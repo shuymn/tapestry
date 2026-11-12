@@ -1049,12 +1049,11 @@ impl Selection {
     fn script_result(
         &mut self,
         controls: &Controls,
-        render: &RenderLink,
         captures: Option<&crate::dev::scenario::Captures>,
         at: ResultAt,
     ) {
         if let Some(script) = &mut self.script {
-            script_result(script, controls, render, &self.menu, captures, at);
+            script_result(script, controls, &self.menu, captures, at);
         }
     }
 
@@ -1090,16 +1089,22 @@ fn shelf_shown(
     }
 }
 
-/// Runs the scripted step due on a result: `drawn` by waiting on `render`
-/// until the result's page has been drawn, then the step after it; `back`
-/// and `retry` as their keys, `next` and `prev` as the right and left
-/// arrows on the window's queue `menu`, `close` as closing the window; a
-/// scenario's captures before them are armed from `captures`.
+/// Runs the scripted steps due on a result, polled after each publication
+/// and at each wake of the result's wait, never blocking. The step in
+/// flight stays the front until it is over, every wait of it ending at its
+/// one deadline, the render bound: a view command (`next` and `prev`, the
+/// right and left arrows on the window's queue `menu`) until a publication
+/// after it has been drawn; a holding capture written on the result until
+/// it ends; `back`, `retry` and `close` until they are sent, which waits
+/// for the result's holding captures and, but `close`, for its drawn page
+/// (a result never drawn still gets its command at the deadline); `stay`
+/// until its page is drawn, then for good, the result leaving by its
+/// scene time, which must be in force. A scenario's captures before the
+/// result's steps are armed from `captures`.
 #[cfg(feature = "dev-tools")]
 pub fn script_result(
     script: &mut crate::dev::SelectScript,
     controls: &Controls,
-    render: &RenderLink,
     menu: &MenuQueue,
     captures: Option<&crate::dev::scenario::Captures>,
     at: ResultAt,
@@ -1108,31 +1113,27 @@ pub fn script_result(
     if script.left_result {
         return;
     }
-    // A publication: the views a command sent are in it.
-    if at.published {
-        script.sent_view = false;
-    }
     script.announce();
     loop {
-        match script.front() {
-            Some(&SelectStep::Capture(k)) => match captures.and_then(|c| c.status(k)) {
-                // A capture written on the result is armed by a
-                // publication that follows the steps before it.
+        match script.front().cloned() {
+            Some(SelectStep::Capture(k)) => match captures.and_then(|c| c.status(k)) {
+                // A capture written on the result is armed with the end
+                // page and view published last, which follow every step
+                // before it, and holds the next step until it ends.
                 Some(st) if st.local => {
+                    let (Some(c), Some(id)) = (captures, at.id) else {
+                        script.fail("a result capture with no result".to_owned());
+                        controls.close();
+                        return;
+                    };
                     if st.state == crate::dev::scenario::CaptureState::Unarmed {
-                        let (Some(c), Some(id)) = (captures, at.id) else {
-                            script.fail("a result capture with no result".to_owned());
-                            controls.close();
-                            return;
-                        };
-                        if !at.published || script.sent_view {
-                            if script.hold_expired() {
-                                script.fail("no view followed the command before it".to_owned());
-                                controls.close();
-                            }
-                            return;
-                        }
                         c.arm_result(k, id.seq, at.page, at.view);
+                    }
+                    if st.hold && !c.status(k).is_some_and(|st| st.ended()) {
+                        if script.hold_expired() {
+                            expired(script, c.expire(Some(id.seq)), controls);
+                        }
+                        return;
                     }
                 }
                 _ => {
@@ -1142,102 +1143,118 @@ pub fn script_result(
                 }
             },
             // Holds the retry's specialization.
-            Some(&SelectStep::SlowSpecializing(ms)) => crate::dev::slow_specializing(ms),
+            Some(SelectStep::SlowSpecializing(ms)) => crate::dev::slow_specializing(ms),
             Some(SelectStep::Drawn) => {
-                if !render.end_page_drawn() {
-                    if script.expired() {
+                if !at.drawn {
+                    if script.hold_expired() {
                         script.fail("the result's page was not drawn".to_owned());
                         controls.close();
                     }
                     return;
                 }
             }
-            _ => break,
+            Some(step @ (SelectStep::Next | SelectStep::Prev)) => match script.sent_page {
+                None => {
+                    if !may_act(script, captures, at, controls, true) {
+                        return;
+                    }
+                    script.sent_page = Some(at.page);
+                    menu.push(MenuInput::Key(if step == SelectStep::Next {
+                        MenuKey::Right
+                    } else {
+                        MenuKey::Left
+                    }));
+                    return;
+                }
+                // Over once a publication after it is drawn: the result's
+                // loop takes the command before it publishes again.
+                Some(sent) if at.page > sent && at.drawn => {}
+                Some(_) => {
+                    if script.hold_expired() {
+                        script.fail(
+                            "no view was published and drawn after the command within the render bound"
+                                .to_owned(),
+                        );
+                        controls.close();
+                    }
+                    return;
+                }
+            },
+            Some(step @ (SelectStep::Back | SelectStep::Retry | SelectStep::Close)) => {
+                if !may_act(script, captures, at, controls, step != SelectStep::Close) {
+                    return;
+                }
+                script.done();
+                script.left_result = true;
+                match step {
+                    SelectStep::Back => controls.command(game::Command::Quit),
+                    SelectStep::Retry => controls.command(game::Command::Retry),
+                    // Closing the window ends the run from any scene.
+                    _ => controls.close(),
+                }
+                return;
+            }
+            // The result is left on its own, by its scene time; the select
+            // screen takes it. Its page drawn with none in force (a
+            // built-in result, or its skin fallen back), or no page drawn
+            // within the bound, it would never leave.
+            Some(SelectStep::Stay) => {
+                if let Some(why) = stay_failure(at, script.hold_expired()) {
+                    script.fail(why.to_owned());
+                    controls.close();
+                }
+                return;
+            }
+            Some(step) => {
+                script.fail(format!("{step:?} on a result"));
+                controls.close();
+                return;
+            }
+            None => return,
         }
         script.done();
         script.announce();
     }
-    let front = script.front();
-    // A leaving or view command waits for the holding captures of the
-    // result, at most the render bound: polled, so the result goes on
-    // serving the close, recoveries and its scene time meanwhile.
-    if matches!(
-        front,
-        Some(
-            SelectStep::Back
-                | SelectStep::Retry
-                | SelectStep::Close
-                | SelectStep::Next
-                | SelectStep::Prev
-        )
-    ) && let (Some(c), Some(id)) = (captures, at.id)
+}
+
+/// Why `stay` fails at `at`, if it does: no page drawn by the step's
+/// deadline (`expired`), or a page drawn with no scene time in force
+/// (dev-tools).
+#[cfg(feature = "dev-tools")]
+const fn stay_failure(at: ResultAt, expired: bool) -> Option<&'static str> {
+    match (at.drawn, at.scene, expired) {
+        (false, _, true) => Some("the result was not drawn within the render bound"),
+        (true, false, _) => Some("stay needs a result skin's scene time; none is in force"),
+        _ => None,
+    }
+}
+
+/// Whether a command may act on the result now (dev-tools): no holding
+/// capture of it has not ended, and, when `drawn` is asked for, its page
+/// has been drawn. Past the step's deadline the holding captures fail,
+/// and a result never drawn gets its command.
+#[cfg(feature = "dev-tools")]
+fn may_act(
+    script: &mut crate::dev::SelectScript,
+    captures: Option<&crate::dev::scenario::Captures>,
+    at: ResultAt,
+    controls: &Controls,
+    drawn: bool,
+) -> bool {
+    if let (Some(c), Some(id)) = (captures, at.id)
         && c.held(Some(id.seq))
     {
         if script.hold_expired() {
             expired(script, c.expire(Some(id.seq)), controls);
         }
-        return;
+        return false;
     }
-    // A command acts on the result once it is drawn: a skin's view
-    // committed, or its built-in page, each frame of it (the S10-09i
-    // design's D1). A result that never draws still gets its command.
-    if matches!(
-        front,
-        Some(SelectStep::Back | SelectStep::Retry | SelectStep::Next | SelectStep::Prev)
-    ) && !render.end_page_drawn()
-        && !script.expired()
-    {
-        return;
-    }
-    match script.front() {
-        Some(SelectStep::Back) => {
-            script.done();
-            script.left_result = true;
-            controls.command(game::Command::Quit);
-        }
-        Some(SelectStep::Retry) => {
-            script.done();
-            script.left_result = true;
-            controls.command(game::Command::Retry);
-        }
-        Some(SelectStep::Next) => {
-            script.done();
-            script.sent_view = true;
-            menu.push(MenuInput::Key(MenuKey::Right));
-        }
-        Some(SelectStep::Prev) => {
-            script.done();
-            script.sent_view = true;
-            menu.push(MenuInput::Key(MenuKey::Left));
-        }
-        // Closing the window ends the run from any scene.
-        Some(SelectStep::Close) => {
-            script.done();
-            script.left_result = true;
-            controls.close();
-        }
-        // The result is left on its own, by its scene time; the select
-        // screen takes it. With none in force once the result is drawn
-        // (a built-in result, or its skin fallen back) it would never
-        // leave.
-        Some(SelectStep::Stay) => {
-            if !at.scene && render.end_page_drawn() {
-                script.fail("stay needs a result skin's scene time; none is in force".to_owned());
-                controls.close();
-            }
-        }
-        Some(step) => {
-            let why = format!("{step:?} on a result");
-            script.fail(why);
-            controls.close();
-        }
-        None => {}
-    }
+    !drawn || at.drawn || script.hold_expired()
 }
 
 /// Where a result stands for its scripted steps (dev-tools): its
-/// identity, the end page and view published last, whether a skin's scene
-/// time is in force, and whether this call follows a publication.
+/// identity, the end page and view published last, whether every page
+/// shown has been drawn, and whether a skin's scene time is in force.
 #[cfg(feature = "dev-tools")]
 #[derive(Clone, Copy, Debug)]
 pub struct ResultAt {
@@ -1247,10 +1264,10 @@ pub struct ResultAt {
     pub page: u64,
     /// The view desired, when a presentation is.
     pub view: Option<u64>,
+    /// Whether the end page shown last has been presented.
+    pub drawn: bool,
     /// Whether a result skin's scene time is in force.
     pub scene: bool,
-    /// Whether this call follows a publication of the result.
-    pub published: bool,
 }
 
 /// The holding captures a step waited on passed the render bound
@@ -2087,40 +2104,32 @@ impl PlayerRig<'_> {
             sel.shelf.release();
         }
         #[cfg(feature = "dev-tools")]
-        self.poll_result_script(true);
+        self.poll_result_script();
     }
 
     /// Runs the scripted steps due on the result shown (dev-tools): after
-    /// its publication (`published`), and at each wake of the result's
-    /// wait, so a step waiting on a capture never holds the game thread.
+    /// each publication, and at each wake of the result's wait, so a step
+    /// in flight never holds the game thread.
     #[cfg(feature = "dev-tools")]
-    pub(crate) fn poll_result_script(&mut self, published: bool) {
+    pub(crate) fn poll_result_script(&mut self) {
         let at = ResultAt {
             id: self.scenario.as_ref().and_then(|s| s.result_id),
             page: self.render.end_pages_shown(),
             view: self.presenter.desired_key(),
+            drawn: self.render.end_page_drawn(),
             scene: self
                 .presenter
                 .timing(&self.render)
                 .is_some_and(|t| t.scene.is_some()),
-            published,
         };
         let Some(sel) = &mut self.selection else {
             if let Some(script) = &mut self.result_script {
-                script_result(
-                    script,
-                    self.controls,
-                    &self.render,
-                    &self.result_input.menu,
-                    None,
-                    at,
-                );
+                script_result(script, self.controls, &self.result_input.menu, None, at);
             }
             return;
         };
         sel.script_result(
             self.controls,
-            &self.render,
             self.scenario.as_ref().map(|s| &s.captures),
             at,
         );
@@ -2139,7 +2148,7 @@ impl PlayerRig<'_> {
         .flatten()
         {
             script.left_result = false;
-            script.sent_view = false;
+            script.sent_page = None;
         }
         self.finish_result(crate::dev::scenario::Leaving::Left);
         let generation = self.generation;
@@ -7543,10 +7552,35 @@ pub(crate) mod tests {
         );
     }
 
-    /// I1 on a result: a capture written after a view command is armed
-    /// only by the publication that follows the command, never by a wake
-    /// of the result's wait before it, and with what that publication
-    /// published.
+    /// A result's scripted steps over captures `c`, at result 4 of play 2.
+    #[cfg(feature = "dev-tools")]
+    fn result_steps(steps: Vec<crate::dev::SelectStep>) -> (crate::dev::SelectScript, MenuQueue) {
+        let o = capture_origin();
+        let script =
+            crate::dev::SelectScript::compiled(steps.into_iter().map(|s| (s, o)).collect());
+        (script, MenuQueue::default())
+    }
+
+    /// Result 4 of play 2 with `page` and `view` published last, drawn or
+    /// not, with or without a scene time.
+    #[cfg(feature = "dev-tools")]
+    fn result_at(page: u64, view: u64, drawn: bool, scene: bool) -> super::ResultAt {
+        super::ResultAt {
+            id: Some(crate::measure::ResultId {
+                seq: 4,
+                generation: 2,
+            }),
+            page,
+            view: Some(view),
+            drawn,
+            scene,
+        }
+    }
+
+    /// A view command is in flight until a publication after it has been
+    /// drawn: the step after it, a capture written on the result, is armed
+    /// only then, with what that publication published; no wake before it
+    /// arms it.
     #[cfg(feature = "dev-tools")]
     #[test]
     fn a_result_capture_after_a_view_command_waits_for_its_publication() {
@@ -7554,55 +7588,23 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let captures = one_capture(dir.path(), Axis::Result(TimeUs(400_000)));
         captures.set_local(0);
-        let o = capture_origin();
-        let mut script = crate::dev::SelectScript::compiled(vec![
-            (crate::dev::SelectStep::Next, o),
-            (crate::dev::SelectStep::Capture(0), o),
-            (crate::dev::SelectStep::Back, o),
+        let (mut script, menu) = result_steps(vec![
+            crate::dev::SelectStep::Next,
+            crate::dev::SelectStep::Capture(0),
+            crate::dev::SelectStep::Back,
         ]);
-        let menu = MenuQueue::default();
-        let id = crate::measure::ResultId {
-            seq: 4,
-            generation: 2,
-        };
-        let at = |page, view, published| super::ResultAt {
-            id: Some(id),
-            page,
-            view: Some(view),
-            scene: false,
-            published,
-        };
         crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
-            // The page is not drawn here: the command waits its step bound.
-            script.age(Duration::from_secs(60));
-            super::script_result(
-                &mut script,
-                rig.controls,
-                &rig.render,
-                &menu,
-                Some(&captures),
-                at(3, 7, true),
-            );
+            let mut run =
+                |at| super::script_result(&mut script, rig.controls, &menu, Some(&captures), at);
+            run(result_at(3, 7, true, false));
             assert_eq!(menu.pop(), Some(MenuInput::Key(MenuKey::Right)));
-            // A wake before the command's publication: not armed.
-            super::script_result(
-                &mut script,
-                rig.controls,
-                &rig.render,
-                &menu,
-                Some(&captures),
-                at(3, 7, false),
-            );
+            // Wakes before the command's publication, or before it is
+            // drawn: not armed.
+            run(result_at(3, 7, true, false));
+            run(result_at(4, 8, false, false));
             assert_eq!(captures.states()[0], CaptureState::Unarmed);
-            // The publication after it arms it with what it published.
-            super::script_result(
-                &mut script,
-                rig.controls,
-                &rig.render,
-                &menu,
-                Some(&captures),
-                at(4, 8, true),
-            );
+            // Its publication drawn: armed with what it published.
+            run(result_at(4, 8, true, false));
             assert_eq!(
                 captures.states()[0],
                 CaptureState::Resulting {
@@ -7612,5 +7614,102 @@ pub(crate) mod tests {
                 }
             );
         });
+    }
+
+    /// With the result's page already drawn, a leaving command after a
+    /// view command waits until the view command's publication is drawn:
+    /// it never overtakes the command the result's loop has not taken.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_view_command_holds_back_until_its_publication_is_drawn() {
+        let (mut script, menu) = result_steps(vec![
+            crate::dev::SelectStep::Next,
+            crate::dev::SelectStep::Back,
+        ]);
+        crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            let controls = rig.controls;
+            let mut run = |at| super::script_result(&mut script, controls, &menu, None, at);
+            run(result_at(3, 7, true, false));
+            assert_eq!(menu.pop(), Some(MenuInput::Key(MenuKey::Right)));
+            run(result_at(3, 7, true, false));
+            run(result_at(4, 8, false, false));
+            assert_eq!(controls.take(), None, "back overtook the view command");
+            run(result_at(4, 8, true, false));
+            assert_eq!(controls.take(), Some(game::Command::Quit));
+            assert!(menu.pop().is_none());
+        });
+    }
+
+    /// A holding capture written on a result holds the next capture step
+    /// until it ends; the next one is then armed with what was published
+    /// last, with no new publication.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_held_result_capture_holds_the_next_capture() {
+        use crate::dev::scenario::{Axis, CaptureState};
+        let dir = tempfile::tempdir().unwrap();
+        let captures = crate::dev::scenario::Captures::of(vec![
+            (TimeUs(0), dir.path().join("a.png")),
+            (TimeUs(0), dir.path().join("b.png")),
+        ]);
+        for i in 0..2 {
+            captures.set_axis(i, Axis::Result(TimeUs(400_000 * (1 - i as i64))));
+            captures.set_hold(i, true);
+            captures.set_local(i);
+        }
+        let (mut script, menu) = result_steps(vec![
+            crate::dev::SelectStep::Capture(0),
+            crate::dev::SelectStep::Capture(1),
+            crate::dev::SelectStep::Back,
+        ]);
+        crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            let mut run =
+                |at| super::script_result(&mut script, rig.controls, &menu, Some(&captures), at);
+            run(result_at(3, 7, true, false));
+            assert!(matches!(
+                captures.states()[0],
+                CaptureState::Resulting { .. }
+            ));
+            assert_eq!(captures.states()[1], CaptureState::Unarmed);
+            run(result_at(3, 7, true, false));
+            assert_eq!(captures.states()[1], CaptureState::Unarmed);
+            captures.set_state(0, CaptureState::Succeeded);
+            run(result_at(3, 7, true, false));
+            assert_eq!(
+                captures.states()[1],
+                CaptureState::Resulting {
+                    seq: 4,
+                    page: 3,
+                    view: Some(7)
+                }
+            );
+        });
+    }
+
+    /// `stay` waits for the result's page within its step's deadline, and
+    /// fails past it; drawn with no scene time in force, it fails at once;
+    /// with one, it waits for the result to leave on its own.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn stay_waits_for_its_page_within_the_bound() {
+        let stay = |bound: Duration, at| {
+            let (mut script, menu) = result_steps(vec![crate::dev::SelectStep::Stay]);
+            script.set_hold_bound(bound);
+            crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+                super::script_result(&mut script, rig.controls, &menu, None, at);
+            });
+            script.failure().map(str::to_owned)
+        };
+        let long = Duration::from_secs(600);
+        assert_eq!(stay(long, result_at(1, 1, false, false)), None);
+        assert_eq!(
+            stay(Duration::ZERO, result_at(1, 1, false, false)).as_deref(),
+            Some("step 1 (capture): the result was not drawn within the render bound")
+        );
+        assert_eq!(
+            stay(long, result_at(1, 1, true, false)).as_deref(),
+            Some("step 1 (capture): stay needs a result skin's scene time; none is in force")
+        );
+        assert_eq!(stay(long, result_at(1, 1, true, true)), None);
     }
 }

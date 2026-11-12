@@ -1571,7 +1571,7 @@ impl Rig for PlayerRig<'_> {
         // capture is polled (dev-tools).
         #[cfg(feature = "dev-tools")]
         if self.end_page.is_some() {
-            self.poll_result_script(false);
+            self.poll_result_script();
         }
     }
 

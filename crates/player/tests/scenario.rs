@@ -195,6 +195,34 @@ impl Fixture {
         self.output(self.command(text).env("TAPESTRY_DEV_RESULT_FAULTS", faults))
     }
 
+    /// [`run`](Self::run), stopped at `limit`: `None` when the run did
+    /// not end by then, the child then killed and waited for.
+    fn run_bounded(
+        &self,
+        text: &str,
+        limit: std::time::Duration,
+    ) -> Option<(Output, String, String)> {
+        let mut child = self
+            .command(text)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let begun = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if begun.elapsed() >= limit {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        Some((out, stdout, stderr))
+    }
+
     fn output(&self, command: &mut Command) -> (Output, String, String) {
         let out = command.output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -623,7 +651,7 @@ fn a_stalled_capture_exits_one_within_the_bound() {
             let _ = child.kill();
             panic!("the run did not end within {} s", bound.as_secs());
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -3282,12 +3310,18 @@ fn held_result_capture_defers_quit() {
 fn stay_without_scene_time_fails() {
     let fx = Fixture::new();
     write_chart(&fx.library(), "a", "譜面A");
-    let (out, stdout, stderr) = fx.run(&small(&[
-        "select = { path = \"library/a/a.bms\" }",
-        "play = { input = \"auto\", until = \"end\" }",
-        "result = \"stay\"",
-        "quit = {}",
-    ]));
+    // Bounded: a stay that waits for good never ends the run.
+    let (out, stdout, stderr) = fx
+        .run_bounded(
+            &small(&[
+                "select = { path = \"library/a/a.bms\" }",
+                "play = { input = \"auto\", until = \"end\" }",
+                "result = \"stay\"",
+                "quit = {}",
+            ]),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("the run did not end within 300 s");
     assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
     assert!(
         stderr.contains("stay needs a result skin's scene time; none is in force"),

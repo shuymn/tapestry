@@ -1091,9 +1091,9 @@ pub struct SelectScript {
     held_until: Option<std::time::Instant>,
     /// How long a step waits on a holding capture: the render bound.
     hold_bound: Option<Duration>,
-    /// A view command was sent on the result since its last publication:
-    /// a capture written after it is armed only by the next one.
-    pub sent_view: bool,
+    /// The end pages shown when the front step, a view command on a
+    /// result, was sent: it is over once a later one has been drawn.
+    pub sent_page: Option<u64>,
     /// The result shown was left by a step: its steps are over until the
     /// next result begins.
     pub left_result: bool,
@@ -1232,6 +1232,7 @@ impl SelectScript {
         self.drawn_from = None;
         self.identities.clear();
         self.held_until = None;
+        self.sent_page = None;
     }
 
     /// How long a step waits on a holding capture: `bound`, the run's

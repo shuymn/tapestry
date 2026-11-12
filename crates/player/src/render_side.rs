@@ -4976,8 +4976,9 @@ impl Run {
                             page: self.end_page.0,
                             view: held.map(|h| h.payload.key),
                             sampled: now,
+                            // Only a frame its skin drew has its timers.
                             timer_origin: held
-                                .filter(|h| h.payload.skin.is_some())
+                                .filter(|_| matches!(built, ResultDrawn::Built))
                                 .map(|h| h.overlay.screen),
                         });
                     }
