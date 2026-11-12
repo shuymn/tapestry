@@ -537,6 +537,7 @@ pub fn view(rows: Vec<RowView>, cursor: Option<usize>) -> SelectionView {
             random: r.random,
             max_ex: None,
             score: r.score,
+            judge_class: None,
         });
     SelectionView {
         position: None,
