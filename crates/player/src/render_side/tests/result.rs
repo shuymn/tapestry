@@ -57,6 +57,10 @@ impl Gate {
     }
 }
 
+/// A result frame built: its time, its `screen` start, and the `screen`
+/// timer's ms its state held as the build began.
+pub(super) type Build = (TimeUs, Option<TimeUs>, Option<i32>);
+
 /// Faults a test turns on.
 #[derive(Default)]
 pub(super) struct Faults {
@@ -108,6 +112,10 @@ pub(super) struct Faults {
     dropping: AtomicBool,
     /// The last result frame built: its time and timer 2's start.
     timers: Mutex<Option<(TimeUs, Option<TimeUs>)>>,
+    /// Every result frame built, in order: its time, its `screen` start,
+    /// and the `screen` timer's ms its state held as the build began (the
+    /// runtime's reading: the frame's visit prepared it).
+    pub(super) builds: Mutex<Vec<Build>>,
     /// The strip's text per slot as prepared, and the one in use.
     strips: Mutex<[Vec<String>; 3]>,
     strip: Mutex<Vec<String>>,
@@ -350,6 +358,12 @@ impl Screen for Recorded {
             self.menu.refuse_next_result(false);
         }
         *self.faults.timers.lock().unwrap() = Some((frame.now, frame.timers.fadeout));
+        let prepared = state.runtime_parts().1.first().copied();
+        self.faults
+            .builds
+            .lock()
+            .unwrap()
+            .push((frame.now, frame.timers.screen, prepared));
         self.menu.build_result(state, frame)
     }
     fn submit_result(&mut self) -> Result<render::FrameTiming, render::RenderError> {
@@ -827,7 +841,6 @@ fn the_barrier_keeps_the_view_and_a_refusal_draws_its_page() {
     let notice = Overlay {
         lines: vec!["NOTICE".to_owned()],
         fadeout: Some(TimeUs(5)),
-        ..Overlay::default()
     };
     show(&rig.link, lifetime, 3, &b, &notice);
     rig.clear();
@@ -1763,7 +1776,8 @@ fn result_frame_alloc() {
         side.overlay = Some((cycle + 1, overlay));
         let now = TimeUs(1_000_000 + 16_000 * i64::try_from(cycle).unwrap());
         let before = crate::alloc_count::this_thread();
-        let fadeout = Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts);
+        let fadeout =
+            Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts, TimeUs(0));
         let commit = crate::alloc_count::this_thread() - before;
         Run::result_visit(Some(&mut side), now, fadeout);
         assert!(
@@ -1792,7 +1806,7 @@ fn result_frame_alloc() {
     // A frame the skin refuses allocates nothing either.
     screen.refuse_next_result(false);
     let before = crate::alloc_count::this_thread();
-    let fadeout = Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts);
+    let fadeout = Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts, TimeUs(0));
     let drawn = Run::result_build(&mut screen, Some(&mut side), TimeUs(2_000_000), fadeout);
     counts.push(crate::alloc_count::this_thread() - before);
     assert!(matches!(drawn, ResultDrawn::Refused(_)), "{drawn:?}");
@@ -2261,11 +2275,17 @@ fn the_gate_and_the_pin_judge_one_view() {
     assert!(rig.until(|d| skin_frame(d).is_some()));
     let t = skin.skin().result_timing();
     assert_eq!(t.input, TimeUs(5_000_000));
+    // The input time counts from the origin A's commit set; the flow's
+    // start, read before it, is earlier.
+    let o = rig.link.presented_origin().expect("A committed");
     let start = TimeUs(0);
-    assert_eq!(rig.link.pin_result(TimeUs(1_000_000), Some(start)), None);
+    assert_eq!(
+        rig.link.pin_result(TimeUs(o.0 + 1_000_000), Some(start)),
+        None
+    );
     assert_eq!(rig.link.result_status().pinned, None);
     assert_eq!(
-        rig.link.pin_result(TimeUs(5_000_000), Some(start)),
+        rig.link.pin_result(TimeUs(o.0 + 5_000_000), Some(start)),
         Some((Some(2), Some(t)))
     );
     rig.link.exit();
@@ -2847,7 +2867,8 @@ fn the_build_mark_precedes_the_result_build() {
     });
     for k in 0..5_i64 {
         let now = TimeUs(1_000_000 + 16_000 * k);
-        let fadeout = Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts);
+        let fadeout =
+            Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts, TimeUs(0));
         Run::result_visit(Some(&mut side), now, fadeout);
         let _ = crate::dev::take_build_mark();
         let _ = render::take_build_start();
@@ -3019,4 +3040,223 @@ fn a_results_frames_are_reported_when_the_render_thread_ends() {
         "lifetime {lifetime}: {:?}",
         kept.screens
     );
+}
+
+/// The result frames built so far.
+fn builds(rig: &Rig) -> Vec<Build> {
+    rig.faults.builds.lock().unwrap().clone()
+}
+
+/// Waits until at least `n` result frames were built.
+fn built(rig: &Rig, n: usize) -> bool {
+    wait_until(|| rig.faults.builds.lock().unwrap().len() >= n)
+}
+
+/// The result's origin is the first committed view's sampled frame
+/// instant (design.md "Rendering and Skins", Timers): the frame that
+/// commits it reads `screen` at 0, and every later frame of the lifetime
+/// keeps that start.
+#[test]
+fn the_first_committed_frame_reads_screen_at_zero() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(built(&rig, 4));
+    let b = builds(&rig);
+    let (first, screen, _) = b[0];
+    assert_eq!(screen, Some(first), "the first frame reads 0");
+    assert!(b.iter().all(|&(_, s, _)| s == Some(first)), "{b:?}");
+    assert_eq!(rig.link.presented_origin(), Some(first));
+    rig.link.exit();
+}
+
+/// A first commit whose frame is never presented (its submission lost)
+/// keeps its origin: the frames drawn after the screen is built again read
+/// `screen` from that commit's instant.
+#[test]
+fn an_unpresented_first_commit_keeps_its_origin() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    rig.faults.lose.store(true, Ordering::Release);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(wait_until(|| rig.link.failed()));
+    assert!(
+        rig.drawn().iter().all(|d| skin_frame(d).is_none()),
+        "never presented"
+    );
+    rig.link.prepare().unwrap();
+    // Frames drawn after the screen is built again.
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    assert!(built(&rig, 3));
+    let b = builds(&rig);
+    let (lost, screen, _) = b[0];
+    assert_eq!(screen, Some(lost));
+    assert!(
+        b[1..]
+            .iter()
+            .all(|&(now, s, _)| s == Some(lost) && now > lost),
+        "{b:?}"
+    );
+    assert_eq!(rig.link.presented_origin(), Some(lost));
+    rig.link.exit();
+}
+
+/// A built-in first view starts the origin; a skin view committed after it
+/// inherits the elapsed time instead of starting its own.
+#[test]
+fn a_skin_after_a_built_in_view_inherits_its_origin() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, None, 1_111, &[]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(rig.until(|d| matches!(d, Drawn::Page(_))));
+    let o = rig
+        .link
+        .presented_origin()
+        .expect("the built-in view committed");
+    assert!(builds(&rig).is_empty(), "no skin frame yet");
+    let b = payload(2, Some(&skin), 2_222, &[]);
+    show(&rig.link, lifetime, 2, &b, &Overlay::default());
+    assert!(built(&rig, 3));
+    let b = builds(&rig);
+    assert!(b[0].0 > o, "{b:?}");
+    assert!(b.iter().all(|&(_, s, _)| s == Some(o)), "{o:?} {b:?}");
+    assert_eq!(rig.link.presented_origin(), Some(o));
+    rig.link.exit();
+}
+
+/// The skin's runtime and its build read one origin: the `screen` timer
+/// the frame's visit prepared is the build's start's reading, the time
+/// since the first commit.
+#[test]
+fn the_runtime_and_the_build_read_one_origin() {
+    let (_dir, skin, _script) = scripted_skin("return true");
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    // Frames until one is at least 2 ms after the first.
+    assert!(wait_until(|| {
+        let b = builds(&rig);
+        b.first()
+            .zip(b.last())
+            .is_some_and(|(f, l)| l.0.0 - f.0.0 >= 2_000)
+    }));
+    let b = builds(&rig);
+    let origin = b[0].0;
+    for &(now, screen, prepared) in &b {
+        assert_eq!(screen, Some(origin));
+        let ms = i32::try_from((now.0 - origin.0) / 1_000).unwrap();
+        assert_eq!(prepared, Some(ms), "{b:?}");
+    }
+    rig.link.exit();
+}
+
+/// The origin survives a switch to another view and a screen built again.
+#[test]
+fn the_origin_survives_a_switch_and_a_screen_built_again() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    let o = rig.link.presented_origin().expect("A committed");
+    let b = payload(2, Some(&skin), 2_222, &["B"]);
+    show(&rig.link, lifetime, 2, &b, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some_and(|(_, n)| n == 1)));
+    rig.faults.lose.store(true, Ordering::Release);
+    assert!(wait_until(|| rig.link.failed()));
+    rig.link.prepare().unwrap();
+    let n = rig.faults.submits.load(Ordering::Acquire);
+    assert!(wait_until(
+        || rig.faults.submits.load(Ordering::Acquire) >= n + 3
+    ));
+    assert_eq!(rig.link.result_status().shown, Some((2, true)));
+    let b = builds(&rig);
+    assert!(b.iter().all(|&(_, s, _)| s == Some(o)), "{o:?} {b:?}");
+    assert_eq!(rig.link.presented_origin(), Some(o));
+    rig.link.exit();
+}
+
+/// A new lifetime takes its own origin: none while a frame of the old one
+/// is held past its check, none after that frame's stale commit, and the
+/// new lifetime's first commit's instant after it.
+#[test]
+fn a_new_lifetime_takes_its_own_origin() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    assert!(rig.link.presented_origin().is_some());
+    let hold = FrameHold::new(&rig.link);
+    let notice = Overlay {
+        lines: vec!["NOTICE".to_owned()],
+        ..Overlay::default()
+    };
+    show(&rig.link, lifetime, 2, &a, &notice);
+    assert!(wait_until(|| hold.holding()));
+    let next = rig.link.begin_result();
+    assert_eq!(rig.link.presented_origin(), None, "before the release");
+    drop(hold);
+    assert!(rig.link.fence(Duration::from_secs(10)));
+    assert_eq!(rig.link.presented_origin(), None, "after the stale commit");
+    rig.faults.builds.lock().unwrap().clear();
+    show(&rig.link, next, 1, &a, &Overlay::default());
+    assert!(built(&rig, 1));
+    let (first, screen, _) = builds(&rig)[0];
+    assert_eq!(screen, Some(first));
+    assert_eq!(rig.link.presented_origin(), Some(first));
+    rig.link.exit();
+}
+
+/// A pressed command's gate counts from the first committed frame under
+/// the pin's lock, though the flow read its start before that commit.
+#[test]
+fn the_pressed_gate_counts_from_the_first_committed_frame() {
+    let (_dir, skin) = lua_skin("skin.input = 5000\n", "");
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    let o = rig.link.presented_origin().expect("A committed");
+    // The flow's start, read before the commit: earlier than the origin.
+    let start = TimeUs(0);
+    assert!(o.0 >= 1_000, "{o:?}");
+    assert_eq!(
+        rig.link.pin_result(TimeUs(o.0 + 4_999_000), Some(start)),
+        None
+    );
+    assert_eq!(
+        rig.link.pin_result(TimeUs(o.0 + 5_000_000), Some(start)),
+        Some((Some(1), Some(skin.skin().result_timing())))
+    );
+    rig.link.exit();
+}
+
+/// A refusal on a healthy device disables the kind: the timing goes, so
+/// commands act at once, and the origin stays.
+#[test]
+fn a_refusal_keeps_the_origin_and_removes_the_timing() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    let o = rig.link.presented_origin().expect("A committed");
+    assert!(rig.link.presented_timing().is_some());
+    rig.faults.refuse.store(true, Ordering::Release);
+    assert!(wait_until(|| rig.link.result_status().disabled.is_some()));
+    assert_eq!(rig.link.presented_timing(), None);
+    assert_eq!(rig.link.presented_origin(), Some(o));
+    rig.link.exit();
 }

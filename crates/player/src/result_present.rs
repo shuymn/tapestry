@@ -5,8 +5,9 @@
 //! A presentation is a view payload, made from one view snapshot (the
 //! bundle or the built-in result, the view and its labels, the strip's
 //! lines that depend on the view and the view's built-in page), with an
-//! overlay merged on its own (the lifetime's start, the fade-out's start
-//! and the strip's lines that do not depend on the view). The presenter
+//! overlay merged on its own (the fade-out's start and the strip's lines
+//! that do not depend on the view). The lifetime's origin, its `screen`
+//! timer's start, is the render thread's: its first commit point sets it. The presenter
 //! numbers each with its own revision, and the render thread takes the
 //! newest of the current result lifetime through a slot, prepares a new
 //! payload apart from what it draws, and promotes it at one commit point
@@ -78,8 +79,6 @@ pub struct ViewPayload {
 /// What merges into a presentation whatever view it shows (D1).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Overlay {
-    /// The lifetime's start on the QPC clock: the `screen` timer.
-    pub screen: TimeUs,
     /// The fade-out's start on the QPC clock (timer 2), once a leaving
     /// command was accepted.
     pub fadeout: Option<TimeUs>,
@@ -153,6 +152,11 @@ pub struct ResultBarrier {
     /// The fade-out's start the barrier was set with: set, the barrier
     /// holds, a view pinned or none presented yet.
     pub fadeout: Option<TimeUs>,
+    /// The lifetime's origin (design.md "Rendering and Skins", Timers):
+    /// the sampled instant of the frame whose commit point first held a
+    /// view presented, written by that commit point with the timing and
+    /// never cleared within the lifetime.
+    pub origin: Option<TimeUs>,
     /// The presented view's skin timing while its skin draws: `None` for
     /// a built-in view, before the first commit and once the kind is
     /// disabled (the S10-09i design's D6, D7).
@@ -439,6 +443,9 @@ pub trait Publish {
     ) -> Option<(Option<ViewKey>, Option<skin_model::ResultTiming>)>;
     /// The current lifetime's presented view's skin timing.
     fn timing(&self) -> Option<skin_model::ResultTiming>;
+    /// The current lifetime's origin: the instant its first view was
+    /// committed, `None` before it.
+    fn origin(&self) -> Option<TimeUs>;
 }
 
 /// The game thread's side of the result's presentation (D1, D4, D7): it
@@ -471,19 +478,16 @@ impl Presenter {
         self.lifetime.is_some()
     }
 
-    /// A result lifetime begins at `now` on the QPC clock (the result
-    /// shown first after its preparation).
-    pub fn begin(&mut self, to: &mut impl Publish, now: TimeUs) {
+    /// A result lifetime begins (the result shown first after its
+    /// preparation); its origin is set by the render thread's first commit
+    /// point of it.
+    pub fn begin(&mut self, to: &mut impl Publish) {
         self.lifetime = Some(to.begin());
         self.revision = 0;
         self.payload = None;
         self.desired = None;
         self.view = None;
-        self.overlay = Overlay {
-            screen: now,
-            fadeout: None,
-            lines: Vec::new(),
-        };
+        self.overlay = Overlay::default();
     }
 
     /// The result is left: its lifetime ends, and nothing of it is drawn.
@@ -650,6 +654,15 @@ impl Presenter {
     pub fn timing(&self, to: &impl Publish) -> Option<skin_model::ResultTiming> {
         self.lifetime?;
         to.timing()
+    }
+
+    /// The result's origin (design.md "Rendering and Skins", Timers): the
+    /// sampled instant of the frame that committed the lifetime's first
+    /// view, a built-in one included, from which its skin's input and
+    /// scene times count; `None` outside a lifetime and before that commit.
+    pub fn origin(&self, to: &impl Publish) -> Option<TimeUs> {
+        self.lifetime?;
+        to.origin()
     }
 
     /// Publishes the payload published last with the overlay as it is,

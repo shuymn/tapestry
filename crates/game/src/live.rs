@@ -479,6 +479,15 @@ pub trait Rig {
     fn result_timing(&self) -> Option<ResultTiming> {
         None
     }
+    /// The result's origin (design.md "Rendering and Skins", Timers): the
+    /// instant its screen's first view was committed, from which a skin's
+    /// input and scene times count; `None` before it. Never set later than
+    /// the timing it goes with, so the flow reads
+    /// [`result_timing`](Self::result_timing) first and then this. By
+    /// default, `None`: the flow counts from the result's show.
+    fn result_origin(&self) -> Option<TimeUs> {
+        None
+    }
     /// A leaving command at `at`, judged and pinned against one view, the
     /// one on screen: with `gate` (a pressed command, the result's start)
     /// a view whose input time has not passed from it refuses it
@@ -1096,8 +1105,11 @@ fn run_from<R: Rig>(
         loaded.emit(&SessionEvent::Result {
             attempt: report.attempt,
         });
-        // The result's start: a skin's input and scene times count from it.
-        let start = rig.now();
+        // The result's show: a skin's input and scene times count from the
+        // rig's origin once it has one (read after the timing, which it
+        // never follows), from here before.
+        let shown = rig.now();
+        let start = |rig: &R| rig.result_origin().unwrap_or(shown);
         rig.show_end(&report, &screen);
         // The leaving command accepted and its outro's end, from the pinned
         // view's timing.
@@ -1114,7 +1126,7 @@ fn run_from<R: Rig>(
                 None => rig
                     .result_timing()
                     .and_then(|t| t.scene)
-                    .map(|scene| start.0.saturating_add(scene.0)),
+                    .map(|scene| start(rig).0.saturating_add(scene.0)),
             };
             until = due.map_or(until, |d| until.min(d));
             rig.idle_wait(TimeUs(until));
@@ -1141,6 +1153,7 @@ fn run_from<R: Rig>(
             // away: what waits on the outro is served at this look.
             let now = rig.now();
             let timing = rig.result_timing();
+            let start = start(rig);
             let mut open = true;
             if outro.is_none() {
                 open = timing.is_none_or(|t| now.0 >= start.0.saturating_add(t.input.0));

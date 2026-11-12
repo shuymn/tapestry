@@ -936,7 +936,7 @@ impl PlayerRig<'_> {
             return;
         }
         if !self.presenter.current() {
-            self.presenter.begin(&mut self.render, self.clock.now());
+            self.presenter.begin(&mut self.render);
             self.result_leaving = false;
             self.result_offset = Some((self.controls.tuning().get().input_offset_us, false));
         }
@@ -1891,6 +1891,11 @@ impl Rig for PlayerRig<'_> {
     /// once.
     fn result_timing(&self) -> Option<game::ResultTiming> {
         self.presenter.timing(&self.render).map(flow_timing)
+    }
+
+    /// The result's origin: the render thread's first commit of a view.
+    fn result_origin(&self) -> Option<TimeUs> {
+        self.presenter.origin(&self.render)
     }
 
     /// The barrier is set at `at` (D4), for every accepted command: the
