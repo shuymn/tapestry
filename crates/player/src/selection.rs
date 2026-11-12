@@ -7542,4 +7542,75 @@ pub(crate) mod tests {
             )
         );
     }
+
+    /// I1 on a result: a capture written after a view command is armed
+    /// only by the publication that follows the command, never by a wake
+    /// of the result's wait before it, and with what that publication
+    /// published.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_result_capture_after_a_view_command_waits_for_its_publication() {
+        use crate::dev::scenario::{Axis, CaptureState};
+        let dir = tempfile::tempdir().unwrap();
+        let captures = one_capture(dir.path(), Axis::Result(TimeUs(400_000)));
+        captures.set_local(0);
+        let o = capture_origin();
+        let mut script = crate::dev::SelectScript::compiled(vec![
+            (crate::dev::SelectStep::Next, o),
+            (crate::dev::SelectStep::Capture(0), o),
+            (crate::dev::SelectStep::Back, o),
+        ]);
+        let menu = MenuQueue::default();
+        let id = crate::measure::ResultId {
+            seq: 4,
+            generation: 2,
+        };
+        let at = |page, view, published| super::ResultAt {
+            id: Some(id),
+            page,
+            view: Some(view),
+            scene: false,
+            published,
+        };
+        crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            // The page is not drawn here: the command waits its step bound.
+            script.age(Duration::from_secs(60));
+            super::script_result(
+                &mut script,
+                rig.controls,
+                &rig.render,
+                &menu,
+                Some(&captures),
+                at(3, 7, true),
+            );
+            assert_eq!(menu.pop(), Some(MenuInput::Key(MenuKey::Right)));
+            // A wake before the command's publication: not armed.
+            super::script_result(
+                &mut script,
+                rig.controls,
+                &rig.render,
+                &menu,
+                Some(&captures),
+                at(3, 7, false),
+            );
+            assert_eq!(captures.states()[0], CaptureState::Unarmed);
+            // The publication after it arms it with what it published.
+            super::script_result(
+                &mut script,
+                rig.controls,
+                &rig.render,
+                &menu,
+                Some(&captures),
+                at(4, 8, true),
+            );
+            assert_eq!(
+                captures.states()[0],
+                CaptureState::Resulting {
+                    seq: 4,
+                    page: 4,
+                    view: Some(8)
+                }
+            );
+        });
+    }
 }

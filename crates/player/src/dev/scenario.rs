@@ -1748,6 +1748,14 @@ impl Captures {
         }
     }
 
+    /// Capture `i` is a capture written on a result (tests).
+    #[cfg(test)]
+    pub fn set_local(&self, i: usize) {
+        if let Some(c) = self.lock().get_mut(i) {
+            c.local = true;
+        }
+    }
+
     /// Capture `i` is in `state` (tests).
     #[cfg(test)]
     pub fn set_state(&self, i: usize, state: CaptureState) {
