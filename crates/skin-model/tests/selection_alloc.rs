@@ -218,6 +218,7 @@ fn a_selection_build_allocates_nothing() {
         v.position = ratio(u64::try_from(cursor).unwrap(), 39);
         if let Some(c) = v.selected.as_mut() {
             c.max_ex = Some(300);
+            c.judge_class = u8::try_from(cursor % 5).ok();
         }
         fx.view(&v);
         let texts = TextTable::new(vec![line; fx.skin.text_slots()]);

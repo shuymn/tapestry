@@ -1273,6 +1273,12 @@ impl SelectScreen {
             random: e.random,
             max_ex: max_ex(e, self.bests_preset.as_ref()),
             score: self.score_of(e),
+            // One validation, as the reference's song database computes
+            // it (design.md "Rendering and Skins", chart metadata).
+            judge_class: e
+                .rank
+                .and_then(skin_beatoraja::JudgeClass::of_listed)
+                .map(skin_beatoraja::JudgeClass::index),
         }
     }
 
@@ -1382,6 +1388,30 @@ mod tests {
             random: false,
             bga: false,
             summary: None,
+            rank: None,
+        }
+    }
+
+    /// The selected chart's judgment class from its library entry's rank,
+    /// with one validation, as the reference's song database computes it:
+    /// `#RANK 3` easy, `#DEFEXRANK 1` very hard (0), `#DEFEXRANK 10` in no
+    /// class (7), no header normal, a refused draw none.
+    #[test]
+    fn the_selected_charts_class_takes_one_validation() {
+        use rules::JudgeRank::{DefExRankMilli, Rank};
+        let s = SelectScreen::new(Vec::new());
+        for (rank, class) in [
+            (Some(Some(Rank(3))), Some(3)),
+            (Some(Some(DefExRankMilli(1_000))), Some(0)),
+            (Some(Some(DefExRankMilli(10_000))), None),
+            (Some(None), Some(2)),
+            (None, None),
+        ] {
+            let e = ChartEntry {
+                rank,
+                ..entry(r"C:\charts\a\1.bms", "a")
+            };
+            assert_eq!(s.selected_chart(&e).judge_class, class, "{rank:?}");
         }
     }
 
