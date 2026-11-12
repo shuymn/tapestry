@@ -205,17 +205,21 @@ fn a_play_frame_s_measured_screen_clock_is_the_built_one() {
     // The screen clock of the lifetime, and the state clock 6 420 ms
     // ahead of it (its origin 7 654 ms before READY at T + 1 234 ms).
     assert_eq!(rig.screen_at(after(t, 1_734)), 1_734 * MS);
-    let built = rig.screens.screen_clocks.lock().unwrap().clone();
-    let measured = measured.lock().unwrap().clone();
-    let pairs: Vec<(i64, Option<i64>)> = built
-        .iter()
-        .filter_map(|&(_, screen, now)| {
-            let m = measured.iter().find(|&&(n, _)| n == now)?;
-            Some((screen, m.1))
-        })
-        .collect();
-    assert!(pairs.len() >= 3, "{built:?} {measured:?}");
-    for (screen, sidecar) in pairs {
+    // Each frame is measured after it is built, through the frame sink:
+    // wait (bounded) until three built frames have their measured record.
+    let pairs = || -> Vec<(i64, Option<i64>)> {
+        let built = rig.screens.screen_clocks.lock().unwrap().clone();
+        let measured = measured.lock().unwrap().clone();
+        built
+            .iter()
+            .filter_map(|&(_, screen, now)| {
+                let m = measured.iter().find(|&&(n, _)| n == now)?;
+                Some((screen, m.1))
+            })
+            .collect()
+    };
+    assert!(wait_until(|| pairs().len() >= 3), "{:?}", pairs());
+    for (screen, sidecar) in pairs() {
         assert_eq!(sidecar, Some(screen));
     }
     rig.exit();
