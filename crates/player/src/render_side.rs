@@ -427,6 +427,12 @@ pub trait Screen: Send {
     fn take_upload_timing(&mut self) -> Option<render::UploadTiming> {
         None
     }
+    /// The adapter it draws on (dev-tools: a scenario's sidecars); none by
+    /// default.
+    #[cfg(feature = "dev-tools")]
+    fn adapter(&self) -> Option<&render::AdapterInfo> {
+        None
+    }
     /// The strip's lines drawn (dev-tools tests); none by default.
     #[cfg(all(test, feature = "dev-tools"))]
     fn result_strip(&self) -> usize {
@@ -4967,6 +4973,8 @@ impl Run {
             let mut view_stamp = None;
             #[cfg(feature = "dev-tools")]
             let mut loading_stamp = None;
+            #[cfg(feature = "dev-tools")]
+            let mut screen_stamp = None;
             // The frame's one instant: a play frame's chart time and the
             // turntable's state time and tick are all of it.
             let frame_at = self.clock.now();
@@ -5091,6 +5099,10 @@ impl Run {
                     let now = TimeUs(frame_at.0 - origin.0);
                     let state_us = frame_at.0 - state_origin.0;
                     let screen_us = frame_at.0 - screen_origin.0;
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        screen_stamp = Some(screen_us);
+                    }
                     // The adjustments change anytime and move the notes
                     // only: one snapshot per frame gives the lanes, the
                     // readouts and the display offset together, and nothing
@@ -5540,6 +5552,8 @@ impl Run {
                         view: view_stamp,
                         #[cfg(feature = "dev-tools")]
                         loading_stamp,
+                        #[cfg(feature = "dev-tools")]
+                        screen_us: screen_stamp,
                         // The measured play's: none once its figures are
                         // taken, so no frame after a `Finish` is its.
                         #[cfg(feature = "dev-tools")]
