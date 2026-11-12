@@ -17,9 +17,9 @@ use skin_model::{
 
 use super::{RenderError, Renderer};
 use crate::decision_labels::{
-    DECISION_TEXT_WRITE_BUDGET, FillStep, Gen, LabelBook, LabelJob, LabelKey, LabelScratch,
-    LabelState, LabelStep, LabelStore, LabelWorker, Settled, StagedLabels, lock,
-    stage_bundle_labels, stage_labels,
+    CoolFrom, DECISION_TEXT_WRITE_BUDGET, FillStep, Gen, LABEL_SLOTS, LabelBook, LabelJob,
+    LabelKey, LabelScratch, LabelState, LabelStep, LabelStore, LabelWorker, Settled, StagedLabels,
+    WorkerHooks, lock, stage_bundle_labels, stage_labels,
 };
 use crate::decl::AttemptText;
 use crate::font_support::{self, Glyph};
@@ -51,11 +51,7 @@ fn truetype_skin() -> tempfile::TempDir {
 
 /// The renderer with `dir`'s decision skin committed.
 fn installed(dir: &tempfile::TempDir) -> (Renderer, Arc<SkinBundle>) {
-    let mut r = offscreen(TARGET[0], TARGET[1]);
-    let b = decision_bundle_in(&r, dir.path(), &default_font());
-    let token = r.install(ScreenKind::Decision, &b, 1).unwrap();
-    r.commit(token).unwrap();
-    (r, b)
+    installed_at(dir, TARGET)
 }
 
 fn strings(title: &str, artist: &str) -> DecisionStrings {
@@ -82,12 +78,13 @@ fn job(r: &Renderer, generation: u64, chart: &str, title: &str) -> LabelJob {
 
 /// `chart`'s job at `generation`, showing `strings`.
 fn job_of(r: &Renderer, generation: u64, chart: &str, strings: DecisionStrings) -> LabelJob {
-    LabelJob {
+    LabelJob::new(
         generation,
-        key: key(chart),
+        PathBuf::from(chart),
+        1,
         strings,
-        plan: Arc::new(r.decision_rows().unwrap().unwrap()),
-    }
+        Arc::new(r.decision_rows().unwrap().unwrap()),
+    )
 }
 
 /// `job` staged on this thread, as the worker stages it.
@@ -127,7 +124,7 @@ fn finish(r: &Renderer) {
 
 /// `job` staged, claimed, written and settled: published.
 fn publish(r: &mut Renderer, b: &SkinBundle, store: &mut LabelStore, job: LabelJob) -> usize {
-    let generation = job.generation;
+    let generation = job.generation();
     store.offer(stage(b, job));
     let slot = store.claim().unwrap();
     fill(r, store);
@@ -175,7 +172,8 @@ fn decision_labels_live_in_the_decision_region() {
     let mut store = store_for();
     let mut drawn = Vec::new();
     for (generation, chart) in [(1, "a"), (2, "b")] {
-        worker.post(job(&r, generation, chart, "ABC"));
+        let j = job(&r, generation, chart, "ABC");
+        store.post(&worker, j, &mut || r.watch_completion());
         rx.recv_timeout(Duration::from_secs(60)).unwrap();
         store.offer(worker.take().unwrap().unwrap());
         let slot = store.claim().unwrap();
@@ -724,7 +722,8 @@ fn waker() -> (Arc<dyn Fn() + Send + Sync>, mpsc::Receiver<()>) {
 }
 
 /// An output taken before a newer job was posted is never claimed, offered
-/// after the post or before it; the newer one is.
+/// after the post or before it; the newer one is. A waiting output is
+/// dropped by the post itself, before any claim.
 #[test]
 fn output_taken_before_a_newer_post_never_publishes() {
     let dir = truetype_skin();
@@ -733,21 +732,21 @@ fn output_taken_before_a_newer_post_never_publishes() {
     let worker = LabelWorker::for_bundle(&b, Some(wake)).unwrap();
     let mut store = store_for();
     // Taken, then B posted, then offered.
-    worker.post(job(&r, 1, "a", "AB"));
+    store.post(&worker, job(&r, 1, "a", "AB"), &mut || r.watch_completion());
     rx.recv_timeout(watchdog()).unwrap();
     let a = worker.take().unwrap().unwrap();
     assert!(a.is_current());
-    worker.post(job(&r, 2, "b", "BA"));
+    store.post(&worker, job(&r, 2, "b", "BA"), &mut || r.watch_completion());
     assert!(!a.is_current());
     store.offer(a);
     assert_eq!(store.claim(), None);
     assert_eq!(store.waiting(), None);
-    // Taken and offered, then C posted, then claimed.
+    // Taken and offered, then C posted: the post drops it.
     rx.recv_timeout(watchdog()).unwrap();
     let bo = worker.take().unwrap().unwrap();
     store.offer(bo);
-    worker.post(job(&r, 3, "c", "CA"));
-    assert_eq!(store.claim(), None);
+    store.post(&worker, job(&r, 3, "c", "CA"), &mut || r.watch_completion());
+    assert_eq!(store.waiting(), None, "the post dropped the older output");
     rx.recv_timeout(watchdog()).unwrap();
     store.offer(worker.take().unwrap().unwrap());
     let slot = store.claim().unwrap();
@@ -783,12 +782,16 @@ fn superseded_output_never_overlaps_the_next_staging() {
         Arc::clone(b.skin()),
         b.text_producer().cloned(),
         Some(wake),
-        Some(hook),
+        WorkerHooks {
+            before_store: Some(hook),
+            ..WorkerHooks::default()
+        },
     )
     .unwrap();
-    worker.post(job(&r, 1, "a", "AB"));
+    let mut store = store_for();
+    store.post(&worker, job(&r, 1, "a", "AB"), &mut || r.watch_completion());
     assert_eq!(at_rx.recv_timeout(watchdog()).unwrap(), 1);
-    worker.post(job(&r, 2, "b", "BA"));
+    store.post(&worker, job(&r, 2, "b", "BA"), &mut || r.watch_completion());
     go_tx.send(()).unwrap();
     // The newer job staged and held: no older output beside it.
     assert_eq!(at_rx.recv_timeout(watchdog()).unwrap(), 2);
@@ -852,7 +855,8 @@ fn dropping_a_worker_inside_a_line_returns_at_once() {
     });
     let worker = LabelWorker::spawn(Arc::clone(b.skin()), Some(producer), None).unwrap();
     let reaped = worker.reaped();
-    worker.post(job(&r, 1, "a", "AB"));
+    let mut store = store_for();
+    store.post(&worker, job(&r, 1, "a", "AB"), &mut || r.watch_completion());
     entered_rx.recv_timeout(watchdog()).unwrap();
     let (dropped_tx, dropped_rx) = mpsc::channel();
     let dropper = std::thread::spawn(move || {
@@ -868,4 +872,381 @@ fn dropping_a_worker_inside_a_line_returns_at_once() {
         .wait_timeout_while(m.lock().unwrap(), watchdog(), |j| !*j)
         .unwrap();
     assert!(*joined.0, "the thread was joined");
+}
+
+/// A title long enough at em 256 to take more than one boundary.
+const LONG: &str = "ABCDEFGHIJKLMNOPQRST";
+
+/// A decision skin whose title is in a Latin face at em 256.
+fn long_skin() -> tempfile::TempDir {
+    decision_folder(
+        &[("ttf.ttf", font_support::build(&font_support::latin("Skin")))],
+        &[ttf()],
+        &[text("f", 256, Value::Ref(10), [0, 100, 1_900, 256])],
+    )
+}
+
+/// A producer that notes whether any slot of `book` was filling while it
+/// laid out a line.
+#[derive(Debug)]
+struct Observing {
+    inner: Arc<dyn AttemptText>,
+    book: Arc<Mutex<LabelBook>>,
+    filling_seen: AtomicBool,
+}
+
+impl AttemptText for Observing {
+    fn layout(&self, req: &TextRequest, em_px: f32, bounds: LineBounds) -> LineFit {
+        let book = lock(&self.book);
+        if (0..LABEL_SLOTS).any(|i| matches!(book.state(i), Some(LabelState::Filling { .. }))) {
+            self.filling_seen.store(true, Ordering::Release);
+        }
+        drop(book);
+        self.inner.layout(req, em_px, bounds)
+    }
+
+    fn raster(&self, layout: &LineLayout, out: &mut [u8]) -> Result<(), SkinError> {
+        self.inner.raster(layout, out)
+    }
+
+    fn resident(&self) -> TextResidency {
+        self.inner.resident()
+    }
+}
+
+/// A claims a slot and writes part of its rows; B is posted. The post
+/// disposes of A before B's staging can exist: A's remaining levels are
+/// freed and its slot cancelled, and B's lines are laid out with no slot
+/// filling. A never publishes; B does, in the other slot.
+#[test]
+fn post_after_claim_disposes_the_older_fill() {
+    let dir = long_skin();
+    let (mut r, b) = installed(&dir);
+    let book = LabelBook::shared(TARGET);
+    let producer = Arc::new(Observing {
+        inner: Arc::clone(b.text_producer().unwrap()),
+        book: Arc::clone(&book),
+        filling_seen: AtomicBool::new(false),
+    });
+    let (wake, rx) = waker();
+    let worker = LabelWorker::spawn(
+        Arc::clone(b.skin()),
+        Some(Arc::clone(&producer) as Arc<dyn AttemptText>),
+        Some(wake),
+    )
+    .unwrap();
+    let mut store = LabelStore::new(book);
+    store.post(&worker, job(&r, 1, "a", LONG), &mut || r.watch_completion());
+    rx.recv_timeout(watchdog()).unwrap();
+    store.offer(worker.take().unwrap().unwrap());
+    let a = store.claim().unwrap();
+    assert_eq!(r.write_decision_labels(&mut store), FillStep::Wrote);
+    assert!(store.memory(None).staged > 0);
+    store.post(&worker, job(&r, 2, "b", LONG), &mut || r.watch_completion());
+    assert_eq!(store.filling(), None, "A's fill disposed in the post");
+    assert_eq!(store.memory(None).staged, 0, "A's levels freed");
+    assert!(matches!(
+        lock(store.book()).state(a),
+        Some(LabelState::Cooling {
+            from: CoolFrom::Cancelled,
+            ..
+        })
+    ));
+    rx.recv_timeout(watchdog()).unwrap();
+    assert!(
+        !producer.filling_seen.load(Ordering::Acquire),
+        "B was laid out beside A's fill"
+    );
+    store.offer(worker.take().unwrap().unwrap());
+    let other = store.claim().unwrap();
+    assert_ne!(other, a);
+    fill(&mut r, &mut store);
+    finish(&r);
+    assert_eq!(
+        r.settle_decision_labels(&mut store).unwrap(),
+        Settled::Published {
+            slot: other,
+            generation: 2
+        }
+    );
+    assert!(matches!(
+        lock(store.book()).state(a),
+        Some(LabelState::Free)
+    ));
+    assert!(store.content(a, 1).is_none());
+    assert!(!lock(store.book()).holds(&key("a")));
+}
+
+/// A fill whose writes completed, then a newer post that never reached
+/// the store: settling it publishes nothing, since publication is fenced
+/// by the newest post.
+#[test]
+fn older_post_never_publishes_its_fill() {
+    let dir = truetype_skin();
+    let (mut r, b) = installed(&dir);
+    let (wake, rx) = waker();
+    let worker = LabelWorker::for_bundle(&b, Some(wake)).unwrap();
+    let mut store = store_for();
+    store.post(&worker, job(&r, 1, "a", "AB"), &mut || r.watch_completion());
+    rx.recv_timeout(watchdog()).unwrap();
+    store.offer(worker.take().unwrap().unwrap());
+    let slot = store.claim().unwrap();
+    fill(&mut r, &mut store);
+    assert!(store.steps.contains(&LabelStep::Submitted));
+    worker.post_unreconciled(job(&r, 2, "b", "BA"));
+    finish(&r);
+    assert_eq!(
+        r.settle_decision_labels(&mut store).unwrap(),
+        Settled::Pending
+    );
+    assert!(!store.steps.contains(&LabelStep::Published));
+    assert!(!matches!(
+        lock(store.book()).state(slot),
+        Some(LabelState::Ready { .. })
+    ));
+    assert!(store.content(slot, 1).is_none());
+    assert_eq!(store.filling(), None);
+}
+
+/// A producer that refuses every line it rasterizes.
+#[derive(Debug)]
+struct Refusing(Arc<dyn AttemptText>);
+
+impl AttemptText for Refusing {
+    fn layout(&self, req: &TextRequest, em_px: f32, bounds: LineBounds) -> LineFit {
+        self.0.layout(req, em_px, bounds)
+    }
+
+    fn raster(&self, _: &LineLayout, _: &mut [u8]) -> Result<(), SkinError> {
+        Err(SkinError {
+            reason: "refused".to_owned(),
+        })
+    }
+
+    fn resident(&self) -> TextResidency {
+        self.0.resident()
+    }
+}
+
+/// A refusal queued by the worker is never taken after a cancel or a
+/// newer post: the request that returned to a key already held, or moved
+/// on, never sees an older job's error.
+#[test]
+fn obsolete_refusal_never_taken_after_a_newer_post() {
+    let dir = truetype_skin();
+    let (r, b) = installed(&dir);
+    let (wake, rx) = waker();
+    let producer = Arc::new(Refusing(Arc::clone(b.text_producer().unwrap())));
+    let worker = LabelWorker::spawn(Arc::clone(b.skin()), Some(producer), Some(wake)).unwrap();
+    let mut store = store_for();
+    store.post(&worker, job(&r, 1, "a", "AB"), &mut || r.watch_completion());
+    rx.recv_timeout(watchdog()).unwrap();
+    assert_eq!(worker.output_generation(), Some(1), "A's refusal queued");
+    store.cancel(&worker, &mut || r.watch_completion());
+    assert!(
+        worker.take().is_none(),
+        "A's refusal taken after the cancel"
+    );
+    store.post(&worker, job(&r, 2, "b", "BA"), &mut || r.watch_completion());
+    rx.recv_timeout(watchdog()).unwrap();
+    assert_eq!(worker.output_generation(), Some(2));
+    store.post(&worker, job(&r, 3, "c", "CA"), &mut || r.watch_completion());
+    if let Some(out) = worker.take() {
+        assert!(
+            matches!(out, Err((3, _))),
+            "{:?}",
+            out.map(|s| s.generation())
+        );
+    } else {
+        rx.recv_timeout(watchdog()).unwrap();
+        assert!(matches!(worker.take(), Some(Err((3, _)))));
+    }
+}
+
+/// Generation zero cancelled, after its output was taken and while its
+/// job is in a line: the taken output is stale and never claimed, and
+/// the job's output is never stored. No generation aliases a cancel.
+#[test]
+fn generation_zero_cancel_supersedes() {
+    let dir = truetype_skin();
+    let (r, b) = installed(&dir);
+    // After the take.
+    let (wake, rx) = waker();
+    let worker = LabelWorker::for_bundle(&b, Some(wake)).unwrap();
+    let mut store = store_for();
+    store.post(&worker, job(&r, 0, "a", "AB"), &mut || r.watch_completion());
+    rx.recv_timeout(watchdog()).unwrap();
+    let a = worker.take().unwrap().unwrap();
+    assert!(a.is_current());
+    store.cancel(&worker, &mut || r.watch_completion());
+    assert!(!a.is_current());
+    store.offer(a);
+    assert_eq!(store.claim(), None);
+    // During the work.
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let producer = Arc::new(Gated {
+        inner: Arc::clone(b.text_producer().unwrap()),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    let (done_tx, done_rx) = mpsc::channel();
+    let done = Mutex::new(done_tx);
+    let after: Arc<dyn Fn(Gen, bool) + Send + Sync> = Arc::new(move |g, stored| {
+        let _ = done
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .send((g, stored));
+    });
+    let worker = LabelWorker::spawn_hooked(
+        Arc::clone(b.skin()),
+        Some(producer),
+        None,
+        WorkerHooks {
+            after_job: Some(after),
+            ..WorkerHooks::default()
+        },
+    )
+    .unwrap();
+    store.post(&worker, job(&r, 0, "a", "AB"), &mut || r.watch_completion());
+    entered_rx.recv_timeout(watchdog()).unwrap();
+    store.cancel(&worker, &mut || r.watch_completion());
+    release_tx.send(()).unwrap();
+    assert_eq!(done_rx.recv_timeout(watchdog()).unwrap(), (0, false));
+    assert!(worker.take().is_none());
+}
+
+/// The renderer with `dir`'s decision skin committed, at `target`.
+fn installed_at(dir: &tempfile::TempDir, target: [u32; 2]) -> (Renderer, Arc<SkinBundle>) {
+    let mut r = offscreen(target[0], target[1]);
+    let b = decision_bundle_in(&r, dir.path(), &default_font());
+    let token = r.install(ScreenKind::Decision, &b, 1).unwrap();
+    r.commit(token).unwrap();
+    (r, b)
+}
+
+/// Pinned at T, built again and restored at U, then back at T: the pin's
+/// key names U, the target its lines were rasterized at (slot, generation
+/// and lifetime kept), so nothing holds T's key and its retire never makes
+/// it ready for T.
+#[test]
+fn restore_at_another_target_keys_that_target() {
+    const U: [u32; 2] = [1_280, 720];
+    let dir = truetype_skin();
+    let (mut r, b) = installed(&dir);
+    let mut store = store_for();
+    let first = job(&r, 1, "a", "ABC");
+    let slot = publish(&mut r, &b, &mut store, first);
+    lock(store.book())
+        .pin(std::path::Path::new("a"), 1, 7)
+        .unwrap();
+    drop(r);
+    let (mut r2, b2) = installed_at(&dir, U);
+    store.reset();
+    {
+        let mut book = lock(store.book());
+        book.reset();
+        book.invalidate(U);
+    }
+    let strings = store.restore_strings(slot, 1).unwrap().clone();
+    let plan = r2.decision_rows().unwrap().unwrap();
+    assert_eq!(plan.target(), U);
+    let staged = stage_bundle_labels(
+        &b2,
+        LabelJob::new(1, PathBuf::from("a"), 1, strings, Arc::new(plan)),
+    )
+    .unwrap()
+    .unwrap();
+    assert!(
+        r2.restore_decision_labels(&mut store, slot, staged)
+            .unwrap()
+    );
+    let mut book = lock(store.book());
+    assert!(
+        matches!(
+            book.state(slot),
+            Some(LabelState::Pinned {
+                generation: 1,
+                lifetime: 7,
+                restoring: false,
+                key,
+                ..
+            }) if key.target == U
+        ),
+        "{:?}",
+        book.state(slot)
+    );
+    book.invalidate(TARGET);
+    assert!(!book.holds(&key("a")), "T's labels are prepared afresh");
+    book.end(7);
+    book.retire_ended(&mut || Arc::new(AtomicBool::new(true)));
+    book.cool();
+    assert!(matches!(book.state(slot), Some(LabelState::Free)));
+    assert_eq!(book.pin(std::path::Path::new("a"), 1, 8), None);
+}
+
+/// Pins `chart` at generation 1 under lifetime 7, ends it and retires it
+/// with its last frame's completion already seen (the test's own flag,
+/// set).
+fn retire_seen(store: &LabelStore, chart: &str) {
+    let mut book = lock(store.book());
+    book.pin(std::path::Path::new(chart), 1, 7).unwrap();
+    book.end(7);
+    book.retire_ended(&mut || Arc::new(AtomicBool::new(true)));
+}
+
+/// The device lost while a retired slot cools and nothing fills: the
+/// settle reports the loss, the book is unhealthy, and the slot is not
+/// made ready.
+#[test]
+fn device_lost_while_cooling_with_no_fill_promotes_nothing() {
+    let dir = truetype_skin();
+    let (mut r, b) = installed(&dir);
+    let mut store = store_for();
+    let first = job(&r, 1, "a", "AB");
+    let slot = publish(&mut r, &b, &mut store, first);
+    retire_seen(&store, "a");
+    r.gpu.device().destroy();
+    finish(&r);
+    let e = r.settle_decision_labels(&mut store).unwrap_err();
+    assert!(matches!(e, RenderError::DeviceLost), "{e:?}");
+    assert!(!e.is_refusal());
+    let book = lock(store.book());
+    assert!(!book.healthy());
+    assert!(
+        matches!(book.state(slot), Some(LabelState::Cooling { .. })),
+        "{:?}",
+        book.state(slot)
+    );
+}
+
+/// The device lost while a retired slot cools and another fill has
+/// written only part of its rows: the loss is reported, the book is
+/// unhealthy, the retired slot is not made ready and the fill is dropped.
+#[test]
+fn device_lost_during_an_incomplete_fill_promotes_nothing() {
+    let dir = long_skin();
+    let (mut r, b) = installed(&dir);
+    let mut store = store_for();
+    let first = job(&r, 1, "a", LONG);
+    let pinned = publish(&mut r, &b, &mut store, first);
+    retire_seen(&store, "a");
+    store.offer(stage(&b, job(&r, 2, "b", LONG)));
+    let slot = store.claim().unwrap();
+    assert_ne!(slot, pinned);
+    assert_eq!(r.write_decision_labels(&mut store), FillStep::Wrote);
+    r.gpu.device().destroy();
+    finish(&r);
+    let e = r.settle_decision_labels(&mut store).unwrap_err();
+    assert!(matches!(e, RenderError::DeviceLost), "{e:?}");
+    let book = lock(store.book());
+    assert!(!book.healthy());
+    assert!(
+        matches!(book.state(pinned), Some(LabelState::Cooling { .. })),
+        "{:?}",
+        book.state(pinned)
+    );
+    assert!(!matches!(book.state(slot), Some(LabelState::Ready { .. })));
+    drop(book);
+    assert_eq!(store.filling(), None);
 }
