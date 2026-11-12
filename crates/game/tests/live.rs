@@ -1265,8 +1265,8 @@ fn a_screen_failure_on_the_end_screen_is_rebuilt_and_shown_again() {
     let dir = tempfile::tempdir().unwrap();
     let mut loaded = loaded(dir.path());
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[], 10_600_000);
-    rig.screen_fails_at = 10_400_000;
+    let mut rig = Fake::new(items, &[], 15_600_000);
+    rig.screen_fails_at = 15_400_000;
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
     assert_eq!(rig.reports[0].end, PlayEnd::Completed);
     assert_eq!(rig.reports[0].tail_cut, None);
@@ -1883,8 +1883,8 @@ fn an_input_failure_on_the_end_screen_ends_the_run_at_the_retry() {
     let dir = tempfile::tempdir().unwrap();
     let mut loaded = loaded(dir.path());
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[(10_600_000, Command::Retry)], i64::MAX);
-    rig.input_fails_at = 10_400_000;
+    let mut rig = Fake::new(items, &[(15_600_000, Command::Retry)], i64::MAX);
+    rig.input_fails_at = 15_400_000;
     let ran = game::live::run_chart(&mut loaded, &mut rig);
     assert!(
         matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
@@ -1911,10 +1911,10 @@ fn a_retry_with_a_failed_input_thread_and_screen_ends_with_the_input_cause() {
         let dir = tempfile::tempdir().unwrap();
         let mut loaded = loaded(dir.path());
         let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-        let mut rig = Fake::new(items, &[(10_600_000, Command::Retry)], i64::MAX);
+        let mut rig = Fake::new(items, &[(15_600_000, Command::Retry)], i64::MAX);
         rig.timing = t;
-        rig.input_fails_at = 10_400_000;
-        rig.screen_fails_at = 10_600_000;
+        rig.input_fails_at = 15_400_000;
+        rig.screen_fails_at = 15_600_000;
         rig.prepare_fails_from = 2;
         let ran = game::live::run_chart(&mut loaded, &mut rig);
         assert!(
@@ -1980,8 +1980,8 @@ fn changed_user_preset_reloads_within_a_poll() {
     let path = write_user_preset(dir.path(), &rules::tapestry());
     let mut loaded = loaded_with(dir.path(), "mine");
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[], 12_000_000);
-    let changed = 11_000_000;
+    let mut rig = Fake::new(items, &[], 17_000_000);
+    let changed = 16_000_000;
     let edit = path.clone();
     rig.at.push((
         changed,
@@ -2037,15 +2037,15 @@ fn failed_reload_keeps_the_previous_preset() {
     let path = write_user_preset(dir.path(), &rules::tapestry());
     let mut loaded = loaded_with(dir.path(), "mine");
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[(11_500_000, Command::Retry)], 15_000_000);
+    let mut rig = Fake::new(items, &[(16_500_000, Command::Retry)], 20_000_000);
     let edit = path.clone();
     rig.at.push((
-        11_000_000,
+        16_000_000,
         Box::new(move || common::rewrite(&edit, "windows = [")),
     ));
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
 
-    let failed = shown(&rig, 11_400_000);
+    let failed = shown(&rig, 16_400_000);
     let e = failed.file_error().unwrap().clone();
     assert_eq!(e.path, path);
     assert!(
@@ -2091,11 +2091,11 @@ fn result_screen_shows_reload_and_error() {
     let path = write_user_preset(dir.path(), &rules::tapestry());
     let mut loaded = loaded_with(dir.path(), "mine");
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[], 13_000_000);
+    let mut rig = Fake::new(items, &[], 18_000_000);
     for (at, text) in [
-        (11_000_000, Some(game::preset_to_toml(&flat_normal()))),
-        (11_500_000, None),
-        (12_000_000, Some(game::preset_to_toml(&flat_normal()))),
+        (16_000_000, Some(game::preset_to_toml(&flat_normal()))),
+        (16_500_000, None),
+        (17_000_000, Some(game::preset_to_toml(&flat_normal()))),
     ] {
         let edit = path.clone();
         rig.at.push((
@@ -2106,7 +2106,7 @@ fn result_screen_shows_reload_and_error() {
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
 
     let new_hash = Some(replay::preset_hash(&mine(flat_normal())));
-    let reloaded = shown(&rig, 11_400_000);
+    let reloaded = shown(&rig, 16_400_000);
     assert_eq!(viewed(reloaded), user("mine"));
     assert_eq!(reloaded.viewed().unwrap().hash, new_hash);
     assert!(!ready(reloaded).as_played);
@@ -2118,13 +2118,13 @@ fn result_screen_shows_reload_and_error() {
             Notice::NextPlayUsesIt("mine".to_owned())
         ]
     );
-    let failed = shown(&rig, 11_900_000);
+    let failed = shown(&rig, 16_900_000);
     let e = failed.file_error().unwrap().clone();
     assert_eq!(e.path, path);
     assert_eq!(viewed(failed), user("mine"));
     assert_eq!(ready(failed), ready(reloaded));
     assert_eq!(failed.notices().last(), Some(&Notice::Failed(e)));
-    let recovered = shown(&rig, 12_900_000);
+    let recovered = shown(&rig, 17_900_000);
     assert_eq!(recovered.file_error(), None);
     assert!(
         !recovered.notices().any(|n| matches!(n, Notice::Failed(_))),
@@ -2206,15 +2206,15 @@ fn result_switches_presets_and_labels_what_if() {
     write_named(dir.path(), "narrow", &narrow());
     let mut loaded = loaded(dir.path());
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[(13_000_000, Command::Retry)], 16_000_000);
+    let mut rig = Fake::new(items, &[(18_000_000, Command::Retry)], 21_000_000);
     rig.menu = vec![
-        (11_000_000, NextPreset),
-        (11_100_000, NextPreset),
-        (11_200_000, NextPreset),
-        (11_300_000, PrevPreset),
-        (11_400_000, NextPreset),
-        (11_500_000, NextPreset),
-        (11_600_000, NextPreset),
+        (16_000_000, NextPreset),
+        (16_100_000, NextPreset),
+        (16_200_000, NextPreset),
+        (16_300_000, PrevPreset),
+        (16_400_000, NextPreset),
+        (16_500_000, NextPreset),
+        (16_600_000, NextPreset),
     ];
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
     // Preset steps are no leaving command: the run's end leaves no
@@ -2229,7 +2229,7 @@ fn result_switches_presets_and_labels_what_if() {
     );
 
     let names = |s: &ResultScreen| s.entries().iter().map(|e| e.id.clone()).collect::<Vec<_>>();
-    let first = shown(&rig, 10_999_000);
+    let first = shown(&rig, 15_999_000);
     let built_in = |n: &str| EntryId::BuiltIn(n.to_owned());
     assert_eq!(
         names(first),
@@ -2248,7 +2248,7 @@ fn result_switches_presets_and_labels_what_if() {
     assert_eq!(own.tally, played.tally);
     assert_eq!(own.coverage, replay::verify::Coverage::Recorded);
     let path: Vec<EntryId> = [
-        11_050_000, 11_150_000, 11_250_000, 11_350_000, 11_450_000, 11_550_000, 11_650_000,
+        16_050_000, 16_150_000, 16_250_000, 16_350_000, 16_450_000, 16_550_000, 16_650_000,
     ]
     .iter()
     .map(|&t| viewed(shown(&rig, t)))
@@ -2266,7 +2266,7 @@ fn result_switches_presets_and_labels_what_if() {
             built_in("tapestry"),
         ]
     );
-    let at_late = ready(shown(&rig, 11_250_000));
+    let at_late = ready(shown(&rig, 16_250_000));
     let finalized = played.record.as_ref().unwrap().status.finalized;
     assert!(!at_late.as_played);
     assert_eq!(
@@ -2275,7 +2275,7 @@ fn result_switches_presets_and_labels_what_if() {
     );
     assert!(at_late.gauges[0].unwrap().cleared);
     // `late` was evaluated once, the second visit came from the cache.
-    let last = shown(&rig, 12_000_000);
+    let last = shown(&rig, 17_000_000);
     assert_eq!(last.evaluations(), 4);
     assert_eq!(loaded.preset(), &rules::tapestry());
     assert_eq!(rig.reports[1].preset, rules::tapestry());
@@ -2283,10 +2283,10 @@ fn result_switches_presets_and_labels_what_if() {
     // From the first entry, Prev wraps to the last.
     let mut loaded = loaded_with(dir.path(), "tapestry");
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[], 12_000_000);
-    rig.menu = vec![(11_000_000, PrevPreset)];
+    let mut rig = Fake::new(items, &[], 17_000_000);
+    rig.menu = vec![(16_000_000, PrevPreset)];
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
-    assert_eq!(viewed(shown(&rig, 11_500_000)), user("narrow"));
+    assert_eq!(viewed(shown(&rig, 16_500_000)), user("narrow"));
 
     // Aborted by focus loss at play time 1.65 s: after `narrow`'s final
     // deadline (1.61 s), before the tapestry preset's (1.68 s).
@@ -2342,10 +2342,10 @@ fn edited_preset_reevaluates_on_the_result_screen() {
     let path = write_user_preset(dir.path(), &rules::tapestry());
     let mut loaded = loaded(dir.path());
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[], 12_000_000);
+    let mut rig = Fake::new(items, &[], 17_000_000);
     // tapestry, beatoraja-style, lr2-style, mine.
-    rig.menu = vec![(10_900_000, game::MenuCommand::PrevPreset)];
-    let changed = 11_000_000;
+    rig.menu = vec![(15_900_000, game::MenuCommand::PrevPreset)];
+    let changed = 16_000_000;
     let edit = path.clone();
     rig.at.push((
         changed,
@@ -2393,7 +2393,7 @@ fn result_poll_runs_at_its_deadline_after_an_early_wake() {
     let path = write_user_preset(dir.path(), &rules::tapestry());
     let mut loaded = loaded_with(dir.path(), "mine");
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[], 12_000_000);
+    let mut rig = Fake::new(items, &[], 17_000_000);
     rig.idle_to_deadline = true;
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
     // The first poll checks at the result's first wake; each wait after
@@ -2409,7 +2409,7 @@ fn result_poll_runs_at_its_deadline_after_an_early_wake() {
     // Again, with an edit landing at the deadline and a wake 1 µs before it.
     let mut loaded = loaded_with(dir.path(), "mine");
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[], 12_000_000);
+    let mut rig = Fake::new(items, &[], 17_000_000);
     rig.idle_to_deadline = true;
     let edit = path.clone();
     rig.at.push((
@@ -2442,7 +2442,7 @@ fn plays_use_reloads_from_the_next_play() {
     let path = write_user_preset(dir.path(), &rules::tapestry());
     let mut loaded = loaded_with(dir.path(), "mine");
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[(11_500_000, Command::Retry)], 15_000_000);
+    let mut rig = Fake::new(items, &[(16_500_000, Command::Retry)], 20_000_000);
     // Between the press and the second note, mid-play.
     let edit = path.clone();
     rig.at.push((
@@ -2477,7 +2477,7 @@ fn plays_use_reloads_from_the_next_play() {
 fn played(dir: &Path, preset: &str) -> (Loaded, PlayReport) {
     let mut loaded = loaded_with(dir, preset);
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[], 11_000_000);
+    let mut rig = Fake::new(items, &[], 16_000_000);
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
     let report = rig.reports.pop().unwrap();
     (loaded, report)
@@ -2900,14 +2900,16 @@ enum Event {
 type Went = (PlayEnd, Option<AbortCause>, bool, usize, usize, game::Leave);
 
 /// `event` at clock time `at` in a play that opens at 7.3 s (origin 8.3
-/// s), completes at 9.983 s and has a 2 s audio tail; the quit key at 15 s
-/// leaves a result shown by then, and the window closes at 16 s.
+/// s), completes at 9.983 s and has a 2 s audio tail; a full play holds 5 s
+/// past its last note's end (design.md "Play Lifecycle", Audio tail), so
+/// the quit key at 20 s leaves a result shown by then, and the window
+/// closes at 21 s.
 fn went(event: Event, at: i64) -> Went {
     let dir = tempfile::tempdir().unwrap();
     let mut loaded = loaded(dir.path());
     let mut items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut commands = vec![(15_000_000, Command::Quit)];
-    let mut quit_at = 16_000_000;
+    let mut commands = vec![(20_000_000, Command::Quit)];
+    let mut quit_at = 21_000_000;
     match event {
         Event::QuitKey => commands.push((at, Command::Quit)),
         Event::Retry => commands.push((at, Command::Retry)),
@@ -3108,7 +3110,7 @@ impl game::RecordSink for QuitWhileSaving {
 /// to its result: after a completed play's tail ran out it is the skip to
 /// its result, and after a play the quit key ended at 9.5 s, while the
 /// chart played, it is taken with that play; either way the result shows
-/// and stays until the next quit at 11 s, instead of reading that press
+/// and stays until the next quit at 16 s, instead of reading that press
 /// as its back.
 #[test]
 fn a_quit_during_the_save_shows_the_result() {
@@ -3148,7 +3150,7 @@ fn quit_during_the_save(abort: Option<i64>, end: PlayEnd) {
     };
     let mut loaded = Loaded::load(root, settings, &chart_path, config, parts).unwrap();
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut commands = vec![(11_000_000, Command::Quit)];
+    let mut commands = vec![(16_000_000, Command::Quit)];
     commands.extend(abort.map(|at| (at, Command::Quit)));
     let mut rig = Fake::new(items, &commands, i64::MAX);
     rig.pressed = pressed;
@@ -3161,9 +3163,9 @@ fn quit_during_the_save(abort: Option<i64>, end: PlayEnd) {
     assert!(matches!(one.saved, Some(Ok(_))), "{end:?}: {:?}", one.saved);
     assert_eq!(rig.shows, 1, "{end:?}");
     assert!(rig.pressed.lock().unwrap().is_empty(), "{end:?}");
-    // Left by the quit at 11 s, not at once.
+    // Left by the quit at 16 s, not at once.
     assert!(
-        rig.clock.now().0 >= 11_000_000,
+        rig.clock.now().0 >= 16_000_000,
         "{end:?}: {}",
         rig.clock.now().0
     );
@@ -3187,10 +3189,11 @@ impl game::RecordSink for BlockedSave {
 }
 
 /// Where the commands of the ResultPreparing tests arrive, after the
-/// first play's save (its chart ends near 10 s on the clock), and where the
-/// result they show is left.
-const FRESH_AT: i64 = 12_000_000;
-const LEAVE_AT: i64 = 20_000_000;
+/// first play's save (its chart ends near 10 s on the clock, and its tail,
+/// holding 5 s past its last note's end, near 14.8 s), and where the result
+/// they show is left.
+const FRESH_AT: i64 = 17_000_000;
+const LEAVE_AT: i64 = 25_000_000;
 
 /// [`chart`] played on `rig` through [`run_chart`](game::live::run_chart)
 /// with every save blocked: while the first one waits, `during_save` runs
@@ -3263,7 +3266,7 @@ fn withdrawn(rig: &Fake) -> usize {
 /// The quit key, or the result's back, pressed while the save blocks
 /// belongs to the play (design.md "State Model", ResultPreparing): the
 /// save completes, the result's preparation follows, and the result shows
-/// once, its event emitted, until the quit at 20 s leaves it.
+/// once, its event emitted, until the quit at 25 s leaves it.
 #[test]
 fn a_quit_during_a_blocked_save_completes_it_and_shows_the_result() {
     for case in ["quit", "back"] {
@@ -3710,7 +3713,7 @@ fn a_completed_first_play_then_result_retry_opens_once_each() {
     let mut loaded = noting_loaded(dir.path(), &order);
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
     // The retry is taken on play 1's result; the window closes on play 2's.
-    let mut rig = Fake::new(items, &[(10_600_000, Command::Retry)], 15_000_000);
+    let mut rig = Fake::new(items, &[(15_600_000, Command::Retry)], 25_000_000);
     rig.order = std::sync::Arc::clone(&order);
     let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
     assert_eq!(left, game::Leave::Quit);
@@ -3747,7 +3750,7 @@ fn an_immediate_play_retry_uses_the_standard_opening() {
     let order = std::sync::Arc::default();
     let mut loaded = noting_loaded(dir.path(), &order);
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 15_000_000);
+    let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 20_000_000);
     rig.order = std::sync::Arc::clone(&order);
     let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
     assert_eq!(left, game::Leave::Quit);
@@ -3938,8 +3941,8 @@ fn a_retry_prepares_with_the_refreshed_play_preset_not_the_viewed_one() {
     let path = write_user_preset(dir.path(), &rules::tapestry());
     let mut loaded = loaded_with(dir.path(), "mine");
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[(11_500_000, Command::Retry)], 15_000_000);
-    rig.menu = vec![(10_500_000, game::MenuCommand::NextPreset)];
+    let mut rig = Fake::new(items, &[(16_500_000, Command::Retry)], 20_000_000);
+    rig.menu = vec![(15_500_000, game::MenuCommand::NextPreset)];
     let mut edited = rules::tapestry();
     edited.gauges.reverse();
     for g in &mut edited.gauges {
@@ -3947,10 +3950,10 @@ fn a_retry_prepares_with_the_refreshed_play_preset_not_the_viewed_one() {
     }
     let to = edited.clone();
     rig.at
-        .push((11_000_000, Box::new(move || rewrite_preset(&path, &to))));
+        .push((16_000_000, Box::new(move || rewrite_preset(&path, &to))));
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
     // The result viewed another preset when the retry was taken.
-    assert_ne!(viewed(shown(&rig, 11_400_000)), user("mine"));
+    assert_ne!(viewed(shown(&rig, 16_400_000)), user("mine"));
     let [one, two, ..] = &rig.attempts[..] else {
         panic!("{:?}", rig.attempts.len());
     };
@@ -5321,6 +5324,54 @@ fn closing_time_and_deadline_saturate() {
     );
 }
 
+/// A full play's hold deadline is its anchor plus 5 s and the skin's
+/// finish margin, without the margin when the fadeout is negative, and
+/// saturates at the end of the clock.
+#[test]
+fn hold_until_adds_the_margins_saturating() {
+    let ending = game::PlayEnding {
+        finish_margin: TimeUs(3_000_000),
+        fadeout: TimeUs(1_000_000),
+    };
+    assert_eq!(game::FINISH_MARGIN, TimeUs(5_000_000));
+    assert_eq!(
+        game::hold_until(TimeUs(1_234_567), ending),
+        TimeUs(9_234_567)
+    );
+    let negative = game::PlayEnding {
+        fadeout: TimeUs(-1_000),
+        ..ending
+    };
+    assert_eq!(
+        game::hold_until(TimeUs(1_234_567), negative),
+        TimeUs(6_234_567)
+    );
+    assert_eq!(
+        game::hold_until(TimeUs(1_234_567), game::PlayEnding::NONE),
+        TimeUs(6_234_567)
+    );
+    assert_eq!(
+        game::hold_until(TimeUs(i64::MAX - 1), ending),
+        TimeUs(i64::MAX)
+    );
+}
+
+/// A fade-out lasts the declared fadeout from its start, saturating; a
+/// fadeout of 0 or less has none.
+#[test]
+fn fade_deadline_is_none_without_a_positive_fadeout() {
+    assert_eq!(
+        game::fade_deadline(TimeUs(8_000_000), TimeUs(1_000_000)),
+        Some(TimeUs(9_000_000))
+    );
+    assert_eq!(game::fade_deadline(TimeUs(8_000_000), TimeUs(0)), None);
+    assert_eq!(game::fade_deadline(TimeUs(8_000_000), TimeUs(-1_000)), None);
+    assert_eq!(
+        game::fade_deadline(TimeUs(i64::MAX - 1), TimeUs(1_000_000)),
+        Some(TimeUs(i64::MAX))
+    );
+}
+
 /// A quit at the chart's start before any advance, READY having no
 /// lead-in: Closing still runs and its result shows, and with nothing
 /// finalized no record is made or saved.
@@ -5565,16 +5616,16 @@ fn each_view_compares_with_its_presets_best_before_the_play() {
     ];
     let (mut loaded, asked) = loaded_with_bests(dir.path(), chart(), Some(count), answers);
     let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
-    let mut rig = Fake::new(items, &[(13_000_000, Command::Retry)], 16_000_000);
+    let mut rig = Fake::new(items, &[(18_000_000, Command::Retry)], 21_000_000);
     rig.menu = vec![
-        (11_000_000, NextPreset),
-        (11_100_000, NextPreset),
-        (11_200_000, PrevPreset),
-        (11_300_000, NextPreset),
-        (11_400_000, NextPreset),
+        (16_000_000, NextPreset),
+        (16_100_000, NextPreset),
+        (16_200_000, PrevPreset),
+        (16_300_000, NextPreset),
+        (16_400_000, NextPreset),
     ];
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
-    let own = ready(shown(&rig, 10_999_000));
+    let own = ready(shown(&rig, 15_999_000));
     let (ex, bp) = (own.tally.ex_score, own.tally.bp);
     // Two notes at the tapestry preset's largest weight.
     assert_eq!((own.figures.notes, own.figures.max_ex), (2, 4));
@@ -5601,7 +5652,7 @@ fn each_view_compares_with_its_presets_best_before_the_play() {
         })
     };
     assert_eq!(
-        compared(shown(&rig, 10_999_000)),
+        compared(shown(&rig, 15_999_000)),
         Known(BestFigures {
             ex: 1,
             ex_diff: i64::from(ex) - 1,
@@ -5613,10 +5664,10 @@ fn each_view_compares_with_its_presets_best_before_the_play() {
             rate: rate(1),
         })
     );
-    let beatoraja = ready(shown(&rig, 11_050_000));
+    let beatoraja = ready(shown(&rig, 16_050_000));
     let max = beatoraja.figures.max_ex;
     assert_eq!(
-        compared(shown(&rig, 11_050_000)),
+        compared(shown(&rig, 16_050_000)),
         Known(BestFigures {
             ex: 3,
             ex_diff: i64::from(beatoraja.tally.ex_score) - 3,
@@ -5631,8 +5682,8 @@ fn each_view_compares_with_its_presets_best_before_the_play() {
             }),
         })
     );
-    let lr2 = ready(shown(&rig, 11_150_000));
-    let empty = compared(shown(&rig, 11_150_000));
+    let lr2 = ready(shown(&rig, 16_150_000));
+    let empty = compared(shown(&rig, 16_150_000));
     assert_eq!(
         empty,
         Known(BestFigures {
@@ -5653,13 +5704,13 @@ fn each_view_compares_with_its_presets_best_before_the_play() {
     // once, the own never. Each play's begin reads under the play preset:
     // the first play's before any view, the retry's after them.
     assert_eq!(
-        compared(shown(&rig, 11_250_000)),
-        compared(shown(&rig, 11_050_000))
+        compared(shown(&rig, 16_250_000)),
+        compared(shown(&rig, 16_050_000))
     );
-    assert_eq!(compared(shown(&rig, 11_350_000)), empty);
+    assert_eq!(compared(shown(&rig, 16_350_000)), empty);
     assert_eq!(
-        compared(shown(&rig, 11_450_000)),
-        compared(shown(&rig, 10_999_000))
+        compared(shown(&rig, 16_450_000)),
+        compared(shown(&rig, 15_999_000))
     );
     let chart_sha = rig.reports[0]
         .record
@@ -5697,9 +5748,9 @@ fn an_uncounted_play_reads_its_own_best_and_a_random_chart_has_no_best_rate() {
     // Unavailable: nothing answers for the key.
     let dir = tempfile::tempdir().unwrap();
     let (mut loaded, asked) = loaded_with_bests(dir.path(), chart(), not_counted(), Vec::new());
-    let mut rig = Fake::new(items(), &[(11_000_000, Command::Retry)], 12_000_000);
+    let mut rig = Fake::new(items(), &[(16_000_000, Command::Retry)], 17_000_000);
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
-    assert_eq!(compared(shown(&rig, 10_999_000)), BestCompare::Unavailable);
+    assert_eq!(compared(shown(&rig, 15_999_000)), BestCompare::Unavailable);
     // The play's begin read first, then the own view's.
     assert_eq!(asked.lock().unwrap()[1].preset_sha256, tapestry);
     // Known on a `#RANDOM` chart: the differences, no rate.
@@ -5711,10 +5762,10 @@ fn an_uncounted_play_reads_its_own_best_and_a_random_chart_has_no_best_rate() {
         BestLookup::Known(best(1, 5, game::BestLamp::Failed)),
     )];
     let (mut loaded, _) = loaded_with_bests(dir.path(), random, not_counted(), answers);
-    let mut rig = Fake::new(items(), &[(11_000_000, Command::Retry)], 12_000_000);
+    let mut rig = Fake::new(items(), &[(16_000_000, Command::Retry)], 17_000_000);
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
-    let own = ready(shown(&rig, 10_999_000));
-    let BestCompare::Known(b) = compared(shown(&rig, 10_999_000)) else {
+    let own = ready(shown(&rig, 15_999_000));
+    let BestCompare::Known(b) = compared(shown(&rig, 15_999_000)) else {
         panic!("unavailable");
     };
     assert_eq!(b.ex_diff, i64::from(own.tally.ex_score) - 1);
@@ -5730,7 +5781,7 @@ fn an_uncounted_play_reads_its_own_best_and_a_random_chart_has_no_best_rate() {
 fn result_start() -> i64 {
     let dir = tempfile::tempdir().unwrap();
     let mut loaded = loaded(dir.path());
-    let mut rig = outro_rig(None, 12_000_000);
+    let mut rig = outro_rig(None, 17_000_000);
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
     rig.shown_at[0]
 }

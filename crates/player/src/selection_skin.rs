@@ -391,6 +391,14 @@ impl SkinFeed {
         self.seen = None;
     }
 
+    /// The lifetime and revision of the update published last
+    /// (dev-tools: a selection capture is armed with it).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn published(&self) -> (u64, u64) {
+        (self.lifetime, self.revision)
+    }
+
     /// The panels' level as the input thread published it, read at `now`
     /// with the search box's focus (`searching`): the panel START, SELECT
     /// or both open (design.md "Input", Menu input), none while the search

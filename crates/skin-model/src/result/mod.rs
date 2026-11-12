@@ -24,6 +24,7 @@ use self::view::{
     ResultNumber, ResultStatus, ResultView, Timelines, TimingStats,
 };
 use crate::JUDGE_CLASS_MAX;
+use crate::chart_image::{ChartKey, ChartTable};
 use crate::expr::{State, TIMER_OFF};
 use crate::select::value;
 use crate::widget::Starts;
@@ -171,6 +172,11 @@ pub struct ResultScreen {
     /// last prepared the timers for, which that frame's build takes
     /// without refilling them.
     pub(crate) prepared: Option<TimeUs>,
+    /// The chart images its frames draw (−100 and −101), of the array the
+    /// view's staging wrote them into, and the live key of the array its
+    /// frames draw from: they draw only while equal.
+    chart: ChartTable,
+    chart_live: Option<ChartKey>,
 }
 
 /// An empty history, the gauge storage's first contents.
@@ -216,6 +222,39 @@ impl ResultScreen {
             has_deviations: false,
             areas: None,
             prepared: None,
+            chart: ChartTable::ABSENT,
+            chart_live: None,
+        }
+    }
+
+    /// Sets the chart images its frames draw, keyed to the array its
+    /// view's staging wrote them into. Their fields are the attempt's
+    /// resolved availability, set with the view, not this table.
+    /// Allocates nothing.
+    pub fn set_chart_images(&mut self, table: ChartTable) {
+        self.chart = table;
+    }
+
+    /// The chart images set for it.
+    #[must_use]
+    pub fn chart_images(&self) -> &ChartTable {
+        &self.chart
+    }
+
+    /// Sets the live key of the array its next frames draw from: the
+    /// frame's renderer sets it before each build. Allocates nothing.
+    pub fn set_chart_live(&mut self, live: Option<ChartKey>) {
+        self.chart_live = live;
+    }
+
+    /// The chart images its frames draw: the table set for it when it
+    /// describes the live array ([`ChartTable::drawable`]), else none.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn drawable_chart(&self) -> &ChartTable {
+        if self.chart.drawable(self.chart_live) {
+            &self.chart
+        } else {
+            &ChartTable::ABSENT
         }
     }
 
@@ -471,6 +510,8 @@ fn fields(view: &ResultView) -> [i32; field::COUNT] {
         set(field::CHART_JUDGE_CLASS, i32::from(k));
         set(field::CHART_JUDGE_CLASS_VALID, 1);
     }
+    set(field::CHART_STAGEFILE, i32::from(c.images.stage));
+    set(field::CHART_BACKBMP, i32::from(c.images.back));
     if view.status != ResultStatus::Ready {
         return f;
     }

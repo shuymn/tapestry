@@ -81,7 +81,7 @@ fn the_slot_keeps_only_the_newest_of_its_lifetime() {
     let mut p = Presenter::default();
     p.begin(&mut sent, TimeUs(0));
     p.want(snapshot("a"));
-    p.land(&mut sent, Some(&Published::BuiltIn));
+    p.land(&mut sent, Some(&Published::BuiltIn), None);
     p.lines(&mut sent, vec!["n".to_owned()]);
     let mut shown = sent.shown.into_iter();
     let (first, second) = (shown.next().unwrap(), shown.next().unwrap());
@@ -123,16 +123,19 @@ fn a_switch_under_the_same_bundle_publishes_a_new_revision() {
     p.land(
         &mut sent,
         Some(&Published::Skin(Arc::clone(&b), None, None)),
+        None,
     );
     // The same layout landing again publishes nothing.
     p.land(
         &mut sent,
         Some(&Published::Skin(Arc::clone(&b), None, None)),
+        None,
     );
     let k2 = p.want(snapshot("v2"));
     p.land(
         &mut sent,
         Some(&Published::Skin(Arc::clone(&b), None, None)),
+        None,
     );
     let got: Vec<(u64, ViewKey, u64)> = sent
         .shown
@@ -161,7 +164,7 @@ fn a_view_fallback_applies_to_its_own_view_only() {
     let skin = Published::Skin(Arc::clone(&b), None, None);
     p.begin(&mut sent, TimeUs(0));
     let k1 = p.want(snapshot("v1"));
-    p.land(&mut sent, Some(&skin));
+    p.land(&mut sent, Some(&skin), None);
     let k2 = p.want(snapshot("v2"));
     // A stale refusal (of v1, no longer desired): nothing changes.
     let stale = ResultReport {
@@ -169,7 +172,7 @@ fn a_view_fallback_applies_to_its_own_view_only() {
         ..ResultReport::default()
     };
     assert!(!p.status(&stale));
-    p.land(&mut sent, Some(&skin));
+    p.land(&mut sent, Some(&skin), None);
     assert!(sent.shown.last().unwrap().payload.skin.is_some());
     // v2's own refusal: the built-in result for it.
     let own = ResultReport {
@@ -177,7 +180,7 @@ fn a_view_fallback_applies_to_its_own_view_only() {
         ..ResultReport::default()
     };
     assert!(p.status(&own));
-    p.land(&mut sent, Some(&skin));
+    p.land(&mut sent, Some(&skin), None);
     let last = sent.shown.last().unwrap();
     assert_eq!(last.payload.key, k2);
     assert!(last.payload.skin.is_none());
@@ -187,7 +190,7 @@ fn a_view_fallback_applies_to_its_own_view_only() {
     );
     // Another view shows the skin again.
     let k3 = p.want(snapshot("v3"));
-    p.land(&mut sent, Some(&skin));
+    p.land(&mut sent, Some(&skin), None);
     let last = sent.shown.last().unwrap();
     assert_eq!(last.payload.key, k3);
     assert!(last.payload.skin.is_some());
@@ -204,23 +207,23 @@ fn attempt_and_run_fallbacks_show_the_built_in_result() {
     p.attempt_fallback("refused upload".to_owned());
     p.begin(&mut sent, TimeUs(0));
     p.want(snapshot("v1"));
-    p.land(&mut sent, Some(&skin));
+    p.land(&mut sent, Some(&skin), None);
     p.want(snapshot("v2"));
-    p.land(&mut sent, Some(&skin));
+    p.land(&mut sent, Some(&skin), None);
     assert!(sent.shown.iter().all(|s| s.payload.skin.is_none()
         && s.payload.why == Some((Scope::Attempt, "refused upload".to_owned()))));
     p.next_attempt();
     p.end(&mut sent);
     p.begin(&mut sent, TimeUs(0));
     p.want(snapshot("v3"));
-    p.land(&mut sent, Some(&skin));
+    p.land(&mut sent, Some(&skin), None);
     assert!(sent.shown.last().unwrap().payload.skin.is_some());
     let disabled = ResultReport {
         disabled: Some("frame refused".to_owned()),
         ..ResultReport::default()
     };
     assert!(p.status(&disabled));
-    p.land(&mut sent, Some(&skin));
+    p.land(&mut sent, Some(&skin), None);
     let last = sent.shown.last().unwrap();
     assert!(last.payload.skin.is_none());
     assert_eq!(last.payload.why.as_ref().map(|w| w.0), Some(Scope::Run));
@@ -237,10 +240,10 @@ fn the_barrier_keeps_the_view_and_merges_the_overlay() {
     let skin = Published::Skin(bundle(), None, None);
     p.begin(&mut sent, TimeUs(0));
     let k1 = p.want(snapshot("v1"));
-    p.land(&mut sent, Some(&skin));
+    p.land(&mut sent, Some(&skin), None);
     assert_eq!(p.pin(&mut sent, TimeUs(40), None).unwrap().0, Some(k1));
     p.want(snapshot("v2"));
-    p.land(&mut sent, Some(&skin));
+    p.land(&mut sent, Some(&skin), None);
     p.lines(&mut sent, vec!["NOTICE".to_owned()]);
     let after: Vec<_> = sent.shown.iter().skip(1).collect();
     assert_eq!(after.len(), 2, "the pin's overlay and the notice");
@@ -257,6 +260,8 @@ fn the_built_in_page_is_the_views_rows_over_the_newest() {
     let page = |tag: &str| EndPage {
         lines: (0..27).map(|i| format!("{tag}{i}")).collect(),
         graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
     };
     let view = page("v");
     let mut latest = page("n");
@@ -363,7 +368,7 @@ fn the_timing_is_the_presented_views_while_a_lifetime_is() {
     assert_eq!(p.timing(&sent), Some(t));
     // A payload published last has no say: built-in here.
     p.want(snapshot("v1"));
-    p.land(&mut sent, Some(&Published::BuiltIn));
+    p.land(&mut sent, Some(&Published::BuiltIn), None);
     assert_eq!(p.timing(&sent), Some(t));
     // A press its input time gates pins nothing and publishes nothing.
     sent.timing = Some(skin_model::ResultTiming {
@@ -374,10 +379,41 @@ fn the_timing_is_the_presented_views_while_a_lifetime_is() {
     assert_eq!(p.pin(&mut sent, TimeUs(5), Some(TimeUs(0))), None);
     assert_eq!((sent.shown.len(), sent.pinned), (shown, None));
     p.want(snapshot("v2"));
-    p.land(&mut sent, Some(&Published::BuiltIn));
+    p.land(&mut sent, Some(&Published::BuiltIn), None);
     assert_eq!(sent.shown.len(), shown + 1, "not pinned: views publish");
     sent.timing = Some(t);
     assert_eq!(p.pin(&mut sent, TimeUs(5), None).unwrap().1, Some(t));
     p.end(&mut sent);
     assert_eq!(p.timing(&sent), None, "the lifetime ended");
+}
+
+/// The same layout landing with other chart images (a fixed skin
+/// published in an earlier attempt, a later attempt's images) is a new
+/// payload carrying them; landing again with the same images is not; the
+/// built-in result carries none.
+#[test]
+fn a_payload_carries_its_attempts_chart_images() {
+    let mut sent = Sent::default();
+    let mut p = Presenter::default();
+    let b = bundle();
+    let skin = Published::Skin(Arc::clone(&b), None, None);
+    let a = Arc::new(crate::chart_images::ChartImages::absent(
+        &skin_model::chart_image::Absent::NoHeader,
+    ));
+    let c = Arc::new(crate::chart_images::ChartImages::absent(
+        &skin_model::chart_image::Absent::NoHeader,
+    ));
+    p.begin(&mut sent, TimeUs(5));
+    p.want(snapshot("v1"));
+    p.land(&mut sent, Some(&skin), Some(Arc::clone(&a)));
+    p.land(&mut sent, Some(&skin), Some(Arc::clone(&a)));
+    p.land(&mut sent, Some(&skin), Some(Arc::clone(&c)));
+    let ids: Vec<Option<u64>> = sent
+        .shown
+        .iter()
+        .map(|s| s.payload.chart.as_ref().map(|c| c.id()))
+        .collect();
+    assert_eq!(ids, [Some(a.id()), Some(c.id())]);
+    p.land(&mut sent, Some(&Published::BuiltIn), Some(Arc::clone(&a)));
+    assert!(sent.shown.last().unwrap().payload.chart.is_none());
 }

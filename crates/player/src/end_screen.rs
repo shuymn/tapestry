@@ -1291,6 +1291,8 @@ pub(crate) mod tests {
         let base = super::EndPage {
             lines: vec!["A".to_owned()],
             graphs: Some(Arc::clone(&graphs)),
+            #[cfg(feature = "dev-tools")]
+            id: None,
         };
         let t = game::Tuning {
             volume_percent: 100,

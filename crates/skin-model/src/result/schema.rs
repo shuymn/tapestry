@@ -127,6 +127,8 @@ pub static RESULT: Schema = Schema {
         value("duration_10us"),
         int("chart.judge_class", 0, JUDGE_CLASS_MAX),
         flag("chart.judge_class_valid"),
+        flag("chart.stagefile"),
+        flag("chart.backbmp"),
     ],
     timers: &[timer("screen"), timer("fadeout")],
     enums: &[],
@@ -233,8 +235,13 @@ pub mod field {
     /// Whether [`CHART_JUDGE_CLASS`] is known: the chart's rank is in a
     /// class.
     pub const CHART_JUDGE_CLASS_VALID: u16 = 62;
+    /// Whether the chart's stage file and back image are images, as the
+    /// attempt resolved them before any result import (options 190, 191,
+    /// 194 and 195).
+    pub const CHART_STAGEFILE: u16 = 63;
+    pub const CHART_BACKBMP: u16 = 64;
     /// The number of fields.
-    pub const COUNT: usize = 63;
+    pub const COUNT: usize = 65;
 }
 
 /// The built-in timer slots of [`RESULT`]; `when` timers follow from
@@ -281,6 +288,8 @@ mod tests {
             (field::DURATION_10US, "duration_10us"),
             (field::CHART_JUDGE_CLASS, "chart.judge_class"),
             (field::CHART_JUDGE_CLASS_VALID, "chart.judge_class_valid"),
+            (field::CHART_STAGEFILE, "chart.stagefile"),
+            (field::CHART_BACKBMP, "chart.backbmp"),
         ] {
             assert_eq!(names[usize::from(slot)], name);
         }

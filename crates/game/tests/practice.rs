@@ -1318,9 +1318,10 @@ fn excerpt_matches_mid_chart_start_end_to_end() {
         rig.sources = SourceSet::new(common::sources()).unwrap();
         rig.script = ScriptedInput::new(items);
         rig.script.poll(TimeUs(CLOCK_START - 1), &mut rig.sources);
-        // The full play is left on its result; the round shows its result
-        // too, as a mid-chart start does.
-        rig.commands.push((1, 25_000 * MS, Command::Quit));
+        // The full play is left on its result, after its hold to 5 s past
+        // its last note (20 s); the round shows its result too, as a
+        // mid-chart start does.
+        rig.commands.push((1, 30_000 * MS, Command::Quit));
         let _ = game::live::run_chart(&mut loaded, &mut rig);
         // Live, the play judged what its record re-evaluates to.
         let summary = rig.reports[0].result.as_ref().unwrap();

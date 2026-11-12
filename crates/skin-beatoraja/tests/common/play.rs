@@ -114,6 +114,9 @@ pub struct Drawn {
     /// Where the play entered Closing, for every frame
     /// ([`SkinFrame::closing`]).
     pub closing: Option<TimeUs>,
+    /// Where a full play's fade-out started, for every frame
+    /// ([`SkinFrame::fading`]).
+    pub fading: Option<TimeUs>,
     pub batch: QuadBatch,
     /// The hi-speed and covers each frame shows.
     pub view: LaneView,
@@ -510,6 +513,7 @@ impl Drawn {
             }],
             playing: true,
             closing: None,
+            fading: None,
             batch,
             // 600 ms of 150 BPM over the original lane.
             view: LaneView {
@@ -602,7 +606,7 @@ impl Drawn {
             lanes: self.view,
             playing: self.playing,
             closing: self.closing,
-            fading: None,
+            fading: self.fading,
             readouts: self.readouts.unwrap_or_else(|| readouts_for(self.view)),
         };
         self.skin

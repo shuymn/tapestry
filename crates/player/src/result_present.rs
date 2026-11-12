@@ -68,6 +68,11 @@ pub struct ViewPayload {
     /// The view's built-in page: its view rows draw when the built-in
     /// result shows.
     pub page: EndPage,
+    /// The chart's images its layout draws, fitted for its chart slot
+    /// ([`crate::result_skin::ResultSkin::chart_for`]): written into the
+    /// array its staging uses as it is staged. `None` without a layout
+    /// keeping a chart layer.
+    pub chart: Option<Arc<crate::chart_images::ChartImages>>,
 }
 
 /// What merges into a presentation whatever view it shows (D1).
@@ -353,6 +358,9 @@ pub fn compose_page(view: &EndPage, latest: &EndPage, why: Option<&str>) -> EndP
     EndPage {
         lines,
         graphs: view.graphs.clone(),
+        // The view's result: the page draws in its place.
+        #[cfg(feature = "dev-tools")]
+        id: view.id,
     }
 }
 
@@ -487,6 +495,12 @@ impl Presenter {
         self.desired = None;
     }
 
+    /// The payload published last (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn payload(&self) -> Option<&Arc<ViewPayload>> {
+        self.payload.as_ref()
+    }
+
     /// The next attempt: the attempt's fallback is forgotten.
     pub fn next_attempt(&mut self) {
         self.attempt = None;
@@ -502,6 +516,13 @@ impl Presenter {
         self.attempt.as_deref()
     }
 
+    /// The desired view's key, if one is (dev-tools: a result capture's
+    /// view).
+    #[cfg(feature = "dev-tools")]
+    pub fn desired_key(&self) -> Option<ViewKey> {
+        self.desired.as_ref().map(|(k, _)| *k)
+    }
+
     /// A new desired view, `snapshot`: its key. Until its layout lands
     /// ([`land`](Self::land)) the view presented stays.
     pub fn want(&mut self, snapshot: Snapshot) -> ViewKey {
@@ -511,9 +532,16 @@ impl Presenter {
     }
 
     /// The desired view's layout landed as `shown` (the result slot's
-    /// publication for the latest request): its payload is published,
-    /// unless the barrier holds or it is the one published.
-    pub fn land(&mut self, to: &mut impl Publish, shown: Option<&Published>) {
+    /// publication for the latest request), drawing the chart's images
+    /// `chart` (its fit, [`crate::result_skin::ResultSkin::chart_for`]):
+    /// its payload is published, unless the barrier holds or it is the
+    /// one published, the same images included.
+    pub fn land(
+        &mut self,
+        to: &mut impl Publish,
+        shown: Option<&Published>,
+        chart: Option<Arc<crate::chart_images::ChartImages>>,
+    ) {
         if self.overlay.fadeout.is_some() || self.lifetime.is_none() {
             return;
         }
@@ -532,6 +560,7 @@ impl Presenter {
             ),
             (None, _, _, _) => return,
         };
+        let chart = chart.filter(|_| skin.is_some());
         let same = self.payload.as_ref().is_some_and(|p| {
             p.key == *key
                 && p.script == script
@@ -540,6 +569,7 @@ impl Presenter {
                     (None, None) => true,
                     _ => false,
                 }
+                && p.chart.as_ref().map(|c| c.id()) == chart.as_ref().map(|c| c.id())
         });
         if same {
             return;
@@ -553,6 +583,7 @@ impl Presenter {
             labels: snapshot.labels.clone(),
             lines: snapshot.lines.clone(),
             page: snapshot.page.clone(),
+            chart,
         });
         self.payload = Some(payload);
         self.publish(to);

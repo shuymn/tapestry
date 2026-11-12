@@ -193,6 +193,21 @@ pub trait Screen: Send {
         let _ = target;
         Err(RenderError::NoChartLayer)
     }
+    /// Writes a result view's chart images, set `set`, into the result
+    /// array `target` names ([`render::Renderer::write_result_chart`]).
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's; [`RenderError::NoChartLayer`] by default.
+    fn write_result_chart(
+        &mut self,
+        target: render::ResultChartTarget,
+        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        set: u64,
+    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+        let _ = (target, images, set);
+        Err(RenderError::NoChartLayer)
+    }
     /// Makes the chart's images unavailable: their generation or target
     /// is no longer current ([`render::Renderer::invalidate_chart_images`]).
     /// The default has none.
@@ -760,6 +775,11 @@ pub struct EndPage {
     pub lines: Vec<String>,
     /// The viewed summary's graphs, shared with the result screen.
     pub graphs: Option<Arc<ResultGraphs>>,
+    /// The result it is a page of, kept by every copy and composition of
+    /// it, so a frame names the result of the page it drew (dev-tools: a
+    /// scenario's captures).
+    #[cfg(feature = "dev-tools")]
+    pub id: Option<crate::measure::ResultId>,
 }
 
 /// An attempt's refusal for `reason`, at no location.
@@ -2080,8 +2100,9 @@ impl RenderLink {
         drop(self.shared.clear_end(upto));
     }
 
-    /// How many end pages were shown so far.
-    #[cfg(all(test, feature = "dev-tools"))]
+    /// How many end pages were shown so far (dev-tools: a result
+    /// capture's end page).
+    #[cfg(feature = "dev-tools")]
     pub fn end_pages_shown(&self) -> u64 {
         self.end_pages.load(Ordering::Relaxed)
     }
@@ -2101,9 +2122,8 @@ impl RenderLink {
     }
 
     /// Waits at most `timeout` until the end page shown last has been
-    /// presented, and the frame sink has seen it (dev-tools: a script's
-    /// `drawn` step). Whether it was.
-    #[cfg(feature = "dev-tools")]
+    /// presented, and the frame sink has seen it (tests). Whether it was.
+    #[cfg(all(test, feature = "dev-tools"))]
     pub fn wait_end_drawn(&self, timeout: Duration) -> bool {
         let deadline = std::time::Instant::now() + timeout;
         loop {
@@ -3509,6 +3529,28 @@ fn play_presentation(
     (lanes, readouts, offset)
 }
 
+/// Which screen a frame drawn in `mode` is of (dev-tools): a generic
+/// page is the decision screen's while one is shown, the practice page's
+/// while its turntable runs.
+#[cfg(feature = "dev-tools")]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+const fn screen_kind(mode: &Mode, decision: bool, page_turns: bool) -> crate::measure::ScreenKind {
+    use crate::measure::ScreenKind as K;
+    match mode {
+        Mode::Idle | Mode::Splash { .. } => K::Splash,
+        Mode::Play { .. } => K::Play,
+        Mode::End => K::End,
+        Mode::Selection => K::Selection,
+        Mode::Result => K::Result,
+        Mode::Menu {
+            loading: Some(_), ..
+        } => K::Loading,
+        Mode::Menu { .. } if decision => K::Decision,
+        Mode::Menu { .. } if page_turns => K::Practice,
+        Mode::Menu { .. } => K::Page,
+    }
+}
+
 /// Whether loading lifetime `lifetime` draws the pending presentation:
 /// play's skin is pending, and no specialization of it is kept that was
 /// committed while `lifetime` was current (`specialized_in`). Allocates
@@ -4844,6 +4886,12 @@ impl Run {
             // before any cleanup (dev-tools: matched against the capture).
             #[cfg(feature = "dev-tools")]
             let mut presented_at: Option<TimeUs> = None;
+            // The select update a selection frame applied, and what a
+            // result frame drew (dev-tools: a scenario's captures).
+            #[cfg(feature = "dev-tools")]
+            let mut selection_stamp: Option<(u64, u64)> = None;
+            #[cfg(feature = "dev-tools")]
+            let mut result_stamp: Option<crate::measure::ResultStamp> = None;
             let drawn = match &mut mode {
                 Mode::Idle => continue,
                 Mode::Splash { pending } => {
@@ -5139,6 +5187,7 @@ impl Run {
                     {
                         presented_at = Some(self.clock.now());
                         crate::dev::mark_presented();
+                        selection_stamp = Some((shown.update.lifetime, shown.update.revision));
                     }
                     if let Ok(SelectionDrawn {
                         refused: Some(why), ..
@@ -5254,6 +5303,32 @@ impl Run {
                         Some(p) => p.clone(),
                         None => latest.clone(),
                     };
+                    // What this frame draws, named by the result of the
+                    // view or page it draws (dev-tools).
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        let held = self.result.as_ref().and_then(|s| s.presented.as_ref());
+                        result_stamp = Some(crate::measure::ResultStamp {
+                            id: match built {
+                                ResultDrawn::Built => held.and_then(|h| h.payload.page.id),
+                                _ => held
+                                    .and_then(|h| h.page.as_ref())
+                                    .map_or(self.end_page.1.id, |p| p.id),
+                            },
+                            path: match built {
+                                ResultDrawn::Built => crate::measure::ResultPath::Skin,
+                                ResultDrawn::BuiltIn => crate::measure::ResultPath::BuiltIn,
+                                ResultDrawn::Refused(_) => crate::measure::ResultPath::Refused,
+                            },
+                            page: self.end_page.0,
+                            view: held.map(|h| h.payload.key),
+                            sampled: now,
+                            // Only a frame its skin drew has its timers.
+                            timer_origin: held
+                                .filter(|_| matches!(built, ResultDrawn::Built))
+                                .map(|h| h.overlay.screen),
+                        });
+                    }
                     match built {
                         // A device lost under the barrier (dev-tools: a
                         // recovery during an outro).
@@ -5283,6 +5358,11 @@ impl Run {
                             // The disable composed the view presented's page.
                             self.disable_result(&e.to_string());
                             let page = page(self.result.as_ref(), &self.end_page.1);
+                            // The page the refusal composed names it.
+                            #[cfg(feature = "dev-tools")]
+                            if let Some(s) = &mut result_stamp {
+                                s.id = page.id;
+                            }
                             let Some(screen) = &mut self.screen else {
                                 continue;
                             };
@@ -5290,7 +5370,32 @@ impl Run {
                         }
                     }
                 }
-                Mode::End => screen.end(&self.end_page.1).map(|p| (timing_of(p), None)),
+                Mode::End => {
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        result_stamp = Some(crate::measure::ResultStamp {
+                            id: self.end_page.1.id,
+                            path: crate::measure::ResultPath::BuiltIn,
+                            page: self.end_page.0,
+                            view: None,
+                            sampled: self.clock.now(),
+                            timer_origin: None,
+                        });
+                    }
+                    screen.end(&self.end_page.1).map(|p| (timing_of(p), None))
+                }
+            };
+            // A result or end frame lost as a device loss (dev-tools: a
+            // recovery while a result shows).
+            #[cfg(feature = "dev-tools")]
+            let drawn = match drawn {
+                Ok(_)
+                    if matches!(mode, Mode::Result | Mode::End)
+                        && crate::dev::lose_result_frame() =>
+                {
+                    Err(RenderError::SurfaceLost)
+                }
+                other => other,
             };
             // Any other frame's present: right after its draw returned.
             #[cfg(feature = "dev-tools")]
@@ -5356,15 +5461,13 @@ impl Run {
                         #[cfg(feature = "dev-tools")]
                         generation: self.measure.generation(),
                         #[cfg(feature = "dev-tools")]
-                        menu: matches!(mode, Mode::Menu { .. } | Mode::Selection | Mode::Result),
+                        screen: screen_kind(&mode, self.decision.is_some(), self.page_turns),
                         #[cfg(feature = "dev-tools")]
-                        loading: matches!(
-                            mode,
-                            Mode::Menu {
-                                loading: Some(_),
-                                ..
-                            }
-                        ),
+                        selection: selection_stamp,
+                        #[cfg(feature = "dev-tools")]
+                        result: result_stamp,
+                        #[cfg(feature = "dev-tools")]
+                        presented_at,
                         #[cfg(feature = "dev-tools")]
                         skin_loading: loading_frame.filter(|&l| {
                             !pending_presentation(&self.committed, self.specialized_in, l)
@@ -6310,6 +6413,39 @@ enum ResultDrawn {
     Refused(BuildError),
 }
 
+/// A result view's chart table: its payload's images `chart` written into
+/// the array `target` names, the one write of a view's images, at its
+/// staging and at a reapply on a screen built again. A view
+/// without images, a target with no chart layer and a refused write (a
+/// misfit, a level mismatch, a write the device refused) leave an
+/// all-absent table, never a failed screen.
+///
+/// # Errors
+///
+/// The device's failure during the write: the screen is failed.
+fn stage_result_chart(
+    screen: &mut dyn Screen,
+    target: render::ResultChartTarget,
+    chart: Option<&crate::chart_images::ChartImages>,
+) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+    use skin_model::chart_image::ChartTable;
+    let Some(set) = chart else {
+        return Ok(ChartTable::ABSENT);
+    };
+    match screen.write_result_chart(target, set.fitted(), set.id()) {
+        Ok(table) => Ok(table),
+        Err(RenderError::NoChartLayer) => Ok(ChartTable::ABSENT),
+        Err(e) if e.chart_outcome() == render::ChartOutcome::Absent => {
+            eprintln!(
+                "render: the result's chart images are not shown: {}",
+                Chain(&e)
+            );
+            Ok(ChartTable::ABSENT)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The strip's text slots, after the one drawn: the one prepared with a
 /// view payload waiting, and the one prepared for the view presented.
 pub(super) const STRIP_PREPARED: usize = 1;
@@ -6682,6 +6818,15 @@ impl Run {
                 match screen.prepare_result(bundle, state, &h.payload.view, &h.payload.labels) {
                     Ok(Ok(())) => {
                         screen.install_result_text();
+                        // The images again, into the restored array.
+                        match stage_result_chart(
+                            screen.as_mut(),
+                            render::ResultChartTarget::Committed,
+                            h.payload.chart.as_deref(),
+                        ) {
+                            Ok(table) => state.set_chart_images(table),
+                            Err(e) => failed = Some(e),
+                        }
                     }
                     Ok(Err(why)) => refused = Some(why),
                     Err(e) => failed = Some(e),
@@ -6749,12 +6894,23 @@ impl Run {
                     };
                     match installed {
                         Ok(Preparation::Ready) => {
-                            token = Some(PreparedToken {
+                            let staged = PreparedToken {
                                 request,
                                 device: screen.device(),
                                 kind: ScreenKind::Result,
-                            });
+                            };
+                            token = Some(staged);
                             let mut state = bundle.skin().prepare_result();
+                            // The view's images, into the array its
+                            // staging uses, keyed to its installation.
+                            match stage_result_chart(
+                                screen.as_mut(),
+                                render::ResultChartTarget::Staged(staged),
+                                p.payload.chart.as_deref(),
+                            ) {
+                                Ok(table) => state.set_chart_images(table),
+                                Err(e) => failed = Some(e),
+                            }
                             let prepared = screen.prepare_result(
                                 bundle,
                                 &mut state,
@@ -6951,7 +7107,12 @@ impl Run {
                             side.discard |= v.token.is_some();
                             side.drop_later(v.held);
                         }
-                        ViewCommit::Refused => side.drop_later(v.held),
+                        // Its commit refused: its staging, still pending,
+                        // is discarded after the frame, as an evicted one.
+                        ViewCommit::Refused => {
+                            side.discard |= v.token.is_some();
+                            side.drop_later(v.held);
+                        }
                     }
                 }
                 if let Some(mut h) = committed {
@@ -9870,12 +10031,16 @@ pub(crate) mod tests {
         link.show_end(super::EndPage {
             lines: vec!["A".to_owned()],
             graphs: None,
+            #[cfg(feature = "dev-tools")]
+            id: None,
         });
         assert!(wait_until(|| link.failed()), "the failure was not reported");
         // More text without a screen builds nothing and stays failed.
         link.show_end(super::EndPage {
             lines: vec!["A".to_owned()],
             graphs: None,
+            #[cfg(feature = "dev-tools")]
+            id: None,
         });
         std::thread::sleep(Duration::from_millis(100));
         assert_eq!(builds.load(Ordering::SeqCst), 1);
@@ -9887,6 +10052,8 @@ pub(crate) mod tests {
         link.show_end(super::EndPage {
             lines: vec!["B".to_owned()],
             graphs: None,
+            #[cfg(feature = "dev-tools")]
+            id: None,
         });
         assert!(wait_until(|| link.failed()));
         // Building again fails: the preparation reports it.
@@ -10351,6 +10518,8 @@ pub(crate) mod tests {
         link.show_end(super::EndPage {
             lines: vec!["END".to_owned()],
             graphs: None,
+            #[cfg(feature = "dev-tools")]
+            id: None,
         });
         assert!(wait_until(|| calls.texts.load(Ordering::Acquire) >= 1));
         let fig = link.finish(clock.now()).expect("the play's figures");
@@ -11150,6 +11319,8 @@ pub(crate) mod tests {
         super::EndPage {
             lines: vec![line.to_owned()],
             graphs: graphs.cloned(),
+            #[cfg(feature = "dev-tools")]
+            id: None,
         }
     }
 
@@ -11299,18 +11470,51 @@ pub(crate) mod tests {
         let (link, _, hold, release) = ends();
         link.show_end(page("first", None));
         assert!(link.wait_end_drawn(Duration::from_secs(10)));
-        assert!(!scripted_end_over(after, Duration::from_millis(299), &link));
-        assert!(scripted_end_over(after, after, &link));
+        assert!(!scripted_end_over(
+            after,
+            Duration::from_millis(299),
+            &link,
+            None
+        ));
+        assert!(scripted_end_over(after, after, &link, None));
         // Stuck in the next page's frame: the page after it is not drawn.
         hold.store(true, Ordering::SeqCst);
         link.show_end(page("stuck", None));
         assert!(wait_until(|| !hold.load(Ordering::SeqCst)));
         link.show_end(page("waiting", None));
-        assert!(!scripted_end_over(after, after, &link));
-        assert!(!scripted_end_over(after, STEP_TIMEOUT - after, &link));
-        assert!(scripted_end_over(after, STEP_TIMEOUT, &link));
+        assert!(!scripted_end_over(after, after, &link, None));
+        assert!(!scripted_end_over(after, STEP_TIMEOUT - after, &link, None));
+        assert!(scripted_end_over(after, STEP_TIMEOUT, &link, None));
         release.send(()).unwrap();
-        assert!(wait_until(|| scripted_end_over(after, after, &link)));
+        assert!(wait_until(|| scripted_end_over(after, after, &link, None)));
+        link.exit();
+    }
+
+    /// A scripted run's end screen is not over while the result script
+    /// still has steps due on it, its page drawn and its time passed: on a
+    /// loaded machine the page is drawn after that time, and the step
+    /// waiting on it is sent at the same wake, so ending there would cut
+    /// the script off with no failure. Once its steps are done, or one left
+    /// the result, the end is over.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_scripted_end_waits_for_the_results_steps() {
+        use crate::dev::SelectScript;
+        use crate::play::scripted_end_over;
+        let after = Duration::from_millis(300);
+        let late = Duration::from_secs(5);
+        let (link, _, _, _) = ends();
+        link.show_end(page("first", None));
+        assert!(link.wait_end_drawn(Duration::from_secs(10)));
+        let mut script = SelectScript::parse("next,back").unwrap();
+        assert!(!scripted_end_over(after, late, &link, Some(&script)));
+        script.done();
+        assert!(!scripted_end_over(after, late, &link, Some(&script)));
+        script.left_result = true;
+        assert!(scripted_end_over(after, late, &link, Some(&script)));
+        script.left_result = false;
+        script.done();
+        assert!(scripted_end_over(after, late, &link, Some(&script)));
         link.exit();
     }
 
@@ -17297,4 +17501,41 @@ pub(crate) mod tests {
     // point and the barrier into the skin or the built-in page.
     #[cfg(feature = "dev-tools")]
     pub(crate) mod result;
+    // The chart's images on the result screen: written at a view's
+    // staging and reapply, drawn from its first frame.
+    #[cfg(feature = "dev-tools")]
+    mod result_chart;
+}
+
+/// Which screen each mode's frame is of (dev-tools).
+#[cfg(all(test, feature = "dev-tools"))]
+mod screen_kind_tests {
+    use super::{Mode, screen_kind};
+    use crate::measure::ScreenKind as K;
+    use crate::menu_screen::MenuPage;
+
+    fn menu(loading: Option<u64>) -> Mode {
+        Mode::Menu {
+            page: Box::new(MenuPage::default()),
+            update: None,
+            changed: false,
+            loading,
+        }
+    }
+
+    #[test]
+    fn each_mode_names_its_screen() {
+        assert_eq!(
+            screen_kind(&Mode::Splash { pending: None }, false, false),
+            K::Splash
+        );
+        assert_eq!(screen_kind(&Mode::Selection, true, true), K::Selection);
+        assert_eq!(screen_kind(&Mode::Result, false, false), K::Result);
+        assert_eq!(screen_kind(&Mode::End, false, false), K::End);
+        assert_eq!(screen_kind(&menu(Some(1)), true, true), K::Loading);
+        assert_eq!(screen_kind(&menu(None), true, false), K::Decision);
+        assert_eq!(screen_kind(&menu(None), false, true), K::Practice);
+        assert_eq!(screen_kind(&menu(None), false, false), K::Page);
+        assert!(K::Result.is_result() && K::End.is_result() && !K::Selection.is_result());
+    }
 }

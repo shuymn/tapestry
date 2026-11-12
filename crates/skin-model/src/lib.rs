@@ -208,9 +208,9 @@ pub use result::schema::{
 };
 pub use result::view::{
     BestFigures, BestRate, BestView, DEVIATION_SLOTS, GRAPH_COLUMNS, GaugeColumn, GaugeHistory,
-    MAX_TIMELINE_BINS, ResultBpm, ResultChart, ResultLabels, ResultNumber, ResultRate, ResultScore,
-    ResultStatus, ResultView, TIMELINE_CHANNELS, Timelines, TimelinesError, TimingStats,
-    Unavailable,
+    ImageFacts, MAX_TIMELINE_BINS, ResultBpm, ResultChart, ResultLabels, ResultNumber, ResultRate,
+    ResultScore, ResultStatus, ResultView, TIMELINE_CHANNELS, Timelines, TimelinesError,
+    TimingStats, Unavailable,
 };
 pub use result::{
     MAX_RESULT_OUTRO, ResultError, ResultFields, ResultFrame, ResultScreen, ResultTimers,
