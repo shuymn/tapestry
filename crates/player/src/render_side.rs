@@ -6592,7 +6592,11 @@ impl Run {
         };
         if let Some(side) = &mut self.decision_side {
             side.retiring = true;
-            side.stop();
+            match self.screen.as_deref() {
+                Some(screen) => side.stop(&mut || screen.watch_completion()),
+                // No device: nothing written is in flight.
+                None => side.stop(&mut || Arc::new(AtomicBool::new(true))),
+            }
         }
         if active.is_none() && !self.decision_skinned() {
             self.drop_decision_side();

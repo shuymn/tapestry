@@ -867,7 +867,7 @@ fn labels_not_ready_at_the_choice_per_key_part() {
     );
     // Target: the next boundary after a resize frees the slot.
     screen.resize(1_280, 720);
-    side.stop();
+    side.stop(&mut || screen.watch_completion());
     quiet(&mut screen, &mut side, None);
     assert_eq!(lock(&book).pin(Path::new("a"), revision, 1), None, "target");
     screen.resize(TARGET[0], TARGET[1]);

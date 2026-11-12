@@ -374,9 +374,8 @@ impl DecisionSide {
                 .as_ref()
                 .is_some_and(|(k, s)| !is_want(k, want, target) || *s != want.strings)
             {
-                self.worker.cancel();
-                self.store.drop_waiting();
-                self.store.cancel(&mut || screen.watch_completion());
+                self.store
+                    .cancel(&self.worker, &mut || screen.watch_completion());
                 self.posted = None;
             }
             let (held, stale) = held(&lock(&book), &self.store, want, target);
@@ -384,19 +383,18 @@ impl DecisionSide {
                 lock(&book).forget(slot, generation);
             }
             if !held && self.posted.is_none() {
-                let key = LabelKey {
-                    chart: want.chart.clone(),
-                    revision: want.revision,
-                    target,
-                };
                 let generation = self.next;
                 self.next = self.next.saturating_add(1);
-                self.worker.post(LabelJob {
+                let job = LabelJob::new(
                     generation,
-                    key: key.clone(),
-                    strings: want.strings.clone(),
+                    want.chart.clone(),
+                    want.revision,
+                    want.strings.clone(),
                     plan,
-                });
+                );
+                let key = job.key().clone();
+                self.store
+                    .post(&self.worker, job, &mut || screen.watch_completion());
                 #[cfg(test)]
                 self.check_post();
                 self.posted = Some((key, want.strings.clone()));
@@ -441,8 +439,8 @@ impl DecisionSide {
     /// generation, on this thread once the worker's job ended
     /// ([`LabelWorker::restage`]).
     pub fn rebuilt(&mut self, screen: &mut dyn Screen) -> Rebuilt {
-        self.worker.cancel();
         self.store.reset();
+        self.worker.quiesce();
         self.posted = None;
         let book = Arc::clone(self.store.book());
         lock(&book).reset();
@@ -461,12 +459,13 @@ impl DecisionSide {
         else {
             return Rebuilt::Refused(RenderError::LabelRegion { needed: 0, band: 0 });
         };
-        let job = LabelJob {
+        let job = LabelJob::new(
             generation,
-            key,
-            strings: strings.clone(),
-            plan: Arc::clone(plan),
-        };
+            key.chart,
+            key.revision,
+            strings.clone(),
+            Arc::clone(plan),
+        );
         let staged = match self.worker.restage(&self.bundle, job) {
             Ok(Some(staged)) => staged,
             Ok(None) => return Rebuilt::Restored,
@@ -479,10 +478,11 @@ impl DecisionSide {
         }
     }
 
-    /// Stops preparing: the job in flight and a waiting output dropped.
-    pub fn stop(&mut self) {
-        self.worker.cancel();
-        self.store.drop_waiting();
+    /// Stops preparing: the job in flight cancelled through the store
+    /// ([`LabelStore::cancel`]), its waiting output dropped and its fill
+    /// disposed of, cooling until `watch`'s flag after a write.
+    pub fn stop(&mut self, watch: render::Watch<'_>) {
+        self.store.cancel(&self.worker, watch);
         self.posted = None;
     }
 }

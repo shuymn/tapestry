@@ -4143,7 +4143,7 @@ impl Renderer {
             .resources
             .labels
             .map_or(0, |_| slot.resources.atlas.side());
-        Some(RowPlan::new(&rows, side, skin.text_slots()))
+        Some(RowPlan::new(&rows, side, skin.text_slots(), self.target()))
     }
 
     /// The decision slot, if committed.
