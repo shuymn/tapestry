@@ -330,3 +330,189 @@ fn a_selection_table_is_dropped_by_a_screen_built_again() {
         .until(|s| s.device == rebuilt && draws_images(s, r.layer));
     r.link.exit();
 }
+
+/// The worker and the coordinator of a cursor on the select screen of
+/// `link`.
+fn cursor_worker(
+    link: &RenderLink,
+) -> (
+    crate::chart_images::ChartImageWorker,
+    game::coord::Coordinator,
+) {
+    let w = crate::chart_images::ChartImageWorker::new(
+        link.chart_generation(),
+        link.cursor_generation(),
+    );
+    let coord = game::coord::Coordinator::new(game::coord::Caps {
+        foreground: 4,
+        speculative: 1,
+    });
+    (w, coord)
+}
+
+/// The names [`crate::selection_skin::selection_images`] writes.
+fn fixture_names() -> [library::Name; 2] {
+    [
+        library::Name::Named("s.png".to_owned()),
+        library::Name::Named("n.png".to_owned()),
+    ]
+}
+
+/// Steps `w` as the select screen does until `done`, at most 30 s.
+fn step_until(
+    w: &crate::chart_images::ChartImageWorker,
+    coord: &game::coord::Coordinator,
+    link: &RenderLink,
+    done: impl Fn(&crate::chart_images::ChartImageWorker) -> bool,
+) {
+    let end = std::time::Instant::now() + Duration::from_secs(30);
+    while !done(w) {
+        assert!(std::time::Instant::now() < end, "{w:?}");
+        w.cursor_step(coord, game::coord::Spawner::SYSTEM, &link.chart_publisher());
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// The selection set current, its job ended and its publication answered.
+fn settled(w: &crate::chart_images::ChartImageWorker) -> bool {
+    w.current_selection().is_some() && w.idle() && !w.selection_pending()
+}
+
+/// The cursor rested on a chart: the worker reads its stage file and
+/// banner and publishes them, and the frames draw both, sampled, with 191
+/// and 193 holding in the conditions and the callbacks; a move draws
+/// nothing from the next frame, and a chart naming no image is published
+/// absent, 190 and 192 holding (SC1-SC3).
+#[test]
+fn a_rested_cursors_images_are_drawn() {
+    let _warp = crate::warp_turn::take();
+    let _serial = crate::imports::tests::serial();
+    let r = rig();
+    let (images, _) = crate::selection_skin::selection_images(r.side, RED, Some(GREEN));
+    let (w, coord) = cursor_worker(&r.link);
+    r.frames.sample.store(true, Ordering::Release);
+    w.rest(w.cursor_request(images.path().to_path_buf(), fixture_names(), r.side, &coord));
+    step_until(&w, &coord, &r.link, settled);
+    r.frames.clear();
+    let drawn = r
+        .frames
+        .until(|s| draws_images(s, r.layer) && s.pixels.is_some());
+    let [stage, banner] = drawn.pixels.unwrap();
+    assert!(near(stage, RED), "{stage:?}");
+    assert!(near(banner, GREEN), "{banner:?}");
+    r.frames.sample.store(false, Ordering::Release);
+    // A move: not current from the next frame.
+    w.cursor_changed(&coord);
+    r.frames.clear();
+    assert!(r.frames.next(3, None).iter().all(draws_none));
+    // A chart naming no image.
+    let none = tempfile::tempdir().unwrap();
+    w.rest(w.cursor_request(
+        none.path().to_path_buf(),
+        [library::Name::None, library::Name::None],
+        r.side,
+        &coord,
+    ));
+    step_until(&w, &coord, &r.link, settled);
+    assert_eq!(w.begun(), 1);
+    r.frames.clear();
+    assert!(r.frames.next(3, None).iter().all(draws_none));
+    r.link.exit();
+}
+
+/// A screen built again with the cursor still: the worker publishes the
+/// same set again on its next step, with no decode, no job and no move,
+/// and the new screen draws it, whether the set's answer came before the
+/// screen failed or was asked while no screen was there.
+#[test]
+fn a_rebuilt_screen_draws_the_cursors_images_again() {
+    let _warp = crate::warp_turn::take();
+    let _serial = crate::imports::tests::serial();
+    for answered_before in [true, false] {
+        let r = rig();
+        let (images, _) = crate::selection_skin::selection_images(r.side, RED, Some(GREEN));
+        let (w, coord) = cursor_worker(&r.link);
+        let rest = || {
+            w.rest(w.cursor_request(images.path().to_path_buf(), fixture_names(), r.side, &coord));
+        };
+        let device = r.frames.until(|_| true).device;
+        if answered_before {
+            rest();
+            step_until(&w, &coord, &r.link, settled);
+            r.frames.clear();
+            r.frames.until(|s| draws_images(s, r.layer));
+        }
+        r.lose.store(true, Ordering::Release);
+        assert!(wait_until(|| r.link.failed()));
+        assert!(wait_until(|| live(&r.link).is_none()));
+        if !answered_before {
+            // Read and published while no screen is there.
+            rest();
+            step_until(&w, &coord, &r.link, settled);
+        }
+        let (begun, decodes) = (w.begun(), w.counts().0);
+        assert_eq!((begun, decodes), (1, 2));
+        r.link.prepare().unwrap();
+        r.link
+            .show_selection(update_of(1, 2, listed(SelectionPlace::All, "")));
+        assert!(wait_until(|| live(&r.link).is_some()));
+        r.frames.clear();
+        let rebuilt = r.frames.until(|s| s.device != device).device;
+        step_until(&w, &coord, &r.link, |w| {
+            settled(w) && w.selection_publications() >= 2
+        });
+        r.frames.clear();
+        r.frames
+            .until(|s| s.device == rebuilt && draws_images(s, r.layer));
+        assert_eq!(
+            (w.begun(), w.counts().0),
+            (begun, decodes),
+            "answered before {answered_before}"
+        );
+        r.link.exit();
+    }
+}
+
+/// A selection skin refused at runtime leaves no installation: the worker
+/// publishes nothing again and begins no job (SX18).
+#[test]
+fn a_refused_selection_skin_is_not_published_again() {
+    let _warp = crate::warp_turn::take();
+    let _serial = crate::imports::tests::serial();
+    let (_dir, skin, script) = chart_skin();
+    let side = skin.side();
+    let layer = skin.chart_layer().unwrap();
+    let frames = Frames::default();
+    let bad = Arc::new(AtomicBool::new(false));
+    let (link, ..) = lossy_spawn(None, &bad, Box::new(frames.clone()));
+    assert_eq!(
+        link.select_with(ScreenKind::Selection, Some(skin), script)
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    link.enter_selection(1);
+    link.show_selection(update_of(1, 1, listed(SelectionPlace::All, "")));
+    frames.until(draws_none);
+    let (images, _) = crate::selection_skin::selection_images(side, RED, Some(GREEN));
+    let (w, coord) = cursor_worker(&link);
+    w.rest(w.cursor_request(images.path().to_path_buf(), fixture_names(), side, &coord));
+    step_until(&w, &coord, &link, settled);
+    frames.clear();
+    frames.until(|s| draws_images(s, layer));
+    // Refused at runtime: its installation removed.
+    bad.store(true, Ordering::Release);
+    assert!(wait_until(|| live(&link).is_none()));
+    let (sent, begun) = (w.selection_publications(), w.begun());
+    for _ in 0..50 {
+        w.cursor_step(
+            &coord,
+            game::coord::Spawner::SYSTEM,
+            &link.chart_publisher(),
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(w.selection_publications(), sent, "published again");
+    assert_eq!(w.begun(), begun);
+    link.exit();
+}

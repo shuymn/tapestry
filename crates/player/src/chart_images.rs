@@ -202,16 +202,7 @@ pub fn read_sources(want: &Want, prior: Option<&Sources>, cancel: &dyn Fn() -> b
         }
     };
     #[cfg(test)]
-    while HOLD.load(std::sync::atomic::Ordering::Acquire) && !cancel() {
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    #[cfg(test)]
-    while HOLD_HARD.load(std::sync::atomic::Ordering::Acquire) {
-        HELD_HARD.store(true, std::sync::atomic::Ordering::Release);
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    #[cfg(test)]
-    HELD_HARD.store(false, std::sync::atomic::Ordering::Release);
+    hold(cancel);
     let identity: chart_image::Identity<'_> = &file_identity;
     let reads = ChartImage::ALL.map(|which| {
         let name = want.names.get(which.index()).map_or("", String::as_str);
@@ -455,6 +446,149 @@ pub enum Publish {
 /// What an answer from a render thread gone reads as.
 const GONE: Published = Err(render::ChartOutcome::Unavailable);
 
+/// What the cursor's request names (design.md "Rendering and Skins",
+/// Chart images): the chart's folder, its stage file and banner names as
+/// the library keeps them, and the page side of the selection
+/// installation's chart layer. A rest compares it with the last selection
+/// set's.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CursorId {
+    pub dir: PathBuf,
+    /// The stage file's, then the banner's.
+    pub names: [library::Name; 2],
+    pub side: u32,
+}
+
+/// The cursor's one image request (S10-12 plan D2, I5): made once the
+/// cursor rested on a chart row, moved into the worker
+/// ([`ChartImageWorker::rest`]), and moved into the job that reads it or
+/// dropped. Its subscriber to the cursor's scope is taken when it is made
+/// ([`ChartImageWorker::cursor_request`]), so a request its scope outlived
+/// is cancelled from its start.
+#[must_use]
+#[derive(Debug)]
+pub struct CursorRequest {
+    id: CursorId,
+    cursor_generation: u64,
+    subscriber: game::coord::Subscriber,
+}
+
+/// The last selection set (I7): what it was read for, for which cursor
+/// generation it is current, and the set. Also the only candidates a
+/// later request's read keeps reads from (D3).
+#[derive(Debug)]
+struct SelectionSet {
+    id: CursorId,
+    cursor_generation: u64,
+    set: Arc<ChartImages>,
+}
+
+/// Reads `id`'s images for the selection installation's chart slots: the
+/// stage file and the banner, each decoded and derived for its slot of
+/// `id.side`, the sources dropped; the back image is never read there.
+/// Each name is resolved again, and `prior`'s read of an unchanged file is
+/// kept (D3). An overlong name resolves to nothing, never to a shortened
+/// one. Asks `cancel` throughout.
+fn read_selection(
+    id: &CursorId,
+    prior: Option<&ChartImages>,
+    cancel: &dyn Fn() -> bool,
+) -> ChartImages {
+    let dir = match ChartDir::new(&id.dir) {
+        Ok(dir) => dir,
+        Err(e) => {
+            return ChartImages::absent(&Absent::Unresolved(chart_image::Unresolved::Io(e.kind())));
+        }
+    };
+    #[cfg(test)]
+    hold(cancel);
+    let identity: chart_image::Identity<'_> = &file_identity;
+    let absent = |binding: chart_image::Binding| {
+        let image = Err(match &binding {
+            chart_image::Binding::Unresolved { why, .. } => Absent::Unresolved(*why),
+            _ => Absent::NoHeader,
+        });
+        Arc::new(Read { binding, image })
+    };
+    let [stage, banner] = &id.names;
+    let reads = ChartImage::ALL.map(|which| {
+        let name = match which {
+            ChartImage::Stage => stage,
+            ChartImage::Banner => banner,
+            ChartImage::Back => return absent(chart_image::Binding::NoHeader),
+        };
+        let (binding, name) = match name {
+            library::Name::None => (chart_image::Binding::NoHeader, ""),
+            library::Name::Overlong => (
+                chart_image::Binding::Unresolved {
+                    name: String::new(),
+                    why: chart_image::Unresolved::Overlong,
+                },
+                "",
+            ),
+            library::Name::Named(name) => (
+                chart_image::resolve(&dir, name, &[], identity),
+                name.as_str(),
+            ),
+        };
+        if let Some(prior) = prior {
+            let kept = prior.read(which);
+            if binding.same_as(&kept.binding) && reusable(kept) {
+                return Arc::clone(&prior.reads[which.index()]);
+            }
+        }
+        let chart_image::Binding::Resolved { .. } = binding else {
+            return absent(binding);
+        };
+        let Some((_, slot)) = which.slot(id.side) else {
+            return absent(chart_image::Binding::NoHeader);
+        };
+        #[cfg(test)]
+        count([1, 0]);
+        let source = chart_image::read_source(&dir, name, &[], cancel, identity);
+        let image = match &source.image {
+            Ok(image) => {
+                #[cfg(test)]
+                count([0, 1]);
+                chart_image::derive(image, slot, cancel)
+            }
+            Err(why) => Err(why.clone()),
+        };
+        Arc::new(Read {
+            binding: source.binding,
+            image,
+        })
+    });
+    ChartImages::of(reads)
+}
+
+/// Holds a read while [`HOLD`] is set and `cancel` does not answer, and
+/// while [`HOLD_HARD`] is set whatever it answers (tests).
+#[cfg(test)]
+fn hold(cancel: &dyn Fn() -> bool) {
+    while HOLD.load(std::sync::atomic::Ordering::Acquire) && !cancel() {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    while HOLD_HARD.load(std::sync::atomic::Ordering::Acquire) {
+        HELD_HARD.store(true, std::sync::atomic::Ordering::Release);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    HELD_HARD.store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// What a job gives: an attempt's job its [`JobOut`], the cursor's job
+/// its selection set.
+#[derive(Debug)]
+enum Output {
+    Attempt(JobOut),
+    Cursor {
+        set: Arc<ChartImages>,
+        /// Tests: the files it decoded and the fits it derived.
+        #[cfg(test)]
+        counts: (u64, u64),
+    },
+}
+
 /// What a job gives: its sources, and the halves it was asked for.
 #[derive(Debug)]
 struct JobOut {
@@ -469,16 +603,30 @@ struct JobOut {
     counts: (u64, u64),
 }
 
-/// A job of the worker, its thread not yet joined.
+/// A job of the worker, its thread not yet joined, and what it is for.
 struct Job {
-    want: Want,
-    generation: u64,
-    /// Whether it decodes the sources (they were not current when it
-    /// began), and which halves it derives: the play half (which it
-    /// publishes) and the result half.
-    fresh: bool,
-    derive: [bool; 2],
-    job: OwnedJob<Arc<JobOut>>,
+    target: Target,
+    job: OwnedJob<Arc<Output>>,
+}
+
+/// What a job reads for.
+#[derive(Debug)]
+enum Target {
+    /// The attempt's want.
+    Attempt {
+        want: Want,
+        generation: u64,
+        /// Whether it decodes the sources (they were not current when it
+        /// began), and which halves it derives: the play half (which it
+        /// publishes) and the result half.
+        fresh: bool,
+        derive: [bool; 2],
+    },
+    /// The cursor's request, for its cursor generation (I6).
+    Cursor {
+        id: CursorId,
+        cursor_generation: u64,
+    },
 }
 
 /// What a job that failed (panicked, or could not start) leaves: the
@@ -516,10 +664,24 @@ struct Core {
     /// The current generation ([`PublicationKey::generation`]), which the
     /// render thread reads.
     generation: Arc<AtomicU64>,
-    /// The job reading `want`'s images.
+    /// The job reading `want`'s images, or the cursor's: one at a time.
     job: Option<Job>,
     /// A job of an earlier want or generation, its thread not yet joined.
-    obsolete: Option<OwnedJob<Arc<JobOut>>>,
+    obsolete: Option<OwnedJob<Arc<Output>>>,
+    /// The selection's cursor generation, which the render thread reads
+    /// ([`crate::render_side::RenderLink::cursor_generation`]): a new one
+    /// at each change of the cursor's request.
+    cursor_generation: Arc<AtomicU64>,
+    /// The cursor's request, deferred until nothing holds the worker (I5).
+    cursor: Option<CursorRequest>,
+    /// The last selection set (I7).
+    selection: Option<SelectionSet>,
+    /// The selection's publication (I8); [`Core::retiring`] is shared
+    /// with play's.
+    sel_publication: Option<Publication>,
+    /// The starter is the selection's ([`ChartImageWorker::cursor_step`]),
+    /// which leaving selection drops.
+    starter_cursor: bool,
     /// The sources last decoded, of which files, in which generation:
     /// current only for `want`'s files in the current generation (the
     /// facts are then resolved), else kept as the candidates a
@@ -552,6 +714,10 @@ struct Core {
     ended: bool,
     /// Jobs begun (tests count jobs by it).
     begun: u64,
+    /// Tests: the selection publications sent, by the game thread or a
+    /// job.
+    #[cfg(test)]
+    sel_sent: u64,
     /// Tests: the files its jobs decoded and the fits they derived.
     #[cfg(test)]
     counts: (u64, u64),
@@ -571,7 +737,7 @@ pub struct ChartImageWorker {
 
 impl Default for ChartImageWorker {
     fn default() -> Self {
-        Self::new(Arc::default())
+        Self::new(Arc::default(), Arc::default())
     }
 }
 
@@ -581,8 +747,13 @@ impl std::fmt::Debug for ChartImageWorker {
         f.debug_struct("ChartImageWorker")
             .field("want", &c.want)
             .field("generation", &c.generation())
-            .field("job", &c.job.as_ref().map(|j| (&j.want, j.generation)))
+            .field("job", &c.job.as_ref().map(|j| &j.target))
             .field("obsolete", &c.obsolete.is_some())
+            .field("cursor", &c.cursor)
+            .field(
+                "selection",
+                &c.selection.as_ref().map(|s| (&s.id, s.cursor_generation)),
+            )
             .field("sources", &c.sources.as_ref().map(|(w, g, _)| (w, g)))
             .field("retiring", &c.retiring.is_some())
             .finish_non_exhaustive()
@@ -601,16 +772,23 @@ pub struct ResultImages {
 }
 
 impl ChartImageWorker {
-    /// A worker writing its generation to `generation`, which the render
-    /// thread reads ([`crate::render_side::RenderLink::chart_generation`]).
+    /// A worker writing its generation to `generation` and the cursor
+    /// generation to `cursor_generation`, which the render thread reads
+    /// ([`crate::render_side::RenderLink::chart_generation`],
+    /// [`crate::render_side::RenderLink::cursor_generation`]).
     #[must_use]
-    pub fn new(generation: Arc<AtomicU64>) -> Self {
+    pub fn new(generation: Arc<AtomicU64>, cursor_generation: Arc<AtomicU64>) -> Self {
         Self {
             core: Arc::new(Mutex::new(Core {
                 want: None,
                 generation,
                 job: None,
                 obsolete: None,
+                cursor_generation,
+                cursor: None,
+                selection: None,
+                sel_publication: None,
+                starter_cursor: false,
                 sources: None,
                 play: None,
                 result: None,
@@ -622,6 +800,8 @@ impl ChartImageWorker {
                 starter: None,
                 ended: false,
                 begun: 0,
+                #[cfg(test)]
+                sel_sent: 0,
                 #[cfg(test)]
                 counts: (0, 0),
                 #[cfg(test)]
@@ -675,6 +855,9 @@ impl ChartImageWorker {
     /// did not change kept, and published again (design C11, P22).
     pub fn attempt(&self, want: Want) {
         let mut c = self.core();
+        if c.ended {
+            return;
+        }
         if c.used && c.sources_current_for(&want) {
             c.renew();
         }
@@ -702,18 +885,157 @@ impl ChartImageWorker {
         c.renew();
         c.want = None;
         c.starter = None;
+        c.starter_cursor = false;
         if let Some(job) = c.job.take() {
             c.retire(job.job);
         }
     }
 
     /// Selection is entered: the sources and halves go, so nothing of the
-    /// last chart's images stays beside selection's.
+    /// last chart's images stays beside selection's, and so does the last
+    /// selection set, so a request after the entry reads its files again
+    /// (ST16); its publication, if unanswered, retires.
     pub fn drop_images(&self) {
         let mut c = self.core();
         c.sources = None;
         c.play = None;
         c.result = None;
+        c.selection = None;
+        c.supersede_selection();
+    }
+
+    /// The cursor's request for `dir`'s images `names` (the stage file's,
+    /// then the banner's) on a selection chart layer of side `side`: for
+    /// the current cursor generation, its subscriber to `coord`'s cursor
+    /// scope taken now (D2).
+    pub fn cursor_request(
+        &self,
+        dir: PathBuf,
+        names: [library::Name; 2],
+        side: u32,
+        coord: &Coordinator,
+    ) -> CursorRequest {
+        let c = self.core();
+        CursorRequest {
+            id: CursorId { dir, names, side },
+            cursor_generation: c.cursor_generation(),
+            subscriber: coord.subscriber(Scope::Cursor),
+        }
+    }
+
+    /// The cursor's request identity changed (SC4, D2): the one function
+    /// every change goes through. A new cursor generation, written where
+    /// the render thread reads it, so no selection table of the last one
+    /// draws from the next frame; the deferred request goes; the cursor's
+    /// scope advances, cancelling a running cursor job, whose output is
+    /// never adopted (it stays the worker's until its thread ends); the
+    /// selection publication is superseded (unanswered, it retires).
+    pub fn cursor_changed(&self, coord: &Coordinator) {
+        self.core().cursor_changed(coord);
+    }
+
+    /// The cursor rested (SC1): `request` is the one deferred, replacing
+    /// any; the next [`cursor_step`](Self::cursor_step) or the waits'
+    /// service begins it once nothing holds the worker.
+    pub fn rest(&self, request: CursorRequest) {
+        let mut c = self.core();
+        if !c.ended {
+            c.cursor = Some(request);
+        }
+    }
+
+    /// Selection is left (D2, SC5), before the play generation renews:
+    /// what [`cursor_changed`](Self::cursor_changed) does, and the
+    /// selection's starter and set go, so nothing of selection begins or
+    /// is published after it. An unanswered selection publication retires,
+    /// and no job begins until it is answered.
+    pub fn leave_selection(&self, coord: &Coordinator) {
+        let mut c = self.core();
+        c.cursor_changed(coord);
+        if c.starter_cursor {
+            c.starter = None;
+            c.starter_cursor = false;
+        }
+        c.selection = None;
+    }
+
+    /// Advances the selection's images without blocking (D2): takes what
+    /// ended, begins the deferred request once nothing holds the worker
+    /// (or publishes without a job what needs none), and publishes the
+    /// current selection set again when its last answer is not current
+    /// (a screen built again, SC6). Never begins anything after
+    /// [`end`](Self::end).
+    pub fn cursor_step(
+        &self,
+        coord: &Coordinator,
+        spawner: Spawner,
+        publisher: &crate::render_side::ChartPublisher,
+    ) {
+        let mut c = self.core();
+        c.take_finished();
+        if c.ended {
+            return;
+        }
+        c.starter = Some((coord.clone(), spawner, Some(publisher.clone())));
+        c.starter_cursor = true;
+        c.begin_if_free();
+        c.republish_selection(publisher);
+    }
+
+    /// Whether a deferred cursor request waits for a job's thread to end
+    /// or a publication to be answered: the select screen then looks
+    /// again within a slice ([`crate::play::IMAGE_SLICE`]).
+    #[must_use]
+    pub fn cursor_waiting(&self) -> bool {
+        let c = self.core();
+        c.cursor.is_some() && c.held_back()
+    }
+
+    /// The selection set, while current for the cursor generation (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn current_selection(&self) -> Option<Arc<ChartImages>> {
+        let c = self.core();
+        let now = c.cursor_generation();
+        c.selection
+            .as_ref()
+            .filter(|s| s.cursor_generation == now)
+            .map(|s| Arc::clone(&s.set))
+    }
+
+    /// The cursor generation (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    #[must_use]
+    pub fn cursor_generation(&self) -> u64 {
+        self.core().cursor_generation()
+    }
+
+    /// Whether a publication retires (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn retiring(&self) -> bool {
+        self.core().retiring.is_some()
+    }
+
+    /// Whether the selection publication is unanswered (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn selection_pending(&self) -> bool {
+        self.core().sel_pending()
+    }
+
+    /// Whether a cursor request is deferred (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn cursor_deferred(&self) -> bool {
+        self.core().cursor.is_some()
+    }
+
+    /// The selection publications sent (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn selection_publications(&self) -> u64 {
+        self.core().sel_sent
     }
 
     /// The result begins: the play half goes (the play installation is not
@@ -808,6 +1130,7 @@ impl ChartImageWorker {
             return;
         };
         c.starter = Some((coord.clone(), spawner, publish.cloned()));
+        c.starter_cursor = false;
         c.begin_if_free();
     }
 
@@ -923,7 +1246,7 @@ impl ChartImageWorker {
         };
         if !asked {
             c.supersede();
-            if c.retiring.is_none() {
+            if c.retiring.is_none() && !c.sel_pending() {
                 c.publication = Some(Publication {
                     generation,
                     request,
@@ -979,10 +1302,14 @@ impl ChartImageWorker {
         c.publication = None;
         c.retiring = None;
         c.starter = None;
+        c.starter_cursor = false;
         c.sources = None;
         c.play = None;
         c.result = None;
         c.blocked = None;
+        c.cursor = None;
+        c.selection = None;
+        c.sel_publication = None;
         let deadline = Instant::now() + STOP_WAIT;
         for job in [c.job.take().map(|j| j.job), c.obsolete.take()]
             .into_iter()
@@ -1067,9 +1394,75 @@ fn run_job(
     }
 }
 
+/// The cursor job's work: `id`'s selection set ([`read_selection`]),
+/// keeping `prior`'s unchanged reads. Asks `cancel` throughout.
+fn run_cursor_job(id: &CursorId, prior: Option<&ChartImages>, cancel: &dyn Fn() -> bool) -> Output {
+    #[cfg(test)]
+    let before = COUNTS.with(std::cell::Cell::get);
+    #[cfg(test)]
+    assert!(
+        !PANIC.swap(false, std::sync::atomic::Ordering::AcqRel),
+        "an injected panic of the images' job"
+    );
+    let set = Arc::new(read_selection(id, prior, cancel));
+    Output::Cursor {
+        set,
+        #[cfg(test)]
+        counts: COUNTS.with(|c| {
+            let (d, f) = c.get();
+            (d - before.0, f - before.1)
+        }),
+    }
+}
+
 impl Core {
     fn generation(&self) -> u64 {
         self.generation.load(Ordering::SeqCst)
+    }
+
+    fn cursor_generation(&self) -> u64 {
+        self.cursor_generation.load(Ordering::SeqCst)
+    }
+
+    /// [`ChartImageWorker::cursor_changed`] under the held worker.
+    fn cursor_changed(&mut self, coord: &Coordinator) {
+        self.cursor_generation.fetch_add(1, Ordering::SeqCst);
+        self.cursor = None;
+        coord.advance(Scope::Cursor);
+        self.supersede_selection();
+    }
+
+    /// The selection publication is no longer the one asked for, by the
+    /// rule of [`supersede`](Self::supersede).
+    fn supersede_selection(&mut self) {
+        if let Some(mut p) = self.sel_publication.take() {
+            p.poll();
+            if p.pending() && self.retiring.is_none() {
+                self.retiring = Some(p);
+            }
+        }
+    }
+
+    /// Whether play's publication is unanswered.
+    fn play_pending(&self) -> bool {
+        self.publication.as_ref().is_some_and(Publication::pending)
+    }
+
+    /// Whether the selection publication is unanswered.
+    fn sel_pending(&self) -> bool {
+        self.sel_publication
+            .as_ref()
+            .is_some_and(Publication::pending)
+    }
+
+    /// Whether a job may not begin now: a job's thread alive, a
+    /// publication retiring, or any target's unanswered (SX20).
+    fn held_back(&self) -> bool {
+        self.job.is_some()
+            || self.obsolete.is_some()
+            || self.retiring.is_some()
+            || self.play_pending()
+            || self.sel_pending()
     }
 
     fn renew(&mut self) {
@@ -1102,9 +1495,12 @@ impl Core {
         if let Some(p) = &mut self.publication {
             p.poll();
         }
+        if let Some(p) = &mut self.sel_publication {
+            p.poll();
+        }
     }
 
-    fn retire(&mut self, job: OwnedJob<Arc<JobOut>>) {
+    fn retire(&mut self, job: OwnedJob<Arc<Output>>) {
         if let Some(old) = self.obsolete.take() {
             // Two ended jobs at once: the older is settled now; its
             // thread has ended or ends promptly once cancelled.
@@ -1251,7 +1647,8 @@ impl Core {
 
     /// Takes what ended: the answers, an obsolete job joined, and a
     /// finished job's output when it is of the current generation and
-    /// files and was not cancelled. Never blocks, never begins a job.
+    /// files (or the current cursor generation) and was not cancelled.
+    /// Never blocks, never begins a job.
     fn take_finished(&mut self) {
         self.poll_answers();
         if self.obsolete.as_ref().is_some_and(OwnedJob::finished)
@@ -1266,43 +1663,75 @@ impl Core {
             self.job = Some(job);
             return;
         }
-        let failed = || failed_out(&job.want, job.fresh, job.derive);
-        let (out, sent) = match job.job.poll().map(|o| o.outcome) {
-            Some(Outcome::Done(out)) => (Some(out), true),
+        let outcome = job.job.poll().map(|o| o.outcome);
+        settle_logged(job.job);
+        match job.target {
+            Target::Attempt {
+                want,
+                generation,
+                fresh,
+                derive,
+            } => self.attempt_finished(&want, generation, (fresh, derive), outcome),
+            Target::Cursor {
+                id,
+                cursor_generation,
+            } => self.cursor_finished(id, cursor_generation, outcome),
+        }
+    }
+
+    /// An attempt's job ended with `outcome`: its output adopted while it
+    /// is still the one asked for.
+    fn attempt_finished(
+        &mut self,
+        want: &Want,
+        generation: u64,
+        (fresh, derive): (bool, [bool; 2]),
+        outcome: Option<Outcome<Arc<Output>>>,
+    ) {
+        let (out, sent) = match outcome {
+            Some(Outcome::Done(out)) => match Arc::try_unwrap(out) {
+                Ok(Output::Attempt(out)) => (Some(out), true),
+                Err(a) => match &*a {
+                    Output::Attempt(a) => (
+                        Some(JobOut {
+                            sources: Arc::clone(&a.sources),
+                            fresh: a.fresh,
+                            play: a.play.clone(),
+                            result: a.result.clone(),
+                            #[cfg(test)]
+                            counts: a.counts,
+                        }),
+                        true,
+                    ),
+                    Output::Cursor { .. } => (None, false),
+                },
+                Ok(Output::Cursor { .. }) => (None, false),
+            },
             Some(Outcome::Panicked(p)) => {
                 log::warn!("chart images: the worker stopped unexpectedly: {}", p.0);
-                (Some(Arc::new(failed())), false)
+                (Some(failed_out(want, fresh, derive)), false)
             }
             // A cancelled read is never terminal: the next step reads again
             // what is still asked for.
             Some(Outcome::Cancelled) | None => (None, false),
         };
-        settle_logged(job.job);
         let Some(out) = out else {
             return;
         };
-        let out = Arc::try_unwrap(out).unwrap_or_else(|a| JobOut {
-            sources: Arc::clone(&a.sources),
-            fresh: a.fresh,
-            play: a.play.clone(),
-            result: a.result.clone(),
-            #[cfg(test)]
-            counts: a.counts,
-        });
         #[cfg(test)]
         {
             self.counts.0 += out.counts.0;
             self.counts.1 += out.counts.1;
         }
-        let current = job.generation == self.generation()
-            && self.want.as_ref().is_some_and(|w| w.same_files(&job.want));
+        let current = generation == self.generation()
+            && self.want.as_ref().is_some_and(|w| w.same_files(want));
         if current
-            && matches!(job.derive, [true, _])
-            && self.want.as_ref().is_some_and(|w| w.play == job.want.play)
+            && matches!(derive, [true, _])
+            && self.want.as_ref().is_some_and(|w| w.play == want.play)
             && let Some(p) = self
                 .publication
                 .as_mut()
-                .filter(|p| p.by_job && p.generation == job.generation && p.set.is_none())
+                .filter(|p| p.by_job && p.generation == generation && p.set.is_none())
         {
             // The job's own publication is of its play half when the job
             // sent it; a panicked job sent nothing, and its failed set is
@@ -1313,20 +1742,93 @@ impl Core {
                 p.unsent = true;
             }
         }
-        self.adopt(&job.want, job.generation, out);
+        self.adopt(want, generation, out);
+    }
+
+    /// The cursor's job for `id` in `cursor_generation` ended with
+    /// `outcome` (SX5-SX8): its set, or a panicked job's failed one, is
+    /// the selection set while that cursor generation is current, else
+    /// dropped (stale); a cancelled job leaves nothing. A failed set,
+    /// which the job never sent, is published by the next step.
+    fn cursor_finished(
+        &mut self,
+        id: CursorId,
+        cursor_generation: u64,
+        outcome: Option<Outcome<Arc<Output>>>,
+    ) {
+        let (set, sent) = match outcome {
+            Some(Outcome::Done(out)) => match &*out {
+                Output::Cursor {
+                    set,
+                    #[cfg(test)]
+                    counts,
+                } => {
+                    #[cfg(test)]
+                    {
+                        self.counts.0 += counts.0;
+                        self.counts.1 += counts.1;
+                    }
+                    (Arc::clone(set), true)
+                }
+                Output::Attempt(_) => return,
+            },
+            Some(Outcome::Panicked(p)) => {
+                log::warn!("chart images: the worker stopped unexpectedly: {}", p.0);
+                (Arc::new(ChartImages::absent(&Absent::Failed)), false)
+            }
+            Some(Outcome::Cancelled) | None => return,
+        };
+        if cursor_generation != self.cursor_generation() {
+            return;
+        }
+        if let Some(p) = self
+            .sel_publication
+            .as_mut()
+            .filter(|p| p.by_job && p.generation == cursor_generation && p.set.is_none())
+        {
+            if sent {
+                p.set = Some(Arc::clone(&set));
+            } else {
+                p.unsent = true;
+            }
+        }
+        self.adopt_selection(id, cursor_generation, set);
+    }
+
+    /// `set` is the selection set for `id` in `cursor_generation` (I7).
+    fn adopt_selection(&mut self, id: CursorId, cursor_generation: u64, set: Arc<ChartImages>) {
+        self.selection = Some(SelectionSet {
+            id,
+            cursor_generation,
+            set,
+        });
+        log::debug!(
+            "chart images: read for the cursor; {} bytes retained",
+            self.retained_bytes()
+        );
     }
 
     /// Begins the job the last step left, once no job's thread is alive and
     /// no publication is unanswered, so a new set is never read while the
     /// render thread may hold two. What is terminal for the play target
     /// (its current half, or absent with no chart layer) is published for
-    /// the skin in use first.
+    /// the skin in use first. With no want, the cursor's deferred request
+    /// is begun instead ([`begin_cursor`](Self::begin_cursor)): an
+    /// attempt's want comes first.
     fn begin_if_free(&mut self) {
         let Some((coord, spawner, publish)) = self.starter.clone() else {
             return;
         };
-        let Some(want) = self.want.clone().filter(|_| !self.ended) else {
+        if self.ended {
             self.starter = None;
+            return;
+        }
+        let Some(want) = self.want.clone() else {
+            if self.starter_cursor {
+                self.begin_cursor(&coord, spawner, publish.as_ref());
+            } else {
+                self.starter = None;
+            }
             return;
         };
         let generation = self.generation();
@@ -1350,7 +1852,7 @@ impl Core {
         if self.job.is_some() || self.obsolete.is_some() {
             return;
         }
-        if self.retiring.is_some() || self.publication.as_ref().is_some_and(Publication::pending) {
+        if self.retiring.is_some() || self.play_pending() || self.sel_pending() {
             self.blocked.get_or_insert_with(Instant::now);
             return;
         }
@@ -1395,7 +1897,7 @@ impl Core {
                 {
                     p.publish(generation, None, out.play.clone(), reply);
                 }
-                Arc::new(out)
+                Arc::new(Output::Attempt(out))
             },
         );
         match spawned {
@@ -1414,10 +1916,12 @@ impl Core {
                     });
                 }
                 self.job = Some(Job {
-                    want,
-                    generation,
-                    fresh,
-                    derive,
+                    target: Target::Attempt {
+                        want,
+                        generation,
+                        fresh,
+                        derive,
+                    },
                     job,
                 });
             }
@@ -1432,6 +1936,194 @@ impl Core {
                 self.begin_if_free();
             }
         }
+    }
+
+    /// Begins the cursor's deferred request once nothing holds the worker
+    /// (SX1, SX20): a request of an older cursor generation is dropped; the
+    /// last selection set's own request is that set again, published
+    /// without a job (D3); one naming no image is published absent at once
+    /// (SX2); otherwise its job reads it on its own subscriber, keeping
+    /// the last selection set's unchanged reads, and publishes what it
+    /// read unless cancelled. A job that cannot start leaves the images
+    /// absent (SX9).
+    fn begin_cursor(
+        &mut self,
+        coord: &Coordinator,
+        spawner: Spawner,
+        publish: Option<&crate::render_side::ChartPublisher>,
+    ) {
+        if self.cursor.is_none() || self.held_back() {
+            return;
+        }
+        let Some(request) = self.cursor.take() else {
+            return;
+        };
+        let cursor_generation = self.cursor_generation();
+        if request.cursor_generation != cursor_generation {
+            return;
+        }
+        let CursorRequest { id, subscriber, .. } = request;
+        let publish_now = |c: &mut Self, set: Arc<ChartImages>| {
+            if let Some(p) = publish {
+                c.publish_selection_now(p, cursor_generation, set);
+            }
+        };
+        if let Some(last) = self
+            .selection
+            .as_mut()
+            .filter(|s| s.id == id && ChartImage::ALL.into_iter().all(|w| reusable(s.set.read(w))))
+        {
+            last.cursor_generation = cursor_generation;
+            let set = Arc::clone(&last.set);
+            publish_now(self, set);
+            return;
+        }
+        if id.names.iter().all(|n| *n == library::Name::None) {
+            let set = Arc::new(ChartImages::absent(&Absent::NoHeader));
+            self.adopt_selection(id, cursor_generation, Arc::clone(&set));
+            publish_now(self, set);
+            return;
+        }
+        // The last selection set is the only candidate (D3).
+        let prior = self
+            .selection
+            .as_ref()
+            .filter(|s| s.id.side == id.side)
+            .map(|s| Arc::clone(&s.set));
+        self.begun += 1;
+        let key = JobKey {
+            kind: JobKind::ChartImages,
+            path: id.dir.clone(),
+            speed: bms_model::Speed::NORMAL,
+        };
+        let (sender, rx) = match publish {
+            Some(p) => {
+                let (reply, rx) = mpsc::sync_channel(1);
+                (Some((p.clone(), reply)), Some(rx))
+            }
+            None => (None, None),
+        };
+        let read = id.clone();
+        let spawned = coord.spawn_owned(
+            spawner,
+            key,
+            (Class::Foreground, false, Owner::Foreground),
+            subscriber,
+            |_| {},
+            move |ctx| {
+                let out = run_cursor_job(&read, prior.as_deref(), &|| ctx.cancelled());
+                if let Some((p, reply)) = sender
+                    && !ctx.cancelled()
+                    && let Output::Cursor { set, .. } = &out
+                {
+                    p.publish_selection(cursor_generation, Some(Arc::clone(set)), reply);
+                }
+                Arc::new(out)
+            },
+        );
+        match spawned {
+            Ok(job) => {
+                if let Some(rx) = rx {
+                    #[cfg(test)]
+                    {
+                        self.sel_sent += 1;
+                    }
+                    self.supersede_selection();
+                    self.sel_publication = Some(Publication {
+                        generation: cursor_generation,
+                        request: None,
+                        set: None,
+                        rx: Some(rx),
+                        ack: None,
+                        by_job: true,
+                        unsent: false,
+                        gone: false,
+                    });
+                }
+                self.job = Some(Job {
+                    target: Target::Cursor {
+                        id,
+                        cursor_generation,
+                    },
+                    job,
+                });
+            }
+            Err(e) => {
+                // A thread that cannot start: the images absent, the run
+                // goes on.
+                log::warn!("chart images: {e}");
+                let set = Arc::new(ChartImages::absent(&Absent::Failed));
+                self.adopt_selection(id, cursor_generation, Arc::clone(&set));
+                publish_now(self, set);
+            }
+        }
+    }
+
+    /// Publishes the selection set again when it is current for the
+    /// cursor generation and its last publication's answer is not (a
+    /// screen built again, SC6, SX11, SX19), or none was sent: no decode,
+    /// no move.
+    fn republish_selection(&mut self, publisher: &crate::render_side::ChartPublisher) {
+        let cursor_generation = self.cursor_generation();
+        let Some(set) = self
+            .selection
+            .as_ref()
+            .filter(|s| s.cursor_generation == cursor_generation)
+            .map(|s| Arc::clone(&s.set))
+        else {
+            return;
+        };
+        self.publish_selection_now(publisher, cursor_generation, set);
+    }
+
+    /// Publishes `set` for `cursor_generation` into the selection
+    /// installation, unless that very publication is asked for and its
+    /// answer, if any, is still current ([`PublicationKey::current`]: the
+    /// cursor generation and the live selection key); `false` when nothing
+    /// was sent: no selection installation to publish into (SX18: the last
+    /// answer stays not current until a new installation's key, which is
+    /// then asked for again), or another publication unanswered.
+    fn publish_selection_now(
+        &mut self,
+        publisher: &crate::render_side::ChartPublisher,
+        cursor_generation: u64,
+        set: Arc<ChartImages>,
+    ) -> bool {
+        self.poll_answers();
+        // Read after the answers: the render thread mirrors its targets
+        // before it answers.
+        let now = publisher.now(self.generation());
+        let asked = self.sel_publication.as_ref().is_some_and(|p| {
+            p.gone
+                || (p.generation == cursor_generation
+                    && same(p.set.as_ref(), Some(&set))
+                    && !p.unsent
+                    && p.ack.as_ref().is_none_or(|a| a.key.current(&now, None)))
+        });
+        if asked || now.selection.is_none() {
+            return asked;
+        }
+        self.supersede_selection();
+        if self.retiring.is_some() || self.play_pending() {
+            return false;
+        }
+        #[cfg(test)]
+        {
+            self.sel_sent += 1;
+        }
+        let (reply, rx) = mpsc::sync_channel(1);
+        publisher.publish_selection(cursor_generation, Some(Arc::clone(&set)), reply);
+        self.sel_publication = Some(Publication {
+            generation: cursor_generation,
+            request: None,
+            set: Some(set),
+            rx: Some(rx),
+            ack: None,
+            by_job: false,
+            unsent: false,
+            gone: false,
+        });
+        true
     }
 
     /// Publishes `set` (absent when `None`) for the skin in use, unless
@@ -1455,7 +2147,7 @@ impl Core {
             return true;
         }
         self.supersede();
-        if self.retiring.is_some() {
+        if self.retiring.is_some() || self.sel_pending() {
             return false;
         }
         let (reply, rx) = mpsc::sync_channel(1);
@@ -1485,8 +2177,9 @@ impl Core {
             .map(|(_, _, s)| s)
             .chain(self.play.iter().map(|h| &h.fits))
             .chain(self.result.iter().map(|h| &h.fits))
+            .chain(self.selection.iter().map(|s| &s.set))
             .chain(
-                [&self.publication, &self.retiring]
+                [&self.publication, &self.sel_publication, &self.retiring]
                     .into_iter()
                     .flatten()
                     .filter_map(|p| p.set.as_ref()),
@@ -1502,7 +2195,7 @@ impl Core {
 }
 
 /// Settles an ended job, logging a panic after its publication.
-fn settle_logged(job: OwnedJob<Arc<JobOut>>) {
+fn settle_logged(job: OwnedJob<Arc<Output>>) {
     if let Settled::Joined {
         after_panic: Some(p),
         ..

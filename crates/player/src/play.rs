@@ -195,6 +195,10 @@ pub struct PlayerRig<'a> {
     /// The page side of the committed play skin's chart layer, if it keeps
     /// one ([`crate::imports::Started::play_chart`]).
     pub play_chart: Option<u32>,
+    /// The page side of the selection skin's chart layer, if it keeps one
+    /// ([`crate::imports::Started::selection_chart`]): without one the
+    /// cursor asks for no image.
+    pub selection_chart: Option<u32>,
     /// The window's controls.
     pub controls: &'a Controls,
     /// Whether the window was shown: recording opens once it is. `None`
@@ -2908,7 +2912,7 @@ impl ResultRetries {
 }
 
 /// How long the chart images' wait parks between its looks.
-const IMAGE_SLICE: std::time::Duration = std::time::Duration::from_millis(2);
+pub(crate) const IMAGE_SLICE: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Where the wait for the chart's images ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

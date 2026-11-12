@@ -919,13 +919,6 @@ pub enum RenderMsg {
     /// Publish the cursor's chart images into the committed selection
     /// installation (S10-12); `set` `None` publishes them absent. Answer
     /// what it left.
-    #[cfg_attr(
-        not(all(test, feature = "dev-tools")),
-        expect(
-            dead_code,
-            reason = "the selection's image worker (S10-12 PR S, layer 2b) uses it"
-        )
-    )]
     SelectionChart {
         /// The cursor generation it is for: refused, nothing published,
         /// once the game thread set another.
@@ -1900,13 +1893,6 @@ fn hook_bound() -> Duration {
 #[derive(Clone)]
 pub struct ChartPublisher {
     tx: Sender<RenderMsg>,
-    #[cfg_attr(
-        not(all(test, feature = "dev-tools")),
-        expect(
-            dead_code,
-            reason = "the selection's image worker (S10-12 PR S, layer 2b) uses it"
-        )
-    )]
     shared: Arc<Shared>,
 }
 
@@ -1931,13 +1917,6 @@ impl ChartPublisher {
     /// Asks the render thread to publish the cursor's chart images `set`
     /// (absent when `None`) of `cursor_generation` into the selection
     /// installation, answering on `reply` ([`RenderMsg::SelectionChart`]).
-    #[cfg_attr(
-        not(all(test, feature = "dev-tools")),
-        expect(
-            dead_code,
-            reason = "the selection's image worker (S10-12 PR S, layer 2b) uses it"
-        )
-    )]
     pub fn publish_selection(
         &self,
         cursor_generation: u64,
@@ -1954,13 +1933,6 @@ impl ChartPublisher {
     /// The present an acknowledgment is checked against, as
     /// [`RenderLink::chart_now`] reads it, from any thread.
     #[must_use]
-    #[cfg_attr(
-        not(all(test, feature = "dev-tools")),
-        expect(
-            dead_code,
-            reason = "the selection's image worker (S10-12 PR S, layer 2b) uses it"
-        )
-    )]
     pub fn now(&self, generation: u64) -> crate::chart_images::ChartNow {
         self.shared.chart_now(generation)
     }
@@ -2429,14 +2401,9 @@ impl RenderLink {
     /// Asks the render thread to publish the cursor's chart images `set`
     /// (absent when `None`) of `cursor_generation` into the selection
     /// installation, answering on the receiver returned, which the caller
-    /// polls ([`RenderMsg::SelectionChart`]).
-    #[cfg_attr(
-        not(all(test, feature = "dev-tools")),
-        expect(
-            dead_code,
-            reason = "the selection's image worker (S10-12 PR S, layer 2b) uses it"
-        )
-    )]
+    /// polls ([`RenderMsg::SelectionChart`]); tests: the worker publishes
+    /// through its [`ChartPublisher::publish_selection`].
+    #[cfg(all(test, feature = "dev-tools"))]
     pub fn publish_selection_chart(
         &self,
         cursor_generation: u64,
@@ -2469,13 +2436,6 @@ impl RenderLink {
     /// worker: a selection publication or table of another one is not
     /// current.
     #[must_use]
-    #[cfg_attr(
-        not(all(test, feature = "dev-tools")),
-        expect(
-            dead_code,
-            reason = "the selection's image worker (S10-12 PR S, layer 2b) uses it"
-        )
-    )]
     pub fn cursor_generation(&self) -> Arc<AtomicU64> {
         Arc::clone(&self.shared.cursor_generation)
     }
@@ -7981,7 +7941,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn one_line(text: &str) -> crate::menu_screen::MenuPage {
+    pub(crate) fn one_line(text: &str) -> crate::menu_screen::MenuPage {
         crate::menu_screen::MenuPage {
             lines: vec![crate::menu_screen::MenuLine {
                 text: text.to_owned(),
@@ -9901,7 +9861,7 @@ pub(crate) mod tests {
     }
 
     /// The loading text of chart `title`.
-    fn chosen(title: &str) -> LoadingText {
+    pub(crate) fn chosen(title: &str) -> LoadingText {
         LoadingText {
             title: title.to_owned(),
             preset: "preset".to_owned(),
