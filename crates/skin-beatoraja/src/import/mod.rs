@@ -2039,7 +2039,7 @@ impl<'d> Cx<'d> {
     /// (`BMSPlayer.java:756`). `finishmargin` is read whether or not the
     /// skin defines a note, as `close` is, where the source sets it only
     /// while loading the note's destination
-    /// (`JsonPlaySkinObjectLoader.java:38-43`). Each is read as every
+    /// (`JsonPlaySkinObjectLoader.java:37-44`). Each is read as every
     /// integer field is: a value the reader refuses refuses the import.
     fn play_ending(&mut self) -> Result<PlayEnding, ImportError> {
         let finish_margin = self.top_int("finishmargin", 0)?;
