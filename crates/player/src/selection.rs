@@ -583,19 +583,15 @@ impl Selection {
     /// answered (the barrier); then a drag, once no batch is in flight and
     /// the press that began its hold was dispatched.
     fn pass(&mut self, level: Option<&input::PanelLevel>, now: TimeUs) -> Option<Pick> {
-        if let Some(sequence) = self.pointer.flight {
-            let mut slots = [crate::pointer::PointerSlot::EMPTY; crate::pointer::BATCH];
-            match self.pointer.shared.take_answers(sequence, &mut slots) {
-                crate::pointer::Taken::Waiting => return None,
-                crate::pointer::Taken::Gone => self.pointer.flight = None,
-                crate::pointer::Taken::Answered { built, len } => {
-                    self.pointer.flight = None;
-                    for slot in slots.iter().take(len) {
-                        if let Some(pick) = self.dispatch_pointer(*slot, built, level, now) {
-                            return Some(pick);
-                        }
-                    }
-                }
+        if self.pointer.take() == crate::pointer::Taken::Waiting {
+            return None;
+        }
+        // The answers in order; a pick leaves the rest for the next pass,
+        // which dispatches them if the pick was refused and selection
+        // stays.
+        while let Some((slot, built)) = self.pointer.next_answer() {
+            if let Some(pick) = self.dispatch_pointer(slot, built, level, now) {
+                return Some(pick);
             }
         }
         let mut taken = 0;
@@ -649,10 +645,9 @@ impl Selection {
                 return pick;
             }
         }
-        let presses = self.menu.presses_taken();
-        if let Some(drag) = self.pointer.shared.take_drag(|d| d.hold <= presses) {
+        if let Some(drag) = self.pointer.shared.take_drag(self.menu.presses_taken()) {
             self.refresh_pending();
-            let facts = self.pointer_facts(level);
+            let facts = self.pointer_facts();
             let act = crate::pointer::resolve_drag(&drag, &facts);
             let pick = self.pointer_act(act, level, now);
             #[cfg(test)]
@@ -673,10 +668,10 @@ impl Selection {
     }
 
     /// What the select screen is to a pointer input now.
-    fn pointer_facts(&self, level: Option<&input::PanelLevel>) -> crate::pointer::Facts {
-        // A panel held counts for the pointer while the search box has
-        // focus too: the box neither takes nor loses its focus then.
-        let held = level.and_then(|l| l.read().open()).or(self.feed.panel());
+    fn pointer_facts(&self) -> crate::pointer::Facts {
+        // The panel the screen shows: none while the search box has
+        // focus, where the pointer acts as without a panel.
+        let held = self.shown_panel();
         crate::pointer::Facts {
             lifetime: self.feed.lifetime,
             word: self.pointer.shared.word(),
@@ -706,7 +701,7 @@ impl Selection {
         now: TimeUs,
     ) -> Option<Pick> {
         self.refresh_pending();
-        let facts = self.pointer_facts(level);
+        let facts = self.pointer_facts();
         let screen = &self.screen;
         let resolved = crate::pointer::resolve(slot.request, slot.hit, built, &facts, |i| {
             screen.row_kind_at(i)

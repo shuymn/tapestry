@@ -200,6 +200,14 @@ pub struct DragCommand {
     pub command: SliderCommand,
 }
 
+/// The one drag command not yet taken, and the game thread to wake when
+/// one is written.
+#[derive(Debug, Default)]
+struct DragSlot {
+    command: Option<DragCommand>,
+    waker: Option<Thread>,
+}
+
 /// The pointer's state shared by the window, the game thread and the
 /// render thread, made once at startup.
 #[derive(Debug)]
@@ -212,7 +220,7 @@ pub struct PointerShared {
     position: AtomicU64,
     drag: Mutex<DragCell>,
     batch: Mutex<PointerBatch>,
-    drag_slot: Mutex<Option<DragCommand>>,
+    drag_slot: Mutex<DragSlot>,
     /// Presses and notches refused at the window: the queue held
     /// [`crate::select::QUEUED_POINTER`] pointer entries.
     dropped: AtomicU64,
@@ -337,6 +345,15 @@ impl PointerShared {
         }
     }
 
+    /// The thread a drag command wakes once written: the current one (the
+    /// game thread, at a selection's entry).
+    pub fn wake_on_drag(&self) {
+        self.drag_slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .waker = Some(std::thread::current());
+    }
+
     /// A selection lifetime begins or ends: the batch in flight is
     /// abandoned, and an untaken drag with it.
     pub fn reset(&self) {
@@ -347,24 +364,38 @@ impl PointerShared {
             b.len = 0;
             b.submitter = None;
         }
-        *self
-            .drag_slot
+        self.drag_slot
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) = None;
+            .unwrap_or_else(PoisonError::into_inner)
+            .command = None;
     }
 
-    /// Takes the drag slot's command once `ready` says its hold's press
-    /// was dispatched; one not ready stays.
-    pub fn take_drag(&self, ready: impl FnOnce(&DragCommand) -> bool) -> Option<DragCommand> {
+    /// Takes the drag slot's command when its hold's press is the last of
+    /// the `presses` taken out of the queue and dispatched: one whose press
+    /// is still queued stays, and one a later press followed is dropped (a
+    /// later press ended its hold).
+    pub fn take_drag(&self, presses: u64) -> Option<DragCommand> {
         let mut slot = self
             .drag_slot
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        if slot.as_ref().is_some_and(ready) {
-            slot.take()
-        } else {
-            None
+        match slot.command {
+            Some(d) if d.hold == presses => slot.command.take(),
+            Some(d) if d.hold < presses => {
+                slot.command = None;
+                None
+            }
+            _ => None,
         }
+    }
+
+    /// Writes a drag command, the latest replacing an untaken one (tests).
+    #[cfg(test)]
+    pub fn put_drag(&self, command: DragCommand) {
+        self.drag_slot
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .command = Some(command);
     }
 
     // The render thread's side.
@@ -400,15 +431,20 @@ impl PointerShared {
             return;
         }
         if let Some(command) = logic.bundle.skin().drag_at(&logic.sel, point(at), target) {
-            *self
+            let mut slot = self
                 .drag_slot
                 .lock()
-                .unwrap_or_else(PoisonError::into_inner) = Some(DragCommand {
+                .unwrap_or_else(PoisonError::into_inner);
+            slot.command = Some(DragCommand {
                 word,
                 hold,
                 built,
                 command,
             });
+            // The game thread takes it at its next look, now.
+            if let Some(t) = &slot.waker {
+                t.unpark();
+            }
         }
     }
 
@@ -467,13 +503,20 @@ pub const fn point(at: [i32; 2]) -> [f32; 2] {
     [x as f32, y as f32]
 }
 
-/// The game thread's side of the pointer: the shared state and the batch
-/// it has in flight, if any (the barrier).
-#[derive(Debug, Default)]
+/// The game thread's side of the pointer: the shared state, the batch it
+/// has in flight, if any (the barrier), and an answered batch's answers
+/// not yet dispatched (a pick left them, and a refused pick resumes them).
+#[derive(Debug)]
 pub struct PointerPass {
     pub shared: std::sync::Arc<PointerShared>,
     /// The sequence of the batch in flight.
     pub flight: Option<u64>,
+    answers: [PointerSlot; BATCH],
+    /// The build the answers were made on.
+    built: Option<Built>,
+    /// The answers taken, and the next to dispatch.
+    len: usize,
+    next: usize,
     /// While set, each input the pass dispatched, with the cursor after
     /// it (tests).
     #[cfg(test)]
@@ -498,25 +541,82 @@ impl PointerPass {
         Self {
             shared,
             flight: None,
+            answers: [PointerSlot::EMPTY; BATCH],
+            built: None,
+            len: 0,
+            next: 0,
             #[cfg(test)]
             log: None,
         }
     }
 
-    /// Selection of `lifetime` is entered: the window takes the pointer
-    /// for it, nothing of an earlier lifetime in flight.
+    /// Selection of `lifetime` is entered on the current thread: the window
+    /// takes the pointer for it, nothing of an earlier lifetime in flight,
+    /// and a drag wakes this thread.
     pub fn enter(&mut self, lifetime: u64) {
-        self.flight = None;
+        self.abandon();
         self.shared.reset();
+        self.shared.wake_on_drag();
         self.shared.publish(lifetime);
     }
 
     /// Selection is left: the window takes nothing more, and nothing in
-    /// flight is dispatched.
+    /// flight or answered is dispatched.
     pub fn leave(&mut self) {
-        self.flight = None;
+        self.abandon();
         self.shared.close();
         self.shared.reset();
+    }
+
+    fn abandon(&mut self) {
+        self.flight = None;
+        self.len = 0;
+        self.next = 0;
+    }
+
+    /// Whether nothing is in flight and every answer was dispatched
+    /// (dev-tools tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    #[must_use]
+    pub const fn settled(&self) -> bool {
+        self.flight.is_none() && self.next >= self.len
+    }
+
+    /// Takes the batch in flight's answers once the render thread answered
+    /// it; [`Taken::Waiting`] while it has not.
+    pub fn take(&mut self) -> Taken {
+        let Some(sequence) = self.flight else {
+            return Taken::Gone;
+        };
+        let taken = self.shared.take_answers(sequence, &mut self.answers);
+        match taken {
+            Taken::Waiting => {}
+            Taken::Gone => self.flight = None,
+            Taken::Answered { built, len } => {
+                self.flight = None;
+                self.built = built;
+                self.len = len;
+                self.next = 0;
+            }
+        }
+        taken
+    }
+
+    /// The next answer not yet dispatched, and the build it was made on;
+    /// it counts as dispatched from here.
+    pub fn next_answer(&mut self) -> Option<(PointerSlot, Option<Built>)> {
+        let slot = *self.answers.get(self.next.min(self.len))?;
+        if self.next >= self.len {
+            return None;
+        }
+        self.next += 1;
+        Some((slot, self.built))
+    }
+}
+
+impl Default for PointerPass {
+    fn default() -> Self {
+        Self::new(std::sync::Arc::default())
     }
 }
 
@@ -543,25 +643,21 @@ struct Held {
 
 impl Capture {
     /// Drops a held button whose word or scene is not `word` and `scene`
-    /// any more, and everything when `word` is inactive; whether the
-    /// pointer is taken now.
+    /// any more, or when `word` is inactive; whether the pointer is taken
+    /// now. The position is kept either way: a press after the next entry
+    /// is at the point the pointer rests on, and the hover draws there.
     fn check(&mut self, shared: &PointerShared, word: u64, scene: u64) -> bool {
+        let active = is_active(word);
         if self
             .held
-            .is_some_and(|h| h.word != word || h.scene != scene)
+            .is_some_and(|h| !active || h.word != word || h.scene != scene)
         {
             self.drop_held(shared);
         }
         if self.wheel.1 != word {
             self.wheel = (0.0, word);
         }
-        if !is_active(word) {
-            self.drop_held(shared);
-            self.position = None;
-            shared.set_position(None);
-            return false;
-        }
-        true
+        active
     }
 
     fn drop_held(&mut self, shared: &PointerShared) {
@@ -572,12 +668,10 @@ impl Capture {
     /// The pointer moved to `at` in the window: the hover's point, and a
     /// drag while a button is held.
     pub fn moved(&mut self, shared: &PointerShared, at: [i32; 2], word: u64, scene: u64) {
-        if !self.check(shared, word, scene) {
-            return;
-        }
+        let active = self.check(shared, word, scene);
         self.position = Some(at);
         shared.set_position(Some(at));
-        if self.held.is_some() {
+        if active && self.held.is_some() {
             let mut cell = shared.drag_cell();
             cell.at = at;
             cell.sequence = cell.sequence.wrapping_add(1);
@@ -916,7 +1010,8 @@ mod tests {
         let (presses, queued) = (std::cell::Cell::new(0), std::cell::RefCell::new(Vec::new()));
         let mut c = Capture::default();
         c.moved(&s, [10, 20], W7 & !1, 0);
-        assert_eq!(s.position(), None);
+        // The position is followed, nothing queued.
+        assert_eq!(s.position(), Some([10, 20]));
         c.button(
             &s,
             Button::Left,
@@ -932,11 +1027,59 @@ mod tests {
         c.button(&s, Button::Left, true, W7, 0, admitting(&presses, &queued));
         assert_eq!(s.drag_now().held, Some(Button::Left));
         assert_eq!(s.drag_now().hold, 1);
-        // The word closes: the next event drops it, and the hover.
+        // The word closes: the next event drops the hold; the position
+        // stays followed.
         c.moved(&s, [11, 20], W7 & !1, 0);
         assert_eq!(s.drag_now().held, None);
-        assert_eq!(s.position(), None);
+        assert_eq!(s.position(), Some([11, 20]));
         assert_eq!(queued.borrow().len(), 1);
+    }
+
+    /// Selection left and entered again with the pointer resting where it
+    /// moved meanwhile: a press without a move is queued there, and the
+    /// hover's point is that one; only leaving the window or a focus loss
+    /// forgets it.
+    #[test]
+    fn the_position_outlives_an_inactive_word() {
+        let s = PointerShared::default();
+        let (presses, queued) = (std::cell::Cell::new(0), std::cell::RefCell::new(Vec::new()));
+        let mut c = Capture::default();
+        c.moved(&s, [1, 1], W7, 0);
+        // Selection left (the decision screen, a play): the pointer moves.
+        c.moved(&s, [30, 40], W7 & !1, 0);
+        c.button(
+            &s,
+            Button::Left,
+            true,
+            W7 & !1,
+            0,
+            admitting(&presses, &queued),
+        );
+        c.button(
+            &s,
+            Button::Left,
+            false,
+            W7 & !1,
+            0,
+            admitting(&presses, &queued),
+        );
+        assert!(queued.borrow().is_empty());
+        // Entered again (lifetime 8, another scene): the same point.
+        assert_eq!(s.position(), Some([30, 40]));
+        c.button(&s, Button::Left, true, W8, 1, admitting(&presses, &queued));
+        assert_eq!(
+            *queued.borrow(),
+            [MenuInput::Pointer {
+                button: Button::Left,
+                at: [30, 40],
+                word: W8
+            }]
+        );
+        c.left(&s, W8, 1);
+        assert_eq!(s.position(), None);
+        c.moved(&s, [5, 5], W8, 1);
+        c.focus_lost(&s);
+        assert_eq!(s.position(), None);
     }
 
     #[test]
@@ -1398,11 +1541,15 @@ mod tests {
                 },
             },
         };
-        *s.drag_slot.lock().unwrap() = Some(cmd(3));
-        assert_eq!(s.take_drag(|d| d.hold <= 2), None);
-        *s.drag_slot.lock().unwrap() = Some(cmd(2));
-        assert_eq!(s.take_drag(|d| d.hold <= 2), Some(cmd(2)));
-        assert_eq!(s.take_drag(|_| true), None);
+        // Its press not yet taken out: it stays.
+        s.put_drag(cmd(3));
+        assert_eq!(s.take_drag(2), None);
+        assert_eq!(s.take_drag(3), Some(cmd(3)));
+        assert_eq!(s.take_drag(3), None);
+        // A later press dispatched: dropped.
+        s.put_drag(cmd(2));
+        assert_eq!(s.take_drag(3), None);
+        assert_eq!(s.take_drag(2), None);
         assert_eq!(resolve_drag(&cmd(2), &facts()), PointerAct::MoveTo(2));
         let panel = Facts {
             panel: true,

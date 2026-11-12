@@ -265,7 +265,7 @@ fn take_all(rig: &mut PlayerRig<'_>) -> Option<game::Pick> {
             return Some(pick);
         }
         let s = sel_of(rig);
-        if s.pointer.flight.is_none() && s.menu.queued() == 0 {
+        if s.pointer.settled() && s.menu.queued() == 0 {
             return None;
         }
         assert!(Instant::now() < deadline, "a batch was never answered");
@@ -880,10 +880,11 @@ fn the_search_text_takes_focus_and_a_press_outside_takes_it_away() {
 
 /// P13: under panel 3 only the order button acts: a press on a row, on
 /// event 15, on empty space (right) or in search text 30, a notch and a
-/// drag on the list slider do nothing, the search box focused before the
-/// panel opened keeping its focus; event 331 and slider 17 take the press
-/// over the row under them and change nothing; the hover image still
-/// draws under the pointer.
+/// drag on the list slider do nothing; event 331 and slider 17 take the
+/// press over the row under them and change nothing; the hover image still
+/// draws under the pointer. With the search box focused, SELECT held opens
+/// no panel (design.md "Input"): a press on empty space acts as without
+/// one, taking the focus away, and the panel opens with it.
 #[test]
 fn under_a_panel_only_the_order_button_acts() {
     let dir = tempfile::tempdir().unwrap();
@@ -892,19 +893,19 @@ fn under_a_panel_only_the_order_button_acts() {
     on_pointer(sel, true, Some(level), |rig, w, screens| {
         let c = rig.controls;
         let searching = |rig: &PlayerRig<'_>| sel_of(rig).screen.searching();
-        // The box focused, then SELECT held: panel 3.
+        // The box focused, then SELECT held: no panel while it has focus.
         w.key(MenuKey::Tab);
         act(rig, screens);
         log(rig);
         panel_key(&mut set, 0x11, 1);
+        act(rig, screens);
+        assert_eq!(sel_of(rig).feed.panel(), None);
         w.click(c, EMPTY, Button::Left);
         act(rig, screens);
         assert_eq!(log(rig), [(Press(Nothing), 0)]);
-        assert!(searching(rig));
-        w.key(MenuKey::Tab);
-        act(rig, screens);
         assert!(!searching(rig));
-        log(rig);
+        // The focus gone, panel 3 shows.
+        assert!(sel_of(rig).feed.panel().is_some());
         w.click(c, row(0, 2), Button::Left);
         w.click(c, PLAY, Button::Left);
         w.click(c, EMPTY, Button::Right);
@@ -1286,10 +1287,10 @@ fn the_pointer_keeps_its_order_and_its_bounds() {
         w.key(MenuKey::Home);
         act(rig, screens);
         log(rig);
-        // Drags competing: the list slider held and moved 50 times a frame
-        // for 5 frames, 60 middle presses on the order button queued.
+        // Drags competing: 60 middle presses on the order button queued,
+        // then the list slider held and moved 50 times a frame for 5
+        // frames (a press after the hold's would end its drag).
         hold(screens);
-        w.down(c, list_slider(0), Button::Left);
         let word = w.shared.word();
         for _ in 0..60 {
             assert!(
@@ -1305,6 +1306,7 @@ fn the_pointer_keeps_its_order_and_its_bounds() {
                     .is_some()
             );
         }
+        w.down(c, list_slider(0), Button::Left);
         for _ in 0..5 {
             for k in 1..=50 {
                 w.to(c, list_slider(20 * k));
@@ -1324,8 +1326,10 @@ fn the_pointer_keeps_its_order_and_its_bounds() {
             .collect();
         assert_eq!(steps, 60, "{l:?}");
         assert!((1..=5).contains(&drags.len()), "{l:?}");
-        assert_eq!(l[0], (Press(MoveTo(0)), 0), "{l:?}");
-        assert!(drags[0] > 0);
+        // The hold's press after the 60 order steps: the list they made
+        // anew is not the one it was drawn with.
+        assert_eq!(l[60], (Press(Nothing), 0), "{l:?}");
+        assert!(drags[0] > 60);
         assert_eq!(w.shared.dropped(), 1);
         assert_eq!(sel_of(rig).screen.order(), 0);
         release(screens);
@@ -1468,20 +1472,17 @@ fn pointer_dispatch_alloc() {
     assert!(sel.pointer.flight.is_none());
     let capacity = menu.capacity();
     let round = |sel: &mut Selection, capture: &mut Capture, seen: &mut u64| {
-        for k in 0..64 {
+        let admit = |i| menu.push_stamped(i, None);
+        capture.button(&shared, Button::Left, false, word, 0, admit);
+        // 63 clicks on rows, then the hold the drags belong to.
+        for k in 0..63 {
             let at = if k % 2 == 0 { slot(1) } else { slot(5) };
-            assert!(
-                menu.push_stamped(
-                    MenuInput::Pointer {
-                        button: Button::Left,
-                        at,
-                        word,
-                    },
-                    None,
-                )
-                .is_some()
-            );
+            capture.moved(&shared, at, word, 0);
+            capture.button(&shared, Button::Left, true, word, 0, admit);
+            capture.button(&shared, Button::Left, false, word, 0, admit);
         }
+        capture.moved(&shared, list_slider(0), word, 0);
+        capture.button(&shared, Button::Left, true, word, 0, admit);
         assert!(sel.pass(None, TimeUs(0)).is_none());
         assert!(sel.pointer.flight.is_some());
         shared.serve(Some(built), Some(&logic), target, seen);
@@ -1496,7 +1497,7 @@ fn pointer_dispatch_alloc() {
     let taken = menu.presses_taken();
     let n = counted(&mut || round(&mut sel, &mut capture, &mut seen));
     assert_eq!(n, 0);
-    // Every press dispatched (the last on chart e), then the drag to the
+    // Every press dispatched (the last the hold's), then the drag to the
     // list slider's end: the last row.
     assert_eq!(menu.presses_taken(), taken + 64);
     assert_eq!((menu.queued(), sel.pointer.flight), (0, None));
@@ -1513,4 +1514,145 @@ fn pointer_dispatch_alloc() {
         "{}",
         size_of::<DragCommand>()
     );
+}
+
+/// A drag with no other input wakes the game thread once its command is
+/// written: one look after the wake applies it.
+#[test]
+fn a_drag_alone_wakes_the_game_thread() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 3);
+    on_pointer(sel, true, None, |rig, w, screens| {
+        let c = rig.controls;
+        w.down(c, list_slider(0), Button::Left);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(MoveTo(0)), 0)]);
+        // A wake owed from before is taken.
+        std::thread::park_timeout(Duration::ZERO);
+        w.to(c, list_slider(1_000));
+        let began = Instant::now();
+        std::thread::park_timeout(Duration::from_secs(30));
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "not woken: {:?}",
+            began.elapsed()
+        );
+        assert!(rig.look().is_none());
+        assert_eq!(log(rig), [(Drag(MoveTo(3)), 3)]);
+    });
+}
+
+/// A drag written for a hold and left untaken does nothing once a later
+/// press was dispatched: the list slider held and dragged to its end while
+/// the game thread looks nowhere, released, then row 2 clicked: the
+/// cursor ends on row 2.
+#[test]
+fn a_later_press_ends_a_drag_left_untaken() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 5);
+    on_pointer(sel, true, None, |rig, w, screens| {
+        let c = rig.controls;
+        w.down(c, list_slider(0), Button::Left);
+        act(rig, screens);
+        log(rig);
+        w.to(c, list_slider(1_000));
+        frames(screens, 2);
+        w.up(c, Button::Left);
+        w.click(c, row(0, 2), Button::Left);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(MoveTo(2)), 2)]);
+        assert_eq!(cursor(rig), 2);
+    });
+}
+
+/// A pick made by one answer of a batch and refused (no play skin ready)
+/// leaves selection in front: the batch's later answers act at the next
+/// pass, in order.
+#[test]
+fn a_refused_pick_leaves_the_rest_of_its_batch_to_act() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 5);
+    on_pointer(sel, true, None, |rig, w, screens| {
+        let c = rig.controls;
+        for _ in 0..3 {
+            w.key(MenuKey::Down);
+        }
+        act(rig, screens);
+        assert_eq!(cursor(rig), 3);
+        log(rig);
+        rig.skin = crate::render_side::SkinState::Refused("not ready".to_owned());
+        // One batch: Enter on the drawn cursor's row, a move to row 1 and
+        // two notches.
+        hold(screens);
+        w.click(c, row(3, 3), Button::Left);
+        w.click(c, row(3, 1), Button::Left);
+        w.wheel(c, 2);
+        assert!(rig.look().is_none());
+        grant(screens, 1);
+        assert_eq!(take_all(rig), None);
+        assert_eq!(
+            log(rig),
+            [
+                (Press(Key(MenuKey::Enter)), 3),
+                (Press(MoveTo(1)), 1),
+                (Notch(Rows(2)), 3),
+            ]
+        );
+        release(screens);
+    });
+}
+
+/// P17: a pass that stops at 128 entries with the press of a hold still
+/// queued applies no drag of that hold; the next pass dispatches the
+/// press, then the drag.
+#[test]
+fn a_drag_waits_for_its_press_past_a_full_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 3);
+    on_pointer(sel, true, None, |rig, w, screens| {
+        let c = rig.controls;
+        // 128 entries that change nothing outside the search box: a held
+        // Backspace's repeats and one-letter texts, alternating.
+        for _ in 0..64 {
+            w.key(MenuKey::BackspaceHeld);
+            w.menu.push(MenuInput::Text("a".to_owned()));
+        }
+        w.down(c, list_slider(0), Button::Left);
+        w.to(c, list_slider(1_000));
+        // The render thread wrote the hold's drag.
+        frames(screens, 2);
+        assert!(rig.look().is_none());
+        let l = log(rig);
+        assert_eq!(l.len(), 128);
+        assert!(l.iter().all(|&e| e == (Input, 0)), "{l:?}");
+        assert_eq!(cursor(rig), 0);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(MoveTo(0)), 0), (Drag(MoveTo(3)), 3)]);
+    });
+}
+
+/// P2: with the render thread a frame behind, a press on the row the
+/// cursor moved to since that frame, drawn off its cursor, moves there
+/// (nothing to move) and is not Enter.
+#[test]
+fn a_press_on_the_cursors_row_drawn_off_the_cursor_is_no_enter() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 4);
+    on_pointer(sel, true, None, |rig, w, screens| {
+        let c = rig.controls;
+        w.key(MenuKey::Down);
+        w.key(MenuKey::Down);
+        act(rig, screens);
+        assert_eq!(cursor(rig), 2);
+        log(rig);
+        hold(screens);
+        w.key(MenuKey::Down);
+        w.click(c, row(2, 3), Button::Left);
+        assert!(rig.look().is_none());
+        assert_eq!(cursor(rig), 3);
+        grant(screens, 1);
+        assert_eq!(take_all(rig), None);
+        assert_eq!(log(rig), [(Input, 3), (Press(MoveTo(3)), 3)]);
+        release(screens);
+    });
 }
