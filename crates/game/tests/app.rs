@@ -1749,10 +1749,10 @@ fn attempts(reports: &[PlayReport]) -> Vec<u32> {
 fn select_play_retry_back_select_again() {
     let acts = vec![
         (0, Act::Choose(0)),
-        (4_000, Act::Retry),
-        (4_000, Act::Back),
+        (9_000, Act::Retry),
+        (9_000, Act::Back),
         (500, Act::Choose(1)),
-        (4_000, Act::Close),
+        (9_000, Act::Close),
     ];
     let (rig, events, ran) = run(Refusal::Missing, acts, |_| {});
     ran.unwrap();
@@ -1832,11 +1832,11 @@ fn select_play_retry_back_select_again() {
 fn configure_sets_each_charts_session() {
     let acts = vec![
         (0, Act::Choose(0)),
-        (4_000, Act::Back),
+        (9_000, Act::Back),
         (500, Act::Choose(1)),
-        (4_000, Act::Back),
+        (9_000, Act::Back),
         (500, Act::Choose(0)),
-        (4_000, Act::Close),
+        (9_000, Act::Close),
     ];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| rig.unsaved = vec![1]);
     ran.unwrap();
@@ -1865,7 +1865,7 @@ fn refused_chart_returns_to_selection_then_valid_chart_plays() {
         let acts = vec![
             (0, Act::Choose(2)),
             (500, Act::Choose(0)),
-            (4_000, Act::Close),
+            (9_000, Act::Close),
         ];
         let (rig, events, ran) = run(refusal, acts, |_| {});
         ran.unwrap();
@@ -1922,9 +1922,9 @@ fn refused_chart_returns_to_selection_then_valid_chart_plays() {
 fn queued_menu_commands_do_not_outlive_their_result() {
     let acts = vec![
         (0, Act::Choose(0)),
-        (4_000, Act::Retry),
+        (9_000, Act::Retry),
         (0, Act::Back),
-        (4_000, Act::Close),
+        (9_000, Act::Close),
     ];
     let (rig, _, ran) = run(Refusal::Missing, acts, |r| r.keep_queued = true);
     ran.unwrap();
@@ -1978,8 +1978,10 @@ fn quit_shows_the_result_close_ends_the_run() {
     assert_eq!(rig.next, 5);
 }
 
-/// Chart A's play completes about 2.7 s after its choice; with a 2 s tail,
-/// 3.5 s after it falls in the tail.
+/// Chart A's play completes about 2.7 s after its choice; its tail lasts
+/// at least the rig's 2 s of audio, and a full play's holds until 5 s
+/// past its last note's end (design.md "Play Lifecycle", Audio tail), so
+/// 3.5 s after the choice falls in the tail.
 const IN_THE_TAIL: i64 = 3_500;
 
 /// The quit key once the play is complete skips its audio tail to the
@@ -1993,7 +1995,7 @@ fn quit_in_the_tail_skips_to_the_result() {
         (IN_THE_TAIL, Act::Quit),
         (1_500, Act::Quit),
         (500, Act::Choose(1)),
-        (6_000, Act::Close),
+        (11_000, Act::Close),
     ];
     let (rig, events, ran) = run(Refusal::Missing, acts, |r| r.tail_waits = 2_000);
     ran.unwrap();
@@ -2052,7 +2054,7 @@ fn retry_in_the_tail_retries() {
     let acts = vec![
         (0, Act::Choose(0)),
         (IN_THE_TAIL, Act::Retry),
-        (5_000, Act::Close),
+        (10_000, Act::Close),
     ];
     let (rig, _, ran) = run(Refusal::Missing, acts, |r| r.tail_waits = 2_000);
     ran.unwrap();
@@ -2123,7 +2125,7 @@ fn commands_in_selection_are_ignored() {
         (0, Act::Next),
         (0, Act::Prev),
         (100, Act::Choose(0)),
-        (4_000, Act::Close),
+        (9_000, Act::Close),
     ];
     let (rig, _, ran) = run(Refusal::Missing, acts, |_| {});
     ran.unwrap();
@@ -2138,11 +2140,11 @@ fn commands_in_selection_are_ignored() {
 fn preset_switch_keeps_the_result_and_the_play_preset() {
     let acts = vec![
         (0, Act::Choose(0)),
-        (4_000, Act::Next),
+        (9_000, Act::Next),
         (100, Act::Prev),
         (100, Act::Next),
         (100, Act::Retry),
-        (4_000, Act::Close),
+        (9_000, Act::Close),
     ];
     let (rig, _, ran) = run(Refusal::Missing, acts, |_| {});
     ran.unwrap();
@@ -2221,10 +2223,10 @@ fn steps_before_a_choice_in_one_batch_apply_first() {
     let acts = vec![
         (0, Act::Choose(0)),
         (0, NEXT),
-        (4_000, Act::Back),
+        (9_000, Act::Back),
         (500, NEXT),
         (100, Act::Choose(1)),
-        (4_000, Act::Close),
+        (9_000, Act::Close),
     ];
     let (rig, _, ran) = run(Refusal::Missing, acts, |_| {});
     ran.unwrap();
@@ -2306,7 +2308,7 @@ fn a_step_recovers_a_shelf_that_cannot_open() {
         (0, Act::Choose(0)),
         (100, PREV),
         (100, Act::Choose(0)),
-        (4_000, Act::Close),
+        (9_000, Act::Close),
     ];
     let dir = tempfile::tempdir().unwrap();
     let mut app = app_named(dir.path(), Refusal::Missing, "gone", &Events::default());
@@ -2340,7 +2342,7 @@ fn steps_outside_selection_are_ignored() {
         (0, Act::Choose(0)),
         // In play, then on the result.
         (500, NEXT),
-        (4_000, NEXT),
+        (9_000, NEXT),
         (100, Act::Back),
         (500, Act::Practice(0)),
         // On the practice page.
@@ -2348,7 +2350,7 @@ fn steps_outside_selection_are_ignored() {
         (100, Act::Page(PracticeInput::Back)),
     ];
     // In selection: taken.
-    acts.extend([(500, NEXT), (100, Act::Choose(1)), (4_000, Act::Close)]);
+    acts.extend([(500, NEXT), (100, Act::Choose(1)), (9_000, Act::Close)]);
     let (rig, _, ran) = run(Refusal::Missing, acts, |_| {});
     ran.unwrap();
     assert!(rig.violations.is_empty(), "{:?}", rig.violations);
@@ -2405,7 +2407,7 @@ fn input_failure_in_play_ends_the_run_after_the_result() {
 /// anew; one that cannot be built ends the run.
 #[test]
 fn screen_failure_in_selection_rebuilds_or_ends_the_run() {
-    let acts = vec![(500, Act::Choose(0)), (4_000, Act::Close)];
+    let acts = vec![(500, Act::Choose(0)), (9_000, Act::Close)];
     let (rig, events, ran) = run(Refusal::Missing, acts.clone(), |r| {
         r.screen_fails_at = CLOCK_START + 100 * MS;
     });
@@ -2461,7 +2463,7 @@ fn a_cancelled_load_leaves_before_any_preparation() {
         (0, Act::Choose(0)),
         (0, Act::Quit),
         (500, Act::Choose(1)),
-        (4_000, Act::Close),
+        (9_000, Act::Close),
     ];
     let (rig, _, ran) = run(Refusal::Missing, acts, |r| r.cancel_loads = vec![0]);
     ran.unwrap();
@@ -2847,12 +2849,12 @@ fn select_screen_polls_the_shelf() {
 fn shelf_survives_returning_to_select() {
     let acts = vec![
         (0, Act::Choose(0)),
-        (4_000, Act::Back),
+        (9_000, Act::Back),
         (1_000, Act::Choose(1)),
-        (4_000, Act::Back),
+        (9_000, Act::Back),
         (1_000, Act::Close),
     ];
-    let (broken, fixed) = (CLOCK_START + 4_500 * MS, CLOCK_START + 9_500 * MS);
+    let (broken, fixed) = (CLOCK_START + 9_500 * MS, CLOCK_START + 19_500 * MS);
     let (rig, app, dir, ran) = run_mine(Refusal::Missing, acts, |r, dir| {
         edit(r, broken, &mine_path(dir), "windows = [".to_owned());
         edit(
@@ -2998,7 +3000,7 @@ fn unloadable_chosen_preset_refuses_then_heals_on_select() {
     let acts = vec![
         (0, Act::Choose(2)),
         (500, Act::Choose(0)),
-        (4_000, Act::Close),
+        (9_000, Act::Close),
     ];
     let (rig, _, ran) = run(Refusal::Preset, acts, |r| {
         r.screen_fails_at = CLOCK_START + 300 * MS;
@@ -3583,7 +3585,7 @@ fn a_refused_preparation_returns_to_selection_which_stays_usable() {
     let acts = vec![
         (0, Act::Choose(0)),
         (500, Act::Choose(1)),
-        (4_000, Act::Close),
+        (9_000, Act::Close),
     ];
     let (rig, events, ran) = run(Refusal::Missing, acts, |rig| rig.refuse_attempts = 1);
     ran.unwrap();
@@ -4523,7 +4525,7 @@ fn a_chart_refused_by_its_read_job_returns_to_selection() {
     let acts = vec![
         (0, Act::Choose(2)),
         (500, Act::Choose(0)),
-        (4_000, Act::Close),
+        (9_000, Act::Close),
     ];
     let run = run_probed(
         Refusal::TooLongAtSpeed,
@@ -4560,7 +4562,7 @@ fn a_quit_while_the_ingest_waits_for_a_permit_leaves() {
             vec![
                 (0, Act::Choose(0)),
                 (500, Act::Choose(1)),
-                (4_000, Act::Close),
+                (9_000, Act::Close),
             ]
         } else {
             vec![(0, Act::Choose(0)), (4_000, Act::Close)]
@@ -4654,7 +4656,7 @@ fn a_quit_during_the_ingest_settles_its_thread_then_leaves() {
     let acts = vec![
         (0, Act::Choose(0)),
         (500, Act::Choose(1)),
-        (4_000, Act::Close),
+        (9_000, Act::Close),
     ];
     let run = run_stopped_read(acts, 0, false, InLoad::Quit);
     run.ran.as_ref().unwrap();
@@ -5539,7 +5541,7 @@ fn a_screen_lost_during_a_pending_read_is_rebuilt_with_no_second_tone() {
 fn each_choice_shows_its_own_decision_screen() {
     let acts = vec![
         (0, Act::Choose(0)),
-        (6_000, Act::Back),
+        (11_000, Act::Back),
         (8_000, Act::Choose(0)),
         (14_000, Act::Close),
     ];

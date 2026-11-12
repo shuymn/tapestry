@@ -1102,10 +1102,10 @@ fn session_waits_for_audio_tail_after_completion() {
     // note inputs.
     assert_eq!(rec.events.len(), 4 + 115 + 114);
     // The session waited for the 3 s BGM sound started at chart 1.0 s
-    // (session time 2.0 s), which plays until 5.0 s. The engine mixes a
-    // block one period after its wake, two periods ahead of playback, so
-    // the last block of it is written at the wake at 5.0 s − 3 × 10 ms.
-    assert_eq!(s.now(), TimeUs(4_970 * MS));
+    // (session time 2.0 s), which plays until 5.0 s, and for the full
+    // play's hold, 5 s past its last note's end at chart 1.1 s, which ends
+    // later: at session time 7.1 s.
+    assert_eq!(s.now(), TimeUs(7_100 * MS));
 
     // Retry during the next play's tail: it still restarts.
     let two = s

@@ -673,6 +673,16 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         self.publish_view();
     }
 
+    /// A full play's fade-out started at play time `at` (design.md "Play
+    /// Lifecycle", Audio tail): publishes the view again with
+    /// [`PlayView::fading`] at `at`, so every later frame draws the
+    /// fade-out from `at`. Closing never calls it.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn enter_fade(&mut self, at: TimeUs) {
+        self.fading = Some(at);
+        self.publish_view();
+    }
+
     /// The events emitted by the last step.
     #[must_use]
     pub fn events(&self) -> &[JudgeEvent] {
