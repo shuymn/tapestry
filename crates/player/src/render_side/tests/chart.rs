@@ -23,6 +23,8 @@ struct Charts {
     published: u32,
     /// Absent publications among them.
     absent: u32,
+    /// A publication waits on `hold` now.
+    stalled: bool,
     /// Each loading frame's lifetime, and whether a table was published
     /// as it was drawn.
     frames: Vec<(u64, bool)>,
@@ -39,9 +41,11 @@ struct ChartScreen {
 impl ChartScreen {
     fn publish(&self) -> Result<ChartTable, RenderError> {
         while self.hold.load(Ordering::Acquire) {
+            self.charts.lock().unwrap().stalled = true;
             std::thread::sleep(Duration::from_millis(1));
         }
         let mut c = self.charts.lock().unwrap();
+        c.stalled = false;
         c.table = true;
         c.published += 1;
         Ok(ChartTable::ABSENT)
@@ -425,6 +429,8 @@ fn a_stalled_render_thread_holds_back_the_next_reads() {
         w.service();
         std::thread::sleep(Duration::from_millis(1));
     }
+    // The render thread holds A's publication.
+    assert!(wait_until(|| r.charts.lock().unwrap().stalled));
     for d in [&b, &c] {
         w.renew();
         w.want(want_in(d.path(), Some(2_048)));
