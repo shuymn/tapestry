@@ -818,6 +818,27 @@ pub fn stage_labels(
     }))
 }
 
+/// [`stage_labels`] of `job` on this thread with `bundle`'s skin and
+/// producer, never superseded: a rebuild's restaging of a pinned slot's
+/// labels. Preparation work: it allocates.
+///
+/// # Errors
+///
+/// As [`stage_labels`].
+pub fn stage_bundle_labels(
+    bundle: &crate::SkinBundle,
+    job: LabelJob,
+) -> Result<Option<StagedLabels>, RenderError> {
+    let producer = bundle.text_producer().map(|p| &**p);
+    stage_labels(
+        bundle.skin(),
+        producer,
+        job,
+        &mut LabelScratch::default(),
+        &|| false,
+    )
+}
+
 /// The worker's own text buffers: a line's A8 pixels, kept, and the
 /// levels it is expanding.
 #[derive(Debug, Default)]
@@ -1526,6 +1547,61 @@ pub(crate) fn settle(t: &LabelTarget<'_>, store: &mut LabelStore) -> Result<Sett
         }
         Publish::Unhealthy => Ok(Settled::Unhealthy),
     }
+}
+
+/// Rebuilds pinned slot `slot`'s content from `staged`, its generation's
+/// strings staged again at the new target, after the renderer was built
+/// again: every row written at once (unbudgeted: a rebuild blocks
+/// already), the writes waited for, then installed under the same
+/// generation. The book is not touched: the slot stays pinned. Whatever
+/// was filling or waiting is dropped first.
+///
+/// # Errors
+///
+/// As [`settle`]: the poll's failure or the device lost (not refusals),
+/// or a write's refusal or rasterized lines with no region (refusals).
+pub(crate) fn restore_pinned(
+    t: &LabelTarget<'_>,
+    store: &mut LabelStore,
+    slot: usize,
+    staged: StagedLabels,
+) -> Result<(), RenderError> {
+    store.reset();
+    let generation = staged.generation;
+    let complete = staged.lines.is_empty();
+    store.fill = Some(Fill {
+        slot,
+        staged,
+        cursor: Cursor::default(),
+        progress: FillProgress {
+            complete,
+            ..FillProgress::default()
+        },
+    });
+    while write_rows(t, store) == FillStep::Wrote {}
+    let Some(fill) = store.fill.take() else {
+        return Ok(());
+    };
+    t.gpu
+        .device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(RenderError::Poll)?;
+    if t.gpu.lost() {
+        lock(&store.book).set_unhealthy();
+        return Err(RenderError::DeviceLost);
+    }
+    match (fill.progress.scope_error, t.region) {
+        (Some(e), _) => return Err(RenderError::Atlas(UploadError::Device(e))),
+        (None, None) if !fill.staged.lines.is_empty() => {
+            return Err(RenderError::Atlas(UploadError::Side { side: 0, max: 0 }));
+        }
+        (None, _) => {}
+    }
+    let content = install(t.region, slot, fill.staged);
+    if let Some(c) = store.contents.get_mut(slot) {
+        *c = Some((generation, content));
+    }
+    Ok(())
 }
 
 /// The content of `staged` written in slot `slot`'s band of `region`: a
