@@ -1633,10 +1633,15 @@ impl PlayerRig<'_> {
         self.sync();
     }
 
-    /// A loading wait's park: the idle wake at most, never past `until`
-    /// ([`game::wait_slice`]).
+    /// How long a loading wait parks: the idle wake at most, never past
+    /// `until` on the rig's clock ([`game::wait_slice`]).
+    fn loading_park_slice(&self, until: Option<TimeUs>) -> Duration {
+        game::wait_slice(until, self.clock.now(), IDLE_PARK)
+    }
+
+    /// A loading wait's park, for [`loading_park_slice`](Self::loading_park_slice).
     pub(crate) fn loading_park(&mut self, until: Option<TimeUs>) {
-        let park = game::wait_slice(until, self.clock.now(), IDLE_PARK);
+        let park = self.loading_park_slice(until);
         self.wait_parked(park);
     }
 }
@@ -2978,7 +2983,29 @@ mod tests {
 
     use game::Command;
 
-    use super::{until_due, until_fired};
+    use super::{IDLE_PARK, until_due, until_fired};
+    use bms_model::TimeSource;
+
+    /// A loading wait parks until a near `until` on the rig's clock, the
+    /// idle wake without one, and nothing for one passed
+    /// ([`game::wait_slice`]); nothing parks here.
+    #[test]
+    fn a_loading_park_ends_at_its_until() {
+        use std::time::Duration;
+        let ((near, none, passed), _) =
+            crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+                let now = rig.clock.now();
+                (
+                    rig.loading_park_slice(Some(TimeUs(now.0 + 30_000))),
+                    rig.loading_park_slice(None),
+                    rig.loading_park_slice(Some(TimeUs(now.0 - 1))),
+                )
+            });
+        assert!(near <= Duration::from_millis(30), "{near:?}");
+        assert!(near < IDLE_PARK, "{near:?}");
+        assert_eq!(none, IDLE_PARK);
+        assert_eq!(passed, Duration::ZERO);
+    }
 
     /// The player's rig's preparation (design.md "Play Lifecycle",
     /// preparing each attempt): it owns its jobs, and its answer stays
