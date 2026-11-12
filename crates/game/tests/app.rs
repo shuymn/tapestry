@@ -484,6 +484,10 @@ struct Headless {
     decision_ms: Option<i64>,
     /// The clock's advance at each decision look, in ms.
     decision_step_ms: i64,
+    /// How far (ms) each look of the chart's read moves the clock: the
+    /// read's worker is real, so a test that times anything against the
+    /// read sets it to 0 and moves time by its holds alone.
+    read_step_ms: i64,
     /// How long a play's load takes while it serves the decision screen,
     /// in ms (none: as without one).
     served_load_ms: Option<i64>,
@@ -741,6 +745,7 @@ impl Headless {
             page_fails_at: None,
             decision_ms: None,
             decision_step_ms: 100,
+            read_step_ms: 100,
             served_load_ms: None,
             decisions: Vec::new(),
             recoveries: Vec::new(),
@@ -1571,7 +1576,7 @@ impl AppRig for Headless {
         // The read's looks move the clock (its wait has no idle wait); the
         // App's own holds move it in their idle waits.
         if origin == game::Origin::Read {
-            self.clock.advance(TimeUs(self.decision_step_ms * MS));
+            self.clock.advance(TimeUs(self.read_step_ms * MS));
         }
         self.tick();
         self.decision_looks.push((origin, self.at()));
@@ -5162,6 +5167,8 @@ fn the_deadline_inside_a_load_wait_begins_loading_and_keeps_the_job() {
     let acts = vec![(0, Act::Choose(0)), (8_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
         decided(rig);
+        // The read's looks move no time (no virtual time from poll counts).
+        rig.read_step_ms = 0;
         rig.served_load_ms = Some(3_000);
     });
     ran.unwrap();
@@ -5227,6 +5234,8 @@ fn a_refusal_at_the_deadline_returns_without_loading() {
     let acts = vec![(0, Act::Choose(2)), (6_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Bank, acts, |rig| {
         decided(rig);
+        // The read's looks move no time (no virtual time from poll counts).
+        rig.read_step_ms = 0;
         rig.refuse_load_at_deadline = true;
     });
     ran.unwrap();
@@ -5246,6 +5255,8 @@ fn a_refusal_after_the_deadline_returns_at_once() {
     let acts = vec![(0, Act::Choose(2)), (8_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Bank, acts, |rig| {
         decided(rig);
+        // The read's looks move no time (no virtual time from poll counts).
+        rig.read_step_ms = 0;
         rig.served_load_ms = Some(2_500);
     });
     ran.unwrap();
@@ -5278,6 +5289,8 @@ fn a_close_in_decision_ends_the_run() {
     let acts = vec![(0, Act::Choose(0)), (700, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
         decided(rig);
+        // The read's looks move no time (no virtual time from poll counts).
+        rig.read_step_ms = 0;
         rig.served_load_ms = Some(3_000);
     });
     ran.unwrap();
@@ -5293,6 +5306,8 @@ fn a_thread_failure_inside_a_decision_load_wait_ends_the_run() {
     let acts = vec![(0, Act::Choose(0)), (6_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
         decided(rig);
+        // The read's looks move no time (no virtual time from poll counts).
+        rig.read_step_ms = 0;
         rig.served_load_ms = Some(3_000);
         rig.input_fails_at = CLOCK_START + 700 * MS;
     });
@@ -5530,6 +5545,8 @@ fn each_choice_shows_its_own_decision_screen() {
     ];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
         decided(rig);
+        // The read's looks move no time (no virtual time from poll counts).
+        rig.read_step_ms = 0;
         rig.screen_fails_in_decision = Some(500);
     });
     ran.unwrap();
@@ -5547,6 +5564,8 @@ fn a_failed_recovery_reports_a_thread_failure_first() {
         let acts = vec![(0, Act::Choose(0)), (10_000, Act::Close)];
         let (_rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
             decided(rig);
+            // The read's looks move no time (no virtual time from poll counts).
+            rig.read_step_ms = 0;
             rig.screen_fails_in_decision = Some(500);
             rig.input_fails_in_decision = input_failed.then_some(500);
             rig.prepare_fails_from = 1;
@@ -5568,6 +5587,8 @@ fn a_screen_lost_while_the_page_waits_is_rebuilt() {
     let acts = vec![(0, Act::Practice(P)), (10_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
         decided(rig);
+        // The read's looks move no time (no virtual time from poll counts).
+        rig.read_step_ms = 0;
         rig.screen_fails_in_jobs = true;
     });
     ran.unwrap();
@@ -5594,6 +5615,8 @@ fn a_leave_inside_the_entry_wait_is_routed_before_the_read() {
     let acts = vec![(0, Act::Choose(0)), (10_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
         decided(rig);
+        // The read's looks move no time (no virtual time from poll counts).
+        rig.read_step_ms = 0;
         rig.close_in_entry = true;
     });
     ran.unwrap();
@@ -5611,6 +5634,8 @@ fn a_step_latched_in_a_wait_ends_the_hold() {
     let acts = vec![(0, Act::Practice(P)), (10_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
         decided(rig);
+        // The read's looks move no time (no virtual time from poll counts).
+        rig.read_step_ms = 0;
         rig.step_in_practice_read = true;
     });
     ran.unwrap();
@@ -5641,6 +5666,8 @@ fn a_step_inside_a_rebuild_is_returned_by_it() {
     let acts = vec![(0, Act::Choose(0)), (8_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
         decided(rig);
+        // The read's looks move no time (no virtual time from poll counts).
+        rig.read_step_ms = 0;
         rig.screen_fails_in_decision = Some(500);
         rig.recovery_polls = 40;
         rig.recovery_poll_ms = 50;
@@ -5680,6 +5707,8 @@ fn the_page_entry_is_served_inside_a_rebuild() {
     let acts = vec![(0, Act::Practice(P)), (10_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
         decided(rig);
+        // The read's looks move no time (no virtual time from poll counts).
+        rig.read_step_ms = 0;
         rig.screen_fails_in_jobs = true;
         rig.recovery_polls = 40;
         rig.recovery_poll_ms = 50;
@@ -5720,7 +5749,7 @@ fn a_refusal_in_hand_outranks_a_rebuild_and_the_deadline() {
         decided(rig);
         // The read's looks move no time: the refused load, at the
         // deadline, comes before anything the clock brings.
-        rig.decision_step_ms = 0;
+        rig.read_step_ms = 0;
         rig.refuse_load_at_deadline = true;
         rig.screen_fails_in_decision = Some(500);
     });
@@ -5742,6 +5771,8 @@ fn a_terminal_event_ends_the_run_inside_a_rebuild() {
     let acts = vec![(0, Act::Choose(0)), (1_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
         decided(rig);
+        // The read's looks move no time (no virtual time from poll counts).
+        rig.read_step_ms = 0;
         rig.screen_fails_in_decision = Some(500);
         rig.recovery_polls = 200;
         rig.recovery_poll_ms = 50;
@@ -5767,7 +5798,7 @@ fn a_refusal_at_the_deadline_does_not_wait_for_a_rebuild() {
         decided(rig);
         // The read's looks move no time: the refused load comes at the
         // choice, before the loss and the deadline the holds bring.
-        rig.decision_step_ms = 0;
+        rig.read_step_ms = 0;
         rig.screen_fails_in_decision = Some(500);
         rig.recovery_polls = 200;
         rig.recovery_poll_ms = 50;
@@ -5817,6 +5848,8 @@ fn a_leaving_look_begins_no_rebuild() {
     let acts = vec![(0, Act::Choose(0)), (500, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
         decided(rig);
+        // The read's looks move no time (no virtual time from poll counts).
+        rig.read_step_ms = 0;
         rig.screen_fails_in_decision = Some(500);
     });
     ran.unwrap();
@@ -5851,10 +5884,11 @@ fn a_practice_screen_failure_is_not_a_later_loads() {
     });
     ran.unwrap();
     assert!(
-        rig.seen
-            .iter()
-            .any(|s| matches!(s, Seen::Practice(Some(_)))),
-        "no notice on the page: {:?}",
+        rig.seen.iter().any(|s| matches!(
+            s,
+            Seen::Practice(Some(n)) if n.contains("the surface cannot be made again")
+        )),
+        "no notice with the screen failure's cause on the page: {:?}",
         rig.seen
     );
     assert!(!rig.refused_at.is_empty(), "the refusal: {:?}", rig.seen);

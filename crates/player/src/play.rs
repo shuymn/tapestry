@@ -2326,7 +2326,9 @@ impl Rig for PlayerRig<'_> {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn screen_failed(&self) -> bool {
-        self.render.failed()
+        // The device lost, or the rebuild's holder holds one under way or
+        // a failure no one reported: either is served the same way.
+        self.render.screen_outstanding()
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]

@@ -853,6 +853,10 @@ pub enum RenderMsg {
     /// message before it, and drawn the frame that followed them, if any.
     #[cfg(test)]
     Fence(mpsc::SyncSender<()>),
+    /// A test's look at the mode the render thread draws after every
+    /// message before it: `idle`, `menu:<its first line>`, or `other`.
+    #[cfg(test)]
+    ModeProbe(mpsc::SyncSender<String>),
     /// Makes the render thread panic (tests: its failure in a play).
     #[cfg(all(test, feature = "dev-tools"))]
     Panic,
@@ -1729,6 +1733,15 @@ impl RenderLink {
         rx.recv_timeout(deadline).is_ok()
     }
 
+    /// The mode the render thread draws once it took every message sent
+    /// before this ([`RenderMsg::ModeProbe`]; tests).
+    #[cfg(test)]
+    pub(crate) fn mode(&self) -> String {
+        let (tx, rx) = mpsc::sync_channel(1);
+        self.send(RenderMsg::ModeProbe(tx));
+        rx.recv_timeout(Duration::from_secs(60)).unwrap_or_default()
+    }
+
     /// Makes the render thread read the launch screen's time as `elapsed`
     /// from now on, or from its clock again with `None` (tests).
     #[cfg(test)]
@@ -1943,11 +1956,28 @@ impl RenderLink {
 
     /// [`prepare`](Self::prepare) begun, not waited for: the rebuild's
     /// request, its answer's bound fixed now, polled with
-    /// [`poll_prepare`](Self::poll_prepare). Dropped, its late answer goes
+    /// [`serve_recovery`](Self::serve_recovery). Dropped, its late answer goes
     /// nowhere; the render thread takes the rebuild before any later
     /// request all the same.
     pub fn begin_prepare(&self) -> PendingPrepare {
         begin_prepare(&self.tx, self.answer_timeout)
+    }
+
+    /// Whether the screen needs its rebuild served: the device or the
+    /// surface lost, or the rebuild's holder ([`serve_recovery`]) holds one
+    /// under way or a failure no one reported. The one answer to "is the
+    /// screen to be built again" for every decision of the flow, so a
+    /// failure saved after the device came back is still served.
+    pub fn screen_outstanding(&self) -> bool {
+        self.failed()
+            || !matches!(
+                *self
+                    .shared
+                    .recovery
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner),
+                Recovery::Idle
+            )
     }
 
     /// The screen's rebuild after a loss, served through its one owner
@@ -4009,6 +4039,18 @@ impl Run {
                 #[cfg(test)]
                 Ok(RenderMsg::Fence(reply)) => {
                     let _ = reply.send(());
+                    continue;
+                }
+                #[cfg(test)]
+                Ok(RenderMsg::ModeProbe(reply)) => {
+                    let _ = reply.send(match &mode {
+                        Mode::Idle => "idle".to_owned(),
+                        Mode::Menu { page, .. } => format!(
+                            "menu:{}",
+                            page.lines.first().map_or("", |l| l.text.as_str())
+                        ),
+                        _ => "other".to_owned(),
+                    });
                     continue;
                 }
                 Ok(RenderMsg::ParkScripts(reply)) => {
@@ -11846,6 +11888,8 @@ pub(crate) mod tests {
         pub(crate) menu_frames: Arc<std::sync::Mutex<Vec<String>>>,
         /// This many chart loads fail as a lost surface.
         pub(crate) lose_chart_loads: Arc<AtomicU32>,
+        /// Every call into the screen builder, failed ones included.
+        pub(crate) build_calls: Arc<AtomicU32>,
         /// Screen builds wait while set.
         pub(crate) hold_builds: Arc<AtomicBool>,
         /// Set while a build waits on `hold_builds`.
@@ -11991,6 +12035,7 @@ pub(crate) mod tests {
         pub(crate) fn spawn_with(&self, frames: Box<dyn super::FrameSink>) -> super::RenderLink {
             let shared = self.clone();
             let make: MakeScreen = Box::new(move || {
+                shared.build_calls.fetch_add(1, Ordering::AcqRel);
                 while shared.hold_builds.load(Ordering::Acquire) {
                     shared.build_held.store(true, Ordering::Release);
                     std::thread::park_timeout(Duration::from_millis(1));
@@ -13573,10 +13618,9 @@ pub(crate) mod tests {
                 Next::Selection => {
                     link.send(RenderMsg::SelectionChanged);
                     link.prepare().unwrap();
-                    // The rebuild and the frames after it drawn before the
-                    // page that replaces them comes.
-                    assert!(link.fence(Duration::from_secs(60)));
-                    assert!(link.fence(Duration::from_secs(60)));
+                    // Selection replaced the decision page before the
+                    // rebuild: nothing of it is restored.
+                    assert_eq!(link.mode(), "idle", "{next:?}: the mode after the rebuild");
                     link.send(RenderMsg::Menu(Box::new(one_line("select"))));
                 }
                 Next::Practice => {
