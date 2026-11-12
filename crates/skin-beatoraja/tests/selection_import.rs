@@ -347,15 +347,30 @@ fn a_set_s_timing_passes_absent_timers_and_cycles() {
 
 /// The fixtures' sources and images with source `m` added, whose file
 /// `m.png` is never written (a file the source cannot load either), its
-/// images `x0`, `x1` and `x5`, and `more` images.
+/// images `x0`, `x1` and `x5`; source `c`, the file [`corrupt`] writes,
+/// its images `c1` and `ct` (timer 21, cycle 100); and `more` images.
 fn with_missing(more: &str) -> String {
     format!(
-        r#""source": [{{"id": "s", "path": "s.png"}}, {{"id": "m", "path": "m.png"}}],
+        r#""source": [{{"id": "s", "path": "s.png"}}, {{"id": "m", "path": "m.png"}},
+                      {{"id": "c", "path": "c.png"}}],
            "image": [{IMAGES},
                {{"id": "x0", "src": "m", "x": 0, "y": 0, "w": 8, "h": 8}},
                {{"id": "x1", "src": "m", "x": 8, "y": 0, "w": 8, "h": 8}},
-               {{"id": "x5", "src": "m", "x": 16, "y": 0, "w": 8, "h": 8}}{more}]"#
+               {{"id": "x5", "src": "m", "x": 16, "y": 0, "w": 8, "h": 8}},
+               {{"id": "c1", "src": "c", "x": 8, "y": 0, "w": 8, "h": 8}},
+               {{"id": "ct", "src": "c", "x": 8, "y": 0, "w": 8, "h": 8, "timer": 21, "cycle": 100}}{more}]"#
     )
+}
+
+/// `c.png` in `root`: a 64×64 PNG cut short after its header, which
+/// admission reads and a whole decode fails, as the source's texture does.
+fn corrupt(root: &std::path::Path) {
+    common::png_with(root, "c.png", 64, 64, |x, y| {
+        [u8::try_from(x).unwrap(), u8::try_from(y).unwrap(), 0, 255]
+    });
+    let path = root.join("c.png");
+    let bytes = std::fs::read(&path).unwrap();
+    std::fs::write(&path, &bytes[..bytes.len() / 2]).unwrap();
 }
 
 /// A song list of `slots` places 100 apart from y 900 down, center
@@ -447,12 +462,12 @@ fn a_missing_non_center_bar_image_hides_its_slot() {
     );
 }
 
-/// A row kind's image inside the set whose file is missing draws that row
-/// with its title and no bar, as the source's slot image with no region
-/// (`SkinImage.java:133-139`, `select/SkinBar.java:266-274`); only an
-/// entry past the set's end steps along the chain (chart 0; folder 1,
-/// else 0; "all charts" 5, else 1, else 0: owner decision O3, where the
-/// source goes from 5 straight to 0).
+/// A row kind's image inside the set whose file is missing, or does not
+/// decode, draws that row with its title and no bar, as the source's slot
+/// image with no region (`SkinImage.java:133-139`,
+/// `select/SkinBar.java:266-274`); a row kind's index (chart 0, folder 1,
+/// "all charts" 5) past the set's end takes image 0, as the source's
+/// (`SkinImage.java:133-135`), whatever image 1 is.
 #[test]
 fn a_missing_row_kind_image_draws_its_row_without_a_bar() {
     let place = [
@@ -477,8 +492,14 @@ fn a_missing_row_kind_image_draws_its_row_without_a_bar() {
             1,
             [2, 2, 1],
         ),
-        (r#"["b0", "x1"]"#, vec![B0], 1, [2, 1, 1]),
-        (r#"["b0", "b1"]"#, vec![B0, B1, B1], 0, [2, 2, 2]),
+        (
+            r#"["b0", "c1", "b0", "b0", "b0", "b5"]"#,
+            vec![B0, B5],
+            1,
+            [2, 1, 2],
+        ),
+        (r#"["b0", "x1"]"#, vec![B0, B0], 1, [2, 1, 2]),
+        (r#"["b0", "b1"]"#, vec![B0, B1, B0], 0, [2, 2, 2]),
         (r#"["b0"]"#, vec![B0, B0, B0], 0, [2, 2, 2]),
     ] {
         let body = format!(
@@ -487,6 +508,7 @@ fn a_missing_row_kind_image_draws_its_row_without_a_bar() {
             with_missing("")
         );
         let d = folder(&body);
+        corrupt(d.path());
         let i = import_selection(d.path()).unwrap();
         // Each of the three slots' two arms notes its hole.
         assert_eq!(
@@ -539,6 +561,15 @@ fn a_set_s_timing_passes_images_that_do_not_load() {
     // and 200 ms cycle, 50 ms then 120 ms into it (21 and 100 would give
     // frame 1, then 0).
     let d = folder(&skin(r#"["a0", "t1", "a0", "a0", "a0", "t5"]"#));
+    let mut s = Sel::of(d.path());
+    start(&mut s);
+    s.view(&view(vec![chart("a")], Some(0), None, None));
+    assert_eq!(s.images(1_050), [[4, 20]]);
+    assert_eq!(s.images(1_120), [[12, 20]]);
+    // Image 2, never drawn, a file whose whole decode fails, with timer 21
+    // and cycle 100: passed over, the same frames.
+    let d = folder(&skin(r#"["a0", "a0", "ct", "a0", "a0", "t5"]"#));
+    corrupt(d.path());
     let mut s = Sel::of(d.path());
     start(&mut s);
     s.view(&view(vec![chart("a")], Some(0), None, None));

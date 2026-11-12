@@ -627,7 +627,10 @@ impl Cx<'_> {
     /// Entry `j` of an image set whose image records are `recs`: its
     /// record when it loads, else why it is a hole, each entry's answer
     /// kept in `loads`. A hole names no image, or a file the source cannot
-    /// load either ([`super::widget::Unplaced`]'s `missing`).
+    /// load either: one [`super::widget::Unplaced`] calls `missing`, or one
+    /// admitted whose whole decode fails, as the source's texture fails
+    /// (`JsonSelectSkinObjectLoader.java:53`). A file only this importer
+    /// refuses loads for the source and is no hole.
     fn set_entry_loads(
         &mut self,
         role: Role,
@@ -646,7 +649,11 @@ impl Cx<'_> {
                 let s = self.src_image(r)?;
                 let l = match self.src_rect(role, at, &s, s.div, true)? {
                     Err(u) if u.missing => Err(u.why),
-                    _ => Ok(()),
+                    Err(_) => Ok(()),
+                    Ok(_) => match self.texture(r, true, at)? {
+                        super::prepare::Load::Absent => Err(NoteKind::MissingAsset),
+                        _ => Ok(()),
+                    },
                 };
                 if let Some(slot) = loads.get_mut(j) {
                     *slot = Some(l);
@@ -658,10 +665,10 @@ impl Cx<'_> {
     }
 
     /// One arm: destination record `rec` drawing image set `set`, each row
-    /// kind's image chosen by the decided chain (chart 0; folder 1, else 0;
-    /// "all charts" 5, else 1, else 0: owner decision O3) stepping only past
-    /// an entry beyond the set's end or one this importer dropped, a hole
-    /// inside it drawing that kind with no bar; every image the set's
+    /// kind's image its own index (chart 0, folder 1, "all charts" 5) or,
+    /// past the set's end or dropped by this importer alone, image 0, as the
+    /// source's (`SkinImage.java:133-135`), a hole inside the set drawing
+    /// that kind with no bar; every image the set's
     /// timing over the images that load
     /// (`JsonSelectSkinObjectLoader.java:50-63`). `None` when it is
     /// dropped as `role` says, never drawn, or its image 0 is a hole
@@ -777,27 +784,21 @@ impl Cx<'_> {
                 return Ok(None);
             }
         };
-        // Each row kind's chain (owner decision O3) steps past an entry
-        // beyond the set's end, as the source falls back to image 0
-        // (`SkinImage.java:133-135`), and past one this importer dropped;
-        // a hole inside the set draws that row with no bar
-        // (`SkinBar.java:266-274`).
+        // Each row kind takes its own index; one past the set's end takes
+        // image 0, as the source does (`SkinImage.java:133-135`), and so
+        // does one this importer dropped; a hole inside the set draws that
+        // row with no bar (`SkinBar.java:266-274`).
         for (j, entry) in image.iter().enumerate() {
             if let (1.., SetImage::Hole(why)) = (j, *entry) {
                 self.drop_el(Role::Decorative, at, why)?;
             }
         }
-        let chain = |js: &[usize]| {
-            for &j in js {
-                match image.get(j) {
-                    Some(SetImage::Drawn(i)) => return Some(*i),
-                    Some(SetImage::Hole(_)) => return None,
-                    _ => {}
-                }
-            }
-            Some(i0)
+        let kind = |j: usize| match image.get(j) {
+            Some(SetImage::Drawn(i)) => Some(*i),
+            Some(SetImage::Hole(_)) => None,
+            _ => Some(i0),
         };
-        let images = [Some(i0), chain(&[1]), chain(&[5, 1])];
+        let images = [Some(i0), kind(1), kind(5)];
         let Some((rects, _)) = self.baked_rects(&c, [1, 1])? else {
             self.drop_el(role, at, NoteKind::Stretch(dst.stretch))?;
             return Ok(None);
