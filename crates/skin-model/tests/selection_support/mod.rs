@@ -10,11 +10,11 @@ use std::sync::OnceLock;
 use bms_model::{ChartSummary, Tempo, TimeUs};
 use image::{ImageFormat, Rgba, RgbaImage};
 use skin_model::{
-    Align, Anchor, AtlasLimits, Blend, ChartLabels, DigitsDef, Ease, ElementDef, End, FileDef,
-    Filter, Fit, FontRef, GlyphSet, ImageDef, ImagePartDef, KeyDef, LEVEL_STYLES, LampKey, Layout,
-    LevelDef, LoadError, Overflow, Pad, PartDef, Place, PlacementDef, Program, Quad, QuadBatch,
-    Ratio, Region, RegionDef, RowFeatures, RowKey, RowKind, RowLabel, RowScore, RowTextDef,
-    RowView, SELECTION, Scope, SelectedChart, Selection, SelectionDefs, SelectionFrame,
+    Align, Anchor, AppReadouts, AtlasLimits, Blend, ChartLabels, DigitsDef, Ease, ElementDef, End,
+    FileDef, Filter, Fit, FontRef, GlyphSet, ImageDef, ImagePartDef, KeyDef, LEVEL_STYLES, LampKey,
+    Layout, LevelDef, LoadError, Overflow, Pad, PartDef, Place, PlacementDef, Program, Quad,
+    QuadBatch, Ratio, Region, RegionDef, RowFeatures, RowKey, RowKind, RowLabel, RowScore,
+    RowTextDef, RowView, SELECTION, Scope, SelectedChart, Selection, SelectionDefs, SelectionFrame,
     SelectionLabels, SelectionPlace, SelectionTimers, SelectionView, Sheet, Skin, SkinDef,
     SongListDef, Source, TimerRef, Track, Ty, UvTable, Variant, WidgetDefs, compile,
     selection_timer,
@@ -401,6 +401,8 @@ pub struct Fx {
     pub target: [u32; 2],
     pub layout: Layout,
     pub timers: SelectionTimers,
+    /// The application's readouts each frame gives.
+    pub app: AppReadouts,
 }
 
 impl Fx {
@@ -418,6 +420,7 @@ impl Fx {
                 screen: Some(TimeUs(0)),
                 ..SelectionTimers::default()
             },
+            app: AppReadouts::LAUNCH,
         }
     }
 
@@ -435,6 +438,7 @@ impl Fx {
             target: self.target,
             layout: &self.layout,
             timers: self.timers,
+            app: self.app,
         };
         self.skin
             .build_selection(&mut self.sel, &frame, &self.uvs, &mut self.batch)
@@ -537,6 +541,7 @@ pub fn view(rows: Vec<RowView>, cursor: Option<usize>) -> SelectionView {
             random: r.random,
             max_ex: None,
             score: r.score,
+            judge_class: None,
         });
     SelectionView {
         position: None,

@@ -124,7 +124,31 @@ impl JudgeClass {
     /// and `#DEFEXRANK 2` hard (1).
     #[must_use]
     pub fn of_headers(headers: &[JudgmentHeader]) -> Option<Self> {
-        let j = match HeaderPolicy::DefExRankFirst.read(headers).rank {
+        let j = Self::percent(HeaderPolicy::DefExRankFirst.read(headers).rank);
+        Self::band(if j <= 0 { 100 } else { j })
+    }
+
+    /// The class a song list shows for a chart of rank `rank` (the
+    /// beatoraja-style header policy's reading, `None` for no rank
+    /// header): its percentage after one validation, as the reference's
+    /// song database computes it (`song/SQLiteSongDatabaseAccessor.java:
+    /// 866`, `song/SongData.java:150`), then the bands. Without the second
+    /// validation [`of_headers`](Self::of_headers) takes, every `j` of 0 or
+    /// less differs from it: 0 is very hard (`#DEFEXRANK 1`, and
+    /// `#DEFEXRANK 57266231`, whose product wraps to 29 and gives 0), and
+    /// below 0 (a product that wraps negative) is in no class.
+    #[must_use]
+    pub fn of_listed(rank: Option<JudgeRank>) -> Option<Self> {
+        Self::band(Self::percent(rank))
+    }
+
+    /// The rule's validation of `rank` into a percentage `j`
+    /// (`play/BMSPlayerRule.java:59-66`): `#RANK r` is 25, 50, 75, 100 or
+    /// 125, none is `#RANK 2`, and `#DEFEXRANK n` (its whole part) is
+    /// `n * 75 / 100` in `i32` arithmetic, wrapping, or computed without
+    /// wrapping past `i32`.
+    fn percent(rank: Option<JudgeRank>) -> i64 {
+        match rank {
             None => i64::from(RANK_2_RATE),
             Some(JudgeRank::Rank(r)) => usize::try_from(r)
                 .ok()
@@ -137,8 +161,11 @@ impl JudgeClass {
                     Err(_) => n.saturating_mul(i64::from(RANK_2_RATE)) / 100,
                 }
             }
-        };
-        let j = if j <= 0 { 100 } else { j };
+        }
+    }
+
+    /// The class of percentage `j` (`BooleanPropertyFactory.java:448-452`).
+    const fn band(j: i64) -> Option<Self> {
         Some(match j {
             0 | 10..35 => Self::VeryHard,
             1 | 35..60 => Self::Hard,
@@ -555,6 +582,49 @@ mod tests {
                     "{scene:?} {n}"
                 );
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod listed_tests {
+    use rules::JudgeRank::{DefExRankMilli, Rank};
+
+    use super::JudgeClass::{self, Easy, Normal, VeryEasy, VeryHard};
+
+    /// The class a song list shows (one validation) and the one an
+    /// attempt shows (two): the same for every rank whose first pass is
+    /// above 0, and different for every one at or below it, which the
+    /// second pass makes 100 (easy): 0 is very hard listed (`#DEFEXRANK 1`,
+    /// and `#DEFEXRANK 57266231`, whose product wraps to 29 and gives 0),
+    /// and below 0 (a product that wraps negative) is in no class listed.
+    #[test]
+    fn a_listed_class_takes_one_validation() {
+        let played = |r| {
+            let j = JudgeClass::percent(r);
+            JudgeClass::band(if j <= 0 { 100 } else { j })
+        };
+        for (rank, listed, twice) in [
+            (None, Some(Normal), Some(Normal)),
+            (Some(Rank(0)), Some(VeryHard), Some(VeryHard)),
+            (Some(Rank(3)), Some(Easy), Some(Easy)),
+            (Some(DefExRankMilli(1_000)), Some(VeryHard), Some(Easy)),
+            (
+                Some(DefExRankMilli(57_266_231_000)),
+                Some(VeryHard),
+                Some(Easy),
+            ),
+            (Some(DefExRankMilli(10_000)), None, None),
+            (Some(DefExRankMilli(120_000)), Some(Easy), Some(Easy)),
+            (Some(DefExRankMilli(30_000_000_000)), None, Some(Easy)),
+            (
+                Some(DefExRankMilli(3_000_000_000_000)),
+                Some(VeryEasy),
+                Some(VeryEasy),
+            ),
+        ] {
+            assert_eq!(JudgeClass::of_listed(rank), listed, "{rank:?}");
+            assert_eq!(played(rank), twice, "{rank:?}");
         }
     }
 }

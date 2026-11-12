@@ -183,6 +183,8 @@ pub struct Sel {
     pub sel: Selection,
     pub batch: QuadBatch,
     pub timers: SelectionTimers,
+    /// The application's readouts each frame gives.
+    pub app: skin_model::AppReadouts,
 }
 
 impl Sel {
@@ -201,6 +203,7 @@ impl Sel {
                 screen: Some(TimeUs(0)),
                 ..SelectionTimers::default()
             },
+            app: skin_model::AppReadouts::LAUNCH,
         }
     }
 
@@ -243,6 +246,7 @@ impl Sel {
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
             timers: self.timers,
+            app: self.app,
         };
         self.skin
             .build_selection(&mut self.sel, &frame, &self.uvs, &mut self.batch)
@@ -368,6 +372,7 @@ pub fn view(
             random: r.random,
             max_ex,
             score: r.score,
+            judge_class: None,
         });
     SelectionView {
         position: None,

@@ -1243,3 +1243,48 @@ fn the_runtime_refuses_an_offset_read() {
     runtime(&mut i).frame(&mut f, &[]);
     assert_eq!(runtime(&mut i).status()[0], CallStatus::Error);
 }
+
+/// Number 27 through the kept VM on selection's production sequence: the
+/// frame prepared with the application's readouts at 3 725 999 ms of
+/// uptime, the runtime run over that state, then the build, which draws
+/// the callback's 1 (the uptime's whole hours); 7 200 000 ms gives 2
+/// (docs/stage3.md S10-09e, S7-07).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_runtime_reads_number_27_from_the_prepared_frame() {
+    untimed();
+    let (_d, mut i) = import_in(&entry(
+        "",
+        &["function() return ms.number(27) / 1 end"],
+        "function() return true end",
+    ));
+    assert_eq!(
+        i.callbacks
+            .iter()
+            .filter(|d| **d == Disposition::Runtime)
+            .count(),
+        1,
+        "{:?}",
+        i.callbacks
+    );
+    let mut rt = i.runtime.take().expect("a runtime");
+    let mut s = common::selection::Sel::new(i.imported.skin);
+    s.view(&common::selection::view(
+        vec![common::selection::chart("a")],
+        Some(0),
+        None,
+        None,
+    ));
+    for (uptime_us, want) in [(3_725_999_000, "1"), (7_200_000_000, "2")] {
+        s.app = skin_model::AppReadouts {
+            uptime_us,
+            ..skin_model::AppReadouts::LAUNCH
+        };
+        s.skin
+            .prepare_selection_frame(&mut s.sel, bms_model::TimeUs(0), &s.timers, &s.app)
+            .unwrap();
+        let (fields, timers) = s.sel.runtime_parts();
+        rt.frame(fields, timers);
+        assert_eq!(s.digits(0).trim_start_matches('0'), want, "{uptime_us}");
+    }
+}

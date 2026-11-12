@@ -4,7 +4,8 @@
 //! text over the selection fields, and every timer, frame after frame as
 //! the timers move, over views that change between frames; and the
 //! settings applied every frame (docs/stage3.md S10-09e), the volume's
-//! number and ratio bar drawing them.
+//! number and ratio bar drawing them, and the application's readouts
+//! changing every frame, numbers drawing them.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -22,10 +23,10 @@ use selection_support::{
     list_element, load, ratio, row_text, view,
 };
 use skin_model::{
-    FontRef, FrameUv, GaugeLook, MasterVolume, NumberDef, OwnLamp, RatioBarDef, RatioForm,
-    RatioSource, RowScore, SelectionDefs, SelectionOrder, SelectionSettings, SliderDirection,
-    Source, SpeedReference, SpeedView, TextDef, TextField, TextImage, TextTable, TextValue,
-    WidgetDefs,
+    AppReadouts, FontRef, FrameUv, GaugeLook, LocalTime, MasterVolume, NumberDef, OwnLamp,
+    RatioBarDef, RatioForm, RatioSource, RowScore, SelectionDefs, SelectionOrder,
+    SelectionSettings, SliderDirection, Source, SpeedReference, SpeedView, TextDef, TextField,
+    TextImage, TextTable, TextValue, WidgetDefs,
 };
 
 struct Counting;
@@ -93,6 +94,8 @@ fn skin() -> Fx {
         element(Source::RatioBar(1), [900, 0, 20, 20]),
         element(Source::Number(1), [500, 120, 10, 10]),
         element(Source::RatioBar(2), [1000, 0, 200, 20]),
+        element(Source::Number(2), [500, 140, 10, 10]),
+        element(Source::Number(3), [500, 160, 10, 10]),
     ];
     let text = |value| TextDef {
         value,
@@ -111,6 +114,14 @@ fn skin() -> Fx {
                 NumberDef {
                     digits: digits(6),
                     value: int("settings.volume"),
+                },
+                NumberDef {
+                    digits: digits(6),
+                    value: int("app.uptime_s"),
+                },
+                NumberDef {
+                    digits: digits(6),
+                    value: int("clock.second"),
                 },
             ],
             texts: vec![
@@ -146,6 +157,24 @@ fn skin() -> Fx {
     )
     .unwrap();
     Fx::new(skin)
+}
+
+/// The application's readouts of the frame at `ms`: every one moving with
+/// it.
+fn app(ms: i64) -> AppReadouts {
+    let k = u8::try_from(ms / 16 % 60).unwrap();
+    AppReadouts {
+        fps: u16::from(k),
+        uptime_us: ms * 1_000_000 + 3_600_000_000,
+        local: LocalTime {
+            year: 2_026 + u16::from(k),
+            month: 1 + k % 12,
+            day: 1 + k % 31,
+            hour: k % 24,
+            minute: k,
+            second: 59 - k,
+        },
+    }
 }
 
 /// The settings of the frame at `ms`: every one moving with it.
@@ -218,6 +247,7 @@ fn a_selection_build_allocates_nothing() {
         v.position = ratio(u64::try_from(cursor).unwrap(), 39);
         if let Some(c) = v.selected.as_mut() {
             c.max_ex = Some(300);
+            c.judge_class = u8::try_from(cursor % 5).ok();
         }
         fx.view(&v);
         let texts = TextTable::new(vec![line; fx.skin.text_slots()]);
@@ -231,6 +261,7 @@ fn a_selection_build_allocates_nothing() {
         for ms in (0..2_000).step_by(16) {
             fx.timers.change = Some(TimeUs(0));
             fx.timers.panels[0] = (ms > 1_000).then_some(TimeUs(1_000_000));
+            fx.app = app(ms);
             total += counted(|| {
                 fx.skin
                     .update_selection_settings(&mut fx.sel, &settings(ms))

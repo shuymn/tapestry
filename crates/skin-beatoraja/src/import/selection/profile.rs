@@ -65,6 +65,9 @@ pub(crate) enum SelValue {
     /// Floating's travel duration and its green number.
     Duration,
     Green,
+    /// The application's readouts, 20 to 29 as `id − 20`, play's fields
+    /// of the same names.
+    App(u8),
 }
 
 impl SelValue {
@@ -89,6 +92,7 @@ impl SelValue {
             Self::Volume => "settings.volume",
             Self::Duration => "settings.duration",
             Self::Green => "settings.green",
+            Self::App(n) => super::super::property::app_field(n),
         }
     }
 
@@ -105,7 +109,7 @@ impl SelValue {
             Self::Level => "cursor.chart",
             Self::RatePercent | Self::RateHundredths | Self::NextRank => "selected.rate_valid",
             Self::Charts => "cursor.folder || cursor.all",
-            Self::ExDifference | Self::DisplayOffset | Self::Volume => "true",
+            Self::ExDifference | Self::DisplayOffset | Self::Volume | Self::App(_) => "true",
             // A duration needs the chart's tempo in Classic.
             Self::Duration | Self::Green => "settings.floating",
         }
@@ -144,11 +148,15 @@ pub(crate) fn number(id: i32) -> Option<Class<SelValue>> {
         57 => Bridge(SelValue::Volume),
         312 => Bridge(SelValue::Duration),
         313 => Bridge(SelValue::Green),
-        // The clock, session and global statistics; the volumes without
-        // their own channel; what the bests do not keep; rivals and IR;
-        // per-lane-class note counts the summary does not split; density
-        // metrics.
-        17..=31
+        // The application's readouts: the presents per second, the local
+        // date and time and the uptime (`IntegerPropertyFactory.java:98-107`).
+        20..=29 => Bridge(SelValue::App(u8::try_from(id - 20).ok()?)),
+        // Session and global statistics; the volumes without their own
+        // channel; what the bests do not keep; rivals and IR; per-lane-class
+        // note counts the summary does not split; density metrics.
+        17..=19
+        | 30
+        | 31
         | 58
         | 59
         | 75
@@ -240,6 +248,25 @@ fn lamp(k: usize) -> SelOption {
     SelOption::Expr(LAMPS.get(k).copied().unwrap_or("false"))
 }
 
+/// The judgment class conditions of 180 to 184 by id less 180, play's form
+/// over the selected chart's class (`BooleanPropertyFactory.java:
+/// 448-452`, read per frame on this screen, `:219`, `:256`): 180 under its
+/// validity, since a row with no class, or no chart, reads 0.
+const JUDGE_CLASSES: [&str; 5] = [
+    "selected.judge_class_valid && selected.judge_class == 0",
+    "selected.judge_class == 1",
+    "selected.judge_class == 2",
+    "selected.judge_class == 3",
+    "selected.judge_class == 4",
+];
+
+/// The judgment class condition of the source's class offset `k` (0 for
+/// very hard).
+fn judge_class(k: i32) -> SelOption {
+    let k = usize::try_from(k).unwrap_or(usize::MAX);
+    SelOption::Expr(JUDGE_CLASSES.get(k).copied().unwrap_or("false"))
+}
+
 /// The rank condition of the source's rank offset `k` (0 for AAA).
 fn rank(k: i32) -> SelOption {
     let k = usize::try_from(k).unwrap_or(usize::MAX);
@@ -275,13 +302,14 @@ pub(crate) fn option(id: i32) -> Option<Class<SelOption>> {
         161..=164 | 1160 | 1161 => Constant(false),
         176 => Expr("selected.summary && !selected.bpm_change"),
         177 => Expr("selected.bpm_change"),
+        // The selected chart's judgment class, from its library entry.
+        180..=184 => judge_class(id - 180),
         200..=207 => rank(id - 200),
         300..=307 => rank(id - 300),
         // Offline: no IR, no rivals.
         50 | 624 => Constant(true),
         // No grade rows, courses, IR, replays, option-specific clear
-        // history, BGA, `#TEXT`, stage file or STOP facts, and no
-        // judgment class on selection.
+        // history, BGA, `#TEXT`, stage file or STOP facts on selection.
         3
         | 51
         | 60
@@ -290,7 +318,6 @@ pub(crate) fn option(id: i32) -> Option<Class<SelOption>> {
         | 171
         | 174
         | 175
-        | 180..=184
         | 191
         | 197
         | 352..=354
@@ -455,7 +482,9 @@ mod tests {
         (171, 172, C::N),
         (174, 174, C::D),
         (177, 177, C::N),
-        (17, 31, C::D),
+        (17, 19, C::D),
+        (20, 29, C::N),
+        (30, 31, C::D),
         (57, 57, C::N),
         (58, 59, C::D),
         (71, 72, C::N),
@@ -546,6 +575,7 @@ mod tests {
         (100, 105),
         (160, 164),
         (176, 177),
+        (180, 184),
         (200, 207),
         (300, 307),
         (1100, 1104),
@@ -559,7 +589,6 @@ mod tests {
         (126, 131, false),
         (170, 171, false),
         (174, 175, false),
-        (180, 184, false),
         (191, 191, false),
         (197, 197, false),
         (352, 354, false),
@@ -575,6 +604,30 @@ mod tests {
         (1203, 1203, false),
         (1205, 1208, false),
     ];
+
+    /// The judgment class options read the selected chart's class, play's
+    /// form over `selected.*`: 180 under its validity, 181 to 184 bare.
+    #[test]
+    fn the_judgment_class_options_read_the_selected_chart() {
+        for (id, src) in [
+            (
+                180,
+                "selected.judge_class_valid && selected.judge_class == 0",
+            ),
+            (181, "selected.judge_class == 1"),
+            (182, "selected.judge_class == 2"),
+            (183, "selected.judge_class == 3"),
+            (184, "selected.judge_class == 4"),
+        ] {
+            assert_eq!(
+                option(id),
+                Some(Class::Bridge(SelOption::Expr(src))),
+                "{id}"
+            );
+            let scope = skin_model::Scope::new(&skin_model::SELECTION);
+            assert!(skin_model::compile(src, &scope, skin_model::Ty::Bool).is_ok());
+        }
+    }
 
     /// Every id of the profile table gets its class, and no other id in
     /// a wide range has one: the explicit tables are exactly the table.

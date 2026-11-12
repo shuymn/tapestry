@@ -16,9 +16,9 @@ use std::cell::Cell;
 use bms_model::{Tempo, TimeUs};
 
 use self::schema::{VALUE_MAX, field, timer};
-use crate::GaugeLook;
 use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
+use crate::play::timers::app_fields;
 use crate::selection::{
     ChartLabels, Ratio, RowKind, RowScore, RowView, SelectionLabels, SelectionOrder,
     SelectionPlace, SelectionSettings, SelectionView, SpeedReference, SpeedView,
@@ -28,6 +28,7 @@ use crate::widget::glyphs::{self, GlyphLine};
 use crate::widget::ratio_bar::Hit;
 use crate::widget::song_list::{LampKey, RowBind, RowStyle};
 use crate::widget::text::{ChartText, MAX_TEXT_BYTES, TextTable};
+use crate::{AppReadouts, BuildError, GaugeLook};
 
 /// The starts of the selection screen's built-in timers this frame, each
 /// `None` while it is off. The screen's lifetime and its UI events give
@@ -52,6 +53,11 @@ pub struct SelectionFrame<'a> {
     /// The player's layout.
     pub layout: &'a Layout,
     pub timers: SelectionTimers,
+    /// The application's readouts at the frame, sampled at the reading
+    /// `now` comes from (design.md "Rendering and Skins", play readouts):
+    /// numbers 20 to 29 read them. A value outside its field's range
+    /// refuses the frame.
+    pub app: AppReadouts,
 }
 
 /// Why a selection call was refused.
@@ -393,14 +399,26 @@ impl Selection {
         self.master_volume = Some(s.master_volume.ratio);
     }
 
-    /// Fills this frame's timers: the built-in ones from `timers`, then
-    /// each `when` timer over the fields. Allocates nothing.
+    /// Fills this frame's application readouts from `app`, then its
+    /// timers: the built-in ones from `timers`, then each `when` timer over
+    /// the fields. Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`BuildError::InvalidReadouts`] for a readout outside its field's
+    /// range: nothing is filled.
     pub(crate) fn fill(
         &mut self,
         now: TimeUs,
         timers: &SelectionTimers,
+        app: &AppReadouts,
         whens: &[crate::expr::Program],
-    ) {
+    ) -> Result<(), BuildError> {
+        let app = app_fields(app).ok_or(BuildError::InvalidReadouts)?;
+        let at = usize::from(field::APP_FPS);
+        if let Some(to) = self.fields.get_mut(at..at + app.len()) {
+            to.copy_from_slice(&app);
+        }
         let [p1, p2, p3] = timers.panels;
         for (start, at) in self
             .starts
@@ -418,6 +436,7 @@ impl Selection {
             whens,
             |_| true,
         );
+        Ok(())
     }
 }
 
@@ -574,6 +593,13 @@ fn fields(view: &SelectionView, cursor: Option<&RowView>) -> [i32; field::COUNT]
         field::SELECTED_LEVEL,
         c.labels.level_value.clamp(-VALUE_MAX, VALUE_MAX),
     );
+    if let Some(k) = c
+        .judge_class
+        .filter(|&k| i32::from(k) <= crate::JUDGE_CLASS_MAX)
+    {
+        set(field::SELECTED_JUDGE_CLASS, i32::from(k));
+        set(field::SELECTED_JUDGE_CLASS_VALID, 1);
+    }
     f
 }
 
