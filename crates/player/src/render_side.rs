@@ -4648,6 +4648,17 @@ impl Run {
                 // Its page, or a newer one an earlier signal took; whether
                 // it may still be drawn is checked before every end frame.
                 Ok(RenderMsg::End) => {
+                    // A result whose lifetime ended (left, or another
+                    // begun) before a frame of it checked goes here, so
+                    // it neither stands in for the page nor makes its
+                    // frame draw nothing.
+                    if self
+                        .result
+                        .as_ref()
+                        .is_some_and(|r| !self.shared.result_slot().current(r.lifetime))
+                    {
+                        self.drop_result();
+                    }
                     if let Some(page) = self.shared.take_end() {
                         self.end_page = page;
                         if let Some(side) = &mut self.result {

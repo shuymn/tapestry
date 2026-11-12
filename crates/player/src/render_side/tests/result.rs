@@ -2297,6 +2297,33 @@ fn a_frame_of_the_old_lifetime_gives_the_new_one_no_timing() {
     rig.link.exit();
 }
 
+/// An end page the render thread takes while it still holds a view of a
+/// lifetime that ended (a frame of it drawn after the new lifetime began)
+/// draws: the old view does not stand in for it, and its lifetime's check
+/// leaves nothing undrawn.
+#[test]
+fn an_end_page_after_the_lifetime_ended_draws() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    let hold = FrameHold::new(&rig.link);
+    assert!(wait_until(|| hold.holding()));
+    rig.link.begin_result();
+    rig.link.show_end(EndPage {
+        lines: vec!["page".to_owned()],
+        graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
+    });
+    drop(hold);
+    assert!(rig.until(|d| *d == Drawn::Page(vec!["page".to_owned()])));
+    assert_eq!(rig.link.presented_timing(), None);
+    rig.link.exit();
+}
+
 /// A command accepted on a built-in view pins it all the same: a skin view
 /// prepared before the frame's wait never commits after it, and the pin
 /// gives no timing, so the command acts at once (T2).
