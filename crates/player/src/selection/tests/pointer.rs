@@ -546,7 +546,10 @@ fn a_command_on_another_list_or_row_does_nothing() {
         assert!(
             s.pointer
                 .shared
-                .answer(Some(built), |_| hits.next().unwrap())
+                .answer(Some(built), |_| skin_model::PressHit {
+                    hit: hits.next().unwrap(),
+                    outside_search: true,
+                })
         );
         assert_eq!(take_all(rig), None);
         assert_eq!(
@@ -1145,14 +1148,17 @@ fn an_input_of_another_lifetime_does_nothing() {
                 skinned: true,
             };
             assert!(s.pointer.shared.answer(Some(built), |_| {
-                Some(skin_model::PointerHit::Row {
-                    row: RowRef {
-                        list_revision,
-                        index: 3,
-                        kind: RowRefKind::Chart,
-                    },
-                    button: Button::Left,
-                })
+                skin_model::PressHit {
+                    hit: Some(skin_model::PointerHit::Row {
+                        row: RowRef {
+                            list_revision,
+                            index: 3,
+                            kind: RowRefKind::Chart,
+                        },
+                        button: Button::Left,
+                    }),
+                    outside_search: true,
+                }
             }));
             assert_eq!(take_all(rig), None);
             assert_eq!(log(rig), [(Press(Nothing), 0)], "answered on {answered}");
@@ -1435,7 +1441,8 @@ fn pointer_dispatch_alloc() {
     // Slot 1 draws folder f0, slot 5 chart e.
     let row_hit = |at: [i32; 2], index: u32, kind| {
         assert_eq!(
-            skin.hit_at(&logic.sel, crate::pointer::point(at), target, Button::Left),
+            skin.hit_at(&logic.sel, crate::pointer::point(at), target, Button::Left)
+                .hit,
             Some(skin_model::PointerHit::Row {
                 row: RowRef {
                     list_revision: u.list_revision,

@@ -25,7 +25,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError, TryLockError};
 use std::thread::Thread;
 
-use skin_model::{Button, PointerHit, RatioSource, RowRefKind, SliderCommand};
+use skin_model::{Button, PointerHit, PressHit, RatioSource, RowRefKind, SliderCommand};
 
 use crate::select::{MenuInput, MenuKey};
 use crate::selection_skin::SelectionLogic;
@@ -108,6 +108,9 @@ pub struct PointerSlot {
     pub request: PointerRequest,
     /// What the press hit on the batch's build; none for a notch.
     pub hit: Option<PointerHit>,
+    /// Whether the press lay outside every search box that build drew,
+    /// whatever it hit ([`PressHit::outside_search`]).
+    pub outside_search: bool,
 }
 
 impl PointerSlot {
@@ -118,6 +121,7 @@ impl PointerSlot {
             notches: 0,
         },
         hit: None,
+        outside_search: true,
     };
 }
 
@@ -312,7 +316,10 @@ impl PointerShared {
             let Some(request) = next() else {
                 break;
             };
-            *slot = PointerSlot { request, hit: None };
+            *slot = PointerSlot {
+                request,
+                ..PointerSlot::EMPTY
+            };
             len += 1;
         }
         if len == 0 {
@@ -419,7 +426,7 @@ impl PointerShared {
                 .bundle
                 .skin()
                 .hit_at(&logic.sel, point(at), target, button),
-            _ => None,
+            _ => PressHit::NONE,
         });
         let Some((word, hold, at)) = self.moved(seen) else {
             return;
@@ -453,7 +460,7 @@ impl PointerShared {
     pub fn answer(
         &self,
         built: Option<Built>,
-        mut hit: impl FnMut(PointerRequest) -> Option<PointerHit>,
+        mut hit: impl FnMut(PointerRequest) -> PressHit,
     ) -> bool {
         let mut b = match self.batch.try_lock() {
             Ok(b) => b,
@@ -465,7 +472,9 @@ impl PointerShared {
         }
         let len = b.len;
         for slot in b.slots.iter_mut().take(len) {
-            slot.hit = hit(slot.request);
+            let h = hit(slot.request);
+            slot.hit = h.hit;
+            slot.outside_search = h.outside_search;
         }
         b.built = built;
         b.state = BatchState::Answered;
@@ -827,12 +836,12 @@ fn current(word: u64, built: Option<Built>, facts: &Facts) -> Option<Built> {
     })
 }
 
-/// What `request`, answered with `hit` on `built`, does on the select screen
+/// What `request`, answered with `press` on `built`, does on the select screen
 /// as `facts` and `kind_at` (the row kind at a selectable index) have it
 /// (design.md "Input", **Pointer input**).
 pub fn resolve(
     request: PointerRequest,
-    hit: Option<PointerHit>,
+    press: PressHit,
     built: Option<Built>,
     facts: &Facts,
     kind_at: impl Fn(usize) -> Option<RowRefKind>,
@@ -840,6 +849,7 @@ pub fn resolve(
     let Some(built) = current(request.word(), built, facts) else {
         return NOTHING;
     };
+    let hit = press.hit;
     if facts.composing {
         return NOTHING;
     }
@@ -867,7 +877,11 @@ pub fn resolve(
             _ => NOTHING,
         };
     }
-    let unfocus = facts.searching && hit != Some(PointerHit::Search);
+    // A press outside the search box's bounds takes its focus whatever it
+    // hits, and one inside keeps it even when a target drawn over the box
+    // takes the press: the source commits outside the box before it walks
+    // the targets (`skin/Skin.java:394-397`).
+    let unfocus = facts.searching && press.outside_search;
     let act = match hit {
         Some(PointerHit::Search) if facts.searching => PointerAct::Nothing,
         Some(PointerHit::Search) => PointerAct::Key(MenuKey::Tab),
@@ -1237,8 +1251,17 @@ mod tests {
         })
     }
 
+    /// `hit` answered as a press inside the search box exactly when it hit
+    /// the box.
+    fn on(hit: Option<PointerHit>) -> PressHit {
+        PressHit {
+            hit,
+            outside_search: hit != Some(PointerHit::Search),
+        }
+    }
+
     fn act(request: PointerRequest, hit: Option<PointerHit>, f: &Facts) -> PointerAct {
-        resolve(request, hit, Some(built(7)), f, kinds).act
+        resolve(request, on(hit), Some(built(7)), f, kinds).act
     }
 
     #[test]
@@ -1292,21 +1315,21 @@ mod tests {
         assert_eq!(act(l, hit, &f), PointerAct::Key(MenuKey::Escape));
         // Observed under 7, built in 8; built in 7, dispatched in 8; the
         // word closed since; the built-in page.
-        assert_eq!(resolve(l, hit, Some(built(8)), &f, kinds), NOTHING);
+        assert_eq!(resolve(l, on(hit), Some(built(8)), &f, kinds), NOTHING);
         let later = Facts {
             lifetime: 8,
             word: W8,
             ..f
         };
-        assert_eq!(resolve(l, hit, Some(built(7)), &later, kinds), NOTHING);
+        assert_eq!(resolve(l, on(hit), Some(built(7)), &later, kinds), NOTHING);
         let closed = Facts { word: W7 & !1, ..f };
-        assert_eq!(resolve(l, hit, Some(built(7)), &closed, kinds), NOTHING);
+        assert_eq!(resolve(l, on(hit), Some(built(7)), &closed, kinds), NOTHING);
         let page = Built {
             skinned: false,
             ..built(7)
         };
-        assert_eq!(resolve(l, None, Some(page), &f, kinds), NOTHING);
-        assert_eq!(resolve(l, None, None, &f, kinds), NOTHING);
+        assert_eq!(resolve(l, on(None), Some(page), &f, kinds), NOTHING);
+        assert_eq!(resolve(l, on(None), None, &f, kinds), NOTHING);
     }
 
     #[test]
@@ -1324,11 +1347,11 @@ mod tests {
             ..built(7)
         };
         assert_eq!(
-            resolve(l, action(15, 1), Some(chart_built), &on_chart, kinds).act,
+            resolve(l, on(action(15, 1)), Some(chart_built), &on_chart, kinds).act,
             PointerAct::Key(MenuKey::Enter)
         );
         assert_eq!(
-            resolve(l, action(315, 1), Some(chart_built), &on_chart, kinds).act,
+            resolve(l, on(action(315, 1)), Some(chart_built), &on_chart, kinds).act,
             PointerAct::Key(MenuKey::Practice)
         );
         assert_eq!(act(l, action(315, 1), &on_chart), PointerAct::Nothing);
@@ -1362,7 +1385,7 @@ mod tests {
         assert_eq!(
             resolve(
                 l,
-                slider(RatioSource::ListPosition, 8),
+                on(slider(RatioSource::ListPosition, 8)),
                 Some(stale),
                 &f,
                 kinds
@@ -1392,7 +1415,7 @@ mod tests {
         let l = press(Button::Right);
         // Any button in the box focuses it; a focused box keeps it.
         assert_eq!(
-            resolve(l, Some(PointerHit::Search), Some(built(7)), &f, kinds),
+            resolve(l, on(Some(PointerHit::Search)), Some(built(7)), &f, kinds),
             Resolved {
                 unfocus: false,
                 act: PointerAct::Key(MenuKey::Tab)
@@ -1405,7 +1428,7 @@ mod tests {
         assert_eq!(
             resolve(
                 l,
-                Some(PointerHit::Search),
+                on(Some(PointerHit::Search)),
                 Some(built(7)),
                 &searching,
                 kinds
@@ -1417,7 +1440,7 @@ mod tests {
         assert_eq!(
             resolve(
                 lp,
-                row(3, RowRefKind::Chart, Button::Left),
+                on(row(3, RowRefKind::Chart, Button::Left)),
                 Some(built(7)),
                 &searching,
                 kinds
@@ -1440,7 +1463,7 @@ mod tests {
             assert_eq!(
                 resolve(
                     request,
-                    row(3, RowRefKind::Chart, Button::Left),
+                    on(row(3, RowRefKind::Chart, Button::Left)),
                     Some(built(7)),
                     &composing,
                     kinds
@@ -1459,7 +1482,7 @@ mod tests {
         assert_eq!(
             resolve(
                 lp,
-                Some(PointerHit::Action { event: 12, arg: -1 }),
+                on(Some(PointerHit::Action { event: 12, arg: -1 })),
                 Some(built(7)),
                 &panel,
                 kinds
@@ -1474,12 +1497,49 @@ mod tests {
             Some(PointerHit::Search),
             None,
         ] {
-            assert_eq!(resolve(lp, hit, Some(built(7)), &panel, kinds), NOTHING);
+            assert_eq!(resolve(lp, on(hit), Some(built(7)), &panel, kinds), NOTHING);
             assert_eq!(
-                resolve(press(Button::Right), hit, Some(built(7)), &panel, kinds),
+                resolve(press(Button::Right), on(hit), Some(built(7)), &panel, kinds),
                 NOTHING
             );
         }
+    }
+
+    /// The focus goes by whether the press lay outside the box's bounds,
+    /// not by what it hit (design.md "Input", **Pointer input**;
+    /// `skin/Skin.java:394-397`).
+    #[test]
+    fn the_search_focus_goes_by_the_box_bounds_not_by_the_hit() {
+        let searching = Facts {
+            searching: true,
+            ..facts()
+        };
+        let l = press(Button::Left);
+        // The order button drawn over the box, inside its bounds: it acts
+        // and the focus stays.
+        let inside = PressHit {
+            hit: Some(PointerHit::Action { event: 12, arg: 1 }),
+            outside_search: false,
+        };
+        assert_eq!(
+            resolve(l, inside, Some(built(7)), &searching, kinds),
+            Resolved {
+                unfocus: false,
+                act: PointerAct::Key(MenuKey::Right)
+            }
+        );
+        // A row outside the bounds: the focus goes, then the row acts.
+        let outside = PressHit {
+            hit: row(3, RowRefKind::Chart, Button::Left),
+            outside_search: true,
+        };
+        assert_eq!(
+            resolve(l, outside, Some(built(7)), &searching, kinds),
+            Resolved {
+                unfocus: true,
+                act: PointerAct::MoveTo(3)
+            }
+        );
     }
 
     #[test]
@@ -1500,8 +1560,8 @@ mod tests {
             })
         );
         assert_eq!(s.take_answers(seq, &mut out), Taken::Waiting);
-        assert!(s.answer(Some(built(7)), |_| Some(PointerHit::Search)));
-        assert!(!s.answer(Some(built(7)), |_| None));
+        assert!(s.answer(Some(built(7)), |_| on(Some(PointerHit::Search))));
+        assert!(!s.answer(Some(built(7)), |_| PressHit::NONE));
         assert_eq!(
             s.take_answers(seq, &mut out),
             Taken::Answered {
@@ -1521,7 +1581,7 @@ mod tests {
         // A reset abandons a batch in flight.
         let seq = s.submit(7, || Some(press(Button::Left))).unwrap();
         s.reset();
-        assert!(!s.answer(Some(built(7)), |_| None));
+        assert!(!s.answer(Some(built(7)), |_| PressHit::NONE));
         assert_eq!(s.take_answers(seq, &mut out), Taken::Gone);
         assert_eq!(s.submit(7, || None), None);
     }

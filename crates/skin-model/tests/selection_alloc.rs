@@ -24,7 +24,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use bms_model::TimeUs;
 use selection_support::{
     Fx, all, chart, digits, element, features, folder, int, labels, lamps, levels, list,
-    list_element, load, ratio, row_text, view,
+    list_element, load, ratio, rect, row_text, view,
 };
 use skin_model::{
     ActionDef, AppReadouts, Button, ClickType, FolderId, FontRef, FrameUv, GaugeLook, HoverRect,
@@ -155,12 +155,16 @@ fn skin() -> Fx {
                     }),
                     hover: Some(hover),
                     search: false,
+                    // Its region sampled each frame, as an imported
+                    // stretched image's.
+                    region: Some(rect([1_300, 0, 100, 40])),
                 },
                 PointerDef {
                     element: 1,
                     action: None,
                     hover: Some(hover),
                     search: false,
+                    region: None,
                 },
             ],
             ratio_bars: vec![
@@ -378,7 +382,7 @@ fn a_selection_build_allocates_nothing() {
                 let press = fx
                     .skin
                     .hit_at(&fx.sel, [1_310.0, 20.0], fx.target, Button::Right);
-                if let Some(PointerHit::Action { event: 12, .. }) = press {
+                if let Some(PointerHit::Action { event: 12, .. }) = press.hit {
                     actions += 1;
                 }
             }
@@ -394,7 +398,7 @@ fn a_selection_build_allocates_nothing() {
                     button: Button::Left,
                 };
                 let at = [110.0, 100.0 * f32::from(slot) + 25.0];
-                if fx.skin.hit_at(&fx.sel, at, fx.target, Button::Left) == Some(want) {
+                if fx.skin.hit_at(&fx.sel, at, fx.target, Button::Left).hit == Some(want) {
                     hits[usize::from(kind == RowRefKind::Folder)] += 1;
                 }
             }

@@ -4,12 +4,20 @@
 //!
 //! The last [`build_selection`](crate::Skin::build_selection) records each
 //! pointer target it drew, in draw order, in target pixels: each changeable
-//! slider's travel, each action element's rect, each search text's input
+//! slider's travel, each action element's region, each search text's input
 //! box and each song list element, with the rect of every slot whose bar
 //! drew. [`Skin::hit_at`](crate::Skin::hit_at) walks them topmost first, as
 //! the source walks its objects (`skin/Skin.java:394-410`); a song list
 //! tries its slots in its clickable order (`select/BarRenderer.java:80-101`).
 //! Every rect's edges are inside it, as the source's.
+//!
+//! Every target and hover rect is taken from the element's region, its
+//! destination before a stretch fits its image in it or an alignment moves
+//! its text: the source computes `region` from the destination in
+//! `SkinObject.prepare`, tests the `mouseRect` and a press against it
+//! (`skin/SkinObject.java:591-607, 671-700`) and stretches only the rect
+//! `draw` draws (`skin/SkinObject.java:623-643`). A search text's input box
+//! is that region moved by its alignment (`skin/SkinText.java:162-169`).
 //!
 //! A hit never changes the skin's state: the screen carries the command out
 //! and validates a row by its [`RowRef`], a fixed-size `Copy` identity that
@@ -20,6 +28,8 @@
 use std::cell::Cell;
 
 use crate::selection::RowKind;
+use crate::track::Track;
+use crate::widget::digits::Align;
 use crate::widget::ratio_bar::{Hit, SliderCommand};
 
 /// What kind of row a [`RowRef`] names: a heading is never one.
@@ -118,7 +128,7 @@ pub struct ActionDef {
 
 /// A hover rect: the element draws only while the pointer is inside it.
 /// In reference pixels, scaled as the element's region is, an offset from
-/// the element's rect's bottom-left corner in y-up space: `x` right, `y`
+/// the element's region's bottom-left corner in y-up space: `x` right, `y`
 /// up (`skin/SkinObject.java:603-607`, `skin/Skin.java:183-184`). Each
 /// value within ±[`MAX_COORD`](crate::MAX_COORD).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -131,7 +141,7 @@ pub struct HoverRect {
 
 /// What pointer input an element of a selection skin takes, at most one
 /// per element.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PointerDef {
     /// The element's index in [`SkinDef::elements`](crate::SkinDef::elements).
     pub element: u32,
@@ -142,6 +152,13 @@ pub struct PointerDef {
     /// Whether its drawn box takes a press as the search box's: only text
     /// showing the query.
     pub search: bool,
+    /// Its region: its destination before a stretch or a text alignment
+    /// moved what it draws, keyed as its element's track is (the same key
+    /// times, ease and end) and sampled at the same time; only its rects
+    /// are read. Its action, search box and hover rect are placed on it
+    /// (`skin/SkinObject.java:591-607, 671-700`). `None`: the element's
+    /// sampled rect is its region.
+    pub region: Option<Track>,
 }
 
 /// Why a selection skin's pointer definitions were refused.
@@ -155,8 +172,31 @@ pub enum PointerError {
     ActionSource,
     #[error("a search box on an element that is not text showing the query")]
     SearchSource,
-    #[error("its hover rect leaves the coordinate range")]
+    #[error("its hover rect or its region leaves the coordinate range")]
     Coordinates,
+    #[error("its region is not keyed as its element's track")]
+    RegionTiming,
+}
+
+/// What a press hits ([`Skin::hit_at`](crate::Skin::hit_at)): the topmost
+/// target, and whether the press lies outside the input box of every search
+/// text drawn, whatever it hit. The source commits a focused search text
+/// on a press outside its box before it walks the targets
+/// (`skin/Skin.java:394-397`, `skin/SkinTextInput.java:77-81`), so a
+/// target drawn over the box takes the press with the focus kept. `Copy`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PressHit {
+    pub hit: Option<PointerHit>,
+    pub outside_search: bool,
+}
+
+impl PressHit {
+    /// Nothing hit, outside every search box: a press on a build that drew
+    /// no target.
+    pub const NONE: Self = Self {
+        hit: None,
+        outside_search: true,
+    };
 }
 
 /// A pointer target as the last build drew it, in target pixels, with
@@ -223,7 +263,8 @@ fn arg(click: ClickType, [x, y, w, h]: [f32; 4], [px, py]: [f32; 2], button: But
 /// What a press of `button` at `point` hits among `targets` drawn at
 /// `target`, topmost first; a song list tries its slots in `clickable`
 /// order among `rows`. A slider or a song list the point misses lets the
-/// walk go on, as the source's do.
+/// walk go on, as the source's do. Whether the point lies outside every
+/// search box is read apart from the walk.
 pub(crate) fn hit(
     targets: &[Cell<Option<Target>>],
     rows: &[Cell<Option<RowHit>>],
@@ -231,25 +272,33 @@ pub(crate) fn hit(
     point: [f32; 2],
     target: [u32; 2],
     button: Button,
-) -> Option<PointerHit> {
-    targets
-        .iter()
-        .rev()
-        .filter_map(Cell::get)
-        .filter(|t| t.target() == target)
-        .find_map(|t| match t {
-            Target::Slider(h) => h.at(point).map(PointerHit::Slider),
-            Target::Action { rect, def, .. } => contains(rect, point).then(|| PointerHit::Action {
-                event: def.event,
-                arg: arg(def.click, rect, point, button),
-            }),
-            Target::Search { rect, .. } => contains(rect, point).then_some(PointerHit::Search),
-            Target::List { first, .. } => clickable.iter().find_map(|&slot| {
-                let cell = usize::from(first).checked_add(usize::from(slot))?;
-                let h = rows.get(cell).and_then(Cell::get)?;
-                contains(h.rect, point).then_some(PointerHit::Row { row: h.row, button })
-            }),
-        })
+) -> PressHit {
+    let drawn = || {
+        targets
+            .iter()
+            .rev()
+            .filter_map(Cell::get)
+            .filter(|t| t.target() == target)
+    };
+    let outside_search =
+        !drawn().any(|t| matches!(t, Target::Search { rect, .. } if contains(rect, point)));
+    let hit = drawn().find_map(|t| match t {
+        Target::Slider(h) => h.at(point).map(PointerHit::Slider),
+        Target::Action { rect, def, .. } => contains(rect, point).then(|| PointerHit::Action {
+            event: def.event,
+            arg: arg(def.click, rect, point, button),
+        }),
+        Target::Search { rect, .. } => contains(rect, point).then_some(PointerHit::Search),
+        Target::List { first, .. } => clickable.iter().find_map(|&slot| {
+            let cell = usize::from(first).checked_add(usize::from(slot))?;
+            let h = rows.get(cell).and_then(Cell::get)?;
+            contains(h.rect, point).then_some(PointerHit::Row { row: h.row, button })
+        }),
+    });
+    PressHit {
+        hit,
+        outside_search,
+    }
 }
 
 /// What dragging to `point` asks of the topmost slider among `targets`
@@ -279,7 +328,7 @@ const fn coord(v: i32) -> f32 {
     v as f32
 }
 
-/// `hover` placed on an element drawn over `[x, y, w, h]` (target pixels,
+/// `hover` placed on an element of region `[x, y, w, h]` (target pixels,
 /// y down) at `scale` target pixels per reference pixel on each axis: left,
 /// top, width, height. The offset runs from the rect's bottom-left corner,
 /// `y` upward.
@@ -293,7 +342,7 @@ pub(crate) fn hover_rect(hover: HoverRect, [x, y, _, h]: [f32; 4], [sx, sy]: [f3
     ]
 }
 
-/// Whether `pointer` is inside `hover` on an element drawn over `rect` at
+/// Whether `pointer` is inside `hover` on an element of region `rect` at
 /// `scale`: never without a pointer.
 pub(crate) fn hovered(
     hover: HoverRect,
@@ -302,6 +351,18 @@ pub(crate) fn hovered(
     pointer: Option<[f32; 2]>,
 ) -> bool {
     pointer.is_some_and(|p| contains(hover_rect(hover, rect, scale), p))
+}
+
+/// A search text's input box on its region `[x, y, w, h]` (any units, x
+/// right): the region moved left by none, half or all of its width as the
+/// text aligns left, centred or right (`skin/SkinText.java:162-169`).
+pub(crate) fn input_box(align: Align, [x, y, w, h]: [f32; 4]) -> [f32; 4] {
+    let left = match align {
+        Align::Left => x,
+        Align::Center => x - w / 2.0,
+        Align::Right => x - w,
+    };
+    [left, y, w, h]
 }
 
 /// Whether every value of `hover` is within ±`max`.

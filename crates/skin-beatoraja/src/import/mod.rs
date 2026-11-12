@@ -1873,6 +1873,26 @@ impl<'d> Cx<'d> {
         Ok(HoverRect { x, y, w, h })
     }
 
+    /// `c`'s pointer region as its element's `track` is keyed: each key's
+    /// destination, before a stretch fits an image in it or an alignment
+    /// moves text (`skin/SkinObject.java:591-602`, where `region` comes
+    /// from the destination, and `623-643`, where only the drawn rect is
+    /// stretched). `None` when it is the track itself.
+    fn pointer_region(&self, c: &Common, track: &Track) -> Result<Option<Track>, ImportError> {
+        let rects = c
+            .track
+            .keys
+            .iter()
+            .map(|k| {
+                self.key_rect(c, k)?
+                    .model_from(self.flip)
+                    .ok_or_else(|| self.range(c.span, "dst"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let region = self.model_track(c, &rects)?;
+        Ok((region != *track).then_some(region))
+    }
+
     /// Key `k`'s rect in reference pixels, y up, with the offsets.
     fn key_rect(&self, c: &Common, k: &SrcKey) -> Result<Rect, ImportError> {
         Rect::scaled(k.rect, self.r)
@@ -1903,11 +1923,13 @@ impl<'d> Cx<'d> {
                 .filter(|_| matches!(source, Source::Image(_) | Source::ImageChoice(_)));
             let search = c.search && matches!(source, Source::Text(_));
             if c.hover.is_some() || action.is_some() || search {
+                let region = self.pointer_region(&c, &track)?;
                 self.sel.pointer.push(PointerDef {
                     element: u32::try_from(self.elements.len()).unwrap_or(u32::MAX),
                     action,
                     hover: c.hover,
                     search,
+                    region,
                 });
             }
         }

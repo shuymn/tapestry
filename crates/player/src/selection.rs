@@ -703,7 +703,11 @@ impl Selection {
         self.refresh_pending();
         let facts = self.pointer_facts();
         let screen = &self.screen;
-        let resolved = crate::pointer::resolve(slot.request, slot.hit, built, &facts, |i| {
+        let press = skin_model::PressHit {
+            hit: slot.hit,
+            outside_search: slot.outside_search,
+        };
+        let resolved = crate::pointer::resolve(slot.request, press, built, &facts, |i| {
             screen.row_kind_at(i)
         });
         if resolved.unfocus {

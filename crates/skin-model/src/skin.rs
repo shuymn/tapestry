@@ -30,7 +30,7 @@ use crate::play::schema::{Grade, field};
 use crate::play::timers::elapsed_us;
 use crate::play::{BuildError, Continuation, Play, PlayContext, PrepareError, SkinFrame};
 use crate::pointer::{
-    self, ActionDef, Button, HoverRect, PointerDef, PointerError, PointerHit, Target,
+    self, ActionDef, Button, HoverRect, PointerDef, PointerError, PressHit, Target,
 };
 use crate::present::{OutTy, Present, PresentDef, PresentError};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
@@ -534,6 +534,9 @@ struct Element {
     /// Its press and its pointer target's slot; a slider's slot is its
     /// kind's.
     press: Option<(usize, Press)>,
+    /// Its pointer region ([`PointerDef::region`]), which its press and
+    /// hover rects are placed on; `None`, its sampled rect.
+    pointer_region: Option<Track>,
 }
 
 /// The runtime state a frame draws from: a play's, or the loading
@@ -1721,7 +1724,8 @@ fn check_selection_widgets(
 /// The pointer entries' checks of [`Skin::new_selection`]: each names an
 /// element of `def` that no other entry names, an action only on an image
 /// or an image choice, a search box only on text showing the query, and a
-/// hover rect within the coordinate range.
+/// hover rect and a region within the coordinate range, the region keyed
+/// as the element's track.
 fn check_pointer(def: &SkinDef, entries: &[PointerDef]) -> Result<(), LoadError> {
     let mut named = vec![false; def.elements.len()];
     for (entry, p) in entries.iter().enumerate() {
@@ -1747,8 +1751,13 @@ fn check_pointer(def: &SkinDef, entries: &[PointerDef]) -> Result<(), LoadError>
         if p.search && !query {
             return fail(PointerError::SearchSource);
         }
-        if p.hover.is_some_and(|h| !pointer::hover_in(h, MAX_COORD)) {
+        if p.hover.is_some_and(|h| !pointer::hover_in(h, MAX_COORD))
+            || p.region.as_ref().is_some_and(track_outside)
+        {
             return fail(PointerError::Coordinates);
+        }
+        if p.region.as_ref().is_some_and(|r| !r.same_timing(&e.track)) {
+            return fail(PointerError::RegionTiming);
         }
     }
     Ok(())
@@ -2718,7 +2727,7 @@ impl Skin {
                 native: e.place.native,
                 follow: e.place.follow,
                 angle: e.place.angle,
-                hover: pointer.and_then(|p: PointerDef| p.hover),
+                hover: pointer.as_ref().and_then(|p| p.hover),
                 press: {
                     let press = match e.source {
                         Source::SongList => {
@@ -2726,14 +2735,17 @@ impl Skin {
                             row_hits = row_hits.saturating_add(list_slots);
                             Some(Press::List { first })
                         }
-                        Source::Text(_) if pointer.is_some_and(|p| p.search) => Some(Press::Search),
+                        Source::Text(_) if pointer.as_ref().is_some_and(|p| p.search) => {
+                            Some(Press::Search)
+                        }
                         Source::Image(_) | Source::ImageChoice(_) => {
-                            pointer.and_then(|p| p.action).map(Press::Action)
+                            pointer.as_ref().and_then(|p| p.action).map(Press::Action)
                         }
                         _ => None,
                     };
                     press.map(|p| (next(&mut targets), p))
                 },
+                pointer_region: pointer.and_then(|p| p.region),
             })
             .collect();
         let whens_need = def.whens.iter().map(|w| Need::of(Some(w))).collect();
@@ -4075,19 +4087,24 @@ impl Skin {
     /// [`build_selection`](Self::build_selection) of `sel` drew, topmost
     /// first (`skin/Skin.java:394-410`):
     ///
-    /// - search text's box, its edges included: [`PointerHit::Search`];
+    /// - search text's input box, its region moved by its alignment, its
+    ///   edges included: [`PointerHit::Search`](crate::PointerHit::Search);
     /// - a changeable slider's travel: the ratio under the point, as
     ///   [`drag_at`](Self::drag_at) reads it; off its travel the walk goes
     ///   on;
-    /// - an action element's rect: its event, its argument by its
-    ///   [`ClickType`](crate::ClickType) and `button`
-    ///   (`skin/SkinObject.java:671-700`);
+    /// - an action element's region, its destination before any stretch:
+    ///   its event, its argument by its [`ClickType`](crate::ClickType) and
+    ///   `button` (`skin/SkinObject.java:671-700`);
     /// - a song list: the first of its clickable slots, in their order,
     ///   whose bar drew over the point, with that row's identity
     ///   (`select/BarRenderer.java:80-101`); none, and the walk goes on.
     ///
-    /// `None` when nothing is hit, or when that build was at another target
-    /// size or of another state. Changes nothing; allocates nothing.
+    /// The hit is `None` when nothing is hit. Apart from it, the answer
+    /// says whether the point lies outside every drawn search text's input
+    /// box, which decides a focused search box's blur whatever is hit
+    /// (`skin/Skin.java:394-397`). [`PressHit::NONE`] when that build was
+    /// at another target size or of another state. Changes nothing;
+    /// allocates nothing.
     #[must_use]
     pub fn hit_at(
         &self,
@@ -4095,9 +4112,9 @@ impl Skin {
         point: [f32; 2],
         target: [u32; 2],
         button: Button,
-    ) -> Option<PointerHit> {
+    ) -> PressHit {
         if !self.owns(sel) {
-            return None;
+            return PressHit::NONE;
         }
         let clickable = self.song_list.as_ref().map_or(&[][..], |l| &l.clickable);
         pointer::hit(
@@ -4540,8 +4557,20 @@ impl Skin {
                 cell.set(Some(t));
             }
         };
-        // Whether an element of hover rect `hover` drawn over `rect` under
-        // `affine` is hovered; one without a rect always is.
+        // An element's pointer region at its local time `t`, its sampled
+        // rect `rect` there: its destination before any stretch or text
+        // alignment. The source computes `region` from the destination in
+        // `SkinObject.prepare` and tests the hover rect and a press against
+        // it (`skin/SkinObject.java:591-607, 671-700`); only `draw`
+        // stretches the rect it draws (`skin/SkinObject.java:623-643`).
+        let region_at = |e: &Element, t: i64, rect: [f32; 4]| {
+            e.pointer_region
+                .as_ref()
+                .and_then(|r| r.sample(t))
+                .map_or(rect, |r| r.rect)
+        };
+        // Whether an element of hover rect `hover` and region `rect` under
+        // `affine` is hovered; one without a hover rect always is.
         let hovered = |hover: Option<HoverRect>, affine: Affine, rect: [f32; 4]| {
             hover.is_none_or(|h| {
                 let scale = affine.scale.map(|s| s * canvas.scale());
@@ -4568,13 +4597,13 @@ impl Skin {
                 if !placement.region(e.region).visible {
                     continue;
                 }
-                let Some((_t, s)) =
+                let Some((t, s)) =
                     sample(rt.starts, now, state, e.slot, e.visible.as_ref(), &e.track)
                 else {
                     continue;
                 };
                 let affine = placement.affine(e.region, e.fill);
-                if !hovered(e.hover, affine, s.rect) {
+                if !hovered(e.hover, affine, region_at(e, t, s.rect)) {
                     #[cfg(feature = "dev-tools")]
                     out.observed(crate::observation::Outcome::PointerOutside);
                     continue;
@@ -4698,6 +4727,9 @@ impl Skin {
             };
             #[cfg(feature = "dev-tools")]
             out.observed_time(t);
+            // Its pointer region, before a chart image's stretch below, and
+            // moved with the covers as its rect is.
+            let region = e.follow.translate(region_at(e, t, s.rect), lanes.as_ref());
             // A chart image: its uv, and its stretch against its native
             // size, applied to the sampled rect as an imported image's is
             // baked into its keys; absent, or unavailable, it draws nothing.
@@ -4774,7 +4806,7 @@ impl Skin {
                 }
                 None => (e.follow.translate(s.rect, lanes.as_ref()), None),
             };
-            if !hovered(e.hover, affine, rect) {
+            if !hovered(e.hover, affine, region) {
                 #[cfg(feature = "dev-tools")]
                 out.observed(crate::observation::Outcome::PointerOutside);
                 continue;
@@ -4819,11 +4851,14 @@ impl Skin {
                         && let Some(f) = image.frame(rt.starts, now, uvs)
                     {
                         brush.push_clipped(out, rect, f, image.filter, trim);
+                        // The source tests a press against the region, not
+                        // the stretched rect drawn
+                        // (`skin/SkinObject.java:671-700`).
                         if let Some((slot, Press::Action(def))) = e.press {
                             record(
                                 slot,
                                 Target::Action {
-                                    rect: on_target(canvas, affine, rect),
+                                    rect: on_target(canvas, affine, region),
                                     def,
                                     target: canvas.target(),
                                 },
@@ -4893,12 +4928,18 @@ impl Skin {
                     }
                 }
                 Kind::Text(_, t) => {
-                    // The box takes a press whether or not its line drew.
+                    // The box takes a press whether or not its line drew:
+                    // the region moved by the alignment
+                    // (`skin/SkinText.java:162-169`).
                     if let Some((slot, Press::Search)) = e.press {
                         record(
                             slot,
                             Target::Search {
-                                rect: on_target(canvas, affine, rect),
+                                rect: on_target(
+                                    canvas,
+                                    affine,
+                                    pointer::input_box(t.align, region),
+                                ),
                                 target: canvas.target(),
                             },
                         );

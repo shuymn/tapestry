@@ -7,13 +7,13 @@
 mod selection_support;
 
 use selection_support::{
-    Fx, boolean, chart, element, folder, list, list_element, load, placement, ratio, view,
+    Fx, boolean, chart, element, folder, list, list_element, load, placement, ratio, rect, view,
 };
 use skin_model::{
     ActionDef, Button, ClickType, ElementDef, HoverRect, LoadError, PointerDef, PointerError,
-    PointerHit, RatioBarDef, RatioForm, RatioSource, RowKind, RowRef, RowRefKind, RowView,
-    SelectionDefs, SelectionText, SliderCommand, SliderDirection, SongListDef, SongListError,
-    Source, TextDef, TextValue, WidgetDefs,
+    PointerHit, PressHit, RatioBarDef, RatioForm, RatioSource, RowKind, RowRef, RowRefKind,
+    RowView, SelectionDefs, SelectionText, SliderCommand, SliderDirection, SongListDef,
+    SongListError, Source, TextDef, TextValue, WidgetDefs,
 };
 
 /// The revision every numbered view here carries.
@@ -51,6 +51,7 @@ fn action(element: usize, event: u16, click: ClickType) -> PointerDef {
         action: Some(ActionDef { event, click }),
         hover: None,
         search: false,
+        region: None,
     }
 }
 
@@ -77,7 +78,7 @@ fn built(elements: Vec<ElementDef>, sel: SelectionDefs, v: &skin_model::Selectio
 
 /// The press at `p` with `button` on `fx`'s last build.
 fn hit(fx: &Fx, p: [f32; 2], button: Button) -> Option<PointerHit> {
-    fx.skin.hit_at(&fx.sel, p, fx.target, button)
+    fx.skin.hit_at(&fx.sel, p, fx.target, button).hit
 }
 
 /// A slider, an action and a song list slot over one point: the topmost
@@ -156,7 +157,7 @@ fn the_topmost_target_takes_the_press() {
         // Another target size than the build's hits nothing.
         assert_eq!(
             fx.skin.hit_at(&fx.sel, point, [1_280, 720], Button::Left),
-            None
+            PressHit::NONE
         );
         assert_eq!(fx.skin.drag_at(&fx.sel, point, [1_280, 720]), None);
     }
@@ -393,6 +394,7 @@ fn the_search_box_takes_a_press_with_an_empty_query() {
                 action: None,
                 hover: None,
                 search: true,
+                region: None,
             }],
             ..SelectionDefs::default()
         },
@@ -431,6 +433,7 @@ fn a_hover_rect_shows_its_element_only_under_the_pointer() {
                         h,
                     }),
                     search: false,
+                    region: None,
                 }],
                 ..SelectionDefs::default()
             },
@@ -505,6 +508,7 @@ fn load_refuses_misplaced_pointer_entries() {
         action: None,
         hover: None,
         search: false,
+        region: None,
     };
     let refused = |r: Result<_, LoadError>| match r {
         Err(LoadError::Pointer { entry, error }) => Some((entry, error)),
@@ -585,4 +589,229 @@ fn load_refuses_misplaced_pointer_entries() {
         Err(LoadError::SongList(SongListError::Clickable { slot: 3 }))
     ));
     assert!(with(vec![2, 2, 0]).is_ok());
+}
+
+/// An element's action and hover rect are placed on its region, its
+/// destination before a stretch fitted its image in it
+/// (`skin/SkinObject.java:591-607, 623-643, 671-700`): a 2:1 image drawn
+/// 100×50 in the middle of a 100×100 destination takes a press anywhere
+/// in the destination, and its hover rect runs from the destination's
+/// corner.
+#[test]
+fn an_action_and_a_hover_rect_are_placed_on_the_region() {
+    let v = view(vec![chart("a")], Some(0));
+    // The drawn rect, stretched: [100, 125, 100, 50].
+    let fx = built(
+        vec![element(Source::Image(5), [100, 125, 100, 50])],
+        SelectionDefs {
+            pointer: vec![PointerDef {
+                region: Some(rect([100, 100, 100, 100])),
+                ..action(0, 12, ClickType::TopBottom)
+            }],
+            ..SelectionDefs::default()
+        },
+        &v,
+    );
+    assert_eq!(fx.batch.quads().len(), 1);
+    // Above and below the drawn rect, in the destination: the halves of
+    // the destination, not of the drawn rect.
+    assert_eq!(
+        hit(&fx, [150.0, 110.0], Button::Left),
+        Some(PointerHit::Action { event: 12, arg: 1 })
+    );
+    assert_eq!(
+        hit(&fx, [150.0, 140.0], Button::Left),
+        Some(PointerHit::Action { event: 12, arg: 1 })
+    );
+    assert_eq!(
+        hit(&fx, [150.0, 190.0], Button::Left),
+        Some(PointerHit::Action { event: 12, arg: -1 })
+    );
+    assert_eq!(hit(&fx, [150.0, 201.0], Button::Left), None);
+    // A hover rect from the region's corner: a right-aligned line drawn at
+    // x 500 in a destination anchored at x 900.
+    let mut fx = built(
+        vec![element(Source::Image(5), [500, 300, 400, 20])],
+        SelectionDefs {
+            pointer: vec![PointerDef {
+                element: 0,
+                action: None,
+                hover: Some(HoverRect {
+                    x: 0,
+                    y: 0,
+                    w: 400,
+                    h: 20,
+                }),
+                search: false,
+                region: Some(rect([900, 300, 400, 20])),
+            }],
+            ..SelectionDefs::default()
+        },
+        &v,
+    );
+    fx.pointer = Some([1_000.0, 310.0]);
+    fx.frame(0);
+    assert_eq!(fx.batch.quads().len(), 1);
+    fx.pointer = Some([600.0, 310.0]);
+    fx.frame(0);
+    assert!(fx.batch.quads().is_empty());
+}
+
+/// A search text's input box is its region moved left by half or all of
+/// its width as it is centred or right-aligned
+/// (`skin/SkinText.java:162-169`), its full height whatever its line's.
+#[test]
+fn a_search_box_is_its_region_moved_by_its_alignment() {
+    for (align, left) in [
+        (skin_model::Align::Center, 700_i32),
+        (skin_model::Align::Right, 500_i32),
+    ] {
+        // The line's box as an imported fixed-size font keys it: moved by
+        // the alignment, 10 tall in a 20-tall destination.
+        let skin = load(
+            vec![element(Source::Text(0), [left, 100, 400, 10])],
+            WidgetDefs {
+                texts: vec![TextDef {
+                    value: TextValue::Selection(SelectionText::Query),
+                    font: skin_model::FontRef::Default,
+                    align,
+                    overflow: skin_model::Overflow::Spill,
+                }],
+                ..WidgetDefs::default()
+            },
+            SelectionDefs {
+                pointer: vec![PointerDef {
+                    element: 0,
+                    action: None,
+                    hover: None,
+                    search: true,
+                    region: Some(rect([900, 100, 400, 20])),
+                }],
+                ..SelectionDefs::default()
+            },
+        )
+        .unwrap();
+        let mut fx = Fx::new(skin);
+        fx.view(&view(Vec::new(), None));
+        fx.frame(0);
+        let x = f32::from(i16::try_from(left).unwrap());
+        let search = Some(PointerHit::Search);
+        for (p, want) in [
+            ([x, 100.0], search),
+            ([x + 400.0, 120.0], search),
+            ([x + 200.0, 118.0], search),
+            ([x - 1.0, 110.0], None),
+            ([x + 401.0, 110.0], None),
+            ([x + 200.0, 121.0], None),
+        ] {
+            assert_eq!(hit(&fx, p, Button::Left), want, "{align:?} {p:?}");
+        }
+    }
+}
+
+/// Whether a press lies outside every search box is read apart from what
+/// it hits (`skin/Skin.java:394-397`): an action drawn over the box takes
+/// a press inside it, which is still inside; a press off the box is
+/// outside whatever it hits.
+#[test]
+fn a_press_says_whether_it_is_outside_the_search_box() {
+    let skin = load(
+        vec![
+            element(Source::Text(0), [100, 100, 300, 20]),
+            element(Source::Image(5), [150, 95, 50, 30]),
+        ],
+        WidgetDefs {
+            texts: vec![TextDef {
+                value: TextValue::Selection(SelectionText::Query),
+                font: skin_model::FontRef::Default,
+                align: skin_model::Align::Left,
+                overflow: skin_model::Overflow::Spill,
+            }],
+            ..WidgetDefs::default()
+        },
+        SelectionDefs {
+            pointer: vec![
+                PointerDef {
+                    element: 0,
+                    action: None,
+                    hover: None,
+                    search: true,
+                    region: None,
+                },
+                action(1, 12, ClickType::Plus),
+            ],
+            ..SelectionDefs::default()
+        },
+    )
+    .unwrap();
+    let mut fx = Fx::new(skin);
+    fx.view(&view(Vec::new(), None));
+    fx.frame(0);
+    let press = |p| fx.skin.hit_at(&fx.sel, p, fx.target, Button::Left);
+    let order = Some(PointerHit::Action { event: 12, arg: 1 });
+    assert_eq!(
+        press([160.0, 110.0]),
+        PressHit {
+            hit: order,
+            outside_search: false
+        }
+    );
+    assert_eq!(
+        press([120.0, 110.0]),
+        PressHit {
+            hit: Some(PointerHit::Search),
+            outside_search: false
+        }
+    );
+    // On the action, below the box.
+    assert_eq!(
+        press([160.0, 124.0]),
+        PressHit {
+            hit: order,
+            outside_search: true
+        }
+    );
+    assert_eq!(
+        press([500.0, 110.0]),
+        PressHit {
+            hit: None,
+            outside_search: true
+        }
+    );
+}
+
+/// The load refuses a region keyed otherwise than its element's track, or
+/// one past the coordinate range.
+#[test]
+fn load_refuses_a_misplaced_region() {
+    let try_load = |region| {
+        load(
+            vec![element(Source::Image(5), [0, 0, 10, 10])],
+            WidgetDefs::default(),
+            SelectionDefs {
+                pointer: vec![PointerDef {
+                    region: Some(region),
+                    ..action(0, 12, ClickType::Plus)
+                }],
+                ..SelectionDefs::default()
+            },
+        )
+    };
+    let refused = |r: Result<_, LoadError>| match r {
+        Err(LoadError::Pointer { entry, error }) => Some((entry, error)),
+        Err(e) => panic!("{e}"),
+        Ok(_) => None,
+    };
+    assert_eq!(
+        refused(try_load(selection_support::keys(&[
+            (0, [0, 0, 20, 20]),
+            (100, [0, 0, 20, 20])
+        ]))),
+        Some((0, PointerError::RegionTiming))
+    );
+    assert_eq!(
+        refused(try_load(rect([skin_model::MAX_COORD + 1, 0, 20, 20]))),
+        Some((0, PointerError::Coordinates))
+    );
+    assert!(try_load(rect([0, 0, 20, 20])).is_ok());
 }

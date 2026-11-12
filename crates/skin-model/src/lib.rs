@@ -198,8 +198,8 @@ pub use play::{
     SkinFrame, attempt_targets,
 };
 pub use pointer::{
-    ActionDef, Button, ClickType, HoverRect, PointerDef, PointerError, PointerHit, RowRef,
-    RowRefKind,
+    ActionDef, Button, ClickType, HoverRect, PointerDef, PointerError, PointerHit, PressHit,
+    RowRef, RowRefKind,
 };
 pub use quad::{Blend, ClipId, ClipRect, Filter, Quad, QuadBatch, Run, RunKey};
 pub use result::schema::{

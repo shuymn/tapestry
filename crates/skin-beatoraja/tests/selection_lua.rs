@@ -423,7 +423,7 @@ fn lua_actions_take_the_json_import() {
     let mut s = Sel::new(i.imported.skin);
     s.view(&view(vec![chart("a")], Some(0), None, None));
     s.frame(0);
-    let hit = |s: &Sel, at| s.skin.hit_at(&s.sel, at, [1_920, 1_080], Button::Left);
+    let hit = |s: &Sel, at| s.skin.hit_at(&s.sel, at, [1_920, 1_080], Button::Left).hit;
     let action = |event, arg| Some(PointerHit::Action { event, arg });
     // Type 2 by halves, type 3 by top and bottom, type 1 negated.
     assert_eq!(hit(&s, [10.0, 1_030.0]), action(15, -1));

@@ -10,7 +10,7 @@ use common::selection::{
     IMAGES, SET, Sel, TEXT_T, TITLE, chart, folder, folder_row, import_selection, song_list, view,
 };
 use skin_beatoraja::{EssentialPart, ImportError, NoteKind, PropertyKind};
-use skin_model::{Button, PointerHit, RatioSource, RowRef, RowRefKind, RowView};
+use skin_model::{Button, PointerHit, PressHit, RatioSource, RowRef, RowRefKind, RowView};
 use tempfile::TempDir;
 
 const TARGET: [u32; 2] = [1_920, 1_080];
@@ -75,7 +75,7 @@ fn drawn(s: &mut Sel) {
 }
 
 fn hit(s: &Sel, at: [f32; 2], button: Button) -> Option<PointerHit> {
-    s.skin.hit_at(&s.sel, at, TARGET, button)
+    s.skin.hit_at(&s.sel, at, TARGET, button).hit
 }
 
 fn action(event: u16, arg: i8) -> Option<PointerHit> {
@@ -374,5 +374,130 @@ fn a_volume_slider_over_a_row_is_hit_first() {
             },
             button: Button::Left,
         })
+    );
+}
+
+/// A 2:1 image fitted with stretch 1 into a square destination is drawn
+/// 100×50 in its middle, but takes a press anywhere in the destination:
+/// the source tests a press against `region`, the destination, and
+/// stretches only the rect it draws (`skin/SkinObject.java:591-602,
+/// 623-643, 671-700`).
+#[test]
+fn a_stretched_image_takes_a_press_on_its_whole_destination() {
+    let images = r#", {"id": "wide", "src": "s", "x": 0, "y": 16, "w": 16, "h": 8, "act": 12}"#;
+    let dsts = dst("wide", [600, 400, 100, 100], r#""stretch": 1,"#);
+    let d = skin(images, &body("", "", &dsts));
+    let mut s = Sel::new(import_selection(d.path()).unwrap().skin);
+    s.view(&view(numbered(vec![chart("a")]), Some(0), None, None));
+    let quads = s.drawn(0);
+    assert!(
+        quads.iter().any(|(_, r)| *r == [600.0, 425.0, 100.0, 50.0]),
+        "{quads:?}"
+    );
+    // Above and below the drawn rect, inside the destination.
+    assert_eq!(hit(&s, [650.0, 410.0], Button::Left), action(12, 1));
+    assert_eq!(hit(&s, [650.0, 490.0], Button::Left), action(12, 1));
+    assert_eq!(hit(&s, [650.0, 501.0], Button::Left), None);
+}
+
+/// A right-aligned text's `mouseRect` runs from its destination's corner,
+/// x 900, not from where its line is drawn: the source tests it against
+/// `region` (`skin/SkinObject.java:603-607`). The text is the search box,
+/// whose input box (x 500 to 900) takes the press only while the pointer
+/// is in the hover rect.
+#[test]
+fn a_right_aligned_text_s_mouse_rect_is_anchored_at_its_destination() {
+    let texts = r#", {"id": "q", "font": "f", "size": 20, "ref": 30, "align": 2}"#;
+    let dsts = dst(
+        "q",
+        [900, 100, 400, 20],
+        r#""mouseRect": {"x": 0, "y": 0, "w": 400, "h": 20},"#,
+    );
+    let d = skin("", &body("", texts, &dsts));
+    let mut s = Sel::new(import_selection(d.path()).unwrap().skin);
+    s.view(&view(numbered(vec![chart("a")]), Some(0), None, None));
+    let mut search_at = |pointer: [f32; 2]| {
+        s.pointer = Some(pointer);
+        s.frame(0);
+        hit(&s, [600.0, 110.0], Button::Left)
+    };
+    assert_eq!(search_at([1_000.0, 110.0]), Some(PointerHit::Search));
+    assert_eq!(search_at([1_300.0, 120.0]), Some(PointerHit::Search));
+    assert_eq!(search_at([600.0, 110.0]), None);
+    assert_eq!(search_at([899.0, 110.0]), None);
+}
+
+/// A centred and a right-aligned search text's input box: the destination
+/// moved left by half or all of its width (`skin/SkinText.java:162-169`).
+#[test]
+fn an_aligned_search_text_s_input_box() {
+    for (align, left) in [(1, 700.0), (2, 500.0)] {
+        let texts =
+            format!(r#", {{"id": "q", "font": "f", "size": 20, "ref": 30, "align": {align}}}"#);
+        let d = skin("", &body("", &texts, &dst("q", [900, 100, 400, 20], "")));
+        let mut s = Sel::of(d.path());
+        drawn(&mut s);
+        let search = Some(PointerHit::Search);
+        for (p, want) in [
+            ([left, 100.0], search),
+            ([left + 400.0, 120.0], search),
+            ([left - 1.0, 110.0], None),
+            ([left + 401.0, 110.0], None),
+            ([left + 200.0, 121.0], None),
+        ] {
+            assert_eq!(hit(&s, p, Button::Left), want, "align {align} {p:?}");
+        }
+    }
+}
+
+/// An action drawn over the search text inside its input box takes the
+/// press, the press still inside the box; a press on a row off the box is
+/// outside it (`skin/Skin.java:394-397`).
+#[test]
+fn a_press_on_an_action_over_the_search_box_is_inside_it() {
+    let images = r#", {"id": "order", "src": "s", "x": 48, "y": 0, "w": 8, "h": 8, "act": 12}"#;
+    let place = r#"{"x": 100, "y": 500, "w": 300, "h": 40}"#;
+    let list = song_list(
+        &[place],
+        &[place],
+        0,
+        &format!("{TITLE}, \"clickable\": [0]"),
+    );
+    let texts = r#", {"id": "q", "font": "f", "size": 20, "ref": 30}"#;
+    let dsts = [
+        dst("q", [100, 100, 300, 20], ""),
+        dst("order", [150, 95, 50, 30], ""),
+    ]
+    .concat();
+    let d = skin(
+        images,
+        &format!(
+            r#""imageset": [{SET}], "text": [{TEXT_T}{texts}], {list},
+               "destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}{dsts}]"#
+        ),
+    );
+    let mut s = Sel::of(d.path());
+    drawn(&mut s);
+    let press = |at| s.skin.hit_at(&s.sel, at, TARGET, Button::Left);
+    assert_eq!(
+        press([160.0, 110.0]),
+        PressHit {
+            hit: action(12, 1),
+            outside_search: false,
+        }
+    );
+    assert_eq!(
+        press([200.0, 560.0]),
+        PressHit {
+            hit: Some(PointerHit::Row {
+                row: RowRef {
+                    list_revision: 0,
+                    index: 0,
+                    kind: RowRefKind::Chart,
+                },
+                button: Button::Left,
+            }),
+            outside_search: true,
+        }
     );
 }
