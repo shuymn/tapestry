@@ -1216,6 +1216,10 @@ struct Shared {
     /// whether one holds (tests).
     #[cfg(test)]
     result_frame_hold: [AtomicBool; 2],
+    /// Each result frame's time and the `screen` timer reading its running
+    /// runtime's host read in it, after its visit (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    result_runtime_timers: Mutex<Vec<(TimeUs, Option<i32>)>>,
     /// Select frames stall 2 ms after their instant is sampled while set
     /// (tests): a second clock reading in the frame would differ from it.
     #[cfg(test)]
@@ -1278,6 +1282,8 @@ impl Shared {
             result_status: Mutex::new(ResultReport::default()),
             #[cfg(test)]
             result_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
+            #[cfg(all(test, feature = "dev-tools"))]
+            result_runtime_timers: Mutex::new(Vec::new()),
             #[cfg(test)]
             selection_stall: AtomicBool::new(false),
         }
@@ -5243,6 +5249,14 @@ impl Run {
                         now,
                     );
                     Self::result_visit(self.result.as_mut(), now, fadeout);
+                    #[cfg(all(test, feature = "dev-tools"))]
+                    if let Some(h) = self.result.as_ref().and_then(|s| s.presented.as_ref()) {
+                        self.shared
+                            .result_runtime_timers
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push((now, h.script.running_frame_timer(0)));
+                    }
                     let built =
                         Self::result_build(screen.as_mut(), self.result.as_mut(), now, fadeout);
                     // A frame under the barrier refused (dev-tools: the

@@ -3130,30 +3130,64 @@ fn a_skin_after_a_built_in_view_inherits_its_origin() {
     rig.link.exit();
 }
 
-/// The skin's runtime and its build read one origin: the `screen` timer
-/// the frame's visit prepared is the build's start's reading, the time
-/// since the first commit.
+/// The skin's kept runtime and its build read one origin: a callback the
+/// importer could not lower (its upvalue changes each call) runs on the
+/// kept VM from the lifetime's first frame, and on every frame the
+/// `screen` timer its host read is the time since the first commit, the
+/// build's `screen` start, as frames advance.
 #[test]
 fn the_runtime_and_the_build_read_one_origin() {
-    let (_dir, skin, _script) = scripted_skin("return true");
+    let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
+    assert!(script.holds(), "the callback runs on a kept runtime");
     let rig = Rig::new();
+    let (g, _gone) = offer(&rig, script);
     let lifetime = installed(&rig, &skin);
-    let a = payload(1, Some(&skin), 1_111, &[]);
-    show(&rig.link, lifetime, 1, &a, &Overlay::default());
-    // Frames until one is at least 2 ms after the first.
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &scripted(1, &skin, Some(g), &[]),
+        &Overlay::default(),
+    );
+    let ran = || {
+        rig.link
+            .shared
+            .result_runtime_timers
+            .lock()
+            .unwrap()
+            .clone()
+    };
+    // Frames until one the runtime ran is 3 ms or more after the first.
     assert!(wait_until(|| {
-        let b = builds(&rig);
-        b.first()
-            .zip(b.last())
-            .is_some_and(|(f, l)| l.0.0 - f.0.0 >= 2_000)
+        let r = ran();
+        let ran_at: Vec<i64> = r
+            .iter()
+            .filter(|(_, t)| t.is_some())
+            .map(|(now, _)| now.0)
+            .collect();
+        ran_at
+            .first()
+            .zip(ran_at.last())
+            .is_some_and(|(f, l)| l - f >= 3_000)
     }));
+    assert!(rig.link.scripts().result_live(Some(g)));
     let b = builds(&rig);
     let origin = b[0].0;
-    for &(now, screen, prepared) in &b {
-        assert_eq!(screen, Some(origin));
+    let ran = ran();
+    let mut readings = Vec::new();
+    for &(now, timer) in &ran {
+        let Some(&(_, screen, prepared)) = b.iter().find(|x| x.0 == now) else {
+            continue;
+        };
         let ms = i32::try_from((now.0 - origin.0) / 1_000).unwrap();
+        assert_eq!(screen, Some(origin), "{b:?}");
+        assert_eq!(timer, Some(ms), "the runtime's reading: {ran:?}");
         assert_eq!(prepared, Some(ms), "{b:?}");
+        readings.push(ms);
     }
+    assert!(readings.first() == Some(&0), "{readings:?}");
+    assert!(readings.windows(2).all(|w| w[0] <= w[1]), "{readings:?}");
+    assert!(readings.last().is_some_and(|&l| l >= 3), "{readings:?}");
     rig.link.exit();
 }
 
