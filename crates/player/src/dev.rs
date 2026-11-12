@@ -1004,6 +1004,10 @@ pub const STEP_TIMEOUT: Duration = Duration::from_secs(20);
 /// seconds, so this bound only catches a pass that never ends.
 pub const STEP_WATCHDOG: Duration = Duration::from_secs(600);
 
+/// How long a step waits on a holding capture when the run sets no render
+/// bound: the production bound on a chart's load.
+pub const HOLD_BOUND: Duration = Duration::from_secs(60);
+
 /// A slow load a script asks for (`slow-load`, `quit-loading`,
 /// `close-loading`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1082,6 +1086,18 @@ pub struct SelectScript {
     /// Each listed file's identity, as far as the front step looked them
     /// up: each at most once per step.
     pub identities: std::collections::HashMap<PathBuf, Option<PathBuf>>,
+    /// When the front step's wait on a holding capture ends, the render
+    /// bound after it began: one deadline for the step.
+    held_until: Option<std::time::Instant>,
+    /// How long a step waits on a holding capture: the render bound.
+    hold_bound: Option<Duration>,
+    /// The views the result had changed to when the front step, a view
+    /// command on a result, was sent: it is over once a later view is
+    /// published and drawn.
+    pub sent_views: Option<u64>,
+    /// The result shown was left by a step: its steps are over until the
+    /// next result begins.
+    pub left_result: bool,
 }
 
 impl SelectScript {
@@ -1216,6 +1232,24 @@ impl SelectScript {
         self.idle_from = None;
         self.drawn_from = None;
         self.identities.clear();
+        self.held_until = None;
+        self.sent_views = None;
+    }
+
+    /// How long a step waits on a holding capture: `bound`, the run's
+    /// render bound.
+    pub const fn set_hold_bound(&mut self, bound: Duration) {
+        self.hold_bound = Some(bound);
+    }
+
+    /// Whether the front step's wait on a holding capture has passed its
+    /// one deadline, set when the wait began.
+    pub fn hold_expired(&mut self) -> bool {
+        let bound = self.hold_bound.unwrap_or(HOLD_BOUND);
+        let until = *self
+            .held_until
+            .get_or_insert_with(|| std::time::Instant::now() + bound);
+        std::time::Instant::now() >= until
     }
 
     /// The front step waits on; `false` once it has waited
@@ -2513,7 +2547,8 @@ fn onsets(samples: &[f32]) -> Vec<usize> {
 /// skin drew, `ready.png` at
 /// the first frame of the lead-in, `play.png` at the first frame at or
 /// after `play_at` (and each play's own as `play-<generation>.png`),
-/// and `end.png` at the first end screen frame.
+/// and `end.png` at the first result frame, its skin's or the built-in
+/// page.
 pub struct FrameDump {
     dir: PathBuf,
     play_at: TimeUs,
@@ -2578,6 +2613,15 @@ impl FrameSink for FrameDump {
         if !drawn.timing.presented {
             return;
         }
+        let names = self.names(drawn);
+        self.save(screen, &names);
+    }
+}
+
+impl FrameDump {
+    /// The files a presented frame `drawn` is saved as, each name taken
+    /// once.
+    fn names(&mut self, drawn: &Drawn<'_>) -> Vec<String> {
         let mut names = Vec::new();
         // Each play's own frame at `play_at`, by its generation.
         if let (Some(t), Some(g)) = (drawn.play, drawn.generation)
@@ -2602,25 +2646,25 @@ impl FrameSink for FrameDump {
                 self.play = true;
                 names.push("play.png".to_owned());
             }
-            None if drawn.loading => {
-                if !self.loading {
+            None => match drawn.screen {
+                crate::measure::ScreenKind::Loading if !self.loading => {
                     self.loading = true;
                     names.push("loading.png".to_owned());
                 }
-            }
-            None if drawn.menu => {
-                if !self.select {
+                crate::measure::ScreenKind::Selection if !self.select => {
                     self.select = true;
                     names.push("select.png".to_owned());
                 }
-            }
-            None if !self.end => {
-                self.end = true;
-                names.push("end.png".to_owned());
-            }
+                // A result's first frame, its skin's or the built-in page.
+                k if k.is_result() && !self.end => {
+                    self.end = true;
+                    names.push("end.png".to_owned());
+                }
+                _ => {}
+            },
             _ => {}
         }
-        self.save(screen, &names);
+        names
     }
 }
 
@@ -2845,8 +2889,10 @@ pub fn script_switches() -> ScriptSwitches {
 /// The environment variable of the result's injected refusals (tests of
 /// the real flow): a comma list of `select<N>`, the N-th selection or
 /// upload of the result kind refused, `stage<N>`, the N-th view staging
-/// refused, and `text<N>`, the N-th view's text refused on a healthy
-/// device (the run's fallback), each counted from 1 on the render thread.
+/// refused, `text<N>`, the N-th view's text refused on a healthy
+/// device (the run's fallback), and `lostresult<N>`, the N-th result or
+/// end frame drawn lost as a device loss, each counted from 1 on the
+/// render thread.
 pub const RESULT_FAULTS_ENV: &str = "TAPESTRY_DEV_RESULT_FAULTS";
 
 /// The result's selections and view stagings asked for so far.
@@ -2928,6 +2974,20 @@ pub fn read_result_faults() {
     };
     PINNED_FAULT.store(count("pinned"), Ordering::SeqCst);
     LOST_PINNED_FAULT.store(count("lostpinned"), Ordering::SeqCst);
+    LOST_RESULT_FAULT.store(count("lostresult"), Ordering::SeqCst);
+}
+
+/// The result or end frame drawn lost as a device loss, counted from 1
+/// over the run's result and end frames: `lostresult<N>` in
+/// [`RESULT_FAULTS_ENV`]; 0 none. The screen is built again as after any
+/// loss.
+static LOST_RESULT_FAULT: AtomicU64 = AtomicU64::new(0);
+static LOST_RESULT_SEEN: AtomicU64 = AtomicU64::new(0);
+
+/// Whether this result or end frame, drawn, is lost as a device loss.
+pub fn lose_result_frame() -> bool {
+    let n = LOST_RESULT_FAULT.load(Ordering::SeqCst);
+    n != 0 && LOST_RESULT_SEEN.fetch_add(1, Ordering::SeqCst) + 1 == n
 }
 
 /// Whether this result frame, built under the barrier, is lost as a

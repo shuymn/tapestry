@@ -608,6 +608,8 @@ fn titled(
         page: EndPage {
             lines: (0..25).map(|i| format!("v{key} {i}")).collect(),
             graphs: None,
+            #[cfg(feature = "dev-tools")]
+            id: None,
         },
     })
 }
@@ -764,6 +766,8 @@ fn the_barrier_keeps_the_view_and_a_refusal_draws_its_page() {
     rig.link.show_end(EndPage {
         lines: latest,
         graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
     });
     assert!(rig.link.fence(Duration::from_secs(10)));
     // Only the refused frame runs: the next waits before its commit
@@ -1128,6 +1132,8 @@ fn a_restore_refused_before_any_result_disables_the_kind() {
     rig.link.show_end(EndPage {
         lines: vec!["page".to_owned()],
         graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
     });
     assert!(wait_until(|| rig.link.failed()));
     rig.link.prepare().unwrap();
@@ -1332,6 +1338,8 @@ fn a_new_lifetimes_page_base_has_its_settings_lines() {
         let base = EndPage {
             lines: (0..20).map(|i| format!("base {i}")).collect(),
             graphs: None,
+            #[cfg(feature = "dev-tools")]
+            id: None,
         };
         p.end_page = Some(base.clone());
         faults.refuse_text.store(true, Ordering::Release);
@@ -1386,6 +1394,8 @@ fn a_restore_refusal_stands_when_the_build_fails() {
     rig.link.show_end(EndPage {
         lines: vec!["page".to_owned()],
         graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
     });
     assert!(wait_until(|| rig.link.failed()));
     rig.faults.refuse_restore.store(true, Ordering::Release);
@@ -1456,6 +1466,8 @@ fn a_new_lifetimes_first_fallback_has_no_earlier_row() {
     rig.link.show_end(EndPage {
         lines: (0..25).map(|i| format!("old {i}")).collect(),
         graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
     });
     show(
         &rig.link,
@@ -1503,6 +1515,8 @@ fn a_render_thread_panic_is_a_failure() {
     rig.link.show_end(EndPage {
         lines: vec!["page".to_owned()],
         graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
     });
     assert!(wait_until(|| rig.faults.dropping.load(Ordering::Acquire)));
     assert!(rig.link.failed(), "failed before the teardown");
@@ -1854,6 +1868,8 @@ fn on_shown_result(
         p.end_page = Some(EndPage {
             lines: vec!["base".to_owned()],
             graphs: None,
+            #[cfg(feature = "dev-tools")]
+            id: None,
         });
         p.present_view(&report, &screen);
         assert!(
