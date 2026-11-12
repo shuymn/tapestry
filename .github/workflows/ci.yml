@@ -67,8 +67,8 @@ jobs:
   # The Windows checks run as three jobs in parallel, each building on its
   # own runner: `windows-test` the workspace's lints and tests,
   # `windows-release` the optimized builds and the production binary, and
-  # `windows-dev-tools` the development features and the game on its
-  # threads. `windows` is the required check over the three.
+  # `windows-dev-tools` (in parts) the development features and the game on
+  # its threads. `windows` is the required check over the three.
   windows-test:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
@@ -188,19 +188,40 @@ jobs:
             test "$code" -eq 2
             grep -q "unknown argument: $arg" probe.err
           done
+      # The player's allocation guards are unit tests of its binary, whose
+      # counting allocator exists only with dev-tools; `_alloc` selects them
+      # (`cargo xtask check-alloc-tests`). Last, so the step above reads the
+      # production binary this build replaces.
+      - name: Player allocation guards (release)
+        run: mise exec -- cargo test --release --locked -p player --features dev-tools --bin tapestry -- _alloc
 
+  # The dev-tools tests take most of this job, bound by the runner's cores,
+  # so each part runs one nextest partition (`slice`, round-robin over the
+  # sorted test list) on its own runner; the first part also runs clippy,
+  # the positive control and the check that the partitions cover every
+  # test exactly once. The parts are numbered by `strategy.job-index`, so
+  # adding a matrix entry adds a partition.
   windows-dev-tools:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
+    name: windows-dev-tools (${{ matrix.part }}/${{ strategy.job-total }})
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3]
     runs-on: windows-2025
     timeout-minutes: 45
     permissions:
       contents: read
     # Line tables keep backtraces' file and line and make the debug
     # artifacts, and so the cache, much smaller than full debug info.
+    # DEV_TOOLS names the packages and features every part tests.
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
+      DEV_TOOLS: -p player -p game -p skin-beatoraja -p skin-model --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked
+      PART: ${{ strategy.job-index }}
+      PARTS: ${{ strategy.job-total }}
     defaults:
       run:
         shell: bash
@@ -223,30 +244,50 @@ jobs:
       # rust-cache, which hashes .cargo/config.toml into its key.
       - name: Optimize dependencies in debug builds
         run: printf '\n[profile.dev.package."*"]\nopt-level = 2\n' >> .cargo/config.toml
+      # The parts share one cache key; the first part builds everything the
+      # others build (and clippy's), so only it saves.
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cmd-format: mise exec -- {0}
           cache-bin: false
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          save-if: ${{ github.ref == 'refs/heads/main' && strategy.job-index == 0 }}
       - name: Clippy (dev-tools)
-        run: mise exec -- cargo clippy -p player -p game -p skin-beatoraja -p skin-model --all-targets --locked --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools -- -D warnings
+        if: ${{ strategy.job-index == 0 }}
+        run: |
+          # shellcheck disable=SC2086 # DEV_TOOLS is split into arguments on purpose
+          mise exec -- cargo clippy $DEV_TOOLS --all-targets -- -D warnings
       - name: Development build includes dev-tools (positive control)
+        if: ${{ strategy.job-index == 0 }}
         run: |
           mise exec -- cargo build --locked -p player --features dev-tools
           mise exec -- cargo xtask check-binary --present "tapestry dev-tools enabled" target/debug/tapestry.exe
           target/debug/tapestry.exe --dev-tools-probe
+      # The partitions together list each test of the unpartitioned run
+      # exactly once, so no test leaves CI unnoticed.
+      - name: Partitions cover every test (dev-tools)
+        if: ${{ strategy.job-index == 0 }}
+        run: |
+          all="$RUNNER_TEMP/all-tests.txt"
+          parts="$RUNNER_TEMP/partition-tests.txt"
+          # shellcheck disable=SC2086 # DEV_TOOLS is split into arguments on purpose
+          mise exec -- cargo nextest list $DEV_TOOLS --message-format oneline | sort > "$all"
+          for k in $(seq 1 "$PARTS"); do
+            # shellcheck disable=SC2086
+            mise exec -- cargo nextest list $DEV_TOOLS --partition "slice:$k/$PARTS" --message-format oneline
+          done | sort > "$parts"
+          echo "$(wc -l < "$all") tests; $(wc -l < "$parts") over $PARTS partitions"
+          test -s "$all"
+          diff "$all" "$parts"
       # The game on its threads, driven by a scripted input log, on WARP.
       - name: Test (dev-tools)
-        run: mise exec -- cargo nextest run -p player -p game -p skin-beatoraja -p skin-model --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked --no-fail-fast
-      # The player's allocation guards are unit tests of its binary, whose
-      # counting allocator exists only with dev-tools; `_alloc` selects them
-      # (`cargo xtask check-alloc-tests`).
-      - name: Player allocation guards (release)
-        run: mise exec -- cargo test --release --locked -p player --features dev-tools --bin tapestry -- _alloc
+        run: |
+          # shellcheck disable=SC2086 # DEV_TOOLS is split into arguments on purpose
+          mise exec -- cargo nextest run $DEV_TOOLS --partition "slice:$((PART + 1))/$PARTS" --no-fail-fast
 
   # Passes when the three Windows jobs passed, or when `changes` found no
   # change the build jobs read and they were skipped; anything else
-  # (a failed, cancelled or unexpectedly skipped job) fails it.
+  # (a failed, cancelled or unexpectedly skipped job) fails it. A matrix
+  # job's result is `success` only when every part succeeded.
   windows:
     needs: [changes, windows-test, windows-release, windows-dev-tools]
     if: ${{ always() }}
