@@ -85,11 +85,14 @@ impl Cx<'_> {
     }
 
     /// Whether `c`, critical and without a timer, is refused (owner
-    /// decision 7, D3, [`policy::untimed_ok`]). An admitted one whose
-    /// presentation phase depends on the start is noted once it is
-    /// retained (`Cx::untimed_phase`).
+    /// decision 7, D3): unless only its presentation phase varies
+    /// ([`policy::untimed_ok`]) or it settles ([`policy::settles`]). An
+    /// admitted one whose presentation phase depends on the start is noted
+    /// once it is retained (`Cx::untimed_phase`).
     fn untimed_refused(&self, c: &Common) -> bool {
-        c.untimed && matches!(c.role, Role::Critical(_)) && !policy::untimed_ok(&c.track)
+        c.untimed
+            && matches!(c.role, Role::Critical(_))
+            && !(policy::untimed_ok(&c.track) || policy::settles(&c.track))
     }
 
     /// Records that `c` keeps an image cycling on `cycle`, for its D3
@@ -104,7 +107,7 @@ impl Cx<'_> {
     /// The cycle of `s` over `frames` for `c`, resolved before its sheet
     /// is admitted, or why `c` is dropped: its timer or cycle refused, or
     /// `c` critical and untimed where it moves or changes a colour
-    /// channel other than alpha (D3).
+    /// channel other than alpha, unless it settles (D3).
     pub(super) fn src_cycle(
         &mut self,
         c: &Common,

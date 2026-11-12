@@ -1759,6 +1759,8 @@ fn the_selected_charts_class_reads_before_the_settings() {
         order: skin_model::SelectionOrder::Title,
         gauge: None,
         covers_on: [false; 3],
+        play_to_end: false,
+        assignment: None,
     };
     fx.skin
         .update_selection_settings(&mut fx.sel, &settings)

@@ -4351,7 +4351,7 @@ impl Run {
                 Ok(RenderMsg::Decision(page)) => {
                     // The decision screen is no play state's presentation:
                     // the turntable is not adopted or ticked (design.md
-                    // :732).
+                    // "State Model").
                     self.page_turns = false;
                     self.decision = Some(page.clone());
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);
@@ -13821,6 +13821,8 @@ pub(crate) mod tests {
             order: skin_model::SelectionOrder::Title,
             gauge: None,
             covers_on: [false; 3],
+            play_to_end: false,
+            assignment: None,
         };
         for (us, ms) in [
             (-15_600, -15),
