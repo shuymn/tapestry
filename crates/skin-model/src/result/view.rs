@@ -126,6 +126,11 @@ pub struct ResultChart {
     /// (`IntegerPropertyFactory.java:562-576`): the chart's, under every
     /// status.
     pub notes: Option<u32>,
+    /// Its judgment class, 0 the hardest to 4 the easiest, as play's
+    /// [`ChartMetadata::judge_class`](crate::ChartMetadata::judge_class):
+    /// from its own rank, whatever preset judged or views it; `None`
+    /// also for a rank in no class. A value above 4 is none.
+    pub judge_class: Option<u8>,
 }
 
 /// A chart's tempo range.

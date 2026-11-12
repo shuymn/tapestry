@@ -258,6 +258,39 @@ fn a_view_fills_the_result_fields() {
     assert_eq!(f(field::CHART_NOTES), 0);
 }
 
+/// The chart's judgment class is the chart's under every status: a class
+/// of 1 or 3 reads it and valid, ready or unavailable; one above 4 and an
+/// unknown one read 0 and not valid, so 180 holds for neither.
+#[test]
+fn the_judgment_class_is_the_charts_under_every_status() {
+    let mut fx = RFx::new(rload(vec![], WidgetDefs::default()).unwrap());
+    for status in [
+        ResultStatus::Ready,
+        ResultStatus::Unavailable(Unavailable::Failed),
+    ] {
+        for (class, want) in [
+            (Some(1), [1, 1]),
+            (Some(3), [3, 1]),
+            (Some(9), [0, 0]),
+            (None, [0, 0]),
+        ] {
+            let mut v = ready(1_000, BestView::Unavailable, 4);
+            v.status = status;
+            v.chart.judge_class = class;
+            fx.view(&v);
+            let f = |slot: u16| fx.res.state().fields[usize::from(slot)];
+            assert_eq!(
+                [
+                    f(field::CHART_JUDGE_CLASS),
+                    f(field::CHART_JUDGE_CLASS_VALID)
+                ],
+                want,
+                "{class:?} {status:?}"
+            );
+        }
+    }
+}
+
 /// The fields a result state reads after a view are exactly
 /// [`ResultFields::of`] that view, the conversion an import reads at load:
 /// for shown, hidden and unavailable values and an unavailable view.

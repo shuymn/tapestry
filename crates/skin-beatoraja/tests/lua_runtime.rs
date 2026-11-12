@@ -1020,6 +1020,71 @@ fn a_result_skin_runs_its_callbacks() {
     assert_eq!(out, [4, -2_147_482_648], "{:?}", runtime(&mut i).status());
 }
 
+/// The judgment class options read by callbacks kept in the result
+/// runtime (values the lowering cannot represent: a division): 181 holds
+/// only for class 1, and 180 only for a known class 0, though an unknown
+/// class's field reads 0; under an unavailable view as under a ready one.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_result_runtime_reads_the_judgment_class() {
+    untimed();
+    let tables = "local ms = require(\"main_state\")\n\
+        skin.value[2] = { id = \"r\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, \
+            digit = 4, value = function() return (ms.option(181) and 2 or 0) / 1 end }\n\
+        skin.value[3] = { id = \"q\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, \
+            digit = 4, value = function() return (ms.option(180) and 2 or 0) / 1 end }";
+    let dsts = "{ id = \"r\", dst = { { x = 0, y = 120, w = 4, h = 8 } } },\n\
+        { id = \"q\", dst = { { x = 0, y = 140, w = 4, h = 8 } } },";
+    let d = common::result::sheet();
+    common::write(
+        d.path(),
+        "s.luaskin",
+        common::result::graph_lua(tables, dsts).as_bytes(),
+    );
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let facts = common::result::facts(None);
+    let LuaOutcome::Imported(mut i) = h
+        .import_runtime(&Config::defaults(h.header()), &facts, &cancel)
+        .unwrap()
+    else {
+        panic!()
+    };
+    let n = runtime(&mut i).outputs();
+    assert_eq!(n, 2, "both kept in the runtime");
+    for (valid, class, class_valid, want) in [
+        (1, 1, 1, [2, 0]),
+        (1, 3, 1, [0, 0]),
+        (1, 0, 1, [0, 2]),
+        (1, 0, 0, [0, 0]),
+        (0, 1, 1, [2, 0]),
+        (0, 0, 1, [0, 2]),
+    ] {
+        let mut f = vec![0; RESULT.fields.len() + 2 * n];
+        for (name, v) in [
+            ("result.valid", valid),
+            ("ex_score", 9),
+            ("chart.judge_class", class),
+            ("chart.judge_class_valid", class_valid),
+        ] {
+            let (slot, _) = RESULT.field(name).unwrap();
+            f[usize::from(slot)] = v;
+        }
+        runtime(&mut i).frame(&mut f, &[]);
+        let out: Vec<i32> = f[RESULT.fields.len()..]
+            .iter()
+            .step_by(2)
+            .copied()
+            .collect();
+        assert_eq!(
+            out,
+            want,
+            "valid {valid}, class {class} ({class_valid}): {:?}",
+            runtime(&mut i).status()
+        );
+    }
+}
+
 /// A runtime's permit returns when the runtime is dropped, on the thread
 /// that drops it, after the VM: when the VM is destroyed the permit is
 /// still out.

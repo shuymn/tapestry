@@ -83,7 +83,7 @@ const TEXT: &[(i32, i32, C)] = &[
 /// §A's image indices: 2 N, 9 constants.
 const IMAGE_INDEX: &[(i32, i32, C)] = &[(42, 42, C::K(0)), (370, 371, C::N), (450, 457, C::K(0))];
 
-/// §A's built-in options: 40 N (180 to 184 the judgment class fact),
+/// §A's built-in options: 40 N (180 to 184 the chart's judgment class),
 /// then the 22 D constants with their values.
 const OPTION_N: &[(i32, i32)] = &[
     (90, 91),
@@ -165,8 +165,22 @@ fn every_profile_id_has_its_class() {
         assert!(crate::import::ops::is_builtin(id), "option {id}");
     }
     assert_eq!(option(160), Some(Class::Bridge(ResOption::Constant(true))));
-    for id in 180..=184 {
-        assert_eq!(option(id), Some(Class::Bridge(ResOption::JudgeClass)));
+    // The judgment class reads the chart's field as play's does, 180 under
+    // its validity; no group guard, since the class is the chart's under
+    // every status.
+    for (id, src) in [
+        (180, "chart.judge_class_valid && chart.judge_class == 0"),
+        (181, "chart.judge_class == 1"),
+        (182, "chart.judge_class == 2"),
+        (183, "chart.judge_class == 3"),
+        (184, "chart.judge_class == 4"),
+    ] {
+        assert_eq!(
+            option(id),
+            Some(Class::Bridge(ResOption::Expr(src))),
+            "{id}"
+        );
+        assert_eq!(option_guard(id), "true", "{id}");
     }
     assert_eq!(timer(2), Timer::Builtin(result_timer::FADEOUT));
     for id in [0, 173, 174] {
