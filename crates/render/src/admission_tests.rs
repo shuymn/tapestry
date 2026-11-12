@@ -84,7 +84,7 @@ fn refused(e: &RenderError, kind: ScreenKind, needed: u64) {
     assert!(e.is_refusal());
 }
 
-/// The shared limit is 768 Mi, at least two atlases at the cap: big as
+/// The shared limit is 832 Mi, at least two atlases at the cap: big as
 /// the selection screen's candidate fits beside play's skin charged the
 /// cap; charged what the limit leaves beside big, play's skin puts the sum
 /// exactly at the limit, and one texel more past it; once a tiny result
@@ -92,7 +92,7 @@ fn refused(e: &RenderError, kind: ScreenKind, needed: u64) {
 /// big is refused.
 #[test]
 fn two_skins_at_the_atlas_cap_fit_together() {
-    assert_eq!(SHARED_TEXELS, 768 << 20);
+    assert_eq!(SHARED_TEXELS, 832 << 20);
     const { assert!(SHARED_TEXELS >= 2 * CAP) };
     let mut r = offscreen(1_920, 1_080);
     let big = big(&r);
@@ -128,14 +128,14 @@ fn two_skins_at_the_atlas_cap_fit_together() {
 /// the largest result skin surveyed. That set is past the former 576 Mi.
 /// A VM charge after S7-07 (4 Mi) is smaller than [`VM_TEXELS`], so the
 /// same set fits under it too. At a replacement's peak the admitted
-/// texels and the replaced atlas are within 1 024 Mi.
+/// texels and the replaced atlas are within 1 088 Mi.
 #[test]
 fn the_largest_skin_of_each_kind_fits_together() {
     const M: u64 = 1_000_000;
     const DECISION: u64 = 8 * 4_224 * 4_224;
     assert_eq!(DECISION, 142_737_408);
     const { assert!(4 << 20 <= VM_TEXELS) };
-    const { assert!(SHARED_TEXELS + CAP == 1_024 << 20) };
+    const { assert!(SHARED_TEXELS + CAP == 1_088 << 20) };
     let mut r = offscreen(1_920, 1_080);
     let p = tiny(&r, RED);
     play(&mut r, &p, 1);
@@ -155,6 +155,43 @@ fn the_largest_skin_of_each_kind_fits_together() {
     const { assert!(231_900_000 < CAP) };
     assert!(needed > 576 << 20, "{needed}");
     assert!(needed <= SHARED_TEXELS, "{needed}");
+    r.admit(ScreenKind::Result, &result).unwrap();
+}
+
+/// The owner's largest set with a play skin's chart layer (S10-12), as
+/// measured over the imported skins at the device's limits: the play skin
+/// with its chart layer and its title card's fonts (178 421 760 texels), the
+/// largest selection skin (201 719 808) and decision skin (142 737 408),
+/// each keeping a VM, and the largest result skin (234 881 024) keeping
+/// one: 808 091 648 texels, past the former 768 Mi and within the limit.
+/// Committed at those charges, a result candidate at an atlas's cap,
+/// more than the measured result skin, is admitted beside them.
+#[test]
+fn the_measured_set_with_a_chart_layer_fits() {
+    const PLAY: u64 = 178_421_760;
+    const SELECTION: u64 = 201_719_808;
+    const DECISION: u64 = 142_737_408;
+    const RESULT: u64 = 234_881_024;
+    const SET: u64 = PLAY + SELECTION + DECISION + RESULT + 3 * VM_TEXELS;
+    assert_eq!(SET, 808_091_648);
+    const { assert!(SET > 768 << 20) };
+    const { assert!(SET <= SHARED_TEXELS) };
+    let mut r = offscreen(1_920, 1_080);
+    let p = tiny(&r, RED);
+    play(&mut r, &p, 1);
+    r.state_charge(&p, PLAY);
+    let sel = tiny(&r, GREEN);
+    commit(&mut r, ScreenKind::Selection, &sel, 2);
+    r.state_charge(&sel, SELECTION + VM_TEXELS);
+    let d = tiny(&r, BLUE);
+    commit(&mut r, ScreenKind::Decision, &d, 3);
+    r.state_charge(&d, DECISION + VM_TEXELS);
+    let result = Arc::new(
+        Arc::try_unwrap(atlas_cap_bundle(&r, GREEN))
+            .unwrap()
+            .keeping_vm(),
+    );
+    const { assert!(RESULT < CAP) };
     r.admit(ScreenKind::Result, &result).unwrap();
 }
 

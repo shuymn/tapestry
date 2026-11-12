@@ -86,8 +86,18 @@ pub struct Survey {
     /// expressions and presentation program run, of
     /// [`skin_model::MAX_SKIN_OPS`], and its program's callbacks.
     pub frame_ops: Option<(usize, usize)>,
+    /// An imported skin's atlas plan in each variant, with the layers it
+    /// keeps and with its chart layer given up, under [`DEVICE_LIMITS`]
+    /// (dev-tools measurement, S10-12 design §4.3).
+    #[cfg(feature = "dev-tools")]
+    pub atlas: Vec<String>,
     /// An imported play skin's declared ending, as read.
     pub play_ending: Option<skin_model::PlayEnding>,
+    /// An imported play skin's elements, and how many run on each timer
+    /// by its play schema name, `when` for a `when` timer and `program`
+    /// for a compiled timer callback, the zero counts left out
+    /// (dev-tools).
+    pub play_elements: Option<(usize, BTreeMap<String, usize>)>,
     /// A result import drawn over [`Choice::result`], when one was given
     /// and the import completed, or a decision import that completed,
     /// drawn over its declared timing ([`decision_frames`]).
@@ -747,6 +757,80 @@ fn runtime_frame(rt: &mut super::runtime::ScreenRuntime, kind: ScreenKind) -> Ru
     }
 }
 
+/// The limits the player's device gives an atlas: the renderer asks
+/// wgpu for its default limits (`render/src/gpu.rs:111`,
+/// `DeviceDescriptor::default()`), whose largest 2D texture side is 8 192
+/// and whose array layers are 256, and keeps one reserved layer
+/// (`render::RESERVED_LAYERS`).
+#[cfg(feature = "dev-tools")]
+pub const DEVICE_LIMITS: skin_model::AtlasLimits = skin_model::AtlasLimits {
+    max_side: 8_192,
+    max_layers: 256,
+    reserved_layers: 1,
+};
+
+/// `skin`'s atlas plan in each variant under [`DEVICE_LIMITS`], one line
+/// per variant and kept layers: its side, pages, layers and level-0
+/// texels against [`skin_model::MAX_ATLAS_TEXELS`], or the refusal. A
+/// skin with a chart layer gets a second line without it.
+#[cfg(feature = "dev-tools")]
+fn atlas_plans(skin: &skin_model::Skin) -> Vec<String> {
+    use skin_model::{KeptLayers, Variant};
+    let kept = skin.kept_layers();
+    let mut sets = vec![("kept", kept)];
+    if kept.chart {
+        sets.push((
+            "no chart layer",
+            KeptLayers {
+                chart: false,
+                ..kept
+            },
+        ));
+    }
+    let mut lines = Vec::new();
+    for variant in [Variant::Lo, Variant::Hi] {
+        for (label, k) in &sets {
+            let shape = skin.sheet().plan_shape(variant, DEVICE_LIMITS, *k);
+            lines.push(match shape {
+                Ok(p) => format!(
+                    "{variant:?} {label} (text {}, chart {}): side {} pages {} layers {} texels {} of {}",
+                    k.text,
+                    k.chart,
+                    p.side,
+                    p.pages,
+                    p.layers,
+                    p.texels,
+                    skin_model::MAX_ATLAS_TEXELS
+                ),
+                Err(e) => format!("{variant:?} {label} (text {}, chart {}): refused: {e}", k.text, k.chart),
+            });
+        }
+    }
+    lines
+}
+
+/// A play skin's element count and its elements per timer, by the play
+/// schema's timer name, `when` for a `when` timer and `program` for a
+/// compiled timer callback.
+#[cfg(feature = "dev-tools")]
+fn play_elements(skin: &skin_model::Skin) -> (usize, BTreeMap<String, usize>) {
+    use skin_model::TimerRef;
+    let timers = skin.element_timers();
+    let mut by = BTreeMap::new();
+    for t in &timers {
+        let name = match *t {
+            TimerRef::Builtin(s) => skin_model::PLAY
+                .timers
+                .get(usize::from(s))
+                .map_or("builtin", |t| t.name),
+            TimerRef::When(_) => "when",
+            TimerRef::Output(_) => "program",
+        };
+        *by.entry(name.to_owned()).or_default() += 1;
+    }
+    (timers.len(), by)
+}
+
 /// Records an import that completed: its outcome, its notes by kind, and
 /// its frames for a `kind` result skin with [`Choice::result`] or a
 /// decision skin.
@@ -758,7 +842,12 @@ fn imported_into(s: &mut Survey, imported: &crate::Imported, kind: ScreenKind, c
     ));
     s.play_ending = (kind == ScreenKind::Play).then(|| imported.skin.play_ending());
     #[cfg(feature = "dev-tools")]
+    if kind == ScreenKind::Play {
+        s.play_elements = Some(play_elements(&imported.skin));
+    }
+    #[cfg(feature = "dev-tools")]
     {
+        s.atlas = atlas_plans(&imported.skin);
         s.gauges = imported
             .skin
             .gauge_shapes()

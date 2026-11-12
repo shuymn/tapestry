@@ -296,6 +296,23 @@ pub(crate) enum Stretch {
 }
 
 impl Stretch {
+    /// A chart image's stretch at placement for this mode
+    /// ([`skin_model::chart_image::ChartStretch`]), which keeps every mode
+    /// but the trimmed ones: `None` for those.
+    pub(crate) const fn chart(self) -> Option<skin_model::chart_image::ChartStretch> {
+        use skin_model::chart_image::ChartStretch;
+        match self {
+            Self::Identity => Some(ChartStretch::Fill),
+            Self::Inner => Some(ChartStretch::Inner),
+            Self::Outer => Some(ChartStretch::Outer),
+            Self::FitWidth => Some(ChartStretch::FitWidth),
+            Self::FitHeight => Some(ChartStretch::FitHeight),
+            Self::NoExpanding => Some(ChartStretch::NoExpanding),
+            Self::NoResize => Some(ChartStretch::NoResize),
+            Self::Trimmed => None,
+        }
+    }
+
     pub(crate) fn of(mode: i32) -> Self {
         match mode {
             1 => Self::Inner,

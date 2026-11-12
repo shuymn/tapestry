@@ -157,6 +157,7 @@ pub fn view(combo: u32, ex_score: u32) -> PlayView {
         complete: false,
         playing: true,
         closing: None,
+        fading: None,
         events: 31,
         offsets: game::OffsetRing::EMPTY,
     }
@@ -242,6 +243,7 @@ pub fn input<'a>(
     FrameInput {
         app: skin_model::AppReadouts::LAUNCH,
         state_us: 0,
+        screen_us: 0,
         now,
         display_offset,
         lanes: LANES,
