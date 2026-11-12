@@ -318,16 +318,15 @@ fn takeover_restarts_no_clock_and_plays_no_tone() {
             assert!(wait_until(|| skins_after(&f.seen, 0) > 0));
             until_clock(rig, TimeUs(origin.0 + refused_ms * MS));
             f.seen.refuse_frame.store(true, Ordering::Release);
-            let taken = std::cell::RefCell::new(None);
-            assert!(wait_until(|| {
-                let mut t = taken.borrow_mut();
-                if t.is_none() {
-                    *t = rig.render.take_decision_takeover();
+            // As App's look takes it, through the rig.
+            let began = std::time::Instant::now();
+            let t = loop {
+                if let Some(t) = rig.take_decision_takeover() {
+                    break t;
                 }
-                t.is_some()
-            }));
-            // As App's look takes it.
-            let t = taken.into_inner().unwrap();
+                assert!(began.elapsed().as_secs() < 60, "no takeover");
+                std::thread::yield_now();
+            };
             assert_eq!(t.lifetime, DecisionLifetime(3));
             assert!(t.at.0 >= origin.0 + refused_ms * MS);
             let now = rig.now();
@@ -776,4 +775,52 @@ fn decision_skin_json_and_lua_draw_through_production() {
             assert_eq!(skins_after(&f.seen, 0), 0);
         },
     );
+}
+
+/// O5, O7: the practice page's entry and a refused load's return
+/// (`closed_epoch`, which App runs for every leave of a screen shown)
+/// end the lifetime in the label book, and its slot is retired.
+#[test]
+fn page_entry_and_leave_end_the_lifetime() {
+    for practice in [true, false] {
+        let dir = listed();
+        flow(&dir, |rig, f| {
+            f.prepared();
+            let d = choose(rig, &f.pick(practice), 3);
+            assert!(matches!(d.shown(), Some(DecisionShown::Skin { .. })));
+            assert_eq!(lock(&f.book).active(), Some(3));
+            rig.closed_epoch();
+            assert_eq!(lock(&f.book).active(), None, "{practice}: still active");
+            assert!(
+                wait_until(|| f.pinned().is_none()),
+                "{practice}: never retired"
+            );
+        });
+    }
+}
+
+/// O7 inside a rig's wait: the play's deadline step taken by a look of
+/// the controls (the step latched there, so App's own look runs no step)
+/// ends the lifetime in the label book, and its slot is retired.
+#[test]
+fn step_inside_a_rig_wait_ends_the_lifetime() {
+    let dir = listed();
+    flow(&dir, |rig, f| {
+        f.prepared();
+        let d = choose(rig, &f.pick(false), 3);
+        let end = d.deadline().unwrap();
+        rig.controls.watch_decision(crate::controls::DecisionWatch {
+            decision: d,
+            origin: Origin::Load,
+            reveal: Box::new(|| {}),
+            failures: rig.failures.clone(),
+            screen: Some(rig.render.recovery_handle()),
+        });
+        until_clock(rig, end);
+        assert_eq!(rig.controls.look(), Some(Verdict::Step));
+        let d = rig.controls.unwatch_decision().unwrap();
+        assert!(d.stepped());
+        assert_eq!(lock(&f.book).active(), None, "the step left it active");
+        assert!(wait_until(|| f.pinned().is_none()), "never retired");
+    });
 }

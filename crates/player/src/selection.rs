@@ -2186,7 +2186,7 @@ enum PageBegin {
 
 impl PlayerRig<'_> {
     /// The decision lifetime the choice claimed ended (its step, the
-    /// practice page's entry, a leave, the chart left after a refusal):
+    /// practice page's entry, a leave, a refused load's return):
     /// the label book is told, so the render thread retires its pinned
     /// slot at its next boundary. Once per claim; a lifetime a look inside
     /// a rig's wait ended already is ended again with no effect.
@@ -2970,8 +2970,6 @@ impl AppRig for PlayerRig<'_> {
     /// nowhere (design.md "Load Pipeline"), but a panic one published
     /// meanwhile that a Start was responsible for, which ends the run.
     fn left_chart(&mut self) -> Result<(), game::LiveError<ScreenError>> {
-        // A leave ends the decision lifetime, whichever way it went.
-        self.end_decision();
         // Its images' job was cancelled with the choice's scope below; its
         // set is never taken, nor drawn.
         self.chart_images.forget();
