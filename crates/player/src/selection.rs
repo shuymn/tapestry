@@ -1433,6 +1433,12 @@ pub enum ChartLoadError {
     /// The screen cannot draw the chart.
     #[error("the screen cannot draw the chart")]
     Screen(#[source] ScreenError),
+    /// The screen failed while it loaded the chart: the device or the
+    /// surface was lost twice, or the render thread did not answer or
+    /// ended. Its error is the rig's, for the flow
+    /// ([`game::AppRig::screen_load_failed`]), which ends the run.
+    #[error("the screen failed while it loaded the chart")]
+    ScreenFailed,
     /// The run has no select screen (never: only selection loads charts).
     #[error("no song selection")]
     NoSelection,
@@ -2248,6 +2254,7 @@ impl PlayerRig<'_> {
                     reveal();
                 }),
                 failures: self.failures.clone(),
+                screen: Some(self.render.recovery_handle()),
             });
         let out = f(self);
         if let Some(d) = self.controls.unwatch_decision() {
@@ -2259,6 +2266,8 @@ impl PlayerRig<'_> {
     /// [`AppRig::load_chart`]'s load, its waits' stops serving the
     /// decision screen when one is watched.
     fn load_watched(&mut self, loaded: &Loaded) -> Result<Loading, ChartLoadError> {
+        // A cause another load left is not this load's.
+        self.screen_load_failure = None;
         // The chart, speed and section are final: the presentation solves
         // for them once, so what the player adjusts while loading applies
         // to this attempt. A refusal is reported by the play's preparation
@@ -2525,7 +2534,17 @@ impl PlayerRig<'_> {
             #[cfg(test)]
             &|| probe(decodes.as_deref(), Probe::Screen, controls, &|| false),
         )
-        .map_err(ChartLoadError::Screen)?;
+        .map_err(|e| match e {
+            // A skin's refusal refuses the chart.
+            ScreenError::Render(r) if r.is_refusal() => {
+                ChartLoadError::Screen(ScreenError::Render(r))
+            }
+            // Anything else is the screen's failure, which ends the run.
+            lost => {
+                self.screen_load_failure = Some(lost);
+                ChartLoadError::ScreenFailed
+            }
+        })?;
         if self.controls.decision_left() {
             println!("load: cancelled");
             return Ok(Loading::Cancelled);
@@ -2680,6 +2699,28 @@ impl AppRig for PlayerRig<'_> {
         });
     }
 
+    fn screen_load_failed(&mut self) -> Option<ScreenError> {
+        self.screen_load_failure.take()
+    }
+
+    fn begin_recovery(&mut self) {
+        self.before_rebuild();
+        // Through the rebuild's one owner: one under way (a look's) is
+        // adopted, a lost screen with none gets one; a failure saved there
+        // is reported by the first poll.
+        let _ = self.render.serve_recovery(None, false);
+    }
+
+    fn poll_recovery(&mut self, until: TimeUs) -> Option<Result<(), ScreenError>> {
+        let left = until.0.saturating_sub(self.clock.now().0).max(0);
+        let until = Instant::now() + Duration::from_micros(left.unsigned_abs());
+        match self.render.serve_recovery(Some(until), true) {
+            crate::render_side::Recovered::Nothing => Some(Ok(())),
+            crate::render_side::Recovered::Running => None,
+            crate::render_side::Recovered::Answered(answered) => Some(answered),
+        }
+    }
+
     fn decision_tick(&mut self, origin: game::Origin) -> Result<(), game::LiveError<ScreenError>> {
         // The page's jobs go on through the decision screen.
         if origin == game::Origin::Jobs {
@@ -2722,14 +2763,6 @@ impl AppRig for PlayerRig<'_> {
             &mut self.result_input.pad,
             deadline,
         )
-    }
-
-    /// The screen was built again during the decision screen: its
-    /// presentation is sent again; the tone is not played again.
-    fn recovered_decision(&mut self) {
-        if let Some((page, _)) = self.selection.as_ref().and_then(|s| s.decision.clone()) {
-            self.render.show_decision(page);
-        }
     }
 
     fn load_chart(
@@ -4014,8 +4047,9 @@ pub(crate) mod tests {
     /// The choice's decision screen is out before its input fence: at the
     /// fence, held before its answer, its presentation and its tone were
     /// already sent (a fence that takes the whole time still shows the
-    /// screen). A recovery sends the presentation again and no tone (ND2);
-    /// a second choice sounds its tone again (ND1).
+    /// screen). A second choice sounds its tone again (ND1); a screen built
+    /// again shows the presentation from the render thread, with no tone
+    /// (ND2, `the_render_thread_draws_the_latest_mode_after_a_rebuild`).
     #[cfg(feature = "dev-tools")]
     #[test]
     fn the_decision_screen_is_out_before_its_fence() {
@@ -4052,14 +4086,12 @@ pub(crate) mod tests {
                     "the presentation and the tone before the fence"
                 );
                 let sent = rig.render.decisions_sent();
-                rig.recovered_decision();
-                assert_eq!((sent(), tones.tone_requests()), (2, 1), "no second tone");
                 rig.closed_epoch();
                 rig.entered_decision(
                     &game::Pick::Practice(chart.clone()),
                     &mut game::Decision::off(),
                 );
-                assert_eq!((sent(), tones.tone_requests()), (3, 2), "a tone a choice");
+                assert_eq!((sent(), tones.tone_requests()), (2, 2), "a tone a choice");
                 thread.stop().unwrap();
             },
         );

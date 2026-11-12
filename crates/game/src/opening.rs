@@ -363,6 +363,13 @@ pub fn load_and_open<R: LoadingRig>(
     // The attempt is prepared before its play begins: its best and target
     // are set first, and the begin reads no more under the same key.
     loaded.prepare_score();
+    // A screen to be built again (a decision screen's rebuild under way or
+    // failed, a device lost) is served before the attempt's preparation
+    // begins, so the preparation builds no screen on its own and a saved
+    // failure is reported here, once.
+    if rig.screen_failed() {
+        rig.prepare_screen().map_err(LiveError::Screen)?;
+    }
     let key = loaded.prep_key();
     let handle = rig.begin_preparation(loaded, key);
     let mut opener = LoadingOpener {

@@ -332,3 +332,366 @@ fn the_attach_fence_serves_the_decision_screen() {
     assert!(ended.decision.stepped());
     assert_eq!(ended.decision.left(), None);
 }
+
+/// A rig on a render thread of `screens`, the decision page drawn and its
+/// screen lost (a frame failed), a play's decision screen watched with the
+/// screen served by its looks; `f` then runs on it.
+fn decision_screen_lost(
+    screens: &crate::render_side::tests::Installers,
+    f: impl FnOnce(&mut crate::play::PlayerRig<'_>),
+) {
+    decision_screen_lost_within(screens, None, f);
+}
+
+/// [`decision_screen_lost`], a rebuild's answer bounded by `bound`.
+fn decision_screen_lost_within(
+    screens: &crate::render_side::tests::Installers,
+    bound: Option<std::time::Duration>,
+    f: impl FnOnce(&mut crate::play::PlayerRig<'_>),
+) {
+    let mut link = screens.spawn_bare();
+    if let Some(bound) = bound {
+        link.set_timeouts(bound, std::time::Duration::from_secs(5));
+    }
+    let _ = crate::tests::on_rig_with(super::settings(), link, |rig, _| {
+        let page = crate::menu_screen::MenuPage {
+            lines: vec![crate::menu_screen::MenuLine {
+                text: "decision".to_owned(),
+                style: crate::menu_screen::LineStyle::Title,
+            }],
+            caret: None,
+        };
+        rig.render.show_decision(page);
+        until("the decision page drawn", || {
+            screens
+                .menu_frames
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l == "decision")
+        });
+        screens.fail.store(true, Ordering::Release);
+        until("the screen lost", || rig.render.failed());
+        screens.fail.store(false, Ordering::Release);
+        let now = rig.clock.now();
+        rig.controls.watch_decision(crate::controls::DecisionWatch {
+            decision: game::Decision::begin(now, Some(game::DECISION_TIME), false),
+            origin: game::Origin::Load,
+            reveal: Box::new(|| {}),
+            failures: rig.failures.clone(),
+            screen: Some(rig.render.recovery_handle()),
+        });
+        f(rig);
+        let _ = rig.controls.unwatch_decision();
+    });
+}
+
+/// B4: the screen lost inside a wait the rig owns: the wait's looks build
+/// it again, one rebuild, and the render thread draws the decision page
+/// on it again.
+#[test]
+fn a_screen_lost_inside_a_rig_wait_is_rebuilt() {
+    let screens = crate::render_side::tests::Installers::default();
+    decision_screen_lost(&screens, |rig| {
+        let drawn = screens.menu_frames.lock().unwrap().len();
+        until("rebuilt from the looks", || {
+            let _ = rig.controls.look();
+            !rig.render.failed() && rig.render.recovery_state() == "idle"
+        });
+        assert_eq!(rig.render.prepares(), 1);
+        until("the decision page drawn again", || {
+            screens.menu_frames.lock().unwrap()[drawn..]
+                .iter()
+                .any(|l| l == "decision")
+        });
+    });
+}
+
+/// B5: the rebuild the looks began fails: its failure stays for the flow,
+/// later looks begin no second rebuild, and the flow takes it as the
+/// screen's error from the rig's recovery, again with no second rebuild.
+#[test]
+fn a_failed_rig_rebuild_ends_the_run_through_app() {
+    use game::AppRig as _;
+    let screens = crate::render_side::tests::Installers::default();
+    decision_screen_lost(&screens, |rig| {
+        screens.fail_builds.store(1, Ordering::Release);
+        until("the rebuild failed", || {
+            let _ = rig.controls.look();
+            rig.render.recovery_state() == "failed"
+        });
+        for _ in 0..20 {
+            let _ = rig.controls.look();
+        }
+        assert_eq!(rig.render.prepares(), 1, "a second rebuild from the looks");
+        rig.begin_recovery();
+        let got = rig.poll_recovery(rig.clock.now());
+        assert!(matches!(got, Some(Err(_))), "{got:?}");
+        assert_eq!(rig.render.prepares(), 1, "a second rebuild from the flow");
+    });
+}
+
+/// B6: the rebuild the looks began is still running when the wait ends:
+/// the flow adopts it, so one rebuild in all, and goes on once it answers.
+#[test]
+fn app_adopts_a_rebuild_begun_inside_a_rig_wait() {
+    use game::AppRig as _;
+    let screens = crate::render_side::tests::Installers::default();
+    decision_screen_lost(&screens, |rig| {
+        screens.hold_builds.store(true, Ordering::Release);
+        until("the rebuild held", || {
+            let _ = rig.controls.look();
+            screens.build_held.load(Ordering::Acquire)
+        });
+        // The wait ends; the flow takes the rebuild over.
+        let _ = rig.controls.unwatch_decision();
+        rig.begin_recovery();
+        screens.hold_builds.store(false, Ordering::Release);
+        let mut got = None;
+        until("the rebuild answered", || {
+            let now = rig.clock.now();
+            got = rig.poll_recovery(bms_model::TimeUs(now.0 + 1_000));
+            got.is_some()
+        });
+        assert!(matches!(got, Some(Ok(()))), "{got:?}");
+        assert_eq!(rig.render.prepares(), 1, "a second rebuild");
+        assert!(!rig.render.failed());
+    });
+}
+
+/// B1r (rig): the flow's poll of a rebuild that is held waits no longer
+/// than its slice, so the flow looks at the screen between polls; once
+/// let go, the rebuild answers.
+#[test]
+fn the_flow_polls_a_held_rebuild_without_waiting_for_it() {
+    use game::AppRig as _;
+    let screens = crate::render_side::tests::Installers::default();
+    decision_screen_lost(&screens, |rig| {
+        screens.hold_builds.store(true, Ordering::Release);
+        let _ = rig.controls.unwatch_decision();
+        rig.begin_recovery();
+        until("the rebuild held", || {
+            screens.build_held.load(Ordering::Acquire)
+        });
+        for _ in 0..3 {
+            let now = rig.clock.now();
+            assert!(
+                rig.poll_recovery(bms_model::TimeUs(now.0 + 20_000))
+                    .is_none(),
+                "answered while held"
+            );
+        }
+        screens.hold_builds.store(false, Ordering::Release);
+        let mut got = None;
+        until("the rebuild answered", || {
+            let now = rig.clock.now();
+            got = rig.poll_recovery(bms_model::TimeUs(now.0 + 1_000));
+            got.is_some()
+        });
+        assert!(matches!(got, Some(Ok(()))), "{got:?}");
+    });
+}
+
+/// E1, E2 (the load): a chart's screen load that lost the device once is
+/// built again with the chart and the load is ready; lost twice, the load
+/// fails as the screen's failure, held for the flow, not as a refusal.
+#[test]
+fn a_device_loss_in_the_chart_load_is_rebuilt_or_ends_the_run() {
+    use game::AppRig as _;
+    for lost in [1, 2] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = song(dir.path(), "");
+        let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+        let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+        let installers = crate::render_side::tests::Installers::default();
+        installers.lose_chart_loads.store(lost, Ordering::Release);
+        super::on_rig(b.sel.take().unwrap(), &installers, false, |rig| {
+            let got = rig.load_chart(&loaded, &mut game::Decision::off());
+            if lost == 1 {
+                assert_eq!(outcome(got), Loading::Ready);
+                assert!(installed(rig, &loaded));
+                assert!(rig.screen_load_failed().is_none());
+            } else {
+                assert!(
+                    matches!(got, Err(super::super::ChartLoadError::ScreenFailed)),
+                    "{got:?}"
+                );
+                assert!(rig.screen_load_failed().is_some(), "not held for the flow");
+            }
+        });
+        assert_eq!(installers.chart_loads.lock().unwrap().len(), 2, "{lost}");
+    }
+}
+
+/// M1: a rebuild a wait's looks began fails after the deadline: the next
+/// preparation of the screen reports that failure, once, and asks no
+/// second rebuild for it.
+#[test]
+fn a_saved_rebuild_failure_is_reported_by_the_next_preparation() {
+    use game::Rig as _;
+    let screens = crate::render_side::tests::Installers::default();
+    decision_screen_lost(&screens, |rig| {
+        screens.fail_builds.store(1, Ordering::Release);
+        until("the rebuild failed", || {
+            let _ = rig.controls.look();
+            rig.render.recovery_state() == "failed"
+        });
+        let _ = rig.controls.unwatch_decision();
+        let got = rig.prepare_screen();
+        assert!(got.is_err(), "the saved failure not reported: {got:?}");
+        assert_eq!(rig.render.prepares(), 1, "a second rebuild for it");
+        assert_eq!(rig.render.recovery_state(), "idle");
+    });
+}
+
+/// M2: the flow begins a rebuild and leaves the decision screen before it
+/// answers: the rebuild stays with its owner, and selection's preparation
+/// takes it over (one rebuild in all) and reports how it ended, a failure
+/// included.
+#[test]
+fn a_rebuild_left_by_the_flow_is_taken_over_by_the_next_screen() {
+    use game::AppRig as _;
+    use game::Rig as _;
+    for fails in [false, true] {
+        let screens = crate::render_side::tests::Installers::default();
+        decision_screen_lost(&screens, |rig| {
+            let _ = rig.controls.unwatch_decision();
+            screens.hold_builds.store(true, Ordering::Release);
+            rig.begin_recovery();
+            until("the rebuild held", || {
+                screens.build_held.load(Ordering::Acquire)
+            });
+            // The flow leaves (a refusal at the deadline, a Back) without
+            // polling it; selection prepares its screen.
+            if fails {
+                screens.fail_builds.store(1, Ordering::Release);
+            }
+            let release = screens.hold_builds.clone();
+            let got = std::thread::scope(|s| {
+                s.spawn(move || release.store(false, Ordering::Release));
+                rig.prepare_screen()
+            });
+            assert_eq!(got.is_err(), fails, "{fails}: {got:?}");
+            assert_eq!(rig.render.prepares(), 1, "{fails}: a second rebuild");
+        });
+    }
+}
+
+/// M3: a screen failure another load left is not this load's: a load that
+/// the skin refuses reports a refusal, with no screen failure for the flow.
+#[test]
+fn a_load_takes_no_screen_failure_another_load_left() {
+    use game::AppRig as _;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+    let installers = crate::render_side::tests::Installers::default();
+    installers.refuse_chart_loads.store(true, Ordering::Release);
+    super::on_rig(b.sel.take().unwrap(), &installers, false, |rig| {
+        rig.screen_load_failure = Some(crate::render_side::ScreenError::NoAnswer);
+        let got = rig.load_chart(&loaded, &mut game::Decision::off());
+        assert!(
+            matches!(got, Err(super::super::ChartLoadError::Screen(_))),
+            "{got:?}"
+        );
+        assert!(
+            rig.screen_load_failed().is_none(),
+            "the other load's failure"
+        );
+    });
+}
+
+/// Round 2 M1: a rebuild from a wait's looks reaches its bound, saved as a
+/// failure; the render thread then builds the screen and clears the
+/// device's flag. The screen is still to be served (the saved failure),
+/// and the next preparation (selection's entry at the latest) reports it,
+/// once; then nothing is outstanding.
+#[test]
+fn a_rebuild_failure_saved_before_the_device_came_back_is_reported() {
+    use game::Rig as _;
+    let screens = crate::render_side::tests::Installers::default();
+    decision_screen_lost_within(
+        &screens,
+        Some(std::time::Duration::from_millis(200)),
+        |rig| {
+            screens.hold_builds.store(true, Ordering::Release);
+            until("the rebuild timed out", || {
+                let _ = rig.controls.look();
+                rig.render.recovery_state() == "failed"
+            });
+            let _ = rig.controls.unwatch_decision();
+            screens.hold_builds.store(false, Ordering::Release);
+            until("the device back", || !rig.render.failed());
+            assert!(rig.screen_failed(), "the saved failure not outstanding");
+            let got = rig.prepare_screen();
+            assert!(
+                matches!(got, Err(crate::render_side::ScreenError::NoAnswer)),
+                "{got:?}"
+            );
+            assert!(!rig.screen_failed(), "reported twice");
+            assert!(rig.prepare_screen().is_ok());
+        },
+    );
+}
+
+/// Round 2 M2: a rebuild failure saved during the chart's load, the play
+/// stepped: the opening serves it before the attempt's preparation
+/// begins, so the run ends with it and the screen builder is not called
+/// again by the preparation.
+#[test]
+fn the_opening_reports_a_saved_rebuild_failure_before_its_preparation() {
+    use bms_model::TimeSource as _;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let mut loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+    let installers = crate::render_side::tests::Installers::default();
+    super::on_rig(b.sel.take().unwrap(), &installers, false, |rig| {
+        assert_eq!(
+            outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+            Loading::Ready
+        );
+        let page = crate::menu_screen::MenuPage {
+            lines: vec![crate::menu_screen::MenuLine {
+                text: "decision".to_owned(),
+                style: crate::menu_screen::LineStyle::Title,
+            }],
+            caret: None,
+        };
+        rig.render.show_decision(page);
+        until("the decision page drawn", || {
+            installers
+                .menu_frames
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l == "decision")
+        });
+        installers.fail.store(true, Ordering::Release);
+        until("the screen lost", || rig.render.failed());
+        installers.fail.store(false, Ordering::Release);
+        installers.fail_builds.store(1, Ordering::Release);
+        let now = rig.clock.now();
+        rig.controls.watch_decision(crate::controls::DecisionWatch {
+            decision: game::Decision::begin(now, Some(game::DECISION_TIME), false),
+            origin: game::Origin::Load,
+            reveal: Box::new(|| {}),
+            failures: rig.failures.clone(),
+            screen: Some(rig.render.recovery_handle()),
+        });
+        until("the rebuild failed", || {
+            let _ = rig.controls.look();
+            rig.render.recovery_state() == "failed"
+        });
+        let _ = rig.controls.unwatch_decision();
+        let calls = installers.build_calls.load(Ordering::Acquire);
+        let got = game::load_and_open(&mut loaded, rig);
+        assert!(matches!(got, Err(game::LiveError::Screen(_))), "{got:?}");
+        assert_eq!(
+            installers.build_calls.load(Ordering::Acquire),
+            calls,
+            "the screen built again before the saved failure was reported"
+        );
+    });
+}
