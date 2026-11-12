@@ -366,17 +366,19 @@ pub(crate) fn image_index(id: i32) -> Option<Class<&'static str>> {
         40 => Bridge("settings.gauge"),
         55 => Bridge("settings.fix_hispeed"),
         // The covers' switches, the hi-speed auto adjustment and the judge
-        // algorithm read the selected chart's play config in the source,
-        // which a folder or the "all charts" row has none of: nothing is
-        // drawn there (`skin/property/IntegerPropertyFactory.java:1216-1227`,
-        // `:1261-1315`; `select/MusicSelector.java:650-654`).
-        330 => Bridge("if cursor.chart then (if settings.sudden then 1 else 0) else -1"),
-        331 => Bridge("if cursor.chart then (if settings.lift then 1 else 0) else -1"),
-        332 => Bridge("if cursor.chart then (if settings.hidden then 1 else 0) else -1"),
+        // algorithm read the selected bar's play config in the source: a
+        // chart's mode's, else the mode filter's, so a folder row shows them
+        // too (`skin/property/IntegerPropertyFactory.java:1216-1227`,
+        // `:1261-1315`; `select/MusicSelector.java:650-669`); only 7-key
+        // charts are listed, whose settings are the play options.
+        330 => Bridge("if settings.sudden then 1 else 0"),
+        331 => Bridge("if settings.lift then 1 else 0"),
+        332 => Bridge("if settings.hidden then 1 else 0"),
         // Floating re-solves the hi-speed at the tempo at the head, as the
         // source's auto adjustment does; Classic has none.
-        342 => Bridge("if cursor.chart then (if settings.floating then 1 else 0) else -1"),
-        340 => Bridge("if cursor.chart then settings.judge_algorithm else -1"),
+        342 => Bridge("if settings.floating then 1 else 0"),
+        // Nothing without a preset (−1).
+        340 => Bridge("settings.judge_algorithm"),
         // The gauge auto shift as the failure handling: none (0) when a
         // failed play closes, continue (1) when it plays to the end
         // (`IntegerPropertyFactory.java:1111`; `play/BMSPlayer.java:654-668`).

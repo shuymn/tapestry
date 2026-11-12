@@ -1096,13 +1096,15 @@ fn the_judgment_class_options_read_the_selected_charts_class() {
 }
 
 /// The settings indices the source reads from its player config and the
-/// selected bar's play config (`skin/property/IntegerPropertyFactory.java:1111-1112`,
-/// `:1216-1227`, `:1261-1315`; `select/MusicSelector.java:650-654` at
-/// `0.8.9`), through the production path: 78 is the failure handling,
-/// 341 always 0 whatever the gauge, and 342, 340 and 330 to 332 draw only
-/// on a chart row, nothing on a folder.
+/// selected bar's play config, which a folder row has too, the mode
+/// filter's (`skin/property/IntegerPropertyFactory.java:1111-1112`,
+/// `:1216-1227`, `:1261-1315`; `select/MusicSelector.java:650-669` at
+/// `0.8.9`), through the production path: 78 is the failure handling, 341
+/// always 0 whatever the gauge, 342 Floating, 340 the preset's assignment
+/// (nothing without a preset) and 330 to 332 the switches, on a chart row
+/// and a folder row alike.
 #[test]
-fn the_chart_settings_indices_follow_the_selected_row() {
+fn the_settings_indices_follow_the_players_settings() {
     use skin_model::{GaugeLook, SelectionOrder, SpeedReference, SpeedView};
     let d = folder(&settings_skin());
     let mut s = Sel::new(import_selection(d.path()).unwrap().skin);
@@ -1129,40 +1131,36 @@ fn the_chart_settings_indices_follow_the_selected_row() {
         [true; 3],
     );
     // A hard gauge (2 if the look were clamped to 0-2), Floating and
-    // play-to-end: 78 continue (1), 341 assist easy (0), 342 on (1).
+    // play-to-end: 78 continue (1), 341 assist easy (0), 342 on (1); the
+    // same on a folder row.
     let shift = skin_model::SelectionSettings {
         play_to_end: true,
         assignment: Some(rules::tapestry().assignment),
         ..base
     };
-    assert_eq!(
-        at(&mut s, &chart_row, &shift),
-        [
-            Some(1),
-            Some(1),
-            Some(1),
-            Some(1),
-            Some(1),
-            Some(0),
-            Some(1)
-        ]
-    );
-    // Close: 78 none (0). Classic: 342 off (0).
+    let all_on = [
+        Some(1),
+        Some(1),
+        Some(1),
+        Some(1),
+        Some(1),
+        Some(0),
+        Some(1),
+    ];
+    assert_eq!(at(&mut s, &chart_row, &shift), all_on);
+    assert_eq!(at(&mut s, &folder_row, &shift), all_on);
+    // Close: 78 none (0). Classic: 342 off (0). On both rows.
     let close = skin_model::SelectionSettings {
         play_to_end: false,
         speed: SpeedView::Classic,
         ..shift
     };
-    let f = at(&mut s, &chart_row, &close);
-    assert_eq!((f[0], f[6]), (Some(0), Some(0)));
-    // On a folder row 330 to 332, 340 and 342 draw nothing; 78 and 341
-    // still draw.
-    assert_eq!(
-        at(&mut s, &folder_row, &shift),
-        [Some(1), None, None, None, None, Some(0), None]
-    );
+    for row in [&chart_row, &folder_row] {
+        let f = at(&mut s, row, &close);
+        assert_eq!((f[0], f[6]), (Some(0), Some(0)));
+    }
     // 340 by preset: combo (0) for the two source-style presets,
-    // duration (1) for tapestry's, nothing without one.
+    // duration (1) for tapestry's, nothing without one, on both rows.
     for (assignment, want) in [
         (Some(rules::lr2_style().assignment), Some(0)),
         (Some(rules::beatoraja_style().assignment), Some(0)),
@@ -1174,16 +1172,19 @@ fn the_chart_settings_indices_follow_the_selected_row() {
             ..shift
         };
         assert_eq!(at(&mut s, &chart_row, &a)[4], want, "{assignment:?}");
+        assert_eq!(at(&mut s, &folder_row, &a)[4], want, "{assignment:?}");
     }
-    // Each cover's switch alone, off then on, on a chart row.
+    // Each cover's switch alone, off then on.
     for (k, id) in [330, 331, 332].into_iter().enumerate() {
         let mut covers_on = [false; 3];
         let off = skin_model::SelectionSettings { covers_on, ..shift };
-        assert_eq!(at(&mut s, &chart_row, &off)[k + 1], Some(0), "{id}");
+        let f = at(&mut s, &chart_row, &off);
+        assert_eq!(f[1..4], [Some(0); 3], "{id}");
         covers_on[k] = true;
         let on = skin_model::SelectionSettings { covers_on, ..shift };
-        let f = at(&mut s, &chart_row, &on);
-        assert_eq!(f[k + 1], Some(1), "{id}");
-        assert_eq!(at(&mut s, &folder_row, &on)[k + 1], None, "{id}");
+        let mut want = [Some(0); 3];
+        want[k] = Some(1);
+        assert_eq!(at(&mut s, &chart_row, &on)[1..4], want, "{id}");
+        assert_eq!(at(&mut s, &folder_row, &on)[1..4], want, "{id}");
     }
 }
