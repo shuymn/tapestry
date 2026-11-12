@@ -356,7 +356,7 @@ pub(crate) const CLEAR_TYPE: &str = "if cursor.chart && selected.played then \
 
 /// The selection image index `id`: an image's or an image set's `ref`.
 pub(crate) fn image_index(id: i32) -> Option<Class<&'static str>> {
-    use Class::{Bridge, Omit, Unavailable};
+    use Class::{Bridge, Omit};
     Some(match id {
         370 => Bridge(CLEAR_TYPE),
         // The settings: the source's sorter index (none for the
@@ -365,9 +365,26 @@ pub(crate) fn image_index(id: i32) -> Option<Class<&'static str>> {
         12 => Bridge("settings.order"),
         40 => Bridge("settings.gauge"),
         55 => Bridge("settings.fix_hispeed"),
-        330 => Bridge("if settings.sudden then 1 else 0"),
-        331 => Bridge("if settings.lift then 1 else 0"),
-        332 => Bridge("if settings.hidden then 1 else 0"),
+        // The covers' switches, the hi-speed auto adjustment and the judge
+        // algorithm read the selected chart's play config in the source,
+        // which a folder or the "all charts" row has none of: nothing is
+        // drawn there (`skin/property/IntegerPropertyFactory.java:1216-1227`,
+        // `:1261-1315`; `select/MusicSelector.java:650-654`).
+        330 => Bridge("if cursor.chart then (if settings.sudden then 1 else 0) else -1"),
+        331 => Bridge("if cursor.chart then (if settings.lift then 1 else 0) else -1"),
+        332 => Bridge("if cursor.chart then (if settings.hidden then 1 else 0) else -1"),
+        // Floating re-solves the hi-speed at the tempo at the head, as the
+        // source's auto adjustment does; Classic has none.
+        342 => Bridge("if cursor.chart then (if settings.floating then 1 else 0) else -1"),
+        340 => Bridge("if cursor.chart then settings.judge_algorithm else -1"),
+        // The gauge auto shift as the failure handling: none (0) when a
+        // failed play closes, continue (1) when it plays to the end
+        // (`IntegerPropertyFactory.java:1111`; `play/BMSPlayer.java:654-668`).
+        78 => Bridge("settings.gauge_shift"),
+        // The bottom-shiftable gauge: its default, assist easy (0), which
+        // the source reads only under an automatic shift tapestry has not
+        // (`IntegerPropertyFactory.java:1112`; `PlayerConfig.java:175`).
+        341 => Bridge("0"),
         // Truthful constants, at the source's value for what tapestry has
         // or lacks: only 7-key charts are listed (`BEAT_7K`), no BGA is
         // drawn (`BGA_OFF`), no lane option, display-timing auto
@@ -377,9 +394,6 @@ pub(crate) fn image_index(id: i32) -> Option<Class<&'static str>> {
         // No image-index property on selection: the source's image draws
         // its entry 0.
         15 | 16 | 19 | 77 | 315..=318 => Bridge("0"),
-        // The gauge auto shift, the judge algorithm, the bottom-shiftable
-        // gauge and the hi-speed auto adjustment: no native equivalent.
-        78 | 340..=342 => Unavailable,
         // The target's clear type.
         371 => Omit,
         _ => return None,
@@ -543,11 +557,13 @@ mod tests {
         (72, 72, C::K(2)),
         (75, 75, C::K(0)),
         (77, 77, C::K(0)),
-        (78, 78, C::E),
+        (78, 78, C::N),
         (301, 308, C::K(0)),
         (315, 318, C::K(0)),
         (330, 332, C::N),
-        (340, 342, C::E),
+        (340, 340, C::N),
+        (341, 341, C::K(0)),
+        (342, 342, C::N),
         (370, 370, C::N),
         (371, 371, C::D),
     ];

@@ -13353,6 +13353,8 @@ pub(crate) mod tests {
             order: skin_model::SelectionOrder::Title,
             gauge: None,
             covers_on: [false; 3],
+            play_to_end: false,
+            assignment: None,
         };
         for (us, ms) in [
             (-15_600, -15),
