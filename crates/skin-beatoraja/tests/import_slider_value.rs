@@ -522,7 +522,7 @@ fn a_critical_read_promotes_the_whole_slider() {
     // With an unsupported blend it refuses, where a decorative one drops.
     let lua = skin(2, "return ms.number(71) / 100", "", "blend = 9,", false);
     assert!(matches!(load(&lua), Err(ImportError::Critical { .. })));
-    // An untimed settling track is held at its final pose (D20).
+    // An untimed settling track plays its keys (D3).
     let lua = skin(2, "return ms.number(71) / 100", "", "", false).replace(
         "dst = { { x = 100, y = 500, w = 64, h = 64 } }",
         "loop = 500, dst = { { time = 0, x = 100, y = 0, w = 64, h = 64 }, { time = 500, y = 500 } }",
@@ -530,11 +530,14 @@ fn a_critical_read_promotes_the_whole_slider() {
     let i = load(&lua).unwrap();
     assert!(common::has(
         &i.imported.report,
-        NoteKind::Deviation(DeviationId::D20)
+        NoteKind::Deviation(DeviationId::D3)
     ));
-    // Drawn at its final pose from the start, long before 500 ms.
+    // On its way at 100 ms, at its final pose from 500 ms.
     let mut p = Drawn::new(i.imported.skin.clone(), 0);
     let q = p.frame(100, &[]);
+    assert_eq!(q.len(), 1, "{q:?}");
+    assert!(!near(q[0].rect[1], TOP), "{q:?}");
+    let q = p.frame(500, &[]);
     assert_eq!(q.len(), 1, "{q:?}");
     assert!(near(q[0].rect[1], TOP), "{q:?}");
     // Not compiled, it refuses; so does an unresolvable callee.

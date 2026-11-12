@@ -24,7 +24,7 @@ use super::{
 use crate::error::{ImportError, Loc};
 use crate::import::ledger;
 pub use crate::import::ledger::{Became, DestinationEntry, DestinationNote};
-use crate::import::{Config, DeviationId, NoteKind};
+use crate::import::{Config, NoteKind};
 use crate::tree::{Arena, CallableKind};
 
 /// One import's outcome under allowlisted labels.
@@ -515,7 +515,6 @@ fn note(kind: &NoteKind) -> String {
         NoteKind::Ignored { field } => format!("Ignored {field}"),
         NoteKind::Callback { field, why } => format!("Callback {field} {}", unsupported(why)),
         NoteKind::OverCap { cap } => format!("OverCap {cap}"),
-        NoteKind::Deviation(DeviationId::D20) => "Deviation D20 entrance lost".to_owned(),
         other => variant(other),
     }
 }
@@ -1572,7 +1571,7 @@ return { type = 0 }",
     }
 
     #[test]
-    fn an_entrance_lost_has_its_label_and_a_looping_track_stops() {
+    fn a_settling_track_imports_and_a_looping_track_stops() {
         let entry = |gauge_loop: i32| {
             format!(
                 "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
@@ -1606,7 +1605,8 @@ return { type = 0 }",
         };
         let settled = run(&entry(250));
         assert_eq!(settled.outcome, "imported");
-        assert_eq!(settled.notes.get("Deviation D20 entrance lost"), Some(&2));
+        // Each destination's D10 and its D3, under one label.
+        assert_eq!(settled.notes.get("Deviation"), Some(&4));
         let looping = run(&entry(100));
         assert_eq!(looping.outcome, "critical Gauge: Timer");
     }

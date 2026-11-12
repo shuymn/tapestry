@@ -4351,7 +4351,7 @@ impl Run {
                 Ok(RenderMsg::Decision(page)) => {
                     // The decision screen is no play state's presentation:
                     // the turntable is not adopted or ticked (design.md
-                    // :732).
+                    // "State Model").
                     self.page_turns = false;
                     self.decision = Some(page.clone());
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);

@@ -152,7 +152,7 @@ impl Cx<'_> {
     /// The system image of `color` for `c`, sampled with `c`'s filter:
     /// charged and added once, a later request charging nothing. `None`
     /// once `c` is dropped, critical and untimed where it moves or
-    /// changes a colour channel other than alpha (D3).
+    /// changes a colour channel other than alpha, unless it settles (D3).
     fn add_system(&mut self, c: &Common, color: [u8; 4]) -> Result<Option<u32>, ImportError> {
         let at = c.span;
         if self.untimed_refused(c) {
