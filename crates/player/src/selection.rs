@@ -3037,15 +3037,11 @@ impl AppRig for PlayerRig<'_> {
         }
     }
 
-    /// The flow applies the step taken now: the strip shows the preset's
-    /// name from here ([`crate::selection_skin::PRESET_SHOWN`]).
+    /// The flow applies the step taken now; a step that changes the
+    /// chosen preset gives the next update its settings through
+    /// [`presets_changed`](game::AppRig::presets_changed).
     fn take_preset_step(&mut self) -> Option<game::PresetStep> {
-        let now = self.clock.now();
-        let sel = self.selection.as_mut()?;
-        let step = sel.preset_steps.pop_front()?;
-        sel.feed.preset_step = Some(now);
-        sel.dirty = true;
-        Some(step)
+        self.selection.as_mut()?.preset_steps.pop_front()
     }
 
     fn take_practice(&mut self) -> Option<PracticeInput> {
@@ -5838,12 +5834,6 @@ pub(crate) mod tests {
                 .all(|r| r.kind == skin_model::RowKind::Chart)
         );
         assert_eq!(u.events.changed, TimeUs(500));
-        // A preset step: the strip names the preset.
-        sel.screen.set_preset("ベータ".to_owned(), None);
-        sel.feed.preset_step = Some(TimeUs(550));
-        let u = at(&mut sel, 550);
-        assert_eq!(u.strip.preset, "ベータ");
-        assert_eq!(u.events.preset_step, Some(TimeUs(550)));
         // The next entry: another lifetime, its own starts.
         sel.feed.enter(TimeUs(600));
         let u = at(&mut sel, 600);
@@ -5852,7 +5842,6 @@ pub(crate) mod tests {
             (u.events.entered, u.events.changed),
             (TimeUs(600), TimeUs(600))
         );
-        assert_eq!(u.events.preset_step, None);
         // Without a skin the view is the cursor's row alone; the keys act
         // the same.
         sel.feed.window = None;
