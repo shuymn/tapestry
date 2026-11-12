@@ -366,14 +366,15 @@ impl DecisionSide {
         let Some((slot, generation, key)) = pinned else {
             return Rebuilt::Restored;
         };
-        let (Some(plan), Some(content)) = (&self.plan, self.store.content_of(slot, generation))
+        let (Some(plan), Some(strings)) =
+            (&self.plan, self.store.restore_strings(slot, generation))
         else {
             return Rebuilt::Refused(RenderError::LabelRegion { needed: 0, band: 0 });
         };
         let job = LabelJob {
             generation,
             key,
-            strings: content.strings().clone(),
+            strings: strings.clone(),
             plan: Arc::clone(plan),
         };
         let staged = match stage_bundle_labels(&self.bundle, job) {

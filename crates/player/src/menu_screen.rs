@@ -1078,7 +1078,12 @@ impl Screen for MenuScreen {
         slot: usize,
         staged: render::StagedLabels,
     ) -> Result<(), RenderError> {
-        self.renderer.restore_decision_labels(store, slot, staged)
+        // Not restoring at that generation: nothing was written, and the
+        // slot's content stays undrawable.
+        match self.renderer.restore_decision_labels(store, slot, staged)? {
+            true => Ok(()),
+            false => Err(RenderError::LabelRegion { needed: 0, band: 0 }),
+        }
     }
 
     fn watch_completion(&self) -> Arc<AtomicBool> {

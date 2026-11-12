@@ -1152,6 +1152,14 @@ pub struct Renderer {
     /// device fail there.
     #[cfg(test)]
     pub(crate) decision_after_submit: Option<fn(&Gpu)>,
+    /// Run by a decision label fill inside a boundary's scopes, after its
+    /// writes: a unit test makes a scope report an error.
+    #[cfg(test)]
+    pub(crate) decision_in_scope: Option<fn(&Gpu)>,
+    /// Unit tests: the pairs of error scopes the decision label fills
+    /// opened.
+    #[cfg(test)]
+    pub(crate) decision_scope_pairs: std::cell::Cell<usize>,
     /// Tests and development builds: the charges stated for bundles
     /// ([`state_charge`](Self::state_charge)).
     #[cfg(any(test, feature = "dev-tools"))]
@@ -1295,6 +1303,10 @@ impl Renderer {
             decision_settle_fault: false,
             #[cfg(test)]
             decision_after_submit: None,
+            #[cfg(test)]
+            decision_in_scope: None,
+            #[cfg(test)]
+            decision_scope_pairs: std::cell::Cell::new(0),
             #[cfg(any(test, feature = "dev-tools"))]
             stated: Vec::new(),
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
@@ -4150,6 +4162,10 @@ impl Renderer {
             region: slot.resources.labels,
             #[cfg(test)]
             after_submit: self.decision_after_submit,
+            #[cfg(test)]
+            in_scope: self.decision_in_scope,
+            #[cfg(test)]
+            scope_pairs: &self.decision_scope_pairs,
         })
     }
 
@@ -4189,10 +4205,14 @@ impl Renderer {
         }
     }
 
-    /// Rebuilds pinned slot `slot`'s content in `store` from `staged` (its
-    /// generation's strings staged again at the current target) on this
-    /// renderer, built again: every row written at once and waited for,
-    /// installed under the same generation; the slot stays pinned.
+    /// Restores pinned slot `slot`'s content in `store` from `staged` (its
+    /// generation's strings, [`LabelStore::restore_strings`], staged
+    /// again at the current target, [`stage_bundle_labels`](crate::stage_bundle_labels))
+    /// on this renderer, built again: every row written at once and waited
+    /// for, installed under the same generation and drawable again; the
+    /// slot stays pinned. Until then, after the store's and the book's
+    /// resets, the slot's content is not drawable. `Ok(false)`, nothing
+    /// written, when the slot is not restoring at `staged`'s generation.
     ///
     /// # Errors
     ///
@@ -4205,7 +4225,7 @@ impl Renderer {
         store: &mut LabelStore,
         slot: usize,
         staged: decision_labels::StagedLabels,
-    ) -> Result<(), RenderError> {
+    ) -> Result<bool, RenderError> {
         match self.label_target() {
             Some(t) => decision_labels::restore_pinned(&t, store, slot, staged),
             None => Err(RenderError::LabelRegion { needed: 0, band: 0 }),
