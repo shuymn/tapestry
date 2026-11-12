@@ -276,6 +276,13 @@ fn report(index: usize, survey: &Survey) -> String {
             skin_model::MAX_SKIN_OPS
         ));
     }
+    if let Some(e) = survey.play_ending {
+        line(&format!(
+            "  ending: finishmargin {} ms, fadeout {} ms",
+            e.finish_margin.0 / 1_000,
+            e.fadeout.0 / 1_000
+        ));
+    }
     for (segments, motion) in &survey.gauges {
         line(&format!("  gauge segments {segments} motion {motion}"));
     }
@@ -771,6 +778,36 @@ mod tests {
         for private in ["resolved", "destination", "fc", "bg", "b.png"] {
             assert!(!named.contains(private), "{private} in {named}");
         }
+    }
+
+    /// A play skin's report prints its declared ending as read: the
+    /// margin in ms, the fade-out with its sign.
+    #[test]
+    fn a_play_skins_report_prints_its_ending() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("s.luaskin"),
+            "local skin = { type = 0, name = \"t\", w = 1920, h = 1080 }\n\
+             if not skin_config then return skin end\n\
+             skin.finishmargin = 3000\n\
+             skin.fadeout = -250\n\
+             skin.destination = { { id = -110, dst = { { w = 64, h = 64 } } } }\n\
+             return skin\n",
+        )
+        .unwrap();
+        let s = survey_with(
+            d.path(),
+            "s.luaskin",
+            &ImportFacts::unavailable(ScreenKind::Play),
+            &Cancel::new(),
+            false,
+            &Choice::default(),
+        );
+        let out = report(0, &s);
+        assert!(
+            out.contains("\n  ending: finishmargin 3000 ms, fadeout -250 ms\n"),
+            "{out}"
+        );
     }
 
     #[test]
