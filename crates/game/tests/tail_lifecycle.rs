@@ -41,8 +41,8 @@ use game::{
     ViewStatus, ViewSummary, audio_control,
 };
 use input::{
-    Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceReader,
-    SourceSet,
+    Action, AutoplayInput, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput,
+    SourceReader, SourceSet,
 };
 use replay::{BuildProvenance, ReceiveMethod};
 
@@ -126,9 +126,15 @@ fn loaded_with(dir: &Path, chart: Chart, autoplay: Option<game::AutoKeySounds>) 
     settings.device.input_offset_us = OFFSET;
     let chart_path = dir.join("play.chart");
     std::fs::write(&chart_path, b"built in code").unwrap();
+    // An autoplay session saves nothing, as the player makes it.
+    let base = if autoplay.is_some() {
+        Parts::unsaved(&settings.player)
+    } else {
+        Parts::standard(&root, &settings.player)
+    };
     let parts = Parts {
         ingest: Box::new(Built(chart)),
-        ..Parts::standard(&root, &settings.player)
+        ..base
     };
     let config = SessionConfig {
         lead_in: TimeUs(1_000 * MS),
@@ -235,6 +241,12 @@ struct Tail {
     plays: usize,
     /// Each end screen shown: its play time, the report and the summary.
     shown: Vec<(i64, PlayReport, Option<ViewSummary>)>,
+    /// An autoplay session's input side, polled on the play's timeline in
+    /// place of the script, with the controls it records.
+    feeder: Option<(AutoplayInput, Vec<ControlId>)>,
+    /// The play time of the first wait after the seal at which the audio
+    /// thread reported the audio done.
+    audio_done_at: Option<i64>,
 }
 
 impl Tail {
@@ -259,12 +271,48 @@ impl Tail {
         let chart = chart();
         let engine =
             AudioEngine::new(bank(bgm_ms), &chart.bgm, RATE, PERIOD, MAX_VOICES, 64).unwrap();
+        Self::on(script, commands, quit_at, engine, common::sources())
+    }
+
+    /// An autoplay session of `loaded` with the BGM `bgm_ms` long: its
+    /// generated input fed on the play's timeline, its merged schedule (the
+    /// BGM and autoplay's key sounds) in the audio engine.
+    fn autoplay(loaded: &Loaded, bgm_ms: i64) -> Self {
+        let made = loaded.autoplay().unwrap();
+        let queue_capacity = made.queue_capacity();
+        let engine =
+            AudioEngine::with_schedule(bank(bgm_ms), made.schedule, RATE, PERIOD, MAX_VOICES, 64)
+                .unwrap();
+        let sources = input::SourceConfig {
+            queue_capacity,
+            ..common::sources()
+        };
+        let mut rig = Self::on(
+            ScriptedInput::new(Vec::new()),
+            &[],
+            i64::MAX,
+            engine,
+            sources,
+        );
+        rig.feeder = Some((AutoplayInput::new(made.events), made.recorded));
+        rig
+    }
+
+    /// A rig whose input comes from `script`, on `engine` and a source set
+    /// of `sources`.
+    fn on(
+        script: ScriptedInput,
+        commands: &[(i64, Command)],
+        quit_at: i64,
+        engine: AudioEngine,
+        sources: input::SourceConfig,
+    ) -> Self {
         let (control, mut worker) = audio_control(engine);
         let (tx, probes) = rtrb::RingBuffer::new(1_024);
         worker.set_probe(tx);
         Self {
             clock: VirtualClock::new(TimeUs(CLOCK_START)),
-            sources: SourceSet::new(common::sources()).unwrap(),
+            sources: SourceSet::new(sources).unwrap(),
             script,
             commands: commands.to_vec(),
             quit_at,
@@ -293,6 +341,8 @@ impl Tail {
             close: None,
             plays: 0,
             shown: Vec::new(),
+            feeder: None,
+            audio_done_at: None,
         }
     }
 
@@ -347,12 +397,18 @@ impl Rig for Tail {
             "the play did not end within a minute"
         );
         if let Some(now) = self.play_time() {
-            self.script.poll(TimeUs(now), &mut self.sources);
+            match &mut self.feeder {
+                Some((feeder, _)) => feeder.poll(TimeUs(now), &mut self.sources),
+                None => self.script.poll(TimeUs(now), &mut self.sources),
+            }
         }
         // A failed output takes no more steps here; the failure is
         // published to the control side.
         while !self.out.failed && self.out.inner.next_wake() <= self.clock.now() {
             self.out.failed = self.worker.step(&mut self.out).is_err();
+        }
+        if self.completed_at.is_some() && self.audio_done_at.is_none() && self.control.done() {
+            self.audio_done_at = self.play_time();
         }
         while let Ok(p) = self.probes.pop() {
             assert!(matches!(p.kind, game::Probed::KeyScheduled { .. }));
@@ -387,7 +443,10 @@ impl Rig for Tail {
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
         let origin = TimeUs(self.clock.now().0 + lead_in.0);
         let open_at = TimeUs(-lead_in.0);
-        self.script.poll(TimeUs(open_at.0 - 1), &mut self.sources);
+        match &mut self.feeder {
+            Some((feeder, recorded)) => feeder.restart(&mut self.sources, recorded.clone()),
+            None => self.script.poll(TimeUs(open_at.0 - 1), &mut self.sources),
+        }
         self.sources.gate_mut().reset();
         let start = self.sources.open_recording(open_at);
         self.origin = Some(origin);
@@ -999,6 +1058,60 @@ fn the_finish_anchor_is_the_last_note_or_the_last_object() {
     let dir = tempfile::tempdir().unwrap();
     let auto = loaded_with(dir.path(), late, Some(game::AutoKeySounds::Scheduled));
     assert_eq!(auto.finish_anchor(), TimeUs(3_100 * MS));
+}
+
+/// The chart with a second BGM event of sound 0 at `T + 2 s`, after the
+/// last note: with the BGM 500 ms long the audio ends at `T + 2.5 s`.
+fn late_bgm() -> Chart {
+    let mut late = chart();
+    late.bgm.push(bms_model::BgmEvent {
+        time: TimeUs(T + 2_000 * MS),
+        sound: SoundId(0),
+    });
+    late
+}
+
+/// An autoplay session of [`late_bgm`], the skin declaring `ending`, run
+/// with its real audio until its result shows.
+fn autoplayed(ending: PlayEnding) -> (Tail, PlayReport) {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded_with(dir.path(), late_bgm(), Some(game::AutoKeySounds::Scheduled));
+    let mut rig = Tail::autoplay(&loaded, 500);
+    rig.ending = ending;
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    let report = rig.reports[0].clone();
+    (rig, report)
+}
+
+/// Autoplay's audio ends with its late background sound, at `T + 2.5 s`;
+/// its hold runs 5 s from that sound's start, its last object, not from
+/// the last note, and with no declaration it shows its result there, with
+/// no fade-out and nothing saved.
+#[test]
+fn autoplay_finishes_after_its_last_background_sound() {
+    let (mut rig, report) = autoplayed(PlayEnding::NONE);
+    assert_eq!(report.end, PlayEnd::Completed);
+    // Every note judged by autoplay.
+    assert_eq!(report.tally.combo, 3);
+    let done = rig.audio_done_at.unwrap();
+    assert!((T + 2_450 * MS..T + 2_550 * MS).contains(&done), "{done}");
+    assert!(rig.seen.iter().all(|s| s.fading.is_none()));
+    assert_eq!(rig.side.as_mut().unwrap().view().fading, None);
+    // The played anchor would give `T + 5 s`.
+    assert_eq!(rig.shown_at(), Some(T + 7_000 * MS));
+    assert!(report.saved.is_none());
+}
+
+/// Autoplay's fade-out starts at its hold's end, 5 s after its last
+/// background sound, and its result follows after the skin's fadeout.
+#[test]
+fn autoplays_fade_out_follows_its_last_background_sound() {
+    let (rig, report) = autoplayed(declared(0, 1_000));
+    assert_eq!(report.end, PlayEnd::Completed);
+    assert!(rig.audio_done_at.unwrap() < T + 2_550 * MS);
+    assert_eq!(rig.fading(), Some(TimeUs(T + 7_000 * MS)));
+    assert_eq!(rig.shown_at(), Some(T + 8_000 * MS));
+    assert!(report.saved.is_none());
 }
 
 /// The audio thread reports the sealed audio ended at the step where the
