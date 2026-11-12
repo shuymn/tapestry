@@ -587,6 +587,40 @@ pub fn admit(
     Ok(())
 }
 
+/// The environment variable of a scenario's injected adapter fault
+/// (tests of recovery): `cpu<N>`, the N-th build of the screen, counted
+/// from 1, reported as a CPU adapter to its line and its admission.
+pub const ADAPTER_FAULTS_ENV: &str = "TAPESTRY_DEV_ADAPTER_FAULTS";
+
+/// The build reported as a CPU adapter ([`ADAPTER_FAULTS_ENV`]); 0 none,
+/// `u64::MAX` not read yet.
+static CPU_BUILD: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+/// The screen's builds so far.
+static BUILDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The adapter a build of the screen got, `info`, or the CPU adapter an
+/// injected fault reports for this build ([`ADAPTER_FAULTS_ENV`]).
+#[must_use]
+pub fn built_adapter(info: &render::AdapterInfo) -> std::borrow::Cow<'_, render::AdapterInfo> {
+    use std::sync::atomic::Ordering;
+    if CPU_BUILD.load(Ordering::SeqCst) == u64::MAX {
+        let list = std::env::var(ADAPTER_FAULTS_ENV).unwrap_or_default();
+        let n = list
+            .split(',')
+            .find_map(|f| f.trim().strip_prefix("cpu")?.parse().ok())
+            .unwrap_or(0);
+        CPU_BUILD.store(n, Ordering::SeqCst);
+    }
+    let build = BUILDS.fetch_add(1, Ordering::SeqCst) + 1;
+    if CPU_BUILD.load(Ordering::SeqCst) == build {
+        return std::borrow::Cow::Owned(render::AdapterInfo {
+            name: "injected CPU adapter".to_owned(),
+            ..render::AdapterInfo::new(render::DeviceType::Cpu, info.backend)
+        });
+    }
+    std::borrow::Cow::Borrowed(info)
+}
+
 /// The line each build of a scenario's screen prints: what it asked for
 /// and what it got.
 #[must_use]

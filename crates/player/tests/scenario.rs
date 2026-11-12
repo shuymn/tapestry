@@ -1239,6 +1239,50 @@ fn a_hardware_scenario_builds_on_the_hardware_adapter() {
     assert_eq!(side_value(&side_of(&fx, "a"), "adapter"), name);
 }
 
+/// Every build of the screen is admitted against the file's choice: a
+/// hardware run whose screen, built again after a device loss on the
+/// result, gets a CPU adapter (injected) is refused there, as at startup.
+#[test]
+fn a_rebuilt_screen_s_cpu_adapter_is_refused_on_a_hardware_choice() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let text = small(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ])
+    .replacen(
+        "size = [640, 360]\n",
+        "size = [640, 360]\nadapter = \"hardware\"\n",
+        1,
+    );
+    let (out, stdout, stderr) = fx.output(
+        fx.command(&text)
+            .env("TAPESTRY_DEV_RESULT_FAULTS", "lostresult1")
+            .env("TAPESTRY_DEV_ADAPTER_FAULTS", "cpu2"),
+    );
+    let lines = adapter_lines(&stdout);
+    assert!(!lines.is_empty(), "{stdout}\n{stderr}");
+    let refusal = "hardware was asked for, and the adapter is a CPU adapter";
+    // No hardware GPU (CI): refused at startup, before any loss.
+    if lines[0].contains(" (Cpu, ") {
+        assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+        assert!(stderr.contains(refusal), "{stderr}");
+        return;
+    }
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[1].starts_with("dev: adapter asked hardware, got injected CPU adapter (Cpu, "),
+        "{lines:?}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains(&format!("{refusal}: injected CPU adapter")),
+        "{stderr}"
+    );
+}
+
 /// Every build of the screen takes the file's choice: the one after a
 /// device loss on the result says so again.
 #[test]

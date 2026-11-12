@@ -1611,11 +1611,14 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
                 height: size.1,
             };
             let r = Renderer::new(target, adapter)?;
-            println!(
-                "{}",
-                dev::scenario::adapter_line(r.choice(), r.gpu().adapter())
-            );
-            dev::scenario::admit(r.choice(), r.gpu().adapter())?;
+            // What this build got, as a test's injected fault may report it,
+            // said on stdout and in the log, then admitted against what the
+            // file asked for.
+            let got = dev::scenario::built_adapter(r.gpu().adapter());
+            let line = dev::scenario::adapter_line(r.choice(), &got);
+            println!("{line}");
+            log::info!("{line}");
+            dev::scenario::admit(adapter, &got)?;
             let fonts = render::text::Fonts::runtime()?;
             Ok(Box::new(MenuScreen::new(r, Some(fonts))) as Box<dyn Screen>)
         }),
