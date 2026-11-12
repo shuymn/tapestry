@@ -366,6 +366,9 @@ impl DecisionSide {
         if !self.retiring
             && let (Some(want), Some(plan)) = (want, self.plan.clone())
         {
+            // Superseded: the job, its waiting output and its fill end
+            // here, before any post. With nothing posted, the store holds
+            // no staging (it was superseded, stopped or reset).
             if self
                 .posted
                 .as_ref()
@@ -388,9 +391,6 @@ impl DecisionSide {
                 };
                 let generation = self.next;
                 self.next = self.next.saturating_add(1);
-                // The store's staging released before the worker stages.
-                self.store.drop_waiting();
-                self.store.cancel(&mut || screen.watch_completion());
                 self.worker.post(LabelJob {
                     generation,
                     key: key.clone(),
@@ -433,15 +433,15 @@ impl DecisionSide {
         self.staged_at_post.push(self.store.memory(None).staged);
     }
 
-    /// The screen was built again: the worker quiesced (its job in flight
-    /// cancelled and ended), the waiting output and the fill dropped with
-    /// the old device's writes, the book reset (every slot free but the
-    /// active lifetime's pinned one), the rows asked again at the new
-    /// target, and that pinned slot's content rebuilt from its strings at
-    /// that target under its generation, on this thread, the worker idle
+    /// The screen was built again: the job in flight cancelled, the
+    /// waiting output and the fill dropped with the old device's writes,
+    /// the book reset (every slot free but the active lifetime's pinned
+    /// one), the rows asked again at the new target, and that pinned
+    /// slot's content rebuilt from its strings at that target under its
+    /// generation, on this thread once the worker's job ended
     /// ([`LabelWorker::restage`]).
     pub fn rebuilt(&mut self, screen: &mut dyn Screen) -> Rebuilt {
-        self.worker.quiesce();
+        self.worker.cancel();
         self.store.reset();
         self.posted = None;
         let book = Arc::clone(self.store.book());

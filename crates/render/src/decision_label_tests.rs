@@ -872,11 +872,11 @@ fn dropping_a_worker_inside_a_line_returns_at_once() {
     assert!(*joined.0, "the thread was joined");
 }
 
-/// A quiesce while the worker is inside a line waits until that job
-/// ended: from its return the worker holds no staging, so a rebuild's
-/// inline restaging never stages beside it.
+/// A restage while the worker is inside a line stages only once that job
+/// ended (its quiesce): from then on the worker holds no staging, so a
+/// rebuild's inline restaging never stages beside it.
 #[test]
-fn quiesce_waits_for_the_job_in_progress() {
+fn restage_waits_for_the_job_in_progress() {
     let dir = truetype_skin();
     let (r, b) = installed(&dir);
     let (entered_tx, entered_rx) = mpsc::channel();
@@ -890,10 +890,12 @@ fn quiesce_waits_for_the_job_in_progress() {
     worker.post(job(&r, 1, "a", "AB"));
     entered_rx.recv_timeout(watchdog()).unwrap();
     let done = AtomicBool::new(false);
+    let again = job(&r, 2, "b", "BA");
     std::thread::scope(|s| {
         let q = s.spawn(|| {
-            worker.quiesce();
+            let staged = worker.restage(&b, again);
             done.store(true, Ordering::Release);
+            staged.unwrap().unwrap().generation()
         });
         let bound = std::time::Instant::now() + watchdog();
         while !worker.quiescing() && !done.load(Ordering::Acquire) {
@@ -902,8 +904,8 @@ fn quiesce_waits_for_the_job_in_progress() {
         }
         let early = done.load(Ordering::Acquire);
         let _ = release_tx.send(());
-        q.join().unwrap();
-        assert!(!early, "the quiesce returned while the job was in progress");
+        assert_eq!(q.join().unwrap(), 2);
+        assert!(!early, "the restage staged while the job was in progress");
     });
     assert_eq!(worker.bytes().0, 0);
     assert_eq!(worker.output_generation(), None);
