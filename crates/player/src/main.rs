@@ -46,6 +46,7 @@ mod measure;
 mod menu_screen;
 mod page_jobs;
 mod play;
+mod pointer;
 mod power;
 mod practice_page;
 #[cfg(feature = "dev-tools")]
@@ -930,6 +931,7 @@ fn rig<'a>(
         load_start: TimeUs(0),
         pending_retry: None,
         window: None,
+        cursor: None,
         retry_from: None,
         state_clock: state_clock::StateClock::default(),
         result_retries: play::ResultRetries::default(),
@@ -1032,10 +1034,11 @@ fn open_window_and_input(
     wake: impl FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     keys: (Option<u32>, Option<u32>),
     monitor: Option<String>,
-    menu: Option<Arc<MenuQueue>>,
+    menu: Option<(Arc<MenuQueue>, Arc<pointer::PointerShared>)>,
 ) -> anyhow::Result<(window::WindowThread, window::Surface, InputThread)> {
+    let (menu, pointer) = menu.map_or_else(|| (None, Arc::default()), |(m, p)| (Some(m), p));
     let (window_thread, surface) =
-        window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu)?;
+        window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu, pointer)?;
     let input = InputThread::spawn(clock, sources, capture, waker, wake);
     let input = match input {
         Ok(i) => i,
@@ -1070,10 +1073,11 @@ fn open_window_and_clocked(
     wake: impl FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     keys: (Option<u32>, Option<u32>),
     monitor: Option<String>,
-    menu: Option<Arc<MenuQueue>>,
+    menu: Option<(Arc<MenuQueue>, Arc<pointer::PointerShared>)>,
 ) -> anyhow::Result<(window::WindowThread, window::Surface, ClockedThread)> {
+    let (menu, pointer) = menu.map_or_else(|| (None, Arc::default()), |(m, p)| (Some(m), p));
     let (window_thread, surface) =
-        window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu)?;
+        window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu, pointer)?;
     match ClockedThread::spawn(clock, sources, waker, wake) {
         Ok(input) => Ok((window_thread, surface, input)),
         Err(e) => {
@@ -1172,7 +1176,7 @@ fn play(
             wake,
             keys,
             monitor,
-            Some(Arc::clone(&menu)),
+            Some((Arc::clone(&menu), Arc::default())),
         )
         .map(|(w, s, t)| (w, s, Some(t), None))
     } else {
@@ -1184,7 +1188,7 @@ fn play(
             wake,
             keys,
             monitor,
-            Some(Arc::clone(&menu)),
+            Some((Arc::clone(&menu), Arc::default())),
         )
         .map(|(w, s, t)| (w, s, None, Some(t)))
     };
@@ -1258,6 +1262,7 @@ fn play(
         rig.recorded.keyboard = keyboard;
     }
     rig.window = Some(window_thread.shown());
+    rig.cursor = Some(window_thread.cursor());
     rig.restorer = restorer(&loaded, &rig);
     rig.gain = gain;
     rig.result_input = menus;
@@ -1515,6 +1520,9 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         axis_mode(&mut sources, &settings.device);
     }
     let (menu, menus) = menu_input(&settings.device, autoplay, &mut sources, controls.tuning());
+    // The pointer's state, which the window, the select screen and the
+    // render thread share.
+    let pointer = Arc::new(pointer::PointerShared::default());
     controls.set_latch(sources.gate().handle());
     controls.set_waker(waker.clone());
     let mode = if autoplay {
@@ -1543,7 +1551,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
                     wake,
                     keys,
                     monitor,
-                    Some(Arc::clone(&menu)),
+                    Some((Arc::clone(&menu), Arc::clone(&pointer))),
                 )
                 .map(|(w, s, t)| (Some(w), Some(s), None, Some(t)))
             } else {
@@ -1556,7 +1564,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
                     wake,
                     keys,
                     monitor,
-                    Some(Arc::clone(&menu)),
+                    Some((Arc::clone(&menu), Arc::clone(&pointer))),
                 )
                 .map(|(w, s, t)| (Some(w), Some(s), Some(t), None))
             }
@@ -1651,6 +1659,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     };
     let mut rig = rig(&root, &settings, autoplay, threads, &controls, clock)?;
     rig.window = window_thread.as_ref().map(window::WindowThread::shown);
+    rig.cursor = window_thread.as_ref().map(window::WindowThread::cursor);
+    rig.render.pointer(Arc::clone(&pointer));
     rig.queue_most = opened.most_queued_periods;
     rig.result_input = menus;
     #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
@@ -1665,6 +1675,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         screen,
         menu,
         dropped: 0,
+        pointer: crate::pointer::PointerPass::new(Arc::clone(&pointer)),
+        dropped_pointer: 0,
         preset_refusal: false,
         search_pending: false,
         preset_steps: std::collections::VecDeque::new(),

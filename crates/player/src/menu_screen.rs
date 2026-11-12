@@ -582,7 +582,7 @@ impl MenuScreen {
             layout: &skin_model::Layout::AUTHOR,
             timers: u.events.timers(),
             app,
-            pointer: None,
+            pointer: logic.pointer,
         };
         // The frame's preparation ends here (dev-tools: the S7-07d
         // gate's whole frames).
@@ -1213,6 +1213,7 @@ impl Screen for MenuScreen {
             return Ok(SelectionDrawn {
                 timing,
                 refused: None,
+                skinned: false,
             });
         };
         let refused = match self.prepare_selection(u, logic, changed)? {
@@ -1245,7 +1246,11 @@ impl Screen for MenuScreen {
             self.send(self.page_caret);
             let timing = self.menu_frame(&u.page, false)?;
             self.shown(timing.presented);
-            return Ok(SelectionDrawn { timing, refused });
+            return Ok(SelectionDrawn {
+                timing,
+                refused,
+                skinned: false,
+            });
         }
         let drawn = self.strip.as_ref().filter(|_| self.strip_lines > 0);
         #[cfg(all(test, feature = "dev-tools"))]
@@ -1260,6 +1265,7 @@ impl Screen for MenuScreen {
         Ok(SelectionDrawn {
             timing,
             refused: None,
+            skinned: true,
         })
     }
 

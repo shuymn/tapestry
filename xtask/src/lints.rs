@@ -481,6 +481,10 @@ pub const IN_PLAY: &[Site] = &[
     // The application clock: each frame's readouts and every present.
     Site::File("crates/player/src/app_clock.rs"),
     Site::File("crates/player/src/turntable.rs"),
+    // The pointer on the select screen: the hover's point, the batch's
+    // answers and the drag the render thread writes each selection frame,
+    // and the window's capture and the game thread's dispatch beside them.
+    Site::File("crates/player/src/pointer.rs"),
     // The play and loading frames' calls through the screen the render
     // thread keeps; its menu preparation runs on menus only, and the
     // loading lines' before the loading frame is built.

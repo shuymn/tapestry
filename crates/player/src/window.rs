@@ -33,7 +33,7 @@ use game::{Adjust, Command};
 use input::WindowKeyEvent;
 use winit::application::ApplicationHandler;
 use winit::dpi::{PhysicalPosition, PhysicalSize};
-use winit::event::{ElementState, Ime, StartCause, WindowEvent};
+use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, DeviceEvents, EventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::monitor::MonitorHandle;
@@ -47,6 +47,7 @@ use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::controls::Controls;
 use crate::menu_screen::WindowSink;
+use crate::pointer::{Capture, PointerShared};
 use crate::render_side::Extent;
 use crate::select::{MenuInput, MenuKey, MenuQueue};
 use crate::tuning::KeyEvent;
@@ -60,6 +61,8 @@ enum Ask {
     /// The caret moved: its area is in [`Shared::caret`] (from the render
     /// thread).
     Caret,
+    /// Show the cursor, or hide it (a play runs).
+    Cursor(bool),
 }
 
 /// What the window thread shares with the threads that draw into the
@@ -195,6 +198,18 @@ impl ImeWindow for Window {
     }
 }
 
+/// What the cursor's switch needs of the window: [`Window`], or a fake in
+/// tests.
+trait CursorWindow {
+    fn show_cursor(&self, shown: bool);
+}
+
+impl CursorWindow for Window {
+    fn show_cursor(&self, shown: bool) {
+        self.set_cursor_visible(shown);
+    }
+}
+
 /// The IME's state on the window thread: whether it is allowed and where
 /// the caret is. The caret's area is reported to the IME whenever it is
 /// allowed, the caret moves or the window's size changes, so its
@@ -271,6 +286,10 @@ struct App {
     /// Set once the window is made.
     showing: Option<Showing>,
     shared: Arc<Shared>,
+    /// The pointer's state shared with the game and render threads.
+    pointer: Arc<PointerShared>,
+    /// The mouse's held button, position and wheel fraction.
+    capture: Capture,
 }
 
 impl ApplicationHandler<Ask> for App {
@@ -293,7 +312,6 @@ impl ApplicationHandler<Ask> for App {
             .with_fullscreen(Some(Fullscreen::Borderless(monitor)));
         match event_loop.create_window(attrs) {
             Ok(w) => {
-                w.set_cursor_visible(false);
                 self.controls.focus(w.has_focus());
                 let surface = surface(&w);
                 let _ = ready.send(surface);
@@ -313,6 +331,9 @@ impl ApplicationHandler<Ask> for App {
         match event {
             WindowEvent::Focused(focused) => {
                 self.controls.focus(focused);
+                if !focused {
+                    self.capture.focus_lost(&self.pointer);
+                }
                 #[cfg(feature = "dev-tools")]
                 if !focused {
                     crate::dev::print_foreground(self.controls.now());
@@ -355,6 +376,49 @@ impl ApplicationHandler<Ask> for App {
                 }
             }
             WindowEvent::CloseRequested => self.controls.close(),
+            WindowEvent::CursorMoved { position, .. } => {
+                // Client pixels: far inside i32.
+                #[expect(
+                    clippy::cast_possible_truncation,
+                    reason = "a window position, saturated at i32's ends"
+                )]
+                let at = [position.x.floor() as i32, position.y.floor() as i32];
+                let word = self.pointer.word();
+                self.capture
+                    .moved(&self.pointer, at, word, self.controls.scene());
+            }
+            WindowEvent::CursorLeft { .. } => {
+                let word = self.pointer.word();
+                self.capture
+                    .left(&self.pointer, word, self.controls.scene());
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if let (Some(menu), Some(button)) = (&self.menu, pointer_button(button)) {
+                    let word = self.pointer.word();
+                    let controls = &self.controls;
+                    self.capture.button(
+                        &self.pointer,
+                        button,
+                        state == ElementState::Pressed,
+                        word,
+                        controls.scene(),
+                        |input| send_pointer(menu, controls, input),
+                    );
+                }
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                if let Some(menu) = &self.menu {
+                    let word = self.pointer.word();
+                    let controls = &self.controls;
+                    self.capture.wheel(
+                        &self.pointer,
+                        wheel_lines(delta),
+                        word,
+                        controls.scene(),
+                        |input| send_pointer(menu, controls, input),
+                    );
+                }
+            }
             _ => {}
         }
     }
@@ -376,7 +440,8 @@ impl ApplicationHandler<Ask> for App {
                     .unwrap_or_else(PoisonError::into_inner);
                 self.ime.caret(w, caret);
             }
-            (Ask::Ime(_) | Ask::Caret, None) => {}
+            (Ask::Cursor(shown), Some(w)) => show_cursor(w, shown),
+            (Ask::Ime(_) | Ask::Caret | Ask::Cursor(_), None) => {}
             (Ask::Exit, _) => {
                 // The window goes before the loop ends, on its own thread.
                 self.window = None;
@@ -419,6 +484,47 @@ impl ImeSwitch {
     }
 }
 
+/// Shows or hides the window's cursor from the game thread.
+#[derive(Clone)]
+pub struct CursorSwitch(CursorSink);
+
+#[derive(Clone)]
+enum CursorSink {
+    Window(EventLoopProxy<Ask>),
+    /// What the game thread asked, in order (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    Seen(Arc<Mutex<Vec<bool>>>),
+}
+
+impl CursorSwitch {
+    /// Shows the cursor, or hides it while a play runs; a window already
+    /// closed ignores it.
+    pub fn set(&self, shown: bool) {
+        match &self.0 {
+            CursorSink::Window(proxy) => {
+                let _ = proxy.send_event(Ask::Cursor(shown));
+            }
+            #[cfg(all(test, feature = "dev-tools"))]
+            CursorSink::Seen(seen) => seen
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(shown),
+        }
+    }
+
+    /// A switch that records what it is asked, and the record (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn recording() -> (Self, Arc<Mutex<Vec<bool>>>) {
+        let seen = Arc::default();
+        (Self(CursorSink::Seen(Arc::clone(&seen))), seen)
+    }
+}
+
+/// Shows or hides `window`'s cursor, as the game thread asked.
+fn show_cursor(window: &impl CursorWindow, shown: bool) {
+    window.show_cursor(shown);
+}
+
 impl WindowThread {
     /// Closes the window and waits for its thread. Call it after every user
     /// of the window (the render thread) is done.
@@ -439,6 +545,11 @@ impl WindowThread {
     /// The switch of the window's IME.
     pub fn ime(&self) -> ImeSwitch {
         ImeSwitch(self.proxy.clone())
+    }
+
+    /// The switch of the window's cursor.
+    pub fn cursor(&self) -> CursorSwitch {
+        CursorSwitch(CursorSink::Window(self.proxy.clone()))
     }
 
     /// Where the render thread tells the window what it drew.
@@ -551,7 +662,8 @@ fn monitor_index(names: &[Option<String>], wanted: &str) -> Option<usize> {
 
 /// Opens the window on its own thread. `retry` and `quit` are the keyboard
 /// scan codes bound to them; `monitor` names the monitor to open on; with
-/// `menu`, the select screen's input goes there.
+/// `menu`, the select screen's input goes there, the pointer's while
+/// `pointer`'s word is active.
 ///
 /// # Errors
 ///
@@ -562,6 +674,7 @@ pub fn open(
     quit: Option<u32>,
     monitor: Option<String>,
     menu: Option<Arc<MenuQueue>>,
+    pointer: Arc<PointerShared>,
 ) -> anyhow::Result<(WindowThread, Surface)> {
     let (ready_tx, ready_rx) = mpsc::channel();
     let (proxy_tx, proxy_rx) = mpsc::channel();
@@ -593,6 +706,8 @@ pub fn open(
                 composition: ImeSession::default(),
                 showing: None,
                 shared: thread_shared,
+                pointer,
+                capture: Capture::default(),
             };
             if let Err(e) = event_loop.run_app(&mut app) {
                 eprintln!("the event loop failed: {e}");
@@ -857,6 +972,46 @@ fn send_menu(
     controls.wake_game();
 }
 
+/// Hands the pointer's `input` to the select screen, stamped with the
+/// ingress word as keys are, and wakes the game thread when it was
+/// admitted; the presses admitted so far, or none when it was refused.
+fn send_pointer(menu: &MenuQueue, controls: &Controls, input: MenuInput) -> Option<u64> {
+    let observed = crate::select::Observed {
+        stamp: controls.ingress(),
+        at: controls.now(),
+    };
+    let admitted = menu.push_stamped(input, Some(observed));
+    if admitted.is_some() {
+        controls.wake_game();
+    }
+    admitted
+}
+
+/// The pointer's button for a mouse button; none for another.
+const fn pointer_button(button: MouseButton) -> Option<skin_model::Button> {
+    Some(match button {
+        MouseButton::Left => skin_model::Button::Left,
+        MouseButton::Right => skin_model::Button::Right,
+        MouseButton::Middle => skin_model::Button::Middle,
+        MouseButton::Back => skin_model::Button::Back,
+        MouseButton::Forward => skin_model::Button::Forward,
+        MouseButton::Other(_) => return None,
+    })
+}
+
+/// A wheel's turn in lines, away from the user positive: a pixel delta
+/// counts a line each 120 pixels, a wheel notch's delta on Windows.
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "a wheel's turn is far inside f32"
+)]
+fn wheel_lines(delta: MouseScrollDelta) -> f32 {
+    match delta {
+        MouseScrollDelta::LineDelta(_, y) => y,
+        MouseScrollDelta::PixelDelta(p) => (p.y / 120.0) as f32,
+    }
+}
+
 /// An IME composition and the ingress word it began under (design.md
 /// "Play Lifecycle", the decision screen): its preedits and its commit
 /// carry that stamp, so a composition open at the choice, or begun in the
@@ -969,6 +1124,37 @@ mod tests {
                 at.x, at.y, size.width, size.height
             ));
         }
+    }
+
+    impl super::CursorWindow for FakeWindow {
+        fn show_cursor(&self, shown: bool) {
+            self.asked.borrow_mut().push(format!("cursor {shown}"));
+        }
+    }
+
+    /// P10: the window shows or hides its cursor as asked, and the game
+    /// thread asks for it shown on entering selection and the practice
+    /// page (a play hides it at its opening and shows it again at its
+    /// result and at its end).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_cursor_shows_on_the_menus() {
+        let w = FakeWindow::new(1_920, 1_080);
+        super::show_cursor(&w, false);
+        super::show_cursor(&w, true);
+        assert_eq!(w.take(), ["cursor false", "cursor true"]);
+        let (switch, seen) = super::CursorSwitch::recording();
+        let ((), _) = crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            use game::AppRig as _;
+            rig.cursor = Some(switch);
+            rig.adjust = None;
+            rig.show_cursor(false);
+            rig.entered_selection();
+            rig.show_cursor(false);
+            let c = bms_model::ChartBuilder::new(120_000).build().unwrap();
+            rig.entered_practice(&game::PracticeScreen::new(&c, &rules::tapestry(), 0));
+        });
+        assert_eq!(*seen.lock().unwrap(), [false, true, false, true]);
     }
 
     /// The hidden window as showing sees it.

@@ -89,6 +89,24 @@ pub enum MenuInput {
         /// The panel open as its packet came.
         panel: Option<usize>,
     },
+    /// A press of `button` at `at` (window pixels), observed under the
+    /// pointer `word` ([`crate::pointer::PointerShared::word`]).
+    Pointer {
+        button: skin_model::Button,
+        at: [i32; 2],
+        word: u64,
+    },
+    /// Wheel notches, a row down each toward the user, observed under the
+    /// pointer `word`.
+    Wheel { notches: i32, word: u64 },
+}
+
+impl MenuInput {
+    /// Whether it is the pointer's: a press or wheel notches.
+    #[must_use]
+    pub const fn is_pointer(&self) -> bool {
+        matches!(self, Self::Pointer { .. } | Self::Wheel { .. })
+    }
 }
 
 /// What a controller's bound lane control does on the select screen
@@ -227,26 +245,78 @@ pub const fn result_event(event: MenuEvent) -> game::MenuCommand {
 
 /// Keys the queue holds at most; a key past them is dropped and counted.
 pub const QUEUED_KEYS: usize = 64;
+/// Pointer entries (presses and runs of notches) the queue holds at most,
+/// counted apart from the keys; one past them is refused at the window.
+pub const QUEUED_POINTER: usize = 64;
+/// Queue entries one pass of the game thread takes at most (design.md
+/// "Input", **Pointer input**): what is pushed beyond them waits for the
+/// next pass, which the push's wake schedules.
+pub const MENU_PASS: usize = 128;
 
 /// What the window hands the select screen, until the game thread takes it
 /// at its next look. Nothing that carries state is ever dropped: committed
 /// text joins the text before it, and an IME composition replaces the one
 /// before it, so its last state, the end of a composition included, always
-/// arrives. Only keys are bounded ([`QUEUED_KEYS`]); a key past the bound
-/// is dropped and counted.
+/// arrives. Keys are bounded ([`QUEUED_KEYS`]), and the pointer's entries
+/// apart from them ([`QUEUED_POINTER`]); one past its bound is refused and
+/// counted. A wheel notch joins a run of notches queued just before it.
+/// The storage for both bounds is reserved once, when the queue is made,
+/// and kept.
 ///
 /// What the window publishes carries the ingress word it was observed
 /// under (design.md "Play Lifecycle", the decision screen), and is
 /// validated where it is taken: under the tuning step lock, an input
 /// stamped with another generation, or under a closed word, is dropped
-/// there. Text and compositions join only those with the same stamp.
-#[derive(Debug, Default)]
+/// there. Text, compositions and notches join only those with the same
+/// stamp.
+#[derive(Debug)]
 pub struct MenuQueue {
-    inputs: Mutex<VecDeque<(MenuInput, Option<Observed>)>>,
+    inputs: Mutex<Queued>,
     dropped: AtomicU64,
     /// The tuning whose ingress word validates stamped inputs; none: every
     /// input is taken.
     gate: Option<Arc<crate::tuning::LiveTuning>>,
+}
+
+impl Default for MenuQueue {
+    fn default() -> Self {
+        Self {
+            inputs: Mutex::new(Queued {
+                entries: VecDeque::with_capacity(QUEUED_KEYS + QUEUED_POINTER),
+                pointers: 0,
+                presses_in: 0,
+                presses_out: 0,
+            }),
+            dropped: AtomicU64::new(0),
+            gate: None,
+        }
+    }
+}
+
+/// The queue's entries and its count of the pointer's.
+#[derive(Debug)]
+struct Queued {
+    entries: VecDeque<(MenuInput, Option<Observed>)>,
+    /// Pointer entries queued.
+    pointers: usize,
+    /// Presses admitted so far.
+    presses_in: u64,
+    /// Presses taken out so far, however (dispatched, stale or cleared).
+    presses_out: u64,
+}
+
+impl Queued {
+    /// Takes the front entry out, counting a pointer one.
+    fn pop_front(&mut self) -> Option<(MenuInput, Option<Observed>)> {
+        let entry = self.entries.pop_front()?;
+        if entry.0.is_pointer() {
+            self.pointers = self.pointers.saturating_sub(1);
+        }
+        if matches!(entry.0, MenuInput::Pointer { .. }) {
+            self.presses_out = self.presses_out.wrapping_add(1);
+        }
+        Some(entry)
+    }
 }
 
 /// How the window observed an input: the ingress word then, and when, on
@@ -276,62 +346,121 @@ impl MenuQueue {
     }
 
     /// Queues `input` as it was `observed` (none: the game thread's own).
-    /// Text and a composition join only one observed under the same word.
-    pub fn push_stamped(&self, input: MenuInput, observed: Option<Observed>) {
+    /// Text, a composition and a wheel notch join only one observed under
+    /// the same word. The presses admitted so far, this one included, or
+    /// none when the input was refused: a key past [`QUEUED_KEYS`], or a
+    /// press or a notch past [`QUEUED_POINTER`] (counted by the caller).
+    pub fn push_stamped(&self, input: MenuInput, observed: Option<Observed>) -> Option<u64> {
         let stamp = observed.map(|o| o.stamp);
         let mut q = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
         let last = q
+            .entries
             .back_mut()
             .filter(|(_, o)| o.map(|o| o.stamp) == stamp)
             .map(|(i, _)| i);
         match (input, last) {
             (MenuInput::Text(text), Some(MenuInput::Text(last))) => last.push_str(&text),
             (MenuInput::Preedit(text), Some(MenuInput::Preedit(last))) => *last = text,
+            (
+                MenuInput::Wheel { notches, word },
+                Some(MenuInput::Wheel {
+                    notches: last,
+                    word: last_word,
+                }),
+            ) if word == *last_word => *last = last.saturating_add(notches),
             (key @ (MenuInput::Key(_) | MenuInput::Pad { .. }), _) => {
                 let keys = q
+                    .entries
                     .iter()
                     .filter(|(i, _)| matches!(i, MenuInput::Key(_) | MenuInput::Pad { .. }))
                     .count();
-                if keys < QUEUED_KEYS {
-                    q.push_back((key, observed));
-                } else {
+                if keys >= QUEUED_KEYS {
                     self.dropped.fetch_add(1, Ordering::Relaxed);
+                    return None;
                 }
+                q.entries.push_back((key, observed));
             }
-            (input, _) => q.push_back((input, observed)),
+            (pointer @ (MenuInput::Pointer { .. } | MenuInput::Wheel { .. }), _) => {
+                if q.pointers >= QUEUED_POINTER {
+                    return None;
+                }
+                q.pointers += 1;
+                if matches!(pointer, MenuInput::Pointer { .. }) {
+                    q.presses_in = q.presses_in.wrapping_add(1);
+                }
+                q.entries.push_back((pointer, observed));
+            }
+            (input, _) => q.entries.push_back((input, observed)),
         }
+        Some(q.presses_in)
     }
 
     /// Takes the oldest input whose stamp is valid now, dropping the
     /// stale ones before it.
     pub fn pop(&self) -> Option<MenuInput> {
         loop {
-            let (input, observed) = self
-                .inputs
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .pop_front()?;
-            let valid = match (observed, &self.gate) {
-                (Some(o), Some(gate)) => gate.with_ingress(|word| word.admits(o.stamp)),
-                _ => true,
-            };
-            if valid {
+            if let Some((input, _)) = self.pop_observed()? {
                 return Some(input);
             }
         }
     }
 
+    /// Takes the oldest entry: none when the queue is empty, `Some(None)`
+    /// when its stamp is not valid now (it is dropped), else the input and
+    /// how it was observed. One entry a call, so a pass counts them.
+    pub fn pop_observed(&self) -> Option<Option<(MenuInput, Option<Observed>)>> {
+        let (input, observed) = self
+            .inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop_front()?;
+        let valid = match (observed, &self.gate) {
+            (Some(o), Some(gate)) => gate.with_ingress(|word| word.admits(o.stamp)),
+            _ => true,
+        };
+        Some(valid.then_some((input, observed)))
+    }
+
+    /// Whether the oldest entry is the pointer's.
+    pub fn front_is_pointer(&self) -> bool {
+        self.inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .front()
+            .is_some_and(|(i, _)| i.is_pointer())
+    }
+
+    /// Presses taken out of the queue so far, however.
+    pub fn presses_taken(&self) -> u64 {
+        self.inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .presses_out
+    }
+
     /// Takes every input queued, and whether one was an Escape observed at
     /// or after `deadline`: what the decision screen reads past its time
     /// (design.md "Play Lifecycle", the practice page). One the window did
-    /// not observe is never an escape.
+    /// not observe is never an escape. The storage stays.
     pub fn take_escape(&self, deadline: bms_model::TimeUs) -> bool {
-        let taken =
-            std::mem::take(&mut *self.inputs.lock().unwrap_or_else(PoisonError::into_inner));
-        taken.into_iter().any(|(i, observed)| {
-            matches!(i, MenuInput::Key(MenuKey::Escape))
-                && observed.is_some_and(|o| o.at.0 >= deadline.0)
-        })
+        let mut q = self.inputs.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut escape = false;
+        while let Some((i, observed)) = q.pop_front() {
+            escape |= matches!(i, MenuInput::Key(MenuKey::Escape))
+                && observed.is_some_and(|o| o.at.0 >= deadline.0);
+        }
+        escape
+    }
+
+    /// The entries the queue's storage holds without growing (tests).
+    #[cfg(test)]
+    pub fn capacity(&self) -> usize {
+        self.inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .capacity()
     }
 
     /// Keys dropped so far.
@@ -787,12 +916,56 @@ impl SelectScreen {
         usize::try_from(below).unwrap_or(usize::MAX) + self.entries.len()
     }
 
-    /// The selectable row under the cursor (dev-tools scripts): charts and the
-    /// rows before them count together, as [`chart_row`](Self::chart_row) and
-    /// [`folder_row`](Self::folder_row) do.
-    #[cfg(feature = "dev-tools")]
+    /// The selectable row under the cursor: the all-chart row, the folders
+    /// and the charts count together, in that order.
     pub const fn cursor(&self) -> usize {
         self.cursor
+    }
+
+    /// The selectable rows listed.
+    pub fn selectable(&self) -> usize {
+        self.lead() + self.entries.len()
+    }
+
+    /// The kind of the selectable row at `index`; none past the list.
+    pub fn row_kind_at(&self, index: usize) -> Option<skin_model::RowRefKind> {
+        let all = usize::from(self.all_row.is_some());
+        if index < all {
+            Some(skin_model::RowRefKind::All)
+        } else if index < self.lead() {
+            Some(skin_model::RowRefKind::Folder)
+        } else {
+            (index < self.selectable()).then_some(skin_model::RowRefKind::Chart)
+        }
+    }
+
+    /// Moves the cursor to the selectable row at `index`, as a key's move
+    /// does; whether it moved.
+    pub fn move_to(&mut self, index: usize) -> bool {
+        if index >= self.selectable() || index == self.cursor {
+            return false;
+        }
+        self.cursor = index;
+        self.scroll(CURSOR_LINE);
+        true
+    }
+
+    /// Whether the IME composes in the search box: its keys, and the
+    /// pointer, do nothing meanwhile.
+    pub fn composing(&self) -> bool {
+        !self.preedit.is_empty()
+    }
+
+    /// The selectable index of a listed row; none for a heading.
+    fn selectable_index(&self, row: Row) -> Option<u32> {
+        let all = usize::from(self.all_row.is_some());
+        let index = match row {
+            Row::All => 0,
+            Row::Folder(i) => all + i,
+            Row::Chart(i) => self.lead() + i,
+            Row::Heading(_) => return None,
+        };
+        u32::try_from(index).ok()
     }
 
     /// The selectable row of chart `i` of [`entries`](Self::entries)
@@ -1012,8 +1185,12 @@ impl SelectScreen {
                 self.searching = false;
                 Acted::Focus(false)
             }
-            // A controller's event came as its key ([`Self::input`]).
-            MenuInput::Key(_) | MenuInput::Pad { .. } => Acted::Nothing,
+            // A controller's event came as its key ([`Self::input`]); the
+            // pointer acts through the game thread's dispatch, never here.
+            MenuInput::Key(_)
+            | MenuInput::Pad { .. }
+            | MenuInput::Pointer { .. }
+            | MenuInput::Wheel { .. } => Acted::Nothing,
         }
     }
 
@@ -1140,7 +1317,12 @@ impl SelectScreen {
         let rows = lines()
             .skip(start)
             .take(end - start)
-            .map(|row| self.row_view(row))
+            .map(|row| RowView {
+                // A skin's rows are its selectable ones; the built-in
+                // page's lines name none.
+                index: self.selectable_index(row).filter(|_| !headings),
+                ..self.row_view(row)
+            })
             .collect();
         let selectable = self.lead() + self.entries.len();
         let position = (selectable > 1)
@@ -1374,7 +1556,9 @@ mod tests {
 
     use library::{ChartEntry, Header, Sort};
 
-    use super::{Acted, MenuInput, MenuKey, MenuQueue, QUEUED_KEYS, SelectScreen};
+    use super::{
+        Acted, MenuInput, MenuKey, MenuQueue, Observed, QUEUED_KEYS, QUEUED_POINTER, SelectScreen,
+    };
     use crate::menu_screen::LineStyle;
 
     fn entry(path: &str, title: &str) -> ChartEntry {
@@ -1691,6 +1875,116 @@ mod tests {
                 MenuInput::Text("日本".to_owned())
             ]
         );
+    }
+
+    fn press(button: skin_model::Button, word: u64) -> MenuInput {
+        MenuInput::Pointer {
+            button,
+            at: [1, 2],
+            word,
+        }
+    }
+
+    /// The pointer's entries are bounded apart from the keys: a full key
+    /// bound admits presses, and the 65th pointer entry is refused while
+    /// keys still go in. Admission returns the presses admitted so far.
+    #[test]
+    fn the_pointer_is_admitted_apart_from_the_keys() {
+        let q = MenuQueue::default();
+        for _ in 0..QUEUED_KEYS {
+            assert!(q.push_stamped(key(MenuKey::Down), None).is_some());
+        }
+        assert_eq!(q.push_stamped(key(MenuKey::Down), None), None);
+        assert_eq!(q.dropped(), 1);
+        for n in 1..=QUEUED_POINTER as u64 {
+            assert_eq!(
+                q.push_stamped(press(skin_model::Button::Left, 3), None),
+                Some(n)
+            );
+        }
+        assert_eq!(
+            q.push_stamped(press(skin_model::Button::Left, 3), None),
+            None
+        );
+        let notch = MenuInput::Wheel {
+            notches: 1,
+            word: 3,
+        };
+        assert_eq!(q.push_stamped(notch.clone(), None), None);
+        // A refused pointer entry is not a dropped key.
+        assert_eq!(q.dropped(), 1);
+        // The keys taken out free no pointer room; a press taken out does.
+        for _ in 0..QUEUED_KEYS {
+            assert_eq!(q.pop(), Some(key(MenuKey::Down)));
+        }
+        assert_eq!(q.push_stamped(notch.clone(), None), None);
+        assert_eq!(q.pop(), Some(press(skin_model::Button::Left, 3)));
+        assert_eq!(q.presses_taken(), 1);
+        assert!(q.push_stamped(notch, None).is_some());
+    }
+
+    /// A notch joins the notch queued just before it under the same word
+    /// and stamp, saturating; anything between, or another word, starts a
+    /// new entry. Order among keys and presses is kept.
+    #[test]
+    fn notches_join_and_the_order_stays() {
+        let q = MenuQueue::default();
+        let wheel = |notches, word| MenuInput::Wheel { notches, word };
+        q.push(wheel(2, 3));
+        q.push(wheel(-1, 3));
+        q.push(wheel(i32::MAX, 3));
+        q.push(wheel(1, 5));
+        q.push(key(MenuKey::Down));
+        q.push(wheel(1, 5));
+        q.push(press(skin_model::Button::Right, 5));
+        q.push(wheel(1, 5));
+        let stamp = Observed {
+            stamp: input::Ingress::INITIAL,
+            at: bms_model::TimeUs(0),
+        };
+        // Another stamp: not joined.
+        assert!(q.push_stamped(wheel(1, 5), Some(stamp)).is_some());
+        let all: Vec<MenuInput> = std::iter::from_fn(|| q.pop()).collect();
+        assert_eq!(
+            all,
+            [
+                wheel(i32::MAX, 3),
+                wheel(1, 5),
+                key(MenuKey::Down),
+                wheel(1, 5),
+                press(skin_model::Button::Right, 5),
+                wheel(1, 5),
+                wheel(1, 5),
+            ]
+        );
+        assert_eq!(q.presses_taken(), 1);
+    }
+
+    /// The storage is reserved once for both bounds and kept: filling both
+    /// grows nothing, and the decision screen's take keeps it.
+    #[test]
+    fn the_queue_keeps_its_reserved_storage() {
+        let q = MenuQueue::default();
+        let reserved = q.capacity();
+        assert!(reserved >= QUEUED_KEYS + QUEUED_POINTER);
+        for _ in 0..QUEUED_POINTER {
+            q.push(press(skin_model::Button::Left, 3));
+            q.push(key(MenuKey::Escape));
+        }
+        assert_eq!(q.capacity(), reserved);
+        assert!(!q.take_escape(bms_model::TimeUs(0)));
+        assert_eq!(q.capacity(), reserved);
+        assert_eq!(q.pop(), None);
+        // Every press taken out is counted, however.
+        assert_eq!(q.presses_taken(), QUEUED_POINTER as u64);
+        // Emptied, it admits a full bound again.
+        for _ in 0..QUEUED_POINTER {
+            assert!(
+                q.push_stamped(press(skin_model::Button::Left, 3), None)
+                    .is_some()
+            );
+        }
+        assert!(q.front_is_pointer());
     }
 
     /// The list is grouped under folder headings, the cursor's chart is
@@ -2271,6 +2565,33 @@ mod tests {
                 Some(2)
             )
         );
+    }
+
+    /// A skin's view names each row by its selectable index, the built-in
+    /// page's by none; the pointer reads the row kinds, moves the cursor
+    /// as a key does and sees the IME composing.
+    #[test]
+    fn rows_carry_their_selectable_index_for_the_pointer() {
+        use skin_model::RowRefKind;
+        let mut s = screen();
+        s.input(key(MenuKey::Down));
+        let v = s.view(10, 10, false);
+        let index: Vec<Option<u32>> = v.rows.iter().map(|r| r.index).collect();
+        assert_eq!(index, [Some(0), Some(1), Some(2)]);
+        assert!(s.view(10, 10, true).rows.iter().all(|r| r.index.is_none()));
+        assert_eq!(s.selectable(), 3);
+        assert_eq!(s.row_kind_at(2), Some(RowRefKind::Chart));
+        assert_eq!(s.row_kind_at(3), None);
+        assert!(s.move_to(2));
+        assert_eq!(s.cursor(), 2);
+        assert!(!s.move_to(2));
+        assert!(!s.move_to(3));
+        assert!(!s.composing());
+        s.input(key(MenuKey::Tab));
+        s.input(MenuInput::Preedit("か".to_owned()));
+        assert!(s.composing());
+        // A pointer entry reaching the screen does nothing, focused or not.
+        assert_eq!(s.input(press(skin_model::Button::Left, 3)), Acted::Nothing);
     }
 
     /// A chart row carries its level as a skin draws it, as the source's

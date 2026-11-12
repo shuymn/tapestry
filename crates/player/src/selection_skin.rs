@@ -295,6 +295,9 @@ pub struct SelectionLogic {
     /// notice for as long as this state lasts, a screen built again
     /// after a device loss included (design.md "beatoraja Lua Skins").
     pub(crate) script_stop: Option<crate::screens::ScriptStop>,
+    /// The pointer's point in target pixels for the next frame's hover;
+    /// none outside the window. The render thread sets it each frame.
+    pub pointer: Option<[f32; 2]>,
 }
 
 impl SelectionLogic {
@@ -307,6 +310,7 @@ impl SelectionLogic {
             id,
             script: ScriptSlot::default(),
             script_stop: None,
+            pointer: None,
         }
     }
 
@@ -425,7 +429,8 @@ impl SkinFeed {
         let (before, after) = self.window.map_or((0, 0), |(center, slots)| {
             (center, slots.saturating_sub(1).saturating_sub(center))
         });
-        let view = screen.view(before, after, false);
+        let mut view = screen.view(before, after, false);
+        view.list_revision = self.list_revision;
         let row = view
             .cursor
             .and_then(|c| view.rows.get(c))
@@ -465,6 +470,9 @@ impl SkinFeed {
 pub struct SelectionDrawn {
     pub timing: render::FrameTiming,
     pub refused: Option<String>,
+    /// Whether the frame drew the skin, not the built-in page: what the
+    /// pointer is hit-tested on.
+    pub skinned: bool,
 }
 
 /// A self-made JSON selection skin (tests): a song list of seven
