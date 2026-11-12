@@ -25,6 +25,7 @@ use crate::result_skin::tests as result;
 use crate::result_skin::{ResultSkin, ResultStart};
 
 mod adapter;
+mod images;
 mod settle;
 
 /// How long a test waits for what must come; `TAPESTRY_TEST_WATCHDOG`
@@ -150,6 +151,7 @@ fn stage(rig: &PlayerRig<'_>) -> &'static str {
         Some(PrepStage::Skin(_)) => "skin",
         Some(PrepStage::Image(..)) => "image",
         Some(PrepStage::Screen(_)) => "screen",
+        Some(PrepStage::Images(..)) => "images",
         Some(PrepStage::Ended(_)) => "ended",
         Some(PrepStage::Answered(_)) => "answered",
     }
