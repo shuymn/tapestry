@@ -181,8 +181,10 @@ fn the_screen_origin_survives_pause_clear_and_play() {
 #[cfg(feature = "dev-tools")]
 #[test]
 fn a_play_frame_s_measured_screen_clock_is_the_built_one() {
-    /// Each play frame's chart time and measured screen clock.
-    struct Measured(Arc<std::sync::Mutex<Vec<(TimeUs, Option<i64>)>>>);
+    /// A play frame's chart time and measured screen clock.
+    type Seen = (TimeUs, Option<i64>);
+    /// Each play frame's.
+    struct Measured(Arc<std::sync::Mutex<Vec<Seen>>>);
     impl super::super::FrameSink for Measured {
         fn frame(&mut self, _: &dyn super::super::Screen, drawn: &crate::measure::Drawn<'_>) {
             if let Some(now) = drawn.play {
