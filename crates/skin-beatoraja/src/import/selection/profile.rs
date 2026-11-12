@@ -65,6 +65,9 @@ pub(crate) enum SelValue {
     /// Floating's travel duration and its green number.
     Duration,
     Green,
+    /// The application's readouts, 20 to 29 as `id − 20`, play's fields
+    /// of the same names.
+    App(u8),
 }
 
 impl SelValue {
@@ -89,6 +92,7 @@ impl SelValue {
             Self::Volume => "settings.volume",
             Self::Duration => "settings.duration",
             Self::Green => "settings.green",
+            Self::App(n) => super::super::property::app_field(n),
         }
     }
 
@@ -105,7 +109,7 @@ impl SelValue {
             Self::Level => "cursor.chart",
             Self::RatePercent | Self::RateHundredths | Self::NextRank => "selected.rate_valid",
             Self::Charts => "cursor.folder || cursor.all",
-            Self::ExDifference | Self::DisplayOffset | Self::Volume => "true",
+            Self::ExDifference | Self::DisplayOffset | Self::Volume | Self::App(_) => "true",
             // A duration needs the chart's tempo in Classic.
             Self::Duration | Self::Green => "settings.floating",
         }
@@ -144,11 +148,15 @@ pub(crate) fn number(id: i32) -> Option<Class<SelValue>> {
         57 => Bridge(SelValue::Volume),
         312 => Bridge(SelValue::Duration),
         313 => Bridge(SelValue::Green),
-        // The clock, session and global statistics; the volumes without
-        // their own channel; what the bests do not keep; rivals and IR;
-        // per-lane-class note counts the summary does not split; density
-        // metrics.
-        17..=31
+        // The application's readouts: the presents per second, the local
+        // date and time and the uptime (`IntegerPropertyFactory.java:98-107`).
+        20..=29 => Bridge(SelValue::App(u8::try_from(id - 20).ok()?)),
+        // Session and global statistics; the volumes without their own
+        // channel; what the bests do not keep; rivals and IR; per-lane-class
+        // note counts the summary does not split; density metrics.
+        17..=19
+        | 30
+        | 31
         | 58
         | 59
         | 75
@@ -474,7 +482,9 @@ mod tests {
         (171, 172, C::N),
         (174, 174, C::D),
         (177, 177, C::N),
-        (17, 31, C::D),
+        (17, 19, C::D),
+        (20, 29, C::N),
+        (30, 31, C::D),
         (57, 57, C::N),
         (58, 59, C::D),
         (71, 72, C::N),

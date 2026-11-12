@@ -327,7 +327,17 @@ fn a_stop_is_reported_once_per_screen() {
     let mut stops = Vec::new();
     for frame in 0..8 {
         let at = bms_model::TimeUs(frame * 16_000);
-        stops.push(super::super::selection_visit(&mut visit, skin, &mut sel, at, &timers).unwrap());
+        stops.push(
+            super::super::selection_visit(
+                &mut visit,
+                skin,
+                &mut sel,
+                at,
+                &timers,
+                &skin_model::AppReadouts::LAUNCH,
+            )
+            .unwrap(),
+        );
     }
     let reported: Vec<_> = stops.iter().flatten().collect();
     assert_eq!(reported, [&super::ScriptStop::Budget], "{stops:?}");
@@ -335,11 +345,27 @@ fn a_stop_is_reported_once_per_screen() {
     let mut again = scripts.slot(ScreenKind::Selection, 1);
     let at = bms_model::TimeUs(200_000);
     assert_eq!(
-        super::super::selection_visit(&mut again, skin, &mut sel, at, &timers).unwrap(),
+        super::super::selection_visit(
+            &mut again,
+            skin,
+            &mut sel,
+            at,
+            &timers,
+            &skin_model::AppReadouts::LAUNCH
+        )
+        .unwrap(),
         Some(super::ScriptStop::Budget)
     );
     assert_eq!(
-        super::super::selection_visit(&mut again, skin, &mut sel, at, &timers).unwrap(),
+        super::super::selection_visit(
+            &mut again,
+            skin,
+            &mut sel,
+            at,
+            &timers,
+            &skin_model::AppReadouts::LAUNCH
+        )
+        .unwrap(),
         None
     );
 }
@@ -584,6 +610,7 @@ fn visits(
                 &mut sel,
                 bms_model::TimeUs(f * 16_000),
                 &timers,
+                &skin_model::AppReadouts::LAUNCH,
             )
             .unwrap()
         })
@@ -632,7 +659,15 @@ fn the_off_switch_takes_no_runtime() {
     for f in 0..3 {
         let at = bms_model::TimeUs(f * 16_000);
         assert_eq!(
-            super::super::selection_visit(&mut visit, skin, &mut sel, at, &timers).unwrap(),
+            super::super::selection_visit(
+                &mut visit,
+                skin,
+                &mut sel,
+                at,
+                &timers,
+                &skin_model::AppReadouts::LAUNCH
+            )
+            .unwrap(),
             None
         );
         assert!(sel.outputs_mut().iter().all(|&v| v == 0));

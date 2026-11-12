@@ -294,3 +294,95 @@ fn lua_reads_take_the_selection_text_and_index_bridges() {
     s.view(&view(vec![chart("u")], Some(0), None, None));
     assert!(s.drawn(0).iter().all(|(_, r)| r[0] != 700.0));
 }
+
+/// Readouts at 3 725 999 ms of uptime (1 h, 2 min, 5 s), 59 presents and
+/// 2026-10-12 21:47:58.
+const APP: skin_model::AppReadouts = skin_model::AppReadouts {
+    fps: 59,
+    uptime_us: 3_725_999_000,
+    local: skin_model::LocalTime {
+        year: 2_026,
+        month: 10,
+        day: 12,
+        hour: 21,
+        minute: 47,
+        second: 58,
+    },
+};
+
+/// Numbers 20 to 29 on selection read the frame's application readouts
+/// by `ref` and by name (docs/stage3.md S10-09e;
+/// `skin/property/IntegerPropertyFactory.java:98-107`), with no note.
+#[test]
+fn json_numbers_20_to_29_read_the_application_readouts() {
+    for (prop, want) in [
+        (r#""ref": 27"#, "1"),
+        (r#""value": "boottime_minute""#, "2"),
+        (r#""ref": 29"#, "5"),
+        (r#""ref": 21"#, "2026"),
+        (r#""value": "current_fps""#, "59"),
+        (r#""ref": 26"#, "58"),
+    ] {
+        let body = format!(
+            r#""imageset": [{SET}], "text": [{TEXT_T}],
+               "value": [{{"id": "v", {DIGITS}, "digit": 4, {prop}}}],
+               "songlist": {{"id": "list", "center": 0,
+                   "liston": [{{"id": "set", "dst": [{{"x": 0, "y": 900, "w": 300, "h": 40}}]}}],
+                   "listoff": [{{"id": "set", "dst": [{{"x": 0, "y": 900, "w": 300, "h": 40}}]}}],
+                   "text": [{{"id": "t", "dst": [{{"x": 0, "y": 0, "w": 100, "h": 10}}]}}]}},
+               "destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}},
+                   {{"id": "v", "dst": [{{"x": 0, "y": 100, "w": 4, "h": 8}}]}}]"#
+        );
+        let d = common::selection::folder(&body);
+        let imported = common::selection::import_selection(d.path()).unwrap();
+        assert!(
+            imported.report.notes.is_empty(),
+            "{prop}: {:?}",
+            imported.report.notes
+        );
+        let mut s = Sel::new(imported.skin);
+        s.view(&view(vec![chart("a")], Some(0), None, None));
+        s.app = APP;
+        assert_eq!(s.digits(0), want, "{prop}");
+    }
+}
+
+/// A Lua selection callback's `number(27)` lowers and reads the frame's
+/// uptime hours: drawn at 1 h, not at 2 h; number 30 stays omitted, noted
+/// as its JSON `ref` is.
+#[test]
+fn a_lua_number_27_lowers_to_the_uptime_hours() {
+    let more = "table.insert(skin.destination, { id = \"b1\",\n\
+                  draw = function() return ms.number(27) == 1 end,\n\
+                  dst = { { x = 700, y = 0, w = 8, h = 8 } } })\n\
+                table.insert(skin.destination, { id = \"b1\",\n\
+                  draw = function() return ms.number(30) == 0 end,\n\
+                  dst = { { x = 800, y = 0, w = 8, h = 8 } } })";
+    let l = common::selection::folder("");
+    let i = import_lua_in(&l, &lua_skin("", more)).unwrap();
+    assert_eq!(
+        i.callbacks
+            .iter()
+            .filter(|d| **d == Disposition::Lowered)
+            .count(),
+        1,
+        "{:?}",
+        i.callbacks
+    );
+    let omitted = NoteKind::UnsupportedProperty {
+        kind: PropertyKind::Integer,
+        id: Some(30),
+    };
+    assert!(
+        i.imported.report.notes.iter().any(|n| n.kind == omitted),
+        "{:?}",
+        i.imported.report.notes
+    );
+    let mut s = Sel::new(i.imported.skin);
+    s.view(&view(vec![chart("a")], Some(0), None, None));
+    let drawn = |s: &mut Sel| s.drawn(0).iter().any(|(_, r)| r[0] == 700.0);
+    s.app = APP;
+    assert!(drawn(&mut s));
+    s.app.uptime_us = 7_200_000_000;
+    assert!(!drawn(&mut s));
+}

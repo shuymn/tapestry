@@ -14,6 +14,36 @@ use crate::render_side::Screen;
 use crate::select::SelectScreen;
 use crate::selection_skin::{SelectionLogic, SelectionUpdate, SkinFeed};
 
+/// The application's readouts a frame is given: 59 presents at
+/// 2026-10-12 21:47:58, 1 h 2 min 5 s after launch.
+const APP: skin_model::AppReadouts = skin_model::AppReadouts {
+    fps: 59,
+    uptime_us: 3_725_999_000,
+    local: skin_model::LocalTime {
+        year: 2_026,
+        month: 10,
+        day: 12,
+        hour: 21,
+        minute: 47,
+        second: 58,
+    },
+};
+
+/// The readouts of frame `k`: each part moving with it.
+fn app(k: i64) -> skin_model::AppReadouts {
+    let k = u8::try_from(k.rem_euclid(60)).unwrap();
+    skin_model::AppReadouts {
+        fps: u16::from(k) * 17,
+        uptime_us: APP.uptime_us + i64::from(k) * 16_667,
+        local: skin_model::LocalTime {
+            month: 1 + k % 12,
+            minute: k,
+            second: 59 - k,
+            ..APP.local
+        },
+    }
+}
+
 /// A WARP screen with the fixture selection skin committed, its skin
 /// state, and what it sent the window.
 fn skinned() -> (tempfile::TempDir, MenuScreen, SelectionLogic, Sent) {
@@ -48,7 +78,7 @@ fn drawn(
     now: i64,
 ) -> usize {
     let d = screen
-        .selection(u, Some(logic), changed, TimeUs(now))
+        .selection(u, Some(logic), changed, TimeUs(now), APP)
         .unwrap();
     assert_eq!(d.refused, None);
     screen.renderer.selection_quads().unwrap().len()
@@ -111,7 +141,7 @@ fn a_refused_frame_sends_the_pages_caret() {
         assert_ne!(line, 0);
         screen.renderer.refuse_next_selection(text);
         let d = screen
-            .selection(&u, Some(&mut logic), text, TimeUs(0))
+            .selection(&u, Some(&mut logic), text, TimeUs(0), APP)
             .unwrap();
         assert!(d.refused.is_some(), "{text}");
         let page = sent.0.lock().unwrap().last().copied().flatten().unwrap();
@@ -160,7 +190,7 @@ fn a_selection_frame_draws_the_skins_staging_and_the_strips_text() {
     feed.preset_step = Some(TimeUs(t));
     let named = update(&mut feed, &s, t);
     let d = screen
-        .selection(&named, Some(&mut logic), true, TimeUs(t))
+        .selection(&named, Some(&mut logic), true, TimeUs(t), APP)
         .unwrap();
     let quads = screen.renderer.selection_quads().unwrap().len();
     assert!(quads > 0);
@@ -169,7 +199,7 @@ fn a_selection_frame_draws_the_skins_staging_and_the_strips_text() {
     s.set_preset(String::new(), None);
     let unnamed = update(&mut feed, &s, t);
     screen
-        .selection(&unnamed, Some(&mut logic), true, TimeUs(t))
+        .selection(&unnamed, Some(&mut logic), true, TimeUs(t), APP)
         .unwrap();
     let without = screen.read_back().unwrap();
     assert_eq!(screen.renderer.selection_quads().unwrap().len(), quads);
@@ -310,8 +340,9 @@ fn the_memory_witness_counts_the_selection_lines_and_state() {
     assert_eq!(screen.renderer.memory().selection_text, 0);
 }
 
-/// A selection frame's app work (the timers, the skin's build and the
-/// strip's sprites) allocates nothing: the first build after the update's
+/// A selection frame's app work (the readouts and timers, the skin's
+/// build and the strip's sprites) allocates nothing, the readouts moving
+/// every frame: the first build after the update's
 /// preparation, each later one, the first after a resize prepared outside
 /// the count, and refused, with the fallback page's own build; each is
 /// counted apart from the GPU submission that follows it. An allocation
@@ -355,7 +386,7 @@ fn selection_frame_alloc() {
         let n = counted(&mut || {
             logic.apply_settings(u.settings.as_ref(), Some(&tuning));
             screen
-                .build_selection_frame(&u, logic, TimeUs(k * 16_667))
+                .build_selection_frame(&u, logic, TimeUs(k * 16_667), app(k))
                 .unwrap();
         });
         screen.renderer.submit_selection(&[]).unwrap();
@@ -378,7 +409,7 @@ fn selection_frame_alloc() {
     // Refused: the skin's build, then the page's own.
     screen.renderer.refuse_next_selection(false);
     let mut refused = Ok(());
-    let n = counted(&mut || refused = screen.build_selection_frame(&u, &mut logic, TimeUs(0)));
+    let n = counted(&mut || refused = screen.build_selection_frame(&u, &mut logic, TimeUs(0), APP));
     assert!(refused.is_err());
     assert_eq!(n, 0, "refused");
     let mut start = None;
@@ -531,10 +562,13 @@ fn selection_runtime_frame_alloc() {
             &mut logic.sel,
             now,
             &u.events.timers(),
+            &APP,
         )
         .unwrap();
         let before = crate::alloc_count::this_thread();
-        screen.build_selection_frame(&u, &mut logic, now).unwrap();
+        screen
+            .build_selection_frame(&u, &mut logic, now, APP)
+            .unwrap();
         assert_eq!(crate::alloc_count::this_thread() - before, 0, "frame {k}");
         screen.renderer.submit_selection(&[]).unwrap();
     }
@@ -575,7 +609,9 @@ fn the_build_mark_precedes_the_selection_build() {
         let now = TimeUs(k * 16_667);
         let _ = crate::dev::take_build_mark();
         let _ = render::take_build_start();
-        screen.build_selection_frame(&u, &mut logic, now).unwrap();
+        screen
+            .build_selection_frame(&u, &mut logic, now, APP)
+            .unwrap();
         screen.renderer.submit_selection(&[]).unwrap();
         let mark = crate::dev::take_build_mark().expect("the build marked");
         let start = render::take_build_start().expect("the build began");
