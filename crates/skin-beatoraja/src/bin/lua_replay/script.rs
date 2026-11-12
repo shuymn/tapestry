@@ -46,7 +46,8 @@ pub enum Phase {
 /// How a round's frames end.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum End {
-    /// Through the last note and the audio tail.
+    /// Through the last note and the audio tail: a practice round's
+    /// ring-out, or a full play's hold and fade-out.
     Tail,
     /// The last frame at this chart time.
     Quit(i64),
@@ -62,7 +63,8 @@ pub enum End {
 /// inputs and how it ends.
 #[derive(Clone, Debug)]
 pub struct Round {
-    /// A section attempt (a practice round), else the whole chart.
+    /// A section attempt (a practice round), else the whole chart (a full
+    /// play, whose tail holds and fades out as the play skin declares).
     pub section: bool,
     /// Per note, the offset of its press from the note (µs), `None` for
     /// no press.
@@ -90,6 +92,8 @@ pub struct Step<'e, 'a> {
     pub rearmed: bool,
     /// Where Closing began, on the play clock.
     pub closing: Option<TimeUs>,
+    /// Where a full play's fade-out began, on the play clock.
+    pub fading: Option<TimeUs>,
 }
 
 /// The chart's initial tempo, in thousandths of a BPM.
@@ -97,8 +101,8 @@ const BPM: i64 = 150_000;
 /// The first note's time and the gap between notes.
 const FIRST: i64 = 1_000_000;
 const GAP: i64 = 400_000;
-/// Frames start this far before chart time 0 (READY) and run this long
-/// past the last note (the audio tail).
+/// Frames start this far before chart time 0 (READY) and, in a practice
+/// round, run this long past the last note (the ring-out).
 pub const LEAD: i64 = 1_000_000;
 const TAIL: i64 = 2_000_000;
 /// Closing's length on the play clock.
@@ -314,9 +318,20 @@ impl Round {
         out
     }
 
-    /// The chart time the round's frames run to.
-    fn last_time(&self, last_note: i64) -> i64 {
-        last_note + TAIL
+    /// The chart time the round's frames run to, and where its fade-out
+    /// starts: a practice round runs [`TAIL`] past the last note with no
+    /// fade-out, whatever the skin declares; a full play, anchored at its
+    /// last note, runs to its hold's end ([`game::hold_until`]) and then,
+    /// when it has one, through its fade-out ([`game::fade_deadline`]).
+    fn last_time(&self, last_note: i64, ending: game::PlayEnding) -> (i64, Option<TimeUs>) {
+        if self.section {
+            return (last_note + TAIL, None);
+        }
+        let held = game::hold_until(TimeUs(last_note), ending);
+        match game::fade_deadline(held, ending.fadeout) {
+            Some(end) => (end.0, Some(held)),
+            None => (held.0, None),
+        }
     }
 
     /// The frame times of one segment: every step from READY through
@@ -346,7 +361,7 @@ impl Round {
         chart: &Chart,
         preset: &rules::RulePreset,
         section: Option<&Section>,
-        (last, shown): (i64, usize),
+        (last, shown, ending): (i64, usize, game::PlayEnding),
         judged: &dyn Fn(&Tally),
         mut frame: impl FnMut(&Step<'_, '_>) -> Result<(), String>,
     ) -> Result<(Tally, i64), String> {
@@ -356,7 +371,7 @@ impl Round {
             held: Vec::new(),
         };
         let inputs = self.inputs();
-        let end = self.last_time(last);
+        let (end, fade) = self.last_time(last, ending);
         let new_ev = || {
             Evaluator::new(chart, preset, &device, &start, section, inputs.len() + 1)
                 .map_err(|e| format!("evaluator: {e:?}"))
@@ -374,6 +389,7 @@ impl Round {
                     ev: &ev,
                     rearmed: false,
                     closing: None,
+                    fading: None,
                 })?;
             }
             base = r + LEAD + STEP;
@@ -390,6 +406,12 @@ impl Round {
         // A quit is an instant of its own: its frame is built and the
         // round settles with the tally there, a judgment due at it included.
         let mut times = self.times(cut);
+        // The fade-out's first frame is the wake that ended the hold.
+        if let Some(f) = fade.filter(|f| f.0 <= cut) {
+            times.push(f.0);
+            times.sort_unstable();
+            times.dedup();
+        }
         if matches!(self.end, End::Quit(_) | End::QuitClosing(_)) && times.last() != Some(&cut) {
             times.push(cut);
         }
@@ -409,6 +431,7 @@ impl Round {
                 ev: &ev,
                 rearmed,
                 closing: None,
+                fading: fade.filter(|f| now >= f.0),
             })?;
             if self.end == End::Fail
                 && let Some(f) = ev.gauges().get(shown).and_then(|g| g.failed_at)
@@ -435,6 +458,7 @@ impl Round {
                     ev: &ev,
                     rearmed,
                     closing,
+                    fading: None,
                 })?;
             }
         }

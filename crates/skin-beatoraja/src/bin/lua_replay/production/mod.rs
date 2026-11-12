@@ -154,6 +154,8 @@ pub enum Stage {
     RearmedReady,
     Play,
     Tail,
+    /// A full play's fade-out, after its tail's hold.
+    FadeOut,
     Failed,
     Closing,
 }
@@ -180,6 +182,7 @@ impl FrameKind {
                 Stage::RearmedReady => "rearmed ready",
                 Stage::Play => "play",
                 Stage::Tail => "tail",
+                Stage::FadeOut => "fadeout",
                 Stage::Failed => "failed",
                 Stage::Closing => "closing",
             },
@@ -318,6 +321,11 @@ pub fn record(
         ..LaneView::NONE
     };
     let end = script.last_note();
+    let declared = skin.play_ending();
+    let ending = game::PlayEnding {
+        finish_margin: declared.finish_margin,
+        fadeout: declared.fadeout,
+    };
     let carry_safe = skin.program_carry_safe();
     let mut model = Model::default();
     let mut frames = Vec::new();
@@ -478,7 +486,7 @@ pub fn record(
                         &chart,
                         &preset,
                         r.section.then_some(&section),
-                        (end.0, shown),
+                        (end.0, shown, ending),
                         &judged,
                         |st| {
                             if st.rearmed && !rearmed {
@@ -513,7 +521,7 @@ pub fn record(
                                 lanes: view,
                                 playing,
                                 closing: st.closing,
-                                fading: None,
+                                fading: st.fading,
                                 // The display offset is 0: the head is now.
                                 readouts: readouts(script.fix_hispeed, tempo.current_x100(now)),
                             };
@@ -552,6 +560,7 @@ pub fn record(
                             let stage = match (st.closing, ready, st.rearmed) {
                                 (Some(_), _, _) if r.end == End::Fail => Stage::Failed,
                                 (Some(_), _, _) => Stage::Closing,
+                                (None, _, _) if st.fading.is_some() => Stage::FadeOut,
                                 (None, true, false) => Stage::Ready,
                                 (None, true, true) => Stage::RearmedReady,
                                 (None, false, _) if now > end => Stage::Tail,

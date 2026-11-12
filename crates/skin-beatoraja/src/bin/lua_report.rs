@@ -818,8 +818,8 @@ mod tests {
     }
 
     /// A play skin's report counts its elements per timer and gives its
-    /// atlas plan under the device's limits in each variant. Timer 2 does
-    /// not map yet, so its destination makes no element.
+    /// atlas plan under the device's limits in each variant: timer 2, the
+    /// fade-out, counts under its schema name.
     #[test]
     fn a_play_skins_report_counts_its_timers_and_plans_its_atlas() {
         let d = tempfile::tempdir().unwrap();
@@ -846,7 +846,7 @@ mod tests {
         );
         let out = report(0, &s);
         assert!(
-            out.contains("\n  elements: 3 (timers: failed 2, screen 1)\n"),
+            out.contains("\n  elements: 4 (timers: fadeout 1, failed 2, screen 1)\n"),
             "{out}"
         );
         for variant in ["Lo", "Hi"] {
