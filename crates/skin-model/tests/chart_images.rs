@@ -23,7 +23,7 @@ const KEY: ChartKey = ChartKey {
 
 /// A table of `stage` and `back` describing [`KEY`]'s array.
 fn table(stage: Option<ChartUv>, back: Option<ChartUv>) -> ChartTable {
-    ChartTable::new(stage, back).keyed(KEY)
+    ChartTable::new(stage, back, None).keyed(KEY)
 }
 use skin_model::{
     AtlasError, AtlasLimits, DecisionDefs, ElementDef, Filter, FrameUv, GUTTER, KeptLayers, Layout,
@@ -315,20 +315,60 @@ fn a_chart_image_draws_its_stretched_rect() {
     assert_eq!(drawn(&h.batch)[0].0, [200.0, 100.0, 200.0, 100.0]);
 }
 
-/// A chart image is play's and the result's: selection and decision
-/// refuse it, a result skin drawing one keeps a chart layer, and so does a
-/// play skin, counted after the text layer.
+/// A chart image is the stage file and back image on play and result, and
+/// the stage file and banner on selection: each other image, and any on
+/// decision, is refused; a skin drawing one keeps a chart layer, a play
+/// skin's counted after the text layer.
 #[test]
 fn a_chart_image_is_play_and_results_and_keeps_a_chart_layer() {
     let element = || chart_image(ChartImage::Stage, ChartStretch::Fill, STAGE);
-    let selection = Skin::new_selection(
-        def(Vec::new(), white_sheet(), vec![element()]),
-        SelectionDefs::default(),
-    );
+    let selection_of = |which| {
+        Skin::new_selection(
+            def(
+                Vec::new(),
+                white_sheet(),
+                vec![ElementDef {
+                    timer: TimerRef::Builtin(skin_model::selection_timer::SCREEN),
+                    ..chart_image(which, ChartStretch::Fill, STAGE)
+                }],
+            ),
+            SelectionDefs::default(),
+        )
+    };
+    for which in [ChartImage::Stage, ChartImage::Banner] {
+        let selection = selection_of(which).unwrap();
+        assert!(selection.has_chart_images(), "{which:?}");
+        assert!(selection.kept_layers().chart, "{which:?}");
+    }
     assert!(matches!(
-        selection,
+        selection_of(ChartImage::Back),
         Err(LoadError::SourceKind {
             kind: ScreenKind::Selection,
+            ..
+        })
+    ));
+    let banner = || chart_image(ChartImage::Banner, ChartStretch::Fill, STAGE);
+    assert!(matches!(
+        load(Vec::new(), vec![banner()]),
+        Err(LoadError::SourceKind {
+            kind: ScreenKind::Play,
+            ..
+        })
+    ));
+    assert!(matches!(
+        Skin::new_result(
+            def(
+                Vec::new(),
+                white_sheet(),
+                vec![ElementDef {
+                    timer: TimerRef::Builtin(skin_model::result_timer::SCREEN),
+                    ..banner()
+                }],
+            ),
+            ResultDefs::default(),
+        ),
+        Err(LoadError::SourceKind {
+            kind: ScreenKind::Result,
             ..
         })
     ));
@@ -601,14 +641,32 @@ fn a_plans_shape_names_its_side_pages_and_layers() {
     assert!(none.side < shape.side);
 }
 
-/// A slot is half the side square, the stage file's at the top left and
-/// the back image's at the top right; a uv covers the content only.
+/// The stage file's and back image's slots are half the side square, at
+/// the top left and top right, and the banner's half the side wide and a
+/// quarter high below the stage file's; no two overlap, and all lie in the
+/// square. A uv covers the content only.
 #[test]
 fn slots_and_uvs_cover_the_content_only() {
     let (origin, slot) = ChartImage::Back.slot(2_048).unwrap();
     assert_eq!((origin, slot.size()), ([1_024, 0], [1_024, 1_024]));
     assert_eq!(ChartImage::Stage.slot(2_048).unwrap().0, [0, 0]);
+    let (at, banner) = ChartImage::Banner.slot(2_048).unwrap();
+    assert_eq!((at, banner.size()), ([0, 1_024], [1_024, 512]));
     assert!(ChartImage::Stage.slot(40).is_none());
+    for side in [2_048, 4_096, 8_192] {
+        let rects = ChartImage::ALL.map(|w| {
+            let ([x, y], s) = w.slot(side).unwrap();
+            let [sw, sh] = s.size();
+            assert!(x + sw <= side && y + sh <= side, "{w:?} in {side}");
+            [x, y, x + sw, y + sh]
+        });
+        for (i, a) in rects.iter().enumerate() {
+            for b in rects.iter().skip(i + 1) {
+                let apart = a[2] <= b[0] || b[2] <= a[0] || a[3] <= b[1] || b[3] <= a[1];
+                assert!(apart, "{a:?} and {b:?} in {side}");
+            }
+        }
+    }
 
     let d = tempfile::tempdir().unwrap();
     image::RgbaImage::from_pixel(5, 3, image::Rgba([9, 9, 9, 255]))
@@ -675,7 +733,7 @@ fn only_a_table_of_the_live_array_draws() {
     }
     l.loading.set_chart_live(Some(KEY));
     l.loading
-        .set_chart_images(Some(ChartTable::new(None, Some(back))));
+        .set_chart_images(Some(ChartTable::new(None, Some(back), None)));
     l.build();
     assert_eq!(drawn(&l.batch), Vec::new(), "an unkeyed table: unavailable");
 

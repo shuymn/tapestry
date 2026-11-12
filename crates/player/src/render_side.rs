@@ -175,7 +175,7 @@ pub trait Screen: Send {
     fn publish_chart_images(
         &mut self,
         target: render::ChartTarget,
-        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
     ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
         let _ = (target, images);
         Err(RenderError::NoChartLayer)
@@ -202,7 +202,7 @@ pub trait Screen: Send {
     fn write_result_chart(
         &mut self,
         target: render::ResultChartTarget,
-        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
         set: u64,
     ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
         let _ = (target, images, set);

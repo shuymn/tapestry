@@ -77,6 +77,8 @@ pub static SELECTION: Schema = Schema {
         int("selected.length_sec", 0, 59),
         int("selected.judge_class", 0, JUDGE_CLASS_MAX),
         flag("selected.judge_class_valid"),
+        flag("selected.stagefile"),
+        flag("selected.banner"),
         int("settings.display_offset", -VALUE_MAX, VALUE_MAX),
         int("settings.volume", 0, 100),
         flag("settings.floating"),
@@ -172,34 +174,40 @@ pub mod field {
     /// chart row.
     pub const SELECTED_JUDGE_CLASS: u16 = 25;
     pub const SELECTED_JUDGE_CLASS_VALID: u16 = 26;
+    /// Whether the cursor's chart's stage file and banner are drawable:
+    /// true only while the selection's chart table is current for the
+    /// cursor generation and holds that image (options 190 to 193). The
+    /// player writes them after the view's fields, which reset them.
+    pub const SELECTED_STAGEFILE: u16 = 27;
+    pub const SELECTED_BANNER: u16 = 28;
     /// The settings' fields, then the application's readouts, from here
     /// on, which a view leaves as they are
     /// ([`SelectionSettings`](crate::SelectionSettings),
     /// [`SelectionFrame::app`](crate::SelectionFrame::app)).
-    pub const SETTINGS: u16 = 27;
+    pub const SETTINGS: u16 = 29;
     /// The display offset in whole ms.
-    pub const SETTINGS_DISPLAY_OFFSET: u16 = 27;
+    pub const SETTINGS_DISPLAY_OFFSET: u16 = 29;
     /// The master gain's number, `(int)(gain · 100f)`.
-    pub const SETTINGS_VOLUME: u16 = 28;
+    pub const SETTINGS_VOLUME: u16 = 30;
     /// Whether the hi-speed is Floating.
-    pub const SETTINGS_FLOATING: u16 = 29;
+    pub const SETTINGS_FLOATING: u16 = 31;
     /// In Floating, the travel duration of the target green number `G`,
     /// `⌊5 · G / 3⌋` ms, and `G`; 0 in Classic.
-    pub const SETTINGS_DURATION: u16 = 30;
-    pub const SETTINGS_GREEN: u16 = 31;
+    pub const SETTINGS_DURATION: u16 = 32;
+    pub const SETTINGS_GREEN: u16 = 33;
     /// The source's fixed hi-speed index: 0 in Classic; in Floating 1 to
     /// 4 by the reference tempo, start, maximum, main and minimum.
-    pub const SETTINGS_FIX_HISPEED: u16 = 32;
+    pub const SETTINGS_FIX_HISPEED: u16 = 34;
     /// The source's sorter index of the order: title 0, artist 1, level 4;
     /// −1 for an order it has no sorter for.
-    pub const SETTINGS_ORDER: u16 = 33;
+    pub const SETTINGS_ORDER: u16 = 35;
     /// The displayed gauge's look, assist-easy 0 to hazard 5; −1 without
     /// one.
-    pub const SETTINGS_GAUGE: u16 = 34;
+    pub const SETTINGS_GAUGE: u16 = 36;
     /// Whether SUDDEN+, LIFT and HIDDEN+ are on.
-    pub const SETTINGS_SUDDEN: u16 = 35;
-    pub const SETTINGS_LIFT: u16 = 36;
-    pub const SETTINGS_HIDDEN: u16 = 37;
+    pub const SETTINGS_SUDDEN: u16 = 37;
+    pub const SETTINGS_LIFT: u16 = 38;
+    pub const SETTINGS_HIDDEN: u16 = 39;
     /// The source's gauge auto-shift index for the failure handling
     /// `player.toml` sets: 0 (none) when a failed play closes, 1
     /// (continue) when it plays to the end.
@@ -254,6 +262,13 @@ mod tests {
             (field::SELECTED_RANK, "selected.rank"),
             (field::SELECTED_LEVEL, "selected.level"),
             (field::SELECTED_LENGTH_SEC, "selected.length_sec"),
+            (
+                field::SELECTED_JUDGE_CLASS_VALID,
+                "selected.judge_class_valid",
+            ),
+            (field::SELECTED_STAGEFILE, "selected.stagefile"),
+            (field::SELECTED_BANNER, "selected.banner"),
+            (field::SETTINGS, "settings.display_offset"),
             (field::SETTINGS_DISPLAY_OFFSET, "settings.display_offset"),
             (field::SETTINGS_VOLUME, "settings.volume"),
             (field::SETTINGS_GREEN, "settings.green"),

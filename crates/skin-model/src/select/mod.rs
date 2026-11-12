@@ -16,6 +16,7 @@ use std::cell::Cell;
 use bms_model::{Tempo, TimeUs};
 
 use self::schema::{VALUE_MAX, field, timer};
+use crate::chart_image::{ChartImage, ChartKey, ChartTable};
 use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
 use crate::play::timers::app_fields;
@@ -128,6 +129,12 @@ pub struct Selection {
     /// last prepared the timers for, which that frame's build takes
     /// without refilling them.
     pub(crate) prepared: Option<TimeUs>,
+    /// The cursor's chart's images published for this state's
+    /// installation; `None` while they are not current.
+    chart: Option<ChartTable>,
+    /// The live key of the array its frames draw from, set by the frame's
+    /// renderer before each build.
+    chart_live: Option<ChartKey>,
 }
 
 impl Selection {
@@ -163,6 +170,8 @@ impl Selection {
             master_volume: None,
             hits: vec![Cell::new(None); sliders].into_boxed_slice(),
             prepared: None,
+            chart: None,
+            chart_live: None,
         }
     }
 
@@ -237,6 +246,54 @@ impl Selection {
 
     pub(crate) fn slots(&self) -> usize {
         self.ms.len()
+    }
+
+    /// Sets the cursor's chart's images its frames draw and its image
+    /// fields read ([`write_chart_fields`](Self::write_chart_fields)):
+    /// `None` while they are not current for the cursor, `Some` once
+    /// they are, an absent entry drawing nothing and reading false.
+    /// Allocates nothing.
+    pub fn set_chart_images(&mut self, table: Option<ChartTable>) {
+        self.chart = table;
+    }
+
+    /// The chart images set for it; `None` while not current.
+    #[must_use]
+    pub fn chart_images(&self) -> Option<&ChartTable> {
+        self.chart.as_ref()
+    }
+
+    /// Sets the live key of the array its next frames draw from: the
+    /// frame's renderer sets it before each build, from its own state.
+    /// Allocates nothing.
+    pub fn set_chart_live(&mut self, live: Option<ChartKey>) {
+        self.chart_live = live;
+    }
+
+    /// The chart images its frames draw: the table set for it when it
+    /// describes the live array ([`ChartTable::drawable`]); `None`, which
+    /// draws nothing, otherwise.
+    #[must_use]
+    pub fn drawable_chart(&self) -> Option<&ChartTable> {
+        self.chart.as_ref().filter(|t| t.drawable(self.chart_live))
+    }
+
+    /// Writes `selected.stagefile` and `selected.banner` from the table
+    /// set ([`set_chart_images`](Self::set_chart_images)): whether it
+    /// holds each image, both false while none is set. A view update
+    /// resets them, so the player writes them after it and before the
+    /// frame's callbacks. Allocates nothing.
+    pub fn write_chart_fields(&mut self) {
+        let [stage, banner] = [ChartImage::Stage, ChartImage::Banner]
+            .map(|which| self.chart.is_some_and(|t| t.present(which)));
+        for (slot, v) in [
+            (field::SELECTED_STAGEFILE, stage),
+            (field::SELECTED_BANNER, banner),
+        ] {
+            if let Some(f) = self.fields.get_mut(usize::from(slot)) {
+                *f = i32::from(v);
+            }
+        }
     }
 
     /// Fills the fields, strings, rows and ratios from `view`, the rows

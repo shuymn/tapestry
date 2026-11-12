@@ -88,7 +88,7 @@ fn loading_frames_draw_the_published_images() {
     let stage = picture(ChartImage::Stage, side, [640, 480], GREEN);
     let back = picture(ChartImage::Back, side, [320, 240], BLUE);
     let table = r
-        .publish_chart_images(ChartTarget::Committed, [Some(&stage), Some(&back)])
+        .publish_chart_images(ChartTarget::Committed, [Some(&stage), Some(&back), None])
         .unwrap();
     assert!(table.present(ChartImage::Stage) && table.present(ChartImage::Back));
     let p = loading(&mut r, &text, &frame(1));
@@ -97,7 +97,7 @@ fn loading_frames_draw_the_published_images() {
     assert_eq!(at(&p, BACK_MARK), RED);
     assert_eq!(at(&p, NO_BACK_MARK), BLACK);
 
-    r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+    r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
         .unwrap();
     let p = loading(&mut r, &text, &frame(1));
     assert_eq!(at(&p, CHART_STAGE), GREEN);
@@ -121,7 +121,7 @@ fn a_prepared_attempt_draws_the_published_images() {
     install(&mut r, &b, 1);
     let side = b.side();
     let back = picture(ChartImage::Back, side, [64, 64], BLUE);
-    r.publish_chart_images(ChartTarget::Committed, [None, Some(&back)])
+    r.publish_chart_images(ChartTarget::Committed, [None, Some(&back), None])
         .unwrap();
     let ctx = context(&GAUGES, false);
     let a = attempt(&r, &chart, &ctx);
@@ -160,7 +160,7 @@ fn a_staged_attempt_takes_the_images_valid_at_its_commit() {
 
     // Staged, then published, then committed.
     let token = r.stage(&b, &attempt(&r, &chart, &ctx), 2).unwrap();
-    r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+    r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
         .unwrap();
     r.commit(token).unwrap();
     let p = play_frame(&mut r);
@@ -170,7 +170,7 @@ fn a_staged_attempt_takes_the_images_valid_at_its_commit() {
 
     // Staged on those images, published again, then committed.
     let token = r.stage(&b, &attempt(&r, &chart, &ctx), 3).unwrap();
-    r.publish_chart_images(ChartTarget::Committed, [None, Some(&back)])
+    r.publish_chart_images(ChartTarget::Committed, [None, Some(&back), None])
         .unwrap();
     r.commit(token).unwrap();
     let p = play_frame(&mut r);
@@ -191,7 +191,7 @@ fn a_restore_makes_the_images_unavailable_until_republished() {
     let (b, _) = bundle(&r, dir.path(), &chart_look());
     install(&mut r, &b, 1);
     let stage = picture(ChartImage::Stage, b.side(), [64, 64], GREEN);
-    r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+    r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
         .unwrap();
     let installation = r.installation(skin_model::ScreenKind::Play).unwrap();
     assert!(installation.loading().chart_images().is_some());
@@ -207,7 +207,7 @@ fn a_restore_makes_the_images_unavailable_until_republished() {
             "{rect:?}: unavailable after the restore"
         );
     }
-    r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+    r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
         .unwrap();
     let p = loading(&mut r, &text, &frame(1));
     assert_eq!(at(&p, CHART_STAGE), GREEN);
@@ -236,7 +236,7 @@ fn another_renderers_publication_never_draws_here() {
     let (b, _) = bundle(&r1, dir.path(), &chart_look());
     install(&mut r1, &b, 1);
     let stage = picture(ChartImage::Stage, b.side(), [64, 64], GREEN);
-    r1.publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+    r1.publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
         .unwrap();
     let installation = r1.installation(skin_model::ScreenKind::Play).unwrap();
 
@@ -245,7 +245,7 @@ fn another_renderers_publication_never_draws_here() {
     r2.restore(skin_model::ScreenKind::Play, &installation)
         .unwrap();
     // The first publishes again, and commits an attempt, after the restore.
-    r1.publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+    r1.publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
         .unwrap();
     let ctx = context(&GAUGES, false);
     let token = r1.stage(&b, &attempt(&r1, &chart, &ctx), 2).unwrap();
@@ -269,12 +269,12 @@ fn another_renderers_publication_never_draws_here() {
 fn no_chart_layer_publishes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let mut r = offscreen(1_920, 1_080);
-    let none = r.publish_chart_images(ChartTarget::Committed, [None, None]);
+    let none = r.publish_chart_images(ChartTarget::Committed, [None, None, None]);
     assert!(matches!(none, Err(RenderError::NoChartLayer)), "{none:?}");
     let (b, _) = bundle(&r, dir.path(), &Look::left([255, 0, 0, 255]));
     assert_eq!(b.chart_layer(), None);
     install(&mut r, &b, 1);
-    let none = r.publish_chart_images(ChartTarget::Committed, [None, None]);
+    let none = r.publish_chart_images(ChartTarget::Committed, [None, None, None]);
     assert!(matches!(none, Err(RenderError::NoChartLayer)), "{none:?}");
     let _ = ChartTable::ABSENT;
 }
@@ -293,7 +293,7 @@ fn an_invalidation_makes_the_images_unavailable() {
     let side = b.side();
     let stage = picture(ChartImage::Stage, side, [640, 480], GREEN);
     let back = picture(ChartImage::Back, side, [512, 384], BLUE);
-    r.publish_chart_images(ChartTarget::Committed, [Some(&stage), Some(&back)])
+    r.publish_chart_images(ChartTarget::Committed, [Some(&stage), Some(&back), None])
         .unwrap();
     let p = loading(&mut r, &text, &frame(1));
     assert_eq!(at(&p, CHART_BACK), BLUE);
@@ -355,7 +355,7 @@ fn an_absent_table_needs_no_chart_layer() {
 
     let back = picture(ChartImage::Back, 2_048, [64, 64], BLUE);
     let e = r
-        .publish_chart_images(ChartTarget::Committed, [None, Some(&back)])
+        .publish_chart_images(ChartTarget::Committed, [None, Some(&back), None])
         .unwrap_err();
     assert!(matches!(e, RenderError::NoChartLayer), "{e:?}");
     assert_eq!(e.chart_outcome(), ChartOutcome::NoTarget);
@@ -391,7 +391,7 @@ fn a_staged_array_takes_its_images_at_its_commit() {
     let (b, _) = bundle(&r, dir.path(), &chart_look());
     install(&mut r, &b, 1);
     let stage = picture(ChartImage::Stage, b.side(), [640, 480], GREEN);
-    r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+    r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
         .unwrap();
     let ctx = context(&GAUGES, false);
 
@@ -401,7 +401,7 @@ fn a_staged_array_takes_its_images_at_its_commit() {
     let outgoing = r.chart_key().unwrap();
     let token = r.stage(&b2, &attempt(&r, &chart, &ctx), 2).unwrap();
     let table = r
-        .publish_chart_images(ChartTarget::Staged(token), [None, Some(&back)])
+        .publish_chart_images(ChartTarget::Staged(token), [None, Some(&back), None])
         .unwrap();
     assert!(table.present(ChartImage::Back) && !table.present(ChartImage::Stage));
     // The committed installation is untouched: its own table and texels.
@@ -429,16 +429,16 @@ fn a_staged_array_takes_its_images_at_its_commit() {
     let (b3, _) = bundle(&r, dir.path(), &chart_look());
     let token = r.stage(&b3, &attempt(&r, &chart, &ctx), 3).unwrap();
     let green = picture(ChartImage::Stage, b3.side(), [64, 64], GREEN);
-    r.publish_chart_images(ChartTarget::Staged(token), [Some(&green), None])
+    r.publish_chart_images(ChartTarget::Staged(token), [Some(&green), None, None])
         .unwrap();
     r.discard();
     let e = r
-        .publish_chart_images(ChartTarget::Staged(token), [Some(&green), None])
+        .publish_chart_images(ChartTarget::Staged(token), [Some(&green), None, None])
         .unwrap_err();
     assert!(matches!(e, RenderError::ChartChanged), "{e:?}");
     let newer = r.stage(&b3, &attempt(&r, &chart, &ctx), 4).unwrap();
     let e = r
-        .publish_chart_images(ChartTarget::Staged(token), [Some(&green), None])
+        .publish_chart_images(ChartTarget::Staged(token), [Some(&green), None, None])
         .unwrap_err();
     assert!(
         matches!(e, RenderError::ChartChanged),

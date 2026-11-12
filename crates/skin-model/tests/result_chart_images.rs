@@ -81,7 +81,7 @@ fn a_result_frame_draws_the_views_chart_images() {
     assert!(stage(&fx).is_empty(), "no table: nothing");
     fx.res.set_chart_live(Some(KEY));
     fx.res
-        .set_chart_images(ChartTable::new(Some(STAGE), None).keyed(KEY));
+        .set_chart_images(ChartTable::new(Some(STAGE), None, None).keyed(KEY));
     fx.frame(10);
     let want = ChartStretch::Inner
         .place([100.0, 700.0, 400.0, 150.0], STAGE.native)

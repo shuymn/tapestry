@@ -87,12 +87,13 @@ pub type Published = Result<ChartTable, render::ChartOutcome>;
 /// The next set's id.
 static SET_IDS: AtomicU64 = AtomicU64::new(1);
 
-/// The chart's stage file and back image as read, by [`ChartImage::index`],
+/// The chart's stage file, back image and banner as read, by
+/// [`ChartImage::index`],
 /// and the set's id, unique in the process: what an array's record names
 /// ([`render::Renderer::write_result_chart`]).
 #[derive(Debug)]
 pub struct ChartImages {
-    reads: [Arc<Read>; 2],
+    reads: [Arc<Read>; 3],
     id: u64,
 }
 
@@ -101,14 +102,14 @@ pub struct ChartImages {
 pub type Sources = ChartImages;
 
 impl ChartImages {
-    fn of(reads: [Arc<Read>; 2]) -> Self {
+    fn of(reads: [Arc<Read>; 3]) -> Self {
         Self {
             reads,
             id: SET_IDS.fetch_add(1, Ordering::Relaxed),
         }
     }
 
-    /// Both absent for `why`.
+    /// All absent for `why`.
     #[must_use]
     pub fn absent(why: &Absent) -> Self {
         let read = || {
@@ -117,7 +118,7 @@ impl ChartImages {
                 image: Err(why.clone()),
             })
         };
-        Self::of([read(), read()])
+        Self::of([read(), read(), read()])
     }
 
     /// Its id.
@@ -128,17 +129,18 @@ impl ChartImages {
 
     /// The fitted images, absent ones `None`.
     #[must_use]
-    pub fn fitted(&self) -> [Option<&Fitted>; 2] {
+    pub fn fitted(&self) -> [Option<&Fitted>; 3] {
         self.reads.each_ref().map(|r| r.image.as_ref().ok())
     }
 
     /// The read of `which`.
     #[must_use]
     pub fn read(&self, which: ChartImage) -> &Read {
-        let [stage, back] = &self.reads;
+        let [stage, back, banner] = &self.reads;
         match which {
             ChartImage::Stage => stage,
             ChartImage::Back => back,
+            ChartImage::Banner => banner,
         }
     }
 
@@ -164,14 +166,15 @@ impl ChartImages {
 }
 
 /// What an attempt asks of the images: the chart's folder and its stage
-/// file and back image names as its labels hold them, and the page side of
+/// file, back image and banner names as its labels hold them (an empty
+/// name reads nothing: play and result name no banner), and the page side of
 /// each target's chart layer, the play installation's and the result's;
 /// `None` for a target that keeps no chart layer (play's images are then
 /// published absent).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Want {
     pub dir: PathBuf,
-    pub names: [String; 2],
+    pub names: [String; 3],
     pub play: Option<u32>,
     pub result: Option<u32>,
 }
@@ -1516,6 +1519,7 @@ fn log_absent(set: &ChartImages) {
                 let name = match which {
                     ChartImage::Stage => "stage file",
                     ChartImage::Back => "back image",
+                    ChartImage::Banner => "banner",
                 };
                 log::warn!("chart: the {name} is not shown: {why}");
                 eprintln!("chart: the {name} is not shown: {why}");
@@ -1559,7 +1563,7 @@ mod tests {
     fn want(dir: &Path, side: Option<u32>) -> Want {
         Want {
             dir: dir.to_path_buf(),
-            names: ["s.png".to_owned(), "b.png".to_owned()],
+            names: ["s.png".to_owned(), "b.png".to_owned(), String::new()],
             play: side,
             result: None,
         }

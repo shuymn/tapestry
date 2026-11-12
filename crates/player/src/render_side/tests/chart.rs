@@ -95,7 +95,7 @@ impl Screen for ChartScreen {
     fn publish_chart_images(
         &mut self,
         target: render::ChartTarget,
-        _images: [Option<&skin_model::chart_image::Fitted>; 2],
+        _images: [Option<&skin_model::chart_image::Fitted>; 3],
     ) -> Result<ChartTable, RenderError> {
         let staged = matches!(target, render::ChartTarget::Staged(_));
         let mut c = self.charts.lock().unwrap();
@@ -172,7 +172,7 @@ fn worker_with_a_set(link: &super::super::RenderLink) -> ChartImageWorker {
     let w = ChartImageWorker::new(link.chart_generation());
     w.attempt(Want {
         dir: std::path::PathBuf::from("no such folder"),
-        names: [String::new(), String::new()],
+        names: [String::new(), String::new(), String::new()],
         play: Some(2_048),
         result: None,
     });
@@ -310,7 +310,7 @@ fn the_job_publishes_its_set_for_the_loading_frames() {
     w.renew();
     w.attempt(Want {
         dir: std::path::PathBuf::from("no such folder"),
-        names: [String::new(), String::new()],
+        names: [String::new(), String::new(), String::new()],
         play: Some(2_048),
         result: None,
     });
@@ -352,7 +352,7 @@ fn folder_with_stage() -> tempfile::TempDir {
 fn want_in(dir: &std::path::Path, side: Option<u32>) -> Want {
     Want {
         dir: dir.to_path_buf(),
-        names: ["s.png".to_owned(), String::new()],
+        names: ["s.png".to_owned(), String::new(), String::new()],
         play: side,
         result: None,
     }

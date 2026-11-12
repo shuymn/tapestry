@@ -871,7 +871,7 @@ impl Screen for MenuScreen {
     fn publish_chart_images(
         &mut self,
         target: render::ChartTarget,
-        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
     ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
         self.renderer.publish_chart_images(target, images)
     }
@@ -886,7 +886,7 @@ impl Screen for MenuScreen {
     fn write_result_chart(
         &mut self,
         target: render::ResultChartTarget,
-        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
         set: u64,
     ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
         self.renderer.write_result_chart(target, images, set)

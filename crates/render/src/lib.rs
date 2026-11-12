@@ -43,6 +43,8 @@ mod outline_support;
 #[cfg(test)]
 mod result_tests;
 #[cfg(test)]
+mod selection_chart_tests;
+#[cfg(test)]
 #[path = "../tests/common/mod.rs"]
 mod test_common;
 #[cfg(test)]
