@@ -493,6 +493,10 @@ pub struct SkinFrame<'a> {
     /// `closing`): the `failed` timer's start, for the displayed survival
     /// gauge's failure and the quit key alike; `None` outside Closing.
     pub closing: Option<TimeUs>,
+    /// Where a completed full play's fade-out started, on its play clock
+    /// (the play view's `fading`): the `fadeout` timer's start; `None`
+    /// before it, in Closing and in a practice round.
+    pub fading: Option<TimeUs>,
     /// The render target's size in pixels; the skin computes its canvas
     /// from it.
     pub target: [u32; 2],
@@ -689,7 +693,7 @@ pub struct Play {
     /// The context's [`PlayContext::last_note_end`].
     last_note_end: TimeUs,
     /// Where `time.remaining_s` counts to: the chart's last resolved
-    /// object ([`last_object`]) or the section's end.
+    /// object ([`Chart::last_object`]) or the section's end.
     readout_end: TimeUs,
     /// The context's [`PlayContext::bpm_range`], validated.
     bpm_range: Option<BpmRange>,
@@ -854,14 +858,6 @@ pub(crate) struct Notes {
     pub(crate) section: Option<(TimeUs, TimeUs)>,
 }
 
-/// The chart's last resolved object: the latest note end (mines included)
-/// or background sound start, at least 0. A sound's tail is not an object.
-fn last_object(chart: &Chart) -> TimeUs {
-    let notes = chart.lanes.iter().flatten().map(Note::end);
-    let bgm = chart.bgm.iter().map(|b| b.time);
-    notes.chain(bgm).fold(TimeUs(0), TimeUs::max)
-}
-
 impl Play {
     /// The bytes this attempt's state holds, itself and every buffer it
     /// owns: the reducer, the timers, the playhead's representatives and
@@ -957,7 +953,7 @@ impl Play {
         }
         let bounds = section.map(|s| (s.start, s.end));
         let playhead = ExactPlayhead::prepare(chart, bounds)?;
-        let readout_end = section.map_or_else(|| last_object(chart), |s| s.end);
+        let readout_end = section.map_or_else(|| chart.last_object(), |s| s.end);
         let initial = ctx.gauges.iter().enumerate().map(|(i, g)| {
             let value = section
                 .and_then(|s| s.initial_gauges.get(i).copied())
@@ -1448,6 +1444,7 @@ mod tests {
                     complete: false,
                     playing: true,
                     closing: None,
+                    fading: None,
                     target: [1_920, 1_080],
                     layout: &layout,
                     turntable: 0,
@@ -1537,6 +1534,7 @@ mod tests {
             complete: false,
             playing: true,
             closing: None,
+            fading: None,
             target: [1_920, 1_080],
             layout: &layout,
             turntable: 0,

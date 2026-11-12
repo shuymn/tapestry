@@ -358,6 +358,9 @@ pub fn compose_page(view: &EndPage, latest: &EndPage, why: Option<&str>) -> EndP
     EndPage {
         lines,
         graphs: view.graphs.clone(),
+        // The view's result: the page draws in its place.
+        #[cfg(feature = "dev-tools")]
+        id: view.id,
     }
 }
 
@@ -511,6 +514,13 @@ impl Presenter {
     /// The attempt's fallback, if any.
     pub fn attempt_fallen(&self) -> Option<&str> {
         self.attempt.as_deref()
+    }
+
+    /// The desired view's key, if one is (dev-tools: a result capture's
+    /// view).
+    #[cfg(feature = "dev-tools")]
+    pub fn desired_key(&self) -> Option<ViewKey> {
+        self.desired.as_ref().map(|(k, _)| *k)
     }
 
     /// A new desired view, `snapshot`: its key. Until its layout lands

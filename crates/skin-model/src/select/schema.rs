@@ -88,6 +88,8 @@ pub static SELECTION: Schema = Schema {
         flag("settings.sudden"),
         flag("settings.lift"),
         flag("settings.hidden"),
+        int("settings.gauge_shift", 0, 1),
+        int("settings.judge_algorithm", -1, 1),
         int("app.fps", 0, FPS_MAX),
         int("clock.year", 0, YEAR_MAX),
         int("clock.month", 0, 12),
@@ -198,13 +200,21 @@ pub mod field {
     pub const SETTINGS_SUDDEN: u16 = 35;
     pub const SETTINGS_LIFT: u16 = 36;
     pub const SETTINGS_HIDDEN: u16 = 37;
+    /// The source's gauge auto-shift index for the failure handling
+    /// `player.toml` sets: 0 (none) when a failed play closes, 1
+    /// (continue) when it plays to the end.
+    pub const SETTINGS_GAUGE_SHIFT: u16 = SETTINGS_HIDDEN + 1;
+    /// The source's judgment-algorithm index of the chosen preset's press
+    /// assignment: 0 (combo) for combo priority, 1 (duration) for the
+    /// nearest note, earlier at a tie; −1 without a preset.
+    pub const SETTINGS_JUDGE_ALGORITHM: u16 = SETTINGS_GAUGE_SHIFT + 1;
     /// The application's readouts of the frame
     /// ([`SelectionFrame::app`](crate::SelectionFrame::app)), as play's
     /// fields of the same names, after the settings: the frames presented
     /// in the last second, the local year, month (1 to 12), day, 24-hour
     /// hour, minute and second, then the uptime's whole hours (unwrapped),
     /// its minutes within the hour and its seconds within the minute.
-    pub const APP_FPS: u16 = SETTINGS_HIDDEN + 1;
+    pub const APP_FPS: u16 = SETTINGS_JUDGE_ALGORITHM + 1;
     pub const CLOCK_YEAR: u16 = APP_FPS + 1;
     pub const CLOCK_SECOND: u16 = APP_FPS + 6;
     pub const APP_UPTIME_H: u16 = APP_FPS + 7;
@@ -249,6 +259,8 @@ mod tests {
             (field::SETTINGS_GREEN, "settings.green"),
             (field::SETTINGS_ORDER, "settings.order"),
             (field::SETTINGS_HIDDEN, "settings.hidden"),
+            (field::SETTINGS_GAUGE_SHIFT, "settings.gauge_shift"),
+            (field::SETTINGS_JUDGE_ALGORITHM, "settings.judge_algorithm"),
             (field::APP_FPS, "app.fps"),
             (field::CLOCK_YEAR, "clock.year"),
             (field::CLOCK_SECOND, "clock.second"),

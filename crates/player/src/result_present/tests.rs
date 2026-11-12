@@ -260,6 +260,8 @@ fn the_built_in_page_is_the_views_rows_over_the_newest() {
     let page = |tag: &str| EndPage {
         lines: (0..27).map(|i| format!("{tag}{i}")).collect(),
         graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
     };
     let view = page("v");
     let mut latest = page("n");

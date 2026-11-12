@@ -62,7 +62,8 @@ pub use adjust_keys::{
 };
 pub use app::{App, AppRig, IDLE_WAIT, LoadRefusal, Loading, Pick, Refused};
 pub use attempt::{
-    Attempt, AttemptKind, NoteEnd, Preparation, PreparationRefusal, ScoreBasis, song_total,
+    Attempt, AttemptKind, NoteEnd, Preparation, PreparationRefusal, ScoreBasis, finish_anchor,
+    song_total,
 };
 pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioLoadError, AudioProbe, AudioWaitError, AudioWorker,
@@ -73,7 +74,10 @@ pub use bests::{
     BestCompare, BestFigures, BestKey, BestLamp, BestLookup, BestRate, BestScore, BestView,
     SavedPlay, ScoreTarget, TargetPlay, score_target,
 };
-pub use decision::{DECISION_TIME, Decision, Origin, Reply, Served, Verdict};
+pub use decision::{
+    DECISION_TIME, Decision, DecisionLifetime, DecisionShown, DecisionTakeover, Origin, Reply,
+    Served, Verdict,
+};
 pub use driver::{AdjustDriver, IngressDrain, InputFailureCell, InputPump};
 pub use error::{Chain, IoFailure};
 pub use eval::TABLE_BYTES_PER_OBJECT;
@@ -87,8 +91,9 @@ pub use keys::{
     LearntRange, Press, ROLES, Refusal, SETTLE_TIME, capture_keys, capture_keys_within,
 };
 pub use live::{
-    CLOSE_FLOOR, Closing, ClosingEnd, InputWaitError, Leave, LiveError, Opening, Outro, PlayEnding,
-    Polled, Rearm, ResultTiming, Rig, closing_deadline, closing_time, gated,
+    CLOSE_FLOOR, Closing, ClosingEnd, FINISH_MARGIN, InputWaitError, Leave, LiveError, Opening,
+    Outro, PlayEnding, Polled, Rearm, ResultTiming, Rig, closing_deadline, closing_time,
+    fade_deadline, gated, hold_until,
 };
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,

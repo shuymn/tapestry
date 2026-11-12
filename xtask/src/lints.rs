@@ -231,6 +231,12 @@ pub const IN_PLAY: &[Site] = &[
             "run_tail",
             "TailStage::begin",
             "TailStage::over",
+            "FadeStage::begin",
+            "FadeStage::over",
+            "tail_exit",
+            "tail_stepped",
+            "hold_until",
+            "fade_deadline",
             "TailAction::of",
             "TailEnd::of",
             "TailEnd::cut",
@@ -258,6 +264,7 @@ pub const IN_PLAY: &[Site] = &[
         "crates/game/src/session.rs",
         &[
             "Loaded::closes_on",
+            "Loaded::finish_anchor",
             "Command::cause",
             "arrival",
             "replay_kind",
@@ -507,13 +514,12 @@ pub const IN_PLAY: &[Site] = &[
             "strip_sprites",
         ],
     ),
-    // The selection frame's timers, the strip's preset line, the
-    // lifetime check before the frame's build and the live settings.
+    // The selection frame's timers, the lifetime check before the
+    // frame's build and the live settings.
     Site::Fns(
         "crates/player/src/selection_skin.rs",
         &[
             "SelectionEvents::timers",
-            "SelectionEvents::preset_shown",
             "SelectionSlot::current",
             "live_settings",
             "SelectionLogic::apply_settings",

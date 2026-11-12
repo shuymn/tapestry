@@ -73,7 +73,10 @@ struct Sampler(Seen);
 
 impl FrameSink for Sampler {
     fn frame(&mut self, screen: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
-        if !self.0.armed.load(Ordering::Acquire) || drawn.play.is_some() || drawn.loading {
+        if !self.0.armed.load(Ordering::Acquire)
+            || drawn.play.is_some()
+            || drawn.loading_stamp.is_some()
+        {
             return;
         }
         let Some((w, _, pixels)) = screen.read_back() else {

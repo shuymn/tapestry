@@ -520,3 +520,116 @@ fn a_round_only_script_anchors_the_screen() {
         assert_eq!(i64::from(ms), (state_us - ready + 2_500_000) / 1_000);
     }
 }
+
+/// The skin's declared ending: a 3 s finish margin and a 1 s fadeout.
+const ENDING: &str = "skin.finishmargin = 3000\nskin.fadeout = 1000\n";
+
+/// Each play frame's `fadeout` timer, off (-1) or its start.
+fn fade_timers(inputs: &[FrameInputs]) -> Vec<i32> {
+    let slot = usize::from(skin_model::timer::FADEOUT);
+    inputs
+        .iter()
+        .filter(|f| f.is_play())
+        .map(|f| f.timers()[slot])
+        .collect()
+}
+
+/// A full play's frames run through its hold and its fade-out: timer 2,
+/// read by a draw callback, is off before the hold's end and on from it
+/// through the 1 s fade-out, in frames labelled `fadeout` that the reference VM
+/// answers alike; no frame of a failing script's Closing has it on.
+#[test]
+fn fade_out_frames_start_timer_2() {
+    let body = format!(
+        "{ENDING}{}",
+        dst(
+            "\"i\"",
+            0,
+            "draw = function() return ms.timer(2) ~= ms.timer_off_value end,"
+        )
+    );
+    let (r, _, inputs) = pieces(&body, Script::full());
+    assert!(r.passes(), "{}", r.text(0, true, true));
+    let (frames, agreed) = r.kinds.get("fadeout").copied().unwrap_or_default();
+    assert!(frames > 0 && agreed > 0, "{}", r.text(0, true, true));
+    let timers = fade_timers(&inputs);
+    // Read as its age in ms: 0 at the hold's end, then rising with the
+    // frames, never off again.
+    let first = timers.iter().position(|&t| t != -1).unwrap();
+    assert!(timers[..first].iter().all(|&t| t == -1));
+    assert_eq!(timers[first], 0);
+    assert!(timers[first..].windows(2).all(|w| w[0] <= w[1]));
+    assert!(*timers.last().unwrap() >= 995, "{timers:?}");
+    assert_eq!(timers.len() - first, frames);
+    // Without the declaration the frames end at the 5 s hold, unfaded.
+    let (plain, _, plain_inputs) = pieces(
+        &dst(
+            "\"i\"",
+            0,
+            "draw = function() return ms.timer(2) ~= ms.timer_off_value end,",
+        ),
+        Script::full(),
+    );
+    assert!(plain.passes(), "{}", plain.text(0, true, true));
+    assert_eq!(plain.kinds.get("fadeout"), None);
+    assert!(fade_timers(&plain_inputs).iter().all(|&t| t == -1));
+    assert!(plain_inputs.len() < inputs.len());
+    // A failing practice script fades no frame. Its skin reads nothing in
+    // Lua, which the harness would stop on the page's outside frames.
+    let declaring = format!("{ENDING}{}", dst("\"i\"", 0, ""));
+    let (failing, _, failing_inputs) = pieces(&declaring, Script::closing());
+    assert!(failing.passes(), "{}", failing.text(0, true, true));
+    assert_eq!(failing.kinds.get("fadeout"), None);
+    assert!(fade_timers(&failing_inputs).iter().all(|&t| t == -1));
+}
+
+/// The longest declared ending, `finishmargin` and `fadeout` both at
+/// `i32::MAX` ms, which the player honours whole, is replayed only to 30 s
+/// past the last note: the hold's frames, not faded, as many as a 30 s
+/// ending gives, with the round's report saying its ending was cut; a
+/// declared ending that fits is not cut.
+#[test]
+fn the_longest_declared_ending_is_replayed_to_its_cap() {
+    let body = |decl: &str| format!("{decl}{}", dst("\"i\"", 0, ""));
+    let max = "skin.finishmargin = 2147483647\nskin.fadeout = 2147483647\n";
+    let (cut, _, inputs) = pieces(&body(max), Script::full());
+    assert!(cut.passes(), "{}", cut.text(0, true, true));
+    assert!(
+        cut.rounds[0].contains("ending replayed 30 s"),
+        "{:?}",
+        cut.rounds
+    );
+    assert_eq!(cut.kinds.get("fadeout"), None);
+    assert!(fade_timers(&inputs).iter().all(|&t| t == -1));
+    // A 25 s hold and a 5 s fade-out end exactly 30 s past the last note:
+    // the same frame times, the last 5 s faded, and nothing cut.
+    let fits = "skin.finishmargin = 20000\nskin.fadeout = 5000\n";
+    let (whole, _, whole_inputs) = pieces(&body(fits), Script::full());
+    assert!(whole.passes(), "{}", whole.text(0, true, true));
+    assert!(
+        !whole.rounds[0].contains("ending replayed"),
+        "{:?}",
+        whole.rounds
+    );
+    assert!(whole.kinds.get("fadeout").is_some_and(|k| k.0 > 0));
+    let times = |i: &[FrameInputs]| i.iter().map(FrameInputs::state_us).collect::<Vec<_>>();
+    let (cut_times, whole_times) = (times(&inputs), times(&whole_inputs));
+    // The fade-out's start adds one frame time of its own.
+    assert_eq!(cut_times.len() + 1, whole_times.len());
+    assert_eq!(cut_times.last(), whole_times.last());
+}
+
+/// A practice round never fades whatever the skin declares: no frame of
+/// the rounds script has timer 2 on or is labelled `fadeout`, and its
+/// frames are those of the same script with no declaration.
+#[test]
+fn a_practice_rounds_frames_never_fade() {
+    let body = dst("\"i\"", 0, "");
+    let (declaring, _, inputs) = pieces(&format!("{ENDING}{body}"), Script::rounds());
+    assert!(declaring.passes(), "{}", declaring.text(0, true, true));
+    assert_eq!(declaring.kinds.get("fadeout"), None);
+    assert!(fade_timers(&inputs).iter().all(|&t| t == -1));
+    let (_, _, plain) = pieces(&body, Script::rounds());
+    let times = |i: &[FrameInputs]| i.iter().map(FrameInputs::state_us).collect::<Vec<_>>();
+    assert_eq!(times(&inputs), times(&plain));
+}

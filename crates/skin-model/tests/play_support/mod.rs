@@ -397,6 +397,8 @@ pub struct Harness {
     pub playing: bool,
     /// Where the play entered Closing ([`SkinFrame::closing`]).
     pub closing: Option<TimeUs>,
+    /// Where the play's fade-out started ([`SkinFrame::fading`]).
+    pub fading: Option<TimeUs>,
     pub target: [u32; 2],
     pub layout: Layout,
     pub view: LaneView,
@@ -443,6 +445,7 @@ impl Harness {
             complete: false,
             playing: true,
             closing: None,
+            fading: None,
             target: [1_920, 1_080],
             layout: Layout::AUTHOR,
             view: VIEW,
@@ -513,6 +516,7 @@ impl Harness {
             lanes: self.view,
             playing: self.playing,
             closing: self.closing,
+            fading: self.fading,
             readouts: self.readouts.unwrap_or_else(|| readouts_for(self.view)),
         };
         self.skin

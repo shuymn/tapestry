@@ -728,6 +728,7 @@ pub fn skin_frame<'a>(f: &FrameInput<'a>) -> SkinFrame<'a> {
         complete: view.complete,
         playing: view.playing,
         closing: view.closing,
+        fading: view.fading,
         target: f.target,
         layout: &Layout::AUTHOR,
         turntable: f.turntable,

@@ -652,13 +652,13 @@ fn the_rhythm_timer_reads_in_lua() {
     assert_eq!(play.frame(10, &[]).len(), 1);
 }
 
-/// A draw callback reads timer 2, the fade-out, as off in every play
-/// frame (docs/stage3.md D14): READY (a 2 s lead-in), Playing, the audio
-/// tail and Closing. The image at x 0 is drawn while it is off, the one
-/// at 100 while it is on; the one at 200 while the play timer is on, so
-/// the frames reach the play.
+/// A draw callback reads timer 2, the fade-out, as off in READY (a 2 s
+/// lead-in), Playing, the audio tail's hold and Closing, and as on from a
+/// full play's published fade-out (docs/stage3.md D30). The image at x 0
+/// is drawn while it is off, the one at 100 while it is on; the one at
+/// 200 while the play timer is on, so the frames reach the play.
 #[test]
-fn a_draw_callback_reads_the_fade_out_timer_off() {
+fn a_draw_callback_reads_the_fade_out_timer() {
     use bms_model::TimeUs;
     use common::play::{MS, context};
     use skin_model::{Attempt, PlayContext};
@@ -703,6 +703,9 @@ fn a_draw_callback_reads_the_fade_out_timer_off() {
     p.playing = false;
     p.complete = true;
     assert_eq!(xs(&mut p, 3_000), [0, 200], "the tail");
+    p.fading = Some(TimeUs(3_100 * MS));
+    assert_eq!(xs(&mut p, 3_200), [100, 200], "the fade-out");
+    p.fading = None;
     p.complete = false;
     p.closing = Some(TimeUs(3_500 * MS));
     assert_eq!(xs(&mut p, 4_000), [0, 200], "Closing");

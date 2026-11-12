@@ -750,6 +750,46 @@ fn failed_comes_from_the_closing_start_not_a_fail_time() {
     assert_eq!(h.start_ms(timer::FAILED), Some(2_004));
 }
 
+/// `fadeout` starts at the play's published fade-out start (the frame's
+/// `fading`) and only there: off through the completed play's hold, and
+/// off in Closing, which never publishes one. `full_combo` keeps its
+/// start through the hold and the fade-out.
+#[test]
+fn fadeout_comes_from_the_published_fade_out_start() {
+    use Judgment::Perfect;
+    let chart = taps_chart();
+    let mut h = Harness::empty(&chart, &full(0));
+    h.frame(
+        3_000,
+        &[
+            ev(1_000, judged(1, 0, Perfect, Some(0), None, 1)),
+            ev(2_000, judged(1, 1, Perfect, Some(0), None, 2)),
+            ev(3_000, judged(1, 2, Perfect, Some(0), None, 3)),
+        ],
+    );
+    assert_eq!(h.start_ms(timer::FULL_COMBO), Some(3_000));
+    // The completed play's hold.
+    h.complete = true;
+    h.playing = false;
+    h.frame(8_000, &[]);
+    assert_eq!(h.start_ms(timer::FADEOUT), None);
+    assert_eq!(h.start_ms(timer::FULL_COMBO), Some(3_000));
+    // Its fade-out, started at 11 s.
+    h.fading = Some(TimeUs(11_000 * MS));
+    h.frame(11_500, &[]);
+    assert_eq!(h.start_ms(timer::FADEOUT), Some(11_000));
+    assert_eq!(h.elapsed(timer::FADEOUT), 500);
+    assert_eq!(h.start_ms(timer::FULL_COMBO), Some(3_000));
+
+    // Closing starts `failed` and never `fadeout`.
+    let mut h = Harness::empty(&chart, &full(0));
+    h.playing = false;
+    h.closing = Some(TimeUs(1_500 * MS));
+    h.frame(2_000, &[]);
+    assert_eq!(h.start_ms(timer::FAILED), Some(1_500));
+    assert_eq!(h.start_ms(timer::FADEOUT), None);
+}
+
 #[test]
 fn combo_up_follows_judgments_and_the_empty_poor_policy() {
     use Judgment::{Perfect, Poor};
