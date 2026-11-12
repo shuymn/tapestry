@@ -1024,6 +1024,13 @@ impl ChartImageWorker {
         c.cursor.is_some() && c.held_back()
     }
 
+    /// Whether a selection set is kept, current or not (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn selection_kept(&self) -> bool {
+        self.core().selection.is_some()
+    }
+
     /// The selection set, while current for the cursor generation (tests).
     #[cfg(test)]
     #[must_use]

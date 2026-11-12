@@ -284,6 +284,14 @@ mod tests {
         ] {
             assert_eq!(names[usize::from(slot)], name);
         }
+        // The image fields are the selected chart's, before the settings,
+        // which a view leaves as they are: the settings and the readouts
+        // moved by two.
+        assert_eq!(
+            (field::SELECTED_STAGEFILE, field::SELECTED_BANNER),
+            (27, 28)
+        );
+        assert_eq!((field::SETTINGS, field::APP_FPS), (29, 42));
         assert_eq!(
             SELECTION.timers[usize::from(timer::CHANGE)].name,
             "select.change"

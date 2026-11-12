@@ -421,6 +421,9 @@ fn leaving_selection_retires_its_publication_before_plays_job() {
     assert!(!c.w.retiring());
     assert_eq!(c.w.begun(), 2, "a cursor job began after the choice");
     assert!(c.w.current_selection().is_none());
+    // The read ignored its cancel and ended after the choice: its set is
+    // of an old cursor generation, never adopted.
+    assert!(!c.w.selection_kept(), "a stale read was adopted");
     assert!(c.written().is_empty(), "the cancelled read was published");
 }
 
