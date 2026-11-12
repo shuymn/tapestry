@@ -219,6 +219,7 @@ fn decision_labels_live_in_the_decision_region() {
         timers: DecisionTimers {
             screen: Some(TimeUs(0)),
             fadeout: None,
+            input: None,
         },
     };
     r.build_decision(&mut dec, labels, &frame).unwrap();

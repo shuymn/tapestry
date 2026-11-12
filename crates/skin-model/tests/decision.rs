@@ -120,6 +120,7 @@ impl DFx {
             timers: DecisionTimers {
                 screen: Some(TimeUs(0)),
                 fadeout: None,
+                input: None,
             },
         }
     }
@@ -462,6 +463,7 @@ fn decision_bitmap_text_follows_the_labels() {
             timers: DecisionTimers {
                 screen: Some(TimeUs(0)),
                 fadeout: None,
+                input: None,
             },
         };
         skin.build_decision(dec, &frame, uvs, &mut batch).unwrap();

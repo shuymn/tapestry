@@ -31,6 +31,31 @@ pub struct DecisionTimers {
     pub screen: Option<TimeUs>,
     /// The fade-out's start: the choice plus the declared scene time.
     pub fadeout: Option<TimeUs>,
+    /// The input declaration's end: the choice plus the declared input
+    /// time, on only strictly after it.
+    pub input: Option<TimeUs>,
+}
+
+impl DecisionTimers {
+    /// The timers at `now` of a screen chosen at `choice` with `timing`:
+    /// the screen's from the choice, the fade-out's from the choice plus
+    /// `scene` once `now` reaches it, and the input's from the choice plus
+    /// `input` once `now` passes it (the source switches it on past
+    /// `input`: off at that instant, on 1 µs later). Allocates nothing.
+    #[must_use]
+    pub const fn at(choice: TimeUs, timing: &DecisionTiming, now: TimeUs) -> Self {
+        let fadeout = TimeUs(choice.0.saturating_add(timing.scene.0));
+        let input = TimeUs(choice.0.saturating_add(timing.input.0));
+        Self {
+            screen: Some(choice),
+            fadeout: if now.0 >= fadeout.0 {
+                Some(fadeout)
+            } else {
+                None
+            },
+            input: if now.0 > input.0 { Some(input) } else { None },
+        }
+    }
 }
 
 /// The longest scene, and the longest fade-out, a decision skin's
@@ -43,8 +68,8 @@ pub const MAX_DECISION_PHASE: TimeUs = TimeUs(10_000_000);
 /// source's `scene`, `fadeout` and `input`
 /// (`skin/json/JsonSkin.java:14-16`), each 0 when not declared. The
 /// fade-out starts at `scene` from the choice and the screen ends at
-/// `scene + fadeout`; `input` is kept and changes nothing (design.md
-/// "Play Lifecycle", the decision screen).
+/// `scene + fadeout`; `input` starts the input timer and changes nothing
+/// else (design.md "Play Lifecycle", the decision screen).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DecisionTiming {
     /// From the choice to the fade-out's start.
@@ -183,7 +208,11 @@ impl DecisionScreen {
         timers: &DecisionTimers,
         whens: &[crate::expr::Program],
     ) {
-        for (start, at) in self.starts.iter_mut().zip([timers.screen, timers.fadeout]) {
+        for (start, at) in self
+            .starts
+            .iter_mut()
+            .zip([timers.screen, timers.fadeout, timers.input])
+        {
             *start = at;
         }
         crate::play::timers::read_screen_timers(
