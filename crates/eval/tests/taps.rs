@@ -649,3 +649,84 @@ fn rank_scaled_window_edges_are_inclusive() {
     assert_eq!(judgments(&events), expected);
     assert_eq!(empty_poors(&events), 2);
 }
+
+/// The tapestry preset's assignment, nearest unjudged note inside BAD and
+/// the earlier at a tie, is the source's Duration algorithm, which the
+/// select screen's judge-algorithm index shows for it: a later note
+/// replaces the candidate only when strictly nearer the press and
+/// unjudged (`play/JudgeAlgorithm.java:24-26` at `0.8.9`), and a note
+/// outside the window is never one (`play/JudgeManager.java:385-392`).
+/// Written from that rule, not ported; the combo-priority run is the
+/// contrast where the two algorithms part.
+#[test]
+fn the_nearest_note_assignment_is_the_duration_algorithm() {
+    let pair = |gap: i64, press_at: i64| {
+        let chart = ChartBuilder::new(BPM)
+            .tap(lane(3), TimeUs(1_000 * MS))
+            .tap(lane(3), TimeUs((1_000 + gap) * MS))
+            .build()
+            .unwrap();
+        let inputs = [
+            press(press_at * MS, 0, 3),
+            release((press_at + 5) * MS, 0, 3),
+        ];
+        (chart, inputs)
+    };
+    let dev = device(&[0]);
+    // Notes at 0 and 100 ms, a press at 60: the later note is nearer
+    // (−40 ms against +60 ms) and takes it.
+    let (chart, inputs) = pair(100, 1_060);
+    let (events, _) = run(&chart, &dev, &InputStart::default(), &inputs, 3_000 * MS);
+    assert_eq!(
+        judgments(&events),
+        [(3, 0, Poor, None), (3, 1, Great, Some(-40 * MS))]
+    );
+    // Combo priority keeps the first note, still inside its GOOD window.
+    let mut combo = rules::tapestry();
+    combo.assignment = rules::Assignment::ComboPriority;
+    let (events, _) = run_with(
+        &chart,
+        &combo,
+        &dev,
+        &InputStart::default(),
+        &inputs,
+        3_000 * MS,
+    );
+    assert_eq!(
+        judgments(&events),
+        [(3, 0, Good, Some(60 * MS)), (3, 1, Poor, None)]
+    );
+    // Notes at 0 and 200 ms, a press at 100: equal distance, the earlier.
+    let (chart, inputs) = pair(200, 1_100);
+    let (events, _) = run(&chart, &dev, &InputStart::default(), &inputs, 3_000 * MS);
+    assert_eq!(
+        judgments(&events),
+        [(3, 0, Good, Some(100 * MS)), (3, 1, Poor, None)]
+    );
+    // The 0 ms note already judged, a press at 40: the judged note is no
+    // candidate, so the 200 ms note, 160 ms ahead, takes it.
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(3), TimeUs(1_000 * MS))
+        .tap(lane(3), TimeUs(1_200 * MS))
+        .build()
+        .unwrap();
+    let inputs = [
+        press(1_000 * MS, 0, 3),
+        release(1_005 * MS, 0, 3),
+        press(1_040 * MS, 0, 3),
+        release(1_045 * MS, 0, 3),
+    ];
+    let (events, _) = run(&chart, &dev, &InputStart::default(), &inputs, 3_000 * MS);
+    assert_eq!(
+        judgments(&events),
+        [(3, 0, Perfect, Some(0)), (3, 1, Bad, Some(-160 * MS))]
+    );
+    // A press 300 ms after the only note, past its BAD window: no note.
+    let chart = ChartBuilder::new(BPM)
+        .tap(lane(3), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    let inputs = [press(1_300 * MS, 0, 3), release(1_305 * MS, 0, 3)];
+    let (events, _) = run(&chart, &dev, &InputStart::default(), &inputs, 3_000 * MS);
+    assert_eq!(judgments(&events), [(3, 0, Poor, None)]);
+}
