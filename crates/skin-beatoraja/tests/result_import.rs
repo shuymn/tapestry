@@ -1153,3 +1153,112 @@ fn a_refusal_carries_the_facts_read_before_it() {
         }]
     );
 }
+
+/// RT1's Lua half: options 190, 191 and 195 read the attempt's resolved
+/// availability with no guard, and a negative id, a literal `not` and a
+/// JSON `op` read the same value, on a ready view and an unavailable one
+/// alike (the chart's facts hold under every status). A Lua skin reading
+/// 191 while it loads records a chart-only fact, which holds only for the
+/// same availability.
+#[test]
+fn the_image_options_read_the_attempts_availability_in_lua() {
+    let ex = value("ex", r#""ref": 71"#);
+    let at = |id: &str, y: i32, op: &str| {
+        format!(r#"{{"id": "{id}", "op": [{op}], "dst": [{{"x": 0, "y": {y}, "w": 8, "h": 8}}]}}"#)
+    };
+    let dsts = [
+        dst("ex", ""),
+        at("dot", 700, "90"),
+        at("dot", 300, "191"),
+        at("lab", 400, "-191"),
+        at("bar", 500, "190"),
+        at("b5", 600, "195"),
+    ]
+    .join(",");
+    let j = folder(&format!(r#""value": [{ex}], "destination": [{dsts}]"#));
+    let json = import_result(j.path()).unwrap_or_else(|e| panic!("{e:?}"));
+    let draw = |id: &str, y: i32, cond: &str| {
+        lua_dst(id, y, 8, &format!("draw = function() return {cond} end,"))
+    };
+    let lua_dsts = [
+        lua_dst("ex", 100, 4, ""),
+        lua_dst("dot", 700, 8, "op = { 90 },"),
+        draw("dot", 300, "ms.option(191)"),
+        draw("lab", 400, "not ms.option(191)"),
+        draw("bar", 500, "ms.option(-191)"),
+        draw("b5", 600, "ms.option(195)"),
+    ]
+    .join(", ");
+    let l = sheet();
+    common::write(
+        l.path(),
+        "s.luaskin",
+        lua_skin("", &lua_value("ex", 4, "ref = 71"), "", &lua_dsts).as_bytes(),
+    );
+    let lua = lua_result(l.path(), &ImportFacts::unavailable(ScreenKind::Result))
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    let with = |mut v: ResultView, stage: bool, back: bool| {
+        v.chart.images = skin_model::ImageFacts { stage, back };
+        v
+    };
+    for skin in [json.skin, lua.imported.skin] {
+        let mut r = Res::new(skin);
+        let mut shown = |v: &ResultView| {
+            r.view(v);
+            [300.0, 400.0, 500.0, 600.0].map(|y| !r.at(0, top(y, 8.0)).is_empty())
+        };
+        let cleared = ready(1_000, true, best(ResultNumber::Shown(-3)));
+        assert_eq!(
+            shown(&with(cleared.clone(), true, false)),
+            [true, false, false, false]
+        );
+        assert_eq!(
+            shown(&with(cleared, false, true)),
+            [false, true, true, true]
+        );
+        // The chart's facts hold whatever the view's status.
+        assert_eq!(
+            shown(&with(unavailable(), true, true)),
+            [true, false, false, true]
+        );
+    }
+    // Read while loading: a chart-only fact, held only by the same
+    // availability.
+    let d = sheet();
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin(
+            "local y = 300\nif ms.option(191) then y = 400 end\n",
+            &lua_value("ex", 4, "ref = 71"),
+            "",
+            &format!(
+                "{}, {}, {}",
+                lua_dst("ex", 100, 4, ""),
+                lua_dst("dot", 700, 8, "op = { 90 },"),
+                "{ id = \"dot\", dst = { { x = 0, y = y, w = 8, h = 8 } } }"
+            ),
+        )
+        .as_bytes(),
+    );
+    let with_stage = with(
+        ready(1_000, true, best(ResultNumber::Shown(-3))),
+        true,
+        false,
+    );
+    let without = with(
+        ready(1_000, true, best(ResultNumber::Shown(-3))),
+        false,
+        false,
+    );
+    let i = lua_result(d.path(), &facts(Some(&with_stage))).unwrap();
+    assert_eq!(
+        i.facts.reads,
+        [FactRead {
+            fact: FactId::ResultOption(191),
+            value: FactValue::Int(1),
+        }]
+    );
+    assert!(i.facts.holds(&facts(Some(&with_stage))));
+    assert!(!i.facts.holds(&facts(Some(&without))));
+}
