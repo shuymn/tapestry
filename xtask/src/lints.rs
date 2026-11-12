@@ -510,8 +510,16 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::chart_key",
             "MenuScreen::build_selection_frame",
             "MenuScreen::build_page_frame",
+            "MenuScreen::build_decision",
             "strip_sprites",
         ],
+    ),
+    // A skinned decision frame: its timers from the choice and its build
+    // from the pinned slot's labels; the label preparation's boundary
+    // work in the same file runs beside the frames.
+    Site::Fns(
+        "crates/player/src/decision_side.rs",
+        &["decision_frame_of", "decision_build"],
     ),
     // The selection frame's timers, the strip's preset line, the
     // lifetime check before the frame's build and the live settings.

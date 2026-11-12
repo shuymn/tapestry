@@ -1057,6 +1057,65 @@ impl Screen for MenuScreen {
         Ok(timing)
     }
 
+    fn decision_rows(&self) -> Option<Result<render::RowPlan, RenderError>> {
+        self.renderer.decision_rows()
+    }
+
+    fn write_decision_labels(&mut self, store: &mut render::LabelStore) -> render::FillStep {
+        self.renderer.write_decision_labels(store)
+    }
+
+    fn settle_decision_labels(
+        &mut self,
+        store: &mut render::LabelStore,
+    ) -> Result<render::Settled, RenderError> {
+        self.renderer.settle_decision_labels(store)
+    }
+
+    fn restore_decision_labels(
+        &mut self,
+        store: &mut render::LabelStore,
+        slot: usize,
+        staged: render::StagedLabels,
+    ) -> Result<(), RenderError> {
+        self.renderer.restore_decision_labels(store, slot, staged)
+    }
+
+    fn watch_completion(&self) -> Arc<AtomicBool> {
+        self.renderer.watch_completion()
+    }
+
+    fn device_lost(&self) -> bool {
+        self.renderer.device_lost()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn build_decision(
+        &mut self,
+        dec: &mut skin_model::DecisionScreen,
+        labels: skin_model::DecisionLabels<'_>,
+        frame: &skin_model::DecisionFrame<'_>,
+    ) -> Result<(), BuildError> {
+        #[cfg(all(test, feature = "dev-tools"))]
+        self.probe_alloc();
+        self.renderer.build_decision(dec, labels, frame)
+    }
+
+    fn submit_decision(&mut self) -> Result<FrameTiming, RenderError> {
+        let timing = self.renderer.submit_decision(&[])?;
+        self.shown(timing.presented);
+        Ok(timing)
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn decision_fault(&mut self, settle: bool) {
+        if settle {
+            self.renderer.fail_next_decision_settle();
+        } else {
+            self.renderer.refuse_next_decision();
+        }
+    }
+
     #[cfg(feature = "dev-tools")]
     fn atlas_uploads(&self) -> u64 {
         self.renderer.atlas_uploads()

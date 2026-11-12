@@ -372,6 +372,90 @@ pub trait Screen: Send {
     fn submit_result(&mut self) -> Result<FrameTiming, RenderError> {
         self.draw()
     }
+    /// The committed decision installation's label rows at the target
+    /// ([`render::Renderer::decision_rows`]); `None` without one, the
+    /// default.
+    fn decision_rows(&self) -> Option<Result<render::RowPlan, RenderError>> {
+        None
+    }
+    /// One frame boundary's writes of `store`'s filling slot
+    /// ([`render::Renderer::write_decision_labels`]). Nothing by default.
+    fn write_decision_labels(&mut self, store: &mut render::LabelStore) -> render::FillStep {
+        let _ = store;
+        render::FillStep::Idle
+    }
+    /// Settles `store` at a frame boundary
+    /// ([`render::Renderer::settle_decision_labels`]). Nothing by default.
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's: the device's failure, or a refusal of the kind.
+    fn settle_decision_labels(
+        &mut self,
+        store: &mut render::LabelStore,
+    ) -> Result<render::Settled, RenderError> {
+        let _ = store;
+        Ok(render::Settled::Pending)
+    }
+    /// Rebuilds pinned slot `slot`'s content from `staged` on a screen
+    /// built again ([`render::Renderer::restore_decision_labels`]). The
+    /// default has no label region and refuses.
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's: the device's failure, or a refusal of the kind.
+    fn restore_decision_labels(
+        &mut self,
+        store: &mut render::LabelStore,
+        slot: usize,
+        staged: render::StagedLabels,
+    ) -> Result<(), RenderError> {
+        let _ = (store, slot, staged);
+        Err(RenderError::LabelRegion { needed: 0, band: 0 })
+    }
+    /// A flag set once the work submitted so far completed
+    /// ([`render::Renderer::watch_completion`]); set already by default,
+    /// which submits nothing.
+    fn watch_completion(&self) -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(true))
+    }
+    /// Whether the device was lost ([`render::Renderer::device_lost`]);
+    /// never by default.
+    fn device_lost(&self) -> bool {
+        false
+    }
+    /// Builds a decision frame of the committed decision installation:
+    /// `dec` at `frame`, its lines borrowed from `labels`, with no call
+    /// into wgpu. Allocates nothing. The default refuses.
+    ///
+    /// # Errors
+    ///
+    /// The skin's refusal of the frame: nothing of it is staged.
+    fn build_decision(
+        &mut self,
+        dec: &mut skin_model::DecisionScreen,
+        labels: skin_model::DecisionLabels<'_>,
+        frame: &skin_model::DecisionFrame<'_>,
+    ) -> Result<(), BuildError> {
+        let _ = (dec, labels, frame);
+        Err(BuildError::Kind)
+    }
+    /// Draws the decision frame [`build_decision`](Self::build_decision)
+    /// built, as [`draw`](Self::draw).
+    ///
+    /// # Errors
+    ///
+    /// As [`draw`](Self::draw).
+    fn submit_decision(&mut self) -> Result<FrameTiming, RenderError> {
+        self.draw()
+    }
+    /// Refuses the next decision frame, or fails the next settling of the
+    /// decision labels as a poll fails with `settle` (dev-tools tests).
+    /// Nothing by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn decision_fault(&mut self, settle: bool) {
+        let _ = settle;
+    }
 
     /// The result frame last built, its quads (dev-tools tests); none by
     /// default.
@@ -895,9 +979,14 @@ pub enum RenderMsg {
     },
     /// Draw the select screen's page instead of a play.
     Menu(Box<MenuPage>),
-    /// Draw the decision screen's built-in presentation: a page kept
-    /// through its chart's load and the screen's preparations.
-    Decision(Box<MenuPage>),
+    /// Draw the decision screen: its built-in presentation `page`, or
+    /// with `shown` pinning a label slot the decision skin, the page
+    /// drawn when the skin cannot draw; kept through its chart's load and
+    /// the screen's preparations.
+    Decision {
+        page: Box<MenuPage>,
+        shown: Option<crate::decision_side::ShownDecision>,
+    },
     /// Draw the practice page: a [`Menu`](Self::Menu) that is its play
     /// state's presentation, so the play state's turntable is adopted,
     /// resumed when the game resumed it, and ticked on its frames.
@@ -1057,6 +1146,17 @@ impl FrameSink for NoFrames {
     fn frame(&mut self, _screen: &dyn Screen, _drawn: &Drawn<'_>) {}
 }
 
+/// What wakes the game thread for a decision takeover
+/// ([`RenderLink::set_game_wake`]).
+#[derive(Default)]
+struct GameWake(Mutex<Option<Arc<dyn Fn() + Send + Sync>>>);
+
+impl std::fmt::Debug for GameWake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GameWake")
+    }
+}
+
 #[derive(Debug)]
 struct Shared {
     failed: AtomicBool,
@@ -1158,6 +1258,20 @@ struct Shared {
     /// Why the selection skin was refused at runtime, until the game
     /// thread takes it for its notice ([`RenderLink::take_selection_refusal`]).
     selection_refused: Mutex<Option<String>>,
+    /// The decision labels' slot states: the render thread prepares them,
+    /// the game thread pins one at the choice.
+    labels: Arc<Mutex<render::LabelBook>>,
+    /// The active decision lifetime's takeover, until the game thread
+    /// takes it ([`RenderLink::take_decision_takeover`]).
+    decision_takeover: Mutex<Option<game::DecisionTakeover>>,
+    /// Why the decision skin was refused for the run, until the game
+    /// thread takes it for its notice ([`RenderLink::take_decision_refusal`]).
+    decision_refused: Mutex<Option<String>>,
+    /// What wakes the game thread for a takeover.
+    game_wake: GameWake,
+    /// The takeovers produced, each counted at its wake (tests).
+    #[cfg(test)]
+    takeovers_woken: AtomicU64,
     /// How long the launch screen has shown, in place of the clock's
     /// reading, while set (tests: [`RenderLink::set_launch_elapsed`]).
     #[cfg(test)]
@@ -1228,6 +1342,12 @@ impl Shared {
             packing: Mutex::new(None),
             selection: Mutex::new(SelectionSlot::default()),
             selection_refused: Mutex::new(None),
+            labels: render::LabelBook::shared([1_920, 1_080]),
+            decision_takeover: Mutex::new(None),
+            decision_refused: Mutex::new(None),
+            game_wake: GameWake::default(),
+            #[cfg(test)]
+            takeovers_woken: AtomicU64::new(0),
             #[cfg(test)]
             launch_elapsed: Mutex::new(None),
             result: Mutex::new(ResultSlot::default()),
@@ -2649,13 +2769,60 @@ impl RenderLink {
         move || reveal(&shared, clock, &tx)
     }
 
-    /// The decision screen's built-in presentation, `page`, drawn until
-    /// the next screen: kept through the chart's load and the screen's
-    /// recovery, and not a loading lifetime.
-    pub fn show_decision(&self, page: MenuPage) {
+    /// The decision screen drawn until the next screen: its built-in
+    /// presentation `page`, or the decision skin from the label slot
+    /// `shown` pinned, `page` drawn when the skin cannot draw; kept
+    /// through the chart's load and the screen's recovery, and not a
+    /// loading lifetime.
+    pub fn show_decision(
+        &self,
+        page: MenuPage,
+        shown: Option<crate::decision_side::ShownDecision>,
+    ) {
         #[cfg(test)]
         self.shared.decisions_sent.fetch_add(1, Ordering::SeqCst);
-        self.send(RenderMsg::Decision(Box::new(page)));
+        self.send(RenderMsg::Decision {
+            page: Box::new(page),
+            shown,
+        });
+    }
+
+    /// The decision labels' slot states, shared with the game thread,
+    /// which pins one at the choice (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn label_book(&self) -> Arc<Mutex<render::LabelBook>> {
+        Arc::clone(&self.shared.labels)
+    }
+
+    /// The decision skin of the active lifetime could not draw: its
+    /// takeover, once ([`game::Decision::apply_takeover`]).
+    pub fn take_decision_takeover(&self) -> Option<game::DecisionTakeover> {
+        self.shared
+            .decision_takeover
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// Why the decision skin was refused for the run, once: the select
+    /// screen's notice says it from the next update.
+    pub fn take_decision_refusal(&self) -> Option<String> {
+        self.shared
+            .decision_refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// What wakes the game thread when the decision skin's takeover is
+    /// produced ([`crate::controls::Controls::wake_game`]).
+    pub fn set_game_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .shared
+            .game_wake
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(wake);
     }
 
     /// How many decision presentations were sent, readable from another
@@ -3197,6 +3364,7 @@ pub fn spawn(
                 section.as_ref(),
                 false,
                 &mut None,
+                &mut None,
             ) {
                 Ok(screen) => {
                     thread_shared.built(screen.as_ref());
@@ -3242,6 +3410,12 @@ pub fn spawn(
                 app: crate::app_clock::AppClock::new(),
                 page_turns: false,
                 decision: None,
+                decision_shown: None,
+                decision_screen: None,
+                decision_side: None,
+                decision_want: None,
+                decision_disabled: None,
+                decision_next: 1,
                 tuning: None,
                 current: None,
                 #[cfg(feature = "dev-tools")]
@@ -3461,11 +3635,20 @@ impl Run {
     /// the latest mode left nothing drawn: built again, it draws that page
     /// again, the presentation of the state the render thread is in. A
     /// later mode message has dropped the page by then, so no decision
-    /// frame is drawn after the render thread took one.
+    /// frame is drawn after the render thread took one. The skinned
+    /// decision screen is kept the same way, and drawn again on a screen
+    /// built again while its slot is pinned.
     fn after_preparing(&self, mode: Mode) -> Mode {
+        let skinned = self.decision.is_some()
+            && self
+                .decision_shown
+                .as_ref()
+                .is_some_and(|s| s.slot.is_some());
         match mode {
+            Mode::Decision if skinned => Mode::Decision,
             decision @ Mode::Menu { loading: None, .. } if self.decision.is_some() => decision,
-            Mode::Idle if self.screen.is_some() => match &self.decision {
+            Mode::Idle if self.screen.is_some() && skinned => Mode::Decision,
+            Mode::Idle | Mode::Decision if self.screen.is_some() => match &self.decision {
                 Some(page) => Mode::Menu {
                     page: page.clone(),
                     update: None,
@@ -3757,6 +3940,7 @@ fn build(
     section: Option<&Section>,
     disabled: bool,
     result_refused: &mut Option<String>,
+    decision_refused: &mut Option<String>,
 ) -> Result<Box<dyn Screen>, RenderError> {
     let mut s = make()?;
     if disabled {
@@ -3818,6 +4002,12 @@ fn build(
                         Chain(&e)
                     ));
                 }
+                if kind == ScreenKind::Decision {
+                    *decision_refused = Some(format!(
+                        "the decision skin was not restored on the screen built again: {}",
+                        Chain(&e)
+                    ));
+                }
             }
             Err(e) => return Err(e),
         }
@@ -3862,6 +4052,10 @@ enum Mode {
         changed: bool,
         loading: Option<u64>,
     },
+    /// The decision skin of the screen shown ([`Run::decision_shown`]),
+    /// its labels borrowed from their pinned slot; its page
+    /// ([`Run::decision`]) draws when the skin cannot.
+    Decision,
     /// The select screen from its newest update: [`Run::selection`].
     Selection,
     /// The result screen from its presentations: [`Run::result`].
@@ -4020,6 +4214,24 @@ struct Run {
     /// message drops it. A chart's load or a preparation keeps its page,
     /// and a screen built again draws it again ([`Run::after_preparing`]).
     decision: Option<Box<MenuPage>>,
+    /// The decision screen shown with it, while it is the latest mode:
+    /// its lifetime, choice, timing and pinned slot, `None` for the slot
+    /// once the built-in presentation took over.
+    decision_shown: Option<crate::decision_side::ShownDecision>,
+    /// The decision skin's state for the screen shown, made at its
+    /// message.
+    decision_screen: Option<skin_model::DecisionScreen>,
+    /// The committed decision installation's label preparation.
+    decision_side: Option<crate::decision_side::DecisionSide>,
+    /// The chart the selection cursor rests on, its labels asked of the
+    /// preparation; kept after selection is left.
+    decision_want: Option<crate::decision_side::Want>,
+    /// Why the decision kind is disabled for the run: no request is posted
+    /// and no slot is pinned from then on.
+    decision_disabled: Option<String>,
+    /// The next decision label preparation's generation, unique for the
+    /// run.
+    decision_next: render::Gen,
     /// The settings keys' values ([`RenderMsg::Tuning`]).
     tuning: Option<Arc<LiveTuning>>,
     /// The committed attempt's tempo and presentation epoch, which its
@@ -4115,6 +4327,7 @@ impl Run {
                 });
             }
         }
+        self.want_decision_labels();
     }
 
     /// The selection skin's state for `shown`'s lifetime on the committed
@@ -4148,7 +4361,7 @@ impl Run {
         loop {
             self.sync_chart();
             let idle = matches!(mode, Mode::Idle) || self.screen.is_none();
-            let msg = if idle && self.attempt.is_some() {
+            let msg = if idle && (self.attempt.is_some() || self.decision_busy()) {
                 // A preparation not yet answered is asked again between
                 // messages.
                 rx.recv_timeout(CANCEL_POLL).map_err(|e| match e {
@@ -4275,34 +4488,46 @@ impl Run {
                     // A generic page (a preparation's wait, a notice) is
                     // no play state's presentation: no turntable.
                     self.page_turns = false;
-                    self.decision = None;
+                    self.clear_decision();
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);
                 }
-                Ok(RenderMsg::Decision(page)) => {
+                Ok(RenderMsg::Decision { page, shown }) => {
                     // The decision screen is no play state's presentation:
                     // the turntable is not adopted or ticked (design.md
                     // :732).
                     self.page_turns = false;
                     self.decision = Some(page.clone());
-                    mode = Self::menu_mode(mode, page, &self.shared, self.started);
+                    // The presentation chosen at the choice is not checked
+                    // again here: a later invalidation is a recovery or a
+                    // takeover, never a retrospective revision.
+                    self.decision_shown = shown;
+                    self.decision_screen = None;
+                    if shown.is_some_and(|s| s.slot.is_some()) {
+                        self.enter_skinned_decision();
+                    }
+                    mode = if self.decision_skinned() {
+                        Mode::Decision
+                    } else {
+                        Self::menu_mode(mode, page, &self.shared, self.started)
+                    };
                 }
                 Ok(RenderMsg::PracticePage(page)) => {
                     // The practice page begins or resumes its play
                     // state's presentation.
                     self.page_turns = true;
-                    self.decision = None;
+                    self.clear_decision();
                     self.turntable.practice_page();
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);
                 }
                 Ok(RenderMsg::ResultChanged) => {
                     self.take_result();
                     if self.result.is_some() {
-                        self.decision = None;
+                        self.clear_decision();
                         mode = Mode::Result;
                     }
                 }
                 Ok(RenderMsg::SelectionChanged) => {
-                    self.decision = None;
+                    self.clear_decision();
                     self.take_selection();
                     mode = match mode {
                         // The launch screen shows out its time, the
@@ -4317,7 +4542,7 @@ impl Run {
                     };
                 }
                 Ok(RenderMsg::Loading(lifetime)) => {
-                    self.decision = None;
+                    self.clear_decision();
                     self.turntable.begin_presentation();
                     // Lines the slot no longer holds (taken, or their
                     // lifetime ended) change nothing, and neither do the
@@ -4612,6 +4837,16 @@ impl Run {
                 screen.resize(size.0, size.1);
                 self.applied = Some(size);
             }
+            // The decision labels' work at this frame boundary, outside
+            // every frame, after the newest size: a device or poll failure
+            // drops the screen, which the game builds again.
+            if self.decision_boundary() {
+                mode = Mode::Idle;
+                continue;
+            }
+            let Some(screen) = &mut self.screen else {
+                continue;
+            };
             // Minimized, nothing is presented, so the swap chain's waitable
             // object would not be signaled: frames are paced by the clock
             // instead, and a frame granted before stays granted.
@@ -4727,6 +4962,8 @@ impl Run {
             // before any cleanup (dev-tools: matched against the capture).
             #[cfg(feature = "dev-tools")]
             let mut presented_at: Option<TimeUs> = None;
+            // A skinned decision frame the skin refused, for its takeover.
+            let mut decision_refused = None;
             let drawn = match &mut mode {
                 Mode::Idle => continue,
                 Mode::Splash { pending } => {
@@ -5143,8 +5380,56 @@ impl Run {
                         }
                     }
                 }
+                Mode::Decision => {
+                    let (Some(shown), Some(dec)) =
+                        (self.decision_shown.as_ref(), self.decision_screen.as_mut())
+                    else {
+                        mode = Mode::Idle;
+                        continue;
+                    };
+                    let built = crate::decision_side::decision_build(
+                        screen.as_mut(),
+                        dec,
+                        self.decision_side
+                            .as_ref()
+                            .map(crate::decision_side::DecisionSide::store),
+                        shown,
+                        frame_at,
+                    );
+                    match built {
+                        crate::decision_side::DecisionDrawn::Built => {
+                            screen.submit_decision().map(|t| (t, None))
+                        }
+                        other => {
+                            // Refused on a healthy device: the page draws in
+                            // this frame, and the built-in presentation takes
+                            // over from now on.
+                            if let crate::decision_side::DecisionDrawn::Refused(e) = other {
+                                decision_refused = Some(e);
+                            }
+                            let Some(page) = &self.decision else {
+                                mode = Mode::Idle;
+                                continue;
+                            };
+                            screen.menu(page, true).map(|t| (t, None))
+                        }
+                    }
+                }
                 Mode::End => screen.end(&self.end_page.1).map(|p| (timing_of(p), None)),
             };
+            // The skin refused its decision frame, which drew the page: the
+            // built-in presentation takes over for the rest of the screen.
+            if let Some(e) = decision_refused {
+                self.decision_frame_refused(e, frame_at);
+                if matches!(mode, Mode::Decision) {
+                    mode = Mode::Menu {
+                        page: self.decision.clone().unwrap_or_default(),
+                        update: None,
+                        changed: false,
+                        loading: None,
+                    };
+                }
+            }
             // Any other frame's present: right after its draw returned.
             #[cfg(feature = "dev-tools")]
             let presented_at = presented_at.unwrap_or_else(|| self.clock.now());
@@ -5209,7 +5494,10 @@ impl Run {
                         #[cfg(feature = "dev-tools")]
                         generation: self.measure.generation(),
                         #[cfg(feature = "dev-tools")]
-                        menu: matches!(mode, Mode::Menu { .. } | Mode::Selection | Mode::Result),
+                        menu: matches!(
+                            mode,
+                            Mode::Menu { .. } | Mode::Decision | Mode::Selection | Mode::Result
+                        ),
                         #[cfg(feature = "dev-tools")]
                         loading: matches!(
                             mode,
@@ -5377,7 +5665,7 @@ impl Run {
             // The committed bundle, from memory: never read again from its
             // files, never another skin in its place.
             let disabled = self.result_disabled.is_some();
-            let mut refused = None;
+            let (mut refused, mut decision_refused) = (None, None);
             let built = build(
                 &mut self.make,
                 &mut self.committed,
@@ -5385,6 +5673,7 @@ impl Run {
                 None,
                 disabled,
                 &mut refused,
+                &mut decision_refused,
             );
             // A restore refused stands for the run, whatever the build.
             if let Some(why) = refused {
@@ -5396,6 +5685,7 @@ impl Run {
             self.result_rebuilt();
             // The new screen takes the window's size afresh.
             self.applied = None;
+            self.decision_rebuilt(decision_refused)?;
         }
         self.shared.failed.store(false, Ordering::Release);
         Ok(())
@@ -5957,6 +6247,9 @@ impl Run {
                 if kind == ScreenKind::Result {
                     let _ = screen.drain_retired();
                 }
+                if kind == ScreenKind::Decision {
+                    self.ensure_decision();
+                }
                 Ok(Preparation::Ready)
             }
             Ok(refused) => {
@@ -6043,6 +6336,9 @@ impl Run {
         screen.remove(kind);
         self.committed.clear(kind);
         self.scripts.retire_kind(kind);
+        if kind == ScreenKind::Decision {
+            self.decision_side = None;
+        }
         commits.committed = commits.committed.max(request);
         Ok(Preparation::Ready)
     }
@@ -6079,7 +6375,7 @@ impl Run {
     fn prepare(&mut self) -> Result<(), RenderError> {
         let chart = self.chart.as_deref();
         let section = self.section.as_ref();
-        let mut refused = None;
+        let (mut refused, mut decision_refused) = (None, None);
         let ready = match (&mut self.screen, chart) {
             (Some(s), Some(chart)) => s.load(chart, section),
             (Some(_), None) => Ok(()),
@@ -6091,17 +6387,19 @@ impl Run {
                     section,
                     self.result_disabled.is_some(),
                     &mut refused,
+                    &mut decision_refused,
                 );
                 // A restore refused stands for the run, whatever the build.
                 if let Some(why) = refused.take() {
                     self.disable_result(&why);
                 }
-                built.map(|s| {
+                built.and_then(|s| {
                     self.built(s.as_ref());
                     self.screen = Some(s);
                     // The new screen takes the window's size afresh.
                     self.applied = None;
                     self.result_rebuilt();
+                    self.decision_rebuilt(decision_refused.take())
                 })
             }
         };
@@ -6112,6 +6410,280 @@ impl Run {
             self.granted = false;
         }
         ready
+    }
+}
+
+/// The decision screen on the render thread (design.md "Play Lifecycle",
+/// the decision screen): its labels prepared at frame boundaries for the
+/// chart under the cursor, its skin drawn from the slot the choice pinned,
+/// the built-in presentation taking over when the skin cannot draw for the
+/// active lifetime, and the kind disabled for the run on a refusal.
+impl Run {
+    /// Whether the decision screen shown draws its skin.
+    fn decision_skinned(&self) -> bool {
+        self.decision.is_some()
+            && self
+                .decision_shown
+                .as_ref()
+                .is_some_and(|s| s.slot.is_some())
+    }
+
+    /// A later mode drops the decision screen: its page, what it shows
+    /// and its skin's state. Its slot is retired once the game ends its
+    /// lifetime.
+    fn clear_decision(&mut self) {
+        self.decision = None;
+        self.decision_shown = None;
+        self.decision_screen = None;
+    }
+
+    /// The skinned decision screen begins: the skin's state made afresh;
+    /// without the decision installation (refused since), the built-in
+    /// presentation takes over at once.
+    fn enter_skinned_decision(&mut self) {
+        match &self.decision_side {
+            Some(side) if !side.retiring => {
+                self.decision_screen = Some(side.bundle().skin().prepare_decision());
+            }
+            _ => {
+                let now = self.clock.now();
+                self.take_over(now, "the decision skin is not installed".to_owned());
+            }
+        }
+    }
+
+    /// Whether the decision labels have work for a later boundary.
+    fn decision_busy(&self) -> bool {
+        let target = self.screen.as_ref().map_or([0, 0], |s| s.target());
+        self.decision_side
+            .as_ref()
+            .is_some_and(|side| side.busy(target, self.decision_want.as_ref()))
+    }
+
+    /// The decision labels' work at a frame boundary
+    /// ([`crate::decision_side::DecisionSide::boundary`]): a refusal disables the kind, a
+    /// device or poll failure drops the screen. Whether the screen was
+    /// dropped.
+    fn decision_boundary(&mut self) -> bool {
+        let (Some(screen), Some(side)) = (self.screen.as_deref_mut(), self.decision_side.as_mut())
+        else {
+            return false;
+        };
+        let book = Arc::clone(&self.shared.labels);
+        match side.boundary(screen, self.decision_want.as_ref()) {
+            crate::decision_side::Boundary::Quiet => {}
+            crate::decision_side::Boundary::Refused(e) => {
+                self.disable_decision(format!("{}", Chain(&e)));
+            }
+            crate::decision_side::Boundary::Failed(e) => {
+                eprintln!("render: the decision labels' device failed: {}", Chain(&e));
+                self.drop_screen();
+                self.granted = false;
+                self.shared.failed.store(true, Ordering::Release);
+                return true;
+            }
+        }
+        // Refused while a lifetime was active: dropped once none is.
+        if self.decision_side.as_ref().is_some_and(|s| s.retiring)
+            && render::lock(&book).active().is_none()
+        {
+            self.drop_decision_side();
+        }
+        false
+    }
+
+    /// The decision skin refused its frame at `at` on a healthy device:
+    /// the built-in presentation takes over for the active lifetime, and
+    /// the kind is disabled for the run.
+    fn decision_frame_refused(&mut self, e: BuildError, at: TimeUs) {
+        let why = format!("the decision skin refused its frame: {}", Chain(&e));
+        self.take_over(at, why.clone());
+        self.disable_decision(why);
+    }
+
+    /// The decision skin of the screen shown cannot draw from `at`: its
+    /// page draws from now on, and a takeover for its lifetime waits for
+    /// the game thread, which is woken, only while that lifetime is the
+    /// active one; another lifetime's is dropped.
+    fn take_over(&mut self, at: TimeUs, why: String) {
+        let Some(shown) = self.decision_shown.as_mut() else {
+            return;
+        };
+        shown.slot = None;
+        self.decision_screen = None;
+        let lifetime = shown.lifetime;
+        if render::lock(&self.shared.labels).active() != Some(lifetime) {
+            eprintln!("render: a takeover of an ended decision lifetime was dropped: {why}");
+            return;
+        }
+        eprintln!("render: the built-in decision presentation takes over: {why}");
+        *self
+            .shared
+            .decision_takeover
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(game::DecisionTakeover {
+            lifetime: game::DecisionLifetime(lifetime),
+            at,
+            why,
+        });
+        #[cfg(test)]
+        self.shared.takeovers_woken.fetch_add(1, Ordering::AcqRel);
+        let wake = self
+            .shared
+            .game_wake
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(wake) = wake {
+            wake();
+        }
+    }
+
+    /// The decision kind is refused for the run, for `why`: the game
+    /// thread's notice says it, no request is posted and no slot pinned
+    /// from now on, and no screen built again restores it. The
+    /// installation and its slots go now, or while a lifetime is active
+    /// at its end, so the pinned presentation keeps drawing.
+    fn disable_decision(&mut self, why: String) {
+        eprintln!("render: the decision skin is disabled for the run: {why}");
+        if self.decision_disabled.is_none() {
+            self.decision_disabled = Some(why.clone());
+            *self
+                .shared
+                .decision_refused
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(why);
+        }
+        self.committed.clear(ScreenKind::Decision);
+        let active = {
+            let mut book = render::lock(&self.shared.labels);
+            book.set_unhealthy();
+            book.active()
+        };
+        if let Some(side) = &mut self.decision_side {
+            side.retiring = true;
+            side.stop();
+        }
+        if active.is_none() {
+            self.drop_decision_side();
+        }
+    }
+
+    /// The decision installation and its label preparation go.
+    fn drop_decision_side(&mut self) {
+        if let Some(side) = self.decision_side.take() {
+            self.decision_next = self.decision_next.max(side.next());
+        }
+        if let Some(screen) = &mut self.screen {
+            screen.remove(ScreenKind::Decision);
+        }
+    }
+
+    /// The committed decision installation's label preparation, made for
+    /// a newly committed one: the book's slots of an earlier one freed, its
+    /// rows asked at the target; a misfit disables the kind.
+    fn ensure_decision(&mut self) {
+        let Some(bundle) = self
+            .committed
+            .get(ScreenKind::Decision)
+            .map(|i| Arc::clone(i.bundle()))
+        else {
+            self.decision_side = None;
+            return;
+        };
+        if self.decision_disabled.is_some()
+            || self
+                .decision_side
+                .as_ref()
+                .is_some_and(|s| s.is_for(&bundle))
+        {
+            return;
+        }
+        let Some(screen) = self.screen.as_deref() else {
+            return;
+        };
+        if let Some(old) = self.decision_side.take() {
+            self.decision_next = self.decision_next.max(old.next());
+        }
+        render::lock(&self.shared.labels).reset();
+        match crate::decision_side::DecisionSide::new(
+            &bundle,
+            &self.shared.labels,
+            self.decision_next,
+            screen,
+        ) {
+            Ok(side) => self.decision_side = Some(side),
+            Err(why) => self.disable_decision(why),
+        }
+    }
+
+    /// The screen was built again (a recovery or a chart load's retry),
+    /// its kinds restored, a refused decision restore saying why in
+    /// `refused`: the label slots reset, the pinned slot's content rebuilt
+    /// at the new target under its generation and the skin drawing on; a
+    /// refusal on the healthy device, or no decision installation left to
+    /// restore while the skin draws, is a takeover and disables the kind;
+    /// a device or poll failure drops the screen again.
+    ///
+    /// # Errors
+    ///
+    /// The device's failure while the pinned labels were rebuilt.
+    fn decision_rebuilt(&mut self, refused: Option<String>) -> Result<(), RenderError> {
+        let now = self.clock.now();
+        if let Some(why) = refused {
+            if self.decision_skinned() {
+                self.take_over(now, why.clone());
+            }
+            self.disable_decision(why);
+        }
+        let installed = self.committed.get(ScreenKind::Decision).is_some();
+        let (Some(side), Some(screen), true) = (
+            self.decision_side.as_mut(),
+            self.screen.as_deref_mut(),
+            installed,
+        ) else {
+            // Nothing to restore the skin from: what drew it takes over.
+            {
+                let mut book = render::lock(&self.shared.labels);
+                book.reset();
+                book.set_unhealthy();
+            }
+            if self.decision_skinned() {
+                self.take_over(now, "no decision skin was left to restore".to_owned());
+            }
+            if let Some(side) = self.decision_side.take() {
+                self.decision_next = self.decision_next.max(side.next());
+            }
+            return Ok(());
+        };
+        match side.rebuilt(screen) {
+            crate::decision_side::Rebuilt::Restored => Ok(()),
+            crate::decision_side::Rebuilt::Refused(e) => {
+                let why = format!(
+                    "the decision labels were not restored on the screen built again: {}",
+                    Chain(&e)
+                );
+                if self.decision_skinned() {
+                    self.take_over(now, why.clone());
+                }
+                self.disable_decision(why);
+                Ok(())
+            }
+            crate::decision_side::Rebuilt::Failed(e) => {
+                self.screen = None;
+                self.granted = false;
+                Err(e)
+            }
+        }
+    }
+
+    /// The cursor's chart from the selection update held, asked of the
+    /// decision labels' preparation.
+    fn want_decision_labels(&mut self) {
+        if let Some(shown) = &self.selection {
+            crate::decision_side::update_want(&mut self.decision_want, &shown.update.view);
+        }
     }
 }
 
@@ -13987,7 +14559,7 @@ pub(crate) mod tests {
                     .filter(|l| *l == "decision")
                     .count()
             };
-            link.show_decision(one_line("decision"));
+            link.show_decision(one_line("decision"), None);
             assert!(wait_until(|| decisions(0) > 0), "{next:?}: the page drawn");
             screens.fail.store(true, Ordering::Release);
             assert!(wait_until(|| link.failed()), "{next:?}");
@@ -17093,6 +17665,10 @@ pub(crate) mod tests {
     mod selection;
     // The chart images' tables: their generation, attempt and target.
     mod chart;
+    // The decision labels' preparation, the skinned decision screen, its
+    // takeover and the kind's refusal for the run.
+    #[cfg(feature = "dev-tools")]
+    mod decision;
     // The result screen's presentations through the slot, the commit
     // point and the barrier into the skin or the built-in page.
     #[cfg(feature = "dev-tools")]
