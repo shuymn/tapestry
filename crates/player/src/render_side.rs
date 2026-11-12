@@ -477,11 +477,12 @@ pub trait Screen: Send {
             present_count: None,
         })
     }
-    /// Draws the select screen from `update` at `now`: with `logic`, the
-    /// selection installation's state for the update's lifetime, the skin
-    /// and the strip over it, its text prepared again when `changed` (or
-    /// when this screen has not prepared it); else the update's page, as
-    /// [`menu`](Self::menu). A skin that refuses its frame or its text on
+    /// Draws the select screen from `update` at `now`, with the
+    /// application's readouts `app` sampled at that same reading: with
+    /// `logic`, the selection installation's state for the update's
+    /// lifetime, the skin and the strip over it, its text prepared again
+    /// when `changed` (or when this screen has not prepared it); else the
+    /// update's page, as [`menu`](Self::menu). A skin that refuses its frame or its text on
     /// a healthy device has the update's page drawn instead in the same
     /// frame, and says why ([`SelectionDrawn::refused`]). The default draws
     /// the page.
@@ -495,8 +496,9 @@ pub trait Screen: Send {
         logic: Option<&mut SelectionLogic>,
         changed: bool,
         now: TimeUs,
+        app: skin_model::AppReadouts,
     ) -> Result<SelectionDrawn, RenderError> {
-        let _ = (logic, now);
+        let _ = (logic, now, app);
         self.menu(&update.page, changed)
             .map(|timing| SelectionDrawn {
                 timing,
@@ -1171,6 +1173,10 @@ struct Shared {
     /// whether one holds (tests).
     #[cfg(test)]
     result_frame_hold: [AtomicBool; 2],
+    /// Select frames stall 2 ms after their instant is sampled while set
+    /// (tests): a second clock reading in the frame would differ from it.
+    #[cfg(test)]
+    selection_stall: AtomicBool,
 }
 
 impl Shared {
@@ -1229,6 +1235,8 @@ impl Shared {
             result_status: Mutex::new(ResultReport::default()),
             #[cfg(test)]
             result_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
+            #[cfg(test)]
+            selection_stall: AtomicBool::new(false),
         }
     }
 
@@ -4962,6 +4970,10 @@ impl Run {
                     drawn
                 }
                 Mode::Selection => {
+                    #[cfg(test)]
+                    if self.shared.selection_stall.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
                     #[cfg(feature = "dev-tools")]
                     {
                         frame_began = Some(Instant::now());
@@ -4987,9 +4999,16 @@ impl Run {
                         logic
                             .apply_settings(shown.update.settings.as_ref(), self.tuning.as_deref());
                     }
-                    let now = self.clock.now();
+                    // The frame's one reading: its timers age on the instant
+                    // the readouts were sampled at.
                     let changed = std::mem::replace(&mut shown.changed, false);
-                    let drawn = screen.selection(&shown.update, shown.logic.as_mut(), changed, now);
+                    let drawn = screen.selection(
+                        &shown.update,
+                        shown.logic.as_mut(),
+                        changed,
+                        frame_at,
+                        app,
+                    );
                     #[cfg(feature = "dev-tools")]
                     {
                         presented_at = Some(self.clock.now());
@@ -12120,6 +12139,7 @@ pub(crate) mod tests {
             logic: Option<&mut crate::selection_skin::SelectionLogic>,
             changed: bool,
             now: TimeUs,
+            app: skin_model::AppReadouts,
         ) -> Result<crate::selection_skin::SelectionDrawn, RenderError> {
             if self.shared.fail.load(Ordering::Acquire) {
                 return Err(RenderError::SurfaceLost);
@@ -12134,6 +12154,8 @@ pub(crate) mod tests {
                 state,
                 changed,
                 events: update.events,
+                now,
+                app,
             };
             self.shared.selections.lock().unwrap().push(seen);
             if changed {
@@ -12156,6 +12178,7 @@ pub(crate) mod tests {
                         target: [1_920, 1_080],
                         layout: &skin_model::Layout::AUTHOR,
                         timers: update.events.timers(),
+                        app,
                     };
                     if skin
                         .build_selection(&mut logic.sel, &frame, logic.bundle.uvs(), &mut batch)
@@ -12372,6 +12395,9 @@ pub(crate) mod tests {
         pub(crate) state: Option<u64>,
         pub(crate) changed: bool,
         pub(crate) events: crate::selection_skin::SelectionEvents,
+        /// The frame's time and the application's readouts it was given.
+        pub(crate) now: TimeUs,
+        pub(crate) app: skin_model::AppReadouts,
     }
 
     /// A selection skin's frame as an [`Installer`] built it: the frame,

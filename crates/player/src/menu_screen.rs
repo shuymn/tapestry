@@ -552,9 +552,10 @@ impl MenuScreen {
         Ok(Ok(()))
     }
 
-    /// The app's share of a selection frame of `u` at `now`: the skin's
-    /// timers from the update's starts, the skin's frame and the strip's
-    /// sprites staged, with no call into wgpu. Allocates nothing.
+    /// The app's share of a selection frame of `u` at `now` with the
+    /// application's readouts `app`: the skin's timers from the update's
+    /// starts, the skin's frame and the strip's sprites staged, with no
+    /// call into wgpu. Allocates nothing.
     ///
     /// # Errors
     ///
@@ -565,6 +566,7 @@ impl MenuScreen {
         u: &SelectionUpdate,
         logic: &mut SelectionLogic,
         now: bms_model::TimeUs,
+        app: skin_model::AppReadouts,
     ) -> Result<(), BuildError> {
         #[cfg(all(test, feature = "dev-tools"))]
         self.probe_alloc();
@@ -580,6 +582,7 @@ impl MenuScreen {
             target: self.renderer.target(),
             layout: &skin_model::Layout::AUTHOR,
             timers: u.events.timers(),
+            app,
         };
         // The frame's preparation ends here (dev-tools: the S7-07d
         // gate's whole frames).
@@ -1196,17 +1199,19 @@ impl Screen for MenuScreen {
         Ok(timing)
     }
 
-    /// The skin installed for selection draws `u` with `logic`, the strip
-    /// over it; without one (or with a state of another installation) the
-    /// page draws. A refusal of the skin's text or frame draws the page
-    /// prepared with the update in the same frame, which prepares nothing
-    /// more.
+    /// The skin installed for selection draws `u` with `logic` at `now`
+    /// with the readouts `app`, the strip over it; without one (or with a
+    /// state of another installation) the page draws. A refusal of the
+    /// skin's text or frame, a readout out of range among it, draws the
+    /// page prepared with the update in the same frame, which prepares
+    /// nothing more.
     fn selection(
         &mut self,
         u: &SelectionUpdate,
         logic: Option<&mut SelectionLogic>,
         changed: bool,
         now: bms_model::TimeUs,
+        app: skin_model::AppReadouts,
     ) -> Result<SelectionDrawn, RenderError> {
         let installed = self.renderer.selection_bundle().cloned();
         let logic = logic.filter(|l| installed.is_some_and(|b| Arc::ptr_eq(&b, &l.bundle)));
@@ -1229,12 +1234,13 @@ impl Screen for MenuScreen {
                 &mut logic.sel,
                 now,
                 &u.events.timers(),
+                &app,
             ) {
                 Ok(stop) => {
                     if let Some(stop) = stop {
                         self.script_stopped(u, logic, stop)?;
                     }
-                    self.build_selection_frame(u, logic, now)
+                    self.build_selection_frame(u, logic, now, app)
                         .err()
                         .map(|e| e.to_string())
                 }
