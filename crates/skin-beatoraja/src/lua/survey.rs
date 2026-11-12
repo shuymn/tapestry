@@ -91,6 +91,8 @@ pub struct Survey {
     /// (dev-tools measurement, S10-12 design §4.3).
     #[cfg(feature = "dev-tools")]
     pub atlas: Vec<String>,
+    /// An imported play skin's declared ending, as read.
+    pub play_ending: Option<skin_model::PlayEnding>,
     /// A result import drawn over [`Choice::result`], when one was given
     /// and the import completed, or a decision import that completed,
     /// drawn over its declared timing ([`decision_frames`]).
@@ -811,6 +813,7 @@ fn imported_into(s: &mut Survey, imported: &crate::Imported, kind: ScreenKind, c
         imported.skin.ops().total(),
         imported.skin.program_callbacks(),
     ));
+    s.play_ending = (kind == ScreenKind::Play).then(|| imported.skin.play_ending());
     #[cfg(feature = "dev-tools")]
     {
         s.atlas = atlas_plans(&imported.skin);

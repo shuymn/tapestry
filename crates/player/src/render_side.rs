@@ -845,14 +845,15 @@ pub enum RenderMsg {
         reply: mpsc::SyncSender<Result<(), RenderError>>,
     },
     /// Install what the preparation of this request staged, and answer
-    /// whether it was, with its receipt (the declared Closing duration):
+    /// whether it was, with its receipt (what the play skin declares,
+    /// [`Declared`]):
     /// not when the request was discarded or superseded, or its screen
     /// was built again since.
     Commit {
         /// The request.
         request: u64,
         /// Where the answer goes.
-        reply: mpsc::SyncSender<Result<Option<TimeUs>, CommitError>>,
+        reply: mpsc::SyncSender<Result<Declared, CommitError>>,
     },
     /// Drop the preparation of this request, answered or not, unless
     /// committed: it was cancelled, refused or timed out.
@@ -1437,18 +1438,46 @@ struct Commits {
     receipt: Receipt,
 }
 
-/// What an attempt's commit gives the game thread: the request and the
-/// declared Closing duration ([`skin_model::Skin::close`]) of the
-/// declarative installation the committed attempt draws with, the one it
-/// staged or the one already in use; `None` for a skin that declares
-/// none and for the simple skin. A pending skin's specialization committed
-/// in the current loading lifetime also gives its declared loading time
-/// (`loadend`), which a game thread that stopped waiting declares itself.
+/// What an attempt's commit gives the game thread: the request and what
+/// the declarative installation the committed attempt draws with, the one
+/// it staged or the one already in use, declares ([`Declared`]). A
+/// pending skin's specialization committed in the current loading
+/// lifetime also gives its declared loading time (`loadend`), which a game
+/// thread that stopped waiting declares itself.
 #[derive(Clone, Copy, Debug, Default)]
 struct Receipt {
     request: u64,
-    close: Option<TimeUs>,
+    declared: Declared,
     loadend: Option<Option<TimeUs>>,
+}
+
+/// What the play skin an attempt draws with declares for the play's
+/// lifecycle, from its commit's receipt: Closing's duration
+/// ([`skin_model::Skin::close`]) and the play's ending
+/// ([`skin_model::Skin::play_ending`]). The default, none declared, for
+/// the simple skin and before a commit.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Declared {
+    /// Closing's declared duration, `None` for none.
+    pub close: Option<TimeUs>,
+    /// The play's declared ending.
+    pub ending: game::PlayEnding,
+}
+
+impl Declared {
+    /// What `skin` declares; the default without a declarative skin.
+    pub(crate) fn of(skin: Option<&skin_model::Skin>) -> Self {
+        skin.map_or_else(Self::default, |s| {
+            let e = s.play_ending();
+            Self {
+                close: s.close(),
+                ending: game::PlayEnding {
+                    finish_margin: e.finish_margin,
+                    fadeout: e.fadeout,
+                },
+            }
+        })
+    }
 }
 
 /// The loading state's lifetime, its newest page and its newest state
@@ -2280,15 +2309,15 @@ impl RenderLink {
     /// was prepared; [`ScreenError::NoAnswer`] past the bound and
     /// [`ScreenError::Ended`] when the render thread is gone.
     ///
-    /// Installed, the play skin's declared Closing duration, from the
+    /// Installed, what the play skin declares ([`Declared`]), from the
     /// receipt taken with the installation, on the answer and past the
     /// bound alike.
-    pub fn commit_attempt(&self) -> Result<Option<TimeUs>, ScreenError> {
+    pub fn commit_attempt(&self) -> Result<Declared, ScreenError> {
         let request = self.requests.load(Ordering::Relaxed);
         let (reply, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::Commit { request, reply });
         match rx.recv_timeout(self.answer_timeout) {
-            Ok(Ok(close)) => Ok(close),
+            Ok(Ok(declared)) => Ok(declared),
             Ok(Err(e)) => {
                 eprintln!("render: the attempt was not installed: {e}");
                 Err(ScreenError::Lost)
@@ -2316,7 +2345,7 @@ impl RenderLink {
                     let r = commits.receipt;
                     drop(commits);
                     if r.request != request {
-                        return Ok(None);
+                        return Ok(Declared::default());
                     }
                     // Declared before the opener reads the minimum again,
                     // outside the commits' lock, whether or not the
@@ -2324,7 +2353,7 @@ impl RenderLink {
                     if let Some(loadend) = r.loadend {
                         self.shared.committed_loading(loadend);
                     }
-                    return Ok(r.close);
+                    return Ok(r.declared);
                 }
                 commits.withdrawn = commits.withdrawn.max(request);
                 Err(ScreenError::NoAnswer)
@@ -5543,13 +5572,6 @@ impl Run {
         }
     }
 
-    /// Installs what the preparation of `request` staged: it must be the
-    /// one answered ready last, not withdrawn by a game thread that stopped
-    /// waiting, on the screen it was prepared on (its device's). Another request's commit changes nothing; one refused by
-    /// the screen discards the staging. Committed, a declarative bundle is
-    /// kept for a screen built again. The receipt taken under the
-    /// commits' lock is answered: the declared Closing duration of the
-    /// declarative installation the attempt draws with, staged or in use.
     /// The present a chart publication is checked against
     /// ([`crate::chart_images::PublicationKey::current`]): the game
     /// thread's generation, and this thread's live targets.
@@ -5679,7 +5701,14 @@ impl Run {
         }
     }
 
-    fn commit(&mut self, request: u64) -> Result<Option<TimeUs>, CommitError> {
+    /// Installs what the preparation of `request` staged: it must be the
+    /// one answered ready last, not withdrawn by a game thread that stopped
+    /// waiting, on the screen it was prepared on (its device's). Another request's commit changes nothing; one refused by
+    /// the screen discards the staging. Committed, a declarative bundle is
+    /// kept for a screen built again. The receipt taken under the
+    /// commits' lock is answered: what the declarative installation the
+    /// attempt draws with, staged or in use, declares.
+    fn commit(&mut self, request: u64) -> Result<Declared, CommitError> {
         // The loading lifetime current, if one is begun: a pending skin's
         // specialization committed now draws its loading frames. Read
         // before the commits' lock, which no loading lock nests in.
@@ -5756,10 +5785,11 @@ impl Run {
         }
         // The installation the attempt draws with: the one it staged, or
         // the one in use it was readied on.
-        let close = self
-            .committed
-            .get(ScreenKind::Play)
-            .and_then(|i| i.bundle().skin().close());
+        let drawn = Declared::of(
+            self.committed
+                .get(ScreenKind::Play)
+                .map(|i| i.bundle().skin().as_ref()),
+        );
         #[cfg(test)]
         self.shared.epochs[1].store(p.presentation.1, Ordering::SeqCst);
         // The committed attempt's `Play` is the screen's now, whatever
@@ -5782,7 +5812,7 @@ impl Run {
         commits.committed = request;
         commits.receipt = Receipt {
             request,
-            close,
+            declared: drawn,
             loadend: declared,
         };
         drop(commits);
@@ -5808,7 +5838,7 @@ impl Run {
         if let Some(loadend) = declared {
             self.shared.committed_loading(loadend);
         }
-        Ok(close)
+        Ok(drawn)
     }
 
     /// Whether `request` is newer than every request asked of the render
@@ -11722,6 +11752,16 @@ pub(crate) mod tests {
         close: Option<TimeUs>,
         loadend: Option<TimeUs>,
     ) -> Arc<render::SkinBundle> {
+        bundle_ending(close, loadend, skin_model::PlayEnding::default())
+    }
+
+    /// [`bundle_declaring`] whose skin also declares the play's ending
+    /// `ending`.
+    pub(crate) fn bundle_ending(
+        close: Option<TimeUs>,
+        loadend: Option<TimeUs>,
+        ending: skin_model::PlayEnding,
+    ) -> Arc<render::SkinBundle> {
         use skin_model::{Anchor, AtlasLimits, Fit, Region, RegionDef, Sheet, SkinDef, Variant};
         let sheet = Sheet::new(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")),
@@ -11745,7 +11785,8 @@ pub(crate) mod tests {
             loadend,
             present: None,
         })
-        .unwrap();
+        .unwrap()
+        .with_play_ending(ending);
         let limits = AtlasLimits {
             max_side: 256,
             max_layers: 4,
@@ -14065,16 +14106,16 @@ pub(crate) mod tests {
         let three = Some(TimeUs(3_000_000));
         let longest = Some(TimeUs(2_147_483_647_000));
         let (chart, screens, mut link) = receipt_link(three);
-        let mut declared = None;
+        let mut declared = super::Declared::default();
 
         // On the answer.
         ready_attempt(&link, &chart);
         crate::play::commit_ready(&link, false, &mut declared).unwrap();
-        assert_eq!(declared, three);
+        assert_eq!(declared.close, three);
         // A retry commits it again.
         ready_attempt(&link, &chart);
         crate::play::commit_ready(&link, false, &mut declared).unwrap();
-        assert_eq!(declared, three);
+        assert_eq!(declared.close, three);
 
         // Refused: the screen built again since the preparation.
         ready_attempt(&link, &chart);
@@ -14083,12 +14124,12 @@ pub(crate) mod tests {
             crate::play::commit_ready(&link, false, &mut declared),
             Err(ScreenError::Lost)
         ));
-        assert_eq!(declared, None);
+        assert_eq!(declared.close, None);
         // A screen built again after the commit keeps the receipt.
         ready_attempt(&link, &chart);
         crate::play::commit_ready(&link, false, &mut declared).unwrap();
         rebuild_screen(&link, &screens);
-        assert_eq!(declared, three);
+        assert_eq!(declared.close, three);
 
         // Withdrawn: the render thread reaches it past the bound.
         ready_attempt(&link, &chart);
@@ -14098,7 +14139,7 @@ pub(crate) mod tests {
             crate::play::commit_ready(&link, false, &mut declared),
             Err(ScreenError::NoAnswer)
         ));
-        assert_eq!(declared, None);
+        assert_eq!(declared.close, None);
         screens.stall.store(false, Ordering::Release);
         let frames = || screens.loading.load(Ordering::Acquire);
         let from = frames();
@@ -14132,24 +14173,76 @@ pub(crate) mod tests {
         crate::play::commit_ready(&link, false, &mut declared).unwrap();
         release.join().unwrap();
         assert!(link.shared.commit_timed_out.load(Ordering::Acquire));
-        assert_eq!(declared, longest);
+        assert_eq!(declared.close, longest);
         assert_eq!(
-            game::closing_time(declared),
+            game::closing_time(declared.close),
             TimeUs(2_147_483_647_000),
             "i32::MAX ms is admitted whole"
         );
         link.exit();
     }
 
-    /// A skin declaring no Closing duration, committed after one that
-    /// declares one, clears the receipt.
+    /// Each commit's receipt carries the play's ending the committed skin
+    /// declares, beside its Closing duration, through the player's commit
+    /// ([`crate::play::commit_ready`]): a margin and a fade-out, a
+    /// negative fade-out kept, and none from a skin declaring none or a
+    /// commit refused.
     #[test]
-    fn a_skin_declaring_no_close_clears_the_receipt() {
-        let (chart, _screens, link) = receipt_link(Some(TimeUs(3_000_000)));
-        let mut declared = None;
+    fn a_commit_receipt_carries_the_declared_ending() {
+        let ms = |v: i64| TimeUs(v * 1_000);
+        let declares = skin_model::PlayEnding {
+            finish_margin: ms(3_000),
+            fadeout: ms(1_000),
+        };
+        let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+        let screens = Installers::default();
+        let link = screens.spawn(&chart, &bundle_ending(Some(ms(2_000)), None, declares));
+        let mut declared = super::Declared::default();
         ready_attempt(&link, &chart);
         crate::play::commit_ready(&link, false, &mut declared).unwrap();
-        assert_eq!(declared, Some(TimeUs(3_000_000)));
+        assert_eq!(
+            declared,
+            super::Declared {
+                close: Some(ms(2_000)),
+                ending: game::PlayEnding {
+                    finish_margin: ms(3_000),
+                    fadeout: ms(1_000),
+                },
+            }
+        );
+
+        // Another skin's negative fade-out arrives with its sign.
+        let negative = skin_model::PlayEnding {
+            finish_margin: ms(12_000),
+            fadeout: ms(-250),
+        };
+        assert_eq!(
+            link.select(ScreenKind::Play, Some(bundle_ending(None, None, negative)))
+                .wait()
+                .unwrap(),
+            Preparation::Ready
+        );
+        ready_attempt(&link, &chart);
+        crate::play::commit_ready(&link, false, &mut declared).unwrap();
+        assert_eq!(
+            declared.ending,
+            game::PlayEnding {
+                finish_margin: ms(12_000),
+                fadeout: ms(-250),
+            }
+        );
+        assert_eq!(declared.close, None);
+
+        // Refused: the screen built again since the preparation.
+        ready_attempt(&link, &chart);
+        rebuild_screen(&link, &screens);
+        assert!(matches!(
+            crate::play::commit_ready(&link, false, &mut declared),
+            Err(ScreenError::Lost)
+        ));
+        assert_eq!(declared.ending, game::PlayEnding::NONE);
+
+        // A skin declaring none clears it.
         assert_eq!(
             link.select(ScreenKind::Play, Some(bundle()))
                 .wait()
@@ -14158,7 +14251,28 @@ pub(crate) mod tests {
         );
         ready_attempt(&link, &chart);
         crate::play::commit_ready(&link, false, &mut declared).unwrap();
-        assert_eq!(declared, None);
+        assert_eq!(declared, super::Declared::default());
+        link.exit();
+    }
+
+    /// A skin declaring no Closing duration, committed after one that
+    /// declares one, clears the receipt.
+    #[test]
+    fn a_skin_declaring_no_close_clears_the_receipt() {
+        let (chart, _screens, link) = receipt_link(Some(TimeUs(3_000_000)));
+        let mut declared = super::Declared::default();
+        ready_attempt(&link, &chart);
+        crate::play::commit_ready(&link, false, &mut declared).unwrap();
+        assert_eq!(declared.close, Some(TimeUs(3_000_000)));
+        assert_eq!(
+            link.select(ScreenKind::Play, Some(bundle()))
+                .wait()
+                .unwrap(),
+            Preparation::Ready
+        );
+        ready_attempt(&link, &chart);
+        crate::play::commit_ready(&link, false, &mut declared).unwrap();
+        assert_eq!(declared.close, None);
         link.exit();
     }
 
@@ -14173,11 +14287,11 @@ pub(crate) mod tests {
             link.select(ScreenKind::Play, None).wait().unwrap(),
             Preparation::Ready
         );
-        let mut declared = None;
+        let mut declared = super::Declared::default();
         for _ in 0..2 {
             ready_attempt(&link, &chart);
             crate::play::commit_ready(&link, false, &mut declared).unwrap();
-            assert_eq!(declared, three);
+            assert_eq!(declared.close, three);
         }
         link.exit();
     }
@@ -14189,10 +14303,10 @@ pub(crate) mod tests {
     #[test]
     fn a_receipt_past_the_bound_is_only_its_own_requests() {
         let (chart, screens, mut link) = receipt_link(Some(TimeUs(3_000_000)));
-        let mut declared = None;
+        let mut declared = super::Declared::default();
         ready_attempt(&link, &chart);
         crate::play::commit_ready(&link, false, &mut declared).unwrap();
-        assert_eq!(declared, Some(TimeUs(3_000_000)));
+        assert_eq!(declared.close, Some(TimeUs(3_000_000)));
         ready_attempt(&link, &chart);
 
         // The render thread stalls in a loading frame, so the commit is
@@ -14206,7 +14320,7 @@ pub(crate) mod tests {
         crate::play::commit_ready(&link, false, &mut declared).unwrap();
         assert!(link.shared.commit_timed_out.load(Ordering::Acquire));
         assert_ne!(link.shared.commits().receipt.request, request);
-        assert_eq!(declared, None);
+        assert_eq!(declared.close, None);
         screens.stall.store(false, Ordering::Release);
         link.exit();
     }
@@ -16574,7 +16688,7 @@ pub(crate) mod tests {
             link.prepare_attempt(attempt, || false).unwrap(),
             Preparation::Ready
         );
-        crate::play::commit_ready(&link, true, &mut None).unwrap();
+        crate::play::commit_ready(&link, true, &mut super::Declared::default()).unwrap();
         let ready = rec.until(next, |s| s.load.percent == 100);
         link.end_loading().unwrap();
         let ended = rec.count();
