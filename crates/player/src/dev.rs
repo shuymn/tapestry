@@ -1373,6 +1373,13 @@ impl SelectScript {
         self.failed.as_deref()
     }
 
+    /// Whether steps are still due on the result shown: none of them left
+    /// it, and some are queued. A scripted run's end does not end the run
+    /// before them ([`crate::play::scripted_end_over`]).
+    pub fn holds_result(&self) -> bool {
+        !self.left_result && !self.steps.is_empty()
+    }
+
     /// A chart was chosen: a refusal from before it is no longer its.
     pub fn chose(&mut self) {
         self.refusal = None;
