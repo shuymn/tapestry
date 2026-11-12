@@ -2881,9 +2881,9 @@ mod tests {
                 g
             };
             let mut seen = vec![read(rig)];
-            rig.entered_decision(
+            let _ = rig.entered_decision(
                 &game::Pick::Play(std::path::PathBuf::from("chart.bms")),
-                &mut game::Decision::off(),
+                game::Decision::off(),
             );
             seen.push(read(rig));
             rig.entered_loading(std::path::Path::new("chart.bms"));

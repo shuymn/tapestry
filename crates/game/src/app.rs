@@ -30,7 +30,9 @@ use bms_model::Speed;
 
 use crate::attempt::PreparationRefusal;
 use crate::coord::{Caps, Coordinator, JobKind, Joined, LoadFailure, Spawner};
-use crate::decision::{Decision, Origin, Reply, Verdict};
+use crate::decision::{
+    Decision, DecisionLifetime, DecisionShown, DecisionTakeover, Origin, Reply, Verdict,
+};
 use crate::error::Chain;
 use crate::live::{Leave, LiveError, Rig, run_over, threads_over};
 use crate::logic::LogicError;
@@ -136,19 +138,29 @@ pub trait AppRig: LoadingRig {
         let _ = (loaded, decision);
         Ok(Loading::Ready)
     }
-    /// The decision screen's time for the choice about to be made; none
-    /// (by default) shows no decision screen.
-    fn decision_time(&self) -> Option<TimeUs> {
+    /// The presentation of the decision screen about to begin for `pick`
+    /// in `lifetime`, chosen once, now (design.md "Play Lifecycle", the
+    /// decision screen): whatever the rig claims for it is named by
+    /// `lifetime`. None (by default) shows no decision screen.
+    fn decision_shown(&mut self, pick: &Pick, lifetime: DecisionLifetime) -> Option<DecisionShown> {
+        let _ = (pick, lifetime);
         None
     }
     /// The decision screen begins for `pick` (design.md "Play Lifecycle",
     /// the decision screen): its presentation and tone, its input epoch,
-    /// and the attempt's reset at the choice, whose wait serves `d`: a
-    /// leaving verdict a look returned there is left in `d`
-    /// ([`Decision::leave`]) for App to route before the chart is read.
-    /// Nothing by default.
-    fn entered_decision(&mut self, pick: &Pick, d: &mut Decision) {
-        let _ = (pick, d);
+    /// and the attempt's reset at the choice, whose wait serves `d`, moved
+    /// there and returned: a leaving verdict a look returned there is left
+    /// in it ([`Decision::leave`]) for App to route before the chart is
+    /// read. Nothing by default.
+    fn entered_decision(&mut self, pick: &Pick, d: Decision) -> Decision {
+        let _ = pick;
+        d
+    }
+    /// The decision skin can no longer draw the active screen: its
+    /// takeover, taken once, at a look of App's
+    /// ([`Decision::apply_takeover`]). None by default.
+    fn take_decision_takeover(&mut self) -> Option<DecisionTakeover> {
+        None
     }
     /// Each look of the decision screen from `origin`, before its
     /// classification: what needs no wait (the page's jobs in
@@ -333,6 +345,8 @@ pub struct App {
     coord: Coordinator,
     /// Starts the load's job threads.
     spawner: Spawner,
+    /// The decision screens' lifetimes minted so far.
+    lifetimes: u64,
 }
 
 impl fmt::Debug for App {
@@ -370,6 +384,7 @@ impl App {
             reopen: PollDeadline::default(),
             coord: Coordinator::new(Caps::for_machine(0, 0)),
             spawner: Spawner::SYSTEM,
+            lifetimes: 0,
         }
     }
 
@@ -548,9 +563,15 @@ impl App {
             let went = match self.session_for(practice, rig) {
                 Err(reason) => Chosen::Refused(reason),
                 Ok(session) => {
-                    decision = Decision::begin(rig.now(), rig.decision_time(), practice);
+                    // The lifetime first, so the presentation chosen for
+                    // it is named by it.
+                    let now = rig.now();
+                    self.lifetimes += 1;
+                    let lifetime = DecisionLifetime(self.lifetimes);
+                    let shown = rig.decision_shown(&pick, lifetime);
+                    decision = Decision::begin(now, lifetime, shown, practice);
                     if decision.on() {
-                        rig.entered_decision(&pick, &mut decision);
+                        decision = rig.entered_decision(&pick, decision);
                     }
                     // A look inside the choice's own wait left the screen.
                     match decision.take_left() {
@@ -976,7 +997,8 @@ enum Next {
 }
 
 /// The decision screen's one look from `origin`, with `reply` in hand:
-/// the rig's tick, then the terminal causes and the escape read now, then
+/// the rig's tick, then a takeover applied, then the terminal causes and
+/// the escape read now (against the deadline then in force), then
 /// [`Decision::classify`], whose verdict it returns. A play's step runs
 /// its effect here ([`AppRig::deadline_step`]), once, as the decision
 /// latches it.
@@ -987,6 +1009,9 @@ fn look<R: AppRig>(
     reply: Option<Reply>,
 ) -> Result<Verdict, LiveError<R::ScreenError>> {
     rig.decision_tick(origin)?;
+    if let Some(takeover) = rig.take_decision_takeover() {
+        let _ = d.apply_takeover(takeover, rig.now());
+    }
     let terminal = rig.quitting() || threads_over(rig).is_err();
     let escape = d.waiting() && d.deadline().is_some_and(|t| rig.decision_escape(t));
     let seen = d.classify(origin, rig.now(), terminal, escape, reply);

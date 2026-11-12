@@ -8,13 +8,72 @@
 //! The state is pure: the caller supplies the time and its looks (a
 //! terminal cause, the escape key) and acts on the [`Verdict`]. The App
 //! serves it between its own waits; a rig serves it inside the waits it
-//! owns, through the same [`Decision`] lent to it.
+//! owns, through the same [`Decision`] moved to it and back.
+//!
+//! The presentation is chosen once, at the choice ([`DecisionShown`]); a
+//! decision skin that cannot draw after it is taken over by the built-in
+//! presentation ([`Decision::apply_takeover`]), named by the screen's
+//! [`DecisionLifetime`], so a takeover of a screen that ended changes
+//! nothing.
 
 use bms_model::TimeUs;
 
 /// The built-in presentation's time from the choice (design.md "Play
 /// Lifecycle", the decision screen).
 pub const DECISION_TIME: TimeUs = TimeUs(1_500_000);
+
+/// One decision screen's lifetime: minted by App at the choice, before
+/// the rig chooses its presentation, so whatever the rig claims for the
+/// screen is named by it, and a takeover is applied only to the lifetime
+/// that is still active.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DecisionLifetime(pub u64);
+
+/// The presentation a decision screen shows, chosen once, at the choice
+/// (design.md "Play Lifecycle", the decision screen).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecisionShown {
+    /// The built-in presentation, for [`DECISION_TIME`].
+    BuiltIn,
+    /// The decision skin, drawing the prepared labels of `slot`'s
+    /// generation `generation`: its fade-out starts at the choice plus `scene`,
+    /// and the screen ends at the choice plus `scene` plus `fadeout`.
+    Skin {
+        /// The label slot the choice claimed.
+        slot: u8,
+        /// The labels' generation in that slot.
+        generation: u64,
+        /// The skin's scene time.
+        scene: TimeUs,
+        /// The skin's fade-out time.
+        fadeout: TimeUs,
+    },
+}
+
+impl DecisionShown {
+    /// How long the screen lasts from the choice.
+    #[must_use]
+    pub const fn time(self) -> TimeUs {
+        match self {
+            Self::BuiltIn => DECISION_TIME,
+            Self::Skin { scene, fadeout, .. } => TimeUs(scene.0.saturating_add(fadeout.0)),
+        }
+    }
+}
+
+/// The decision skin of `lifetime` cannot draw any more (refused at `at`,
+/// for `why`): the built-in presentation takes over
+/// ([`Decision::apply_takeover`]).
+#[must_use]
+#[derive(Debug, PartialEq, Eq)]
+pub struct DecisionTakeover {
+    /// The lifetime whose skin was refused.
+    pub lifetime: DecisionLifetime,
+    /// When it was refused, on the rig's clock.
+    pub at: TimeUs,
+    /// Why.
+    pub why: String,
+}
 
 /// Where the decision screen is when it looks.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -86,11 +145,23 @@ pub enum Served<T> {
     Left(Verdict),
 }
 
-/// The decision screen of one choice, or none ([`Decision::off`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The decision screen of one choice, or none ([`Decision::off`]). One
+/// owner at a time: it moves into a wait the rig owns and back, never
+/// copied, so whatever a look changes there (a takeover, a leave) reaches
+/// the one App routes.
+#[must_use]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Decision {
     /// The deadline on the rig's clock; none when the screen is off.
     deadline: Option<TimeUs>,
+    /// The choice's instant, on the rig's clock.
+    origin: TimeUs,
+    /// The presentation shown; none when the screen is off.
+    shown: Option<DecisionShown>,
+    /// The screen's lifetime while it is active: none when the screen is
+    /// off, and from its step (the play's loading state, the practice
+    /// page's entry) or its leave on.
+    lifetime: Option<DecisionLifetime>,
     /// The choice was to practice.
     practice: bool,
     /// The deadline's step ran.
@@ -106,10 +177,12 @@ pub struct Decision {
 
 impl Decision {
     /// No decision screen: every look continues.
-    #[must_use]
     pub const fn off() -> Self {
         Self {
             deadline: None,
+            origin: TimeUs(0),
+            shown: None,
+            lifetime: None,
             practice: false,
             stepped: false,
             latched: false,
@@ -118,12 +191,20 @@ impl Decision {
         }
     }
 
-    /// The decision screen of a choice made at `now`, shown for `time`
-    /// (none: no screen), to practice with `practice`.
-    #[must_use]
-    pub fn begin(now: TimeUs, time: Option<TimeUs>, practice: bool) -> Self {
+    /// The decision screen of a choice made at `now` in `lifetime`,
+    /// showing `shown` (none: no screen) for its time, to practice with
+    /// `practice`.
+    pub fn begin(
+        now: TimeUs,
+        lifetime: DecisionLifetime,
+        shown: Option<DecisionShown>,
+        practice: bool,
+    ) -> Self {
         Self {
-            deadline: time.map(|t| TimeUs(now.0.saturating_add(t.0))),
+            deadline: shown.map(|s| TimeUs(now.0.saturating_add(s.time().0))),
+            origin: now,
+            shown,
+            lifetime: shown.map(|_| lifetime),
             practice,
             ..Self::off()
         }
@@ -139,6 +220,47 @@ impl Decision {
     #[must_use]
     pub const fn deadline(&self) -> Option<TimeUs> {
         self.deadline
+    }
+
+    /// The choice's instant.
+    #[must_use]
+    pub const fn origin(&self) -> TimeUs {
+        self.origin
+    }
+
+    /// The presentation shown, when on.
+    #[must_use]
+    pub const fn shown(&self) -> Option<DecisionShown> {
+        self.shown
+    }
+
+    /// The screen's lifetime while it is active: from the choice to its
+    /// step or its leave.
+    #[must_use]
+    pub const fn lifetime(&self) -> Option<DecisionLifetime> {
+        self.lifetime
+    }
+
+    /// The decision skin of `takeover`'s lifetime cannot draw any more,
+    /// seen at `now`: while that lifetime is active, the built-in
+    /// presentation takes over and the deadline becomes the choice plus
+    /// [`DECISION_TIME`], earlier or later than the skin's own (design.md
+    /// "Play Lifecycle", the decision screen); one already due routes at
+    /// the next classification. No clock restarts: the choice stays the
+    /// origin. Whether it was applied: a takeover of another lifetime, or
+    /// of one that ended, changes nothing.
+    pub fn apply_takeover(&mut self, takeover: DecisionTakeover, now: TimeUs) -> bool {
+        if self.lifetime != Some(takeover.lifetime) {
+            return false;
+        }
+        let deadline = TimeUs(self.origin.0.saturating_add(DECISION_TIME.0));
+        self.deadline = Some(deadline);
+        self.shown = Some(DecisionShown::BuiltIn);
+        // A deadline still ahead: no longer past it.
+        if now.0 < deadline.0 {
+            self.waiting = false;
+        }
+        true
     }
 
     /// Whether the choice was to practice.
@@ -186,6 +308,7 @@ impl Decision {
     /// the caller routes it when the wait returns.
     pub const fn leave(&mut self, verdict: Verdict) {
         self.left = Some(verdict);
+        self.lifetime = None;
     }
 
     /// Classifies a look at `now` from `origin`: `terminal` when the run is
@@ -196,8 +319,25 @@ impl Decision {
     /// state or the wait for a late read is reached); at the deadline a
     /// latched refusal returns, else the step runs once (practice whose
     /// read still runs waits instead); past it, while practice waits,
-    /// the escape goes back.
+    /// the escape goes back. The step and every leaving verdict end the
+    /// screen's lifetime.
     pub fn classify(
+        &mut self,
+        origin: Origin,
+        now: TimeUs,
+        terminal: bool,
+        escape: bool,
+        reply: Option<Reply>,
+    ) -> Verdict {
+        let seen = self.route(origin, now, terminal, escape, reply);
+        if seen == Verdict::Step || seen.leaves() {
+            self.lifetime = None;
+        }
+        seen
+    }
+
+    /// [`classify`](Self::classify)'s verdict, before the lifetime ends.
+    fn route(
         &mut self,
         origin: Origin,
         now: TimeUs,
@@ -246,11 +386,21 @@ mod tests {
     }
 
     fn play() -> Decision {
-        Decision::begin(at(0), Some(DECISION_TIME), false)
+        Decision::begin(
+            at(0),
+            DecisionLifetime(1),
+            Some(DecisionShown::BuiltIn),
+            false,
+        )
     }
 
     fn practice() -> Decision {
-        Decision::begin(at(0), Some(DECISION_TIME), true)
+        Decision::begin(
+            at(0),
+            DecisionLifetime(1),
+            Some(DecisionShown::BuiltIn),
+            true,
+        )
     }
 
     /// Off, every look continues; a refusal returns at once.
@@ -385,5 +535,109 @@ mod tests {
             d.classify(Origin::Jobs, at(1_500), false, false, None),
             Verdict::Step
         );
+    }
+
+    fn skin(scene: i64, fadeout: i64) -> DecisionShown {
+        DecisionShown::Skin {
+            slot: 1,
+            generation: 7,
+            scene: at(scene),
+            fadeout: at(fadeout),
+        }
+    }
+
+    fn takeover(lifetime: u64, ms: i64) -> DecisionTakeover {
+        DecisionTakeover {
+            lifetime: DecisionLifetime(lifetime),
+            at: at(ms),
+            why: String::new(),
+        }
+    }
+
+    /// A skinned screen from a choice at 7,000 ms ends at the choice plus
+    /// `scene` plus `fadeout`: not at 2,999 ms from it, at 3,000.
+    #[test]
+    fn a_skin_s_deadline_is_its_scene_plus_fadeout() {
+        let mut d = Decision::begin(
+            at(7_000),
+            DecisionLifetime(3),
+            Some(skin(2_500, 500)),
+            false,
+        );
+        assert_eq!(d.origin(), at(7_000));
+        assert_eq!(d.lifetime(), Some(DecisionLifetime(3)));
+        assert_eq!(
+            d.classify(Origin::Load, at(9_999), false, false, None),
+            Verdict::Continue
+        );
+        assert_eq!(
+            d.classify(Origin::Load, at(10_000), false, false, None),
+            Verdict::Step
+        );
+        assert_eq!(d.lifetime(), None, "the step ends the lifetime");
+        let off = Decision::begin(at(7_000), DecisionLifetime(3), None, false);
+        assert!(!off.on());
+        assert_eq!(off.lifetime(), None, "no screen, no lifetime");
+    }
+
+    /// A takeover of the active lifetime: the built-in presentation, the
+    /// deadline at the choice plus 1.5 s whatever the skin's was, the
+    /// choice kept; another lifetime's, or one after the step or a leave,
+    /// changes nothing.
+    #[test]
+    fn a_takeover_applies_only_to_the_active_lifetime() {
+        let begun =
+            || Decision::begin(at(7_000), DecisionLifetime(3), Some(skin(2_500, 500)), true);
+        let mut d = begun();
+        assert!(!d.apply_takeover(takeover(4, 8_000), at(8_000)));
+        assert_eq!(d.deadline(), Some(at(10_000)));
+        assert!(d.apply_takeover(takeover(3, 8_000), at(8_000)));
+        assert_eq!(d.deadline(), Some(at(8_500)));
+        assert_eq!(d.shown(), Some(DecisionShown::BuiltIn));
+        assert_eq!(d.origin(), at(7_000));
+        let mut d = begun();
+        assert_eq!(
+            d.classify(Origin::Jobs, at(10_000), false, false, None),
+            Verdict::Step
+        );
+        assert!(!d.apply_takeover(takeover(3, 10_100), at(10_100)));
+        assert_eq!(d.deadline(), Some(at(10_000)));
+        let mut d = begun();
+        d.leave(Verdict::End);
+        assert!(!d.apply_takeover(takeover(3, 8_000), at(8_000)));
+        assert_eq!(d.deadline(), Some(at(10_000)));
+        let mut d = begun();
+        assert_eq!(
+            d.classify(Origin::Read, at(8_000), true, false, None),
+            Verdict::End
+        );
+        assert!(
+            !d.apply_takeover(takeover(3, 8_000), at(8_000)),
+            "a leaving verdict ends the lifetime"
+        );
+    }
+
+    /// A takeover lengthening a screen practice waits past (1.0 → 1.5 s):
+    /// no longer past its time, so it no longer waits until the new
+    /// deadline.
+    #[test]
+    fn a_lengthening_takeover_ends_the_wait_until_its_deadline() {
+        let mut d = Decision::begin(at(0), DecisionLifetime(1), Some(skin(1_000, 0)), true);
+        assert_eq!(
+            d.classify(Origin::Read, at(1_000), false, false, None),
+            Verdict::Continue
+        );
+        assert!(d.waiting());
+        assert!(d.apply_takeover(takeover(1, 1_200), at(1_200)));
+        assert!(!d.waiting());
+        assert_eq!(
+            d.classify(Origin::Read, at(1_300), false, true, None),
+            Verdict::Continue
+        );
+        assert_eq!(
+            d.classify(Origin::Read, at(1_500), false, false, None),
+            Verdict::Continue
+        );
+        assert!(d.waiting());
     }
 }
