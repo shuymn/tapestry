@@ -430,6 +430,10 @@ struct Loader {
     /// The loading state's waits and polls: the clock time each began
     /// at and the `until` it was given.
     requests: Vec<(i64, Option<i64>)>,
+    /// The pending preparation's polls go through production's
+    /// [`game::poll_until`], each moving the clock 1 ms; their slices on the
+    /// monotonic clock, with the clock time each began at.
+    production_poll: Option<Vec<(i64, std::time::Duration)>>,
     /// The gauge [`Shown`] shows.
     shown: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Taken right after the first snapshot at or after its time that is
@@ -495,6 +499,7 @@ impl Loader {
             lost_staging: false,
             opens: 0,
             requests: Vec::new(),
+            production_poll: None,
             shown: std::sync::Arc::default(),
             after_quiet: None,
         }
@@ -505,7 +510,12 @@ impl Loader {
     }
 
     fn happen(&mut self, what: Happen) {
-        let now = self.clock.now().0;
+        self.happen_at(what, self.clock.now().0);
+    }
+
+    /// What happens, at its own time `at` (an event keeps the time it was
+    /// received at, whenever the game thread looks).
+    fn happen_at(&mut self, what: Happen, now: i64) {
         match what {
             Happen::Ev(ev) => self.model.take(ev, now),
             Happen::Quit => self.commands.push((i64::MIN, Command::Quit)),
@@ -569,8 +579,8 @@ impl Loader {
             while s.commands().pop().is_ok() {}
         }
         while let Some(i) = self.events.iter().position(|&(at, _)| at <= now) {
-            let what = self.events.remove(i).1;
-            self.happen(what);
+            let (at, what) = self.events.remove(i);
+            self.happen_at(what, at);
         }
     }
 
@@ -635,6 +645,9 @@ impl Loader {
                     || matches!(what, Happen::Quit | Happen::Close)
             })
             .map(|&(at, _)| at)
+            // A held START's release changes the panels' level, which
+            // wakes it too.
+            .chain(self.holds.iter().map(|&(_, to)| to))
             .filter(|&at| at > now)
             .min()
     }
@@ -706,8 +719,13 @@ impl Rig for Loader {
     fn poll_preparation(
         &mut self,
         handle: &mut game::PrepHandle,
-        _deadline: std::time::Instant,
+        deadline: std::time::Instant,
     ) -> Result<game::PrepPoll<Preparation>, SurfaceLost> {
+        let slice = deadline.saturating_duration_since(std::time::Instant::now());
+        let now = self.clock.now().0;
+        if let Some(slices) = &mut self.production_poll {
+            slices.push((now, slice));
+        }
         self.step("poll");
         self.polls.push((self.clock.now().0, handle.ticket()));
         self.wait();
@@ -951,6 +969,9 @@ impl LoadingRig for Loader {
         handle: &mut game::PrepHandle,
         until: Option<TimeUs>,
     ) -> Result<game::PrepPoll<Preparation>, SurfaceLost> {
+        if self.production_poll.is_some() {
+            return game::poll_until(self, handle, until);
+        }
         let now = self.clock.now().0;
         let answer = usize::try_from(handle.ticket() - 1)
             .ok()
@@ -958,6 +979,12 @@ impl LoadingRig for Loader {
             .map_or(i64::MIN, |&(at, _)| at);
         self.step("poll");
         self.polls.push((now, handle.ticket()));
+        // A poll until now, an entry's, waits for nothing and is not a
+        // wait's request.
+        if until == Some(TimeUs(now)) {
+            self.serve();
+            return self.answer(handle);
+        }
         // An answer already in ends the poll at once.
         self.request(until, [Some(now + PREP_SLICE_US), Some(answer), None]);
         self.serve();
@@ -1130,6 +1157,8 @@ fn showing(dir: &Path) -> (Loaded, Loader) {
 type Ran = Result<Leave, LiveError<SurfaceLost>>;
 
 fn run(loaded: &mut Loaded, rig: &mut Loader) -> Ran {
+    // What happens at the start has happened before the first look.
+    rig.serve();
     game::load_and_open(loaded, rig)
 }
 
@@ -1429,6 +1458,113 @@ fn an_event_condition_parks_until_its_event() {
             "{name}: {parks:?}"
         );
     }
+}
+
+/// The wait reopened after the commit looks before it waits: a
+/// specialization declaring 1 100 ms commits at 1 000 ms, so the minimum
+/// ends 100 ms on, sooner than an idle wake; it is looked at there.
+#[test]
+fn a_committed_minimum_sooner_than_the_idle_wake_is_not_waited_past() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.commit_loadend = Some(Some(TimeUs(1_100_000)));
+    run(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.times("commit"), [T0 + SECOND]);
+    assert_eq!(rig.until_at(T0 + SECOND), Some(T0 + 1_100_000));
+    assert_eq!(rig.times("close"), [T0 + 1_100_000]);
+}
+
+/// A wait entered with its conditions already met (the first frame
+/// presented 2 s ago, the tuning quiet) opens at once, waiting nothing:
+/// its preparation, ready or still pending (until 3 s), is polled once
+/// without waiting.
+#[test]
+fn a_wait_entered_with_its_conditions_met_waits_nothing() {
+    for pending in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let mut rig = Loader::new(&loaded);
+        rig.acks = vec![(T0, 7, T0 - 2 * SECOND)];
+        if pending {
+            rig.answers = vec![(T0 + 3 * SECOND, Preparation::Ready)];
+        }
+        run(&mut loaded, &mut rig).unwrap();
+        assert_eq!(applied_at(&rig), [T0], "{pending}");
+        assert!(rig.requests.is_empty(), "{pending}: {:?}", rig.requests);
+    }
+}
+
+/// A tap during a pending poll keeps the time it was received at, off
+/// the polls' 10 ms grid: tapped at 625 ms, the tuning is quiet at
+/// 1 625 ms, and the wait looks there while the preparation is pending.
+#[test]
+fn a_tap_during_a_pending_poll_keeps_its_time() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.answers = vec![(T0 + 3 * SECOND, Preparation::Ready)];
+    rig.at(T0 + 625_000, Happen::Ev(Ev::Tap(DISPLAY_UP)));
+    run(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.applied[0].last_activity, Some(TimeUs(T0 + 625_000)));
+    assert_eq!(rig.until_at(T0 + 1_620_000), Some(T0 + 1_625_000));
+    assert_eq!(applied_at(&rig)[0], T0 + 1_625_000);
+}
+
+/// Deferred by a held START and then for focus, the deferral's waits are
+/// the loading state's: the hold's release at 1 300 ms wakes it, and its
+/// look asks for the quiet deadline a second after focus came back
+/// (1 234 ms), where the opening closes.
+#[test]
+fn a_focus_deferral_waits_for_its_quiet_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.at_step.push(("end loading", Happen::Hold(300_000)));
+    rig.at(T0 + 1_100_000, Happen::Ev(Ev::FocusLost));
+    rig.at(T0 + 1_234_000, Happen::Ev(Ev::FocusBack));
+    run(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.times("deferred"), [T0 + SECOND]);
+    assert_eq!(rig.until_at(T0 + 1_234_000), None);
+    assert_eq!(rig.until_at(T0 + 1_300_000), Some(T0 + 2_234_000));
+    assert_eq!(rig.times("close"), [T0 + 2_234_000]);
+}
+
+/// Production's poll ([`game::poll_until`], the default of
+/// [`LoadingRig::loading_poll`]) asks the preparation for at most 10 ms
+/// on the monotonic clock, and no further than the next wake is on the
+/// rig's: at 500 ms (the minimum's end 503 ms away) a whole slice, at
+/// 1 000 ms (3 ms away) 3 ms at most.
+#[test]
+fn production_s_poll_ends_at_the_next_wake() {
+    use std::time::Duration;
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.acks = vec![(T0, 7, T0 + 3_000)];
+    rig.answers = vec![(T0 + 3 * SECOND, Preparation::Ready)];
+    rig.production_poll = Some(Vec::new());
+    run(&mut loaded, &mut rig).unwrap();
+    let slices = rig.production_poll.take().unwrap();
+    let at = |t: i64| {
+        let [(_, slice)] = slices
+            .iter()
+            .filter(|&&(n, _)| n == T0 + t)
+            .copied()
+            .collect::<Vec<_>>()[..]
+        else {
+            panic!("no one poll at {t}");
+        };
+        slice
+    };
+    assert!(at(500_000) > Duration::from_millis(3), "{:?}", at(500_000));
+    assert!(
+        at(500_000) <= Duration::from_millis(10),
+        "{:?}",
+        at(500_000)
+    );
+    assert!(at(SECOND) <= Duration::from_millis(3), "{:?}", at(SECOND));
+    assert_eq!(applied_at(&rig)[0], T0 + 1_003_000);
 }
 
 /// A deadline already passed is never asked for: the quiet deadline
@@ -1948,8 +2084,9 @@ fn a_preparation_ready_before_the_first_ack_is_not_polled_again() {
     assert_eq!(rig.readied, [(1, 1)]);
 }
 
-/// Q2: ready with 900 ms of the minimum left: polled in 10 ms slices
-/// until then; the rest of the wait and the key check poll nothing.
+/// Q2: ready with 900 ms of the minimum left: polled once without
+/// waiting as the wait is entered, then in 10 ms slices until then; the
+/// rest of the wait and the key check poll nothing.
 #[test]
 fn a_preparation_ready_before_the_minimum_ends_is_not_polled_again() {
     let dir = tempfile::tempdir().unwrap();
@@ -1957,7 +2094,7 @@ fn a_preparation_ready_before_the_minimum_ends_is_not_polled_again() {
     let mut rig = Loader::new(&loaded);
     rig.answers = vec![(T0 + 100_000, Preparation::Ready)];
     run(&mut loaded, &mut rig).unwrap();
-    assert_eq!(rig.polls.len(), 10);
+    assert_eq!(rig.polls.len(), 11);
     assert_eq!(rig.polls.last(), Some(&(T0 + 90_000, 1)));
     assert_eq!(applied_at(&rig), [T0 + SECOND]);
     assert_eq!(opening_steps(&rig), OPENING);
@@ -2829,7 +2966,15 @@ fn a_failure_during_a_deferral_ends_the_run() {
             Happen::InputFails => assert_failed(&ran, true, "deferred"),
             _ => assert_failed(&ran, false, "deferred"),
         }
-        assert_eq!(rig.clock.now().0, T0 + 1_100_000, "{what:?}");
+        // A close wakes the deferred wait; a thread's failure wakes
+        // nothing and is seen at its next look, the idle wake after the
+        // look at 1 001 ms (held START).
+        let seen = if matches!(what, Happen::Close) {
+            1_100_000
+        } else {
+            1_251_000
+        };
+        assert_eq!(rig.clock.now().0, T0 + seen, "{what:?}");
         assert_eq!(rig.count("open"), 0);
         assert_eq!(rig.count("reopen"), 1);
     }

@@ -100,7 +100,7 @@ pub use logic::{
 };
 pub use opening::{
     AcceptanceRevision, LOADING_FLOOR, LoadingOpener, LoadingRig, QUIET, Revalidated,
-    TuningSnapshot, load_and_open, loading_minimum, minimum_ends, wait_slice,
+    TuningSnapshot, load_and_open, loading_minimum, minimum_ends, poll_until, wait_slice,
 };
 pub use policy::{
     DefaultPolicy, FailureAction, GaugeIndex, NoSessionEvents, SessionEvent, SessionEventSink,
