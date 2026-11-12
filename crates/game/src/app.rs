@@ -542,7 +542,8 @@ impl App {
                 Pick::Practice(chart) => (chart.clone(), true),
             };
             // What the chart loads with, and autoplay's P refused on the
-            // select screen, before any decision screen (design.md :753).
+            // select screen, before any decision screen (design.md "Play
+            // Lifecycle", the decision screen).
             let mut decision = Decision::off();
             let went = match self.session_for(practice, rig) {
                 Err(reason) => Chosen::Refused(reason),
