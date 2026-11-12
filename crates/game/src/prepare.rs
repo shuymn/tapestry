@@ -49,6 +49,12 @@ pub struct ChartLabels {
     pub difficulty: String,
     /// Whether the chart defines a BGA image (`bms_parser::Labels::bga`).
     pub bga: bool,
+    /// The stage file and back image names (`#STAGEFILE`, `#BACKBMP`) as
+    /// the loader keeps them, each the last declaration in the taken
+    /// branches, trimmed; empty when there is none. The chart's images are
+    /// read from them (`skin_model::chart_image`).
+    pub stagefile: String,
+    pub backbmp: String,
 }
 
 /// Why a chart could not be ingested.
@@ -131,6 +137,8 @@ impl ChartIngest for BmsIngest {
                 playlevel: l.playlevel,
                 difficulty: l.difficulty,
                 bga: l.bga,
+                stagefile: l.stagefile,
+                backbmp: l.backbmp,
             },
             chart: loaded.chart,
             profile: loaded.profile,

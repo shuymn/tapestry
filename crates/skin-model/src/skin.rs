@@ -11,6 +11,7 @@ use bms_model::{Chart, LANE_COUNT, TimeUs};
 use eval::{GaugeState, NoteFacts};
 use rules::GaugeValue;
 
+use crate::AppReadouts;
 use crate::atlas::uv::{Cycle, UvTable};
 use crate::atlas::{Atlas, AtlasError, AtlasLimits, KeptLayers, Variant};
 use crate::canvas::{Canvas, Fit, MAX_CANVAS, f32_of};
@@ -3827,27 +3828,32 @@ impl Skin {
         sel.row_bitmap = rows.into_boxed_slice();
     }
 
-    /// Prepares the timers of `sel`'s frame at `now` from `timers`: the
-    /// built-in timers start from the frame's starts and the `when` timers
-    /// over the fields, as the build would. The build of the same frame
-    /// (the same `now`) then takes them as they are, so what runs between
+    /// Prepares `sel`'s frame at `now`: the application's readouts from
+    /// `app`, then the timers from `timers`, the built-in timers starting
+    /// from the frame's starts and the `when` timers over the fields, as
+    /// the build would. The build of the same frame (the same `now`, with
+    /// the same `app`) then takes them as they are, so what runs between
     /// the two (the screen's runtime, docs/stage3.md S7-07) reads the
     /// state the build draws. Allocates nothing.
     ///
     /// # Errors
     ///
-    /// [`BuildError::Kind`] for a skin that is not a selection skin.
+    /// [`BuildError::Kind`] for a skin that is not a selection skin;
+    /// [`BuildError::InvalidReadouts`] for a readout of `app` outside its
+    /// field's range, which leaves nothing prepared.
     pub fn prepare_selection_frame(
         &self,
         sel: &mut Selection,
         now: TimeUs,
         timers: &SelectionTimers,
+        app: &AppReadouts,
     ) -> Result<(), BuildError> {
         if self.kind != ScreenKind::Selection {
             return Err(BuildError::Kind);
         }
         if self.owns(sel) {
-            sel.fill(now, timers, &self.whens);
+            sel.prepared = None;
+            sel.fill(now, timers, app, &self.whens)?;
             sel.prepared = Some(now);
         }
         Ok(())
@@ -3856,7 +3862,8 @@ impl Skin {
     /// Builds one selection frame of `sel`, which must come from this
     /// skin's [`prepare_selection`](Self::prepare_selection): starts the
     /// built-in timers from the frame's starts and the `when` timers over
-    /// the fields, unless [`prepare_selection_frame`](Self::prepare_selection_frame)
+    /// the fields, after the application's readouts, unless
+    /// [`prepare_selection_frame`](Self::prepare_selection_frame)
     /// prepared them for this frame's time, places the regions, then appends each drawn element's
     /// quads to `out` in draw order (the caller clears `out`): images,
     /// image choices, numbers, text, the song list's slots and the ratio
@@ -3869,7 +3876,8 @@ impl Skin {
     /// # Errors
     ///
     /// [`BuildError::Kind`] for a skin that is not a selection skin;
-    /// nothing is appended.
+    /// [`BuildError::InvalidReadouts`] for a readout of the frame's `app`
+    /// outside its field's range. Nothing is appended.
     pub fn build_selection(
         &self,
         sel: &mut Selection,
@@ -3892,7 +3900,7 @@ impl Skin {
         let canvas = self.canvas(frame.target);
         let placement = self.placement(&canvas, frame.layout, Side::Left);
         if sel.prepared.take() != Some(frame.now) {
-            sel.fill(frame.now, &frame.timers, &self.whens);
+            sel.fill(frame.now, &frame.timers, &frame.app, &self.whens)?;
         }
         let sel = &*sel;
         let rt = Runtime {

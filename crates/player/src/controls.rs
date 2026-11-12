@@ -69,6 +69,15 @@ impl std::fmt::Debug for DecisionWatch {
     }
 }
 
+/// The chart images' work a look serves ([`Controls::serve_images`]).
+pub struct ImageService(pub Box<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for ImageService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ImageService")
+    }
+}
+
 /// The shared state between the window thread, the power notification and
 /// the game thread.
 #[derive(Debug)]
@@ -105,6 +114,10 @@ pub struct Controls {
     scene: std::sync::atomic::AtomicU64,
     /// The decision screen a chart's load serves, while it loads.
     watch: std::sync::Mutex<Option<DecisionWatch>>,
+    /// What every look serves before its verdict: the chart images' work
+    /// a step left (a finished job's set, a job begun later, a terminal
+    /// absence published), nonblocking ([`serve_images`](Self::serve_images)).
+    images: std::sync::Mutex<Option<ImageService>>,
 }
 
 impl Controls {
@@ -143,6 +156,7 @@ impl Controls {
             overlay: Arc::new(AtomicBool::new(false)),
             scene: std::sync::atomic::AtomicU64::new(0),
             watch: std::sync::Mutex::new(None),
+            images: std::sync::Mutex::new(None),
         }
     }
 
@@ -362,6 +376,15 @@ impl Controls {
             .is_some_and(|w| w.decision.left().is_some())
     }
 
+    /// Every look ([`look`](Self::look)) serves the chart images' work with
+    /// `serve` from now on, which must not block.
+    pub fn serve_images(&self, serve: ImageService) {
+        *self
+            .images
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(serve);
+    }
+
     /// The waits of a chart's load serve `watch` from now on, until
     /// [`unwatch_decision`](Self::unwatch_decision).
     pub fn watch_decision(&self, watch: DecisionWatch) {
@@ -401,6 +424,13 @@ impl Controls {
     /// here: a press counts by when it was observed, at App's next look.
     /// `None` without a decision screen watched.
     pub fn look(&self) -> Option<game::Verdict> {
+        // The chart images' work first, whatever the verdict: it neither
+        // blocks nor changes it.
+        if let Ok(images) = self.images.try_lock()
+            && let Some(serve) = images.as_ref()
+        {
+            (serve.0)();
+        }
         let mut watch = self
             .watch
             .lock()

@@ -1269,6 +1269,9 @@ pub struct Started {
     /// laid out per attempt and view, its prepared atlas uploaded after
     /// each attempt's commit (the S10-09i design's D2).
     pub result: Option<crate::result_skin::ResultStart>,
+    /// The page side of the committed play skin's chart layer, when it
+    /// keeps one: the chart's images are fitted for it (S10-12).
+    pub play_chart: Option<u32>,
 }
 
 impl PartialEq for Started {
@@ -1278,6 +1281,7 @@ impl PartialEq for Started {
         self.play == other.play
             && self.notice == other.notice
             && self.selection == other.selection
+            && self.play_chart == other.play_chart
             && match (&self.pending, &other.pending) {
                 (None, None) => true,
                 (Some(a), Some(b)) => Arc::ptr_eq(&a.play, &b.play),
@@ -1400,11 +1404,17 @@ pub fn startup(
                 let skin = bundle.skin();
                 let window = (kind == ScreenKind::Selection)
                     .then(|| (skin.song_list_center(), skin.song_list_slots()));
+                let chart = (kind == ScreenKind::Play)
+                    .then(|| bundle.chart_layer().map(|_| side))
+                    .flatten();
                 let pending = render.select_with(kind, Some(bundle), script);
                 match answered(kind, pending, &mut stop)? {
                     None => {
                         if window.is_some() {
                             started.selection = window;
+                        }
+                        if kind == ScreenKind::Play {
+                            started.play_chart = chart;
                         }
                         committed = committed.saturating_add(texels);
                         let atlas = Atlas { texels, side };

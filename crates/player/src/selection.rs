@@ -2626,6 +2626,9 @@ impl AppRig for PlayerRig<'_> {
     /// stage: a loading lifetime begins, with the shown gauge's descriptor
     /// from the validated preset selection has chosen.
     fn entered_loading(&mut self, chart: &std::path::Path) {
+        // A new generation of the chart's images before the loading
+        // lifetime begins: none of the last one's draws in it.
+        self.chart_images.renew();
         // The coming attempt's entry: its loading-time adjustments are its
         // own, and solve nothing until its chart is read. A failed fence is
         // the input thread's failure, which ends the run.
@@ -2664,6 +2667,10 @@ impl AppRig for PlayerRig<'_> {
     /// (its loading-time adjustments are its own), whose fence waits on the
     /// input thread with the screen already showing.
     fn entered_decision(&mut self, pick: &Pick, d: &mut game::Decision) {
+        // A new generation of the chart's images before the held loading
+        // lifetime begins: none of the last choice's draws when the
+        // deadline reveals it.
+        self.chart_images.renew();
         self.controls.close_epoch();
         if let Some(ime) = self.selection.as_ref().and_then(|s| s.ime.as_ref()) {
             ime.set(false);
@@ -2770,6 +2777,7 @@ impl AppRig for PlayerRig<'_> {
         loaded: &Loaded,
         decision: &mut game::Decision,
     ) -> Result<Loading, ChartLoadError> {
+        self.chart_images_at_choice(loaded);
         let stepped = decision.stepped();
         let loading = self.watching(loaded.path(), decision, |rig| rig.load_watched(loaded));
         if decision.stepped() && !stepped {
@@ -2847,6 +2855,9 @@ impl AppRig for PlayerRig<'_> {
     /// nowhere (design.md "Load Pipeline"), but a panic one published
     /// meanwhile that a Start was responsible for, which ends the run.
     fn left_chart(&mut self) -> Result<(), game::LiveError<ScreenError>> {
+        // Its images' job was cancelled with the choice's scope below; its
+        // set is never taken, nor drawn.
+        self.chart_images.forget();
         let looks = looks!(self);
         let Some(sel) = &mut self.selection else {
             return Ok(());
