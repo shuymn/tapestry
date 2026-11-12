@@ -12,7 +12,7 @@
 //! thread's frame sink.
 //!
 //! ```toml
-//! version = 5
+//! version = 6
 //! output = "out"                 # needed by captures; made by the run
 //! size = [1920, 1080]            # optional: the offscreen target
 //!
@@ -25,9 +25,22 @@
 //! # or { ready_at = 500, file = … }: ms since its first candidate's READY
 //! # state began; or { closing_at = 300, file = … }: ms since its Closing
 //! # began, which no frame is guaranteed to show; or
-//! # { loading = true, file = … }: its loading state's first frame. Beside
-//! # each PNG, a JSON file of the same name says what the frame was, and a
-//! # play frame of an imported skin a JSON lines file its display list.
+//! # { loading = true, file = … }: its loading state's first frame; or
+//! # { result_at = 400, file = … }: ms since the next play's result's first
+//! # presented frame. On the select screen, { select_at = 250, file = … }:
+//! # ms since the first presented selection frame that applied the update
+//! # the steps before it published. Written on a result, { result_at = … }
+//! # is that result's, once it draws a view or page published after the
+//! # steps before it. A select_at or result_at capture holds the next step
+//! # (and a result's leaving or view command) until it is written or has
+//! # failed, at most the render thread bound; `hold = false` does not.
+//! # Beside each PNG, a JSON file of the same name says what the frame was,
+//! # and a play frame of an imported skin a JSON lines file its display
+//! # list.
+//!
+//! [[step]]
+//! cursor = { path = "library/a/a.bms" }     # or { search = "text" }:
+//! # the cursor onto the chart, which is not chosen
 //!
 //! [[step]]
 //! select = { path = "library/a/a.bms" }     # or { search = "text" }
@@ -48,7 +61,8 @@
 //! [[step]]
 //! result = "next-preset"         # "prev-preset" | "retry" | "back" | "stay"
 //! # "stay": nothing pressed once the result is drawn; it leaves on its
-//! # own (a result skin's scene time), and selection takes the next step
+//! # own (a result skin's scene time), and selection takes the next step;
+//! # with no scene time in force the run fails
 //!
 //! [[step]]
 //! practice = { path = "library/a/a.bms", from = 1, to = 2, speed = 75, lead_in_ms = 2000, gauge = 20, repeat = true, input = "logs/a.tprl", rounds = 1 }
@@ -81,11 +95,11 @@ use serde::Deserialize;
 use super::{SelectScript, SelectStep};
 use crate::args::UsageError;
 use crate::input_side::Recorded;
-use crate::measure::Drawn;
+use crate::measure::{Drawn, ResultId, ScreenKind};
 use crate::render_side::{FrameSink, RenderEnd, Screen};
 
 /// The one version of the file this build reads.
-const VERSION: i64 = 5;
+const VERSION: i64 = 6;
 
 /// The largest file read.
 const MAX_FILE: usize = 1 << 20;
@@ -105,6 +119,8 @@ pub enum StepKind {
     Quit,
     /// `practice`.
     Practice,
+    /// `cursor`.
+    Cursor,
 }
 
 impl fmt::Display for StepKind {
@@ -116,6 +132,7 @@ impl fmt::Display for StepKind {
             Self::Capture => "capture",
             Self::Quit => "quit",
             Self::Practice => "practice",
+            Self::Cursor => "cursor",
         })
     }
 }
@@ -353,6 +370,7 @@ enum Step {
     Capture(CaptureSpec),
     Quit(Empty),
     Practice(PracticeSpec),
+    Cursor(SelectSpec),
 }
 
 impl Step {
@@ -364,6 +382,7 @@ impl Step {
             Self::Capture(_) => StepKind::Capture,
             Self::Quit(_) => StepKind::Quit,
             Self::Practice(_) => StepKind::Practice,
+            Self::Cursor(_) => StepKind::Cursor,
         }
     }
 }
@@ -449,6 +468,9 @@ struct CaptureSpec {
     ready_at: Option<i64>,
     closing_at: Option<i64>,
     loading: Option<bool>,
+    select_at: Option<i64>,
+    result_at: Option<i64>,
+    hold: Option<bool>,
     file: PathBuf,
 }
 
@@ -576,12 +598,14 @@ fn parse(text: &str, base: &Path) -> Result<Scenario, String> {
     let captures = compiled
         .captures
         .into_iter()
-        .map(|(file, axis, origin)| Capture {
-            axis,
+        .map(|c| Capture {
+            axis: c.axis,
             path: output
                 .as_deref()
-                .map_or_else(PathBuf::new, |o| o.join(file)),
-            origin,
+                .map_or_else(PathBuf::new, |o| o.join(&c.file)),
+            origin: c.origin,
+            hold: c.hold,
+            local: c.local,
             state: CaptureState::Unarmed,
             reported: false,
         })
@@ -598,22 +622,44 @@ fn parse(text: &str, base: &Path) -> Result<Scenario, String> {
     })
 }
 
-/// The axis a `capture` step names: exactly one of `at`, `ready_at`,
-/// `closing_at` and `loading = true`.
-fn capture_axis(c: &CaptureSpec) -> Result<Axis, String> {
+/// The axis a `capture` step names, exactly one of `at`, `ready_at`,
+/// `closing_at`, `loading = true`, `select_at` and `result_at`, and
+/// whether it holds: `select_at` and `result_at` do unless `hold = false`;
+/// the others take no `hold`.
+fn capture_axis(c: &CaptureSpec) -> Result<(Axis, bool), String> {
     let ms = |v: i64, name: &str| {
+        if v < 0 && name != "at" {
+            return Err(format!("{name} must be 0 or more"));
+        }
         v.checked_mul(1_000)
             .map(TimeUs)
             .ok_or_else(|| format!("{name} is too large"))
     };
-    match (c.at, c.ready_at, c.closing_at, c.loading) {
-        (Some(at), None, None, None) => Ok(Axis::Chart(ms(at, "at")?)),
-        (None, Some(r), None, None) if r < 0 => Err("ready_at must be 0 or more".to_owned()),
-        (None, Some(r), None, None) => Ok(Axis::Ready(ms(r, "ready_at")?)),
-        (None, None, Some(c), None) if c < 0 => Err("closing_at must be 0 or more".to_owned()),
-        (None, None, Some(c), None) => Ok(Axis::Closing(ms(c, "closing_at")?)),
-        (None, None, None, Some(true)) => Ok(Axis::Loading),
-        _ => Err("give one of at, ready_at, closing_at and loading = true".to_owned()),
+    let axis = match (
+        c.at,
+        c.ready_at,
+        c.closing_at,
+        c.loading,
+        c.select_at,
+        c.result_at,
+    ) {
+        (Some(at), None, None, None, None, None) => Axis::Chart(ms(at, "at")?),
+        (None, Some(r), None, None, None, None) => Axis::Ready(ms(r, "ready_at")?),
+        (None, None, Some(c), None, None, None) => Axis::Closing(ms(c, "closing_at")?),
+        (None, None, None, Some(true), None, None) => Axis::Loading,
+        (None, None, None, None, Some(s), None) => Axis::Select(ms(s, "select_at")?),
+        (None, None, None, None, None, Some(r)) => Axis::Result(ms(r, "result_at")?),
+        _ => {
+            return Err(
+                "give one of at, ready_at, closing_at, loading = true, select_at and result_at"
+                    .to_owned(),
+            );
+        }
+    };
+    match (axis, c.hold) {
+        (Axis::Select(_) | Axis::Result(_), hold) => Ok((axis, hold.unwrap_or(true))),
+        (_, None) => Ok((axis, false)),
+        (_, Some(_)) => Err("hold is for select_at and result_at".to_owned()),
     }
 }
 
@@ -651,8 +697,18 @@ fn roots(given: &[PathBuf], base: &Path) -> Result<Vec<(PathBuf, PathBuf)>, Stri
 struct Compiled {
     steps: Vec<(SelectStep, Origin)>,
     logs: Vec<ScriptedInput>,
-    /// Each capture's file (under the output), axis and step.
-    captures: Vec<(PathBuf, Axis, Origin)>,
+    captures: Vec<CompiledCapture>,
+}
+
+/// A capture as its step compiles.
+struct CompiledCapture {
+    /// Its file, under the output.
+    file: PathBuf,
+    axis: Axis,
+    origin: Origin,
+    hold: bool,
+    /// A `result_at` written on a result: that result's.
+    local: bool,
 }
 
 /// Where the sequence of steps stands.
@@ -675,9 +731,13 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
     let mut logs = Vec::new();
     // Each log decoded once, by its path; a generated one by what it is.
     let mut log_paths: Vec<LogKey> = Vec::new();
-    let mut captures: Vec<(PathBuf, Axis, Origin)> = Vec::new();
+    let mut captures: Vec<CompiledCapture> = Vec::new();
     // Captures no play has followed yet.
     let mut waiting: Vec<Origin> = Vec::new();
+    // `result_at` captures waiting for the next play's result.
+    let mut results: Vec<(Origin, bool)> = Vec::new();
+    // The holding captures of the result shown.
+    let mut holds: Vec<Origin> = Vec::new();
     let mut seq = Seq::Select;
     // The chosen chart's input and the step that set it.
     let mut chart_input: Option<(InputRef, Origin)> = None;
@@ -709,6 +769,20 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                 steps.push((SelectStep::Enter, o));
                 chart_input = None;
                 Seq::Chosen
+            }
+            (Seq::Select, Step::Cursor(s)) => {
+                match (&s.path, &s.search) {
+                    (Some(p), None) => {
+                        let target = target(base, p, roots).map_err(at)?;
+                        steps.push((SelectStep::PickPath(target), o));
+                    }
+                    (None, Some(text)) => {
+                        steps.push((SelectStep::Query(text.clone()), o));
+                        steps.push((SelectStep::PickSearched(text.clone()), o));
+                    }
+                    _ => return Err(at("give either path or search".to_owned())),
+                }
+                Seq::Select
             }
             (Seq::Chosen | Seq::Replay, Step::Play(p)) => {
                 // A log by its path, or one generated: the index it has, or
@@ -781,11 +855,33 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                 // A quit, at chart time 0 or later, ends the play midway on
                 // its result, as a skip does once it is complete.
                 match until {
-                    None | Some((_, UntilCommand::Quit | UntilCommand::Skip)) => Seq::Result,
-                    Some((_, UntilCommand::Retry)) => Seq::Replay,
+                    None | Some((_, UntilCommand::Quit | UntilCommand::Skip)) => {
+                        holds = results
+                            .iter()
+                            .filter(|(_, h)| *h)
+                            .map(|(c, _)| *c)
+                            .collect();
+                        results.clear();
+                        Seq::Result
+                    }
+                    Some((_, UntilCommand::Retry)) => {
+                        if let Some((c, _)) = results.first() {
+                            return Err(format!(
+                                "{c}: no result follows: step {} ends in a retry",
+                                o.index
+                            ));
+                        }
+                        Seq::Replay
+                    }
                 }
             }
             (Seq::Result, Step::Result(r)) => {
+                if let (ResultKind::Stay, Some(h)) = (r, holds.first()) {
+                    return Err(format!(
+                        "{h}: a holding capture cannot wait on stay, which leaves on its own; \
+                         give hold = false, or leave with back"
+                    ));
+                }
                 let (step, next) = match r {
                     ResultKind::NextPreset => (SelectStep::Next, Seq::Result),
                     ResultKind::PrevPreset => (SelectStep::Prev, Seq::Result),
@@ -793,31 +889,68 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                     ResultKind::Back => (SelectStep::Back, Seq::Select),
                     ResultKind::Stay => (SelectStep::Stay, Seq::Select),
                 };
+                if next != Seq::Result {
+                    holds.clear();
+                }
                 steps.push((step, o));
                 next
             }
             (Seq::Select | Seq::Result, Step::Capture(c)) => {
-                let axis = capture_axis(c).map_err(at)?;
+                let (axis, hold) = capture_axis(c).map_err(at)?;
                 let rel = capture_file(&c.file).map_err(at)?;
                 let key = rel.to_string_lossy().to_lowercase();
-                if let Some((_, _, other)) = captures
+                if let Some(other) = captures
                     .iter()
-                    .find(|(f, _, _)| f.to_string_lossy().to_lowercase() == key)
+                    .find(|other| other.file.to_string_lossy().to_lowercase() == key)
                 {
                     return Err(at(format!(
                         "{} is also step {}'s file",
                         c.file.display(),
-                        other.index
+                        other.origin.index
                     )));
                 }
                 let k = u16::try_from(captures.len())
                     .map_err(|_| at("too many captures".to_owned()))?;
-                captures.push((rel, axis, o));
-                waiting.push(o);
+                // A selection's needs the select screen; a result's written
+                // on a result is that result's, else the next play's.
+                let local = match (axis, seq) {
+                    (Axis::Select(_), Seq::Result) => {
+                        return Err(at("select_at needs the select screen".to_owned()));
+                    }
+                    (Axis::Select(_), _) => false,
+                    (Axis::Result(_), Seq::Result) => {
+                        if hold {
+                            holds.push(o);
+                        }
+                        true
+                    }
+                    (Axis::Result(_), _) => {
+                        results.push((o, hold));
+                        waiting.push(o);
+                        false
+                    }
+                    _ => {
+                        waiting.push(o);
+                        false
+                    }
+                };
+                captures.push(CompiledCapture {
+                    file: rel,
+                    axis,
+                    origin: o,
+                    hold,
+                    local,
+                });
                 steps.push((SelectStep::Capture(k), o));
                 seq
             }
             (Seq::Select, Step::Practice(p)) => {
+                if let Some((c, _)) = results.first() {
+                    return Err(format!(
+                        "{c}: a practice shows no result: step {} practices",
+                        o.index
+                    ));
+                }
                 let goal = practice_goal(p, base, &mut log_paths, &mut logs).map_err(at)?;
                 match (&p.path, &p.search) {
                     (Some(path), None) => {
@@ -997,7 +1130,7 @@ fn is_link(meta: &fs::Metadata) -> bool {
 fn make_output(
     base: &Path,
     output: &Path,
-    captures: &[(PathBuf, Axis, Origin)],
+    captures: &[CompiledCapture],
 ) -> Result<PathBuf, String> {
     if !stays_below(output) {
         return Err(format!(
@@ -1026,10 +1159,11 @@ fn make_output(
         }
     }
     // Inside a folder this run just made: no link can be there.
-    for (file, _, o) in captures {
-        if let Some(dir) = file.parent().filter(|d| !d.as_os_str().is_empty()) {
+    for c in captures {
+        if let Some(dir) = c.file.parent().filter(|d| !d.as_os_str().is_empty()) {
             let dir = at.join(dir);
-            fs::create_dir_all(&dir).map_err(|e| format!("{o}: {}: {e}", dir.display()))?;
+            fs::create_dir_all(&dir)
+                .map_err(|e| format!("{}: {}: {e}", c.origin, dir.display()))?;
         }
     }
     Ok(at)
@@ -1078,7 +1212,34 @@ pub enum CaptureState {
     Pending,
     /// A play of this generation takes it.
     Bound(u64),
-    /// The render thread writes it from a frame of this generation.
+    /// A `select_at` capture armed by the select screen's update of this
+    /// lifetime and revision, published after the steps before it: a
+    /// selection frame that applied it or a later one takes it, the first
+    /// such frame presented being its origin.
+    Selecting {
+        /// The update's lifetime.
+        lifetime: u64,
+        /// The update's revision.
+        revision: u64,
+        /// When the first frame that applied it was presented.
+        origin: Option<TimeUs>,
+    },
+    /// A `result_at` capture bound to the play of this generation, until
+    /// its result begins.
+    AwaitingResult(u64),
+    /// A `result_at` capture of the result numbered `seq`: a frame of it
+    /// that drew an end page numbered `page` or later and, when given, a
+    /// view keyed `view` or later takes it.
+    Resulting {
+        /// The result's number.
+        seq: u64,
+        /// The end page published after the steps before it.
+        page: u64,
+        /// The view desired after the steps before it.
+        view: Option<u64>,
+    },
+    /// The render thread writes it from a frame of this generation
+    /// ([`SCREEN_SAVE`] for a selection or result frame).
     Saving(u64),
     /// Written.
     Succeeded,
@@ -1101,6 +1262,12 @@ pub enum Axis {
     Closing(TimeUs),
     /// The first presented frame of its loading state.
     Loading,
+    /// The first presented selection frame at or after this time since
+    /// the first that applied the update its step was armed with.
+    Select(TimeUs),
+    /// The first presented frame of its result at or after this time
+    /// since that result's first presented frame.
+    Result(TimeUs),
 }
 
 impl Axis {
@@ -1110,14 +1277,64 @@ impl Axis {
             Self::Ready(_) => "ready",
             Self::Closing(_) => "closing",
             Self::Loading => "loading",
+            Self::Select(_) => "select",
+            Self::Result(_) => "result",
         }
     }
 
     const fn target(self) -> i64 {
         match self {
-            Self::Chart(t) | Self::Ready(t) | Self::Closing(t) => t.0,
+            Self::Chart(t)
+            | Self::Ready(t)
+            | Self::Closing(t)
+            | Self::Select(t)
+            | Self::Result(t) => t.0,
             Self::Loading => 0,
         }
+    }
+
+    /// The screen whose leaving fails it, by name.
+    const fn screen(self) -> &'static str {
+        match self {
+            Self::Select(_) => "selection",
+            _ => "result",
+        }
+    }
+}
+
+/// The generation a selection or result frame is saved under: no play's.
+pub const SCREEN_SAVE: u64 = u64::MAX;
+
+/// How a selection or a result was left, for the captures it fails.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Leaving {
+    /// It was left: a choice, back, its scene time, a retry, practice.
+    Left,
+    /// The run ended.
+    Ended,
+}
+
+/// A capture as the step that runs it sees it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CaptureStatus {
+    /// What it waits for.
+    pub axis: Axis,
+    /// Whether it holds the next step.
+    pub hold: bool,
+    /// A `result_at` written on a result: that result's.
+    pub local: bool,
+    /// How far it has come.
+    pub state: CaptureState,
+}
+
+impl CaptureStatus {
+    /// Whether it has ended: written or failed.
+    #[must_use]
+    pub const fn ended(&self) -> bool {
+        matches!(
+            self.state,
+            CaptureState::Succeeded | CaptureState::Failed(_)
+        )
     }
 }
 
@@ -1131,6 +1348,12 @@ pub struct Capture {
     pub path: PathBuf,
     /// Its step.
     pub origin: Origin,
+    /// Whether it holds the next step until it ends (`select_at` and
+    /// `result_at` unless `hold = false`).
+    pub hold: bool,
+    /// A `result_at` written on a result: that result's, not the next
+    /// play's.
+    pub local: bool,
     /// How far it has come.
     pub state: CaptureState,
     /// Whether the game thread has reported how it ended.
@@ -1170,13 +1393,149 @@ impl Captures {
         }
     }
 
-    /// The play of `generation` starts: it takes every capture armed.
+    /// The play of `generation` starts: it takes every capture armed, a
+    /// `result_at` one for the result it shows.
     pub fn bind(&self, generation: u64) {
         for c in self.lock().iter_mut() {
             if c.state == CaptureState::Pending {
-                c.state = CaptureState::Bound(generation);
+                c.state = match c.axis {
+                    Axis::Result(_) => CaptureState::AwaitingResult(generation),
+                    _ => CaptureState::Bound(generation),
+                };
             }
         }
+    }
+
+    /// Capture `k`, as its step sees it.
+    pub fn status(&self, k: u16) -> Option<CaptureStatus> {
+        self.lock().get(usize::from(k)).map(|c| CaptureStatus {
+            axis: c.axis,
+            hold: c.hold,
+            local: c.local,
+            state: c.state.clone(),
+        })
+    }
+
+    /// Capture `k`, a `select_at`, is armed with the select screen's
+    /// update published after the steps before it.
+    pub fn arm_select(&self, k: u16, lifetime: u64, revision: u64) {
+        if let Some(c) = self.lock().get_mut(usize::from(k))
+            && c.state == CaptureState::Unarmed
+        {
+            c.state = CaptureState::Selecting {
+                lifetime,
+                revision,
+                origin: None,
+            };
+        }
+    }
+
+    /// Capture `k`, a `result_at` written on result `seq`, is armed with
+    /// the end page and view published after the steps before it.
+    pub fn arm_result(&self, k: u16, seq: u64, page: u64, view: Option<u64>) {
+        if let Some(c) = self.lock().get_mut(usize::from(k))
+            && c.state == CaptureState::Unarmed
+        {
+            c.state = CaptureState::Resulting { seq, page, view };
+        }
+    }
+
+    /// Result `id` begins: the `result_at` captures bound to its play are
+    /// its.
+    pub fn begin_result(&self, id: ResultId) {
+        for c in self.lock().iter_mut() {
+            if c.state == CaptureState::AwaitingResult(id.generation) {
+                c.state = CaptureState::Resulting {
+                    seq: id.seq,
+                    page: 0,
+                    view: None,
+                };
+            }
+        }
+    }
+
+    /// Whether a holding capture of the selection (`None`) or of result
+    /// `seq` has not ended.
+    pub fn held(&self, result: Option<u64>) -> bool {
+        self.lock()
+            .iter()
+            .any(|c| c.hold && Self::of_screen(c, result))
+    }
+
+    /// Whether `c` is a capture of the selection (`None`) or of result
+    /// `seq` that has not ended, one being written included.
+    fn of_screen(c: &Capture, result: Option<u64>) -> bool {
+        match (&c.state, result, c.axis) {
+            (CaptureState::Selecting { .. }, None, _)
+            | (CaptureState::Saving(SCREEN_SAVE), None, Axis::Select(_)) => true,
+            (CaptureState::Resulting { seq, .. }, Some(r), _) => *seq == r,
+            (CaptureState::Saving(SCREEN_SAVE), Some(_), Axis::Result(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// The selection (`None`) or result `seq` was left as `how`: each of
+    /// its captures whose frame was not taken fails; one being written is
+    /// left to its writer. Returns how those not reported yet ended.
+    pub fn leave(&self, result: Option<u64>, how: Leaving) -> Settled {
+        let mut list = self.lock();
+        for c in list.iter_mut() {
+            let waiting = Self::waiting_on(c, result);
+            if waiting {
+                let what = match how {
+                    Leaving::Left => format!("the {} left", c.axis.screen()),
+                    Leaving::Ended => "the run ended".to_owned(),
+                };
+                c.state = CaptureState::Failed(format!(
+                    "{what} before a frame at {} ms on its {} axis",
+                    c.axis.target() / 1_000,
+                    c.axis.name()
+                ));
+            }
+        }
+        Self::report(&mut list)
+    }
+
+    /// The holding captures of the selection (`None`) or of result `seq`
+    /// whose frame was not taken fail, the render bound passed. Returns
+    /// how those not reported yet ended.
+    pub fn expire(&self, result: Option<u64>) -> Settled {
+        let mut list = self.lock();
+        for c in list.iter_mut() {
+            let waiting = Self::waiting_on(c, result);
+            if c.hold && waiting {
+                c.state = CaptureState::Failed(format!(
+                    "the capture did not resolve within the render bound ({} ms on its {} axis)",
+                    c.axis.target() / 1_000,
+                    c.axis.name()
+                ));
+            }
+        }
+        Self::report(&mut list)
+    }
+
+    /// Whether `c` waits for a frame of the selection (`None`) or of
+    /// result `seq`: armed, its frame not taken.
+    fn waiting_on(c: &Capture, result: Option<u64>) -> bool {
+        match (&c.state, result) {
+            (CaptureState::Selecting { .. }, None) => true,
+            (CaptureState::Resulting { seq, .. }, Some(r)) => *seq == r,
+            _ => false,
+        }
+    }
+
+    /// The captures that ended and were not reported yet, now reported.
+    fn report(list: &mut [Capture]) -> Settled {
+        let mut settled = Settled::default();
+        for c in list.iter_mut().filter(|c| !c.reported) {
+            match &c.state {
+                CaptureState::Succeeded => settled.written.push((c.origin, c.path.clone())),
+                CaptureState::Failed(why) => settled.failed.push((c.origin, why.clone())),
+                _ => continue,
+            }
+            c.reported = true;
+        }
+        settled
     }
 
     /// The play of `generation` is over, its frames drawn when `answered`
@@ -1185,8 +1544,6 @@ impl Captures {
     /// render thread holds the list (it did not answer).
     pub fn settle(&self, generation: u64, answered: bool) -> Result<Settled, ()> {
         let mut list = self.try_lock().ok_or(())?;
-        let mut settled = Settled::default();
-        let Settled { written, failed } = &mut settled;
         for c in list.iter_mut() {
             match c.state {
                 CaptureState::Bound(g) if g == generation => {
@@ -1205,17 +1562,8 @@ impl Captures {
                 }
                 _ => {}
             }
-            if c.reported {
-                continue;
-            }
-            match &c.state {
-                CaptureState::Succeeded => written.push((c.origin, c.path.clone())),
-                CaptureState::Failed(why) => failed.push((c.origin, why.clone())),
-                _ => continue,
-            }
-            c.reported = true;
         }
-        Ok(settled)
+        Ok(Self::report(&mut list))
     }
 
     /// After the render thread has ended: each capture that did not end,
@@ -1227,7 +1575,12 @@ impl Captures {
         };
         list.iter()
             .filter_map(|c| match &c.state {
-                CaptureState::Pending | CaptureState::Bound(_) | CaptureState::Saving(_) => {
+                CaptureState::Pending
+                | CaptureState::Bound(_)
+                | CaptureState::Saving(_)
+                | CaptureState::Selecting { .. }
+                | CaptureState::AwaitingResult(_)
+                | CaptureState::Resulting { .. } => {
                     Some(format!("{}: {} did not run", c.origin, c.path.display()))
                 }
                 CaptureState::Failed(why) if !c.reported => Some(format!("{}: {why}", c.origin)),
@@ -1256,6 +1609,8 @@ impl Captures {
                     axis: Axis::Chart(at),
                     path,
                     origin,
+                    hold: false,
+                    local: false,
                     state: CaptureState::Unarmed,
                     reported: false,
                 })
@@ -1303,6 +1658,9 @@ pub struct ScenarioFrames {
     backlog: Arc<(Mutex<Backlog>, Condvar)>,
     /// The bytes the backlog may hold: [`WRITE_BYTES`], less in tests.
     write_bytes: usize,
+    /// The newest result seen, by its number, and when its first frame
+    /// was presented: its captures' origin.
+    result_origin: Option<(u64, TimeUs)>,
 }
 
 /// The captured frames that may wait for or be in the writer at once.
@@ -1381,6 +1739,22 @@ impl Captures {
             c.axis = axis;
         }
     }
+
+    /// Capture `i` holds (tests).
+    #[cfg(test)]
+    pub fn set_hold(&self, i: usize, hold: bool) {
+        if let Some(c) = self.lock().get_mut(i) {
+            c.hold = hold;
+        }
+    }
+
+    /// Capture `i` is in `state` (tests).
+    #[cfg(test)]
+    pub fn set_state(&self, i: usize, state: CaptureState) {
+        if let Some(c) = self.lock().get_mut(i) {
+            c.state = state;
+        }
+    }
 }
 
 impl ScenarioFrames {
@@ -1407,6 +1781,7 @@ impl ScenarioFrames {
             writer: None,
             backlog: Arc::default(),
             write_bytes: WRITE_BYTES,
+            result_origin: None,
         }
     }
 
@@ -1525,14 +1900,22 @@ impl FrameSink for ScenarioFrames {
             return;
         }
         self.frame = self.frame.wrapping_add(1);
-        let due: Vec<(usize, PathBuf, Axis, u64)> = {
+        // A result's origin: its first presented frame, whatever drew it.
+        if drawn.screen.is_result()
+            && let Some(id) = drawn.result.and_then(|r| r.id)
+            && self.result_origin.is_none_or(|(seq, _)| seq != id.seq)
+        {
+            self.result_origin = Some((id.seq, drawn.presented_at));
+        }
+        let result_origin = self.result_origin;
+        let due: Vec<(usize, PathBuf, Axis, u64, Stamp)> = {
             let mut list = self.captures.lock();
             list.iter_mut()
                 .enumerate()
-                .filter_map(|(i, c)| match capture_due(c, drawn)? {
-                    Due::Save(generation) => {
+                .filter_map(|(i, c)| match capture_due(c, drawn, result_origin)? {
+                    Due::Save(generation, stamp) => {
                         c.state = CaptureState::Saving(generation);
-                        Some((i, c.path.clone(), c.axis, generation))
+                        Some((i, c.path.clone(), c.axis, generation, stamp))
                     }
                     Due::Fail(why) => {
                         c.state = CaptureState::Failed(format!("{}: {why}", c.path.display()));
@@ -1561,7 +1944,7 @@ impl FrameSink for ScenarioFrames {
                 .map_or(0, |l| l.as_ref().map_or_else(String::len, String::len));
         if let Err(why) = self.admit(bytes) {
             let mut list = self.captures.lock();
-            for (i, path, _, generation) in due {
+            for (i, path, _, generation, _) in due {
                 if let Some(c) = list.get_mut(i)
                     && c.state == CaptureState::Saving(generation)
                 {
@@ -1572,8 +1955,8 @@ impl FrameSink for ScenarioFrames {
         }
         let due = due
             .into_iter()
-            .map(|(i, path, axis, generation)| {
-                let side = sidecar(axis, self.frame, drawn);
+            .map(|(i, path, axis, generation, stamp)| {
+                let side = sidecar(axis, self.frame, drawn, stamp);
                 (i, path, side, generation)
             })
             .collect();
@@ -1602,22 +1985,96 @@ impl FrameSink for ScenarioFrames {
 
 /// What a frame means for a capture waiting on it.
 enum Due {
-    /// It is the frame: saved under this generation.
-    Save(u64),
+    /// It is the frame: saved under this generation, with what its capture
+    /// waited for.
+    Save(u64, Stamp),
     /// The capture can no longer be met.
     Fail(&'static str),
 }
 
-/// What `drawn` means for capture `c`, if anything.
-fn capture_due(c: &Capture, drawn: &Drawn<'_>) -> Option<Due> {
-    if let Axis::Loading = c.axis {
+/// What a selection or result capture waited for, for its sidecar.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Stamp {
+    /// A play axis's: its frame says it all.
+    Play,
+    /// The update's revision it was armed with, and its origin.
+    Select { revision: u64, origin: TimeUs },
+    /// Its result's origin, and the end page and view it was armed with.
+    Result {
+        origin: TimeUs,
+        page: u64,
+        view: Option<u64>,
+    },
+}
+
+/// What `drawn` means for capture `c`, if anything: a selection capture's
+/// origin is set on the first frame that applied its update; a result
+/// capture's is its result's, `result_origin`.
+fn capture_due(
+    c: &mut Capture,
+    drawn: &Drawn<'_>,
+    result_origin: Option<(u64, TimeUs)>,
+) -> Option<Due> {
+    match c.axis {
         // Armed, whether or not its play has started; its frames carry no
         // play to bind to.
-        return match c.state {
-            CaptureState::Pending if drawn.loading => Some(Due::Save(0)),
-            CaptureState::Bound(g) if drawn.loading => Some(Due::Save(g)),
-            _ => None,
-        };
+        Axis::Loading => {
+            let loading = drawn.screen == ScreenKind::Loading;
+            return match c.state {
+                CaptureState::Pending if loading => Some(Due::Save(0, Stamp::Play)),
+                CaptureState::Bound(g) if loading => Some(Due::Save(g, Stamp::Play)),
+                _ => None,
+            };
+        }
+        Axis::Select(since) => {
+            let CaptureState::Selecting {
+                lifetime,
+                revision,
+                origin,
+            } = &mut c.state
+            else {
+                return None;
+            };
+            if drawn.screen != ScreenKind::Selection {
+                return None;
+            }
+            let (l, r) = drawn.selection?;
+            if l != *lifetime || r < *revision {
+                return None;
+            }
+            let o = *origin.get_or_insert(drawn.presented_at);
+            let stamp = Stamp::Select {
+                revision: *revision,
+                origin: o,
+            };
+            return (drawn.presented_at.0 - o.0 >= since.0)
+                .then_some(Due::Save(SCREEN_SAVE, stamp));
+        }
+        Axis::Result(since) => {
+            let CaptureState::Resulting { seq, page, view } = c.state else {
+                return None;
+            };
+            if !drawn.screen.is_result() {
+                return None;
+            }
+            let drew = drawn.result?;
+            if drew.id?.seq != seq || drew.page < page {
+                return None;
+            }
+            if let Some(v) = view
+                && drew.view.is_none_or(|drawn_view| drawn_view < v)
+            {
+                return None;
+            }
+            let (of, origin) = result_origin?;
+            if of != seq {
+                return None;
+            }
+            let stamp = Stamp::Result { origin, page, view };
+            return (drawn.presented_at.0 - origin.0 >= since.0)
+                .then_some(Due::Save(SCREEN_SAVE, stamp));
+        }
+        Axis::Chart(_) | Axis::Ready(_) | Axis::Closing(_) => {}
     }
     let (Some(generation), Some(t)) = (drawn.generation, drawn.play) else {
         return None;
@@ -1626,7 +2083,7 @@ fn capture_due(c: &Capture, drawn: &Drawn<'_>) -> Option<Due> {
         return None;
     }
     match c.axis {
-        Axis::Chart(at) => (t >= at).then_some(Due::Save(generation)),
+        Axis::Chart(at) => (t >= at).then_some(Due::Save(generation, Stamp::Play)),
         Axis::Ready(since) => {
             let view = drawn.view?;
             if view.generation != 0 {
@@ -1636,29 +2093,65 @@ fn capture_due(c: &Capture, drawn: &Drawn<'_>) -> Option<Due> {
             if t >= end {
                 return Some(Due::Fail("its READY state ended first"));
             }
-            (t.0 - origin.0 >= since.0).then_some(Due::Save(generation))
+            (t.0 - origin.0 >= since.0).then_some(Due::Save(generation, Stamp::Play))
         }
         Axis::Closing(since) => {
             let start = drawn.view?.closing?;
-            (t.0 - start.0 >= since.0).then_some(Due::Save(generation))
+            (t.0 - start.0 >= since.0).then_some(Due::Save(generation, Stamp::Play))
         }
-        Axis::Loading => None,
+        Axis::Loading | Axis::Select(_) | Axis::Result(_) => None,
     }
 }
 
 /// What the capture of `axis` on frame number `frame` was: its PNG's
 /// companion. A frame's play state may lag its time, which the view says.
-fn sidecar(axis: Axis, frame: u64, drawn: &Drawn<'_>) -> String {
+fn sidecar(axis: Axis, frame: u64, drawn: &Drawn<'_>, stamp: Stamp) -> String {
     let opt = |v: Option<i64>| v.map_or_else(|| "null".to_owned(), |v| v.to_string());
+    let num = |v: Option<u64>| opt(v.and_then(|v| i64::try_from(v).ok()));
     let view = drawn.view;
     let ready = view.and_then(|v| v.ready);
     let closing = view.and_then(|v| v.closing);
     let loading = drawn.loading_stamp;
+    let at = drawn.presented_at.0;
+    let (select_origin, stamp_revision) = match stamp {
+        Stamp::Select { revision, origin } => (Some(origin.0), Some(revision)),
+        _ => (None, None),
+    };
+    let (result_origin, stamp_page, stamp_view) = match stamp {
+        Stamp::Result { origin, page, view } => (Some(origin.0), Some(page), view),
+        _ => (None, None, None),
+    };
+    let result = drawn.result;
+    let id = result.and_then(|r| r.id);
+    let screen = format!(
+        "\"screen\":\"{}\",\"presented_us\":{at},\"select_us\":{},\"select_origin_us\":{},\
+         \"selection_lifetime\":{},\"selection_revision\":{},\"stamp_revision\":{},\
+         \"result_us\":{},\"result_origin_us\":{},\"result_seq\":{},\"result_generation\":{},\
+         \"result_drawn\":{},\"result_page\":{},\"result_view\":{},\"stamp_page\":{},\
+         \"stamp_view\":{},\"sampled_us\":{},\"result_timer_origin_us\":{}",
+        drawn.screen.name(),
+        opt(select_origin.map(|o| at - o)),
+        opt(select_origin),
+        num(drawn.selection.map(|(l, _)| l)),
+        num(drawn.selection.map(|(_, r)| r)),
+        num(stamp_revision),
+        opt(result_origin.map(|o| at - o)),
+        opt(result_origin),
+        num(id.map(|i| i.seq)),
+        num(id.map(|i| i.generation)),
+        result.map_or_else(|| "null".to_owned(), |r| format!("\"{}\"", r.path.name())),
+        num(result.map(|r| r.page)),
+        num(result.and_then(|r| r.view)),
+        num(stamp_page),
+        num(stamp_view),
+        opt(result.map(|r| r.sampled.0)),
+        opt(result.and_then(|r| r.timer_origin).map(|t| t.0)),
+    );
     format!(
         "{{\"axis\":\"{}\",\"target_us\":{},\"frame\":{frame},\"phase\":\"{}\",\
          \"chart_us\":{},\"ready_us\":{},\"ready_origin_us\":{},\"play_at_us\":{},\
          \"closing_us\":{},\"closing_start_us\":{},\"loading_us\":{},\"loading_origin_us\":{},\"settled\":{},\"completed_us\":{},\
-         \"generation\":{},\"view_generation\":{},\"finalized_us\":{},\"events\":{}}}\n",
+         \"generation\":{},\"view_generation\":{},\"finalized_us\":{},\"events\":{},{screen}}}\n",
         axis.name(),
         axis.target(),
         phase(drawn),
@@ -1819,7 +2312,12 @@ fn display_list_lines(list: &skin_model::DisplayList, drawn: &Drawn<'_>) -> Resu
 /// raising it only from the chart's start.
 fn phase(drawn: &Drawn<'_>) -> &'static str {
     let (Some(t), Some(v)) = (drawn.play, drawn.view) else {
-        return if drawn.loading { "loading" } else { "other" };
+        return match drawn.screen {
+            ScreenKind::Loading => "loading",
+            ScreenKind::Selection => "selection",
+            ScreenKind::Result | ScreenKind::End => "result",
+            _ => "other",
+        };
     };
     let before_play = v.ready.is_some_and(|(_, start)| t < start);
     match (v.closing.is_some(), v.complete, v.playing, before_play) {
@@ -1858,6 +2356,10 @@ pub struct State {
     /// The practice page's nearest approach to the goal its step sets,
     /// in keys: only a page nearer than this is progress.
     pub nearest: Option<u64>,
+    /// The result shown, from its preparation until it is left.
+    pub result_id: Option<ResultId>,
+    /// The results begun so far: the next one's number less one.
+    pub result_seq: u64,
 }
 
 /// Runs the scenario of `args`: song selection, headless, on its steps.
@@ -1868,9 +2370,11 @@ pub struct State {
 pub fn run(args: ScenarioArgs, clock: QpcClock) -> anyhow::Result<()> {
     let Scenario {
         rescan_ms,
-        script,
+        mut script,
         session,
     } = load(&args.file)?;
+    // A holding capture waits at most the render bound.
+    script.set_hold_bound(args.render_timeout.unwrap_or(super::HOLD_BOUND));
     if let Some((stage, mode)) = args.specializing {
         super::specializing(stage, mode);
     }
@@ -2149,7 +2653,7 @@ mod tests {
 
     /// The file of `steps` (TOML `[[step]]` bodies, one per entry).
     fn file(output: Option<&str>, steps: &[&str]) -> String {
-        let mut text = "version = 5\n".to_owned();
+        let mut text = "version = 6\n".to_owned();
         if let Some(o) = output {
             writeln!(text, "output = \"{o}\"").unwrap();
         }
@@ -2642,7 +3146,7 @@ mod tests {
     #[test]
     fn bounds_are_checked() {
         let dir = folder();
-        let mut text = "version = 5\nstep = [".to_owned();
+        let mut text = "version = 6\nstep = [".to_owned();
         for _ in 0..=u16::MAX {
             text.push_str("{quit={}},");
         }
@@ -2690,7 +3194,7 @@ mod tests {
     fn an_oversized_file_is_refused() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("big.toml");
-        let mut text = "version = 5\n".to_owned();
+        let mut text = "version = 6\n".to_owned();
         text.push_str(&"#".repeat(super::MAX_FILE));
         fs::write(&path, text).unwrap();
         let e = format!("{:#}", super::load(&path).unwrap_err());
@@ -2710,16 +3214,16 @@ mod tests {
             let e = refused(dir.path(), None, &[step]);
             assert!(e.contains(&format!("line {line}")), "{step}: {e}");
         }
-        let e = parse("version = 5\nfast = true\n", dir.path()).unwrap_err();
+        let e = parse("version = 6\nfast = true\n", dir.path()).unwrap_err();
         assert!(e.contains("fast"), "{e}");
         // Another version, the previous one too, is refused.
         assert_eq!(
             parse("version = 1\nfast = true\n", dir.path()).unwrap_err(),
-            "version 1 is not supported; this build reads version 5"
+            "version 1 is not supported; this build reads version 6"
         );
         assert_eq!(
             parse("[library]\n", dir.path()).unwrap_err(),
-            "no version; this build reads version 5"
+            "no version; this build reads version 6"
         );
     }
 
@@ -2731,7 +3235,7 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             std::fs::write(dir.path().join("a.bms"), "").unwrap();
             let text = format!(
-                "version = 5\noutput = \"out\"\n[library]\nroots = [\".\"]\n[[step]]\ncapture = {{ {body}file = \"a.png\" }}\n[[step]]\nselect = {{ path = \"a.bms\" }}\n[[step]]\nplay = {{ input = \"auto\", until = \"end\" }}\n[[step]]\nresult = \"back\"\n[[step]]\nquit = {{}}\n"
+                "version = 6\noutput = \"out\"\n[library]\nroots = [\".\"]\n[[step]]\ncapture = {{ {body}file = \"a.png\" }}\n[[step]]\nselect = {{ path = \"a.bms\" }}\n[[step]]\nplay = {{ input = \"auto\", until = \"end\" }}\n[[step]]\nresult = \"back\"\n[[step]]\nquit = {{}}\n"
             );
             parse(&text, dir.path()).map(|p| p.session.captures.0.lock().unwrap()[0].axis)
         };
@@ -2764,7 +3268,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let sized = |size: &str| {
             let text = format!(
-                "version = 5\nsize = {size}\n[library]\nroots = [\".\"]\n[[step]]\nquit = {{}}\n"
+                "version = 6\nsize = {size}\n[library]\nroots = [\".\"]\n[[step]]\nquit = {{}}\n"
             );
             parse(&text, dir.path()).map(|p| p.session.size)
         };
@@ -2786,7 +3290,7 @@ mod tests {
             events: 56,
             ..drawn_view()
         });
-        let side = super::sidecar(super::Axis::Chart(TimeUs(0)), 9, &d);
+        let side = super::sidecar(super::Axis::Chart(TimeUs(0)), 9, &d, super::Stamp::Play);
         assert!(side.contains("\"view_generation\":3,"), "{side}");
         assert!(side.contains("\"finalized_us\":1234,"), "{side}");
         assert!(side.contains("\"events\":56"), "{side}");
@@ -2854,8 +3358,11 @@ mod tests {
             d
         };
         let due = |d: &crate::measure::Drawn<'_>| {
-            let list = c.0.lock().unwrap();
-            matches!(super::capture_due(&list[0], d), Some(super::Due::Save(1)))
+            let mut list = c.0.lock().unwrap();
+            matches!(
+                super::capture_due(&mut list[0], d, None),
+                Some(super::Due::Save(1, _))
+            )
         };
         // Past its time on the chart, but no Closing in the view: none.
         assert!(!due(&closing(9_000, None)));
@@ -2866,6 +3373,7 @@ mod tests {
             super::Axis::Closing(TimeUs(300_000)),
             4,
             &closing(5_300, Some(5_000)),
+            super::Stamp::Play,
         );
         assert!(side.contains("\"closing_us\":300000,"), "{side}");
         assert!(side.contains("\"closing_start_us\":5000000,"), "{side}");
@@ -3498,8 +4006,10 @@ mod tests {
             play: Some(TimeUs(ms * 1_000)),
             view: Some(drawn_view()),
             loading_stamp: None,
-            menu: false,
-            loading: false,
+            screen: crate::measure::ScreenKind::Play,
+            selection: None,
+            result: None,
+            presented_at: TimeUs(0),
             skin_loading: None,
             generation: Some(generation),
             timing: render::FrameTiming {
@@ -3550,5 +4060,397 @@ mod tests {
             let _ = self.held.lock().unwrap().recv();
             Some((1, 1, vec![0; 4]))
         }
+    }
+
+    /// Captures under `dir` waiting on `axes`, each holding as given.
+    fn screen_captures(dir: &Path, axes: &[(super::Axis, bool)]) -> Captures {
+        let c = Captures::of(
+            (0..axes.len())
+                .map(|i| (TimeUs(0), dir.join(format!("{i}.png"))))
+                .collect(),
+        );
+        for (i, &(axis, hold)) in axes.iter().enumerate() {
+            c.set_axis(i, axis);
+            c.set_hold(i, hold);
+        }
+        c
+    }
+
+    /// A presented frame of `screen`, presented at `at_ms` on the clock.
+    fn screen_drawn(
+        screen: crate::measure::ScreenKind,
+        at_ms: i64,
+    ) -> crate::measure::Drawn<'static> {
+        let mut d = drawn(1, 0);
+        d.play = None;
+        d.view = None;
+        d.generation = None;
+        d.screen = screen;
+        d.presented_at = TimeUs(at_ms * 1_000);
+        d
+    }
+
+    /// A selection frame that applied update `revision` of `lifetime`.
+    fn selection_frame(lifetime: u64, revision: u64, at_ms: i64) -> crate::measure::Drawn<'static> {
+        let mut d = screen_drawn(crate::measure::ScreenKind::Selection, at_ms);
+        d.selection = Some((lifetime, revision));
+        d
+    }
+
+    /// A built-in result frame of result `seq` that drew end page `page`
+    /// (and view `view`).
+    fn result_frame(
+        seq: u64,
+        page: u64,
+        view: Option<u64>,
+        at_ms: i64,
+    ) -> crate::measure::Drawn<'static> {
+        let mut d = screen_drawn(crate::measure::ScreenKind::End, at_ms);
+        d.result = Some(crate::measure::ResultStamp {
+            id: Some(crate::measure::ResultId { seq, generation: 1 }),
+            path: crate::measure::ResultPath::BuiltIn,
+            page,
+            view,
+            sampled: TimeUs(at_ms * 1_000 - 2_000),
+            timer_origin: None,
+        });
+        d
+    }
+
+    /// A sink of `c` with a screen whose read-back answers at once.
+    fn released(c: &Captures) -> (super::ScenarioFrames, Stalling) {
+        let sink = super::ScenarioFrames::new(c.clone());
+        let (entered, seen) = std::sync::mpsc::channel();
+        std::mem::forget(seen);
+        let (_, held) = std::sync::mpsc::channel::<()>();
+        let screen = Stalling {
+            entered,
+            held: std::sync::Mutex::new(held),
+        };
+        (sink, screen)
+    }
+
+    /// I1 on the render side: a selection capture takes only a selection
+    /// frame of its update's lifetime that applied its revision or a later
+    /// one; its origin is the first such frame presented.
+    #[test]
+    fn a_select_capture_takes_its_update_or_a_later_one() {
+        use crate::measure::ScreenKind;
+        let dir = tempfile::tempdir().unwrap();
+        let c = screen_captures(dir.path(), &[(super::Axis::Select(TimeUs(250_000)), true)]);
+        c.arm_select(0, 1, 5);
+        let due = |d: &crate::measure::Drawn<'_>| {
+            let mut list = c.0.lock().unwrap();
+            matches!(
+                super::capture_due(&mut list[0], d, None),
+                Some(super::Due::Save(super::SCREEN_SAVE, _))
+            )
+        };
+        assert!(!due(&selection_frame(1, 4, 0)), "an earlier revision");
+        assert!(!due(&selection_frame(2, 9, 0)), "another lifetime");
+        let mut other = selection_frame(1, 5, 0);
+        other.screen = ScreenKind::Page;
+        assert!(!due(&other), "another screen");
+        // The origin: the first frame that applied revision 5 or later.
+        assert!(!due(&selection_frame(1, 6, 10)));
+        assert!(!due(&selection_frame(1, 6, 200)));
+        assert!(due(&selection_frame(1, 7, 260)));
+        assert!(matches!(
+            c.states()[0],
+            CaptureState::Selecting {
+                origin: Some(TimeUs(10_000)),
+                ..
+            }
+        ));
+    }
+
+    /// I3 on the render side: a result's origin is its first presented
+    /// frame, kept while its pages change; a later result has its own. Each
+    /// capture of a result takes only a frame of it.
+    #[test]
+    fn a_results_origin_is_its_first_presented_frame() {
+        use super::FrameSink as _;
+        let dir = tempfile::tempdir().unwrap();
+        let c = screen_captures(
+            dir.path(),
+            &[
+                (super::Axis::Result(TimeUs(400_000)), true),
+                (super::Axis::Result(TimeUs(0)), true),
+            ],
+        );
+        for (i, seq) in [(0, 1), (1, 2)] {
+            c.set_state(
+                i,
+                CaptureState::Resulting {
+                    seq,
+                    page: 0,
+                    view: None,
+                },
+            );
+        }
+        let (mut sink, screen) = released(&c);
+        sink.frame(&screen, &result_frame(1, 1, None, 1_000));
+        sink.frame(&screen, &result_frame(1, 2, None, 1_300));
+        assert!(matches!(c.states()[0], CaptureState::Resulting { .. }));
+        sink.frame(&screen, &result_frame(1, 3, None, 1_450));
+        sink.frame(&screen, &result_frame(2, 4, None, 2_000));
+        sink.finish();
+        let side = |i: usize| fs::read_to_string(dir.path().join(format!("{i}.json"))).unwrap();
+        let first = side(0);
+        assert!(first.contains("\"result_origin_us\":1000000,"), "{first}");
+        assert!(first.contains("\"result_us\":450000,"), "{first}");
+        assert!(first.contains("\"result_seq\":1,"), "{first}");
+        assert!(first.contains("\"result_page\":3,"), "{first}");
+        assert!(first.contains("\"screen\":\"end\""), "{first}");
+        assert!(first.contains("\"phase\":\"result\""), "{first}");
+        let second = side(1);
+        assert!(second.contains("\"result_origin_us\":2000000,"), "{second}");
+        assert!(second.contains("\"result_seq\":2,"), "{second}");
+    }
+
+    /// A capture written on a result takes only a frame that drew the end
+    /// page and view published after the steps before it.
+    #[test]
+    fn a_result_capture_waits_for_its_page_and_view() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = screen_captures(dir.path(), &[(super::Axis::Result(TimeUs(0)), true)]);
+        c.arm_result(0, 1, 3, Some(7));
+        let due = |d: &crate::measure::Drawn<'_>| {
+            let mut list = c.0.lock().unwrap();
+            matches!(
+                super::capture_due(&mut list[0], d, Some((1, TimeUs(0)))),
+                Some(super::Due::Save(..))
+            )
+        };
+        assert!(!due(&result_frame(1, 2, Some(7), 10)), "an earlier page");
+        assert!(!due(&result_frame(1, 3, Some(6), 10)), "an earlier view");
+        assert!(!due(&result_frame(1, 3, None, 10)), "no view");
+        assert!(!due(&result_frame(2, 3, Some(7), 10)), "another result");
+        assert!(due(&result_frame(1, 3, Some(7), 10)));
+    }
+
+    /// A leaving fails the captures of what was left whose frame was not
+    /// taken, saying how; one being written is left to its writer; another
+    /// result's are untouched.
+    #[test]
+    fn a_leaving_fails_only_the_left_screens_waiting_captures() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = screen_captures(
+            dir.path(),
+            &[
+                (super::Axis::Result(TimeUs(400_000)), true),
+                (super::Axis::Result(TimeUs(0)), true),
+                (super::Axis::Result(TimeUs(0)), true),
+                (super::Axis::Select(TimeUs(600_000_000)), false),
+            ],
+        );
+        let resulting = |seq| CaptureState::Resulting {
+            seq,
+            page: 0,
+            view: None,
+        };
+        c.set_state(0, resulting(1));
+        c.set_state(1, CaptureState::Saving(super::SCREEN_SAVE));
+        c.set_state(2, resulting(2));
+        c.arm_select(3, 1, 1);
+        assert!(c.held(Some(1)) && c.held(Some(2)));
+        let settled = c.leave(Some(1), super::Leaving::Left);
+        assert_eq!(
+            settled.failed,
+            [(
+                origin(1, StepKind::Capture),
+                "the result left before a frame at 400 ms on its result axis".to_owned()
+            )]
+        );
+        let states = c.states();
+        assert_eq!(states[1], CaptureState::Saving(super::SCREEN_SAVE));
+        assert_eq!(states[2], resulting(2));
+        let settled = c.leave(None, super::Leaving::Ended);
+        assert_eq!(
+            settled.failed[0].1,
+            "the run ended before a frame at 600000 ms on its select axis"
+        );
+    }
+
+    /// A writer's outcome never replaces an ended capture's: the first
+    /// ending stands.
+    #[test]
+    fn late_writer_does_not_overwrite() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = screen_captures(dir.path(), &[(super::Axis::Result(TimeUs(0)), true)]);
+        c.set_state(0, CaptureState::Failed("left".to_owned()));
+        let backlog = std::sync::Arc::new((
+            std::sync::Mutex::new(super::Backlog {
+                frames: 1,
+                bytes: 0,
+            }),
+            std::sync::Condvar::new(),
+        ));
+        let mut job = super::Job {
+            pixels: Some((1, 1, vec![0; 4])),
+            list: None,
+            due: vec![(
+                0,
+                dir.path().join("0.png"),
+                "{}\n".to_owned(),
+                super::SCREEN_SAVE,
+            )],
+            bytes: 0,
+            backlog,
+            captures: c.clone(),
+        };
+        super::write_frame(&mut job);
+        drop(job);
+        assert_eq!(c.states()[0], CaptureState::Failed("left".to_owned()));
+    }
+
+    /// The refusals of selection and result captures, each naming its
+    /// step.
+    #[test]
+    fn screen_captures_out_of_place_are_refused() {
+        let dir = folder();
+        let select = "select = { path = \"library/a/a.bms\" }";
+        let auto = "play = { input = \"auto\", until = \"end\" }";
+        let result_at = "capture = { result_at = 100, file = \"r.png\" }";
+        assert_eq!(
+            refused(
+                dir.path(),
+                Some("out"),
+                &[
+                    result_at,
+                    select,
+                    "play = { input = \"auto\", until = { at_ms = 0, command = \"retry\" } }",
+                    auto,
+                    "result = \"back\"",
+                    "quit = {}"
+                ]
+            ),
+            "step 1 (capture): no result follows: step 3 ends in a retry"
+        );
+        write_log(dir.path());
+        let practice = practice(&format!("{FIELDS}, rounds = 1"));
+        assert_eq!(
+            refused(
+                dir.path(),
+                Some("out"),
+                &[result_at, &practice, "quit = {}"]
+            ),
+            "step 1 (capture): a practice shows no result: step 2 practices"
+        );
+        assert!(
+            refused(
+                dir.path(),
+                Some("out"),
+                &[result_at, select, auto, "result = \"stay\"", "quit = {}"]
+            )
+            .starts_with("step 1 (capture): a holding capture cannot wait on stay"),
+        );
+        assert!(
+            refused(
+                dir.path(),
+                Some("out"),
+                &[select, auto, result_at, "result = \"stay\"", "quit = {}"]
+            )
+            .starts_with("step 3 (capture): a holding capture cannot wait on stay"),
+        );
+        assert_eq!(
+            refused(
+                dir.path(),
+                Some("out"),
+                &[
+                    select,
+                    auto,
+                    "capture = { select_at = 0, file = \"s.png\" }",
+                    "quit = {}"
+                ]
+            ),
+            "step 3 (capture): select_at needs the select screen"
+        );
+        assert_eq!(
+            refused(
+                dir.path(),
+                Some("out"),
+                &[
+                    "capture = { at = 0, hold = true, file = \"a.png\" }",
+                    "quit = {}"
+                ]
+            ),
+            "step 1 (capture): hold is for select_at and result_at"
+        );
+        // Not holding, a result capture may wait on stay.
+        parse(
+            &file(
+                Some("out2"),
+                &[
+                    "capture = { result_at = 100, hold = false, file = \"r.png\" }",
+                    select,
+                    auto,
+                    "result = \"stay\"",
+                    "quit = {}",
+                ],
+            ),
+            dir.path(),
+        )
+        .unwrap();
+    }
+
+    /// A `cursor` step moves the cursor as `select` does, without the
+    /// choice.
+    #[test]
+    fn a_cursor_step_moves_without_choosing() {
+        let dir = folder();
+        let s = parse(
+            &file(
+                Some("out"),
+                &[
+                    "cursor = { path = \"library/b/b.bms\" }",
+                    "capture = { select_at = 250, file = \"s.png\" }",
+                    "cursor = { search = \"x\" }",
+                    "quit = {}",
+                ],
+            ),
+            dir.path(),
+        )
+        .unwrap();
+        let mut script = s.script;
+        let mut kinds = Vec::new();
+        while let Some(step) = script.front().cloned() {
+            kinds.push(step);
+            script.done();
+        }
+        assert!(matches!(kinds[0], SelectStep::PickPath(_)), "{kinds:?}");
+        assert_eq!(kinds[1], SelectStep::Capture(0));
+        assert_eq!(kinds[2], SelectStep::Query("x".to_owned()));
+        assert_eq!(kinds[3], SelectStep::PickSearched("x".to_owned()));
+        assert_eq!(kinds[4], SelectStep::Close);
+        assert!(!kinds.contains(&SelectStep::Enter), "{kinds:?}");
+        let st = s.session.captures.status(0).unwrap();
+        assert_eq!(st.axis, super::Axis::Select(TimeUs(250_000)));
+        assert!(st.hold && !st.local);
+    }
+
+    /// The frame dump names a result's first frame `end.png`, its skin's
+    /// or the built-in page, and only a selection frame `select.png`.
+    #[test]
+    fn the_frame_dump_names_a_result_frame_end() {
+        use crate::measure::ScreenKind;
+        let dir = tempfile::tempdir().unwrap();
+        let mut dump = crate::dev::FrameDump::new(dir.path().to_path_buf(), TimeUs(1_000_000));
+        assert!(dump.names(&screen_drawn(ScreenKind::Page, 0)).is_empty());
+        assert_eq!(
+            dump.names(&screen_drawn(ScreenKind::Selection, 0)),
+            ["select.png"]
+        );
+        assert_eq!(
+            dump.names(&screen_drawn(ScreenKind::Result, 0)),
+            ["end.png"]
+        );
+        assert!(dump.names(&screen_drawn(ScreenKind::End, 0)).is_empty());
+        let mut dump = crate::dev::FrameDump::new(dir.path().to_path_buf(), TimeUs(1_000_000));
+        assert_eq!(dump.names(&screen_drawn(ScreenKind::End, 0)), ["end.png"]);
+        assert_eq!(
+            dump.names(&screen_drawn(ScreenKind::Loading, 0)),
+            ["loading.png"]
+        );
     }
 }

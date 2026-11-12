@@ -1696,6 +1696,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             shown: false,
             rounds: 0,
             nearest: None,
+            result_id: None,
+            result_seq: 0,
         });
     }
     // The skins, before the first screen: a refused play skin admits no
@@ -1754,6 +1756,14 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         .selection
         .as_ref()
         .and_then(selection::Selection::script_failure);
+    // The run ends: a result or selection shown is left, and its captures
+    // whose frame was not taken fail, before the scenario is taken from
+    // the rig (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    {
+        rig.finish_result(dev::scenario::Leaving::Ended);
+        rig.finish_selection(dev::scenario::Leaving::Ended);
+    }
     #[cfg(feature = "dev-tools")]
     let scenario = rig.scenario.take().map(|sc| {
         let script = rig.selection.as_mut().and_then(|sel| sel.script.take());

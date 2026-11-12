@@ -933,11 +933,29 @@ impl Selection {
                     }
                     return false;
                 }
-                Some(SelectStep::Capture(k)) => {
-                    if let Some(c) = captures {
-                        c.arm(k);
+                Some(SelectStep::Capture(k)) => match captures.and_then(|c| c.status(k)) {
+                    // A selection capture is armed by the look, with the
+                    // update published after the steps before it, and
+                    // holds the next step until it ends.
+                    Some(st) if matches!(st.axis, crate::dev::scenario::Axis::Select(_)) => {
+                        if st.state == crate::dev::scenario::CaptureState::Unarmed {
+                            return false;
+                        }
+                        if st.hold && !st.ended() {
+                            if script.hold_expired()
+                                && let Some(c) = captures
+                            {
+                                expired(script, c.expire(None), controls);
+                            }
+                            return false;
+                        }
                     }
-                }
+                    _ => {
+                        if let Some(c) = captures {
+                            c.arm(k);
+                        }
+                    }
+                },
                 Some(SelectStep::CloseMeasuring) => script.close_measuring = true,
                 Some(SelectStep::QuitMeasuring) => script.quit_measuring = true,
                 Some(SelectStep::QuitDecoding) => script.quit_decoding = true,
@@ -1033,9 +1051,10 @@ impl Selection {
         controls: &Controls,
         render: &RenderLink,
         captures: Option<&crate::dev::scenario::Captures>,
+        at: ResultAt,
     ) {
         if let Some(script) = &mut self.script {
-            script_result(script, controls, render, &self.menu, captures);
+            script_result(script, controls, render, &self.menu, captures, at);
         }
     }
 
@@ -1083,21 +1102,53 @@ pub fn script_result(
     render: &RenderLink,
     menu: &MenuQueue,
     captures: Option<&crate::dev::scenario::Captures>,
+    at: ResultAt,
 ) {
+    // A step left this result: the steps after it are the next screen's.
+    if script.left_result {
+        return;
+    }
+    // A publication: the views a command sent are in it.
+    if at.published {
+        script.sent_view = false;
+    }
     script.announce();
     loop {
         match script.front() {
-            Some(&SelectStep::Capture(k)) => {
-                if let Some(c) = captures {
-                    c.arm(k);
+            Some(&SelectStep::Capture(k)) => match captures.and_then(|c| c.status(k)) {
+                // A capture written on the result is armed by a
+                // publication that follows the steps before it.
+                Some(st) if st.local => {
+                    if st.state == crate::dev::scenario::CaptureState::Unarmed {
+                        let (Some(c), Some(id)) = (captures, at.id) else {
+                            script.fail("a result capture with no result".to_owned());
+                            controls.close();
+                            return;
+                        };
+                        if !at.published || script.sent_view {
+                            if script.hold_expired() {
+                                script.fail("no view followed the command before it".to_owned());
+                                controls.close();
+                            }
+                            return;
+                        }
+                        c.arm_result(k, id.seq, at.page, at.view);
+                    }
                 }
-            }
+                _ => {
+                    if let Some(c) = captures {
+                        c.arm(k);
+                    }
+                }
+            },
             // Holds the retry's specialization.
             Some(&SelectStep::SlowSpecializing(ms)) => crate::dev::slow_specializing(ms),
             Some(SelectStep::Drawn) => {
-                if !render.wait_end_drawn(crate::dev::STEP_TIMEOUT) {
-                    script.fail("the result's page was not drawn".to_owned());
-                    controls.close();
+                if !render.end_page_drawn() {
+                    if script.expired() {
+                        script.fail("the result's page was not drawn".to_owned());
+                        controls.close();
+                    }
                     return;
                 }
             }
@@ -1106,39 +1157,75 @@ pub fn script_result(
         script.done();
         script.announce();
     }
+    let front = script.front();
+    // A leaving or view command waits for the holding captures of the
+    // result, at most the render bound: polled, so the result goes on
+    // serving the close, recoveries and its scene time meanwhile.
+    if matches!(
+        front,
+        Some(
+            SelectStep::Back
+                | SelectStep::Retry
+                | SelectStep::Close
+                | SelectStep::Next
+                | SelectStep::Prev
+        )
+    ) && let (Some(c), Some(id)) = (captures, at.id)
+        && c.held(Some(id.seq))
+    {
+        if script.hold_expired() {
+            expired(script, c.expire(Some(id.seq)), controls);
+        }
+        return;
+    }
     // A command acts on the result once it is drawn: a skin's view
     // committed, or its built-in page, each frame of it (the S10-09i
     // design's D1). A result that never draws still gets its command.
     if matches!(
-        script.front(),
+        front,
         Some(SelectStep::Back | SelectStep::Retry | SelectStep::Next | SelectStep::Prev)
-    ) {
-        let _ = render.wait_end_drawn(crate::dev::STEP_TIMEOUT);
+    ) && !render.end_page_drawn()
+        && !script.expired()
+    {
+        return;
     }
     match script.front() {
         Some(SelectStep::Back) => {
             script.done();
+            script.left_result = true;
             controls.command(game::Command::Quit);
         }
         Some(SelectStep::Retry) => {
             script.done();
+            script.left_result = true;
             controls.command(game::Command::Retry);
         }
         Some(SelectStep::Next) => {
             script.done();
+            script.sent_view = true;
             menu.push(MenuInput::Key(MenuKey::Right));
         }
         Some(SelectStep::Prev) => {
             script.done();
+            script.sent_view = true;
             menu.push(MenuInput::Key(MenuKey::Left));
         }
         // Closing the window ends the run from any scene.
         Some(SelectStep::Close) => {
             script.done();
+            script.left_result = true;
             controls.close();
         }
-        // The result is left on its own; the select screen takes it.
-        Some(SelectStep::Stay) => {}
+        // The result is left on its own, by its scene time; the select
+        // screen takes it. With none in force once the result is drawn
+        // (a built-in result, or its skin fallen back) it would never
+        // leave.
+        Some(SelectStep::Stay) => {
+            if !at.scene && render.end_page_drawn() {
+                script.fail("stay needs a result skin's scene time; none is in force".to_owned());
+                controls.close();
+            }
+        }
         Some(step) => {
             let why = format!("{step:?} on a result");
             script.fail(why);
@@ -1146,6 +1233,65 @@ pub fn script_result(
         }
         None => {}
     }
+}
+
+/// Where a result stands for its scripted steps (dev-tools): its
+/// identity, the end page and view published last, whether a skin's scene
+/// time is in force, and whether this call follows a publication.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug)]
+pub struct ResultAt {
+    /// The result shown.
+    pub id: Option<crate::measure::ResultId>,
+    /// The end pages shown so far.
+    pub page: u64,
+    /// The view desired, when a presentation is.
+    pub view: Option<u64>,
+    /// Whether a result skin's scene time is in force.
+    pub scene: bool,
+    /// Whether this call follows a publication of the result.
+    pub published: bool,
+}
+
+/// The holding captures a step waited on passed the render bound
+/// (dev-tools): each one failed is the script's failure, and the run
+/// closes.
+#[cfg(feature = "dev-tools")]
+fn expired(
+    script: &mut crate::dev::SelectScript,
+    settled: crate::dev::scenario::Settled,
+    controls: &Controls,
+) {
+    if settled.failed.is_empty() {
+        script.fail("the capture did not resolve within the render bound".to_owned());
+    }
+    for (o, why) in settled.failed {
+        script.fail_at(o, &why);
+    }
+    controls.close();
+}
+
+/// How the captures a selection's or result's leaving settled reach the
+/// run (dev-tools): each written is said, each failed is the script's
+/// failure, which closes the run.
+#[cfg(feature = "dev-tools")]
+pub(crate) fn report_captures(
+    script: Option<&mut crate::dev::SelectScript>,
+    settled: crate::dev::scenario::Settled,
+    controls: &Controls,
+) {
+    for (o, path) in &settled.written {
+        println!("dev: scenario: {o}: wrote {}", path.display());
+    }
+    if settled.failed.is_empty() {
+        return;
+    }
+    if let Some(script) = script {
+        for (o, why) in &settled.failed {
+            script.fail_at(*o, why);
+        }
+    }
+    controls.close();
 }
 
 /// The routine of every entry into a menu screen, selection's or the
@@ -1837,9 +1983,27 @@ impl PlayerRig<'_> {
             log::info!("select: chose {}{what}", path.display());
             sel.dirty = true;
             sel.practicing = matches!(pick, Pick::Practice(_));
+            // The selection is left: its captures whose frame was not
+            // taken fail (dev-tools).
+            #[cfg(feature = "dev-tools")]
+            if let Some(sc) = &self.scenario {
+                let settled = sc.captures.leave(None, crate::dev::scenario::Leaving::Left);
+                report_captures(sel.script.as_mut(), settled, self.controls);
+            }
             // The decision screen follows at once (`entered_decision`).
         } else {
             sel.show(&self.render, None, now);
+            // A selection capture due is armed with the update just
+            // published, which follows every step before it (dev-tools).
+            #[cfg(feature = "dev-tools")]
+            if let (Some(sc), Some(script)) = (&self.scenario, &sel.script)
+                && let Some(&SelectStep::Capture(k)) = script.front()
+                && let Some(st) = sc.captures.status(k)
+                && matches!(st.axis, crate::dev::scenario::Axis::Select(_))
+            {
+                let (lifetime, revision) = sel.feed.published();
+                sc.captures.arm_select(k, lifetime, revision);
+            }
         }
         chosen
     }
@@ -1919,8 +2083,29 @@ impl PlayerRig<'_> {
 
     /// A result shows: the scan goes on, and a scripted step for it runs.
     pub(crate) fn result_shown(&mut self) {
+        if let Some(sel) = &mut self.selection {
+            sel.shelf.release();
+        }
+        #[cfg(feature = "dev-tools")]
+        self.poll_result_script(true);
+    }
+
+    /// Runs the scripted steps due on the result shown (dev-tools): after
+    /// its publication (`published`), and at each wake of the result's
+    /// wait, so a step waiting on a capture never holds the game thread.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn poll_result_script(&mut self, published: bool) {
+        let at = ResultAt {
+            id: self.scenario.as_ref().and_then(|s| s.result_id),
+            page: self.render.end_pages_shown(),
+            view: self.presenter.desired_key(),
+            scene: self
+                .presenter
+                .timing(&self.render)
+                .is_some_and(|t| t.scene.is_some()),
+            published,
+        };
         let Some(sel) = &mut self.selection else {
-            #[cfg(feature = "dev-tools")]
             if let Some(script) = &mut self.result_script {
                 script_result(
                     script,
@@ -1928,16 +2113,80 @@ impl PlayerRig<'_> {
                     &self.render,
                     &self.result_input.menu,
                     None,
+                    at,
                 );
             }
             return;
         };
-        sel.shelf.release();
-        #[cfg(feature = "dev-tools")]
         sel.script_result(
             self.controls,
             &self.render,
             self.scenario.as_ref().map(|s| &s.captures),
+            at,
+        );
+    }
+
+    /// A result begins (dev-tools): a new identity, numbered after every
+    /// earlier one, for the play it follows; one still current is left
+    /// first (a result withdrawn before it showed). Its steps run afresh.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn result_began(&mut self) {
+        for script in [
+            self.selection.as_mut().and_then(|s| s.script.as_mut()),
+            self.result_script.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            script.left_result = false;
+            script.sent_view = false;
+        }
+        self.finish_result(crate::dev::scenario::Leaving::Left);
+        let generation = self.generation;
+        let Some(sc) = &mut self.scenario else {
+            return;
+        };
+        sc.result_seq += 1;
+        let id = crate::measure::ResultId {
+            seq: sc.result_seq,
+            generation,
+        };
+        sc.result_id = Some(id);
+        sc.captures.begin_result(id);
+    }
+
+    /// The result shown is left as `how` (dev-tools): its identity ends,
+    /// and each of its captures whose frame was not taken fails. Called
+    /// from every real leaving, never from a recovery; a second call does
+    /// nothing.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn finish_result(&mut self, how: crate::dev::scenario::Leaving) {
+        let Some(sc) = &mut self.scenario else {
+            return;
+        };
+        let Some(id) = sc.result_id.take() else {
+            return;
+        };
+        let settled = sc.captures.leave(Some(id.seq), how);
+        report_captures(
+            self.selection.as_mut().and_then(|s| s.script.as_mut()),
+            settled,
+            self.controls,
+        );
+    }
+
+    /// The selection is left as `how` (dev-tools): each of its captures
+    /// whose frame was not taken fails.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn finish_selection(&mut self, how: crate::dev::scenario::Leaving) {
+        let Some(sc) = &self.scenario else {
+            return;
+        };
+        let settled = sc.captures.leave(None, how);
+        report_captures(
+            self.selection.as_mut().and_then(|s| s.script.as_mut()),
+            settled,
+            self.controls,
         );
     }
 
@@ -2863,6 +3112,10 @@ impl AppRig for PlayerRig<'_> {
         // the panels' level read at the entry is the one Idle publishes.
         self.input.idle();
         self.leave_result();
+        // A result left for selection, by back or its scene time
+        // (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        self.finish_result(crate::dev::scenario::Leaving::Left);
         // Another scene: held adjustment controls act no more until
         // pressed afresh.
         self.enter_scene();
@@ -2970,6 +3223,9 @@ impl AppRig for PlayerRig<'_> {
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
         self.leave_result();
+        // A result left for the practice page (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        self.finish_result(crate::dev::scenario::Leaving::Left);
         self.enter_scene();
         self.render.leave_selection();
         recover(
@@ -4799,6 +5055,8 @@ pub(crate) mod tests {
             shown: true,
             rounds: 0,
             nearest: None,
+            result_id: None,
+            result_seq: 0,
         };
         (script, state)
     }
@@ -7053,5 +7311,235 @@ pub(crate) mod tests {
         want.folder_charts = Vec::new();
         want.query = "c".to_owned();
         assert_eq!(got, want);
+    }
+
+    /// A scenario's state over `captures`, a selection's.
+    #[cfg(feature = "dev-tools")]
+    fn capture_state(captures: crate::dev::scenario::Captures) -> crate::dev::scenario::State {
+        crate::dev::scenario::State {
+            logs: Vec::new(),
+            captures,
+            recorded: crate::input_side::Recorded {
+                keyboard: Vec::new(),
+                controller: Vec::new(),
+                controller_device: None,
+                scratch: game::ScratchConfig::default(),
+            },
+            chart_input: None,
+            pending: None,
+            until: None,
+            sent: None,
+            practice: None,
+            shown: false,
+            rounds: 0,
+            nearest: None,
+            result_id: None,
+            result_seq: 0,
+        }
+    }
+
+    /// One capture under `dir` waiting on `axis`, holding.
+    #[cfg(feature = "dev-tools")]
+    fn one_capture(
+        dir: &std::path::Path,
+        axis: crate::dev::scenario::Axis,
+    ) -> crate::dev::scenario::Captures {
+        let c = crate::dev::scenario::Captures::of(vec![(TimeUs(0), dir.join("c.png"))]);
+        c.set_axis(0, axis);
+        c.set_hold(0, true);
+        c
+    }
+
+    #[cfg(feature = "dev-tools")]
+    fn capture_origin() -> crate::dev::scenario::Origin {
+        crate::dev::scenario::Origin {
+            index: 1,
+            kind: crate::dev::scenario::StepKind::Capture,
+        }
+    }
+
+    /// I1: a selection capture is armed by the look, after it published
+    /// the pass's changes and the steps before it: with that publication's
+    /// revision, never the one before.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_select_capture_is_armed_with_the_looks_publication() {
+        use crate::dev::scenario::{Axis, CaptureState};
+        use game::AppRig as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sel = selection(dir.path());
+        let captures = one_capture(dir.path(), Axis::Select(TimeUs(0)));
+        crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            rig.adjust = None;
+            rig.selection = Some(sel);
+            rig.entered_selection();
+            rig.scenario = Some(capture_state(captures.clone()));
+            let s = rig.selection.as_mut().unwrap();
+            s.script = Some(crate::dev::SelectScript::compiled(vec![(
+                crate::dev::SelectStep::Capture(0),
+                capture_origin(),
+            )]));
+            // A change of this pass, before its steps: not yet published.
+            s.dirty = true;
+            let before = s.feed.published();
+            assert!(rig.look().is_none());
+            let after = rig.selection.as_ref().unwrap().feed.published();
+            assert!(after.1 > before.1, "{before:?} {after:?}");
+            assert!(
+                matches!(
+                    captures.states()[0],
+                    CaptureState::Selecting { lifetime, revision, .. } if (lifetime, revision) == after
+                ),
+                "{:?}",
+                captures.states()
+            );
+        });
+    }
+
+    /// I2 on the select screen: a holding selection capture keeps the next
+    /// step from running until it ends.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn held_select_capture_defers_the_next_step() {
+        use crate::dev::scenario::{Axis, CaptureState};
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let captures = one_capture(dir.path(), Axis::Select(TimeUs(0)));
+        let o = capture_origin();
+        sel.script = Some(crate::dev::SelectScript::compiled(vec![
+            (crate::dev::SelectStep::Capture(0), o),
+            (crate::dev::SelectStep::Up, o),
+        ]));
+        let controls = crate::controls::Controls::new(input::QpcClock::start());
+        // Not armed yet: the look arms it after its publication.
+        assert!(!sel.script(&controls, 0, 0, Some(&captures)));
+        captures.arm_select(0, 1, 1);
+        assert!(!sel.script(&controls, 0, 0, Some(&captures)));
+        assert!(!sel.script(&controls, 0, 0, Some(&captures)));
+        assert_eq!(
+            sel.script.as_ref().unwrap().front(),
+            Some(&crate::dev::SelectStep::Capture(0))
+        );
+        assert!(
+            sel.menu.pop().is_none(),
+            "a step ran while the capture held"
+        );
+        captures.set_state(0, CaptureState::Succeeded);
+        assert!(sel.script(&controls, 0, 0, Some(&captures)));
+        assert_eq!(sel.menu.pop(), Some(MenuInput::Key(MenuKey::Escape)));
+    }
+
+    /// I3: each result gets its own number, never reused; the captures
+    /// bound to its play are its; a result begun while another is current
+    /// leaves that one first; back to selection leaves it.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_result_back_ends_its_identity() {
+        use crate::dev::scenario::{Axis, CaptureState};
+        use game::AppRig as _;
+        let dir = tempfile::tempdir().unwrap();
+        let captures = one_capture(dir.path(), Axis::Result(TimeUs(400_000)));
+        crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            rig.adjust = None;
+            rig.scenario = Some(capture_state(captures.clone()));
+            rig.generation = 3;
+            captures.arm(0);
+            captures.bind(3);
+            assert_eq!(captures.states()[0], CaptureState::AwaitingResult(3));
+            rig.result_began();
+            let id = rig.scenario.as_ref().unwrap().result_id;
+            assert_eq!(id.map(|i| (i.seq, i.generation)), Some((1, 3)));
+            assert!(matches!(
+                captures.states()[0],
+                CaptureState::Resulting { seq: 1, .. }
+            ));
+            rig.entered_selection();
+            assert_eq!(rig.scenario.as_ref().unwrap().result_id, None);
+            assert_eq!(
+                captures.states()[0],
+                CaptureState::Failed(
+                    "the result left before a frame at 400 ms on its result axis".to_owned()
+                )
+            );
+            // Idempotent: a second leaving does nothing.
+            rig.entered_selection();
+        });
+    }
+
+    /// A result begun while one is current (a result withdrawn before it
+    /// showed) leaves that one, and takes the next number.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_withdrawn_result_is_superseded() {
+        use crate::dev::scenario::{Axis, CaptureState};
+        let dir = tempfile::tempdir().unwrap();
+        let captures = one_capture(dir.path(), Axis::Result(TimeUs(0)));
+        crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            rig.scenario = Some(capture_state(captures.clone()));
+            rig.result_began();
+            captures.arm_result(0, 1, 0, None);
+            rig.result_began();
+            let sc = rig.scenario.as_ref().unwrap();
+            assert_eq!(sc.result_id.map(|i| i.seq), Some(2));
+            assert!(matches!(captures.states()[0], CaptureState::Failed(_)));
+        });
+    }
+
+    /// A retry the flow served leaves the result at the next preparation;
+    /// a rebuild after a loss with no leaving keeps it.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_retry_ends_its_results_identity() {
+        crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            rig.scenario = Some(capture_state(
+                crate::dev::scenario::Captures::of(Vec::new()),
+            ));
+            rig.result_began();
+            // A recovery of the built-in result: no leaving.
+            rig.before_rebuild();
+            assert!(rig.scenario.as_ref().unwrap().result_id.is_some());
+            rig.result_leaving = true;
+            rig.before_rebuild();
+            assert!(rig.scenario.as_ref().unwrap().result_id.is_none());
+        });
+    }
+
+    /// The practice page entered from a result leaves it.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn entered_practice_finishes_a_result() {
+        use game::AppRig as _;
+        let (_, state) = practice_script(3, Vec::new(), &rules::tapestry());
+        let screen = state.practice.clone().unwrap();
+        crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            rig.adjust = None;
+            rig.scenario = Some(capture_state(
+                crate::dev::scenario::Captures::of(Vec::new()),
+            ));
+            rig.result_began();
+            rig.entered_practice(&screen);
+            assert!(rig.scenario.as_ref().unwrap().result_id.is_none());
+        });
+    }
+
+    /// The run's end leaves the result shown: its captures whose frame was
+    /// not taken fail, saying the run ended.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_play_runs_result_capture_ends_at_shutdown() {
+        use crate::dev::scenario::{Axis, CaptureState};
+        let dir = tempfile::tempdir().unwrap();
+        let captures = one_capture(dir.path(), Axis::Result(TimeUs(5_000)));
+        crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            rig.scenario = Some(capture_state(captures.clone()));
+            rig.result_began();
+            captures.arm_result(0, 1, 0, None);
+        });
+        assert_eq!(
+            captures.states()[0],
+            CaptureState::Failed(
+                "the run ended before a frame at 5 ms on its result axis".to_owned()
+            )
+        );
     }
 }
