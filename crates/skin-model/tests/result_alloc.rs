@@ -217,6 +217,7 @@ fn with_graphs(mut v: ResultView) -> ResultView {
     }
     v.deviations = Some(Box::new(deviations));
     v.timing_areas = Some([[-20, 20], [-60, 60], [-150, 150], [-220, 220], [-150, 500]]);
+    v.chart.judge_class = Some(3);
     v
 }
 
