@@ -107,7 +107,7 @@ impl Cx<'_> {
     /// The cycle of `s` over `frames` for `c`, resolved before its sheet
     /// is admitted, or why `c` is dropped: its timer or cycle refused, or
     /// `c` critical and untimed where it moves or changes a colour
-    /// channel other than alpha (D3).
+    /// channel other than alpha, unless it settles (D3).
     pub(super) fn src_cycle(
         &mut self,
         c: &Common,
