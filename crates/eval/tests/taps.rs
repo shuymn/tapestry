@@ -650,16 +650,19 @@ fn rank_scaled_window_edges_are_inclusive() {
     assert_eq!(empty_poors(&events), 2);
 }
 
-/// The tapestry preset's assignment, nearest unjudged note inside BAD and
-/// the earlier at a tie, is the source's Duration algorithm, which the
-/// select screen's judge-algorithm index shows for it: a later note
-/// replaces the candidate only when strictly nearer the press and
-/// unjudged (`play/JudgeAlgorithm.java:24-26` at `0.8.9`), and a note
-/// outside the window is never one (`play/JudgeManager.java:385-392`).
-/// Written from that rule, not ported; the combo-priority run is the
-/// contrast where the two algorithms part.
+/// The tapestry preset's candidate order, the reason the select screen's
+/// judge-algorithm index shows 1 for it: among unjudged notes inside BAD
+/// a later note takes the press only when strictly nearer, so a tie keeps
+/// the earlier note, as the source's Duration comparator orders two
+/// candidates (`play/JudgeAlgorithm.java:24-26` at `0.8.9`); a judged
+/// note is passed over, and a press outside BAD on both sides of a note
+/// takes no note. Only tapestry's evaluator runs here: the source's
+/// candidate loop also admits judged and POOR-only candidates
+/// (`play/JudgeManager.java:396-413`), which these examples do not reach,
+/// and no equivalence beyond them is claimed. The combo-priority run is
+/// the contrast where the two orders part.
 #[test]
-fn the_nearest_note_assignment_is_the_duration_algorithm() {
+fn the_nearest_note_order_prefers_the_strictly_nearer_note() {
     let pair = |gap: i64, press_at: i64| {
         let chart = ChartBuilder::new(BPM)
             .tap(lane(3), TimeUs(1_000 * MS))
@@ -729,4 +732,10 @@ fn the_nearest_note_assignment_is_the_duration_algorithm() {
     let inputs = [press(1_300 * MS, 0, 3), release(1_305 * MS, 0, 3)];
     let (events, _) = run(&chart, &dev, &InputStart::default(), &inputs, 3_000 * MS);
     assert_eq!(judgments(&events), [(3, 0, Poor, None)]);
+    // A press 200 ms before the unjudged note, before its BAD window: no
+    // note either, only an empty POOR; the note is missed later.
+    let inputs = [press(800 * MS, 0, 3), release(805 * MS, 0, 3)];
+    let (events, _) = run(&chart, &dev, &InputStart::default(), &inputs, 3_000 * MS);
+    assert_eq!(judgments(&events), [(3, 0, Poor, None)]);
+    assert_eq!(empty_poors(&events), 1);
 }
