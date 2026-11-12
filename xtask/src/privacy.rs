@@ -104,8 +104,9 @@ const CASES: &[Case] = &[
             skin: &skin_model::Skin,
             sel: &mut skin_model::Selection,
             timers: &skin_model::SelectionTimers,
+            app: &skin_model::AppReadouts,
         ) {
-            let _ = crate::screens::selection_visit(slot, skin, sel, bms_model::TimeUs(0), timers);
+            let _ = crate::screens::selection_visit(slot, skin, sel, bms_model::TimeUs(0), timers, app);
         }",
         None,
     ),
