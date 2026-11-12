@@ -5309,12 +5309,15 @@ impl Run {
     /// unavailable with the staged one, so no frame draws a table of an
     /// earlier choice or attempt; a staged one whose staging is gone is
     /// forgotten. The live targets are mirrored for the game thread.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn sync_chart(&mut self) {
         let now = self.chart_now();
-        let stale = |k: &Option<crate::chart_images::PublicationKey>| {
-            k.is_some_and(|k| !k.current(&now, k.request))
+        // The committed table serves no staging; the staged one the live
+        // staging's request.
+        let stale = |k: &Option<crate::chart_images::PublicationKey>, attempt: Option<u64>| {
+            k.is_some_and(|k| !k.current(&now, attempt))
         };
-        if self.chart_generation != now.generation || stale(&self.chart_table) {
+        if self.chart_generation != now.generation || stale(&self.chart_table, None) {
             if let Some(screen) = &mut self.screen {
                 screen.invalidate_chart_images();
             }
@@ -5322,7 +5325,7 @@ impl Run {
             self.chart_table = None;
             self.staged_table = None;
         }
-        if stale(&self.staged_table) {
+        if stale(&self.staged_table, now.staged) {
             self.staged_table = None;
         }
         let targets = (now.staged, now.committed);
@@ -5337,10 +5340,13 @@ impl Run {
     }
 
     /// Publishes `set` (absent when `None`) of `generation` for the
-    /// attempt of `request`: into its staged array when the staging has
-    /// one of its own, else into the committed play installation (S10-12
-    /// design §5.3). Another generation than the current one publishes
-    /// nothing. The answer says what it was for and where it went.
+    /// attempt of `request` into its one target: the staging of that
+    /// request, or for `None` the committed play installation (S10-12
+    /// design §5.3). The publication is admitted only while its key is
+    /// current ([`crate::chart_images::PublicationKey::current`]): another
+    /// generation, or a request whose staging is gone, publishes nothing,
+    /// and nothing of a staging's goes to the committed installation. The
+    /// answer says what it was for and where it went.
     fn publish_chart(
         &mut self,
         generation: u64,
@@ -5357,63 +5363,49 @@ impl Run {
         }
         self.sync_chart();
         let now = self.chart_now();
-        let key = |target| PublicationKey {
+        let key = PublicationKey {
             generation,
             request,
-            target,
+            target: match request {
+                Some(r) => PublishedTo::Staged(r),
+                None => PublishedTo::Committed(now.committed),
+            },
         };
         let unpublished = Ack {
-            key: key(PublishedTo::Committed(now.committed)),
+            key,
             answer: Err(render::ChartOutcome::Unavailable),
         };
-        if generation != now.generation {
+        if !key.current(&now, request) {
             return unpublished;
         }
-        let staged = request.and_then(|r| {
-            self.prepared
-                .as_ref()
-                .filter(|p| p.token.request == r)
-                .map(|p| (r, render::ChartTarget::Staged(p.token)))
-        });
+        let target = match (request, self.prepared.as_ref()) {
+            (None, _) => render::ChartTarget::Committed,
+            (Some(_), Some(p)) => render::ChartTarget::Staged(p.token),
+            (Some(_), None) => return unpublished,
+        };
         let Some(screen) = &mut self.screen else {
             return unpublished;
         };
-        let publish = |screen: &mut Box<dyn Screen>, target| match set {
+        let answer = match set {
             Some(set) => screen.publish_chart_images(target, set.fitted()),
             None => screen.publish_chart_absent(target),
         };
         // What a publication left in its target: a table, or an all-absent
         // one; nothing for the other failures.
-        let left = |answer: &Result<_, RenderError>| {
-            answer.is_ok()
-                || answer
-                    .as_ref()
-                    .is_err_and(|e| e.chart_outcome() == render::ChartOutcome::Absent)
-        };
-        if let Some((r, target)) = staged {
-            let answer = publish(screen, target);
-            if !matches!(answer, Err(RenderError::NoChartLayer)) {
-                let k = key(PublishedTo::Staged(r));
-                if left(&answer) {
-                    self.staged_table = Some(k);
-                }
-                // The game thread logs what it left; this thread draws
-                // frames and logs nothing.
-                return Ack {
-                    key: k,
-                    answer: answer.map_err(|e| e.chart_outcome()),
-                };
+        let left = answer.is_ok()
+            || answer
+                .as_ref()
+                .is_err_and(|e| e.chart_outcome() == render::ChartOutcome::Absent);
+        if left {
+            match request {
+                Some(_) => self.staged_table = Some(key),
+                None => self.chart_table = Some(key),
             }
         }
-        // A staging without an array of its own draws from the committed
-        // one: published there.
-        let answer = publish(screen, render::ChartTarget::Committed);
-        let k = key(PublishedTo::Committed(screen.chart_key()));
-        if left(&answer) {
-            self.chart_table = Some(k);
-        }
+        // The game thread logs what it left; this thread draws frames and
+        // logs nothing.
         Ack {
-            key: k,
+            key,
             answer: answer.map_err(|e| e.chart_outcome()),
         }
     }
@@ -5447,6 +5439,13 @@ impl Run {
                 asked: request,
             });
         }
+        // The staged chart table, current for this request while it is
+        // staged, moves into the committed installation with it.
+        let before = self.chart_now();
+        let moving = self
+            .staged_table
+            .take()
+            .filter(|k| k.current(&before, Some(request)));
         let Some(p) = self.prepared.take() else {
             return Err(CommitError::NothingStaged);
         };
@@ -5457,14 +5456,11 @@ impl Run {
             screen.discard();
             return Err(e);
         }
-        // The staged chart table moved into the committed installation
-        // with it: its key is the committed layer's now.
-        if let Some(k) = self
-            .staged_table
-            .take()
-            .filter(|k| k.request == Some(request))
-        {
+        // Its key is the committed layer's now, the generation's whatever
+        // attempt draws it.
+        if let Some(k) = moving {
             self.chart_table = Some(crate::chart_images::PublicationKey {
+                request: None,
                 target: crate::chart_images::PublishedTo::Committed(screen.chart_key()),
                 ..k
             });

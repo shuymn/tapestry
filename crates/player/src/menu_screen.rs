@@ -895,6 +895,7 @@ impl Screen for MenuScreen {
         self.renderer.invalidate_chart_images();
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
         self.renderer.chart_key()
     }

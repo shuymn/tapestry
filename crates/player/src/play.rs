@@ -651,7 +651,7 @@ impl PlayerRig<'_> {
     /// [`ImagesPoll::Expired`] when the publication's answer did not come
     /// within the render link's bound; `None` at `until`.
     fn poll_images(&mut self, target: Option<u64>, until: Instant) -> Option<ImagesPoll> {
-        let mut worker = std::mem::take(&mut self.chart_images);
+        let worker = self.chart_images.clone();
         let mut adjust = self.adjust.take();
         let out = loop {
             let stops = || {
@@ -686,7 +686,6 @@ impl PlayerRig<'_> {
             std::thread::park_timeout(IMAGE_SLICE.min(until - now));
         };
         self.adjust = adjust;
-        self.chart_images = worker;
         out
     }
 

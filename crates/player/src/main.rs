@@ -28,6 +28,7 @@ mod background;
 mod bank_witness;
 mod bests;
 mod carry;
+mod chart_currency;
 mod chart_images;
 mod controls;
 #[cfg(feature = "dev-tools")]
@@ -888,6 +889,11 @@ fn rig<'a>(
         std::sync::Arc::clone(&audio_lost),
     );
     let chart_images = crate::chart_images::ChartImageWorker::new(render.chart_generation());
+    // The loading waits serve the images' work a step left.
+    let served = chart_images.clone();
+    controls.serve_images(crate::controls::ImageService(Box::new(move || {
+        served.service();
+    })));
     let mut rig = PlayerRig {
         failures,
         input,

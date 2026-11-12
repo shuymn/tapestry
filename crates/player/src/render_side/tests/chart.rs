@@ -21,6 +21,8 @@ struct Charts {
     table: bool,
     /// Publications made.
     published: u32,
+    /// Absent publications among them.
+    absent: u32,
     /// Each loading frame's lifetime, and whether a table was published
     /// as it was drawn.
     frames: Vec<(u64, bool)>,
@@ -92,7 +94,9 @@ impl Screen for ChartScreen {
         &mut self,
         _target: render::ChartTarget,
     ) -> Result<ChartTable, RenderError> {
-        self.publish()
+        let t = self.publish();
+        self.charts.lock().unwrap().absent += 1;
+        t
     }
     fn invalidate_chart_images(&mut self) {
         self.charts.lock().unwrap().table = false;
@@ -134,8 +138,12 @@ fn rig() -> Rig {
             hold: Arc::clone(&h),
         }) as Box<dyn Screen>)
     });
+    let link = spawn_empty(make);
+    // The screen built, its chart layer's key mirrored: a publication
+    // reaches it.
+    assert!(wait_until(|| link.chart_now(0).committed.is_some()));
     Rig {
-        link: spawn_empty(make),
+        link,
         charts,
         installation,
         hold,
@@ -145,7 +153,7 @@ fn rig() -> Rig {
 /// The worker of `link`'s generation, its current set read for a target
 /// with a chart layer: both absent (no folder), not a job.
 fn worker_with_a_set(link: &super::super::RenderLink) -> ChartImageWorker {
-    let mut w = ChartImageWorker::new(link.chart_generation());
+    let w = ChartImageWorker::new(link.chart_generation());
     w.want(Want {
         dir: std::path::PathBuf::from("no such folder"),
         names: [String::new(), String::new()],
@@ -157,7 +165,7 @@ fn worker_with_a_set(link: &super::super::RenderLink) -> ChartImageWorker {
 }
 
 /// Polls `w`'s publication for `request` until it answers, at most 10 s.
-fn answered(w: &mut ChartImageWorker, link: &super::super::RenderLink, request: Option<u64>) {
+fn answered(w: &ChartImageWorker, link: &super::super::RenderLink, request: Option<u64>) {
     let end = Instant::now() + Duration::from_secs(10);
     while !matches!(w.publish(link, request), Publish::Answered(_)) {
         assert!(Instant::now() < end, "never answered");
@@ -172,8 +180,8 @@ fn answered(w: &mut ChartImageWorker, link: &super::super::RenderLink, request: 
 #[test]
 fn a_new_generation_hides_the_last_table_from_the_next_loading_frame() {
     let r = rig();
-    let mut w = worker_with_a_set(&r.link);
-    answered(&mut w, &r.link, None);
+    let w = worker_with_a_set(&r.link);
+    answered(&w, &r.link, None);
     r.link.begin_loading(&chosen("A"), None);
     r.link.loading().show(one_line("A"));
     let a = r.link.loading_lifetime();
@@ -220,11 +228,11 @@ fn a_new_generation_hides_the_last_table_from_the_next_loading_frame() {
 #[test]
 fn an_acknowledgment_of_a_replaced_target_is_asked_again() {
     let r = rig();
-    let mut w = worker_with_a_set(&r.link);
-    answered(&mut w, &r.link, None);
+    let w = worker_with_a_set(&r.link);
+    answered(&w, &r.link, None);
     assert_eq!(r.charts.lock().unwrap().published, 1);
     // Answered again without a publication while the target holds.
-    answered(&mut w, &r.link, None);
+    answered(&w, &r.link, None);
     assert_eq!(r.charts.lock().unwrap().published, 1);
     r.installation.store(2, Ordering::SeqCst);
     // The render thread mirrors its targets at its next turn, which a
@@ -237,7 +245,7 @@ fn an_acknowledgment_of_a_replaced_target_is_asked_again() {
             .map(|k| k.installation)
             == Some(2)
     }));
-    answered(&mut w, &r.link, None);
+    answered(&w, &r.link, None);
     assert_eq!(
         r.charts.lock().unwrap().published,
         2,
@@ -253,7 +261,7 @@ fn an_answer_that_never_comes_expires() {
     let mut r = rig();
     r.link
         .set_timeouts(Duration::from_millis(200), Duration::from_secs(5));
-    let mut w = worker_with_a_set(&r.link);
+    let w = worker_with_a_set(&r.link);
     r.hold.store(true, Ordering::Release);
     let began = Instant::now();
     let end = began + Duration::from_secs(10);
@@ -281,7 +289,7 @@ fn the_job_publishes_its_set_for_the_loading_frames() {
         foreground: 4,
         speculative: 1,
     });
-    let mut w = ChartImageWorker::new(r.link.chart_generation());
+    let w = ChartImageWorker::new(r.link.chart_generation());
     w.renew();
     w.want(Want {
         dir: std::path::PathBuf::from("no such folder"),
@@ -306,7 +314,220 @@ fn the_job_publishes_its_set_for_the_loading_frames() {
         );
         std::thread::sleep(Duration::from_millis(1));
     }
-    answered(&mut w, &r.link, None);
+    answered(&w, &r.link, None);
     assert_eq!(r.charts.lock().unwrap().published, 1);
+    r.link.exit();
+}
+
+/// A folder holding a 64×48 stage file, `s.png`.
+fn folder_with_stage() -> tempfile::TempDir {
+    let d = tempfile::tempdir().unwrap();
+    let file = std::fs::File::create(d.path().join("s.png")).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 64, 48);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let texels = [10, 20, 30, 255].repeat(64 * 48);
+    e.write_header().unwrap().write_image_data(&texels).unwrap();
+    d
+}
+
+fn want_in(dir: &std::path::Path, side: Option<u32>) -> Want {
+    Want {
+        dir: dir.to_path_buf(),
+        names: ["s.png".to_owned(), String::new()],
+        side,
+    }
+}
+
+fn coordinator() -> game::coord::Coordinator {
+    game::coord::Coordinator::new(game::coord::Caps {
+        foreground: 4,
+        speculative: 1,
+    })
+}
+
+/// A job that panics before it publishes leaves its reply unsent: its
+/// failed set is published, absent, and the attempt's answer is that
+/// publication's, never taken from the dropped sender.
+#[test]
+fn a_panicked_job_publishes_its_failed_set_before_the_answer() {
+    let _serial = crate::imports::tests::serial();
+    let r = rig();
+    let d = folder_with_stage();
+    let coord = coordinator();
+    let w = ChartImageWorker::new(r.link.chart_generation());
+    w.renew();
+    w.want(want_in(d.path(), Some(2_048)));
+    let publisher = r.link.chart_publisher();
+    crate::chart_images::PANIC.store(true, Ordering::Release);
+    w.step(
+        Some((&coord, game::coord::Spawner::SYSTEM)),
+        &|| false,
+        Some(&publisher),
+    );
+    let end = Instant::now() + Duration::from_secs(10);
+    while !(w.idle() && w.current().is_some()) {
+        assert!(Instant::now() < end, "{w:?}");
+        w.step(
+            Some((&coord, game::coord::Spawner::SYSTEM)),
+            &|| false,
+            None,
+        );
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let answer = loop {
+        if let Publish::Answered(a) = w.publish(&r.link, None) {
+            break a;
+        }
+        assert!(Instant::now() < end, "never answered");
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    let c = r.charts.lock().unwrap();
+    assert_eq!(
+        (c.published, answer.is_ok()),
+        (1, true),
+        "answered before the failed set was published"
+    );
+    drop(c);
+    r.link.exit();
+}
+
+/// A stalled render thread holding the first choice's publication, and
+/// two more choices: no job reads a set until that publication is
+/// answered, so at most the current set and the retiring one are alive;
+/// once it is, the last choice's job reads.
+#[test]
+fn a_stalled_render_thread_holds_back_the_next_reads() {
+    let _serial = crate::imports::tests::serial();
+    let r = rig();
+    let (a, b, c) = (
+        folder_with_stage(),
+        folder_with_stage(),
+        folder_with_stage(),
+    );
+    let coord = coordinator();
+    let w = ChartImageWorker::new(r.link.chart_generation());
+    let publisher = r.link.chart_publisher();
+    let step = |w: &ChartImageWorker| {
+        w.step(
+            Some((&coord, game::coord::Spawner::SYSTEM)),
+            &|| false,
+            Some(&publisher),
+        );
+    };
+    r.hold.store(true, Ordering::Release);
+    w.renew();
+    w.want(want_in(a.path(), Some(2_048)));
+    step(&w);
+    let end = Instant::now() + Duration::from_secs(10);
+    while !w.idle() {
+        assert!(Instant::now() < end, "{w:?}");
+        w.service();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    for d in [&b, &c] {
+        w.renew();
+        w.want(want_in(d.path(), Some(2_048)));
+        for _ in 0..20 {
+            step(&w);
+            w.service();
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+    assert_eq!(w.begun(), 1, "a set read while the render thread held one");
+    r.hold.store(false, Ordering::Release);
+    while !(w.idle() && w.current().is_some()) {
+        assert!(Instant::now() < end, "{w:?}");
+        w.service();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(w.begun(), 2, "C's job, and never B's");
+    r.link.exit();
+}
+
+/// A target with no chart layer: its absence is terminal at the choice and
+/// published then, so the loading frames' title card condition reads the
+/// images absent while the chart loads, before any preparation.
+#[test]
+fn a_target_with_no_layer_reads_absent_while_the_chart_loads() {
+    let r = rig();
+    let coord = coordinator();
+    let w = ChartImageWorker::new(r.link.chart_generation());
+    w.renew();
+    w.want(want_in(std::path::Path::new("no such folder"), None));
+    let publisher = r.link.chart_publisher();
+    w.step(
+        Some((&coord, game::coord::Spawner::SYSTEM)),
+        &|| false,
+        Some(&publisher),
+    );
+    assert!(wait_until(|| r.charts.lock().unwrap().absent == 1));
+    assert_eq!(w.begun(), 0);
+    r.link.exit();
+}
+
+/// The next chart's job held back at its choice by the last one's thread
+/// begins from the loading waits' looks, with nothing else stepped, and
+/// its set reaches the loading frames.
+#[test]
+fn a_job_held_back_begins_from_the_waits() {
+    let _serial = crate::imports::tests::serial();
+    let r = rig();
+    let (a, b) = (folder_with_stage(), folder_with_stage());
+    let coord = coordinator();
+    let w = ChartImageWorker::new(r.link.chart_generation());
+    let publisher = r.link.chart_publisher();
+    crate::chart_images::HOLD.store(true, Ordering::Release);
+    w.renew();
+    w.want(want_in(a.path(), Some(2_048)));
+    w.step(
+        Some((&coord, game::coord::Spawner::SYSTEM)),
+        &|| false,
+        Some(&publisher),
+    );
+    assert_eq!(w.begun(), 1);
+    // A is left in its read; B chosen: held back.
+    w.forget();
+    w.renew();
+    w.want(want_in(b.path(), Some(2_048)));
+    w.step(
+        Some((&coord, game::coord::Spawner::SYSTEM)),
+        &|| false,
+        Some(&publisher),
+    );
+    assert_eq!(w.begun(), 1);
+    // The waits look; nothing else steps the worker.
+    let controls = crate::controls::Controls::new(QpcClock::start());
+    let served = w.clone();
+    controls.serve_images(crate::controls::ImageService(Box::new(move || {
+        served.service();
+    })));
+    crate::chart_images::HOLD.store(false, Ordering::Release);
+    let end = Instant::now() + Duration::from_secs(10);
+    while r.charts.lock().unwrap().published < 1 || w.begun() < 2 {
+        assert!(Instant::now() < end, "{w:?}");
+        let _ = controls.look();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(w.begun(), 2);
+    r.link.exit();
+}
+
+/// A publication for a staging the render thread does not hold is
+/// admitted nowhere: nothing reaches the committed installation, and the
+/// attempt gets no answer from it.
+#[test]
+fn a_publication_for_a_staging_gone_publishes_nothing() {
+    let r = rig();
+    let w = worker_with_a_set(&r.link);
+    for _ in 0..50 {
+        assert_eq!(w.publish(&r.link, Some(99)), Publish::Waiting);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        r.charts.lock().unwrap().published,
+        0,
+        "a staging's publication reached the committed installation"
+    );
     r.link.exit();
 }
