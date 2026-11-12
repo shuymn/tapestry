@@ -13,8 +13,9 @@
 //! (`none` for a chart in no class, `pending` for a level the base
 //! snapshot has pending; each
 //! unavailable when not given) and, with `--result dense`, a result
-//! scene's view known: a ready result with a known best, dense timelines
-//! (512 bins of 2 s, every channel 9 and 19 notes unjudged), a gauge
+//! scene's view known: a ready result with a known best, its chart of
+//! the judgment class given, dense timelines (512 bins of 2 s, every
+//! channel 9 and 19 notes unjudged), a gauge
 //! history crossing its border in every column and a deviation in every
 //! ms slot, over which a result skin that imports is then drawn (its
 //! widget charge, quad capacity, the most quads a frame drew, the quads
@@ -131,7 +132,15 @@ fn facts(mut args: &[String]) -> Option<(ImportFacts, Choice, bool, &[String])> 
                 args = rest;
             }
             [flag, ..] if flag.starts_with("--") => return None,
-            _ => return Some((facts, choice, local, args)),
+            _ => {
+                // A dense view shows the class `--class` gives, whatever
+                // the flags' order, as the attempt's chart carries it.
+                if let (Some(view), Fact::Known(class)) = (&mut choice.result, facts.judge_class) {
+                    view.chart.judge_class = class.map(JudgeClass::index);
+                    facts.result = Fact::Known(ResultFields::of(view));
+                }
+                return Some((facts, choice, local, args));
+            }
         }
     }
 }

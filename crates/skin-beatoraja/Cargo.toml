@@ -12,12 +12,15 @@ publish.workspace = true
 # (src/bin/lua_replay, design.md "beatoraja Lua Skins", the reference
 # executor), for the developer's PC only (docs/stage3.md §3), and the
 # sandbox's VM hooks for the player's import tests (src/lua/vm_hooks.rs).
-dev-tools = ["skin-model/dev-tools", "dep:eval"]
+dev-tools = ["skin-model/dev-tools", "dep:eval", "dep:game"]
 
 [dependencies]
 bms-model.workspace = true
 # The replay harness's frames (src/bin/lua_replay), dev-tools only.
 eval = { workspace = true, optional = true }
+# The replay harness's tempo readouts, from the chart as the player
+# prepares them (src/bin/lua_replay), dev-tools only.
+game = { workspace = true, optional = true }
 image.workspace = true
 mlua.workspace = true
 rules.workspace = true

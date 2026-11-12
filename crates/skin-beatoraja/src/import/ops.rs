@@ -304,6 +304,16 @@ const SONG_NO_BGA: i32 = 170;
 /// chart's own rank (`lua::facts::JudgeClass::of_headers`), whatever rank
 /// the play preset judges with; a chart in no class holds none.
 const CHART_JUDGE: i32 = 180;
+/// The conditions of 180 to 184 by id less 180, on the play and the
+/// result screens alike: 180 under the class's validity, since an unknown
+/// class reads 0.
+pub(crate) const JUDGE_CLASSES: [&str; 5] = [
+    "chart.judge_class_valid && chart.judge_class == 0",
+    "chart.judge_class == 1",
+    "chart.judge_class == 2",
+    "chart.judge_class == 3",
+    "chart.judge_class == 4",
+];
 /// `now_loading` and `loaded` (`BooleanPropertyFactory.java:426-429`), the
 /// source's preload state and its complement: entering READY flips them
 /// (`play/BMSPlayer.java:514`), a load's progress reaching 100 does not.
@@ -460,14 +470,10 @@ fn builtin(id: i32) -> Option<(Body, bool)> {
         154 => (Body::Text("chart.difficulty == 4"), false),
         155 => (Body::Text("chart.difficulty == 5"), false),
         SONG_NO_BGA => (Body::Text("chart.bga_valid && !chart.bga"), false),
-        CHART_JUDGE => (
-            Body::Text("chart.judge_class_valid && chart.judge_class == 0"),
+        CHART_JUDGE..=184 => (
+            Body::Text(JUDGE_CLASSES.get(usize::try_from(id - CHART_JUDGE).ok()?)?),
             false,
         ),
-        181 => (Body::Text("chart.judge_class == 1"), false),
-        182 => (Body::Text("chart.judge_class == 2"), false),
-        183 => (Body::Text("chart.judge_class == 3"), false),
-        184 => (Body::Text("chart.judge_class == 4"), false),
         // The chart's own images: drawable in this installation (S10-12
         // design §5.3); unavailable while loading until they settle.
         190 => (Body::Text("!chart.stagefile"), false),
@@ -569,9 +575,9 @@ pub(crate) fn numeric_in(kind: ScreenKind, op: i32, items: &BTreeMap<i32, bool>)
 /// folded. A result option's validity
 /// ([`super::result::profile::option_guard`]) is joined outside the
 /// negation, so neither the option nor its negation holds on a view
-/// without the value. The result's judgment class is a
-/// load-time fact; neither the result nor the decision schema has a
-/// field for it, so a frame condition on it is unsupported.
+/// without the value. The decision's judgment class is a load-time
+/// fact; the decision schema has no field for it, so a frame condition on
+/// it is unsupported.
 fn profile_cond(kind: ScreenKind, id: i32, negative: bool) -> Cond {
     use super::result::profile::{self as result, ResOption};
     let guard = match result::option_guard(id) {
@@ -893,6 +899,51 @@ mod tests {
         assert_eq!(numeric(-193, &none), Cond::Unsupported(-193));
         assert_eq!(numeric(171, &none), Cond::Unsupported(171));
         assert_eq!(numeric(-171, &none), Cond::Unsupported(-171));
+    }
+
+    /// The judgment class options on the result screen are play's
+    /// expressions over the result schema's `chart.judge_class`, by id
+    /// and by name, a negation wrapping the whole (180's validity
+    /// included), and no group guard: the class is the chart's under
+    /// every status. The decision screen's stay unsupported.
+    #[test]
+    fn judge_class_conditions_map_on_the_result_screen() {
+        let none = BTreeMap::new();
+        let scope = skin_model::Scope::new(&skin_model::RESULT);
+        for (id, name, src) in [
+            (
+                180,
+                "chart_judge_veryhard",
+                "chart.judge_class_valid && chart.judge_class == 0",
+            ),
+            (181, "chart_judge_hard", "chart.judge_class == 1"),
+            (182, "chart_judge_normal", "chart.judge_class == 2"),
+            (183, "chart_judge_easy", "chart.judge_class == 3"),
+            (184, "chart_judge_veryeasy", "chart.judge_class == 4"),
+        ] {
+            assert_eq!(
+                numeric_in(ScreenKind::Result, id, &none),
+                expr(src, false),
+                "{id}"
+            );
+            assert_eq!(
+                named_in(ScreenKind::Result, name),
+                Some(expr(src, false)),
+                "{name}"
+            );
+            assert_eq!(
+                numeric_in(ScreenKind::Result, -id, &none),
+                expr(&format!("!({src})"), false),
+                "{id}"
+            );
+            assert_eq!(numeric(id, &none), expr(src, false), "{id}: play's");
+            assert!(skin_model::compile(src, &scope, skin_model::Ty::Bool).is_ok());
+            assert_eq!(
+                numeric_in(ScreenKind::Decision, id, &none),
+                Cond::Unsupported(id),
+                "{id}"
+            );
+        }
     }
 
     #[test]

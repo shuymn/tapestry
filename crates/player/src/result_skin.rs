@@ -1489,8 +1489,9 @@ impl Drop for ResultSkin {
 /// floored hundredths with whether it changes in whole BPMs, as the play
 /// readouts take them (numbers 90-91); its length at 1×, to its last
 /// note's end or BGM event, whatever section or speed is played (numbers
-/// 1163-1164); and its judged notes (number 74), which a
-/// view replaces with its own.
+/// 1163-1164); its judged notes (number 74), which a view replaces with
+/// its own; and its judgment class (options 180-184), [`attempt_class`],
+/// the same in every view.
 pub fn attempt_chart(loaded: &game::Loaded) -> ResultChart {
     let attempt = loaded.attempt();
     let labels = &attempt.labels;
@@ -1507,6 +1508,7 @@ pub fn attempt_chart(loaded: &game::Loaded) -> ResultChart {
         difficulty: Some(difficulty).filter(|d| (1..=5).contains(d)),
         length: Some(loaded.chart().meta.length),
         notes: Some(game::ResultBasis::of(loaded.chart(), None).notes),
+        judge_class: attempt_class(loaded).map(JudgeClass::index),
     }
 }
 

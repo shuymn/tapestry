@@ -24,6 +24,9 @@ pub struct Script {
     /// The speed policy's hi-speed fix every frame gives (image index 55,
     /// `settings.fix_hispeed`): 0 Classic, Floating 1 to 4.
     pub fix_hispeed: u8,
+    /// The chart's tempo changes after its initial [`BPM`]: each at a
+    /// chart time (µs), in thousandths of a BPM.
+    pub tempo: Vec<(i64, i64)>,
 }
 
 /// One phase of a play state.
@@ -89,6 +92,8 @@ pub struct Step<'e, 'a> {
     pub closing: Option<TimeUs>,
 }
 
+/// The chart's initial tempo, in thousandths of a BPM.
+const BPM: i64 = 150_000;
 /// The first note's time and the gap between notes.
 const FIRST: i64 = 1_000_000;
 const GAP: i64 = 400_000;
@@ -129,6 +134,7 @@ impl Script {
             origin: STATE_AT_ZERO - LEAD,
             phases: vec![Phase::Round(round)],
             fix_hispeed: 0,
+            tempo: Vec::new(),
         }
     }
 
@@ -178,6 +184,7 @@ impl Script {
             origin: 0,
             phases,
             fix_hispeed: 0,
+            tempo: Vec::new(),
         }
     }
 
@@ -255,12 +262,17 @@ impl Script {
         FIRST + GAP * i64::try_from(i).unwrap_or(i64::MAX / GAP)
     }
 
-    /// The chart: `notes` notes on key 1.
+    /// The chart: `notes` notes on key 1, at [`BPM`] and its tempo
+    /// changes.
     pub fn chart(&self) -> Chart {
+        let b = self
+            .tempo
+            .iter()
+            .fold(ChartBuilder::new(BPM), |b, &(at, milli)| {
+                b.bpm(TimeUs(at), milli)
+            });
         (0..self.notes)
-            .fold(ChartBuilder::new(150_000), |b, i| {
-                b.tap(lane(), TimeUs(Self::note_time(i)))
-            })
+            .fold(b, |b, i| b.tap(lane(), TimeUs(Self::note_time(i))))
             .build()
             .expect("a self-made chart builds")
     }

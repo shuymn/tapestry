@@ -499,6 +499,63 @@ fn a_negated_result_option_needs_its_value() {
     }
 }
 
+/// The judgment class options on a result skin: JSON `op` 181, -181 and
+/// 180, and Lua `draw` callbacks the import lowers reading
+/// `ms.option(181)`, `not ms.option(181)` and `ms.option(180)`, keep their
+/// images, drawn by the attempt's chart's class as play's are, on a ready
+/// view and an unavailable one alike; 180 needs a known class.
+#[test]
+fn the_judgment_class_options_read_the_attempts_chart() {
+    let ex = value("ex", r#""ref": 71"#);
+    let at = |id: &str, y: i32, more: &str| {
+        format!(r#"{{"id": "{id}", {more} "dst": [{{"x": 0, "y": {y}, "w": 8, "h": 8}}]}}"#)
+    };
+    let dsts = [
+        dst("ex", ""),
+        at("dot", 200, r#""op": [90],"#),
+        at("lab", 300, r#""op": [181],"#),
+        at("bar", 400, r#""op": [-181],"#),
+        at("b5", 500, r#""op": [180],"#),
+    ]
+    .join(",");
+    let j = folder(&format!(r#""value": [{ex}], "destination": [{dsts}]"#));
+    let json = import_result(j.path()).unwrap_or_else(|e| panic!("{e:?}"));
+    let draw = |id: &str, y: i32, cond: &str| {
+        lua_dst(id, y, 8, &format!("draw = function() return {cond} end,"))
+    };
+    let lua_dsts = [
+        lua_dst("ex", 100, 4, ""),
+        draw("dot", 200, "ms.option(90)"),
+        draw("lab", 300, "ms.option(181)"),
+        draw("bar", 400, "not ms.option(181)"),
+        draw("b5", 500, "ms.option(180)"),
+    ]
+    .join(", ");
+    let l = sheet();
+    common::write(
+        l.path(),
+        "s.luaskin",
+        lua_skin("", &lua_value("ex", 4, "ref = 71"), "", &lua_dsts).as_bytes(),
+    );
+    let lua = lua_result(l.path(), &ImportFacts::unavailable(ScreenKind::Result))
+        .unwrap_or_else(|e| panic!("{e:?}"));
+    for skin in [json.skin, lua.imported.skin] {
+        let mut r = Res::new(skin);
+        let mut shown = |mut v: ResultView, class: Option<u8>| {
+            v.chart.judge_class = class;
+            r.view(&v);
+            [300.0, 400.0, 500.0].map(|y| !r.at(0, top(y, 8.0)).is_empty())
+        };
+        let ready = || ready(1_000, true, BestView::Unavailable);
+        assert_eq!(shown(ready(), Some(1)), [true, false, false]);
+        assert_eq!(shown(ready(), Some(3)), [false, true, false]);
+        assert_eq!(shown(ready(), Some(0)), [false, true, true]);
+        assert_eq!(shown(ready(), None), [false, true, false]);
+        assert_eq!(shown(unavailable(), Some(1)), [true, false, false]);
+        assert_eq!(shown(unavailable(), Some(0)), [false, true, true]);
+    }
+}
+
 /// C16: only a number shows the EX score; an image set choosing by 71 or
 /// 171, by `value` or a Lua callback, beside a status and no EX number, is
 /// refused for the missing score.
