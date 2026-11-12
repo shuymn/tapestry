@@ -17311,4 +17311,8 @@ pub(crate) mod tests {
     // point and the barrier into the skin or the built-in page.
     #[cfg(feature = "dev-tools")]
     pub(crate) mod result;
+    // The chart's images on the result screen: written at a view's
+    // staging and reapply, drawn from its first frame.
+    #[cfg(feature = "dev-tools")]
+    mod result_chart;
 }

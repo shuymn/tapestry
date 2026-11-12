@@ -492,6 +492,12 @@ impl Presenter {
         self.desired = None;
     }
 
+    /// The payload published last (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn payload(&self) -> Option<&Arc<ViewPayload>> {
+        self.payload.as_ref()
+    }
+
     /// The next attempt: the attempt's fallback is forgotten.
     pub fn next_attempt(&mut self) {
         self.attempt = None;

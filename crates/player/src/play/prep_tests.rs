@@ -26,6 +26,8 @@ use crate::result_skin::{ResultSkin, ResultStart};
 
 mod adapter;
 mod images;
+mod result_flow;
+mod result_images;
 mod settle;
 
 /// How long a test waits for what must come; `TAPESTRY_TEST_WATCHDOG`

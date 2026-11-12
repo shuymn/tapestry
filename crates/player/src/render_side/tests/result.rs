@@ -22,7 +22,7 @@ use crate::result_present::{Overlay, ResultPresentation, ViewKey, ViewPayload};
 /// What a frame drew: the skin's quads and the strip's lines, or the
 /// built-in page's lines.
 #[derive(Clone, Debug, PartialEq)]
-enum Drawn {
+pub(super) enum Drawn {
     Skin(Vec<Quad>, usize),
     Page(Vec<String>),
 }
@@ -30,7 +30,7 @@ enum Drawn {
 /// The frames' pacing: while `pace` is set each frame wait takes one of
 /// `permits`, holding until there is one.
 #[derive(Default)]
-struct Gate {
+pub(super) struct Gate {
     pace: AtomicBool,
     permits: AtomicU32,
     waits: AtomicU32,
@@ -38,13 +38,13 @@ struct Gate {
 }
 
 impl Gate {
-    fn hold(&self) {
+    pub(super) fn hold(&self) {
         self.pace.store(true, Ordering::Release);
         assert!(wait_until(|| self.held.load(Ordering::Acquire)));
     }
 
     /// One frame, then held again in the next wait.
-    fn step(&self) {
+    pub(super) fn step(&self) {
         let before = self.waits.load(Ordering::Acquire);
         self.permits.store(1, Ordering::Release);
         assert!(wait_until(|| self.waits.load(Ordering::Acquire) > before
@@ -52,18 +52,18 @@ impl Gate {
             && self.permits.load(Ordering::Acquire) == 0));
     }
 
-    fn release(&self) {
+    pub(super) fn release(&self) {
         self.pace.store(false, Ordering::Release);
     }
 }
 
 /// Faults a test turns on.
 #[derive(Default)]
-struct Faults {
+pub(super) struct Faults {
     /// The next result frame submitted fails as a lost device.
-    lose: AtomicBool,
+    pub(super) lose: AtomicBool,
     /// The next result frame is refused by the skin.
-    refuse: AtomicBool,
+    pub(super) refuse: AtomicBool,
     /// A screen built again refuses to restore the result's installation.
     refuse_restore: AtomicBool,
     /// The next result text prepared is refused by the skin.
@@ -71,9 +71,9 @@ struct Faults {
     /// The next built-in page drawn fails as a lost device.
     lose_page: AtomicBool,
     /// The next frame wait times out.
-    time_out: AtomicBool,
+    pub(super) time_out: AtomicBool,
     /// The next strip prepared for a view prepared fails as a lost device.
-    fail_strip: AtomicBool,
+    pub(super) fail_strip: AtomicBool,
     /// The next view prepared takes this long, ms (the whole frames'
     /// preparation before a wait).
     slow_prepare: std::sync::atomic::AtomicU64,
@@ -107,6 +107,24 @@ struct Faults {
     /// The strip's text per slot as prepared, and the one in use.
     strips: Mutex<[Vec<String>; 3]>,
     strip: Mutex<Vec<String>>,
+    /// While it holds points (x, y), each result frame submitted is read
+    /// back and its pixels there kept in `samples`, with the frame's index
+    /// in what was drawn.
+    pub(super) sample: Mutex<Vec<[usize; 2]>>,
+    pub(super) samples: Mutex<Vec<(usize, Vec<[u8; 3]>)>>,
+    /// Stagings discarded.
+    pub(super) discards: AtomicU32,
+    /// The renderer's result chart writes that wrote pixels, after the
+    /// last write asked, and each write's table.
+    pub(super) chart_writes: std::sync::atomic::AtomicU64,
+    pub(super) chart_tables: Mutex<Vec<skin_model::chart_image::ChartTable>>,
+    /// The next result chart write that would write pixels is refused.
+    pub(super) refuse_chart: AtomicBool,
+    /// The next commit is refused (as one for another device), its
+    /// staging left as it is.
+    pub(super) refuse_commit: AtomicBool,
+    /// The next installation of the result kind is refused.
+    pub(super) refuse_install: AtomicBool,
 }
 
 impl Drop for Recorded {
@@ -154,10 +172,33 @@ impl Screen for Recorded {
         self.menu.device()
     }
     fn commit(&mut self, token: render::PreparedToken) -> Result<(), render::CommitError> {
+        if self.faults.refuse_commit.swap(false, Ordering::AcqRel) {
+            return Err(render::CommitError::Device);
+        }
         self.menu.commit(token)
     }
     fn discard(&mut self) {
+        self.faults.discards.fetch_add(1, Ordering::AcqRel);
         self.menu.discard();
+    }
+    fn write_result_chart(
+        &mut self,
+        target: render::ResultChartTarget,
+        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        set: u64,
+    ) -> Result<skin_model::chart_image::ChartTable, render::RenderError> {
+        if self.faults.refuse_chart.swap(false, Ordering::AcqRel) {
+            self.menu.renderer_mut().refuse_next_result_chart();
+        }
+        let out = self.menu.write_result_chart(target, images, set);
+        self.faults.chart_writes.store(
+            self.menu.renderer_mut().result_chart_writes(),
+            Ordering::Release,
+        );
+        if let Ok(t) = &out {
+            self.faults.chart_tables.lock().unwrap().push(*t);
+        }
+        out
     }
     fn install(
         &mut self,
@@ -170,6 +211,9 @@ impl Screen for Recorded {
                 && self.faults.panic_install.swap(false, Ordering::AcqRel)),
             "the render thread panics in the upload (a test's fault)"
         );
+        if kind == ScreenKind::Result && self.faults.refuse_install.swap(false, Ordering::AcqRel) {
+            return Ok(crate::render_side::refusal("the test refused the staging"));
+        }
         if kind == ScreenKind::Play && self.faults.release_then_fail.swap(false, Ordering::AcqRel) {
             self.menu.remove(ScreenKind::Result);
             return Err(render::RenderError::SurfaceLost);
@@ -294,7 +338,22 @@ impl Screen for Recorded {
         self.faults.submits.fetch_add(1, Ordering::AcqRel);
         let quads = self.menu.result_quads().unwrap_or_default();
         let strip = self.menu.result_strip();
-        self.drawn.lock().unwrap().push(Drawn::Skin(quads, strip));
+        let points = self.faults.sample.lock().unwrap().clone();
+        let mut drawn = self.drawn.lock().unwrap();
+        if !points.is_empty()
+            && let Some((w, _, pixels)) = self.menu.read_back()
+        {
+            let w = usize::try_from(w).unwrap();
+            let rgb = points
+                .iter()
+                .map(|&[x, y]| {
+                    let at = (y * w + x) * 4;
+                    [pixels[at], pixels[at + 1], pixels[at + 2]]
+                })
+                .collect();
+            self.faults.samples.lock().unwrap().push((drawn.len(), rgb));
+        }
+        drawn.push(Drawn::Skin(quads, strip));
         Ok(t)
     }
     fn end(&mut self, page: &EndPage) -> Result<bool, render::RenderError> {
@@ -360,11 +419,11 @@ impl Screen for Recorded {
 
 /// A render thread on recorded WARP screens.
 pub(crate) struct Rig {
-    link: RenderLink,
+    pub(super) link: RenderLink,
     clock: QpcClock,
-    gate: Arc<Gate>,
-    faults: Arc<Faults>,
-    drawn: Arc<Mutex<Vec<Drawn>>>,
+    pub(super) gate: Arc<Gate>,
+    pub(super) faults: Arc<Faults>,
+    pub(super) drawn: Arc<Mutex<Vec<Drawn>>>,
 }
 
 impl Rig {
@@ -408,16 +467,16 @@ impl Rig {
         }
     }
 
-    fn drawn(&self) -> Vec<Drawn> {
+    pub(super) fn drawn(&self) -> Vec<Drawn> {
         self.drawn.lock().unwrap().clone()
     }
 
-    fn clear(&self) {
+    pub(super) fn clear(&self) {
         self.drawn.lock().unwrap().clear();
     }
 
     /// Waits until the last frame drew `want`.
-    fn until(&self, want: impl Fn(&Drawn) -> bool) -> bool {
+    pub(super) fn until(&self, want: impl Fn(&Drawn) -> bool) -> bool {
         wait_until(|| self.drawn.lock().unwrap().last().is_some_and(&want))
     }
 }
@@ -476,7 +535,7 @@ fn lua_skin(head: &str, places: &str) -> (tempfile::TempDir, Arc<render::SkinBun
 }
 
 /// [`lua_skin`], with the runtime its import kept.
-fn lua_skin_scripted(
+pub(super) fn lua_skin_scripted(
     head: &str,
     places: &str,
 ) -> (
@@ -575,7 +634,7 @@ fn scripted_skin(
 
 /// A view payload `key` with EX score `ex`, its view lines `lines` and a
 /// built-in page whose view rows say `v<key>`.
-fn payload(
+pub(super) fn payload(
     key: ViewKey,
     skin: Option<&Arc<render::SkinBundle>>,
     ex: u32,
@@ -585,7 +644,7 @@ fn payload(
 }
 
 /// [`payload`] of a chart titled `title`.
-fn titled(
+pub(super) fn titled(
     key: ViewKey,
     skin: Option<&Arc<render::SkinBundle>>,
     ex: u32,
@@ -614,7 +673,7 @@ fn titled(
 }
 
 /// Sends `payload` as revision `revision` of `lifetime` with `overlay`.
-fn show(
+pub(super) fn show(
     link: &RenderLink,
     lifetime: u64,
     revision: u64,
@@ -631,11 +690,11 @@ fn show(
 }
 
 /// The skin's own quads of a frame, the strip's bands left out.
-fn skin_quads(q: &[Quad]) -> Vec<Quad> {
+pub(super) fn skin_quads(q: &[Quad]) -> Vec<Quad> {
     q.iter().filter(|q| q.layer != 0).copied().collect()
 }
 
-fn skin_frame(d: &Drawn) -> Option<(&[Quad], usize)> {
+pub(super) fn skin_frame(d: &Drawn) -> Option<(&[Quad], usize)> {
     match d {
         Drawn::Skin(q, n) => Some((q, *n)),
         Drawn::Page(_) => None,
@@ -643,7 +702,7 @@ fn skin_frame(d: &Drawn) -> Option<(&[Quad], usize)> {
 }
 
 /// Installs the fixed skin as the result kind's and begins a lifetime.
-fn installed(rig: &Rig, skin: &Arc<render::SkinBundle>) -> u64 {
+pub(super) fn installed(rig: &Rig, skin: &Arc<render::SkinBundle>) -> u64 {
     assert_eq!(
         rig.link
             .select(ScreenKind::Result, Some(Arc::clone(skin)))

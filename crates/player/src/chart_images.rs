@@ -1494,6 +1494,7 @@ mod tests {
     /// the worker, one job, and its thread is joined once it ended.
     #[test]
     fn the_worker_reads_both_images() {
+        let _serial = crate::imports::tests::serial();
         let d = tempfile::tempdir().unwrap();
         png(d.path(), "s.png", [640, 480], [10, 20, 30]);
         png(d.path(), "b.png", [512, 384], [40, 50, 60]);
@@ -1522,6 +1523,7 @@ mod tests {
     /// present now is read.
     #[test]
     fn a_retry_reads_only_what_changed() {
+        let _serial = crate::imports::tests::serial();
         let d = tempfile::tempdir().unwrap();
         png(d.path(), "s.png", [640, 480], [10, 20, 30]);
         let coord = Coordinator::new(CAPS);
@@ -1586,6 +1588,7 @@ mod tests {
     /// never a pending wait and never the run's failure.
     #[test]
     fn a_refused_thread_leaves_the_images_absent() {
+        let _serial = crate::imports::tests::serial();
         let d = tempfile::tempdir().unwrap();
         png(d.path(), "s.png", [640, 480], [10, 20, 30]);
         let coord = Coordinator::new(CAPS);
@@ -1682,6 +1685,7 @@ mod tests {
     /// fit is placed there, and nothing is decoded again.
     #[test]
     fn a_fit_for_a_larger_layer_is_derived_again_for_a_smaller_one() {
+        let _serial = crate::imports::tests::serial();
         let d = tempfile::tempdir().unwrap();
         png(d.path(), "s.png", [1_600, 1_200], [10, 20, 30]);
         let coord = Coordinator::new(CAPS);
@@ -1711,6 +1715,7 @@ mod tests {
     /// (RX6e); a read stopped part way resolves nothing.
     #[test]
     fn the_direct_launch_reads_at_once() {
+        let _serial = crate::imports::tests::serial();
         let d = tempfile::tempdir().unwrap();
         png(d.path(), "s.png", [640, 480], [10, 20, 30]);
         let w = ChartImageWorker::default();
