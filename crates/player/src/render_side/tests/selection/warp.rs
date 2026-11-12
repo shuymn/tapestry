@@ -152,6 +152,22 @@ impl Screen for Lossy {
     fn remove(&mut self, kind: ScreenKind) {
         self.menu.remove(kind);
     }
+    fn publish_chart_absent(
+        &mut self,
+        target: render::ChartTarget,
+    ) -> Result<skin_model::chart_image::ChartTable, render::RenderError> {
+        self.menu.publish_chart_absent(target)
+    }
+    fn write_selection_chart(
+        &mut self,
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
+        set: u64,
+    ) -> Result<skin_model::chart_image::ChartTable, render::RenderError> {
+        self.menu.write_selection_chart(images, set)
+    }
+    fn selection_chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
+        self.menu.selection_chart_key()
+    }
     fn wait(&self) -> bool {
         let gate = &self.gate;
         gate.waits.fetch_add(1, Ordering::AcqRel);
@@ -256,6 +272,19 @@ fn lossy_link_with(
     fault: Option<bool>,
     bad_month: &Arc<AtomicBool>,
 ) -> (RenderLink, Frames, Arc<AtomicBool>, Arc<AtomicBool>) {
+    let frames = Frames::default();
+    let (link, lose, skip) = lossy_spawn(fault, bad_month, Box::new(frames.clone()));
+    (link, frames, lose, skip)
+}
+
+/// A render thread on [`Lossy`] WARP screens as [`lossy_link_with`]
+/// makes it, its frames given to `sink`, with the screens' `lose` and
+/// `skip` flags.
+pub(super) fn lossy_spawn(
+    fault: Option<bool>,
+    bad_month: &Arc<AtomicBool>,
+    sink: Box<dyn FrameSink>,
+) -> (RenderLink, Arc<AtomicBool>, Arc<AtomicBool>) {
     let bad_month = Arc::clone(bad_month);
     let lose = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&lose);
@@ -283,19 +312,9 @@ fn lossy_link_with(
             bad_month: Arc::clone(&bad_month),
         }) as Box<dyn Screen>)
     });
-    let frames = Frames::default();
     let clock = QpcClock::start();
-    let link = spawn(
-        make,
-        None,
-        None,
-        clock,
-        view(),
-        measure(clock),
-        Box::new(frames.clone()),
-    )
-    .unwrap();
-    (link, frames, lose, skip)
+    let link = spawn(make, None, None, clock, view(), measure(clock), sink).unwrap();
+    (link, lose, skip)
 }
 
 fn row(key: RowKey, kind: RowKind, title: &str) -> RowView {
@@ -316,7 +335,7 @@ fn row(key: RowKey, kind: RowKind, title: &str) -> RowView {
 
 /// A view of the all-charts row, a folder and a chart at `place` with
 /// `query`, the cursor on the first.
-fn listed(place: SelectionPlace, query: &str) -> SelectionView {
+pub(super) fn listed(place: SelectionPlace, query: &str) -> SelectionView {
     let folder = skin_model::FolderId::new(std::path::PathBuf::from("曲集"));
     SelectionView {
         rows: vec![

@@ -52,6 +52,9 @@ pub static HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 
 pub use crate::chart_currency::{ChartNow, PublicationKey, PublishedTo};
 
+// A name the library keeps is one the chart-image reader accepts.
+const _: () = assert!(library::IMAGE_NAME_BYTES == skin_model::MAX_PATH_BYTES);
+
 /// Holds every read of the images until let go, whatever its cancel says
 /// (tests: a job that ignores its cancel).
 #[cfg(test)]

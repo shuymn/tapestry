@@ -6,14 +6,19 @@ use skin_model::{AppReadouts, BuildError, Selection, SelectionTimers, Skin};
 
 use super::script::{ScriptSlot, ScriptStop};
 
-/// Prepares `sel`'s frame at `now` for `skin`, its application readouts
-/// from `app` and its timers from `timers`
-/// ([`Skin::prepare_selection_frame`]), then runs the runtime `slot`'s
-/// screen has, if any, against that state, writing every callback's
-/// output slot; without one every output is its constant. The build of
-/// the same frame then draws this state without refilling it. Called
-/// after the frame's view and settings are applied and before its build,
-/// outside the build's no-allocation span.
+/// Writes `sel`'s chart image fields from the table set on it
+/// ([`Selection::write_chart_fields`]), prepares its frame at `now` for
+/// `skin`, its application readouts from `app` and its timers from
+/// `timers` ([`Skin::prepare_selection_frame`]), then runs the runtime
+/// `slot`'s screen has, if any, against that state, writing every
+/// callback's output slot; without one every output is its constant. The
+/// build of the same frame then draws this state without refilling it.
+/// Called after the frame's view and settings are applied and before its
+/// build, outside the build's no-allocation span: the image fields are
+/// written after the view update, which resets them, and before the
+/// `when` timers and the callbacks, so a frame, a callback and a
+/// condition read one value (design.md "Rendering and Skins", Chart
+/// images).
 ///
 /// Returns why the runtime stopped, once for `slot`'s screen: on the
 /// frame it stops, or on the first frame of a screen resuming a stopped
@@ -32,6 +37,7 @@ pub(crate) fn selection_visit(
     timers: &SelectionTimers,
     app: &AppReadouts,
 ) -> Result<Option<ScriptStop>, BuildError> {
+    sel.write_chart_fields();
     skin.prepare_selection_frame(sel, now, timers, app)?;
     // The switches' `off` (dev-tools): no runtime taken.
     #[cfg(feature = "dev-tools")]

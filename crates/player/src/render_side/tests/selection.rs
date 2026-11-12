@@ -467,4 +467,6 @@ fn a_when_timer_restarts_at_each_entry_and_survives_a_screen_built_again() {
 }
 
 #[cfg(feature = "dev-tools")]
+mod images;
+#[cfg(feature = "dev-tools")]
 mod warp;

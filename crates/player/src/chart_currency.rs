@@ -17,6 +17,10 @@ pub enum PublishedTo {
     /// The committed play installation's chart layer, by its live key
     /// (`None` with no installation or on a lost device).
     Committed(Option<ChartKey>),
+    /// The selection installation's chart layer, by its live key (`None`
+    /// with no selection installation or on a lost device). Its key's
+    /// generation is the cursor generation, not the play one.
+    Selection(Option<ChartKey>),
 }
 
 /// What a published table and its acknowledgment are for: the images'
@@ -26,6 +30,7 @@ pub struct PublicationKey {
     /// The generation of the images' resolution
     /// ([`crate::chart_images::ChartImageWorker::renew`]): a new one at
     /// each choice, practice Start, retry's re-resolution and chart left.
+    /// For a [`PublishedTo::Selection`] key, the cursor generation.
     pub generation: u64,
     /// The attempt: the request of the staging the table is for, `None`
     /// for the committed installation's table, which is the current
@@ -45,31 +50,46 @@ pub struct ChartNow {
     pub staged: Option<u64>,
     /// The committed play installation's live chart key.
     pub committed: Option<ChartKey>,
+    /// The cursor generation the game thread set last: a new one at each
+    /// change of the selection's image request.
+    pub cursor_generation: u64,
+    /// The selection installation's live chart key.
+    pub selection: Option<ChartKey>,
 }
 
 impl PublicationKey {
     /// Whether this publication is current at `now` for the attempt
     /// `request` the caller expects: the same generation, that attempt,
-    /// and its target still the live one. The one test of currency, asked
-    /// by:
+    /// and its target still the live one. A selection key is compared with
+    /// the cursor generation instead of the play one, and is never an
+    /// attempt's. The one test of currency, asked by:
     /// - the game thread's [`crate::chart_images::ChartImageWorker::publish`],
     ///   before taking an acknowledgment (the barrier before readiness and
     ///   the loading frames' publication) and before keeping one it asked
     ///   for;
-    /// - the render thread's `Run::publish_chart`, before admitting an
-    ///   incoming publication into its one target;
+    /// - the render thread's `Run::publish_chart` and
+    ///   `Run::publish_selection_chart`, before admitting an incoming
+    ///   publication into its one target;
     /// - the render thread's `Run::commit`, before re-keying the staged
     ///   table into the committed installation;
     /// - the render thread's `Run::sync_chart`, before every frame and
-    ///   publication, for the committed table (expecting `None`) and the
-    ///   staged one (expecting the live staging's request).
+    ///   publication, for the committed table (expecting `None`), the
+    ///   staged one (expecting the live staging's request) and the
+    ///   selection's (expecting `None`).
     #[must_use]
     pub fn current(&self, now: &ChartNow, request: Option<u64>) -> bool {
+        if let PublishedTo::Selection(k) = self.target {
+            return self.generation == now.cursor_generation
+                && self.request.is_none()
+                && request.is_none()
+                && now.selection == k;
+        }
         self.generation == now.generation
             && self.request == request
             && match self.target {
                 PublishedTo::Staged(r) => request == Some(r) && now.staged == Some(r),
                 PublishedTo::Committed(k) => request.is_none() && now.committed == k,
+                PublishedTo::Selection(_) => false,
             }
     }
 }
@@ -96,6 +116,7 @@ mod tests {
             generation: 5,
             staged: Some(9),
             committed: Some(K),
+            ..ChartNow::default()
         };
         let committed = PublicationKey {
             generation: 5,
@@ -154,6 +175,109 @@ mod tests {
                 ..now
             },
             Some(9)
+        ));
+    }
+
+    /// A selection key is current for its cursor generation and the live
+    /// selection key, whatever the play generation; never for an attempt,
+    /// and a missing key is not a missing installation's.
+    #[test]
+    fn a_selection_key_is_current_for_its_cursor_generation_and_key() {
+        let now = ChartNow {
+            generation: 5,
+            staged: None,
+            committed: None,
+            cursor_generation: 11,
+            selection: Some(K),
+        };
+        let key = PublicationKey {
+            generation: 11,
+            request: None,
+            target: PublishedTo::Selection(Some(K)),
+        };
+        assert!(key.current(&now, None));
+        assert!(
+            key.current(
+                &ChartNow {
+                    generation: 6,
+                    ..now
+                },
+                None
+            ),
+            "the play generation is not compared"
+        );
+        assert!(
+            !key.current(
+                &ChartNow {
+                    cursor_generation: 12,
+                    ..now
+                },
+                None
+            ),
+            "another cursor generation"
+        );
+        let other = ChartKey {
+            installation: 7,
+            ..K
+        };
+        assert!(
+            !key.current(
+                &ChartNow {
+                    selection: Some(other),
+                    ..now
+                },
+                None
+            ),
+            "another selection key"
+        );
+        assert!(
+            !key.current(
+                &ChartNow {
+                    selection: None,
+                    ..now
+                },
+                None
+            ),
+            "the installation gone"
+        );
+        let unkeyed = PublicationKey {
+            target: PublishedTo::Selection(None),
+            ..key
+        };
+        assert!(
+            unkeyed.current(
+                &ChartNow {
+                    selection: None,
+                    ..now
+                },
+                None
+            ),
+            "a None key is current only while there is no key"
+        );
+        assert!(
+            !unkeyed.current(&now, None),
+            "a None key against a live one"
+        );
+        assert!(!key.current(&now, Some(11)), "a request given");
+        let attempt = PublicationKey {
+            request: Some(3),
+            ..key
+        };
+        assert!(
+            !attempt.current(&now, Some(3)),
+            "a selection key with an attempt"
+        );
+        // A committed key with the cursor generation is not a selection one.
+        let committed = PublicationKey {
+            target: PublishedTo::Committed(Some(K)),
+            ..key
+        };
+        assert!(!committed.current(
+            &ChartNow {
+                committed: Some(K),
+                ..now
+            },
+            None
         ));
     }
 }

@@ -511,6 +511,7 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::target",
             "MenuScreen::minimized",
             "MenuScreen::chart_key",
+            "MenuScreen::selection_chart_key",
             "MenuScreen::build_selection_frame",
             "MenuScreen::build_page_frame",
             "strip_sprites",

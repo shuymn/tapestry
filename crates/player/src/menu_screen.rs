@@ -901,6 +901,19 @@ impl Screen for MenuScreen {
         self.renderer.chart_key()
     }
 
+    fn write_selection_chart(
+        &mut self,
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
+        set: u64,
+    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+        self.renderer.write_selection_chart(images, set)
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn selection_chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
+        self.renderer.selection_chart_key()
+    }
+
     /// Stages `skin`'s chart-independent installation of `kind`,
     /// answering at once; a refusal on a healthy device
     /// ([`RenderError::is_refusal`]), the texels the screens share
