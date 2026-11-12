@@ -1101,8 +1101,10 @@ mod tests {
     fn the_failure_handling_is_the_loaded_one() {
         let dir = tempfile::tempdir().unwrap();
         let root = game::DataRoot::new(dir.path().to_owned());
-        let mut player = game::PlayerSettings::default();
-        player.on_failure = game::FailureAction::PlayToEnd;
+        let player = game::PlayerSettings {
+            on_failure: game::FailureAction::PlayToEnd,
+            ..game::PlayerSettings::default()
+        };
         let loaded = game::Settings {
             device: game::DeviceSettings::default(),
             player,
