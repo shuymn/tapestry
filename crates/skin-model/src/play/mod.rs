@@ -487,6 +487,10 @@ pub struct SkinFrame<'a> {
     /// `closing`): the `failed` timer's start, for the displayed survival
     /// gauge's failure and the quit key alike; `None` outside Closing.
     pub closing: Option<TimeUs>,
+    /// Where a completed full play's fade-out started, on its play clock
+    /// (the play view's `fading`): the `fadeout` timer's start; `None`
+    /// before it, in Closing and in a practice round.
+    pub fading: Option<TimeUs>,
     /// The render target's size in pixels; the skin computes its canvas
     /// from it.
     pub target: [u32; 2],
@@ -1441,6 +1445,7 @@ mod tests {
                     complete: false,
                     playing: true,
                     closing: None,
+                    fading: None,
                     target: [1_920, 1_080],
                     layout: &layout,
                     turntable: 0,
@@ -1529,6 +1534,7 @@ mod tests {
             complete: false,
             playing: true,
             closing: None,
+            fading: None,
             target: [1_920, 1_080],
             layout: &layout,
             turntable: 0,

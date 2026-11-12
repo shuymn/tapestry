@@ -1087,6 +1087,9 @@ impl Play {
         set(timer::GAUGE_MAX, gauge_max);
         set(timer::BEAT, beat);
         set(timer::RHYTHM, rhythm);
+        // From the lifecycle's fade-out start alone, which Closing never
+        // publishes.
+        set(timer::FADEOUT, frame.fading);
         set(timer::JUDGE, judge.map(|(_, at)| at));
         for grade in Grade::ALL {
             let at = judge.filter(|&(g, _)| g == grade).map(|(_, at)| at);

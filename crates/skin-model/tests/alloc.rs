@@ -1824,6 +1824,7 @@ fn stretch(
             // A Closing that starts with the shown survival gauge's
             // failure, drawn while that gauge shows.
             closing: gauges[1].failed_at.filter(|_| shown == 1),
+            fading: None,
         };
         let use_small = frame_no % 100 == 99;
         let out = if use_small { &mut *small } else { &mut *batch };
@@ -2221,6 +2222,7 @@ fn build_does_not_allocate() {
         readouts: readouts_for(views.lanes[0]),
         playing: true,
         closing: None,
+        fading: None,
     };
     skin.build(&mut play, &frame, &loaded.uvs, &mut batch)
         .expect("the frame builds");
@@ -2304,6 +2306,7 @@ fn build_does_not_allocate() {
             readouts: readouts_for(views.lanes[0]),
             playing: true,
             closing: None,
+            fading: None,
         };
         bitmap
             .build(&mut play, &frame, &uvs, &mut batch)
@@ -2639,6 +2642,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             readouts: readouts_for(lanes),
             playing: true,
             closing: None,
+            fading: None,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch)
             .expect("the frame builds");
@@ -2758,6 +2762,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 readouts: readouts_for(lanes),
                 playing: true,
                 closing: None,
+                fading: None,
             };
             let out = if i % 50 == 49 { &mut small } else { &mut batch };
             out.clear();
@@ -2801,6 +2806,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
                 readouts: bad,
                 playing: true,
                 closing: None,
+                fading: None,
             };
             assert_eq!(
                 skin.build(&mut play, &frame, &uvs, &mut batch),
@@ -2951,6 +2957,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                     readouts: readouts_for(lanes),
                     playing: true,
                     closing: None,
+                    fading: None,
                 };
                 let out = if i % 25 == 24 { &mut small } else { &mut batch };
                 out.clear();
@@ -2999,6 +3006,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                         readouts: readouts_for(lanes),
                         playing: true,
                         closing: None,
+                        fading: None,
                     };
                     batch.clear();
                     skin.build(&mut play, &frame, &uvs, &mut batch)
@@ -3038,6 +3046,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                     readouts: bad,
                     playing: true,
                     closing: None,
+                    fading: None,
                 };
                 assert_eq!(
                     skin.build(&mut play, &frame, &uvs, &mut batch),
@@ -3265,6 +3274,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             readouts,
             playing: true,
             closing: None,
+            fading: None,
         };
         let out = if i % 50 == 49 { &mut small } else { &mut batch };
         out.clear();
@@ -3325,6 +3335,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             readouts: bad,
             playing: true,
             closing: None,
+            fading: None,
         };
         assert_eq!(
             skin.build(&mut play, &frame, &uvs, &mut batch),
@@ -3461,6 +3472,7 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
         readouts,
         playing: true,
         closing: None,
+        fading: None,
     };
     let bar_uv = |uvs: &UvTable| uvs.get(lanes_support::BAR).unwrap().uv;
     let (mut quads, mut turned, mut drops) = (0_usize, 0_usize, 0_u32);
@@ -3723,6 +3735,7 @@ fn grade_attachments_do_not_allocate(ctx: &PlayContext<'_>) {
             readouts: readouts_for(lanes),
             playing: true,
             closing: None,
+            fading: None,
         };
         batch.clear();
         skin.build(&mut play, &frame, &loaded.uvs, &mut batch)
@@ -3878,6 +3891,7 @@ fn large_gauges_do_not_allocate(ctx: &PlayContext<'_>, views: &Views, descs: &[G
                 readouts: readouts_for(view),
                 playing: true,
                 closing: None,
+                fading: None,
             };
             let out = if no % 10 == 9 { &mut small } else { &mut batch };
             out.clear();
@@ -4041,6 +4055,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         readouts,
         playing: true,
         closing: None,
+        fading: None,
     };
     let invalid = FrameReadouts {
         duration: Some(DurationRatio {
@@ -4180,6 +4195,7 @@ fn rhythm_does_not_allocate(descs: &[GaugeDesc]) {
     let lanes = LaneView::NONE;
     // (now, playing, complete, closing)
     let frame = |now: i64, playing: bool, complete: bool, closing: Option<TimeUs>| SkinFrame {
+        fading: None,
         app: skin_model::AppReadouts::LAUNCH,
         state_us: 0,
         now: TimeUs(now),
@@ -4334,6 +4350,7 @@ fn main_bpm_does_not_allocate(descs: &[GaugeDesc]) {
         app: skin_model::AppReadouts::LAUNCH,
         playing: true,
         closing: None,
+        fading: None,
     };
     let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
     let mut plays = [
@@ -4498,6 +4515,7 @@ fn progress_and_length_do_not_allocate(descs: &[GaugeDesc]) {
         app: skin_model::AppReadouts::LAUNCH,
         playing: true,
         closing: None,
+        fading: None,
     };
     let loading_frame = |no: i64| LoadingFrame {
         app: skin_model::AppReadouts::LAUNCH,
@@ -4802,6 +4820,7 @@ fn programs_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         readouts: readouts_for(play_support::VIEW),
         playing: true,
         closing: None,
+        fading: None,
     };
     let tallies: &'static [Tally] =
         Box::leak((0..10).map(tally).collect::<Vec<_>>().into_boxed_slice());
@@ -5043,6 +5062,7 @@ fn promoted_numerics_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         readouts: readouts_for(play_support::VIEW),
         playing: true,
         closing: None,
+        fading: None,
     };
     let clocks = [-1, -7_000_003, (1 << 53) + 1, (1 << 53) + 2, 1 << 53, 5_000];
     let mut play = skin.prepare(chart, ctx).unwrap();
@@ -5206,6 +5226,7 @@ fn app_readouts_do_not_allocate(
         readouts: readouts_for(play_support::VIEW),
         playing: true,
         closing: None,
+        fading: None,
     };
     let mut play = skin.prepare(chart, ctx).unwrap();
     let mut loading = skin.prepare_loading(Side::Left);
@@ -5352,6 +5373,7 @@ fn slots_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         readouts: readouts_for(play_support::VIEW),
         playing: true,
         closing: None,
+        fading: None,
     };
     let tallies: &'static [Tally] =
         Box::leak((0..10).map(tally).collect::<Vec<_>>().into_boxed_slice());
@@ -5474,6 +5496,7 @@ fn carried_slots_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         readouts: readouts_for(play_support::VIEW),
         playing: true,
         closing: None,
+        fading: None,
     };
     // The latch set at 100 ms of the state clock in an earlier round.
     let carried = Bank::of(vec![Val::Int(100_000)]);
