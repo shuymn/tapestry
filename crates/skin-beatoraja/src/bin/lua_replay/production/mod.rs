@@ -87,8 +87,11 @@ fn play_score(main: Option<Tempo>) -> skin_model::PlayScore<'static> {
 /// them for a real chart: the attempt's tempo provider over the chart as
 /// loaded (at 1×, so a playback tempo is the original one), the original
 /// BPM range as `player`'s `attempt_context::bpm_range` takes it from the
-/// timeline's extrema, and the whole chart's MAIN as the session computes
-/// it once per load (`game`'s references over the whole chart).
+/// timeline's extrema, and the whole chart's MAIN from `game`'s references
+/// over the whole chart. The references are all or nothing: a chart whose
+/// fine tempo makes any of them inexact leaves this MAIN unknown, where
+/// the player computes MAIN on its own and may know it. The scripts'
+/// charts use whole millibpm tempos, so for them the two agree.
 struct ChartTempo {
     provider: game::AttemptTempo,
     range: Option<BpmRange>,
