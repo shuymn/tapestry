@@ -575,7 +575,11 @@ fn layout(
         let derived = crate::chart_images::derive_set(&chart.sources, spec.bundle.side(), &|| {
             cancel.is_cancelled()
         });
-        spec.derived = Some((chart.sources.id(), Arc::new(derived)));
+        // A derivation that failed is not kept with the layout: the layout
+        // is laid out again (and derives again) when it is asked for.
+        if let Some(derived) = derived {
+            spec.derived = Some((chart.sources.id(), Arc::new(derived)));
+        }
     }
     // A layout that gave no specialization keeps no runtime: it goes here,
     // on the job's thread.

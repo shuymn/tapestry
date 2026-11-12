@@ -212,9 +212,7 @@ pub fn read_sources(want: &Want, prior: Option<&Sources>, cancel: &dyn Fn() -> b
         let now = chart_image::resolve(&dir, name, &[], identity);
         if let Some(prior) = prior {
             let kept = prior.read(which);
-            if now.same_as(&kept.binding)
-                && !matches!(kept.image, Err(Absent::Cancelled | Absent::Failed))
-            {
+            if now.same_as(&kept.binding) && reusable(kept) {
                 return Arc::clone(&prior.reads[which.index()]);
             }
         }
@@ -234,6 +232,35 @@ pub fn read_sources(want: &Want, prior: Option<&Sources>, cancel: &dyn Fn() -> b
         }
     });
     ChartImages::of(reads)
+}
+
+/// Whether `read` may be carried past the job that made it (kept for a
+/// later generation, or with a layout): what it holds is the file's own
+/// (an image, or the absence its observation gives), never a job's
+/// failure (panicked, could not start) or cancellation. The one test every
+/// reuse of a source asks.
+fn reusable(read: &Read) -> bool {
+    !matches!(read.image, Err(Absent::Cancelled | Absent::Failed))
+}
+
+/// Whether `fit`, derived from `source`, may be reused: it is an image,
+/// or `source`'s own absence. A fit absent while its source is an image is
+/// its derivation's failure (cancelled, failed, or its allocation
+/// refused), which a later derivation may not repeat. The one test every
+/// reuse of a fit asks.
+fn fit_reusable(fit: &Read, source: &Read) -> bool {
+    fit.image.is_ok() || (source.image.is_err() && reusable(fit))
+}
+
+impl ChartImages {
+    /// Whether every fit of this set, derived from `sources`, may be
+    /// reused ([`fit_reusable`]).
+    #[must_use]
+    pub fn reusable_from(&self, sources: &Sources) -> bool {
+        ChartImage::ALL
+            .into_iter()
+            .all(|w| fit_reusable(self.read(w), sources.read(w)))
+    }
 }
 
 /// A half: the fits of a generation's sources for chart layers of one
@@ -264,6 +291,7 @@ fn derive_half(
         if let Some(p) = prior
             && p.side == side
             && Arc::ptr_eq(&p.from.reads[i], source)
+            && fit_reusable(&p.fits.reads[i], source)
         {
             return Arc::clone(&p.fits.reads[i]);
         }
@@ -277,6 +305,7 @@ fn derive_half(
             return Arc::clone(source);
         };
         if let Some(o) = other
+            && fit_reusable(o.read(which), source)
             && o.read(which)
                 .image
                 .as_ref()
@@ -296,10 +325,11 @@ fn derive_half(
 }
 
 /// `sources`' fits for chart layers of side `side`, each derived anew
-/// (a result layout's own chart slot).
+/// (a result layout's own chart slot), kept with that layout: `None` when a
+/// derivation failed, so no failed fit is ever kept ([`fit_reusable`]).
 #[must_use]
-pub fn derive_set(sources: &Sources, side: u32, cancel: &dyn Fn() -> bool) -> ChartImages {
-    derive_half(sources, side, None, None, cancel)
+pub fn derive_set(sources: &Sources, side: u32, cancel: &dyn Fn() -> bool) -> Option<ChartImages> {
+    Some(derive_half(sources, side, None, None, cancel)).filter(|d| d.reusable_from(sources))
 }
 
 /// Whether `fit` was derived from `source`: the same observation and
@@ -2037,6 +2067,85 @@ mod tests {
         w.step(Some((&coord, Spawner::SYSTEM)), &|| false, None);
         w.service();
         assert_eq!(w.begun(), jobs, "a job began after the end");
+    }
+
+    /// A result half whose derivation failed, then a new generation of the
+    /// same, unchanged files before the result took it (a practice Start):
+    /// the failed fit is never carried forward; with a working spawner the
+    /// half is an image again (derived afresh, or shared with the play
+    /// half's own fit), from the kept sources, decoding nothing.
+    #[test]
+    fn a_failed_fit_is_derived_again_in_the_next_generation() {
+        let _serial = crate::imports::tests::serial();
+        let d = tempfile::tempdir().unwrap();
+        png(d.path(), "s.png", [640, 480], [10, 20, 30]);
+        let coord = Coordinator::new(CAPS);
+        let w = ChartImageWorker::default();
+        w.attempt(both(d.path(), Some(SIDE), None));
+        settle_all(&w, &coord);
+        let sources = w.sources().unwrap();
+        w.attempt(both(d.path(), Some(SIDE), Some(4_096)));
+        w.step(
+            Some((&coord, Spawner::refusing_owned(&[JobKind::ChartImages]))),
+            &|| false,
+            None,
+        );
+        assert_eq!(
+            w.current_result().unwrap().read(ChartImage::Stage).image,
+            Err(Absent::Failed)
+        );
+        // Drawn, then renewed before the result took the half.
+        w.committed();
+        w.renew();
+        w.attempt(both(d.path(), Some(SIDE), Some(4_096)));
+        let decodes = w.counts().0;
+        settle_all(&w, &coord);
+        let half = w.current_result().unwrap();
+        assert_eq!(
+            half.read(ChartImage::Stage)
+                .image
+                .as_ref()
+                .map(skin_model::chart_image::Fitted::content),
+            Ok([640, 480]),
+            "the failed fit carried forward"
+        );
+        assert!(std::ptr::eq(
+            w.sources().unwrap().read(ChartImage::Stage),
+            sources.read(ChartImage::Stage)
+        ));
+        assert_eq!(w.counts().0, decodes, "decoded again");
+    }
+
+    /// Sources a failed job left (its panic) are never kept for the next
+    /// generation of the same, unchanged files: they are read again, and
+    /// the facts resolve to the file's own; a derivation cancelled part way
+    /// is not a set a layout keeps.
+    #[test]
+    fn failed_sources_and_derivations_are_never_kept() {
+        let _serial = crate::imports::tests::serial();
+        let d = tempfile::tempdir().unwrap();
+        png(d.path(), "s.png", [640, 480], [10, 20, 30]);
+        let coord = Coordinator::new(CAPS);
+        let w = ChartImageWorker::default();
+        super::PANIC.store(true, std::sync::atomic::Ordering::Release);
+        w.attempt(both(d.path(), None, None));
+        settle_all(&w, &coord);
+        assert_eq!(w.facts(), Some(skin_model::ImageFacts::default()));
+        w.committed();
+        w.renew();
+        w.attempt(both(d.path(), None, None));
+        settle_all(&w, &coord);
+        assert_eq!(
+            w.facts(),
+            Some(skin_model::ImageFacts {
+                stage: true,
+                back: false
+            }),
+            "the failed sources kept"
+        );
+        let sources = w.sources().unwrap();
+        assert!(super::derive_set(&sources, 4_096, &|| true).is_none());
+        assert!(super::derive_set(&sources, 4_096, &|| false).is_some());
     }
 
     /// The run's end with a held job cancelled through its

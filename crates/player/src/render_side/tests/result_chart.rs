@@ -110,7 +110,7 @@ fn images(side: u32, stage: [u8; 3], back: [u8; 3]) -> (tempfile::TempDir, Arc<C
         result: None,
     };
     let sources = read_sources(&want, None, &|| false);
-    let set = derive_set(&sources, side, &|| false);
+    let set = derive_set(&sources, side, &|| false).unwrap();
     assert!(set.fitted().iter().all(Option::is_some), "{set:?}");
     (d, Arc::new(set))
 }

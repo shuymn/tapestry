@@ -100,7 +100,7 @@ fn handed(dir: &Path, side: Option<u32>) -> ResultImages {
     };
     let sources = Arc::new(read_sources(&want, None, &|| false));
     assert!(sources.facts().stage && sources.facts().back);
-    let half = side.map(|s| Arc::new(derive_set(&sources, s, &|| false)));
+    let half = side.map(|s| Arc::new(derive_set(&sources, s, &|| false).unwrap()));
     ResultImages {
         sources,
         half,
