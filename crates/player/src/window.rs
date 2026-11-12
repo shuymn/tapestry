@@ -1157,6 +1157,25 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), [false, true, false, true]);
     }
 
+    /// P10: the decision screen keeps the cursor shown: entering it from
+    /// selection asks for nothing.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_cursor_stays_shown_on_the_decision_screen() {
+        let (switch, seen) = super::CursorSwitch::recording();
+        let ((), _) = crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            use game::AppRig as _;
+            rig.cursor = Some(switch);
+            rig.adjust = None;
+            rig.entered_selection();
+            let _ = rig.entered_decision(
+                &game::Pick::Play(std::path::PathBuf::from("chart.bms")),
+                game::Decision::off(),
+            );
+        });
+        assert_eq!(*seen.lock().unwrap(), [true]);
+    }
+
     /// The hidden window as showing sees it.
     #[derive(Default)]
     struct FakeShow {

@@ -3330,7 +3330,7 @@ pub fn spawn(
                 decision: None,
                 tuning: None,
                 pointer: None,
-                drag_seen: 0,
+                drag_seen: crate::pointer::Seen::default(),
                 current: None,
                 #[cfg(feature = "dev-tools")]
                 ready: None,
@@ -4149,8 +4149,8 @@ struct Run {
     tuning: Option<Arc<LiveTuning>>,
     /// The pointer's shared state ([`RenderMsg::Pointer`]).
     pointer: Option<Arc<crate::pointer::PointerShared>>,
-    /// The drag cell's movement sequence last taken: one drag a frame.
-    drag_seen: u64,
+    /// The drag cell's movement last taken: one drag a frame.
+    drag_seen: crate::pointer::Seen,
     /// The committed attempt's tempo and presentation epoch, which its
     /// play frames project the snapshot with.
     current: Option<(game::AttemptTempo, u64)>,

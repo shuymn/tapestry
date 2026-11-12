@@ -1086,7 +1086,7 @@ fn an_input_of_another_lifetime_does_nothing() {
         };
         assert_eq!(lifetime(rig), 7);
         let w7 = w.shared.word();
-        assert_eq!(w7, 7 << 1 | 1);
+        assert_eq!(w7, crate::pointer::word_of(7));
         // Observed under 7, taken in 8.
         hold(screens);
         again(rig);
@@ -1466,7 +1466,7 @@ fn pointer_dispatch_alloc() {
     let menu = Arc::clone(&sel.menu);
     let word = shared.word();
     let mut capture = Capture::default();
-    let mut seen = shared.drag_now().sequence;
+    let mut seen = crate::pointer::Seen::default();
     // The hold the drags belong to, begun on the list slider and
     // dispatched.
     capture.moved(&shared, list_slider(0), word, 0);
@@ -1478,7 +1478,7 @@ fn pointer_dispatch_alloc() {
     assert!(sel.pass(None, TimeUs(0)).is_none());
     assert!(sel.pointer.flight.is_none());
     let capacity = menu.capacity();
-    let round = |sel: &mut Selection, capture: &mut Capture, seen: &mut u64| {
+    let round = |sel: &mut Selection, capture: &mut Capture, seen: &mut crate::pointer::Seen| {
         let admit = |i| menu.push_stamped(i, None);
         capture.button(&shared, Button::Left, false, word, 0, admit);
         // 63 clicks on rows, then the hold the drags belong to.
@@ -1661,5 +1661,93 @@ fn a_press_on_the_cursors_row_drawn_off_the_cursor_is_no_enter() {
         assert_eq!(take_all(rig), None);
         assert_eq!(log(rig), [(Input, 3), (Press(MoveTo(3)), 3)]);
         release(screens);
+    });
+}
+
+/// P15: a hold's drag is its own movement only. With the render thread
+/// held, the list slider pressed, moved to its end and released, then
+/// event 13 over the slider pressed without moving: the second hold drags
+/// nothing (the first hold's unseen movement is not its), and the cursor
+/// stays where the first press put it.
+#[test]
+fn a_new_hold_drags_nothing_of_an_earlier_holds_movement() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 5);
+    on_pointer(sel, true, None, |rig, w, screens| {
+        let c = rig.controls;
+        hold(screens);
+        w.down(c, list_slider(0), Button::Left);
+        w.to(c, list_slider(1_000));
+        w.up(c, Button::Left);
+        w.down(c, MODE_ON_SLIDER, Button::Left);
+        release(screens);
+        dragged(rig, screens);
+        assert_eq!(log(rig), [(Press(MoveTo(0)), 0), (Press(Nothing), 0)]);
+        assert_eq!(cursor(rig), 0);
+        w.up(c, Button::Left);
+    });
+}
+
+/// The window loses its focus, as the window sees one.
+fn lose_focus(w: &mut Window, c: &Controls) {
+    w.capture.focus_lost(&w.shared);
+    c.focus(false);
+}
+
+/// P16: a drag the render thread wrote before a focus loss and the game
+/// thread took after it does nothing; once back, a fresh press acts.
+#[test]
+fn a_focus_loss_drops_a_drag_already_written() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 5);
+    on_pointer(sel, true, None, |rig, w, screens| {
+        let c = rig.controls;
+        w.down(c, list_slider(0), Button::Left);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(MoveTo(0)), 0)]);
+        w.to(c, list_slider(1_000));
+        // The render thread wrote the drag; the game thread took nothing.
+        frames(screens, 2);
+        lose_focus(w, c);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Drag(Nothing), 0)]);
+        assert_eq!(cursor(rig), 0);
+        c.focus(true);
+        w.click(c, row(0, 2), Button::Left);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(MoveTo(2)), 2)]);
+    });
+}
+
+/// P16: a press answered before a focus loss and dispatched after it does
+/// nothing, nor does a notch queued before it; once back, both act.
+#[test]
+fn a_focus_loss_drops_an_answered_press_and_a_queued_notch() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 5);
+    on_pointer(sel, true, None, |rig, w, screens| {
+        let c = rig.controls;
+        // A press, answered on the frame granted, then the focus lost.
+        hold(screens);
+        w.click(c, row(0, 2), Button::Left);
+        assert!(rig.look().is_none());
+        grant(screens, 1);
+        lose_focus(w, c);
+        release(screens);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(Nothing), 0)], "the answered press");
+        assert_eq!(cursor(rig), 0);
+        c.focus(true);
+        // A notch queued, then the focus lost.
+        w.wheel(c, 2);
+        lose_focus(w, c);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Notch(Nothing), 0)], "the queued notch");
+        assert_eq!(cursor(rig), 0);
+        c.focus(true);
+        w.click(c, row(0, 2), Button::Left);
+        w.wheel(c, 1);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(MoveTo(2)), 2), (Notch(Rows(1)), 3)]);
     });
 }

@@ -6,15 +6,19 @@
 //!
 //! The path: the window admits a press or a notch into the menu queue only
 //! under an active [pointer word](PointerShared::word) (the selection
-//! lifetime and an active bit), stamped with that word. The game thread
+//! lifetime, the window's cancellation generation and an active bit),
+//! stamped with that word; a focus loss advances the generation, so every
+//! press, notch and drag observed before it, queued, answered or written,
+//! acts no more. The game thread
 //! hands each run of consecutive pointer entries to the render thread as
 //! one [`PointerBatch`] and takes nothing more from the queue until it comes
 //! back answered (the barrier); the render thread answers every slot on the
 //! frame it just built ([`PointerShared::serve`]) and wakes the thread that
-//! submitted it. A drag is never queued: the window bumps a movement
-//! sequence in the [drag cell](DragCell), and the render thread hit-tests
-//! at most one drag a frame into a one-command drag slot, which the game
-//! applies only once the press that began its hold was dispatched.
+//! submitted it. A drag is never queued: the window counts the moves of
+//! the current hold in the [drag cell](DragCell), and the render thread
+//! hit-tests at most one drag a frame, of that hold's own movement, into a
+//! one-command drag slot, which the game applies only once the press that
+//! began its hold was dispatched.
 //!
 //! Everything here is fixed-size and written in place: no allocation on
 //! any thread's pointer path.
@@ -34,10 +38,30 @@ use crate::selection_skin::SelectionLogic;
 /// bound ([`crate::select::QUEUED_POINTER`]), so one batch takes any run.
 pub const BATCH: usize = crate::select::QUEUED_POINTER;
 
-/// The selection lifetime a pointer word names.
+/// Where a pointer word's lifetime begins: its low 32 bits sit above the
+/// window's cancellation generation (bits 1 to 31) and the active bit.
+const LIFETIME_SHIFT: u32 = 32;
+
+/// A pointer word's cancellation generation bits.
+const GENERATION: u64 = (1 << LIFETIME_SHIFT) - 2;
+
+/// The selection lifetime a pointer word names: its low 32 bits.
 #[must_use]
 pub const fn lifetime_of(word: u64) -> u64 {
-    word >> 1
+    word >> LIFETIME_SHIFT
+}
+
+/// Whether a pointer word names selection lifetime `lifetime`.
+#[must_use]
+pub const fn names(word: u64, lifetime: u64) -> bool {
+    lifetime_of(word) == lifetime & (u64::MAX >> LIFETIME_SHIFT)
+}
+
+/// The word [`PointerShared::publish`] makes for `lifetime` (tests).
+#[cfg(test)]
+#[must_use]
+pub const fn word_of(lifetime: u64) -> u64 {
+    lifetime << LIFETIME_SHIFT | 1
 }
 
 /// Whether a pointer word is active: selection is the screen in front.
@@ -179,8 +203,8 @@ pub enum Taken {
 }
 
 /// The pointer's drag cell: the held button and its latest point, the word
-/// and scene of its press, the presses admitted when its hold began, and
-/// the movement sequence, bumped on each move while held.
+/// and scene of its press, the presses admitted when its hold began (the
+/// hold's identity), and the moves of that hold.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct DragCell {
     pub held: Option<Button>,
@@ -189,7 +213,18 @@ pub struct DragCell {
     pub scene: u64,
     /// Presses admitted to the queue when the hold began, its own included.
     pub hold: u64,
-    pub sequence: u64,
+    /// Moves of this hold: none at its press, so no movement of an earlier
+    /// hold is ever this one's.
+    pub moves: u64,
+}
+
+/// The movement the render thread hit-tested last: the word and hold it
+/// belonged to, and how many moves of that hold it had.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Seen {
+    word: u64,
+    hold: u64,
+    moves: u64,
 }
 
 /// A drag hit-tested on a build: the slider command, the hold it belongs
@@ -216,8 +251,10 @@ struct DragSlot {
 /// render thread, made once at startup.
 #[derive(Debug)]
 pub struct PointerShared {
-    /// `lifetime << 1 | active`: published by the game thread at each
-    /// selection entry, its bit 0 cleared when selection ends.
+    /// `lifetime << 32 | generation << 1 | active`: published by the game
+    /// thread at each selection entry (generation 0), its bit 0 cleared
+    /// when selection ends, its generation advanced by the window at each
+    /// focus loss ([`cancel`](Self::cancel)).
     word: AtomicU64,
     /// The pointer's latest window position, two `i32`s, or
     /// [`NO_POSITION`]: the hover's point, read each frame.
@@ -247,7 +284,19 @@ impl PointerShared {
     /// Selection of `lifetime` is the screen in front (the game thread).
     pub fn publish(&self, lifetime: u64) {
         self.word
-            .store(lifetime.wrapping_shl(1) | 1, Ordering::Release);
+            .store(lifetime.wrapping_shl(LIFETIME_SHIFT) | 1, Ordering::Release);
+    }
+
+    /// The window lost its focus (the window thread): the word's
+    /// cancellation generation moves on, so every press, notch and drag
+    /// observed before it, wherever it is (queued, in a batch, answered,
+    /// in the drag slot), is of another word at dispatch and does nothing.
+    pub fn cancel(&self) {
+        let _ = self
+            .word
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |w| {
+                Some(w & !GENERATION | w.wrapping_add(2) & GENERATION)
+            });
     }
 
     /// Selection ends: the window queues nothing until the next entry.
@@ -410,17 +459,17 @@ impl PointerShared {
     /// Answers a pending batch on what this frame built (`built`, none
     /// when it built no selection frame), with `hit` for each request
     /// observed in the build's lifetime on a skin it drew, and wakes its
-    /// submitter; then hit-tests the drag cell's latest point once if it
-    /// moved since `seen`. Takes the batch only if it is free at once.
+    /// submitter; then hit-tests the drag cell's latest point once if its
+    /// hold moved since `seen`. Takes the batch only if it is free at once.
     pub fn serve(
         &self,
         built: Option<Built>,
         logic: Option<&SelectionLogic>,
         target: [u32; 2],
-        seen: &mut u64,
+        seen: &mut Seen,
     ) {
         let skin = logic.filter(|_| built.is_some_and(|b| b.skinned));
-        let drawn = |word: u64| built.is_some_and(|b| b.skinned && b.lifetime == lifetime_of(word));
+        let drawn = |word: u64| built.is_some_and(|b| b.skinned && names(word, b.lifetime));
         self.answer(built, |request| match (request, skin) {
             (PointerRequest::Press { word, button, at }, Some(logic)) if drawn(word) => logic
                 .bundle
@@ -486,15 +535,21 @@ impl PointerShared {
         true
     }
 
-    /// The drag cell's word, hold and latest point when it moved since
-    /// `seen` while held under the current, active word: one drag a frame
-    /// at most, at the latest point.
-    fn moved(&self, seen: &mut u64) -> Option<(u64, u64, [i32; 2])> {
+    /// The drag cell's word, hold and latest point when the hold it holds
+    /// moved since `seen` while held under the current, active word: one
+    /// drag a frame at most, at the latest point. Only that hold's own
+    /// movement counts, and a press begins its hold with none.
+    fn moved(&self, seen: &mut Seen) -> Option<(u64, u64, [i32; 2])> {
         let cell = *self.drag_cell();
-        if cell.sequence == *seen {
+        let latest = Seen {
+            word: cell.word,
+            hold: cell.hold,
+            moves: cell.moves,
+        };
+        if cell.moves == 0 || latest == *seen {
             return None;
         }
-        *seen = cell.sequence;
+        *seen = latest;
         let word = self.word();
         (cell.held.is_some() && cell.word == word && is_active(word))
             .then_some((cell.word, cell.hold, cell.at))
@@ -683,7 +738,7 @@ impl Capture {
         if active && self.held.is_some() {
             let mut cell = shared.drag_cell();
             cell.at = at;
-            cell.sequence = cell.sequence.wrapping_add(1);
+            cell.moves = cell.moves.wrapping_add(1).max(1);
         }
     }
 
@@ -726,14 +781,13 @@ impl Capture {
                     word,
                     scene,
                 });
-                let mut cell = shared.drag_cell();
-                *cell = DragCell {
+                *shared.drag_cell() = DragCell {
                     held: Some(button),
                     at,
                     word,
                     scene,
                     hold,
-                    sequence: cell.sequence,
+                    moves: 0,
                 };
             }
             None => {
@@ -770,8 +824,10 @@ impl Capture {
         }
     }
 
-    /// The window lost its focus: nothing stays held, and no hover.
+    /// The window lost its focus: nothing stays held, no hover, and
+    /// nothing observed before acts ([`PointerShared::cancel`]).
     pub fn focus_lost(&mut self, shared: &PointerShared) {
+        shared.cancel();
         self.drop_held(shared);
         self.position = None;
         self.wheel.0 = 0.0;
@@ -825,11 +881,12 @@ const NOTHING: Resolved = Resolved {
 };
 
 /// Whether an input observed under `word`, tested on `built`, acts now:
-/// one lifetime throughout, still in front, on a frame that drew the skin.
+/// one lifetime throughout, still in front, on a frame that drew the skin,
+/// and no focus lost since (the word's generation).
 fn current(word: u64, built: Option<Built>, facts: &Facts) -> Option<Built> {
     built.filter(|b| {
         b.skinned
-            && b.lifetime == lifetime_of(word)
+            && names(word, b.lifetime)
             && b.lifetime == facts.lifetime
             && facts.word == word
             && is_active(word)
@@ -991,18 +1048,31 @@ mod tests {
         }
     }
 
-    const W7: u64 = 7 << 1 | 1;
-    const W8: u64 = 8 << 1 | 1;
+    const W7: u64 = word_of(7);
+    const W8: u64 = word_of(8);
 
     #[test]
-    fn the_word_is_the_lifetime_and_its_active_bit() {
+    fn the_word_is_the_lifetime_its_generation_and_its_active_bit() {
         let s = PointerShared::default();
         assert!(!is_active(s.word()));
         s.publish(7);
         assert_eq!(s.word(), W7);
         assert_eq!(lifetime_of(s.word()), 7);
+        // A focus loss: another word of the same lifetime, still active.
+        s.cancel();
+        let lost = s.word();
+        assert_ne!(lost, W7);
+        assert!(names(lost, 7) && is_active(lost));
+        // The generation wraps inside its bits.
+        s.word.store(W7 | GENERATION, Ordering::Release);
+        s.cancel();
+        assert_eq!(s.word(), W7);
+        // A lifetime past 32 bits is named by its low ones.
+        assert!(names(W7, u64::from(u32::MAX) + 8));
+        s.publish(8);
+        s.publish(7);
         s.close();
-        assert_eq!(s.word(), 7 << 1);
+        assert_eq!(s.word(), W7 & !1);
         assert!(!is_active(s.word()));
     }
 
@@ -1097,27 +1167,28 @@ mod tests {
     }
 
     #[test]
-    fn a_hold_moves_the_sequence_only_while_its_word_and_scene_stand() {
+    fn a_hold_counts_its_moves_only_while_its_word_and_scene_stand() {
         let s = PointerShared::default();
         let (presses, queued) = (std::cell::Cell::new(0), std::cell::RefCell::new(Vec::new()));
         let mut c = Capture::default();
         c.moved(&s, [1, 1], W7, 3);
-        let before = s.drag_now().sequence;
         c.button(&s, Button::Left, true, W7, 3, admitting(&presses, &queued));
         // A press and a still hold move nothing.
-        assert_eq!(s.drag_now().sequence, before);
+        assert_eq!(s.drag_now().moves, 0);
         c.moved(&s, [2, 1], W7, 3);
         c.moved(&s, [3, 1], W7, 3);
         let cell = s.drag_now();
-        assert_eq!((cell.sequence, cell.at), (before + 2, [3, 1]));
+        assert_eq!((cell.moves, cell.at), (2, [3, 1]));
         // Another scene (a focus loss elsewhere): dropped, and a move after
         // it drags nothing until a fresh press.
         c.moved(&s, [4, 1], W7, 4);
         assert_eq!(s.drag_now().held, None);
-        assert_eq!(s.drag_now().sequence, before + 2);
+        assert_eq!(s.drag_now().moves, 2);
         // A missed inactive interval: another lifetime, active.
         c.button(&s, Button::Left, true, W7, 4, admitting(&presses, &queued));
         assert_eq!(s.drag_now().held, Some(Button::Left));
+        // A fresh press begins its hold with no movement.
+        assert_eq!(s.drag_now().moves, 0);
         c.moved(&s, [5, 1], W8, 4);
         assert_eq!(s.drag_now().held, None);
         // A release of another button keeps the hold; its own drops it.
@@ -1136,13 +1207,16 @@ mod tests {
         let mut c = Capture::default();
         c.moved(&s, [1, 1], W7, 0);
         c.button(&s, Button::Left, true, W7, 0, admitting(&presses, &queued));
+        s.publish(7);
         c.focus_lost(&s);
+        // What was observed under W7 acts no more.
+        assert_ne!(s.word(), W7);
         assert_eq!(s.drag_now().held, None);
         assert_eq!(s.position(), None);
         // Back, moved with the button still down: no drag.
-        let seq = s.drag_now().sequence;
+        let moves = s.drag_now().moves;
         c.moved(&s, [9, 9], W7, 1);
-        assert_eq!(s.drag_now().sequence, seq);
+        assert_eq!(s.drag_now().moves, moves);
         // A press with no position known is not queued.
         let mut fresh = Capture::default();
         fresh.button(&s, Button::Left, true, W7, 1, admitting(&presses, &queued));
@@ -1626,15 +1700,46 @@ mod tests {
         s.publish(7);
         c.moved(&s, [1, 1], W7, 0);
         c.button(&s, Button::Left, true, W7, 0, admitting(&presses, &queued));
-        let mut seen = s.drag_now().sequence;
+        let mut seen = Seen::default();
         assert_eq!(s.moved(&mut seen), None);
         c.moved(&s, [2, 1], W7, 0);
         c.moved(&s, [3, 1], W7, 0);
         assert_eq!(s.moved(&mut seen), Some((W7, 1, [3, 1])));
         assert_eq!(s.moved(&mut seen), None);
+        // Moved, released and pressed again with no frame between: the
+        // earlier hold's movement is not the new hold's.
         c.moved(&s, [4, 1], W7, 0);
+        c.button(&s, Button::Left, false, W7, 0, |_| None);
+        c.button(&s, Button::Left, true, W7, 0, admitting(&presses, &queued));
+        assert_eq!(s.moved(&mut seen), None);
+        c.moved(&s, [5, 1], W7, 0);
+        assert_eq!(s.moved(&mut seen), Some((W7, 2, [5, 1])));
+        c.moved(&s, [6, 1], W7, 0);
         s.close();
         assert_eq!(s.moved(&mut seen), None);
+    }
+
+    /// P15, P16: a hold of lifetime 7 moved and left unseen (no frame
+    /// between), then selection entered again as 8 and pressed afresh with
+    /// no move: the render side finds no drag of the lifetime-8 hold, and
+    /// the hold's own move gives one.
+    #[test]
+    fn a_hold_of_one_lifetime_lends_no_movement_to_the_next() {
+        let s = PointerShared::default();
+        let (presses, queued) = (std::cell::Cell::new(0), std::cell::RefCell::new(Vec::new()));
+        let mut c = Capture::default();
+        let mut seen = Seen::default();
+        s.publish(7);
+        c.moved(&s, [1, 1], W7, 0);
+        c.button(&s, Button::Left, true, W7, 0, admitting(&presses, &queued));
+        assert_eq!(s.moved(&mut seen), None);
+        c.moved(&s, [9, 1], W7, 0);
+        s.publish(8);
+        c.button(&s, Button::Left, true, W8, 1, admitting(&presses, &queued));
+        assert_eq!(s.drag_now().word, W8);
+        assert_eq!(s.moved(&mut seen), None);
+        c.moved(&s, [5, 1], W8, 1);
+        assert_eq!(s.moved(&mut seen), Some((W8, 2, [5, 1])));
     }
 
     #[test]
