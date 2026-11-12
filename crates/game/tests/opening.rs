@@ -417,6 +417,13 @@ struct Loader {
     /// structural changed.
     lost_staging: bool,
     opens: usize,
+    /// A loading wait parks this long at most (µs), as production's idle
+    /// wake does, stopping at its `until` and at the next event's time (the
+    /// input thread unparks production); `None`: every loading wait is one
+    /// [`wait`](Rig::wait), 1 ms.
+    park: Option<i64>,
+    /// The loading waits taken.
+    loading_waits: usize,
     /// The gauge [`Shown`] shows.
     shown: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Taken right after the first snapshot at or after its time that is
@@ -481,6 +488,8 @@ impl Loader {
             quit_on_open: 1,
             lost_staging: false,
             opens: 0,
+            park: None,
+            loading_waits: 0,
             shown: std::sync::Arc::default(),
             after_quiet: None,
         }
@@ -850,6 +859,35 @@ impl Rig for Loader {
 }
 
 impl LoadingRig for Loader {
+    fn loading_wait(&mut self, until: Option<TimeUs>) {
+        self.loading_waits += 1;
+        assert!(
+            self.loading_waits < 100_000,
+            "the wait spins: {:?}",
+            self.log
+        );
+        let Some(park) = self.park else {
+            self.wait();
+            return;
+        };
+        let now = self.clock.now().0;
+        let event = self
+            .events
+            .iter()
+            .map(|&(at, _)| at)
+            .filter(|&at| at > now)
+            .min();
+        let step = [Some(now + park), until.map(|u| u.0), event]
+            .into_iter()
+            .flatten()
+            .min()
+            .map_or(park, |at| at - now)
+            .max(MS);
+        // The wait itself moves the clock its 1 ms.
+        self.clock.advance(TimeUs(step - MS));
+        self.wait();
+    }
+
     fn loading_lifetime(&self) -> u64 {
         self.lifetime
     }
@@ -1134,6 +1172,74 @@ fn a_delayed_first_frame_moves_the_minimum() {
     rig.acks = vec![(T0 + 2_000_000, 7, T0 + 2_000_000)];
     run(&mut loaded, &mut rig).unwrap();
     assert_eq!(applied_at(&rig), [T0 + 3_000_000]);
+}
+
+/// The loading state's wait (design.md "Play Lifecycle"): parking up to
+/// the idle wake (250 ms) as production does, it wakes at the minimum's
+/// end, not at the next idle wake past it. The first frame at 150 ms puts
+/// the minimum's end at 1 150 ms, between idle wakes (1 000, 1 250).
+#[test]
+fn the_loading_wait_wakes_at_the_minimum_s_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.park = Some(250_000);
+    rig.acks = vec![(T0 + 150_000, 7, T0 + 150_000)];
+    run(&mut loaded, &mut rig).unwrap();
+    assert_eq!(applied_at(&rig), [T0 + 1_150_000]);
+    assert_eq!(rig.opened_at(), T0 + 1_150_000);
+}
+
+/// The wait wakes at the tuning's quiet deadline: a tap at 620 ms makes
+/// the tuning quiet at 1 620 ms, past the minimum (1 000 ms) and between
+/// idle wakes.
+#[test]
+fn the_loading_wait_wakes_at_the_quiet_deadline() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.park = Some(250_000);
+    rig.acks = vec![(T0, 7, T0)];
+    rig.at(T0 + 620_000, Happen::Ev(Ev::Tap(DISPLAY_UP)));
+    run(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.model.acted, 1);
+    assert_eq!(applied_at(&rig), [T0 + 1_620_000]);
+}
+
+/// The wait reopened after the commit wakes at the minimum the commit
+/// lengthened: a specialization declaring 2 900 ms ends it at 2 900 ms,
+/// between the idle wakes after the commit (2 750, 3 000).
+#[test]
+fn the_reopened_wait_wakes_at_the_lengthened_minimum() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.park = Some(250_000);
+    rig.acks = vec![(T0, 7, T0)];
+    rig.commit_loadend = Some(Some(TimeUs(2_900_000)));
+    run(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.times("commit"), [T0 + SECOND]);
+    assert_eq!(rig.times("close"), [T0 + 2_900_000]);
+    assert_eq!(rig.opened_at(), T0 + 2_900_000);
+}
+
+/// A wait blocked only by an event (focus lost) has no timed wake: it
+/// parks the idle wake each time rather than spinning, and opens at the
+/// quiet deadline after focus returns (3 000 + 1 000 ms).
+#[test]
+fn a_focus_wait_parks_without_spinning() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = Loader::new(&loaded);
+    rig.park = Some(250_000);
+    rig.acks = vec![(T0, 7, T0)];
+    rig.at(T0 + 200_000, Happen::Ev(Ev::FocusLost));
+    rig.at(T0 + 3_000_000, Happen::Ev(Ev::FocusBack));
+    run(&mut loaded, &mut rig).unwrap();
+    assert_eq!(applied_at(&rig), [T0 + 4_000_000]);
+    // 4 s of waiting at most one idle wake apart, a few events and
+    // deadlines besides: not thousands of zero-length parks.
+    assert!(rig.loading_waits <= 30, "{}", rig.loading_waits);
 }
 
 /// L4: the declared loadend against the one-second floor, and the wait

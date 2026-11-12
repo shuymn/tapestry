@@ -162,6 +162,24 @@ impl TuningSnapshot {
         quiet && self.stable && self.focused && !self.held && !self.overflow
     }
 
+    /// When the tuning becomes quiet if nothing happens first: the last
+    /// activity plus [`QUIET`], when that is after `now` and nothing else
+    /// keeps it from being quiet (an unstable observation, focus lost, a
+    /// held control, an overflow, which change only on an event); `None`
+    /// otherwise ([`quiet_at`](Self::quiet_at)).
+    #[must_use]
+    pub const fn quiet_deadline(&self, now: TimeUs) -> Option<TimeUs> {
+        let Some(last) = self.last_activity else {
+            return None;
+        };
+        let at = last.0.saturating_add(QUIET.0);
+        if at > now.0 && self.stable && self.focused && !self.held && !self.overflow {
+            Some(TimeUs(at))
+        } else {
+            None
+        }
+    }
+
     /// Whether nothing changed since `earlier` was taken (both stable, the
     /// same acceptance revision) and the tuning is still quiet at `now`
     /// ([`quiet_at`](Self::quiet_at)).
@@ -205,6 +223,15 @@ pub trait LoadingRig: Rig {
     /// None by default.
     fn loadend(&self) -> Option<TimeUs> {
         None
+    }
+    /// Waits in the loading state for the next look ([`wait_loading`]): as
+    /// [`Rig::wait`] does, but never past `until` on the rig's clock when it
+    /// is given, the next instant a condition of the wait can change by
+    /// time alone (design.md "Play Lifecycle", the loading state's wait). By
+    /// default, one [`Rig::wait`].
+    fn loading_wait(&mut self, until: Option<TimeUs>) {
+        let _ = until;
+        self.wait();
     }
     /// Whether the skin refused a loading frame of lifetime `lifetime`:
     /// nothing of it is drawn again, so its first frame may never be
@@ -691,6 +718,9 @@ fn wait_loading<R: LoadingRig>(
     opener: &mut LoadingOpener,
     committed: bool,
 ) -> Result<bool, LiveError<R::ScreenError>> {
+    // The next instant the conditions can change by time alone, from the
+    // last look; none before the first.
+    let mut wake = None;
     loop {
         if opener.latch == PrepState::Pending {
             let deadline = std::time::Instant::now() + PREP_SLICE;
@@ -701,7 +731,7 @@ fn wait_loading<R: LoadingRig>(
                 opener.latch = PrepState::of(answer);
             }
         } else {
-            rig.wait();
+            rig.loading_wait(wake);
         }
         // The exits in order, those that end the run first: a thread's
         // failure, a refusal, a close, a refused loading frame (its
@@ -747,6 +777,30 @@ fn wait_loading<R: LoadingRig>(
         if opener.minimum_passed(rig, now) && tuning.quiet_at(now) {
             return Ok(true);
         }
+        wake = next_wake(opener, rig, now, &tuning);
+    }
+}
+
+/// The next instant the loading wait's conditions can change by time
+/// alone, after `now`: the minimum's end while it has not passed, and the
+/// tuning's quiet deadline while quiet time is all it lacks
+/// ([`TuningSnapshot::quiet_deadline`]), the earlier of the two. `None`
+/// when neither: what is left changes only on an event (an
+/// acknowledgement, focus, a held control, an overflow, an answer).
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn next_wake<R: LoadingRig>(
+    opener: &LoadingOpener,
+    rig: &R,
+    now: TimeUs,
+    tuning: &TuningSnapshot,
+) -> Option<TimeUs> {
+    let minimum = opener
+        .ack
+        .map(|ack| minimum_ends(ack, rig.loadend()))
+        .filter(|end| end.0 > now.0);
+    match (minimum, tuning.quiet_deadline(now)) {
+        (Some(a), Some(b)) => Some(TimeUs(a.0.min(b.0))),
+        (a, b) => a.or(b),
     }
 }
 

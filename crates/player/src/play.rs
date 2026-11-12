@@ -1590,22 +1590,24 @@ pub(crate) const fn until_due(origin: TimeUs, at: TimeUs, now: TimeUs) -> bool {
     now.0 - origin.0 >= at.0
 }
 
-impl Rig for PlayerRig<'_> {
-    type Reader = SourceReader;
-    type ScreenError = ScreenError;
-    type ResultPrep = ();
+/// How long a loading wait parks until `until` from `now` on the clock:
+/// the idle wake at most, never past `until` (design.md "Play Lifecycle",
+/// the loading state's wait); the idle wake without one.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn park_for(until: Option<TimeUs>, now: TimeUs) -> Duration {
+    until.map_or(IDLE_PARK, |u| {
+        IDLE_PARK.min(Duration::from_micros(
+            u.0.saturating_sub(now.0).max(0).unsigned_abs(),
+        ))
+    })
+}
 
+impl PlayerRig<'_> {
+    /// Parks for `park` at most (the input thread unparks it earlier),
+    /// then serves what a step's wait serves ([`game::Rig::wait`]).
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn now(&self) -> TimeUs {
-        let now = self.clock.now();
-        #[cfg(test)]
-        self.opening_gates.read_clock(now);
-        now
-    }
-
-    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn wait(&mut self) {
-        thread::park_timeout(if self.in_play { PARK } else { IDLE_PARK });
+    fn wait_parked(&mut self, park: Duration) {
+        thread::park_timeout(park);
         self.serve_adjustments();
         // A scenario's `until`: the command, sent once, as its key would.
         #[cfg(feature = "dev-tools")]
@@ -1641,6 +1643,31 @@ impl Rig for PlayerRig<'_> {
             }
         }
         self.sync();
+    }
+
+    /// A loading wait's park until `until` ([`park_for`]).
+    pub(crate) fn loading_park(&mut self, until: Option<TimeUs>) {
+        let park = park_for(until, self.clock.now());
+        self.wait_parked(park);
+    }
+}
+
+impl Rig for PlayerRig<'_> {
+    type Reader = SourceReader;
+    type ScreenError = ScreenError;
+    type ResultPrep = ();
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn now(&self) -> TimeUs {
+        let now = self.clock.now();
+        #[cfg(test)]
+        self.opening_gates.read_clock(now);
+        now
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn wait(&mut self) {
+        self.wait_parked(if self.in_play { PARK } else { IDLE_PARK });
     }
 
     fn idle_wait(&mut self, deadline: TimeUs) {
@@ -2962,7 +2989,27 @@ mod tests {
 
     use game::Command;
 
-    use super::{until_due, until_fired};
+    use super::{IDLE_PARK, park_for, until_due, until_fired};
+
+    /// A loading wait parks until its `until`, the idle wake at most, and
+    /// the idle wake without one or for one already past (no zero park
+    /// below 0: a past `until` parks 0, the look runs at once).
+    #[test]
+    fn a_loading_wait_parks_until_its_deadline() {
+        use std::time::Duration;
+        let now = TimeUs(5_000_000);
+        assert_eq!(
+            park_for(Some(TimeUs(5_030_000)), now),
+            Duration::from_millis(30)
+        );
+        assert_eq!(
+            park_for(Some(TimeUs(5_249_999)), now),
+            Duration::from_micros(249_999)
+        );
+        assert_eq!(park_for(Some(TimeUs(6_000_000)), now), IDLE_PARK);
+        assert_eq!(park_for(None, now), IDLE_PARK);
+        assert_eq!(park_for(Some(TimeUs(4_000_000)), now), Duration::ZERO);
+    }
 
     /// The player's rig's preparation (design.md "Play Lifecycle",
     /// preparing each attempt): it owns its jobs, and its answer stays
