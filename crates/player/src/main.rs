@@ -910,6 +910,8 @@ fn rig<'a>(
         seen: Delivered::default(),
         shown_speed: end_screen::SpeedLine::default(),
         end_page: None,
+        recovering: crate::render_side::Recovery::Idle,
+        screen_load_failure: None,
         hints: Hints::new(device.keyboard.retry, device.keyboard.quit),
         result_input: result_input::ResultInput::new(Arc::new(MenuQueue::default()), None),
         viewed: None,

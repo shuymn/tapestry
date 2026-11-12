@@ -489,9 +489,25 @@ struct Headless {
     served_load_ms: Option<i64>,
     /// The chosen chart at each decision screen's entry.
     decisions: Vec<(usize, i64)>,
-    /// Each recovery of the decision screen: the clock, and how many looks
-    /// came before it (the look that made it is the next one recorded).
-    recovered_decisions: Vec<(i64, usize)>,
+    /// Each rebuild of the decision screen, at its answer: the clock, the
+    /// looks recorded when it began (the look that began it is the last of
+    /// them), and the looks and idle waits recorded when it answered.
+    recoveries: Vec<(i64, usize, usize, usize)>,
+    /// How many polls a rebuild of the decision screen stays unanswered
+    /// (none: it answers at its first poll, as a synchronous rebuild).
+    recovery_polls: usize,
+    /// How far (ms) each unanswered poll of a rebuild moves the clock.
+    recovery_poll_ms: i64,
+    /// The running rebuild's polls left, and its looks when it began.
+    recovery: Option<(usize, usize)>,
+    /// The page's read latches the page's step itself, past the deadline,
+    /// as a wait inside the rig would.
+    step_in_practice_read: bool,
+    /// A play's chart load fails with the screen's failure (the device
+    /// lost twice): the load errs, and the failure is the flow's to take.
+    screen_lost_in_load: bool,
+    /// The screen's failure a chart's load hid, until the flow takes it.
+    screen_load_failure: Option<SurfaceLost>,
     /// The screen fails this long (ms) after the first decision screen
     /// begins.
     screen_fails_in_decision: Option<i64>,
@@ -727,7 +743,13 @@ impl Headless {
             decision_step_ms: 100,
             served_load_ms: None,
             decisions: Vec::new(),
-            recovered_decisions: Vec::new(),
+            recoveries: Vec::new(),
+            recovery_polls: 0,
+            recovery_poll_ms: 0,
+            recovery: None,
+            step_in_practice_read: false,
+            screen_lost_in_load: false,
+            screen_load_failure: None,
             screen_fails_in_decision: None,
             input_fails_in_decision: None,
             screen_fails_in_jobs: false,
@@ -1284,6 +1306,10 @@ impl AppRig for Headless {
         loaded: &Loaded,
         decision: &mut Decision,
     ) -> Result<Loading, BankLost> {
+        if std::mem::take(&mut self.screen_lost_in_load) {
+            self.screen_load_failure = Some(SurfaceLost);
+            return Err(BankLost);
+        }
         // A load that serves the decision screen while it runs.
         if decision.on()
             && let Some(ms) = self.served_load_ms
@@ -1456,10 +1482,22 @@ impl AppRig for Headless {
     fn practice_read(
         &mut self,
         _loaded: &game::Loaded,
-        _decision: &mut Decision,
+        decision: &mut Decision,
     ) -> Result<Loading, BankLost> {
         if self.refuse_page_read {
             return Err(BankLost);
+        }
+        // A wait inside the read looked past the deadline: the page's step
+        // latched there, before App holds.
+        if std::mem::take(&mut self.step_in_practice_read)
+            && let Some(t) = decision.deadline()
+        {
+            let now = self.at();
+            if now < t.0 {
+                self.clock.advance(TimeUs(t.0 - now));
+            }
+            let seen = decision.classify(game::Origin::Jobs, TimeUs(self.at()), false, false, None);
+            assert_eq!(seen, game::Verdict::Step, "the page's step in the read");
         }
         // The page's bank waits for its prerequisites: the screen lost
         // now is found by the page's hold.
@@ -1501,9 +1539,32 @@ impl AppRig for Headless {
         }
     }
 
-    fn recovered_decision(&mut self) {
-        let looks = self.decision_looks.len();
-        self.recovered_decisions.push((self.at(), looks));
+    fn screen_load_failed(&mut self) -> Option<SurfaceLost> {
+        self.screen_load_failure.take()
+    }
+
+    fn begin_recovery(&mut self) {
+        assert!(self.recovery.is_none(), "a second rebuild begun");
+        self.recovery = Some((self.recovery_polls, self.decision_looks.len()));
+    }
+
+    fn poll_recovery(&mut self, until: TimeUs) -> Option<Result<(), SurfaceLost>> {
+        let (left, begun) = self.recovery.expect("a rebuild polled before it began");
+        if left > 0 {
+            self.recovery = Some((left - 1, begun));
+            let to = (self.at() + self.recovery_poll_ms * MS).min(until.0.max(self.at() + 1));
+            self.clock.advance(TimeUs(to - self.at()));
+            return None;
+        }
+        self.recovery = None;
+        let answered = game::Rig::prepare_screen(self);
+        self.recoveries.push((
+            self.at(),
+            begun,
+            self.decision_looks.len(),
+            self.idle_waits.len(),
+        ));
+        Some(answered)
     }
 
     fn decision_tick(&mut self, origin: game::Origin) -> Result<(), LiveError<SurfaceLost>> {
@@ -5437,13 +5498,13 @@ fn a_screen_lost_during_a_pending_read_is_rebuilt_with_no_second_tone() {
     run.ran.as_ref().unwrap();
     let rig = &run.rig;
     let choice = chosen_at(rig, P);
-    let [(recovered, looks)] = rig.recovered_decisions[..] else {
-        panic!("{:?}", rig.recovered_decisions);
+    let [(recovered, begun, _, _)] = rig.recoveries[..] else {
+        panic!("{:?}", rig.recoveries);
     };
-    // The look the recovery came in is the read's, not the page's hold
+    // The look that began the rebuild is the read's, not the page's hold
     // after it.
     assert_eq!(
-        rig.decision_looks.get(looks).map(|&(o, _)| o),
+        rig.decision_looks.get(begun - 1).map(|&(o, _)| o),
         Some(game::Origin::Read),
         "recovered only after the read"
     );
@@ -5473,12 +5534,7 @@ fn each_choice_shows_its_own_decision_screen() {
     });
     ran.unwrap();
     assert_eq!(rig.decisions.len(), 2, "{:?}", rig.decisions);
-    assert_eq!(
-        rig.recovered_decisions.len(),
-        1,
-        "{:?}",
-        rig.recovered_decisions
-    );
+    assert_eq!(rig.recoveries.len(), 1, "{:?}", rig.recoveries);
 }
 
 /// A recovery's rebuild that fails while the input thread failed
@@ -5516,11 +5572,11 @@ fn a_screen_lost_while_the_page_waits_is_rebuilt() {
     });
     ran.unwrap();
     let choice = chosen_at(&rig, P);
-    let [(recovered, looks)] = rig.recovered_decisions[..] else {
-        panic!("{:?}", rig.recovered_decisions);
+    let [(recovered, begun, _, _)] = rig.recoveries[..] else {
+        panic!("{:?}", rig.recoveries);
     };
     assert_eq!(
-        rig.decision_looks.get(looks).map(|&(o, _)| o),
+        rig.decision_looks.get(begun - 1).map(|&(o, _)| o),
         Some(game::Origin::Jobs),
         "recovered in the page's hold"
     );
@@ -5545,4 +5601,227 @@ fn a_leave_inside_the_entry_wait_is_routed_before_the_read() {
     assert!(rig.decision_looks.is_empty(), "{:?}", rig.decision_looks);
     assert!(rig.loading_pages.is_empty());
     assert!(rig.deadline_steps.is_empty());
+}
+
+/// A6: a step a wait inside the rig latched before App holds (here the
+/// page's read, past the deadline) ends the page's hold at once: the page
+/// opens, though every later look classifies only `Continue`.
+#[test]
+fn a_step_latched_in_a_wait_ends_the_hold() {
+    let acts = vec![(0, Act::Practice(P)), (10_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.step_in_practice_read = true;
+    });
+    ran.unwrap();
+    let choice = chosen_at(&rig, P);
+    let [entered] = rig.page_entered_at[..] else {
+        panic!("the page did not open: {:?}", rig.page_entered_at);
+    };
+    assert!(entered >= choice + 1_500 * MS, "{entered} from {choice}");
+    assert_eq!(rig.closed_epochs, 1);
+}
+
+/// The rebuild of the decision screen that `rig` recorded, alone: its
+/// answer's clock, its looks when it began and answered, and its idle
+/// waits when it answered.
+fn one_recovery(rig: &Headless) -> (i64, usize, usize, usize) {
+    let [recovery] = rig.recoveries[..] else {
+        panic!("{:?}", rig.recoveries);
+    };
+    recovery
+}
+
+/// B2s: the screen lost before the deadline, its rebuild running across
+/// it: the play's step runs inside the rebuild, once, and the look that
+/// recovers returns it itself as the rebuild answers, so the play goes on
+/// with no further idle wait of the decision screen.
+#[test]
+fn a_step_inside_a_rebuild_is_returned_by_it() {
+    let acts = vec![(0, Act::Choose(0)), (8_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.screen_fails_in_decision = Some(500);
+        rig.recovery_polls = 40;
+        rig.recovery_poll_ms = 50;
+    });
+    ran.unwrap();
+    let choice = chosen_at(&rig, 0);
+    let (answered, begun, looks, idles) = one_recovery(&rig);
+    let [step] = rig.deadline_steps[..] else {
+        panic!("{:?}", rig.deadline_steps);
+    };
+    // The step inside the rebuild: after it began, before it answered.
+    let began_at = rig.decision_looks[begun - 1].1;
+    assert!(began_at < choice + 1_500 * MS, "{began_at} from {choice}");
+    assert!(
+        step >= choice + 1_500 * MS && step < answered,
+        "{step} {answered}"
+    );
+    // Nothing of the decision screen after the answer: no look, and no
+    // idle wait at the answer.
+    assert_eq!(rig.decision_looks.len(), looks, "a look after the rebuild");
+    assert!(
+        !rig.idle_waits[idles..]
+            .iter()
+            .any(|&(at, _)| at == answered),
+        "an idle wait after the rebuild: {:?}",
+        &rig.idle_waits[idles..]
+    );
+    assert!(rig.opened_at[0] >= answered);
+}
+
+/// B2p: the screen lost as the practice page's chart is read, its rebuild
+/// running across the deadline: the page's step is seen inside the
+/// rebuild and the page opens as the rebuild answers, with no idle wait
+/// between.
+#[test]
+fn the_page_entry_is_served_inside_a_rebuild() {
+    let acts = vec![(0, Act::Practice(P)), (10_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.screen_fails_in_jobs = true;
+        rig.recovery_polls = 40;
+        rig.recovery_poll_ms = 50;
+    });
+    ran.unwrap();
+    let choice = chosen_at(&rig, P);
+    let (answered, begun, looks, idles) = one_recovery(&rig);
+    // A look inside the rebuild found the deadline.
+    assert!(
+        rig.decision_looks[begun..looks]
+            .iter()
+            .any(|&(o, at)| o == game::Origin::Jobs && at >= choice + 1_500 * MS),
+        "{:?}",
+        &rig.decision_looks[begun..looks]
+    );
+    let [entered] = rig.page_entered_at[..] else {
+        panic!("{:?}", rig.page_entered_at);
+    };
+    assert_eq!(
+        entered, answered,
+        "the page opened after the rebuild's answer"
+    );
+    assert!(
+        !rig.idle_waits[idles..].iter().any(|&(at, _)| at < entered),
+        "an idle wait before the page: {:?}",
+        &rig.idle_waits[idles..]
+    );
+}
+
+/// B3b: a refusal in hand with the deadline due, the screen lost: the one
+/// look classifies the reply first, so the run returns to selection with
+/// the reason, with no rebuild of the decision screen, no step and no
+/// loading state (selection's own entry builds the screen).
+#[test]
+fn a_refusal_in_hand_outranks_a_rebuild_and_the_deadline() {
+    let acts = vec![(0, Act::Choose(2)), (6_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Bank, acts, |rig| {
+        decided(rig);
+        rig.refuse_load_at_deadline = true;
+        rig.screen_fails_in_decision = Some(500);
+    });
+    ran.unwrap();
+    let choice = chosen_at(&rig, 2);
+    // Shown (again on selection's screen once selection built it).
+    assert!(!rig.refused_at.is_empty(), "{:?}", rig.seen);
+    assert!(rig.refused_at[0] >= choice + 1_500 * MS);
+    assert!(rig.recoveries.is_empty(), "rebuilt: {:?}", rig.recoveries);
+    assert!(rig.deadline_steps.is_empty(), "stepped");
+    assert!(rig.loading_pages.is_empty(), "the loading state shown");
+}
+
+/// B1r: the screen lost, its rebuild running long: a close inside the
+/// rebuild ends the run at the next look between its polls, before the
+/// rebuild answers, with no step and no loading state.
+#[test]
+fn a_terminal_event_ends_the_run_inside_a_rebuild() {
+    let acts = vec![(0, Act::Choose(0)), (1_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.screen_fails_in_decision = Some(500);
+        rig.recovery_polls = 200;
+        rig.recovery_poll_ms = 50;
+    });
+    ran.unwrap();
+    assert!(rig.quitting);
+    assert!(
+        rig.recoveries.is_empty(),
+        "waited for the rebuild: {:?}",
+        rig.recoveries
+    );
+    assert!(rig.deadline_steps.is_empty(), "stepped");
+    assert!(rig.loading_pages.is_empty());
+}
+
+/// B3: a refusal held to the deadline with the screen lost and its
+/// rebuild running past it: selection with the reason at the deadline,
+/// not after the rebuild.
+#[test]
+fn a_refusal_at_the_deadline_does_not_wait_for_a_rebuild() {
+    let acts = vec![(0, Act::Choose(2)), (20_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Bank, acts, |rig| {
+        decided(rig);
+        rig.screen_fails_in_decision = Some(500);
+        rig.recovery_polls = 200;
+        rig.recovery_poll_ms = 50;
+    });
+    ran.unwrap();
+    let choice = chosen_at(&rig, 2);
+    let Some(&first) = rig.refused_at.first() else {
+        panic!(
+            "no refusal: {:?} recoveries {:?} looks {:?}",
+            rig.seen, rig.recoveries, rig.decision_looks
+        );
+    };
+    assert!(
+        first >= choice + 1_500 * MS && first < choice + 1_600 * MS,
+        "{first} from {choice}"
+    );
+    assert!(
+        rig.recoveries.is_empty(),
+        "waited for the rebuild: {:?}",
+        rig.recoveries
+    );
+    assert!(rig.deadline_steps.is_empty());
+}
+
+/// E2 (flow): a chart's load that failed with the screen (its device lost
+/// twice) ends the run with the screen's failure; no refusal is shown.
+#[test]
+fn a_screen_failure_in_the_chart_load_ends_the_run() {
+    let acts = vec![(0, Act::Choose(0)), (10_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.screen_lost_in_load = true;
+    });
+    assert!(
+        matches!(ran, Err(LiveError::Screen(SurfaceLost))),
+        "{ran:?}"
+    );
+    assert!(rig.refused_at.is_empty(), "refused: {:?}", rig.refused_at);
+}
+
+/// A look that leaves the decision screen begins no rebuild of a screen
+/// lost meanwhile (the next screen's own entry builds it): the close and
+/// the screen's loss seen by the same look, while the play's load holds
+/// for the deadline, end the run with no rebuild.
+#[test]
+fn a_leaving_look_begins_no_rebuild() {
+    let acts = vec![(0, Act::Choose(0)), (500, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.screen_fails_in_decision = Some(500);
+    });
+    ran.unwrap();
+    assert!(rig.quitting);
+    let choice = chosen_at(&rig, 0);
+    assert!(
+        rig.decision_looks
+            .iter()
+            .any(|&(_, at)| at >= choice + 500 * MS),
+        "no look after the loss: {:?}",
+        rig.decision_looks
+    );
+    assert!(rig.recoveries.is_empty(), "rebuilt: {:?}", rig.recoveries);
 }

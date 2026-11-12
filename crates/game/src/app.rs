@@ -175,10 +175,30 @@ pub trait AppRig: LoadingRig {
         let _ = deadline;
         false
     }
-    /// The screen was built again during the decision screen: its
-    /// presentation is sent again, its tone not played again. Nothing by
-    /// default.
-    fn recovered_decision(&mut self) {}
+    /// The screen lost during the decision screen: its rebuild begins,
+    /// one at a time, answered through
+    /// [`poll_recovery`](Self::poll_recovery). The rig's render side
+    /// restores the presentation of the state it is in once the screen is
+    /// built again. Nothing by default: the default poll rebuilds the
+    /// screen there.
+    fn begin_recovery(&mut self) {}
+    /// After [`load_chart`](crate::LoadingRig::load_chart) returned an
+    /// error: the screen's failure it hid, if the chart's screen load lost
+    /// the device or the surface twice ([`LiveError::Screen`], not a
+    /// refusal), taken. None by default.
+    fn screen_load_failed(&mut self) -> Option<Self::ScreenError> {
+        None
+    }
+    /// The rebuild [`begin_recovery`](Self::begin_recovery) began, waited
+    /// for until `until` at most: `None` while it runs, its answer once it
+    /// came, or the error of its bound. By default the screen is built
+    /// again here, waiting for it ([`Rig::prepare_screen`]).
+    ///
+    /// [`Rig::prepare_screen`]: crate::Rig::prepare_screen
+    fn poll_recovery(&mut self, until: TimeUs) -> Option<Result<(), Self::ScreenError>> {
+        let _ = until;
+        Some(self.prepare_screen())
+    }
     /// Each pass of the practice page, whatever the input: the rig
     /// advances its page jobs. Nothing by default.
     ///
@@ -741,7 +761,12 @@ impl App {
             }
         } else {
             match rig.load_chart(&loaded, d) {
-                Err(e) => Ok(Chosen::Refused(Refused::Bank(e))),
+                // A screen lost in the chart's load is the screen's
+                // failure, which ends the run; anything else is refused.
+                Err(e) => match rig.screen_load_failed() {
+                    Some(lost) => Err(LiveError::Screen(lost)),
+                    None => Ok(Chosen::Refused(Refused::Bank(e))),
+                },
                 Ok(Loading::Cancelled) => match d.take_left() {
                     Some(left) => left_by(Ok(next_of(left)), rig),
                     None => cancelled(rig).map(Chosen::Left),
@@ -944,61 +969,94 @@ enum Next {
     End,
 }
 
-/// The decision screen's one look from `origin`, with `reply` in hand: a
-/// screen lost meanwhile built again ([`recover_decision`]), the rig's
-/// tick, then the terminal causes and the escape read now, then
-/// [`Decision::classify`]. A play's step runs here. Every look of the
-/// screen comes here, the chart's read's included, so the screen is
-/// recovered while the read is pending as while the flow holds.
+/// The decision screen's one look from `origin`, with `reply` in hand:
+/// the rig's tick, then the terminal causes and the escape read now, then
+/// [`Decision::classify`], whose verdict it returns. A play's step runs
+/// its effect here ([`AppRig::deadline_step`]), once, as the decision
+/// latches it.
+fn look<R: AppRig>(
+    d: &mut Decision,
+    rig: &mut R,
+    origin: Origin,
+    reply: Option<Reply>,
+) -> Result<Verdict, LiveError<R::ScreenError>> {
+    rig.decision_tick(origin)?;
+    let terminal = rig.quitting() || threads_over(rig).is_err();
+    let escape = d.waiting() && d.deadline().is_some_and(|t| rig.decision_escape(t));
+    let seen = d.classify(origin, rig.now(), terminal, escape, reply);
+    if seen == Verdict::Step && !d.practice() {
+        rig.deadline_step();
+    }
+    Ok(seen)
+}
+
+/// What App does on a look's verdict.
+const fn next_for(d: &Decision, v: Verdict) -> Next {
+    match v {
+        Verdict::Continue => Next::Go,
+        Verdict::Step if d.practice() => Next::Page,
+        Verdict::Step => Next::Stepped,
+        Verdict::End => Next::End,
+        Verdict::Return => Next::Return,
+        Verdict::Back => Next::Back,
+    }
+}
+
+/// The decision screen's look from `origin` ([`look`]), first, so `reply`
+/// is consumed once, in [`Decision::classify`]'s order, before anything
+/// else. A screen lost meanwhile is then built again, unless the look left
+/// the screen (the next screen's own entry builds it): the rebuild begins
+/// ([`AppRig::begin_recovery`]) and is polled with the screen looked at
+/// between polls. A leaving verdict returns at once, the rebuild left
+/// running; the deadline's step runs inside it, and is returned when the
+/// rebuild ends, as the transition the look latched. Every look of the
+/// screen comes here, the chart's read's included.
+///
+/// # Errors
+///
+/// The rig's tick's; a thread's failure seen when the rebuild fails, else
+/// the screen's that cannot be built again. A close then ends the run
+/// ([`Next::End`]).
 fn serve<R: AppRig>(
     d: &mut Decision,
     rig: &mut R,
     origin: Origin,
     reply: Option<Reply>,
 ) -> Result<Next, LiveError<R::ScreenError>> {
-    if rig.screen_failed() {
-        recover_decision(rig)?;
+    let seen = look(d, rig, origin, reply)?;
+    let mut next = next_for(d, seen);
+    if seen.leaves() || !rig.screen_failed() {
+        return Ok(next);
     }
-    rig.decision_tick(origin)?;
-    let terminal = rig.quitting() || threads_over(rig).is_err();
-    let escape = d.waiting() && d.deadline().is_some_and(|t| rig.decision_escape(t));
-    Ok(
-        match d.classify(origin, rig.now(), terminal, escape, reply) {
-            Verdict::Continue => Next::Go,
-            Verdict::Step if d.practice() => Next::Page,
-            Verdict::Step => {
-                rig.deadline_step();
-                Next::Stepped
+    rig.begin_recovery();
+    loop {
+        let now = rig.now();
+        let poll_until = now.0.saturating_add(IDLE_WAIT.0);
+        let until = d
+            .deadline()
+            .filter(|t| t.0 > now.0)
+            .map_or(poll_until, |t| t.0.min(poll_until));
+        match rig.poll_recovery(TimeUs(until)) {
+            Some(Ok(())) => return Ok(next),
+            Some(Err(e)) => {
+                // The rebuild answers no terminal cause: a failure that
+                // came meanwhile ends the run with its own cause, a close
+                // as a close.
+                threads_over(rig)?;
+                if rig.quitting() {
+                    return Ok(Next::End);
+                }
+                return Err(LiveError::Screen(e));
             }
-            Verdict::End => Next::End,
-            Verdict::Return => Next::Return,
-            Verdict::Back => Next::Back,
-        },
-    )
-}
-
-/// The screen lost during the decision screen, built again: its
-/// presentation is sent again, its deadline kept and its tone not played
-/// again ([`AppRig::recovered_decision`]). The rebuild's wait answers no
-/// terminal cause, so a failure that came while it waited, seen when it
-/// fails, ends the run with its own cause, and a close as a close (the
-/// look that follows ends it), before the screen's error is reported.
-///
-/// # Errors
-///
-/// A thread's failure, else the screen's that cannot be built again.
-fn recover_decision<R: AppRig>(rig: &mut R) -> Result<(), LiveError<R::ScreenError>> {
-    match rig.prepare_screen() {
-        Ok(()) => {
-            rig.recovered_decision();
-            Ok(())
-        }
-        Err(e) => {
-            threads_over(rig)?;
-            if rig.quitting() {
-                return Ok(());
+            None => {
+                let seen = look(d, rig, origin, None)?;
+                if seen.leaves() {
+                    return Ok(next_for(d, seen));
+                }
+                if seen == Verdict::Step {
+                    next = next_for(d, seen);
+                }
             }
-            Err(LiveError::Screen(e))
         }
     }
 }
@@ -1016,13 +1074,22 @@ const fn next_of(v: Verdict) -> Next {
 
 /// The decision screen, nothing in its waits but its looks, until a look
 /// gives more than [`Next::Go`]: what it gave. A screen lost meanwhile is
-/// recovered by the next look ([`serve`]).
+/// recovered by the next look ([`serve`]). A step a wait before the hold
+/// latched (the decision stepped, nothing left or refused) ends it at
+/// once: a later look classifies only [`Verdict::Continue`].
 fn hold<R: AppRig>(
     d: &mut Decision,
     rig: &mut R,
     origin: Origin,
 ) -> Result<Next, LiveError<R::ScreenError>> {
     loop {
+        if d.stepped() && d.left().is_none() && !d.latched() {
+            return Ok(if d.practice() {
+                Next::Page
+            } else {
+                Next::Stepped
+            });
+        }
         let next = serve(d, rig, origin, None)?;
         if next != Next::Go {
             return Ok(next);

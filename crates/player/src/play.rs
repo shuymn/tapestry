@@ -237,6 +237,13 @@ pub struct PlayerRig<'a> {
     /// The end screen's page while it shows: the summary's lines and the
     /// view's graphs; the settings lines are added each time it is sent.
     pub end_page: Option<EndPage>,
+    /// The decision screen's rebuild the flow polls
+    /// ([`game::AppRig::poll_recovery`]): under way, or how it failed.
+    pub recovering: crate::render_side::Recovery,
+    /// The screen's failure a chart's load hid behind
+    /// [`crate::selection::ChartLoadError::ScreenFailed`], for the flow
+    /// ([`game::AppRig::screen_load_failed`]).
+    pub screen_load_failure: Option<ScreenError>,
     /// The end screen's key names.
     pub hints: Hints,
     /// The result screen's input.
@@ -1755,21 +1762,19 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn prepare_screen(&mut self) -> Result<(), ScreenError> {
-        // Within a result lifetime a screen built again is not a leaving,
-        // an outro playing included, until the flow serves the command:
-        // the render side draws on from what it presented (the S10-09i
-        // design's D4, "Recovery").
-        if self.presenter.current() && !self.result_leaving {
-            return self.render.prepare();
+        self.before_rebuild();
+        // A rebuild a decision screen's look began and left is taken over,
+        // not asked again; one that failed there is asked again here.
+        match self.render.take_recovery() {
+            crate::render_side::Recovery::Pending(pending) => loop {
+                if let Some(answered) = self.render.poll_prepare(&pending, None) {
+                    return answered;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            },
+            crate::render_side::Recovery::Idle | crate::render_side::Recovery::Failed(_) => {}
         }
-        self.leave_result();
-        self.retry_from = self.pending_retry.take();
-        // What a result offered before this preparation is no later
-        // result's.
-        self.result_retries = ResultRetries::default();
-        #[cfg(feature = "dev-tools")]
-        self.scenario_pending();
-        prepare_render(&mut self.end_page, &self.render)
+        self.render.prepare()
     }
 
     /// The attempt's preparation begun (design.md "Play Lifecycle",
@@ -2600,6 +2605,29 @@ pub(crate) const fn flow_timing(t: skin_model::ResultTiming) -> game::ResultTimi
 /// first (a retry), its page and the render thread's slot emptied before
 /// the preparation's handshake, so no page of the result is drawn after,
 /// even one that waited while the render thread was behind.
+impl PlayerRig<'_> {
+    /// What every rebuild of the screen does first ([`game::Rig::prepare_screen`],
+    /// the decision screen's recovery): within a result lifetime a screen
+    /// built again is not a leaving, an outro playing included, until the
+    /// flow serves the command, and the render side draws on from what it
+    /// presented (the S10-09i design's D4, "Recovery"), so nothing here;
+    /// otherwise the result is left, a retry asked for is taken, what a
+    /// result offered is no later result's, and the end screen goes.
+    pub(crate) fn before_rebuild(&mut self) {
+        if self.presenter.current() && !self.result_leaving {
+            return;
+        }
+        self.leave_result();
+        self.retry_from = self.pending_retry.take();
+        self.result_retries = ResultRetries::default();
+        #[cfg(feature = "dev-tools")]
+        self.scenario_pending();
+        self.end_page = None;
+        self.render.clear_end();
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn prepare_render(
     end_page: &mut Option<EndPage>,
     render: &RenderLink,
