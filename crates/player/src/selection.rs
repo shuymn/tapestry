@@ -1196,9 +1196,10 @@ pub fn script_result(
                 return;
             }
             // The result is left on its own, by its scene time; the select
-            // screen takes it. Its page drawn with none in force (a
-            // built-in result, or its skin fallen back), or no page drawn
-            // within the bound, it would never leave.
+            // screen takes it. Its page drawn with no scene time in force
+            // and no leaving accepted (a built-in result, or its skin
+            // fallen back before its scene time), or no page drawn within
+            // the bound, it would never leave.
             Some(SelectStep::Stay) => {
                 if let Some(why) = stay_failure(at, script.hold_expired()) {
                     script.fail(why.to_owned());
@@ -1219,11 +1220,12 @@ pub fn script_result(
 }
 
 /// Why `stay` fails at `at`, if it does: no page drawn by the step's
-/// deadline (`expired`), or a page drawn with no scene time in force
-/// (dev-tools).
+/// deadline (`expired`), or a page drawn with no scene time in force and
+/// no leaving accepted, which a skin falling back during the outro its
+/// scene time began does not undo (dev-tools).
 #[cfg(feature = "dev-tools")]
 const fn stay_failure(at: ResultAt, expired: bool) -> Option<&'static str> {
-    match (at.drawn, at.scene, expired) {
+    match (at.drawn, at.scene || at.leaving, expired) {
         (false, _, true) => Some("the result was not drawn within the render bound"),
         (true, false, _) => Some("stay needs a result skin's scene time; none is in force"),
         _ => None,
@@ -1269,6 +1271,9 @@ pub struct ResultAt {
     pub drawn: bool,
     /// The views the result has changed to so far.
     pub views: u64,
+    /// Whether a leaving was accepted (its outro began) or served: the
+    /// result leaves whatever its timing is now.
+    pub leaving: bool,
     /// Whether a result skin's scene time is in force.
     pub scene: bool,
 }
@@ -2125,6 +2130,7 @@ impl PlayerRig<'_> {
             view: self.presenter.desired_key(),
             drawn: self.render.end_page_drawn(),
             views: self.views_shown,
+            leaving: self.result_outro.is_some() || self.result_leaving,
             scene: self
                 .presenter
                 .timing(&self.render)
@@ -7579,6 +7585,19 @@ pub(crate) mod tests {
     /// [`result_at`] after `views` changes of view.
     #[cfg(feature = "dev-tools")]
     fn result_views(page: u64, view: u64, drawn: bool, scene: bool, views: u64) -> super::ResultAt {
+        result_leaving(page, view, drawn, scene, views, false)
+    }
+
+    /// [`result_views`], with a leaving accepted or not.
+    #[cfg(feature = "dev-tools")]
+    fn result_leaving(
+        page: u64,
+        view: u64,
+        drawn: bool,
+        scene: bool,
+        views: u64,
+        leaving: bool,
+    ) -> super::ResultAt {
         super::ResultAt {
             id: Some(crate::measure::ResultId {
                 seq: 4,
@@ -7589,6 +7608,7 @@ pub(crate) mod tests {
             drawn,
             scene,
             views,
+            leaving,
         }
     }
 
@@ -7729,5 +7749,8 @@ pub(crate) mod tests {
             Some("step 1 (capture): stay needs a result skin's scene time; none is in force")
         );
         assert_eq!(stay(long, result_at(1, 1, true, true)), None);
+        // Its scene time accepted back, then the skin fell back during the
+        // outro: it is leaving, not failing.
+        assert_eq!(stay(long, result_leaving(1, 1, true, false, 1, true)), None);
     }
 }
