@@ -6101,9 +6101,11 @@ fn skin_decision_ends_at_scene_plus_fadeout() {
 fn hook_off_runs_no_decision_screen() {
     let acts = vec![
         (0, Act::Choose(0)),
-        (4_000, Act::Back),
+        // Back and close 4 s after each result, which shows 4.789 s later
+        // than it did before a full play held 5 s past its last note.
+        (8_789, Act::Back),
         (500, Act::Choose(1)),
-        (4_000, Act::Close),
+        (8_789, Act::Close),
     ];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |_| {});
     ran.unwrap();
@@ -6121,25 +6123,26 @@ fn hook_off_runs_no_decision_screen() {
 }
 
 /// The idle waits of [`hook_off_runs_no_decision_screen`]'s run: each wait's
-/// clock and deadline.
+/// clock and deadline. Each play's result shows after its 5 s hold past the
+/// last note (design.md "Play Lifecycle", Audio tail).
 const IDLE_WAITS_OFF: [(i64, i64); 17] = [
-    (7_711_000, 7_711_000),
-    (7_711_001, 7_961_001),
-    (7_961_001, 8_211_001),
-    (8_211_001, 8_461_001),
-    (8_461_001, 8_711_001),
-    (8_711_001, 8_961_001),
-    (8_961_001, 9_211_001),
-    (9_000_000, 9_211_001),
-    (9_211_001, 9_461_001),
-    (9_461_001, 9_711_001),
-    (12_111_000, 9_711_001),
-    (12_111_001, 12_361_001),
-    (12_361_001, 12_611_001),
-    (12_611_001, 12_861_001),
-    (12_861_001, 13_111_001),
-    (13_111_001, 13_361_001),
-    (13_361_001, 13_611_001),
+    (12_500_000, 12_500_000),
+    (12_500_001, 12_750_001),
+    (12_750_001, 13_000_001),
+    (13_000_001, 13_250_001),
+    (13_250_001, 13_500_001),
+    (13_500_001, 13_750_001),
+    (13_750_001, 14_000_001),
+    (13_789_000, 14_000_001),
+    (14_000_001, 14_250_001),
+    (14_250_001, 14_500_001),
+    (21_689_000, 14_500_001),
+    (21_689_001, 21_939_001),
+    (21_939_001, 22_189_001),
+    (22_189_001, 22_439_001),
+    (22_439_001, 22_689_001),
+    (22_689_001, 22_939_001),
+    (22_939_001, 23_189_001),
 ];
 
 /// A skin refused 1,000 ms after the choice: the built-in presentation
