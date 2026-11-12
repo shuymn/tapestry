@@ -1,5 +1,5 @@
 //! The chart's images on the result across attempts, through the
-//! player's flow on WARP (S10-12 RC2, RC3, RC4; RX6, RX6a, RX11c, RX11e):
+//! player's flow on WARP:
 //! each attempt prepared (its facts stage, the result's image stage and
 //! `send_screen`'s want), committed (the images handed to the result),
 //! shown (`show_end`, the presenter's payload) and drawn by the render
@@ -333,7 +333,7 @@ fn shown(
     }
 }
 
-/// RT20 (RX11c): a fixed result skin over two attempts on charts A and
+/// A fixed result skin over two attempts on charts A and
 /// B, each with its own stage file: the second attempt's payload carries
 /// B's images and its view draws B's stage file, not A's.
 #[test]
@@ -365,7 +365,7 @@ fn a_fixed_result_draws_each_attempts_stage_file() {
     });
 }
 
-/// RT23 (RC2, RX6, RX11e): a pending Lua result skin whose import reads
+/// A pending Lua result skin whose import reads
 /// the stage file's availability (191) to choose its layout, on charts A
 /// (its stage file missing) and B (otherwise equal, with one). A's image
 /// stage never begins while its facts are unresolved: held in the facts
@@ -424,7 +424,7 @@ fn a_skin_reading_191_lays_out_each_charts_availability() {
     });
 }
 
-/// RT24's cached layout (RC2, RX6a): a pending skin reading 191 with the
+/// A pending skin reading 191 with the
 /// layout specialized on 191 cached; a retry after deleting the stage
 /// file, and one after writing it again, each hold their facts
 /// unresolved until the retry's own sources: the deleted case shows the

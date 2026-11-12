@@ -668,7 +668,7 @@ impl PlayerRig<'_> {
         };
         prep.specialized = matches!(skin, AttemptSkin::Specialized(_));
         // The images the attempt draws, fitted for its play skin's chart
-        // layer and for the result's (D1): the side of the attempt's bundle
+        // layer and for the result's: the side of the attempt's bundle
         // for every view, else of the prepared atlas, when it keeps one.
         let play = self.play_side(&skin);
         let result = self.result_skin.chart_side();
@@ -936,8 +936,6 @@ impl PlayerRig<'_> {
             return;
         }
         if !self.presenter.current() {
-            // The play installation is not drawn from here: its half goes.
-            self.chart_images.result_began();
             self.presenter.begin(&mut self.render, self.clock.now());
             self.result_leaving = false;
             self.result_offset = Some((self.controls.tuning().get().input_offset_us, false));
@@ -1960,7 +1958,7 @@ impl Rig for PlayerRig<'_> {
         let loading = self.loading_active();
         commit_ready(&self.render, loading, &mut self.declared)?;
         self.chart_images.committed();
-        // The attempt's sources and result half move to the result (I2),
+        // The attempt's sources and result half move to the result,
         // replacing the last attempt's: only once its commit passed.
         self.result_skin
             .take_images(self.chart_images.take_result());
@@ -2830,6 +2828,9 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn show_end(&mut self, report: &PlayReport, screen: &ResultScreen) {
+        // The result is entered, whatever presents it: the play
+        // installation is not drawn from here, so its half goes.
+        self.chart_images.result_began();
         self.print_view(screen);
         // A switch: its layout is requested; the current generation stays
         // until it lands (design D11). The attempt's fallback requests none.

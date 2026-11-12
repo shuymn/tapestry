@@ -387,7 +387,7 @@ fn the_timing_is_the_presented_views_while_a_lifetime_is() {
     assert_eq!(p.timing(&sent), None, "the lifetime ended");
 }
 
-/// RX11c: the same layout landing with other chart images (a fixed skin
+/// The same layout landing with other chart images (a fixed skin
 /// published in an earlier attempt, a later attempt's images) is a new
 /// payload carrying them; landing again with the same images is not; the
 /// built-in result carries none.

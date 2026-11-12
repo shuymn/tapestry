@@ -60,6 +60,10 @@ impl Gate {
 /// Faults a test turns on.
 #[derive(Default)]
 pub(super) struct Faults {
+    /// The texels the next result installation is charged
+    /// (`Renderer::state_charge`), so only releasing it admits a play skin
+    /// at the atlas cap; 0 for its own charge.
+    pub(super) charge_result: std::sync::atomic::AtomicU64,
     /// The next result frame submitted fails as a lost device.
     pub(super) lose: AtomicBool,
     /// The next result frame is refused by the skin.
@@ -125,6 +129,10 @@ pub(super) struct Faults {
     pub(super) refuse_commit: AtomicBool,
     /// The next installation of the result kind is refused.
     pub(super) refuse_install: AtomicBool,
+    /// The next result staging answers cancelled.
+    pub(super) cancel_install: AtomicBool,
+    /// The next result chart write fails as a lost device.
+    pub(super) lose_chart: AtomicBool,
 }
 
 impl Drop for Recorded {
@@ -190,6 +198,9 @@ impl Screen for Recorded {
         if self.faults.refuse_chart.swap(false, Ordering::AcqRel) {
             self.menu.renderer_mut().refuse_next_result_chart();
         }
+        if self.faults.lose_chart.swap(false, Ordering::AcqRel) {
+            return Err(render::RenderError::DeviceLost);
+        }
         let out = self.menu.write_result_chart(target, images, set);
         self.faults.chart_writes.store(
             self.menu.renderer_mut().result_chart_writes(),
@@ -214,9 +225,20 @@ impl Screen for Recorded {
         if kind == ScreenKind::Result && self.faults.refuse_install.swap(false, Ordering::AcqRel) {
             return Ok(crate::render_side::refusal("the test refused the staging"));
         }
+        if kind == ScreenKind::Result && self.faults.cancel_install.swap(false, Ordering::AcqRel) {
+            return Ok(Preparation::Cancelled);
+        }
         if kind == ScreenKind::Play && self.faults.release_then_fail.swap(false, Ordering::AcqRel) {
             self.menu.remove(ScreenKind::Result);
             return Err(render::RenderError::SurfaceLost);
+        }
+        let charge = if kind == ScreenKind::Result {
+            self.faults.charge_result.swap(0, Ordering::AcqRel)
+        } else {
+            0
+        };
+        if charge > 0 {
+            self.menu.renderer_mut().state_charge(skin, charge);
         }
         self.menu.install(kind, skin, request)
     }

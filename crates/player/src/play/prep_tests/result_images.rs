@@ -1,6 +1,6 @@
 //! The chart's images from the preparation to the result, through the
-//! player's preparation and lifecycle (S10-12 PR R, RT8, RT10, RT12-RT14,
-//! RT19, RT25, RT26): the facts stage resolves the images' availability,
+//! player's preparation and lifecycle:
+//! the facts stage resolves the images' availability,
 //! the commit alone hands the attempt's sources and result half to the
 //! result skin, a payload carries the fit its view draws, and selection,
 //! a retry and practice leave each owner with what the exit table says.
@@ -145,7 +145,7 @@ fn payload_chart(rig: &crate::play::PlayerRig<'_>) -> Option<Arc<ChartImages>> {
     rig.presenter.payload().and_then(|p| p.chart.clone())
 }
 
-/// RT25, RX6e: the direct launch (no coordinator) with a play skin keeping
+/// The direct launch (no coordinator) with a play skin keeping
 /// no chart layer and a result skin keeping one: the facts stage decodes
 /// the sources on the game thread, so the facts resolve and the
 /// preparation readies; the commit hands the result its half, fitted for
@@ -173,7 +173,7 @@ fn the_direct_launch_resolves_the_results_images_without_a_play_layer() {
     });
 }
 
-/// RT10 (RX6c, RX7): play's publication held past the render link's bound
+/// Play's publication held past the render link's bound
 /// refuses the preparation before any commit, and the commit then asked
 /// for fails, handing the result nothing, though the worker's sources and
 /// result half were read, so a hand-off before the commit's answer would
@@ -203,7 +203,7 @@ fn a_held_publication_hands_the_result_nothing() {
     });
 }
 
-/// RT10 (RX7): a preparation answered ready whose commit the render thread
+/// A preparation answered ready whose commit the render thread
 /// refuses (its staging gone, as a discard leaves it: `NothingStaged`)
 /// hands the result nothing, the sources and result half read.
 #[test]
@@ -228,7 +228,7 @@ fn a_refused_commit_hands_the_result_nothing() {
     });
 }
 
-/// RT8 (RX3, RX6b): a quit while the facts stage's job decodes, with a
+/// A quit while the facts stage's job decodes, with a
 /// coordinator: the preparation ends cancelled, the facts unresolved, and
 /// nothing is handed to the result.
 #[test]
@@ -262,7 +262,7 @@ fn a_quit_in_the_facts_stage_cancels_and_hands_nothing() {
     });
 }
 
-/// RT26 (RX6d): with a coordinator, the choice's publication held by the
+/// With a coordinator, the choice's publication held by the
 /// render thread, unanswered, and a new generation asked for: the facts
 /// stage's job cannot begin while it is, and past the render link's bound
 /// the preparation is refused, never left waiting (the hold lasts longer).
@@ -300,7 +300,7 @@ fn a_publication_held_at_the_choice_refuses_the_facts_stage() {
     });
 }
 
-/// RT19 (RX5b): with a coordinator, a play skin keeping no chart layer and
+/// With a coordinator, a play skin keeping no chart layer and
 /// a result skin keeping one: the job decodes the stage file once and
 /// derives only the result half, play's images are absent, and the result
 /// view's payload carries that half.
@@ -329,7 +329,7 @@ fn a_result_layer_alone_derives_the_result_half() {
     });
 }
 
-/// RT12 (RX8a, RX8b), the player's half: the result's upload refused shows
+/// The result's upload refused shows
 /// the built-in page for the attempt, its payload carrying no images
 /// though the result keeps them; an upload withdrawn by a quit while the
 /// render thread holds it installs nothing once released, the images kept
@@ -383,10 +383,35 @@ fn a_refused_or_withdrawn_upload_carries_no_images() {
     });
 }
 
-/// RT14 (RX21a-c): the owners after a result, a retry, practice and
+/// The owners after a result, a retry, practice and
 /// selection. During the play the worker keeps the sources and both
 /// halves, and the result skin the attempt's sources and result half;
 /// the result drops the play half; both stay within the design's bound.
+/// The built-in result (no result skin) is a result entry too: the play
+/// half goes, and only the sources stay with the worker.
+#[test]
+fn a_built_in_result_keeps_no_play_half() {
+    let _serial = imports::serial();
+    let (_dir, l) = chart_with_stage();
+    let results = tempfile::tempdir().unwrap();
+    on_warp(l.chart(), |rig, _| {
+        rig.adjust = None;
+        rig.play_chart = Some(2_048);
+        assert!(!rig.result_skin.has_skin());
+        assert_eq!(prepared(rig, &l), Preparation::Ready);
+        rig.commit_attempt().unwrap();
+        let play = rig.chart_images.current().expect("the play half");
+        let during_play = rig.chart_images.retained();
+        show_result(rig, results.path());
+        assert!(rig.chart_images.current().is_none(), "the play half kept");
+        until("the play half's bytes released", || {
+            rig.chart_images.service();
+            rig.chart_images.retained() + play.bytes() <= during_play
+        });
+        assert!(rig.chart_images.sources().is_some());
+    });
+}
+
 /// A retry re-resolves (no decode for the unchanged file) and replaces
 /// the result's images with its own; practice entry drops the result's
 /// and keeps the worker's sources, so its Start decodes nothing;
@@ -567,7 +592,7 @@ fn on_warp<R>(
     .0
 }
 
-/// RT13 (RX19, RX21b): a retry after the first attempt's result drew its
+/// A retry after the first attempt's result drew its
 /// stage file, the file replaced in between: the retry's preparation (play's
 /// admission releasing the result's installation) re-resolves it, and the
 /// retry's result view draws the new stage file, not the first.

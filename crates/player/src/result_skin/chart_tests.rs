@@ -153,7 +153,7 @@ fn staged_skin(d: &Path, limits: AtlasLimits) -> ResultSkin {
     rs
 }
 
-/// RT21, RX11d, RX9: a pending skin with no prepared entry asks the
+/// A pending skin with no prepared entry asks the
 /// worker for no result side; its view's layout derives the images from
 /// the sources at its own chart slot, owned by the cached layout and
 /// published with its bundle: `chart_for` gives the stage file and the
@@ -186,7 +186,38 @@ fn a_layout_with_no_prepared_entry_derives_from_the_sources() {
     assert_eq!(rs.image_bytes(), sources.bytes() + fit.bytes());
 }
 
-/// RT5 (the growing slot), RX9: the prepared atlas's side is 2 304, so
+/// Selection's and practice's entry drop every image the result keeps,
+/// a kept layout's derivation included: nothing of the chart's pixels
+/// stays (its `Weak` dead), while the layout itself stays reusable, and
+/// reused with the next attempt's images it derives them again.
+#[test]
+fn leaving_the_result_drops_the_layouts_derivations() {
+    let _s = serial();
+    let d = unprepared_skin();
+    let c = chart_dir([640, 480]);
+    let mut rs = staged_skin(d.path(), LIMITS);
+    rs.take_images(Some(handed(c.path(), rs.chart_side())));
+    rs.request(view(5));
+    settled(&mut rs);
+    let b = shown(&rs);
+    let (_, owned) = cached_derivation(&rs).expect("the cached layout owns it");
+    let weak = Arc::downgrade(&owned);
+    drop(owned);
+    rs.drop_images();
+    assert_eq!(rs.image_bytes(), 0);
+    assert!(cached_derivation(&rs).is_none());
+    assert!(rs.chart_for(&b).is_none());
+    assert!(weak.upgrade().is_none(), "the derivation's pixels kept");
+    // The next attempt's images: the kept layout derives them again.
+    let e = chart_dir([320, 240]);
+    rs.take_images(Some(handed(e.path(), rs.chart_side())));
+    rs.request(view(5));
+    settled(&mut rs);
+    let fit = rs.chart_for(&shown(&rs)).expect("derived again");
+    assert_eq!(content(&fit, ChartImage::Stage), [320, 240]);
+}
+
+/// The prepared atlas's side is 2 304, so
 /// the result half is the 2 304 fit (its stage file 1 136 wide); a view
 /// that rebinds to it draws that half, and a later view whose cell the
 /// prepared atlas lacks packs a union of side 4 096 and draws the stage
@@ -230,7 +261,7 @@ fn a_growing_union_derives_its_slot_from_the_sources() {
     assert!(Arc::ptr_eq(&owned, &fit));
 }
 
-/// RT6, RX10a: a layout landing for an older request publishes nothing.
+/// A layout landing for an older request publishes nothing.
 /// Its derivation is dropped with it when the latest view is another
 /// (an unavailable view here, the built-in result), and cached with it
 /// when the latest view is its own, which then reuses it with no job.
@@ -271,7 +302,7 @@ fn an_older_landing_drops_or_caches_its_derivation() {
     assert_eq!(content(&fit, ChartImage::Stage), [640, 480]);
 }
 
-/// RT6, RX10b-d: a refused layout publishes the built-in result and
+/// A refused layout publishes the built-in result and
 /// leaves the cached layout's derivation as it was; a deferred one keeps
 /// its request and publishes nothing until the atlas is released; a
 /// layout settled after its outcome came drops its derivation with it.
@@ -350,7 +381,7 @@ fn view_at(level: i32, nr: u32) -> ViewFacts {
     ViewFacts(Some(skin_model::ResultFields::of(&v)))
 }
 
-/// RT6, RX11: attempt A (level 12) prepares nothing (its probe is
+/// Attempt A (level 12) prepares nothing (its probe is
 /// refused) and view 5's layout packs its own atlas of side 2 048, its
 /// images derived from A's sources (a 640×480 stage file). Attempt B
 /// (level 13) prepares an atlas of side 2 304 (its probe draws `w1`), so
@@ -400,7 +431,7 @@ fn a_cached_layout_of_other_sources_is_laid_out_again() {
     assert_eq!(content(&fit, ChartImage::Stage), [800, 600]);
 }
 
-/// RT6, RX11b: a skin that reads no fact of the viewed result makes a
+/// A skin that reads no fact of the viewed result makes a
 /// bundle for every view, cached and reused by the next attempt; each
 /// attempt asks the worker for its result half at that bundle's side, so
 /// the reused bundle draws attempt B's half, not A's.
@@ -481,7 +512,7 @@ fn logged(what: &str, f: impl FnOnce()) -> Vec<String> {
 
 const GIVEN_UP: &str = "skin: its chart layer is given up";
 
-/// RT17, RC6 (the union path): a pending skin whose atlas fits only
+/// A pending skin whose atlas fits only
 /// without the chart layer: view 2's cell is not in the prepared atlas,
 /// and its union is packed without the layer, the note logged; the view
 /// shows the skin, with no chart layer and so no chart images.
@@ -510,7 +541,7 @@ fn a_union_with_no_room_for_the_chart_layer_keeps_the_skin() {
     assert!(rs.chart_for(&b).is_none());
 }
 
-/// RT17, RC6 (the image stage's path): a skin that reads no fact of the
+/// A skin that reads no fact of the
 /// viewed result, whose atlas fits only without the chart layer, makes
 /// its bundle for every view without the layer, the note logged, and
 /// shows it.

@@ -127,7 +127,7 @@ fn a_quit_while_the_images_are_read_cancels() {
     });
 }
 
-/// RC2, RX6, RX6a (RT24's core): the result's chart facts are the
+/// The result's chart facts are the
 /// attempt's resolved availability, taken in the facts stage before the
 /// result's image stage; a retry after the attempt drew them renews the
 /// generation, so a stage file deleted meanwhile is resolved absent, and
@@ -157,5 +157,38 @@ fn the_result_facts_are_each_attempts_images() {
         let texels = [1, 2, 3, 255].repeat(64 * 48);
         e.write_header().unwrap().write_image_data(&texels).unwrap();
         assert!(images(rig).stage);
+    });
+}
+
+/// A quit while the Images stage waits for its publication's answer (the
+/// facts resolved, the screen staged): the preparation is cancelled, what
+/// it staged discarded, and nothing is handed to the result.
+#[test]
+fn a_quit_in_the_images_stage_cancels_and_hands_nothing() {
+    let _serial = imports::serial();
+    let (_dir, l) = chart_with_stage();
+    let screens = Installers::default();
+    on_rig(l.chart(), &screens, false, |rig| {
+        rig.play_chart = Some(2_048);
+        rig.render
+            .set_timeouts(Duration::from_secs(30), Duration::from_secs(5));
+        rig.render.hold_chart_publications(true);
+        let mut h = begin(rig, &l);
+        let began = Instant::now();
+        while stage(rig) != "images" {
+            assert!(began.elapsed() < Duration::from_secs(10), "{}", stage(rig));
+            let until = Instant::now() + Duration::from_millis(10);
+            assert!(matches!(
+                rig.poll_preparation(&mut h, until).unwrap(),
+                game::PrepPoll::Pending
+            ));
+        }
+        assert!(rig.chart_images.facts().is_some());
+        rig.controls.command(game::Command::Quit);
+        let ended = polled(rig, &mut h).unwrap();
+        rig.render.hold_chart_publications(false);
+        assert_eq!(ended, Preparation::Cancelled);
+        assert!(rig.commit_attempt().is_err(), "nothing to commit");
+        assert_eq!(rig.result_skin.image_bytes(), 0, "handed to the result");
     });
 }

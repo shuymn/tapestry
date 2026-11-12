@@ -127,7 +127,7 @@ struct ChartFrom {
     side: Option<u32>,
 }
 
-/// The attempt's images the result draws (I2): its sources, and its
+/// The attempt's images the result draws: its sources, and its
 /// result half, handed over at the attempt's commit.
 #[derive(Debug)]
 struct HeldImages {
@@ -289,7 +289,7 @@ pub struct ResultSkin {
     /// thread, [`crate::controls::Controls::game_thread`]): a switch's
     /// layout lands then, not at the end of the game thread's idle wait.
     wake: Option<std::thread::Thread>,
-    /// The committed attempt's images (I2): replaced at the next commit,
+    /// The committed attempt's images: replaced at the next commit,
     /// dropped at selection's and practice's entry.
     images: Option<HeldImages>,
 }
@@ -778,7 +778,7 @@ impl ResultSkin {
         }
     }
 
-    /// The committed attempt's images, from its commit on (I2): its
+    /// The committed attempt's images, from its commit on: its
     /// sources and its result half, replacing the last attempt's.
     pub fn take_images(&mut self, images: Option<crate::chart_images::ResultImages>) {
         self.images = images.map(|i| HeldImages {
@@ -793,8 +793,16 @@ impl ResultSkin {
     }
 
     /// The attempt's images go: selection or practice is entered.
+    ///
+    /// The one exit of every image the result keeps: the sources and the
+    /// result half, and each kept layout's derivation (a layout kept for
+    /// reuse keeps its bundle and facts, and derives again if it is
+    /// reused with other images).
     pub fn drop_images(&mut self) {
         self.images = None;
+        for l in self.layout.iter_mut().chain(self.presented.iter_mut()) {
+            l.derived = None;
+        }
     }
 
     /// The bytes of the images it keeps: the sources, the result half and
@@ -822,8 +830,8 @@ impl ResultSkin {
         total
     }
 
-    /// The chart layer side the attempt's result half is derived for
-    /// (D1): a bundle for every view's, else the prepared atlas's, when
+    /// The chart layer side the attempt's result half is derived for:
+    /// a bundle for every view's, else the prepared atlas's, when
     /// it keeps a chart layer; `None` otherwise (a layout then derives
     /// its own from the sources).
     #[must_use]

@@ -1,5 +1,5 @@
 //! The chart's own images on the result screen through the real render
-//! thread (S10-12, RC3 and RC7): a view's images are written into the
+//! thread: a view's images are written into the
 //! array its staging uses and keyed to that staging's installation, so
 //! its first frame draws them; a set the array already holds is not
 //! written again; a staging that never commits takes its table with it,
@@ -213,7 +213,7 @@ fn tables(rig: &Rig) -> Vec<ChartTable> {
     rig.faults.chart_tables.lock().unwrap().clone()
 }
 
-/// RX12 (RT5): the first view, staged on its own resources, has its
+/// The first view, staged on its own resources, has its
 /// images written into its own array and keyed to its installation: the
 /// very first frame draws both from the chart layer, the stage-slot and
 /// back-slot texels sampled, and 191 holds.
@@ -243,7 +243,75 @@ fn a_first_view_on_its_own_resources_draws_its_images() {
     rig.exit();
 }
 
-/// RX13 (RT5): pages uploaded alone, then a view of a layout on them, then
+/// A play skin at the atlas cap that only the result's committed charge
+/// keeps out is admitted by releasing the result's installation (the
+/// renderer's own admission); the next result lifetime installs the
+/// result skin again and its first view writes and draws its own images,
+/// the second chart's.
+#[test]
+fn a_result_released_by_plays_admission_draws_the_next_charts_images() {
+    let (_dir, skin, _) = chart_skin("");
+    let layer = skin.chart_layer().unwrap();
+    let (_a, red) = images(skin.side(), RED, BLUE);
+    let (_b, green) = images(skin.side(), GREEN, BLUE);
+    let big = {
+        let r = crate::render_common::offscreen(1_920, 1_080);
+        crate::render_decl::atlas_cap_bundle(&r, [0, 0, 255, 255])
+    };
+    let mut rig = Rig::new();
+    rig.link
+        .set_timeouts(Duration::from_secs(60), Duration::from_secs(10));
+    sample(&rig);
+    rig.faults.charge_result.store(
+        render::SHARED_TEXELS - skin_model::MAX_ATLAS_TEXELS + 256 * 256 * 2,
+        Ordering::Release,
+    );
+    let lifetime = rig.link.begin_result();
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &viewed(1, &skin, 1_111, &[], &red),
+        &Overlay::default(),
+    );
+    let (i, q) = first_with(&rig, 0);
+    assert!(draws_images(&q, layer));
+    assert!(near(sampled(&rig, i)[0], RED));
+    assert_eq!(rig.link.result_status().installed, Some(skin.atlas_id()));
+    // Play's admission: past the shared limit only with the result's
+    // charge, so the result's installation is released.
+    assert_eq!(
+        rig.link
+            .select(skin_model::ScreenKind::Play, Some(Arc::clone(&big)))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    assert!(
+        wait_until(|| rig.link.result_status().installed.is_none()),
+        "{:?}",
+        rig.link.result_status()
+    );
+    // The next attempt's result: installed again, its images written.
+    let written = writes(&rig);
+    reset(&rig);
+    let lifetime = rig.link.begin_result();
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &viewed(2, &skin, 2_222, &[], &green),
+        &Overlay::default(),
+    );
+    let (i, q) = first_with(&rig, 0);
+    assert!(draws_images(&q, layer), "{q:?}");
+    assert!(near(sampled(&rig, i)[0], GREEN), "{:?}", sampled(&rig, i));
+    assert_eq!(writes(&rig), written + 1);
+    assert_eq!(rig.link.result_status().installed, Some(skin.atlas_id()));
+    rig.exit();
+}
+
+/// Pages uploaded alone, then a view of a layout on them, then
 /// a view of another layout on the same array with the same set, then the
 /// same layout again (installed): the first view writes the set into the
 /// pages' array; the next ones write nothing (the array holds it), each
@@ -300,7 +368,7 @@ fn a_layout_on_the_installed_array_writes_nothing_and_draws_at_once() {
     rig.exit();
 }
 
-/// RX15 and RX14 (RT5): a view staged and written, superseded before its
+/// A view staged and written, superseded before its
 /// commit, is discarded with its staging and never draws; a view whose
 /// staging is refused gets no table, writes nothing, and draws its
 /// built-in page.
@@ -379,10 +447,61 @@ fn a_superseded_or_refused_view_draws_no_table_of_its_own() {
     assert!(rig.until(|d| matches!(d, Drawn::Page(p) if p.iter().any(|l| l == "v4 2"))));
     assert_eq!((writes(&rig), tables(&rig).len()), before);
     assert!(!rig.link.failed());
+    // A staging cancelled: the same, its own page.
+    rig.faults.cancel_install.store(true, Ordering::Release);
+    show(
+        &rig.link,
+        lifetime,
+        5,
+        &viewed(5, &y, 5_555, &[], &green),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| matches!(d, Drawn::Page(p) if p.iter().any(|l| l == "v5 2"))));
+    assert_eq!((writes(&rig), tables(&rig).len()), before);
+    assert!(!rig.link.failed());
     rig.exit();
 }
 
-/// RX16a-d (RT5): a view presented (A, red) and a newer one staged and
+/// A device failing during a view's chart write fails the screen: the
+/// staging is never committed, and on the screen built again the view is
+/// staged again and its first frame draws its images.
+#[test]
+fn a_device_lost_during_the_chart_write_draws_the_images_on_the_next_screen() {
+    let (_x_dir, x, _) = chart_skin("");
+    let (_red, red) = images(x.side(), RED, BLUE);
+    let (_green, green) = images(x.side(), GREEN, BLUE);
+    let rig = Rig::new();
+    sample(&rig);
+    let lifetime = rig.link.begin_result();
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &viewed(1, &x, 1_111, &[], &red),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    let written = writes(&rig);
+    rig.faults.lose_chart.store(true, Ordering::Release);
+    show(
+        &rig.link,
+        lifetime,
+        2,
+        &viewed(2, &x, 2_222, &["B"], &green),
+        &Overlay::default(),
+    );
+    assert!(wait_until(|| rig.link.failed()));
+    assert_eq!(writes(&rig), written, "nothing written by the lost write");
+    reset(&rig);
+    rig.link.prepare().unwrap();
+    let (i, q) = first_with(&rig, 1);
+    assert!(draws_images(&q, x.chart_layer().unwrap()), "{q:?}");
+    let px = sampled(&rig, i);
+    assert!(near(px[0], GREEN) && near(px[1], BLUE), "{px:?}");
+    rig.exit();
+}
+
+/// A view presented (A, red) and a newer one staged and
 /// written (B, green) whose commit does not happen: its generation
 /// evicted (`Gone`), its commit refused, or a fade-out begun. Each frame
 /// after draws A with its own table (the stage texel red), B is never
@@ -461,7 +580,7 @@ fn a_commit_that_does_not_happen_keeps_the_presented_views_table() {
     }
 }
 
-/// RX17 and RX18 (RT11): the screen fails with a view presented, and with
+/// The screen fails with a view presented, and with
 /// a newer view staged and written but not committed; on the screen built
 /// again, the first frame of each view draws its images (the stage
 /// texel): the presented view's written again at the reapply, the
@@ -532,7 +651,7 @@ fn the_images_draw_again_on_a_screen_built_again() {
     rig.exit();
 }
 
-/// RX17b (RT18): a view staged on the installed array whose write is
+/// A view staged on the installed array whose write is
 /// refused draws with an all-absent table (no image quad, the stage point
 /// not the images', 191 still holding), the array's record is cleared (the
 /// next view of the set it held writes it again), and the screen does not
@@ -588,7 +707,7 @@ fn a_refused_chart_write_draws_absent_and_keeps_the_screen() {
     rig.exit();
 }
 
-/// RX20 (RT12's render half): once the result is disabled, a view with
+/// Once the result is disabled, a view with
 /// images draws its built-in page and writes no chart.
 #[test]
 fn a_disabled_result_draws_the_page_and_writes_no_chart() {
@@ -631,7 +750,7 @@ fn a_disabled_result_draws_the_page_and_writes_no_chart() {
     rig.exit();
 }
 
-/// RT16: the commit point and the build of a result frame allocate
+/// The commit point and the build of a result frame allocate
 /// nothing with a chart table installed (the skin's images drawn) and with
 /// one absent, alternating; each view's table is written outside the
 /// counted spans, as its staging writes it. Unoptimized builds count the

@@ -6362,7 +6362,7 @@ enum ResultDrawn {
 
 /// A result view's chart table: its payload's images `chart` written into
 /// the array `target` names, the one write of a view's images, at its
-/// staging and at a reapply on a screen built again (RC3, RC7). A view
+/// staging and at a reapply on a screen built again. A view
 /// without images, a target with no chart layer and a refused write (a
 /// misfit, a level mismatch, a write the device refused) leave an
 /// all-absent table, never a failed screen.
