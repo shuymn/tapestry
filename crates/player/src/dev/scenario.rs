@@ -3576,10 +3576,11 @@ mod tests {
         assert!(saves(&c, &loading_drawn(None, 1_500_000), 0));
         // A play frame while still pending is not its play's: nothing.
         assert!(due(&c, &drawn(1, 0)).is_none());
-        // Bound to play 2.
+        // Bound to play 2: not before 1.5 s, then at it and after it.
         c.bind(2);
-        assert!(!saves(&c, &loading_drawn(Some(2), 1_234_567), 2));
-        assert!(saves(&c, &loading_drawn(Some(2), 1_734_000), 2));
+        assert!(!saves(&c, &loading_drawn(Some(2), 1_499_999), 2));
+        assert!(saves(&c, &loading_drawn(Some(2), 1_500_000), 2));
+        assert!(saves(&c, &loading_drawn(Some(2), 1_500_001), 2));
         // Another play's frame: nothing; its own play's: failed.
         assert!(due(&c, &drawn(1, 0)).is_none());
         assert!(matches!(

@@ -27,10 +27,22 @@ struct Rig {
 
 impl Rig {
     fn new(loadend: Option<TimeUs>) -> Self {
+        Self::with_frames(loadend, Box::new(NoFrames))
+    }
+
+    /// [`new`](Self::new) with the frame sink `frames`.
+    fn with_frames(loadend: Option<TimeUs>, frames: Box<dyn super::super::FrameSink>) -> Self {
         let chart = Arc::new(late_tap());
         let screens = Installers::default();
         screens.screen_clocks.lock().unwrap().reserve(1 << 16);
-        let link = screens.spawn(&chart, &bundle_declaring(None, loadend));
+        let link = screens.spawn_with(frames);
+        link.load(Arc::clone(&chart), None).unwrap();
+        assert_eq!(
+            link.select(ScreenKind::Play, Some(bundle_declaring(None, loadend)))
+                .wait()
+                .unwrap(),
+            Preparation::Ready
+        );
         let clock = link.clock;
         Self {
             chart,
@@ -159,6 +171,53 @@ fn the_screen_origin_survives_pause_clear_and_play() {
     rig.link.clear_loading();
     rig.play(after(t, 1_234));
     assert_eq!(rig.screen_at(after(t, 1_734)), 1_734 * MS);
+    rig.exit();
+}
+
+/// The play frames' measured screen clock (dev-tools: a scenario's
+/// sidecar, design.md "Shortening Launch-Based Checks") is the one each
+/// frame was built with, paired by chart time, under a state clock whose
+/// origin is apart from the screen's (design.md "Timers").
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_play_frame_s_measured_screen_clock_is_the_built_one() {
+    /// A play frame's chart time and measured screen clock.
+    type Seen = (TimeUs, Option<i64>);
+    /// Each play frame's.
+    struct Measured(Arc<std::sync::Mutex<Vec<Seen>>>);
+    impl super::super::FrameSink for Measured {
+        fn frame(&mut self, _: &dyn super::super::Screen, drawn: &crate::measure::Drawn<'_>) {
+            if let Some(now) = drawn.play {
+                let mut seen = self.0.lock().unwrap();
+                if seen.len() < seen.capacity() {
+                    seen.push((now, drawn.screen_us));
+                }
+            }
+        }
+    }
+    let measured = Arc::new(std::sync::Mutex::new(Vec::with_capacity(1 << 16)));
+    let rig = Rig::with_frames(Some(LOADEND), Box::new(Measured(Arc::clone(&measured))));
+    rig.play_state(1);
+    let t = rig.begin();
+    rig.link.pause_loading().unwrap();
+    rig.link.clear_loading();
+    rig.play(after(t, 1_234));
+    // The screen clock of the lifetime, and the state clock 6 420 ms
+    // ahead of it (its origin 7 654 ms before READY at T + 1 234 ms).
+    assert_eq!(rig.screen_at(after(t, 1_734)), 1_734 * MS);
+    let built = rig.screens.screen_clocks.lock().unwrap().clone();
+    let measured = measured.lock().unwrap().clone();
+    let pairs: Vec<(i64, Option<i64>)> = built
+        .iter()
+        .filter_map(|&(_, screen, now)| {
+            let m = measured.iter().find(|&&(n, _)| n == now)?;
+            Some((screen, m.1))
+        })
+        .collect();
+    assert!(pairs.len() >= 3, "{built:?} {measured:?}");
+    for (screen, sidecar) in pairs {
+        assert_eq!(sidecar, Some(screen));
+    }
     rig.exit();
 }
 
