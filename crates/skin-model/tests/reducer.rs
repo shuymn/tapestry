@@ -236,10 +236,11 @@ const EXPECTED: [&[(u16, i64)]; 16] = [
 /// lead-in: `ready` at −1 s, `play` at 0, `beat` at the first µs whose
 /// display position reaches beat 6 (2.4 s at 150 BPM; the map floors each
 /// µs's position, so the crossing is 1 µs later), and the reducer's
-/// timers.
+/// timers; `screen` from its own origin, 2 345 ms before READY, never
+/// READY's.
 const FINAL: &[(u16, i64)] = &[
     (timer::READY, -1_000 * MS),
-    (timer::SCREEN, -1_000 * MS),
+    (timer::SCREEN, SCREEN_FROM),
     (timer::PLAY, 0),
     (timer::BEAT, 2_400 * MS + 1),
     // No bar line: 2 500 ms at 150 BPM is 6 250 ms of the rhythm clock.
@@ -261,6 +262,10 @@ fn effect_sourced(slot: u16) -> bool {
     !matches!(slot, 0..=3 | 6) && slot != timer::SCREEN && slot != timer::RHYTHM
 }
 
+/// Where the screen clock starts in the split test's frames: 2 345 ms
+/// before READY.
+const SCREEN_FROM: i64 = -3_345 * MS;
+
 #[track_caller]
 fn check_prefix(h: &Harness, k: usize, context: &str) {
     let on = EXPECTED[k];
@@ -281,6 +286,7 @@ fn every_split_of_the_script_reaches_the_same_states() {
     let events = script();
     let n = events.len();
     let mut h = Harness::new(mine_when_skin(), &chart, &full(1_000));
+    h.screen_from = SCREEN_FROM;
     // The snapshot's gauge stays at the maximum, so `gauge_max` shows the
     // reducer's state.
     h.gauges[0] = state(GaugeValue::FULL);

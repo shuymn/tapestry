@@ -1805,6 +1805,9 @@ fn stretch(
         let frame = SkinFrame {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            // The screen clock runs on from an origin 2 345 ms before chart
+            // time 0, as after a loading lifetime.
+            screen_us: now + 2_345 * MS,
             now: TimeUs(now),
             display_offset: offset,
             tally,
@@ -2207,6 +2210,7 @@ fn build_does_not_allocate() {
     let frame = SkinFrame {
         app: skin_model::AppReadouts::LAUNCH,
         state_us: 0,
+        screen_us: 0,
         now: TimeUs(5_000 * MS),
         display_offset: TimeUs(0),
         tally: &t,
@@ -2291,6 +2295,7 @@ fn build_does_not_allocate() {
         let frame = SkinFrame {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: 0,
             now: TimeUs(ms * MS),
             display_offset: TimeUs(0),
             tally: &t,
@@ -2627,6 +2632,7 @@ fn source_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         let frame = SkinFrame {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: 0,
             now: TimeUs(now),
             display_offset: TimeUs(0),
             tally: &t,
@@ -2747,6 +2753,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             let frame = SkinFrame {
                 app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
+                screen_us: 0,
                 now: TimeUs(now),
                 display_offset: TimeUs(0),
                 tally: &t,
@@ -2791,6 +2798,7 @@ fn fallback_lanes_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
             let frame = SkinFrame {
                 app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
+                screen_us: 0,
                 now: TimeUs(1_000 * MS),
                 display_offset: TimeUs(0),
                 tally: &t,
@@ -2942,6 +2950,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                 let frame = SkinFrame {
                     app: skin_model::AppReadouts::LAUNCH,
                     state_us: 0,
+                    screen_us: 0,
                     now: TimeUs(now),
                     display_offset: TimeUs(0),
                     tally: &t,
@@ -2991,6 +3000,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                     let frame = SkinFrame {
                         app: skin_model::AppReadouts::LAUNCH,
                         state_us: 0,
+                        screen_us: 0,
                         now: TimeUs(from + (k + 1) * 700 * MS),
                         display_offset: TimeUs(0),
                         tally: &t,
@@ -3031,6 +3041,7 @@ fn timeline_lanes_do_not_allocate(full: &PlayContext<'_>) {
                 let frame = SkinFrame {
                     app: skin_model::AppReadouts::LAUNCH,
                     state_us: 0,
+                    screen_us: 0,
                     now: TimeUs(from + 9_000 * MS),
                     display_offset: TimeUs(0),
                     tally: &t,
@@ -3259,6 +3270,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         let frame = SkinFrame {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: 0,
             now: TimeUs(now),
             display_offset: TimeUs(0),
             tally: &t,
@@ -3320,6 +3332,7 @@ fn cover_trims_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         let frame = SkinFrame {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: 0,
             now: TimeUs(1_000 * MS),
             display_offset: TimeUs(0),
             tally: &t,
@@ -3457,6 +3470,7 @@ fn bar_groups_do_not_allocate(ctx: &PlayContext<'_>) {
     let frame_at = |now: i64, offset: i64, target, lanes, readouts| SkinFrame {
         app: skin_model::AppReadouts::LAUNCH,
         state_us: 0,
+        screen_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(offset),
         tally: &t,
@@ -3720,6 +3734,7 @@ fn grade_attachments_do_not_allocate(ctx: &PlayContext<'_>) {
         let frame = SkinFrame {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: 0,
             now: TimeUs(now),
             display_offset: TimeUs(0),
             tally: if judged { &after } else { &before },
@@ -3876,6 +3891,7 @@ fn large_gauges_do_not_allocate(ctx: &PlayContext<'_>, views: &Views, descs: &[G
             let frame = SkinFrame {
                 app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
+                screen_us: 0,
                 now: TimeUs(now),
                 display_offset: TimeUs(0),
                 tally: &t,
@@ -4040,6 +4056,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
     let frame = |now: i64, readouts: FrameReadouts| SkinFrame {
         app: skin_model::AppReadouts::LAUNCH,
         state_us: 0,
+        screen_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(0),
         tally: &t,
@@ -4200,6 +4217,7 @@ fn rhythm_does_not_allocate(descs: &[GaugeDesc]) {
         fading: None,
         app: skin_model::AppReadouts::LAUNCH,
         state_us: 0,
+        screen_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(0),
         tally: &t,
@@ -4334,6 +4352,7 @@ fn main_bpm_does_not_allocate(descs: &[GaugeDesc]) {
     let lanes = LaneView::NONE;
     let frame = |now: i64| SkinFrame {
         state_us: 0,
+        screen_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(0),
         tally: &t,
@@ -4499,6 +4518,7 @@ fn progress_and_length_do_not_allocate(descs: &[GaugeDesc]) {
     let lanes = LaneView::NONE;
     let frame = |now: i64| SkinFrame {
         state_us: 0,
+        screen_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(0),
         tally: &t,
@@ -4805,6 +4825,7 @@ fn programs_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     let frame = |now: i64, t: &'static Tally| SkinFrame {
         app: skin_model::AppReadouts::LAUNCH,
         state_us: 0,
+        screen_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(0),
         tally: t,
@@ -5047,6 +5068,7 @@ fn promoted_numerics_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     let frame = |now: i64, state_us: i64| SkinFrame {
         app: skin_model::AppReadouts::LAUNCH,
         state_us,
+        screen_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(0),
         tally: &t,
@@ -5211,6 +5233,7 @@ fn app_readouts_do_not_allocate(
     let frame = |now: i64, app| SkinFrame {
         app,
         state_us: now,
+        screen_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(0),
         tally: &t,
@@ -5358,6 +5381,7 @@ fn slots_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     let frame = |now: i64, t: &'static Tally| SkinFrame {
         app: skin_model::AppReadouts::LAUNCH,
         state_us: now + 500_000,
+        screen_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(0),
         tally: t,
@@ -5481,6 +5505,7 @@ fn carried_slots_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     let frame = |now: i64, t: &'static Tally| SkinFrame {
         app: skin_model::AppReadouts::LAUNCH,
         state_us: now + 500_000,
+        screen_us: 0,
         now: TimeUs(now),
         display_offset: TimeUs(0),
         tally: t,

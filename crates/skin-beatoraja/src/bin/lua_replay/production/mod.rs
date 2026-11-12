@@ -324,6 +324,11 @@ pub fn record(
     let mut inputs = Vec::new();
     let mut rounds = Vec::new();
     let mut clock = script.origin;
+    // The play state's screen origin on the state clock, as the player
+    // resolves it: the first loading phase's `since`, kept over later
+    // loading phases and rounds; with none, its first round anchors it the
+    // skin's loading minimum before READY opens.
+    let mut screen_origin: Option<i64> = None;
     let mut pages = 0;
     let mut slots = 0;
     let score: std::cell::Cell<Option<[i32; 3]>> = std::cell::Cell::new(None);
@@ -335,6 +340,7 @@ pub fn record(
                     let mut loading = skin.prepare_loading(Side::Left);
                     let allowed = loading_allowed(play_level.is_some());
                     let since = TimeUs(clock);
+                    screen_origin.get_or_insert(since.0);
                     let mut t = 0;
                     while t < *len_us {
                         let state_us = clock + t;
@@ -451,6 +457,9 @@ pub fn record(
                     let round = rounds.len();
                     let mut rearmed = false;
                     let base = clock;
+                    // READY opens at the round's first frame, `base`.
+                    let screen_origin = *screen_origin
+                        .get_or_insert(base - game::loading_minimum(skin.loadend()).0);
                     let targets = skin_model::attempt_targets(&chart, &ctx.attempt);
                     let fresh = skin_model::score_fields(
                         &eval::Tally::default(),
@@ -487,6 +496,7 @@ pub fn record(
                             let frame = SkinFrame {
                                 app: skin_model::AppReadouts::LAUNCH,
                                 state_us,
+                                screen_us: state_us - screen_origin,
                                 now,
                                 display_offset: TimeUs(0),
                                 tally: st.ev.tally(),

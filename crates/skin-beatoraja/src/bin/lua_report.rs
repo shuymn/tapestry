@@ -270,6 +270,9 @@ fn report(index: usize, survey: &Survey) -> String {
         ));
     }
     line(&format!("  modules: {}", survey.modules));
+    for a in &survey.atlas {
+        line(&format!("  atlas: {a}"));
+    }
     if let Some((ops, callbacks)) = survey.frame_ops {
         line(&format!(
             "  frame: operations {ops} of {}, program callbacks {callbacks}",
@@ -286,9 +289,6 @@ fn report(index: usize, survey: &Survey) -> String {
     if let Some((n, by)) = &survey.play_elements {
         let timers: Vec<String> = by.iter().map(|(t, c)| format!("{t} {c}")).collect();
         line(&format!("  elements: {n} (timers: {})", timers.join(", ")));
-    }
-    for a in &survey.play_atlas {
-        line(&format!("  atlas: {a}"));
     }
     for (segments, motion) in &survey.gauges {
         line(&format!("  gauge segments {segments} motion {motion}"));

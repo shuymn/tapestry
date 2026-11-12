@@ -879,6 +879,30 @@ impl Screen for MenuScreen {
         self.renderer.discard();
     }
 
+    fn publish_chart_images(
+        &mut self,
+        target: render::ChartTarget,
+        images: [Option<&skin_model::chart_image::Fitted>; 2],
+    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+        self.renderer.publish_chart_images(target, images)
+    }
+
+    fn publish_chart_absent(
+        &mut self,
+        target: render::ChartTarget,
+    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+        self.renderer.publish_chart_absent(target)
+    }
+
+    fn invalidate_chart_images(&mut self) {
+        self.renderer.invalidate_chart_images();
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
+        self.renderer.chart_key()
+    }
+
     /// Stages `skin`'s chart-independent installation of `kind`,
     /// answering at once; a refusal on a healthy device
     /// ([`RenderError::is_refusal`]), the texels the screens share

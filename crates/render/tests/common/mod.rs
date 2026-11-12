@@ -243,6 +243,7 @@ pub fn input<'a>(
     FrameInput {
         app: skin_model::AppReadouts::LAUNCH,
         state_us: 0,
+        screen_us: 0,
         now,
         display_offset,
         lanes: LANES,

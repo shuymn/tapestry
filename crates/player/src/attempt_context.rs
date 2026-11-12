@@ -275,6 +275,8 @@ mod tests {
                 playlevel: "12".to_owned(),
                 difficulty: "4".to_owned(),
                 bga: true,
+                stagefile: "s.png".to_owned(),
+                backbmp: "b.bmp".to_owned(),
             },
             &chart,
         );

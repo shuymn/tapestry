@@ -455,6 +455,12 @@ pub struct SkinFrame<'a> {
     /// Real time, never chart time: it advances through loading, READY, a
     /// paused chart time and a practice session's page.
     pub state_us: i64,
+    /// The screen clock: µs since the play state's screen origin, sampled
+    /// with `now` on the same clock, from which the `screen` timer, the
+    /// untimed elements' timer, runs (design.md "Timers"). It runs on
+    /// through READY, a rearm, every round and every practice Start, and is
+    /// not the state clock (docs/stage3.md D3).
+    pub screen_us: i64,
     /// The play view's running totals.
     pub tally: &'a Tally,
     /// The play view's gauges, in the preset's order.
@@ -1433,6 +1439,7 @@ mod tests {
                 let frame = SkinFrame {
                     app: crate::AppReadouts::LAUNCH,
                     state_us: 0,
+                    screen_us: 0,
                     now: TimeUs(now_ms * MS),
                     display_offset: TimeUs(0),
                     tally: &tally,
@@ -1522,6 +1529,7 @@ mod tests {
         let refused = SkinFrame {
             app: crate::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: 0,
             now: TimeUs(1_250 * MS),
             display_offset: TimeUs(0),
             tally: &inconsistent,

@@ -134,6 +134,10 @@ pub struct Drawn {
     /// The state clock each frame gives (`SkinFrame::state_us`): by
     /// default 0.
     pub state_us: i64,
+    /// The chart time in µs the screen clock starts at: each frame's
+    /// `screen_us` is its `now` less this (`SkinFrame::screen_us`). By
+    /// default READY's start, so an untimed element runs from READY.
+    pub screen_from: i64,
     /// Whether evaluation is complete, for every frame
     /// ([`SkinFrame::complete`]): by default not.
     pub complete: bool,
@@ -214,6 +218,15 @@ pub fn follow(notes: &mut NoteFacts, chart: &Chart, ev: &JudgeEvent) {
 /// The attempt every drawn import plays: the whole chart, no lead-in.
 pub fn context() -> PlayContext<'static> {
     context_with(None, None)
+}
+
+/// Where READY starts in chart µs for the attempt `ctx` describes: its lead-in
+/// before chart time 0 or before its section's start.
+pub fn ready_start(ctx: &PlayContext<'_>) -> i64 {
+    match ctx.attempt {
+        skin_model::Attempt::Full { lead_in } => -lead_in.0,
+        skin_model::Attempt::Section(s) => s.start.0 - s.lead_in.0,
+    }
 }
 
 /// [`context`] with the chart's BPM range `bpm_range` and BPM-change fact
@@ -483,6 +496,7 @@ impl Drawn {
             .into_parts()
             .1;
         let play = skin.prepare_carried(chart, ctx, carry).unwrap();
+        let screen_from = ready_start(ctx);
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
         Self {
             skin,
@@ -509,6 +523,7 @@ impl Drawn {
             input: eval::InputFacts::NONE,
             turntable: 0,
             state_us: 0,
+            screen_from,
             complete: false,
             ring: [0; skin_model::OFFSET_SLOTS],
             ring_count: 0,
@@ -567,6 +582,7 @@ impl Drawn {
         let frame = SkinFrame {
             app: self.app,
             state_us: self.state_us,
+            screen_us: (ms * MS).saturating_sub(self.screen_from),
             now: TimeUs(ms * MS),
             display_offset: self.display_offset,
             tally: &self.tally,

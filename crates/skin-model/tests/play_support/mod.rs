@@ -223,6 +223,15 @@ pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
     }
 }
 
+/// Where READY starts in chart µs for the attempt `ctx` describes: its lead-in
+/// before chart time 0 or before its section's start.
+pub fn ready_start(ctx: &PlayContext<'_>) -> i64 {
+    match ctx.attempt {
+        skin_model::Attempt::Full { lead_in } => -lead_in.0,
+        skin_model::Attempt::Section(s) => s.start.0 - s.lead_in.0,
+    }
+}
+
 /// The readouts of a frame showing `view`: no tempo, hi-speed or duration,
 /// and every cover chosen on, stored at the amount `view` draws (capped
 /// at 1 000), so the frame is consistent.
@@ -399,6 +408,10 @@ pub struct Harness {
     pub turntable: i32,
     /// The state clock each frame gives: by default 0.
     pub state_us: i64,
+    /// The chart time in µs the screen clock starts at: each frame's
+    /// `screen_us` is its `now` less this (`SkinFrame::screen_us`). By
+    /// default READY's start, so an untimed element runs from READY.
+    pub screen_from: i64,
     /// The chart, which [`follow`] reads.
     pub chart: Chart,
     /// The note facts each frame gives, following its effects
@@ -419,6 +432,7 @@ impl Harness {
     pub fn new(skin: Skin, chart: &Chart, ctx: &PlayContext<'_>) -> Self {
         let play = skin.prepare(chart, ctx).unwrap();
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+        let screen_from = ready_start(ctx);
         Self {
             uvs: uvs(&skin),
             skin,
@@ -438,6 +452,7 @@ impl Harness {
             readouts: None,
             turntable: 0,
             state_us: 0,
+            screen_from,
             chart: chart.clone(),
             notes: NoteFacts::new(chart),
             input: eval::InputFacts::NONE,
@@ -481,6 +496,7 @@ impl Harness {
         let frame = SkinFrame {
             app: self.app,
             state_us: self.state_us,
+            screen_us: now_us.saturating_sub(self.screen_from),
             now: TimeUs(now_us),
             display_offset: self.offset,
             tally: &self.tally,

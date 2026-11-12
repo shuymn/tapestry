@@ -326,6 +326,9 @@ fn system_images_charge_the_texel_totals() {
     assert_eq!(MAX_TOTAL_TEXELS, 16 * (4_096 * 3_072));
 }
 
+/// The banner and any other negative id stay dropped; the chart's stage
+/// file and back image (100, 101) are chart images on play
+/// (`import_chart_images.rs`), and generate no image.
 #[test]
 fn other_negative_ids_stay_dropped() {
     let l = import_body(
@@ -340,7 +343,8 @@ fn other_negative_ids_stay_dropped() {
         object: Object::System,
     };
     let r = l.report();
-    assert_eq!(common::kinds(r), [system; 5]);
+    assert_eq!(common::kinds(r), [system; 3]);
+    assert!(l.ok().skin.has_chart_images());
     assert!(r.notes.iter().all(|n| n.severity == Severity::Dropped));
     assert_eq!(r.usage.images, 0);
     assert!(painted(&l, 0).is_empty());
@@ -360,10 +364,10 @@ fn a_lua_skin_draws_system_images() {
          return skin\n",
     )]);
     let imported = common::lua_import(d.path()).unwrap().imported;
-    let system = NoteKind::Unsupported {
-        object: Object::System,
-    };
-    assert_eq!(common::kinds(&imported.report), [system]);
+    // The stage file is a chart image: no note, no image, nothing drawn
+    // with no image published.
+    assert!(common::kinds(&imported.report).is_empty());
+    assert!(imported.skin.has_chart_images());
     assert_eq!(imported.report.usage.images, 2);
     let l = Loaded {
         dir: d,

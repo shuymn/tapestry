@@ -86,6 +86,11 @@ pub struct Survey {
     /// expressions and presentation program run, of
     /// [`skin_model::MAX_SKIN_OPS`], and its program's callbacks.
     pub frame_ops: Option<(usize, usize)>,
+    /// An imported skin's atlas plan in each variant, with the layers it
+    /// keeps and with its chart layer given up, under [`DEVICE_LIMITS`]
+    /// (dev-tools measurement, S10-12 design §4.3).
+    #[cfg(feature = "dev-tools")]
+    pub atlas: Vec<String>,
     /// An imported play skin's declared ending, as read.
     pub play_ending: Option<skin_model::PlayEnding>,
     /// An imported play skin's elements, and how many run on each timer
@@ -93,10 +98,6 @@ pub struct Survey {
     /// for a compiled timer callback, the zero counts left out
     /// (dev-tools).
     pub play_elements: Option<(usize, BTreeMap<String, usize>)>,
-    /// An imported play skin's atlas plan under the player's device
-    /// limits ([`play_atlas`]), one line per variant and kept layers
-    /// (dev-tools).
-    pub play_atlas: Vec<String>,
     /// A result import drawn over [`Choice::result`], when one was given
     /// and the import completed, or a decision import that completed,
     /// drawn over its declared timing ([`decision_frames`]).
@@ -756,10 +757,11 @@ fn runtime_frame(rt: &mut super::runtime::ScreenRuntime, kind: ScreenKind) -> Ru
     }
 }
 
-/// The limits the player's device gives an atlas: the renderer asks wgpu
-/// for its default limits (`DeviceDescriptor::default()`), whose largest
-/// 2D texture side is 8 192 and whose array layers are 256, and keeps one
-/// reserved layer (`render`'s `RESERVED_LAYERS`).
+/// The limits the player's device gives an atlas: the renderer asks
+/// wgpu for its default limits (`render/src/gpu.rs:111`,
+/// `DeviceDescriptor::default()`), whose largest 2D texture side is 8 192
+/// and whose array layers are 256, and keeps one reserved layer
+/// (`render::RESERVED_LAYERS`).
 #[cfg(feature = "dev-tools")]
 pub const DEVICE_LIMITS: skin_model::AtlasLimits = skin_model::AtlasLimits {
     max_side: 8_192,
@@ -767,16 +769,12 @@ pub const DEVICE_LIMITS: skin_model::AtlasLimits = skin_model::AtlasLimits {
     reserved_layers: 1,
 };
 
-/// A play skin's atlas plan in each variant under [`DEVICE_LIMITS`], the
-/// production packing without reading a file ([`Sheet::plan_shape`]):
-/// one line per variant and kept layers, with its side, pages, layers and
-/// level-0 texels as the renderer charges them, against
-/// [`skin_model::MAX_ATLAS_TEXELS`], or the packer's refusal. A skin with
-/// a chart layer gets a second line without it.
-///
-/// [`Sheet::plan_shape`]: skin_model::Sheet::plan_shape
+/// `skin`'s atlas plan in each variant under [`DEVICE_LIMITS`], one line
+/// per variant and kept layers: its side, pages, layers and level-0
+/// texels against [`skin_model::MAX_ATLAS_TEXELS`], or the refusal. A
+/// skin with a chart layer gets a second line without it.
 #[cfg(feature = "dev-tools")]
-fn play_atlas(skin: &skin_model::Skin) -> Vec<String> {
+fn atlas_plans(skin: &skin_model::Skin) -> Vec<String> {
     use skin_model::{KeptLayers, Variant};
     let kept = skin.kept_layers();
     let mut sets = vec![("kept", kept)];
@@ -792,17 +790,19 @@ fn play_atlas(skin: &skin_model::Skin) -> Vec<String> {
     let mut lines = Vec::new();
     for variant in [Variant::Lo, Variant::Hi] {
         for (label, k) in &sets {
-            let head = format!("{variant:?} {label} (text {}, chart {})", k.text, k.chart);
-            lines.push(match skin.sheet().plan_shape(variant, DEVICE_LIMITS, *k) {
+            let shape = skin.sheet().plan_shape(variant, DEVICE_LIMITS, *k);
+            lines.push(match shape {
                 Ok(p) => format!(
-                    "{head}: side {} pages {} layers {} texels {} of {}",
+                    "{variant:?} {label} (text {}, chart {}): side {} pages {} layers {} texels {} of {}",
+                    k.text,
+                    k.chart,
                     p.side,
                     p.pages,
                     p.layers,
                     p.texels,
                     skin_model::MAX_ATLAS_TEXELS
                 ),
-                Err(e) => format!("{head}: refused: {e}"),
+                Err(e) => format!("{variant:?} {label} (text {}, chart {}): refused: {e}", k.text, k.chart),
             });
         }
     }
@@ -844,10 +844,10 @@ fn imported_into(s: &mut Survey, imported: &crate::Imported, kind: ScreenKind, c
     #[cfg(feature = "dev-tools")]
     if kind == ScreenKind::Play {
         s.play_elements = Some(play_elements(&imported.skin));
-        s.play_atlas = play_atlas(&imported.skin);
     }
     #[cfg(feature = "dev-tools")]
     {
+        s.atlas = atlas_plans(&imported.skin);
         s.gauges = imported
             .skin
             .gauge_shapes()

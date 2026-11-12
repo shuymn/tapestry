@@ -5,11 +5,15 @@
 //! opaque black and an opaque white 1×1 region, which become generated
 //! images of that size and colour, drawn as any image is: stretched to
 //! the destination, its colour, alpha and blend applied, following the
-//! covers, and an offset-4 one painting SUDDEN+. The chart's stage file,
-//! back image and banner (100–102) and every other id are dropped, or
-//! refuse the skin when they are failure presentation.
+//! covers, and an offset-4 one painting SUDDEN+. On a play skin, the
+//! chart's stage file and back image (100 and 101) become chart images
+//! (S10-12 design §6): drawn from the chart layer the player writes, their
+//! stretch applied at placement against the image's own size. The banner
+//! (102), 100 and 101 on any other screen, and every other id are dropped,
+//! or refuse the skin when they are failure presentation.
 
 use skin_model::Source;
+use skin_model::chart_image::ChartImage;
 
 use super::super::asset::SYSTEM_SIZE;
 use super::super::policy::Role;
@@ -37,6 +41,17 @@ impl Cx<'_> {
     /// else dropped as unsupported.
     pub(in super::super) fn system(&mut self, dst: Dst, n: i32) -> Result<(), ImportError> {
         let at = dst.span;
+        let chart = match n {
+            -100 => Some(ChartImage::Stage),
+            -101 => Some(ChartImage::Back),
+            _ => None,
+        };
+        if let Some(which) = chart
+            && self.kind == skin_model::ScreenKind::Play
+            && !dst.failure
+        {
+            return self.chart_image(dst, which);
+        }
         let Some(color) = n.checked_neg().and_then(color) else {
             let why = NoteKind::Unsupported {
                 object: Object::System,
@@ -72,6 +87,56 @@ impl Cx<'_> {
         };
         let t = self.model_track(&c, &rects)?;
         self.push_native(c, Source::Image(image), t, native)
+    }
+
+    /// A play destination of the chart's stage file or back image: an
+    /// element of [`Source::ChartImage`], its keys' rects unbaked, as the
+    /// image's size is known only when the player publishes it, and its
+    /// stretch kept for placement. A trimmed stretch is dropped, as a
+    /// system image's is, and an offset-4 one that may reach the lanes too:
+    /// the chart's image is never SUDDEN+'s paint. Charges no image.
+    fn chart_image(&mut self, dst: Dst, which: ChartImage) -> Result<(), ImportError> {
+        let at = dst.span;
+        let (charged, lowered) = self.lowered(&dst)?;
+        let role = super::super::policy::Role::Decorative;
+        if lowered == Lowered::Paint {
+            return self.drop_el(
+                role,
+                at,
+                NoteKind::Unsupported {
+                    object: Object::System,
+                },
+            );
+        }
+        let Some(stretch) = Stretch::of(dst.stretch).chart() else {
+            return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
+        };
+        let Some(c) = self.turning_image_common(&dst, charged, (Lowered::Image, role))? else {
+            return Ok(());
+        };
+        if self.untimed_refused(&c) {
+            return self.drop_el(c.role, at, NoteKind::Timer(TimerWhy::Untimed));
+        }
+        let mut rects = Vec::with_capacity(c.track.keys.len());
+        for k in &c.track.keys {
+            let r = self.key_rect(&c, k)?;
+            rects.push(
+                r.model_from(self.flip)
+                    .ok_or_else(|| self.range(at, "dst"))?,
+            );
+        }
+        let t = self.model_track(&c, &rects)?;
+        let filter = c.filter;
+        self.push_native(
+            c,
+            Source::ChartImage {
+                which,
+                filter,
+                stretch,
+            },
+            t,
+            None,
+        )
     }
 
     /// The system image of `color` for `c` and `c`'s keys baked against
