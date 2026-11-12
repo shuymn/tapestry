@@ -22,16 +22,17 @@
 //!    ([`super::property::Value::critical`]).
 //! 6. A decorative element whose image or font fails: only it is dropped;
 //!    aggregate limits still refuse ([`unsupported`]).
-//! 7. Elements without a timer run on the `screen` timer, which restarts
-//!    at READY; a critical one only with its placement and its colour
-//!    other than alpha the same at every key, so only its presentation
-//!    phase (alpha, its first key, its end, an image cycle without a
-//!    timer) depends on the start, noted (D3, [`untimed_ok`]); an image
-//!    cycle without a timer runs on `screen` under a timed destination
-//!    too, noted on a critical one ([`start_dependent`]). A critical one
-//!    whose placement or other colour does change is admitted only if it
-//!    settles, drawn at its last key from the start, its entrance lost
-//!    and noted (D20, [`settles`]).
+//! 7. Elements without a timer run on the `screen` timer, which in play
+//!    runs from the play state's screen origin through READY into the
+//!    play; a critical one only with its placement and its colour other
+//!    than alpha the same at every key, so only its presentation phase
+//!    (alpha, its first key, its end, an image cycle without a timer)
+//!    depends on the start, noted (D3, [`untimed_ok`]); an image cycle
+//!    without a timer runs on `screen` under a timed destination too,
+//!    noted on a critical one ([`start_dependent`]). A critical one whose
+//!    placement or other colour does change is admitted only if it
+//!    settles, playing its authored keys, noted the same way (D3,
+//!    [`settles`]).
 //! 8. Play-state display differences on decorative elements are accepted
 //!    (D4, [`super::ops`], [`super::property`]).
 //! 9. Text is always drawn with smooth sampling and normal blending (D5).
@@ -229,12 +230,13 @@ pub(crate) fn untimed_ok(track: &Accepted) -> bool {
     track.fixed_but_alpha()
 }
 
-/// Whether a critical element without a timer is held at its last key
-/// from the start (D20): [`untimed_ok`] refuses its track, and that track
-/// shows its last key's values for all later time. That is exactly a hold:
-/// `loop` at the last key, or past it where the source's first key
-/// (`SkinObject.java:365-371, 573-574`) shows the last's values. A `loop`
-/// before the last key repeats and one of -1 hides (`:361-364`).
+/// Whether a critical element without a timer settles (D3): [`untimed_ok`]
+/// refuses its track, and that track shows its last key's values for all
+/// later time, so it plays its authored keys once from the screen's start
+/// and holds the last. That is exactly a hold: `loop` at the last key, or
+/// past it where the source's first key (`SkinObject.java:365-371,
+/// 573-574`) shows the last's values. A `loop` before the last key repeats
+/// and one of -1 hides (`:361-364`).
 pub(crate) fn settles(track: &Accepted) -> bool {
     !untimed_ok(track) && track.end == End::Hold
 }
