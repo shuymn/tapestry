@@ -286,7 +286,7 @@ impl DecisionSide {
     }
 
     /// The bytes the labels hold, the worker's staging included (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dev-tools"))]
     #[must_use]
     pub fn memory(&self) -> render::DecisionMemory {
         self.store.memory(Some(&self.worker))
