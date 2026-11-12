@@ -111,6 +111,37 @@ fn the_slot_holds_the_newest_and_a_left_lifetime_is_never_drawn() {
     link.exit();
 }
 
+/// A selection frame's time and its application readouts are one clock
+/// reading (design.md "Rendering and Skins", play readouts): each frame's
+/// time is its readouts' uptime on the clock started at launch, though the
+/// frame stalls 2 ms after that reading, and the skin's frame is built at
+/// that time, its timers aging on it.
+#[test]
+fn a_selection_frames_time_and_readouts_are_one_reading() {
+    let screens = Installers::default();
+    let link = screens.spawn_bare();
+    let (_dir, skin) = when_bundle();
+    assert_eq!(
+        link.select(ScreenKind::Selection, Some(skin))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    link.shared.selection_stall.store(true, Ordering::Release);
+    link.enter_selection(1);
+    link.show_selection(update(1, 1));
+    assert!(wait_until(|| screens.built.lock().unwrap().len() >= 5));
+    link.exit();
+    let seen = seen(&screens);
+    assert!(seen.len() >= 5);
+    for s in &seen {
+        assert_eq!(s.app.uptime_us, s.now.0, "{s:?}");
+    }
+    for (s, at, _) in screens.built.lock().unwrap().iter() {
+        assert_eq!((*at, s.app.uptime_us), (s.now, at.0));
+    }
+}
+
 /// An update taken while the launch screen shows, whose lifetime ends
 /// during the frame wait in which the launch screen's time runs out, is
 /// never built: the launch screen hands over to selection, and the

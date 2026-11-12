@@ -6,6 +6,7 @@
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
 use crate::JUDGE_CLASS_MAX;
+use crate::play::schema::{FPS_MAX, YEAR_MAX};
 use crate::schema::{Export, Field, FieldTy, Schema, TimerDef};
 
 /// The largest value an integer field reads: one below `i32::MAX`, which a
@@ -39,8 +40,9 @@ const fn timer(name: &'static str) -> TimerDef {
 }
 
 /// The selection screen's state: the cursor's row and the chart under it,
-/// from the selection view; timers from the screen's lifetime and its UI
-/// events.
+/// from the selection view; the settings; the application's readouts,
+/// play's fields of the same names, from each frame; timers from the
+/// screen's lifetime and its UI events.
 pub static SELECTION: Schema = Schema {
     fields: &[
         flag("cursor.chart"),
@@ -86,6 +88,16 @@ pub static SELECTION: Schema = Schema {
         flag("settings.sudden"),
         flag("settings.lift"),
         flag("settings.hidden"),
+        int("app.fps", 0, FPS_MAX),
+        int("clock.year", 0, YEAR_MAX),
+        int("clock.month", 0, 12),
+        int("clock.day", 0, 31),
+        int("clock.hour", 0, 23),
+        int("clock.minute", 0, 59),
+        int("clock.second", 0, 59),
+        int("app.uptime_h", 0, i32::MAX),
+        int("app.uptime_m", 0, 59),
+        int("app.uptime_s", 0, 59),
     ],
     timers: &[
         timer("screen"),
@@ -158,8 +170,10 @@ pub mod field {
     /// chart row.
     pub const SELECTED_JUDGE_CLASS: u16 = 25;
     pub const SELECTED_JUDGE_CLASS_VALID: u16 = 26;
-    /// The settings' fields, from here on, which a view leaves as they are
-    /// ([`SelectionSettings`](crate::SelectionSettings)).
+    /// The settings' fields, then the application's readouts, from here
+    /// on, which a view leaves as they are
+    /// ([`SelectionSettings`](crate::SelectionSettings),
+    /// [`SelectionFrame::app`](crate::SelectionFrame::app)).
     pub const SETTINGS: u16 = 27;
     /// The display offset in whole ms.
     pub const SETTINGS_DISPLAY_OFFSET: u16 = 27;
@@ -184,8 +198,19 @@ pub mod field {
     pub const SETTINGS_SUDDEN: u16 = 35;
     pub const SETTINGS_LIFT: u16 = 36;
     pub const SETTINGS_HIDDEN: u16 = 37;
+    /// The application's readouts of the frame
+    /// ([`SelectionFrame::app`](crate::SelectionFrame::app)), as play's
+    /// fields of the same names, after the settings: the frames presented
+    /// in the last second, the local year, month (1 to 12), day, 24-hour
+    /// hour, minute and second, then the uptime's whole hours (unwrapped),
+    /// its minutes within the hour and its seconds within the minute.
+    pub const APP_FPS: u16 = SETTINGS_HIDDEN + 1;
+    pub const CLOCK_YEAR: u16 = APP_FPS + 1;
+    pub const CLOCK_SECOND: u16 = APP_FPS + 6;
+    pub const APP_UPTIME_H: u16 = APP_FPS + 7;
+    pub const APP_UPTIME_S: u16 = APP_FPS + 9;
     /// The number of fields.
-    pub const COUNT: usize = 38;
+    pub const COUNT: usize = APP_UPTIME_S as usize + 1;
 }
 
 /// The built-in timer slots of [`SELECTION`]; `when` timers follow from
@@ -224,6 +249,11 @@ mod tests {
             (field::SETTINGS_GREEN, "settings.green"),
             (field::SETTINGS_ORDER, "settings.order"),
             (field::SETTINGS_HIDDEN, "settings.hidden"),
+            (field::APP_FPS, "app.fps"),
+            (field::CLOCK_YEAR, "clock.year"),
+            (field::CLOCK_SECOND, "clock.second"),
+            (field::APP_UPTIME_H, "app.uptime_h"),
+            (field::APP_UPTIME_S, "app.uptime_s"),
         ] {
             assert_eq!(names[usize::from(slot)], name);
         }
@@ -232,5 +262,15 @@ mod tests {
             "select.change"
         );
         assert_eq!(SELECTION.timers[usize::from(timer::PANEL3)].name, "panel3");
+        // The application's readouts read as play's fields of the same
+        // names, with the same ranges.
+        for f in SELECTION
+            .fields
+            .get(usize::from(field::APP_FPS)..=usize::from(field::APP_UPTIME_S))
+            .unwrap()
+        {
+            let (_, play) = crate::PLAY.field(f.name).unwrap();
+            assert_eq!(f.ty, play.ty, "{}", f.name);
+        }
     }
 }

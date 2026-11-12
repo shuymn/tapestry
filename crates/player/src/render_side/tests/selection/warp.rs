@@ -103,12 +103,15 @@ impl Gate {
 /// new device), whose next selection frame is reported not presented while
 /// `skip` is set (as the renderer skips an offscreen frame whose previous
 /// frame the GPU has not done in time, a slow WARP on a loaded machine),
-/// and whose frames `gate` paces.
+/// and whose frames `gate` paces. While `bad_month` is set, its next
+/// selection frame is given readouts whose month is 13, out of its
+/// field's range.
 struct Lossy {
     menu: MenuScreen,
     lose: Arc<AtomicBool>,
     skip: Arc<AtomicBool>,
     gate: Arc<Gate>,
+    bad_month: Arc<AtomicBool>,
 }
 
 impl Screen for Lossy {
@@ -191,11 +194,15 @@ impl Screen for Lossy {
         logic: Option<&mut crate::selection_skin::SelectionLogic>,
         changed: bool,
         now: bms_model::TimeUs,
+        mut app: skin_model::AppReadouts,
     ) -> Result<crate::selection_skin::SelectionDrawn, render::RenderError> {
         if self.lose.swap(false, Ordering::AcqRel) {
             return Err(render::RenderError::SurfaceLost);
         }
-        let mut drawn = self.menu.selection(update, logic, changed, now)?;
+        if logic.is_some() && self.bad_month.swap(false, Ordering::AcqRel) {
+            app.local.month = 13;
+        }
+        let mut drawn = self.menu.selection(update, logic, changed, now, app)?;
         if self.skip.swap(false, Ordering::AcqRel) {
             drawn.timing.presented = false;
         }
@@ -240,6 +247,16 @@ fn warp_link(fault: Option<bool>) -> (RenderLink, Frames) {
 
 /// [`warp_link`] on [`Lossy`] screens, with their `lose` and `skip` flags.
 fn lossy_link(fault: Option<bool>) -> (RenderLink, Frames, Arc<AtomicBool>, Arc<AtomicBool>) {
+    lossy_link_with(fault, &Arc::default())
+}
+
+/// [`lossy_link`], its screens' selection frames given readouts out of
+/// range while `bad_month` is set.
+fn lossy_link_with(
+    fault: Option<bool>,
+    bad_month: &Arc<AtomicBool>,
+) -> (RenderLink, Frames, Arc<AtomicBool>, Arc<AtomicBool>) {
+    let bad_month = Arc::clone(bad_month);
     let lose = Arc::new(AtomicBool::new(false));
     let flag = Arc::clone(&lose);
     let skip = Arc::new(AtomicBool::new(false));
@@ -263,6 +280,7 @@ fn lossy_link(fault: Option<bool>) -> (RenderLink, Frames, Arc<AtomicBool>, Arc<
             lose: Arc::clone(&flag),
             skip: Arc::clone(&skipping),
             gate: Arc::default(),
+            bad_month: Arc::clone(&bad_month),
         }) as Box<dyn Screen>)
     });
     let frames = Frames::default();
@@ -490,6 +508,51 @@ fn a_refused_selection_frame_or_text_falls_back_for_the_run() {
     }
 }
 
+/// A readout out of its field's range (month 13) refuses the selection
+/// frame on the production path: the frame presents the page, the refusal
+/// says why, and from then on the page draws, the skin gone for the run.
+#[test]
+fn an_invalid_readout_falls_back_for_the_run() {
+    let (_dir, skin) = skin();
+    let bad = Arc::new(AtomicBool::new(true));
+    let (link, frames, ..) = lossy_link_with(None, &bad);
+    assert_eq!(
+        link.select(ScreenKind::Selection, Some(skin))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    link.enter_selection(1);
+    link.show_selection(with_page(1));
+    let why = Mutex::new(None);
+    assert!(wait_until(|| {
+        let mut why = why.lock().unwrap();
+        if why.is_none() {
+            *why = link.take_selection_refusal();
+        }
+        why.is_some()
+    }));
+    let why = why.into_inner().unwrap().unwrap();
+    assert!(
+        why.contains(&skin_model::BuildError::InvalidReadouts.to_string()),
+        "{why}"
+    );
+    assert!(!bad.load(Ordering::Acquire));
+    assert!(wait_until(|| !frames.0.lock().unwrap().is_empty()));
+    let (quads, _, _, presented, lit, _) = frames.0.lock().unwrap()[0].clone();
+    assert!(presented);
+    assert_eq!(quads, None);
+    assert!(lit.is_some_and(|n| n > 500), "{lit:?}");
+    let drawn = frames.0.lock().unwrap().len();
+    assert!(wait_until(|| frames.0.lock().unwrap().len() > drawn + 2));
+    assert!(
+        frames.0.lock().unwrap()[drawn..]
+            .iter()
+            .all(|(q, ..)| q.is_none())
+    );
+    link.exit();
+}
+
 /// The select screen frames a script's `drawn` step counts are the
 /// presented ones only: a frame skipped behind a slow GPU shows nothing,
 /// so a frame dump waiting on it would have nothing to write.
@@ -583,6 +646,7 @@ fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
                 lose: Arc::default(),
                 skip: Arc::default(),
                 gate: Arc::clone(&paced),
+                bad_month: Arc::default(),
             }) as Box<dyn Screen>)
         });
         let clock = QpcClock::start();
