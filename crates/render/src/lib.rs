@@ -88,7 +88,7 @@ pub use renderer::take_build_start;
 pub use renderer::{
     Admission, ChartOutcome, ChartTarget, CommitError, FrameTiming, LoadingTextError,
     LoadingTextKey, MAX_SPRITES, MemoryWitness, PreparedToken, RESULT_STRIP_SPRITES, RenderError,
-    Renderer, SHARED_TEXELS, STRIP_SPRITES, Target, VM_TEXELS, letterbox,
+    Renderer, ResultChartTarget, SHARED_TEXELS, STRIP_SPRITES, Target, VM_TEXELS, letterbox,
 };
 pub use simple::{
     RESULT_CELL_COLUMN, RESULT_GAUGE_ROW, SimpleSkin, layout, result_graphs, result_screen,

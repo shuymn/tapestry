@@ -18,10 +18,12 @@ use skin_beatoraja::{
     Cancel, Config, Fact, FactDeps, ImportFacts, JudgeClass, LuaHeader, LuaOutcome,
 };
 use skin_model::{
-    Atlas, AtlasId, BestFigures, BestRate, BestView, FileSource, LampKey, Layout, ResourceCache,
-    ResultChart, ResultFields, ResultNumber, ResultRate, ResultScore, ResultStatus, ResultView,
-    Root, ScreenKind, Sheet, TimingStats, Variant,
+    Atlas, AtlasId, BestFigures, BestRate, BestView, FileSource, ImageFacts, KeptLayers, LampKey,
+    Layout, ResourceCache, ResultChart, ResultFields, ResultNumber, ResultRate, ResultScore,
+    ResultStatus, ResultView, Root, ScreenKind, Sheet, TimingStats, Variant,
 };
+
+use crate::chart_images::{ChartImages, Sources};
 
 use crate::imports::{self, ImportTarget, Job, Ran};
 use crate::screens::{ScriptGen, ScriptPermit, ScriptSlot, Scripts};
@@ -110,6 +112,44 @@ struct Specialized {
     entry: Option<Arc<ImageEntry>>,
     /// Its runtime's generation, once offered; reused only while live.
     script: Option<ScriptGen>,
+    /// The chart's images derived for its chart slot by its layout job,
+    /// when that slot differs from the result half's, with the id of the
+    /// sources they came from: it lives no longer than its atlas.
+    derived: Option<(u64, Arc<ChartImages>)>,
+}
+
+/// What a layout job derives the chart's images from: the attempt's
+/// sources, and the result half's chart layer side, which needs no
+/// derivation.
+#[derive(Clone, Debug)]
+struct ChartFrom {
+    sources: Arc<Sources>,
+    side: Option<u32>,
+}
+
+/// The attempt's images the result draws: its sources, and its
+/// result half, handed over at the attempt's commit.
+#[derive(Debug)]
+struct HeldImages {
+    sources: Arc<Sources>,
+    half: Option<Arc<ChartImages>>,
+    /// The chart layer side the half is derived for.
+    side: Option<u32>,
+}
+
+/// The chart's facts a result view carries but its images'
+/// availability, which only the attempt's facts stage resolves: no
+/// result import, probe or view sees them before
+/// ([`PendingChart::resolved`]).
+#[derive(Clone, Copy, Debug)]
+pub struct PendingChart(ResultChart);
+
+impl PendingChart {
+    /// The chart's facts with its images' resolved availability.
+    #[must_use]
+    pub const fn resolved(self, images: ImageFacts) -> ResultChart {
+        ResultChart { images, ..self.0 }
+    }
 }
 
 /// Why a layout gave no specialization.
@@ -249,6 +289,9 @@ pub struct ResultSkin {
     /// thread, [`crate::controls::Controls::game_thread`]): a switch's
     /// layout lands then, not at the end of the game thread's idle wait.
     wake: Option<std::thread::Thread>,
+    /// The committed attempt's images: replaced at the next commit,
+    /// dropped at selection's and practice's entry.
+    images: Option<HeldImages>,
 }
 
 impl std::fmt::Debug for ResultSkin {
@@ -434,7 +477,7 @@ fn lock(slot: &Slot) -> MutexGuard<'_, Option<Images>> {
 struct Needs {
     sheet: Sheet,
     variant: Variant,
-    text: bool,
+    kept: KeptLayers,
 }
 
 impl Needs {
@@ -442,7 +485,7 @@ impl Needs {
     fn held_by(&self, entry: &ImageEntry) -> bool {
         entry
             .atlas
-            .rebind(&self.sheet, self.variant, self.text)
+            .rebind_keeping(&self.sheet, self.variant, self.kept)
             .is_ok()
     }
 }
@@ -484,6 +527,7 @@ fn layout(
     others: Vec<AtlasId>,
     cancel: &Cancel,
     permit: Option<ScriptPermit>,
+    chart: Option<&ChartFrom>,
 ) -> (Laid, ScriptSlot) {
     #[cfg(all(test, feature = "dev-tools"))]
     tests::layout_starts();
@@ -521,7 +565,22 @@ fn layout(
         }
     };
     let script = ScriptSlot::staged_with(imported.runtime.take(), permit);
-    let laid = lay_out(pending, imported, slot, base, others, cancel);
+    let mut laid = lay_out(pending, imported, slot, base, others, cancel);
+    // A chart slot the result half does not fit: the images derived from
+    // the attempt's sources at its size, here, off the game thread.
+    if let (Ok(spec), Some(chart)) = (&mut laid.result, chart)
+        && spec.bundle.chart_layer().is_some()
+        && Some(spec.bundle.side()) != chart.side
+    {
+        let derived = crate::chart_images::derive_set(&chart.sources, spec.bundle.side(), &|| {
+            cancel.is_cancelled()
+        });
+        // A derivation that failed is not kept with the layout: the layout
+        // is laid out again (and derives again) when it is asked for.
+        if let Some(derived) = derived {
+            spec.derived = Some((chart.sources.id(), Arc::new(derived)));
+        }
+    }
     // A layout that gave no specialization keeps no runtime: it goes here,
     // on the job's thread.
     let script = if laid.result.is_ok() {
@@ -543,14 +602,14 @@ fn lay_out(
     cancel: &Cancel,
 ) -> Laid {
     let deps = imported.facts;
-    let skin = imported.imported.skin;
+    let mut skin = imported.imported.skin;
     let scratch = imported.imported.scratch;
     let variant = skin.variant(pending.target.size, &Layout::AUTHOR);
-    let text = skin.has_outline_text();
+    let (kept, _) = imports::plan_layers(&mut skin, variant, pending.target.limits);
     let entry = lock(slot).as_ref().and_then(|i| i.entry.clone());
     let held = entry
         .as_ref()
-        .and_then(|e| e.atlas.rebind(skin.sheet(), variant, text).ok());
+        .and_then(|e| e.atlas.rebind_keeping(skin.sheet(), variant, kept).ok());
     let (atlas, entry, taken) = match held {
         Some(atlas) => (atlas, entry, None),
         None => {
@@ -574,10 +633,10 @@ fn lay_out(
                 }
                 match union
                     .filter(|_| earlier)
-                    .filter(|u| u.plan(variant, limits, text).is_ok())
+                    .filter(|u| u.plan_keeping(variant, limits, kept).is_ok())
                 {
                     Some(u) => u,
-                    None if skin.sheet().plan(variant, limits, text).is_ok() => {
+                    None if skin.sheet().plan_keeping(variant, limits, kept).is_ok() => {
                         skin.sheet().clone()
                     }
                     None => {
@@ -599,26 +658,26 @@ fn lay_out(
                     needs: None,
                 };
             }
-            let kept = images.cells;
+            let kept_cells = images.cells;
             drop(images.entry);
             #[cfg(all(test, feature = "dev-tools"))]
             tests::build_gate(cancel);
             #[cfg(any(test, feature = "dev-tools"))]
             BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            let built =
-                match packed.atlas_reserving(variant, limits, text, &|| cancel.is_cancelled()) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        return Laid {
-                            result: Err(format!("the atlas cannot be built: {e}").into()),
-                            taken: Some(Images {
-                                cells: kept,
-                                ..Images::default()
-                            }),
-                            needs: None,
-                        };
-                    }
-                };
+            let built = match packed.atlas_keeping(variant, limits, kept, &|| cancel.is_cancelled())
+            {
+                Ok(a) => a,
+                Err(e) => {
+                    return Laid {
+                        result: Err(format!("the atlas cannot be built: {e}").into()),
+                        taken: Some(Images {
+                            cells: kept_cells,
+                            ..Images::default()
+                        }),
+                        needs: None,
+                    };
+                }
+            };
             let new = Arc::new(ImageEntry {
                 atlas: built,
                 packed,
@@ -627,7 +686,7 @@ fn lay_out(
                 entry: Some(Arc::clone(&new)),
                 ..Images::default()
             });
-            match new.atlas.rebind(skin.sheet(), variant, text) {
+            match new.atlas.rebind_keeping(skin.sheet(), variant, kept) {
                 Ok(a) => (a, Some(new), taken),
                 Err(e) => {
                     return Laid {
@@ -642,7 +701,7 @@ fn lay_out(
     let needs = Needs {
         sheet: skin.sheet().clone(),
         variant,
-        text,
+        kept,
     };
     let result = imports::bundle_of(skin, scratch, atlas, &pending.target, cancel)
         .map(|bundle| Specialized {
@@ -650,6 +709,7 @@ fn lay_out(
             facts: deps,
             entry,
             script: None,
+            derived: None,
         })
         .map_err(Unbuilt::from);
     Laid {
@@ -720,6 +780,123 @@ impl ResultSkin {
         {
             self.layout_for(request, view);
         }
+    }
+
+    /// The committed attempt's images, from its commit on: its
+    /// sources and its result half, replacing the last attempt's.
+    pub fn take_images(&mut self, images: Option<crate::chart_images::ResultImages>) {
+        self.images = images.map(|i| HeldImages {
+            sources: i.sources,
+            half: i.half,
+            side: i.side,
+        });
+        log::info!(
+            "chart images: the result keeps {} bytes",
+            self.image_bytes()
+        );
+    }
+
+    /// The attempt's images go: selection or practice is entered.
+    ///
+    /// The one exit of every image the result keeps: the sources and the
+    /// result half, and each kept layout's derivation (a layout kept for
+    /// reuse keeps its bundle and facts, and derives again if it is
+    /// reused with other images).
+    pub fn drop_images(&mut self) {
+        self.images = None;
+        for l in self.layout.iter_mut().chain(self.presented.iter_mut()) {
+            l.derived = None;
+        }
+    }
+
+    /// The bytes of the images it keeps: the sources, the result half and
+    /// the layouts' derivations, each once (the memory witness).
+    #[must_use]
+    pub fn image_bytes(&self) -> u64 {
+        let mut seen: Vec<&Arc<ChartImages>> = Vec::new();
+        let sets = self
+            .images
+            .iter()
+            .flat_map(|h| std::iter::once(&h.sources).chain(h.half.as_ref()))
+            .chain(
+                self.layout
+                    .iter()
+                    .chain(&self.presented)
+                    .filter_map(|l| l.derived.as_ref().map(|(_, d)| d)),
+            );
+        let mut total = 0_u64;
+        for s in sets {
+            if !seen.iter().any(|k| Arc::ptr_eq(k, s)) {
+                total = total.saturating_add(s.bytes());
+                seen.push(s);
+            }
+        }
+        total
+    }
+
+    /// The chart layer side the attempt's result half is derived for:
+    /// a bundle for every view's, else the prepared atlas's, when
+    /// it keeps a chart layer; `None` otherwise (a layout then derives
+    /// its own from the sources).
+    #[must_use]
+    pub fn chart_side(&self) -> Option<u32> {
+        match &self.attempt {
+            Some(ForAttempt::Every(b, _, _)) => b.chart_layer().map(|_| b.side()),
+            Some(ForAttempt::Pending) => self
+                .image
+                .as_ref()
+                .filter(|e| e.atlas.chart_layer().is_some())
+                .map(|e| e.atlas.side()),
+            Some(ForAttempt::BuiltIn) | None => None,
+        }
+    }
+
+    /// The chart's images a payload of `bundle` draws: the result half
+    /// when it is fitted for `bundle`'s chart slot, else the derivation
+    /// its layout made from this attempt's sources; `None` for a bundle
+    /// with no chart layer, or before the attempt's commit. The one
+    /// function a payload, a view's reuse and an attempt's reuse take a
+    /// fit from.
+    #[must_use]
+    pub fn chart_for(&self, bundle: &Arc<SkinBundle>) -> Option<Arc<ChartImages>> {
+        let held = self.images.as_ref()?;
+        bundle.chart_layer()?;
+        let side = bundle.side();
+        if held.side == Some(side)
+            && let Some(h) = &held.half
+        {
+            return Some(Arc::clone(h));
+        }
+        self.layout
+            .iter()
+            .chain(&self.presented)
+            .find(|l| Arc::ptr_eq(&l.bundle, bundle))
+            .and_then(|l| l.derived.as_ref())
+            .filter(|(id, _)| *id == held.sources.id())
+            .map(|(_, d)| Arc::clone(d))
+    }
+
+    /// Whether `l`'s images are this attempt's: it keeps no chart layer,
+    /// the attempt's images are not handed over yet, the result half fits
+    /// its slot, or its derivation is of these sources.
+    fn chart_ready(&self, l: &Specialized) -> bool {
+        let Some(held) = &self.images else {
+            return true;
+        };
+        l.bundle.chart_layer().is_none()
+            || held.side == Some(l.bundle.side())
+            || l.derived
+                .as_ref()
+                .is_some_and(|(id, _)| *id == held.sources.id())
+    }
+
+    /// What a layout job derives from: the attempt's sources and the
+    /// result half's side.
+    fn chart_from(&self) -> Option<ChartFrom> {
+        self.images.as_ref().map(|h| ChartFrom {
+            sources: Arc::clone(&h.sources),
+            side: h.side,
+        })
     }
 
     /// The published generation's prepared atlas.
@@ -885,10 +1062,11 @@ impl ResultSkin {
                     // one bundle for every view, packed as any kind's
                     // once its plan fits and what is not shown is
                     // released; with no room, laid out per view.
-                    let skin = i.imported.skin;
+                    let mut skin = i.imported.skin;
                     let variant = skin.variant(pending.target.size, &Layout::AUTHOR);
                     let limits = pending.target.limits;
-                    if let Err(e) = skin.sheet().plan(variant, limits, skin.has_outline_text()) {
+                    let (kept, _) = imports::plan_layers(&mut skin, variant, limits);
+                    if let Err(e) = skin.sheet().plan_keeping(variant, limits, kept) {
                         return (
                             Some(Err(format!("the atlas cannot be built: {e}"))),
                             deps,
@@ -930,6 +1108,7 @@ impl ResultSkin {
                         base,
                         others,
                         cancel,
+                        None,
                         None,
                     );
                     // The probe's layout is never shown: its atlas is.
@@ -1023,6 +1202,7 @@ impl ResultSkin {
                             facts: deps,
                             entry: None,
                             script,
+                            derived: None,
                         });
                         self.probe = None;
                     }
@@ -1125,6 +1305,7 @@ impl ResultSkin {
         let base = self.shown_entry();
         let others = self.others();
         let class = self.class;
+        let chart = self.chart_from();
         // The game thread, woken once the outcome is in.
         let wake = self.wake.clone();
         match imports::spawn_job_with(
@@ -1138,6 +1319,7 @@ impl ResultSkin {
                     others,
                     cancel,
                     Some(permit),
+                    chart.as_ref(),
                 );
                 LayoutOut {
                     request,
@@ -1214,6 +1396,8 @@ impl ResultSkin {
             .iter()
             .chain(self.presented.iter().filter(|l| self.protected(l.script)))
             .filter(|l| self.scripts.result_live(l.script))
+            // A layout whose images are of other sources: laid out again.
+            .filter(|l| self.chart_ready(l))
             .find(|l| match view.0 {
                 Some(fields) => l.facts.holds(&result_facts(fields, self.class)),
                 None => {
@@ -1492,12 +1676,12 @@ impl Drop for ResultSkin {
 /// 1163-1164); its judged notes (number 74), which a view replaces with
 /// its own; and its judgment class (options 180-184), [`attempt_class`],
 /// the same in every view.
-pub fn attempt_chart(loaded: &game::Loaded) -> ResultChart {
+pub fn attempt_chart(loaded: &game::Loaded) -> PendingChart {
     let attempt = loaded.attempt();
     let labels = &attempt.labels;
     let difficulty = crate::imports::facts::difficulty_of(&labels.difficulty);
     let tempo = attempt.tempo.meta();
-    ResultChart {
+    PendingChart(ResultChart {
         level: Some(crate::imports::facts::level_of(&labels.playlevel)),
         total: u32::try_from(attempt.song_total).ok(),
         bpm: crate::attempt_context::bpm_range(tempo).map(|r| skin_model::ResultBpm {
@@ -1509,7 +1693,8 @@ pub fn attempt_chart(loaded: &game::Loaded) -> ResultChart {
         length: Some(loaded.chart().meta.length),
         notes: Some(game::ResultBasis::of(loaded.chart(), None).notes),
         judge_class: attempt_class(loaded).map(JudgeClass::index),
-    }
+        images: ImageFacts::default(),
+    })
 }
 
 /// The judgment class of the chart at `loaded` (options 180-184), as the
@@ -1525,5 +1710,7 @@ pub fn view_facts(screen: &game::ResultScreen, chart: ResultChart) -> ViewFacts 
     ViewFacts((view.status == ResultStatus::Ready).then(|| ResultFields::of(&view)))
 }
 
+#[cfg(all(test, feature = "dev-tools"))]
+mod chart_tests;
 #[cfg(all(test, feature = "dev-tools"))]
 pub(crate) mod tests;

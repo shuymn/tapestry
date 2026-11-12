@@ -2151,6 +2151,16 @@ impl PlayerRig<'_> {
         );
     }
 
+    /// The script whose steps run on the result shown (dev-tools):
+    /// selection's, else the direct play's.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn result_steps(&self) -> Option<&crate::dev::SelectScript> {
+        self.selection
+            .as_ref()
+            .and_then(|s| s.script.as_ref())
+            .or(self.result_script.as_ref())
+    }
+
     /// A result begins (dev-tools): a new identity, numbered after every
     /// earlier one, for the play it follows; one still current is left
     /// first (a result withdrawn before it showed). Its steps run afresh.
@@ -3164,6 +3174,10 @@ impl AppRig for PlayerRig<'_> {
         // (dev-tools).
         #[cfg(feature = "dev-tools")]
         self.finish_result(crate::dev::scenario::Leaving::Left);
+        // The last chart's images go: nothing of them stays beside
+        // selection.
+        self.chart_images.drop_images();
+        self.result_skin.drop_images();
         // Another scene: held adjustment controls act no more until
         // pressed afresh.
         self.enter_scene();
@@ -3274,6 +3288,9 @@ impl AppRig for PlayerRig<'_> {
         // A result left for the practice page (dev-tools).
         #[cfg(feature = "dev-tools")]
         self.finish_result(crate::dev::scenario::Leaving::Left);
+        // The result's images go; the worker's sources stay, the practice
+        // Start's candidates.
+        self.result_skin.drop_images();
         self.enter_scene();
         self.render.leave_selection();
         recover(

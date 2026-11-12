@@ -883,6 +883,15 @@ impl Screen for MenuScreen {
         self.renderer.publish_chart_absent(target)
     }
 
+    fn write_result_chart(
+        &mut self,
+        target: render::ResultChartTarget,
+        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        set: u64,
+    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+        self.renderer.write_result_chart(target, images, set)
+    }
+
     fn invalidate_chart_images(&mut self) {
         self.renderer.invalidate_chart_images();
     }
