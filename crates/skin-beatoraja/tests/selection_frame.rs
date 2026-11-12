@@ -1012,3 +1012,51 @@ fn the_settings_draw_the_players_values_through_the_production_path() {
         (Some(&"501".to_owned()), Some(&"301".to_owned()))
     );
 }
+
+/// The judgment class options on selection, in the shapes real skins use
+/// (`op` 5 or 2 with one of 180 to 184) and bare: drawn only on a chart row
+/// of their class; 180 not on a chart whose class is unknown, nor on a
+/// folder row; a negated -181 on every row but a class-1 chart.
+#[test]
+fn the_judgment_class_options_read_the_selected_charts_class() {
+    let ops = ["5, 180", "2, 181", "180", "-181"];
+    let dsts: Vec<String> = ops
+        .iter()
+        .enumerate()
+        .map(|(i, op)| {
+            format!(
+                r#"{{"id": "dot", "op": [{op}], "dst": [{}]}}"#,
+                at(10 * i as i32, 1000, 8, 8)
+            )
+        })
+        .collect();
+    let d = folder(&minimal(&format!(
+        r#""destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}, {}]"#,
+        dsts.join(",")
+    )));
+    let mut s = Sel::of(d.path());
+    let shown = |s: &mut Sel| -> Vec<usize> {
+        s.drawn(0)
+            .into_iter()
+            .filter(|(t, _)| *t == DOT)
+            .map(|(_, r)| (r[0] / 10.0) as usize)
+            .collect()
+    };
+    for (class, want) in [
+        (Some(0), vec![0, 2, 3]),
+        (Some(1), vec![1]),
+        (None, vec![3]),
+    ] {
+        let mut v = view(vec![chart("a"), folder_row("f", 3)], Some(0), None, None);
+        v.selected.as_mut().unwrap().judge_class = class;
+        s.view(&v);
+        assert_eq!(shown(&mut s), want, "{class:?}");
+    }
+    s.view(&view(
+        vec![chart("a"), folder_row("f", 3)],
+        Some(1),
+        None,
+        None,
+    ));
+    assert_eq!(shown(&mut s), [3], "a folder row");
+}

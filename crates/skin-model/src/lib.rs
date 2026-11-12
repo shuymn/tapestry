@@ -216,8 +216,8 @@ pub use selection::{
 };
 pub use skin::{
     DecisionDefs, ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS,
-    MAX_WIDGET_QUADS, PlayDefs, ResultDefs, SelectionDefs, SelectionRequests, Skin, SkinDef,
-    Source, TimerRef, VisualizerError, WidgetDefs,
+    MAX_WIDGET_QUADS, PlayDefs, PlayEnding, ResultDefs, SelectionDefs, SelectionRequests, Skin,
+    SkinDef, Source, TimerRef, VisualizerError, WidgetDefs,
 };
 pub use track::{
     Ease, End, KeyDef, MAX_GEOMETRY, MAX_KEY_US, MAX_TRACK_KEYS, Prop, Sample, Track, TrackError,
