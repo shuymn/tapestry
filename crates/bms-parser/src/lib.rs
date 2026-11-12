@@ -305,6 +305,11 @@ pub struct Scanned {
     pub listing: Listing,
     /// The seed-0 branch's summary, or why it is refused.
     pub summary: Result<ChartSummary, LoadError>,
+    /// The seed-0 branch's judgment-header declarations, in file order
+    /// ([`ChartMeta::judgment_headers`](bms_model::ChartMeta::judgment_headers)),
+    /// which a song list reads the chart's rank from; none when the branch
+    /// is refused.
+    pub judgment_headers: Vec<bms_model::JudgmentHeader>,
 }
 
 /// Reads what a song list stores of a chart: [`read_listing`] and
@@ -319,9 +324,17 @@ pub fn read_scanned(bytes: &[u8], limits: &Limits) -> Result<Scanned, LoadError>
         return Err(LoadError::FileTooLarge { bytes: bytes.len() });
     }
     let text = decode(bytes, &mut Vec::new());
+    let (summary, judgment_headers) = match built_at_1x(&text, limits) {
+        Ok(loaded) => {
+            let summary = ChartSummary::of(&loaded.chart);
+            (Ok(summary), loaded.chart.meta.judgment_headers)
+        }
+        Err(e) => (Err(e), Vec::new()),
+    };
     Ok(Scanned {
         listing: header::listing(&text),
-        summary: summary_of(&text, limits),
+        summary,
+        judgment_headers,
     })
 }
 
@@ -342,11 +355,16 @@ pub fn summarize(bytes: &[u8], limits: &Limits) -> Result<ChartSummary, LoadErro
 }
 
 fn summary_of(text: &str, limits: &Limits) -> Result<ChartSummary, LoadError> {
+    built_at_1x(text, limits).map(|loaded| ChartSummary::of(&loaded.chart))
+}
+
+/// The seed-0 branch at 1×, with no file system ([`summarize`]).
+fn built_at_1x(text: &str, limits: &Limits) -> Result<Loaded, LoadError> {
     let opts = LoadOptions {
         limits: *limits,
         ..LoadOptions::default()
     };
-    build(text, None, &opts, Vec::new()).map(|loaded| ChartSummary::of(&loaded.chart))
+    build(text, None, &opts, Vec::new())
 }
 
 /// [`load_bms`]'s pipeline over the decoded `text`. `files` gives the file's

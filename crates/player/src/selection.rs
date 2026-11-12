@@ -3122,6 +3122,7 @@ pub(crate) mod tests {
             random: false,
             bga,
             summary: None,
+            rank: None,
         }
     }
 

@@ -90,8 +90,8 @@ pub use keys::{
     LearntRange, Press, ROLES, Refusal, SETTLE_TIME, capture_keys, capture_keys_within,
 };
 pub use live::{
-    CLOSE_FLOOR, Closing, ClosingEnd, InputWaitError, Leave, LiveError, Opening, Outro, Polled,
-    Rearm, ResultTiming, Rig, closing_deadline, closing_time, gated,
+    CLOSE_FLOOR, Closing, ClosingEnd, InputWaitError, Leave, LiveError, Opening, Outro, PlayEnding,
+    Polled, Rearm, ResultTiming, Rig, closing_deadline, closing_time, gated,
 };
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,
