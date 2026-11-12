@@ -863,6 +863,41 @@ mod tests {
         assert!(!out.contains("no chart layer"), "{out}");
     }
 
+    /// An element on a compiled timer callback counts under `program`,
+    /// apart from built-in and `when` timers, and the total counts it.
+    #[test]
+    fn a_compiled_timer_callback_counts_as_program() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(
+            d.path().join("s.luaskin"),
+            "local skin = { type = 0, name = \"t\", w = 1920, h = 1080 }\n\
+             if not skin_config then return skin end\n\
+             local state = 5000000\n\
+             local function timer() state = state return state end\n\
+             skin.destination = {\n\
+               { id = -110, timer = 3, dst = { { w = 64, h = 64 } } },\n\
+               { id = -110, timer = timer, dst = { { w = 64, h = 64 } } },\n\
+               { id = -110, timer = timer, dst = { { w = 32, h = 32 } } },\n\
+               { id = -110, dst = { { w = 16, h = 16 } } },\n\
+             }\n\
+             return skin\n",
+        )
+        .unwrap();
+        let s = survey_with(
+            d.path(),
+            "s.luaskin",
+            &ImportFacts::unavailable(ScreenKind::Play),
+            &Cancel::new(),
+            false,
+            &Choice::default(),
+        );
+        let out = report(0, &s);
+        assert!(
+            out.contains("\n  elements: 4 (timers: failed 1, program 2, screen 1)\n"),
+            "{out}"
+        );
+    }
+
     #[test]
     fn local_detail_lists_the_configuration_and_each_destination() {
         let s = Survey {
