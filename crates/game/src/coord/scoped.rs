@@ -67,6 +67,8 @@ pub struct Spawner {
     refused: &'static [JobKind],
     /// Kinds refused for owned jobs only.
     refused_owned: &'static [JobKind],
+    /// More kinds refused for owned jobs only ([`Self::also_refusing_owned`]).
+    refused_owned_also: &'static [JobKind],
 }
 
 impl Spawner {
@@ -74,6 +76,7 @@ impl Spawner {
     pub const SYSTEM: Self = Self {
         refused: &[],
         refused_owned: &[],
+        refused_owned_also: &[],
     };
 
     /// The system's threads, except for `refused`'s jobs (tests).
@@ -83,6 +86,7 @@ impl Spawner {
         Self {
             refused,
             refused_owned: &[],
+            refused_owned_also: &[],
         }
     }
 
@@ -94,6 +98,19 @@ impl Spawner {
         Self {
             refused: &[],
             refused_owned: refused,
+            refused_owned_also: &[],
+        }
+    }
+
+    /// This spawner, also refusing owned jobs of `refused`'s kinds (tests):
+    /// a test keeps a job it does not watch from running beside the ones
+    /// it counts.
+    #[doc(hidden)]
+    #[must_use]
+    pub const fn also_refusing_owned(self, refused: &'static [JobKind]) -> Self {
+        Self {
+            refused_owned_also: refused,
+            ..self
         }
     }
 
@@ -118,7 +135,10 @@ impl Spawner {
         kind: JobKind,
         f: impl FnOnce() + Send + 'static,
     ) -> io::Result<thread::JoinHandle<()>> {
-        if self.refused.contains(&kind) || self.refused_owned.contains(&kind) {
+        if self.refused.contains(&kind)
+            || self.refused_owned.contains(&kind)
+            || self.refused_owned_also.contains(&kind)
+        {
             return Err(io::Error::other("refused (test)"));
         }
         thread::Builder::new()
