@@ -453,6 +453,16 @@ impl MenuQueue {
         escape
     }
 
+    /// The entries queued (dev-tools tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn queued(&self) -> usize {
+        self.inputs
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entries
+            .len()
+    }
+
     /// The entries the queue's storage holds without growing (tests).
     #[cfg(test)]
     pub fn capacity(&self) -> usize {

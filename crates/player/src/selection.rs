@@ -642,8 +642,11 @@ impl Selection {
             if !acts {
                 continue;
             }
-            if let Some(pick) = self.take_reading(input, level, now) {
-                return Some(pick);
+            let pick = self.take_reading(input, level, now);
+            #[cfg(test)]
+            self.dispatched(crate::pointer::Dispatched::Input);
+            if pick.is_some() {
+                return pick;
             }
         }
         let presses = self.menu.presses_taken();
@@ -651,9 +654,22 @@ impl Selection {
             self.refresh_pending();
             let facts = self.pointer_facts(level);
             let act = crate::pointer::resolve_drag(&drag, &facts);
-            return self.pointer_act(act, level, now);
+            let pick = self.pointer_act(act, level, now);
+            #[cfg(test)]
+            self.dispatched(crate::pointer::Dispatched::Drag(act));
+            return pick;
         }
         None
+    }
+
+    /// Records a dispatched input and the cursor after it, while the log
+    /// is kept (tests).
+    #[cfg(test)]
+    fn dispatched(&mut self, what: crate::pointer::Dispatched) {
+        let cursor = self.screen.cursor();
+        if let Some(log) = &mut self.pointer.log {
+            log.push((what, cursor));
+        }
     }
 
     /// What the select screen is to a pointer input now.
@@ -699,7 +715,17 @@ impl Selection {
             // As Tab in the box: the focus goes, and the IME with it.
             let _ = self.take_reading(MenuInput::Key(MenuKey::Tab), level, now);
         }
-        self.pointer_act(resolved.act, level, now)
+        let pick = self.pointer_act(resolved.act, level, now);
+        #[cfg(test)]
+        self.dispatched(match slot.request {
+            crate::pointer::PointerRequest::Press { .. } => {
+                crate::pointer::Dispatched::Press(resolved.act)
+            }
+            crate::pointer::PointerRequest::Wheel { .. } => {
+                crate::pointer::Dispatched::Notch(resolved.act)
+            }
+        });
+        pick
     }
 
     /// Carries out what a pointer input does.
@@ -3281,6 +3307,9 @@ use page_start::Got;
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(feature = "dev-tools")]
+    mod pointer;
+
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 

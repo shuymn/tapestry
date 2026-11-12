@@ -474,6 +474,21 @@ pub struct PointerPass {
     pub shared: std::sync::Arc<PointerShared>,
     /// The sequence of the batch in flight.
     pub flight: Option<u64>,
+    /// While set, each input the pass dispatched, with the cursor after
+    /// it (tests).
+    #[cfg(test)]
+    pub log: Option<Vec<(Dispatched, usize)>>,
+}
+
+/// An input a pass dispatched, as [`PointerPass::log`] records it (tests).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Dispatched {
+    /// A queued input that is not the pointer's.
+    Input,
+    Press(PointerAct),
+    Notch(PointerAct),
+    Drag(PointerAct),
 }
 
 impl PointerPass {
@@ -483,6 +498,8 @@ impl PointerPass {
         Self {
             shared,
             flight: None,
+            #[cfg(test)]
+            log: None,
         }
     }
 
