@@ -372,6 +372,7 @@ pub fn view(
             random: r.random,
             max_ex,
             score: r.score,
+            judge_class: None,
         });
     SelectionView {
         position: None,

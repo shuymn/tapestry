@@ -5,6 +5,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
+use crate::JUDGE_CLASS_MAX;
 use crate::play::schema::{FPS_MAX, YEAR_MAX};
 use crate::schema::{Export, Field, FieldTy, Schema, TimerDef};
 
@@ -74,6 +75,8 @@ pub static SELECTION: Schema = Schema {
         int("selected.level", -VALUE_MAX, VALUE_MAX),
         value("selected.length_min"),
         int("selected.length_sec", 0, 59),
+        int("selected.judge_class", 0, JUDGE_CLASS_MAX),
+        flag("selected.judge_class_valid"),
         int("settings.display_offset", -VALUE_MAX, VALUE_MAX),
         int("settings.volume", 0, 100),
         flag("settings.floating"),
@@ -161,47 +164,53 @@ pub mod field {
     /// Its length's whole minutes, and the seconds past them.
     pub const SELECTED_LENGTH_MIN: u16 = 23;
     pub const SELECTED_LENGTH_SEC: u16 = 24;
+    /// The chart's judgment class, 0 the hardest to 4 the easiest, from
+    /// its library entry's rank with one validation, as the reference's
+    /// song database computes it; 0 and not valid without a class or off a
+    /// chart row.
+    pub const SELECTED_JUDGE_CLASS: u16 = 25;
+    pub const SELECTED_JUDGE_CLASS_VALID: u16 = 26;
     /// The settings' fields, then the application's readouts, from here
     /// on, which a view leaves as they are
     /// ([`SelectionSettings`](crate::SelectionSettings),
     /// [`SelectionFrame::app`](crate::SelectionFrame::app)).
-    pub const SETTINGS: u16 = 25;
+    pub const SETTINGS: u16 = 27;
     /// The display offset in whole ms.
-    pub const SETTINGS_DISPLAY_OFFSET: u16 = 25;
+    pub const SETTINGS_DISPLAY_OFFSET: u16 = 27;
     /// The master gain's number, `(int)(gain · 100f)`.
-    pub const SETTINGS_VOLUME: u16 = 26;
+    pub const SETTINGS_VOLUME: u16 = 28;
     /// Whether the hi-speed is Floating.
-    pub const SETTINGS_FLOATING: u16 = 27;
+    pub const SETTINGS_FLOATING: u16 = 29;
     /// In Floating, the travel duration of the target green number `G`,
     /// `⌊5 · G / 3⌋` ms, and `G`; 0 in Classic.
-    pub const SETTINGS_DURATION: u16 = 28;
-    pub const SETTINGS_GREEN: u16 = 29;
+    pub const SETTINGS_DURATION: u16 = 30;
+    pub const SETTINGS_GREEN: u16 = 31;
     /// The source's fixed hi-speed index: 0 in Classic; in Floating 1 to
     /// 4 by the reference tempo, start, maximum, main and minimum.
-    pub const SETTINGS_FIX_HISPEED: u16 = 30;
+    pub const SETTINGS_FIX_HISPEED: u16 = 32;
     /// The source's sorter index of the order: title 0, artist 1, level 4;
     /// −1 for an order it has no sorter for.
-    pub const SETTINGS_ORDER: u16 = 31;
+    pub const SETTINGS_ORDER: u16 = 33;
     /// The displayed gauge's look, assist-easy 0 to hazard 5; −1 without
     /// one.
-    pub const SETTINGS_GAUGE: u16 = 32;
+    pub const SETTINGS_GAUGE: u16 = 34;
     /// Whether SUDDEN+, LIFT and HIDDEN+ are on.
-    pub const SETTINGS_SUDDEN: u16 = 33;
-    pub const SETTINGS_LIFT: u16 = 34;
-    pub const SETTINGS_HIDDEN: u16 = 35;
+    pub const SETTINGS_SUDDEN: u16 = 35;
+    pub const SETTINGS_LIFT: u16 = 36;
+    pub const SETTINGS_HIDDEN: u16 = 37;
     /// The application's readouts of the frame
     /// ([`SelectionFrame::app`](crate::SelectionFrame::app)), as play's
-    /// fields of the same names: the frames presented in the last second,
-    /// the local year, month (1 to 12), day, 24-hour hour, minute and
-    /// second, then the uptime's whole hours (unwrapped), its minutes
-    /// within the hour and its seconds within the minute.
-    pub const APP_FPS: u16 = 36;
-    pub const CLOCK_YEAR: u16 = 37;
-    pub const CLOCK_SECOND: u16 = 42;
-    pub const APP_UPTIME_H: u16 = 43;
-    pub const APP_UPTIME_S: u16 = 45;
+    /// fields of the same names, after the settings: the frames presented
+    /// in the last second, the local year, month (1 to 12), day, 24-hour
+    /// hour, minute and second, then the uptime's whole hours (unwrapped),
+    /// its minutes within the hour and its seconds within the minute.
+    pub const APP_FPS: u16 = SETTINGS_HIDDEN + 1;
+    pub const CLOCK_YEAR: u16 = APP_FPS + 1;
+    pub const CLOCK_SECOND: u16 = APP_FPS + 6;
+    pub const APP_UPTIME_H: u16 = APP_FPS + 7;
+    pub const APP_UPTIME_S: u16 = APP_FPS + 9;
     /// The number of fields.
-    pub const COUNT: usize = 46;
+    pub const COUNT: usize = APP_UPTIME_S as usize + 1;
 }
 
 /// The built-in timer slots of [`SELECTION`]; `when` timers follow from

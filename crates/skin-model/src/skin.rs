@@ -182,6 +182,18 @@ pub struct DecisionDefs {
     pub timing: crate::decision::DecisionTiming,
 }
 
+/// What a play skin declares for the end of a play (design.md "Play
+/// Lifecycle", Audio tail), in µs from its top-level `finishmargin` and
+/// `fadeout` in ms (`skin/json/JsonSkin.java:14, 21` at 0.8.9), each 0
+/// when not declared, over the whole range the source reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlayEnding {
+    /// The hold past the finish point before the fade-out, at least 0.
+    pub finish_margin: TimeUs,
+    /// The fade-out's length as declared, which may be negative.
+    pub fadeout: TimeUs,
+}
+
 /// The widgets only a play skin draws.
 #[derive(Clone, Debug, Default)]
 pub struct PlayDefs {
@@ -593,6 +605,8 @@ pub struct Skin {
     result_timing: crate::result::ResultTiming,
     /// A decision skin's declared timing; the default for another kind.
     decision_timing: crate::decision::DecisionTiming,
+    /// A play skin's declared ending; the default for another kind.
+    play_ending: PlayEnding,
     gauge_graphs: Box<[GaugeGraph]>,
     timing_graphs: Box<[TimingGraph]>,
     bpm_graphs: Box<[BpmGraph]>,
@@ -2634,6 +2648,7 @@ impl Skin {
             judge_graphs,
             result_timing: res.timing,
             decision_timing: crate::decision::DecisionTiming::default(),
+            play_ending: PlayEnding::default(),
             gauge_graphs,
             timing_graphs,
             bpm_graphs,
@@ -3547,6 +3562,24 @@ impl Skin {
     pub fn with_outputs(mut self, n: usize) -> Self {
         self.outputs = n;
         self
+    }
+
+    /// The skin with the ending a play skin declares; another kind keeps
+    /// the default, since only play has an ending.
+    #[must_use]
+    pub fn with_play_ending(mut self, ending: PlayEnding) -> Self {
+        if self.kind == ScreenKind::Play {
+            self.play_ending = ending;
+        }
+        self
+    }
+
+    /// What a play skin declares for the end of a play
+    /// ([`with_play_ending`](Self::with_play_ending)); the default for
+    /// another kind.
+    #[must_use]
+    pub fn play_ending(&self) -> PlayEnding {
+        self.play_ending
     }
 
     /// The callback outputs a selection or result state carries.

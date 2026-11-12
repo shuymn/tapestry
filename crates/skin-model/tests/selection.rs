@@ -1732,3 +1732,51 @@ fn an_invalid_readout_refuses_the_selection_frame() {
     fx.frame(16);
     assert_eq!(shown(&fx), [1, 2]);
 }
+
+/// The selected chart's judgment class reads as its fields, before the
+/// settings: a chart of class 2, a folder row and a chart with no class;
+/// a settings change leaves the class as it was and reads the settings
+/// at their own slots.
+#[test]
+fn the_selected_charts_class_reads_before_the_settings() {
+    use skin_model::selection_field as field;
+    let mut fx = number_skin("1", "true");
+    let class = |fx: &Fx| {
+        let f = fx.sel.state().fields;
+        [
+            f[usize::from(field::SELECTED_JUDGE_CLASS)],
+            f[usize::from(field::SELECTED_JUDGE_CLASS_VALID)],
+        ]
+    };
+    let mut v = view(vec![chart("a"), folder("f", 3)], Some(0));
+    v.selected.as_mut().unwrap().judge_class = Some(2);
+    fx.view(&v);
+    assert_eq!(class(&fx), [2, 1]);
+    let settings = skin_model::SelectionSettings {
+        display_offset_ms: -7,
+        master_volume: skin_model::MasterVolume::of_gain(0.5),
+        speed: skin_model::SpeedView::Classic,
+        order: skin_model::SelectionOrder::Title,
+        gauge: None,
+        covers_on: [false; 3],
+    };
+    fx.skin
+        .update_selection_settings(&mut fx.sel, &settings)
+        .unwrap();
+    assert_eq!(class(&fx), [2, 1], "the settings overwrote the class");
+    assert_eq!(
+        fx.sel.state().fields[usize::from(field::SETTINGS_DISPLAY_OFFSET)],
+        -7
+    );
+    fx.view(&view(vec![chart("a"), folder("f", 3)], Some(1)));
+    assert_eq!(class(&fx), [0, 0], "a folder row");
+    let mut v = view(vec![chart("a")], Some(0));
+    v.selected.as_mut().unwrap().judge_class = None;
+    fx.view(&v);
+    assert_eq!(class(&fx), [0, 0], "no class");
+    assert_eq!(
+        fx.sel.state().fields[usize::from(field::SETTINGS_DISPLAY_OFFSET)],
+        -7,
+        "a view left the settings"
+    );
+}

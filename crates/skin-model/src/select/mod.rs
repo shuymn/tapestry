@@ -593,6 +593,13 @@ fn fields(view: &SelectionView, cursor: Option<&RowView>) -> [i32; field::COUNT]
         field::SELECTED_LEVEL,
         c.labels.level_value.clamp(-VALUE_MAX, VALUE_MAX),
     );
+    if let Some(k) = c
+        .judge_class
+        .filter(|&k| i32::from(k) <= crate::JUDGE_CLASS_MAX)
+    {
+        set(field::SELECTED_JUDGE_CLASS, i32::from(k));
+        set(field::SELECTED_JUDGE_CLASS_VALID, 1);
+    }
     f
 }
 

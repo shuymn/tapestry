@@ -126,7 +126,9 @@ pub fn create(conn: &Connection) -> rusqlite::Result<()> {
              length_us INTEGER,
              tempo_start BLOB,
              tempo_min BLOB,
-             tempo_max BLOB
+             tempo_max BLOB,
+             rank_kind INTEGER,
+             rank_value INTEGER
          );
          CREATE INDEX charts_root ON charts(root);
          CREATE INDEX charts_title ON charts(mode, title_key IS NULL, title_key, path);
@@ -320,6 +322,34 @@ pub struct Row {
     pub random: bool,
     pub bga: bool,
     pub summary: Option<ChartSummary>,
+    /// [`ChartEntry::rank`].
+    pub rank: Option<Option<rules::JudgeRank>>,
+}
+
+/// A rank as `charts.rank_kind` and `rank_value` store it: no kind when the
+/// seed-0 branch is refused; kind 0 with no rank header (its value 0,
+/// unread); kind 1 a `#RANK`, as written; kind 2 a `#DEFEXRANK`, in
+/// thousandths.
+fn rank_columns(rank: Option<Option<rules::JudgeRank>>) -> (Option<i64>, Option<i64>) {
+    match rank {
+        None => (None, None),
+        Some(None) => (Some(0), Some(0)),
+        Some(Some(rules::JudgeRank::Rank(r))) => (Some(1), Some(i64::from(r))),
+        Some(Some(rules::JudgeRank::DefExRankMilli(m))) => (Some(2), Some(m)),
+    }
+}
+
+/// The rank of [`rank_columns`]; none for an unknown kind, or a rank kind
+/// without its value, which no row this build wrote holds.
+fn rank_of(kind: Option<i64>, value: Option<i64>) -> Option<Option<rules::JudgeRank>> {
+    match (kind?, value) {
+        (0, _) => Some(None),
+        (1, Some(v)) => i32::try_from(v)
+            .ok()
+            .map(|r| Some(rules::JudgeRank::Rank(r))),
+        (2, Some(v)) => Some(Some(rules::JudgeRank::DefExRankMilli(v))),
+        _ => None,
+    }
 }
 
 /// A mode as `charts.mode` stores it; the lists read 0 alone.
@@ -403,9 +433,9 @@ pub fn commit(
             "INSERT INTO charts (root, path, size, mtime_ns, sha256, md5, title, subtitle,
                  artist, subartist, genre, playlevel, difficulty, bpm, norm_text, title_key,
                  artist_key, folder, mode, random, bga, loader, taps, longs, mines,
-                 length_us, tempo_start, tempo_min, tempo_max)
+                 length_us, tempo_start, tempo_min, tempo_max, rank_kind, rank_value)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29)
+                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
              ON CONFLICT (path) DO UPDATE SET root = excluded.root, size = excluded.size,
                  mtime_ns = excluded.mtime_ns, sha256 = excluded.sha256, md5 = excluded.md5,
                  title = excluded.title, subtitle = excluded.subtitle,
@@ -418,12 +448,14 @@ pub fn commit(
                  taps = excluded.taps,
                  longs = excluded.longs, mines = excluded.mines,
                  length_us = excluded.length_us, tempo_start = excluded.tempo_start,
-                 tempo_min = excluded.tempo_min, tempo_max = excluded.tempo_max",
+                 tempo_min = excluded.tempo_min, tempo_max = excluded.tempo_max,
+                 rank_kind = excluded.rank_kind, rank_value = excluded.rank_value",
         )?;
         for row in upserts {
             let h = &row.header;
             let keys = Keys::of(h);
             let summary = row.summary.as_ref();
+            let (rank_kind, rank_value) = rank_columns(row.rank);
             upsert.execute(params![
                 row.root,
                 row.path,
@@ -457,6 +489,8 @@ pub fn commit(
                 summary.map(|s| tempo_bytes(s.tempo_start)),
                 summary.map(|s| tempo_bytes(s.tempo_min)),
                 summary.map(|s| tempo_bytes(s.tempo_max)),
+                rank_kind,
+                rank_value,
             ])?;
         }
         let mut delete = tx.prepare("DELETE FROM charts WHERE path = ?1")?;
@@ -471,7 +505,8 @@ pub fn commit(
 /// The columns [`entry`] reads, of `charts` as `c`.
 pub const ENTRY_COLUMNS: &str = "c.path, c.size, c.mtime_ns, c.sha256, c.md5, c.title, \
      c.subtitle, c.artist, c.subartist, c.genre, c.playlevel, c.difficulty, c.bpm, c.random, \
-     c.bga, c.taps, c.longs, c.mines, c.length_us, c.tempo_start, c.tempo_min, c.tempo_max";
+     c.bga, c.taps, c.longs, c.mines, c.length_us, c.tempo_start, c.tempo_min, c.tempo_max, \
+     c.rank_kind, c.rank_value";
 
 /// A tempo as a summary column stores it: `u128` does not fit an integer.
 const fn tempo_bytes(tempo: Tempo) -> [u8; 16] {
@@ -531,6 +566,7 @@ pub fn entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChartEntry> {
         random: r.get(13)?,
         bga: r.get(14)?,
         summary: summary(r, 15)?,
+        rank: rank_of(r.get(22)?, r.get(23)?),
     })
 }
 

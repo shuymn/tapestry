@@ -32,7 +32,9 @@ use crate::measure::{
     AudioBase, Figures, PlayMeasure, Step, StepSample, judgment_samples, limits_line, measure_path,
     process_page_faults, to_toml,
 };
-use crate::render_side::{AttemptSkin, EndPage, RenderEnd, RenderLink, RenderMsg, ScreenError};
+use crate::render_side::{
+    AttemptSkin, Declared, EndPage, RenderEnd, RenderLink, RenderMsg, ScreenError,
+};
 
 use crate::result_input::ResultInput;
 use crate::tuning::{Delivered, SettingsFiles};
@@ -237,6 +239,10 @@ pub struct PlayerRig<'a> {
     /// The end screen's page while it shows: the summary's lines and the
     /// view's graphs; the settings lines are added each time it is sent.
     pub end_page: Option<EndPage>,
+    /// The screen's failure a chart's load hid behind
+    /// [`crate::selection::ChartLoadError::ScreenFailed`], for the flow
+    /// ([`game::AppRig::screen_load_failed`]).
+    pub screen_load_failure: Option<ScreenError>,
     /// The end screen's key names.
     pub hints: Hints,
     /// The result screen's input.
@@ -270,9 +276,9 @@ pub struct PlayerRig<'a> {
     pub ready_state_at: Option<TimeUs>,
     /// Where the current play's chart time 0 lies on the clock.
     pub origin: Option<TimeUs>,
-    /// The play skin's declared Closing duration, from the current
-    /// attempt's commit receipt ([`commit_ready`]); `None` before it.
-    pub declared_close: Option<TimeUs>,
+    /// What the play skin declares, from the current attempt's commit
+    /// receipt ([`commit_ready`]); none declared before it.
+    pub declared: Declared,
     /// Where each logic step's measurement goes (the render thread).
     pub steps: rtrb::Producer<StepSample>,
     /// Step samples of the current play the full queue refused.
@@ -1389,9 +1395,9 @@ pub(crate) fn closing_line(c: &game::ClosingReport) -> String {
 pub(crate) fn commit_ready(
     render: &RenderLink,
     loading: bool,
-    declared: &mut Option<TimeUs>,
+    declared: &mut Declared,
 ) -> Result<(), ScreenError> {
-    *declared = None;
+    *declared = Declared::default();
     if loading {
         render.loading().report(LoadInput::Ready, None);
     }
@@ -1565,10 +1571,16 @@ impl Rig for PlayerRig<'_> {
         c
     }
 
-    /// The current attempt's commit receipt.
+    /// The current attempt's commit receipt: Closing's duration.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn declared_close(&self) -> Option<TimeUs> {
-        self.declared_close
+        self.declared.close
+    }
+
+    /// The current attempt's commit receipt: the play's ending.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn declared_ending(&self) -> game::PlayEnding {
+        self.declared.ending
     }
 
     /// As [`take`](Self::take), with the quit key taken without dropping a
@@ -1714,7 +1726,7 @@ impl Rig for PlayerRig<'_> {
     /// passed, so its progress reaches 100.
     fn commit_attempt(&mut self) -> Result<(), ScreenError> {
         let loading = self.loading_active();
-        commit_ready(&self.render, loading, &mut self.declared_close)?;
+        commit_ready(&self.render, loading, &mut self.declared)?;
         #[cfg(feature = "dev-tools")]
         {
             self.probe_ready = Some((std::time::Instant::now(), "none"));
@@ -1755,21 +1767,21 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn prepare_screen(&mut self) -> Result<(), ScreenError> {
-        // Within a result lifetime a screen built again is not a leaving,
-        // an outro playing included, until the flow serves the command:
-        // the render side draws on from what it presented (the S10-09i
-        // design's D4, "Recovery").
-        if self.presenter.current() && !self.result_leaving {
-            return self.render.prepare();
+        self.before_rebuild();
+        // The screen's rebuild after a loss goes through its one owner: one
+        // under way (a decision screen's, left) is taken over and waited
+        // for, a failure saved there is reported here, and a lost screen
+        // with neither is built again there. Nothing of it: a preparation.
+        loop {
+            match self.render.serve_recovery(
+                Some(std::time::Instant::now() + std::time::Duration::from_millis(10)),
+                true,
+            ) {
+                crate::render_side::Recovered::Nothing => return self.render.prepare(),
+                crate::render_side::Recovered::Running => {}
+                crate::render_side::Recovered::Answered(answered) => return answered,
+            }
         }
-        self.leave_result();
-        self.retry_from = self.pending_retry.take();
-        // What a result offered before this preparation is no later
-        // result's.
-        self.result_retries = ResultRetries::default();
-        #[cfg(feature = "dev-tools")]
-        self.scenario_pending();
-        prepare_render(&mut self.end_page, &self.render)
     }
 
     /// The attempt's preparation begun (design.md "Play Lifecycle",
@@ -2322,7 +2334,9 @@ impl Rig for PlayerRig<'_> {
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn screen_failed(&self) -> bool {
-        self.render.failed()
+        // The device lost, or the rebuild's holder holds one under way or
+        // a failure no one reported: either is served the same way.
+        self.render.screen_outstanding()
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -2600,6 +2614,29 @@ pub(crate) const fn flow_timing(t: skin_model::ResultTiming) -> game::ResultTimi
 /// first (a retry), its page and the render thread's slot emptied before
 /// the preparation's handshake, so no page of the result is drawn after,
 /// even one that waited while the render thread was behind.
+impl PlayerRig<'_> {
+    /// What every rebuild of the screen does first ([`game::Rig::prepare_screen`],
+    /// the decision screen's recovery): within a result lifetime a screen
+    /// built again is not a leaving, an outro playing included, until the
+    /// flow serves the command, and the render side draws on from what it
+    /// presented (the S10-09i design's D4, "Recovery"), so nothing here;
+    /// otherwise the result is left, a retry asked for is taken, what a
+    /// result offered is no later result's, and the end screen goes.
+    pub(crate) fn before_rebuild(&mut self) {
+        if self.presenter.current() && !self.result_leaving {
+            return;
+        }
+        self.leave_result();
+        self.retry_from = self.pending_retry.take();
+        self.result_retries = ResultRetries::default();
+        #[cfg(feature = "dev-tools")]
+        self.scenario_pending();
+        self.end_page = None;
+        self.render.clear_end();
+    }
+}
+
+#[cfg(test)]
 pub(crate) fn prepare_render(
     end_page: &mut Option<EndPage>,
     render: &RenderLink,

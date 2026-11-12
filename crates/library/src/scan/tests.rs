@@ -1000,7 +1000,10 @@ fn a_library_is_never_rebuilt_under_its_own_connections() {
         .unwrap();
     // The file now claims another version while the library holds it.
     lib.reader()
-        .execute_batch("PRAGMA user_version = 8;")
+        .execute_batch(&format!(
+            "PRAGMA user_version = {};",
+            crate::SCHEMA_VERSION + 1
+        ))
         .unwrap();
     let again = dir.path().join(".").join("library.db");
     assert!(matches!(
@@ -1031,7 +1034,12 @@ fn a_library_is_never_rebuilt_under_its_own_connections() {
     drain(&scan, &gate);
     drop(scan);
     let (lib, opened) = Library::open(&path).unwrap();
-    assert_eq!(opened, crate::Opened::Rebuilt { old_version: 8 });
+    assert_eq!(
+        opened,
+        crate::Opened::Rebuilt {
+            old_version: crate::SCHEMA_VERSION + 1
+        }
+    );
     assert!(indexed(&lib).is_empty());
 }
 
