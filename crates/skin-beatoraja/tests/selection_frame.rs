@@ -830,8 +830,13 @@ fn settings_frame(s: &mut Sel) -> SettingsFrame {
     f
 }
 
+/// The image indices the settings set: the order, the gauge, the fixed
+/// hi-speed, the three covers' switches, the gauge auto shift, the judge
+/// algorithm and the hi-speed auto adjustment.
+const SETTABLE: [i32; 9] = [12, 40, 55, 330, 331, 332, 78, 340, 342];
+
 /// Settings of `display_offset_ms`, `gain`, `speed`, `order`, `gauge` and
-/// `covers_on`.
+/// `covers_on`, a failed play closing and no preset's assignment.
 fn settings(
     display_offset_ms: i32,
     gain: f32,
@@ -847,6 +852,8 @@ fn settings(
         order,
         gauge,
         covers_on,
+        play_to_end: false,
+        assignment: None,
     }
 }
 
@@ -863,7 +870,7 @@ fn the_settings_draw_the_players_values_through_the_production_path() {
     use skin_model::{GaugeLook, SelectionOrder, SpeedReference, SpeedView};
     let d = folder(&settings_skin());
     let i = import_selection(d.path()).unwrap();
-    // Only the ids with no native equivalent are noted unavailable.
+    // Every settings id has a bridge or a constant: none is unavailable.
     let unavailable: Vec<i32> = common::kinds(&i.report)
         .into_iter()
         .filter_map(|k| match k {
@@ -871,7 +878,7 @@ fn the_settings_draw_the_players_values_through_the_production_path() {
             _ => None,
         })
         .collect();
-    assert_eq!(unavailable, [78, 340, 341, 342]);
+    assert_eq!(unavailable, Vec::<i32>::new());
     let mut s = Sel::new(i.skin);
     s.view(&view(vec![chart("a")], Some(0), None, None));
     // Before any settings: no volume ratio, so neither bar draws.
@@ -880,14 +887,14 @@ fn the_settings_draw_the_players_values_through_the_production_path() {
     let constants = |f: &SettingsFrame| -> BTreeMap<i32, u8> {
         f.indices
             .iter()
-            .filter(|(id, _)| ![12, 40, 55, 330, 331, 332].contains(*id))
+            .filter(|(id, _)| !SETTABLE.contains(*id))
             .map(|(&id, &k)| (id, k))
             .collect()
     };
     // The truthful constants: 7-key and no BGA (2), every other 0.
     let mut want_constants: BTreeMap<i32, u8> = [
         11, 15, 16, 19, 42, 43, 54, 72, 75, 77, 301, 302, 303, 304, 305, 306, 307, 308, 315, 316,
-        317, 318,
+        317, 318, 341,
     ]
     .into_iter()
     .map(|id| (id, 0))
@@ -911,11 +918,22 @@ fn the_settings_draw_the_players_values_through_the_production_path() {
         "Classic: no duration"
     );
     assert_eq!(constants(&f), want_constants);
-    let settable =
-        |f: &SettingsFrame| [12, 40, 55, 330, 331, 332].map(|id| f.indices.get(&id).copied());
+    let settable = |f: &SettingsFrame| SETTABLE.map(|id| f.indices.get(&id).copied());
+    // On a chart row with no preset (340 draws nothing) and a failed play
+    // closing (78 is 0).
     assert_eq!(
         settable(&f),
-        [Some(0), Some(3), Some(0), Some(1), Some(0), Some(1)]
+        [
+            Some(0),
+            Some(3),
+            Some(0),
+            Some(1),
+            Some(0),
+            Some(1),
+            Some(0),
+            None,
+            Some(0)
+        ]
     );
     // 0.45 as the f32 gain: 7 549 747 / 2^24 of the travel and width.
     let x = (100.0 * f64::from(7_549_747_u32) / f64::from(1_u32 << 24)) as f32;
@@ -948,7 +966,17 @@ fn the_settings_draw_the_players_values_through_the_production_path() {
     assert_eq!(constants(&f), want_constants);
     assert_eq!(
         settable(&f),
-        [Some(4), Some(0), Some(4), Some(0), Some(1), Some(0)]
+        [
+            Some(4),
+            Some(0),
+            Some(4),
+            Some(0),
+            Some(1),
+            Some(0),
+            Some(0),
+            None,
+            Some(1)
+        ]
     );
     assert_eq!(f.slider.unwrap()[0], 100.0);
     assert_eq!(f.graph.unwrap()[2], 100.0);
@@ -985,13 +1013,19 @@ fn the_settings_draw_the_players_values_through_the_production_path() {
     );
     assert_eq!(
         settable(&f),
-        [None, None, Some(1), Some(0), Some(0), Some(0)]
+        [
+            None,
+            None,
+            Some(1),
+            Some(0),
+            Some(0),
+            Some(0),
+            Some(0),
+            None,
+            Some(1)
+        ]
     );
     assert_eq!(f.slider.unwrap()[0], 0.0);
-    // The unavailable ones never draw.
-    for id in [78, 340, 341, 342] {
-        assert!(!f.indices.contains_key(&id), "{id}");
-    }
 
     // The duration truncates: 5 · 301 / 3 is 501.67, drawn 501.
     let d = settings(
@@ -1059,4 +1093,98 @@ fn the_judgment_class_options_read_the_selected_charts_class() {
         None,
     ));
     assert_eq!(shown(&mut s), [3], "a folder row");
+}
+
+/// The settings indices the source reads from its player config and the
+/// selected bar's play config, which a folder row has too, the mode
+/// filter's (`skin/property/IntegerPropertyFactory.java:1111-1112`,
+/// `:1216-1227`, `:1261-1315`; `select/MusicSelector.java:650-669` at
+/// `0.8.9`), through the production path: 78 is the failure handling, 341
+/// always 0 whatever the gauge, 342 Floating, 340 the preset's assignment
+/// (nothing without a preset) and 330 to 332 the switches, on a chart row
+/// and a folder row alike.
+#[test]
+fn the_settings_indices_follow_the_players_settings() {
+    use skin_model::{GaugeLook, SelectionOrder, SpeedReference, SpeedView};
+    let d = folder(&settings_skin());
+    let mut s = Sel::new(import_selection(d.path()).unwrap().skin);
+    let chart_row = view(vec![chart("a")], Some(0), None, None);
+    let folder_row = view(vec![folder_row("f", 3)], Some(0), None, None);
+    let floating = SpeedView::Floating {
+        reference: SpeedReference::Maximum,
+        green: 300,
+    };
+    let at = |s: &mut Sel, v, settings: &skin_model::SelectionSettings| {
+        s.view(v);
+        s.skin
+            .update_selection_settings(&mut s.sel, settings)
+            .unwrap();
+        let f = settings_frame(s);
+        [78, 330, 331, 332, 340, 341, 342].map(|id| f.indices.get(&id).copied())
+    };
+    let base = settings(
+        0,
+        0.5,
+        floating,
+        SelectionOrder::Title,
+        Some(GaugeLook::Hard),
+        [true; 3],
+    );
+    // A hard gauge (2 if the look were clamped to 0-2), Floating and
+    // play-to-end: 78 continue (1), 341 assist easy (0), 342 on (1); the
+    // same on a folder row.
+    let shift = skin_model::SelectionSettings {
+        play_to_end: true,
+        assignment: Some(rules::tapestry().assignment),
+        ..base
+    };
+    let all_on = [
+        Some(1),
+        Some(1),
+        Some(1),
+        Some(1),
+        Some(1),
+        Some(0),
+        Some(1),
+    ];
+    assert_eq!(at(&mut s, &chart_row, &shift), all_on);
+    assert_eq!(at(&mut s, &folder_row, &shift), all_on);
+    // Close: 78 none (0). Classic: 342 off (0). On both rows.
+    let close = skin_model::SelectionSettings {
+        play_to_end: false,
+        speed: SpeedView::Classic,
+        ..shift
+    };
+    for row in [&chart_row, &folder_row] {
+        let f = at(&mut s, row, &close);
+        assert_eq!((f[0], f[6]), (Some(0), Some(0)));
+    }
+    // 340 by preset: combo (0) for the two source-style presets,
+    // duration (1) for tapestry's, nothing without one, on both rows.
+    for (assignment, want) in [
+        (Some(rules::lr2_style().assignment), Some(0)),
+        (Some(rules::beatoraja_style().assignment), Some(0)),
+        (Some(rules::tapestry().assignment), Some(1)),
+        (None, None),
+    ] {
+        let a = skin_model::SelectionSettings {
+            assignment,
+            ..shift
+        };
+        assert_eq!(at(&mut s, &chart_row, &a)[4], want, "{assignment:?}");
+        assert_eq!(at(&mut s, &folder_row, &a)[4], want, "{assignment:?}");
+    }
+    // Each cover's switch alone, off then on.
+    for (k, id) in [330, 331, 332].into_iter().enumerate() {
+        let mut covers_on = [false; 3];
+        let off = skin_model::SelectionSettings { covers_on, ..shift };
+        let f = at(&mut s, &chart_row, &off);
+        assert_eq!(f[1..4], [Some(0); 3], "{id}");
+        covers_on[k] = true;
+        let on = skin_model::SelectionSettings { covers_on, ..shift };
+        let mut want = [Some(0); 3];
+        want[k] = Some(1);
+        assert_eq!(at(&mut s, &chart_row, &on)[1..4], want, "{id}");
+        assert_eq!(at(&mut s, &folder_row, &on)[1..4], want, "{id}");
+    }
 }

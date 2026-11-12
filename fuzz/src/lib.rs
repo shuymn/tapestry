@@ -782,6 +782,7 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         let frame = SkinFrame {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: screen_us_at(TimeUs(ms * 1_000)),
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
             tally: &tally,
@@ -799,6 +800,7 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
             readouts: readouts_for(LANES_OFF),
             playing: true,
             closing: None,
+            fading: None,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch)
             .expect("the frame builds");
@@ -837,6 +839,7 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         let frame = SkinFrame {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: screen_us_at(TimeUs(ms * 1_000)),
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
             tally: &tally,
@@ -854,6 +857,7 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
             readouts,
             playing: true,
             closing: None,
+            fading: None,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch)
             .expect("the frame builds");
@@ -937,6 +941,7 @@ fn lane_order_probes(
         let frame = SkinFrame {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: screen_us_at(TimeUs(800_000 + i64::try_from(k).unwrap_or(0) * 400_000)),
             now: TimeUs(800_000 + i64::try_from(k).unwrap_or(0) * 400_000),
             display_offset: TimeUs(0),
             tally: &tally,
@@ -954,6 +959,7 @@ fn lane_order_probes(
             readouts: readouts_for(view),
             playing: true,
             closing: None,
+            fading: None,
         };
         skin.build(&mut play, &frame, uvs, batch)
             .expect("the frame builds");
@@ -1028,6 +1034,7 @@ fn gauge_probes(
             let frame = SkinFrame {
                 app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
+                screen_us: screen_us_at(TimeUs(i64::try_from(k).unwrap_or(0) * 16_000)),
                 now: TimeUs(i64::try_from(k).unwrap_or(0) * 16_000),
                 display_offset: TimeUs(0),
                 tally: &tally,
@@ -1045,6 +1052,7 @@ fn gauge_probes(
                 readouts: readouts_for(LANES_OFF),
                 playing: true,
                 closing: None,
+                fading: None,
             };
             skin.build(&mut play, &frame, uvs, batch)
                 .expect("the frame builds");
@@ -1151,6 +1159,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
         let frame = SkinFrame {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: screen_us_at(TimeUs(ms * 1_000)),
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(0),
             tally: &tally,
@@ -1168,6 +1177,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
             readouts: readouts_for(LANES_OFF),
             playing: true,
             closing: None,
+            fading: None,
         };
         skin.build(&mut play, &frame, &uvs, &mut batch)
             .expect("the frame builds");
@@ -1272,6 +1282,7 @@ fn grade_anchor_probes(
             let frame = SkinFrame {
                 app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
+                screen_us: screen_us_at(TimeUs(now)),
                 now: TimeUs(now),
                 display_offset: TimeUs(0),
                 tally: &tally,
@@ -1289,6 +1300,7 @@ fn grade_anchor_probes(
                 readouts: readouts_for(view),
                 playing: true,
                 closing: None,
+                fading: None,
             };
             skin.build(&mut play, &frame, uvs, batch)
                 .expect("the frame builds");
@@ -1466,6 +1478,7 @@ fn digit_probes(
         let frame = SkinFrame {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: screen_us_at(now),
             now,
             display_offset: TimeUs(0),
             tally: &tally,
@@ -1483,6 +1496,7 @@ fn digit_probes(
             readouts: readouts_for(LANES_OFF),
             playing: true,
             closing: None,
+            fading: None,
         };
         skin.build(&mut play, &frame, uvs, batch)
             .expect("the frame builds");
@@ -1556,6 +1570,7 @@ fn long_note_probes(
             let frame = SkinFrame {
                 app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
+                screen_us: screen_us_at(TimeUs(ms * 1_000)),
                 now: TimeUs(ms * 1_000),
                 display_offset: TimeUs(0),
                 tally,
@@ -1573,6 +1588,7 @@ fn long_note_probes(
                 readouts: readouts_for(lanes),
                 playing: true,
                 closing: None,
+                fading: None,
             };
             skin.build(&mut play, &frame, uvs, batch)
                 .expect("the frame builds");
@@ -1627,6 +1643,7 @@ fn bar_probes(
         let frame = SkinFrame {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: screen_us_at(TimeUs(ms * 1_000)),
             now: TimeUs(ms * 1_000),
             display_offset: TimeUs(offset * 1_000),
             tally,
@@ -1644,6 +1661,7 @@ fn bar_probes(
             readouts: readouts_for(lanes),
             playing: true,
             closing: None,
+            fading: None,
         };
         skin.build(&mut play, &frame, uvs, batch)
             .expect("the frame builds");
@@ -1740,6 +1758,7 @@ fn choice_probes(
         let frame = SkinFrame {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: screen_us_at(TimeUs(now)),
             now: TimeUs(now),
             display_offset: TimeUs(0),
             tally: &tally,
@@ -1757,6 +1776,7 @@ fn choice_probes(
             readouts: readouts_for(LANES_OFF),
             playing: true,
             closing: None,
+            fading: None,
         };
         skin.build(&mut play, &frame, uvs, batch)
             .expect("a consistent snapshot builds");
@@ -1840,6 +1860,7 @@ fn rate_and_kind_probes(
             let frame = SkinFrame {
                 app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
+                screen_us: screen_us_at(TimeUs(2_000_000)),
                 now: TimeUs(2_000_000),
                 display_offset: TimeUs(0),
                 tally: &tally,
@@ -1857,6 +1878,7 @@ fn rate_and_kind_probes(
                 readouts: readouts_for(LANES_OFF),
                 playing: true,
                 closing: None,
+                fading: None,
             };
             skin.build(&mut play, &frame, uvs, batch)
                 .expect("a consistent snapshot builds");
@@ -1947,6 +1969,16 @@ const LANES_OFF: skin_model::LaneView = skin_model::LaneView {
 /// The readouts of a frame showing `view`: no tempo, hi-speed or duration,
 /// every cover chosen on and stored at the amount `view` draws (capped at
 /// 1 000), so the frame is consistent.
+/// A stable origin for the fuzz frames' play screen clock, 1 234 ms before
+/// chart time 0, so an untimed track advances with `now` across a sweep
+/// rather than restarting at every frame.
+const SCREEN_ORIGIN: bms_model::TimeUs = bms_model::TimeUs(-1_234_000);
+
+/// The screen clock of a frame at `now`: the time since [`SCREEN_ORIGIN`].
+fn screen_us_at(now: bms_model::TimeUs) -> i64 {
+    now.0.saturating_sub(SCREEN_ORIGIN.0)
+}
+
 fn readouts_for(view: skin_model::LaneView) -> skin_model::FrameReadouts {
     skin_model::FrameReadouts {
         covers: skin_model::CoverSettings {
@@ -2123,6 +2155,7 @@ fn readout_probes(
             let frame = SkinFrame {
                 app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
+                screen_us: screen_us_at(TimeUs(now_ms * 1_000)),
                 now: TimeUs(now_ms * 1_000),
                 display_offset: TimeUs(0),
                 tally: &tally,
@@ -2140,6 +2173,7 @@ fn readout_probes(
                 readouts,
                 playing: true,
                 closing: None,
+                fading: None,
             };
             skin.build(&mut play, &frame, uvs, batch)
                 .expect("consistent readouts build");
@@ -3631,6 +3665,7 @@ pub fn present(data: &[u8]) -> Option<usize> {
         let frame = SkinFrame {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: screen_us_at(TimeUs(i64::from(combo) * 16_000)),
             now: TimeUs(i64::from(combo) * 16_000),
             display_offset: TimeUs(0),
             tally: &tally,
@@ -3648,6 +3683,7 @@ pub fn present(data: &[u8]) -> Option<usize> {
             readouts: readouts_for(LANES_OFF),
             playing: true,
             closing: None,
+            fading: None,
         };
         batch.clear();
         skin.build(&mut play, &frame, &uvs, &mut batch)

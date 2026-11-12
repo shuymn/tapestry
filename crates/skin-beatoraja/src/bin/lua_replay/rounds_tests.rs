@@ -457,3 +457,66 @@ fn a_quit_settles_the_judgment_due_at_it() {
     assert_eq!(inputs[after(0)].fields()[point], 200_000);
     assert_eq!(inputs[after(1)].fields()[point], 0);
 }
+
+/// Each play frame's `screen` reading (ms) and state clock.
+fn screens(inputs: &[FrameInputs]) -> Vec<(i32, i64)> {
+    let slot = usize::from(skin_model::timer::SCREEN);
+    inputs
+        .iter()
+        .filter(|f| f.is_play())
+        .map(|f| (f.timers()[slot], f.state_us()))
+        .collect()
+}
+
+/// A practice script's untimed elements run on the play state's screen
+/// origin, as the player resolves it: the first loading phase's `since`
+/// (the state clock at 3 210 ms, 1 234 ms of loading), kept through a
+/// rearmed round and over a later loading phase into the next round.
+#[test]
+fn a_practice_script_s_rounds_run_on_the_loading_origin() {
+    use crate::script::LEAD;
+    let mut r1 = Round::on_time(7, true);
+    r1.rearm_at = Some(-LEAD / 2);
+    let since = 3_210_000;
+    let script = Script {
+        name: "screen",
+        notes: 7,
+        origin: since,
+        phases: vec![
+            Phase::Loading { len_us: 1_234_000 },
+            Phase::Page { len_us: 500_000 },
+            Phase::Round(r1),
+            Phase::Page { len_us: 500_000 },
+            Phase::Loading { len_us: 700_000 },
+            Phase::Round(Round::on_time(7, true)),
+            Phase::Page { len_us: 500_000 },
+        ],
+        fix_hispeed: 0,
+        tempo: Vec::new(),
+    };
+    let body = dst("\"i\"", 0, "");
+    let (r, _, inputs) = pieces(&body, script);
+    assert!(r.passes(), "{}", r.text(0, true, true));
+    assert_eq!(rounds_of(&inputs).len(), 2);
+    let read = screens(&inputs);
+    assert!(read.len() > 100);
+    for (ms, state_us) in read {
+        assert_eq!(i64::from(ms), (state_us - since) / 1_000, "at {state_us}");
+    }
+}
+
+/// A round-only script has no loading phase: its screen is anchored as
+/// the player anchors it, reading the skin's loading minimum (2 500 ms
+/// declared) when READY opens.
+#[test]
+fn a_round_only_script_anchors_the_screen() {
+    let body = format!("skin.loadend = 2500\n{}", dst("\"i\"", 0, ""));
+    let (r, _, inputs) = pieces(&body, Script::full());
+    assert!(r.passes(), "{}", r.text(0, true, true));
+    let read = screens(&inputs);
+    assert_eq!(read[0].0, 2_500);
+    let ready = read[0].1;
+    for (ms, state_us) in read {
+        assert_eq!(i64::from(ms), (state_us - ready + 2_500_000) / 1_000);
+    }
+}

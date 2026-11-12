@@ -184,6 +184,11 @@ pub struct SelectionSettings {
     pub gauge: Option<GaugeLook>,
     /// Whether SUDDEN+, LIFT and HIDDEN+ are on.
     pub covers_on: [bool; 3],
+    /// Whether a failed play goes on to the end (`player.toml`'s
+    /// `on_failure`), rather than closing.
+    pub play_to_end: bool,
+    /// The chosen preset's press assignment; `None` without a preset.
+    pub assignment: Option<rules::Assignment>,
 }
 
 /// Where selection is.

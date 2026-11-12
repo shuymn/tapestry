@@ -646,6 +646,16 @@ fn slot_of(timer: TimerRef, whens: usize) -> Option<usize> {
     screen_slot_of(timer, whens, usize::from(BUILTIN))
 }
 
+/// The built-in timers of a `kind` screen, before its `when` timers.
+const fn builtin_timers(kind: ScreenKind) -> usize {
+    (match kind {
+        ScreenKind::Selection => selection_timer::BUILTIN,
+        ScreenKind::Result => result_timer::BUILTIN,
+        ScreenKind::Decision => decision_timer::BUILTIN,
+        ScreenKind::Play => BUILTIN,
+    }) as usize
+}
+
 /// [`slot_of`] over a screen's `builtin` built-in timers.
 fn screen_slot_of(timer: TimerRef, whens: usize, builtin: usize) -> Option<usize> {
     match timer {
@@ -1950,12 +1960,7 @@ impl Skin {
         if present.is_some() && kind != ScreenKind::Play {
             return Err(LoadError::PresentKind);
         }
-        let builtin = usize::from(match kind {
-            ScreenKind::Selection => selection_timer::BUILTIN,
-            ScreenKind::Result => result_timer::BUILTIN,
-            ScreenKind::Decision => decision_timer::BUILTIN,
-            ScreenKind::Play => BUILTIN,
-        });
+        let builtin = builtin_timers(kind);
         let elements = &def.elements;
         let whens = &def.whens;
         let w = &def.widgets;
@@ -2851,6 +2856,26 @@ impl Skin {
         self.present
             .as_ref()
             .is_none_or(crate::present::Present::carry_safe)
+    }
+
+    /// Each element's timer in draw order, by kind (dev-tools): a
+    /// built-in timer's slot, a `when` timer's index, or for a compiled
+    /// timer callback ([`TimerRef::Output`]) its rank among the program's
+    /// timer callbacks, which follow every `when` timer.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn element_timers(&self) -> Vec<TimerRef> {
+        let builtin = builtin_timers(self.kind);
+        let whens = builtin + self.whens.len();
+        let at = |n: usize| u16::try_from(n).unwrap_or(u16::MAX);
+        self.elements
+            .iter()
+            .map(|e| match e.slot {
+                s if s < builtin => TimerRef::Builtin(at(s)),
+                s if s < whens => TimerRef::When(at(s - builtin)),
+                s => TimerRef::Output(at(s - whens)),
+            })
+            .collect()
     }
 
     /// Each gauge widget's segments and motion, in widget order

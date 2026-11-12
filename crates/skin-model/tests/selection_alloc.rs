@@ -199,6 +199,12 @@ fn settings(ms: i64) -> SelectionSettings {
         ][usize::try_from(k % 4).unwrap()],
         gauge: (k % 3 > 0).then_some(GaugeLook::Normal),
         covers_on: [k % 2 == 0, k % 3 == 0, k % 5 == 0],
+        play_to_end: k % 2 == 1,
+        assignment: [
+            None,
+            Some(rules::Assignment::ComboPriority),
+            Some(rules::Assignment::NearestTiesEarlier),
+        ][usize::try_from(k % 3).unwrap()],
     }
 }
 

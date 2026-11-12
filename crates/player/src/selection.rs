@@ -1755,11 +1755,13 @@ impl PlayerRig<'_> {
             .or_else(|| self.files.play_options());
         let tuning = self.controls.tuning();
         let gauge = self.gauge;
+        let on_failure = self.files.on_failure();
         if let Some(sel) = &mut self.selection {
             sel.feed.settings = crate::selection_skin::settings_of(
                 options,
                 sel.screen.bests_preset(),
                 gauge,
+                on_failure,
                 sel.screen.order_view(),
                 tuning,
             );

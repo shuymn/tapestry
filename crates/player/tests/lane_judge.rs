@@ -246,6 +246,7 @@ impl<'a> Rig<'a> {
         let f = FrameInput {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: 0,
             now,
             display_offset: TimeUs(0),
             lanes: LaneView::NONE,

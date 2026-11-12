@@ -719,6 +719,12 @@ impl SettingsFiles {
         &self.root
     }
 
+    /// The failure handling `player.toml` holds, read at startup and
+    /// written back as read.
+    pub const fn on_failure(&self) -> game::FailureAction {
+        self.written.player.on_failure
+    }
+
     /// The play preset `player.toml` is to hold.
     pub fn preset(&self) -> &str {
         &self.preset
@@ -1087,6 +1093,34 @@ mod tests {
             }
         );
         assert_eq!(t.version(), 2);
+    }
+
+    /// The failure handling the select screen shows is the one
+    /// `player.toml` was loaded with, and a preset write keeps it.
+    #[test]
+    fn the_failure_handling_is_the_loaded_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = game::DataRoot::new(dir.path().to_owned());
+        let player = game::PlayerSettings {
+            on_failure: game::FailureAction::PlayToEnd,
+            ..game::PlayerSettings::default()
+        };
+        let loaded = game::Settings {
+            device: game::DeviceSettings::default(),
+            player,
+        };
+        let mut files = SettingsFiles::new(root.clone(), loaded.clone());
+        assert_eq!(files.on_failure(), game::FailureAction::PlayToEnd);
+        assert!(
+            files
+                .choose_preset("lr2-style", Tuning::of(&loaded), 2)
+                .is_ok()
+        );
+        assert_eq!(files.on_failure(), game::FailureAction::PlayToEnd);
+        assert_eq!(
+            game::Settings::load(&root).unwrap().player.on_failure,
+            game::FailureAction::PlayToEnd
+        );
     }
 
     /// Only a changed file is written, and one that cannot be written is
