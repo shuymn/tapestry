@@ -8,16 +8,19 @@
 
 pub mod compare;
 pub mod continuation;
+#[cfg(test)]
+mod readouts_tests;
 
 use std::collections::BTreeMap;
 
-use bms_model::TimeUs;
+use bms_model::{Chart, Tempo, TimeUs};
+use game::adjustment::TempoMap as _;
 use skin_beatoraja::lua::replay::Recorded;
 use skin_model::present::trace::{self, Event};
 use skin_model::{
-    AtlasLimits, Attempt, ChartMetadata, CoverSettings, FrameReadouts, Gain, GaugeDesc, LaneView,
-    Layout, LoadState, LoadingField, LoadingFrame, PlayContext, QuadBatch, Side, Skin, SkinFrame,
-    Variant, field, loading_field,
+    AtlasLimits, Attempt, BpmRange, ChartMetadata, CoverSettings, FrameReadouts, Gain, GaugeDesc,
+    LaneView, Layout, LoadState, LoadingField, LoadingFrame, PlayContext, QuadBatch, READOUT_MAX,
+    Side, Skin, SkinFrame, Variant, field, loading_field,
 };
 
 use self::continuation::{Carried, Model};
@@ -59,8 +62,9 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-/// The play's best and target: a test's ([`SCORE_BASIS`]), else none.
-fn play_score() -> skin_model::PlayScore<'static> {
+/// The play's best and target, a test's ([`SCORE_BASIS`]), else none,
+/// with the whole chart's MAIN tempo `main`.
+fn play_score(main: Option<Tempo>) -> skin_model::PlayScore<'static> {
     #[cfg(test)]
     if let Some((best, target)) = SCORE_BASIS.with(std::cell::Cell::get) {
         return skin_model::PlayScore {
@@ -69,10 +73,66 @@ fn play_score() -> skin_model::PlayScore<'static> {
                 best_known: true,
                 target,
             },
+            main,
             ..skin_model::PlayScore::NONE
         };
     }
-    skin_model::PlayScore::NONE
+    skin_model::PlayScore {
+        main,
+        ..skin_model::PlayScore::NONE
+    }
+}
+
+/// The script's chart's tempo readouts, prepared as the player prepares
+/// them for a real chart: the attempt's tempo provider over the chart as
+/// loaded (at 1×, so a playback tempo is the original one), the original
+/// BPM range as `player`'s `attempt_context::bpm_range` takes it from the
+/// timeline's extrema, and the whole chart's MAIN from `game`'s references
+/// over the whole chart. The references are all or nothing: a chart whose
+/// fine tempo makes any of them inexact leaves this MAIN unknown, where
+/// the player computes MAIN on its own and may know it. The scripts'
+/// charts use whole millibpm tempos, so for them the two agree.
+struct ChartTempo {
+    provider: game::AttemptTempo,
+    range: Option<BpmRange>,
+    main: Option<Tempo>,
+}
+
+impl ChartTempo {
+    fn of(chart: &Chart) -> Self {
+        let provider = game::AttemptTempo::prepare(chart, None);
+        let meta = *provider.meta();
+        let x100 = |t: Tempo| readout(t.units() / (Tempo::UNITS_PER_BPM / 100));
+        let range = x100(meta.min)
+            .zip(x100(meta.max))
+            .map(|(min_x100, max_x100)| BpmRange { min_x100, max_x100 });
+        // MAIN's exact ratio back to the tempo it came from: its
+        // denominator divides 10^18, so the units are exact.
+        let main = provider.references().ok().and_then(|r| {
+            let (num, den) = (u128::from(r.main.num()), u128::from(r.main.den()));
+            Tempo::from_units(num.checked_mul(Tempo::UNITS_PER_BPM)? / den)
+        });
+        Self {
+            provider,
+            range,
+            main,
+        }
+    }
+
+    /// The current tempo at the display head `head` in floored
+    /// hundredths of a BPM, at most [`READOUT_MAX`], as
+    /// `render::presentation` projects the provider's tempo there.
+    fn current_x100(&self, head: TimeUs) -> Option<u32> {
+        let bpm = self.provider.bpm_at(head)?;
+        readout(100 * u128::from(bpm.num()) / u128::from(bpm.den()))
+    }
+}
+
+/// `n` as a readout, if it is at most [`READOUT_MAX`].
+fn readout(n: u128) -> Option<u32> {
+    u32::try_from(n)
+        .ok()
+        .filter(|&v| i64::from(v) <= i64::from(READOUT_MAX))
 }
 
 /// The score input's EX-score offset: a test's, else 0.
@@ -178,10 +238,11 @@ const LIMITS: AtlasLimits = AtlasLimits {
 };
 
 /// The readouts of a frame: every cover on at 0, the script's hi-speed
-/// fix, nothing else known.
-fn readouts(fix_hispeed: u8) -> FrameReadouts {
+/// fix, the chart's current tempo `bpm_current_x100`, nothing else known.
+fn readouts(fix_hispeed: u8, bpm_current_x100: Option<u32>) -> FrameReadouts {
     FrameReadouts {
         fix_hispeed,
+        bpm_current_x100,
         covers: CoverSettings {
             cover: 0,
             lift: 0,
@@ -238,6 +299,7 @@ pub fn record(
     play_level: Option<i32>,
 ) -> Result<(ProductionRun, Vec<FrameInputs>), String> {
     let chart = script.chart();
+    let tempo = ChartTempo::of(&chart);
     let preset = rules::tapestry();
     let gauges: Vec<GaugeDesc> = preset.gauges.iter().map(GaugeDesc::from_rule).collect();
     let survival = preset
@@ -286,7 +348,7 @@ pub fn record(
                             target: [1_920, 1_080],
                             layout: &Layout::AUTHOR,
                             lanes: view,
-                            covers: readouts(script.fix_hispeed).covers,
+                            covers: readouts(script.fix_hispeed, None).covers,
                             display_offset: TimeUs(0),
                             fix_hispeed: script.fix_hispeed,
                             gauge: None,
@@ -377,10 +439,10 @@ pub fn record(
                         scratch: Side::Left,
                         ln_default: rules::LnMode::Ln,
                         last_note_end: end,
-                        bpm_range: None,
+                        bpm_range: tempo.range,
                         bpm_whole_change: None,
                         play_level,
-                        score: play_score(),
+                        score: play_score(tempo.main),
                     };
                     let carried = model.carried(carry_safe);
                     let mut play = skin
@@ -441,7 +503,8 @@ pub fn record(
                                 lanes: view,
                                 playing,
                                 closing: st.closing,
-                                readouts: readouts(script.fix_hispeed),
+                                // The display offset is 0: the head is now.
+                                readouts: readouts(script.fix_hispeed, tempo.current_x100(now)),
                             };
                             batch.clear();
                             skin.build(&mut play, &frame, &uvs, &mut batch)

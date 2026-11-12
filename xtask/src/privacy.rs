@@ -196,6 +196,7 @@ fn replay_tree(_root: &Path) -> Tree {
         deps: &[
             ("bms-model", ""),
             ("eval", ""),
+            ("game", ""),
             ("rules", ""),
             ("skin-beatoraja", "dev-tools"),
             ("skin-model", "dev-tools"),
