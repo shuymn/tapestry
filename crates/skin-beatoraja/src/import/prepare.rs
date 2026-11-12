@@ -228,7 +228,7 @@ enum Static {
 fn static_class(id: i32) -> Static {
     match id {
         ops::TABLE_SONG | ops::COURSE_MODE | 280..=283 | 289 => Static::Known(false),
-        150..=155 | 170 | 176 | 177 | 180..=184 => Static::Chart,
+        150..=155 | 170 | 176 | 177 | 180..=184 | 190 | 191 | 194 | 195 => Static::Chart,
         171..=175
         | 178
         | 179
@@ -238,7 +238,8 @@ fn static_class(id: i32) -> Static {
         | 1161
         | 40
         | 41
-        | 190..=195
+        | 192
+        | 193
         | 50
         | 51
         | 118
@@ -731,8 +732,8 @@ impl Cx<'_> {
         c: &Common,
         timer: &Prop,
     ) -> Result<(Option<String>, Option<u16>), Unsupported> {
-        // The source's first key, before D20 settles a critical track.
-        let held = c.track.end == skin_model::End::Hold && c.first_at == 0;
+        let held =
+            c.track.end == skin_model::End::Hold && c.track.keys.first().is_some_and(|k| k.at == 0);
         if !held {
             return Err(Unsupported::Construct(
                 "a slider value whose keys need the source's prepare clock",

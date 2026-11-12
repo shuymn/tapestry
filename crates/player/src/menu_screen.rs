@@ -264,14 +264,13 @@ struct SelectionKey {
     state: u64,
 }
 
-/// The strip's sprites over a selection skin at `now`, in layout pixels:
-/// a dark band under each line shown (the search line and the notice, and
-/// the preset's name while it shows) and the composition's underline. At
-/// most [`render::STRIP_SPRITES`]; allocates nothing.
+/// The strip's sprites over a selection skin, in layout pixels: a dark
+/// band under each line shown (the search line and the notice) and the
+/// composition's underline; none without a line. At most
+/// [`render::STRIP_SPRITES`]; allocates nothing.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn strip_sprites(
     lines: usize,
-    preset: bool,
     underline: Option<[f32; 4]>,
     out: &mut [Sprite; render::STRIP_SPRITES],
 ) -> usize {
@@ -281,9 +280,8 @@ fn strip_sprites(
         color: [0.0, 0.0, 0.0, 0.75],
         ..Sprite::default()
     };
-    let shown = lines.min(2) + usize::from(preset);
     let mut n = 0;
-    for (i, slot) in out.iter_mut().take(shown).enumerate() {
+    for (i, slot) in out.iter_mut().take(lines.min(2)).enumerate() {
         *slot = band(i);
         n += 1;
     }
@@ -351,14 +349,15 @@ pub struct MenuScreen {
     chosen: ChosenTextState,
     /// The strip's search line and notice over a selection skin.
     strip: Option<MenuText>,
-    /// The strip's preset name, drawn while it shows.
-    preset: Option<MenuText>,
     /// The strip's lines prepared.
     strip_lines: usize,
     /// The strip's lines last prepared, and whether the last selection
     /// frame drew the strip (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     strip_shown: (Vec<String>, bool),
+    /// The strip's sprites the last selection frame staged (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    strip_staged: usize,
     /// The strip's composition, underlined.
     strip_underline: Option<[f32; 4]>,
     /// What the selection skin's text and the strip were prepared for.
@@ -489,10 +488,11 @@ impl MenuScreen {
                 refused: None,
             },
             strip: None,
-            preset: None,
             strip_lines: 0,
             #[cfg(all(test, feature = "dev-tools"))]
             strip_shown: (Vec::new(), false),
+            #[cfg(all(test, feature = "dev-tools"))]
+            strip_staged: 0,
             strip_underline: None,
             selection_key: None,
             page_caret: None,
@@ -571,12 +571,11 @@ impl MenuScreen {
         #[cfg(all(test, feature = "dev-tools"))]
         self.probe_alloc();
         let mut sprites = [Sprite::default(); render::STRIP_SPRITES];
-        let n = strip_sprites(
-            self.strip_lines,
-            u.events.preset_shown(now),
-            self.strip_underline,
-            &mut sprites,
-        );
+        let n = strip_sprites(self.strip_lines, self.strip_underline, &mut sprites);
+        #[cfg(all(test, feature = "dev-tools"))]
+        {
+            self.strip_staged = n;
+        }
         let frame = skin_model::SelectionFrame {
             now,
             target: self.renderer.target(),
@@ -747,9 +746,7 @@ impl MenuScreen {
     }
 
     /// Lays out the strip `strip` over a selection skin: its search line
-    /// and notice from the top, the preset's name in a text of its own
-    /// under them, which a frame draws only while it shows; the caret's
-    /// area goes to the window. `script`, the runtime's stop notice, is
+    /// and notice from the top; the caret's area goes to the window. `script`, the runtime's stop notice, is
     /// the notice line while `strip` has none.
     fn prepare_strip(
         &mut self,
@@ -777,20 +774,6 @@ impl MenuScreen {
         let refs: Vec<&TextBlock> = blocks.iter().collect();
         let text = self
             .strip
-            .get_or_insert_with(|| MenuText::new(&self.renderer));
-        text.prepare(&self.renderer, fonts, &refs)?;
-        let preset = MenuPage {
-            lines: vec![MenuLine {
-                text: strip.preset.clone(),
-                style: LineStyle::Title,
-            }],
-            caret: None,
-        };
-        let below = lines_from(TOP, page.lines.len());
-        let (blocks, _) = lay_out(fonts, &preset, LEFT, below);
-        let refs: Vec<&TextBlock> = blocks.iter().collect();
-        let text = self
-            .preset
             .get_or_insert_with(|| MenuText::new(&self.renderer));
         text.prepare(&self.renderer, fonts, &refs)?;
         self.strip_lines = page.lines.len();
@@ -821,6 +804,12 @@ impl MenuScreen {
     #[cfg(test)]
     pub(crate) const fn renderer_mut(&mut self) -> &mut Renderer {
         &mut self.renderer
+    }
+
+    /// The strip's sprites the last selection frame staged.
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) const fn selection_strip_staged(&self) -> usize {
+        self.strip_staged
     }
 
     /// Tells the window a frame was `presented`, with nothing allocated (a
@@ -877,6 +866,30 @@ impl Screen for MenuScreen {
 
     fn discard(&mut self) {
         self.renderer.discard();
+    }
+
+    fn publish_chart_images(
+        &mut self,
+        target: render::ChartTarget,
+        images: [Option<&skin_model::chart_image::Fitted>; 2],
+    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+        self.renderer.publish_chart_images(target, images)
+    }
+
+    fn publish_chart_absent(
+        &mut self,
+        target: render::ChartTarget,
+    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+        self.renderer.publish_chart_absent(target)
+    }
+
+    fn invalidate_chart_images(&mut self) {
+        self.renderer.invalidate_chart_images();
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
+        self.renderer.chart_key()
     }
 
     /// Stages `skin`'s chart-independent installation of `kind`,
@@ -1233,27 +1246,14 @@ impl Screen for MenuScreen {
             self.shown(timing.presented);
             return Ok(SelectionDrawn { timing, refused });
         }
-        let preset = u.events.preset_shown(now);
-        let texts = [
-            self.strip.as_ref().filter(|_| self.strip_lines > 0),
-            self.preset.as_ref().filter(|_| preset),
-        ];
-        let mut drawn: [Option<&MenuText>; 2] = [None; 2];
-        let mut n = 0;
-        for t in texts.into_iter().flatten() {
-            if let Some(slot) = drawn.get_mut(n) {
-                *slot = Some(t);
-                n += 1;
-            }
-        }
+        let drawn = self.strip.as_ref().filter(|_| self.strip_lines > 0);
         #[cfg(all(test, feature = "dev-tools"))]
         {
-            self.strip_shown.1 = drawn[0].is_some() && self.strip_lines > 0;
+            self.strip_shown.1 = drawn.is_some();
         }
         let timing = match drawn {
-            [Some(a), Some(b)] => self.renderer.submit_selection(&[a, b]),
-            [Some(a), None] => self.renderer.submit_selection(&[a]),
-            _ => self.renderer.submit_selection(&[]),
+            Some(t) => self.renderer.submit_selection(&[t]),
+            None => self.renderer.submit_selection(&[]),
         }?;
         self.shown(timing.presented);
         Ok(SelectionDrawn {

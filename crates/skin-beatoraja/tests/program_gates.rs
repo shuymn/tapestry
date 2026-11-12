@@ -315,6 +315,42 @@ fn a_chart_static_condition_gates_the_value() {
     }
 }
 
+/// A chart image's presence (S10-12), a chart fact the source prunes by
+/// too, gates a value callback for the attempt: with op 191 the callback
+/// runs while the stage file is present, not while it is absent.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_chart_image_condition_gates_the_value() {
+    use skin_model::chart_image::{ChartKey, ChartTable, ChartUv};
+    const KEY: ChartKey = ChartKey {
+        renderer: 1,
+        installation: 2,
+        atlas: 3,
+        generation: 4,
+    };
+    let stage = ChartUv {
+        uv: skin_model::FrameUv {
+            uv: [0.0, 0.0, 0.25, 0.25],
+            layer: 9,
+        },
+        native: [640, 480],
+    };
+    let body = "skin.value = { { id = \"m\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 4,
+         value = function() return ms.number(100) / 2 end } }
+"
+        .to_owned()
+        + &dst("m", "op = { 191 },");
+    let skin = import(&body).unwrap().imported.skin;
+    for (present, want) in [(true, 1), (false, 0)] {
+        let mut p = Drawn::new(skin.clone(), 4);
+        p.play.set_chart_live(Some(KEY));
+        p.play
+            .set_chart_images(ChartTable::new(present.then_some(stage), None).keyed(KEY));
+        assert_eq!(invoked(&mut p, 1_000, &[]), want, "{present}");
+        assert_eq!(invoked(&mut p, 1_016, &[]), want, "{present}");
+    }
+}
+
 /// A false static condition removes the object, a name or negation
 /// keeping its property's class.
 #[cfg(feature = "dev-tools")]
@@ -784,10 +820,10 @@ fn a_movie_grouped_image_is_not_removed() {
     );
 }
 
-/// A critical slider whose keys start at 1 s is settled to its last key
-/// (D20), but the source reads its value only from 1 s: it refuses.
+/// A critical slider whose keys start at 1 s settles, but the source reads
+/// its value only from 1 s: it refuses.
 #[test]
-fn a_settled_late_start_slider_refuses() {
+fn a_late_start_slider_refuses() {
     let body = "skin.slider = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 8, h = 8, angle = 1, range = 100,\n\
            value = function() return ms.number(75) / 100 end } }\n\
          table.insert(skin.destination, { id = \"v\", loop = 2000,\n\

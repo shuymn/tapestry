@@ -20,10 +20,10 @@
 //!   and strings) is the render thread's, apart from the renderer: made
 //!   fresh at each entry, kept across a renderer built again, whose text
 //!   is prepared again over it.
-//! - **The strip.** The search box with focus, a notice, and for
-//!   [`PRESET_SHOWN`] after a preset step the preset's name are drawn by
+//! - **The strip.** The search box with focus and a notice are drawn by
 //!   the player over the skin ([`StripText`]), the IME's composition
-//!   measured there as on the page.
+//!   measured there as on the page; with neither, nothing is drawn over
+//!   it.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -39,9 +39,6 @@ use skin_model::{
 use crate::menu_screen::{Caret, LineStyle, MenuLine, MenuPage};
 use crate::screens::ScriptSlot;
 use crate::tuning::LiveTuning;
-
-/// How long the strip shows the preset's name after a preset step.
-pub const PRESET_SHOWN: TimeUs = TimeUs(3_000_000);
 
 /// What one change of the select screen gives the render thread.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,8 +77,7 @@ impl SelectionUpdate {
 }
 
 /// The strip's text: the search line while the search box has focus,
-/// with where its composition lies, the notice, and the chosen preset's
-/// name.
+/// with where its composition lies, and the notice.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StripText {
     /// The search line and its caret's bytes in it, while the box has
@@ -89,15 +85,13 @@ pub struct StripText {
     pub search: Option<(String, usize, usize)>,
     /// The notice, if any.
     pub notice: Option<String>,
-    /// The chosen preset's name.
-    pub preset: String,
 }
 
 impl StripText {
-    /// The strip of `page` (its search line while it has a caret, and its
-    /// notice line when it says something) and `preset`.
+    /// The strip of `page`: its search line while it has a caret, and its
+    /// notice line when it says something.
     #[must_use]
-    pub fn of(page: &MenuPage, preset: &str) -> Self {
+    pub fn of(page: &MenuPage) -> Self {
         let search = page.caret.and_then(|c| {
             let line = page.lines.get(c.line)?;
             Some((line.text.clone(), c.start, c.end))
@@ -107,11 +101,7 @@ impl StripText {
             .iter()
             .find(|l| l.style == LineStyle::Notice && !l.text.is_empty())
             .map(|l| l.text.clone());
-        Self {
-            search,
-            notice,
-            preset: preset.to_owned(),
-        }
+        Self { search, notice }
     }
 
     /// The strip's lines as a page, top down: the search line with its
@@ -153,8 +143,6 @@ pub struct SelectionEvents {
     /// Each panel's opening while it is open: START, SELECT or both held
     /// ([`SkinFeed::panels`]).
     pub panels: [Option<TimeUs>; 3],
-    /// The latest preset step the flow applied in the lifetime.
-    pub preset_step: Option<TimeUs>,
 }
 
 impl SelectionEvents {
@@ -165,16 +153,6 @@ impl SelectionEvents {
             screen: Some(self.entered),
             change: Some(self.changed),
             panels: self.panels,
-        }
-    }
-
-    /// Whether the strip shows the preset's name at `now`: from a preset
-    /// step until [`PRESET_SHOWN`] after it. Allocates nothing.
-    #[must_use]
-    pub const fn preset_shown(&self, now: TimeUs) -> bool {
-        match self.preset_step {
-            Some(t) => now.0 >= t.0 && now.0 - t.0 < PRESET_SHOWN.0,
-            None => false,
         }
     }
 }
@@ -200,12 +178,14 @@ pub fn live_settings(s: &SelectionSettings, tuning: &LiveTuning) -> SelectionSet
 /// The settings a selection skin shows, as the game thread knows them
 /// (docs/stage3.md §3, Selection): the play options in force (`options`,
 /// none before any), the chosen `preset`'s gauge shown for the settings'
-/// `gauge` as an attempt resolves it, the list's `order`, and the volume
-/// and the display offset `tuning` holds now.
+/// `gauge` as an attempt resolves it and its press assignment, the
+/// failure handling `on_failure`, the list's `order`, and the volume and
+/// the display offset `tuning` holds now.
 pub fn settings_of(
     options: Option<game::PlayOptions>,
     preset: Option<&rules::RulePreset>,
     gauge: usize,
+    on_failure: game::FailureAction,
     order: SelectionOrder,
     tuning: &LiveTuning,
 ) -> Option<SelectionSettings> {
@@ -240,6 +220,8 @@ pub fn settings_of(
         order,
         gauge,
         covers_on: [covers.sudden.on, covers.lift.on, covers.hidden.on],
+        play_to_end: on_failure == game::FailureAction::PlayToEnd,
+        assignment: preset.map(|p| p.assignment),
     };
     Some(live_settings(&s, tuning))
 }
@@ -380,8 +362,6 @@ pub struct SkinFeed {
     entered: TimeUs,
     changed: TimeUs,
     key: Option<ChangeKey>,
-    /// The latest preset step the flow applied in the lifetime.
-    pub preset_step: Option<TimeUs>,
     /// The installed selection skin's song list: its center slot and its
     /// placements; `None` without a skin.
     pub window: Option<(usize, usize)>,
@@ -404,7 +384,6 @@ impl SkinFeed {
         self.entered = now;
         self.changed = now;
         self.key = None;
-        self.preset_step = None;
         self.seen = None;
     }
 
@@ -469,7 +448,7 @@ impl SkinFeed {
             lifetime: self.lifetime,
             revision: self.revision,
             list_revision: self.list_revision,
-            strip: StripText::of(&page, screen.preset()),
+            strip: StripText::of(&page),
             page,
             view,
             labels: crate::select::labels(),
@@ -479,7 +458,6 @@ impl SkinFeed {
                 panels: std::array::from_fn(|p| {
                     self.panel.filter(|&(open, _)| open == p).map(|(_, at)| at)
                 }),
-                preset_step: self.preset_step,
             },
             settings: self.settings.map(|s| SelectionSettings {
                 order: screen.order_view(),
@@ -725,22 +703,6 @@ mod tests {
     use super::{SelectionEvents, SelectionSlot, StripText};
     use crate::select::{MenuInput, MenuKey, SelectScreen};
 
-    /// The preset's name shows from its step until 3 s after it, not at
-    /// 3 s; before any step, never.
-    #[test]
-    fn the_preset_name_shows_for_three_seconds() {
-        let t = 5_000_000;
-        let e = SelectionEvents {
-            preset_step: Some(TimeUs(t)),
-            ..SelectionEvents::default()
-        };
-        assert!(e.preset_shown(TimeUs(t)));
-        assert!(e.preset_shown(TimeUs(t + 2_999_999)));
-        assert!(!e.preset_shown(TimeUs(t + 3_000_000)));
-        assert!(!e.preset_shown(TimeUs(t - 1)));
-        assert!(!SelectionEvents::default().preset_shown(TimeUs(t)));
-    }
-
     /// The settings a skin shows are the play options in force, the
     /// preset's displayed gauge as an attempt resolves it, the settings
     /// keys' values and, in each update, the list's order; none before
@@ -773,6 +735,7 @@ mod tests {
                 Some(options),
                 Some(&preset),
                 gauge,
+                game::FailureAction::Close,
                 SelectionOrder::Title,
                 &tuning,
             )
@@ -790,12 +753,41 @@ mod tests {
             // 53 % plays as the f32 0.53, which the source shows as 52.
             assert_eq!(s.master_volume, MasterVolume::of_gain(0.53));
             assert_eq!(s.master_volume.number, 52);
+            assert!(!s.play_to_end);
+            assert_eq!(s.assignment, Some(rules::Assignment::NearestTiesEarlier));
         }
+        // The failure handling the files hold, and no assignment without a
+        // preset.
+        let s = super::settings_of(
+            Some(options),
+            None,
+            0,
+            game::FailureAction::PlayToEnd,
+            SelectionOrder::Title,
+            &tuning,
+        )
+        .unwrap();
+        assert!(s.play_to_end);
+        assert_eq!(s.assignment, None);
         assert_eq!(
-            super::settings_of(None, Some(&preset), 0, SelectionOrder::Title, &tuning),
+            super::settings_of(
+                None,
+                Some(&preset),
+                0,
+                game::FailureAction::Close,
+                SelectionOrder::Title,
+                &tuning
+            ),
             None
         );
-        let s = super::settings_of(Some(options), None, 0, SelectionOrder::Title, &tuning);
+        let s = super::settings_of(
+            Some(options),
+            None,
+            0,
+            game::FailureAction::Close,
+            SelectionOrder::Title,
+            &tuning,
+        );
         assert_eq!(s.unwrap().gauge, None);
         // The update takes the list's order.
         let mut feed = super::SkinFeed {
@@ -845,12 +837,12 @@ mod tests {
     #[test]
     fn the_strip_shows_the_search_with_focus_and_the_notice() {
         let mut s = SelectScreen::new(Vec::new());
-        assert_eq!(StripText::of(&s.page(""), "p").page().lines.len(), 0);
+        assert_eq!(StripText::of(&s.page("")).page().lines.len(), 0);
         s.input(MenuInput::Key(MenuKey::Tab));
         s.input(MenuInput::Text("abc".to_owned()));
         s.input(MenuInput::Preedit("かな".to_owned()));
         s.set_notice(Some("refused".to_owned()));
-        let strip = StripText::of(&s.page(""), "p");
+        let strip = StripText::of(&s.page(""));
         let page = strip.page();
         assert_eq!(page.lines.len(), 2);
         let caret = page.caret.unwrap();
@@ -858,6 +850,5 @@ mod tests {
         assert_eq!(&line[caret.start..caret.end], "かな");
         assert!(line[..caret.start].ends_with("abc"));
         assert_eq!(page.lines[1].text, "refused");
-        assert_eq!(strip.preset, "p");
     }
 }

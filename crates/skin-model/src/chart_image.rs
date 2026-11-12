@@ -214,6 +214,10 @@ pub enum Absent {
     Changed,
     #[error("the read was cancelled")]
     Cancelled,
+    /// The worker reading it panicked or could not start (the player's):
+    /// the images it had not finished are absent, and the run goes on.
+    #[error("the image's worker failed")]
+    Failed,
 }
 
 /// A slot of an atlas layer an image is fitted into, its gutters
@@ -245,6 +249,16 @@ impl Slot {
     #[must_use]
     pub fn max_content(self) -> [u32; 2] {
         self.size.map(|s| s - 2 * GUTTER)
+    }
+
+    /// Whether `fitted`'s allocation, padding and gutters included, fits
+    /// it: what [`ChartUv::of`] places, and what a read kept for another
+    /// slot must pass to be reused for this one.
+    #[must_use]
+    pub fn holds(self, fitted: &Fitted) -> bool {
+        let [pw, ph] = fitted.padded;
+        let [sw, sh] = self.size;
+        pw <= sw && ph <= sh
     }
 }
 
@@ -743,9 +757,7 @@ impl ChartUv {
     #[must_use]
     pub fn of(fitted: &Fitted, which: ChartImage, side: u32, layer: u16) -> Option<Self> {
         let ([ox, oy], slot) = which.slot(side)?;
-        let [pw, ph] = fitted.padded;
-        let [sw, sh] = slot.size();
-        if pw > sw || ph > sh {
+        if !slot.holds(fitted) {
             return None;
         }
         let [cw, ch] = fitted.content;

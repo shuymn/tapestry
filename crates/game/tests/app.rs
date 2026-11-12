@@ -19,7 +19,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -31,10 +31,11 @@ use game::coord::{
 };
 use game::{
     AbortCause, App, AppRig, AudioQueue, AudioWaitError, ChartIngest, Closing, Command, DataRoot,
-    Decision, DeviceSettings, IngestError, Ingested, InputWaitError, LiveError, LoadRefusal,
-    Loaded, Loading, LoadingRig, LogicError, MenuCommand, Opening, Parts, Pick, PlayEnd,
-    PlayReport, PracticeInput, PracticeScreen, PresetStep, Refused, RenderSide, Rig, SessionConfig,
-    SessionError, SessionEvent, SessionEventSink, Settings,
+    Decision, DecisionLifetime, DecisionShown, DecisionTakeover, DeviceSettings, IngestError,
+    Ingested, InputWaitError, LiveError, LoadRefusal, Loaded, Loading, LoadingRig, LogicError,
+    MenuCommand, Opening, Parts, Pick, PlayEnd, PlayReport, PracticeInput, PracticeScreen,
+    PresetStep, Refused, RenderSide, Rig, SessionConfig, SessionError, SessionEvent,
+    SessionEventSink, Settings,
 };
 use input::{
     Action, DeviceId, DeviceKind, InputAdapter, Packet, ScriptItem, ScriptedInput, SourceReader,
@@ -177,6 +178,12 @@ struct Probe {
     panic_at: Option<usize>,
     /// The calls that returned.
     ended: AtomicUsize,
+    /// A gate was armed: the read's looks move the clock only while its
+    /// call is held at the gate ([`Probe::held`]).
+    gated: AtomicBool,
+    /// The gated call is held at its gate: it said it started and the gate
+    /// is not open yet.
+    holding: AtomicBool,
 }
 
 /// A call of the probed ingest held until the test opens it.
@@ -194,13 +201,21 @@ impl Probe {
             gate: Mutex::new(None),
             panic_at: None,
             ended: AtomicUsize::new(0),
+            gated: AtomicBool::new(false),
+            holding: AtomicBool::new(false),
         }
     }
 
     /// Call `at` says it started on `started`, then waits for `open`.
     fn gated(self, at: usize, started: mpsc::Sender<()>, open: mpsc::Receiver<()>) -> Self {
         *self.gate.lock().unwrap() = Some(Gate { at, started, open });
+        self.gated.store(true, Ordering::SeqCst);
         self
+    }
+
+    /// Whether the gated call is held at its gate now.
+    fn held(&self) -> bool {
+        self.holding.load(Ordering::SeqCst)
     }
 
     fn calls(&self) -> Vec<(Option<String>, usize)> {
@@ -240,8 +255,10 @@ impl ChartIngest for Probed {
         };
         let gate = p.gate.lock().unwrap().take_if(|g| g.at == call);
         if let Some(g) = gate {
+            p.holding.store(true, Ordering::SeqCst);
             let _ = g.started.send(());
             g.open.recv_timeout(watchdog()).expect("the gate opens");
+            p.holding.store(false, Ordering::SeqCst);
         }
         if p.panic_at == Some(call) {
             panic!("{INGEST_PANIC}");
@@ -479,15 +496,41 @@ struct Headless {
     refuse_page_read: bool,
     /// The page's `n`th poll (from 1) fails the run.
     page_fails_at: Option<usize>,
-    /// The decision screen's time in ms; none (every existing test) shows
-    /// none.
-    decision_ms: Option<i64>,
+    /// The decision screen's presentation; none (every existing test)
+    /// shows none.
+    shown: Option<DecisionShown>,
+    /// The lifetime of each choice, as the presentation hook was given it.
+    lifetimes: Vec<DecisionLifetime>,
+    /// A takeover this long (ms) after the next choice, of its lifetime
+    /// moved by the offset (0: the active one).
+    takeover_in: Option<(i64, u64)>,
+    /// The takeover armed at a choice: when it is due and its lifetime.
+    takeover_due: Option<(i64, DecisionLifetime)>,
+    /// Each takeover taken: the clock and the origin of the look before it.
+    takeovers_taken: Vec<(i64, Option<game::Origin>)>,
+    /// Back pressed this long (ms) after the next choice, as its press is
+    /// observed.
+    escape_in: Option<i64>,
+    /// The press armed at a choice: when it was observed.
+    escape_due: Option<i64>,
+    /// Each stamped press taken: the clock and the deadline it was judged
+    /// against.
+    escapes_taken: Vec<(i64, i64)>,
+    /// Told when a stamped press is taken.
+    escape_taken_seen: Option<mpsc::Sender<()>>,
     /// The clock's advance at each decision look, in ms.
     decision_step_ms: i64,
     /// How far (ms) each look of the chart's read moves the clock: the
     /// read's worker is real, so a test that times anything against the
     /// read sets it to 0 and moves time by its holds alone.
     read_step_ms: i64,
+    /// With a gated read: the signal after which the read's looks stop
+    /// moving the clock, the last one the test's opener waits for, so the
+    /// clock stands still from it until the read ends, however long the
+    /// opener and the worker take on the wall clock.
+    freeze_on: Option<Freeze>,
+    /// The freeze's signal was sent.
+    read_frozen: bool,
     /// How long a play's load takes while it serves the decision screen,
     /// in ms (none: as without one).
     served_load_ms: Option<i64>,
@@ -743,9 +786,19 @@ impl Headless {
             page_polls: Vec::new(),
             refuse_page_read: false,
             page_fails_at: None,
-            decision_ms: None,
+            shown: None,
+            lifetimes: Vec::new(),
+            takeover_in: None,
+            takeover_due: None,
+            takeovers_taken: Vec::new(),
+            escape_in: None,
+            escape_due: None,
+            escapes_taken: Vec::new(),
+            escape_taken_seen: None,
             decision_step_ms: 100,
             read_step_ms: 100,
+            freeze_on: None,
+            read_frozen: false,
             served_load_ms: None,
             decisions: Vec::new(),
             recoveries: Vec::new(),
@@ -806,6 +859,22 @@ impl Headless {
 
     fn at(&self) -> i64 {
         self.clock.now().0
+    }
+
+    /// The armed takeover, taken once it is due.
+    fn due_takeover(&mut self) -> Option<DecisionTakeover> {
+        let (at, lifetime) = self.takeover_due?;
+        if self.at() < at {
+            return None;
+        }
+        self.takeover_due = None;
+        let before = self.decision_looks.last().map(|&(o, _)| o);
+        self.takeovers_taken.push((self.at(), before));
+        Some(DecisionTakeover {
+            lifetime,
+            at: TimeUs(at),
+            why: "refused".to_owned(),
+        })
     }
 
     fn due_act(&self) -> Option<Act> {
@@ -1220,7 +1289,14 @@ impl Rig for Headless {
             .map(|(at, _)| *at)
             .min()
             .unwrap_or(i64::MAX);
-        let to = deadline.0.min(next).min(edit).max(self.at() + 1);
+        // A takeover wakes the wait, as the render side wakes the game.
+        let takeover = self.takeover_due.map_or(i64::MAX, |(at, _)| at);
+        let to = deadline
+            .0
+            .min(next)
+            .min(edit)
+            .min(takeover)
+            .max(self.at() + 1);
         self.clock.advance(TimeUs(to - self.at()));
         self.tick();
     }
@@ -1327,6 +1403,10 @@ impl AppRig for Headless {
                     || game::Rig::input_failure(self).is_some()
                     || game::Rig::audio_failure(self).is_some();
                 self.decision_looks.push((game::Origin::Load, self.at()));
+                // The rig's own look takes a takeover, as the player's does.
+                if let Some(takeover) = self.due_takeover() {
+                    let _ = decision.apply_takeover(takeover, self.clock.now());
+                }
                 match decision.classify(game::Origin::Load, self.clock.now(), terminal, false, None)
                 {
                     game::Verdict::Continue => {}
@@ -1512,11 +1592,27 @@ impl AppRig for Headless {
         Ok(Loading::Ready)
     }
 
-    fn decision_time(&self) -> Option<TimeUs> {
-        self.decision_ms.map(|ms| TimeUs(ms * MS))
+    fn decision_shown(
+        &mut self,
+        _pick: &Pick,
+        lifetime: DecisionLifetime,
+    ) -> Option<DecisionShown> {
+        self.lifetimes.push(lifetime);
+        let now = self.at();
+        if let Some((ms, offset)) = self.takeover_in.take() {
+            self.takeover_due = Some((now + ms * MS, DecisionLifetime(lifetime.0 + offset)));
+        }
+        if let Some(ms) = self.escape_in.take() {
+            self.escape_due = Some(now + ms * MS);
+        }
+        self.shown
     }
 
-    fn entered_decision(&mut self, pick: &Pick, d: &mut Decision) {
+    fn take_decision_takeover(&mut self) -> Option<DecisionTakeover> {
+        self.due_takeover()
+    }
+
+    fn entered_decision(&mut self, pick: &Pick, mut d: Decision) -> Decision {
         let i = self.chosen.unwrap();
         self.decisions.push((i, self.at()));
         // A look inside the choice's own wait (its input fence) left the
@@ -1542,6 +1638,7 @@ impl AppRig for Headless {
             }
             self.loading = Some(i);
         }
+        d
     }
 
     fn screen_load_failed(&mut self) -> Option<SurfaceLost> {
@@ -1574,9 +1671,21 @@ impl AppRig for Headless {
 
     fn decision_tick(&mut self, origin: game::Origin) -> Result<(), LiveError<SurfaceLost>> {
         // The read's looks move the clock (its wait has no idle wait); the
-        // App's own holds move it in their idle waits.
+        // App's own holds move it in their idle waits. A gated read's looks
+        // move it only while its call is held at the gate and before the
+        // freeze: never while the worker is still starting or finishing, so
+        // the virtual times a test sees do not depend on how the worker
+        // thread is scheduled.
         if origin == game::Origin::Read {
-            self.clock.advance(TimeUs(self.read_step_ms * MS));
+            let gated = self
+                .probe
+                .as_ref()
+                .is_some_and(|p| p.gated.load(Ordering::SeqCst));
+            let moves =
+                !gated || (!self.read_frozen && self.probe.as_ref().is_some_and(|p| p.held()));
+            if moves {
+                self.clock.advance(TimeUs(self.read_step_ms * MS));
+            }
         }
         self.tick();
         self.decision_looks.push((origin, self.at()));
@@ -1585,6 +1694,7 @@ impl AppRig for Headless {
             || game::Rig::audio_failure(self).is_some())
             && let Some(seen) = self.ending_seen.take()
         {
+            self.read_frozen |= self.freeze_on == Some(Freeze::Ending);
             let _ = seen.send(());
         }
         Ok(())
@@ -1601,9 +1711,22 @@ impl AppRig for Headless {
         self.closed_epochs += 1;
     }
 
-    fn decision_escape(&mut self, _deadline: TimeUs) -> bool {
+    fn decision_escape(&mut self, deadline: TimeUs) -> bool {
         if let Some(seen) = self.waiting_seen.take() {
+            self.read_frozen |= self.freeze_on == Some(Freeze::Waiting);
             let _ = seen.send(());
+        }
+        // A stamped press, once observed, taken and judged by its stamp.
+        if let Some(at) = self.escape_due
+            && self.at() >= at
+        {
+            self.escape_due = None;
+            self.escapes_taken.push((self.at(), deadline.0));
+            if let Some(seen) = self.escape_taken_seen.take() {
+                self.read_frozen |= self.freeze_on == Some(Freeze::Taken);
+                let _ = seen.send(());
+            }
+            return at >= deadline.0;
         }
         if self.escape_when_waiting {
             self.escapes += 1;
@@ -4412,6 +4535,17 @@ impl ProbedRun {
 /// The thread every chosen chart is read on.
 const READ_THREAD: &str = "load-read";
 
+/// The signal a gated read's clock stops at ([`Headless::freeze_on`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Freeze {
+    /// The decision screen seen waiting for the read.
+    Waiting,
+    /// The run seen ending.
+    Ending,
+    /// The stamped Back press taken.
+    Taken,
+}
+
 fn run_probed(
     refusal: Refusal,
     acts: Vec<(i64, Act)>,
@@ -5122,7 +5256,7 @@ fn a_page_job_failure_ends_the_run_at_its_pass() {
 
 /// The decision screen on, as the player's built-in presentation: 1.5 s.
 fn decided(rig: &mut Headless) {
-    rig.decision_ms = Some(1_500);
+    rig.shown = Some(DecisionShown::BuiltIn);
 }
 
 /// The choice's clock time on the decision screen of chart `i`.
@@ -5335,7 +5469,13 @@ fn an_autoplay_practice_is_refused_before_the_decision_screen() {
 #[test]
 fn a_read_done_in_time_does_not_extend_the_decision_screen() {
     let acts = vec![(0, Act::Practice(P)), (3_000, Act::Close)];
-    let (rig, _events, ran) = run(Refusal::Missing, acts, decided);
+    // The read's looks move no time: the worker is real, so the read is
+    // done in time however it is scheduled, and the page opens at the
+    // deadline the App's own hold reaches.
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.read_step_ms = 0;
+    });
     ran.unwrap();
     let choice = chosen_at(&rig, P);
     let entered = rig.page_entered_at[0];
@@ -5382,6 +5522,11 @@ fn run_late_read(
             decided(rig);
             rig.waiting_seen = Some(waiting_tx);
             rig.ending_seen = Some(ending_tx);
+            rig.freeze_on = Some(if after_end {
+                Freeze::Ending
+            } else {
+                Freeze::Waiting
+            });
             setup(rig);
         },
     );
@@ -5432,11 +5577,13 @@ fn quit_or_back_while_waiting_returns_to_selection() {
         rig.seen
     );
     // The positive control: the same press with the read done in time is
-    // never taken; the page opens at the deadline.
+    // never taken; the page opens at the deadline. The read's looks move no
+    // time, so the read is done in time however its worker is scheduled.
     let acts = vec![(0, Act::Practice(P)), (3_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
         decided(rig);
         rig.escape_when_waiting = true;
+        rig.read_step_ms = 0;
     });
     ran.unwrap();
     assert_eq!(rig.escapes, 0, "the escape was taken before the time");
@@ -5892,4 +6039,346 @@ fn a_practice_screen_failure_is_not_a_later_loads() {
         rig.seen
     );
     assert!(!rig.refused_at.is_empty(), "the refusal: {:?}", rig.seen);
+}
+
+// The presentation chosen at the choice and its takeover (design.md "Play
+// Lifecycle", the decision screen): the screen's time is the skin's, a
+// takeover counts 1.5 s from the original choice while its lifetime is
+// active, and Back past the screen's time is judged against the deadline
+// then in force.
+
+/// A decision skin's presentation: `scene` then `fadeout` ms.
+fn skin(scene: i64, fadeout: i64) -> DecisionShown {
+    DecisionShown::Skin {
+        slot: 0,
+        generation: 1,
+        scene: TimeUs(scene * MS),
+        fadeout: TimeUs(fadeout * MS),
+    }
+}
+
+/// The 2,500/500 ms decision skin, its read's looks moving no time.
+fn skinned(rig: &mut Headless) {
+    rig.shown = Some(skin(2_500, 500));
+    rig.read_step_ms = 0;
+}
+
+/// The one deadline step `rig` recorded.
+fn one_step(rig: &Headless) -> i64 {
+    let [step] = rig.deadline_steps[..] else {
+        panic!("{:?}", rig.deadline_steps);
+    };
+    step
+}
+
+/// A skinned screen ends at the choice plus `scene` plus `fadeout`: the
+/// play's step at 3,000 ms, not at 2,999 or at the built-in 1,500.
+#[test]
+fn skin_decision_ends_at_scene_plus_fadeout() {
+    let acts = vec![(0, Act::Choose(0)), (9_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, skinned);
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let choice = chosen_at(&rig, 0);
+    let step = one_step(&rig);
+    assert_eq!(step - choice, 3_000 * MS, "the step from the choice");
+    assert!(
+        rig.decision_looks
+            .iter()
+            .any(|&(o, at)| o == game::Origin::Ready && at < step),
+        "no look before the deadline: {:?}",
+        rig.decision_looks
+    );
+    assert_eq!(rig.loading_pages, [(0, step)]);
+}
+
+/// The hook off (the default, every headless fixture): no decision
+/// screen, no step, no epoch, and the idle waits are those of a run
+/// without one; each choice is still given its own lifetime.
+#[test]
+fn hook_off_runs_no_decision_screen() {
+    let acts = vec![
+        (0, Act::Choose(0)),
+        (4_000, Act::Back),
+        (500, Act::Choose(1)),
+        (4_000, Act::Close),
+    ];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |_| {});
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    assert!(rig.decisions.is_empty(), "{:?}", rig.decisions);
+    assert!(rig.decision_looks.is_empty(), "{:?}", rig.decision_looks);
+    assert!(rig.deadline_steps.is_empty());
+    assert_eq!(rig.closed_epochs, 0);
+    assert_eq!(
+        rig.lifetimes,
+        [DecisionLifetime(1), DecisionLifetime(2)],
+        "one lifetime per choice"
+    );
+    assert_eq!(rig.idle_waits, IDLE_WAITS_OFF, "{:?}", rig.idle_waits);
+}
+
+/// The idle waits of [`hook_off_runs_no_decision_screen`]'s run: each wait's
+/// clock and deadline.
+const IDLE_WAITS_OFF: [(i64, i64); 17] = [
+    (7_711_000, 7_711_000),
+    (7_711_001, 7_961_001),
+    (7_961_001, 8_211_001),
+    (8_211_001, 8_461_001),
+    (8_461_001, 8_711_001),
+    (8_711_001, 8_961_001),
+    (8_961_001, 9_211_001),
+    (9_000_000, 9_211_001),
+    (9_211_001, 9_461_001),
+    (9_461_001, 9_711_001),
+    (12_111_000, 9_711_001),
+    (12_111_001, 12_361_001),
+    (12_361_001, 12_611_001),
+    (12_611_001, 12_861_001),
+    (12_861_001, 13_111_001),
+    (13_111_001, 13_361_001),
+    (13_361_001, 13_611_001),
+];
+
+/// A skin refused 1,000 ms after the choice: the built-in presentation
+/// from then, the step at the choice plus 1,500 ms, not 1,500 ms after the
+/// refusal; the hold's wait woken at the refusal takes it.
+#[test]
+fn takeover_before_builtin_time_ends_at_1500() {
+    let acts = vec![(0, Act::Choose(0)), (9_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        skinned(rig);
+        rig.takeover_in = Some((1_000, 0));
+    });
+    ran.unwrap();
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let choice = chosen_at(&rig, 0);
+    assert_eq!(
+        rig.takeovers_taken,
+        [(choice + 1_000 * MS, Some(game::Origin::Ready))]
+    );
+    assert_eq!(one_step(&rig) - choice, 1_500 * MS);
+    assert_eq!(rig.decisions.len(), 1, "no second decision screen");
+}
+
+/// The hold of a practice page's entry takes a takeover at its next look:
+/// the look recorded at the refusal's time, then the page at the choice
+/// plus 1,500 ms.
+#[test]
+fn hold_applies_a_takeover_at_its_next_look() {
+    let acts = vec![(0, Act::Practice(P)), (9_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        skinned(rig);
+        rig.takeover_in = Some((1_000, 0));
+    });
+    ran.unwrap();
+    let choice = chosen_at(&rig, P);
+    let taken = choice + 1_000 * MS;
+    assert!(
+        rig.decision_looks.contains(&(game::Origin::Jobs, taken)),
+        "{:?}",
+        rig.decision_looks
+    );
+    assert_eq!(rig.takeovers_taken, [(taken, Some(game::Origin::Jobs))]);
+    assert_eq!(rig.page_entered_at, [choice + 1_500 * MS]);
+}
+
+/// A skin refused 2,000 ms after the choice, past the built-in time: the
+/// screen ends at once on its route: the play's loading state, the
+/// practice page (its chart read), selection for a held refused load.
+#[test]
+fn takeover_after_builtin_time_routes_at_once() {
+    for (route, chart, refusal) in [
+        ("play", Some(0), Refusal::Missing),
+        ("practice", None, Refusal::Missing),
+        ("refused", Some(2), Refusal::Bank),
+    ] {
+        let acts = vec![
+            (0, chart.map_or(Act::Practice(P), Act::Choose)),
+            (9_000, Act::Close),
+        ];
+        let (rig, _events, ran) = run(refusal, acts, |rig| {
+            skinned(rig);
+            rig.takeover_in = Some((2_000, 0));
+        });
+        ran.unwrap();
+        let choice = chosen_at(&rig, chart.unwrap_or(P));
+        let at = choice + 2_000 * MS;
+        assert_eq!(rig.takeovers_taken.len(), 1, "{route}");
+        match route {
+            "play" => assert_eq!(one_step(&rig), at, "{route}"),
+            "practice" => assert_eq!(rig.page_entered_at, [at], "{route}"),
+            _ => {
+                assert_eq!(rig.refused_at, [at], "{route}");
+                assert!(rig.deadline_steps.is_empty(), "{route}");
+            }
+        }
+    }
+}
+
+/// A takeover naming another lifetime changes nothing: the skin's own
+/// deadline holds.
+#[test]
+fn takeover_from_another_lifetime_is_ignored() {
+    let acts = vec![(0, Act::Choose(0)), (9_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        skinned(rig);
+        rig.takeover_in = Some((1_000, 1));
+    });
+    ran.unwrap();
+    let choice = chosen_at(&rig, 0);
+    assert_eq!(rig.takeovers_taken.len(), 1, "taken and dropped");
+    assert_eq!(one_step(&rig) - choice, 3_000 * MS);
+}
+
+/// The lifetime ends at the step: a takeover of it arriving after the
+/// step (inside the load's wait) changes nothing, so a refused load after
+/// it returns at once rather than being held to a deadline moved to
+/// 1,500 ms.
+#[test]
+fn takeover_after_step_is_ignored() {
+    let acts = vec![(0, Act::Choose(2)), (9_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Bank, acts, |rig| {
+        rig.shown = Some(skin(1_000, 0));
+        rig.read_step_ms = 0;
+        rig.served_load_ms = Some(1_300);
+        rig.takeover_in = Some((1_200, 0));
+    });
+    ran.unwrap();
+    let choice = chosen_at(&rig, 2);
+    assert_eq!(one_step(&rig) - choice, 1_000 * MS);
+    assert_eq!(
+        rig.takeovers_taken,
+        [(choice + 1_200 * MS, Some(game::Origin::Load))]
+    );
+    assert_eq!(rig.refused_at, [choice + 1_300 * MS], "held after the step");
+}
+
+/// A takeover of a skin shorter than the built-in time lengthens the
+/// screen to the choice plus 1,500 ms.
+#[test]
+fn takeover_lengthens_a_short_skin_screen() {
+    let acts = vec![(0, Act::Choose(0)), (9_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        rig.shown = Some(skin(500, 500));
+        rig.read_step_ms = 0;
+        rig.takeover_in = Some((800, 0));
+    });
+    ran.unwrap();
+    let choice = chosen_at(&rig, 0);
+    assert_eq!(rig.takeovers_taken.len(), 1);
+    assert_eq!(one_step(&rig) - choice, 1_500 * MS);
+}
+
+/// A practice run whose read is held until a stamped Back press is taken,
+/// the skin, the takeover and the press armed by `setup`.
+fn run_read_until_escape(setup: impl FnOnce(&mut Headless)) -> ProbedRun {
+    let acts = vec![(0, Act::Practice(P)), (10_000, Act::Close)];
+    let (started_tx, started) = mpsc::channel();
+    let (open_tx, open) = mpsc::channel();
+    let (taken_tx, taken) = mpsc::channel::<()>();
+    let opener = std::thread::spawn(move || {
+        started.recv_timeout(watchdog()).expect("the read started");
+        taken.recv_timeout(watchdog()).expect("the press taken");
+        let _ = open_tx.send(());
+    });
+    let run = run_probed(
+        Refusal::Missing,
+        acts,
+        Spawner::SYSTEM,
+        |p| p.gated(0, started_tx, open),
+        |rig, _| {
+            rig.escape_taken_seen = Some(taken_tx);
+            rig.freeze_on = Some(Freeze::Taken);
+            setup(rig);
+        },
+    );
+    opener.join().unwrap();
+    run
+}
+
+/// A takeover shortening the screen (3,000 → 1,500 ms) while practice
+/// waits for its read: Back stamped at 2,000 ms, taken after the takeover,
+/// is past the deadline then in force and goes back.
+#[test]
+fn escape_after_takeover_shortening() {
+    let run = run_read_until_escape(|rig| {
+        rig.shown = Some(skin(2_500, 500));
+        rig.takeover_in = Some((2_500, 0));
+        rig.escape_in = Some(2_000);
+    });
+    run.ran.as_ref().unwrap();
+    let rig = &run.rig;
+    let choice = chosen_at(rig, P);
+    assert_eq!(
+        rig.takeovers_taken,
+        [(choice + 2_500 * MS, Some(game::Origin::Read))]
+    );
+    let [(taken, deadline)] = rig.escapes_taken[..] else {
+        panic!("{:?}", rig.escapes_taken);
+    };
+    assert!(taken > choice + 2_500 * MS, "taken before the takeover");
+    assert_eq!(deadline, choice + 1_500 * MS, "judged against the new time");
+    assert!(rig.page_entered_at.is_empty(), "the page opened");
+    assert_eq!(rig.closed_epochs, 1);
+}
+
+/// A takeover lengthening the screen (1,000 → 1,500 ms) while practice
+/// waits for its read: Back stamped at 1,200 ms, at the takeover's look,
+/// is before the deadline then in force and is dropped; the page opens.
+#[test]
+fn escape_after_takeover_lengthening() {
+    let run = run_read_until_escape(|rig| {
+        rig.shown = Some(skin(1_000, 0));
+        rig.takeover_in = Some((1_200, 0));
+        rig.escape_in = Some(1_200);
+    });
+    run.ran.as_ref().unwrap();
+    let rig = &run.rig;
+    let choice = chosen_at(rig, P);
+    assert_eq!(
+        rig.takeovers_taken,
+        [(choice + 1_200 * MS, Some(game::Origin::Read))]
+    );
+    let [(_, deadline)] = rig.escapes_taken[..] else {
+        panic!("{:?}", rig.escapes_taken);
+    };
+    assert_eq!(deadline, choice + 1_500 * MS, "judged against the new time");
+    assert_eq!(rig.page_entered_at.len(), 1, "went back: {:?}", rig.seen);
+}
+
+/// A skinned screen follows its own time on the play path whether the
+/// chart was ready before the scene ended, after it, or after the screen's
+/// end: the loading state from the step at 3,000 ms in each.
+#[test]
+fn chart_ready_before_and_after_scene_both_reach_loading() {
+    for load in [None, Some(2_800), Some(3_500)] {
+        let acts = vec![(0, Act::Choose(0)), (9_000, Act::Close)];
+        let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+            skinned(rig);
+            rig.served_load_ms = load;
+        });
+        ran.unwrap();
+        assert!(rig.violations.is_empty(), "{load:?}: {:?}", rig.violations);
+        let choice = chosen_at(&rig, 0);
+        let step = one_step(&rig);
+        assert_eq!(step - choice, 3_000 * MS, "{load:?}");
+        assert_eq!(rig.loading_pages, [(0, step)], "{load:?}");
+        let ready = choice + load.unwrap_or(0) * MS;
+        assert!(rig.opened_at[0] >= step.max(ready), "{load:?}");
+    }
+}
+
+/// A refused load under a skinned screen is held to the skin's time, then
+/// selection shows it.
+#[test]
+fn refused_load_held_to_the_skin_time() {
+    let acts = vec![(0, Act::Choose(2)), (9_000, Act::Close)];
+    let (rig, _events, ran) = run(Refusal::Bank, acts, skinned);
+    ran.unwrap();
+    let choice = chosen_at(&rig, 2);
+    assert_eq!(rig.refused_at, [choice + 3_000 * MS]);
+    assert!(rig.deadline_steps.is_empty());
+    assert!(rig.loading_pages.is_empty());
+    assert_eq!(rig.closed_epochs, 1);
 }

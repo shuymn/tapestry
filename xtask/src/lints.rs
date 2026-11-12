@@ -474,6 +474,8 @@ pub const IN_PLAY: &[Site] = &[
     Site::Fns("crates/render/src/gpu.rs", &["Gpu::device", "Gpu::queue"]),
     Site::File("crates/player/src/measure.rs"),
     Site::File("crates/player/src/render_side.rs"),
+    // The chart images' currency, which the render thread asks per frame.
+    Site::File("crates/player/src/chart_currency.rs"),
     // The application clock: each frame's readouts and every present.
     Site::File("crates/player/src/app_clock.rs"),
     Site::File("crates/player/src/turntable.rs"),
@@ -499,18 +501,18 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::resize",
             "MenuScreen::target",
             "MenuScreen::minimized",
+            "MenuScreen::chart_key",
             "MenuScreen::build_selection_frame",
             "MenuScreen::build_page_frame",
             "strip_sprites",
         ],
     ),
-    // The selection frame's timers, the strip's preset line, the
-    // lifetime check before the frame's build and the live settings.
+    // The selection frame's timers, the lifetime check before the
+    // frame's build and the live settings.
     Site::Fns(
         "crates/player/src/selection_skin.rs",
         &[
             "SelectionEvents::timers",
-            "SelectionEvents::preset_shown",
             "SelectionSlot::current",
             "live_settings",
             "SelectionLogic::apply_settings",

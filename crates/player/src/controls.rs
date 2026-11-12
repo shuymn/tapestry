@@ -44,7 +44,8 @@ const EPOCH: u8 = 8;
 /// ([`game::Decision::classify`]) and runs the play's deadline step there,
 /// on whichever thread asks.
 pub struct DecisionWatch {
-    /// The decision screen, lent by the flow for the wait.
+    /// The decision screen, moved here by the flow for the wait and back
+    /// at its end ([`Controls::unwatch_decision`]).
     pub decision: game::Decision,
     /// Where the screen is while the wait runs: a play's load
     /// ([`game::Origin::Load`]), or practice before its chart is read
@@ -66,6 +67,15 @@ impl std::fmt::Debug for DecisionWatch {
         f.debug_struct("DecisionWatch")
             .field("decision", &self.decision)
             .finish_non_exhaustive()
+    }
+}
+
+/// The chart images' work a look serves ([`Controls::serve_images`]).
+pub struct ImageService(pub Box<dyn Fn() + Send + Sync>);
+
+impl std::fmt::Debug for ImageService {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ImageService")
     }
 }
 
@@ -105,6 +115,10 @@ pub struct Controls {
     scene: std::sync::atomic::AtomicU64,
     /// The decision screen a chart's load serves, while it loads.
     watch: std::sync::Mutex<Option<DecisionWatch>>,
+    /// What every look serves before its verdict: the chart images' work
+    /// a step left (a finished job's set, a job begun later, a terminal
+    /// absence published), nonblocking ([`serve_images`](Self::serve_images)).
+    images: std::sync::Mutex<Option<ImageService>>,
 }
 
 impl Controls {
@@ -143,6 +157,7 @@ impl Controls {
             overlay: Arc::new(AtomicBool::new(false)),
             scene: std::sync::atomic::AtomicU64::new(0),
             watch: std::sync::Mutex::new(None),
+            images: std::sync::Mutex::new(None),
         }
     }
 
@@ -362,6 +377,15 @@ impl Controls {
             .is_some_and(|w| w.decision.left().is_some())
     }
 
+    /// Every look ([`look`](Self::look)) serves the chart images' work with
+    /// `serve` from now on, which must not block.
+    pub fn serve_images(&self, serve: ImageService) {
+        *self
+            .images
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(serve);
+    }
+
     /// The waits of a chart's load serve `watch` from now on, until
     /// [`unwatch_decision`](Self::unwatch_decision).
     pub fn watch_decision(&self, watch: DecisionWatch) {
@@ -371,18 +395,20 @@ impl Controls {
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(watch);
     }
 
-    /// The watched decision as it stands (tests).
+    /// `f` on the watched decision as it stands, borrowed under the
+    /// watch's lock (tests).
     #[cfg(all(test, feature = "dev-tools"))]
-    pub fn watched(&self) -> Option<game::Decision> {
-        self.watch
+    pub fn with_watched<T>(&self, f: impl FnOnce(Option<&game::Decision>) -> T) -> T {
+        f(self
+            .watch
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .as_ref()
-            .map(|w| w.decision)
+            .map(|w| &w.decision))
     }
 
     /// The load's waits serve no decision screen any more: the one they
-    /// served, as they left it.
+    /// served, moved back as they left it.
     pub fn unwatch_decision(&self) -> Option<game::Decision> {
         self.watch
             .lock()
@@ -401,6 +427,13 @@ impl Controls {
     /// here: a press counts by when it was observed, at App's next look.
     /// `None` without a decision screen watched.
     pub fn look(&self) -> Option<game::Verdict> {
+        // The chart images' work first, whatever the verdict: it neither
+        // blocks nor changes it.
+        if let Ok(images) = self.images.try_lock()
+            && let Some(serve) = images.as_ref()
+        {
+            (serve.0)();
+        }
         let mut watch = self
             .watch
             .lock()
@@ -771,7 +804,8 @@ mod tests {
             c.close_epoch();
             c.watch_decision(watch(game::Decision::begin(
                 now,
-                Some(game::DECISION_TIME),
+                game::DecisionLifetime(1),
+                Some(game::DecisionShown::BuiltIn),
                 false,
             )));
             assert!(!c.look().is_some_and(game::Verdict::leaves));
@@ -783,7 +817,8 @@ mod tests {
             let due = bms_model::TimeUs(now.0 - game::DECISION_TIME.0);
             c.watch_decision(watch(game::Decision::begin(
                 due,
-                Some(game::DECISION_TIME),
+                game::DecisionLifetime(2),
+                Some(game::DecisionShown::BuiltIn),
                 false,
             )));
             let scene = c.scene();

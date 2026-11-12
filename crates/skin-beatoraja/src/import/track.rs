@@ -193,16 +193,6 @@ impl Accepted {
     pub(crate) fn fixed_but_alpha(&self) -> bool {
         self.fixed.but_alpha
     }
-
-    /// Leaves one key at 0: the last, whose rect, colour and angle stand
-    /// for the whole track.
-    pub(crate) fn keep_last_from_start(&mut self) {
-        self.keys.drain(..self.keys.len().saturating_sub(1));
-        for k in &mut self.keys {
-            k.at = 0;
-        }
-        self.fixed = Fixed::of(&self.keys);
-    }
 }
 
 /// Sorts `keys` stably by time and accepts them with loop point `l`:
@@ -296,6 +286,23 @@ pub(crate) enum Stretch {
 }
 
 impl Stretch {
+    /// A chart image's stretch at placement for this mode
+    /// ([`skin_model::chart_image::ChartStretch`]), which keeps every mode
+    /// but the trimmed ones: `None` for those.
+    pub(crate) const fn chart(self) -> Option<skin_model::chart_image::ChartStretch> {
+        use skin_model::chart_image::ChartStretch;
+        match self {
+            Self::Identity => Some(ChartStretch::Fill),
+            Self::Inner => Some(ChartStretch::Inner),
+            Self::Outer => Some(ChartStretch::Outer),
+            Self::FitWidth => Some(ChartStretch::FitWidth),
+            Self::FitHeight => Some(ChartStretch::FitHeight),
+            Self::NoExpanding => Some(ChartStretch::NoExpanding),
+            Self::NoResize => Some(ChartStretch::NoResize),
+            Self::Trimmed => None,
+        }
+    }
+
     pub(crate) fn of(mode: i32) -> Self {
         match mode {
             1 => Self::Inner,

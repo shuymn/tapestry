@@ -1399,7 +1399,12 @@ fn read_with_the_background_held(
                 }
             });
             let now = bms_model::TimeSource::now(&rig.clock);
-            let mut decision = game::Decision::begin(now, Some(game::DECISION_TIME), true);
+            let mut decision = game::Decision::begin(
+                now,
+                game::DecisionLifetime(1),
+                Some(game::DecisionShown::BuiltIn),
+                true,
+            );
             let got = outcome(rig.practice_read(&read, &mut decision));
             returned.store(true, Ordering::SeqCst);
             assert_eq!(got, Loading::Ready);
@@ -1511,7 +1516,8 @@ fn due_practice(rig: &PlayerRig<'_>) -> game::Decision {
     let now = rig.clock.now();
     game::Decision::begin(
         bms_model::TimeUs(now.0 - game::DECISION_TIME.0),
-        Some(game::DECISION_TIME),
+        game::DecisionLifetime(1),
+        Some(game::DecisionShown::BuiltIn),
         true,
     )
 }
