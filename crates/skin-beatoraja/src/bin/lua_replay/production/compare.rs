@@ -102,7 +102,16 @@ fn converted(field: &str, o: Outcome) -> Option<Converted> {
 }
 
 /// The first difference between production's invocation and the
-/// reference's, if any.
+/// reference's, if any: the class, the raw value, then the converted
+/// output.
+///
+/// One raw difference is no finding by itself: the reference's `nil`
+/// against production's integer 0. The program gives 0 where a branch of
+/// the source returns nothing, and the source converts that `nil` to 0
+/// (`toint()`, `toboolean()`). The pair agrees only when the converted
+/// output is equal, so a `value` agrees (0 drawn on both sides) and a
+/// `draw` does not (`nil` false, 0 true); `nil` against any other integer
+/// stays a raw difference.
 fn differ(field: &str, prod: (Result<Val, Fail>, Converted), refo: Outcome) -> Option<String> {
     let (result, conv) = prod;
     let class = match (result, refo) {
@@ -116,6 +125,7 @@ fn differ(field: &str, prod: (Result<Val, Fail>, Converted), refo: Outcome) -> O
     }
     if let (Ok(v), Outcome::Value(r)) = (result, refo)
         && !same_raw(val_raw(v), r)
+        && !matches!((v, r), (Val::Int(0), Raw::Nil))
     {
         return Some(format!("raw: production {v:?}, reference {r:?}"));
     }
@@ -1214,6 +1224,41 @@ mod tests {
     use super::compare;
     use crate::observed::Point;
     use crate::tests::{TAMPERED, pieces};
+
+    /// The reference's `nil` against production's integer 0 agrees only
+    /// when the converted output is equal; `nil` against another integer,
+    /// and any other raw mismatch, stays a raw finding.
+    #[test]
+    fn nil_against_zero_agrees_only_with_the_same_output() {
+        use skin_model::present::Val;
+
+        use super::differ;
+        use crate::observed::{Outcome, Raw};
+
+        let nil = Outcome::Value(Raw::Nil);
+        // A value: `nil` converts to 0, given, as production's 0 does.
+        assert_eq!(
+            differ("value", (Ok(Val::Int(0)), Converted::Int(0, true)), nil),
+            None
+        );
+        // A draw: `nil` is false where production's 0 is true.
+        let d = differ("draw", (Ok(Val::Int(0)), Converted::Bool(true)), nil);
+        assert!(
+            d.as_deref().is_some_and(|d| d.starts_with("converted:")),
+            "{d:?}"
+        );
+        // A value whose 0 production does not give.
+        let d = differ("value", (Ok(Val::Int(0)), Converted::Int(0, false)), nil);
+        assert!(
+            d.as_deref().is_some_and(|d| d.starts_with("converted:")),
+            "{d:?}"
+        );
+        // `nil` against another integer, and a non-nil mismatch.
+        for (v, r) in [(Val::Int(7), Raw::Nil), (Val::Int(7), Raw::Int(9))] {
+            let d = differ("value", (Ok(v), Converted::Int(7, true)), Outcome::Value(r));
+            assert!(d.as_deref().is_some_and(|d| d.starts_with("raw:")), "{d:?}");
+        }
+    }
 
     /// The untouched run agrees; each alteration of production's side is
     /// found.
