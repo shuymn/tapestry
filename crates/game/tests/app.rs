@@ -19,7 +19,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
@@ -178,6 +178,12 @@ struct Probe {
     panic_at: Option<usize>,
     /// The calls that returned.
     ended: AtomicUsize,
+    /// A gate was armed: the read's looks move the clock only while its
+    /// call is held at the gate ([`Probe::held`]).
+    gated: AtomicBool,
+    /// The gated call is held at its gate: it said it started and the gate
+    /// is not open yet.
+    holding: AtomicBool,
 }
 
 /// A call of the probed ingest held until the test opens it.
@@ -195,13 +201,21 @@ impl Probe {
             gate: Mutex::new(None),
             panic_at: None,
             ended: AtomicUsize::new(0),
+            gated: AtomicBool::new(false),
+            holding: AtomicBool::new(false),
         }
     }
 
     /// Call `at` says it started on `started`, then waits for `open`.
     fn gated(self, at: usize, started: mpsc::Sender<()>, open: mpsc::Receiver<()>) -> Self {
         *self.gate.lock().unwrap() = Some(Gate { at, started, open });
+        self.gated.store(true, Ordering::SeqCst);
         self
+    }
+
+    /// Whether the gated call is held at its gate now.
+    fn held(&self) -> bool {
+        self.holding.load(Ordering::SeqCst)
     }
 
     fn calls(&self) -> Vec<(Option<String>, usize)> {
@@ -241,8 +255,10 @@ impl ChartIngest for Probed {
         };
         let gate = p.gate.lock().unwrap().take_if(|g| g.at == call);
         if let Some(g) = gate {
+            p.holding.store(true, Ordering::SeqCst);
             let _ = g.started.send(());
             g.open.recv_timeout(watchdog()).expect("the gate opens");
+            p.holding.store(false, Ordering::SeqCst);
         }
         if p.panic_at == Some(call) {
             panic!("{INGEST_PANIC}");
@@ -508,6 +524,13 @@ struct Headless {
     /// read's worker is real, so a test that times anything against the
     /// read sets it to 0 and moves time by its holds alone.
     read_step_ms: i64,
+    /// With a gated read: the signal after which the read's looks stop
+    /// moving the clock, the last one the test's opener waits for, so the
+    /// clock stands still from it until the read ends, however long the
+    /// opener and the worker take on the wall clock.
+    freeze_on: Option<Freeze>,
+    /// The freeze's signal was sent.
+    read_frozen: bool,
     /// How long a play's load takes while it serves the decision screen,
     /// in ms (none: as without one).
     served_load_ms: Option<i64>,
@@ -774,6 +797,8 @@ impl Headless {
             escape_taken_seen: None,
             decision_step_ms: 100,
             read_step_ms: 100,
+            freeze_on: None,
+            read_frozen: false,
             served_load_ms: None,
             decisions: Vec::new(),
             recoveries: Vec::new(),
@@ -1646,9 +1671,21 @@ impl AppRig for Headless {
 
     fn decision_tick(&mut self, origin: game::Origin) -> Result<(), LiveError<SurfaceLost>> {
         // The read's looks move the clock (its wait has no idle wait); the
-        // App's own holds move it in their idle waits.
+        // App's own holds move it in their idle waits. A gated read's looks
+        // move it only while its call is held at the gate and before the
+        // freeze: never while the worker is still starting or finishing, so
+        // the virtual times a test sees do not depend on how the worker
+        // thread is scheduled.
         if origin == game::Origin::Read {
-            self.clock.advance(TimeUs(self.read_step_ms * MS));
+            let gated = self
+                .probe
+                .as_ref()
+                .is_some_and(|p| p.gated.load(Ordering::SeqCst));
+            let moves =
+                !gated || (!self.read_frozen && self.probe.as_ref().is_some_and(|p| p.held()));
+            if moves {
+                self.clock.advance(TimeUs(self.read_step_ms * MS));
+            }
         }
         self.tick();
         self.decision_looks.push((origin, self.at()));
@@ -1657,6 +1694,7 @@ impl AppRig for Headless {
             || game::Rig::audio_failure(self).is_some())
             && let Some(seen) = self.ending_seen.take()
         {
+            self.read_frozen |= self.freeze_on == Some(Freeze::Ending);
             let _ = seen.send(());
         }
         Ok(())
@@ -1675,6 +1713,7 @@ impl AppRig for Headless {
 
     fn decision_escape(&mut self, deadline: TimeUs) -> bool {
         if let Some(seen) = self.waiting_seen.take() {
+            self.read_frozen |= self.freeze_on == Some(Freeze::Waiting);
             let _ = seen.send(());
         }
         // A stamped press, once observed, taken and judged by its stamp.
@@ -1684,6 +1723,7 @@ impl AppRig for Headless {
             self.escape_due = None;
             self.escapes_taken.push((self.at(), deadline.0));
             if let Some(seen) = self.escape_taken_seen.take() {
+                self.read_frozen |= self.freeze_on == Some(Freeze::Taken);
                 let _ = seen.send(());
             }
             return at >= deadline.0;
@@ -4495,6 +4535,17 @@ impl ProbedRun {
 /// The thread every chosen chart is read on.
 const READ_THREAD: &str = "load-read";
 
+/// The signal a gated read's clock stops at ([`Headless::freeze_on`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Freeze {
+    /// The decision screen seen waiting for the read.
+    Waiting,
+    /// The run seen ending.
+    Ending,
+    /// The stamped Back press taken.
+    Taken,
+}
+
 fn run_probed(
     refusal: Refusal,
     acts: Vec<(i64, Act)>,
@@ -5418,7 +5469,13 @@ fn an_autoplay_practice_is_refused_before_the_decision_screen() {
 #[test]
 fn a_read_done_in_time_does_not_extend_the_decision_screen() {
     let acts = vec![(0, Act::Practice(P)), (3_000, Act::Close)];
-    let (rig, _events, ran) = run(Refusal::Missing, acts, decided);
+    // The read's looks move no time: the worker is real, so the read is
+    // done in time however it is scheduled, and the page opens at the
+    // deadline the App's own hold reaches.
+    let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
+        decided(rig);
+        rig.read_step_ms = 0;
+    });
     ran.unwrap();
     let choice = chosen_at(&rig, P);
     let entered = rig.page_entered_at[0];
@@ -5465,6 +5522,11 @@ fn run_late_read(
             decided(rig);
             rig.waiting_seen = Some(waiting_tx);
             rig.ending_seen = Some(ending_tx);
+            rig.freeze_on = Some(if after_end {
+                Freeze::Ending
+            } else {
+                Freeze::Waiting
+            });
             setup(rig);
         },
     );
@@ -5515,11 +5577,13 @@ fn quit_or_back_while_waiting_returns_to_selection() {
         rig.seen
     );
     // The positive control: the same press with the read done in time is
-    // never taken; the page opens at the deadline.
+    // never taken; the page opens at the deadline. The read's looks move no
+    // time, so the read is done in time however its worker is scheduled.
     let acts = vec![(0, Act::Practice(P)), (3_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
         decided(rig);
         rig.escape_when_waiting = true;
+        rig.read_step_ms = 0;
     });
     ran.unwrap();
     assert_eq!(rig.escapes, 0, "the escape was taken before the time");
@@ -6225,6 +6289,7 @@ fn run_read_until_escape(setup: impl FnOnce(&mut Headless)) -> ProbedRun {
         |p| p.gated(0, started_tx, open),
         |rig, _| {
             rig.escape_taken_seen = Some(taken_tx);
+            rig.freeze_on = Some(Freeze::Taken);
             setup(rig);
         },
     );
