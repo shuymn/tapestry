@@ -2222,19 +2222,20 @@ impl PlayerRig<'_> {
         Ok(())
     }
 
-    /// `f` with `decision` watched by the waits it owns
+    /// `f` with `decision` moved to the waits it owns
     /// ([`Controls::look`], reached from every wait's stop), when
-    /// the screen shows; `decision` comes back as they left it.
+    /// the screen shows; `decision` comes back with `f`'s answer, as they
+    /// left it.
     ///
     /// [`Controls::look`]: crate::controls::Controls::look
     fn watching<T>(
         &mut self,
         chart: &std::path::Path,
-        decision: &mut game::Decision,
+        decision: game::Decision,
         f: impl FnOnce(&mut Self) -> T,
-    ) -> T {
+    ) -> (T, game::Decision) {
         if !decision.on() {
-            return f(self);
+            return (f(self), decision);
         }
         let reveal = self.render.reveal_handle();
         let name = file_name(chart);
@@ -2247,7 +2248,7 @@ impl PlayerRig<'_> {
         };
         self.controls
             .watch_decision(crate::controls::DecisionWatch {
-                decision: *decision,
+                decision,
                 origin,
                 reveal: Box::new(move || {
                     println!("load: the play screen loads {name}");
@@ -2257,10 +2258,12 @@ impl PlayerRig<'_> {
                 screen: Some(self.render.recovery_handle()),
             });
         let out = f(self);
-        if let Some(d) = self.controls.unwatch_decision() {
-            *decision = d;
-        }
-        out
+        // Only this wait unwatches what it watched.
+        let decision = self
+            .controls
+            .unwatch_decision()
+            .unwrap_or_else(game::Decision::off);
+        (out, decision)
     }
 
     /// [`AppRig::load_chart`]'s load, its waits' stops serving the
@@ -2656,8 +2659,13 @@ impl AppRig for PlayerRig<'_> {
         cancelled(self.controls)
     }
 
-    fn decision_time(&self) -> Option<TimeUs> {
-        Some(game::DECISION_TIME)
+    /// The built-in presentation, for every choice.
+    fn decision_shown(
+        &mut self,
+        _pick: &Pick,
+        _lifetime: game::DecisionLifetime,
+    ) -> Option<game::DecisionShown> {
+        Some(game::DecisionShown::BuiltIn)
     }
 
     /// The decision screen begins: the input epoch first, so nothing
@@ -2666,7 +2674,7 @@ impl AppRig for PlayerRig<'_> {
     /// and held until the deadline reveals it; then the attempt's entry
     /// (its loading-time adjustments are its own), whose fence waits on the
     /// input thread with the screen already showing.
-    fn entered_decision(&mut self, pick: &Pick, d: &mut game::Decision) {
+    fn entered_decision(&mut self, pick: &Pick, d: game::Decision) -> game::Decision {
         // A new generation of the chart's images before the held loading
         // lifetime begins: none of the last choice's draws when the
         // deadline reveals it.
@@ -2678,7 +2686,7 @@ impl AppRig for PlayerRig<'_> {
         self.render.leave_selection();
         let (Pick::Play(chart) | Pick::Practice(chart)) = pick;
         let Some(sel) = &mut self.selection else {
-            return;
+            return d;
         };
         let page = loading_text(sel, chart, self.autoplay);
         println!("decision: {} chosen", file_name(chart));
@@ -2698,12 +2706,13 @@ impl AppRig for PlayerRig<'_> {
         // The attempt's entry last: its fence waits on the input thread with
         // the screen and its tone already out, serving the decision screen
         // (a leaving verdict is left in `d` for App to route).
-        self.watching(chart, d, |rig| {
+        let ((), d) = self.watching(chart, d, |rig| {
             rig.next_window_scene();
             if let Some((driver, mut pump)) = rig.adjustments_watched() {
                 let _ = driver.enter_attempt_served(None, &mut pump);
             }
         });
+        d
     }
 
     fn screen_load_failed(&mut self) -> Option<ScreenError> {
@@ -2779,7 +2788,10 @@ impl AppRig for PlayerRig<'_> {
     ) -> Result<Loading, ChartLoadError> {
         self.chart_images_at_choice(loaded);
         let stepped = decision.stepped();
-        let loading = self.watching(loaded.path(), decision, |rig| rig.load_watched(loaded));
+        // Moved to the load's waits and back, one owner at a time.
+        let lent = std::mem::replace(decision, game::Decision::off());
+        let (loading, served) = self.watching(loaded.path(), lent, |rig| rig.load_watched(loaded));
+        *decision = served;
         if decision.stepped() && !stepped {
             // The deadline's step ran inside a wait: the opening's
             // reducer count is forgotten, as at its own step.
@@ -4089,7 +4101,9 @@ pub(crate) mod tests {
                     Box::new(move |_| {
                         let _ = seen_tx.send((sent(), tones_now.tone_requests()));
                     }),
-                    &mut |rig| rig.entered_decision(&pick, &mut game::Decision::off()),
+                    &mut |rig| {
+                        let _ = rig.entered_decision(&pick, game::Decision::off());
+                    },
                     &mut || {},
                 );
                 assert_eq!(
@@ -4099,10 +4113,8 @@ pub(crate) mod tests {
                 );
                 let sent = rig.render.decisions_sent();
                 rig.closed_epoch();
-                rig.entered_decision(
-                    &game::Pick::Practice(chart.clone()),
-                    &mut game::Decision::off(),
-                );
+                let _ = rig
+                    .entered_decision(&game::Pick::Practice(chart.clone()), game::Decision::off());
                 assert_eq!((sent(), tones.tone_requests()), (2, 2), "a tone a choice");
                 thread.stop().unwrap();
             },
@@ -4120,14 +4132,15 @@ pub(crate) mod tests {
     /// The choice `pick` entered with `decision` watched, its entry fence
     /// held on the input thread (its answer withheld) until `event`'s
     /// condition holds, `event`'s act run once the input thread is at the
-    /// fence; with no event, until the entry returns.
+    /// fence; with no event, until the entry returns. The decision comes
+    /// back as the entry left it.
     #[cfg(feature = "dev-tools")]
     fn entry_held(
         rig: &mut crate::play::PlayerRig<'_>,
         pick: &game::Pick,
-        decision: &mut game::Decision,
+        decision: game::Decision,
         event: Option<AtFence<'_>>,
-    ) {
+    ) -> game::Decision {
         use game::AppRig as _;
         let (at_tx, at_rx) = std::sync::mpsc::channel::<()>();
         let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
@@ -4142,7 +4155,7 @@ pub(crate) mod tests {
             resume,
         });
         let controls = rig.controls;
-        std::thread::scope(|s| {
+        let decision = std::thread::scope(|s| {
             let go = go_tx.clone();
             s.spawn(move || {
                 at_rx
@@ -4157,14 +4170,16 @@ pub(crate) mod tests {
                     let _ = go.send(());
                 }
             });
-            rig.entered_decision(pick, decision);
+            let decision = rig.entered_decision(pick, decision);
             let _ = go_tx.send(());
+            decision
         });
         assert!(
             reached_rx.recv_timeout(Duration::from_secs(60)).is_ok(),
             "the fence answered"
         );
         resume_tx.send(()).unwrap();
+        decision
     }
 
     /// The decision screen of `pick` on a rig with its input thread, its
@@ -4199,9 +4214,13 @@ pub(crate) mod tests {
                 } else {
                     now
                 };
-                let mut decision =
-                    game::Decision::begin(begun, Some(game::DECISION_TIME), practice);
-                entry_held(rig, &pick, &mut decision, event);
+                let decision = game::Decision::begin(
+                    begun,
+                    game::DecisionLifetime(1),
+                    Some(game::DecisionShown::BuiltIn),
+                    practice,
+                );
+                let decision = entry_held(rig, &pick, decision, event);
                 check(rig, decision);
                 thread.stop().unwrap();
             },
@@ -4217,7 +4236,9 @@ pub(crate) mod tests {
     #[test]
     fn a_close_inside_the_entry_fence_ends_the_run_cleanly() {
         let play = |c: &std::path::Path| game::Pick::Play(c.to_owned());
-        let left = |c: &crate::controls::Controls| c.watched().is_none_or(|d| d.left().is_some());
+        let left = |c: &crate::controls::Controls| {
+            c.with_watched(|d| d.is_none_or(|d| d.left().is_some()))
+        };
         let close = |c: &crate::controls::Controls| c.close();
         entered_held(play, false, Some((&close, &left)), |rig, d| {
             assert_eq!(d.left(), Some(game::Verdict::End));
@@ -4254,7 +4275,9 @@ pub(crate) mod tests {
     #[test]
     fn a_practice_deadline_inside_the_entry_fence_waits_for_the_read() {
         let practice = |c: &std::path::Path| game::Pick::Practice(c.to_owned());
-        let waiting = |c: &crate::controls::Controls| c.watched().is_none_or(|d| d.waiting());
+        let waiting = |c: &crate::controls::Controls| {
+            c.with_watched(|d| d.is_none_or(game::Decision::waiting))
+        };
         let nothing = |_: &crate::controls::Controls| {};
         entered_held(practice, true, Some((&nothing, &waiting)), |rig, d| {
             assert!(d.waiting(), "not waiting for the read");
