@@ -864,6 +864,7 @@ mod tests {
             };
             assert_eq!(loading_timer(slot), Some(want), "{}", t.name);
         }
+        assert_eq!(loading_timer(timer::FADEOUT), Some(LoadingTimer::Off));
         assert_eq!(loading_timer(timer::BUILTIN), None);
     }
 

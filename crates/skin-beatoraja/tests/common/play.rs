@@ -602,6 +602,7 @@ impl Drawn {
             lanes: self.view,
             playing: self.playing,
             closing: self.closing,
+            fading: None,
             readouts: self.readouts.unwrap_or_else(|| readouts_for(self.view)),
         };
         self.skin

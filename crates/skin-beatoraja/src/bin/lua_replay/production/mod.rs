@@ -513,6 +513,7 @@ pub fn record(
                                 lanes: view,
                                 playing,
                                 closing: st.closing,
+                                fading: None,
                                 // The display offset is 0: the head is now.
                                 readouts: readouts(script.fix_hispeed, tempo.current_x100(now)),
                             };

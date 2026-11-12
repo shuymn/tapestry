@@ -1209,6 +1209,7 @@ fn an_inconsistent_snapshot_poisons_the_play() {
             complete: false,
             playing: true,
             closing: None,
+            fading: None,
             target: h.target,
             layout: &layout,
             turntable: 0,

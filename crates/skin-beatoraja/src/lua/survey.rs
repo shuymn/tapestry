@@ -93,6 +93,11 @@ pub struct Survey {
     pub atlas: Vec<String>,
     /// An imported play skin's declared ending, as read.
     pub play_ending: Option<skin_model::PlayEnding>,
+    /// An imported play skin's elements, and how many run on each timer
+    /// by its play schema name, `when` for a `when` timer and `program`
+    /// for a compiled timer callback, the zero counts left out
+    /// (dev-tools).
+    pub play_elements: Option<(usize, BTreeMap<String, usize>)>,
     /// A result import drawn over [`Choice::result`], when one was given
     /// and the import completed, or a decision import that completed,
     /// drawn over its declared timing ([`decision_frames`]).
@@ -804,6 +809,28 @@ fn atlas_plans(skin: &skin_model::Skin) -> Vec<String> {
     lines
 }
 
+/// A play skin's element count and its elements per timer, by the play
+/// schema's timer name, `when` for a `when` timer and `program` for a
+/// compiled timer callback.
+#[cfg(feature = "dev-tools")]
+fn play_elements(skin: &skin_model::Skin) -> (usize, BTreeMap<String, usize>) {
+    use skin_model::TimerRef;
+    let timers = skin.element_timers();
+    let mut by = BTreeMap::new();
+    for t in &timers {
+        let name = match *t {
+            TimerRef::Builtin(s) => skin_model::PLAY
+                .timers
+                .get(usize::from(s))
+                .map_or("builtin", |t| t.name),
+            TimerRef::When(_) => "when",
+            TimerRef::Output(_) => "program",
+        };
+        *by.entry(name.to_owned()).or_default() += 1;
+    }
+    (timers.len(), by)
+}
+
 /// Records an import that completed: its outcome, its notes by kind, and
 /// its frames for a `kind` result skin with [`Choice::result`] or a
 /// decision skin.
@@ -814,6 +841,10 @@ fn imported_into(s: &mut Survey, imported: &crate::Imported, kind: ScreenKind, c
         imported.skin.program_callbacks(),
     ));
     s.play_ending = (kind == ScreenKind::Play).then(|| imported.skin.play_ending());
+    #[cfg(feature = "dev-tools")]
+    if kind == ScreenKind::Play {
+        s.play_elements = Some(play_elements(&imported.skin));
+    }
     #[cfg(feature = "dev-tools")]
     {
         s.atlas = atlas_plans(&imported.skin);
