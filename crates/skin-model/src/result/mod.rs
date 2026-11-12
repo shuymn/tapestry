@@ -23,6 +23,7 @@ use self::view::{
     BestView, DEVIATION_SLOTS, GRAPH_COLUMNS, GaugeColumn, GaugeHistory, ResultLabels,
     ResultNumber, ResultStatus, ResultView, Timelines, TimingStats,
 };
+use crate::JUDGE_CLASS_MAX;
 use crate::expr::{State, TIMER_OFF};
 use crate::select::value;
 use crate::widget::Starts;
@@ -465,6 +466,10 @@ fn fields(view: &ResultView) -> [i32; field::COUNT] {
     if let Some(notes) = c.notes {
         set(field::CHART_NOTES, value(u64::from(notes)));
         set(field::CHART_NOTES_VALID, 1);
+    }
+    if let Some(k) = c.judge_class.filter(|&k| i32::from(k) <= JUDGE_CLASS_MAX) {
+        set(field::CHART_JUDGE_CLASS, i32::from(k));
+        set(field::CHART_JUDGE_CLASS_VALID, 1);
     }
     if view.status != ResultStatus::Ready {
         return f;

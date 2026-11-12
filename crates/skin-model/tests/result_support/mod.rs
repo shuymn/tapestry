@@ -110,6 +110,7 @@ pub fn chart() -> ResultChart {
         difficulty: Some(4),
         length: Some(TimeUs(123_456_789)),
         notes: Some(600),
+        judge_class: None,
     }
 }
 

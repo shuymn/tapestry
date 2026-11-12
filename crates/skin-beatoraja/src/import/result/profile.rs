@@ -233,9 +233,9 @@ pub(crate) enum ResOption {
     Expr(&'static str),
     /// A truthful constant.
     Constant(bool),
-    /// The judgment class (180 to 184): an import fact a Lua skin reads
-    /// while it loads; the result schema has no field for it, so a frame
-    /// condition on it is unsupported.
+    /// The judgment class (180 to 184) on the decision screen: an import
+    /// fact a Lua skin reads while it loads; the decision schema has no
+    /// field for it, so a frame condition on it is unsupported.
     JudgeClass,
 }
 
@@ -292,7 +292,9 @@ pub(crate) fn option(id: i32) -> Option<Class<ResOption>> {
         160 => Constant(true),
         161..=164 => Constant(false),
         177 => Expr("chart.bpm_changes"),
-        180..=184 => ResOption::JudgeClass,
+        // The attempt's chart's class, as play's (`BooleanPropertyFactory.
+        // java:448-452`, static on this screen, `:219`, `:256`).
+        180..=184 => from(&crate::import::ops::JUDGE_CLASSES, id - 180),
         300..=307 => from(&GRADES, id - 300),
         320..=327 => from(&BEST_GRADES, id - 320),
         330 => Expr("best.ex_updated"),

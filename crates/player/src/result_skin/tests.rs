@@ -98,6 +98,7 @@ fn chart() -> ResultChart {
         difficulty: None,
         length: None,
         notes: None,
+        judge_class: None,
     }
 }
 
@@ -359,6 +360,24 @@ fn the_chart_facts_are_projected() {
     assert_eq!(c.notes, Some(2));
     // The chart's last object, measure 2's note, at 4 s (`#BPM 120`).
     assert_eq!(c.length, Some(bms_model::TimeUs(4_000_000)));
+}
+
+/// The attempt's chart's judgment class (options 180-184) is projected
+/// as play's: `#RANK 3` easy, `#RANK 0` very hard, no header normal,
+/// `#DEFEXRANK 120` easy (90) and `#DEFEXRANK 10` in no class (7).
+#[test]
+fn the_charts_judgment_class_is_projected() {
+    for (head, class) in [
+        ("#RANK 3\n", Some(3)),
+        ("#RANK 0\n", Some(0)),
+        ("", Some(2)),
+        ("#DEFEXRANK 120\n", Some(3)),
+        ("#DEFEXRANK 10\n", None),
+    ] {
+        let loaded =
+            crate::imports::facts::tests::loaded(&format!("{head}#00111:01\n"), "beatoraja-style");
+        assert_eq!(super::attempt_chart(&loaded).judge_class, class, "{head:?}");
+    }
 }
 
 /// The chart's length (numbers 1163-1164) is its 1× content end, a
