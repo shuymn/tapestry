@@ -4414,7 +4414,7 @@ impl Run {
                 }
                 Ok(RenderMsg::ResultChanged) => {
                     self.take_result();
-                    if self.result.is_some() {
+                    if self.current_result().is_some() {
                         self.decision = None;
                         mode = Mode::Result;
                     }
@@ -4532,7 +4532,7 @@ impl Run {
                     let _ = reply.send(ready);
                     mode = self.after_preparing(mode);
                     // A result lifetime draws on from what it presented.
-                    if self.result.as_ref().is_some_and(ResultSide::shows) {
+                    if self.current_result().is_some_and(ResultSide::shows) {
                         mode = Mode::Result;
                     }
                     continue;
@@ -4654,6 +4654,7 @@ impl Run {
                 // Its page, or a newer one an earlier signal took; whether
                 // it may still be drawn is checked before every end frame.
                 Ok(RenderMsg::End) => {
+                    let shows = self.current_result().is_some_and(ResultSide::shows);
                     if let Some(page) = self.shared.take_end() {
                         self.end_page = page;
                         if let Some(side) = &mut self.result {
@@ -4662,11 +4663,7 @@ impl Run {
                     }
                     // A result skin's presentation draws instead while its
                     // lifetime is current: the page is its built-in rows'.
-                    mode = if self.result.as_ref().is_some_and(ResultSide::shows) {
-                        Mode::Result
-                    } else {
-                        Mode::End
-                    };
+                    mode = if shows { Mode::Result } else { Mode::End };
                 }
                 Ok(RenderMsg::Finish { end, reply }) => {
                     // Judgments still queued were never drawn in this play:
@@ -6587,6 +6584,22 @@ impl Run {
         if let Some(side) = &mut self.result {
             side.incoming = Some(p);
         }
+    }
+
+    /// The result side, while its lifetime is current: what a message
+    /// asks before it enters [`Mode::Result`]. One whose lifetime ended
+    /// (left, or another begun) before a frame of it checked is dropped
+    /// here, so the mode the message chooses otherwise stands, not a
+    /// result frame that would only find it gone and draw nothing.
+    fn current_result(&mut self) -> Option<&ResultSide> {
+        if self
+            .result
+            .as_ref()
+            .is_some_and(|r| !self.shared.result_slot().current(r.lifetime))
+        {
+            self.drop_result();
+        }
+        self.result.as_ref()
     }
 
     /// The render loop ended (dev-tools): the select and result screens'
