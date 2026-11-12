@@ -871,3 +871,40 @@ fn dropping_a_worker_inside_a_line_returns_at_once() {
         .unwrap();
     assert!(*joined.0, "the thread was joined");
 }
+
+/// A quiesce while the worker is inside a line waits until that job
+/// ended: from its return the worker holds no staging, so a rebuild's
+/// inline restaging never stages beside it.
+#[test]
+fn quiesce_waits_for_the_job_in_progress() {
+    let dir = truetype_skin();
+    let (r, b) = installed(&dir);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let producer = Arc::new(Gated {
+        inner: Arc::clone(b.text_producer().unwrap()),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    let worker = LabelWorker::spawn(Arc::clone(b.skin()), Some(producer), None).unwrap();
+    worker.post(job(&r, 1, "a", "AB"));
+    entered_rx.recv_timeout(watchdog()).unwrap();
+    let done = AtomicBool::new(false);
+    std::thread::scope(|s| {
+        let q = s.spawn(|| {
+            worker.quiesce();
+            done.store(true, Ordering::Release);
+        });
+        let bound = std::time::Instant::now() + watchdog();
+        while !worker.quiescing() && !done.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < bound, "never quiescing");
+            std::thread::yield_now();
+        }
+        let early = done.load(Ordering::Acquire);
+        let _ = release_tx.send(());
+        q.join().unwrap();
+        assert!(!early, "the quiesce returned while the job was in progress");
+    });
+    assert_eq!(worker.bytes().0, 0);
+    assert_eq!(worker.output_generation(), None);
+}

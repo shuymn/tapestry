@@ -565,6 +565,8 @@ fn fire_held() {
 struct Direct {
     menu: MenuScreen,
     hold: bool,
+    /// While set, a filling slot's settling finds its writes pending.
+    hold_settle: bool,
 }
 
 impl Screen for Direct {
@@ -585,6 +587,9 @@ impl Screen for Direct {
         &mut self,
         store: &mut render::LabelStore,
     ) -> Result<render::Settled, RenderError> {
+        if self.hold_settle && store.filling().is_some() {
+            return Ok(render::Settled::Pending);
+        }
         self.menu.settle_decision_labels(store)
     }
     fn restore_decision_labels(
@@ -667,6 +672,7 @@ fn side_of(dir: &TempDir, fonts: bool) -> (Direct, DecisionSide, Arc<Mutex<Label
     let screen = Direct {
         menu: MenuScreen::new(r, fonts),
         hold: false,
+        hold_settle: false,
     };
     let book = LabelBook::shared(TARGET);
     let side = DecisionSide::new(&b, &book, 1, &screen).unwrap();
@@ -821,12 +827,16 @@ fn newer_request_drops_waiting_output_and_cancels_job() {
         std::thread::sleep(Duration::from_millis(1));
     }
     let c_gen = c_gen.expect("C's output waiting");
-    // D asked: C's waiting output is dropped at once.
+    // D asked: C's waiting output is dropped before D's job stages, so
+    // the store stages nothing beside the worker.
+    side.check_posts = true;
     quiet(&mut screen, &mut side, d.as_ref());
+    side.check_posts = false;
     assert_ne!(side.store().waiting(), Some(c_gen), "C's output kept");
+    assert_eq!(side.staged_at_post, [0], "C's staging alive at D's post");
     for _ in 0..60_000 {
         quiet(&mut screen, &mut side, d.as_ref());
-        assert!(side.store().memory(None).staged <= bound);
+        assert!(side.memory().staged <= bound);
         if side.store().waiting().is_some() {
             break;
         }
@@ -1099,7 +1109,9 @@ fn decision_rebuild_poll_failure_is_not_a_takeover() {
 /// R4.6: another preparation refused while a lifetime is active (the
 /// pinned chart's re-preparation after a target change) disables the
 /// kind for later choices but is no takeover: the pinned skin draws to
-/// the lifetime's end, and the installation goes then.
+/// the lifetime's end and on until the render leaves the screen (the
+/// target back, so the retired slot keeps its content), and the
+/// installation goes then.
 #[test]
 fn other_prep_refused_during_lifetime_keeps_drawing() {
     let dir = skin_dir();
@@ -1110,7 +1122,14 @@ fn other_prep_refused_during_lifetime_keeps_drawing() {
     rig.skin_frames(from, 3);
     assert_eq!(rig.link.take_decision_takeover(), None);
     assert_eq!(rig.seen.removed.load(Ordering::Acquire), 0);
+    rig.extent.publish(TARGET[0], TARGET[1]);
+    assert!(wait_until(|| lock(&rig.book).current().0 == TARGET));
     lock(&rig.book).end(5);
+    let from = rig.seen.len();
+    rig.skin_frames(from, 3);
+    assert_eq!(rig.seen.removed.load(Ordering::Acquire), 0);
+    assert_eq!(rig.seen.pages(from, "page"), 0, "the skin cut short");
+    rig.link.loading().show(one_line("loading"));
     assert!(wait_until(|| rig.seen.removed.load(Ordering::Acquire) == 1));
     rig.link.exit();
 }
@@ -1239,7 +1258,14 @@ fn decision_frame_alloc() {
     for (i, n) in (0_i64..).zip(frames.iter_mut()) {
         let now = TimeUs(7_000_000 + i * 1_000_000);
         let before = this_thread();
-        let drawn = decision_build(&mut screen, &mut dec, Some(side.store()), &shown, now);
+        let drawn = decision_build(
+            &mut screen,
+            &mut dec,
+            Some(side.store()),
+            Some(1),
+            &shown,
+            now,
+        );
         *n = this_thread() - before;
         assert_eq!(drawn, DecisionDrawn::Built);
         screen.submit_decision().unwrap();
@@ -1281,17 +1307,28 @@ fn decision_builtin_frame_alloc() {
     let control = this_thread();
     drop(std::hint::black_box(vec![1_u8; 8]));
     assert!(this_thread() > control, "the allocation was not counted");
-    let mut build = |screen: &mut Direct, shown: &ShownDecision| {
+    let mut build = |screen: &mut Direct, shown: &ShownDecision, active: Option<u64>| {
         let before = this_thread();
-        let drawn = decision_build(screen, &mut dec, Some(side.store()), shown, TimeUs(1));
+        let drawn = decision_build(
+            screen,
+            &mut dec,
+            Some(side.store()),
+            active,
+            shown,
+            TimeUs(1),
+        );
         (drawn, this_thread() - before)
     };
-    assert_eq!(build(&mut screen, &builtin), (DecisionDrawn::BuiltIn, 0));
+    assert_eq!(
+        build(&mut screen, &builtin, Some(1)),
+        (DecisionDrawn::BuiltIn, 0)
+    );
     let refused = DecisionDrawn::Refused(skin_model::BuildError::Kind);
-    assert_eq!(build(&mut screen, &stale), (refused, 0));
+    assert_eq!(build(&mut screen, &stale, Some(1)), (refused, 0));
+    assert_eq!(build(&mut screen, &stale, None), (DecisionDrawn::Ended, 0));
     screen.decision_fault(false);
     let refused = DecisionDrawn::Refused(skin_model::BuildError::Kind);
-    assert_eq!(build(&mut screen, &skinned), (refused, 0));
+    assert_eq!(build(&mut screen, &skinned, Some(1)), (refused, 0));
 }
 
 /// R0.4: a selection frame while a decision preparation runs (its job on
@@ -1346,4 +1383,259 @@ fn selection_frame_during_decision_prep_alloc() {
         during.iter().all(|&n| n <= steady),
         "steady {steady}, during {during:?}"
     );
+}
+
+/// The slot of `book` pinned by `lifetime` at `generation`, its content
+/// restored (not restoring).
+fn restored_pin(book: &LabelBook, slot: usize, generation: u64, lifetime: u64) -> bool {
+    matches!(
+        book.state(slot),
+        Some(LabelState::Pinned { generation: g, lifetime: l, restoring: false, .. })
+            if *g == generation && *l == lifetime
+    )
+}
+
+/// O3, O4: a rebuild with two pins, one of a lifetime that ended before a
+/// boundary retired it and one of the active lifetime: the active pin is
+/// the one restored (drawable on the new renderer), and the ended one is
+/// freed.
+#[test]
+fn two_pin_rebuild_restores_the_active_pin() {
+    let _turn = crate::warp_turn::take();
+    let dir = skin_dir();
+    let (mut screen, mut side, book) = side_of(&dir, false);
+    let (a, b) = (want("a", "A"), want("b", "B"));
+    until(&mut screen, &mut side, a.as_ref(), &book, |k| {
+        ready(k, "a", "A")
+    });
+    until(&mut screen, &mut side, b.as_ref(), &book, |k| {
+        ready(k, "b", "B")
+    });
+    let (sa, ..) = lock(&book)
+        .pin(Path::new("a"), labels_revision(&labels("A")), 1)
+        .unwrap();
+    lock(&book).end(1);
+    let (sb, gb, _) = lock(&book)
+        .pin(Path::new("b"), labels_revision(&labels("B")), 2)
+        .unwrap();
+    assert!(matches!(side.rebuilt(&mut screen), Rebuilt::Restored));
+    let k = lock(&book);
+    assert!(
+        matches!(k.state(sa), Some(LabelState::Free)),
+        "the ended lifetime's pin kept: {k:?}"
+    );
+    assert!(restored_pin(&k, sb, gb, 2), "{k:?}");
+    drop(k);
+    assert!(side.store().content(sb, gb).is_some(), "B not restored");
+}
+
+/// O1, O2: the cursor back on a ready chart while another chart's job is
+/// in flight supersedes that job: it never claims the older ready slot,
+/// so both ready charts stay ready.
+#[test]
+fn return_to_a_cached_chart_supersedes_the_job() {
+    let _turn = crate::warp_turn::take();
+    let dir = skin_dir();
+    let (mut screen, mut side, book) = side_of(&dir, false);
+    let (a, x, b) = (want("a", "A"), want("x", "X"), want("b", "B"));
+    until(&mut screen, &mut side, a.as_ref(), &book, |k| {
+        ready(k, "a", "A")
+    });
+    until(&mut screen, &mut side, x.as_ref(), &book, |k| {
+        ready(k, "x", "X")
+    });
+    let posts = side.posts;
+    quiet(&mut screen, &mut side, b.as_ref());
+    assert_eq!(side.posts, posts + 1, "B's job posted");
+    // Boundaries long enough for B's job, had it gone on, to take a slot.
+    for _ in 0..500 {
+        quiet(&mut screen, &mut side, a.as_ref());
+        if !ready(&lock(&book), "a", "A") {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let k = lock(&book);
+    assert!(ready(&k, "a", "A"), "A's slot taken: {k:?}");
+    assert!(ready(&k, "x", "X"), "{k:?}");
+    assert!(!ready(&k, "b", "B"), "B prepared after the return: {k:?}");
+    drop(k);
+    assert_eq!(side.posts, posts + 1);
+}
+
+/// O2: a newer request while the older one's slot is filling (its writes
+/// not settled) cancels the fill: the slot is never published for the
+/// old chart, cools as a cancelled one and is freed; the newer one is
+/// prepared.
+#[test]
+fn newer_request_cancels_a_filling_slot() {
+    let _turn = crate::warp_turn::take();
+    let dir = skin_dir();
+    let (mut screen, mut side, book) = side_of(&dir, false);
+    let (c, d) = (want("c", "C"), want("d", "D"));
+    screen.hold_settle = true;
+    let mut filling = None;
+    for _ in 0..60_000 {
+        quiet(&mut screen, &mut side, c.as_ref());
+        filling = side.store().filling();
+        if filling.is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let (slot, generation) = filling.expect("C's slot filling");
+    quiet(&mut screen, &mut side, d.as_ref());
+    assert_ne!(
+        side.store().filling(),
+        Some((slot, generation)),
+        "C's fill kept"
+    );
+    screen.hold_settle = false;
+    for _ in 0..60_000 {
+        quiet(&mut screen, &mut side, d.as_ref());
+        let k = lock(&book);
+        assert!(!ready(&k, "c", "C"), "C published after D was asked: {k:?}");
+        if ready(&k, "d", "D") {
+            return;
+        }
+        drop(k);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("D never ready: {:?}", lock(&book));
+}
+
+/// Two label sets of one chart made to share a digest: the second is
+/// asked and prepared again (its strings differ), not taken as the first
+/// one's ready slot.
+#[test]
+fn equal_digests_of_other_labels_are_prepared_again() {
+    struct Unforce;
+    impl Drop for Unforce {
+        fn drop(&mut self) {
+            crate::decision_side::FORCED_REVISION.set(None);
+        }
+    }
+    let _turn = crate::warp_turn::take();
+    crate::decision_side::FORCED_REVISION.set(Some(42));
+    let _unforce = Unforce;
+    let dir = skin_dir();
+    let (mut screen, mut side, book) = side_of(&dir, false);
+    let mut w = None;
+    update_want(&mut w, &view_on("a", "A"));
+    until(&mut screen, &mut side, w.as_ref(), &book, |k| {
+        ready(k, "a", "A")
+    });
+    let first = w.as_ref().unwrap().strings.clone();
+    update_want(&mut w, &view_on("a", "B"));
+    let second = w.as_ref().unwrap().strings.clone();
+    assert_ne!(first, second, "the want kept the first labels");
+    let holds = |side: &DecisionSide, strings: &skin_model::DecisionStrings| {
+        let k = lock(&book);
+        (0..render::LABEL_SLOTS).any(|i| match k.state(i) {
+            Some(LabelState::Ready { generation, .. }) => side
+                .store()
+                .content_of(i, *generation)
+                .is_some_and(|c| c.strings() == strings),
+            _ => false,
+        })
+    };
+    for _ in 0..60_000 {
+        quiet(&mut screen, &mut side, w.as_ref());
+        if holds(&side, &second) {
+            assert!(!holds(&side, &first), "the first labels still ready");
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    panic!("the second labels never prepared: {:?}", lock(&book));
+}
+
+/// R4.4, O8: a resized skinned screen whose lifetime ended before the
+/// render left it: its retired slot is freed (another target) and its
+/// content goes, and the frames draw the page with no refusal, no
+/// takeover and no notice.
+#[test]
+fn ended_resized_decision_draws_the_page_without_refusal() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    let shown = rig.drawing("a", "A");
+    let (slot, generation) = shown.slot.unwrap();
+    rig.extent.publish(1_280, 720);
+    assert!(wait_until(|| lock(&rig.book).current().0 == [1_280, 720]));
+    lock(&rig.book).end(5);
+    assert!(wait_until(|| {
+        lock(&rig.book).state(slot).and_then(LabelState::generation) != Some(generation)
+    }));
+    let from = rig.seen.len();
+    assert!(wait_until(|| rig.seen.pages(from, "page") >= 3));
+    assert_eq!(rig.link.take_decision_refusal(), None, "a refusal noted");
+    assert_eq!(rig.link.take_decision_takeover(), None);
+    assert_eq!(rig.seen.removed.load(Ordering::Acquire), 0);
+    assert!(lock(&rig.book).healthy());
+    rig.link.exit();
+}
+
+/// R4.5, O8: a decision restore refused on a healthy device stands for
+/// the run (its notice) when the rest of the rebuild then fails: a
+/// chart's load lost again after the refused restore.
+#[test]
+fn decision_restore_refusal_stands_when_the_rebuild_fails() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    rig.drawing("a", "A");
+    rig.seen.refuse_restore.store(true, Ordering::Release);
+    rig.seen.lose_loads.store(2, Ordering::Release);
+    let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+    assert!(rig.link.load(chart, None).is_err());
+    let notice = rig.link.take_decision_refusal().expect("the refusal lost");
+    assert!(notice.contains("not restored"), "{notice}");
+    rig.link.exit();
+}
+
+/// R1.5, R4.6: a choice pinned before another preparation's refusal,
+/// its decision message taken after it: the pinned presentation enters
+/// on the installation kept for it and draws the skin; no takeover.
+#[test]
+fn delayed_entry_after_another_refusal_draws_the_pin() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    rig.prepared("a", "A");
+    let (slot, generation, timing) = lock(&rig.book)
+        .pin(Path::new("a"), labels_revision(&labels("A")), 5)
+        .unwrap();
+    rig.refuse_another();
+    let shown = ShownDecision {
+        lifetime: 5,
+        origin: rig.link.clock.now(),
+        timing,
+        slot: Some((slot, generation)),
+    };
+    let from = rig.seen.len();
+    rig.link.leave_selection();
+    rig.link.show_decision(one_line("page"), Some(shown));
+    rig.skin_frames(from, 3);
+    assert_eq!(rig.link.take_decision_takeover(), None);
+    rig.link.exit();
+}
+
+/// O6, R4.4: a takeover is published under the lock the game ends a
+/// lifetime under: held between its lifetime's check and its
+/// publication, the book cannot be locked, so the lifetime cannot end
+/// between them.
+#[test]
+fn takeover_published_under_the_lifetime_lock() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    rig.drawing("a", "A");
+    let gate = &rig.link.shared.takeover_gate;
+    gate.hold(true);
+    rig.seen.refuse_frame.store(true, Ordering::Release);
+    assert!(wait_until(|| gate.waiting()));
+    let free = rig.book.try_lock().is_ok();
+    gate.hold(false);
+    assert!(!free, "the lifetime could end before the publication");
+    assert!(wait_until(|| gate.passed() == 1));
+    let t = rig.link.take_decision_takeover().expect("a takeover");
+    assert_eq!(t.lifetime, game::DecisionLifetime(5));
+    rig.link.exit();
 }
