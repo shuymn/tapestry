@@ -239,6 +239,7 @@ pub const IN_PLAY: &[Site] = &[
             "Rig::abort_close",
             "Rig::take_closing",
             "Rig::declared_close",
+            "Rig::declared_ending",
             "run_closing",
             "ClosingStage::begin",
             "ClosingStage::over",
