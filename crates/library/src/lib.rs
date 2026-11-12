@@ -113,7 +113,7 @@ pub use scan::{
 pub use search::{FolderKey, FolderRow, Level, SEPARATOR, Search, Sort};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 7;
+pub const SCHEMA_VERSION: i64 = 8;
 
 /// Why the library database cannot be opened, read or scanned.
 #[derive(Debug, thiserror::Error)]
@@ -224,6 +224,11 @@ pub struct ChartEntry {
     /// Its seed-0 branch's summary; `None` when the loader refuses that
     /// branch.
     pub summary: Option<ChartSummary>,
+    /// Its rank as the beatoraja-style header policy reads its seed-0
+    /// branch's declarations ([`rules::HeaderPolicy::DefExRankFirst`]):
+    /// `Some(None)` with no rank header (read as `#RANK 2`), `None` when
+    /// the loader refuses that branch.
+    pub rank: Option<Option<rules::JudgeRank>>,
 }
 
 /// The lock beside a database file, held by its [`Library`] and by the lease

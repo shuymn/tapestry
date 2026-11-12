@@ -506,6 +506,11 @@ fn read_chart(root: i64, path: String, limits: &Limits, options: &ScanOptions) -
         mode,
         random,
         bga,
+        rank: scanned.summary.is_ok().then(|| {
+            rules::HeaderPolicy::DefExRankFirst
+                .read(&scanned.judgment_headers)
+                .rank
+        }),
         summary: scanned.summary.ok(),
     })
 }

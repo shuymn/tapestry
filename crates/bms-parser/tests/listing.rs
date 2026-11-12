@@ -259,6 +259,25 @@ fn read_scanned_is_the_listing_and_the_summary() {
     assert!(refused.summary.is_err());
 }
 
+/// The seed-0 branch's judgment-header declarations come with the scan, in
+/// file order, which a song list reads the rank from; a refused branch
+/// carries none.
+#[test]
+fn read_scanned_carries_the_seed_0_judgment_headers() {
+    let limits = Limits::default();
+    let s = read_scanned(b"#RANK 3\n#DEFEXRANK 120\n#BPM 120\n#00111:01\n", &limits).unwrap();
+    assert_eq!(
+        rules::HeaderPolicy::DefExRankFirst
+            .read(&s.judgment_headers)
+            .rank,
+        Some(rules::JudgeRank::DefExRankMilli(120_000))
+    );
+    assert_eq!(s.judgment_headers.len(), 2);
+    let refused = read_scanned(b"#RANK 3\n#BPM 0\n#00138:01\n", &limits).unwrap();
+    assert!(refused.summary.is_err());
+    assert!(refused.judgment_headers.is_empty());
+}
+
 fn line() -> impl Strategy<Value = String> {
     let channel = prop::sample::select(vec![
         "11", "16", "18", "19", "38", "52", "58", "D1", "D8", "21", "28", "41", "61", "E1", "01",
