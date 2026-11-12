@@ -252,6 +252,7 @@ fn an_outside_frame_write_is_found() {
             Phase::Round(Round::on_time(7, true)),
         ],
         fix_hispeed: 0,
+        tempo: Vec::new(),
     };
     let body = format!("{LATCH}{}", dst("-111", 0, "timer = latch, loop = -1,"));
     let clean = run_with(&body, &options(script.clone()));
