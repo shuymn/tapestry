@@ -3025,13 +3025,11 @@ impl AppRig for PlayerRig<'_> {
         }
     }
 
-    /// The flow applies the step taken now: the next update carries the
-    /// new preset's settings.
+    /// The flow applies the step taken now; a step that changes the
+    /// chosen preset gives the next update its settings through
+    /// [`presets_changed`](game::AppRig::presets_changed).
     fn take_preset_step(&mut self) -> Option<game::PresetStep> {
-        let sel = self.selection.as_mut()?;
-        let step = sel.preset_steps.pop_front()?;
-        sel.dirty = true;
-        Some(step)
+        self.selection.as_mut()?.preset_steps.pop_front()
     }
 
     fn take_practice(&mut self) -> Option<PracticeInput> {
