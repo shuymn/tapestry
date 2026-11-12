@@ -126,6 +126,16 @@ fn skin() -> Skin {
             },
             relement(Source::JudgeGraph(0), [0, 200, 520, 82], None),
             relement(Source::JudgeGraph(1), [0, 300, 520, 82], None),
+            // The chart's stage file (S10-12), drawn from a table.
+            relement(
+                Source::ChartImage {
+                    which: skin_model::chart_image::ChartImage::Stage,
+                    filter: skin_model::Filter::Linear,
+                    stretch: skin_model::chart_image::ChartStretch::Inner,
+                },
+                [1_200, 500, 300, 200],
+                Some("chart.stagefile"),
+            ),
             relement(Source::GaugeGraph(0), [0, 400, 519, 259], None),
             relement(Source::TimingGraph(0), [600, 0, 520, 82], None),
         ],
@@ -244,7 +254,31 @@ fn a_result_build_allocates_nothing() {
     // The first build after preparation, before any view, on the batch
     // reserved at the skin's capacity.
     total += counted(|| fx.frame(0));
-    for v in &views {
+    // The chart's images: a table installed for every other view, absent
+    // for the rest (S10-12, RC8).
+    let key = skin_model::chart_image::ChartKey {
+        renderer: 1,
+        installation: 2,
+        atlas: 3,
+        generation: 4,
+    };
+    let stage = skin_model::chart_image::ChartUv {
+        uv: FrameUv {
+            uv: [0.0, 0.0, 0.25, 0.25],
+            layer: 0,
+        },
+        native: [1_600, 1_200],
+    };
+    fx.res.set_chart_live(Some(key));
+    for (k, v) in views.iter().enumerate() {
+        let mut v = v.clone();
+        v.chart.images.stage = true;
+        let v = &v;
+        fx.res.set_chart_images(if k % 2 == 0 {
+            skin_model::chart_image::ChartTable::new(Some(stage), None).keyed(key)
+        } else {
+            skin_model::chart_image::ChartTable::ABSENT
+        });
         fx.view(v);
         fx.skin
             .attach_result_text(&mut fx.res, TextTable::new(vec![line; 1]))

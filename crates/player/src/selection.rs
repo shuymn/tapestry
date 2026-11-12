@@ -2874,6 +2874,10 @@ impl AppRig for PlayerRig<'_> {
         // the panels' level read at the entry is the one Idle publishes.
         self.input.idle();
         self.leave_result();
+        // The last chart's images go: nothing of them stays beside
+        // selection (RX21a).
+        self.chart_images.drop_images();
+        self.result_skin.drop_images();
         // Another scene: held adjustment controls act no more until
         // pressed afresh.
         self.enter_scene();
@@ -2981,6 +2985,9 @@ impl AppRig for PlayerRig<'_> {
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {
         self.leave_result();
+        // The result's images go; the worker's sources stay, the practice
+        // Start's candidates (RX21c).
+        self.result_skin.drop_images();
         self.enter_scene();
         self.render.leave_selection();
         recover(

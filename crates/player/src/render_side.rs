@@ -193,6 +193,21 @@ pub trait Screen: Send {
         let _ = target;
         Err(RenderError::NoChartLayer)
     }
+    /// Writes a result view's chart images, set `set`, into the result
+    /// array `target` names ([`render::Renderer::write_result_chart`]).
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's; [`RenderError::NoChartLayer`] by default.
+    fn write_result_chart(
+        &mut self,
+        target: render::ResultChartTarget,
+        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        set: u64,
+    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+        let _ = (target, images, set);
+        Err(RenderError::NoChartLayer)
+    }
     /// Makes the chart's images unavailable: their generation or target
     /// is no longer current ([`render::Renderer::invalidate_chart_images`]).
     /// The default has none.
@@ -6257,6 +6272,39 @@ enum ResultDrawn {
     Refused(BuildError),
 }
 
+/// A result view's chart table: its payload's images `chart` written into
+/// the array `target` names, the one write of a view's images, at its
+/// staging and at a reapply on a screen built again (RC3, RC7). A view
+/// without images, a target with no chart layer and a refused write (a
+/// misfit, a level mismatch, a write the device refused) leave an
+/// all-absent table, never a failed screen.
+///
+/// # Errors
+///
+/// The device's failure during the write: the screen is failed.
+fn stage_result_chart(
+    screen: &mut dyn Screen,
+    target: render::ResultChartTarget,
+    chart: Option<&crate::chart_images::ChartImages>,
+) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+    use skin_model::chart_image::ChartTable;
+    let Some(set) = chart else {
+        return Ok(ChartTable::ABSENT);
+    };
+    match screen.write_result_chart(target, set.fitted(), set.id()) {
+        Ok(table) => Ok(table),
+        Err(RenderError::NoChartLayer) => Ok(ChartTable::ABSENT),
+        Err(e) if e.chart_outcome() == render::ChartOutcome::Absent => {
+            eprintln!(
+                "render: the result's chart images are not shown: {}",
+                Chain(&e)
+            );
+            Ok(ChartTable::ABSENT)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// The strip's text slots, after the one drawn: the one prepared with a
 /// view payload waiting, and the one prepared for the view presented.
 pub(super) const STRIP_PREPARED: usize = 1;
@@ -6629,6 +6677,15 @@ impl Run {
                 match screen.prepare_result(bundle, state, &h.payload.view, &h.payload.labels) {
                     Ok(Ok(())) => {
                         screen.install_result_text();
+                        // The images again, into the restored array.
+                        match stage_result_chart(
+                            screen.as_mut(),
+                            render::ResultChartTarget::Committed,
+                            h.payload.chart.as_deref(),
+                        ) {
+                            Ok(table) => state.set_chart_images(table),
+                            Err(e) => failed = Some(e),
+                        }
                     }
                     Ok(Err(why)) => refused = Some(why),
                     Err(e) => failed = Some(e),
@@ -6696,12 +6753,23 @@ impl Run {
                     };
                     match installed {
                         Ok(Preparation::Ready) => {
-                            token = Some(PreparedToken {
+                            let staged = PreparedToken {
                                 request,
                                 device: screen.device(),
                                 kind: ScreenKind::Result,
-                            });
+                            };
+                            token = Some(staged);
                             let mut state = bundle.skin().prepare_result();
+                            // The view's images, into the array its
+                            // staging uses, keyed to its installation.
+                            match stage_result_chart(
+                                screen.as_mut(),
+                                render::ResultChartTarget::Staged(staged),
+                                p.payload.chart.as_deref(),
+                            ) {
+                                Ok(table) => state.set_chart_images(table),
+                                Err(e) => failed = Some(e),
+                            }
                             let prepared = screen.prepare_result(
                                 bundle,
                                 &mut state,

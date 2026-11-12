@@ -674,3 +674,37 @@ fn each_checkpoint_cancels_the_read() {
         assert_eq!(absent(&r), Absent::Cancelled, "checkpoint {at} of {total}");
     }
 }
+
+/// RC1, RC5: a source is read once, level 0 only, fitted to the largest
+/// chart slot; every slot's fit derives from it as a read for that slot
+/// would place it (the same content, gutters and levels), up to the
+/// native size in a larger slot and an area downscale in a smaller one,
+/// never upscaled; a fit derives as itself only for slots that would
+/// derive the same content.
+#[test]
+fn a_source_derives_each_slots_fit() {
+    use skin_model::chart_image::{derive, read_source, source_slot};
+    let d = dir();
+    save(d.path(), "s.png", &solid(1_600, 1_200, [10, 20, 30, 255]));
+    let root = ChartDir::new(d.path()).unwrap();
+    let source = fitted(read_source(&root, "s.png", &[], &never, &fixed));
+    assert_eq!(source.levels().len(), 1);
+    assert_eq!(source.content(), [1_600, 1_200]);
+    assert!(source_slot().unwrap().holds(&source));
+    let large = derive(&source, slot(2_048), &never).unwrap();
+    assert_eq!(large.content(), [1_600, 1_200], "its native size");
+    assert_eq!(large.levels().len(), MIP_LEVELS);
+    assert_eq!(large, fitted(read_in(d.path(), "s.png", 2_048)));
+    let small = derive(&source, slot(1_152), &never).unwrap();
+    assert_eq!(small.content(), [1_136, 852]);
+    assert_eq!(texel(&small, 0, GUTTER + 5, GUTTER + 5), [10, 20, 30, 255]);
+    assert!(slot(2_048).derives_as(&large));
+    assert!(slot(4_096).derives_as(&large), "the native size again");
+    assert!(!slot(1_152).derives_as(&large));
+    assert!(slot(1_152).derives_as(&small));
+    assert!(!slot(2_048).derives_as(&small), "a larger slot gets more");
+    assert_eq!(
+        derive(&source, slot(1_152), &|| true),
+        Err(Absent::Cancelled)
+    );
+}

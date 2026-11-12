@@ -595,6 +595,7 @@ fn titled(
     let mut view = crate::result_skin::probe_view(ResultChart::default());
     view.score.tally.ex_score = ex;
     Arc::new(ViewPayload {
+        chart: None,
         key,
         skin: skin.map(Arc::clone),
         script: None,
@@ -1632,6 +1633,7 @@ fn result_frame_alloc() {
             &title,
         );
         let p = Arc::new(ViewPayload {
+            chart: None,
             script: g,
             ..(*p).clone()
         });
@@ -2266,6 +2268,7 @@ fn scripted(
     let ex = 1_000 * u32::try_from(key).unwrap();
     let p = payload(key, Some(skin), ex, lines);
     Arc::new(ViewPayload {
+        chart: None,
         script: g,
         ..(*p).clone()
     })
@@ -2647,6 +2650,7 @@ fn the_build_mark_precedes_the_result_build() {
     let mut side = ResultSide::new(1);
     let p = titled(0, Some(&skin), 1_000, &[], "A");
     let p = Arc::new(ViewPayload {
+        chart: None,
         script: g,
         ..(*p).clone()
     });

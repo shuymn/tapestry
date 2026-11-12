@@ -149,6 +149,7 @@ fn stage(rig: &PlayerRig<'_>) -> &'static str {
     match rig.prep.as_ref().map(|p| &p.stage) {
         None => "none",
         Some(PrepStage::Skin(_)) => "skin",
+        Some(PrepStage::Facts(_)) => "facts",
         Some(PrepStage::Image(..)) => "image",
         Some(PrepStage::Screen(_)) => "screen",
         Some(PrepStage::Images(..)) => "images",

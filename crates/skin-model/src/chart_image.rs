@@ -260,6 +260,16 @@ impl Slot {
         let [sw, sh] = self.size;
         pw <= sw && ph <= sh
     }
+
+    /// Whether `fitted` is what [`derive`] gives for this slot from the
+    /// same source: it holds it, and its content is the one this slot's
+    /// fit has. Two slots for which a fit passes share it.
+    #[must_use]
+    pub fn derives_as(self, fitted: &Fitted) -> bool {
+        self.holds(fitted)
+            && fitted.levels.len() == MIP_LEVELS
+            && fitted_size(fitted.native, self.max_content()) == fitted.content
+    }
 }
 
 /// An image fitted into a slot, premultiplied, with its mip levels.
@@ -415,6 +425,87 @@ pub fn read(
     cancel: &dyn Fn() -> bool,
     identity: Identity<'_>,
 ) -> Read {
+    read_levels(dir, label, fallbacks, slot, MIP_LEVELS, cancel, identity)
+}
+
+/// The side of the largest chart slot any installation can have: half of
+/// a page of [`MAX_PAGE_SIDE`].
+pub const SOURCE_SIDE: u32 = MAX_PAGE_SIDE / 2;
+
+/// The slot a source is fitted for ([`read_source`]): the largest chart
+/// slot any installation can have, [`SOURCE_SIDE`] square.
+#[must_use]
+pub fn source_slot() -> Option<Slot> {
+    Slot::new([SOURCE_SIDE, SOURCE_SIDE])
+}
+
+/// Reads the image `label` names in `dir` once, as [`read`] does, into a
+/// **source**: fitted for [`source_slot`], level 0 only. Every slot's fit is
+/// then [`derive`]d from it, so a file is decoded once whatever slots its
+/// image is drawn in. `None` slot never occurs ([`SOURCE_SIDE`] is a
+/// valid side); it reads as [`Absent::Failed`].
+#[must_use]
+pub fn read_source(
+    dir: &ChartDir,
+    label: &str,
+    fallbacks: &[&str],
+    cancel: &dyn Fn() -> bool,
+    identity: Identity<'_>,
+) -> Read {
+    let Some(slot) = source_slot() else {
+        return Read {
+            binding: resolve(dir, label, fallbacks, identity),
+            image: Err(Absent::Failed),
+        };
+    };
+    read_levels(dir, label, fallbacks, slot, 1, cancel, identity)
+}
+
+/// The fit of `source` (a [`read_source`]'s image) for `slot`: its content
+/// `fitted_size(native, slot.max_content())`, as a read for `slot` would
+/// make it, never larger than the source's, since the source's slot is the
+/// largest: up to the native size, an area downscale below it, nothing
+/// upscaled. Then the gutters and every mip level, as [`read`] gives them.
+/// `cancel` is asked before the fit and before each mip level.
+///
+/// # Errors
+///
+/// [`Absent::Cancelled`] once `cancel` answers; [`Absent::Decode`] for a
+/// source with no level 0 or one that cannot be allocated.
+pub fn derive(source: &Fitted, slot: Slot, cancel: &dyn Fn() -> bool) -> Result<Fitted, Absent> {
+    checkpoint(cancel, Site::Fitted)?;
+    let [cw, ch] = fitted_size(source.native, slot.max_content());
+    let [mw, mh] = source.content;
+    let content = [cw.min(mw), ch.min(mh)];
+    // The source's content texels, [`GUTTER`] in on each axis.
+    let [sw, sh] = source.content;
+    let pw = to_usize(source.padded[0]);
+    let level0 = source.levels.first().ok_or(Absent::Decode)?;
+    let mut texels = zeroed(u64::from(sw) * u64::from(sh) * 4)?;
+    let row = to_usize(sw) * 4;
+    for (y, out) in (0..to_usize(sh)).zip(texels.chunks_exact_mut(row)) {
+        let at = ((y + to_usize(GUTTER)) * pw + to_usize(GUTTER)) * 4;
+        let src = level0.get(at..at + row).ok_or(Absent::Decode)?;
+        out.copy_from_slice(src);
+    }
+    let texels = if content == source.content {
+        texels
+    } else {
+        area(&texels, source.content, content)?
+    };
+    finish(source.native, content, texels, MIP_LEVELS, cancel)
+}
+
+/// [`read`] with `levels` mip levels (level 0 alone for a source).
+fn read_levels(
+    dir: &ChartDir,
+    label: &str,
+    fallbacks: &[&str],
+    slot: Slot,
+    levels: usize,
+    cancel: &dyn Fn() -> bool,
+    identity: Identity<'_>,
+) -> Read {
     let mut retried = false;
     loop {
         let binding = resolve(dir, label, fallbacks, identity);
@@ -434,7 +525,7 @@ pub fn read(
             }
             Binding::Resolved { path, key, .. } => (path.clone(), key.clone()),
         };
-        match read_resolved(&canonical, &key, slot, cancel, identity) {
+        match read_resolved(&canonical, &key, slot, levels, cancel, identity) {
             Ok(fitted) => {
                 return Read {
                     binding,
@@ -475,6 +566,7 @@ fn read_resolved(
     canonical: &Path,
     key: &FileKey,
     slot: Slot,
+    levels: usize,
     cancel: &dyn Fn() -> bool,
     identity: Identity<'_>,
 ) -> Result<Fitted, Stop> {
@@ -505,7 +597,7 @@ fn read_resolved(
     decode::check_whole(&bytes, dims, header).map_err(absent_of)?;
     let image = decode::decode(bytes, dims).map_err(absent_of)?;
     checkpoint(cancel, Site::Decoded)?;
-    Ok(fit(image, slot, cancel)?)
+    Ok(fit(image, slot, levels, cancel)?)
 }
 
 /// What a read decodes: the whole bytes, the dimensions and a PNG's
@@ -567,8 +659,14 @@ fn to_usize(n: u32) -> usize {
     usize::try_from(n).unwrap_or(usize::MAX)
 }
 
-/// Fits the straight-alpha `image` into `slot` (see the module).
-fn fit(image: RgbaImage, slot: Slot, cancel: &dyn Fn() -> bool) -> Result<Fitted, Absent> {
+/// Fits the straight-alpha `image` into `slot` (see the module), with
+/// `levels` mip levels.
+fn fit(
+    image: RgbaImage,
+    slot: Slot,
+    levels: usize,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Fitted, Absent> {
     let native = [image.width(), image.height()];
     let content = fitted_size(native, slot.max_content());
     let mut texels = image.into_raw();
@@ -582,11 +680,24 @@ fn fit(image: RgbaImage, slot: Slot, cancel: &dyn Fn() -> bool) -> Result<Fitted
         area(&texels, native, content)?
     };
     checkpoint(cancel, Site::Fitted)?;
+    finish(native, content, texels, levels, cancel)
+}
+
+/// The fitted image of `texels` (premultiplied RGBA8 of `content`) of an
+/// image of `native` texels: placed [`GUTTER`] texels in, with `count` mip
+/// levels (at most [`MIP_LEVELS`]).
+fn finish(
+    native: [u32; 2],
+    content: [u32; 2],
+    texels: Vec<u8>,
+    count: usize,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Fitted, Absent> {
     let padded = content.map(|c| c.next_multiple_of(ALIGN) + 2 * GUTTER);
-    let mut levels = Vec::with_capacity(MIP_LEVELS);
+    let mut levels = Vec::with_capacity(count);
     levels.push(extrude(&texels, content, padded)?.into_boxed_slice());
     drop(texels);
-    for k in 1..MIP_LEVELS {
+    for k in 1..count.min(MIP_LEVELS) {
         checkpoint(cancel, Site::Mip)?;
         let [pw, ph] = padded.map(|s| s >> (k - 1));
         let mut dst = zeroed(u64::from(pw / 2) * u64::from(ph / 2) * 4)?;

@@ -5,12 +5,13 @@
 //! opaque black and an opaque white 1×1 region, which become generated
 //! images of that size and colour, drawn as any image is: stretched to
 //! the destination, its colour, alpha and blend applied, following the
-//! covers, and an offset-4 one painting SUDDEN+. On a play skin, the
-//! chart's stage file and back image (100 and 101) become chart images
-//! (S10-12 design §6): drawn from the chart layer the player writes, their
-//! stretch applied at placement against the image's own size. The banner
-//! (102), 100 and 101 on any other screen, and every other id are dropped,
-//! or refuse the skin when they are failure presentation.
+//! covers, and an offset-4 one painting SUDDEN+. On a play or result
+//! skin, the chart's stage file and back image (100 and 101) become chart
+//! images (S10-12 design §6): drawn from the chart layer the player
+//! writes, their stretch applied at placement against the image's own
+//! size. The banner (102), 100 and 101 on any other screen, and every
+//! other id are dropped, or refuse the skin when they are failure
+//! presentation.
 
 use skin_model::Source;
 use skin_model::chart_image::ChartImage;
@@ -47,7 +48,10 @@ impl Cx<'_> {
             _ => None,
         };
         if let Some(which) = chart
-            && self.kind == skin_model::ScreenKind::Play
+            && matches!(
+                self.kind,
+                skin_model::ScreenKind::Play | skin_model::ScreenKind::Result
+            )
             && !dst.failure
         {
             return self.chart_image(dst, which);

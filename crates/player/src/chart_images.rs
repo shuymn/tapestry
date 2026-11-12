@@ -1,23 +1,33 @@
-//! The chart's own images on play (S10-12 design §5): the stage file and
-//! back image an attempt's labels name, read from the chart's folder under
-//! T08's rules and fitted into the play installation's chart layer on one
-//! owned worker, then published by the render thread, and settled before
-//! the attempt's final readiness.
+//! The chart's own images (S10-12 design §5): the stage file and back
+//! image an attempt's labels name, read from the chart's folder under
+//! T08's rules, fitted into each installation's chart layer on one owned
+//! worker, and published by the render thread.
 //!
-//! - **The set** ([`ChartImages`]) is the two reads, each with the
-//!   observation its pixels came from. A later attempt re-resolves both
-//!   names and keeps a read whose observation is unchanged (design.md
-//!   "Load Pipeline", Freshness): only a changed or new file is decoded.
+//! - **Sources** ([`Sources`]): each generation (a choice, a practice
+//!   Start, a retry's re-resolution) decodes each named image once, fitted
+//!   to the largest chart slot any installation can have, level 0 only. A
+//!   later generation re-resolves both names and keeps a source whose
+//!   observation is unchanged (design.md "Load Pipeline", Freshness): only
+//!   a changed or new file is decoded.
+//! - **Halves**: every installation's fit is derived from the sources
+//!   ([`chart_image::derive`]): the play half for the play installation,
+//!   the result half for the result's. A half is kept per image while its
+//!   source is the same read, and a fit one slot would derive as another's
+//!   is shared.
+//! - **Availability** ([`ImageFacts`]) is the worker's: unresolved from a
+//!   generation's start until its sources are adopted, then whether each
+//!   source is an image. A failed job resolves both absent.
 //! - **The worker** ([`ChartImageWorker`]) runs at most one job, never
 //!   beginning one while another's thread has not ended; a job of a chart
 //!   left is cancelled through the choice's scope and kept until its
 //!   thread ends. A panic, or a thread that cannot start, makes the
 //!   images it had not finished absent and never ends the run.
-//! - **The target** is the play installation the attempt draws with: the
-//!   committed one, or a pending skin's specialization staged with an
-//!   array of its own. The render thread answers what each publication
-//!   left ([`Published`]); an installation with no chart layer is given
-//!   the images absent, so a skin's "no image" presentation shows.
+//! - **The play target** is the play installation the attempt draws
+//!   with: the committed one, or a pending skin's specialization staged
+//!   with an array of its own. The render thread answers what each
+//!   publication left ([`Published`]); an installation with no chart layer
+//!   is given the images absent, so a skin's "no image" presentation shows.
+//!   The result half is handed to the result at the attempt's commit.
 //! - **Direct launch:** with no coordinator, the images are read
 //!   synchronously on the game thread in the attempt's preparation.
 
@@ -30,6 +40,7 @@ use std::time::{Duration, Instant};
 use game::coord::{
     Class, Coordinator, JobKey, JobKind, Outcome, OwnedJob, Owner, Scope, Settled, Spawner,
 };
+use skin_model::ImageFacts;
 use skin_model::chart_image::{
     self, Absent, ChartDir, ChartImage, ChartTable, FileIdentity, Fitted, Read,
 };
@@ -45,16 +56,49 @@ pub use crate::chart_currency::{ChartNow, PublicationKey, PublishedTo};
 #[cfg(test)]
 pub static PANIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(test)]
+thread_local! {
+    /// Files decoded into sources, and fits derived from them, on this
+    /// thread (tests: a job hands its counts back with its output).
+    static COUNTS: std::cell::Cell<(u64, u64)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+/// Counts a decode (`[1, 0]`) or a derivation (`[0, 1]`) (tests).
+#[cfg(test)]
+fn count([decodes, derives]: [u64; 2]) {
+    COUNTS.with(|c| {
+        let (d, f) = c.get();
+        c.set((d + decodes, f + derives));
+    });
+}
+
 /// What a publication left ([`render::ChartOutcome`] when it failed).
 pub type Published = Result<ChartTable, render::ChartOutcome>;
 
-/// The chart's stage file and back image as read, by [`ChartImage::index`].
+/// The next set's id.
+static SET_IDS: AtomicU64 = AtomicU64::new(1);
+
+/// The chart's stage file and back image as read, by [`ChartImage::index`],
+/// and the set's id, unique in the process: what an array's record names
+/// ([`render::Renderer::write_result_chart`]).
 #[derive(Debug)]
 pub struct ChartImages {
     reads: [Arc<Read>; 2],
+    id: u64,
 }
 
+/// The sources of a generation: each image decoded once, level 0 only,
+/// fitted to the largest chart slot ([`chart_image::read_source`]).
+pub type Sources = ChartImages;
+
 impl ChartImages {
+    fn of(reads: [Arc<Read>; 2]) -> Self {
+        Self {
+            reads,
+            id: SET_IDS.fetch_add(1, Ordering::Relaxed),
+        }
+    }
+
     /// Both absent for `why`.
     #[must_use]
     pub fn absent(why: &Absent) -> Self {
@@ -64,9 +108,13 @@ impl ChartImages {
                 image: Err(why.clone()),
             })
         };
-        Self {
-            reads: [read(), read()],
-        }
+        Self::of([read(), read()])
+    }
+
+    /// Its id.
+    #[must_use]
+    pub const fn id(&self) -> u64 {
+        self.id
     }
 
     /// The fitted images, absent ones `None`.
@@ -85,6 +133,15 @@ impl ChartImages {
         }
     }
 
+    /// Whether each image is one: the availability of sources.
+    #[must_use]
+    pub fn facts(&self) -> ImageFacts {
+        ImageFacts {
+            stage: self.read(ChartImage::Stage).image.is_ok(),
+            back: self.read(ChartImage::Back).image.is_ok(),
+        }
+    }
+
     /// The bytes of its fitted levels, for the memory witness.
     #[must_use]
     pub fn bytes(&self) -> u64 {
@@ -97,28 +154,32 @@ impl ChartImages {
     }
 }
 
-/// What an attempt asks of the images: the chart's folder, its stage file
-/// and back image names as its labels hold them, and the page side of the
-/// target's chart layer; `None` when the target keeps no chart layer, whose
-/// images are published absent.
+/// What an attempt asks of the images: the chart's folder and its stage
+/// file and back image names as its labels hold them, and the page side of
+/// each target's chart layer, the play installation's and the result's;
+/// `None` for a target that keeps no chart layer (play's images are then
+/// published absent).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Want {
     pub dir: PathBuf,
     pub names: [String; 2],
-    pub side: Option<u32>,
+    pub play: Option<u32>,
+    pub result: Option<u32>,
 }
 
-/// Reads `want`'s images, re-resolving each name and keeping `prior`'s
-/// read of an unchanged file (both observations equal, identities
-/// available), and asking `cancel` at the reader's checkpoints. One image at
-/// a time.
+impl Want {
+    /// Whether `other` names the same files: the same sources.
+    fn same_files(&self, other: &Self) -> bool {
+        self.dir == other.dir && self.names == other.names
+    }
+}
+
+/// Decodes `want`'s images into sources, re-resolving each name and
+/// keeping `prior`'s read of an unchanged file (both observations equal,
+/// identities available), asking `cancel` at the reader's checkpoints. One
+/// image at a time.
 #[must_use]
-pub fn read_set(
-    want: &Want,
-    side: u32,
-    prior: Option<&ChartImages>,
-    cancel: &dyn Fn() -> bool,
-) -> ChartImages {
+pub fn read_sources(want: &Want, prior: Option<&Sources>, cancel: &dyn Fn() -> bool) -> Sources {
     let dir = match ChartDir::new(&want.dir) {
         Ok(dir) => dir,
         Err(e) => {
@@ -135,41 +196,109 @@ pub fn read_set(
         "an injected panic of the images' read"
     );
     let identity: chart_image::Identity<'_> = &file_identity;
-    let mut reads = Vec::with_capacity(2);
-    for (which, name) in ChartImage::ALL.into_iter().zip(&want.names) {
-        let Some((_, slot)) = which.slot(side) else {
-            reads.push(Arc::new(Read {
-                binding: chart_image::Binding::NoHeader,
-                image: Err(Absent::NoHeader),
-            }));
-            continue;
-        };
+    let reads = ChartImage::ALL.map(|which| {
+        let name = want.names.get(which.index()).map_or("", String::as_str);
+        let now = chart_image::resolve(&dir, name, &[], identity);
         if let Some(prior) = prior {
             let kept = prior.read(which);
-            let now = chart_image::resolve(&dir, name, &[], identity);
-            // Kept only when unchanged and fitted for a slot it still
-            // fits: a read for a larger layer is read again for this one.
-            if now.same_as(&kept.binding) && kept.image.as_ref().is_ok_and(|f| slot.holds(f)) {
-                reads.push(Arc::clone(&prior.reads[which.index()]));
-                continue;
+            if now.same_as(&kept.binding)
+                && !matches!(kept.image, Err(Absent::Cancelled | Absent::Failed))
+            {
+                return Arc::clone(&prior.reads[which.index()]);
             }
         }
-        reads.push(Arc::new(chart_image::read(
-            &dir,
-            name,
-            &[],
-            slot,
-            cancel,
-            identity,
-        )));
-    }
-    let mut it = reads.into_iter();
-    match (it.next(), it.next()) {
-        (Some(stage), Some(back)) => ChartImages {
-            reads: [stage, back],
-        },
-        _ => ChartImages::absent(&Absent::Failed),
-    }
+        match now {
+            chart_image::Binding::Resolved { .. } => {
+                #[cfg(test)]
+                count([1, 0]);
+                Arc::new(chart_image::read_source(&dir, name, &[], cancel, identity))
+            }
+            binding => {
+                let image = Err(match &binding {
+                    chart_image::Binding::Unresolved { why, .. } => Absent::Unresolved(*why),
+                    _ => Absent::NoHeader,
+                });
+                Arc::new(Read { binding, image })
+            }
+        }
+    });
+    ChartImages::of(reads)
+}
+
+/// A half: the fits of a generation's sources for chart layers of one
+/// side, and the sources they were derived from.
+#[derive(Debug)]
+struct Half {
+    side: u32,
+    generation: u64,
+    from: Arc<Sources>,
+    fits: Arc<ChartImages>,
+}
+
+/// Derives `sources`' fits for chart layers of side `side`: each image's
+/// read is kept from `prior` while its source is the same read and its
+/// side the same, shared with `other` when its slot derives as that fit
+/// ([`chart_image::Slot::derives_as`]), else derived anew. An absent
+/// source stays absent; a side with no slot has the images absent.
+fn derive_half(
+    sources: &Sources,
+    side: u32,
+    prior: Option<&Half>,
+    other: Option<&ChartImages>,
+    cancel: &dyn Fn() -> bool,
+) -> ChartImages {
+    let reads = ChartImage::ALL.map(|which| {
+        let i = which.index();
+        let source = &sources.reads[i];
+        if let Some(p) = prior
+            && p.side == side
+            && Arc::ptr_eq(&p.from.reads[i], source)
+        {
+            return Arc::clone(&p.fits.reads[i]);
+        }
+        let Some((_, slot)) = which.slot(side) else {
+            return Arc::new(Read {
+                binding: chart_image::Binding::NoHeader,
+                image: Err(Absent::NoHeader),
+            });
+        };
+        let Ok(image) = &source.image else {
+            return Arc::clone(source);
+        };
+        if let Some(o) = other
+            && o.read(which)
+                .image
+                .as_ref()
+                .is_ok_and(|f| slot.derives_as(f))
+            && fitted_from(o.read(which), source)
+        {
+            return Arc::clone(&o.reads[i]);
+        }
+        #[cfg(test)]
+        count([0, 1]);
+        Arc::new(Read {
+            binding: source.binding.clone(),
+            image: chart_image::derive(image, slot, cancel),
+        })
+    });
+    ChartImages::of(reads)
+}
+
+/// `sources`' fits for chart layers of side `side`, each derived anew
+/// (a result layout's own chart slot).
+#[must_use]
+pub fn derive_set(sources: &Sources, side: u32, cancel: &dyn Fn() -> bool) -> ChartImages {
+    derive_half(sources, side, None, None, cancel)
+}
+
+/// Whether `fit` was derived from `source`: the same observation and
+/// native size.
+fn fitted_from(fit: &Read, source: &Read) -> bool {
+    fit.binding == source.binding
+        && match (&fit.image, &source.image) {
+            (Ok(a), Ok(b)) => a.native() == b.native(),
+            _ => false,
+        }
 }
 
 /// An open file's identity: its volume's serial number and its file
@@ -279,11 +408,24 @@ pub enum Publish {
 /// What an answer from a render thread gone reads as.
 const GONE: Published = Err(render::ChartOutcome::Unavailable);
 
+/// What a job gives: its sources, and the halves it was asked for.
+#[derive(Debug)]
+struct JobOut {
+    sources: Arc<Sources>,
+    play: Option<Arc<ChartImages>>,
+    result: Option<Arc<ChartImages>>,
+    /// Tests: the files it decoded and the fits it derived.
+    #[cfg(test)]
+    counts: (u64, u64),
+}
+
 /// A job of the worker, its thread not yet joined.
 struct Job {
     want: Want,
     generation: u64,
-    job: OwnedJob<Arc<ChartImages>>,
+    /// Whether it derives the play half (and publishes it).
+    play: bool,
+    job: OwnedJob<Arc<JobOut>>,
 }
 
 /// What a job begun later, from a wait, needs: the coordinator, the
@@ -305,13 +447,17 @@ struct Core {
     /// The job reading `want`'s images.
     job: Option<Job>,
     /// A job of an earlier want or generation, its thread not yet joined.
-    obsolete: Option<OwnedJob<Arc<ChartImages>>>,
-    /// The images last read, what for, and in which generation: current
-    /// only for `want` in the current generation, else kept as the
-    /// candidates a re-resolution reuses.
-    set: Option<(Want, u64, Arc<ChartImages>)>,
-    /// The set was drawn by a committed attempt: the next attempt of the
-    /// same want re-resolves its files first.
+    obsolete: Option<OwnedJob<Arc<JobOut>>>,
+    /// The sources last decoded, of which files, in which generation:
+    /// current only for `want`'s files in the current generation (the
+    /// facts are then resolved), else kept as the candidates a
+    /// re-resolution reuses.
+    sources: Option<(Want, u64, Arc<Sources>)>,
+    /// The play half and the result half last derived.
+    play: Option<Half>,
+    result: Option<Half>,
+    /// The sources were drawn by a committed attempt: the next attempt of
+    /// the same files re-resolves them first.
     used: bool,
     /// The last publication.
     publication: Option<Publication>,
@@ -324,11 +470,19 @@ struct Core {
     /// first one for its generation and request, kept across publications
     /// asked again for it.
     deadline: Option<(u64, Option<u64>, Instant)>,
+    /// Since when a job the want needs could not begin for a publication
+    /// unanswered: the facts' wait is bounded from there.
+    blocked: Option<Instant>,
     /// A job the last step could not begin yet (a job's thread still
     /// alive, or a publication unanswered): the waits' service begins it.
     starter: Option<Starter>,
-    /// Jobs begun (tests count decodes by it).
+    /// The run ended ([`ChartImageWorker::end`]): nothing begins again.
+    ended: bool,
+    /// Jobs begun (tests count jobs by it).
     begun: u64,
+    /// Tests: the files its jobs decoded and the fits they derived.
+    #[cfg(test)]
+    counts: (u64, u64),
 }
 
 /// The run's one owner of the chart-image worker (module doc): a handle,
@@ -352,10 +506,21 @@ impl std::fmt::Debug for ChartImageWorker {
             .field("generation", &c.generation())
             .field("job", &c.job.as_ref().map(|j| (&j.want, j.generation)))
             .field("obsolete", &c.obsolete.is_some())
-            .field("set", &c.set.as_ref().map(|(w, g, _)| (w, g)))
+            .field("sources", &c.sources.as_ref().map(|(w, g, _)| (w, g)))
             .field("retiring", &c.retiring.is_some())
             .finish_non_exhaustive()
     }
+}
+
+/// What the attempt's result takes at its commit
+/// ([`ChartImageWorker::take_result`]): the generation's sources, and its
+/// result half, if one was asked for.
+#[derive(Debug)]
+pub struct ResultImages {
+    pub sources: Arc<Sources>,
+    pub half: Option<Arc<ChartImages>>,
+    /// The chart layer side the half is derived for.
+    pub side: Option<u32>,
 }
 
 impl ChartImageWorker {
@@ -369,13 +534,19 @@ impl ChartImageWorker {
                 generation,
                 job: None,
                 obsolete: None,
-                set: None,
+                sources: None,
+                play: None,
+                result: None,
                 used: false,
                 publication: None,
                 retiring: None,
                 deadline: None,
+                blocked: None,
                 starter: None,
+                ended: false,
                 begun: 0,
+                #[cfg(test)]
+                counts: (0, 0),
             })),
         }
     }
@@ -391,7 +562,7 @@ impl ChartImageWorker {
         self.core().generation()
     }
 
-    /// Jobs begun (tests count decodes by it).
+    /// Jobs begun (tests).
     #[cfg(test)]
     #[must_use]
     pub fn begun(&self) -> u64 {
@@ -402,35 +573,44 @@ impl ChartImageWorker {
     /// re-resolution or a chart left. Written at once where the render
     /// thread reads it, so no table or acknowledgment of the last one is
     /// current from here, and no frame drawn after a loading lifetime
-    /// begun after this draws one. What the last generation read stays,
-    /// only as the candidates the next read reuses; its job, if running,
-    /// is left to end, and its set is never taken; its publication, if
+    /// begun after this draws one; the facts are unresolved until this
+    /// generation's sources. What the last generation read stays, only as
+    /// the candidates the next read reuses; its job, if running, is left
+    /// to end, and its output is never taken; its publication, if
     /// unanswered, retires.
     pub fn renew(&self) {
         self.core().renew();
     }
 
-    /// Asks for `want`'s images for the attempt being prepared. A new want
-    /// drops the last publication (retiring it while unanswered), which is
-    /// published again for it. The same want after an attempt drew the set
-    /// (a retry or a practice round) is a new generation
-    /// ([`renew`](Self::renew)): its files are re-resolved, what did not
-    /// change kept, and published again (design C11, P22).
-    pub fn want(&self, want: Want) {
+    /// Asks for `want`'s images for the attempt being prepared: the one
+    /// function that sets what is asked (at the choice, on entering the
+    /// attempt's facts stage, and with both sides known). Each part is
+    /// compared on its own: a want that changes only a side keeps the
+    /// sources, the other half and its publication, and the next job only
+    /// derives. A changed play part drops the last publication (retiring
+    /// it while unanswered), which is published again for it. The same
+    /// files after an attempt drew them (a retry or a practice round) are a
+    /// new generation ([`renew`](Self::renew)): they are re-resolved, what
+    /// did not change kept, and published again (design C11, P22).
+    pub fn attempt(&self, want: Want) {
         let mut c = self.core();
-        if c.used && c.current_for(&want).is_some() {
+        if c.used && c.sources_current_for(&want) {
             c.renew();
         }
-        if c.want.as_ref() != Some(&want) {
+        let same_play = c
+            .want
+            .as_ref()
+            .is_some_and(|w| w.same_files(&want) && w.play == want.play);
+        if !same_play {
             c.supersede();
         }
         c.want = Some(want);
     }
 
-    /// The current set was drawn by an attempt that committed.
+    /// The current sources were drawn by an attempt that committed.
     pub fn committed(&self) {
         let mut c = self.core();
-        c.used = c.current().is_some();
+        c.used = c.sources_current();
     }
 
     /// The chart is left: a new generation with nothing asked for. Its
@@ -446,14 +626,74 @@ impl ChartImageWorker {
         }
     }
 
+    /// Selection is entered: the sources and halves go, so nothing of the
+    /// last chart's images stays beside selection's.
+    pub fn drop_images(&self) {
+        let mut c = self.core();
+        c.sources = None;
+        c.play = None;
+        c.result = None;
+    }
+
+    /// The result begins: the play half goes (the play installation is not
+    /// drawn); a retry derives it again from the sources, decoding
+    /// nothing. Its publication goes once answered.
+    pub fn result_began(&self) {
+        let mut c = self.core();
+        c.play = None;
+        c.poll_answers();
+        if c.publication.as_ref().is_some_and(|p| !p.pending()) {
+            c.publication = None;
+        }
+    }
+
+    /// The facts of the current generation: `None` until its sources are
+    /// adopted, then whether each is an image.
+    #[must_use]
+    pub fn facts(&self) -> Option<ImageFacts> {
+        let c = self.core();
+        c.sources_current()
+            .then(|| c.sources.as_ref().map(|(_, _, s)| s.facts()))?
+    }
+
+    /// How long a job the want needs has been held back by a publication
+    /// unanswered, if it is.
+    #[must_use]
+    pub fn blocked_for(&self) -> Option<Duration> {
+        self.core().blocked.map(|at| at.elapsed())
+    }
+
+    /// What the attempt's result takes at its commit: the current sources
+    /// (kept here as the candidates of the next generation) and the result
+    /// half, moved out. `None` before the sources are adopted.
+    #[must_use]
+    pub fn take_result(&self) -> Option<ResultImages> {
+        let mut c = self.core();
+        if !c.sources_current() {
+            return None;
+        }
+        let sources = c.sources.as_ref().map(|(_, _, s)| Arc::clone(s))?;
+        let side = c.want.as_ref().and_then(|w| w.result);
+        let half = if c.result_current() {
+            c.result.take().map(|h| h.fits)
+        } else {
+            None
+        };
+        Some(ResultImages {
+            sources,
+            half,
+            side,
+        })
+    }
+
     /// Advances the worker without blocking: takes what ended, and begins
     /// the job `want` needs once no job's thread is alive and no
     /// publication is unanswered, else leaves it to the loading waits'
     /// [`service`](Self::service). `coord` `None` (the direct launch) reads
     /// at once on this thread, asking `cancel`. With `publish`, the skin in
     /// use's loading frames get what is terminal at once: the job publishes
-    /// its set as soon as it is read, and a target with no chart layer, or a
-    /// job that cannot start, publishes the images absent now.
+    /// its play half as soon as it is derived, and a target with no chart
+    /// layer, or a job that cannot start, publishes the images absent now.
     pub fn step(
         &self,
         coord: Option<(&Coordinator, Spawner)>,
@@ -462,23 +702,28 @@ impl ChartImageWorker {
     ) {
         let mut c = self.core();
         c.take_finished();
+        if c.ended {
+            return;
+        }
         let Some(want) = c.want.clone() else {
             return;
         };
         let generation = c.generation();
         let Some((coord, spawner)) = coord else {
-            if c.current().is_some() || c.job.is_some() {
+            if c.job.is_some() || !c.needs_job() {
                 return;
             }
-            let Some(side) = want.side else {
-                return;
-            };
-            let prior = c.set.as_ref().map(|(_, _, s)| Arc::clone(s));
             c.begun += 1;
-            let set = Arc::new(read_set(&want, side, prior.as_deref(), cancel));
-            log_absent(&set);
-            c.set = Some((want, generation, set));
-            log::info!("chart images: read; {} bytes retained", c.retained_bytes());
+            let out = c.run(&want, cancel);
+            #[cfg(test)]
+            {
+                c.counts.0 += out.counts.0;
+                c.counts.1 += out.counts.1;
+            }
+            // A read stopped part way is never this generation's.
+            if !cancel() {
+                c.adopt(&want, generation, out);
+            }
             return;
         };
         c.starter = Some((coord.clone(), spawner, publish.cloned()));
@@ -487,9 +732,9 @@ impl ChartImageWorker {
 
     /// The loading waits' service ([`crate::controls::Controls::look`]):
     /// what [`step`](Self::step) left, nonblocking, from whichever thread
-    /// waits. Takes a finished job's set and answers, and begins a job the
-    /// last step left once nothing holds it back. Nothing when the game
-    /// thread holds the worker.
+    /// waits. Takes a finished job's output and answers, and begins a job
+    /// the last step left once nothing holds it back. Nothing when the
+    /// game thread holds the worker.
     pub fn service(&self) {
         let Ok(mut c) = self.core.try_lock() else {
             return;
@@ -498,23 +743,55 @@ impl ChartImageWorker {
         c.begin_if_free();
     }
 
-    /// The set `want` asked for, once read in the current generation
-    /// (tests).
+    /// The play half `want` asked for, once derived in the current
+    /// generation (tests).
     #[cfg(test)]
     #[must_use]
     pub fn current(&self) -> Option<Arc<ChartImages>> {
-        self.core().current().cloned()
+        self.core().play_current().cloned()
     }
 
-    /// Publishes the current set (or absent, for a target with no chart
-    /// layer) for the attempt of `request` once it is read, and takes its
-    /// answer: [`Publish::Answered`] once the publication for that
-    /// generation and request has returned and is still current
-    /// ([`PublicationKey::current`]); one that is not, or one its job never
-    /// sent, is asked again, once no other publication is unanswered.
-    /// [`Publish::Expired`] when no current answer came within the render
-    /// link's bound since the first publication for the generation and
-    /// request.
+    /// The result half, once derived in the current generation (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn current_result(&self) -> Option<Arc<ChartImages>> {
+        let c = self.core();
+        c.result_current()
+            .then(|| c.result.as_ref().map(|h| Arc::clone(&h.fits)))?
+    }
+
+    /// The current sources (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn sources(&self) -> Option<Arc<Sources>> {
+        let c = self.core();
+        c.sources_current()
+            .then(|| c.sources.as_ref().map(|(_, _, s)| Arc::clone(s)))?
+    }
+
+    /// The files its jobs decoded and the fits they derived (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn counts(&self) -> (u64, u64) {
+        self.core().counts
+    }
+
+    /// The bytes it keeps (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn retained(&self) -> u64 {
+        self.core().retained_bytes()
+    }
+
+    /// Publishes the current play half (or absent, for a target with no
+    /// chart layer) for the attempt of `request` once everything asked for
+    /// is read, and takes its answer: [`Publish::Answered`] once the
+    /// publication for that generation and request has returned and is
+    /// still current ([`PublicationKey::current`]); one that is not, or
+    /// one its job never sent, is asked again, once no other publication
+    /// is unanswered. [`Publish::Expired`] when no current answer came
+    /// within the render link's bound since the first publication for the
+    /// generation and request.
     pub fn publish(
         &self,
         render: &crate::render_side::RenderLink,
@@ -525,8 +802,12 @@ impl ChartImageWorker {
         let Some(want) = c.want.as_ref() else {
             return Publish::Waiting;
         };
-        let set = match want.side {
-            Some(_) => match c.current() {
+        let play = want.play;
+        if c.needs_job() {
+            return Publish::Waiting;
+        }
+        let set = match play {
+            Some(_) => match c.play_current() {
                 Some(s) => Some(Arc::clone(s)),
                 None => return Publish::Waiting,
             },
@@ -597,14 +878,22 @@ impl ChartImageWorker {
         c.job.is_none() && c.obsolete.is_none()
     }
 
-    /// At the run's end: every job is stopped and joined within
-    /// [`STOP_WAIT`], or left to the process's exit (design P17); a panic
-    /// is logged, never the run's.
+    /// At the run's end: nothing begins from here (no want, step, service
+    /// or admission begins a job); what it keeps goes, and every job is
+    /// stopped and joined within [`STOP_WAIT`], or left to the process's
+    /// exit, owning what it holds (design P17); a panic is logged, never
+    /// the run's.
     pub fn end(&self) {
         let mut c = self.core();
+        c.ended = true;
+        c.want = None;
         c.publication = None;
         c.retiring = None;
         c.starter = None;
+        c.sources = None;
+        c.play = None;
+        c.result = None;
+        c.blocked = None;
         let deadline = Instant::now() + STOP_WAIT;
         for job in [c.job.take().map(|j| j.job), c.obsolete.take()]
             .into_iter()
@@ -631,6 +920,46 @@ fn same(a: Option<&Arc<ChartImages>>, b: Option<&Arc<ChartImages>>) -> bool {
         (Some(a), Some(b)) => Arc::ptr_eq(a, b),
         (None, None) => true,
         _ => false,
+    }
+}
+
+/// The job's work: `want`'s sources decoded (keeping `prior`'s unchanged
+/// reads) unless `prior` is current (`fresh` false), then each half
+/// `derive` asks for derived. Asks `cancel` throughout.
+fn run_job(
+    want: &Want,
+    prior: Option<&Arc<Sources>>,
+    fresh: bool,
+    halves: [Option<&Half>; 2],
+    derive: [bool; 2],
+    cancel: &dyn Fn() -> bool,
+) -> JobOut {
+    #[cfg(test)]
+    let before = COUNTS.with(std::cell::Cell::get);
+    let sources = match prior {
+        Some(p) if !fresh => Arc::clone(p),
+        _ => Arc::new(read_sources(want, prior.map(AsRef::as_ref), cancel)),
+    };
+    let [play_prior, result_prior] = halves;
+    let [derive_play, derive_result] = derive;
+    let play = want
+        .play
+        .filter(|_| derive_play)
+        .map(|side| Arc::new(derive_half(&sources, side, play_prior, None, cancel)));
+    let other = play.as_deref().or(play_prior.map(|h| h.fits.as_ref()));
+    let result = want
+        .result
+        .filter(|_| derive_result)
+        .map(|side| Arc::new(derive_half(&sources, side, result_prior, other, cancel)));
+    JobOut {
+        sources,
+        play,
+        result,
+        #[cfg(test)]
+        counts: COUNTS.with(|c| {
+            let (d, f) = c.get();
+            (d - before.0, f - before.1)
+        }),
     }
 }
 
@@ -671,7 +1000,7 @@ impl Core {
         }
     }
 
-    fn retire(&mut self, job: OwnedJob<Arc<ChartImages>>) {
+    fn retire(&mut self, job: OwnedJob<Arc<JobOut>>) {
         if let Some(old) = self.obsolete.take() {
             // Two ended jobs at once: the older is settled now; its
             // thread has ended or ends promptly once cancelled.
@@ -680,20 +1009,136 @@ impl Core {
         self.obsolete = Some(job);
     }
 
-    fn current(&self) -> Option<&Arc<ChartImages>> {
-        self.current_for(self.want.as_ref()?)
+    /// Whether the sources are current for `want`'s files.
+    fn sources_current_for(&self, want: &Want) -> bool {
+        self.sources
+            .as_ref()
+            .is_some_and(|(w, g, _)| w.same_files(want) && *g == self.generation())
     }
 
-    fn current_for(&self, want: &Want) -> Option<&Arc<ChartImages>> {
-        self.set
+    fn sources_current(&self) -> bool {
+        self.want
             .as_ref()
-            .filter(|(w, g, _)| w == want && *g == self.generation())
-            .map(|(_, _, s)| s)
+            .is_some_and(|w| self.sources_current_for(w))
+    }
+
+    /// The half `half` when current for side `side` of the current
+    /// generation's sources.
+    fn half_current<'a>(&'a self, half: Option<&'a Half>, side: Option<u32>) -> Option<&'a Half> {
+        let side = side?;
+        let sources = self.sources.as_ref().map(|(_, _, s)| s)?;
+        half.filter(|h| {
+            self.sources_current()
+                && h.side == side
+                && h.generation == self.generation()
+                && Arc::ptr_eq(&h.from, sources)
+        })
+    }
+
+    fn play_current(&self) -> Option<&Arc<ChartImages>> {
+        let side = self.want.as_ref()?.play;
+        self.half_current(self.play.as_ref(), side).map(|h| &h.fits)
+    }
+
+    fn result_current(&self) -> bool {
+        let side = self.want.as_ref().and_then(|w| w.result);
+        self.half_current(self.result.as_ref(), side).is_some()
+    }
+
+    /// Whether the want needs a job: its sources not current, or a half it
+    /// asks for not derived from them.
+    fn needs_job(&self) -> bool {
+        let Some(want) = &self.want else {
+            return false;
+        };
+        !self.sources_current()
+            || (want.play.is_some() && self.play_current().is_none())
+            || (want.result.is_some() && !self.result_current())
+    }
+
+    /// The prior sources a job re-resolves against, and the halves it
+    /// keeps reads of.
+    fn priors(&self) -> (Option<Arc<Sources>>, Option<Half>, Option<Half>) {
+        let copy = |h: &Half| Half {
+            side: h.side,
+            generation: h.generation,
+            from: Arc::clone(&h.from),
+            fits: Arc::clone(&h.fits),
+        };
+        (
+            self.sources.as_ref().map(|(_, _, s)| Arc::clone(s)),
+            self.play.as_ref().map(copy),
+            self.result.as_ref().map(copy),
+        )
+    }
+
+    /// What a job for the want does: whether it decodes the sources, and
+    /// which halves it derives.
+    fn work(&self) -> (bool, [bool; 2]) {
+        let want = self.want.as_ref();
+        (
+            !self.sources_current(),
+            [
+                want.is_some_and(|w| w.play.is_some()) && self.play_current().is_none(),
+                want.is_some_and(|w| w.result.is_some()) && !self.result_current(),
+            ],
+        )
+    }
+
+    /// The job's work on this thread (the direct launch): the sources,
+    /// and the halves.
+    fn run(&self, want: &Want, cancel: &dyn Fn() -> bool) -> JobOut {
+        let (prior, play, result) = self.priors();
+        let (fresh, derive) = self.work();
+        run_job(
+            want,
+            prior.as_ref(),
+            fresh,
+            [play.as_ref(), result.as_ref()],
+            derive,
+            cancel,
+        )
+    }
+
+    /// Adopts `out`, a job's output for `want` begun in `generation`: each
+    /// part only while it is still the one asked for in the current
+    /// generation. The facts resolve with the sources.
+    fn adopt(&mut self, want: &Want, generation: u64, out: JobOut) {
+        let Some(now) = self.want.clone() else {
+            return;
+        };
+        if generation != self.generation() || !now.same_files(want) {
+            return;
+        }
+        log_absent(&out.sources);
+        let sources = Arc::clone(&out.sources);
+        self.sources = Some((want.clone(), generation, out.sources));
+        let half = |side: Option<u32>, fits: Option<Arc<ChartImages>>, asked: Option<u32>| match (
+            side, fits,
+        ) {
+            (Some(side), Some(fits)) if asked == Some(side) => Some(Half {
+                side,
+                generation,
+                from: Arc::clone(&sources),
+                fits,
+            }),
+            _ => None,
+        };
+        if let Some(h) = half(want.play, out.play, now.play) {
+            self.play = Some(h);
+        }
+        if let Some(h) = half(want.result, out.result, now.result) {
+            self.result = Some(h);
+        }
+        log::info!(
+            "chart images: read; {} bytes retained",
+            self.retained_bytes()
+        );
     }
 
     /// Takes what ended: the answers, an obsolete job joined, and a
-    /// finished job's set when it is of the current generation and want
-    /// and was not cancelled. Never blocks, never begins a job.
+    /// finished job's output when it is of the current generation and
+    /// files and was not cancelled. Never blocks, never begins a job.
     fn take_finished(&mut self) {
         self.poll_answers();
         if self.obsolete.as_ref().is_some_and(OwnedJob::finished)
@@ -708,88 +1153,110 @@ impl Core {
             self.job = Some(job);
             return;
         }
-        let (set, sent) = match job.job.poll().map(|o| o.outcome) {
-            Some(Outcome::Done(set)) => (Some(set), true),
+        let failed = || {
+            let absent =
+                |side: Option<u32>| side.map(|_| Arc::new(ChartImages::absent(&Absent::Failed)));
+            JobOut {
+                sources: Arc::new(ChartImages::absent(&Absent::Failed)),
+                play: absent(job.want.play.filter(|_| job.play)),
+                result: absent(job.want.result),
+                #[cfg(test)]
+                counts: (0, 0),
+            }
+        };
+        let (out, sent) = match job.job.poll().map(|o| o.outcome) {
+            Some(Outcome::Done(out)) => (Some(out), true),
             Some(Outcome::Panicked(p)) => {
                 log::warn!("chart images: the worker stopped unexpectedly: {}", p.0);
-                (Some(Arc::new(ChartImages::absent(&Absent::Failed))), false)
+                (Some(Arc::new(failed())), false)
             }
-            // A cancelled read is never a terminal set: the next step
-            // reads again what is still asked for.
+            // A cancelled read is never terminal: the next step reads again
+            // what is still asked for.
             Some(Outcome::Cancelled) | None => (None, false),
         };
         settle_logged(job.job);
-        if let Some(set) = set
-            && job.generation == self.generation()
-            && self.want.as_ref() == Some(&job.want)
+        let Some(out) = out else {
+            return;
+        };
+        let out = Arc::try_unwrap(out).unwrap_or_else(|a| JobOut {
+            sources: Arc::clone(&a.sources),
+            play: a.play.clone(),
+            result: a.result.clone(),
+            #[cfg(test)]
+            counts: a.counts,
+        });
+        #[cfg(test)]
         {
-            log_absent(&set);
-            if let Some(p) = self
+            self.counts.0 += out.counts.0;
+            self.counts.1 += out.counts.1;
+        }
+        let current = job.generation == self.generation()
+            && self.want.as_ref().is_some_and(|w| w.same_files(&job.want));
+        if current
+            && job.play
+            && self.want.as_ref().is_some_and(|w| w.play == job.want.play)
+            && let Some(p) = self
                 .publication
                 .as_mut()
                 .filter(|p| p.by_job && p.generation == job.generation && p.set.is_none())
-            {
-                // The job's own publication is of this set when the job
-                // sent it; a panicked job sent nothing, and its failed set
-                // is published by the game thread.
-                if sent {
-                    p.set = Some(Arc::clone(&set));
-                } else {
-                    p.unsent = true;
-                }
+        {
+            // The job's own publication is of its play half when the job
+            // sent it; a panicked job sent nothing, and its failed set is
+            // published by the game thread.
+            if sent && let Some(play) = &out.play {
+                p.set = Some(Arc::clone(play));
+            } else {
+                p.unsent = true;
             }
-            self.set = Some((job.want, job.generation, set));
-            log::info!(
-                "chart images: read; {} bytes retained",
-                self.retained_bytes()
-            );
         }
+        self.adopt(&job.want, job.generation, out);
     }
 
     /// Begins the job the last step left, once no job's thread is alive and
     /// no publication is unanswered, so a new set is never read while the
-    /// render thread may hold two.
+    /// render thread may hold two. What is terminal for the play target
+    /// (its current half, or absent with no chart layer) is published for
+    /// the skin in use first.
     fn begin_if_free(&mut self) {
         let Some((coord, spawner, publish)) = self.starter.clone() else {
             return;
         };
-        let Some(want) = self.want.clone() else {
+        let Some(want) = self.want.clone().filter(|_| !self.ended) else {
             self.starter = None;
             return;
         };
         let generation = self.generation();
-        let Some(side) = want.side else {
-            // No chart layer: the images are absent, terminal at once.
-            if publish
-                .as_ref()
-                .is_none_or(|p| self.publish_now(p, generation, None))
-            {
-                self.starter = None;
-            }
-            return;
+        let terminal = match want.play {
+            None => Some(None),
+            Some(_) => self.play_current().map(|s| Some(Arc::clone(s))),
         };
-        // A current set: what is left is its publication for the skin in
-        // use, unless the job's own is it.
-        if let Some(set) = self.current().cloned() {
-            if publish
+        let mut published = true;
+        if let Some(set) = terminal {
+            published = publish
                 .as_ref()
-                .is_none_or(|p| self.publish_now(p, generation, Some(set)))
-            {
+                .is_none_or(|p| self.publish_now(p, generation, set));
+        }
+        if !self.needs_job() {
+            self.blocked = None;
+            if published {
                 self.starter = None;
             }
             return;
         }
-        if self.job.is_some()
-            || self.obsolete.is_some()
-            || self.retiring.is_some()
-            || self.publication.as_ref().is_some_and(Publication::pending)
-        {
+        if self.job.is_some() || self.obsolete.is_some() {
             return;
         }
-        // The starter stays until the set is published (above).
-        // The last set's reads are the candidates: an unchanged file's read
-        // that fits the slot is kept, not decoded again.
-        let prior = self.set.as_ref().map(|(_, _, s)| Arc::clone(s));
+        if self.retiring.is_some() || self.publication.as_ref().is_some_and(Publication::pending) {
+            self.blocked.get_or_insert_with(Instant::now);
+            return;
+        }
+        self.blocked = None;
+        // The starter stays until the play half is published (above).
+        // The last sources' reads are the candidates: an unchanged file's
+        // read is kept, not decoded again.
+        let (prior, play_prior, result_prior) = self.priors();
+        let (fresh, derive) = self.work();
+        let [derives_play, _] = derive;
         self.begun += 1;
         let key = JobKey {
             kind: JobKind::ChartImages,
@@ -798,11 +1265,11 @@ impl Core {
         };
         let read = want.clone();
         let (sender, rx) = match &publish {
-            Some(p) => {
+            Some(p) if derives_play => {
                 let (reply, rx) = mpsc::sync_channel(1);
                 (Some((p.clone(), reply)), Some(rx))
             }
-            None => (None, None),
+            _ => (None, None),
         };
         let spawned = coord.spawn_owned(
             spawner,
@@ -811,18 +1278,26 @@ impl Core {
             coord.subscriber(Scope::Choice),
             |_| {},
             move |ctx| {
-                let set = Arc::new(read_set(&read, side, prior.as_deref(), &|| ctx.cancelled()));
+                let out = run_job(
+                    &read,
+                    prior.as_ref(),
+                    fresh,
+                    [play_prior.as_ref(), result_prior.as_ref()],
+                    derive,
+                    &|| ctx.cancelled(),
+                );
                 if let Some((p, reply)) = sender
                     && !ctx.cancelled()
                 {
-                    p.publish(generation, None, Some(Arc::clone(&set)), reply);
+                    p.publish(generation, None, out.play.clone(), reply);
                 }
-                set
+                Arc::new(out)
             },
         );
         match spawned {
             Ok(job) => {
                 if let Some(rx) = rx {
+                    self.supersede();
                     self.publication = Some(Publication {
                         generation,
                         request: None,
@@ -837,6 +1312,7 @@ impl Core {
                 self.job = Some(Job {
                     want,
                     generation,
+                    play: derives_play,
                     job,
                 });
             }
@@ -844,8 +1320,17 @@ impl Core {
                 // A thread that cannot start: the images absent, terminal
                 // at once, the run goes on (design C13).
                 log::warn!("chart images: {e}");
-                let set = Arc::new(ChartImages::absent(&Absent::Failed));
-                self.set = Some((want, generation, set));
+                let absent = |side: Option<u32>| {
+                    side.map(|_| Arc::new(ChartImages::absent(&Absent::Failed)))
+                };
+                let out = JobOut {
+                    sources: Arc::new(ChartImages::absent(&Absent::Failed)),
+                    play: absent(want.play),
+                    result: absent(want.result),
+                    #[cfg(test)]
+                    counts: (0, 0),
+                };
+                self.adopt(&want, generation, out);
                 // Published at once, or by the waits' service once the
                 // retiring one is answered.
                 self.begin_if_free();
@@ -854,8 +1339,9 @@ impl Core {
     }
 
     /// Publishes `set` (absent when `None`) for the skin in use, unless
-    /// that very publication is already asked for; `false` when another is
-    /// unanswered, so nothing was sent.
+    /// that very publication is already asked for and its answer, if any,
+    /// is not of another generation; `false` when another is unanswered,
+    /// so nothing was sent.
     fn publish_now(
         &mut self,
         publisher: &crate::render_side::ChartPublisher,
@@ -891,16 +1377,26 @@ impl Core {
         true
     }
 
-    /// The bytes of the sets it keeps: the last read and, while the render
-    /// thread may still hold them, the published and the retiring one.
+    /// The bytes it keeps: the sources, both halves and, while the render
+    /// thread may still hold them, the published and the retiring set,
+    /// each counted once.
     fn retained_bytes(&self) -> u64 {
-        let set = self.set.as_ref().map(|(_, _, s)| s);
-        let mut total = set.map_or(0, |s| s.bytes());
-        let mut seen: Vec<&Arc<ChartImages>> = set.into_iter().collect();
-        for p in [&self.publication, &self.retiring].into_iter().flatten() {
-            if let Some(s) = &p.set
-                && !seen.iter().any(|k| Arc::ptr_eq(k, s))
-            {
+        let mut seen: Vec<&Arc<ChartImages>> = Vec::new();
+        let mut total = 0_u64;
+        let sets = self
+            .sources
+            .iter()
+            .map(|(_, _, s)| s)
+            .chain(self.play.iter().map(|h| &h.fits))
+            .chain(self.result.iter().map(|h| &h.fits))
+            .chain(
+                [&self.publication, &self.retiring]
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|p| p.set.as_ref()),
+            );
+        for s in sets {
+            if !seen.iter().any(|k| Arc::ptr_eq(k, s)) {
                 total = total.saturating_add(s.bytes());
                 seen.push(s);
             }
@@ -910,7 +1406,7 @@ impl Core {
 }
 
 /// Settles an ended job, logging a panic after its publication.
-fn settle_logged(job: OwnedJob<Arc<ChartImages>>) {
+fn settle_logged(job: OwnedJob<Arc<JobOut>>) {
     if let Settled::Joined {
         after_panic: Some(p),
         ..
@@ -974,7 +1470,8 @@ mod tests {
         Want {
             dir: dir.to_path_buf(),
             names: ["s.png".to_owned(), "b.png".to_owned()],
-            side,
+            play: side,
+            result: None,
         }
     }
 
@@ -1002,7 +1499,7 @@ mod tests {
         png(d.path(), "b.png", [512, 384], [40, 50, 60]);
         let coord = Coordinator::new(CAPS);
         let w = ChartImageWorker::default();
-        w.want(want(d.path(), Some(SIDE)));
+        w.attempt(want(d.path(), Some(SIDE)));
         step_until(&w, &coord, Spawner::SYSTEM, |w| {
             w.current().is_some() && w.idle()
         });
@@ -1030,7 +1527,7 @@ mod tests {
         let coord = Coordinator::new(CAPS);
         let w = ChartImageWorker::default();
         let ready = |w: &ChartImageWorker| w.current().is_some() && w.idle();
-        w.want(want(d.path(), Some(SIDE)));
+        w.attempt(want(d.path(), Some(SIDE)));
         step_until(&w, &coord, Spawner::SYSTEM, ready);
         let first = w.current().unwrap();
         assert!(matches!(
@@ -1038,13 +1535,13 @@ mod tests {
             Err(Absent::Unresolved(_))
         ));
         // Not drawn yet: the same want is the same set.
-        w.want(want(d.path(), Some(SIDE)));
+        w.attempt(want(d.path(), Some(SIDE)));
         w.step(Some((&coord, Spawner::SYSTEM)), &|| false, None);
         assert!(std::sync::Arc::ptr_eq(&w.current().unwrap(), &first));
         // Drawn, then the back image appears: the stage file kept.
         w.committed();
         png(d.path(), "b.png", [512, 384], [40, 50, 60]);
-        w.want(want(d.path(), Some(SIDE)));
+        w.attempt(want(d.path(), Some(SIDE)));
         assert!(w.current().is_none(), "unavailable while re-resolved");
         step_until(&w, &coord, Spawner::SYSTEM, ready);
         let second = w.current().unwrap();
@@ -1066,7 +1563,7 @@ mod tests {
         w.committed();
         std::thread::sleep(Duration::from_millis(20));
         png(d.path(), "s.png", [320, 240], [70, 80, 90]);
-        w.want(want(d.path(), Some(SIDE)));
+        w.attempt(want(d.path(), Some(SIDE)));
         step_until(&w, &coord, Spawner::SYSTEM, ready);
         let third = w.current().unwrap();
         assert_eq!(
@@ -1093,7 +1590,7 @@ mod tests {
         png(d.path(), "s.png", [640, 480], [10, 20, 30]);
         let coord = Coordinator::new(CAPS);
         let w = ChartImageWorker::default();
-        w.want(want(d.path(), Some(SIDE)));
+        w.attempt(want(d.path(), Some(SIDE)));
         w.step(
             Some((&coord, Spawner::refusing_owned(&[JobKind::ChartImages]))),
             &|| false,
@@ -1118,12 +1615,12 @@ mod tests {
         let coord = Coordinator::new(CAPS);
         let w = ChartImageWorker::default();
         super::HOLD.store(true, std::sync::atomic::Ordering::Release);
-        w.want(want(a.path(), Some(SIDE)));
+        w.attempt(want(a.path(), Some(SIDE)));
         w.step(Some((&coord, Spawner::SYSTEM)), &|| false, None);
         assert_eq!(w.begun(), 1);
         // A is left with its read held: B asked for, never begun meanwhile.
         w.forget();
-        w.want(want(b.path(), Some(SIDE)));
+        w.attempt(want(b.path(), Some(SIDE)));
         for _ in 0..20 {
             w.step(Some((&coord, Spawner::SYSTEM)), &|| false, None);
             std::thread::sleep(Duration::from_millis(2));
@@ -1156,14 +1653,14 @@ mod tests {
         let w = ChartImageWorker::default();
         super::HOLD.store(true, std::sync::atomic::Ordering::Release);
         w.renew();
-        w.want(want(d.path(), Some(SIDE)));
+        w.attempt(want(d.path(), Some(SIDE)));
         w.step(Some((&coord, Spawner::SYSTEM)), &|| false, None);
         assert_eq!(w.begun(), 1);
         // Left: the choice's scope cancelled; then chosen again.
         coord.advance(Scope::Choice);
         w.forget();
         w.renew();
-        w.want(want(d.path(), Some(SIDE)));
+        w.attempt(want(d.path(), Some(SIDE)));
         super::HOLD.store(false, std::sync::atomic::Ordering::Release);
         step_until(&w, &coord, Spawner::SYSTEM, |w| {
             w.current().is_some() && w.idle()
@@ -1180,20 +1677,20 @@ mod tests {
         assert_eq!(w.begun(), 2);
     }
 
-    /// A read fitted for a larger layer, its file unchanged, is read again
-    /// for a smaller layer whose slot it does not fit: the new read is
-    /// placed there.
+    /// A fit for a larger layer, its file unchanged, is derived again from
+    /// the source for a smaller layer whose slot it does not fit: the new
+    /// fit is placed there, and nothing is decoded again.
     #[test]
-    fn a_read_for_a_larger_layer_is_read_again_for_a_smaller_one() {
+    fn a_fit_for_a_larger_layer_is_derived_again_for_a_smaller_one() {
         let d = tempfile::tempdir().unwrap();
         png(d.path(), "s.png", [1_600, 1_200], [10, 20, 30]);
         let coord = Coordinator::new(CAPS);
         let w = ChartImageWorker::default();
         let ready = |w: &ChartImageWorker| w.current().is_some() && w.idle();
-        w.want(want(d.path(), Some(4_096)));
+        w.attempt(want(d.path(), Some(4_096)));
         step_until(&w, &coord, Spawner::SYSTEM, ready);
         let large = w.current().unwrap();
-        w.want(want(d.path(), Some(SIDE)));
+        w.attempt(want(d.path(), Some(SIDE)));
         step_until(&w, &coord, Spawner::SYSTEM, ready);
         let small = w.current().unwrap();
         let fitted = small.read(ChartImage::Stage).image.as_ref().unwrap();
@@ -1209,21 +1706,222 @@ mod tests {
     }
 
     /// With no coordinator (the direct launch) the images are read at once
-    /// on the calling thread; a target with no chart layer reads none.
+    /// on the calling thread; a play target with no chart layer has no
+    /// play half, but the sources are decoded and the facts resolved
+    /// (RX6e); a read stopped part way resolves nothing.
     #[test]
     fn the_direct_launch_reads_at_once() {
         let d = tempfile::tempdir().unwrap();
         png(d.path(), "s.png", [640, 480], [10, 20, 30]);
         let w = ChartImageWorker::default();
-        w.want(want(d.path(), Some(SIDE)));
+        w.attempt(want(d.path(), Some(SIDE)));
         w.step(None, &|| false, None);
         assert!(w.idle());
         let set = w.current().unwrap();
         assert!(set.read(ChartImage::Stage).image.is_ok());
         let none = ChartImageWorker::default();
-        none.want(want(d.path(), None));
+        none.attempt(want(d.path(), None));
         none.step(None, &|| false, None);
         assert!(none.current().is_none());
-        assert_eq!(none.begun(), 0);
+        assert_eq!(none.begun(), 1);
+        assert_eq!(
+            none.facts(),
+            Some(skin_model::ImageFacts {
+                stage: true,
+                back: false
+            })
+        );
+        let stopped = ChartImageWorker::default();
+        stopped.attempt(want(d.path(), None));
+        stopped.step(None, &|| true, None);
+        assert_eq!(stopped.facts(), None);
+    }
+
+    /// Steps `w` until its facts resolve and its halves are derived, idle.
+    fn settle_all(w: &ChartImageWorker, coord: &Coordinator) {
+        step_until(w, coord, Spawner::SYSTEM, |w| {
+            w.idle() && w.facts().is_some() && !w.core().needs_job()
+        });
+    }
+
+    fn both(dir: &Path, play: Option<u32>, result: Option<u32>) -> Want {
+        Want {
+            play,
+            result,
+            ..want(dir, None)
+        }
+    }
+
+    /// RC1, RT3: a play side of 2 304 and a result side of 4 096, a
+    /// 1 600×1 200 stage file and a 512×384 back image: each file decoded
+    /// once; the result's stage file at its native size, play's
+    /// downscaled into its 1 152 slot; the back image's fit shared, as both
+    /// slots derive it at its native size.
+    #[test]
+    fn sources_decode_once_and_every_half_derives_from_them() {
+        let _serial = crate::imports::tests::serial();
+        let d = tempfile::tempdir().unwrap();
+        png(d.path(), "s.png", [1_600, 1_200], [10, 20, 30]);
+        png(d.path(), "b.png", [512, 384], [40, 50, 60]);
+        let coord = Coordinator::new(CAPS);
+        let w = ChartImageWorker::default();
+        w.attempt(both(d.path(), Some(2_304), Some(4_096)));
+        settle_all(&w, &coord);
+        assert_eq!(w.counts(), (2, 3));
+        let play = w.current().unwrap();
+        let result = w.current_result().unwrap();
+        let content =
+            |s: &super::ChartImages, which| s.read(which).image.as_ref().unwrap().content();
+        assert_eq!(content(&result, ChartImage::Stage), [1_600, 1_200]);
+        assert!(content(&play, ChartImage::Stage)[0] < 1_600);
+        assert!(std::ptr::eq(
+            play.read(ChartImage::Back),
+            result.read(ChartImage::Back)
+        ));
+        assert_eq!(
+            w.facts(),
+            Some(skin_model::ImageFacts {
+                stage: true,
+                back: true
+            })
+        );
+        // Handed over at the commit: the half moves, the sources stay.
+        let taken = w.take_result().unwrap();
+        assert!(std::sync::Arc::ptr_eq(
+            taken.half.as_ref().unwrap(),
+            &result
+        ));
+        assert!(w.current_result().is_none());
+        assert!(std::sync::Arc::ptr_eq(
+            &taken.sources,
+            &w.sources().unwrap()
+        ));
+    }
+
+    /// RX5c, RT4: the want at the choice (no play side), then the facts
+    /// stage's (play 2 304), then both sides: the later jobs decode
+    /// nothing; the last derives only the result half (here sharing the
+    /// play half's fits), keeping the sources and the play half as the
+    /// same sets.
+    #[test]
+    fn a_want_changing_only_a_side_only_derives() {
+        let _serial = crate::imports::tests::serial();
+        let d = tempfile::tempdir().unwrap();
+        png(d.path(), "s.png", [640, 480], [10, 20, 30]);
+        png(d.path(), "b.png", [512, 384], [40, 50, 60]);
+        let coord = Coordinator::new(CAPS);
+        let w = ChartImageWorker::default();
+        w.attempt(both(d.path(), None, None));
+        settle_all(&w, &coord);
+        let sources = w.sources().unwrap();
+        w.attempt(both(d.path(), Some(2_304), None));
+        settle_all(&w, &coord);
+        let play = w.current().unwrap();
+        let (_, der) = w.counts();
+        w.attempt(both(d.path(), Some(2_304), Some(4_096)));
+        settle_all(&w, &coord);
+        assert_eq!(w.counts().0, 2, "decoded at the choice only");
+        assert_eq!(w.counts().1, der, "640×480 fits both slots: shared");
+        assert!(std::sync::Arc::ptr_eq(&w.sources().unwrap(), &sources));
+        assert!(std::sync::Arc::ptr_eq(&w.current().unwrap(), &play));
+        assert!(w.current_result().is_some());
+        assert_eq!(w.begun(), 3);
+    }
+
+    /// RX2, RT7: a job whose files are no longer asked for when it ends:
+    /// its output is never adopted, and the facts stay unresolved until
+    /// the files asked for are read.
+    #[test]
+    fn a_stale_jobs_output_is_never_adopted() {
+        let _serial = crate::imports::tests::serial();
+        let a = tempfile::tempdir().unwrap();
+        let b = tempfile::tempdir().unwrap();
+        png(a.path(), "s.png", [640, 480], [10, 20, 30]);
+        let coord = Coordinator::new(CAPS);
+        let w = ChartImageWorker::default();
+        super::HOLD.store(true, std::sync::atomic::Ordering::Release);
+        w.attempt(want(a.path(), Some(SIDE)));
+        w.step(Some((&coord, Spawner::SYSTEM)), &|| false, None);
+        // Another chart's files while A's read is held.
+        w.attempt(want(b.path(), Some(SIDE)));
+        super::HOLD.store(false, std::sync::atomic::Ordering::Release);
+        settle_all(&w, &coord);
+        // B has no files: A's stage file, read, was never adopted for it.
+        assert_eq!(
+            w.facts(),
+            Some(skin_model::ImageFacts {
+                stage: false,
+                back: false
+            }),
+            "the job's output adopted for B"
+        );
+        assert!(w.current().unwrap().read(ChartImage::Stage).image.is_err());
+        assert_eq!(w.begun(), 2);
+    }
+
+    /// RX4, RX5, RT9: a panicked job and a thread that cannot start
+    /// resolve the facts as absent, and the halves asked for absent.
+    #[test]
+    fn a_failed_job_resolves_the_facts_absent() {
+        let _serial = crate::imports::tests::serial();
+        let d = tempfile::tempdir().unwrap();
+        png(d.path(), "s.png", [640, 480], [10, 20, 30]);
+        let coord = Coordinator::new(CAPS);
+        let none = Some(skin_model::ImageFacts::default());
+        let w = ChartImageWorker::default();
+        super::PANIC.store(true, std::sync::atomic::Ordering::Release);
+        w.attempt(both(d.path(), Some(SIDE), Some(4_096)));
+        settle_all(&w, &coord);
+        assert_eq!(w.facts(), none);
+        assert_eq!(
+            w.current_result().unwrap().read(ChartImage::Stage).image,
+            Err(Absent::Failed)
+        );
+        let w = ChartImageWorker::default();
+        w.attempt(both(d.path(), Some(SIDE), Some(4_096)));
+        w.step(
+            Some((&coord, Spawner::refusing_owned(&[JobKind::ChartImages]))),
+            &|| false,
+            None,
+        );
+        assert_eq!(w.facts(), none);
+        assert!(w.current().is_some() && w.current_result().is_some());
+    }
+
+    /// RX22, RT15: the run's end with a held job cancelled through its
+    /// scope: `end` returns within its bound, keeps nothing, and nothing
+    /// begins after it, from a step, the waits' service or the direct
+    /// launch's read.
+    #[test]
+    fn nothing_begins_after_the_end() {
+        let _serial = crate::imports::tests::serial();
+        let d = tempfile::tempdir().unwrap();
+        png(d.path(), "s.png", [640, 480], [10, 20, 30]);
+        let coord = Coordinator::new(CAPS);
+        let w = ChartImageWorker::default();
+        w.attempt(want(d.path(), Some(SIDE)));
+        settle_all(&w, &coord);
+        assert!(w.retained() > 0);
+        super::HOLD.store(true, std::sync::atomic::Ordering::Release);
+        w.renew();
+        w.attempt(want(d.path(), Some(SIDE)));
+        w.step(Some((&coord, Spawner::SYSTEM)), &|| false, None);
+        assert!(!w.idle());
+        coord.advance(Scope::Choice);
+        let began = Instant::now();
+        w.end();
+        assert!(began.elapsed() < super::STOP_WAIT + Duration::from_secs(1));
+        assert!(w.idle());
+        assert_eq!(w.retained(), 0);
+        super::HOLD.store(false, std::sync::atomic::Ordering::Release);
+        let jobs = w.begun();
+        w.attempt(want(d.path(), Some(SIDE)));
+        for _ in 0..10 {
+            w.step(Some((&coord, Spawner::SYSTEM)), &|| false, None);
+            w.service();
+        }
+        w.step(None, &|| false, None);
+        assert_eq!(w.begun(), jobs, "a job began after the end");
+        assert_eq!(w.facts(), None);
     }
 }

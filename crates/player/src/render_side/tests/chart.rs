@@ -170,10 +170,11 @@ fn rig() -> Rig {
 /// with a chart layer: both absent (no folder), not a job.
 fn worker_with_a_set(link: &super::super::RenderLink) -> ChartImageWorker {
     let w = ChartImageWorker::new(link.chart_generation());
-    w.want(Want {
+    w.attempt(Want {
         dir: std::path::PathBuf::from("no such folder"),
         names: [String::new(), String::new()],
-        side: Some(2_048),
+        play: Some(2_048),
+        result: None,
     });
     w.step(None, &|| false, None);
     assert!(w.current().is_some());
@@ -307,10 +308,11 @@ fn the_job_publishes_its_set_for_the_loading_frames() {
     });
     let w = ChartImageWorker::new(r.link.chart_generation());
     w.renew();
-    w.want(Want {
+    w.attempt(Want {
         dir: std::path::PathBuf::from("no such folder"),
         names: [String::new(), String::new()],
-        side: Some(2_048),
+        play: Some(2_048),
+        result: None,
     });
     let publisher = r.link.chart_publisher();
     w.step(
@@ -351,7 +353,8 @@ fn want_in(dir: &std::path::Path, side: Option<u32>) -> Want {
     Want {
         dir: dir.to_path_buf(),
         names: ["s.png".to_owned(), String::new()],
-        side,
+        play: side,
+        result: None,
     }
 }
 
@@ -373,7 +376,7 @@ fn a_panicked_job_publishes_its_failed_set_before_the_answer() {
     let coord = coordinator();
     let w = ChartImageWorker::new(r.link.chart_generation());
     w.renew();
-    w.want(want_in(d.path(), Some(2_048)));
+    w.attempt(want_in(d.path(), Some(2_048)));
     let publisher = r.link.chart_publisher();
     crate::chart_images::PANIC.store(true, Ordering::Release);
     w.step(
@@ -433,7 +436,7 @@ fn a_stalled_render_thread_holds_back_the_next_reads() {
     };
     r.hold.store(true, Ordering::Release);
     w.renew();
-    w.want(want_in(a.path(), Some(2_048)));
+    w.attempt(want_in(a.path(), Some(2_048)));
     step(&w);
     let end = Instant::now() + Duration::from_secs(10);
     while !w.idle() {
@@ -445,7 +448,7 @@ fn a_stalled_render_thread_holds_back_the_next_reads() {
     assert!(wait_until(|| r.charts.lock().unwrap().stalled));
     for d in [&b, &c] {
         w.renew();
-        w.want(want_in(d.path(), Some(2_048)));
+        w.attempt(want_in(d.path(), Some(2_048)));
         for _ in 0..20 {
             step(&w);
             w.service();
@@ -472,7 +475,7 @@ fn a_target_with_no_layer_reads_absent_while_the_chart_loads() {
     let coord = coordinator();
     let w = ChartImageWorker::new(r.link.chart_generation());
     w.renew();
-    w.want(want_in(std::path::Path::new("no such folder"), None));
+    w.attempt(want_in(std::path::Path::new("no such folder"), None));
     let publisher = r.link.chart_publisher();
     w.step(
         Some((&coord, game::coord::Spawner::SYSTEM)),
@@ -497,7 +500,7 @@ fn a_job_held_back_begins_from_the_waits() {
     let publisher = r.link.chart_publisher();
     crate::chart_images::HOLD.store(true, Ordering::Release);
     w.renew();
-    w.want(want_in(a.path(), Some(2_048)));
+    w.attempt(want_in(a.path(), Some(2_048)));
     w.step(
         Some((&coord, game::coord::Spawner::SYSTEM)),
         &|| false,
@@ -507,7 +510,7 @@ fn a_job_held_back_begins_from_the_waits() {
     // A is left in its read; B chosen: held back.
     w.forget();
     w.renew();
-    w.want(want_in(b.path(), Some(2_048)));
+    w.attempt(want_in(b.path(), Some(2_048)));
     w.step(
         Some((&coord, game::coord::Spawner::SYSTEM)),
         &|| false,

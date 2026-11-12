@@ -49,13 +49,14 @@ fn the_preparation_waits_for_the_images() {
         let _let_go = LetGo;
         rig.play_chart = Some(2_048);
         HOLD.store(true, Ordering::Release);
-        let mut h = begin(rig, &l);
         let began = Instant::now();
+        // The direct launch decodes in the facts stage, from the begin on.
         let ready = std::thread::scope(|s| {
             s.spawn(|| {
                 std::thread::sleep(Duration::from_millis(100));
                 HOLD.store(false, Ordering::Release);
             });
+            let mut h = begin(rig, &l);
             polled(rig, &mut h).unwrap()
         });
         assert_eq!(ready, Preparation::Ready);
@@ -111,16 +112,50 @@ fn a_quit_while_the_images_are_read_cancels() {
         let _let_go = LetGo;
         rig.play_chart = Some(2_048);
         HOLD.store(true, Ordering::Release);
-        let mut h = begin(rig, &l);
         let controls = rig.controls;
+        // The direct launch decodes in the facts stage, from the begin on.
         let ended = std::thread::scope(|s| {
             s.spawn(|| {
                 std::thread::sleep(Duration::from_millis(50));
                 controls.command(game::Command::Quit);
             });
+            let mut h = begin(rig, &l);
             polled(rig, &mut h).unwrap()
         });
         assert_eq!(ended, Preparation::Cancelled);
         assert!(rig.commit_attempt().is_err(), "nothing to commit");
+    });
+}
+
+/// RC2, RX6, RX6a (RT24's core): the result's chart facts are the
+/// attempt's resolved availability, taken in the facts stage before the
+/// result's image stage; a retry after the attempt drew them renews the
+/// generation, so a stage file deleted meanwhile is resolved absent, and
+/// one added again present.
+#[test]
+fn the_result_facts_are_each_attempts_images() {
+    let _serial = imports::serial();
+    let (dir, l) = chart_with_stage();
+    let screens = Installers::default();
+    on_rig(l.chart(), &screens, false, |rig| {
+        rig.play_chart = Some(2_048);
+        let images = |rig: &mut crate::play::PlayerRig<'_>| {
+            let mut h = begin(rig, &l);
+            assert_eq!(polled(rig, &mut h).unwrap(), Preparation::Ready);
+            rig.result_chart.unwrap().images
+        };
+        assert!(images(rig).stage);
+        // Drawn: the next attempt re-resolves the file.
+        rig.chart_images.committed();
+        std::fs::remove_file(dir.path().join("s.png")).unwrap();
+        assert!(!images(rig).stage, "the deleted file's facts kept");
+        rig.chart_images.committed();
+        let file = std::fs::File::create(dir.path().join("s.png")).unwrap();
+        let mut e = png::Encoder::new(std::io::BufWriter::new(file), 64, 48);
+        e.set_color(png::ColorType::Rgba);
+        e.set_depth(png::BitDepth::Eight);
+        let texels = [1, 2, 3, 255].repeat(64 * 48);
+        e.write_header().unwrap().write_image_data(&texels).unwrap();
+        assert!(images(rig).stage);
     });
 }
