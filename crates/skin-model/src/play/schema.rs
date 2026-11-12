@@ -723,7 +723,9 @@ pub mod timer {
     /// ([`LoadState::since`](crate::LoadState::since)); off in a play.
     pub const LOADING: u16 = 55;
     /// The screen's start, which an untimed element runs on: the loading
-    /// lifetime's origin while loading, `ready`'s start in a play.
+    /// lifetime's origin while loading; in a play the play state's screen
+    /// origin ([`SkinFrame::screen_us`](crate::SkinFrame::screen_us)), on
+    /// from the first frame and never restarted at READY.
     pub const SCREEN: u16 = 56;
     /// The rhythm clock: its start is `now` less the time since the
     /// latest bar line at 1 000 ms per chart beat, from `play`'s start

@@ -1351,6 +1351,7 @@ mod tests {
         FrameInput {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: 0,
             now: TimeUs(now),
             display_offset: TimeUs(0),
             lanes: LANES,

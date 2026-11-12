@@ -243,6 +243,39 @@ fn the_notes_graph_stacks_its_categories() {
     }
 }
 
+/// A graph's reveal runs on the screen timer, which runs from the play
+/// state's screen origin (docs/stage3.md D26, D3): after 1 234 ms of
+/// loading, a 2 000 ms reveal has shown 61.7 % of the width at READY (to
+/// x = 185 of 300), not none of it.
+#[test]
+fn a_graph_reveal_runs_on_the_screen() {
+    let chart = notes_chart();
+    let profile = ChartProfile::of(&chart, &[]);
+    let score = PlayScore {
+        profile: Some(&profile),
+        ..PlayScore::NONE
+    };
+    let s = skin(
+        vec![el(Source::JudgeGraph(0), [0, 0, 300, 400])],
+        PlayDefs {
+            judge_graphs: vec![JudgeGraphDef {
+                delay: TimeUs(2_000 * MS),
+                ..notes_graph(false)
+            }],
+            ..PlayDefs::default()
+        },
+    );
+    let mut fx = Fx::new(s, &chart, &ready(score));
+    fx.h.screen_from = (-1_000 - 1_234) * MS;
+    // READY's first frame.
+    fx.frame(-1_000);
+    let key = rgb(0xcc_cccc);
+    // Bin 1's bottom cell, x 100 to 200: drawn up to x = 185 only.
+    fx.is(150.0, 395.0, key);
+    fx.is(180.0, 395.0, key);
+    fx.empty(190.0, 395.0);
+}
+
 /// C20: the scale depends on the largest bin alone: `[21, 30]` and
 /// `[30, 21]` both scale to 40.
 #[test]
