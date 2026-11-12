@@ -87,8 +87,10 @@ pub struct Definition {
     top: u32,
     limits: Limits,
     pub(crate) run: Run,
-    /// A Lua candidate's cancellation request, seen before each include
-    /// is read and after it is parsed ([`crate::lua`]).
+    /// The cancellation request the import observes: a Lua candidate's
+    /// ([`crate::lua`]), or one a JSON skin's caller gives
+    /// ([`Self::observe`]); seen before each include is read and after it
+    /// is parsed, before each destination, and as files are validated.
     cancel: Option<Cancel>,
 }
 
@@ -289,13 +291,19 @@ impl Definition {
         self.store.take().unwrap_or_default()
     }
 
-    /// Whether the Lua candidate this definition belongs to was
-    /// cancelled.
+    /// Makes this definition's resolution and import observe `cancel`: once
+    /// it is requested they stop with [`crate::LuaWhy::Cancelled`], as a
+    /// Lua candidate's do.
+    pub fn observe(&mut self, cancel: Cancel) {
+        self.cancel = Some(cancel);
+    }
+
+    /// Whether the request this definition observes was cancelled.
     pub(crate) fn is_cancelled(&self) -> bool {
         self.cancel.as_ref().is_some_and(Cancel::is_cancelled)
     }
 
-    /// A cancellation of the Lua candidate this definition belongs to.
+    /// A cancellation of the request this definition observes.
     pub(crate) fn cancelled(&self, at: impl FnOnce() -> Option<Loc>) -> Result<(), ImportError> {
         if self.is_cancelled() {
             return Err(Self::cancellation(at()));

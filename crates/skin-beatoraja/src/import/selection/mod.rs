@@ -629,8 +629,12 @@ impl Cx<'_> {
     /// kept in `loads`. A hole names no image, or a file the source cannot
     /// load either: one [`super::widget::Unplaced`] calls `missing`, or one
     /// admitted whose whole decode fails, as the source's texture fails
-    /// (`JsonSelectSkinObjectLoader.java:53`). A file only this importer
-    /// refuses loads for the source and is no hole.
+    /// before its rectangle is read (`JsonSelectSkinObjectLoader.java:53`),
+    /// so a rectangle this importer refuses does not spare its file the
+    /// decode. A file only this importer refuses loads for the source and
+    /// is no hole. Each entry's answer is a unit the import's cancellation
+    /// is asked before; a file's decode is run once in the import
+    /// ([`super::asset::Assets::validate`]).
     fn set_entry_loads(
         &mut self,
         role: Role,
@@ -646,11 +650,11 @@ impl Cx<'_> {
         let loaded = match known {
             Some(l) => l,
             None => {
+                self.def.cancelled(|| Some(self.loc(at)))?;
                 let s = self.src_image(r)?;
                 let l = match self.src_rect(role, at, &s, s.div, true)? {
                     Err(u) if u.missing => Err(u.why),
-                    Err(_) => Ok(()),
-                    Ok(_) => match self.texture(r, true, at)? {
+                    _ => match self.texture(r, true, at)? {
                         super::prepare::Load::Absent => Err(NoteKind::MissingAsset),
                         _ => Ok(()),
                     },
@@ -706,8 +710,10 @@ impl Cx<'_> {
         }
         // Whether each entry loads, read once when first asked: an entry
         // naming no image, or one whose file the source cannot load either
-        // (`Unplaced::missing`), is a hole; an importer-only refusal
-        // (a cap, a glob, a rect) loads for the source and is not one.
+        // (`Unplaced::missing`, or a whole decode that fails), is a hole;
+        // an importer-only refusal (a cap, a glob some file matches, a
+        // rect over a file that decodes) loads for the source and is not
+        // one.
         let mut loads: Vec<Option<Result<(), NoteKind>>> = vec![None; recs.len()];
         // The set's timing, as the source takes it over the images that
         // load, in order (`JsonSelectSkinObjectLoader.java:50-63`): the

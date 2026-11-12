@@ -700,3 +700,88 @@ fn song_list_charges_come_before_their_work() {
     assert_eq!(admits, 0);
     assert!(!trace.contains(&Admit));
 }
+
+/// Imports selection skin `body` beside 64×64 `a.png` and `c.png`
+/// (sources `a` and `c`, images `b` and `d` of them) into the selection
+/// slot, the definition observing `cancel` when given, which is cancelled
+/// once one whole decode has run: the result and the whole decodes run.
+fn run_validated(
+    body: &str,
+    cancel: Option<crate::lua::Cancel>,
+) -> (Result<Imported, ImportError>, u32) {
+    use super::asset::{CANCEL_AFTER, VALIDATIONS};
+    let d = tempfile::tempdir().unwrap();
+    let json = format!(
+        r#"{{"type": 5, "w": 1920, "h": 1080,
+            "source": [{{"id": "a", "path": "a.png"}}, {{"id": "c", "path": "c.png"}}],
+            "font": [{{"id": "f", "path": "f.ttf"}}],
+            "image": [{{"id": "b", "src": "a", "w": 8, "h": 8}},
+                      {{"id": "d", "src": "c", "w": 8, "h": 8}}],
+            "text": [{{"id": "t", "font": "f", "ref": 10}}], {body}}}"#
+    );
+    std::fs::write(d.path().join("s.json"), json).unwrap();
+    std::fs::write(d.path().join("f.ttf"), [0, 1, 0, 0, 0]).unwrap();
+    png(d.path(), "a.png", 64, 64);
+    png(d.path(), "c.png", 64, 64);
+    VALIDATIONS.with(|n| n.set(0));
+    let (mut def, h) = crate::read_header(d.path(), "s.json").unwrap();
+    if let Some(c) = cancel {
+        CANCEL_AFTER.with(|a| *a.borrow_mut() = Some(c.clone()));
+        def.observe(c);
+    }
+    let r = import(&mut def, &h, &Config::defaults(&h), ScreenKind::Selection);
+    CANCEL_AFTER.with(|a| a.borrow_mut().take());
+    (r, VALIDATIONS.with(std::cell::Cell::get))
+}
+
+/// A song list of `slots` places, each arm of each drawing image set
+/// `set` of `images`, its titles, and the list drawn.
+fn slotted(slots: usize, images: &str) -> String {
+    let arms: Vec<String> = (0..slots)
+        .map(|k| {
+            let y = 900 - 100 * k;
+            format!(r#"{{"id": "set", "dst": [{{"x": 0, "y": {y}, "w": 300, "h": 40}}]}}"#)
+        })
+        .collect();
+    let arms = arms.join(",");
+    format!(
+        r#""imageset": [{{"id": "set", "images": [{images}]}}],
+           "songlist": {{"id": "list", "center": 0, "liston": [{arms}], "listoff": [{arms}],
+               "text": [{{"id": "t", "dst": [{{"x": 0, "y": 0, "w": 100, "h": 10}}]}}]}},
+           "destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}]"#
+    )
+}
+
+/// A song list's image set tells its holes by whole decodes (design.md
+/// "Threat Model" T08): each file once in the import, however many of a
+/// set's entries name it and however many placements draw the set, with no
+/// resource cache in front of the disk.
+#[test]
+fn a_song_list_decodes_each_file_once() {
+    // Three places, two arms each: six placements over six entries, two
+    // files.
+    let (r, decodes) = run_validated(&slotted(3, r#""b", "b", "d", "b", "b", "d""#), None);
+    r.unwrap();
+    assert_eq!(decodes, 2);
+}
+
+/// A JSON song list observes the stop its caller gives between the whole
+/// decodes that tell its holes: requested once the first file is decoded,
+/// the import stops before the second.
+#[test]
+fn a_stop_between_a_song_list_s_decodes_ends_the_import() {
+    let cancel = crate::lua::Cancel::new();
+    let (r, decodes) = run_validated(&slotted(3, r#""b", "d""#), Some(cancel));
+    assert!(
+        matches!(
+            r,
+            Err(ImportError::Lua {
+                why: crate::lua::LuaWhy::Cancelled,
+                ..
+            })
+        ),
+        "{:?}",
+        r.map(|i| i.report)
+    );
+    assert_eq!(decodes, 1);
+}

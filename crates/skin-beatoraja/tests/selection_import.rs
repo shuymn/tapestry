@@ -541,6 +541,7 @@ fn a_set_s_timing_passes_images_that_do_not_load() {
         {"id": "c0", "src": "s", "x": 0, "y": 16, "w": 16, "h": 8, "divx": 2, "cycle": 300},
         {"id": "t1", "src": "m", "x": 8, "y": 0, "w": 8, "h": 8, "timer": 21, "cycle": 100},
         {"id": "t5", "src": "s", "x": 16, "y": 16, "w": 8, "h": 8, "timer": 22, "cycle": 200},
+        {"id": "cx", "src": "c", "x": -1, "y": 0, "w": 8, "h": 8, "timer": 21, "cycle": 100},
         {"id": "w0", "src": "w", "x": 0, "y": 0, "w": 8, "h": 1}"#;
     let skin = |set: &str| {
         format!(
@@ -567,14 +568,20 @@ fn a_set_s_timing_passes_images_that_do_not_load() {
     assert_eq!(s.images(1_050), [[4, 20]]);
     assert_eq!(s.images(1_120), [[12, 20]]);
     // Image 2, never drawn, a file whose whole decode fails, with timer 21
-    // and cycle 100: passed over, the same frames.
-    let d = folder(&skin(r#"["a0", "a0", "ct", "a0", "a0", "t5"]"#));
-    corrupt(d.path());
-    let mut s = Sel::of(d.path());
-    start(&mut s);
-    s.view(&view(vec![chart("a")], Some(0), None, None));
-    assert_eq!(s.images(1_050), [[4, 20]]);
-    assert_eq!(s.images(1_120), [[12, 20]]);
+    // and cycle 100: passed over, the same frames; so too with a rectangle
+    // this importer refuses, since the source's texture fails before its
+    // rectangle is read.
+    for two in ["ct", "cx"] {
+        let d = folder(&skin(&format!(
+            r#"["a0", "a0", "{two}", "a0", "a0", "t5"]"#
+        )));
+        corrupt(d.path());
+        let mut s = Sel::of(d.path());
+        start(&mut s);
+        s.view(&view(vec![chart("a")], Some(0), None, None));
+        assert_eq!(s.images(1_050), [[4, 20]], "{two}");
+        assert_eq!(s.images(1_120), [[12, 20]], "{two}");
+    }
     // Image 0's cycle 300 with no timer, image 5's timer 22: 100 ms into
     // the cycle frame 0, 200 ms frame 1 (no timer would give 1 at 1.1 s).
     let d = folder(&skin(r#"["c0", "a0", "a0", "a0", "a0", "t5"]"#));
