@@ -5340,13 +5340,14 @@ impl Run {
     }
 
     /// Publishes `set` (absent when `None`) of `generation` for the
-    /// attempt of `request` into its one target: the staging of that
-    /// request, or for `None` the committed play installation (S10-12
+    /// attempt of `request`: for `None` into the committed play
+    /// installation; for a staging, into its array, or, when it has none of
+    /// its own (a pending skin's specialization reused on the installation
+    /// in use), into the committed installation it draws from (S10-12
     /// design §5.3). The publication is admitted only while its key is
     /// current ([`crate::chart_images::PublicationKey::current`]): another
-    /// generation, or a request whose staging is gone, publishes nothing,
-    /// and nothing of a staging's goes to the committed installation. The
-    /// answer says what it was for and where it went.
+    /// generation, or a request whose staging is gone, publishes nothing
+    /// anywhere. The answer says what it was for and where it went.
     fn publish_chart(
         &mut self,
         generation: u64,
@@ -5386,21 +5387,31 @@ impl Run {
         let Some(screen) = &mut self.screen else {
             return unpublished;
         };
-        let answer = match set {
+        let publish = |screen: &mut Box<dyn Screen>, target| match set {
             Some(set) => screen.publish_chart_images(target, set.fitted()),
             None => screen.publish_chart_absent(target),
         };
+        let mut answer = publish(screen, target);
+        // The admitted staging draws from the committed installation when
+        // it has no array of its own: its table is published there.
+        let committed = request.is_none() || matches!(answer, Err(RenderError::NoChartLayer));
+        if request.is_some() && committed {
+            answer = publish(screen, render::ChartTarget::Committed);
+        }
         // What a publication left in its target: a table, or an all-absent
         // one; nothing for the other failures.
         let left = answer.is_ok()
             || answer
                 .as_ref()
                 .is_err_and(|e| e.chart_outcome() == render::ChartOutcome::Absent);
-        if left {
-            match request {
-                Some(_) => self.staged_table = Some(key),
-                None => self.chart_table = Some(key),
-            }
+        if left && committed {
+            self.chart_table = Some(PublicationKey {
+                generation,
+                request: None,
+                target: PublishedTo::Committed(now.committed),
+            });
+        } else if left {
+            self.staged_table = Some(key);
         }
         // The game thread logs what it left; this thread draws frames and
         // logs nothing.

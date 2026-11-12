@@ -25,6 +25,11 @@ struct Charts {
     absent: u32,
     /// A publication waits on `hold` now.
     stalled: bool,
+    /// Each publication's target, staged or not.
+    staged: Vec<bool>,
+    /// Staged targets have no array of their own: they answer
+    /// `NoChartLayer`, as a reused specialization's staging does.
+    no_staged_array: bool,
     /// Each loading frame's lifetime, and whether a table was published
     /// as it was drawn.
     frames: Vec<(u64, bool)>,
@@ -89,9 +94,16 @@ impl Screen for ChartScreen {
     }
     fn publish_chart_images(
         &mut self,
-        _target: render::ChartTarget,
+        target: render::ChartTarget,
         _images: [Option<&skin_model::chart_image::Fitted>; 2],
     ) -> Result<ChartTable, RenderError> {
+        let staged = matches!(target, render::ChartTarget::Staged(_));
+        let mut c = self.charts.lock().unwrap();
+        c.staged.push(staged);
+        if staged && c.no_staged_array {
+            return Err(RenderError::NoChartLayer);
+        }
+        drop(c);
         self.publish()
     }
     fn publish_chart_absent(
@@ -536,4 +548,55 @@ fn a_publication_for_a_staging_gone_publishes_nothing() {
         "a staging's publication reached the committed installation"
     );
     r.link.exit();
+}
+
+/// A staging with no array of its own (a pending skin's specialization
+/// reused on the installation in use) draws from the committed
+/// installation: the attempt's publication goes there, and its answer is
+/// the attempt's.
+#[test]
+fn a_staging_without_its_own_array_publishes_into_the_committed_one() {
+    let r = rig();
+    r.charts.lock().unwrap().no_staged_array = true;
+    let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+    let loaded = r.link.begin_load(Arc::clone(&chart), None);
+    loaded.wait_serving(&r.link, || false).unwrap();
+    let mut pending = r
+        .link
+        .begin_attempt(titled(&chart), super::super::AttemptSkin::InUse);
+    let answered = loop {
+        if let Some(a) = pending.wait_until(None, || false) {
+            break a.unwrap();
+        }
+    };
+    assert_eq!(answered.preparation, Preparation::Ready);
+    let request = pending.request();
+    let w = worker_with_a_set(&r.link);
+    answered_for(&w, &r.link, Some(request));
+    let c = r.charts.lock().unwrap();
+    assert_eq!(
+        c.staged,
+        [true, false],
+        "not published into the committed installation"
+    );
+    assert_eq!(c.published, 1);
+    drop(c);
+    r.link.exit();
+}
+
+/// [`answered`], for a staging's request.
+fn answered_for(w: &ChartImageWorker, link: &super::super::RenderLink, request: Option<u64>) {
+    let end = Instant::now() + Duration::from_secs(10);
+    loop {
+        match w.publish(link, request) {
+            Publish::Answered(a) => {
+                assert!(a.is_ok(), "{a:?}");
+                return;
+            }
+            Publish::Waiting => {}
+            Publish::Expired => panic!("expired"),
+        }
+        assert!(Instant::now() < end, "never answered");
+        std::thread::sleep(Duration::from_millis(1));
+    }
 }
