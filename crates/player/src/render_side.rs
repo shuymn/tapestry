@@ -1279,6 +1279,10 @@ struct Shared {
     /// presentation (tests).
     #[cfg(test)]
     decision_gate: Arc<TestGate>,
+    /// A takeover waits here between its lifetime's check and its
+    /// publication while a test holds it (tests).
+    #[cfg(test)]
+    takeover_gate: TestGate,
     /// How long the launch screen has shown, in place of the clock's
     /// reading, while set (tests: [`RenderLink::set_launch_elapsed`]).
     #[cfg(test)]
@@ -1359,6 +1363,8 @@ impl Shared {
             decision_sent: Mutex::new(None),
             #[cfg(test)]
             decision_gate: Arc::default(),
+            #[cfg(test)]
+            takeover_gate: TestGate::default(),
             #[cfg(test)]
             launch_elapsed: Mutex::new(None),
             result: Mutex::new(ResultSlot::default()),
@@ -5488,12 +5494,14 @@ impl Run {
                         mode = Mode::Idle;
                         continue;
                     };
+                    let active = render::lock(&self.shared.labels).active();
                     let built = crate::decision_side::decision_build(
                         screen.as_mut(),
                         dec,
                         self.decision_side
                             .as_ref()
                             .map(crate::decision_side::DecisionSide::store),
+                        active,
                         shown,
                         frame_at,
                     );
@@ -5504,7 +5512,8 @@ impl Run {
                         other => {
                             // Refused on a healthy device: the page draws in
                             // this frame, and the built-in presentation takes
-                            // over from now on.
+                            // over from now on. A screen whose lifetime ended
+                            // draws the page, refusing nothing.
                             if let crate::decision_side::DecisionDrawn::Refused(e) = other {
                                 decision_refused = Some(e);
                             }
@@ -5779,6 +5788,9 @@ impl Run {
             // A restore refused stands for the run, whatever the build.
             if let Some(why) = refused {
                 self.disable_result(&why);
+            }
+            if let Some(why) = &decision_refused {
+                self.disable_decision(why.clone());
             }
             let screen = built?;
             self.built(screen.as_ref());
@@ -6494,6 +6506,9 @@ impl Run {
                 if let Some(why) = refused.take() {
                     self.disable_result(&why);
                 }
+                if let Some(why) = &decision_refused {
+                    self.disable_decision(why.clone());
+                }
                 built.and_then(|s| {
                     self.built(s.as_ref());
                     self.screen = Some(s);
@@ -6538,15 +6553,17 @@ impl Run {
         self.decision_screen = None;
     }
 
-    /// The skinned decision screen begins: the skin's state made afresh;
-    /// without the decision installation (refused since), the built-in
-    /// presentation takes over at once.
+    /// The skinned decision screen begins: the skin's state made afresh,
+    /// on the installation kept for its pin even when the kind was refused
+    /// since (a retiring side refuses only later preparations and
+    /// choices); without the installation, the built-in presentation takes
+    /// over at once.
     fn enter_skinned_decision(&mut self) {
         match &self.decision_side {
-            Some(side) if !side.retiring => {
+            Some(side) => {
                 self.decision_screen = Some(side.bundle().skin().prepare_decision());
             }
-            _ => {
+            None => {
                 let now = self.clock.now();
                 self.take_over(now, "the decision skin is not installed".to_owned());
             }
@@ -6584,9 +6601,12 @@ impl Run {
                 return true;
             }
         }
-        // Refused while a lifetime was active: dropped once none is.
+        // Refused while a lifetime was active: dropped once none is and
+        // the render left the skinned screen, which draws from its store
+        // until then.
         if self.decision_side.as_ref().is_some_and(|s| s.retiring)
             && render::lock(&book).active().is_none()
+            && !self.decision_skinned()
         {
             self.drop_decision_side();
         }
@@ -6613,20 +6633,28 @@ impl Run {
         shown.slot = None;
         self.decision_screen = None;
         let lifetime = shown.lifetime;
-        if render::lock(&self.shared.labels).active() != Some(lifetime) {
-            eprintln!("render: a takeover of an ended decision lifetime was dropped: {why}");
-            return;
+        {
+            // Published under the book's lock, which the game ends a
+            // lifetime under: never once it ended.
+            let book = render::lock(&self.shared.labels);
+            if book.active() != Some(lifetime) {
+                eprintln!("render: a takeover of an ended decision lifetime was dropped: {why}");
+                return;
+            }
+            #[cfg(test)]
+            self.shared.takeover_gate.pass();
+            eprintln!("render: the built-in decision presentation takes over: {why}");
+            *self
+                .shared
+                .decision_takeover
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(game::DecisionTakeover {
+                lifetime: game::DecisionLifetime(lifetime),
+                at,
+                why,
+            });
+            drop(book);
         }
-        eprintln!("render: the built-in decision presentation takes over: {why}");
-        *self
-            .shared
-            .decision_takeover
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(game::DecisionTakeover {
-            lifetime: game::DecisionLifetime(lifetime),
-            at,
-            why,
-        });
         let wake = self
             .shared
             .game_wake
@@ -6644,8 +6672,9 @@ impl Run {
     /// The decision kind is refused for the run, for `why`: the game
     /// thread's notice says it, no request is posted and no slot pinned
     /// from now on, and no screen built again restores it. The
-    /// installation and its slots go now, or while a lifetime is active
-    /// at its end, so the pinned presentation keeps drawing.
+    /// installation and its slots go now, or while a lifetime is active or
+    /// the skin still draws, once neither holds (its end and the render
+    /// leaving the screen), so the pinned presentation keeps drawing.
     fn disable_decision(&mut self, why: String) {
         eprintln!("render: the decision skin is disabled for the run: {why}");
         if self.decision_disabled.is_none() {
@@ -6666,7 +6695,7 @@ impl Run {
             side.retiring = true;
             side.stop();
         }
-        if active.is_none() {
+        if active.is_none() && !self.decision_skinned() {
             self.drop_decision_side();
         }
     }
@@ -6721,22 +6750,23 @@ impl Run {
 
     /// The screen was built again (a recovery or a chart load's retry),
     /// its kinds restored, a refused decision restore saying why in
-    /// `refused`: the label slots reset, the pinned slot's content rebuilt
-    /// at the new target under its generation and the skin drawing on; a
-    /// refusal on the healthy device, or no decision installation left to
-    /// restore while the skin draws, is a takeover and disables the kind;
-    /// a device or poll failure drops the screen again.
+    /// `refused` (its refusal of the kind already stood, recorded before
+    /// the build's result was known): the label slots reset, the pinned
+    /// slot's content rebuilt at the new target under its generation and
+    /// the skin drawing on; a refused restore, a refusal of the labels'
+    /// rebuild on the healthy device, or no decision installation left to
+    /// restore while the skin draws, is a takeover; a device or poll
+    /// failure drops the screen again.
     ///
     /// # Errors
     ///
     /// The device's failure while the pinned labels were rebuilt.
     fn decision_rebuilt(&mut self, refused: Option<String>) -> Result<(), RenderError> {
         let now = self.clock.now();
-        if let Some(why) = refused {
-            if self.decision_skinned() {
-                self.take_over(now, why.clone());
-            }
-            self.disable_decision(why);
+        if let Some(why) = refused
+            && self.decision_skinned()
+        {
+            self.take_over(now, why);
         }
         let installed = self.committed.get(ScreenKind::Decision).is_some();
         let (Some(side), Some(screen), true) = (

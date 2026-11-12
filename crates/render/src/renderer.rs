@@ -4207,7 +4207,7 @@ impl Renderer {
 
     /// Restores pinned slot `slot`'s content in `store` from `staged` (its
     /// generation's strings, [`LabelStore::restore_strings`], staged
-    /// again at the current target, [`stage_bundle_labels`](crate::stage_bundle_labels))
+    /// again at the current target, [`LabelWorker::restage`](crate::LabelWorker::restage))
     /// on this renderer, built again: every row written at once and waited
     /// for, installed under the same generation and drawable again; the
     /// slot stays pinned. Until then, after the store's and the book's
