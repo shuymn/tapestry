@@ -421,6 +421,15 @@ pub(crate) enum Value {
     Result(ResValue),
 }
 
+/// The field of [`Value::App`] and of the selection profile's
+/// application readouts `n`, `id − 20`; the last past them.
+pub(super) fn app_field(n: u8) -> &'static str {
+    APP_FIELDS
+        .get(usize::from(n))
+        .copied()
+        .unwrap_or("app.uptime_s")
+}
+
 /// The fields of [`Value::App`] by `id − 20`.
 const APP_FIELDS: [&str; 10] = [
     "app.fps",
@@ -538,10 +547,7 @@ impl Value {
             Self::RecentTiming => "judge.recent_ms",
             Self::SongTotal => "chart.total",
             Self::DisplayOffset => "display_offset.ms",
-            Self::App(n) => APP_FIELDS
-                .get(usize::from(n))
-                .copied()
-                .unwrap_or("app.uptime_s"),
+            Self::App(n) => app_field(n),
             Self::Selection(v) => v.expr(),
             Self::Result(v) => v.expr,
             Self::DurationVariant(n) => DURATION_VARIANTS
@@ -1168,11 +1174,12 @@ mod tests {
         assert!(STRING_TYPES.contains(&(12, "fulltitle")));
     }
 
-    /// Numbers 20 to 29 read the application's readouts on play, by id
-    /// and by name, and stay unsupported on selection and result, whose
-    /// rows bridge them (S10-09e, S10-16).
+    /// Numbers 20 to 29 read the application's readouts on play and on
+    /// selection, by id and by name, each the field of the same name and
+    /// range in either schema, and stay unsupported on result, whose row
+    /// bridges them (S10-16); 19 and 30 stay unsupported.
     #[test]
-    fn application_readouts_resolve_on_play() {
+    fn application_readouts_resolve_on_play_and_selection() {
         let scope = skin_model::Scope::new(&skin_model::PLAY);
         let named = [
             (20, "current_fps", "app.fps", (0, 1_024)),
@@ -1199,16 +1206,37 @@ mod tests {
             assert_eq!(value.range(), range, "{id}");
             assert!(!value.deviates() && value.part().is_none(), "{id}");
             assert!(skin_model::compile(expr, &scope, skin_model::Ty::Int).is_ok());
-            for kind in [ScreenKind::Selection, ScreenKind::Result] {
-                assert_eq!(
-                    int_in(kind, id),
-                    IntProp::Unsupported(Some(id)),
-                    "{kind:?} {id}"
-                );
-            }
+            let sel = Value::Selection(SelValue::App(u8::try_from(id - 20).unwrap()));
+            assert_eq!(
+                int_in(ScreenKind::Selection, id),
+                IntProp::Shown(sel),
+                "{id}"
+            );
+            assert_eq!((sel.expr(), sel.availability()), (expr, Some("true")));
+            assert_eq!(sel.range(), range, "selection {id}");
+            assert!(
+                skin_model::compile(
+                    expr,
+                    &skin_model::Scope::new(&skin_model::SELECTION),
+                    skin_model::Ty::Int
+                )
+                .is_ok()
+            );
+            assert_eq!(
+                int_in(ScreenKind::Result, id),
+                IntProp::Unsupported(Some(id)),
+                "result {id}"
+            );
         }
         assert_eq!(int_by_id(19), IntProp::Unsupported(Some(19)));
         assert_eq!(int_by_id(30), IntProp::Unsupported(Some(30)));
+        for id in [17, 18, 19, 30, 31] {
+            assert_eq!(
+                int_in(ScreenKind::Selection, id),
+                IntProp::Unsupported(Some(id)),
+                "selection {id}"
+            );
+        }
     }
 
     #[test]
