@@ -264,7 +264,7 @@ impl Fixture {
 
 /// The scenario of `steps`, over `library`, with `out` as its output.
 fn scenario(steps: &[&str]) -> String {
-    let mut text = "version = 6\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
+    let mut text = "version = 7\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
     for s in steps {
         text.push_str("[[step]]\n");
         text.push_str(s);
@@ -673,27 +673,27 @@ fn a_stalled_capture_exits_one_within_the_bound() {
 #[test]
 fn other_scenario_version_is_refused() {
     let fx = Fixture::new();
-    let (out, _, stderr) = fx.run("version = 7\nwhat_v7_adds = true\n");
+    let (out, _, stderr) = fx.run("version = 8\nwhat_v8_adds = true\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("version 7 is not supported; this build reads version 6"),
+        stderr.contains("version 8 is not supported; this build reads version 7"),
         "{stderr}"
     );
-    assert!(!stderr.contains("what_v7_adds"), "{stderr}");
+    assert!(!stderr.contains("what_v8_adds"), "{stderr}");
     assert!(!fx.data().join("library.db").exists());
     // The previous version too: its files are refused, never read.
-    let old = scenario(&["quit = {}"]).replacen("version = 6", "version = 5", 1);
+    let old = scenario(&["quit = {}"]).replacen("version = 7", "version = 6", 1);
     let (out, _, stderr) = fx.run(&old);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("version 5 is not supported; this build reads version 6"),
+        stderr.contains("version 6 is not supported; this build reads version 7"),
         "{stderr}"
     );
     assert!(!fx.data().join("library.db").exists());
     let (out, _, stderr) = fx.run("[library]\nroots = [\"library\"]\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("no version; this build reads version 6"),
+        stderr.contains("no version; this build reads version 7"),
         "{stderr}"
     );
     assert!(!fx.data().join("library.db").exists());
@@ -1119,6 +1119,70 @@ fn a_ready_capture_past_ready_fails_the_run() {
     assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
     assert!(stderr.contains("its READY state ended first"), "{stderr}");
     assert!(!fx.base.join("out").join("late.png").exists());
+}
+
+/// A skin with a 2 500 ms loading time, installed as the play skin.
+fn install_slow_loading_skin(fx: &Fixture) {
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    fs::write(
+        skin.join("s.json"),
+        r#"{"type": 0, "w": 1920, "h": 1080, "loadend": 2500, "destination": []}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 's.json'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// A `loading_at` capture takes a frame on its loading state's clock, its
+/// screen clock the same; the play's frames run that screen clock on
+/// (docs/stage3.md D3). One past the loading state fails the run.
+#[test]
+fn a_loading_at_capture_runs_on_the_loading_clock() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    install_slow_loading_skin(&fx);
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "capture = { loading_at = 1500, file = \"mid.png\" }",
+        "capture = { at = 0, file = \"start.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let dir = fx.base.join("out");
+    assert!(dir.join("mid.png").exists());
+    let mid = fs::read_to_string(dir.join("mid.json")).unwrap();
+    assert_eq!(side_value(&mid, "axis"), "loading_at", "{mid}");
+    assert_eq!(side_value(&mid, "phase"), "loading", "{mid}");
+    let loading_us = side_num(&mid, "loading_us");
+    // At or after 1.5 s, and inside the 2.5 s loading state.
+    assert!((1_500_000..2_500_000).contains(&loading_us), "{mid}");
+    assert_eq!(side_num(&mid, "screen_us"), loading_us, "{mid}");
+    // The play's screen clock runs on past the whole loading time.
+    let start = fs::read_to_string(dir.join("start.json")).unwrap();
+    assert!(side_num(&start, "screen_us") >= 2_500_000, "{start}");
+    assert_eq!(side_value(&start, "loading_us"), "null", "{start}");
+
+    let late = scenario(&[
+        "capture = { loading_at = 60000, file = \"late.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ])
+    .replacen("output = \"out\"", "output = \"late\"", 1);
+    let (out, stdout, stderr) = fx.run(&late);
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(stderr.contains("its loading state ended first"), "{stderr}");
 }
 
 /// A capture whose file is a folder when its frame comes fails the run,
