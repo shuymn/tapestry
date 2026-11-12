@@ -117,30 +117,65 @@ fn a_mid_chart_ready_state() {
     assert_eq!(h.field(field::NOTES), 1);
 }
 
-/// In a play the screen timer, which untimed elements run on, starts at
-/// `ready`'s start, so an untimed animation starts again at
-/// READY; `loading` stays off and `load.percent` reads 100.
-#[test]
-fn the_screen_timer_starts_with_ready_in_a_play() {
-    let chart = taps(&[1_000, 31_000]);
-    let s = section(30_000, 60_000, 1_000);
-    let skin = load(
-        Vec::new(),
-        vec![element(TimerRef::Builtin(timer::SCREEN), 1)],
-    )
-    .unwrap();
-    let mut h = Harness::new(skin, &chart, &in_section(&s));
-    h.frame_us(28_999_999, &[]);
-    assert_eq!(h.elapsed(timer::SCREEN), TIMER_OFF);
-    assert!(h.batch.quads().is_empty());
-    for (now, ms) in [(29_000, 0), (29_250, 250), (31_000, 2_000)] {
-        h.frame(now, &[]);
-        assert_eq!(h.start(timer::SCREEN), h.start(timer::READY), "at {now}");
-        assert_eq!(h.elapsed(timer::SCREEN), ms, "at {now}");
-        assert_eq!(h.batch.quads().len(), 1, "at {now}");
-        assert_eq!(h.elapsed(timer::LOADING), TIMER_OFF, "at {now}");
-        assert_eq!(h.field(field::LOAD_PERCENT), 100, "at {now}");
+/// An untimed element moving from x = 0 at 0 to x = 2 000 at 2 000 ms on
+/// the screen timer.
+fn screen_mover() -> ElementDef {
+    let key = |at_ms: i64, x: i32| {
+        let mut props = [None; 9];
+        props[0] = Some(x);
+        KeyDef {
+            at: TimeUs(at_ms * MS),
+            props,
+        }
+    };
+    ElementDef {
+        track: Track::new(&[key(0, 0), key(2_000, 2_000)], Ease::Linear, End::Hold).unwrap(),
+        ..element(TimerRef::Builtin(timer::SCREEN), 0)
     }
+}
+
+/// In a play the screen timer, which untimed elements run on, runs from
+/// the play state's screen origin (`SkinFrame::screen_us`) through READY
+/// into the play, never restarted at READY or at play's start (design.md
+/// "Timers"): after 1 234 ms of loading and a 1 000 ms lead-in it reads
+/// 1 234 ms at READY and 2 734 ms 1 500 ms later, and an untimed track
+/// samples its key at the screen's time. `loading` stays off and
+/// `load.percent` reads 100.
+#[test]
+fn the_screen_runs_on_from_the_loading_origin_into_the_play() {
+    let chart = taps(&[1_000, 31_000]);
+    let skin = load(Vec::new(), vec![screen_mover()]).unwrap();
+    let mut h = Harness::new(skin, &chart, &full(1_000));
+    // The loading lifetime began 1 234 ms before READY (chart -1 000 ms).
+    h.screen_from = (-1_000 - 1_234) * MS;
+    h.frame(-1_000, &[]);
+    assert_eq!(h.elapsed(timer::READY), 0);
+    assert_eq!(h.elapsed(timer::SCREEN), 1_234);
+    h.frame(-500, &[]);
+    assert_eq!(h.elapsed(timer::SCREEN), 1_734);
+    assert_eq!(h.batch.quads()[0].rect[0], 1_734.0);
+    h.frame(500, &[]);
+    assert_eq!(h.elapsed(timer::PLAY), 500);
+    assert_eq!(h.elapsed(timer::SCREEN), 2_734);
+    assert_eq!(h.batch.quads()[0].rect[0], 2_000.0);
+    assert_eq!(h.elapsed(timer::LOADING), TIMER_OFF);
+    assert_eq!(h.field(field::LOAD_PERCENT), 100);
+}
+
+/// A READY rearm starts the attempt's runtime over but not the screen
+/// timer: the frame's screen clock alone sets it.
+#[test]
+fn a_rearm_keeps_the_screen() {
+    let chart = taps(&[1_000]);
+    let skin = load(Vec::new(), vec![screen_mover()]).unwrap();
+    let mut h = Harness::new(skin, &chart, &full(1_000));
+    h.screen_from = -500 * MS - 3_210_000;
+    h.frame(-500, &[]);
+    assert_eq!(h.elapsed(timer::SCREEN), 3_210);
+    h.play.rearm();
+    h.frame(-500, &[]);
+    assert_eq!(h.elapsed(timer::SCREEN), 3_210);
+    assert_eq!(h.elapsed(timer::READY), 500);
 }
 
 /// Key-on and key-off from the view's lane input, mutually exclusive, in
@@ -1161,6 +1196,7 @@ fn an_inconsistent_snapshot_poisons_the_play() {
         let f = skin_model::SkinFrame {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: 0,
             now: TimeUs(now * MS),
             display_offset: TimeUs(0),
             tally: &tally,

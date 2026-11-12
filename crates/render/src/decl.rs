@@ -714,6 +714,7 @@ pub fn skin_frame<'a>(f: &FrameInput<'a>) -> SkinFrame<'a> {
         now: f.now,
         display_offset: f.display_offset,
         state_us: f.state_us,
+        screen_us: f.screen_us,
         tally: &view.tally,
         gauges: &view.gauges,
         gauge: f.gauge,
