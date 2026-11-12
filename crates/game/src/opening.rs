@@ -233,6 +233,22 @@ pub trait LoadingRig: Rig {
         let _ = until;
         self.wait();
     }
+    /// Polls the pending preparation in the loading state's wait
+    /// ([`wait_loading`]): as [`Rig::poll_preparation`] with a deadline
+    /// [`PREP_SLICE`] away, but never past `until` on the rig's clock when
+    /// it is given ([`wait_slice`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Rig::poll_preparation`].
+    fn loading_poll(
+        &mut self,
+        handle: &mut PrepHandle,
+        until: Option<TimeUs>,
+    ) -> Result<PrepPoll<Preparation>, Self::ScreenError> {
+        let slice = wait_slice(until, self.now(), PREP_SLICE);
+        self.poll_preparation(handle, std::time::Instant::now() + slice)
+    }
     /// Whether the skin refused a loading frame of lifetime `lifetime`:
     /// nothing of it is drawn again, so its first frame may never be
     /// acknowledged. None refused by default.
@@ -723,9 +739,8 @@ fn wait_loading<R: LoadingRig>(
     let mut wake = None;
     loop {
         if opener.latch == PrepState::Pending {
-            let deadline = std::time::Instant::now() + PREP_SLICE;
             if let PrepPoll::Done(answer) = rig
-                .poll_preparation(&mut opener.handle, deadline)
+                .loading_poll(&mut opener.handle, wake)
                 .map_err(LiveError::Screen)?
             {
                 opener.latch = PrepState::of(answer);
@@ -779,6 +794,24 @@ fn wait_loading<R: LoadingRig>(
         }
         wake = next_wake(opener, rig, now, &tuning);
     }
+}
+
+/// How long a wait from `now` may last to end by `until` on the same
+/// clock: `most` at most, never past `until`; `most` without one, and
+/// nothing for one already reached (the look runs at once). The loading
+/// state's wait asks only for instants after its look ([`next_wake`]).
+#[must_use]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub fn wait_slice(
+    until: Option<TimeUs>,
+    now: TimeUs,
+    most: std::time::Duration,
+) -> std::time::Duration {
+    until.map_or(most, |u| {
+        most.min(std::time::Duration::from_micros(
+            u.0.saturating_sub(now.0).max(0).unsigned_abs(),
+        ))
+    })
 }
 
 /// The next instant the loading wait's conditions can change by time
