@@ -255,7 +255,7 @@ fn a_result_build_allocates_nothing() {
     // reserved at the skin's capacity.
     total += counted(|| fx.frame(0));
     // The chart's images: a table installed for every other view, absent
-    // for the rest (S10-12, RC8).
+    // for the rest.
     let key = skin_model::chart_image::ChartKey {
         renderer: 1,
         installation: 2,

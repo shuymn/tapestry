@@ -1154,7 +1154,7 @@ fn a_refusal_carries_the_facts_read_before_it() {
     );
 }
 
-/// RT1's Lua half: options 190, 191 and 195 read the attempt's resolved
+/// Options 190, 191 and 195 read the attempt's resolved
 /// availability with no guard, and a negative id, a literal `not` and a
 /// JSON `op` read the same value, on a ready view and an unavailable one
 /// alike (the chart's facts hold under every status). A Lua skin reading

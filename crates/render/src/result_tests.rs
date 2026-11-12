@@ -1048,8 +1048,8 @@ fn stage_picture(
         .unwrap()
 }
 
-/// RC3, RC7 and the array's record (S10-12, the result's chart images): a
-/// view's images are written into the array its staging uses and keyed
+/// The result's chart images and the array's record: a view's images are
+/// written into the array its staging uses and keyed
 /// to its installation, so its first frame after the commit draws them; a
 /// layout staged on the installed array of the same set writes nothing
 /// again and draws them with its own installation's key; the record is the

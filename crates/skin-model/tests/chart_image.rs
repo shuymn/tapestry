@@ -675,7 +675,7 @@ fn each_checkpoint_cancels_the_read() {
     }
 }
 
-/// RC1, RC5: a source is read once, level 0 only, fitted to the largest
+/// A source is read once, level 0 only, fitted to the largest
 /// chart slot; every slot's fit derives from it as a read for that slot
 /// would place it (the same content, gutters and levels), up to the
 /// native size in a larger slot and an area downscale in a smaller one,
