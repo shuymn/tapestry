@@ -346,10 +346,9 @@ fn witness_terms_are_disjoint() {
         rx.recv_timeout(Duration::from_secs(60)).unwrap();
         worker.take().unwrap().unwrap()
     };
-    let first = staged(1, "A");
-    let second = staged(2, "B");
-    let third = staged(3, "C");
-    store.offer(first);
+    // Each output is claimed before the next job is posted: a newer post
+    // supersedes every output taken before it.
+    store.offer(staged(1, "A"));
     store.claim().unwrap();
     while r.write_decision_labels(&mut store) == FillStep::Wrote {}
     let _ = r.gpu().device().poll(wgpu::PollType::wait_indefinitely());
@@ -357,10 +356,10 @@ fn witness_terms_are_disjoint() {
         r.settle_decision_labels(&mut store).unwrap(),
         Settled::Published { .. }
     ));
-    store.offer(second);
+    store.offer(staged(2, "B"));
     store.claim().unwrap();
     assert_eq!(r.write_decision_labels(&mut store), FillStep::Complete);
-    store.offer(third);
+    store.offer(staged(3, "C"));
     let d = store.memory(Some(&worker));
     assert!(d.labels > 0 && d.staged > 0 && d.upload > 0, "{d:?}");
     assert!(d.staged <= plan.staged_bound(), "{d:?}");

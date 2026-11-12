@@ -33,6 +33,13 @@
 //! render thread's [`LabelStore`], which a decision frame borrows by
 //! `(slot, generation)` ([`LabelStore::content`]).
 //!
+//! **A rebuild.** The resets keep a pinned slot and its generation, but
+//! not its content: the store keeps only its strings, so nothing of the
+//! old device's layer is drawn, until its lines staged again are written
+//! on the new renderer ([`restore_pinned`]). A worker's output is fenced
+//! by the newest job posted: a slot is never claimed for an output a newer
+//! post superseded, taken before it or not.
+//!
 //! Preparation work allocates; reading a slot's content for a frame
 //! allocates nothing.
 
@@ -263,12 +270,16 @@ pub enum LabelState {
         key: LabelKey,
         timing: DecisionTiming,
     },
-    /// Drawn by a decision lifetime.
+    /// Drawn by a decision lifetime. `restoring` from a
+    /// [`reset`](LabelBook::reset) until its content was restored on the
+    /// renderer built again ([`restore_pinned`]): no content of it is
+    /// drawable meanwhile, and a retire then frees it, never ready again.
     Pinned {
         generation: Gen,
         key: LabelKey,
         timing: DecisionTiming,
         lifetime: u64,
+        restoring: bool,
     },
     /// Waiting for `done`, set when the GPU finished the work it watches.
     Cooling {
@@ -524,6 +535,7 @@ impl LabelBook {
             key: std::mem::replace(key, LabelKey::empty()),
             timing,
             lifetime,
+            restoring: false,
         };
         self.active = Some(lifetime);
         Some((slot, generation, timing))
@@ -543,7 +555,8 @@ impl LabelBook {
 
     /// Retires `slot` if it is pinned at `generation` by `lifetime` and that
     /// lifetime is no longer active: cooling until `watch`'s flag, set when
-    /// the last frame that drew it completed. Whether it was retired.
+    /// the last frame that drew it completed; a slot still restoring cools
+    /// as a cancelled one, free at its flag. Whether it was retired.
     pub fn retire(
         &mut self,
         slot: usize,
@@ -560,6 +573,7 @@ impl LabelBook {
             key,
             timing,
             lifetime: l,
+            restoring,
         } = s
         else {
             return false;
@@ -567,12 +581,17 @@ impl LabelBook {
         if *g != generation || *l != lifetime || active == Some(lifetime) {
             return false;
         }
+        let from = if *restoring {
+            CoolFrom::Cancelled
+        } else {
+            CoolFrom::Retired
+        };
         *s = LabelState::Cooling {
             generation,
             key: std::mem::replace(key, LabelKey::empty()),
             timing: *timing,
             done: watch(),
-            from: CoolFrom::Retired,
+            from,
         };
         true
     }
@@ -636,15 +655,43 @@ impl LabelBook {
     }
 
     /// The renderer was built again: a new epoch, every slot free but a
-    /// pinned one, the device healthy.
+    /// pinned one, which keeps its generation and is restoring until its
+    /// content is restored ([`restore_pinned`]), the device healthy.
     pub fn reset(&mut self) {
         self.epoch += 1;
         for s in &mut self.slots {
-            if !matches!(s, LabelState::Pinned { .. }) {
-                *s = LabelState::Free;
+            match s {
+                LabelState::Pinned { restoring, .. } => *restoring = true,
+                _ => *s = LabelState::Free,
             }
         }
         self.healthy = true;
+    }
+
+    /// Whether `slot` is pinned at `generation` and restoring: its content
+    /// waits for [`Renderer::restore_decision_labels`](crate::Renderer::restore_decision_labels).
+    #[must_use]
+    pub fn awaits_restore(&self, slot: usize, generation: Gen) -> bool {
+        matches!(
+            self.slots.get(slot),
+            Some(LabelState::Pinned { generation: g, restoring: true, .. }) if *g == generation
+        )
+    }
+
+    /// Pinned slot `slot`'s content at `generation` was restored: no
+    /// longer restoring. Whether it was.
+    fn restored(&mut self, slot: usize, generation: Gen) -> bool {
+        match self.slots.get_mut(slot) {
+            Some(LabelState::Pinned {
+                generation: g,
+                restoring,
+                ..
+            }) if *g == generation && *restoring => {
+                *restoring = false;
+                true
+            }
+            _ => false,
+        }
     }
 }
 
@@ -703,11 +750,14 @@ impl StagedLine {
 /// A preparation's output: its lines rasterized and expanded, its notes,
 /// its bitmap lines and the strings they were made from. It has one
 /// owner: the worker, then the store's waiting output, then a filling
-/// slot.
+/// slot. Its fence is the newest generation asked of the worker that made
+/// it: once a newer job is posted (or the worker cancelled), it is
+/// superseded, and no slot is claimed for it ([`LabelStore::claim`]).
 #[must_use]
 #[derive(Debug)]
 pub struct StagedLabels {
     generation: Gen,
+    fence: Arc<AtomicU64>,
     key: LabelKey,
     timing: DecisionTiming,
     strings: DecisionStrings,
@@ -729,6 +779,13 @@ impl StagedLabels {
     #[must_use]
     pub const fn key(&self) -> &LabelKey {
         &self.key
+    }
+
+    /// Whether it is still the newest generation asked of its worker
+    /// (always, staged without one).
+    #[must_use]
+    pub fn is_current(&self) -> bool {
+        self.fence.load(Ordering::Acquire) == self.generation
     }
 
     /// One note per line without an image: its slot and why.
@@ -807,6 +864,7 @@ pub fn stage_labels(
     let bitmap = skin.decision_bitmap_lines(&job.strings);
     Ok(Some(StagedLabels {
         generation: job.generation,
+        fence: Arc::new(AtomicU64::new(job.generation)),
         key: job.key,
         timing: skin.decision_timing(),
         strings: job.strings,
@@ -816,6 +874,28 @@ pub fn stage_labels(
         slots: skin.text_slots(),
         side: plan.side,
     }))
+}
+
+/// [`stage_labels`] of `job` on this thread with `bundle`'s skin and
+/// producer, never superseded: a rebuild's restaging of a pinned slot's
+/// labels ([`Renderer::restore_decision_labels`](crate::Renderer::restore_decision_labels)).
+/// Preparation work: it allocates.
+///
+/// # Errors
+///
+/// As [`stage_labels`].
+pub fn stage_bundle_labels(
+    bundle: &crate::SkinBundle,
+    job: LabelJob,
+) -> Result<Option<StagedLabels>, RenderError> {
+    let producer = bundle.text_producer().map(|p| &**p);
+    stage_labels(
+        bundle.skin(),
+        producer,
+        job,
+        &mut LabelScratch::default(),
+        &|| false,
+    )
 }
 
 /// The worker's own text buffers: a line's A8 pixels, kept, and the
@@ -842,8 +922,10 @@ struct Mailbox {
 struct WorkerShared {
     mailbox: Mutex<Mailbox>,
     posted: Condvar,
-    /// The newest generation posted; 0 after a cancel.
-    latest: AtomicU64,
+    /// The newest generation posted; 0 after a cancel. Changed only with
+    /// `output` locked, as the worker's last check before it stores an
+    /// output, so a superseded output is never stored.
+    latest: Arc<AtomicU64>,
     output: Mutex<Option<LabelOutput>>,
     /// The worker's A8 buffer's bytes, and its producer's mask bound once
     /// a line was rasterized.
@@ -851,6 +933,13 @@ struct WorkerShared {
     mask: AtomicU64,
     building: Arc<AtomicU64>,
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Unit tests: run by the worker with a job's generation once it was
+    /// staged, before its last check.
+    #[cfg(test)]
+    before_store: Option<Arc<dyn Fn(Gen) + Send + Sync>>,
+    /// Unit tests: set once the worker's thread was joined.
+    #[cfg(test)]
+    reaped: Arc<(Mutex<bool>, Condvar)>,
 }
 
 fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -860,7 +949,8 @@ fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 /// One decision installation's preparation thread, with a one-slot
 /// mailbox: a job posted replaces the one waiting, and supersedes the one
 /// in progress, which stops between lines; an output of a superseded
-/// generation is dropped.
+/// generation is dropped. Dropping it closes the thread without waiting
+/// for it: a thread of its own joins it.
 pub struct LabelWorker {
     shared: Arc<WorkerShared>,
     thread: Option<JoinHandle<()>>,
@@ -886,16 +976,48 @@ impl LabelWorker {
         producer: Option<Arc<dyn AttemptText>>,
         wake: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> std::io::Result<Self> {
+        Self::spawn_with(
+            skin,
+            producer,
+            wake,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    /// Unit tests: [`spawn`](Self::spawn), `before_store` run with each
+    /// job's generation once it was staged, before the worker's last
+    /// check.
+    #[cfg(test)]
+    pub(crate) fn spawn_hooked(
+        skin: Arc<Skin>,
+        producer: Option<Arc<dyn AttemptText>>,
+        wake: Option<Arc<dyn Fn() + Send + Sync>>,
+        before_store: Option<Arc<dyn Fn(Gen) + Send + Sync>>,
+    ) -> std::io::Result<Self> {
+        Self::spawn_with(skin, producer, wake, before_store)
+    }
+
+    fn spawn_with(
+        skin: Arc<Skin>,
+        producer: Option<Arc<dyn AttemptText>>,
+        wake: Option<Arc<dyn Fn() + Send + Sync>>,
+        #[cfg(test)] before_store: Option<Arc<dyn Fn(Gen) + Send + Sync>>,
+    ) -> std::io::Result<Self> {
         let building = Arc::new(AtomicU64::new(0));
         let shared = Arc::new(WorkerShared {
             mailbox: Mutex::new(Mailbox::default()),
             posted: Condvar::new(),
-            latest: AtomicU64::new(0),
+            latest: Arc::new(AtomicU64::new(0)),
             output: Mutex::new(None),
             a8: AtomicU64::new(0),
             mask: AtomicU64::new(0),
             building: Arc::clone(&building),
             wake,
+            #[cfg(test)]
+            before_store,
+            #[cfg(test)]
+            reaped: Arc::new((Mutex::new(false), Condvar::new())),
         });
         let s = Arc::clone(&shared);
         let thread = std::thread::Builder::new()
@@ -931,20 +1053,26 @@ impl LabelWorker {
     }
 
     /// Posts `job`: it replaces a waiting job and supersedes the one in
-    /// progress and any output not taken.
+    /// progress, any output not taken and every output taken before.
     pub fn post(&self, job: LabelJob) {
-        self.shared.latest.store(job.generation, Ordering::Release);
-        *locked(&self.shared.output) = None;
+        self.supersede(job.generation);
         locked(&self.shared.mailbox).job = Some(job);
         self.shared.posted.notify_one();
     }
 
     /// Cancels every job, waiting or in progress, and drops an output not
-    /// taken.
+    /// taken; every output taken before is superseded.
     pub fn cancel(&self) {
-        self.shared.latest.store(0, Ordering::Release);
+        self.supersede(0);
         locked(&self.shared.mailbox).job = None;
-        *locked(&self.shared.output) = None;
+    }
+
+    /// Makes `generation` the newest and drops the output not taken, in
+    /// one lock of the output.
+    fn supersede(&self, generation: Gen) {
+        let mut output = locked(&self.shared.output);
+        self.shared.latest.store(generation, Ordering::Release);
+        *output = None;
     }
 
     /// The output of the newest job, once returned.
@@ -956,6 +1084,22 @@ impl LabelWorker {
             Err((g, _)) => *g,
         };
         (generation == self.shared.latest.load(Ordering::Acquire)).then_some(out)
+    }
+
+    /// Unit tests: the generation of the output not taken.
+    #[cfg(test)]
+    pub(crate) fn output_generation(&self) -> Option<Gen> {
+        locked(&self.shared.output).as_ref().map(|o| match o {
+            Ok(s) => s.generation,
+            Err((g, _)) => *g,
+        })
+    }
+
+    /// Unit tests: set, with its condition notified, once the thread was
+    /// joined after a drop.
+    #[cfg(test)]
+    pub(crate) fn reaped(&self) -> Arc<(Mutex<bool>, Condvar)> {
+        Arc::clone(&self.shared.reaped)
     }
 
     /// The bytes the worker holds: its staged levels (the job in progress
@@ -978,13 +1122,28 @@ impl LabelWorker {
 }
 
 impl Drop for LabelWorker {
+    /// Closes the thread without waiting for it: the line it may be
+    /// working on is not interrupted, so a thread of its own joins it.
     fn drop(&mut self) {
-        self.shared.latest.store(0, Ordering::Release);
+        self.supersede(0);
         locked(&self.shared.mailbox).closed = true;
         self.shared.posted.notify_one();
-        if let Some(t) = self.thread.take() {
-            let _ = t.join();
-        }
+        let Some(t) = self.thread.take() else {
+            return;
+        };
+        #[cfg(test)]
+        let reaped = Arc::clone(&self.shared.reaped);
+        // Without a joiner the thread is detached: it ends after its line.
+        let _ = std::thread::Builder::new()
+            .name("decision labels join".to_owned())
+            .spawn(move || {
+                let _ = t.join();
+                #[cfg(test)]
+                {
+                    *locked(&reaped.0) = true;
+                    reaped.1.notify_all();
+                }
+            });
     }
 }
 
@@ -1018,14 +1177,26 @@ fn run(
             s.mask.store(mask, Ordering::Relaxed);
         }
         let out = match out {
-            Ok(Some(staged)) => Ok(staged),
+            Ok(Some(mut staged)) => {
+                staged.fence = Arc::clone(&s.latest);
+                Ok(staged)
+            }
             Ok(None) => continue,
             Err(e) => Err((generation, e)),
         };
-        if superseded() {
-            continue;
+        #[cfg(test)]
+        if let Some(hook) = &s.before_store {
+            hook(generation);
         }
-        *locked(&s.output) = Some(out);
+        {
+            // The last check and the store in the lock a post changes the
+            // newest generation in.
+            let mut output = locked(&s.output);
+            if superseded() {
+                continue;
+            }
+            *output = Some(out);
+        }
         if let Some(wake) = &s.wake {
             wake();
         }
@@ -1061,6 +1232,24 @@ impl LabelContent {
     }
 }
 
+/// What the store holds of a slot: its drawable content, or, for a pinned
+/// slot after a reset, only the strings its content is restored from (no
+/// table of the old device's layer is kept, so none is drawn).
+#[derive(Debug)]
+enum Held {
+    Drawable(LabelContent),
+    Restoring(DecisionStrings),
+}
+
+impl Held {
+    fn bytes(&self) -> u64 {
+        match self {
+            Self::Drawable(c) => c.bytes(),
+            Self::Restoring(s) => u64::try_from(s.heap_bytes()).unwrap_or(u64::MAX),
+        }
+    }
+}
+
 /// The filling slot's progress: rows written, the first error a write's
 /// scope reported, the completion flag once submitted, and the bytes the
 /// last boundary staged.
@@ -1069,7 +1258,8 @@ pub struct FillProgress {
     /// The lines whose every level was written.
     pub rows_written: usize,
     /// The first error a boundary's scopes reported: the fill writes no
-    /// more and is refused once its writes completed.
+    /// more, submits at the next boundary and is refused once its writes
+    /// completed.
     pub scope_error: Option<wgpu::Error>,
     /// Set when the submitted writes completed.
     pub done: Option<Arc<AtomicBool>>,
@@ -1104,6 +1294,7 @@ struct Fill {
 pub(crate) enum LabelStep {
     Written,
     Submitted,
+    Watched,
     CompletionSeen,
     LostChecked,
     Published,
@@ -1116,7 +1307,7 @@ pub(crate) enum LabelStep {
 #[derive(Debug)]
 pub struct LabelStore {
     book: Arc<Mutex<LabelBook>>,
-    contents: [Option<(Gen, LabelContent)>; LABEL_SLOTS],
+    contents: [Option<(Gen, Held)>; LABEL_SLOTS],
     fill: Option<Fill>,
     waiting: Option<StagedLabels>,
     #[cfg(test)]
@@ -1191,10 +1382,27 @@ impl LabelStore {
 
     /// The renderer was built again: the fill and the waiting output are
     /// dropped with the old device's writes (the book's
-    /// [`reset`](LabelBook::reset) frees their slots).
+    /// [`reset`](LabelBook::reset) frees their slots), and no slot's
+    /// content is drawable until restored: a pinned slot keeps only its
+    /// strings ([`restore_strings`](Self::restore_strings)).
     pub fn reset(&mut self) {
         self.fill = None;
         self.waiting = None;
+        for c in self.contents.iter_mut().flatten() {
+            if let Held::Drawable(content) = &mut c.1 {
+                c.1 = Held::Restoring(std::mem::take(&mut content.strings));
+            }
+        }
+    }
+
+    /// The strings slot `slot`'s content at `generation` is restored from,
+    /// while it waits to be restored after a reset.
+    #[must_use]
+    pub fn restore_strings(&self, slot: usize, generation: Gen) -> Option<&DecisionStrings> {
+        match self.contents.get(slot) {
+            Some(Some((g, Held::Restoring(s)))) if *g == generation => Some(s),
+            _ => None,
+        }
     }
 
     /// Drops the waiting output.
@@ -1220,12 +1428,22 @@ impl LabelStore {
         self.fill.as_ref().map(|f| &f.progress)
     }
 
+    /// Unit tests: the filling slot's progress, to change.
+    #[cfg(test)]
+    pub(crate) fn progress_mut(&mut self) -> Option<&mut FillProgress> {
+        self.fill.as_mut().map(|f| &mut f.progress)
+    }
+
     /// Claims a slot for the waiting output when none is filling: it
-    /// moves into the slot's fill, the slot's old content dropped. The
-    /// slot claimed.
+    /// moves into the slot's fill, the slot's old content dropped. A
+    /// waiting output no longer current ([`StagedLabels::is_current`]) is
+    /// dropped instead. The slot claimed.
     pub fn claim(&mut self) -> Option<usize> {
         if self.fill.is_some() {
             return None;
+        }
+        if self.waiting.as_ref().is_some_and(|w| !w.is_current()) {
+            self.waiting = None;
         }
         let w = self.waiting.as_ref()?;
         let slot = lock(&self.book).claim(w.generation, w.key.clone(), w.timing)?;
@@ -1261,7 +1479,7 @@ impl LabelStore {
     #[must_use]
     pub fn content(&self, slot: usize, generation: Gen) -> Option<DecisionLabels<'_>> {
         match self.contents.get(slot) {
-            Some(Some((g, c))) if *g == generation => Some(DecisionLabels {
+            Some(Some((g, Held::Drawable(c)))) if *g == generation => Some(DecisionLabels {
                 text: &c.table,
                 bitmap: &c.bitmap,
             }),
@@ -1273,7 +1491,7 @@ impl LabelStore {
     #[must_use]
     pub fn content_of(&self, slot: usize, generation: Gen) -> Option<&LabelContent> {
         match self.contents.get(slot) {
-            Some(Some((g, c))) if *g == generation => Some(c),
+            Some(Some((g, Held::Drawable(c)))) if *g == generation => Some(c),
             _ => None,
         }
     }
@@ -1317,6 +1535,20 @@ pub(crate) struct LabelTarget<'a> {
     /// completion is registered: a unit test makes the device fail there.
     #[cfg(test)]
     pub(crate) after_submit: Option<fn(&Gpu)>,
+    /// Run inside a boundary's scopes, after its writes: a unit test makes
+    /// a scope report an error.
+    #[cfg(test)]
+    pub(crate) in_scope: Option<fn(&Gpu)>,
+    /// Unit tests: the pairs of error scopes opened so far.
+    #[cfg(test)]
+    pub(crate) scope_pairs: &'a std::cell::Cell<usize>,
+}
+
+/// `work` inside one pair of error scopes on `t`'s device.
+fn scoped<T>(t: &LabelTarget<'_>, work: impl FnOnce() -> T) -> (T, Option<wgpu::Error>) {
+    #[cfg(test)]
+    t.scope_pairs.set(t.scope_pairs.get() + 1);
+    skin_atlas::scoped(t.gpu.device(), work)
 }
 
 /// Registers one flag-only completion for the work submitted so far on
@@ -1331,10 +1563,11 @@ pub(crate) fn watch(gpu: &Gpu) -> Arc<AtomicBool> {
 }
 
 /// Writes the filling slot's next rows, at most
-/// [`DECISION_TEXT_WRITE_BUDGET`] bytes (at least one row), inside one
-/// pair of error scopes, each line's levels freed once written; after the
-/// last, or after a scope reported an error, submits and watches
-/// ([`submit_and_watch`]).
+/// [`DECISION_TEXT_WRITE_BUDGET`] bytes (at least one row), each line's
+/// levels freed once written; after the last, submits once. The writes
+/// and the submission share the boundary's one pair of error scopes; the
+/// one flag-only completion is registered after the scopes settled. A
+/// scope's error stops the writes: the next boundary only submits.
 pub(crate) fn write_rows(t: &LabelTarget<'_>, store: &mut LabelStore) -> FillStep {
     let Some(fill) = store.fill.as_mut() else {
         return FillStep::Idle;
@@ -1352,9 +1585,11 @@ pub(crate) fn write_rows(t: &LabelTarget<'_>, store: &mut LabelStore) -> FillSte
     let queue = t.gpu.queue();
     let texture = t.atlas.texture();
     let mut bytes = 0_u64;
-    let ((), refused) = skin_atlas::scoped(t.gpu.device(), || {
+    let mut submitted = false;
+    let failed = fill.progress.scope_error.is_some();
+    let ((), refused) = scoped(t, || {
         let c = &mut fill.cursor;
-        while let Some(line) = fill.staged.lines.get_mut(c.line) {
+        while let Some(line) = fill.staged.lines.get_mut(c.line).filter(|_| !failed) {
             let Some(level) = line.levels.get(c.level) else {
                 line.levels = Default::default();
                 fill.progress.rows_written += 1;
@@ -1389,60 +1624,48 @@ pub(crate) fn write_rows(t: &LabelTarget<'_>, store: &mut LabelStore) -> FillSte
                 c.row = 0;
             }
         }
+        #[cfg(test)]
+        if let Some(f) = t.in_scope {
+            f(t.gpu);
+        }
+        if failed || fill.cursor.line >= fill.staged.lines.len() {
+            fill.progress.complete = true;
+            for l in &mut fill.staged.lines {
+                l.levels = Default::default();
+            }
+            if fill.progress.wrote {
+                queue.submit([]);
+                submitted = true;
+            }
+        }
     });
     fill.progress.upload = bytes;
+    if let Some(e) = refused {
+        fill.progress.scope_error.get_or_insert(e);
+    }
     #[cfg(test)]
     if bytes > 0 {
         store.steps.push(LabelStep::Written);
     }
-    let Some(fill) = store.fill.as_mut() else {
-        return FillStep::Idle;
-    };
-    if let Some(e) = refused {
-        fill.progress.scope_error.get_or_insert(e);
-    }
-    let done = fill.cursor.line >= fill.staged.lines.len();
-    if !done && fill.progress.scope_error.is_none() {
+    if !fill.progress.complete {
         return FillStep::Wrote;
     }
-    submit_and_watch(t, store);
-    FillStep::Complete
-}
-
-/// Submits the fill's writes once and registers one flag-only
-/// completion; its remaining levels are dropped.
-fn submit_and_watch(t: &LabelTarget<'_>, store: &mut LabelStore) {
-    let Some(fill) = store.fill.as_mut() else {
-        return;
-    };
-    fill.progress.complete = true;
-    for l in &mut fill.staged.lines {
-        l.levels = Default::default();
-    }
-    if !fill.progress.wrote {
-        return;
-    }
-    let ((), refused) = skin_atlas::scoped(t.gpu.device(), || {
-        t.gpu.queue().submit([]);
-    });
-    if let Some(e) = refused {
-        fill.progress.scope_error.get_or_insert(e);
-    }
-    #[cfg(test)]
-    {
-        store.steps.push(LabelStep::Submitted);
-        if let Some(f) = t.after_submit {
-            f(t.gpu);
+    if submitted {
+        #[cfg(test)]
+        {
+            store.steps.push(LabelStep::Submitted);
+            if let Some(f) = t.after_submit {
+                f(t.gpu);
+            }
         }
-    }
-    let done = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&done);
-    t.gpu
-        .queue()
-        .on_submitted_work_done(move || flag.store(true, Ordering::Release));
-    if let Some(fill) = store.fill.as_mut() {
+        let done = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&done);
+        queue.on_submitted_work_done(move || flag.store(true, Ordering::Release));
         fill.progress.done = Some(done);
+        #[cfg(test)]
+        store.steps.push(LabelStep::Watched);
     }
+    FillStep::Complete
 }
 
 /// Settles the filling slot at a boundary: polls the device without
@@ -1493,13 +1716,7 @@ pub(crate) fn settle(t: &LabelTarget<'_>, store: &mut LabelStore) -> Result<Sett
         return Err(RenderError::DeviceLost);
     }
     let (slot, generation) = (fill.slot, fill.staged.generation);
-    let refused = match (fill.progress.scope_error, t.region) {
-        (Some(e), _) => Some(RenderError::Atlas(UploadError::Device(e))),
-        (None, None) if !fill.staged.lines.is_empty() => {
-            Some(RenderError::Atlas(UploadError::Side { side: 0, max: 0 }))
-        }
-        (None, _) => None,
-    };
+    let refused = refusal(fill.progress.scope_error, t.region, &fill.staged);
     if let Some(e) = refused {
         lock(&store.book).cancel(slot, generation, false, &mut || {
             Arc::new(AtomicBool::new(true))
@@ -1513,7 +1730,7 @@ pub(crate) fn settle(t: &LabelTarget<'_>, store: &mut LabelStore) -> Result<Sett
     match published {
         Publish::Published => {
             if let Some(c) = store.contents.get_mut(slot) {
-                *c = Some((generation, content));
+                *c = Some((generation, Held::Drawable(content)));
             }
             #[cfg(test)]
             store.steps.push(LabelStep::Published);
@@ -1526,6 +1743,82 @@ pub(crate) fn settle(t: &LabelTarget<'_>, store: &mut LabelStore) -> Result<Sett
         }
         Publish::Unhealthy => Ok(Settled::Unhealthy),
     }
+}
+
+/// Why a fill whose writes completed is refused: a scope's error, or
+/// rasterized lines with no region to write them.
+fn refusal(
+    scope_error: Option<wgpu::Error>,
+    region: Option<LabelRegion>,
+    staged: &StagedLabels,
+) -> Option<RenderError> {
+    match (scope_error, region) {
+        (Some(e), _) => Some(RenderError::Atlas(UploadError::Device(e))),
+        (None, None) if !staged.lines.is_empty() => {
+            Some(RenderError::Atlas(UploadError::Side { side: 0, max: 0 }))
+        }
+        (None, _) => None,
+    }
+}
+
+/// Restores pinned slot `slot`'s content from `staged`, its generation's
+/// strings ([`LabelStore::restore_strings`]) staged again at the current
+/// target, on a renderer built again: every row written at once
+/// (unbudgeted: a rebuild blocks already), the writes waited for, then
+/// installed under the same generation and drawable again, the slot no
+/// longer restoring. Whatever was filling or waiting is dropped first.
+/// `Ok(false)`, nothing written, when `slot` is not restoring at that
+/// generation.
+///
+/// # Errors
+///
+/// As [`settle`]: the poll's failure or the device lost (not refusals),
+/// or a write's refusal or rasterized lines with no region (refusals);
+/// the slot stays restoring, its content not drawable.
+pub(crate) fn restore_pinned(
+    t: &LabelTarget<'_>,
+    store: &mut LabelStore,
+    slot: usize,
+    staged: StagedLabels,
+) -> Result<bool, RenderError> {
+    let generation = staged.generation;
+    if store.restore_strings(slot, generation).is_none()
+        || !lock(&store.book).awaits_restore(slot, generation)
+    {
+        return Ok(false);
+    }
+    store.waiting = None;
+    let complete = staged.lines.is_empty();
+    store.fill = Some(Fill {
+        slot,
+        staged,
+        cursor: Cursor::default(),
+        progress: FillProgress {
+            complete,
+            ..FillProgress::default()
+        },
+    });
+    while write_rows(t, store) == FillStep::Wrote {}
+    let Some(fill) = store.fill.take() else {
+        return Ok(false);
+    };
+    t.gpu
+        .device()
+        .poll(wgpu::PollType::wait_indefinitely())
+        .map_err(RenderError::Poll)?;
+    if t.gpu.lost() {
+        lock(&store.book).set_unhealthy();
+        return Err(RenderError::DeviceLost);
+    }
+    if let Some(e) = refusal(fill.progress.scope_error, t.region, &fill.staged) {
+        return Err(e);
+    }
+    let content = install(t.region, slot, fill.staged);
+    if let Some(c) = store.contents.get_mut(slot) {
+        *c = Some((generation, Held::Drawable(content)));
+    }
+    lock(&store.book).restored(slot, generation);
+    Ok(true)
 }
 
 /// The content of `staged` written in slot `slot`'s band of `region`: a
@@ -1821,6 +2114,93 @@ mod tests {
         assert!(is_ready(&b, s, 1));
         b.reset();
         assert!(is_free(&b, s));
+    }
+
+    /// A pinned slot reset is restoring: retired before its content was
+    /// restored, it is freed at its flag, never ready again; once
+    /// restored, it is ready again at its flag.
+    #[test]
+    fn restoring_pin_never_ready_again_before_its_restore() {
+        let mut flags = Flags::default();
+        let mut b = LabelBook::new(T);
+        let s = ready(&mut b, 1, "a");
+        b.pin(Path::new("a"), 1, 1).unwrap();
+        assert!(!b.awaits_restore(s, 1));
+        b.reset();
+        assert!(b.awaits_restore(s, 1));
+        assert!(!b.awaits_restore(s, 2));
+        b.end(1);
+        b.retire_ended(&mut || flags.watch());
+        assert!(is_cooling(&b, s, CoolFrom::Cancelled));
+        flags.fire(0);
+        b.cool();
+        assert!(is_free(&b, s));
+        assert_eq!(b.pin(Path::new("a"), 1, 2), None);
+        // Restored: no longer restoring, and ready again after its retire.
+        let s = ready(&mut b, 2, "a");
+        b.pin(Path::new("a"), 1, 3).unwrap();
+        b.reset();
+        assert!(b.restored(s, 2));
+        assert!(!b.awaits_restore(s, 2));
+        assert!(!b.restored(s, 2));
+        b.end(3);
+        b.retire_ended(&mut || flags.watch());
+        flags.fire(1);
+        b.cool();
+        assert!(is_ready(&b, s, 2));
+    }
+
+    /// The row rule at each of its edges, from the formula's own numbers:
+    /// `pad(min(1024, ceil(2 em)))` (gutters of 8 on both sides, rounded
+    /// up to 8), rows stacked from 0, `min(side, 4096)` wide, laid out
+    /// within the row less its gutters, and a plan refused only past half
+    /// the layer.
+    #[test]
+    fn row_formula_at_its_edges() {
+        use super::{RowPlan, row_height};
+        use crate::renderer::RenderError;
+        // ceil(2 × 18) = 36, + 16 = 52, up to 56.
+        assert_eq!(row_height(18.0), 56);
+        // 2 × 20 = 40 + 16 = 56 exactly; 20.01 rounds 40.02 up to 41: 64.
+        assert_eq!(row_height(20.0), 56);
+        assert_eq!(row_height(20.01), 64);
+        // 2 × 16.1 = 32.2 → 33 → 49 → 56; 2 × 16 = 32 → 48.
+        assert_eq!(row_height(16.0), 48);
+        assert_eq!(row_height(16.1), 56);
+        // The cap: 2 × 512 = 1 024 → 1 040; more stays at 1 040.
+        assert_eq!(row_height(512.0), 1_040);
+        assert_eq!(row_height(512.5), 1_040);
+        assert_eq!(row_height(4_000.0), 1_040);
+        // No line: only the gutters.
+        assert_eq!(row_height(0.0), 16);
+        assert_eq!(row_height(-3.0), 16);
+        assert_eq!(row_height(f32::NAN), 16);
+
+        let plan = RowPlan::new(&[(3, 18.0), (5, 24.0), (9, 20.01)], 2_048, 12).unwrap();
+        let rows: Vec<_> = plan.rows().iter().map(|r| (r.slot, r.y, r.h)).collect();
+        // 24: 48 + 16 = 64.
+        assert_eq!(rows, [(3, 0, 56), (5, 56, 64), (9, 120, 64)]);
+        assert_eq!(plan.width(), 2_048);
+        let b = plan.bounds(&plan.rows()[1]);
+        assert_eq!((b.w, b.h), (2_032, 48));
+        // The width's cap.
+        let wide = RowPlan::new(&[(0, 18.0)], 8_192, 1).unwrap();
+        assert_eq!(wide.width(), 4_096);
+        assert_eq!(wide.bounds(&wide.rows()[0]).w, 4_080);
+        // The fit: exactly half the layer fits, one row more does not.
+        // Side 2 080: band 1 040, one capped row.
+        assert!(RowPlan::new(&[(0, 600.0)], 2_080, 1).is_ok());
+        let e = RowPlan::new(&[(0, 600.0), (1, 0.0)], 2_080, 2).unwrap_err();
+        assert!(
+            matches!(
+                e,
+                RenderError::LabelRegion {
+                    needed: 1_056,
+                    band: 1_040
+                }
+            ),
+            "{e:?}"
+        );
     }
 
     /// A target change or a rebuild between the claim and the publish:

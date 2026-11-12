@@ -1,30 +1,34 @@
 //! The decision label slots on a device (WARP): the region, the bounded
-//! writes, the completion and its device and key checks, the bitmap-only
-//! path, and a line taller than its row. The book's own transitions are
-//! tested without a device in `decision_labels`.
+//! writes and their scopes, the completion and its device and key checks,
+//! the bitmap-only path, a line taller than its row, a pinned slot's
+//! restore after a reset, and the worker's supersession and drop. The
+//! book's own transitions are tested without a device in
+//! `decision_labels`.
 
 use std::path::PathBuf;
-use std::sync::Arc;
-use std::sync::mpsc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, PoisonError, mpsc};
 use std::time::Duration;
 
 use bms_model::TimeUs;
 use skin_model::{
-    DecisionFrame, DecisionStrings, DecisionTimers, Layout, ResultLabels, ScreenKind,
+    DecisionFrame, DecisionStrings, DecisionTimers, Layout, ResultLabels, ScreenKind, TextRequest,
 };
 
 use super::{RenderError, Renderer};
-use crate::SkinBundle;
 use crate::decision_labels::{
-    DECISION_TEXT_WRITE_BUDGET, FillStep, LabelBook, LabelJob, LabelKey, LabelScratch, LabelState,
-    LabelStep, LabelStore, LabelWorker, Settled, StagedLabels, lock, stage_labels,
+    DECISION_TEXT_WRITE_BUDGET, FillStep, Gen, LabelBook, LabelJob, LabelKey, LabelScratch,
+    LabelState, LabelStep, LabelStore, LabelWorker, Settled, StagedLabels, lock,
+    stage_bundle_labels, stage_labels,
 };
+use crate::decl::AttemptText;
 use crate::font_support::{self, Glyph};
-use crate::outline::TextNote;
+use crate::outline::{LineBounds, LineFit, LineLayout, TextNote, TextResidency};
 use crate::outline_support::{
     Value, bitmap, bitmap_files, decision_bundle_in, decision_folder, default_font, text, ttf,
 };
 use crate::test_common::{offscreen, rgb_at};
+use crate::{SkinBundle, SkinError};
 
 const TARGET: [u32; 2] = [1_920, 1_080];
 /// The title's box, y down: 18 pixels tall, so its em is 18.
@@ -456,4 +460,412 @@ fn decision_rows_refuse_a_misfit() {
         "{e:?}"
     );
     assert!(e.is_refusal());
+}
+
+/// The longest a test waits for another thread before it fails:
+/// `TAPESTRY_TEST_WATCHDOG` seconds, 60 unless set.
+fn watchdog() -> Duration {
+    let secs = std::env::var("TAPESTRY_TEST_WATCHDOG")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(60);
+    Duration::from_secs(secs)
+}
+
+/// The decision frame at 0 of `labels` built and drawn on `r`: the lit
+/// pixels in the title's box.
+fn title_pixels(r: &mut Renderer, b: &SkinBundle, labels: skin_model::DecisionLabels<'_>) -> usize {
+    let skin = Arc::clone(b.skin());
+    let mut dec = skin.prepare_decision();
+    let frame = DecisionFrame {
+        now: TimeUs(0),
+        target: TARGET,
+        layout: &Layout::AUTHOR,
+        timers: DecisionTimers {
+            screen: Some(TimeUs(0)),
+            fadeout: None,
+        },
+    };
+    r.build_decision(&mut dec, labels, &frame).unwrap();
+    r.submit_decision(&[]).unwrap();
+    let pixels = r.read_back();
+    let [x, y, w, h] = TITLE.map(|v| u32::try_from(v).unwrap());
+    (y..y + h)
+        .flat_map(|py| (x..x + w).map(move |px| (px, py)))
+        .filter(|&p| rgb_at(&pixels, TARGET[0], p)[0] > 128)
+        .count()
+}
+
+/// A pinned slot after a reset (the renderer built again, its decision
+/// installation restored on a new array): its content is not drawable,
+/// only its strings are kept, until it is restored on the new renderer
+/// under the same slot and generation; then it draws there.
+#[test]
+fn reset_pinned_slot_draws_only_after_its_restore() {
+    let dir = truetype_skin();
+    let (mut r, b) = installed(&dir);
+    let mut store = store_for();
+    let first = job(&r, 1, "a", "ABC");
+    let slot = publish(&mut r, &b, &mut store, first);
+    lock(store.book())
+        .pin(std::path::Path::new("a"), 1, 7)
+        .unwrap();
+    assert!(store.content(slot, 1).is_some());
+    drop(r);
+    // Built again: a new device, the installation on a new array.
+    let (mut r2, b2) = installed(&dir);
+    store.reset();
+    lock(store.book()).reset();
+    assert!(store.content(slot, 1).is_none(), "no stale table drawn");
+    assert!(store.content_of(slot, 1).is_none());
+    assert!(lock(store.book()).awaits_restore(slot, 1));
+    let strings = store.restore_strings(slot, 1).unwrap().clone();
+    // Not restoring at another generation: nothing written.
+    let other = stage_bundle_labels(&b2, job_of(&r2, 2, "a", strings.clone()))
+        .unwrap()
+        .unwrap();
+    assert!(!r2.restore_decision_labels(&mut store, slot, other).unwrap());
+    assert!(store.content(slot, 1).is_none());
+    let staged = stage_bundle_labels(&b2, job_of(&r2, 1, "a", strings))
+        .unwrap()
+        .unwrap();
+    assert!(
+        r2.restore_decision_labels(&mut store, slot, staged)
+            .unwrap()
+    );
+    let book = lock(store.book());
+    assert!(!book.awaits_restore(slot, 1));
+    assert!(matches!(
+        book.state(slot),
+        Some(LabelState::Pinned {
+            generation: 1,
+            lifetime: 7,
+            restoring: false,
+            ..
+        })
+    ));
+    drop(book);
+    let labels = store.content(slot, 1).unwrap();
+    let lit = title_pixels(&mut r2, &b2, labels);
+    assert!(lit > 50, "the restored title draws: {lit} lit pixels");
+}
+
+/// Every boundary of a fill opens exactly one pair of error scopes, the
+/// last one's submission inside it; one submission and one completion
+/// registered.
+#[test]
+fn one_scope_pair_per_boundary() {
+    let dir = decision_folder(
+        &[("ttf.ttf", font_support::build(&font_support::latin("Skin")))],
+        &[ttf()],
+        &[text("f", 256, Value::Ref(10), [0, 100, 1_900, 256])],
+    );
+    let (mut r, b) = installed(&dir);
+    let mut store = store_for();
+    store.offer(stage(&b, job(&r, 1, "a", "ABCDEFGHIJKLMNOPQRST")));
+    store.claim().unwrap();
+    let mut boundaries = 0;
+    loop {
+        let before = r.decision_scope_pairs.get();
+        let step = r.write_decision_labels(&mut store);
+        boundaries += 1;
+        assert_eq!(
+            r.decision_scope_pairs.get() - before,
+            1,
+            "boundary {boundaries}"
+        );
+        if step == FillStep::Complete {
+            break;
+        }
+    }
+    assert!(boundaries > 1);
+    let count = |step| store.steps.iter().filter(|s| **s == step).count();
+    assert_eq!(count(LabelStep::Submitted), 1);
+    assert_eq!(count(LabelStep::Watched), 1);
+    // A complete fill opens no more.
+    let before = r.decision_scope_pairs.get();
+    assert_eq!(r.write_decision_labels(&mut store), FillStep::Complete);
+    assert_eq!(r.decision_scope_pairs.get(), before);
+}
+
+/// Nothing is published before the completion was seen: a fill whose
+/// completion has not fired stays pending through polls, then publishes.
+#[test]
+fn nothing_published_before_its_completion() {
+    let dir = truetype_skin();
+    let (mut r, b) = installed(&dir);
+    let mut store = store_for();
+    store.offer(stage(&b, job(&r, 1, "a", "AB")));
+    let slot = store.claim().unwrap();
+    fill(&mut r, &mut store);
+    finish(&r);
+    // The completion held back: the test's own flag stands for it.
+    let held = Arc::new(AtomicBool::new(false));
+    store.progress_mut().unwrap().done = Some(Arc::clone(&held));
+    for _ in 0..3 {
+        assert_eq!(
+            r.settle_decision_labels(&mut store).unwrap(),
+            Settled::Pending
+        );
+    }
+    assert!(store.content(slot, 1).is_none());
+    assert!(matches!(
+        lock(store.book()).state(slot),
+        Some(LabelState::Filling { .. })
+    ));
+    held.store(true, Ordering::Release);
+    assert_eq!(
+        r.settle_decision_labels(&mut store).unwrap(),
+        Settled::Published {
+            slot,
+            generation: 1
+        }
+    );
+}
+
+/// A scope that reported an error refuses the fill: nothing published,
+/// the slot freed, a refusal of the kind.
+#[test]
+fn scope_error_refuses_the_fill() {
+    let dir = truetype_skin();
+    let (mut r, b) = installed(&dir);
+    r.decision_in_scope = Some(|gpu| {
+        // Mappable for reading and writing at once: a validation error.
+        let _ = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 4,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE,
+            mapped_at_creation: false,
+        });
+    });
+    let mut store = store_for();
+    store.offer(stage(&b, job(&r, 1, "a", "AB")));
+    let slot = store.claim().unwrap();
+    fill(&mut r, &mut store);
+    assert!(store.progress().unwrap().scope_error.is_some());
+    finish(&r);
+    let e = r.settle_decision_labels(&mut store).unwrap_err();
+    assert!(
+        matches!(e, RenderError::Atlas(crate::UploadError::Device(_))),
+        "{e:?}"
+    );
+    assert!(e.is_refusal());
+    assert!(!store.steps.contains(&LabelStep::Published));
+    assert!(matches!(
+        lock(store.book()).state(slot),
+        Some(LabelState::Free)
+    ));
+    assert!(store.content(slot, 1).is_none());
+}
+
+/// A bitmap-only decision skin: the installation committed with the
+/// title and the artist in a bitmap font.
+fn bitmap_installed() -> (tempfile::TempDir, Renderer, Arc<SkinBundle>) {
+    let dir = decision_folder(
+        &bitmap_files(),
+        &[bitmap()],
+        &[
+            text("g", 8, Value::Ref(10), TITLE),
+            text("g", 8, Value::Ref(16), ARTIST),
+        ],
+    );
+    let (r, b) = installed(&dir);
+    (dir, r, b)
+}
+
+/// The bitmap-only path with the device destroyed before its boundary:
+/// the device's failure, not a refusal, and nothing published.
+#[test]
+fn bitmap_only_prep_with_device_lost_publishes_nothing() {
+    let (_dir, mut r, b) = bitmap_installed();
+    let mut store = store_for();
+    store.offer(stage(&b, job(&r, 1, "a", "AB")));
+    let slot = store.claim().unwrap();
+    assert_eq!(r.write_decision_labels(&mut store), FillStep::Complete);
+    r.gpu.device().destroy();
+    finish(&r);
+    let e = r.settle_decision_labels(&mut store).unwrap_err();
+    assert!(matches!(e, RenderError::DeviceLost), "{e:?}");
+    assert!(!e.is_refusal());
+    assert!(!lock(store.book()).healthy());
+    assert!(store.content(slot, 1).is_none());
+}
+
+/// The bitmap-only path with the target changed before its boundary:
+/// stale, the slot freed.
+#[test]
+fn bitmap_only_prep_on_a_changed_target_is_stale() {
+    let (_dir, mut r, b) = bitmap_installed();
+    let mut store = store_for();
+    store.offer(stage(&b, job(&r, 1, "a", "AB")));
+    let slot = store.claim().unwrap();
+    lock(store.book()).invalidate([1_280, 720]);
+    assert_eq!(r.write_decision_labels(&mut store), FillStep::Complete);
+    assert_eq!(
+        r.settle_decision_labels(&mut store).unwrap(),
+        Settled::Stale
+    );
+    assert!(matches!(
+        lock(store.book()).state(slot),
+        Some(LabelState::Free)
+    ));
+    assert!(store.content(slot, 1).is_none());
+}
+
+/// A wake that reports on a channel.
+fn waker() -> (Arc<dyn Fn() + Send + Sync>, mpsc::Receiver<()>) {
+    let (tx, rx) = mpsc::channel();
+    (
+        Arc::new(move || {
+            let _ = tx.send(());
+        }),
+        rx,
+    )
+}
+
+/// An output taken before a newer job was posted is never claimed, offered
+/// after the post or before it; the newer one is.
+#[test]
+fn output_taken_before_a_newer_post_never_publishes() {
+    let dir = truetype_skin();
+    let (mut r, b) = installed(&dir);
+    let (wake, rx) = waker();
+    let worker = LabelWorker::for_bundle(&b, Some(wake)).unwrap();
+    let mut store = store_for();
+    // Taken, then B posted, then offered.
+    worker.post(job(&r, 1, "a", "AB"));
+    rx.recv_timeout(watchdog()).unwrap();
+    let a = worker.take().unwrap().unwrap();
+    assert!(a.is_current());
+    worker.post(job(&r, 2, "b", "BA"));
+    assert!(!a.is_current());
+    store.offer(a);
+    assert_eq!(store.claim(), None);
+    assert_eq!(store.waiting(), None);
+    // Taken and offered, then C posted, then claimed.
+    rx.recv_timeout(watchdog()).unwrap();
+    let bo = worker.take().unwrap().unwrap();
+    store.offer(bo);
+    worker.post(job(&r, 3, "c", "CA"));
+    assert_eq!(store.claim(), None);
+    rx.recv_timeout(watchdog()).unwrap();
+    store.offer(worker.take().unwrap().unwrap());
+    let slot = store.claim().unwrap();
+    fill(&mut r, &mut store);
+    finish(&r);
+    assert_eq!(
+        r.settle_decision_labels(&mut store).unwrap(),
+        Settled::Published {
+            slot,
+            generation: 3
+        }
+    );
+    assert!(!lock(store.book()).holds(&key("a")));
+    assert!(!lock(store.book()).holds(&key("b")));
+}
+
+/// A worker held between its staging and its last check while a newer
+/// job is posted: the superseded output is never stored, so none is alive
+/// while the newer job's staging is.
+#[test]
+fn superseded_output_never_overlaps_the_next_staging() {
+    let dir = truetype_skin();
+    let (r, b) = installed(&dir);
+    let (at_tx, at_rx) = mpsc::channel::<Gen>();
+    let (go_tx, go_rx) = mpsc::channel::<()>();
+    let go = Mutex::new(go_rx);
+    let hook: Arc<dyn Fn(Gen) + Send + Sync> = Arc::new(move |g| {
+        let _ = at_tx.send(g);
+        let _ = go.lock().unwrap_or_else(PoisonError::into_inner).recv();
+    });
+    let (wake, rx) = waker();
+    let worker = LabelWorker::spawn_hooked(
+        Arc::clone(b.skin()),
+        b.text_producer().cloned(),
+        Some(wake),
+        Some(hook),
+    )
+    .unwrap();
+    worker.post(job(&r, 1, "a", "AB"));
+    assert_eq!(at_rx.recv_timeout(watchdog()).unwrap(), 1);
+    worker.post(job(&r, 2, "b", "BA"));
+    go_tx.send(()).unwrap();
+    // The newer job staged and held: no older output beside it.
+    assert_eq!(at_rx.recv_timeout(watchdog()).unwrap(), 2);
+    assert_eq!(worker.output_generation(), None);
+    go_tx.send(()).unwrap();
+    rx.recv_timeout(watchdog()).unwrap();
+    assert_eq!(worker.take().unwrap().unwrap().generation(), 2);
+}
+
+/// A producer whose first layout reports that it started and waits until
+/// released: a worker held inside a line.
+#[derive(Debug)]
+struct Gated {
+    inner: Arc<dyn AttemptText>,
+    entered: Mutex<Option<mpsc::Sender<()>>>,
+    release: Mutex<Option<mpsc::Receiver<()>>>,
+}
+
+impl AttemptText for Gated {
+    fn layout(&self, req: &TextRequest, em_px: f32, bounds: LineBounds) -> LineFit {
+        let entered = self
+            .entered
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some(tx) = entered {
+            let _ = tx.send(());
+            let release = self
+                .release
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            if let Some(rx) = release {
+                let _ = rx.recv();
+            }
+        }
+        self.inner.layout(req, em_px, bounds)
+    }
+
+    fn raster(&self, layout: &LineLayout, out: &mut [u8]) -> Result<(), SkinError> {
+        self.inner.raster(layout, out)
+    }
+
+    fn resident(&self) -> TextResidency {
+        self.inner.resident()
+    }
+}
+
+/// Dropping a worker held inside a line returns without waiting for the
+/// line, and its thread is joined once the line ends.
+#[test]
+fn dropping_a_worker_inside_a_line_returns_at_once() {
+    let dir = truetype_skin();
+    let (r, b) = installed(&dir);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let producer = Arc::new(Gated {
+        inner: Arc::clone(b.text_producer().unwrap()),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    let worker = LabelWorker::spawn(Arc::clone(b.skin()), Some(producer), None).unwrap();
+    let reaped = worker.reaped();
+    worker.post(job(&r, 1, "a", "AB"));
+    entered_rx.recv_timeout(watchdog()).unwrap();
+    let (dropped_tx, dropped_rx) = mpsc::channel();
+    let dropper = std::thread::spawn(move || {
+        drop(worker);
+        let _ = dropped_tx.send(());
+    });
+    let dropped = dropped_rx.recv_timeout(watchdog());
+    let _ = release_tx.send(());
+    dropper.join().unwrap();
+    assert!(dropped.is_ok(), "the drop waited for the line");
+    let (m, cv) = &*reaped;
+    let joined = cv
+        .wait_timeout_while(m.lock().unwrap(), watchdog(), |j| !*j)
+        .unwrap();
+    assert!(*joined.0, "the thread was joined");
 }

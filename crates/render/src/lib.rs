@@ -74,7 +74,7 @@ pub use decision_labels::{
     CoolFrom, DECISION_TEXT_WRITE_BUDGET, DecisionMemory, FillProgress, FillStep, Gen, LABEL_SLOTS,
     LabelBook, LabelContent, LabelJob, LabelKey, LabelOutput, LabelRow, LabelScratch, LabelState,
     LabelStore, LabelWorker, Publish, RowPlan, Settled, StagedLabels, Watch, lock, row_height,
-    stage_labels,
+    stage_bundle_labels, stage_labels,
 };
 pub use decl::{
     AttemptText, BundleError, DeclSkin, Installation, LoadingPresentation, SkinBundle, pages_bytes,
