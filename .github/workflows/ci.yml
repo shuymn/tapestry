@@ -158,7 +158,7 @@ jobs:
       # "Scope of No Allocation"); after the production build, whose release
       # dependencies it reuses.
       - name: Render staging allocation test (release)
-        run: mise exec -- cargo test --release --locked -p render --test alloc
+        run: mise exec -- cargo test --release --locked -p render --test alloc --test decision_build_alloc
       # The loader's chart ceiling (design.md "Memory Budget"): one ignored
       # measurement, run alone in the release profile it is sized for.
       - name: Chart memory ceiling (release)

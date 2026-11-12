@@ -388,6 +388,9 @@ pub const IN_PLAY: &[Site] = &[
     ),
     Site::File("crates/player/src/audio_side.rs"),
     // The render thread's frame.
+    // The decision label slots: a frame borrows a slot's content, and the
+    // boundary's writes and settling run beside the frames.
+    Site::File("crates/render/src/decision_labels.rs"),
     Site::File("crates/render/src/decl.rs"),
     Site::File("crates/render/src/measure.rs"),
     Site::File("crates/render/src/overlay.rs"),
@@ -420,6 +423,8 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/select/schema.rs"),
     Site::File("crates/skin-model/src/result/mod.rs"),
     Site::File("crates/skin-model/src/result/schema.rs"),
+    // The decision screen's timers and the labels a build borrows.
+    Site::File("crates/skin-model/src/decision/mod.rs"),
     // The master gain a selection frame shows, from the gain that plays.
     Site::Fns(
         "crates/skin-model/src/selection.rs",

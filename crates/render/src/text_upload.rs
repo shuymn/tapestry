@@ -297,6 +297,42 @@ pub(crate) fn prepare(
     Ok((TextTable::new(lines), holder, report))
 }
 
+/// One line's RGBA levels for a fixed place of exactly its padded size
+/// (a decision label's row, [`crate::decision_labels`]): `line`
+/// rasterized into `scratch`'s A8 buffer, expanded as [`prepare`] expands
+/// a line into a rectangle of `pad(size)` (each side with its gutters,
+/// rounded up to the mips' alignment), with mips 1 to 3. Returns that
+/// size and the levels, taken from the scratch, which keeps its A8 buffer
+/// for the next line. Preparation work: it allocates.
+///
+/// # Errors
+///
+/// The producer's refusal of the line.
+pub(crate) fn line_levels(
+    producer: &dyn AttemptText,
+    line: &crate::outline::LineLayout,
+    scratch: &mut TextScratch,
+) -> Result<([u32; 2], [Vec<u8>; MIP_LEVELS]), crate::SkinError> {
+    rasterize(producer, line, scratch)?;
+    let size = line.size.map(padded_side);
+    let [w, h] = size;
+    expand(scratch, [0, 0, w, h], line.size);
+    Ok((size, std::mem::take(&mut scratch.rgba)))
+}
+
+/// A line's side `v` with its gutters, rounded up to the mips'
+/// alignment: the side of its rectangle.
+pub(crate) const fn padded_side(v: u32) -> u32 {
+    let align = skin_model::ALIGN;
+    (v + 2 * GUTTER).div_ceil(align) * align
+}
+
+/// The A8 buffer's bytes: a decision worker's scratch, counted in its own
+/// term ([`crate::decision_labels`]).
+pub(crate) fn a8_bytes(scratch: &TextScratch) -> u64 {
+    u64::try_from(scratch.a8.capacity()).unwrap_or(u64::MAX)
+}
+
 /// Rasterizes `line` into the scratch's A8 buffer, zeroed first.
 fn rasterize(
     producer: &dyn AttemptText,
@@ -356,7 +392,7 @@ fn expand(scratch: &mut TextScratch, rect: [u32; 4], [w, h]: [u32; 2]) {
 
 /// A row of `w` RGBA texels padded to `COPY_BYTES_PER_ROW_ALIGNMENT`, as
 /// the queue stages it.
-fn padded(w: u32) -> u64 {
+pub(crate) fn padded(w: u32) -> u64 {
     let row = u64::from(w) * 4;
     let align = u64::from(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT);
     row.div_ceil(align) * align
@@ -364,7 +400,7 @@ fn padded(w: u32) -> u64 {
 
 /// Writes `bytes`, a `w` × `h` RGBA rectangle, at `(x, y)` of `layer`'s
 /// level `level`.
-fn write(
+pub(crate) fn write(
     queue: &wgpu::Queue,
     texture: &wgpu::Texture,
     layer: u32,
