@@ -2186,8 +2186,10 @@ enum PageBegin {
 
 impl PlayerRig<'_> {
     /// The decision lifetime the choice claimed ended (its step, the
-    /// practice page's entry, a leave): the label book is told, so the
-    /// render thread retires its pinned slot at its next boundary.
+    /// practice page's entry, a leave, the chart left after a refusal):
+    /// the label book is told, so the render thread retires its pinned
+    /// slot at its next boundary. Once per claim; a lifetime a look inside
+    /// a rig's wait ended already is ended again with no effect.
     fn end_decision(&mut self) {
         if let Some(claim) = self.decision_claim.take() {
             self.render.end_decision(claim.lifetime);
@@ -2707,15 +2709,21 @@ impl AppRig for PlayerRig<'_> {
         lifetime: game::DecisionLifetime,
     ) -> Option<game::DecisionShown> {
         let (Pick::Play(chart) | Pick::Practice(chart)) = pick;
-        // The chart's labels as the cursor's preparation asked for them.
-        let revision = self
+        // The chart's labels as the cursor's preparation asked for them:
+        // their revision, and their strings, which the slot pinned must
+        // have been prepared from.
+        let labels = self
             .selection
             .as_ref()
             .and_then(|s| s.screen.selected())
             .filter(|e| e.path == *chart)
-            .map(|e| crate::decision_side::labels_revision(&decision_labels(&e.header)));
-        let pinned =
-            revision.and_then(|revision| self.render.pin_decision(chart, revision, lifetime.0));
+            .map(|e| decision_labels(&e.header));
+        let pinned = labels.and_then(|l| {
+            let strings = crate::decision_side::decision_strings(&l);
+            let revision = crate::decision_side::labels_revision(&l);
+            self.render
+                .pin_decision(chart, revision, &strings, lifetime.0)
+        });
         let (slot, shown, timing) = match pinned {
             Some((slot, generation, timing)) => (
                 Some((slot, generation)),
@@ -2962,6 +2970,8 @@ impl AppRig for PlayerRig<'_> {
     /// nowhere (design.md "Load Pipeline"), but a panic one published
     /// meanwhile that a Start was responsible for, which ends the run.
     fn left_chart(&mut self) -> Result<(), game::LiveError<ScreenError>> {
+        // A leave ends the decision lifetime, whichever way it went.
+        self.end_decision();
         // Its images' job was cancelled with the choice's scope below; its
         // set is never taken, nor drawn.
         self.chart_images.forget();
@@ -4384,7 +4394,7 @@ pub(crate) mod tests {
 
     /// O6 inside a rig's wait: a takeover of the skinned screen's lifetime
     /// left by the render thread while the choice's own wait (its entry
-    /// fence, held on the input thread) serves the screen is applied
+    /// fence, held at the input thread's gate) serves the screen is applied
     /// there, to the decision the wait watches, with no look of App's: it
     /// comes back with the built-in presentation and the deadline 1,500 ms
     /// from the original choice.
@@ -4418,14 +4428,17 @@ pub(crate) mod tests {
                     }),
                     false,
                 );
-                rig.render
-                    .recovery_handle()
-                    .leave_takeover(game::DecisionTakeover {
+                // Left once the input thread holds the entry's fence: the
+                // wait is serving the screen, and only its looks can take
+                // it.
+                let handle = rig.render.recovery_handle();
+                let leave = move |_: &crate::controls::Controls| {
+                    handle.leave_takeover(game::DecisionTakeover {
                         lifetime,
                         at: origin,
                         why: "refused".to_owned(),
                     });
-                let nothing = |_: &crate::controls::Controls| {};
+                };
                 let taken = |c: &crate::controls::Controls| {
                     c.with_watched(|d| {
                         d.is_none_or(|d| d.shown() == Some(game::DecisionShown::BuiltIn))
@@ -4435,7 +4448,7 @@ pub(crate) mod tests {
                     rig,
                     &game::Pick::Play(chart.clone()),
                     decision,
-                    Some((&nothing, &taken)),
+                    Some((&leave, &taken)),
                 );
                 assert_eq!(d.shown(), Some(game::DecisionShown::BuiltIn));
                 assert_eq!(d.deadline(), Some(TimeUs(origin.0 + 1_500_000)));

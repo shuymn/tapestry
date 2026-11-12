@@ -80,6 +80,19 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// The strings a decision skin shows of a chart's labels, as a
+/// preparation is asked for them and the choice compares them.
+#[must_use]
+pub fn decision_strings(l: &skin_model::ChartLabels) -> DecisionStrings {
+    DecisionStrings::new(&ResultLabels {
+        title: l.title.clone(),
+        subtitle: l.subtitle.clone(),
+        artist: l.artist.clone(),
+        subartist: l.subartist.clone(),
+        genre: l.genre.clone(),
+    })
+}
+
 /// The cursor's chart in `view` and its labels' revision; `None` on any
 /// other row. Allocates nothing.
 fn cursor_chart(view: &SelectionView) -> Option<(&Path, u64)> {
@@ -101,13 +114,7 @@ pub fn update_want(want: &mut Option<Want>, view: &SelectionView) {
     let Some(l) = view.selected.as_ref().map(|s| &s.labels) else {
         return;
     };
-    let strings = DecisionStrings::new(&ResultLabels {
-        title: l.title.clone(),
-        subtitle: l.subtitle.clone(),
-        artist: l.artist.clone(),
-        subartist: l.subartist.clone(),
-        genre: l.genre.clone(),
-    });
+    let strings = decision_strings(l);
     if want
         .as_ref()
         .is_some_and(|w| w.chart == chart && w.revision == revision && w.strings == strings)
@@ -170,6 +177,31 @@ fn held(
     out
 }
 
+/// The strings each label slot's generation was prepared from, as the
+/// render thread recorded them when it claimed the slot for that
+/// generation: what the choice compares the chosen chart's strings with
+/// before it pins a slot whose labels' revision matches (equal digests of
+/// other labels), on the game thread, where the slots' contents are not.
+pub type PreparedStrings = Mutex<[Option<(Gen, DecisionStrings)>; LABEL_SLOTS]>;
+
+/// Whether slot `slot` holds `strings` at `generation` in `prepared`.
+#[must_use]
+pub fn prepared_holds(
+    prepared: &PreparedStrings,
+    slot: usize,
+    generation: Gen,
+    strings: &DecisionStrings,
+) -> bool {
+    prepared
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(slot)
+        .is_some_and(|p| {
+            p.as_ref()
+                .is_some_and(|(g, s)| *g == generation && s == strings)
+        })
+}
+
 /// What a frame boundary's work came to.
 #[derive(Debug)]
 pub enum Boundary {
@@ -205,6 +237,9 @@ pub struct DecisionSide {
     plan: Option<Arc<RowPlan>>,
     /// The key and strings last asked of the worker, until superseded.
     posted: Option<(LabelKey, DecisionStrings)>,
+    /// The strings each slot's generation was prepared from, shared with
+    /// the choice.
+    pub prepared: Arc<PreparedStrings>,
     /// The next preparation's generation.
     next: Gen,
     /// Refused while a lifetime was active: no request is posted, and it
@@ -253,6 +288,7 @@ impl DecisionSide {
             store: LabelStore::new(Arc::clone(book)),
             plan: None,
             posted: None,
+            prepared: Arc::default(),
             next,
             retiring: false,
             #[cfg(test)]
@@ -407,6 +443,7 @@ impl DecisionSide {
             }
         }
         self.store.claim();
+        self.note_filling();
         screen.write_decision_labels(&mut self.store);
         let settled = screen.settle_decision_labels(&mut self.store);
         self.store.prune();
@@ -414,6 +451,27 @@ impl DecisionSide {
             Ok(_) => Boundary::Quiet,
             Err(e) if e.is_refusal() => Boundary::Refused(e),
             Err(e) => Boundary::Failed(e),
+        }
+    }
+
+    /// The filling slot's generation, the one posted last, noted with the
+    /// strings it was asked with before it can be published.
+    fn note_filling(&self) {
+        let (Some((slot, generation)), Some((_, strings))) = (self.store.filling(), &self.posted)
+        else {
+            return;
+        };
+        if generation.saturating_add(1) != self.next {
+            return;
+        }
+        let mut prepared = self
+            .prepared
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(p) = prepared.get_mut(slot)
+            && p.as_ref().is_none_or(|(g, _)| *g != generation)
+        {
+            *p = Some((generation, strings.clone()));
         }
     }
 

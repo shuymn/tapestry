@@ -160,10 +160,13 @@ struct Seen {
     /// The settlings `hold_settle` skipped.
     skipped_settles: AtomicU32,
     /// Each skin frame's time and its input and fade-out timers' starts.
-    timers: Mutex<Vec<(TimeUs, Option<TimeUs>, Option<TimeUs>)>>,
+    timers: Mutex<Vec<FrameTimers>>,
     lit: Mutex<Vec<(u64, usize)>>,
     drew: Mutex<Vec<Drew>>,
 }
+
+/// A skin frame's time and its input and fade-out timers' starts.
+type FrameTimers = (TimeUs, Option<TimeUs>, Option<TimeUs>);
 
 impl Seen {
     fn skins(&self, from: usize) -> usize {

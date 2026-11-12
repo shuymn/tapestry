@@ -100,6 +100,15 @@ impl Flow {
 ///
 /// [`Recorder`]: super::Recorder
 fn flow<R>(dir: &TempDir, f: impl FnOnce(&mut PlayerRig<'_>, &Flow) -> R) -> R {
+    flow_with(|clock| Rig::on(dir, clock), f)
+}
+
+/// [`flow`] on the render thread `rig` makes on the clock it is given,
+/// its decision skin committed as it chose.
+fn flow_with<R>(
+    rig: impl FnOnce(input::QpcClock) -> Rig,
+    f: impl FnOnce(&mut PlayerRig<'_>, &Flow) -> R,
+) -> R {
     let clock = input::QpcClock::start();
     let Rig {
         link,
@@ -107,7 +116,7 @@ fn flow<R>(dir: &TempDir, f: impl FnOnce(&mut PlayerRig<'_>, &Flow) -> R) -> R {
         book,
         extent,
         _turn: turn,
-    } = Rig::on(dir, clock);
+    } = rig(clock);
     let charts = tempfile::tempdir().unwrap();
     let (mut sel, roots) = crate::selection::tests::tree(charts.path(), &[&["a.bms"]]);
     assert!(sel.screen.select_path(&roots[0].join("a.bms")));
@@ -530,4 +539,241 @@ fn same_chart_chosen_again_without_cursor_move_draws_skin() {
         assert!(wait_until(|| skins_after(&f.seen, from) >= 3));
         assert_eq!(rig.render.take_decision_refusal(), None);
     });
+}
+
+/// The labels' strings: a choice whose chart and labels' revision match a
+/// ready slot prepared from other strings (equal digests of other labels)
+/// does not pin it: the built-in presentation for 1,500 ms, the lifetime
+/// active all the same and the slot still ready.
+#[test]
+fn choice_of_other_strings_under_an_equal_digest_draws_builtin() {
+    let dir = listed();
+    flow(&dir, |rig, f| {
+        f.prepared();
+        let (slot, generation) = f.ready().unwrap();
+        // The slot's generation as if prepared from other labels whose
+        // digest is the chart's.
+        {
+            let prepared = rig.render.prepared_strings();
+            let mut p = prepared.lock().unwrap();
+            let other = crate::decision_side::decision_strings(&skin_model::ChartLabels {
+                title: "Other".to_owned(),
+                ..skin_model::ChartLabels::default()
+            });
+            p[slot] = Some((generation, other));
+        }
+        let d = choose(rig, &f.pick(false), 3);
+        assert_eq!(
+            d.shown(),
+            Some(DecisionShown::BuiltIn),
+            "pinned other labels"
+        );
+        assert_eq!(d.deadline(), Some(TimeUs(d.origin().0 + 1_500 * MS)));
+        assert_eq!(f.pinned(), None);
+        assert_eq!(f.ready(), Some((slot, generation)));
+        assert_eq!(lock(&f.book).active(), Some(3));
+    });
+}
+
+/// R5.1 (stage3's list) on the play path: the skinned screen follows its
+/// own time whether the chart's load reached its last stage before the
+/// scene ended or after the step: no loading frame before the step at
+/// 3,000 ms, loading frames after it and no skin frame.
+#[test]
+fn chart_ready_before_and_after_scene_both_reach_loading() {
+    use crate::loading_text::Stage;
+    for before in [true, false] {
+        let dir = listed();
+        flow(&dir, |rig, f| {
+            f.prepared();
+            let mut d = choose(rig, &f.pick(false), 3);
+            assert!(matches!(d.shown(), Some(DecisionShown::Skin { .. })));
+            let origin = d.origin();
+            let page = rig.selection.as_ref().unwrap().loading.clone().unwrap();
+            let loading = rig.render.loading_drawn();
+            assert!(wait_until(|| skins_after(&f.seen, 0) > 0));
+            if before {
+                until_clock(rig, TimeUs(origin.0 + 1_000 * MS));
+                crate::selection::show_stage(&rig.render, Some(&page), Stage::Screen);
+                let from = f.seen.skins(0);
+                assert!(wait_until(|| skins_after(&f.seen, 0) > from + 2));
+                assert_eq!(
+                    rig.render.loading_drawn(),
+                    loading,
+                    "{before}: loading early"
+                );
+            }
+            let end = d.deadline().unwrap();
+            assert_eq!(end, TimeUs(origin.0 + 3_000 * MS));
+            assert_eq!(
+                d.classify(Origin::Ready, end, false, false, None),
+                Verdict::Step
+            );
+            rig.deadline_step();
+            if !before {
+                crate::selection::show_stage(&rig.render, Some(&page), Stage::Screen);
+            }
+            assert!(
+                wait_until(|| rig.render.loading_drawn() > loading + 2),
+                "{before}: no loading"
+            );
+            let from = f.seen.len();
+            let drawn = rig.render.loading_drawn();
+            assert!(wait_until(|| rig.render.loading_drawn() > drawn + 2));
+            assert_eq!(
+                skins_after(&f.seen, from),
+                0,
+                "{before}: the skin after the step"
+            );
+        });
+    }
+}
+
+/// Startup's kinds on `rig`'s render thread, the decision kind's from
+/// `choice` through production's build and every other kind's a built
+/// bundle: the full configured set of song selection.
+fn configured(rig: &Rig, choice: &game::SkinChoice) -> crate::imports::Started {
+    use crate::imports::{Build, KindOutcome, Launch, Summary, build, startup};
+    use skin_model::ScreenKind;
+    let built: Build = Arc::new(|kind, choice, autoplay, target, cancel| match kind {
+        ScreenKind::Decision => build(kind, choice, autoplay, target, cancel),
+        _ => KindOutcome::Bundle(
+            crate::render_side::tests::bundle(),
+            Summary {
+                sources: vec!["s.json".to_owned()],
+                files: Vec::new(),
+                usage: skin_beatoraja::Usage::default(),
+                notes: Vec::new(),
+                suppressed: 0,
+                chart_layer: None,
+            },
+            crate::screens::ScriptSlot::default(),
+        ),
+    });
+    let choices = game::SkinChoices {
+        play: Some(choice.clone()),
+        selection: Some(choice.clone()),
+        decision: Some(choice.clone()),
+        result: Some(choice.clone()),
+    };
+    startup(
+        &rig.link,
+        &choices,
+        Launch::Selection,
+        false,
+        &built,
+        || false,
+    )
+    .unwrap()
+}
+
+/// A Lua decision skin with [`skin_dir`]'s font and labels, declaring the
+/// 2,500 / 500 / 500 ms timing.
+fn lua_skin_dir() -> TempDir {
+    let dir = skin_dir();
+    let flip = |y: i32, h: i32| 1_080 - y - h;
+    let entry = format!(
+        "local skin = {{ type = 6, name = \"t\", w = 1920, h = 1080 }}\n\
+         if not skin_config then return skin end\n\
+         skin.scene = 2500 skin.input = 500 skin.fadeout = 500\n\
+         skin.font = {{ {{ id = \"f\", path = \"ttf.ttf\" }} }}\n\
+         skin.text = {{ {{ id = \"t0\", font = \"f\", size = 18, ref = 10 }},\n\
+         {{ id = \"t1\", font = \"f\", size = 18, ref = 16 }} }}\n\
+         skin.destination = {{\n\
+         {{ id = \"t0\", dst = {{ {{ x = 100, y = {t0}, w = 1200, h = 18 }} }} }},\n\
+         {{ id = \"t1\", dst = {{ {{ x = 100, y = {t1}, w = 1200, h = 18 }} }} }} }}\n\
+         return skin\n",
+        t0 = flip(100, 18),
+        t1 = flip(600, 18),
+    );
+    std::fs::write(dir.path().join("s.luaskin"), entry).unwrap();
+    dir
+}
+
+/// R6.3 (C14): self-made JSON and Lua decision skins, each the decision
+/// kind of the full configured set installed by startup through
+/// production's build, draw through production: the set installed with no
+/// notice, the result kind's skin fixed, the choice pinning the chart's
+/// labels with the declared timing and the title drawn lit from them. A
+/// decision skin the render thread refuses (its labels' rows do not fit
+/// the region) leaves the run's notice, and its choice draws the built-in
+/// presentation for 1,500 ms.
+#[test]
+fn decision_skin_json_and_lua_draw_through_production() {
+    use crate::render_outline::{Value, decision_folder, text, ttf};
+    // The Lua skin's VMs count, and are held, with the hooks' tests'.
+    let _serial = crate::imports::tests::serial();
+    let json = listed();
+    let lua = lua_skin_dir();
+    for (dir, entry) in [(&json, "s.json"), (&lua, "s.luaskin")] {
+        let choice = crate::imports::tests::choice(dir.path(), entry);
+        let started = std::cell::RefCell::new(None);
+        flow_with(
+            |clock| {
+                let rig = Rig::bare(clock);
+                *started.borrow_mut() = Some(configured(&rig, &choice));
+                rig
+            },
+            |rig, f| {
+                let started = started.borrow_mut().take().unwrap();
+                assert_eq!(started.notice, None, "{entry}");
+                assert!(
+                    matches!(
+                        started.result,
+                        Some(crate::result_skin::ResultStart::Fixed(..))
+                    ),
+                    "{entry}"
+                );
+                assert_eq!(rig.render.take_decision_refusal(), None, "{entry}");
+                f.prepared();
+                let d = choose(rig, &f.pick(false), 3);
+                assert!(
+                    matches!(
+                        d.shown(),
+                        Some(DecisionShown::Skin { scene, fadeout, .. })
+                            if scene == TimeUs(2_500 * MS) && fadeout == TimeUs(500 * MS)
+                    ),
+                    "{entry}: {:?}",
+                    d.shown()
+                );
+                assert!(wait_until(|| skins_after(&f.seen, 0) > 0), "{entry}");
+                f.seen.probe.store(true, Ordering::Release);
+                assert!(wait_until(|| !f.seen.lit.lock().unwrap().is_empty()));
+                let lit = f.seen.lit.lock().unwrap()[0].1;
+                assert!(lit > 0, "{entry}: the title not drawn");
+            },
+        );
+    }
+    // A real render refusal: three labels at em 256 do not fit the region.
+    let misfit = decision_folder(
+        &[(
+            "ttf.ttf",
+            crate::font_support::build(&crate::font_support::latin("Skin")),
+        )],
+        &[ttf()],
+        &[
+            text("f", 256, Value::Ref(10), [0, 0, 100, 256]),
+            text("f", 256, Value::Ref(11), [0, 300, 100, 256]),
+            text("f", 256, Value::Ref(16), [0, 600, 100, 256]),
+        ],
+    );
+    let choice = crate::imports::tests::choice(misfit.path(), "s.json");
+    flow_with(
+        |clock| {
+            let rig = Rig::bare(clock);
+            let started = configured(&rig, &choice);
+            assert_eq!(started.notice, None);
+            rig
+        },
+        |rig, f| {
+            let notice = rig.render.take_decision_refusal().expect("the notice");
+            assert!(notice.contains("rows"), "{notice}");
+            let d = choose(rig, &f.pick(false), 3);
+            assert_eq!(d.shown(), Some(DecisionShown::BuiltIn));
+            assert_eq!(d.deadline(), Some(TimeUs(d.origin().0 + 1_500 * MS)));
+            let from = f.seen.len();
+            assert!(wait_until(|| f.seen.len() > from + 2));
+            assert_eq!(skins_after(&f.seen, 0), 0);
+        },
+    );
 }

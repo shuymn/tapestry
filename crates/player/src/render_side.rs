@@ -1261,6 +1261,9 @@ struct Shared {
     /// The decision labels' slot states: the render thread prepares them,
     /// the game thread pins one at the choice.
     labels: Arc<Mutex<render::LabelBook>>,
+    /// The strings each label slot's generation was prepared from, which
+    /// the choice compares before it pins.
+    prepared: Arc<crate::decision_side::PreparedStrings>,
     /// The active decision lifetime's takeover, until the game thread
     /// takes it ([`RenderLink::take_decision_takeover`]).
     decision_takeover: Mutex<Option<game::DecisionTakeover>>,
@@ -1354,6 +1357,7 @@ impl Shared {
             selection: Mutex::new(SelectionSlot::default()),
             selection_refused: Mutex::new(None),
             labels: render::LabelBook::shared([1_920, 1_080]),
+            prepared: Arc::default(),
             decision_takeover: Mutex::new(None),
             decision_refused: Mutex::new(None),
             game_wake: GameWake::default(),
@@ -2818,19 +2822,40 @@ impl RenderLink {
         Arc::clone(&self.shared.labels)
     }
 
-    /// The choice of `chart`, its labels at `revision`, in decision
-    /// lifetime `lifetime` (design.md "Play Lifecycle", the decision
-    /// screen): the ready label slot holding them pinned and the lifetime
-    /// made the active one in one lock, without waiting for any
+    /// The choice of `chart`, its labels `strings` at `revision`, in
+    /// decision lifetime `lifetime` (design.md "Play Lifecycle", the
+    /// decision screen): the ready label slot holding them pinned and the
+    /// lifetime made the active one in one lock, without waiting for any
     /// preparation; its slot, generation and the skin's timing. None, with
-    /// nothing changed, when none is ready or the device is not healthy.
+    /// nothing changed, when none is ready, the ready slot of that
+    /// revision was prepared from other strings (equal digests of other
+    /// labels), or the device is not healthy.
     pub fn pin_decision(
         &self,
         chart: &std::path::Path,
         revision: u64,
+        strings: &skin_model::DecisionStrings,
         lifetime: u64,
     ) -> Option<(usize, render::Gen, skin_model::DecisionTiming)> {
-        render::lock(&self.shared.labels).pin(chart, revision, lifetime)
+        let mut book = render::lock(&self.shared.labels);
+        // The slot the pin takes: the first ready one of that revision.
+        let (slot, generation) = (0..render::LABEL_SLOTS).find_map(|i| match book.state(i) {
+            Some(render::LabelState::Ready {
+                generation, key, ..
+            }) if key.chart == chart && key.revision == revision => Some((i, *generation)),
+            _ => None,
+        })?;
+        if !crate::decision_side::prepared_holds(&self.shared.prepared, slot, generation, strings) {
+            return None;
+        }
+        book.pin(chart, revision, lifetime)
+    }
+
+    /// The strings the label slots were prepared from, as the choice reads
+    /// them (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn prepared_strings(&self) -> Arc<crate::decision_side::PreparedStrings> {
+        Arc::clone(&self.shared.prepared)
     }
 
     /// Decision lifetime `lifetime` begins with no slot pinned (the
@@ -6743,7 +6768,10 @@ impl Run {
             self.decision_next,
             screen,
         ) {
-            Ok(side) => self.decision_side = Some(side),
+            Ok(mut side) => {
+                side.prepared = Arc::clone(&self.shared.prepared);
+                self.decision_side = Some(side);
+            }
             Err(why) => self.disable_decision(why),
         }
     }
