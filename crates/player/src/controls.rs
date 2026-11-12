@@ -56,6 +56,9 @@ pub struct DecisionWatch {
     pub reveal: Box<dyn Fn() + Send + Sync>,
     /// The rig's thread failures, as the rig itself reads them.
     pub failures: crate::failures::Failures,
+    /// The screen, built again from the wait's looks when it was lost
+    /// ([`crate::render_side::RecoveryHandle::look`]); none: not served.
+    pub screen: Option<crate::render_side::RecoveryHandle>,
 }
 
 impl std::fmt::Debug for DecisionWatch {
@@ -420,6 +423,10 @@ impl Controls {
         }
         if seen.leaves() {
             w.decision.leave(seen);
+        } else if let Some(screen) = &w.screen {
+            // A screen lost meanwhile is built again from here; the flow
+            // takes the rebuild over, or its failure, at its next look.
+            screen.look();
         }
         Some(seen)
     }
@@ -758,6 +765,7 @@ mod tests {
                         reveals.fetch_add(1, Ordering::SeqCst);
                     }),
                     failures: failures.clone(),
+                    screen: None,
                 }
             };
             c.close_epoch();

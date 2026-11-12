@@ -87,8 +87,8 @@ struct Faults {
     /// At each status publication, after a frame's cleanup: the frames
     /// submitted and the presents the render thread had timed.
     cleanups: Mutex<Vec<(u64, u64)>>,
-    /// The next chart load fails as a lost device.
-    fail_load: AtomicBool,
+    /// The next this many chart loads fail as a lost device.
+    fail_load: std::sync::atomic::AtomicU32,
     /// The next play selection releases the result's installation, then
     /// fails as a lost device (as play's admission releases it first).
     release_then_fail: AtomicBool,
@@ -132,7 +132,12 @@ impl Screen for Recorded {
         chart: &bms_model::Chart,
         section: Option<&eval::Section>,
     ) -> Result<(), render::RenderError> {
-        if self.faults.fail_load.swap(false, Ordering::AcqRel) {
+        if self
+            .faults
+            .fail_load
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1))
+            .is_ok()
+        {
             return Err(render::RenderError::SurfaceLost);
         }
         if self
@@ -1384,9 +1389,10 @@ fn a_restore_refusal_stands_when_the_build_fails() {
     });
     assert!(wait_until(|| rig.link.failed()));
     rig.faults.refuse_restore.store(true, Ordering::Release);
-    rig.faults.fail_load.store(true, Ordering::Release);
+    // The load and its rebuild with the chart both lost.
+    rig.faults.fail_load.store(2, Ordering::Release);
     // The screen built again with the chart: the result's restore
-    // refused, then the chart's load fails.
+    // refused, then the chart's load fails, twice.
     assert!(rig.link.load(Arc::clone(&chart), None).is_err());
     rig.faults.refuse_restore.store(false, Ordering::Release);
     rig.link.load(chart, None).unwrap();
