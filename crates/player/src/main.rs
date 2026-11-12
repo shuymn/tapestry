@@ -926,7 +926,7 @@ fn rig<'a>(
         times: LoadTimes::default(),
         ready_state_at: None,
         origin: None,
-        declared_close: None,
+        declared: crate::render_side::Declared::default(),
         steps,
         steps_dropped: 0,
         figures: None,
@@ -2615,16 +2615,21 @@ mod tests {
         }
     }
 
-    /// The rig answers the Closing duration the play skin declares from
-    /// the attempt's commit receipt: none before the first commit, the
-    /// committed skin's after it. The attempt is prepared as the flow
+    /// The rig answers the Closing duration and the play's ending the play
+    /// skin declares from the attempt's commit receipt: none before the
+    /// first commit, the committed skin's after it. The attempt is prepared as the flow
     /// prepares it: ready, its handle holds the screen's inputs it was
     /// staged with, and its final readiness is ready.
     #[cfg(feature = "dev-tools")]
     #[test]
     fn the_rig_declares_the_committed_skins_close() {
+        use bms_model::TimeUs;
         use game::Rig as _;
-        let three = Some(bms_model::TimeUs(3_000_000));
+        let three = Some(TimeUs(3_000_000));
+        let ending = skin_model::PlayEnding {
+            finish_margin: TimeUs(3_000_000),
+            fadeout: TimeUs(1_000_000),
+        };
         let dir = tempfile::tempdir().unwrap();
         let root = game::DataRoot::new(dir.path().join("loaded"));
         let settings = game::Settings {
@@ -2655,10 +2660,10 @@ mod tests {
         .unwrap();
         let render = crate::render_side::tests::Installers::default().spawn(
             &Arc::new(loaded.chart().clone()),
-            &crate::render_side::tests::bundle_closing(three),
+            &crate::render_side::tests::bundle_ending(three, None, ending),
         );
         let (declared, _) = on_rig_with(settings, render, |rig, _| {
-            let before = rig.declared_close();
+            let before = (rig.declared_close(), rig.declared_ending());
             let mut handle = rig.begin_preparation(&loaded, loaded.prep_key());
             assert_eq!(handle.key().screen(), None);
             let ended = loop {
@@ -2680,9 +2685,21 @@ mod tests {
                 game::Readiness::Ready
             ));
             rig.commit_attempt().unwrap();
-            (before, rig.declared_close())
+            (before, (rig.declared_close(), rig.declared_ending()))
         });
-        assert_eq!(declared, (None, three));
+        assert_eq!(
+            declared,
+            (
+                (None, game::PlayEnding::NONE),
+                (
+                    three,
+                    game::PlayEnding {
+                        finish_margin: TimeUs(3_000_000),
+                        fadeout: TimeUs(1_000_000),
+                    }
+                )
+            )
+        );
     }
 
     /// Which launcher [`super::launch`] chose for `input` and `options`,

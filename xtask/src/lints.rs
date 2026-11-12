@@ -296,6 +296,7 @@ pub const IN_PLAY: &[Site] = &[
             "PlayerRig::take",
             "PlayerRig::take_closing",
             "PlayerRig::declared_close",
+            "PlayerRig::declared_ending",
             "PlayerRig::quitting",
             "PlayerRig::measured",
             "PlayerRig::focus_lost",

@@ -32,7 +32,9 @@ use crate::measure::{
     AudioBase, Figures, PlayMeasure, Step, StepSample, judgment_samples, limits_line, measure_path,
     process_page_faults, to_toml,
 };
-use crate::render_side::{AttemptSkin, EndPage, RenderEnd, RenderLink, RenderMsg, ScreenError};
+use crate::render_side::{
+    AttemptSkin, Declared, EndPage, RenderEnd, RenderLink, RenderMsg, ScreenError,
+};
 
 use crate::result_input::ResultInput;
 use crate::tuning::{Delivered, SettingsFiles};
@@ -274,9 +276,9 @@ pub struct PlayerRig<'a> {
     pub ready_state_at: Option<TimeUs>,
     /// Where the current play's chart time 0 lies on the clock.
     pub origin: Option<TimeUs>,
-    /// The play skin's declared Closing duration, from the current
-    /// attempt's commit receipt ([`commit_ready`]); `None` before it.
-    pub declared_close: Option<TimeUs>,
+    /// What the play skin declares, from the current attempt's commit
+    /// receipt ([`commit_ready`]); none declared before it.
+    pub declared: Declared,
     /// Where each logic step's measurement goes (the render thread).
     pub steps: rtrb::Producer<StepSample>,
     /// Step samples of the current play the full queue refused.
@@ -1393,9 +1395,9 @@ pub(crate) fn closing_line(c: &game::ClosingReport) -> String {
 pub(crate) fn commit_ready(
     render: &RenderLink,
     loading: bool,
-    declared: &mut Option<TimeUs>,
+    declared: &mut Declared,
 ) -> Result<(), ScreenError> {
-    *declared = None;
+    *declared = Declared::default();
     if loading {
         render.loading().report(LoadInput::Ready, None);
     }
@@ -1569,10 +1571,16 @@ impl Rig for PlayerRig<'_> {
         c
     }
 
-    /// The current attempt's commit receipt.
+    /// The current attempt's commit receipt: Closing's duration.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn declared_close(&self) -> Option<TimeUs> {
-        self.declared_close
+        self.declared.close
+    }
+
+    /// The current attempt's commit receipt: the play's ending.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn declared_ending(&self) -> game::PlayEnding {
+        self.declared.ending
     }
 
     /// As [`take`](Self::take), with the quit key taken without dropping a
@@ -1718,7 +1726,7 @@ impl Rig for PlayerRig<'_> {
     /// passed, so its progress reaches 100.
     fn commit_attempt(&mut self) -> Result<(), ScreenError> {
         let loading = self.loading_active();
-        commit_ready(&self.render, loading, &mut self.declared_close)?;
+        commit_ready(&self.render, loading, &mut self.declared)?;
         #[cfg(feature = "dev-tools")]
         {
             self.probe_ready = Some((std::time::Instant::now(), "none"));
