@@ -185,6 +185,8 @@ pub struct Sel {
     pub timers: SelectionTimers,
     /// The application's readouts each frame gives.
     pub app: skin_model::AppReadouts,
+    /// The pointer each frame gives, in target pixels.
+    pub pointer: Option<[f32; 2]>,
 }
 
 impl Sel {
@@ -204,6 +206,7 @@ impl Sel {
                 ..SelectionTimers::default()
             },
             app: skin_model::AppReadouts::LAUNCH,
+            pointer: None,
         }
     }
 
@@ -247,7 +250,7 @@ impl Sel {
             layout: &Layout::AUTHOR,
             timers: self.timers,
             app: self.app,
-            pointer: None,
+            pointer: self.pointer,
         };
         self.skin
             .build_selection(&mut self.sel, &frame, &self.uvs, &mut self.batch)

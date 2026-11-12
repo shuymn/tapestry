@@ -36,10 +36,11 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use bms_model::TimeUs;
 use skin_model::{
-    Anchor, AngleFollow, Blend, CycleDef, DecisionDefs, DecisionTiming, Ease, ElementDef, Filter,
-    Fit, Follow, Grade, KeyDef, LanesDef, LanesError, LoadError, MAX_GEOMETRY, Native, Place,
-    PlayDefs, PlayEnding, Program, Region, RegionDef, ResultDefs, ResultTiming, Scope, ScreenKind,
-    SelectionDefs, Skin, SkinDef, Source, TimerRef, Track, Ty, WidgetDefs, compile, timer as slot,
+    ActionDef, Anchor, AngleFollow, Blend, CycleDef, DecisionDefs, DecisionTiming, Ease,
+    ElementDef, Filter, Fit, Follow, Grade, HoverRect, KeyDef, LanesDef, LanesError, LoadError,
+    MAX_GEOMETRY, Native, Place, PlayDefs, PlayEnding, PointerDef, Program, Region, RegionDef,
+    ResultDefs, ResultTiming, Scope, ScreenKind, SelectionDefs, Skin, SkinDef, Source, TimerRef,
+    Track, Ty, WidgetDefs, compile, timer as slot,
 };
 
 pub use budget::ImportLimit;
@@ -291,7 +292,15 @@ struct Dst {
     ops: Vec<Op>,
     draw: Prop,
     keys: Vec<u32>,
-    mouse: bool,
+    /// Its `mouseRect` object, read only where a hover rect is kept
+    /// ([`Cx::hover`]).
+    mouse: Option<u32>,
+    /// Whether it is a nested destination: a song list part's on a
+    /// selection skin, which keeps no hover rect.
+    nested: bool,
+    /// The action of the image or image set it draws, on a selection
+    /// skin, set before its element is built.
+    action: Option<ActionDef>,
     /// Whether it is failure presentation ([`Cx::failure`]).
     failure: bool,
 }
@@ -409,6 +418,12 @@ struct Common {
     /// Its conditions' sources, in the source's order, as `visible` joins
     /// them: what a value read after them is gated by.
     conds: Vec<String>,
+    /// On a selection skin: its hover rect ([`Cx::hover`]), its action
+    /// (an image's or an image set's) and whether it is the search box
+    /// (text 30's).
+    hover: Option<HoverRect>,
+    action: Option<ActionDef>,
+    search: bool,
 }
 
 /// The import's running state.
@@ -879,7 +894,14 @@ impl<'d> Cx<'d> {
             [Some(f)] => self.tables.nested.get(&f).cloned().unwrap_or_default(),
             [None] => Vec::new(),
         };
-        self.read_dst_keys(rec, keys)
+        let (id, dst) = self.read_dst_keys(rec, keys)?;
+        Ok((
+            id,
+            Dst {
+                nested: true,
+                ..dst
+            },
+        ))
     }
 
     /// A destination record's fields with `keys` as its `dst`.
@@ -950,7 +972,9 @@ impl<'d> Cx<'d> {
             ops,
             draw,
             keys,
-            mouse: mouse.is_some_and(|m| self.def.arena.is_object(m)),
+            mouse: mouse.filter(|&m| self.def.arena.is_object(m)),
+            nested: false,
+            action: None,
             failure,
         };
         Ok((id, dst))
@@ -1222,11 +1246,19 @@ impl<'d> Cx<'d> {
         let text = o.text;
         let at = dst.span;
         // The source draws it only while the mouse is inside its rect
-        // (`SkinObject.java:603-607`); the play has no mouse.
-        if dst.mouse {
-            self.drop_el(role, at, NoteKind::UnsupportedField { field: "mouseRect" })?;
-            return Ok(None);
-        }
+        // (`SkinObject.java:603-607`): only a selection skin's elements
+        // keep it; the play, decision and result have no pointer, and a
+        // song list part has no hover of its own.
+        let hover = match dst.mouse {
+            None => None,
+            Some(m) if self.kind == ScreenKind::Selection && !dst.nested => {
+                Some(self.hover(at, m)?)
+            }
+            Some(_) => {
+                self.drop_el(role, at, NoteKind::UnsupportedField { field: "mouseRect" })?;
+                return Ok(None);
+            }
+        };
         // Keys: charged as written before they are read, then as emitted
         // when more (a neutral track emits its first and last).
         let written = dst.keys.len();
@@ -1627,6 +1659,9 @@ impl<'d> Cx<'d> {
             display_deviation: deviates,
             tests_status,
             conds,
+            hover,
+            action: dst.action,
+            search: false,
         }))
     }
 
@@ -1820,6 +1855,24 @@ impl<'d> Cx<'d> {
         Track::new(&keys, c.ease, c.track.end).map_err(|_| self.range(c.span, "dst"))
     }
 
+    /// `mouseRect` object `m` of the destination at `at` as a hover rect:
+    /// its `x`, `y`, `w` and `h` (0 when absent) scaled as the region is
+    /// (`skin/Skin.java:183-185`), an offset from the region's
+    /// bottom-left corner, y up.
+    fn hover(&mut self, at: Span, m: u32) -> Result<HoverRect, ImportError> {
+        let [x, y, w, h] = self.def.fields(m, ["x", "y", "w", "h"]);
+        let src = [
+            self.int_or(x, "x", 0)?,
+            self.int_or(y, "y", 0)?,
+            self.int_or(w, "w", 0)?,
+            self.int_or(h, "h", 0)?,
+        ];
+        let [x, y, w, h] = Rect::scaled(src, self.r)
+            .and_then(|r| geom::coords([r.x.round()?, r.y.round()?, r.w.round()?, r.h.round()?]))
+            .ok_or_else(|| self.range(at, "mouseRect"))?;
+        Ok(HoverRect { x, y, w, h })
+    }
+
     /// Key `k`'s rect in reference pixels, y up, with the offsets.
     fn key_rect(&self, c: &Common, k: &SrcKey) -> Result<Rect, ImportError> {
         Rect::scaled(k.rect, self.r)
@@ -1842,6 +1895,22 @@ impl<'d> Cx<'d> {
         native: Option<Native>,
     ) -> Result<(), ImportError> {
         self.retained(&c)?;
+        if self.kind == ScreenKind::Selection {
+            // Only an image or an image choice carries an action, and only
+            // text showing the query is the search box.
+            let action = c
+                .action
+                .filter(|_| matches!(source, Source::Image(_) | Source::ImageChoice(_)));
+            let search = c.search && matches!(source, Source::Text(_));
+            if c.hover.is_some() || action.is_some() || search {
+                self.sel.pointer.push(PointerDef {
+                    element: u32::try_from(self.elements.len()).unwrap_or(u32::MAX),
+                    action,
+                    hover: c.hover,
+                    search,
+                });
+            }
+        }
         self.elements.push(ElementDef {
             source,
             track,
@@ -2158,7 +2227,8 @@ impl<'d> Cx<'d> {
             let widgets = SelectionDefs {
                 song_list: self.sel.list.take(),
                 ratio_bars: std::mem::take(&mut self.sel.ratio_bars),
-                pointer: Vec::new(),
+                // Kept: a refusal names its entry's element.
+                pointer: self.sel.pointer.clone(),
             };
             Skin::new_selection(def, widgets)
         } else if result {
@@ -2235,6 +2305,10 @@ impl<'d> Cx<'d> {
             | LoadError::SourceKind { element, .. } => Some(self.element_spans.get(element)?),
             LoadError::SongList(_) => Some(self.sel.span.as_ref()?),
             LoadError::RatioBar { bar, .. } => Some(self.sel.bar_spans.get(bar)?),
+            LoadError::Pointer { entry, .. } => {
+                let element = self.sel.pointer.get(entry)?.element;
+                Some(self.element_spans.get(usize::try_from(element).ok()?)?)
+            }
             LoadError::WhenNotBool { when } => Some(self.when_spans.get(when)?),
             LoadError::Lanes(LanesError::BarGroup { group, .. }) => {
                 Some(self.lanes.as_ref()?.bar_spans.get(group)?)
