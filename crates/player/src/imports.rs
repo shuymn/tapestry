@@ -529,6 +529,20 @@ fn stopped(cancel: &Cancel) -> Result<(), String> {
     }
 }
 
+/// JSON skin `def`, read with `header`, imported into `kind` with
+/// `config`, observing `cancel` as a Lua pass does: a stop during its
+/// work, a song list's image validation among it, ends it.
+fn import_json(
+    mut def: Definition,
+    header: &Header,
+    config: &Config,
+    kind: ScreenKind,
+    cancel: &Cancel,
+) -> Result<Imported, ImportError> {
+    def.observe(cancel.clone());
+    skin_beatoraja::import(&mut def, header, config, kind)
+}
+
 fn built(
     kind: ScreenKind,
     choice: &SkinChoice,
@@ -579,7 +593,7 @@ fn built(
     // only its runtime runs (docs/stage3.md S7-07).
     let mut script = ScriptSlot::default();
     let imported: Result<Imported, ImportError> = match pass {
-        Pass::Json(mut def, _) => skin_beatoraja::import(&mut def, &header, &config, kind),
+        Pass::Json(def, _) => import_json(def, &header, &config, kind, cancel),
         Pass::Lua(h) => {
             let facts = ImportFacts::base(kind, Fact::Known(autoplay));
             let outcome = if matches!(kind, ScreenKind::Selection | ScreenKind::Result) {
