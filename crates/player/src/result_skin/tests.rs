@@ -99,6 +99,7 @@ fn chart() -> ResultChart {
         length: None,
         notes: None,
         judge_class: None,
+        images: skin_model::ImageFacts::default(),
     }
 }
 
@@ -346,7 +347,7 @@ fn the_chart_facts_are_projected() {
         "#PLAYLEVEL 7\n#DIFFICULTY 3\n#TOTAL 300.7\n#BPM01 180\n#00208:01\n#00211:01\n",
         "beatoraja-style",
     );
-    let c = super::attempt_chart(&loaded);
+    let c = super::attempt_chart(&loaded).resolved(skin_model::ImageFacts::default());
     assert_eq!((c.level, c.difficulty), (Some(7), Some(3)));
     assert_eq!(c.total, Some(300));
     assert_eq!(
@@ -376,7 +377,13 @@ fn the_charts_judgment_class_is_projected() {
     ] {
         let loaded =
             crate::imports::facts::tests::loaded(&format!("{head}#00111:01\n"), "beatoraja-style");
-        assert_eq!(super::attempt_chart(&loaded).judge_class, class, "{head:?}");
+        assert_eq!(
+            super::attempt_chart(&loaded)
+                .resolved(skin_model::ImageFacts::default())
+                .judge_class,
+            class,
+            "{head:?}"
+        );
     }
 }
 
@@ -389,7 +396,11 @@ fn the_charts_judgment_class_is_projected() {
 fn the_length_is_the_charts_content_end_at_1x() {
     let (_dir, mut loaded) =
         crate::imports::facts::tests::loaded_kept("#WAV01 a.wav\n#01001:01\n", "beatoraja-style");
-    let length = |l: &game::Loaded| super::attempt_chart(l).length;
+    let length = |l: &game::Loaded| {
+        super::attempt_chart(l)
+            .resolved(skin_model::ImageFacts::default())
+            .length
+    };
     assert_eq!(length(&loaded), Some(bms_model::TimeUs(20_000_000)));
     loaded
         .set_speed(bms_model::Speed::from_twentieths(15).unwrap())

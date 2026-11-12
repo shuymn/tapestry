@@ -83,14 +83,17 @@ const TEXT: &[(i32, i32, C)] = &[
 /// §A's image indices: 2 N, 9 constants.
 const IMAGE_INDEX: &[(i32, i32, C)] = &[(42, 42, C::K(0)), (370, 371, C::N), (450, 457, C::K(0))];
 
-/// §A's built-in options: 40 N (180 to 184 the chart's judgment class),
-/// then the 22 D constants with their values.
+/// §A's built-in options: 44 N (180 to 184 the chart's judgment class,
+/// 190, 191, 194 and 195 its stage file and back image), then the 21 D
+/// constants with their values.
 const OPTION_N: &[(i32, i32)] = &[
     (90, 91),
     (150, 155),
     (160, 164),
     (177, 177),
     (180, 184),
+    (190, 191),
+    (194, 195),
     (300, 307),
     (320, 327),
     (330, 330),
@@ -101,7 +104,6 @@ const OPTION_N: &[(i32, i32)] = &[
 const OPTION_D: &[(i32, i32, bool)] = &[
     (50, 50, true),
     (51, 51, false),
-    (191, 191, false),
     (196, 196, true),
     (197, 198, false),
     (280, 283, false),
@@ -144,7 +146,7 @@ fn every_profile_id_has_its_class() {
     let n = OPTION_N.iter().flat_map(|&(a, b)| a..=b);
     let d = OPTION_D.iter().flat_map(|&(a, b, _)| a..=b);
     // 160 to 164 are N (constant per kind) with constant values.
-    assert_eq!((n.clone().count(), d.clone().count()), (40, 22));
+    assert_eq!((n.clone().count(), d.clone().count()), (44, 21));
     for id in 0..=3_000 {
         let class = option(id);
         if n.clone().any(|i| i == id) {

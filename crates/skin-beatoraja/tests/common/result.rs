@@ -144,6 +144,7 @@ pub fn chart() -> ResultChart {
         length: Some(TimeUs(123_456_789)),
         notes: Some(600),
         judge_class: None,
+        images: skin_model::ImageFacts::default(),
     }
 }
 

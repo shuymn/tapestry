@@ -308,8 +308,15 @@ pub(crate) fn option(id: i32) -> Option<Class<ResOption>> {
         // No replay slots: each slot absent.
         196 | 1196 | 1199 | 1202 => Constant(true),
         197 | 198 | 1197 | 1198 | 1200 | 1201 | 1203 | 1204 => Constant(false),
-        // No stage file shown, no courses, no difficulty tables.
-        191 | 280..=283 | 289 | 290 | 1008 => Constant(false),
+        // The chart's stage file and back image, as the attempt resolved
+        // them before any result import (`BooleanPropertyFactory.java:
+        // 529-540`, static on this screen, `:219`).
+        190 => Expr("!chart.stagefile"),
+        191 => Expr("chart.stagefile"),
+        194 => Expr("!chart.backbmp"),
+        195 => Expr("chart.backbmp"),
+        // No courses, no difficulty tables.
+        280..=283 | 289 | 290 | 1008 => Constant(false),
         _ => return None,
     }))
 }

@@ -434,8 +434,9 @@ pub struct AttemptPrep {
     loading_gauge: Option<skin_model::LoadingGauge>,
     /// The gauge the attempt shows, by its index in the preset.
     displayed: usize,
-    /// The attempt's chart facts a result view carries.
-    chart: skin_model::ResultChart,
+    /// The attempt's chart facts a result view carries, its images'
+    /// availability resolved only in the facts stage.
+    chart: crate::result_skin::PendingChart,
     /// The attempt's judgment class.
     class: Option<skin_beatoraja::JudgeClass>,
     /// The chart's strings the attempt's result shows, until the result
@@ -460,6 +461,10 @@ pub struct AttemptPrep {
 enum PrepStage {
     /// The pending play skin's specialization runs.
     Skin(Box<crate::imports::Specializing>),
+    /// The chart's images' availability is resolved, the play skin known:
+    /// the worker decodes the generation's sources, and nothing of the
+    /// result (import, probe, reuse) runs before they are adopted.
+    Facts(AttemptSkin),
     /// The result skin's image stage runs, the play skin known.
     Image(AttemptSkin, Box<crate::result_skin::ImageJob>),
     /// The render thread prepares the attempt.
@@ -496,13 +501,109 @@ pub struct Shutdown {
 }
 
 impl PlayerRig<'_> {
+    /// The chart layer side of the play installation `skin` draws with:
+    /// the skin in use's, or a pending skin's specialization's; `None`
+    /// without a chart layer.
+    fn play_side(&self, skin: &AttemptSkin) -> Option<u32> {
+        match skin {
+            AttemptSkin::InUse => self.play_chart,
+            AttemptSkin::Specialized(bundle) => bundle.chart_layer().map(|_| bundle.side()),
+        }
+    }
+
+    /// The facts stage entered, the play skin `skin` known: the attempt's
+    /// images asked for ([`crate::chart_images::ChartImageWorker::attempt`]),
+    /// which renews a retry's or a practice round's generation, so their
+    /// availability is unresolved until this generation's sources. The
+    /// worker is stepped once: sources already adopted (or, in the direct
+    /// launch, decoded now on this thread) go on to the result's image
+    /// stage at once; otherwise the preparation's polls wait for them.
+    fn enter_facts(&mut self, prep: &mut AttemptPrep, skin: AttemptSkin) -> PrepStage {
+        let (dir, names) = prep.images.clone();
+        let play = self.play_side(&skin);
+        self.chart_images.attempt(crate::chart_images::Want {
+            dir,
+            names,
+            play,
+            result: None,
+        });
+        let coord = self.selection.as_ref().map(|s| (&s.coord, s.spawner));
+        let publisher =
+            (self.pending.is_none() && coord.is_some()).then(|| self.render.chart_publisher());
+        let stops = || {
+            preparation_stops(
+                self.quitting(),
+                self.controls.leaving(),
+                self.input_failure(),
+                self.audio_failure(),
+            )
+        };
+        self.chart_images.step(coord, &stops, publisher.as_ref());
+        match self.chart_images.facts() {
+            Some(images) => self.after_skin(prep, skin, images),
+            None => PrepStage::Facts(skin),
+        }
+    }
+
+    /// The chart's images' availability, waited for until `until`: the
+    /// worker stepped (its play half published into the skin in use's
+    /// loading frames as soon as it is read), the adjustments served
+    /// meanwhile. [`FactsPoll::Stopped`] when the wait stops
+    /// ([`preparation_stops`]), the worker kept;
+    /// [`FactsPoll::Refused`] when a job could not begin for a publication
+    /// unanswered past the render link's bound; `None` at `until`.
+    fn poll_facts(&mut self, until: Instant) -> Option<FactsPoll> {
+        let worker = self.chart_images.clone();
+        let bound = self.render.answer_bound();
+        let mut adjust = self.adjust.take();
+        let out = loop {
+            let stops = || {
+                preparation_stops(
+                    self.quitting(),
+                    self.controls.leaving(),
+                    self.input_failure(),
+                    self.audio_failure(),
+                )
+            };
+            let coord = self.selection.as_ref().map(|s| (&s.coord, s.spawner));
+            let publisher =
+                (self.pending.is_none() && coord.is_some()).then(|| self.render.chart_publisher());
+            worker.step(coord, &stops, publisher.as_ref());
+            if stops() {
+                break Some(FactsPoll::Stopped);
+            }
+            if let Some(facts) = worker.facts() {
+                break Some(FactsPoll::Ready(facts));
+            }
+            if worker.blocked_for().is_some_and(|d| d >= bound) {
+                break Some(FactsPoll::Refused);
+            }
+            #[cfg(feature = "dev-tools")]
+            crate::dev::press_due(self.controls, crate::dev::LoadPhase::Preparing);
+            serve_adjustments(adjust.as_mut(), &self.input, self.controls.tuning());
+            let now = Instant::now();
+            if now >= until {
+                break None;
+            }
+            std::thread::park_timeout(IMAGE_SLICE.min(until - now));
+        };
+        self.adjust = adjust;
+        out
+    }
+
     /// The result skin's image stage for the attempt (design D11), begun
-    /// after the play skin's specialization and before READY with what the
-    /// attempt's preparation began with, and its play skin `skin`: decided
-    /// at once, or its job running, waited for in the preparation's polls
-    /// ([`poll_image`](Self::poll_image)).
-    fn after_skin(&mut self, prep: &mut AttemptPrep, skin: AttemptSkin) -> PrepStage {
-        self.result_chart = Some(prep.chart);
+    /// once its images' availability `images` is resolved and before READY
+    /// with what the attempt's preparation began with, and its play skin
+    /// `skin`: decided at once, or its job running, waited for in the
+    /// preparation's polls ([`poll_image`](Self::poll_image)).
+    fn after_skin(
+        &mut self,
+        prep: &mut AttemptPrep,
+        skin: AttemptSkin,
+        images: skin_model::ImageFacts,
+    ) -> PrepStage {
+        let chart = prep.chart.resolved(images);
+        self.result_chart = Some(chart);
         self.result_labels = prep.labels.take();
         // Once the run disabled the result skin, no skin work is done: the
         // built-in result shows the chart and labels taken above.
@@ -511,7 +612,7 @@ impl PlayerRig<'_> {
         }
         #[cfg(feature = "dev-tools")]
         crate::dev::stage_began(crate::dev::SpecializingStage::ResultImage);
-        match self.result_skin.begin_image_stage(prep.chart, prep.class) {
+        match self.result_skin.begin_image_stage(chart, prep.class) {
             crate::result_skin::ImageStage::Ready(staged) => self.after_image(prep, skin, staged),
             crate::result_skin::ImageStage::Running(job) => PrepStage::Image(skin, job),
         }
@@ -566,14 +667,18 @@ impl PlayerRig<'_> {
             return PrepStage::Ended(Preparation::Cancelled);
         };
         prep.specialized = matches!(skin, AttemptSkin::Specialized(_));
-        // The images the attempt draws, fitted for its skin's chart layer.
-        let side = match &skin {
-            AttemptSkin::InUse => self.play_chart,
-            AttemptSkin::Specialized(bundle) => bundle.chart_layer().map(|_| bundle.side()),
-        };
+        // The images the attempt draws, fitted for its play skin's chart
+        // layer and for the result's: the side of the attempt's bundle
+        // for every view, else of the prepared atlas, when it keeps one.
+        let play = self.play_side(&skin);
+        let result = self.result_skin.chart_side();
         let (dir, names) = prep.images.clone();
-        self.chart_images
-            .want(crate::chart_images::Want { dir, names, side });
+        self.chart_images.attempt(crate::chart_images::Want {
+            dir,
+            names,
+            play,
+            result,
+        });
         self.attempt_gauge = prep.displayed;
         refresh_loading_gauge(&self.render, self.loading_active(), prep.loading_gauge);
         // The attempt attached last is the one prepared: its epoch is
@@ -629,19 +734,18 @@ impl PlayerRig<'_> {
 
     /// The chart's images when `loaded` is loaded (S10-12 design §5.3),
     /// in the generation its choice or Start began
-    /// ([`crate::chart_images::ChartImageWorker::renew`]): with the play
-    /// skin in use known (no pending skin), the images' job begins now and
-    /// publishes them into the skin in use as soon as they are read, so
-    /// the loading frames draw them while the chart's sounds load.
+    /// ([`crate::chart_images::ChartImageWorker::renew`]): the images' job
+    /// begins now, whatever the play skin is, and decodes the sources;
+    /// with the play skin in use known (no pending skin) it also fits them
+    /// for it and publishes them into it as soon as they are read, so the
+    /// loading frames draw them while the chart's sounds load.
     pub(crate) fn chart_images_at_choice(&mut self, loaded: &Loaded) {
-        if self.pending.is_some() {
-            return;
-        }
         let labels = loaded.labels();
-        self.chart_images.want(crate::chart_images::Want {
+        self.chart_images.attempt(crate::chart_images::Want {
             dir: crate::chart_images::folder(loaded.path()),
             names: [labels.stagefile.clone(), labels.backbmp.clone()],
-            side: self.play_chart,
+            play: self.play_chart.filter(|_| self.pending.is_none()),
+            result: None,
         });
         let coord = self.selection.as_ref().map(|s| (&s.coord, s.spawner));
         // No coordinator (no song selection): the preparation reads them.
@@ -742,7 +846,8 @@ impl PlayerRig<'_> {
                 settled
             }
             // The images' worker is the rig's: it is never settled here.
-            PrepStage::Screen(_)
+            PrepStage::Facts(_)
+            | PrepStage::Screen(_)
             | PrepStage::Images(..)
             | PrepStage::Ended(_)
             | PrepStage::Answered(_) => crate::imports::Settled::Ended,
@@ -767,7 +872,8 @@ impl PlayerRig<'_> {
             PrepStage::Image(_, mut job) => {
                 let _ = self.result_skin.settle_image_stage(&mut job, || true);
             }
-            PrepStage::Screen(_)
+            PrepStage::Facts(_)
+            | PrepStage::Screen(_)
             | PrepStage::Images(..)
             | PrepStage::Ended(_)
             | PrepStage::Answered(_) => {}
@@ -795,8 +901,14 @@ impl PlayerRig<'_> {
         let ready = self.result_skin.poll();
         if self.presenter.current() {
             if self.presenter.status(&status) || ready {
+                let chart = match self.result_skin.shown() {
+                    Some(crate::result_skin::Published::Skin(b, _, _)) => {
+                        self.result_skin.chart_for(b)
+                    }
+                    _ => None,
+                };
                 self.presenter
-                    .land(&mut self.render, self.result_skin.shown());
+                    .land(&mut self.render, self.result_skin.shown(), chart);
             }
             self.present_overlay();
         }
@@ -1846,6 +1958,10 @@ impl Rig for PlayerRig<'_> {
         let loading = self.loading_active();
         commit_ready(&self.render, loading, &mut self.declared)?;
         self.chart_images.committed();
+        // The attempt's sources and result half move to the result,
+        // replacing the last attempt's: only once its commit passed.
+        self.result_skin
+            .take_images(self.chart_images.take_result());
         #[cfg(feature = "dev-tools")]
         {
             self.probe_ready = Some((std::time::Instant::now(), "none"));
@@ -1968,7 +2084,7 @@ impl Rig for PlayerRig<'_> {
             stage: PrepStage::Answered(None),
         };
         prep.stage = match self.begin_skin(loaded) {
-            Ok(SkinStep::Ready(skin)) => self.after_skin(&mut prep, skin),
+            Ok(SkinStep::Ready(skin)) => self.enter_facts(&mut prep, skin),
             Ok(SkinStep::Running(job)) => PrepStage::Skin(job),
             Err(ended) => PrepStage::Ended(ended),
         };
@@ -2010,8 +2126,30 @@ impl Rig for PlayerRig<'_> {
                         prep.stage = PrepStage::Skin(job);
                         break Ok(game::PrepPoll::Pending);
                     }
-                    Some(Ok(skin)) => prep.stage = self.after_skin(&mut prep, skin),
+                    Some(Ok(skin)) => prep.stage = self.enter_facts(&mut prep, skin),
                     Some(Err(ended)) => prep.stage = PrepStage::Ended(ended),
+                },
+                PrepStage::Facts(skin) => match self.poll_facts(deadline) {
+                    None => {
+                        prep.stage = PrepStage::Facts(skin);
+                        break Ok(game::PrepPoll::Pending);
+                    }
+                    Some(FactsPoll::Ready(images)) => {
+                        prep.stage = self.after_skin(&mut prep, skin, images);
+                    }
+                    // Stopped before anything was staged: nothing to drop.
+                    Some(FactsPoll::Stopped) => {
+                        prep.stage = PrepStage::Ended(Preparation::Cancelled);
+                    }
+                    // A publication held past the bound: refused, as an
+                    // expired publication is.
+                    Some(FactsPoll::Refused) => {
+                        prep.stage =
+                            PrepStage::Ended(Preparation::Refused(game::PreparationRefusal {
+                                location: None,
+                                reason: "the chart's images were not read in time".to_owned(),
+                            }));
+                    }
                 },
                 PrepStage::Image(skin, mut job) => match self.poll_image(&mut job, deadline) {
                     None => {
@@ -2690,6 +2828,9 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn show_end(&mut self, report: &PlayReport, screen: &ResultScreen) {
+        // The result is entered, whatever presents it: the play
+        // installation is not drawn from here, so its half goes.
+        self.chart_images.result_began();
         self.print_view(screen);
         // A switch: its layout is requested; the current generation stays
         // until it lands (design D11). The attempt's fallback requests none.
@@ -2774,6 +2915,18 @@ enum ImagesPoll {
     Stopped,
     /// The publication's answer did not come within its bound.
     Expired,
+}
+
+/// Where the wait for the chart's images' availability ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FactsPoll {
+    /// The generation's sources were adopted: their availability.
+    Ready(skin_model::ImageFacts),
+    /// A stop ([`preparation_stops`]).
+    Stopped,
+    /// A job the images need was held back by a publication unanswered
+    /// past the render link's bound.
+    Refused,
 }
 
 /// Whether a waiting attempt's preparation stops early: the player quit or

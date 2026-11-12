@@ -3164,6 +3164,10 @@ impl AppRig for PlayerRig<'_> {
         // (dev-tools).
         #[cfg(feature = "dev-tools")]
         self.finish_result(crate::dev::scenario::Leaving::Left);
+        // The last chart's images go: nothing of them stays beside
+        // selection.
+        self.chart_images.drop_images();
+        self.result_skin.drop_images();
         // Another scene: held adjustment controls act no more until
         // pressed afresh.
         self.enter_scene();
@@ -3274,6 +3278,9 @@ impl AppRig for PlayerRig<'_> {
         // A result left for the practice page (dev-tools).
         #[cfg(feature = "dev-tools")]
         self.finish_result(crate::dev::scenario::Leaving::Left);
+        // The result's images go; the worker's sources stay, the practice
+        // Start's candidates.
+        self.result_skin.drop_images();
         self.enter_scene();
         self.render.leave_selection();
         recover(
