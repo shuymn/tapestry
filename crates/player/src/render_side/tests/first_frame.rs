@@ -259,13 +259,20 @@ fn the_hold_paces() {
         "the hold progresses"
     );
     assert_eq!(screens.waits.load(SeqCst), asked, "a wait asked while held");
-    // At most one look per pace over a window, whatever the scheduling.
-    let (began, first) = (Instant::now(), entries(&link));
+    // At most one look per pace over a window. Both counts are read
+    // inside the window, so every look between them lies in it; with the
+    // time since the showing at 0 each wait is the whole pace, never a
+    // clamped one, and a sleep never ends early, so k looks need k - 1
+    // whole paces between them. A thread descheduled anywhere only lowers
+    // the count: this fails a spin, never the hold.
+    let began = Instant::now();
+    let first = entries(&link);
     std::thread::sleep(Duration::from_millis(100));
-    let (span, last) = (began.elapsed(), entries(&link));
+    let last = entries(&link);
+    let span = began.elapsed();
     let paces = u64::try_from(span.as_micros()).unwrap() / HELD_PACE.0.unsigned_abs();
     assert!(
-        last - first <= paces + 2,
+        last - first <= paces + 1,
         "{} looks in {span:?}",
         last - first
     );
@@ -318,6 +325,7 @@ fn the_hold_counts_from_the_showing() {
         || first_shown(&link).is_some_and(|(l, _)| l == lifetime)
     ));
     let (_, shown) = first_shown(&link).unwrap();
+    assert_eq!(link.shared.current_origin(), (lifetime, Some(shown)));
     assert!(shown >= revealed, "{shown:?} {revealed:?}");
     assert!(waits(&link) > 0 || wait_until(|| waits(&link) > 0));
     link.end_loading().unwrap();
@@ -332,6 +340,7 @@ fn the_hold_counts_from_the_showing() {
         || first_shown(&link).is_some_and(|(l, _)| l == lifetime)
     ));
     let (_, shown) = first_shown(&link).unwrap();
+    assert_eq!(link.shared.current_origin(), (lifetime, Some(shown)));
     assert!(shown >= began, "{shown:?} {began:?}");
     link.end_loading().unwrap();
     link.exit();
@@ -493,6 +502,7 @@ fn a_successor_lifetime_holds_on_its_own() {
         || first_shown(&link).is_some_and(|(l, _)| l == second)
     ));
     let (_, at) = first_shown(&link).unwrap();
+    assert_eq!(link.shared.current_origin(), (second, Some(at)));
     assert!(at >= shown, "its own showing: {at:?} {shown:?}");
     let from = waits(&link);
     assert!(wait_until(|| waits(&link) >= from + 3), "held on its own");
@@ -566,6 +576,33 @@ fn a_notice_before_the_first_visit_breaks_the_image() {
     assert!(wait_until(|| pending(&screens) >= 1));
     assert_eq!(entries(&link), 0);
     link.end_loading().unwrap();
+    link.exit();
+}
+
+/// TB8: a lifetime cleared during the hold, a stale update of it queued
+/// before the clear, takes no frame's pacing on a target paced by the
+/// clock: the held iteration that finds it ended goes idle at once. The
+/// iteration is held past its extent read while the update and the clear
+/// are queued, and the next one, which takes the stale update, is held
+/// before its pacing.
+#[test]
+fn a_cleared_hold_takes_no_frame_pacing() {
+    let (_chart, _screens, link, _extent) = rig(NEVER);
+    hold_at(&link, 0);
+    show_held(&link);
+    let [before_token, after_extent, _] = &link.shared.frame_gates;
+    after_extent.hold(true);
+    assert!(wait_until(|| after_extent.waiting()));
+    let paced = link.shared.clock_paced.load(SeqCst);
+    link.loading()
+        .report(LoadInput::Stage(Stage::Chart), Some(one_line("stale")));
+    link.clear_loading();
+    before_token.hold(true);
+    after_extent.hold(false);
+    assert!(wait_until(|| before_token.waiting()));
+    assert_eq!(link.shared.clock_paced.load(SeqCst), paced);
+    release(&link);
+    let _ = link.end_loading();
     link.exit();
 }
 

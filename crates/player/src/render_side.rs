@@ -5595,8 +5595,14 @@ impl Run {
                 update,
                 ..
             } = &mode
-                && self.shared.loading_current(*lifetime)
             {
+                // Loading ended or cleared since: nothing of it is drawn,
+                // and no frame's pacing is taken for it; a frame granted
+                // stays so for what comes next.
+                if !self.shared.loading_current(*lifetime) {
+                    mode = Mode::Idle;
+                    continue;
+                }
                 let lifetime = *lifetime;
                 let now = self.clock.now();
                 let mut first = match self.first_frame {
