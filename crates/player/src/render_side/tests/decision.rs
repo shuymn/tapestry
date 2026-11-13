@@ -21,7 +21,7 @@ use skin_model::{
 use tempfile::TempDir;
 
 use super::super::{Extent, MakeScreen, RenderLink, Screen};
-use super::{one_line, preset_attempt, spawn_empty_on, wait_until};
+use super::{one_line, preset_attempt, wait_until};
 use crate::decision_side::{
     Boundary, DecisionDrawn, DecisionSide, Rebuilt, ShownDecision, Want, decision_build,
     decision_frame_of, labels_revision, update_want,
@@ -398,6 +398,9 @@ impl Screen for Recorder {
     fn device_lost(&self) -> bool {
         self.menu.device_lost()
     }
+    fn allocate_in_next_decision(&mut self, refuse: bool) {
+        self.menu.allocate_in_next_decision(refuse);
+    }
     fn build_decision(
         &mut self,
         dec: &mut skin_model::DecisionScreen,
@@ -487,9 +490,63 @@ impl Screen for Recorder {
 
 /// A render thread on [`Recorder`]s with the decision skin of `dir`
 /// committed, holding WARP's turn.
+/// What the render thread reported of the decision screens.
+#[derive(Default)]
+pub(super) struct Decided {
+    pub(super) records: Mutex<Vec<crate::measure::DecisionRecord>>,
+    pub(super) stamps: Mutex<Vec<(u64, crate::measure::DecisionDrawnAs)>>,
+}
+
+/// The frame sink noting [`Decided`].
+pub(super) struct DecidedSink(pub(super) Arc<Decided>);
+
+impl crate::render_side::FrameSink for DecidedSink {
+    fn frame(&mut self, _: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
+        if let Some(stamp) = drawn.decision.filter(|_| drawn.timing.presented) {
+            self.0
+                .stamps
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(stamp);
+        }
+    }
+
+    fn decision_left(&mut self, record: &crate::measure::DecisionRecord) {
+        self.0
+            .records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(*record);
+    }
+}
+
+impl Decided {
+    /// The decision screens left so far.
+    pub(super) fn records(&self) -> Vec<crate::measure::DecisionRecord> {
+        self.records
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The presented frames' stamps of lifetime `lifetime` so far.
+    pub(super) fn stamps_of(&self, lifetime: u64) -> Vec<crate::measure::DecisionDrawnAs> {
+        self.stamps
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|(l, _)| *l == lifetime)
+            .map(|&(_, s)| s)
+            .collect()
+    }
+}
+
 struct Rig {
     link: RenderLink,
     seen: Arc<Seen>,
+    /// The decision screens the render thread left, and its frames'
+    /// stamps.
+    decided: Arc<Decided>,
     book: Arc<Mutex<LabelBook>>,
     extent: Arc<Extent>,
     _turn: crate::warp_turn::Turn,
@@ -549,13 +606,15 @@ impl Rig {
                 seen: Arc::clone(&s),
             }) as Box<dyn Screen>)
         });
-        let link = spawn_empty_on(make, clock);
+        let decided = Arc::new(Decided::default());
+        let link = super::spawn_on_with(make, clock, Box::new(DecidedSink(Arc::clone(&decided))));
         let extent = Arc::new(Extent::default());
         link.follow(&extent);
         let book = link.label_book();
         Self {
             link,
             seen,
+            decided,
             book,
             extent,
             _turn: turn,
@@ -1289,6 +1348,20 @@ fn other_prep_refused_during_lifetime_keeps_drawing() {
     rig.link.loading().show(one_line("loading"));
     assert!(wait_until(|| rig.seen.removed.load(Ordering::Acquire) == 1));
     rig.link.exit();
+    // The screen's record: the skin drew to its end, the other refusal no
+    // fallback of it.
+    let [r] = rig.decided.records()[..] else {
+        panic!("{:?}", rig.decided.records());
+    };
+    assert_eq!((r.skin, r.fell_back), (true, None), "{r:?}");
+    assert!(r.skin_frames >= 6, "{r:?}");
+    let stamps = rig.decided.stamps_of(r.lifetime);
+    assert!(
+        stamps
+            .iter()
+            .all(|s| *s == crate::measure::DecisionDrawnAs::Skin),
+        "{stamps:?}"
+    );
 }
 
 /// R4.6: a refusal reaching the boundary after the lifetime ended, before
@@ -1660,6 +1733,42 @@ fn selection_frame_during_decision_prep_alloc() {
     assert!(during.iter().all(|&n| n == 0), "during {during:?}");
 }
 
+/// A pinned decision skin frame while the labels are prepared again at
+/// the frame boundaries (a resize re-prepares the pinned chart at the new
+/// target): the decision screen's count holds exactly the allocation made
+/// inside one of those frames' builds (the positive control, which fired
+/// once), none of the preparation's work (design.md "Scope of No
+/// Allocation").
+#[test]
+fn decision_frame_during_label_prep_alloc() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    // The test double notes each build it makes; its notes reserved, so
+    // only the screen's own work is in the count.
+    rig.seen.timers.lock().unwrap().reserve(1 << 12);
+    rig.seen.drew.lock().unwrap().reserve(1 << 12);
+    rig.drawing("a", "A");
+    let fired = rig.link.decision_faults_fired();
+    rig.link
+        .set_decision_faults(crate::dev::DecisionFaults::parse("alloc2"));
+    rig.extent.publish(1_280, 720);
+    assert!(wait_until(|| lock(&rig.book).current().0 == [1_280, 720]));
+    let from = rig.seen.len();
+    rig.skin_frames(from, 3);
+    assert!(
+        wait_until(|| ready(&lock(&rig.book), "a", "A")),
+        "prepared again"
+    );
+    assert_eq!(fired(), 1, "the fault fired");
+    rig.link.loading().show(one_line("loading"));
+    rig.link.exit();
+    let [r] = rig.decided.records()[..] else {
+        panic!("{:?}", rig.decided.records());
+    };
+    assert_eq!(r.app, 1, "{r:?}");
+    assert_eq!((r.skin, r.fell_back), (true, None), "{r:?}");
+}
+
 /// The slot of `book` pinned by `lifetime` at `generation`, its content
 /// restored (not restoring).
 fn restored_pin(book: &LabelBook, slot: usize, generation: u64, lifetime: u64) -> bool {
@@ -1855,6 +1964,26 @@ fn ended_resized_decision_draws_the_page_without_refusal() {
     assert_eq!(rig.seen.removed.load(Ordering::Acquire), 0);
     assert!(lock(&rig.book).healthy());
     rig.link.exit();
+    // Its record: the skin chosen, no fallback; the frames after its
+    // content went counted apart and stamped so.
+    let [r] = rig.decided.records()[..] else {
+        panic!("{:?}", rig.decided.records());
+    };
+    assert_eq!((r.skin, r.fell_back, r.ended), (true, None, true), "{r:?}");
+    assert!(r.ended_frames >= 3, "{r:?}");
+    assert_eq!(r.page_frames, 0, "{r:?}");
+    assert_eq!(r.presentation(), "skin");
+    let stamps = rig.decided.stamps_of(r.lifetime);
+    let ended = stamps
+        .iter()
+        .position(|s| *s == crate::measure::DecisionDrawnAs::Ended)
+        .expect("an ended frame");
+    assert!(
+        stamps[ended..]
+            .iter()
+            .all(|s| *s == crate::measure::DecisionDrawnAs::Ended),
+        "{stamps:?}"
+    );
 }
 
 /// R4.5, O8: a decision restore refused on a healthy device stands for

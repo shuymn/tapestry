@@ -527,3 +527,96 @@ fn play_frames_screen_alloc() {
     assert_eq!(fig.render_app_allocations, Some(0));
     rig.link.exit();
 }
+
+/// The decision screen of lifetime `lifetime`, drawn with its built-in
+/// presentation (no slot pinned), until a few of its frames are presented.
+#[cfg(feature = "dev-tools")]
+fn decision_shown(rig: &Rig, lifetime: u64) {
+    let from = rig.screens.menu_frames.lock().unwrap().len();
+    rig.link.show_decision(
+        one_line("decision"),
+        Some(crate::decision_side::ShownDecision {
+            lifetime,
+            origin: rig.clock.now(),
+            timing: skin_model::DecisionTiming::default(),
+            slot: None,
+        }),
+    );
+    assert!(wait_until(
+        || rig.screens.menu_frames.lock().unwrap().len() >= from + 3
+    ));
+}
+
+/// A play started and over at once: its figures.
+#[cfg(feature = "dev-tools")]
+fn played(rig: &Rig) -> crate::measure::Figures {
+    let t = rig.begin();
+    rig.link.loading().show(one_line("loading"));
+    rig.play(after(t, 1_234));
+    rig.link
+        .finish(rig.clock.now())
+        .expect("the play's figures")
+}
+
+/// The decision screen's record goes to the play it led to, once: the
+/// play after it carries it, written as zeros for the built-in
+/// presentation; a retry, which no decision screen leads, carries none.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_play_after_a_decision_screen_carries_its_record_once() {
+    let rig = Rig::new(Some(LOADEND));
+    rig.play_state(1);
+    decision_shown(&rig, 5);
+    let first = played(&rig);
+    let d = first.decision.expect("the decision screen's record");
+    assert_eq!(
+        (d.lifetime, d.skin, d.builds, d.app),
+        (5, false, 0, 0),
+        "{d:?}"
+    );
+    assert!(d.page_frames >= 3, "{d:?}");
+    assert_eq!(d.presentation(), "built-in");
+    let text = crate::measure::to_toml(&first, (None, None));
+    for line in [
+        "decision_app = 0",
+        "[decision]",
+        "lifetime = 5",
+        "presentation = \"built-in\"",
+        "builds = 0",
+        "skin_frames = 0",
+    ] {
+        assert!(text.lines().any(|l| l == line), "{line}: {text}");
+    }
+    // A retry: no decision screen led it.
+    let retry = played(&rig);
+    assert_eq!(retry.decision, None);
+    let text = crate::measure::to_toml(&retry, (None, None));
+    assert!(!text.contains("decision"), "{text}");
+    rig.exit();
+}
+
+/// On the practice path the decision screen's record goes to the first
+/// round only; a practice left before any round leaves its record to no
+/// play: the next chart's play carries its own screen's.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn practice_rounds_and_an_abandoned_practice() {
+    let rig = Rig::new(Some(LOADEND));
+    rig.play_state(1);
+    decision_shown(&rig, 6);
+    rig.link
+        .send(RenderMsg::PracticePage(Box::new(one_line("page"))));
+    let round = played(&rig);
+    assert_eq!(round.decision.map(|d| d.lifetime), Some(6));
+    let second = played(&rig);
+    assert_eq!(second.decision, None, "a later round");
+    // Practice chosen, left from its page before a Start.
+    decision_shown(&rig, 7);
+    rig.link
+        .send(RenderMsg::PracticePage(Box::new(one_line("page"))));
+    rig.link.send(RenderMsg::SelectionChanged);
+    decision_shown(&rig, 8);
+    let next = played(&rig);
+    assert_eq!(next.decision.map(|d| d.lifetime), Some(8));
+    rig.exit();
+}

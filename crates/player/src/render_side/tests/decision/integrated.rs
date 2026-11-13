@@ -25,6 +25,9 @@ use skin_model::{AtlasId, BuildError, ScreenKind};
 use tempfile::TempDir;
 
 use crate::controls::Controls;
+use crate::measure::{DecisionDrawnAs, DecisionFallback, DecisionRecord};
+
+use super::{Decided, DecidedSink};
 use crate::menu_screen::{MenuPage, MenuScreen};
 use crate::render_side::tests::wait_until;
 use crate::render_side::{EndPage, MakeScreen, Screen, TakeoverAcks};
@@ -472,6 +475,9 @@ impl Screen for Noted {
         self.seen.gate.wait();
         !self.menu.paced() || self.menu.wait()
     }
+    fn allocate_in_next_decision(&mut self, refuse: bool) {
+        self.menu.allocate_in_next_decision(refuse);
+    }
     fn paced(&self) -> bool {
         self.seen.gate.pacing() || self.menu.paced()
     }
@@ -672,6 +678,16 @@ struct Side<'a> {
     /// The game thread's looks for the decision skin's takeover and the
     /// render thread's drained frame loops.
     acks: Arc<TakeoverAcks>,
+    /// The decision faults fired so far.
+    fired: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// The decision labels' work at a frame boundary waits here.
+    label_gate: Arc<crate::render_side::TestGate>,
+    /// A scenario's choice waits here, its labels found ready.
+    ready_gate: Arc<crate::render_side::TestGate>,
+    /// The decision labels' readiness asked so far.
+    ready_checks: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// The decision screens sent so far.
+    decisions_sent: Box<dyn Fn() -> u64 + Send + Sync>,
 }
 
 impl Side<'_> {
@@ -833,11 +849,26 @@ impl Drop for CloseOnDrop<'_> {
 }
 
 /// What a run gave: how `App::run` ended, the frames drawn and the plays
-/// that ended.
+/// that ended; each decision screen the render thread left, as its record
+/// says, and each presented decision frame's stamp.
 struct Ran {
     ran: Result<(), game::LiveError<crate::render_side::ScreenError>>,
     frames: Vec<Drawn>,
     ended: Vec<game::PlayEnd>,
+    records: Vec<DecisionRecord>,
+    stamps: Vec<(u64, DecisionDrawnAs)>,
+    /// Why the select screen's script failed, if it did.
+    failure: Option<String>,
+}
+
+/// What a run starts with beyond its set: the decision faults the first
+/// decision screen takes, the select screen's script, and whether the
+/// decision labels' work is held at its gate from the start.
+#[derive(Default)]
+struct Opts {
+    faults: Option<crate::dev::DecisionFaults>,
+    script: Option<crate::dev::SelectScript>,
+    hold_labels: bool,
 }
 
 /// `set` installed by production's startup on a render thread of
@@ -846,6 +877,16 @@ struct Ran {
 /// `preset` when given. `helper` runs beside the run; the window closes
 /// when it returns, which ends the run.
 fn run(set: &Set, preset: Option<&str>, helper: impl FnOnce(&Side<'_>) + Send) -> Ran {
+    run_with(set, preset, Opts::default(), helper)
+}
+
+/// [`run`] with `opts`.
+fn run_with(
+    set: &Set,
+    preset: Option<&str>,
+    opts: Opts,
+    helper: impl FnOnce(&Side<'_>) + Send,
+) -> Ran {
     use crate::imports::{Build, Launch, startup};
     let _turn = crate::warp_turn::take();
     // The Lua skins' VMs and the startup's jobs, counted by the importer's
@@ -873,7 +914,18 @@ fn run(set: &Set, preset: Option<&str>, helper: impl FnOnce(&Side<'_>) + Send) -
             }) as Box<dyn Screen>)
         })
     };
-    let link = crate::render_side::tests::spawn_empty_on(make, clock);
+    let decided = Arc::new(Decided::default());
+    let link = crate::render_side::tests::spawn_on_with(
+        make,
+        clock,
+        Box::new(DecidedSink(Arc::clone(&decided))),
+    );
+    if let Some(f) = opts.faults {
+        link.set_decision_faults(f);
+    }
+    let fired = link.decision_faults_fired();
+    let (label_gate, ready_gate) = (link.label_gate(), link.ready_gate());
+    let (ready_checks, decisions_sent) = (link.ready_checks(), link.decisions_sent());
     let build: Build = Arc::new(crate::imports::build);
     let started = startup(
         &link,
@@ -900,6 +952,11 @@ fn run(set: &Set, preset: Option<&str>, helper: impl FnOnce(&Side<'_>) + Send) -
     );
     let book = link.label_book();
     let acks = link.takeover_acks();
+    // Held after the set installed: the labels for the cursor's chart are
+    // asked once the select screen shows.
+    if opts.hold_labels {
+        label_gate.hold(true);
+    }
     let charts = tempfile::tempdir().unwrap();
     // A 7-key chart (its invisible note on key 6) with one note to play.
     let root = charts.path().join("root0");
@@ -913,6 +970,7 @@ fn run(set: &Set, preset: Option<&str>, helper: impl FnOnce(&Side<'_>) + Send) -
     assert!(sel.screen.select_path(&roots[0].join("a.bms")));
     let chart = sel.screen.selected().unwrap().path.clone();
     let menu = Arc::clone(&sel.menu);
+    sel.script = opts.script;
     sel.started(started.notice, started.selection);
     let settings = game::Settings {
         device: game::DeviceSettings::default(),
@@ -966,6 +1024,11 @@ fn run(set: &Set, preset: Option<&str>, helper: impl FnOnce(&Side<'_>) + Send) -
             chart,
             clock,
             acks,
+            fired: Box::new(fired),
+            label_gate: Arc::clone(&label_gate),
+            ready_gate: Arc::clone(&ready_gate),
+            ready_checks: Box::new(ready_checks),
+            decisions_sent: Box::new(decisions_sent),
         };
         let mut app = game::App::new(
             game::DataRoot::new(charts.path().join("app")),
@@ -978,6 +1041,7 @@ fn run(set: &Set, preset: Option<&str>, helper: impl FnOnce(&Side<'_>) + Send) -
             let helper = s.spawn(|| {
                 let _close = CloseOnDrop(controls);
                 let _let_go = LetGo(&seen.gate);
+                let _labels = LetLabelsGo(&label_gate, &ready_gate);
                 let _run = RunClock(clock);
                 helper(&side);
             });
@@ -989,13 +1053,45 @@ fn run(set: &Set, preset: Option<&str>, helper: impl FnOnce(&Side<'_>) + Send) -
         });
         thread.stop().unwrap();
         let ended = rig.ended_plays.iter().map(|(end, _)| *end).collect();
-        (ran, ended)
+        let failure = rig
+            .selection
+            .as_ref()
+            .and_then(|s| s.script.as_ref())
+            .and_then(|s| s.failure().map(str::to_owned));
+        (ran, ended, failure)
     });
-    let (ran, ended) = ran;
+    let (ran, ended, failure) = ran;
+    let records = decided
+        .records
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
+    let stamps = decided
+        .stamps
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .clone();
     Ran {
         ran,
         frames: seen.frames(),
         ended,
+        records,
+        stamps,
+        failure,
+    }
+}
+
+/// Lets the label and ready gates go when dropped, so a helper that fails
+/// leaves neither held.
+struct LetLabelsGo<'a>(
+    &'a crate::render_side::TestGate,
+    &'a crate::render_side::TestGate,
+);
+
+impl Drop for LetLabelsGo<'_> {
+    fn drop(&mut self) {
+        self.0.hold(false);
+        self.1.hold(false);
     }
 }
 
@@ -1034,7 +1130,9 @@ fn first(frames: &[Drawn], from: usize, f: impl Fn(&Frame) -> bool) -> Option<us
 fn full_set_draws_the_decision_then_plays_to_a_skinned_result() {
     for entry in ["s.json", "s.luaskin"] {
         let set = Set::new(entry);
-        let Ran { ran, frames, ended } = run(&set, None, |side| {
+        let Ran {
+            ran, frames, ended, ..
+        } = run(&set, None, |side| {
             side.prepared();
             side.seen.probe.store(true, Ordering::Release);
             let (chosen, origin, mark) = side.choose(MenuKey::Enter);
@@ -1256,4 +1354,333 @@ fn refused_build_routes_the_practice_path() {
 #[test]
 fn refused_build_returns_a_held_refused_load() {
     refused_build_routes(Route::Held);
+}
+
+/// The decision skin frames drawn so far.
+fn skin_frames(frames: &[Drawn]) -> usize {
+    frames
+        .iter()
+        .filter(|d| matches!(d.frame, Frame::Decision { .. }))
+        .count()
+}
+
+impl Side<'_> {
+    /// With the gate held, lets frames through one at a time, the clock
+    /// moved 50 ms on before each, until `done` holds of the frames drawn
+    /// so far: the clock's time then.
+    #[track_caller]
+    fn frames_until(&self, chosen: TimeUs, what: &str, done: impl Fn(&[Drawn]) -> bool) -> TimeUs {
+        self.seen.gate.hold();
+        let mut t = chosen;
+        for k in 1..=40 {
+            if done(&self.seen.frames()) {
+                return t;
+            }
+            t = TimeUs(chosen.0 + k * 50 * MS);
+            self.clock.set(t);
+            self.step_until(what, |_, d| !d.is_empty());
+        }
+        panic!(
+            "never {what}: {:?}",
+            self.seen.frames().iter().rev().take(6).collect::<Vec<_>>()
+        );
+    }
+
+    /// The decision screen left for the loading state: the clock let run
+    /// and the frames let go until the loading state draws.
+    fn to_loading(&self) {
+        self.clock.run();
+        self.seen.gate.release();
+        self.seen.until("the loading state", |d| {
+            d.iter().any(|d| d.frame == Frame::Loading)
+        });
+    }
+}
+
+/// The one decision screen a run left, and its frames' stamps.
+#[track_caller]
+fn one_record(ran: &Ran) -> (DecisionRecord, Vec<DecisionDrawnAs>) {
+    assert!(ran.ran.is_ok(), "{:?}", ran.ran);
+    let [r] = ran.records[..] else {
+        panic!("one decision screen: {:?}", ran.records);
+    };
+    let stamps = ran
+        .stamps
+        .iter()
+        .filter(|(l, _)| *l == r.lifetime)
+        .map(|&(_, s)| s)
+        .collect();
+    (r, stamps)
+}
+
+/// A decision skin's screen, its frames let through at times the test
+/// sets: its builds, counted as an app region of their own, allocate
+/// nothing, and its record says the skin drew, built and presented, with
+/// no allocation (design.md "Scope of No Allocation").
+#[test]
+fn a_decision_skin_screen_allocates_nothing() {
+    let set = Set::new("s.luaskin");
+    let ran = run(&set, None, |side| {
+        side.prepared();
+        let (chosen, ..) = side.choose(MenuKey::Enter);
+        side.frames_until(chosen, "three decision skin frames", |f| {
+            skin_frames(f) >= 3
+        });
+        side.to_loading();
+    });
+    let (r, stamps) = one_record(&ran);
+    assert!(r.skin_allocates_nothing(), "{r:?}");
+    assert!(r.builds >= 3 && r.skin_frames >= 3, "{r:?}");
+    assert_eq!(r.presentation(), "skin");
+    assert!(
+        stamps.iter().all(|s| *s == DecisionDrawnAs::Skin),
+        "{stamps:?}"
+    );
+    assert_eq!(stamps.len() as u64, r.skin_frames);
+}
+
+/// The third decision skin build made to allocate inside the skin's own
+/// build: the allocation is counted, once, and the fault fired.
+#[test]
+fn a_later_decision_build_made_to_allocate_is_counted() {
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        faults: Some(crate::dev::DecisionFaults::parse("alloc3")),
+        ..Opts::default()
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        side.prepared();
+        let (chosen, ..) = side.choose(MenuKey::Enter);
+        side.frames_until(chosen, "four decision skin frames", |f| skin_frames(f) >= 4);
+        assert_eq!((side.fired)(), 1, "the fault fired");
+        side.to_loading();
+    });
+    let (r, _) = one_record(&ran);
+    assert_eq!(r.app, 1, "{r:?}");
+    assert!(r.builds >= 4, "{r:?}");
+    assert_eq!(r.presentation(), "skin");
+    assert!(!r.skin_allocates_nothing());
+}
+
+/// The second build made to allocate inside the skin's build, then
+/// refused: its allocation counts, exactly once (the refusal's report and
+/// takeover outside the region); the screen fell back, the refused frame
+/// itself and every later one drawn as the fallback, never as the
+/// built-in presentation chosen.
+#[test]
+fn a_refused_allocating_build_is_counted() {
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        faults: Some(crate::dev::DecisionFaults::parse("allocrefuse2")),
+        ..Opts::default()
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        side.prepared();
+        let (chosen, ..) = side.choose(MenuKey::Enter);
+        side.frames_until(chosen, "the refused build's page", |f| {
+            f.iter().any(|d| matches!(d.frame, Frame::Page(_)))
+        });
+        assert_eq!((side.fired)(), 1, "the fault fired");
+        side.to_loading();
+    });
+    let (r, stamps) = one_record(&ran);
+    assert_eq!(r.app, 1, "{r:?}");
+    assert_eq!(r.builds, 2, "{r:?}");
+    assert_eq!(r.fell_back, Some(DecisionFallback::Refused));
+    assert_eq!(r.presentation(), "fallback:refused");
+    assert_eq!(stamps.first(), Some(&DecisionDrawnAs::Skin), "{stamps:?}");
+    assert!(stamps.len() >= 2, "{stamps:?}");
+    assert!(
+        stamps
+            .iter()
+            .skip(1)
+            .all(|s| *s == DecisionDrawnAs::Fallback),
+        "{stamps:?}"
+    );
+}
+
+/// The second skin frame made to allocate before its submission, outside
+/// the counted build: nothing is counted (the region's negative control).
+#[test]
+fn a_submission_allocation_is_not_counted() {
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        faults: Some(crate::dev::DecisionFaults::parse("submitalloc2")),
+        ..Opts::default()
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        side.prepared();
+        let (chosen, ..) = side.choose(MenuKey::Enter);
+        side.frames_until(chosen, "three decision skin frames", |f| {
+            skin_frames(f) >= 3
+        });
+        assert_eq!((side.fired)(), 1, "the fault fired");
+        side.to_loading();
+    });
+    let (r, _) = one_record(&ran);
+    assert!(r.skin_allocates_nothing(), "{r:?}");
+}
+
+/// A build made to allocate before a lost frame and one after the screen
+/// was built again both count, in one record the recovery kept; the frames
+/// after it are the skin's again.
+#[test]
+fn allocations_before_and_after_recovery_both_count() {
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        faults: Some(crate::dev::DecisionFaults::parse("alloc2,lost3,alloc5")),
+        ..Opts::default()
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        side.prepared();
+        let (chosen, ..) = side.choose(MenuKey::Enter);
+        side.frames_until(chosen, "skin frames after the recovery", |f| {
+            skin_frames(f) >= 5
+        });
+        assert_eq!((side.fired)(), 3, "every fault fired");
+        side.to_loading();
+    });
+    let (r, stamps) = one_record(&ran);
+    assert_eq!(r.app, 2, "{r:?}");
+    assert!(r.builds >= 5, "{r:?}");
+    assert_eq!(r.presentation(), "skin");
+    assert!(
+        stamps.iter().all(|s| *s == DecisionDrawnAs::Skin),
+        "{stamps:?}"
+    );
+}
+
+/// The origin of a select step, for a script made of compiled steps.
+fn select_origin() -> crate::dev::scenario::Origin {
+    crate::dev::scenario::Origin {
+        index: 1,
+        kind: crate::dev::scenario::StepKind::Select,
+    }
+}
+
+/// A script that waits for the decision skin's labels (`decision =
+/// "skin"`), then chooses with `choose`.
+fn ready_script(choose: crate::dev::SelectStep) -> crate::dev::SelectScript {
+    let o = select_origin();
+    crate::dev::SelectScript::compiled(vec![
+        (crate::dev::SelectStep::DecisionReady, o),
+        (choose, o),
+    ])
+}
+
+/// A scenario's choice with `decision = "skin"` (its compiled steps, run
+/// by the select screen's script on the rig), its labels' work held at
+/// its gate: the script asks the readiness again and again and sends no
+/// decision screen; let go, the labels are prepared and the choice pins
+/// them, the skin chosen. For a play (Enter) and a practice (P).
+#[test]
+fn a_scenario_choice_waits_for_its_labels() {
+    for choose in [
+        crate::dev::SelectStep::Enter,
+        crate::dev::SelectStep::PracticeKey(crate::dev::scenario::InputRef::Auto),
+    ] {
+        let set = Set::new("s.luaskin");
+        let what = format!("{choose:?}");
+        let opts = Opts {
+            script: Some(ready_script(choose)),
+            hold_labels: true,
+            ..Opts::default()
+        };
+        let ran = run_with(&set, None, opts, |side| {
+            assert!(
+                wait_until(|| side.label_gate.waiting()),
+                "{what}: the labels' work held"
+            );
+            let from = (side.ready_checks)();
+            assert!(
+                wait_until(|| (side.ready_checks)() >= from + 3),
+                "{what}: asked again"
+            );
+            assert_eq!(
+                (side.decisions_sent)(),
+                0,
+                "{what}: chosen before its labels"
+            );
+            side.label_gate.hold(false);
+            side.seen.until("a decision skin frame", |d| {
+                d.iter().any(|d| matches!(d.frame, Frame::Decision { .. }))
+            });
+            assert_eq!((side.decisions_sent)(), 1, "{what}");
+        });
+        assert!(ran.failure.is_none(), "{what}: {:?}", ran.failure);
+        let r = ran.records.first().expect("the decision screen left");
+        assert!(r.skin, "{what}: {r:?}");
+    }
+}
+
+/// The labels found ready, then gone before the choice (the book marked
+/// unhealthy while the script waits at its ready gate): the choice pins
+/// nothing, and the script fails naming the step. For a play and a
+/// practice.
+#[test]
+fn a_pin_lost_after_readiness_fails_its_step() {
+    for choose in [
+        crate::dev::SelectStep::Enter,
+        crate::dev::SelectStep::PracticeKey(crate::dev::scenario::InputRef::Auto),
+    ] {
+        let set = Set::new("s.luaskin");
+        let what = format!("{choose:?}");
+        let opts = Opts {
+            script: Some(ready_script(choose)),
+            ..Opts::default()
+        };
+        let ran = run_with(&set, None, opts, |side| {
+            side.ready_gate.hold(true);
+            assert!(
+                wait_until(|| side.ready_gate.waiting()),
+                "{what}: found ready"
+            );
+            lock(side.book).set_unhealthy();
+            side.ready_gate.hold(false);
+            assert!(
+                wait_until(|| (side.decisions_sent)() == 1),
+                "{what}: chosen"
+            );
+        });
+        let failure = ran.failure.expect("the script failed");
+        assert!(
+            failure.contains("the decision skin's labels were not pinned at the choice"),
+            "{what}: {failure}"
+        );
+        assert!(
+            failure.contains(&format!("{}", select_origin())),
+            "{what}: {failure}"
+        );
+        assert!(
+            ran.records.iter().all(|r| !r.skin),
+            "{what}: {:?}",
+            ran.records
+        );
+    }
+}
+
+/// A choice without `decision = "skin"` does not wait: its labels' work
+/// held, it is chosen at once, the built-in presentation drawn, and the
+/// script does not fail.
+#[test]
+fn a_choice_without_the_option_does_not_wait() {
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        script: Some(crate::dev::SelectScript::compiled(vec![(
+            crate::dev::SelectStep::Enter,
+            select_origin(),
+        )])),
+        hold_labels: true,
+        ..Opts::default()
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        assert!(
+            wait_until(|| (side.decisions_sent)() == 1),
+            "chosen at once"
+        );
+        side.label_gate.hold(false);
+    });
+    assert!(ran.failure.is_none(), "{:?}", ran.failure);
+    let r = ran.records.first().expect("the decision screen left");
+    assert!(!r.skin, "{r:?}");
 }

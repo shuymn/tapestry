@@ -479,6 +479,13 @@ pub trait Screen: Send {
     fn decision_fault(&mut self, settle: bool) {
         let _ = settle;
     }
+    /// The next decision build allocates inside the skin's build, then
+    /// refuses when `refuse` (dev-tools: the allocation count's faults).
+    /// Nothing by default.
+    #[cfg(feature = "dev-tools")]
+    fn allocate_in_next_decision(&mut self, refuse: bool) {
+        let _ = refuse;
+    }
 
     /// The result frame last built, its quads (dev-tools tests); none by
     /// default.
@@ -1242,6 +1249,13 @@ pub trait FrameSink: Send {
     /// does for the frames drawn so far is done when this returns.
     #[cfg(feature = "dev-tools")]
     fn finish(&mut self) {}
+
+    /// The render thread left a decision screen: what it drew, as its
+    /// record says, after every frame of it (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    fn decision_left(&mut self, record: &crate::measure::DecisionRecord) {
+        let _ = record;
+    }
 }
 
 /// No frame sink.
@@ -1391,6 +1405,24 @@ struct Shared {
     /// presentation (tests).
     #[cfg(test)]
     decision_gate: Arc<TestGate>,
+    /// The decision screen's faults the next decision skin build takes,
+    /// counted from it, in place of the environment's (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    decision_faults: Mutex<Option<crate::dev::DecisionFaults>>,
+    /// The decision faults fired so far (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    decision_faults_fired: AtomicU64,
+    /// The decision labels' work waits here at a frame boundary with work
+    /// to do, while a test holds it (tests).
+    #[cfg(test)]
+    label_gate: Arc<TestGate>,
+    /// A scenario's choice waits here after its labels were found ready,
+    /// before it chooses, while a test holds it (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    ready_gate: Arc<TestGate>,
+    /// The decision labels' readiness asked so far (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    ready_checks: AtomicU64,
     /// A takeover waits here between its lifetime's check and its
     /// publication while a test holds it (tests).
     #[cfg(test)]
@@ -1529,6 +1561,16 @@ impl Shared {
             decision_sent: Mutex::new(None),
             #[cfg(test)]
             decision_gate: Arc::default(),
+            #[cfg(all(test, feature = "dev-tools"))]
+            decision_faults: Mutex::new(None),
+            #[cfg(all(test, feature = "dev-tools"))]
+            decision_faults_fired: AtomicU64::new(0),
+            #[cfg(test)]
+            label_gate: Arc::default(),
+            #[cfg(all(test, feature = "dev-tools"))]
+            ready_gate: Arc::default(),
+            #[cfg(all(test, feature = "dev-tools"))]
+            ready_checks: AtomicU64::new(0),
             #[cfg(test)]
             takeover_gate: TestGate::default(),
             #[cfg(test)]
@@ -3140,6 +3182,71 @@ impl RenderLink {
         book.pin(chart, revision, lifetime)
     }
 
+    /// Whether [`pin_decision`](Self::pin_decision) would pin a slot for
+    /// `chart`'s labels of `revision` and `strings` now, without pinning
+    /// one (dev-tools: a scenario's choice waits for it).
+    #[cfg(feature = "dev-tools")]
+    pub fn decision_ready(
+        &self,
+        chart: &std::path::Path,
+        revision: u64,
+        strings: &skin_model::DecisionStrings,
+    ) -> bool {
+        #[cfg(all(test, feature = "dev-tools"))]
+        self.shared.ready_checks.fetch_add(1, Ordering::SeqCst);
+        let book = render::lock(&self.shared.labels);
+        if !book.healthy() {
+            return false;
+        }
+        (0..render::LABEL_SLOTS).any(|i| match book.state(i) {
+            Some(render::LabelState::Ready {
+                generation, key, ..
+            }) if key.chart == chart && key.revision == revision => {
+                crate::decision_side::prepared_holds(&self.shared.prepared, i, *generation, strings)
+            }
+            _ => false,
+        })
+    }
+
+    /// The decision faults the next decision skin build takes, counted
+    /// from it (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn set_decision_faults(&self, faults: crate::dev::DecisionFaults) {
+        *self
+            .shared
+            .decision_faults
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(faults);
+    }
+
+    /// The decision faults fired so far, read from any thread (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn decision_faults_fired(&self) -> impl Fn() -> u64 + Send + Sync + 'static {
+        let shared = Arc::clone(&self.shared);
+        move || shared.decision_faults_fired.load(Ordering::SeqCst)
+    }
+
+    /// The decision labels' readiness asked so far, read from any thread
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn ready_checks(&self) -> impl Fn() -> u64 + Send + Sync + 'static {
+        let shared = Arc::clone(&self.shared);
+        move || shared.ready_checks.load(Ordering::SeqCst)
+    }
+
+    /// The gate the decision labels' work waits at (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn label_gate(&self) -> Arc<TestGate> {
+        Arc::clone(&self.shared.label_gate)
+    }
+
+    /// The gate a scenario's choice waits at after its labels were found
+    /// ready (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn ready_gate(&self) -> Arc<TestGate> {
+        Arc::clone(&self.shared.ready_gate)
+    }
+
     /// The strings the label slots were prepared from, as the choice reads
     /// them (tests).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -3222,7 +3329,7 @@ impl RenderLink {
     /// How many decision presentations were sent, readable from another
     /// thread (tests).
     #[cfg(all(test, feature = "dev-tools"))]
-    pub fn decisions_sent(&self) -> impl Fn() -> u64 + Send + 'static {
+    pub fn decisions_sent(&self) -> impl Fn() -> u64 + Send + Sync + 'static {
         let shared = Arc::clone(&self.shared);
         move || shared.decisions_sent.load(Ordering::SeqCst)
     }
@@ -3826,6 +3933,12 @@ pub fn spawn(
                 decision_shown: None,
                 decision_screen: None,
                 decision_side: None,
+                #[cfg(feature = "dev-tools")]
+                decision_record: None,
+                #[cfg(feature = "dev-tools")]
+                pending_decision: None,
+                #[cfg(feature = "dev-tools")]
+                decision_faults: crate::dev::DecisionFaults::read(),
                 decision_want: None,
                 decision_disabled: None,
                 decision_next: 1,
@@ -4965,6 +5078,17 @@ struct Run {
     decision_screen: Option<skin_model::DecisionScreen>,
     /// The committed decision installation's label preparation.
     decision_side: Option<crate::decision_side::DecisionSide>,
+    /// The decision screen drawn now, as the allocation count records it
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    decision_record: Option<crate::measure::DecisionRecord>,
+    /// The decision screen left last, for the next play's figures
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pending_decision: Option<crate::measure::DecisionRecord>,
+    /// The decision screen's faults and their counts (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    decision_faults: crate::dev::DecisionFaults,
     /// The chart the selection cursor rests on, its labels asked of the
     /// preparation; kept after selection is left.
     decision_want: Option<crate::decision_side::Want>,
@@ -5244,6 +5368,18 @@ impl Run {
                     // the turntable is not adopted or ticked (design.md
                     // "State Model").
                     self.page_turns = false;
+                    // A decision screen still drawn is left: another
+                    // lifetime's replaces it (dev-tools).
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        self.leave_decision();
+                        // Another decision lifetime: the last one's record
+                        // leads no play.
+                        self.pending_decision = None;
+                        self.decision_record = shown.map(|s| {
+                            crate::measure::DecisionRecord::new(s.lifetime, s.slot.is_some())
+                        });
+                    }
                     self.decision = Some(page.clone());
                     // The presentation chosen at the choice is not checked
                     // again here: a later invalidation is a recovery or a
@@ -5276,6 +5412,10 @@ impl Run {
                 }
                 Ok(RenderMsg::SelectionChanged) => {
                     self.clear_decision();
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        self.pending_decision = None;
+                    }
                     self.take_selection();
                     mode = match mode {
                         // The launch screen shows out its time, the
@@ -5508,7 +5648,19 @@ impl Run {
                     // carry waits for its settlement.
                     self.carries.on(crate::carry::Event::Started);
                     self.turntable.play_starts();
+                    // A decision screen is left by the loading state or
+                    // the practice page before any play (dev-tools).
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        debug_assert!(
+                            self.decision_record.is_none(),
+                            "a play started on a decision screen not left"
+                        );
+                        self.leave_decision();
+                    }
                     self.measure.start(*measure);
+                    #[cfg(feature = "dev-tools")]
+                    self.measure.led_by(self.pending_decision.take());
                     self.shared.first_frame.store(i64::MIN, Ordering::Release);
                     mode = Mode::Play {
                         origin,
@@ -5579,7 +5731,12 @@ impl Run {
                         charged,
                     });
                 }
-                Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => return,
+                Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => {
+                    // A decision screen still drawn is reported.
+                    #[cfg(feature = "dev-tools")]
+                    self.leave_decision();
+                    return;
+                }
                 Err(TryRecvError::Empty) => {
                     #[cfg(test)]
                     self.shared
@@ -5867,6 +6024,24 @@ impl Run {
             // A decision frame that drew its page without a refusal (its
             // lifetime ended): the page mode takes the screen.
             let mut decision_fallback = false;
+            // What a frame of the decision screen drew (dev-tools): the
+            // page drawn for it is decided by its record; the skinned
+            // screen's frame by its build below.
+            #[cfg(feature = "dev-tools")]
+            let mut decision_as = match (&mode, &self.decision_record) {
+                (Mode::Menu { loading: None, .. }, Some(r))
+                    if self.decision.is_some() && !self.page_turns =>
+                {
+                    Some(if r.ended {
+                        crate::measure::DecisionDrawnAs::Ended
+                    } else if r.skin {
+                        crate::measure::DecisionDrawnAs::Fallback
+                    } else {
+                        crate::measure::DecisionDrawnAs::BuiltIn
+                    })
+                }
+                _ => None,
+            };
             // The select update a selection frame applied, and what a
             // result frame drew (dev-tools: a scenario's captures).
             #[cfg(feature = "dev-tools")]
@@ -6418,6 +6593,32 @@ impl Run {
                         continue;
                     };
                     let active = render::lock(&self.shared.labels).active();
+                    // Faults a test set since, counted from this build.
+                    #[cfg(all(test, feature = "dev-tools"))]
+                    if let Some(f) = self
+                        .shared
+                        .decision_faults
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .take()
+                    {
+                        self.decision_faults = f;
+                    }
+                    // A fault due for this build (dev-tools).
+                    #[cfg(feature = "dev-tools")]
+                    if shown.slot.is_some()
+                        && let Some(refuse) = self.decision_faults.build()
+                    {
+                        screen.allocate_in_next_decision(refuse);
+                    }
+                    // The decision skin's build, an app region of its own
+                    // (design.md "Scope of No Allocation"): from the label
+                    // lookup through the staging, left before its outcome
+                    // is looked at.
+                    #[cfg(feature = "dev-tools")]
+                    let app_before = crate::alloc_count::app_allocations();
+                    #[cfg(feature = "dev-tools")]
+                    let region = crate::alloc_count::AppRegion::enter();
                     let built = crate::decision_side::decision_build(
                         screen.as_mut(),
                         dec,
@@ -6428,9 +6629,51 @@ impl Run {
                         shown,
                         frame_at,
                     );
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        drop(region);
+                        let app = crate::alloc_count::app_allocations().saturating_sub(app_before);
+                        if let Some(r) = &mut self.decision_record {
+                            r.app = r.app.saturating_add(app);
+                            if matches!(
+                                built,
+                                crate::decision_side::DecisionDrawn::Built
+                                    | crate::decision_side::DecisionDrawn::Refused(_)
+                            ) {
+                                r.builds = r.builds.saturating_add(1);
+                            }
+                            if matches!(built, crate::decision_side::DecisionDrawn::Ended) {
+                                r.ended = true;
+                            }
+                        }
+                        decision_as = Some(match built {
+                            crate::decision_side::DecisionDrawn::Built => {
+                                crate::measure::DecisionDrawnAs::Skin
+                            }
+                            crate::decision_side::DecisionDrawn::Ended => {
+                                crate::measure::DecisionDrawnAs::Ended
+                            }
+                            _ => crate::measure::DecisionDrawnAs::Fallback,
+                        });
+                    }
                     match built {
                         crate::decision_side::DecisionDrawn::Built => {
-                            screen.submit_decision().map(|t| (t, None))
+                            // Faults due for this frame (dev-tools): an
+                            // allocation before the submission, outside the
+                            // counted build, and a frame drawn lost.
+                            #[cfg(feature = "dev-tools")]
+                            let (alloc, lost) = self.decision_faults.submit();
+                            #[cfg(feature = "dev-tools")]
+                            if alloc {
+                                drop(std::hint::black_box(Box::new(0_u8)));
+                            }
+                            let drawn = screen.submit_decision().map(|t| (t, None));
+                            #[cfg(feature = "dev-tools")]
+                            let drawn = match drawn {
+                                Ok(_) if lost => Err(RenderError::SurfaceLost),
+                                other => other,
+                            };
+                            drawn
                         }
                         other => {
                             // Refused on a healthy device: the page draws in
@@ -6480,6 +6723,25 @@ impl Run {
                 }
                 other => other,
             };
+            // The decision screen's frame counted in its record
+            // (dev-tools).
+            #[cfg(feature = "dev-tools")]
+            {
+                #[cfg(test)]
+                self.shared
+                    .decision_faults_fired
+                    .store(self.decision_faults.fired, Ordering::SeqCst);
+                if let (Some(r), Some(drew)) = (&mut self.decision_record, decision_as)
+                    && matches!(&drawn, Ok((t, _)) if t.presented)
+                {
+                    let n = match drew {
+                        crate::measure::DecisionDrawnAs::Skin => &mut r.skin_frames,
+                        crate::measure::DecisionDrawnAs::Ended => &mut r.ended_frames,
+                        _ => &mut r.page_frames,
+                    };
+                    *n = n.saturating_add(1);
+                }
+            }
             // The page drew in place of the skin: the page mode takes the
             // screen from the next frame, its layout kept (prepared once).
             // A refusal is the takeover's; an ended lifetime's screen only
@@ -6590,6 +6852,12 @@ impl Run {
                         selection: selection_stamp,
                         #[cfg(feature = "dev-tools")]
                         result: result_stamp,
+                        #[cfg(feature = "dev-tools")]
+                        decision: self
+                            .decision_record
+                            .as_ref()
+                            .zip(decision_as)
+                            .map(|(r, drew)| (r.lifetime, drew)),
                         #[cfg(feature = "dev-tools")]
                         presented_at,
                         #[cfg(feature = "dev-tools")]
@@ -7579,9 +7847,35 @@ impl Run {
     /// and its skin's state. Its slot is retired once the game ends its
     /// lifetime.
     fn clear_decision(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        self.leave_decision();
         self.decision = None;
         self.decision_shown = None;
         self.decision_screen = None;
+    }
+
+    /// The decision screen drawn is left (dev-tools): its record reported
+    /// on stdout and to the frame sink, after every frame of it, and kept
+    /// for the next play's figures.
+    #[cfg(feature = "dev-tools")]
+    fn leave_decision(&mut self) {
+        if let Some(r) = self.decision_record.take() {
+            println!("{}", r.line());
+            self.frames.decision_left(&r);
+            self.pending_decision = Some(r);
+        }
+    }
+
+    /// The decision screen's record notes why it fell back, the first
+    /// reason kept (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    const fn fell_back(&mut self, why: crate::measure::DecisionFallback) {
+        if let Some(r) = &mut self.decision_record
+            && r.skin
+            && r.fell_back.is_none()
+        {
+            r.fell_back = Some(why);
+        }
     }
 
     /// The skinned decision screen begins: the skin's state made afresh,
@@ -7595,6 +7889,8 @@ impl Run {
                 self.decision_screen = Some(side.bundle().skin().prepare_decision());
             }
             None => {
+                #[cfg(feature = "dev-tools")]
+                self.fell_back(crate::measure::DecisionFallback::NotInstalled);
                 let now = self.clock.now();
                 self.take_over(now, "the decision skin is not installed".to_owned());
             }
@@ -7619,6 +7915,10 @@ impl Run {
             return false;
         };
         let book = Arc::clone(&self.shared.labels);
+        #[cfg(test)]
+        if side.busy(screen.target(), self.decision_want.as_ref()) {
+            self.shared.label_gate.pass();
+        }
         match side.boundary(screen, self.decision_want.as_ref()) {
             crate::decision_side::Boundary::Quiet => {}
             crate::decision_side::Boundary::Refused(e) => {
@@ -7651,6 +7951,8 @@ impl Run {
     /// woken for a refusal's takeover finds its notice.
     fn decision_frame_refused(&mut self, e: BuildError, at: TimeUs) {
         let why = format!("the decision skin refused its frame: {}", Chain(&e));
+        #[cfg(feature = "dev-tools")]
+        self.fell_back(crate::measure::DecisionFallback::Refused);
         self.disable_decision(why.clone());
         self.take_over(at, why);
     }
@@ -7660,6 +7962,10 @@ impl Run {
     /// the game thread, which is woken, only while that lifetime is the
     /// active one; another lifetime's is dropped.
     fn take_over(&mut self, at: TimeUs, why: String) {
+        #[cfg(feature = "dev-tools")]
+        if self.decision_shown.is_some() {
+            self.fell_back(crate::measure::DecisionFallback::TakenOver);
+        }
         let Some(shown) = self.decision_shown.as_mut() else {
             return;
         };
@@ -10565,16 +10871,16 @@ pub(crate) mod tests {
 
     /// [`spawn_empty`] on `clock`, a game rig's.
     pub(crate) fn spawn_empty_on(make: MakeScreen, clock: QpcClock) -> super::RenderLink {
-        spawn(
-            make,
-            None,
-            None,
-            clock,
-            view(),
-            measure(clock),
-            Box::new(NoFrames),
-        )
-        .unwrap()
+        spawn_on_with(make, clock, Box::new(NoFrames))
+    }
+
+    /// [`spawn_empty_on`] with the frame sink `frames`.
+    pub(crate) fn spawn_on_with(
+        make: MakeScreen,
+        clock: QpcClock,
+        frames: Box<dyn super::FrameSink>,
+    ) -> super::RenderLink {
+        spawn(make, None, None, clock, view(), measure(clock), frames).unwrap()
     }
 
     /// A screen whose skin refuses every section's attempt and fails its

@@ -969,6 +969,41 @@ impl Selection {
         }
     }
 
+    /// A scenario's `decision = "skin"` step due (dev-tools): done once the
+    /// decision skin's labels for the chart under the cursor are ready to
+    /// pin on `render`, the choice that follows then required to pin them;
+    /// until then the steps wait, and the step fails after its timeout.
+    #[cfg(feature = "dev-tools")]
+    fn decision_ready_step(&mut self, render: &RenderLink, controls: &Controls) {
+        let Some(script) = &mut self.script else {
+            return;
+        };
+        if script.front() != Some(&SelectStep::DecisionReady) {
+            return;
+        }
+        let ready = self.screen.selected().is_some_and(|e| {
+            let l = decision_labels(&e.header);
+            render.decision_ready(
+                &e.path,
+                crate::decision_side::labels_revision(&l),
+                &crate::decision_side::decision_strings(&l),
+            )
+        });
+        if !ready {
+            if script.expired() {
+                script.fail("the decision skin's labels were not ready".to_owned());
+                controls.close();
+            }
+            return;
+        }
+        // A test may change the label book here, between the labels found
+        // ready and the choice.
+        #[cfg(all(test, feature = "dev-tools"))]
+        render.ready_gate().pass();
+        script.skin_decision = script.origin();
+        script.done();
+    }
+
     /// Runs the scripted steps due on the select screen. A step that types
     /// puts its input on the window's queue, as the window does, and the
     /// steps stop there until the queue is taken: `true` then. `drawn` is
@@ -1128,6 +1163,9 @@ impl Selection {
                     }
                 }
                 Some(SelectStep::Enter) => typed.push(MenuInput::Key(MenuKey::Enter)),
+                // The rig answers it, with the render thread's label book
+                // ([`SelectionState::decision_ready_step`]).
+                Some(SelectStep::DecisionReady) => return false,
                 Some(SelectStep::PrevPreset) => typed.push(MenuInput::Key(MenuKey::PrevPreset)),
                 Some(SelectStep::NextPreset) => typed.push(MenuInput::Key(MenuKey::NextPreset)),
                 Some(SelectStep::PracticeKey(_)) => {
@@ -2310,6 +2348,10 @@ impl PlayerRig<'_> {
         );
         sel.panels(self.panels.as_ref(), self.clock.now());
         #[cfg(feature = "dev-tools")]
+        if chosen.is_none() {
+            sel.decision_ready_step(&self.render, self.controls);
+        }
+        #[cfg(feature = "dev-tools")]
         if chosen.is_none()
             && sel.script(
                 self.controls,
@@ -3322,6 +3364,19 @@ impl AppRig for PlayerRig<'_> {
             self.render
                 .pin_decision(chart, revision, &strings, lifetime.0)
         });
+        // A scenario's choice that must pin the decision skin's labels
+        // (`decision = "skin"`) fails its step when it did not (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        if let Some(script) = self.selection.as_mut().and_then(|s| s.script.as_mut())
+            && let Some(origin) = script.skin_decision.take()
+            && pinned.is_none()
+        {
+            script.fail_at(
+                origin,
+                "the decision skin's labels were not pinned at the choice",
+            );
+            self.controls.close();
+        }
         let (slot, shown, timing) = match pinned {
             Some((slot, generation, timing)) => (
                 Some((slot, generation)),

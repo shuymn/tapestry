@@ -1148,6 +1148,11 @@ impl Screen for MenuScreen {
         Ok(timing)
     }
 
+    #[cfg(feature = "dev-tools")]
+    fn allocate_in_next_decision(&mut self, refuse: bool) {
+        self.renderer.allocate_in_next_decision(refuse);
+    }
+
     #[cfg(all(test, feature = "dev-tools"))]
     fn decision_fault(&mut self, settle: bool) {
         if settle {
