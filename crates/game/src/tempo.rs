@@ -11,26 +11,12 @@
 //! shares the chart's timeline and holds nothing else on the heap; MAIN's
 //! histogram lives only while the references are prepared.
 
-use bms_model::{Chart, ChartTimeline, LnMode, MAX_TIMELINE_POINTS, NoteKind, Speed, Tempo};
-use bms_model::{TempoMeta, TimeUs, TimelineId};
+pub use bms_model::MAIN_HISTOGRAM_LIMIT;
+use bms_model::{Chart, ChartTimeline, MainError, Speed, Tempo, TempoMeta, TimeUs};
 use eval::Section;
 
 use crate::adjustment::TempoMap;
 use crate::hispeed::{HiSpeedReference, Ratio, References};
-
-/// One tempo of MAIN's histogram: its weight and its earliest weighted
-/// row.
-#[derive(Clone, Copy, Debug)]
-struct Bin {
-    tempo: Tempo,
-    weight: u64,
-    earliest: TimelineId,
-}
-
-/// The bytes MAIN's histogram takes at most: one bin for each run of rows
-/// sharing a tempo, and a timeline holds at most [`MAX_TIMELINE_POINTS`]
-/// rows.
-pub const MAIN_HISTOGRAM_LIMIT: usize = MAX_TIMELINE_POINTS * size_of::<Bin>();
 
 /// Why an attempt's reference tempos are unavailable.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -187,59 +173,14 @@ pub(crate) fn whole_main(chart: &Chart, limit: usize) -> Result<Tempo, Reference
     main(chart, None, limit)
 }
 
-/// MAIN's tempo ([`AttemptTempo::prepare_within`]).
+/// MAIN's tempo ([`AttemptTempo::prepare_within`]): the chart's
+/// ([`bms_model::main_tempo`]), weighed by the section's targets only.
 fn main(chart: &Chart, section: Option<&Section>, limit: usize) -> Result<Tempo, ReferenceError> {
-    let timeline = &chart.timeline;
-    let runs = timeline.points().chunk_by(|a, b| a.tempo == b.tempo);
-    // Every distinct tempo of the rows has a bin; the runs bound them.
-    let count = runs.clone().count();
-    let needed = count.saturating_mul(size_of::<Bin>());
-    let refused = ReferenceError::Histogram { needed, limit };
-    if needed > limit {
-        return Err(refused);
-    }
-    let mut bins: Vec<Bin> = Vec::new();
-    bins.try_reserve_exact(count).map_err(|_| refused)?;
-    bins.extend(runs.filter_map(|run| {
-        run.first().map(|p| Bin {
-            tempo: p.tempo,
-            weight: 0,
-            earliest: TimelineId(u32::MAX),
-        })
-    }));
-    bins.sort_unstable_by_key(|b| b.tempo);
-    bins.dedup_by_key(|b| b.tempo);
-    let tails = matches!(chart.meta.ln_mode, Some(LnMode::Cn | LnMode::Hcn));
-    for note in chart.lanes.iter().flatten() {
-        if section.is_some_and(|s| !s.is_target(note)) {
-            continue;
-        }
-        let (head, end) = match note.kind {
-            NoteKind::Tap => (true, false),
-            NoteKind::Long { .. } => (true, tails),
-            NoteKind::Mine { .. } => (false, false),
-        };
-        let ids = [
-            head.then_some(note.anchors.head),
-            end.then_some(note.anchors.end),
-        ];
-        for id in ids.into_iter().flatten() {
-            let tempo = timeline.point(id).ok_or(ReferenceError::Link(id.0))?.tempo;
-            // Every row's tempo has its bin.
-            let bin = bins
-                .binary_search_by_key(&tempo, |b| b.tempo)
-                .ok()
-                .and_then(|i| bins.get_mut(i))
-                .ok_or(ReferenceError::Link(id.0))?;
-            bin.weight += 1;
-            bin.earliest = bin.earliest.min(id);
-        }
-    }
-    let heaviest = bins
-        .iter()
-        .filter(|b| b.weight > 0)
-        .min_by_key(|b| (std::cmp::Reverse(b.weight), b.earliest));
-    Ok(heaviest.map_or(timeline.meta().initial, |b| b.tempo))
+    let keep = |note: &bms_model::Note| section.is_none_or(|s| s.is_target(note));
+    bms_model::main_tempo(chart, keep, limit).map_err(|e| match e {
+        MainError::Histogram { needed, limit } => ReferenceError::Histogram { needed, limit },
+        MainError::Link(row) => ReferenceError::Link(row),
+    })
 }
 
 #[cfg(test)]

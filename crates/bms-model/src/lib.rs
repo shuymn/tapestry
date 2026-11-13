@@ -12,6 +12,8 @@ mod builder;
 mod chart;
 mod clock;
 mod error;
+mod info;
+mod main_tempo;
 mod presentation;
 mod profile;
 mod scroll;
@@ -25,6 +27,8 @@ pub use chart::{
 };
 pub use clock::{TimeSource, VirtualClock};
 pub use error::{EndpointLocation, EndpointPart, ModelError, PresentationError};
+pub use info::{ChartInfo, END_WINDOW_SECONDS};
+pub use main_tempo::{MAIN_HISTOGRAM_LIMIT, MainError, main_tempo};
 pub use profile::{
     ChartProfile, KEY_LONG_BODY, KEY_LONG_HEAD, KEY_TAP, MINE, NOTE_BINS, NOTE_CATEGORIES,
     SCRATCH_LONG_BODY, SCRATCH_LONG_HEAD, SCRATCH_TAP, SpeedRow,
