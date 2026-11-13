@@ -549,6 +549,28 @@ fn score_of(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Score> {
             if best.max_combo < best.play.max_combo {
                 return Err(inconsistent(4, "a best max combo below its play's"));
             }
+            // A best comes from a counted play.
+            if plays == 0 {
+                return Err(inconsistent(0, "a best without a play"));
+            }
+            // A clear is an eligible play whose own lamp is not FAILED, and
+            // the merged lamp is cleared exactly when one of them was.
+            match (clears > 0, best.lamp_cleared()) {
+                (true, false) => return Err(inconsistent(1, "clears with a FAILED lamp")),
+                (false, true) => return Err(inconsistent(1, "a cleared lamp without clears")),
+                _ => {}
+            }
+            // One play is the whole best: its BP and max combo are the
+            // best's.
+            if plays == 1 && best.bp != best.play.bp {
+                return Err(inconsistent(3, "one play whose best BP is not its own"));
+            }
+            if plays == 1 && best.max_combo != best.play.max_combo {
+                return Err(inconsistent(
+                    4,
+                    "one play whose best max combo is not its own",
+                ));
+            }
             Some(best)
         }
     };
@@ -632,7 +654,8 @@ mod tests {
         }
     }
 
-    /// The best a play of `p` sets, its BP, clears and FULL COMBO given.
+    /// The best one play of `p` sets, its BP, clears and FULL COMBO given:
+    /// its values are its play's own, as a counted play's are.
     fn best(p: Breakdown, bp: u32, cleared: u8, full_combo: bool) -> Best {
         Best {
             ex: p.ex,
@@ -640,8 +663,13 @@ mod tests {
             max_combo: p.max_combo,
             cleared: vec![cleared],
             full_combo,
-            play: p,
+            play: Breakdown { bp, ..p },
         }
+    }
+
+    /// The play `c` contributes.
+    fn play_of(c: &Contribution) -> Breakdown {
+        c.best.as_ref().unwrap().play
     }
 
     /// A contribution of the play hashed `body`, saved as `c/<body>.tprl`;
@@ -816,23 +844,68 @@ mod tests {
     #[test]
     fn an_inconsistent_score_is_a_read_error() {
         let conn = database();
-        let c = contribution(3, Some(best(play(3, 6, 3), 0, 1, true)));
+        // One play, cleared, its own BP and max combo the best's.
+        let c = contribution(3, Some(best(play(3, 6, 3), 103, 1, false)));
         super::ingest(&conn, &c).unwrap();
         let score = || super::score(&conn, &c.key);
-        assert!(score().is_ok());
-        for (set, undo) in [
-            ("plays = -1", "plays = 1"),
-            ("clears = -1", "clears = 1"),
-            ("clears = 2", "clears = 1"),
-            ("best_ex = 7", "best_ex = 6"),
-            ("best_bp = 104", "best_bp = 0"),
-            ("best_combo = 2", "best_combo = 3"),
+        assert_eq!(score().unwrap().map(|s| (s.plays, s.clears)), Some((1, 1)));
+        // Each change breaks one relation only, and is read back as that
+        // one.
+        for (set, undo, why) in [
+            (
+                "plays = -1, clears = 0",
+                "plays = 1, clears = 1",
+                "a negative play count",
+            ),
+            ("clears = -1", "clears = 1", "a negative clear count"),
+            (
+                "plays = 2, clears = 3",
+                "plays = 1, clears = 1",
+                "more clears than plays",
+            ),
+            (
+                "best_ex = 7",
+                "best_ex = 6",
+                "a best EX that is not its play's",
+            ),
+            (
+                "plays = 2, best_bp = 104",
+                "plays = 1, best_bp = 103",
+                "a best BP worse than its play's",
+            ),
+            (
+                "plays = 2, best_combo = 2",
+                "plays = 1, best_combo = 3",
+                "a best max combo below its play's",
+            ),
+            (
+                "plays = 0, clears = 0",
+                "plays = 1, clears = 1",
+                "a best without a play",
+            ),
+            (
+                "plays = 2, cleared = x'00'",
+                "plays = 1, cleared = x'01'",
+                "clears with a FAILED lamp",
+            ),
+            ("clears = 0", "clears = 1", "a cleared lamp without clears"),
+            (
+                "best_bp = 102",
+                "best_bp = 103",
+                "one play whose best BP is not its own",
+            ),
+            (
+                "best_combo = 4",
+                "best_combo = 3",
+                "one play whose best max combo is not its own",
+            ),
         ] {
             conn.execute(&format!("UPDATE scores SET {set}"), [])
                 .unwrap();
             let e = score().unwrap_err();
             assert!(
-                matches!(e, rusqlite::Error::FromSqlConversionFailure(..)),
+                matches!(e, rusqlite::Error::FromSqlConversionFailure(..))
+                    && e.to_string().contains(why),
                 "{set}: {e}"
             );
             conn.execute(&format!("UPDATE scores SET {undo}"), [])
@@ -846,7 +919,12 @@ mod tests {
             [],
         )
         .unwrap();
-        assert!(score().is_err());
+        assert!(
+            score()
+                .unwrap_err()
+                .to_string()
+                .contains("clears without a best")
+        );
         conn.execute("UPDATE scores SET clears = 0", []).unwrap();
         assert!(score().unwrap().unwrap().best.is_none());
     }
@@ -856,7 +934,7 @@ mod tests {
         let low = contribution(1, Some(best(play(1, 4, 2), 3, 1, false)));
         let high = contribution(9, Some(best(play(9, 6, 2), 3, 1, false)));
         for order in [[&low, &high], [&high, &low]] {
-            assert_eq!(fold(&order).best.unwrap().play, play(9, 6, 2));
+            assert_eq!(fold(&order).best.unwrap().play, play_of(&high));
         }
     }
 
@@ -865,7 +943,7 @@ mod tests {
         let a = contribution(4, Some(best(play(4, 6, 2), 3, 1, false)));
         let b = contribution(8, Some(best(play(8, 6, 3), 3, 1, false)));
         for order in [[&a, &b], [&b, &a]] {
-            assert_eq!(fold(&order).best.unwrap().play, play(4, 6, 2));
+            assert_eq!(fold(&order).best.unwrap().play, play_of(&a));
         }
     }
 
@@ -878,7 +956,7 @@ mod tests {
         let combo = contribution(3, Some(best(play(3, 80, 100), 30, 1, false)));
         for order in [[&ex, &combo], [&combo, &ex]] {
             let b = fold(&order).best.unwrap();
-            assert_eq!((b.max_combo, b.play), (100, play(2, 90, 50)));
+            assert_eq!((b.max_combo, b.play), (100, play_of(&ex)));
         }
     }
 
@@ -904,7 +982,7 @@ mod tests {
             (5, 3, 6, 1, 9)
         );
         assert_eq!((b.cleared.clone(), b.full_combo), (vec![0b11], true));
-        assert_eq!(b.play, play(4, 6, 3));
+        assert_eq!(b.play, play_of(&cs[1]));
         assert_eq!(b.ex, b.play.ex);
         for order in &all[1..] {
             assert_eq!(fold(order), first);
