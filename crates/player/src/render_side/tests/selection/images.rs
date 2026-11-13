@@ -516,3 +516,65 @@ fn a_refused_selection_skin_is_not_published_again() {
     assert_eq!(w.begun(), begun);
     link.exit();
 }
+
+/// A chart refused before selection's departure (a practice the session
+/// refuses) enters selection again with no departure: the entry is a new
+/// cursor generation whatever row the cursor is on, so with the cursor
+/// moved meanwhile to the all-charts row, the new visit's frames draw
+/// nothing of the last chart's images, and 190 and 192 hold, 191 and 193
+/// not (SX17, through the player's selection on the render thread).
+#[test]
+fn an_entry_with_no_departure_draws_nothing_of_the_last_visit() {
+    use game::AppRig as _;
+
+    use crate::select::MenuKey;
+    use crate::selection::image_tests::{library, look_until, past_rest, press};
+    let _warp = crate::warp_turn::take();
+    let _serial = crate::imports::tests::serial();
+    let (_skin, skin, script) = chart_skin();
+    let (layer, side) = (skin.chart_layer().unwrap(), skin.side());
+    let frames = Frames::default();
+    let (link, ..) = lossy_spawn(None, &Arc::default(), Box::new(frames.clone()));
+    assert_eq!(
+        link.select_with(ScreenKind::Selection, Some(skin), script)
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = library(
+        dir.path(),
+        &[("a.bms", Some("hidden-a.png"), Some("hidden-n.png"))],
+    );
+    let settings = game::Settings {
+        device: game::DeviceSettings::default(),
+        player: game::PlayerSettings::default(),
+    };
+    crate::tests::on_rig_with(settings, link, |rig, _| {
+        rig.adjust = None;
+        rig.selection = Some(sel);
+        rig.selection_chart = Some(side);
+        rig.entered_selection();
+        frames.until(draws_none);
+        // The cursor rests on the chart: its images are drawn.
+        press(rig, MenuKey::Down);
+        assert!(rig.choose().is_none());
+        past_rest();
+        look_until(rig, |w| {
+            w.current_selection().is_some() && w.idle() && !w.selection_pending()
+        });
+        frames.clear();
+        frames.until(|s| draws_images(s, layer));
+        // Refused before the departure: the chart left and selection
+        // entered again, the cursor on the all-charts row meanwhile.
+        assert!(rig.selection.as_mut().unwrap().screen.move_to(0));
+        rig.left_chart().unwrap();
+        rig.entered_selection();
+        for _ in 0..3 {
+            assert!(rig.choose().is_none());
+        }
+        frames.clear();
+        let seen = frames.next(3, None);
+        assert!(seen.iter().all(draws_none), "{:?}", seen.last());
+    });
+}

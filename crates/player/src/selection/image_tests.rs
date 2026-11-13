@@ -53,7 +53,10 @@ fn write(root: &Path, file: &str, stage: Option<&str>, banner: Option<&str>) {
 /// and its images: `hidden-a.png` 640×480, `hidden-b.png` 320×240,
 /// `hidden-n.png` 300×80 and `hidden-m.png` 200×40 (the scan lists no file
 /// named `hidden…`).
-fn library(dir: &Path, charts: &[(&str, Option<&str>, Option<&str>)]) -> (Selection, PathBuf) {
+pub(crate) fn library(
+    dir: &Path,
+    charts: &[(&str, Option<&str>, Option<&str>)],
+) -> (Selection, PathBuf) {
     let root = dir.join("root0");
     for (file, stage, banner) in charts {
         write(&root, file, *stage, *banner);
@@ -264,7 +267,7 @@ impl Drop for LetGo {
 }
 
 /// Pushes `key` on the select screen's queue.
-fn press(rig: &mut crate::play::PlayerRig<'_>, key: MenuKey) {
+pub(crate) fn press(rig: &mut crate::play::PlayerRig<'_>, key: MenuKey) {
     rig.selection
         .as_ref()
         .unwrap()
@@ -273,14 +276,17 @@ fn press(rig: &mut crate::play::PlayerRig<'_>, key: MenuKey) {
 }
 
 /// The rest past, with a little to spare.
-fn past_rest() {
+pub(crate) fn past_rest() {
     std::thread::sleep(Duration::from_micros(
         u64::try_from(REST.0).unwrap() + 30_000,
     ));
 }
 
 /// Looks until `done`, at most 10 s.
-fn look_until(rig: &mut crate::play::PlayerRig<'_>, done: impl Fn(&ChartImageWorker) -> bool) {
+pub(crate) fn look_until(
+    rig: &mut crate::play::PlayerRig<'_>,
+    done: impl Fn(&ChartImageWorker) -> bool,
+) {
     let end = Instant::now() + Duration::from_secs(10);
     while !done(&rig.chart_images) {
         assert!(Instant::now() < end, "{:?}", rig.chart_images);
