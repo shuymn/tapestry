@@ -484,3 +484,58 @@ fn zero_and_negative_scroll_reach_the_rows() {
         ]
     );
 }
+
+/// Fixture TT: a tempo change after the last object reaches the preview's
+/// rows with no shown object at all, as the source's speed list keeps every
+/// timeline: a tap at 0 at 120 BPM, 240 BPM a quarter into the measure
+/// (500 ms). Play's rows stop at the tap.
+#[test]
+fn a_trailing_tempo_change_reaches_the_preview() {
+    let text = "#BPM 120\n#00019:01\n#00003:00F00000\n";
+    let one = bms_model::SCROLL_ONE;
+    assert_eq!(
+        preview(text).speeds(),
+        [speed_row(0, 120, one), speed_row(500, 240, one)]
+    );
+    assert_eq!(
+        load(text, 0).unwrap().profile.speeds(),
+        [speed_row(0, 120, one)]
+    );
+}
+
+/// Fixture TS: a STOP after the last object stops the preview's rows and
+/// ends at its own end: a tap at 0 at 120 BPM, a STOP of 500 ms at 1 s.
+#[test]
+fn a_trailing_stop_reaches_the_preview() {
+    let text = "#BPM 120\n#STOP01 48\n#00019:01\n#00009:0001\n";
+    let one = bms_model::SCROLL_ONE;
+    let stopped = bms_model::SpeedRow {
+        ms: 1_000,
+        tempo: None,
+        scroll: one,
+    };
+    assert_eq!(
+        preview(text).speeds(),
+        [speed_row(0, 120, one), stopped, speed_row(1_500, 120, one)]
+    );
+    assert_eq!(
+        load(text, 0).unwrap().profile.speeds(),
+        [speed_row(0, 120, one)]
+    );
+}
+
+/// Fixture SU: a scroll change naming no `#SCROLLxx` is left out before
+/// timing: it adds no point, so the rows and seconds are those without it,
+/// and one past the duration cap (999 measures of 4 s at 60 BPM) does not
+/// leave the preview as the play chart's, so a hidden note at 4 s still
+/// lengthens it to 6 seconds.
+#[test]
+fn an_undefined_scroll_change_is_no_point() {
+    let base = "#BPM 120\n#STOP01 48\n#00011:01\n#00009:00000001\n#00111:00000100\n#00131:01\n";
+    let with = format!("{base}#001SC:0001\n");
+    assert_eq!(preview(&with).speeds(), preview(base).speeds());
+    assert_eq!(preview(&with).seconds(), preview(base).seconds());
+    let tail = "#BPM 60\n#00011:01\n#00131:01\n";
+    assert_eq!(preview(tail).seconds().len(), 6);
+    assert_eq!(preview(&format!("{tail}#999SC:01\n")).seconds().len(), 6);
+}

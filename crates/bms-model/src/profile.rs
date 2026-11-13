@@ -69,8 +69,8 @@ pub struct PreviewInputs {
 pub struct PreviewTimeline {
     /// The rows in time order, a STOP's end the row after its start.
     pub points: Vec<TimelinePoint>,
-    /// The rows where a STOP of at least 1 ms starts, in order.
-    pub long_stops: Vec<TimelineId>,
+    /// The rows where a STOP starts, in order.
+    pub stops: Vec<TimelineId>,
     /// The tempo before time 0.
     pub initial: Tempo,
 }
@@ -87,11 +87,11 @@ pub struct ChartProfile {
 
 impl ChartProfile {
     /// The profile of `chart`, whose times must be its 1× times and whose
-    /// `meta.length` its summary's length. `long_stops` are the rows, in
-    /// order, where a STOP of at least 1 ms starts: its own length
-    /// truncated to µs, which the rows' floored times cannot give.
+    /// `meta.length` its summary's length. `stops` are the rows, in order,
+    /// where a STOP of any positive length starts, which the rows' floored
+    /// times cannot tell from a point at the same position.
     #[must_use]
-    pub fn of(chart: &Chart, long_stops: &[TimelineId]) -> Self {
+    pub fn of(chart: &Chart, stops: &[TimelineId]) -> Self {
         let seconds = seconds(chart, chart.meta.length);
         let (bins, bin_seconds) = condense(&seconds);
         let timeline = &chart.timeline;
@@ -99,13 +99,7 @@ impl ChartProfile {
             seconds,
             bins,
             bin_seconds,
-            speeds: speeds(
-                timeline.points(),
-                timeline.meta().initial,
-                long_stops,
-                &[],
-                None,
-            ),
+            speeds: speeds(timeline.points(), timeline.meta().initial, stops, &[], None),
             length_ms: ms_of(chart.meta.length),
         }
     }
@@ -120,7 +114,7 @@ impl ChartProfile {
     /// carry the scroll factor, a scroll change being a point of its own;
     /// the last row is at the latest point, scroll change or shown object.
     #[must_use]
-    pub fn preview(chart: &Chart, long_stops: &[TimelineId], inputs: &PreviewInputs) -> Self {
+    pub fn preview(chart: &Chart, stops: &[TimelineId], inputs: &PreviewInputs) -> Self {
         let end = inputs
             .last_shown
             .map_or(chart.meta.length, |t| t.max(chart.meta.length));
@@ -130,14 +124,14 @@ impl ChartProfile {
             Some(t) => speeds(
                 &t.points,
                 t.initial,
-                &t.long_stops,
+                &t.stops,
                 &inputs.scroll,
                 inputs.last_shown,
             ),
             None => speeds(
                 chart.timeline.points(),
                 chart.timeline.meta().initial,
-                long_stops,
+                stops,
                 &inputs.scroll,
                 inputs.last_shown,
             ),
@@ -187,10 +181,10 @@ impl ChartProfile {
 
     /// The tempo rows, in time order: the initial tempo at 0; at each
     /// point (a note's head or end, a BGM event, a tempo change, a STOP's
-    /// start or a bar line, never a STOP's end; in a preview also a scroll
-    /// change) the state there: stopped where a STOP of at least 1 ms
-    /// starts (one of the `long_stops` given to [`of`](Self::of)), otherwise
-    /// its tempo and scroll factor; a row only where the effective speed
+    /// start or end, or a bar line; in a preview also a scroll change) the
+    /// state there: stopped where a STOP starts (one of the `stops` given
+    /// to [`of`](Self::of)), otherwise its tempo and scroll factor, so a
+    /// STOP ends at its own end; a row only where the effective speed
     /// (tempo times factor, 0 while stopped) differs from the last row's,
     /// compared exactly; and the state at the last point unless a row is
     /// already there.
@@ -307,7 +301,7 @@ fn effective(tempo: Option<Tempo>, scroll: i128) -> (i8, (u128, u128)) {
 fn speeds(
     points: &[TimelinePoint],
     initial: Tempo,
-    long_stops: &[TimelineId],
+    stops: &[TimelineId],
     scroll: &[(TimeUs, i128)],
     last_shown: Option<TimeUs>,
 ) -> Vec<SpeedRow> {
@@ -334,15 +328,8 @@ fn speeds(
     let mut changes = scroll.iter().peekable();
     let mut last = None;
     for (i, p) in points.iter().enumerate() {
-        // A STOP's end is the row after its start: the same position,
-        // later. It is no point of its own.
-        let prev = i.checked_sub(1).and_then(|j| points.get(j));
-        if prev.is_some_and(|q| q.pos == p.pos && q.at < p.at) {
-            continue;
-        }
         // A scroll change before this point is a point of its own at the
-        // tempo then, a STOP being over by then (a later position is a
-        // later time than the STOP's end).
+        // tempo then, a STOP being over by then (its end is a point).
         while let Some(&&(at, f)) = changes.peek()
             && at < p.at
         {
@@ -360,7 +347,7 @@ fn speeds(
         tempo = p.tempo;
         let id = TimelineId(u32::try_from(i).unwrap_or(u32::MAX));
         let ms = ms_of(p.at);
-        state.0 = if long_stops.binary_search(&id).is_ok() {
+        state.0 = if stops.binary_search(&id).is_ok() {
             None
         } else {
             Some(p.tempo)
