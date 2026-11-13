@@ -141,8 +141,11 @@ impl PlayId {
     }
 }
 
-/// The stored length of a [`Breakdown`]'s values: 22 little-endian `u32`s.
-pub const BREAKDOWN_BYTES: usize = 88;
+/// The values a [`Breakdown`] stores, each a little-endian `u32`.
+pub const BREAKDOWN_FIELDS: usize = 22;
+
+/// The stored length of a [`Breakdown`]'s values.
+pub const BREAKDOWN_BYTES: usize = 4 * BREAKDOWN_FIELDS;
 
 /// One play's breakdown, as its as-played evaluation counted it, beside the
 /// play's identity: what the bests keep of the play that set the best EX
@@ -176,51 +179,69 @@ pub struct Breakdown {
 }
 
 impl Breakdown {
-    /// The stored bytes: the values as little-endian `u32`s in this order:
+    /// Its stored values in their stored order, the one definition of the
+    /// layout the encoder, the decoder and the table's length check share:
     /// notes, EX, BP, max combo, the five counts, the five early, the five
     /// late, then the empty POORs, early and late.
+    fn fields_mut(&mut self) -> [&mut u32; BREAKDOWN_FIELDS] {
+        let [c0, c1, c2, c3, c4] = &mut self.counts;
+        let [e0, e1, e2, e3, e4] = &mut self.early;
+        let [l0, l1, l2, l3, l4] = &mut self.late;
+        [
+            &mut self.notes,
+            &mut self.ex,
+            &mut self.bp,
+            &mut self.max_combo,
+            c0,
+            c1,
+            c2,
+            c3,
+            c4,
+            e0,
+            e1,
+            e2,
+            e3,
+            e4,
+            l0,
+            l1,
+            l2,
+            l3,
+            l4,
+            &mut self.empty_poor,
+            &mut self.empty_poor_early,
+            &mut self.empty_poor_late,
+        ]
+    }
+
+    /// The stored bytes: the values as little-endian `u32`s in the
+    /// layout's order.
     #[must_use]
     pub fn to_bytes(&self) -> [u8; BREAKDOWN_BYTES] {
-        let values = [self.notes, self.ex, self.bp, self.max_combo]
-            .into_iter()
-            .chain(self.counts)
-            .chain(self.early)
-            .chain(self.late)
-            .chain([self.empty_poor, self.empty_poor_early, self.empty_poor_late]);
+        let mut values = *self;
         let mut out = [0; BREAKDOWN_BYTES];
-        for (to, v) in out.as_chunks_mut::<4>().0.iter_mut().zip(values) {
+        for (to, v) in out
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
+            .zip(values.fields_mut())
+        {
             *to = v.to_le_bytes();
         }
         out
     }
 
     /// The breakdown of the play `body_sha256` from its stored bytes
-    /// ([`to_bytes`](Self::to_bytes)); `None` unless they are exactly
-    /// [`BREAKDOWN_BYTES`] long.
+    /// ([`to_bytes`](Self::to_bytes)).
     #[must_use]
-    pub fn from_bytes(body_sha256: [u8; 32], bytes: &[u8]) -> Option<Self> {
-        let bytes: &[u8; BREAKDOWN_BYTES] = bytes.try_into().ok()?;
-        let mut words = bytes
-            .as_chunks::<4>()
-            .0
-            .iter()
-            .map(|w| u32::from_le_bytes(*w));
-        // The length is checked, so every read finds its word. Fields are
-        // read in the order they are written below.
-        let mut next = || words.next().unwrap_or_default();
-        Some(Self {
+    pub fn from_bytes(body_sha256: [u8; 32], bytes: &[u8; BREAKDOWN_BYTES]) -> Self {
+        let mut b = Self {
             body_sha256,
-            notes: next(),
-            ex: next(),
-            bp: next(),
-            max_combo: next(),
-            counts: [next(), next(), next(), next(), next()],
-            early: [next(), next(), next(), next(), next()],
-            late: [next(), next(), next(), next(), next()],
-            empty_poor: next(),
-            empty_poor_early: next(),
-            empty_poor_late: next(),
-        })
+            ..Self::default()
+        };
+        for (to, from) in b.fields_mut().into_iter().zip(bytes.as_chunks::<4>().0) {
+            *to = u32::from_le_bytes(*from);
+        }
+        b
     }
 
     /// Whether this play is kept over `other`: the higher EX score, and of
@@ -484,46 +505,72 @@ pub(crate) fn restamp(conn: &Connection, id: &PlayId) -> rusqlite::Result<()> {
 }
 
 fn score_of(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Score> {
-    let plays: i64 = r.get(at)?;
-    let clears: i64 = r.get(at + 1)?;
+    let inconsistent = |i: usize, what: &'static str| {
+        rusqlite::Error::FromSqlConversionFailure(
+            at + i,
+            Type::Integer,
+            Box::new(Inconsistent(what)),
+        )
+    };
+    let count = |i: usize, what| {
+        let n: i64 = r.get(at + i)?;
+        u64::try_from(n).map_err(|_| inconsistent(i, what))
+    };
+    let plays = count(0, "a negative play count")?;
+    let clears = count(1, "a negative clear count")?;
+    if clears > plays {
+        return Err(inconsistent(1, "more clears than plays"));
+    }
     let ex: Option<u32> = r.get(at + 2)?;
     let best = match ex {
+        None if clears > 0 => return Err(inconsistent(1, "clears without a best")),
         None => None,
         Some(ex) => {
-            let sha: Vec<u8> = r.get(at + 7)?;
-            let bytes: Vec<u8> = r.get(at + 8)?;
-            let malformed = |i: usize| {
-                rusqlite::Error::FromSqlConversionFailure(at + i, Type::Blob, Box::new(Malformed))
-            };
-            let sha: [u8; 32] = sha.try_into().map_err(|_| malformed(7))?;
-            Some(Best {
+            // Fixed arrays: a blob of another length is refused from its
+            // borrowed bytes, before anything is copied.
+            let sha: [u8; 32] = r.get(at + 7)?;
+            let bytes: [u8; BREAKDOWN_BYTES] = r.get(at + 8)?;
+            let best = Best {
                 ex,
                 bp: r.get(at + 3)?,
                 max_combo: r.get(at + 4)?,
                 cleared: r.get::<_, Option<Vec<u8>>>(at + 5)?.unwrap_or_default(),
                 full_combo: r.get(at + 6)?,
-                play: Breakdown::from_bytes(sha, &bytes).ok_or_else(|| malformed(8))?,
-            })
+                play: Breakdown::from_bytes(sha, &bytes),
+            };
+            // The play is the best EX's, and the best BP and max combo are
+            // at least as good as any one play's.
+            if best.play.ex != best.ex {
+                return Err(inconsistent(2, "a best EX that is not its play's"));
+            }
+            if best.bp > best.play.bp {
+                return Err(inconsistent(3, "a best BP worse than its play's"));
+            }
+            if best.max_combo < best.play.max_combo {
+                return Err(inconsistent(4, "a best max combo below its play's"));
+            }
+            Some(best)
         }
     };
     Ok(Score {
-        plays: u64::try_from(plays).unwrap_or(0),
-        clears: u64::try_from(clears).unwrap_or(0),
+        plays,
+        clears,
         best,
     })
 }
 
-/// A stored breakdown or play hash of the wrong length.
+/// A stored score whose values contradict one another (design.md
+/// "Personal Bests"): a failed read, never a corrected value.
 #[derive(Debug)]
-struct Malformed;
+struct Inconsistent(&'static str);
 
-impl fmt::Display for Malformed {
+impl fmt::Display for Inconsistent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("a stored best play has the wrong length")
+        write!(f, "a stored score is inconsistent: {}", self.0)
     }
 }
 
-impl std::error::Error for Malformed {}
+impl std::error::Error for Inconsistent {}
 
 /// The columns [`score_of`] reads, in its order.
 const SCORE_COLUMNS: &str =
@@ -572,7 +619,9 @@ mod tests {
             body_sha256: [body; 32],
             notes: 10,
             ex,
-            bp: v,
+            // Above every best BP the tests give, as a best's BP never
+            // exceeds its play's.
+            bp: v + 100,
             max_combo: combo,
             counts: [ex / 2, ex % 2, v, 0, 1],
             early: [ex / 4, 0, v, 0, 0],
@@ -684,7 +733,7 @@ mod tests {
     /// Every value has its own slot, in the stored order, and only the
     /// exact length decodes.
     #[test]
-    fn a_breakdown_round_trips_and_refuses_other_lengths() {
+    fn a_breakdown_round_trips_in_its_layout() {
         let p = Breakdown {
             body_sha256: [7; 32],
             notes: 1,
@@ -706,16 +755,14 @@ mod tests {
             .map(|w| u32::from_le_bytes(*w))
             .collect();
         assert_eq!(words, (1..=22).collect::<Vec<u32>>());
-        assert_eq!(Breakdown::from_bytes([7; 32], &bytes), Some(p));
-        for len in [0, BREAKDOWN_BYTES - 1, BREAKDOWN_BYTES + 1] {
-            assert_eq!(Breakdown::from_bytes([7; 32], &vec![0; len]), None, "{len}");
-        }
+        assert_eq!(Breakdown::from_bytes([7; 32], &bytes), p);
+        assert_eq!(super::BREAKDOWN_FIELDS * 4, BREAKDOWN_BYTES);
     }
 
     /// The DDL checks the length the layout has.
     #[test]
     fn the_scores_ddl_checks_the_breakdown_length() {
-        assert!(crate::db::SCORES_DDL.contains(&format!("length(play) = {BREAKDOWN_BYTES})")));
+        assert!(crate::db::scores_ddl().contains(&format!("length(play) = {BREAKDOWN_BYTES})")));
     }
 
     /// A stored breakdown or play hash of another length is a read error,
@@ -729,18 +776,79 @@ mod tests {
         conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
             .unwrap();
         let good_play = c.best.as_ref().unwrap().play.to_bytes().to_vec();
-        for (column, len, good) in [
-            ("play", 87, good_play.clone()),
-            ("play", 89, good_play),
-            ("play_sha256", 31, vec![3; 32]),
+        // The stored values cut short or run on: read as a layout, each
+        // would still give a consistent best, so only the length refuses.
+        let mut longer = good_play.clone();
+        longer.push(0);
+        let mut huge = good_play.clone();
+        huge.resize(64 << 20, 0);
+        for (column, bad, good) in [
+            (
+                "play",
+                good_play[..BREAKDOWN_BYTES - 1].to_vec(),
+                good_play.clone(),
+            ),
+            ("play", longer, good_play.clone()),
+            // Refused from its borrowed bytes, never copied whole.
+            ("play", huge, good_play),
+            ("play_sha256", vec![3; 31], vec![3; 32]),
+            ("play_sha256", vec![3; 33], vec![3; 32]),
         ] {
-            conn.execute(&format!("UPDATE scores SET {column} = zeroblob({len})"), [])
+            let len = bad.len();
+            conn.execute(&format!("UPDATE scores SET {column} = ?1"), [bad])
                 .unwrap();
-            assert!(super::score(&conn, &c.key).is_err(), "{column} {len}");
+            let e = super::score(&conn, &c.key).unwrap_err();
+            assert!(
+                e.to_string().contains(&format!("out of {len} byte blob")),
+                "{column} {len}: {e}"
+            );
             conn.execute(&format!("UPDATE scores SET {column} = ?1"), [good])
                 .unwrap();
             assert!(super::score(&conn, &c.key).is_ok(), "{column} restored");
         }
+    }
+
+    /// A stored score whose values contradict one another is a read
+    /// error, never a corrected value: a negative play or clear count,
+    /// more clears than plays, clears without a best, and a best whose EX
+    /// is not its play's or whose BP or max combo is worse than its
+    /// play's.
+    #[test]
+    fn an_inconsistent_score_is_a_read_error() {
+        let conn = database();
+        let c = contribution(3, Some(best(play(3, 6, 3), 0, 1, true)));
+        super::ingest(&conn, &c).unwrap();
+        let score = || super::score(&conn, &c.key);
+        assert!(score().is_ok());
+        for (set, undo) in [
+            ("plays = -1", "plays = 1"),
+            ("clears = -1", "clears = 1"),
+            ("clears = 2", "clears = 1"),
+            ("best_ex = 7", "best_ex = 6"),
+            ("best_bp = 104", "best_bp = 0"),
+            ("best_combo = 2", "best_combo = 3"),
+        ] {
+            conn.execute(&format!("UPDATE scores SET {set}"), [])
+                .unwrap();
+            let e = score().unwrap_err();
+            assert!(
+                matches!(e, rusqlite::Error::FromSqlConversionFailure(..)),
+                "{set}: {e}"
+            );
+            conn.execute(&format!("UPDATE scores SET {undo}"), [])
+                .unwrap();
+            assert!(score().is_ok(), "{undo}");
+        }
+        // Clears with no best: the best's columns null together.
+        conn.execute(
+            "UPDATE scores SET best_ex = NULL, best_bp = NULL, best_combo = NULL,
+                 play_sha256 = NULL, play = NULL",
+            [],
+        )
+        .unwrap();
+        assert!(score().is_err());
+        conn.execute("UPDATE scores SET clears = 0", []).unwrap();
+        assert!(score().unwrap().unwrap().best.is_none());
     }
 
     #[test]
