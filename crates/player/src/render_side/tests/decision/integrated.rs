@@ -27,7 +27,7 @@ use tempfile::TempDir;
 use crate::controls::Controls;
 use crate::menu_screen::{MenuPage, MenuScreen};
 use crate::render_side::tests::wait_until;
-use crate::render_side::{EndPage, MakeScreen, Screen};
+use crate::render_side::{EndPage, MakeScreen, Screen, TakeoverAcks};
 use crate::select::{MenuInput, MenuKey, MenuQueue};
 
 const MS: i64 = 1_000;
@@ -669,6 +669,9 @@ struct Side<'a> {
     chart: PathBuf,
     /// The run's clock, which the helper holds and moves on.
     clock: QpcClock,
+    /// The game thread's looks for the decision skin's takeover and the
+    /// render thread's drained frame loops.
+    acks: Arc<TakeoverAcks>,
 }
 
 impl Side<'_> {
@@ -719,6 +722,68 @@ impl Side<'_> {
             "the first decision skin frame on the held clock"
         );
         (at, screen, mark)
+    }
+
+    /// The takeover of a build refused at `refused_t`, before the
+    /// destination is due, processed with the clock held there: the game
+    /// thread took it and looked again, so the look that took it and what
+    /// that look routed are over; then frames are let through until one
+    /// from a frame loop that drained the render thread's messages after
+    /// that look has drawn, so it drew whatever the look sent, and each
+    /// drew the built-in page. No frame since the refusal (`from`) drew
+    /// the destination.
+    #[track_caller]
+    fn taken_over(
+        &self,
+        case: &str,
+        from: usize,
+        refused_t: TimeUs,
+        destination: &dyn Fn(&Frame) -> bool,
+    ) {
+        let early = |what: &str| {
+            let frames = self.seen.frames();
+            assert!(
+                !frames.iter().skip(from).any(|d| destination(&d.frame)),
+                "{case}: the destination drawn {what}, the clock held at the refusal: {:?}",
+                frames.get(from..).unwrap()
+            );
+        };
+        let start = Instant::now();
+        while !self.acks.looked_after() {
+            early("before the game looked again");
+            assert!(
+                start.elapsed() < BOUND,
+                "{case}: the game never looked again after taking the takeover: last frames {:?}",
+                self.seen.frames().iter().rev().take(6).collect::<Vec<_>>()
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        early("as the game looked again");
+        let looked = self.acks.drained();
+        self.seen.gate.hold();
+        let start = Instant::now();
+        loop {
+            // The frame held now is drawn by a loop that drained after
+            // the look.
+            let consumed = self.acks.drained() > looked;
+            let (_, drawn) = self.step_until("a frame after the look", |_, d| !d.is_empty());
+            assert!(
+                drawn
+                    .iter()
+                    .all(|d| d.at == refused_t && matches!(d.frame, Frame::Page(_))),
+                "{case}: the frame after the game's look drew {drawn:?}"
+            );
+            if consumed {
+                break;
+            }
+            assert!(
+                start.elapsed() < BOUND,
+                "{case}: the render thread never drained its messages after the look"
+            );
+        }
+        early("after the game's look");
+        assert_eq!(self.clock.now(), refused_t, "{case}: the clock held");
+        self.seen.gate.release();
     }
 
     /// Lets frames through one at a time, the gate held, until `done`
@@ -834,6 +899,7 @@ fn run(set: &Set, preset: Option<&str>, helper: impl FnOnce(&Side<'_>) + Send) -
         "the result skin is fixed"
     );
     let book = link.label_book();
+    let acks = link.takeover_acks();
     let charts = tempfile::tempdir().unwrap();
     // A 7-key chart (its invisible note on key 6) with one note to play.
     let root = charts.path().join("root0");
@@ -899,6 +965,7 @@ fn run(set: &Set, preset: Option<&str>, helper: impl FnOnce(&Side<'_>) + Send) -
             book: &book,
             chart,
             clock,
+            acks,
         };
         let mut app = game::App::new(
             game::DataRoot::new(charts.path().join("app")),
@@ -1083,13 +1150,16 @@ enum Route {
 /// R4.1, R4.2 (stage3's list) through the run, on the held clock: the
 /// decision skin's build refused by the renderer in the frame let through
 /// at exactly 1,000 ms from the choice draws the built-in presentation in
-/// that very frame, and its destination (`route`) first draws at exactly
-/// 1,500 ms; refused at exactly 2,000 ms, past the presentation's time,
-/// the destination draws at once, at the refusal's own time. The clock
-/// moves only when the test moves it, so each destination is due at a
-/// time the run cannot pass before drawing it, and the skin's own 3,000
-/// ms never comes. The built-in page draws in between, and no skin frame
-/// after the refusal.
+/// that very frame; with the clock still held there, the game takes the
+/// takeover and looks again, and the frames drawn after that are still
+/// the built-in page ([`Side::taken_over`]); only then does the clock
+/// move, and the destination (`route`) first draws at exactly 1,500 ms.
+/// Refused at exactly 2,000 ms, past the presentation's time, the
+/// destination draws at once, at the refusal's own time. The clock moves
+/// only when the test moves it, so each destination is due at a time the
+/// run cannot pass before drawing it, and the skin's own 3,000 ms never
+/// comes. The built-in page draws in between, and no skin frame after the
+/// refusal.
 fn refused_build_routes(route: Route) {
     let practice = crate::ui_text::Message::PracticeTitle { name: "a" }.text();
     let destination = |f: &Frame| match route {
@@ -1130,6 +1200,7 @@ fn refused_build_routes(route: Route) {
             // At 1,500 ms from the choice, or at once past it: the clock
             // stays there until the destination draws.
             let due = if refused_ms < 1_500 {
+                side.taken_over(&case, from, refused_t, &destination);
                 TimeUs(chosen.0 + 1_500 * MS)
             } else {
                 refused_at
