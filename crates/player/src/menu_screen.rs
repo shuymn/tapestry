@@ -1503,6 +1503,29 @@ impl MenuScreen {
             drop(std::hint::black_box(Box::new(0_u8)));
         }
     }
+
+    /// A skinned selection frame of `u` with `logic` at `now` for the
+    /// allocation guards outside this module (tests): its preparation
+    /// (`changed` as [`selection`](Screen::selection) takes it), the app's
+    /// build ([`build_selection_frame`](Self::build_selection_frame)) and
+    /// the GPU submission. Returns the build's allocations alone.
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn selection_build_count(
+        &mut self,
+        u: &SelectionUpdate,
+        logic: &mut SelectionLogic,
+        changed: bool,
+        now: bms_model::TimeUs,
+    ) -> u64 {
+        use crate::alloc_count::this_thread;
+        self.prepare_selection(u, logic, changed).unwrap().unwrap();
+        let before = this_thread();
+        self.build_selection_frame(u, logic, now, skin_model::AppReadouts::LAUNCH)
+            .unwrap();
+        let built = this_thread() - before;
+        self.renderer.submit_selection(&[]).unwrap();
+        built
+    }
 }
 
 #[cfg(test)]
