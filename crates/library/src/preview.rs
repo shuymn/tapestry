@@ -4,10 +4,11 @@
 //! player's song information shows it (beatoraja `song/SongInformation.java`
 //! and `skin/property/IntegerPropertyFactory.java` at 0.8.9).
 //!
-//! [`ChartInfo`] gives the integer parts; dividing them and reading the
-//! gauge total takes floating point, which the chart model does not use, so
-//! it is done here, once at the scan, in the reference's `double`
-//! operations, and the shown integers are stored.
+//! [`ChartInfo`] gives the integer parts; the divisions and the gauge total
+//! are done here, once at the scan, exactly, and the shown integers, each
+//! rounded down, are stored. The reference computes them in `double`, whose
+//! rounding is not reproduced (design.md "Design Principles", "Reproduce a
+//! source's rules, not its byproducts").
 
 use bms_model::{ChartInfo, ChartProfile, HeaderValue, JudgmentHeader, Tempo};
 use rules::HeaderPolicy;
@@ -46,76 +47,87 @@ pub struct ChartInfoView {
     pub main_bpm: Option<i32>,
 }
 
-/// `x` as Java's `(int)` of a `double` makes it: truncated toward 0,
-/// saturating at the ends of `i32`, NaN 0, which Rust's cast is too.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the reference's (int) of a double, which this cast is"
-)]
-const fn java_int(x: f64) -> i32 {
-    x as i32
+/// `v` as a shown integer: saturated to `i32`.
+fn shown_int(v: i128) -> i32 {
+    i32::try_from(v).unwrap_or(if v < 0 { i32::MIN } else { i32::MAX })
 }
 
-/// `n` as a `double`, exact below 2^53.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "note counts are far below 2^53, where f64 is exact"
-)]
-const fn double(n: u64) -> f64 {
-    n as f64
-}
-
-/// The whole part and the hundredths of `x` as the reference shows them,
-/// `(int) x` and `((int)(x · 100)) % 100`.
-fn shown(x: f64) -> (i32, i32) {
-    (java_int(x), java_int(x * 100.0) % 100)
-}
-
-/// The exact decimal text of `v` units of `10^-18` ([`HeaderValue::ONE`]):
-/// its integer part, then its 18 fractional digits with trailing zeros
-/// trimmed.
-fn decimal_text(v: i128) -> String {
-    let sign = if v < 0 { "-" } else { "" };
-    let magnitude = v.unsigned_abs();
-    let one = HeaderValue::ONE.unsigned_abs();
-    let whole = magnitude / one;
-    let fraction = magnitude % one;
-    if fraction == 0 {
-        return format!("{sign}{whole}");
+/// The whole part and the hundredths of `notes / seconds`, both rounded
+/// down, exactly; 0 over no second.
+fn shown_mean(notes: u64, seconds: u32) -> (i32, i32) {
+    let (n, s) = (i128::from(notes), i128::from(seconds));
+    if s == 0 {
+        return (0, 0);
     }
-    let digits = format!("{fraction:018}");
-    format!("{sign}{whole}.{}", digits.trim_end_matches('0'))
+    (shown_int(n / s), shown_int(n * 100 / s % 100))
 }
 
 /// The gauge total the reference's song information reads
 /// (`song/SongData.java` validates the model with
-/// `play/BMSPlayerRule.java:68-80` before building it): the `#TOTAL` the
-/// reference decoder reads, a number above 0
-/// ([`HeaderPolicy::DefExRankFirst`]), as the nearest `double` to its
-/// exact value, which is what `Double.parseDouble` gives for its text,
-/// since Rust's parse rounds correctly too; else `max(260, 7.605 n / (0.01
-/// n + 6.5))` in the reference's order, for the chart's `notes`.
-///
-/// A `#TOTAL` written with more than 18 fractional digits is held to
-/// `10^-18` by the loader's canonical form, so its `double` can differ in
-/// the last place from the reference's.
-#[must_use]
-pub fn gauge_total(headers: &[JudgmentHeader], notes: u32) -> f64 {
-    let declared = HeaderPolicy::DefExRankFirst
-        .total_header(headers)
-        .and_then(HeaderValue::number)
-        .and_then(|v| decimal_text(v).parse::<f64>().ok());
-    declared.unwrap_or_else(|| {
-        let n = f64::from(notes);
-        f64::max(260.0, 7.605 * n / (0.01 * n + 6.5))
-    })
+/// `play/BMSPlayerRule.java:68-80` before building it), exactly: the
+/// `#TOTAL` the reference decoder reads, a number above 0
+/// ([`HeaderPolicy::DefExRankFirst`]), at the loader's `10^-18`; else the
+/// gauge's default `max(260, 7.605 n / (0.01 n + 6.5))` for the chart's
+/// `n` notes ([`rules::DefaultTotal::NotesCurve`]). The reference works in
+/// `double`, so a value its rounding moves across an integer shows
+/// differently (design.md "Differences from the Source").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GaugeTotal {
+    /// Above 0.
+    numerator: i128,
+    /// Above 0.
+    denominator: i128,
 }
 
-/// The border's start for `notes` notes under `total`: `(int)(N · (1 −
-/// 100 / total))`, as the reference starts its count.
-#[must_use]
-pub fn border_start(notes: u32, total: f64) -> i64 {
-    i64::from(java_int(f64::from(notes) * (1.0 - 100.0 / total)))
+impl GaugeTotal {
+    /// The total of a chart with the judgment `headers` and `notes` notes.
+    #[must_use]
+    pub fn of(headers: &[JudgmentHeader], notes: u32) -> Self {
+        if let Some(units) = HeaderPolicy::DefExRankFirst
+            .total_header(headers)
+            .and_then(HeaderValue::number)
+            .filter(|&v| v > 0)
+        {
+            return Self {
+                numerator: units,
+                denominator: HeaderValue::ONE,
+            };
+        }
+        // 7.605 n / (0.01 n + 6.5) = 7 605 n / (10 n + 6 500).
+        let n = i128::from(notes);
+        let (curve, over) = (7_605 * n, 10 * n + 6_500);
+        if curve >= 260 * over {
+            Self {
+                numerator: curve,
+                denominator: over,
+            }
+        } else {
+            Self {
+                numerator: 260,
+                denominator: 1,
+            }
+        }
+    }
+
+    /// Its whole part, rounded down: number 368.
+    #[must_use]
+    pub fn whole(self) -> i32 {
+        shown_int(self.numerator / self.denominator)
+    }
+
+    /// The border's start for `notes` notes: `N · (1 − 100 / total)`
+    /// truncated toward 0, as the reference starts its count.
+    #[must_use]
+    pub fn border_start(self, notes: u32) -> i64 {
+        // N − a / p, with a = 100 · N · q.
+        let n = i128::from(notes);
+        let a = 100 * n * self.denominator;
+        let floor = a / self.numerator;
+        let ceil = floor + i128::from(a % self.numerator != 0);
+        // Above 0 it rounds down (N − ⌈a / p⌉), below 0 up (N − ⌊a / p⌋).
+        let start = if ceil <= n { n - ceil } else { n - floor };
+        i64::try_from(start).unwrap_or(i64::MIN)
+    }
 }
 
 impl ChartInfoView {
@@ -128,22 +140,16 @@ impl ChartInfoView {
         headers: &[JudgmentHeader],
         main: Option<Option<Tempo>>,
     ) -> Self {
-        let mut total = 0.0;
+        let mut total = None;
         let info = ChartInfo::analyze(profile, |notes| {
-            total = gauge_total(headers, notes);
-            border_start(notes, total)
+            let t = GaugeTotal::of(headers, notes);
+            total = Some(t);
+            t.border_start(notes)
         });
         let count = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
-        let mean = |notes: u64, seconds: u32| {
-            if seconds == 0 {
-                0.0
-            } else {
-                double(notes) / f64::from(seconds)
-            }
-        };
-        let (density_end, density_end_hundredths) = shown(mean(info.end_notes, info.end_seconds));
+        let (density_end, density_end_hundredths) = shown_mean(info.end_notes, info.end_seconds);
         let (density_average, density_average_hundredths) =
-            shown(mean(info.average_notes, info.average_seconds));
+            shown_mean(info.average_notes, info.average_seconds);
         let one = Tempo::UNITS_PER_BPM;
         Self {
             key_taps: count(info.key_taps),
@@ -155,7 +161,7 @@ impl ChartInfoView {
             density_end_hundredths,
             density_average,
             density_average_hundredths,
-            total: java_int(total),
+            total: total.map_or(0, GaugeTotal::whole),
             main_bpm: main
                 .map(|m| m.map_or(0, |t| i32::try_from(t.units() / one).unwrap_or(i32::MAX))),
         }
