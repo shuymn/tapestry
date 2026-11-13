@@ -174,6 +174,7 @@ fn frames(r: &mut Renderer, b: &SkinBundle, store: &LabelStore, slot: usize) -> 
                 timers: DecisionTimers {
                     screen: Some(TimeUs(0)),
                     fadeout: (n > 1).then_some(TimeUs(2_000_000)),
+                    input: None,
                 },
             };
             let (built, allocs) = counted(|| r.build_decision(&mut dec, labels, &frame).is_ok());

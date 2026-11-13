@@ -1788,3 +1788,177 @@ fn the_selected_charts_class_reads_before_the_settings() {
         "a view left the settings"
     );
 }
+
+/// A chart with a best whose play of 7 notes judged PERFECT 4 (1 early,
+/// 3 late), GREAT 2 (early), BAD 1 (late) and 2 empty POORs (1 early, 1
+/// late), its max combo 4, while the best max combo, another play's, is 9;
+/// 5 plays, 2 of them clears; a summary of `summary_notes`.
+fn breakdown_view(random: bool, summary_notes: u32) -> skin_model::SelectionView {
+    let mut row = chart("a");
+    row.random = random;
+    row.score = RowScore::Best {
+        plays: 5,
+        ex: 10,
+        bp: 1,
+        lamp: OwnLamp::Cleared {
+            gauge: 0,
+            rank: 0,
+            look: GaugeLook::Normal,
+        },
+    };
+    let mut v = view(vec![row], Some(0));
+    let c = v.selected.as_mut().unwrap();
+    c.summary = Some(summary(summary_notes, 0, 0, 60, 120, 120));
+    c.clears = 2;
+    let per = |perfect, great, bad| rules::PerJudgment {
+        perfect,
+        great,
+        good: 0,
+        bad,
+        poor: 0,
+    };
+    let tally = eval::Tally {
+        counts: per(4, 2, 1),
+        ex_score: 10,
+        bp: 1,
+        max_combo: 4,
+        empty_poor: 2,
+        early: per(1, 2, 0),
+        late: per(3, 0, 1),
+        empty_poor_early: 1,
+        empty_poor_late: 1,
+        ..eval::Tally::default()
+    };
+    c.best = Some(skin_model::SelectedBest {
+        max_combo: 9,
+        play: skin_model::BestPlay { tally, notes: 7 },
+    });
+    v
+}
+
+/// Each number of the best play reads that one play, the clears and the
+/// best max combo the key's; the point score takes the play's own combo:
+/// `⌊(150 000 · 4 + 100 000 · 2) / 7⌋ + ⌊50 000 · 4 / 7⌋` = 114 285 +
+/// 28 571, where one floor would give 142 857 and the best max combo 9
+/// another value (design.md "Personal Bests").
+#[test]
+fn the_best_play_breakdown_fills_the_fields() {
+    let v = breakdown_view(false, 7);
+    for (field, guard, want) in [
+        ("selected.point", "true", vec![1, 4, 2, 8, 5, 6]),
+        ("selected.max_combo", "selected.played", vec![9]),
+        ("selected.clears", "selected.played", vec![2]),
+        ("selected.fails", "selected.played", vec![3]),
+        ("selected.count.perfect", "true", vec![4]),
+        ("selected.count.great", "true", vec![2]),
+        ("selected.count.bad", "true", vec![1]),
+        ("selected.count.empty_poor", "true", vec![2]),
+        ("selected.count.fast", "true", vec![3]),
+        ("selected.count.slow", "true", vec![2]),
+        ("selected.count.early.perfect", "true", vec![1]),
+        ("selected.count.late.perfect", "true", vec![3]),
+        ("selected.count.early.great", "true", vec![2]),
+        ("selected.count.late.bad", "true", vec![1]),
+        ("selected.count.early.empty_poor", "true", vec![1]),
+        ("selected.count.late.empty_poor", "true", vec![1]),
+        ("selected.count.bad_poor", "true", vec![1]),
+        ("selected.count.poor_miss", "true", vec![2]),
+        ("selected.count.bad_poor_miss", "true", vec![3]),
+        // ⌊400 / 7⌋, ⌊200 / 7⌋ and ⌊100 / 7⌋.
+        (
+            "selected.rate.perfect",
+            "selected.play_notes_valid",
+            vec![5, 7],
+        ),
+        (
+            "selected.rate.great",
+            "selected.play_notes_valid",
+            vec![2, 8],
+        ),
+        ("selected.rate.bad", "selected.play_notes_valid", vec![1, 4]),
+    ] {
+        let mut fx = number_skin(field, guard);
+        fx.view(&v);
+        fx.frame(0);
+        assert_eq!(shown(&fx), want, "{field}");
+    }
+    // Without a best, the counts and the point read 0, and the rates'
+    // validity is false; unplayed, nothing of the key is known.
+    let mut no_best = v.clone();
+    let c = no_best.selected.as_mut().unwrap();
+    c.best = None;
+    c.clears = 0;
+    c.score = RowScore::NoBest { plays: 5 };
+    for (field, guard, want) in [
+        ("selected.point", "true", vec![0]),
+        ("selected.count.perfect", "true", vec![0]),
+        ("selected.max_combo", "selected.played", vec![0]),
+        ("selected.fails", "selected.played", vec![5]),
+        ("selected.rate.perfect", "selected.play_notes_valid", vec![]),
+    ] {
+        let mut fx = number_skin(field, guard);
+        fx.view(&no_best);
+        fx.frame(0);
+        assert_eq!(shown(&fx), want, "no best: {field}");
+    }
+    let mut unplayed = no_best;
+    unplayed.selected.as_mut().unwrap().score = RowScore::Unplayed;
+    let mut fx = number_skin("selected.clears", "selected.played");
+    fx.view(&unplayed);
+    fx.frame(0);
+    assert!(shown(&fx).is_empty());
+}
+
+/// The rate bars of the best play divide each count by the play's own
+/// notes, not the summary's (here 20, as a chart that draws may have),
+/// and the best max combo's by the summary's notes for every chart, as the
+/// source's (`FloatPropertyFactory.java:155-176`, `:308` at `0.8.9`).
+#[test]
+fn the_best_play_bars_divide_by_its_own_notes() {
+    let mut fx = bar_skin(
+        (0..5)
+            .map(|k| {
+                bar(
+                    RatioForm::Bar { vertical: false },
+                    RatioSource::JudgeRate(k),
+                )
+            })
+            .chain([bar(
+                RatioForm::Bar { vertical: false },
+                RatioSource::ComboRate,
+            )])
+            .collect(),
+    );
+    let widths = |fx: &mut Fx, v: &skin_model::SelectionView| {
+        fx.view(v);
+        fx.frame(0);
+        fx.batch
+            .quads()
+            .iter()
+            .map(|q| q.rect[2])
+            .collect::<Vec<f32>>()
+    };
+    let close = |got: Vec<f32>, want: &[f32]| {
+        assert_eq!(got.len(), want.len(), "{got:?}");
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-3, "{got:?} {want:?}");
+        }
+    };
+    // PERFECT 4, GREAT 2, GOOD 0, BAD 1 and POOR 0 of 7, and the best
+    // max combo 9 of the summary's 20.
+    let per = |n: f32| 40.0 * n / 7.0;
+    close(
+        widths(&mut fx, &breakdown_view(false, 20)),
+        &[per(4.0), per(2.0), 0.0, per(1.0), 0.0, 40.0 * 9.0 / 20.0],
+    );
+    // A chart that draws: the play's own notes still, and the best max
+    // combo 9 over the summary's 20 (0.45), as for any chart.
+    close(
+        widths(&mut fx, &breakdown_view(true, 20)),
+        &[per(4.0), per(2.0), 0.0, per(1.0), 0.0, 40.0 * 0.45],
+    );
+    // Without a best: no judgment bar, and the combo bar at 0.
+    let mut v = breakdown_view(false, 20);
+    v.selected.as_mut().unwrap().best = None;
+    close(widths(&mut fx, &v), &[0.0]);
+}

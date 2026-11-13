@@ -221,6 +221,7 @@ fn decision_labels_live_in_the_decision_region() {
         timers: DecisionTimers {
             screen: Some(TimeUs(0)),
             fadeout: None,
+            input: None,
         },
     };
     r.build_decision(&mut dec, labels, &frame).unwrap();
@@ -482,6 +483,7 @@ fn title_pixels(r: &mut Renderer, b: &SkinBundle, labels: skin_model::DecisionLa
         timers: DecisionTimers {
             screen: Some(TimeUs(0)),
             fadeout: None,
+            input: None,
         },
     };
     r.build_decision(&mut dec, labels, &frame).unwrap();
@@ -874,6 +876,45 @@ fn dropping_a_worker_inside_a_line_returns_at_once() {
     assert!(*joined.0, "the thread was joined");
 }
 
+/// A restage while the worker is inside a line stages only once that job
+/// ended (its quiesce): from then on the worker holds no staging, so a
+/// rebuild's inline restaging never stages beside it.
+#[test]
+fn restage_waits_for_the_job_in_progress() {
+    let dir = truetype_skin();
+    let (r, b) = installed(&dir);
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let producer = Arc::new(Gated {
+        inner: Arc::clone(b.text_producer().unwrap()),
+        entered: Mutex::new(Some(entered_tx)),
+        release: Mutex::new(Some(release_rx)),
+    });
+    let worker = LabelWorker::spawn(Arc::clone(b.skin()), Some(producer), None).unwrap();
+    worker.post_unreconciled(job(&r, 1, "a", "AB"));
+    entered_rx.recv_timeout(watchdog()).unwrap();
+    let done = AtomicBool::new(false);
+    let again = job(&r, 2, "b", "BA");
+    std::thread::scope(|s| {
+        let q = s.spawn(|| {
+            let staged = worker.restage(&b, again);
+            done.store(true, Ordering::Release);
+            staged.unwrap().unwrap().generation()
+        });
+        let bound = std::time::Instant::now() + watchdog();
+        while !worker.quiescing() && !done.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < bound, "never quiescing");
+            std::thread::yield_now();
+        }
+        let early = done.load(Ordering::Acquire);
+        let _ = release_tx.send(());
+        assert_eq!(q.join().unwrap(), 2);
+        assert!(!early, "the restage staged while the job was in progress");
+    });
+    assert_eq!(worker.bytes().0, 0);
+    assert_eq!(worker.output_generation(), None);
+}
+
 /// A title long enough at em 256 to take more than one boundary.
 const LONG: &str = "ABCDEFGHIJKLMNOPQRST";
 
@@ -1249,4 +1290,150 @@ fn device_lost_during_an_incomplete_fill_promotes_nothing() {
     assert!(!matches!(book.state(slot), Some(LabelState::Ready { .. })));
     drop(book);
     assert_eq!(store.filling(), None);
+}
+
+/// A play skin's producer: a line starting with `T` to `W` is 2 032 × 1 000
+/// (half a 2 048 layer), anything else 100 × 50; every line full
+/// coverage.
+#[derive(Debug)]
+struct Halves;
+
+impl AttemptText for Halves {
+    fn layout(&self, req: &TextRequest, em_px: f32, _: LineBounds) -> LineFit {
+        let size = if req.text.starts_with(['T', 'U', 'V', 'W']) {
+            [2_032, 1_000]
+        } else {
+            [100, 50]
+        };
+        LineFit::Fits(LineLayout {
+            font: req.font,
+            size,
+            ink: [0.0, 0.0, 1.0, 1.0],
+            advance: 1.0,
+            raster_em: em_px,
+            glyphs: Box::new([]),
+        })
+    }
+
+    fn raster(&self, _: &LineLayout, out: &mut [u8]) -> Result<(), SkinError> {
+        out.fill(255);
+        Ok(())
+    }
+
+    fn resident(&self) -> TextResidency {
+        TextResidency::default()
+    }
+}
+
+/// The decision frame at 0 of `labels` drawn on `r`: the read-back's
+/// pixels in the title's box.
+fn title_box(r: &mut Renderer, b: &SkinBundle, labels: skin_model::DecisionLabels<'_>) -> Vec<u8> {
+    let skin = Arc::clone(b.skin());
+    let mut dec = skin.prepare_decision();
+    let frame = DecisionFrame {
+        now: TimeUs(0),
+        target: TARGET,
+        layout: &Layout::AUTHOR,
+        timers: DecisionTimers {
+            screen: Some(TimeUs(0)),
+            fadeout: None,
+            input: None,
+        },
+    };
+    r.build_decision(&mut dec, labels, &frame).unwrap();
+    r.submit_decision(&[]).unwrap();
+    let pixels = r.read_back();
+    let [x, y, w, h] = TITLE.map(|v| u32::try_from(v).unwrap());
+    (y..y + h)
+        .flat_map(|py| (x..x + w).map(move |px| (px, py)))
+        .flat_map(|p| rgb_at(&pixels, TARGET[0], p))
+        .collect()
+}
+
+/// R6.1: a play attempt's text overflowing play's layer, prepared through
+/// the production path ([`Renderer::stage`], what the player's attempt
+/// preparation calls), evicts play's lines and reports `LayerFull`, and
+/// leaves the decision region alone: a pinned and a ready slot keep their
+/// state, generation and content, and the pinned one draws the same
+/// pixels.
+#[test]
+fn decision_region_survives_play_text_pressure() {
+    let dir = truetype_skin();
+    let (mut r, b) = installed(&dir);
+    let mut store = store_for();
+    let first = job(&r, 1, "a", "ABC");
+    let pinned = publish(&mut r, &b, &mut store, first);
+    lock(store.book())
+        .pin(std::path::Path::new("a"), 1, 7)
+        .unwrap();
+    let second = job(&r, 2, "b", "XYZ");
+    let ready = publish(&mut r, &b, &mut store, second);
+    assert_ne!(pinned, ready);
+    let seen = |store: &LabelStore| {
+        let book = lock(store.book());
+        [(pinned, 1), (ready, 2)].map(|(slot, generation)| {
+            format!(
+                "{:?} {:?}",
+                book.state(slot),
+                store.content(slot, generation).map(|l| l.text)
+            )
+        })
+    };
+    let before = seen(&store);
+    let drawn = title_box(&mut r, &b, store.content(pinned, 1).unwrap());
+    assert!(drawn.iter().any(|&c| c > 128), "the title draws");
+
+    // Play's skin, its title and artist laid out by [`Halves`].
+    let play_dir = crate::outline_support::folder(
+        &[("ttf.ttf", font_support::build(&font_support::latin("Skin")))],
+        &[ttf()],
+        &[
+            text("f", 50, Value::Ref(10), [0, 0, 100, 50]),
+            text("f", 50, Value::Ref(16), [0, 60, 100, 50]),
+        ],
+    );
+    let play = crate::outline_support::bundle_with(&r, play_dir.path(), |_| {
+        Arc::new(Halves) as Arc<dyn AttemptText>
+    });
+    crate::test_common::install(&mut r, &play, 3);
+    let chart = bms_model::ChartBuilder::new(120_000).build().unwrap();
+    let ctx = crate::test_common::context(&crate::test_common::GAUGES, false);
+    let attempt = |r: &mut Renderer, title: &str, artist: &str, request: u64| {
+        let text = skin_model::ChartText {
+            title,
+            subtitle: "",
+            artist,
+            subartist: "",
+            genre: "",
+        };
+        let a = crate::AttemptInput {
+            chart: &chart,
+            context: &ctx,
+            text: &text,
+            target: r.target(),
+            continuation: skin_model::Continuation::Fresh,
+        };
+        r.stage(&play, &a, request).unwrap()
+    };
+    // T, then U installed: play's layer holds both halves.
+    for (request, title) in [(4, "T"), (5, "U")] {
+        let token = attempt(&mut r, title, "", request);
+        r.commit(token).unwrap();
+    }
+    // V evicts T; W finds no room beside the installed U.
+    let token = attempt(&mut r, "V", "W", 6);
+    let report = r.text_report();
+    assert!(report.counts.evictions >= 1, "{report:?}");
+    assert!(
+        report.notes.iter().any(|(_, n)| *n == TextNote::LayerFull),
+        "{report:?}"
+    );
+    r.commit(token).unwrap();
+
+    assert_eq!(seen(&store), before, "a decision slot changed");
+    assert_eq!(
+        title_box(&mut r, &b, store.content(pinned, 1).unwrap()),
+        drawn,
+        "the pinned labels draw otherwise"
+    );
 }

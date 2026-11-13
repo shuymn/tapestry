@@ -327,7 +327,8 @@ impl SkinBundle {
 
     /// The producer of its attempts' and its loading frames' prepared
     /// text, if any.
-    pub(crate) fn text_producer(&self) -> Option<&Arc<dyn AttemptText>> {
+    #[must_use]
+    pub fn text_producer(&self) -> Option<&Arc<dyn AttemptText>> {
         self.text.as_ref()
     }
 

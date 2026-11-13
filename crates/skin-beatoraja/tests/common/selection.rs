@@ -378,6 +378,8 @@ pub fn view(
             max_ex,
             score: r.score,
             judge_class: None,
+            clears: 0,
+            best: None,
         });
     SelectionView {
         position: None,

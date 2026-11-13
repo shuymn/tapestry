@@ -376,6 +376,52 @@ pub struct SelectedChart {
     /// 4 the easiest; `None` without one, or for a rank in no class. A
     /// value above 4 is none.
     pub judge_class: Option<u8>,
+    /// The counted plays that were clears under the chosen preset: eligible
+    /// plays whose own lamp is not FAILED (design.md "Personal Bests"); 0
+    /// when unplayed.
+    pub clears: u64,
+    /// The best's values beyond `score`'s; `None` without a best.
+    pub best: Option<SelectedBest>,
+}
+
+/// What the bests keep of the selected chart beside its EX, BP and lamp
+/// (design.md "Personal Bests").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectedBest {
+    /// The best max combo, of any counted play: not necessarily `play`'s.
+    pub max_combo: u32,
+    /// The one play that set the best EX score.
+    pub play: BestPlay,
+}
+
+/// The play that set a best EX score, every figure from that one play.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BestPlay {
+    /// Its evaluation's counts: judgments, their early and late splits,
+    /// empty POORs, EX score, BP and max combo; the current combo is 0.
+    pub tally: eval::Tally,
+    /// The judged notes of the chart as it drew them.
+    pub notes: u32,
+}
+
+impl BestPlay {
+    /// The source's point score of a 7-key play
+    /// (`ScoreDataProperty.java:75-78` at `0.8.9`): `⌊(150 000·PERFECT +
+    /// 100 000·GREAT + 20 000·GOOD) / n⌋ + ⌊50 000·combo / n⌋`, two floors,
+    /// with this play's own max combo where the source takes the best max
+    /// combo, so every figure is one play's; 0 with no notes.
+    #[must_use]
+    pub fn point(&self) -> u64 {
+        let n = u64::from(self.notes);
+        if n == 0 {
+            return 0;
+        }
+        let c = &self.tally.counts;
+        let judged = 150_000 * u64::from(c.perfect)
+            + 100_000 * u64::from(c.great)
+            + 20_000 * u64::from(c.good);
+        judged / n + 50_000 * u64::from(self.tally.max_combo) / n
+    }
 }
 
 #[cfg(test)]
@@ -402,6 +448,33 @@ mod tests {
         assert_eq!(RowFeatures::of(&summary(1, 0)), f(true, false));
         assert_eq!(RowFeatures::of(&summary(0, 1)), f(false, true));
         assert_eq!(RowFeatures::of(&summary(5, 9)), f(true, true));
+    }
+
+    /// The point score floors its two terms apart, as the source's: notes
+    /// 7, PERFECT 4, GREAT 2, BAD 1, combo 4 give 114 285 + 28 571, where
+    /// one floor over the sum gives 142 857; no notes give 0.
+    #[test]
+    fn the_point_score_floors_its_two_terms_apart() {
+        let mut tally = eval::Tally::default();
+        tally.counts.perfect = 4;
+        tally.counts.great = 2;
+        tally.counts.bad = 1;
+        tally.max_combo = 4;
+        let play = |notes| super::BestPlay { tally, notes };
+        assert_eq!(play(7).point(), 142_856);
+        assert_eq!(play(0).point(), 0);
+        // GOOD weighs 20 000: one GOOD of one note, its combo 1.
+        let mut good = eval::Tally::default();
+        good.counts.good = 1;
+        good.max_combo = 1;
+        assert_eq!(
+            super::BestPlay {
+                tally: good,
+                notes: 1
+            }
+            .point(),
+            70_000
+        );
     }
 
     #[test]

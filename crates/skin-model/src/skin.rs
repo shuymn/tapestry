@@ -5111,6 +5111,12 @@ impl Skin {
                                 sel.position
                             }
                             (RatioSource::ExRate, Phase::Selection { sel, .. }) => sel.ex_rate,
+                            (RatioSource::JudgeRate(k), Phase::Selection { sel, .. }) => {
+                                sel.judge_rates.get(usize::from(k)).copied().flatten()
+                            }
+                            (RatioSource::ComboRate, Phase::Selection { sel, .. }) => {
+                                sel.combo_rate
+                            }
                             (RatioSource::SystemVolume, Phase::Selection { sel, .. }) => {
                                 sel.system_volume
                             }

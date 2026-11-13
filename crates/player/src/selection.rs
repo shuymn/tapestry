@@ -2235,6 +2235,16 @@ impl PlayerRig<'_> {
             sel.screen.set_notice(Some(notice));
             sel.dirty = true;
         }
+        // The decision skin refused for the run: the built-in presentation
+        // draws from the next choice on, and the notice says why.
+        if let Some(why) = self.render.take_decision_refusal() {
+            log::warn!(
+                "select: the decision skin was refused, the built-in presentation draws: {why}"
+            );
+            let notice = crate::imports::notice(skin_model::ScreenKind::Decision, &why);
+            sel.screen.set_notice(Some(notice));
+            sel.dirty = true;
+        }
         // The panel the keys find open, then the one they leave (a search
         // box taking focus closes it).
         sel.panels(self.panels.as_ref(), self.clock.now());
@@ -3253,7 +3263,7 @@ impl AppRig for PlayerRig<'_> {
         let page = loading_text(sel, chart, self.autoplay);
         println!("decision: {} chosen", file_name(chart));
         let shown = page.decision();
-        self.render.show_decision(shown.clone());
+        self.render.show_decision(shown.clone(), None);
         sel.decision = Some((shown, file_name(chart)));
         self.audio.control.play_tone();
         if matches!(pick, Pick::Play(_)) {
@@ -3275,6 +3285,12 @@ impl AppRig for PlayerRig<'_> {
             }
         });
         d
+    }
+
+    /// The render thread's takeover of the active decision lifetime's
+    /// skin, once.
+    fn take_decision_takeover(&mut self) -> Option<game::DecisionTakeover> {
+        self.render.take_decision_takeover()
     }
 
     fn screen_load_failed(&mut self) -> Option<ScreenError> {
@@ -5867,7 +5883,16 @@ pub(crate) mod tests {
                 bp: 0,
                 cleared: vec![0b1],
                 full_combo: false,
+                // Its own play, as a counted one is: the read refuses a
+                // best whose EX is not its play's.
+                play: library::Breakdown {
+                    body_sha256: [7; 32],
+                    ex: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
             }),
+            clear: true,
             ineligible: None,
         };
         sel.shelf.best_writer().unwrap().ingest(&c).unwrap();
@@ -7587,11 +7612,13 @@ pub(crate) mod tests {
             c.sha256,
             library::Score {
                 plays: 3,
+                clears: 0,
                 best: Some(library::Best {
                     ex: 3,
                     bp: 1,
                     cleared: vec![1],
                     full_combo: false,
+                    ..Default::default()
                 }),
             },
         )]));

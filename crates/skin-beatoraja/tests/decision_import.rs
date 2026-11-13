@@ -14,7 +14,7 @@ use skin_beatoraja::{
     Fact, FactId, ImportError, ImportFacts, JudgeClass, LuaOutcome, NoteKind, Object, PropertyKind,
     Report, Severity,
 };
-use skin_model::{DecisionTiming, MAX_DECISION_PHASE, ScreenKind, Skin};
+use skin_model::{DecisionTimers, DecisionTiming, MAX_DECISION_PHASE, ScreenKind, Skin};
 use tempfile::TempDir;
 
 /// The top of a quad drawn at `y` with height `h`.
@@ -533,39 +533,80 @@ fn a_built_in_wins_over_a_configured_option_of_its_id() {
     }
 }
 
-/// Timers 0 and 1 never start on the decision screen (the input start is
-/// never set, design §3.4), whether named by a custom timer's alias in
-/// JSON or read by a Lua callback; an alias of timer 2 is the fade-out.
+/// Timer 0 never starts on the decision screen, and timer 1 is the
+/// input timer: off at the choice plus `input` and on 1 µs later, its
+/// start the choice plus `input` (the source switches it on past
+/// `input`), whether named directly, by a custom timer's alias in JSON or
+/// read by a Lua callback; timer 2 is the fade-out. The choice is at
+/// 7,000 ms, `input` 700 ms.
 #[test]
-fn timers_0_and_1_never_start_by_alias_or_callback() {
-    let json = r#""customTimers": [{"id": 10000, "timer": 0}, {"id": 10001, "timer": 1},
-                                 {"id": 10002, "timer": 2}],
+fn decision_timer_1_starts_at_input() {
+    let choice = TimeUs(7_000_000);
+    let timing = DecisionTiming {
+        scene: TimeUs(2_500_000),
+        fadeout: TimeUs(500_000),
+        input: TimeUs(700_000),
+    };
+    let at = |us: i64| TimeUs(choice.0 + us);
+    // Each element 8 high at its own y: b0 on timer 0, b1 on timer 1 (and
+    // its alias), bar on timer 2.
+    let check = |mut d: Dec, what: &str| {
+        for (us, want) in [
+            (0, vec![]),
+            (700_000, vec![]),
+            (700_001, vec![top(110, 8)]),
+            (2_500_000, vec![top(110, 8), top(120, 8)]),
+        ] {
+            d.timers = DecisionTimers::at(choice, &timing, at(us));
+            let mut want = want;
+            want.sort_by(f32::total_cmp);
+            assert_eq!(d.tops_at(at(us)), want, "{what} at {us} µs");
+        }
+        // Its start is the choice plus `input`, not the frame's time.
+        d.timers = DecisionTimers::at(choice, &timing, at(700_001));
+        assert_eq!(d.timers.input, Some(at(700_000)), "{what}");
+    };
+    let json = r#""input": 700, "scene": 2500, "fadeout": 500,
+        "customTimers": [{"id": 10000, "timer": 0}, {"id": 10001, "timer": 1},
+                         {"id": 10002, "timer": 2}],
         "destination": [
             {"id": "b0", "timer": 10000, "dst": [{"x": 0, "y": 100, "w": 8, "h": 8}]},
             {"id": "b1", "timer": 10001, "dst": [{"x": 0, "y": 110, "w": 8, "h": 8}]},
             {"id": "bar", "timer": 10002, "dst": [{"x": 0, "y": 120, "w": 8, "h": 8}]}]"#;
     let d = folder(json);
-    let mut j = Dec::new(
-        import_decision(d.path())
-            .unwrap_or_else(|e| panic!("{e}"))
-            .skin,
+    let imported = import_decision(d.path()).unwrap_or_else(|e| panic!("{e}"));
+    assert_eq!(imported.skin.decision_timing(), timing);
+    check(Dec::new(imported.skin), "json alias");
+    let direct = r#""input": 700, "scene": 2500, "fadeout": 500,
+        "destination": [
+            {"id": "b0", "timer": 0, "dst": [{"x": 0, "y": 100, "w": 8, "h": 8}]},
+            {"id": "b1", "timer": 1, "dst": [{"x": 0, "y": 110, "w": 8, "h": 8}]},
+            {"id": "bar", "timer": 2, "dst": [{"x": 0, "y": 120, "w": 8, "h": 8}]}]"#;
+    let d = folder(direct);
+    check(
+        Dec::new(
+            import_decision(d.path())
+                .unwrap_or_else(|e| panic!("{e}"))
+                .skin,
+        ),
+        "json",
     );
-    j.timers.fadeout = Some(TimeUs(0));
-    assert_eq!(j.tops(0), [top(120, 8)]);
-    let lua = "skin.destination = { \
+    let lua = "skin.input = 700 skin.scene = 2500 skin.fadeout = 500 \
+        skin.destination = { \
         { id = \"b0\", draw = function() return ms.timer(0) ~= ms.timer_off_value end, \
           dst = { { x = 0, y = 100, w = 8, h = 8 } } }, \
         { id = \"b1\", draw = function() return ms.timer(1) ~= ms.timer_off_value end, \
           dst = { { x = 0, y = 110, w = 8, h = 8 } } }, \
-        { id = \"lab\", draw = function() return ms.timer(1) == ms.timer_off_value end, \
+        { id = \"bar\", draw = function() return ms.timer(2) ~= ms.timer_off_value end, \
           dst = { { x = 0, y = 120, w = 8, h = 8 } } } }";
     let d = lua_folder("", lua);
-    let mut l = Dec::new(
-        lua_decision(d.path())
-            .unwrap_or_else(|e| panic!("{e}"))
-            .imported
-            .skin,
+    check(
+        Dec::new(
+            lua_decision(d.path())
+                .unwrap_or_else(|e| panic!("{e}"))
+                .imported
+                .skin,
+        ),
+        "lua",
     );
-    l.timers.fadeout = Some(TimeUs(0));
-    assert_eq!(l.tops(0), [top(120, 8)]);
 }

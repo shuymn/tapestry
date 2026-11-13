@@ -74,7 +74,6 @@ pub use decision_labels::{
     CoolFrom, DECISION_TEXT_WRITE_BUDGET, DecisionMemory, FillProgress, FillStep, Gen, LABEL_SLOTS,
     LabelBook, LabelContent, LabelJob, LabelKey, LabelOutput, LabelRow, LabelScratch, LabelState,
     LabelStore, LabelWorker, Publish, RowPlan, Settled, StagedLabels, Watch, lock, row_height,
-    stage_bundle_labels, stage_labels,
 };
 pub use decl::{
     AttemptText, BundleError, DeclSkin, Installation, LoadingPresentation, SkinBundle, pages_bytes,
@@ -93,7 +92,7 @@ pub use renderer::UploadTiming;
 #[cfg(feature = "dev-tools")]
 pub use renderer::take_build_start;
 pub use renderer::{
-    Admission, ChartOutcome, ChartTarget, CommitError, FrameTiming, LoadingTextError,
+    Admission, ChartOutcome, ChartTarget, CommitError, FrameTiming, LoadingOn, LoadingTextError,
     LoadingTextKey, MAX_SPRITES, MemoryWitness, PreparedToken, RESULT_STRIP_SPRITES, RenderError,
     Renderer, ResultChartTarget, SHARED_TEXELS, STRIP_SPRITES, Target, VM_TEXELS, letterbox,
 };

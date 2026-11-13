@@ -2950,6 +2950,7 @@ fn a_play_begins_with_its_best_and_target_by_case() {
         plays: 2,
         ex: Some(40),
         bp: Some(3),
+        max_combo: None,
         clear: Some(game::BestLamp::Failed),
     });
     let basis = |best, best_known, target| ScoreBasis {
@@ -3058,6 +3059,7 @@ fn a_practice_round_reads_no_best() {
         plays: 1,
         ex: Some(40),
         bp: Some(3),
+        max_combo: None,
         clear: None,
     });
     let (mut loaded, asked) = scored(&root, taps_n(27), ScoreTarget::Max, Some(known), false);

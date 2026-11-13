@@ -5586,6 +5586,7 @@ fn best(ex: u32, bp: u32, clear: game::BestLamp) -> game::BestScore {
         plays: 3,
         ex: Some(ex),
         bp: Some(bp),
+        max_combo: None,
         clear: Some(clear),
     }
 }
@@ -5668,6 +5669,8 @@ fn each_view_compares_with_its_presets_best_before_the_play() {
             bp: Some(5),
             bp_diff: Some(i64::from(bp) - 5),
             clear: Some(BestLamp::Cleared { gauge: 0 }),
+            max_combo: None,
+            max_combo_diff: None,
             ex_updated: true,
             bp_updated: true,
             rate: rate(1),
@@ -5683,6 +5686,8 @@ fn each_view_compares_with_its_presets_best_before_the_play() {
             bp: Some(0),
             bp_diff: Some(i64::from(beatoraja.tally.bp)),
             clear: Some(BestLamp::FullCombo),
+            max_combo: None,
+            max_combo_diff: None,
             ex_updated: beatoraja.tally.ex_score > 3,
             bp_updated: false,
             rate: Some(BestRate {
@@ -5701,6 +5706,8 @@ fn each_view_compares_with_its_presets_best_before_the_play() {
             bp: None,
             bp_diff: None,
             clear: None,
+            max_combo: None,
+            max_combo_diff: None,
             ex_updated: lr2.tally.ex_score > 0,
             bp_updated: true,
             rate: Some(BestRate {
