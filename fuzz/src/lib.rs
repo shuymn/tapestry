@@ -637,6 +637,8 @@ fn draw_selection(skin: &skin_model::Skin) -> Vec<usize> {
             max_ex: Some(300),
             score: RowScore::NoBest { plays: 1 },
             judge_class: Some(3),
+            clears: 0,
+            best: None,
         });
         let view = SelectionView {
             rows: rows.clone(),
