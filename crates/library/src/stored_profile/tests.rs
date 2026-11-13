@@ -33,7 +33,7 @@ fn rows(n: u32) -> Vec<SpeedRow> {
 }
 
 fn round_trip(bins: &[Bin], rows: &[SpeedRow]) -> (usize, StoredProfile) {
-    let bytes = encode_parts(MAIN, 1, bins, rows).unwrap();
+    let bytes = encode_parts(MAIN, 7, 1, bins, rows).unwrap();
     (bytes.len(), decode(&bytes).unwrap())
 }
 
@@ -102,7 +102,7 @@ fn the_byte_bound_is_inclusive() {
         })
         .collect();
     let mut bins = vec![[0_u16; NOTE_CATEGORIES]; NOTE_BINS];
-    let len = |bins: &[Bin]| encode_parts(MAIN, 1, bins, &rows).unwrap().len();
+    let len = |bins: &[Bin]| encode_parts(MAIN, 7, 1, bins, &rows).unwrap().len();
     // Widen counts from 1 byte to 2 until the profile is exactly the bound.
     let mut cells = 0;
     let mut kept = len(&bins);
@@ -113,10 +113,10 @@ fn the_byte_bound_is_inclusive() {
     }
     assert_eq!(kept, MAX_PROFILE_BYTES);
     assert_eq!(MAX_PROFILE_BYTES, 24_576);
-    let at_bound = decode(&encode_parts(MAIN, 1, &bins, &rows).unwrap()).unwrap();
+    let at_bound = decode(&encode_parts(MAIN, 7, 1, &bins, &rows).unwrap()).unwrap();
     assert_eq!(at_bound.rows.as_deref(), Some(rows.as_slice()));
     bins[cells / NOTE_CATEGORIES][cells % NOTE_CATEGORIES] = 128;
-    let past = decode(&encode_parts(MAIN, 1, &bins, &rows).unwrap()).unwrap();
+    let past = decode(&encode_parts(MAIN, 7, 1, &bins, &rows).unwrap()).unwrap();
     assert_eq!(past.rows, None);
     assert_eq!(past.bins, bins);
 }
@@ -126,7 +126,7 @@ fn the_byte_bound_is_inclusive() {
 #[test]
 fn the_main_tempo_round_trips_exactly() {
     for main in [None, Some(None), Some(tempo(1_805 * BPM / 10))] {
-        let bytes = encode_parts(main, 1, &[], &rows(2)).unwrap();
+        let bytes = encode_parts(main, 7, 1, &[], &rows(2)).unwrap();
         assert_eq!(decode(&bytes).unwrap().main, main);
     }
 }
@@ -150,7 +150,7 @@ fn scroll_factors_round_trip() {
 /// What this build did not write within the bounds is refused.
 #[test]
 fn damaged_blobs_are_refused() {
-    let good = encode_parts(MAIN, 1, &[[1; NOTE_CATEGORIES]], &rows(3)).unwrap();
+    let good = encode_parts(MAIN, 7, 1, &[[1; NOTE_CATEGORIES]], &rows(3)).unwrap();
     assert!(decode(&good).is_some());
     // Truncated, or with a byte more.
     assert_eq!(decode(&good[..good.len() - 1]), None);
@@ -159,33 +159,33 @@ fn damaged_blobs_are_refused() {
     assert_eq!(decode(&longer), None);
     // An empty profile reads back; another version, an unknown flag or an
     // unknown MAIN tag does not.
-    assert!(decode(&[1, 0, 0, 1, 0, 0]).is_some());
-    assert_eq!(decode(&[2, 0, 0, 1, 0, 0]), None);
-    assert_eq!(decode(&[1, 2, 0, 1, 0, 0]), None);
-    assert_eq!(decode(&[1, 0, 3, 1, 0, 0]), None);
+    assert!(decode(&[1, 0, 0, 0, 1, 0, 0]).is_some());
+    assert_eq!(decode(&[2, 0, 0, 0, 1, 0, 0]), None);
+    assert_eq!(decode(&[1, 2, 0, 0, 1, 0, 0]), None);
+    assert_eq!(decode(&[1, 0, 3, 0, 1, 0, 0]), None);
     // 513 bins, written in full (LEB 0x81 0x04), so the count alone
     // refuses them.
-    let mut bins_513 = vec![1, 0, 0, 1, 0x81, 0x04];
+    let mut bins_513 = vec![1, 0, 0, 0, 1, 0x81, 0x04];
     bins_513.extend(vec![0; 513 * NOTE_CATEGORIES]);
     bins_513.push(0);
     assert_eq!(decode(&bins_513), None);
-    let mut bins_512 = vec![1, 0, 0, 1, 0x80, 0x04];
+    let mut bins_512 = vec![1, 0, 0, 0, 1, 0x80, 0x04];
     bins_512.extend(vec![0; 512 * NOTE_CATEGORIES]);
     bins_512.push(0);
     assert!(decode(&bins_512).is_some(), "the same blob at 512 reads");
     // 4 097 rows (LEB 0x81 0x20), refused before they are read.
-    assert_eq!(decode(&[1, 0, 0, 1, 0, 0x81, 0x20]), None);
+    assert_eq!(decode(&[1, 0, 0, 0, 1, 0, 0x81, 0x20]), None);
     // A count past u16 (65 536, LEB 0x80 0x80 0x04).
     assert_eq!(
-        decode(&[1, 0, 0, 1, 1, 0x80, 0x80, 0x04, 0, 0, 0, 0, 0, 0, 0]),
+        decode(&[1, 0, 0, 0, 1, 1, 0x80, 0x80, 0x04, 0, 0, 0, 0, 0, 0, 0]),
         None
     );
     // Rows left out yet counted.
-    assert_eq!(decode(&[1, 1, 0, 1, 0, 1]), None);
+    assert_eq!(decode(&[1, 1, 0, 0, 1, 0, 1]), None);
     // A tempo below the tempo range (1 unit).
-    assert_eq!(decode(&[1, 0, 0, 1, 0, 1, 0, 1, 1, 36, 1]), None);
+    assert_eq!(decode(&[1, 0, 0, 0, 1, 0, 1, 0, 1, 1, 36, 1]), None);
     // A scroll factor past i128 (2 · 10^38).
-    assert_eq!(decode(&[1, 0, 0, 1, 0, 1, 0, 0, 76, 2]), None);
+    assert_eq!(decode(&[1, 0, 0, 0, 1, 0, 1, 0, 0, 76, 2]), None);
     // A number past u128.
     let mut huge = vec![1, 0, 0];
     huge.extend([0xff; 19]);
@@ -193,4 +193,49 @@ fn damaged_blobs_are_refused() {
     assert_eq!(decode(&huge), None);
     // Past the byte bound.
     assert_eq!(decode(&vec![0; MAX_PROFILE_BYTES + 1]), None);
+}
+
+/// The content length reads back.
+#[test]
+fn the_length_round_trips() {
+    let bytes = encode_parts(MAIN, 4_200, 1, &[], &rows(2)).unwrap();
+    assert_eq!(decode(&bytes).unwrap().length_ms, 4_200);
+}
+
+/// Fixture OVF: 4 097 genuinely changing tempos (alternating 120 and 240
+/// BPM) pass the row bound after coalescing, so their rows are left out
+/// and the bins kept; fixture RED's 4 096 redundant changes coalesce to
+/// two rows and stay.
+#[test]
+fn a_real_overflow_drops_the_rows_and_a_redundant_one_does_not() {
+    let lane = bms_model::Lane::new(1).unwrap();
+    let profile = |redundant: bool| {
+        let mut b = bms_model::ChartBuilder::new(120_000);
+        let mut scroll = Vec::new();
+        for k in 0..4_097_i64 {
+            let at = bms_model::TimeUs(1_000_000 + k * 1_000);
+            let fast = k % 2 == 0;
+            b = b.bpm(at, if fast { 240_000 } else { 120_000 });
+            if redundant {
+                scroll.push((at, if fast { SCROLL_ONE / 2 } else { SCROLL_ONE }));
+            }
+        }
+        let mut chart = b.tap(lane, bms_model::TimeUs(6_000_000)).build().unwrap();
+        chart.meta.length = bms_model::ChartSummary::of(&chart).length;
+        let inputs = bms_model::PreviewInputs {
+            timeline: None,
+            last_shown: None,
+            scroll,
+        };
+        bms_model::ChartProfile::preview(&chart, &[], &inputs)
+    };
+    let real = profile(false);
+    assert!(real.speeds().len() > MAX_ROWS);
+    let stored = decode(&super::encode(&real, MAIN).unwrap()).unwrap();
+    assert_eq!(stored.rows, None);
+    assert_eq!(stored.bins, real.bins());
+    let redundant = profile(true);
+    assert_eq!(redundant.speeds().len(), 2);
+    let stored = decode(&super::encode(&redundant, MAIN).unwrap()).unwrap();
+    assert_eq!(stored.rows.as_deref(), Some(redundant.speeds()));
 }

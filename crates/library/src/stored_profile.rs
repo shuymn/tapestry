@@ -5,7 +5,8 @@
 //!
 //! The encoding is a version byte, a flags byte (bit 0: the rows were left
 //! out), the MAIN tempo (a tag: 0 unavailable, 1 none weighted, 2 a tempo,
-//! then for 2 the tempo as a row's), the bin width in seconds, the bin count
+//! then for 2 the tempo as a row's), the content's length in whole ms
+//! ([`ChartProfile::length_ms`]), the bin width in seconds, the bin count
 //! and each bin's [`NOTE_CATEGORIES`] counts, then the row count and each
 //! row: its time as the ms since the row before it, a tag byte (0 a STOP;
 //! otherwise the tempo's power of ten plus 1) and the tempo's units over
@@ -38,6 +39,9 @@ pub struct StoredProfile {
     /// The exact MAIN tempo ([`bms_model::main_tempo`]): `Some(None)` when
     /// no note weighs anything, `None` when it was unavailable.
     pub main: Option<Option<Tempo>>,
+    /// The content's length in whole ms ([`ChartProfile::length_ms`]),
+    /// which the tempo graph spans.
+    pub length_ms: u32,
     /// The seconds each bin spans ([`ChartProfile::bin_seconds`]).
     pub bin_seconds: u32,
     /// The notes graph's bins ([`ChartProfile::bins`]).
@@ -88,6 +92,7 @@ fn count(n: usize) -> u128 {
 pub fn encode(profile: &ChartProfile, main: Option<Option<Tempo>>) -> Option<Vec<u8>> {
     encode_parts(
         main,
+        profile.length_ms(),
         profile.bin_seconds(),
         profile.bins(),
         profile.speeds(),
@@ -97,6 +102,7 @@ pub fn encode(profile: &ChartProfile, main: Option<Option<Tempo>>) -> Option<Vec
 /// [`encode`] of a profile's parts.
 fn encode_parts(
     main: Option<Option<Tempo>>,
+    length_ms: u32,
     bin_seconds: u32,
     bins: &[[u16; NOTE_CATEGORIES]],
     rows: &[SpeedRow],
@@ -115,6 +121,7 @@ fn encode_parts(
             put_tempo(&mut out, t);
         }
     }
+    put(&mut out, u128::from(length_ms));
     put(&mut out, u128::from(bin_seconds));
     put(&mut out, count(bins.len()));
     for &c in bins.iter().flatten() {
@@ -220,6 +227,7 @@ pub fn decode(bytes: &[u8]) -> Option<StoredProfile> {
         }
         _ => return None,
     };
+    let length_ms: u32 = r.bounded()?;
     let bin_seconds: u32 = r.bounded()?;
     let bin_count: usize = r.bounded()?;
     if bin_count > NOTE_BINS {
@@ -265,6 +273,7 @@ pub fn decode(bytes: &[u8]) -> Option<StoredProfile> {
     }
     Some(StoredProfile {
         main,
+        length_ms,
         bin_seconds,
         bins,
         rows,

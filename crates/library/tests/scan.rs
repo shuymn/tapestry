@@ -1074,6 +1074,7 @@ fn the_scan_stores_the_preview_profile() {
     );
     let stored = lib.profile(&entry).unwrap().unwrap();
     assert_eq!(stored.bins.len(), 6);
+    assert_eq!(stored.length_ms, 4_200);
     let rows = stored.rows.unwrap();
     assert_eq!(rows[1].ms, 1_000);
     assert_eq!(rows[1].scroll, bms_model::SCROLL_ONE / 2);

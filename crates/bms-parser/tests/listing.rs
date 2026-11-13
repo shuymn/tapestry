@@ -423,3 +423,64 @@ fn a_preview_object_past_the_cap_is_left_out() {
     assert_eq!(scanned.profile.unwrap().seconds().len(), 2);
     assert!(load(text, 0).is_ok());
 }
+
+fn speed_row(ms: u32, bpm: i64, scroll: i128) -> bms_model::SpeedRow {
+    bms_model::SpeedRow {
+        ms,
+        tempo: Some(Tempo::from_milli(bpm * 1_000).unwrap()),
+        scroll,
+    }
+}
+
+/// Fixture TB: a tempo change after play's last object reaches the preview
+/// through its own timeline: a note at 0 at 120 BPM, 240 BPM (03 `F0`) at
+/// measure 1 (2 s) and a hidden note at measure 2 (3 s). Play's rows stop
+/// at its note.
+#[test]
+fn a_tempo_change_past_plays_end_reaches_the_preview() {
+    let text = "#BPM 120\n#00011:01\n#00103:F0\n#00231:01\n";
+    let one = bms_model::SCROLL_ONE;
+    let p = preview(text);
+    assert_eq!(
+        p.speeds(),
+        [
+            speed_row(0, 120, one),
+            speed_row(2_000, 240, one),
+            speed_row(3_000, 240, one)
+        ]
+    );
+    assert_eq!(p.length_ms(), 3_000);
+    let loaded = load(text, 0).unwrap();
+    assert_eq!(loaded.profile.speeds(), [speed_row(0, 120, one)]);
+    assert_eq!(loaded.chart.meta.length, TimeUs(0));
+}
+
+/// Fixture HS: a later scroll change ends the rows but not the length,
+/// which stays at the hidden note's 3 s.
+#[test]
+fn a_late_scroll_change_does_not_lengthen_the_content() {
+    let text = "#BPM 120\n#SCROLL01 2\n#00011:01\n#00103:F0\n#00231:01\n#003SC:01\n";
+    let p = preview(text);
+    assert_eq!(p.length_ms(), 3_000);
+    assert_eq!(
+        p.speeds().last(),
+        Some(&speed_row(4_000, 240, 2 * bms_model::SCROLL_ONE))
+    );
+}
+
+/// Fixture Z/N: a scroll of 0 and a negative scroll reach the rows as
+/// written.
+#[test]
+fn zero_and_negative_scroll_reach_the_rows() {
+    let text = "#BPM 120\n#SCROLL01 0\n#SCROLL02 -1\n#00011:01010101\n#000SC:0001\n\
+         #001SC:02\n#00111:01\n";
+    let one = bms_model::SCROLL_ONE;
+    assert_eq!(
+        preview(text).speeds(),
+        [
+            speed_row(0, 120, one),
+            speed_row(1_000, 120, 0),
+            speed_row(2_000, 120, -one)
+        ]
+    );
+}

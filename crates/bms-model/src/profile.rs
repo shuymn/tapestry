@@ -4,7 +4,7 @@
 //! speed, the only point that holds them (design.md "Practice Speed
 //! Changes").
 
-use crate::{Chart, Lane, NoteKind, Tempo, TimeUs, TimelineId};
+use crate::{Chart, Lane, NoteKind, Tempo, TimeUs, TimelineId, TimelinePoint};
 
 /// The note categories of a second, in [`ChartProfile::seconds`]' order.
 pub const NOTE_CATEGORIES: usize = 7;
@@ -50,12 +50,29 @@ pub struct SpeedRow {
 /// shows them.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PreviewInputs {
+    /// The preview's own timeline, the chart's objects and the preview's
+    /// timed together, which keeps the tempo changes and STOPs a play's
+    /// timeline drops after its last object; `None` when the chart has no
+    /// preview object, or timing them failed, so the play chart's is used.
+    pub timeline: Option<PreviewTimeline>,
     /// The latest hidden note (channels 31–39), BGA event (04) or layer
     /// event (07), which lengthen the seconds the preview counts over.
     pub last_shown: Option<TimeUs>,
     /// The scroll changes (channel `SC` with `#SCROLLxx`) in time order, one
     /// per time, each the factor in units of `10^-18` from then on.
     pub scroll: Vec<(TimeUs, i128)>,
+}
+
+/// [`PreviewInputs::timeline`]: rows as a [`ChartTimeline`](crate::ChartTimeline)
+/// holds them, at 1×.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PreviewTimeline {
+    /// The rows in time order, a STOP's end the row after its start.
+    pub points: Vec<TimelinePoint>,
+    /// The rows where a STOP of at least 1 ms starts, in order.
+    pub long_stops: Vec<TimelineId>,
+    /// The tempo before time 0.
+    pub initial: Tempo,
 }
 
 /// A chart's notes by second and its tempo rows, at 1× times.
@@ -65,6 +82,7 @@ pub struct ChartProfile {
     bins: Vec<[u16; NOTE_CATEGORIES]>,
     bin_seconds: u32,
     speeds: Vec<SpeedRow>,
+    length_ms: u32,
 }
 
 impl ChartProfile {
@@ -76,22 +94,31 @@ impl ChartProfile {
     pub fn of(chart: &Chart, long_stops: &[TimelineId]) -> Self {
         let seconds = seconds(chart, chart.meta.length);
         let (bins, bin_seconds) = condense(&seconds);
+        let timeline = &chart.timeline;
         Self {
             seconds,
             bins,
             bin_seconds,
-            speeds: speeds(chart, long_stops, &PreviewInputs::default()),
+            speeds: speeds(
+                timeline.points(),
+                timeline.meta().initial,
+                long_stops,
+                &[],
+                None,
+            ),
+            length_ms: ms_of(chart.meta.length),
         }
     }
 
     /// A song list's preview profile of `chart` ([`of`](Self::of)'s
     /// arguments) with what the loader timed for it (`inputs`), as the
-    /// reference player's song information reads a chart: its seconds run
-    /// to the later of the length and [`PreviewInputs::last_shown`], and its
-    /// tempo rows carry the scroll factor, a scroll change being a point of
-    /// its own, the last row at the latest point, scroll change or shown
-    /// object (beatoraja `song/SongInformation.java:102`, `:180-210`;
-    /// jbms-parser `BMSModel.getLastMilliTime`).
+    /// reference player's song information reads a chart (beatoraja
+    /// `song/SongInformation.java:102`, `:180-210`; jbms-parser
+    /// `BMSModel.getLastMilliTime`): its length runs to the later of the
+    /// chart's and [`PreviewInputs::last_shown`], its seconds over it; its
+    /// tempo rows follow the preview's own timeline when there is one, and
+    /// carry the scroll factor, a scroll change being a point of its own;
+    /// the last row is at the latest point, scroll change or shown object.
     #[must_use]
     pub fn preview(chart: &Chart, long_stops: &[TimelineId], inputs: &PreviewInputs) -> Self {
         let end = inputs
@@ -99,12 +126,37 @@ impl ChartProfile {
             .map_or(chart.meta.length, |t| t.max(chart.meta.length));
         let seconds = seconds(chart, end);
         let (bins, bin_seconds) = condense(&seconds);
+        let speeds = match &inputs.timeline {
+            Some(t) => speeds(
+                &t.points,
+                t.initial,
+                &t.long_stops,
+                &inputs.scroll,
+                inputs.last_shown,
+            ),
+            None => speeds(
+                chart.timeline.points(),
+                chart.timeline.meta().initial,
+                long_stops,
+                &inputs.scroll,
+                inputs.last_shown,
+            ),
+        };
         Self {
             seconds,
             bins,
             bin_seconds,
-            speeds: speeds(chart, long_stops, inputs),
+            speeds,
+            length_ms: ms_of(end),
         }
+    }
+
+    /// The content's length in whole ms: the chart's
+    /// ([`ChartMeta::length`](crate::ChartMeta::length)), or a preview's
+    /// with its shown objects, which a tempo graph spans.
+    #[must_use]
+    pub const fn length_ms(&self) -> u32 {
+        self.length_ms
     }
 
     /// One entry per 1× second, `⌊length / 1 s⌋ + 2` of them: each
@@ -135,11 +187,13 @@ impl ChartProfile {
 
     /// The tempo rows, in time order: the initial tempo at 0; at each
     /// point (a note's head or end, a BGM event, a tempo change, a STOP's
-    /// start or a bar line, never a STOP's end) a stopped row where a STOP
-    /// of at least 1 ms starts (one of the `long_stops` given to
-    /// [`of`](Self::of)) unless already stopped, otherwise a row
-    /// where the tempo differs from the current one; and the current tempo
-    /// at the last point unless a row is already there.
+    /// start or a bar line, never a STOP's end; in a preview also a scroll
+    /// change) the state there: stopped where a STOP of at least 1 ms
+    /// starts (one of the `long_stops` given to [`of`](Self::of)), otherwise
+    /// its tempo and scroll factor; a row only where the effective speed
+    /// (tempo times factor, 0 while stopped) differs from the last row's,
+    /// compared exactly; and the state at the last point unless a row is
+    /// already there.
     #[must_use]
     pub fn speeds(&self) -> &[SpeedRow] {
         &self.speeds
@@ -222,33 +276,63 @@ fn ms_of(t: TimeUs) -> u32 {
     u32::try_from(t.0.max(0) / 1_000).unwrap_or(u32::MAX)
 }
 
-fn speeds(chart: &Chart, long_stops: &[TimelineId], inputs: &PreviewInputs) -> Vec<SpeedRow> {
-    let points = chart.timeline.points();
-    let mut tempo = chart.timeline.meta().initial;
-    let mut current = Some(tempo);
-    let mut factor = SCROLL_ONE;
+/// `a · b` as 256 bits, high then low.
+const fn wide(a: u128, b: u128) -> (u128, u128) {
+    const LOW: u128 = u64::MAX as u128;
+    let (a1, a0) = (a >> 64, a & LOW);
+    let (b1, b0) = (b >> 64, b & LOW);
+    let lo = a0 * b0;
+    let mid1 = a1 * b0;
+    let mid2 = a0 * b1;
+    let hi = a1 * b1;
+    let (mid, carry) = mid1.overflowing_add(mid2);
+    let carry = if carry { 1_u128 << 64 } else { 0 };
+    let (lo, c) = lo.overflowing_add(mid << 64);
+    let hi = hi + (mid >> 64) + carry + if c { 1 } else { 0 };
+    (hi, lo)
+}
+
+/// A state's effective speed as a sign and a 256-bit magnitude: the tempo's
+/// units times the factor's, 0 while stopped.
+fn effective(tempo: Option<Tempo>, scroll: i128) -> (i8, (u128, u128)) {
+    match tempo {
+        Some(t) if scroll != 0 => (
+            if scroll < 0 { -1 } else { 1 },
+            wide(t.units(), scroll.unsigned_abs()),
+        ),
+        _ => (0, (0, 0)),
+    }
+}
+
+fn speeds(
+    points: &[TimelinePoint],
+    initial: Tempo,
+    long_stops: &[TimelineId],
+    scroll: &[(TimeUs, i128)],
+    last_shown: Option<TimeUs>,
+) -> Vec<SpeedRow> {
+    let mut tempo = initial;
+    let mut state = (Some(initial), SCROLL_ONE);
     let mut rows = vec![SpeedRow {
         ms: 0,
-        tempo: current,
-        scroll: factor,
+        tempo: state.0,
+        scroll: state.1,
     }];
-    let mut changes = inputs.scroll.iter().peekable();
-    let mut last = None;
-    // A scroll change before the next point: a point of its own at the
-    // current tempo, a STOP being over by then (a later position is a
-    // later time than the STOP's end).
-    let scroll_point = |rows: &mut Vec<SpeedRow>, current: &mut Option<Tempo>, at, f, tempo| {
-        let ms = ms_of(at);
-        if *current != Some(tempo) || rows.last().is_some_and(|r| r.scroll != f) {
-            *current = Some(tempo);
+    // A row where the effective speed changes.
+    let emit = |rows: &mut Vec<SpeedRow>, ms, state: (Option<Tempo>, i128)| {
+        let changed = rows
+            .last()
+            .is_none_or(|r| effective(r.tempo, r.scroll) != effective(state.0, state.1));
+        if changed {
             rows.push(SpeedRow {
                 ms,
-                tempo: *current,
-                scroll: f,
+                tempo: state.0,
+                scroll: state.1,
             });
         }
-        ms
     };
+    let mut changes = scroll.iter().peekable();
+    let mut last = None;
     for (i, p) in points.iter().enumerate() {
         // A STOP's end is the row after its start: the same position,
         // later. It is no point of its own.
@@ -256,48 +340,41 @@ fn speeds(chart: &Chart, long_stops: &[TimelineId], inputs: &PreviewInputs) -> V
         if prev.is_some_and(|q| q.pos == p.pos && q.at < p.at) {
             continue;
         }
+        // A scroll change before this point is a point of its own at the
+        // tempo then, a STOP being over by then (a later position is a
+        // later time than the STOP's end).
         while let Some(&&(at, f)) = changes.peek()
             && at < p.at
         {
             changes.next();
-            factor = f;
-            scroll_point(&mut rows, &mut current, at, f, tempo);
+            state = (Some(tempo), f);
+            emit(&mut rows, ms_of(at), state);
         }
         // A change at this point's time applies at it.
         while let Some(&&(at, f)) = changes.peek()
             && at == p.at
         {
             changes.next();
-            factor = f;
+            state.1 = f;
         }
         tempo = p.tempo;
         let id = TimelineId(u32::try_from(i).unwrap_or(u32::MAX));
         let ms = ms_of(p.at);
-        let scrolled = rows.last().is_some_and(|r| r.scroll != factor);
-        if long_stops.binary_search(&id).is_ok() {
-            if current.is_some() {
-                current = None;
-                rows.push(SpeedRow {
-                    ms,
-                    tempo: None,
-                    scroll: factor,
-                });
-            }
-        } else if current != Some(p.tempo) || scrolled {
-            current = Some(p.tempo);
-            rows.push(SpeedRow {
-                ms,
-                tempo: current,
-                scroll: factor,
-            });
-        }
+        state.0 = if long_stops.binary_search(&id).is_ok() {
+            None
+        } else {
+            Some(p.tempo)
+        };
+        emit(&mut rows, ms, state);
         last = Some(ms);
     }
     for &(at, f) in changes {
-        factor = f;
-        last = Some(scroll_point(&mut rows, &mut current, at, f, tempo));
+        state = (Some(tempo), f);
+        let ms = ms_of(at);
+        emit(&mut rows, ms, state);
+        last = Some(ms);
     }
-    let shown = inputs.last_shown.map(ms_of);
+    let shown = last_shown.map(ms_of);
     let last = match (last, shown) {
         (Some(a), Some(b)) => Some(a.max(b)),
         (a, b) => a.or(b),
@@ -307,8 +384,8 @@ fn speeds(chart: &Chart, long_stops: &[TimelineId], inputs: &PreviewInputs) -> V
     {
         rows.push(SpeedRow {
             ms,
-            tempo: current,
-            scroll: factor,
+            tempo: state.0,
+            scroll: state.1,
         });
     }
     rows
@@ -361,6 +438,7 @@ mod tests {
     fn a_shown_object_lengthens_the_preview() {
         let chart = four_taps();
         let inputs = PreviewInputs {
+            timeline: None,
             last_shown: Some(TimeUs(4_200_000)),
             scroll: Vec::new(),
         };
@@ -370,6 +448,7 @@ mod tests {
         assert_eq!(preview.speeds().last(), Some(&row(4_200, 120, SCROLL_ONE)));
         // A shown object before the length changes nothing.
         let early = PreviewInputs {
+            timeline: None,
             last_shown: Some(TimeUs(500_000)),
             scroll: Vec::new(),
         };
@@ -385,6 +464,7 @@ mod tests {
     fn the_rows_carry_the_scroll_factor() {
         let chart = four_taps();
         let inputs = PreviewInputs {
+            timeline: None,
             last_shown: None,
             scroll: vec![
                 (TimeUs(1_000_000), SCROLL_ONE / 2),
@@ -414,6 +494,7 @@ mod tests {
     #[test]
     fn a_late_scroll_change_ends_the_rows() {
         let inputs = PreviewInputs {
+            timeline: None,
             last_shown: None,
             scroll: vec![(TimeUs(5_000_000), 3 * SCROLL_ONE)],
         };
@@ -422,5 +503,75 @@ mod tests {
             speeds.speeds().last(),
             Some(&row(5_000, 120, 3 * SCROLL_ONE))
         );
+    }
+
+    /// Fixture RED: rows follow the effective speed, compared exactly, so
+    /// (120 BPM, ×1) and (240 BPM, ×0.5) alternating at 4 096 points give
+    /// the initial row and the last one only.
+    #[test]
+    fn equal_effective_speeds_coalesce() {
+        let lane = Lane::new(1).unwrap();
+        let mut b = ChartBuilder::new(120_000);
+        let mut scroll = Vec::new();
+        for k in 0..4_096_i64 {
+            let at = TimeUs(1_000_000 + k * 1_000);
+            let fast = k % 2 == 0;
+            b = b.bpm(at, if fast { 240_000 } else { 120_000 });
+            scroll.push((at, if fast { SCROLL_ONE / 2 } else { SCROLL_ONE }));
+        }
+        let chart = chart(b.tap(lane, TimeUs(6_000_000)));
+        let inputs = PreviewInputs {
+            timeline: None,
+            last_shown: None,
+            scroll,
+        };
+        assert_eq!(
+            ChartProfile::preview(&chart, &[], &inputs).speeds(),
+            [row(0, 120, SCROLL_ONE), row(6_000, 120, SCROLL_ONE)]
+        );
+    }
+
+    /// A scroll of 0 is a speed of 0, as a STOP's: two such states in a
+    /// row are one row; a negative factor is its own speed.
+    #[test]
+    fn a_zero_scroll_is_speed_zero() {
+        let inputs = PreviewInputs {
+            timeline: None,
+            last_shown: None,
+            scroll: vec![
+                (TimeUs(500_000), 0),
+                (TimeUs(1_000_000), 0),
+                (TimeUs(1_500_000), -SCROLL_ONE),
+            ],
+        };
+        assert_eq!(
+            ChartProfile::preview(&four_taps(), &[], &inputs).speeds(),
+            [
+                row(0, 120, SCROLL_ONE),
+                row(500, 120, 0),
+                row(1_500, 120, -SCROLL_ONE),
+                row(3_000, 120, -SCROLL_ONE),
+            ]
+        );
+    }
+
+    /// The preview's length is the later of the chart's and the last shown
+    /// object, in whole ms, never a later scroll change (fixture HS); the
+    /// play profile's is the chart's.
+    #[test]
+    fn the_preview_length_is_the_content_length() {
+        let chart = four_taps();
+        let inputs = PreviewInputs {
+            timeline: None,
+            last_shown: Some(TimeUs(4_200_500)),
+            scroll: vec![(TimeUs(5_000_000), 2 * SCROLL_ONE)],
+        };
+        let preview = ChartProfile::preview(&chart, &[], &inputs);
+        assert_eq!(preview.length_ms(), 4_200);
+        assert_eq!(
+            preview.speeds().last(),
+            Some(&row(5_000, 120, 2 * SCROLL_ONE))
+        );
+        assert_eq!(ChartProfile::of(&chart, &[]).length_ms(), 3_000);
     }
 }
