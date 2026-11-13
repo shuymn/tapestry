@@ -447,7 +447,7 @@ fn a_reused_specialization_draws_with_no_upload() {
     let on = render::LoadingOn::Staged(again);
     assert_eq!(r.loading_text_key_on(on), r.loading_text_key());
     let lifetime_2 = common::loading_frame(2, TimeUs(0), TimeUs(0));
-    let mut staged = |r: &mut Renderer| {
+    let staged = |r: &mut Renderer| {
         let t = r.loading_frame_on(on, &lifetime_2, &menu).unwrap().unwrap();
         assert!(t.presented);
         read_back(r)
