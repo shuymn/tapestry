@@ -433,7 +433,13 @@ struct Loader {
     /// The pending preparation's polls go through production's
     /// [`game::poll_until`], each moving the clock 1 ms; their slices on the
     /// monotonic clock, with the clock time each began at.
-    production_poll: Option<Vec<(i64, std::time::Duration)>>,
+    /// Each production poll's rig time and its slice's bounds: the
+    /// deadline measured from just after the poll began (at most the slice
+    /// `poll_until` asked for) and from the clock read before it (at least
+    /// that slice), so no assertion depends on how long the thread ran.
+    production_poll: Option<Vec<(i64, std::time::Duration, std::time::Duration)>>,
+    /// When the rig's clock was last read (the production poll's bound).
+    read_at: std::cell::Cell<Option<std::time::Instant>>,
     /// The gauge [`Shown`] shows.
     shown: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// Taken right after the first snapshot at or after its time that is
@@ -500,6 +506,7 @@ impl Loader {
             opens: 0,
             requests: Vec::new(),
             production_poll: None,
+            read_at: std::cell::Cell::new(None),
             shown: std::sync::Arc::default(),
             after_quiet: None,
         }
@@ -673,6 +680,7 @@ impl Rig for Loader {
     type ResultPrep = ();
 
     fn now(&self) -> TimeUs {
+        self.read_at.set(Some(std::time::Instant::now()));
         self.clock.now()
     }
 
@@ -721,10 +729,14 @@ impl Rig for Loader {
         handle: &mut game::PrepHandle,
         deadline: std::time::Instant,
     ) -> Result<game::PrepPoll<Preparation>, SurfaceLost> {
-        let slice = deadline.saturating_duration_since(std::time::Instant::now());
+        let least = deadline.saturating_duration_since(std::time::Instant::now());
+        let most = self
+            .read_at
+            .get()
+            .map_or(least, |read| deadline.saturating_duration_since(read));
         let now = self.clock.now().0;
         if let Some(slices) = &mut self.production_poll {
-            slices.push((now, slice));
+            slices.push((now, least, most));
         }
         self.step("poll");
         self.polls.push((self.clock.now().0, handle.ticket()));
@@ -1546,24 +1558,23 @@ fn production_s_poll_ends_at_the_next_wake() {
     rig.production_poll = Some(Vec::new());
     run(&mut loaded, &mut rig).unwrap();
     let slices = rig.production_poll.take().unwrap();
+    // Each poll's (least, most): the slice asked for lies between them.
     let at = |t: i64| {
-        let [(_, slice)] = slices
+        let [(_, least, most)] = slices
             .iter()
-            .filter(|&&(n, _)| n == T0 + t)
+            .filter(|&&(n, _, _)| n == T0 + t)
             .copied()
             .collect::<Vec<_>>()[..]
         else {
             panic!("no one poll at {t}");
         };
-        slice
+        (least, most)
     };
-    assert!(at(500_000) > Duration::from_millis(3), "{:?}", at(500_000));
-    assert!(
-        at(500_000) <= Duration::from_millis(10),
-        "{:?}",
-        at(500_000)
-    );
-    assert!(at(SECOND) <= Duration::from_millis(3), "{:?}", at(SECOND));
+    let (least, most) = at(500_000);
+    assert!(most > Duration::from_millis(3), "{most:?}");
+    assert!(least <= Duration::from_millis(10), "{least:?}");
+    let (least, _) = at(SECOND);
+    assert!(least <= Duration::from_millis(3), "{least:?}");
     assert_eq!(applied_at(&rig)[0], T0 + 1_003_000);
 }
 
