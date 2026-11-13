@@ -977,7 +977,7 @@ pub fn resolve(
             },
             Some(PointerHit::Action { event, .. }) => Resolved {
                 unfocus: false,
-                act: cover(event, &built, facts, &kind_at),
+                act: cover(event),
             },
             _ => NOTHING,
         };
@@ -1024,7 +1024,7 @@ pub fn resolve(
         }
         // Every other action takes the press and does nothing, but the
         // cover switches.
-        Some(PointerHit::Action { event, .. }) => cover(event, &built, facts, &kind_at),
+        Some(PointerHit::Action { event, .. }) => cover(event),
         Some(PointerHit::Slider(command)) => list_slider(command, &built, facts),
         None if button == Button::Right => PointerAct::Key(MenuKey::Escape),
         None => PointerAct::Nothing,
@@ -1054,27 +1054,17 @@ const fn order(arg: i8) -> PointerAct {
 }
 
 /// Event `event` as a cover switch: 330, 331 and 332 turn SUDDEN+, LIFT
-/// and HIDDEN+ over while the drawn cursor is on a chart row, as the
-/// source's act only on a bar with a play config
-/// (`skin/property/EventFactory.java:677-703`,
-/// `select/MusicSelector.java:650-654` at 0.8.9); anything else does
-/// nothing.
-fn cover(
-    event: u16,
-    built: &Built,
-    facts: &Facts,
-    kind_at: &impl Fn(usize) -> Option<RowRefKind>,
-) -> PointerAct {
-    let kind = match event {
-        330 => game::CoverKind::Sudden,
-        331 => game::CoverKind::Lift,
-        332 => game::CoverKind::Hidden,
-        _ => return PointerAct::Nothing,
-    };
-    if kind_at(facts.cursor) == Some(RowRefKind::Chart) && drawn_cursor(built, facts) {
-        PointerAct::Cover(kind)
-    } else {
-        PointerAct::Nothing
+/// and HIDDEN+ over, whatever row the cursor is on. The source's act on
+/// the selected row's play config, which for a folder or any row with no
+/// chart is the configured mode's (`skin/property/EventFactory.java:677-703`,
+/// `select/MusicSelector.java:650-669` at 0.8.9); tapestry has the one
+/// 7-key configuration. Anything else does nothing.
+const fn cover(event: u16) -> PointerAct {
+    match event {
+        330 => PointerAct::Cover(game::CoverKind::Sudden),
+        331 => PointerAct::Cover(game::CoverKind::Lift),
+        332 => PointerAct::Cover(game::CoverKind::Hidden),
+        _ => PointerAct::Nothing,
     }
 }
 
@@ -1550,49 +1540,39 @@ mod tests {
         assert_eq!(resolve(l, on(None), None, &f, kinds), NOTHING);
     }
 
-    /// Events 330, 331 and 332 turn their own switch over on the drawn
-    /// chart cursor, under a panel too, and do nothing on a folder, the
-    /// "all charts" row or a cursor the build drew elsewhere.
+    /// Events 330, 331 and 332 turn their own switch over on every row,
+    /// under a panel too, whether or not the build drew the cursor there:
+    /// the "all charts" row (0), a folder (1) and a chart (2).
     #[test]
-    fn the_cover_switches_act_on_the_drawn_chart_row() {
+    fn the_cover_switches_act_on_every_row() {
         let l = press(Button::Left);
         let action = |event| Some(PointerHit::Action { event, arg: 1 });
-        let chart = Facts {
-            cursor: 2,
-            ..facts()
-        };
-        let drawn = Built {
-            cursor: Some(2),
-            ..built(7)
-        };
-        for panel in [false, true] {
-            let f = Facts { panel, ..chart };
+        for (panel, cursor) in [false, true]
+            .into_iter()
+            .flat_map(|p| [0, 1, 2].map(|c| (p, c)))
+        {
+            let f = Facts {
+                panel,
+                cursor,
+                ..facts()
+            };
             for (event, kind) in [
                 (330, game::CoverKind::Sudden),
                 (331, game::CoverKind::Lift),
                 (332, game::CoverKind::Hidden),
             ] {
                 assert_eq!(
-                    resolve(l, on(action(event)), Some(drawn), &f, kinds).act,
+                    act(l, action(event), &f),
                     PointerAct::Cover(kind),
-                    "{event} under a panel: {panel}"
+                    "{event} on row {cursor}, under a panel: {panel}"
                 );
-                // The build drew the cursor on row 1.
-                assert_eq!(act(l, action(event), &f), PointerAct::Nothing);
             }
         }
-        // A folder (row 1) and the "all charts" row (row 0), drawn there.
-        for cursor in [0, 1] {
-            let f = Facts { cursor, ..facts() };
-            let b = Built {
-                cursor: Some(u32::try_from(cursor).unwrap()),
-                ..built(7)
-            };
-            assert_eq!(
-                resolve(l, on(action(331)), Some(b), &f, kinds).act,
-                PointerAct::Nothing
-            );
-        }
+        // Another lifetime's input still does nothing.
+        assert_eq!(
+            resolve(l, on(action(330)), Some(built(8)), &facts(), kinds),
+            NOTHING
+        );
     }
 
     #[test]

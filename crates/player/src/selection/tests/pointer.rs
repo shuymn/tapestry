@@ -1867,13 +1867,14 @@ fn sent(screens: &Installers) -> Option<[bool; 3]> {
     updates.last().and_then(|u| u.settings).map(|s| s.covers_on)
 }
 
-/// K1: with the driver, event 330 on the drawn chart row turns SUDDEN+
-/// on: the next update shows it, the driver holds it for the next play,
-/// and `player.toml` gets it at the next settings write (a play's end),
-/// not at once. On a folder row it does nothing; 332 twice turns HIDDEN+
-/// on and off again.
+/// K1: with the driver, event 330 turns SUDDEN+ on whatever the row, a
+/// folder's here as the source's: the next update shows it, the driver
+/// holds it for the next play, and `player.toml` gets it at the next
+/// settings write, not at once (the real play's end is
+/// `a_cover_turned_after_a_cancelled_load_reaches_the_next_play`). 332
+/// twice on a chart row turns HIDDEN+ on and off again.
 #[test]
-fn a_cover_switch_turns_on_a_chart_row_and_is_written_later() {
+fn a_cover_switch_turns_on_any_row_and_is_written_later() {
     let dir = tempfile::tempdir().unwrap();
     let (sel, _) = tree(dir.path(), &[&["f/s/x.bms", "a.bms"]]);
     let skin = crate::selection_skin::pointer_fixture(true);
@@ -1890,22 +1891,25 @@ fn a_cover_switch_turns_on_a_chart_row_and_is_written_later() {
         assert_eq!(sel_of(rig).screen.row_kind_at(1), Some(RowRefKind::Folder));
         w.click(c, SUDDEN, Button::Left);
         act(rig, screens);
-        assert_eq!(log(rig), [(Press(Nothing), 1)]);
-        assert_eq!(held(rig), [false; 3]);
+        assert_eq!(log(rig), [(Press(Cover(CoverKind::Sudden)), 1)]);
+        assert_eq!(held(rig), [true, false, false]);
+        assert_eq!(sent(screens), Some([true, false, false]));
         // Chart a under the cursor.
         w.key(MenuKey::Down);
         act(rig, screens);
         log(rig);
-        w.click(c, SUDDEN, Button::Left);
-        act(rig, screens);
-        assert_eq!(log(rig), [(Press(Cover(CoverKind::Sudden)), 2)]);
-        assert_eq!(held(rig), [true, false, false]);
-        assert_eq!(sent(screens), Some([true, false, false]));
         w.click(c, HIDDEN, Button::Left);
         w.click(c, HIDDEN, Button::Left);
         act(rig, screens);
+        assert_eq!(
+            log(rig),
+            [
+                (Press(Cover(CoverKind::Hidden)), 2),
+                (Press(Cover(CoverKind::Hidden)), 2)
+            ]
+        );
         assert_eq!(held(rig), [true, false, false]);
-        // Not written yet; written at a play's end.
+        // Not written yet; written at the next settings write.
         assert_eq!(switches(&player_toml(rig)), [false; 3]);
         rig.persist();
         assert_eq!(switches(&player_toml(rig)), [true, false, false]);
