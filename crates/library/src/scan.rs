@@ -512,6 +512,7 @@ fn read_chart(root: i64, path: String, limits: &Limits, options: &ScanOptions) -
                 .rank
         }),
         summary: scanned.summary.ok(),
+        images: scanned.labels.as_ref().map(crate::ChartNames::of),
     })
 }
 

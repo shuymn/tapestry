@@ -386,3 +386,41 @@ fn a_lua_number_27_lowers_to_the_uptime_hours() {
     s.app.uptime_us = 7_200_000_000;
     assert!(!drawn(&mut s));
 }
+
+/// A Lua skin's song list image whose file is missing takes the JSON
+/// rule: on a non-center slot the slot draws nothing and the skin
+/// imports with the hole noted; on the center slot it refuses as the
+/// selected row.
+#[test]
+fn a_lua_missing_bar_image_takes_the_json_rule() {
+    let missing = "table.insert(skin.source, { id = \"m\", path = \"m.png\" })\n\
+                   table.insert(skin.image, { id = \"x0\", src = \"m\", x = 0, y = 0, w = 8, h = 8 })\n\
+                   table.insert(skin.imageset, { id = \"gone\", images = { \"x0\" } })\n";
+    let slot = "table.insert(skin.songlist.liston, { id = \"gone\", dst = { { x = 0, y = 800, w = 300, h = 40 } } })\n\
+                table.insert(skin.songlist.listoff, { id = \"gone\", dst = { { x = 0, y = 800, w = 300, h = 40 } } })";
+    let l = common::selection::folder("");
+    let i = import_lua_in(&l, &lua_skin("", &format!("{missing}{slot}"))).unwrap();
+    let holes = i
+        .imported
+        .report
+        .notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::MissingAsset)
+        .count();
+    assert_eq!(holes, 2, "{:?}", i.imported.report);
+    let mut s = Sel::new(i.imported.skin);
+    s.view(&view(vec![chart("a"), chart("b")], Some(0), None, None));
+    // The center's bar alone, at y 900.
+    let bars: Vec<f32> = s.drawn(0).into_iter().map(|(_, r)| r[1]).collect();
+    assert_eq!(bars, [140.0]);
+    // The center's set with the missing image 0.
+    let center = format!("{missing}skin.imageset[1].images = {{ \"x0\" }}");
+    match import_lua(&lua_skin("", &center)) {
+        Err(skin_beatoraja::ImportError::Essential {
+            part: skin_beatoraja::EssentialPart::SelectedRow,
+            why: Some(NoteKind::MissingAsset),
+            ..
+        }) => {}
+        other => panic!("{:?}", other.map(|i| i.imported.report)),
+    }
+}

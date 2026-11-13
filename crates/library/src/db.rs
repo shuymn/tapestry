@@ -14,7 +14,7 @@ use bms_parser::{ChartMode, Header};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 
 use crate::search::Keys;
-use crate::{ChartEntry, LibraryError, SCHEMA_VERSION};
+use crate::{ChartEntry, ChartNames, LibraryError, Name, SCHEMA_VERSION};
 
 /// How long a connection waits for another one's lock, such as a checkpoint.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -128,7 +128,10 @@ pub fn create(conn: &Connection) -> rusqlite::Result<()> {
              tempo_min BLOB,
              tempo_max BLOB,
              rank_kind INTEGER,
-             rank_value INTEGER
+             rank_value INTEGER,
+             stagefile TEXT,
+             banner TEXT,
+             image_names INTEGER
          );
          CREATE INDEX charts_root ON charts(root);
          CREATE INDEX charts_title ON charts(mode, title_key IS NULL, title_key, path);
@@ -324,6 +327,8 @@ pub struct Row {
     pub summary: Option<ChartSummary>,
     /// [`ChartEntry::rank`].
     pub rank: Option<Option<rules::JudgeRank>>,
+    /// [`ChartEntry::images`].
+    pub images: Option<ChartNames>,
 }
 
 /// A rank as `charts.rank_kind` and `rank_value` store it: no kind when the
@@ -337,6 +342,50 @@ fn rank_columns(rank: Option<Option<rules::JudgeRank>>) -> (Option<i64>, Option<
         Some(Some(rules::JudgeRank::Rank(r))) => (Some(1), Some(i64::from(r))),
         Some(Some(rules::JudgeRank::DefExRankMilli(m))) => (Some(2), Some(m)),
     }
+}
+
+/// `image_names`' bit of an overlong stage file.
+const OVERLONG_STAGEFILE: i64 = 1;
+/// `image_names`' bit of an overlong banner.
+const OVERLONG_BANNER: i64 = 2;
+
+/// Image names as `charts.stagefile`, `banner` and `image_names` store
+/// them: no mask when the seed-0 branch is refused; a name only when it is
+/// [`Name::Named`], an overlong one by its bit, never its text.
+fn image_columns(images: Option<&ChartNames>) -> (Option<&str>, Option<&str>, Option<i64>) {
+    let Some(images) = images else {
+        return (None, None, None);
+    };
+    fn column(name: &Name, bit: i64) -> (Option<&str>, i64) {
+        match name {
+            Name::None => (None, 0),
+            Name::Named(text) => (Some(text.as_str()), 0),
+            Name::Overlong => (None, bit),
+        }
+    }
+    let (stagefile, a) = column(&images.stagefile, OVERLONG_STAGEFILE);
+    let (banner, b) = column(&images.banner, OVERLONG_BANNER);
+    (stagefile, banner, Some(a | b))
+}
+
+/// The names of [`image_columns`].
+fn images_of(
+    stagefile: Option<String>,
+    banner: Option<String>,
+    mask: Option<i64>,
+) -> Option<ChartNames> {
+    let mask = mask?;
+    let name = |text: Option<String>, bit: i64| {
+        if mask & bit != 0 {
+            Name::Overlong
+        } else {
+            text.map_or(Name::None, Name::Named)
+        }
+    };
+    Some(ChartNames {
+        stagefile: name(stagefile, OVERLONG_STAGEFILE),
+        banner: name(banner, OVERLONG_BANNER),
+    })
 }
 
 /// The rank of [`rank_columns`]; none for an unknown kind, or a rank kind
@@ -433,9 +482,11 @@ pub fn commit(
             "INSERT INTO charts (root, path, size, mtime_ns, sha256, md5, title, subtitle,
                  artist, subartist, genre, playlevel, difficulty, bpm, norm_text, title_key,
                  artist_key, folder, mode, random, bga, loader, taps, longs, mines,
-                 length_us, tempo_start, tempo_min, tempo_max, rank_kind, rank_value)
+                 length_us, tempo_start, tempo_min, tempo_max, rank_kind, rank_value,
+                 stagefile, banner, image_names)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
-                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31)
+                 ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
+                 ?33, ?34)
              ON CONFLICT (path) DO UPDATE SET root = excluded.root, size = excluded.size,
                  mtime_ns = excluded.mtime_ns, sha256 = excluded.sha256, md5 = excluded.md5,
                  title = excluded.title, subtitle = excluded.subtitle,
@@ -449,13 +500,16 @@ pub fn commit(
                  longs = excluded.longs, mines = excluded.mines,
                  length_us = excluded.length_us, tempo_start = excluded.tempo_start,
                  tempo_min = excluded.tempo_min, tempo_max = excluded.tempo_max,
-                 rank_kind = excluded.rank_kind, rank_value = excluded.rank_value",
+                 rank_kind = excluded.rank_kind, rank_value = excluded.rank_value,
+                 stagefile = excluded.stagefile, banner = excluded.banner,
+                 image_names = excluded.image_names",
         )?;
         for row in upserts {
             let h = &row.header;
             let keys = Keys::of(h);
             let summary = row.summary.as_ref();
             let (rank_kind, rank_value) = rank_columns(row.rank);
+            let (stagefile, banner, image_names) = image_columns(row.images.as_ref());
             upsert.execute(params![
                 row.root,
                 row.path,
@@ -491,6 +545,9 @@ pub fn commit(
                 summary.map(|s| tempo_bytes(s.tempo_max)),
                 rank_kind,
                 rank_value,
+                stagefile,
+                banner,
+                image_names,
             ])?;
         }
         let mut delete = tx.prepare("DELETE FROM charts WHERE path = ?1")?;
@@ -506,7 +563,7 @@ pub fn commit(
 pub const ENTRY_COLUMNS: &str = "c.path, c.size, c.mtime_ns, c.sha256, c.md5, c.title, \
      c.subtitle, c.artist, c.subartist, c.genre, c.playlevel, c.difficulty, c.bpm, c.random, \
      c.bga, c.taps, c.longs, c.mines, c.length_us, c.tempo_start, c.tempo_min, c.tempo_max, \
-     c.rank_kind, c.rank_value";
+     c.rank_kind, c.rank_value, c.stagefile, c.banner, c.image_names";
 
 /// A tempo as a summary column stores it: `u128` does not fit an integer.
 const fn tempo_bytes(tempo: Tempo) -> [u8; 16] {
@@ -567,6 +624,7 @@ pub fn entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChartEntry> {
         bga: r.get(14)?,
         summary: summary(r, 15)?,
         rank: rank_of(r.get(22)?, r.get(23)?),
+        images: images_of(r.get(24)?, r.get(25)?, r.get(26)?),
     })
 }
 

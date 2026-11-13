@@ -88,7 +88,7 @@ pub use renderer::take_build_start;
 pub use renderer::{
     Admission, ChartOutcome, ChartTarget, CommitError, FrameTiming, LoadingTextError,
     LoadingTextKey, MAX_SPRITES, MemoryWitness, PreparedToken, RESULT_STRIP_SPRITES, RenderError,
-    Renderer, SHARED_TEXELS, STRIP_SPRITES, Target, VM_TEXELS, letterbox,
+    Renderer, ResultChartTarget, SHARED_TEXELS, STRIP_SPRITES, Target, VM_TEXELS, letterbox,
 };
 pub use simple::{
     RESULT_CELL_COLUMN, RESULT_GAUGE_ROW, SimpleSkin, layout, result_graphs, result_screen,
@@ -100,3 +100,7 @@ pub use sprite::{Blend, FLAG_BASE, FLAG_NEAREST, Instance, Run, Sprite, SpriteBa
 pub use staging::{Scissor, Staging};
 pub use text_cache::{MAX_ALIASES, MAX_ROUNDS, MAX_TEXT_ENTRIES, TextCounts};
 pub use text_upload::{MAX_RECT_H, MAX_RECT_W, MAX_TEXT_MASK_BYTES, TextReport, text_upload_bound};
+/// The adapter facts [`Gpu::adapter`] gives, for callers without `wgpu`
+/// (dev-tools: a scenario's adapter line and admission).
+#[cfg(feature = "dev-tools")]
+pub use wgpu::{AdapterInfo, DeviceType};

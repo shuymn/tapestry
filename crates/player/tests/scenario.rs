@@ -264,7 +264,7 @@ impl Fixture {
 
 /// The scenario of `steps`, over `library`, with `out` as its output.
 fn scenario(steps: &[&str]) -> String {
-    let mut text = "version = 6\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
+    let mut text = "version = 8\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
     for s in steps {
         text.push_str("[[step]]\n");
         text.push_str(s);
@@ -673,27 +673,27 @@ fn a_stalled_capture_exits_one_within_the_bound() {
 #[test]
 fn other_scenario_version_is_refused() {
     let fx = Fixture::new();
-    let (out, _, stderr) = fx.run("version = 7\nwhat_v7_adds = true\n");
+    let (out, _, stderr) = fx.run("version = 9\nwhat_v9_adds = true\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("version 7 is not supported; this build reads version 6"),
+        stderr.contains("version 9 is not supported; this build reads version 8"),
         "{stderr}"
     );
-    assert!(!stderr.contains("what_v7_adds"), "{stderr}");
+    assert!(!stderr.contains("what_v9_adds"), "{stderr}");
     assert!(!fx.data().join("library.db").exists());
     // The previous version too: its files are refused, never read.
-    let old = scenario(&["quit = {}"]).replacen("version = 6", "version = 5", 1);
+    let old = scenario(&["quit = {}"]).replacen("version = 8", "version = 7", 1);
     let (out, _, stderr) = fx.run(&old);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("version 5 is not supported; this build reads version 6"),
+        stderr.contains("version 7 is not supported; this build reads version 8"),
         "{stderr}"
     );
     assert!(!fx.data().join("library.db").exists());
     let (out, _, stderr) = fx.run("[library]\nroots = [\"library\"]\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("no version; this build reads version 6"),
+        stderr.contains("no version; this build reads version 8"),
         "{stderr}"
     );
     assert!(!fx.data().join("library.db").exists());
@@ -1119,6 +1119,200 @@ fn a_ready_capture_past_ready_fails_the_run() {
     assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
     assert!(stderr.contains("its READY state ended first"), "{stderr}");
     assert!(!fx.base.join("out").join("late.png").exists());
+}
+
+/// A skin with a 2 500 ms loading time, installed as the play skin.
+fn install_slow_loading_skin(fx: &Fixture) {
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    fs::write(
+        skin.join("s.json"),
+        r#"{"type": 0, "w": 1920, "h": 1080, "loadend": 2500, "destination": []}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 's.json'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// A `loading_at` capture takes a frame on its loading state's clock, its
+/// screen clock the same; the play's frames run that screen clock on
+/// (docs/stage3.md D3). One past the loading state fails the run.
+#[test]
+fn a_loading_at_capture_runs_on_the_loading_clock() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    install_slow_loading_skin(&fx);
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "capture = { loading_at = 1500, file = \"mid.png\" }",
+        "capture = { at = 0, file = \"start.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let dir = fx.base.join("out");
+    assert!(dir.join("mid.png").exists());
+    let mid = fs::read_to_string(dir.join("mid.json")).unwrap();
+    assert_eq!(side_value(&mid, "axis"), "loading_at", "{mid}");
+    assert_eq!(side_value(&mid, "phase"), "loading", "{mid}");
+    let loading_us = side_num(&mid, "loading_us");
+    // At or after 1.5 s, and inside the 2.5 s loading state.
+    assert!((1_500_000..2_500_000).contains(&loading_us), "{mid}");
+    assert_eq!(side_num(&mid, "screen_us"), loading_us, "{mid}");
+    // The play's screen clock runs on past the whole loading time.
+    let start = fs::read_to_string(dir.join("start.json")).unwrap();
+    assert!(side_num(&start, "screen_us") >= 2_500_000, "{start}");
+    assert_eq!(side_value(&start, "loading_us"), "null", "{start}");
+
+    let late = scenario(&[
+        "capture = { loading_at = 60000, file = \"late.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ])
+    .replacen("output = \"out\"", "output = \"late\"", 1);
+    let (out, stdout, stderr) = fx.run(&late);
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(stderr.contains("its loading state ended first"), "{stderr}");
+}
+
+/// The adapter lines of `stdout`.
+fn adapter_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|l| l.starts_with("dev: adapter asked "))
+        .collect()
+}
+
+/// A run asking for the hardware adapter builds its screen with that
+/// choice and says what it got: a CPU adapter refuses the run, any other
+/// draws it and names itself in each capture's sidecar. CI has no
+/// hardware GPU, so either outcome is checked as it comes.
+#[test]
+fn a_hardware_scenario_builds_on_the_hardware_adapter() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let text = small(&[
+        "capture = { at = 0, file = \"a.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ])
+    .replacen(
+        "size = [640, 360]\n",
+        "size = [640, 360]\nadapter = \"hardware\"\n",
+        1,
+    );
+    let (out, stdout, stderr) = fx.run(&text);
+    let lines = adapter_lines(&stdout);
+    assert!(!lines.is_empty(), "{stdout}\n{stderr}");
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.starts_with("dev: adapter asked hardware, got ")),
+        "{lines:?}"
+    );
+    if lines[0].contains(" (Cpu, ") {
+        assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+        assert!(
+            stderr.contains("hardware was asked for, and the adapter is a CPU adapter"),
+            "{stderr}"
+        );
+        return;
+    }
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let name = lines[0]
+        .trim_start_matches("dev: adapter asked hardware, got ")
+        .rsplit_once(" (")
+        .unwrap()
+        .0;
+    assert_eq!(side_value(&side_of(&fx, "a"), "adapter"), name);
+}
+
+/// Every build of the screen is admitted against the file's choice: a
+/// hardware run whose screen, built again after a device loss on the
+/// result, gets a CPU adapter (injected) is refused there, as at startup.
+#[test]
+fn a_rebuilt_screen_s_cpu_adapter_is_refused_on_a_hardware_choice() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let text = small(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ])
+    .replacen(
+        "size = [640, 360]\n",
+        "size = [640, 360]\nadapter = \"hardware\"\n",
+        1,
+    );
+    let (out, stdout, stderr) = fx.output(
+        fx.command(&text)
+            .env("TAPESTRY_DEV_RESULT_FAULTS", "lostresult1")
+            .env("TAPESTRY_DEV_ADAPTER_FAULTS", "cpu2"),
+    );
+    let lines = adapter_lines(&stdout);
+    assert!(!lines.is_empty(), "{stdout}\n{stderr}");
+    let refusal = "hardware was asked for, and the adapter is a CPU adapter";
+    // No hardware GPU (CI): refused at startup, before any loss.
+    if lines[0].contains(" (Cpu, ") {
+        assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+        assert!(stderr.contains(refusal), "{stderr}");
+        return;
+    }
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[1].starts_with("dev: adapter asked hardware, got injected CPU adapter (Cpu, "),
+        "{lines:?}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains(&format!("{refusal}: injected CPU adapter")),
+        "{stderr}"
+    );
+}
+
+/// Every build of the screen takes the file's choice: the one after a
+/// device loss on the result says so again.
+#[test]
+fn a_screen_built_again_keeps_the_adapter_choice() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let (out, stdout, stderr) = fx.run_with(
+        &small(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ])
+        .replacen(
+            "size = [640, 360]\n",
+            "size = [640, 360]\nadapter = \"warp\"\n",
+            1,
+        ),
+        "lostresult1",
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stderr.contains("render: "), "no loss: {stderr}");
+    let lines = adapter_lines(&stdout);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.starts_with("dev: adapter asked warp, got ")),
+        "{lines:?}"
+    );
 }
 
 /// A capture whose file is a folder when its frame comes fails the run,
