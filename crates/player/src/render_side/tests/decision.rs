@@ -1325,6 +1325,81 @@ fn ignored_takeover_keeps_the_run_notice() {
     rig.link.exit();
 }
 
+/// O6, O8: a refusal's notice is stored before its takeover is published
+/// and the game thread woken: held before the notice, the game thread is
+/// not woken and no takeover can be taken; once let go, the takeover it
+/// is woken for finds the notice.
+#[test]
+fn refusal_notice_stands_before_the_takeover_wakes_the_game() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    let woken = Arc::new(AtomicU32::new(0));
+    let w = Arc::clone(&woken);
+    rig.link.set_game_wake(Arc::new(move || {
+        w.fetch_add(1, Ordering::AcqRel);
+    }));
+    rig.drawing("a", "A");
+    let gate = &rig.link.shared.notice_gate;
+    gate.hold(true);
+    rig.seen.refuse_frame.store(true, Ordering::Release);
+    assert!(wait_until(|| gate.waiting()));
+    assert_eq!(woken.load(Ordering::Acquire), 0, "woken before the notice");
+    assert_eq!(rig.link.take_decision_takeover(), None);
+    gate.hold(false);
+    assert!(wait_until(|| woken.load(Ordering::Acquire) == 1));
+    let t = rig.link.take_decision_takeover().expect("a takeover");
+    assert_eq!(t.lifetime, game::DecisionLifetime(5));
+    assert!(rig.link.take_decision_refusal().is_some(), "the notice");
+    rig.link.exit();
+}
+
+/// O6, O8: a label restore refused on the screen built again stores its
+/// notice before its takeover is published and the game thread woken.
+#[test]
+fn restore_refusal_notice_stands_before_the_takeover() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    let woken = Arc::new(AtomicU32::new(0));
+    let w = Arc::clone(&woken);
+    rig.link.set_game_wake(Arc::new(move || {
+        w.fetch_add(1, Ordering::AcqRel);
+    }));
+    rig.drawing("a", "A");
+    let gate = &rig.link.shared.notice_gate;
+    gate.hold(true);
+    *rig.seen.rows.lock().unwrap() = RowsGate::Armed;
+    // The rebuild asks from the test thread; a helper meets the render
+    // thread at the rows and then at the notice, and notes what it finds
+    // there before letting it go.
+    let seen = Arc::clone(&rig.seen);
+    let shared = Arc::clone(&rig.link.shared);
+    let w = Arc::clone(&woken);
+    let helper = std::thread::spawn(move || {
+        assert!(seen.held_in_rows(), "the rebuild's rows never asked");
+        seen.open_rows();
+        let gate = &shared.notice_gate;
+        assert!(wait_until(|| gate.waiting()), "no refusal's notice");
+        let at_notice = (
+            w.load(Ordering::Acquire),
+            shared.decision_takeover.lock().unwrap().is_some(),
+        );
+        gate.hold(false);
+        at_notice
+    });
+    rig.rebuild().unwrap();
+    let (woken_at_notice, takeover_at_notice) = helper.join().unwrap();
+    assert_eq!(woken_at_notice, 0, "woken before the notice");
+    assert!(
+        !takeover_at_notice,
+        "the takeover published before the notice"
+    );
+    assert!(wait_until(|| woken.load(Ordering::Acquire) == 1));
+    let t = rig.link.take_decision_takeover().expect("a takeover");
+    assert_eq!(t.lifetime, game::DecisionLifetime(5));
+    assert!(rig.link.take_decision_refusal().is_some(), "the notice");
+    rig.link.exit();
+}
+
 /// O6: the skin's frame refused for the active lifetime is a takeover,
 /// and the game thread is woken for it; the page draws from then on.
 #[test]

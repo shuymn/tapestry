@@ -1364,6 +1364,10 @@ struct Shared {
     /// publication while a test holds it (tests).
     #[cfg(test)]
     takeover_gate: TestGate,
+    /// The decision kind's refusal waits here before its notice is
+    /// stored while a test holds it (tests).
+    #[cfg(test)]
+    notice_gate: TestGate,
     /// How long the launch screen has shown, in place of the clock's
     /// reading, while set (tests: [`RenderLink::set_launch_elapsed`]).
     #[cfg(test)]
@@ -1452,6 +1456,8 @@ impl Shared {
             takeovers_woken: AtomicU64::new(0),
             #[cfg(test)]
             takeover_gate: TestGate::default(),
+            #[cfg(test)]
+            notice_gate: TestGate::default(),
             #[cfg(test)]
             launch_elapsed: Mutex::new(None),
             result: Mutex::new(ResultSlot::default()),
@@ -7100,12 +7106,14 @@ impl Run {
     }
 
     /// The decision skin refused its frame at `at` on a healthy device:
-    /// the built-in presentation takes over for the active lifetime, and
-    /// the kind is disabled for the run.
+    /// the kind is disabled for the run, then the built-in presentation
+    /// takes over for the active lifetime. The notice is stored before the
+    /// takeover is published and the game thread woken, so a game thread
+    /// woken for a refusal's takeover finds its notice.
     fn decision_frame_refused(&mut self, e: BuildError, at: TimeUs) {
         let why = format!("the decision skin refused its frame: {}", Chain(&e));
-        self.take_over(at, why.clone());
-        self.disable_decision(why);
+        self.disable_decision(why.clone());
+        self.take_over(at, why);
     }
 
     /// The decision skin of the screen shown cannot draw from `at`: its
@@ -7165,6 +7173,8 @@ impl Run {
         eprintln!("render: the decision skin is disabled for the run: {why}");
         if self.decision_disabled.is_none() {
             self.decision_disabled = Some(why.clone());
+            #[cfg(test)]
+            self.shared.notice_gate.pass();
             *self
                 .shared
                 .decision_refused
@@ -7296,10 +7306,12 @@ impl Run {
                     "the decision labels were not restored on the screen built again: {}",
                     Chain(&e)
                 );
-                if self.decision_skinned() {
-                    self.take_over(now, why.clone());
+                // The notice first, then the takeover and its wake.
+                let skinned = self.decision_skinned();
+                self.disable_decision(why.clone());
+                if skinned {
+                    self.take_over(now, why);
                 }
-                self.disable_decision(why);
                 Ok(())
             }
             crate::decision_side::Rebuilt::Failed(e) => {
