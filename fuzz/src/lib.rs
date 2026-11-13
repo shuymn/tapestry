@@ -450,6 +450,8 @@ pub fn result_view(ready: bool) -> skin_model::ResultView {
             ex_diff: 1_060,
             bp: ResultNumber::Hidden,
             bp_diff: ResultNumber::Hidden,
+            max_combo: ResultNumber::Hidden,
+            max_combo_diff: ResultNumber::Hidden,
             clear: LampKey::NoPlay,
             ex_updated: true,
             bp_updated: true,
