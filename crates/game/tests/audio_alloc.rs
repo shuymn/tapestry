@@ -259,7 +259,9 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
         };
         let mut admit = |control: &mut game::AudioControl, g: SystemGeneration| {
             let id = g.id();
-            control.install_system(g).unwrap();
+            if let Err(e) = control.install_system(g) {
+                panic!("{id:?} refused with room in the return ring: {e}");
+            }
             handed.push(id);
             id
         };
