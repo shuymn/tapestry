@@ -3667,6 +3667,16 @@ const fn screen_kind(mode: &Mode, decision: bool, page_turns: bool) -> crate::me
     }
 }
 
+/// The token a play attempt's staging of request `request` bears on the
+/// screen of device `device`.
+const fn attempt_token(request: u64, device: u64) -> PreparedToken {
+    PreparedToken {
+        request,
+        device,
+        kind: ScreenKind::Play,
+    }
+}
+
 /// What a loading frame draws (design.md "beatoraja Lua Skins", the
 /// pending presentation).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -6526,7 +6536,7 @@ impl Run {
         if let Some(p) = self.attempt.take() {
             let _ = p.reply.send(Ok(self.answered(refusal(why))));
             if let Some(screen) = &mut self.screen {
-                screen.discard();
+                screen.discard_token(attempt_token(p.request, screen.device()));
             }
         }
         self.drop_prepared();
@@ -6603,7 +6613,7 @@ impl Run {
         if self.attempt.as_ref().is_some_and(|p| p.request == request) {
             self.attempt = None;
             if let Some(screen) = &mut self.screen {
-                screen.discard();
+                screen.discard_token(attempt_token(request, screen.device()));
             }
         }
         if self
@@ -6617,10 +6627,10 @@ impl Run {
 
     /// Drops the preparation answered ready and not committed, if any.
     fn drop_prepared(&mut self) {
-        if self.prepared.take().is_some()
+        if let Some(p) = self.prepared.take()
             && let Some(screen) = &mut self.screen
         {
-            screen.discard();
+            screen.discard_token(p.token);
         }
     }
 
@@ -7086,6 +7096,18 @@ impl Run {
         {
             self.drop_result();
             return;
+        }
+        // A view newer than every request becomes the newest, and its
+        // staging takes the screen's one slot: the play attempt preparing
+        // or answered is superseded first, so no staging stays answered
+        // once another request is the newest.
+        if self
+            .result
+            .as_ref()
+            .and_then(|r| r.incoming.as_ref())
+            .is_some_and(|p| p.request > self.requested)
+        {
+            self.supersede_attempts("a result view superseded it");
         }
         let disabled = self.result_disabled.is_some();
         let Some(side) = &mut self.result else {
