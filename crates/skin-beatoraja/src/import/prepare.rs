@@ -622,7 +622,8 @@ impl Cx<'_> {
     /// resolution ([`Self::resolve_path`]). A file is unknown unless
     /// `decode`: the installation pass reads no file, since the import
     /// charges an element before it admits a file and admits none for an
-    /// element it drops. With `decode` a file is admitted, as its own
+    /// element it drops, but for a song list placement's image set, whose
+    /// entries' files are admitted to tell its holes apart. With `decode` a file is admitted, as its own
     /// import would (cached for it): missing, it is absent; refused only by
     /// this importer, unknown; admitted, it loads once a whole decode
     /// proves it (the verdict cached), else it is absent.

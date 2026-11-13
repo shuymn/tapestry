@@ -947,7 +947,7 @@ impl PlayerRig<'_> {
             return;
         }
         if !self.presenter.current() {
-            self.presenter.begin(&mut self.render, self.clock.now());
+            self.presenter.begin(&mut self.render);
             self.result_leaving = false;
             self.result_offset = Some((self.controls.tuning().get().input_offset_us, false));
         }
@@ -1713,22 +1713,12 @@ pub(crate) const fn until_due(origin: TimeUs, at: TimeUs, now: TimeUs) -> bool {
     now.0 - origin.0 >= at.0
 }
 
-impl Rig for PlayerRig<'_> {
-    type Reader = SourceReader;
-    type ScreenError = ScreenError;
-    type ResultPrep = ();
-
+impl PlayerRig<'_> {
+    /// Parks for `park` at most (the input thread unparks it earlier),
+    /// then serves what a step's wait serves ([`game::Rig::wait`]).
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn now(&self) -> TimeUs {
-        let now = self.clock.now();
-        #[cfg(test)]
-        self.opening_gates.read_clock(now);
-        now
-    }
-
-    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn wait(&mut self) {
-        thread::park_timeout(if self.in_play { PARK } else { IDLE_PARK });
+    fn wait_parked(&mut self, park: Duration) {
+        thread::park_timeout(park);
         self.serve_adjustments();
         // A scenario's `until`: the command, sent once, as its key would.
         #[cfg(feature = "dev-tools")]
@@ -1764,6 +1754,37 @@ impl Rig for PlayerRig<'_> {
             }
         }
         self.sync();
+    }
+
+    /// How long a loading wait parks: the idle wake at most, never past
+    /// `until` on the rig's clock ([`game::wait_slice`]).
+    fn loading_park_slice(&self, until: Option<TimeUs>) -> Duration {
+        game::wait_slice(until, self.clock.now(), IDLE_PARK)
+    }
+
+    /// A loading wait's park, for [`loading_park_slice`](Self::loading_park_slice).
+    pub(crate) fn loading_park(&mut self, until: Option<TimeUs>) {
+        let park = self.loading_park_slice(until);
+        self.wait_parked(park);
+    }
+}
+
+impl Rig for PlayerRig<'_> {
+    type Reader = SourceReader;
+    type ScreenError = ScreenError;
+    type ResultPrep = ();
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn now(&self) -> TimeUs {
+        let now = self.clock.now();
+        #[cfg(test)]
+        self.opening_gates.read_clock(now);
+        now
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn wait(&mut self) {
+        self.wait_parked(if self.in_play { PARK } else { IDLE_PARK });
     }
 
     fn idle_wait(&mut self, deadline: TimeUs) {
@@ -1902,6 +1923,11 @@ impl Rig for PlayerRig<'_> {
     /// once.
     fn result_timing(&self) -> Option<game::ResultTiming> {
         self.presenter.timing(&self.render).map(flow_timing)
+    }
+
+    /// The result's origin: the render thread's first commit of a view.
+    fn result_origin(&self) -> Option<TimeUs> {
+        self.presenter.origin(&self.render)
     }
 
     /// The barrier is set at `at` (D4), for every accepted command: the
@@ -3138,7 +3164,29 @@ mod tests {
 
     use game::Command;
 
-    use super::{until_due, until_fired};
+    use super::{IDLE_PARK, until_due, until_fired};
+    use bms_model::TimeSource;
+
+    /// A loading wait parks until a near `until` on the rig's clock, the
+    /// idle wake without one, and nothing for one passed
+    /// ([`game::wait_slice`]); nothing parks here.
+    #[test]
+    fn a_loading_park_ends_at_its_until() {
+        use std::time::Duration;
+        let ((near, none, passed), _) =
+            crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+                let now = rig.clock.now();
+                (
+                    rig.loading_park_slice(Some(TimeUs(now.0 + 30_000))),
+                    rig.loading_park_slice(None),
+                    rig.loading_park_slice(Some(TimeUs(now.0 - 1))),
+                )
+            });
+        assert!(near <= Duration::from_millis(30), "{near:?}");
+        assert!(near < IDLE_PARK, "{near:?}");
+        assert_eq!(none, IDLE_PARK);
+        assert_eq!(passed, Duration::ZERO);
+    }
 
     /// The player's rig's preparation (design.md "Play Lifecycle",
     /// preparing each attempt): it owns its jobs, and its answer stays

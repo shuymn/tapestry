@@ -300,6 +300,7 @@ pub const IN_PLAY: &[Site] = &[
             "PlayerRig::send_end",
             "PlayerRig::now",
             "PlayerRig::wait",
+            "PlayerRig::wait_parked",
             "PlayerRig::take",
             "PlayerRig::take_closing",
             "PlayerRig::declared_close",

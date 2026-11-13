@@ -1435,6 +1435,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         .and_then(|sc| sc.size)
         .or(s.dev.size)
         .unwrap_or(dev::DEFAULT_SIZE);
+    // What draws a headless run's screen: WARP unless a scenario asks for
+    // the hardware adapter.
+    #[cfg(feature = "dev-tools")]
+    let adapter = scenario
+        .as_ref()
+        .map_or(AdapterChoice::Warp, |sc| sc.adapter.choice());
     #[cfg(feature = "dev-tools")]
     if let Some(sc) = &scenario {
         roots.clone_from(&sc.roots);
@@ -1604,14 +1610,23 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             let screen = MenuScreen::new(r, Some(fonts)).with_sink(Box::new(link.clone()));
             Ok(Box::new(screen) as Box<dyn Screen>)
         }),
-        // Headless (dev-tools): offscreen on WARP.
+        // Headless (dev-tools): offscreen on WARP, or on the hardware
+        // adapter a scenario asks for, admitted at every build.
         #[cfg(feature = "dev-tools")]
         _ => Box::new(move || {
             let target = Target::Offscreen {
                 width: size.0,
                 height: size.1,
             };
-            let r = Renderer::new(target, AdapterChoice::Warp)?;
+            let r = Renderer::new(target, adapter)?;
+            // What this build got, as a test's injected fault may report it,
+            // said on stdout and in the log, then admitted against what the
+            // file asked for.
+            let got = dev::scenario::built_adapter(r.gpu().adapter());
+            let line = dev::scenario::adapter_line(r.choice(), &got);
+            println!("{line}");
+            log::info!("{line}");
+            dev::scenario::admit(adapter, &got)?;
             let fonts = render::text::Fonts::runtime()?;
             Ok(Box::new(MenuScreen::new(r, Some(fonts))) as Box<dyn Screen>)
         }),

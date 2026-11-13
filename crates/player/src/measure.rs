@@ -420,6 +420,10 @@ pub struct Drawn<'a> {
     /// When a loading frame was sampled (dev-tools: a scenario's captures).
     #[cfg(feature = "dev-tools")]
     pub loading_stamp: Option<LoadingStamp>,
+    /// The screen clock a play frame was built with, µs since its play
+    /// state's screen origin (dev-tools: a scenario's captures).
+    #[cfg(feature = "dev-tools")]
+    pub screen_us: Option<i64>,
     /// Which screen drew it (dev-tools: the frame dump and a scenario's
     /// captures).
     #[cfg(feature = "dev-tools")]
@@ -1445,6 +1449,8 @@ mod frame_tests {
             view: None,
             #[cfg(feature = "dev-tools")]
             loading_stamp: None,
+            #[cfg(feature = "dev-tools")]
+            screen_us: None,
             #[cfg(feature = "dev-tools")]
             screen: super::ScreenKind::Play,
             #[cfg(feature = "dev-tools")]

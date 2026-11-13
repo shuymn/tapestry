@@ -283,6 +283,9 @@ struct Fake {
     /// clock (a fallback), then none.
     timing: Option<game::ResultTiming>,
     timing_until: i64,
+    /// The result's origin the rig gives, this long after the last show
+    /// ([`Rig::result_origin`]); `None` gives none.
+    origin_delay: Option<i64>,
     /// The result's outro steps in order, with their clock times: `outro`
     /// ([`Rig::begin_outro`], with its start) and `accept`
     /// ([`Rig::accept_leaving`]).
@@ -484,6 +487,7 @@ impl Fake {
             compared: 0,
             timing: None,
             timing_until: i64::MAX,
+            origin_delay: None,
             result_order: Vec::new(),
             served: Vec::new(),
             turntable: Vec::new(),
@@ -597,6 +601,11 @@ impl Rig for Fake {
     fn result_timing(&self) -> Option<game::ResultTiming> {
         self.timing
             .filter(|_| self.clock.now().0 < self.timing_until)
+    }
+
+    fn result_origin(&self) -> Option<TimeUs> {
+        let shown = *self.shown_at.last()?;
+        self.origin_delay.map(|d| TimeUs(shown + d))
     }
 
     fn begin_outro(&mut self, at: TimeUs, gate: Option<TimeUs>) -> game::Outro {
@@ -5945,6 +5954,40 @@ fn the_scene_time_accepts_back_with_its_outro() {
     assert_eq!(rig.accepted, [game::MenuCommand::Back]);
     assert_eq!(rig.result_order[0], ("outro", s + 3_000_000));
     assert_eq!(rig.clock.now().0, s + 3_500_000);
+}
+
+/// The skin's input and scene times count from the result's origin, the
+/// render thread's first commit of a view, not from its show (design.md
+/// "Rendering and Skins", Timers; "State Model", Result): a press after
+/// the input time from the show but before it from the origin is dropped,
+/// one at it accepted, and the scene time accepts back from the origin.
+#[test]
+fn input_and_scene_count_from_the_rigs_origin() {
+    use game::MenuCommand::Back;
+    let s = result_start();
+    let o = s + 300_000;
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(0, 2_000_000, None), i64::MAX);
+    rig.origin_delay = Some(300_000);
+    press(&mut rig, &[(s + 2_100_000, Back), (o + 2_000_000, Back)]);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    assert_eq!(
+        rig.result_order,
+        [
+            ("gated", s + 2_100_000),
+            ("outro", o + 2_000_000),
+            ("accept", o + 2_000_000)
+        ]
+    );
+
+    let mut loaded = self::loaded(dir.path());
+    let mut rig = outro_rig(timing(0, 0, Some(3_000_000)), i64::MAX);
+    rig.origin_delay = Some(300_000);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    assert_eq!(rig.result_order[0], ("outro", o + 3_000_000));
 }
 
 /// C18: with the built-in presentation (no timing) a command takes effect

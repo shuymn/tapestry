@@ -406,6 +406,12 @@ pub trait Screen: Send {
     fn take_upload_timing(&mut self) -> Option<render::UploadTiming> {
         None
     }
+    /// The adapter it draws on (dev-tools: a scenario's sidecars); none by
+    /// default.
+    #[cfg(feature = "dev-tools")]
+    fn adapter(&self) -> Option<&render::AdapterInfo> {
+        None
+    }
     /// The strip's lines drawn (dev-tools tests); none by default.
     #[cfg(all(test, feature = "dev-tools"))]
     fn result_strip(&self) -> usize {
@@ -1215,6 +1221,10 @@ struct Shared {
     /// whether one holds (tests).
     #[cfg(test)]
     result_frame_hold: [AtomicBool; 2],
+    /// Each result frame's time and the `screen` timer reading its running
+    /// runtime's host read in it, after its visit (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    result_runtime_timers: Mutex<Vec<(TimeUs, Option<i32>)>>,
     /// Select frames stall 2 ms after their instant is sampled while set
     /// (tests): a second clock reading in the frame would differ from it.
     #[cfg(test)]
@@ -1277,6 +1287,8 @@ impl Shared {
             result_status: Mutex::new(ResultReport::default()),
             #[cfg(test)]
             result_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
+            #[cfg(all(test, feature = "dev-tools"))]
+            result_runtime_timers: Mutex::new(Vec::new()),
             #[cfg(test)]
             selection_stall: AtomicBool::new(false),
         }
@@ -2030,10 +2042,11 @@ impl RenderLink {
     /// point holds, so the view returned is the one presented at that
     /// instant.
     ///
-    /// With `gate` (a pressed command: the result's start), the view
-    /// presented judges it first under the same lock: while its input time
-    /// has not passed from `gate` at `at`, nothing is set and `None` is
-    /// given (the S10-09i design's D6).
+    /// With `gate` (a pressed command: the result's start as the flow last
+    /// read it), the view presented judges it first under the same lock:
+    /// while its input time has not passed at `at` from the lifetime's
+    /// origin, recorded with that view's timing (else `gate`), nothing is
+    /// set and `None` is given (the S10-09i design's D6).
     pub fn pin_result(
         &self,
         at: TimeUs,
@@ -2047,6 +2060,9 @@ impl RenderLink {
                 ..ResultBarrier::default()
             };
         }
+        // A flow that read the start before the first commit pins after
+        // it: the origin recorded with the timing is the start.
+        let gate = gate.map(|g| b.origin.unwrap_or(g));
         if game::gated(b.timing.map(crate::play::flow_timing), at, gate) == game::Outro::Gated {
             return None;
         }
@@ -2062,6 +2078,17 @@ impl RenderLink {
         let lifetime = self.result_lifetimes.load(Ordering::Relaxed);
         let b = self.shared.barrier();
         b.timing.filter(|_| b.lifetime == lifetime)
+    }
+
+    /// The current result lifetime's origin (design.md "Rendering and
+    /// Skins", Timers): the sampled instant of the frame that committed
+    /// its first view, `None` before it. Recorded under the same lock as
+    /// the timing and never later, so a timing read first and then this
+    /// pairs with an origin.
+    pub fn presented_origin(&self) -> Option<TimeUs> {
+        let lifetime = self.result_lifetimes.load(Ordering::Relaxed);
+        let b = self.shared.barrier();
+        b.origin.filter(|_| b.lifetime == lifetime)
     }
 
     /// What the render thread shows of the result kind, and the run's
@@ -2906,6 +2933,9 @@ impl crate::result_present::Publish for RenderLink {
     }
     fn timing(&self) -> Option<skin_model::ResultTiming> {
         self.presented_timing()
+    }
+    fn origin(&self) -> Option<TimeUs> {
+        self.presented_origin()
     }
 }
 
@@ -4425,7 +4455,7 @@ impl Run {
                 }
                 Ok(RenderMsg::ResultChanged) => {
                     self.take_result();
-                    if self.result.is_some() {
+                    if self.current_result().is_some() {
                         self.decision = None;
                         mode = Mode::Result;
                     }
@@ -4543,7 +4573,7 @@ impl Run {
                     let _ = reply.send(ready);
                     mode = self.after_preparing(mode);
                     // A result lifetime draws on from what it presented.
-                    if self.result.as_ref().is_some_and(ResultSide::shows) {
+                    if self.current_result().is_some_and(ResultSide::shows) {
                         mode = Mode::Result;
                     }
                     continue;
@@ -4669,6 +4699,7 @@ impl Run {
                 // Its page, or a newer one an earlier signal took; whether
                 // it may still be drawn is checked before every end frame.
                 Ok(RenderMsg::End) => {
+                    let shows = self.current_result().is_some_and(ResultSide::shows);
                     if let Some(page) = self.shared.take_end() {
                         self.end_page = page;
                         if let Some(side) = &mut self.result {
@@ -4677,11 +4708,7 @@ impl Run {
                     }
                     // A result skin's presentation draws instead while its
                     // lifetime is current: the page is its built-in rows'.
-                    mode = if self.result.as_ref().is_some_and(ResultSide::shows) {
-                        Mode::Result
-                    } else {
-                        Mode::End
-                    };
+                    mode = if shows { Mode::Result } else { Mode::End };
                 }
                 Ok(RenderMsg::Finish { end, reply }) => {
                     // Judgments still queued were never drawn in this play:
@@ -4865,6 +4892,8 @@ impl Run {
             let mut view_stamp = None;
             #[cfg(feature = "dev-tools")]
             let mut loading_stamp = None;
+            #[cfg(feature = "dev-tools")]
+            let mut screen_stamp = None;
             // The frame's one instant: a play frame's chart time and the
             // turntable's state time and tick are all of it.
             let frame_at = self.clock.now();
@@ -4989,6 +5018,10 @@ impl Run {
                     let now = TimeUs(frame_at.0 - origin.0);
                     let state_us = frame_at.0 - state_origin.0;
                     let screen_us = frame_at.0 - screen_origin.0;
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        screen_stamp = Some(screen_us);
+                    }
                     // The adjustments change anytime and move the notes
                     // only: one snapshot per frame gives the lanes, the
                     // readouts and the display offset together, and nothing
@@ -5266,8 +5299,17 @@ impl Run {
                         self.result.as_mut(),
                         &self.shared,
                         &self.scripts,
+                        now,
                     );
                     Self::result_visit(self.result.as_mut(), now, fadeout);
+                    #[cfg(all(test, feature = "dev-tools"))]
+                    if let Some(h) = self.result.as_ref().and_then(|s| s.presented.as_ref()) {
+                        self.shared
+                            .result_runtime_timers
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push((now, h.script.running_frame_timer(0)));
+                    }
                     let built =
                         Self::result_build(screen.as_mut(), self.result.as_mut(), now, fadeout);
                     // A frame under the barrier refused (dev-tools: the
@@ -5324,9 +5366,11 @@ impl Run {
                             view: held.map(|h| h.payload.key),
                             sampled: now,
                             // Only a frame its skin drew has its timers.
-                            timer_origin: held
+                            timer_origin: self
+                                .result
+                                .as_ref()
                                 .filter(|_| matches!(built, ResultDrawn::Built))
-                                .map(|h| h.overlay.screen),
+                                .and_then(|s| s.origin),
                         });
                     }
                     match built {
@@ -5456,6 +5500,8 @@ impl Run {
                         view: view_stamp,
                         #[cfg(feature = "dev-tools")]
                         loading_stamp,
+                        #[cfg(feature = "dev-tools")]
+                        screen_us: screen_stamp,
                         // The measured play's: none once its figures are
                         // taken, so no frame after a `Finish` is its.
                         #[cfg(feature = "dev-tools")]
@@ -6484,6 +6530,12 @@ struct ResultSide {
     incoming: Option<Box<ResultPresentation>>,
     prepared: Option<PreparedView>,
     presented: Option<HeldView>,
+    /// The lifetime's origin, its `screen` timer's start (design.md
+    /// "Rendering and Skins", Timers): the sampled instant of the frame
+    /// whose commit point first held a view presented, a built-in one
+    /// included; kept through frames not presented, every view after it
+    /// and a screen built again.
+    origin: Option<TimeUs>,
     /// The newest overlay not yet merged, with its revision.
     overlay: Option<(u64, Overlay)>,
     /// What the commit point replaced or discarded, dropped after the
@@ -6524,6 +6576,7 @@ impl ResultSide {
             incoming: None,
             prepared: None,
             presented: None,
+            origin: None,
             overlay: None,
             dropped: [None, None],
             overflow: None,
@@ -6626,6 +6679,22 @@ impl Run {
         if let Some(side) = &mut self.result {
             side.incoming = Some(p);
         }
+    }
+
+    /// The result side, while its lifetime is current: what a message
+    /// asks before it enters [`Mode::Result`]. One whose lifetime ended
+    /// (left, or another begun) before a frame of it checked is dropped
+    /// here, so the mode the message chooses otherwise stands, not a
+    /// result frame that would only find it gone and draw nothing.
+    fn current_result(&mut self) -> Option<&ResultSide> {
+        if self
+            .result
+            .as_ref()
+            .is_some_and(|r| !self.shared.result_slot().current(r.lifetime))
+        {
+            self.drop_result();
+        }
+        self.result.as_ref()
     }
 
     /// The render loop ended (dev-tools): the select and result screens'
@@ -7047,14 +7116,18 @@ impl Run {
     /// one hold of the result runtimes' lock with its generation checked
     /// live first ([`Scripts::commit_view`]), and becomes the one
     /// presented, the running runtime moving to it when it keeps the
-    /// presented generation; then the overlay merges. Nothing is
-    /// destroyed. Returns the fade-out's start. Allocates nothing.
+    /// presented generation; then the overlay merges. The first commit
+    /// point of the lifetime that leaves a view presented, built-in or
+    /// not, sets the lifetime's origin to `now`, the frame's sampled
+    /// instant, recorded with the view's timing. Nothing is destroyed.
+    /// Returns the fade-out's start. Allocates nothing.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn result_commit(
         screen: &mut dyn Screen,
         side: Option<&mut ResultSide>,
         shared: &Shared,
         scripts: &Scripts,
+        now: TimeUs,
     ) -> Option<TimeUs> {
         let side = side?;
         let fadeout;
@@ -7137,7 +7210,11 @@ impl Run {
                     screen.use_result_strip(STRIP_PRESENTED);
                 }
             }
+            if side.origin.is_none() && side.presented.is_some() {
+                side.origin = Some(now);
+            }
             b.presented = side.presented.as_ref().map(|h| h.payload.key);
+            b.origin = side.origin;
             b.timing = side
                 .presented
                 .as_ref()
@@ -7166,7 +7243,7 @@ impl Run {
             return;
         };
         let timers = skin_model::ResultTimers {
-            screen: Some(h.overlay.screen),
+            screen: side.origin,
             fadeout,
         };
         if let Ok(Some(stop)) = crate::screens::result_visit(
@@ -7192,7 +7269,11 @@ impl Run {
         now: TimeUs,
         fadeout: Option<TimeUs>,
     ) -> ResultDrawn {
-        let Some(h) = side.and_then(|s| s.presented.as_mut()) else {
+        let Some(side) = side else {
+            return ResultDrawn::BuiltIn;
+        };
+        let origin = side.origin;
+        let Some(h) = side.presented.as_mut() else {
             return ResultDrawn::BuiltIn;
         };
         if let Some(state) = h.state.as_mut().filter(|_| h.payload.skin.is_some()) {
@@ -7201,7 +7282,7 @@ impl Run {
                 target: screen.target(),
                 layout: &skin_model::Layout::AUTHOR,
                 timers: skin_model::ResultTimers {
-                    screen: Some(h.overlay.screen),
+                    screen: origin,
                     fadeout,
                 },
             };

@@ -68,13 +68,6 @@ pub(super) struct SrcImage {
     pub(super) timing: [u32; 2],
 }
 
-impl SrcImage {
-    /// The `source` id its `src` names.
-    pub(super) fn src_name(&self) -> Option<&str> {
-        self.src.as_deref()
-    }
-}
-
 impl Cx<'_> {
     /// The frames of a `div` grid. A grid of more than the skin's frames
     /// is the aggregate frame limit, refused before anything reads it.
