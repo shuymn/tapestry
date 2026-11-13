@@ -104,6 +104,13 @@ fn skin() -> Fx {
         element(Source::Number(3), [500, 160, 10, 10]),
         // An action shown only under the pointer; the first number is too.
         element(Source::Image(5), [1_300, 0, 100, 40]),
+        // The best play's numbers and bars.
+        element(Source::Number(4), [500, 180, 10, 10]),
+        element(Source::Number(5), [500, 200, 10, 10]),
+        element(Source::Number(6), [500, 220, 10, 10]),
+        element(Source::Number(7), [500, 240, 10, 10]),
+        element(Source::RatioBar(3), [1_100, 0, 200, 20]),
+        element(Source::RatioBar(4), [1_100, 40, 200, 20]),
     ];
     let hover = HoverRect {
         x: 0,
@@ -136,6 +143,22 @@ fn skin() -> Fx {
                 NumberDef {
                     digits: digits(6),
                     value: int("clock.second"),
+                },
+                NumberDef {
+                    digits: digits(6),
+                    value: int("selected.point"),
+                },
+                NumberDef {
+                    digits: digits(6),
+                    value: int("selected.max_combo"),
+                },
+                NumberDef {
+                    digits: digits(6),
+                    value: int("selected.count.fast"),
+                },
+                NumberDef {
+                    digits: digits(6),
+                    value: int("selected.rate.perfect"),
                 },
             ],
             texts: vec![
@@ -186,6 +209,16 @@ fn skin() -> Fx {
                     image: 3,
                     form: RatioForm::Bar { vertical: false },
                     source: RatioSource::MasterVolume,
+                },
+                RatioBarDef {
+                    image: 3,
+                    form: RatioForm::Bar { vertical: false },
+                    source: RatioSource::JudgeRate(0),
+                },
+                RatioBarDef {
+                    image: 3,
+                    form: RatioForm::Bar { vertical: false },
+                    source: RatioSource::ComboRate,
                 },
             ],
         },
@@ -289,6 +322,23 @@ fn a_selection_build_allocates_nothing() {
         if let Some(c) = v.selected.as_mut() {
             c.max_ex = Some(300);
             c.judge_class = u8::try_from(cursor % 5).ok();
+            c.summary = Some(selection_support::summary(200, 30, 0, 90, 150, 150));
+            c.clears = 1;
+            let mut tally = eval::Tally::default();
+            tally.counts.perfect = 120;
+            tally.counts.great = 80;
+            tally.early.great = 50;
+            tally.max_combo = 150;
+            c.best = Some(skin_model::SelectedBest {
+                max_combo: 190,
+                play: skin_model::BestPlay { tally, notes: 230 },
+            });
+        }
+        // The same view without a best, made before any count.
+        let mut bare = v.clone();
+        if let Some(c) = bare.selected.as_mut() {
+            c.best = None;
+            c.clears = 0;
         }
         fx.view(&v);
         let texts = TextTable::new(vec![line; fx.skin.text_slots()]);
@@ -299,6 +349,17 @@ fn a_selection_build_allocates_nothing() {
         // One build outside the count: the batch reaches its size.
         fx.frame(0);
         assert!(!fx.batch.quads().is_empty());
+        // A view change, its strings' capacity reached: the fields, the
+        // best play's numbers and the bars' ratios are filled in place.
+        // The labels are made before the count, as the player keeps its own.
+        let labels = selection_support::labels_of();
+        total += counted(|| {
+            for view in [&bare, &v] {
+                fx.skin
+                    .update_selection(&mut fx.sel, view, &labels)
+                    .unwrap();
+            }
+        });
         for ms in (0..2_000).step_by(16) {
             fx.timers.change = Some(TimeUs(0));
             fx.timers.panels[0] = (ms > 1_000).then_some(TimeUs(1_000_000));
