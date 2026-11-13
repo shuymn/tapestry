@@ -21,10 +21,12 @@
 //! `source`, `sites` and `tests` are non-empty arrays of distinct,
 //! non-empty strings.
 //!
-//! A tag is a line that is exactly `// Source: SF-ddd`. A line whose text
-//! starts with `// Source:` and then, after any spaces, `SF` is read as a
-//! tag and reported when it is not one; other `// Source:` lines are
-//! provenance and are ignored, as are `.java:NNN` citations. A tag sits in
+//! A tag is a line that is exactly `// Source: SF-ddd`, with one space
+//! after the colon. A line whose text starts with `// Source:` and then
+//! `SF`, with any number of spaces between, is reported unless it is
+//! exactly a tag (`// Source:SF-001` and `// Source:  SF-001` are); other
+//! `// Source:` lines are provenance and are ignored, as are `.java:NNN`
+//! citations. A tag sits in
 //! the run of comments and attributes directly above code and names an
 //! entry. Above a `#[test]` fn, that test is one of the entry's `tests`;
 //! above other code, the file is one of its `sites`. Each site holds a tag
