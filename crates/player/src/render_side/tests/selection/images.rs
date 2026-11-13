@@ -23,12 +23,14 @@ use crate::selection_skin::{BANNER_AT, BANNER_DST, STAGE_AT, STAGE_DST, chart_ma
 const RED: [u8; 3] = [200, 10, 10];
 const GREEN: [u8; 3] = [10, 200, 10];
 
-/// One selection frame as drawn: its quads, its device, and the pixels
-/// at the stage file's and the banner's points when sampled.
+/// One selection frame as drawn: its quads, its device, the update it
+/// applied (lifetime, revision), and the pixels at the stage file's and
+/// the banner's points when sampled.
 #[derive(Clone, Debug)]
 struct Seen {
     quads: Vec<Quad>,
     device: u64,
+    update: Option<(u64, u64)>,
     pixels: Option<[[u8; 3]; 2]>,
 }
 
@@ -40,7 +42,7 @@ struct Frames {
 }
 
 impl FrameSink for Frames {
-    fn frame(&mut self, screen: &dyn Screen, _drawn: &crate::measure::Drawn<'_>) {
+    fn frame(&mut self, screen: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
         let Some(quads) = screen.selection_quads() else {
             return;
         };
@@ -58,6 +60,7 @@ impl FrameSink for Frames {
         self.seen.lock().unwrap().push(Seen {
             quads,
             device: screen.device(),
+            update: drawn.selection,
             pixels,
         });
     }
@@ -328,6 +331,30 @@ fn a_selection_table_is_dropped_by_a_screen_built_again() {
     r.frames.clear();
     r.frames
         .until(|s| s.device == rebuilt && draws_images(s, r.layer));
+    r.link.exit();
+}
+
+/// A view update while the table is current: the frame that applies it
+/// (its view's fields reset) still draws both images, with 191 and 193
+/// holding in its conditions and its callbacks, since the image fields
+/// are written after the view's and before the callbacks (ST9, through
+/// the render thread's selection frame).
+#[test]
+fn the_frame_of_a_view_update_reads_the_current_table() {
+    let _warp = crate::warp_turn::take();
+    let _serial = crate::imports::tests::serial();
+    let r = rig();
+    let (_images, set) = crate::selection_skin::selection_images(r.side, RED, Some(GREEN));
+    let ack = publish(&r.link, 0, &set);
+    assert!(ack.answer.is_ok(), "{ack:?}");
+    r.frames.clear();
+    r.frames.until(|s| draws_images(s, r.layer));
+    // Another view, the table still current.
+    r.frames.clear();
+    r.link
+        .show_selection(update_of(1, 2, listed(SelectionPlace::All, "x")));
+    let first = r.frames.until(|s| s.update == Some((1, 2)));
+    assert!(draws_images(&first, r.layer), "{first:?}");
     r.link.exit();
 }
 
