@@ -221,11 +221,7 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
             VALID,
             (0, M),
         ),
-        1163 => v(
-            "chart.length_ms / 60000 % 60",
-            "chart.length_valid",
-            (0, 59),
-        ),
+        1163 => v("chart.length_ms / 60000", "chart.length_valid", (0, 35_791)),
         1164 => v("chart.length_ms / 1000 % 60", "chart.length_valid", (0, 59)),
         20..=29 => app(id)?,
         // No score target; no IR.

@@ -4,8 +4,8 @@
 //! graph 102 fills `load.percent / 100` and graph 101
 //! `time.progress_ppm / 10⁶` (`skin/property/FloatPropertyFactory.java:
 //! 128-137, 284-290`, `skin/SkinGraph.java:98-106`), and numbers 1163 and
-//! 1164 read the chart's 1× length's minutes within the hour and seconds
-//! within the minute (`IntegerPropertyFactory.java:473-478`), the same at
+//! 1164 read the chart's 1× length's whole minutes and seconds within
+//! the minute (`IntegerPropertyFactory.java:473-478`), the same at
 //! every practice speed and while loading from the chosen chart's library
 //! length. JSON by id and name, and Lua.
 
@@ -213,13 +213,13 @@ fn loading_reads_the_loads_percent() {
     }
 }
 
-/// C15: 1163 and 1164 are `⌊L/60 000⌋ % 60` and `⌊L/1 000⌋ % 60` of the
+/// C15: 1163 and 1164 are `⌊L/60 000⌋` and `⌊L/1 000⌋ % 60` of the
 /// chart's 1× length L in ms: 125 400 → 2, 5; 3 690 000 (an hour, a
-/// minute and a half) → 1, 30, where unwrapped minutes give 61; 0 → 0, 0.
+/// minute and a half) → 61, 30; 0 → 0, 0.
 /// The same while loading from the frame's chosen length; nothing while
 /// it gives none.
 #[test]
-fn the_length_reads_minutes_within_the_hour_and_seconds() {
+fn the_length_reads_whole_minutes_and_seconds() {
     for refs in [BY_ID, BY_NAME] {
         let l = skin_with(refs);
         let skin = l.ok().skin.clone();
@@ -227,7 +227,7 @@ fn the_length_reads_minutes_within_the_hour_and_seconds() {
         let mut loader = Loader::new(skin.clone());
         for (ms, min, sec) in [
             (125_400, "2", "5"),
-            (3_690_000, "1", "30"),
+            (3_690_000, "61", "30"),
             (59_999, "0", "59"),
             (0, "0", "0"),
         ] {

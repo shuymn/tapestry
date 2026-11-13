@@ -1489,7 +1489,7 @@ fn volumes_frame(s: &mut Sel) -> VolumesFrame {
 }
 
 /// Numbers 57, 58 and 59 show the system, key and background volume's
-/// `(int)(gain · 100f)`, truncated, and sliders and graphs 17, 18 and 19
+/// whole percent, rounded half up (0.53 shows 53, 0.994 shows 99), and sliders and graphs 17, 18 and 19
 /// each that channel's exact ratio, through the production path; a change
 /// of one channel moves only its own number, slider and graph.
 #[test]
@@ -1527,35 +1527,35 @@ fn each_volume_draws_on_its_own_number_slider_and_graph() {
             .all(|(g, w)| g.is_some_and(|g| (g - w).abs() < 1e-3))
     };
     s.skin
-        .update_selection_settings(&mut s.sel, &volumes(0.45, 0.2, 0.999))
+        .update_selection_settings(&mut s.sel, &volumes(0.53, 0.2, 0.994))
         .unwrap();
     let (numbers, sliders, graphs) = volumes_frame(&mut s);
     assert_eq!(
         numbers,
         BTreeMap::from([
-            (57, "45".to_owned()),
+            (57, "53".to_owned()),
             (58, "20".to_owned()),
             (59, "99".to_owned()),
         ])
     );
-    let want = [x(0.45), x(0.2), x(0.999)];
+    let want = [x(0.53), x(0.2), x(0.994)];
     assert!(close(sliders, want), "{sliders:?} {want:?}");
     assert!(close(graphs, want), "{graphs:?} {want:?}");
 
     // The key volume alone at unity.
     s.skin
-        .update_selection_settings(&mut s.sel, &volumes(0.45, 1.0, 0.999))
+        .update_selection_settings(&mut s.sel, &volumes(0.53, 1.0, 0.994))
         .unwrap();
     let (numbers, sliders, graphs) = volumes_frame(&mut s);
     assert_eq!(
         numbers,
         BTreeMap::from([
-            (57, "45".to_owned()),
+            (57, "53".to_owned()),
             (58, "100".to_owned()),
             (59, "99".to_owned()),
         ])
     );
-    let want = [x(0.45), 100.0, x(0.999)];
+    let want = [x(0.53), 100.0, x(0.994)];
     assert!(close(sliders, want), "{sliders:?} {want:?}");
     assert!(close(graphs, want), "{graphs:?} {want:?}");
 }
