@@ -70,6 +70,16 @@ pub struct Source {
     pub warned_lnobj: bool,
     /// A defaulted `#LNTYPE` was warned about; it is warned once per chart.
     pub warned_lntype: bool,
+    /// Objects a song list's preview times and nothing else reads
+    /// ([`bms_model::PreviewInputs`]): hidden notes (31-39) and BGA and
+    /// layer events (04, 07), each as [`ObjectKind::Bgm`] of id 0, in file
+    /// order; they stay silent, unplayed and undrawn.
+    pub shown: Vec<RawObject>,
+    /// Scroll changes (channel `SC`), each as [`ObjectKind::Bgm`] of its
+    /// `#SCROLLxx` id, in file order, for the preview alone.
+    pub scrolls: Vec<RawObject>,
+    /// `#SCROLLxx` factors in units of `10^-18`, those that are numbers.
+    pub scroll_defs: BTreeMap<u16, i128>,
 }
 
 /// Headers read and ignored without a warning: descriptive ones, and ones
@@ -343,6 +353,19 @@ fn parse_channel(
             }
             _ => None,
         };
+        let preview = |id| RawObject {
+            measure,
+            index,
+            count,
+            kind: ObjectKind::Bgm(id),
+            line,
+        };
+        match channel {
+            [b'0', b'4' | b'7'] => source.shown.push(preview(0)),
+            [b'3', d] if lane_of(d).is_some() => source.shown.push(preview(0)),
+            [b'S', b'C'] => source.scrolls.push(preview(id)),
+            _ => {}
+        }
         match kind {
             Some(kind) => source.objects.push(RawObject {
                 measure,
@@ -491,6 +514,16 @@ fn parse_header(
                     });
                 }
                 source.stop_defs.insert(id, v);
+            } else if let Some(id) = defined_id("SCROLL") {
+                // Read for a song list's preview alone; play ignores scroll
+                // changes, as the warning says.
+                if let Some(v) = header_value(value).number() {
+                    source.scroll_defs.insert(id, v);
+                }
+                warnings.push(Warning {
+                    line: Some(line),
+                    kind: WarningKind::UnknownHeader(upper.to_owned()),
+                });
             } else if let Some(id) = defined_id("WAV") {
                 source.wavs.insert(
                     id,
