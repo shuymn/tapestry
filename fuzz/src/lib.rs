@@ -502,6 +502,7 @@ fn draw_result(skin: &skin_model::Skin) -> Vec<usize> {
                     screen: Some(TimeUs(0)),
                     fadeout: (ms > 0).then_some(TimeUs(0)),
                 },
+                app: skin_model::AppReadouts::LAUNCH,
             };
             skin.build_result(&mut res, &frame, &uvs, &mut batch)
                 .expect("an imported result skin builds");

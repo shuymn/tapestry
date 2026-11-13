@@ -138,6 +138,10 @@ fn skin() -> Skin {
             ),
             relement(Source::GaugeGraph(0), [0, 400, 519, 259], None),
             relement(Source::TimingGraph(0), [600, 0, 520, 82], None),
+            // The application's readouts: the clock and the uptime.
+            relement(Source::Number(4), [600, 100, 10, 10], None),
+            relement(Source::Number(5), [600, 120, 10, 10], None),
+            relement(Source::Number(6), [600, 140, 10, 10], None),
         ],
         WidgetDefs {
             numbers: vec![
@@ -145,6 +149,9 @@ fn skin() -> Skin {
                 number("best.bp_diff", 4),
                 number("timing.mean_x100", 5),
                 number("chart.level", 2),
+                number("clock.second", 2),
+                number("app.uptime_s", 2),
+                number("app.fps", 4),
             ],
             texts: vec![text(TextField::FullTitle)],
             image_choices: vec![choice],
@@ -302,6 +309,10 @@ fn a_result_build_allocates_nothing() {
         assert_eq!(fx.batch.dropped(), 0);
         for ms in (16..2_000).step_by(16) {
             fx.timers.fadeout = (ms > 1_000).then_some(TimeUs(1_000_000));
+            // The readouts change every frame.
+            fx.app.uptime_us = ms * 1_000;
+            fx.app.fps = u16::try_from(ms % 1_000).unwrap();
+            fx.app.local.second = u8::try_from(ms / 16 % 60).unwrap();
             total += counted(|| fx.frame(ms));
         }
     }

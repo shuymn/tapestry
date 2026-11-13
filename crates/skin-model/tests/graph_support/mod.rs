@@ -266,6 +266,7 @@ impl GFx {
             target: [1_920, 1_080],
             layout: &self.layout,
             timers: self.timers,
+            app: skin_model::AppReadouts::LAUNCH,
         };
         self.skin
             .build_result(&mut self.res, &frame, self.atlas.uvs(), &mut self.batch)

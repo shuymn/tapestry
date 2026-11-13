@@ -116,6 +116,10 @@ pub(super) struct Faults {
     /// and the `screen` timer's ms its state held as the build began (the
     /// runtime's reading: the frame's visit prepared it).
     pub(super) builds: Mutex<Vec<Build>>,
+    /// Every result frame built: its time, its readouts, and the year and
+    /// the uptime's seconds its state held as the build began (what the
+    /// frame's visit prepared).
+    pub(super) uptimes: Mutex<Vec<(TimeUs, skin_model::AppReadouts, [i32; 2])>>,
     /// The strip's text per slot as prepared, and the one in use.
     strips: Mutex<[Vec<String>; 3]>,
     strip: Mutex<Vec<String>>,
@@ -359,11 +363,24 @@ impl Screen for Recorded {
         }
         *self.faults.timers.lock().unwrap() = Some((frame.now, frame.timers.fadeout));
         let prepared = state.runtime_parts().1.first().copied();
+        let held = {
+            let fields = &*state.runtime_parts().0;
+            let at = |slot: u16| fields.get(usize::from(slot)).copied().unwrap_or(-1);
+            [
+                at(skin_model::result_field::CLOCK_YEAR),
+                at(skin_model::result_field::APP_UPTIME_S),
+            ]
+        };
         self.faults
             .builds
             .lock()
             .unwrap()
             .push((frame.now, frame.timers.screen, prepared));
+        self.faults
+            .uptimes
+            .lock()
+            .unwrap()
+            .push((frame.now, frame.app, held));
         self.menu.build_result(state, frame)
     }
     fn submit_result(&mut self) -> Result<render::FrameTiming, render::RenderError> {
@@ -1779,13 +1796,24 @@ fn result_frame_alloc() {
         let fadeout =
             Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts, TimeUs(0));
         let commit = crate::alloc_count::this_thread() - before;
-        Run::result_visit(Some(&mut side), now, fadeout);
+        Run::result_visit(
+            Some(&mut side),
+            now,
+            fadeout,
+            &skin_model::AppReadouts::LAUNCH,
+        );
         assert!(
             side.presented.as_ref().is_some_and(|h| h.script.runs()),
             "the runtime ran between the spans"
         );
         let before = crate::alloc_count::this_thread();
-        let drawn = Run::result_build(&mut screen, Some(&mut side), now, fadeout);
+        let drawn = Run::result_build(
+            &mut screen,
+            Some(&mut side),
+            now,
+            fadeout,
+            &skin_model::AppReadouts::LAUNCH,
+        );
         counts.push(commit + crate::alloc_count::this_thread() - before);
         assert_eq!(drawn, ResultDrawn::Built);
         assert_eq!(screen.result_strip(), 13);
@@ -1807,7 +1835,13 @@ fn result_frame_alloc() {
     screen.refuse_next_result(false);
     let before = crate::alloc_count::this_thread();
     let fadeout = Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts, TimeUs(0));
-    let drawn = Run::result_build(&mut screen, Some(&mut side), TimeUs(2_000_000), fadeout);
+    let drawn = Run::result_build(
+        &mut screen,
+        Some(&mut side),
+        TimeUs(2_000_000),
+        fadeout,
+        &skin_model::AppReadouts::LAUNCH,
+    );
     counts.push(crate::alloc_count::this_thread() - before);
     assert!(matches!(drawn, ResultDrawn::Refused(_)), "{drawn:?}");
     // The control: the count sees an allocation in the same window.
@@ -2869,10 +2903,21 @@ fn the_build_mark_precedes_the_result_build() {
         let now = TimeUs(1_000_000 + 16_000 * k);
         let fadeout =
             Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts, TimeUs(0));
-        Run::result_visit(Some(&mut side), now, fadeout);
+        Run::result_visit(
+            Some(&mut side),
+            now,
+            fadeout,
+            &skin_model::AppReadouts::LAUNCH,
+        );
         let _ = crate::dev::take_build_mark();
         let _ = render::take_build_start();
-        let drawn = Run::result_build(&mut screen, Some(&mut side), now, fadeout);
+        let drawn = Run::result_build(
+            &mut screen,
+            Some(&mut side),
+            now,
+            fadeout,
+            &skin_model::AppReadouts::LAUNCH,
+        );
         assert_eq!(drawn, ResultDrawn::Built);
         screen.submit_result().unwrap();
         let mark = crate::dev::take_build_mark().expect("the build marked");
@@ -3293,4 +3338,28 @@ fn a_refusal_keeps_the_origin_and_removes_the_timing() {
     assert_eq!(rig.link.presented_timing(), None);
     assert_eq!(rig.link.presented_origin(), Some(o));
     rig.link.exit();
+}
+
+/// A result frame's time and its application readouts are one clock
+/// reading, as a selection frame's are (design.md "Rendering and Skins",
+/// play readouts): each frame's time is its readouts' uptime on the clock
+/// started at launch, though the frame stalls 2 ms after that reading;
+/// and the state the frame's visit prepared, which the build draws, holds
+/// those readouts.
+#[test]
+fn a_result_frames_time_and_readouts_are_one_reading() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    rig.link.shared.result_stall.store(true, Ordering::Release);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(wait_until(|| rig.faults.uptimes.lock().unwrap().len() >= 5));
+    rig.link.exit();
+    let seen = rig.faults.uptimes.lock().unwrap().clone();
+    for (now, app, held) in seen {
+        assert_eq!(app.uptime_us, now.0, "{now:?}");
+        let second = i32::try_from(app.uptime_us / 1_000_000 % 60).unwrap();
+        assert_eq!(held, [i32::from(app.local.year), second], "{now:?}");
+    }
 }

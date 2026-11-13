@@ -104,6 +104,7 @@ fn result_entry_points_refuse_other_kinds() {
         target: fx.target,
         layout: &fx.layout,
         timers: fx.timers,
+        app: fx.app,
     };
     assert_eq!(
         play.build_result(&mut inert, &frame, &fx.uvs, &mut fx.batch),
@@ -802,7 +803,7 @@ fn a_prepared_result_frame_is_built_without_its_timers_filled_again() {
     fx.view(&ready(1, BestView::Unavailable, 1));
     let prepare = |fx: &mut RFx, ms: i64| {
         fx.skin
-            .prepare_result_frame(&mut fx.res, TimeUs(ms * 1_000), &fx.timers)
+            .prepare_result_frame(&mut fx.res, TimeUs(ms * 1_000), &fx.timers, &fx.app)
             .unwrap();
     };
     prepare(&mut fx, 16);
@@ -819,7 +820,134 @@ fn a_prepared_result_frame_is_built_without_its_timers_filled_again() {
     let sel =
         selection_support::load(Vec::new(), WidgetDefs::default(), Default::default()).unwrap();
     assert_eq!(
-        sel.prepare_result_frame(&mut fx.res, TimeUs(0), &fx.timers),
+        sel.prepare_result_frame(&mut fx.res, TimeUs(0), &fx.timers, &fx.app),
         Err(BuildError::Kind)
     );
+}
+
+/// Readouts whose every part is told apart: 1 024 presents (the most),
+/// 30 827-12-31 23:59:58 and 600 h of uptime exactly.
+const APP: skin_model::AppReadouts = skin_model::AppReadouts {
+    fps: 1_024,
+    uptime_us: 2_160_000_000_000,
+    local: skin_model::LocalTime {
+        year: 30_827,
+        month: 12,
+        day: 31,
+        hour: 23,
+        minute: 59,
+        second: 58,
+    },
+};
+
+/// A result skin drawing `value` as a six-cell number at y = 100.
+fn app_number(value: &str) -> RFx {
+    RFx::new(
+        rload(
+            vec![relement(Source::Number(0), [100, 100, 10, 10], None)],
+            WidgetDefs {
+                numbers: vec![number(value, 6)],
+                ..WidgetDefs::default()
+            },
+        )
+        .unwrap(),
+    )
+}
+
+/// The digits drawn at y = 100.
+fn app_digits(fx: &RFx) -> Vec<u16> {
+    fx.at_y(100.0)
+        .into_iter()
+        .filter(|&(image, _)| image == DIGITS)
+        .map(|(_, g)| g)
+        .collect()
+}
+
+/// Numbers 20 to 29 on the result read the frame's application readouts,
+/// as play's and selection's do: the presents per second, the local date
+/// and time, and the uptime's whole hours unwrapped and its minutes and
+/// seconds; a later frame's readouts show with no view between, and a
+/// view's fields leave them to the frame
+/// (`skin/property/IntegerPropertyFactory.java:98-107`).
+#[test]
+fn numbers_20_to_29_read_the_result_frames_application_readouts() {
+    let at_600h = [
+        ("app.fps", vec![1, 0, 2, 4]),
+        ("clock.year", vec![3, 0, 8, 2, 7]),
+        ("clock.month", vec![1, 2]),
+        ("clock.day", vec![3, 1]),
+        ("clock.hour", vec![2, 3]),
+        ("clock.minute", vec![5, 9]),
+        ("clock.second", vec![5, 8]),
+        ("app.uptime_h", vec![6, 0, 0]),
+        ("app.uptime_m", vec![0]),
+        ("app.uptime_s", vec![0]),
+    ];
+    for (value, want) in at_600h {
+        let mut fx = app_number(value);
+        fx.view(&ready(1, BestView::Unavailable, 1));
+        fx.app = APP;
+        fx.frame(0);
+        assert_eq!(app_digits(&fx), want, "{value}");
+    }
+    // 3 725 999 ms: 1 h, 2 min, 5 s, at the next frame with no view; a
+    // view between leaves the frame's readouts drawn.
+    for (value, want) in [
+        ("app.uptime_h", vec![1]),
+        ("app.uptime_m", vec![2]),
+        ("app.uptime_s", vec![5]),
+    ] {
+        let mut fx = app_number(value);
+        fx.view(&ready(1, BestView::Unavailable, 1));
+        fx.app = APP;
+        fx.frame(0);
+        fx.app.uptime_us = 3_725_999_000;
+        fx.frame(16);
+        assert_eq!(app_digits(&fx), want, "{value}");
+        fx.view(&ready(2, BestView::Unavailable, 1));
+        fx.frame(32);
+        assert_eq!(app_digits(&fx), want, "{value} after a view");
+    }
+    // A view's fields hold none of them: they are the frame's.
+    let fields = ResultFields::of(&ready(1, BestView::Unavailable, 1));
+    let app = usize::from(field::APP_FPS)..=usize::from(field::APP_UPTIME_S);
+    assert!(fields.0[app].iter().all(|&v| v == 0));
+}
+
+/// A readout outside its field's range refuses the result frame, at its
+/// preparation and at its build, and nothing is drawn; the next valid
+/// frame draws.
+#[test]
+fn an_invalid_readout_refuses_the_result_frame() {
+    let mut fx = app_number("clock.month");
+    fx.view(&ready(1, BestView::Unavailable, 1));
+    let bad = skin_model::AppReadouts {
+        local: skin_model::LocalTime {
+            month: 13,
+            ..APP.local
+        },
+        ..APP
+    };
+    assert_eq!(
+        fx.skin
+            .prepare_result_frame(&mut fx.res, TimeUs(0), &fx.timers, &bad),
+        Err(BuildError::InvalidReadouts)
+    );
+    fx.batch.clear();
+    let frame = skin_model::ResultFrame {
+        now: TimeUs(0),
+        target: fx.target,
+        layout: &fx.layout,
+        timers: fx.timers,
+        app: bad,
+    };
+    assert_eq!(
+        fx.skin
+            .build_result(&mut fx.res, &frame, &fx.uvs, &mut fx.batch),
+        Err(BuildError::InvalidReadouts)
+    );
+    assert!(fx.batch.quads().is_empty());
+    fx.app = APP;
+    fx.frame(16);
+    assert_eq!(app_digits(&fx), [1, 2]);
 }

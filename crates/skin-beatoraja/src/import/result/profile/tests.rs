@@ -37,7 +37,7 @@ fn rows(spans: &[(i32, i32, C)]) -> Vec<(i32, C)> {
 /// §A's numeric ids, the source's bundled skin's five more (S10-09i) and
 /// the ids equal to or derived from bridged ones (S7-07c).
 const NUMERIC: &[(i32, i32, C)] = &[
-    (21, 25, C::D),
+    (20, 29, C::N),
     (45, 49, C::N),
     (71, 72, C::N),
     (74, 76, C::N),
@@ -142,7 +142,7 @@ fn every_profile_id_has_its_class() {
             .filter(|&id| of(number(id)) == Some(c))
             .count()
     };
-    assert_eq!((count(C::N), count(C::D)), (83, 33));
+    assert_eq!((count(C::N), count(C::D)), (93, 28));
     let n = OPTION_N.iter().flat_map(|&(a, b)| a..=b);
     let d = OPTION_D.iter().flat_map(|&(a, b, _)| a..=b);
     // 160 to 164 are N (constant per kind) with constant values.
