@@ -1059,6 +1059,7 @@ impl Lanes {
 
     /// Note `i` of lane `l` as the source player draws it; `false` once
     /// the frame's lanes stop.
+    // Not a source copy: the reason names an argument, the skin's offset.
     #[expect(
         clippy::too_many_arguments,
         reason = "the frame's scale and the source's offset beside the note"
