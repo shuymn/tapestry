@@ -805,9 +805,23 @@ impl Screen for Direct {
 /// A test-thread preparation: the screen (with the runtime fonts when
 /// `fonts`), the side and its book.
 fn side_of(dir: &TempDir, fonts: bool) -> (Direct, DecisionSide, Arc<Mutex<LabelBook>>) {
-    let mut r = crate::render_common::offscreen(TARGET[0], TARGET[1]);
+    side_on(
+        crate::render_common::offscreen(TARGET[0], TARGET[1]),
+        dir,
+        fonts,
+        1,
+    )
+}
+
+/// [`side_of`] on `r`, the decision skin installed as `request`.
+fn side_on(
+    mut r: render::Renderer,
+    dir: &TempDir,
+    fonts: bool,
+    request: u64,
+) -> (Direct, DecisionSide, Arc<Mutex<LabelBook>>) {
     let b = decision_bundle_in(&r, dir.path(), &default_font());
-    let token = r.install(ScreenKind::Decision, &b, 1).unwrap();
+    let token = r.install(ScreenKind::Decision, &b, request).unwrap();
     r.commit(token).unwrap();
     let fonts = fonts.then(|| render::text::Fonts::runtime().unwrap());
     let screen = Direct {
@@ -1513,15 +1527,23 @@ fn decision_builtin_frame_alloc() {
     assert_eq!(build(&mut screen, &skinned, Some(1)), (refused, 0));
 }
 
-/// R0.4: a selection frame while a decision preparation runs (its job on
-/// the worker, then its slot filling) allocates no more than a steady
-/// selection frame; the boundary's work is outside the frame.
+/// R0.4: a skinned selection frame while a decision preparation runs on
+/// the same screen (its job on the worker, then its slot filling) only
+/// reads prepared state: its app work (the skin's build, design.md "Scope
+/// of No Allocation") allocates nothing, as a steady selection frame's
+/// does. The boundary's work and the GPU submission are outside the count.
 #[test]
 fn selection_frame_during_decision_prep_alloc() {
     use crate::alloc_count::this_thread;
     let _turn = crate::warp_turn::take();
     let dir = skin_dir();
-    let (mut screen, mut side, book) = side_of(&dir, true);
+    let sel_dir = crate::selection_skin::fixture();
+    let mut r = crate::render_common::offscreen(TARGET[0], TARGET[1]);
+    let sel = crate::selection_skin::fixture_bundle(&r, sel_dir.path(), "s.json");
+    let token = r.install(ScreenKind::Selection, &sel, 1).unwrap();
+    r.commit(token).unwrap();
+    let mut logic = crate::selection_skin::SelectionLogic::new(&sel, 1);
+    let (mut screen, mut side, book) = side_on(r, &dir, true, 2);
     let update = SelectionUpdate {
         lifetime: 1,
         revision: 1,
@@ -1533,21 +1555,18 @@ fn selection_frame_during_decision_prep_alloc() {
         events: SelectionEvents::default(),
         settings: None,
     };
-    let frame = |screen: &mut Direct, changed: bool| {
-        let before = this_thread();
+    let mut k = 0_i64;
+    let mut frame = |screen: &mut Direct, changed: bool| {
+        k += 1;
         screen
-            .selection(
-                &update,
-                None,
-                changed,
-                TimeUs(1),
-                skin_model::AppReadouts::LAUNCH,
-            )
-            .unwrap();
-        this_thread() - before
+            .menu
+            .selection_build_count(&update, &mut logic, changed, TimeUs(k * 16_667))
     };
-    frame(&mut screen, true);
-    let steady = (0..3).map(|_| frame(&mut screen, false)).max().unwrap();
+    let control = this_thread();
+    drop(std::hint::black_box(vec![1_u8; 8]));
+    assert!(this_thread() > control, "the allocation was not counted");
+    assert_eq!(frame(&mut screen, true), 0, "first");
+    assert_eq!(frame(&mut screen, false), 0, "steady");
     let a = want("a", "A");
     let mut during = Vec::new();
     quiet(&mut screen, &mut side, a.as_ref());
@@ -1561,10 +1580,7 @@ fn selection_frame_during_decision_prep_alloc() {
         std::thread::sleep(Duration::from_millis(1));
     }
     assert!(ready(&lock(&book), "a", "A"));
-    assert!(
-        during.iter().all(|&n| n <= steady),
-        "steady {steady}, during {during:?}"
-    );
+    assert!(during.iter().all(|&n| n == 0), "during {during:?}");
 }
 
 /// The slot of `book` pinned by `lifetime` at `generation`, its content
