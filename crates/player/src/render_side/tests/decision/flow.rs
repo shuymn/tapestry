@@ -689,14 +689,14 @@ fn lua_skin_dir() -> TempDir {
     dir
 }
 
-/// R6.3 (C14): self-made JSON and Lua decision skins, each the decision
-/// kind of the full configured set installed by startup through
-/// production's build, draw through production: the set installed with no
-/// notice, the result kind's skin fixed, the choice pinning the chart's
-/// labels with the declared timing and the title drawn lit from them. A
-/// decision skin the render thread refuses (its labels' rows do not fit
-/// the region) leaves the run's notice, and its choice draws the built-in
-/// presentation for 1,500 ms.
+/// R6.3: self-made JSON and Lua decision skins, each installed by startup
+/// through production's build beside test bundles of the other kinds (the
+/// full configured set's run is `integrated`'s), draw through production:
+/// the set installed with no notice, the result kind's skin fixed, the
+/// choice pinning the chart's labels with the declared timing and the
+/// title drawn lit from them. A decision skin the render thread refuses
+/// (its labels' rows do not fit the region) leaves the run's notice, and
+/// its choice draws the built-in presentation for 1,500 ms.
 #[test]
 fn decision_skin_json_and_lua_draw_through_production() {
     use crate::render_outline::{Value, decision_folder, text, ttf};
