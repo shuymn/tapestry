@@ -6636,29 +6636,22 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     {
                         drop(region);
+                        use crate::decision_side::DecisionDrawn;
+                        use crate::measure::DecisionDrawnAs;
                         let app = crate::alloc_count::app_allocations().saturating_sub(app_before);
+                        let drew = match built {
+                            DecisionDrawn::Built => DecisionDrawnAs::Skin,
+                            DecisionDrawn::Ended => DecisionDrawnAs::Ended,
+                            _ => DecisionDrawnAs::Fallback,
+                        };
                         if let Some(r) = &mut self.decision_record {
                             r.app = r.app.saturating_add(app);
-                            if matches!(
-                                built,
-                                crate::decision_side::DecisionDrawn::Built
-                                    | crate::decision_side::DecisionDrawn::Refused(_)
-                            ) {
-                                r.builds = r.builds.saturating_add(1);
-                            }
-                            if matches!(built, crate::decision_side::DecisionDrawn::Ended) {
-                                r.ended = true;
-                            }
+                            let a_build =
+                                matches!(built, DecisionDrawn::Built | DecisionDrawn::Refused(_));
+                            r.builds = r.builds.saturating_add(u64::from(a_build));
+                            r.ended |= drew == DecisionDrawnAs::Ended;
                         }
-                        decision_as = Some(match built {
-                            crate::decision_side::DecisionDrawn::Built => {
-                                crate::measure::DecisionDrawnAs::Skin
-                            }
-                            crate::decision_side::DecisionDrawn::Ended => {
-                                crate::measure::DecisionDrawnAs::Ended
-                            }
-                            _ => crate::measure::DecisionDrawnAs::Fallback,
-                        });
+                        decision_as = Some(drew);
                     }
                     match built {
                         crate::decision_side::DecisionDrawn::Built => {
@@ -7979,16 +7972,14 @@ impl Run {
     /// the game thread, which is woken, only while that lifetime is the
     /// active one; another lifetime's is dropped.
     fn take_over(&mut self, at: TimeUs, why: String) {
-        #[cfg(feature = "dev-tools")]
-        if self.decision_shown.is_some() {
-            self.fell_back(crate::measure::DecisionFallback::TakenOver);
-        }
         let Some(shown) = self.decision_shown.as_mut() else {
             return;
         };
         shown.slot = None;
         self.decision_screen = None;
         let lifetime = shown.lifetime;
+        #[cfg(feature = "dev-tools")]
+        self.fell_back(crate::measure::DecisionFallback::TakenOver);
         {
             // Published under the book's lock, which the game ends a
             // lifetime under: never once it ended.

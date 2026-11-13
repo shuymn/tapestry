@@ -537,6 +537,7 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::build_selection_frame",
             "MenuScreen::build_page_frame",
             "MenuScreen::build_decision",
+            "MenuScreen::allocate_in_next_decision",
             "strip_sprites",
         ],
     ),
