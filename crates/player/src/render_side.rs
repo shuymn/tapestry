@@ -6323,7 +6323,7 @@ impl Run {
             return Err(CommitError::Device);
         };
         if let Err(e) = screen.commit(p.token) {
-            screen.discard();
+            screen.discard_token(p.token);
             return Err(e);
         }
         // Its key is the committed layer's now, the generation's whatever
@@ -6486,7 +6486,11 @@ impl Run {
                 let shared = Arc::clone(&self.shared);
                 let mut commits = shared.commits();
                 if commits.withdrawn >= request {
-                    screen.discard();
+                    screen.discard_token(PreparedToken {
+                        request,
+                        device: screen.device(),
+                        kind,
+                    });
                     return Ok(Preparation::Cancelled);
                 }
                 let token = PreparedToken {
@@ -6495,7 +6499,11 @@ impl Run {
                     kind,
                 };
                 if let Err(e) = screen.commit(token) {
-                    screen.discard();
+                    screen.discard_token(PreparedToken {
+                        request,
+                        device: screen.device(),
+                        kind,
+                    });
                     return Ok(refusal(e.to_string()));
                 }
                 commits.committed = commits.committed.max(request);
@@ -6517,7 +6525,11 @@ impl Run {
                 Ok(Preparation::Ready)
             }
             Ok(refused) => {
-                screen.discard();
+                screen.discard_token(PreparedToken {
+                    request,
+                    device: screen.device(),
+                    kind,
+                });
                 Ok(refused)
             }
             Err(e) => {
@@ -7197,7 +7209,11 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     let installed = match installed {
                         Ok(Preparation::Ready) if crate::dev::refuse_result_staging() => {
-                            screen.discard();
+                            screen.discard_token(PreparedToken {
+                                request,
+                                device: screen.device(),
+                                kind: ScreenKind::Result,
+                            });
                             Ok(refusal("dev: the view's staging was refused"))
                         }
                         other => other,
@@ -7745,7 +7761,11 @@ impl Run {
                 let shared = Arc::clone(&self.shared);
                 let mut commits = shared.commits();
                 if commits.withdrawn >= request {
-                    screen.discard();
+                    screen.discard_token(PreparedToken {
+                        request,
+                        device: screen.device(),
+                        kind,
+                    });
                     return Ok(Preparation::Cancelled);
                 }
                 let token = PreparedToken {
@@ -7754,7 +7774,11 @@ impl Run {
                     kind,
                 };
                 if let Err(e) = screen.commit(token) {
-                    screen.discard();
+                    screen.discard_token(PreparedToken {
+                        request,
+                        device: screen.device(),
+                        kind,
+                    });
                     return Ok(refusal(e.to_string()));
                 }
                 let _ = screen.drain_retired();
@@ -7763,7 +7787,11 @@ impl Run {
                 Ok(Preparation::Ready)
             }
             Ok(refused) => {
-                screen.discard();
+                screen.discard_token(PreparedToken {
+                    request,
+                    device: screen.device(),
+                    kind,
+                });
                 Ok(refused)
             }
             Err(e) => {
