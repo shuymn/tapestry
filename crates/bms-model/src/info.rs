@@ -1,8 +1,8 @@
 //! What a song list previews of a chart's notes before it is chosen
 //! (design.md "Loading and Song Selection", Summaries): the counts by
 //! kind and the integer parts of the densities, from the chart's
-//! [`ChartProfile`]. Dividing them into the shown decimals takes floating
-//! point, which this crate does not use; the library does it.
+//! [`ChartProfile`]. The library divides them into the shown decimals
+//! and reads the gauge total, exactly.
 
 use crate::ChartProfile;
 use crate::profile::{
@@ -81,7 +81,7 @@ fn total_of(seconds: &[[u32; NOTE_CATEGORIES]], c: usize) -> u32 {
 impl ChartInfo {
     /// The info of `profile`, the border starting at `border_start(N)`
     /// for the chart's `N` notes: the caller's reading of the chart's
-    /// gauge total, which takes floating point.
+    /// gauge total.
     ///
     /// The source analyses a chart only up to 6 hours; the loader's own
     /// 60-minute cap (design.md "Loading Limits") is far below it, so

@@ -38,7 +38,7 @@ pub struct ChartInfoView {
     pub density_average: i32,
     /// Its hundredths.
     pub density_average_hundredths: i32,
-    /// The gauge total ([`gauge_total`]), truncated.
+    /// The gauge total ([`GaugeTotal::whole`]), rounded down.
     pub total: i32,
     /// The MAIN tempo in whole BPM truncated, 0 when no note weighs
     /// anything (a chart of mines alone), as the reference's song
