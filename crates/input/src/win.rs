@@ -153,6 +153,9 @@ fn qpc_frequency() -> QpcFrequency {
 pub struct QpcClock {
     origin: i64,
     frequency: QpcFrequency,
+    /// A test's hold on every copy (dev-tools: [`QpcClock::holdable`]).
+    #[cfg(feature = "dev-tools")]
+    hold: Option<&'static ClockHold>,
 }
 
 impl QpcClock {
@@ -162,6 +165,8 @@ impl QpcClock {
         Self {
             origin: read_qpc(),
             frequency: qpc_frequency(),
+            #[cfg(feature = "dev-tools")]
+            hold: None,
         }
     }
 
@@ -181,7 +186,117 @@ impl QpcClock {
 
 impl TimeSource for QpcClock {
     fn now(&self) -> TimeUs {
-        qpc_to_us(read_qpc(), self.origin, self.frequency)
+        let now = qpc_to_us(read_qpc(), self.origin, self.frequency);
+        #[cfg(feature = "dev-tools")]
+        if let Some(hold) = self.hold {
+            return hold.read(now);
+        }
+        now
+    }
+}
+
+/// A test's hold on a [`QpcClock`] and all its copies (dev-tools): held,
+/// every copy reads the time the test set; let run, the clock runs on
+/// from there. No copy ever reads an earlier time than one read before.
+#[cfg(feature = "dev-tools")]
+#[derive(Debug)]
+pub struct ClockHold {
+    /// The time held, or [`ClockHold::RUNNING`].
+    held: std::sync::atomic::AtomicI64,
+    /// How far the clock runs behind QPC once let run.
+    behind: std::sync::atomic::AtomicI64,
+    /// The latest time any copy read.
+    last: std::sync::atomic::AtomicI64,
+}
+
+#[cfg(feature = "dev-tools")]
+impl ClockHold {
+    const RUNNING: i64 = i64::MIN;
+
+    /// The time a copy reads, QPC reading `real`.
+    fn read(&self, real: TimeUs) -> TimeUs {
+        let held = self.held.load(Ordering::SeqCst);
+        let t = if held == Self::RUNNING {
+            real.0.saturating_sub(self.behind.load(Ordering::SeqCst))
+        } else {
+            held
+        };
+        TimeUs(self.last.fetch_max(t, Ordering::SeqCst).max(t))
+    }
+}
+
+#[cfg(feature = "dev-tools")]
+impl QpcClock {
+    /// A clock that reads 0 now and that a test can hold, move on and let
+    /// run again; every copy shares the hold. Each call leaks one small
+    /// [`ClockHold`].
+    #[must_use]
+    pub fn holdable() -> Self {
+        let hold = Box::leak(Box::new(ClockHold {
+            held: std::sync::atomic::AtomicI64::new(ClockHold::RUNNING),
+            behind: std::sync::atomic::AtomicI64::new(0),
+            last: std::sync::atomic::AtomicI64::new(0),
+        }));
+        Self {
+            hold: Some(hold),
+            ..Self::start()
+        }
+    }
+
+    /// Holds the clock: every copy reads the time it reads now, which is
+    /// returned, until [`set`](Self::set) or [`run`](Self::run).
+    ///
+    /// # Panics
+    ///
+    /// If the clock is not [`holdable`](Self::holdable).
+    #[expect(clippy::expect_used, reason = "a test's misuse")]
+    pub fn hold(&self) -> TimeUs {
+        let hold = self.hold.expect("a holdable clock");
+        let now = self.now();
+        hold.held.store(now.0, Ordering::SeqCst);
+        self.now()
+    }
+
+    /// Moves a held clock on to `t`: every copy reads `t` from now on.
+    ///
+    /// # Panics
+    ///
+    /// If the clock is not [`holdable`](Self::holdable) and held, or `t`
+    /// is earlier than a time a copy read.
+    #[expect(clippy::expect_used, reason = "a test's misuse")]
+    pub fn set(&self, t: TimeUs) {
+        let hold = self.hold.expect("a holdable clock");
+        assert_ne!(
+            hold.held.load(Ordering::SeqCst),
+            ClockHold::RUNNING,
+            "the clock runs"
+        );
+        let last = hold.last.load(Ordering::SeqCst);
+        assert!(
+            t.0 >= last,
+            "the clock moved back from {last} to {} µs",
+            t.0
+        );
+        hold.held.store(t.0, Ordering::SeqCst);
+    }
+
+    /// Lets a held clock run on from the time it reads; a running one
+    /// runs on.
+    ///
+    /// # Panics
+    ///
+    /// If the clock is not [`holdable`](Self::holdable).
+    #[expect(clippy::expect_used, reason = "a test's misuse")]
+    pub fn run(&self) {
+        let hold = self.hold.expect("a holdable clock");
+        let held = hold.held.load(Ordering::SeqCst);
+        if held == ClockHold::RUNNING {
+            return;
+        }
+        let real = qpc_to_us(read_qpc(), self.origin, self.frequency);
+        hold.behind
+            .store(real.0.saturating_sub(held), Ordering::SeqCst);
+        hold.held.store(ClockHold::RUNNING, Ordering::SeqCst);
     }
 }
 
