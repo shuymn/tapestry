@@ -16,7 +16,9 @@ use crate::atlas::{Atlas, AtlasError, AtlasLimits, KeptLayers, Variant};
 use crate::canvas::{Canvas, Fit, MAX_CANVAS, f32_of};
 use crate::chart_image::{ChartImage, ChartStretch, ChartTable};
 use crate::decision::schema::timer as decision_timer;
-use crate::decision::{DecisionError, DecisionFrame, DecisionScreen};
+use crate::decision::{
+    DecisionError, DecisionFrame, DecisionLabels, DecisionScreen, DecisionStrings,
+};
 use crate::expr::State;
 use crate::expr::{CompileError, Program, SkinOps};
 use crate::image::Sheet;
@@ -4418,6 +4420,55 @@ impl Skin {
         self.text_requests(&dec.strings.chart(), target, layout)
     }
 
+    /// The rows a decision preparation reserves for its rasterized lines
+    /// on a `target`-pixel target with `layout`: each text element
+    /// [`text_requests`](Self::text_requests) may ask a line for, as
+    /// `(slot, em)` in slot order, whatever its string. It allocates.
+    #[must_use]
+    pub fn outline_rows(&self, target: [u32; 2], layout: &Layout) -> Vec<(u16, f32)> {
+        let (fit, ..) = self.fit(target);
+        self.elements
+            .iter()
+            .filter_map(|e| {
+                let Kind::Text(i, t) = e.kind else {
+                    return None;
+                };
+                let hidden = e.visible.as_ref().and_then(Program::constant) == Some(0);
+                (!hidden && t.bitmap.is_none() && self.texts.get(i).is_some())
+                    .then(|| (t.slot, self.em_px(&e.track, e.region, fit, layout)))
+            })
+            .collect()
+    }
+
+    /// The lines to rasterize for `strings` on a `target`-pixel target
+    /// with `layout`, as [`decision_text_requests`](Self::decision_text_requests)
+    /// makes them, without a decision state: for a worker. It allocates.
+    /// A skin that is not a decision skin gives none.
+    #[must_use]
+    pub fn decision_text_requests_for(
+        &self,
+        strings: &DecisionStrings,
+        target: [u32; 2],
+        layout: &Layout,
+    ) -> Vec<TextRequest> {
+        if self.kind != ScreenKind::Decision {
+            return Vec::new();
+        }
+        self.text_requests(&strings.chart(), target, layout)
+    }
+
+    /// The lines in bitmap fonts of `strings`, chosen and cleaned as
+    /// [`attach_decision_bitmap_text`](Self::attach_decision_bitmap_text)
+    /// lays them out, without a decision state: for a worker. It
+    /// allocates. A skin that is not a decision skin gives no slot.
+    #[must_use]
+    pub fn decision_bitmap_lines(&self, strings: &DecisionStrings) -> BitmapLines {
+        if self.kind != ScreenKind::Decision {
+            return BitmapLines::default();
+        }
+        BitmapLines::new(self.bitmap_lines(&strings.chart()))
+    }
+
     /// Attaches the rasterized lines for `dec`'s text elements; a slot in
     /// a bitmap font draws its bitmap line instead.
     ///
@@ -4474,6 +4525,46 @@ impl Skin {
             state: dec.state(),
             text: &dec.text,
             bitmap: &dec.bitmap,
+            chart: None,
+        };
+        let at = (frame.now, frame.target, frame.layout);
+        self.draw_screen(&rt, Phase::Decision, at, uvs, out);
+        Ok(())
+    }
+
+    /// Builds one decision frame of `dec` as
+    /// [`build_decision`](Self::build_decision) does, its lines drawn from
+    /// `labels`, borrowed from their owner, in place of `dec`'s own:
+    /// nothing is moved or copied. Allocates nothing.
+    ///
+    /// A state this skin did not make, labels whose tables are not one
+    /// line per text slot, or a uv table of another sheet or length, draws
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`BuildError::Kind`] for a skin that is not a decision skin;
+    /// nothing is appended.
+    pub fn build_decision_with(
+        &self,
+        dec: &mut DecisionScreen,
+        labels: DecisionLabels<'_>,
+        frame: &DecisionFrame<'_>,
+        uvs: &UvTable,
+        out: &mut QuadBatch,
+    ) -> Result<(), BuildError> {
+        let slots = self.text_slots();
+        let fits = labels.text.len() == slots && labels.bitmap.len() == slots;
+        if !self.screen_draws(ScreenKind::Decision, fits && self.owns_decision(dec), uvs)? {
+            return Ok(());
+        }
+        dec.fill(frame.now, &frame.timers, &self.whens);
+        let dec = &*dec;
+        let rt = Runtime {
+            starts: dec.starts(),
+            state: dec.state(),
+            text: labels.text,
+            bitmap: labels.bitmap.lines(),
             chart: None,
         };
         let at = (frame.now, frame.target, frame.layout);
