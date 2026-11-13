@@ -1374,6 +1374,10 @@ struct Shared {
     /// publication while a test holds it (tests).
     #[cfg(test)]
     takeover_gate: TestGate,
+    /// The game thread's looks for a takeover and the render thread's
+    /// drained frame loops (tests).
+    #[cfg(test)]
+    takeover_acks: Arc<TakeoverAcks>,
     /// The decision kind's refusal waits here before its notice is
     /// stored while a test holds it (tests).
     #[cfg(test)]
@@ -1471,6 +1475,8 @@ impl Shared {
             decision_gate: Arc::default(),
             #[cfg(test)]
             takeover_gate: TestGate::default(),
+            #[cfg(test)]
+            takeover_acks: Arc::default(),
             #[cfg(test)]
             notice_gate: TestGate::default(),
             #[cfg(test)]
@@ -3087,6 +3093,13 @@ impl RenderLink {
         Arc::clone(&self.shared.decision_gate)
     }
 
+    /// The game thread's looks for a takeover and the render thread's
+    /// drained frame loops (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn takeover_acks(&self) -> Arc<TakeoverAcks> {
+        Arc::clone(&self.shared.takeover_acks)
+    }
+
     /// The takeovers whose producer woke the game thread (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn takeovers_woken(&self) -> u64 {
@@ -4219,11 +4232,56 @@ impl RecoveryHandle {
 
 /// The active decision lifetime's takeover in `shared`, taken.
 fn take_takeover(shared: &Shared) -> Option<game::DecisionTakeover> {
-    shared
+    let mut slot = shared
         .decision_takeover
         .lock()
-        .unwrap_or_else(PoisonError::into_inner)
-        .take()
+        .unwrap_or_else(PoisonError::into_inner);
+    let taken = slot.take();
+    #[cfg(test)]
+    shared.takeover_acks.look(taken.is_some());
+    drop(slot);
+    taken
+}
+
+/// What a test reads to know a takeover was processed (tests): the game
+/// thread's looks for a takeover, each counted as it takes the slot's
+/// lock, and the render thread's frame loops that found no message
+/// waiting. The game's looks at a decision screen run one after another,
+/// each taking the slot once: a look counted after the one that took a
+/// takeover began once that look, and what it routed, had ended. A frame
+/// loop drained after that took every message the game sent before.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct TakeoverAcks {
+    /// The looks so far.
+    looks: AtomicU64,
+    /// The look that took the last takeover, counted from 1; 0 before any.
+    took: AtomicU64,
+    /// The frame loops that found no message waiting.
+    drained: AtomicU64,
+}
+
+#[cfg(test)]
+impl TakeoverAcks {
+    fn look(&self, took: bool) {
+        let n = self.looks.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        if took {
+            self.took.store(n, Ordering::Release);
+        }
+    }
+
+    /// Whether a takeover was taken and the game looked again since.
+    #[cfg(feature = "dev-tools")]
+    pub fn looked_after(&self) -> bool {
+        let took = self.took.load(Ordering::Acquire);
+        took != 0 && self.looks.load(Ordering::Acquire) > took
+    }
+
+    /// The frame loops so far that found no message waiting.
+    #[cfg(feature = "dev-tools")]
+    pub fn drained(&self) -> u64 {
+        self.drained.load(Ordering::Acquire)
+    }
 }
 
 fn ended(shared: &Shared) -> ScreenError {
@@ -5297,7 +5355,13 @@ impl Run {
                     });
                 }
                 Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => return,
-                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Empty) => {
+                    #[cfg(test)]
+                    self.shared
+                        .takeover_acks
+                        .drained
+                        .fetch_add(1, Ordering::AcqRel);
+                }
             }
             // The whole frames of a selection lifetime that ended, before
             // any frame of what follows: updates, rebuilds and resizes of

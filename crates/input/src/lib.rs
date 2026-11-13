@@ -80,6 +80,8 @@ pub use sources::{
     Arrival, ConfigError, DeviceKind, ReopenError, SOURCE_LIMIT, SourceConfig, SourceSet,
 };
 pub use time::{Percentile, QpcFrequency, WAKE_HISTOGRAM_LIMIT, WakeHistogram, qpc_to_us};
+#[cfg(all(windows, feature = "dev-tools"))]
+pub use win::ClockHold;
 #[cfg(windows)]
 pub use win::{
     ClockedThread, CollectionInfo, InputError, InputThread, QpcClock, Waker, controller_layouts,

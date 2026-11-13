@@ -218,7 +218,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
-      DEV_TOOLS: -p player -p game -p skin-beatoraja -p skin-model --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked
+      DEV_TOOLS: -p player -p game -p input -p skin-beatoraja -p skin-model --features player/dev-tools,game/dev-tools,input/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked
       PART: 1
       PARTS: 3
     defaults:
@@ -295,7 +295,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
-      DEV_TOOLS: -p player -p game -p skin-beatoraja -p skin-model --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked
+      DEV_TOOLS: -p player -p game -p input -p skin-beatoraja -p skin-model --features player/dev-tools,game/dev-tools,input/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked
       PART: 2
       PARTS: 3
     defaults:
@@ -313,7 +313,7 @@ jobs:
     env:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
-      DEV_TOOLS: -p player -p game -p skin-beatoraja -p skin-model --features player/dev-tools,game/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked
+      DEV_TOOLS: -p player -p game -p input -p skin-beatoraja -p skin-model --features player/dev-tools,game/dev-tools,input/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked
       PART: 3
       PARTS: 3
     defaults:
