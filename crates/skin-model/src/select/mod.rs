@@ -290,12 +290,6 @@ impl Selection {
         self.chart = table;
     }
 
-    /// The chart images set for it; `None` while not current.
-    #[must_use]
-    pub fn chart_images(&self) -> Option<&ChartTable> {
-        self.chart.as_ref()
-    }
-
     /// Sets the live key of the array its next frames draw from: the
     /// frame's renderer sets it before each build, from its own state.
     /// Allocates nothing.
@@ -317,12 +311,11 @@ impl Selection {
     /// resets them, so the player writes them after it and before the
     /// frame's callbacks. Allocates nothing.
     pub fn write_chart_fields(&mut self) {
-        let [stage, banner] = [ChartImage::Stage, ChartImage::Banner]
-            .map(|which| self.chart.is_some_and(|t| t.present(which)));
-        for (slot, v) in [
-            (field::SELECTED_STAGEFILE, stage),
-            (field::SELECTED_BANNER, banner),
+        for (slot, which) in [
+            (field::SELECTED_STAGEFILE, ChartImage::Stage),
+            (field::SELECTED_BANNER, ChartImage::Banner),
         ] {
+            let v = self.chart.is_some_and(|t| t.present(which));
             if let Some(f) = self.fields.get_mut(usize::from(slot)) {
                 *f = i32::from(v);
             }

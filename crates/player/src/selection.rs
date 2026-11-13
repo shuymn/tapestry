@@ -482,13 +482,12 @@ impl Selection {
     /// copied only when it changed.
     fn track_cursor(&mut self, images: CursorImages<'_>, now: TimeUs) {
         let chart = self.cursor_chart(images.side);
-        let same = match (chart, &self.rest.chart) {
-            (None, None) => true,
-            (Some((path, names, side)), Some(c)) => {
-                c.path == path && c.names == *names && c.side == side
-            }
-            _ => false,
-        };
+        let same = self
+            .rest
+            .chart
+            .as_ref()
+            .map(|c| (c.path.as_path(), &c.names, c.side))
+            == chart;
         if !same {
             let chart = chart.map(|(path, names, side)| CursorChart {
                 path: path.to_owned(),

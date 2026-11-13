@@ -2089,16 +2089,16 @@ impl Core {
     /// Publishes `set` for `cursor_generation` into the selection
     /// installation, unless that very publication is asked for and its
     /// answer, if any, is still current ([`PublicationKey::current`]: the
-    /// cursor generation and the live selection key); `false` when nothing
-    /// was sent: no selection installation to publish into (SX18: the last
+    /// cursor generation and the live selection key). Nothing is sent
+    /// without a selection installation to publish into (SX18: the last
     /// answer stays not current until a new installation's key, which is
-    /// then asked for again), or another publication unanswered.
+    /// then asked for again), or while another publication is unanswered.
     fn publish_selection_now(
         &mut self,
         publisher: &crate::render_side::ChartPublisher,
         cursor_generation: u64,
         set: Arc<ChartImages>,
-    ) -> bool {
+    ) {
         self.poll_answers();
         // Read after the answers: the render thread mirrors its targets
         // before it answers.
@@ -2111,11 +2111,11 @@ impl Core {
                     && p.ack.as_ref().is_none_or(|a| a.key.current(&now, None)))
         });
         if asked || now.selection.is_none() {
-            return asked;
+            return;
         }
         self.supersede_selection();
         if self.retiring.is_some() || self.play_pending() {
-            return false;
+            return;
         }
         #[cfg(test)]
         {
@@ -2130,7 +2130,6 @@ impl Core {
             rx,
             false,
         ));
-        true
     }
 
     /// Publishes `set` (absent when `None`) for the skin in use, unless
