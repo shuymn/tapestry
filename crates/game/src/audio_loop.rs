@@ -1327,6 +1327,25 @@ impl AudioControl {
         seq
     }
 
+    /// Stops every voice of every kind started before now, in every
+    /// generation, at the audio thread's next step, under one number: every
+    /// stop word rises to it, or to [`TERMINAL`] once the sequence is
+    /// exhausted, so it is never refused. Returns the number drawn.
+    pub fn system_stop_all(&self) -> Option<u64> {
+        let seq = self.system_seq();
+        for word in &self.shared.system_stops {
+            word.fetch_max(seq.unwrap_or(TERMINAL), Ordering::Release);
+        }
+        seq
+    }
+
+    /// Whether the audio thread has ended: nothing it was handed is
+    /// acknowledged any more.
+    #[must_use]
+    pub fn gone(&self) -> bool {
+        self.shared.gone.load(Ordering::Acquire)
+    }
+
     /// Queues `generation` to become the current system generation under
     /// a new number, and publishes the number: the audio thread applies it
     /// after every start numbered below it. The empty generation is queued
