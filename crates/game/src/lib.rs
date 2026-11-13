@@ -52,6 +52,7 @@ mod save;
 mod session;
 mod settings;
 mod sound;
+pub mod sound_sets;
 mod start_gate;
 mod tempo;
 mod tuning;
@@ -171,6 +172,7 @@ pub use settings::{
     save_settings, volume_key,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
+pub use sound_sets::SoundSettings;
 pub use tempo::{AttemptTempo, MAIN_HISTOGRAM_LIMIT, ReferenceError};
 pub use tuning::{
     Adjust, MAX_VOLUME_PERCENT, OFFSET_LIMIT_US, OFFSET_STEP_US, SPEED_KEYS, Tuning,
