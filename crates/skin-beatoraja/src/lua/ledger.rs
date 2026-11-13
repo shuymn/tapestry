@@ -170,11 +170,17 @@ impl Ledger {
     /// frame's budget counted from now ([`super::limits::RUNTIME_INSTRUCTIONS`],
     /// [`super::limits::RUNTIME_HOST_CALLS`], [`super::limits::RUNTIME_FRAME_TIME`]).
     pub(crate) fn begin_frame(&self) {
-        self.clear_fault();
         #[cfg(feature = "dev-tools")]
         let budget = super::vm_hooks::frame_time();
         #[cfg(not(feature = "dev-tools"))]
         let budget = super::limits::RUNTIME_FRAME_TIME;
+        self.begin_frame_within(budget);
+    }
+
+    /// [`begin_frame`](Self::begin_frame) with `budget` of time in place
+    /// of the frame time's.
+    pub(crate) fn begin_frame_within(&self, budget: Duration) {
+        self.clear_fault();
         self.frame.set(Some(Frame {
             start: self.counts(),
             deadline: Instant::now() + budget,
