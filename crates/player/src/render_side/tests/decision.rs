@@ -8,7 +8,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::time::Duration;
 
 use bms_model::{ChartBuilder, TimeSource, TimeUs};
@@ -135,6 +135,18 @@ enum Drew {
     },
 }
 
+/// Where a [`Recorder`]'s row plan meets the test ([`Seen::rows`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum RowsGate {
+    #[default]
+    Open,
+    /// The next row plan asked waits here for the test, then is refused.
+    Armed,
+    /// The render thread waits in its row plan until the test opens the
+    /// gate.
+    Held,
+}
+
 /// What the test sets and reads of the [`Recorder`]s a render thread
 /// builds, their devices numbered from 1.
 #[derive(Default)]
@@ -164,6 +176,12 @@ struct Seen {
     probe: AtomicBool,
     lit: Mutex<Vec<(u64, usize)>>,
     drew: Mutex<Vec<Drew>>,
+    /// Signaled, under `drew`'s lock, at each frame noted and each
+    /// removal.
+    moved: Condvar,
+    /// The row plan's meeting point, signaled through `rows_moved`.
+    rows: Mutex<RowsGate>,
+    rows_moved: Condvar,
 }
 
 impl Seen {
@@ -201,6 +219,39 @@ impl Seen {
 
     fn len(&self) -> usize {
         self.drew.lock().unwrap().len()
+    }
+
+    /// `frame` noted, the waiters told.
+    fn note(&self, frame: Drew) {
+        self.drew.lock().unwrap().push(frame);
+        self.moved.notify_all();
+    }
+
+    /// The frames once `done` holds (checked at each frame noted and each
+    /// removal), or after 60 s, the bound [`wait_until`]'s is.
+    fn wait_for(&self, done: impl Fn(&[Drew]) -> bool) -> MutexGuard<'_, Vec<Drew>> {
+        let drew = self.drew.lock().unwrap();
+        self.moved
+            .wait_timeout_while(drew, Duration::from_secs(60), |d| !done(d))
+            .unwrap()
+            .0
+    }
+
+    /// Waits until the render thread is held in its row plan; whether it
+    /// was within 60 s.
+    fn held_in_rows(&self) -> bool {
+        let gate = self.rows.lock().unwrap();
+        let (gate, _) = self
+            .rows_moved
+            .wait_timeout_while(gate, Duration::from_secs(60), |g| *g != RowsGate::Held)
+            .unwrap();
+        *gate == RowsGate::Held
+    }
+
+    /// Lets the row plan held go, refused.
+    fn open_rows(&self) {
+        *self.rows.lock().unwrap() = RowsGate::Open;
+        self.rows_moved.notify_all();
     }
 }
 
@@ -273,11 +324,28 @@ impl Screen for Recorder {
     }
     fn remove(&mut self, kind: ScreenKind) {
         if kind == ScreenKind::Decision {
+            let _drew = self.seen.drew.lock().unwrap();
             self.seen.removed.fetch_add(1, Ordering::AcqRel);
+            self.seen.moved.notify_all();
         }
         self.menu.remove(kind);
     }
     fn decision_rows(&self) -> Option<Result<render::RowPlan, RenderError>> {
+        let mut gate = self.seen.rows.lock().unwrap();
+        if *gate == RowsGate::Armed {
+            *gate = RowsGate::Held;
+            self.seen.rows_moved.notify_all();
+            // Bounded, so a test failing while it holds the gate never
+            // strands the render thread.
+            drop(
+                self.seen
+                    .rows_moved
+                    .wait_timeout_while(gate, Duration::from_secs(60), |g| *g == RowsGate::Held)
+                    .unwrap(),
+            );
+            return Some(Err(RenderError::LabelRegion { needed: 1, band: 0 }));
+        }
+        drop(gate);
         self.menu.decision_rows()
     }
     fn write_decision_labels(&mut self, store: &mut render::LabelStore) -> render::FillStep {
@@ -322,7 +390,7 @@ impl Screen for Recorder {
             self.menu.decision_fault(false);
         }
         self.menu.build_decision(dec, labels, frame)?;
-        self.seen.drew.lock().unwrap().push(Drew::Skin {
+        self.seen.note(Drew::Skin {
             device: self.device,
             now: frame.now,
             screen: frame.timers.screen,
@@ -373,7 +441,7 @@ impl Screen for Recorder {
             .lines
             .first()
             .map_or_else(String::new, |l| l.text.clone());
-        self.seen.drew.lock().unwrap().push(Drew::Page {
+        self.seen.note(Drew::Page {
             device: self.device,
             line,
             changed,
@@ -1161,6 +1229,47 @@ fn other_prep_refused_during_lifetime_keeps_drawing() {
     assert_eq!(rig.seen.pages(from, "page"), 0, "the skin cut short");
     rig.link.loading().show(one_line("loading"));
     assert!(wait_until(|| rig.seen.removed.load(Ordering::Acquire) == 1));
+    rig.link.exit();
+}
+
+/// R4.6: a refusal reaching the boundary after the lifetime ended, before
+/// the render took the next mode message: the skin still draws from its
+/// pinned slot, so the installation stays. The resize's row plan is held
+/// at its gate, then refused; while it is held the lifetime ends, the
+/// window goes back to the pinned target (applied from the next loop, so
+/// the slot keeps its content) and no mode message is sent. The first
+/// frame after the refusal draws the skin, with no removal and no
+/// takeover; the next mode message removes the installation.
+#[test]
+fn refusal_after_the_lifetime_ended_keeps_the_skin_until_the_next_mode() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    rig.drawing("a", "A");
+    *rig.seen.rows.lock().unwrap() = RowsGate::Armed;
+    rig.extent.publish(1_280, 720);
+    assert!(rig.seen.held_in_rows(), "the resize's rows never asked");
+    lock(&rig.book).end(5);
+    rig.extent.publish(TARGET[0], TARGET[1]);
+    let from = rig.seen.len();
+    rig.seen.open_rows();
+    let first = rig.seen.wait_for(|d| d.len() > from).get(from).cloned();
+    assert!(
+        matches!(first, Some(Drew::Skin { .. })),
+        "the first frame after the refusal: {first:?}"
+    );
+    assert_eq!(
+        rig.seen.removed.load(Ordering::Acquire),
+        0,
+        "the installation removed while the skin draws"
+    );
+    assert_eq!(rig.link.take_decision_takeover(), None);
+    assert!(rig.link.take_decision_refusal().is_some(), "no notice");
+    rig.link.loading().show(one_line("loading"));
+    drop(
+        rig.seen
+            .wait_for(|_| rig.seen.removed.load(Ordering::Acquire) > 0),
+    );
+    assert_eq!(rig.seen.removed.load(Ordering::Acquire), 1, "never removed");
     rig.link.exit();
 }
 
