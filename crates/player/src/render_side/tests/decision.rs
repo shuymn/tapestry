@@ -21,7 +21,7 @@ use skin_model::{
 use tempfile::TempDir;
 
 use super::super::{Extent, MakeScreen, RenderLink, Screen};
-use super::{one_line, preset_attempt, spawn_empty, wait_until};
+use super::{one_line, preset_attempt, spawn_empty_on, wait_until};
 use crate::decision_side::{
     Boundary, DecisionDrawn, DecisionSide, Rebuilt, ShownDecision, Want, decision_build,
     decision_frame_of, labels_revision, update_want,
@@ -176,6 +176,13 @@ struct Seen {
     removed: AtomicU32,
     /// The next skin frame's lit pixels in the title's box are noted.
     probe: AtomicBool,
+    /// A filling slot whose writes were all submitted is not settled
+    /// while set, as if their completion had not come.
+    hold_settle: AtomicBool,
+    /// The settlings `hold_settle` skipped.
+    skipped_settles: AtomicU32,
+    /// Each skin frame's time and its input and fade-out timers' starts.
+    timers: Mutex<Vec<FrameTimers>>,
     lit: Mutex<Vec<(u64, usize)>>,
     drew: Mutex<Vec<Drew>>,
     /// Signaled, under `drew`'s lock, at each frame noted and each
@@ -185,6 +192,9 @@ struct Seen {
     rows: Mutex<RowsGate>,
     rows_moved: Condvar,
 }
+
+/// A skin frame's time and its input and fade-out timers' starts.
+type FrameTimers = (TimeUs, Option<TimeUs>, Option<TimeUs>);
 
 impl Seen {
     fn skins(&self, from: usize) -> usize {
@@ -360,6 +370,12 @@ impl Screen for Recorder {
         if self.seen.refuse_settle.load(Ordering::Acquire) && store.filling().is_some() {
             return Err(RenderError::LabelRegion { needed: 1, band: 0 });
         }
+        if self.seen.hold_settle.load(Ordering::Acquire)
+            && store.progress().is_some_and(|p| p.complete)
+        {
+            self.seen.skipped_settles.fetch_add(1, Ordering::AcqRel);
+            return Ok(render::Settled::Pending);
+        }
         if self.seen.fail_settle.swap(false, Ordering::AcqRel) {
             self.menu.decision_fault(true);
         }
@@ -392,6 +408,11 @@ impl Screen for Recorder {
             self.menu.decision_fault(false);
         }
         self.menu.build_decision(dec, labels, frame)?;
+        self.seen.timers.lock().unwrap().push((
+            frame.now,
+            frame.timers.input,
+            frame.timers.fadeout,
+        ));
         self.seen.note(Drew::Skin {
             device: self.device,
             now: frame.now,
@@ -482,11 +503,35 @@ impl Rig {
     /// [`new`](Self::new) whose screens are made at `size`, as the
     /// production factory makes them at the window's first size.
     fn sized(dir: &TempDir, size: [u32; 2]) -> Self {
-        let turn = crate::warp_turn::take();
+        Self::at(dir, size, input::QpcClock::start())
+    }
+
+    /// [`new`](Self::new) on `clock`.
+    fn on(dir: &TempDir, clock: input::QpcClock) -> Self {
+        Self::at(dir, TARGET, clock)
+    }
+
+    /// [`sized`](Self::sized) on `clock`.
+    fn at(dir: &TempDir, size: [u32; 2], clock: input::QpcClock) -> Self {
+        let rig = Self::bare_at(crate::warp_turn::take(), size, clock);
         let bundle = {
             let probe = crate::render_common::offscreen(size[0], size[1]);
             decision_bundle_in(&probe, dir.path(), &default_font())
         };
+        let answer = rig.link.select(ScreenKind::Decision, Some(bundle)).wait();
+        assert_eq!(answer.unwrap(), Preparation::Ready);
+        rig
+    }
+
+    /// A render thread on [`Recorder`]s on `clock`, nothing committed,
+    /// holding `turn`, WARP's turn the caller took (before
+    /// `crate::imports::tests::serial` when it takes both).
+    fn bare(turn: crate::warp_turn::Turn, clock: input::QpcClock) -> Self {
+        Self::bare_at(turn, TARGET, clock)
+    }
+
+    /// [`bare`](Self::bare) whose screens are made at `size`.
+    fn bare_at(turn: crate::warp_turn::Turn, size: [u32; 2], clock: input::QpcClock) -> Self {
         let seen = Arc::new(Seen::default());
         let s = Arc::clone(&seen);
         let make: MakeScreen = Box::new(move || {
@@ -504,11 +549,9 @@ impl Rig {
                 seen: Arc::clone(&s),
             }) as Box<dyn Screen>)
         });
-        let link = spawn_empty(make);
+        let link = spawn_empty_on(make, clock);
         let extent = Arc::new(Extent::default());
         link.follow(&extent);
-        let answer = link.select(ScreenKind::Decision, Some(bundle)).wait();
-        assert_eq!(answer.unwrap(), Preparation::Ready);
         let book = link.label_book();
         Self {
             link,
@@ -1325,6 +1368,81 @@ fn ignored_takeover_keeps_the_run_notice() {
     rig.link.exit();
 }
 
+/// O6, O8: a refusal's notice is stored before its takeover is published
+/// and the game thread woken: held before the notice, the game thread is
+/// not woken and no takeover can be taken; once let go, the takeover it
+/// is woken for finds the notice.
+#[test]
+fn refusal_notice_stands_before_the_takeover_wakes_the_game() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    let woken = Arc::new(AtomicU32::new(0));
+    let w = Arc::clone(&woken);
+    rig.link.set_game_wake(Arc::new(move || {
+        w.fetch_add(1, Ordering::AcqRel);
+    }));
+    rig.drawing("a", "A");
+    let gate = &rig.link.shared.notice_gate;
+    gate.hold(true);
+    rig.seen.refuse_frame.store(true, Ordering::Release);
+    assert!(wait_until(|| gate.waiting()));
+    assert_eq!(woken.load(Ordering::Acquire), 0, "woken before the notice");
+    assert_eq!(rig.link.take_decision_takeover(), None);
+    gate.hold(false);
+    assert!(wait_until(|| woken.load(Ordering::Acquire) == 1));
+    let t = rig.link.take_decision_takeover().expect("a takeover");
+    assert_eq!(t.lifetime, game::DecisionLifetime(5));
+    assert!(rig.link.take_decision_refusal().is_some(), "the notice");
+    rig.link.exit();
+}
+
+/// O6, O8: a label restore refused on the screen built again stores its
+/// notice before its takeover is published and the game thread woken.
+#[test]
+fn restore_refusal_notice_stands_before_the_takeover() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    let woken = Arc::new(AtomicU32::new(0));
+    let w = Arc::clone(&woken);
+    rig.link.set_game_wake(Arc::new(move || {
+        w.fetch_add(1, Ordering::AcqRel);
+    }));
+    rig.drawing("a", "A");
+    let gate = &rig.link.shared.notice_gate;
+    gate.hold(true);
+    *rig.seen.rows.lock().unwrap() = RowsGate::Armed;
+    // The rebuild asks from the test thread; a helper meets the render
+    // thread at the rows and then at the notice, and notes what it finds
+    // there before letting it go.
+    let seen = Arc::clone(&rig.seen);
+    let shared = Arc::clone(&rig.link.shared);
+    let w = Arc::clone(&woken);
+    let helper = std::thread::spawn(move || {
+        assert!(seen.held_in_rows(), "the rebuild's rows never asked");
+        seen.open_rows();
+        let gate = &shared.notice_gate;
+        assert!(wait_until(|| gate.waiting()), "no refusal's notice");
+        let at_notice = (
+            w.load(Ordering::Acquire),
+            shared.decision_takeover.lock().unwrap().is_some(),
+        );
+        gate.hold(false);
+        at_notice
+    });
+    rig.rebuild().unwrap();
+    let (woken_at_notice, takeover_at_notice) = helper.join().unwrap();
+    assert_eq!(woken_at_notice, 0, "woken before the notice");
+    assert!(
+        !takeover_at_notice,
+        "the takeover published before the notice"
+    );
+    assert!(wait_until(|| woken.load(Ordering::Acquire) == 1));
+    let t = rig.link.take_decision_takeover().expect("a takeover");
+    assert_eq!(t.lifetime, game::DecisionLifetime(5));
+    assert!(rig.link.take_decision_refusal().is_some(), "the notice");
+    rig.link.exit();
+}
+
 /// O6: the skin's frame refused for the active lifetime is a takeover,
 /// and the game thread is woken for it; the page draws from then on.
 #[test]
@@ -2066,3 +2184,6 @@ fn recover_refusal_stands_when_the_result_restore_fails() {
     assert!(!ready(&lock(&rig.book), "b", "B"), "the kind not disabled");
     rig.link.exit();
 }
+
+// The decision skin through the player's flow.
+mod flow;

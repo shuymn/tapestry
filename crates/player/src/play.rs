@@ -403,6 +403,12 @@ pub struct PlayerRig<'a> {
     /// When the accepted leaving command's outro began (the view pinned),
     /// while the lifetime is current: no view's layout is asked for.
     pub result_outro: Option<TimeUs>,
+    /// The decision screen the choice claimed, from its presentation's
+    /// choice ([`game::AppRig::decision_shown`]) to its entry, and its
+    /// lifetime until it ends: what the render thread is told to draw
+    /// (its choice set at the entry), and the lifetime the label book is
+    /// told has ended.
+    pub decision_claim: Option<crate::decision_side::ShownDecision>,
     /// Development builds: G2's start (the S10-09i design's §8.1), when
     /// the attempt's `commit_ready` returned, and what its result step
     /// did, until the opening prints it.
@@ -413,6 +419,9 @@ pub struct PlayerRig<'a> {
     /// looks again.
     #[cfg(test)]
     pub relooked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Tests: set by the idle wait right before it parks.
+    #[cfg(test)]
+    pub park_probe: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Tests: the audio output reads as lost while set, from any thread.
     #[cfg(all(test, feature = "dev-tools"))]
     pub audio_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1792,6 +1801,9 @@ impl Rig for PlayerRig<'_> {
     fn idle_wait(&mut self, deadline: TimeUs) {
         let left = deadline.0 - self.clock.now().0;
         if left > 0 {
+            #[cfg(test)]
+            self.park_probe
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             thread::park_timeout(Duration::from_micros(left.unsigned_abs()));
         }
         // A switch's layout lands when its job is done: the job wakes this
