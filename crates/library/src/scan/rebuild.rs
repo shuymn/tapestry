@@ -738,6 +738,7 @@ impl Scanner<'_> {
                 record,
                 &verified,
                 &re.evaluation,
+                &loaded,
                 &preset,
             ))
         }));

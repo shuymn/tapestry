@@ -20,6 +20,12 @@ pub enum RatioSource {
     /// The selected chart's best EX score over the largest its summary
     /// allows; none without both or with a largest of 0.
     ExRate,
+    /// The selected chart's best EX play's judgments of one kind,
+    /// PERFECT (0) to POOR (4), over its own notes; none without one.
+    JudgeRate(u8),
+    /// The selected chart's best max combo over its summary's notes, a
+    /// chart that draws included; none without a summary.
+    ComboRate,
     /// The master gain that plays, exactly
     /// ([`MasterVolume::ratio`](crate::MasterVolume::ratio)); none before
     /// the settings.
@@ -56,7 +62,12 @@ impl RatioSource {
                 field::TIME_PROGRESS_PPM,
                 u64::from(crate::play::schema::PROGRESS_FULL.unsigned_abs()),
             )),
-            Self::ListPosition | Self::ExRate | Self::MasterVolume | Self::Score(_) => None,
+            Self::ListPosition
+            | Self::ExRate
+            | Self::JudgeRate(_)
+            | Self::ComboRate
+            | Self::MasterVolume
+            | Self::Score(_) => None,
         }
     }
 }

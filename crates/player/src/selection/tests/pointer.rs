@@ -23,7 +23,8 @@ use crate::render_side::tests::{Installers, wait_until};
 use crate::select::{MenuInput, MenuKey, MenuQueue};
 
 use Dispatched::{Drag, Input, Notch, Press};
-use PointerAct::{Key, MoveTo, Nothing, Rows};
+use PointerAct::{Cover, Key, MoveTo, Nothing, Rows};
+use game::CoverKind;
 
 /// The window's side: its capture of the mouse, the pointer's shared state
 /// and the menu queue it admits presses and notches into.
@@ -174,12 +175,24 @@ fn shown() -> skin_model::SelectionSettings {
 ///
 /// [`pointer_fixture`]: crate::selection_skin::pointer_fixture
 fn on_pointer<R>(
-    mut sel: Selection,
+    sel: Selection,
     volume: bool,
     panels: Option<input::PanelLevel>,
     f: impl FnOnce(&mut PlayerRig<'_>, &mut Window, &Installers) -> R,
 ) -> R {
     let dir = crate::selection_skin::pointer_fixture(volume);
+    on_pointer_from(&dir, sel, panels, false, f)
+}
+
+/// [`on_pointer`] on the skin in `dir`, the rig's adjustments' driver
+/// kept when `driver` (otherwise none, as before the first play's).
+fn on_pointer_from<R>(
+    dir: &tempfile::TempDir,
+    mut sel: Selection,
+    panels: Option<input::PanelLevel>,
+    driver: bool,
+    f: impl FnOnce(&mut PlayerRig<'_>, &mut Window, &Installers) -> R,
+) -> R {
     let limits = skin_model::AtlasLimits {
         max_side: 4_096,
         max_layers: 16,
@@ -212,7 +225,9 @@ fn on_pointer<R>(
         player: game::PlayerSettings::default(),
     };
     let (out, _) = crate::tests::on_rig_with(settings, render, |rig, _| {
-        rig.adjust = None;
+        if !driver {
+            rig.adjust = None;
+        }
         if let Some(level) = panels {
             rig.panels = Some(level);
         }
@@ -942,21 +957,26 @@ fn the_search_text_takes_focus_and_a_press_outside_takes_it_away() {
     });
 }
 
-/// P13: under panel 3 only the order button acts: a press on a row, on
-/// event 15, on empty space (right) or in search text 30, a notch and a
-/// drag on the list slider do nothing; event 331 and slider 17 take the
-/// press over the row under them and change nothing; the hover image still
-/// draws under the pointer. With the search box focused, SELECT held opens
+/// P13 and K4: under panel 3 only the order button and the cover switches
+/// act: a press on a row, on event 15, on empty space (right) or in search
+/// text 30, a notch and a drag on the list slider do nothing; event 331
+/// turns LIFT over on the chart under the cursor without moving to the row
+/// under it; slider 17 takes the press over the row under it and changes
+/// nothing; the hover image still draws under the pointer. With the search box focused, SELECT held opens
 /// no panel (design.md "Input"): a press on empty space acts as without
 /// one, taking the focus away, and the panel opens with it.
 #[test]
-fn under_a_panel_only_the_order_button_acts() {
+fn under_a_panel_only_the_order_button_and_the_covers_act() {
     let dir = tempfile::tempdir().unwrap();
     let (sel, _) = charts(dir.path(), 4);
     let (mut set, level) = panel_keys();
     on_pointer(sel, true, Some(level), |rig, w, screens| {
         let c = rig.controls;
         let searching = |rig: &PlayerRig<'_>| sel_of(rig).screen.searching();
+        // The cursor on chart c1.
+        w.key(MenuKey::Down);
+        act(rig, screens);
+        log(rig);
         // The box focused, then SELECT held: no panel while it has focus.
         w.key(MenuKey::Tab);
         act(rig, screens);
@@ -966,11 +986,11 @@ fn under_a_panel_only_the_order_button_acts() {
         assert_eq!(sel_of(rig).feed.panel(), None);
         w.click(c, EMPTY, Button::Left);
         act(rig, screens);
-        assert_eq!(log(rig), [(Press(Nothing), 0)]);
+        assert_eq!(log(rig), [(Press(Nothing), 1)]);
         assert!(!searching(rig));
         // The focus gone, panel 3 shows.
         assert!(sel_of(rig).feed.panel().is_some());
-        w.click(c, row(0, 2), Button::Left);
+        w.click(c, row(1, 3), Button::Left);
         w.click(c, PLAY, Button::Left);
         w.click(c, EMPTY, Button::Right);
         w.click(c, SEARCH, Button::Left);
@@ -979,11 +999,11 @@ fn under_a_panel_only_the_order_button_acts() {
         assert_eq!(
             log(rig),
             [
-                (Press(Nothing), 0),
-                (Press(Nothing), 0),
-                (Press(Nothing), 0),
-                (Press(Nothing), 0),
-                (Notch(Nothing), 0),
+                (Press(Nothing), 1),
+                (Press(Nothing), 1),
+                (Press(Nothing), 1),
+                (Press(Nothing), 1),
+                (Notch(Nothing), 1),
             ]
         );
         assert!(!searching(rig));
@@ -993,19 +1013,19 @@ fn under_a_panel_only_the_order_button_acts() {
         w.to(c, list_slider(1_000));
         dragged(rig, screens);
         w.up(c, Button::Left);
-        assert_eq!(log(rig), [(Press(Nothing), 0), (Drag(Nothing), 0)]);
+        assert_eq!(log(rig), [(Press(Nothing), 1), (Drag(Nothing), 1)]);
         // The order steps.
         w.click(c, ORDER, Button::Left);
         act(rig, screens);
-        assert_eq!(log(rig), [(Press(Key(MenuKey::Right)), 0)]);
+        assert_eq!(log(rig), [(Press(Key(MenuKey::Right)), 1)]);
         assert_eq!(sel_of(rig).screen.order(), 1);
-        // 331 over row 1: taken, no toggle, no move.
+        // 331 over row 2: LIFT on, no move.
         w.click(c, COVER_ON_ROW, Button::Left);
         act(rig, screens);
-        assert_eq!(log(rig), [(Press(Nothing), 0)]);
+        assert_eq!(log(rig), [(Press(Cover(CoverKind::Lift)), 1)]);
         assert_eq!(
             sel_of(rig).feed.settings.map(|s| s.covers_on),
-            Some([false; 3])
+            Some([false, true, false])
         );
         // Slider 17 over row 2 dragged to 0.3.
         w.down(c, volume_at(500), Button::Left);
@@ -1013,7 +1033,7 @@ fn under_a_panel_only_the_order_button_acts() {
         w.to(c, volume_at(300));
         dragged(rig, screens);
         w.up(c, Button::Left);
-        assert_eq!(log(rig), [(Press(Nothing), 0), (Drag(Nothing), 0)]);
+        assert_eq!(log(rig), [(Press(Nothing), 1), (Drag(Nothing), 1)]);
         assert_eq!(rig.controls.tuning().volume(), GAIN);
         // The hover image draws under the pointer, and not away from it.
         w.to(c, HOVER);
@@ -1816,5 +1836,171 @@ fn a_focus_loss_drops_an_answered_press_and_a_queued_notch() {
         w.wheel(c, 1);
         act(rig, screens);
         assert_eq!(log(rig), [(Press(MoveTo(2)), 2), (Notch(Rows(1)), 3)]);
+    });
+}
+
+/// Event 330's point.
+const SUDDEN: [i32; 2] = [150, 525];
+/// Event 332's point.
+const HIDDEN: [i32; 2] = [150, 625];
+
+/// The play options `player.toml` holds now: the defaults while it does
+/// not exist.
+fn player_toml(rig: &PlayerRig<'_>) -> game::PlayerSettings {
+    let path = rig.files.root().player_settings();
+    if path.exists() {
+        game::load_settings(&path).unwrap()
+    } else {
+        game::PlayerSettings::default()
+    }
+}
+
+/// The covers' switches `settings` holds.
+fn switches(settings: &game::PlayerSettings) -> [bool; 3] {
+    let c = settings.options().unwrap().covers();
+    [c.sudden.on, c.lift.on, c.hidden.on]
+}
+
+/// The settings the last update sent to the render thread carry.
+fn sent(screens: &Installers) -> Option<[bool; 3]> {
+    let updates = screens.updates.lock().unwrap();
+    updates.last().and_then(|u| u.settings).map(|s| s.covers_on)
+}
+
+/// K1: with the driver, event 330 turns SUDDEN+ on whatever the row, a
+/// folder's here as the source's: the next update shows it, the driver
+/// holds it for the next play, and `player.toml` gets it at the next
+/// settings write, not at once (the real play's end is
+/// `a_cover_turned_after_a_cancelled_load_reaches_the_next_play`). 332
+/// twice on a chart row turns HIDDEN+ on and off again.
+#[test]
+fn a_cover_switch_turns_on_any_row_and_is_written_later() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = tree(dir.path(), &[&["f/s/x.bms", "a.bms"]]);
+    let skin = crate::selection_skin::pointer_fixture(true);
+    on_pointer_from(&skin, sel, None, true, |rig, w, screens| {
+        let c = rig.controls;
+        let held = |rig: &PlayerRig<'_>| {
+            let c = rig.adjust.as_ref().unwrap().options().covers();
+            [c.sudden.on, c.lift.on, c.hidden.on]
+        };
+        // Folder f under the cursor.
+        w.key(MenuKey::Down);
+        act(rig, screens);
+        log(rig);
+        assert_eq!(sel_of(rig).screen.row_kind_at(1), Some(RowRefKind::Folder));
+        w.click(c, SUDDEN, Button::Left);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(Cover(CoverKind::Sudden)), 1)]);
+        assert_eq!(held(rig), [true, false, false]);
+        assert_eq!(sent(screens), Some([true, false, false]));
+        // Chart a under the cursor.
+        w.key(MenuKey::Down);
+        act(rig, screens);
+        log(rig);
+        w.click(c, HIDDEN, Button::Left);
+        w.click(c, HIDDEN, Button::Left);
+        act(rig, screens);
+        assert_eq!(
+            log(rig),
+            [
+                (Press(Cover(CoverKind::Hidden)), 2),
+                (Press(Cover(CoverKind::Hidden)), 2)
+            ]
+        );
+        assert_eq!(held(rig), [true, false, false]);
+        // Not written yet; written at the next settings write.
+        assert_eq!(switches(&player_toml(rig)), [false; 3]);
+        rig.persist();
+        assert_eq!(switches(&player_toml(rig)), [true, false, false]);
+    });
+}
+
+/// K5: with no driver (none was made yet), event 332 on a chart row turns
+/// HIDDEN+ on in the options `player.toml` is to hold, shown at once and
+/// written at the next settings write.
+#[test]
+fn a_cover_switch_with_no_driver_reaches_the_files() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 2);
+    on_pointer(sel, true, None, |rig, w, screens| {
+        let c = rig.controls;
+        w.key(MenuKey::Down);
+        act(rig, screens);
+        log(rig);
+        w.click(c, HIDDEN, Button::Left);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(Cover(CoverKind::Hidden)), 1)]);
+        let o = rig.files.play_options().unwrap().covers();
+        assert_eq!([o.sudden.on, o.lift.on, o.hidden.on], [false, false, true]);
+        assert_eq!(sent(screens), Some([false, false, true]));
+        assert_eq!(switches(&player_toml(rig)), [false; 3]);
+        rig.persist();
+        assert_eq!(switches(&player_toml(rig)), [false, false, true]);
+    });
+}
+
+/// K6: a preset step after a switch the driver holds writes `player.toml`
+/// with the new preset and the switch.
+#[test]
+fn a_preset_step_writes_the_switch_the_driver_holds() {
+    use game::AppRig as _;
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 2);
+    let presets = dir.path().join("presets");
+    std::fs::create_dir_all(&presets).unwrap();
+    let skin = crate::selection_skin::pointer_fixture(true);
+    on_pointer_from(&skin, sel, None, true, |rig, w, screens| {
+        let c = rig.controls;
+        let before = rig.files.preset().to_owned();
+        let mut shelf = game::Shelf::open(presets, &before).unwrap();
+        w.key(MenuKey::Down);
+        act(rig, screens);
+        log(rig);
+        w.click(c, COVER_ON_ROW, Button::Left);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(Cover(CoverKind::Lift)), 1)]);
+        assert_eq!(switches(&player_toml(rig)), [false; 3]);
+        shelf.step(game::PresetStep::Next);
+        rig.presets_changed(Ok(&shelf));
+        assert!(rig.files.root().player_settings().exists());
+        let written = player_toml(rig);
+        assert_ne!(written.preset, before);
+        assert_eq!(written.preset, shelf.chosen_name());
+        assert_eq!(switches(&written), [false, true, false]);
+    });
+}
+
+/// P2: a slot whose bar image 0's file is missing draws nothing and takes
+/// no click, and a folder row whose image 1's file is missing draws its
+/// title with no bar and takes no click; a chart row beside it moves.
+#[test]
+fn a_slot_or_row_without_its_bar_takes_no_click() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = tree(dir.path(), &[&["f/s/x.bms", "g/s/y.bms", "a.bms"]]);
+    let skin = crate::selection_skin::pointer_fixture_with(true, true);
+    on_pointer_from(&skin, sel, None, false, |rig, w, screens| {
+        let c = rig.controls;
+        // All charts, folders f and g, chart a; the cursor on chart a,
+        // drawn at slot 3: slot 1 holds folder f, slot 2 folder g.
+        for _ in 0..3 {
+            w.key(MenuKey::Down);
+        }
+        act(rig, screens);
+        log(rig);
+        assert_eq!(cursor(rig), 3);
+        assert_eq!(sel_of(rig).screen.row_kind_at(2), Some(RowRefKind::Folder));
+        // Slot 1, hidden; slot 2, folder g without its bar.
+        w.click(c, slot(1), Button::Left);
+        w.click(c, slot(2), Button::Left);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(Nothing), 3), (Press(Nothing), 3)]);
+        let rects = last_rects(screens);
+        assert!(!rects.contains(&[1_000.0, 200.0, 800.0, 80.0]), "{rects:?}");
+        assert!(!rects.contains(&[1_000.0, 300.0, 800.0, 80.0]), "{rects:?}");
+        // Slot 0, the "all charts" row with its bar: moved to.
+        w.click(c, slot(0), Button::Left);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(MoveTo(0)), 0)]);
     });
 }

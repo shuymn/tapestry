@@ -30,6 +30,12 @@ pub struct ResultParts {
     pub timing_areas: [[i16; 2]; 5],
 }
 
+/// A best value as the model shows it: hidden when there is none,
+/// otherwise at most `i32`'s bounds.
+fn number(v: Option<i64>) -> ResultNumber {
+    v.map_or(ResultNumber::Hidden, |v| ResultNumber::Shown(saturated(v)))
+}
+
 /// The parts of `summary`, a view under `preset`, of the result whose
 /// views share `basis` ([`game::ResultScreen::basis`]). A best not yet
 /// read is unavailable; a best that is not known (no library, a failed
@@ -68,13 +74,11 @@ pub fn result_parts(
             Some(BestCompare::Known(b)) => BestView::Known(BestFigures {
                 ex: b.ex,
                 ex_diff: saturated(b.ex_diff),
-                bp: b.bp.map_or(ResultNumber::Hidden, |v| {
-                    ResultNumber::Shown(saturated(i64::from(v)))
-                }),
-                bp_diff: b
-                    .bp_diff
-                    .map_or(ResultNumber::Hidden, |v| ResultNumber::Shown(saturated(v))),
+                bp: number(b.bp.map(i64::from)),
+                bp_diff: number(b.bp_diff),
                 clear: lamp_key(b.clear, preset),
+                max_combo: number(b.max_combo.map(i64::from)),
+                max_combo_diff: number(b.max_combo_diff),
                 ex_updated: b.ex_updated,
                 bp_updated: b.bp_updated,
                 rate: b.rate.map(|r| BestRate {
@@ -257,6 +261,8 @@ mod tests {
             bp: None,
             bp_diff: None,
             clear: None,
+            max_combo: None,
+            max_combo_diff: None,
             ex_updated: true,
             bp_updated: true,
             rate: Some(BestRate {
@@ -290,11 +296,17 @@ mod tests {
             (ResultNumber::Hidden, ResultNumber::Hidden)
         );
         assert_eq!(b.clear, LampKey::NoPlay);
+        assert_eq!(
+            (b.max_combo, b.max_combo_diff),
+            (ResultNumber::Hidden, ResultNumber::Hidden)
+        );
         assert!(b.ex_updated && b.bp_updated && b.rate.unwrap().updated);
         let shown = BestFigures {
             bp: Some(12),
             bp_diff: Some(-3),
             clear: Some(BestLamp::FullCombo),
+            max_combo: Some(100),
+            max_combo_diff: Some(20),
             ..known
         };
         let BestView::Known(b) =
@@ -307,6 +319,10 @@ mod tests {
             (ResultNumber::Shown(12), ResultNumber::Shown(-3))
         );
         assert_eq!(b.clear, LampKey::FullCombo);
+        assert_eq!(
+            (b.max_combo, b.max_combo_diff),
+            (ResultNumber::Shown(100), ResultNumber::Shown(20))
+        );
         let t = parts.timing.unwrap();
         assert_eq!((t.samples, t.mean_x100, t.sd_x100), (4, -75, 12));
         let lines = parts.timelines.unwrap();

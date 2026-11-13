@@ -38,8 +38,8 @@
 use bms_model::{Speed, TimeUs};
 
 use crate::hispeed::{
-    CoverKind, GREEN_TARGETS, MAX_COVER, PlayOptions, Ratio, References, SpeedMode,
-    Unrepresentable, solve, step_hispeed,
+    CoverKind, GREEN_TARGETS, MAX_COVER, PlayOptions, PlayOptionsError, Ratio, References,
+    SpeedMode, Unrepresentable, solve, step_hispeed,
 };
 use crate::tuning::OFFSET_LIMIT_US;
 
@@ -727,6 +727,20 @@ impl Adjustment {
             epoch: self.epoch,
             scratch: self.scratch,
         }
+    }
+
+    /// Turns the cover `kind` on or off from outside the controls (the
+    /// select screen's skin, between attempts, design.md "Play
+    /// Adjustments"). The amount, `H` and the rest stay; Floating solves at
+    /// the next attachment. Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// What [`PlayOptions::set_covers`] refuses; nothing changes then.
+    pub fn set_cover_on(&mut self, kind: CoverKind, on: bool) -> Result<(), PlayOptionsError> {
+        let mut covers = self.options.covers();
+        covers.get_mut(kind).on = on;
+        self.options.set_covers(covers)
     }
 
     /// The scratch directions the next snapshot publishes.

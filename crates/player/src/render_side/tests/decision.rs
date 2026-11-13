@@ -85,6 +85,8 @@ fn view_on(chart: &str, title: &str) -> SelectionView {
             max_ex: None,
             score: RowScore::Unplayed,
             judge_class: None,
+            clears: 0,
+            best: None,
         }),
         ..SelectionView::default()
     }

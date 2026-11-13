@@ -44,8 +44,12 @@
 //! - `meta(id = 1, replay_format, canonical, evaluator, loader, bests,
 //!   requested, completed)`: the interpretation the bests were derived under
 //!   ([`Tuple`]), and the catch-up counters.
-//! - `scores(preset_sha256, ln_mode, chart_sha256, plays, best_ex, best_bp,
-//!   cleared, full_combo)`: one [`Score`] per [`Key`].
+//! - `scores(preset_sha256, ln_mode, chart_sha256, plays, clears, best_ex,
+//!   best_bp, best_combo, cleared, full_combo, play_sha256, play)`: one
+//!   [`Score`] per [`Key`], the best play's [`Breakdown`] in `play`
+//!   ([`BREAKDOWN_BYTES`]). Its layout belongs to [`BESTS_VERSION`], not to
+//!   the schema version: opening a database of another bests tuple creates
+//!   the table again, unread, so a change of its columns scans no chart.
 //! - `counted(path, body_sha256, size, mtime_ns)`: each play counted
 //!   ([`PlayId`]).
 //! - `refused(path, size, mtime_ns, reason, waits_for)`: records refused for
@@ -108,8 +112,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use rusqlite::Connection;
 
 pub use bests::{
-    BESTS_VERSION, Best, Contribution, Ineligible, Ingested, Key, LN_MODE, PlayId, Score, Verified,
-    counts_for_best, ineligible,
+    BESTS_VERSION, BREAKDOWN_BYTES, Best, Breakdown, Contribution, Ineligible, Ingested, Key,
+    LN_MODE, PlayId, Score, Verified, counts_for_best, ineligible,
 };
 pub use bms_model::ChartSummary;
 pub use bms_parser::{ChartMode, Header};

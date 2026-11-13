@@ -165,6 +165,14 @@ pub trait Screen: Send {
     /// Drops what a preparation staged and was not committed. The default
     /// has nothing to drop.
     fn discard(&mut self) {}
+    /// Drops the staging `token` names, if the screen still holds it, and
+    /// nothing else: a staging of another kind or request made since
+    /// stays. The default drops what is staged ([`discard`](Self::discard)),
+    /// for a screen that keeps no tokens.
+    fn discard_token(&mut self, token: PreparedToken) {
+        let _ = token;
+        self.discard();
+    }
     /// Publishes the chart's images into `target`
     /// ([`render::Renderer::publish_chart_images`]). The default draws no
     /// declarative skin, so it has no chart layer.
@@ -666,8 +674,32 @@ pub trait Screen: Send {
         let _ = (update, frame);
         self.menu(page, changed).map(Ok)
     }
+    /// [`loading`](Self::loading) drawn from the play staging `token`
+    /// names, before its commit (design.md "beatoraja Lua Skins", the
+    /// pending presentation). The default draws as `loading`.
+    ///
+    /// # Errors
+    ///
+    /// As [`loading`](Self::loading).
+    fn loading_staged(
+        &mut self,
+        page: &MenuPage,
+        update: Option<&LoadingUpdate>,
+        changed: bool,
+        frame: &LoadingFrame<'_>,
+        token: PreparedToken,
+    ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
+        let _ = token;
+        self.loading(page, update, changed, frame)
+    }
+    /// The play staging the screen holds, if any: what a staged loading
+    /// frame may draw. None by default.
+    fn staged_token(&self) -> Option<PreparedToken> {
+        None
+    }
     /// Draws the play screen's loading state while play's skin is pending
-    /// and no specialization of it was committed in the loading lifetime:
+    /// and no specialization of it is staged for or committed in the
+    /// loading lifetime:
     /// a cleared canvas with `page`, the load's lines, where
     /// [`loading`](Self::loading) puts them, laid out again when `changed`.
     /// No skin's frame is drawn. The default draws the lines as a menu
@@ -928,6 +960,10 @@ pub enum RenderMsg {
     PrepareAttempt {
         /// The request's number.
         request: u64,
+        /// The loading lifetime current when the request was published,
+        /// none for a retry or a round: its staging draws that lifetime's
+        /// loading frames only.
+        lifetime: Option<u64>,
         /// The attempt, owned.
         attempt: Box<AttemptContext>,
         /// The play skin it is prepared with.
@@ -1291,6 +1327,10 @@ struct Shared {
     /// [`hook_bound`] (tests).
     #[cfg(test)]
     hold_declaration: AtomicBool,
+    /// While set, the render thread waits before it takes an attempt's
+    /// request, at most [`hook_bound`] (tests).
+    #[cfg(test)]
+    hold_receipt: AtomicBool,
     #[cfg(test)]
     declaration_held: AtomicBool,
     /// Set when a held declaration let go at [`hook_bound`] instead of
@@ -1406,6 +1446,8 @@ impl Shared {
             #[cfg(test)]
             hold_declaration: AtomicBool::new(false),
             #[cfg(test)]
+            hold_receipt: AtomicBool::new(false),
+            #[cfg(test)]
             declaration_held: AtomicBool::new(false),
             #[cfg(test)]
             declaration_expired: AtomicBool::new(false),
@@ -1445,11 +1487,12 @@ impl Shared {
     /// play skin declaring the loading time `loadend`: the first of its
     /// lifetime is acknowledged at the clock's `now()`, tagged with the
     /// lifetime it was drawn for; a later one of the same lifetime changes
-    /// only the declared time. Allocates nothing.
+    /// only the declared time (`None`: the frame drew no skin, and declares
+    /// nothing, [`LoadingAck::declare`]). Allocates nothing.
     fn presented_loading(
         &self,
         lifetime: u64,
-        loadend: Option<TimeUs>,
+        loadend: Option<Option<TimeUs>>,
         now: impl FnOnce() -> TimeUs,
     ) {
         #[cfg(test)]
@@ -1473,7 +1516,7 @@ impl Shared {
                 .loading_ack
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            ack.loadend = loadend;
+            ack.declare(lifetime, loadend);
             if ack.first.is_none_or(|(l, _)| l != lifetime) {
                 ack.first = Some((lifetime, now()));
             }
@@ -1482,14 +1525,26 @@ impl Shared {
         self.loading_acked.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// A specialization committed in the current loading lifetime declares
-    /// the loading time `loadend`: the declaration from now on, before any
-    /// frame draws with it. Allocates nothing.
-    fn committed_loading(&self, loadend: Option<TimeUs>) {
+    /// A specialization committed in loading lifetime `lifetime`, the
+    /// current one, declares the loading time `loadend`: the declaration
+    /// from now on, before any frame draws with it. Allocates nothing.
+    fn committed_loading(&self, lifetime: u64, loadend: Option<TimeUs>) {
         self.loading_ack
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .loadend = loadend;
+            .declare(lifetime, Some(loadend));
+    }
+
+    /// The loading lifetime current, if one is begun (a held one
+    /// included): its producer's state is the slot's lifetime's. Takes the
+    /// producer's lock, then the slot's, as every lifetime change does.
+    fn current_lifetime(&self) -> Option<u64> {
+        let producer = self.producer();
+        let current = self.loading_slot().lifetime;
+        producer
+            .as_ref()
+            .filter(|s| s.lifetime() == current)
+            .map(LifetimeState::lifetime)
     }
 
     /// The skin refused a loading frame of lifetime `lifetime` for `why`:
@@ -1622,17 +1677,35 @@ impl TestGate {
 
 /// The render thread's acknowledgement of the loading state's frames: the
 /// latest lifetime whose first frame was presented, with when, and the
-/// play skin's declared loading time ([`skin_model::Skin::loadend`]) as
-/// the last presented loading frame drew with it, or as a specialization
-/// committed since in the current lifetime declares it: the installed
-/// skin's, or none while a pending skin has no specialization committed
-/// in the lifetime. With them, the latest lifetime whose loading frame the
-/// skin refused, and why.
+/// play skin's declared loading time ([`skin_model::Skin::loadend`]), the
+/// skin drawn's latest declaration in the lifetime `loadend_of` (design.md
+/// "Play Lifecycle", the minimum): what the last presented loading frame
+/// drawing a skin drew with, or what a specialization committed since
+/// declares; a frame of the pending presentation changes nothing, and
+/// another lifetime starts with none. With them, the latest lifetime
+/// whose loading frame the skin refused, and why.
 #[derive(Clone, Copy, Debug, Default)]
 struct LoadingAck {
     first: Option<(u64, TimeUs)>,
     loadend: Option<TimeUs>,
+    loadend_of: Option<u64>,
     refused: Option<(u64, BuildError)>,
+}
+
+impl LoadingAck {
+    /// Lifetime `lifetime` declares `loadend`, `None` for a frame drawing
+    /// no skin: it replaces the declaration of the same lifetime, shorter
+    /// or longer, and another lifetime's starts afresh. Allocates nothing.
+    const fn declare(&mut self, lifetime: u64, loadend: Option<Option<TimeUs>>) {
+        let same = matches!(self.loadend_of, Some(l) if l == lifetime);
+        if !same {
+            self.loadend_of = Some(lifetime);
+            self.loadend = None;
+        }
+        if let Some(declared) = loadend {
+            self.loadend = declared;
+        }
+    }
 }
 
 /// The last request committed and the last whose commit the game thread
@@ -1657,7 +1730,9 @@ struct Commits {
 struct Receipt {
     request: u64,
     declared: Declared,
-    loadend: Option<Option<TimeUs>>,
+    /// What its commit declared for the loading lifetime it was the
+    /// current one of.
+    loadend: Option<(u64, Option<TimeUs>)>,
 }
 
 /// What the play skin an attempt draws with declares for the play's
@@ -2445,8 +2520,13 @@ impl RenderLink {
     pub fn begin_attempt(&self, attempt: AttemptContext, skin: AttemptSkin) -> PendingAttempt {
         let request = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
         let (reply, rx) = mpsc::sync_channel(1);
+        // Read where the request is published: every lifetime change is
+        // this thread's, so it is the one the request belongs to however
+        // late the render thread takes it.
+        let lifetime = self.shared.current_lifetime();
         self.send(RenderMsg::PrepareAttempt {
             request,
+            lifetime,
             attempt: Box::new(attempt),
             skin,
             reply,
@@ -2598,8 +2678,8 @@ impl RenderLink {
                     // Declared before the opener reads the minimum again,
                     // outside the commits' lock, whether or not the
                     // render thread has declared it yet.
-                    if let Some(loadend) = r.loadend {
-                        self.shared.committed_loading(loadend);
+                    if let Some((lifetime, loadend)) = r.loadend {
+                        self.shared.committed_loading(lifetime, loadend);
                     }
                     return Ok(r.declared);
                 }
@@ -3860,14 +3940,71 @@ const fn screen_kind(mode: &Mode, decision: bool, page_turns: bool) -> crate::me
     }
 }
 
-/// Whether loading lifetime `lifetime` draws the pending presentation:
-/// play's skin is pending, and no specialization of it is kept that was
-/// committed while `lifetime` was current (`specialized_in`). Allocates
-/// nothing.
+/// The token a play attempt's staging of request `request` bears on the
+/// screen of device `device`.
+const fn attempt_token(request: u64, device: u64) -> PreparedToken {
+    PreparedToken {
+        request,
+        device,
+        kind: ScreenKind::Play,
+    }
+}
+
+/// What a loading frame draws (design.md "beatoraja Lua Skins", the
+/// pending presentation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Presented {
+    /// Play's skin is not pending: its installed skin, or the built-in
+    /// presentation, as for any skin.
+    Ordinary,
+    /// The specialization committed in the lifetime.
+    Committed,
+    /// The play staging `token` names, declaring `loadend`.
+    Staged {
+        token: PreparedToken,
+        loadend: Option<TimeUs>,
+    },
+    /// The pending presentation: the cleared canvas and the load's lines.
+    Placeholder,
+}
+
+/// What loading lifetime `lifetime` draws: the ordinary presentation while
+/// play's skin is not pending; else the staging answered for a request
+/// published in that lifetime, while it is the newest play request, on
+/// the screen's device and still held by the screen (`staged`); else the
+/// specialization committed in it (`specialized_in`); else the pending
+/// presentation. One value per frame feeds its drawing, its declared
+/// loading time and its records. Allocates nothing.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-fn pending_presentation(committed: &Committed, specialized_in: Option<u64>, lifetime: u64) -> bool {
-    committed.pending(ScreenKind::Play)
-        && (committed.get(ScreenKind::Play).is_none() || specialized_in != Some(lifetime))
+fn presentation_of(
+    committed: &Committed,
+    specialized_in: Option<u64>,
+    prepared: Option<Candidate>,
+    requested: u64,
+    (staged, device): (Option<PreparedToken>, u64),
+    lifetime: u64,
+) -> Presented {
+    if !committed.pending(ScreenKind::Play) {
+        return Presented::Ordinary;
+    }
+    if let Some(p) = prepared
+        && p.declarative
+        && p.lifetime == Some(lifetime)
+        && p.token.kind == ScreenKind::Play
+        && p.token.request == requested
+        && p.token.device == device
+        && staged == Some(p.token)
+    {
+        return Presented::Staged {
+            token: p.token,
+            loadend: p.loadend,
+        };
+    }
+    if specialized_in == Some(lifetime) && committed.get(ScreenKind::Play).is_some() {
+        Presented::Committed
+    } else {
+        Presented::Placeholder
+    }
 }
 
 /// What a preparation or a load leaves drawn: the splash stays until what
@@ -4357,6 +4494,8 @@ struct ShownSelection {
 /// An attempt's preparation the screen has not answered yet.
 struct Preparing {
     request: u64,
+    /// The loading lifetime its request was published in.
+    lifetime: Option<u64>,
     attempt: Box<AttemptContext>,
     /// The declarative skin it stages, if one is chosen.
     skin: Option<Arc<SkinBundle>>,
@@ -4389,8 +4528,36 @@ pub enum ReadyAnswer {
 
 /// An attempt's preparation answered ready: its token and whether it
 /// staged a declarative skin.
+/// What the draw rule reads of the preparation answered ready
+/// ([`Prepared::candidate`]): a copy, allocating nothing.
+#[derive(Clone, Copy, Debug)]
+struct Candidate {
+    token: PreparedToken,
+    lifetime: Option<u64>,
+    declarative: bool,
+    loadend: Option<TimeUs>,
+}
+
+impl Prepared {
+    /// What the draw rule reads of it.
+    const fn candidate(&self) -> Candidate {
+        Candidate {
+            token: self.token,
+            lifetime: self.lifetime,
+            declarative: self.declarative,
+            loadend: self.loadend,
+        }
+    }
+}
+
 struct Prepared {
     token: PreparedToken,
+    /// The loading lifetime its request was published in: only that
+    /// lifetime's loading frames draw it, and its commit is that
+    /// lifetime's.
+    lifetime: Option<u64>,
+    /// The loading time its skin declares, a declarative one's.
+    loadend: Option<TimeUs>,
     /// The screen's structural inputs it was staged with.
     screen: game::ScreenKey,
     declarative: bool,
@@ -4944,12 +5111,22 @@ impl Run {
                 }
                 Ok(RenderMsg::PrepareAttempt {
                     request,
+                    lifetime,
                     attempt,
                     skin,
                     reply,
                 }) => {
+                    #[cfg(test)]
+                    {
+                        let deadline = Instant::now() + hook_bound();
+                        while self.shared.hold_receipt.load(Ordering::Acquire)
+                            && Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
                     self.turntable.begin_presentation();
-                    self.begin_attempt(request, attempt, skin, reply);
+                    self.begin_attempt(request, lifetime, attempt, skin, reply);
                     mode = self.after_preparing(mode);
                     continue;
                 }
@@ -5266,6 +5443,9 @@ impl Run {
             let mut view_stamp = None;
             #[cfg(feature = "dev-tools")]
             let mut loading_stamp = None;
+            // What the loading frame drew, as its drawing decided it.
+            #[cfg(feature = "dev-tools")]
+            let mut frame_presented: Option<Presented> = None;
             #[cfg(feature = "dev-tools")]
             let mut screen_stamp = None;
             // The frame's one instant: a play frame's chart time and the
@@ -5463,9 +5643,21 @@ impl Run {
                     // out again.
                     #[cfg(feature = "dev-tools")]
                     let [_, _, _, before] = crate::alloc_count::counts();
-                    let pending = loading_frame.is_some_and(|l| {
-                        pending_presentation(&self.committed, self.specialized_in, l)
+                    let presented = loading_frame.map(|l| {
+                        presentation_of(
+                            &self.committed,
+                            self.specialized_in,
+                            self.prepared.as_ref().map(Prepared::candidate),
+                            self.requested,
+                            (screen.staged_token(), screen.device()),
+                            l,
+                        )
                     });
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        frame_presented = presented;
+                    }
+                    let pending = presented == Some(Presented::Placeholder);
                     let sampled = self.clock.now();
                     #[cfg(feature = "dev-tools")]
                     {
@@ -5489,7 +5681,17 @@ impl Run {
                             self.turntable.angle(),
                             app,
                         );
-                        match screen.loading(page, update.as_deref(), *changed, &frame) {
+                        let drawn = match presented {
+                            Some(Presented::Staged { token, .. }) => screen.loading_staged(
+                                page,
+                                update.as_deref(),
+                                *changed,
+                                &frame,
+                                token,
+                            ),
+                            _ => screen.loading(page, update.as_deref(), *changed, &frame),
+                        };
+                        match drawn {
                             Ok(Ok(t)) => Ok(t),
                             Ok(Err(e)) => {
                                 // Refused: nothing of it was drawn, the
@@ -5513,12 +5715,16 @@ impl Run {
                     if let (Some(lifetime), Ok((t, _))) = (loading_frame, &drawn)
                         && t.presented
                     {
-                        let loadend = if pending {
-                            None
-                        } else {
-                            self.committed
-                                .get(ScreenKind::Play)
-                                .and_then(|i| i.bundle().skin().loadend())
+                        // The skin drawn declares; the pending presentation
+                        // draws none and changes nothing.
+                        let loadend = match presented {
+                            Some(Presented::Staged { loadend, .. }) => Some(loadend),
+                            Some(Presented::Placeholder) | None => None,
+                            Some(Presented::Ordinary | Presented::Committed) => Some(
+                                self.committed
+                                    .get(ScreenKind::Play)
+                                    .and_then(|i| i.bundle().skin().loadend()),
+                            ),
                         };
                         let clock = self.clock;
                         self.shared
@@ -5971,8 +6177,8 @@ impl Run {
                         #[cfg(feature = "dev-tools")]
                         presented_at,
                         #[cfg(feature = "dev-tools")]
-                        skin_loading: loading_frame.filter(|&l| {
-                            !pending_presentation(&self.committed, self.specialized_in, l)
+                        skin_loading: loading_frame.filter(|_| {
+                            frame_presented.is_some_and(|p| p != Presented::Placeholder)
                         }),
                         timing,
                         statistics: screen.statistics(),
@@ -6204,6 +6410,7 @@ impl Run {
     fn begin_attempt(
         &mut self,
         request: u64,
+        lifetime: Option<u64>,
         attempt: Box<AttemptContext>,
         skin: AttemptSkin,
         reply: mpsc::SyncSender<Result<Answered, RenderError>>,
@@ -6236,6 +6443,7 @@ impl Run {
         let offer = self.carries.offer(attempt.carry_key(), &installed);
         let p = Preparing {
             request,
+            lifetime,
             attempt,
             skin,
             offer,
@@ -6307,6 +6515,8 @@ impl Run {
                     device: screen.device(),
                     kind: ScreenKind::Play,
                 },
+                lifetime: p.lifetime,
+                loadend: p.skin.as_ref().and_then(|b| b.skin().loadend()),
                 screen: game::ScreenKey {
                     device: screen.device(),
                     target: screen.target(),
@@ -6522,16 +6732,9 @@ impl Run {
     /// attempt draws with, staged or in use, declares.
     fn commit(&mut self, request: u64) -> Result<Declared, CommitError> {
         // The loading lifetime current, if one is begun: a pending skin's
-        // specialization committed now draws its loading frames. Read
+        // specialization committed in it declares its loading time. Read
         // before the commits' lock, which no loading lock nests in.
-        let lifetime = {
-            let producer = self.shared.producer();
-            let current = self.shared.loading_slot().lifetime;
-            producer
-                .as_ref()
-                .filter(|s| s.lifetime() == current)
-                .map(LifetimeState::lifetime)
-        };
+        let current = self.shared.current_lifetime();
         // Held through the installation: a withdrawal waits for it, or it
         // sees the withdrawal and installs nothing.
         let shared = Arc::clone(&self.shared);
@@ -6563,7 +6766,7 @@ impl Run {
             return Err(CommitError::Device);
         };
         if let Err(e) = screen.commit(p.token) {
-            screen.discard();
+            screen.discard_token(p.token);
             return Err(e);
         }
         // Its key is the committed layer's now, the generation's whatever
@@ -6583,13 +6786,17 @@ impl Run {
             // loading frames of the lifetime it was committed in.
             self.committed
                 .pend(ScreenKind::Play, screen.installation(ScreenKind::Play));
-            self.specialized_in = lifetime;
-            if lifetime.is_some() {
-                declared = Some(
+            // The lifetime its request was published in, which its frames
+            // drew: a request of an earlier lifetime committed in a later
+            // one is neither drawn nor declared for that one.
+            self.specialized_in = p.lifetime;
+            if let Some(lifetime) = p.lifetime.filter(|&l| Some(l) == current) {
+                declared = Some((
+                    lifetime,
                     self.committed
                         .get(ScreenKind::Play)
                         .and_then(|i| i.bundle().skin().loadend()),
-                );
+                ));
             }
         } else if p.declarative {
             self.committed
@@ -6647,8 +6854,8 @@ impl Run {
         // Before the answer, outside the commits' lock: the opener reads
         // the minimum again once the commit is answered (or, past the
         // bound, once it read the receipt, which carries it too).
-        if let Some(loadend) = declared {
-            self.shared.committed_loading(loadend);
+        if let Some((lifetime, loadend)) = declared {
+            self.shared.committed_loading(lifetime, loadend);
         }
         Ok(drawn)
     }
@@ -6722,7 +6929,11 @@ impl Run {
                 let shared = Arc::clone(&self.shared);
                 let mut commits = shared.commits();
                 if commits.withdrawn >= request {
-                    screen.discard();
+                    screen.discard_token(PreparedToken {
+                        request,
+                        device: screen.device(),
+                        kind,
+                    });
                     return Ok(Preparation::Cancelled);
                 }
                 let token = PreparedToken {
@@ -6731,7 +6942,11 @@ impl Run {
                     kind,
                 };
                 if let Err(e) = screen.commit(token) {
-                    screen.discard();
+                    screen.discard_token(PreparedToken {
+                        request,
+                        device: screen.device(),
+                        kind,
+                    });
                     return Ok(refusal(e.to_string()));
                 }
                 commits.committed = commits.committed.max(request);
@@ -6756,7 +6971,11 @@ impl Run {
                 Ok(Preparation::Ready)
             }
             Ok(refused) => {
-                screen.discard();
+                screen.discard_token(PreparedToken {
+                    request,
+                    device: screen.device(),
+                    kind,
+                });
                 Ok(refused)
             }
             Err(e) => {
@@ -6775,7 +6994,7 @@ impl Run {
         if let Some(p) = self.attempt.take() {
             let _ = p.reply.send(Ok(self.answered(refusal(why))));
             if let Some(screen) = &mut self.screen {
-                screen.discard();
+                screen.discard_token(attempt_token(p.request, screen.device()));
             }
         }
         self.drop_prepared();
@@ -6791,11 +7010,14 @@ impl Run {
     /// skin selected for later attempts, and no specialization drawn by
     /// any loading lifetime yet. A withdrawal changes nothing.
     fn pend(&mut self, request: u64, kind: ScreenKind) -> Result<Preparation, RenderError> {
-        if !self.newest(request) {
-            return Ok(refusal("a newer request superseded it"));
-        }
+        // Refused before it is the newest: a request that changes nothing
+        // supersedes nothing, so no staging stays resident while no longer
+        // the newest request's.
         if kind != ScreenKind::Play {
             return Ok(refusal(format!("the {kind} skin cannot be pending")));
+        }
+        if !self.newest(request) {
+            return Ok(refusal("a newer request superseded it"));
         }
         self.supersede_attempts("a newer skin selection superseded it");
         if let Err(e) = self.recover() {
@@ -6852,7 +7074,7 @@ impl Run {
         if self.attempt.as_ref().is_some_and(|p| p.request == request) {
             self.attempt = None;
             if let Some(screen) = &mut self.screen {
-                screen.discard();
+                screen.discard_token(attempt_token(request, screen.device()));
             }
         }
         if self
@@ -6866,10 +7088,10 @@ impl Run {
 
     /// Drops the preparation answered ready and not committed, if any.
     fn drop_prepared(&mut self) {
-        if self.prepared.take().is_some()
+        if let Some(p) = self.prepared.take()
             && let Some(screen) = &mut self.screen
         {
-            screen.discard();
+            screen.discard_token(p.token);
         }
     }
 
@@ -7330,8 +7552,9 @@ struct ResultSide {
     stop: Option<ScriptStop>,
     /// The stop came this frame: the strip is prepared again after it.
     restrip: bool,
-    /// A staging the commit point discarded, dropped after the frame.
-    discard: bool,
+    /// A staging the commit point discarded, dropped after the frame: its
+    /// token, so no other staging goes with it.
+    discard: Option<PreparedToken>,
     /// A commit happened: what it replaced is drained after the frame.
     drain: bool,
     /// A commit happened: what the result kind keeps to restore is
@@ -7362,7 +7585,7 @@ impl ResultSide {
             notes: ScriptNotes::default(),
             stop: None,
             restrip: false,
-            discard: false,
+            discard: None,
             drain: false,
             reconcile: false,
             reapply: false,
@@ -7497,10 +7720,10 @@ impl Run {
             self.frames_view = None;
         }
         if let Some(side) = self.result.take()
-            && side.prepared.as_ref().is_some_and(|p| p.token.is_some())
+            && let Some(token) = side.prepared.and_then(|p| p.token)
             && let Some(screen) = &mut self.screen
         {
-            screen.discard();
+            screen.discard_token(token);
         }
     }
 
@@ -7647,6 +7870,18 @@ impl Run {
             self.drop_result();
             return;
         }
+        // A view newer than every request becomes the newest, and its
+        // staging takes the screen's one slot: the play attempt preparing
+        // or answered is superseded first, so no staging stays answered
+        // once another request is the newest.
+        if self
+            .result
+            .as_ref()
+            .and_then(|r| r.incoming.as_ref())
+            .is_some_and(|p| p.request > self.requested)
+        {
+            self.supersede_attempts("a result view superseded it");
+        }
         let disabled = self.result_disabled.is_some();
         let Some(side) = &mut self.result else {
             return;
@@ -7695,14 +7930,14 @@ impl Run {
             if presented && side.prepared.as_ref().is_some_and(|v| !same(&v.held)) {
                 // The newest is the view presented again: the other one
                 // prepared goes, so it is not committed after it.
-                if side.prepared.take().is_some_and(|v| v.token.is_some()) {
-                    screen.discard();
+                if let Some(token) = side.prepared.take().and_then(|v| v.token) {
+                    screen.discard_token(token);
                 }
             }
             if !known {
                 // A new view payload: the one prepared before goes.
-                if side.prepared.take().is_some_and(|v| v.token.is_some()) {
-                    screen.discard();
+                if let Some(token) = side.prepared.take().and_then(|v| v.token) {
+                    screen.discard_token(token);
                 }
                 let request = p.request;
                 let restaged = std::mem::take(&mut side.restaged);
@@ -7735,7 +7970,11 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     let installed = match installed {
                         Ok(Preparation::Ready) if crate::dev::refuse_result_staging() => {
-                            screen.discard();
+                            screen.discard_token(PreparedToken {
+                                request,
+                                device: screen.device(),
+                                kind: ScreenKind::Result,
+                            });
                             Ok(refusal("dev: the view's staging was refused"))
                         }
                         other => other,
@@ -7825,8 +8064,8 @@ impl Run {
                         ));
                     }
                     side.prepared = Some(PreparedView { held, token });
-                } else if token.is_some() {
-                    screen.discard();
+                } else if let Some(token) = token {
+                    screen.discard_token(token);
                 }
             }
             side.overlay = Some((p.revision, p.overlay));
@@ -7920,7 +8159,7 @@ impl Run {
             }
             if b.fadeout.is_some() {
                 if let Some(v) = side.prepared.take() {
-                    side.discard |= v.token.is_some();
+                    side.discard = v.token.or(side.discard);
                     side.drop_later(v.held);
                 }
                 if let (Some((revision, overlay)), Some(h)) =
@@ -7956,13 +8195,13 @@ impl Run {
                         // Its generation was evicted: it never commits,
                         // its staging discarded after the frame.
                         ViewCommit::Gone => {
-                            side.discard |= v.token.is_some();
+                            side.discard = v.token.or(side.discard);
                             side.drop_later(v.held);
                         }
                         // Its commit refused: its staging, still pending,
                         // is discarded after the frame, as an evicted one.
                         ViewCommit::Refused => {
-                            side.discard |= v.token.is_some();
+                            side.discard = v.token.or(side.discard);
                             side.drop_later(v.held);
                         }
                     }
@@ -8128,8 +8367,8 @@ impl Run {
             }
         }
         if let Some(screen) = &mut self.screen {
-            if std::mem::take(&mut side.discard) {
-                screen.discard();
+            if let Some(token) = side.discard.take() {
+                screen.discard_token(token);
             }
             if std::mem::take(&mut side.drain) {
                 let _ = screen.drain_retired();
@@ -8283,7 +8522,11 @@ impl Run {
                 let shared = Arc::clone(&self.shared);
                 let mut commits = shared.commits();
                 if commits.withdrawn >= request {
-                    screen.discard();
+                    screen.discard_token(PreparedToken {
+                        request,
+                        device: screen.device(),
+                        kind,
+                    });
                     return Ok(Preparation::Cancelled);
                 }
                 let token = PreparedToken {
@@ -8292,7 +8535,11 @@ impl Run {
                     kind,
                 };
                 if let Err(e) = screen.commit(token) {
-                    screen.discard();
+                    screen.discard_token(PreparedToken {
+                        request,
+                        device: screen.device(),
+                        kind,
+                    });
                     return Ok(refusal(e.to_string()));
                 }
                 let _ = screen.drain_retired();
@@ -8301,7 +8548,11 @@ impl Run {
                 Ok(Preparation::Ready)
             }
             Ok(refused) => {
-                screen.discard();
+                screen.discard_token(PreparedToken {
+                    request,
+                    device: screen.device(),
+                    kind,
+                });
                 Ok(refused)
             }
             Err(e) => {
@@ -10551,6 +10802,57 @@ pub(crate) mod tests {
         link.exit();
     }
 
+    /// The draw rule and the drawn skin's declaration allocate nothing: a
+    /// staged, a shorter successor's and a placeholder frame's
+    /// acknowledgements and a commit's declaration, lifetime after
+    /// lifetime.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_drawn_skin_s_declaration_alloc() {
+        use super::{Candidate, Committed, Presented, presentation_of};
+        let shared = super::Shared::new();
+        let clock = QpcClock::start();
+        // Made before counting: an ordinary play skin, and a pending one
+        // with a specialization committed in lifetime 2 and a staging of
+        // request 5 answered for lifetime 3.
+        let ordinary = Committed::default();
+        let mut pending = Committed::default();
+        pending.pend(ScreenKind::Play, Some(render::Installation::new(bundle())));
+        let token = render::PreparedToken {
+            request: 5,
+            device: 1,
+            kind: ScreenKind::Play,
+        };
+        let staged = Candidate {
+            token,
+            lifetime: Some(3),
+            declarative: true,
+            loadend: Some(TimeUs(2_700_000)),
+        };
+        shared.presented_loading(1, Some(Some(TimeUs(2_700_000))), || clock.now());
+        let before = crate::alloc_count::this_thread();
+        for lifetime in 2..10 {
+            let drawn = presentation_of(&ordinary, None, None, 0, (None, 1), lifetime);
+            assert_eq!(drawn, Presented::Ordinary);
+            let at = |l| presentation_of(&pending, Some(2), Some(staged), 5, (Some(token), 1), l);
+            assert_eq!(
+                at(3),
+                Presented::Staged {
+                    token,
+                    loadend: Some(TimeUs(2_700_000))
+                }
+            );
+            assert_eq!(at(2), Presented::Committed);
+            assert_eq!(at(4), Presented::Placeholder);
+            shared.presented_loading(lifetime, Some(Some(TimeUs(2_700_000))), || clock.now());
+            shared.presented_loading(lifetime, Some(Some(TimeUs(600_000))), || clock.now());
+            shared.presented_loading(lifetime, None, || clock.now());
+            shared.committed_loading(lifetime, Some(TimeUs(1_500_000)));
+            assert_eq!(shared.loading_ack().loadend, Some(TimeUs(1_500_000)));
+        }
+        assert_eq!(crate::alloc_count::this_thread() - before, 0);
+    }
+
     /// The render thread's acknowledgement of a presented loading frame,
     /// the first of a lifetime and a later one, allocates nothing, nor
     /// does the game thread's read of it.
@@ -10562,8 +10864,8 @@ pub(crate) mod tests {
         shared.presented_loading(1, None, || clock.now());
         let before = crate::alloc_count::this_thread();
         for lifetime in 2..10 {
-            shared.presented_loading(lifetime, Some(TimeUs(1_500_000)), || clock.now());
-            shared.presented_loading(lifetime, Some(TimeUs(1_500_000)), || clock.now());
+            shared.presented_loading(lifetime, Some(Some(TimeUs(1_500_000))), || clock.now());
+            shared.presented_loading(lifetime, None, || clock.now());
             let read = shared.loading_ack();
             assert_eq!(read.first.map(|(l, _)| l), Some(lifetime));
             assert_eq!(read.loadend, Some(TimeUs(1_500_000)));
@@ -13118,6 +13420,9 @@ pub(crate) mod tests {
         /// them.
         staged_play: Option<FakePlay>,
         held_play: Option<FakePlay>,
+        /// The token of the play staging a specialization made, neither
+        /// committed nor discarded.
+        staged_token: Option<render::PreparedToken>,
     }
 
     /// An attempt's `Play` as the carry sees it: its slots and whether its
@@ -13232,6 +13537,11 @@ pub(crate) mod tests {
                     render::Installation::new(Arc::clone(skin)),
                 ));
                 *self.shared.staging.lock().unwrap() = Some(Arc::clone(skin));
+                self.staged_token = Some(render::PreparedToken {
+                    request,
+                    device: self.device,
+                    kind: ScreenKind::Play,
+                });
             }
             // A screen may stage and answer later.
             if hold {
@@ -13252,6 +13562,7 @@ pub(crate) mod tests {
                 self.shared.commit_held.store(true, Ordering::Release);
                 std::thread::sleep(Duration::from_millis(1));
             }
+            self.staged_token = None;
             if let Some((kind, staged)) = self.staged.take() {
                 if kind == ScreenKind::Play {
                     *self.shared.play.lock().unwrap() = Some(Arc::clone(staged.bundle()));
@@ -13290,6 +13601,7 @@ pub(crate) mod tests {
             self.note("discard");
             self.staged = None;
             self.staged_play = None;
+            self.staged_token = None;
             *self.shared.staging.lock().unwrap() = None;
         }
         fn install(
@@ -13516,6 +13828,24 @@ pub(crate) mod tests {
             }
             Ok(Ok(timing(true)))
         }
+        fn loading_staged(
+            &mut self,
+            page: &crate::menu_screen::MenuPage,
+            update: Option<&LoadingUpdate>,
+            changed: bool,
+            frame: &render::LoadingFrame<'_>,
+            token: render::PreparedToken,
+        ) -> Result<Result<FrameTiming, skin_model::BuildError>, RenderError> {
+            self.shared
+                .staged_frames
+                .lock()
+                .unwrap()
+                .push((frame.lifetime, token.request));
+            self.loading(page, update, changed, frame)
+        }
+        fn staged_token(&self) -> Option<render::PreparedToken> {
+            self.staged_token
+        }
         fn pending_loading(
             &mut self,
             _page: &crate::menu_screen::MenuPage,
@@ -13625,6 +13955,9 @@ pub(crate) mod tests {
         /// The skin an attempt's preparation staged and neither committed
         /// nor discarded, on the screen built last.
         staging: Arc<std::sync::Mutex<Option<Arc<render::SkinBundle>>>>,
+        /// Each loading frame drawn from a play staging: its lifetime and
+        /// the staging's request.
+        pub(crate) staged_frames: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
         /// The request whose preparation stages, then does not answer; 0
         /// for none.
         hold_staged: Arc<std::sync::atomic::AtomicU64>,
@@ -13728,6 +14061,7 @@ pub(crate) mod tests {
                     target: [1_920, 1_080],
                     staged_play: None,
                     held_play: None,
+                    staged_token: None,
                 }) as Box<dyn Screen>)
             });
             let clock = QpcClock::start();
@@ -14467,6 +14801,7 @@ pub(crate) mod tests {
             let (reply, rx) = std::sync::mpsc::sync_channel(1);
             link.send(RenderMsg::PrepareAttempt {
                 request,
+                lifetime: None,
                 attempt: Box::new(titled(&chart)),
                 skin: super::AttemptSkin::Specialized(Arc::clone(&held)),
                 reply,
@@ -14560,12 +14895,446 @@ pub(crate) mod tests {
         link.exit();
     }
 
+    /// A specialization staged for the loading lifetime draws its loading
+    /// frames from its answer, before any commit, and the pending
+    /// presentation stops; nothing is committed.
+    #[test]
+    fn a_staged_specialization_draws_before_its_commit() {
+        let (chart, screens, link) = pending_link();
+        let pending = || screens.pending.load(Ordering::Acquire);
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| pending() >= 3));
+        let (lifetime, _) = link.loading_ack().unwrap();
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        let staged = || screens.staged_frames.lock().unwrap().clone();
+        assert!(wait_until(|| staged().len() >= 3));
+        let from = pending();
+        assert!(wait_until(|| staged().len() >= 6));
+        assert!(pending() <= from + 1, "{from} {}", pending());
+        assert!(
+            staged().iter().all(|&(l, _)| l == lifetime),
+            "{:?}",
+            staged()
+        );
+        assert!(screens.play.lock().unwrap().is_none(), "nothing committed");
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A play skin that is not pending draws its loading frames as before,
+    /// whatever is staged: on a selected declarative skin and on the
+    /// built-in presentation, an attempt staged with a specialization
+    /// draws no staged frame and no pending presentation, and the
+    /// declaration stays the installed skin's.
+    #[test]
+    fn an_ordinary_skin_draws_its_loading_frames_as_before() {
+        for selected in [true, false] {
+            let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+            let screens = Installers::default();
+            let link = screens.spawn_bare();
+            link.load(Arc::clone(&chart), None).unwrap();
+            if selected {
+                assert_eq!(
+                    link.select(
+                        ScreenKind::Play,
+                        Some(bundle_declaring(None, Some(TimeUs(2_000_000))))
+                    )
+                    .wait()
+                    .unwrap(),
+                    Preparation::Ready
+                );
+            }
+            link.loading().show(one_line("one"));
+            let frames = || screens.loading.load(Ordering::Acquire);
+            assert!(wait_until(|| frames() >= 2), "{selected}");
+            assert_eq!(
+                specialized(
+                    &link,
+                    &chart,
+                    &bundle_declaring(None, Some(TimeUs(600_000)))
+                )
+                .unwrap(),
+                Preparation::Ready
+            );
+            let from = frames();
+            assert!(wait_until(|| frames() >= from + 3), "{selected}");
+            assert!(
+                screens.staged_frames.lock().unwrap().is_empty(),
+                "{selected}"
+            );
+            assert_eq!(screens.pending.load(Ordering::Acquire), 0, "{selected}");
+            let installed = selected.then_some(TimeUs(2_000_000));
+            assert_eq!(link.loading_loadend(), installed, "{selected}");
+            link.end_loading().unwrap();
+            link.exit();
+        }
+    }
+
+    /// A staging comes before the specialization committed earlier in the
+    /// lifetime: R1 committed, then R2 staged draws R2's; R2 discarded,
+    /// the lifetime's frames draw R1's again (committed, not staged).
+    #[test]
+    fn a_staging_after_a_commit_in_the_lifetime_draws() {
+        let (chart, screens, link) = pending_link();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| screens.pending.load(Ordering::Acquire) >= 2));
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        link.commit_attempt().unwrap();
+        // R1's own staged frames, drawn before its commit, come first.
+        let from = screens.staged_frames.lock().unwrap().len();
+        let staged = || screens.staged_frames.lock().unwrap()[from..].to_vec();
+        let mut r2 = link.begin_attempt(titled(&chart), super::AttemptSkin::Specialized(bundle()));
+        let answer = loop {
+            if let Some(a) = r2.wait_until(None, || false) {
+                break a.unwrap();
+            }
+        };
+        assert_eq!(answer.preparation, Preparation::Ready);
+        assert!(wait_until(|| staged().len() >= 3));
+        let request = staged().last().unwrap().1;
+        drop(r2);
+        link.discard_attempt();
+        // Discarded: the committed one again, no staged frame more.
+        let skin = screens.loading.load(Ordering::Acquire);
+        assert!(wait_until(
+            || screens.loading.load(Ordering::Acquire) >= skin + 3
+        ));
+        let after = staged();
+        assert!(wait_until(
+            || screens.loading.load(Ordering::Acquire) >= skin + 6
+        ));
+        assert!(
+            staged().len() <= after.len() + 1,
+            "{after:?} {:?}",
+            staged()
+        );
+        assert!(staged().iter().all(|&(_, r)| r == request));
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A request belongs to the lifetime current when it is published:
+    /// published in lifetime 1 and taken by the render thread only after
+    /// lifetime 2 began, its staging never draws lifetime 2's frames, its
+    /// commit is lifetime 1's and declares nothing for lifetime 2, whose
+    /// minimum stays the floor; a request published in lifetime 2 draws.
+    #[test]
+    fn a_staging_draws_only_in_its_request_s_lifetime() {
+        let (chart, screens, link) = pending_link();
+        let pending = || screens.pending.load(Ordering::Acquire);
+        let staged = || screens.staged_frames.lock().unwrap().clone();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| pending() >= 2));
+        link.shared.hold_receipt.store(true, Ordering::Release);
+        let mut r1 = link.begin_attempt(
+            titled(&chart),
+            super::AttemptSkin::Specialized(bundle_declaring(None, Some(TimeUs(3_000_000)))),
+        );
+        link.clear_loading();
+        link.loading().show(one_line("two"));
+        link.shared.hold_receipt.store(false, Ordering::Release);
+        let answer = loop {
+            if let Some(a) = r1.wait_until(None, || false) {
+                break a.unwrap();
+            }
+        };
+        assert_eq!(answer.preparation, Preparation::Ready);
+        let p = pending();
+        assert!(wait_until(|| pending() >= p + 3));
+        assert!(staged().is_empty(), "{:?}", staged());
+        let (two, _) = link.loading_ack().unwrap();
+        link.commit_attempt().unwrap();
+        let p = pending();
+        assert!(
+            wait_until(|| pending() >= p + 3),
+            "lifetime 2 stays pending"
+        );
+        assert!(staged().is_empty(), "{:?}", staged());
+        assert_eq!(
+            link.loading_loadend(),
+            None,
+            "nothing declared for lifetime 2"
+        );
+        // Published in lifetime 2: drawn.
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| !staged().is_empty()));
+        assert!(staged().iter().all(|&(l, _)| l == two), "{:?}", staged());
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// The drawn skin's declaration governs the minimum, from the
+    /// lifetime's first frame: a staging declaring 2 700 ms, then a
+    /// successor declaring 600 ms drawn in the same lifetime, gives the
+    /// floor (the source's current skin); the successor discarded, the
+    /// pending presentation drawn changes nothing; 600 then 2 700 gives
+    /// 2 700 ms.
+    #[test]
+    fn the_drawn_skin_s_loadend_governs_the_minimum() {
+        let (chart, screens, link) = pending_link();
+        let staged = || screens.staged_frames.lock().unwrap().len();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| link.loading_acked() >= 2));
+        let (_, at) = link.loading_ack().unwrap();
+        let minimum = || game::minimum_ends(at, link.loading_loadend()).0 - at.0;
+        let stage = |ms: i64| {
+            let n = staged();
+            assert_eq!(
+                specialized(
+                    &link,
+                    &chart,
+                    &bundle_declaring(None, Some(TimeUs(ms * 1_000)))
+                )
+                .unwrap(),
+                Preparation::Ready
+            );
+            assert!(wait_until(|| staged() >= n + 2));
+        };
+        stage(2_700);
+        assert_eq!(minimum(), 2_700_000);
+        stage(600);
+        assert_eq!(minimum(), 1_000_000, "the shorter skin drawn");
+        stage(2_700);
+        assert_eq!(minimum(), 2_700_000);
+        link.discard_attempt();
+        let p = screens.pending.load(Ordering::Acquire);
+        assert!(wait_until(
+            || screens.pending.load(Ordering::Acquire) >= p + 3
+        ));
+        assert_eq!(minimum(), 2_700_000, "the placeholder changes nothing");
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A staging answered and committed before any loading frame drew it
+    /// (its lifetime held, drawing nothing) is declared by the commit, in
+    /// the lifetime its request was published in.
+    #[test]
+    fn a_commit_before_any_staged_frame_declares_at_the_commit() {
+        let (chart, screens, link) = pending_link();
+        link.begin_loading_held(&chosen("One"), None);
+        assert_eq!(
+            specialized(
+                &link,
+                &chart,
+                &bundle_declaring(None, Some(TimeUs(2_700_000)))
+            )
+            .unwrap(),
+            Preparation::Ready
+        );
+        assert_eq!(link.loading_loadend(), None, "no frame drew it");
+        link.commit_attempt().unwrap();
+        assert_eq!(link.loading_loadend(), Some(TimeUs(2_700_000)));
+        assert!(screens.staged_frames.lock().unwrap().is_empty());
+        link.reveal_loading();
+        assert!(wait_until(|| link.loading_acked() >= 2));
+        assert_eq!(link.loading_loadend(), Some(TimeUs(2_700_000)));
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// Each drop of a staging stops its drawing from the next frame: its
+    /// discard, a newer request (the staging superseded while the newer
+    /// one is unanswered) and a skin selection's `pend` each send the
+    /// lifetime's frames back to the pending presentation, never R's token
+    /// again; a late discard of an older request, unanswered, leaves the
+    /// newer staging drawn.
+    #[test]
+    fn each_drop_of_a_staging_stops_its_drawing() {
+        // A way to drop the staging, on the link, its screens and the chart.
+        type DropIt = Box<dyn Fn(&super::RenderLink, &Installers, &Chart)>;
+        let drops: [(&str, DropIt); 3] =
+            [
+                ("discard", Box::new(|link, _, _| link.discard_attempt())),
+                (
+                    "newer request",
+                    Box::new(|link, screens, chart| {
+                        let next = link.requests.load(Ordering::Relaxed) + 1;
+                        screens.hold_staged.store(next, Ordering::Release);
+                        std::mem::forget(link.begin_attempt(
+                            titled(chart),
+                            super::AttemptSkin::Specialized(bundle()),
+                        ));
+                    }),
+                ),
+                (
+                    "pend",
+                    Box::new(|link, _, _| {
+                        assert_eq!(
+                            link.pend(ScreenKind::Play).wait().unwrap(),
+                            Preparation::Ready
+                        );
+                    }),
+                ),
+            ];
+        for (name, drop_it) in drops {
+            let (chart, screens, link) = pending_link();
+            let staged = || screens.staged_frames.lock().unwrap().clone();
+            let pending = || screens.pending.load(Ordering::Acquire);
+            link.loading().show(one_line("one"));
+            assert!(wait_until(|| pending() >= 2), "{name}");
+            assert_eq!(
+                specialized(&link, &chart, &bundle()).unwrap(),
+                Preparation::Ready
+            );
+            assert!(wait_until(|| staged().len() >= 2), "{name}");
+            drop_it(&link, &screens, &chart);
+            let p = pending();
+            assert!(wait_until(|| pending() >= p + 3), "{name}");
+            let after = staged().len();
+            let p = pending();
+            assert!(wait_until(|| pending() >= p + 3), "{name}");
+            assert!(staged().len() <= after + 1, "{name}: {:?}", staged());
+            screens.hold_staged.store(0, Ordering::Release);
+            link.end_loading().unwrap();
+            link.exit();
+        }
+
+        // A late discard of an older, unanswered request leaves R2 drawn.
+        let (chart, screens, link) = pending_link();
+        let staged = || screens.staged_frames.lock().unwrap().clone();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| screens.pending.load(Ordering::Acquire) >= 2));
+        let r1 = link.requests.load(Ordering::Relaxed) + 1;
+        screens.hold_staged.store(r1, Ordering::Release);
+        let older = link.begin_attempt(titled(&chart), super::AttemptSkin::Specialized(bundle()));
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| staged().len() >= 2));
+        let r2 = staged().last().unwrap().1;
+        assert_ne!(r2, r1);
+        drop(older);
+        let n = staged().len();
+        assert!(wait_until(|| staged().len() >= n + 3), "R2 still drawn");
+        assert!(staged().iter().all(|&(_, r)| r == r2));
+        screens.hold_staged.store(0, Ordering::Release);
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A refused request changes nothing: `pend` of a kind that cannot be
+    /// pending, asked while a play staging is drawn, neither becomes the
+    /// newest request nor supersedes the staging, which stays resident
+    /// and goes on drawing.
+    #[test]
+    fn a_refused_pend_leaves_the_drawn_staging() {
+        let (chart, screens, link) = pending_link();
+        let staged = || screens.staged_frames.lock().unwrap().clone();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| screens.pending.load(Ordering::Acquire) >= 2));
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| staged().len() >= 2));
+        let request = staged().last().unwrap().1;
+        assert!(matches!(
+            link.pend(ScreenKind::Result).wait().unwrap(),
+            Preparation::Refused(_)
+        ));
+        let n = staged().len();
+        assert!(wait_until(|| staged().len() >= n + 3), "still drawn");
+        assert!(staged().iter().all(|&(_, r)| r == request));
+        assert!(screens.staging.lock().unwrap().is_some(), "still resident");
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A staging whose device is lost is never drawn on the screen built
+    /// again: the lifetime's frames draw the pending presentation until a
+    /// staging on the new device is answered, which draws.
+    #[test]
+    fn a_lost_device_never_draws_the_old_staging() {
+        let (chart, screens, link) = pending_link();
+        let staged = || screens.staged_frames.lock().unwrap().clone();
+        let pending = || screens.pending.load(Ordering::Acquire);
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| pending() >= 2));
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| staged().len() >= 2));
+        let old = staged().last().unwrap().1;
+        let builds = screens.builds.load(Ordering::Acquire);
+        screens.fail.store(true, Ordering::Release);
+        assert!(wait_until(|| link.failed()));
+        screens.fail.store(false, Ordering::Release);
+        // Built again, as the loading wait builds a lost screen.
+        link.prepare().unwrap();
+        assert!(screens.builds.load(Ordering::Acquire) > builds);
+        // The lifetime's page shown again on it.
+        link.loading().show(one_line("one"));
+        let p = pending();
+        assert!(
+            wait_until(|| pending() >= p + 3),
+            "the pending presentation"
+        );
+        let n = staged().len();
+        let p = pending();
+        assert!(wait_until(|| pending() >= p + 3));
+        assert!(staged().len() <= n, "{:?}", staged());
+        // Staged again on the new device: drawn.
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| staged().len() >= n + 2));
+        assert!(staged().last().unwrap().1 > old);
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A result skin selected while a play staging is drawn supersedes the
+    /// attempt first: the staging is released, the frames go back to the
+    /// pending presentation, and the attempt's commit finds nothing staged.
+    #[test]
+    fn a_result_selection_supersedes_a_drawn_staging() {
+        let (chart, screens, link) = pending_link();
+        let staged = || screens.staged_frames.lock().unwrap().len();
+        let pending = || screens.pending.load(Ordering::Acquire);
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| pending() >= 2));
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| staged() >= 2));
+        assert_eq!(
+            link.select(ScreenKind::Result, Some(bundle()))
+                .wait()
+                .unwrap(),
+            Preparation::Ready
+        );
+        assert!(screens.staging.lock().unwrap().is_none(), "released");
+        let p = pending();
+        assert!(wait_until(|| pending() >= p + 3));
+        let n = staged();
+        let p = pending();
+        assert!(wait_until(|| pending() >= p + 3));
+        assert!(staged() <= n + 1);
+        assert!(link.commit_attempt().is_err(), "nothing staged");
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
     /// L5: a pending play skin's base import stops at the fact it reads,
     /// inside the configured pass and before the skin's table exists, so
-    /// it declares no loading time: until a specialization commits in the
+    /// it declares no loading time: until a specialization is drawn in the
     /// lifetime the minimum is the floor, a second from the first frame;
-    /// a specialization declaring 3 000 ms then moves it to 3 s from that
-    /// same frame.
+    /// a specialization declaring 3 000 ms, from its first staged frame,
+    /// then moves it to 3 s from that same frame.
     #[test]
     fn a_pending_skin_uses_the_floor_until_its_specialization_commits() {
         let (chart, _screens, link) = pending_link();
@@ -14582,9 +15351,12 @@ pub(crate) mod tests {
             specialized(&link, &chart, &declared).unwrap(),
             Preparation::Ready
         );
-        assert_eq!(link.loading_loadend(), None, "staged, not committed");
+        // Staged: the first loading frame drawing it declares it, before
+        // the commit.
+        assert!(wait_until(
+            || link.loading_loadend() == Some(TimeUs(3_000_000))
+        ));
         link.commit_attempt().unwrap();
-        // Declared with the commit's answer, before a frame draws with it.
         assert_eq!(link.loading_loadend(), Some(TimeUs(3_000_000)));
         // A frame acknowledged after the commit's answer drew after it.
         let committed = link.loading_acked();
@@ -14606,13 +15378,14 @@ pub(crate) mod tests {
     #[test]
     fn a_timed_out_commit_declares_its_loading_time_from_the_receipt() {
         let (chart, _screens, mut link) = pending_link();
-        link.loading().show(one_line("one"));
-        assert!(wait_until(|| link.loading_acked() >= 2));
+        // Held: no loading frame draws the staging before the commit.
+        link.begin_loading_held(&chosen("One"), None);
         let declared = bundle_declaring(None, Some(TimeUs(3_000_000)));
         assert_eq!(
             specialized(&link, &chart, &declared).unwrap(),
             Preparation::Ready
         );
+        assert_eq!(link.loading_loadend(), None, "no frame drew it");
         /// Lets the render thread go when dropped, the test failing
         /// included.
         struct Hold(Arc<super::Shared>);
@@ -16347,6 +17120,7 @@ pub(crate) mod tests {
         let (reply, rx) = std::sync::mpsc::sync_channel(1);
         link.send(RenderMsg::PrepareAttempt {
             request: 2,
+            lifetime: None,
             attempt: Box::new(titled(&chart)),
             skin: super::AttemptSkin::InUse,
             reply,

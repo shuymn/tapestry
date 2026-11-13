@@ -1607,3 +1607,49 @@ fn a_left_entry_fence_latches_nothing() {
     rig.enter(-1_000_000);
     rig.attach(tempo(150, None), -1_000_000).unwrap();
 }
+
+/// A cover switched between attempts (the select screen's skin) is
+/// published at once, saved with the options, and solved at the next
+/// attachment: Floating at 150 BPM and green 300 gives 16/5 with no
+/// cover and 56/25 with SUDDEN+ at 300‰ on. Refused while an attempt is
+/// attached and not yet prepared, changing nothing.
+#[test]
+fn a_cover_set_between_attempts_reaches_the_next_attachment() {
+    let off = Covers {
+        sudden: Cover {
+            amount: 300,
+            on: false,
+        },
+        ..Covers::default()
+    };
+    let mut rig = Rig::new(options(SpeedMode::Floating, 100, 300, off));
+    rig.enter(-2_000_000);
+    rig.attach(tempo(150, None), -2_000_000).unwrap();
+    assert_eq!(rig.drain().hispeed, Some(r(16, 5)));
+    assert_eq!(
+        rig.driver.set_cover_on(game::CoverKind::Sudden, true),
+        Err(game::CoverRefused::Attached)
+    );
+    assert!(!rig.driver.options().covers().sudden.on);
+    // The attempt prepared and played: back between attempts.
+    let _ = rig.driver.prepared();
+    rig.driver
+        .set_cover_on(game::CoverKind::Sudden, true)
+        .unwrap();
+    assert!(rig.reader.read().options.covers().sudden.on);
+    assert_eq!(rig.driver.options().covers(), sudden(300));
+    rig.enter(-2_000_000);
+    rig.attach(tempo(150, None), -2_000_000).unwrap();
+    assert_eq!(rig.drain().hispeed, Some(r(56, 25)));
+    // Off again, and the lift on: each switch alone.
+    rig.driver.invalidate();
+    rig.driver
+        .set_cover_on(game::CoverKind::Sudden, false)
+        .unwrap();
+    rig.driver
+        .set_cover_on(game::CoverKind::Lift, true)
+        .unwrap();
+    let c = rig.driver.options().covers();
+    assert_eq!((c.sudden.on, c.lift.on, c.hidden.on), (false, true, false));
+    assert_eq!(c.sudden.amount, 300);
+}

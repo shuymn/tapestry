@@ -50,6 +50,9 @@ pub struct BestScore {
     pub ex: Option<u32>,
     /// The best BP; `None` until a play counts for the best.
     pub bp: Option<u32>,
+    /// The best max combo, of any counted play, not only the best EX
+    /// score's; `None` until a play counts for the best.
+    pub max_combo: Option<u32>,
     /// The lamp; `None` until a play counts for the best.
     pub clear: Option<BestLamp>,
 }
@@ -112,6 +115,12 @@ pub struct BestFigures {
     pub bp_diff: Option<i64>,
     /// The best's lamp; `None` when empty.
     pub clear: Option<BestLamp>,
+    /// The best's max combo; `None` (nothing drawn) unless it is above 0,
+    /// as the source draws its old combo only then
+    /// (`IntegerPropertyFactory.java:734-752` at `0.8.9`).
+    pub max_combo: Option<u32>,
+    /// The view's max combo minus it; `None` as `max_combo`.
+    pub max_combo_diff: Option<i64>,
     /// Whether the view's EX score beats it.
     pub ex_updated: bool,
     /// Whether the view's BP beats it; true when empty.
@@ -138,10 +147,15 @@ impl BestCompare {
     #[must_use]
     pub fn of(before: &BestLookup, tally: &Tally, figures: &ResultFigures, random: bool) -> Self {
         let (ex, bp) = (tally.ex_score, tally.bp);
-        let (best_ex, best_bp, clear) = match before {
+        let (best_ex, best_bp, best_combo, clear) = match before {
             BestLookup::Unavailable => return Self::Unavailable,
-            BestLookup::KnownEmpty => (0, None, None),
-            BestLookup::Known(b) => (b.ex.unwrap_or(0), b.bp, b.clear),
+            BestLookup::KnownEmpty => (0, None, None, None),
+            BestLookup::Known(b) => (
+                b.ex.unwrap_or(0),
+                b.bp,
+                b.max_combo.filter(|c| *c > 0),
+                b.clear,
+            ),
         };
         let rate = (!random)
             .then(|| Rate::of(best_ex, figures.max_ex))
@@ -156,6 +170,8 @@ impl BestCompare {
             bp: best_bp,
             bp_diff: best_bp.map(|b| i64::from(bp) - i64::from(b)),
             clear,
+            max_combo: best_combo,
+            max_combo_diff: best_combo.map(|c| i64::from(tally.max_combo) - i64::from(c)),
             ex_updated: ex > best_ex,
             bp_updated: best_bp.is_none_or(|b| bp < b),
             rate,
@@ -391,5 +407,63 @@ mod tests {
             score_target(ScoreTarget::Max, 81, 0, TargetPlay::Random),
             162
         );
+    }
+
+    /// A view of max combo `combo` compared with `before`.
+    fn compare_combo(before: &super::BestLookup, combo: u32) -> super::BestCompare {
+        let tally = eval::Tally {
+            max_combo: combo,
+            ..eval::Tally::default()
+        };
+        let figures = crate::result_figures::ResultFigures {
+            notes: 200,
+            max_ex: 400,
+            rate: None,
+            next_rank: 0,
+            clear: super::BestLamp::Failed,
+            cleared: false,
+            gauge_permille: 0,
+            timing: None,
+            duration_us: None,
+            areas: [[0; 2]; 5],
+        };
+        super::BestCompare::of(before, &tally, &figures, false)
+    }
+
+    /// A best of max combo `combo` (another play's than the best EX's).
+    fn known(combo: Option<u32>) -> super::BestLookup {
+        super::BestLookup::Known(super::BestScore {
+            plays: 2,
+            ex: Some(90),
+            bp: Some(3),
+            max_combo: combo,
+            clear: Some(super::BestLamp::Failed),
+        })
+    }
+
+    /// The best max combo before the play is carried with the view's max
+    /// combo less it: 100 before and 120 now give 100 and 20.
+    #[test]
+    fn compare_carries_the_best_max_combo() {
+        let super::BestCompare::Known(b) = compare_combo(&known(Some(100)), 120) else {
+            panic!("unavailable");
+        };
+        assert_eq!((b.max_combo, b.max_combo_diff), (Some(100), Some(20)));
+        let super::BestCompare::Known(b) = compare_combo(&known(Some(100)), 80) else {
+            panic!("unavailable");
+        };
+        assert_eq!((b.max_combo, b.max_combo_diff), (Some(100), Some(-20)));
+    }
+
+    /// A best max combo of 0, an empty best and one without a best draw
+    /// nothing, as the source draws its old combo only above 0.
+    #[test]
+    fn a_zero_previous_combo_hides_173_and_175() {
+        for before in [known(Some(0)), known(None), super::BestLookup::KnownEmpty] {
+            let super::BestCompare::Known(b) = compare_combo(&before, 50) else {
+                panic!("unavailable");
+            };
+            assert_eq!((b.max_combo, b.max_combo_diff), (None, None), "{before:?}");
+        }
     }
 }

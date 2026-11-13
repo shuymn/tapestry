@@ -136,6 +136,7 @@ impl BestsRecords {
             record,
             &verified,
             evaluation,
+            play.chart,
             &preset,
         );
         // The guard goes before a failure requests a catch-up through it.
@@ -175,6 +176,7 @@ pub fn shown(score: &Score, preset: &RulePreset) -> BestScore {
         plays: score.plays,
         ex: best.map(|b| b.ex),
         bp: best.map(|b| b.bp),
+        max_combo: best.map(|b| b.max_combo),
         clear: best.map(|b| best_lamp(own_lamp(b, preset))),
     }
 }
@@ -239,15 +241,50 @@ pub fn lamp_text(best: &Best, preset: &RulePreset) -> String {
 pub fn row_score(score: Option<&Score>, preset: &RulePreset) -> RowScore {
     match score {
         None => RowScore::Unplayed,
-        Some(Score { plays, best: None }) => RowScore::NoBest { plays: *plays },
+        Some(Score {
+            plays, best: None, ..
+        }) => RowScore::NoBest { plays: *plays },
         Some(Score {
             plays,
             best: Some(b),
+            ..
         }) => RowScore::Best {
             plays: *plays,
             ex: b.ex,
             bp: b.bp,
             lamp: own_lamp(b, preset),
+        },
+    }
+}
+
+/// What selection shows of a stored best beside its EX, BP and lamp: the
+/// best max combo, and the play that set the best EX with its evaluation's
+/// counts (design.md "Personal Bests").
+pub fn selected_best(best: &Best) -> skin_model::SelectedBest {
+    let p = &best.play;
+    let per = |[perfect, great, good, bad, poor]: [u32; 5]| rules::PerJudgment {
+        perfect,
+        great,
+        good,
+        bad,
+        poor,
+    };
+    skin_model::SelectedBest {
+        max_combo: best.max_combo,
+        play: skin_model::BestPlay {
+            tally: eval::Tally {
+                counts: per(p.counts),
+                ex_score: p.ex,
+                bp: p.bp,
+                max_combo: p.max_combo,
+                empty_poor: p.empty_poor,
+                early: per(p.early),
+                late: per(p.late),
+                empty_poor_early: p.empty_poor_early,
+                empty_poor_late: p.empty_poor_late,
+                ..eval::Tally::default()
+            },
+            notes: p.notes,
         },
     }
 }
@@ -355,6 +392,7 @@ mod tests {
             bp: 0,
             cleared: bits,
             full_combo,
+            ..Default::default()
         }
     }
 
@@ -448,6 +486,7 @@ mod tests {
             plays,
             ex: Some(ex),
             bp: Some(bp),
+            max_combo: Some(0),
             clear: Some(match lamp {
                 "NORMAL" => BestLamp::Cleared { gauge: 0 },
                 "HARD" => BestLamp::Cleared { gauge: 3 },
@@ -509,12 +548,14 @@ mod tests {
         let p = ranked();
         let scored = Score {
             plays: 2,
+            clears: 0,
             best: Some(cleared(&[3], false)),
         };
         let cell = |score: Option<&Score>, p| chart_cell(&super::row_score(score, p), Some(p));
         assert_eq!(cell(Some(&scored), &p), "HARD           10");
         let no_best = Score {
             plays: 2,
+            clears: 0,
             best: None,
         };
         assert_eq!(cell(Some(&no_best), &p), "-               -");
@@ -608,6 +649,63 @@ mod tests {
     }
 
     /// A view's best before the play, read through the live writer: known
+    /// The max combo a result compares with is the counted transaction's
+    /// best before the play, of any play, not the best EX play's and not
+    /// the one after: a first play (EX 4, combo 2), then one of combo 3
+    /// (EX 3) reads 2 and +1; a later play of combo 2 reads that 3 and −1.
+    #[test]
+    fn result_reads_the_best_combo_before_the_play() {
+        let fx = common::Fixture::new();
+        let lib = fx.open();
+        fx.pass(&lib);
+        let mut sink = sink(&fx, &lib);
+        // The last tap missed: EX 4, combo 2.
+        let mut missed_last = common::played(0);
+        missed_last.events.truncate(4);
+        let compare = |view: &BestView, record: &replay::PlayRecord| {
+            let BestView::Counted { previous, .. } = view else {
+                panic!("{view:?}");
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let chart =
+                replay::verify::load_recorded_chart(record, common::CHART.as_bytes(), dir.path())
+                    .unwrap();
+            let tally = replay::verify::evaluate_record(record, &chart, None)
+                .unwrap()
+                .evaluation
+                .tally;
+            let figures = game::ResultFigures {
+                notes: 3,
+                max_ex: 6,
+                rate: None,
+                next_rank: 0,
+                clear: BestLamp::Failed,
+                cleared: false,
+                gauge_permille: 0,
+                timing: None,
+                duration_us: None,
+                areas: [[0; 2]; 5],
+            };
+            let game::BestCompare::Known(b) = game::BestCompare::of(
+                &game::BestLookup::previous(previous.as_ref()),
+                &tally,
+                &figures,
+                false,
+            ) else {
+                panic!("unavailable");
+            };
+            (b.ex, b.max_combo, b.max_combo_diff)
+        };
+        let first = finish(&mut sink, &missed_last);
+        assert_eq!(compare(&first, &missed_last), (0, None, None));
+        let all_great = common::played(30);
+        let second = finish(&mut sink, &all_great);
+        assert_eq!(compare(&second, &all_great), (4, Some(2), Some(1)));
+        // The same play again, saved under its own name: counted again.
+        let third = finish(&mut sink, &missed_last);
+        assert_eq!(compare(&third, &missed_last), (4, Some(3), Some(-1)));
+    }
+
     /// empty without a row, then the counted best with its typed lamp,
     /// and known empty again under another preset's key.
     #[test]
@@ -631,6 +729,7 @@ mod tests {
                 plays: 1,
                 ex: Some(6),
                 bp: Some(0),
+                max_combo: Some(3),
                 clear: Some(BestLamp::FullCombo),
             })
         );
@@ -653,11 +752,13 @@ mod tests {
         assert_eq!(super::lookup(None, &p), BestLookup::KnownEmpty);
         let no_best = Score {
             plays: 3,
+            clears: 0,
             best: None,
         };
         assert_eq!(super::lookup(Some(&no_best), &p), BestLookup::KnownEmpty);
         let scored = Score {
             plays: 3,
+            clears: 0,
             best: Some(cleared(&[0, 3], false)),
         };
         assert_eq!(
@@ -666,6 +767,7 @@ mod tests {
                 plays: 3,
                 ex: Some(10),
                 bp: Some(0),
+                max_combo: Some(0),
                 clear: Some(BestLamp::Cleared { gauge: 3 }),
             })
         );

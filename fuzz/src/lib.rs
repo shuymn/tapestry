@@ -450,6 +450,8 @@ pub fn result_view(ready: bool) -> skin_model::ResultView {
             ex_diff: 1_060,
             bp: ResultNumber::Hidden,
             bp_diff: ResultNumber::Hidden,
+            max_combo: ResultNumber::Hidden,
+            max_combo_diff: ResultNumber::Hidden,
             clear: LampKey::NoPlay,
             ex_updated: true,
             bp_updated: true,
@@ -632,6 +634,8 @@ fn draw_selection(skin: &skin_model::Skin) -> Vec<usize> {
             max_ex: Some(300),
             score: RowScore::NoBest { plays: 1 },
             judge_class: Some(3),
+            clears: 0,
+            best: None,
         });
         let view = SelectionView {
             rows: rows.clone(),

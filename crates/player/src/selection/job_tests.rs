@@ -160,6 +160,7 @@ fn bench_on(coord: Coordinator, dir: &Path, decodes: Decodes, spawner: Spawner) 
         dirty: false,
         search_pending: false,
         preset_steps: std::collections::VecDeque::new(),
+        covers_turned: [false; 3],
         script: None,
         coord: coord.clone(),
         spawner,

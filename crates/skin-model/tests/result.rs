@@ -217,6 +217,8 @@ fn a_view_fills_the_result_fields() {
         (field::BEST_RATE_BP, 7_500),
         (field::BEST_GRADE, 5),
         (field::BEST_RATE_UPDATED, 1),
+        (field::BEST_MAX_COMBO, 100),
+        (field::BEST_MAX_COMBO_DIFF, 20),
         (field::CHART_LEVEL, 12),
         (field::CHART_LEVEL_VALID, 1),
         (field::CHART_TOTAL, 300),
@@ -239,10 +241,14 @@ fn a_view_fills_the_result_fields() {
     assert_eq!(f(field::BEST_KNOWN), 1);
     assert_eq!(f(field::BEST_BP), i32::MIN);
     assert_eq!(f(field::BEST_BP_DIFF), i32::MIN);
+    assert_eq!(f(field::BEST_MAX_COMBO), i32::MIN);
+    assert_eq!(f(field::BEST_MAX_COMBO_DIFF), i32::MIN);
     // Unavailable best: every best field is 0 and invalid.
     fx.view(&ready(1_000, BestView::Unavailable, 4));
     let f = |slot: u16| fx.res.state().fields[usize::from(slot)];
-    for slot in field::BEST_KNOWN..=field::BEST_RATE_UPDATED {
+    for slot in (field::BEST_KNOWN..=field::BEST_RATE_UPDATED)
+        .chain([field::BEST_MAX_COMBO, field::BEST_MAX_COMBO_DIFF])
+    {
         assert_eq!(f(slot), 0, "slot {slot}");
     }
     // An unknown chart fact is invalid; a difficulty outside 1 to 5 is 0.
