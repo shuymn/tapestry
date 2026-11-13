@@ -9,9 +9,9 @@
 //!   a sound set, `select` for a BGM set), within [`ScanLimits`].
 //! - [`resolve`] finds each kind's file: its `.wav` name, then `.flac`,
 //!   `.ogg` and `.mp3`, first in the picked set and then in `defaultsound\`.
-//!   A candidate must stay inside its folder once canonicalized and be a
-//!   regular file; one that does not is refused and named, and lookup moves
-//!   on.
+//!   A candidate must stay inside its folder once canonicalized, be a
+//!   regular file and keep its extension; one that does not is refused and
+//!   named, and lookup moves on.
 //! - [`Recovery`] owns `sound-sets.toml` under the exclusive lock
 //!   `sound-sets.lock`: a source's identity is committed as the marker
 //!   before any of its files is read for decoding and cleared after, and a
@@ -288,6 +288,8 @@ pub enum Why {
     NotAFile,
     /// It could not be resolved (a dangling link).
     Unresolved,
+    /// It leads to a file named with another extension.
+    Extension,
     /// Its metadata could not be read for a reason other than its absence.
     Unreadable(io::ErrorKind),
     /// Its decode refused it.
@@ -300,6 +302,7 @@ impl fmt::Display for Why {
             Self::Escapes => f.write_str("it leads out of its folder"),
             Self::NotAFile => f.write_str("it is not a regular file"),
             Self::Unresolved => f.write_str("it cannot be resolved"),
+            Self::Extension => f.write_str("it leads to a file of another extension"),
             Self::Unreadable(kind) => write!(f, "it cannot be read: {kind}"),
             Self::File(r) => r.fmt(f),
         }
@@ -327,43 +330,48 @@ impl fmt::Display for Refused {
 }
 
 /// `kind`'s file in the canonical `folder`: the first of its names with
-/// [`EXTENSIONS`] that exists, stays inside the folder and is a regular
-/// file. Only a name the system reports not found is absent: one whose
-/// metadata cannot be read, or that exists but fails, is refused into
-/// `refused` and the next is tried. Nothing is opened: a FIFO is refused by
-/// its type.
+/// [`EXTENSIONS`] that exists and that [`admit`] admits. Only a name the
+/// system reports not found is absent: one whose metadata cannot be read,
+/// or that exists but is not admitted, is refused into `refused` and the
+/// next is tried. Nothing is opened: a FIFO is refused by its type.
 fn locate(folder: &Path, kind: SystemKind, refused: &mut Vec<Refused>) -> Option<PathBuf> {
     for ext in EXTENSIONS {
         let joined = folder.join(format!("{}.{ext}", file_stem(kind)));
-        let mut refuse = |why| {
-            refused.push(Refused {
-                path: joined.clone(),
-                why,
-            });
-        };
-        match candidate_metadata(&joined) {
-            Ok(_) => {}
+        let why = match candidate_metadata(&joined) {
+            Ok(_) => match admit(folder, &joined, ext) {
+                Ok((canonical, _)) => return Some(canonical),
+                Err(why) => why,
+            },
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                refuse(Why::Unreadable(e.kind()));
-                continue;
-            }
-        }
-        let Ok(canonical) = joined.canonicalize() else {
-            refuse(Why::Unresolved);
-            continue;
+            Err(e) => Why::Unreadable(e.kind()),
         };
-        if !canonical.starts_with(folder) {
-            refuse(Why::Escapes);
-            continue;
-        }
-        if !fs::metadata(&canonical).is_ok_and(|m| m.is_file()) {
-            refuse(Why::NotAFile);
-            continue;
-        }
-        return Some(canonical);
+        refused.push(Refused { path: joined, why });
     }
     None
+}
+
+/// The canonical path and metadata of the existing candidate `joined` of
+/// the canonical `folder`, named with `ext`, when it is admitted: once
+/// canonicalized it stays inside the folder, is a regular file and keeps
+/// the extension `ext`. tapestry writes no file with an audio extension,
+/// so a link never admits one of its own files, whose writes would change
+/// a [`SourceIdentity`].
+fn admit(folder: &Path, joined: &Path, ext: &str) -> Result<(PathBuf, fs::Metadata), Why> {
+    let canonical = joined.canonicalize().map_err(|_| Why::Unresolved)?;
+    if !canonical.starts_with(folder) {
+        return Err(Why::Escapes);
+    }
+    let meta = fs::metadata(&canonical)
+        .ok()
+        .filter(fs::Metadata::is_file)
+        .ok_or(Why::NotAFile)?;
+    if !canonical
+        .extension()
+        .is_some_and(|e| e.eq_ignore_ascii_case(ext))
+    {
+        return Err(Why::Extension);
+    }
+    Ok((canonical, meta))
 }
 
 /// A candidate's own metadata, links not followed; in tests, an injected
@@ -410,14 +418,19 @@ pub struct FileStamp {
     pub mtime_ns: i64,
 }
 
-/// A source's identity (design.md T18): its canonical folder with the name,
-/// size and modification time of each candidate file of every kind that
-/// exists in it, sorted by name; a candidate that is a link leading out of
-/// the folder is stamped by the link's own metadata, so nothing outside the
-/// folder changes the identity. It covers every kind whatever role the
-/// folder serves, so a folder that is a sound set, a BGM set and
-/// `defaultsound\` at once has one identity, and its quarantine holds for
-/// every role. A change of any of them makes another identity.
+/// A source's identity (design.md T18): its canonical folder with a stamp
+/// of each candidate file of every kind that exists in it, sorted by name.
+/// A candidate lookup admits ([`admit`]) is stamped with the size and
+/// modification time of the file it resolves to, so a link is followed
+/// only to a regular file inside the folder. Any other candidate (a link
+/// or junction to a folder, out of the folder or that cannot be resolved,
+/// a folder, a device) is stamped by its name alone: none of it is read,
+/// and its times can move with whatever is written in or through it, the
+/// recovery state included when the data root lies in the set. It covers
+/// every kind whatever role the folder serves, so a folder that is a sound
+/// set, a BGM set and `defaultsound\` at once has one identity, and its
+/// quarantine holds for every role. A change of any stamp makes another
+/// identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceIdentity {
@@ -435,31 +448,16 @@ impl SourceIdentity {
             for ext in EXTENSIONS {
                 let name = format!("{}.{ext}", file_stem(kind));
                 let path = folder.join(&name);
-                let Ok(own) = fs::symlink_metadata(&path) else {
+                if fs::symlink_metadata(&path).is_err() {
                     continue;
+                }
+                let (size, mtime_ns) = match admit(folder, &path, ext) {
+                    Ok((_, meta)) => (meta.len(), mtime_ns(&meta)),
+                    Err(_) => (0, 0),
                 };
-                // Only what the folder controls: a link is followed while
-                // its target stays inside the folder; one leading out (or
-                // unresolved) is stamped by its own metadata, so a target
-                // outside cannot change the identity.
-                let meta = match path.canonicalize() {
-                    Ok(target) if target.starts_with(folder) => {
-                        fs::metadata(&target).unwrap_or(own)
-                    }
-                    _ => own,
-                };
-                let mtime_ns =
-                    meta.modified()
-                        .ok()
-                        .map_or(0, |t| match t.duration_since(UNIX_EPOCH) {
-                            Ok(d) => i64::try_from(d.as_nanos()).unwrap_or(i64::MAX),
-                            Err(e) => {
-                                i64::try_from(e.duration().as_nanos()).map_or(i64::MIN, |n| -n)
-                            }
-                        });
                 files.push(FileStamp {
                     name,
-                    size: meta.len(),
+                    size,
                     mtime_ns,
                 });
             }
@@ -470,6 +468,17 @@ impl SourceIdentity {
             files,
         }
     }
+}
+
+/// `meta`'s modification time in ns since the Unix epoch, 0 when the system
+/// gives none.
+fn mtime_ns(meta: &fs::Metadata) -> i64 {
+    meta.modified()
+        .ok()
+        .map_or(0, |t| match t.duration_since(UNIX_EPOCH) {
+            Ok(d) => i64::try_from(d.as_nanos()).unwrap_or(i64::MAX),
+            Err(e) => i64::try_from(e.duration().as_nanos()).map_or(i64::MIN, |n| -n),
+        })
 }
 
 impl fmt::Display for SourceIdentity {

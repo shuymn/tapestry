@@ -844,14 +844,15 @@ fn choose_leaves_out_quarantined_sets() {
     assert!(random_index(3) < 3);
 }
 
-/// The real decode, except that at `select.wav` it copies the recovery
+/// The real decode, except that at the file `at` it copies the recovery
 /// state as it stands: what a launch that crashed there would leave.
-struct CrashAtSelect {
+struct CrashAt {
+    at: &'static str,
     state: PathBuf,
     left: Mutex<Option<Vec<u8>>>,
 }
 
-impl DecodeFile for CrashAtSelect {
+impl DecodeFile for CrashAt {
     fn decode(
         &self,
         path: &Path,
@@ -860,7 +861,7 @@ impl DecodeFile for CrashAtSelect {
         limits: &BankLimits,
         cancel: &(dyn Fn() -> bool + Sync),
     ) -> Result<Decoded, FileRefusal> {
-        if path.file_name().is_some_and(|n| n == "select.wav") {
+        if path.file_name().is_some_and(|n| n == self.at) {
             *self.left.lock().unwrap() = Some(fs::read(&self.state).unwrap());
         }
         OneFile.decode(path, rate, budget, limits, cancel)
@@ -885,7 +886,8 @@ fn a_folder_quarantined_in_one_role_stays_so_in_every_role() {
 
     // The first launch crashes decoding `select.wav`, its BGM marker
     // committed.
-    let crash = CrashAtSelect {
+    let crash = CrashAt {
+        at: "select.wav",
         state: data.sound_sets(),
         left: Mutex::new(None),
     };
@@ -999,6 +1001,101 @@ fn a_link_out_of_the_set_cannot_expire_its_quarantine() {
     );
     assert!(matches!(report.decode, PickDecode::Ready(_)));
     assert_eq!(recovery.quarantined().len(), 1, "the quarantine dropped");
+}
+
+/// The recovery state inside the selected set cannot expire its own
+/// quarantine: a launch that crashes decoding `clear.wav` leaves a marker,
+/// and the marker and quarantine commits write `sound-sets.toml` through a
+/// temporary file in the data root, which changes that folder's times. The
+/// identity follows a candidate's link only to a regular file of its
+/// extension inside the set, so neither `fail.wav`, a junction to the set
+/// folder itself, nor `scratch.wav`, a link to `sound-sets.toml`, nor
+/// `fail.wav` as the folder holding the data root, carries those times.
+// Covers: T18
+#[test]
+fn the_recovery_state_in_a_set_cannot_expire_its_quarantine() {
+    let base = tmp();
+    let set = base.path().join("set");
+    let in_set = base.path().join("in-set");
+    for (layout, set, data) in [
+        (
+            "the data root is the set",
+            set.clone(),
+            DataRoot::new(set.clone()),
+        ),
+        (
+            "the data root is the set's fail.wav folder",
+            in_set.clone(),
+            DataRoot::new(in_set.join("fail.wav")),
+        ),
+    ] {
+        put_bytes(&set, "clear.wav", &wav(480, 200));
+        // The lock and the state file exist before any identity is read.
+        drop(Recovery::open(&data, Box::new(DiskFs::default())).unwrap());
+        if layout == "the data root is the set" {
+            link_dir(&set.join("fail.wav"), &set);
+            link_file(&set.join("scratch.wav"), &data.sound_sets());
+        }
+        let sets = scan(&set, SetRole::Sound, &ScanLimits::default()).sets;
+        assert_eq!(sets, [canon(&set)], "{layout}");
+        let the_pick = pick(Some(&set), None, &data.default_sounds());
+
+        let crash = CrashAt {
+            at: "clear.wav",
+            state: data.sound_sets(),
+            left: Mutex::new(None),
+        };
+        {
+            let mut recovery = Recovery::open(&data, Box::new(DiskFs::default()))
+                .unwrap()
+                .recovery;
+            let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
+            decode_pick(
+                &the_pick,
+                &KeptSounds::default(),
+                &budget,
+                &mut recovery,
+                &|| false,
+                &crash,
+            );
+        }
+        let left = crash.left.lock().unwrap().take();
+        fs::write(data.sound_sets(), left.expect("clear.wav decoded")).unwrap();
+
+        for launch in 2..=3 {
+            let opened = Recovery::open(&data, Box::new(DiskFs::default())).unwrap();
+            if launch == 2 {
+                assert_eq!(
+                    opened.quarantined.as_ref().map(|q| &q.path),
+                    Some(&canon(&set)),
+                    "{layout}"
+                );
+            }
+            let mut recovery = opened.recovery;
+            let chosen = choose(&sets, &mut recovery, &[], &mut |_| 0);
+            assert_eq!(chosen, None, "{layout}, launch {launch}: the set chosen");
+            let seen = Arc::new(Mutex::new(Seen::default()));
+            let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
+            decode_pick(
+                &the_pick,
+                &KeptSounds::default(),
+                &budget,
+                &mut recovery,
+                &|| false,
+                &LoggedDecode(Arc::clone(&seen)),
+            );
+            assert_eq!(
+                ops(&seen),
+                Vec::<String>::new(),
+                "{layout}, launch {launch}: the quarantined set was read"
+            );
+            assert_eq!(
+                recovery.quarantined().len(),
+                1,
+                "{layout}, launch {launch}: the quarantine dropped"
+            );
+        }
+    }
 }
 
 fn identity_of_set(set: &Path) -> game::sound_sets::SourceIdentity {
