@@ -433,12 +433,10 @@ pub(crate) fn graph(ty: i32) -> Option<Class<RatioSource>> {
 /// The selection event `id`: an image's `act`, a `customEvents` action.
 /// Each is a pointer target that takes the press; only an N event acts.
 pub(crate) fn event(id: i32) -> Option<Class<()>> {
-    use Class::{Bridge, Omit, Unavailable};
+    use Class::{Bridge, Omit};
     Some(match id {
-        // Sort, play and practice.
-        12 | 15 | 315 => Bridge(()),
-        // The cover actions, which the settings panel will back.
-        330..=332 => Unavailable,
+        // Sort, play, practice and the cover switches.
+        12 | 15 | 315 | 330..=332 => Bridge(()),
         // No native contract.
         11 | 13 | 14 | 16 | 17 | 19 | 308 | 316..=318 | 340..=342 => Omit,
         _ => return None,
@@ -583,7 +581,7 @@ mod tests {
         (308, 308, C::D),
         (315, 315, C::N),
         (316, 318, C::D),
-        (330, 332, C::E),
+        (330, 332, C::N),
         (340, 342, C::D),
     ];
 

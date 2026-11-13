@@ -85,8 +85,8 @@ fn action(event: u16, arg: i8) -> Option<PointerHit> {
 }
 
 /// Each click type gives its argument; every profile event's image is a
-/// target, an N event noted nothing, an E one as unavailable and a D one
-/// as ignored; an image set and an image group take their action as an
+/// target, an N event (the cover switch 331 among them) noted nothing and
+/// a D one as ignored; an image set and an image group take their action as an
 /// image does; an unknown event or a `click` past 3 has no target, each
 /// noted.
 #[test]
@@ -122,8 +122,7 @@ fn act_and_click_become_actions() {
         kind: PropertyKind::Event,
         id,
     };
-    assert!(notes.contains(&event(331)), "{notes:?}");
-    for id in [12, 15, 315] {
+    for id in [12, 15, 315, 331] {
         assert!(!notes.contains(&event(id)), "{notes:?}");
     }
     let ignored = |field| NoteKind::Ignored { field };
@@ -152,7 +151,7 @@ fn act_and_click_become_actions() {
     // Type 3: top and bottom.
     assert_eq!(hit(&s, [650.0, 10.0], Button::Left), action(12, 1));
     assert_eq!(hit(&s, [650.0, 90.0], Button::Left), action(12, -1));
-    // E and D: consumed targets.
+    // The cover switch and a D event: targets.
     assert_eq!(hit(&s, [850.0, 50.0], Button::Left), action(331, 1));
     assert_eq!(hit(&s, [1_050.0, 50.0], Button::Left), action(13, 1));
     // No target.
