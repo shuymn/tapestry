@@ -195,6 +195,10 @@ pub struct PlayerRig<'a> {
     /// The page side of the committed play skin's chart layer, if it keeps
     /// one ([`crate::imports::Started::play_chart`]).
     pub play_chart: Option<u32>,
+    /// The page side of the selection skin's chart layer, if it keeps one
+    /// ([`crate::imports::Started::selection_chart`]): without one the
+    /// cursor asks for no image.
+    pub selection_chart: Option<u32>,
     /// The window's controls.
     pub controls: &'a Controls,
     /// Whether the window was shown: recording opens once it is. `None`
@@ -539,11 +543,11 @@ impl PlayerRig<'_> {
     /// launch, decoded now on this thread) go on to the result's image
     /// stage at once; otherwise the preparation's polls wait for them.
     fn enter_facts(&mut self, prep: &mut AttemptPrep, skin: AttemptSkin) -> PrepStage {
-        let (dir, names) = prep.images.clone();
+        let (dir, [stage, back]) = prep.images.clone();
         let play = self.play_side(&skin);
         self.chart_images.attempt(crate::chart_images::Want {
             dir,
-            names,
+            names: [stage, back, String::new()],
             play,
             result: None,
         });
@@ -692,10 +696,10 @@ impl PlayerRig<'_> {
         // for every view, else of the prepared atlas, when it keeps one.
         let play = self.play_side(&skin);
         let result = self.result_skin.chart_side();
-        let (dir, names) = prep.images.clone();
+        let (dir, [stage, back]) = prep.images.clone();
         self.chart_images.attempt(crate::chart_images::Want {
             dir,
-            names,
+            names: [stage, back, String::new()],
             play,
             result,
         });
@@ -763,7 +767,11 @@ impl PlayerRig<'_> {
         let labels = loaded.labels();
         self.chart_images.attempt(crate::chart_images::Want {
             dir: crate::chart_images::folder(loaded.path()),
-            names: [labels.stagefile.clone(), labels.backbmp.clone()],
+            names: [
+                labels.stagefile.clone(),
+                labels.backbmp.clone(),
+                String::new(),
+            ],
             play: self.play_chart.filter(|_| self.pending.is_none()),
             result: None,
         });
@@ -2959,7 +2967,7 @@ impl ResultRetries {
 }
 
 /// How long the chart images' wait parks between its looks.
-const IMAGE_SLICE: std::time::Duration = std::time::Duration::from_millis(2);
+pub(crate) const IMAGE_SLICE: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Where the wait for the chart's images ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

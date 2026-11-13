@@ -1304,6 +1304,9 @@ pub struct Started {
     /// The page side of the committed play skin's chart layer, when it
     /// keeps one: the chart's images are fitted for it (S10-12).
     pub play_chart: Option<u32>,
+    /// The page side of the installed selection skin's chart layer, when
+    /// it keeps one: the cursor's images are read for it (S10-12).
+    pub selection_chart: Option<u32>,
 }
 
 impl PartialEq for Started {
@@ -1314,6 +1317,7 @@ impl PartialEq for Started {
             && self.notice == other.notice
             && self.selection == other.selection
             && self.play_chart == other.play_chart
+            && self.selection_chart == other.selection_chart
             && match (&self.pending, &other.pending) {
                 (None, None) => true,
                 (Some(a), Some(b)) => Arc::ptr_eq(&a.play, &b.play),
@@ -1436,7 +1440,7 @@ pub fn startup(
                 let skin = bundle.skin();
                 let window = (kind == ScreenKind::Selection)
                     .then(|| (skin.song_list_center(), skin.song_list_slots()));
-                let chart = (kind == ScreenKind::Play)
+                let chart = matches!(kind, ScreenKind::Play | ScreenKind::Selection)
                     .then(|| bundle.chart_layer().map(|_| side))
                     .flatten();
                 let pending = render.select_with(kind, Some(bundle), script);
@@ -1447,6 +1451,9 @@ pub fn startup(
                         }
                         if kind == ScreenKind::Play {
                             started.play_chart = chart;
+                        }
+                        if kind == ScreenKind::Selection {
+                            started.selection_chart = chart;
                         }
                         committed = committed.saturating_add(texels);
                         let atlas = Atlas { texels, side };

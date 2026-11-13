@@ -183,7 +183,7 @@ pub trait Screen: Send {
     fn publish_chart_images(
         &mut self,
         target: render::ChartTarget,
-        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
     ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
         let _ = (target, images);
         Err(RenderError::NoChartLayer)
@@ -210,7 +210,7 @@ pub trait Screen: Send {
     fn write_result_chart(
         &mut self,
         target: render::ResultChartTarget,
-        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
         set: u64,
     ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
         let _ = (target, images, set);
@@ -224,6 +224,27 @@ pub trait Screen: Send {
     /// ([`render::Renderer::chart_key`]); `None` by default, which has no
     /// chart layer.
     fn chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
+        None
+    }
+    /// Writes the cursor's chart images, set `set`, into the committed
+    /// selection installation's array
+    /// ([`render::Renderer::write_selection_chart`]).
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's; [`RenderError::NoChartLayer`] by default.
+    fn write_selection_chart(
+        &mut self,
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
+        set: u64,
+    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+        let _ = (images, set);
+        Err(RenderError::NoChartLayer)
+    }
+    /// The live key of the committed selection installation's chart layer
+    /// ([`render::Renderer::selection_chart_key`]); `None` by default,
+    /// which has none.
+    fn selection_chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
         None
     }
     /// Stages `skin`'s chart-independent installation of `kind` for
@@ -1047,6 +1068,18 @@ pub enum RenderMsg {
         /// Where the answer goes.
         reply: mpsc::SyncSender<crate::chart_images::Ack>,
     },
+    /// Publish the cursor's chart images into the committed selection
+    /// installation (S10-12); `set` `None` publishes them absent. Answer
+    /// what it left.
+    SelectionChart {
+        /// The cursor generation it is for: refused, nothing published,
+        /// once the game thread set another.
+        cursor_generation: u64,
+        /// The images, or `None` for absent.
+        set: Option<Arc<crate::chart_images::ChartImages>>,
+        /// Where the answer goes.
+        reply: mpsc::SyncSender<crate::chart_images::Ack>,
+    },
     /// Install this declarative skin's chart-independent installation
     /// for the screen kind, and for play prepare every later attempt
     /// with it; `None` prepares play's later attempts with the skin in
@@ -1251,6 +1284,37 @@ impl FrameSink for NoFrames {
     fn frame(&mut self, _screen: &dyn Screen, _drawn: &Drawn<'_>) {}
 }
 
+/// The chart images' live targets, as the render thread mirrors them for
+/// the game thread ([`crate::chart_images::ChartNow`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ChartTargets {
+    /// The request of the staging the render thread holds.
+    staged: Option<u64>,
+    /// The committed play installation's chart key.
+    committed: Option<skin_model::chart_image::ChartKey>,
+    /// The committed selection installation's chart key.
+    selection: Option<skin_model::chart_image::ChartKey>,
+}
+
+impl Shared {
+    /// The present a chart acknowledgment of `generation` is checked
+    /// against: the cursor generation and the live targets the render
+    /// thread mirrored last.
+    fn chart_now(&self, generation: u64) -> crate::chart_images::ChartNow {
+        let t = *self
+            .chart_targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        crate::chart_images::ChartNow {
+            generation,
+            staged: t.staged,
+            committed: t.committed,
+            cursor_generation: self.cursor_generation.load(Ordering::SeqCst),
+            selection: t.selection,
+        }
+    }
+}
+
 /// What wakes the game thread for a decision takeover
 /// ([`RenderLink::set_game_wake`]).
 #[derive(Default)]
@@ -1274,10 +1338,13 @@ struct Shared {
     /// writes ([`crate::chart_images::ChartImageWorker::renew`]) and the
     /// render thread reads before each frame and publication.
     chart_generation: Arc<AtomicU64>,
-    /// The chart images' live targets as the render thread last saw them:
-    /// the staging's request and the committed chart layer's key, which
-    /// the game thread checks an acknowledgment against.
-    chart_targets: Mutex<(Option<u64>, Option<skin_model::chart_image::ChartKey>)>,
+    /// The cursor generation of the selection's chart images, which the
+    /// game thread's worker writes and the render thread reads before
+    /// each frame and selection publication.
+    cursor_generation: Arc<AtomicU64>,
+    /// The chart images' live targets as the render thread last saw them,
+    /// which the game thread checks an acknowledgment against.
+    chart_targets: Mutex<ChartTargets>,
     /// While set, a chart publication waits before it publishes, at most
     /// [`hook_bound`] (tests).
     #[cfg(test)]
@@ -1474,7 +1541,8 @@ impl Shared {
             failed: AtomicBool::new(false),
             recovery: Mutex::new(Recovery::Idle),
             chart_generation: Arc::default(),
-            chart_targets: Mutex::new((None, None)),
+            cursor_generation: Arc::default(),
+            chart_targets: Mutex::new(ChartTargets::default()),
             #[cfg(test)]
             chart_hold: AtomicBool::new(false),
             first_frame: AtomicI64::new(i64::MIN),
@@ -2150,6 +2218,7 @@ fn hook_bound() -> Duration {
 #[derive(Clone)]
 pub struct ChartPublisher {
     tx: Sender<RenderMsg>,
+    shared: Arc<Shared>,
 }
 
 impl ChartPublisher {
@@ -2168,6 +2237,29 @@ impl ChartPublisher {
             set,
             reply,
         });
+    }
+
+    /// Asks the render thread to publish the cursor's chart images `set`
+    /// (absent when `None`) of `cursor_generation` into the selection
+    /// installation, answering on `reply` ([`RenderMsg::SelectionChart`]).
+    pub fn publish_selection(
+        &self,
+        cursor_generation: u64,
+        set: Option<Arc<crate::chart_images::ChartImages>>,
+        reply: mpsc::SyncSender<crate::chart_images::Ack>,
+    ) {
+        let _ = self.tx.send(RenderMsg::SelectionChart {
+            cursor_generation,
+            set,
+            reply,
+        });
+    }
+
+    /// The present an acknowledgment is checked against, as
+    /// [`RenderLink::chart_now`] reads it, from any thread.
+    #[must_use]
+    pub fn now(&self, generation: u64) -> crate::chart_images::ChartNow {
+        self.shared.chart_now(generation)
     }
 }
 
@@ -2651,12 +2743,30 @@ impl RenderLink {
         rx
     }
 
+    /// Asks the render thread to publish the cursor's chart images `set`
+    /// (absent when `None`) of `cursor_generation` into the selection
+    /// installation, answering on the receiver returned, which the caller
+    /// polls ([`RenderMsg::SelectionChart`]); tests: the worker publishes
+    /// through its [`ChartPublisher::publish_selection`].
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn publish_selection_chart(
+        &self,
+        cursor_generation: u64,
+        set: Option<Arc<crate::chart_images::ChartImages>>,
+    ) -> mpsc::Receiver<crate::chart_images::Ack> {
+        let (reply, rx) = mpsc::sync_channel(1);
+        self.chart_publisher()
+            .publish_selection(cursor_generation, set, reply);
+        rx
+    }
+
     /// What publishes the chart's images from another thread: the job
     /// that read them.
     #[must_use]
     pub fn chart_publisher(&self) -> ChartPublisher {
         ChartPublisher {
             tx: self.tx.clone(),
+            shared: Arc::clone(&self.shared),
         }
     }
 
@@ -2667,21 +2777,21 @@ impl RenderLink {
         Arc::clone(&self.shared.chart_generation)
     }
 
+    /// Where the selection's cursor generation is written, for the
+    /// worker: a selection publication or table of another one is not
+    /// current.
+    #[must_use]
+    pub fn cursor_generation(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.shared.cursor_generation)
+    }
+
     /// The present an acknowledgment of `generation`'s images is checked
     /// against ([`crate::chart_images::PublicationKey::current`]): the
-    /// live targets the render thread mirrored last.
+    /// live targets the render thread mirrored last, and the cursor
+    /// generation.
     #[must_use]
     pub fn chart_now(&self, generation: u64) -> crate::chart_images::ChartNow {
-        let (staged, committed) = *self
-            .shared
-            .chart_targets
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        crate::chart_images::ChartNow {
-            generation,
-            staged,
-            committed,
-        }
+        self.shared.chart_now(generation)
     }
 
     /// How long an answer of the render thread is waited for.
@@ -2690,8 +2800,8 @@ impl RenderLink {
         self.answer_timeout
     }
 
-    /// Holds every chart publication before it publishes while `on`, at
-    /// most [`hook_bound`] each (tests).
+    /// Holds every chart publication, the selection's included, before it
+    /// publishes while `on`, at most [`hook_bound`] each (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn hold_chart_publications(&self, on: bool) {
         self.shared.chart_hold.store(on, Ordering::SeqCst);
@@ -3817,7 +3927,8 @@ pub fn spawn(
                 chart_generation: 0,
                 chart_table: None,
                 staged_table: None,
-                chart_targets: (None, None),
+                selection_table: None,
+                chart_targets: ChartTargets::default(),
                 presentation: None,
                 turntable: crate::turntable::Turntable::default(),
                 app: crate::app_clock::AppClock::new(),
@@ -4939,8 +5050,15 @@ struct Run {
     /// and the staging's.
     chart_table: Option<crate::chart_images::PublicationKey>,
     staged_table: Option<crate::chart_images::PublicationKey>,
+    /// What the selection installation's chart table was published for,
+    /// with the table its frames are given while it is current (the
+    /// render side's copy of the worker's selection set, I7).
+    selection_table: Option<(
+        crate::chart_images::PublicationKey,
+        skin_model::chart_image::ChartTable,
+    )>,
     /// The live targets last mirrored to the game thread.
-    chart_targets: (Option<u64>, Option<skin_model::chart_image::ChartKey>),
+    chart_targets: ChartTargets,
     /// The adjustments' snapshots ([`RenderMsg::Presentation`]).
     presentation: Option<game::adjustment::PresentationReader>,
     /// The play state's turntable (docs/stage3.md, offset 1).
@@ -5144,6 +5262,7 @@ impl Run {
                         | RenderMsg::Ready { .. }
                         | RenderMsg::Discard(_)
                         | RenderMsg::ChartImages { .. }
+                        | RenderMsg::SelectionChart { .. }
                         | RenderMsg::ParkScripts(_))
                 )
             {
@@ -5476,6 +5595,15 @@ impl Run {
                     reply,
                 }) => {
                     let ack = self.publish_chart(generation, request, set.as_deref());
+                    let _ = reply.send(ack);
+                    continue;
+                }
+                Ok(RenderMsg::SelectionChart {
+                    cursor_generation,
+                    set,
+                    reply,
+                }) => {
+                    let ack = self.publish_selection_chart(cursor_generation, set.as_deref());
                     let _ = reply.send(ack);
                     continue;
                 }
@@ -6193,6 +6321,14 @@ impl Run {
                     // The frame's one reading: its timers age on the instant
                     // the readouts were sampled at.
                     let changed = std::mem::replace(&mut shown.changed, false);
+                    // The cursor's chart images as current for this frame
+                    // (`sync_chart` ran after the lifetime's check): its
+                    // visit writes their fields after the view's.
+                    if let Some(logic) = shown.logic.as_mut() {
+                        logic
+                            .sel
+                            .set_chart_images(self.selection_table.map(|(_, t)| t));
+                    }
                     let drawn = screen.selection(
                         &shown.update,
                         shown.logic.as_mut(),
@@ -6220,6 +6356,7 @@ impl Run {
                         );
                         screen.remove(ScreenKind::Selection);
                         self.committed.clear(ScreenKind::Selection);
+                        self.selection_table = None;
                         // Parked as the state goes, then retired.
                         shown.logic = None;
                         self.scripts.retire_kind(ScreenKind::Selection);
@@ -7019,6 +7156,8 @@ impl Run {
             generation: self.shared.chart_generation.load(Ordering::SeqCst),
             staged: self.prepared.as_ref().map(|p| p.token.request),
             committed: self.screen.as_ref().and_then(|s| s.chart_key()),
+            cursor_generation: self.shared.cursor_generation.load(Ordering::SeqCst),
+            selection: self.screen.as_ref().and_then(|s| s.selection_chart_key()),
         }
     }
 
@@ -7027,7 +7166,10 @@ impl Run {
     /// generation, its installation or array replaced) is made
     /// unavailable with the staged one, so no frame draws a table of an
     /// earlier choice or attempt; a staged one whose staging is gone is
-    /// forgotten. The live targets are mirrored for the game thread.
+    /// forgotten. The selection table is dropped once it is not current
+    /// (another cursor generation, or its installation rebuilt, replaced,
+    /// removed or refused), so no selection frame draws it. The live
+    /// targets are mirrored for the game thread.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn sync_chart(&mut self) {
         let now = self.chart_now();
@@ -7047,7 +7189,17 @@ impl Run {
         if stale(&self.staged_table, now.staged) {
             self.staged_table = None;
         }
-        let targets = (now.staged, now.committed);
+        if self
+            .selection_table
+            .is_some_and(|(k, _)| !k.current(&now, None))
+        {
+            self.selection_table = None;
+        }
+        let targets = ChartTargets {
+            staged: now.staged,
+            committed: now.committed,
+            selection: now.selection,
+        };
         if self.chart_targets != targets {
             self.chart_targets = targets;
             *self
@@ -7075,12 +7227,7 @@ impl Run {
     ) -> crate::chart_images::Ack {
         use crate::chart_images::{Ack, PublicationKey, PublishedTo};
         #[cfg(test)]
-        {
-            let end = Instant::now() + hook_bound();
-            while self.shared.chart_hold.load(Ordering::SeqCst) && Instant::now() < end {
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
+        self.chart_held();
         self.sync_chart();
         let now = self.chart_now();
         let key = PublicationKey {
@@ -7134,6 +7281,73 @@ impl Run {
         }
         // The game thread logs what it left; this thread draws frames and
         // logs nothing.
+        Ack {
+            key,
+            answer: answer.map_err(|e| e.chart_outcome()),
+        }
+    }
+
+    /// Waits while chart publications are held, at most [`hook_bound`]
+    /// (tests: `RenderLink::hold_chart_publications`).
+    #[cfg(test)]
+    fn chart_held(&self) {
+        let end = Instant::now() + hook_bound();
+        while self.shared.chart_hold.load(Ordering::SeqCst) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Publishes the cursor's chart images `set` (absent when `None`) of
+    /// `cursor_generation` into the committed selection installation, and
+    /// records the table its frames are given while it stays current
+    /// ([`Self::sync_chart`]). Admitted only while the cursor generation
+    /// is the game thread's: an older one publishes nothing. With no
+    /// selection installation, or one keeping no chart layer, nothing is
+    /// recorded (`NoTarget`). A write the installation refuses leaves the
+    /// images absent there, recorded so its frames read them so.
+    fn publish_selection_chart(
+        &mut self,
+        cursor_generation: u64,
+        set: Option<&crate::chart_images::ChartImages>,
+    ) -> crate::chart_images::Ack {
+        use crate::chart_images::{Ack, PublicationKey, PublishedTo};
+        #[cfg(test)]
+        self.chart_held();
+        self.sync_chart();
+        let now = self.chart_now();
+        let key = PublicationKey {
+            generation: cursor_generation,
+            request: None,
+            target: PublishedTo::Selection(now.selection),
+        };
+        let refused = |outcome| Ack {
+            key,
+            answer: Err(outcome),
+        };
+        let Some(live) = now.selection else {
+            return refused(render::ChartOutcome::NoTarget);
+        };
+        if !key.current(&now, None) {
+            return refused(render::ChartOutcome::Unavailable);
+        }
+        let Some(screen) = &mut self.screen else {
+            return refused(render::ChartOutcome::Unavailable);
+        };
+        let answer = match set {
+            Some(set) => screen.write_selection_chart(set.fitted(), set.id()),
+            None => screen.publish_chart_absent(render::ChartTarget::Selection),
+        };
+        match &answer {
+            Ok(table) => self.selection_table = Some((key, *table)),
+            // A refused write leaves the images absent there: the frames
+            // read them so, as for play. The answer carries it; this thread
+            // logs nothing.
+            Err(e) if e.chart_outcome() == render::ChartOutcome::Absent => {
+                self.selection_table =
+                    Some((key, skin_model::chart_image::ChartTable::ABSENT.keyed(live)));
+            }
+            Err(_) => {}
+        }
         Ack {
             key,
             answer: answer.map_err(|e| e.chart_outcome()),
@@ -9327,7 +9541,7 @@ pub(crate) mod tests {
         }
     }
 
-    fn one_line(text: &str) -> crate::menu_screen::MenuPage {
+    pub(crate) fn one_line(text: &str) -> crate::menu_screen::MenuPage {
         crate::menu_screen::MenuPage {
             lines: vec![crate::menu_screen::MenuLine {
                 text: text.to_owned(),
@@ -11302,7 +11516,7 @@ pub(crate) mod tests {
     }
 
     /// The loading text of chart `title`.
-    fn chosen(title: &str) -> LoadingText {
+    pub(crate) fn chosen(title: &str) -> LoadingText {
         LoadingText {
             title: title.to_owned(),
             preset: "preset".to_owned(),

@@ -159,10 +159,12 @@ pub enum Source {
     TimingVisualizer(u32),
     /// The hit-error visualizer at this index of [`PlayDefs::hit_errors`].
     HitErrorVisualizer(u32),
-    /// The chart's own image `which` (play and result, S10-12): its installed
-    /// uv and native size ([`ChartTable`]), on the element's track, met by
-    /// `stretch` at placement and sampled with `filter`. An absent image,
-    /// and any while its table is unavailable, draws nothing.
+    /// The chart's own image `which` (S10-12): the stage file or back image
+    /// on play and result, the cursor's chart's stage file or banner on
+    /// selection. Its installed uv and native size ([`ChartTable`]), on the
+    /// element's track, met by `stretch` at placement and sampled with
+    /// `filter`. An absent image, and any while its table is unavailable,
+    /// draws nothing.
     ChartImage {
         which: ChartImage,
         filter: Filter,
@@ -1554,7 +1556,9 @@ fn selection_text(def: &SkinDef, source: Source) -> bool {
 /// score rate; a selection skin no lanes, gauge, judge, cover paint,
 /// graph or ratio bar of a score rate; a result skin none of these but
 /// its graphs; a decision skin only images, image choices whose selector
-/// is a constant, and chart text. The ratio bars are `sel`'s.
+/// is a constant, and chart text. Chart images are the stage file and back
+/// image on play and result, the stage file and banner on selection, and
+/// none on decision. The ratio bars are `sel`'s.
 fn check_kind(
     def: &SkinDef,
     kind: ScreenKind,
@@ -1599,10 +1603,10 @@ fn check_kind(
             },
             ScreenKind::Selection => match e.source {
                 Source::RatioBar(i) => score(i) != Some(true),
+                Source::ChartImage { which, .. } => which != ChartImage::Back,
                 _ => !matches!(
                     e.source,
                     Source::Lanes
-                        | Source::ChartImage { .. }
                         | Source::Gauge(_)
                         | Source::Judge(_)
                         | Source::CoverPaint(_)
@@ -1616,6 +1620,7 @@ fn check_kind(
             },
             ScreenKind::Result => match e.source {
                 Source::JudgeGraph(i) => notes(i) != Some(true),
+                Source::ChartImage { which, .. } => which != ChartImage::Banner,
                 _ => {
                     !selection_text(def, e.source)
                         && !matches!(
@@ -1635,6 +1640,7 @@ fn check_kind(
             ScreenKind::Play => match e.source {
                 Source::RatioBar(i) => score(i) == Some(true),
                 Source::JudgeGraph(i) => notes(i) == Some(true),
+                Source::ChartImage { which, .. } => which != ChartImage::Banner,
                 _ => {
                     !selection_text(def, e.source)
                         && !matches!(
@@ -4098,7 +4104,7 @@ impl Skin {
             state: sel.state(),
             text: &sel.text,
             bitmap: &sel.bitmap,
-            chart: None,
+            chart: sel.drawable_chart(),
         };
         let scene = Scene {
             turntable: 0,

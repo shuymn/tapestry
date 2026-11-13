@@ -288,7 +288,7 @@ impl Screen for Noted {
     fn publish_chart_images(
         &mut self,
         target: render::ChartTarget,
-        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
     ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
         self.menu.publish_chart_images(target, images)
     }

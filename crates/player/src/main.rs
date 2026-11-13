@@ -890,7 +890,10 @@ fn rig<'a>(
         #[cfg(test)]
         std::sync::Arc::clone(&audio_lost),
     );
-    let chart_images = crate::chart_images::ChartImageWorker::new(render.chart_generation());
+    let chart_images = crate::chart_images::ChartImageWorker::new(
+        render.chart_generation(),
+        render.cursor_generation(),
+    );
     // The loading waits serve the images' work a step left.
     let served = chart_images.clone();
     controls.serve_images(crate::controls::ImageService(Box::new(move || {
@@ -905,6 +908,7 @@ fn rig<'a>(
         pending: None,
         chart_images,
         play_chart: None,
+        selection_chart: None,
         controls,
         clock,
         recorded: input_side::Recorded {
@@ -1327,6 +1331,7 @@ fn skins_then_chart(loaded: &mut Loaded, rig: &mut PlayerRig<'_>) -> anyhow::Res
         Ok(started) => {
             rig.pending = started.pending;
             rig.play_chart = started.play_chart;
+            rig.selection_chart = started.selection_chart;
             rig.result_skin = crate::result_skin::ResultSkin::new(started.result)
                 .with_scripts(rig.render.scripts().clone());
             rig.result_skin.set_wake(rig.controls.game_thread());
@@ -1721,6 +1726,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         coord: coord.clone(),
         spawner: game::coord::Spawner::SYSTEM,
         page: crate::page_jobs::PageJobs::new(Arc::new(crate::priority::Checked::SYSTEM)),
+        rest: crate::selection::CursorRest::default(),
         #[cfg(test)]
         decodes: None,
         #[cfg(test)]
@@ -1760,6 +1766,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             // A pending play skin admits charts, each built for.
             rig.pending = started.pending;
             rig.play_chart = started.play_chart;
+            rig.selection_chart = started.selection_chart;
             rig.result_skin = crate::result_skin::ResultSkin::new(started.result)
                 .with_scripts(rig.render.scripts().clone());
             rig.result_skin.set_wake(rig.controls.game_thread());

@@ -405,12 +405,20 @@ pub(crate) fn option(id: i32) -> Option<Class<SelOption>> {
         177 => Expr("selected.bpm_change"),
         // The selected chart's judgment class, from its library entry.
         180..=184 => judge_class(id - 180),
+        // The cursor's chart's stage file and banner, as the selection's
+        // table holds them, false while it is not current (as the source's
+        // null image reads while its loader runs); no back image
+        // (`BooleanPropertyFactory.java:219`, `:529-540` at `0.8.9`).
+        190 => Expr("!selected.stagefile"),
+        191 => Expr("selected.stagefile"),
+        192 => Expr("!selected.banner"),
+        193 => Expr("selected.banner"),
         200..=207 => rank(id - 200),
         300..=307 => rank(id - 300),
         // Offline: no IR, no rivals.
         50 | 624 => Constant(true),
         // No grade rows, courses, IR, replays, option-specific clear
-        // history, BGA, `#TEXT`, stage file or STOP facts on selection.
+        // history, BGA, `#TEXT` or STOP facts on selection.
         3
         | 51
         | 60
@@ -419,7 +427,6 @@ pub(crate) fn option(id: i32) -> Option<Class<SelOption>> {
         | 171
         | 174
         | 175
-        | 191
         | 197
         | 352..=354
         | 606
@@ -701,6 +708,7 @@ mod tests {
         (160, 164),
         (176, 177),
         (180, 184),
+        (190, 193),
         (200, 207),
         (300, 307),
         (1100, 1104),
@@ -714,7 +722,6 @@ mod tests {
         (126, 131, false),
         (170, 171, false),
         (174, 175, false),
-        (191, 191, false),
         (197, 197, false),
         (352, 354, false),
         (606, 606, false),
@@ -754,6 +761,27 @@ mod tests {
         }
     }
 
+    /// The image options read the selection's image fields, with no
+    /// guard: 190 and 192 negated, 191 and 193 bare; 194 and 195 have no
+    /// bridge.
+    #[test]
+    fn the_image_options_read_the_selection_table() {
+        for (id, src) in [
+            (190, "!selected.stagefile"),
+            (191, "selected.stagefile"),
+            (192, "!selected.banner"),
+            (193, "selected.banner"),
+        ] {
+            assert_eq!(
+                option(id),
+                Some(Class::Bridge(SelOption::Expr(src))),
+                "{id}"
+            );
+        }
+        assert_eq!(option(194), None);
+        assert_eq!(option(195), None);
+    }
+
     /// Every id of the profile table gets its class, and no other id in
     /// a wide range has one: the explicit tables are exactly the table.
     #[test]
@@ -776,7 +804,7 @@ mod tests {
         }
         let n = OPTION_N.iter().flat_map(|&(a, b)| a..=b);
         let d = OPTION_D.iter().flat_map(|&(a, b, _)| a..=b);
-        assert_eq!(n.clone().count() + d.clone().count(), 95);
+        assert_eq!(n.clone().count() + d.clone().count(), 98);
         for id in 0..=3_000 {
             let class = option(id);
             if n.clone().any(|i| i == id) {

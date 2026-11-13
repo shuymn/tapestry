@@ -296,7 +296,7 @@ fn a_result_build_allocates_nothing() {
         v.chart.images.stage = true;
         let v = &v;
         fx.res.set_chart_images(if k % 2 == 0 {
-            skin_model::chart_image::ChartTable::new(Some(stage), None).keyed(key)
+            skin_model::chart_image::ChartTable::new(Some(stage), None, None).keyed(key)
         } else {
             skin_model::chart_image::ChartTable::ABSENT
         });

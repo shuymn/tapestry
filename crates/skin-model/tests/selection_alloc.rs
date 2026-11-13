@@ -5,10 +5,13 @@
 //! the timers move, over views that change between frames; and the
 //! settings applied every frame (docs/stage3.md S10-09e), the volume's
 //! number and ratio bar drawing them, and the application's readouts
-//! changing every frame, numbers drawing them; and pointer input
-//! (docs/stage3.md S10-09e): frames whose pointer moves across hover rects,
-//! presses hitting chart and folder rows whose paths are long, an action,
-//! and drags on a slider.
+//! changing every frame, numbers drawing them; the cursor's chart's
+//! stage file and banner with an element under `selected.stagefile`, over
+//! tables that change between frames (one of the live array, none, and
+//! one of another array), their fields written every frame; and pointer
+//! input (docs/stage3.md S10-09e): frames whose pointer moves across hover
+//! rects, presses hitting chart and folder rows whose paths are long, an
+//! action, and drags on a slider.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -23,9 +26,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::TimeUs;
 use selection_support::{
-    Fx, all, chart, digits, element, features, folder, int, labels, lamps, levels, list,
+    Fx, all, boolean, chart, digits, element, features, folder, int, labels, lamps, levels, list,
     list_element, load, ratio, rect, row_text, view,
 };
+use skin_model::chart_image::{ChartImage, ChartKey, ChartStretch, ChartTable, ChartUv};
 use skin_model::{
     ActionDef, AppReadouts, Button, ClickType, FolderId, FontRef, FrameUv, GaugeLook, HoverRect,
     LocalTime, NumberDef, OwnLamp, PointerDef, PointerHit, RatioBarDef, RatioForm, RatioSource,
@@ -111,6 +115,28 @@ fn skin() -> Fx {
         element(Source::Number(7), [500, 240, 10, 10]),
         element(Source::RatioBar(3), [1_100, 0, 200, 20]),
         element(Source::RatioBar(4), [1_100, 40, 200, 20]),
+        // The cursor's chart's images, and an element under one.
+        element(
+            Source::ChartImage {
+                which: ChartImage::Stage,
+                filter: skin_model::Filter::Linear,
+                stretch: ChartStretch::Inner,
+            },
+            [1_200, 300, 640, 480],
+        ),
+        element(
+            Source::ChartImage {
+                which: ChartImage::Banner,
+                filter: skin_model::Filter::Linear,
+                stretch: ChartStretch::Fill,
+            },
+            [1_200, 100, 600, 160],
+        ),
+        {
+            let mut e = element(Source::Image(0), [1_200, 900, 8, 8]);
+            e.visible = Some(boolean("selected.stagefile"));
+            e
+        },
     ];
     let hover = HoverRect {
         x: 0,
@@ -280,6 +306,35 @@ fn settings(ms: i64) -> SelectionSettings {
     }
 }
 
+/// The array the chart tables describe.
+const KEY: ChartKey = ChartKey {
+    renderer: 1,
+    installation: 2,
+    atlas: 3,
+    generation: 4,
+};
+
+/// The chart table of the frame at `ms`: in turn one of the live array, none,
+/// and one of another array.
+fn chart_table(ms: i64) -> Option<ChartTable> {
+    let uv = |native| ChartUv {
+        uv: FrameUv {
+            uv: [0.0, 0.0, 0.25, 0.25],
+            layer: 9,
+        },
+        native,
+    };
+    let table = ChartTable::new(Some(uv([640, 480])), None, Some(uv([300, 80])));
+    match ms / 16 % 3 {
+        0 => Some(table.keyed(KEY)),
+        1 => None,
+        _ => Some(table.keyed(ChartKey {
+            generation: 5,
+            ..KEY
+        })),
+    }
+}
+
 #[test]
 fn a_selection_build_allocates_nothing() {
     let mut fx = skin();
@@ -350,9 +405,12 @@ fn a_selection_build_allocates_nothing() {
         fx.skin
             .attach_selection_text(&mut fx.sel, texts, row_texts)
             .unwrap();
-        // One build outside the count: the batch reaches its size.
+        // One build outside the count: the batch reaches its size, the
+        // chart images drawn.
+        fx.sel.set_chart_images(chart_table(0));
+        fx.sel.set_chart_live(Some(KEY));
         fx.frame(0);
-        assert!(!fx.batch.quads().is_empty());
+        assert_eq!(fx.batch.quads().iter().filter(|q| q.layer == 9).count(), 2);
         // A view change, its strings' capacity reached: the fields, the
         // best play's numbers and the bars' ratios are filled in place.
         // The labels are made before the count, as the player keeps its own.
@@ -372,6 +430,9 @@ fn a_selection_build_allocates_nothing() {
                 fx.skin
                     .update_selection_settings(&mut fx.sel, &settings(ms))
                     .unwrap();
+                fx.sel.set_chart_images(chart_table(ms));
+                fx.sel.set_chart_live(Some(KEY));
+                fx.sel.write_chart_fields();
                 fx.frame(ms);
                 std::hint::black_box(fx.skin.drag_at(&fx.sel, [910.0, 30.0], fx.target));
             });

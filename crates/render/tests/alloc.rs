@@ -993,7 +993,7 @@ fn loading_frames() {
         [64, 48],
     );
     let table = r
-        .publish_chart_images(render::ChartTarget::Committed, [Some(&stage), None])
+        .publish_chart_images(render::ChartTarget::Committed, [Some(&stage), None, None])
         .unwrap();
     assert!(table.present(skin_model::chart_image::ChartImage::Stage));
     // The chosen chart's text prepared and installed for lifetime 1
