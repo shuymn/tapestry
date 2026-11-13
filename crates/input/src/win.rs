@@ -198,30 +198,133 @@ impl TimeSource for QpcClock {
 /// A test's hold on a [`QpcClock`] and all its copies (dev-tools): held,
 /// every copy reads the time the test set; let run, the clock runs on
 /// from there. No copy ever reads an earlier time than one read before.
+///
+/// Every read and every change is one step under one lock: a read either
+/// comes before a hold, which then reads no earlier, or after it, and
+/// reads the held time, whenever it sampled QPC.
 #[cfg(feature = "dev-tools")]
 #[derive(Debug)]
 pub struct ClockHold {
-    /// The time held, or [`ClockHold::RUNNING`].
-    held: std::sync::atomic::AtomicI64,
-    /// How far the clock runs behind QPC once let run.
-    behind: std::sync::atomic::AtomicI64,
+    state: std::sync::Mutex<HoldState>,
+    /// Where a test parks a read between its QPC sample and its step.
+    #[cfg(test)]
+    gate: ReadGate,
+}
+
+/// A [`ClockHold`]'s state, read and changed under its lock.
+#[cfg(feature = "dev-tools")]
+#[derive(Debug, Default)]
+struct HoldState {
+    /// The time held, or `None` while the clock runs.
+    held: Option<i64>,
+    /// How far the clock runs behind QPC while it runs.
+    behind: i64,
     /// The latest time any copy read.
-    last: std::sync::atomic::AtomicI64,
+    last: i64,
+}
+
+#[cfg(feature = "dev-tools")]
+impl HoldState {
+    /// The time read now, QPC having read `real`: the held time, else
+    /// `real` less `behind`, never earlier than a time read before.
+    fn at(&self, real: TimeUs) -> i64 {
+        match self.held {
+            Some(held) => held,
+            None => real.0.saturating_sub(self.behind).max(self.last),
+        }
+    }
 }
 
 #[cfg(feature = "dev-tools")]
 impl ClockHold {
-    const RUNNING: i64 = i64::MIN;
+    fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(HoldState::default()),
+            #[cfg(test)]
+            gate: ReadGate::default(),
+        }
+    }
 
-    /// The time a copy reads, QPC reading `real`.
+    fn lock(&self) -> std::sync::MutexGuard<'_, HoldState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The time a copy reads, QPC having read `real`.
     fn read(&self, real: TimeUs) -> TimeUs {
-        let held = self.held.load(Ordering::SeqCst);
-        let t = if held == Self::RUNNING {
-            real.0.saturating_sub(self.behind.load(Ordering::SeqCst))
-        } else {
-            held
-        };
-        TimeUs(self.last.fetch_max(t, Ordering::SeqCst).max(t))
+        #[cfg(test)]
+        self.gate.pass();
+        let mut s = self.lock();
+        let t = s.at(real);
+        s.last = t;
+        TimeUs(t)
+    }
+
+    /// Held from the time read now, QPC reading `real` (held, the time
+    /// held): that time.
+    fn hold(&self, real: TimeUs) -> TimeUs {
+        let mut s = self.lock();
+        let t = s.at(real);
+        s.held = Some(t);
+        s.last = t;
+        TimeUs(t)
+    }
+
+    /// The held time moved on to `t`.
+    fn set(&self, t: TimeUs) {
+        let mut s = self.lock();
+        assert!(s.held.is_some(), "the clock runs");
+        let last = s.last;
+        assert!(
+            t.0 >= last,
+            "the clock moved back from {last} to {} µs",
+            t.0
+        );
+        s.held = Some(t.0);
+        s.last = t.0;
+    }
+
+    /// Let run on from the held time, QPC reading `real`.
+    fn run(&self, real: TimeUs) {
+        let mut s = self.lock();
+        if let Some(held) = s.held.take() {
+            s.behind = real.0.saturating_sub(held);
+        }
+    }
+}
+
+/// A test's park for one read of a [`ClockHold`], between its QPC sample
+/// and its step under the lock.
+#[cfg(all(feature = "dev-tools", test))]
+#[derive(Debug)]
+struct ReadGate {
+    /// The next read parks.
+    armed: AtomicBool,
+    /// Passed once the read parked.
+    parked: std::sync::Barrier,
+    /// Passed once the test lets it go.
+    release: std::sync::Barrier,
+}
+
+#[cfg(all(feature = "dev-tools", test))]
+impl Default for ReadGate {
+    fn default() -> Self {
+        Self {
+            armed: AtomicBool::new(false),
+            parked: std::sync::Barrier::new(2),
+            release: std::sync::Barrier::new(2),
+        }
+    }
+}
+
+#[cfg(all(feature = "dev-tools", test))]
+impl ReadGate {
+    fn pass(&self) {
+        if self.armed.swap(false, Ordering::SeqCst) {
+            self.parked.wait();
+            self.release.wait();
+        }
     }
 }
 
@@ -232,15 +335,15 @@ impl QpcClock {
     /// [`ClockHold`].
     #[must_use]
     pub fn holdable() -> Self {
-        let hold = Box::leak(Box::new(ClockHold {
-            held: std::sync::atomic::AtomicI64::new(ClockHold::RUNNING),
-            behind: std::sync::atomic::AtomicI64::new(0),
-            last: std::sync::atomic::AtomicI64::new(0),
-        }));
         Self {
-            hold: Some(hold),
+            hold: Some(Box::leak(Box::new(ClockHold::new()))),
             ..Self::start()
         }
+    }
+
+    /// QPC's time on this clock, held or not.
+    fn real(&self) -> TimeUs {
+        qpc_to_us(read_qpc(), self.origin, self.frequency)
     }
 
     /// Holds the clock: every copy reads the time it reads now, which is
@@ -251,10 +354,7 @@ impl QpcClock {
     /// If the clock is not [`holdable`](Self::holdable).
     #[expect(clippy::expect_used, reason = "a test's misuse")]
     pub fn hold(&self) -> TimeUs {
-        let hold = self.hold.expect("a holdable clock");
-        let now = self.now();
-        hold.held.store(now.0, Ordering::SeqCst);
-        self.now()
+        self.hold.expect("a holdable clock").hold(self.real())
     }
 
     /// Moves a held clock on to `t`: every copy reads `t` from now on.
@@ -265,19 +365,7 @@ impl QpcClock {
     /// is earlier than a time a copy read.
     #[expect(clippy::expect_used, reason = "a test's misuse")]
     pub fn set(&self, t: TimeUs) {
-        let hold = self.hold.expect("a holdable clock");
-        assert_ne!(
-            hold.held.load(Ordering::SeqCst),
-            ClockHold::RUNNING,
-            "the clock runs"
-        );
-        let last = hold.last.load(Ordering::SeqCst);
-        assert!(
-            t.0 >= last,
-            "the clock moved back from {last} to {} µs",
-            t.0
-        );
-        hold.held.store(t.0, Ordering::SeqCst);
+        self.hold.expect("a holdable clock").set(t);
     }
 
     /// Lets a held clock run on from the time it reads; a running one
@@ -288,15 +376,7 @@ impl QpcClock {
     /// If the clock is not [`holdable`](Self::holdable).
     #[expect(clippy::expect_used, reason = "a test's misuse")]
     pub fn run(&self) {
-        let hold = self.hold.expect("a holdable clock");
-        let held = hold.held.load(Ordering::SeqCst);
-        if held == ClockHold::RUNNING {
-            return;
-        }
-        let real = qpc_to_us(read_qpc(), self.origin, self.frequency);
-        hold.behind
-            .store(real.0.saturating_sub(held), Ordering::SeqCst);
-        hold.held.store(ClockHold::RUNNING, Ordering::SeqCst);
+        self.hold.expect("a holdable clock").run(self.real());
     }
 }
 
@@ -1772,6 +1852,42 @@ mod qpc_tests {
         assert!(before <= t && t <= after, "{before:?} {t:?} {after:?}");
         let later = clock.from_qpc(ticks + clock.frequency().hz());
         assert_eq!(later.0 - t.0, 1_000_000);
+    }
+}
+
+/// The held clock's steps (dev-tools).
+#[cfg(all(test, feature = "dev-tools"))]
+mod hold_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::Ordering;
+
+    use bms_model::TimeUs;
+
+    use super::ClockHold;
+
+    /// A read that sampled QPC later than a hold did, parked between its
+    /// sample and its step while the hold is taken, reads the held time,
+    /// and so does every read after it: no read moves the clock past a
+    /// held time.
+    #[test]
+    fn a_read_parked_across_a_hold_reads_the_held_time() {
+        let hold = Arc::new(ClockHold::new());
+        hold.gate.armed.store(true, Ordering::SeqCst);
+        let reader = {
+            let hold = Arc::clone(&hold);
+            std::thread::spawn(move || hold.read(TimeUs(1_000)))
+        };
+        hold.gate.parked.wait();
+        let held = hold.hold(TimeUs(500));
+        assert_eq!(held, TimeUs(500));
+        hold.gate.release.wait();
+        assert_eq!(reader.join().unwrap(), held, "the parked read");
+        assert_eq!(hold.read(TimeUs(2_000)), held, "a later read");
+        hold.set(TimeUs(600));
+        assert_eq!(hold.read(TimeUs(3_000)), TimeUs(600));
+        // Let run at QPC 3,000: the clock runs on from 600.
+        hold.run(TimeUs(3_000));
+        assert_eq!(hold.read(TimeUs(3_100)), TimeUs(700));
     }
 }
 
