@@ -167,6 +167,66 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
     steps(&mut worker, 80);
     assert!(!worker.engine().tone_sounding());
     assert_eq!(counting::calls(), 0);
+    // The system sounds (design.md "Audio", system sounds): the game
+    // thread's draws, starts, stops and tone requests in play, and audio
+    // steps that install a generation over one still sounding, send the
+    // silent one back and leave it in the return ring, and take the empty
+    // install, which sends the other back too. The generations are built
+    // before, and the returns dropped after, what is counted.
+    {
+        use audio::{GenId, SystemGeneration, SystemKind};
+
+        let sound = std::sync::Arc::new(audio::Sound::mono(vec![500; 4_800]));
+        let pick = |id| {
+            [SystemKind::Select, SystemKind::Scratch, SystemKind::Decide]
+                .into_iter()
+                .fold(SystemGeneration::new(GenId(id), RATE), |g, k| {
+                    g.with(k, std::sync::Arc::clone(&sound))
+                })
+        };
+        let ids: Vec<u64> = (0..3).map(|_| control.system_seq().unwrap()).collect();
+        let (a, b) = (pick(ids[0]), pick(ids[1]));
+        let empty = SystemGeneration::empty(GenId(ids[2]));
+        let mut game = |f: &mut dyn FnMut(&mut game::AudioControl)| {
+            counting::track(true);
+            counting::self_check();
+            f(&mut control);
+            counting::track(false);
+        };
+        let mut a = Some(a);
+        game(&mut |c| {
+            c.install_system(a.take().unwrap()).unwrap();
+            c.system_start(SystemKind::Select, true, Some(GenId(ids[0])))
+                .unwrap();
+            c.system_start(SystemKind::Scratch, false, None).unwrap();
+            let _ = c.system_seq();
+        });
+        steps(&mut worker, 5);
+        let mut b = Some(b);
+        game(&mut |c| {
+            c.install_system(b.take().unwrap()).unwrap();
+            c.system_start(SystemKind::Decide, false, None).unwrap();
+            c.system_stop(SystemKind::Scratch);
+            c.play_tone();
+        });
+        steps(&mut worker, 5);
+        assert_eq!(worker.engine().system().retired(), Some(GenId(ids[0])));
+        game(&mut |c| {
+            c.system_stop(SystemKind::Select);
+        });
+        steps(&mut worker, 3);
+        assert_eq!(worker.engine().system().retired(), None);
+        let mut empty = Some(empty);
+        game(&mut |c| {
+            c.install_system(empty.take().unwrap()).unwrap();
+            c.system_start(SystemKind::Decide, false, None).unwrap();
+        });
+        steps(&mut worker, 60);
+        assert_eq!(control.system_installed(), Some(GenId(ids[2])));
+        assert_eq!(counting::calls(), 0, "the system sounds allocated or freed");
+        let back: Vec<_> = std::iter::from_fn(|| control.take_system_return()).collect();
+        assert_eq!(back.len(), 2, "both left in the return ring");
+    }
     // Three gated practice attempts with one rearm each, the game thread
     // taking back none of the restores the rearms replace: the first fills
     // the return queue, the second's waits on the audio thread, and the
