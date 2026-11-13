@@ -831,6 +831,19 @@ impl ScreenRuntime {
         &self.status
     }
 
+    /// The timer readings its host read in the last frame, as
+    /// [`frame`](Self::frame) was given them (dev-tools: a test compares
+    /// them with what the frame's build drew).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn frame_timers(&self) -> Vec<i32> {
+        self.pass
+            .screen
+            .borrow()
+            .as_ref()
+            .map_or_else(Vec::new, |s| s.timers.clone())
+    }
+
     /// The notes so far in its book, and how many more were dropped past
     /// the cap.
     #[must_use]
