@@ -320,11 +320,6 @@ fn rank_timers_open_at_their_thresholds() {
         assert_eq!(d.frame(20, &[]).len(), 1, "{id}");
         // The timer starts when the condition first holds.
         assert_eq!(d.rects(70), [[50, 1_070, 10, 10]]);
-        // An EX score the round has no judgment for (a play state's carried
-        // one) waits (s7-06s-design.md §2.4).
-        let mut d = images(&[&format!(r#""timer": {id},"#)], "").drawn();
-        d.tally = tally(ex, 1);
-        assert!(d.frame(10, &[]).is_empty(), "{id}: unjudged");
     }
     // At 27 notes each threshold is a whole score, 2·i, and opens there.
     for (id, ex) in [(348, 36), (349, 42), (350, 48)] {

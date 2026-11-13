@@ -345,7 +345,7 @@ fn a_chart_image_condition_gates_the_value() {
         let mut p = Drawn::new(skin.clone(), 4);
         p.play.set_chart_live(Some(KEY));
         p.play
-            .set_chart_images(ChartTable::new(present.then_some(stage), None).keyed(KEY));
+            .set_chart_images(ChartTable::new(present.then_some(stage), None, None).keyed(KEY));
         assert_eq!(invoked(&mut p, 1_000, &[]), want, "{present}");
         assert_eq!(invoked(&mut p, 1_016, &[]), want, "{present}");
     }

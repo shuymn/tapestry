@@ -30,7 +30,7 @@ use crate::play::loading::{Loading, LoadingFrame, LoadingGauge, Need, loading_ra
 use crate::play::schema::timer::BUILTIN;
 use crate::play::schema::{Grade, field};
 use crate::play::timers::elapsed_us;
-use crate::play::{BuildError, Continuation, Play, PlayContext, PrepareError, SkinFrame};
+use crate::play::{BuildError, Play, PlayContext, PrepareError, SkinFrame};
 use crate::pointer::{
     self, ActionDef, Button, HoverRect, PointerDef, PointerError, PressHit, SearchBounds, Target,
 };
@@ -159,10 +159,12 @@ pub enum Source {
     TimingVisualizer(u32),
     /// The hit-error visualizer at this index of [`PlayDefs::hit_errors`].
     HitErrorVisualizer(u32),
-    /// The chart's own image `which` (play and result, S10-12): its installed
-    /// uv and native size ([`ChartTable`]), on the element's track, met by
-    /// `stretch` at placement and sampled with `filter`. An absent image,
-    /// and any while its table is unavailable, draws nothing.
+    /// The chart's own image `which` (S10-12): the stage file or back image
+    /// on play and result, the cursor's chart's stage file or banner on
+    /// selection. Its installed uv and native size ([`ChartTable`]), on the
+    /// element's track, met by `stretch` at placement and sampled with
+    /// `filter`. An absent image, and any while its table is unavailable,
+    /// draws nothing.
     ChartImage {
         which: ChartImage,
         filter: Filter,
@@ -1554,7 +1556,9 @@ fn selection_text(def: &SkinDef, source: Source) -> bool {
 /// score rate; a selection skin no lanes, gauge, judge, cover paint,
 /// graph or ratio bar of a score rate; a result skin none of these but
 /// its graphs; a decision skin only images, image choices whose selector
-/// is a constant, and chart text. The ratio bars are `sel`'s.
+/// is a constant, and chart text. Chart images are the stage file and back
+/// image on play and result, the stage file and banner on selection, and
+/// none on decision. The ratio bars are `sel`'s.
 fn check_kind(
     def: &SkinDef,
     kind: ScreenKind,
@@ -1599,10 +1603,10 @@ fn check_kind(
             },
             ScreenKind::Selection => match e.source {
                 Source::RatioBar(i) => score(i) != Some(true),
+                Source::ChartImage { which, .. } => which != ChartImage::Back,
                 _ => !matches!(
                     e.source,
                     Source::Lanes
-                        | Source::ChartImage { .. }
                         | Source::Gauge(_)
                         | Source::Judge(_)
                         | Source::CoverPaint(_)
@@ -1616,6 +1620,7 @@ fn check_kind(
             },
             ScreenKind::Result => match e.source {
                 Source::JudgeGraph(i) => notes(i) != Some(true),
+                Source::ChartImage { which, .. } => which != ChartImage::Banner,
                 _ => {
                     !selection_text(def, e.source)
                         && !matches!(
@@ -1635,6 +1640,7 @@ fn check_kind(
             ScreenKind::Play => match e.source {
                 Source::RatioBar(i) => score(i) == Some(true),
                 Source::JudgeGraph(i) => notes(i) == Some(true),
+                Source::ChartImage { which, .. } => which != ChartImage::Banner,
                 _ => {
                     !selection_text(def, e.source)
                         && !matches!(
@@ -3005,17 +3011,6 @@ impl Skin {
         format!("{:?}", self.present)
     }
 
-    /// Whether the presentation program's slotted callbacks may run on a
-    /// carried state ([`Present::carry_safe`](crate::present::Present::carry_safe));
-    /// true without a program (dev-tools).
-    #[cfg(feature = "dev-tools")]
-    #[must_use]
-    pub fn program_carry_safe(&self) -> bool {
-        self.present
-            .as_ref()
-            .is_none_or(crate::present::Present::carry_safe)
-    }
-
     /// Each element's timer in draw order, by kind (dev-tools): a
     /// built-in timer's slot, a `when` timer's index, or for a compiled
     /// timer callback ([`TimerRef::Output`]) its rank among the program's
@@ -3518,38 +3513,20 @@ impl Skin {
             .map_or(0, |p| crate::output::slots(p.len()))
     }
 
-    /// A fresh [`Play`] for the first attempt of a play state of `chart`:
-    /// [`prepare_carried`](Self::prepare_carried) with
-    /// [`Continuation::Fresh`].
+    /// A fresh [`Play`] for one attempt of `chart`: the first, a retry or a
+    /// practice round alike, each starting clean.
     ///
     /// # Errors
     ///
-    /// As [`prepare_carried`](Self::prepare_carried).
+    /// A negative lead-in, a READY state start outside the time range, or
+    /// a section whose initial gauges do not match the context's gauges.
     pub fn prepare(&self, chart: &Chart, ctx: &PlayContext<'_>) -> Result<Play, PrepareError> {
-        self.prepare_carried(chart, ctx, Continuation::Fresh)
-    }
-
-    /// A [`Play`] for one attempt of `chart`, taking over `carry` from the
-    /// earlier attempts of its play state: everything else starts clean.
-    ///
-    /// # Errors
-    ///
-    /// A negative lead-in, a READY state start outside the time range, a
-    /// section whose initial gauges do not match the context's gauges, or
-    /// a carried bank that does not fit the program.
-    pub fn prepare_carried(
-        &self,
-        chart: &Chart,
-        ctx: &PlayContext<'_>,
-        carry: Continuation<'_>,
-    ) -> Result<Play, PrepareError> {
         if self.kind != ScreenKind::Play {
             return Err(PrepareError::Kind);
         }
         Play::new(
             chart,
             ctx,
-            carry,
             self.present.as_ref(),
             self.whens.len(),
             self.lanes.is_some(),
@@ -4098,7 +4075,7 @@ impl Skin {
             state: sel.state(),
             text: &sel.text,
             bitmap: &sel.bitmap,
-            chart: None,
+            chart: sel.drawable_chart(),
         };
         let scene = Scene {
             turntable: 0,

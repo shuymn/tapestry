@@ -39,7 +39,7 @@ const BACK: ChartUv = ChartUv {
 };
 
 fn table(stage: bool, back: bool) -> ChartTable {
-    ChartTable::new(stage.then_some(STAGE), back.then_some(BACK)).keyed(KEY)
+    ChartTable::new(stage.then_some(STAGE), back.then_some(BACK), None).keyed(KEY)
 }
 
 /// The model rect (y down, 1080 high) of a reference rect (y up).

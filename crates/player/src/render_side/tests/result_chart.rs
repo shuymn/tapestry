@@ -105,13 +105,13 @@ fn images(side: u32, stage: [u8; 3], back: [u8; 3]) -> (tempfile::TempDir, Arc<C
     png(&d.path().join("b.png"), [32, 24], back);
     let want = Want {
         dir: d.path().to_owned(),
-        names: ["s.png".to_owned(), "b.png".to_owned()],
+        names: ["s.png".to_owned(), "b.png".to_owned(), String::new()],
         play: None,
         result: None,
     };
     let sources = read_sources(&want, None, &|| false);
     let set = derive_set(&sources, side, &|| false).unwrap();
-    assert!(set.fitted().iter().all(Option::is_some), "{set:?}");
+    assert!(set.fitted()[..2].iter().all(Option::is_some), "{set:?}");
     (d, Arc::new(set))
 }
 

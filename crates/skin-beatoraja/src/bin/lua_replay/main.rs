@@ -2,7 +2,7 @@
 //! reference executor; docs/stage3.md S7-06e), for the developer's PC:
 //! `lua_replay [--autoplay on|off] [--class veryhard|hard|normal|easy|veryeasy|none]
 //! [--level <n>] [--option <name> <item>]... [--file <name> <candidate>]...
-//! [--script full|mixed|rounds|rounds-unwitnessed|closing|zero-score] [--perturb <id>=<delta>]... [--isolation <file>] [--local]
+//! [--script full|mixed|rounds|closing] [--perturb <id>=<delta>]... [--isolation <file>] [--local]
 //! <root> <entry> [<root> <entry>]...`
 //!
 //! Each play skin is imported twice. The production import's frames are
@@ -47,7 +47,7 @@ use crate::script::Script;
 
 const USAGE: &str = "usage: lua_replay [--autoplay on|off] \
      [--class veryhard|hard|normal|easy|veryeasy|none] [--level <n>] \
-     [--option <name> <item>]... [--file <name> <candidate>]... [--script full|mixed|rounds|rounds-unwitnessed|closing|zero-score] \
+     [--option <name> <item>]... [--file <name> <candidate>]... [--script full|mixed|rounds|closing] \
      [--perturb <id>=<delta>]... [--isolation <file>] [--local] [--all] <root> <entry> [<root> <entry>]...";
 
 /// What the flags ask for.
@@ -184,30 +184,46 @@ pub fn replay(root: &Path, entry: &str, o: &Options) -> Result<Report, Stop> {
         _ => None,
     };
     let (prod, inputs) = production::record(&skin, recorded, &o.script, level).map_err(fail)?;
-    let (out, rec, vm) = h.import_reference(&config, &o.facts, &cancel);
-    let structure = match out.map_err(|e| fail(format!("reference import: {e}")))? {
-        LuaOutcome::Imported(i) => i.imported.skin.program_structure(),
-        LuaOutcome::Pending(p) => return Err(fail(format!("pending {:?}", p.pending))),
-    };
-    let vm = vm.ok_or_else(|| fail("the reference kept no VM".into()))?;
-    if !prod.same_import(&rec, &structure) {
-        return Err(Stop::Differs);
-    }
-    for &(id, d) in &o.perturb {
-        vm.perturb(id, d);
-    }
-    let reference = reference::Reference::new(&vm, &rec.items, &rec.sources);
-    #[cfg(test)]
-    let reference = {
+    let mut checked = false;
+    let mut differs = false;
+    // Each round's reference: a fresh import, checked against production's
+    // once.
+    let fresh = || -> Result<reference::Fresh, String> {
+        let (out, rec, vm) = h.import_reference(&config, &o.facts, &cancel);
+        let structure = match out.map_err(|e| format!("reference import: {e}"))? {
+            LuaOutcome::Imported(i) => i.imported.skin.program_structure(),
+            LuaOutcome::Pending(p) => return Err(format!("pending {:?}", p.pending)),
+        };
+        let vm = vm.ok_or_else(|| "the reference kept no VM".to_owned())?;
+        if !checked {
+            checked = true;
+            if !prod.same_import(&rec, &structure) {
+                differs = true;
+                return Err("differs".into());
+            }
+        }
+        for &(id, d) in &o.perturb {
+            vm.perturb(id, d);
+        }
+        #[cfg(test)]
         for &id in &o.deny {
             vm.deny(id);
         }
-        match o.page_point {
-            Some((page, point)) => reference.page_point(page, point),
-            None => reference,
-        }
+        Ok(reference::Fresh {
+            vm,
+            items: rec.items,
+            sources: rec.sources,
+        })
     };
-    let mut observed = reference.run(&inputs);
+    #[cfg(test)]
+    let page_point = o.page_point;
+    #[cfg(not(test))]
+    let page_point = None;
+    let observed = reference::run_rounds(&inputs, fresh, page_point);
+    if differs {
+        return Err(Stop::Differs);
+    }
+    let mut observed = observed.map_err(fail)?;
     observed.root = root.to_path_buf();
     Ok(production::compare::compare(&prod, &observed, &o.isolation))
 }

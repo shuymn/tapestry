@@ -235,7 +235,7 @@ impl Screen for Recorded {
     fn write_result_chart(
         &mut self,
         target: render::ResultChartTarget,
-        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
         set: u64,
     ) -> Result<skin_model::chart_image::ChartTable, render::RenderError> {
         if self.faults.refuse_chart.swap(false, Ordering::AcqRel) {

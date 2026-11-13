@@ -497,15 +497,18 @@ enum Draw {
 }
 
 /// Where chart images are published ([`Renderer::publish_chart_images`]):
-/// the committed play installation's array, or a staged one's own array,
+/// the committed play installation's array, a staged one's own array,
 /// named by its token (S10-12 design §5.3, a pending play skin's
-/// specialization).
+/// specialization), or the committed selection installation's array.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChartTarget {
     /// The committed play installation.
     Committed,
     /// The staged play installation `token` names, with its own array.
     Staged(PreparedToken),
+    /// The committed selection installation, its tables keyed by
+    /// [`Renderer::selection_chart_key`].
+    Selection,
 }
 
 /// Where a result view's chart images are written
@@ -1135,6 +1138,10 @@ pub struct Renderer {
     result_chart_writes: u64,
     #[cfg(any(test, feature = "dev-tools"))]
     result_chart_refuse: bool,
+    /// Tests and development builds: the selection chart writes that wrote
+    /// pixels, a skipped one not counted.
+    #[cfg(any(test, feature = "dev-tools"))]
+    selection_chart_writes: u64,
     /// Tests and development builds: the last atlas array upload's timing
     /// (the S10-09i design's §8.1 G1), until
     /// [`take_upload_timing`](Self::take_upload_timing) takes it.
@@ -1220,6 +1227,10 @@ pub struct Renderer {
     /// as a skin refuses one.
     #[cfg(any(test, feature = "dev-tools"))]
     decision_fault: bool,
+    /// Development builds: the next decision build allocates inside the
+    /// skin's build, then refuses if `Some(true)` (a development fault).
+    #[cfg(feature = "dev-tools")]
+    decision_alloc: Option<bool>,
     /// Tests and development builds: the next settling of the decision
     /// labels fails as a poll fails.
     #[cfg(any(test, feature = "dev-tools"))]
@@ -1349,6 +1360,8 @@ impl Renderer {
             #[cfg(any(test, feature = "dev-tools"))]
             result_chart_refuse: false,
             #[cfg(any(test, feature = "dev-tools"))]
+            selection_chart_writes: 0,
+            #[cfg(any(test, feature = "dev-tools"))]
             upload_timing: None,
             started: None,
             refused: None,
@@ -1385,6 +1398,8 @@ impl Renderer {
             result_faults: (false, false),
             #[cfg(any(test, feature = "dev-tools"))]
             decision_fault: false,
+            #[cfg(feature = "dev-tools")]
+            decision_alloc: None,
             #[cfg(any(test, feature = "dev-tools"))]
             decision_settle_fault: false,
             #[cfg(test)]
@@ -2657,6 +2672,9 @@ impl Renderer {
     /// installation's own ([`ChartTarget::Staged`]), whose table is held
     /// with the staging under the staging's own key and drawn by its
     /// loading presentation from then on; its commit keeps the key.
+    /// [`ChartTarget::Selection`] writes as
+    /// [`write_selection_chart`](Self::write_selection_chart) does, with
+    /// no set recorded, so the next write is never skipped.
     ///
     /// # Errors
     ///
@@ -2679,10 +2697,11 @@ impl Renderer {
     pub fn publish_chart_images(
         &mut self,
         target: ChartTarget,
-        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
     ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
         match target {
             ChartTarget::Committed => self.publish_committed_chart(images),
+            ChartTarget::Selection => self.write_selection_chart_in(images, None),
             ChartTarget::Staged(token) => {
                 let Some(mut pending) = self.pending.take() else {
                     return Err(RenderError::ChartChanged);
@@ -2699,7 +2718,7 @@ impl Renderer {
     /// committed installation.
     fn publish_committed_chart(
         &mut self,
-        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
     ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
         use skin_model::chart_image::{ChartImage, ChartTable, ChartUv};
         let Some(installed) = self.installed.clone() else {
@@ -2729,7 +2748,7 @@ impl Renderer {
             self.chart_waits = 0;
         }
         let side = self.atlas.side();
-        let mut uvs = [None; 2];
+        let mut uvs = [None; 3];
         for (which, image) in ChartImage::ALL.into_iter().zip(images) {
             let Some(f) = image else {
                 continue;
@@ -2795,8 +2814,8 @@ impl Renderer {
             return Err(RenderError::ChartChanged);
         }
         // 4. Published.
-        let [stage, back] = uvs;
-        let table = ChartTable::new(stage, back).keyed(key);
+        let [stage, back, banner] = uvs;
+        let table = ChartTable::new(stage, back, banner).keyed(key);
         self.chart = Some(PublishedChart { table, ..began });
         self.sync_chart();
         // A loss after the re-check discards the publication: it is the
@@ -2814,7 +2833,7 @@ impl Renderer {
         &mut self,
         pending: &mut Pending,
         token: PreparedToken,
-        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
     ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
         use skin_model::chart_image::{ChartImage, ChartTable, ChartUv};
         if pending.token != token {
@@ -2844,7 +2863,7 @@ impl Renderer {
         // 1. Unavailable from the first byte.
         pending.chart = None;
         let side = res.atlas.side();
-        let mut uvs = [None; 2];
+        let mut uvs = [None; 3];
         for (which, image) in ChartImage::ALL.into_iter().zip(images) {
             let Some(f) = image else {
                 continue;
@@ -2897,8 +2916,8 @@ impl Renderer {
         // 3. The staging is the one written into: it was held out for the
         // write. 4. Held with it under its own key, which its commit keeps,
         // and drawn by its loading presentation meanwhile.
-        let [stage, back] = uvs;
-        let table = ChartTable::new(stage, back).keyed(staged_key);
+        let [stage, back, banner] = uvs;
+        let table = ChartTable::new(stage, back, banner).keyed(staged_key);
         pending.chart = Some(table);
         Ok(table)
     }
@@ -2911,7 +2930,8 @@ impl Renderer {
     ///
     /// # Errors
     ///
-    /// [`RenderError::NoChartLayer`] with no committed play installation,
+    /// [`RenderError::NoChartLayer`] with no committed play (or, for
+    /// [`ChartTarget::Selection`], selection) installation,
     /// [`RenderError::DeviceLost`] once the device is lost, and
     /// [`RenderError::ChartChanged`] for a token that is not the
     /// staging's: nothing changes.
@@ -2932,6 +2952,18 @@ impl Renderer {
                 self.chart = Some(PublishedChart { key, table });
                 self.sync_chart();
                 Ok(table)
+            }
+            ChartTarget::Selection => {
+                let i = Self::screen(ScreenKind::Selection);
+                if i.and_then(|i| self.screens.get(i))
+                    .is_none_or(Option::is_none)
+                {
+                    return Err(RenderError::NoChartLayer);
+                }
+                let Some(key) = self.selection_chart_key() else {
+                    return Err(RenderError::DeviceLost);
+                };
+                Ok(ChartTable::ABSENT.keyed(key))
             }
             ChartTarget::Staged(token) => match self.pending.as_mut() {
                 // A lost device's staging never commits a drawable table:
@@ -2991,7 +3023,7 @@ impl Renderer {
     pub fn write_result_chart(
         &mut self,
         target: ResultChartTarget,
-        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
         set: u64,
     ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
         if self.gpu.lost() {
@@ -3009,15 +3041,15 @@ impl Renderer {
         &mut self,
         pending: Option<&mut Pending>,
         target: ResultChartTarget,
-        images: [Option<&skin_model::chart_image::Fitted>; 2],
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
         set: u64,
     ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
-        use skin_model::chart_image::{ChartImage, ChartKey, ChartTable, ChartUv};
         let renderer = self.id;
         #[cfg(any(test, feature = "dev-tools"))]
         let refuse = std::mem::take(&mut self.result_chart_refuse);
-        #[cfg(test)]
-        let fault = self.chart_fault.take();
+        #[cfg(not(any(test, feature = "dev-tools")))]
+        let refuse = false;
+        let seams = self.chart_seams(refuse);
         let slot = Self::screen(ScreenKind::Result)
             .and_then(|i| self.screens.get_mut(i))
             .and_then(Option::as_mut);
@@ -3048,86 +3080,123 @@ impl Renderer {
                 (installation, atlas)
             }
         };
-        let bundle = installation.bundle();
-        let (Some(layer), Some(at)) = (bundle.chart_layer(), atlas.chart_layer()) else {
-            return Err(RenderError::NoChartLayer);
-        };
-        if u32::from(layer) != at {
-            return Err(RenderError::NoChartLayer);
-        }
-        let key = ChartKey {
+        let (table, wrote) = write_chart_set(
+            &self.gpu,
             renderer,
-            installation: installation.loading().id(),
-            atlas: bundle.atlas_id().0,
-            generation: atlas.serial(),
-        };
-        let side = atlas.side();
-        let mut uvs = [None; 2];
-        for (which, image) in ChartImage::ALL.into_iter().zip(images) {
-            let Some(f) = image else {
-                continue;
-            };
-            let uv = ChartUv::of(f, which, side, layer)
-                .filter(|_| u32::try_from(f.levels().len()).ok() == Some(atlas.levels()));
-            let Some(uv) = uv else {
-                atlas.set_chart_set(None);
-                return Err(RenderError::ChartImage { which });
-            };
-            if let Some(slot) = uvs.get_mut(which.index()) {
-                *slot = Some(uv);
-            }
-        }
-        let [stage, back] = uvs;
-        let table = ChartTable::new(stage, back).keyed(key);
-        if atlas.chart_set() == Some(set) {
-            return Ok(table);
-        }
-        atlas.set_chart_set(None);
-        #[cfg(any(test, feature = "dev-tools"))]
-        if refuse {
-            return Err(RenderError::ChartImage {
-                which: ChartImage::Stage,
-            });
-        }
-        let gpu = &self.gpu;
-        for (which, image) in ChartImage::ALL.into_iter().zip(images) {
-            let (Some(f), Some((origin, _))) = (image, which.slot(side)) else {
-                continue;
-            };
-            let ((), refused) = skin_atlas::scoped(gpu.device(), || {
-                for ((k, bytes), level) in (0_u32..).zip(f.levels()).zip(0..) {
-                    let Some(size) = f.level_size(level) else {
-                        continue;
-                    };
-                    skin_atlas::write_region(
-                        gpu.queue(),
-                        atlas.texture(),
-                        (at, k),
-                        origin.map(|o| o >> k),
-                        size,
-                        bytes,
-                    );
-                }
-                #[cfg(test)]
-                if let Some(fault) = fault {
-                    fault(gpu);
-                }
-                gpu.queue().submit([]);
-            });
-            let waited = wait_for_gpu(gpu);
-            if waited.is_err() || gpu.lost() {
-                return Err(waited.err().unwrap_or(RenderError::DeviceLost));
-            }
-            if let Some(e) = refused {
-                return Err(RenderError::Atlas(UploadError::Device(e)));
-            }
-        }
-        atlas.set_chart_set(Some(set));
+            &installation,
+            atlas,
+            images,
+            Some(set),
+            seams,
+        )?;
         #[cfg(any(test, feature = "dev-tools"))]
         {
-            self.result_chart_writes += 1;
+            self.result_chart_writes += u64::from(wrote);
         }
+        #[cfg(not(any(test, feature = "dev-tools")))]
+        let _ = wrote;
         Ok(table)
+    }
+
+    /// Writes chart set `set`'s `images` (each fitted for the selection
+    /// layout's chart slots) into the committed selection installation's
+    /// array, and returns the table of where they lie, keyed to
+    /// [`selection_chart_key`](Self::selection_chart_key). The write is
+    /// skipped when the array's chart layer already holds `set`.
+    ///
+    /// # Errors
+    ///
+    /// - [`RenderError::NoChartLayer`]: no selection installation, or one
+    ///   keeping no chart layer (nothing changes).
+    /// - [`RenderError::ChartImage`] (a misfit or a level mismatch) and
+    ///   [`RenderError::Atlas`] (a write refused): refusals, after which
+    ///   the array's record is cleared.
+    /// - [`RenderError::DeviceLost`] and a failing wait's error: the
+    ///   device's failure.
+    pub fn write_selection_chart(
+        &mut self,
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
+        set: u64,
+    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+        self.write_selection_chart_in(images, Some(set))
+    }
+
+    /// [`write_selection_chart`](Self::write_selection_chart), recording
+    /// `set` when there is one; with none, the write is never skipped and
+    /// the record stays cleared.
+    fn write_selection_chart_in(
+        &mut self,
+        images: [Option<&skin_model::chart_image::Fitted>; 3],
+        set: Option<u64>,
+    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
+        if self.gpu.lost() {
+            return Err(RenderError::DeviceLost);
+        }
+        let renderer = self.id;
+        let seams = self.chart_seams(false);
+        let Some(Some(slot)) =
+            Self::screen(ScreenKind::Selection).and_then(|i| self.screens.get_mut(i))
+        else {
+            return Err(RenderError::NoChartLayer);
+        };
+        let (table, wrote) = write_chart_set(
+            &self.gpu,
+            renderer,
+            &slot.installation,
+            &mut slot.resources.atlas,
+            images,
+            set,
+            seams,
+        )?;
+        #[cfg(any(test, feature = "dev-tools"))]
+        {
+            self.selection_chart_writes += u64::from(wrote);
+        }
+        #[cfg(not(any(test, feature = "dev-tools")))]
+        let _ = wrote;
+        Ok(table)
+    }
+
+    /// The seams of a chart write: `refuse`, and the test fault, taken.
+    fn chart_seams(&mut self, refuse: bool) -> ChartSeams {
+        #[cfg(not(any(test, feature = "dev-tools")))]
+        let _ = refuse;
+        ChartSeams {
+            #[cfg(any(test, feature = "dev-tools"))]
+            refuse,
+            #[cfg(test)]
+            fault: self.chart_fault.take(),
+        }
+    }
+
+    /// The live key of the selection kind's committed array, as
+    /// [`write_selection_chart`](Self::write_selection_chart) keys its
+    /// tables; `None` without one or once the device is lost. Selection
+    /// frames draw a table only while it equals this.
+    #[must_use]
+    pub fn selection_chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
+        self.slot_chart_key(ScreenKind::Selection)
+    }
+
+    /// The live key of `kind`'s committed array; `None` without one or
+    /// once the device is lost.
+    fn slot_chart_key(&self, kind: ScreenKind) -> Option<skin_model::chart_image::ChartKey> {
+        let i = Self::screen(kind)?;
+        let s = self.screens.get(i)?.as_ref()?;
+        (!self.gpu.lost()).then(|| skin_model::chart_image::ChartKey {
+            renderer: self.id,
+            installation: s.installation.loading().id(),
+            atlas: s.installation.bundle().atlas_id().0,
+            generation: s.resources.atlas.serial(),
+        })
+    }
+
+    /// Tests and development builds: the selection chart writes that
+    /// wrote pixels.
+    #[cfg(any(test, feature = "dev-tools"))]
+    #[must_use]
+    pub const fn selection_chart_writes(&self) -> u64 {
+        self.selection_chart_writes
     }
 
     /// The live key of the result kind's committed array, as
@@ -3136,14 +3205,7 @@ impl Renderer {
     /// table only while it equals this.
     #[must_use]
     pub fn result_chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
-        let i = Self::screen(ScreenKind::Result)?;
-        let s = self.screens.get(i)?.as_ref()?;
-        (!self.gpu.lost()).then(|| skin_model::chart_image::ChartKey {
-            renderer: self.id,
-            installation: s.installation.loading().id(),
-            atlas: s.installation.bundle().atlas_id().0,
-            generation: s.resources.atlas.serial(),
-        })
+        self.slot_chart_key(ScreenKind::Result)
     }
 
     /// Tests and development builds: the result chart writes that wrote
@@ -3583,13 +3645,6 @@ impl Renderer {
     /// Nothing allocates.
     pub fn rearm(&mut self) {
         self.skin.rearm();
-    }
-
-    /// What the play skin in use's attempt gives the next attempt of its
-    /// play state ([`PlaySkin::carry`]).
-    #[must_use]
-    pub fn carry(&self) -> Option<skin_model::Carry<'_>> {
-        self.skin.carry()
     }
 
     /// The app's share of a frame ([`Staging::build`]): the skin builds
@@ -4494,6 +4549,9 @@ impl Renderer {
         if std::mem::take(&mut self.selection_faults.0) {
             return Err(BuildError::Kind);
         }
+        // The array this frame draws from: a table keyed to another draws
+        // nothing.
+        sel.set_chart_live(self.selection_chart_key());
         let Some(Some(slot)) =
             Self::screen(ScreenKind::Selection).and_then(|i| self.screens.get_mut(i))
         else {
@@ -4988,8 +5046,21 @@ impl Renderer {
         let bundle = slot.installation.bundle();
         let uvs = bundle.uvs();
         let skin = bundle.skin();
+        #[cfg(feature = "dev-tools")]
+        let alloc = self.decision_alloc.take();
         slot.resources.staging.build_with(
-            |quads| skin.build_decision_with(dec, labels, &f, uvs, quads),
+            |quads| {
+                // A development fault: an allocation inside the skin's
+                // build, then a refusal when asked.
+                #[cfg(feature = "dev-tools")]
+                if let Some(refuse) = alloc {
+                    drop(std::hint::black_box(Box::new(0_u8)));
+                    if refuse {
+                        return Err(BuildError::Kind);
+                    }
+                }
+                skin.build_decision_with(dec, labels, &f, uvs, quads)
+            },
             &[],
         )?;
         self.started = Some(start);
@@ -5013,6 +5084,14 @@ impl Renderer {
     #[cfg(any(test, feature = "dev-tools"))]
     pub fn refuse_next_decision(&mut self) {
         self.decision_fault = true;
+    }
+
+    /// Development builds: the next decision build allocates inside the
+    /// skin's build ([`build_decision`](Self::build_decision)), then
+    /// refuses as a skin refuses one when `refuse`.
+    #[cfg(feature = "dev-tools")]
+    pub fn allocate_in_next_decision(&mut self, refuse: bool) {
+        self.decision_alloc = Some(refuse);
     }
 
     /// Development builds: the result frame last built, the skin's quads
@@ -5399,6 +5478,118 @@ const OFFSCREEN_FRAME_WAIT: Duration = Duration::from_millis(100);
 fn finish_uploads(gpu: &Gpu) -> Result<(), RenderError> {
     gpu.queue().submit([]);
     wait_for_gpu(gpu)
+}
+
+/// Test and development seams of [`write_chart_set`]: a refusal of the
+/// write as a misfit, and a fault run inside the write's error scope.
+/// Neither exists in a production build.
+#[derive(Clone, Copy)]
+struct ChartSeams {
+    #[cfg(any(test, feature = "dev-tools"))]
+    refuse: bool,
+    #[cfg(test)]
+    fault: Option<fn(&Gpu)>,
+}
+
+/// Writes `images` (each fitted for its chart slot) into `atlas`'s chart
+/// layer for `installation`, and returns the table of where they lie,
+/// keyed to that array, with whether pixels were written. A `set` the
+/// array's record already holds skips the write; otherwise the record is
+/// cleared first and set to `set` by a whole write.
+///
+/// # Errors
+///
+/// [`RenderError::NoChartLayer`] when the installation or array keeps no
+/// chart layer (nothing changes); [`RenderError::ChartImage`] and
+/// [`RenderError::Atlas`] for refusals (the record cleared); the device's
+/// failures.
+fn write_chart_set(
+    gpu: &Gpu,
+    renderer: u64,
+    installation: &Installation,
+    atlas: &mut AtlasTexture,
+    images: [Option<&skin_model::chart_image::Fitted>; 3],
+    set: Option<u64>,
+    seams: ChartSeams,
+) -> Result<(skin_model::chart_image::ChartTable, bool), RenderError> {
+    use skin_model::chart_image::{ChartImage, ChartKey, ChartTable, ChartUv};
+    #[cfg(not(any(test, feature = "dev-tools")))]
+    let _ = seams;
+    let bundle = installation.bundle();
+    let (Some(layer), Some(at)) = (bundle.chart_layer(), atlas.chart_layer()) else {
+        return Err(RenderError::NoChartLayer);
+    };
+    if u32::from(layer) != at {
+        return Err(RenderError::NoChartLayer);
+    }
+    let key = ChartKey {
+        renderer,
+        installation: installation.loading().id(),
+        atlas: bundle.atlas_id().0,
+        generation: atlas.serial(),
+    };
+    let side = atlas.side();
+    let mut uvs = [None; 3];
+    for (which, image) in ChartImage::ALL.into_iter().zip(images) {
+        let Some(f) = image else {
+            continue;
+        };
+        let uv = ChartUv::of(f, which, side, layer)
+            .filter(|_| u32::try_from(f.levels().len()).ok() == Some(atlas.levels()));
+        let Some(uv) = uv else {
+            atlas.set_chart_set(None);
+            return Err(RenderError::ChartImage { which });
+        };
+        if let Some(slot) = uvs.get_mut(which.index()) {
+            *slot = Some(uv);
+        }
+    }
+    let [stage, back, banner] = uvs;
+    let table = ChartTable::new(stage, back, banner).keyed(key);
+    if set.is_some() && atlas.chart_set() == set {
+        return Ok((table, false));
+    }
+    atlas.set_chart_set(None);
+    #[cfg(any(test, feature = "dev-tools"))]
+    if seams.refuse {
+        return Err(RenderError::ChartImage {
+            which: ChartImage::Stage,
+        });
+    }
+    for (which, image) in ChartImage::ALL.into_iter().zip(images) {
+        let (Some(f), Some((origin, _))) = (image, which.slot(side)) else {
+            continue;
+        };
+        let ((), refused) = skin_atlas::scoped(gpu.device(), || {
+            for ((k, bytes), level) in (0_u32..).zip(f.levels()).zip(0..) {
+                let Some(size) = f.level_size(level) else {
+                    continue;
+                };
+                skin_atlas::write_region(
+                    gpu.queue(),
+                    atlas.texture(),
+                    (at, k),
+                    origin.map(|o| o >> k),
+                    size,
+                    bytes,
+                );
+            }
+            #[cfg(test)]
+            if let Some(fault) = seams.fault {
+                fault(gpu);
+            }
+            gpu.queue().submit([]);
+        });
+        let waited = wait_for_gpu(gpu);
+        if waited.is_err() || gpu.lost() {
+            return Err(waited.err().unwrap_or(RenderError::DeviceLost));
+        }
+        if let Some(e) = refused {
+            return Err(RenderError::Atlas(UploadError::Device(e)));
+        }
+    }
+    atlas.set_chart_set(set);
+    Ok((table, true))
 }
 
 /// Waits until the GPU has done every submission, submitting nothing.
@@ -6216,7 +6407,6 @@ mod tests {
             context: &ctx,
             text,
             target: r.target(),
-            continuation: skin_model::Continuation::Fresh,
         };
         r.stage(b, &a, request)
     }
@@ -6287,7 +6477,7 @@ mod tests {
         let back = chart_picture(ChartImage::Back, side, [5, 3], [40, 50, 60]);
         assert_eq!(stage.padded(), [24, 24]);
         let table = r
-            .publish_chart_images(ChartTarget::Committed, [Some(&stage), Some(&back)])
+            .publish_chart_images(ChartTarget::Committed, [Some(&stage), Some(&back), None])
             .unwrap();
         // One image per submission, each waited for before the next is
         // queued: its waits before it, then its own.
@@ -6328,7 +6518,7 @@ mod tests {
         }
         // A publication over published images: unavailable from its first
         // byte, never the old table over the texels being replaced.
-        r.publish_chart_images(ChartTarget::Committed, [None, Some(&back)])
+        r.publish_chart_images(ChartTarget::Committed, [None, Some(&back), None])
             .unwrap();
         assert_eq!(
             r.chart_during_write,
@@ -6345,11 +6535,11 @@ mod tests {
         use skin_model::chart_image::{ChartImage, ChartTable};
         let (mut r, _dir, side) = chart_renderer();
         let stage = chart_picture(ChartImage::Stage, side, [64, 64], [1, 2, 3]);
-        r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+        r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
             .unwrap();
         r.chart_fault = Some(refuse);
         let e = r
-            .publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+            .publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
             .unwrap_err();
         assert!(
             matches!(e, RenderError::Atlas(UploadError::Device(_))),
@@ -6360,11 +6550,11 @@ mod tests {
         let presented = || r.installed.as_ref().unwrap().loading().chart_images();
         assert_eq!(presented(), Some(absent));
 
-        r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+        r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
             .unwrap();
         let wide = chart_picture(ChartImage::Stage, side * 2, [side + 100, 8], [1, 2, 3]);
         let e = r
-            .publish_chart_images(ChartTarget::Committed, [Some(&wide), None])
+            .publish_chart_images(ChartTarget::Committed, [Some(&wide), None, None])
             .unwrap_err();
         assert!(
             matches!(
@@ -6388,11 +6578,11 @@ mod tests {
         use skin_model::chart_image::ChartImage;
         let (mut r, _dir, side) = chart_renderer();
         let stage = chart_picture(ChartImage::Stage, side, [64, 64], [1, 2, 3]);
-        r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+        r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
             .unwrap();
         r.chart_fault = Some(|gpu| gpu.device().destroy());
         let e = r
-            .publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+            .publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
             .unwrap_err();
         assert!(!e.is_refusal(), "{e:?}");
         assert!(r.gpu.lost());
@@ -6437,11 +6627,11 @@ mod tests {
 
         let (mut r, _dir, side) = chart_renderer();
         let stage = chart_picture(ChartImage::Stage, side, [64, 64], [1, 2, 3]);
-        r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+        r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
             .unwrap();
         r.chart_wait_fault = Some(|| RenderError::Poll(wgpu::PollError::Timeout));
         let e = r
-            .publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+            .publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
             .unwrap_err();
         assert!(matches!(e, RenderError::Poll(_)), "{e:?}");
         assert_eq!(e.chart_outcome(), ChartOutcome::Unavailable);
@@ -6485,7 +6675,7 @@ mod tests {
         let (mut r, _dir, side) = chart_renderer();
         let stage = chart_picture(ChartImage::Stage, side, [64, 64], [1, 2, 3]);
         let table = r
-            .publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+            .publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
             .unwrap();
         assert!(table.drawable(r.chart_key()));
         r.gpu.device().destroy();
@@ -6497,7 +6687,7 @@ mod tests {
         assert_eq!(copy, Some(table), "the copy is still there");
         assert!(!table.drawable(r.chart_key()), "but draws nowhere");
         let e = r
-            .publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+            .publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
             .unwrap_err();
         assert!(matches!(e, RenderError::DeviceLost), "{e:?}");
     }
@@ -6511,7 +6701,7 @@ mod tests {
         let (mut r, _dir, side) = chart_renderer();
         let stage = chart_picture(ChartImage::Stage, side, [64, 64], [1, 2, 3]);
         let table = r
-            .publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+            .publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
             .unwrap();
         let bundle = std::sync::Arc::clone(r.installed.as_ref().unwrap().bundle());
         let levels = crate::decl::page_levels(bundle.atlas_pages());
@@ -6525,7 +6715,7 @@ mod tests {
         assert!(!table.drawable(r.chart_key()), "another generation's array");
         assert_eq!(r.valid_chart(), None);
         let again = r
-            .publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+            .publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
             .unwrap();
         assert!(again.drawable(r.chart_key()));
     }
@@ -6540,7 +6730,7 @@ mod tests {
         use skin_model::chart_image::ChartImage;
         let (mut r, _dir, side) = chart_renderer();
         let stage = chart_picture(ChartImage::Stage, side, [64, 64], [1, 2, 3]);
-        r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None])
+        r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
             .unwrap();
         let chart = bms_model::ChartBuilder::new(120_000).build().unwrap();
         let ctx = context(&GAUGES, false);

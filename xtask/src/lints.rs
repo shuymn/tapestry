@@ -368,6 +368,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/audio/src/engine.rs"),
     Site::File("crates/audio/src/mixer.rs"),
     Site::File("crates/audio/src/run.rs"),
+    Site::File("crates/audio/src/system.rs"),
     Site::File("crates/audio/src/wasapi.rs"),
     Site::Fns(
         "crates/audio/src/bank.rs",
@@ -534,9 +535,11 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::target",
             "MenuScreen::minimized",
             "MenuScreen::chart_key",
+            "MenuScreen::selection_chart_key",
             "MenuScreen::build_selection_frame",
             "MenuScreen::build_page_frame",
             "MenuScreen::build_decision",
+            "MenuScreen::allocate_in_next_decision",
             "strip_sprites",
         ],
     ),
@@ -548,6 +551,9 @@ pub const IN_PLAY: &[Site] = &[
         "crates/player/src/decision_side.rs",
         &["decision_frame_of", "decision_build", "DecisionSide::store"],
     ),
+    // A decision skin build's and submission's injected faults
+    // (dev-tools), counted on the render thread at each.
+    Site::File("crates/player/src/dev/decision_faults.rs"),
     // The selection frame's timers, the lifetime check before the
     // frame's build and the live settings.
     Site::Fns(

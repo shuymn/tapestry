@@ -1,7 +1,7 @@
-//! A chart's own images: the stage file and back image a chart's header
-//! names (system images 100 and 101 of beatoraja skins), read from the
-//! chart's folder and fitted into a slot of an atlas layer (docs/stage3.md
-//! S10-12). S15 reads BGA images through the same path, with its own
+//! A chart's own images: the stage file, back image and banner a chart's
+//! header names (system images 100, 101 and 102 of beatoraja skins), read
+//! from the chart's folder and fitted into a slot of an atlas layer
+//! (docs/stage3.md S10-12). S15 reads BGA images through the same path, with its own
 //! extension fallbacks and slots.
 //!
 //! - **Confinement** (design.md "Threat Model", T08: a chart's files are
@@ -820,16 +820,17 @@ fn to_f32(v: i128) -> f32 {
 }
 
 /// Which of a chart's own images an element draws: the stage file
-/// (system image 100) or the back image (101).
+/// (system image 100), the back image (101) or the banner (102).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum ChartImage {
     Stage,
     Back,
+    Banner,
 }
 
 impl ChartImage {
-    /// Both, in table order.
-    pub const ALL: [Self; 2] = [Self::Stage, Self::Back];
+    /// All three, in table order.
+    pub const ALL: [Self; 3] = [Self::Stage, Self::Back, Self::Banner];
 
     /// Its index in a [`ChartTable`].
     #[must_use]
@@ -838,21 +839,25 @@ impl ChartImage {
         match self {
             Self::Stage => 0,
             Self::Back => 1,
+            Self::Banner => 2,
         }
     }
 
     /// Its slot in a chart layer of side `side`, gutters included, and
-    /// the slot's origin: the stage file at the top left, the back image
-    /// at the top right, each half the side square (S10-12 design §4.3).
-    /// `None` for a side whose half is no [`Slot`].
+    /// the slot's origin: the stage file at the top left and the back
+    /// image at the top right, each half the side square, and the banner
+    /// below the stage file, half the side wide and a quarter high
+    /// (S10-12 design §4.3). No two overlap. `None` for a side whose
+    /// slot is no [`Slot`].
     #[must_use]
     pub fn slot(self, side: u32) -> Option<([u32; 2], Slot)> {
         let half = side / 2;
-        let origin = match self {
-            Self::Stage => [0, 0],
-            Self::Back => [half, 0],
+        let (origin, size) = match self {
+            Self::Stage => ([0, 0], [half, half]),
+            Self::Back => ([half, 0], [half, half]),
+            Self::Banner => ([0, half], [half, side / 4]),
         };
-        Slot::new([half, half]).map(|s| (origin, s))
+        Slot::new(size).map(|s| (origin, s))
     }
 }
 
@@ -911,23 +916,27 @@ pub struct ChartKey {
 /// array its uvs describe; a table without one describes none.
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct ChartTable {
-    uvs: [Option<ChartUv>; 2],
+    uvs: [Option<ChartUv>; 3],
     key: Option<ChartKey>,
 }
 
 impl ChartTable {
-    /// Both absent, of no array.
+    /// All absent, of no array.
     pub const ABSENT: Self = Self {
-        uvs: [None, None],
+        uvs: [None, None, None],
         key: None,
     };
 
-    /// The stage file `stage` and the back image `back`, of no array
-    /// until [`keyed`](Self::keyed).
+    /// The stage file `stage`, the back image `back` and the banner
+    /// `banner`, of no array until [`keyed`](Self::keyed).
     #[must_use]
-    pub const fn new(stage: Option<ChartUv>, back: Option<ChartUv>) -> Self {
+    pub const fn new(
+        stage: Option<ChartUv>,
+        back: Option<ChartUv>,
+        banner: Option<ChartUv>,
+    ) -> Self {
         Self {
-            uvs: [stage, back],
+            uvs: [stage, back, banner],
             key: None,
         }
     }

@@ -26,8 +26,10 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ::audio::{
-    AudioEngine, AudioOutput, BgmSchedule, Channel, FrameLine, Gain, InvalidVolume, MAX_VOLUME,
-    OutputError, ScheduledKind, SeekSource, SoundBank,
+    AudioEngine, AudioOutput, BgmSchedule, Channel, FrameLine, Gain, GenId, InvalidVolume,
+    MAX_VOLUME, OutputError, SYSTEM_INSTALLS, SYSTEM_KINDS, SYSTEM_RETURNS, SYSTEM_STARTS,
+    ScheduledKind, SeekSource, SoundBank, SystemGeneration, SystemInstall, SystemKind,
+    SystemSnapshot, SystemStart,
 };
 use bms_model::TimeUs;
 
@@ -109,6 +111,76 @@ const LOADS_CAPACITY: usize = 1;
 /// How long the game thread waits for the audio thread to take a play
 /// switch: far beyond a period, which is when it takes one.
 pub const SWITCH_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// The system sounds' request sequence issues numbers below this: a draw
+/// that would reach it is refused, and every later one is too.
+pub const SEQ_LIMIT: u64 = 1 << 63;
+/// The number never issued: the stop of a kind whose stop was asked for
+/// once the sequence was exhausted, and the empty install's number then.
+pub const TERMINAL: u64 = u64::MAX;
+
+/// Why a system sound's start was not queued.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum SystemStartError {
+    /// The start ring is full; counted.
+    #[error("the system sounds' start ring is full")]
+    Full,
+    /// The request sequence is exhausted; counted, except a decision
+    /// sound's, which its caller turns into the tone.
+    #[error("the system sounds' request sequence is exhausted")]
+    Exhausted,
+}
+
+/// Why a system generation was not queued for install; the generation
+/// comes back with it.
+#[derive(Debug, thiserror::Error)]
+pub enum SystemInstallError {
+    /// The install ring is full.
+    #[error("the system sounds' install ring is full")]
+    Full(SystemGeneration),
+    /// The generations handed over and not taken back fill the return
+    /// ring's room ([`SYSTEM_RETURNS`]); taking one back frees a place.
+    #[error("the system generations not yet taken back fill the return ring")]
+    Unreturned(SystemGeneration),
+    /// The request sequence is exhausted (only the empty generation is
+    /// installed then, at the terminal number).
+    #[error("the system sounds' request sequence is exhausted")]
+    Exhausted(SystemGeneration),
+    /// It was decoded at another rate than the output's.
+    #[error("the system generation is at {rate} Hz but the output runs at {output} Hz")]
+    RateMismatch {
+        /// The generation.
+        generation: SystemGeneration,
+        /// Its rate.
+        rate: u32,
+        /// The output's rate.
+        output: u32,
+    },
+}
+
+/// Where a test hook runs inside the audio thread's snapshot of the system
+/// sounds' requests (dev-tools).
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SnapshotPoint {
+    /// After the cutoff is read, before either ring.
+    AfterCutoff,
+    /// Between the start ring's read and the install ring's.
+    BetweenRings,
+    /// After the whole snapshot, before the requests are taken.
+    AfterSnapshot,
+}
+
+/// A test hook run at each [`SnapshotPoint`] (dev-tools).
+#[cfg(feature = "dev-tools")]
+struct SnapshotHook(Box<dyn FnMut(SnapshotPoint) + Send>);
+
+#[cfg(feature = "dev-tools")]
+impl std::fmt::Debug for SnapshotHook {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SnapshotHook")
+    }
+}
 
 /// Why the audio thread did not take a play switch or a queue change.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -311,6 +383,23 @@ impl AudioCounters {
         self.0.steals.load(Ordering::Acquire)
     }
 
+    /// System sound starts refused since the engine started: a full start
+    /// ring or an exhausted sequence on the requesting side, a full voice
+    /// pool, and every start or tone request after the output failed on
+    /// the audio thread.
+    #[must_use]
+    pub fn system_refused(&self) -> u64 {
+        self.0.system_refused.load(Ordering::Acquire)
+            + self.0.system_refused_requests.load(Ordering::Acquire)
+    }
+
+    /// Audio steps whose system requests waited behind an install that
+    /// found the retired slot taken.
+    #[must_use]
+    pub fn system_install_waits(&self) -> u64 {
+        self.0.system_install_waits.load(Ordering::Acquire)
+    }
+
     /// Whether the audio thread dropped READY candidate `generation`'s
     /// transport, by a cancel or a commit that found it cancelled: its
     /// cancellation is acknowledged, and no authorization of it is left.
@@ -375,6 +464,22 @@ struct Shared {
     /// The decision tones asked for so far (dev-tools).
     #[cfg(feature = "dev-tools")]
     tones: AtomicU64,
+    /// The system sounds' request sequence: the next number to issue.
+    /// Starts at 1; never passes [`SEQ_LIMIT`].
+    system_seq: AtomicU64,
+    /// The highest number the game thread has pushed a start or install
+    /// under (0: none): the audio thread takes nothing above it.
+    system_published: AtomicU64,
+    /// Per [`SystemKind`], its stop: raised, never lowered.
+    system_stops: [AtomicU64; SYSTEM_KINDS],
+    /// The current system generation's id (0: none installed).
+    system_installed: AtomicU64,
+    /// System starts the audio thread refused so far.
+    system_refused: AtomicU64,
+    /// System starts the requesting side refused so far.
+    system_refused_requests: AtomicU64,
+    /// Steps so far whose system requests waited behind a blocked install.
+    system_install_waits: AtomicU64,
     /// The latest report that the sealed play's audio has ended: its
     /// generation in the high 32 bits, the key-sound commands the audio
     /// thread had taken from its queue in the low 32.
@@ -517,6 +622,15 @@ pub struct AudioControl {
     /// Pushes of a switch taken as a full queue still to come (dev-tools).
     #[cfg(feature = "dev-tools")]
     full_for: Arc<std::sync::atomic::AtomicU32>,
+    /// The game thread's system sound starts, in number order.
+    system_starts: rtrb::Producer<SystemStart>,
+    /// System generations to install, in number order.
+    system_installs: rtrb::Producer<SystemInstall>,
+    /// System generations the audio thread is done with, freed here.
+    system_returns: rtrb::Consumer<SystemGeneration>,
+    /// System generations handed to the audio thread and not taken back:
+    /// queued, current, retired or in the return ring.
+    system_held: usize,
 }
 
 /// The audio thread's end: the engine and the play it is playing.
@@ -560,6 +674,12 @@ pub struct AudioWorker {
     steady_from: Option<TimeUs>,
     /// The play's underruns counted so far.
     steady: u32,
+    system_starts: rtrb::Consumer<SystemStart>,
+    system_installs: rtrb::Consumer<SystemInstall>,
+    system_returns: rtrb::Producer<SystemGeneration>,
+    /// A test hook inside the system snapshot (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    snapshot_hook: Option<SnapshotHook>,
 }
 
 /// A rearm the audio thread set aside while the restore it would replace
@@ -588,9 +708,13 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
     let rate = engine.bank().rate();
     let line = engine.frame_line();
     let source = engine.seek_source();
+    let (starts_tx, starts_rx) = rtrb::RingBuffer::new(SYSTEM_STARTS);
+    let (installs_tx, installs_rx) = rtrb::RingBuffer::new(SYSTEM_INSTALLS);
+    let (returns_tx, returns_rx) = rtrb::RingBuffer::new(SYSTEM_RETURNS);
     let shared = Arc::new(Shared {
         rate: line.rate,
         period: line.period,
+        system_seq: AtomicU64::new(1),
         ..Shared::default()
     });
     let control = AudioControl {
@@ -609,6 +733,10 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
         generation: 0,
         accepted: None,
         queue_change: 0,
+        system_starts: starts_tx,
+        system_installs: installs_tx,
+        system_returns: returns_rx,
+        system_held: 0,
     };
     let worker = AudioWorker {
         engine,
@@ -634,6 +762,11 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
         queue_change: 0,
         steady_from: None,
         steady: 0,
+        system_starts: starts_rx,
+        system_installs: installs_rx,
+        system_returns: returns_tx,
+        #[cfg(feature = "dev-tools")]
+        snapshot_hook: None,
     };
     // Before its first step, the line of an engine that has not woken.
     worker.publish_line();
@@ -1125,6 +1258,164 @@ impl AudioControl {
         self.shared.tone.store(true, Ordering::Release);
     }
 
+    /// Draws the next number of the system sounds' request sequence:
+    /// `None` once exhausted. A draw issues a number only below
+    /// [`SEQ_LIMIT`] and a refused one changes nothing, so the sequence
+    /// never wraps and, once exhausted, stays exhausted.
+    #[must_use]
+    pub fn system_seq(&self) -> Option<u64> {
+        self.shared
+            .system_seq
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |next| {
+                (next < SEQ_LIMIT).then(|| next + 1)
+            })
+            .ok()
+    }
+
+    /// Queues a start of `kind` under a new number, `looped` until stopped,
+    /// bound to `generation` when given (it plays only from that one), and
+    /// publishes the number. Returns the number.
+    ///
+    /// # Errors
+    ///
+    /// [`SystemStartError::Full`] when the start ring is full, before any
+    /// number is drawn, and [`SystemStartError::Exhausted`] once the
+    /// sequence is; each is counted ([`AudioCounters::system_refused`]),
+    /// except an exhausted decision sound's.
+    pub fn system_start(
+        &mut self,
+        kind: SystemKind,
+        looped: bool,
+        generation: Option<GenId>,
+    ) -> Result<u64, SystemStartError> {
+        let refused = |e: SystemStartError| {
+            if !(e == SystemStartError::Exhausted && kind == SystemKind::Decide) {
+                self.shared
+                    .system_refused_requests
+                    .fetch_add(1, Ordering::AcqRel);
+            }
+            Err(e)
+        };
+        if self.system_starts.is_full() {
+            return refused(SystemStartError::Full);
+        }
+        let Some(seq) = self.system_seq() else {
+            return refused(SystemStartError::Exhausted);
+        };
+        let start = SystemStart {
+            kind,
+            looped,
+            generation,
+            seq,
+        };
+        if self.system_starts.push(start).is_err() {
+            return refused(SystemStartError::Full);
+        }
+        self.shared.system_published.store(seq, Ordering::Release);
+        Ok(seq)
+    }
+
+    /// Stops every voice of `kind` started before now, in every
+    /// generation, at the audio thread's next step: the kind's stop word
+    /// rises to a new number, or to [`TERMINAL`] once the sequence is
+    /// exhausted, so a stop is never refused. Returns the number drawn.
+    pub fn system_stop(&self, kind: SystemKind) -> Option<u64> {
+        let seq = self.system_seq();
+        if let Some(word) = self.shared.system_stops.get(kind.index()) {
+            word.fetch_max(seq.unwrap_or(TERMINAL), Ordering::Release);
+        }
+        seq
+    }
+
+    /// Queues `generation` to become the current system generation under
+    /// a new number, and publishes the number: the audio thread applies it
+    /// after every start numbered below it. The empty generation is queued
+    /// at [`TERMINAL`] once the sequence is exhausted. Returns the number.
+    ///
+    /// It is admitted only while the generations handed over and not
+    /// taken back ([`take_system_return`](Self::take_system_return)) number
+    /// fewer than [`SYSTEM_RETURNS`], or, for the empty generation, one
+    /// more. The current one never waits in the return ring, so every
+    /// generation the audio thread replaces has a return slot, and none is
+    /// ever held there without one.
+    ///
+    /// # Errors
+    ///
+    /// [`SystemInstallError`] with the generation, unqueued: a full ring,
+    /// the generations not taken back at their bound, an exhausted
+    /// sequence, or another rate than the output's.
+    pub fn install_system(
+        &mut self,
+        generation: SystemGeneration,
+    ) -> Result<u64, SystemInstallError> {
+        if !generation.is_empty() && generation.rate() != self.rate {
+            let rate = generation.rate();
+            return Err(SystemInstallError::RateMismatch {
+                generation,
+                rate,
+                output: self.rate,
+            });
+        }
+        if self.system_installs.is_full() {
+            return Err(SystemInstallError::Full(generation));
+        }
+        let bound = SYSTEM_RETURNS + usize::from(generation.is_empty());
+        if self.system_held >= bound {
+            return Err(SystemInstallError::Unreturned(generation));
+        }
+        let seq = match self.system_seq() {
+            Some(seq) => seq,
+            None if generation.is_empty() => TERMINAL,
+            None => return Err(SystemInstallError::Exhausted(generation)),
+        };
+        if let Err(rtrb::PushError::Full(install)) =
+            self.system_installs.push(SystemInstall { generation, seq })
+        {
+            return Err(SystemInstallError::Full(install.generation));
+        }
+        self.system_held += 1;
+        self.shared.system_published.store(seq, Ordering::Release);
+        Ok(seq)
+    }
+
+    /// The system generation the audio thread has installed last.
+    #[must_use]
+    pub fn system_installed(&self) -> Option<GenId> {
+        let id = self.shared.system_installed.load(Ordering::Acquire);
+        (id != 0).then_some(GenId(id))
+    }
+
+    /// A system generation the audio thread is done with, to be dropped
+    /// here; taking it frees its place for another install.
+    pub fn take_system_return(&mut self) -> Option<SystemGeneration> {
+        let generation = self.system_returns.pop().ok()?;
+        self.system_held = self.system_held.saturating_sub(1);
+        Some(generation)
+    }
+
+    /// Sets the next number the request sequence issues (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub fn seed_system_seq(&self, next: u64) {
+        self.shared.system_seq.store(next, Ordering::Release);
+    }
+
+    /// The next number the request sequence would issue (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn system_seq_word(&self) -> u64 {
+        self.shared.system_seq.load(Ordering::Acquire)
+    }
+
+    /// `kind`'s stop word (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn system_stop_word(&self, kind: SystemKind) -> u64 {
+        self.shared
+            .system_stops
+            .get(kind.index())
+            .map_or(0, |word| word.load(Ordering::Acquire))
+    }
+
     /// The current play's number: 0 before the first play, then one more
     /// for each [`play`](Self::play).
     #[must_use]
@@ -1166,9 +1457,7 @@ impl AudioWorker {
                     .set_volume(channel, f32::from_bits(volume as u32));
             }
         }
-        if self.shared.tone.swap(false, Ordering::Acquire) {
-            self.engine.play_tone();
-        }
+        self.system_control();
         if let Some(old) = self.unreturned_restore.take() {
             self.give_back(old);
         }
@@ -1330,6 +1619,74 @@ impl AudioWorker {
             }
         }
         !self.exited
+    }
+
+    /// The system sounds' control step: a snapshot, in this order, of the
+    /// tone word (taken), the cutoff (the game thread's publication word),
+    /// each ring's readable count and the stop words; then the requests it
+    /// admits ([`SystemVoices::apply`](::audio::SystemVoices::apply)), and
+    /// the installed generation's id published.
+    fn system_control(&mut self) {
+        let Self {
+            engine,
+            shared,
+            system_starts,
+            system_installs,
+            system_returns,
+            #[cfg(feature = "dev-tools")]
+            snapshot_hook,
+            ..
+        } = self;
+        #[cfg(feature = "dev-tools")]
+        let mut hook = |point| {
+            if let Some(SnapshotHook(hook)) = snapshot_hook {
+                hook(point);
+            }
+        };
+        let tone = shared.tone.swap(false, Ordering::Acquire);
+        let cutoff = shared.system_published.load(Ordering::Acquire);
+        #[cfg(feature = "dev-tools")]
+        hook(SnapshotPoint::AfterCutoff);
+        let starts = system_starts.slots();
+        #[cfg(feature = "dev-tools")]
+        hook(SnapshotPoint::BetweenRings);
+        let installs = system_installs.slots();
+        let stops = shared
+            .system_stops
+            .each_ref()
+            .map(|word| word.load(Ordering::Acquire));
+        #[cfg(feature = "dev-tools")]
+        hook(SnapshotPoint::AfterSnapshot);
+        let snap = SystemSnapshot {
+            tone,
+            cutoff,
+            starts,
+            installs,
+            stops,
+        };
+        let system = engine.system_mut();
+        let report = system.apply(&snap, system_starts, system_installs, system_returns);
+        if let Some(id) = report.installed {
+            shared.system_installed.store(id.0, Ordering::Release);
+        }
+        shared
+            .system_refused
+            .store(system.refused(), Ordering::Release);
+        shared
+            .system_install_waits
+            .store(system.install_waits(), Ordering::Release);
+    }
+
+    /// Hands a silent retired system generation back: after the mix, and
+    /// at each control step after an output failure.
+    fn system_sweep(&mut self) {
+        self.engine.system_mut().sweep(&mut self.system_returns);
+    }
+
+    /// Runs `hook` at each point of the system snapshot (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub fn set_snapshot_hook(&mut self, hook: impl FnMut(SnapshotPoint) + Send + 'static) {
+        self.snapshot_hook = Some(SnapshotHook(Box::new(hook)));
     }
 
     /// The rearmed candidate's start, chart time 0 at `origin`, waiting
@@ -1507,6 +1864,7 @@ impl AudioWorker {
         }
         self.change_queue(out);
         let stepped = self.engine_step(out);
+        self.system_sweep();
         // A failed write may have mixed, and stolen voices, first.
         self.shared
             .deferred_wakes
@@ -1566,15 +1924,20 @@ impl AudioWorker {
         Ok(true)
     }
 
-    /// Steps until told to exit. After an output failure it only takes
-    /// control messages, every `idle`, until then.
+    /// Steps until told to exit. After an output failure every system
+    /// voice and the tone end, and it only takes control messages, every
+    /// `idle`, until then: system stops and installs still apply and a
+    /// silent retired generation still goes back, while every system start
+    /// is discarded.
     pub fn run(&mut self, out: &mut impl AudioOutput, idle: std::time::Duration) {
         loop {
             match self.step(out) {
                 Ok(true) => {}
                 Ok(false) => return,
                 Err(_) => {
+                    self.engine.system_mut().fail();
                     while self.control() {
+                        self.system_sweep();
                         std::thread::sleep(idle);
                     }
                     return;

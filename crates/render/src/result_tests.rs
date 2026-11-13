@@ -1084,7 +1084,11 @@ fn result_chart_images_are_written_into_the_staged_array() {
     // A on its own array: written, keyed to its staging's installation.
     let token = r.install(ScreenKind::Result, &a, 1).unwrap();
     let t1 = r
-        .write_result_chart(ResultChartTarget::Staged(token), [Some(&red), None], 1)
+        .write_result_chart(
+            ResultChartTarget::Staged(token),
+            [Some(&red), None, None],
+            1,
+        )
         .unwrap();
     assert_eq!(r.result_chart_writes(), 1);
     r.commit(token).unwrap();
@@ -1100,7 +1104,11 @@ fn result_chart_images_are_written_into_the_staged_array() {
     // B on A's pages, the same set: nothing written, its own key.
     let token = r.install(ScreenKind::Result, &b, 2).unwrap();
     let t2 = r
-        .write_result_chart(ResultChartTarget::Staged(token), [Some(&red), None], 1)
+        .write_result_chart(
+            ResultChartTarget::Staged(token),
+            [Some(&red), None, None],
+            1,
+        )
         .unwrap();
     assert_eq!(r.result_chart_writes(), 1, "the installed array's set");
     assert_ne!(t2.key(), t1.key());
@@ -1115,11 +1123,11 @@ fn result_chart_images_are_written_into_the_staged_array() {
 
     // The record is an id: set 1 gone, still skipped; set 2 writes.
     drop(red);
-    r.write_result_chart(ResultChartTarget::Committed, [None, None], 1)
+    r.write_result_chart(ResultChartTarget::Committed, [None, None, None], 1)
         .unwrap();
     assert_eq!(r.result_chart_writes(), 1);
     let t3 = r
-        .write_result_chart(ResultChartTarget::Committed, [Some(&green), None], 2)
+        .write_result_chart(ResultChartTarget::Committed, [Some(&green), None, None], 2)
         .unwrap();
     assert_eq!(r.result_chart_writes(), 2);
     sb.set_chart_images(t3);
@@ -1128,11 +1136,11 @@ fn result_chart_images_are_written_into_the_staged_array() {
     // A refused write: absent, the record cleared, so set 2 writes again.
     r.refuse_next_result_chart();
     let refused = r
-        .write_result_chart(ResultChartTarget::Committed, [Some(&green), None], 4)
+        .write_result_chart(ResultChartTarget::Committed, [Some(&green), None, None], 4)
         .unwrap_err();
     assert_eq!(refused.chart_outcome(), render::ChartOutcome::Absent);
     assert_eq!(r.result_chart_writes(), 2);
-    r.write_result_chart(ResultChartTarget::Committed, [Some(&green), None], 2)
+    r.write_result_chart(ResultChartTarget::Committed, [Some(&green), None, None], 2)
         .unwrap();
     assert_eq!(r.result_chart_writes(), 3, "the record was cleared");
 
@@ -1144,7 +1152,7 @@ fn result_chart_images_are_written_into_the_staged_array() {
     sb.set_chart_images(t3);
     assert_eq!(rgb_at(&pixels(&mut r, &mut sb, &[]), W, A_AT), BLACK);
     let t4 = r
-        .write_result_chart(ResultChartTarget::Committed, [Some(&green), None], 2)
+        .write_result_chart(ResultChartTarget::Committed, [Some(&green), None, None], 2)
         .unwrap();
     sb.set_chart_images(t4);
     assert_eq!(rgb_at(&pixels(&mut r, &mut sb, &[]), W, A_AT), GREEN_PX);

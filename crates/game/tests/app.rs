@@ -606,6 +606,8 @@ struct Headless {
     finalized: Vec<bool>,
     /// Each idle wait: when it began and its deadline.
     idle_waits: Vec<(i64, i64)>,
+    /// What the select screen's own wake answers.
+    selection_wake: Option<i64>,
     /// Edits of the files run once the clock reaches their time.
     edits: Vec<(i64, Box<dyn FnOnce()>)>,
     /// The presses that hit the loaded chart's notes.
@@ -783,6 +785,7 @@ impl Headless {
             play: None,
             finalized: Vec::new(),
             idle_waits: Vec::new(),
+            selection_wake: None,
             page_polls: Vec::new(),
             refuse_page_read: false,
             page_fails_at: None,
@@ -1337,6 +1340,10 @@ impl LoadingRig for Headless {
 
 impl AppRig for Headless {
     type BankError = BankLost;
+
+    fn selection_wake(&self) -> Option<TimeUs> {
+        self.selection_wake.map(TimeUs)
+    }
 
     #[cfg(feature = "dev-tools")]
     fn configure(&mut self, config: &mut SessionConfig, parts: &mut Parts) {
@@ -3155,6 +3162,27 @@ fn unloadable_chosen_preset_refuses_then_heals_on_select() {
         panic!("{:?}", rig.seen);
     };
     assert_eq!(plays[0].preset, mine(rules::tapestry()));
+}
+
+/// The select screen's own wake, earlier than the idle wait and the poll
+/// deadline, ends the idle wait there; one later than them changes
+/// nothing.
+#[test]
+fn the_select_screens_wake_ends_its_idle_wait() {
+    let wake = CLOCK_START + 150 * MS;
+    let (rig, _, ran) = run(Refusal::Missing, vec![(1_000, Act::Close)], |r| {
+        r.selection_wake = Some(wake);
+    });
+    ran.unwrap();
+    let first = rig.idle_waits.first().copied().unwrap();
+    assert_eq!(first, (CLOCK_START, wake), "{:?}", rig.idle_waits);
+    let late = CLOCK_START + 10_000 * MS;
+    let (rig, _, ran) = run(Refusal::Missing, vec![(1_000, Act::Close)], |r| {
+        r.selection_wake = Some(late);
+    });
+    ran.unwrap();
+    let first = rig.idle_waits.first().copied().unwrap();
+    assert!(first.1 < late, "{:?}", rig.idle_waits);
 }
 
 /// A wake 1 µs before selection's poll deadline does not check; the wait

@@ -1,8 +1,9 @@
 //! The chart's own images on a play skin (S10-12): a destination of
 //! system image 100 or 101 becomes a chart image, its keys unbaked and its
 //! stretch, colour, blend and filter kept for placement; the trimmed
-//! stretches are dropped; and on the selection and decision screens they
-//! stay dropped (the result's are `result_chart_images`).
+//! stretches are dropped; on the selection screen the back image is
+//! dropped (its stage file and banner are `selection_chart_images`), and
+//! on the decision screen both (the result's are `result_chart_images`).
 //! Conditions 190, 191, 194 and 195 read the images' presence, and while
 //! loading none of them is evaluated until the images settle.
 
@@ -38,7 +39,7 @@ const BACK: ChartUv = ChartUv {
 };
 
 fn table(stage: bool, back: bool) -> ChartTable {
-    ChartTable::new(stage.then_some(STAGE), back.then_some(BACK)).keyed(KEY)
+    ChartTable::new(stage.then_some(STAGE), back.then_some(BACK), None).keyed(KEY)
 }
 
 /// The quads of `l`'s first frame with `table` published.
@@ -164,10 +165,11 @@ fn trimmed_stretches_and_the_banner_are_dropped() {
     );
 }
 
-/// On the selection and decision screens 100 and 101 stay dropped as
-/// unsupported system objects: the skins are admitted.
+/// On the selection screen 100 lowers and 101 is dropped as an
+/// unsupported system object; on the decision screen both are: the skins
+/// are admitted.
 #[test]
-fn chart_images_stay_dropped_on_selection_and_decision() {
+fn chart_images_on_selection_and_decision() {
     let dsts = r#""destination": [{"id": "-100", "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]},
         {"id": "-101", "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}]"#;
     let system = NoteKind::Unsupported {
@@ -182,10 +184,10 @@ fn chart_images_stay_dropped_on_selection_and_decision() {
     );
     let s = common::selection::folder(&selection);
     let i = common::selection::import_selection(s.path()).unwrap();
-    assert!(!i.skin.has_chart_images());
+    assert!(i.skin.has_chart_images());
     assert_eq!(
         i.report.notes.iter().filter(|n| n.kind == system).count(),
-        2
+        1
     );
     let d = common::decision::folder(dsts);
     let i = common::decision::import_decision(d.path()).unwrap();

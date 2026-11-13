@@ -51,9 +51,17 @@ fn skinned() -> (tempfile::TempDir, MenuScreen, SelectionLogic, Sent) {
 }
 
 /// [`skinned`] on `r`.
-fn skinned_on(mut r: render::Renderer) -> (tempfile::TempDir, MenuScreen, SelectionLogic, Sent) {
-    let dir = crate::selection_skin::fixture();
-    let b = crate::selection_skin::fixture_bundle(&r, dir.path(), "s.json");
+fn skinned_on(r: render::Renderer) -> (tempfile::TempDir, MenuScreen, SelectionLogic, Sent) {
+    skinned_with(r, crate::selection_skin::fixture(), "s.json")
+}
+
+/// [`skinned_on`] with the skin `entry` of `dir`.
+fn skinned_with(
+    mut r: render::Renderer,
+    dir: tempfile::TempDir,
+    entry: &str,
+) -> (tempfile::TempDir, MenuScreen, SelectionLogic, Sent) {
+    let b = crate::selection_skin::fixture_bundle(&r, dir.path(), entry);
     let token = r.install(ScreenKind::Selection, &b, 1).unwrap();
     r.commit(token).unwrap();
     let sent = Sent::default();
@@ -318,11 +326,18 @@ fn the_memory_witness_counts_the_selection_lines_and_state() {
 /// preparation, each later one, the first after a resize prepared
 /// outside the count, and refused, with the fallback page's own build;
 /// each is counted apart from the GPU submission that follows it. An
-/// allocation put into that work (the probe) is counted.
+/// allocation put into that work (the probe) is counted. The skin draws
+/// the chart's stage file and banner, its table changing between frames
+/// (none, the images, absent).
 #[test]
 fn selection_frame_alloc() {
     let _warp = crate::warp_turn::take();
-    let (_dir, mut screen, mut logic, _) = skinned();
+    let (_dir, mut screen, mut logic, _) = skinned_with(
+        warp(),
+        crate::selection_skin::chart_fixture(),
+        "chart.luaskin",
+    );
+    let tables = chart_tables(&mut screen, &logic);
     let mut feed = SkinFeed::default();
     feed.enter(TimeUs(0));
     let mut s = searching("abc", "かな");
@@ -368,6 +383,8 @@ fn selection_frame_alloc() {
         }
         let n = counted(&mut || {
             logic.apply_settings(u.settings.as_ref(), Some(&tuning));
+            logic.sel.set_chart_images(chart_table(&tables, k));
+            logic.sel.write_chart_fields();
             screen
                 .build_selection_frame(&u, logic, TimeUs(k * 16_667), app(k))
                 .unwrap();
@@ -388,6 +405,12 @@ fn selection_frame_alloc() {
     const { assert!(render::STRIP_SPRITES == 3) };
     for k in 1..100 {
         assert_eq!(build(&mut screen, &mut logic, k), 0, "{k}");
+        let q = screen.renderer.selection_quads().unwrap();
+        assert_eq!(
+            has(&q, crate::selection_skin::STAGE_DST, None),
+            k % 3 == 1,
+            "{k}: the stage file drawn"
+        );
     }
     screen.resize(1_280, 720);
     prepare(&mut screen, &mut logic, false);
@@ -518,15 +541,18 @@ fn measure_on(adapter: render::AdapterChoice) {
 
 /// A selection frame's build allocates nothing with the skin's runtime
 /// present and running each frame before it, outside the counted build
-/// (docs/stage3.md S7-07; design.md "Scope of No Allocation").
+/// (docs/stage3.md S7-07; design.md "Scope of No Allocation"): the
+/// skin's callbacks read the chart image options, and it draws the stage
+/// file and banner, their table changing between frames.
 #[test]
 fn selection_runtime_frame_alloc() {
     let _warp = crate::warp_turn::take();
     let _serial = crate::imports::tests::serial();
+    let _untimed = crate::selection_skin::untimed();
     let mut r = warp();
-    let dir = crate::selection_skin::runtime_fixture();
+    let dir = crate::selection_skin::chart_fixture();
     let (b, script) =
-        crate::selection_skin::fixture_scripted(r.atlas_limits(), dir.path(), "rt.luaskin");
+        crate::selection_skin::fixture_scripted(r.atlas_limits(), dir.path(), "chart.luaskin");
     let token = r.install(ScreenKind::Selection, &b, 1).unwrap();
     r.commit(token).unwrap();
     let key = std::sync::Arc::as_ptr(&b).addr();
@@ -538,12 +564,14 @@ fn selection_runtime_frame_alloc() {
     let mut feed = SkinFeed::default();
     feed.enter(TimeUs(0));
     let u = update(&mut feed, &searching("", ""), 0);
+    let tables = chart_tables(&mut screen, &logic);
     screen
         .prepare_selection(&u, &mut logic, true)
         .unwrap()
         .unwrap();
     for k in 0..50 {
         let now = TimeUs(k * 16_667);
+        logic.sel.set_chart_images(chart_table(&tables, k));
         crate::screens::selection_visit(
             &mut logic.script,
             logic.bundle.skin(),
@@ -558,13 +586,26 @@ fn selection_runtime_frame_alloc() {
             .build_selection_frame(&u, &mut logic, now, APP)
             .unwrap();
         assert_eq!(crate::alloc_count::this_thread() - before, 0, "frame {k}");
+        let q = screen.renderer.selection_quads().unwrap();
+        // The callbacks read 191 as the frame draws the stage file.
+        let drawn = k % 3 == 1;
+        assert_eq!(
+            has(&q, crate::selection_skin::STAGE_DST, None),
+            drawn,
+            "{k}"
+        );
+        assert_eq!(
+            has(&q, crate::selection_skin::chart_mark(1, 1), None),
+            drawn,
+            "{k}: 191 in a callback"
+        );
         screen.renderer.submit_selection(&[]).unwrap();
     }
     logic.script.park();
     assert_eq!(
         scripts.parked(ScreenKind::Selection),
-        Some((50, false)),
-        "the runtime ran each frame"
+        Some((50 * 12, false)),
+        "the runtime ran its twelve callbacks each frame"
     );
 }
 
@@ -605,4 +646,156 @@ fn the_build_mark_precedes_the_selection_build() {
         let start = render::take_build_start().expect("the build began");
         assert!(mark <= start, "frame {k}: the build began before its mark");
     }
+}
+
+/// The chart fixture's tables a frame is given in turn: none (not
+/// current), its images written into the screen's selection array, and
+/// absent for that array.
+fn chart_tables(
+    screen: &mut MenuScreen,
+    logic: &SelectionLogic,
+) -> [Option<skin_model::chart_image::ChartTable>; 3] {
+    let (_images, set) = crate::selection_skin::selection_images(
+        logic.bundle.side(),
+        [200, 10, 10],
+        Some([10, 200, 10]),
+    );
+    let table = screen
+        .write_selection_chart(set.fitted(), set.id())
+        .unwrap();
+    let key = table.key().unwrap();
+    [
+        None,
+        Some(table),
+        Some(skin_model::chart_image::ChartTable::ABSENT.keyed(key)),
+    ]
+}
+
+/// The table of [`chart_tables`] frame `k` is given.
+fn chart_table(
+    tables: &[Option<skin_model::chart_image::ChartTable>; 3],
+    k: i64,
+) -> Option<skin_model::chart_image::ChartTable> {
+    tables[usize::try_from(k.rem_euclid(3)).unwrap()]
+}
+
+/// Whether `q` holds a quad on `rect`, rounded, from `layer` if given.
+fn has(q: &[skin_model::Quad], rect: [f32; 4], layer: Option<u16>) -> bool {
+    q.iter()
+        .any(|q| q.rect.map(f32::round) == rect && layer.is_none_or(|l| q.layer == l))
+}
+
+/// The chart fixture's skin with its runtime on a WARP screen, its chart
+/// layer's index, and its state.
+fn chart_skinned(
+    scripts: &crate::screens::Scripts,
+) -> (tempfile::TempDir, MenuScreen, SelectionLogic, u16) {
+    let mut r = warp();
+    let dir = crate::selection_skin::chart_fixture();
+    let (b, script) =
+        crate::selection_skin::fixture_scripted(r.atlas_limits(), dir.path(), "chart.luaskin");
+    assert!(script.holds(), "the callbacks are the runtime's");
+    let layer = b.chart_layer().expect("the skin keeps a chart layer");
+    let token = r.install(ScreenKind::Selection, &b, 1).unwrap();
+    r.commit(token).unwrap();
+    let key = std::sync::Arc::as_ptr(&b).addr();
+    scripts.commit(ScreenKind::Selection, key, script);
+    let screen = MenuScreen::new(r, Some(Fonts::runtime().unwrap()));
+    let logic = SelectionLogic::new(&b, 1).with_script(scripts.slot(ScreenKind::Selection, key));
+    (dir, screen, logic, layer)
+}
+
+/// Options 190 to 193 read the selection table set for the frame, the
+/// same in the frame's conditions (`op`), in the runtime's callbacks
+/// (`option(n)`, `option(-n)`, `not option(m)`)
+/// and in its draws of −100 and −102 (D4, SC2, SC3): while no table is
+/// current 190 and 192 hold, 191 and 193 do not and neither image draws;
+/// with one, 191 and 193 read each image's presence. The fields are
+/// written after the view update and before the callbacks: a frame whose
+/// view changed reads the table, and a frame whose table changed reads it
+/// in its own callbacks, not the last frame's.
+#[test]
+fn the_selection_image_options_agree_in_frames_callbacks_and_conditions() {
+    let _warp = crate::warp_turn::take();
+    let _serial = crate::imports::tests::serial();
+    let _untimed = crate::selection_skin::untimed();
+    let scripts = crate::screens::Scripts::new();
+    let (_dir, mut screen, mut logic, layer) = chart_skinned(&scripts);
+    let side = logic.bundle.side();
+    let (_both, both) =
+        crate::selection_skin::selection_images(side, [200, 10, 10], Some([10, 200, 10]));
+    let (_stage, stage_only) = crate::selection_skin::selection_images(side, [10, 10, 200], None);
+    let mut feed = SkinFeed::default();
+    feed.enter(TimeUs(0));
+    let mut u = update(&mut feed, &searching("", ""), 0);
+    let frame = |screen: &mut MenuScreen,
+                 logic: &mut SelectionLogic,
+                 u: &SelectionUpdate,
+                 changed: bool,
+                 table: Option<skin_model::chart_image::ChartTable>,
+                 k: i64| {
+        logic.sel.set_chart_images(table);
+        let d = screen
+            .selection(u, Some(logic), changed, TimeUs(k * 16_667), APP)
+            .unwrap();
+        assert_eq!(d.refused, None);
+        screen.renderer.selection_quads().unwrap()
+    };
+    // What each option of `CHART_OPTIONS` reads with the stage file's and
+    // the banner's presence.
+    let check = |q: &[skin_model::Quad], stage: bool, banner: bool, what: &str| {
+        let reads = [!stage, stage, !banner, banner, !stage, !banner];
+        for (i, (n, want)) in crate::selection_skin::CHART_OPTIONS
+            .iter()
+            .zip(reads)
+            .enumerate()
+        {
+            for (row, how) in ["op", "callback", "callback not"].iter().enumerate() {
+                assert_eq!(
+                    has(q, crate::selection_skin::chart_mark(row, i), None),
+                    want,
+                    "{what}: option {n} by {how}"
+                );
+            }
+        }
+        assert_eq!(
+            has(q, crate::selection_skin::STAGE_DST, Some(layer)),
+            stage,
+            "{what}: −100"
+        );
+        assert_eq!(
+            has(q, crate::selection_skin::BANNER_DST, Some(layer)),
+            banner,
+            "{what}: −102"
+        );
+    };
+    let table = screen
+        .write_selection_chart(both.fitted(), both.id())
+        .unwrap();
+    assert_eq!(table.key(), screen.selection_chart_key());
+    assert!(table.key().is_some());
+    // Not current: the first frame of the view.
+    let q = frame(&mut screen, &mut logic, &u, true, None, 0);
+    check(&q, false, false, "not current");
+    // Current from the next frame: its callbacks read this frame's table.
+    let q = frame(&mut screen, &mut logic, &u, false, Some(table), 1);
+    check(&q, true, true, "current");
+    // A view update (a panel opened) resets the view's fields; the table
+    // still reads in that frame's callbacks.
+    u.revision += 1;
+    let q = frame(&mut screen, &mut logic, &u, true, Some(table), 2);
+    check(&q, true, true, "current, the view changed");
+    // Not current again (a cursor move), in the same frame.
+    let q = frame(&mut screen, &mut logic, &u, false, None, 3);
+    check(&q, false, false, "not current again");
+    // A set without a banner: 193 does not hold, 192 does.
+    let table = screen
+        .write_selection_chart(stage_only.fitted(), stage_only.id())
+        .unwrap();
+    let q = frame(&mut screen, &mut logic, &u, false, Some(table), 4);
+    check(&q, true, false, "no banner");
+    // An absent table keyed to the array: neither.
+    let absent = skin_model::chart_image::ChartTable::ABSENT.keyed(table.key().unwrap());
+    let q = frame(&mut screen, &mut logic, &u, false, Some(absent), 5);
+    check(&q, false, false, "absent");
 }

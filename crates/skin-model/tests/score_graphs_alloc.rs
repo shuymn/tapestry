@@ -29,10 +29,9 @@ use bms_model::{Chart, ChartBuilder, TimeUs};
 use eval::{Section, Tally};
 use rules::PerJudgment;
 use skin_model::{
-    Align, Atlas, Attempt, BpmColors, BpmGraphDef, Continuation, ElementDef, EmaMode, GlyphSet,
-    HitErrorDef, MAX_CELLS, Pad, PlayContext, PlayDefs, PlayScore, RatioBarDef, RatioForm,
-    RatioSource, Rgba8, ScoreBasis, ScoreRate, Skin, Source, TimerRef, TimingVisualizerDef,
-    Variant, WidgetDefs, timer,
+    Align, Atlas, Attempt, BpmColors, BpmGraphDef, ElementDef, EmaMode, GlyphSet, HitErrorDef,
+    MAX_CELLS, Pad, PlayContext, PlayDefs, PlayScore, RatioBarDef, RatioForm, RatioSource, Rgba8,
+    ScoreBasis, ScoreRate, Skin, Source, TimerRef, TimingVisualizerDef, Variant, WidgetDefs, timer,
 };
 
 use play_support::{GAUGES, Harness, MS, def, full, lane};
@@ -409,20 +408,8 @@ fn score_frames_do_not_allocate() {
     let mut round = h.skin.prepare(&chart, &practice).unwrap();
     std::mem::swap(&mut h.play, &mut round);
     assert_eq!(frame(&mut h, 1_300, tally(2, 1, 0)), 0);
-    // The first round's score data, carried: the projections ignore it.
-    let score = skin_model::settled(&tally(2, 1, 0), 7, false);
-    assert!(score.is_some());
-    let mut next = h
-        .skin
-        .prepare_carried(
-            &chart,
-            &practice,
-            Continuation::Carried {
-                score,
-                bank: Some(h.play.bank()),
-            },
-        )
-        .unwrap();
+    // The next round, prepared fresh.
+    let mut next = h.skin.prepare(&chart, &practice).unwrap();
     std::mem::swap(&mut h.play, &mut next);
     let none = [
         Some(0),
@@ -554,18 +541,7 @@ fn graph_frames(name: &str, skin: Skin, chart: &Chart, score: PlayScore<'_>, che
     let mut round = h.skin.prepare(chart, &practice).unwrap();
     std::mem::swap(&mut h.play, &mut round);
     assert_eq!(frame(&mut h, 1_300, tally(2, 1, 0)), 0);
-    let carried = skin_model::settled(&tally(2, 1, 0), 7, false);
-    let mut next = h
-        .skin
-        .prepare_carried(
-            chart,
-            &practice,
-            Continuation::Carried {
-                score: carried,
-                bank: Some(h.play.bank()),
-            },
-        )
-        .unwrap();
+    let mut next = h.skin.prepare(chart, &practice).unwrap();
     std::mem::swap(&mut h.play, &mut next);
     h.clear_ring();
     assert_eq!(frame(&mut h, 400, tally(0, 0, 0)), 0);
