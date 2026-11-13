@@ -26,10 +26,10 @@ pub enum RatioSource {
     /// The selected chart's best max combo over its summary's notes, a
     /// chart that draws included; none without a summary.
     ComboRate,
-    /// The master gain that plays, exactly
-    /// ([`MasterVolume::ratio`](crate::MasterVolume::ratio)); none before
+    /// The system volume that plays, exactly
+    /// ([`VolumeReading::ratio`](crate::VolumeReading::ratio)); none before
     /// the settings.
-    MasterVolume,
+    SystemVolume,
     /// A play's score rate: a play skin's source, and only a play skin's,
     /// as the two below.
     Score(ScoreRate),
@@ -66,7 +66,7 @@ impl RatioSource {
             | Self::ExRate
             | Self::JudgeRate(_)
             | Self::ComboRate
-            | Self::MasterVolume
+            | Self::SystemVolume
             | Self::Score(_) => None,
         }
     }

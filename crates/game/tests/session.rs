@@ -2829,7 +2829,22 @@ fn a_practice_set_before_the_session_starts_is_checked_against_its_engine() {
         repeat: false,
     };
     loaded.set_practice(Some(practice.clone())).unwrap();
-    assert_ne!(loaded.audio_schedule(), chart.bgm);
+    assert_ne!(
+        loaded.audio_schedule(),
+        chart
+            .bgm
+            .iter()
+            .map(|&e| e.into())
+            .collect::<Vec<audio::ScheduledSound>>()
+    );
+    // A round's key sounds outside its section play at the background
+    // volume, as its BGM does.
+    assert!(
+        loaded
+            .audio_schedule()
+            .iter()
+            .all(|e| e.channel == audio::Channel::Background)
+    );
     let audio = steady_audio(&chart, common::bank(&chart));
     let mut session = loaded.start(audio, SourceSet::new(common::sources()).unwrap());
     let err = session

@@ -1,6 +1,13 @@
 //! The mixer: preallocated voices summed in `f32`, one sounding instance per
-//! sound id, oldest-voice stealing with a raised-cosine fade, volume, the
-//! play's fixed gain and a static soft clipper.
+//! sound id, oldest-voice stealing with a raised-cosine fade, the key and
+//! background volumes, the play's fixed gain and a static soft clipper.
+//!
+//! Each voice carries the [`Channel`] of the start that began it, and its
+//! samples are scaled by that channel's volume as they are summed, which is
+//! the two channels summed apart and each scaled by its volume (design.md
+//! "Audio", the three volumes); the play's gain and the soft clipper follow
+//! on the whole sum. A volume change applies from the next block, to the
+//! voices already sounding too.
 //!
 //! A triggered sound waits as a pending start at an absolute output frame,
 //! and rendering applies pending starts in time order as it reaches them, so
@@ -30,7 +37,7 @@
 //! output on its own frames: gain 1 before its fade frame, falling linearly
 //! to 0 at its end frame, where every voice stops and from which nothing
 //! starts. The envelope multiplies the clipped output, so it is independent
-//! of the volume and of how the output is divided into blocks. Stopping
+//! of the volumes and of how the output is divided into blocks. Stopping
 //! everything ([`Mixer::stop_all`], as every play's start does) takes it
 //! off.
 //!
@@ -54,7 +61,7 @@ use crate::bank::{Sound, SoundBank};
 pub const MAX_VOICES: usize = 256;
 /// Starts that can wait to be applied; more are dropped and counted.
 pub const MAX_PENDING_STARTS: usize = 1024;
-/// Largest master volume (+24 dB), so no sum of voices overflows `f32`.
+/// Largest volume (+24 dB), so no sum of voices overflows `f32`.
 pub const MAX_VOLUME: f32 = 16.0;
 /// Fade applied to a stolen voice.
 pub const STEAL_FADE_MS: u32 = 2;
@@ -68,11 +75,75 @@ pub const MAX_GAIN: f32 = 1.995_262_3;
 /// Level below which [`soft_clip`] passes samples unchanged.
 pub const SOFT_CLIP_KNEE: f32 = 0.8;
 
+/// One of the three volumes (design.md "Audio", the three volumes): the
+/// system volume scales the player's own sounds, the key volume a chart's
+/// key sounds and the background volume its BGM-lane sounds. A chart's
+/// voice is on the key or the background channel, as its start was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum Channel {
+    /// The player's own sounds (the decision tone).
+    System,
+    /// A chart's key sounds: judged, autoplayed and the audio tail's.
+    Key,
+    /// A chart's BGM-lane sounds, and a practice round's notes outside its
+    /// section.
+    Background,
+}
+
+impl Channel {
+    /// Every channel, in [`index`](Self::index) order.
+    pub const ALL: [Self; 3] = [Self::System, Self::Key, Self::Background];
+
+    /// Its place in [`ALL`](Self::ALL).
+    #[must_use]
+    pub const fn index(self) -> usize {
+        match self {
+            Self::System => 0,
+            Self::Key => 1,
+            Self::Background => 2,
+        }
+    }
+}
+
+/// The three volumes, 1.0 until set.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Volumes {
+    system: f32,
+    key: f32,
+    background: f32,
+}
+
+impl Volumes {
+    const UNITY: Self = Self {
+        system: 1.0,
+        key: 1.0,
+        background: 1.0,
+    };
+
+    pub(crate) const fn get(&self, channel: Channel) -> f32 {
+        match channel {
+            Channel::System => self.system,
+            Channel::Key => self.key,
+            Channel::Background => self.background,
+        }
+    }
+
+    const fn set(&mut self, channel: Channel, volume: f32) {
+        match channel {
+            Channel::System => self.system = volume,
+            Channel::Key => self.key = volume,
+            Channel::Background => self.background = volume,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct Voice {
     pub(crate) active: bool,
     /// The sound id it was triggered as.
     pub(crate) id: SoundId,
+    /// The channel its start was on, whose volume scales it.
+    pub(crate) channel: Channel,
     /// Index into the bank's stored sounds.
     pub(crate) sound: u32,
     /// Output frame of its first sample: before frame 0 for a voice a seek
@@ -88,6 +159,7 @@ impl Voice {
     const IDLE: Self = Self {
         active: false,
         id: SoundId(0),
+        channel: Channel::Key,
         sound: 0,
         start: 0,
         seq: 0,
@@ -349,10 +421,10 @@ pub struct Mixer {
     /// First output frame not yet rendered.
     mixed_to: u64,
     seq: u64,
-    volume: f32,
+    volumes: Volumes,
     /// The play's fixed gain on the sum.
     gain: f32,
-    /// Samples above [`SOFT_CLIP_KNEE`] after the volume and the gain.
+    /// Samples above [`SOFT_CLIP_KNEE`] after the volumes and the gain.
     saturated: u64,
     counts: Counts,
     dropped_starts: u64,
@@ -383,7 +455,7 @@ impl Mixer {
             fade,
             mixed_to: 0,
             seq: 0,
-            volume: 1.0,
+            volumes: Volumes::UNITY,
             gain: HEADROOM,
             saturated: 0,
             counts: Counts::default(),
@@ -464,35 +536,37 @@ impl Mixer {
         self.pending.len() < MAX_PENDING_STARTS
     }
 
-    /// Output samples so far whose level, after the volume and the gain,
+    /// Output samples so far whose level, after the volumes and the gain,
     /// was above [`SOFT_CLIP_KNEE`] and so saturated.
     #[must_use]
     pub fn saturated(&self) -> u64 {
         self.saturated
     }
 
-    /// The master volume.
+    /// `channel`'s volume: 1.0 until set.
     #[must_use]
-    pub const fn volume(&self) -> f32 {
-        self.volume
+    pub const fn volume(&self, channel: Channel) -> f32 {
+        self.volumes.get(channel)
     }
 
-    /// Sets the master volume, applied with the gain before the soft
-    /// clipper.
+    /// Sets `channel`'s volume, which scales that channel's voices as they
+    /// are summed, before the gain and the soft clipper, from the next
+    /// block. The mixer keeps the system volume for its engine and scales
+    /// no voice by it.
     ///
     /// # Errors
     ///
     /// [`InvalidVolume`] for a volume outside `0.0..=MAX_VOLUME`, which is
     /// not applied.
-    pub fn set_volume(&mut self, volume: f32) -> Result<(), InvalidVolume> {
+    pub fn set_volume(&mut self, channel: Channel, volume: f32) -> Result<(), InvalidVolume> {
         if !(0.0..=MAX_VOLUME).contains(&volume) {
             return Err(InvalidVolume(volume));
         }
-        self.volume = volume;
+        self.volumes.set(channel, volume);
         Ok(())
     }
 
-    /// Sets the play's fixed gain on the sum, applied with the volume
+    /// Sets the play's fixed gain on the sum, applied after the volumes,
     /// before the soft clipper: [`HEADROOM`] until set.
     ///
     /// # Errors
@@ -554,8 +628,15 @@ impl Mixer {
     /// it starts there too. Returns `None` if the bank holds no sound for
     /// `id`, [`MAX_PENDING_STARTS`] are waiting, or the start falls at or
     /// after a ring-out's end. While a placed seek waits to enter, no start
-    /// is put before its frame.
-    pub fn trigger(&mut self, bank: &SoundBank, id: SoundId, at: u64) -> Option<u64> {
+    /// is put before its frame. The voice is on `channel`, whose volume
+    /// scales it; the id rule above does not look at channels.
+    pub fn trigger(
+        &mut self,
+        bank: &SoundBank,
+        id: SoundId,
+        at: u64,
+        channel: Channel,
+    ) -> Option<u64> {
         let sound = bank.slot(id)?;
         let mut start = at.max(self.mixed_to);
         if let Seek::Placed { from, .. } = self.seek {
@@ -573,6 +654,7 @@ impl Mixer {
         let voice = Voice {
             active: true,
             id,
+            channel,
             sound,
             start: signed(start),
             seq: self.seq,
@@ -623,15 +705,22 @@ impl Mixer {
     }
 
     /// Adds every voice and release into `out` (whose first frame is
-    /// `block_start`) over frames `from..to`. Voices that end by `to` are
-    /// freed.
-    fn mix(&mut self, bank: &SoundBank, out: &mut [f32], block_start: i64, from: i64, to: i64) {
+    /// `block_start`) over frames `from..to`, each scaled by its channel's
+    /// volume in `volumes`. Voices that end by `to` are freed.
+    fn mix(
+        &mut self,
+        bank: &SoundBank,
+        out: &mut [f32],
+        volumes: Volumes,
+        (block_start, from, to): (i64, i64, i64),
+    ) {
         let fade = &self.fade;
         let mut last_end = self.last_end;
         for v in self.live.all_mut().filter(|v| v.active) {
             if v.start >= to {
                 continue;
             }
+            let volume = volumes.get(v.channel);
             let Some(sound) = bank.stored(v.sound) else {
                 v.active = false;
                 continue;
@@ -645,9 +734,9 @@ impl Mixer {
                     reason = "`s` is below `cut` plus the fade length, so the fade index is in bounds"
                 )]
                 let g = if s < v.cut {
-                    1.0
+                    volume
                 } else {
-                    fade[(s - v.cut) as usize]
+                    fade[(s - v.cut) as usize] * volume
                 };
                 let (l, r) = sound.frame((s - v.start) as usize);
                 let o = (s - block_start) as usize * CHANNELS;
@@ -671,12 +760,13 @@ impl Mixer {
     /// Renders the next `out.len() / 2` frames into interleaved stereo
     /// `out` (overwritten), starting at [`Mixer::mixed_to`]: every voice
     /// summed, with each pending start applied and a placed seek's voices
-    /// entered when their frame is reached (the seek first), then the
-    /// volume, the gain and [`soft_clip`], then a ring-out's envelope.
-    /// Every voice stops at a ring-out's end frame.
+    /// entered when their frame is reached (the seek first), each voice
+    /// scaled by its channel's volume, then the gain and [`soft_clip`],
+    /// then a ring-out's envelope. Every voice stops at a ring-out's end
+    /// frame.
     pub fn render(&mut self, bank: &SoundBank, out: &mut [f32]) {
-        let (block_start, block_end) = self.sum(bank, out);
-        let gain = self.volume * self.gain;
+        let (block_start, block_end) = self.sum(bank, out, self.volumes);
+        let gain = self.gain;
         for x in out.iter_mut() {
             let y = *x * gain;
             if y.abs() > SOFT_CLIP_KNEE {
@@ -697,16 +787,17 @@ impl Mixer {
     /// The next `out.len() / 2` frames as [`render`](Self::render) sums
     /// them, into interleaved stereo `out` (overwritten): every voice at
     /// unity gain, with pending starts, a placed seek and a ring-out's end
-    /// applied, before the volume, the gain, the soft clipper and a
+    /// applied, before the volumes, the gain, the soft clipper and a
     /// ring-out's fade. The saturation count is not touched. What the
     /// loudness analysis measures; it allocates nothing.
     pub fn mix_raw(&mut self, bank: &SoundBank, out: &mut [f32]) {
-        self.sum(bank, out);
+        self.sum(bank, out, Volumes::UNITY);
     }
 
-    /// The voice sum of the next block into `out` (overwritten), which ends
-    /// the block: returns its first frame and the frame after it.
-    fn sum(&mut self, bank: &SoundBank, out: &mut [f32]) -> (i64, i64) {
+    /// The voice sum of the next block into `out` (overwritten), each voice
+    /// scaled by its channel's volume in `volumes`, which ends the block:
+    /// returns its first frame and the frame after it.
+    fn sum(&mut self, bank: &SoundBank, out: &mut [f32], volumes: Volumes) -> (i64, i64) {
         out.fill(0.0);
         let block_start = signed(self.mixed_to);
         let block_end = block_start + (out.len() / CHANNELS) as i64;
@@ -727,7 +818,7 @@ impl Mixer {
                 .min(seek.map_or(block_end, |(from, _)| from))
                 .min(end.unwrap_or(block_end));
             if until > pos {
-                self.mix(bank, out, block_start, pos, until);
+                self.mix(bank, out, volumes, (block_start, pos, until));
                 pos = until;
             }
             if let Some(end) = end
@@ -807,8 +898,8 @@ mod tests {
         let sound = || crate::Sound::mono(vec![8_192; 4]);
         let bank = SoundBank::from_sounds(400, vec![sound(), sound()]);
         let mut m = Mixer::new(1, 400);
-        m.trigger(&bank, SoundId(0), 0).unwrap();
-        m.trigger(&bank, SoundId(1), 2).unwrap();
+        m.trigger(&bank, SoundId(0), 0, Channel::Key).unwrap();
+        m.trigger(&bank, SoundId(1), 2, Channel::Key).unwrap();
         let mut out = [0.0; 12];
         m.render(&bank, &mut out);
         assert_eq!(m.steals(), 1);
@@ -829,12 +920,18 @@ mod tests {
             16.01,
             f32::MAX,
         ] {
-            assert!(m.set_volume(v).is_err(), "{v}");
+            for c in Channel::ALL {
+                assert!(m.set_volume(c, v).is_err(), "{c:?} {v}");
+            }
         }
-        assert_eq!(m.set_volume(0.0), Ok(()));
-        assert_eq!(m.set_volume(MAX_VOLUME), Ok(()));
-        assert_eq!(m.set_volume(0.5), Ok(()));
-        m.trigger(&bank, SoundId(0), 0).unwrap();
+        for c in Channel::ALL {
+            assert_eq!(m.set_volume(c, 0.0), Ok(()));
+            assert_eq!(m.set_volume(c, MAX_VOLUME), Ok(()));
+        }
+        assert_eq!(m.set_volume(Channel::Key, 0.5), Ok(()));
+        // The system volume scales no chart voice.
+        assert_eq!(m.set_volume(Channel::System, 0.0), Ok(()));
+        m.trigger(&bank, SoundId(0), 0, Channel::Key).unwrap();
         let mut out = [0.0; 4];
         m.render(&bank, &mut out);
         // 0.25 × 0.5 volume × 0.5 headroom.
@@ -846,13 +943,13 @@ mod tests {
         let bank = SoundBank::from_sounds(400, vec![crate::Sound::mono(vec![1; 2])]);
         let mut m = Mixer::new(4, 400);
         for k in 0..MAX_PENDING_STARTS as u64 {
-            assert_eq!(m.trigger(&bank, SoundId(0), k), Some(k));
+            assert_eq!(m.trigger(&bank, SoundId(0), k, Channel::Key), Some(k));
         }
-        assert_eq!(m.trigger(&bank, SoundId(0), 0), None);
+        assert_eq!(m.trigger(&bank, SoundId(0), 0, Channel::Key), None);
         assert_eq!(m.dropped_starts(), 1);
         // Rendering frees room again.
         let mut out = vec![0.0; 2 * 2 * MAX_PENDING_STARTS];
         m.render(&bank, &mut out);
-        assert!(m.trigger(&bank, SoundId(0), 0).is_some());
+        assert!(m.trigger(&bank, SoundId(0), 0, Channel::Key).is_some());
     }
 }

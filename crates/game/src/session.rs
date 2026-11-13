@@ -17,10 +17,9 @@ use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ::audio::{AudioOutput, OutputError};
+use ::audio::{AudioOutput, OutputError, ScheduledSound};
 use bms_model::{
-    BgmEvent, Chart, ChartProfile, ModelError, PresentationError, Speed, TimeSource, TimeUs,
-    VirtualClock,
+    Chart, ChartProfile, ModelError, PresentationError, Speed, TimeSource, TimeUs, VirtualClock,
 };
 use eval::{ControlId, Evaluator, GaugeState, InputStart, JudgeEvent, Section, Tally};
 use input::hid::is_axis;
@@ -1197,10 +1196,10 @@ impl Loaded {
     /// note that is not a target) during practice, else the chart's BGM.
     /// An autoplay session's comes with [`autoplay`](Self::autoplay).
     #[must_use]
-    pub fn audio_schedule(&self) -> Vec<BgmEvent> {
+    pub fn audio_schedule(&self) -> Vec<ScheduledSound> {
         match self.section() {
             Some(section) => crate::practice::schedule(&self.chart, section),
-            None => self.chart.bgm.clone(),
+            None => self.chart.bgm.iter().map(|&e| e.into()).collect(),
         }
     }
 
@@ -1726,7 +1725,7 @@ impl Loaded {
             schedule: match self.config.autoplay {
                 None | Some(AutoKeySounds::Scheduled) => crate::autoplay::schedule(&self.chart),
                 #[cfg(feature = "dev-tools")]
-                Some(AutoKeySounds::Judged) => self.chart.bgm.clone(),
+                Some(AutoKeySounds::Judged) => self.chart.bgm.iter().map(|&e| e.into()).collect(),
             },
             recorded: KeyConfig::autoplay().recorded(),
         })
@@ -2840,7 +2839,7 @@ impl Reservation {
         let event = size_of::<eval::PhysicalInputEvent>();
         let own = events
             .saturating_mul(2 * event)
-            .saturating_add(schedule.saturating_mul(size_of::<BgmEvent>()));
+            .saturating_add(schedule.saturating_mul(size_of::<ScheduledSound>()));
         Self {
             fixed: self.fixed.saturating_add(own),
             per_input: self.per_input,

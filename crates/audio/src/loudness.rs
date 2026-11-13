@@ -1,6 +1,6 @@
 //! The loudness analysis of a chart (design.md "Algorithms", per-chart
 //! volume normalization): its 1× autoplay schedule mixed offline through
-//! [`Mixer::mix_raw`], at unity gain, before the volume, the play's gain and
+//! [`Mixer::mix_raw`], at unity gain, before the volumes, the play's gain and
 //! the soft clipper, in [`BLOCK_FRAMES`]-frame blocks fed to an EBU R128
 //! meter in mode `I | TRUE_PEAK | HISTOGRAM`.
 //!
@@ -33,7 +33,7 @@ use ebur128::{EbuR128, Mode};
 
 use crate::CHANNELS;
 use crate::bank::SoundBank;
-use crate::mixer::{HEADROOM, MAX_GAIN, MAX_VOICES, Mixer};
+use crate::mixer::{Channel, HEADROOM, MAX_GAIN, MAX_VOICES, Mixer};
 
 /// Frames mixed per [`Analysis::step`].
 pub const BLOCK_FRAMES: usize = 4096;
@@ -242,8 +242,11 @@ impl Analysis {
                 self.next = Some(event);
                 break;
             }
-            // A sound the bank lacks starts nothing, as in play.
-            let _ = self.mixer.trigger(&self.bank, event.sound, at);
+            // A sound the bank lacks starts nothing, as in play. The sum is
+            // at unity, so the channel scales nothing.
+            let _ = self
+                .mixer
+                .trigger(&self.bank, event.sound, at, Channel::Background);
         }
         // A full pending queue stops the admission before the schedule's
         // end is seen: look ahead, so the block that ends the program is

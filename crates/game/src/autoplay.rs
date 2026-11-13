@@ -2,6 +2,7 @@
 //! (design.md "Autoplay"): the generated input and the audio schedule with
 //! the key sounds merged into the BGM.
 
+use ::audio::{Channel, ScheduledSound};
 use bms_model::{BgmEvent, Chart, LANE_COUNT, Note, NoteKind, SoundId, TimeUs};
 use eval::{ControlId, PhysicalInputEvent};
 use input::TimeOverflow;
@@ -18,8 +19,9 @@ pub struct Autoplay {
     pub events: Vec<PhysicalInputEvent>,
     /// The chart's BGM, merged with the key sounds autoplay presses when
     /// they are scheduled ([`crate::AutoKeySounds`]), for the audio engine
-    /// to take ([`::audio::AudioEngine::with_schedule`]).
-    pub schedule: Vec<BgmEvent>,
+    /// to take ([`::audio::AudioEngine::with_schedule`]): the BGM on the
+    /// background channel, the key sounds on the key channel.
+    pub schedule: Vec<ScheduledSound>,
     /// The controls the generated keyboard records.
     pub recorded: Vec<ControlId>,
 }
@@ -80,18 +82,27 @@ pub(crate) fn schedule_len_where(chart: &Chart, keep: impl Fn(&Note) -> bool) ->
 /// order with the key sound of every note autoplay presses (taps and long
 /// note heads, at the note's time, with the sound the evaluator plays for
 /// an on-time press). At equal times BGM comes first, then the key sounds
-/// in lane order. It is built in a vector of exactly [`schedule_len`]
-/// entries, without sorting.
+/// in lane order. The BGM is on the background channel and the key sounds
+/// on the key channel, as autoplayed key sounds play at the key volume
+/// (design.md "Audio", the three volumes). It is built in a vector of
+/// exactly [`schedule_len`] entries, without sorting.
 #[must_use]
-pub fn schedule(chart: &Chart) -> Vec<BgmEvent> {
-    schedule_where(chart, |_| true)
+pub fn schedule(chart: &Chart) -> Vec<ScheduledSound> {
+    schedule_where(chart, |_| true, Channel::Key)
 }
 
-/// [`schedule`] with the key sounds of the notes `keep` keeps only, in a
-/// vector of exactly [`schedule_len_where`] entries.
-pub(crate) fn schedule_where(chart: &Chart, keep: impl Fn(&Note) -> bool) -> Vec<BgmEvent> {
+/// [`schedule`] with the key sounds of the notes `keep` keeps only, on
+/// `keys`, in a vector of exactly [`schedule_len_where`] entries.
+pub(crate) fn schedule_where(
+    chart: &Chart,
+    keep: impl Fn(&Note) -> bool,
+    keys: Channel,
+) -> Vec<ScheduledSound> {
     let mut out = Vec::with_capacity(schedule_len_where(chart, &keep));
-    out.extend(merged(chart, &keep));
+    out.extend(merged(chart, &keep).map(|(event, key)| {
+        let channel = if key { keys } else { Channel::Background };
+        ScheduledSound::on(event, channel)
+    }));
     out
 }
 
@@ -103,15 +114,18 @@ static EVERY_NOTE: fn(&Note) -> bool = |_| true;
 /// "Algorithms"), in memory independent of the chart's length. A change in
 /// what it yields changes what the analysis measures, so it bumps
 /// `audio::ANALYSIS_VERSION`.
+/// The analysis sums every start at unity, so it takes no channel.
 pub fn schedule_iter(chart: &Chart) -> impl Iterator<Item = BgmEvent> + '_ {
-    merged(chart, &EVERY_NOTE)
+    merged(chart, &EVERY_NOTE).map(|(event, _)| event)
 }
 
-/// The merge of [`schedule_where`]: fixed state, one head per lane.
+/// The merge of [`schedule_where`]: fixed state, one head per lane. Each
+/// start comes with whether it is a note's key sound (`true`) or a BGM
+/// event.
 fn merged<'c>(
     chart: &'c Chart,
     keep: &'c impl Fn(&Note) -> bool,
-) -> impl Iterator<Item = BgmEvent> + 'c {
+) -> impl Iterator<Item = (BgmEvent, bool)> + 'c {
     let mut lanes = chart.lanes.each_ref().map(|notes| lane_sounds(notes, keep));
     let mut heads: [Option<(TimeUs, SoundId)>; LANE_COUNT] = [None; LANE_COUNT];
     for (head, lane) in heads.iter_mut().zip(&mut lanes) {
@@ -132,13 +146,13 @@ fn merged<'c>(
         let next_bgm = bgm.peek().map(|b| b.time);
         match (earliest, next_bgm) {
             (None, None) => None,
-            (Some((_, key)), Some(b)) if b <= key => bgm.next().copied(),
-            (None, Some(_)) => bgm.next().copied(),
+            (Some((_, key)), Some(b)) if b <= key => bgm.next().map(|&e| (e, false)),
+            (None, Some(_)) => bgm.next().map(|&e| (e, false)),
             (Some((i, _)), _) => {
                 let (head, lane) = (heads.get_mut(i)?, lanes.get_mut(i)?);
                 let (time, sound) = head.take()?;
                 *head = lane.next();
-                Some(BgmEvent { time, sound })
+                Some((BgmEvent { time, sound }, true))
             }
         }
     })
@@ -146,6 +160,7 @@ fn merged<'c>(
 
 #[cfg(test)]
 mod tests {
+    use ::audio::{Channel, ScheduledSound};
     use bms_model::{
         BgmEvent, Chart, ChartBuilder, LANE_COUNT, Lane, Note, NoteKind, SoundId, TimeUs,
     };
@@ -197,12 +212,16 @@ mod tests {
     }
 
     /// The order the schedule is specified in, made independently: every
-    /// BGM event, and the key sound of every kept note but a mine, sorted
-    /// by time, BGM before key sounds, key sounds by lane, each source in
-    /// its own order (a stable sort).
-    fn expected(chart: &Chart, keep: impl Fn(&Note) -> bool) -> Vec<BgmEvent> {
-        let mut all: Vec<(TimeUs, usize, BgmEvent)> =
-            chart.bgm.iter().map(|&e| (e.time, 0, e)).collect();
+    /// BGM event on the background channel, and the key sound of every
+    /// kept note but a mine on `keys`, sorted by time, BGM before key
+    /// sounds, key sounds by lane, each source in its own order (a stable
+    /// sort).
+    fn expected(chart: &Chart, keep: impl Fn(&Note) -> bool, keys: Channel) -> Vec<ScheduledSound> {
+        let mut all: Vec<(TimeUs, usize, ScheduledSound)> = chart
+            .bgm
+            .iter()
+            .map(|&e| (e.time, 0, ScheduledSound::on(e, Channel::Background)))
+            .collect();
         for (lane, notes) in chart.lanes.iter().enumerate() {
             for n in notes {
                 if matches!(n.kind, NoteKind::Mine { .. }) || !keep(n) {
@@ -212,9 +231,10 @@ mod tests {
                     all.push((
                         n.time,
                         1 + lane,
-                        BgmEvent {
+                        ScheduledSound {
                             time: n.time,
                             sound,
+                            channel: keys,
                         },
                     ));
                 }
@@ -225,21 +245,42 @@ mod tests {
     }
 
     /// The iterator, the whole schedule and a filtered (practice) schedule
-    /// each yield the specified order.
+    /// each yield the specified order and channels: autoplay's key sounds
+    /// on the key channel, a practice round's on the background channel,
+    /// the BGM on the background channel in both.
     #[test]
     fn schedule_iter_matches_schedule() {
+        let untagged = |s: &[ScheduledSound]| {
+            s.iter()
+                .map(|e| BgmEvent {
+                    time: e.time,
+                    sound: e.sound,
+                })
+                .collect::<Vec<_>>()
+        };
         for seed in 0..32 {
             let chart = chart(seed);
-            let all = expected(&chart, |_| true);
+            let all = expected(&chart, |_| true, Channel::Key);
             assert!(all.len() > 60, "{seed}: {}", all.len());
-            assert_eq!(schedule_iter(&chart).collect::<Vec<_>>(), all, "{seed}");
+            assert!(all.iter().any(|e| e.channel == Channel::Key), "{seed}");
+            assert!(
+                all.iter().any(|e| e.channel == Channel::Background),
+                "{seed}"
+            );
+            assert_eq!(
+                schedule_iter(&chart).collect::<Vec<_>>(),
+                untagged(&all),
+                "{seed}"
+            );
             assert_eq!(schedule(&chart), all, "{seed}");
             // A practice round's schedule keeps the notes outside its
-            // section.
+            // section, on the background channel.
             let outside = |n: &Note| n.time < TimeUs(300_000) || n.time >= TimeUs(700_000);
+            let practice = expected(&chart, outside, Channel::Background);
+            assert!(practice.iter().all(|e| e.channel == Channel::Background));
             assert_eq!(
-                schedule_where(&chart, outside),
-                expected(&chart, outside),
+                schedule_where(&chart, outside, Channel::Background),
+                practice,
                 "{seed}"
             );
         }

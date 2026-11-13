@@ -1503,7 +1503,18 @@ mod tests {
         use bms_model::TimeSource as _;
         let clock = QpcClock::start();
         let tuning = crate::tuning::LiveTuning::new(game::Tuning {
-            volume_percent: 100,
+            system: game::Volume {
+                percent: 100,
+                intent: false,
+            },
+            key: game::Volume {
+                percent: 100,
+                intent: false,
+            },
+            background: game::Volume {
+                percent: 100,
+                intent: false,
+            },
             display_offset_us: 0,
             input_offset_us: 0,
         });
@@ -1555,7 +1566,7 @@ mod tests {
         let mut keys = Keys::new(None, None);
         press(&c, &mut keys, Adjust::VolumeUp, false);
         let pressed = c.tuning().snapshot();
-        assert_eq!(pressed.values.unwrap().volume_percent, 100, "at the limit");
+        assert_eq!(pressed.values.unwrap().key.percent, 100, "at the limit");
         assert_eq!(c.tuning().held(), [(Adjust::VolumeUp, Fresh)]);
         let first = last(&c);
         press(&c, &mut keys, Adjust::VolumeUp, true);
@@ -1592,7 +1603,7 @@ mod tests {
         let s = c.tuning().snapshot();
         let at = last(&c);
         assert!(!s.held);
-        assert_eq!(s.values.unwrap().volume_percent, 95);
+        assert_eq!(s.values.unwrap().key.percent, 95);
         assert!(!s.quiet_at(bms_model::TimeUs(at + game::QUIET.0 - 1)));
         assert!(s.quiet_at(bms_model::TimeUs(at + game::QUIET.0)));
     }
@@ -1607,7 +1618,18 @@ mod tests {
         let c = Controls::with_tuning(
             clock,
             std::sync::Arc::new(crate::tuning::LiveTuning::new(game::Tuning {
-                volume_percent: 100,
+                system: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
+                key: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
+                background: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
                 display_offset_us: 0,
                 input_offset_us: 0,
             })),
@@ -1768,7 +1790,7 @@ mod tests {
         let after = c.tuning().get();
         assert_eq!(after.display_offset_us, before.display_offset_us);
         assert_eq!(after.input_offset_us, before.input_offset_us);
-        assert_ne!(after.volume_percent, before.volume_percent);
+        assert_ne!(after.key, before.key);
     }
 
     /// `device.toml`'s monitor picks a monitor by its exact device name,

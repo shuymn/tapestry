@@ -8,7 +8,7 @@ use audio::{AudioEngine, MAX_VOICES, RecordingOutput, SimConfig, SimDevice};
 use bms_model::{Chart, ChartBuilder, SoundId, TimeUs};
 use common::{MS, PERIOD, RATE, bank, lane};
 use eval::{JudgeEvent, JudgeEventKind};
-use game::{AudioControl, AudioWorker, EventSink, audio_control, audio_link_at};
+use game::{AudioControl, AudioWorker, Channel, EventSink, audio_control, audio_link_at};
 
 /// Two sounds of 480 frames at 48 kHz (10 ms), sound 0 played as BGM at
 /// chart 0 and sound 1 as the key sound. The bank fills sound `i` with the
@@ -180,16 +180,19 @@ fn a_gone_worker_fails_the_next_play() {
     assert_eq!(control.failure(), Some(audio::OutputError::DeviceLost));
 }
 
-/// The master volume set from the game thread scales what the audio
-/// thread mixes from its next step on, during a play: the BGM sound at
-/// unity, then key sounds at one half, at zero and at one quarter. A
-/// volume outside 0 to the mixer's largest is refused and changes nothing.
+/// The key volume set from the game thread scales what the audio thread
+/// mixes of its channel from its next step on, during a play: the BGM
+/// sound at unity whatever the key volume, then key sounds at one half,
+/// at zero and at one quarter. A volume outside 0 to the mixer's largest
+/// is refused on every channel and changes nothing.
 #[test]
 fn volume_change_scales_mixed_samples() {
     let chart = chart();
     let (mut control, mut worker, mut out) = rig(&chart);
     let (mut sink, queue) = audio_link_at(8, TimeUs(50 * MS));
     control.play(TimeUs(50 * MS), queue).unwrap();
+    // The key volume does not reach the BGM sound.
+    control.set_volume(Channel::Key, 0.2).unwrap();
     let steps = |worker: &mut AudioWorker, out: &mut RecordingOutput<SimDevice>| {
         for _ in 0..15 {
             worker.step(out).unwrap();
@@ -197,10 +200,15 @@ fn volume_change_scales_mixed_samples() {
     };
     steps(&mut worker, &mut out);
     for (volume, pressed) in [(0.5, 150), (0.0, 300), (0.25, 450)] {
-        control.set_volume(volume).unwrap();
+        control.set_volume(Channel::Key, volume).unwrap();
         if volume == 0.25 {
             for refused in [-0.01, audio::MAX_VOLUME * 2.0, f32::NAN] {
-                assert!(control.set_volume(refused).is_err(), "{refused}");
+                for channel in Channel::ALL {
+                    assert!(
+                        control.set_volume(channel, refused).is_err(),
+                        "{channel:?} {refused}"
+                    );
+                }
             }
         }
         sink.receive(&key_sound(pressed * MS));
@@ -246,8 +254,9 @@ fn a_plays_gain_applies_from_its_play() {
         .unwrap();
     steps(&mut worker, &mut out);
     assert_eq!(worker.engine().mixer().gain(), 1.0);
-    // The volume halves mid-play; the gain stays.
-    control.set_volume(0.5).unwrap();
+    // The key and background volumes halve mid-play; the gain stays.
+    control.set_volume(Channel::Key, 0.5).unwrap();
+    control.set_volume(Channel::Background, 0.5).unwrap();
     sink.receive(&key_sound(150 * MS));
     steps(&mut worker, &mut out);
     // The next play, at the headroom: its BGM at a quarter (volume 0.5).
@@ -425,10 +434,10 @@ fn a_loaded_bank_replaces_the_previous_charts_sounds() {
         RATE,
         vec![audio::Sound::mono(vec![5_000; 480])],
     ));
-    let schedule = vec![bms_model::BgmEvent {
+    let schedule = vec![audio::ScheduledSound::from(bms_model::BgmEvent {
         time: TimeUs(0),
         sound: SoundId(0),
-    }];
+    })];
     // The load waits for the audio thread, stepped here meanwhile. How many
     // steps that takes depends on when the loading thread runs, so they go
     // to the bare device: recorded, they could fill the recording.
@@ -536,8 +545,8 @@ mod restore {
     use std::sync::Arc;
 
     use audio::{
-        AudioEngine, Gain, MAX_VOICES, RecordingOutput, SeekPlan, SimConfig, SimDevice, Sound,
-        SoundBank,
+        AudioEngine, Gain, MAX_VOICES, RecordingOutput, ScheduledSound, SeekPlan, SimConfig,
+        SimDevice, Sound, SoundBank,
     };
     use bms_model::{BgmEvent, SoundId, TimeUs};
     use game::{
@@ -568,11 +577,13 @@ mod restore {
         ))
     }
 
-    fn schedule() -> Vec<BgmEvent> {
+    fn schedule() -> Vec<ScheduledSound> {
         [(5_000, 0), (8_050, 1)]
-            .map(|(t, s)| BgmEvent {
-                time: TimeUs(t * MS),
-                sound: SoundId(s),
+            .map(|(t, s)| {
+                ScheduledSound::from(BgmEvent {
+                    time: TimeUs(t * MS),
+                    sound: SoundId(s),
+                })
             })
             .to_vec()
     }
@@ -823,10 +834,10 @@ mod restore {
         // is then the late load's, what the engine plays.
         let (mut control, mut worker, mut out) = rig();
         steps(&mut worker, &mut out, WARM);
-        let late = vec![BgmEvent {
+        let late = vec![ScheduledSound::from(BgmEvent {
             time: TimeUs(6_000 * MS),
             sound: SoundId(0),
-        }];
+        })];
         let timeout = Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout));
         assert_eq!(
             control.load(bank(), audio::BgmSchedule::new(late.clone())),
@@ -1250,7 +1261,10 @@ fn an_install_timeout_is_freed_by_the_next_unload() {
     let new = bank(&chart);
     let installed = std::sync::Arc::downgrade(&new);
     assert_eq!(
-        control.load(new, audio::BgmSchedule::new(chart.bgm.clone())),
+        control.load(
+            new,
+            audio::BgmSchedule::new(chart.bgm.iter().map(|&e| e.into()).collect())
+        ),
         Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout))
     );
     worker.step(&mut out).unwrap();
@@ -1339,7 +1353,7 @@ fn a_left_switch_is_drained_and_replaced() {
     let mut next = control
         .switch(
             Arc::clone(&second),
-            audio::BgmSchedule::new(chart.bgm.clone()),
+            audio::BgmSchedule::new(chart.bgm.iter().map(|&e| e.into()).collect()),
         )
         .unwrap();
     let done = loop {
@@ -1354,7 +1368,11 @@ fn a_left_switch_is_drained_and_replaced() {
     };
     assert_eq!(done, Ok(()));
     assert!(Arc::ptr_eq(worker.engine().bank(), &second));
-    assert!(control.seek_source().matches(&chart.bgm));
+    assert!(
+        control
+            .seek_source()
+            .matches(&chart.bgm.iter().map(|&e| e.into()).collect::<Vec<_>>())
+    );
     assert!(left.upgrade().is_none(), "the late answer was kept");
 }
 
@@ -1380,7 +1398,7 @@ fn a_full_control_queue_keeps_the_switch_unsent() {
     let mut switch = control
         .switch(
             Arc::clone(&original),
-            audio::BgmSchedule::new(chart.bgm.clone()),
+            audio::BgmSchedule::new(chart.bgm.iter().map(|&e| e.into()).collect()),
         )
         .unwrap();
     for _ in 0..3 {
@@ -1401,7 +1419,11 @@ fn a_full_control_queue_keeps_the_switch_unsent() {
     };
     assert_eq!(done, Ok(()));
     assert!(Arc::ptr_eq(worker.engine().bank(), &original));
-    assert!(control.seek_source().matches(&chart.bgm));
+    assert!(
+        control
+            .seek_source()
+            .matches(&chart.bgm.iter().map(|&e| e.into()).collect::<Vec<_>>())
+    );
     // Kept full to the bound.
     fill(&mut control);
     let mut kept = control

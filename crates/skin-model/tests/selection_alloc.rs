@@ -28,10 +28,10 @@ use selection_support::{
 };
 use skin_model::{
     ActionDef, AppReadouts, Button, ClickType, FolderId, FontRef, FrameUv, GaugeLook, HoverRect,
-    LocalTime, MasterVolume, NumberDef, OwnLamp, PointerDef, PointerHit, RatioBarDef, RatioForm,
-    RatioSource, RowKey, RowRef, RowRefKind, RowScore, SelectionDefs, SelectionOrder,
-    SelectionSettings, SliderDirection, Source, SpeedReference, SpeedView, TextDef, TextField,
-    TextImage, TextTable, TextValue, WidgetDefs,
+    LocalTime, NumberDef, OwnLamp, PointerDef, PointerHit, RatioBarDef, RatioForm, RatioSource,
+    RowKey, RowRef, RowRefKind, RowScore, SelectionDefs, SelectionOrder, SelectionSettings,
+    SliderDirection, Source, SpeedReference, SpeedView, TextDef, TextField, TextImage, TextTable,
+    TextValue, VolumeReading, WidgetDefs,
 };
 
 struct Counting;
@@ -134,7 +134,7 @@ fn skin() -> Fx {
                 },
                 NumberDef {
                     digits: digits(6),
-                    value: int("settings.volume"),
+                    value: int("settings.volume_system"),
                 },
                 NumberDef {
                     digits: digits(6),
@@ -208,7 +208,7 @@ fn skin() -> Fx {
                 RatioBarDef {
                     image: 3,
                     form: RatioForm::Bar { vertical: false },
-                    source: RatioSource::MasterVolume,
+                    source: RatioSource::SystemVolume,
                 },
                 RatioBarDef {
                     image: 3,
@@ -250,7 +250,7 @@ fn settings(ms: i64) -> SelectionSettings {
     let k = u32::try_from(ms / 16).unwrap();
     SelectionSettings {
         display_offset_ms: i32::try_from(ms).unwrap() - 1_000,
-        master_volume: MasterVolume::of_gain(f32::from(u8::try_from(k % 101).unwrap()) / 100.0),
+        system_volume: VolumeReading::of_gain(f32::from(u8::try_from(k % 101).unwrap()) / 100.0),
         speed: if k % 2 == 0 {
             SpeedView::Classic
         } else {

@@ -47,6 +47,15 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
         let origin = TimeUs((100 + play * 400) * MS);
         // Between plays the queue deepens to three periods and back.
         control.request_queued_periods(if play % 2 == 0 { 3 } else { 2 });
+        // Each play a volume change on every channel, which the counted
+        // steps take.
+        for (channel, volume) in [
+            (game::Channel::System, 0.45),
+            (game::Channel::Key, 0.2),
+            (game::Channel::Background, 0.999),
+        ] {
+            control.set_volume(channel, volume).unwrap();
+        }
         // Before the third play another chart.s sounds are loaded: the
         // audio thread swaps them in and hands the old ones back.
         if play == 2 {
@@ -54,12 +63,15 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
             // thread takes it late, in a counted step, and its answer is
             // freed by the next load, on the game thread.
             assert_eq!(
-                control.load(bank(&chart), audio::BgmSchedule::new(chart.bgm.clone())),
+                control.load(
+                    bank(&chart),
+                    audio::BgmSchedule::new(chart.bgm.iter().map(|&e| e.into()).collect())
+                ),
                 Err(game::AudioLoadError::Wait(game::AudioWaitError::Timeout))
             );
             steps(&mut worker, 1);
             let next = bank(&chart);
-            let schedule = chart.bgm.clone();
+            let schedule = chart.bgm.iter().map(|&e| e.into()).collect();
             std::thread::scope(|s| {
                 let load = s.spawn(|| control.load(next, audio::BgmSchedule::new(schedule)));
                 while !load.is_finished() {
@@ -96,7 +108,10 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
     // Three practice rounds whose restores are placed, fall back and are
     // refused, the last rung out to its end: the plans are made and freed
     // here, and travel with the starts.
-    let restorer = game::Restorer::new(control.seek_source(), chart.bgm.clone());
+    let restorer = game::Restorer::new(
+        control.seek_source(),
+        chart.bgm.iter().map(|&e| e.into()).collect(),
+    );
     for (round, late) in [(0, 0), (1, 25), (2, 75)] {
         // Chart time 1 s is 200 ms after the opening.
         let written = i64::try_from(worker.engine().written()).unwrap();
