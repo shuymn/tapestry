@@ -478,9 +478,6 @@ impl Screen for Noted {
     fn rearm(&mut self) {
         self.menu.rearm();
     }
-    fn carry(&self) -> Option<skin_model::Carry<'_>> {
-        self.menu.carry()
-    }
     fn build(&mut self, f: &render::FrameInput<'_>) -> Result<(), BuildError> {
         self.menu.build(f)
     }

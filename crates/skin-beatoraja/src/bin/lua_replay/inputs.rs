@@ -23,11 +23,13 @@ pub struct FrameInputs {
     timers: Vec<i32>,
     state_us: i64,
     host: Host,
-    /// On a play frame, the play state's score data as the source keeps
-    /// it: `None` before its first judgment, else `[ex_score,
-    /// rate.current_bp, rate.whole_bp]` at its last (s7-06e-3-design.md
-    /// §2a).
+    /// On a play frame, the round's score data: `None` before its first
+    /// judgment, else `[ex_score, rate.current_bp, rate.whole_bp]` at its
+    /// last.
     score: Option<[i32; 3]>,
+    /// Whether the frame is its round's first, where a fresh reference
+    /// starts.
+    round_start: bool,
 }
 
 impl FrameInputs {
@@ -38,10 +40,23 @@ impl FrameInputs {
             state_us,
             host: Host::Play,
             score: None,
+            round_start: false,
         }
     }
 
-    /// The frame with the play state's score data `score`.
+    /// The frame as its round's first when `first`.
+    #[must_use]
+    pub fn starting_round(mut self, first: bool) -> Self {
+        self.round_start = first;
+        self
+    }
+
+    /// Whether the frame is its round's first.
+    pub fn starts_round(&self) -> bool {
+        self.round_start
+    }
+
+    /// The frame with the round's score data `score`.
     #[must_use]
     pub fn with_score(mut self, score: Option<[i32; 3]>) -> Self {
         self.score = score;
@@ -60,6 +75,7 @@ impl FrameInputs {
             state_us,
             host: Host::Outside { allowed, page },
             score: None,
+            round_start: false,
         }
     }
 

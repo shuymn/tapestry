@@ -466,8 +466,6 @@ pub struct AttemptPrep {
     scratch_notes: Vec<game::ScratchNote>,
     /// Prepared with a pending play skin's specialization.
     specialized: bool,
-    /// The play state and chart the attempt belongs to.
-    carry_key: Option<crate::carry::CarryKey>,
     /// When the render thread was asked.
     staging: Instant,
     stage: PrepStage,
@@ -710,8 +708,7 @@ impl PlayerRig<'_> {
         let epoch = self.adjust.as_mut().and_then(game::AdjustDriver::prepared);
         let attempt =
             AttemptContext::new(attempt, SIMPLE_SCRATCH, epoch.unwrap_or(0), self.autoplay)
-                .with_scratch_notes(std::mem::take(&mut prep.scratch_notes))
-                .with_carry_key(prep.carry_key);
+                .with_scratch_notes(std::mem::take(&mut prep.scratch_notes));
         prep.staging = Instant::now();
         PrepStage::Screen(self.render.begin_attempt(attempt, skin))
     }
@@ -2100,7 +2097,6 @@ impl Rig for PlayerRig<'_> {
                 labels: None,
                 images: (std::path::PathBuf::new(), [String::new(), String::new()]),
                 scratch_notes: Vec::new(),
-                carry_key: None,
                 specialized: false,
                 staging: Instant::now(),
                 stage: PrepStage::Ended(Preparation::Cancelled),
@@ -2135,10 +2131,6 @@ impl Rig for PlayerRig<'_> {
                 Vec::new()
             },
             specialized: false,
-            carry_key: self.play_states.current().map(|s| crate::carry::CarryKey {
-                play_state: s.number,
-                chart: key.chart(),
-            }),
             staging: Instant::now(),
             stage: PrepStage::Answered(None),
         };
@@ -2787,8 +2779,6 @@ impl Rig for PlayerRig<'_> {
     fn ended(&mut self, report: &PlayReport) {
         #[cfg(test)]
         self.ended_plays.push((report.end, report.record.clone()));
-        // The play state's carry takes the final tally.
-        self.render.settled(report.tally);
         // The result is another scene: held adjustment controls act no more
         // until pressed afresh.
         self.enter_scene();

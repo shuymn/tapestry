@@ -197,7 +197,7 @@ impl Script {
         }
     }
 
-    /// `rounds`: R1 every note on time and witnessed; R2 rearmed in its
+    /// `rounds`: R1 every note on time; R2 rearmed in its
     /// READY and quit after note 3; R3 every note on time.
     pub fn rounds() -> Self {
         let r1 = Round::on_time(7, true);
@@ -206,20 +206,6 @@ impl Script {
         r2.end = End::Quit(Self::note_time(2) + 100_000);
         let r3 = Round::on_time(7, true);
         Self::practice("rounds", vec![r1, r2, r3])
-    }
-
-    /// `rounds-unwitnessed`: as `rounds`, but R1's frames stop just before
-    /// note 7's press, and R2 runs through its tail.
-    pub fn rounds_unwitnessed() -> Self {
-        let mut s = Self::rounds();
-        s.name = "rounds-unwitnessed";
-        if let Some(r) = s.round_mut(0) {
-            r.end = End::Unbuilt(Self::note_time(6) - 1);
-        }
-        if let Some(r) = s.round_mut(1) {
-            r.end = End::Tail;
-        }
-        s
     }
 
     /// `closing`: R1 shows the survival gauge at 1 % and misses note 1,
@@ -234,24 +220,13 @@ impl Script {
         Self::practice("closing", vec![r1, r2])
     }
 
-    /// `zero-score`: R1 misses note 1 and quits at its miss deadline, so
-    /// its only score update has EX 0; R2 every note on time.
-    pub fn zero_score() -> Self {
-        let mut r1 = Round::on_time(7, true);
-        r1.presses[0] = None;
-        r1.end = End::Quit(Self::note_time(0) + 180_000);
-        Self::practice("zero-score", vec![r1, Round::on_time(7, true)])
-    }
-
     /// The script named `name`.
     pub fn named(name: &str) -> Option<Self> {
         match name {
             "full" => Some(Self::full()),
             "mixed" => Some(Self::mixed()),
             "rounds" => Some(Self::rounds()),
-            "rounds-unwitnessed" => Some(Self::rounds_unwitnessed()),
             "closing" => Some(Self::closing()),
-            "zero-score" => Some(Self::zero_score()),
             _ => None,
         }
     }

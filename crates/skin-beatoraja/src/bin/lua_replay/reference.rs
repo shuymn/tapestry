@@ -636,11 +636,11 @@ impl<'a> Reference<'a> {
         }
     }
 
-    /// Runs every frame of `frames`: installation first, on the first play
-    /// frame's host, since it reads only the play state's static facts;
-    /// then each frame on its own host (s7-06e-2-design.md §5).
-    pub fn run(mut self, frames: &[FrameInputs]) -> Observed {
-        if let Some(f) = frames.iter().find(|f| f.is_play()).or(frames.first()) {
+    /// Runs every frame of `frames`: installation first, on `install`'s
+    /// host, since it reads only the play state's static facts; then each
+    /// frame on its own host (s7-06e-2-design.md §5).
+    fn run_from(mut self, install: Option<&FrameInputs>, frames: &[FrameInputs]) -> Observed {
+        if let Some(f) = install {
             self.host(f);
             self.install();
         }
@@ -679,14 +679,63 @@ impl<'a> Reference<'a> {
             }
         }
     }
+}
 
-    /// Answers the point as `point` on the practice page of ordinal `page`
-    /// (a test's mutation control, as `--perturb` is for play frames).
-    #[cfg(test)]
-    pub fn page_point(mut self, page: usize, point: i32) -> Self {
-        self.page_point = Some((page, point));
-        self
+/// One reference VM, fresh from the reference import, and the import's
+/// record it resolves its destinations against.
+pub struct Fresh {
+    pub vm: ReferenceVm,
+    pub items: BTreeMap<i32, bool>,
+    pub sources: BTreeMap<String, SourceFact>,
+}
+
+/// Runs `frames` with a fresh reference at each round's first frame
+/// ([`FrameInputs::starts_round`]), as production prepares every round
+/// fresh (design.md "beatoraja Lua Skins", the reference executor): the
+/// frames before the first round run on a reference of their own, and an
+/// outside frame on the reference of the round before it, so a write it
+/// makes reaches no later round. Every reference installs on the run's
+/// first play frame; one that installs other objects than the first fails
+/// the run. `page_point` is a test's override of one page's point.
+///
+/// # Errors
+///
+/// `fresh` failing, or a reference installing other objects.
+pub fn run_rounds(
+    frames: &[FrameInputs],
+    mut fresh: impl FnMut() -> Result<Fresh, String>,
+    page_point: Option<(usize, i32)>,
+) -> Result<Observed, String> {
+    let install = frames.iter().find(|f| f.is_play()).or(frames.first());
+    let mut starts: Vec<usize> = frames
+        .iter()
+        .enumerate()
+        .filter(|(i, f)| *i > 0 && f.starts_round())
+        .map(|(i, _)| i)
+        .collect();
+    starts.insert(0, 0);
+    starts.push(frames.len());
+    let mut observed: Option<Observed> = None;
+    for w in starts.windows(2) {
+        let &[from, to] = w else { continue };
+        let Some(segment) = frames.get(from..to) else {
+            continue;
+        };
+        let f = fresh()?;
+        let mut reference = Reference::new(&f.vm, &f.items, &f.sources);
+        reference.page_point = page_point;
+        let part = reference.run_from(install, segment);
+        match &mut observed {
+            None => observed = Some(part),
+            Some(o) if o.installed == part.installed => o.frames.extend(part.frames),
+            Some(_) => {
+                return Err(format!(
+                    "the reference at frame {from} installs other objects than the first"
+                ));
+            }
+        }
     }
+    Ok(observed.unwrap_or_default())
 }
 
 fn obj_keys(o: &Obj) -> Vec<Key> {

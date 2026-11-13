@@ -308,8 +308,6 @@ struct Schema<'a> {
     timer_slots: &'a BTreeMap<u16, usize>,
     /// Per callback, whether it loads or stores a slot.
     slotted: &'a [bool],
-    /// Why this frame's round refuses its slots, if it does.
-    refused: Option<&'static str>,
 }
 
 /// Whether a timer invocation's conversion is on: given, and not the off
@@ -421,32 +419,11 @@ fn production_shapes(events: &[Event], s: &Schema<'_>) -> (Prod, Vec<Misshapen>)
             kbad(k, format!("timer {k}: sampled with no installed start"));
         }
     }
-    // The slots (s7-06e-2-design.md §6.2): a slotted callback is a timer;
-    // `SlotsOff` only on one, and only where the round refuses its slots,
-    // where every slotted callback's first event is one.
+    // The slots (s7-06e-2-design.md §6.2): a slotted callback is a timer.
     for k in 0..s.callbacks {
         let slotted = s.slotted.get(usize::from(k)).copied().unwrap_or(false);
-        let off = matches!(p.first.get(&k), Some(First::Skipped(Skip::SlotsOff)));
         if slotted && !(s.is_timer)(k) {
             kbad(k, format!("callback {k}: slotted but not a timer"));
-        }
-        if off && !slotted {
-            kbad(
-                k,
-                format!("callback {k}: SlotsOff on a callback with no slot"),
-            );
-        } else if off && s.refused.is_none() {
-            kbad(
-                k,
-                format!("callback {k}: SlotsOff on a round whose slots run"),
-            );
-        } else if slotted && !off && s.refused.is_some() {
-            kbad(
-                k,
-                format!(
-                    "callback {k}: slotted callback ran where the continuation refuses its slots"
-                ),
-            );
         }
     }
     (p, bad)
@@ -675,14 +652,10 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
             what,
         });
     };
-    rep.carry_safe = run.carry_safe;
     for (i, r) in run.rounds.iter().enumerate() {
         rep.rounds.push(format!(
-            "round {} {:?}: slots run {}, terminal {}{}",
+            "round {}{}",
             i + 1,
-            r.carried,
-            r.slots_run,
-            r.terminal,
             if r.ending_cut {
                 ", ending replayed 30 s past the last note of a longer declaration"
             } else {
@@ -742,8 +715,8 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
         for (_, key, what) in rbad {
             find(key.unwrap_or(UNKNOWN), i, what);
         }
-        let (round, carried) = match pf.kind {
-            FrameKind::Play { round, carried, .. } => (round, carried),
+        let round = match pf.kind {
+            FrameKind::Play { round, .. } => round,
             FrameKind::Loading | FrameKind::Page => {
                 if !rf.outside {
                     find(
@@ -820,13 +793,11 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 "frame kind: production play, reference outside".into(),
             );
         }
-        let refused = carried.refused();
         let schema = Schema {
             callbacks,
             is_timer: &is_timer,
             timer_slots: &run.timer_slots,
             slotted: &run.slotted,
-            refused,
         };
         let (p, pbad) = production_shapes(&pf.events, &schema);
         for (k, key, what) in pbad {
@@ -842,16 +813,8 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
         // follows.
         for occs in &cat {
             let mut blocked = false;
-            let mut slots_off = false;
             for occ in occs {
                 let key = occ.key;
-                if slots_off {
-                    find(
-                        key,
-                        i,
-                        "an occurrence after a slotted callback held by SlotsOff".into(),
-                    );
-                }
                 let k = cx.compiled(&key);
                 let calls = match occ.first {
                     Point::Ran { outcome, .. } => {
@@ -922,22 +885,6 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                     continue;
                 };
                 seen.insert(k);
-                // A slotted callback the round's continuation holds: every
-                // effect of it this frame is the carried-state limit's
-                // (s7-06e-2-design.md §6.2); anywhere else production's
-                // shapes reported it.
-                if matches!(p.first.get(&k), Some(First::Skipped(Skip::SlotsOff))) {
-                    used.insert((k, 1));
-                    used.insert((k, 2));
-                    slots_off = true;
-                    if let Some(why) = refused {
-                        *rep.buckets
-                            .entry(format!("carried-state limit: {why}"))
-                            .or_default() += calls.len();
-                        *rep.slots_off.entry((round + 1, why)).or_default() += calls.len();
-                    }
-                    continue;
-                }
                 rep.matched += calls.len().max(1);
                 if let Point::NotReached { why, .. } = occ.first {
                     let was_blocked = blocked;
@@ -1506,7 +1453,6 @@ mod tests {
             is_timer: &is_timer,
             timer_slots: &slots,
             slotted: &[],
-            refused: None,
         };
         let orphan = [
             Event::Skipped {
@@ -1857,8 +1803,6 @@ mod tests {
     /// each broken on one side, are found by their own message.
     #[test]
     fn rounds_and_outside_mutations_are_found() {
-        use skin_model::present::Fail;
-
         use crate::production::FrameKind;
         use crate::script::Script;
         use crate::tests::{LATCH, dst, pieces_over};
@@ -1884,23 +1828,6 @@ mod tests {
                 r.text(0, true, true)
             );
         };
-        let first_of = |run: &crate::production::ProductionRun, round: usize| {
-            run.frames
-                .iter()
-                .position(|f| matches!(f.kind, FrameKind::Play { round: r, .. } if r == round))
-                .unwrap()
-        };
-        let hold = |f: &mut crate::production::FrameTrace| {
-            f.events
-                .retain(|e| !matches!(e, Event::Ran { k: 0, .. } | Event::Timer { k: 0, .. }));
-            f.events.insert(
-                0,
-                Event::Skipped {
-                    k: 0,
-                    why: Skip::SlotsOff,
-                },
-            );
-        };
         // A production event on an outside frame, and a sample on a page
         // (a page builds nothing, so even a built-in timer's is one).
         found("production event on an outside frame", &|run, _| {
@@ -1917,33 +1844,6 @@ mod tests {
                 .unwrap();
             f.events.push(Event::Sampled { slot: 0, age_us: 0 });
         });
-        // `SlotsOff` on a fresh round, and on a valid carry-safe one.
-        for round in [0, 1] {
-            found("SlotsOff on a round whose slots run", &|run, _| {
-                let i = first_of(run, round);
-                hold(&mut run.frames[i]);
-            });
-        }
-        // A slotted callback running on a refused round.
-        found("ran where the continuation refuses its slots", &|run, _| {
-            let i = first_of(run, 2);
-            let f = &mut run.frames[i];
-            f.events
-                .retain(|e| !matches!(e, Event::Skipped { k: 0, .. }));
-            f.events.insert(
-                0,
-                Event::Ran {
-                    k: 0,
-                    call: 1,
-                    result: Err(Fail::Error),
-                    conv: Converted::Long(Some(i64::MIN)),
-                },
-            );
-        });
-        // `SlotsOff` on a callback with no slot.
-        found("SlotsOff on a callback with no slot", &|run, _| {
-            run.slotted = vec![false; run.slotted.len()];
-        });
         // An outside frame's catalogue broken: a point omitted.
         found("partition", &|_, obs| {
             let f = obs.frames.iter_mut().find(|f| f.outside).unwrap();
@@ -1955,28 +1855,49 @@ mod tests {
         });
     }
 
+    /// The probe of the score tests: Rm's `getDummyNumber` shape, the EX
+    /// score behind a guard on property 101, so it reads 0 before a round's
+    /// first judgment on both sides (the source's `MIN_VALUE` and the
+    /// play's own value for no judgment both fail the guard).
+    const SCORE_PROBE: &str = "skin.value = { { id = \"s\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2,\n\
+           value = function() if ms.number(101) < 1 then return 0 else return ms.number(71) end end } }\n\
+         table.insert(skin.destination, { id = \"s\", dst = { { x = 0, y = 0, w = 60, h = 6 } } })\n";
+
+    /// The first frame of round `round` (from 0) at READY.
+    fn ready_of(run: &crate::production::ProductionRun, round: usize) -> usize {
+        run.frames
+            .iter()
+            .position(|f| {
+                matches!(
+                    f.kind,
+                    super::super::FrameKind::Play {
+                        round: r,
+                        stage: super::super::Stage::Ready,
+                    } if r == round
+                )
+            })
+            .unwrap()
+    }
+
     /// A wrong lowered expression reading the score on a later round's
-    /// READY is a finding: `max(ex_score, 1)` against the closure's 0
-    /// (zero-score: R2 READY carries EX 0), compared directly
-    /// (s7-06s-design.md S8).
+    /// READY is a finding: the probe agrees on every play frame as it is,
+    /// and `max(ex_score, 1)` in its place gives 1 at round 2's READY
+    /// where both sides read 0.
     #[test]
     fn a_wrong_score_expression_stays_a_finding() {
         use crate::script::Script;
         use crate::tests::pieces_over;
-        let body = "skin.value = { { id = \"m\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2,\n\
-               value = function() return ms.number(71) end } }\n\
-             table.insert(skin.destination, { id = \"m\", dst = { { x = 0, y = 0, w = 60, h = 6 } } })\n";
-        let (run, obs) = pieces_over(body, Script::zero_score());
+        let (run, obs) = pieces_over(SCORE_PROBE, Script::rounds());
         let clean = compare(&run, &obs, &[]);
         assert!(
             clean
                 .findings
                 .iter()
-                .all(|f| f.place.starts_with("round 1 ")),
+                .all(|f| !f.place.starts_with("round ")),
             "{}",
             clean.text(0, true, true)
         );
-        let (mut run, obs) = pieces_over(body, Script::zero_score());
+        let (mut run, obs) = pieces_over(SCORE_PROBE, Script::rounds());
         let mut n = 0;
         for o in &mut run.recorded.occurrences {
             if let Some(l) = o.lowered.as_mut() {
@@ -2000,48 +1921,21 @@ mod tests {
         );
     }
 
-    /// s7-06s S8: the old fresh score fields on a carried round's READY,
-    /// injected after the record loop's self-check, are a lowered finding
-    /// there, never an attribution: the comparator holds no waiver for the
-    /// score readings across rounds (Rm's `getDummyNumber` shape).
+    /// The previous round's score fields on a later round's READY (a stale
+    /// carry), injected after the record loop's self-check, are a lowered
+    /// finding there, never an attribution.
     #[test]
-    fn stale_score_fields_on_a_carried_frame_are_found() {
+    fn stale_score_fields_on_a_later_round_are_found() {
         use crate::script::Script;
         use crate::tests::pieces_over;
         use skin_model::field;
-        let body = "skin.value = { { id = \"s\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2,\n\
-               value = function() if ms.number(101) < 1 then return 0 else return ms.number(101) end end } }\n\
-             table.insert(skin.destination, { id = \"s\", dst = { { x = 0, y = 0, w = 60, h = 6 } } })\n";
-        let (run, obs) = pieces_over(body, Script::rounds());
-        let clean = compare(&run, &obs, &[]);
-        assert!(
-            clean
-                .findings
-                .iter()
-                .all(|f| !f.place.starts_with("round 2 ")),
-            "{}",
-            clean.text(0, true, true)
-        );
-        let (mut run, obs) = pieces_over(body, Script::rounds());
-        let i = run
-            .frames
-            .iter()
-            .position(|f| {
-                matches!(
-                    f.kind,
-                    super::super::FrameKind::Play {
-                        round: 1,
-                        stage: super::super::Stage::Ready,
-                        ..
-                    }
-                )
-            })
-            .unwrap();
+        let (mut run, obs) = pieces_over(SCORE_PROBE, Script::rounds());
+        let i = ready_of(&run, 1);
         let f = &mut run.frames[i];
         for (slot, v) in [
-            (field::EX_SCORE, 0),
+            (field::EX_SCORE, 14),
             (field::RATE_CURRENT_BP, 10_000),
-            (field::RATE_WHOLE_BP, 0),
+            (field::RATE_WHOLE_BP, 10_000),
         ] {
             f.fields[usize::from(slot)] = v;
         }

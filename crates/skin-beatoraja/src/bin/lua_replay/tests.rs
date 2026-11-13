@@ -981,9 +981,20 @@ pub fn pieces_over(
     };
     let (run, inputs) =
         crate::production::record(&i.imported.skin, rec, &o.script, Some(12)).unwrap();
-    let (_, rec, vm) = h.import_reference(&config, &o.facts, &cancel);
-    let vm = vm.unwrap();
-    let mut obs = crate::reference::Reference::new(&vm, &rec.items, &rec.sources).run(&inputs);
+    let mut obs = crate::reference::run_rounds(
+        &inputs,
+        || {
+            let (_, rec, vm) = h.import_reference(&config, &o.facts, &cancel);
+            let vm = vm.unwrap();
+            Ok(crate::reference::Fresh {
+                vm,
+                items: rec.items,
+                sources: rec.sources,
+            })
+        },
+        None,
+    )
+    .unwrap();
     obs.root = d.path().to_path_buf();
     (run, obs)
 }

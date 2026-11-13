@@ -6,7 +6,7 @@
 use crate::Options;
 use crate::inputs::FrameInputs;
 use crate::isolation;
-use crate::observed::{Observed, Point};
+use crate::observed::Observed;
 use crate::report::Report;
 use crate::script::{Phase, Round, Script};
 use crate::tests::{LATCH, dst, folder, options, run_with};
@@ -29,13 +29,20 @@ fn pieces_with(body: &str, o: &Options) -> (Report, Observed, Vec<FrameInputs>) 
     };
     let (run, inputs) =
         crate::production::record(&i.imported.skin, rec, &o.script, Some(12)).unwrap();
-    let (_, rec, vm) = h.import_reference(&config, &o.facts, &cancel);
-    let vm = vm.unwrap();
-    let mut reference = crate::reference::Reference::new(&vm, &rec.items, &rec.sources);
-    if let Some((page, point)) = o.page_point {
-        reference = reference.page_point(page, point);
-    }
-    let mut obs = reference.run(&inputs);
+    let mut obs = crate::reference::run_rounds(
+        &inputs,
+        || {
+            let (_, rec, vm) = h.import_reference(&config, &o.facts, &cancel);
+            let vm = vm.unwrap();
+            Ok(crate::reference::Fresh {
+                vm,
+                items: rec.items,
+                sources: rec.sources,
+            })
+        },
+        o.page_point,
+    )
+    .unwrap();
     obs.root = d.path().to_path_buf();
     let report = crate::production::compare::compare(&run, &obs, &[]);
     (report, obs, inputs)
@@ -80,43 +87,55 @@ fn latch_pair() -> String {
     )
 }
 
-/// A latch the carry cannot run: its return reads the max combo
-/// (`lua_callbacks.rs`, `a_program_reading_other_fields_does_not_carry`).
-const MAX_COMBO_LATCH: &str = "local latch = (function()\n\
-       local state = ms.timer_off_value\n\
-       return function()\n\
-         if state == ms.timer_off_value and ms.number(100) == 200000 then state = ms.time() end\n\
-         if ms.number(75) >= 0 then return state end\n\
-         return ms.timer_off_value\n\
-       end\n\
-     end)()\n";
+/// A latch whose return reads the max combo, which no outside host
+/// answers.
+const MAX_COMBO_LATCH: &str = "local latch = (function()
+       local state = ms.timer_off_value
+       return function()
+         if state == ms.timer_off_value and ms.number(100) == 200000 then state = ms.time() end
+         if ms.number(75) >= 0 then return state end
+         return ms.timer_off_value
+       end
+     end)()
+";
 
-/// R20, C1: the carried round shows the latch round 1 set, from its
-/// first READY frame, across its rearm.
+/// Each round starts fresh on both sides (design.md "beatoraja Lua
+/// Skins", the reference executor): every round's first frame is dark;
+/// rounds 1 and 3, every note on time, light the latch at their own full
+/// score; round 2, quit after note 3, stays dark throughout, its rearmed
+/// READY included; production and the reference agree.
 #[test]
-fn rounds_carry_the_latch() {
+fn rounds_start_fresh() {
     let (r, obs, inputs) = pieces(&latch_pair(), Script::rounds());
     assert!(r.passes(), "{}", r.text(0, true, true));
     assert_eq!(r.compiled.len(), 2);
-    assert!(
-        r.slots_off.keys().all(|&(round, _)| round == 3),
-        "{:?}",
-        r.slots_off
-    );
     let rounds = rounds_of(&inputs);
     assert_eq!(rounds.len(), 3);
-    // Round 1: off until the frame the point reaches 200 000.
-    let set = rounds[0]
-        .iter()
-        .copied()
-        .find(|&i| starts(&obs, i).iter().any(Option::is_some))
-        .expect("the latch sets in round 1");
-    let at = inputs[set].state_us();
-    assert!(starts(&obs, set).iter().all(|s| *s == Some(at)));
-    // Round 2's first READY frame: both on, round 1's start, agreed.
-    let first = rounds[1][0];
-    assert_eq!(starts(&obs, first), [Some(at), Some(at)]);
-    assert_eq!(r.first_agreed.get(1), Some(&4), "{}", r.text(0, true, true));
+    for (n, round) in rounds.iter().enumerate() {
+        assert_eq!(starts(&obs, round[0]), [None, None], "round {}", n + 1);
+    }
+    for n in [0, 2] {
+        let set = rounds[n]
+            .iter()
+            .copied()
+            .find(|&i| starts(&obs, i).iter().any(Option::is_some))
+            .unwrap_or_else(|| panic!("the latch sets in round {}", n + 1));
+        let at = inputs[set].state_us();
+        assert_eq!(starts(&obs, set), [Some(at), Some(at)], "round {}", n + 1);
+        assert!(
+            rounds[n]
+                .iter()
+                .filter(|&&i| i >= set)
+                .all(|&i| starts(&obs, i) == [Some(at), Some(at)]),
+            "round {}",
+            n + 1
+        );
+    }
+    assert!(
+        rounds[1]
+            .iter()
+            .all(|&i| starts(&obs, i).iter().all(Option::is_none))
+    );
     assert!(r.kinds.get("rearmed ready").is_some_and(|k| k.1 > 0));
 }
 
@@ -170,61 +189,15 @@ fn failed_and_closing_frames_are_play_frames() {
     }
 }
 
-/// R20, C2, C7: the round after a quit, and every round after an
-/// unwitnessed end, refuses the slots; a program that is not carry-safe
-/// refuses them on any carried round.
+/// A slotted root stopped on an outside frame (a read no outside host
+/// answers) is a finding no entry waives.
 #[test]
-fn a_quit_round_refuses_the_slots() {
-    // The quit: round 3's invocations of both callbacks, all attributed.
-    let (r, obs, inputs) = pieces(&latch_pair(), Script::rounds());
-    assert!(r.passes(), "{}", r.text(0, true, true));
-    let rounds = rounds_of(&inputs);
-    let ran: usize = rounds[2]
-        .iter()
-        .map(|&i| {
-            obs.frames[i]
-                .points
-                .iter()
-                .filter(|p| matches!(p, Point::Ran { .. }))
-                .count()
-        })
-        .sum();
-    assert!(ran > 0);
-    assert_eq!(
-        r.slots_off.iter().collect::<Vec<_>>(),
-        [(&(3, "invalid bank"), &ran)]
-    );
-    // An unwitnessed round 1: the reference latches on the page after it,
-    // rounds 2 and 3 are refused.
-    let (r, obs, inputs) = pieces(&latch_pair(), Script::rounds_unwitnessed());
-    assert!(r.passes(), "{}", r.text(0, true, true));
-    let rounds = rounds_of(&inputs);
-    assert!(
-        rounds[0]
-            .iter()
-            .all(|&i| starts(&obs, i).iter().all(Option::is_none))
-    );
-    let page = rounds[0].last().unwrap() + 1;
-    assert!(!inputs[page].is_play());
-    let at = inputs[page].state_us();
-    assert_eq!(starts(&obs, rounds[1][0]), [Some(at), Some(at)]);
-    assert_eq!(
-        r.slots_off.keys().copied().collect::<Vec<_>>(),
-        [(2, "invalid bank"), (3, "invalid bank")]
-    );
-    // Not carry-safe: round 2 refused for it, round 3 for the bank round
-    // 2 could not witness. Its read of the max combo stops it on every outside
-    // frame, a finding no entry waives.
+fn a_slotted_root_stopped_outside_is_found() {
     let body = format!(
         "{MAX_COMBO_LATCH}{}",
         dst("-111", 0, "timer = latch, loop = -1,")
     );
     let (r, _, _) = pieces(&body, Script::rounds());
-    assert!(!r.carry_safe);
-    assert_eq!(
-        r.slots_off.keys().copied().collect::<Vec<_>>(),
-        [(2, "not carry-safe"), (3, "invalid bank")]
-    );
     assert!(!r.findings.is_empty());
     assert!(
         r.findings.iter().all(|f| f
@@ -236,10 +209,13 @@ fn a_quit_round_refuses_the_slots() {
     );
 }
 
-/// R20, C4: a latch written on the page (its point perturbed there) is
-/// found on the next round's first READY frame; round 1 stays clean.
+/// A latch written on the page (its point perturbed there) stays in the
+/// reference of the round before it: the next round's fresh reference
+/// starts dark, and production agrees, so the run passes (design.md
+/// "beatoraja Lua Skins", the reference executor: an outside frame's
+/// write reaches no later round).
 #[test]
-fn an_outside_frame_write_is_found() {
+fn a_page_write_does_not_leak_into_the_next_round() {
     let mut r1 = Round::on_time(7, true);
     r1.presses[6] = Some(30_000);
     let script = Script {
@@ -255,32 +231,22 @@ fn an_outside_frame_write_is_found() {
         tempo: Vec::new(),
     };
     let body = format!("{LATCH}{}", dst("-111", 0, "timer = latch, loop = -1,"));
-    let clean = run_with(&body, &options(script.clone()));
-    assert!(clean.passes(), "{}", clean.text(0, true, true));
     let mut o = options(script);
     o.page_point = Some((0, 200_000));
     let (r, obs, inputs) = pieces_with(&body, &o);
-    assert!(
-        r.findings.iter().all(|f| !f.place.starts_with("round 1")),
-        "{}",
-        r.text(0, true, true)
-    );
-    let first = r
-        .findings
-        .iter()
-        .find(|f| f.place.starts_with("round 2"))
-        .expect("a finding in round 2");
-    assert_eq!(first.place, "round 2 ready");
+    assert!(r.passes(), "{}", r.text(0, true, true));
     let rounds = rounds_of(&inputs);
-    assert_eq!(first.frame, rounds[1][0]);
+    // The control: the page wrote the latch, on its first frame.
     let page = rounds[0].last().unwrap() + 1;
-    assert_eq!(starts(&obs, first.frame), [Some(inputs[page].state_us())]);
+    assert!(!inputs[page].is_play());
+    let last_page = rounds[1][0] - 1;
+    assert_eq!(starts(&obs, last_page), [Some(inputs[page].state_us())]);
+    // Round 2 starts dark and lights at its own full score.
+    assert_eq!(starts(&obs, rounds[1][0]), [None]);
     assert!(
-        r.findings
+        rounds[1]
             .iter()
-            .any(|f| f.frame == first.frame && f.what.starts_with("timer: production (false")),
-        "{}",
-        r.text(0, true, true)
+            .any(|&i| starts(&obs, i).iter().all(Option::is_some))
     );
 }
 
@@ -439,23 +405,24 @@ fn whole_chart_scripts_keep_their_frames() {
     assert_eq!(r.rounds.len(), 1);
 }
 
-/// C2: a quit is its own instant: a round quit exactly at its first
-/// note's miss deadline settles with that POOR, so the next page reads
-/// the point 0, not the 200 000 round 1 left.
+/// Every page reads the point 0, the next round's fresh score data,
+/// after a full-score round as after a quit.
 #[test]
-fn a_quit_settles_the_judgment_due_at_it() {
-    let r1 = Round::on_time(7, true);
-    let mut r2 = Round::on_time(7, true);
-    r2.presses[0] = None;
-    r2.end = crate::script::End::Quit(Script::note_time(0) + 180_000);
-    let script = Script::practice("quit-at-a-miss", vec![r1, r2]);
-    let (r, _, inputs) = pieces(&latch_pair(), script);
+fn pages_read_the_point_at_0() {
+    let (r, _, inputs) = pieces(&latch_pair(), Script::rounds());
     assert!(r.passes(), "{}", r.text(0, true, true));
     let point = usize::from(skin_model::field::POINT);
     let rounds = rounds_of(&inputs);
-    let after = |round: usize| rounds[round].last().unwrap() + 1;
-    assert_eq!(inputs[after(0)].fields()[point], 200_000);
-    assert_eq!(inputs[after(1)].fields()[point], 0);
+    for round in &rounds {
+        let after = round.last().unwrap() + 1;
+        assert!(!inputs[after].is_play());
+        assert_eq!(inputs[after].fields()[point], 0);
+    }
+    assert!(
+        rounds
+            .first()
+            .is_some_and(|r| inputs[*r.last().unwrap()].fields()[point] == 200_000)
+    );
 }
 
 /// Each play frame's `screen` reading (ms) and state clock.

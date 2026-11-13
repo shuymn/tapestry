@@ -188,14 +188,14 @@ pub use play::schema::{
     GREEN_MAX, Grade, JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, PLAY, PROGRESS_FULL,
     RANK_TWENTY_SEVENTHS, RATE_BASIS_POINTS, READOUT_MAX, YEAR_MAX, field, lane_timer, timer,
 };
+pub use play::timers::native_values;
 #[cfg(feature = "dev-tools")]
 pub use play::timers::score_fields;
-pub use play::timers::{Settled, native_values, settled};
 pub use play::{
-    AppReadouts, Attempt, BpmRange, BuildError, Carry, ChartMetadata, Continuation, CoverSettings,
-    DurationRatio, FrameReadouts, GaugeDesc, LoadState, LocalTime, NativeReadouts, NativeValues,
-    OFFSET_SLOTS, Offsets, Play, PlayContext, PlayScore, PrepareError, RoundedDuration, ScoreBasis,
-    SkinFrame, attempt_targets,
+    AppReadouts, Attempt, BpmRange, BuildError, ChartMetadata, CoverSettings, DurationRatio,
+    FrameReadouts, GaugeDesc, LoadState, LocalTime, NativeReadouts, NativeValues, OFFSET_SLOTS,
+    Offsets, Play, PlayContext, PlayScore, PrepareError, RoundedDuration, ScoreBasis, SkinFrame,
+    attempt_targets,
 };
 pub use pointer::{
     ActionDef, Button, ClickType, HoverRect, MAX_SEARCH_BOXES, PointerDef, PointerError,

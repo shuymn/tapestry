@@ -1411,7 +1411,6 @@ fn decision_region_survives_play_text_pressure() {
             context: &ctx,
             text: &text,
             target: r.target(),
-            continuation: skin_model::Continuation::Fresh,
         };
         r.stage(&play, &a, request).unwrap()
     };

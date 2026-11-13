@@ -97,7 +97,6 @@ fn stage(
         context: &ctx,
         text,
         target: r.target(),
-        continuation: skin_model::Continuation::Fresh,
     };
     r.stage(b, &a, request).unwrap()
 }

@@ -103,26 +103,12 @@ pub(crate) fn builtin(id: i32) -> Timer {
 /// gcd(27, 2i) ≥ 3`) and each rounding is within 2^-25, so the two agree
 /// for every target count up to 932,067, past the parser's 500,000-object
 /// cap.
-///
-/// It waits for the round's own judgment (a count of any kind, the empty
-/// POOR's included): the EX score reads the play state's carried score
-/// data until then (design.md "beatoraja Lua Skins", the program), and the
-/// source's rank timers are switched only at a judgment
-/// (`BMSPlayer.java:1040-1042` at `0.8.9`), so a carried EX score turning
-/// them on over another section's targets would be a rank state the source
-/// never enters (s7-06s-design.md §2.4). Once the round has a judgment the
-/// EX score is its own, so the guard changes nothing there.
 pub(crate) fn rank_source(k: usize) -> Option<String> {
     if let Some(&(_, flag)) = k.checked_sub(RANKS.len()).and_then(|j| REACHED.get(j)) {
         return Some(flag.to_owned());
     }
     let &(_, i) = RANKS.get(k)?;
-    Some(format!(
-        "(count.perfect > 0 || count.great > 0 || count.good > 0 || count.bad > 0 \
-         || count.poor > 0 || count.empty_poor > 0) \
-         && notes > 0 && 27 * ex_score >= {} * notes",
-        2 * i
-    ))
+    Some(format!("notes > 0 && 27 * ex_score >= {} * notes", 2 * i))
 }
 
 /// The declared custom timers: id to the timer it reads, or `None` when

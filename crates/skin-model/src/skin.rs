@@ -30,7 +30,7 @@ use crate::play::loading::{Loading, LoadingFrame, LoadingGauge, Need, loading_ra
 use crate::play::schema::timer::BUILTIN;
 use crate::play::schema::{Grade, field};
 use crate::play::timers::elapsed_us;
-use crate::play::{BuildError, Continuation, Play, PlayContext, PrepareError, SkinFrame};
+use crate::play::{BuildError, Play, PlayContext, PrepareError, SkinFrame};
 use crate::pointer::{
     self, ActionDef, Button, HoverRect, PointerDef, PointerError, PressHit, SearchBounds, Target,
 };
@@ -3011,17 +3011,6 @@ impl Skin {
         format!("{:?}", self.present)
     }
 
-    /// Whether the presentation program's slotted callbacks may run on a
-    /// carried state ([`Present::carry_safe`](crate::present::Present::carry_safe));
-    /// true without a program (dev-tools).
-    #[cfg(feature = "dev-tools")]
-    #[must_use]
-    pub fn program_carry_safe(&self) -> bool {
-        self.present
-            .as_ref()
-            .is_none_or(crate::present::Present::carry_safe)
-    }
-
     /// Each element's timer in draw order, by kind (dev-tools): a
     /// built-in timer's slot, a `when` timer's index, or for a compiled
     /// timer callback ([`TimerRef::Output`]) its rank among the program's
@@ -3524,38 +3513,20 @@ impl Skin {
             .map_or(0, |p| crate::output::slots(p.len()))
     }
 
-    /// A fresh [`Play`] for the first attempt of a play state of `chart`:
-    /// [`prepare_carried`](Self::prepare_carried) with
-    /// [`Continuation::Fresh`].
+    /// A fresh [`Play`] for one attempt of `chart`: the first, a retry or a
+    /// practice round alike, each starting clean.
     ///
     /// # Errors
     ///
-    /// As [`prepare_carried`](Self::prepare_carried).
+    /// A negative lead-in, a READY state start outside the time range, or
+    /// a section whose initial gauges do not match the context's gauges.
     pub fn prepare(&self, chart: &Chart, ctx: &PlayContext<'_>) -> Result<Play, PrepareError> {
-        self.prepare_carried(chart, ctx, Continuation::Fresh)
-    }
-
-    /// A [`Play`] for one attempt of `chart`, taking over `carry` from the
-    /// earlier attempts of its play state: everything else starts clean.
-    ///
-    /// # Errors
-    ///
-    /// A negative lead-in, a READY state start outside the time range, a
-    /// section whose initial gauges do not match the context's gauges, or
-    /// a carried bank that does not fit the program.
-    pub fn prepare_carried(
-        &self,
-        chart: &Chart,
-        ctx: &PlayContext<'_>,
-        carry: Continuation<'_>,
-    ) -> Result<Play, PrepareError> {
         if self.kind != ScreenKind::Play {
             return Err(PrepareError::Kind);
         }
         Play::new(
             chart,
             ctx,
-            carry,
             self.present.as_ref(),
             self.whens.len(),
             self.lanes.is_some(),
