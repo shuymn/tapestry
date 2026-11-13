@@ -2203,6 +2203,31 @@ mod tests {
         gate: Option<Arc<crate::dev::AudioGate>>,
         f: impl FnOnce(&mut crate::play::PlayerRig<'_>, &game::Settings, InputEnd) -> R,
     ) -> (R, bool) {
+        let silent = |rate, _| {
+            (
+                Arc::new(audio::SoundBank::from_sounds(rate, Vec::new())),
+                Vec::new(),
+            )
+        };
+        on_rig_playing(settings, render, clock, gate, (silent, 1), |_| {}, f)
+    }
+
+    /// [`on_rig_gated`] whose engine plays the bank and schedule `chart`
+    /// makes at the output's rate and period, recording up to `seconds`,
+    /// and whose output is given to `done` when the audio thread ends.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn on_rig_playing<R>(
+        settings: game::Settings,
+        render: crate::render_side::RenderLink,
+        clock: QpcClock,
+        gate: Option<Arc<crate::dev::AudioGate>>,
+        (chart, seconds): (
+            impl FnOnce(u32, u32) -> (Arc<audio::SoundBank>, Vec<audio::ScheduledSound>),
+            usize,
+        ),
+        done: impl FnOnce(&crate::dev::Paced<audio::RecordingOutput<audio::SimDevice>>) + Send + 'static,
+        f: impl FnOnce(&mut crate::play::PlayerRig<'_>, &game::Settings, InputEnd) -> R,
+    ) -> (R, bool) {
         let dir = tempfile::tempdir().unwrap();
         let root = game::DataRoot::new(dir.path().join("data"));
         let controls = super::controls(&settings, clock);
@@ -2210,17 +2235,17 @@ mod tests {
         let (hook, input) = input_side::link(Arc::clone(&controls), Mode::Clock, waker.clone());
         let (audio, opened) = crate::audio_side::spawn(
             move || {
-                let mut out = crate::dev::recording_output(clock, 1);
+                let mut out = crate::dev::recording_output(clock, seconds);
                 out.gate = gate;
                 Ok::<_, std::convert::Infallible>((out, None))
             },
-            |_| {},
+            done,
         )
         .unwrap();
-        let bank = audio::SoundBank::from_sounds(opened.rate, Vec::new());
-        let engine = audio::AudioEngine::new(
-            Arc::new(bank),
-            &[],
+        let (bank, schedule) = chart(opened.rate, opened.period);
+        let engine = audio::AudioEngine::with_schedule(
+            bank,
+            schedule,
             opened.rate,
             opened.period,
             audio::MAX_VOICES,
@@ -2239,6 +2264,99 @@ mod tests {
         let gated = rig.gate.is_some() && rig.adjust.is_some();
         let _ = rig.shut_down();
         (out, gated)
+    }
+
+    /// The game thread's sync sends each of the three volumes to the audio
+    /// thread, and F3 the stepped key and background volumes: a key sound
+    /// (left channel only) plays at the key volume, a BGM-lane sound (right
+    /// only) at the background volume, and the decision tone at the system
+    /// volume, each read from what the real output recorded.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn sync_sends_each_volume_to_the_audio_thread() {
+        use std::sync::Mutex;
+        let settings = game::Settings {
+            device: game::DeviceSettings {
+                system_volume: 0.45,
+                key_volume: 0.2,
+                background_volume: 0.8,
+                ..game::DeviceSettings::default()
+            },
+            player: game::PlayerSettings::default(),
+        };
+        // A quarter of full scale on one side each, for 0.8 s, from the
+        // play's start.
+        let chart = |rate: u32, _| {
+            let frames = rate as usize * 8 / 10;
+            let side = |left: bool| {
+                audio::Sound::stereo(
+                    (0..frames)
+                        .flat_map(|_| if left { [8_192, 0] } else { [0, 8_192] })
+                        .collect(),
+                )
+            };
+            let bank = audio::SoundBank::from_sounds(rate, vec![side(true), side(false)]);
+            let at = |sound, channel| audio::ScheduledSound {
+                time: bms_model::TimeUs(0),
+                sound: bms_model::SoundId(sound),
+                channel,
+            };
+            (
+                Arc::new(bank),
+                vec![at(0, game::Channel::Key), at(1, game::Channel::Background)],
+            )
+        };
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&recorded);
+        let done = move |out: &crate::dev::Paced<audio::RecordingOutput<audio::SimDevice>>| {
+            *kept.lock().unwrap() = out.samples().to_vec();
+        };
+        let wait = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
+        on_rig_playing(
+            settings,
+            crate::render_side::tests::Installers::default().spawn_bare(),
+            QpcClock::start(),
+            None,
+            (chart, 3),
+            done,
+            |rig, _, input| {
+                // The play starts now: its sounds start at its chart time 0.
+                use bms_model::TimeSource as _;
+                let now = input.clock.now();
+                let (_sink, queue) = game::audio_link_at(8, now);
+                rig.audio.control.play(now, queue).unwrap();
+                rig.sync();
+                wait(300);
+                assert!(rig.controls.tuning().adjust(game::Adjust::VolumeDown));
+                rig.sync();
+                wait(700);
+                rig.audio.control.play_tone();
+                wait(800);
+            },
+        );
+        let samples = recorded.lock().unwrap().clone();
+        assert!(!samples.is_empty());
+        // The headroom halves the sum; the levels pass no knee.
+        let level = |volume: f32| 0.25 * volume * 0.5;
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        let frames: Vec<(f32, f32)> = samples.chunks(2).map(|f| (f[0], f[1])).collect();
+        let shows = |key: f32, background: f32| {
+            frames
+                .iter()
+                .any(|&(l, r)| close(l, level(key)) && close(r, level(background)))
+        };
+        assert!(shows(0.2, 0.8), "the loaded volumes");
+        assert!(shows(0.15, 0.75), "F3's volumes");
+        // The tone, alone on both sides once the chart's sounds end: at the
+        // system volume, under its unity peak.
+        let tone: Vec<f32> = frames
+            .iter()
+            .filter(|&&(l, r)| l != 0.0 && l == r)
+            .map(|&(l, _)| l.abs())
+            .collect();
+        let peak = tone.iter().copied().fold(0.0, f32::max);
+        assert!(tone.len() > 1_000, "{} tone frames", tone.len());
+        assert!(peak > 0.05 && peak <= 0.25 * 0.45, "peak {peak}");
     }
 
     /// A retry pressed in Closing with the quit key, in either order, is

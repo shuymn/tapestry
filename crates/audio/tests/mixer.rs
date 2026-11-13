@@ -528,11 +528,16 @@ fn a_saturated_channel_leaves_the_other_unchanged() {
     assert_eq!(m.saturated(), 100);
 }
 
-/// `render` is `mix_raw` followed by the play's gain, the soft clipper and
-/// a ring-out's envelope, bit for bit, from identical mixers at unity
-/// volumes, voices on both channels; `mix_raw` is the same sum whatever
-/// the volumes, leaves the saturation count alone and the sum above full
-/// scale.
+/// `render` is `mix_raw` scaled by the volumes, then the play's gain, the
+/// soft clipper and a ring-out's envelope, bit for bit, from identical
+/// mixers, voices on both channels; `mix_raw` is the same sum whatever the
+/// volumes, leaves the saturation count alone and the sum above full scale.
+/// The exact cases give both channels one volume that is a power of two:
+/// scaling by one commutes with every rounding of the sum, so the scaled
+/// sum is the raw sum times the volume, bit for bit. Two different volumes
+/// round each voice's product before the sum, which the raw sum cannot
+/// reproduce bit for bit; `channels_scale_their_own_voices` checks that
+/// case to within an ulp.
 #[test]
 fn render_is_mix_raw_then_gain_and_clipper() {
     let bank = split_bank();
@@ -573,9 +578,14 @@ fn render_is_mix_raw_then_gain_and_clipper() {
             .all(|(a, b)| a.to_bits() == b.to_bits()),
         "the volumes moved the raw sum"
     );
-    for gain in [H, 1.3, audio::MAX_GAIN] {
-        let volume = 1.0f32;
-        let mut m = mixer(1.0, 1.0, gain);
+    for (volume, gain) in [
+        (1.0f32, H),
+        (1.0, 1.3),
+        (1.0, audio::MAX_GAIN),
+        (0.5, audio::MAX_GAIN),
+        (2.0, 1.3),
+    ] {
+        let mut m = mixer(volume, volume, gain);
         let (raw, raw_saturated) = raw_of(m.clone());
         let mut out = Vec::new();
         for _ in 0..13 {
@@ -598,7 +608,7 @@ fn render_is_mix_raw_then_gain_and_clipper() {
                 };
                 frame
                     .iter()
-                    .map(move |&x| audio::soft_clip(x * (volume * gain)) * e)
+                    .map(move |&x| audio::soft_clip((x * volume) * gain) * e)
             })
             .collect();
         assert_eq!(out.len(), expected.len());
