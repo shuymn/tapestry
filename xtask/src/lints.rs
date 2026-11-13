@@ -352,6 +352,16 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/player/src/tuning.rs"),
     Site::File("crates/player/src/failures.rs"),
     Site::File("crates/player/src/start_gate.rs"),
+    // The system sounds' requests from the logic step, and the latch a
+    // refused number makes there.
+    Site::Fns(
+        "crates/player/src/system_sounds.rs",
+        &[
+            "SystemSounds::start",
+            "SystemSounds::stop",
+            "SystemSounds::latch",
+        ],
+    ),
     // The audio thread.
     Site::File("crates/game/src/audio_loop.rs"),
     Site::Fns(

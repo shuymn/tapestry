@@ -67,6 +67,7 @@ mod shelf;
 mod sound_sets_disk;
 mod start_gate;
 mod state_clock;
+mod system_sounds;
 mod tuning;
 mod turntable;
 mod ui_text;
