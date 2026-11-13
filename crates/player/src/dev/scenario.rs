@@ -486,6 +486,7 @@ struct CaptureSpec {
     loading_at: Option<i64>,
     select_at: Option<i64>,
     result_at: Option<i64>,
+    decision_at: Option<i64>,
     hold: Option<bool>,
     file: PathBuf,
 }
@@ -754,18 +755,24 @@ fn capture_axis(c: &CaptureSpec) -> Result<(Axis, bool), String> {
         c.loading_at,
         c.select_at,
         c.result_at,
+        c.decision_at,
     ) {
-        (Some(at), None, None, None, None, None, None) => Axis::Chart(ms(at, "at")?),
-        (None, Some(r), None, None, None, None, None) => Axis::Ready(ms(r, "ready_at")?),
-        (None, None, Some(c), None, None, None, None) => Axis::Closing(ms(c, "closing_at")?),
-        (None, None, None, Some(true), None, None, None) => Axis::Loading,
-        (None, None, None, None, Some(l), None, None) => Axis::LoadingAt(ms(l, "loading_at")?),
-        (None, None, None, None, None, Some(s), None) => Axis::Select(ms(s, "select_at")?),
-        (None, None, None, None, None, None, Some(r)) => Axis::Result(ms(r, "result_at")?),
+        (Some(at), None, None, None, None, None, None, None) => Axis::Chart(ms(at, "at")?),
+        (None, Some(r), None, None, None, None, None, None) => Axis::Ready(ms(r, "ready_at")?),
+        (None, None, Some(c), None, None, None, None, None) => Axis::Closing(ms(c, "closing_at")?),
+        (None, None, None, Some(true), None, None, None, None) => Axis::Loading,
+        (None, None, None, None, Some(l), None, None, None) => {
+            Axis::LoadingAt(ms(l, "loading_at")?)
+        }
+        (None, None, None, None, None, Some(s), None, None) => Axis::Select(ms(s, "select_at")?),
+        (None, None, None, None, None, None, Some(r), None) => Axis::Result(ms(r, "result_at")?),
+        (None, None, None, None, None, None, None, Some(d)) => {
+            Axis::Decision(ms(d, "decision_at")?)
+        }
         _ => {
             return Err(
                 "give one of at, ready_at, closing_at, loading = true, loading_at, \
-                 select_at and result_at"
+                 select_at, result_at and decision_at"
                     .to_owned(),
             );
         }
@@ -848,6 +855,8 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
     let mut captures: Vec<CompiledCapture> = Vec::new();
     // Captures no play has followed yet.
     let mut waiting: Vec<Origin> = Vec::new();
+    // The `decision_at` captures no choice follows yet.
+    let mut deciding: Vec<Origin> = Vec::new();
     // `result_at` captures waiting for the next play's result.
     let mut results: Vec<(Origin, bool)> = Vec::new();
     // The holding captures of the result shown.
@@ -869,6 +878,7 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
         };
         seq = match (seq, step) {
             (Seq::Select, Step::Select(s)) => {
+                deciding.clear();
                 match (&s.path, &s.search) {
                     (Some(p), None) => {
                         let target = target(base, p, roots).map_err(at)?;
@@ -1034,6 +1044,15 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                     (Axis::Select(_), Seq::Result) => {
                         return Err(at("select_at needs the select screen".to_owned()));
                     }
+                    // The next choice's decision screen: only a choice on
+                    // the select screen shows one.
+                    (Axis::Decision(_), Seq::Result) => {
+                        return Err(at("decision_at needs the select screen".to_owned()));
+                    }
+                    (Axis::Decision(_), _) => {
+                        deciding.push(o);
+                        false
+                    }
                     (Axis::Select(_), _) => false,
                     (Axis::Result(_), Seq::Result) => {
                         if hold {
@@ -1062,6 +1081,7 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                 seq
             }
             (Seq::Select, Step::Practice(p)) => {
+                deciding.clear();
                 if let Some((c, _)) = results.first() {
                     return Err(format!(
                         "{c}: a practice shows no result: step {} practices",
@@ -1108,6 +1128,9 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
     }
     if let Some(o) = waiting.first() {
         return Err(format!("{o}: no play follows"));
+    }
+    if let Some(o) = deciding.first() {
+        return Err(format!("{o}: no choice follows"));
     }
     match last {
         Some(o) if seq != Seq::End => return Err(format!("{o}: the last step must be quit")),
@@ -1347,6 +1370,15 @@ pub enum CaptureState {
     /// A `result_at` capture bound to the play of this generation, until
     /// its result begins.
     AwaitingResult(u64),
+    /// A `decision_at` capture bound to the decision screen of this
+    /// lifetime, chosen at `origin` on the clock: a frame of that screen
+    /// takes it, until the render thread leaves the screen.
+    Deciding {
+        /// The decision lifetime.
+        lifetime: u64,
+        /// The choice.
+        origin: TimeUs,
+    },
     /// A `result_at` capture of the result numbered `seq`: a frame of it
     /// that drew an end page numbered `page` or later and, when given, a
     /// view keyed `view` or later takes it.
@@ -1393,6 +1425,10 @@ pub enum Axis {
     /// The first presented frame of its result at or after this time
     /// since that result's first presented frame.
     Result(TimeUs),
+    /// The first presented frame of the next choice's decision screen,
+    /// drawn by its skin or the built-in presentation, at or after this
+    /// time since the choice; failed when the screen is left first.
+    Decision(TimeUs),
 }
 
 impl Axis {
@@ -1405,6 +1441,7 @@ impl Axis {
             Self::LoadingAt(_) => "loading_at",
             Self::Select(_) => "select",
             Self::Result(_) => "result",
+            Self::Decision(_) => "decision",
         }
     }
 
@@ -1415,7 +1452,8 @@ impl Axis {
             | Self::Closing(t)
             | Self::LoadingAt(t)
             | Self::Select(t)
-            | Self::Result(t) => t.0,
+            | Self::Result(t)
+            | Self::Decision(t) => t.0,
             Self::Loading => 0,
         }
     }
@@ -1524,11 +1562,36 @@ impl Captures {
     /// `result_at` one for the result it shows.
     pub fn bind(&self, generation: u64) {
         for c in self.lock().iter_mut() {
-            if c.state == CaptureState::Pending {
+            if c.state == CaptureState::Pending && !matches!(c.axis, Axis::Decision(_)) {
                 c.state = match c.axis {
                     Axis::Result(_) => CaptureState::AwaitingResult(generation),
                     _ => CaptureState::Bound(generation),
                 };
+            }
+        }
+    }
+
+    /// A choice's decision screen begins, decision lifetime `lifetime`
+    /// chosen at `origin`, before the render thread is told to show it:
+    /// it takes every `decision_at` capture armed.
+    pub fn bind_decision(&self, lifetime: u64, origin: TimeUs) {
+        for c in self.lock().iter_mut() {
+            if c.state == CaptureState::Pending && matches!(c.axis, Axis::Decision(_)) {
+                c.state = CaptureState::Deciding { lifetime, origin };
+            }
+        }
+    }
+
+    /// The render thread left the decision screen of `lifetime`, after
+    /// every frame of it: each of its captures whose frame was not taken
+    /// fails; one being written is left to its writer.
+    pub fn leave_decision(&self, lifetime: u64) {
+        for c in self.lock().iter_mut() {
+            if matches!(c.state, CaptureState::Deciding { lifetime: l, .. } if l == lifetime) {
+                c.state = CaptureState::Failed(format!(
+                    "its decision screen ended before a frame at {} ms on its decision axis",
+                    c.axis.target() / 1_000
+                ));
             }
         }
     }
@@ -1707,7 +1770,8 @@ impl Captures {
                 | CaptureState::Saving(_)
                 | CaptureState::Selecting { .. }
                 | CaptureState::AwaitingResult(_)
-                | CaptureState::Resulting { .. } => {
+                | CaptureState::Resulting { .. }
+                | CaptureState::Deciding { .. } => {
                     Some(format!("{}: {} did not run", c.origin, c.path.display()))
                 }
                 CaptureState::Failed(why) if !c.reported => Some(format!("{}: {why}", c.origin)),
@@ -2030,6 +2094,10 @@ fn write_frame(job: &mut Job) {
 }
 
 impl FrameSink for ScenarioFrames {
+    fn decision_left(&mut self, record: &crate::measure::DecisionRecord) {
+        self.captures.leave_decision(record.lifetime);
+    }
+
     fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>) {
         if !drawn.timing.presented {
             return;
@@ -2140,6 +2208,8 @@ enum Stamp {
         page: u64,
         view: Option<u64>,
     },
+    /// Its decision screen's choice.
+    Decision { origin: TimeUs },
 }
 
 /// What `drawn` means for capture `c`, if anything: a selection capture's
@@ -2225,6 +2295,19 @@ fn capture_due(
             return (drawn.presented_at.0 - origin.0 >= since.0)
                 .then_some(Due::Save(SCREEN_SAVE, stamp));
         }
+        Axis::Decision(since) => {
+            let CaptureState::Deciding { lifetime, origin } = c.state else {
+                return None;
+            };
+            // A frame of its screen, drawn by its skin or the built-in
+            // presentation; never one drawn after the screen's labels went.
+            let (l, drew) = drawn.decision?;
+            if l != lifetime || drew == crate::measure::DecisionDrawnAs::Ended {
+                return None;
+            }
+            return (drawn.presented_at.0 - origin.0 >= since.0)
+                .then_some(Due::Save(SCREEN_SAVE, Stamp::Decision { origin }));
+        }
         Axis::Chart(_) | Axis::Ready(_) | Axis::Closing(_) => {}
     }
     let (Some(generation), Some(t)) = (drawn.generation, drawn.play) else {
@@ -2250,7 +2333,11 @@ fn capture_due(
             let start = drawn.view?.closing?;
             (t.0 - start.0 >= since.0).then_some(Due::Save(generation, Stamp::Play))
         }
-        Axis::Loading | Axis::LoadingAt(_) | Axis::Select(_) | Axis::Result(_) => None,
+        Axis::Loading
+        | Axis::LoadingAt(_)
+        | Axis::Select(_)
+        | Axis::Result(_)
+        | Axis::Decision(_) => None,
     }
 }
 
@@ -2278,6 +2365,20 @@ fn sidecar(
         Stamp::Result { origin, page, view } => (Some(origin.0), Some(page), view),
         _ => (None, None, None),
     };
+    let decision_origin = match stamp {
+        Stamp::Decision { origin } => Some(origin.0),
+        _ => None,
+    };
+    let decision = format!(
+        "\"decision_us\":{},\"decision_origin_us\":{},\"decision_lifetime\":{},\"decision_presentation\":{}",
+        opt(decision_origin.map(|o| at - o)),
+        opt(decision_origin),
+        num(drawn.decision.map(|(l, _)| l)),
+        drawn.decision.map_or_else(
+            || "null".to_owned(),
+            |(_, drew)| format!("\"{}\"", drew.name())
+        ),
+    );
     let result = drawn.result;
     let id = result.and_then(|r| r.id);
     let screen = format!(
@@ -2309,7 +2410,7 @@ fn sidecar(
         "{{\"axis\":\"{}\",\"target_us\":{},\"frame\":{frame},\"phase\":\"{}\",\
          \"chart_us\":{},\"ready_us\":{},\"ready_origin_us\":{},\"play_at_us\":{},\
          \"closing_us\":{},\"closing_start_us\":{},\"loading_us\":{},\"loading_origin_us\":{},\"settled\":{},\"screen_us\":{},\"completed_us\":{},\
-         \"generation\":{},\"view_generation\":{},\"finalized_us\":{},\"events\":{},{screen}}}\n",
+         \"generation\":{},\"view_generation\":{},\"finalized_us\":{},\"events\":{},{screen},{decision}}}\n",
         axis.name(),
         axis.target(),
         phase(drawn),
@@ -4514,6 +4615,181 @@ mod tests {
             held: std::sync::Mutex::new(held),
         };
         (sink, screen)
+    }
+
+    /// A decision frame of lifetime `lifetime` drawn as `drew`, presented
+    /// at `at_ms`.
+    fn decision_frame(
+        lifetime: u64,
+        drew: crate::measure::DecisionDrawnAs,
+        at_ms: i64,
+    ) -> crate::measure::Drawn<'static> {
+        let mut d = screen_drawn(crate::measure::ScreenKind::Decision, at_ms);
+        d.decision = Some((lifetime, drew));
+        d
+    }
+
+    /// A decision capture is bound at its choice and takes only a frame
+    /// of that screen at or after its time since the choice (the exact
+    /// time included), drawn by the skin or the built-in presentation or
+    /// fallen back to; never a frame of another screen, nor one drawn
+    /// after the screen's labels went. A play's start does not bind it.
+    #[test]
+    fn a_decision_capture_takes_its_screen_s_frame_from_the_choice() {
+        use crate::measure::DecisionDrawnAs::{BuiltIn, Ended, Fallback, Skin};
+        let dir = tempfile::tempdir().unwrap();
+        let c = screen_captures(
+            dir.path(),
+            &[(super::Axis::Decision(TimeUs(300_000)), false)],
+        );
+        c.arm(0);
+        c.bind(7);
+        assert_eq!(
+            c.status(0).unwrap().state,
+            CaptureState::Pending,
+            "a play bound it"
+        );
+        c.bind_decision(4, TimeUs(1_000_000));
+        let due = |d: &crate::measure::Drawn<'_>| {
+            let mut list = c.0.lock().unwrap();
+            matches!(
+                super::capture_due(&mut list[0], d, None),
+                Some(super::Due::Save(super::SCREEN_SAVE, _))
+            )
+        };
+        assert!(!due(&decision_frame(4, Skin, 1_299)), "before its time");
+        assert!(!due(&decision_frame(3, Skin, 1_400)), "an earlier screen");
+        assert!(!due(&decision_frame(5, Skin, 1_400)), "a later screen");
+        assert!(
+            !due(&decision_frame(4, Ended, 1_400)),
+            "after its labels went"
+        );
+        assert!(
+            !due(&screen_drawn(crate::measure::ScreenKind::Decision, 1_400)),
+            "no stamp"
+        );
+        for drew in [Skin, BuiltIn, Fallback] {
+            assert!(
+                due(&decision_frame(4, drew, 1_300)),
+                "{drew:?} at the exact time"
+            );
+        }
+    }
+
+    /// The render thread's departure from a decision screen fails the
+    /// captures bound to it that took no frame, whether or not any frame
+    /// was presented, and only those: another screen's capture stays, and
+    /// one being written is left to its writer.
+    #[test]
+    fn a_decision_departure_fails_only_its_own_captures() {
+        let dir = tempfile::tempdir().unwrap();
+        let axis = super::Axis::Decision(TimeUs(0));
+        let c = screen_captures(dir.path(), &[(axis, false), (axis, false), (axis, false)]);
+        c.arm(0);
+        c.bind_decision(1, TimeUs(0));
+        c.arm(1);
+        c.bind_decision(2, TimeUs(0));
+        c.set_state(2, CaptureState::Saving(super::SCREEN_SAVE));
+        c.leave_decision(1);
+        assert!(matches!(
+            c.status(0).unwrap().state,
+            CaptureState::Failed(_)
+        ));
+        assert_eq!(
+            c.status(1).unwrap().state,
+            CaptureState::Deciding {
+                lifetime: 2,
+                origin: TimeUs(0)
+            }
+        );
+        assert_eq!(
+            c.status(2).unwrap().state,
+            CaptureState::Saving(super::SCREEN_SAVE)
+        );
+        c.leave_decision(2);
+        let CaptureState::Failed(why) = c.status(1).unwrap().state else {
+            panic!("{:?}", c.status(1));
+        };
+        assert_eq!(
+            why,
+            "its decision screen ended before a frame at 0 ms on its decision axis"
+        );
+    }
+
+    /// A not-presented decision frame takes no capture: the sink looks
+    /// only at presented frames.
+    #[test]
+    fn an_unpresented_decision_frame_takes_no_capture() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = screen_captures(dir.path(), &[(super::Axis::Decision(TimeUs(0)), false)]);
+        c.arm(0);
+        c.bind_decision(1, TimeUs(0));
+        let (mut sink, screen) = released(&c);
+        let mut d = decision_frame(1, crate::measure::DecisionDrawnAs::Skin, 10);
+        d.timing.presented = false;
+        crate::render_side::FrameSink::frame(&mut sink, &screen, &d);
+        assert!(matches!(
+            c.status(0).unwrap().state,
+            CaptureState::Deciding { .. }
+        ));
+    }
+
+    /// `decision_at` is a capture of the select screen that a choice
+    /// follows: refused on a result, with no choice after it, mixed with
+    /// another axis, with `hold`, negative or too large; accepted before
+    /// `select` and before `practice`.
+    #[test]
+    fn decision_at_is_checked_when_loaded() {
+        let dir = folder();
+        write_log(dir.path());
+        let select = "select = { path = \"library/a/a.bms\" }";
+        let play = "play = { input = \"log.tprl\", until = \"end\" }";
+        let cap = |fields: &str| format!("capture = {{ {fields}, file = \"d.png\" }}");
+        // Each file its own output folder, which a load makes.
+        let n = std::cell::Cell::new(0);
+        let out = || {
+            n.set(n.get() + 1);
+            format!("out{}", n.get())
+        };
+        let ok = |steps: &[&str]| parse(&file(Some(&out()), steps), dir.path()).map(|_| ());
+        assert_eq!(
+            ok(&[&cap("decision_at = 300"), select, play, "quit = {}"]),
+            Ok(())
+        );
+        assert_eq!(
+            ok(&[
+                &cap("decision_at = 0"),
+                &practice(&format!("{FIELDS}, rounds = 1")),
+                "quit = {}"
+            ]),
+            Ok(())
+        );
+        let refused = |steps: &[&str]| parse(&file(Some(&out()), steps), dir.path()).unwrap_err();
+        let e = refused(&[
+            select,
+            play,
+            &cap("decision_at = 0"),
+            "result = \"back\"",
+            "quit = {}",
+        ]);
+        assert!(e.contains("decision_at needs the select screen"), "{e}");
+        let e = refused(&[
+            select,
+            play,
+            "result = \"back\"",
+            &cap("decision_at = 0"),
+            "quit = {}",
+        ]);
+        assert!(e.contains("no choice follows"), "{e}");
+        for fields in [
+            "decision_at = 0, at = 0",
+            "decision_at = 0, hold = true",
+            "decision_at = -1",
+            "decision_at = 9223372036854775807",
+        ] {
+            let e = refused(&[&cap(fields), select, play, "quit = {}"]);
+            assert!(!e.is_empty(), "{fields}");
+        }
     }
 
     /// I1 on the render side: a selection capture takes only a selection

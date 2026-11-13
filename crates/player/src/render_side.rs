@@ -1412,6 +1412,10 @@ struct Shared {
     /// The decision faults fired so far (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     decision_faults_fired: AtomicU64,
+    /// A refused decision frame waits here after its present was sampled,
+    /// before its refusal is reported, while a test holds it (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    decision_cleanup_gate: Arc<TestGate>,
     /// The decision labels' work waits here at a frame boundary with work
     /// to do, while a test holds it (tests).
     #[cfg(test)]
@@ -1565,6 +1569,8 @@ impl Shared {
             decision_faults: Mutex::new(None),
             #[cfg(all(test, feature = "dev-tools"))]
             decision_faults_fired: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            decision_cleanup_gate: Arc::default(),
             #[cfg(test)]
             label_gate: Arc::default(),
             #[cfg(all(test, feature = "dev-tools"))]
@@ -3224,6 +3230,13 @@ impl RenderLink {
     pub fn decision_faults_fired(&self) -> impl Fn() -> u64 + Send + Sync + 'static {
         let shared = Arc::clone(&self.shared);
         move || shared.decision_faults_fired.load(Ordering::SeqCst)
+    }
+
+    /// The gate a refused decision frame waits at between its present and
+    /// its refusal's report (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn decision_cleanup_gate(&self) -> Arc<TestGate> {
+        Arc::clone(&self.shared.decision_cleanup_gate)
     }
 
     /// The decision labels' readiness asked so far, read from any thread
@@ -6707,6 +6720,19 @@ impl Run {
                     screen.end(&self.end_page.1).map(|p| (timing_of(p), None))
                 }
             };
+            // A decision frame's present: right after its draw returned,
+            // before a refusal's report and takeover (dev-tools: matched
+            // against a capture's time since the choice).
+            #[cfg(feature = "dev-tools")]
+            if decision_as.is_some() && presented_at.is_none() {
+                presented_at = Some(self.clock.now());
+            }
+            // A test holds a refused decision frame here, its present
+            // sampled, before the refusal is reported (tests).
+            #[cfg(all(test, feature = "dev-tools"))]
+            if decision_refused.is_some() {
+                self.shared.decision_cleanup_gate.pass();
+            }
             // A result or end frame lost as a device loss (dev-tools: a
             // recovery while a result shows).
             #[cfg(feature = "dev-tools")]
