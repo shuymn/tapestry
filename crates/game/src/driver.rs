@@ -49,11 +49,22 @@ use crate::adjustment::{
 };
 use crate::attempt::PreparationRefusal;
 use crate::decision::{Served, Verdict};
-use crate::hispeed::PlayOptions;
+use crate::hispeed::{CoverKind, PlayOptions, PlayOptionsError};
 use crate::live::InputWaitError;
 use crate::session::Loaded;
 use crate::tempo::AttemptTempo;
 use crate::turntable::ScratchDevice;
+
+/// Why [`AdjustDriver::set_cover_on`] changed nothing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum CoverRefused {
+    /// An attempt is attached and not yet prepared.
+    #[error("an attempt is attached")]
+    Attached,
+    /// The options refused the change.
+    #[error(transparent)]
+    Invalid(PlayOptionsError),
+}
 
 /// What a drain runs under [`InputPump::with_ingress`]: given the ingress
 /// word (none: no gate) and the meeting point between each validation and
@@ -738,6 +749,27 @@ impl AdjustDriver {
     #[must_use]
     pub const fn options(&self) -> PlayOptions {
         self.reducer.options()
+    }
+
+    /// Turns the cover `kind` on or off between attempts (the select
+    /// screen's skin, design.md "Play Adjustments") and publishes it: the
+    /// next attachment solves with it and [`options`](Self::options) saves
+    /// it. Refused, changing nothing, while an attempt is attached and not
+    /// yet prepared, whose solve would no longer match. Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`CoverRefused::Attached`] while an attempt is pending, or what
+    /// [`PlayOptions::set_covers`] refuses.
+    pub fn set_cover_on(&mut self, kind: CoverKind, on: bool) -> Result<(), CoverRefused> {
+        if self.has_pending() {
+            return Err(CoverRefused::Attached);
+        }
+        self.reducer
+            .set_cover_on(kind, on)
+            .map_err(CoverRefused::Invalid)?;
+        self.reducer.publish(&mut self.writer);
+        Ok(())
     }
 
     /// The latest state, as the next snapshot will publish it.
