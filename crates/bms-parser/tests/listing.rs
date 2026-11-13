@@ -259,6 +259,21 @@ fn read_scanned_is_the_listing_and_the_summary() {
     assert!(refused.summary.is_err());
 }
 
+/// The scan's profile and MAIN tempo are the loader's: the profile a
+/// play's graphs draw and the MAIN of every note.
+#[test]
+fn read_scanned_carries_the_profile_and_main_tempo() {
+    let limits = Limits::default();
+    let scanned = read_scanned(CHART.as_bytes(), &limits).unwrap();
+    let loaded = load(CHART, 0).unwrap();
+    assert_eq!(scanned.profile.as_ref(), Some(&loaded.profile));
+    let main = bms_model::main_tempo(&loaded.chart, |_| true, bms_model::MAIN_HISTOGRAM_LIMIT).ok();
+    assert!(main.is_some());
+    assert_eq!(scanned.main, main);
+    let refused = read_scanned(b"#BPM 0\n#00138:01\n", &limits).unwrap();
+    assert!(refused.profile.is_none() && refused.main.is_none());
+}
+
 /// The seed-0 branch's judgment-header declarations come with the scan, in
 /// file order, which a song list reads the rank from; a refused branch
 /// carries none.

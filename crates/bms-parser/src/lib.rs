@@ -315,6 +315,13 @@ pub struct Scanned {
     /// The seed-0 branch's labels, from which a song list keeps the image
     /// names; none when the branch is refused.
     pub labels: Option<Labels>,
+    /// The seed-0 branch's profile at 1×, from which a song list previews
+    /// its densities and graphs; none when the branch is refused.
+    pub profile: Option<ChartProfile>,
+    /// The seed-0 branch's MAIN tempo ([`bms_model::main_tempo`], every
+    /// note weighed); none when the branch is refused or the histogram was
+    /// not allocated.
+    pub main: Option<bms_model::Tempo>,
 }
 
 /// Reads what a song list stores of a chart: [`read_listing`] and
@@ -329,22 +336,29 @@ pub fn read_scanned(bytes: &[u8], limits: &Limits) -> Result<Scanned, LoadError>
         return Err(LoadError::FileTooLarge { bytes: bytes.len() });
     }
     let text = decode(bytes, &mut Vec::new());
-    let (summary, judgment_headers, labels) = match built_at_1x(&text, limits) {
+    let (summary, judgment_headers, labels, profile, main) = match built_at_1x(&text, limits) {
         Ok(loaded) => {
             let summary = ChartSummary::of(&loaded.chart);
+            let main =
+                bms_model::main_tempo(&loaded.chart, |_| true, bms_model::MAIN_HISTOGRAM_LIMIT)
+                    .ok();
             (
                 Ok(summary),
                 loaded.chart.meta.judgment_headers,
                 Some(loaded.labels),
+                Some(loaded.profile),
+                main,
             )
         }
-        Err(e) => (Err(e), Vec::new(), None),
+        Err(e) => (Err(e), Vec::new(), None, None, None),
     };
     Ok(Scanned {
         listing: header::listing(&text),
         summary,
         judgment_headers,
         labels,
+        profile,
+        main,
     })
 }
 
