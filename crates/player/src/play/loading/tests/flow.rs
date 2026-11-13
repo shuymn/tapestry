@@ -194,16 +194,18 @@ fn on_loading<R>(
     held_ack: bool,
     f: impl FnOnce(&mut PlayerRig<'_>, &Side<'_>, &mut game::Loaded) -> R,
 ) -> R {
-    on_loading_with(loaded, pending, held_ack, false, f)
+    on_loading_with(loaded, pending, held_ack, false, None, f)
 }
 
 /// [`on_loading`], with every loading frame refused from before the
-/// lifetime begins while `refused`.
+/// lifetime begins while `refused`, and the first frame's hold bound
+/// `hold` when given, from before the lifetime begins.
 fn on_loading_with<R>(
     loaded: &mut game::Loaded,
     pending: Option<&str>,
     held_ack: bool,
     refused: bool,
+    hold: Option<TimeUs>,
     f: impl FnOnce(&mut PlayerRig<'_>, &Side<'_>, &mut game::Loaded) -> R,
 ) -> R {
     let _serial = imports::serial();
@@ -226,6 +228,14 @@ fn on_loading_with<R>(
     } else {
         screens.spawn(&chart, &bundle())
     };
+    if let Some(bound) = hold {
+        render.set_first_frame_hold(bound);
+        // A page presented before the lifetime: the image the hold keeps.
+        render.show_decision(crate::menu_screen::MenuPage::default(), None);
+        until("the page presented", || {
+            screens.menu_frames.lock().unwrap().len() >= 2
+        });
+    }
     on_input_rig_with(covers(), render, |rig, keys| {
         let dir = tempfile::tempdir().unwrap();
         let (sel, _) = crate::selection::tests::tree(dir.path(), &[&["b.bms"]]);
@@ -571,7 +581,7 @@ fn ends(side: &Side<'_>) -> Vec<TimeUs> {
 #[test]
 fn a_refused_first_loading_frame_ends_the_run() {
     let (_dir, mut loaded) = plain();
-    on_loading_with(&mut loaded, None, false, true, |rig, side, loaded| {
+    on_loading_with(&mut loaded, None, false, true, None, |rig, side, loaded| {
         let lifetime = rig.render.loading_lifetime();
         let frames = || {
             side.screens
@@ -643,6 +653,56 @@ fn the_opener_counts_the_minimum_from_the_render_ack() {
         };
         assert!(end.0 >= at.0 + 1_000_000, "{end:?} {at:?}");
     });
+}
+
+/// TB12: a pending play skin's first loading frame held while its
+/// specialization runs, over the selection frames presented before: no
+/// frame of the lifetime is presented or acknowledged during the hold, the
+/// opening waits for it, and the first acknowledged frame is the staged
+/// skin's, the minimum counting from it.
+#[test]
+fn the_opening_waits_for_the_held_first_frame() {
+    let (_dir, mut loaded) = plain();
+    let never = Some(TimeUs(3_600_000_000));
+    on_loading_with(
+        &mut loaded,
+        Some("local lv = ms.number(96)"),
+        false,
+        false,
+        never,
+        |rig, side, loaded| {
+            let lifetime = rig.render.loading_lifetime();
+            let held = rig.render.held_waits();
+            let acked = rig.render.ack_hold();
+            // The specialization's job does not end until let go.
+            skin_beatoraja::vm_hooks::hold();
+            side.loading_end.hold(true);
+            let ended = open_with(loaded, rig, side, || {
+                until("the specialization held", || {
+                    skin_beatoraja::vm_hooks::waiting() > 0
+                });
+                until("the first frame held", || held() >= 3);
+                assert!(!acked.held(), "a held frame was presented");
+                skin_beatoraja::vm_hooks::release();
+                side.quit_at_the_end_of_loading();
+            });
+            skin_beatoraja::vm_hooks::release();
+            assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+            let pending = side
+                .screens
+                .pending
+                .load(std::sync::atomic::Ordering::Acquire);
+            assert_eq!(pending, 0, "the placeholder drawn");
+            let staged = side.screens.staged_frames.lock().unwrap().clone();
+            assert_eq!(staged.first().map(|&(l, _)| l), Some(lifetime));
+            let (first, at) = rig.render.loading_ack().unwrap();
+            assert_eq!(first, lifetime);
+            let [end] = ends(side)[..] else {
+                panic!("{:?}", ends(side));
+            };
+            assert!(end.0 >= at.0 + 1_000_000, "{end:?} {at:?}");
+        },
+    );
 }
 
 /// The one close after a deferral or a commit: the time the flow decided

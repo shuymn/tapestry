@@ -787,9 +787,17 @@ pub struct Extent {
     size: AtomicU64,
     /// A [`RenderMsg::Resize`] is on its way for [`size`](Self::size).
     queued: AtomicBool,
+    /// Every size notice published so far, the same size again included:
+    /// counted after its size is stored, so a count read comes with its
+    /// size or a newer one.
+    notices: AtomicU64,
     /// Where the wake goes, once a render thread follows the slot
     /// ([`RenderLink::follow`]).
     wake: Mutex<Option<Sender<RenderMsg>>>,
+    /// A publish waits here between its size and its count while a test
+    /// holds it (tests).
+    #[cfg(test)]
+    counting: TestGate,
 }
 
 /// No size published yet.
@@ -800,18 +808,25 @@ impl Default for Extent {
         Self {
             size: AtomicU64::new(UNKNOWN),
             queued: AtomicBool::new(false),
+            notices: AtomicU64::new(0),
             wake: Mutex::new(None),
+            #[cfg(test)]
+            counting: TestGate::default(),
         }
     }
 }
 
 impl Extent {
     /// Publishes the window's client size in physical pixels, zero sides
-    /// when minimized, and wakes the render thread unless a wake is on its
-    /// way already.
+    /// when minimized, counts the notice, and wakes the render thread
+    /// unless a wake is on its way already.
     pub fn publish(&self, width: u32, height: u32) {
         let packed = (u64::from(width) << 32) | u64::from(height);
         self.size.store(packed, Ordering::Release);
+        #[cfg(test)]
+        self.counting.pass();
+        // After the size: a count read with `Acquire` sees its size.
+        self.notices.fetch_add(1, Ordering::Release);
         // Under the sender's lock, so a wake is marked only when it is
         // sent: before a render thread follows, none is, and the
         // [`RenderMsg::Follow`] that comes after reads the newest size.
@@ -831,6 +846,12 @@ impl Extent {
     /// the flag it set, so its size is the one read next.
     fn acknowledge(&self) {
         self.queued.swap(false, Ordering::AcqRel);
+    }
+
+    /// The size notices published so far: read before the size, a count
+    /// comes with its size or a newer one.
+    fn notices(&self) -> u64 {
+        self.notices.load(Ordering::Acquire)
     }
 
     /// The newest size published, if any. Reading it takes no wake, so a
@@ -1395,6 +1416,26 @@ struct Shared {
     /// (tests): a second clock reading in the frame would differ from it.
     #[cfg(test)]
     result_stall: AtomicBool,
+    /// The first loading frame's hold bound in place of
+    /// [`FIRST_FRAME_HOLD`], in µs (tests).
+    #[cfg(test)]
+    hold_bound: AtomicI64,
+    /// The held iterations, and their waits (tests).
+    #[cfg(test)]
+    held: [AtomicU64; 2],
+    /// The render thread's own allocations so far, read as each held
+    /// iteration begins (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    held_allocations: AtomicU64,
+    /// A frame waits here before it takes its token, after its extent
+    /// read and resize, and before its image's stamp, while a test holds
+    /// each (tests).
+    #[cfg(test)]
+    frame_gates: [TestGate; 3],
+    /// The stamps so far, and whether the last left the image valid,
+    /// right after it (tests).
+    #[cfg(test)]
+    stamps: [AtomicU64; 2],
 }
 
 impl Shared {
@@ -1471,6 +1512,16 @@ impl Shared {
             selection_stall: AtomicBool::new(false),
             #[cfg(test)]
             result_stall: AtomicBool::new(false),
+            #[cfg(test)]
+            hold_bound: AtomicI64::new(FIRST_FRAME_HOLD.0),
+            #[cfg(test)]
+            held: [AtomicU64::new(0), AtomicU64::new(0)],
+            #[cfg(all(test, feature = "dev-tools"))]
+            held_allocations: AtomicU64::new(0),
+            #[cfg(test)]
+            frame_gates: Default::default(),
+            #[cfg(test)]
+            stamps: [AtomicU64::new(0), AtomicU64::new(0)],
         }
     }
 
@@ -2898,6 +2949,24 @@ impl RenderLink {
         self.shared.loading_acked.load(Ordering::SeqCst)
     }
 
+    /// Holds the loading state's first frame for at most `bound` in place
+    /// of [`FIRST_FRAME_HOLD`] (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn set_first_frame_hold(&self, bound: TimeUs) {
+        self.shared.hold_bound.store(bound.0, Ordering::SeqCst);
+    }
+
+    /// The first frame's held iterations' waits so far, read from any
+    /// thread (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn held_waits(&self) -> impl Fn() -> u64 + Send + Sync + 'static {
+        let shared = Arc::clone(&self.shared);
+        move || {
+            let [_, waits] = &shared.held;
+            waits.load(Ordering::SeqCst)
+        }
+    }
+
     /// Where the current loading lifetime's lines and state are shown
     /// from, on any thread.
     pub fn loading(&self) -> LoadingSink {
@@ -3602,6 +3671,8 @@ pub fn spawn(
                 shared: thread_shared,
                 end_page: (0, EndPage::default()),
                 granted: false,
+                image: Image::default(),
+                first_frame: None,
                 extent: None,
                 applied: None,
                 selected: None,
@@ -4464,6 +4535,103 @@ struct Prepared {
     gauge_looks: Vec<skin_model::GaugeLook>,
 }
 
+/// The longest the loading state's first frame is held while it would be
+/// the pending presentation, from the showing (design.md "The pending
+/// presentation").
+const FIRST_FRAME_HOLD: TimeUs = TimeUs(500_000);
+
+/// The longest a held iteration waits before it looks again.
+const HELD_PACE: TimeUs = TimeUs(4_000);
+
+/// A frame's token: the target changes applied and the size notices
+/// published when it began, before it read the window's size.
+type FrameToken = (u64, u64);
+
+/// Whether the image on the screen is still the one last presented, on
+/// the target it was drawn for (design.md "The pending presentation"):
+/// valid only while no target change was applied, no size notice was
+/// published and no frame failed to present since that presentation, and
+/// only if none came between its frame's beginning and its presentation.
+#[derive(Clone, Copy, Debug, Default)]
+struct Image {
+    /// The target changes applied: each resize, each screen built or
+    /// dropped.
+    target: u64,
+    /// The token of the frame last presented while it still matched;
+    /// `None` after any break.
+    stamp: Option<FrameToken>,
+}
+
+impl Image {
+    /// A frame beginning now, with `notices` published.
+    const fn token(&self, notices: u64) -> FrameToken {
+        (self.target, notices)
+    }
+
+    /// A target change applied: the image no longer fits it.
+    const fn changed(&mut self) {
+        self.target = self.target.wrapping_add(1);
+        self.stamp = None;
+    }
+
+    /// A frame failed to present, or the device was lost.
+    const fn broken(&mut self) {
+        self.stamp = None;
+    }
+
+    /// The frame begun with `token` was presented, `notices` published
+    /// now: valid only if nothing changed since it began.
+    fn presented(&mut self, token: FrameToken, notices: u64) {
+        self.stamp = (token == self.token(notices)).then_some(token);
+    }
+
+    /// Whether the image is valid, `notices` published now.
+    fn valid(&self, notices: u64) -> bool {
+        self.stamp == Some(self.token(notices))
+    }
+}
+
+/// The size notices `extent` published, none without one.
+fn notices_of(extent: Option<&Arc<Extent>>) -> u64 {
+    extent.map_or(0, |e| e.notices())
+}
+
+/// A loading lifetime's first frame: when it was shown, and whether its
+/// hold ended, never to begin again in the lifetime.
+#[derive(Clone, Copy, Debug)]
+struct FirstFrame {
+    lifetime: u64,
+    shown_at: TimeUs,
+    ended: bool,
+}
+
+/// The first frame's hold bound: [`FIRST_FRAME_HOLD`], or a test's.
+fn first_frame_bound(shared: &Shared) -> TimeUs {
+    #[cfg(test)]
+    {
+        TimeUs(shared.hold_bound.load(Ordering::SeqCst))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = shared;
+        FIRST_FRAME_HOLD
+    }
+}
+
+/// How long a held iteration at `now` waits before it looks again: at
+/// most [`HELD_PACE`], never past `shown_at + bound`; `None` once that is
+/// reached, which ends the hold.
+const fn held_wait(now: TimeUs, shown_at: TimeUs, bound: TimeUs) -> Option<TimeUs> {
+    let remaining = shown_at.0.saturating_add(bound.0).saturating_sub(now.0);
+    if remaining <= 0 {
+        None
+    } else if remaining < HELD_PACE.0 {
+        Some(TimeUs(remaining))
+    } else {
+        Some(HELD_PACE)
+    }
+}
+
 struct Run {
     /// The first field, so it drops first: an unwinding thread publishes
     /// its failure before the screen's resources are destroyed.
@@ -4488,6 +4656,10 @@ struct Run {
     /// frame of latency), so the next frame takes it instead of waiting
     /// again, which would never end; until a new screen is built.
     granted: bool,
+    /// The image on the screen and its validity.
+    image: Image,
+    /// The current loading lifetime's first frame, once visited.
+    first_frame: Option<FirstFrame>,
     /// The window's size followed, if any.
     extent: Option<Arc<Extent>>,
     /// The size last applied to the screen; `None` until one is, and for
@@ -5151,6 +5323,8 @@ impl Run {
                     // the channel, after this: it is taken there.
                     self.extent = Some(extent);
                     self.applied = None;
+                    // Another slot's notices: none of them stamped the image.
+                    self.image.changed();
                 }
                 // Applied below, as every loop applies the newest size.
                 Ok(RenderMsg::Resize) => {
@@ -5207,13 +5381,22 @@ impl Run {
             let Some(screen) = &mut self.screen else {
                 continue;
             };
+            #[cfg(test)]
+            self.shared.frame_gates[0].pass();
+            // The frame's token, before it reads the window's size: a
+            // notice or a target change from here on leaves what it
+            // presents invalid.
+            let token = self.image.token(notices_of(self.extent.as_ref()));
             // The window's newest size, between frames.
             if let Some(size) = self.extent.as_ref().and_then(|e| e.latest())
                 && self.applied != Some(size)
             {
                 screen.resize(size.0, size.1);
                 self.applied = Some(size);
+                self.image.changed();
             }
+            #[cfg(test)]
+            self.shared.frame_gates[1].pass();
             // The decision labels' work at this frame boundary, outside
             // every frame, after the newest size: a device or poll failure
             // drops the screen, which the game builds again.
@@ -5538,6 +5721,48 @@ impl Run {
                         frame_presented = presented;
                     }
                     let pending = presented == Some(Presented::Placeholder);
+                    // The lifetime's first frame is held while it would be
+                    // the pending presentation and the image on the screen
+                    // is still valid, for a bound from the showing
+                    // (design.md "The pending presentation"): nothing is
+                    // built or presented, and a frame granted stays so.
+                    let mut lost = false;
+                    if let Some(lifetime) = loading_frame {
+                        let now = self.clock.now();
+                        let mut first = match self.first_frame {
+                            Some(f) if f.lifetime == lifetime => f,
+                            _ => FirstFrame {
+                                lifetime,
+                                shown_at: update.as_deref().map_or(now, |u| u.origin),
+                                ended: false,
+                            },
+                        };
+                        if pending && !first.ended {
+                            if screen.device_lost() {
+                                // The screen's failure, as a frame's.
+                                lost = true;
+                                first.ended = true;
+                            } else if let Some(wait) =
+                                held_wait(now, first.shown_at, first_frame_bound(&self.shared))
+                                    .filter(|_| self.image.valid(notices_of(self.extent.as_ref())))
+                            {
+                                self.first_frame = Some(first);
+                                #[cfg(all(test, feature = "dev-tools"))]
+                                self.shared
+                                    .held_allocations
+                                    .store(crate::alloc_count::this_thread(), Ordering::SeqCst);
+                                #[cfg(test)]
+                                self.shared.held[0].fetch_add(1, Ordering::SeqCst);
+                                std::thread::sleep(Duration::from_micros(wait.0.unsigned_abs()));
+                                #[cfg(test)]
+                                self.shared.held[1].fetch_add(1, Ordering::SeqCst);
+                                continue;
+                            } else {
+                                first.ended = true;
+                            }
+                        }
+                        self.first_frame = Some(first);
+                    }
                     let sampled = self.clock.now();
                     #[cfg(feature = "dev-tools")]
                     {
@@ -5547,7 +5772,9 @@ impl Run {
                             settled: !pending,
                         });
                     }
-                    let drawn = if pending {
+                    let drawn = if lost {
+                        Err(RenderError::DeviceLost)
+                    } else if pending {
                         // No specialization committed in this lifetime:
                         // the load's lines on a cleared canvas.
                         screen.pending_loading(page, *changed)
@@ -5609,6 +5836,12 @@ impl Run {
                         let clock = self.clock;
                         self.shared
                             .presented_loading(lifetime, loadend, || clock.now());
+                        // Presented: the hold has ended for the lifetime.
+                        if let Some(f) = &mut self.first_frame
+                            && f.lifetime == lifetime
+                        {
+                            f.ended = true;
+                        }
                     }
                     #[cfg(feature = "dev-tools")]
                     if let Ok((t, _)) = &drawn {
@@ -5986,6 +6219,23 @@ impl Run {
             // Any other frame's present: right after its draw returned.
             #[cfg(feature = "dev-tools")]
             let presented_at = presented_at.unwrap_or_else(|| self.clock.now());
+            #[cfg(test)]
+            self.shared.frame_gates[2].pass();
+            // The image's validity: a presented frame is valid only if
+            // nothing changed since its token; any other result breaks it.
+            match &drawn {
+                Ok((t, _)) if t.presented => self
+                    .image
+                    .presented(token, notices_of(self.extent.as_ref())),
+                _ => self.image.broken(),
+            }
+            #[cfg(test)]
+            {
+                let valid = self.image.valid(notices_of(self.extent.as_ref()));
+                let [count, last] = &self.shared.stamps;
+                last.store(u64::from(valid), Ordering::SeqCst);
+                count.fetch_add(1, Ordering::SeqCst);
+            }
             if !minimized {
                 self.granted = false;
             }
@@ -6271,6 +6521,7 @@ impl Run {
             let screen = built?;
             self.built(screen.as_ref());
             self.screen = Some(screen);
+            self.image.changed();
             self.result_rebuilt();
             // The new screen takes the window's size afresh.
             self.applied = None;
@@ -7004,6 +7255,7 @@ impl Run {
                 built.and_then(|s| {
                     self.built(s.as_ref());
                     self.screen = Some(s);
+                    self.image.changed();
                     // The new screen takes the window's size afresh.
                     self.applied = None;
                     self.result_rebuilt();
@@ -7015,6 +7267,7 @@ impl Run {
             self.shared.failed.store(false, Ordering::Release);
         } else {
             self.screen = None;
+            self.image.changed();
             self.granted = false;
         }
         ready
@@ -7272,6 +7525,7 @@ impl Run {
         ) {
             screen.resize(size.0, size.1);
             self.applied = Some(size);
+            self.image.changed();
         }
         let now = self.clock.now();
         if let Some(why) = refused
@@ -7316,6 +7570,7 @@ impl Run {
             }
             crate::decision_side::Rebuilt::Failed(e) => {
                 self.screen = None;
+                self.image.changed();
                 self.granted = false;
                 Err(e)
             }
@@ -7683,6 +7938,7 @@ impl Run {
     fn drop_screen(&mut self) {
         self.reconcile_result();
         self.screen = None;
+        self.image.changed();
         // The attempt is abandoned: its preparation before a wait is no
         // recovered frame's (dev-tools: the whole frames).
         #[cfg(feature = "dev-tools")]
@@ -13679,7 +13935,7 @@ pub(crate) mod tests {
                 .first()
                 .map_or_else(String::new, |l| l.text.clone());
             self.shared.menu_frames.lock().unwrap().push(first);
-            Ok(timing(true))
+            Ok(timing(!self.shared.unpresented.load(Ordering::Acquire)))
         }
         fn loading(
             &mut self,
@@ -13705,7 +13961,7 @@ pub(crate) mod tests {
             if self.shared.refuse_loading.load(Ordering::Acquire) {
                 return Ok(Err(skin_model::BuildError::InvalidReadouts));
             }
-            Ok(Ok(timing(true)))
+            Ok(Ok(timing(!self.shared.unpresented.load(Ordering::Acquire))))
         }
         fn loading_staged(
             &mut self,
@@ -13734,7 +13990,10 @@ pub(crate) mod tests {
                 return Err(RenderError::SurfaceLost);
             }
             self.shared.pending.fetch_add(1, Ordering::AcqRel);
-            Ok(timing(true))
+            Ok(timing(!self.shared.unpresented.load(Ordering::Acquire)))
+        }
+        fn device_lost(&self) -> bool {
+            self.shared.lost.load(Ordering::Acquire)
         }
         #[cfg(feature = "dev-tools")]
         fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
@@ -13749,6 +14008,11 @@ pub(crate) mod tests {
         /// The screens built so far.
         pub(crate) builds: Arc<AtomicU32>,
         hold: Arc<AtomicBool>,
+        /// Menu and loading frames return not presented while set, as on
+        /// an outdated swap chain.
+        unpresented: Arc<AtomicBool>,
+        /// The device reports itself lost while set.
+        lost: Arc<AtomicBool>,
         /// Every frame and installation fails as a lost device while set.
         pub(crate) fail: Arc<AtomicBool>,
         /// Loading frames drawn, refused ones included.
@@ -13772,7 +14036,7 @@ pub(crate) mod tests {
         /// with it.
         pub(crate) chart_loads: Arc<std::sync::Mutex<Vec<(usize, bool)>>>,
         /// Loading frames drawn as the pending presentation.
-        pending: Arc<AtomicU32>,
+        pub(crate) pending: Arc<AtomicU32>,
         stall: Arc<AtomicBool>,
         /// Set while a loading frame is held by `stall`.
         stalled: Arc<AtomicBool>,
@@ -19034,6 +19298,10 @@ pub(crate) mod tests {
     // staging and reapply, drawn from its first frame.
     #[cfg(feature = "dev-tools")]
     mod result_chart;
+    // The loading state's first frame held while it would be the pending
+    // presentation, and the validity of the image it holds.
+    #[cfg(feature = "dev-tools")]
+    mod first_frame;
 }
 
 /// Which screen each mode's frame is of (dev-tools).
