@@ -1877,7 +1877,7 @@ fn result_frame_alloc() {
     screen.commit(token(1, &screen)).unwrap();
     let shared = Shared::new();
     let scripts = crate::screens::Scripts::new();
-    let g = scripts.offer_result(script, true);
+    let g = scripts.offer_result(script.untimed(), true);
     assert!(g.is_some(), "the dot's draw runs in the runtime");
     let mut side = ResultSide::new(1);
     let lines: Vec<String> = (0..13).map(|i| format!("FACT {i}")).collect();
@@ -2646,7 +2646,7 @@ fn scripted(
 fn a_result_runtime_runs_from_the_first_frame_across_a_switch() {
     let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
     let rig = Rig::new();
-    let (g, gone) = offer(&rig, script);
+    let (g, gone) = offer(&rig, script.untimed());
     let lifetime = installed(&rig, &skin);
     show(
         &rig.link,
@@ -2800,7 +2800,7 @@ fn frames(rig: &Rig, n: usize) -> Vec<Vec<Quad>> {
 fn a_result_runtime_rests_through_a_play_and_resumes() {
     let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
     let rig = Rig::new();
-    let (g, gone) = offer(&rig, script);
+    let (g, gone) = offer(&rig, script.untimed());
     let lifetime = installed(&rig, &skin);
     for key in 1..=4 {
         show(
@@ -2898,7 +2898,7 @@ fn a_render_panic_in_a_play_leaves_the_result_runtime_to_the_game_thread() {
 fn a_retired_result_runtime_is_not_resumed() {
     let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
     let rig = Rig::new();
-    let (g, gone) = offer(&rig, script);
+    let (g, gone) = offer(&rig, script.untimed());
     let lifetime = installed(&rig, &skin);
     show(
         &rig.link,
@@ -3324,7 +3324,7 @@ fn the_runtime_and_the_build_read_one_origin() {
     let (_dir, skin, script) = scripted_skin("calls = calls + 1 return calls > 0");
     assert!(script.holds(), "the callback runs on a kept runtime");
     let rig = Rig::new();
-    let (g, _gone) = offer(&rig, script);
+    let (g, _gone) = offer(&rig, script.untimed());
     let lifetime = installed(&rig, &skin);
     show(
         &rig.link,

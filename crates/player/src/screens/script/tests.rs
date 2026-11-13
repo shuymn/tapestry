@@ -584,8 +584,23 @@ impl Drop for Switches {
 /// `entry`'s selection runtime committed in a fresh cell, with its
 /// bundle.
 fn selection_of(entry: &str) -> (tempfile::TempDir, Arc<render::SkinBundle>, Scripts) {
+    selection_slot_of(entry, |slot| slot)
+}
+
+/// [`selection_of`] with its runtime's frames untimed
+/// ([`ScriptSlot::untimed`]).
+fn untimed_selection_of(entry: &str) -> (tempfile::TempDir, Arc<render::SkinBundle>, Scripts) {
+    selection_slot_of(entry, ScriptSlot::untimed)
+}
+
+/// [`selection_of`] with its slot made of the import's by `slot`.
+fn selection_slot_of(
+    entry: &str,
+    slot: impl FnOnce(ScriptSlot) -> ScriptSlot,
+) -> (tempfile::TempDir, Arc<render::SkinBundle>, Scripts) {
     let dir = crate::selection_skin::runtime_fixture();
-    let (bundle, slot) = crate::selection_skin::fixture_scripted(LIMITS, dir.path(), entry);
+    let (bundle, imported) = crate::selection_skin::fixture_scripted(LIMITS, dir.path(), entry);
+    let slot = slot(imported);
     assert!(slot.holds(), "{entry}'s callback runs in the runtime");
     let scripts = Scripts::new();
     scripts.commit(ScreenKind::Selection, 1, slot);
@@ -683,7 +698,7 @@ fn the_off_switch_takes_no_runtime() {
 #[test]
 fn the_collect_switch_collects_once_after_each_frame() {
     let _serial = crate::imports::tests::serial();
-    let (_dir, bundle, scripts) = selection_of("rt.luaskin");
+    let (_dir, bundle, scripts) = untimed_selection_of("rt.luaskin");
     let _s = Switches::set(crate::dev::ScriptSwitches {
         collect: true,
         ..Default::default()

@@ -166,7 +166,7 @@ fn chart_skin() -> (
     let limits = crate::render_common::offscreen(1_920, 1_080).atlas_limits();
     let (skin, script) =
         crate::selection_skin::fixture_scripted(limits, dir.path(), "chart.luaskin");
-    (dir, skin, script)
+    (dir, skin, script.untimed())
 }
 
 /// A render thread on WARP with the chart fixture's selection skin
