@@ -14,7 +14,8 @@
 //! fading over its last [`FADE`], instead of the full play's audio tail,
 //! and the frozen record is saved once the ring-out has ended.
 
-use bms_model::{BgmEvent, Chart, NoteKind, Speed, TimeUs};
+use ::audio::{Channel, ScheduledSound};
+use bms_model::{Chart, NoteKind, Speed, TimeUs};
 use eval::{DeviceProfile, EvalError, Evaluator, InputStart, Section};
 use rules::{GaugeValue, RulePreset};
 
@@ -280,10 +281,12 @@ pub(crate) fn check(
 /// The audio schedule of a round of `section`: the chart's BGM merged with
 /// the key sound of every note that is not a target, at the note's time,
 /// as autoplay plays it (before the section, after its end, and long notes
-/// crossing either edge).
+/// crossing either edge). Those key sounds are on the background channel,
+/// as the source moves them to the background (design.md "Audio", the
+/// three volumes).
 #[must_use]
-pub(crate) fn schedule(chart: &Chart, section: &Section) -> Vec<BgmEvent> {
-    crate::autoplay::schedule_where(chart, |n| !section.is_target(n))
+pub(crate) fn schedule(chart: &Chart, section: &Section) -> Vec<ScheduledSound> {
+    crate::autoplay::schedule_where(chart, |n| !section.is_target(n), Channel::Background)
 }
 
 #[cfg(test)]

@@ -1760,7 +1760,7 @@ fn the_selected_charts_class_reads_before_the_settings() {
     assert_eq!(class(&fx), [2, 1]);
     let settings = skin_model::SelectionSettings {
         display_offset_ms: -7,
-        master_volume: skin_model::MasterVolume::of_gain(0.5),
+        system_volume: skin_model::VolumeReading::of_gain(0.5),
         speed: skin_model::SpeedView::Classic,
         order: skin_model::SelectionOrder::Title,
         gauge: None,

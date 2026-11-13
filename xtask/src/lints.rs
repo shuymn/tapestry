@@ -282,6 +282,8 @@ pub const IN_PLAY: &[Site] = &[
         &[
             "Adjust::is_input_offset",
             "Tuning::adjust",
+            "Tuning::channel",
+            "Tuning::set_volume",
             "Tuning::volume",
         ],
     ),
@@ -441,10 +443,10 @@ pub const IN_PLAY: &[Site] = &[
         "crates/skin-model/src/widget/glyphs.rs",
         &["BitmapLines::len", "BitmapLines::lines"],
     ),
-    // The master gain a selection frame shows, from the gain that plays.
+    // The system volume a selection frame shows, from the gain that plays.
     Site::Fns(
         "crates/skin-model/src/selection.rs",
-        &["Ratio::of_f32", "MasterVolume::of_gain"],
+        &["Ratio::of_f32", "VolumeReading::of_gain"],
     ),
     // A frame of an image from its cycle and its place in the atlas.
     Site::File("crates/skin-model/src/atlas/uv.rs"),

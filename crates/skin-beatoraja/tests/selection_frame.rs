@@ -737,7 +737,7 @@ const SETTING_INDICES: [i32; 38] = [
 
 /// The settings fixture: a number per id of [`SETTING_NUMBERS`] on row
 /// `i` (y up `10 · i`), an image of eleven entries per id of
-/// [`SETTING_INDICES`] at x `10 · i` (its first 32), the master volume's
+/// [`SETTING_INDICES`] at x `10 · i` (its first 32), the system volume's
 /// slider (range 100 to the right, at y 600) and graph (100 wide, at
 /// y 500).
 fn settings_skin() -> String {
@@ -847,7 +847,7 @@ fn settings(
 ) -> skin_model::SelectionSettings {
     skin_model::SelectionSettings {
         display_offset_ms,
-        master_volume: skin_model::MasterVolume::of_gain(gain),
+        system_volume: skin_model::VolumeReading::of_gain(gain),
         speed,
         order,
         gauge,

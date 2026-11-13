@@ -12,8 +12,8 @@
 //! explicit stop, so a refused restore plays the round with the BGM
 //! silent rather than from chart time 0.
 
-use ::audio::{AudioEngine, FrameLine, SeekError, SeekPlan, SeekSource};
-use bms_model::{BgmEvent, TimeUs};
+use ::audio::{AudioEngine, FrameLine, ScheduledSound, SeekError, SeekPlan, SeekSource};
+use bms_model::TimeUs;
 
 use crate::practice::RESTORE_RETRY;
 
@@ -38,7 +38,7 @@ pub enum RestoreError {
 #[derive(Clone, Debug)]
 pub struct Restorer {
     source: SeekSource,
-    schedule: Vec<BgmEvent>,
+    schedule: Vec<ScheduledSound>,
 }
 
 /// A round's restore, planned: the seek for the lead-in's start and its
@@ -54,7 +54,7 @@ pub struct Restore {
 impl Restorer {
     /// A restorer for the engine `source` describes, playing `schedule`.
     #[must_use]
-    pub const fn new(source: SeekSource, schedule: Vec<BgmEvent>) -> Self {
+    pub const fn new(source: SeekSource, schedule: Vec<ScheduledSound>) -> Self {
         Self { source, schedule }
     }
 

@@ -7,8 +7,9 @@ mod common;
 use std::sync::Arc;
 
 use audio::{
-    AudioEngine, AudioOutput, BankLimits, EngineError, RecordingOutput, Resume, Scheduled,
-    ScheduledKind, SimConfig, SimDevice, Sound, SoundBank, SoundCmd, Speed, load_bank_at,
+    AudioEngine, AudioOutput, BankLimits, Channel, EngineError, RecordingOutput, Resume, Scheduled,
+    ScheduledKind, ScheduledSound, SimConfig, SimDevice, Sound, SoundBank, SoundCmd, Speed,
+    load_bank_at,
 };
 use bms_model::{BgmEvent, SoundId, TimeUs};
 use rtrb::{Producer, RingBuffer};
@@ -32,6 +33,11 @@ fn bank() -> Arc<SoundBank> {
             Sound::mono((0..48).map(|i| CLICK_FIRST + 101 * i).collect()),
         ],
     ))
+}
+
+/// A chart's BGM-lane events as the engine schedules them.
+fn tagged(events: &[BgmEvent]) -> Vec<ScheduledSound> {
+    events.iter().map(|&e| e.into()).collect()
 }
 
 fn engine(bgm: &[BgmEvent]) -> AudioEngine {
@@ -324,8 +330,18 @@ fn a_bgm_event_and_a_scheduled_key_sound_at_one_time_sound_once() {
         time: TimeUs(100_000),
         sound: KEY,
     };
-    let mut e =
-        AudioEngine::with_schedule(bank(), vec![event; 2], RATE, PERIOD, 64, 1_024).unwrap();
+    let mut e = AudioEngine::with_schedule(
+        bank(),
+        vec![
+            ScheduledSound::on(event, Channel::Background),
+            ScheduledSound::on(event, Channel::Key),
+        ],
+        RATE,
+        PERIOD,
+        64,
+        1_024,
+    )
+    .unwrap();
     let dev = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
     let mut out = RecordingOutput::new(dev, 48_000);
     let (_tx, mut rx) = queue();
@@ -602,16 +618,19 @@ fn another_chart_replaces_the_bank_and_bgm() {
     // A seek planned for the old chart's schedule.
     let stale = audio::SeekPlan::new(
         &e.seek_source(),
-        &old_bgm,
+        e.schedule(),
         e.frame_line(),
         TimeUs(60_000_000),
     )
     .unwrap();
     let (back, back_bgm) = e
-        .replace(Arc::clone(&new_bank), audio::BgmSchedule::new(new_bgm))
+        .replace(
+            Arc::clone(&new_bank),
+            audio::BgmSchedule::new(tagged(&new_bgm)),
+        )
         .expect("same rate");
     assert_eq!(e.seek(&stale), Err(audio::SeekError::Source));
-    assert_eq!(back_bgm.events(), old_bgm);
+    assert_eq!(back_bgm.events(), tagged(&old_bgm));
     assert_eq!(back.stored_count(), 2);
     assert!(Arc::ptr_eq(e.bank(), &new_bank));
     assert_eq!((e.mixer().sounding(), e.bgm_left()), (0, 0));
@@ -663,11 +682,13 @@ fn a_seek_planned_before_a_bank_replacement_is_refused() {
     let empty = Arc::new(SoundBank::from_sounds(RATE, Vec::new()));
     let mut e = AudioEngine::new(empty, &schedule, RATE, PERIOD, 64, 64).unwrap();
     let at = TimeUs(10_000_000);
-    let stale = audio::SeekPlan::new(&e.seek_source(), &schedule, e.frame_line(), at).unwrap();
-    e.replace(bank(), audio::BgmSchedule::new(schedule.clone()))
+    let stale =
+        audio::SeekPlan::new(&e.seek_source(), &tagged(&schedule), e.frame_line(), at).unwrap();
+    e.replace(bank(), audio::BgmSchedule::new(tagged(&schedule)))
         .expect("same rate");
     assert_eq!(e.seek(&stale), Err(audio::SeekError::Source));
-    let fresh = audio::SeekPlan::new(&e.seek_source(), &schedule, e.frame_line(), at).unwrap();
+    let fresh =
+        audio::SeekPlan::new(&e.seek_source(), &tagged(&schedule), e.frame_line(), at).unwrap();
     assert_eq!(e.seek(&fresh), Ok(()));
 }
 
@@ -774,20 +795,29 @@ fn the_decision_tone_sounds_after_a_run_out_round() {
     assert_eq!(after, alone);
 }
 
-/// V4: the decision tone follows the master volume, never the play's gain.
+/// V4: the decision tone follows the system volume, never the key or
+/// background volume or the play's gain.
 #[test]
-fn the_decision_tone_follows_the_volume_not_the_gain() {
+fn the_decision_tone_follows_the_system_volume_not_the_gain() {
     let alone = tone_alone();
     let mut gained = silent_engine();
     gained.set_gain(audio::MAX_GAIN).unwrap();
     let (_, with_gain) = with_tone(gained, 70, |_, _, _| {});
     assert_eq!(with_gain, alone);
-    let mut quiet = silent_engine();
-    quiet.set_volume(0.5).unwrap();
-    let (_, half) = with_tone(quiet, 70, |_, _, _| {});
-    for (h, a) in half.iter().zip(&alone) {
-        assert!((h - a * 0.5).abs() < 1e-6, "{h} vs {a}");
+    let quiet = |key: f32| {
+        let mut e = silent_engine();
+        e.set_gain(audio::MAX_GAIN).unwrap();
+        e.set_volume(Channel::System, 0.45).unwrap();
+        e.set_volume(Channel::Key, key).unwrap();
+        e.set_volume(Channel::Background, 0.2).unwrap();
+        with_tone(e, 70, |_, _, _| {}).1
+    };
+    let scaled = quiet(0.2);
+    assert!(scaled.iter().any(|&x| x != 0.0));
+    for (s, a) in scaled.iter().zip(&alone) {
+        assert!((s - a * 0.45).abs() < 1e-6, "{s} vs {a}");
     }
+    assert_eq!(quiet(1.0), scaled);
 }
 
 /// V6: an engine whose tone has ended plays its chart exactly as one that

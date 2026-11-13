@@ -3827,7 +3827,7 @@ impl Skin {
         Ok(())
     }
 
-    /// Fills `sel`'s settings' fields and the master volume's ratio from
+    /// Fills `sel`'s settings' fields and the system volume's ratio from
     /// `settings`, apart from the view, which a later
     /// [`update_selection`](Self::update_selection) leaves as they are.
     /// Writes fields only: no string, no allocation, so a frame may call
@@ -5117,8 +5117,8 @@ impl Skin {
                             (RatioSource::ComboRate, Phase::Selection { sel, .. }) => {
                                 sel.combo_rate
                             }
-                            (RatioSource::MasterVolume, Phase::Selection { sel, .. }) => {
-                                sel.master_volume
+                            (RatioSource::SystemVolume, Phase::Selection { sel, .. }) => {
+                                sel.system_volume
                             }
                             (RatioSource::Score(r), Phase::Play { play, .. }) => {
                                 play.score_ratio(r)

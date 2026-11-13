@@ -2432,6 +2432,14 @@ pub fn recording_output(clock: QpcClock, seconds: usize) -> Paced<RecordingOutpu
     }
 }
 
+#[cfg(test)]
+impl<O: Recorded> Paced<O> {
+    /// The samples its output kept (tests).
+    pub fn samples(&self) -> &[f32] {
+        self.inner.samples()
+    }
+}
+
 impl<O: AudioOutput + Wakes> AudioOutput for Paced<O> {
     fn rate(&self) -> u32 {
         self.inner.rate()
