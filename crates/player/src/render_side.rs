@@ -14191,7 +14191,9 @@ pub(crate) mod tests {
     /// newer staging drawn.
     #[test]
     fn each_drop_of_a_staging_stops_its_drawing() {
-        let drops: [(&str, Box<dyn Fn(&super::RenderLink, &Installers, &Chart)>); 3] =
+        // A way to drop the staging, on the link, its screens and the chart.
+        type DropIt = Box<dyn Fn(&super::RenderLink, &Installers, &Chart)>;
+        let drops: [(&str, DropIt); 3] =
             [
                 ("discard", Box::new(|link, _, _| link.discard_attempt())),
                 (
