@@ -888,6 +888,11 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                 Seq::Chosen
             }
             (Seq::Select, Step::Cursor(s)) => {
+                if s.decision.is_some() {
+                    return Err(at(
+                        "a cursor step makes no choice: decision belongs on select".to_owned(),
+                    ));
+                }
                 match (&s.path, &s.search) {
                     (Some(p), None) => {
                         let target = target(base, p, roots).map_err(at)?;
@@ -4100,6 +4105,18 @@ pub(crate) mod tests {
         )
         .expect_err("refused");
         assert!(e.contains("built-in"), "{e}");
+        let e = parse(
+            &file(
+                None,
+                &[
+                    "cursor = { path = \"library/a/a.bms\", decision = \"skin\" }",
+                    "quit = {}",
+                ],
+            ),
+            dir.path(),
+        )
+        .expect_err("a cursor step makes no choice");
+        assert!(e.contains("decision belongs on select"), "{e}");
     }
 
     /// A `practice` step picks its chart as `select` does, presses P, sets
