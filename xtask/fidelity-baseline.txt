@@ -9,7 +9,6 @@ expect-reason 4 crates/skin-model/src/present/num.rs
 expect-reason 1 crates/skin-model/src/selection.rs
 expect-reason 2 crates/skin-model/src/widget/bpm_graph.rs
 expect-reason 2 crates/skin-model/src/widget/hit_error.rs
-expect-reason 1 crates/skin-model/src/widget/lanes.rs
 expect-reason 1 crates/skin-model/tests/play.rs
 java-name 1 crates/bms-parser/src/parse.rs
 java-name 1 crates/skin-beatoraja/src/lib.rs
