@@ -97,8 +97,10 @@ extern crate self as library;
 mod bests;
 mod db;
 mod loudness;
+mod preview;
 mod scan;
 mod search;
+mod stored_profile;
 
 use std::collections::HashMap;
 use std::ffi::OsString;
@@ -119,14 +121,16 @@ pub use bms_model::ChartSummary;
 pub use bms_parser::{ChartMode, Header};
 pub use db::Tuple;
 pub use loudness::{LoudnessKey, LoudnessRow};
+pub use preview::{ChartInfoView, border_start, gauge_total};
 pub use scan::{
     BATCH, BEST_BATCH, BestsReport, HEADER_FIELD_BYTES, PassGuard, PassStart, REBUILD_MEMORY,
     Refusal, Refusals, Scan, ScanError, ScanOptions, ScanReport, ThreadStart, stamp,
 };
 pub use search::{FolderKey, FolderRow, Level, SEPARATOR, Search, Sort};
+pub use stored_profile::{MAX_PROFILE_BYTES, MAX_ROWS, StoredProfile};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 9;
+pub const SCHEMA_VERSION: i64 = 10;
 
 /// Why the library database cannot be opened, read or scanned.
 #[derive(Debug, thiserror::Error)]
@@ -245,6 +249,10 @@ pub struct ChartEntry {
     /// The image names its seed-0 branch declares; `None` when the loader
     /// refuses that branch.
     pub images: Option<ChartNames>,
+    /// What a song list previews of its seed-0 branch's notes, densities,
+    /// gauge total and MAIN tempo; `None` when the loader refuses that
+    /// branch.
+    pub info: Option<ChartInfoView>,
 }
 
 /// The longest image name the library keeps, in bytes: the chart-image
@@ -643,6 +651,21 @@ impl Library {
             conn: db::connect(&self.path).map_err(|e| self.database(e))?,
             owner: Arc::clone(&self.owner),
         })
+    }
+
+    /// The stored profile of `entry`'s chart, for the song list's graphs:
+    /// `None` when there is none, when it is not of the file `entry` was
+    /// read from (its SHA-256) by this build's loader, or when it does not
+    /// decode within the bounds ([`StoredProfile`]).
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when SQLite refuses the query.
+    pub fn profile(&self, entry: &ChartEntry) -> Result<Option<StoredProfile>, LibraryError> {
+        let Some(path) = entry.path.to_str() else {
+            return Ok(None);
+        };
+        db::profile(&self.reader, path, &entry.sha256).map_err(|e| self.database(e))
     }
 
     /// Every indexed chart, by path.

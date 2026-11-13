@@ -3866,6 +3866,7 @@ pub(crate) mod tests {
             summary: None,
             rank: None,
             images: None,
+            info: None,
         }
     }
 
