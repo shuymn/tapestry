@@ -127,9 +127,10 @@ pub struct Selection {
     /// The best EX play's PERFECT to POOR over its own notes (graphs 140
     /// to 144); `None` without one or with no notes.
     pub(crate) judge_rates: [Option<Ratio>; 5],
-    /// The best max combo over the chart's summary notes (graph 145);
-    /// `None` for a chart that draws, whose best may come from a draw with
-    /// other notes, and without a summary.
+    /// The best max combo over the chart's summary notes (graph 145), as
+    /// the source divides it by the chart's notes for every chart
+    /// (`FloatPropertyFactory.java:155-176`, `:308` at `0.8.9`); `None`
+    /// without a summary or with no notes.
     pub(crate) combo_rate: Option<Ratio>,
     /// The master gain, as of the last settings; `None` before any.
     pub(crate) master_volume: Option<Ratio>,
@@ -319,7 +320,7 @@ impl Selection {
                 Ratio::new(u64::from(count), u64::from(p.notes))
             });
         }
-        self.combo_rate = selected.filter(|c| !c.random).and_then(|c| {
+        self.combo_rate = selected.and_then(|c| {
             let s = c.summary?;
             let combo = c.best.map_or(0, |b| b.max_combo);
             Ratio::new(u64::from(combo), u64::from(s.taps) + u64::from(s.longs))

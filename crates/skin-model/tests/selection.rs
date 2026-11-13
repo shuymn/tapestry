@@ -1911,8 +1911,8 @@ fn the_best_play_breakdown_fills_the_fields() {
 
 /// The rate bars of the best play divide each count by the play's own
 /// notes, not the summary's (here 20, as a chart that draws may have),
-/// and the best max combo's by the summary's notes, none for a chart that
-/// draws.
+/// and the best max combo's by the summary's notes for every chart, as the
+/// source's (`FloatPropertyFactory.java:155-176`, `:308` at `0.8.9`).
 #[test]
 fn the_best_play_bars_divide_by_its_own_notes() {
     let mut fx = bar_skin(
@@ -1951,10 +1951,11 @@ fn the_best_play_bars_divide_by_its_own_notes() {
         widths(&mut fx, &breakdown_view(false, 20)),
         &[per(4.0), per(2.0), 0.0, per(1.0), 0.0, 40.0 * 9.0 / 20.0],
     );
-    // A chart that draws: the play's own notes still, and no combo bar.
+    // A chart that draws: the play's own notes still, and the best max
+    // combo 9 over the summary's 20 (0.45), as for any chart.
     close(
         widths(&mut fx, &breakdown_view(true, 20)),
-        &[per(4.0), per(2.0), 0.0, per(1.0), 0.0],
+        &[per(4.0), per(2.0), 0.0, per(1.0), 0.0, 40.0 * 0.45],
     );
     // Without a best: no judgment bar, and the combo bar at 0.
     let mut v = breakdown_view(false, 20);

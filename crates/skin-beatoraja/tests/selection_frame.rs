@@ -1349,7 +1349,9 @@ fn the_best_play_breakdown_draws() {
 /// (plays, no best) the max combo, clears and the score's counts read 0
 /// and the fails the plays, the rates nothing; unplayed, those draw
 /// nothing; the point score and the judge counts read 0 either way
-/// (`ScoreDataProperty.java:90-91`, `MainState.java:141-144`).
+/// (`ScoreDataProperty.java:90-91`, `MainState.java:141-144`). A best play
+/// of no notes draws its counts and no rate, as the source's hidden rate
+/// with no notes (`IntegerPropertyFactory.java:505-511`).
 #[test]
 fn a_chart_without_a_best_play_shows_the_sources_empty_values() {
     let d = folder(&best_numbers_skin());
@@ -1378,4 +1380,15 @@ fn a_chart_without_a_best_play_shows_the_sources_empty_values() {
     assert_eq!(best_numbers(&mut s), want);
     s.view(&view(vec![chart("u")], Some(0), None, None));
     assert_eq!(best_numbers(&mut s), zero_counts.collect());
+    // A best play of no notes: its point score 0, its counts drawn, no
+    // rate.
+    let mut v = best_view(true);
+    if let Some(b) = v.selected.as_mut().and_then(|c| c.best.as_mut()) {
+        b.play.notes = 0;
+    }
+    s.view(&v);
+    let drawn = best_numbers(&mut s);
+    assert_eq!(drawn.get(&100).map(String::as_str), Some("0"));
+    assert_eq!(drawn.get(&80).map(String::as_str), Some("4"));
+    assert!((85..=89).all(|id| !drawn.contains_key(&id)), "{drawn:?}");
 }
