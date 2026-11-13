@@ -2275,11 +2275,17 @@ mod tests {
     /// thread, and F3 the stepped key and background volumes: a key sound
     /// (left channel only) plays at the key volume, a BGM-lane sound (right
     /// only) at the background volume, and the decision tone at the system
-    /// volume, each read from what the real output recorded.
+    /// volume, each read from what the real output recorded. The audio
+    /// thread is held at its gate while the test acts, and each phase ends
+    /// when the output has written enough frames after it, so no phase
+    /// depends on how long a thread sleeps; the wall clock only bounds a
+    /// stalled audio thread.
     #[cfg(feature = "dev-tools")]
     #[test]
     fn sync_sends_each_volume_to_the_audio_thread() {
         use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+        const SECONDS: usize = 20;
         let settings = game::Settings {
             device: game::DeviceSettings {
                 system_volume: 0.45,
@@ -2289,10 +2295,10 @@ mod tests {
             },
             player: game::PlayerSettings::default(),
         };
-        // A quarter of full scale on one side each, for 0.8 s, from the
-        // play's start.
+        // A quarter of full scale on one side each, from the play's start
+        // for as long as the recording: every phase sounds both.
         let chart = |rate: u32, _| {
-            let frames = rate as usize * 8 / 10;
+            let frames = rate as usize * SECONDS;
             let side = |left: bool| {
                 audio::Sound::stereo(
                     (0..frames)
@@ -2316,27 +2322,64 @@ mod tests {
         let done = move |out: &crate::dev::Paced<audio::RecordingOutput<audio::SimDevice>>| {
             *kept.lock().unwrap() = out.samples().to_vec();
         };
-        let wait = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
+        let gate = Arc::new(crate::dev::AudioGate::default());
         on_rig_playing(
             settings,
             crate::render_side::tests::Installers::default().spawn_bare(),
             QpcClock::start(),
-            None,
-            (chart, 3),
+            Some(Arc::clone(&gate)),
+            (chart, SECONDS),
             done,
             |rig, _, input| {
+                let written = |rig: &crate::play::PlayerRig<'_>| {
+                    rig.audio
+                        .control
+                        .counters()
+                        .frame_line(bms_model::TimeUs(0))
+                        .block_start
+                };
+                // Waits for `done`: the wall clock only catches a stall.
+                let until = |done: &dyn Fn() -> bool| {
+                    let began = Instant::now();
+                    while !done() {
+                        assert!(
+                            began.elapsed() < Duration::from_secs(10),
+                            "the audio thread stalled"
+                        );
+                        std::thread::yield_now();
+                    }
+                };
+                // Acts with the audio thread held at its gate, then lets it
+                // write `frames` past where it stopped: a step that began
+                // after the action took its volumes, and at least one whole
+                // block was mixed with them.
+                let phase = |rig: &mut crate::play::PlayerRig<'_>,
+                             act: &dyn Fn(&mut crate::play::PlayerRig<'_>),
+                             frames: u64| {
+                    gate.hold();
+                    until(&|| gate.stopped());
+                    act(rig);
+                    let from = written(rig);
+                    gate.release();
+                    until(&|| written(rig) >= from + frames);
+                };
                 // The play starts now: its sounds start at its chart time 0.
                 use bms_model::TimeSource as _;
                 let now = input.clock.now();
                 let (_sink, queue) = game::audio_link_at(8, now);
                 rig.audio.control.play(now, queue).unwrap();
-                rig.sync();
-                wait(300);
-                assert!(rig.controls.tuning().adjust(game::Adjust::VolumeDown));
-                rig.sync();
-                wait(700);
-                rig.audio.control.play_tone();
-                wait(800);
+                let blocks = 4 * 480;
+                phase(rig, &|rig| rig.sync(), blocks);
+                phase(
+                    rig,
+                    &|rig| {
+                        assert!(rig.controls.tuning().adjust(game::Adjust::VolumeDown));
+                        rig.sync();
+                    },
+                    blocks,
+                );
+                // The tone lasts 0.6 s.
+                phase(rig, &|rig| rig.audio.control.play_tone(), 48_000 * 7 / 10);
             },
         );
         let samples = recorded.lock().unwrap().clone();
@@ -2352,16 +2395,17 @@ mod tests {
         };
         assert!(shows(0.2, 0.8), "the loaded volumes");
         assert!(shows(0.15, 0.75), "F3's volumes");
-        // The tone, alone on both sides once the chart's sounds end: at the
+        // The tone over F3's volumes: the same on both sides, at the
         // system volume, under its unity peak.
         let tone: Vec<f32> = frames
             .iter()
-            .filter(|&&(l, r)| l != 0.0 && l == r)
-            .map(|&(l, _)| l.abs())
+            .map(|&(l, r)| (l - level(0.15), r - level(0.75)))
+            .filter(|&(d, e)| d.abs() > 1e-4 && (d - e).abs() < 1e-6)
+            .map(|(d, _)| d.abs())
             .collect();
         let peak = tone.iter().copied().fold(0.0, f32::max);
         assert!(tone.len() > 1_000, "{} tone frames", tone.len());
-        assert!(peak > 0.05 && peak <= 0.25 * 0.45, "peak {peak}");
+        assert!(peak > 0.05 && peak <= 0.25 * 0.45 + 1e-6, "peak {peak}");
     }
 
     /// A retry pressed in Closing with the quit key, in either order, is
