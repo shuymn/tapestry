@@ -539,3 +539,47 @@ fn an_undefined_scroll_change_is_no_point() {
     assert_eq!(preview(tail).seconds().len(), 6);
     assert_eq!(preview(&format!("{tail}#999SC:01\n")).seconds().len(), 6);
 }
+
+/// Fixture SR: a scroll change applies at its own row, not at the first
+/// row of its µs: measure 0 is 4·10⁻⁷ beats long, so its tap, its tempo
+/// change and its scroll change all floor to 0 µs; the change to ×0.5
+/// sits with the 240 BPM change at a quarter, so the rows are (0, 120)
+/// and (500, 240 × 0.5), never 120 × 0.5 at the tap's row.
+#[test]
+fn a_scroll_change_applies_at_its_own_row() {
+    let text = "#BPM 120\n#SCROLL01 0.5\n#00002:0.0000001\n#00019:01\n#00003:00F00000\n\
+                #000SC:00010000\n#00119:0001\n";
+    let one = bms_model::SCROLL_ONE;
+    assert_eq!(
+        preview(text).speeds(),
+        [speed_row(0, 120, one), speed_row(500, 240, one / 2)]
+    );
+}
+
+/// Two scroll changes at distinct positions inside one µs each apply at
+/// their own row: ×0.5 then ×2, both at 0 ms, in position order.
+#[test]
+fn scroll_changes_inside_one_microsecond_stay_apart() {
+    let text = "#BPM 120\n#SCROLL01 0.5\n#SCROLL02 2\n#00002:0.0000001\n#000SC:0102\n#00111:01\n";
+    let one = bms_model::SCROLL_ONE;
+    assert_eq!(
+        preview(text).speeds(),
+        [
+            speed_row(0, 120, one),
+            speed_row(0, 120, one / 2),
+            speed_row(0, 120, 2 * one)
+        ]
+    );
+}
+
+/// Two scroll changes at one position apply in file order: the later one
+/// is the factor from that row on.
+#[test]
+fn the_later_scroll_change_at_a_position_wins() {
+    let text = "#BPM 120\n#SCROLL01 0.5\n#SCROLL02 2\n#00011:01\n#001SC:01\n#001SC:02\n#00111:01\n";
+    let one = bms_model::SCROLL_ONE;
+    assert_eq!(
+        preview(text).speeds(),
+        [speed_row(0, 120, one), speed_row(2_000, 120, 2 * one)]
+    );
+}

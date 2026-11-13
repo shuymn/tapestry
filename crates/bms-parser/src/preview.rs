@@ -14,7 +14,7 @@
 //! the play chart's. A scroll change naming no `#SCROLLxx` is left out
 //! before timing, as the source skips it.
 
-use bms_model::{PreviewInputs, PreviewTimeline, Speed, TimeUs};
+use bms_model::{PreviewInputs, PreviewTimeline, Speed, TimeUs, TimelineId};
 
 use crate::Limits;
 use crate::parse::{ObjectKind, Source};
@@ -50,6 +50,7 @@ pub fn inputs(source: &Source, limits: &Limits) -> Option<PreviewInputs> {
     let timed =
         timing::compute_with(&both, limits, Speed::NORMAL, Tail::Kept, &mut Vec::new()).ok()?;
     let mut inputs = PreviewInputs::default();
+    let mut scroll: Vec<(TimelineId, i128)> = Vec::new();
     for o in &timed.objects {
         if o.seq >= first_scroll {
             let ObjectKind::Bgm(id) = o.kind else {
@@ -59,10 +60,10 @@ pub fn inputs(source: &Source, limits: &Limits) -> Option<PreviewInputs> {
                 continue;
             };
             // In position order, file order within one: a later change at
-            // one time replaces an earlier one.
-            match inputs.scroll.last_mut() {
-                Some(last) if last.0 == o.time => last.1 = factor,
-                _ => inputs.scroll.push((o.time, factor)),
+            // one position (one row) replaces an earlier one.
+            match scroll.last_mut() {
+                Some(last) if last.0 == o.id => last.1 = factor,
+                _ => scroll.push((o.id, factor)),
             }
         } else if o.seq >= first_shown {
             inputs.last_shown = Some(inputs.last_shown.map_or(o.time, |t: TimeUs| t.max(o.time)));
@@ -71,6 +72,7 @@ pub fn inputs(source: &Source, limits: &Limits) -> Option<PreviewInputs> {
     inputs.timeline = Some(PreviewTimeline {
         points: timed.rows,
         stops: timed.stops,
+        scroll,
         initial: timed.initial_tempo,
     });
     Some(inputs)

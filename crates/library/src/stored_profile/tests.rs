@@ -228,10 +228,23 @@ fn a_real_overflow_drops_the_rows_and_a_redundant_one_does_not() {
         }
         let mut chart = b.tap(lane, bms_model::TimeUs(6_000_000)).build().unwrap();
         chart.meta.length = bms_model::ChartSummary::of(&chart).length;
+        // Each change at its tempo change's row.
+        let points = chart.timeline.points().to_vec();
+        let scroll = scroll
+            .into_iter()
+            .map(|(at, f)| {
+                let i = points.iter().position(|p| p.at == at).unwrap();
+                (bms_model::TimelineId(u32::try_from(i).unwrap()), f)
+            })
+            .collect();
         let inputs = bms_model::PreviewInputs {
-            timeline: None,
+            timeline: Some(bms_model::PreviewTimeline {
+                points,
+                stops: Vec::new(),
+                scroll,
+                initial: chart.timeline.meta().initial,
+            }),
             last_shown: None,
-            scroll,
         };
         bms_model::ChartProfile::preview(&chart, &[], &inputs)
     };
