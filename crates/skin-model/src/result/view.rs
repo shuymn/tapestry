@@ -131,6 +131,19 @@ pub struct ResultChart {
     /// from its own rank, whatever preset judged or views it; `None`
     /// also for a rank in no class. A value above 4 is none.
     pub judge_class: Option<u8>,
+    /// Whether its stage file and back image are images, resolved before
+    /// any result import, probe or view (options 190, 191, 194 and 195).
+    pub images: ImageFacts,
+}
+
+/// Whether a chart's stage file and back image are images: each `true`
+/// exactly when the attempt's read of it decoded (S10-12, the result's
+/// availability). Static for the attempt's result, as the source's
+/// options are there (`BooleanPropertyFactory.java:219`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ImageFacts {
+    pub stage: bool,
+    pub back: bool,
 }
 
 /// A chart's tempo range.

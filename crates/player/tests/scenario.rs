@@ -195,6 +195,34 @@ impl Fixture {
         self.output(self.command(text).env("TAPESTRY_DEV_RESULT_FAULTS", faults))
     }
 
+    /// [`run`](Self::run), stopped at `limit`: `None` when the run did
+    /// not end by then, the child then killed and waited for.
+    fn run_bounded(
+        &self,
+        text: &str,
+        limit: std::time::Duration,
+    ) -> Option<(Output, String, String)> {
+        let mut child = self
+            .command(text)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let begun = std::time::Instant::now();
+        while child.try_wait().unwrap().is_none() {
+            if begun.elapsed() >= limit {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let out = child.wait_with_output().unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        Some((out, stdout, stderr))
+    }
+
     fn output(&self, command: &mut Command) -> (Output, String, String) {
         let out = command.output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -236,7 +264,7 @@ impl Fixture {
 
 /// The scenario of `steps`, over `library`, with `out` as its output.
 fn scenario(steps: &[&str]) -> String {
-    let mut text = "version = 5\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
+    let mut text = "version = 8\noutput = \"out\"\n[library]\nroots = [\"library\"]\n".to_owned();
     for s in steps {
         text.push_str("[[step]]\n");
         text.push_str(s);
@@ -623,7 +651,7 @@ fn a_stalled_capture_exits_one_within_the_bound() {
             let _ = child.kill();
             panic!("the run did not end within {} s", bound.as_secs());
         }
-        std::thread::sleep(Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(100));
     }
     let out = child.wait_with_output().unwrap();
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -645,27 +673,27 @@ fn a_stalled_capture_exits_one_within_the_bound() {
 #[test]
 fn other_scenario_version_is_refused() {
     let fx = Fixture::new();
-    let (out, _, stderr) = fx.run("version = 6\nwhat_v6_adds = true\n");
+    let (out, _, stderr) = fx.run("version = 9\nwhat_v9_adds = true\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("version 6 is not supported; this build reads version 5"),
+        stderr.contains("version 9 is not supported; this build reads version 8"),
         "{stderr}"
     );
-    assert!(!stderr.contains("what_v6_adds"), "{stderr}");
+    assert!(!stderr.contains("what_v9_adds"), "{stderr}");
     assert!(!fx.data().join("library.db").exists());
     // The previous version too: its files are refused, never read.
-    let old = scenario(&["quit = {}"]).replacen("version = 5", "version = 4", 1);
+    let old = scenario(&["quit = {}"]).replacen("version = 8", "version = 7", 1);
     let (out, _, stderr) = fx.run(&old);
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("version 4 is not supported; this build reads version 5"),
+        stderr.contains("version 7 is not supported; this build reads version 8"),
         "{stderr}"
     );
     assert!(!fx.data().join("library.db").exists());
     let (out, _, stderr) = fx.run("[library]\nroots = [\"library\"]\n");
     assert_eq!(out.status.code(), Some(1), "{stderr}");
     assert!(
-        stderr.contains("no version; this build reads version 5"),
+        stderr.contains("no version; this build reads version 8"),
         "{stderr}"
     );
     assert!(!fx.data().join("library.db").exists());
@@ -1091,6 +1119,200 @@ fn a_ready_capture_past_ready_fails_the_run() {
     assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
     assert!(stderr.contains("its READY state ended first"), "{stderr}");
     assert!(!fx.base.join("out").join("late.png").exists());
+}
+
+/// A skin with a 2 500 ms loading time, installed as the play skin.
+fn install_slow_loading_skin(fx: &Fixture) {
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    fs::write(
+        skin.join("s.json"),
+        r#"{"type": 0, "w": 1920, "h": 1080, "loadend": 2500, "destination": []}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 's.json'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// A `loading_at` capture takes a frame on its loading state's clock, its
+/// screen clock the same; the play's frames run that screen clock on
+/// (docs/stage3.md D3). One past the loading state fails the run.
+#[test]
+fn a_loading_at_capture_runs_on_the_loading_clock() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    install_slow_loading_skin(&fx);
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "capture = { loading_at = 1500, file = \"mid.png\" }",
+        "capture = { at = 0, file = \"start.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let dir = fx.base.join("out");
+    assert!(dir.join("mid.png").exists());
+    let mid = fs::read_to_string(dir.join("mid.json")).unwrap();
+    assert_eq!(side_value(&mid, "axis"), "loading_at", "{mid}");
+    assert_eq!(side_value(&mid, "phase"), "loading", "{mid}");
+    let loading_us = side_num(&mid, "loading_us");
+    // At or after 1.5 s, and inside the 2.5 s loading state.
+    assert!((1_500_000..2_500_000).contains(&loading_us), "{mid}");
+    assert_eq!(side_num(&mid, "screen_us"), loading_us, "{mid}");
+    // The play's screen clock runs on past the whole loading time.
+    let start = fs::read_to_string(dir.join("start.json")).unwrap();
+    assert!(side_num(&start, "screen_us") >= 2_500_000, "{start}");
+    assert_eq!(side_value(&start, "loading_us"), "null", "{start}");
+
+    let late = scenario(&[
+        "capture = { loading_at = 60000, file = \"late.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ])
+    .replacen("output = \"out\"", "output = \"late\"", 1);
+    let (out, stdout, stderr) = fx.run(&late);
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(stderr.contains("its loading state ended first"), "{stderr}");
+}
+
+/// The adapter lines of `stdout`.
+fn adapter_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|l| l.starts_with("dev: adapter asked "))
+        .collect()
+}
+
+/// A run asking for the hardware adapter builds its screen with that
+/// choice and says what it got: a CPU adapter refuses the run, any other
+/// draws it and names itself in each capture's sidecar. CI has no
+/// hardware GPU, so either outcome is checked as it comes.
+#[test]
+fn a_hardware_scenario_builds_on_the_hardware_adapter() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let text = small(&[
+        "capture = { at = 0, file = \"a.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ])
+    .replacen(
+        "size = [640, 360]\n",
+        "size = [640, 360]\nadapter = \"hardware\"\n",
+        1,
+    );
+    let (out, stdout, stderr) = fx.run(&text);
+    let lines = adapter_lines(&stdout);
+    assert!(!lines.is_empty(), "{stdout}\n{stderr}");
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.starts_with("dev: adapter asked hardware, got ")),
+        "{lines:?}"
+    );
+    if lines[0].contains(" (Cpu, ") {
+        assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+        assert!(
+            stderr.contains("hardware was asked for, and the adapter is a CPU adapter"),
+            "{stderr}"
+        );
+        return;
+    }
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let name = lines[0]
+        .trim_start_matches("dev: adapter asked hardware, got ")
+        .rsplit_once(" (")
+        .unwrap()
+        .0;
+    assert_eq!(side_value(&side_of(&fx, "a"), "adapter"), name);
+}
+
+/// Every build of the screen is admitted against the file's choice: a
+/// hardware run whose screen, built again after a device loss on the
+/// result, gets a CPU adapter (injected) is refused there, as at startup.
+#[test]
+fn a_rebuilt_screen_s_cpu_adapter_is_refused_on_a_hardware_choice() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let text = small(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ])
+    .replacen(
+        "size = [640, 360]\n",
+        "size = [640, 360]\nadapter = \"hardware\"\n",
+        1,
+    );
+    let (out, stdout, stderr) = fx.output(
+        fx.command(&text)
+            .env("TAPESTRY_DEV_RESULT_FAULTS", "lostresult1")
+            .env("TAPESTRY_DEV_ADAPTER_FAULTS", "cpu2"),
+    );
+    let lines = adapter_lines(&stdout);
+    assert!(!lines.is_empty(), "{stdout}\n{stderr}");
+    let refusal = "hardware was asked for, and the adapter is a CPU adapter";
+    // No hardware GPU (CI): refused at startup, before any loss.
+    if lines[0].contains(" (Cpu, ") {
+        assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+        assert!(stderr.contains(refusal), "{stderr}");
+        return;
+    }
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines[1].starts_with("dev: adapter asked hardware, got injected CPU adapter (Cpu, "),
+        "{lines:?}"
+    );
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains(&format!("{refusal}: injected CPU adapter")),
+        "{stderr}"
+    );
+}
+
+/// Every build of the screen takes the file's choice: the one after a
+/// device loss on the result says so again.
+#[test]
+fn a_screen_built_again_keeps_the_adapter_choice() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let (out, stdout, stderr) = fx.run_with(
+        &small(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ])
+        .replacen(
+            "size = [640, 360]\n",
+            "size = [640, 360]\nadapter = \"warp\"\n",
+            1,
+        ),
+        "lostresult1",
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stderr.contains("render: "), "no loss: {stderr}");
+    let lines = adapter_lines(&stdout);
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert!(
+        lines
+            .iter()
+            .all(|l| l.starts_with("dev: adapter asked warp, got ")),
+        "{lines:?}"
+    );
 }
 
 /// A capture whose file is a folder when its frame comes fails the run,
@@ -2980,4 +3202,343 @@ fn a_fallback_during_the_outro_serves_back_at_once() {
         1,
         "{stdout}"
     );
+}
+
+/// The sidecar of capture `name` under the run's output.
+fn side_of(fx: &Fixture, name: &str) -> String {
+    fs::read_to_string(fx.base.join("out").join(format!("{name}.json"))).unwrap()
+}
+
+/// [`scenario`] at 640×360.
+fn small(steps: &[&str]) -> String {
+    scenario(steps).replacen(
+        "output = \"out\"\n",
+        "output = \"out\"\nsize = [640, 360]\n",
+        1,
+    )
+}
+
+/// I1, I2: each holding selection capture takes a frame of the update its
+/// own cursor step published, before the next step's: its revision is at
+/// least its stamp's and below the next capture's stamp.
+#[test]
+fn held_select_captures_follow_their_own_cursor_steps() {
+    let fx = Fixture::new();
+    for (c, title) in [("a", "譜面A"), ("b", "譜面B"), ("c", "譜面C")] {
+        write_chart(&fx.library(), c, title);
+    }
+    let (out, stdout, stderr) = fx.run(&small(&[
+        "cursor = { path = \"library/b/b.bms\" }",
+        "capture = { select_at = 250, file = \"b.png\" }",
+        "cursor = { path = \"library/c/c.bms\" }",
+        "capture = { select_at = 250, file = \"c.png\" }",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let (b, c) = (side_of(&fx, "b"), side_of(&fx, "c"));
+    for side in [&b, &c] {
+        assert_eq!(side_value(side, "screen"), "selection", "{side}");
+        assert_eq!(side_value(side, "axis"), "select", "{side}");
+        assert!(side_num(side, "select_us") >= 250_000, "{side}");
+        assert!(
+            side_num(side, "selection_revision") >= side_num(side, "stamp_revision"),
+            "{side}"
+        );
+    }
+    assert!(
+        side_num(&b, "selection_revision") < side_num(&c, "stamp_revision"),
+        "{b}\n{c}"
+    );
+    let png = |n: &str| fs::read(fx.base.join("out").join(format!("{n}.png"))).unwrap();
+    assert_ne!(png("b"), png("c"));
+}
+
+/// A selection capture that does not hold fails when the selection is
+/// left before its frame, saying so.
+#[test]
+fn a_select_capture_left_before_its_frame_fails() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let (out, stdout, stderr) = fx.run(&small(&[
+        "capture = { select_at = 600000, hold = false, file = \"s.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains(
+            "step 1 (capture): the selection left before a frame at 600000 ms on its select axis"
+        ),
+        "{stderr}"
+    );
+}
+
+/// I2 on a result: back waits for a holding capture of the built-in
+/// result, which is taken 400 ms after the result's first frame.
+#[test]
+fn held_result_capture_defers_back() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let (out, stdout, stderr) = fx.run(&small(&[
+        "capture = { result_at = 400, file = \"r.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = { miss = \"all\" }, until = { at_ms = 1500, command = \"quit\" } }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let side = side_of(&fx, "r");
+    assert_eq!(side_value(&side, "phase"), "result", "{side}");
+    assert_eq!(side_value(&side, "result_drawn"), "built-in", "{side}");
+    assert!(side_num(&side, "result_us") >= 400_000, "{side}");
+    assert_eq!(side_num(&side, "result_seq"), 1, "{side}");
+}
+
+/// I3: a result's origin is its first presented frame, whatever view it
+/// shows later; a capture written on the result after a view command
+/// takes a frame of the view that command made.
+#[test]
+fn a_result_origin_survives_a_view_change() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    result_skin(&fx, Reads::Nothing);
+    let (out, stdout, stderr) = fx.run(&small(&[
+        "capture = { result_at = 0, file = \"r0.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"next-preset\"",
+        "capture = { result_at = 400, file = \"r1.png\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let (r0, r1) = (side_of(&fx, "r0"), side_of(&fx, "r1"));
+    assert_eq!(
+        side_num(&r0, "presented_us"),
+        side_num(&r1, "result_origin_us"),
+        "{r0}\n{r1}"
+    );
+    assert_eq!(side_num(&r0, "result_seq"), side_num(&r1, "result_seq"));
+    assert!(
+        side_num(&r1, "result_view") >= side_num(&r1, "stamp_view"),
+        "{r1}"
+    );
+    assert!(
+        side_num(&r1, "stamp_view") > side_num(&r0, "result_view"),
+        "{r0}\n{r1}"
+    );
+    assert!(side_num(&r1, "result_us") >= 400_000, "{r1}");
+    assert_eq!(side_value(&r0, "result_drawn"), "skin", "{r0}");
+}
+
+/// A capture that does not hold, past the skin's scene time, fails when
+/// the result leaves on its own.
+#[test]
+fn a_result_capture_past_the_scene_fails() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    result_skin_with(&fx, Reads::Nothing, ", fadeout = 200, scene = 1500");
+    let (out, stdout, stderr) = fx.run(&small(&[
+        "capture = { result_at = 600000, hold = false, file = \"r.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"stay\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains(
+            "step 1 (capture): the result left before a frame at 600000 ms on its result axis"
+        ),
+        "{stderr}"
+    );
+}
+
+/// `play --dev-frames` writes a skinned result's first frame as
+/// `end.png`.
+#[test]
+fn the_frame_dump_writes_a_skinned_results_end_frame() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    result_skin(&fx, Reads::Nothing);
+    let frames = fx.base.join("frames");
+    fs::create_dir_all(&frames).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_tapestry"))
+        .arg("play")
+        .arg(fx.library().join("a").join("a.bms"))
+        .args(["--auto", "--dev-headless", "--dev-size", "320x180"])
+        .arg("--dev-frames")
+        .arg(&frames)
+        .args(["--dev-render-timeout", "600"])
+        .env("LOCALAPPDATA", &fx.appdata)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(
+        !lines(&stdout, "dev: result shown: skin").is_empty(),
+        "{stdout}"
+    );
+    assert!(frames.join("end.png").exists(), "{stdout}");
+    assert!(!frames.join("select.png").exists(), "{stdout}");
+}
+
+/// I3 through a device loss: a built-in result's screen lost and built
+/// again keeps its identity and origin.
+#[test]
+fn a_built_in_result_keeps_its_identity_through_recovery() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let (out, stdout, stderr) = fx.run_with(
+        &small(&[
+            "capture = { result_at = 0, file = \"r0.png\" }",
+            "capture = { result_at = 800, file = \"r1.png\" }",
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ]),
+        "lostresult2",
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(stderr.contains("render: "), "no loss: {stderr}");
+    let (r0, r1) = (side_of(&fx, "r0"), side_of(&fx, "r1"));
+    assert_eq!(side_num(&r0, "result_seq"), side_num(&r1, "result_seq"));
+    assert_eq!(
+        side_num(&r0, "result_origin_us"),
+        side_num(&r1, "result_origin_us")
+    );
+    assert!(side_num(&r1, "result_us") >= 800_000, "{r1}");
+}
+
+/// A refused result skin's built-in page names the same result.
+#[test]
+fn a_refused_result_skin_keeps_its_identity() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    result_skin(&fx, Reads::Chart);
+    let (out, stdout, stderr) = fx.run_with(
+        &small(&[
+            "capture = { result_at = 300, file = \"r.png\" }",
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ]),
+        "select1",
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let side = side_of(&fx, "r");
+    assert_eq!(side_num(&side, "result_seq"), 1, "{side}");
+    assert_ne!(side_value(&side, "result_drawn"), "skin", "{side}");
+}
+
+/// Two results of a run have two numbers and two origins.
+#[test]
+fn two_results_have_two_identities() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let (out, stdout, stderr) = fx.run(&small(&[
+        "capture = { result_at = 0, file = \"r1.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "capture = { result_at = 0, file = \"r2.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let (r1, r2) = (side_of(&fx, "r1"), side_of(&fx, "r2"));
+    assert_eq!(side_num(&r1, "result_seq"), 1, "{r1}");
+    assert_eq!(side_num(&r2, "result_seq"), 2, "{r2}");
+    assert!(
+        side_num(&r2, "result_origin_us") > side_num(&r1, "presented_us"),
+        "{r1}\n{r2}"
+    );
+}
+
+/// A close on a result fails its capture whose frame was not taken,
+/// saying the run ended.
+#[test]
+fn a_close_on_a_result_fails_its_capture() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let (out, stdout, stderr) = fx.run(&small(&[
+        "capture = { result_at = 600000, hold = false, file = \"r.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains(
+            "step 1 (capture): the run ended before a frame at 600000 ms on its result axis"
+        ),
+        "{stderr}"
+    );
+}
+
+/// A scripted quit on a result waits for its holding capture.
+#[test]
+fn held_result_capture_defers_quit() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let (out, stdout, stderr) = fx.run(&small(&[
+        "capture = { result_at = 400, file = \"r.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(side_num(&side_of(&fx, "r"), "result_us") >= 400_000);
+}
+
+/// `stay` on a result with no scene time in force fails at once: it would
+/// never leave.
+#[test]
+fn stay_without_scene_time_fails() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    // Bounded: a stay that waits for good never ends the run.
+    let (out, stdout, stderr) = fx
+        .run_bounded(
+            &small(&[
+                "select = { path = \"library/a/a.bms\" }",
+                "play = { input = \"auto\", until = \"end\" }",
+                "result = \"stay\"",
+                "quit = {}",
+            ]),
+            std::time::Duration::from_secs(300),
+        )
+        .expect("the run did not end within 300 s");
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        stderr.contains("stay needs a result skin's scene time; none is in force"),
+        "{stderr}"
+    );
+}
+
+/// A capture whose frame is being written when its result is left is not
+/// failed by the leaving.
+#[test]
+fn a_saving_capture_survives_departure() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let (out, stdout, stderr) = fx.output(
+        fx.command(&small(&[
+            "capture = { result_at = 0, hold = false, file = \"r.png\" }",
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ]))
+        .env("TAPESTRY_DEV_CAPTURE_STALL_MS", "2000"),
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(fx.base.join("out").join("r.png").exists());
 }

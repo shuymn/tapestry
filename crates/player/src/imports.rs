@@ -529,6 +529,20 @@ fn stopped(cancel: &Cancel) -> Result<(), String> {
     }
 }
 
+/// JSON skin `def`, read with `header`, imported into `kind` with
+/// `config`, observing `cancel` as a Lua pass does: a stop during its
+/// work, a song list's image validation among it, ends it.
+fn import_json(
+    mut def: Definition,
+    header: &Header,
+    config: &Config,
+    kind: ScreenKind,
+    cancel: &Cancel,
+) -> Result<Imported, ImportError> {
+    def.observe(cancel.clone());
+    skin_beatoraja::import(&mut def, header, config, kind)
+}
+
 fn built(
     kind: ScreenKind,
     choice: &SkinChoice,
@@ -579,7 +593,7 @@ fn built(
     // only its runtime runs (docs/stage3.md S7-07).
     let mut script = ScriptSlot::default();
     let imported: Result<Imported, ImportError> = match pass {
-        Pass::Json(mut def, _) => skin_beatoraja::import(&mut def, &header, &config, kind),
+        Pass::Json(def, _) => import_json(def, &header, &config, kind, cancel),
         Pass::Lua(h) => {
             let facts = ImportFacts::base(kind, Fact::Known(autoplay));
             let outcome = if matches!(kind, ScreenKind::Selection | ScreenKind::Result) {
@@ -677,14 +691,32 @@ fn pack(
     let mut summary = Summary::of(imported.report, header);
     let mut skin = imported.skin;
     let variant = skin.variant(target.size, &Layout::AUTHOR);
-    summary.chart_layer = skin
-        .fit_chart_layer(variant, target.limits)
-        .map(|e| Chain(&e).to_string());
+    summary.chart_layer = plan_layers(&mut skin, variant, target.limits).1;
     let atlas = skin
         .atlas(variant, target.limits, &|| cancel.is_cancelled())
         .map_err(|e| format!("the atlas cannot be built: {}", Chain(&e)))?;
     let bundle = bundle_of(skin, imported.scratch, atlas, target, cancel)?;
     Ok((bundle, summary))
+}
+
+/// The layers `skin`'s atlas of `variant` keeps after its pages within
+/// `limits`: the one decision every pack and plan of an imported skin
+/// takes them from ([`skin_model::Skin::fit_chart_layer`]). A chart layer
+/// that the limits refuse while the atlas without it fits is given up, so
+/// the skin keeps its main presentation and its chart images draw absent;
+/// the note says why.
+pub(crate) fn plan_layers(
+    skin: &mut skin_model::Skin,
+    variant: skin_model::Variant,
+    limits: skin_model::AtlasLimits,
+) -> (skin_model::KeptLayers, Option<String>) {
+    let note = skin
+        .fit_chart_layer(variant, limits)
+        .map(|e| Chain(&e).to_string());
+    if let Some(why) = &note {
+        log::info!("skin: its chart layer is given up: {why}");
+    }
+    (skin.kept_layers(), note)
 }
 
 /// `skin` bundled with `atlas` (built from its sheet, or rebound to it):

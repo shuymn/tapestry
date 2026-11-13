@@ -201,18 +201,18 @@ fn timer_140_is_the_rhythm_clock() {
     assert_ne!(d.frame(20, &[])[0].uv, first);
 }
 
-/// Timer 2, the fade-out, is never set on play (docs/stage3.md D14): a
-/// destination on it is never drawn and a cycle on it stays on its first
-/// frame, with an `Unset` note and no drop, through READY (a 2 s lead-in),
-/// Playing, the audio tail and Closing, while the READY, play and failure
-/// timers run. Told apart by width: 10 on timer 2, 11 on READY (40), 12
+/// Timer 2, the fade-out, runs on play only from a full play's published
+/// fade-out (docs/stage3.md D30): a destination on it is not drawn and a
+/// cycle on it stays on its first frame through READY (a 2 s lead-in),
+/// Playing, the audio tail's hold and Closing, while the READY, play and
+/// failure timers run; from the fade-out's start both run. Neither is
+/// noted or dropped. Told apart by width: 10 on timer 2, 11 on READY (40), 12
 /// on play (41), 13 on failure (3), 14 untimed; the cycles are 15 on
 /// timer 2 and 16 on READY.
 #[test]
-fn the_fade_out_timer_is_never_set_on_play() {
+fn the_fade_out_timer_runs_only_in_the_fade_out() {
     use bms_model::TimeUs;
     use common::play::{Drawn, MS, context};
-    use skin_beatoraja::Severity;
     use skin_model::{Attempt, PlayContext, timer as slot};
     let dst = |id: &str, t: &str, w: i32| {
         format!(r#"{{"id": "{id}", {t} "dst": [{{"x": 0, "y": 0, "w": {w}, "h": 10}}]}}"#)
@@ -264,23 +264,21 @@ fn the_fade_out_timer_is_never_set_on_play() {
     let (tail, c2_tail, _) = shown(&mut d, 3_050);
     assert_eq!(tail, [11, 12, 14, 15, 16], "the tail");
     assert_eq!(c2_tail, c2, "the tail");
+    d.fading = Some(TimeUs(3_100 * MS));
+    let (fading, c2_fading, _) = shown(&mut d, 3_250);
+    assert_eq!(fading, [10, 11, 12, 14, 15, 16], "the fade-out");
+    assert_ne!(c2_fading, c2, "the fade-out: the cycle on 2 runs");
+    assert_eq!(d.play.timer(slot::FADEOUT), d.fading, "the fade-out runs");
+    d.fading = None;
     d.complete = false;
     d.closing = Some(TimeUs(3_500 * MS));
     let (closing, c2_closing, _) = shown(&mut d, 4_150);
     assert_eq!(closing, [11, 12, 13, 14, 15, 16], "Closing");
     assert_eq!(c2_closing, c2, "Closing");
     assert_eq!(d.play.timer(slot::FAILED), d.closing, "the failure runs");
-    // Kept, not dropped: each reads `Unset`, ignored.
+    assert_eq!(d.play.timer(slot::FADEOUT), None, "Closing never fades");
     let r = loaded.report();
-    assert_eq!(
-        common::kinds(r),
-        [timer(TimerWhy::Unset(2)), timer(TimerWhy::Unset(2))],
-        "{r:?}"
-    );
-    assert!(
-        r.notes.iter().all(|n| n.severity == Severity::Ignored),
-        "{r:?}"
-    );
+    assert!(r.notes.is_empty(), "{r:?}");
 }
 
 #[test]

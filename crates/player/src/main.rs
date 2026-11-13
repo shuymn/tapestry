@@ -46,6 +46,7 @@ mod measure;
 mod menu_screen;
 mod page_jobs;
 mod play;
+mod pointer;
 mod power;
 mod practice_page;
 #[cfg(feature = "dev-tools")]
@@ -930,6 +931,7 @@ fn rig<'a>(
         load_start: TimeUs(0),
         pending_retry: None,
         window: None,
+        cursor: None,
         retry_from: None,
         state_clock: state_clock::StateClock::default(),
         result_retries: play::ResultRetries::default(),
@@ -988,6 +990,8 @@ fn rig<'a>(
         result_facts: None,
         result_offset: None,
         result_leaving: false,
+        #[cfg(feature = "dev-tools")]
+        views_shown: 0,
         result_outro: None,
         #[cfg(feature = "dev-tools")]
         probe_ready: None,
@@ -1032,10 +1036,11 @@ fn open_window_and_input(
     wake: impl FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     keys: (Option<u32>, Option<u32>),
     monitor: Option<String>,
-    menu: Option<Arc<MenuQueue>>,
+    menu: Option<(Arc<MenuQueue>, Arc<pointer::PointerShared>)>,
 ) -> anyhow::Result<(window::WindowThread, window::Surface, InputThread)> {
+    let (menu, pointer) = menu.map_or_else(|| (None, Arc::default()), |(m, p)| (Some(m), p));
     let (window_thread, surface) =
-        window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu)?;
+        window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu, pointer)?;
     let input = InputThread::spawn(clock, sources, capture, waker, wake);
     let input = match input {
         Ok(i) => i,
@@ -1070,10 +1075,11 @@ fn open_window_and_clocked(
     wake: impl FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     keys: (Option<u32>, Option<u32>),
     monitor: Option<String>,
-    menu: Option<Arc<MenuQueue>>,
+    menu: Option<(Arc<MenuQueue>, Arc<pointer::PointerShared>)>,
 ) -> anyhow::Result<(window::WindowThread, window::Surface, ClockedThread)> {
+    let (menu, pointer) = menu.map_or_else(|| (None, Arc::default()), |(m, p)| (Some(m), p));
     let (window_thread, surface) =
-        window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu)?;
+        window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu, pointer)?;
     match ClockedThread::spawn(clock, sources, waker, wake) {
         Ok(input) => Ok((window_thread, surface, input)),
         Err(e) => {
@@ -1172,7 +1178,7 @@ fn play(
             wake,
             keys,
             monitor,
-            Some(Arc::clone(&menu)),
+            Some((Arc::clone(&menu), Arc::default())),
         )
         .map(|(w, s, t)| (w, s, Some(t), None))
     } else {
@@ -1184,7 +1190,7 @@ fn play(
             wake,
             keys,
             monitor,
-            Some(Arc::clone(&menu)),
+            Some((Arc::clone(&menu), Arc::default())),
         )
         .map(|(w, s, t)| (w, s, None, Some(t)))
     };
@@ -1258,6 +1264,7 @@ fn play(
         rig.recorded.keyboard = keyboard;
     }
     rig.window = Some(window_thread.shown());
+    rig.cursor = Some(window_thread.cursor());
     rig.restorer = restorer(&loaded, &rig);
     rig.gain = gain;
     rig.result_input = menus;
@@ -1428,6 +1435,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         .and_then(|sc| sc.size)
         .or(s.dev.size)
         .unwrap_or(dev::DEFAULT_SIZE);
+    // What draws a headless run's screen: WARP unless a scenario asks for
+    // the hardware adapter.
+    #[cfg(feature = "dev-tools")]
+    let adapter = scenario
+        .as_ref()
+        .map_or(AdapterChoice::Warp, |sc| sc.adapter.choice());
     #[cfg(feature = "dev-tools")]
     if let Some(sc) = &scenario {
         roots.clone_from(&sc.roots);
@@ -1515,6 +1528,9 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         axis_mode(&mut sources, &settings.device);
     }
     let (menu, menus) = menu_input(&settings.device, autoplay, &mut sources, controls.tuning());
+    // The pointer's state, which the window, the select screen and the
+    // render thread share.
+    let pointer = Arc::new(pointer::PointerShared::default());
     controls.set_latch(sources.gate().handle());
     controls.set_waker(waker.clone());
     let mode = if autoplay {
@@ -1543,7 +1559,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
                     wake,
                     keys,
                     monitor,
-                    Some(Arc::clone(&menu)),
+                    Some((Arc::clone(&menu), Arc::clone(&pointer))),
                 )
                 .map(|(w, s, t)| (Some(w), Some(s), None, Some(t)))
             } else {
@@ -1556,7 +1572,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
                     wake,
                     keys,
                     monitor,
-                    Some(Arc::clone(&menu)),
+                    Some((Arc::clone(&menu), Arc::clone(&pointer))),
                 )
                 .map(|(w, s, t)| (Some(w), Some(s), Some(t), None))
             }
@@ -1594,14 +1610,23 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             let screen = MenuScreen::new(r, Some(fonts)).with_sink(Box::new(link.clone()));
             Ok(Box::new(screen) as Box<dyn Screen>)
         }),
-        // Headless (dev-tools): offscreen on WARP.
+        // Headless (dev-tools): offscreen on WARP, or on the hardware
+        // adapter a scenario asks for, admitted at every build.
         #[cfg(feature = "dev-tools")]
         _ => Box::new(move || {
             let target = Target::Offscreen {
                 width: size.0,
                 height: size.1,
             };
-            let r = Renderer::new(target, AdapterChoice::Warp)?;
+            let r = Renderer::new(target, adapter)?;
+            // What this build got, as a test's injected fault may report it,
+            // said on stdout and in the log, then admitted against what the
+            // file asked for.
+            let got = dev::scenario::built_adapter(r.gpu().adapter());
+            let line = dev::scenario::adapter_line(r.choice(), &got);
+            println!("{line}");
+            log::info!("{line}");
+            dev::scenario::admit(adapter, &got)?;
             let fonts = render::text::Fonts::runtime()?;
             Ok(Box::new(MenuScreen::new(r, Some(fonts))) as Box<dyn Screen>)
         }),
@@ -1651,6 +1676,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     };
     let mut rig = rig(&root, &settings, autoplay, threads, &controls, clock)?;
     rig.window = window_thread.as_ref().map(window::WindowThread::shown);
+    rig.cursor = window_thread.as_ref().map(window::WindowThread::cursor);
+    rig.render.pointer(Arc::clone(&pointer));
     rig.queue_most = opened.most_queued_periods;
     rig.result_input = menus;
     #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
@@ -1665,6 +1692,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         screen,
         menu,
         dropped: 0,
+        pointer: crate::pointer::PointerPass::new(Arc::clone(&pointer)),
+        dropped_pointer: 0,
         preset_refusal: false,
         search_pending: false,
         preset_steps: std::collections::VecDeque::new(),
@@ -1707,6 +1736,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             shown: false,
             rounds: 0,
             nearest: None,
+            result_id: None,
+            result_seq: 0,
         });
     }
     // The skins, before the first screen: a refused play skin admits no
@@ -1766,6 +1797,14 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         .selection
         .as_ref()
         .and_then(selection::Selection::script_failure);
+    // The run ends: a result or selection shown is left, and its captures
+    // whose frame was not taken fail, before the scenario is taken from
+    // the rig (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    {
+        rig.finish_result(dev::scenario::Leaving::Ended);
+        rig.finish_selection(dev::scenario::Leaving::Ended);
+    }
     #[cfg(feature = "dev-tools")]
     let scenario = rig.scenario.take().map(|sc| {
         let script = rig.selection.as_mut().and_then(|sel| sel.script.take());
@@ -2881,9 +2920,9 @@ mod tests {
                 g
             };
             let mut seen = vec![read(rig)];
-            rig.entered_decision(
+            let _ = rig.entered_decision(
                 &game::Pick::Play(std::path::PathBuf::from("chart.bms")),
-                &mut game::Decision::off(),
+                game::Decision::off(),
             );
             seen.push(read(rig));
             rig.entered_loading(std::path::Path::new("chart.bms"));
