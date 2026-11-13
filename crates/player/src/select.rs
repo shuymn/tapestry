@@ -2260,11 +2260,13 @@ mod tests {
                 [1; 32],
                 library::Score {
                     plays: 3,
+                    clears: 0,
                     best: Some(library::Best {
                         ex: 1234,
                         bp: 5,
                         cleared: vec![1 << hard],
                         full_combo: false,
+                        ..Default::default()
                     }),
                 },
             ),
@@ -2272,6 +2274,7 @@ mod tests {
                 [2; 32],
                 library::Score {
                     plays: 2,
+                    clears: 0,
                     best: None,
                 },
             ),
@@ -2381,11 +2384,13 @@ mod tests {
         let easy = 0;
         let best = |ex, bp, cleared: Vec<u8>, full_combo| library::Score {
             plays: 4,
+            clears: 0,
             best: Some(library::Best {
                 ex,
                 bp,
                 cleared,
                 full_combo,
+                ..Default::default()
             }),
         };
         s.set_bests_preset(Some(preset));
@@ -2427,6 +2432,7 @@ mod tests {
             [1; 32],
             library::Score {
                 plays: 2,
+                clears: 0,
                 best: None,
             },
         )]));
@@ -2486,11 +2492,13 @@ mod tests {
                 [1; 32],
                 library::Score {
                     plays: 1,
+                    clears: 0,
                     best: Some(library::Best {
                         ex: 40,
                         bp: 0,
                         cleared: Vec::new(),
                         full_combo: false,
+                        ..Default::default()
                     }),
                 },
             )]));

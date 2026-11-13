@@ -136,6 +136,7 @@ impl BestsRecords {
             record,
             &verified,
             evaluation,
+            play.chart,
             &preset,
         );
         // The guard goes before a failure requests a catch-up through it.
@@ -239,10 +240,13 @@ pub fn lamp_text(best: &Best, preset: &RulePreset) -> String {
 pub fn row_score(score: Option<&Score>, preset: &RulePreset) -> RowScore {
     match score {
         None => RowScore::Unplayed,
-        Some(Score { plays, best: None }) => RowScore::NoBest { plays: *plays },
+        Some(Score {
+            plays, best: None, ..
+        }) => RowScore::NoBest { plays: *plays },
         Some(Score {
             plays,
             best: Some(b),
+            ..
         }) => RowScore::Best {
             plays: *plays,
             ex: b.ex,
@@ -355,6 +359,7 @@ mod tests {
             bp: 0,
             cleared: bits,
             full_combo,
+            ..Default::default()
         }
     }
 
@@ -509,12 +514,14 @@ mod tests {
         let p = ranked();
         let scored = Score {
             plays: 2,
+            clears: 0,
             best: Some(cleared(&[3], false)),
         };
         let cell = |score: Option<&Score>, p| chart_cell(&super::row_score(score, p), Some(p));
         assert_eq!(cell(Some(&scored), &p), "HARD           10");
         let no_best = Score {
             plays: 2,
+            clears: 0,
             best: None,
         };
         assert_eq!(cell(Some(&no_best), &p), "-               -");
@@ -653,11 +660,13 @@ mod tests {
         assert_eq!(super::lookup(None, &p), BestLookup::KnownEmpty);
         let no_best = Score {
             plays: 3,
+            clears: 0,
             best: None,
         };
         assert_eq!(super::lookup(Some(&no_best), &p), BestLookup::KnownEmpty);
         let scored = Score {
             plays: 3,
+            clears: 0,
             best: Some(cleared(&[0, 3], false)),
         };
         assert_eq!(

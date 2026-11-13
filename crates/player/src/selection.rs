@@ -5867,7 +5867,16 @@ pub(crate) mod tests {
                 bp: 0,
                 cleared: vec![0b1],
                 full_combo: false,
+                // Its own play, as a counted one is: the read refuses a
+                // best whose EX is not its play's.
+                play: library::Breakdown {
+                    body_sha256: [7; 32],
+                    ex: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
             }),
+            clear: true,
             ineligible: None,
         };
         sel.shelf.best_writer().unwrap().ingest(&c).unwrap();
@@ -7587,11 +7596,13 @@ pub(crate) mod tests {
             c.sha256,
             library::Score {
                 plays: 3,
+                clears: 0,
                 best: Some(library::Best {
                     ex: 3,
                     bp: 1,
                     cleared: vec![1],
                     full_combo: false,
+                    ..Default::default()
                 }),
             },
         )]));
