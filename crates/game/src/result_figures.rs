@@ -22,9 +22,9 @@ pub const MAX_TIMELINE_BINS: usize = 512;
 /// early; then the same four late.
 pub const TIMELINE_CHANNELS: usize = 9;
 
-/// The farthest sample from its note the timing statistics keep, in µs:
-/// the presses whose ms value, truncated toward zero, lies within ±150.
-pub const TIMING_RANGE_US: i64 = 150_999;
+/// The farthest sample from its note the timing statistics keep, in µs,
+/// either way, inclusive: 150 ms.
+pub const TIMING_RANGE_US: i64 = 150_000;
 
 /// The rank thresholds in 27ths of the largest EX score, F to AAA.
 const RANK_LOW: [u128; 8] = [0, 6, 9, 12, 15, 18, 21, 24];
