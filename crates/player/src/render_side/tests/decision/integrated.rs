@@ -27,7 +27,7 @@ use tempfile::TempDir;
 use crate::controls::Controls;
 use crate::measure::{DecisionDrawnAs, DecisionFallback, DecisionRecord};
 
-use super::{Decided, DecidedSink};
+use super::{Decided, DecidedSink, RigSink};
 use crate::menu_screen::{MenuPage, MenuScreen};
 use crate::render_side::tests::wait_until;
 use crate::render_side::{EndPage, MakeScreen, Screen, TakeoverAcks};
@@ -245,6 +245,8 @@ struct Seen {
     refused_at: Mutex<Option<TimeUs>>,
     /// The next decision frame's fade marker is read back.
     probe: AtomicBool,
+    /// A chart's load on the render thread waits here while held.
+    load_gate: crate::render_side::TestGate,
     drawn: Mutex<Vec<Drawn>>,
     more: Condvar,
 }
@@ -331,6 +333,7 @@ impl Screen for Noted {
         chart: &bms_model::Chart,
         section: Option<&eval::Section>,
     ) -> Result<(), RenderError> {
+        self.seen.load_gate.pass();
         self.menu.load(chart, section)
     }
     fn prepare_attempt(
@@ -735,6 +738,8 @@ impl Set {
 /// What a run's helper reaches beside the game thread.
 struct Side<'a> {
     seen: &'a Seen,
+    /// The game thread's controls: the decision screen its waits watch.
+    controls: &'a Controls,
     menu: &'a MenuQueue,
     book: &'a Mutex<LabelBook>,
     /// The chart under the cursor, as the library lists it.
@@ -1123,6 +1128,7 @@ fn run_with(
         let controls = rig.controls;
         let side = Side {
             seen: &seen,
+            controls,
             menu: &menu,
             book: &book,
             chart,
@@ -1204,35 +1210,6 @@ fn run_with(
         stamps,
         failure,
         measured,
-    }
-}
-
-/// The rig's frame sink: the decision screens' records, and a scenario's
-/// captures when it has some.
-struct RigSink {
-    decided: DecidedSink,
-    frames: Option<crate::dev::scenario::ScenarioFrames>,
-}
-
-impl crate::render_side::FrameSink for RigSink {
-    fn frame(&mut self, screen: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
-        self.decided.frame(screen, drawn);
-        if let Some(f) = &mut self.frames {
-            f.frame(screen, drawn);
-        }
-    }
-
-    fn finish(&mut self) {
-        if let Some(f) = &mut self.frames {
-            f.finish();
-        }
-    }
-
-    fn decision_left(&mut self, record: &DecisionRecord) {
-        self.decided.decision_left(record);
-        if let Some(f) = &mut self.frames {
-            f.decision_left(record);
-        }
     }
 }
 
@@ -1981,6 +1958,21 @@ fn failed(c: &crate::dev::scenario::Captures, k: u16) -> String {
     }
 }
 
+/// Capture `k` failed already: the render thread drew `next`, so it took
+/// the message that left the decision screen, and the screen's departure
+/// came before that frame.
+#[track_caller]
+fn settled_by_now(c: &crate::dev::scenario::Captures, k: u16, next: &str) {
+    assert!(
+        matches!(
+            state_of(c, k),
+            crate::dev::scenario::CaptureState::Failed(_)
+        ),
+        "not failed when {next} drew: {:?}",
+        state_of(c, k)
+    );
+}
+
 /// A decision skin frame at 300 ms from the choice is captured: the frame
 /// let through at 100 ms is not taken, the one at 300 ms is, its sidecar
 /// naming the skin, the screen's lifetime and the time since the choice.
@@ -2074,7 +2066,8 @@ fn a_built_in_decision_frame_is_captured() {
 }
 
 /// A capture past the decision screen's time fails when the render thread
-/// leaves the screen for the loading state, with frames drawn before it.
+/// leaves the screen for the loading state, with frames drawn before it:
+/// failed once a loading frame is drawn, before the run ends.
 #[test]
 fn a_decision_capture_past_its_screen_fails() {
     let dir = tempfile::tempdir().unwrap();
@@ -2089,6 +2082,7 @@ fn a_decision_capture_past_its_screen_fails() {
         side.prepared();
         side.choose(MenuKey::Enter);
         side.to_loading();
+        settled_by_now(&c, 0, "the loading state");
     });
     assert!(ran.ran.is_ok(), "{:?}", ran.ran);
     let why = failed(&c, 0);
@@ -2301,6 +2295,65 @@ fn a_departure_fails_only_its_own_screen_s_capture() {
     }
 }
 
+/// The deadline reached while the game thread waits for the chart's load
+/// (the render thread held inside it): the wait's own look steps the
+/// screen and reveals the loading state, and the render thread's
+/// departure, when it takes that message after the load, fails the
+/// capture; before it, the capture stands.
+#[test]
+fn a_deadline_inside_a_watched_wait_departs() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = decision_captures(dir.path(), &[600_000]);
+    c.arm(0);
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        captures: Some(c.clone()),
+        ..Opts::default()
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        side.prepared();
+        side.seen.load_gate.hold(true);
+        let chosen = side.hold_clock();
+        side.press(MenuKey::Enter);
+        assert!(
+            wait_until(|| side.seen.load_gate.waiting()),
+            "the chart's load never reached the render thread"
+        );
+        let left = side.decided_count();
+        side.clock.set(TimeUs(chosen.0 + 4_000 * MS));
+        assert!(
+            wait_until(|| side
+                .controls
+                .with_watched(|d| d.is_some_and(game::Decision::stepped))),
+            "the deadline not stepped inside the load's wait"
+        );
+        assert!(
+            matches!(
+                state_of(&c, 0),
+                crate::dev::scenario::CaptureState::Deciding { .. }
+            ),
+            "settled before the render thread left the screen: {:?}",
+            state_of(&c, 0)
+        );
+        assert_eq!(side.decided_count(), left, "left inside the load");
+        side.seen.load_gate.hold(false);
+        let why = failed(&c, 0);
+        assert!(
+            why.contains("its decision screen ended before a frame at 600000 ms"),
+            "{why}"
+        );
+        side.clock.run();
+    });
+    assert!(ran.ran.is_ok(), "{:?}", ran.ran);
+    let r = ran.records.first().expect("the screen left");
+    assert!(
+        ran.stamps.iter().filter(|(l, _)| *l == r.lifetime).count()
+            == usize::try_from(r.skin_frames + r.page_frames + r.ended_frames).unwrap(),
+        "{r:?} {:?}",
+        ran.stamps
+    );
+}
+
 /// The practice page's entry leaves the decision screen: a capture past
 /// its time fails there.
 #[test]
@@ -2321,6 +2374,7 @@ fn the_practice_page_leaves_the_decision_screen() {
         side.seen.until("the practice page", |d| {
             d.iter().any(|d| d.frame == Frame::Page(practice.clone()))
         });
+        settled_by_now(&c, 0, "the practice page");
     });
     assert!(ran.ran.is_ok(), "{:?}", ran.ran);
     let why = failed(&c, 0);

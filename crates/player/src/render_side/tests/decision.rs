@@ -520,6 +520,35 @@ impl crate::render_side::FrameSink for DecidedSink {
     }
 }
 
+/// The rig's frame sink: the decision screens' records, and a scenario's
+/// captures when it has some.
+pub(super) struct RigSink {
+    pub(super) decided: DecidedSink,
+    pub(super) frames: Option<crate::dev::scenario::ScenarioFrames>,
+}
+
+impl crate::render_side::FrameSink for RigSink {
+    fn frame(&mut self, screen: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
+        self.decided.frame(screen, drawn);
+        if let Some(f) = &mut self.frames {
+            f.frame(screen, drawn);
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(f) = &mut self.frames {
+            f.finish();
+        }
+    }
+
+    fn decision_left(&mut self, record: &crate::measure::DecisionRecord) {
+        self.decided.decision_left(record);
+        if let Some(f) = &mut self.frames {
+            f.decision_left(record);
+        }
+    }
+}
+
 impl Decided {
     /// The decision screens left so far.
     pub(super) fn records(&self) -> Vec<crate::measure::DecisionRecord> {
@@ -571,12 +600,29 @@ impl Rig {
     /// [`sized`](Self::sized) on `clock`.
     fn at(dir: &TempDir, size: [u32; 2], clock: input::QpcClock) -> Self {
         let rig = Self::bare_at(crate::warp_turn::take(), size, clock);
+        rig.install(dir, size);
+        rig
+    }
+
+    /// The decision skin of `dir` committed, made at `size`.
+    fn install(&self, dir: &TempDir, size: [u32; 2]) {
         let bundle = {
             let probe = crate::render_common::offscreen(size[0], size[1]);
             decision_bundle_in(&probe, dir.path(), &default_font())
         };
-        let answer = rig.link.select(ScreenKind::Decision, Some(bundle)).wait();
+        let answer = self.link.select(ScreenKind::Decision, Some(bundle)).wait();
         assert_eq!(answer.unwrap(), Preparation::Ready);
+    }
+
+    /// [`on`](Self::on), its frames also given to `captures`' frame sink.
+    fn capturing(
+        dir: &TempDir,
+        clock: input::QpcClock,
+        captures: &crate::dev::scenario::Captures,
+    ) -> Self {
+        let frames = crate::dev::scenario::ScenarioFrames::new(captures.clone());
+        let rig = Self::bare_with(crate::warp_turn::take(), TARGET, clock, Some(frames));
+        rig.install(dir, TARGET);
         rig
     }
 
@@ -589,6 +635,16 @@ impl Rig {
 
     /// [`bare`](Self::bare) whose screens are made at `size`.
     fn bare_at(turn: crate::warp_turn::Turn, size: [u32; 2], clock: input::QpcClock) -> Self {
+        Self::bare_with(turn, size, clock, None)
+    }
+
+    /// [`bare_at`](Self::bare_at), its frames also given to `frames`.
+    fn bare_with(
+        turn: crate::warp_turn::Turn,
+        size: [u32; 2],
+        clock: input::QpcClock,
+        frames: Option<crate::dev::scenario::ScenarioFrames>,
+    ) -> Self {
         let seen = Arc::new(Seen::default());
         let s = Arc::clone(&seen);
         let make: MakeScreen = Box::new(move || {
@@ -607,7 +663,14 @@ impl Rig {
             }) as Box<dyn Screen>)
         });
         let decided = Arc::new(Decided::default());
-        let link = super::spawn_on_with(make, clock, Box::new(DecidedSink(Arc::clone(&decided))));
+        let link = super::spawn_on_with(
+            make,
+            clock,
+            Box::new(RigSink {
+                decided: DecidedSink(Arc::clone(&decided)),
+                frames,
+            }),
+        );
         let extent = Arc::new(Extent::default());
         link.follow(&extent);
         let book = link.label_book();
@@ -2140,6 +2203,68 @@ fn ended_resized_decision_draws_the_page_without_refusal() {
             .all(|s| *s == crate::measure::DecisionDrawnAs::Ended),
         "{stamps:?}"
     );
+}
+
+/// A capture due after the screen's labels went with its lifetime: the
+/// resized screen's frames since (stamped `Ended`) are not taken, though
+/// presented at and past its time, and it fails when the render thread
+/// leaves the screen.
+#[test]
+fn ended_frames_are_not_captured() {
+    use crate::dev::scenario::{Axis, CaptureState, Captures};
+    use crate::measure::DecisionDrawnAs;
+    let dir = skin_dir();
+    let out = tempfile::tempdir().unwrap();
+    let c = Captures::of(vec![(TimeUs(0), out.path().join("0.png"))]);
+    c.set_axis(0, Axis::Decision(TimeUs(1_000_000)));
+    c.arm(0);
+    let clock = input::QpcClock::holdable();
+    let rig = Rig::capturing(&dir, clock, &c);
+    rig.prepared("a", "A");
+    // The game's side: the capture bound at the choice, on the held clock.
+    let origin = clock.hold();
+    c.bind_decision(5, origin);
+    let shown = rig.choose("a", "A", 5);
+    assert_eq!(shown.origin, origin);
+    rig.skin_frames(0, 3);
+    let (slot, generation) = shown.slot.unwrap();
+    rig.extent.publish(1_280, 720);
+    assert!(wait_until(|| lock(&rig.book).current().0 == [1_280, 720]));
+    lock(&rig.book).end(5);
+    assert!(wait_until(|| {
+        lock(&rig.book).state(slot).and_then(LabelState::generation) != Some(generation)
+    }));
+    // Every frame from here is drawn past the capture's time.
+    clock.set(TimeUs(origin.0 + 1_500_000));
+    let from = rig.decided.stamps_of(5).len();
+    assert!(wait_until(|| rig.decided.stamps_of(5).len() >= from + 3));
+    let since = rig.decided.stamps_of(5).split_off(from);
+    assert!(
+        since.iter().all(|s| *s == DecisionDrawnAs::Ended),
+        "{since:?}"
+    );
+    assert!(
+        matches!(c.status(0).unwrap().state, CaptureState::Deciding { .. }),
+        "an ended frame taken: {:?}",
+        c.status(0)
+    );
+    rig.link.exit();
+    clock.run();
+    assert!(wait_until(|| matches!(
+        c.status(0).unwrap().state,
+        CaptureState::Failed(_)
+    )));
+    let CaptureState::Failed(why) = c.status(0).unwrap().state else {
+        panic!("{:?}", c.status(0));
+    };
+    assert_eq!(
+        why,
+        "its decision screen ended before a frame at 1000 ms on its decision axis"
+    );
+    let [r] = rig.decided.records()[..] else {
+        panic!("{:?}", rig.decided.records());
+    };
+    assert!(r.ended_frames >= 3, "{r:?}");
 }
 
 /// R4.5, O8: a decision restore refused on a healthy device stands for
