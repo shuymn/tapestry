@@ -104,6 +104,14 @@ pub(crate) fn replace(path: &Path, text: &str) -> io::Result<()> {
 /// The `.rs` files under [`TAGGED`] that hold a tag, as (path relative to
 /// `root` with `/` separators, contents), in path order.
 pub fn sources(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let mut out = rust_files(root)?;
+    out.retain(|(_, text)| text.contains(TAG));
+    Ok(out)
+}
+
+/// Every `.rs` file under [`TAGGED`], as (path relative to `root` with `/`
+/// separators, contents), in path order.
+pub(crate) fn rust_files(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     let mut dirs = vec![(root.join(TAGGED), TAGGED.to_owned())];
     while let Some((dir, rel)) = dirs.pop() {
@@ -120,9 +128,7 @@ pub fn sources(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
             } else if kind.is_file() && name.ends_with(".rs") {
                 let text = std::fs::read_to_string(entry.path())
                     .with_context(|| format!("cannot read `{path}`"))?;
-                if text.contains(TAG) {
-                    out.push((path, text));
-                }
+                out.push((path, text));
             }
         }
     }

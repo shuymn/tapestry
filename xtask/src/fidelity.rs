@@ -81,14 +81,12 @@ use std::path::Path;
 use anyhow::{Context as _, bail};
 
 use crate::arch::WINDOWS_ONLY_ALLOWED;
-use crate::contract::{check_test, fn_name, is_test, replace};
+use crate::contract::{check_test, fn_name, is_test, replace, rust_files};
 
 /// The ledger, relative to the workspace root.
 pub const LEDGER: &str = "docs/fidelity.toml";
 /// The lint baseline, relative to the workspace root.
 pub const BASELINE: &str = "xtask/fidelity-baseline.txt";
-/// The directory scanned for tags and lint hits.
-const SCANNED: &str = "crates";
 /// The reference executor, which mirrors the source on purpose: its files
 /// are not linted.
 const ORACLES: &[&str] = &[
@@ -151,7 +149,8 @@ pub fn run(manifest: &Path, mode: Mode) -> anyhow::Result<Vec<String>> {
         .context("the workspace manifest has no directory")?;
     let ledger = std::fs::read_to_string(root.join(LEDGER))
         .with_context(|| format!("cannot read {LEDGER}"))?;
-    let sources = sources(root)?;
+    // Every file, whatever tags it holds.
+    let sources = rust_files(root)?;
     let path = root.join(BASELINE);
     let baseline = match std::fs::read_to_string(&path) {
         Ok(text) => Some(text),
@@ -183,33 +182,6 @@ pub fn run(manifest: &Path, mode: Mode) -> anyhow::Result<Vec<String>> {
             Ok(diags)
         }
     }
-}
-
-/// Every `.rs` file under [`SCANNED`], as (path relative to `root` with
-/// `/` separators, contents), in path order.
-pub fn sources(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
-    let mut out = Vec::new();
-    let mut dirs = vec![(root.join(SCANNED), SCANNED.to_owned())];
-    while let Some((dir, rel)) = dirs.pop() {
-        let entries = std::fs::read_dir(&dir).with_context(|| format!("cannot read `{rel}`"))?;
-        for entry in entries {
-            let entry = entry.with_context(|| format!("cannot read `{rel}`"))?;
-            let kind = entry
-                .file_type()
-                .with_context(|| format!("cannot read `{rel}`"))?;
-            let name = entry.file_name().to_string_lossy().into_owned();
-            let path = format!("{rel}/{name}");
-            if kind.is_dir() {
-                dirs.push((entry.path(), path));
-            } else if kind.is_file() && name.ends_with(".rs") {
-                let text = std::fs::read_to_string(entry.path())
-                    .with_context(|| format!("cannot read `{path}`"))?;
-                out.push((path, text));
-            }
-        }
-    }
-    out.sort();
-    Ok(out)
 }
 
 /// The diagnostics of `ledger` and `sources` (path, contents) against the
