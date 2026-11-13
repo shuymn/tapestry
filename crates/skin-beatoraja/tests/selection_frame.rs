@@ -848,6 +848,8 @@ fn settings(
     skin_model::SelectionSettings {
         display_offset_ms,
         system_volume: skin_model::VolumeReading::of_gain(gain),
+        key_volume: skin_model::VolumeReading::of_gain(gain),
+        background_volume: skin_model::VolumeReading::of_gain(gain),
         speed,
         order,
         gauge,
@@ -1391,4 +1393,169 @@ fn a_chart_without_a_best_play_shows_the_sources_empty_values() {
     assert_eq!(drawn.get(&100).map(String::as_str), Some("0"));
     assert_eq!(drawn.get(&80).map(String::as_str), Some("4"));
     assert!((85..=89).all(|id| !drawn.contains_key(&id)), "{drawn:?}");
+}
+
+/// The volumes fixture: numbers 57, 58 and 59 on rows 0 to 2 (y up
+/// `10 · i`), and per channel 17, 18 and 19 a slider (range 100 to the
+/// right, at y 600, 620 and 640) and a graph (100 wide, at y 500, 520 and
+/// 540).
+fn volumes_skin() -> String {
+    const IDS: [i32; 3] = [17, 18, 19];
+    let values: Vec<String> = [57, 58, 59]
+        .iter()
+        .map(|id| format!(r#"{{"id": "n{id}", {DIGITS}, "digit": 5, "ref": {id}}}"#))
+        .collect();
+    let sliders: Vec<String> = IDS
+        .iter()
+        .map(|ty| {
+            format!(
+                r#"{{"id": "vs{ty}", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": {ty}, "angle": 1, "range": 100}}"#
+            )
+        })
+        .collect();
+    let graphs: Vec<String> = IDS
+        .iter()
+        .map(|ty| {
+            format!(
+                r#"{{"id": "vg{ty}", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": {ty}, "angle": 0}}"#
+            )
+        })
+        .collect();
+    let mut dsts: Vec<String> = [57, 58, 59]
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            format!(
+                r#"{{"id": "n{id}", "dst": [{}]}}"#,
+                at(0, 10 * i as i32, 4, 8)
+            )
+        })
+        .collect();
+    for (i, ty) in IDS.iter().enumerate() {
+        let i = i as i32;
+        dsts.push(format!(
+            r#"{{"id": "vs{ty}", "dst": [{}]}}"#,
+            at(0, 600 + 20 * i, 10, 10)
+        ));
+        dsts.push(format!(
+            r#"{{"id": "vg{ty}", "dst": [{}]}}"#,
+            at(0, 500 + 20 * i, 100, 10)
+        ));
+    }
+    let list = song_list(&[&at(0, 900, 300, 40)], &[&at(0, 900, 300, 40)], 0, TITLE);
+    format!(
+        r#""imageset": [{SET}], "text": [{TEXT_T}], "value": [{}], {list},
+           "image": [{}],
+           "slider": [{}],
+           "graph": [{}],
+           "destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}, {}]"#,
+        values.join(","),
+        common::selection::IMAGES,
+        sliders.join(","),
+        graphs.join(","),
+        dsts.join(",")
+    )
+}
+
+/// What the volumes fixture draws: numbers 57 to 59's digits, and each
+/// channel's slider thumb x and graph width, by channel 17 to 19.
+/// Numbers 57 to 59's digits, then the sliders' thumb x and the graphs'
+/// widths, by channel.
+type VolumesFrame = (BTreeMap<i32, String>, [Option<f32>; 3], [Option<f32>; 3]);
+
+fn volumes_frame(s: &mut Sel) -> VolumesFrame {
+    let mut numbers = BTreeMap::new();
+    let (mut sliders, mut graphs) = ([None; 3], [None; 3]);
+    for (t, r) in s.drawn(0) {
+        if let Some(d) = digit_of(t) {
+            let i = ((1072.0 - r[1]) / 10.0) as usize;
+            numbers
+                .entry([57, 58, 59][i])
+                .or_insert_with(String::new)
+                .push(char::from(b'0' + d));
+        } else if t[1] < 8 && (40..48).contains(&t[0]) {
+            // y down: a slider's top at 1080 − 610 − 20 · i, a graph's at
+            // 1080 − 510 − 20 · i.
+            for i in 0..3 {
+                if r[1] == 470.0 - 20.0 * i as f32 {
+                    sliders[i] = Some(r[0]);
+                } else if r[1] == 570.0 - 20.0 * i as f32 {
+                    graphs[i] = Some(r[2]);
+                }
+            }
+        }
+    }
+    (numbers, sliders, graphs)
+}
+
+/// Numbers 57, 58 and 59 show the system, key and background volume's
+/// `(int)(gain · 100f)`, truncated, and sliders and graphs 17, 18 and 19
+/// each that channel's exact ratio, through the production path; a change
+/// of one channel moves only its own number, slider and graph.
+#[test]
+fn each_volume_draws_on_its_own_number_slider_and_graph() {
+    let d = folder(&volumes_skin());
+    let i = import_selection(d.path()).unwrap();
+    let unavailable: Vec<i32> = common::kinds(&i.report)
+        .into_iter()
+        .filter_map(|k| match k {
+            skin_beatoraja::NoteKind::Unavailable { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(unavailable, Vec::<i32>::new());
+    let mut s = Sel::new(i.skin);
+    s.view(&view(vec![chart("a")], Some(0), None, None));
+    let volumes = |system: f32, key: f32, background: f32| skin_model::SelectionSettings {
+        system_volume: skin_model::VolumeReading::of_gain(system),
+        key_volume: skin_model::VolumeReading::of_gain(key),
+        background_volume: skin_model::VolumeReading::of_gain(background),
+        ..settings(
+            0,
+            1.0,
+            skin_model::SpeedView::Classic,
+            skin_model::SelectionOrder::Title,
+            None,
+            [false; 3],
+        )
+    };
+    // A gain's exact ratio as the bars draw it: 100 of travel or width.
+    let x = |gain: f32| (100.0 * f64::from(gain)) as f32;
+    let close = |got: [Option<f32>; 3], want: [f32; 3]| {
+        got.iter()
+            .zip(want)
+            .all(|(g, w)| g.is_some_and(|g| (g - w).abs() < 1e-3))
+    };
+    s.skin
+        .update_selection_settings(&mut s.sel, &volumes(0.45, 0.2, 0.999))
+        .unwrap();
+    let (numbers, sliders, graphs) = volumes_frame(&mut s);
+    assert_eq!(
+        numbers,
+        BTreeMap::from([
+            (57, "45".to_owned()),
+            (58, "20".to_owned()),
+            (59, "99".to_owned()),
+        ])
+    );
+    let want = [x(0.45), x(0.2), x(0.999)];
+    assert!(close(sliders, want), "{sliders:?} {want:?}");
+    assert!(close(graphs, want), "{graphs:?} {want:?}");
+
+    // The key volume alone at unity.
+    s.skin
+        .update_selection_settings(&mut s.sel, &volumes(0.45, 1.0, 0.999))
+        .unwrap();
+    let (numbers, sliders, graphs) = volumes_frame(&mut s);
+    assert_eq!(
+        numbers,
+        BTreeMap::from([
+            (57, "45".to_owned()),
+            (58, "100".to_owned()),
+            (59, "99".to_owned()),
+        ])
+    );
+    let want = [x(0.45), 100.0, x(0.999)];
+    assert!(close(sliders, want), "{sliders:?} {want:?}");
+    assert!(close(graphs, want), "{graphs:?} {want:?}");
 }

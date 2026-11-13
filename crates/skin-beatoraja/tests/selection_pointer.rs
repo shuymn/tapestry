@@ -294,10 +294,23 @@ fn a_song_list_part_keeps_no_mouse_rect() {
     }
 }
 
-/// P7: a system volume slider drawn over the third row is imported with
-/// no note and takes a press at its centre as a slider.
+/// P7: each volume slider, 17, 18 and 19, drawn over the third row is
+/// imported with no note and takes a press at its centre as a slider of
+/// its own channel.
 #[test]
 fn a_volume_slider_over_a_row_is_hit_first() {
+    for (ty, source) in [
+        (17, RatioSource::SystemVolume),
+        (18, RatioSource::KeyVolume),
+        (19, RatioSource::BackgroundVolume),
+    ] {
+        volume_slider_over_a_row(ty, source);
+    }
+}
+
+/// [`a_volume_slider_over_a_row_is_hit_first`] for slider `ty`, whose
+/// source is `source`.
+fn volume_slider_over_a_row(ty: i32, source: RatioSource) {
     let place = |top: i32| {
         format!(
             r#"{{"x": 100, "y": {}, "w": 300, "h": 40}}"#,
@@ -313,7 +326,7 @@ fn a_volume_slider_over_a_row_is_hit_first() {
         &format!("{TITLE}, \"clickable\": [0, 1, 2]"),
     );
     let d = folder(&format!(
-        r#""slider": [{{"id": "vol", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": 17, "angle": 1, "range": 200}}],
+        r#""slider": [{{"id": "vol", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": {ty}, "angle": 1, "range": 200}}],
            "imageset": [{SET}], "text": [{TEXT_T}], {list},
            "destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}{}]"#,
         dst("vol", [100, 300, 40, 40], ""),
@@ -327,7 +340,7 @@ fn a_volume_slider_over_a_row_is_hit_first() {
                 ..
             }
         )),
-        "{:?}",
+        "{ty}: {:?}",
         i.report.notes
     );
     let mut s = Sel::new(i.skin);
@@ -336,7 +349,9 @@ fn a_volume_slider_over_a_row_is_hit_first() {
             &mut s.sel,
             &skin_model::SelectionSettings {
                 display_offset_ms: 0,
-                system_volume: skin_model::VolumeReading::of_gain(0.5),
+                system_volume: skin_model::VolumeReading::of_gain(0.45),
+                key_volume: skin_model::VolumeReading::of_gain(0.2),
+                background_volume: skin_model::VolumeReading::of_gain(0.999),
                 speed: skin_model::SpeedView::Classic,
                 order: skin_model::SelectionOrder::Title,
                 gauge: None,
@@ -361,8 +376,8 @@ fn a_volume_slider_over_a_row_is_hit_first() {
         "{drawn:?}"
     );
     match hit(&s, [120.0, 320.0], Button::Left) {
-        Some(PointerHit::Slider(c)) => assert_eq!(c.source, RatioSource::SystemVolume),
-        other => panic!("{other:?}"),
+        Some(PointerHit::Slider(c)) => assert_eq!(c.source, source, "{ty}"),
+        other => panic!("{ty}: {other:?}"),
     }
     // Past its travel (200 to the right), the third row.
     assert_eq!(

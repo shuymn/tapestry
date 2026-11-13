@@ -158,9 +158,10 @@ impl SelectionEvents {
     }
 }
 
-/// `s` with the system volume that plays and the display offset as
+/// `s` with the three volumes that play and the display offset as
 /// `tuning` holds them now: what a selection frame shows of the settings
-/// keys (F5 and F6) and the system volume, read on the render thread. Allocates nothing.
+/// keys (F3 to F6) and the system volume, read on the render thread.
+/// Allocates nothing.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 #[must_use]
 pub fn live_settings(s: &SelectionSettings, tuning: &LiveTuning) -> SelectionSettings {
@@ -172,6 +173,8 @@ pub fn live_settings(s: &SelectionSettings, tuning: &LiveTuning) -> SelectionSet
             i32::MAX
         }),
         system_volume: VolumeReading::of_gain(tuning.volume(Channel::System)),
+        key_volume: VolumeReading::of_gain(tuning.volume(Channel::Key)),
+        background_volume: VolumeReading::of_gain(tuning.volume(Channel::Background)),
         ..*s
     }
 }
@@ -180,8 +183,8 @@ pub fn live_settings(s: &SelectionSettings, tuning: &LiveTuning) -> SelectionSet
 /// (docs/stage3.md §3, Selection): the play options in force (`options`,
 /// none before any), the chosen `preset`'s gauge shown for the settings'
 /// `gauge` as an attempt resolves it and its press assignment, the
-/// failure handling `on_failure`, the list's `order`, and the volume and
-/// the display offset `tuning` holds now.
+/// failure handling `on_failure`, the list's `order`, and the three
+/// volumes and the display offset `tuning` holds now.
 pub fn settings_of(
     options: Option<game::PlayOptions>,
     preset: Option<&rules::RulePreset>,
@@ -217,6 +220,8 @@ pub fn settings_of(
     let s = SelectionSettings {
         display_offset_ms: 0,
         system_volume: VolumeReading::of_gain(0.0),
+        key_volume: VolumeReading::of_gain(0.0),
+        background_volume: VolumeReading::of_gain(0.0),
         speed,
         order,
         gauge,
@@ -597,11 +602,13 @@ fn fixture_slots() -> String {
 /// sliding right 1 000 from 100, 900, 20×40 (its travel x 100 to 1 100,
 /// y 900 to 940); event 13 over that travel at 500, 905, 40×30; events 13,
 /// 331 and 340 over slot 4 at 1300, 1400 and 1500, top 510, each 60×40;
-/// events 330 and 332 at 100, 500 and 100, 600, each 100×50; slider 17 (the system volume) sliding right 200 from 1050, 610, 20×40
-/// (over slot 5, its travel x 1 050 to 1 250); and an image at 100, 1000,
-/// 179×37 drawn only while the pointer is inside its region, by a
-/// `mouseRect` {0, 0, 179, 37} as a hover button's. Without `volume`,
-/// slider 17 is not drawn.
+/// events 330 and 332 at 100, 500 and 100, 600, each 100×50; the volume
+/// sliders, each sliding right 200, 20×40: 17 (the system volume) from
+/// 1050, 610 and 19 (the background volume) from 1400, 620, both over
+/// slot 5, and 18 (the key volume) from 1050, 520, over slot 4; and an
+/// image at 100, 1000, 179×37 drawn only while the pointer is inside its
+/// region, by a `mouseRect` {0, 0, 179, 37} as a hover button's. Without
+/// `volume`, no volume slider is drawn.
 #[cfg(test)]
 #[cfg(feature = "dev-tools")]
 pub(crate) fn pointer_fixture(volume: bool) -> tempfile::TempDir {
@@ -676,7 +683,12 @@ pub(crate) fn pointer_fixture_with(volume: bool, holes: bool) -> tempfile::TempD
         dst("a330", [100, 500, 100, 50], ""),
         dst("a332", [100, 600, 100, 50], ""),
         if volume {
-            dst("vol", [1_050, 610, 20, 40], "")
+            [
+                dst("vol", [1_050, 610, 20, 40], ""),
+                dst("vol18", [1_050, 520, 20, 40], ""),
+                dst("vol19", [1_400, 620, 20, 40], ""),
+            ]
+            .concat()
         } else {
             String::new()
         },
@@ -694,7 +706,9 @@ pub(crate) fn pointer_fixture_with(volume: bool, holes: bool) -> tempfile::TempD
             "image": [{{"id": "b", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8}}{images}],
             "imageset": [{sets}],
             "slider": [{{"id": "ls", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "type": 1, "angle": 1, "range": 1000}},
-                       {{"id": "vol", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "type": 17, "angle": 1, "range": 200, "changeable": true}}],
+                       {{"id": "vol", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "type": 17, "angle": 1, "range": 200, "changeable": true}},
+                       {{"id": "vol18", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "type": 18, "angle": 1, "range": 200, "changeable": true}},
+                       {{"id": "vol19", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "type": 19, "angle": 1, "range": 200, "changeable": true}}],
             "text": [{{"id": "t", "font": "f", "size": 30, "ref": 10}},
                      {{"id": "q", "font": "f", "size": 30, "ref": 30, "align": 2}},
                      {{"id": "q2", "font": "f", "size": 30, "ref": 30}}],
@@ -909,6 +923,9 @@ mod tests {
             // 53 % plays as the f32 0.53, which the source shows as 52.
             assert_eq!(s.system_volume, VolumeReading::of_gain(0.53));
             assert_eq!(s.system_volume.number, 52);
+            // The key and background volumes, each its own (20 % and 99 %).
+            assert_eq!(s.key_volume, VolumeReading::of_gain(0.2));
+            assert_eq!(s.background_volume, VolumeReading::of_gain(0.99));
             assert!(!s.play_to_end);
             assert_eq!(s.assignment, Some(rules::Assignment::NearestTiesEarlier));
         }

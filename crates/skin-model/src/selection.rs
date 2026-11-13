@@ -181,6 +181,10 @@ pub struct SelectionSettings {
     pub display_offset_ms: i32,
     /// The system volume that plays.
     pub system_volume: VolumeReading,
+    /// The key volume that plays.
+    pub key_volume: VolumeReading,
+    /// The background volume that plays.
+    pub background_volume: VolumeReading,
     pub speed: SpeedView,
     pub order: SelectionOrder,
     /// The chosen preset's displayed gauge's look; `None` without a

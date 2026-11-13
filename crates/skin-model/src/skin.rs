@@ -5120,6 +5120,12 @@ impl Skin {
                             (RatioSource::SystemVolume, Phase::Selection { sel, .. }) => {
                                 sel.system_volume
                             }
+                            (RatioSource::KeyVolume, Phase::Selection { sel, .. }) => {
+                                sel.key_volume
+                            }
+                            (RatioSource::BackgroundVolume, Phase::Selection { sel, .. }) => {
+                                sel.background_volume
+                            }
                             (RatioSource::Score(r), Phase::Play { play, .. }) => {
                                 play.score_ratio(r)
                             }

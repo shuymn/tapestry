@@ -132,8 +132,11 @@ pub struct Selection {
     /// (`FloatPropertyFactory.java:155-176`, `:308` at `0.8.9`); `None`
     /// without a summary or with no notes.
     pub(crate) combo_rate: Option<Ratio>,
-    /// The system volume, as of the last settings; `None` before any.
+    /// The system, key and background volumes, as of the last settings;
+    /// `None` before any.
     pub(crate) system_volume: Option<Ratio>,
+    pub(crate) key_volume: Option<Ratio>,
+    pub(crate) background_volume: Option<Ratio>,
     /// Per pointer target in draw order (each changeable slider, action
     /// element, search text and song list element): as the last build
     /// drew it, `None` when it did not draw.
@@ -185,6 +188,8 @@ impl Selection {
             judge_rates: [None; 5],
             combo_rate: None,
             system_volume: None,
+            key_volume: None,
+            background_volume: None,
             targets: vec![Cell::new(None); targets].into_boxed_slice(),
             row_hits: vec![Cell::new(None); row_hits].into_boxed_slice(),
             search: vec![Cell::new(None); search].into_boxed_slice(),
@@ -389,7 +394,7 @@ impl Selection {
         }
     }
 
-    /// Fills the settings' fields and the system volume's ratio from `s`,
+    /// Fills the settings' fields and the three volumes' ratios from `s`,
     /// leaving the view's as they are. Allocates nothing.
     pub(crate) fn settings(&mut self, s: &SelectionSettings) {
         let mut set = |slot: u16, v: i32| {
@@ -453,7 +458,17 @@ impl Selection {
                 None => -1,
             },
         );
+        set(
+            field::SETTINGS_VOLUME_KEY,
+            s.key_volume.number.clamp(0, 100),
+        );
+        set(
+            field::SETTINGS_VOLUME_BACKGROUND,
+            s.background_volume.number.clamp(0, 100),
+        );
         self.system_volume = Some(s.system_volume.ratio);
+        self.key_volume = Some(s.key_volume.ratio);
+        self.background_volume = Some(s.background_volume.ratio);
     }
 
     /// Fills this frame's application readouts from `app`, then its
