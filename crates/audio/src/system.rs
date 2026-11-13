@@ -48,6 +48,11 @@ pub const SYSTEM_RETURNS: usize = 3;
 /// The kinds a generation can hold.
 pub const SYSTEM_KINDS: usize = 13;
 
+/// Whether a start numbered `seq` of `kind` falls below its kind's stop.
+fn stopped(stops: &[u64; SYSTEM_KINDS], kind: SystemKind, seq: u64) -> bool {
+    stops.get(kind.index()).is_some_and(|&word| seq < word)
+}
+
 /// A kind of system sound: the source's sound files of selection, the
 /// decision, the ready and closing sounds, and the result's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -234,8 +239,7 @@ impl SystemGeneration {
     /// The sound `kind` plays, if it has one.
     #[must_use]
     pub fn sound(&self, kind: SystemKind) -> Option<&Arc<Sound>> {
-        let at = (*self.kinds.get(kind.index())?)?;
-        self.sounds.get(usize::from(at))
+        self.sounds.get(usize::from(self.index(kind)?))
     }
 
     fn index(&self, kind: SystemKind) -> Option<u8> {
@@ -622,14 +626,12 @@ impl SystemVoices {
     /// Ends every voice, and discards the waiting loop, started below its
     /// kind's stop.
     fn stop_below(&mut self, stops: &[u64; SYSTEM_KINDS]) {
-        let below =
-            |kind: SystemKind, seq: u64| stops.get(kind.index()).is_some_and(|&word| seq < word);
         for v in self.voices.iter_mut().filter(|v| v.active) {
-            if below(v.kind, v.seq) {
+            if stopped(stops, v.kind, v.seq) {
                 v.active = false;
             }
         }
-        if self.pending.is_some_and(|p| below(p.kind, p.seq)) {
+        if self.pending.is_some_and(|p| stopped(stops, p.kind, p.seq)) {
             self.pending = None;
         }
     }
@@ -697,7 +699,7 @@ impl SystemVoices {
             self.refused += 1;
             return;
         }
-        if stops.get(s.kind.index()).is_some_and(|&word| s.seq < word) {
+        if stopped(stops, s.kind, s.seq) {
             return;
         }
         let current = self.current();

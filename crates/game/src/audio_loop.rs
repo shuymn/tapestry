@@ -1368,11 +1368,10 @@ impl AudioControl {
             None if generation.is_empty() => TERMINAL,
             None => return Err(SystemInstallError::Exhausted(generation)),
         };
-        match self.system_installs.push(SystemInstall { generation, seq }) {
-            Ok(()) => {}
-            Err(rtrb::PushError::Full(install)) => {
-                return Err(SystemInstallError::Full(install.generation));
-            }
+        if let Err(rtrb::PushError::Full(install)) =
+            self.system_installs.push(SystemInstall { generation, seq })
+        {
+            return Err(SystemInstallError::Full(install.generation));
         }
         self.system_held += 1;
         self.shared.system_published.store(seq, Ordering::Release);
