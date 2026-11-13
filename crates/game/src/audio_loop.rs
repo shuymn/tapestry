@@ -384,9 +384,9 @@ impl AudioCounters {
     }
 
     /// System sound starts refused since the engine started: a full start
-    /// ring or an exhausted sequence on the requesting side, a full voice
-    /// pool, and every start or tone request after the output failed on
-    /// the audio thread.
+    /// ring or an exhausted sequence on the requesting side, a full
+    /// one-shot part or a sounding reserved voice, and every start or tone
+    /// request after the output failed on the audio thread.
     #[must_use]
     pub fn system_refused(&self) -> u64 {
         self.0.system_refused.load(Ordering::Acquire)
