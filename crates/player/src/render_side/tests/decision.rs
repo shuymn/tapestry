@@ -442,7 +442,7 @@ impl Rig {
 
     /// [`sized`](Self::sized) on `clock`.
     fn at(dir: &TempDir, size: [u32; 2], clock: input::QpcClock) -> Self {
-        let rig = Self::bare_at(size, clock);
+        let rig = Self::bare_at(crate::warp_turn::take(), size, clock);
         let bundle = {
             let probe = crate::render_common::offscreen(size[0], size[1]);
             decision_bundle_in(&probe, dir.path(), &default_font())
@@ -452,14 +452,15 @@ impl Rig {
         rig
     }
 
-    /// A render thread on [`Recorder`]s on `clock`, nothing committed.
-    fn bare(clock: input::QpcClock) -> Self {
-        Self::bare_at(TARGET, clock)
+    /// A render thread on [`Recorder`]s on `clock`, nothing committed,
+    /// holding `turn`, WARP's turn the caller took (before
+    /// `crate::imports::tests::serial` when it takes both).
+    fn bare(turn: crate::warp_turn::Turn, clock: input::QpcClock) -> Self {
+        Self::bare_at(turn, TARGET, clock)
     }
 
     /// [`bare`](Self::bare) whose screens are made at `size`.
-    fn bare_at(size: [u32; 2], clock: input::QpcClock) -> Self {
-        let turn = crate::warp_turn::take();
+    fn bare_at(turn: crate::warp_turn::Turn, size: [u32; 2], clock: input::QpcClock) -> Self {
         let seen = Arc::new(Seen::default());
         let s = Arc::clone(&seen);
         let make: MakeScreen = Box::new(move || {

@@ -700,16 +700,19 @@ fn lua_skin_dir() -> TempDir {
 #[test]
 fn decision_skin_json_and_lua_draw_through_production() {
     use crate::render_outline::{Value, decision_folder, text, ttf};
-    // The Lua skin's VMs count, and are held, with the hooks' tests'.
-    let _serial = crate::imports::tests::serial();
+    // Each flow holds WARP's turn, then the import serial lock (the Lua
+    // skin's VMs count, and are held, with the hooks' tests'), in the
+    // order `warp_turn` documents.
+    let held = || (crate::warp_turn::take(), crate::imports::tests::serial());
     let json = listed();
     let lua = lua_skin_dir();
     for (dir, entry) in [(&json, "s.json"), (&lua, "s.luaskin")] {
         let choice = crate::imports::tests::choice(dir.path(), entry);
         let started = std::cell::RefCell::new(None);
+        let (turn, _serial) = held();
         flow_with(
             |clock| {
-                let rig = Rig::bare(clock);
+                let rig = Rig::bare(turn, clock);
                 *started.borrow_mut() = Some(configured(&rig, &choice));
                 rig
             },
@@ -757,9 +760,10 @@ fn decision_skin_json_and_lua_draw_through_production() {
         ],
     );
     let choice = crate::imports::tests::choice(misfit.path(), "s.json");
+    let (turn, _serial) = held();
     flow_with(
         |clock| {
-            let rig = Rig::bare(clock);
+            let rig = Rig::bare(turn, clock);
             let started = configured(&rig, &choice);
             assert_eq!(started.notice, None);
             rig
