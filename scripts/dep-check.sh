@@ -17,33 +17,59 @@ tries=3
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
 
-# Each reads the status and the log of the last try.
+# Each reads the status and the log of the last try and returns 0 for an
+# index failure, 1 for anything else, and 2 when the log could not be read
+# (which fails the check: an unreadable log proves nothing).
 # cargo-deny with `--deny index-failure` reports each crate it could not look
 # up as `error[index-failure]: unable to check for yanked crates` and exits 1
 # (only the advisories check failed). Any other error diagnostic, a fatal
 # `[ERROR]` log line, or another exit code is a real failure.
 deny_index_failure() {
-  local lines others
+  local lines others found=0
   [ "$status" -eq 1 ] || return 1
-  lines=$(sed 's/\x1b\[[0-9;]*m//g' "$log")
-  grep -q '^error\[index-failure\]: ' <<<"$lines" || return 1
+  lines=$(sed 's/\x1b\[[0-9;]*m//g' "$log") || return 2
+  grep -q '^error\[index-failure\]: ' <<<"$lines" || found=$?
+  [ "$found" -le 1 ] || return 2
+  [ "$found" -eq 0 ] || return 1
   others=$(grep -E '^(error|bug)(\[[a-z-]+\])?: |\[ERROR\]' <<<"$lines" |
-    grep -v '^error\[index-failure\]: ' || true)
+    grep -v '^error\[index-failure\]: ') || found=$?
+  [ "$found" -le 1 ] || return 2
   [ -z "$others" ]
 }
 
 # cargo-audit only logs index failures on stderr and still exits 0, so a
 # nonzero exit is always a real failure.
 audit_index_failure() {
+  local found=0
   [ "$status" -eq 0 ] || return 1
-  grep -qE "couldn't (update|open) crates.io index|couldn't check if the package is yanked" "$log"
+  grep -qE "couldn't (update|open) crates.io index|couldn't check if the package is yanked" "$log" || found=$?
+  [ "$found" -le 1 ] || return 2
+  return "$found"
 }
 
-for try in $(seq "$tries"); do
-  status=0
+for ((try = 1; try <= tries; try++)); do
   # stderr goes to the log (and on to the job's stderr); stdout stays as is.
-  { mise exec -- cargo "$tool" "$@" 2>&1 1>&3 | tee "$log" >&2; } 3>&1 || status=$?
-  "${tool}_index_failure" || exit "$status"
+  # The checker's own status decides; a log `tee` could not write fails the
+  # check rather than being read.
+  set +e
+  { mise exec -- cargo "$tool" "$@" 2>&1 1>&3 | tee "$log" >&2; } 3>&1
+  codes=("${PIPESTATUS[@]}")
+  set -e
+  status=${codes[0]}
+  if [ "${codes[1]:-1}" -ne 0 ]; then
+    echo "cargo $tool: its output could not be logged" >&2
+    exit 1
+  fi
+  kind=0
+  "${tool}_index_failure" || kind=$?
+  case $kind in
+    0) ;;
+    1) exit "$status" ;;
+    *)
+      echo "cargo $tool: its log could not be read" >&2
+      exit 1
+      ;;
+  esac
   if [ "$try" -eq "$tries" ]; then
     echo "cargo $tool could not read the registry index $tries times" >&2
     exit 1
