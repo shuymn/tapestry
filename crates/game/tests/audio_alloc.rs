@@ -227,6 +227,87 @@ fn audio_loop_neither_allocates_nor_frees_across_retries() {
         let back: Vec<_> = std::iter::from_fn(|| control.take_system_return()).collect();
         assert_eq!(back.len(), 2, "both left in the return ring");
     }
+    // The return ring's room bounds the installs: with the generations not
+    // taken back at three, a pick's install is refused, and the empty
+    // install, admitted as the fourth, fills the ring; then both are
+    // refused until the game thread takes the returns, and each one taken
+    // frees one place. The audio steps neither allocate nor free, and
+    // every generation handed over comes back.
+    {
+        use audio::{GenId, SystemGeneration, SystemKind};
+        use game::SystemInstallError;
+
+        let engine =
+            AudioEngine::new(bank(&chart), &chart.bgm, RATE, PERIOD, MAX_VOICES, 0).unwrap();
+        let (mut control, mut worker) = audio_control(engine);
+        let sound = std::sync::Arc::new(audio::Sound::mono(vec![500; 480]));
+        let pick = |control: &game::AudioControl| {
+            let id = GenId(control.system_seq().unwrap());
+            SystemGeneration::new(id, RATE).with(SystemKind::Scratch, std::sync::Arc::clone(&sound))
+        };
+        let empty = |control: &game::AudioControl| {
+            SystemGeneration::empty(GenId(control.system_seq().unwrap()))
+        };
+        let mut handed = Vec::new();
+        let mut back = Vec::with_capacity(16);
+        let drain = |control: &mut game::AudioControl, back: &mut Vec<SystemGeneration>| {
+            let before = back.len();
+            while let Some(g) = control.take_system_return() {
+                back.push(g);
+            }
+            back.len() - before
+        };
+        let mut admit = |control: &mut game::AudioControl, g: SystemGeneration| {
+            let id = g.id();
+            if let Err(e) = control.install_system(g) {
+                panic!("{id:?} refused with room in the return ring: {e}");
+            }
+            handed.push(id);
+            id
+        };
+        let refused = |control: &mut game::AudioControl, g: SystemGeneration| {
+            let id = g.id();
+            match control.install_system(g) {
+                Err(SystemInstallError::Unreturned(g)) => assert_eq!(g.id(), id),
+                other => panic!("{id:?} admitted past the return ring: {other:?}"),
+            }
+        };
+        for _ in 0..3 {
+            let g = pick(&control);
+            admit(&mut control, g);
+            steps(&mut worker, 2);
+        }
+        let g = pick(&control);
+        refused(&mut control, g);
+        let e = empty(&control);
+        let e = admit(&mut control, e);
+        steps(&mut worker, 2);
+        assert_eq!(control.system_installed(), Some(e));
+        let (g, e2) = (pick(&control), empty(&control));
+        refused(&mut control, g);
+        refused(&mut control, e2);
+        steps(&mut worker, 50);
+        assert_eq!(drain(&mut control, &mut back), 3, "the ring held three");
+        assert_eq!(drain(&mut control, &mut back), 0);
+        let (g, g2, g3) = (pick(&control), pick(&control), pick(&control));
+        admit(&mut control, g);
+        steps(&mut worker, 2);
+        admit(&mut control, g2);
+        steps(&mut worker, 2);
+        refused(&mut control, g3);
+        assert_eq!(drain(&mut control, &mut back), 2);
+        let e2 = empty(&control);
+        let e2 = admit(&mut control, e2);
+        steps(&mut worker, 2);
+        assert_eq!(drain(&mut control, &mut back), 1);
+        assert_eq!(control.system_installed(), Some(e2));
+        assert_eq!(control.counters().system_install_waits(), 0);
+        assert_eq!(counting::calls(), 0, "the system steps allocated or freed");
+        let mut returned: Vec<GenId> = back.iter().map(SystemGeneration::id).collect();
+        returned.push(e2);
+        returned.sort();
+        assert_eq!(returned, handed, "every generation handed over came back");
+    }
     // Three gated practice attempts with one rearm each, the game thread
     // taking back none of the restores the rearms replace: the first fills
     // the return queue, the second's waits on the audio thread, and the

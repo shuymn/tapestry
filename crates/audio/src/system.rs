@@ -9,8 +9,11 @@
 //! step from a [`SystemSnapshot`] of those rings and words, in sequence order
 //! up to the snapshot's cutoff, so a start never overtakes an install
 //! numbered below it. A replaced generation is retired while a voice still
-//! plays from it and goes back through the return ring once it is silent:
-//! nothing here allocates or frees after [`SystemVoices::new`].
+//! plays from it and goes back through the return ring once it is silent.
+//! A generation leaves its place only into a return slot reserved first: an
+//! install or a sweep that finds no room waits for a later step, so every
+//! generation stays owned. Nothing here allocates or frees after
+//! [`SystemVoices::new`].
 //!
 //! System voices and the tone are summed onto the chart's output at the
 //! system volume and the sum is clamped once ([`SystemVoices::mix_into`]);
@@ -20,7 +23,8 @@
 
 use std::sync::Arc;
 
-use rtrb::{Consumer, Producer, PushError};
+use rtrb::chunks::WriteChunkUninit;
+use rtrb::{Consumer, Producer};
 
 use crate::CHANNELS;
 use crate::bank::Sound;
@@ -36,10 +40,18 @@ pub const SYSTEM_STARTS: usize = 64;
 pub const SYSTEM_INSTALLS: usize = 2;
 /// Entries of the return ring: the retired generation and the current one
 /// at an empty install, plus the one an install held behind a taken
-/// retired slot adds.
+/// retired slot adds. The requesting side hands over at most this many
+/// generations it has not taken back, and one more for the empty install:
+/// the current one never waits in the ring, so the ring always has room
+/// for the rest.
 pub const SYSTEM_RETURNS: usize = 3;
 /// The kinds a generation can hold.
 pub const SYSTEM_KINDS: usize = 13;
+
+/// Whether a start numbered `seq` of `kind` falls below its kind's stop.
+fn stopped(stops: &[u64; SYSTEM_KINDS], kind: SystemKind, seq: u64) -> bool {
+    stops.get(kind.index()).is_some_and(|&word| seq < word)
+}
 
 /// A kind of system sound: the source's sound files of selection, the
 /// decision, the ready and closing sounds, and the result's.
@@ -227,8 +239,7 @@ impl SystemGeneration {
     /// The sound `kind` plays, if it has one.
     #[must_use]
     pub fn sound(&self, kind: SystemKind) -> Option<&Arc<Sound>> {
-        let at = (*self.kinds.get(kind.index())?)?;
-        self.sounds.get(usize::from(at))
+        self.sounds.get(usize::from(self.index(kind)?))
     }
 
     fn index(&self, kind: SystemKind) -> Option<u8> {
@@ -299,7 +310,8 @@ pub struct ApplyReport {
     /// Starts it took from the ring.
     pub taken: u32,
     /// Whether its merge ended at an install that found the retired slot
-    /// taken: that install and every request above it stay queued.
+    /// taken, or no room in the return ring for what it sends back: that
+    /// install and every request above it stay queued.
     pub blocked: bool,
     /// Whether it started the tone.
     pub tone: bool,
@@ -425,8 +437,24 @@ pub struct SystemVoices {
     failed: bool,
     /// Starts refused: a full pool, or after the failure.
     refused: u64,
-    /// Steps whose merge ended at an install the taken retired slot held.
+    /// Steps whose merge ended at an install the taken retired slot or a
+    /// full return ring held.
     install_waits: u64,
+}
+
+/// What an install sends back: the old current unless it retires, and, at
+/// an empty install, the retired one too.
+#[derive(Clone, Copy, Debug)]
+struct SendsBack {
+    current: bool,
+    retired: bool,
+}
+
+impl SendsBack {
+    /// The return slots it takes.
+    fn slots(self) -> usize {
+        usize::from(self.current) + usize::from(self.retired)
+    }
 }
 
 impl SystemVoices {
@@ -489,7 +517,7 @@ impl SystemVoices {
     }
 
     /// Steps so far whose merge ended at an install the taken retired slot
-    /// held.
+    /// or a full return ring held.
     #[must_use]
     pub const fn install_waits(&self) -> u64 {
         self.install_waits
@@ -509,10 +537,11 @@ impl SystemVoices {
     /// generation; then the starts and installs numbered up to the cutoff
     /// apply in number order, each start against the generation current
     /// at its place, until an install that finds the retired slot taken,
-    /// which stays queued with everything above it. A tone request starts
-    /// the tone after the step's installs, or waits, held, behind a
-    /// blocked install. A replaced generation retires while a voice plays
-    /// from it and otherwise goes to `returns` at once.
+    /// or too few free slots in `returns` for what it sends back, which
+    /// stays queued with everything above it. A tone request starts the
+    /// tone after the step's installs, or waits, held, behind a blocked
+    /// install. A replaced generation retires while a voice plays from it
+    /// and otherwise goes to `returns` at once.
     pub fn apply(
         &mut self,
         snap: &SystemSnapshot,
@@ -597,14 +626,12 @@ impl SystemVoices {
     /// Ends every voice, and discards the waiting loop, started below its
     /// kind's stop.
     fn stop_below(&mut self, stops: &[u64; SYSTEM_KINDS]) {
-        let below =
-            |kind: SystemKind, seq: u64| stops.get(kind.index()).is_some_and(|&word| seq < word);
         for v in self.voices.iter_mut().filter(|v| v.active) {
-            if below(v.kind, v.seq) {
+            if stopped(stops, v.kind, v.seq) {
                 v.active = false;
             }
         }
-        if self.pending.is_some_and(|p| below(p.kind, p.seq)) {
+        if self.pending.is_some_and(|p| stopped(stops, p.kind, p.seq)) {
             self.pending = None;
         }
     }
@@ -649,12 +676,16 @@ impl SystemVoices {
                     if held_at == Some(seq) || (!empty && self.retired.is_some()) {
                         return true;
                     }
+                    let back = self.sends_back(empty);
+                    let Ok(room) = returns.write_chunk_uninit(back.slots()) else {
+                        return true;
+                    };
                     let Ok(install) = installs.pop() else {
                         return false;
                     };
                     installs_left -= 1;
                     report.installed = Some(install.generation.id());
-                    self.install(install.generation, returns);
+                    self.install(install.generation, back, room);
                 }
                 // Nothing left up to the cutoff.
                 _ => return false,
@@ -668,7 +699,7 @@ impl SystemVoices {
             self.refused += 1;
             return;
         }
-        if stops.get(s.kind.index()).is_some_and(|&word| s.seq < word) {
+        if stopped(stops, s.kind, s.seq) {
             return;
         }
         let current = self.current();
@@ -713,35 +744,52 @@ impl SystemVoices {
         self.voices.iter().any(|v| v.active && v.generation == id)
     }
 
-    /// `generation` becomes current. The empty generation sends the old current
-    /// and the retired one back; otherwise the old current retires while a
-    /// voice plays from it. A loop waiting for `generation` starts; one for an
-    /// earlier generation is discarded.
-    fn install(&mut self, generation: SystemGeneration, returns: &mut Producer<SystemGeneration>) {
-        let id = generation.id();
-        let old = self.current.replace(generation);
-        if self
+    /// What an install, empty or not, would send back now: the empty
+    /// generation sends the old current and the retired one; otherwise the
+    /// old current retires while a voice plays from it and the slot is
+    /// free.
+    fn sends_back(&self, empty: bool) -> SendsBack {
+        let current = self
             .current
             .as_ref()
-            .is_some_and(SystemGeneration::is_empty)
-        {
+            .is_some_and(|old| empty || !(self.retired.is_none() && self.has_voice(old.id())));
+        SendsBack {
+            current,
+            retired: empty && self.retired.is_some(),
+        }
+    }
+
+    /// `generation` becomes current, and what `back` names goes into
+    /// `room`, reserved for it. A loop waiting for `generation` starts; one
+    /// for an earlier generation is discarded.
+    fn install(
+        &mut self,
+        generation: SystemGeneration,
+        back: SendsBack,
+        room: WriteChunkUninit<'_, SystemGeneration>,
+    ) {
+        let id = generation.id();
+        if generation.is_empty() {
             // Its stop ended every set voice already; none plays on.
             for v in &mut self.voices {
                 v.active = false;
             }
-            if let Some(old) = old {
-                give_back(returns, old);
-            }
-            if let Some(retired) = self.retired.take() {
-                give_back(returns, retired);
-            }
-        } else if let Some(old) = old {
-            if self.has_voice(old.id()) && self.retired.is_none() {
-                self.retired = Some(old);
-            } else {
-                give_back(returns, old);
-            }
         }
+        let old = self.current.replace(generation);
+        let (old_back, old_kept) = if back.current {
+            (old, None)
+        } else {
+            (None, old)
+        };
+        let retired_back = if back.retired {
+            self.retired.take()
+        } else {
+            None
+        };
+        if old_kept.is_some() {
+            self.retired = old_kept;
+        }
+        room.fill_from_iter(old_back.into_iter().chain(retired_back));
         match self.pending {
             Some(p) if p.generation == Some(id) => {
                 self.pending = None;
@@ -754,14 +802,15 @@ impl SystemVoices {
 
     /// Sends a retired generation that no voice plays from any more back
     /// through `returns`: after the mix, and at each control step after
-    /// the output failed.
+    /// the output failed. With no free slot it stays retired until a later
+    /// sweep finds one.
     pub fn sweep(&mut self, returns: &mut Producer<SystemGeneration>) {
         let _stepping = Stepping::enter();
         if let Some(id) = self.retired()
             && !self.has_voice(id)
-            && let Some(retired) = self.retired.take()
+            && let Ok(room) = returns.write_chunk_uninit(1)
         {
-            give_back(returns, retired);
+            room.fill_from_iter(self.retired.take());
         }
     }
 
@@ -830,21 +879,5 @@ impl SystemVoices {
                 *x = tone.map_or(*x, |s| *x + s).clamp(-1.0, 1.0);
             }
         }
-    }
-}
-
-/// Hands `generation` back. The ring is sized so it always has room
-/// ([`SYSTEM_RETURNS`]): debug builds assert it, and were it full in a
-/// release build the generation would be leaked rather than freed in the
-/// step.
-fn give_back(returns: &mut Producer<SystemGeneration>, generation: SystemGeneration) {
-    if let Err(PushError::Full(generation)) = returns.push(generation) {
-        #[cfg(debug_assertions)]
-        panic!(
-            "the system return ring is full: {:?} not returned",
-            generation.id()
-        );
-        #[cfg(not(debug_assertions))]
-        std::mem::forget(generation);
     }
 }
