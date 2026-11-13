@@ -229,8 +229,13 @@ fn a_ring_out_ends_a_seek_still_waiting() {
     let mut e = AudioEngine::new(bank(), &bgm, RATE, 480, 8, 0).unwrap();
     run_to(&mut e, &mut out, 50 * MS);
     e.restart(TimeUs(ORIGIN));
-    let plan =
-        audio::SeekPlan::new(&e.seek_source(), &bgm, e.frame_line(), TimeUs(10_000 * MS)).unwrap();
+    let plan = audio::SeekPlan::new(
+        &e.seek_source(),
+        e.schedule(),
+        e.frame_line(),
+        TimeUs(10_000 * MS),
+    )
+    .unwrap();
     e.seek(&plan).unwrap();
     e.ring_out(TimeUs(1_000 * MS), TimeUs(1_500 * MS));
     // Past the ring-out's end, long before the seek's frame: the play is
@@ -280,8 +285,13 @@ fn a_seek_during_a_ring_out_waits_for_the_next_play() {
     e.restart(TimeUs(ORIGIN));
     e.ring_out(FADE_AT, END_AT);
     run_to(&mut e, &mut out, ORIGIN + 2_200 * MS);
-    let plan =
-        audio::SeekPlan::new(&e.seek_source(), &bgm(), e.frame_line(), TimeUs(2_400 * MS)).unwrap();
+    let plan = audio::SeekPlan::new(
+        &e.seek_source(),
+        e.schedule(),
+        e.frame_line(),
+        TimeUs(2_400 * MS),
+    )
+    .unwrap();
     assert_eq!(e.seek(&plan), Err(audio::SeekError::RingingOut));
     run_to(&mut e, &mut out, ORIGIN + 3_000 * MS);
     assert!(e.mixer().rung_out());
@@ -290,7 +300,12 @@ fn a_seek_during_a_ring_out_waits_for_the_next_play() {
     // The next play takes the ring-out off, and a seek with it.
     let origin = out.inner().next_wake().0 + 200 * MS;
     e.restart(TimeUs(origin));
-    let plan =
-        audio::SeekPlan::new(&e.seek_source(), &bgm(), e.frame_line(), TimeUs(1_000 * MS)).unwrap();
+    let plan = audio::SeekPlan::new(
+        &e.seek_source(),
+        e.schedule(),
+        e.frame_line(),
+        TimeUs(1_000 * MS),
+    )
+    .unwrap();
     assert_eq!(e.seek(&plan), Ok(()));
 }

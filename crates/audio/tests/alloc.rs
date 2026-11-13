@@ -12,8 +12,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use audio::{
-    AudioEngine, AudioOutput, OutputError, RecordingOutput, SHIFT_HISTORY, SeekPlan, SimConfig,
-    SimDevice, Sound, SoundBank, SoundCmd, Wake, run_audio,
+    AudioEngine, AudioOutput, Channel, OutputError, RecordingOutput, SHIFT_HISTORY, SeekPlan,
+    SimConfig, SimDevice, Sound, SoundBank, SoundCmd, Wake, run_audio,
 };
 use bms_model::{BgmEvent, SoundId, TimeUs};
 use rtrb::RingBuffer;
@@ -104,6 +104,14 @@ fn mixing_does_not_allocate() {
             })
             .unwrap();
         }
+        // A volume change each step, on each channel in turn.
+        let (channel, volume) = [
+            (Channel::System, 0.45),
+            (Channel::Key, 0.2),
+            (Channel::Background, 0.999),
+            (Channel::Key, 1.0),
+        ][step as usize % 4];
+        e.set_volume(channel, volume).unwrap();
         let r = e.step(&mut out, &mut rx).unwrap();
         frames += u64::from(r.frames);
         commands += r.commands;
@@ -115,7 +123,13 @@ fn mixing_does_not_allocate() {
     e.restart(TimeUs(now.0 - 15_000_000 + 100_000));
     // The plan is made where the play is prepared, which may allocate.
     counting::track(false);
-    let plan = SeekPlan::new(&e.seek_source(), &bgm, e.frame_line(), TimeUs(15_000_000)).unwrap();
+    let plan = SeekPlan::new(
+        &e.seek_source(),
+        e.schedule(),
+        e.frame_line(),
+        TimeUs(15_000_000),
+    )
+    .unwrap();
     counting::track(true);
     e.seek(&plan).unwrap();
     let sought = e.bgm_left();

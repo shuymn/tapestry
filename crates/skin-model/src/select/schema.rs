@@ -111,7 +111,7 @@ pub static SELECTION: Schema = Schema {
         value("selected.rate.bad"),
         value("selected.rate.poor"),
         int("settings.display_offset", -VALUE_MAX, VALUE_MAX),
-        int("settings.volume", 0, 100),
+        int("settings.volume_system", 0, 100),
         flag("settings.floating"),
         value("settings.duration"),
         value("settings.green"),
@@ -245,8 +245,8 @@ pub mod field {
     pub const SETTINGS: u16 = SELECTED_RATE_POOR + 1;
     /// The display offset in whole ms.
     pub const SETTINGS_DISPLAY_OFFSET: u16 = SETTINGS;
-    /// The master gain's number, `(int)(gain · 100f)`.
-    pub const SETTINGS_VOLUME: u16 = SETTINGS + 1;
+    /// The system volume's number, `(int)(gain · 100f)`.
+    pub const SETTINGS_VOLUME_SYSTEM: u16 = SETTINGS + 1;
     /// Whether the hi-speed is Floating.
     pub const SETTINGS_FLOATING: u16 = SETTINGS + 2;
     /// In Floating, the travel duration of the target green number `G`,
@@ -354,7 +354,7 @@ mod tests {
             (field::SELECTED_RATE_POOR, "selected.rate.poor"),
             (field::SETTINGS, "settings.display_offset"),
             (field::SETTINGS_DISPLAY_OFFSET, "settings.display_offset"),
-            (field::SETTINGS_VOLUME, "settings.volume"),
+            (field::SETTINGS_VOLUME_SYSTEM, "settings.volume_system"),
             (field::SETTINGS_GREEN, "settings.green"),
             (field::SETTINGS_ORDER, "settings.order"),
             (field::SETTINGS_HIDDEN, "settings.hidden"),

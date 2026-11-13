@@ -148,7 +148,7 @@ const fn volume_at(v: i32) -> [i32; 2] {
     [1_050 + v / 5, 630]
 }
 
-/// The master gain the rig plays at: slider 17 shows it.
+/// The system volume the rig plays at: slider 17 shows it.
 const GAIN: f32 = 0.45;
 
 /// The settings a selection skin shows, which slider 17 needs to draw; the
@@ -156,7 +156,7 @@ const GAIN: f32 = 0.45;
 fn shown() -> skin_model::SelectionSettings {
     skin_model::SelectionSettings {
         display_offset_ms: 0,
-        master_volume: skin_model::MasterVolume::of_gain(GAIN),
+        system_volume: skin_model::VolumeReading::of_gain(GAIN),
         speed: skin_model::SpeedView::Classic,
         order: skin_model::SelectionOrder::Title,
         gauge: None,
@@ -169,7 +169,7 @@ fn shown() -> skin_model::SelectionSettings {
 /// `f` on a rig of the game's threads with `sel` on its select screen,
 /// the render thread drawing [`pointer_fixture`] (slider 17 drawn with
 /// `volume`) and taking the pointer, entered with `panels`' level if given,
-/// the settings shown and its first update drawn; the master gain at
+/// the settings shown and its first update drawn; the system volume at
 /// [`GAIN`]; the library's scan paused, so the list changes only as the
 /// test changes it.
 ///
@@ -219,7 +219,7 @@ fn on_pointer_from<R>(
     };
     let settings = game::Settings {
         device: game::DeviceSettings {
-            master_volume: GAIN,
+            system_volume: GAIN,
             ..game::DeviceSettings::default()
         },
         player: game::PlayerSettings::default(),
@@ -233,7 +233,7 @@ fn on_pointer_from<R>(
         }
         rig.selection = Some(sel);
         rig.entered_selection();
-        assert_eq!(rig.controls.tuning().volume(), GAIN);
+        assert_eq!(rig.controls.tuning().volume(game::Channel::System), GAIN);
         sel_mut(rig).feed.settings = Some(shown());
         sel_mut(rig).dirty = true;
         quiet(rig);
@@ -763,10 +763,10 @@ fn the_volume_slider_takes_the_press_and_changes_nothing() {
             dragged(rig, screens);
             w.up(c, Button::Left);
             assert_eq!(log(rig), [(Press(Nothing), 0), (Drag(Nothing), 0)]);
-            assert_eq!(rig.controls.tuning().volume(), GAIN);
+            assert_eq!(rig.controls.tuning().volume(game::Channel::System), GAIN);
             assert_eq!(
-                sel_of(rig).feed.settings.map(|s| s.master_volume),
-                Some(skin_model::MasterVolume::of_gain(GAIN))
+                sel_of(rig).feed.settings.map(|s| s.system_volume),
+                Some(skin_model::VolumeReading::of_gain(GAIN))
             );
         });
     }
@@ -1034,7 +1034,7 @@ fn under_a_panel_only_the_order_button_and_the_covers_act() {
         dragged(rig, screens);
         w.up(c, Button::Left);
         assert_eq!(log(rig), [(Press(Nothing), 1), (Drag(Nothing), 1)]);
-        assert_eq!(rig.controls.tuning().volume(), GAIN);
+        assert_eq!(rig.controls.tuning().volume(game::Channel::System), GAIN);
         // The hover image draws under the pointer, and not away from it.
         w.to(c, HOVER);
         frames(screens, 2);

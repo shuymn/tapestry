@@ -635,14 +635,14 @@ pub fn settings_lines(t: Tuning, speed: SpeedLine) -> Vec<String> {
     } else {
         ("CLASSIC", String::new())
     };
+    // The volumes keep their room: a long hi-speed part is what shortens.
+    let volumes = format!(
+        "  F3/F4 KEY {}% BG {}%",
+        t.key.percent, t.background.percent
+    );
+    let speed = format!("F1/F2 HI-SPEED {hispeed} {mode} GREEN {green}{target}");
     vec![
-        fit(
-            &format!(
-                "F1/F2 HI-SPEED {hispeed} {mode} GREEN {green}{target}  F3/F4 VOLUME {}%",
-                t.volume_percent
-            ),
-            COLUMNS,
-        ),
+        fit(&speed, COLUMNS.saturating_sub(volumes.len())) + &volumes,
         fit(
             &format!(
                 "F5/F6 DISPLAY {} MS  F7/F8 INPUT {} MS (NEXT PLAY)  F9 OVERLAY",
@@ -709,7 +709,18 @@ pub(crate) mod tests {
     #[test]
     fn settings_lines_show_each_value_and_its_keys() {
         let t = game::Tuning {
-            volume_percent: 35,
+            system: game::Volume {
+                percent: 100,
+                intent: false,
+            },
+            key: game::Volume {
+                percent: 35,
+                intent: false,
+            },
+            background: game::Volume {
+                percent: 40,
+                intent: false,
+            },
             display_offset_us: -2_000,
             input_offset_us: 4_000,
         };
@@ -722,7 +733,7 @@ pub(crate) mod tests {
         assert_eq!(
             super::settings_lines(t, floating),
             [
-                "F1/F2 HI-SPEED 3.20 FLOATING GREEN 300 (TARGET 300)  F3/F4 VOLUME 35%",
+                "F1/F2 HI-SPEED 3.20 FLOATING GREEN 300 (TARGET 300)  F3/F4 KEY 35% BG 40%",
                 "F5/F6 DISPLAY -2.0 MS  F7/F8 INPUT +4.0 MS (NEXT PLAY)  F9 OVERLAY",
             ]
         );
@@ -734,12 +745,46 @@ pub(crate) mod tests {
         };
         assert_eq!(
             super::settings_lines(t, classic)[0],
-            "F1/F2 HI-SPEED 2.56 CLASSIC GREEN 150  F3/F4 VOLUME 35%"
+            "F1/F2 HI-SPEED 2.56 CLASSIC GREEN 150  F3/F4 KEY 35% BG 40%"
         );
         assert_eq!(
             super::settings_lines(t, super::SpeedLine::default())[0],
-            "F1/F2 HI-SPEED - CLASSIC GREEN -  F3/F4 VOLUME 35%"
+            "F1/F2 HI-SPEED - CLASSIC GREEN -  F3/F4 KEY 35% BG 40%"
         );
+    }
+
+    /// The volumes always show whole, both at 100 %, however long the
+    /// hi-speed part is: the line stays within the columns and the
+    /// hi-speed part is what shortens.
+    #[test]
+    fn the_volumes_fit_the_widest_settings_line() {
+        let full = game::Volume {
+            percent: 100,
+            intent: true,
+        };
+        let t = game::Tuning {
+            system: full,
+            key: full,
+            background: full,
+            display_offset_us: -1_000_000,
+            input_offset_us: -1_000_000,
+        };
+        let widest = super::SpeedLine {
+            hispeed_x100: Some(2_000),
+            floating: true,
+            green: Some(1_234_567),
+            target: 6_000,
+        };
+        let lines = super::settings_lines(t, widest);
+        assert_eq!(lines[0].len(), super::COLUMNS, "{}", lines[0]);
+        assert!(
+            lines[0].ends_with("..  F3/F4 KEY 100% BG 100%"),
+            "{}",
+            lines[0]
+        );
+        for line in &lines {
+            assert!(line.len() <= super::COLUMNS, "{line}");
+        }
     }
 
     /// The queue line says what the play queued and, when the next play
@@ -1295,7 +1340,18 @@ pub(crate) mod tests {
             id: None,
         };
         let t = game::Tuning {
-            volume_percent: 100,
+            system: game::Volume {
+                percent: 100,
+                intent: false,
+            },
+            key: game::Volume {
+                percent: 100,
+                intent: false,
+            },
+            background: game::Volume {
+                percent: 100,
+                intent: false,
+            },
             display_offset_us: 0,
             input_offset_us: 0,
         };
@@ -1304,7 +1360,18 @@ pub(crate) mod tests {
         let changed = super::with_settings(
             &base,
             game::Tuning {
-                volume_percent: 35,
+                system: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
+                key: game::Volume {
+                    percent: 35,
+                    intent: false,
+                },
+                background: game::Volume {
+                    percent: 35,
+                    intent: false,
+                },
                 ..t
             },
             speed,
@@ -1378,7 +1445,18 @@ pub(crate) mod tests {
         );
         page.extend(super::settings_lines(
             game::Tuning {
-                volume_percent: 100,
+                system: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
+                key: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
+                background: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
                 display_offset_us: -12_000,
                 input_offset_us: -7_500,
             },

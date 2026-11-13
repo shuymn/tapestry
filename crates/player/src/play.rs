@@ -16,7 +16,7 @@ use audio::OutputError;
 use bms_model::{TimeSource, TimeUs};
 use eval::JudgeEvent;
 use game::{
-    Advance, AudioQueue, AudioWaitError, Chain, Closing, Command, InputWaitError, Loaded,
+    Advance, AudioQueue, AudioWaitError, Chain, Channel, Closing, Command, InputWaitError, Loaded,
     MenuCommand, Opening, PlayReport, Preparation, RenderSide, RestoreError, Restored,
     ResultScreen, Rig, Settings, Tuning,
 };
@@ -1476,17 +1476,19 @@ impl PlayerRig<'_> {
         self.queue_line = Some(line);
     }
 
-    /// Acts on changed settings keys' values: the volume goes to the
+    /// Acts on changed settings keys' values: the volumes go to the
     /// audio thread, and a shown end screen is drawn again.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn sync(&mut self) {
         let tuned = self.seen.take_new(self.controls.tuning());
         if tuned.is_some() {
-            // Always within 0 to unity: loading and `Tuning` keep it there.
-            let _ = self
-                .audio
-                .control
-                .set_volume(self.controls.tuning().volume());
+            // Always within 0 to unity: loading and `Tuning` keep them there.
+            for channel in Channel::ALL {
+                let _ = self
+                    .audio
+                    .control
+                    .set_volume(channel, self.controls.tuning().volume(channel));
+            }
         }
         // The end screen's hi-speed line follows the adjustments too.
         let speed = self.speed_line();
@@ -3109,10 +3111,10 @@ mod restore_tests {
             48_000,
             vec![Sound::mono(vec![1_000; 4 * 48_000])],
         ));
-        let schedule = vec![BgmEvent {
+        let schedule = vec![audio::ScheduledSound::from(BgmEvent {
             time: TimeUs(5_000_000),
             sound: SoundId(0),
-        }];
+        })];
         let engine =
             AudioEngine::with_schedule(bank, schedule.clone(), 48_000, 480, 16, 0).unwrap();
         let (mut control, mut worker) = audio_control(engine);

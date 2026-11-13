@@ -1378,6 +1378,10 @@ struct Shared {
     /// drained frame loops (tests).
     #[cfg(test)]
     takeover_acks: Arc<TakeoverAcks>,
+    /// The decision kind's refusal waits here before its notice is
+    /// stored while a test holds it (tests).
+    #[cfg(test)]
+    notice_gate: TestGate,
     /// How long the launch screen has shown, in place of the clock's
     /// reading, while set (tests: [`RenderLink::set_launch_elapsed`]).
     #[cfg(test)]
@@ -1473,6 +1477,8 @@ impl Shared {
             takeover_gate: TestGate::default(),
             #[cfg(test)]
             takeover_acks: Arc::default(),
+            #[cfg(test)]
+            notice_gate: TestGate::default(),
             #[cfg(test)]
             launch_elapsed: Mutex::new(None),
             result: Mutex::new(ResultSlot::default()),
@@ -7290,12 +7296,14 @@ impl Run {
     }
 
     /// The decision skin refused its frame at `at` on a healthy device:
-    /// the built-in presentation takes over for the active lifetime, and
-    /// the kind is disabled for the run.
+    /// the kind is disabled for the run, then the built-in presentation
+    /// takes over for the active lifetime. The notice is stored before the
+    /// takeover is published and the game thread woken, so a game thread
+    /// woken for a refusal's takeover finds its notice.
     fn decision_frame_refused(&mut self, e: BuildError, at: TimeUs) {
         let why = format!("the decision skin refused its frame: {}", Chain(&e));
-        self.take_over(at, why.clone());
-        self.disable_decision(why);
+        self.disable_decision(why.clone());
+        self.take_over(at, why);
     }
 
     /// The decision skin of the screen shown cannot draw from `at`: its
@@ -7355,6 +7363,8 @@ impl Run {
         eprintln!("render: the decision skin is disabled for the run: {why}");
         if self.decision_disabled.is_none() {
             self.decision_disabled = Some(why.clone());
+            #[cfg(test)]
+            self.shared.notice_gate.pass();
             *self
                 .shared
                 .decision_refused
@@ -7489,10 +7499,12 @@ impl Run {
                     "the decision labels were not restored on the screen built again: {}",
                     Chain(&e)
                 );
-                if self.decision_skinned() {
-                    self.take_over(now, why.clone());
+                // The notice first, then the takeover and its wake.
+                let skinned = self.decision_skinned();
+                self.disable_decision(why.clone());
+                if skinned {
+                    self.take_over(now, why);
                 }
-                self.disable_decision(why);
                 Ok(())
             }
             crate::decision_side::Rebuilt::Failed(e) => {
@@ -15786,7 +15798,7 @@ pub(crate) mod tests {
         };
         let settings = skin_model::SelectionSettings {
             display_offset_ms: 0,
-            master_volume: skin_model::MasterVolume::of_gain(0.0),
+            system_volume: skin_model::VolumeReading::of_gain(0.0),
             speed: skin_model::SpeedView::Classic,
             order: skin_model::SelectionOrder::Title,
             gauge: None,
@@ -15812,7 +15824,18 @@ pub(crate) mod tests {
             .model();
             assert_eq!((f.display_offset, f.fix_hispeed), (TimeUs(us), 3), "{us}");
             let tuning = crate::tuning::LiveTuning::new(game::Tuning {
-                volume_percent: 100,
+                system: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
+                key: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
+                background: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
                 display_offset_us: us,
                 input_offset_us: 0,
             });

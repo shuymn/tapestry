@@ -1006,9 +1006,12 @@ fn settings_keys_persist_and_the_input_offset_waits_for_the_next_play() {
 
     let root = game::DataRoot::new(fx.appdata.join("tapestry"));
     let s = game::Settings::load(&root).unwrap();
-    // 100 - 5 %; 3 * 1 ms; F8 during play does nothing, 2 * 1 ms on the
+    // The key and background volumes 100 - 5 %, the system volume
+    // untouched; 3 * 1 ms; F8 during play does nothing, 2 * 1 ms on the
     // end screen.
-    assert_eq!(s.device.master_volume, 0.95);
+    assert_eq!(s.device.key_volume, 0.95);
+    assert_eq!(s.device.background_volume, 0.95);
+    assert_eq!(s.device.system_volume, 1.0);
     assert_eq!(s.device.display_offset_us, 3_000);
     assert_eq!(s.device.input_offset_us, 2_000);
     assert_eq!(s.device.keyboard, DeviceSettings::default().keyboard);
