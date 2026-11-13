@@ -910,6 +910,8 @@ pub enum PointerAct {
     Rows(i32),
     /// Turns this cover switch over (events 330 to 332).
     Cover(game::CoverKind),
+    /// Sets this volume to this whole percent (sliders 17 to 19).
+    Volume(game::Channel, u32),
 }
 
 /// A press's effect: the search box's focus taken away first, then `act`.
@@ -969,7 +971,8 @@ pub fn resolve(
         PointerRequest::Press { button, .. } => button,
     };
     if facts.panel {
-        // Under a panel only the order button and the cover switches act.
+        // Under a panel only the order button, the cover switches and the
+        // volume sliders act.
         return match hit {
             Some(PointerHit::Action { event: 12, arg }) => Resolved {
                 unfocus: false,
@@ -978,6 +981,10 @@ pub fn resolve(
             Some(PointerHit::Action { event, .. }) => Resolved {
                 unfocus: false,
                 act: cover(event),
+            },
+            Some(PointerHit::Slider(command)) => Resolved {
+                unfocus: false,
+                act: volume(command),
             },
             _ => NOTHING,
         };
@@ -1025,19 +1032,21 @@ pub fn resolve(
         // Every other action takes the press and does nothing, but the
         // cover switches.
         Some(PointerHit::Action { event, .. }) => cover(event),
-        Some(PointerHit::Slider(command)) => list_slider(command, &built, facts),
+        Some(PointerHit::Slider(command)) => slider(command, &built, facts),
         None if button == Button::Right => PointerAct::Key(MenuKey::Escape),
         None => PointerAct::Nothing,
     };
     Resolved { unfocus, act }
 }
 
-/// What a drag does: the list slider moves the cursor as a press on it;
-/// nothing else, under a panel or while the IME composes.
+/// What a drag does: a slider acts as a press on it, a volume slider under
+/// a panel too, the list slider not; nothing while the IME composes.
 pub fn resolve_drag(drag: &DragCommand, facts: &Facts) -> PointerAct {
     match current(drag.word, Some(drag.built), facts) {
-        Some(built) if !facts.composing && !facts.panel => list_slider(drag.command, &built, facts),
-        _ => PointerAct::Nothing,
+        Some(_) if facts.composing => PointerAct::Nothing,
+        Some(_) if facts.panel => volume(drag.command),
+        Some(built) => slider(drag.command, &built, facts),
+        None => PointerAct::Nothing,
     }
 }
 
@@ -1075,6 +1084,31 @@ fn drawn_cursor(built: &Built, facts: &Facts) -> bool {
             .cursor
             .and_then(|c| usize::try_from(c).ok())
             .is_some_and(|c| c == facts.cursor)
+}
+
+/// A slider at `command`'s ratio: the list slider or a volume slider.
+fn slider(command: SliderCommand, built: &Built, facts: &Facts) -> PointerAct {
+    match volume(command) {
+        PointerAct::Nothing => list_slider(command, built, facts),
+        act => act,
+    }
+}
+
+/// Volume slider 17, 18 or 19 at `command`'s ratio `v`: the system, key or
+/// background volume to `round(100 · v)` %, ties up (the source writes its
+/// continuous value, `skin/property/FloatPropertyFactory.java:261-275` at
+/// 0.8.9; tapestry keeps whole percents). Any other slider does nothing.
+fn volume(command: SliderCommand) -> PointerAct {
+    let channel = match command.source {
+        RatioSource::SystemVolume => game::Channel::System,
+        RatioSource::KeyVolume => game::Channel::Key,
+        RatioSource::BackgroundVolume => game::Channel::Background,
+        _ => return PointerAct::Nothing,
+    };
+    let n = u128::from(command.value.numerator);
+    let d = u128::from(command.value.denominator).max(1);
+    let percent = (n.saturating_mul(200) + d) / (2 * d);
+    PointerAct::Volume(channel, u32::try_from(percent.min(100)).unwrap_or(100))
 }
 
 /// The list slider at `command`'s ratio `v`, drawn on the current list:
@@ -1619,7 +1653,7 @@ mod tests {
         );
         assert_eq!(
             act(l, slider(RatioSource::SystemVolume, 8), &f),
-            PointerAct::Nothing
+            PointerAct::Volume(game::Channel::System, 100)
         );
         let stale = Built {
             list_revision: 1,
@@ -1903,6 +1937,77 @@ mod tests {
             ..facts()
         };
         assert_eq!(resolve_drag(&cmd(2), &panel), PointerAct::Nothing);
+        // A volume slider's drag sets its volume, under a panel too.
+        let volume = DragCommand {
+            command: SliderCommand {
+                source: RatioSource::KeyVolume,
+                value: Ratio {
+                    numerator: 2,
+                    denominator: 5,
+                },
+            },
+            ..cmd(2)
+        };
+        for f in [facts(), panel] {
+            assert_eq!(
+                resolve_drag(&volume, &f),
+                PointerAct::Volume(game::Channel::Key, 40)
+            );
+        }
+        let composing = Facts {
+            composing: true,
+            ..facts()
+        };
+        assert_eq!(resolve_drag(&volume, &composing), PointerAct::Nothing);
+    }
+
+    /// K2: volume slider 17, 18 or 19 at v sets the system, key or
+    /// background volume to `round(100 · v)` %, ties up; with or without a
+    /// panel.
+    #[test]
+    fn a_volume_slider_sets_its_channel_to_a_whole_percent() {
+        let l = press(Button::Left);
+        let at = |source, numerator, denominator| {
+            Some(PointerHit::Slider(SliderCommand {
+                source,
+                value: Ratio {
+                    numerator,
+                    denominator,
+                },
+            }))
+        };
+        let panel = Facts {
+            panel: true,
+            ..facts()
+        };
+        for f in [facts(), panel] {
+            for (source, n, d, want) in [
+                (
+                    RatioSource::SystemVolume,
+                    764,
+                    1_000,
+                    (game::Channel::System, 76),
+                ),
+                (RatioSource::KeyVolume, 765, 1_000, (game::Channel::Key, 77)),
+                (
+                    RatioSource::BackgroundVolume,
+                    1,
+                    1,
+                    (game::Channel::Background, 100),
+                ),
+                (RatioSource::SystemVolume, 0, 1, (game::Channel::System, 0)),
+                // 0.004 rounds down, 0.005 up.
+                (RatioSource::KeyVolume, 4, 1_000, (game::Channel::Key, 0)),
+                (RatioSource::KeyVolume, 5, 1_000, (game::Channel::Key, 1)),
+            ] {
+                assert_eq!(
+                    act(l, at(source, n, d), &f),
+                    PointerAct::Volume(want.0, want.1),
+                    "{source:?} {n}/{d} panel {}",
+                    f.panel
+                );
+            }
+        }
     }
 
     #[test]

@@ -25,8 +25,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bms_model::TimeUs;
 use game::{
-    AcceptanceRevision, Adjust, Chain, Channel, DataRoot, DeviceSettings, Settings, Tuning,
-    TuningSnapshot, Volume, save_settings,
+    AcceptanceRevision, Adjust, Chain, Channel, DataRoot, DeviceSettings, MAX_VOLUME_PERCENT,
+    Settings, Tuning, TuningSnapshot, Volume, save_settings,
 };
 use input::{ActivityRecord, Ingress, SectionValue};
 
@@ -335,6 +335,26 @@ impl LiveTuning {
     /// its percent, which is what [`Tuning::apply_to`] writes.
     pub fn volume(&self, channel: Channel) -> f32 {
         self.channel(channel).playing()
+    }
+
+    /// Sets `channel` to `percent`, held within 0 to unity, with its write
+    /// intent, even at an unchanged percent: the native setter a selection
+    /// skin's volume slider goes through. It plays from the next sync and
+    /// is written at the next settings write, as a volume key's step is.
+    /// Returns whether anything changed.
+    pub fn set_volume(&self, channel: Channel, percent: u32) -> bool {
+        let _w = self.window();
+        let new = Volume {
+            percent: percent.min(MAX_VOLUME_PERCENT),
+            intent: true,
+        };
+        let live = self.channel(channel);
+        if live.get() == new {
+            return false;
+        }
+        live.set(new);
+        self.version.fetch_add(1, Ordering::AcqRel);
+        true
     }
 
     /// The current values. Only the window thread changes them, one at a
@@ -1202,6 +1222,36 @@ mod tests {
             torn
         });
         assert_eq!(torn, 0, "pairs no step stored");
+    }
+
+    /// The native setter sets the write intent even at the loaded percent,
+    /// so the whole percent plays and is written, and counts as a change;
+    /// the same percent again changes nothing, and a percent past unity is
+    /// held there.
+    #[test]
+    fn a_set_volume_plays_and_is_written_as_set() {
+        let device = game::DeviceSettings {
+            key_volume: 0.754,
+            ..game::DeviceSettings::default()
+        };
+        let settings = game::Settings {
+            device: device.clone(),
+            player: game::PlayerSettings::default(),
+        };
+        let t = LiveTuning::new(Tuning::of(&settings)).with_loaded_volumes(&device);
+        assert_eq!(t.volume(Channel::Key), 0.754);
+        assert!(t.set_volume(Channel::Key, 75));
+        assert_eq!(t.version(), 1);
+        assert_eq!(t.volume(Channel::Key), 0.75);
+        let mut written = settings.clone();
+        t.get().apply_to(&mut written);
+        assert_eq!(written.device.key_volume, 0.75);
+        assert_eq!(written.device.background_volume, 1.0);
+        assert_eq!(written.device.system_volume, 1.0);
+        assert!(!t.set_volume(Channel::Key, 75));
+        assert_eq!(t.version(), 1);
+        assert!(t.set_volume(Channel::System, 250));
+        assert_eq!(t.volume(Channel::System), 1.0);
     }
 
     #[test]
