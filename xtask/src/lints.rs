@@ -368,6 +368,7 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/audio/src/engine.rs"),
     Site::File("crates/audio/src/mixer.rs"),
     Site::File("crates/audio/src/run.rs"),
+    Site::File("crates/audio/src/system.rs"),
     Site::File("crates/audio/src/wasapi.rs"),
     Site::Fns(
         "crates/audio/src/bank.rs",

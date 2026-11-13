@@ -548,6 +548,7 @@ fn measure_on(adapter: render::AdapterChoice) {
 fn selection_runtime_frame_alloc() {
     let _warp = crate::warp_turn::take();
     let _serial = crate::imports::tests::serial();
+    let _untimed = crate::selection_skin::untimed();
     let mut r = warp();
     let dir = crate::selection_skin::chart_fixture();
     let (b, script) =
@@ -717,6 +718,7 @@ fn chart_skinned(
 fn the_selection_image_options_agree_in_frames_callbacks_and_conditions() {
     let _warp = crate::warp_turn::take();
     let _serial = crate::imports::tests::serial();
+    let _untimed = crate::selection_skin::untimed();
     let scripts = crate::screens::Scripts::new();
     let (_dir, mut screen, mut logic, layer) = chart_skinned(&scripts);
     let side = logic.bundle.side();

@@ -573,6 +573,7 @@ fn labels_follow_the_row_s_features() {
 /// A level's strip follows the selection loader
 /// (`JsonSelectSkinObjectLoader.java:181-196`): a ten-glyph strip pads
 /// with blanks whatever its `padding`, and its digit offsets are unread.
+// Source: SF-004
 #[test]
 fn level_strips_follow_the_selection_loader() {
     let list = song_list(

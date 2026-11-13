@@ -432,6 +432,7 @@ impl Arena {
     /// case only is an intentional subset. A mixed Lua table has none: the
     /// source's Lua loader reads no wrapper (`LuaSkinLoader.java:171-210`
     /// at `0.8.9`), and its string keys stay a record's fields.
+    // Source: SF-002
     pub(crate) fn first_member_ci(&self, id: u32, name: &str) -> Option<u32> {
         if !self.is_object(id) || self.is_mixed(id) {
             return None;
@@ -471,6 +472,7 @@ impl Arena {
                 // `true`, `false` and `null` are compared after unescaping
                 // (JsonReader.rl:118-128); the number check runs on the
                 // token as written (JsonReader.rl:130-176).
+                // Source: SF-003
                 let is = |word: &str| Unescape::new(raw, escaped).eq(word.chars());
                 if is("true") {
                     return Scalar::Bool(true);

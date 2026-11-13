@@ -948,6 +948,30 @@ pub(crate) fn fixture_scripted(
     }
 }
 
+/// Gives this thread's runtime frames a time budget no frame reaches
+/// until dropped: a test of what the callbacks give, whose outcome a
+/// loaded machine's clock must not decide. Under the real budget a frame
+/// that a busy machine delays past it gives the rest of its callbacks
+/// their constants (design.md "beatoraja Lua Skins", the runtime).
+#[cfg(all(test, feature = "dev-tools"))]
+#[must_use]
+pub(crate) fn untimed() -> Untimed {
+    skin_beatoraja::vm_hooks::set_frame_time(Some(std::time::Duration::from_secs(3_600)));
+    Untimed
+}
+
+/// [`untimed`]'s guard: dropped, the thread's frames have the limit's
+/// time budget again.
+#[cfg(all(test, feature = "dev-tools"))]
+pub(crate) struct Untimed;
+
+#[cfg(all(test, feature = "dev-tools"))]
+impl Drop for Untimed {
+    fn drop(&mut self) {
+        skin_beatoraja::vm_hooks::set_frame_time(None);
+    }
+}
+
 /// The fixture's skin `entry` in `dir` built as the selection kind for `r`
 /// (dev-tools tests).
 #[cfg(all(test, feature = "dev-tools"))]
