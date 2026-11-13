@@ -266,8 +266,8 @@ pub mod field {
     pub const APP_UPTIME_H: u16 = APP_FPS + 7;
     pub const APP_UPTIME_S: u16 = APP_FPS + 9;
     /// The best's max combo, of any counted play, and the view's max combo
-    /// minus it; each [`HIDDEN`](super::HIDDEN) unless that best max combo
-    /// is above 0.
+    /// minus it; each [`HIDDEN`](super::HIDDEN) while no play counts for
+    /// the best.
     pub const BEST_MAX_COMBO: u16 = APP_UPTIME_S + 1;
     pub const BEST_MAX_COMBO_DIFF: u16 = APP_UPTIME_S + 2;
     /// The number of fields.

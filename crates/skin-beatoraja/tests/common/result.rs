@@ -160,7 +160,7 @@ pub fn best(bp_diff: ResultNumber) -> BestView {
         bp_diff,
         clear: LampKey::Hard,
         // A best max combo of 100, this view's 120, with a BP; hidden
-        // with it, as a best max combo of 0 is.
+        // with it.
         max_combo: match bp_diff {
             ResultNumber::Shown(_) => ResultNumber::Shown(100),
             ResultNumber::Hidden => ResultNumber::Hidden,
