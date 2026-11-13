@@ -855,8 +855,8 @@ fn first(frames: &[Drawn], from: usize, f: impl Fn(&Frame) -> bool) -> Option<us
 /// startup (JSON and Lua decision skins in turn), a chart chosen on the
 /// skinned select screen draws the decision skin from the choice; its
 /// fade marker, on timer 2 from choice + `scene`, is dark in a frame
-/// before 2,500 ms and drawn as the fade defines in one between 2,500
-/// and 3,000 ms; then the play loads (loading frames), commits and runs
+/// before 2,500 ms and drawn as the fade defines in frames let through at
+/// 2,500 and 2,750 ms; then the play loads (loading frames), commits and runs
 /// to its end (play frames, a completed play), and with the decision
 /// skin resident the result draws skinned: result skin frames, never the
 /// built-in result page.
@@ -886,30 +886,31 @@ fn full_set_draws_the_decision_then_plays_to_a_skinned_result() {
             let early = at.0 - origin.0;
             assert!((0..2_500 * MS).contains(&early), "{entry}: {early} µs");
             assert_eq!(mark, Some(0), "{entry}: the marker before timer 2");
-            // The next frame at 2,500 ms from the choice.
-            side.until_clock(TimeUs(origin.0 + 2_500 * MS));
-            side.seen.probe.store(true, Ordering::Release);
-            side.seen.gate.step();
-            let inside = side.seen.frames();
-            let Some(Drawn {
-                at,
-                frame: Frame::Decision { mark, .. },
-            }) = inside.last()
-            else {
-                panic!("{entry}: {:?}", inside.last());
-            };
-            let late = at.0 - origin.0;
-            assert!(
-                (2_500 * MS..3_000 * MS).contains(&late),
-                "{entry}: {late} µs"
-            );
-            // Alpha 128 at the fade-out's start, rising to 255 at its end.
-            let alpha = 128 + 127 * (late - 2_500 * MS) / (500 * MS);
-            let mark = i64::from(mark.expect("probed"));
-            assert!(
-                (mark - alpha).abs() <= 8,
-                "{entry}: marker {mark} at {late} µs, alpha {alpha}"
-            );
+            // One frame let through at 2,500 ms from the choice, as timer
+            // 2 starts, and one at 2,750 ms, halfway through the fade-out.
+            for ms in [2_500, 2_750] {
+                side.until_clock(TimeUs(origin.0 + ms * MS));
+                side.seen.probe.store(true, Ordering::Release);
+                side.seen.gate.step();
+                let inside = side.seen.frames();
+                let Some(Drawn {
+                    at,
+                    frame: Frame::Decision { mark, .. },
+                }) = inside.last()
+                else {
+                    panic!("{entry}: {:?}", inside.last());
+                };
+                let late = at.0 - origin.0;
+                assert!((ms * MS..3_000 * MS).contains(&late), "{entry}: {late} µs");
+                // Alpha 128 at the fade-out's start, rising to 255 at its
+                // end.
+                let alpha = 128 + 127 * (late - 2_500 * MS) / (500 * MS);
+                let mark = i64::from(mark.expect("probed"));
+                assert!(
+                    (mark - alpha).abs() <= 8,
+                    "{entry}: marker {mark} at {late} µs, alpha {alpha}"
+                );
+            }
             side.seen.gate.release();
             side.seen.until("a result skin frame", |d| {
                 d.iter()
@@ -958,10 +959,11 @@ enum Route {
 /// R4.1, R4.2 (stage3's list) through the run: the decision skin's build
 /// refused by the renderer in a frame let through at 1,000 ms from the
 /// choice draws the built-in presentation in that very frame, and its
-/// destination (`route`) first draws at 1,500 ms, not before and not at
-/// the skin's 3,000 ms; refused at 2,000 ms, past the presentation's
-/// time, the destination draws at once, before the skin's 3,000 ms. The
-/// built-in page draws in between, and no skin frame after the refusal.
+/// destination (`route`) first draws at 1,500 ms, not before; refused at
+/// 2,000 ms, past the presentation's time, the destination draws at once.
+/// Each is drawn within 500 ms of when it is due, well before the skin's
+/// own 3,000 ms. The built-in page draws in between, and no skin frame
+/// after the refusal.
 fn refused_build_routes(route: Route) {
     let practice = crate::ui_text::Message::PracticeTitle { name: "a" }.text();
     let destination = |f: &Frame| match route {
@@ -1031,14 +1033,16 @@ fn refused_build_routes(route: Route) {
             route != Route::Held || !frames.iter().any(|d| d.frame == Frame::Loading),
             "{case}: the refused load's loading state drew"
         );
+        // At 1,500 ms, or at once past it: each within 500 ms (the screen's
+        // own end, at 3,000 ms, lies beyond both).
         let reached = frames.get(dest).unwrap().at.0;
-        let earliest = if refused_ms < 1_500 {
+        let due = if refused_ms < 1_500 {
             at(1_500)
         } else {
             refused.at.0
         };
         assert!(
-            (earliest..at(3_000)).contains(&reached),
+            (due..due + 500 * MS).contains(&reached),
             "{case}: reached at {} µs",
             reached - origin.0
         );
