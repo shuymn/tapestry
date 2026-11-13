@@ -43,6 +43,7 @@ allow = [
     "Apache-2.0", # most crates (MIT OR Apache-2.0)
     "Unicode-3.0", # unicode-ident, unicode-normalization
     "BSD-3-Clause", # encoding_rs (together with MIT OR Apache-2.0), zstd (replay)
+    "BSD-2-Clause", # zstd-sys (replay), with BSD-3-Clause for its bundled zstd sources
     "MPL-2.0",    # triple_buffer, symphonia (audio decoding); used unmodified
     "Zlib",       # foldhash, under hashbrown in the wgpu graph, and slotmap under fontdb (render)
     "ISC",        # libloading, which wgpu-hal uses to load the DX12 runtime (render)
