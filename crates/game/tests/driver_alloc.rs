@@ -3,7 +3,8 @@
 //! releases, repeats and ticks with the attempt's tempo provider, an
 //! opening's and a cancellation's markers, a loss and its recovery, the
 //! window's speed keys, a provisional close with its decision either way,
-//! and a display offset cut into the stream. This
+//! a display offset cut into the stream, and a cover switched between
+//! attempts. This
 //! file holds a single test, so the harness's other threads are not
 //! tracked.
 
@@ -155,6 +156,12 @@ fn the_driver_drains_without_allocating() {
         let _ = driver.drain(round * 1_000);
         let _ = reader.read();
         at += 300_000;
+    }
+    // Between attempts: a cover switched from the select screen's skin.
+    driver.invalidate();
+    for on in [true, false] {
+        driver.set_cover_on(game::CoverKind::Lift, on).unwrap();
+        let _ = reader.read();
     }
     let calls = counting::calls() - before;
     counting::track(false);

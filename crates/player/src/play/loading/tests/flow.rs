@@ -1069,3 +1069,44 @@ fn the_cursor_hides_for_the_play_and_shows_at_its_result() {
         assert_eq!(*seen.lock().unwrap(), [false, true, true]);
     });
 }
+
+/// K1 and K5 end to end, and the cancelled load: a load attached and then
+/// left before its play (as a cancel while decoding or measuring, a
+/// refusal or Back leave it) leaves nothing pending once selection is
+/// entered, so SUDDEN+ turned from the skin there is taken; the next load
+/// attaches with it, the play opens with it, and the
+/// play's end writes it to `player.toml`, which did not hold it before.
+#[test]
+fn a_cover_turned_after_a_cancelled_load_reaches_the_next_play() {
+    let (_dir, mut loaded) = plain();
+    on_loading(&mut loaded, None, false, |rig, side, loaded| {
+        let player_toml = |rig: &PlayerRig<'_>| {
+            let path = rig.files.root().player_settings();
+            path.exists()
+                .then(|| game::load_settings::<game::PlayerSettings>(&path).unwrap())
+                .is_some_and(|p| p.covers.sudden_on)
+        };
+        assert!(rig.adjust.as_ref().unwrap().has_pending());
+        rig.left_chart().unwrap();
+        rig.entered_selection();
+        assert!(!rig.adjust.as_ref().unwrap().has_pending());
+        rig.selection.as_mut().unwrap().covers_turned[0] = true;
+        // The look that takes them.
+        assert!(rig.choose().is_none());
+        assert!(rig.adjust.as_ref().unwrap().options().covers().sudden.on);
+        assert!(!player_toml(rig));
+        // The next play, loaded, attached and played to its end.
+        rig.entered_loading(loaded.path());
+        if let Some((driver, mut pump)) = rig.adjustments() {
+            assert_eq!(driver.attach_loaded(loaded, &mut pump).unwrap(), None);
+        }
+        let ended = open_with(loaded, rig, side, || side.quit_the_play(1));
+        assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+        assert_eq!(rig.ended_plays.len(), 1);
+        // The state the play's opening started with.
+        let driver = rig.adjust.as_ref().unwrap();
+        let opened = (0..8).find_map(|g| driver.opened(g)).expect("an opening");
+        assert!(opened.sudden.on);
+        assert!(player_toml(rig));
+    });
+}

@@ -1697,6 +1697,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         preset_refusal: false,
         search_pending: false,
         preset_steps: std::collections::VecDeque::new(),
+        covers_turned: [false; 3],
         feed: selection_skin::SkinFeed::default(),
         ime,
         rate: opened.rate,

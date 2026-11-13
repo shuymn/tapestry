@@ -908,6 +908,8 @@ pub enum PointerAct {
     MoveTo(usize),
     /// Moves the cursor this many rows, down positive.
     Rows(i32),
+    /// Turns this cover switch over (events 330 to 332).
+    Cover(game::CoverKind),
 }
 
 /// A press's effect: the search box's focus taken away first, then `act`.
@@ -967,11 +969,15 @@ pub fn resolve(
         PointerRequest::Press { button, .. } => button,
     };
     if facts.panel {
-        // Under a panel only the order button acts.
+        // Under a panel only the order button and the cover switches act.
         return match hit {
             Some(PointerHit::Action { event: 12, arg }) => Resolved {
                 unfocus: false,
                 act: order(arg),
+            },
+            Some(PointerHit::Action { event, .. }) => Resolved {
+                unfocus: false,
+                act: cover(event),
             },
             _ => NOTHING,
         };
@@ -1016,8 +1022,9 @@ pub fn resolve(
                 PointerAct::Nothing
             }
         }
-        // Every other action and slider takes the press and does nothing.
-        Some(PointerHit::Action { .. }) => PointerAct::Nothing,
+        // Every other action takes the press and does nothing, but the
+        // cover switches.
+        Some(PointerHit::Action { event, .. }) => cover(event),
         Some(PointerHit::Slider(command)) => list_slider(command, &built, facts),
         None if button == Button::Right => PointerAct::Key(MenuKey::Escape),
         None => PointerAct::Nothing,
@@ -1043,6 +1050,21 @@ const fn order(arg: i8) -> PointerAct {
         PointerAct::Key(MenuKey::Left)
     } else {
         PointerAct::Nothing
+    }
+}
+
+/// Event `event` as a cover switch: 330, 331 and 332 turn SUDDEN+, LIFT
+/// and HIDDEN+ over, whatever row the cursor is on. The source's act on
+/// the selected row's play config, which for a folder or any row with no
+/// chart is the configured mode's (`skin/property/EventFactory.java:677-703`,
+/// `select/MusicSelector.java:650-669` at 0.8.9); tapestry has the one
+/// 7-key configuration. Anything else does nothing.
+const fn cover(event: u16) -> PointerAct {
+    match event {
+        330 => PointerAct::Cover(game::CoverKind::Sudden),
+        331 => PointerAct::Cover(game::CoverKind::Lift),
+        332 => PointerAct::Cover(game::CoverKind::Hidden),
+        _ => PointerAct::Nothing,
     }
 }
 
@@ -1516,6 +1538,41 @@ mod tests {
         };
         assert_eq!(resolve(l, on(None), Some(page), &f, kinds), NOTHING);
         assert_eq!(resolve(l, on(None), None, &f, kinds), NOTHING);
+    }
+
+    /// Events 330, 331 and 332 turn their own switch over on every row,
+    /// under a panel too, whether or not the build drew the cursor there:
+    /// the "all charts" row (0), a folder (1) and a chart (2).
+    #[test]
+    fn the_cover_switches_act_on_every_row() {
+        let l = press(Button::Left);
+        let action = |event| Some(PointerHit::Action { event, arg: 1 });
+        for (panel, cursor) in [false, true]
+            .into_iter()
+            .flat_map(|p| [0, 1, 2].map(|c| (p, c)))
+        {
+            let f = Facts {
+                panel,
+                cursor,
+                ..facts()
+            };
+            for (event, kind) in [
+                (330, game::CoverKind::Sudden),
+                (331, game::CoverKind::Lift),
+                (332, game::CoverKind::Hidden),
+            ] {
+                assert_eq!(
+                    act(l, action(event), &f),
+                    PointerAct::Cover(kind),
+                    "{event} on row {cursor}, under a panel: {panel}"
+                );
+            }
+        }
+        // Another lifetime's input still does nothing.
+        assert_eq!(
+            resolve(l, on(action(330)), Some(built(8)), &facts(), kinds),
+            NOTHING
+        );
     }
 
     #[test]

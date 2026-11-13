@@ -14,18 +14,20 @@ mod font_support;
 mod outline_support;
 
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, mpsc};
+use std::time::Duration;
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
 use common::{GAUGES, context, input, offscreen, read_back, view};
 use outline_support::{FontRec, Value, default_font, distance_field, text, ttf};
 use render::text::MenuText;
 use render::{
-    AttemptInput, AttemptText, LineBounds, LineFit, LineLayout, OutlineText, Renderer, SkinBundle,
-    SkinError, TextResidency, text_upload_bound,
+    AttemptInput, AttemptText, FillStep, LabelBook, LabelJob, LabelStore, LabelWorker, LineBounds,
+    LineFit, LineLayout, OutlineText, Renderer, Settled, SkinBundle, SkinError, TextResidency,
+    text_upload_bound,
 };
-use skin_model::{ChartText, TextRequest, TextSlots};
+use skin_model::{ChartText, DecisionStrings, ResultLabels, ScreenKind, TextRequest, TextSlots};
 
 fn chart() -> Chart {
     ChartBuilder::new(120_000).build().unwrap()
@@ -303,6 +305,91 @@ fn witness_terms_are_disjoint() {
     // The mask counts once in the total, apart from every other term.
     let without = render::MemoryWitness { text_mask: 0, ..m };
     assert_eq!(m.total(), without.total() + render::MAX_TEXT_MASK_BYTES);
+
+    // The decision labels' terms: a published slot's content, a fill's
+    // last boundary of writes, a waiting output's levels and the worker's
+    // buffers, each in its own term and none in the renderer's.
+    let decision = outline_support::decision_folder(
+        &[("ttf.ttf", font_support::build(&font_support::latin("Skin")))],
+        &[ttf()],
+        &[
+            text("f", 18, Value::Ref(10), [100, 100, 1_200, 18]),
+            text("f", 24, Value::Ref(16), [100, 300, 1_200, 24]),
+        ],
+    );
+    let db = outline_support::decision_bundle_in(&r, decision.path(), &default);
+    let token = r.install(ScreenKind::Decision, &db, 2).unwrap();
+    r.commit(token).unwrap();
+    let before = r.memory();
+    let plan = Arc::new(r.decision_rows().unwrap().unwrap());
+    let (tx, rx) = mpsc::channel();
+    let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let _ = tx.send(());
+    });
+    let worker = LabelWorker::for_bundle(&db, Some(wake)).unwrap();
+    let mut store = LabelStore::new(LabelBook::shared([1_920, 1_080]));
+    let job = |generation: u64, title: &str| {
+        LabelJob::new(
+            generation,
+            title.into(),
+            1,
+            DecisionStrings::new(&ResultLabels {
+                title: title.to_owned(),
+                artist: "AB".to_owned(),
+                ..ResultLabels::default()
+            }),
+            Arc::clone(&plan),
+        )
+    };
+    let staged = |store: &mut LabelStore, r: &Renderer, generation: u64, title: &str| {
+        store.post(&worker, job(generation, title), &mut || {
+            r.watch_completion()
+        });
+        rx.recv_timeout(Duration::from_secs(60)).unwrap();
+        worker.take().unwrap().unwrap()
+    };
+    // Each output is claimed before the next job is posted: a newer post
+    // supersedes every older preparation.
+    let a = staged(&mut store, &r, 1, "A");
+    store.offer(a);
+    store.claim().unwrap();
+    while r.write_decision_labels(&mut store) == FillStep::Wrote {}
+    let _ = r.gpu().device().poll(wgpu::PollType::wait_indefinitely());
+    assert!(matches!(
+        r.settle_decision_labels(&mut store).unwrap(),
+        Settled::Published { .. }
+    ));
+    let bo = staged(&mut store, &r, 2, "B");
+    store.offer(bo);
+    store.claim().unwrap();
+    assert_eq!(r.write_decision_labels(&mut store), FillStep::Complete);
+    // A waiting output beside the fill: staged on this thread, as a
+    // rebuild's restore stages, since a post would dispose of the fill.
+    store.offer(
+        render::stage_bundle_labels(&db, job(3, "C"))
+            .unwrap()
+            .unwrap(),
+    );
+    let d = store.memory(Some(&worker));
+    assert!(d.labels > 0 && d.staged > 0 && d.upload > 0, "{d:?}");
+    assert!(d.staged <= plan.staged_bound(), "{d:?}");
+    assert!(d.upload <= render::DECISION_TEXT_WRITE_BUDGET);
+    assert!(d.text_mask >= plan.mask_bound(), "{d:?}");
+    let after = r.memory().with_decision(d);
+    assert_eq!(
+        (before.decision_labels, before.decision_staged),
+        (0, 0),
+        "the renderer's own witness leaves them out"
+    );
+    assert_eq!(
+        (after.text_scratch, after.text_mask, after.text_upload),
+        (before.text_scratch, before.text_mask, before.text_upload)
+    );
+    assert_eq!(after.text_cache, before.text_cache);
+    assert_eq!(
+        after.total(),
+        before.total() + d.labels + d.staged + d.text_mask + d.upload
+    );
 }
 
 /// A face whose `A` to `F` are blocks 7.8 em wide and 3.5 em tall less

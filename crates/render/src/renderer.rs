@@ -12,13 +12,17 @@ use std::time::{Duration, Instant};
 use bms_model::Chart;
 use eval::Section;
 use skin_model::{
-    AtlasId, AtlasLimits, BitmapLines, BuildError, ChartText, Layout, PackedPages, ResultFrame,
-    ResultScreen, ScreenKind, Selection, SelectionFrame, TextSlots, TextTable, TextTableError,
+    AtlasId, AtlasLimits, BitmapLines, BuildError, ChartText, DecisionFrame, DecisionLabels,
+    DecisionScreen, Layout, PackedPages, ResultFrame, ResultScreen, ScreenKind, Selection,
+    SelectionFrame, TextSlots, TextTable, TextTableError,
 };
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
+use crate::decision_labels::{
+    self, DecisionMemory, FillStep, LabelRegion, LabelStore, LabelTarget, RowPlan, Settled,
+};
 use crate::decl::{DeclSkin, Installation, SkinBundle, page_levels, pages_bytes, pages_texels};
 use crate::gpu::{self, AdapterChoice, Gpu};
 use crate::measure::{FrameStatistics, Presentation};
@@ -415,6 +419,15 @@ pub enum RenderError {
     /// committed or restored.
     #[error("the result skin is disabled for this run")]
     ResultDisabled,
+    /// The decision installation's label rows at the target pass half its
+    /// text layer: its labels cannot be prepared, and the kind is refused.
+    #[error("the decision labels need {needed} rows of a {band}-row band")]
+    LabelRegion {
+        /// The rows' heights together.
+        needed: u64,
+        /// Half the text layer's side.
+        band: u32,
+    },
     /// A pages-only installation asked for a kind other than the result's,
     /// the only kind that has one ([`Renderer::install_pages`]).
     #[error("the {kind} screen has no pages-only installation")]
@@ -442,6 +455,7 @@ impl RenderError {
             | Self::Admission { .. }
             | Self::ResultDisabled
             | Self::PagesKind { .. }
+            | Self::LabelRegion { .. }
             | Self::ChartImage { .. } => true,
             Self::Atlas(UploadError::Device(e)) => matches!(
                 e,
@@ -582,8 +596,11 @@ struct Resources {
     atlas_bind: wgpu::BindGroup,
     staging: Staging,
     instances: wgpu::Buffer,
-    /// The text layer's cache: empty with the atlas.
+    /// The text layer's cache: empty with the atlas; none for the
+    /// decision installation, whose layer is its label region.
     text_cache: TextCache,
+    /// The decision installation's label region over its text layer.
+    labels: Option<LabelRegion>,
 }
 
 /// The result kind's pages-only installation ([`Renderer::install_pages`]):
@@ -813,6 +830,18 @@ pub struct MemoryWitness {
     /// installation on another array (its array, layout, text cache,
     /// lines and own CPU description) or a pages-only one.
     pub retired: u64,
+    /// The decision label slots' contents: their strings, tables and
+    /// bitmap lines ([`with_decision`](Self::with_decision)).
+    pub decision_labels: u64,
+    /// The decision labels' levels staged and not yet written: the
+    /// worker's, the waiting output's and the filling slot's remainder.
+    pub decision_staged: u64,
+    /// The decision worker's A8 buffer and its producer's glyph mask
+    /// bound, apart from the renderer's own ([`text_mask`](Self::text_mask)).
+    pub decision_text_mask: u64,
+    /// The bytes the queue staged for the decision labels' last boundary
+    /// of writes, until the fill ends.
+    pub decision_upload: u64,
 }
 
 impl MemoryWitness {
@@ -846,6 +875,23 @@ impl MemoryWitness {
             .saturating_add(self.result_text)
             .saturating_add(self.result_loading)
             .saturating_add(self.retired)
+            .saturating_add(self.decision_labels)
+            .saturating_add(self.decision_staged)
+            .saturating_add(self.decision_text_mask)
+            .saturating_add(self.decision_upload)
+    }
+
+    /// The witness with the decision labels' bytes, which their owner
+    /// keeps apart from the renderer ([`LabelStore::memory`]).
+    #[must_use]
+    pub const fn with_decision(self, d: DecisionMemory) -> Self {
+        Self {
+            decision_labels: d.labels,
+            decision_staged: d.staged,
+            decision_text_mask: d.text_mask,
+            decision_upload: d.upload,
+            ..self
+        }
     }
 }
 
@@ -1126,6 +1172,23 @@ pub struct Renderer {
     /// preparation, is refused as a skin refuses one.
     #[cfg(any(test, feature = "dev-tools"))]
     result_faults: (bool, bool),
+    /// Tests and development builds: the next decision frame is refused
+    /// as a skin refuses one.
+    #[cfg(any(test, feature = "dev-tools"))]
+    decision_fault: bool,
+    /// Run by a decision label fill after its submission and the scopes'
+    /// pop, before its completion is registered: a unit test makes the
+    /// device fail there.
+    #[cfg(test)]
+    pub(crate) decision_after_submit: Option<fn(&Gpu)>,
+    /// Run by a decision label fill inside a boundary's scopes, after its
+    /// writes: a unit test makes a scope report an error.
+    #[cfg(test)]
+    pub(crate) decision_in_scope: Option<fn(&Gpu)>,
+    /// Unit tests: the pairs of error scopes the decision label fills
+    /// opened.
+    #[cfg(test)]
+    pub(crate) decision_scope_pairs: std::cell::Cell<usize>,
     /// Tests and development builds: the charges stated for bundles
     /// ([`state_charge`](Self::state_charge)).
     #[cfg(any(test, feature = "dev-tools"))]
@@ -1271,6 +1334,14 @@ impl Renderer {
             selection_faults: (false, false),
             #[cfg(any(test, feature = "dev-tools"))]
             result_faults: (false, false),
+            #[cfg(any(test, feature = "dev-tools"))]
+            decision_fault: false,
+            #[cfg(test)]
+            decision_after_submit: None,
+            #[cfg(test)]
+            decision_in_scope: None,
+            #[cfg(test)]
+            decision_scope_pairs: std::cell::Cell::new(0),
             #[cfg(any(test, feature = "dev-tools"))]
             stated: Vec::new(),
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
@@ -1812,7 +1883,7 @@ impl Renderer {
             }
             None => (
                 Installation::new(Arc::clone(bundle)),
-                PendingRes::Own(Box::new(self.resources_for(bundle)?)),
+                PendingRes::Own(Box::new(self.resources_for(kind, bundle)?)),
             ),
         };
         let mut skin = DeclSkin::of(&installation);
@@ -1902,10 +1973,23 @@ impl Renderer {
     /// uploaded with its bind group and an instance buffer for the staging,
     /// all finished on the GPU. A device refusing any of them (memory,
     /// validation) is answered as a refusal, never an uncaptured error.
-    fn resources_for(&mut self, bundle: &Arc<SkinBundle>) -> Result<Resources, RenderError> {
+    /// The decision kind's text layer is its label region, with no cache.
+    fn resources_for(
+        &mut self,
+        kind: ScreenKind,
+        bundle: &Arc<SkinBundle>,
+    ) -> Result<Resources, RenderError> {
         let staging = self.staging_for(bundle)?;
         let (atlas, atlas_bind, buffer, text_cache) =
             self.upload_array(bundle.atlas_pages(), Some(staging.instance_capacity()))?;
+        let (text_cache, labels) = if kind == ScreenKind::Decision {
+            let region = atlas
+                .text_layer()
+                .map(|layer| LabelRegion::new(atlas.side(), layer));
+            (TextCache::none(), region)
+        } else {
+            (text_cache, None)
+        };
         #[expect(
             clippy::expect_used,
             reason = "upload_array makes the instance buffer it is given a size for"
@@ -1917,6 +2001,7 @@ impl Renderer {
             staging,
             instances,
             text_cache,
+            labels,
         })
     }
 
@@ -2262,17 +2347,18 @@ impl Renderer {
                                     s.resources.atlas,
                                     s.resources.atlas_bind,
                                     s.resources.text_cache,
+                                    s.resources.labels,
                                     s.text,
                                 ))
                             }
                             (None, Some(p)) => {
-                                Some((p.atlas, p.atlas_bind, p.text_cache, Holder::default()))
+                                Some((p.atlas, p.atlas_bind, p.text_cache, None, Holder::default()))
                             }
                             (None, None) => None,
                         };
                         let canvas = installation.bundle().skin().canvas(target);
                         staging.project(&canvas);
-                        if let (Some((atlas, atlas_bind, text_cache, text)), Some(slot)) =
+                        if let (Some((atlas, atlas_bind, text_cache, labels, text)), Some(slot)) =
                             (held, self.screens.get_mut(i))
                         {
                             *slot = Some(Slot {
@@ -2283,6 +2369,7 @@ impl Renderer {
                                     staging: *staging,
                                     instances,
                                     text_cache,
+                                    labels,
                                 },
                                 text,
                             });
@@ -2379,7 +2466,7 @@ impl Renderer {
             return Err(RenderError::ResultDisabled);
         }
         self.admit(kind, installation.bundle())?;
-        let r = self.resources_for(installation.bundle())?;
+        let r = self.resources_for(kind, installation.bundle())?;
         match Self::screen(kind) {
             None => {
                 self.replace_resources(r);
@@ -3316,6 +3403,11 @@ impl Renderer {
                 .saturating_add(staged_result_text.map_or(0, |h| bytes(h.bytes()))),
             result_loading,
             retired,
+            // Kept apart from the renderer: `with_decision` adds them.
+            decision_labels: 0,
+            decision_staged: 0,
+            decision_text_mask: 0,
+            decision_upload: 0,
         }
     }
 
@@ -4275,6 +4367,181 @@ impl Renderer {
         }
     }
 
+    /// The committed decision installation's bundle, if any.
+    #[must_use]
+    pub fn decision_bundle(&self) -> Option<&Arc<SkinBundle>> {
+        self.committed_installation(ScreenKind::Decision)
+            .map(Installation::bundle)
+    }
+
+    /// The committed decision installation's label rows at the current
+    /// target ([`RowPlan`]); `None` without a decision installation. An
+    /// installation without rasterized text has none.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::LabelRegion`]: the rows do not fit half its text
+    /// layer, a refusal of the kind.
+    pub fn decision_rows(&self) -> Option<Result<RowPlan, RenderError>> {
+        let slot = self.decision_slot()?;
+        let skin = slot.installation.bundle().skin();
+        let rows = skin.outline_rows(self.target(), &Layout::AUTHOR);
+        let side = slot
+            .resources
+            .labels
+            .map_or(0, |_| slot.resources.atlas.side());
+        Some(RowPlan::new(&rows, side, skin.text_slots(), self.target()))
+    }
+
+    /// The decision slot, if committed.
+    fn decision_slot(&self) -> Option<&Slot> {
+        Self::screen(ScreenKind::Decision)
+            .and_then(|i| self.screens.get(i))
+            .and_then(Option::as_ref)
+    }
+
+    /// Where `store`'s fill writes: the decision slot's array and region.
+    fn label_target(&self) -> Option<LabelTarget<'_>> {
+        let slot = self.decision_slot()?;
+        Some(LabelTarget {
+            gpu: &self.gpu,
+            atlas: &slot.resources.atlas,
+            region: slot.resources.labels,
+            #[cfg(test)]
+            after_submit: self.decision_after_submit,
+            #[cfg(test)]
+            in_scope: self.decision_in_scope,
+            #[cfg(test)]
+            scope_pairs: &self.decision_scope_pairs,
+        })
+    }
+
+    /// One frame boundary's writes of `store`'s filling slot into the
+    /// decision installation's label region: at most
+    /// [`DECISION_TEXT_WRITE_BUDGET`](crate::DECISION_TEXT_WRITE_BUDGET)
+    /// bytes, each line's levels dropped once written; after the last,
+    /// one submission and one completion watched. Outside every frame.
+    pub fn write_decision_labels(&mut self, store: &mut LabelStore) -> FillStep {
+        match self.label_target() {
+            Some(t) => decision_labels::write_rows(&t, store),
+            None => FillStep::Idle,
+        }
+    }
+
+    /// Settles `store` at a frame boundary: polls without blocking,
+    /// settles the cooling slots, and publishes the filling slot once its
+    /// writes completed, the device healthy, its key current and every
+    /// write's scope empty. Outside every frame.
+    ///
+    /// # Errors
+    ///
+    /// A poll's failure ([`RenderError::Poll`]) or the device lost
+    /// ([`RenderError::DeviceLost`]), not refusals; a refused write
+    /// ([`RenderError::Atlas`]), a refusal of the kind.
+    pub fn settle_decision_labels(
+        &mut self,
+        store: &mut LabelStore,
+    ) -> Result<Settled, RenderError> {
+        match self.label_target() {
+            Some(t) => decision_labels::settle(&t, store),
+            None => Ok(Settled::Pending),
+        }
+    }
+
+    /// Restores pinned slot `slot`'s content in `store` from `staged` (its
+    /// generation's strings, [`LabelStore::restore_strings`], staged
+    /// again at the current target, [`stage_bundle_labels`](crate::stage_bundle_labels))
+    /// on this renderer, built again: every row written at once and waited
+    /// for, installed under the same generation and drawable again; the
+    /// slot stays pinned. Until then, after the store's and the book's
+    /// resets, the slot's content is not drawable. `Ok(false)`, nothing
+    /// written, when the slot is not restoring at `staged`'s generation.
+    ///
+    /// # Errors
+    ///
+    /// Without a decision installation, [`RenderError::LabelRegion`] with
+    /// no band (a refusal); otherwise as
+    /// [`settle_decision_labels`](Self::settle_decision_labels): the
+    /// device's failure, or a refusal of the kind.
+    pub fn restore_decision_labels(
+        &mut self,
+        store: &mut LabelStore,
+        slot: usize,
+        staged: decision_labels::StagedLabels,
+    ) -> Result<bool, RenderError> {
+        match self.label_target() {
+            Some(t) => decision_labels::restore_pinned(&t, store, slot, staged),
+            None => Err(RenderError::LabelRegion { needed: 0, band: 0 }),
+        }
+    }
+
+    /// Submits what is queued and registers one flag-only completion for
+    /// the work submitted so far, its flag returned: a label slot's watch
+    /// ([`LabelBook::retire`](crate::LabelBook::retire),
+    /// [`LabelStore::cancel`]).
+    #[must_use]
+    pub fn watch_completion(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        decision_labels::watch(&self.gpu)
+    }
+
+    /// The app's share of a decision frame: the decision installation's
+    /// skin builds `f` of `dec` into its slot's staging, its lines drawn
+    /// from `labels`, borrowed from their slot, with no call into wgpu.
+    /// Nothing allocates, the refusal included.
+    ///
+    /// # Errors
+    ///
+    /// The skin's refusal of the frame, or [`BuildError::Kind`] without a
+    /// decision installation: nothing of it is staged.
+    pub fn build_decision(
+        &mut self,
+        dec: &mut DecisionScreen,
+        labels: DecisionLabels<'_>,
+        f: &DecisionFrame<'_>,
+    ) -> Result<(), BuildError> {
+        self.started = None;
+        let start = Instant::now();
+        let target = self.target();
+        #[cfg(any(test, feature = "dev-tools"))]
+        if std::mem::take(&mut self.decision_fault) {
+            return Err(BuildError::Kind);
+        }
+        let Some(Some(slot)) =
+            Self::screen(ScreenKind::Decision).and_then(|i| self.screens.get_mut(i))
+        else {
+            return Err(BuildError::Kind);
+        };
+        let f = DecisionFrame { target, ..*f };
+        let bundle = slot.installation.bundle();
+        let uvs = bundle.uvs();
+        let skin = bundle.skin();
+        slot.resources.staging.build_with(
+            |quads| skin.build_decision_with(dec, labels, &f, uvs, quads),
+            &[],
+        )?;
+        self.started = Some(start);
+        Ok(())
+    }
+
+    /// Submits and presents the decision frame
+    /// [`build_decision`](Self::build_decision) staged, then each of
+    /// `texts` in a pass of its own over it. Without a frame built since,
+    /// nothing is acquired or submitted, as [`submit`](Self::submit).
+    ///
+    /// # Errors
+    ///
+    /// As [`menu_frame`](Self::menu_frame).
+    pub fn submit_decision(&mut self, texts: &[&MenuText]) -> Result<FrameTiming, RenderError> {
+        self.submit_screen(ScreenKind::Decision, texts)
+    }
+
+    /// Tests and development builds: the next decision frame is refused
+    /// ([`build_decision`](Self::build_decision)) as a skin refuses one.
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub fn refuse_next_decision(&mut self) {
+        self.decision_fault = true;
+    }
+
     /// Development builds: the result frame last built, the skin's quads
     /// in drawing order; `None` without a result layout.
     #[cfg(feature = "dev-tools")]
@@ -4885,6 +5152,10 @@ fn pipelines(
 
 /// The projection's uniform: half the canvas's size, padded to 16 bytes.
 const PROJECTION_BYTES: u64 = 16;
+
+#[cfg(test)]
+#[path = "decision_label_tests.rs"]
+mod decision_label_tests;
 
 #[cfg(test)]
 mod tests {
