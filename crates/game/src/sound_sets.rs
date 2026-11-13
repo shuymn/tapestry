@@ -141,13 +141,6 @@ impl SetRole {
             _ => Self::Sound,
         }
     }
-
-    /// The kinds a set of this role gives.
-    fn kinds(self) -> impl Iterator<Item = SystemKind> {
-        SystemKind::ALL
-            .into_iter()
-            .filter(move |&k| Self::of(k) == self)
-    }
 }
 
 /// The file name of `kind` without its extension, as the source names it.
@@ -295,6 +288,8 @@ pub enum Why {
     NotAFile,
     /// It could not be resolved (a dangling link).
     Unresolved,
+    /// Its metadata could not be read for a reason other than its absence.
+    Unreadable(io::ErrorKind),
     /// Its decode refused it.
     File(FileRefusal),
 }
@@ -305,6 +300,7 @@ impl fmt::Display for Why {
             Self::Escapes => f.write_str("it leads out of its folder"),
             Self::NotAFile => f.write_str("it is not a regular file"),
             Self::Unresolved => f.write_str("it cannot be resolved"),
+            Self::Unreadable(kind) => write!(f, "it cannot be read: {kind}"),
             Self::File(r) => r.fmt(f),
         }
     }
@@ -332,20 +328,27 @@ impl fmt::Display for Refused {
 
 /// `kind`'s file in the canonical `folder`: the first of its names with
 /// [`EXTENSIONS`] that exists, stays inside the folder and is a regular
-/// file. Each one that exists but fails is refused into `refused` and the
-/// next is tried. Nothing is opened: a FIFO is refused by its type.
+/// file. Only a name the system reports not found is absent: one whose
+/// metadata cannot be read, or that exists but fails, is refused into
+/// `refused` and the next is tried. Nothing is opened: a FIFO is refused by
+/// its type.
 fn locate(folder: &Path, kind: SystemKind, refused: &mut Vec<Refused>) -> Option<PathBuf> {
     for ext in EXTENSIONS {
         let joined = folder.join(format!("{}.{ext}", file_stem(kind)));
-        if fs::symlink_metadata(&joined).is_err() {
-            continue;
-        }
         let mut refuse = |why| {
             refused.push(Refused {
                 path: joined.clone(),
                 why,
             });
         };
+        match candidate_metadata(&joined) {
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                refuse(Why::Unreadable(e.kind()));
+                continue;
+            }
+        }
         let Ok(canonical) = joined.canonicalize() else {
             refuse(Why::Unresolved);
             continue;
@@ -363,6 +366,38 @@ fn locate(folder: &Path, kind: SystemKind, refused: &mut Vec<Refused>) -> Option
     None
 }
 
+/// A candidate's own metadata, links not followed; in tests, an injected
+/// error first.
+fn candidate_metadata(path: &Path) -> io::Result<fs::Metadata> {
+    #[cfg(test)]
+    if let Some(kind) = inject::metadata_fault(path) {
+        return Err(kind.into());
+    }
+    fs::symlink_metadata(path)
+}
+
+/// A test-only hook that fails a chosen candidate's metadata read.
+#[cfg(test)]
+mod inject {
+    use std::cell::RefCell;
+    use std::io::ErrorKind;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        /// The candidates whose metadata read fails on this thread.
+        static METADATA: RefCell<Vec<(PathBuf, ErrorKind)>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// The metadata read of `path` fails with `kind` on this thread.
+    pub fn fail_metadata(path: &Path, kind: ErrorKind) {
+        METADATA.with(|m| m.borrow_mut().push((path.to_owned(), kind)));
+    }
+
+    pub fn metadata_fault(path: &Path) -> Option<ErrorKind> {
+        METADATA.with(|m| m.borrow().iter().find(|(p, _)| p == path).map(|&(_, k)| k))
+    }
+}
+
 /// One file of a source's identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -376,8 +411,11 @@ pub struct FileStamp {
 }
 
 /// A source's identity (design.md T18): its canonical folder with the name,
-/// size and modification time of each of its candidate files that exist,
-/// sorted by name. A change of any of them makes another identity.
+/// size and modification time of each candidate file of every kind that
+/// exists in it, sorted by name. It covers every kind whatever role the
+/// folder serves, so a folder that is a sound set, a BGM set and
+/// `defaultsound\` at once has one identity, and its quarantine holds for
+/// every role. A change of any of them makes another identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceIdentity {
@@ -388,11 +426,10 @@ pub struct SourceIdentity {
 }
 
 impl SourceIdentity {
-    /// The identity of the canonical `folder` over the candidates of
-    /// `kinds`.
-    fn of(folder: &Path, kinds: impl Iterator<Item = SystemKind>) -> Self {
+    /// The identity of the canonical `folder`.
+    fn of(folder: &Path) -> Self {
         let mut files = Vec::new();
-        for kind in kinds {
+        for kind in SystemKind::ALL {
             for ext in EXTENSIONS {
                 let name = format!("{}.{ext}", file_stem(kind));
                 let path = folder.join(&name);
@@ -503,22 +540,15 @@ pub struct Resolution {
 /// if absent.
 pub fn resolve(pick: &SetPick, excluded: &mut dyn FnMut(&SourceIdentity) -> bool) -> Resolution {
     let mut sources: [Option<SourceIdentity>; 3] = Default::default();
-    for (source, folder, kinds) in [
-        (
-            Source::SoundSet,
-            pick.sound_set.as_deref(),
-            Some(SetRole::Sound),
-        ),
-        (Source::BgmSet, pick.bgm_set.as_deref(), Some(SetRole::Bgm)),
-        (Source::Defaults, Some(pick.defaults.as_path()), None),
+    for (source, folder) in [
+        (Source::SoundSet, pick.sound_set.as_deref()),
+        (Source::BgmSet, pick.bgm_set.as_deref()),
+        (Source::Defaults, Some(pick.defaults.as_path())),
     ] {
         let Some(folder) = folder.and_then(|f| f.canonicalize().ok()) else {
             continue;
         };
-        let identity = match kinds {
-            Some(role) => SourceIdentity::of(&folder, role.kinds()),
-            None => SourceIdentity::of(&folder, SystemKind::ALL.into_iter()),
-        };
+        let identity = SourceIdentity::of(&folder);
         if !excluded(&identity)
             && let Some(slot) = sources.get_mut(source.index())
         {
@@ -563,12 +593,11 @@ pub fn random_index(n: usize) -> usize {
     usize::try_from(h.finish() % n).unwrap_or(0)
 }
 
-/// Chooses one of `sets` (a [`scan`]'s, of `role`) with `index`, leaving
-/// out those whose identity `recovery` quarantines or `skipped` holds; the
-/// identity is read only for a set whose folder one of them names.
+/// Chooses one of `sets` (a [`scan`]'s) with `index`, leaving out those
+/// whose identity `recovery` quarantines or `skipped` holds; the identity
+/// is read only for a set whose folder one of them names.
 pub fn choose(
     sets: &[PathBuf],
-    role: SetRole,
     recovery: &mut Recovery,
     skipped: &[SourceIdentity],
     index: &mut dyn FnMut(usize) -> usize,
@@ -578,7 +607,7 @@ pub fn choose(
         .filter(|set| {
             let named = recovery.names(set) || skipped.iter().any(|s| &s.path == *set);
             !named || {
-                let identity = SourceIdentity::of(set, role.kinds());
+                let identity = SourceIdentity::of(set);
                 recovery.admits(&identity) && !skipped.contains(&identity)
             }
         })
@@ -859,8 +888,9 @@ impl Recovery {
     }
 
     /// Whether `identity` may decode: not while it equals a quarantined
-    /// one. A quarantined identity of the same folder that differs is
-    /// stale: it is dropped, and the next commit writes that.
+    /// one. A folder has one identity whatever role it serves, so a
+    /// quarantined identity of the same folder that differs is stale (its
+    /// candidates changed): it is dropped, and the next commit writes that.
     pub fn admits(&mut self, identity: &SourceIdentity) -> bool {
         if self.state.quarantined.contains(identity) {
             return false;
@@ -902,11 +932,14 @@ impl Recovery {
     }
 }
 
-/// A sound a later pick may keep: its PCM, shared, and its source.
+/// A sound a later pick may keep: its PCM, shared, its file's content and
+/// its source.
 #[derive(Clone, Debug)]
 pub struct Kept {
     /// The sound.
     pub sound: Arc<Sound>,
+    /// The SHA-256 of the bytes of the file it was decoded from.
+    pub digest: [u8; 32],
     /// The identity of the source it was decoded from.
     pub source: SourceIdentity,
 }
@@ -1012,7 +1045,8 @@ type Slots = [Option<Kept>; SYSTEM_KINDS];
 /// then each source with a file to decode is decoded under its marker,
 /// committed before its first byte is read and cleared after, whatever the
 /// outcome. Identical bytes at different paths are decoded and charged
-/// once. A cancel stops at the next check; a marker that cannot be
+/// once, a kept sound's file's bytes included: a file the pick finds with
+/// them shares the kept sound. A cancel stops at the next check; a marker that cannot be
 /// committed stops the pick before that source is read; one that cannot be
 /// cleared stops it after.
 pub fn decode_pick(
@@ -1054,8 +1088,9 @@ fn pick_body(
     });
     let mut refused = resolution.refused;
     let mut slots: Slots = Default::default();
-    // The kept sounds first, each distinct one charged once.
-    let mut charged: Vec<Arc<Sound>> = Vec::new();
+    // The kept sounds first, each content charged once and taken, so a file
+    // of the same bytes shares the kept sound.
+    let mut digests: HashMap<[u8; 32], Arc<Sound>> = HashMap::new();
     for kind in SystemKind::ALL {
         if !matches!(resolution.kinds.get(kind.index()), Some(Resolved::Missing)) {
             continue;
@@ -1064,14 +1099,20 @@ fn pick_body(
         if recovery.quarantined().contains(&k.source) || pick.skipped.contains(&k.source) {
             continue;
         }
-        if !charged.iter().any(|c| Arc::ptr_eq(c, &k.sound)) {
-            if budget.charge(k.sound.bytes()).is_err() {
-                continue;
-            }
-            charged.push(Arc::clone(&k.sound));
+        if budget.keep(k.digest, k.sound.bytes()).is_err() {
+            continue;
         }
+        let sound = Arc::clone(
+            digests
+                .entry(k.digest)
+                .or_insert_with(|| Arc::clone(&k.sound)),
+        );
         if let Some(slot) = slots.get_mut(kind.index()) {
-            *slot = Some(k.clone());
+            *slot = Some(Kept {
+                sound,
+                digest: k.digest,
+                source: k.source.clone(),
+            });
         }
     }
     let mut report = PickReport {
@@ -1081,7 +1122,6 @@ fn pick_body(
         refused: Vec::new(),
         panicked: Vec::new(),
     };
-    let mut digests: HashMap<[u8; 32], Arc<Sound>> = HashMap::new();
     let mut cancelled = false;
     for source in Source::ALL {
         let files: Vec<(SystemKind, &Path)> = SystemKind::ALL
@@ -1118,10 +1158,11 @@ fn pick_body(
                 cancelled: c,
             }) => {
                 refused.extend(r);
-                for (kind, sound) in sounds {
+                for (kind, sound, digest) in sounds {
                     if let Some(slot) = slots.get_mut(kind.index()) {
                         *slot = Some(Kept {
                             sound,
+                            digest,
                             source: identity.clone(),
                         });
                     }
@@ -1155,7 +1196,7 @@ fn pick_body(
 
 /// What one source's decode made.
 struct SourceDecode {
-    sounds: Vec<(SystemKind, Arc<Sound>)>,
+    sounds: Vec<(SystemKind, Arc<Sound>, [u8; 32])>,
     refused: Vec<Refused>,
     cancelled: bool,
 }
@@ -1178,11 +1219,11 @@ fn decode_source(
             Ok(Decoded::Sound { sound, digest }) => {
                 let sound = Arc::new(sound);
                 digests.insert(digest, Arc::clone(&sound));
-                out.sounds.push((kind, sound));
+                out.sounds.push((kind, sound, digest));
             }
             Ok(Decoded::Same { digest }) => {
                 if let Some(sound) = digests.get(&digest) {
-                    out.sounds.push((kind, Arc::clone(sound)));
+                    out.sounds.push((kind, Arc::clone(sound), digest));
                 }
             }
             Err(FileRefusal::Cancelled) => {
@@ -1196,4 +1237,107 @@ fn decode_source(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::ErrorKind;
+
+    use super::*;
+
+    /// A 16-bit mono WAV at 48 kHz holding 64 frames of `value`.
+    fn wav(value: i16) -> Vec<u8> {
+        let data: u32 = 128;
+        let mut b = Vec::new();
+        b.extend_from_slice(b"RIFF");
+        b.extend_from_slice(&(36 + data).to_le_bytes());
+        b.extend_from_slice(b"WAVEfmt ");
+        b.extend_from_slice(&16u32.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&1u16.to_le_bytes());
+        b.extend_from_slice(&48_000u32.to_le_bytes());
+        b.extend_from_slice(&96_000u32.to_le_bytes());
+        b.extend_from_slice(&2u16.to_le_bytes());
+        b.extend_from_slice(&16u16.to_le_bytes());
+        b.extend_from_slice(b"data");
+        b.extend_from_slice(&data.to_le_bytes());
+        for _ in 0..64 {
+            b.extend_from_slice(&value.to_le_bytes());
+        }
+        b
+    }
+
+    fn decode(pick: &SetPick, kept: &KeptSounds, recovery: &mut Recovery) -> PickReport {
+        let budget = PickBudget::new(PICK_BYTES);
+        decode_pick(pick, kept, &budget, recovery, &|| false, &OneFile)
+    }
+
+    /// A candidate whose metadata cannot be read is refused and named once,
+    /// not taken as absent: lookup moves on to the next candidate, and a
+    /// kind left with no other is silent, not given the previous pick's
+    /// sound (design.md T18).
+    #[test]
+    fn an_unreadable_candidate_is_refused_not_missing() {
+        let tmp = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        fs::create_dir_all(&tmp).unwrap();
+        let dir = tempfile::tempdir_in(tmp).unwrap();
+        let data = DataRoot::new(dir.path().join("data"));
+        let set = data.sound().join("set");
+        fs::create_dir_all(&set).unwrap();
+        for (name, value) in [
+            ("clear.wav", 1),
+            ("fail.wav", 2),
+            ("scratch.wav", 3),
+            ("scratch.flac", 4),
+        ] {
+            fs::write(set.join(name), wav(value)).unwrap();
+        }
+        let pick = SetPick {
+            sound_set: Some(set.clone()),
+            bgm_set: None,
+            defaults: data.default_sounds(),
+            id: GenId(1),
+            rate: 48_000,
+            limits: BankLimits::default(),
+            skipped: Vec::new(),
+        };
+        let mut recovery = Recovery::open(&data, Box::new(DiskFs::default()))
+            .unwrap()
+            .recovery;
+        let a = decode(&pick, &KeptSounds::default(), &mut recovery);
+        assert!(matches!(a.decode, PickDecode::Ready(_)), "{:?}", a.decode);
+        assert!(a.kept.get(SystemKind::Fail).is_some());
+
+        let set = set.canonicalize().unwrap();
+        for name in ["fail.wav", "scratch.wav"] {
+            inject::fail_metadata(&set.join(name), ErrorKind::PermissionDenied);
+        }
+        let b = decode(&pick, &a.kept, &mut recovery);
+        let PickDecode::Ready(generation) = b.decode else {
+            panic!("{:?}", b.decode)
+        };
+        let unreadable = |name: &str| Refused {
+            path: set.join(name),
+            why: Why::Unreadable(ErrorKind::PermissionDenied),
+        };
+        let mut refused = b.refused.clone();
+        refused.sort_by(|x, y| x.path.cmp(&y.path));
+        assert_eq!(
+            refused,
+            [unreadable("fail.wav"), unreadable("scratch.wav")],
+            "each refused once"
+        );
+        assert_eq!(
+            generation.sound(SystemKind::Fail),
+            None,
+            "the refused kind kept the previous sound"
+        );
+        assert!(b.kept.get(SystemKind::Fail).is_none());
+        let scratch = b.kept.get(SystemKind::Scratch).expect("scratch.flac");
+        assert!(!Arc::ptr_eq(
+            &scratch.sound,
+            &a.kept.get(SystemKind::Scratch).unwrap().sound
+        ));
+        assert!(generation.sound(SystemKind::Clear).is_some());
+    }
 }

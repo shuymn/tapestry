@@ -1572,6 +1572,25 @@ impl PickBudget {
             .map(|_| ())
             .map_err(|_| FileRefusal::OverCap(Cap::BankMemory))
     }
+
+    /// Charges a kept sound of `bytes`, decoded from a file whose bytes
+    /// hash to `digest`, and takes that content: a file of the same bytes
+    /// comes back from [`decode_one`] as [`Decoded::Same`]. A content
+    /// already taken is charged nothing more.
+    ///
+    /// # Errors
+    ///
+    /// [`FileRefusal::OverCap`] with [`Cap::BankMemory`] when they do not
+    /// fit in what remains; nothing is charged or taken then.
+    pub fn keep(&self, digest: [u8; 32], bytes: u64) -> Result<(), FileRefusal> {
+        let mut taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
+        if taken.contains_key(&digest) {
+            return Ok(());
+        }
+        self.charge(bytes)?;
+        taken.insert(digest, self.files.fetch_add(1, Ordering::Relaxed));
+        Ok(())
+    }
 }
 
 /// Why [`decode_one`] stored no sound.

@@ -156,55 +156,70 @@ fn scan_finds_sets_at_any_depth_and_never_enters_links() {
     );
 }
 
-/// ST2: each cap at its bound: a set at depth 8 is found and one at depth
-/// 9 is not, while a set listed after that deep branch is still found (the
-/// depth cap prunes, it does not stop the scan); the 4 096th folder is
-/// listed and the 4 097th is not; the 65 536th entry is listed and the
-/// 65 537th is not. Each cap is named once.
+/// ST2: the default caps are depth 8, 4 096 folders and 65 536 entries.
+/// Each cap, set small, at its bound: a set at the deepest depth is found
+/// and one deeper is not, while a set listed after that deep branch is
+/// still found (the depth cap prunes, it does not stop the scan); the last
+/// folder allowed is listed and the next is not; the last entry allowed is
+/// listed and the next is not, so a folder whose listing it cuts is not a
+/// set. Each cap is named once.
 #[test]
 fn scan_caps_stop_at_their_bounds() {
-    let limits = ScanLimits::default();
+    let defaults = ScanLimits::default();
     assert_eq!(
-        (limits.depth, limits.folders, limits.entries),
+        (defaults.depth, defaults.folders, defaults.entries),
         (8, 4_096, 65_536)
     );
 
     let base = tmp();
+    let limits = ScanLimits {
+        depth: 2,
+        ..defaults
+    };
     let root = base.path().join("deep");
-    let eight: PathBuf = (1..=8).map(|d| format!("d{d}")).collect();
-    put(&root.join(&eight), "clear.wav");
-    put(&root.join(&eight).join("d9"), "clear.wav");
-    put(&root.join(&eight).join("e9"), "clear.wav");
+    let two = Path::new("d1/d2");
+    put(&root.join(two), "clear.wav");
+    put(&root.join(two).join("d3"), "clear.wav");
+    put(&root.join(two).join("e3"), "clear.wav");
     put(&root.join("z"), "clear.wav");
     let scanned = scan(&root, SetRole::Sound, &limits);
     assert_eq!(
         scanned.sets,
-        [canon(&root.join(&eight)), canon(&root.join("z"))]
+        [canon(&root.join(two)), canon(&root.join("z"))]
     );
     assert_eq!(scanned.caps, [ScanCap::Depth]);
 
-    // The root and 4 096 folders: the root is listed first, so the last
-    // folder in order is the 4 097th.
+    // The root and 4 folders under a cap of 4: the root is listed first, so
+    // the last folder in order is the 5th.
+    let limits = ScanLimits {
+        folders: 4,
+        ..defaults
+    };
     let root = base.path().join("wide");
-    for i in 0..4_096 {
-        fs::create_dir_all(root.join(format!("f{i:04}"))).unwrap();
+    for i in 0..4 {
+        fs::create_dir_all(root.join(format!("f{i}"))).unwrap();
     }
-    for i in [0, 4_094, 4_095] {
-        put(&root.join(format!("f{i:04}")), "clear.wav");
+    for i in [0, 2, 3] {
+        put(&root.join(format!("f{i}")), "clear.wav");
     }
     let scanned = scan(&root, SetRole::Sound, &limits);
     assert_eq!(
         scanned.sets,
-        [canon(&root.join("f0000")), canon(&root.join("f4094"))]
+        [canon(&root.join("f0")), canon(&root.join("f2"))]
     );
     assert_eq!(scanned.caps, [ScanCap::Folders]);
 
-    // The root lists 65 533 files and the folders `a` and `b`; `a` lists
-    // its marker, the 65 536th entry, and `b`'s marker is the 65 537th.
+    // Under a cap of 8 entries, the root lists 5 files and the folders `a`
+    // and `b`; `a` lists its marker, the 8th entry, and `b`'s marker is the
+    // 9th.
+    let limits = ScanLimits {
+        entries: 8,
+        ..defaults
+    };
     let root = base.path().join("many");
     fs::create_dir_all(&root).unwrap();
-    for i in 0..65_533 {
-        fs::File::create(root.join(format!("n{i:05}"))).unwrap();
+    for i in 0..5 {
+        fs::File::create(root.join(format!("n{i}"))).unwrap();
     }
     put(&root.join("a"), "clear.wav");
     put(&root.join("b"), "clear.wav");
@@ -818,21 +833,128 @@ fn choose_leaves_out_quarantined_sets() {
     let sets = scan(&f.data.sound(), SetRole::Sound, &ScanLimits::default()).sets;
     assert_eq!(sets.len(), 2);
     for at in [0, 1, 5] {
-        let chosen = choose(&sets, SetRole::Sound, &mut recovery, &[], &mut |n| {
+        let chosen = choose(&sets, &mut recovery, &[], &mut |n| {
             assert_eq!(n, 1);
             at
         });
         assert_eq!(chosen, Some(canon(&other)));
     }
-    let chosen = choose(
-        &sets,
-        SetRole::Sound,
-        &mut recovery,
-        &[identity_of_set(&other)],
-        &mut |_| 0,
-    );
+    let chosen = choose(&sets, &mut recovery, &[identity_of_set(&other)], &mut |_| 0);
     assert_eq!(chosen, None, "a skipped set is chosen");
     assert!(random_index(3) < 3);
+}
+
+/// The real decode, except that at `select.wav` it copies the recovery
+/// state as it stands: what a launch that crashed there would leave.
+struct CrashAtSelect {
+    state: PathBuf,
+    left: Mutex<Option<Vec<u8>>>,
+}
+
+impl DecodeFile for CrashAtSelect {
+    fn decode(
+        &self,
+        path: &Path,
+        rate: u32,
+        budget: &PickBudget,
+        limits: &BankLimits,
+        cancel: &(dyn Fn() -> bool + Sync),
+    ) -> Result<Decoded, FileRefusal> {
+        if path.file_name().is_some_and(|n| n == "select.wav") {
+            *self.left.lock().unwrap() = Some(fs::read(&self.state).unwrap());
+        }
+        OneFile.decode(path, rate, budget, limits, cancel)
+    }
+}
+
+/// One folder as the sound root, the BGM root and `defaultsound\`: a launch
+/// that crashes decoding its BGM file quarantines the folder for every
+/// role, and it stays quarantined across launches while each role chooses
+/// again; a healthy sound set beside it is still chosen.
+// Covers: T18
+#[test]
+fn a_folder_quarantined_in_one_role_stays_so_in_every_role() {
+    let base = tmp();
+    let data = DataRoot::new(base.path().join("data"));
+    let shared = data.default_sounds();
+    put_bytes(&shared, "clear.wav", &wav(480, 200));
+    put_bytes(&shared, "select.wav", &wav(240, -200));
+    let other = shared.join("other");
+    put_bytes(&other, "clear.wav", &wav(120, 50));
+    let both = pick(Some(&shared), Some(&shared), &shared);
+
+    // The first launch crashes decoding `select.wav`, its BGM marker
+    // committed.
+    let crash = CrashAtSelect {
+        state: data.sound_sets(),
+        left: Mutex::new(None),
+    };
+    {
+        let mut recovery = Recovery::open(&data, Box::new(DiskFs::default()))
+            .unwrap()
+            .recovery;
+        let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
+        decode_pick(
+            &both,
+            &KeptSounds::default(),
+            &budget,
+            &mut recovery,
+            &|| false,
+            &crash,
+        );
+    }
+    let left = crash
+        .left
+        .lock()
+        .unwrap()
+        .take()
+        .expect("select.wav decoded");
+    fs::write(data.sound_sets(), &left).unwrap();
+
+    let limits = ScanLimits::default();
+    let sound_sets = scan(&shared, SetRole::Sound, &limits).sets;
+    let bgm_sets = scan(&shared, SetRole::Bgm, &limits).sets;
+    assert_eq!(sound_sets, [canon(&shared), canon(&other)]);
+    assert_eq!(bgm_sets, [canon(&shared)]);
+    for launch in 2..=3 {
+        let opened = Recovery::open(&data, Box::new(DiskFs::default())).unwrap();
+        let mut recovery = opened.recovery;
+        if launch == 2 {
+            assert_eq!(
+                opened.quarantined.as_ref().map(|q| &q.path),
+                Some(&canon(&shared))
+            );
+        }
+        assert_eq!(recovery.quarantined().len(), 1, "launch {launch}");
+        let sound = choose(&sound_sets, &mut recovery, &[], &mut |n| {
+            assert_eq!(n, 1, "launch {launch}: the sound sets open");
+            0
+        });
+        assert_eq!(sound, Some(canon(&other)), "launch {launch}");
+        let bgm = choose(&bgm_sets, &mut recovery, &[], &mut |_| 0);
+        assert_eq!(bgm, None, "launch {launch}: the BGM set chosen");
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
+        let report = decode_pick(
+            &pick(sound.as_deref(), bgm.as_deref(), &shared),
+            &KeptSounds::default(),
+            &budget,
+            &mut recovery,
+            &|| false,
+            &LoggedDecode(Arc::clone(&seen)),
+        );
+        assert_eq!(
+            ops(&seen),
+            ["decode clear.wav"],
+            "launch {launch}: only the other set is read"
+        );
+        assert!(matches!(report.decode, PickDecode::Ready(_)));
+        assert_eq!(
+            recovery.quarantined().len(),
+            1,
+            "launch {launch}: the quarantine dropped"
+        );
+    }
 }
 
 fn identity_of_set(set: &Path) -> game::sound_sets::SourceIdentity {
@@ -864,7 +986,9 @@ fn a_kind_with_no_candidate_keeps_its_sound() {
         panic!()
     };
     let b_set = f.data.sound().join("b");
-    put(&b_set, "clear.wav");
+    put_bytes(&b_set, "clear.wav", &wav(96, 50));
+    // A byte copy of A's `scratch.wav`.
+    put(&b_set, "o-close.wav");
     fs::create_dir_all(b_set.join("fail.wav")).unwrap();
     let b_pick = pick(Some(&b_set), None, &f.data.default_sounds());
     let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
@@ -885,6 +1009,12 @@ fn a_kind_with_no_candidate_keeps_its_sound() {
         b_gen.sound(SystemKind::Fail),
         None,
         "a refused candidate keeps nothing"
+    );
+    assert!(
+        b_gen
+            .sound(SystemKind::OptionClose)
+            .is_some_and(|s| Arc::ptr_eq(s, kept)),
+        "a copy of a kept sound's bytes does not play the kept sound"
     );
     assert_eq!(budget.used(), b_gen.bytes());
     assert_eq!(
@@ -913,6 +1043,63 @@ fn a_kind_with_no_candidate_keeps_its_sound() {
         None,
         "a skipped source's sound kept"
     );
+}
+
+/// A kept sound of 80 MiB and a file the new pick finds with the same bytes
+/// fit a 128 MiB budget: the content is charged once, and the file shares
+/// the kept sound.
+#[test]
+fn a_copy_of_a_kept_sound_is_charged_once() {
+    const MIB: usize = 1024 * 1024;
+    let f = fixture();
+    let big = wav(40 * MIB, 7);
+    put_bytes(&f.set, "scratch.wav", &big);
+    let mut a_pick = set_pick(&f);
+    a_pick.limits.max_sound_seconds = 1_000;
+    let mut recovery = Recovery::open(&f.data, Box::new(DiskFs::default()))
+        .unwrap()
+        .recovery;
+    let first = PickBudget::new(game::sound_sets::PICK_BYTES);
+    let a = decode_pick(
+        &a_pick,
+        &KeptSounds::default(),
+        &first,
+        &mut recovery,
+        &|| false,
+        &OneFile,
+    );
+    let kept = Arc::clone(&a.kept.get(SystemKind::Scratch).expect("scratch").sound);
+    assert_eq!(kept.bytes(), 80 * 1024 * 1024);
+
+    // B has no `scratch` and a byte copy of it as `fail.wav`.
+    let b_set = f.data.sound().join("b");
+    put_bytes(&b_set, "clear.wav", &wav(96, 50));
+    put_bytes(&b_set, "fail.wav", &big);
+    drop(big);
+    let mut b_pick = pick(Some(&b_set), None, &f.data.default_sounds());
+    b_pick.limits.max_sound_seconds = 1_000;
+    let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
+    let b = decode_pick(
+        &b_pick,
+        &a.kept,
+        &budget,
+        &mut recovery,
+        &|| false,
+        &OneFile,
+    );
+    assert_eq!(b.refused, [], "the copy was charged again");
+    let PickDecode::Ready(b_gen) = b.decode else {
+        panic!("{:?}", b.decode)
+    };
+    for kind in [SystemKind::Scratch, SystemKind::Fail] {
+        assert!(
+            b_gen.sound(kind).is_some_and(|s| Arc::ptr_eq(s, &kept)),
+            "{kind:?} does not play the kept sound"
+        );
+    }
+    let clear = b_gen.sound(SystemKind::Clear).unwrap().bytes();
+    assert_eq!(budget.used(), kept.bytes() + clear);
+    assert_eq!(b_gen.bytes(), kept.bytes() + clear);
 }
 
 /// A file with the same bytes as a refused one is refused and named too,
