@@ -141,7 +141,7 @@ impl Showing {
     fn poll(
         &mut self,
         window: &impl ShowWindow,
-        controls: &Controls,
+        focus: impl FnOnce(bool),
         shared: &Shared,
         now: Instant,
     ) -> Option<Instant> {
@@ -149,25 +149,25 @@ impl Showing {
             return None;
         }
         if shared.presented.load(Ordering::Acquire) {
-            self.show(window, controls, shared);
+            self.show(window, focus, shared);
             return None;
         }
         if now >= self.deadline {
             println!("window: no frame within {SHOW_TIMEOUT:?}; shown anyway");
-            self.show(window, controls, shared);
+            self.show(window, focus, shared);
             return None;
         }
         Some((now + SHOW_POLL).min(self.deadline))
     }
 
-    /// Shows `window` and tells `controls` whether it has focus, so the
-    /// focus latch and the input thread see the window gain focus even
-    /// when no focus event follows the show; then wakes whoever waits for
-    /// the show.
-    fn show(&mut self, window: &impl ShowWindow, controls: &Controls, shared: &Shared) {
+    /// Shows `window` and tells `focus` whether it has focus (the window's
+    /// focus change, [`App::focus`]), so the focus latch and the input
+    /// thread see the window gain focus even when no focus event follows
+    /// the show; then wakes whoever waits for the show.
+    fn show(&mut self, window: &impl ShowWindow, focus: impl FnOnce(bool), shared: &Shared) {
         self.shown = true;
         window.show();
-        controls.focus(window.has_focus());
+        focus(window.has_focus());
         shared.mark_shown();
     }
 }
@@ -312,7 +312,7 @@ impl ApplicationHandler<Ask> for App {
             .with_fullscreen(Some(Fullscreen::Borderless(monitor)));
         match event_loop.create_window(attrs) {
             Ok(w) => {
-                self.controls.focus(w.has_focus());
+                self.focus(w.has_focus());
                 let surface = surface(&w);
                 let _ = ready.send(surface);
                 publish(&self.shared.extent, &w);
@@ -330,10 +330,7 @@ impl ApplicationHandler<Ask> for App {
     fn window_event(&mut self, _event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::Focused(focused) => {
-                self.controls.focus(focused);
-                if !focused {
-                    self.capture.focus_lost(&self.pointer);
-                }
+                self.focus(focused);
                 #[cfg(feature = "dev-tools")]
                 if !focused {
                     crate::dev::print_foreground(self.controls.now());
@@ -454,9 +451,21 @@ impl ApplicationHandler<Ask> for App {
 impl App {
     /// Shows the hidden window once its first frame was presented, or at
     /// its deadline; until then the loop wakes to look again.
+    /// The window's focus is `focused`, as every focus change the window
+    /// reports goes: the pointer cancelled first on a loss, then the
+    /// controls told, which wake the game thread
+    /// ([`Capture::focus_changed`]).
+    fn focus(&mut self, focused: bool) {
+        let controls = &self.controls;
+        self.capture
+            .focus_changed(&self.pointer, focused, |f| controls.focus(f));
+    }
+
     fn poll_showing(&mut self, event_loop: &ActiveEventLoop) {
         if let (Some(w), Some(showing)) = (&self.window, &mut self.showing) {
-            let flow = match showing.poll(w, &self.controls, &self.shared, Instant::now()) {
+            let (capture, pointer, controls) = (&mut self.capture, &self.pointer, &self.controls);
+            let focus = |f| capture.focus_changed(pointer, f, |f| controls.focus(f));
+            let flow = match showing.poll(w, focus, &self.shared, Instant::now()) {
                 Some(next) => ControlFlow::WaitUntil(next),
                 None => ControlFlow::Wait,
             };
@@ -1213,17 +1222,17 @@ mod tests {
         c.focus(false);
         // Nothing presented: it looks again soon, still hidden.
         assert_eq!(
-            showing.poll(&w, &c, &shared, start),
+            showing.poll(&w, |f| c.focus(f), &shared, start),
             Some(start + super::SHOW_POLL)
         );
         assert_eq!(w.shows.get(), 0);
         assert!(!shown.wait(Duration::ZERO));
         shared.presented.store(true, Ordering::Release);
-        assert_eq!(showing.poll(&w, &c, &shared, start), None);
+        assert_eq!(showing.poll(&w, |f| c.focus(f), &shared, start), None);
         assert_eq!(w.shows.get(), 1);
         assert!(c.focused());
         assert!(shown.wait(Duration::ZERO));
-        assert_eq!(showing.poll(&w, &c, &shared, start), None);
+        assert_eq!(showing.poll(&w, |f| c.focus(f), &shared, start), None);
         assert_eq!(w.shows.get(), 1);
     }
 
@@ -1245,7 +1254,7 @@ mod tests {
         window_side.presented.store(true, Ordering::Release);
         let showed = Instant::now();
         assert_eq!(
-            showing.poll(&FakeShow::default(), &c, &window_side, showed),
+            showing.poll(&FakeShow::default(), |f| c.focus(f), &window_side, showed),
             None
         );
         opener.join().unwrap();
@@ -1269,12 +1278,12 @@ mod tests {
         let mut showing = super::Showing::new(start);
         let late = start + super::SHOW_TIMEOUT - Duration::from_millis(1);
         assert_eq!(
-            showing.poll(&w, &c, &shared, late),
+            showing.poll(&w, |f| c.focus(f), &shared, late),
             Some(start + super::SHOW_TIMEOUT)
         );
         assert_eq!(w.shows.get(), 0);
         assert_eq!(
-            showing.poll(&w, &c, &shared, start + super::SHOW_TIMEOUT),
+            showing.poll(&w, |f| c.focus(f), &shared, start + super::SHOW_TIMEOUT),
             None
         );
         assert_eq!(w.shows.get(), 1);

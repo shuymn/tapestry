@@ -29,7 +29,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, PoisonError, TryLockError};
 use std::thread::Thread;
 
-use skin_model::{Button, PointerHit, PressHit, RatioSource, RowRefKind, SliderCommand};
+use skin_model::{
+    Button, PointerHit, PressHit, RatioSource, RowRefKind, SearchBoxes, SliderCommand,
+};
 
 use crate::select::{MenuInput, MenuKey};
 use crate::selection_skin::SelectionLogic;
@@ -132,9 +134,9 @@ pub struct PointerSlot {
     pub request: PointerRequest,
     /// What the press hit on the batch's build; none for a notch.
     pub hit: Option<PointerHit>,
-    /// Whether the press lay outside every search box that build drew,
-    /// whatever it hit ([`PressHit::outside_search`]).
-    pub outside_search: bool,
+    /// The search boxes whose last prepared bounds held the press,
+    /// whatever it hit ([`PressHit::inside_search`]).
+    pub inside_search: SearchBoxes,
 }
 
 impl PointerSlot {
@@ -145,7 +147,7 @@ impl PointerSlot {
             notches: 0,
         },
         hit: None,
-        outside_search: true,
+        inside_search: SearchBoxes::NONE,
     };
 }
 
@@ -291,11 +293,18 @@ impl PointerShared {
     /// cancellation generation moves on, so every press, notch and drag
     /// observed before it, wherever it is (queued, in a batch, answered,
     /// in the drag slot), is of another word at dispatch and does nothing.
-    pub fn cancel(&self) {
+    /// A generation never repeats within a lifetime: once the last one is
+    /// spent, a loss clears the active bit instead, and the pointer takes
+    /// nothing until the next entry publishes a word.
+    fn cancel(&self) {
         let _ = self
             .word
             .try_update(Ordering::AcqRel, Ordering::Acquire, |w| {
-                Some(w & !GENERATION | w.wrapping_add(2) & GENERATION)
+                Some(if w & GENERATION == GENERATION {
+                    w & !1
+                } else {
+                    w & !GENERATION | w.wrapping_add(2) & GENERATION
+                })
             });
     }
 
@@ -523,7 +532,7 @@ impl PointerShared {
         for slot in b.slots.iter_mut().take(len) {
             let h = hit(slot.request);
             slot.hit = h.hit;
-            slot.outside_search = h.outside_search;
+            slot.inside_search = h.inside_search;
         }
         b.built = built;
         b.state = BatchState::Answered;
@@ -581,6 +590,15 @@ pub struct PointerPass {
     /// The answers taken, and the next to dispatch.
     len: usize,
     next: usize,
+    /// The search box a press gave the search focus to, by its order among
+    /// the skin's search texts: the box whose last bounds a press must lie
+    /// in to keep the focus. The game thread knows the focus, the render
+    /// thread each box's bounds; each answer carries which boxes held the
+    /// press ([`PointerSlot::inside_search`]), so the two meet here without
+    /// either reading the other's state. `None` for focus another input
+    /// gave (Tab), which every box holds, and cleared at every focus change
+    /// and every entry.
+    pub search_box: Option<u8>,
     /// While set, each input the pass dispatched, with the cursor after
     /// it (tests).
     #[cfg(test)]
@@ -609,6 +627,7 @@ impl PointerPass {
             built: None,
             len: 0,
             next: 0,
+            search_box: None,
             #[cfg(test)]
             log: None,
         }
@@ -619,6 +638,7 @@ impl PointerPass {
     /// and a drag wakes this thread.
     pub fn enter(&mut self, lifetime: u64) {
         self.abandon();
+        self.search_box = None;
         self.shared.reset();
         self.shared.wake_on_drag();
         self.shared.publish(lifetime);
@@ -824,9 +844,27 @@ impl Capture {
         }
     }
 
+    /// The window's focus changed to `focused` (the window thread, every
+    /// focus change the window reports): a loss first cancels the pointer
+    /// ([`focus_lost`](Self::focus_lost)), and only then does `publish`
+    /// tell the rest ([`Controls::focus`](crate::controls::Controls::focus),
+    /// which wakes the game thread), so a thread that sees the loss never
+    /// finds an input observed before it still current.
+    pub fn focus_changed(
+        &mut self,
+        shared: &PointerShared,
+        focused: bool,
+        publish: impl FnOnce(bool),
+    ) {
+        if !focused {
+            self.focus_lost(shared);
+        }
+        publish(focused);
+    }
+
     /// The window lost its focus: nothing stays held, no hover, and
     /// nothing observed before acts ([`PointerShared::cancel`]).
-    pub fn focus_lost(&mut self, shared: &PointerShared) {
+    fn focus_lost(&mut self, shared: &PointerShared) {
         shared.cancel();
         self.drop_held(shared);
         self.position = None;
@@ -850,6 +888,10 @@ pub struct Facts {
     /// The cursor's selectable index.
     pub cursor: usize,
     pub searching: bool,
+    /// The search box a press gave the focus to, by its order among the
+    /// skin's search texts; `None` while not searching or for focus the
+    /// keyboard gave, which every box holds ([`SearchBoxes::outside`]).
+    pub search_box: Option<u8>,
     /// The IME composes (a preedit is shown).
     pub composing: bool,
     /// A panel is held.
@@ -934,14 +976,16 @@ pub fn resolve(
             _ => NOTHING,
         };
     }
-    // A press outside the search box's bounds takes its focus whatever it
-    // hits, and one inside keeps it even when a target drawn over the box
-    // takes the press: the source commits outside the box before it walks
-    // the targets (`skin/Skin.java:394-397`).
-    let unfocus = facts.searching && press.outside_search;
+    // A press outside the focused box's last bounds takes its focus
+    // whatever it hits, drawn or hidden since, and one inside keeps it even
+    // when a target drawn over the box takes the press: the source commits
+    // the focused text outside its own bounds before it walks the targets
+    // (`skin/Skin.java:394-397`, `skin/SkinTextInput.java:77-81`). Another
+    // box hit then takes the focus.
+    let unfocus = facts.searching && press.inside_search.outside(facts.search_box);
     let act = match hit {
-        Some(PointerHit::Search) if facts.searching => PointerAct::Nothing,
-        Some(PointerHit::Search) => PointerAct::Key(MenuKey::Tab),
+        Some(PointerHit::Search { .. }) if facts.searching && !unfocus => PointerAct::Nothing,
+        Some(PointerHit::Search { .. }) => PointerAct::Key(MenuKey::Tab),
         Some(PointerHit::Row { row, button }) => {
             let index = usize::try_from(row.index).unwrap_or(usize::MAX);
             let valid = row.list_revision == facts.list_revision
@@ -1063,10 +1107,10 @@ mod tests {
         let lost = s.word();
         assert_ne!(lost, W7);
         assert!(names(lost, 7) && is_active(lost));
-        // The generation wraps inside its bits.
+        // The last generation spent: no wrap, the word latches inactive.
         s.word.store(W7 | GENERATION, Ordering::Release);
         s.cancel();
-        assert_eq!(s.word(), W7);
+        assert_eq!(s.word(), (W7 | GENERATION) & !1);
         // A lifetime past 32 bits is named by its low ones.
         assert!(names(W7, u64::from(u32::MAX) + 8));
         s.publish(8);
@@ -1200,6 +1244,66 @@ mod tests {
         assert_eq!(s.dropped(), 0);
     }
 
+    /// A generation never repeats within a lifetime: past the last one a
+    /// focus loss latches the word inactive, a press is not taken and an
+    /// input of any earlier word stays stale, until the next entry.
+    #[test]
+    fn a_spent_generation_latches_the_pointer_until_the_next_entry() {
+        let s = PointerShared::default();
+        let (presses, queued) = (std::cell::Cell::new(0), std::cell::RefCell::new(Vec::new()));
+        let mut c = Capture::default();
+        // Lifetime 7, one loss short of its last generation.
+        let next_to_last = W7 | (GENERATION - 2);
+        s.word.store(next_to_last, Ordering::Release);
+        c.focus_changed(&s, false, |_| {});
+        let last = s.word();
+        assert_eq!(last, W7 | GENERATION);
+        assert!(is_active(last));
+        c.focus_changed(&s, false, |_| {});
+        let latched = s.word();
+        assert!(!is_active(latched), "{latched:#x}");
+        assert_eq!(lifetime_of(latched), 7);
+        for earlier in [W7, next_to_last, last] {
+            assert_ne!(latched, earlier);
+        }
+        // Further losses keep it latched; nothing is queued under it.
+        c.focus_changed(&s, false, |_| {});
+        assert_eq!(s.word(), latched);
+        c.moved(&s, [1, 1], s.word(), 0);
+        c.button(
+            &s,
+            Button::Left,
+            true,
+            s.word(),
+            0,
+            admitting(&presses, &queued),
+        );
+        assert!(queued.borrow().is_empty());
+        // The next entry takes the pointer again.
+        s.publish(8);
+        assert_eq!(s.word(), W8);
+        c.button(&s, Button::Left, true, W8, 0, admitting(&presses, &queued));
+        assert_eq!(queued.borrow().len(), 1);
+    }
+
+    /// The window's focus change cancels the pointer before it tells the
+    /// rest: what `publish` runs (the game thread, woken) already finds the
+    /// word moved on.
+    #[test]
+    fn a_focus_loss_cancels_the_pointer_before_it_is_published() {
+        let s = PointerShared::default();
+        s.publish(7);
+        let mut c = Capture::default();
+        let mut seen = None;
+        c.focus_changed(&s, false, |focused| seen = Some((focused, s.word())));
+        let (focused, word) = seen.unwrap();
+        assert!(!focused);
+        assert_ne!(word, W7, "published before the cancel");
+        // A return cancels nothing.
+        c.focus_changed(&s, true, |focused| seen = Some((focused, s.word())));
+        assert_eq!(seen, Some((true, word)));
+    }
+
     #[test]
     fn focus_loss_drops_the_hold_and_the_hover() {
         let s = PointerShared::default();
@@ -1289,6 +1393,7 @@ mod tests {
             count: 5,
             cursor: 1,
             searching: false,
+            search_box: None,
             composing: false,
             panel: false,
         }
@@ -1325,12 +1430,19 @@ mod tests {
         })
     }
 
+    /// The only search box.
+    const SEARCH: Option<PointerHit> = Some(PointerHit::Search { index: 0 });
+
     /// `hit` answered as a press inside the search box exactly when it hit
     /// the box.
     fn on(hit: Option<PointerHit>) -> PressHit {
         PressHit {
             hit,
-            outside_search: hit != Some(PointerHit::Search),
+            inside_search: if hit == SEARCH {
+                SearchBoxes(1)
+            } else {
+                SearchBoxes::NONE
+            },
         }
     }
 
@@ -1489,7 +1601,7 @@ mod tests {
         let l = press(Button::Right);
         // Any button in the box focuses it; a focused box keeps it.
         assert_eq!(
-            resolve(l, on(Some(PointerHit::Search)), Some(built(7)), &f, kinds),
+            resolve(l, on(SEARCH), Some(built(7)), &f, kinds),
             Resolved {
                 unfocus: false,
                 act: PointerAct::Key(MenuKey::Tab)
@@ -1500,13 +1612,7 @@ mod tests {
             ..f
         };
         assert_eq!(
-            resolve(
-                l,
-                on(Some(PointerHit::Search)),
-                Some(built(7)),
-                &searching,
-                kinds
-            ),
+            resolve(l, on(SEARCH), Some(built(7)), &searching, kinds),
             NOTHING
         );
         // Outside it the focus goes first, then the press hits.
@@ -1566,11 +1672,7 @@ mod tests {
                 act: PointerAct::Key(MenuKey::Left)
             }
         );
-        for hit in [
-            row(3, RowRefKind::Chart, Button::Left),
-            Some(PointerHit::Search),
-            None,
-        ] {
+        for hit in [row(3, RowRefKind::Chart, Button::Left), SEARCH, None] {
             assert_eq!(resolve(lp, on(hit), Some(built(7)), &panel, kinds), NOTHING);
             assert_eq!(
                 resolve(press(Button::Right), on(hit), Some(built(7)), &panel, kinds),
@@ -1593,7 +1695,7 @@ mod tests {
         // and the focus stays.
         let inside = PressHit {
             hit: Some(PointerHit::Action { event: 12, arg: 1 }),
-            outside_search: false,
+            inside_search: SearchBoxes(1),
         };
         assert_eq!(
             resolve(l, inside, Some(built(7)), &searching, kinds),
@@ -1605,7 +1707,7 @@ mod tests {
         // A row outside the bounds: the focus goes, then the row acts.
         let outside = PressHit {
             hit: row(3, RowRefKind::Chart, Button::Left),
-            outside_search: true,
+            inside_search: SearchBoxes::NONE,
         };
         assert_eq!(
             resolve(l, outside, Some(built(7)), &searching, kinds),
@@ -1614,6 +1716,60 @@ mod tests {
                 act: PointerAct::MoveTo(3)
             }
         );
+    }
+
+    /// With two search boxes, the focus goes by the bounds of the box that
+    /// took it: a press inside box 1 only drops box 0's focus, an action
+    /// over it included, and a press inside box 0 only keeps it; a press on
+    /// box 1 while box 0 has the focus moves the focus there (the source's
+    /// `commitIfOutside`, then `focus`, `skin/Skin.java:394-404`). Focus the
+    /// keyboard gave goes only outside every box.
+    #[test]
+    fn the_search_focus_goes_by_the_focused_box_s_bounds() {
+        let l = press(Button::Left);
+        let order = Some(PointerHit::Action { event: 12, arg: 1 });
+        let at = |hit, inside| PressHit {
+            hit,
+            inside_search: SearchBoxes(inside),
+        };
+        let on_box = |box_: Option<u8>| Facts {
+            searching: true,
+            search_box: box_,
+            ..facts()
+        };
+        let resolved = |p, f: &Facts| resolve(l, p, Some(built(7)), f, kinds);
+        let unfocused = |act| Resolved { unfocus: true, act };
+        let kept = |act| Resolved {
+            unfocus: false,
+            act,
+        };
+        let right = PointerAct::Key(MenuKey::Right);
+        assert_eq!(
+            resolved(at(order, 0b10), &on_box(Some(0))),
+            unfocused(right)
+        );
+        assert_eq!(resolved(at(order, 0b01), &on_box(Some(0))), kept(right));
+        assert_eq!(
+            resolved(at(order, 0b01), &on_box(Some(1))),
+            unfocused(right)
+        );
+        assert_eq!(resolved(at(order, 0b10), &on_box(Some(1))), kept(right));
+        assert_eq!(
+            resolved(
+                at(Some(PointerHit::Search { index: 1 }), 0b10),
+                &on_box(Some(0))
+            ),
+            unfocused(PointerAct::Key(MenuKey::Tab))
+        );
+        assert_eq!(
+            resolved(
+                at(Some(PointerHit::Search { index: 1 }), 0b10),
+                &on_box(Some(1))
+            ),
+            NOTHING
+        );
+        assert_eq!(resolved(at(order, 0b10), &on_box(None)), kept(right));
+        assert_eq!(resolved(at(order, 0), &on_box(None)), unfocused(right));
     }
 
     #[test]
@@ -1634,7 +1790,7 @@ mod tests {
             })
         );
         assert_eq!(s.take_answers(seq, &mut out), Taken::Waiting);
-        assert!(s.answer(Some(built(7)), |_| on(Some(PointerHit::Search))));
+        assert!(s.answer(Some(built(7)), |_| on(SEARCH)));
         assert!(!s.answer(Some(built(7)), |_| PressHit::NONE));
         assert_eq!(
             s.take_answers(seq, &mut out),
@@ -1650,7 +1806,7 @@ mod tests {
                 notches: 63
             }
         );
-        assert_eq!(out[0].hit, Some(PointerHit::Search));
+        assert_eq!(out[0].hit, SEARCH);
         assert_eq!(s.take_answers(seq, &mut out), Taken::Gone);
         // A reset abandons a batch in flight.
         let seq = s.submit(7, || Some(press(Button::Left))).unwrap();

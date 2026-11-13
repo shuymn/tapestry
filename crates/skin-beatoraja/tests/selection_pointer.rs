@@ -10,7 +10,9 @@ use common::selection::{
     IMAGES, SET, Sel, TEXT_T, TITLE, chart, folder, folder_row, import_selection, song_list, view,
 };
 use skin_beatoraja::{EssentialPart, ImportError, NoteKind, PropertyKind};
-use skin_model::{Button, PointerHit, PressHit, RatioSource, RowRef, RowRefKind, RowView};
+use skin_model::{
+    Button, PointerHit, PressHit, RatioSource, RowRef, RowRefKind, RowView, SearchBoxes,
+};
 use tempfile::TempDir;
 
 const TARGET: [u32; 2] = [1_920, 1_080];
@@ -222,7 +224,7 @@ fn text_30_by_ref_is_the_search_box() {
         drawn(&mut s);
         hit(&s, [200.0, 110.0], Button::Left)
     };
-    assert_eq!(case(r#""ref": 30"#), Some(PointerHit::Search));
+    assert_eq!(case(r#""ref": 30"#), Some(PointerHit::Search { index: 0 }));
     assert_eq!(case(r#""value": 30"#), None);
     assert_eq!(case(r#""ref": 30, "event": 1"#), None);
     // Another text is none.
@@ -400,6 +402,55 @@ fn a_stretched_image_takes_a_press_on_its_whole_destination() {
     assert_eq!(hit(&s, [650.0, 501.0], Button::Left), None);
 }
 
+/// An image set of `extra`'s destination fields, fitted with stretch 1 into
+/// a square destination, its first image square and its selected one
+/// (ref 11: entry 2) 2:1, drawn: the selected image is drawn 100×50 in the
+/// destination's middle.
+fn wide_selected(extra: &str) -> Sel {
+    let images = r#", {"id": "wide", "src": "s", "x": 0, "y": 16, "w": 16, "h": 8}"#;
+    let set = r#", {"id": "is", "images": ["dot", "dot", "wide"], "ref": 11, "act": 12}"#;
+    let more = format!(r#""stretch": 1, {extra}"#);
+    let d = skin(
+        images,
+        &body(set, "", &dst("is", [600, 400, 100, 100], &more)),
+    );
+    let mut s = Sel::new(import_selection(d.path()).unwrap().skin);
+    s.view(&view(numbered(vec![chart("a")]), Some(0), None, None));
+    s
+}
+
+/// Where [`wide_selected`] draws its selected image.
+const WIDE_DRAWN: [f32; 4] = [600.0, 425.0, 100.0, 50.0];
+
+/// An image set's region is its destination whichever image is selected:
+/// with its 2:1 image drawn 100×50 in the middle of its square destination,
+/// a press anywhere in the destination is its action
+/// (`skin/SkinObject.java:591-602, 623-643, 671-700`).
+#[test]
+fn an_image_set_takes_a_press_on_its_destination_whichever_image_draws() {
+    let mut s = wide_selected("");
+    let quads = s.drawn(0);
+    assert!(quads.iter().any(|(_, r)| *r == WIDE_DRAWN), "{quads:?}");
+    // Above and below the drawn rect, inside the destination.
+    assert_eq!(hit(&s, [650.0, 410.0], Button::Left), action(12, 1));
+    assert_eq!(hit(&s, [650.0, 490.0], Button::Left), action(12, 1));
+    assert_eq!(hit(&s, [650.0, 501.0], Button::Left), None);
+}
+
+/// An image set's `mouseRect` runs from its destination's corner whichever
+/// image is selected (`skin/SkinObject.java:603-607`): drawn only while the
+/// pointer is in the destination's bottom 10 pixels, not the drawn rect's.
+#[test]
+fn an_image_set_s_mouse_rect_runs_from_its_destination_whichever_image_draws() {
+    let mut s = wide_selected(r#""mouseRect": {"x": 0, "y": 0, "w": 100, "h": 10},"#);
+    let mut drawn_at = |pointer: [f32; 2]| {
+        s.pointer = Some(pointer);
+        s.drawn(0).iter().any(|(_, r)| *r == WIDE_DRAWN)
+    };
+    assert!(drawn_at([650.0, 495.0]), "in the destination's bottom rows");
+    assert!(!drawn_at([650.0, 470.0]), "in the drawn rect's bottom rows");
+}
+
 /// A right-aligned text's `mouseRect` runs from its destination's corner,
 /// x 900, not from where its line is drawn: the source tests it against
 /// `region` (`skin/SkinObject.java:603-607`). The text is the search box,
@@ -421,8 +472,14 @@ fn a_right_aligned_text_s_mouse_rect_is_anchored_at_its_destination() {
         s.frame(0);
         hit(&s, [600.0, 110.0], Button::Left)
     };
-    assert_eq!(search_at([1_000.0, 110.0]), Some(PointerHit::Search));
-    assert_eq!(search_at([1_300.0, 120.0]), Some(PointerHit::Search));
+    assert_eq!(
+        search_at([1_000.0, 110.0]),
+        Some(PointerHit::Search { index: 0 })
+    );
+    assert_eq!(
+        search_at([1_300.0, 120.0]),
+        Some(PointerHit::Search { index: 0 })
+    );
     assert_eq!(search_at([600.0, 110.0]), None);
     assert_eq!(search_at([899.0, 110.0]), None);
 }
@@ -437,7 +494,7 @@ fn an_aligned_search_text_s_input_box() {
         let d = skin("", &body("", &texts, &dst("q", [900, 100, 400, 20], "")));
         let mut s = Sel::of(d.path());
         drawn(&mut s);
-        let search = Some(PointerHit::Search);
+        let search = Some(PointerHit::Search { index: 0 });
         for (p, want) in [
             ([left, 100.0], search),
             ([left + 400.0, 120.0], search),
@@ -483,7 +540,7 @@ fn a_press_on_an_action_over_the_search_box_is_inside_it() {
         press([160.0, 110.0]),
         PressHit {
             hit: action(12, 1),
-            outside_search: false,
+            inside_search: SearchBoxes(1),
         }
     );
     assert_eq!(
@@ -497,7 +554,7 @@ fn a_press_on_an_action_over_the_search_box_is_inside_it() {
                 },
                 button: Button::Left,
             }),
-            outside_search: true,
+            inside_search: SearchBoxes::NONE,
         }
     );
 }

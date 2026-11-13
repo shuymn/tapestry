@@ -19,7 +19,7 @@ use self::schema::{VALUE_MAX, field, timer};
 use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
 use crate::play::timers::app_fields;
-use crate::pointer::{RowHit, Target};
+use crate::pointer::{RowHit, SearchBounds, Target};
 use crate::selection::{
     ChartLabels, Ratio, RowKind, RowScore, RowView, SelectionLabels, SelectionOrder,
     SelectionPlace, SelectionSettings, SelectionView, SpeedReference, SpeedView,
@@ -133,6 +133,10 @@ pub struct Selection {
     /// Per song list element and slot: the slot's bar as the last build
     /// drew it, `None` when it did not.
     pub(crate) row_hits: Box<[Cell<Option<RowHit>>]>,
+    /// Per search text: its input box as the last build that sampled it
+    /// placed it, kept across builds (a build that hides it keeps the
+    /// bounds before); `None` until one does.
+    pub(crate) search: Box<[Cell<Option<SearchBounds>>]>,
     /// The frame time [`Skin::prepare_selection_frame`](crate::Skin::prepare_selection_frame)
     /// last prepared the timers for, which that frame's build takes
     /// without refilling them.
@@ -141,15 +145,16 @@ pub struct Selection {
 
 impl Selection {
     /// A fresh state with `whens` `when` timers, `text_slots` text slots,
-    /// `rows` song list slots, and `targets` pointer targets and row hit
-    /// cells; `live` when a selection skin makes it.
+    /// `rows` song list slots, and `targets` pointer targets, row hit cells
+    /// and `search` search texts' kept bounds; `live` when a selection skin
+    /// makes it.
     pub(crate) fn new(
         skin: u64,
         live: bool,
         whens: usize,
         text_slots: usize,
         rows: usize,
-        [targets, row_hits]: [usize; 2],
+        [targets, row_hits, search]: [usize; 3],
         outputs: usize,
     ) -> Self {
         let slots = usize::from(timer::BUILTIN).saturating_add(whens);
@@ -172,6 +177,7 @@ impl Selection {
             master_volume: None,
             targets: vec![Cell::new(None); targets].into_boxed_slice(),
             row_hits: vec![Cell::new(None); row_hits].into_boxed_slice(),
+            search: vec![Cell::new(None); search].into_boxed_slice(),
             prepared: None,
         }
     }
@@ -179,7 +185,7 @@ impl Selection {
     /// A state with no timer, text, row or pointer slot, which a skin of
     /// another kind gives: nothing accepts it.
     pub(crate) fn inert(skin: u64) -> Self {
-        let mut s = Self::new(skin, false, 0, 0, 0, [0, 0], 0);
+        let mut s = Self::new(skin, false, 0, 0, 0, [0, 0, 0], 0);
         s.starts = Box::default();
         s.ms = Box::default();
         s
@@ -222,7 +228,8 @@ impl Selection {
             + self.row_text.heap_bytes()
             + glyphs::lines_bytes(&self.row_bitmap)
             + size_of_val(&*self.targets)
-            + size_of_val(&*self.row_hits);
+            + size_of_val(&*self.row_hits)
+            + size_of_val(&*self.search);
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 

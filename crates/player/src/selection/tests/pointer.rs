@@ -78,6 +78,12 @@ impl Window {
             });
     }
 
+    /// The window's focus changed to `focused`, as the window reports it.
+    fn focus(&mut self, c: &Controls, focused: bool) {
+        self.capture
+            .focus_changed(&self.shared, focused, |f| c.focus(f));
+    }
+
     /// `key` typed.
     fn key(&self, key: MenuKey) {
         self.menu.push(MenuInput::Key(key));
@@ -111,6 +117,13 @@ const PRACTICE: [i32; 2] = [150, 425];
 /// Search text 30's input box: right-aligned at x 900, 400 wide, so its
 /// box runs from 500; this is `x − w/2`.
 const SEARCH: [i32; 2] = [700, 60];
+/// The second search text's input box, x 1 000 to 1 300 and y 0 to 30,
+/// past the first's.
+const SEARCH_B: [i32; 2] = [1_200, 15];
+/// Event 13 over the first search box, outside the second.
+const MODE_ON_A: [i32; 2] = [620, 55];
+/// Event 13 over the second search box, outside the first.
+const MODE_ON_B: [i32; 2] = [1_070, 15];
 /// Event 13 over the list slider's travel, at v = 0.42.
 const MODE_ON_SLIDER: [i32; 2] = [520, 920];
 /// Event 13 over slot 4.
@@ -548,7 +561,7 @@ fn a_command_on_another_list_or_row_does_nothing() {
                 .shared
                 .answer(Some(built), |_| skin_model::PressHit {
                     hit: hits.next().unwrap(),
-                    outside_search: true,
+                    inside_search: skin_model::SearchBoxes::NONE,
                 })
         );
         assert_eq!(take_all(rig), None);
@@ -801,6 +814,54 @@ fn another_button_on_a_row_or_a_right_press_goes_back() {
         act(rig, screens);
         assert_eq!(log(rig), [(Press(Key(MenuKey::Left)), 0)]);
         assert_eq!(sel_of(rig).screen.order(), 3);
+    });
+}
+
+/// P9: with two search texts, the focus goes by the last bounds of the box
+/// a press focused: the source commits its focused text on a press outside
+/// that text's own bounds (`skin/Skin.java:394-404`,
+/// `skin/SkinTextInput.java:77-81`). Focused by a press in A, event 13
+/// drawn over A takes the press and the focus stays, and over B (inside B,
+/// outside A) it takes A's focus away; focused by a press in B, the
+/// reverse. A press in B while A has the focus moves the focus to B. Focus
+/// Tab gave is every box's: it goes only outside both.
+#[test]
+fn the_search_focus_goes_by_the_bounds_of_the_box_that_took_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 3);
+    on_pointer(sel, true, None, |rig, w, screens| {
+        let c = rig.controls;
+        let searching = |rig: &PlayerRig<'_>| sel_of(rig).screen.searching();
+        let press = |rig: &mut PlayerRig<'_>, w: &mut Window, at| {
+            w.click(c, at, Button::Left);
+            act(rig, screens);
+            log(rig)
+        };
+        assert_eq!(press(rig, w, SEARCH), [(Press(Key(MenuKey::Tab)), 0)]);
+        assert_eq!(press(rig, w, MODE_ON_A), [(Press(Nothing), 0)]);
+        assert!(searching(rig), "A focused, the press inside A");
+        assert_eq!(press(rig, w, MODE_ON_B), [(Press(Nothing), 0)]);
+        assert!(!searching(rig), "A focused, the press inside B only");
+        assert_eq!(press(rig, w, SEARCH_B), [(Press(Key(MenuKey::Tab)), 0)]);
+        press(rig, w, MODE_ON_B);
+        assert!(searching(rig), "B focused, the press inside B");
+        press(rig, w, MODE_ON_A);
+        assert!(!searching(rig), "B focused, the press inside A only");
+        // A focused, then a press in B: B takes the focus.
+        press(rig, w, SEARCH);
+        assert_eq!(press(rig, w, SEARCH_B), [(Press(Key(MenuKey::Tab)), 0)]);
+        assert!(searching(rig));
+        press(rig, w, MODE_ON_A);
+        assert!(!searching(rig), "B took the focus from A");
+        // Focus Tab gave: inside either box keeps it, outside both drops it.
+        w.key(MenuKey::Tab);
+        act(rig, screens);
+        log(rig);
+        press(rig, w, MODE_ON_A);
+        press(rig, w, MODE_ON_B);
+        assert!(searching(rig), "Tab's focus, the presses inside a box");
+        press(rig, w, EMPTY);
+        assert!(!searching(rig), "Tab's focus, the press outside both");
     });
 }
 
@@ -1157,7 +1218,7 @@ fn an_input_of_another_lifetime_does_nothing() {
                         },
                         button: Button::Left,
                     }),
-                    outside_search: true,
+                    inside_search: skin_model::SearchBoxes::NONE,
                 }
             }));
             assert_eq!(take_all(rig), None);
@@ -1190,9 +1251,8 @@ fn an_input_of_another_lifetime_does_nothing() {
         // Across a focus loss, as the window sees one.
         w.down(c, list_slider(0), Button::Left);
         act(rig, screens);
-        w.capture.focus_lost(&w.shared);
-        c.focus(false);
-        c.focus(true);
+        w.focus(c, false);
+        w.focus(c, true);
         w.to(c, list_slider(1_000));
         dragged(rig, screens);
         assert_eq!(log(rig), [(Press(MoveTo(0)), 0)]);
@@ -1688,10 +1748,17 @@ fn a_new_hold_drags_nothing_of_an_earlier_holds_movement() {
     });
 }
 
-/// The window loses its focus, as the window sees one.
-fn lose_focus(w: &mut Window, c: &Controls) {
-    w.capture.focus_lost(&w.shared);
-    c.focus(false);
+/// The window loses its focus through the path the window takes
+/// ([`Capture::focus_changed`]), and the game thread, woken by the loss it
+/// publishes, runs its passes there, before the window thread goes on: the
+/// interleaving in which an input observed before the loss must already be
+/// stale.
+fn lose_focus(rig: &mut PlayerRig<'_>, w: &mut Window) {
+    let c = rig.controls;
+    w.capture.focus_changed(&w.shared, false, |focused| {
+        c.focus(focused);
+        assert_eq!(take_all(rig), None);
+    });
 }
 
 /// P16: a drag the render thread wrote before a focus loss and the game
@@ -1708,11 +1775,11 @@ fn a_focus_loss_drops_a_drag_already_written() {
         w.to(c, list_slider(1_000));
         // The render thread wrote the drag; the game thread took nothing.
         frames(screens, 2);
-        lose_focus(w, c);
+        lose_focus(rig, w);
         act(rig, screens);
         assert_eq!(log(rig), [(Drag(Nothing), 0)]);
         assert_eq!(cursor(rig), 0);
-        c.focus(true);
+        w.focus(c, true);
         w.click(c, row(0, 2), Button::Left);
         act(rig, screens);
         assert_eq!(log(rig), [(Press(MoveTo(2)), 2)]);
@@ -1732,19 +1799,19 @@ fn a_focus_loss_drops_an_answered_press_and_a_queued_notch() {
         w.click(c, row(0, 2), Button::Left);
         assert!(rig.look().is_none());
         grant(screens, 1);
-        lose_focus(w, c);
+        lose_focus(rig, w);
         release(screens);
         act(rig, screens);
         assert_eq!(log(rig), [(Press(Nothing), 0)], "the answered press");
         assert_eq!(cursor(rig), 0);
-        c.focus(true);
+        w.focus(c, true);
         // A notch queued, then the focus lost.
         w.wheel(c, 2);
-        lose_focus(w, c);
+        lose_focus(rig, w);
         act(rig, screens);
         assert_eq!(log(rig), [(Notch(Nothing), 0)], "the queued notch");
         assert_eq!(cursor(rig), 0);
-        c.focus(true);
+        w.focus(c, true);
         w.click(c, row(0, 2), Button::Left);
         w.wheel(c, 1);
         act(rig, screens);

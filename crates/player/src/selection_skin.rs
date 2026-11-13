@@ -627,6 +627,11 @@ pub(crate) fn pointer_fixture(volume: bool) -> tempfile::TempDir {
     .concat();
     let drawn: String = [
         dst("q", [900, 40, 400, 40], ""),
+        // A second search text, and event 13 over each box, inside it and
+        // outside the other.
+        dst("q2", [1_000, 0, 300, 30], ""),
+        dst("a13", [600, 45, 40, 20], ""),
+        dst("a13", [1_050, 5, 40, 20], ""),
         dst("a12", [100, 200, 100, 50], ""),
         dst("a15", [100, 300, 100, 50], ""),
         dst("a315", [100, 400, 100, 50], ""),
@@ -656,7 +661,8 @@ pub(crate) fn pointer_fixture(volume: bool) -> tempfile::TempDir {
             "slider": [{{"id": "ls", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "type": 1, "angle": 1, "range": 1000}},
                        {{"id": "vol", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "type": 17, "angle": 1, "range": 200, "changeable": true}}],
             "text": [{{"id": "t", "font": "f", "size": 30, "ref": 10}},
-                     {{"id": "q", "font": "f", "size": 30, "ref": 30, "align": 2}}],
+                     {{"id": "q", "font": "f", "size": 30, "ref": 30, "align": 2}},
+                     {{"id": "q2", "font": "f", "size": 30, "ref": 30}}],
             "songlist": {{"id": "list", "center": 3, "liston": [{slots}], "listoff": [{slots}],
                           "clickable": [0, 1, 2, 3, 4, 5, 6],
                           "text": [{{"id": "t", "dst": [{{"x": 10, "y": 10, "w": 700, "h": 40}}]}}]}},

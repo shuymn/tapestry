@@ -502,6 +502,9 @@ impl Selection {
                 None
             }
             Acted::Focus(on) => {
+                // Given or taken, the focus is no box's until a press on
+                // one names it ([`Self::dispatch_pointer`]).
+                self.pointer.search_box = None;
                 if let Some(ime) = &self.ime {
                     ime.set(on);
                 }
@@ -679,6 +682,7 @@ impl Selection {
             count: self.screen.selectable(),
             cursor: self.screen.cursor(),
             searching: self.screen.searching(),
+            search_box: self.pointer.search_box,
             composing: self.screen.composing(),
             panel: held.is_some(),
         }
@@ -705,7 +709,7 @@ impl Selection {
         let screen = &self.screen;
         let press = skin_model::PressHit {
             hit: slot.hit,
-            outside_search: slot.outside_search,
+            inside_search: slot.inside_search,
         };
         let resolved = crate::pointer::resolve(slot.request, press, built, &facts, |i| {
             screen.row_kind_at(i)
@@ -715,6 +719,16 @@ impl Selection {
             let _ = self.take_reading(MenuInput::Key(MenuKey::Tab), level, now);
         }
         let pick = self.pointer_act(resolved.act, level, now);
+        // A press that focused a search box names it: its bounds keep the
+        // focus from here.
+        if let (
+            crate::pointer::PointerAct::Key(MenuKey::Tab),
+            Some(skin_model::PointerHit::Search { index }),
+        ) = (resolved.act, slot.hit)
+            && self.screen.searching()
+        {
+            self.pointer.search_box = Some(index);
+        }
         #[cfg(test)]
         self.dispatched(match slot.request {
             crate::pointer::PointerRequest::Press { .. } => {

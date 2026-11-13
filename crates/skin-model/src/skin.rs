@@ -30,7 +30,7 @@ use crate::play::schema::{Grade, field};
 use crate::play::timers::elapsed_us;
 use crate::play::{BuildError, Continuation, Play, PlayContext, PrepareError, SkinFrame};
 use crate::pointer::{
-    self, ActionDef, Button, HoverRect, PointerDef, PointerError, PressHit, Target,
+    self, ActionDef, Button, HoverRect, PointerDef, PointerError, PressHit, SearchBounds, Target,
 };
 use crate::present::{OutTy, Present, PresentDef, PresentError};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
@@ -501,8 +501,10 @@ enum Kind {
 #[derive(Clone, Copy, Debug)]
 enum Press {
     Action(ActionDef),
-    /// Search text's input box.
-    Search,
+    /// Search text `index`'s input box (its order among the search texts).
+    Search {
+        index: u8,
+    },
     /// A song list, its slots' row hits from `first`.
     List {
         first: u16,
@@ -535,7 +537,9 @@ struct Element {
     /// kind's.
     press: Option<(usize, Press)>,
     /// Its pointer region ([`PointerDef::region`]), which its press and
-    /// hover rects are placed on; `None`, its sampled rect.
+    /// hover rects are placed on: the pointer entry's region, else its own
+    /// track (never an image choice entry's); `None` without a pointer
+    /// entry, its sampled rect.
     pointer_region: Option<Track>,
 }
 
@@ -660,6 +664,8 @@ pub struct Skin {
     targets: usize,
     /// The row hit cells: the song list's slots per song list element.
     row_hits: usize,
+    /// The search texts, each with its kept input box.
+    search_boxes: usize,
     /// The callbacks whose outputs a selection or result state carries
     /// after its fields ([`crate::output`]): the screen's runtime writes
     /// them (docs/stage3.md S7-07).
@@ -1725,7 +1731,10 @@ fn check_selection_widgets(
 /// element of `def` that no other entry names, an action only on an image
 /// or an image choice, a search box only on text showing the query, and a
 /// hover rect and a region within the coordinate range, the region keyed
-/// as the element's track.
+/// as the element's track; an image choice's entries keyed as it is too,
+/// since its region is its own track whichever entry draws. Search texts
+/// are text elements, so at most
+/// [`MAX_SEARCH_BOXES`](crate::MAX_SEARCH_BOXES).
 fn check_pointer(def: &SkinDef, entries: &[PointerDef]) -> Result<(), LoadError> {
     let mut named = vec![false; def.elements.len()];
     for (entry, p) in entries.iter().enumerate() {
@@ -1750,6 +1759,17 @@ fn check_pointer(def: &SkinDef, entries: &[PointerDef]) -> Result<(), LoadError>
         };
         if p.search && !query {
             return fail(PointerError::SearchSource);
+        }
+        // An entry's own track places what it draws, never its pointer
+        // region: that is the element's track, sampled at the same times.
+        if choice_of(def, e.source).is_some_and(|c| {
+            c.choices
+                .iter()
+                .flatten()
+                .filter_map(|c| c.track.as_ref())
+                .any(|t| !t.same_timing(&e.track))
+        }) {
+            return fail(PointerError::RegionTiming);
         }
         if p.hover.is_some_and(|h| !pointer::hover_in(h, MAX_COORD))
             || p.region.as_ref().is_some_and(track_outside)
@@ -2527,6 +2547,9 @@ impl Skin {
         // 16 384 / 5 song list slots in all, since each slot's quads count
         // against `MAX_WIDGET_QUADS`, so a list's first cell fits a `u16`.
         let (mut targets, mut row_hits) = (0_usize, 0_usize);
+        // Search texts in draw order: text elements, so at most
+        // `MAX_SEARCH_BOXES`.
+        let mut search_boxes = 0_usize;
         let SelectionDefs {
             song_list,
             ratio_bars,
@@ -2635,6 +2658,12 @@ impl Skin {
             .zip(slots)
             .zip(pointers)
             .map(|((e, slot), pointer)| Element {
+                // Before the track moves: an interactive element's region
+                // is its own, never the sampled rect of an image choice's
+                // entry, whichever entry draws.
+                pointer_region: pointer
+                    .as_ref()
+                    .map(|p| p.region.clone().unwrap_or_else(|| e.track.clone())),
                 loading: {
                     let choice = |i: usize| image_choices.get(i).map(|c| &c.value);
                     let value = match e.source {
@@ -2736,7 +2765,9 @@ impl Skin {
                             Some(Press::List { first })
                         }
                         Source::Text(_) if pointer.as_ref().is_some_and(|p| p.search) => {
-                            Some(Press::Search)
+                            Some(Press::Search {
+                                index: u8::try_from(next(&mut search_boxes)).unwrap_or(u8::MAX),
+                            })
                         }
                         Source::Image(_) | Source::ImageChoice(_) => {
                             pointer.as_ref().and_then(|p| p.action).map(Press::Action)
@@ -2745,7 +2776,6 @@ impl Skin {
                     };
                     press.map(|p| (next(&mut targets), p))
                 },
-                pointer_region: pointer.and_then(|p| p.region),
             })
             .collect();
         let whens_need = def.whens.iter().map(|w| Need::of(Some(w))).collect();
@@ -2785,6 +2815,7 @@ impl Skin {
             hit_errors,
             plan,
             targets,
+            search_boxes,
             row_hits,
             outputs: 0,
             id: NEXT_SKIN.fetch_add(1, Ordering::Relaxed),
@@ -3752,7 +3783,7 @@ impl Skin {
             self.whens.len(),
             self.text_slots(),
             self.song_list_slots(),
-            [self.targets, self.row_hits],
+            [self.targets, self.row_hits, self.search_boxes],
             self.outputs,
         )
     }
@@ -3766,6 +3797,7 @@ impl Skin {
             && sel.rows.len() == self.song_list_slots()
             && sel.targets.len() == self.targets
             && sel.row_hits.len() == self.row_hits
+            && sel.search.len() == self.search_boxes
             && sel.text.len() == self.text_slots()
     }
 
@@ -4088,7 +4120,8 @@ impl Skin {
     /// first (`skin/Skin.java:394-410`):
     ///
     /// - search text's input box, its region moved by its alignment, its
-    ///   edges included: [`PointerHit::Search`](crate::PointerHit::Search);
+    ///   edges included: [`PointerHit::Search`](crate::PointerHit::Search),
+    ///   with its order among the search texts;
     /// - a changeable slider's travel: the ratio under the point, as
     ///   [`drag_at`](Self::drag_at) reads it; off its travel the walk goes
     ///   on;
@@ -4100,11 +4133,13 @@ impl Skin {
     ///   (`select/BarRenderer.java:80-101`); none, and the walk goes on.
     ///
     /// The hit is `None` when nothing is hit. Apart from it, the answer
-    /// says whether the point lies outside every drawn search text's input
-    /// box, which decides a focused search box's blur whatever is hit
-    /// (`skin/Skin.java:394-397`). [`PressHit::NONE`] when that build was
-    /// at another target size or of another state. Changes nothing;
-    /// allocates nothing.
+    /// says which search texts' input boxes, as the last build to sample
+    /// each placed it (drawn now or hidden since), hold the point
+    /// ([`SearchBoxes`](crate::SearchBoxes)), which decides the focused
+    /// box's blur whatever is hit (`skin/Skin.java:394-397`,
+    /// `skin/SkinTextInput.java:77-81`). [`PressHit::NONE`] for a state of
+    /// another skin; a box placed at another target size holds no point.
+    /// Changes nothing; allocates nothing.
     #[must_use]
     pub fn hit_at(
         &self,
@@ -4120,6 +4155,7 @@ impl Skin {
         pointer::hit(
             &sel.targets,
             &sel.row_hits,
+            &sel.search,
             clickable,
             point,
             target,
@@ -4746,6 +4782,25 @@ impl Skin {
                 _ => (s, None),
             };
             let affine = placement.affine(e.region, e.fill);
+            // A search text's input box, the region moved by the alignment
+            // (`skin/SkinText.java:162-169`), kept in the state as sampled
+            // here, before a hover rect hides it: the source prepares its
+            // `region` before its `mouseRect` test, and a condition or a
+            // timer that hides it leaves the last one
+            // (`skin/SkinObject.java:348-356, 591-607`).
+            let search_box = match (e.press, e.kind) {
+                (Some((slot, Press::Search { index })), Kind::Text(_, text)) => {
+                    let rect = on_target(canvas, affine, pointer::input_box(text.align, region));
+                    if let Some(cell) = sel.and_then(|s| s.search.get(usize::from(index))) {
+                        cell.set(Some(SearchBounds {
+                            rect,
+                            target: canvas.target(),
+                        }));
+                    }
+                    Some((slot, index, rect))
+                }
+                _ => None,
+            };
             let map = placement.bind(e.bind);
             // The covers' motion, after the track and before the lane map
             // and the region; lanes and judges never follow. A paint also
@@ -4928,18 +4983,13 @@ impl Skin {
                     }
                 }
                 Kind::Text(_, t) => {
-                    // The box takes a press whether or not its line drew:
-                    // the region moved by the alignment
-                    // (`skin/SkinText.java:162-169`).
-                    if let Some((slot, Press::Search)) = e.press {
+                    // The box takes a press whether or not its line drew.
+                    if let Some((slot, index, rect)) = search_box {
                         record(
                             slot,
                             Target::Search {
-                                rect: on_target(
-                                    canvas,
-                                    affine,
-                                    pointer::input_box(t.align, region),
-                                ),
+                                rect,
+                                index,
                                 target: canvas.target(),
                             },
                         );

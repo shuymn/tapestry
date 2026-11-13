@@ -19,6 +19,13 @@
 //! `draw` draws (`skin/SkinObject.java:623-643`). A search text's input box
 //! is that region moved by its alignment (`skin/SkinText.java:162-169`).
 //!
+//! Apart from the targets, which each build clears, the state keeps each
+//! search text's input box as the last build that sampled it placed it:
+//! a press says which of those boxes hold its point ([`SearchBoxes`]), and
+//! the screen, which alone knows the focus and which box gave it, blurs a
+//! press outside the focused box's bounds, drawn or hidden since
+//! (`skin/SkinTextInput.java:77-81`).
+//!
 //! A hit never changes the skin's state: the screen carries the command out
 //! and validates a row by its [`RowRef`], a fixed-size `Copy` identity that
 //! never holds a path.
@@ -100,8 +107,9 @@ pub enum PointerHit {
     Action { event: u16, arg: i8 },
     /// A song list slot whose bar drew, and the button pressed.
     Row { row: RowRef, button: Button },
-    /// The input box of drawn search text, whatever the button.
-    Search,
+    /// The input box of drawn search text `index` (its order among the
+    /// skin's search texts), whatever the button.
+    Search { index: u8 },
 }
 
 /// How an action's argument comes from the press (the source's click
@@ -157,7 +165,8 @@ pub struct PointerDef {
     /// times, ease and end) and sampled at the same time; only its rects
     /// are read. Its action, search box and hover rect are placed on it
     /// (`skin/SkinObject.java:591-607, 671-700`). `None`: the element's
-    /// sampled rect is its region.
+    /// own track is its region, an image choice's whichever entry draws
+    /// (an entry's track places only what it draws).
     pub region: Option<Track>,
 }
 
@@ -174,29 +183,70 @@ pub enum PointerError {
     SearchSource,
     #[error("its hover rect or its region leaves the coordinate range")]
     Coordinates,
-    #[error("its region is not keyed as its element's track")]
+    #[error("its region, or an entry of its image choice, is not keyed as its element's track")]
     RegionTiming,
 }
 
+/// The most search texts a selection skin has: each is a text element
+/// ([`MAX_TEXT_ELEMENTS`](crate::MAX_TEXT_ELEMENTS)) and one bit of
+/// [`SearchBoxes`].
+pub const MAX_SEARCH_BOXES: usize = crate::widget::text::MAX_TEXT_ELEMENTS;
+const _: () = assert!(MAX_SEARCH_BOXES <= 64, "a search box is a bit of a u64");
+
+/// The search texts whose input box, as last prepared, holds a press's
+/// point: bit `i` for search text `i` (its order among the skin's search
+/// texts, [`PointerHit::Search`]). A box keeps the bounds of the last
+/// build that sampled it, so one its condition or timer hides since is
+/// still tested at its previous bounds, as the source keeps a hidden
+/// text's `region` (`skin/SkinObject.java:348-356, 591-602`). `Copy`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub struct SearchBoxes(pub u64);
+
+impl SearchBoxes {
+    /// No box holds the point.
+    pub const NONE: Self = Self(0);
+
+    /// Whether a press is outside the focused search text: `focused` its
+    /// index, or `None` for focus no box gave (the keyboard's), which every
+    /// box holds. The source commits the focused text on a press outside
+    /// its own bounds before it walks the targets
+    /// (`skin/Skin.java:394-397`, `skin/SkinTextInput.java:77-81`).
+    #[must_use]
+    pub const fn outside(self, focused: Option<u8>) -> bool {
+        match focused {
+            Some(i) => i >= 64 || (self.0 >> i) & 1 == 0,
+            None => self.0 == 0,
+        }
+    }
+}
+
 /// What a press hits ([`Skin::hit_at`](crate::Skin::hit_at)): the topmost
-/// target, and whether the press lies outside the input box of every search
-/// text drawn, whatever it hit. The source commits a focused search text
-/// on a press outside its box before it walks the targets
-/// (`skin/Skin.java:394-397`, `skin/SkinTextInput.java:77-81`), so a
-/// target drawn over the box takes the press with the focus kept. `Copy`.
+/// target, and apart from it the search texts whose last prepared input
+/// box holds the point ([`SearchBoxes`]), whatever it hit, so a target
+/// drawn over the focused box takes the press with the focus kept. The
+/// focus itself is the screen's: the answer says which boxes hold the
+/// point, and the screen blurs by the box it focused. `Copy`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PressHit {
     pub hit: Option<PointerHit>,
-    pub outside_search: bool,
+    pub inside_search: SearchBoxes,
 }
 
 impl PressHit {
-    /// Nothing hit, outside every search box: a press on a build that drew
-    /// no target.
+    /// Nothing hit, inside no search box: a press on a build that drew no
+    /// target.
     pub const NONE: Self = Self {
         hit: None,
-        outside_search: true,
+        inside_search: SearchBoxes::NONE,
     };
+}
+
+/// A search text's input box as the last build that sampled it placed it,
+/// in target pixels, with that build's target size: kept across builds.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SearchBounds {
+    pub(crate) rect: [f32; 4],
+    pub(crate) target: [u32; 2],
 }
 
 /// A pointer target as the last build drew it, in target pixels, with
@@ -212,6 +262,7 @@ pub(crate) enum Target {
     },
     Search {
         rect: [f32; 4],
+        index: u8,
         target: [u32; 2],
     },
     /// A song list element: its first slot's cell in the row hits.
@@ -263,41 +314,48 @@ fn arg(click: ClickType, [x, y, w, h]: [f32; 4], [px, py]: [f32; 2], button: But
 /// What a press of `button` at `point` hits among `targets` drawn at
 /// `target`, topmost first; a song list tries its slots in `clickable`
 /// order among `rows`. A slider or a song list the point misses lets the
-/// walk go on, as the source's do. Whether the point lies outside every
-/// search box is read apart from the walk.
+/// walk go on, as the source's do. Which search boxes hold the point is
+/// read apart from the walk, on their kept bounds `search`.
 pub(crate) fn hit(
     targets: &[Cell<Option<Target>>],
     rows: &[Cell<Option<RowHit>>],
+    search: &[Cell<Option<SearchBounds>>],
     clickable: &[u8],
     point: [f32; 2],
     target: [u32; 2],
     button: Button,
 ) -> PressHit {
-    let drawn = || {
-        targets
-            .iter()
-            .rev()
-            .filter_map(Cell::get)
-            .filter(|t| t.target() == target)
-    };
-    let outside_search =
-        !drawn().any(|t| matches!(t, Target::Search { rect, .. } if contains(rect, point)));
-    let hit = drawn().find_map(|t| match t {
-        Target::Slider(h) => h.at(point).map(PointerHit::Slider),
-        Target::Action { rect, def, .. } => contains(rect, point).then(|| PointerHit::Action {
-            event: def.event,
-            arg: arg(def.click, rect, point, button),
-        }),
-        Target::Search { rect, .. } => contains(rect, point).then_some(PointerHit::Search),
-        Target::List { first, .. } => clickable.iter().find_map(|&slot| {
-            let cell = usize::from(first).checked_add(usize::from(slot))?;
-            let h = rows.get(cell).and_then(Cell::get)?;
-            contains(h.rect, point).then_some(PointerHit::Row { row: h.row, button })
-        }),
-    });
+    let mut inside = 0_u64;
+    for (i, b) in search.iter().take(MAX_SEARCH_BOXES).enumerate() {
+        if b.get()
+            .is_some_and(|b| b.target == target && contains(b.rect, point))
+        {
+            inside |= 1 << i;
+        }
+    }
+    let hit = targets
+        .iter()
+        .rev()
+        .filter_map(Cell::get)
+        .filter(|t| t.target() == target)
+        .find_map(|t| match t {
+            Target::Slider(h) => h.at(point).map(PointerHit::Slider),
+            Target::Action { rect, def, .. } => contains(rect, point).then(|| PointerHit::Action {
+                event: def.event,
+                arg: arg(def.click, rect, point, button),
+            }),
+            Target::Search { rect, index, .. } => {
+                contains(rect, point).then_some(PointerHit::Search { index })
+            }
+            Target::List { first, .. } => clickable.iter().find_map(|&slot| {
+                let cell = usize::from(first).checked_add(usize::from(slot))?;
+                let h = rows.get(cell).and_then(Cell::get)?;
+                contains(h.rect, point).then_some(PointerHit::Row { row: h.row, button })
+            }),
+        });
     PressHit {
         hit,
-        outside_search,
+        inside_search: SearchBoxes(inside),
     }
 }
 

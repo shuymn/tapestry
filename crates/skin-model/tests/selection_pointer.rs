@@ -12,8 +12,8 @@ use selection_support::{
 use skin_model::{
     ActionDef, Button, ClickType, ElementDef, HoverRect, LoadError, PointerDef, PointerError,
     PointerHit, PressHit, RatioBarDef, RatioForm, RatioSource, RowKind, RowRef, RowRefKind,
-    RowView, SelectionDefs, SelectionText, SliderCommand, SliderDirection, SongListDef,
-    SongListError, Source, TextDef, TextValue, WidgetDefs,
+    RowView, SearchBoxes, SelectionDefs, SelectionText, SliderCommand, SliderDirection,
+    SongListDef, SongListError, Source, TextDef, TextValue, WidgetDefs,
 };
 
 /// The revision every numbered view here carries.
@@ -406,8 +406,14 @@ fn the_search_box_takes_a_press_with_an_empty_query() {
     fx.view(&v);
     fx.frame(0);
     for button in [Button::Left, Button::Right, Button::Middle] {
-        assert_eq!(hit(&fx, [100.0, 100.0], button), Some(PointerHit::Search));
-        assert_eq!(hit(&fx, [300.0, 120.0], button), Some(PointerHit::Search));
+        assert_eq!(
+            hit(&fx, [100.0, 100.0], button),
+            Some(PointerHit::Search { index: 0 })
+        );
+        assert_eq!(
+            hit(&fx, [300.0, 120.0], button),
+            Some(PointerHit::Search { index: 0 })
+        );
     }
     assert_eq!(hit(&fx, [301.0, 110.0], Button::Left), None);
     assert_eq!(hit(&fx, [150.0, 210.0], Button::Left), None);
@@ -695,7 +701,7 @@ fn a_search_box_is_its_region_moved_by_its_alignment() {
         fx.view(&view(Vec::new(), None));
         fx.frame(0);
         let x = f32::from(i16::try_from(left).unwrap());
-        let search = Some(PointerHit::Search);
+        let search = Some(PointerHit::Search { index: 0 });
         for (p, want) in [
             ([x, 100.0], search),
             ([x + 400.0, 120.0], search),
@@ -753,14 +759,14 @@ fn a_press_says_whether_it_is_outside_the_search_box() {
         press([160.0, 110.0]),
         PressHit {
             hit: order,
-            outside_search: false
+            inside_search: SearchBoxes(1)
         }
     );
     assert_eq!(
         press([120.0, 110.0]),
         PressHit {
-            hit: Some(PointerHit::Search),
-            outside_search: false
+            hit: Some(PointerHit::Search { index: 0 }),
+            inside_search: SearchBoxes(1)
         }
     );
     // On the action, below the box.
@@ -768,15 +774,169 @@ fn a_press_says_whether_it_is_outside_the_search_box() {
         press([160.0, 124.0]),
         PressHit {
             hit: order,
-            outside_search: true
+            inside_search: SearchBoxes::NONE
         }
     );
     assert_eq!(
         press([500.0, 110.0]),
         PressHit {
             hit: None,
-            outside_search: true
+            inside_search: SearchBoxes::NONE
         }
+    );
+}
+
+/// Query text over `r`, a search text.
+fn query_text() -> TextDef {
+    TextDef {
+        value: TextValue::Selection(SelectionText::Query),
+        font: skin_model::FontRef::Default,
+        align: skin_model::Align::Left,
+        overflow: skin_model::Overflow::Spill,
+    }
+}
+
+/// A search entry for element `element`.
+fn search(element: u32) -> PointerDef {
+    PointerDef {
+        element,
+        action: None,
+        hover: None,
+        search: true,
+        region: None,
+    }
+}
+
+/// Each press says which search texts' input boxes, as last sampled, hold
+/// it, by their order. A box its condition hides since, or its track's
+/// end, takes no press but keeps its last bounds: a press there is still
+/// inside it, one off it is not (`skin/SkinObject.java:348-356, 591-602`,
+/// `skin/SkinTextInput.java:77-81`).
+#[test]
+fn a_search_box_keeps_its_last_bounds_while_hidden() {
+    let mut by_condition = element(Source::Text(0), [100, 100, 300, 20]);
+    by_condition.visible = Some(boolean("cursor.chart"));
+    let mut by_time = element(Source::Text(1), [100, 300, 300, 20]);
+    by_time.track = selection_support::keys_ending(
+        &[(0, [100, 300, 300, 20]), (1_000, [100, 300, 300, 20])],
+        skin_model::End::Hide,
+    );
+    let skin = load(
+        vec![by_condition, by_time],
+        WidgetDefs {
+            texts: vec![query_text(), query_text()],
+            ..WidgetDefs::default()
+        },
+        SelectionDefs {
+            pointer: vec![search(0), search(1)],
+            ..SelectionDefs::default()
+        },
+    )
+    .unwrap();
+    let mut fx = Fx::new(skin);
+    let press = |fx: &Fx, p| fx.skin.hit_at(&fx.sel, p, fx.target, Button::Left);
+    // Both drawn: each takes a press in its box, inside it alone.
+    fx.view(&numbered(vec![chart("a")]));
+    fx.frame(0);
+    assert_eq!(
+        press(&fx, [120.0, 110.0]),
+        PressHit {
+            hit: Some(PointerHit::Search { index: 0 }),
+            inside_search: SearchBoxes(0b01),
+        }
+    );
+    assert_eq!(
+        press(&fx, [120.0, 310.0]),
+        PressHit {
+            hit: Some(PointerHit::Search { index: 1 }),
+            inside_search: SearchBoxes(0b10),
+        }
+    );
+    // The first hidden by its condition, the second past its track's end.
+    fx.view(&view(Vec::new(), None));
+    fx.frame(2_000);
+    assert_eq!(
+        press(&fx, [120.0, 110.0]),
+        PressHit {
+            hit: None,
+            inside_search: SearchBoxes(0b01),
+        },
+        "inside the box its condition hid"
+    );
+    assert_eq!(
+        press(&fx, [120.0, 310.0]),
+        PressHit {
+            hit: None,
+            inside_search: SearchBoxes(0b10),
+        },
+        "inside the box its track's end hid"
+    );
+    assert_eq!(press(&fx, [500.0, 110.0]), PressHit::NONE);
+}
+
+/// The load refuses an image choice entry keyed otherwise than its
+/// element's track on an element with a pointer entry (its region is its
+/// own track whichever entry draws), and more search texts than
+/// [`skin_model::MAX_SEARCH_BOXES`].
+#[test]
+fn load_refuses_an_unkeyed_choice_and_too_many_search_texts() {
+    let choice = |track| skin_model::ImageChoiceDef {
+        value: selection_support::int("0"),
+        choices: vec![Some(skin_model::ImageChoicePart {
+            span: skin_model::ImageSpan {
+                image: 5,
+                first: 0,
+                frames: 1,
+            },
+            cycle: None,
+            track,
+            native: None,
+        })],
+        past_table: skin_model::PastTable::Hide,
+    };
+    let with = |track| {
+        load(
+            vec![element(Source::ImageChoice(0), [0, 0, 10, 10])],
+            WidgetDefs {
+                image_choices: vec![choice(track)],
+                ..WidgetDefs::default()
+            },
+            SelectionDefs {
+                pointer: vec![action(0, 12, ClickType::Plus)],
+                ..SelectionDefs::default()
+            },
+        )
+    };
+    match with(Some(selection_support::keys(&[
+        (0, [0, 0, 20, 10]),
+        (100, [0, 0, 20, 10]),
+    ]))) {
+        Err(LoadError::Pointer { entry: 0, error }) => {
+            assert_eq!(error, PointerError::RegionTiming);
+        }
+        other => panic!("{:?}", other.err()),
+    }
+    assert!(with(Some(rect([0, 0, 20, 10]))).is_ok());
+    // Search texts are text elements: one past the bound is refused as
+    // that, so every search text is a bit of the answer.
+    let n = skin_model::MAX_SEARCH_BOXES + 1;
+    let texts = load(
+        (0..n)
+            .map(|i| element(Source::Text(u32::try_from(i).unwrap()), [0, 0, 10, 10]))
+            .collect(),
+        WidgetDefs {
+            texts: (0..n).map(|_| query_text()).collect(),
+            ..WidgetDefs::default()
+        },
+        SelectionDefs {
+            pointer: (0..n).map(|i| search(u32::try_from(i).unwrap())).collect(),
+            ..SelectionDefs::default()
+        },
+    );
+    assert!(
+        matches!(texts, Err(LoadError::TooManyTexts { n: 65 })),
+        "{:?}",
+        texts.err()
     );
 }
 
