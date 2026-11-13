@@ -5,8 +5,9 @@
 //! A presentation is a view payload, made from one view snapshot (the
 //! bundle or the built-in result, the view and its labels, the strip's
 //! lines that depend on the view and the view's built-in page), with an
-//! overlay merged on its own (the lifetime's start, the fade-out's start
-//! and the strip's lines that do not depend on the view). The presenter
+//! overlay merged on its own (the fade-out's start and the strip's lines
+//! that do not depend on the view). The lifetime's origin, its `screen`
+//! timer's start, is the render thread's: its first commit point sets it. The presenter
 //! numbers each with its own revision, and the render thread takes the
 //! newest of the current result lifetime through a slot, prepares a new
 //! payload apart from what it draws, and promotes it at one commit point
@@ -68,13 +69,16 @@ pub struct ViewPayload {
     /// The view's built-in page: its view rows draw when the built-in
     /// result shows.
     pub page: EndPage,
+    /// The chart's images its layout draws, fitted for its chart slot
+    /// ([`crate::result_skin::ResultSkin::chart_for`]): written into the
+    /// array its staging uses as it is staged. `None` without a layout
+    /// keeping a chart layer.
+    pub chart: Option<Arc<crate::chart_images::ChartImages>>,
 }
 
 /// What merges into a presentation whatever view it shows (D1).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Overlay {
-    /// The lifetime's start on the QPC clock: the `screen` timer.
-    pub screen: TimeUs,
     /// The fade-out's start on the QPC clock (timer 2), once a leaving
     /// command was accepted.
     pub fadeout: Option<TimeUs>,
@@ -148,6 +152,11 @@ pub struct ResultBarrier {
     /// The fade-out's start the barrier was set with: set, the barrier
     /// holds, a view pinned or none presented yet.
     pub fadeout: Option<TimeUs>,
+    /// The lifetime's origin (design.md "Rendering and Skins", Timers):
+    /// the sampled instant of the frame whose commit point first held a
+    /// view presented, written by that commit point with the timing and
+    /// never cleared within the lifetime.
+    pub origin: Option<TimeUs>,
     /// The presented view's skin timing while its skin draws: `None` for
     /// a built-in view, before the first commit and once the kind is
     /// disabled (the S10-09i design's D6, D7).
@@ -434,6 +443,9 @@ pub trait Publish {
     ) -> Option<(Option<ViewKey>, Option<skin_model::ResultTiming>)>;
     /// The current lifetime's presented view's skin timing.
     fn timing(&self) -> Option<skin_model::ResultTiming>;
+    /// The current lifetime's origin: the instant its first view was
+    /// committed, `None` before it.
+    fn origin(&self) -> Option<TimeUs>;
 }
 
 /// The game thread's side of the result's presentation (D1, D4, D7): it
@@ -466,19 +478,16 @@ impl Presenter {
         self.lifetime.is_some()
     }
 
-    /// A result lifetime begins at `now` on the QPC clock (the result
-    /// shown first after its preparation).
-    pub fn begin(&mut self, to: &mut impl Publish, now: TimeUs) {
+    /// A result lifetime begins (the result shown first after its
+    /// preparation); its origin is set by the render thread's first commit
+    /// point of it.
+    pub fn begin(&mut self, to: &mut impl Publish) {
         self.lifetime = Some(to.begin());
         self.revision = 0;
         self.payload = None;
         self.desired = None;
         self.view = None;
-        self.overlay = Overlay {
-            screen: now,
-            fadeout: None,
-            lines: Vec::new(),
-        };
+        self.overlay = Overlay::default();
     }
 
     /// The result is left: its lifetime ends, and nothing of it is drawn.
@@ -488,6 +497,12 @@ impl Presenter {
         }
         self.payload = None;
         self.desired = None;
+    }
+
+    /// The payload published last (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn payload(&self) -> Option<&Arc<ViewPayload>> {
+        self.payload.as_ref()
     }
 
     /// The next attempt: the attempt's fallback is forgotten.
@@ -521,9 +536,16 @@ impl Presenter {
     }
 
     /// The desired view's layout landed as `shown` (the result slot's
-    /// publication for the latest request): its payload is published,
-    /// unless the barrier holds or it is the one published.
-    pub fn land(&mut self, to: &mut impl Publish, shown: Option<&Published>) {
+    /// publication for the latest request), drawing the chart's images
+    /// `chart` (its fit, [`crate::result_skin::ResultSkin::chart_for`]):
+    /// its payload is published, unless the barrier holds or it is the
+    /// one published, the same images included.
+    pub fn land(
+        &mut self,
+        to: &mut impl Publish,
+        shown: Option<&Published>,
+        chart: Option<Arc<crate::chart_images::ChartImages>>,
+    ) {
         if self.overlay.fadeout.is_some() || self.lifetime.is_none() {
             return;
         }
@@ -542,6 +564,7 @@ impl Presenter {
             ),
             (None, _, _, _) => return,
         };
+        let chart = chart.filter(|_| skin.is_some());
         let same = self.payload.as_ref().is_some_and(|p| {
             p.key == *key
                 && p.script == script
@@ -550,6 +573,7 @@ impl Presenter {
                     (None, None) => true,
                     _ => false,
                 }
+                && p.chart.as_ref().map(|c| c.id()) == chart.as_ref().map(|c| c.id())
         });
         if same {
             return;
@@ -563,6 +587,7 @@ impl Presenter {
             labels: snapshot.labels.clone(),
             lines: snapshot.lines.clone(),
             page: snapshot.page.clone(),
+            chart,
         });
         self.payload = Some(payload);
         self.publish(to);
@@ -629,6 +654,15 @@ impl Presenter {
     pub fn timing(&self, to: &impl Publish) -> Option<skin_model::ResultTiming> {
         self.lifetime?;
         to.timing()
+    }
+
+    /// The result's origin (design.md "Rendering and Skins", Timers): the
+    /// sampled instant of the frame that committed the lifetime's first
+    /// view, a built-in one included, from which its skin's input and
+    /// scene times count; `None` outside a lifetime and before that commit.
+    pub fn origin(&self, to: &impl Publish) -> Option<TimeUs> {
+        self.lifetime?;
+        to.origin()
     }
 
     /// Publishes the payload published last with the overlay as it is,

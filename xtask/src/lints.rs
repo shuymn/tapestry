@@ -480,6 +480,8 @@ pub const IN_PLAY: &[Site] = &[
         &["glyph_uv", "solid_uv", "texels", "cell_of"],
     ),
     Site::Fns("crates/render/src/gpu.rs", &["Gpu::device", "Gpu::queue"]),
+    // A result frame's live chart key reads its array's number.
+    Site::Fns("crates/render/src/skin_atlas.rs", &["AtlasTexture::serial"]),
     Site::File("crates/player/src/measure.rs"),
     Site::File("crates/player/src/render_side.rs"),
     // The chart images' currency, which the render thread asks per frame.

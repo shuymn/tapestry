@@ -26,6 +26,8 @@ use crate::result_skin::{ResultSkin, ResultStart};
 
 mod adapter;
 mod images;
+mod result_flow;
+mod result_images;
 mod settle;
 
 /// How long a test waits for what must come; `TAPESTRY_TEST_WATCHDOG`
@@ -149,6 +151,7 @@ fn stage(rig: &PlayerRig<'_>) -> &'static str {
     match rig.prep.as_ref().map(|p| &p.stage) {
         None => "none",
         Some(PrepStage::Skin(_)) => "skin",
+        Some(PrepStage::Facts(_)) => "facts",
         Some(PrepStage::Image(..)) => "image",
         Some(PrepStage::Screen(_)) => "screen",
         Some(PrepStage::Images(..)) => "images",

@@ -183,7 +183,17 @@ pub(crate) struct AtlasTexture {
     /// The chart layer, after the pages and the text layer, if the array
     /// has one.
     chart_layer: Option<u32>,
+    /// This array's number, unique in the process: a chart table keyed to
+    /// it describes no array made since, a restore's included.
+    serial: u64,
+    /// The chart set whose images its chart layer holds, by the set's id:
+    /// set by a whole write, cleared before any write and by a failed one.
+    /// An id, never the set (it keeps no pixels alive).
+    chart_set: Option<u64>,
 }
+
+/// The next [`AtlasTexture::serial`].
+static SERIALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 impl AtlasTexture {
     /// The built-in atlas alone: one 128-texel layer without mips.
@@ -244,7 +254,25 @@ impl AtlasTexture {
             levels,
             text_layer: None,
             chart_layer: None,
+            serial: SERIALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            chart_set: None,
         }
+    }
+
+    /// This array's number, unique in the process.
+    pub(crate) const fn serial(&self) -> u64 {
+        self.serial
+    }
+
+    /// The chart set its chart layer holds, if a whole write left one.
+    pub(crate) const fn chart_set(&self) -> Option<u64> {
+        self.chart_set
+    }
+
+    /// Records the chart set its chart layer holds (`None` before a write
+    /// and after a failed one).
+    pub(crate) fn set_chart_set(&mut self, set: Option<u64>) {
+        self.chart_set = set;
     }
 
     /// The array, for the text layer's writes.

@@ -155,7 +155,7 @@ pub enum Source {
     TimingVisualizer(u32),
     /// The hit-error visualizer at this index of [`PlayDefs::hit_errors`].
     HitErrorVisualizer(u32),
-    /// The chart's own image `which` (play only, S10-12): its installed
+    /// The chart's own image `which` (play and result, S10-12): its installed
     /// uv and native size ([`ChartTable`]), on the element's track, met by
     /// `stretch` at placement and sampled with `filter`. An absent image,
     /// and any while its table is unavailable, draws nothing.
@@ -1569,7 +1569,6 @@ fn check_kind(
                                 | Source::CoverPaint(_)
                                 | Source::SongList
                                 | Source::RatioBar(_)
-                                | Source::ChartImage { .. }
                                 | Source::BpmGraph(_)
                                 | Source::TimingVisualizer(_)
                                 | Source::HitErrorVisualizer(_)
@@ -4133,7 +4132,7 @@ impl Skin {
             state: res.state(),
             text: &res.text,
             bitmap: &res.bitmap,
-            chart: None,
+            chart: Some(res.drawable_chart()),
         };
         let at = (frame.now, frame.target, frame.layout);
         self.draw_screen(&rt, Phase::Result { res }, at, uvs, out);
