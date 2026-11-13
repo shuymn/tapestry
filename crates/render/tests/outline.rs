@@ -23,9 +23,9 @@ use common::{GAUGES, context, input, offscreen, read_back, view};
 use outline_support::{FontRec, Value, default_font, distance_field, text, ttf};
 use render::text::MenuText;
 use render::{
-    AttemptInput, AttemptText, FillStep, LabelBook, LabelJob, LabelKey, LabelStore, LabelWorker,
-    LineBounds, LineFit, LineLayout, OutlineText, Renderer, Settled, SkinBundle, SkinError,
-    TextResidency, text_upload_bound,
+    AttemptInput, AttemptText, FillStep, LabelBook, LabelJob, LabelStore, LabelWorker, LineBounds,
+    LineFit, LineLayout, OutlineText, Renderer, Settled, SkinBundle, SkinError, TextResidency,
+    text_upload_bound,
 };
 use skin_model::{ChartText, DecisionStrings, ResultLabels, ScreenKind, TextRequest, TextSlots};
 
@@ -328,27 +328,30 @@ fn witness_terms_are_disjoint() {
     });
     let worker = LabelWorker::for_bundle(&db, Some(wake)).unwrap();
     let mut store = LabelStore::new(LabelBook::shared([1_920, 1_080]));
-    let staged = |generation: u64, title: &str| {
-        worker.post(LabelJob {
+    let job = |generation: u64, title: &str| {
+        LabelJob::new(
             generation,
-            key: LabelKey {
-                chart: title.into(),
-                revision: 1,
-                target: [1_920, 1_080],
-            },
-            strings: DecisionStrings::new(&ResultLabels {
+            title.into(),
+            1,
+            DecisionStrings::new(&ResultLabels {
                 title: title.to_owned(),
                 artist: "AB".to_owned(),
                 ..ResultLabels::default()
             }),
-            plan: Arc::clone(&plan),
+            Arc::clone(&plan),
+        )
+    };
+    let staged = |store: &mut LabelStore, r: &Renderer, generation: u64, title: &str| {
+        store.post(&worker, job(generation, title), &mut || {
+            r.watch_completion()
         });
         rx.recv_timeout(Duration::from_secs(60)).unwrap();
         worker.take().unwrap().unwrap()
     };
     // Each output is claimed before the next job is posted: a newer post
-    // supersedes every output taken before it.
-    store.offer(staged(1, "A"));
+    // supersedes every older preparation.
+    let a = staged(&mut store, &r, 1, "A");
+    store.offer(a);
     store.claim().unwrap();
     while r.write_decision_labels(&mut store) == FillStep::Wrote {}
     let _ = r.gpu().device().poll(wgpu::PollType::wait_indefinitely());
@@ -356,10 +359,13 @@ fn witness_terms_are_disjoint() {
         r.settle_decision_labels(&mut store).unwrap(),
         Settled::Published { .. }
     ));
-    store.offer(staged(2, "B"));
+    let bo = staged(&mut store, &r, 2, "B");
+    store.offer(bo);
     store.claim().unwrap();
     assert_eq!(r.write_decision_labels(&mut store), FillStep::Complete);
-    store.offer(staged(3, "C"));
+    // A waiting output beside the fill: staged on this thread, as a
+    // rebuild's restore stages, since a post would dispose of the fill.
+    store.offer(worker.restage(&db, job(3, "C")).unwrap().unwrap());
     let d = store.memory(Some(&worker));
     assert!(d.labels > 0 && d.staged > 0 && d.upload > 0, "{d:?}");
     assert!(d.staged <= plan.staged_bound(), "{d:?}");

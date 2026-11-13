@@ -282,6 +282,22 @@ impl DecisionSide {
         screen: &dyn Screen,
     ) -> Result<Self, String> {
         let worker = LabelWorker::for_bundle(bundle, None).map_err(|e| e.to_string())?;
+        Self::with_worker(bundle, book, next, screen, worker)
+    }
+
+    /// [`new`](Self::new) with `worker` preparing the labels (tests: a
+    /// producer of their own).
+    ///
+    /// # Errors
+    ///
+    /// The rows do not fit the region.
+    pub(crate) fn with_worker(
+        bundle: &Arc<SkinBundle>,
+        book: &Arc<Mutex<LabelBook>>,
+        next: Gen,
+        screen: &dyn Screen,
+        worker: LabelWorker,
+    ) -> Result<Self, String> {
         let mut side = Self {
             bundle: Arc::clone(bundle),
             worker,
@@ -334,12 +350,18 @@ impl DecisionSide {
         &self.bundle
     }
 
-    /// Its rows asked again of `screen`, at its target now.
+    /// Its rows asked again of `screen`, at its target now, and the book's
+    /// target made that target (its ready slots of another target freed).
+    /// The one place target identity is set: the book's target and the
+    /// plan's ([`RowPlan::target`]) are the screen's together, and every
+    /// job's key takes the plan's ([`LabelJob::new`]), so a key names the
+    /// target its lines are rasterized at.
     ///
     /// # Errors
     ///
     /// The rows do not fit the region: a refusal of the kind.
     pub fn replan(&mut self, screen: &dyn Screen) -> Result<(), RenderError> {
+        lock(self.store.book()).invalidate(screen.target());
         self.plan = None;
         if let Some(plan) = screen.decision_rows() {
             self.plan = Some(Arc::new(plan?));
@@ -370,30 +392,46 @@ impl DecisionSide {
         unasked || cooling || in_flight
     }
 
-    /// One frame boundary's work, outside every frame: a target change
-    /// taken, the device's health read, ended lifetimes' slots retired,
-    /// the worker's output taken, `want` asked (one job, the latest), a
-    /// slot claimed, its writes bounded, and the slots settled. Whenever
-    /// `want` is no longer the job asked last (another key or strings,
-    /// a key a slot holds already included), that job is superseded:
-    /// cancelled on the worker, its waiting output dropped and its filling
-    /// slot cancelled. A new job is posted only after the store's staging
-    /// was released, so at most one generation's staging is alive.
+    /// One frame boundary's work, outside every frame, in one order:
+    ///
+    /// 1. Target identity: the book's target and the row plan are made
+    ///    the screen's target together ([`replan`](Self::replan)) before
+    ///    anything is posted or claimed.
+    /// 2. The device's health read; ended lifetimes' slots retired.
+    /// 3. Supersession: a changed request (another key or strings, a
+    ///    return to a key a slot already holds included) is reconciled
+    ///    before any worker output is consumed: the job asked last is
+    ///    cancelled through the store ([`LabelStore::cancel`]), which drops
+    ///    its waiting output and disposes of its fill. So an obsolete job's
+    ///    output, `Ok` or `Err`, never reaches this boundary: a refusal
+    ///    taken here is the current request's.
+    /// 4. The worker's output taken; `want` posted (one job, the latest)
+    ///    through [`LabelStore::post`], which releases every older staging
+    ///    before the worker gets the job.
+    /// 5. A slot claimed, its writes bounded, and the slots settled.
     pub fn boundary(&mut self, screen: &mut dyn Screen, want: Option<&Want>) -> Boundary {
         let book = Arc::clone(self.store.book());
-        // A target change: the slots of another target freed, the rows
-        // asked again at the new one.
         let target = screen.target();
-        if lock(&book).current().0 != target {
-            lock(&book).invalidate(target);
-            if let Err(e) = self.replan(screen) {
-                return Boundary::Refused(e);
-            }
+        if lock(&book).current().0 != target
+            && let Err(e) = self.replan(screen)
+        {
+            return Boundary::Refused(e);
         }
         if screen.device_lost() {
             lock(&book).set_unhealthy();
         }
         lock(&book).retire_ended(&mut || screen.watch_completion());
+        if !self.retiring
+            && let Some(want) = want
+            && self
+                .posted
+                .as_ref()
+                .is_some_and(|(k, s)| !is_want(k, want, target) || *s != want.strings)
+        {
+            self.store
+                .cancel(&self.worker, &mut || screen.watch_completion());
+            self.posted = None;
+        }
         match self.worker.take() {
             Some(Ok(staged)) => self.store.offer(staged),
             Some(Err((_, e))) => return Boundary::Refused(e),
@@ -402,37 +440,23 @@ impl DecisionSide {
         if !self.retiring
             && let (Some(want), Some(plan)) = (want, self.plan.clone())
         {
-            // Superseded: the job, its waiting output and its fill end
-            // here, before any post. With nothing posted, the store holds
-            // no staging (it was superseded, stopped or reset).
-            if self
-                .posted
-                .as_ref()
-                .is_some_and(|(k, s)| !is_want(k, want, target) || *s != want.strings)
-            {
-                self.worker.cancel();
-                self.store.drop_waiting();
-                self.store.cancel(&mut || screen.watch_completion());
-                self.posted = None;
-            }
             let (held, stale) = held(&lock(&book), &self.store, want, target);
             if let Some((slot, generation)) = stale {
                 lock(&book).forget(slot, generation);
             }
             if !held && self.posted.is_none() {
-                let key = LabelKey {
-                    chart: want.chart.clone(),
-                    revision: want.revision,
-                    target,
-                };
                 let generation = self.next;
                 self.next = self.next.saturating_add(1);
-                self.worker.post(LabelJob {
+                let job = LabelJob::new(
                     generation,
-                    key: key.clone(),
-                    strings: want.strings.clone(),
+                    want.chart.clone(),
+                    want.revision,
+                    want.strings.clone(),
                     plan,
-                });
+                );
+                let key = job.key().clone();
+                self.store
+                    .post(&self.worker, job, &mut || screen.watch_completion());
                 #[cfg(test)]
                 self.check_post();
                 self.posted = Some((key, want.strings.clone()));
@@ -491,16 +515,22 @@ impl DecisionSide {
         self.staged_at_post.push(self.store.memory(None).staged);
     }
 
-    /// The screen was built again: the job in flight cancelled, the
-    /// waiting output and the fill dropped with the old device's writes,
-    /// the book reset (every slot free but the active lifetime's pinned
-    /// one), the rows asked again at the new target, and that pinned
-    /// slot's content rebuilt from its strings at that target under its
-    /// generation, on this thread once the worker's job ended
-    /// ([`LabelWorker::restage`]).
+    /// The screen was built again, the window's live size applied to it
+    /// first: the waiting output and the fill dropped with the old
+    /// device's writes, the job in flight cancelled and ended, the book
+    /// reset (every slot free but the active lifetime's pinned one), its
+    /// target and the rows made the screen's ([`replan`](Self::replan)),
+    /// and the pinned slot's content rebuilt from its strings at that
+    /// target under its generation, on this thread once the worker's job
+    /// ended ([`LabelWorker::restage`]).
+    /// Target identity: the restored pin's key names the target its lines
+    /// were rasterized at, the screen's ([`LabelJob::new`] takes the
+    /// plan's; the book's restore commits it), not the pin's target before
+    /// the rebuild.
     pub fn rebuilt(&mut self, screen: &mut dyn Screen) -> Rebuilt {
-        self.worker.cancel();
         self.store.reset();
+        // Every older job's output, a refusal included, is stale from here.
+        self.worker.quiesce();
         self.posted = None;
         let book = Arc::clone(self.store.book());
         lock(&book).reset();
@@ -519,12 +549,13 @@ impl DecisionSide {
         else {
             return Rebuilt::Refused(RenderError::LabelRegion { needed: 0, band: 0 });
         };
-        let job = LabelJob {
+        let job = LabelJob::new(
             generation,
-            key,
-            strings: strings.clone(),
-            plan: Arc::clone(plan),
-        };
+            key.chart,
+            key.revision,
+            strings.clone(),
+            Arc::clone(plan),
+        );
         let staged = match self.worker.restage(&self.bundle, job) {
             Ok(Some(staged)) => staged,
             Ok(None) => return Rebuilt::Restored,
@@ -537,10 +568,11 @@ impl DecisionSide {
         }
     }
 
-    /// Stops preparing: the job in flight and a waiting output dropped.
-    pub fn stop(&mut self) {
-        self.worker.cancel();
-        self.store.drop_waiting();
+    /// Stops preparing: the job in flight cancelled through the store
+    /// ([`LabelStore::cancel`]), its waiting output dropped and its fill
+    /// disposed of, cooling until `watch`'s flag after a write.
+    pub fn stop(&mut self, watch: render::Watch<'_>) {
+        self.store.cancel(&self.worker, watch);
         self.posted = None;
     }
 }

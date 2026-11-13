@@ -29,7 +29,7 @@ use outline_support::{
     Value, bitmap, bitmap_files, decision_bundle_in, decision_folder, default_font, text, ttf,
 };
 use render::{
-    FillStep, LabelBook, LabelJob, LabelKey, LabelStore, LabelWorker, Renderer, Settled, SkinBundle,
+    FillStep, LabelBook, LabelJob, LabelStore, LabelWorker, Renderer, Settled, SkinBundle,
 };
 use skin_model::{DecisionFrame, DecisionStrings, DecisionTimers, ResultLabels, ScreenKind};
 
@@ -132,22 +132,20 @@ fn prepared(dir: &tempfile::TempDir) -> (Renderer, Arc<SkinBundle>, LabelStore, 
         let _ = tx.send(());
     });
     let worker = LabelWorker::for_bundle(&b, Some(wake)).unwrap();
-    worker.post(LabelJob {
-        generation: 1,
-        key: LabelKey {
-            chart: PathBuf::from("a"),
-            revision: 1,
-            target: TARGET,
-        },
-        strings: DecisionStrings::new(&ResultLabels {
+    let mut store = LabelStore::new(LabelBook::shared(TARGET));
+    let job = LabelJob::new(
+        1,
+        PathBuf::from("a"),
+        1,
+        DecisionStrings::new(&ResultLabels {
             title: "AB".to_owned(),
             artist: "BA".to_owned(),
             ..ResultLabels::default()
         }),
-        plan: Arc::new(r.decision_rows().unwrap().unwrap()),
-    });
+        Arc::new(r.decision_rows().unwrap().unwrap()),
+    );
+    store.post(&worker, job, &mut || r.watch_completion());
     rx.recv_timeout(Duration::from_secs(60)).unwrap();
-    let mut store = LabelStore::new(LabelBook::shared(TARGET));
     store.offer(worker.take().unwrap().unwrap());
     let slot = store.claim().unwrap();
     while r.write_decision_labels(&mut store) == FillStep::Wrote {}

@@ -428,6 +428,11 @@ pub const IN_PLAY: &[Site] = &[
     // The decision screen's timers and the labels a build borrows.
     Site::File("crates/skin-model/src/decision/mod.rs"),
     Site::File("crates/skin-model/src/decision/schema.rs"),
+    // A decision frame draws a slot's bitmap lines.
+    Site::Fns(
+        "crates/skin-model/src/widget/glyphs.rs",
+        &["BitmapLines::len", "BitmapLines::lines"],
+    ),
     // The master gain a selection frame shows, from the gain that plays.
     Site::Fns(
         "crates/skin-model/src/selection.rs",

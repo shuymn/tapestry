@@ -36,9 +36,24 @@
 //! **A rebuild.** The resets keep a pinned slot and its generation, but
 //! not its content: the store keeps only its strings, so nothing of the
 //! old device's layer is drawn, until its lines staged again are written
-//! on the new renderer ([`restore_pinned`]). A worker's output is fenced
-//! by the newest job posted: a slot is never claimed for an output a newer
-//! post superseded, taken before it or not.
+//! on the new renderer ([`restore_pinned`]).
+//!
+//! **Invariants.** Each is enforced at one place, named here:
+//!
+//! - *Supersession* ([`LabelStore::post`]): every post and cancel mints a
+//!   new ticket in the worker, and only the newest ticket's work lives. A
+//!   post first makes every older output stale, taken or not, then
+//!   disposes the store's older waiting output and fill (the fill's slot
+//!   cancelled), and only then hands its job to the worker. Publication
+//!   ([`settle`]) is fenced by the same ticket, so nothing of an older post
+//!   ever publishes.
+//! - *Target identity* ([`LabelJob::new`], [`LabelBook::restored`]): a
+//!   key's target is the target its rows were planned at ([`RowPlan`]
+//!   records it), at a preparation and at a pinned slot's restore alike.
+//! - *Device loss* ([`settle`]): `Gpu::lost()` is read after every poll
+//!   that returned, before any slot is promoted and before any early
+//!   return; a lost device marks the book unhealthy and is reported as
+//!   [`RenderError::DeviceLost`].
 //!
 //! Preparation work allocates; reading a slot's content for a frame
 //! allocates nothing.
@@ -73,8 +88,11 @@ pub const LABEL_SLOTS: usize = 2;
 /// one fixed rule; a taller line is a note, not a refusal).
 const ROW_EMS: f32 = 2.0;
 
-/// A label content's name: the generation of its preparation. A rebuild
-/// keeps a pinned slot's generation.
+/// A label content's name: the generation of its preparation, any value
+/// its caller gives it. A rebuild keeps a pinned slot's generation.
+/// Supersession never reads it: a job is fenced by the ticket its post
+/// minted ([`LabelStore::post`]), so no generation, zero included, can
+/// alias a cancellation.
 pub type Gen = u64;
 
 /// The decision installation's text layer, as its label region: its side
@@ -117,6 +135,9 @@ pub struct LabelRow {
 /// an installation without rasterized text.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct RowPlan {
+    /// The target the rows were planned at: the target of every key whose
+    /// lines are rasterized at these rows.
+    target: [u32; 2],
     side: u32,
     width: u32,
     rows: Box<[LabelRow]>,
@@ -136,14 +157,19 @@ pub fn row_height(em: f32) -> u32 {
 }
 
 impl RowPlan {
-    /// The rows of `rows` (each text element's `(slot, em)`) on a text
-    /// layer `side` texels square (0 for none), for a skin of `slots` text
-    /// slots.
+    /// The rows of `rows` (each text element's `(slot, em)` at `target`)
+    /// on a text layer `side` texels square (0 for none), for a skin of
+    /// `slots` text slots.
     ///
     /// # Errors
     ///
     /// [`RenderError::LabelRegion`] when the rows pass half the layer.
-    pub fn new(rows: &[(u16, f32)], side: u32, slots: usize) -> Result<Self, RenderError> {
+    pub fn new(
+        rows: &[(u16, f32)],
+        side: u32,
+        slots: usize,
+        target: [u32; 2],
+    ) -> Result<Self, RenderError> {
         let band = side / 2;
         let mut y = 0_u64;
         let mut out = Vec::with_capacity(rows.len());
@@ -161,6 +187,7 @@ impl RowPlan {
             return Err(RenderError::LabelRegion { needed: y, band });
         }
         Ok(Self {
+            target,
             side,
             width: side.min(MAX_LINE_W),
             rows: out.into_boxed_slice(),
@@ -184,6 +211,12 @@ impl RowPlan {
     #[must_use]
     pub const fn side(&self) -> u32 {
         self.side
+    }
+
+    /// The target the rows were planned at.
+    #[must_use]
+    pub const fn target(&self) -> [u32; 2] {
+        self.target
     }
 
     /// The row of text slot `slot`.
@@ -227,7 +260,8 @@ impl RowPlan {
 }
 
 /// What a decision label preparation is for: the chosen chart, its labels'
-/// revision and the target its rows were planned at.
+/// revision and the target its lines were rasterized at (its rows' target,
+/// [`RowPlan::target`]; for a restored pin, the target of its restore).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct LabelKey {
     /// The chart's path.
@@ -714,15 +748,20 @@ impl LabelBook {
         )
     }
 
-    /// Pinned slot `slot`'s content at `generation` was restored: no
-    /// longer restoring. Whether it was.
-    fn restored(&mut self, slot: usize, generation: Gen) -> bool {
+    /// Pinned slot `slot`'s content at `generation` was restored, its
+    /// lines rasterized at `target`: no longer restoring, and its key names
+    /// `target`, its slot, generation and lifetime kept, so every later
+    /// target comparison is against the target it was restored at. Whether
+    /// it was restoring.
+    pub(crate) fn restored(&mut self, slot: usize, generation: Gen, target: [u32; 2]) -> bool {
         match self.slots.get_mut(slot) {
             Some(LabelState::Pinned {
                 generation: g,
+                key,
                 restoring,
                 ..
             }) if *g == generation && *restoring => {
+                key.target = target;
                 *restoring = false;
                 true
             }
@@ -748,16 +787,52 @@ pub fn lock(book: &Mutex<LabelBook>) -> MutexGuard<'_, LabelBook> {
     book.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// A preparation asked of the worker.
+/// A preparation asked of the worker. Its key's target is its rows'
+/// target ([`RowPlan::target`]) by construction: the key names the target
+/// its lines are rasterized at.
 #[derive(Debug)]
 pub struct LabelJob {
-    /// Its generation: a newer one supersedes it.
-    pub generation: Gen,
-    pub key: LabelKey,
-    /// The chosen chart's strings.
-    pub strings: DecisionStrings,
-    /// The rows at the key's target.
-    pub plan: Arc<RowPlan>,
+    generation: Gen,
+    key: LabelKey,
+    strings: DecisionStrings,
+    plan: Arc<RowPlan>,
+}
+
+impl LabelJob {
+    /// `chart`'s labels at `revision`, showing `strings`, laid out at
+    /// `plan`'s rows: preparation `generation`, keyed at `plan`'s target.
+    #[must_use]
+    pub fn new(
+        generation: Gen,
+        chart: PathBuf,
+        revision: u64,
+        strings: DecisionStrings,
+        plan: Arc<RowPlan>,
+    ) -> Self {
+        let key = LabelKey {
+            chart,
+            revision,
+            target: plan.target(),
+        };
+        Self {
+            generation,
+            key,
+            strings,
+            plan,
+        }
+    }
+
+    /// Its generation.
+    #[must_use]
+    pub const fn generation(&self) -> Gen {
+        self.generation
+    }
+
+    /// Its key.
+    #[must_use]
+    pub const fn key(&self) -> &LabelKey {
+        &self.key
+    }
 }
 
 /// One rasterized line staged for its row: its padded size, the line's
@@ -786,13 +861,15 @@ impl StagedLine {
 /// A preparation's output: its lines rasterized and expanded, its notes,
 /// its bitmap lines and the strings they were made from. It has one
 /// owner: the worker, then the store's waiting output, then a filling
-/// slot. Its fence is the newest generation asked of the worker that made
-/// it: once a newer job is posted (or the worker cancelled), it is
-/// superseded, and no slot is claimed for it ([`LabelStore::claim`]).
+/// slot. It is current while its `ticket` is its worker's newest (`fence`):
+/// a later post or cancel mints a newer one, and from then on it is
+/// neither claimed, kept nor published ([`LabelStore::post`]). Staged
+/// without a worker, its fence is its own, and it stays current.
 #[must_use]
 #[derive(Debug)]
 pub struct StagedLabels {
     generation: Gen,
+    ticket: u64,
     fence: Arc<AtomicU64>,
     key: LabelKey,
     timing: DecisionTiming,
@@ -817,11 +894,11 @@ impl StagedLabels {
         &self.key
     }
 
-    /// Whether it is still the newest generation asked of its worker
-    /// (always, staged without one).
+    /// Whether no post or cancel followed its own on its worker (always,
+    /// staged without one).
     #[must_use]
     pub fn is_current(&self) -> bool {
-        self.fence.load(Ordering::Acquire) == self.generation
+        self.fence.load(Ordering::Acquire) == self.ticket
     }
 
     /// One note per line without an image: its slot and why.
@@ -900,7 +977,8 @@ pub(crate) fn stage_labels(
     let bitmap = skin.decision_bitmap_lines(&job.strings);
     Ok(Some(StagedLabels {
         generation: job.generation,
-        fence: Arc::new(AtomicU64::new(job.generation)),
+        ticket: 0,
+        fence: Arc::new(AtomicU64::new(0)),
         key: job.key,
         timing: skin.decision_timing(),
         strings: job.strings,
@@ -951,10 +1029,23 @@ pub type LabelOutput = Result<StagedLabels, (Gen, RenderError)>;
 
 #[derive(Debug, Default)]
 struct Mailbox {
-    job: Option<LabelJob>,
+    /// The job and the ticket its post minted.
+    job: Option<(u64, LabelJob)>,
     closed: bool,
     /// A job taken and not yet ended: its staging may be alive.
     working: bool,
+}
+
+/// Unit tests: what the worker runs at its steps.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct WorkerHooks {
+    /// Run with a job's generation once it was staged, before the
+    /// worker's last check.
+    pub(crate) before_store: Option<Arc<dyn Fn(Gen) + Send + Sync>>,
+    /// Run with a job's generation once the worker is done with it, and
+    /// whether it stored an output.
+    pub(crate) after_job: Option<Arc<dyn Fn(Gen, bool) + Send + Sync>>,
 }
 
 struct WorkerShared {
@@ -965,10 +1056,11 @@ struct WorkerShared {
     /// Unit tests: set while a quiesce waits for the job in progress.
     #[cfg(test)]
     quiescing: AtomicBool,
-    /// The newest generation posted; 0 after a cancel. Changed only with
-    /// `output` locked, as the worker's last check before it stores an
-    /// output, so a superseded output is never stored.
-    latest: Arc<AtomicU64>,
+    /// The newest ticket: minted by every post and cancel, never reused.
+    /// Changed only with `output` locked, which is cleared in the same
+    /// lock; the worker's last check before it stores an output is in that
+    /// lock too, so `output` only ever holds the newest ticket's output.
+    ticket: Arc<AtomicU64>,
     output: Mutex<Option<LabelOutput>>,
     /// The worker's A8 buffer's bytes, and its producer's mask bound once
     /// a line was rasterized.
@@ -976,10 +1068,8 @@ struct WorkerShared {
     mask: AtomicU64,
     building: Arc<AtomicU64>,
     wake: Option<Arc<dyn Fn() + Send + Sync>>,
-    /// Unit tests: run by the worker with a job's generation once it was
-    /// staged, before its last check.
     #[cfg(test)]
-    before_store: Option<Arc<dyn Fn(Gen) + Send + Sync>>,
+    hooks: WorkerHooks,
     /// Unit tests: set once the worker's thread was joined.
     #[cfg(test)]
     reaped: Arc<(Mutex<bool>, Condvar)>,
@@ -990,10 +1080,12 @@ fn locked<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 /// One decision installation's preparation thread, with a one-slot
-/// mailbox: a job posted replaces the one waiting, and supersedes the one
-/// in progress, which stops between lines; an output of a superseded
-/// generation is dropped. Dropping it closes the thread without waiting
-/// for it: a thread of its own joins it.
+/// mailbox. Jobs reach it only through the store ([`LabelStore::post`],
+/// [`LabelStore::cancel`]), which mint a new ticket for each: a job posted
+/// replaces the one waiting and supersedes the one in progress, which
+/// stops between lines, and an output of a superseded ticket is never
+/// stored. Dropping it closes the thread without waiting for it: a thread
+/// of its own joins it.
 pub struct LabelWorker {
     shared: Arc<WorkerShared>,
     thread: Option<JoinHandle<()>>,
@@ -1002,7 +1094,7 @@ pub struct LabelWorker {
 impl std::fmt::Debug for LabelWorker {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("LabelWorker")
-            .field("latest", &self.shared.latest.load(Ordering::Relaxed))
+            .field("ticket", &self.shared.ticket.load(Ordering::Relaxed))
             .finish_non_exhaustive()
     }
 }
@@ -1024,28 +1116,27 @@ impl LabelWorker {
             producer,
             wake,
             #[cfg(test)]
-            None,
+            WorkerHooks::default(),
         )
     }
 
-    /// Unit tests: [`spawn`](Self::spawn), `before_store` run with each
-    /// job's generation once it was staged, before the worker's last
-    /// check.
+    /// Unit tests: [`spawn`](Self::spawn), with `hooks` run at the
+    /// worker's steps.
     #[cfg(test)]
     pub(crate) fn spawn_hooked(
         skin: Arc<Skin>,
         producer: Option<Arc<dyn AttemptText>>,
         wake: Option<Arc<dyn Fn() + Send + Sync>>,
-        before_store: Option<Arc<dyn Fn(Gen) + Send + Sync>>,
+        hooks: WorkerHooks,
     ) -> std::io::Result<Self> {
-        Self::spawn_with(skin, producer, wake, before_store)
+        Self::spawn_with(skin, producer, wake, hooks)
     }
 
     fn spawn_with(
         skin: Arc<Skin>,
         producer: Option<Arc<dyn AttemptText>>,
         wake: Option<Arc<dyn Fn() + Send + Sync>>,
-        #[cfg(test)] before_store: Option<Arc<dyn Fn(Gen) + Send + Sync>>,
+        #[cfg(test)] hooks: WorkerHooks,
     ) -> std::io::Result<Self> {
         let building = Arc::new(AtomicU64::new(0));
         let shared = Arc::new(WorkerShared {
@@ -1054,14 +1145,14 @@ impl LabelWorker {
             idle: Condvar::new(),
             #[cfg(test)]
             quiescing: AtomicBool::new(false),
-            latest: Arc::new(AtomicU64::new(0)),
+            ticket: Arc::new(AtomicU64::new(0)),
             output: Mutex::new(None),
             a8: AtomicU64::new(0),
             mask: AtomicU64::new(0),
             building: Arc::clone(&building),
             wake,
             #[cfg(test)]
-            before_store,
+            hooks,
             #[cfg(test)]
             reaped: Arc::new((Mutex::new(false), Condvar::new())),
         });
@@ -1098,18 +1189,34 @@ impl LabelWorker {
         )
     }
 
-    /// Posts `job`: it replaces a waiting job and supersedes the one in
-    /// progress, any output not taken and every output taken before.
-    pub fn post(&self, job: LabelJob) {
-        self.supersede(job.generation);
-        locked(&self.shared.mailbox).job = Some(job);
+    /// Mints the newest ticket and drops the output not taken, in one lock
+    /// of the output: from here on every output staged under an older
+    /// ticket, taken or not, is stale. The ticket minted.
+    fn supersede(&self) -> u64 {
+        let mut output = locked(&self.shared.output);
+        let ticket = self.shared.ticket.fetch_add(1, Ordering::AcqRel) + 1;
+        *output = None;
+        ticket
+    }
+
+    /// Hands `job` to the thread under `ticket`, replacing a waiting job.
+    fn place(&self, ticket: u64, job: LabelJob) {
+        locked(&self.shared.mailbox).job = Some((ticket, job));
         self.shared.posted.notify_one();
     }
 
-    /// Cancels every job, waiting or in progress, and drops an output not
-    /// taken; every output taken before is superseded.
-    pub fn cancel(&self) {
-        self.supersede(0);
+    /// Unit tests: a post that bypasses the store, so a test can see the
+    /// publication fence alone.
+    #[cfg(test)]
+    pub(crate) fn post_unreconciled(&self, job: LabelJob) {
+        let ticket = self.supersede();
+        self.place(ticket, job);
+    }
+
+    /// Cancels every job, waiting or in progress, and drops the output not
+    /// taken; every output taken before is stale.
+    fn cancel(&self) {
+        self.supersede();
         locked(&self.shared.mailbox).job = None;
     }
 
@@ -1156,23 +1263,13 @@ impl LabelWorker {
         stage_bundle_labels(bundle, job)
     }
 
-    /// Makes `generation` the newest and drops the output not taken, in
-    /// one lock of the output.
-    fn supersede(&self, generation: Gen) {
-        let mut output = locked(&self.shared.output);
-        self.shared.latest.store(generation, Ordering::Release);
-        *output = None;
-    }
-
-    /// The output of the newest job, once returned.
+    /// The output of the newest job, once returned, `Ok` or `Err`. It is
+    /// never an older post's: a post or cancel clears the output in the
+    /// lock it mints its ticket in, so after [`LabelStore::post`] or
+    /// [`LabelStore::cancel`] nothing older is returned.
     #[must_use]
     pub fn take(&self) -> Option<LabelOutput> {
-        let out = locked(&self.shared.output).take()?;
-        let generation = match &out {
-            Ok(s) => s.generation,
-            Err((g, _)) => *g,
-        };
-        (generation == self.shared.latest.load(Ordering::Acquire)).then_some(out)
+        locked(&self.shared.output).take()
     }
 
     /// Unit tests: the generation of the output not taken.
@@ -1214,7 +1311,7 @@ impl Drop for LabelWorker {
     /// Closes the thread without waiting for it: the line it may be
     /// working on is not interrupted, so a thread of its own joins it.
     fn drop(&mut self) {
-        self.supersede(0);
+        self.supersede();
         locked(&self.shared.mailbox).closed = true;
         self.shared.posted.notify_one();
         let Some(t) = self.thread.take() else {
@@ -1244,7 +1341,7 @@ fn run(
     scratch: &mut LabelScratch,
 ) {
     loop {
-        let job = {
+        let (ticket, job) = {
             let mut m = locked(&s.mailbox);
             loop {
                 if m.closed {
@@ -1257,28 +1354,35 @@ fn run(
                 m = s.posted.wait(m).unwrap_or_else(PoisonError::into_inner);
             }
         };
-        let stored = work(s, skin, producer, scratch, job);
+        #[cfg(test)]
+        let generation = job.generation;
+        let stored = stage_one(s, skin, producer, scratch, ticket, job);
         // The job ended, its staging stored or dropped.
         locked(&s.mailbox).working = false;
         s.idle.notify_all();
+        #[cfg(test)]
+        if let Some(hook) = &s.hooks.after_job {
+            hook(generation, stored);
+        }
         if stored && let Some(wake) = &s.wake {
             wake();
         }
     }
 }
 
-/// One job of the worker's: staged, then stored as the output unless
-/// superseded. Whether it was stored.
-fn work(
+/// Stages `job`, posted under `ticket`, and stores its output unless a
+/// newer ticket was minted meanwhile. Whether it stored one.
+fn stage_one(
     s: &WorkerShared,
     skin: &Skin,
     producer: Option<&dyn AttemptText>,
     scratch: &mut LabelScratch,
+    ticket: u64,
     job: LabelJob,
 ) -> bool {
     let generation = job.generation;
     let mask = job.plan.mask_bound();
-    let superseded = || s.latest.load(Ordering::Acquire) != generation;
+    let superseded = || s.ticket.load(Ordering::Acquire) != ticket;
     let out = stage_labels(skin, producer, job, scratch, &superseded);
     scratch.building.store(0, Ordering::Relaxed);
     s.a8.store(text_upload::a8_bytes(&scratch.text), Ordering::Relaxed);
@@ -1287,18 +1391,18 @@ fn work(
     }
     let out = match out {
         Ok(Some(mut staged)) => {
-            staged.fence = Arc::clone(&s.latest);
+            staged.ticket = ticket;
+            staged.fence = Arc::clone(&s.ticket);
             Ok(staged)
         }
         Ok(None) => return false,
         Err(e) => Err((generation, e)),
     };
     #[cfg(test)]
-    if let Some(hook) = &s.before_store {
+    if let Some(hook) = &s.hooks.before_store {
         hook(generation);
     }
-    // The last check and the store in the lock a post changes the newest
-    // generation in.
+    // The last check and the store in the lock a post mints its ticket in.
     let mut output = locked(&s.output);
     if superseded() {
         return false;
@@ -1520,9 +1624,42 @@ impl LabelStore {
         }
     }
 
-    /// Drops the waiting output.
-    pub fn drop_waiting(&mut self) {
-        self.waiting = None;
+    /// Posts `job` to `worker`, superseding every older preparation, in
+    /// one order (the supersession invariant): a new ticket is minted, so
+    /// every older output, taken or not, is stale and the one not taken is
+    /// dropped; then the store's stale waiting output is dropped and its
+    /// stale fill disposed of, its remaining levels freed and its slot
+    /// cancelled (cooling until `watch`'s flag after a write, never
+    /// published); only then is `job` handed to the worker. So no older
+    /// preparation's staging is alive once the new one's can exist, and
+    /// none publishes after this post ([`settle`] is fenced by the ticket).
+    pub fn post(&mut self, worker: &LabelWorker, job: LabelJob, watch: Watch<'_>) {
+        let ticket = worker.supersede();
+        self.reconcile(watch);
+        worker.place(ticket, job);
+    }
+
+    /// Cancels every preparation of `worker`'s: as [`post`](Self::post)
+    /// with no job. After it, [`LabelWorker::take`] returns nothing older,
+    /// `Ok` or `Err` (a request that returns to a key already held cancels
+    /// the job in flight here, before it takes).
+    pub fn cancel(&mut self, worker: &LabelWorker, watch: Watch<'_>) {
+        worker.cancel();
+        self.reconcile(watch);
+    }
+
+    /// Drops the waiting output and disposes of the fill unless current
+    /// ([`StagedLabels::is_current`]): the fill's slot is cancelled,
+    /// cooling until `watch`'s flag after a write.
+    fn reconcile(&mut self, watch: Watch<'_>) {
+        if self.waiting.as_ref().is_some_and(|w| !w.is_current()) {
+            self.waiting = None;
+        }
+        if self.fill.as_ref().is_some_and(|f| !f.staged.is_current())
+            && let Some(f) = self.fill.take()
+        {
+            lock(&self.book).cancel(f.slot, f.staged.generation, f.progress.wrote, watch);
+        }
     }
 
     /// The waiting output's generation.
@@ -1577,16 +1714,6 @@ impl LabelStore {
             },
         });
         Some(slot)
-    }
-
-    /// Ends the fill, superseded: its slot free, or cooling until `watch`'s
-    /// flag after a write. Whether one was filling.
-    pub fn cancel(&mut self, watch: Watch<'_>) -> bool {
-        let Some(f) = self.fill.take() else {
-            return false;
-        };
-        lock(&self.book).cancel(f.slot, f.staged.generation, f.progress.wrote, watch);
-        true
     }
 
     /// Slot `slot`'s content at `generation`, borrowed for a frame. Allocates
@@ -1783,11 +1910,15 @@ pub(crate) fn write_rows(t: &LabelTarget<'_>, store: &mut LabelStore) -> FillSte
     FillStep::Complete
 }
 
-/// Settles the filling slot at a boundary: polls the device without
-/// blocking, settles the cooling slots, and once the fill's writes are
-/// queued and their completion seen by that poll, with the device healthy
-/// (read after it) and every scope empty, installs its content
-/// ([`install`]) and publishes it if its key is still current.
+/// Settles the label slots at a boundary: polls the device without
+/// blocking; reads `Gpu::lost()` after that poll, before anything else (the
+/// device-loss invariant: a lost device marks the book unhealthy and is
+/// reported, and no slot is promoted, cooling ones included); disposes of
+/// a fill a newer post superseded (the publication fence,
+/// [`LabelStore::post`]); settles the cooling slots; and once the fill's
+/// writes are queued and their completion seen by that poll, with every
+/// scope empty, installs its content ([`install`]) and publishes it if its
+/// key is still current.
 ///
 /// # Errors
 ///
@@ -1801,21 +1932,13 @@ pub(crate) fn settle(t: &LabelTarget<'_>, store: &mut LabelStore) -> Result<Sett
         .device()
         .poll(wgpu::PollType::Poll)
         .map_err(RenderError::Poll)?;
-    lock(&store.book).cool();
-    let Some(fill) = store.fill.as_ref() else {
-        return Ok(Settled::Pending);
-    };
-    if !fill.progress.complete {
-        return Ok(Settled::Pending);
-    }
-    let seen = fill
-        .progress
-        .done
-        .as_ref()
-        .is_none_or(|d| d.load(Ordering::Acquire));
-    if !seen && !t.gpu.lost() {
-        return Ok(Settled::Pending);
-    }
+    let seen = store.fill.as_ref().is_some_and(|f| {
+        f.progress.complete
+            && f.progress
+                .done
+                .as_ref()
+                .is_none_or(|d| d.load(Ordering::Acquire))
+    });
     #[cfg(test)]
     if seen {
         store.steps.push(LabelStep::CompletionSeen);
@@ -1823,13 +1946,19 @@ pub(crate) fn settle(t: &LabelTarget<'_>, store: &mut LabelStore) -> Result<Sett
     let lost = t.gpu.lost();
     #[cfg(test)]
     store.steps.push(LabelStep::LostChecked);
-    let Some(fill) = store.fill.take() else {
-        return Ok(Settled::Pending);
-    };
     if lost {
+        store.fill = None;
         lock(&store.book).set_unhealthy();
         return Err(RenderError::DeviceLost);
     }
+    store.reconcile(&mut || watch(t.gpu));
+    lock(&store.book).cool();
+    if !seen {
+        return Ok(Settled::Pending);
+    }
+    let Some(fill) = store.fill.take() else {
+        return Ok(Settled::Pending);
+    };
     let (slot, generation) = (fill.slot, fill.staged.generation);
     let refused = refusal(fill.progress.scope_error, t.region, &fill.staged);
     if let Some(e) = refused {
@@ -1881,7 +2010,10 @@ fn refusal(
 /// target, on a renderer built again: every row written at once
 /// (unbudgeted: a rebuild blocks already), the writes waited for, then
 /// installed under the same generation and drawable again, the slot no
-/// longer restoring. Whatever was filling or waiting is dropped first.
+/// longer restoring, its key naming the target `staged` was rasterized at
+/// (its rows' target: the target-identity invariant, so a later target
+/// change compares against it). Whatever was filling or waiting is
+/// dropped first.
 /// `Ok(false)`, nothing written, when `slot` is not restoring at that
 /// generation.
 ///
@@ -1896,7 +2028,7 @@ pub(crate) fn restore_pinned(
     slot: usize,
     staged: StagedLabels,
 ) -> Result<bool, RenderError> {
-    let generation = staged.generation;
+    let (generation, target) = (staged.generation, staged.key.target);
     if store.restore_strings(slot, generation).is_none()
         || !lock(&store.book).awaits_restore(slot, generation)
     {
@@ -1932,7 +2064,7 @@ pub(crate) fn restore_pinned(
     if let Some(c) = store.contents.get_mut(slot) {
         *c = Some((generation, Held::Drawable(content)));
     }
-    lock(&store.book).restored(slot, generation);
+    lock(&store.book).restored(slot, generation, target);
     Ok(true)
 }
 
@@ -2255,9 +2387,9 @@ mod tests {
         let s = ready(&mut b, 2, "a");
         b.pin(Path::new("a"), 1, 3).unwrap();
         b.reset();
-        assert!(b.restored(s, 2));
+        assert!(b.restored(s, 2, T));
         assert!(!b.awaits_restore(s, 2));
-        assert!(!b.restored(s, 2));
+        assert!(!b.restored(s, 2, T));
         b.end(3);
         b.retire_ended(&mut || flags.watch());
         flags.fire(1);
@@ -2311,7 +2443,7 @@ mod tests {
         assert_eq!(row_height(-3.0), 16);
         assert_eq!(row_height(f32::NAN), 16);
 
-        let plan = RowPlan::new(&[(3, 18.0), (5, 24.0), (9, 20.01)], 2_048, 12).unwrap();
+        let plan = RowPlan::new(&[(3, 18.0), (5, 24.0), (9, 20.01)], 2_048, 12, T).unwrap();
         let rows: Vec<_> = plan.rows().iter().map(|r| (r.slot, r.y, r.h)).collect();
         // 24: 48 + 16 = 64.
         assert_eq!(rows, [(3, 0, 56), (5, 56, 64), (9, 120, 64)]);
@@ -2319,13 +2451,13 @@ mod tests {
         let b = plan.bounds(&plan.rows()[1]);
         assert_eq!((b.w, b.h), (2_032, 48));
         // The width's cap.
-        let wide = RowPlan::new(&[(0, 18.0)], 8_192, 1).unwrap();
+        let wide = RowPlan::new(&[(0, 18.0)], 8_192, 1, T).unwrap();
         assert_eq!(wide.width(), 4_096);
         assert_eq!(wide.bounds(&wide.rows()[0]).w, 4_080);
         // The fit: exactly half the layer fits, one row more does not.
         // Side 2 080: band 1 040, one capped row.
-        assert!(RowPlan::new(&[(0, 600.0)], 2_080, 1).is_ok());
-        let e = RowPlan::new(&[(0, 600.0), (1, 0.0)], 2_080, 2).unwrap_err();
+        assert!(RowPlan::new(&[(0, 600.0)], 2_080, 1, T).is_ok());
+        let e = RowPlan::new(&[(0, 600.0), (1, 0.0)], 2_080, 2, T).unwrap_err();
         assert!(
             matches!(
                 e,
@@ -2360,5 +2492,31 @@ mod tests {
         assert_eq!(epoch, 1);
         b.reset();
         assert!(is_free(&b, s));
+    }
+
+    /// A pin made at T and restored at U names U: back at T, nothing holds
+    /// T's key, and its retire then never makes it ready for T; it keeps
+    /// its slot, generation and lifetime.
+    #[test]
+    fn restored_pin_keys_the_target_it_was_restored_at() {
+        const U: [u32; 2] = [1_280, 720];
+        let mut b = LabelBook::new(T);
+        let s = ready(&mut b, 1, "a");
+        b.pin(Path::new("a"), 1, 7).unwrap();
+        b.reset();
+        b.invalidate(U);
+        assert!(b.restored(s, 1, U));
+        assert!(is_pinned(&b, s, 1, 7));
+        assert!(b.holds(&LabelKey {
+            target: U,
+            ..key("a")
+        }));
+        b.invalidate(T);
+        assert!(!b.holds(&key("a")), "T's labels are prepared afresh");
+        b.end(7);
+        b.retire_ended(&mut || Arc::new(AtomicBool::new(true)));
+        b.cool();
+        assert!(is_free(&b, s));
+        assert_eq!(b.pin(Path::new("a"), 1, 8), None);
     }
 }

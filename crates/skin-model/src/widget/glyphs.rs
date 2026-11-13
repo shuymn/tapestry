@@ -70,6 +70,7 @@ impl BitmapLines {
 
     /// The number of slots.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn len(&self) -> usize {
         self.0.len()
     }
@@ -87,6 +88,7 @@ impl BitmapLines {
     }
 
     /// The lines, one per slot. Allocates nothing.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn lines(&self) -> &[Option<GlyphLine>] {
         &self.0
     }
