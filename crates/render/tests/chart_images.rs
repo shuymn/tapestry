@@ -501,7 +501,8 @@ fn staged_chart_images_draw_before_the_commit_and_move_with_it() {
         "unavailable before its publication"
     );
     assert_eq!(at(&p, CHART_STAGE), BLACK, "never the committed one's");
-    r.publish_chart_images(ChartTarget::Staged(token), [None, Some(&back), None])
+    let table = r
+        .publish_chart_images(ChartTarget::Staged(token), [None, Some(&back), None])
         .unwrap();
     let p = staged(&mut r, on);
     assert_eq!(at(&p, CHART_BACK), RED);
@@ -515,6 +516,10 @@ fn staged_chart_images_draw_before_the_commit_and_move_with_it() {
     );
     assert_eq!(at(&p, CHART_BACK), BLACK);
     r.commit(token).unwrap();
+    // Keyed at its publication with the staging's own key, which the
+    // commit keeps.
+    assert!(table.key().is_some());
+    assert_eq!(table.key(), r.chart_key(), "keyed to the staging");
     let p = loading(&mut r, &text, &frame(1));
     assert_eq!(at(&p, CHART_BACK), RED, "moved with the commit");
     assert_eq!(at(&p, CHART_STAGE), BLACK);
