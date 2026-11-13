@@ -6,7 +6,7 @@
 //! the bests phase of a scan pass; and the cached loudness measurements of
 //! the charts played (design.md "Algorithms").
 //!
-//! # Schema version 9
+//! # Schema version 10
 //!
 //! [`SCHEMA_VERSION`] is kept in `PRAGMA user_version`.
 //!
@@ -15,7 +15,10 @@
 //!   subtitle, artist, subartist, genre, playlevel, difficulty, bpm,
 //!   norm_text, title_key, artist_key, folder, mode, random, bga, loader,
 //!   taps, longs, mines, length_us, tempo_start, tempo_min, tempo_max,
-//!   rank_kind, rank_value, stagefile, banner, image_names)`: the
+//!   rank_kind, rank_value, stagefile, banner, image_names, key_taps,
+//!   key_longs, scratch_taps, scratch_longs, density_peak, density_end,
+//!   density_end_x100, density_average, density_average_x100, gauge_total,
+//!   main_bpm)`: the
 //!   header values as [`bms_parser::read_scanned`] reads them, `NULL` when
 //!   undeclared; the searched fields normalized and joined ([`Search`]); the
 //!   normalized title and artist, by which [`Sort::Title`] and [`Sort::Artist`]
@@ -32,11 +35,18 @@
 //!   branch declares ([`ChartEntry::images`]): `stagefile` and `banner`,
 //!   `NULL` when undeclared or overlong, and `image_names` `NULL` when the
 //!   branch is refused, else a bitmask of the overlong ones (1 the stage
-//!   file, 2 the banner), never shortened.
+//!   file, 2 the banner), never shortened; and the values a song list
+//!   previews of that branch ([`ChartInfoView`]), all `NULL` when the
+//!   branch is refused, `main_bpm` also without a MAIN tempo.
 //!   Indexed by `root`; by `(mode, title_key IS NULL, title_key, path)`, the
 //!   [`Sort::Title`] order, so an unfiltered list reads only the rows it
 //!   returns; and by `(mode, folder)`, by which [`Library::level`] finds a
 //!   level's folders.
+//! - `profiles(chart_id, sha256, loader, data)`: the stored profile
+//!   ([`StoredProfile`], at most [`MAX_PROFILE_BYTES`]) of a chart row's
+//!   seed-0 branch, stamped with the file's SHA-256 and the loader version
+//!   it was read with; written or deleted in its chart row's upsert, and
+//!   deleted with its chart row.
 //! - `charts_fts(norm_text)`: an FTS5 trigram index of `charts.norm_text`,
 //!   kept in the same transactions as `charts` by triggers.
 //! - `charts_sha(sha256, path)`: the index by which a record finds its
@@ -79,8 +89,9 @@
 //! another lock. A rebuild happens in [`Library::open`] after the lock is
 //! taken and before any connection exists. The lock file is left in place;
 //! the database file itself is never locked, since SQLite locks it. Each
-//! stored header value is cut to [`HEADER_FIELD_BYTES`], so a batch has a
-//! fixed bound in bytes.
+//! stored header value is cut to [`HEADER_FIELD_BYTES`] and each stored
+//! profile is at most [`MAX_PROFILE_BYTES`], so a batch has a fixed bound
+//! in bytes.
 
 #![forbid(unsafe_code)]
 #![deny(
