@@ -923,6 +923,9 @@ mod tests {
             // 53 % plays as the f32 0.53, which the source shows as 52.
             assert_eq!(s.system_volume, VolumeReading::of_gain(0.53));
             assert_eq!(s.system_volume.number, 52);
+            // The key and background volumes, each its own (20 % and 99 %).
+            assert_eq!(s.key_volume, VolumeReading::of_gain(0.2));
+            assert_eq!(s.background_volume, VolumeReading::of_gain(0.99));
             assert!(!s.play_to_end);
             assert_eq!(s.assignment, Some(rules::Assignment::NearestTiesEarlier));
         }
