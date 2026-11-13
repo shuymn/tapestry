@@ -3,20 +3,25 @@
 //! self-made and kind-correct) built and installed by production's
 //! startup, then `game::App::run` on the player's rig, choices made with
 //! the select screen's keys and every frame drawn on WARP by a real menu
-//! screen that notes what it drew. A frame gate on the render thread
-//! times the frames a test reads (the fade marker's pixels, the refused
-//! build); everything else is observed as drawn, never classified by hand.
+//! screen that notes each frame that reached the target. The run's clock
+//! is the test's: held from before the choice, it reads only the times the
+//! test sets, so the choice, every timer and every frame drawn meanwhile
+//! fall on exact times whatever the threads' scheduling; a frame gate on
+//! the render thread lets the frames a test reads (the fade marker's
+//! pixels, the refused build) through one at a time at those times.
+//! Everything else is observed as drawn, never classified by hand. Wall
+//! clock limits only detect a hang.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bms_model::{TimeSource as _, TimeUs};
 use game::Preparation;
 use input::QpcClock;
 use render::{FrameTiming, LabelBook, LabelState, RenderError, SkinBundle, lock};
-use skin_model::{BuildError, ScreenKind};
+use skin_model::{AtlasId, BuildError, ScreenKind};
 use tempfile::TempDir;
 
 use crate::controls::Controls;
@@ -34,10 +39,19 @@ const MARK: [i32; 4] = [800, 500, 64, 64];
 /// The pixel read inside [`MARK`].
 const MARK_AT: (u32, u32) = (832, 532);
 
-/// How long a wait for the render thread or the run lasts at most.
+/// The result fixture's marker, a gray (9, 9, 9) box at x 1,600, y 780
+/// up from the bottom, 64 × 64 (Lua destinations): drawn only by the
+/// result skin.
+const RESULT_MARK: &str = "{ id = \"dot\", dst = { { x = 1600, y = 780, w = 64, h = 64 } } },";
+
+/// The pixel read inside [`RESULT_MARK`], y down.
+const RESULT_MARK_AT: (u32, u32) = (1_632, 268);
+
+/// How long a wait for the render thread or the run lasts at most: hang
+/// detection only, never part of a claim.
 const BOUND: Duration = Duration::from_secs(20);
 
-/// What one frame drew.
+/// What one frame drew, or the play's commit.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Frame {
     /// A select screen's frame, drawn by its skin or as its page.
@@ -55,18 +69,23 @@ enum Frame {
     Loading,
     /// A play frame.
     Play,
-    /// A result skin's frame: the skin's own quads.
-    Result { quads: usize },
+    /// A staged installation committed (not a frame).
+    Commit,
+    /// A result skin's frame: the skin's own quads and, in the first one,
+    /// the color of [`RESULT_MARK_AT`].
+    Result { quads: usize, mark: Option<[u8; 3]> },
     /// The built-in result page.
     End,
 }
 
-/// A frame and when it was drawn: a decision frame's own time, else the
-/// clock as the screen drew it.
+/// A frame that reached the target, and when it was drawn: a decision
+/// frame's own time, else the clock as the screen drew it; and the
+/// decision installation's atlas resident on the GPU then.
 #[derive(Clone, Debug)]
 struct Drawn {
     at: TimeUs,
     frame: Frame,
+    decision: Option<AtlasId>,
 }
 
 /// The frame gate's state: while `pace`, each frame wait takes one of
@@ -164,11 +183,11 @@ struct Seen {
 }
 
 impl Seen {
-    fn push(&self, at: TimeUs, frame: Frame) {
+    fn push(&self, drawn: Drawn) {
         self.drawn
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .push(Drawn { at, frame });
+            .push(drawn);
         self.more.notify_all();
     }
 
@@ -204,19 +223,38 @@ impl Seen {
     }
 }
 
-/// A real menu screen on WARP that notes each frame it draws ([`Frame`])
-/// and lets [`Seen`]'s gate time its frames.
+/// A real menu screen on WARP that notes each frame that reached the
+/// target ([`Frame`]) and lets [`Seen`]'s gate time its frames.
 struct Noted {
     menu: MenuScreen,
     seen: Arc<Seen>,
     clock: QpcClock,
     /// The decision frame built last: its time and `screen` timer.
     decision: Option<(TimeUs, Option<TimeUs>)>,
+    /// A result skin frame reached the target, its marker read.
+    result_read: bool,
 }
 
 impl Noted {
-    fn note(&self, frame: Frame) {
-        self.seen.push(self.clock.now(), frame);
+    /// The decision installation's atlas resident on the GPU.
+    fn resident(&self) -> Option<AtlasId> {
+        let [committed, ..] = self.menu.retained_atlases(ScreenKind::Decision);
+        committed
+    }
+
+    fn note_at(&self, at: TimeUs, frame: Frame) {
+        self.seen.push(Drawn {
+            at,
+            frame,
+            decision: self.resident(),
+        });
+    }
+
+    /// `frame`, when `presented`.
+    fn note(&self, presented: bool, frame: Frame) {
+        if presented {
+            self.note_at(self.clock.now(), frame);
+        }
     }
 }
 
@@ -240,7 +278,9 @@ impl Screen for Noted {
         self.menu.device()
     }
     fn commit(&mut self, token: render::PreparedToken) -> Result<(), render::CommitError> {
-        self.menu.commit(token)
+        self.menu.commit(token)?;
+        self.note(true, Frame::Commit);
+        Ok(())
     }
     fn discard(&mut self) {
         self.menu.discard();
@@ -343,7 +383,15 @@ impl Screen for Noted {
             .menu
             .result_quads()
             .map_or(0, |q| q.iter().filter(|q| q.layer != 0).count());
-        self.note(Frame::Result { quads });
+        // The first one to reach the target has its marker read back.
+        let mark = if t.presented && !self.result_read {
+            self.result_read = true;
+            let (w, _, pixels) = self.menu.read_back().ok_or(RenderError::DeviceLost)?;
+            Some(crate::render_common::rgb_at(&pixels, w, RESULT_MARK_AT))
+        } else {
+            None
+        };
+        self.note(t.presented, Frame::Result { quads, mark });
         Ok(t)
     }
     fn decision_rows(&self) -> Option<Result<render::RowPlan, RenderError>> {
@@ -395,14 +443,17 @@ impl Screen for Noted {
     }
     fn submit_decision(&mut self) -> Result<FrameTiming, RenderError> {
         let t = self.menu.submit_decision()?;
+        let (at, screen) = self.decision.take().unwrap_or((self.clock.now(), None));
+        if !t.presented {
+            return Ok(t);
+        }
         let mark = if self.seen.probe.swap(false, Ordering::AcqRel) {
             let (w, _, pixels) = self.menu.read_back().ok_or(RenderError::DeviceLost)?;
             Some(crate::render_common::rgb_at(&pixels, w, MARK_AT)[0])
         } else {
             None
         };
-        let (at, screen) = self.decision.take().unwrap_or((self.clock.now(), None));
-        self.seen.push(at, Frame::Decision { screen, mark });
+        self.note_at(at, Frame::Decision { screen, mark });
         Ok(t)
     }
     fn decision_fault(&mut self, settle: bool) {
@@ -435,7 +486,7 @@ impl Screen for Noted {
     }
     fn draw(&mut self) -> Result<FrameTiming, RenderError> {
         let t = self.menu.draw()?;
-        self.note(Frame::Play);
+        self.note(t.presented, Frame::Play);
         Ok(t)
     }
     fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError> {
@@ -443,7 +494,7 @@ impl Screen for Noted {
     }
     fn end(&mut self, page: &EndPage) -> Result<bool, RenderError> {
         let p = self.menu.end(page)?;
-        self.note(Frame::End);
+        self.note(p, Frame::End);
         Ok(p)
     }
     fn splash(&mut self, elapsed: Duration) -> Option<Result<bool, RenderError>> {
@@ -457,8 +508,8 @@ impl Screen for Noted {
         frame: &render::LoadingFrame<'_>,
     ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
         let t = self.menu.loading(page, update, changed, frame)?;
-        if t.is_ok() {
-            self.note(Frame::Loading);
+        if let Ok(t) = &t {
+            self.note(t.presented, Frame::Loading);
         }
         Ok(t)
     }
@@ -468,7 +519,7 @@ impl Screen for Noted {
         changed: bool,
     ) -> Result<FrameTiming, RenderError> {
         let t = self.menu.pending_loading(page, changed)?;
-        self.note(Frame::Loading);
+        self.note(t.presented, Frame::Loading);
         Ok(t)
     }
     fn menu(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
@@ -477,7 +528,7 @@ impl Screen for Noted {
             .lines
             .first()
             .map_or_else(String::new, |l| l.text.clone());
-        self.note(Frame::Page(line));
+        self.note(t.presented, Frame::Page(line));
         Ok(t)
     }
     fn selection(
@@ -488,11 +539,13 @@ impl Screen for Noted {
         now: TimeUs,
         app: skin_model::AppReadouts,
     ) -> Result<crate::selection_skin::SelectionDrawn, RenderError> {
-        let skinned = logic.is_some();
         let drawn = self.menu.selection(update, logic, changed, now, app)?;
-        self.note(Frame::Selection {
-            skinned: skinned && drawn.refused.is_none(),
-        });
+        self.note(
+            drawn.timing.presented,
+            Frame::Selection {
+                skinned: drawn.skinned,
+            },
+        );
         Ok(drawn)
     }
     fn resize(&mut self, width: u32, height: u32) {
@@ -575,7 +628,8 @@ fn decision_dir() -> TempDir {
 
 /// The full configured set's folders, each a self-made skin of its kind:
 /// a Lua play skin, a JSON select screen skin, the decision skin (its
-/// `entry`, JSON or Lua) and a Lua result skin with no fact pending.
+/// `entry`, JSON or Lua) and a Lua result skin with no fact pending, its
+/// marker at [`RESULT_MARK`].
 struct Set {
     play: TempDir,
     selection: TempDir,
@@ -591,7 +645,7 @@ impl Set {
             selection: crate::selection_skin::fixture(),
             decision: decision_dir(),
             entry,
-            result: crate::render_side::tests::result::fixed_skin().0,
+            result: crate::render_side::tests::result::lua_skin_scripted("", RESULT_MARK).0,
         }
     }
 
@@ -613,6 +667,7 @@ struct Side<'a> {
     book: &'a Mutex<LabelBook>,
     /// The chart under the cursor, as the library lists it.
     chart: PathBuf,
+    /// The run's clock, which the helper holds and moves on.
     clock: QpcClock,
 }
 
@@ -637,26 +692,68 @@ impl Side<'_> {
         self.menu.push(MenuInput::Key(key));
     }
 
-    /// Waits until the clock reads `t`.
-    fn until_clock(&self, t: TimeUs) {
-        while self.clock.now().0 < t.0 {
-            std::thread::yield_now();
-        }
+    /// The clock held from now: the time every thread reads until the
+    /// helper moves it.
+    fn hold_clock(&self) -> TimeUs {
+        self.clock.hold()
     }
 
-    /// Waits for the first decision skin frame: the choice's time, which
-    /// its `screen` timer starts from.
-    fn origin(&self) -> TimeUs {
+    /// The chart chosen (`key`) on the held clock, which stays at the
+    /// choice's time until the first decision skin frame is drawn, at that
+    /// time: the frame (its time, `screen` timer and probe).
+    fn choose(&self, key: MenuKey) -> (TimeUs, Option<TimeUs>, Option<u8>) {
+        let chosen = self.hold_clock();
+        self.press(key);
         let frames = self.seen.until("a decision skin frame", |d| {
             d.iter().any(|d| matches!(d.frame, Frame::Decision { .. }))
         });
-        frames
+        let (at, screen, mark) = frames
             .iter()
             .find_map(|d| match d.frame {
-                Frame::Decision { screen, .. } => screen,
+                Frame::Decision { screen, mark } => Some((d.at, screen, mark)),
                 _ => None,
             })
-            .expect("the decision's screen timer runs from the choice")
+            .expect("a decision skin frame");
+        assert_eq!(
+            at, chosen,
+            "the first decision skin frame on the held clock"
+        );
+        (at, screen, mark)
+    }
+
+    /// Lets frames through one at a time, the gate held, until `done`
+    /// holds of the seen state and the frames the last one drew: those
+    /// frames, and the index of the first.
+    #[track_caller]
+    fn step_until(
+        &self,
+        what: &str,
+        done: impl Fn(&Seen, &[Drawn]) -> bool,
+    ) -> (usize, Vec<Drawn>) {
+        let start = Instant::now();
+        loop {
+            // Nothing is drawn while the render thread is held.
+            let from = self.seen.frames().len();
+            self.seen.gate.step();
+            let drawn = self.seen.frames().split_off(from);
+            if done(self.seen, &drawn) {
+                return (from, drawn);
+            }
+            assert!(
+                start.elapsed() < BOUND,
+                "never {what}: last frames {drawn:?}"
+            );
+        }
+    }
+}
+
+/// Lets the run's clock run when dropped, so a helper that fails leaves
+/// the run's threads on a running clock to end on.
+struct RunClock(QpcClock);
+
+impl Drop for RunClock {
+    fn drop(&mut self) {
+        self.0.run();
     }
 }
 
@@ -689,7 +786,8 @@ fn run(set: &Set, preset: Option<&str>, helper: impl FnOnce(&Side<'_>) + Send) -
     // The Lua skins' VMs and the startup's jobs, counted by the importer's
     // tests: one run at a time with them.
     let _serial = crate::imports::tests::serial();
-    let clock = QpcClock::start();
+    // Every thread of the run reads this clock; the helper holds it.
+    let clock = QpcClock::holdable();
     let seen = Arc::new(Seen::default());
     let make: MakeScreen = {
         let seen = Arc::clone(&seen);
@@ -706,6 +804,7 @@ fn run(set: &Set, preset: Option<&str>, helper: impl FnOnce(&Side<'_>) + Send) -
                 seen: Arc::clone(&seen),
                 clock,
                 decision: None,
+                result_read: false,
             }) as Box<dyn Screen>)
         })
     };
@@ -812,6 +911,7 @@ fn run(set: &Set, preset: Option<&str>, helper: impl FnOnce(&Side<'_>) + Send) -
             let helper = s.spawn(|| {
                 let _close = CloseOnDrop(controls);
                 let _let_go = LetGo(&seen.gate);
+                let _run = RunClock(clock);
                 helper(&side);
             });
             let ran = app.run(rig);
@@ -854,68 +954,68 @@ fn first(frames: &[Drawn], from: usize, f: impl Fn(&Frame) -> bool) -> Option<us
 /// C14, P5: with the full configured set installed by production's
 /// startup (JSON and Lua decision skins in turn), a chart chosen on the
 /// skinned select screen draws the decision skin from the choice; its
-/// fade marker, on timer 2 from choice + `scene`, is dark in a frame
-/// before 2,500 ms and drawn as the fade defines in frames let through at
-/// 2,500 and 2,750 ms; then the play loads (loading frames), commits and runs
-/// to its end (play frames, a completed play), and with the decision
-/// skin resident the result draws skinned: result skin frames, never the
-/// built-in result page.
+/// fade marker, on timer 2 from choice + `scene`, is dark in the frame
+/// drawn at the choice and drawn as the fade defines in frames let through
+/// at exactly 2,500 and 2,750 ms on the held clock; then the play loads
+/// (loading frames), commits and runs to its end (play frames, a completed
+/// play), and the result draws skinned: result skin frames, the first one
+/// reaching the target with the skin's marker in its pixels, never the
+/// built-in result page. The decision installation's atlas stays resident
+/// on the GPU from its first frame through the play's commit to that
+/// result frame.
 #[test]
 fn full_set_draws_the_decision_then_plays_to_a_skinned_result() {
     for entry in ["s.json", "s.luaskin"] {
         let set = Set::new(entry);
         let Ran { ran, frames, ended } = run(&set, None, |side| {
             side.prepared();
-            side.seen.gate.hold();
             side.seen.probe.store(true, Ordering::Release);
-            side.press(MenuKey::Enter);
-            // Frames one at a time until the decision skin's first.
-            let mut before = None;
-            for _ in 0..50 {
-                side.seen.gate.step();
-                before = side.seen.frames().into_iter().find_map(|d| match d.frame {
-                    Frame::Decision { screen, mark } => Some((d.at, screen, mark)),
-                    _ => None,
-                });
-                if before.is_some() {
-                    break;
-                }
-            }
-            let (at, origin, mark) = before.expect("a decision skin frame");
-            let origin = origin.expect("the screen timer from the choice");
-            let early = at.0 - origin.0;
-            assert!((0..2_500 * MS).contains(&early), "{entry}: {early} µs");
+            let (chosen, origin, mark) = side.choose(MenuKey::Enter);
+            assert_eq!(
+                origin,
+                Some(chosen),
+                "{entry}: the screen timer from the choice"
+            );
             assert_eq!(mark, Some(0), "{entry}: the marker before timer 2");
             // One frame let through at 2,500 ms from the choice, as timer
             // 2 starts, and one at 2,750 ms, halfway through the fade-out.
+            side.seen.gate.hold();
             for ms in [2_500, 2_750] {
-                side.until_clock(TimeUs(origin.0 + ms * MS));
+                let t = TimeUs(chosen.0 + ms * MS);
+                side.clock.set(t);
                 side.seen.probe.store(true, Ordering::Release);
-                side.seen.gate.step();
-                let inside = side.seen.frames();
+                let (_, drawn) = side
+                    .step_until(&format!("a decision frame at {ms} ms"), |_, d| {
+                        d.iter().any(|d| matches!(d.frame, Frame::Decision { .. }))
+                    });
                 let Some(Drawn {
                     at,
                     frame: Frame::Decision { mark, .. },
-                }) = inside.last()
+                    ..
+                }) = drawn
+                    .iter()
+                    .find(|d| matches!(d.frame, Frame::Decision { .. }))
                 else {
-                    panic!("{entry}: {:?}", inside.last());
+                    unreachable!()
                 };
-                let late = at.0 - origin.0;
-                assert!((ms * MS..3_000 * MS).contains(&late), "{entry}: {late} µs");
+                assert_eq!(*at, t, "{entry}: the frame let through at {ms} ms");
                 // Alpha 128 at the fade-out's start, rising to 255 at its
                 // end.
-                let alpha = 128 + 127 * (late - 2_500 * MS) / (500 * MS);
+                let alpha = 128 + 127 * (ms - 2_500) / 500;
                 let mark = i64::from(mark.expect("probed"));
                 assert!(
-                    (mark - alpha).abs() <= 8,
-                    "{entry}: marker {mark} at {late} µs, alpha {alpha}"
+                    (mark - alpha).abs() <= 1,
+                    "{entry}: marker {mark} at {ms} ms, alpha {alpha}"
                 );
             }
+            side.clock.run();
             side.seen.gate.release();
-            side.seen.until("a result skin frame", |d| {
-                d.iter()
-                    .any(|d| matches!(d.frame, Frame::Result { quads } if quads > 0))
-            });
+            side.seen
+                .until("a skinned result frame reaching the target", |d| {
+                    d.iter().any(
+                        |d| matches!(d.frame, Frame::Result { quads, mark: Some(_) } if quads > 0),
+                    )
+                });
         });
         assert!(ran.is_ok(), "{entry}: {ran:?}");
         assert_eq!(ended, [game::PlayEnd::Completed], "{entry}");
@@ -927,12 +1027,23 @@ fn full_set_draws_the_decision_then_plays_to_a_skinned_result() {
             .expect("the decision skin drew");
         let loading = first(&frames, decision, |f| *f == Frame::Loading).expect("loading drew");
         let play = first(&frames, loading, |f| *f == Frame::Play).expect("the play drew");
+        let commit = first(&frames, decision, |f| *f == Frame::Commit)
+            .filter(|&i| i < play)
+            .expect("the play committed before its first frame");
         let result = first(
             &frames,
             play,
-            |f| matches!(f, Frame::Result { quads } if *quads > 0),
+            |f| matches!(f, Frame::Result { quads, .. } if *quads > 0),
         )
         .expect("the result skin drew");
+        let Frame::Result { mark, .. } = &frames[result].frame else {
+            unreachable!()
+        };
+        assert_eq!(
+            *mark,
+            Some([9, 9, 9]),
+            "{entry}: the result skin's marker in its first frame"
+        );
         assert!(
             first(&frames, loading, |f| matches!(f, Frame::Decision { .. })).is_none(),
             "{entry}: a decision frame after loading"
@@ -941,6 +1052,19 @@ fn full_set_draws_the_decision_then_plays_to_a_skinned_result() {
             first(&frames, decision, |f| *f == Frame::End).is_none(),
             "{entry}: the built-in result page drew (the skin's first frame {result})"
         );
+        // P5: the decision installation resident from its first frame
+        // through the play's commit to the result's first frame.
+        let resident = frames[decision]
+            .decision
+            .expect("the decision installation's atlas at its first frame");
+        for (i, d) in frames.iter().enumerate().take(result + 1).skip(decision) {
+            assert_eq!(
+                d.decision,
+                Some(resident),
+                "{entry}: the decision installation not resident at {i} (commit {commit}, \
+                 result {result}): {d:?}"
+            );
+        }
     }
 }
 
@@ -956,13 +1080,15 @@ enum Route {
     Held,
 }
 
-/// R4.1, R4.2 (stage3's list) through the run: the decision skin's build
-/// refused by the renderer in a frame let through at 1,000 ms from the
-/// choice draws the built-in presentation in that very frame, and its
-/// destination (`route`) first draws at 1,500 ms, not before; refused at
-/// 2,000 ms, past the presentation's time, the destination draws at once.
-/// Each is drawn within 500 ms of when it is due, well before the skin's
-/// own 3,000 ms. The built-in page draws in between, and no skin frame
+/// R4.1, R4.2 (stage3's list) through the run, on the held clock: the
+/// decision skin's build refused by the renderer in the frame let through
+/// at exactly 1,000 ms from the choice draws the built-in presentation in
+/// that very frame, and its destination (`route`) first draws at exactly
+/// 1,500 ms; refused at exactly 2,000 ms, past the presentation's time,
+/// the destination draws at once, at the refusal's own time. The clock
+/// moves only when the test moves it, so each destination is due at a
+/// time the run cannot pass before drawing it, and the skin's own 3,000
+/// ms never comes. The built-in page draws in between, and no skin frame
 /// after the refusal.
 fn refused_build_routes(route: Route) {
     let practice = crate::ui_text::Message::PracticeTitle { name: "a" }.text();
@@ -974,56 +1100,61 @@ fn refused_build_routes(route: Route) {
     for refused_ms in [1_000, 2_000] {
         let set = Set::new("s.json");
         let preset = (route == Route::Held).then_some("missing");
-        let mut origin = None;
+        let case = format!("{route:?} refused at {refused_ms} ms");
+        let mut seen = None;
         let Ran { ran, frames, .. } = run(&set, preset, |side| {
             side.prepared();
-            side.press(if route == Route::Practice {
+            let (chosen, ..) = side.choose(if route == Route::Practice {
                 MenuKey::Practice
             } else {
                 MenuKey::Enter
             });
-            let o = side.origin();
             // The refused frame is the first one at the time.
             side.seen.gate.hold();
-            side.until_clock(TimeUs(o.0 + refused_ms * MS));
+            let refused_t = TimeUs(chosen.0 + refused_ms * MS);
+            side.clock.set(refused_t);
             side.seen.refuse.store(true, Ordering::Release);
-            side.seen.gate.step();
+            let (from, drawn) =
+                side.step_until("the build refused", |s, _| s.refused_at().is_some());
+            let refused_at = side.seen.refused_at().expect("the build refused");
+            assert_eq!(refused_at, refused_t, "{case}: the refusal's time");
+            // That frame itself drew the built-in page, before any other.
+            assert!(
+                matches!(
+                    drawn.as_slice(),
+                    [Drawn { at, frame: Frame::Page(l), .. }] if *at == refused_t && *l != practice
+                ),
+                "{case}: the refused frame drew {drawn:?}"
+            );
             side.seen.gate.release();
-            let refused = side.seen.refused_at().expect("the build refused");
+            // At 1,500 ms from the choice, or at once past it: the clock
+            // stays there until the destination draws.
+            let due = if refused_ms < 1_500 {
+                TimeUs(chosen.0 + 1_500 * MS)
+            } else {
+                refused_at
+            };
+            side.clock.set(due);
             side.seen.until("the destination drawn", |d| {
-                d.iter()
-                    .any(|d| d.at.0 >= refused.0 && destination(&d.frame))
+                d.iter().skip(from).any(|d| destination(&d.frame))
             });
-            origin = Some(o);
+            seen = Some((from, due));
         });
-        let case = format!("{route:?} refused at {refused_ms} ms");
         assert!(ran.is_ok(), "{case}: {ran:?}");
-        let origin = origin.expect("the helper ran");
-        let at = |ms: i64| origin.0 + ms * MS;
-        // The frame the refusal came in drew the built-in page.
-        let last = frames
-            .iter()
-            .rposition(|d| matches!(d.frame, Frame::Decision { .. }))
-            .expect("the skin drew");
-        let refused = frames.get(last + 1).expect("a frame after the skin's");
+        let (refused, due) = seen.expect("the helper ran");
         assert!(
-            matches!(&refused.frame, Frame::Page(l) if *l != practice),
-            "{case}: {refused:?}"
-        );
-        assert!(
-            (at(refused_ms)..at(refused_ms + 500)).contains(&refused.at.0),
-            "{case}: refused at {} µs",
-            refused.at.0 - origin.0
+            first(&frames, refused, |f| matches!(f, Frame::Decision { .. })).is_none(),
+            "{case}: a skin frame after the refusal"
         );
         let first_decision = first(&frames, 0, |f| matches!(f, Frame::Decision { .. })).unwrap();
         assert!(
-            first(&frames, first_decision, destination).is_some_and(|i| i > last),
+            first(&frames, first_decision, destination).is_some_and(|i| i > refused),
             "{case}: the destination before the refusal"
         );
-        let dest = first(&frames, last + 1, destination).expect("the destination drew");
+        let dest = first(&frames, refused, destination).expect("the destination drew");
         assert!(
             frames
-                .get(last + 1..dest)
+                .get(refused..dest)
                 .unwrap()
                 .iter()
                 .all(|d| matches!(&d.frame, Frame::Page(l) if *l != practice)),
@@ -1033,18 +1164,10 @@ fn refused_build_routes(route: Route) {
             route != Route::Held || !frames.iter().any(|d| d.frame == Frame::Loading),
             "{case}: the refused load's loading state drew"
         );
-        // At 1,500 ms, or at once past it: each within 500 ms (the screen's
-        // own end, at 3,000 ms, lies beyond both).
-        let reached = frames.get(dest).unwrap().at.0;
-        let due = if refused_ms < 1_500 {
-            at(1_500)
-        } else {
-            refused.at.0
-        };
-        assert!(
-            (due..due + 500 * MS).contains(&reached),
-            "{case}: reached at {} µs",
-            reached - origin.0
+        assert_eq!(
+            frames.get(dest).unwrap().at,
+            due,
+            "{case}: the destination's first frame"
         );
     }
 }
