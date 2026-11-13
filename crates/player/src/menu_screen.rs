@@ -33,8 +33,9 @@ use eval::Section;
 use game::Preparation;
 use render::text::{Fonts, MenuText, TextBlock, TextStyle};
 use render::{
-    AttemptInput, Blend, CommitError, FrameTiming, Installation, LoadingFrame, LoadingTextError,
-    LoadingTextKey, PreparedToken, RenderError, Renderer, SkinBundle, Sprite, solid_uv,
+    AttemptInput, Blend, CommitError, FrameTiming, Installation, LoadingFrame, LoadingOn,
+    LoadingTextError, LoadingTextKey, PreparedToken, RenderError, Renderer, SkinBundle, Sprite,
+    solid_uv,
 };
 use skin_model::{BuildError, ChartText, ScreenKind, TextField, TextSlots};
 
@@ -609,10 +610,15 @@ impl MenuScreen {
     /// The device failing while the text is prepared (not a refusal,
     /// [`RenderError::is_refusal`]): the screen is dropped and built again.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn chosen_text(&mut self, update: &LoadingUpdate, lifetime: u64) -> Result<(), RenderError> {
-        self.renderer.enter_loading(lifetime);
+    fn chosen_text(
+        &mut self,
+        update: &LoadingUpdate,
+        lifetime: u64,
+        on: LoadingOn,
+    ) -> Result<(), RenderError> {
+        self.renderer.enter_loading_on(on, lifetime);
         if let Some(staged) = self.chosen.staged.take() {
-            match self.renderer.install_staged_loading_text() {
+            match self.renderer.install_staged_loading_text_on(on) {
                 // Every slot holds what was asked: a refusal before it no
                 // longer describes them, so it is forgotten.
                 Ok(true) => {
@@ -630,7 +636,7 @@ impl MenuScreen {
                 Err(_) => {}
             }
         }
-        let Some(key) = self.renderer.loading_text_key() else {
+        let Some(key) = self.renderer.loading_text_key_on(on) else {
             self.chosen = ChosenTextState::default();
             return Ok(());
         };
@@ -648,7 +654,7 @@ impl MenuScreen {
         ) else {
             return Ok(());
         };
-        self.renderer.clear_loading_text(which);
+        self.renderer.clear_loading_text_on(on, which);
         let c = &update.chart;
         fn field(f: &Option<String>) -> &str {
             f.as_deref().unwrap_or_default()
@@ -662,7 +668,7 @@ impl MenuScreen {
         };
         match self
             .renderer
-            .prepare_loading_text(lifetime, update.revision, which, &chart)
+            .prepare_loading_text_on(on, lifetime, update.revision, which, &chart)
         {
             Ok(()) => self.chosen.staged = Some(asked),
             Err(e) if e.is_refusal() => {
@@ -677,6 +683,37 @@ impl MenuScreen {
             Err(e) => return Err(e),
         }
         Ok(())
+    }
+
+    /// The skin's loading frame `frame` of the installation `on` names, the
+    /// installed one or a staging before its commit, then the lines over
+    /// it ([`Screen::loading`]). The chosen chart's text is brought to the
+    /// lifetime's state `update` for that installation
+    /// ([`chosen_text`](Self::chosen_text)) and the lines are laid out
+    /// before the frame is built, outside its work.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn loading_on(
+        &mut self,
+        on: LoadingOn,
+        page: &MenuPage,
+        update: Option<&LoadingUpdate>,
+        changed: bool,
+        frame: &LoadingFrame<'_>,
+    ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
+        if let Some(update) = update {
+            self.chosen_text(update, frame.lifetime, on)?;
+        }
+        if changed || self.stale || self.text.is_none() {
+            self.prepare(page, LOADING_LEFT, LOADING_TOP)?;
+        }
+        let Some(text) = &self.text else {
+            return Err(RenderError::OtherRenderersText);
+        };
+        let timing = self.renderer.loading_frame_on(on, frame, text)?;
+        if let Ok(t) = &timing {
+            self.shown(t.presented);
+        }
+        Ok(timing)
     }
 
     /// Tells `sink` of its first frame presented and the caret's area of
@@ -1148,20 +1185,22 @@ impl Screen for MenuScreen {
         changed: bool,
         frame: &LoadingFrame<'_>,
     ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
-        if let Some(update) = update {
-            self.chosen_text(update, frame.lifetime)?;
-        }
-        if changed || self.stale || self.text.is_none() {
-            self.prepare(page, LOADING_LEFT, LOADING_TOP)?;
-        }
-        let Some(text) = &self.text else {
-            return Err(RenderError::OtherRenderersText);
-        };
-        let timing = self.renderer.loading_frame(frame, text)?;
-        if let Ok(t) = &timing {
-            self.shown(t.presented);
-        }
-        Ok(timing)
+        self.loading_on(LoadingOn::Installed, page, update, changed, frame)
+    }
+
+    fn loading_staged(
+        &mut self,
+        page: &MenuPage,
+        update: Option<&LoadingUpdate>,
+        changed: bool,
+        frame: &LoadingFrame<'_>,
+        token: PreparedToken,
+    ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
+        self.loading_on(LoadingOn::Staged(token), page, update, changed, frame)
+    }
+
+    fn staged_token(&self) -> Option<PreparedToken> {
+        self.renderer.staged()
     }
 
     /// The cleared canvas with the load's lines where a skin's loading

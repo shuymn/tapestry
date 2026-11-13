@@ -3454,6 +3454,28 @@ impl Renderer {
         }
     }
 
+    /// [`enter_loading`](Self::enter_loading) for the installation `on`
+    /// names: a staging's skin enters the lifetime its frames draw, the
+    /// installed one is left as it is.
+    pub fn enter_loading_on(&mut self, on: LoadingOn, lifetime: u64) {
+        let LoadingOn::Staged(token) = on else {
+            self.enter_loading(lifetime);
+            return;
+        };
+        if self.loading_refused.is_some_and(|(l, _)| l != lifetime) {
+            self.loading_refused = None;
+        }
+        if let Some(Pending {
+            token: t,
+            skin: Some(skin),
+            ..
+        }) = self.pending.as_mut()
+            && *t == token
+        {
+            skin.enter_loading(lifetime);
+        }
+    }
+
     /// Loading lifetime `lifetime` draws next, between frames: a skin's
     /// loading state of another lifetime starts afresh
     /// ([`PlaySkin::enter_loading`]), in place, and a refusal of
