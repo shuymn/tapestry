@@ -2716,7 +2716,7 @@ pub fn conclude<E: std::error::Error + 'static>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fmt::Write as _;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -4087,7 +4087,7 @@ mod tests {
     }
 
     /// An input log of no events at `dir/log.tprl`.
-    fn write_log(dir: &Path) {
+    pub(crate) fn write_log(dir: &Path) {
         use replay::{
             BuildProvenance, ChartRecord, DeviceRecord, EndStatus, PlayRecord, PlayType,
             PresetRecord, ReceiveMethod, SourceRecord, Status, Versions,

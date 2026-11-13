@@ -813,6 +813,9 @@ impl Screen for Direct {
     fn device_lost(&self) -> bool {
         self.menu.device_lost()
     }
+    fn allocate_in_next_decision(&mut self, refuse: bool) {
+        self.menu.allocate_in_next_decision(refuse);
+    }
     fn build_decision(
         &mut self,
         dec: &mut skin_model::DecisionScreen,
@@ -1611,6 +1614,7 @@ fn decision_frame_alloc() {
             Some(1),
             &shown,
             now,
+            &mut crate::dev::DecisionFaults::default(),
         );
         *n = this_thread() - before;
         assert_eq!(drawn, DecisionDrawn::Built);
@@ -1662,6 +1666,7 @@ fn decision_builtin_frame_alloc() {
             active,
             shown,
             TimeUs(1),
+            &mut crate::dev::DecisionFaults::default(),
         );
         (drawn, this_thread() - before)
     };
@@ -1675,6 +1680,68 @@ fn decision_builtin_frame_alloc() {
     screen.decision_fault(false);
     let refused = DecisionDrawn::Refused(skin_model::BuildError::Kind);
     assert_eq!(build(&mut screen, &skinned, Some(1)), (refused, 0));
+}
+
+/// A decision build fault counts only the builds that call the skin: a
+/// frame of a screen that ended (its slot's content gone) builds nothing
+/// and takes no fault's number. `alloc3` allocates in the third real
+/// build, after an ended attempt, never in the second; it fires once.
+#[test]
+fn a_build_fault_skips_an_ended_frame_alloc() {
+    use crate::alloc_count::this_thread;
+    let _turn = crate::warp_turn::take();
+    let dir = skin_dir();
+    let (mut screen, mut side, book) = side_of(&dir, false);
+    let a = want("a", "A");
+    until(&mut screen, &mut side, a.as_ref(), &book, |k| {
+        ready(k, "a", "A")
+    });
+    let (slot, generation, timing) = lock(&book)
+        .pin(Path::new("a"), labels_revision(&labels("A")), 1)
+        .unwrap();
+    let skinned = ShownDecision {
+        lifetime: 1,
+        origin: TimeUs(0),
+        timing,
+        slot: Some((slot, generation)),
+    };
+    let ended = ShownDecision {
+        slot: Some((slot, generation + 1)),
+        ..skinned
+    };
+    let mut dec = side.bundle().skin().prepare_decision();
+    let mut faults = crate::dev::DecisionFaults::parse("alloc3");
+    let control = this_thread();
+    drop(std::hint::black_box(vec![1_u8; 8]));
+    assert!(this_thread() > control, "the allocation was not counted");
+    let mut build = |screen: &mut Direct, shown: &ShownDecision, active: Option<u64>| {
+        let before = this_thread();
+        let drawn = decision_build(
+            screen,
+            &mut dec,
+            Some(side.store()),
+            active,
+            shown,
+            TimeUs(1),
+            &mut faults,
+        );
+        (drawn, this_thread() - before)
+    };
+    assert_eq!(
+        build(&mut screen, &skinned, Some(1)),
+        (DecisionDrawn::Built, 0)
+    );
+    assert_eq!(build(&mut screen, &ended, None), (DecisionDrawn::Ended, 0));
+    assert_eq!(
+        build(&mut screen, &skinned, Some(1)),
+        (DecisionDrawn::Built, 0),
+        "the ended attempt took a number"
+    );
+    assert_eq!(
+        build(&mut screen, &skinned, Some(1)),
+        (DecisionDrawn::Built, 1)
+    );
+    assert_eq!(faults.fired, 1);
 }
 
 /// R0.4: a skinned selection frame while a decision preparation runs on
@@ -1766,6 +1833,47 @@ fn decision_frame_during_label_prep_alloc() {
         panic!("{:?}", rig.decided.records());
     };
     assert_eq!(r.app, 1, "{r:?}");
+    assert_eq!((r.skin, r.fell_back), (true, None), "{r:?}");
+}
+
+/// A lost decision screen built again by the recovery the game asks for
+/// (`RenderLink::prepare`, no chart loaded, so no preparation builds it):
+/// a build made to allocate before the loss and one after the rebuild are
+/// both in the screen's one record, which the rebuild keeps.
+#[test]
+fn a_recovery_keeps_the_decision_screen_s_count() {
+    let dir = skin_dir();
+    let rig = Rig::new(&dir);
+    // The test double notes each build it makes; its notes reserved, so
+    // only the screen's own work is in the count.
+    rig.seen.timers.lock().unwrap().reserve(1 << 12);
+    rig.seen.drew.lock().unwrap().reserve(1 << 12);
+    rig.drawing("a", "A");
+    let fired = rig.link.decision_faults_fired();
+    rig.link
+        .set_decision_faults(crate::dev::DecisionFaults::parse("alloc1"));
+    assert!(wait_until(|| fired() == 1), "the fault before the loss");
+    assert_eq!(rig.seen.builds.load(Ordering::Acquire), 1);
+    rig.rebuild().unwrap();
+    assert_eq!(
+        rig.seen.builds.load(Ordering::Acquire),
+        2,
+        "the recovery built the screen again"
+    );
+    rig.link
+        .set_decision_faults(crate::dev::DecisionFaults::default());
+    rig.skin_frames(rig.seen.len(), 3);
+    assert_eq!(fired(), 0);
+    rig.link
+        .set_decision_faults(crate::dev::DecisionFaults::parse("alloc1"));
+    assert!(wait_until(|| fired() == 1), "the fault after the rebuild");
+    rig.skin_frames(rig.seen.len(), 3);
+    rig.link.loading().show(one_line("loading"));
+    rig.link.exit();
+    let [r] = rig.decided.records()[..] else {
+        panic!("{:?}", rig.decided.records());
+    };
+    assert_eq!(r.app, 2, "{r:?}");
     assert_eq!((r.skin, r.fell_back), (true, None), "{r:?}");
 }
 
