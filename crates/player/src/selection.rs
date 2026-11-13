@@ -5783,6 +5783,13 @@ pub(crate) mod tests {
                 bp: 0,
                 cleared: vec![0b1],
                 full_combo: false,
+                // Its own play, as a counted one is: the read refuses a
+                // best whose EX is not its play's.
+                play: library::Breakdown {
+                    body_sha256: [7; 32],
+                    ex: 2,
+                    ..Default::default()
+                },
                 ..Default::default()
             }),
             clear: true,
