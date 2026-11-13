@@ -20,10 +20,10 @@ pub enum RatioSource {
     /// The selected chart's best EX score over the largest its summary
     /// allows; none without both or with a largest of 0.
     ExRate,
-    /// The master gain that plays, exactly
-    /// ([`MasterVolume::ratio`](crate::MasterVolume::ratio)); none before
+    /// The system volume that plays, exactly
+    /// ([`VolumeReading::ratio`](crate::VolumeReading::ratio)); none before
     /// the settings.
-    MasterVolume,
+    SystemVolume,
     /// A play's score rate: a play skin's source, and only a play skin's,
     /// as the two below.
     Score(ScoreRate),
@@ -56,7 +56,7 @@ impl RatioSource {
                 field::TIME_PROGRESS_PPM,
                 u64::from(crate::play::schema::PROGRESS_FULL.unsigned_abs()),
             )),
-            Self::ListPosition | Self::ExRate | Self::MasterVolume | Self::Score(_) => None,
+            Self::ListPosition | Self::ExRate | Self::SystemVolume | Self::Score(_) => None,
         }
     }
 }

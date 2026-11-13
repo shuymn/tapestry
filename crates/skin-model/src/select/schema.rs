@@ -78,7 +78,7 @@ pub static SELECTION: Schema = Schema {
         int("selected.judge_class", 0, JUDGE_CLASS_MAX),
         flag("selected.judge_class_valid"),
         int("settings.display_offset", -VALUE_MAX, VALUE_MAX),
-        int("settings.volume", 0, 100),
+        int("settings.volume_system", 0, 100),
         flag("settings.floating"),
         value("settings.duration"),
         value("settings.green"),
@@ -179,8 +179,8 @@ pub mod field {
     pub const SETTINGS: u16 = 27;
     /// The display offset in whole ms.
     pub const SETTINGS_DISPLAY_OFFSET: u16 = 27;
-    /// The master gain's number, `(int)(gain · 100f)`.
-    pub const SETTINGS_VOLUME: u16 = 28;
+    /// The system volume's number, `(int)(gain · 100f)`.
+    pub const SETTINGS_VOLUME_SYSTEM: u16 = 28;
     /// Whether the hi-speed is Floating.
     pub const SETTINGS_FLOATING: u16 = 29;
     /// In Floating, the travel duration of the target green number `G`,
@@ -255,7 +255,7 @@ mod tests {
             (field::SELECTED_LEVEL, "selected.level"),
             (field::SELECTED_LENGTH_SEC, "selected.length_sec"),
             (field::SETTINGS_DISPLAY_OFFSET, "settings.display_offset"),
-            (field::SETTINGS_VOLUME, "settings.volume"),
+            (field::SETTINGS_VOLUME_SYSTEM, "settings.volume_system"),
             (field::SETTINGS_GREEN, "settings.green"),
             (field::SETTINGS_ORDER, "settings.order"),
             (field::SETTINGS_HIDDEN, "settings.hidden"),

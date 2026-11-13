@@ -57,6 +57,8 @@ mod tempo;
 mod tuning;
 mod turntable;
 
+/// The three volumes' channels (design.md "Audio", the three volumes).
+pub use ::audio::Channel;
 pub use adjust_keys::{
     AdjustBinding, AdjustKeyError, AdjustmentConfig, AdjustmentKeys, AdjustmentPlan,
 };
@@ -163,13 +165,13 @@ pub use settings::{
     DeviceSettingsError, KeyConfig, KeyError, LaneKey, Language, LibrarySettings, NEXT_PRESET_KEY,
     OVERLAY_KEY, PREV_PRESET_KEY, PlayerSettings, PlayerSettingsError, Role, ScratchConfig,
     SettingsError, SettingsFile, SkinChoice, SkinChoices, load_settings, reserved_key,
-    save_settings,
+    save_settings, volume_key,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
 pub use tempo::{AttemptTempo, MAIN_HISTOGRAM_LIMIT, ReferenceError};
 pub use tuning::{
     Adjust, MAX_VOLUME_PERCENT, OFFSET_LIMIT_US, OFFSET_STEP_US, SPEED_KEYS, Tuning,
-    VOLUME_STEP_PERCENT,
+    VOLUME_STEP_PERCENT, Volume,
 };
 pub use turntable::{
     AnalogTurn, AutoplayScratch, PlayState, PlayStates, ScratchInput, ScratchNote, ScratchNoteKind,

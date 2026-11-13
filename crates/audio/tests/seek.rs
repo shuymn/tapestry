@@ -7,8 +7,8 @@ mod common;
 use std::sync::{Arc, OnceLock};
 
 use audio::{
-    AudioEngine, BankLimits, RecordingOutput, SeekPlan, SimConfig, SimDevice, Sound, SoundBank,
-    Speed, load_bank_at,
+    AudioEngine, BankLimits, Channel, RecordingOutput, ScheduledSound, SeekPlan, SimConfig,
+    SimDevice, Sound, SoundBank, Speed, load_bank_at,
 };
 use bms_model::{BgmEvent, SoundId, TimeUs};
 use proptest::prelude::*;
@@ -36,18 +36,38 @@ struct Case {
 /// every sound has ended; the output frame of `t`; and the first frame
 /// written after the restart.
 fn play(case: &Case, seek: bool) -> (Vec<f32>, u64, u64) {
+    play_on(case, &tagged(&case.bgm), (1.0, 1.0), seek)
+}
+
+/// [`play`] of `schedule` in place of `case.bgm`, at the key and
+/// background volumes `key` and `background`.
+fn play_on(
+    case: &Case,
+    schedule: &[ScheduledSound],
+    (key, background): (f32, f32),
+    seek: bool,
+) -> (Vec<f32>, u64, u64) {
     let dev = SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0)));
     let longest = (0..case.bank.stored_count() as u32)
         .filter_map(|i| case.bank.stored(i))
         .map(Sound::frames)
         .max()
         .unwrap_or(0);
-    let last = case.bgm.last().map_or(0, |e| e.time.0).max(case.t.0);
+    let last = schedule.last().map_or(0, |e| e.time.0).max(case.t.0);
     let end_us = case.origin.0 + last + (longest as i64 * 1_000_000 / i64::from(RATE)) + 50_000;
     let frames = (end_us * i64::from(RATE) / 1_000_000) as usize + 4 * PERIOD as usize;
     let mut out = RecordingOutput::new(dev, frames + 4 * PERIOD as usize);
-    let mut e =
-        AudioEngine::new(case.bank.clone(), &case.bgm, RATE, PERIOD, case.voices, 0).unwrap();
+    let mut e = AudioEngine::with_schedule(
+        case.bank.clone(),
+        schedule.to_vec(),
+        RATE,
+        PERIOD,
+        case.voices,
+        0,
+    )
+    .unwrap();
+    e.set_volume(Channel::Key, key).unwrap();
+    e.set_volume(Channel::Background, background).unwrap();
     e.set_output_offset(case.offset);
     let (_tx, mut rx) = RingBuffer::new(1);
     for _ in 0..WARMUP {
@@ -56,7 +76,7 @@ fn play(case: &Case, seek: bool) -> (Vec<f32>, u64, u64) {
     let restarted = e.written();
     e.restart(case.origin);
     if seek {
-        let plan = SeekPlan::new(&e.seek_source(), &case.bgm, e.frame_line(), case.t).unwrap();
+        let plan = SeekPlan::new(&e.seek_source(), schedule, e.frame_line(), case.t).unwrap();
         e.seek(&plan).unwrap();
     }
     while out.samples().len() < frames * 2 {
@@ -113,6 +133,11 @@ fn sound(frames: usize, stereo: bool, first: i16, step: i16) -> Sound {
     } else {
         Sound::mono(samples)
     }
+}
+
+/// A chart's BGM-lane events as the engine schedules them.
+fn tagged(events: &[BgmEvent]) -> Vec<ScheduledSound> {
+    events.iter().map(|&e| e.into()).collect()
 }
 
 fn events(times_ms: &[(i64, u16)]) -> Vec<BgmEvent> {
@@ -231,6 +256,47 @@ proptest! {
 /// The left channel of `out` at frame `f`.
 fn left(out: &[f32], f: u64) -> f32 {
     out[2 * f as usize]
+}
+
+/// Each voice a seek parks keeps the channel of its schedule entry: from
+/// the seek's frame, a schedule of key and background starts at key 0.2 and
+/// background 0.999 sounds as it does played from the start.
+#[test]
+fn a_seek_keeps_each_voices_channel() {
+    let bank = Arc::new(SoundBank::from_sounds(
+        RATE,
+        vec![sound(16_000, false, 1_000, 1), sound(16_000, true, -900, 2)],
+    ));
+    let case = Case {
+        bank,
+        bgm: Vec::new(),
+        voices: 4,
+        origin: TimeUs(1_000_000),
+        offset: TimeUs(0),
+        t: TimeUs(500_000),
+    };
+    let key = |ms: i64| ScheduledSound {
+        time: TimeUs(ms * 1_000),
+        sound: SoundId(0),
+        channel: Channel::Key,
+    };
+    let background = |ms: i64| ScheduledSound {
+        time: TimeUs(ms * 1_000),
+        sound: SoundId(1),
+        channel: Channel::Background,
+    };
+    let schedule = [key(100), background(200), key(700), background(900)];
+    let volumes = (0.2, 0.999);
+    let (full, at, _) = play_on(&case, &schedule, volumes, false);
+    let (sought, at_seek, _) = play_on(&case, &schedule, volumes, true);
+    assert_eq!(at, at_seek);
+    let from = at as usize;
+    assert!(full[2 * from..].iter().any(|&x| x != 0.0));
+    assert_eq!(first_difference(&full, &sought, from), None);
+    // Both channels sound at t, each at its own volume: the same schedule
+    // at unity differs there.
+    let (unity, _, _) = play_on(&case, &schedule, (1.0, 1.0), false);
+    assert_ne!(full[2 * from], unity[2 * from]);
 }
 
 #[test]
@@ -424,7 +490,7 @@ fn a_start_the_plan_left_out_never_starts_before_the_seek() {
             ..line
         };
         assert_eq!((later.frame(bgm[0].time), later.frame(t)), (frame, frame));
-        let plan = SeekPlan::new(&e.seek_source(), &bgm, later, t).unwrap();
+        let plan = SeekPlan::new(&e.seek_source(), &tagged(&bgm), later, t).unwrap();
         assert_eq!(plan.sounding(), 0);
         e.seek(&plan).unwrap();
         let (_tx, mut rx) = RingBuffer::new(1);
@@ -468,18 +534,22 @@ fn seek_source_matches_its_schedule() {
     let bgm = events(&[(0, 0), (300, 1)]);
     let mut e = AudioEngine::new(Arc::clone(&bank), &bgm, RATE, PERIOD, 4, 0).unwrap();
     let source = e.seek_source();
-    assert!(source.matches(&bgm));
+    assert!(source.matches(&tagged(&bgm)));
     let mut moved = bgm.clone();
     moved[1].time = TimeUs(300_001);
-    assert!(!source.matches(&moved));
-    assert!(!source.matches(&events(&[(0, 1), (300, 1)])));
-    assert!(!source.matches(&bgm[..1]));
+    assert!(!source.matches(&tagged(&moved)));
+    assert!(!source.matches(&tagged(&events(&[(0, 1), (300, 1)]))));
+    assert!(!source.matches(&tagged(&bgm[..1])));
+    // The same times and sounds on another channel are another schedule.
+    let mut retagged = tagged(&bgm);
+    retagged[1].channel = Channel::Key;
+    assert!(!source.matches(&retagged));
     let next = events(&[(100, 1)]);
-    e.replace(bank, audio::BgmSchedule::new(next.clone()))
+    e.replace(bank, audio::BgmSchedule::new(tagged(&next)))
         .unwrap();
     let source = e.seek_source();
-    assert!(source.matches(&next));
-    assert!(!source.matches(&bgm));
+    assert!(source.matches(&tagged(&next)));
+    assert!(!source.matches(&tagged(&bgm)));
 }
 
 #[test]
@@ -498,19 +568,19 @@ fn a_plan_for_another_play_or_an_expired_frame_is_refused() {
     let at = TimeUs(500_000);
     let frames = 2 * RATE as usize;
     let (mut alone, mut alone_out) = started(&bank, &bgm);
-    let plan = SeekPlan::new(&alone.seek_source(), &bgm, alone.frame_line(), at).unwrap();
+    let plan = SeekPlan::new(&alone.seek_source(), &tagged(&bgm), alone.frame_line(), at).unwrap();
     alone.seek(&plan).unwrap();
     let want = run_to(&mut alone, &mut alone_out, frames);
 
     let (mut e, mut out) = started(&bank, &bgm);
     let line = e.frame_line();
     let source = e.seek_source();
-    e.seek(&SeekPlan::new(&source, &bgm, line, at).unwrap())
+    e.seek(&SeekPlan::new(&source, &tagged(&bgm), line, at).unwrap())
         .unwrap();
     let state = |e: &AudioEngine| (e.bgm_left(), e.mixer().sounding(), e.mixer().pending());
     let before = state(&e);
     assert_eq!(
-        SeekPlan::new(&source, &swapped, line, at).map(|_| ()),
+        SeekPlan::new(&source, &tagged(&swapped), line, at).map(|_| ()),
         Err(audio::SeekError::Source)
     );
     let (other_schedule, _) = started(&bank, &swapped);
@@ -529,16 +599,19 @@ fn a_plan_for_another_play_or_an_expired_frame_is_refused() {
     assert_eq!(line.frame(expired), written - 1);
     let refusals = [
         (
-            SeekPlan::new(&other_schedule.seek_source(), &swapped, line, at),
+            SeekPlan::new(&other_schedule.seek_source(), &tagged(&swapped), line, at),
             "another schedule",
         ),
         (
-            SeekPlan::new(&other_bank.seek_source(), &bgm, line, at),
+            SeekPlan::new(&other_bank.seek_source(), &tagged(&bgm), line, at),
             "another bank",
         ),
-        (SeekPlan::new(&source, &bgm, doubled, at), "another period"),
         (
-            SeekPlan::new(&source, &bgm, line, expired),
+            SeekPlan::new(&source, &tagged(&bgm), doubled, at),
+            "another period",
+        ),
+        (
+            SeekPlan::new(&source, &tagged(&bgm), line, expired),
             "an expired frame",
         ),
     ];
@@ -570,7 +643,7 @@ fn a_plan_for_another_play_or_an_expired_frame_is_refused() {
     // A plan to the first frame not yet written is still on time.
     let on_time = TimeUs(written * 125 - line.base_us);
     let (mut fresh, _) = started(&bank, &bgm);
-    let plan = SeekPlan::new(&fresh.seek_source(), &bgm, line, on_time).unwrap();
+    let plan = SeekPlan::new(&fresh.seek_source(), &tagged(&bgm), line, on_time).unwrap();
     assert_eq!(fresh.seek(&plan), Ok(()));
     assert_eq!(run_to(&mut e, &mut out, frames), want);
 }
@@ -614,7 +687,7 @@ fn seek_cost_into_a_dense_chart() {
             AudioEngine::new(bank.clone(), &bgm, DEVICE, 480, audio::MAX_VOICES, 0).unwrap();
         e.restart(TimeUs(0));
         let source = e.seek_source();
-        let plan_at = |line| SeekPlan::new(&source, &bgm, line, t).unwrap();
+        let plan_at = |line| SeekPlan::new(&source, &tagged(&bgm), line, t).unwrap();
         let mut plan = plan_at(e.frame_line());
         let (plan_median, plan_worst) = timed(runs, || plan = plan_at(e.frame_line()));
         let (take_median, take_worst) = timed(101, || e.seek(&plan).unwrap());

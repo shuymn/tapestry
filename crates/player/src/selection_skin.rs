@@ -30,10 +30,11 @@
 use std::sync::Arc;
 
 use bms_model::TimeUs;
+use game::Channel;
 use render::SkinBundle;
 use skin_model::{
-    MasterVolume, SelectionLabels, SelectionOrder, SelectionSettings, SelectionTimers,
-    SelectionView, SpeedReference, SpeedView,
+    SelectionLabels, SelectionOrder, SelectionSettings, SelectionTimers, SelectionView,
+    SpeedReference, SpeedView, VolumeReading,
 };
 
 use crate::menu_screen::{Caret, LineStyle, MenuLine, MenuPage};
@@ -157,9 +158,9 @@ impl SelectionEvents {
     }
 }
 
-/// `s` with the master gain that plays and the display offset as
+/// `s` with the system volume that plays and the display offset as
 /// `tuning` holds them now: what a selection frame shows of the settings
-/// keys (F3 to F6), read on the render thread. Allocates nothing.
+/// keys (F5 and F6) and the system volume, read on the render thread. Allocates nothing.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 #[must_use]
 pub fn live_settings(s: &SelectionSettings, tuning: &LiveTuning) -> SelectionSettings {
@@ -170,7 +171,7 @@ pub fn live_settings(s: &SelectionSettings, tuning: &LiveTuning) -> SelectionSet
         } else {
             i32::MAX
         }),
-        master_volume: MasterVolume::of_gain(tuning.volume()),
+        system_volume: VolumeReading::of_gain(tuning.volume(Channel::System)),
         ..*s
     }
 }
@@ -215,7 +216,7 @@ pub fn settings_of(
     });
     let s = SelectionSettings {
         display_offset_ms: 0,
-        master_volume: MasterVolume::of_gain(0.0),
+        system_volume: VolumeReading::of_gain(0.0),
         speed,
         order,
         gauge,
@@ -492,8 +493,8 @@ pub(crate) fn fixture() -> tempfile::TempDir {
 }
 
 /// [`fixture`] with the settings drawn after it, in this order: number
-/// 57 (the master gain's), number 12 (the display offset) and graph 17
-/// (the master gain, 1 000 wide at y 100) (dev-tools tests).
+/// 57 (the system volume's), number 12 (the display offset) and graph 17
+/// (the system volume, 1 000 wide at y 100) (dev-tools tests).
 #[cfg(all(test, feature = "dev-tools"))]
 pub(crate) fn settings_fixture() -> tempfile::TempDir {
     fixture_of(
@@ -596,7 +597,7 @@ fn fixture_slots() -> String {
 /// sliding right 1 000 from 100, 900, 20×40 (its travel x 100 to 1 100,
 /// y 900 to 940); event 13 over that travel at 500, 905, 40×30; events 13,
 /// 331 and 340 over slot 4 at 1300, 1400 and 1500, top 510, each 60×40;
-/// events 330 and 332 at 100, 500 and 100, 600, each 100×50; slider 17 (the master gain) sliding right 200 from 1050, 610, 20×40
+/// events 330 and 332 at 100, 500 and 100, 600, each 100×50; slider 17 (the system volume) sliding right 200 from 1050, 610, 20×40
 /// (over slot 5, its travel x 1 050 to 1 250); and an image at 100, 1000,
 /// 179×37 drawn only while the pointer is inside its region, by a
 /// `mouseRect` {0, 0, 179, 37} as a hover button's. Without `volume`,
@@ -853,9 +854,20 @@ mod tests {
     /// the options are known.
     #[test]
     fn the_settings_are_the_players_own() {
-        use skin_model::{GaugeLook, MasterVolume, SelectionOrder, SpeedReference, SpeedView};
+        use skin_model::{GaugeLook, SelectionOrder, SpeedReference, SpeedView, VolumeReading};
         let tuning = crate::tuning::LiveTuning::new(game::Tuning {
-            volume_percent: 53,
+            system: game::Volume {
+                percent: 53,
+                intent: false,
+            },
+            key: game::Volume {
+                percent: 20,
+                intent: false,
+            },
+            background: game::Volume {
+                percent: 99,
+                intent: false,
+            },
             display_offset_us: -12_000,
             input_offset_us: 0,
         });
@@ -895,8 +907,8 @@ mod tests {
             assert_eq!(s.covers_on, [covers.sudden.on, true, covers.hidden.on]);
             assert_eq!(s.display_offset_ms, -12);
             // 53 % plays as the f32 0.53, which the source shows as 52.
-            assert_eq!(s.master_volume, MasterVolume::of_gain(0.53));
-            assert_eq!(s.master_volume.number, 52);
+            assert_eq!(s.system_volume, VolumeReading::of_gain(0.53));
+            assert_eq!(s.system_volume.number, 52);
             assert!(!s.play_to_end);
             assert_eq!(s.assignment, Some(rules::Assignment::NearestTiesEarlier));
         }

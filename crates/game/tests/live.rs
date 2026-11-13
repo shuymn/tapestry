@@ -141,7 +141,7 @@ struct Fake {
     /// screen: each waits for the next play.
     offset_changes: Vec<(i64, i64)>,
     pending_offset: Option<i64>,
-    /// Master volumes the player sets at these clock times, each taken by
+    /// Key volumes the player sets at these clock times, each taken by
     /// the next play's starting settings.
     volume_changes: Vec<(i64, f32)>,
     /// Every step's measurement, by play.
@@ -1013,7 +1013,7 @@ impl Rig for Fake {
         }
         let now = self.clock.now().0;
         while let Some(i) = self.volume_changes.iter().position(|&(at, _)| at <= now) {
-            settings.device.master_volume = self.volume_changes.remove(i).1;
+            settings.device.key_volume = self.volume_changes.remove(i).1;
         }
     }
 }
@@ -3925,7 +3925,7 @@ fn a_volume_or_offset_change_keeps_the_key() {
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
     // Both reached the retry's settings.
     assert_eq!(loaded.settings().device.input_offset_us, 8_000);
-    assert!((loaded.settings().device.master_volume - 0.25).abs() < f32::EPSILON);
+    assert!((loaded.settings().device.key_volume - 0.25).abs() < f32::EPSILON);
     let [one, two] = &rig.reports[..] else {
         panic!("{} plays", rig.reports.len());
     };

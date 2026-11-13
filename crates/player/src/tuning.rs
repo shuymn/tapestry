@@ -1,7 +1,7 @@
 //! The settings keys' values while the game runs (design.md "Input"): the
 //! window thread steps them on F3 to F8, the adjustments' driver reads the
-//! display offset at each drain, and the game thread forwards the volume to
-//! the audio thread, takes the input offset into the next play and writes
+//! display offset at each drain, and the game thread forwards the volumes
+//! to the audio thread, takes the input offset into the next play and writes
 //! the files when a play ends. The values are read lock-free; nothing here
 //! allocates.
 //!
@@ -25,7 +25,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bms_model::TimeUs;
 use game::{
-    AcceptanceRevision, Adjust, Chain, DataRoot, Settings, Tuning, TuningSnapshot, save_settings,
+    AcceptanceRevision, Adjust, Chain, Channel, DataRoot, DeviceSettings, MAX_VOLUME_PERCENT,
+    Settings, Tuning, TuningSnapshot, Volume, save_settings,
 };
 use input::{ActivityRecord, Ingress, SectionValue};
 
@@ -196,15 +197,55 @@ impl Window {
     }
 }
 
-/// The four values, shared, with tuning acceptance.
+/// One of the three volumes, shared.
+#[derive(Debug)]
+struct LiveVolume {
+    percent: AtomicU32,
+    /// The volume as loaded, exact (`f32` bits), which plays until the
+    /// player sets it.
+    loaded: AtomicU32,
+    /// The write intent: the player has set it, so its percent plays and
+    /// is written.
+    intent: AtomicBool,
+}
+
+impl LiveVolume {
+    fn new(v: Volume) -> Self {
+        Self {
+            percent: AtomicU32::new(v.percent),
+            loaded: AtomicU32::new((v.percent as f32 / 100.0).to_bits()),
+            intent: AtomicBool::new(v.intent),
+        }
+    }
+
+    fn get(&self) -> Volume {
+        Volume {
+            percent: self.percent.load(Ordering::Acquire),
+            intent: self.intent.load(Ordering::Acquire),
+        }
+    }
+
+    /// What plays: as loaded until the player sets it.
+    fn playing(&self) -> f32 {
+        if self.intent.load(Ordering::Acquire) {
+            self.percent.load(Ordering::Acquire) as f32 / 100.0
+        } else {
+            f32::from_bits(self.loaded.load(Ordering::Acquire))
+        }
+    }
+
+    fn set(&self, v: Volume) {
+        self.percent.store(v.percent, Ordering::Release);
+        self.intent.store(v.intent, Ordering::Release);
+    }
+}
+
+/// The values, shared, with tuning acceptance.
 #[derive(Debug)]
 pub struct LiveTuning {
-    volume_percent: AtomicU32,
-    /// The volume as loaded, exact (`f32` bits), which plays until a
-    /// volume key moves it to a whole percent.
-    loaded_volume: AtomicU32,
-    /// Whether a volume key has moved the volume.
-    volume_moved: AtomicBool,
+    system: LiveVolume,
+    key: LiveVolume,
+    background: LiveVolume,
     display_offset_us: AtomicI64,
     input_offset_us: AtomicI64,
     /// Counts the changes, so readers notice one.
@@ -227,9 +268,9 @@ impl LiveTuning {
     /// The values `t`, with no end screen shown.
     pub fn new(t: Tuning) -> Self {
         Self {
-            volume_percent: AtomicU32::new(t.volume_percent),
-            loaded_volume: AtomicU32::new(t.volume().to_bits()),
-            volume_moved: AtomicBool::new(false),
+            system: LiveVolume::new(t.system),
+            key: LiveVolume::new(t.key),
+            background: LiveVolume::new(t.background),
             display_offset_us: AtomicI64::new(t.display_offset_us),
             input_offset_us: AtomicI64::new(t.input_offset_us),
             version: AtomicU64::new(0),
@@ -239,12 +280,25 @@ impl LiveTuning {
         }
     }
 
-    /// The values `t`, with the volume as loaded, `volume` (between whole
-    /// percents, as `Tuning` keeps it), playing until a volume key moves it.
-    pub fn with_loaded_volume(self, volume: f32) -> Self {
-        self.loaded_volume
-            .store(volume.to_bits(), Ordering::Release);
+    /// The values with each volume as `device` loaded it, exact (between
+    /// whole percents, as `Tuning` keeps it), playing until the player
+    /// sets it.
+    pub fn with_loaded_volumes(self, device: &DeviceSettings) -> Self {
+        for channel in Channel::ALL {
+            self.channel(channel)
+                .loaded
+                .store(device.volume(channel).to_bits(), Ordering::Release);
+        }
         self
+    }
+
+    /// `channel`'s shared volume.
+    const fn channel(&self, channel: Channel) -> &LiveVolume {
+        match channel {
+            Channel::System => &self.system,
+            Channel::Key => &self.key,
+            Channel::Background => &self.background,
+        }
     }
 
     /// The step lock.
@@ -269,20 +323,45 @@ impl LiveTuning {
         self.record.window.publish(w.section());
     }
 
-    /// The master volume to play: as loaded until a volume key moves it.
-    pub fn volume(&self) -> f32 {
-        if self.volume_moved.load(Ordering::Acquire) {
-            self.get().volume()
-        } else {
-            f32::from_bits(self.loaded_volume.load(Ordering::Acquire))
+    /// `channel`'s volume to play: as loaded until the player sets it, then
+    /// its percent, which is what [`Tuning::apply_to`] writes.
+    pub fn volume(&self, channel: Channel) -> f32 {
+        self.channel(channel).playing()
+    }
+
+    /// Sets `channel` to `percent`, held within 0 to unity, with its write
+    /// intent, even at an unchanged percent, and raises the settings write
+    /// a key step raises: the native setter (a skin's slider, or a
+    /// script's). Returns whether anything changed.
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "the selection skin's volume sliders will set through it"
+        )
+    )]
+    pub fn set_volume(&self, channel: Channel, percent: u32) -> bool {
+        let _w = self.window();
+        let new = Volume {
+            percent: percent.min(MAX_VOLUME_PERCENT),
+            intent: true,
+        };
+        let live = self.channel(channel);
+        if live.get() == new {
+            return false;
         }
+        live.set(new);
+        self.version.fetch_add(1, Ordering::AcqRel);
+        true
     }
 
     /// The current values. Only the window thread changes them, one at a
     /// time, so a read between two changes sees each value as it is.
     pub fn get(&self) -> Tuning {
         Tuning {
-            volume_percent: self.volume_percent.load(Ordering::Acquire),
+            system: self.system.get(),
+            key: self.key.get(),
+            background: self.background.get(),
             display_offset_us: self.display_offset_us.load(Ordering::Acquire),
             input_offset_us: self.input_offset_us.load(Ordering::Acquire),
         }
@@ -335,9 +414,9 @@ impl LiveTuning {
         // Only the value the key owns is stored.
         match a {
             Adjust::VolumeDown | Adjust::VolumeUp => {
-                self.volume_percent
-                    .store(new.volume_percent, Ordering::Release);
-                self.volume_moved.store(true, Ordering::Release);
+                // `Tuning::adjust` sets only a volume whose percent moves.
+                self.key.set(new.key);
+                self.background.set(new.background);
             }
             Adjust::DisplayOffsetDown | Adjust::DisplayOffsetUp => {
                 self.display_offset_us
@@ -809,7 +888,7 @@ impl SettingsFiles {
 #[cfg(test)]
 mod tests {
     use bms_model::TimeUs;
-    use game::{Adjust, Tuning};
+    use game::{Adjust, Channel, Tuning, Volume};
 
     use super::{Acceptance, Delivered, HoldClass, KeyEvent, LiveTuning, SettingsFiles};
 
@@ -1015,8 +1094,14 @@ mod tests {
     }
 
     fn start() -> Tuning {
+        let loaded = |percent| Volume {
+            percent,
+            intent: false,
+        };
         Tuning {
-            volume_percent: 100,
+            system: loaded(45),
+            key: loaded(100),
+            background: loaded(40),
             display_offset_us: 0,
             input_offset_us: 2_000,
         }
@@ -1049,50 +1134,116 @@ mod tests {
         let t = LiveTuning::new(start());
         assert!(t.adjust(Adjust::VolumeDown));
         let mut seen = Delivered::default();
-        assert_eq!(seen.take_new(&t).map(|v| v.volume_percent), Some(95));
+        assert_eq!(seen.take_new(&t).map(|v| v.key.percent), Some(95));
         assert_eq!(seen.take_new(&t), None);
         assert!(t.adjust(Adjust::VolumeDown));
-        assert_eq!(seen.take_new(&t).map(|v| v.volume_percent), Some(90));
+        assert_eq!(seen.take_new(&t).map(|v| v.key.percent), Some(90));
         assert_eq!(seen.take_new(&t), None);
     }
 
-    /// A volume between whole percents plays as loaded until a volume key
-    /// moves it; other keys leave it.
+    /// A volume between whole percents plays as loaded until the player
+    /// sets it; other keys leave it, and the volume keys never move the
+    /// system volume.
     #[test]
     fn the_loaded_volume_plays_until_a_volume_key_moves_it() {
-        let quiet = Tuning {
-            volume_percent: 0,
-            ..start()
+        let device = game::DeviceSettings {
+            system_volume: 0.45,
+            key_volume: 0.004,
+            background_volume: 0.999,
+            ..game::DeviceSettings::default()
         };
-        let t = LiveTuning::new(quiet).with_loaded_volume(0.004);
-        assert_eq!(t.volume(), 0.004);
+        let settings = game::Settings {
+            device: device.clone(),
+            player: game::PlayerSettings::default(),
+        };
+        let t = LiveTuning::new(Tuning::of(&settings)).with_loaded_volumes(&device);
+        assert_eq!(t.volume(Channel::Key), 0.004);
         assert!(t.adjust(Adjust::DisplayOffsetUp));
-        assert_eq!(t.volume(), 0.004);
+        assert_eq!(t.volume(Channel::Key), 0.004);
+        // Background 0.999 is 100 %: F4 moves the key volume only.
         assert!(t.adjust(Adjust::VolumeUp));
-        assert_eq!(t.volume(), 0.05);
+        assert_eq!(t.volume(Channel::Key), 0.05);
+        assert_eq!(t.volume(Channel::Background), 0.999);
         assert!(t.adjust(Adjust::VolumeDown));
-        assert_eq!(t.volume(), 0.0);
+        assert_eq!(t.volume(Channel::Key), 0.0);
+        assert_eq!(t.volume(Channel::Background), 0.95);
+        assert_eq!(t.volume(Channel::System).to_bits(), 0.45f32.to_bits());
+        // What plays is what is written.
+        let mut written = settings.clone();
+        t.get().apply_to(&mut written);
+        for channel in Channel::ALL {
+            assert_eq!(
+                written.device.volume(channel).to_bits(),
+                t.volume(channel).to_bits(),
+                "{channel:?}"
+            );
+        }
         // Without a loaded volume, the whole percent plays.
-        assert_eq!(LiveTuning::new(start()).volume(), 1.0);
+        assert_eq!(LiveTuning::new(start()).volume(Channel::Key), 1.0);
+    }
+
+    /// The native setter sets the write intent even at the loaded percent,
+    /// so the whole percent plays and is written, and asks for a write.
+    #[test]
+    fn a_set_volume_plays_and_is_written_as_set() {
+        let device = game::DeviceSettings {
+            key_volume: 0.754,
+            ..game::DeviceSettings::default()
+        };
+        let settings = game::Settings {
+            device: device.clone(),
+            player: game::PlayerSettings::default(),
+        };
+        let t = LiveTuning::new(Tuning::of(&settings)).with_loaded_volumes(&device);
+        assert_eq!(t.volume(Channel::Key), 0.754);
+        assert!(t.set_volume(Channel::Key, 75));
+        assert_eq!(t.version(), 1);
+        assert_eq!(t.volume(Channel::Key), 0.75);
+        let mut written = settings.clone();
+        t.get().apply_to(&mut written);
+        assert_eq!(written.device.key_volume, 0.75);
+        assert_eq!(written.device.background_volume, 1.0);
+        // Again at the same percent: nothing changes.
+        assert!(!t.set_volume(Channel::Key, 75));
+        assert_eq!(t.version(), 1);
     }
 
     #[test]
     fn a_step_at_a_bound_changes_nothing() {
-        let t = LiveTuning::new(start());
-        // Volume is at unity already.
+        let at = |key, background| {
+            let mut t = start();
+            t.key.percent = key;
+            t.background.percent = background;
+            LiveTuning::new(t)
+        };
+        // Both volumes at unity, or both silent: a step changes nothing.
+        let t = at(100, 100);
         assert!(!t.adjust(Adjust::VolumeUp));
         assert_eq!(t.version(), 0);
+        let silent = at(0, 0);
+        assert!(!silent.adjust(Adjust::VolumeDown));
+        assert_eq!(silent.get(), at(0, 0).get());
+        // Key 100 and background 40: F4 moves the background only, F3 both.
+        let t = LiveTuning::new(start());
+        assert!(t.adjust(Adjust::VolumeUp));
+        let set = |percent| Volume {
+            percent,
+            intent: true,
+        };
+        assert_eq!((t.get().key, t.get().background), (start().key, set(45)));
         assert!(t.adjust(Adjust::VolumeDown));
         assert!(t.adjust(Adjust::DisplayOffsetDown));
         assert_eq!(
             t.get(),
             Tuning {
-                volume_percent: 95,
+                key: set(95),
+                background: set(40),
                 display_offset_us: -1_000,
                 ..start()
             }
         );
-        assert_eq!(t.version(), 2);
+        assert_eq!(t.get().system, start().system);
+        assert_eq!(t.version(), 3);
     }
 
     /// The failure handling the select screen shows is the one

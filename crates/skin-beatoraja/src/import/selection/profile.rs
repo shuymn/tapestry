@@ -62,8 +62,8 @@ pub(crate) enum SelValue {
     LengthSec,
     /// The settings' display offset, whole ms.
     DisplayOffset,
-    /// The master gain's number.
-    Volume,
+    /// The system volume's number.
+    SystemVolume,
     /// Floating's travel duration and its green number.
     Duration,
     Green,
@@ -91,7 +91,7 @@ impl SelValue {
             Self::LengthMin => "selected.length_min",
             Self::LengthSec => "selected.length_sec",
             Self::DisplayOffset => "settings.display_offset",
-            Self::Volume => "settings.volume",
+            Self::SystemVolume => "settings.volume_system",
             Self::Duration => "settings.duration",
             Self::Green => "settings.green",
             Self::App(n) => super::super::property::app_field(n),
@@ -111,7 +111,7 @@ impl SelValue {
             Self::Level => "cursor.chart",
             Self::RatePercent | Self::RateHundredths | Self::NextRank => "selected.rate_valid",
             Self::Charts => "cursor.folder || cursor.all",
-            Self::ExDifference | Self::DisplayOffset | Self::Volume | Self::App(_) => "true",
+            Self::ExDifference | Self::DisplayOffset | Self::SystemVolume | Self::App(_) => "true",
             // A duration needs the chart's tempo in Classic.
             Self::Duration | Self::Green => "settings.floating",
         }
@@ -144,10 +144,10 @@ pub(crate) fn number(id: i32) -> Option<Class<SelValue>> {
         1163 => Bridge(SelValue::LengthMin),
         1164 => Bridge(SelValue::LengthSec),
         // The display offset (the source's judge timing, of the same
-        // sign), the master gain standing for the source's system volume,
+        // sign), the system volume (`IntegerPropertyFactory.java:122-124`),
         // and Floating's travel duration and its green number.
         12 => Bridge(SelValue::DisplayOffset),
-        57 => Bridge(SelValue::Volume),
+        57 => Bridge(SelValue::SystemVolume),
         312 => Bridge(SelValue::Duration),
         313 => Bridge(SelValue::Green),
         // The application's readouts: the presents per second, the local
@@ -409,8 +409,8 @@ pub(crate) fn slider(ty: i32) -> Option<Class<RatioSource>> {
     use Class::{Bridge, Omit};
     Some(match ty {
         1 => Bridge(RatioSource::ListPosition),
-        // The source's system volume: the master gain.
-        17 => Bridge(RatioSource::MasterVolume),
+        // The source's system volume (`FloatPropertyFactory.java:261-265`).
+        17 => Bridge(RatioSource::SystemVolume),
         // The key and background volumes: no channel of their own.
         18 | 19 => Omit,
         _ => return None,
@@ -422,7 +422,7 @@ pub(crate) fn graph(ty: i32) -> Option<Class<RatioSource>> {
     use Class::{Bridge, Omit};
     Some(match ty {
         147 => Bridge(RatioSource::ExRate),
-        17 => Bridge(RatioSource::MasterVolume),
+        17 => Bridge(RatioSource::SystemVolume),
         // Folder distributions, the other volumes and the judgment splits
         // the bests do not keep.
         -2 | -1 | 18 | 19 | 140..=144 => Omit,
@@ -691,13 +691,13 @@ mod tests {
         }
         assert_eq!((0..3_000).filter(|&id| timer(id).is_some()).count(), 4);
         assert_eq!(slider(1), Some(Class::Bridge(RatioSource::ListPosition)));
-        assert_eq!(slider(17), Some(Class::Bridge(RatioSource::MasterVolume)));
+        assert_eq!(slider(17), Some(Class::Bridge(RatioSource::SystemVolume)));
         assert_eq!(
             (slider(18), slider(19)),
             (Some(Class::Omit), Some(Class::Omit))
         );
         assert_eq!(graph(147), Some(Class::Bridge(RatioSource::ExRate)));
-        assert_eq!(graph(17), Some(Class::Bridge(RatioSource::MasterVolume)));
+        assert_eq!(graph(17), Some(Class::Bridge(RatioSource::SystemVolume)));
         for ty in [-2, -1, 18, 19, 140, 141, 142, 143, 144] {
             assert_eq!(graph(ty), Some(Class::Omit), "{ty}");
         }

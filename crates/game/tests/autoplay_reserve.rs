@@ -167,7 +167,8 @@ fn expected(chart: &Chart) -> (usize, usize) {
     let events = 2 * notes;
     let schedule = chart.bgm.len() + notes;
     let r = Reservation::of(chart, &rules::tapestry(), &device, EFFECTS).unwrap();
-    let own = 2 * events * size_of::<PhysicalInputEvent>() + schedule * size_of::<BgmEvent>();
+    let own = 2 * events * size_of::<PhysicalInputEvent>()
+        + schedule * size_of::<audio::ScheduledSound>();
     (r.bytes(events) + own, own)
 }
 
@@ -217,7 +218,7 @@ fn autoplay_buffers_are_charged_and_admitted_before_they_exist() {
     let small = chart(3_000, 40);
     let schedule = loaded(dir.path(), &small).autoplay().unwrap().schedule;
     let bank = common::bank(&small);
-    let engine = |s: Vec<BgmEvent>| {
+    let engine = |s: Vec<audio::ScheduledSound>| {
         let bank = std::sync::Arc::clone(&bank);
         measured(move || {
             AudioEngine::with_schedule(bank, s, common::RATE, common::PERIOD, MAX_VOICES, 0)
@@ -239,7 +240,7 @@ fn autoplay_buffers_are_charged_and_admitted_before_they_exist() {
     let notes = (RECORDING_MEMORY - base) * 1_000 / (double - base) + 1_000 - 2;
     let (below, own) = expected(&chart(i64::try_from(notes).unwrap(), 0));
     assert!(below <= RECORDING_MEMORY, "{below}");
-    let entry = size_of::<BgmEvent>();
+    let entry = size_of::<audio::ScheduledSound>();
     let bgm = (RECORDING_MEMORY - below) / entry + 1;
     let over = chart(i64::try_from(notes).unwrap(), bgm);
     let (total, own_over) = expected(&over);

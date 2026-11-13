@@ -1618,7 +1618,7 @@ mod tests {
             PointerAct::MoveTo(4)
         );
         assert_eq!(
-            act(l, slider(RatioSource::MasterVolume, 8), &f),
+            act(l, slider(RatioSource::SystemVolume, 8), &f),
             PointerAct::Nothing
         );
         let stale = Built {

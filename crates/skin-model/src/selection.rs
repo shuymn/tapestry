@@ -102,20 +102,20 @@ impl Ratio {
     }
 }
 
-/// The master gain as a selection skin shows it: the gain that plays,
+/// A volume as a selection skin shows it: the gain that plays,
 /// as an exact ratio for the sliders and graphs, and the number the
 /// source's system volume number draws, `(int)(gain · 100f)`: the `f32`
 /// product truncated toward zero, which is not always the exact floor
 /// (0.01 shows 1, 0.53 shows 52).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MasterVolume {
+pub struct VolumeReading {
     /// The gain, exactly ([`Ratio::of_f32`]).
     pub ratio: Ratio,
     /// `(int)(gain · 100f)`.
     pub number: i32,
 }
 
-impl MasterVolume {
+impl VolumeReading {
     /// The volume of `gain`, a gain from 0 to 1 (`device.toml`'s range);
     /// one outside it reads as 0.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -179,8 +179,8 @@ pub struct SelectionSettings {
     /// The display offset in whole ms, its sign the settings': a positive
     /// one draws the chart as if later, as the source's judge timing.
     pub display_offset_ms: i32,
-    /// The master gain that plays.
-    pub master_volume: MasterVolume,
+    /// The system volume that plays.
+    pub system_volume: VolumeReading,
     pub speed: SpeedView,
     pub order: SelectionOrder,
     /// The chosen preset's displayed gauge's look; `None` without a
@@ -482,10 +482,10 @@ mod tests {
             (0.81, 81),
             (1.0, 100),
         ] {
-            let v = super::MasterVolume::of_gain(gain);
+            let v = super::VolumeReading::of_gain(gain);
             assert_eq!(v.number, number, "{gain}");
             assert_eq!(Some(v.ratio), Ratio::of_f32(gain), "{gain}");
         }
-        assert_eq!(super::MasterVolume::of_gain(1.5).number, 0);
+        assert_eq!(super::VolumeReading::of_gain(1.5).number, 0);
     }
 }

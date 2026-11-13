@@ -638,8 +638,8 @@ pub fn settings_lines(t: Tuning, speed: SpeedLine) -> Vec<String> {
     vec![
         fit(
             &format!(
-                "F1/F2 HI-SPEED {hispeed} {mode} GREEN {green}{target}  F3/F4 VOLUME {}%",
-                t.volume_percent
+                "F1/F2 HI-SPEED {hispeed} {mode} GREEN {green}{target}  F3/F4 KEY {}% BG {}%",
+                t.key.percent, t.background.percent
             ),
             COLUMNS,
         ),
@@ -709,7 +709,18 @@ pub(crate) mod tests {
     #[test]
     fn settings_lines_show_each_value_and_its_keys() {
         let t = game::Tuning {
-            volume_percent: 35,
+            system: game::Volume {
+                percent: 100,
+                intent: false,
+            },
+            key: game::Volume {
+                percent: 35,
+                intent: false,
+            },
+            background: game::Volume {
+                percent: 40,
+                intent: false,
+            },
             display_offset_us: -2_000,
             input_offset_us: 4_000,
         };
@@ -722,7 +733,7 @@ pub(crate) mod tests {
         assert_eq!(
             super::settings_lines(t, floating),
             [
-                "F1/F2 HI-SPEED 3.20 FLOATING GREEN 300 (TARGET 300)  F3/F4 VOLUME 35%",
+                "F1/F2 HI-SPEED 3.20 FLOATING GREEN 300 (TARGET 300)  F3/F4 KEY 35% BG 40%",
                 "F5/F6 DISPLAY -2.0 MS  F7/F8 INPUT +4.0 MS (NEXT PLAY)  F9 OVERLAY",
             ]
         );
@@ -734,11 +745,11 @@ pub(crate) mod tests {
         };
         assert_eq!(
             super::settings_lines(t, classic)[0],
-            "F1/F2 HI-SPEED 2.56 CLASSIC GREEN 150  F3/F4 VOLUME 35%"
+            "F1/F2 HI-SPEED 2.56 CLASSIC GREEN 150  F3/F4 KEY 35% BG 40%"
         );
         assert_eq!(
             super::settings_lines(t, super::SpeedLine::default())[0],
-            "F1/F2 HI-SPEED - CLASSIC GREEN -  F3/F4 VOLUME 35%"
+            "F1/F2 HI-SPEED - CLASSIC GREEN -  F3/F4 KEY 35% BG 40%"
         );
     }
 
@@ -1295,7 +1306,18 @@ pub(crate) mod tests {
             id: None,
         };
         let t = game::Tuning {
-            volume_percent: 100,
+            system: game::Volume {
+                percent: 100,
+                intent: false,
+            },
+            key: game::Volume {
+                percent: 100,
+                intent: false,
+            },
+            background: game::Volume {
+                percent: 100,
+                intent: false,
+            },
             display_offset_us: 0,
             input_offset_us: 0,
         };
@@ -1304,7 +1326,18 @@ pub(crate) mod tests {
         let changed = super::with_settings(
             &base,
             game::Tuning {
-                volume_percent: 35,
+                system: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
+                key: game::Volume {
+                    percent: 35,
+                    intent: false,
+                },
+                background: game::Volume {
+                    percent: 35,
+                    intent: false,
+                },
                 ..t
             },
             speed,
@@ -1378,7 +1411,18 @@ pub(crate) mod tests {
         );
         page.extend(super::settings_lines(
             game::Tuning {
-                volume_percent: 100,
+                system: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
+                key: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
+                background: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
                 display_offset_us: -12_000,
                 input_offset_us: -7_500,
             },

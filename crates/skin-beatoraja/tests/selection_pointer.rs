@@ -294,7 +294,7 @@ fn a_song_list_part_keeps_no_mouse_rect() {
     }
 }
 
-/// P7: a master volume slider drawn over the third row is imported with
+/// P7: a system volume slider drawn over the third row is imported with
 /// no note and takes a press at its centre as a slider.
 #[test]
 fn a_volume_slider_over_a_row_is_hit_first() {
@@ -336,7 +336,7 @@ fn a_volume_slider_over_a_row_is_hit_first() {
             &mut s.sel,
             &skin_model::SelectionSettings {
                 display_offset_ms: 0,
-                master_volume: skin_model::MasterVolume::of_gain(0.5),
+                system_volume: skin_model::VolumeReading::of_gain(0.5),
                 speed: skin_model::SpeedView::Classic,
                 order: skin_model::SelectionOrder::Title,
                 gauge: None,
@@ -361,7 +361,7 @@ fn a_volume_slider_over_a_row_is_hit_first() {
         "{drawn:?}"
     );
     match hit(&s, [120.0, 320.0], Button::Left) {
-        Some(PointerHit::Slider(c)) => assert_eq!(c.source, RatioSource::MasterVolume),
+        Some(PointerHit::Slider(c)) => assert_eq!(c.source, RatioSource::SystemVolume),
         other => panic!("{other:?}"),
     }
     // Past its travel (200 to the right), the third row.

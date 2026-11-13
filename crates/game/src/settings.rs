@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use ::audio::AudioEngine;
+use ::audio::{AudioEngine, Channel};
 use bms_model::{Lane, TimeUs};
 use eval::{
     AxisBinding, AxisMode, Binding, ControlId, DeviceProfile, ScratchSettings, SourceProfile,
@@ -90,8 +90,8 @@ pub enum SettingsError {
     /// `version`, `None` when it has none. Nothing is converted.
     #[error(
         "device.toml has version {}; this tapestry reads only version {DEVICE_SETTINGS_VERSION} \
-         (START/SELECT bindings). Move device.toml aside; tapestry then starts from defaults, \
-         and `tapestry keys` writes a new one.",
+         (the system, key and background volumes). Move device.toml aside; tapestry then \
+         starts from defaults, and `tapestry keys` writes a new one.",
         found.map_or_else(|| "none".to_owned(), |v| v.to_string())
     )]
     DeviceVersion {
@@ -129,10 +129,12 @@ pub enum DeviceSettingsError {
         /// Its value, µs.
         value: i64,
     },
-    /// A master volume outside 0.0 to 1.0, as the bits of the `f32`
-    /// ([`f32::to_bits`]), so the error stays `Eq`.
-    #[error("master_volume {} is outside 0.0 to 1.0", f32::from_bits(*.bits))]
-    MasterVolume {
+    /// A volume outside 0.0 to 1.0, named by its key, as the bits of the
+    /// `f32` ([`f32::to_bits`]), so the error stays `Eq`.
+    #[error("{key} {} is outside 0.0 to 1.0", f32::from_bits(*.bits))]
+    Volume {
+        /// The key: `system_volume`, `key_volume` or `background_volume`.
+        key: &'static str,
         /// The volume's bits.
         bits: u32,
     },
@@ -630,9 +632,19 @@ impl From<ControllerDevice> for HidProduct {
     }
 }
 
+/// `channel`'s key in `device.toml`.
+#[must_use]
+pub const fn volume_key(channel: Channel) -> &'static str {
+    match channel {
+        Channel::System => "system_volume",
+        Channel::Key => "key_volume",
+        Channel::Background => "background_volume",
+    }
+}
+
 /// The `version` a `device.toml` carries; [`load_settings`] refuses any
 /// other, and a file without one.
-pub const DEVICE_SETTINGS_VERSION: u32 = 2;
+pub const DEVICE_SETTINGS_VERSION: u32 = 3;
 
 /// `device.toml`: what belongs to this PC and its devices.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -662,8 +674,13 @@ pub struct DeviceSettings {
     /// The monitor to play on, by its display device name (for example
     /// `\.\DISPLAY1`); the system's primary monitor when absent.
     pub monitor: Option<String>,
-    /// The master volume, 0.0 (silent) to 1.0 (unity).
-    pub master_volume: f32,
+    /// The system volume, 0.0 (silent) to 1.0 (unity): the player's own
+    /// sounds (design.md "Audio", the three volumes).
+    pub system_volume: f32,
+    /// The key volume, 0.0 to 1.0: a chart's key sounds.
+    pub key_volume: f32,
+    /// The background volume, 0.0 to 1.0: a chart's BGM-lane sounds.
+    pub background_volume: f32,
     /// How controllers' axes play their lanes.
     pub scratch: ScratchConfig,
     /// Periods the audio output keeps queued ahead of playback, 2 or 3
@@ -720,7 +737,9 @@ impl Default for DeviceSettings {
             display_offset_us: 0,
             audio_device: None,
             monitor: None,
-            master_volume: 1.0,
+            system_volume: 1.0,
+            key_volume: 1.0,
+            background_volume: 1.0,
             scratch: ScratchConfig::default(),
             queued_periods: DEFAULT_QUEUED_PERIODS,
             library: LibrarySettings::default(),
@@ -743,8 +762,8 @@ impl DeviceSettings {
     /// configs ([`KeyConfig::check`], the play adjustments' roles
     /// included), a controller key config binding anything only with its
     /// [`controller_device`](Self::controller_device), the input and
-    /// display offsets within ±[`OFFSET_LIMIT_US`], the master volume from
-    /// 0.0 to 1.0, the queued periods within [`QUEUED_PERIODS`], and a
+    /// display offsets within ±[`OFFSET_LIMIT_US`], each of the three
+    /// volumes from 0.0 to 1.0, the queued periods within [`QUEUED_PERIODS`], and a
     /// positive `[scratch] adjust_counts_per_step`.
     ///
     /// # Errors
@@ -768,10 +787,14 @@ impl DeviceSettings {
                 return Err(DeviceSettingsError::Offset { name, value });
             }
         }
-        if !(0.0..=1.0).contains(&self.master_volume) {
-            return Err(DeviceSettingsError::MasterVolume {
-                bits: self.master_volume.to_bits(),
-            });
+        for channel in Channel::ALL {
+            let volume = self.volume(channel);
+            if !(0.0..=1.0).contains(&volume) {
+                return Err(DeviceSettingsError::Volume {
+                    key: volume_key(channel),
+                    bits: volume.to_bits(),
+                });
+            }
         }
         if !QUEUED_PERIODS.contains(&self.queued_periods) {
             return Err(DeviceSettingsError::QueuedPeriods(self.queued_periods));
@@ -782,10 +805,32 @@ impl DeviceSettings {
         Ok(())
     }
 
-    /// Gives `engine` the master volume and the audio output offset. An
-    /// out-of-range volume is not applied; the engine keeps unity.
+    /// `channel`'s volume as the file holds it.
+    #[must_use]
+    pub const fn volume(&self, channel: Channel) -> f32 {
+        match channel {
+            Channel::System => self.system_volume,
+            Channel::Key => self.key_volume,
+            Channel::Background => self.background_volume,
+        }
+    }
+
+    /// Sets `channel`'s volume, unchecked ([`validate`](Self::validate)
+    /// checks it).
+    pub const fn set_volume(&mut self, channel: Channel, volume: f32) {
+        match channel {
+            Channel::System => self.system_volume = volume,
+            Channel::Key => self.key_volume = volume,
+            Channel::Background => self.background_volume = volume,
+        }
+    }
+
+    /// Gives `engine` the three volumes and the audio output offset. An
+    /// out-of-range volume is not applied; the engine keeps unity for it.
     pub fn apply_to(&self, engine: &mut AudioEngine) {
-        let _ = engine.set_volume(self.master_volume);
+        for channel in Channel::ALL {
+            let _ = engine.set_volume(channel, self.volume(channel));
+        }
         engine.set_output_offset(TimeUs(self.audio_offset_us));
     }
 
@@ -1104,7 +1149,7 @@ pub trait SettingsFile: DeserializeOwned + Default {
 }
 
 impl SettingsFile for DeviceSettings {
-    /// Refuses a file without `version = 2` ([`DEVICE_SETTINGS_VERSION`]):
+    /// Refuses a file without `version = 3` ([`DEVICE_SETTINGS_VERSION`]):
     /// [`SettingsError::DeviceVersion`]. A `version` that is not an integer
     /// is left to the typed parse.
     fn refuse(table: &toml::Table) -> Result<(), SettingsError> {

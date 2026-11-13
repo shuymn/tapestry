@@ -14184,7 +14184,7 @@ pub(crate) mod tests {
         };
         let settings = skin_model::SelectionSettings {
             display_offset_ms: 0,
-            master_volume: skin_model::MasterVolume::of_gain(0.0),
+            system_volume: skin_model::VolumeReading::of_gain(0.0),
             speed: skin_model::SpeedView::Classic,
             order: skin_model::SelectionOrder::Title,
             gauge: None,
@@ -14210,7 +14210,18 @@ pub(crate) mod tests {
             .model();
             assert_eq!((f.display_offset, f.fix_hispeed), (TimeUs(us), 3), "{us}");
             let tuning = crate::tuning::LiveTuning::new(game::Tuning {
-                volume_percent: 100,
+                system: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
+                key: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
+                background: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
                 display_offset_us: us,
                 input_offset_us: 0,
             });

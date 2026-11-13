@@ -5,11 +5,11 @@ use std::fs;
 use bms_model::{Lane, TimeUs};
 use eval::{AxisBinding, AxisMode, Binding, ControlId, ScratchSettings, SourceProfile};
 use game::{
-    Adjust, Chain, ControllerDevice, CoverSettings, DataRoot, DeviceSettings, FailureAction,
-    HiSpeedReference, HiSpeedSettings, KeyConfig, KeyError, LaneKey, Language, LibrarySettings,
-    LocalRecords, PlayerSettings, PlayerSettingsError, RecordSink, Role, ScoreTarget,
-    ScratchConfig, Settings, SettingsError, SkinChoice, SkinChoices, SpeedMode, Tuning,
-    load_settings, save_settings, write_atomic,
+    Adjust, Chain, Channel, ControllerDevice, CoverSettings, DataRoot, DeviceSettings,
+    FailureAction, HiSpeedReference, HiSpeedSettings, KeyConfig, KeyError, LaneKey, Language,
+    LibrarySettings, LocalRecords, PlayerSettings, PlayerSettingsError, RecordSink, Role,
+    ScoreTarget, ScratchConfig, Settings, SettingsError, SkinChoice, SkinChoices, SpeedMode,
+    Tuning, Volume, load_settings, save_settings, write_atomic,
 };
 use input::DeviceKind;
 use input::hid::AxisCap;
@@ -27,7 +27,7 @@ fn temp_root() -> (tempfile::TempDir, DataRoot) {
 fn changed() -> Settings {
     Settings {
         device: DeviceSettings {
-            version: 2,
+            version: 3,
             keyboard: KeyConfig {
                 lanes: vec![
                     LaneKey {
@@ -79,7 +79,9 @@ fn changed() -> Settings {
             display_offset_us: 16_700,
             audio_device: Some("device-a".to_owned()),
             monitor: Some(r"\.\DISPLAY3".to_owned()),
-            master_volume: 0.75,
+            system_volume: 0.45,
+            key_volume: 0.2,
+            background_volume: 0.999,
             scratch: ScratchConfig {
                 relative: None,
                 wrap: Some(1_024),
@@ -330,7 +332,7 @@ fn device_and_player_settings_round_trip() {
     // is refused like any other.
     fs::write(
         root.device_settings(),
-        "version = 2\n[library]\nroots = ['D:\\BMS', \"songs/new\"]\n",
+        "version = 3\n[library]\nroots = ['D:\\BMS', \"songs/new\"]\n",
     )
     .unwrap();
     assert_eq!(
@@ -341,19 +343,19 @@ fn device_and_player_settings_round_trip() {
     // not reversed.
     fs::write(
         root.device_settings(),
-        "version = 2\n[scratch]\nmenu_reversed = true\n",
+        "version = 3\n[scratch]\nmenu_reversed = true\n",
     )
     .unwrap();
     assert!(Settings::load(&root).unwrap().device.scratch.menu_reversed);
     fs::write(
         root.device_settings(),
-        "version = 2\n[scratch]\npress_threshold = 5\n",
+        "version = 3\n[scratch]\npress_threshold = 5\n",
     )
     .unwrap();
     assert!(!Settings::load(&root).unwrap().device.scratch.menu_reversed);
     fs::write(
         root.device_settings(),
-        "version = 2\n[library]\nroot = 'D:\\BMS'\n",
+        "version = 3\n[library]\nroot = 'D:\\BMS'\n",
     )
     .unwrap();
     assert!(matches!(
@@ -363,9 +365,10 @@ fn device_and_player_settings_round_trip() {
     s.save(&root).unwrap();
 
     // The settings keys' values, stepped and written as the game does at
-    // the end of a play, come back the same: volume down once (75 − 5 =
-    // 70 %), display offset up once (16.7 + 1 = 17.7 ms) and input offset
-    // down three times (4.5 − 3 = 1.5 ms).
+    // the end of a play, come back the same: volume down once (key 20 − 5
+    // = 15 %, background 99.9, rounded to 100, − 5 = 95 %, the system
+    // volume untouched), display offset up once (16.7 + 1 = 17.7 ms) and
+    // input offset down three times (4.5 − 3 = 1.5 ms).
     let mut t = Tuning::of(&s);
     for a in [
         Adjust::VolumeDown,
@@ -381,7 +384,9 @@ fn device_and_player_settings_round_trip() {
     stepped.save(&root).unwrap();
     let back = Settings::load(&root).unwrap();
     assert_eq!(back, stepped);
-    assert_eq!(back.device.master_volume, 0.7);
+    assert_eq!(back.device.key_volume, 0.15);
+    assert_eq!(back.device.background_volume, 0.95);
+    assert_eq!(back.device.system_volume.to_bits(), 0.45f32.to_bits());
     assert_eq!(back.device.display_offset_us, 17_700);
     assert_eq!(back.device.input_offset_us, 1_500);
     // Everything else is as it was.
@@ -390,7 +395,17 @@ fn device_and_player_settings_round_trip() {
     assert_eq!(back.device.controller_device, s.device.controller_device);
     assert_eq!(back.device.audio_offset_us, -12_000);
     assert_eq!(back.player, s.player);
-    assert_eq!(Tuning::of(&back), t);
+    // Read back, a volume is what was written, with no write intent.
+    let loaded = |v: Volume| Volume { intent: false, ..v };
+    assert_eq!(
+        Tuning::of(&back),
+        Tuning {
+            system: loaded(t.system),
+            key: loaded(t.key),
+            background: loaded(t.background),
+            ..t
+        }
+    );
 }
 
 #[test]
@@ -1029,8 +1044,12 @@ fn settings_outside_their_ranges_are_refused_on_load() {
         with(|d| d.input_offset_us = -1_000_000),
         with(|d| d.display_offset_us = 1_000_000),
         with(|d| d.display_offset_us = -1_000_000),
-        with(|d| d.master_volume = 0.0),
-        with(|d| d.master_volume = 1.0),
+        with(|d| d.system_volume = 0.0),
+        with(|d| d.system_volume = 1.0),
+        with(|d| d.key_volume = 0.0),
+        with(|d| d.key_volume = 1.0),
+        with(|d| d.background_volume = 0.0),
+        with(|d| d.background_volume = 1.0),
         with(|d| d.queued_periods = 2),
         with(|d| d.queued_periods = 3),
     ] {
@@ -1053,9 +1072,24 @@ fn settings_outside_their_ranges_are_refused_on_load() {
             with(|d| d.display_offset_us = -1_000_001),
             "display_offset_us -1000001",
         ),
-        (with(|d| d.master_volume = 1.01), "master_volume 1.01"),
-        (with(|d| d.master_volume = -0.01), "master_volume -0.01"),
-        (with(|d| d.master_volume = f32::NAN), "master_volume NaN"),
+        (with(|d| d.system_volume = 1.01), "system_volume 1.01"),
+        (with(|d| d.system_volume = -0.01), "system_volume -0.01"),
+        (with(|d| d.system_volume = f32::NAN), "system_volume NaN"),
+        (with(|d| d.key_volume = 1.01), "key_volume 1.01"),
+        (with(|d| d.key_volume = -0.01), "key_volume -0.01"),
+        (with(|d| d.key_volume = f32::NAN), "key_volume NaN"),
+        (
+            with(|d| d.background_volume = 1.01),
+            "background_volume 1.01",
+        ),
+        (
+            with(|d| d.background_volume = -0.01),
+            "background_volume -0.01",
+        ),
+        (
+            with(|d| d.background_volume = f32::NAN),
+            "background_volume NaN",
+        ),
         (
             with(|d| d.queued_periods = 1),
             "queued_periods 1 is outside 2 to 3",
@@ -1068,6 +1102,15 @@ fn settings_outside_their_ranges_are_refused_on_load() {
     for (d, says) in &refused {
         assert_invalid(d, &player, says);
     }
+    // The master volume is gone: a version 3 file that sets it is refused
+    // as an unknown key.
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    fs::write(root.device_settings(), "version = 3\nmaster_volume = 0.5\n").unwrap();
+    assert!(matches!(
+        load_settings::<DeviceSettings>(&root.device_settings()),
+        Err(SettingsError::Parse(e)) if e.message().contains("master_volume")
+    ));
     assert_invalid(
         &with(|d| d.scratch.adjust_counts_per_step = Some(0)),
         &player,
@@ -1239,7 +1282,7 @@ fn a_player_toml_with_visible_time_ms_is_refused() {
     }
 }
 
-/// `speculation` in a `version = 2` file: absent, `true` and `false` each
+/// `speculation` in a `version = 3` file: absent, `true` and `false` each
 /// read and write back as they were, an absent one staying absent; a value
 /// that is not a boolean is refused naming the key.
 #[test]
@@ -1260,7 +1303,7 @@ fn device_settings_keep_speculation_as_read() {
         ),
     ] {
         let text = format!(
-            "version = 2
+            "version = 3
 {line}"
         );
         fs::write(root.device_settings(), &text).unwrap();
@@ -1283,7 +1326,7 @@ fn device_settings_refuse_a_speculation_that_is_not_a_boolean() {
     fs::create_dir_all(root.path()).unwrap();
     fs::write(
         root.device_settings(),
-        "version = 2
+        "version = 3
 speculation = \"yes\"
 ",
     )
@@ -1296,24 +1339,24 @@ speculation = \"yes\"
     );
 }
 
-/// A `device.toml` without `version = 2`, none or another, is refused with
+/// A `device.toml` without `version = 3`, none or another, is refused with
 /// what to do; nothing is converted, and the file is left as it was. A
-/// missing file gives the defaults, written with `version = 2`.
+/// missing file gives the defaults, written with `version = 3`.
 #[test]
-fn a_device_toml_without_version_2_is_refused() {
+fn a_device_toml_without_version_3_is_refused() {
     let (_dir, root) = temp_root();
     fs::create_dir_all(root.path()).unwrap();
     let says = |found: &str| {
         format!(
-            "device.toml has version {found}; this tapestry reads only version 2 \
-             (START/SELECT bindings). Move device.toml aside; tapestry then starts from \
-             defaults, and `tapestry keys` writes a new one."
+            "device.toml has version {found}; this tapestry reads only version 3 \
+             (the system, key and background volumes). Move device.toml aside; tapestry then \
+             starts from defaults, and `tapestry keys` writes a new one."
         )
     };
     for (text, found, shown) in [
         ("[library]\nroots = []\n", None, "none"),
-        ("version = 1\n", Some(1), "1"),
-        ("version = 3\nmaster_volume = 0.5\n", Some(3), "3"),
+        ("version = 2\nmaster_volume = 0.5\n", Some(2), "2"),
+        ("version = 4\n", Some(4), "4"),
     ] {
         fs::write(root.device_settings(), text).unwrap();
         let e = Settings::load(&root).unwrap_err();
@@ -1321,7 +1364,7 @@ fn a_device_toml_without_version_2_is_refused() {
         assert_eq!(Chain(&e).to_string(), says(shown));
         assert_eq!(fs::read_to_string(root.device_settings()).unwrap(), text);
     }
-    fs::write(root.device_settings(), "version = 2\n").unwrap();
+    fs::write(root.device_settings(), "version = 3\n").unwrap();
     assert_eq!(
         Settings::load(&root).unwrap().device,
         DeviceSettings::default()
@@ -1332,7 +1375,7 @@ fn a_device_toml_without_version_2_is_refused() {
     assert_eq!(s.device.version, game::DEVICE_SETTINGS_VERSION);
     s.save(&root).unwrap();
     let text = fs::read_to_string(root.device_settings()).unwrap();
-    assert!(text.lines().any(|l| l == "version = 2"), "{text}");
+    assert!(text.lines().any(|l| l == "version = 3"), "{text}");
 }
 
 /// A `device.toml` whose adjustment roles collide with a lane, retry,
@@ -1426,24 +1469,37 @@ fn settings_keys_step_and_stop_at_their_bounds() {
     assert_eq!(game::NEXT_PRESET_KEY, game::KEEP_KEY);
     assert!(game::reserved_key(game::PREV_PRESET_KEY).is_some());
 
+    let loaded = |percent| Volume {
+        percent,
+        intent: false,
+    };
+    let set = |percent| Volume {
+        percent,
+        intent: true,
+    };
     let t = Tuning {
-        volume_percent: 40,
+        system: loaded(45),
+        key: loaded(100),
+        background: loaded(40),
         display_offset_us: 2_000,
         input_offset_us: -3_000,
     };
-    // Each key moves its own value only.
+    // Each key moves its own values only: the volume keys the key and
+    // background volumes, each set only when its percent changes, never
+    // the system volume.
     let steps = [
         (
             Adjust::VolumeDown,
             Tuning {
-                volume_percent: 35,
+                key: set(95),
+                background: set(35),
                 ..t
             },
         ),
         (
             Adjust::VolumeUp,
             Tuning {
-                volume_percent: 45,
+                background: set(45),
                 ..t
             },
         ),
@@ -1479,17 +1535,20 @@ fn settings_keys_step_and_stop_at_their_bounds() {
     for (a, after) in steps {
         assert_eq!(t.adjust(a), after, "{a:?}");
     }
-    // Volume stops at 0 % and at unity.
+    // A volume stops at 0 % and at unity; at its bound a key changes
+    // nothing and sets no intent.
     let vol = |p| Tuning {
-        volume_percent: p,
+        key: loaded(p),
+        background: loaded(p),
         ..t
     };
-    assert_eq!(vol(0).adjust(Adjust::VolumeDown).volume_percent, 0);
-    assert_eq!(vol(3).adjust(Adjust::VolumeDown).volume_percent, 0);
-    assert_eq!(vol(100).adjust(Adjust::VolumeUp).volume_percent, 100);
-    assert_eq!(vol(98).adjust(Adjust::VolumeUp).volume_percent, 100);
-    assert_eq!(vol(0).volume(), 0.0);
-    assert_eq!(vol(100).volume(), 1.0);
+    assert_eq!(vol(0).adjust(Adjust::VolumeDown), vol(0));
+    assert_eq!(vol(3).adjust(Adjust::VolumeDown).key, set(0));
+    assert_eq!(vol(100).adjust(Adjust::VolumeUp), vol(100));
+    assert_eq!(vol(98).adjust(Adjust::VolumeUp).background, set(100));
+    assert_eq!(vol(0).volume(Channel::Key), 0.0);
+    assert_eq!(vol(100).volume(Channel::Background), 1.0);
+    assert_eq!(vol(0).volume(Channel::System), 0.45);
     // Offsets stop at ±1 s.
     let off = |us| Tuning {
         display_offset_us: us,
@@ -1513,21 +1572,70 @@ fn settings_keys_step_and_stop_at_their_bounds() {
     );
 }
 
-/// A volume between whole percents is written back as it was until a
-/// volume key moves it; then it is the step's whole percent.
+/// A volume between whole percents is written back as it was until the
+/// player sets it; then it is the set whole percent.
 #[test]
 fn an_untouched_volume_keeps_its_exact_value() {
     let mut s = changed();
-    s.device.master_volume = 0.754;
+    s.device.key_volume = 0.754;
+    s.device.background_volume = 0.3;
     let t = Tuning::of(&s);
-    assert_eq!(t.volume_percent, 75);
+    assert_eq!((t.key.percent, t.background.percent), (75, 30));
+    assert!(!t.key.intent && !t.background.intent && !t.system.intent);
     let mut kept = s.clone();
     t.adjust(Adjust::DisplayOffsetDown).apply_to(&mut kept);
-    assert_eq!(kept.device.master_volume, 0.754);
+    assert_eq!(kept.device.key_volume, 0.754);
+    assert_eq!(kept.device.background_volume, 0.3);
+    assert_eq!(kept.device.system_volume, 0.45);
     assert_eq!(kept.device.display_offset_us, 15_700);
     let mut moved = s.clone();
     t.adjust(Adjust::VolumeUp).apply_to(&mut moved);
-    assert_eq!(moved.device.master_volume, 0.8);
+    assert_eq!(moved.device.key_volume, 0.8);
+    assert_eq!(moved.device.background_volume, 0.35);
+    assert_eq!(moved.device.system_volume, 0.45);
+}
+
+/// The write intent decides what is written: a volume the player set
+/// plays and is written at its whole percent, even at the percent it
+/// loaded as; one only stepped back to where it was keeps the step's
+/// percent; one a key could not move keeps its exact loaded value.
+#[test]
+fn a_set_volume_is_written_as_set() {
+    let mut s = changed();
+    s.device.key_volume = 0.754;
+    // (a) Set to the percent it rounds to.
+    let mut t = Tuning::of(&s);
+    t.set_volume(Channel::Key, 75);
+    assert!(t.key.intent);
+    assert_eq!(t.volume(Channel::Key), 0.75);
+    let mut written = s.clone();
+    t.apply_to(&mut written);
+    assert_eq!(written.device.key_volume, 0.75);
+    // (b) Up and back down.
+    let t = Tuning::of(&s)
+        .adjust(Adjust::VolumeUp)
+        .adjust(Adjust::VolumeDown);
+    let mut written = s.clone();
+    t.apply_to(&mut written);
+    assert_eq!(written.device.key_volume, 0.75);
+    // (c) Background 0.999 rounds to 100 %: F4 moves only the key volume,
+    // and the background volume is written back exactly.
+    let t = Tuning::of(&s).adjust(Adjust::VolumeUp);
+    assert!(t.key.intent && !t.background.intent);
+    let mut written = s.clone();
+    t.apply_to(&mut written);
+    assert_eq!(written.device.key_volume, 0.8);
+    assert_eq!(written.device.background_volume, 0.999);
+    // The setter clamps to unity.
+    let mut t = Tuning::of(&s);
+    t.set_volume(Channel::System, 250);
+    assert_eq!(
+        t.system,
+        Volume {
+            percent: 100,
+            intent: true
+        }
+    );
 }
 
 /// Two names of one key (Raw Input names Print Screen 0x54 with Alt and

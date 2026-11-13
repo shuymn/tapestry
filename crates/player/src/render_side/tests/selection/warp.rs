@@ -577,7 +577,7 @@ fn only_presented_select_frames_count_as_drawn() {
 }
 
 /// What a selection frame of the settings fixture showed: numbers 57 and
-/// 12 as drawn, the master gain's graph's width, and the views the skin
+/// 12 as drawn, the system volume's graph's width, and the views the skin
 /// had taken by then.
 #[derive(Clone, Debug, PartialEq)]
 struct SettingsSeen {
@@ -614,10 +614,11 @@ impl FrameSink for SettingsFrames {
 
 /// C13 (player half) and C14: through the player's startup settings, its
 /// settings keys' values, the select screen's update and the render
-/// thread's frame on WARP, a loaded `master_volume` shows the source's
+/// thread's frame on WARP, a loaded `system_volume` shows the source's
 /// number of the `f32` that plays and its exact ratio, the gain playing
-/// unchanged; F4, F6 and F5 on selection each show in the one frame
-/// granted after the key, with no view taken.
+/// unchanged; F4 (the key and background volumes, so neither 57 nor 17
+/// moves), F6 and F5 on selection each show in the one frame granted
+/// after the key, with no view taken.
 #[test]
 fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
     let _serial = crate::imports::tests::serial();
@@ -672,7 +673,11 @@ fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
             device: game::DeviceSettings::default(),
             player: game::PlayerSettings::default(),
         };
-        settings.device.master_volume = gain;
+        settings.device.system_volume = gain;
+        // The key and background volumes the keys step: F4 moves the key
+        // volume (background 0.999 is at 100 %), never the system volume.
+        settings.device.key_volume = 0.2;
+        settings.device.background_volume = 0.999;
         let charts = tempfile::tempdir().unwrap();
         let (sel, _) = crate::selection::tests::tree(charts.path(), &[&["a.bms"]]);
         let seen = || frames.0.lock().unwrap().clone();
@@ -694,7 +699,10 @@ fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
                 seen().last()
             );
             // The audio's gain is the loaded one, exactly.
-            assert_eq!(tuning.volume().to_bits(), gain.to_bits());
+            assert_eq!(
+                tuning.volume(game::Channel::System).to_bits(),
+                gain.to_bits()
+            );
             if gain != 0.7649 {
                 return;
             }
@@ -710,15 +718,20 @@ fn the_settings_show_the_gain_that_plays_and_follow_the_keys() {
                 let after = seen();
                 (pressed, after.len() - before, after.last().cloned())
             };
-            // F4: 76 + 5, the f32 0.81; then F6 and F5: the display offset
-            // 1 ms, then 0.
+            // F4: the key volume 20 + 5, the system volume, 57 and 17
+            // unchanged; then F6 and F5: the display offset 1 ms, then 0.
             let steps = [
-                (next(Adjust::VolumeUp), [81, 0]),
-                (next(Adjust::DisplayOffsetUp), [81, 1]),
-                (next(Adjust::DisplayOffsetDown), [81, 0]),
+                (next(Adjust::VolumeUp), [76, 0]),
+                (next(Adjust::DisplayOffsetUp), [76, 1]),
+                (next(Adjust::DisplayOffsetDown), [76, 0]),
             ];
+            assert_eq!(tuning.get().key.percent, 25);
+            assert_eq!(
+                tuning.volume(game::Channel::System).to_bits(),
+                gain.to_bits()
+            );
             gate.pace.store(false, Ordering::Release);
-            let graph = width(13_589_545, 1 << 24);
+            let graph = width(ratio.0, ratio.1);
             for ((pressed, drawn, frame), numbers) in steps {
                 assert!(pressed, "{numbers:?}");
                 assert_eq!(drawn, 1, "{numbers:?}: {frame:?}");

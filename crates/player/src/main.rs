@@ -99,7 +99,7 @@ use std::time::SystemTime;
 
 use anyhow::Context as _;
 use audio::{AudioEngine, BankLimits, MAX_VOICES, load_bank_at};
-use bms_model::{BgmEvent, TimeUs};
+use bms_model::TimeUs;
 use eval::ControlId;
 use game::{
     AutoKeySounds, DataRoot, DeviceSettings, Loaded, Parts, SessionConfig, Settings, Tuning,
@@ -567,7 +567,7 @@ struct Prepared {
     /// The source set the input thread keeps.
     sources: SourceSet,
     /// The audio schedule, when it is not the chart's BGM (autoplay).
-    schedule: Option<Vec<BgmEvent>>,
+    schedule: Option<Vec<audio::ScheduledSound>>,
     /// The controls every keyboard records, when they are not the key
     /// config's (autoplay).
     keyboard: Option<Vec<ControlId>>,
@@ -655,7 +655,7 @@ fn generated(loaded: Loaded, chart: &Path) -> anyhow::Result<Prepared> {
 /// load measures, and nothing is stored). A close cancels the measurement.
 fn start_engine(
     loaded: &Loaded,
-    schedule: Option<Vec<BgmEvent>>,
+    schedule: Option<Vec<audio::ScheduledSound>>,
     audio: audio_side::AudioThread,
     opened: audio_side::Opened,
     probe: rtrb::Producer<game::AudioProbe>,
@@ -802,7 +802,7 @@ fn view() -> View {
 /// (design.md "Play Lifecycle", "Audio tail"); only closing the window
 /// latches quitting.
 fn controls(s: &Settings, clock: QpcClock) -> Arc<Controls> {
-    let tuning = LiveTuning::new(Tuning::of(s)).with_loaded_volume(s.device.master_volume);
+    let tuning = LiveTuning::new(Tuning::of(s)).with_loaded_volumes(&s.device);
     let controls = Controls::with_tuning(clock, Arc::new(tuning));
     controls.quit_leaves();
     controls.set_game(std::thread::current());
