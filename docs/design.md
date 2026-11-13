@@ -1588,7 +1588,7 @@ Which tests check part of each row's mitigation. `Tagged tests` is generated fro
 | T15 | Unverified | |
 | T16 | Unverified | |
 | T17 | Unverified | |
-| T18 | `crates/game/tests/sound_sets.rs`: `recovery_cases`, `refused_candidates_are_named_and_skipped`, `scan_finds_sets_at_any_depth_and_never_enters_links` | |
+| T18 | `crates/game/tests/sound_sets.rs`: `a_copy_of_a_refused_file_is_named_too`, `recovery_cases`, `refused_candidates_are_named_and_skipped`, `scan_finds_sets_at_any_depth_and_never_enters_links` | |
 
 ### Privacy
 

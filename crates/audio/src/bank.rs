@@ -892,6 +892,8 @@ fn process(
         Ok(bytes) => bytes,
         Err(stop) => return (None, Outcome::Stopped(stop)),
     };
+    #[cfg(test)]
+    inject::built(inject::Built::Read);
     // The read may have blocked for long: a cancel meanwhile ends here.
     if shared.asks(path, Phase::AfterRead) {
         return (None, Outcome::Stopped(Stop::Cancelled));
@@ -1652,6 +1654,15 @@ pub fn decode_one(
     };
     let index = budget.files.fetch_add(1, Ordering::Relaxed);
     let (digest, outcome) = process(index, path, SoundId(0), &shared);
+    // The budget remembers only contents it stored a sound for: a copy of a
+    // refused file's bytes is decoded and refused on its own, so it is
+    // named too.
+    if let (Outcome::Stopped(_), Some(hash)) = (&outcome, digest) {
+        let mut taken = budget.taken.lock().unwrap_or_else(|e| e.into_inner());
+        if taken.get(&hash) == Some(&index) {
+            taken.remove(&hash);
+        }
+    }
     match (outcome, digest) {
         (Outcome::Stored(sound), Some(digest)) => Ok(Decoded::Sound { sound, digest }),
         (Outcome::Duplicate(_), Some(digest)) => Ok(Decoded::Same { digest }),
@@ -1685,9 +1696,11 @@ mod inject {
         Panic,
     }
 
-    /// What a decode builds past a check.
+    /// What a decode builds past a check: the file's bytes read whole,
+    /// then the probe, the codec and the resampler.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     pub enum Built {
+        Read,
         Probe,
         Codec,
         Resampler,
@@ -2078,7 +2091,8 @@ mod tests {
 
     /// ST6b: a cancel seen at a check builds nothing past it. A 22 050 Hz
     /// file decoded for 48 kHz, cancelled at the first question of each
-    /// phase in turn: after the read and before the probe, no probe; before
+    /// phase in turn: after the read, the bytes read once and no probe (the
+    /// check follows the read); before the probe, no probe; before
     /// the codec, the probe but no codec; before the resampler, every packet
     /// decoded but no resampler; the armed phase is the last asked. Unarmed,
     /// one of each is built and the phases come in their order.
@@ -2096,6 +2110,7 @@ mod tests {
             let budget = PickBudget::new(128 * 1024 * 1024);
             let got = decode_one(&path, 48_000, &budget, &limits, &|| false);
             let built = [
+                inject::Built::Read,
                 inject::Built::Probe,
                 inject::Built::Codec,
                 inject::Built::Resampler,
@@ -2105,7 +2120,7 @@ mod tests {
         };
         let (whole, built, all) = decode("unarmed", None);
         assert!(matches!(whole, Ok(Decoded::Sound { .. })), "{whole:?}");
-        assert_eq!(built, [1, 1, 1]);
+        assert_eq!(built, [1, 1, 1, 1]);
         assert_eq!(
             runs(&all),
             [
@@ -2122,14 +2137,14 @@ mod tests {
         assert_eq!(count(&all, Phase::BeforeResampler), 1);
         let packets = count(&all, Phase::Packet);
         for (phase, want) in [
-            (Phase::AfterRead, [0, 0, 0]),
-            (Phase::BeforeProbe, [0, 0, 0]),
-            (Phase::BeforeCodec, [1, 0, 0]),
-            (Phase::BeforeResampler, [1, 1, 0]),
+            (Phase::AfterRead, [1, 0, 0, 0]),
+            (Phase::BeforeProbe, [1, 0, 0, 0]),
+            (Phase::BeforeCodec, [1, 1, 0, 0]),
+            (Phase::BeforeResampler, [1, 1, 1, 0]),
         ] {
             let (got, built, log) = decode(&format!("{phase:?}"), Some(phase));
             assert_eq!(got, Err(FileRefusal::Cancelled), "{phase:?}");
-            assert_eq!(built, want, "{phase:?}: probe, codec, resampler");
+            assert_eq!(built, want, "{phase:?}: read, probe, codec, resampler");
             assert_eq!(log.last(), Some(&phase), "{phase:?}: {log:?}");
             if phase == Phase::BeforeResampler {
                 assert_eq!(count(&log, Phase::Packet), packets, "every packet decoded");

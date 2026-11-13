@@ -83,7 +83,8 @@ fn a_budget_charge_past_what_remains_is_refused() {
     assert_eq!((budget.used(), budget.limit()), (1_000, 1_000));
 }
 
-/// A folder in a file's place is refused on its handle, not read.
+/// A folder in a file's place is not read: Windows refuses to open it, and
+/// elsewhere its opened handle is refused as not a regular file.
 #[test]
 fn a_folder_is_not_a_sound() {
     let dir = tmp();
@@ -91,8 +92,62 @@ fn a_folder_is_not_a_sound() {
     std::fs::create_dir(&folder).unwrap();
     let budget = PickBudget::new(1_024);
     let got = decode_one(&folder, 48_000, &budget, &BankLimits::default(), &|| false);
-    assert!(
-        matches!(got, Err(FileRefusal::Undecodable(_) | FileRefusal::Io(_))),
-        "{got:?}"
+    if cfg!(windows) {
+        assert!(matches!(got, Err(FileRefusal::Io(_))), "{got:?}");
+    } else {
+        assert_eq!(
+            got,
+            Err(FileRefusal::Undecodable("not a regular file".into()))
+        );
+    }
+}
+
+/// A device opened in a file's place is refused on its handle before it is
+/// read: unchecked, the null device reads as nothing and the endless one
+/// up to the file cap.
+#[test]
+fn a_device_is_not_a_sound() {
+    let device = if cfg!(windows) { "NUL" } else { "/dev/zero" };
+    let budget = PickBudget::new(1_024);
+    let got = decode_one(
+        std::path::Path::new(device),
+        48_000,
+        &budget,
+        &BankLimits::default(),
+        &|| false,
     );
+    assert_eq!(
+        got,
+        Err(FileRefusal::Undecodable("not a regular file".into()))
+    );
+}
+
+/// A file with the same bytes as a refused one is decoded and refused on
+/// its own, never taken as the same contents.
+#[test]
+fn a_copy_of_a_refused_file_is_refused_too() {
+    let dir = tmp();
+    let limits = BankLimits::default();
+    let budget = PickBudget::new(128 * 1024 * 1024);
+    for name in ["clear.wav", "fail.wav"] {
+        let path = put(dir.path(), name, b"RIFF not really a wave");
+        let got = decode_one(&path, 48_000, &budget, &limits, &|| false);
+        assert!(
+            matches!(got, Err(FileRefusal::Undecodable(_))),
+            "{name}: {got:?}"
+        );
+    }
+    let big = put(dir.path(), "big.wav", &wav(48_000, 1, &ramp(300, 1, 3)));
+    let small = PickBudget::new(100);
+    for name in ["big.wav", "big-copy.wav"] {
+        let path = dir.path().join(name);
+        if name != "big.wav" {
+            std::fs::copy(&big, &path).unwrap();
+        }
+        assert_eq!(
+            decode_one(&path, 48_000, &small, &limits, &|| false),
+            Err(FileRefusal::OverCap(Cap::BankMemory)),
+            "{name}"
+        );
+    }
 }

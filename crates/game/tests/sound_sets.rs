@@ -121,7 +121,8 @@ fn found(r: &Resolution, kind: SystemKind) -> (PathBuf, Source) {
 
 /// ST1: a set is a folder whose own marker resolves, at any depth and the
 /// root included; a folder holding only other kinds is not one; a link or
-/// junction is never entered, a linked root included.
+/// junction is never entered, a linked root included. A link back to the
+/// root would run the scan down to its depth cap if it were entered.
 // Covers: T18
 #[test]
 fn scan_finds_sets_at_any_depth_and_never_enters_links() {
@@ -133,6 +134,7 @@ fn scan_finds_sets_at_any_depth_and_never_enters_links() {
     put(&root.join("x"), "scratch.wav");
     put(&outside, "clear.wav");
     link_dir(&root.join("linked"), &outside);
+    link_dir(&root.join("loop"), &root);
     let limits = ScanLimits::default();
     let scanned = scan(&root, SetRole::Sound, &limits);
     assert_eq!(scanned.sets, [canon(&root), canon(&root.join("a/b/c"))]);
@@ -155,9 +157,10 @@ fn scan_finds_sets_at_any_depth_and_never_enters_links() {
 }
 
 /// ST2: each cap at its bound: a set at depth 8 is found and one at depth
-/// 9 is not; the 4 096th folder is listed and the 4 097th is not; the
-/// 65 536th entry is listed and the 65 537th is not. Each cap is named
-/// once.
+/// 9 is not, while a set listed after that deep branch is still found (the
+/// depth cap prunes, it does not stop the scan); the 4 096th folder is
+/// listed and the 4 097th is not; the 65 536th entry is listed and the
+/// 65 537th is not. Each cap is named once.
 #[test]
 fn scan_caps_stop_at_their_bounds() {
     let limits = ScanLimits::default();
@@ -172,8 +175,12 @@ fn scan_caps_stop_at_their_bounds() {
     put(&root.join(&eight), "clear.wav");
     put(&root.join(&eight).join("d9"), "clear.wav");
     put(&root.join(&eight).join("e9"), "clear.wav");
+    put(&root.join("z"), "clear.wav");
     let scanned = scan(&root, SetRole::Sound, &limits);
-    assert_eq!(scanned.sets, [canon(&root.join(&eight))]);
+    assert_eq!(
+        scanned.sets,
+        [canon(&root.join(&eight)), canon(&root.join("z"))]
+    );
     assert_eq!(scanned.caps, [ScanCap::Depth]);
 
     // The root and 4 096 folders: the root is listed first, so the last
@@ -266,6 +273,28 @@ fn resolution_follows_the_sources_order() {
         (canon(&only.join("select.ogg")), Source::Defaults)
     );
     assert_eq!(resolved(&r, SystemKind::Decide), &Resolved::Missing);
+
+    // One kind with all four: each removed in turn gives the next.
+    let four = base.path().join("four");
+    for ext in ["mp3", "ogg", "flac", "wav"] {
+        put(&four, &format!("scratch.{ext}"));
+    }
+    for (ext, next) in [("wav", "flac"), ("flac", "ogg"), ("ogg", "mp3")] {
+        let r = resolve(&pick(Some(&four), None, &only), &mut |_| false);
+        assert_eq!(
+            found(&r, SystemKind::Scratch),
+            (
+                canon(&four.join(format!("scratch.{ext}"))),
+                Source::SoundSet
+            )
+        );
+        fs::remove_file(four.join(format!("scratch.{ext}"))).unwrap();
+        let r = resolve(&pick(Some(&four), None, &only), &mut |_| false);
+        assert_eq!(
+            found(&r, SystemKind::Scratch).0,
+            canon(&four.join(format!("scratch.{next}")))
+        );
+    }
 }
 
 /// ST5: a candidate that is a folder, a link out of its folder or a FIFO is
@@ -884,4 +913,49 @@ fn a_kind_with_no_candidate_keeps_its_sound() {
         None,
         "a skipped source's sound kept"
     );
+}
+
+/// A file with the same bytes as a refused one is refused and named too,
+/// in the same source and in `defaultsound\`: the pick never takes it as
+/// the same contents as a sound it does not hold.
+// Covers: T18
+#[test]
+fn a_copy_of_a_refused_file_is_named_too() {
+    let f = fixture();
+    let garbage = b"RIFF not really a wave";
+    put_bytes(&f.set, "clear.wav", garbage);
+    put_bytes(&f.set, "fail.wav", garbage);
+    put_bytes(&f.data.default_sounds(), "scratch.wav", garbage);
+    let mut recovery = Recovery::open(&f.data, Box::new(DiskFs::default()))
+        .unwrap()
+        .recovery;
+    let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
+    let report = decode_pick(
+        &set_pick(&f),
+        &KeptSounds::default(),
+        &budget,
+        &mut recovery,
+        &|| false,
+        &OneFile,
+    );
+    let mut named: Vec<PathBuf> = report
+        .refused
+        .iter()
+        .map(|r| {
+            assert!(
+                matches!(r.why, Why::File(FileRefusal::Undecodable(_))),
+                "{r:?}"
+            );
+            r.path.clone()
+        })
+        .collect();
+    named.sort();
+    let mut want = vec![
+        canon(&f.set.join("clear.wav")),
+        canon(&f.set.join("fail.wav")),
+        canon(&f.data.default_sounds().join("scratch.wav")),
+    ];
+    want.sort();
+    assert_eq!(named, want, "each refused file named once");
+    assert_eq!(budget.used(), 0);
 }
