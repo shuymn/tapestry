@@ -176,6 +176,7 @@ pub fn shown(score: &Score, preset: &RulePreset) -> BestScore {
         plays: score.plays,
         ex: best.map(|b| b.ex),
         bp: best.map(|b| b.bp),
+        max_combo: best.map(|b| b.max_combo),
         clear: best.map(|b| best_lamp(own_lamp(b, preset))),
     }
 }
@@ -453,6 +454,7 @@ mod tests {
             plays,
             ex: Some(ex),
             bp: Some(bp),
+            max_combo: Some(0),
             clear: Some(match lamp {
                 "NORMAL" => BestLamp::Cleared { gauge: 0 },
                 "HARD" => BestLamp::Cleared { gauge: 3 },
@@ -615,6 +617,63 @@ mod tests {
     }
 
     /// A view's best before the play, read through the live writer: known
+    /// The max combo a result compares with is the counted transaction's
+    /// best before the play, of any play, not the best EX play's and not
+    /// the one after: a first play (EX 4, combo 2), then one of combo 3
+    /// (EX 3) reads 2 and +1; a later play of combo 2 reads that 3 and −1.
+    #[test]
+    fn result_reads_the_best_combo_before_the_play() {
+        let fx = common::Fixture::new();
+        let lib = fx.open();
+        fx.pass(&lib);
+        let mut sink = sink(&fx, &lib);
+        // The last tap missed: EX 4, combo 2.
+        let mut missed_last = common::played(0);
+        missed_last.events.truncate(4);
+        let compare = |view: &BestView, record: &replay::PlayRecord| {
+            let BestView::Counted { previous, .. } = view else {
+                panic!("{view:?}");
+            };
+            let dir = tempfile::tempdir().unwrap();
+            let chart =
+                replay::verify::load_recorded_chart(record, common::CHART.as_bytes(), dir.path())
+                    .unwrap();
+            let tally = replay::verify::evaluate_record(record, &chart, None)
+                .unwrap()
+                .evaluation
+                .tally;
+            let figures = game::ResultFigures {
+                notes: 3,
+                max_ex: 6,
+                rate: None,
+                next_rank: 0,
+                clear: BestLamp::Failed,
+                cleared: false,
+                gauge_permille: 0,
+                timing: None,
+                duration_us: None,
+                areas: [[0; 2]; 5],
+            };
+            let game::BestCompare::Known(b) = game::BestCompare::of(
+                &game::BestLookup::previous(previous.as_ref()),
+                &tally,
+                &figures,
+                false,
+            ) else {
+                panic!("unavailable");
+            };
+            (b.ex, b.max_combo, b.max_combo_diff)
+        };
+        let first = finish(&mut sink, &missed_last);
+        assert_eq!(compare(&first, &missed_last), (0, None, None));
+        let all_great = common::played(30);
+        let second = finish(&mut sink, &all_great);
+        assert_eq!(compare(&second, &all_great), (4, Some(2), Some(1)));
+        // The same play again, saved under its own name: counted again.
+        let third = finish(&mut sink, &missed_last);
+        assert_eq!(compare(&third, &missed_last), (4, Some(3), Some(-1)));
+    }
+
     /// empty without a row, then the counted best with its typed lamp,
     /// and known empty again under another preset's key.
     #[test]
@@ -638,6 +697,7 @@ mod tests {
                 plays: 1,
                 ex: Some(6),
                 bp: Some(0),
+                max_combo: Some(3),
                 clear: Some(BestLamp::FullCombo),
             })
         );
@@ -675,6 +735,7 @@ mod tests {
                 plays: 3,
                 ex: Some(10),
                 bp: Some(0),
+                max_combo: Some(0),
                 clear: Some(BestLamp::Cleared { gauge: 3 }),
             })
         );

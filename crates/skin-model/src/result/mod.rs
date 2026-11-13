@@ -588,6 +588,8 @@ fn fields(view: &ResultView) -> [i32; field::COUNT] {
         set(field::BEST_BP, number(b.bp));
         set(field::BEST_BP_DIFF, number(b.bp_diff));
         set(field::BEST_CLEAR, b.clear.clear_type());
+        set(field::BEST_MAX_COMBO, number(b.max_combo));
+        set(field::BEST_MAX_COMBO_DIFF, number(b.max_combo_diff));
         set(field::BEST_EX_UPDATED, i32::from(b.ex_updated));
         set(field::BEST_BP_UPDATED, i32::from(b.bp_updated));
         if let Some(r) = b.rate {

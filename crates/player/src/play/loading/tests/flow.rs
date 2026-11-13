@@ -357,6 +357,7 @@ fn the_committed_play_skin_has_the_plays_best_and_target() {
         plays: 1,
         ex: Some(40),
         bp: Some(0),
+        max_combo: None,
         clear: None,
     });
     let cases = [
