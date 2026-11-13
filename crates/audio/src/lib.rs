@@ -6,7 +6,9 @@
 //!   bank over the caps of [`BankLimits`] before decoding when the files
 //!   declare their length, and while decoding otherwise. [`load_bank_at`]
 //!   converts them for a practice [`Speed`] in a second [`Stage`], with each
-//!   stage's workspace bound charged before it is built.
+//!   stage's workspace bound charged before it is built. [`decode_one`]
+//!   decodes one file the same way under a [`PickBudget`] that the calls of
+//!   one pick of system sounds share.
 //! - [`Mixer`] sums preallocated voices in `f32`, steals the oldest voice
 //!   with a short fade when all are busy, scales each voice by its
 //!   channel's volume (key or background), applies the play's fixed gain (0.5, or the chart's normalization gain), and a static soft
@@ -50,9 +52,9 @@ mod system;
 mod wasapi;
 
 pub use bank::{
-    BankError, BankLimits, BankWarning, Cap, Conversion, Found, LoadStats, MAX_RATE, MIN_RATE,
-    Sound, SoundBank, Speed, Stage, Width, load_bank, load_bank_at, load_bank_reporting,
-    load_bank_width, plan_conversion,
+    BankError, BankLimits, BankWarning, Cap, Conversion, Decoded, FileRefusal, Found, LoadStats,
+    MAX_RATE, MIN_RATE, PickBudget, Sound, SoundBank, Speed, Stage, Width, decode_one, load_bank,
+    load_bank_at, load_bank_reporting, load_bank_width, plan_conversion,
 };
 pub use clock::{MIX_CLOCK_REBASE_AFTER, MIX_CLOCK_WINDOW, MixClock};
 pub use engine::{
