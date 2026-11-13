@@ -124,6 +124,13 @@ pub struct Selection {
     pub(crate) row_bitmap: Box<[Option<GlyphLine>]>,
     pub(crate) position: Option<Ratio>,
     pub(crate) ex_rate: Option<Ratio>,
+    /// The best EX play's PERFECT to POOR over its own notes (graphs 140
+    /// to 144); `None` without one or with no notes.
+    pub(crate) judge_rates: [Option<Ratio>; 5],
+    /// The best max combo over the chart's summary notes (graph 145);
+    /// `None` for a chart that draws, whose best may come from a draw with
+    /// other notes, and without a summary.
+    pub(crate) combo_rate: Option<Ratio>,
     /// The master gain, as of the last settings; `None` before any.
     pub(crate) master_volume: Option<Ratio>,
     /// Per pointer target in draw order (each changeable slider, action
@@ -174,6 +181,8 @@ impl Selection {
             row_bitmap: vec![None; rows].into_boxed_slice(),
             position: None,
             ex_rate: None,
+            judge_rates: [None; 5],
+            combo_rate: None,
             master_volume: None,
             targets: vec![Cell::new(None); targets].into_boxed_slice(),
             row_hits: vec![Cell::new(None); row_hits].into_boxed_slice(),
@@ -301,6 +310,20 @@ impl Selection {
                 (RowScore::Best { ex, .. }, Some(max)) => Ratio::new(u64::from(ex), max),
                 _ => None,
             });
+        let selected = view.selected.as_ref();
+        let play = selected.and_then(|c| c.best).map(|b| b.play);
+        let counts = play.map(|p| judgments(&p.tally));
+        for (i, rate) in self.judge_rates.iter_mut().enumerate() {
+            *rate = play.zip(counts).and_then(|(p, counts)| {
+                let count = counts.get(i).copied().unwrap_or(0);
+                Ratio::new(u64::from(count), u64::from(p.notes))
+            });
+        }
+        self.combo_rate = selected.filter(|c| !c.random).and_then(|c| {
+            let s = c.summary?;
+            let combo = c.best.map_or(0, |b| b.max_combo);
+            Ratio::new(u64::from(combo), u64::from(s.taps) + u64::from(s.longs))
+        });
     }
 
     /// The text strings of the cursor's row and the place (docs/stage3.md
@@ -538,6 +561,12 @@ pub(crate) fn next_rank(ex: u64, max: u64) -> u64 {
     u64::try_from(next).unwrap_or(u64::MAX)
 }
 
+/// The judgments of `t`, PERFECT to POOR.
+const fn judgments(t: &eval::Tally) -> [u32; 5] {
+    let c = &t.counts;
+    [c.perfect, c.great, c.good, c.bad, c.poor]
+}
+
 /// The fields of `view`, its cursor's row `cursor`.
 fn fields(view: &SelectionView, cursor: Option<&RowView>) -> [i32; field::COUNT] {
     let mut f = [0; field::COUNT];
@@ -573,6 +602,58 @@ fn fields(view: &SelectionView, cursor: Option<&RowView>) -> [i32; field::COUNT]
             set(field::SELECTED_BEST, 1);
             set(field::SELECTED_EX, value(u64::from(ex)));
             set(field::SELECTED_BP, value(u64::from(bp)));
+        }
+    }
+    if let RowScore::NoBest { plays } | RowScore::Best { plays, .. } = c.score {
+        set(field::SELECTED_CLEARS, value(c.clears));
+        set(field::SELECTED_FAILS, value(plays.saturating_sub(c.clears)));
+    }
+    if let Some(b) = c.best {
+        set(field::SELECTED_MAX_COMBO, value(u64::from(b.max_combo)));
+        let p = &b.play;
+        let t = &p.tally;
+        set(field::SELECTED_POINT, value(p.point()));
+        let [perfect, great, good, bad, poor] = judgments(t).map(u64::from);
+        let empty = u64::from(t.empty_poor);
+        let counts = [
+            perfect,
+            great,
+            good,
+            bad,
+            poor,
+            empty,
+            u64::from(t.fast()),
+            u64::from(t.slow()),
+            u64::from(t.early.perfect),
+            u64::from(t.late.perfect),
+            u64::from(t.early.great),
+            u64::from(t.late.great),
+            u64::from(t.early.good),
+            u64::from(t.late.good),
+            u64::from(t.early.bad),
+            u64::from(t.late.bad),
+            u64::from(t.early.poor),
+            u64::from(t.late.poor),
+            u64::from(t.empty_poor_early),
+            u64::from(t.empty_poor_late),
+            bad + poor,
+            poor + empty,
+            bad + poor + empty,
+        ];
+        for (slot, v) in (field::SELECTED_COUNT_PERFECT..).zip(counts) {
+            set(slot, value(v));
+        }
+        // Each count's whole percent of the play's notes, as the source's
+        // `getJudgeCount(i) * 100 / getNotes()`
+        // (`skin/property/IntegerPropertyFactory.java:503-509` at `0.8.9`).
+        let notes = u64::from(p.notes);
+        if notes > 0 {
+            set(field::SELECTED_PLAY_NOTES_VALID, 1);
+        }
+        for (slot, n) in (field::SELECTED_RATE_PERFECT..).zip([perfect, great, good, bad, poor]) {
+            if let Some(rate) = (n * 100).checked_div(notes) {
+                set(slot, value(rate));
+            }
         }
     }
     let lamp = LampKey::of(c.score).index();

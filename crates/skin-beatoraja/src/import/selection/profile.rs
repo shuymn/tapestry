@@ -70,7 +70,60 @@ pub(crate) enum SelValue {
     /// The application's readouts, 20 to 29 as `id − 20`, play's fields
     /// of the same names.
     App(u8),
+    /// The best max combo, of any counted play.
+    MaxCombo,
+    /// The counted plays that were clears, and the plays less them.
+    Clears,
+    Fails,
+    /// The best EX play's point score.
+    Point,
+    /// The best EX play's counts, [`COUNTS`]'s entry `n`: 0 without a
+    /// score, as the source's judge counts on selection.
+    Count(u8),
+    /// The best EX play's PERFECT to POOR, drawn only with a score row,
+    /// as the source's score-data counts.
+    ScoreCount(u8),
+    /// The best EX play's PERFECT to POOR in whole percent of its notes.
+    Rate(u8),
 }
+
+/// The best EX play's counts as the selection schema gives them: PERFECT
+/// to POOR, the empty POORs, FAST, SLOW, the early and late pairs, then
+/// BAD and POOR, POOR and the empty POORs, and all three.
+const COUNTS: [&str; 23] = [
+    "selected.count.perfect",
+    "selected.count.great",
+    "selected.count.good",
+    "selected.count.bad",
+    "selected.count.poor",
+    "selected.count.empty_poor",
+    "selected.count.fast",
+    "selected.count.slow",
+    "selected.count.early.perfect",
+    "selected.count.late.perfect",
+    "selected.count.early.great",
+    "selected.count.late.great",
+    "selected.count.early.good",
+    "selected.count.late.good",
+    "selected.count.early.bad",
+    "selected.count.late.bad",
+    "selected.count.early.poor",
+    "selected.count.late.poor",
+    "selected.count.early.empty_poor",
+    "selected.count.late.empty_poor",
+    "selected.count.bad_poor",
+    "selected.count.poor_miss",
+    "selected.count.bad_poor_miss",
+];
+
+/// The best EX play's judgment rates, PERFECT to POOR.
+const RATES: [&str; 5] = [
+    "selected.rate.perfect",
+    "selected.rate.great",
+    "selected.rate.good",
+    "selected.rate.bad",
+    "selected.rate.poor",
+];
 
 impl SelValue {
     /// Its expression over the selection schema.
@@ -95,6 +148,18 @@ impl SelValue {
             Self::Duration => "settings.duration",
             Self::Green => "settings.green",
             Self::App(n) => super::super::property::app_field(n),
+            Self::MaxCombo => "selected.max_combo",
+            Self::Clears => "selected.clears",
+            Self::Fails => "selected.fails",
+            Self::Point => "selected.point",
+            Self::Count(n) | Self::ScoreCount(n) => COUNTS
+                .get(usize::from(n))
+                .copied()
+                .unwrap_or("selected.count.perfect"),
+            Self::Rate(n) => RATES
+                .get(usize::from(n))
+                .copied()
+                .unwrap_or("selected.rate.perfect"),
         }
     }
 
@@ -104,7 +169,13 @@ impl SelValue {
         match self {
             Self::Ex | Self::Bp => "selected.best",
             Self::MaxEx => "selected.max_ex_valid",
-            Self::Plays => "selected.played",
+            Self::Plays | Self::MaxCombo | Self::Clears | Self::Fails | Self::ScoreCount(_) => {
+                "selected.played"
+            }
+            Self::Rate(_) => "selected.play_notes_valid",
+            // The source's point score and judge counts read 0 without a
+            // score (`ScoreDataProperty.java:90-91`, `MainState.java:141-144`).
+            Self::Point | Self::Count(_) => "true",
             Self::Notes | Self::BpmMax | Self::BpmMin | Self::LengthMin | Self::LengthSec => {
                 "selected.summary"
             }
@@ -153,21 +224,40 @@ pub(crate) fn number(id: i32) -> Option<Class<SelValue>> {
         // The application's readouts: the presents per second, the local
         // date and time and the uptime (`IntegerPropertyFactory.java:98-107`).
         20..=29 => Bridge(SelValue::App(u8::try_from(id - 20).ok()?)),
+        // The best max combo, of any counted play: one property
+        // (`IntegerPropertyFactory.java:131`, `:182`, `:234`, `:627-631`).
+        75 | 105 | 174 => Bridge(SelValue::MaxCombo),
+        // Clears and plays less them (`:140-152`).
+        78 => Bridge(SelValue::Clears),
+        79 => Bridge(SelValue::Fails),
+        // The score's counts, hidden without a score (`:500-504`), and
+        // their whole percent of its notes, hidden without notes
+        // (`:505-511`).
+        80..=84 => Bridge(SelValue::ScoreCount(u8::try_from(id - 80).ok()?)),
+        85..=89 => Bridge(SelValue::Rate(u8::try_from(id - 85).ok()?)),
+        // The point score (`:174`; `ScoreDataProperty.java:75-78`).
+        100 => Bridge(SelValue::Point),
+        // The judge counts, 0 without a score (`:444-467`, `:512-519`;
+        // `MainState.java:141-144`): PERFECT to POOR, the early and late
+        // pairs, MISS (the empty POORs) and its splits, the early and late
+        // totals, then BAD and POOR, POOR and MISS, and all three.
+        110..=114 => Bridge(SelValue::Count(u8::try_from(id - 110).ok()?)),
+        410..=419 => Bridge(SelValue::Count(u8::try_from(id - 410 + 8).ok()?)),
+        420 => Bridge(SelValue::Count(5)),
+        421 => Bridge(SelValue::Count(18)),
+        422 => Bridge(SelValue::Count(19)),
+        423 => Bridge(SelValue::Count(6)),
+        424 => Bridge(SelValue::Count(7)),
+        425..=427 => Bridge(SelValue::Count(u8::try_from(id - 425 + 20).ok()?)),
         // Session and global statistics; the volumes without their own
-        // channel; what the bests do not keep; rivals and IR; per-lane-class
-        // note counts the summary does not split; density metrics.
+        // channel; rivals and IR; per-lane-class note counts the summary
+        // does not split; density metrics.
         17..=19
         | 30
         | 31
         | 58
         | 59
-        | 75
-        | 78
         | 92
-        | 100
-        | 105
-        | 174
-        | 110..=114
         | 179
         | 180
         | 227
@@ -180,8 +270,7 @@ pub(crate) fn number(id: i32) -> Option<Class<SelValue>> {
         | 360
         | 362..=365
         | 368
-        | 380..=384
-        | 410..=426 => Omit,
+        | 380..=384 => Omit,
         _ => return None,
     })
 }
@@ -422,10 +511,15 @@ pub(crate) fn graph(ty: i32) -> Option<Class<RatioSource>> {
     use Class::{Bridge, Omit};
     Some(match ty {
         147 => Bridge(RatioSource::ExRate),
+        // The best EX play's PERFECT to POOR over its own notes, where the
+        // source divides by the chart's (`FloatPropertyFactory.java:303-307`,
+        // `:542-561`), and the best max combo over the chart's notes
+        // (`:155-176`, `:308`).
+        140..=144 => Bridge(RatioSource::JudgeRate(u8::try_from(ty - 140).ok()?)),
+        145 => Bridge(RatioSource::ComboRate),
         17 => Bridge(RatioSource::MasterVolume),
-        // Folder distributions, the other volumes and the judgment splits
-        // the bests do not keep.
-        -2 | -1 | 18 | 19 | 140..=144 => Omit,
+        // Folder distributions and the other volumes.
+        -2 | -1 | 18 | 19 => Omit,
         _ => return None,
     })
 }
@@ -491,7 +585,7 @@ mod tests {
         (12, 12, C::N),
         (45, 49, C::N),
         (101, 101, C::N),
-        (105, 105, C::D),
+        (105, 105, C::N),
         (106, 106, C::N),
         (108, 108, C::N),
         (115, 116, C::N),
@@ -499,7 +593,7 @@ mod tests {
         (152, 153, C::N),
         (155, 156, C::N),
         (171, 172, C::N),
-        (174, 174, C::D),
+        (174, 174, C::N),
         (177, 177, C::N),
         (17, 19, C::D),
         (20, 29, C::N),
@@ -508,15 +602,15 @@ mod tests {
         (58, 59, C::D),
         (71, 72, C::N),
         (74, 74, C::N),
-        (75, 75, C::D),
+        (75, 75, C::N),
         (76, 77, C::N),
-        (78, 78, C::D),
+        (78, 89, C::N),
         (90, 91, C::N),
         (92, 92, C::D),
         (96, 96, C::N),
-        (100, 100, C::D),
+        (100, 100, C::N),
         (102, 103, C::N),
-        (110, 114, C::D),
+        (110, 114, C::N),
         (150, 150, C::N),
         (154, 154, C::N),
         (179, 180, C::D),
@@ -532,7 +626,7 @@ mod tests {
         (362, 365, C::D),
         (368, 368, C::D),
         (380, 384, C::D),
-        (410, 426, C::D),
+        (410, 427, C::N),
         (1163, 1164, C::N),
     ];
 
@@ -700,9 +794,13 @@ mod tests {
         );
         assert_eq!(graph(147), Some(Class::Bridge(RatioSource::ExRate)));
         assert_eq!(graph(17), Some(Class::Bridge(RatioSource::MasterVolume)));
-        for ty in [-2, -1, 18, 19, 140, 141, 142, 143, 144] {
+        for ty in [-2, -1, 18, 19] {
             assert_eq!(graph(ty), Some(Class::Omit), "{ty}");
         }
+        for (ty, k) in (140..=144).zip(0..) {
+            assert_eq!(graph(ty), Some(Class::Bridge(RatioSource::JudgeRate(k))));
+        }
+        assert_eq!(graph(145), Some(Class::Bridge(RatioSource::ComboRate)));
     }
 
     /// Every bridge compiles against the selection schema with its type.

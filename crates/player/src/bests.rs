@@ -257,6 +257,38 @@ pub fn row_score(score: Option<&Score>, preset: &RulePreset) -> RowScore {
     }
 }
 
+/// What selection shows of a stored best beside its EX, BP and lamp: the
+/// best max combo, and the play that set the best EX with its evaluation's
+/// counts (design.md "Personal Bests").
+pub fn selected_best(best: &Best) -> skin_model::SelectedBest {
+    let p = &best.play;
+    let per = |[perfect, great, good, bad, poor]: [u32; 5]| rules::PerJudgment {
+        perfect,
+        great,
+        good,
+        bad,
+        poor,
+    };
+    skin_model::SelectedBest {
+        max_combo: best.max_combo,
+        play: skin_model::BestPlay {
+            tally: eval::Tally {
+                counts: per(p.counts),
+                ex_score: p.ex,
+                bp: p.bp,
+                max_combo: p.max_combo,
+                empty_poor: p.empty_poor,
+                early: per(p.early),
+                late: per(p.late),
+                empty_poor_early: p.empty_poor_early,
+                empty_poor_late: p.empty_poor_late,
+                ..eval::Tally::default()
+            },
+            notes: p.notes,
+        },
+    }
+}
+
 /// The end screen's line about the play's best under its `preset`: the
 /// best with the play's difference from the previous one, or why it set
 /// none.
