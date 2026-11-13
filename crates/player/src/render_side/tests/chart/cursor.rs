@@ -218,6 +218,25 @@ fn a_move_cancels_a_held_read() {
     assert_eq!(c.written(), vec![(set.id(), [true, false, true])]);
 }
 
+/// A read that ended before a move, its outcome taken after it, is of an
+/// old cursor generation: its set is never adopted (SX6). The move cancels
+/// nothing then, the job having ended done.
+#[test]
+fn a_read_done_before_a_move_is_never_adopted_after_it() {
+    let _serial = crate::imports::tests::serial();
+    let c = cursor();
+    let a = chart([100, 100], [10, 10]);
+    c.rest(a.path(), named());
+    c.step();
+    assert_eq!(c.w.begun(), 1);
+    // Its thread ends; no step takes its outcome yet.
+    assert!(wait_until(|| c.w.job_ended()));
+    c.moved();
+    c.until(|c| c.w.idle());
+    assert!(!c.w.selection_kept(), "the old generation's set adopted");
+    assert!(c.w.current_selection().is_none());
+}
+
 /// A→B→A reads A again (the last set is the only candidate); a rest on B
 /// again after a move away and back, before any other rest, publishes B's
 /// set again without a job.

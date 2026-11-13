@@ -533,11 +533,14 @@ impl Selection {
             .then(|| TimeUs(self.rest.since.0.saturating_add(REST.0)))
     }
 
-    /// Selection is entered at `now`: a new cursor generation, the rest
-    /// counted from here (SX17), the cursor's chart set by the first
-    /// update's [`track_cursor`](Self::track_cursor).
-    fn rest_entered(&mut self, images: CursorImages<'_>, now: TimeUs) {
-        images.worker.cursor_changed(&self.coord);
+    /// Selection is entered at `now`: the rest counted from here (SX17),
+    /// the cursor's chart forgotten, so the first update's
+    /// [`track_cursor`](Self::track_cursor) starts a new cursor generation
+    /// on a chart row. Off one, the generation the departure started
+    /// ([`left_selection`](PlayerRig::left_selection)) holds: every way out
+    /// of selection goes through it, so a table of the last visit is never
+    /// current at the entry.
+    fn rest_entered(&mut self, now: TimeUs) {
         self.rest = CursorRest {
             chart: None,
             since: now,
@@ -3793,14 +3796,8 @@ impl AppRig for PlayerRig<'_> {
             return;
         };
         let now = self.clock.now();
-        let images = CursorImages {
-            worker: &self.chart_images,
-            side: self.selection_chart,
-        };
-        // A new cursor generation before the list is read again: a table
-        // of the last visit draws nothing, and the rest counts from now,
-        // whatever the cursor is on (SX17).
-        sel.rest_entered(images, now);
+        // The rest counts from now, whatever the cursor is on (SX17).
+        sel.rest_entered(now);
         sel.entered(now);
         // A panel held at the entry opens with it.
         sel.panels(self.panels.as_ref(), now);
@@ -3808,6 +3805,10 @@ impl AppRig for PlayerRig<'_> {
         // The window takes the pointer for this lifetime from now on.
         sel.pointer.enter(sel.feed.lifetime);
         println!("select: {} charts listed", sel.screen.listed());
+        let images = CursorImages {
+            worker: &self.chart_images,
+            side: self.selection_chart,
+        };
         sel.show(&self.render, images, None, now);
     }
 

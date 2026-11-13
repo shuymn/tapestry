@@ -1024,6 +1024,14 @@ impl ChartImageWorker {
         c.cursor.is_some() && c.held_back()
     }
 
+    /// Whether the job's thread has ended, its outcome not yet taken
+    /// (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn job_ended(&self) -> bool {
+        self.core().job.as_ref().is_some_and(|j| j.job.finished())
+    }
+
     /// Whether a selection set is kept, current or not (tests).
     #[cfg(test)]
     #[must_use]
