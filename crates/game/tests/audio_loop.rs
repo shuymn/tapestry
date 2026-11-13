@@ -2068,22 +2068,23 @@ mod system_sounds {
         assert_eq!(c.system_seq_word(), u64::MAX - 1);
         drop(c);
 
-        // A select loop in the retired and in the current generation, then
-        // a select stop with the sequence exhausted.
+        // A scratch loop in the retired and in the current generation (one
+        // kind sounding twice takes the one-shot voices), then a scratch
+        // stop with the sequence exhausted.
         let (mut c, mut worker, mut out) = rig();
         let r = pick(&c, &kinds);
         let r = install(&mut c, r);
-        c.system_start(SystemKind::Select, true, Some(r)).unwrap();
+        c.system_start(SystemKind::Scratch, true, Some(r)).unwrap();
         steps(&mut worker, &mut out, 1);
         let a = pick(&c, &kinds);
         let a = install(&mut c, a);
-        c.system_start(SystemKind::Select, true, Some(a)).unwrap();
+        c.system_start(SystemKind::Scratch, true, Some(a)).unwrap();
         steps(&mut worker, &mut out, 1);
         assert_eq!(worker.engine().system().retired(), Some(r));
         assert_eq!(sounding(&worker), 2);
         c.seed_system_seq(SEQ_LIMIT);
-        assert_eq!(c.system_stop(SystemKind::Select), None);
-        assert_eq!(c.system_stop_word(SystemKind::Select), TERMINAL);
+        assert_eq!(c.system_stop(SystemKind::Scratch), None);
+        assert_eq!(c.system_stop_word(SystemKind::Scratch), TERMINAL);
         steps(&mut worker, &mut out, 1);
         assert_eq!(sounding(&worker), 0);
         assert_eq!(returned(&mut c), [r]);
