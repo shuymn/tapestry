@@ -4070,26 +4070,32 @@ impl Skin {
         res.bitmap = self.bitmap_lines(&res.strings.chart());
     }
 
-    /// Prepares the timers of `res`'s frame at `now` from `timers`, as
+    /// Prepares `res`'s frame at `now`: the application's readouts from
+    /// `app`, then the timers from `timers`, as
     /// [`prepare_selection_frame`](Self::prepare_selection_frame) does a
-    /// selection's: the build of the same frame (the same `now`) then takes
-    /// them as they are, so the screen's runtime between the two reads the
-    /// state the build draws (docs/stage3.md S7-07). Allocates nothing.
+    /// selection's: the build of the same frame (the same `now`, with the
+    /// same `app`) then takes them as they are, so the screen's runtime
+    /// between the two reads the state the build draws (docs/stage3.md
+    /// S7-07). Allocates nothing.
     ///
     /// # Errors
     ///
-    /// [`BuildError::Kind`] for a skin that is not a result skin.
+    /// [`BuildError::Kind`] for a skin that is not a result skin;
+    /// [`BuildError::InvalidReadouts`] for a readout of `app` outside its
+    /// field's range, which leaves nothing prepared.
     pub fn prepare_result_frame(
         &self,
         res: &mut ResultScreen,
         now: TimeUs,
         timers: &ResultTimers,
+        app: &AppReadouts,
     ) -> Result<(), BuildError> {
         if self.kind != ScreenKind::Result {
             return Err(BuildError::Kind);
         }
         if self.owns_result(res) {
-            res.fill(now, timers, &self.whens);
+            res.prepared = None;
+            res.fill(now, timers, app, &self.whens)?;
             res.prepared = Some(now);
         }
         Ok(())
@@ -4111,8 +4117,9 @@ impl Skin {
     ///
     /// # Errors
     ///
-    /// [`BuildError::Kind`] for a skin that is not a result skin; nothing
-    /// is appended.
+    /// [`BuildError::Kind`] for a skin that is not a result skin;
+    /// [`BuildError::InvalidReadouts`] for a readout of the frame's `app`
+    /// outside its field's range. Nothing is appended.
     pub fn build_result(
         &self,
         res: &mut ResultScreen,
@@ -4124,7 +4131,7 @@ impl Skin {
             return Ok(());
         }
         if res.prepared.take() != Some(frame.now) {
-            res.fill(frame.now, &frame.timers, &self.whens);
+            res.fill(frame.now, &frame.timers, &frame.app, &self.whens)?;
         }
         let res = &*res;
         let rt = Runtime {

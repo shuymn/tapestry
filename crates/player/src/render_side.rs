@@ -1224,6 +1224,10 @@ struct Shared {
     /// (tests): a second clock reading in the frame would differ from it.
     #[cfg(test)]
     selection_stall: AtomicBool,
+    /// Result frames stall 2 ms after their instant is sampled while set
+    /// (tests): a second clock reading in the frame would differ from it.
+    #[cfg(test)]
+    result_stall: AtomicBool,
 }
 
 impl Shared {
@@ -1286,6 +1290,8 @@ impl Shared {
             result_runtime_timers: Mutex::new(Vec::new()),
             #[cfg(test)]
             selection_stall: AtomicBool::new(false),
+            #[cfg(test)]
+            result_stall: AtomicBool::new(false),
         }
     }
 
@@ -5231,13 +5237,20 @@ impl Run {
                     drawn.map(|d| (d.timing, None))
                 }
                 Mode::Result => {
+                    #[cfg(test)]
+                    if self.shared.result_stall.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
                     #[cfg(feature = "dev-tools")]
                     {
                         frame_began = Some(Instant::now());
                         let _ = crate::dev::take_build_mark();
                         let _ = crate::screens::take_visit();
                     }
-                    let now = self.clock.now();
+                    // The frame's one instant, its readouts' reading, as a
+                    // selection frame's: its timers age on the same clock
+                    // reading as its clock and uptime numbers.
+                    let now = frame_at;
                     if let Some(side) = &mut self.result {
                         side.drain();
                     }
@@ -5248,7 +5261,7 @@ impl Run {
                         &self.scripts,
                         now,
                     );
-                    Self::result_visit(self.result.as_mut(), now, fadeout);
+                    Self::result_visit(self.result.as_mut(), now, fadeout, &app);
                     #[cfg(all(test, feature = "dev-tools"))]
                     if let Some(h) = self.result.as_ref().and_then(|s| s.presented.as_ref()) {
                         self.shared
@@ -5257,8 +5270,13 @@ impl Run {
                             .unwrap_or_else(PoisonError::into_inner)
                             .push((now, h.script.running_frame_timer(0)));
                     }
-                    let built =
-                        Self::result_build(screen.as_mut(), self.result.as_mut(), now, fadeout);
+                    let built = Self::result_build(
+                        screen.as_mut(),
+                        self.result.as_mut(),
+                        now,
+                        fadeout,
+                        &app,
+                    );
                     // A frame under the barrier refused (dev-tools: the
                     // fallback during an outro).
                     #[cfg(feature = "dev-tools")]
@@ -7179,7 +7197,12 @@ impl Run {
     /// commit point and its build, outside both counted spans
     /// ([`crate::screens::result_visit`]); a stop's notice is latched for
     /// the lifetime and its strip prepared again after the frame.
-    fn result_visit(side: Option<&mut ResultSide>, now: TimeUs, fadeout: Option<TimeUs>) {
+    fn result_visit(
+        side: Option<&mut ResultSide>,
+        now: TimeUs,
+        fadeout: Option<TimeUs>,
+        app: &skin_model::AppReadouts,
+    ) {
         let Some(side) = side else {
             return;
         };
@@ -7200,6 +7223,7 @@ impl Run {
             state,
             now,
             &timers,
+            app,
         ) && side.stop.is_none()
         {
             side.stop = Some(stop);
@@ -7215,6 +7239,7 @@ impl Run {
         side: Option<&mut ResultSide>,
         now: TimeUs,
         fadeout: Option<TimeUs>,
+        app: &skin_model::AppReadouts,
     ) -> ResultDrawn {
         let Some(side) = side else {
             return ResultDrawn::BuiltIn;
@@ -7232,6 +7257,7 @@ impl Run {
                     screen: origin,
                     fadeout,
                 },
+                app: *app,
             };
             // The frame's preparation ends here (dev-tools: the S7-07d
             // gate's whole frames).

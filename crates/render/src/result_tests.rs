@@ -339,6 +339,7 @@ fn at_zero(layout: &Layout) -> ResultFrame<'_> {
             screen: Some(TimeUs(0)),
             fadeout: None,
         },
+        app: skin_model::AppReadouts::LAUNCH,
     }
 }
 

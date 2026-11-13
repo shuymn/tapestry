@@ -255,6 +255,7 @@ fn frames(
                 screen: Some(bms_model::TimeUs(0)),
                 fadeout: None,
             },
+            app: skin_model::AppReadouts::LAUNCH,
         };
         skin.build_result(&mut res, &frame, atlas.uvs(), &mut batch)
             .ok()?;
