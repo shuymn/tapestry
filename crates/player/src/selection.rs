@@ -5783,7 +5783,9 @@ pub(crate) mod tests {
                 bp: 0,
                 cleared: vec![0b1],
                 full_combo: false,
+                ..Default::default()
             }),
+            clear: true,
             ineligible: None,
         };
         sel.shelf.best_writer().unwrap().ingest(&c).unwrap();
@@ -7502,11 +7504,13 @@ pub(crate) mod tests {
             c.sha256,
             library::Score {
                 plays: 3,
+                clears: 0,
                 best: Some(library::Best {
                     ex: 3,
                     bp: 1,
                     cleared: vec![1],
                     full_combo: false,
+                    ..Default::default()
                 }),
             },
         )]));

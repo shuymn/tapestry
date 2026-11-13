@@ -79,6 +79,32 @@ pub fn connect(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
+/// The `scores` table of the current bests version ([`crate::BESTS_VERSION`]):
+/// created with the schema, and dropped and created again when the stored
+/// bests tuple is not this build's, so a change of its columns needs no
+/// schema change. `play` is a [`crate::Breakdown`] in its fixed layout
+/// ([`crate::bests::BREAKDOWN_BYTES`] bytes); the best's values are all set
+/// or all null.
+pub(crate) const SCORES_DDL: &str = "CREATE TABLE scores (
+             preset_sha256 BLOB NOT NULL,
+             ln_mode INTEGER NOT NULL,
+             chart_sha256 BLOB NOT NULL,
+             plays INTEGER NOT NULL,
+             clears INTEGER NOT NULL DEFAULT 0,
+             best_ex INTEGER,
+             best_bp INTEGER,
+             best_combo INTEGER,
+             cleared BLOB,
+             full_combo INTEGER NOT NULL DEFAULT 0,
+             play_sha256 BLOB CHECK (play_sha256 IS NULL OR length(play_sha256) = 32),
+             play BLOB CHECK (play IS NULL OR length(play) = 88),
+             CHECK ((best_ex IS NULL) = (best_bp IS NULL)
+                 AND (best_ex IS NULL) = (best_combo IS NULL)
+                 AND (best_ex IS NULL) = (play_sha256 IS NULL)
+                 AND (best_ex IS NULL) = (play IS NULL)),
+             PRIMARY KEY (preset_sha256, ln_mode, chart_sha256)
+         ) WITHOUT ROWID;";
+
 /// Creates schema [`SCHEMA_VERSION`] in an empty database, version included,
 /// in one transaction.
 ///
@@ -165,17 +191,7 @@ pub fn create(conn: &Connection) -> rusqlite::Result<()> {
              requested INTEGER NOT NULL,
              completed INTEGER NOT NULL
          );
-         CREATE TABLE scores (
-             preset_sha256 BLOB NOT NULL,
-             ln_mode INTEGER NOT NULL,
-             chart_sha256 BLOB NOT NULL,
-             plays INTEGER NOT NULL,
-             best_ex INTEGER,
-             best_bp INTEGER,
-             cleared BLOB,
-             full_combo INTEGER NOT NULL DEFAULT 0,
-             PRIMARY KEY (preset_sha256, ln_mode, chart_sha256)
-         ) WITHOUT ROWID;
+         {SCORES_DDL}
          CREATE TABLE counted (
              path TEXT NOT NULL,
              body_sha256 BLOB NOT NULL,
@@ -265,9 +281,10 @@ pub fn stored_tuple(conn: &Connection) -> rusqlite::Result<Option<Tuple>> {
 }
 
 /// Makes the stored bests this build's: when the tuple differs or is
-/// missing, clears `scores`, `counted` and `refused`, writes the tuple and
-/// requests a catch-up, in one transaction. Returns the tuple found when it
-/// was not this build's.
+/// missing, creates `scores` again in this build's layout, clears `counted`
+/// and `refused`, writes the tuple and requests a catch-up, in one
+/// transaction; no stored best is read. Returns the tuple found when it was
+/// not this build's.
 pub fn check_tuple(conn: &mut Connection) -> rusqlite::Result<Option<Option<Tuple>>> {
     let tx = conn.transaction()?;
     let stored = stored_tuple(&tx)?;
@@ -275,7 +292,11 @@ pub fn check_tuple(conn: &mut Connection) -> rusqlite::Result<Option<Option<Tupl
     if stored == Some(current) {
         return Ok(None);
     }
-    tx.execute_batch("DELETE FROM scores; DELETE FROM counted; DELETE FROM refused;")?;
+    // The derived tables of another interpretation are discarded unread;
+    // `scores` is created again in this version's layout.
+    tx.execute_batch(&format!(
+        "DROP TABLE IF EXISTS scores; {SCORES_DDL} DELETE FROM counted; DELETE FROM refused;"
+    ))?;
     tx.execute(
         "INSERT INTO meta (id, replay_format, canonical, evaluator, loader, bests, requested,
              completed)

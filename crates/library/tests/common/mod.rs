@@ -144,6 +144,7 @@ pub fn contribution(records: &Path, rel: &str, text: &str, record: &PlayRecord) 
             completed: re.evaluation.completed,
         },
         &re.evaluation,
+        &chart,
         &preset,
     )
 }

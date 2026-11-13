@@ -224,8 +224,8 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
         1164 => v("chart.length_ms / 1000 % 60", "chart.length_valid", (0, 59)),
         20..=29 => app(id)?,
         // No score target; no IR. The best's max combo (173, and 175 the
-        // difference from it) is not kept with a best until stage3.md's
-        // row S10-14.
+        // difference from it) is kept with a best but not read by the
+        // result until stage3.md's row S10-14.
         151 | 157 | 158 | 173 | 175 | 179 | 180 | 182 | 380..=399 => {
             return Some(Omit);
         }
