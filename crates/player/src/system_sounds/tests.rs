@@ -17,7 +17,9 @@ use audio::{
     SimDevice, Sound, SoundBank, SystemKind, SystemVoices,
 };
 use bms_model::TimeUs;
-use game::sound_sets::{DecodeFile, LinkCount, OneFile, RecoveryFs, ScanLimits, file_stem};
+use game::sound_sets::{
+    DecodeFile, LinkCount, OneFile, RecoveryFs, ScanLimits, Unavailable, file_stem,
+};
 use game::{AudioWaitError, AudioWorker, DataRoot, SoundSettings, audio_control};
 
 use super::{Clock, Event, Hooks, RealClock, Reason, Settled, Setup, Spawn, SystemSounds};
@@ -211,6 +213,29 @@ impl Clock for TestClock {
     }
 }
 
+/// The system's clock, counting the owner's pauses.
+#[derive(Default)]
+struct CountingClock {
+    pauses: AtomicU64,
+}
+
+impl CountingClock {
+    fn pauses(&self) -> u64 {
+        self.pauses.load(Ordering::Acquire)
+    }
+}
+
+impl Clock for CountingClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    fn pause(&self, d: Duration) {
+        self.pauses.fetch_add(1, Ordering::AcqRel);
+        thread::sleep(d);
+    }
+}
+
 /// What the decoder seam does with a file.
 #[derive(Clone, Copy, Debug, Default)]
 struct Rule {
@@ -351,6 +376,8 @@ struct MemState {
     files: Mutex<HashMap<PathBuf, Vec<u8>>>,
     writes: AtomicUsize,
     fail_from: AtomicUsize,
+    /// Another instance holds the lock.
+    held: AtomicBool,
 }
 
 impl MemFs {
@@ -359,7 +386,13 @@ impl MemFs {
             files: Mutex::new(HashMap::new()),
             writes: AtomicUsize::new(0),
             fail_from: AtomicUsize::new(usize::MAX),
+            held: AtomicBool::new(false),
         }))
+    }
+
+    /// Another instance holds the lock: it is refused.
+    fn hold_lock(&self) {
+        self.0.held.store(true, Ordering::Release);
     }
 
     /// Every write from the `n`th (1 the first) on fails.
@@ -376,7 +409,7 @@ impl MemFs {
 
 impl RecoveryFs for MemFs {
     fn lock(&mut self, _: &Path) -> io::Result<bool> {
-        Ok(true)
+        Ok(!self.0.held.load(Ordering::Acquire))
     }
 
     fn read(&mut self, path: &Path) -> io::Result<Option<Vec<u8>>> {
@@ -404,6 +437,15 @@ impl RecoveryFs for MemFs {
 
 fn failing_spawn(_: Box<dyn FnOnce() + Send>) -> io::Result<thread::JoinHandle<()>> {
     Err(io::Error::other("a seamed spawn failure"))
+}
+
+/// Runs the worker to its end before the thread it returns is made: a
+/// worker that ends at once has ended before the startup admission. Only
+/// for a worker that cannot open the recovery state (one that opens it
+/// waits for asks here).
+fn finished_spawn(body: Box<dyn FnOnce() + Send>) -> io::Result<thread::JoinHandle<()>> {
+    body();
+    Ok(thread::spawn(|| {}))
 }
 
 /// How a run is made.
@@ -807,7 +849,12 @@ fn an_entry_stops_the_last_visit_first() {
 /// and no install waits.
 #[test]
 fn an_entry_waits_then_rerolls() {
-    let mut run = Run::with_seam(visits(), Opts::default(), |seam| {
+    let clock = Arc::new(CountingClock::default());
+    let opts = Opts {
+        clock: Arc::clone(&clock) as Arc<dyn Clock>,
+        ..Opts::default()
+    };
+    let mut run = Run::with_seam(visits(), opts, |seam| {
         seam.rule(
             "B/clear.wav",
             Rule {
@@ -853,13 +900,13 @@ fn an_entry_waits_then_rerolls() {
     let took = at.elapsed();
     assert!(e > d);
     assert!(took < Duration::from_secs(1), "{took:?}");
-    // (d) After a settled visit: admitted with no wait.
+    // (d) After a settled visit: admitted with no wait (no slice paused).
     run.settle();
     run.pick(5);
-    let at = Instant::now();
+    let paused = clock.pauses();
     let f = run.entry();
     assert!(f > e);
-    assert!(at.elapsed() < Duration::from_millis(100));
+    assert_eq!(clock.pauses(), paused, "the entry waited");
     // (e) Polls admit nothing.
     run.settle();
     let before = run.admitted();
@@ -969,6 +1016,29 @@ fn virtual_run(fx: Fixture, arm: impl FnOnce(&Seam)) -> (Run, Arc<TestClock>) {
         ..Opts::default()
     };
     (Run::with_seam(fx, opts, arm), clock)
+}
+
+/// Every decode entered had returned by `returned`, a settlement's
+/// return: the clock moves on past it and real time passes, so a call
+/// still to come would be stamped later, then each path's entries equal
+/// its returns and every call is stamped at or before `returned`.
+fn decodes_ended_by(run: &Run, clock: &TestClock, returned: Instant) {
+    clock.pause(SLICES);
+    thread::sleep(Duration::from_millis(50));
+    let calls = run.seam.calls();
+    assert!(!calls.is_empty());
+    let mut open: HashMap<&Path, i64> = HashMap::new();
+    for c in &calls {
+        *open.entry(&c.path).or_default() += if c.returned { -1 } else { 1 };
+    }
+    assert!(
+        open.values().all(|&n| n == 0),
+        "a decode under way: {open:?}"
+    );
+    assert!(
+        calls.iter().all(|c| c.at <= returned),
+        "a decode after the settlement's return"
+    );
 }
 
 /// A blocked read for `suffix`, cancelled at the gate unless `ready`.
@@ -1204,10 +1274,40 @@ fn superseded_values_are_dropped() {
     assert_eq!(run.installed(), Some(a));
 }
 
+/// S5: `close` right after a latch, no poll between: the deferred-drop
+/// slot goes before the charge of the generation the empty install sent
+/// back is released.
+#[test]
+fn close_drains_the_slot_before_the_returns() {
+    let mut run = Run::new(visits(), Opts::default());
+    run.settle();
+    let a = run.entry();
+    run.sounds
+        .latch(&mut run.audio.control, Reason::SequenceExhausted);
+    let empty = run.sounds.newest;
+    let until = Instant::now() + PATIENCE;
+    while run.installed() != Some(empty) {
+        assert!(Instant::now() < until, "the empty install never applied");
+        thread::sleep(Duration::from_millis(1));
+    }
+    run.audio.steps(2);
+    assert!(!run.events().contains(&Event::Drained));
+    run.sounds.close(&mut run.audio.control);
+    let events = run.events();
+    let drained = events.iter().position(|&e| e == Event::Drained).unwrap();
+    let released = events
+        .iter()
+        .position(|&e| e == Event::Released(a))
+        .unwrap();
+    assert!(drained < released, "{events:?}");
+}
+
 /// S5: a panic in one source's decode leaves its kinds silent, skips it
 /// for the run and installs the rest; with its clear failing too, the run
 /// latches; a worker that cannot start latches with nothing reserved; a
-/// worker that ends mid-pick releases the reservation and latches.
+/// worker that ended at the lock before the startup admission latches by
+/// the lock; a worker that ends mid-pick releases the reservation and
+/// latches.
 #[test]
 fn worker_failures() {
     let panics = |seam: &Seam| {
@@ -1265,6 +1365,34 @@ fn worker_failures() {
     );
     drop(run);
 
+    // The lock held by another instance, the worker ended before the
+    // startup admission: the latch names the lock, not the worker.
+    let fs = MemFs::new();
+    fs.hold_lock();
+    let opts = Opts {
+        fs,
+        spawn: finished_spawn,
+        ..Opts::default()
+    };
+    let run = Run::new(visits(), opts);
+    assert!(
+        matches!(
+            run.sounds.latched,
+            Some(Reason::Recovery(Unavailable::Locked { .. }))
+        ),
+        "{:?}",
+        run.sounds.latched
+    );
+    assert!(
+        run.said()
+            .iter()
+            .any(|l| l.contains("held by another tapestry")),
+        "{:?}",
+        run.said()
+    );
+    assert_eq!(run.sounds.charged(), 0);
+    drop(run);
+
     let opts = Opts::default();
     let panic = Arc::clone(&opts.picker_panics);
     let mut run = Run::new(visits(), opts);
@@ -1316,9 +1444,7 @@ fn a_pick_holds_ready_until_it_reports() {
     assert!(checked && clock.elapsed() > Duration::from_secs(60));
     let a = run.sounds.newest;
     assert_eq!(run.installed(), Some(a));
-    let calls = run.seam.calls();
-    assert!(!calls.is_empty());
-    assert!(calls.iter().all(|c| c.at <= returned));
+    decodes_ended_by(&run, &clock, returned);
     drop(run);
 
     // (b) Superseded at an entry's timeout: B's first read (its scratch)
@@ -1360,7 +1486,7 @@ fn a_pick_holds_ready_until_it_reports() {
         .filter(|c| c.path.ends_with("B/scratch.wav"))
         .collect();
     assert_eq!(b_calls.len(), 2);
-    assert!(b_calls.iter().all(|c| c.at <= returned));
+    decodes_ended_by(&run, &clock, returned);
     drop(run);
 
     // (c) The quit key, in (a) and in (b): within the slice, the pick left
@@ -1429,18 +1555,31 @@ fn a_pick_holds_ready_until_it_reports() {
 /// S10: `start` of each set kind, the decision sound, `stop`, a full
 /// ring's refusal, starts refused while latched and the decision sound as
 /// the tone allocate and free nothing on this thread, the first exhaustion
-/// latch inside the window included (from a start and, in a second run,
-/// from a stop): the mapping it invalidates moves into the slot, dropped
-/// and named only at the next poll, before that poll releases the charge
-/// of the generation the empty install sent back.
+/// latch inside the window included: the ring drained, the window's first
+/// call latches by its refused draw, a `start(Scratch)`, a
+/// `start(Decide)` (which asks for the tone) or a `stop`, one per run. The
+/// mapping it invalidates moves into the slot, dropped and named only at
+/// the next poll, before that poll releases the charge of the generation
+/// the empty install sent back.
 #[cfg(feature = "dev-tools")]
 #[test]
 fn system_sounds_start_and_stop_alloc() {
     use crate::alloc_count::{this_thread, this_thread_frees};
     use game::SEQ_LIMIT;
 
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum First {
+        Start,
+        Decide,
+        Stop,
+    }
+
     let kinds = SystemKind::ALL;
-    for latch_by_stop in [false, true] {
+    let decides = (0..3_000_usize)
+        .filter(|k| k % 3 == 1 || (k % 3 == 0 && kinds[k % kinds.len()] == SystemKind::Decide))
+        .count();
+    let decides = u64::try_from(decides).unwrap();
+    for first in [First::Start, First::Decide, First::Stop] {
         let fx = Fixture::new();
         for kind in [SystemKind::Clear, SystemKind::Scratch, SystemKind::Fail] {
             fx.sound("sound/A", kind, 100);
@@ -1478,14 +1617,20 @@ fn system_sounds_start_and_stop_alloc() {
         );
         assert!(sounds.latched.is_none());
 
-        // The first exhaustion latch inside the window.
+        // The first exhaustion latch inside the window, the ring drained so
+        // a start reaches its draw.
+        run.audio.step_now(2);
+        let control = &mut run.audio.control;
+        let sounds = &mut run.sounds;
         control.seed_system_seq(SEQ_LIMIT);
+        let tones = control.failure_probe().tone_requests();
         let before = counts();
-        if latch_by_stop {
-            sounds.stop(control, SystemKind::Select);
-        } else {
-            sounds.start(control, SystemKind::Scratch, None);
+        match first {
+            First::Start => sounds.start(control, SystemKind::Scratch, None),
+            First::Decide => sounds.start(control, SystemKind::Decide, None),
+            First::Stop => sounds.stop(control, SystemKind::Select),
         }
+        assert!(sounds.latched.is_some(), "the first call latched");
         for k in 0..3_000_usize {
             let kind = kinds[k % kinds.len()];
             match k % 3 {
@@ -1496,6 +1641,11 @@ fn system_sounds_start_and_stop_alloc() {
         }
         assert_eq!(counts(), before, "allocations and frees, latching");
         assert_eq!(sounds.latched, Some(Reason::SequenceExhausted));
+        assert_eq!(
+            control.failure_probe().tone_requests(),
+            tones + decides + u64::from(first == First::Decide),
+            "the tone for each decision sound"
+        );
         assert!(sounds.mapping.is_empty(), "the mapping moved out");
         assert!(sounds.deferred.is_some(), "the slot holds it, undropped");
         assert!(!sounds.events.contains(&Event::Drained));

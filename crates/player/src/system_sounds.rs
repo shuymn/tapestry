@@ -640,7 +640,8 @@ impl SystemSounds {
 
     /// Ends the worker (its pick cancelled, waited for within
     /// [`STOP_WAIT`], then left to end with the process), drops what the
-    /// game thread holds and takes the returns. Idempotent.
+    /// game thread holds and takes the returns, the deferred-drop slot
+    /// drained before any return's charge is released. Idempotent.
     #[cfg_attr(
         not(test),
         expect(
@@ -652,6 +653,7 @@ impl SystemSounds {
         if self.closed {
             return;
         }
+        self.drain_deferred();
         self.end_worker();
         self.take_returns(control);
         self.drain_deferred();
@@ -902,6 +904,11 @@ impl SystemSounds {
             .and_then(|w| w.asks.as_ref())
             .is_some_and(|tx| tx.try_send(ask).is_ok());
         if !sent {
+            // The worker has ended: what it answered first (a recovery state
+            // it could not open) names the latch.
+            while let Some(reply) = self.next_reply() {
+                self.handle(control, reply);
+            }
             self.worker_ended = true;
             self.latch(control, Reason::WorkerGone);
             return None;
