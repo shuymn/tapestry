@@ -349,3 +349,77 @@ fn read_scanned_carries_the_seed_0_labels() {
     assert!(refused.summary.is_err());
     assert_eq!(refused.labels, None);
 }
+
+/// The preview profile of `text`'s seed-0 branch.
+fn preview(text: &str) -> bms_model::ChartProfile {
+    read_scanned(text.as_bytes(), &Limits::default())
+        .unwrap()
+        .profile
+        .unwrap()
+}
+
+/// Nine taps in second 0 at 240 BPM (a measure a second).
+const NINE: &str = "#BPM 240\n#00011:010101010101010101\n";
+
+/// Fixtures H and BGA: a hidden note (31-39), a BGA event (04) or a layer
+/// event (07) at 4.2 s lengthens the preview's seconds to 6, as the
+/// reference's last time counts them; a poor-BGA event (06) does not, nor
+/// any of them the play profile.
+#[test]
+fn hidden_notes_and_bga_lengthen_the_preview() {
+    for (channel, seconds) in [("31", 6), ("39", 6), ("04", 6), ("07", 6), ("06", 2)] {
+        let text = format!("{NINE}#004{channel}:0001000000\n");
+        assert_eq!(preview(&text).seconds().len(), seconds, "channel {channel}");
+        let loaded = load(&text, 0).unwrap();
+        assert_eq!(loaded.profile.seconds().len(), 2, "play keeps its length");
+        assert_eq!(loaded.chart.meta.length, TimeUs(888_888));
+    }
+    assert_eq!(preview(NINE).seconds().len(), 2);
+}
+
+/// Fixture SC: the preview's rows carry `#SCROLLxx`'s factors at channel
+/// `SC`'s times; an undefined id changes nothing; the play profile and the
+/// play chart read no scroll.
+#[test]
+fn scroll_changes_reach_the_preview_rows() {
+    let text = "#BPM 120\n#SCROLL01 0.5\n#SCROLL02 2\n\
+         #00011:01010101\n#000SC:0001\n#00111:01\n#001SC:0203\n#00211:01\n";
+    let one = bms_model::SCROLL_ONE;
+    let at = |ms, scroll| bms_model::SpeedRow {
+        ms,
+        tempo: Some(Tempo::from_milli(120_000).unwrap()),
+        scroll,
+    };
+    assert_eq!(
+        preview(text).speeds(),
+        [
+            at(0, one),
+            at(1_000, one / 2),
+            at(2_000, 2 * one),
+            at(4_000, 2 * one)
+        ]
+    );
+    let loaded = load(text, 0).unwrap();
+    assert_eq!(loaded.profile.speeds(), [at(0, one), at(4_000, one)]);
+    let plain = "#BPM 120\n#00011:01010101\n#00111:01\n#00211:01\n";
+    assert_eq!(
+        load(plain, 0).unwrap().chart.identity.resolved_hash,
+        loaded.chart.identity.resolved_hash,
+        "the play chart is the same without them"
+    );
+}
+
+/// The preview's objects are timed apart: one past the duration cap
+/// leaves the preview as the play chart's, and the chart still loads.
+#[test]
+fn a_preview_object_past_the_cap_is_left_out() {
+    // 999 measures of 4 s at 60 BPM pass the 60-minute cap.
+    let text = "#BPM 60
+#00011:01
+#99904:01
+";
+    let scanned = read_scanned(text.as_bytes(), &Limits::default()).unwrap();
+    assert!(scanned.summary.is_ok());
+    assert_eq!(scanned.profile.unwrap().seconds().len(), 2);
+    assert!(load(text, 0).is_ok());
+}

@@ -42,7 +42,11 @@ pub enum MainError {
 /// head, and a long note's end when the chart declares CN or HCN; mines
 /// count nothing, and invisible notes and background sounds are not notes.
 /// The heaviest tempo wins, a tie going to the one weighted first in row
-/// order, and without any weight it is the initial tempo.
+/// order; `None` when no note weighs anything (a chart of mines alone),
+/// which a play takes as its initial tempo and a song list as no MAIN.
+/// The tie rule is tapestry's: the reference player takes the order of
+/// its hash map, which is no rule of its own (design.md "Design
+/// Principles", rules, not byproducts).
 ///
 /// # Errors
 ///
@@ -52,7 +56,7 @@ pub fn main_tempo(
     chart: &Chart,
     keep: impl Fn(&Note) -> bool,
     limit: usize,
-) -> Result<Tempo, MainError> {
+) -> Result<Option<Tempo>, MainError> {
     let timeline = &chart.timeline;
     let runs = timeline.points().chunk_by(|a, b| a.tempo == b.tempo);
     // Every distinct tempo of the rows has a bin; the runs bound them.
@@ -103,7 +107,7 @@ pub fn main_tempo(
         .iter()
         .filter(|b| b.weight > 0)
         .min_by_key(|b| (std::cmp::Reverse(b.weight), b.earliest));
-    Ok(heaviest.map_or(timeline.meta().initial, |b| b.tempo))
+    Ok(heaviest.map(|b| b.tempo))
 }
 
 #[cfg(test)]
@@ -129,7 +133,9 @@ mod tests {
     }
 
     fn main(chart: &Chart) -> Tempo {
-        main_tempo(chart, |_| true, MAIN_HISTOGRAM_LIMIT).unwrap()
+        main_tempo(chart, |_| true, MAIN_HISTOGRAM_LIMIT)
+            .unwrap()
+            .unwrap()
     }
 
     /// Fixture C: the most-noted tempo.
@@ -144,8 +150,8 @@ mod tests {
         assert_eq!(main(&chart(10, 10)), tempo(150));
     }
 
-    /// Fixture M: mines weigh nothing, so a chart of mines alone has the
-    /// initial tempo.
+    /// Fixture M: mines weigh nothing, so a chart of mines alone has no
+    /// MAIN.
     #[test]
     fn mines_alone_give_the_initial_tempo() {
         let lane = Lane::new(1).unwrap();
@@ -156,7 +162,7 @@ mod tests {
             .mine(lane, TimeUs(1_300_000), 1)
             .build()
             .unwrap();
-        assert_eq!(main(&chart), tempo(150));
+        assert_eq!(main_tempo(&chart, |_| true, MAIN_HISTOGRAM_LIMIT), Ok(None));
     }
 
     /// The notes `keep` refuses weigh nothing.
@@ -168,7 +174,7 @@ mod tests {
             |n| n.time < TimeUs(10_000_000),
             MAIN_HISTOGRAM_LIMIT,
         );
-        assert_eq!(early, Ok(tempo(150)));
+        assert_eq!(early, Ok(Some(tempo(150))));
     }
 
     /// A histogram past its limit is refused before it is allocated.

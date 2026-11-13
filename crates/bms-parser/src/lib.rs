@@ -163,6 +163,7 @@ mod error;
 mod hash;
 mod header;
 mod parse;
+mod preview;
 mod resolve;
 mod sound;
 mod timing;
@@ -295,7 +296,7 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
     }
     let mut warnings = Vec::new();
     let text = decode(bytes, &mut warnings);
-    build(&text, Some((bytes, chart_dir)), opts, warnings)
+    build(&text, Some((bytes, chart_dir)), opts, warnings, false).map(|(loaded, _)| loaded)
 }
 
 /// A chart's listing and, as far as the loader takes its seed-0 branch, its
@@ -315,13 +316,14 @@ pub struct Scanned {
     /// The seed-0 branch's labels, from which a song list keeps the image
     /// names; none when the branch is refused.
     pub labels: Option<Labels>,
-    /// The seed-0 branch's profile at 1×, from which a song list previews
-    /// its densities and graphs; none when the branch is refused.
+    /// The seed-0 branch's preview profile at 1×
+    /// ([`ChartProfile::preview`]), from which a song list previews its
+    /// densities and graphs; none when the branch is refused.
     pub profile: Option<ChartProfile>,
     /// The seed-0 branch's MAIN tempo ([`bms_model::main_tempo`], every
-    /// note weighed); none when the branch is refused or the histogram was
-    /// not allocated.
-    pub main: Option<bms_model::Tempo>,
+    /// note weighed): `Some(None)` when no note weighs anything; none when
+    /// the branch is refused or the histogram was not allocated.
+    pub main: Option<Option<bms_model::Tempo>>,
 }
 
 /// Reads what a song list stores of a chart: [`read_listing`] and
@@ -336,8 +338,9 @@ pub fn read_scanned(bytes: &[u8], limits: &Limits) -> Result<Scanned, LoadError>
         return Err(LoadError::FileTooLarge { bytes: bytes.len() });
     }
     let text = decode(bytes, &mut Vec::new());
-    let (summary, judgment_headers, labels, profile, main) = match built_at_1x(&text, limits) {
-        Ok(loaded) => {
+    let built = built_at_1x(text.as_ref(), limits, true);
+    let (summary, judgment_headers, labels, profile, main) = match built {
+        Ok((loaded, preview)) => {
             let summary = ChartSummary::of(&loaded.chart);
             let main =
                 bms_model::main_tempo(&loaded.chart, |_| true, bms_model::MAIN_HISTOGRAM_LIMIT)
@@ -346,7 +349,7 @@ pub fn read_scanned(bytes: &[u8], limits: &Limits) -> Result<Scanned, LoadError>
                 Ok(summary),
                 loaded.chart.meta.judgment_headers,
                 Some(loaded.labels),
-                Some(loaded.profile),
+                preview,
                 main,
             )
         }
@@ -379,29 +382,39 @@ pub fn summarize(bytes: &[u8], limits: &Limits) -> Result<ChartSummary, LoadErro
 }
 
 fn summary_of(text: &str, limits: &Limits) -> Result<ChartSummary, LoadError> {
-    built_at_1x(text, limits).map(|loaded| ChartSummary::of(&loaded.chart))
+    built_at_1x(text, limits, false).map(|(loaded, _)| ChartSummary::of(&loaded.chart))
 }
 
 /// The seed-0 branch at 1×, with no file system ([`summarize`]).
-fn built_at_1x(text: &str, limits: &Limits) -> Result<Loaded, LoadError> {
+/// With `preview`, also the branch's preview profile.
+fn built_at_1x(
+    text: &str,
+    limits: &Limits,
+    preview: bool,
+) -> Result<(Loaded, Option<ChartProfile>), LoadError> {
     let opts = LoadOptions {
         limits: *limits,
         ..LoadOptions::default()
     };
-    build(text, None, &opts, Vec::new())
+    build(text, None, &opts, Vec::new(), preview)
 }
 
 /// [`load_bms`]'s pipeline over the decoded `text`. `files` gives the file's
 /// bytes and folder, from which its hashes and its sounds' paths come; with
-/// none the chart has neither, which [`summarize`] does not read.
+/// none the chart has neither, which [`summarize`] does not read. With
+/// `preview`, also the preview profile at 1× ([`ChartProfile::preview`]),
+/// its objects timed apart ([`preview::inputs`]); one whose timing fails is
+/// the play chart's.
 fn build(
     text: &str,
     files: Option<(&[u8], &Path)>,
     opts: &LoadOptions,
     mut warnings: Vec<Warning>,
-) -> Result<Loaded, LoadError> {
+    preview: bool,
+) -> Result<(Loaded, Option<ChartProfile>), LoadError> {
     let limits = &opts.limits;
     let mut source = parse::parse(text, limits, opts.seed, &mut warnings)?;
+    let inputs = preview.then(|| preview::inputs(&source, limits).unwrap_or_default());
     let mut timeline = timing::compute(&source, limits, opts.speed, &mut warnings)?;
 
     let dir = match files {
@@ -501,6 +514,7 @@ fn build(
     chart.meta.length = bms_model::ChartSummary::of(&chart).length;
     // Before the remap below: the only point that holds the 1× times.
     let profile = ChartProfile::of(&chart, &long_stops);
+    let shown = inputs.map(|i| ChartProfile::preview(&chart, &long_stops, &i));
     drop(long_stops);
     if files.is_some() {
         chart.identity.resolved_hash = hash::resolved_hash(&chart);
@@ -533,12 +547,15 @@ fn build(
             .map_err(|e| LoadError::Links(Box::new(e)))?;
         chart.identity.played_hash = hash::played_hash(&chart, opts.speed);
     }
-    Ok(Loaded {
-        chart,
-        labels,
-        profile,
-        warnings,
-    })
+    Ok((
+        Loaded {
+            chart,
+            labels,
+            profile,
+            warnings,
+        },
+        shown,
+    ))
 }
 
 /// Decodes the text in the encoding of the "Text encoding" rule, warning with

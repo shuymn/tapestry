@@ -39,7 +39,10 @@ pub struct ChartInfoView {
     pub density_average_hundredths: i32,
     /// The gauge total ([`gauge_total`]), truncated.
     pub total: i32,
-    /// The MAIN tempo in whole BPM truncated; `None` without one.
+    /// The MAIN tempo in whole BPM truncated, 0 when no note weighs
+    /// anything (a chart of mines alone), as the reference's song
+    /// information leaves it; `None` when it was unavailable (its histogram
+    /// was not allocated).
     pub main_bpm: Option<i32>,
 }
 
@@ -116,10 +119,15 @@ pub fn border_start(notes: u32, total: f64) -> i64 {
 }
 
 impl ChartInfoView {
-    /// The view of the chart whose seed-0 branch has `profile`, the
-    /// judgment `headers` and the MAIN tempo `main`.
+    /// The view of the chart whose seed-0 branch has the preview `profile`,
+    /// the judgment `headers` and the MAIN tempo `main` (as
+    /// [`bms_parser::Scanned::main`]).
     #[must_use]
-    pub fn of(profile: &ChartProfile, headers: &[JudgmentHeader], main: Option<Tempo>) -> Self {
+    pub fn of(
+        profile: &ChartProfile,
+        headers: &[JudgmentHeader],
+        main: Option<Option<Tempo>>,
+    ) -> Self {
         let mut total = 0.0;
         let info = ChartInfo::analyze(profile, |notes| {
             total = gauge_total(headers, notes);
@@ -148,7 +156,8 @@ impl ChartInfoView {
             density_average,
             density_average_hundredths,
             total: java_int(total),
-            main_bpm: main.map(|t| i32::try_from(t.units() / one).unwrap_or(i32::MAX)),
+            main_bpm: main
+                .map(|m| m.map_or(0, |t| i32::try_from(t.units() / one).unwrap_or(i32::MAX))),
         }
     }
 }

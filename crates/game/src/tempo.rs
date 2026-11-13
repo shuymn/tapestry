@@ -174,13 +174,15 @@ pub(crate) fn whole_main(chart: &Chart, limit: usize) -> Result<Tempo, Reference
 }
 
 /// MAIN's tempo ([`AttemptTempo::prepare_within`]): the chart's
-/// ([`bms_model::main_tempo`]), weighed by the section's targets only.
+/// ([`bms_model::main_tempo`]), weighed by the section's targets only, and
+/// the initial tempo when nothing weighs.
 fn main(chart: &Chart, section: Option<&Section>, limit: usize) -> Result<Tempo, ReferenceError> {
     let keep = |note: &bms_model::Note| section.is_none_or(|s| s.is_target(note));
-    bms_model::main_tempo(chart, keep, limit).map_err(|e| match e {
+    let main = bms_model::main_tempo(chart, keep, limit).map_err(|e| match e {
         MainError::Histogram { needed, limit } => ReferenceError::Histogram { needed, limit },
         MainError::Link(row) => ReferenceError::Link(row),
-    })
+    })?;
+    Ok(main.unwrap_or(chart.timeline.meta().initial))
 }
 
 #[cfg(test)]

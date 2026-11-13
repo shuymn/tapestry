@@ -520,7 +520,7 @@ fn read_chart(root: i64, path: String, limits: &Limits, options: &ScanOptions) -
         profile: scanned
             .profile
             .as_ref()
-            .and_then(crate::stored_profile::encode),
+            .and_then(|p| crate::stored_profile::encode(p, scanned.main)),
     })
 }
 

@@ -1033,3 +1033,49 @@ fn schema_9_reads_previews_again() {
     assert_eq!(entry.info.map(|i| i.density_peak), Some(13));
     assert!(lib.profile(&entry).unwrap().is_some());
 }
+
+/// Fixture C: the exact MAIN reaches the stored profile, a fractional one
+/// included, while number 92 shows it truncated; a chart of mines alone
+/// stores none weighted and shows 0.
+#[test]
+fn the_exact_main_tempo_is_stored() {
+    let fx = Fixture::new();
+    fx.write("c/c.bms", b"#BPM 180.5\n#00011:01010101\n");
+    fx.write("m/m.bms", b"#BPM 150\n#000D1:010101\n");
+    let (lib, _) = fx.open();
+    scan(&lib, std::slice::from_ref(&fx.root));
+    let entries = lib.charts().unwrap();
+    let main = |name: &str| {
+        let entry = entries.iter().find(|e| e.path.ends_with(name)).unwrap();
+        let stored = lib.profile(entry).unwrap().unwrap().main;
+        (entry.info.unwrap().main_bpm, stored)
+    };
+    let exact = bms_model::Tempo::from_milli(180_500).unwrap();
+    assert_eq!(main("c.bms"), (Some(180), Some(Some(exact))));
+    assert_eq!(main("m.bms"), (Some(0), Some(None)));
+}
+
+/// Fixtures H and SC through the scan: a hidden note lengthens the stored
+/// bins, and the stored rows carry the scroll factor.
+#[test]
+fn the_scan_stores_the_preview_profile() {
+    let fx = Fixture::new();
+    fx.write(
+        "h.bms",
+        b"#BPM 240\n#00011:010101010101010101\n#00431:0001000000\n#SCROLL01 0.5\n#001SC:01\n",
+    );
+    let (lib, _) = fx.open();
+    scan(&lib, std::slice::from_ref(&fx.root));
+    let entry = lib.charts().unwrap().remove(0);
+    let info = entry.info.unwrap();
+    assert_eq!(
+        (info.density_average, info.density_average_hundredths),
+        (1, 50)
+    );
+    let stored = lib.profile(&entry).unwrap().unwrap();
+    assert_eq!(stored.bins.len(), 6);
+    let rows = stored.rows.unwrap();
+    assert_eq!(rows[1].ms, 1_000);
+    assert_eq!(rows[1].scroll, bms_model::SCROLL_ONE / 2);
+    assert_eq!(rows.last().unwrap().ms, 4_200);
+}

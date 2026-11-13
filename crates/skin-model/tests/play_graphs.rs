@@ -482,7 +482,11 @@ fn tempo_chart() -> (Chart, ChartProfile) {
 #[test]
 fn the_bpm_graph_draws_the_sources_strokes() {
     let (chart, profile) = tempo_chart();
-    let row = |ms, t| bms_model::SpeedRow { ms, tempo: t };
+    let row = |ms, t| bms_model::SpeedRow {
+        ms,
+        tempo: t,
+        scroll: bms_model::SCROLL_ONE,
+    };
     assert_eq!(
         profile.speeds(),
         [

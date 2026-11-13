@@ -211,3 +211,54 @@ fn a_declared_total_is_its_nearest_double() {
     // Not positive: the default.
     assert_eq!(gauge_total(&[total(0)], 28).to_bits(), 260.0_f64.to_bits());
 }
+
+/// Fixture E600: `#TOTAL 600` starts the border at 5 for 6 notes; counting
+/// the three mines of second 0, it is reached there, so the window is two
+/// seconds, 6 / 2 = 3.00. Without the mines it would be second 1: 2.00.
+#[test]
+fn mines_count_down_the_border() {
+    let b = taps(&[4, 2])
+        .mine(lane(5), TimeUs(500_000), 1)
+        .mine(lane(6), TimeUs(500_000), 1)
+        .mine(lane(7), TimeUs(500_000), 1);
+    let v = view(b, &[total(600 * ONE)]);
+    assert_eq!((v.density_end, v.density_end_hundredths), (3, 0));
+}
+
+/// Fixture T31291: 31 291 notes and no `#TOTAL` give 745.0238…, whose
+/// border start in `double` is 27 090, reached in second 0, so the window
+/// is three seconds: 31 291 / 3 = 10 430.33. The exact quotient would
+/// start it at 27 091, reached in second 1: 4 201 / 2 = 2 100.50.
+#[test]
+fn the_default_total_is_a_double() {
+    let v = view(taps(&[27_090, 1, 4_200]), &[]);
+    assert_eq!(v.total, 745);
+    assert_eq!((v.density_end, v.density_end_hundredths), (10_430, 33));
+}
+
+/// Fixture T200: `#TOTAL 199.99999999999999999` is 200.0 as a `double`, so
+/// it shows 200, where play's thousandths show 199.
+#[test]
+fn a_declared_total_shows_its_double() {
+    let declared = total(200 * ONE - 10);
+    assert_eq!(view(taps(&[10]), &[declared]).total, 200);
+}
+
+/// Fixture M: a chart of mines alone weighs no tempo, so its MAIN shows 0,
+/// as the reference's song information leaves it; an unavailable MAIN
+/// shows nothing.
+#[test]
+fn no_weighted_note_shows_main_zero() {
+    let mut chart = ChartBuilder::new(150_000)
+        .mine(lane(1), TimeUs(100_000), 1)
+        .mine(lane(1), TimeUs(200_000), 1)
+        .mine(lane(1), TimeUs(300_000), 1)
+        .build()
+        .unwrap();
+    chart.meta.length = ChartSummary::of(&chart).length;
+    let main = main_tempo(&chart, |_| true, MAIN_HISTOGRAM_LIMIT).ok();
+    assert_eq!(main, Some(None));
+    let profile = ChartProfile::of(&chart, &[]);
+    assert_eq!(ChartInfoView::of(&profile, &[], main).main_bpm, Some(0));
+    assert_eq!(ChartInfoView::of(&profile, &[], None).main_bpm, None);
+}
