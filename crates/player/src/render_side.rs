@@ -3175,13 +3175,7 @@ impl RenderLink {
         lifetime: u64,
     ) -> Option<(usize, render::Gen, skin_model::DecisionTiming)> {
         let mut book = render::lock(&self.shared.labels);
-        // The slot the pin takes: the first ready one of that revision.
-        let (slot, generation) = (0..render::LABEL_SLOTS).find_map(|i| match book.state(i) {
-            Some(render::LabelState::Ready {
-                generation, key, ..
-            }) if key.chart == chart && key.revision == revision => Some((i, *generation)),
-            _ => None,
-        })?;
+        let (slot, generation) = ready_slot(&book, chart, revision)?;
         if !crate::decision_side::prepared_holds(&self.shared.prepared, slot, generation, strings) {
             return None;
         }
@@ -3204,13 +3198,8 @@ impl RenderLink {
         if !book.healthy() {
             return false;
         }
-        (0..render::LABEL_SLOTS).any(|i| match book.state(i) {
-            Some(render::LabelState::Ready {
-                generation, key, ..
-            }) if key.chart == chart && key.revision == revision => {
-                crate::decision_side::prepared_holds(&self.shared.prepared, i, *generation, strings)
-            }
-            _ => false,
+        ready_slot(&book, chart, revision).is_some_and(|(slot, generation)| {
+            crate::decision_side::prepared_holds(&self.shared.prepared, slot, generation, strings)
         })
     }
 
@@ -3519,6 +3508,24 @@ impl crate::result_present::Publish for RenderLink {
     fn origin(&self) -> Option<TimeUs> {
         self.presented_origin()
     }
+}
+
+/// The slot [`LabelBook::pin`](render::LabelBook::pin) takes for `chart`'s
+/// labels of `revision` in `book`: the first ready one holding them, and
+/// its generation. The choice ([`RenderLink::pin_decision`]) and its
+/// readiness ([`RenderLink::decision_ready`]) check the prepared strings on
+/// this slot, so both answer for the same one.
+fn ready_slot(
+    book: &render::LabelBook,
+    chart: &std::path::Path,
+    revision: u64,
+) -> Option<(usize, render::Gen)> {
+    (0..render::LABEL_SLOTS).find_map(|i| match book.state(i) {
+        Some(render::LabelState::Ready {
+            generation, key, ..
+        }) if key.chart == chart && key.revision == revision => Some((i, *generation)),
+        _ => None,
+    })
 }
 
 /// A chart's load the render thread was asked for ([`RenderLink::begin_load`]).

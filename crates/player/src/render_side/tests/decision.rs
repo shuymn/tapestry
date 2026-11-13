@@ -1106,6 +1106,54 @@ fn labels_not_ready_at_the_choice_per_key_part() {
     assert!(lock(&book).pin(Path::new("a"), revision, 1).is_some());
 }
 
+/// The choice's readiness and its pin answer for the same slot: the first
+/// ready one of the chart's key, as the book pins it. With two ready slots
+/// for one key, a later slot prepared from the chart's strings does not make
+/// the choice ready while the first was prepared from others (equal digests
+/// of other labels).
+#[test]
+fn readiness_checks_the_slot_the_pin_takes() {
+    let rig = Rig::bare(crate::warp_turn::take(), input::QpcClock::start());
+    let chart = Path::new("a");
+    let revision = labels_revision(&labels("A"));
+    let ours = want("a", "A").unwrap().strings;
+    let others = want("a", "B").unwrap().strings;
+    let slots = {
+        let mut book = lock(&rig.book);
+        let target = book.current().0;
+        [1, 2].map(|generation| {
+            let key = render::LabelKey {
+                chart: chart.to_owned(),
+                revision,
+                target,
+            };
+            let slot = book
+                .claim(generation, key, DecisionTiming::default())
+                .expect("a free slot");
+            assert_eq!(book.publish(slot, generation), render::Publish::Published);
+            (slot, generation)
+        })
+    };
+    assert_eq!(slots.map(|(slot, _)| slot), [0, 1]);
+    let prepare = |first: &skin_model::DecisionStrings| {
+        *rig.link.shared.prepared.lock().unwrap() =
+            [Some((1, first.clone())), Some((2, ours.clone()))];
+    };
+    prepare(&others);
+    assert!(
+        !rig.link.decision_ready(chart, revision, &ours),
+        "ready on the later slot"
+    );
+    assert_eq!(rig.link.pin_decision(chart, revision, &ours, 1), None);
+    prepare(&ours);
+    assert!(rig.link.decision_ready(chart, revision, &ours));
+    let (slot, generation, _) = rig
+        .link
+        .pin_decision(chart, revision, &ours, 1)
+        .expect("the first slot pinned");
+    assert_eq!((slot, generation), (0, 1));
+}
+
 /// R0.1 (C12): each key part's own event re-schedules without a cursor
 /// move: a scan replacing the chart under the cursor (same labels, another
 /// path), a scan updating its labels (same path), a resize, a rebuild;
