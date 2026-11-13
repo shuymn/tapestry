@@ -536,11 +536,12 @@ pub const IN_PLAY: &[Site] = &[
         ],
     ),
     // A skinned decision frame: its timers from the choice and its build
-    // from the pinned slot's labels; the label preparation's boundary
-    // work in the same file runs beside the frames.
+    // from the pinned slot's labels, read through `DecisionSide::store`;
+    // the label preparation's boundary work in the same file runs
+    // beside the frames.
     Site::Fns(
         "crates/player/src/decision_side.rs",
-        &["decision_frame_of", "decision_build"],
+        &["decision_frame_of", "decision_build", "DecisionSide::store"],
     ),
     // The selection frame's timers, the lifetime check before the
     // frame's build and the live settings.
