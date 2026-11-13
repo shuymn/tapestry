@@ -3153,11 +3153,14 @@ impl Renderer {
 
     /// The seams of a chart write: `refuse`, and the test fault, taken.
     fn chart_seams(&mut self, refuse: bool) -> ChartSeams {
-        #[cfg(test)]
-        let fault = self.chart_fault.take();
-        #[cfg(not(test))]
-        let fault = None;
-        ChartSeams { refuse, fault }
+        #[cfg(not(any(test, feature = "dev-tools")))]
+        let _ = refuse;
+        ChartSeams {
+            #[cfg(any(test, feature = "dev-tools"))]
+            refuse,
+            #[cfg(test)]
+            fault: self.chart_fault.take(),
+        }
     }
 
     /// The live key of the selection kind's committed array, as
@@ -5459,10 +5462,12 @@ fn finish_uploads(gpu: &Gpu) -> Result<(), RenderError> {
 
 /// Test and development seams of [`write_chart_set`]: a refusal of the
 /// write as a misfit, and a fault run inside the write's error scope.
-/// Neither is ever set in a production build.
+/// Neither exists in a production build.
 #[derive(Clone, Copy)]
 struct ChartSeams {
+    #[cfg(any(test, feature = "dev-tools"))]
     refuse: bool,
+    #[cfg(test)]
     fault: Option<fn(&Gpu)>,
 }
 
@@ -5488,6 +5493,8 @@ fn write_chart_set(
     seams: ChartSeams,
 ) -> Result<(skin_model::chart_image::ChartTable, bool), RenderError> {
     use skin_model::chart_image::{ChartImage, ChartKey, ChartTable, ChartUv};
+    #[cfg(not(any(test, feature = "dev-tools")))]
+    let _ = seams;
     let bundle = installation.bundle();
     let (Some(layer), Some(at)) = (bundle.chart_layer(), atlas.chart_layer()) else {
         return Err(RenderError::NoChartLayer);
@@ -5523,6 +5530,7 @@ fn write_chart_set(
         return Ok((table, false));
     }
     atlas.set_chart_set(None);
+    #[cfg(any(test, feature = "dev-tools"))]
     if seams.refuse {
         return Err(RenderError::ChartImage {
             which: ChartImage::Stage,
@@ -5546,6 +5554,7 @@ fn write_chart_set(
                     bytes,
                 );
             }
+            #[cfg(test)]
             if let Some(fault) = seams.fault {
                 fault(gpu);
             }
