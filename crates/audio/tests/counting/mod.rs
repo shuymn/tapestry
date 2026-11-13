@@ -1,5 +1,5 @@
 //! A counting global allocator for allocation tests. It counts allocations
-//! made on threads that opted in (a thread-local flag), so the test
+//! and frees made on threads that opted in (a thread-local flag), so the test
 //! harness's own threads do not disturb the count. Each test binary
 //! registers it with `#[global_allocator]` and calls [`self_check`] where
 //! it starts tracking.
@@ -18,6 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 pub struct Counting;
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
+static FREES: AtomicU64 = AtomicU64::new(0);
 static WATCH_ALL: AtomicBool = AtomicBool::new(false);
 static LARGEST: AtomicU64 = AtomicU64::new(0);
 
@@ -37,6 +38,11 @@ pub fn track(on: bool) {
 /// Allocations counted so far.
 pub fn allocations() -> u64 {
     ALLOCS.load(Ordering::Relaxed)
+}
+
+/// Frees counted so far.
+pub fn frees() -> u64 {
+    FREES.load(Ordering::Relaxed)
 }
 
 /// Starts measuring this thread's peak from the bytes live now.
@@ -75,14 +81,20 @@ pub fn largest() -> u64 {
 
 /// The positive control, called while this thread is tracked: one
 /// allocation that escapes through `black_box`, so no profile elides it,
-/// must be counted. It is taken back out of the count, so a test's bound
-/// stays zero, and a build whose count never moves fails here instead of
-/// passing.
+/// and its free must be counted. They are taken back out of the counts, so
+/// a test's bound stays zero, and a build whose counts never move fails
+/// here instead of passing.
 pub fn self_check() {
-    let before = allocations();
+    let (allocated, freed) = (allocations(), frees());
     drop(std::hint::black_box(vec![1u8; 8]));
-    assert_eq!(allocations() - before, 1, "the allocation was not counted");
+    assert_eq!(
+        allocations() - allocated,
+        1,
+        "the allocation was not counted"
+    );
+    assert_eq!(frees() - freed, 1, "the free was not counted");
     ALLOCS.fetch_sub(1, Ordering::Relaxed);
+    FREES.fetch_sub(1, Ordering::Relaxed);
 }
 
 fn note(size: usize) {
@@ -115,6 +127,9 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if TRACK.try_with(Cell::get).unwrap_or(false) {
+            FREES.fetch_add(1, Ordering::Relaxed);
+        }
         freed(layout.size());
         // SAFETY: same contract as the caller's.
         unsafe { System.dealloc(ptr, layout) }
