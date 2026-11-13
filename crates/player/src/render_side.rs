@@ -5412,10 +5412,6 @@ impl Run {
                 }
                 Ok(RenderMsg::SelectionChanged) => {
                     self.clear_decision();
-                    #[cfg(feature = "dev-tools")]
-                    {
-                        self.pending_decision = None;
-                    }
                     self.take_selection();
                     mode = match mode {
                         // The launch screen shows out its time, the
