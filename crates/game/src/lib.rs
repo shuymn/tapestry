@@ -78,7 +78,7 @@ pub use decision::{
     DECISION_TIME, Decision, DecisionLifetime, DecisionShown, DecisionTakeover, Origin, Reply,
     Served, Verdict,
 };
-pub use driver::{AdjustDriver, IngressDrain, InputFailureCell, InputPump};
+pub use driver::{AdjustDriver, CoverRefused, IngressDrain, InputFailureCell, InputPump};
 pub use error::{Chain, IoFailure};
 pub use eval::TABLE_BYTES_PER_OBJECT;
 pub use hispeed::{
