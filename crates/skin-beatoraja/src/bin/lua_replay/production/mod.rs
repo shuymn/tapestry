@@ -7,7 +7,6 @@
 //! reference gets only the frames' inputs ([`FrameInputs`]).
 
 pub mod compare;
-pub mod continuation;
 #[cfg(test)]
 mod readouts_tests;
 
@@ -23,7 +22,6 @@ use skin_model::{
     Side, Skin, SkinFrame, Variant, field, loading_field,
 };
 
-use self::continuation::{Carried, Model};
 use crate::inputs::FrameInputs;
 use crate::script::{End, Phase, STEP, Script};
 
@@ -32,26 +30,6 @@ thread_local! {
     /// A test's offset of the score input's EX score: a wrong model of
     /// the source's score data, which the record loop must refuse.
     pub static SCORE_SKEW: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
-}
-
-#[cfg(test)]
-thread_local! {
-    /// Whether a test drops the carried score data from each round's
-    /// offer: a wrong model of the player's carry, which the record loop
-    /// must refuse at a carried round's first frame.
-    pub static DROP_SCORE_CARRY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-/// The round's offer: the model's, its score data dropped by a test.
-fn offer(model: &Model) -> skin_model::Continuation<'_> {
-    let offer = model.offer();
-    #[cfg(test)]
-    if DROP_SCORE_CARRY.with(std::cell::Cell::get)
-        && let skin_model::Continuation::Carried { bank, .. } = offer
-    {
-        return skin_model::Continuation::Carried { score: None, bank };
-    }
-    offer
 }
 
 #[cfg(test)]
@@ -164,11 +142,7 @@ pub enum Stage {
 /// builds no play frame for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::production) enum FrameKind {
-    Play {
-        round: usize,
-        stage: Stage,
-        carried: Carried,
-    },
+    Play { round: usize, stage: Stage },
     Loading,
     Page,
 }
@@ -209,13 +183,9 @@ pub(in crate::production) struct FrameTrace {
     pub(in crate::production) timers: Vec<i32>,
 }
 
-/// One round as production played it: what it took over and the witness
-/// its `Play` showed at its end.
+/// One round as production played it.
 #[derive(Clone, Copy, Debug)]
 pub(in crate::production) struct RoundTrace {
-    pub(in crate::production) carried: Carried,
-    pub(in crate::production) slots_run: bool,
-    pub(in crate::production) terminal: bool,
     /// Its replayed ending was cut ([`crate::script::ENDING_SPAN`]).
     pub(in crate::production) ending_cut: bool,
 }
@@ -232,7 +202,6 @@ pub struct ProductionRun {
     pub(in crate::production) structure: String,
     /// Per callback, whether it loads or stores a slot.
     pub(in crate::production) slotted: Vec<bool>,
-    pub(in crate::production) carry_safe: bool,
     pub(in crate::production) rounds: Vec<RoundTrace>,
 }
 
@@ -281,7 +250,8 @@ fn loading_allowed(level: bool) -> Vec<bool> {
         .collect()
 }
 
-/// The fields a page frame's host answers: the point only.
+/// The fields a page frame's host answers: the point only, 0 there as the
+/// next round's fresh score data holds it.
 fn page_allowed() -> Vec<bool> {
     (0..field::COUNT)
         .map(|slot| u16::try_from(slot).is_ok_and(|s| s == field::POINT))
@@ -290,8 +260,8 @@ fn page_allowed() -> Vec<bool> {
 
 /// Plays `script` over `skin`, as production imported it, recording
 /// each frame: the run and the frames' inputs. Each round is prepared
-/// with what the harness's model of the carry offers
-/// (s7-06e-2-design.md §4).
+/// fresh, as every attempt is, and its first frame's inputs start a fresh
+/// reference ([`FrameInputs::starts_round`]).
 ///
 /// # Errors
 ///
@@ -328,8 +298,6 @@ pub fn record(
         finish_margin: declared.finish_margin,
         fadeout: declared.fadeout,
     };
-    let carry_safe = skin.program_carry_safe();
-    let mut model = Model::default();
     let mut frames = Vec::new();
     let mut inputs = Vec::new();
     let mut rounds = Vec::new();
@@ -404,10 +372,7 @@ pub fn record(
                     clock += len_us;
                 }
                 Phase::Page { len_us } => {
-                    let mut fields = vec![0; field::COUNT];
-                    if let Some(p) = fields.get_mut(usize::from(field::POINT)) {
-                        *p = model.score().map_or(0, |s| s.point);
-                    }
+                    let fields = vec![0; field::COUNT];
                     let mut t = 0;
                     while t < *len_us {
                         let state_us = clock + t;
@@ -460,10 +425,13 @@ pub fn record(
                         play_level,
                         score: play_score(tempo.main),
                     };
-                    let carried = model.carried(carry_safe);
                     let mut play = skin
-                        .prepare_carried(&chart, &ctx, offer(&model))
+                        .prepare(&chart, &ctx)
                         .map_err(|e| format!("prepare: {e:?}"))?;
+                    // Each round's score data starts afresh, as its
+                    // reference's does.
+                    score.set(None);
+                    let mut first = true;
                     let round = rounds.len();
                     let mut rearmed = false;
                     let base = clock;
@@ -484,7 +452,7 @@ pub fn record(
                             );
                         }
                     };
-                    let (tally, took, ending_cut) = r.play(
+                    let (_, took, ending_cut) = r.play(
                         &chart,
                         &preset,
                         r.section.then_some(&section),
@@ -533,14 +501,12 @@ pub fn record(
                             let s = play.state();
                             let fields = s.fields.get(..field::COUNT).unwrap_or(s.fields);
                             let outs = s.fields.get(field::COUNT..).unwrap_or_default().to_vec();
-                            // The score input is the source's score data:
+                            // The score input is the round's score data:
                             // on every play frame production's score fields
-                            // must be it, the carried data before the
-                            // round's first judgment included, and before
-                            // the play state's first judgment the round's
-                            // own for no judgment (s7-06s-design.md §2.5);
-                            // else the harness's model or production's carry
-                            // is wrong.
+                            // must be it, and before the round's first
+                            // judgment the round's own for no judgment;
+                            // else the harness's model or production's
+                            // fresh round is wrong.
                             let want = score.get().or(fresh);
                             let own = [
                                 field::EX_SCORE,
@@ -557,7 +523,8 @@ pub fn record(
                             }
                             inputs.push(
                                 FrameInputs::new(fields, s.timers, state_us)
-                                    .with_score(score.get()),
+                                    .with_score(score.get())
+                                    .starting_round(std::mem::take(&mut first)),
                             );
                             let stage = match (st.closing, ready, st.rearmed) {
                                 (Some(_), _, _) if r.end == End::Fail => Stage::Failed,
@@ -573,25 +540,14 @@ pub fn record(
                                 now,
                                 state_us,
                                 outs,
-                                kind: FrameKind::Play {
-                                    round,
-                                    stage,
-                                    carried,
-                                },
+                                kind: FrameKind::Play { round, stage },
                                 fields: fields.to_vec(),
                                 timers: s.timers.to_vec(),
                             });
                             Ok(())
                         },
                     )?;
-                    let carry = play.carry();
-                    rounds.push(RoundTrace {
-                        carried,
-                        slots_run: carry.slots_run,
-                        terminal: carry.terminal,
-                        ending_cut,
-                    });
-                    model.settle(&tally, &carry, ctx.empty_poor_counted);
+                    rounds.push(RoundTrace { ending_cut });
                     slots = play.state().timers.len();
                     clock = base + took;
                 }
@@ -623,7 +579,6 @@ pub fn record(
             callbacks: skin.program_callbacks(),
             structure: skin.program_structure(),
             slotted: skin.program_slotted(),
-            carry_safe,
             rounds,
         },
         inputs,

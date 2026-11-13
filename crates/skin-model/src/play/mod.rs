@@ -22,7 +22,6 @@ use self::playhead::ExactPlayhead;
 use self::reducer::Reducer;
 use self::rhythm::Rhythm;
 use self::schema::{field, timer};
-use self::timers::Settled;
 use crate::chart_image::{ChartKey, ChartTable};
 use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
@@ -68,32 +67,6 @@ pub enum Attempt<'a> {
     Section(&'a Section),
 }
 
-/// What an attempt takes over from the earlier attempts of its play state
-/// (design.md "beatoraja Lua Skins", the program's state): the source keeps
-/// its skin's state and its score data (the point, the EX score and the
-/// score rates) for as long as its play state lasts (`ScoreDataProperty`
-/// of the `MainState`, not reset at `BMSPlayer.java:582` at `0.8.9`).
-#[derive(Clone, Copy, Debug, Default)]
-pub enum Continuation<'a> {
-    /// The play state's first attempt: the slots at their initial values,
-    /// the score data the attempt's own, the program run.
-    #[default]
-    Fresh,
-    /// A later attempt of the play state: the score data the play state's
-    /// last judgment left, read until this attempt's first judgment
-    /// (`None` before any judgment: the attempt's own, as a fresh one's),
-    /// and the
-    /// slots as the last witnessed run left them, `None` when no such run
-    /// carries them (then the callbacks with slots do not run, their
-    /// timers off). A program that is not
-    /// [`carry_safe`](crate::present::Present::carry_safe) runs no
-    /// callback with slots either.
-    Carried {
-        score: Option<Settled>,
-        bank: Option<&'a crate::present::Bank>,
-    },
-}
-
 /// The target count of `attempt` over `chart`: what its point is over,
 /// whatever the skin (the reducer's rule).
 #[must_use]
@@ -103,17 +76,6 @@ pub fn attempt_targets(chart: &Chart, attempt: &Attempt<'_>) -> u32 {
         Attempt::Section(s) => Some((s.start, s.end)),
     };
     reducer::count_targets(chart, section)
-}
-
-/// What a play's committed attempt gives the next attempt of its play
-/// state: its slots, whether its callbacks with slots ran, whether its last
-/// build ran them on a complete view, and its target count.
-#[derive(Clone, Copy, Debug)]
-pub struct Carry<'a> {
-    pub bank: &'a crate::present::Bank,
-    pub slots_run: bool,
-    pub terminal: bool,
-    pub targets: u32,
 }
 
 /// A play's best and target EX scores, read once when the play began and
@@ -608,10 +570,6 @@ pub enum PrepareError {
         /// Its time.
         at: TimeUs,
     },
-    /// A carried bank that does not fit the program's slots: another
-    /// length, or a value outside its slot's domain.
-    #[error("the carried slots do not fit the skin's program")]
-    Continuation,
 }
 
 /// Why [`Skin::build`](crate::Skin::build) refused a frame. The frame's
@@ -663,20 +621,9 @@ pub struct Play {
     /// The presentation program's slots: fresh at each prepare, kept by
     /// a rearm.
     bank: crate::present::Bank,
-    /// Whether the program's callbacks with slots run: a fresh attempt's,
-    /// or a carried one's with its slots carried and a
-    /// [`carry_safe`](crate::present::Present::carry_safe) program.
-    slots_run: bool,
-    /// The score data the play state's last judgment left (`None` before
-    /// any), which the score fields read until this attempt's first
-    /// judgment.
-    cached: Option<Settled>,
     /// Whether the attempt has had a judgment: a frame's tally was not the
     /// zero tally. A rearm clears it.
     judged: bool,
-    /// Whether the last build ran the callbacks with slots on a complete
-    /// view, so the slots as it left them are the round's last.
-    terminal: bool,
     /// The attempt's exact playhead, which notes, bar lines and the beat
     /// sample; a rearm keeps it.
     playhead: ExactPlayhead,
@@ -897,7 +844,6 @@ impl Play {
     pub(crate) fn new(
         chart: &Chart,
         ctx: &PlayContext<'_>,
-        carry: Continuation<'_>,
         present: Option<&crate::present::Present>,
         whens: usize,
         lanes: bool,
@@ -907,25 +853,8 @@ impl Play {
     ) -> Result<Self, PrepareError> {
         let outputs = present.map_or(0, |p| crate::output::slots(p.len()));
         let timers = whens.saturating_add(present.map_or(0, crate::present::Present::timers));
-        let mut bank =
+        let bank =
             present.map_or_else(crate::present::Bank::default, crate::present::Present::bank);
-        let (slots_run, cached) = match carry {
-            Continuation::Fresh => (true, None),
-            Continuation::Carried { score, bank: None } => (false, score),
-            Continuation::Carried {
-                score,
-                bank: Some(b),
-            } => {
-                if !present.map_or(b.values().is_empty(), |p| p.fits(b)) {
-                    return Err(PrepareError::Continuation);
-                }
-                bank.copy_from(b);
-                (
-                    present.is_none_or(crate::present::Present::carry_safe),
-                    score,
-                )
-            }
-        };
         let (play_at, lead_in, section) = match ctx.attempt {
             Attempt::Full { lead_in } => (TimeUs(0), lead_in, None),
             Attempt::Section(s) => (s.start, s.lead_in, Some(s)),
@@ -995,10 +924,7 @@ impl Play {
             ms: vec![TIMER_OFF; slots].into_boxed_slice(),
             fields: vec![0; field::COUNT.saturating_add(outputs)].into_boxed_slice(),
             bank,
-            slots_run,
-            cached,
             judged: false,
-            terminal: false,
             playhead,
             display: Position(0),
             beat: None,
@@ -1041,12 +967,11 @@ impl Play {
     /// cursor and the first judgment's latch, as a fresh attempt has them.
     /// The chart's notes,
     /// the prepared playhead, the gauges, the attached and bitmap text, the
-    /// program's slots, the cached score data and a refused build stay, and
+    /// program's slots and a refused build stay, and
     /// nothing is allocated.
     pub fn rearm(&mut self) {
         self.reducer.rearm();
         self.judged = false;
-        self.terminal = false;
         self.holds = [None; LANE_COUNT];
         self.starts.fill(None);
         self.ms.fill(TIMER_OFF);
@@ -1141,17 +1066,6 @@ impl Play {
     #[must_use]
     pub fn bank(&self) -> &crate::present::Bank {
         &self.bank
-    }
-
-    /// What the next attempt of the play state takes over from this one.
-    #[must_use]
-    pub fn carry(&self) -> Carry<'_> {
-        Carry {
-            bank: &self.bank,
-            slots_run: self.slots_run,
-            terminal: self.terminal,
-            targets: self.reducer.targets(),
-        }
     }
 
     /// The number of timer slots: built-in, `when` and the program's.
@@ -1584,7 +1498,6 @@ mod tests {
         let mut play = super::Play::new(
             &chart,
             &ctx,
-            super::Continuation::Fresh,
             None,
             0,
             false,

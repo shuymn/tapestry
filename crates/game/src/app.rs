@@ -263,6 +263,13 @@ pub trait AppRig: LoadingRig {
     fn take_preset_step(&mut self) -> Option<PresetStep> {
         None
     }
+    /// When the select screen next has work of its own without input
+    /// (the cursor's rest coming due, or a job of its images waiting to
+    /// begin): the idle wait on the select screen ends there at the
+    /// latest. `None` (the default) when nothing is due.
+    fn selection_wake(&self) -> Option<TimeUs> {
+        None
+    }
 }
 
 /// A chart chosen on the select screen, and what to do with it.
@@ -534,7 +541,8 @@ impl App {
                 }
                 // The user preset files are polled while selection shows,
                 // and the wait ends at the poll deadline at the latest, so a
-                // wake just before it does not put the check off.
+                // wake just before it does not put the check off; and at
+                // the screen's own wake ([`AppRig::selection_wake`]).
                 let now = rig.now();
                 if self.poll(now) | stepped {
                     // A refusal for the shelf that would not open is over
@@ -549,7 +557,10 @@ impl App {
                     rig.presets_changed(self.shelf.as_ref());
                 }
                 let deadline = self.next_poll(now);
-                rig.idle_wait(TimeUs(now.0.saturating_add(IDLE_WAIT.0).min(deadline.0)));
+                let wake = rig.selection_wake().map_or(i64::MAX, |w| w.0);
+                rig.idle_wait(TimeUs(
+                    now.0.saturating_add(IDLE_WAIT.0).min(deadline.0).min(wake),
+                ));
             };
             refusal = None;
             let (chart, practice) = match &pick {

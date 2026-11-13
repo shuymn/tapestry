@@ -913,55 +913,6 @@ fn rates_divide_the_ex_score_by_twice_the_targets() {
     assert_eq!(rates(&h), (10_000, 10_000));
 }
 
-/// s7-06s S5: the score data a settlement keeps is what a frame over the
-/// same final tally reads, under the attempt's empty-POOR rule (one PGREAT
-/// and two POORs, one of them an empty POOR: two judged targets counted,
-/// three not); a tally the build refuses settles nothing.
-#[test]
-fn settled_reads_as_the_last_frame() {
-    let chart = taps(&[1_000, 2_000, 3_000, 4_000]);
-    let tallies = [
-        scored([1, 0, 0, 0, 2], 1, 2),
-        scored([3, 1, 0, 0, 0], 0, 7),
-        scored([0, 0, 1, 1, 0], 2, 0),
-    ];
-    for counted in [false, true] {
-        let ctx = PlayContext {
-            empty_poor_counted: counted,
-            ..full(0)
-        };
-        for t in &tallies {
-            let Some(s) = skin_model::settled(t, 4, counted) else {
-                // Only the counted rule refuses: more empty POORs than POORs.
-                assert!(counted && t.empty_poor > t.counts.poor, "{t:?}");
-                continue;
-            };
-            let mut h = Harness::empty(&chart, &ctx);
-            h.tally = *t;
-            h.frame(2_000, &[]);
-            assert_eq!(
-                s,
-                skin_model::Settled {
-                    point: h.field(field::POINT),
-                    ex_score: h.field(field::EX_SCORE),
-                    rate_current_bp: h.field(field::RATE_CURRENT_BP),
-                    rate_whole_bp: h.field(field::RATE_WHOLE_BP),
-                },
-                "counted {counted}: {t:?}"
-            );
-        }
-    }
-    // The rules differ on the first tally's current rate.
-    let current = |counted| {
-        skin_model::settled(&tallies[0], 4, counted)
-            .unwrap()
-            .rate_current_bp
-    };
-    assert_eq!((current(true), current(false)), (5_000, 3_333));
-    assert_eq!(skin_model::settled(&tallies[2], 4, true), None);
-    assert_eq!(skin_model::settled(&eval::Tally::default(), 4, false), None);
-}
-
 #[test]
 fn a_rate_floors_one_basis_point_value() {
     // 100 taps.

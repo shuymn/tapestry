@@ -94,7 +94,7 @@ fn chart_dir(stage: [u32; 2]) -> tempfile::TempDir {
 fn handed(dir: &Path, side: Option<u32>) -> ResultImages {
     let want = Want {
         dir: dir.to_path_buf(),
-        names: ["stage.png".to_owned(), "back.png".to_owned()],
+        names: ["stage.png".to_owned(), "back.png".to_owned(), String::new()],
         play: None,
         result: side,
     };

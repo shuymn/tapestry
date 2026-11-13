@@ -792,6 +792,131 @@ return skin
     dir
 }
 
+/// The chart images' destinations of [`chart_fixture`] (model rects, y
+/// down) and a point in each: the stage file (−100) and the banner (−102).
+#[cfg(test)]
+#[cfg(feature = "dev-tools")]
+pub(crate) const STAGE_DST: [f32; 4] = [1_000.0, 580.0, 400.0, 300.0];
+#[cfg(test)]
+#[cfg(feature = "dev-tools")]
+pub(crate) const STAGE_AT: [usize; 2] = [1_200, 730];
+#[cfg(test)]
+#[cfg(feature = "dev-tools")]
+pub(crate) const BANNER_DST: [f32; 4] = [1_500.0, 800.0, 300.0, 80.0];
+#[cfg(test)]
+#[cfg(feature = "dev-tools")]
+pub(crate) const BANNER_AT: [usize; 2] = [1_650, 840];
+
+/// The options [`chart_fixture`] reads, in the order of its marks.
+#[cfg(test)]
+#[cfg(feature = "dev-tools")]
+pub(crate) const CHART_OPTIONS: [&str; 6] = ["190", "191", "192", "193", "-191", "-193"];
+
+/// The mark rect of [`chart_fixture`]'s `row` (0: the `op`s, the
+/// import's conditions; 1: the runtime's callbacks reading the option; 2:
+/// the runtime's callbacks reading `not` its opposite) for its `i`th
+/// option of [`CHART_OPTIONS`].
+#[cfg(test)]
+#[cfg(feature = "dev-tools")]
+pub(crate) fn chart_mark(row: usize, i: usize) -> [f32; 4] {
+    let x = 20.0 * f32::from(u8::try_from(i + 1).unwrap());
+    let y = 1_080.0 - 40.0 * f32::from(u8::try_from(row + 1).unwrap()) - 8.0;
+    [x, y, 8.0, 8.0]
+}
+
+/// [`lua_fixture`] with `chart.luaskin`: the stage file (−100) at
+/// [`STAGE_DST`], the banner (−102) at [`BANNER_DST`], and a mark per
+/// option of [`CHART_OPTIONS`] on each row of [`chart_mark`]: under an
+/// `op`, and under two callbacks the runtime runs (an upvalue counts
+/// their calls, so none is lowered), twelve in all, returning the option
+/// and `not` its opposite (dev-tools tests).
+#[cfg(test)]
+#[cfg(feature = "dev-tools")]
+pub(crate) fn chart_fixture() -> tempfile::TempDir {
+    use std::fmt::Write as _;
+    let dir = lua_fixture();
+    let lua = std::fs::read_to_string(dir.path().join("s.luaskin")).unwrap();
+    let mut tail = String::from(
+        r#"local calls = 0
+skin.image[#skin.image + 1] = { id = "m", src = "s", x = 0, y = 0, w = 8, h = 8 }
+local d = skin.destination
+d[#d + 1] = { id = -100, dst = { { x = 1000, y = 200, w = 400, h = 300 } } }
+d[#d + 1] = { id = -102, dst = { { x = 1500, y = 200, w = 300, h = 80 } } }
+"#,
+    );
+    for (i, n) in CHART_OPTIONS.iter().enumerate() {
+        let x = 20 * (i + 1);
+        let opposite = n
+            .strip_prefix('-')
+            .map_or_else(|| format!("-{n}"), str::to_owned);
+        for (row, draw) in [
+            (0, None),
+            (1, Some(format!("calls = calls + 1; return ms.option({n})"))),
+            (
+                2,
+                Some(format!(
+                    "calls = calls + 1; return not ms.option({opposite})"
+                )),
+            ),
+        ] {
+            let y = 40 * (row + 1);
+            let when = draw.map_or_else(
+                || format!("op = {{ {n} }}"),
+                |body| format!("draw = function() {body} end"),
+            );
+            writeln!(
+                tail,
+                "d[#d + 1] = {{ id = \"m\", {when}, dst = {{ {{ x = {x}, y = {y}, w = 8, h = 8 }} }} }}"
+            )
+            .unwrap();
+        }
+    }
+    tail.push_str("return skin\n");
+    let text = lua.replacen("\nreturn skin\n", &format!("\n{tail}"), 1);
+    std::fs::write(dir.path().join("chart.luaskin"), text).unwrap();
+    dir
+}
+
+/// A chart's selection images, a 64×48 stage file of `stage` and, when
+/// `banner` is given, a 60×16 banner of it, read and fitted for a chart
+/// layer of side `side` (dev-tools tests).
+#[cfg(test)]
+#[cfg(feature = "dev-tools")]
+pub(crate) fn selection_images(
+    side: u32,
+    stage: [u8; 3],
+    banner: Option<[u8; 3]>,
+) -> (tempfile::TempDir, Arc<crate::chart_images::ChartImages>) {
+    let png = |path: &std::path::Path, [w, h]: [u32; 2], [r, g, b]: [u8; 3]| {
+        let file = std::fs::File::create(path).unwrap();
+        let mut e = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        e.set_color(png::ColorType::Rgba);
+        e.set_depth(png::BitDepth::Eight);
+        let texels = [r, g, b, 255].repeat(usize::try_from(w * h).unwrap());
+        e.write_header().unwrap().write_image_data(&texels).unwrap();
+    };
+    let d = tempfile::tempdir().unwrap();
+    png(&d.path().join("s.png"), [64, 48], stage);
+    if let Some(banner) = banner {
+        png(&d.path().join("n.png"), [60, 16], banner);
+    }
+    let want = crate::chart_images::Want {
+        dir: d.path().to_owned(),
+        names: [
+            "s.png".to_owned(),
+            String::new(),
+            banner.map_or_else(String::new, |_| "n.png".to_owned()),
+        ],
+        play: None,
+        result: None,
+    };
+    let sources = crate::chart_images::read_sources(&want, None, &|| false);
+    let set = crate::chart_images::derive_set(&sources, side, &|| false).unwrap();
+    let [s, _, n] = set.fitted();
+    assert!(s.is_some() && n.is_some() == banner.is_some(), "{set:?}");
+    (d, Arc::new(set))
+}
+
 /// [`fixture_bundle`], with the runtime the import kept for the screen.
 #[cfg(all(test, feature = "dev-tools"))]
 pub(crate) fn fixture_scripted(

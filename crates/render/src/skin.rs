@@ -170,10 +170,6 @@ pub struct AttemptInput<'a> {
     /// ([`Renderer::target`](crate::Renderer::target)); the renderer sets
     /// it.
     pub target: [u32; 2],
-    /// What the attempt takes over from the earlier attempts of its play
-    /// state; [`Continuation::Fresh`](skin_model::Continuation::Fresh)
-    /// for a play state's first.
-    pub continuation: skin_model::Continuation<'a>,
 }
 
 impl AttemptInput<'_> {
@@ -267,13 +263,6 @@ pub trait PlaySkin: Send {
     /// ([`skin_model::chart_image::ChartTable::drawable`]). Nothing by
     /// default: a skin that draws no chart image.
     fn set_chart_live(&mut self, _live: Option<skin_model::chart_image::ChartKey>) {}
-
-    /// What the prepared attempt gives the next attempt of its play state
-    /// ([`skin_model::Play::carry`]); `None` for a skin with no presentation
-    /// program state, the default.
-    fn carry(&self) -> Option<skin_model::Carry<'_>> {
-        None
-    }
 
     /// The most sprites a frame of the skin pushes: the renderer's batch,
     /// staging and instance buffer hold this many, and never fewer than

@@ -54,15 +54,10 @@ pub struct Report {
     /// Per frame kind (loading, page, ready, …): frames and agreed
     /// invocations.
     pub kinds: BTreeMap<&'static str, (usize, usize)>,
-    /// Each round's continuation and witness.
+    /// Each round's line.
     pub rounds: Vec<String>,
     /// The agreed invocations of each round's first frame.
     pub first_agreed: Vec<usize>,
-    /// Source invocations attributed to the carried-state limit, by round
-    /// (from 1) and reason.
-    pub slots_off: BTreeMap<(usize, &'static str), usize>,
-    /// Whether the program's slotted callbacks may run on a carried state.
-    pub carry_safe: bool,
     /// Lowered invocations compared and agreed, by frame kind and consumer.
     pub lowered: BTreeMap<(&'static str, &'static str), usize>,
 }
@@ -106,7 +101,6 @@ impl Report {
         for (k, (n, a)) in &self.kinds {
             let _ = writeln!(o, "frames {k}: {n}, agreed {a}");
         }
-        let _ = writeln!(o, "carry-safe {}", self.carry_safe);
         for (r, a) in self.rounds.iter().zip(
             self.first_agreed
                 .iter()
@@ -114,9 +108,6 @@ impl Report {
                 .chain(std::iter::repeat(None)),
         ) {
             let _ = writeln!(o, "{r}; first frame agreed {}", a.map_or(0, |a| *a));
-        }
-        for ((r, why), n) in &self.slots_off {
-            let _ = writeln!(o, "round {r} carried-state limit {why}: {n}");
         }
         for ((kind, field), n) in &self.lowered {
             let _ = writeln!(o, "lowered {field} agreed on {kind} frames: {n}");

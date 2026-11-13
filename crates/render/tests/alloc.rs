@@ -819,7 +819,6 @@ fn imported_frames(chart: &Chart, overlay: &[&str], glyphs: usize) {
         context: &ctx,
         text: &labels,
         target: [1_920, 1_080],
-        continuation: skin_model::Continuation::Fresh,
     };
     let mut skin = DeclSkin::new(b.clone());
     skin.prepare(r.gpu(), &a).unwrap();
@@ -993,7 +992,7 @@ fn loading_frames() {
         [64, 48],
     );
     let table = r
-        .publish_chart_images(render::ChartTarget::Committed, [Some(&stage), None])
+        .publish_chart_images(render::ChartTarget::Committed, [Some(&stage), None, None])
         .unwrap();
     assert!(table.present(skin_model::chart_image::ChartImage::Stage));
     // The chosen chart's text prepared and installed for lifetime 1
@@ -1567,7 +1566,6 @@ fn outline_frames(chart: &Chart, overlay: &[&str]) {
         context: &ctx,
         text: &labels,
         target: r.target(),
-        continuation: skin_model::Continuation::Fresh,
     };
     let token = r.stage(&b, &a, 1).unwrap();
     r.commit(token).unwrap();

@@ -142,11 +142,11 @@ fn chart_image_frames_do_not_allocate() {
         ..KEY
     };
     let tables = [
-        ChartTable::new(Some(uv([640, 480])), Some(uv([200, 600]))).keyed(KEY),
-        ChartTable::new(None, Some(uv([1, 1]))).keyed(KEY),
+        ChartTable::new(Some(uv([640, 480])), Some(uv([200, 600])), None).keyed(KEY),
+        ChartTable::new(None, Some(uv([1, 1])), None).keyed(KEY),
         ChartTable::ABSENT.keyed(KEY),
         // Another array's: unavailable while loading, absent in a play.
-        ChartTable::new(Some(uv([640, 480])), None).keyed(other),
+        ChartTable::new(Some(uv([640, 480])), None, None).keyed(other),
     ];
 
     // Play frames, the images set between them.

@@ -33,7 +33,10 @@ use crate::recording::SoundRecording;
 use crate::render_side::{FrameSink, Screen};
 
 pub mod checkpoints;
+mod decision_faults;
 pub mod scenario;
+
+pub use decision_faults::DecisionFaults;
 
 /// How long each loudness measurement holds before its first block, in
 /// milliseconds (a script's `slow-measuring`): a load's and the
@@ -906,6 +909,10 @@ pub enum SelectStep {
     Idle(u64),
     /// Press Enter.
     Enter,
+    /// Wait until the decision skin's labels for the chart under the
+    /// cursor are ready to pin, then require the choice that follows to
+    /// pin them (a scenario's `decision = "skin"`).
+    DecisionReady,
     /// Press F11: the previous play preset.
     PrevPreset,
     /// Press F12: the next play preset.
@@ -1098,6 +1105,9 @@ pub struct SelectScript {
     /// The result shown was left by a step: its steps are over until the
     /// next result begins.
     pub left_result: bool,
+    /// The scenario step whose choice must pin the decision skin's
+    /// labels, until that choice.
+    pub skin_decision: Option<scenario::Origin>,
 }
 
 impl SelectScript {
@@ -2575,6 +2585,9 @@ pub struct FrameDump {
     /// The loading lifetime whose `loading-skin-<lifetime>.png` was written
     /// last.
     skin_loading: Option<u64>,
+    /// The decision lifetime whose `decision-skin-<lifetime>.png` was
+    /// written last.
+    skin_decision: Option<u64>,
     /// The generation of the play whose `play-<generation>.png` was
     /// written last.
     numbered: Option<u64>,
@@ -2592,6 +2605,7 @@ impl FrameDump {
             select: false,
             loading: false,
             skin_loading: None,
+            skin_decision: None,
             numbered: None,
         }
     }
@@ -2651,6 +2665,13 @@ impl FrameDump {
         {
             self.skin_loading = Some(l);
             names.push(format!("loading-skin-{l}.png"));
+        }
+        // Each decision screen's first frame its skin drew.
+        if let Some((l, crate::measure::DecisionDrawnAs::Skin)) = drawn.decision
+            && self.skin_decision != Some(l)
+        {
+            self.skin_decision = Some(l);
+            names.push(format!("decision-skin-{l}.png"));
         }
         match drawn.play {
             Some(t) if t.0 < 0 && !self.ready_state => {

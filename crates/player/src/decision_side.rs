@@ -622,6 +622,7 @@ pub fn decision_build(
     active: Option<u64>,
     shown: &ShownDecision,
     now: TimeUs,
+    #[cfg(feature = "dev-tools")] faults: &mut crate::dev::DecisionFaults,
 ) -> DecisionDrawn {
     let Some((slot, generation)) = shown.slot else {
         return DecisionDrawn::BuiltIn;
@@ -633,6 +634,12 @@ pub fn decision_build(
         return DecisionDrawn::Refused(BuildError::Kind);
     };
     let frame = decision_frame_of(shown, now, screen.target());
+    // A development fault due for this build, armed right before it: only
+    // a frame that found its labels counts as one (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    if let Some(refuse) = faults.build() {
+        screen.allocate_in_next_decision(refuse);
+    }
     match screen.build_decision(dec, labels, &frame) {
         Ok(()) => DecisionDrawn::Built,
         Err(e) => DecisionDrawn::Refused(e),

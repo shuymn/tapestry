@@ -94,41 +94,26 @@ fn point(t: &Tally, targets: u32) -> i32 {
     low(sum / n).wrapping_add(low(50_000 * i64::from(int(t.max_combo)) / n))
 }
 
-/// The play state's score data (`ScoreDataProperty` at `0.8.9`) as a
-/// frame reads it: the point, the EX score and the two score rates, the
-/// fields `fill_fields` writes for one tally.
+/// The attempt's score data (`ScoreDataProperty` at `0.8.9`) as a frame
+/// reads it: the point, the EX score and the two score rates, the fields
+/// `fill_fields` writes for one tally.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Settled {
-    pub point: i32,
-    pub ex_score: i32,
-    pub rate_current_bp: i32,
-    pub rate_whole_bp: i32,
+struct Scores {
+    point: i32,
+    ex_score: i32,
+    rate_current_bp: i32,
+    rate_whole_bp: i32,
 }
 
 /// The score data a frame over `t` reads, the attempt having `targets`
 /// targets of which `t` judged `judged`: the field fill's own formulas.
-fn scores(t: &Tally, targets: u32, judged: u64) -> Settled {
-    Settled {
+fn scores(t: &Tally, targets: u32, judged: u64) -> Scores {
+    Scores {
         point: point(t, targets),
         ex_score: count(t.ex_score),
         rate_current_bp: rate_bp(t.ex_score, judged),
         rate_whole_bp: rate_bp(t.ex_score, u64::from(targets)),
     }
-}
-
-/// The play state's score data after an attempt whose final tally is `t`
-/// over `targets` (the source updates it at a judgment only,
-/// `BMSPlayer.java:1038` at `0.8.9`, so the last judgment's stays): what
-/// a frame over `t` reads. `None` for the zero tally, which no judgment
-/// changed, and for a tally [`Skin::build`](crate::Skin::build) refuses
-/// (more counted empty POORs than POORs), which no frame showed: the play
-/// state's earlier data stays, the point included.
-#[must_use]
-pub fn settled(t: &Tally, targets: u32, empty_poor_counted: bool) -> Option<Settled> {
-    if *t == Tally::default() {
-        return None;
-    }
-    Some(scores(t, targets, judged_targets(t, empty_poor_counted)?))
 }
 
 /// The three score fields a play frame over `t` gives, `[ex_score,
@@ -832,7 +817,6 @@ impl Play {
         whens: &[Program],
         present: Option<&Present>,
     ) -> Result<(), BuildError> {
-        self.terminal = false;
         self.check()?;
         let Some(judged) = judged_targets(frame.tally, self.empty_poor_counted) else {
             return self.refuse(BuildError::InconsistentTally);
@@ -880,28 +864,21 @@ impl Play {
                 bank: &mut self.bank,
                 outs,
                 timers,
-                slots: self.slots_run,
             });
-            self.terminal = self.slots_run && frame.complete;
         }
         Ok(())
     }
 
-    /// The score fields: the play state's cached score data until the
-    /// attempt's first judgment (the first frame whose tally is not the
-    /// zero tally: every judgment, the empty POOR included, adds a count),
-    /// then the attempt's own, `judged` its judged targets
-    /// (`ScoreDataProperty.java:64-99`, updated only at a judgment,
-    /// `BMSPlayer.java:1038` at `0.8.9`). With no cached data (a play
-    /// state with no judgment yet) it is the attempt's own throughout.
-    fn score_now(&mut self, t: &Tally, judged: u64) -> Settled {
+    /// The score fields: the attempt's own, `judged` its judged targets
+    /// (`ScoreDataProperty.java:64-99` at `0.8.9`), from its first frame;
+    /// it also latches the attempt's first judgment (the first frame whose
+    /// tally is not the zero tally: every judgment, the empty POOR
+    /// included, adds a count), which the score figures wait for.
+    fn score_now(&mut self, t: &Tally, judged: u64) -> Scores {
         if !self.judged && *t != Tally::default() {
             self.judged = true;
         }
-        match self.cached {
-            Some(c) if !self.judged => c,
-            _ => scores(t, self.reducer.targets(), judged),
-        }
+        scores(t, self.reducer.targets(), judged)
     }
 
     /// The fields, in slot order (`field::*`): the snapshot's, `judged`
@@ -913,8 +890,7 @@ impl Play {
         let t = frame.tally;
         let score = self.score_now(t, judged);
         // After `score_now`, whose latch is the update the score figures
-        // wait for. The figures read the frame's own tally, never the
-        // play state's carried score data.
+        // wait for. The figures read the frame's own tally.
         let inputs = ScoreInputs {
             ex: t.ex_score,
             judged,

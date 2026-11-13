@@ -195,6 +195,10 @@ pub struct PlayerRig<'a> {
     /// The page side of the committed play skin's chart layer, if it keeps
     /// one ([`crate::imports::Started::play_chart`]).
     pub play_chart: Option<u32>,
+    /// The page side of the selection skin's chart layer, if it keeps one
+    /// ([`crate::imports::Started::selection_chart`]): without one the
+    /// cursor asks for no image.
+    pub selection_chart: Option<u32>,
     /// The window's controls.
     pub controls: &'a Controls,
     /// Whether the window was shown: recording opens once it is. `None`
@@ -462,8 +466,6 @@ pub struct AttemptPrep {
     scratch_notes: Vec<game::ScratchNote>,
     /// Prepared with a pending play skin's specialization.
     specialized: bool,
-    /// The play state and chart the attempt belongs to.
-    carry_key: Option<crate::carry::CarryKey>,
     /// When the render thread was asked.
     staging: Instant,
     stage: PrepStage,
@@ -539,11 +541,11 @@ impl PlayerRig<'_> {
     /// launch, decoded now on this thread) go on to the result's image
     /// stage at once; otherwise the preparation's polls wait for them.
     fn enter_facts(&mut self, prep: &mut AttemptPrep, skin: AttemptSkin) -> PrepStage {
-        let (dir, names) = prep.images.clone();
+        let (dir, [stage, back]) = prep.images.clone();
         let play = self.play_side(&skin);
         self.chart_images.attempt(crate::chart_images::Want {
             dir,
-            names,
+            names: [stage, back, String::new()],
             play,
             result: None,
         });
@@ -692,10 +694,10 @@ impl PlayerRig<'_> {
         // for every view, else of the prepared atlas, when it keeps one.
         let play = self.play_side(&skin);
         let result = self.result_skin.chart_side();
-        let (dir, names) = prep.images.clone();
+        let (dir, [stage, back]) = prep.images.clone();
         self.chart_images.attempt(crate::chart_images::Want {
             dir,
-            names,
+            names: [stage, back, String::new()],
             play,
             result,
         });
@@ -706,8 +708,7 @@ impl PlayerRig<'_> {
         let epoch = self.adjust.as_mut().and_then(game::AdjustDriver::prepared);
         let attempt =
             AttemptContext::new(attempt, SIMPLE_SCRATCH, epoch.unwrap_or(0), self.autoplay)
-                .with_scratch_notes(std::mem::take(&mut prep.scratch_notes))
-                .with_carry_key(prep.carry_key);
+                .with_scratch_notes(std::mem::take(&mut prep.scratch_notes));
         prep.staging = Instant::now();
         PrepStage::Screen(self.render.begin_attempt(attempt, skin))
     }
@@ -763,7 +764,11 @@ impl PlayerRig<'_> {
         let labels = loaded.labels();
         self.chart_images.attempt(crate::chart_images::Want {
             dir: crate::chart_images::folder(loaded.path()),
-            names: [labels.stagefile.clone(), labels.backbmp.clone()],
+            names: [
+                labels.stagefile.clone(),
+                labels.backbmp.clone(),
+                String::new(),
+            ],
             play: self.play_chart.filter(|_| self.pending.is_none()),
             result: None,
         });
@@ -2092,7 +2097,6 @@ impl Rig for PlayerRig<'_> {
                 labels: None,
                 images: (std::path::PathBuf::new(), [String::new(), String::new()]),
                 scratch_notes: Vec::new(),
-                carry_key: None,
                 specialized: false,
                 staging: Instant::now(),
                 stage: PrepStage::Ended(Preparation::Cancelled),
@@ -2127,10 +2131,6 @@ impl Rig for PlayerRig<'_> {
                 Vec::new()
             },
             specialized: false,
-            carry_key: self.play_states.current().map(|s| crate::carry::CarryKey {
-                play_state: s.number,
-                chart: key.chart(),
-            }),
             staging: Instant::now(),
             stage: PrepStage::Answered(None),
         };
@@ -2779,8 +2779,6 @@ impl Rig for PlayerRig<'_> {
     fn ended(&mut self, report: &PlayReport) {
         #[cfg(test)]
         self.ended_plays.push((report.end, report.record.clone()));
-        // The play state's carry takes the final tally.
-        self.render.settled(report.tally);
         // The result is another scene: held adjustment controls act no more
         // until pressed afresh.
         self.enter_scene();
@@ -2959,7 +2957,7 @@ impl ResultRetries {
 }
 
 /// How long the chart images' wait parks between its looks.
-const IMAGE_SLICE: std::time::Duration = std::time::Duration::from_millis(2);
+pub(crate) const IMAGE_SLICE: std::time::Duration = std::time::Duration::from_millis(2);
 
 /// Where the wait for the chart's images ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

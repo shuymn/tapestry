@@ -465,40 +465,12 @@ impl Drawn {
     /// `skin` played over `chart` with the context `ctx`.
     #[allow(dead_code, reason = "not every test binary gives its own context")]
     pub fn over_context(skin: Skin, chart: &bms_model::Chart, ctx: &PlayContext<'_>) -> Self {
-        Self::carried_over(skin, chart, ctx, skin_model::Continuation::Fresh)
-    }
-
-    /// [`over_section`](Self::over_section), taking over `carry` from the
-    /// earlier attempts of the play state.
-    pub fn over_carried(
-        skin: Skin,
-        notes: u32,
-        section: &eval::Section,
-        carry: skin_model::Continuation<'_>,
-    ) -> Self {
-        Self::carried_over(
-            skin,
-            &chart(notes),
-            &PlayContext {
-                attempt: Attempt::Section(section),
-                ..context_with(None, None)
-            },
-            carry,
-        )
-    }
-
-    fn carried_over(
-        skin: Skin,
-        chart: &bms_model::Chart,
-        ctx: &PlayContext<'_>,
-        carry: skin_model::Continuation<'_>,
-    ) -> Self {
         let uvs = skin
             .atlas(Variant::Lo, LIMITS, &|| false)
             .unwrap()
             .into_parts()
             .1;
-        let play = skin.prepare_carried(chart, ctx, carry).unwrap();
+        let play = skin.prepare(chart, ctx).unwrap();
         let screen_from = ready_start(ctx);
         let batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
         Self {

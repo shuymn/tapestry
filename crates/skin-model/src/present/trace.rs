@@ -18,8 +18,6 @@ use super::{Fail, Val};
 /// Why a callback did not run this frame.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Skip {
-    /// Its slots do not run on this attempt (the carried-state limits).
-    SlotsOff,
     /// The callback it follows gave no value, or a false draw, or an off
     /// timer.
     After,

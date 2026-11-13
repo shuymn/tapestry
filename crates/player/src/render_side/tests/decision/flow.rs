@@ -116,6 +116,7 @@ fn flow_with<R>(
         book,
         extent,
         _turn: turn,
+        ..
     } = rig(clock);
     let charts = tempfile::tempdir().unwrap();
     let (mut sel, roots) = crate::selection::tests::tree(charts.path(), &[&["a.bms"]]);

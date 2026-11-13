@@ -23,8 +23,8 @@ use bms_model::{Chart, ChartBuilder, TimeUs};
 use eval::{Section, Tally};
 use rules::PerJudgment;
 use skin_model::{
-    Atlas, Attempt, Continuation, ElementDef, PlayContext, PlayDefs, PlayScore, RatioBarDef,
-    RatioForm, RatioSource, ScoreBasis, ScoreRate, Skin, Source, TimerRef, Variant, field, timer,
+    Atlas, Attempt, ElementDef, PlayContext, PlayDefs, PlayScore, RatioBarDef, RatioForm,
+    RatioSource, ScoreBasis, ScoreRate, Skin, Source, TimerRef, Variant, field, timer,
 };
 
 use play_support::{GAUGES, Harness, MS, bool_program, def, full, lane, white_sheet};
@@ -511,22 +511,8 @@ fn a_new_round_starts_its_projections_fresh() {
     fx.frame(1_300, tally(2, 1, 0, 0));
     assert_eq!(fx.figures().current, vec![1]);
     fx.bar(1, Some((5, 6)));
-    // The first round's score data, carried: the projections ignore it.
-    let score = skin_model::settled(&tally(2, 1, 0, 0), 7, false);
-    assert!(score.is_some());
-    let mut next = {
-        let carry = fx.h.play.carry();
-        fx.h.skin
-            .prepare_carried(
-                &chart,
-                &practice,
-                Continuation::Carried {
-                    score,
-                    bank: Some(carry.bank),
-                },
-            )
-            .unwrap()
-    };
+    // The next round, prepared fresh.
+    let mut next = fx.h.skin.prepare(&chart, &practice).unwrap();
     std::mem::swap(&mut fx.h.play, &mut next);
     fx.frame(400, tally(0, 0, 0, 0));
     let fresh = Figures {

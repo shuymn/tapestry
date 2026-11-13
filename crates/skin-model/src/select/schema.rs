@@ -110,6 +110,8 @@ pub static SELECTION: Schema = Schema {
         value("selected.rate.good"),
         value("selected.rate.bad"),
         value("selected.rate.poor"),
+        flag("selected.stagefile"),
+        flag("selected.banner"),
         int("settings.display_offset", -VALUE_MAX, VALUE_MAX),
         int("settings.volume_system", 0, 100),
         flag("settings.floating"),
@@ -240,11 +242,17 @@ pub mod field {
     /// `selected.play_notes_valid` is false.
     pub const SELECTED_RATE_PERFECT: u16 = 55;
     pub const SELECTED_RATE_POOR: u16 = 59;
+    /// Whether the cursor's chart's stage file and banner are drawable:
+    /// true only while the selection's chart table is current for the
+    /// cursor generation and holds that image (options 190 to 193). The
+    /// player writes them after the view's fields, which reset them.
+    pub const SELECTED_STAGEFILE: u16 = SELECTED_RATE_POOR + 1;
+    pub const SELECTED_BANNER: u16 = SELECTED_STAGEFILE + 1;
     /// The settings' fields, then the application's readouts, from here
     /// on, which a view leaves as they are
     /// ([`SelectionSettings`](crate::SelectionSettings),
     /// [`SelectionFrame::app`](crate::SelectionFrame::app)).
-    pub const SETTINGS: u16 = SELECTED_RATE_POOR + 1;
+    pub const SETTINGS: u16 = SELECTED_BANNER + 1;
     /// The display offset in whole ms.
     pub const SETTINGS_DISPLAY_OFFSET: u16 = SETTINGS;
     /// The system volume's number, `(int)(gain · 100f)`.
@@ -357,6 +365,8 @@ mod tests {
             ),
             (field::SELECTED_RATE_PERFECT, "selected.rate.perfect"),
             (field::SELECTED_RATE_POOR, "selected.rate.poor"),
+            (field::SELECTED_STAGEFILE, "selected.stagefile"),
+            (field::SELECTED_BANNER, "selected.banner"),
             (field::SETTINGS, "settings.display_offset"),
             (field::SETTINGS_DISPLAY_OFFSET, "settings.display_offset"),
             (field::SETTINGS_VOLUME_SYSTEM, "settings.volume_system"),
@@ -378,6 +388,12 @@ mod tests {
         ] {
             assert_eq!(names[usize::from(slot)], name);
         }
+        // The image fields are the selected chart's, the last before the
+        // settings, which a view leaves as they are.
+        assert_eq!(
+            names[usize::from(field::SETTINGS) - 2..usize::from(field::SETTINGS)],
+            ["selected.stagefile", "selected.banner"]
+        );
         assert_eq!(
             SELECTION.timers[usize::from(timer::CHANGE)].name,
             "select.change"

@@ -69,7 +69,7 @@ pub const MAGENTA: [u8; 3] = [255, 0, 255];
 pub const RED: [u8; 3] = [255, 0, 0];
 
 /// Writes a `w`×`h` RGBA PNG at `path`, texel `(x, y)` from `texel`.
-fn png(path: &Path, w: u32, h: u32, texel: impl Fn(u32, u32) -> [u8; 4]) {
+pub fn png(path: &Path, w: u32, h: u32, texel: impl Fn(u32, u32) -> [u8; 4]) {
     let file = fs::File::create(path).unwrap();
     let mut e = png::Encoder::new(BufWriter::new(file), w, h);
     e.set_color(png::ColorType::Rgba);
