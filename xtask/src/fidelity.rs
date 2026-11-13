@@ -50,10 +50,12 @@
 //!   word Java, LuaJ or libGDX (`'s` allowed), or "the source's" or "as the
 //!   source".
 //!
-//! A hit is cleared when the run of comments and attributes directly above
-//! its item or attribute holds a tag or a `// Not a source copy: <reason>`
-//! marker (an empty reason is reported). Each clears only the hits of the
-//! code directly below its run, never a copy elsewhere in the file.
+//! A hit is cleared when the run of comments and attributes of its item
+//! holds a tag or a `// Not a source copy: <reason>` marker (an empty
+//! reason is reported); a hit on an attribute belongs to the item that
+//! attribute's run ends at. A run ends upward at a blank line or code, so
+//! each mark clears only the hits of the item directly below it, never a
+//! copy elsewhere in the file.
 //!
 //! The hits left are counted per lint and file against the baseline,
 //! `xtask/fidelity-baseline.txt` (`<lint> <count> <file>` per line, `#`
@@ -801,11 +803,22 @@ fn run_above(lines: &[&str], item: usize) -> (usize, Vec<String>) {
     (i, out)
 }
 
-/// Whether the run of comments and attributes directly above line `i`
-/// holds a tag or a marker with its reason.
+/// Whether the run of comments and attributes of the item on line `i`
+/// holds a tag or a marker with its reason. A hit on an attribute belongs
+/// to the item that attribute's run ends at, so a mark anywhere in that
+/// run clears it.
 fn cleared(lines: &[&str], i: usize) -> bool {
-    let (start, _) = run_above(lines, i);
-    (start..i).any(|j| match lines.get(j).map(|l| mark(l)) {
+    let attribute = lines.get(i).is_some_and(|l| {
+        let t = l.trim_start();
+        t.starts_with("#[") || t.starts_with("#![")
+    });
+    let item = attribute
+        .then(|| attribute_end(lines, i).and_then(|end| code_below(lines, end)))
+        .flatten()
+        .filter(|&item| run_above(lines, item).0 <= i)
+        .unwrap_or(i);
+    let (start, _) = run_above(lines, item);
+    (start..item).any(|j| match lines.get(j).map(|l| mark(l)) {
         Some(Mark::Tag(_)) => true,
         Some(Mark::Marker(reason)) => !reason.is_empty(),
         _ => false,

@@ -742,6 +742,22 @@ fn unrelated(values: &[&str], i: usize) -> usize {
 }
 
 #[test]
+fn a_marker_inside_an_item_s_run_clears_its_attributes() {
+    let inside = "\
+#[expect(clippy::cast_precision_loss, reason = \"Java's cast\")]
+// Not a source copy: the format sets this cast.
+fn float() {}
+";
+    assert_eq!(hits_in("crates/d/src/lib.rs", inside), NONE);
+    // Only that item's: the next item's attribute is still a hit.
+    let next = format!("{inside}#[expect(clippy::x, reason = \"Java's cast\")]\nfn other() {{}}\n");
+    assert_eq!(
+        hits_in("crates/d/src/lib.rs", &next),
+        [grew("crates/d/src/lib.rs", "expect-reason", &[4], 0)]
+    );
+}
+
+#[test]
 fn a_new_hit_beyond_the_baseline_is_reported() {
     let added = files_with(
         LINTED,
