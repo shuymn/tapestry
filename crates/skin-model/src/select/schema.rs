@@ -255,7 +255,7 @@ pub mod field {
     pub const SETTINGS: u16 = SELECTED_BANNER + 1;
     /// The display offset in whole ms.
     pub const SETTINGS_DISPLAY_OFFSET: u16 = SETTINGS;
-    /// The system volume's number, `(int)(gain · 100f)`.
+    /// The system volume's number, its whole percent rounded half up.
     pub const SETTINGS_VOLUME_SYSTEM: u16 = SETTINGS + 1;
     /// Whether the hi-speed is Floating.
     pub const SETTINGS_FLOATING: u16 = SETTINGS + 2;
@@ -284,7 +284,8 @@ pub mod field {
     /// assignment: 0 (combo) for combo priority, 1 (duration) for the
     /// nearest note, earlier at a tie; −1 without a preset.
     pub const SETTINGS_JUDGE_ALGORITHM: u16 = SETTINGS_GAUGE_SHIFT + 1;
-    /// The key and background volumes' numbers, `(int)(gain · 100f)`.
+    /// The key and background volumes' numbers, each its whole percent
+    /// rounded half up.
     pub const SETTINGS_VOLUME_KEY: u16 = SETTINGS_JUDGE_ALGORITHM + 1;
     pub const SETTINGS_VOLUME_BACKGROUND: u16 = SETTINGS_VOLUME_KEY + 1;
     /// The application's readouts of the frame

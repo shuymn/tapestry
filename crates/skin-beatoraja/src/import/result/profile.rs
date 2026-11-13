@@ -172,8 +172,8 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
         // (`IntegerPropertyFactory.java:712-732`).
         176 => v("best.bp", BEST, (HIDDEN, M)),
         // The best max combo before this play and this play's less it,
-        // both hidden unless that best is above 0
-        // (`IntegerPropertyFactory.java:734-752`).
+        // both drawn for a known best, 0 included, and hidden only while
+        // no play counts for the best.
         173 => v("best.max_combo", BEST, (HIDDEN, M)),
         175 => v("best.max_combo_diff", BEST, (HIDDEN, M)),
         178 => v("best.bp_diff", BEST, (HIDDEN, M)),

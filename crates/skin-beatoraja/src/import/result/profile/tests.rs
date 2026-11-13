@@ -263,8 +263,7 @@ fn the_mean_truncates_toward_zero() {
 
 /// 173 is the best max combo before this play and 175 this play's less
 /// it, each drawn only with a known best and hidden as `i32::MIN` while
-/// the comparison hides it (a best max combo of 0), as the source's
-/// (`IntegerPropertyFactory.java:734-752`).
+/// the comparison hides it (no play counts for the best).
 #[test]
 fn best_max_combo_reads_173_and_175() {
     use skin_model::result_field as f;

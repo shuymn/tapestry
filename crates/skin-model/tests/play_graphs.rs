@@ -1132,10 +1132,11 @@ fn the_average_moves_by_steps_below_one_ms() {
     assert_eq!(shown_ema(&late, 0), -3);
 }
 
-/// C26: any finite weight steps by plain arithmetic, the average held within
-/// ±2^53 ms and drawn within the judge width. At 1e20 after 1 it is
-/// 2^53; after −2, `2^53 + 1e20 · (−2 − 2^53)` is held at −2^53, drawn at
-/// −1 000: texel 2 000. At −0.5 after 40 the average is −20: texel 1 020.
+/// C26: any finite weight steps by plain arithmetic and the average is
+/// drawn within the judge width. At 1e20 after 1 and then −2 it is held at
+/// −2^53 (the value itself is pinned by `ema_step`'s unit tests in
+/// `widget/hit_error.rs`), drawn at −1 000: texel 2 000. At −0.5 after 40
+/// the average is −20: texel 1 020.
 #[test]
 fn extreme_weights_stay_finite() {
     for (alpha, values, want) in [(1e20_f32, vec![1, -2], -1_000), (-0.5, vec![40], -20)] {

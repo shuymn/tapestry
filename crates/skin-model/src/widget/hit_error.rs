@@ -350,3 +350,30 @@ impl HitError {
         r.draw(d.state.runs(), u32::MAX, brush, f, self.solid.filter, out);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{EMA_BOUND, ema_step};
+
+    /// The bound is 2^53 ms either way: 1.5 · 2^52 (weight 2^40 after
+    /// 6 144) is kept as it is, 3 · 2^52 (weight 2^41) is held at 2^53, and
+    /// a step from 2^53 to `2^53 + 1e20 · (−2 − 2^53)` at −2^53.
+    #[test]
+    fn the_average_is_held_at_two_to_the_53() {
+        let two_52 = 4_503_599_627_370_496.0;
+        assert_eq!(EMA_BOUND, 2.0 * two_52);
+        assert_eq!(ema_step(0.0, 6_144.0, 1_099_511_627_776.0), 1.5 * two_52);
+        assert_eq!(ema_step(0.0, 6_144.0, 2_199_023_255_552.0), 2.0 * two_52);
+        assert_eq!(ema_step(0.0, 1.0, 1e20), 2.0 * two_52);
+        assert_eq!(ema_step(2.0 * two_52, -2.0, 1e20), -2.0 * two_52);
+    }
+
+    /// An infinite weight's step is held at the bound; one that is no
+    /// number (an infinite weight times no difference) keeps the average.
+    #[test]
+    fn an_infinite_weight_is_held_and_no_number_keeps_the_average() {
+        assert_eq!(ema_step(0.0, 40.0, f32::INFINITY), EMA_BOUND);
+        assert_eq!(ema_step(0.0, -40.0, f32::INFINITY), -EMA_BOUND);
+        assert_eq!(ema_step(5.0, 5.0, f32::INFINITY), 5.0);
+    }
+}
