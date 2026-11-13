@@ -36,6 +36,8 @@ pub enum Outcome {
     /// A value slider's displacement is past
     /// [`MAX_SLIDE`](crate::MAX_SLIDE): off the window, not drawn.
     SlideBeyond,
+    /// Its hover rect does not hold the frame's pointer, or there is none.
+    PointerOutside,
 }
 
 /// One element's observation in one frame.

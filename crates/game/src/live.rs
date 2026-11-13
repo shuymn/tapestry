@@ -479,6 +479,15 @@ pub trait Rig {
     fn result_timing(&self) -> Option<ResultTiming> {
         None
     }
+    /// The result's origin (design.md "Rendering and Skins", Timers): the
+    /// instant its screen's first view was committed, from which a skin's
+    /// input and scene times count; `None` before it. Never set later than
+    /// the timing it goes with, so the flow reads
+    /// [`result_timing`](Self::result_timing) first and then this. By
+    /// default, `None`: the flow counts from the result's show.
+    fn result_origin(&self) -> Option<TimeUs> {
+        None
+    }
     /// A leaving command at `at`, judged and pinned against one view, the
     /// one on screen: with `gate` (a pressed command, the result's start)
     /// a view whose input time has not passed from it refuses it
@@ -815,6 +824,40 @@ impl PlayEnding {
     };
 }
 
+/// The source's margin from a full play's finish anchor to its finished
+/// state (`play/BMSPlayer.java:66, 199` at 0.8.9): the least a full play's
+/// hold lasts past its anchor (design.md "Play Lifecycle", Audio tail).
+pub const FINISH_MARGIN: TimeUs = TimeUs(5_000_000);
+
+/// Where a full play's hold may end at the earliest, for a play whose
+/// finish anchor is `anchor`: [`FINISH_MARGIN`] after it, plus the skin's
+/// finish margin unless its fadeout is negative (the source's timer that
+/// is off reads 0, so it leaves before the margin, `BMSPlayer.java:756`),
+/// saturating.
+#[must_use]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub const fn hold_until(anchor: TimeUs, ending: PlayEnding) -> TimeUs {
+    let finished = anchor.0.saturating_add(FINISH_MARGIN.0);
+    if ending.fadeout.0 < 0 {
+        TimeUs(finished)
+    } else {
+        TimeUs(finished.saturating_add(ending.finish_margin.0))
+    }
+}
+
+/// Where a full play's fade-out started at play time `start` ends, or
+/// `None` when `fadeout` is 0 or less: no fade-out, the result at `start`.
+/// Saturating.
+#[must_use]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub const fn fade_deadline(start: TimeUs, fadeout: TimeUs) -> Option<TimeUs> {
+    if fadeout.0 > 0 {
+        Some(TimeUs(start.0.saturating_add(fadeout.0)))
+    } else {
+        None
+    }
+}
+
 /// The shortest Closing (design.md "Play Lifecycle", Closing): the same
 /// 1 s as the loading state's minimum.
 pub const CLOSE_FLOOR: TimeUs = TimeUs(1_000_000);
@@ -1062,8 +1105,11 @@ fn run_from<R: Rig>(
         loaded.emit(&SessionEvent::Result {
             attempt: report.attempt,
         });
-        // The result's start: a skin's input and scene times count from it.
-        let start = rig.now();
+        // The result's show: a skin's input and scene times count from the
+        // rig's origin once it has one (read after the timing, which it
+        // never follows), from here before.
+        let shown = rig.now();
+        let start = |rig: &R| rig.result_origin().unwrap_or(shown);
         rig.show_end(&report, &screen);
         // The leaving command accepted and its outro's end, from the pinned
         // view's timing.
@@ -1080,7 +1126,7 @@ fn run_from<R: Rig>(
                 None => rig
                     .result_timing()
                     .and_then(|t| t.scene)
-                    .map(|scene| start.0.saturating_add(scene.0)),
+                    .map(|scene| start(rig).0.saturating_add(scene.0)),
             };
             until = due.map_or(until, |d| until.min(d));
             rig.idle_wait(TimeUs(until));
@@ -1107,6 +1153,7 @@ fn run_from<R: Rig>(
             // away: what waits on the outro is served at this look.
             let now = rig.now();
             let timing = rig.result_timing();
+            let start = start(rig);
             let mut open = true;
             if outro.is_none() {
                 open = timing.is_none_or(|t| now.0 >= start.0.saturating_add(t.input.0));
@@ -2261,15 +2308,20 @@ const fn cancel_reason(end: PlayEnd, closing: bool) -> CancelReason {
 /// "Mid-Chart Start and Section Repeat"). Nothing is recorded, and the
 /// controls and failures act on every stage alike ([`run_tail`]); a stage
 /// differs only in its data: where it ends, and what follows it once it
-/// ran to its end. A full play is the stage that ends when the audio is
-/// done and does not repeat.
+/// ran to its end. A full play is the stage that holds until its audio is
+/// done and its hold deadline ([`hold_until`]) has passed, then fades out,
+/// and does not repeat.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct TailStage {
-    /// Where the stage's ring-out ends, in the play's time: it then ends
-    /// once the audio is done and the play's time has reached it, since
-    /// the audio side mixes ahead and its report alone can come early.
-    /// `None`: it ends when the audio is done (a full play).
-    ring_out_end: Option<TimeUs>,
+    /// Where the stage may end at the earliest, in the play's time: a
+    /// round's ring-out end, or a full play's hold deadline. It ends once
+    /// the audio is done and the play's time has reached it, since the
+    /// audio side mixes ahead and its report alone can come early.
+    end_at: TimeUs,
+    /// A full play's declared fadeout (`Some`, 0 without a declaration),
+    /// which follows the stage's end; `None` for a practice round, which
+    /// never fades out whatever the skin declares.
+    fadeout: Option<TimeUs>,
     /// Whether a stage run to its end is followed by the next round, with
     /// no result between (a repeated round); otherwise the result shows.
     repeats: bool,
@@ -2277,8 +2329,9 @@ struct TailStage {
 
 impl TailStage {
     /// The stage of a play completed at play time `now`: a round rings out
-    /// from that step; a full play, with no ring-out, seals its key sounds
-    /// and lets its audio end by itself.
+    /// from that step; a full play seals its key sounds, lets its audio
+    /// end by itself and holds to its deadline from its finish anchor and
+    /// the play skin's declared ending.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn begin<R: Rig>(rig: &mut R, loaded: &Loaded, round: bool, now: TimeUs) -> Self {
         if round {
@@ -2286,26 +2339,55 @@ impl TailStage {
             let fade_at = TimeUs(end_at.0.saturating_sub(FADE.0));
             rig.ring_out(fade_at, end_at);
             Self {
-                ring_out_end: Some(end_at),
+                end_at,
+                fadeout: None,
                 repeats: loaded.practice().is_some_and(|p| p.repeat),
             }
         } else {
             rig.seal_audio();
+            let ending = rig.declared_ending();
             Self {
-                ring_out_end: None,
+                end_at: hold_until(loaded.finish_anchor(), ending),
+                fadeout: Some(ending.fadeout),
                 repeats: false,
             }
         }
     }
 
-    /// Whether the stage has run to its end, for a play whose chart time 0
-    /// lies at `origin`.
+    /// The play time at which the stage has run to its end, for a play
+    /// whose chart time 0 lies at `origin`, or `None` while it runs.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn over<R: Rig>(self, rig: &R, origin: TimeUs) -> bool {
-        rig.audio_done()
-            && self
-                .ring_out_end
-                .is_none_or(|end_at| rig.now().0 - origin.0 >= end_at.0)
+    fn over<R: Rig>(self, rig: &R, origin: TimeUs) -> Option<TimeUs> {
+        if !rig.audio_done() {
+            return None;
+        }
+        let now = TimeUs(rig.now().0 - origin.0);
+        (now.0 >= self.end_at.0).then_some(now)
+    }
+}
+
+/// A full play's fade-out on its play clock: where it runs out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct FadeStage {
+    /// Where it runs out.
+    deadline: TimeUs,
+}
+
+impl FadeStage {
+    /// The fade-out that starts at play time `start` for a skin that
+    /// declares `fadeout`, or `None` when it has none ([`fade_deadline`]).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    const fn begin(start: TimeUs, fadeout: TimeUs) -> Option<Self> {
+        match fade_deadline(start, fadeout) {
+            Some(deadline) => Some(Self { deadline }),
+            None => None,
+        }
+    }
+
+    /// Whether it has run out at play time `now`.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    const fn over(self, now: TimeUs) -> bool {
+        now.0 >= self.deadline.0
     }
 }
 
@@ -2350,9 +2432,12 @@ impl TailEnd {
 /// an audio failure or a screen failure, which cut it with their cause;
 /// otherwise the tail's feedback converts the input that reached the
 /// play's queues ([`Logic::feedback_to`]): its presses sound and its lanes
-/// light, and nothing is judged or recorded. Whatever ends the tail ends
-/// the feedback first, so no press is taken after it; whatever ends it
-/// early stops its audio. The play stays complete either way.
+/// light, and nothing is judged or recorded. A full play with a fade-out
+/// then publishes it at the play time its hold ended ([`Logic::enter_fade`])
+/// and runs it to its deadline with the same exits, converting no input.
+/// Whatever ends the tail ends the feedback first, so no press is taken
+/// after it; whatever ends it early stops its audio. The play stays
+/// complete either way.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn run_tail<R: Rig>(
     rig: &mut R,
@@ -2378,39 +2463,82 @@ fn run_tail<R: Rig>(
         rig.cancel_audio();
         return end;
     }
-    while !stage.over(rig, origin) {
+    // The hold: the tail's feedback converts the input until it ends.
+    let held = loop {
+        if let Some(now) = stage.over(rig, origin) {
+            break now;
+        }
         rig.wait();
-        // Closing the window ends the run: no command is taken with it.
-        let ended = if rig.quitting() {
-            Some(TailEnd::Cut(AbortCause::Quit))
-        } else if let Some(c) = rig.take() {
-            Some(TailEnd::of(TailAction::of(c)))
-        } else if let Some(e) = rig.input_failure() {
-            *input_error = Some(e);
-            Some(TailEnd::Cut(AbortCause::InputFailed))
-        } else if rig.focus_lost() {
-            Some(TailEnd::Cut(AbortCause::FocusLoss))
-        } else if !rig.connected() {
-            Some(TailEnd::Cut(AbortCause::LastSourceRemoved))
-        } else if let Some(e) = rig.audio_failure() {
-            *output_error = Some(e);
-            Some(TailEnd::Cut(AbortCause::OutputFailed))
-        } else if rig.screen_failed() {
-            Some(TailEnd::Cut(AbortCause::ScreenFailed))
-        } else {
+        if let Some(end) = tail_exit(rig, input_error, output_error).or_else(|| {
             let _ = logic.feedback_to();
-            rig.stepped(false);
-            rig.audio_failure().map(|e| {
-                *output_error = Some(e);
-                TailEnd::Cut(AbortCause::OutputFailed)
-            })
-        };
-        if let Some(end) = ended {
+            tail_stepped(rig, output_error)
+        }) {
+            rig.cancel_audio();
+            return end;
+        }
+    };
+    // The fade-out, a full play's with a positive fadeout only: it converts
+    // nothing, so no press sounds and the lanes stay as the hold left them.
+    let Some(fade) = stage.fadeout.and_then(|fo| FadeStage::begin(held, fo)) else {
+        return TailEnd::RanOut;
+    };
+    logic.enter_fade(held);
+    loop {
+        if fade.over(TimeUs(rig.now().0 - origin.0)) {
+            return TailEnd::RanOut;
+        }
+        rig.wait();
+        if let Some(end) =
+            tail_exit(rig, input_error, output_error).or_else(|| tail_stepped(rig, output_error))
+        {
             rig.cancel_audio();
             return end;
         }
     }
-    TailEnd::RanOut
+}
+
+/// What ends the tail at a wait, in both its hold and its fade-out, if
+/// anything does: closing the window, a command (skipping to the result,
+/// a retry or a suspend), an input-thread failure, focus loss, removal of
+/// the last device, an audio failure or a screen failure, in this order.
+/// A failure is latched into `input_error` or `output_error`.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn tail_exit<R: Rig>(
+    rig: &mut R,
+    input_error: &mut Option<InputWaitError>,
+    output_error: &mut Option<OutputError>,
+) -> Option<TailEnd> {
+    // Closing the window ends the run: no command is taken with it.
+    if rig.quitting() {
+        Some(TailEnd::Cut(AbortCause::Quit))
+    } else if let Some(c) = rig.take() {
+        Some(TailEnd::of(TailAction::of(c)))
+    } else if let Some(e) = rig.input_failure() {
+        *input_error = Some(e);
+        Some(TailEnd::Cut(AbortCause::InputFailed))
+    } else if rig.focus_lost() {
+        Some(TailEnd::Cut(AbortCause::FocusLoss))
+    } else if !rig.connected() {
+        Some(TailEnd::Cut(AbortCause::LastSourceRemoved))
+    } else if let Some(e) = rig.audio_failure() {
+        *output_error = Some(e);
+        Some(TailEnd::Cut(AbortCause::OutputFailed))
+    } else if rig.screen_failed() {
+        Some(TailEnd::Cut(AbortCause::ScreenFailed))
+    } else {
+        None
+    }
+}
+
+/// A tail's step once nothing ended it: the frame is stepped, and an audio
+/// failure reported meanwhile ends the tail.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn tail_stepped<R: Rig>(rig: &mut R, output_error: &mut Option<OutputError>) -> Option<TailEnd> {
+    rig.stepped(false);
+    rig.audio_failure().map(|e| {
+        *output_error = Some(e);
+        TailEnd::Cut(AbortCause::OutputFailed)
+    })
 }
 
 /// Runs a play's Closing until it ends (design.md "Play Lifecycle",

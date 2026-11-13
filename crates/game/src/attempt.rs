@@ -177,6 +177,20 @@ impl NoteEnd {
     }
 }
 
+/// A full play's finish anchor on `chart`'s play clock (design.md "Play
+/// Lifecycle", Audio tail; the source's `playtime` less its margin,
+/// `play/BMSPlayer.java:198-199` at 0.8.9): the last note's end
+/// ([`NoteEnd::Play`]) for a played chart, or, autoplayed, its last
+/// object, background sounds included ([`Chart::last_object`]).
+#[must_use]
+pub fn finish_anchor(chart: &Chart, autoplay: bool) -> TimeUs {
+    if autoplay {
+        chart.last_object()
+    } else {
+        NoteEnd::Play.of(chart)
+    }
+}
+
 impl Attempt {
     /// The attempt numbered `number` of `chart` under `preset`: the whole
     /// chart with a `lead_in` READY state, or the round of `section`, its
@@ -305,6 +319,25 @@ mod tests {
             speed: Speed::from_twentieths(30).unwrap(),
         };
         assert_eq!(practice.of(&chart), TimeUs(6_148_914_691_236_517_204));
+    }
+
+    /// A full play's finish anchor: the last note's end when played; the
+    /// last object, a background sound after the last note included, when
+    /// autoplayed.
+    #[test]
+    fn the_finish_anchor_is_the_last_note_or_the_last_object() {
+        let lane = |i| Lane::new(i).unwrap();
+        let mut chart = ChartBuilder::new(150_000)
+            .tap(lane(1), TimeUs(1_000 * MS))
+            .long(lane(2), TimeUs(2_000 * MS), TimeUs(3_500 * MS))
+            .build()
+            .unwrap();
+        chart.bgm.push(BgmEvent {
+            time: TimeUs(6_000 * MS),
+            sound: SoundId(1),
+        });
+        assert_eq!(super::finish_anchor(&chart, false), TimeUs(3_500 * MS));
+        assert_eq!(super::finish_anchor(&chart, true), TimeUs(6_000 * MS));
     }
 
     /// Without notes, the whole chart ends at 0 whatever background

@@ -287,6 +287,7 @@ fn decision_entry_points_refuse_other_kinds() {
         target: fx.target,
         layout: &fx.layout,
         timers: skin_model::ResultTimers::default(),
+        app: skin_model::AppReadouts::LAUNCH,
     };
     assert_eq!(
         fx.skin

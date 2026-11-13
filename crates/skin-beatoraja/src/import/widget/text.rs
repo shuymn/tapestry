@@ -105,7 +105,15 @@ impl Cx<'_> {
     pub(in super::super) fn text(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
         let role = Role::Decorative.or_failure(dst.failure);
-        let [r, value, constant] = self.def.fields(rec, ["ref", "value", "constantText"]);
+        let [r, value, constant, event] = self
+            .def
+            .fields(rec, ["ref", "value", "constantText", "event"]);
+        // The search box: a text whose `ref` has the one native writer,
+        // the query's, and no `event` of its own
+        // (`JsonSkinObjectLoader.java:663-665`); a `value` has no writer.
+        let search = self.kind == skin_model::ScreenKind::Selection
+            && event.is_none_or(|f| matches!(self.def.arena.scalar(f), crate::tree::Scalar::Null))
+            && r.is_some_and(|f| self.def.int(f, "ref").is_ok_and(|r| r == 30));
         // The effective string (`JsonSkinObjectLoader.java:633-636`,
         // `SkinText.java:102`). A function folds or follows the role, and
         // it never falls back to `ref`.
@@ -198,6 +206,8 @@ impl Cx<'_> {
         self.budget
             .text(u32::try_from(quads).unwrap_or(u32::MAX))
             .map_err(|l| self.limit(at, l))?;
+        // Only text showing the query takes the press as the search box.
+        c.search = search && text == TextValue::Selection(skin_model::SelectionText::Query);
         let index = u32::try_from(self.widgets.texts.len()).unwrap_or(u32::MAX);
         self.widgets.texts.push(TextDef {
             value: text,

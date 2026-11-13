@@ -157,6 +157,7 @@ fn quads(skin: &Skin, r: &Renderer, perfect: u32) -> (Vec<Sprite>, skin_model::A
             screen: Some(TimeUs(0)),
             fadeout: None,
         },
+        app: skin_model::AppReadouts::LAUNCH,
     };
     skin.build_result(&mut res, &frame, atlas.uvs(), &mut out)
         .unwrap();

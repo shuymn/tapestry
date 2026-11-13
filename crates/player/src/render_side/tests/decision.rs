@@ -64,6 +64,7 @@ fn view_on(chart: &str, title: &str) -> SelectionView {
     let l = labels(title);
     SelectionView {
         rows: vec![RowView {
+            index: Some(0),
             key: RowKey::Chart(chart.into()),
             kind: RowKind::Chart,
             title: l.title.clone(),

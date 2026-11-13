@@ -58,8 +58,8 @@ fn the_play_level_follows_the_frames_chosen_chart() {
 
 /// Untimed destinations and image cycles draw while loading, from the
 /// loading state's origin, while those on an explicit `ready` (40) stay
-/// absent; a play runs them again from `ready`'s start, READY's
-/// restart.
+/// absent; a play runs them on from the play state's screen origin, here
+/// 1 234 ms before READY, never restarted at READY.
 #[test]
 fn untimed_elements_run_from_the_loading_origin() {
     // Told apart by width: 10 untimed, 11 on ready, 12 moving untimed,
@@ -95,13 +95,22 @@ fn untimed_elements_run_from_the_loading_origin() {
     assert_ne!(first, later);
     assert_eq!(l.loading.timer(timer::SCREEN), Some(bms_model::TimeUs(0)));
 
-    // In the play the same element runs from `ready`'s start.
+    // In the play the same element runs on from the screen origin,
+    // 1 234 ms before READY: at READY + 500 ms it is 1 734 ms into its
+    // track, which loops from 0 at 1 000 ms, where a restart at READY
+    // would put it at 500.
     let mut d = import_body(&body).drawn();
+    d.screen_from -= 1_234_000;
     d.frame(0, &[]);
     let ready = d.play.timer(timer::READY).expect("ready has started").0 / 1_000;
-    assert_eq!(d.play.timer(timer::SCREEN), d.play.timer(timer::READY));
-    let rects = d.rects(ready + 500);
+    assert_eq!(
+        d.play.timer(timer::SCREEN).map(|t| t.0 / 1_000),
+        Some(ready - 1_234)
+    );
+    let rects = d.rects(ready - 1_234 + 500);
     assert_eq!(of_width(&rects, 12).map(|r| r[0]), Some(500));
+    let rects = d.rects(ready + 500);
+    assert_eq!(of_width(&rects, 12).map(|r| r[0]), Some(734));
 }
 
 /// Op 80 holds in every loading frame, whatever the load's progress, and

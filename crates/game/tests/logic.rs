@@ -622,3 +622,30 @@ fn a_frozen_step_finds_the_last_source_removed() {
     assert_eq!(logic.finalized(), Some(TimeUs(200_000)));
     assert_eq!(logic.record().events, [disconnected(300_000, 0)]);
 }
+
+/// A fade-out started with `Logic::enter_fade` is in both views at once:
+/// the one the logic side reads (`Logic::view`) and the one the render side
+/// acquires; before it, neither has one.
+#[test]
+fn enter_fade_reaches_both_views() {
+    let chart = taps(&[(1, 1_000)]);
+    let rule = rules::tapestry();
+    let dev = device(&[0]);
+    let (w, r) = source_queue(16);
+    w.publish(TimeUs(500_000));
+    let (mut logic, mut render) = Logic::new(
+        &chart,
+        &rule,
+        &dev,
+        &InputStart::default(),
+        vec![r],
+        CONFIG,
+        Vec::new(),
+    )
+    .unwrap();
+    let _ = logic.advance_to(TimeUs(501_000));
+    assert_eq!((logic.view().fading, render.view().fading), (None, None));
+    logic.enter_fade(TimeUs(9_000_000));
+    assert_eq!(logic.view().fading, Some(TimeUs(9_000_000)));
+    assert_eq!(render.view().fading, Some(TimeUs(9_000_000)));
+}

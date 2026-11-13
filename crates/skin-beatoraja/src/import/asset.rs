@@ -333,6 +333,10 @@ pub(crate) struct Assets {
     /// The judge graphs' white chip grids, by lit texels across and down:
     /// at most four.
     chip_grids: HashMap<[u8; 2], u32>,
+    /// Each admitted file's whole-decode verdict ([`Self::validate`]),
+    /// kept for the import whatever the source caches: a cancellation is
+    /// never kept.
+    validated: HashMap<u32, Result<(), Invalid>>,
 }
 
 #[cfg(test)]
@@ -340,6 +344,11 @@ thread_local! {
     /// The `admit_file` calls this thread has made: a header is read at
     /// most once per call.
     pub(crate) static ADMITS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// The whole decodes [`Assets::validate`] has run on this thread.
+    pub(crate) static VALIDATIONS: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// A request cancelled once the next whole decode has run.
+    pub(crate) static CANCEL_AFTER: std::cell::RefCell<Option<crate::lua::Cancel>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 impl Assets {
@@ -355,6 +364,7 @@ impl Assets {
             note_fallbacks: [None; 3],
             systems: HashMap::new(),
             chip_grids: HashMap::new(),
+            validated: HashMap::new(),
         }
     }
 
@@ -508,14 +518,27 @@ impl Assets {
     }
 
     /// Whether admitted file `file` decodes completely
-    /// ([`SheetBuilder::validate_file`]), `cancel` asked as it goes.
-    pub(crate) fn validate(&self, file: u32, cancel: &dyn Fn() -> bool) -> Result<(), Invalid> {
-        match self.builder.validate_file(file, cancel) {
+    /// ([`SheetBuilder::validate_file`]), `cancel` asked as it goes: one
+    /// whole decode a file in an import, its verdict kept for every later
+    /// request, which asks `cancel` too. A cancellation is not kept.
+    pub(crate) fn validate(&mut self, file: u32, cancel: &dyn Fn() -> bool) -> Result<(), Invalid> {
+        if let Some(&v) = self.validated.get(&file) {
+            return if cancel() { Err(Invalid::Cancelled) } else { v };
+        }
+        #[cfg(test)]
+        VALIDATIONS.with(|n| n.set(n.get() + 1));
+        let v = match self.builder.validate_file(file, cancel) {
             Ok(()) => Ok(()),
-            Err(None) => Err(Invalid::Cancelled),
+            Err(None) => return Err(Invalid::Cancelled),
             Err(Some(e)) if refused(&e) => Err(Invalid::Refused),
             Err(Some(_)) => Err(Invalid::Fails),
+        };
+        #[cfg(test)]
+        if let Some(c) = CANCEL_AFTER.with(|c| c.borrow_mut().take()) {
+            c.cancel();
         }
+        self.validated.insert(file, v);
+        v
     }
 
     /// The error a failed file was cached with, taken: a critical user
@@ -844,6 +867,12 @@ mod tests {
         // the import stops, and the verdict is not cached.
         assert_eq!(assets.validate(file, &|| true), Err(Invalid::Cancelled));
         assert_eq!(assets.validate(file, &|| false), Ok(()));
+        // The verdict kept: a later request decodes nothing, and still
+        // stops on a cancellation.
+        VALIDATIONS.with(|n| n.set(0));
+        assert_eq!(assets.validate(file, &|| false), Ok(()));
+        assert_eq!(assets.validate(file, &|| true), Err(Invalid::Cancelled));
+        assert_eq!(VALIDATIONS.with(std::cell::Cell::get), 0);
     }
 
     #[test]

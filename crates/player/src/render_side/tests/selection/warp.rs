@@ -302,6 +302,7 @@ fn row(key: RowKey, kind: RowKind, title: &str) -> RowView {
     RowView {
         key,
         kind,
+        index: None,
         title: title.to_owned(),
         subtitle: String::new(),
         artist: String::new(),
@@ -337,6 +338,7 @@ fn listed(place: SelectionPlace, query: &str) -> SelectionView {
         place,
         query: query.to_owned(),
         selected: None,
+        list_revision: 0,
     }
 }
 

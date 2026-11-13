@@ -622,7 +622,8 @@ impl Cx<'_> {
     /// resolution ([`Self::resolve_path`]). A file is unknown unless
     /// `decode`: the installation pass reads no file, since the import
     /// charges an element before it admits a file and admits none for an
-    /// element it drops. With `decode` a file is admitted, as its own
+    /// element it drops, but for a song list placement's image set, whose
+    /// entries' files are admitted to tell its holes apart. With `decode` a file is admitted, as its own
     /// import would (cached for it): missing, it is absent; refused only by
     /// this importer, unknown; admitted, it loads once a whole decode
     /// proves it (the verdict cached), else it is absent.
@@ -732,8 +733,8 @@ impl Cx<'_> {
         c: &Common,
         timer: &Prop,
     ) -> Result<(Option<String>, Option<u16>), Unsupported> {
-        // The source's first key, before D20 settles a critical track.
-        let held = c.track.end == skin_model::End::Hold && c.first_at == 0;
+        let held =
+            c.track.end == skin_model::End::Hold && c.track.keys.first().is_some_and(|k| k.at == 0);
         if !held {
             return Err(Unsupported::Construct(
                 "a slider value whose keys need the source's prepare clock",

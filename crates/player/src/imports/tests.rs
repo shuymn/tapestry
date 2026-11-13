@@ -1838,3 +1838,26 @@ fn the_reports_carry_text_only() {
 
 mod attempt;
 mod startup;
+
+/// A JSON skin's import observes the stop its caller gives, as a Lua
+/// pass's does: requested, the import ends with the cancellation.
+#[test]
+fn a_json_import_observes_its_stop() {
+    let dir = options_skin();
+    let (def, header) = skin_beatoraja::read_header(dir.path(), "s.json").unwrap();
+    let config = skin_beatoraja::Config::defaults(&header);
+    let cancel = Cancel::new();
+    cancel.cancel();
+    let r = super::import_json(def, &header, &config, ScreenKind::Play, &cancel);
+    assert!(
+        matches!(
+            r,
+            Err(skin_beatoraja::ImportError::Lua {
+                why: skin_beatoraja::LuaWhy::Cancelled,
+                ..
+            })
+        ),
+        "{:?}",
+        r.map(|i| i.report)
+    );
+}

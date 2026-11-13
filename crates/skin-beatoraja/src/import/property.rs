@@ -1174,12 +1174,12 @@ mod tests {
         assert!(STRING_TYPES.contains(&(12, "fulltitle")));
     }
 
-    /// Numbers 20 to 29 read the application's readouts on play and on
-    /// selection, by id and by name, each the field of the same name and
-    /// range in either schema, and stay unsupported on result, whose row
-    /// bridges them (S10-16); 19 and 30 stay unsupported.
+    /// Numbers 20 to 29 read the application's readouts on play, on
+    /// selection and on result, by id and by name, each the field of the
+    /// same name and range in every schema, always available; 19 and 30
+    /// stay unsupported.
     #[test]
-    fn application_readouts_resolve_on_play_and_selection() {
+    fn application_readouts_resolve_on_play_selection_and_result() {
         let scope = skin_model::Scope::new(&skin_model::PLAY);
         let named = [
             (20, "current_fps", "app.fps", (0, 1_024)),
@@ -1222,10 +1222,23 @@ mod tests {
                 )
                 .is_ok()
             );
+            let IntProp::Shown(res @ Value::Result(r)) = int_in(ScreenKind::Result, id) else {
+                panic!("result {id}: {:?}", int_in(ScreenKind::Result, id));
+            };
             assert_eq!(
-                int_in(ScreenKind::Result, id),
-                IntProp::Unsupported(Some(id)),
+                (r.expr, r.guard, r.range),
+                (expr, "true", range),
                 "result {id}"
+            );
+            assert_eq!(res.range(), range, "result {id}");
+            assert!(r.part.is_none(), "result {id}");
+            assert!(
+                skin_model::compile(
+                    expr,
+                    &skin_model::Scope::new(&skin_model::RESULT),
+                    skin_model::Ty::Int
+                )
+                .is_ok()
             );
         }
         assert_eq!(int_by_id(19), IntProp::Unsupported(Some(19)));

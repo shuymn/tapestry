@@ -28,6 +28,9 @@ pub struct FrameInput<'a> {
     /// The state clock: µs since the play state was entered, sampled with
     /// `now` ([`SkinFrame::state_us`](skin_model::SkinFrame::state_us)).
     pub state_us: i64,
+    /// The screen clock: µs since the play state's screen origin, sampled
+    /// with `now` ([`SkinFrame::screen_us`](skin_model::SkinFrame::screen_us)).
+    pub screen_us: i64,
     /// The lanes: the exact original-lane gain and the effective covers
     /// (design.md "Play readouts"), from the frame's presentation
     /// snapshot ([`presentation::frame`](crate::presentation::frame)).
