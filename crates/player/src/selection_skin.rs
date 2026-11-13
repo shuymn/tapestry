@@ -295,6 +295,9 @@ pub struct SelectionLogic {
     /// notice for as long as this state lasts, a screen built again
     /// after a device loss included (design.md "beatoraja Lua Skins").
     pub(crate) script_stop: Option<crate::screens::ScriptStop>,
+    /// The pointer's point in target pixels for the next frame's hover;
+    /// none outside the window. The render thread sets it each frame.
+    pub pointer: Option<[f32; 2]>,
 }
 
 impl SelectionLogic {
@@ -307,6 +310,7 @@ impl SelectionLogic {
             id,
             script: ScriptSlot::default(),
             script_stop: None,
+            pointer: None,
         }
     }
 
@@ -433,7 +437,8 @@ impl SkinFeed {
         let (before, after) = self.window.map_or((0, 0), |(center, slots)| {
             (center, slots.saturating_sub(1).saturating_sub(center))
         });
-        let view = screen.view(before, after, false);
+        let mut view = screen.view(before, after, false);
+        view.list_revision = self.list_revision;
         let row = view
             .cursor
             .and_then(|c| view.rows.get(c))
@@ -473,6 +478,9 @@ impl SkinFeed {
 pub struct SelectionDrawn {
     pub timing: render::FrameTiming,
     pub refused: Option<String>,
+    /// Whether the frame drew the skin, not the built-in page: what the
+    /// pointer is hit-tested on.
+    pub skinned: bool,
 }
 
 /// A self-made JSON selection skin (tests): a song list of seven
@@ -521,28 +529,8 @@ pub(crate) fn panels_fixture() -> tempfile::TempDir {
 /// own.
 #[cfg(test)]
 fn fixture_of(widgets: &str, drawn: &str) -> tempfile::TempDir {
-    use std::fmt::Write as _;
-
-    let dir = tempfile::tempdir().unwrap();
-    let d = dir.path();
-    let file = std::fs::File::create(d.join("s.png")).unwrap();
-    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 16, 16);
-    e.set_color(png::ColorType::Rgba);
-    e.set_depth(png::BitDepth::Eight);
-    let white = vec![255_u8; 16 * 16 * 4];
-    e.write_header().unwrap().write_image_data(&white).unwrap();
-    let font = crate::font_support::build(&crate::font_support::cjk("F"));
-    std::fs::write(d.join("f.ttf"), font).unwrap();
-    let mut slots = String::new();
-    for i in 0..7 {
-        let sep = if i == 0 { "" } else { "," };
-        let y = 900 - i * 100;
-        write!(
-            slots,
-            r#"{sep}{{"id": "set", "dst": [{{"x": 1000, "y": {y}, "w": 800, "h": 80}}]}}"#
-        )
-        .unwrap();
-    }
+    let dir = fixture_files();
+    let slots = fixture_slots();
     let json = format!(
         r#"{{"type": 5, "w": 1920, "h": 1080,
             "source": [{{"id": "s", "path": "s.png"}}],
@@ -558,7 +546,129 @@ fn fixture_of(widgets: &str, drawn: &str) -> tempfile::TempDir {
                             {{"id": "place", "dst": [{{"x": 100, "y": 1000, "w": 800, "h": 40}}]}},
                             {{"id": "q", "dst": [{{"x": 100, "y": 950, "w": 800, "h": 40}}]}}{drawn}]}}"#
     );
-    std::fs::write(d.join("s.json"), json).unwrap();
+    std::fs::write(dir.path().join("s.json"), json).unwrap();
+    dir
+}
+
+/// A folder holding the fixtures' image `s.png` (16×16, white) and font
+/// `f.ttf`.
+#[cfg(test)]
+fn fixture_files() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let d = dir.path();
+    let file = std::fs::File::create(d.join("s.png")).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), 16, 16);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let white = vec![255_u8; 16 * 16 * 4];
+    e.write_header().unwrap().write_image_data(&white).unwrap();
+    let font = crate::font_support::build(&crate::font_support::cjk("F"));
+    std::fs::write(d.join("f.ttf"), font).unwrap();
+    dir
+}
+
+/// The fixtures' seven song list placements: slot `i` at x 1000, y-down
+/// top `100 + 100·i`, 800×80.
+#[cfg(test)]
+fn fixture_slots() -> String {
+    use std::fmt::Write as _;
+
+    let mut slots = String::new();
+    for i in 0..7 {
+        let sep = if i == 0 { "" } else { "," };
+        let y = 900 - i * 100;
+        write!(
+            slots,
+            r#"{sep}{{"id": "set", "dst": [{{"x": 1000, "y": {y}, "w": 800, "h": 80}}]}}"#
+        )
+        .unwrap();
+    }
+    slots
+}
+
+/// A selection skin taking the pointer (dev-tools tests), on a 1920×1080
+/// canvas whose y-down rects (left, top, width, height) are, in draw
+/// order: [`fixture`]'s song list (slot `i` at 1000, `100 + 100·i`,
+/// 800×80, center 3), every slot clickable, in slot order; search text 30
+/// right-aligned at x 900, top 40, 400×40 (its input box 500 to 900);
+/// action images with click type 0: event 12 at 100, 200, event 15 at 100,
+/// 300 and event 315 at 100, 400, each 100×50; the list slider (type 1)
+/// sliding right 1 000 from 100, 900, 20×40 (its travel x 100 to 1 100,
+/// y 900 to 940); event 13 over that travel at 500, 905, 40×30; events 13,
+/// 331 and 340 over slot 4 at 1300, 1400 and 1500, top 510, each 60×40;
+/// slider 17 (the master gain) sliding right 200 from 1050, 610, 20×40
+/// (over slot 5, its travel x 1 050 to 1 250); and an image at 100, 1000,
+/// 179×37 drawn only while the pointer is inside its region, by a
+/// `mouseRect` {0, 0, 179, 37} as a hover button's. Without `volume`,
+/// slider 17 is not drawn.
+#[cfg(test)]
+#[cfg(feature = "dev-tools")]
+pub(crate) fn pointer_fixture(volume: bool) -> tempfile::TempDir {
+    let dir = fixture_files();
+    let slots = fixture_slots();
+    // A destination of `id` whose y-down rect is `[x, top, w, h]`.
+    let dst = |id: &str, [x, top, w, h]: [i32; 4], more: &str| {
+        let y = 1_080 - top - h;
+        format!(r#", {{"id": "{id}", {more} "dst": [{{"x": {x}, "y": {y}, "w": {w}, "h": {h}}}]}}"#)
+    };
+    let act = |id: &str, event: u16| {
+        format!(
+            r#", {{"id": "{id}", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "act": {event}, "click": 0}}"#
+        )
+    };
+    let images: String = [
+        act("a12", 12),
+        act("a13", 13),
+        act("a15", 15),
+        act("a315", 315),
+        act("a331", 331),
+        act("a340", 340),
+    ]
+    .concat();
+    let drawn: String = [
+        dst("q", [900, 40, 400, 40], ""),
+        // A second search text, and event 13 over each box, inside it and
+        // outside the other.
+        dst("q2", [1_000, 0, 300, 30], ""),
+        dst("a13", [600, 45, 40, 20], ""),
+        dst("a13", [1_050, 5, 40, 20], ""),
+        dst("a12", [100, 200, 100, 50], ""),
+        dst("a15", [100, 300, 100, 50], ""),
+        dst("a315", [100, 400, 100, 50], ""),
+        dst("ls", [100, 900, 20, 40], ""),
+        dst("a13", [500, 905, 40, 30], ""),
+        dst("a13", [1_300, 510, 60, 40], ""),
+        dst("a331", [1_400, 510, 60, 40], ""),
+        dst("a340", [1_500, 510, 60, 40], ""),
+        if volume {
+            dst("vol", [1_050, 610, 20, 40], "")
+        } else {
+            String::new()
+        },
+        dst(
+            "b",
+            [100, 1_000, 179, 37],
+            r#""mouseRect": {"x": 0, "y": 0, "w": 179, "h": 37},"#,
+        ),
+    ]
+    .concat();
+    let json = format!(
+        r#"{{"type": 5, "w": 1920, "h": 1080,
+            "source": [{{"id": "s", "path": "s.png"}}],
+            "font": [{{"id": "f", "path": "f.ttf"}}],
+            "image": [{{"id": "b", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8}}{images}],
+            "imageset": [{{"id": "set", "images": ["b", "b", "b", "b", "b", "b"]}}],
+            "slider": [{{"id": "ls", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "type": 1, "angle": 1, "range": 1000}},
+                       {{"id": "vol", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "type": 17, "angle": 1, "range": 200, "changeable": true}}],
+            "text": [{{"id": "t", "font": "f", "size": 30, "ref": 10}},
+                     {{"id": "q", "font": "f", "size": 30, "ref": 30, "align": 2}},
+                     {{"id": "q2", "font": "f", "size": 30, "ref": 30}}],
+            "songlist": {{"id": "list", "center": 3, "liston": [{slots}], "listoff": [{slots}],
+                          "clickable": [0, 1, 2, 3, 4, 5, 6],
+                          "text": [{{"id": "t", "dst": [{{"x": 10, "y": 10, "w": 700, "h": 40}}]}}]}},
+            "destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}{drawn}]}}"#
+    );
+    std::fs::write(dir.path().join("s.json"), json).unwrap();
     dir
 }
 

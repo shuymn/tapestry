@@ -185,6 +185,8 @@ pub struct Sel {
     pub timers: SelectionTimers,
     /// The application's readouts each frame gives.
     pub app: skin_model::AppReadouts,
+    /// The pointer each frame gives, in target pixels.
+    pub pointer: Option<[f32; 2]>,
 }
 
 impl Sel {
@@ -204,6 +206,7 @@ impl Sel {
                 ..SelectionTimers::default()
             },
             app: skin_model::AppReadouts::LAUNCH,
+            pointer: None,
         }
     }
 
@@ -247,6 +250,7 @@ impl Sel {
             layout: &Layout::AUTHOR,
             timers: self.timers,
             app: self.app,
+            pointer: self.pointer,
         };
         self.skin
             .build_selection(&mut self.sel, &frame, &self.uvs, &mut self.batch)
@@ -287,6 +291,7 @@ pub fn chart(title: &str) -> RowView {
     RowView {
         key: RowKey::Chart(PathBuf::from(format!("{title}.bms"))),
         kind: RowKind::Chart,
+        index: None,
         title: title.to_owned(),
         subtitle: String::new(),
         artist: String::new(),
@@ -381,6 +386,7 @@ pub fn view(
         place: SelectionPlace::Top,
         query: String::new(),
         selected,
+        list_revision: 0,
     }
 }
 

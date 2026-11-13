@@ -599,6 +599,7 @@ fn draw_selection(skin: &skin_model::Skin) -> Vec<usize> {
             _ => RowKey::Folder(skin_model::FolderId::new(title.into())),
         },
         kind,
+        index: None,
         title: title.to_owned(),
         subtitle: String::new(),
         artist: String::new(),
@@ -642,6 +643,7 @@ fn draw_selection(skin: &skin_model::Skin) -> Vec<usize> {
             place: SelectionPlace::Folder(vec!["f".to_owned()]),
             query: "q".to_owned(),
             selected,
+            list_revision: 0,
         };
         skin.update_selection(&mut sel, &view, &labels)
             .expect("an imported selection skin takes a view");
@@ -660,6 +662,7 @@ fn draw_selection(skin: &skin_model::Skin) -> Vec<usize> {
                     panels: [Some(TimeUs(0)), None, None],
                 },
                 app: skin_model::AppReadouts::LAUNCH,
+                pointer: None,
             };
             skin.build_selection(&mut sel, &frame, &uvs, &mut batch)
                 .expect("an imported selection skin builds");
@@ -667,7 +670,7 @@ fn draw_selection(skin: &skin_model::Skin) -> Vec<usize> {
             drawn.push(batch.quads().len());
             let before = format!("{sel:?}");
             for q in batch.quads() {
-                let _ = skin.slider_at(&sel, [q.rect[0], q.rect[1]], [1_920, 1_080]);
+                let _ = skin.drag_at(&sel, [q.rect[0], q.rect[1]], [1_920, 1_080]);
             }
             assert_eq!(format!("{sel:?}"), before, "a press changed the state");
         }

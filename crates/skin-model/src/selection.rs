@@ -30,6 +30,10 @@ pub struct SelectionView {
     pub query: String,
     /// The chart under the cursor; `None` on any other row.
     pub selected: Option<SelectedChart>,
+    /// The list's revision: it changes whenever the list's rows may have
+    /// changed, so a [`RowRef`](crate::RowRef) drawn from an earlier list
+    /// names no row of this one.
+    pub list_revision: u64,
 }
 
 /// An exact ratio `numerator / denominator`, the denominator never zero.
@@ -253,6 +257,10 @@ pub enum RowKind {
 pub struct RowView {
     pub key: RowKey,
     pub kind: RowKind,
+    /// The row's index among the list's selectable rows, the cursor's
+    /// space; `None` for a heading, and where the view does not number
+    /// its rows.
+    pub index: Option<u32>,
     /// A chart's `#TITLE` as stored, a folder's directory name, a heading's
     /// folder under its root; empty for the "all charts" row and a chart
     /// without a title.

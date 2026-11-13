@@ -524,6 +524,7 @@ pub trait Screen: Send {
             .map(|timing| SelectionDrawn {
                 timing,
                 refused: None,
+                skinned: false,
             })
     }
     /// The lines the selection skin's text last asked for, and how many
@@ -828,6 +829,10 @@ pub enum RenderMsg {
     /// The settings keys' values, which every selection frame reads the
     /// volume and the display offset from. Sent once, at the start.
     Tuning(Arc<LiveTuning>),
+    /// The pointer's shared state, which every selection frame reads the
+    /// hover's point from and answers the pointer's batches and drags
+    /// through. Sent once, at the start.
+    Pointer(Arc<crate::pointer::PointerShared>),
     /// Make sure the screen can draw, building it again if it failed (the
     /// device's recovery, for a play and the menus alike), and answer when
     /// it can. It prepares no attempt.
@@ -2470,6 +2475,12 @@ impl RenderLink {
         self.send(RenderMsg::Tuning(tuning));
     }
 
+    /// Hands the render thread the pointer's shared state: every selection
+    /// frame draws its hover and answers its batches and drags.
+    pub fn pointer(&self, pointer: Arc<crate::pointer::PointerShared>) {
+        self.send(RenderMsg::Pointer(pointer));
+    }
+
     /// Hands the render thread the adjustments' snapshots, which every
     /// play and loading frame is drawn from from now on.
     pub fn presentation(&self, reader: game::adjustment::PresentationReader) {
@@ -3354,6 +3365,8 @@ pub fn spawn(
                 page_turns: false,
                 decision: None,
                 tuning: None,
+                pointer: None,
+                drag_seen: crate::pointer::Seen::default(),
                 current: None,
                 #[cfg(feature = "dev-tools")]
                 ready: None,
@@ -4170,6 +4183,10 @@ struct Run {
     decision: Option<Box<MenuPage>>,
     /// The settings keys' values ([`RenderMsg::Tuning`]).
     tuning: Option<Arc<LiveTuning>>,
+    /// The pointer's shared state ([`RenderMsg::Pointer`]).
+    pointer: Option<Arc<crate::pointer::PointerShared>>,
+    /// The drag cell's movement last taken: one drag a frame.
+    drag_seen: crate::pointer::Seen,
     /// The committed attempt's tempo and presentation epoch, which its
     /// play frames project the snapshot with.
     current: Option<(game::AttemptTempo, u64)>,
@@ -4610,6 +4627,10 @@ impl Run {
                     self.tuning = Some(tuning);
                     continue;
                 }
+                Ok(RenderMsg::Pointer(pointer)) => {
+                    self.pointer = Some(pointer);
+                    continue;
+                }
                 Ok(RenderMsg::Commit { request, reply }) => {
                     let _ = reply.send(self.commit(request));
                     continue;
@@ -4842,6 +4863,11 @@ impl Run {
             {
                 self.selection = None;
                 mode = Mode::Idle;
+                // A batch in flight is answered with no build: nothing
+                // waits on a selection no longer drawn.
+                if let Some(pointer) = &self.pointer {
+                    pointer.serve(None, None, screen.target(), &mut self.drag_seen);
+                }
                 continue;
             }
             // The result was left during the wait: nothing of it is drawn.
@@ -5179,6 +5205,12 @@ impl Run {
                     if let Some(logic) = shown.logic.as_mut() {
                         logic
                             .apply_settings(shown.update.settings.as_ref(), self.tuning.as_deref());
+                        // The hover's point as the window last saw it.
+                        logic.pointer = self
+                            .pointer
+                            .as_ref()
+                            .and_then(|p| p.position())
+                            .map(crate::pointer::point);
                     }
                     // The frame's one reading: its timers age on the instant
                     // the readouts were sampled at.
@@ -5218,6 +5250,27 @@ impl Run {
                             .selection_refused
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner) = Some(why.clone());
+                    }
+                    // The pointer's batch and drag, on what this frame built.
+                    if let Some(pointer) = &self.pointer {
+                        let u = &shown.update;
+                        let built = drawn.as_ref().ok().map(|d| crate::pointer::Built {
+                            lifetime: u.lifetime,
+                            revision: u.revision,
+                            list_revision: u.list_revision,
+                            cursor: u
+                                .view
+                                .cursor
+                                .and_then(|c| u.view.rows.get(c))
+                                .and_then(|r| r.index),
+                            skinned: d.skinned && d.refused.is_none() && shown.logic.is_some(),
+                        });
+                        pointer.serve(
+                            built,
+                            shown.logic.as_ref(),
+                            screen.target(),
+                            &mut self.drag_seen,
+                        );
                     }
                     #[cfg(feature = "dev-tools")]
                     if let Ok(d) = &drawn {
@@ -12604,6 +12657,7 @@ pub(crate) mod tests {
             }
             // The skin's frame at `now`, built by the model alone, when the
             // skin is a selection skin.
+            let mut skinned = false;
             if let Some(logic) = logic.filter(|_| state.is_some()) {
                 let skin = Arc::clone(logic.bundle.skin());
                 if skin
@@ -12620,11 +12674,13 @@ pub(crate) mod tests {
                         layout: &skin_model::Layout::AUTHOR,
                         timers: update.events.timers(),
                         app,
+                        pointer: logic.pointer,
                     };
                     if skin
                         .build_selection(&mut logic.sel, &frame, logic.bundle.uvs(), &mut batch)
                         .is_ok()
                     {
+                        skinned = true;
                         let rects = batch.quads().iter().map(|q| q.rect).collect();
                         self.shared.built.lock().unwrap().push((seen, now, rects));
                     }
@@ -12634,6 +12690,7 @@ pub(crate) mod tests {
                 .then(|| "refused for the test".to_owned());
             Ok(crate::selection_skin::SelectionDrawn {
                 timing: timing(true),
+                skinned: skinned && refused.is_none(),
                 refused,
             })
         }
