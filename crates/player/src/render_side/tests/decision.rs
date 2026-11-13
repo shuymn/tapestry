@@ -2187,3 +2187,5 @@ fn recover_refusal_stands_when_the_result_restore_fails() {
 
 // The decision skin through the player's flow.
 mod flow;
+// The decision skin inside the whole run, with the full configured set.
+mod integrated;

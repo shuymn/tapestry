@@ -18,7 +18,7 @@ windows-only = true
 [features]
 default = []
 # Development features. Never enabled in production builds (R3).
-dev-tools = ["game/dev-tools", "render/dev-tools", "skin-beatoraja/dev-tools", "dep:serde", "dep:toml"]
+dev-tools = ["game/dev-tools", "input/dev-tools", "render/dev-tools", "skin-beatoraja/dev-tools", "dep:serde", "dep:toml"]
 
 [dependencies]
 anyhow.workspace = true

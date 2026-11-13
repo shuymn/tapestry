@@ -6456,7 +6456,7 @@ pub(crate) mod tests {
     }
 
     /// [`tree`] over charts already written under `roots`.
-    fn over(
+    pub(crate) fn over(
         dir: &std::path::Path,
         roots: Vec<std::path::PathBuf>,
     ) -> (Selection, Vec<std::path::PathBuf>) {
