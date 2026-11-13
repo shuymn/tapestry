@@ -106,6 +106,16 @@ fn skin() -> Fx {
         element(Source::RatioBar(2), [1000, 0, 200, 20]),
         element(Source::Number(2), [500, 140, 10, 10]),
         element(Source::Number(3), [500, 160, 10, 10]),
+        // An action shown only under the pointer; the first number is too.
+        element(Source::Image(5), [1_300, 0, 100, 40]),
+        // The best play's numbers and bars.
+        element(Source::Number(4), [500, 180, 10, 10]),
+        element(Source::Number(5), [500, 200, 10, 10]),
+        element(Source::Number(6), [500, 220, 10, 10]),
+        element(Source::Number(7), [500, 240, 10, 10]),
+        element(Source::RatioBar(3), [1_100, 0, 200, 20]),
+        element(Source::RatioBar(4), [1_100, 40, 200, 20]),
+        // The cursor's chart's images, and an element under one.
         element(
             Source::ChartImage {
                 which: ChartImage::Stage,
@@ -127,15 +137,6 @@ fn skin() -> Fx {
             e.visible = Some(boolean("selected.stagefile"));
             e
         },
-        // An action shown only under the pointer; the first number is too.
-        element(Source::Image(5), [1_300, 0, 100, 40]),
-        // The best play's numbers and bars.
-        element(Source::Number(4), [500, 180, 10, 10]),
-        element(Source::Number(5), [500, 200, 10, 10]),
-        element(Source::Number(6), [500, 220, 10, 10]),
-        element(Source::Number(7), [500, 240, 10, 10]),
-        element(Source::RatioBar(3), [1_100, 0, 200, 20]),
-        element(Source::RatioBar(4), [1_100, 40, 200, 20]),
     ];
     let hover = HoverRect {
         x: 0,
