@@ -1806,12 +1806,13 @@ mod system_sounds {
                 .and_then(|p| p.generation),
             Some(d)
         );
+        // A and B are back; taken, they make room for E (the fourth).
+        assert_eq!(returned(&mut control), [a, b]);
         let e = pick(&control, &kinds);
         install(&mut control, e);
         steps(&mut worker, &mut out, 10);
         assert_eq!(sounding(&worker), 0);
         assert_eq!(worker.engine().system().pending(), None);
-        let _ = b;
     }
 
     /// An output that fails every write once told to.
@@ -2105,8 +2106,11 @@ mod system_sounds {
     /// that step, and the next applies it in number order, so a decision
     /// sound plays from the generation current at its number; the latch's
     /// stops and empty install discard a decision sound below them, and
-    /// the tone asked for with them starts only in the step that applies
-    /// the empty install.
+    /// the tone asked for with them starts in the step that applies the
+    /// empty install and not in the step before it. The order inside that
+    /// step, the install and then the tone, is `SystemVoices::apply`'s,
+    /// which no snapshot hook reaches; the audio crate's apply test checks
+    /// that a tone behind a blocked install waits for it.
     #[cfg(feature = "dev-tools")]
     #[test]
     fn the_cutoff_orders_starts_and_installs_across_threads() {

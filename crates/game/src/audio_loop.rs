@@ -138,6 +138,10 @@ pub enum SystemInstallError {
     /// The install ring is full.
     #[error("the system sounds' install ring is full")]
     Full(SystemGeneration),
+    /// The generations handed over and not taken back fill the return
+    /// ring's room ([`SYSTEM_RETURNS`]); taking one back frees a place.
+    #[error("the system generations not yet taken back fill the return ring")]
+    Unreturned(SystemGeneration),
     /// The request sequence is exhausted (only the empty generation is
     /// installed then, at the terminal number).
     #[error("the system sounds' request sequence is exhausted")]
@@ -624,6 +628,9 @@ pub struct AudioControl {
     system_installs: rtrb::Producer<SystemInstall>,
     /// System generations the audio thread is done with, freed here.
     system_returns: rtrb::Consumer<SystemGeneration>,
+    /// System generations handed to the audio thread and not taken back:
+    /// queued, current, retired or in the return ring.
+    system_held: usize,
 }
 
 /// The audio thread's end: the engine and the play it is playing.
@@ -729,6 +736,7 @@ pub fn audio_control(mut engine: AudioEngine) -> (AudioControl, AudioWorker) {
         system_starts: starts_tx,
         system_installs: installs_tx,
         system_returns: returns_rx,
+        system_held: 0,
     };
     let worker = AudioWorker {
         engine,
@@ -1324,10 +1332,18 @@ impl AudioControl {
     /// after every start numbered below it. The empty generation is queued
     /// at [`TERMINAL`] once the sequence is exhausted. Returns the number.
     ///
+    /// It is admitted only while the generations handed over and not
+    /// taken back ([`take_system_return`](Self::take_system_return)) number
+    /// fewer than [`SYSTEM_RETURNS`], or, for the empty generation, one
+    /// more. The current one never waits in the return ring, so every
+    /// generation the audio thread replaces has a return slot, and none is
+    /// ever held there without one.
+    ///
     /// # Errors
     ///
     /// [`SystemInstallError`] with the generation, unqueued: a full ring,
-    /// an exhausted sequence, or another rate than the output's.
+    /// the generations not taken back at their bound, an exhausted
+    /// sequence, or another rate than the output's.
     pub fn install_system(
         &mut self,
         generation: SystemGeneration,
@@ -1343,6 +1359,10 @@ impl AudioControl {
         if self.system_installs.is_full() {
             return Err(SystemInstallError::Full(generation));
         }
+        let bound = SYSTEM_RETURNS + usize::from(generation.is_empty());
+        if self.system_held >= bound {
+            return Err(SystemInstallError::Unreturned(generation));
+        }
         let seq = match self.system_seq() {
             Some(seq) => seq,
             None if generation.is_empty() => TERMINAL,
@@ -1354,6 +1374,7 @@ impl AudioControl {
                 return Err(SystemInstallError::Full(install.generation));
             }
         }
+        self.system_held += 1;
         self.shared.system_published.store(seq, Ordering::Release);
         Ok(seq)
     }
@@ -1366,9 +1387,11 @@ impl AudioControl {
     }
 
     /// A system generation the audio thread is done with, to be dropped
-    /// here.
+    /// here; taking it frees its place for another install.
     pub fn take_system_return(&mut self) -> Option<SystemGeneration> {
-        self.system_returns.pop().ok()
+        let generation = self.system_returns.pop().ok()?;
+        self.system_held = self.system_held.saturating_sub(1);
+        Some(generation)
     }
 
     /// Sets the next number the request sequence issues (dev-tools).
