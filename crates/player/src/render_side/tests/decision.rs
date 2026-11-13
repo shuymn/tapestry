@@ -87,6 +87,7 @@ fn view_on(chart: &str, title: &str) -> SelectionView {
             judge_class: None,
             clears: 0,
             best: None,
+            info: None,
         }),
         ..SelectionView::default()
     }

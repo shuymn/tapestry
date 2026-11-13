@@ -773,6 +773,39 @@ fn fields(view: &SelectionView, cursor: Option<&RowView>) -> [i32; field::COUNT]
         field::SELECTED_LEVEL,
         c.labels.level_value.clamp(-VALUE_MAX, VALUE_MAX),
     );
+    if let Some(i) = c.info {
+        set(field::SELECTED_INFO_VALID, 1);
+        for (slot, v) in (field::SELECTED_KEY_TAPS..).zip([
+            i.key_taps,
+            i.key_longs,
+            i.scratch_taps,
+            i.scratch_longs,
+            i.density_peak,
+            i.density_end,
+            i.density_end_hundredths,
+            i.density_average,
+            i.density_average_hundredths,
+            i.total,
+        ]) {
+            set(slot, v.clamp(0, VALUE_MAX));
+        }
+        for (slot, v) in [
+            (
+                field::SELECTED_DENSITY_END_HUNDREDTHS,
+                i.density_end_hundredths,
+            ),
+            (
+                field::SELECTED_DENSITY_AVERAGE_HUNDREDTHS,
+                i.density_average_hundredths,
+            ),
+        ] {
+            set(slot, v.clamp(0, 99));
+        }
+        if let Some(bpm) = i.main_bpm {
+            set(field::SELECTED_MAIN_BPM, bpm.clamp(0, VALUE_MAX));
+            set(field::SELECTED_MAIN_BPM_VALID, 1);
+        }
+    }
     if let Some(k) = c
         .judge_class
         .filter(|&k| i32::from(k) <= crate::JUDGE_CLASS_MAX)

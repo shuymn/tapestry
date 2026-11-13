@@ -27,7 +27,7 @@ use library::{ChartEntry, FolderKey, FolderRow, Level, Score, Search, Sort};
 use rules::RulePreset;
 use skin_model::{
     ChartLabels, FolderId, MAX_VISIBLE_ROWS, Ratio, RowFeatures, RowKey, RowKind, RowScore,
-    RowView, SelectedChart, SelectionLabels, SelectionPlace, SelectionView,
+    RowView, SelectedChart, SelectedInfo, SelectionLabels, SelectionPlace, SelectionView,
 };
 
 use crate::menu_screen::{Caret, LineStyle, MenuLine, MenuPage, PAGE_LINES};
@@ -1479,6 +1479,7 @@ impl SelectScreen {
             best: stored
                 .and_then(|s| s.best.as_ref())
                 .map(crate::bests::selected_best),
+            info: e.info.map(selected_info),
         }
     }
 
@@ -1543,6 +1544,23 @@ pub fn labels() -> SelectionLabels {
 /// it is absent or reads none.
 fn level_value(text: Option<&str>) -> i32 {
     text.map_or(0, crate::imports::facts::level_of)
+}
+
+/// The library's preview numbers as a selection skin reads them.
+const fn selected_info(i: library::ChartInfoView) -> SelectedInfo {
+    SelectedInfo {
+        key_taps: i.key_taps,
+        key_longs: i.key_longs,
+        scratch_taps: i.scratch_taps,
+        scratch_longs: i.scratch_longs,
+        density_peak: i.density_peak,
+        density_end: i.density_end,
+        density_end_hundredths: i.density_end_hundredths,
+        density_average: i.density_average,
+        density_average_hundredths: i.density_average_hundredths,
+        total: i.total,
+        main_bpm: i.main_bpm,
+    }
 }
 
 /// `#DIFFICULTY` when it is 1 to 5.

@@ -380,6 +380,7 @@ pub fn view(
             judge_class: None,
             clears: 0,
             best: None,
+            info: None,
         });
     SelectionView {
         position: None,

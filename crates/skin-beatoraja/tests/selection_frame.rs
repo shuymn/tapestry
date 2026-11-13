@@ -1200,11 +1200,16 @@ const BEST_NUMBERS: [i32; 40] = [
 
 /// A skin with a 6-digit number per id of [`BEST_NUMBERS`] on row `i`.
 fn best_numbers_skin() -> String {
-    let values: Vec<String> = BEST_NUMBERS
+    numbers_skin(&BEST_NUMBERS)
+}
+
+/// A skin with a 6-digit number per id of `ids`, the `i`th on row `i`.
+fn numbers_skin(ids: &[i32]) -> String {
+    let values: Vec<String> = ids
         .iter()
         .map(|id| format!(r#"{{"id": "n{id}", {DIGITS}, "digit": 6, "ref": {id}}}"#))
         .collect();
-    let dsts: Vec<String> = BEST_NUMBERS
+    let dsts: Vec<String> = ids
         .iter()
         .enumerate()
         .map(|(i, id)| {
@@ -1227,12 +1232,17 @@ fn best_numbers_skin() -> String {
 
 /// Each drawn number of [`best_numbers_skin`] by its id.
 fn best_numbers(s: &mut Sel) -> BTreeMap<i32, String> {
+    numbers(s, &BEST_NUMBERS)
+}
+
+/// Each drawn number of [`numbers_skin`] of `ids` by its id.
+fn numbers(s: &mut Sel, ids: &[i32]) -> BTreeMap<i32, String> {
     let mut numbers: BTreeMap<i32, String> = BTreeMap::new();
     for (t, r) in s.drawn(0) {
         if let Some(d) = digit_of(t) {
             let i = ((1072.0 - r[1]) / 10.0) as usize;
             numbers
-                .entry(BEST_NUMBERS[i])
+                .entry(ids[i])
                 .or_default()
                 .push(char::from(b'0' + d));
         }
@@ -1393,6 +1403,86 @@ fn a_chart_without_a_best_play_shows_the_sources_empty_values() {
     assert_eq!(drawn.get(&100).map(String::as_str), Some("0"));
     assert_eq!(drawn.get(&80).map(String::as_str), Some("4"));
     assert!((85..=89).all(|id| !drawn.contains_key(&id)), "{drawn:?}");
+}
+
+/// The scan's preview numbers, each on its own row: the MAIN tempo, the
+/// counts by kind and the mines, the densities and the TOTAL.
+const PREVIEW_NUMBERS: [i32; 13] = [
+    92, 350, 351, 352, 353, 354, 360, 361, 362, 363, 364, 365, 368,
+];
+
+/// A chart row's view with preview numbers `info`.
+fn preview_view(info: Option<skin_model::SelectedInfo>) -> skin_model::SelectionView {
+    let mut v = view(vec![chart("a"), folder_row("f", 3)], Some(0), None, None);
+    if let Some(c) = v.selected.as_mut() {
+        c.info = info;
+    }
+    v
+}
+
+/// The scan's preview numbers draw on a chart row as the source draws its
+/// song information (`skin/property/IntegerPropertyFactory.java:167-173,
+/// 319-395` at `0.8.9`): the counts by kind (key taps 350, key long notes
+/// 351, scratch taps 352, scratch long notes 353), the peak density 360
+/// with hundredths 0, the end 362/363 and average 364/365 densities, the
+/// TOTAL 368 and the MAIN tempo 92; 354 never draws. A MAIN of 0 draws 0;
+/// an unknown MAIN draws nothing, and the rest still draw. A chart without
+/// them, and a folder row, draw none.
+#[test]
+fn the_preview_numbers_draw_on_a_chart_row() {
+    let d = folder(&numbers_skin(&PREVIEW_NUMBERS));
+    let mut s = Sel::new(import_selection(d.path()).unwrap().skin);
+    let info = skin_model::SelectedInfo {
+        key_taps: 20,
+        key_longs: 3,
+        scratch_taps: 4,
+        scratch_longs: 1,
+        density_peak: 13,
+        density_end: 10,
+        density_end_hundredths: 50,
+        density_average: 9,
+        density_average_hundredths: 75,
+        total: 260,
+        main_bpm: Some(180),
+    };
+    let want = |main: Option<&str>| -> BTreeMap<i32, String> {
+        [
+            (350, "20"),
+            (351, "3"),
+            (352, "4"),
+            (353, "1"),
+            (360, "13"),
+            (361, "0"),
+            (362, "10"),
+            (363, "50"),
+            (364, "9"),
+            (365, "75"),
+            (368, "260"),
+        ]
+        .into_iter()
+        .chain(main.map(|m| (92, m)))
+        .map(|(k, v)| (k, v.to_owned()))
+        .collect()
+    };
+    s.view(&preview_view(Some(info)));
+    assert_eq!(numbers(&mut s, &PREVIEW_NUMBERS), want(Some("180")));
+    s.view(&preview_view(Some(skin_model::SelectedInfo {
+        main_bpm: Some(0),
+        ..info
+    })));
+    assert_eq!(numbers(&mut s, &PREVIEW_NUMBERS), want(Some("0")));
+    s.view(&preview_view(Some(skin_model::SelectedInfo {
+        main_bpm: None,
+        ..info
+    })));
+    assert_eq!(numbers(&mut s, &PREVIEW_NUMBERS), want(None));
+    s.view(&preview_view(None));
+    assert_eq!(numbers(&mut s, &PREVIEW_NUMBERS), BTreeMap::new());
+    let mut on_folder = preview_view(Some(info));
+    on_folder.cursor = Some(1);
+    on_folder.selected = None;
+    s.view(&on_folder);
+    assert_eq!(numbers(&mut s, &PREVIEW_NUMBERS), BTreeMap::new());
 }
 
 /// The volumes fixture: numbers 57, 58 and 59 on rows 0 to 2 (y up

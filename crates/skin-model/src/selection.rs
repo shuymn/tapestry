@@ -386,6 +386,32 @@ pub struct SelectedChart {
     pub clears: u64,
     /// The best's values beyond `score`'s; `None` without a best.
     pub best: Option<SelectedBest>,
+    /// The scan's preview numbers of its draw with seed 0; `None` when
+    /// that draw is refused.
+    pub info: Option<SelectedInfo>,
+}
+
+/// The preview numbers the scan stores for a chart (design.md "Loading and
+/// Song Selection", Summaries), each as a skin draws it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SelectedInfo {
+    pub key_taps: i32,
+    pub key_longs: i32,
+    pub scratch_taps: i32,
+    pub scratch_longs: i32,
+    /// The most notes in any 1× second.
+    pub density_peak: i32,
+    /// The end density's whole notes per second, and its hundredths.
+    pub density_end: i32,
+    pub density_end_hundredths: i32,
+    /// The average density's whole notes per second, and its hundredths.
+    pub density_average: i32,
+    pub density_average_hundredths: i32,
+    /// The gauge's TOTAL as the source validates it, truncated.
+    pub total: i32,
+    /// The MAIN tempo in whole BPM, rounded down: 0 when no note weighs;
+    /// `None` when it is unknown.
+    pub main_bpm: Option<i32>,
 }
 
 /// What the bests keep of the selected chart beside its EX, BP and lamp
