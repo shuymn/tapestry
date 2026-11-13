@@ -573,6 +573,9 @@ jobs:
       # Docs-only changes too: a clause and its tests change together.
       - name: Contract index
         run: mise exec -- cargo xtask check-contract
+      # Docs-only changes too: a ledger entry and its tags change together.
+      - name: Source fidelity
+        run: mise exec -- cargo xtask check-fidelity
       - name: actionlint
         run: mise exec -- actionlint
       - name: shellcheck
