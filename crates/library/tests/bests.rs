@@ -1182,3 +1182,56 @@ fn a_bests_2_database_is_recreated_without_reading_it() {
     assert_eq!(report.read, 0);
     assert_eq!(score_of(&lib, &record), Some(current));
 }
+
+/// A recreation that fails partway, here at the tuple's write after
+/// `scores` was created again, leaves the database as it was: the old
+/// layout with its row, the ledgers and the old tuple; the next open
+/// recreates it whole.
+#[test]
+fn an_interrupted_recreation_leaves_the_old_bests() {
+    let fx = Fixture::new();
+    fx.chart("a.bms", CHART);
+    let lib = fx.open();
+    fx.pass(&lib);
+    let record = played(0);
+    let (rel, _) = fx.save(&record, "1-1.tprl");
+    fx.live(&lib, &rel, CHART, &record);
+    drop(lib);
+    sql(
+        &fx.db(),
+        &format!(
+            "DROP TABLE scores; {SCORES_V2}
+             INSERT INTO scores VALUES (x'{}', 1, x'{}', 7, 9, 1, x'03', 1);
+             UPDATE meta SET bests = 2;
+             CREATE TRIGGER fail BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            hex(&record.preset.sha256),
+            hex(&record.chart.identity.sha256),
+        ),
+    );
+    assert!(library::Library::open(&fx.db()).is_err());
+    let conn = rusqlite::Connection::open(fx.db()).unwrap();
+    let old: (i64, i64) = conn
+        .query_row("SELECT plays, best_ex FROM scores", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(old, (7, 9));
+    assert!(conn.prepare("SELECT play FROM scores").is_err());
+    let counted: i64 = conn
+        .query_row("SELECT count(*) FROM counted", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(counted, 1);
+    let bests: i64 = conn
+        .query_row("SELECT bests FROM meta", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(bests, 2);
+    conn.execute_batch("DROP TRIGGER fail;").unwrap();
+    drop(conn);
+    let (lib, _) = library::Library::open(&fx.db()).unwrap();
+    assert!(matches!(lib.bests_state(), BestsState::Invalidated { .. }));
+    sql(
+        &fx.db(),
+        "SELECT clears, best_combo, play_sha256, play FROM scores",
+    );
+    assert_eq!(tables(&fx.db()), (Vec::new(), Vec::new()));
+}

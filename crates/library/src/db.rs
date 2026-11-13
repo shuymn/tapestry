@@ -83,9 +83,12 @@ pub fn connect(path: &Path) -> rusqlite::Result<Connection> {
 /// created with the schema, and dropped and created again when the stored
 /// bests tuple is not this build's, so a change of its columns needs no
 /// schema change. `play` is a [`crate::Breakdown`] in its fixed layout
-/// ([`crate::bests::BREAKDOWN_BYTES`] bytes); the best's values are all set
-/// or all null.
-pub(crate) const SCORES_DDL: &str = "CREATE TABLE scores (
+/// ([`crate::bests::BREAKDOWN_BYTES`] bytes, the length its check takes from
+/// the layout); the best's values are all set or all null.
+pub(crate) fn scores_ddl() -> String {
+    let len = crate::bests::BREAKDOWN_BYTES;
+    format!(
+        "CREATE TABLE scores (
              preset_sha256 BLOB NOT NULL,
              ln_mode INTEGER NOT NULL,
              chart_sha256 BLOB NOT NULL,
@@ -97,13 +100,15 @@ pub(crate) const SCORES_DDL: &str = "CREATE TABLE scores (
              cleared BLOB,
              full_combo INTEGER NOT NULL DEFAULT 0,
              play_sha256 BLOB CHECK (play_sha256 IS NULL OR length(play_sha256) = 32),
-             play BLOB CHECK (play IS NULL OR length(play) = 88),
+             play BLOB CHECK (play IS NULL OR length(play) = {len}),
              CHECK ((best_ex IS NULL) = (best_bp IS NULL)
                  AND (best_ex IS NULL) = (best_combo IS NULL)
                  AND (best_ex IS NULL) = (play_sha256 IS NULL)
                  AND (best_ex IS NULL) = (play IS NULL)),
              PRIMARY KEY (preset_sha256, ln_mode, chart_sha256)
-         ) WITHOUT ROWID;";
+         ) WITHOUT ROWID;"
+    )
+}
 
 /// Creates schema [`SCHEMA_VERSION`] in an empty database, version included,
 /// in one transaction.
@@ -116,6 +121,7 @@ pub(crate) const SCORES_DDL: &str = "CREATE TABLE scores (
 /// a second case folding of its own would make it disagree with `LIKE`;
 /// diacritics are kept, as normalization keeps them.
 pub fn create(conn: &Connection) -> rusqlite::Result<()> {
+    let scores = scores_ddl();
     conn.execute_batch(&format!(
         "BEGIN;
          CREATE TABLE roots (
@@ -191,7 +197,7 @@ pub fn create(conn: &Connection) -> rusqlite::Result<()> {
              requested INTEGER NOT NULL,
              completed INTEGER NOT NULL
          );
-         {SCORES_DDL}
+         {scores}
          CREATE TABLE counted (
              path TEXT NOT NULL,
              body_sha256 BLOB NOT NULL,
@@ -295,7 +301,8 @@ pub fn check_tuple(conn: &mut Connection) -> rusqlite::Result<Option<Option<Tupl
     // The derived tables of another interpretation are discarded unread;
     // `scores` is created again in this version's layout.
     tx.execute_batch(&format!(
-        "DROP TABLE IF EXISTS scores; {SCORES_DDL} DELETE FROM counted; DELETE FROM refused;"
+        "DROP TABLE IF EXISTS scores; {} DELETE FROM counted; DELETE FROM refused;",
+        scores_ddl()
     ))?;
     tx.execute(
         "INSERT INTO meta (id, replay_format, canonical, evaluator, loader, bests, requested,
