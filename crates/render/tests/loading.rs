@@ -25,8 +25,9 @@ use decl_support::{
 };
 use render::text::MenuText;
 use render::{
-    AttemptInput, CommitError, FrameInput, Gpu, Installation, LoadingFrame, LoadingTextError,
-    PlaySkin, PreparedToken, RenderError, Renderer, SkinBundle, SkinError, Sprite, SpriteBatch,
+    AttemptInput, CommitError, FrameInput, Gpu, Installation, LoadingFrame, LoadingOn,
+    LoadingTextError, PlaySkin, PreparedToken, RenderError, Renderer, SkinBundle, SkinError,
+    Sprite, SpriteBatch,
 };
 use skin_model::{
     BuildError, ScreenKind, TextField, TextImage, TextSlots, TextTable, TextTableError,
@@ -549,6 +550,59 @@ fn loading_frames_follow_resize_and_minimize() {
     r.resize(1_920, 1_080);
     let p = loading(&mut r, &text, &frame_at(1, 32));
     assert_eq!(at(&p, BACKGROUND), RED);
+}
+
+/// A staging's loading frames draw before its commit and follow a resize:
+/// its own staging is projected for the new target, letterboxed for
+/// another aspect (the 1920×1080 canvas onto 960×720: half size, 90
+/// pixels down), so the red background's centre (50, 950) lands at
+/// (25, 565), and the band above the canvas stays black.
+#[test]
+fn a_staged_loading_frame_follows_a_resize() {
+    let chart = chart();
+    let dir = tempfile::tempdir().unwrap();
+    let mut r = offscreen(1_920, 1_080);
+    let text = MenuText::new(&r);
+    let (a, _) = bundle(
+        &r,
+        dir.path(),
+        &Look {
+            loading: true,
+            ..Look::left([0, 0, 255, 255])
+        },
+    );
+    let (b, _) = bundle(&r, dir.path(), &loader());
+    install(&mut r, &a, 1);
+    let token = stage(&mut r, &b, &chart, 2).unwrap();
+    let on = LoadingOn::Staged(token);
+    let p = {
+        let t = r
+            .loading_frame_on(on, &frame_at(1, 0), &text)
+            .unwrap()
+            .unwrap();
+        assert!(t.presented);
+        read_back(&r)
+    };
+    assert_eq!(
+        at(&p, BACKGROUND),
+        RED,
+        "drawn staged, not the installed blue"
+    );
+    r.resize(960, 720);
+    let t = r
+        .loading_frame_on(on, &frame_at(1, 16), &text)
+        .unwrap()
+        .unwrap();
+    assert!(t.presented);
+    let p = read_back(&r);
+    assert_eq!(common::rgb_at(&p, 960, (25, 565)), RED);
+    assert_eq!(common::rgb_at(&p, 960, (25, 45)), BLACK);
+    // A token no longer staged draws nothing.
+    r.discard();
+    assert!(matches!(
+        r.loading_frame_on(on, &frame_at(1, 32), &text),
+        Err(RenderError::NotStaged)
+    ));
 }
 
 /// The memory a replacement holds counts both installations' loading

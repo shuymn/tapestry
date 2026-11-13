@@ -39,7 +39,8 @@
 //!    back and waits again, the preparation kept (a local retry); otherwise
 //!    tuning acceptance closes;
 //! 6. the commit; a minimum the commit lengthened (a pending skin's
-//!    specialization declares its loading time only once committed) is
+//!    specialization declares its loading time from its first loading
+//!    frame, or at the commit when no frame drew it before) is
 //!    waited out with acceptance reopened, then closed again on a fresh,
 //!    quiet snapshot applied to the starting settings; the end of loading
 //!    and the last look; then recording opens through the common play
@@ -218,9 +219,10 @@ pub trait LoadingRig: Rig {
     fn loading_ack(&self) -> Option<(u64, TimeUs)> {
         Some((self.loading_lifetime(), TimeUs(i64::MIN)))
     }
-    /// The loading time the play skin declares (`loadend`): the installed
-    /// skin's, or a pending skin's base until its specialization commits.
-    /// None by default.
+    /// The loading time the play skin drawn declares (`loadend`): the
+    /// installed skin's, or for a pending skin the specialization its
+    /// loading frames draw, its latest declaration in the lifetime. None by
+    /// default.
     fn loadend(&self) -> Option<TimeUs> {
         None
     }
@@ -538,10 +540,10 @@ fn dispose<R: Rig>(loaded: &mut Loaded, rig: &mut R, start: Option<PlayStart>) {
 /// The commit, the end of loading and the last look: `false` when the
 /// player quit or closed before the end of loading or at the last look.
 ///
-/// A pending play skin's specialization declares its loading time only
-/// once committed in the lifetime (design.md "Rendering and Skins", the
-/// pending presentation), so the minimum is looked at again after the
-/// commit. While it still runs, tuning acceptance reopens and the loading
+/// A pending play skin's specialization declares its loading time from
+/// its first loading frame, or at the commit when no frame drew it before
+/// (design.md "Rendering and Skins", the pending presentation), so the
+/// minimum is looked at again after the commit. While it still runs, tuning acceptance reopens and the loading
 /// state waits as before the opening; then acceptance closes again on a
 /// fresh copy, which must be quiet and past the minimum at one time
 /// (else it reopens and waits on) and becomes the starting settings. The
