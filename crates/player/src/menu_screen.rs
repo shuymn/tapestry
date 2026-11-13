@@ -1202,6 +1202,7 @@ impl Screen for MenuScreen {
         self.loading_on(LoadingOn::Installed, page, update, changed, frame)
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn loading_staged(
         &mut self,
         page: &MenuPage,
@@ -1213,8 +1214,15 @@ impl Screen for MenuScreen {
         self.loading_on(LoadingOn::Staged(token), page, update, changed, frame)
     }
 
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn staged_token(&self) -> Option<PreparedToken> {
         self.renderer.staged()
+    }
+
+    fn discard_token(&mut self, token: PreparedToken) {
+        if self.renderer.staged() == Some(token) {
+            self.renderer.discard();
+        }
     }
 
     /// The cleared canvas with the load's lines where a skin's loading

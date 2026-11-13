@@ -496,6 +496,9 @@ pub const IN_PLAY: &[Site] = &[
         "crates/player/src/menu_screen.rs",
         &[
             "MenuScreen::loading",
+            "MenuScreen::loading_staged",
+            "MenuScreen::loading_on",
+            "MenuScreen::staged_token",
             "MenuScreen::chosen_text",
             "fields_changed",
             "text_plan",

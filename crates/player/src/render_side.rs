@@ -165,6 +165,14 @@ pub trait Screen: Send {
     /// Drops what a preparation staged and was not committed. The default
     /// has nothing to drop.
     fn discard(&mut self) {}
+    /// Drops the staging `token` names, if the screen still holds it, and
+    /// nothing else: a staging of another kind or request made since
+    /// stays. The default drops what is staged ([`discard`](Self::discard)),
+    /// for a screen that keeps no tokens.
+    fn discard_token(&mut self, token: PreparedToken) {
+        let _ = token;
+        self.discard();
+    }
     /// Publishes the chart's images into `target`
     /// ([`render::Renderer::publish_chart_images`]). The default draws no
     /// declarative skin, so it has no chart layer.
@@ -3669,7 +3677,7 @@ enum Presented {
 fn presentation_of(
     committed: &Committed,
     specialized_in: Option<u64>,
-    prepared: Option<&Prepared>,
+    prepared: Option<Candidate>,
     requested: u64,
     (staged, device): (Option<PreparedToken>, u64),
     lifetime: u64,
@@ -4166,6 +4174,28 @@ pub enum ReadyAnswer {
 
 /// An attempt's preparation answered ready: its token and whether it
 /// staged a declarative skin.
+/// What the draw rule reads of the preparation answered ready
+/// ([`Prepared::candidate`]): a copy, allocating nothing.
+#[derive(Clone, Copy, Debug)]
+struct Candidate {
+    token: PreparedToken,
+    lifetime: Option<u64>,
+    declarative: bool,
+    loadend: Option<TimeUs>,
+}
+
+impl Prepared {
+    /// What the draw rule reads of it.
+    const fn candidate(&self) -> Candidate {
+        Candidate {
+            token: self.token,
+            lifetime: self.lifetime,
+            declarative: self.declarative,
+            loadend: self.loadend,
+        }
+    }
+}
+
 struct Prepared {
     token: PreparedToken,
     /// The loading lifetime its request was published in: only that
@@ -5003,6 +5033,9 @@ impl Run {
             let mut view_stamp = None;
             #[cfg(feature = "dev-tools")]
             let mut loading_stamp = None;
+            // What the loading frame drew, as its drawing decided it.
+            #[cfg(feature = "dev-tools")]
+            let mut frame_presented: Option<Presented> = None;
             #[cfg(feature = "dev-tools")]
             let mut screen_stamp = None;
             // The frame's one instant: a play frame's chart time and the
@@ -5199,12 +5232,16 @@ impl Run {
                         presentation_of(
                             &self.committed,
                             self.specialized_in,
-                            self.prepared.as_ref(),
+                            self.prepared.as_ref().map(Prepared::candidate),
                             self.requested,
                             (screen.staged_token(), screen.device()),
                             l,
                         )
                     });
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        frame_presented = presented;
+                    }
                     let pending = presented == Some(Presented::Placeholder);
                     let sampled = self.clock.now();
                     #[cfg(feature = "dev-tools")]
@@ -5621,15 +5658,8 @@ impl Run {
                         #[cfg(feature = "dev-tools")]
                         presented_at,
                         #[cfg(feature = "dev-tools")]
-                        skin_loading: loading_frame.filter(|&l| {
-                            presentation_of(
-                                &self.committed,
-                                self.specialized_in,
-                                self.prepared.as_ref(),
-                                self.requested,
-                                (screen.staged_token(), screen.device()),
-                                l,
-                            ) != Presented::Placeholder
+                        skin_loading: loading_frame.filter(|_| {
+                            frame_presented.is_some_and(|p| p != Presented::Placeholder)
                         }),
                         timing,
                         statistics: screen.statistics(),
@@ -6441,11 +6471,14 @@ impl Run {
     /// skin selected for later attempts, and no specialization drawn by
     /// any loading lifetime yet. A withdrawal changes nothing.
     fn pend(&mut self, request: u64, kind: ScreenKind) -> Result<Preparation, RenderError> {
-        if !self.newest(request) {
-            return Ok(refusal("a newer request superseded it"));
-        }
+        // Refused before it is the newest: a request that changes nothing
+        // supersedes nothing, so no staging stays resident while no longer
+        // the newest request's.
         if kind != ScreenKind::Play {
             return Ok(refusal(format!("the {kind} skin cannot be pending")));
+        }
+        if !self.newest(request) {
+            return Ok(refusal("a newer request superseded it"));
         }
         self.supersede_attempts("a newer skin selection superseded it");
         if let Err(e) = self.recover() {
@@ -6665,8 +6698,9 @@ struct ResultSide {
     stop: Option<ScriptStop>,
     /// The stop came this frame: the strip is prepared again after it.
     restrip: bool,
-    /// A staging the commit point discarded, dropped after the frame.
-    discard: bool,
+    /// A staging the commit point discarded, dropped after the frame: its
+    /// token, so no other staging goes with it.
+    discard: Option<PreparedToken>,
     /// A commit happened: what it replaced is drained after the frame.
     drain: bool,
     /// A commit happened: what the result kind keeps to restore is
@@ -6697,7 +6731,7 @@ impl ResultSide {
             notes: ScriptNotes::default(),
             stop: None,
             restrip: false,
-            discard: false,
+            discard: None,
             drain: false,
             reconcile: false,
             reapply: false,
@@ -6832,10 +6866,10 @@ impl Run {
             self.frames_view = None;
         }
         if let Some(side) = self.result.take()
-            && side.prepared.as_ref().is_some_and(|p| p.token.is_some())
+            && let Some(token) = side.prepared.and_then(|p| p.token)
             && let Some(screen) = &mut self.screen
         {
-            screen.discard();
+            screen.discard_token(token);
         }
     }
 
@@ -7030,14 +7064,14 @@ impl Run {
             if presented && side.prepared.as_ref().is_some_and(|v| !same(&v.held)) {
                 // The newest is the view presented again: the other one
                 // prepared goes, so it is not committed after it.
-                if side.prepared.take().is_some_and(|v| v.token.is_some()) {
-                    screen.discard();
+                if let Some(token) = side.prepared.take().and_then(|v| v.token) {
+                    screen.discard_token(token);
                 }
             }
             if !known {
                 // A new view payload: the one prepared before goes.
-                if side.prepared.take().is_some_and(|v| v.token.is_some()) {
-                    screen.discard();
+                if let Some(token) = side.prepared.take().and_then(|v| v.token) {
+                    screen.discard_token(token);
                 }
                 let request = p.request;
                 let restaged = std::mem::take(&mut side.restaged);
@@ -7160,8 +7194,8 @@ impl Run {
                         ));
                     }
                     side.prepared = Some(PreparedView { held, token });
-                } else if token.is_some() {
-                    screen.discard();
+                } else if let Some(token) = token {
+                    screen.discard_token(token);
                 }
             }
             side.overlay = Some((p.revision, p.overlay));
@@ -7255,7 +7289,7 @@ impl Run {
             }
             if b.fadeout.is_some() {
                 if let Some(v) = side.prepared.take() {
-                    side.discard |= v.token.is_some();
+                    side.discard = v.token.or(side.discard);
                     side.drop_later(v.held);
                 }
                 if let (Some((revision, overlay)), Some(h)) =
@@ -7291,13 +7325,13 @@ impl Run {
                         // Its generation was evicted: it never commits,
                         // its staging discarded after the frame.
                         ViewCommit::Gone => {
-                            side.discard |= v.token.is_some();
+                            side.discard = v.token.or(side.discard);
                             side.drop_later(v.held);
                         }
                         // Its commit refused: its staging, still pending,
                         // is discarded after the frame, as an evicted one.
                         ViewCommit::Refused => {
-                            side.discard |= v.token.is_some();
+                            side.discard = v.token.or(side.discard);
                             side.drop_later(v.held);
                         }
                     }
@@ -7455,8 +7489,8 @@ impl Run {
             }
         }
         if let Some(screen) = &mut self.screen {
-            if std::mem::take(&mut side.discard) {
-                screen.discard();
+            if let Some(token) = side.discard.take() {
+                screen.discard_token(token);
             }
             if std::mem::take(&mut side.drain) {
                 let _ = screen.drain_retired();
@@ -9881,14 +9915,41 @@ pub(crate) mod tests {
     #[cfg(feature = "dev-tools")]
     #[test]
     fn the_drawn_skin_s_declaration_alloc() {
+        use super::{Candidate, Committed, Presented, presentation_of};
         let shared = super::Shared::new();
         let clock = QpcClock::start();
-        let committed = super::Committed::default();
+        // Made before counting: an ordinary play skin, and a pending one
+        // with a specialization committed in lifetime 2 and a staging of
+        // request 5 answered for lifetime 3.
+        let ordinary = Committed::default();
+        let mut pending = Committed::default();
+        pending.pend(ScreenKind::Play, Some(render::Installation::new(bundle())));
+        let token = render::PreparedToken {
+            request: 5,
+            device: 1,
+            kind: ScreenKind::Play,
+        };
+        let staged = Candidate {
+            token,
+            lifetime: Some(3),
+            declarative: true,
+            loadend: Some(TimeUs(2_700_000)),
+        };
         shared.presented_loading(1, Some(Some(TimeUs(2_700_000))), || clock.now());
         let before = crate::alloc_count::this_thread();
         for lifetime in 2..10 {
-            let drawn = super::presentation_of(&committed, None, None, 0, (None, 1), lifetime);
-            assert_eq!(drawn, super::Presented::Ordinary);
+            let drawn = presentation_of(&ordinary, None, None, 0, (None, 1), lifetime);
+            assert_eq!(drawn, Presented::Ordinary);
+            let at = |l| presentation_of(&pending, Some(2), Some(staged), 5, (Some(token), 1), l);
+            assert_eq!(
+                at(3),
+                Presented::Staged {
+                    token,
+                    loadend: Some(TimeUs(2_700_000))
+                }
+            );
+            assert_eq!(at(2), Presented::Committed);
+            assert_eq!(at(4), Presented::Placeholder);
             shared.presented_loading(lifetime, Some(Some(TimeUs(2_700_000))), || clock.now());
             shared.presented_loading(lifetime, Some(Some(TimeUs(600_000))), || clock.now());
             shared.presented_loading(lifetime, None, || clock.now());
@@ -14260,6 +14321,34 @@ pub(crate) mod tests {
         assert!(wait_until(|| staged().len() >= n + 3), "R2 still drawn");
         assert!(staged().iter().all(|&(_, r)| r == r2));
         screens.hold_staged.store(0, Ordering::Release);
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A refused request changes nothing: `pend` of a kind that cannot be
+    /// pending, asked while a play staging is drawn, neither becomes the
+    /// newest request nor supersedes the staging, which stays resident
+    /// and goes on drawing.
+    #[test]
+    fn a_refused_pend_leaves_the_drawn_staging() {
+        let (chart, screens, link) = pending_link();
+        let staged = || screens.staged_frames.lock().unwrap().clone();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| screens.pending.load(Ordering::Acquire) >= 2));
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| staged().len() >= 2));
+        let request = staged().last().unwrap().1;
+        assert!(matches!(
+            link.pend(ScreenKind::Result).wait().unwrap(),
+            Preparation::Refused(_)
+        ));
+        let n = staged().len();
+        assert!(wait_until(|| staged().len() >= n + 3), "still drawn");
+        assert!(staged().iter().all(|&(_, r)| r == request));
+        assert!(screens.staging.lock().unwrap().is_some(), "still resident");
         link.end_loading().unwrap();
         link.exit();
     }
