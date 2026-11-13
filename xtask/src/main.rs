@@ -8,6 +8,7 @@ mod banned_words;
 mod binary;
 mod contract;
 mod demo;
+mod fidelity;
 #[cfg(test)]
 mod fixture;
 // Lint fixtures under the workspace lints: `cargo xtask check-lints`.
@@ -38,6 +39,11 @@ commands:
                                           headings and tests that exist, the threat IDs,
                                           the Covers: tags and the Verification table;
                                           --update rewrites that table first
+  check-fidelity [--update|--init]        check docs/fidelity.toml against the Source:
+                                          tags, and the source-fidelity lint hits
+                                          against xtask/fidelity-baseline.txt;
+                                          --update lowers the baseline, --init
+                                          writes an absent one
   banned-words (--staged|--all) [--list <path>]
                                           check paths and contents in the index for
                                           terms in banned-words.txt
@@ -75,6 +81,15 @@ fn main() -> ExitCode {
         ),
         Some("check-contract") if rest == ["--update"] => {
             report("check-contract", contract::run(&workspace_manifest(), true))
+        }
+        Some("check-fidelity") => {
+            let mode = match &rest[..] {
+                [] => fidelity::Mode::Check,
+                [a] if a == "--update" => fidelity::Mode::Update,
+                [a] if a == "--init" => fidelity::Mode::Init,
+                _ => return usage_error("check-fidelity takes --update or --init"),
+            };
+            report("check-fidelity", fidelity::run(&workspace_manifest(), mode))
         }
         Some("banned-words") => banned_words::run(&rest),
         Some("portable") => portable::run(&workspace_manifest(), &rest),

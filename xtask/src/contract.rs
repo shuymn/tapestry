@@ -92,7 +92,7 @@ fn temporary(path: &Path) -> std::path::PathBuf {
 
 /// Replaces the contents of `path` with `text` by writing a file beside it
 /// and renaming it over `path`, so a failed write leaves `path` whole.
-fn replace(path: &Path, text: &str) -> io::Result<()> {
+pub(crate) fn replace(path: &Path, text: &str) -> io::Result<()> {
     let tmp = temporary(path);
     let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, path));
     if written.is_err() {
@@ -531,7 +531,7 @@ fn citations(spec: &str) -> Option<Vec<(&str, &str)>> {
 
 /// Checks that `source` defines `fn test` once, as a test that is not
 /// ignored.
-fn check_test(at: &str, file: &str, test: &str, source: &str, diags: &mut Vec<String>) {
+pub(crate) fn check_test(at: &str, file: &str, test: &str, source: &str, diags: &mut Vec<String>) {
     let lines: Vec<&str> = source.lines().collect();
     let defs: Vec<usize> = (0..lines.len())
         .filter(|&i| lines.get(i).is_some_and(|l| defines(l, test)))
@@ -558,7 +558,7 @@ fn check_test(at: &str, file: &str, test: &str, source: &str, diags: &mut Vec<St
     }
 }
 
-fn is_test(attrs: &[String]) -> bool {
+pub(crate) fn is_test(attrs: &[String]) -> bool {
     attrs.iter().any(|a| a == "#[test]")
 }
 
@@ -575,7 +575,7 @@ fn defines(line: &str, name: &str) -> bool {
 }
 
 /// The name of the fn whose definition `line` starts.
-fn fn_name(line: &str) -> Option<&str> {
+pub(crate) fn fn_name(line: &str) -> Option<&str> {
     let mut rest = line.trim_start();
     'prefixes: loop {
         for prefix in [
@@ -605,7 +605,7 @@ fn fn_name(line: &str) -> Option<&str> {
 /// above line `def`, and its attributes, one string each. An attribute over
 /// several lines ends with a line ending in `]` and starts at the nearest
 /// `#[` above it.
-fn attributes(lines: &[&str], def: usize) -> (usize, Vec<String>) {
+pub(crate) fn attributes(lines: &[&str], def: usize) -> (usize, Vec<String>) {
     let mut out = Vec::new();
     let mut i = def;
     while let Some(prev) = i.checked_sub(1) {
