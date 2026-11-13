@@ -393,6 +393,9 @@ pub struct Selection {
     /// odd number of times since the rig last took them
     /// ([`PlayerRig::turn_covers`]).
     pub covers_turned: [bool; 3],
+    /// The volumes the skin's sliders set since the last look, by
+    /// [`game::Channel::index`]: the newest percent of each.
+    pub volumes_set: [Option<u32>; 3],
     /// What the render thread is given of each change: the lifetime, the
     /// timers' starts and the skin's window.
     pub feed: SkinFeed,
@@ -760,6 +763,13 @@ impl Selection {
             crate::pointer::PointerAct::Cover(kind) => {
                 if let Some(turned) = self.covers_turned.get_mut(cover_index(kind)) {
                     *turned = !*turned;
+                }
+                return None;
+            }
+            crate::pointer::PointerAct::Volume(channel, percent) => {
+                // The newest of a channel's settings counts.
+                if let Some(set) = self.volumes_set.get_mut(channel.index()) {
+                    *set = Some(percent);
                 }
                 return None;
             }
@@ -2231,6 +2241,30 @@ impl PlayerRig<'_> {
         }
     }
 
+    /// Sets the volumes the skin's sliders set (design.md "Audio", the
+    /// three volumes), each through the tuning's native setter: it plays
+    /// from the next sync and is written at the next settings write
+    /// (design.md "Settings Files"); then the next update shows it.
+    fn set_volumes(&mut self) {
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
+        let set = std::mem::take(&mut sel.volumes_set);
+        if set == [None; 3] {
+            return;
+        }
+        let tuning = self.controls.tuning();
+        for (channel, percent) in game::Channel::ALL.into_iter().zip(set) {
+            if let Some(percent) = percent {
+                tuning.set_volume(channel, percent);
+            }
+        }
+        self.feed_settings();
+        if let Some(sel) = &mut self.selection {
+            sel.dirty = true;
+        }
+    }
+
     /// Whether a loading lifetime runs: from the choice or a practice's
     /// Start until loading ends.
     pub(crate) fn loading_active(&self) -> bool {
@@ -2290,8 +2324,10 @@ impl PlayerRig<'_> {
                 self.clock.now(),
             );
         }
-        // The switches the skin turned, shown with this look's update.
+        // The switches the skin turned and the volumes its sliders set,
+        // shown with this look's update.
         self.turn_covers();
+        self.set_volumes();
         let sel = self.selection.as_mut()?;
         // Before anything of the choice: no chart without its skin.
         let now = self.clock.now();
@@ -4164,6 +4200,7 @@ pub(crate) mod tests {
             search_pending: false,
             preset_steps: std::collections::VecDeque::new(),
             covers_turned: [false; 3],
+            volumes_set: [None; 3],
             #[cfg(feature = "dev-tools")]
             script: None,
             coord: crate::shelf::tests::coordinator(),
@@ -6451,6 +6488,7 @@ pub(crate) mod tests {
             search_pending: false,
             preset_steps: std::collections::VecDeque::new(),
             covers_turned: [false; 3],
+            volumes_set: [None; 3],
             #[cfg(feature = "dev-tools")]
             script: None,
             coord: crate::shelf::tests::coordinator(),

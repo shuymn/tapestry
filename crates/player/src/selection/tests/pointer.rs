@@ -23,7 +23,7 @@ use crate::render_side::tests::{Installers, wait_until};
 use crate::select::{MenuInput, MenuKey, MenuQueue};
 
 use Dispatched::{Drag, Input, Notch, Press};
-use PointerAct::{Cover, Key, MoveTo, Nothing, Rows};
+use PointerAct::{Cover, Key, MoveTo, Nothing, Rows, Volume};
 use game::CoverKind;
 
 /// The window's side: its capture of the mouse, the pointer's shared state
@@ -756,44 +756,113 @@ fn an_event_with_no_contract_takes_the_press() {
     });
 }
 
-/// P7: the volume sliders 17, 18 and 19 each take a press or a drag over
-/// the row under it and change nothing: each volume stays and the cursor
-/// stays off that row; with no volume slider drawn, the same press moves
-/// to the row.
+/// The volume `channel` plays at `percent`, as the tuning gives it.
+fn percent_gain(percent: u32) -> f32 {
+    percent as f32 / 100.0
+}
+
+/// K2: volume slider 17, 18 or 19 pressed at v sets the system, key or
+/// background volume to `round(100 · v)` % and nothing else: the row under
+/// it is not moved, the other two volumes stay, and the next update shows
+/// it; a drag sets it again. With no volume slider drawn, the same press
+/// moves to the row.
 #[test]
-fn the_volume_slider_takes_the_press_and_changes_nothing() {
-    // Each slider's point at `v` per mille, and the row under it: slots 5
-    // and 4 hold the third (2) and second (1) rows.
+fn a_volume_slider_sets_its_own_volume() {
+    use game::Channel;
     type At = fn(i32) -> [i32; 2];
-    let sliders: [(At, usize); 3] = [(volume_at, 2), (key_at, 1), (background_at, 2)];
-    for (at, row) in sliders {
+    // Each slider's point in per mille, the row under it (slots 5 and 4
+    // hold the third and second rows), its channel and the percent its
+    // point gives: 0.76, 0.765 (ties up) and 1.0 of the travel.
+    let sliders: [(At, i32, usize, Channel, u32); 3] = [
+        (volume_at, 760, 2, Channel::System, 76),
+        (key_at, 765, 1, Channel::Key, 77),
+        (background_at, 1_000, 2, Channel::Background, 100),
+    ];
+    let loaded = [
+        (Channel::System, GAIN),
+        (Channel::Key, KEY),
+        (Channel::Background, BACKGROUND),
+    ];
+    for (at, v, row, channel, percent) in sliders {
         for volume in [true, false] {
             let dir = tempfile::tempdir().unwrap();
             let (sel, _) = charts(dir.path(), 3);
             on_pointer(sel, volume, None, |rig, w, screens| {
                 let c = rig.controls;
-                w.click(c, at(500), Button::Left);
+                w.click(c, at(v), Button::Left);
                 act(rig, screens);
                 if !volume {
                     assert_eq!(log(rig), [(Press(MoveTo(row)), row)]);
                     return;
                 }
-                assert_eq!(log(rig), [(Press(Nothing), 0)]);
-                // A drag from 1.0 to 0.2.
+                assert_eq!(log(rig), [(Press(Volume(channel, percent)), 0)]);
+                let tuning = rig.controls.tuning();
+                for (other, gain) in loaded {
+                    let want = if other == channel {
+                        percent_gain(percent)
+                    } else {
+                        gain
+                    };
+                    assert_eq!(tuning.volume(other), want, "{channel:?}: {other:?}");
+                }
+                let shown = |s: skin_model::SelectionSettings| match channel {
+                    Channel::System => s.system_volume,
+                    Channel::Key => s.key_volume,
+                    Channel::Background => s.background_volume,
+                };
+                assert_eq!(
+                    sel_of(rig).feed.settings.map(shown),
+                    Some(skin_model::VolumeReading::of_gain(percent_gain(percent)))
+                );
+                // A drag to 0 sets it again.
                 w.down(c, at(1_000), Button::Left);
                 act(rig, screens);
-                w.to(c, at(200));
+                w.to(c, at(0));
                 dragged(rig, screens);
                 w.up(c, Button::Left);
-                assert_eq!(log(rig), [(Press(Nothing), 0), (Drag(Nothing), 0)]);
-                let tuning = rig.controls.tuning();
-                assert_eq!(tuning.volume(game::Channel::System), GAIN);
-                assert_eq!(tuning.volume(game::Channel::Key), KEY);
-                assert_eq!(tuning.volume(game::Channel::Background), BACKGROUND);
-                assert_eq!(sel_of(rig).feed.settings, Some(shown()));
+                assert_eq!(
+                    log(rig),
+                    [
+                        (Press(Volume(channel, 100)), 0),
+                        (Drag(Volume(channel, 0)), 0)
+                    ]
+                );
+                assert_eq!(rig.controls.tuning().volume(channel), 0.0);
             });
         }
     }
+}
+
+/// K3: a volume slider's setting is written at the next settings write,
+/// not at once: `device.toml` then holds the system volume it set, the key
+/// and background volumes exactly as loaded and every other setting as
+/// before; `player.toml` is not written.
+#[test]
+fn a_volume_slider_is_written_with_the_other_settings_kept() {
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 3);
+    on_pointer(sel, true, None, |rig, w, screens| {
+        let c = rig.controls;
+        let device = rig.files.root().device_settings();
+        let player = rig.files.root().player_settings();
+        let before = std::fs::read(&device).ok();
+        w.click(c, volume_at(200), Button::Left);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(Volume(game::Channel::System, 20)), 0)]);
+        assert_eq!(std::fs::read(&device).ok(), before, "written at once");
+        rig.persist();
+        let written: game::DeviceSettings = game::load_settings(&device).unwrap();
+        assert_eq!(
+            written,
+            game::DeviceSettings {
+                system_volume: 0.2,
+                key_volume: KEY,
+                background_volume: BACKGROUND,
+                ..game::DeviceSettings::default()
+            }
+        );
+        assert!(!player.exists(), "player.toml written");
+    });
 }
 
 /// P8: inside a folder, a right press on a row that is not the cursor's,
@@ -985,8 +1054,8 @@ fn the_search_text_takes_focus_and_a_press_outside_takes_it_away() {
 /// act: a press on a row, on event 15, on empty space (right) or in search
 /// text 30, a notch and a drag on the list slider do nothing; event 331
 /// turns LIFT over on the chart under the cursor without moving to the row
-/// under it; sliders 17 and 18 take the press over the row under them and
-/// change nothing; the hover image still draws under the pointer. With the search box focused, SELECT held opens
+/// under it; sliders 17 and 18 set their volumes without moving to the row
+/// under them; the hover image still draws under the pointer. With the search box focused, SELECT held opens
 /// no panel (design.md "Input"): a press on empty space acts as without
 /// one, taking the focus away, and the panel opens with it.
 #[test]
@@ -1051,22 +1120,39 @@ fn under_a_panel_only_the_order_button_and_the_covers_act() {
             sel_of(rig).feed.settings.map(|s| s.covers_on),
             Some([false, true, false])
         );
-        // Slider 17 over row 2 dragged to 0.3.
+        // Slider 17 over row 2 pressed at 0.5 and dragged to 0.3: the
+        // system volume set, no row moved.
         w.down(c, volume_at(500), Button::Left);
         act(rig, screens);
         w.to(c, volume_at(300));
         dragged(rig, screens);
         w.up(c, Button::Left);
-        assert_eq!(log(rig), [(Press(Nothing), 1), (Drag(Nothing), 1)]);
-        assert_eq!(rig.controls.tuning().volume(game::Channel::System), GAIN);
-        // Slider 18 over row 1 dragged to 0.3.
+        assert_eq!(
+            log(rig),
+            [
+                (Press(Volume(game::Channel::System, 50)), 1),
+                (Drag(Volume(game::Channel::System, 30)), 1)
+            ]
+        );
+        assert_eq!(rig.controls.tuning().volume(game::Channel::System), 0.3);
+        // Slider 18 over row 1 dragged to 0.4: the key volume set.
         w.down(c, key_at(500), Button::Left);
         act(rig, screens);
-        w.to(c, key_at(300));
+        w.to(c, key_at(400));
         dragged(rig, screens);
         w.up(c, Button::Left);
-        assert_eq!(log(rig), [(Press(Nothing), 1), (Drag(Nothing), 1)]);
-        assert_eq!(rig.controls.tuning().volume(game::Channel::Key), KEY);
+        assert_eq!(
+            log(rig),
+            [
+                (Press(Volume(game::Channel::Key, 50)), 1),
+                (Drag(Volume(game::Channel::Key, 40)), 1)
+            ]
+        );
+        assert_eq!(rig.controls.tuning().volume(game::Channel::Key), 0.4);
+        assert_eq!(
+            rig.controls.tuning().volume(game::Channel::Background),
+            BACKGROUND
+        );
         // The hover image draws under the pointer, and not away from it.
         w.to(c, HOVER);
         frames(screens, 2);
