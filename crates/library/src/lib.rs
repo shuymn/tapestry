@@ -37,7 +37,8 @@
 //!   branch is refused, else a bitmask of the overlong ones (1 the stage
 //!   file, 2 the banner), never shortened; and the values a song list
 //!   previews of that branch ([`ChartInfoView`]), all `NULL` when the
-//!   branch is refused, `main_bpm` also without a MAIN tempo.
+//!   branch is refused, `main_bpm` also when the MAIN tempo was
+//!   unavailable, and 0 when no note weighs one.
 //!   Indexed by `root`; by `(mode, title_key IS NULL, title_key, path)`, the
 //!   [`Sort::Title`] order, so an unfiltered list reads only the rows it
 //!   returns; and by `(mode, folder)`, by which [`Library::level`] finds a
