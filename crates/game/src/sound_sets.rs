@@ -412,7 +412,9 @@ pub struct FileStamp {
 
 /// A source's identity (design.md T18): its canonical folder with the name,
 /// size and modification time of each candidate file of every kind that
-/// exists in it, sorted by name. It covers every kind whatever role the
+/// exists in it, sorted by name; a candidate that is a link leading out of
+/// the folder is stamped by the link's own metadata, so nothing outside the
+/// folder changes the identity. It covers every kind whatever role the
 /// folder serves, so a folder that is a sound set, a BGM set and
 /// `defaultsound\` at once has one identity, and its quarantine holds for
 /// every role. A change of any of them makes another identity.
@@ -433,8 +435,18 @@ impl SourceIdentity {
             for ext in EXTENSIONS {
                 let name = format!("{}.{ext}", file_stem(kind));
                 let path = folder.join(&name);
-                let Ok(meta) = fs::metadata(&path).or_else(|_| fs::symlink_metadata(&path)) else {
+                let Ok(own) = fs::symlink_metadata(&path) else {
                     continue;
+                };
+                // Only what the folder controls: a link is followed while
+                // its target stays inside the folder; one leading out (or
+                // unresolved) is stamped by its own metadata, so a target
+                // outside cannot change the identity.
+                let meta = match path.canonicalize() {
+                    Ok(target) if target.starts_with(folder) => {
+                        fs::metadata(&target).unwrap_or(own)
+                    }
+                    _ => own,
                 };
                 let mtime_ns =
                     meta.modified()

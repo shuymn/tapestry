@@ -957,6 +957,50 @@ fn a_folder_quarantined_in_one_role_stays_so_in_every_role() {
     }
 }
 
+/// A set whose candidates link out of its folder stays quarantined while
+/// the links' targets change: its identity stamps what the folder holds,
+/// not what lies outside it, so a set cannot expire its own quarantine
+/// through a folder or file that changes between launches.
+// Covers: T18
+#[test]
+fn a_link_out_of_the_set_cannot_expire_its_quarantine() {
+    let f = fixture();
+    let outside = tmp();
+    let folder = outside.path().join("folder");
+    put(&folder, "old.wav");
+    fs::remove_file(f.set.join("fail.wav")).unwrap();
+    link_dir(&f.set.join("fail.wav"), &folder);
+    let file = put(outside.path(), "file.wav");
+    let file_linked = link_file(&f.set.join("scratch.wav"), &file).is_some();
+
+    let identity = identity_of(&f);
+    {
+        let mut r = Recovery::open(&f.data, Box::new(DiskFs::default()))
+            .unwrap()
+            .recovery;
+        r.mark(&identity).unwrap();
+    }
+    let opened = Recovery::open(&f.data, Box::new(DiskFs::default())).unwrap();
+    assert_eq!(opened.quarantined, Some(identity));
+    let mut recovery = opened.recovery;
+
+    // The targets change between launches: the folder gains a file and
+    // the file grows.
+    put(&folder, "new.wav");
+    if file_linked {
+        put_bytes(outside.path(), "file.wav", &wav(500, 7));
+    }
+    let seen = Arc::new(Mutex::new(Seen::default()));
+    let report = run(&f, &mut recovery, &seen);
+    assert_eq!(
+        ops(&seen),
+        Vec::<String>::new(),
+        "the quarantined set was read"
+    );
+    assert!(matches!(report.decode, PickDecode::Ready(_)));
+    assert_eq!(recovery.quarantined().len(), 1, "the quarantine dropped");
+}
+
 fn identity_of_set(set: &Path) -> game::sound_sets::SourceIdentity {
     resolve(&pick(Some(set), None, Path::new("absent")), &mut |_| false).sources[0]
         .clone()
