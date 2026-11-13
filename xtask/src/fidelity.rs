@@ -77,7 +77,7 @@ use std::path::Path;
 use anyhow::{Context as _, bail};
 
 use crate::arch::WINDOWS_ONLY_ALLOWED;
-use crate::contract::{attributes, check_test, fn_name, is_test, replace};
+use crate::contract::{check_test, fn_name, is_test, replace};
 
 /// The ledger, relative to the workspace root.
 pub const LEDGER: &str = "docs/fidelity.toml";
@@ -395,7 +395,7 @@ fn analyze(ledger: &str, sources: &[(String, String)]) -> (Vec<String>, Hits) {
                         continue;
                     };
                     let code = lines.get(def).copied().unwrap_or("");
-                    let test = fn_name(code).filter(|_| is_test(&attributes(&lines, def).1));
+                    let test = fn_name(code).filter(|_| is_test(&run_above(&lines, def).1));
                     match test {
                         Some(name) => {
                             let cited = format!("{file}::{name}");
@@ -763,10 +763,48 @@ fn lint(file: &str, lines: &[&str], hits: &mut Hits) {
     }
 }
 
+/// The first line of the run of comments and attributes directly above
+/// line `item`, and its attributes, one string each (a multi-line one
+/// joined). The run ends at a blank line or code: a line ending in `]`
+/// belongs to it only as the last line of an attribute whose `#[` is the
+/// nearest one above, with no blank line between.
+fn run_above(lines: &[&str], item: usize) -> (usize, Vec<String>) {
+    let mut out = Vec::new();
+    let mut i = item;
+    while let Some(prev) = i.checked_sub(1) {
+        let Some(line) = lines.get(prev).map(|l| l.trim()) else {
+            break;
+        };
+        if line.starts_with("//") {
+            i = prev;
+            continue;
+        }
+        let open = (0..=prev)
+            .rev()
+            .take_while(|&j| lines.get(j).is_some_and(|l| !l.trim().is_empty()))
+            .find(|&j| {
+                lines.get(j).is_some_and(|l| {
+                    let t = l.trim_start();
+                    t.starts_with("#[") || t.starts_with("#![")
+                })
+            })
+            .filter(|&j| attribute_end(lines, j) == Some(prev));
+        let Some(open) = open else {
+            break;
+        };
+        let joined: Vec<&str> = (open..=prev)
+            .filter_map(|j| lines.get(j).map(|l| l.trim()))
+            .collect();
+        out.push(joined.concat());
+        i = open;
+    }
+    (i, out)
+}
+
 /// Whether the run of comments and attributes directly above line `i`
 /// holds a tag or a marker with its reason.
 fn cleared(lines: &[&str], i: usize) -> bool {
-    let (start, _) = attributes(lines, i);
+    let (start, _) = run_above(lines, i);
     (start..i).any(|j| match lines.get(j).map(|l| mark(l)) {
         Some(Mark::Tag(_)) => true,
         Some(Mark::Marker(reason)) => !reason.is_empty(),

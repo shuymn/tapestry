@@ -719,6 +719,29 @@ fn rounds_as_the_source() {}
 }
 
 #[test]
+fn a_marker_clears_nothing_past_a_code_line_ending_in_a_bracket() {
+    // The line above the hit ends in `]` but is code, not an attribute:
+    // the marker above the first fn stays with that fn.
+    let indexed = "\
+// Not a source copy: this helper describes the format.
+#[must_use]
+fn helper_as_the_source() -> usize {
+    0
+}
+
+fn unrelated(values: &[&str], i: usize) -> usize {
+    values[i]
+        .encode_utf16()
+        .count()
+}
+";
+    assert_eq!(
+        hits_in("crates/d/src/lib.rs", indexed),
+        [grew("crates/d/src/lib.rs", "utf16", &[9], 0)]
+    );
+}
+
+#[test]
 fn a_new_hit_beyond_the_baseline_is_reported() {
     let added = files_with(
         LINTED,

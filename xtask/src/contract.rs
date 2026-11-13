@@ -605,7 +605,7 @@ pub(crate) fn fn_name(line: &str) -> Option<&str> {
 /// above line `def`, and its attributes, one string each. An attribute over
 /// several lines ends with a line ending in `]` and starts at the nearest
 /// `#[` above it.
-pub(crate) fn attributes(lines: &[&str], def: usize) -> (usize, Vec<String>) {
+fn attributes(lines: &[&str], def: usize) -> (usize, Vec<String>) {
     let mut out = Vec::new();
     let mut i = def;
     while let Some(prev) = i.checked_sub(1) {
