@@ -1858,3 +1858,20 @@ fn target_reads_max_by_default_round_trips_and_refuses_others() {
         "{message}"
     );
 }
+
+/// The engine takes each of the three volumes from `device.toml`.
+#[test]
+fn device_settings_give_the_engine_each_volume() {
+    let d = DeviceSettings {
+        system_volume: 0.45,
+        key_volume: 0.2,
+        background_volume: 0.999,
+        ..DeviceSettings::default()
+    };
+    let bank = std::sync::Arc::new(audio::SoundBank::from_sounds(48_000, Vec::new()));
+    let mut e = audio::AudioEngine::new(bank, &[], 48_000, 480, 4, 0).unwrap();
+    d.apply_to(&mut e);
+    for c in Channel::ALL {
+        assert_eq!(e.mixer().volume(c), d.volume(c), "{c:?}");
+    }
+}
