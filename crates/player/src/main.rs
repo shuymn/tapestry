@@ -27,7 +27,6 @@ mod background;
 #[cfg(feature = "dev-tools")]
 mod bank_witness;
 mod bests;
-mod carry;
 mod chart_currency;
 mod chart_images;
 mod controls;

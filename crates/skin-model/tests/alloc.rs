@@ -1947,15 +1947,6 @@ fn stretch(
     }
 }
 
-/// A carried round's score data: distinct values per field, so a swapped
-/// field shows.
-const CARRIED_SCORE: skin_model::Settled = skin_model::Settled {
-    point: 200_000,
-    ex_score: 6,
-    rate_current_bp: 9_000,
-    rate_whole_bp: 4_285,
-};
-
 #[test]
 fn build_does_not_allocate() {
     let chart = chart();
@@ -2198,7 +2189,6 @@ fn build_does_not_allocate() {
     programs_do_not_allocate(&chart, &full);
     promoted_numerics_do_not_allocate(&chart, &full);
     slots_do_not_allocate(&chart, &full);
-    carried_slots_do_not_allocate(&chart, &full);
     app_readouts_do_not_allocate(&chart, &full, &views, &descs);
     // The next attempt, prepared untracked after the stretches, builds.
     let mut play = skin.prepare(&chart, &full).unwrap();
@@ -5424,173 +5414,6 @@ fn slots_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     TRACK.with(|t| t.set(false));
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0, "slots: allocations");
     assert_eq!(seen, [true, true], "the timer off and on");
-    // The positive control: an allocation on this thread is counted.
-    TRACK.with(|t| t.set(true));
-    std::hint::black_box(Vec::<u8>::with_capacity(16));
-    TRACK.with(|t| t.set(false));
-    assert!(ALLOCS.load(Ordering::Relaxed) > 0, "the counter counts");
-    ALLOCS.store(0, Ordering::Relaxed);
-}
-
-/// A later attempt of a play state carrying a latch's slot and the point
-/// (design.md "beatoraja Lua Skins", the program's state), its program
-/// carry-safe (its guard reads only the point): built frame after frame
-/// on complete views before and after its first judgment, through a
-/// rearm, its callbacks with slots run, its timer keeps the carried start,
-/// its last build is a terminal witness, and nothing allocates; with a
-/// positive control.
-fn carried_slots_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
-    use present_support::{Builder, Cb, read};
-    use skin_model::present::{Bank, Cmp, Conv, Domain, Insn, OFF, SlotDef, Val};
-    let domain = Domain {
-        off: true,
-        ints: Some((0, 1 << 53)),
-    };
-    let mut b = Builder::default();
-    b.0.slots.push(SlotDef { init: OFF, domain });
-    b.0.domains.push(domain);
-    let k = b.push(Cb::code(
-        vec![
-            Insn::LoadSlot { dst: 0, slot: 0 },
-            Insn::Const { dst: 1, k: 0 },
-            Insn::Cmp {
-                op: Cmp::Eq,
-                dst: 2,
-                a: 0,
-                b: 1,
-            },
-            Insn::Test {
-                cond: 2,
-                when: false,
-                to: 7,
-            },
-            Insn::Read { dst: 2, read: 0 },
-            Insn::Test {
-                cond: 2,
-                when: false,
-                to: 7,
-            },
-            Insn::StateUs { dst: 0 },
-            Insn::StoreSlot {
-                slot: 0,
-                src: 0,
-                domain: 0,
-            },
-            Insn::Ret { src: 0 },
-        ],
-        vec![OFF],
-        vec![read("point >= 200000", skin_model::Ty::Bool, None)],
-        Conv::Timer,
-    ));
-    let elements = vec![widget(
-        Source::Image(0),
-        track(0, Ease::Linear, End::Hold),
-        TimerRef::Output(k),
-        Place::SCREEN,
-    )];
-    let skin = present_support::load(
-        Some(b.0),
-        Vec::new(),
-        elements,
-        skin_model::WidgetDefs::default(),
-    )
-    .unwrap();
-    let uvs = play_support::uvs(&skin);
-    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
-    let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
-    let notes = NoteFacts::default();
-    let layout = SkinLayout::AUTHOR;
-    let zero: &'static Tally = Box::leak(Box::new(Tally::default()));
-    let judged: &'static Tally = Box::leak(Box::new(tally(5)));
-    let frame = |now: i64, t: &'static Tally| SkinFrame {
-        app: skin_model::AppReadouts::LAUNCH,
-        state_us: now + 500_000,
-        screen_us: 0,
-        now: TimeUs(now),
-        display_offset: TimeUs(0),
-        tally: t,
-        gauges: &gauges,
-        gauge: 0,
-        effects: &[],
-        notes: &notes,
-        offsets: skin_model::Offsets::NONE,
-        input: &eval::InputFacts::NONE,
-        complete: true,
-        target: TARGETS[0],
-        layout: &layout,
-        turntable: 0,
-        lanes: play_support::VIEW,
-        readouts: readouts_for(play_support::VIEW),
-        playing: true,
-        closing: None,
-        fading: None,
-    };
-    // The latch set at 100 ms of the state clock in an earlier round.
-    let carried = Bank::of(vec![Val::Int(100_000)]);
-    let mut play = skin
-        .prepare_carried(
-            chart,
-            ctx,
-            skin_model::Continuation::Carried {
-                score: Some(CARRIED_SCORE),
-                bank: Some(&carried),
-            },
-        )
-        .unwrap();
-    assert!(play.carry().slots_run, "a carry-safe program runs");
-    // Each frame's timer start and score fields, kept without allocating.
-    let mut starts = [None; 64];
-    let mut scores = [[0; 3]; 64];
-    TRACK.with(|t| t.set(true));
-    for (i, now) in (0..64 * 16 * MS).step_by(16 * MS as usize).enumerate() {
-        if i == 32 {
-            play.rearm();
-        }
-        batch.clear();
-        let t = if i % 32 < 16 { zero } else { judged };
-        skin.build(&mut play, &frame(now, t), &uvs, &mut batch)
-            .expect("the frame builds");
-        if let Some(s) = starts.get_mut(i) {
-            *s = play.timer(timer::BUILTIN);
-        }
-        let fields = play.state().fields;
-        if let Some(s) = scores.get_mut(i) {
-            *s = [
-                field::EX_SCORE,
-                field::RATE_CURRENT_BP,
-                field::RATE_WHOLE_BP,
-            ]
-            .map(|f| fields.get(usize::from(f)).copied().unwrap_or(-1));
-        }
-    }
-    let witness = play.carry().terminal;
-    TRACK.with(|t| t.set(false));
-    assert_eq!(
-        ALLOCS.load(Ordering::Relaxed),
-        0,
-        "carried slots: allocations"
-    );
-    assert!(witness, "the last build is a terminal witness");
-    assert_eq!(play.bank().values(), [Val::Int(100_000)]);
-    // 100 ms of the state clock is 400 ms before chart time 0.
-    assert!(
-        starts.iter().all(|s| *s == Some(TimeUs(-400_000))),
-        "{starts:?}"
-    );
-    // The carried score data before each first judgment, the rearm's
-    // included; the round's own from it.
-    let carried = [
-        CARRIED_SCORE.ex_score,
-        CARRIED_SCORE.rate_current_bp,
-        CARRIED_SCORE.rate_whole_bp,
-    ];
-    for (i, s) in scores.iter().enumerate() {
-        if i % 32 < 16 {
-            assert_eq!(*s, carried, "frame {i}");
-        } else {
-            assert_ne!(s[0], carried[0], "frame {i}");
-        }
-    }
     // The positive control: an allocation on this thread is counted.
     TRACK.with(|t| t.set(true));
     std::hint::black_box(Vec::<u8>::with_capacity(16));

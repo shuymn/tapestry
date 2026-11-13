@@ -151,14 +151,6 @@ impl Program {
         self.loads().map(|(slot, _)| slot)
     }
 
-    /// Whether every read the program performs is a load of field `slot`:
-    /// any other field, any output and any timer operand gives false. A
-    /// positive witness over every operation, so an operation added later
-    /// must be classified here.
-    pub(crate) fn reads_only(&self, slot: u16) -> bool {
-        self.loads_only(&|s| s == slot)
-    }
-
     /// Whether every read the program performs is a load of a field
     /// `allowed` accepts: any output and any timer operand gives false,
     /// whatever `allowed` says. A positive witness over every operation,
@@ -321,7 +313,5 @@ mod tests {
         ] {
             assert!(!program(vec![op]).loads_only(&all), "{op:?}");
         }
-        assert!(program(vec![load(3)]).reads_only(3));
-        assert!(!program(vec![load(3), Op::On(0)]).reads_only(3));
     }
 }

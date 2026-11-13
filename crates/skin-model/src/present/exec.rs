@@ -77,11 +77,6 @@ pub struct Io<'a, 'b> {
     pub outs: &'a mut [i32],
     /// The timer callbacks' starts, in order, `None` while off.
     pub timers: &'a mut [Option<TimeUs>],
-    /// Whether callbacks with slots run: on a fresh attempt, and on a
-    /// carried one whose slots are valid and whose program is carry-safe
-    /// ([`crate::Continuation`]); otherwise they are skipped, their timers
-    /// off.
-    pub slots: bool,
 }
 
 impl Present {
@@ -104,12 +99,7 @@ impl Present {
     pub fn run(&self, io: &mut Io<'_, '_>) {
         let mut timer = 0_usize;
         for (k, cb) in self.def.callbacks.iter().enumerate() {
-            let slotted = self.slotted.get(k).copied().unwrap_or(true);
-            let held = if io.slots || !slotted {
-                self.held(cb, io.state, io.outs)
-            } else {
-                Some(Held::Slots)
-            };
+            let held = self.held(cb, io.state, io.outs);
             let go = held.is_none();
             #[cfg(feature = "dev-tools")]
             let id = u16::try_from(k).unwrap_or(u16::MAX);
@@ -323,8 +313,6 @@ impl Present {
 /// Why a callback does not run this frame.
 #[derive(Clone, Copy)]
 enum Held {
-    /// Its slots do not run on this attempt.
-    Slots,
     After,
     Gate,
 }
@@ -333,7 +321,6 @@ enum Held {
 impl Held {
     const fn skip(self) -> super::trace::Skip {
         match self {
-            Self::Slots => super::trace::Skip::SlotsOff,
             Self::After => super::trace::Skip::After,
             Self::Gate => super::trace::Skip::Gate,
         }

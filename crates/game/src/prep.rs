@@ -80,13 +80,6 @@ impl Changes {
 }
 
 impl PrepKey {
-    /// The loaded chart's identity: a new choice is another, a practice's
-    /// speed change is not.
-    #[must_use]
-    pub const fn chart(&self) -> u64 {
-        self.chart
-    }
-
     /// The screen's structural inputs it holds, if a preparation was
     /// staged with them.
     #[must_use]

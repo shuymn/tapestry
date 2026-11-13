@@ -408,9 +408,8 @@ impl ReferenceVm {
         self.set_play(fields, timers, state_us, None);
     }
 
-    /// [`Self::set_frame`] with the play state's score data, as the source
-    /// keeps it across its rounds: `Some(None)` before its first score
-    /// update (the EX score and the score rates read `Integer.MIN_VALUE`),
+    /// [`Self::set_frame`] with the round's score data: `Some(None)`
+    /// before its first score update (the EX score and the score rates read `Integer.MIN_VALUE`),
     /// `Some(Some([ex_score, rate.current_bp, rate.whole_bp]))` after it,
     /// those three fields answered from it (s7-06e-3-design.md §2a); `None`
     /// answers them from `fields`.

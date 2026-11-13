@@ -24,12 +24,23 @@ fn pieces(body: &str, o: &Options) -> (Report, Observed, Vec<FrameInputs>) {
     };
     let (run, inputs) =
         crate::production::record(&i.imported.skin, rec, &o.script, Some(12)).unwrap();
-    let (_, rec, vm) = h.import_reference(&config, &o.facts, &cancel);
-    let vm = vm.unwrap();
-    for &(id, delta) in &o.perturb {
-        vm.perturb(id, delta);
-    }
-    let mut obs = crate::reference::Reference::new(&vm, &rec.items, &rec.sources).run(&inputs);
+    let mut obs = crate::reference::run_rounds(
+        &inputs,
+        || {
+            let (_, rec, vm) = h.import_reference(&config, &o.facts, &cancel);
+            let vm = vm.unwrap();
+            for &(id, delta) in &o.perturb {
+                vm.perturb(id, delta);
+            }
+            Ok(crate::reference::Fresh {
+                vm,
+                items: rec.items,
+                sources: rec.sources,
+            })
+        },
+        None,
+    )
+    .unwrap();
     obs.root = d.path().to_path_buf();
     let report = crate::production::compare::compare(&run, &obs, &o.isolation);
     (report, obs, inputs)
@@ -308,8 +319,8 @@ fn lowered_consumers_follow_the_rounds() {
     );
 }
 
-/// L7: FAILED and Closing frames, the latter in a carried round whose
-/// slots are refused, are compared too.
+/// L7: FAILED and Closing frames, the latter in round 2, are compared
+/// too.
 #[test]
 fn lowered_consumers_follow_failed_and_closing() {
     let body = dst(
@@ -374,13 +385,16 @@ fn a_perturbed_lowered_read_is_found() {
 /// 3 above.
 const THREE_WAY: &str = "function() local n = ms.number(71) if n < 0 then return 1 elseif n == 0 then return 2 end return 3 end";
 
-/// L10: the score data lives across the play state: `MIN_VALUE` before
-/// its first judgment, then kept across pages, rounds and rearms; a number
-/// whose `ref` is the EX score skips its conditions only before it.
+/// L10: the score data starts afresh at each round: `MIN_VALUE` before
+/// the round's first judgment on the source's side, so a number whose
+/// `ref` is the EX score skips its conditions there in every round, and
+/// production's own value for no judgment is a finding there only (the
+/// known difference, "Score data before the first judgment").
 #[test]
-fn score_data_lives_across_the_play_state() {
+fn score_data_starts_at_each_round() {
     let body = format!(
-        "{VALUES}{}table.insert(skin.value, {{ id = \"e\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2, ref = 71 }})\n{}",
+        "{VALUES}{}table.insert(skin.value, {{ id = \"e\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2, ref = 71 }})
+{}",
         number("m", THREE_WAY, 0),
         dst(
             "\"e\"",
@@ -390,35 +404,48 @@ fn score_data_lives_across_the_play_state() {
     );
     let (r, obs, inputs) = pieces(&body, &options(Script::rounds()));
     let rounds = rounds_of(&inputs);
-    let first = |k: usize| rounds[k][0];
-    assert_eq!(values_on(&obs, first(0)).first(), Some(&1));
-    assert_eq!(values_on(&obs, first(1)).first(), Some(&3));
-    assert_eq!(values_on(&obs, first(2)).first(), Some(&3));
     let sentinel = |i: usize| {
         obs.frames[i].points.iter().any(
             |p| matches!(p, Point::NotReached { key, why: Cause::Sentinel } if key.field == "draw"),
         )
     };
-    assert!(sentinel(first(0)));
-    assert!(!sentinel(first(1)) && !sentinel(first(2)));
-    // R1 before its first judgment (READY and the play up to the first
-    // note): no score data, a finding (s7-06s-design.md O2); R2 and R3
-    // before theirs: the carried score data on both sides, agreed.
+    for (n, round) in rounds.iter().enumerate() {
+        assert_eq!(
+            values_on(&obs, round[0]).first(),
+            Some(&1),
+            "round {}",
+            n + 1
+        );
+        assert!(sentinel(round[0]), "round {}", n + 1);
+        assert_eq!(
+            values_on(&obs, *round.last().unwrap()).first(),
+            Some(&3),
+            "round {}",
+            n + 1
+        );
+        assert!(
+            r.findings
+                .iter()
+                .any(|f| f.place.starts_with(&format!("round {} ", n + 1))),
+            "round {}: {}",
+            n + 1,
+            r.text(0, true, true)
+        );
+    }
     assert!(
-        r.findings
-            .iter()
-            .all(|f| f.place.starts_with("round 1 ") && f.key.field == "value"),
+        r.findings.iter().all(|f| f.key.field == "value"),
         "{}",
         r.text(0, true, true)
     );
-    assert!(!r.findings.is_empty());
     assert!(r.buckets.keys().all(|b| !b.contains("score")));
 }
 
-/// L10: the eight score properties' exact answers on each round's first
-/// READY frame, through Lua reads.
+/// L10: the eight score properties' exact answers through Lua reads:
+/// `MIN_VALUE` on each round's first READY frame, then the round's own
+/// values at its last frame (round 1 every note on time: EX 14; round 2
+/// quit after note 3: EX 6).
 #[test]
-fn score_ids_carry_exact_values() {
+fn score_ids_read_exact_values() {
     let ids = [71, 101, 102, 103, 115, 116, 155, 156];
     let body = ids
         .iter()
@@ -433,45 +460,22 @@ fn score_ids_carry_exact_values() {
     let min = i32::MIN;
     let (_, obs, inputs) = pieces(&body, &options(Script::rounds()));
     let rounds = rounds_of(&inputs);
-    assert_eq!(values_on(&obs, rounds[0][0]), [min; 8]);
+    for round in &rounds {
+        assert_eq!(values_on(&obs, round[0]), [min; 8]);
+    }
     assert_eq!(
-        values_on(&obs, rounds[1][0]),
+        values_on(&obs, *rounds[0].last().unwrap()),
         [14, 14, 100, 0, 100, 0, 100, 0]
     );
     assert_eq!(
-        values_on(&obs, rounds[2][0]),
+        values_on(&obs, *rounds[1].last().unwrap()),
         [6, 6, 100, 0, 42, 85, 42, 85]
     );
-    let (_, obs, inputs) = pieces(&body, &options(Script::zero_score()));
-    let rounds = rounds_of(&inputs);
-    assert_eq!(values_on(&obs, rounds[0][0]), [min; 8]);
-    assert_eq!(values_on(&obs, rounds[1][0]), [0; 8]);
 }
 
-/// L10: a judgment the frames do not build still updates the score data:
-/// `rounds-unwitnessed` carries EX 14, not its last built frame's 12.
-#[test]
-fn unwitnessed_rounds_carry_every_judgment() {
-    let body = format!(
-        "{VALUES}{}",
-        number("m", "function() return ms.number(71) end", 0)
-    );
-    let (_, obs, inputs) = pieces(&body, &options(Script::rounds_unwitnessed()));
-    let rounds = rounds_of(&inputs);
-    let last = *rounds[0].last().unwrap();
-    assert_eq!(inputs[last].score().map(|s| s[0]), Some(12));
-    assert_eq!(
-        inputs[last + 1].score().map(|s| s[0]),
-        None,
-        "a page has no play score"
-    );
-    assert_eq!(inputs[rounds[1][0]].score().map(|s| s[0]), Some(14));
-    assert_eq!(values_on(&obs, rounds[1][0]), [14]);
-}
-
-/// s7-06s S8: the score readings agree across rounds (Rm's
-/// `getDummyNumber` shape): production reads the carried score data where
-/// the source does, so the run passes with nothing attributed.
+/// s7-06s S8: the score readings agree in every round (Rm's
+/// `getDummyNumber` shape): each round's score data is its own on both
+/// sides, so the run passes with nothing attributed.
 #[test]
 fn a_score_reading_agrees_across_rounds() {
     let dummy = |n: i32| {
@@ -512,45 +516,21 @@ fn a_mismatched_score_input_is_refused() {
 
 /// The replay refuses a run whose score input disagrees with a play
 /// frame's score fields (its self-check, s7-06s-design.md S7): reached
-/// only through a broken model or carry, so this checks the replay's
-/// normal path, carried rounds' READY included, stays accepted.
+/// only through a broken model or round, so this checks the replay's
+/// normal path, later rounds' READY included, stays accepted.
 #[test]
 fn the_score_input_matches_every_play_frame() {
     let body = format!(
         "{VALUES}{}",
         number("m", "function() return ms.number(71) end", 0)
     );
-    for s in [
-        Script::rounds(),
-        Script::rounds_unwitnessed(),
-        Script::zero_score(),
-    ] {
+    for s in [Script::rounds(), Script::closing()] {
         let d = folder(&body);
         match replay(d.path(), "s.luaskin", &options(s)) {
             Ok(_) => {}
             Err(Stop::Failed(e)) => panic!("refused: {e}"),
             Err(Stop::Differs) => panic!("the imports differ"),
         }
-    }
-}
-
-/// s7-06s S7: a production carry that drops the score data (a carried
-/// round reading its own fresh values at READY, where the source reads the
-/// last update) is refused at the carried round's first frame.
-#[test]
-fn a_dropped_score_carry_is_refused() {
-    let body = format!(
-        "{VALUES}{}",
-        number("m", "function() return ms.number(71) end", 0)
-    );
-    let d = folder(&body);
-    crate::production::DROP_SCORE_CARRY.with(|s| s.set(true));
-    let got = replay(d.path(), "s.luaskin", &options(Script::rounds()));
-    crate::production::DROP_SCORE_CARRY.with(|s| s.set(false));
-    match got {
-        Err(Stop::Failed(e)) => assert!(e.contains("score input Some([14, "), "{e}"),
-        Ok(_) => panic!("accepted"),
-        Err(Stop::Differs) => panic!("the imports differ"),
     }
 }
 
