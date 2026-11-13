@@ -541,11 +541,13 @@ impl crate::render_side::FrameSink for RigSink {
         }
     }
 
+    /// Settles the scenario's captures before publishing the record, so a
+    /// test that sees the record sees the settlement too.
     fn decision_left(&mut self, record: &crate::measure::DecisionRecord) {
-        self.decided.decision_left(record);
         if let Some(f) = &mut self.frames {
             f.decision_left(record);
         }
+        self.decided.decision_left(record);
     }
 }
 
