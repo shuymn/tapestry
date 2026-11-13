@@ -878,6 +878,7 @@ fn a_rounds_result_compares_with_no_best() {
             plays: 1,
             ex: Some(16),
             bp: Some(0),
+            max_combo: None,
             clear: Some(game::BestLamp::FullCombo),
         }),
         asked: Rc::clone(&asked),

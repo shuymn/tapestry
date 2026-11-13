@@ -67,6 +67,7 @@ fn time_steps(label: &str, text: &str, record: &PlayRecord) {
             completed: re.evaluation.completed,
         },
         &re.evaluation,
+        &chart,
         &preset,
     );
     drop(re);

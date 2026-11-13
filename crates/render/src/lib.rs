@@ -92,7 +92,7 @@ pub use renderer::UploadTiming;
 #[cfg(feature = "dev-tools")]
 pub use renderer::take_build_start;
 pub use renderer::{
-    Admission, ChartOutcome, ChartTarget, CommitError, FrameTiming, LoadingTextError,
+    Admission, ChartOutcome, ChartTarget, CommitError, FrameTiming, LoadingOn, LoadingTextError,
     LoadingTextKey, MAX_SPRITES, MemoryWitness, PreparedToken, RESULT_STRIP_SPRITES, RenderError,
     Renderer, ResultChartTarget, SHARED_TEXELS, STRIP_SPRITES, Target, VM_TEXELS, letterbox,
 };

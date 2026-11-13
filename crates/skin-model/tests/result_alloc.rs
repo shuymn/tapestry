@@ -142,6 +142,10 @@ fn skin() -> Skin {
             relement(Source::Number(4), [600, 100, 10, 10], None),
             relement(Source::Number(5), [600, 120, 10, 10], None),
             relement(Source::Number(6), [600, 140, 10, 10], None),
+            // The best max combo before the play and the play's less it
+            // (173 and 175), shown, hidden or negative by the view.
+            relement(Source::Number(7), [600, 160, 10, 10], Some("best.known")),
+            relement(Source::Number(8), [600, 180, 10, 10], Some("best.known")),
         ],
         WidgetDefs {
             numbers: vec![
@@ -152,6 +156,8 @@ fn skin() -> Skin {
                 number("clock.second", 2),
                 number("app.uptime_s", 2),
                 number("app.fps", 4),
+                number("best.max_combo", 4),
+                number("best.max_combo_diff", 4),
             ],
             texts: vec![text(TextField::FullTitle)],
             image_choices: vec![choice],
@@ -251,8 +257,16 @@ fn a_result_build_allocates_nothing() {
     );
     let mut unavailable = ready(10, BestView::Unavailable, 512);
     unavailable.status = ResultStatus::Unavailable(Unavailable::Failed);
+    // The best max combo 100 against a play of 80: a negative difference.
+    let mut fewer = ready(1_100, best(ResultNumber::Shown(2)), 200);
+    if let BestView::Known(b) = &mut fewer.best {
+        b.max_combo_diff = ResultNumber::Shown(-20);
+    }
     let views = [
+        // The best max combo shown, 100 and +20.
         with_graphs(ready(1_000, best(ResultNumber::Shown(-3)), 512)),
+        fewer,
+        // Hidden, as a best max combo of 0.
         ready(1_200, best(ResultNumber::Hidden), 300),
         unavailable,
         with_graphs(ready(1_400, BestView::Unavailable, 1)),
@@ -287,6 +301,22 @@ fn a_result_build_allocates_nothing() {
             skin_model::chart_image::ChartTable::ABSENT
         });
         fx.view(v);
+        if let BestView::Known(b) = v.best {
+            // The view's values reach the fields the two numbers read.
+            let f = |slot: u16| fx.res.state().fields[usize::from(slot)];
+            let shown = |n| match n {
+                ResultNumber::Shown(v) => v,
+                ResultNumber::Hidden => i32::MIN,
+            };
+            assert_eq!(
+                f(skin_model::result_field::BEST_MAX_COMBO),
+                shown(b.max_combo)
+            );
+            assert_eq!(
+                f(skin_model::result_field::BEST_MAX_COMBO_DIFF),
+                shown(b.max_combo_diff)
+            );
+        }
         fx.skin
             .attach_result_text(&mut fx.res, TextTable::new(vec![line; 1]))
             .unwrap();

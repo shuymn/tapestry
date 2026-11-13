@@ -389,6 +389,10 @@ pub struct Selection {
     /// Steps of the play preset taken and not yet applied: the flow takes
     /// them after each look ([`AppRig::take_preset_step`]).
     pub preset_steps: std::collections::VecDeque<game::PresetStep>,
+    /// The cover switches (SUDDEN+, LIFT, HIDDEN+) the skin turned over an
+    /// odd number of times since the rig last took them
+    /// ([`PlayerRig::turn_covers`]).
+    pub covers_turned: [bool; 3],
     /// What the render thread is given of each change: the lifetime, the
     /// timers' starts and the skin's window.
     pub feed: SkinFeed,
@@ -752,6 +756,12 @@ impl Selection {
             crate::pointer::PointerAct::Nothing => return None,
             crate::pointer::PointerAct::Key(key) => {
                 return self.take_reading(MenuInput::Key(key), level, now);
+            }
+            crate::pointer::PointerAct::Cover(kind) => {
+                if let Some(turned) = self.covers_turned.get_mut(cover_index(kind)) {
+                    *turned = !*turned;
+                }
+                return None;
             }
             crate::pointer::PointerAct::MoveTo(index) => index,
             crate::pointer::PointerAct::Rows(rows) => {
@@ -1261,6 +1271,16 @@ impl Selection {
         self.script
             .as_ref()
             .and_then(|s| s.failure().map(str::to_owned))
+    }
+}
+
+/// The place of cover `kind` in [`Selection::covers_turned`] and
+/// [`skin_model::SelectionSettings::covers_on`].
+const fn cover_index(kind: game::CoverKind) -> usize {
+    match kind {
+        game::CoverKind::Sudden => 0,
+        game::CoverKind::Lift => 1,
+        game::CoverKind::Hidden => 2,
     }
 }
 
@@ -2164,6 +2184,53 @@ impl PlayerRig<'_> {
         }
     }
 
+    /// Turns over the cover switches the skin turned (design.md "Play
+    /// Adjustments"): in the driver, or in the options `player.toml` is to
+    /// hold where there is none, each written at the next settings write
+    /// (design.md "Settings Files"); then the next update shows them.
+    fn turn_covers(&mut self) {
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
+        let turned = std::mem::take(&mut sel.covers_turned);
+        if turned == [false; 3] {
+            return;
+        }
+        let kinds = [
+            game::CoverKind::Sudden,
+            game::CoverKind::Lift,
+            game::CoverKind::Hidden,
+        ];
+        for (kind, _) in kinds.into_iter().zip(turned).filter(|&(_, t)| t) {
+            let failed = match &mut self.adjust {
+                Some(driver) => {
+                    let on = !driver.options().covers().get(kind).on;
+                    driver.set_cover_on(kind, on).err().map(|e| e.to_string())
+                }
+                // Startup refuses options out of range, so there are some.
+                None => self.files.play_options().and_then(|mut options| {
+                    let mut covers = options.covers();
+                    let cover = covers.get_mut(kind);
+                    cover.on = !cover.on;
+                    match options.set_covers(covers) {
+                        Ok(()) => {
+                            self.files.set_options(options);
+                            None
+                        }
+                        Err(e) => Some(e.to_string()),
+                    }
+                }),
+            };
+            if let Some(why) = failed {
+                log::warn!("select: the {kind:?} switch was not turned: {why}");
+            }
+        }
+        self.feed_settings();
+        if let Some(sel) = &mut self.selection {
+            sel.dirty = true;
+        }
+    }
+
     /// Whether a loading lifetime runs: from the choice or a practice's
     /// Start until loading ends.
     pub(crate) fn loading_active(&self) -> bool {
@@ -2223,6 +2290,9 @@ impl PlayerRig<'_> {
                 self.clock.now(),
             );
         }
+        // The switches the skin turned, shown with this look's update.
+        self.turn_covers();
+        let sel = self.selection.as_mut()?;
         // Before anything of the choice: no chart without its skin.
         let now = self.clock.now();
         let chosen = sel.admit(chosen, &mut self.skin, &self.render, now);
@@ -3432,6 +3502,13 @@ impl AppRig for PlayerRig<'_> {
             .ok()
             .map(game::Shelf::chosen_name)
             .filter(|n| *n != self.files.preset());
+        // The play options as the game holds them, a switch the skin
+        // turned included, are written with the preset.
+        if chosen.is_some()
+            && let Some(driver) = &self.adjust
+        {
+            self.files.set_options(driver.options());
+        }
         // Said once written, or once the write failed.
         let failed = chosen.is_some_and(|n| {
             let t = self.controls.tuning().get();
@@ -3492,6 +3569,12 @@ impl AppRig for PlayerRig<'_> {
         // Another scene: held adjustment controls act no more until
         // pressed afresh.
         self.enter_scene();
+        // A load left before its play (cancelled while decoding or
+        // measuring, refused, or Back) leaves no attempt pending: the
+        // switches a skin turns from here reach the next attachment.
+        if let Some(driver) = &mut self.adjust {
+            driver.invalidate();
+        }
         self.show_cursor(true);
         recover(
             &mut self.result_input,
@@ -4080,6 +4163,7 @@ pub(crate) mod tests {
             dirty: false,
             search_pending: false,
             preset_steps: std::collections::VecDeque::new(),
+            covers_turned: [false; 3],
             #[cfg(feature = "dev-tools")]
             script: None,
             coord: crate::shelf::tests::coordinator(),
@@ -5954,7 +6038,16 @@ pub(crate) mod tests {
                 bp: 0,
                 cleared: vec![0b1],
                 full_combo: false,
+                // Its own play, as a counted one is: the read refuses a
+                // best whose EX is not its play's.
+                play: library::Breakdown {
+                    body_sha256: [7; 32],
+                    ex: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
             }),
+            clear: true,
             ineligible: None,
         };
         sel.shelf.best_writer().unwrap().ingest(&c).unwrap();
@@ -6357,6 +6450,7 @@ pub(crate) mod tests {
             dirty: false,
             search_pending: false,
             preset_steps: std::collections::VecDeque::new(),
+            covers_turned: [false; 3],
             #[cfg(feature = "dev-tools")]
             script: None,
             coord: crate::shelf::tests::coordinator(),
@@ -7673,11 +7767,13 @@ pub(crate) mod tests {
             c.sha256,
             library::Score {
                 plays: 3,
+                clears: 0,
                 best: Some(library::Best {
                     ex: 3,
                     bp: 1,
                     cleared: vec![1],
                     full_combo: false,
+                    ..Default::default()
                 }),
             },
         )]));

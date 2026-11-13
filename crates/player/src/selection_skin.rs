@@ -596,7 +596,7 @@ fn fixture_slots() -> String {
 /// sliding right 1 000 from 100, 900, 20×40 (its travel x 100 to 1 100,
 /// y 900 to 940); event 13 over that travel at 500, 905, 40×30; events 13,
 /// 331 and 340 over slot 4 at 1300, 1400 and 1500, top 510, each 60×40;
-/// slider 17 (the master gain) sliding right 200 from 1050, 610, 20×40
+/// events 330 and 332 at 100, 500 and 100, 600, each 100×50; slider 17 (the master gain) sliding right 200 from 1050, 610, 20×40
 /// (over slot 5, its travel x 1 050 to 1 250); and an image at 100, 1000,
 /// 179×37 drawn only while the pointer is inside its region, by a
 /// `mouseRect` {0, 0, 179, 37} as a hover button's. Without `volume`,
@@ -604,8 +604,33 @@ fn fixture_slots() -> String {
 #[cfg(test)]
 #[cfg(feature = "dev-tools")]
 pub(crate) fn pointer_fixture(volume: bool) -> tempfile::TempDir {
+    pointer_fixture_with(volume, false)
+}
+
+/// [`pointer_fixture`], with `holes` two bar images whose file is missing:
+/// every slot's folder image (1), and slot 1's image 0, which hides that
+/// slot.
+#[cfg(test)]
+#[cfg(feature = "dev-tools")]
+pub(crate) fn pointer_fixture_with(volume: bool, holes: bool) -> tempfile::TempDir {
     let dir = fixture_files();
-    let slots = fixture_slots();
+    let mut slots = fixture_slots();
+    let (sets, missing) = if holes {
+        // Slot 1's arms: the second of the seven.
+        let first = slots.find(r#""id": "set""#).unwrap() + 1;
+        let second = first + slots[first..].find(r#""id": "set""#).unwrap();
+        slots.replace_range(second..second + 11, r#""id": "odd""#);
+        (
+            r#"{"id": "set", "images": ["b", "x", "b", "b", "b", "b"]},
+               {"id": "odd", "images": ["x", "b"]}"#,
+            r#", {"id": "m", "path": "m.png"}"#,
+        )
+    } else {
+        (
+            r#"{"id": "set", "images": ["b", "b", "b", "b", "b", "b"]}"#,
+            "",
+        )
+    };
     // A destination of `id` whose y-down rect is `[x, top, w, h]`.
     let dst = |id: &str, [x, top, w, h]: [i32; 4], more: &str| {
         let y = 1_080 - top - h;
@@ -621,8 +646,15 @@ pub(crate) fn pointer_fixture(volume: bool) -> tempfile::TempDir {
         act("a13", 13),
         act("a15", 15),
         act("a315", 315),
+        act("a330", 330),
         act("a331", 331),
+        act("a332", 332),
         act("a340", 340),
+        if holes {
+            r#", {"id": "x", "src": "m", "x": 0, "y": 0, "w": 8, "h": 8}"#.to_owned()
+        } else {
+            String::new()
+        },
     ]
     .concat();
     let drawn: String = [
@@ -640,6 +672,8 @@ pub(crate) fn pointer_fixture(volume: bool) -> tempfile::TempDir {
         dst("a13", [1_300, 510, 60, 40], ""),
         dst("a331", [1_400, 510, 60, 40], ""),
         dst("a340", [1_500, 510, 60, 40], ""),
+        dst("a330", [100, 500, 100, 50], ""),
+        dst("a332", [100, 600, 100, 50], ""),
         if volume {
             dst("vol", [1_050, 610, 20, 40], "")
         } else {
@@ -654,10 +688,10 @@ pub(crate) fn pointer_fixture(volume: bool) -> tempfile::TempDir {
     .concat();
     let json = format!(
         r#"{{"type": 5, "w": 1920, "h": 1080,
-            "source": [{{"id": "s", "path": "s.png"}}],
+            "source": [{{"id": "s", "path": "s.png"}}{missing}],
             "font": [{{"id": "f", "path": "f.ttf"}}],
             "image": [{{"id": "b", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8}}{images}],
-            "imageset": [{{"id": "set", "images": ["b", "b", "b", "b", "b", "b"]}}],
+            "imageset": [{sets}],
             "slider": [{{"id": "ls", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "type": 1, "angle": 1, "range": 1000}},
                        {{"id": "vol", "src": "s", "x": 0, "y": 0, "w": 8, "h": 8, "type": 17, "angle": 1, "range": 200, "changeable": true}}],
             "text": [{{"id": "t", "font": "f", "size": 30, "ref": 10}},

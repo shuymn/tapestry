@@ -140,6 +140,8 @@ pub static RESULT: Schema = Schema {
         int("app.uptime_h", 0, i32::MAX),
         int("app.uptime_m", 0, 59),
         int("app.uptime_s", 0, 59),
+        hideable("best.max_combo"),
+        hideable("best.max_combo_diff"),
     ],
     timers: &[timer("screen"), timer("fadeout")],
     enums: &[],
@@ -263,8 +265,13 @@ pub mod field {
     pub const CLOCK_SECOND: u16 = APP_FPS + 6;
     pub const APP_UPTIME_H: u16 = APP_FPS + 7;
     pub const APP_UPTIME_S: u16 = APP_FPS + 9;
+    /// The best's max combo, of any counted play, and the view's max combo
+    /// minus it; each [`HIDDEN`](super::HIDDEN) unless that best max combo
+    /// is above 0.
+    pub const BEST_MAX_COMBO: u16 = APP_UPTIME_S + 1;
+    pub const BEST_MAX_COMBO_DIFF: u16 = APP_UPTIME_S + 2;
     /// The number of fields.
-    pub const COUNT: usize = APP_UPTIME_S as usize + 1;
+    pub const COUNT: usize = BEST_MAX_COMBO_DIFF as usize + 1;
 }
 
 /// The built-in timer slots of [`RESULT`]; `when` timers follow from
@@ -318,6 +325,8 @@ mod tests {
             (field::CLOCK_SECOND, "clock.second"),
             (field::APP_UPTIME_H, "app.uptime_h"),
             (field::APP_UPTIME_S, "app.uptime_s"),
+            (field::BEST_MAX_COMBO, "best.max_combo"),
+            (field::BEST_MAX_COMBO_DIFF, "best.max_combo_diff"),
         ] {
             assert_eq!(names[usize::from(slot)], name);
         }

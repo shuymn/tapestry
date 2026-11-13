@@ -157,6 +157,7 @@ fn known(ex: u32) -> game::BestLookup {
         plays: 1,
         ex: Some(ex),
         bp: Some(0),
+        max_combo: None,
         clear: None,
     })
 }

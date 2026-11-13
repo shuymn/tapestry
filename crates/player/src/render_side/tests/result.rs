@@ -139,6 +139,8 @@ pub(super) struct Faults {
     /// The next commit is refused (as one for another device), its
     /// staging left as it is.
     pub(super) refuse_commit: AtomicBool,
+    /// Whether the last commit found the staging its token names.
+    pub(super) commit_found: AtomicBool,
     /// The next installation of the result kind is refused.
     pub(super) refuse_install: AtomicBool,
     /// The next result staging answers cancelled.
@@ -195,11 +197,40 @@ impl Screen for Recorded {
         if self.faults.refuse_commit.swap(false, Ordering::AcqRel) {
             return Err(render::CommitError::Device);
         }
+        self.faults
+            .commit_found
+            .store(self.menu.staged_token() == Some(token), Ordering::Release);
         self.menu.commit(token)
     }
     fn discard(&mut self) {
         self.faults.discards.fetch_add(1, Ordering::AcqRel);
         self.menu.discard();
+    }
+    fn discard_token(&mut self, token: render::PreparedToken) {
+        if self.menu.staged_token() == Some(token) {
+            self.faults.discards.fetch_add(1, Ordering::AcqRel);
+        }
+        self.menu.discard_token(token);
+    }
+    fn staged_token(&self) -> Option<render::PreparedToken> {
+        self.menu.staged_token()
+    }
+    fn prepare_attempt(
+        &mut self,
+        a: &render::AttemptInput<'_>,
+        skin: Option<&Arc<render::SkinBundle>>,
+        request: u64,
+    ) -> Option<Result<Preparation, render::RenderError>> {
+        // A specialization stages on the menu screen; an attempt with the
+        // skin in use loads through this screen's faults, as before.
+        if skin.is_some() {
+            return self.menu.prepare_attempt(a, skin, request);
+        }
+        Some(match self.load(a.chart, a.section()) {
+            Ok(()) => Ok(Preparation::Ready),
+            Err(render::RenderError::Skin(e)) => Ok(super::super::refusal(e.reason)),
+            Err(e) => Err(e),
+        })
     }
     fn write_result_chart(
         &mut self,
@@ -1081,6 +1112,111 @@ fn the_view_presented_again_drops_the_one_prepared() {
         assert_eq!(d, Drawn::Skin(ref_a.clone(), 0), "only a draws");
     }
     assert_eq!(rig.link.result_status().shown, Some((1, true)));
+    rig.link.exit();
+}
+
+/// The result's cleanup discards only its own staging: a view prepared
+/// and left uncommitted (its frame's wait timed out), the result left and
+/// the loading state shown before its cleanup ran, then a play attempt
+/// staged; the cleanup the next preparation runs leaves the play's
+/// staging, which its commit then finds.
+#[test]
+fn the_result_s_cleanup_leaves_a_play_staging() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    rig.link.load(Arc::clone(&chart), None).unwrap();
+    // A declarative play skin selected, and another staged with the play.
+    let target = crate::render_common::offscreen(1_920, 1_080);
+    let (_play_dir, play) = crate::render_json::bundle(&target);
+    let (_staged_dir, staged) = crate::render_json::bundle(&target);
+    assert_eq!(
+        rig.link
+            .select(ScreenKind::Play, Some(play))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    let lifetime = installed(&rig, &skin);
+    let a = payload(1, Some(&skin), 1_111, &[]);
+    let b = payload(2, Some(&skin), 2_222, &[]);
+    show(&rig.link, lifetime, 1, &a, &Overlay::default());
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    // b is prepared and held at the next frame's wait, which times out.
+    rig.gate.hold();
+    show(&rig.link, lifetime, 2, &b, &Overlay::default());
+    rig.gate.step();
+    rig.faults.time_out.store(true, Ordering::Release);
+    // Queued behind the wait: the result left, the loading state shown,
+    // a play attempt staged.
+    rig.link.end_result();
+    rig.link.loading().show(super::one_line("loading"));
+    let mut attempt = rig.link.begin_attempt(
+        super::titled(&chart),
+        super::super::AttemptSkin::Specialized(staged),
+    );
+    rig.gate.release();
+    let answer = loop {
+        if let Some(a) = attempt.wait_until(None, || false) {
+            break a.unwrap();
+        }
+    };
+    assert_eq!(answer.preparation, Preparation::Ready);
+    // The next preparation runs the result's cleanup first.
+    rig.link.prepare().unwrap();
+    rig.link.commit_attempt().unwrap();
+    assert!(
+        rig.faults.commit_found.load(Ordering::Acquire),
+        "the play's staging was discarded by the result's cleanup"
+    );
+    rig.link.exit();
+}
+
+/// A result view newer than every request supersedes the play attempt
+/// staged before it: the play's staging, which the view's own replaces in
+/// the screen's one slot, is discarded with its answer, never left
+/// answered behind a newer request.
+#[test]
+fn a_newer_result_view_supersedes_a_play_staging() {
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let chart = Arc::new(bms_model::ChartBuilder::new(120_000).build().unwrap());
+    rig.link.load(Arc::clone(&chart), None).unwrap();
+    let target = crate::render_common::offscreen(1_920, 1_080);
+    let (_play_dir, play) = crate::render_json::bundle(&target);
+    let (_staged_dir, staged) = crate::render_json::bundle(&target);
+    assert_eq!(
+        rig.link
+            .select(ScreenKind::Play, Some(play))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    let lifetime = installed(&rig, &skin);
+    assert_eq!(
+        rig.link
+            .prepare_attempt_with(
+                super::titled(&chart),
+                super::super::AttemptSkin::Specialized(staged),
+                || false,
+            )
+            .unwrap(),
+        Preparation::Ready
+    );
+    let discards = rig.faults.discards.load(Ordering::Acquire);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    assert!(rig.until(|d| skin_frame(d).is_some()));
+    assert_eq!(
+        rig.faults.discards.load(Ordering::Acquire),
+        discards + 1,
+        "the play's staging discarded with its answer"
+    );
     rig.link.exit();
 }
 

@@ -77,6 +77,39 @@ pub static SELECTION: Schema = Schema {
         int("selected.length_sec", 0, 59),
         int("selected.judge_class", 0, JUDGE_CLASS_MAX),
         flag("selected.judge_class_valid"),
+        value("selected.clears"),
+        value("selected.fails"),
+        value("selected.max_combo"),
+        value("selected.point"),
+        flag("selected.play_notes_valid"),
+        value("selected.count.perfect"),
+        value("selected.count.great"),
+        value("selected.count.good"),
+        value("selected.count.bad"),
+        value("selected.count.poor"),
+        value("selected.count.empty_poor"),
+        value("selected.count.fast"),
+        value("selected.count.slow"),
+        value("selected.count.early.perfect"),
+        value("selected.count.late.perfect"),
+        value("selected.count.early.great"),
+        value("selected.count.late.great"),
+        value("selected.count.early.good"),
+        value("selected.count.late.good"),
+        value("selected.count.early.bad"),
+        value("selected.count.late.bad"),
+        value("selected.count.early.poor"),
+        value("selected.count.late.poor"),
+        value("selected.count.early.empty_poor"),
+        value("selected.count.late.empty_poor"),
+        value("selected.count.bad_poor"),
+        value("selected.count.poor_miss"),
+        value("selected.count.bad_poor_miss"),
+        value("selected.rate.perfect"),
+        value("selected.rate.great"),
+        value("selected.rate.good"),
+        value("selected.rate.bad"),
+        value("selected.rate.poor"),
         int("settings.display_offset", -VALUE_MAX, VALUE_MAX),
         int("settings.volume", 0, 100),
         flag("settings.floating"),
@@ -172,34 +205,67 @@ pub mod field {
     /// chart row.
     pub const SELECTED_JUDGE_CLASS: u16 = 25;
     pub const SELECTED_JUDGE_CLASS_VALID: u16 = 26;
+    /// The counted plays that were clears, and the plays less them; 0
+    /// while `selected.played` is false.
+    pub const SELECTED_CLEARS: u16 = 27;
+    pub const SELECTED_FAILS: u16 = 28;
+    /// The best max combo, of any counted play; 0 without a best.
+    pub const SELECTED_MAX_COMBO: u16 = 29;
+    /// The best EX play's point score
+    /// ([`BestPlay::point`](crate::BestPlay::point)); 0 without one.
+    pub const SELECTED_POINT: u16 = 30;
+    /// Whether the best EX play's notes are known and above 0, which its
+    /// judgment rates divide by.
+    pub const SELECTED_PLAY_NOTES_VALID: u16 = 31;
+    /// The best EX play's judgments, PERFECT to POOR, then its empty
+    /// POORs, FAST and SLOW, as the result's `count.*` fields; 0 without
+    /// one.
+    pub const SELECTED_COUNT_PERFECT: u16 = 32;
+    pub const SELECTED_COUNT_POOR: u16 = 36;
+    pub const SELECTED_COUNT_EMPTY_POOR: u16 = 37;
+    pub const SELECTED_COUNT_FAST: u16 = 38;
+    pub const SELECTED_COUNT_SLOW: u16 = 39;
+    /// Each kind's early and late judgments in pairs, PERFECT to POOR,
+    /// then the empty POORs'.
+    pub const SELECTED_COUNT_EARLY_PERFECT: u16 = 40;
+    pub const SELECTED_COUNT_LATE_EMPTY_POOR: u16 = 51;
+    /// BAD and POOR, POOR and the empty POORs, and all three.
+    pub const SELECTED_COUNT_BAD_POOR: u16 = 52;
+    pub const SELECTED_COUNT_POOR_MISS: u16 = 53;
+    pub const SELECTED_COUNT_BAD_POOR_MISS: u16 = 54;
+    /// Each judgment's count, PERFECT to POOR, in whole percent of the
+    /// best EX play's notes, rounded down; 0 while
+    /// `selected.play_notes_valid` is false.
+    pub const SELECTED_RATE_PERFECT: u16 = 55;
+    pub const SELECTED_RATE_POOR: u16 = 59;
     /// The settings' fields, then the application's readouts, from here
     /// on, which a view leaves as they are
     /// ([`SelectionSettings`](crate::SelectionSettings),
     /// [`SelectionFrame::app`](crate::SelectionFrame::app)).
-    pub const SETTINGS: u16 = 27;
+    pub const SETTINGS: u16 = SELECTED_RATE_POOR + 1;
     /// The display offset in whole ms.
-    pub const SETTINGS_DISPLAY_OFFSET: u16 = 27;
+    pub const SETTINGS_DISPLAY_OFFSET: u16 = SETTINGS;
     /// The master gain's number, `(int)(gain · 100f)`.
-    pub const SETTINGS_VOLUME: u16 = 28;
+    pub const SETTINGS_VOLUME: u16 = SETTINGS + 1;
     /// Whether the hi-speed is Floating.
-    pub const SETTINGS_FLOATING: u16 = 29;
+    pub const SETTINGS_FLOATING: u16 = SETTINGS + 2;
     /// In Floating, the travel duration of the target green number `G`,
     /// `⌊5 · G / 3⌋` ms, and `G`; 0 in Classic.
-    pub const SETTINGS_DURATION: u16 = 30;
-    pub const SETTINGS_GREEN: u16 = 31;
+    pub const SETTINGS_DURATION: u16 = SETTINGS + 3;
+    pub const SETTINGS_GREEN: u16 = SETTINGS + 4;
     /// The source's fixed hi-speed index: 0 in Classic; in Floating 1 to
     /// 4 by the reference tempo, start, maximum, main and minimum.
-    pub const SETTINGS_FIX_HISPEED: u16 = 32;
+    pub const SETTINGS_FIX_HISPEED: u16 = SETTINGS + 5;
     /// The source's sorter index of the order: title 0, artist 1, level 4;
     /// −1 for an order it has no sorter for.
-    pub const SETTINGS_ORDER: u16 = 33;
+    pub const SETTINGS_ORDER: u16 = SETTINGS + 6;
     /// The displayed gauge's look, assist-easy 0 to hazard 5; −1 without
     /// one.
-    pub const SETTINGS_GAUGE: u16 = 34;
+    pub const SETTINGS_GAUGE: u16 = SETTINGS + 7;
     /// Whether SUDDEN+, LIFT and HIDDEN+ are on.
-    pub const SETTINGS_SUDDEN: u16 = 35;
-    pub const SETTINGS_LIFT: u16 = 36;
-    pub const SETTINGS_HIDDEN: u16 = 37;
+    pub const SETTINGS_SUDDEN: u16 = SETTINGS + 8;
+    pub const SETTINGS_LIFT: u16 = SETTINGS + 9;
+    pub const SETTINGS_HIDDEN: u16 = SETTINGS + 10;
     /// The source's gauge auto-shift index for the failure handling
     /// `player.toml` sets: 0 (none) when a failed play closes, 1
     /// (continue) when it plays to the end.
@@ -254,6 +320,39 @@ mod tests {
             (field::SELECTED_RANK, "selected.rank"),
             (field::SELECTED_LEVEL, "selected.level"),
             (field::SELECTED_LENGTH_SEC, "selected.length_sec"),
+            (field::SELECTED_CLEARS, "selected.clears"),
+            (field::SELECTED_FAILS, "selected.fails"),
+            (field::SELECTED_MAX_COMBO, "selected.max_combo"),
+            (field::SELECTED_POINT, "selected.point"),
+            (
+                field::SELECTED_PLAY_NOTES_VALID,
+                "selected.play_notes_valid",
+            ),
+            (field::SELECTED_COUNT_PERFECT, "selected.count.perfect"),
+            (field::SELECTED_COUNT_POOR, "selected.count.poor"),
+            (
+                field::SELECTED_COUNT_EMPTY_POOR,
+                "selected.count.empty_poor",
+            ),
+            (field::SELECTED_COUNT_FAST, "selected.count.fast"),
+            (field::SELECTED_COUNT_SLOW, "selected.count.slow"),
+            (
+                field::SELECTED_COUNT_EARLY_PERFECT,
+                "selected.count.early.perfect",
+            ),
+            (
+                field::SELECTED_COUNT_LATE_EMPTY_POOR,
+                "selected.count.late.empty_poor",
+            ),
+            (field::SELECTED_COUNT_BAD_POOR, "selected.count.bad_poor"),
+            (field::SELECTED_COUNT_POOR_MISS, "selected.count.poor_miss"),
+            (
+                field::SELECTED_COUNT_BAD_POOR_MISS,
+                "selected.count.bad_poor_miss",
+            ),
+            (field::SELECTED_RATE_PERFECT, "selected.rate.perfect"),
+            (field::SELECTED_RATE_POOR, "selected.rate.poor"),
+            (field::SETTINGS, "settings.display_offset"),
             (field::SETTINGS_DISPLAY_OFFSET, "settings.display_offset"),
             (field::SETTINGS_VOLUME, "settings.volume"),
             (field::SETTINGS_GREEN, "settings.green"),

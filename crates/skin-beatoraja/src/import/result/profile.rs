@@ -171,6 +171,11 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
         // Hidden with no previous BP, as the source's `MIN_VALUE`
         // (`IntegerPropertyFactory.java:712-732`).
         176 => v("best.bp", BEST, (HIDDEN, M)),
+        // The best max combo before this play and this play's less it,
+        // both hidden unless that best is above 0
+        // (`IntegerPropertyFactory.java:734-752`).
+        173 => v("best.max_combo", BEST, (HIDDEN, M)),
+        175 => v("best.max_combo_diff", BEST, (HIDDEN, M)),
         178 => v("best.bp_diff", BEST, (HIDDEN, M)),
         183 => v("best.rate_bp / 100", "best.rate_valid", (0, M / 100)),
         184 => v("best.rate_bp % 100", "best.rate_valid", (0, 99)),
@@ -223,10 +228,8 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
         ),
         1164 => v("chart.length_ms / 1000 % 60", "chart.length_valid", (0, 59)),
         20..=29 => app(id)?,
-        // No score target; no IR. The best's max combo (173, and 175 the
-        // difference from it) is not kept with a best until stage3.md's
-        // row S10-14.
-        151 | 157 | 158 | 173 | 175 | 179 | 180 | 182 | 380..=399 => {
+        // No score target; no IR.
+        151 | 157 | 158 | 179 | 180 | 182 | 380..=399 => {
             return Some(Omit);
         }
         _ => return None,

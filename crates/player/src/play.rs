@@ -1439,7 +1439,7 @@ impl PlayerRig<'_> {
     /// Writes the settings keys' values to `device.toml` and
     /// `player.toml`, each atomically and only if it changed. Called when a
     /// play ends and when the run ends, never during a play.
-    fn persist(&mut self) {
+    pub(crate) fn persist(&mut self) {
         if let Some(driver) = &self.adjust {
             self.files.set_options(driver.options());
         }

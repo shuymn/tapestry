@@ -10,13 +10,13 @@ use skin_beatoraja::{
 };
 use skin_model::ScreenKind;
 
-/// The JSON skin: number 71 by `ref`, number 410, an image under op 2 and
+/// The JSON skin: number 71 by `ref`, number 333, an image under op 2 and
 /// one under `draw` 625.
 fn json_body() -> String {
     format!(
         r#""imageset": [{SET}], "text": [{TEXT_T}],
            "value": [{{"id": "ex", {DIGITS}, "digit": 4, "ref": 71}},
-                     {{"id": "ep", {DIGITS}, "digit": 4, "ref": 410}}],
+                     {{"id": "ep", {DIGITS}, "digit": 4, "ref": 333}}],
            "songlist": {{"id": "list", "center": 0,
                "liston": [{{"id": "set", "dst": [{{"x": 0, "y": 900, "w": 300, "h": 40}}]}}],
                "listoff": [{{"id": "set", "dst": [{{"x": 0, "y": 900, "w": 300, "h": 40}}]}}],
@@ -58,7 +58,7 @@ fn lua_entry() -> String {
            {{ id = \"ex\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, digit = 4,\n\
              value = function() return ms.number(71) end }},\n\
            {{ id = \"ep\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, digit = 4,\n\
-             value = function() return ms.number(410) end }} }}\n\
+             value = function() return ms.number(333) end }} }}\n\
          skin.songlist = {{ id = \"list\", center = 0,\n\
            liston = {{ {{ id = \"set\", dst = {{ {{ x = 0, y = 900, w = 300, h = 40 }} }} }} }},\n\
            listoff = {{ {{ id = \"set\", dst = {{ {{ x = 0, y = 900, w = 300, h = 40 }} }} }} }},\n\
@@ -91,7 +91,7 @@ fn lua_reads_and_json_fields_draw_the_same_frames() {
         LuaOutcome::Imported(i) => i,
         LuaOutcome::Pending(p) => panic!("{p:?}"),
     };
-    // 71, option 2 and option 625 lower; 410 does not, and is dropped as
+    // 71, option 2 and option 625 lower; 333 (notes played over all charts) does not, and is dropped as
     // the JSON `ref` is.
     let lowered = lua
         .callbacks
@@ -109,7 +109,7 @@ fn lua_reads_and_json_fields_draw_the_same_frames() {
     };
     let note = NoteKind::UnsupportedProperty {
         kind: PropertyKind::Integer,
-        id: Some(410),
+        id: Some(333),
     };
     assert_eq!(dropped(&json.report), [note]);
     assert_eq!(dropped(&lua.imported.report), [note]);

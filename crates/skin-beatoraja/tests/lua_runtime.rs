@@ -192,7 +192,7 @@ fn callbacks_run_on_the_kept_vm() {
         "local req = require\nlocal held = { d = dofile }",
         &[
             "function() return ms.number(77) / 2 end",
-            "function() return ms.number(410) + 7 end",
+            "function() return ms.number(333) + 7 end",
             "function() return ms.number(283) end",
             "function() req(\"x\") return 5 end",
             "function() held.d(\"x\") return 5 end",
@@ -238,7 +238,7 @@ fn callbacks_run_on_the_kept_vm() {
     let (notes, dropped) = runtime(&mut i).notes();
     assert_eq!(dropped, 0);
     assert!(notes.contains(&RuntimeNote::ImportOnly), "{notes:?}");
-    for (api, id, value) in [("number", 410, 0), ("number", 283, i32::MIN)] {
+    for (api, id, value) in [("number", 333, 0), ("number", 283, i32::MIN)] {
         assert!(
             notes.contains(&RuntimeNote::Absent { api, id, value }),
             "{notes:?}"

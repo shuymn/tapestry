@@ -11,7 +11,7 @@ use common::{
     CHART, Fixture, MS, RANDOM_CHART, contribution, hex, hits, key, played, record_of, refused,
     score_of, sql, tables,
 };
-use library::{Best, BestsState, Ineligible, Ingested, LN_MODE, Score, Tuple};
+use library::{Best, BestsState, Ineligible, Ingested, LN_MODE, PlayId, Score, Tuple};
 use replay::{EndStatus, InitialGauge, PlayRecord, PlayType, Practice};
 
 /// A database of the version before: deleted and rebuilt; its loudness goes,
@@ -73,13 +73,28 @@ fn completed_full_play_updates_the_best() {
         panic!("not counted");
     };
     assert_eq!(previous, None);
+    // The play kept: its own breakdown, under its body hash.
+    let late_play = current.best.as_ref().unwrap().play;
+    assert_eq!(
+        late_play.body_sha256,
+        PlayId::of(String::new(), &first, 0, 0).body_sha256
+    );
+    assert_eq!(
+        (late_play.notes, late_play.ex, late_play.max_combo),
+        (3, 3, 3)
+    );
+    assert_eq!(late_play.counts, [0, 3, 0, 0, 0]);
+    assert_eq!(late_play.late, [0, 3, 0, 0, 0]);
     let late = Score {
         plays: 1,
+        clears: 1,
         best: Some(Best {
             ex: 3,
             bp: 0,
+            max_combo: 3,
             cleared: vec![0b11],
             full_combo: true,
+            play: late_play,
         }),
     };
     assert_eq!(current, late);
@@ -91,13 +106,18 @@ fn completed_full_play_updates_the_best() {
         panic!("not counted");
     };
     assert_eq!(previous, Some(late));
+    let best_play = current.best.as_ref().unwrap().play;
+    assert_eq!((best_play.ex, best_play.counts), (6, [3, 0, 0, 0, 0]));
     let best = Score {
         plays: 2,
+        clears: 2,
         best: Some(Best {
             ex: 6,
             bp: 0,
+            max_combo: 3,
             cleared: vec![0b11],
             full_combo: true,
+            play: best_play,
         }),
     };
     assert_eq!(current, best);
@@ -130,6 +150,7 @@ fn played_to_end_with_overflow_sets_no_best() {
         score_of(&lib, &record),
         Some(Score {
             plays: 1,
+            clears: 0,
             best: None
         })
     );
@@ -205,6 +226,8 @@ fn only_eligible_plays_set_bests() {
         lib.best_writer().unwrap().ingest(&c).unwrap();
         let after = score_of(&lib, &record).unwrap();
         assert_eq!((after.plays, after.best), (before + 1, None), "{reason:?}");
+        // Played through with every note hit, yet no clear: not eligible.
+        assert_eq!((c.clear, after.clears), (false, 0), "{reason:?}");
     }
     // Unverified: refused, so no row at all, and a catch-up does not
     // count it either.
@@ -240,6 +263,7 @@ fn played_to_end_claim_without_completion_sets_no_best() {
         score_of(&lib, &record),
         Some(Score {
             plays: 1,
+            clears: 0,
             best: None
         })
     );
@@ -320,9 +344,13 @@ fn random_chart_draws_share_the_file_best() {
     // BP and FULL COMBO from the shorter one.
     let merged = Score {
         plays: 2,
+        clears: 2,
         best: Some(Best {
             ex: 6,
             bp: 0,
+            max_combo: bests[0].max_combo.max(bests[1].max_combo),
+            // The breakdown is the longer draw's, whose EX is the best.
+            play: bests[1].play,
             cleared: bests[0]
                 .cleared
                 .iter()
@@ -670,7 +698,12 @@ fn missing_chart_is_retried_after_it_is_scanned() {
     assert_eq!(report.read, 1);
     assert!(!report.bests.catch_up);
     assert_eq!((report.bests.retried, report.bests.counted), (1, 1));
-    assert_eq!(score_of(&lib, &record).unwrap().plays, 1);
+    let waited = score_of(&lib, &record).unwrap();
+    assert_eq!((waited.plays, waited.clears), (1, 1));
+    assert_eq!(
+        waited.best.unwrap().play.body_sha256,
+        PlayId::of(String::new(), &record, 0, 0).body_sha256
+    );
     // A later pass reading no chart retries nothing.
     let report = fx.pass(&lib).bests;
     assert_eq!((report.retried, report.counted), (0, 0));
@@ -912,4 +945,293 @@ fn a_capture_cancelled_before_playback_counts_nothing() {
     assert_eq!(report.bests.refused.no_played_attempt, 1);
     assert_eq!(report.bests.refused.total(), 1);
     assert_eq!(score_of(&lib, &record), None);
+}
+
+/// 128 taps on key 1, sixteenths from 2 s: enough misses to fail every
+/// gauge of the tapestry preset.
+fn dense_chart() -> String {
+    let mut text = "#BPM 120
+"
+    .to_owned();
+    for m in 1..=8 {
+        text.push_str(&format!(
+            "#{m:03}11:{}
+",
+            "01".repeat(16)
+        ));
+    }
+    text
+}
+
+/// Every note of [`dense_chart`] hit on time.
+fn dense_hits() -> Vec<eval::PhysicalInputEvent> {
+    (1..=8)
+        .flat_map(|m| (0..16).map(move |i| (2_000 * m + 125 * i) * MS))
+        .flat_map(|t| [key(1, t, 1), key(1, t + 50 * MS, 0)])
+        .collect()
+}
+
+/// The plays kept are the same whether counted live or rebuilt from the
+/// same records listed in another order; a refused record adds nothing to
+/// either.
+#[test]
+fn rebuild_equals_live_in_another_order() {
+    let fx = Fixture::new();
+    fx.chart("a.bms", CHART);
+    let lib = fx.open();
+    fx.pass(&lib);
+    // Live in the order 3, 2, 1; a catch-up lists 1, 2, 3.
+    let plays = [
+        ("3-1.tprl", played(30)),
+        ("2-1.tprl", played(10)),
+        ("1-1.tprl", played(0)),
+    ];
+    for (name, record) in &plays {
+        let (rel, _) = fx.save(record, name);
+        fx.live(&lib, &rel, CHART, record);
+    }
+    let mut refused_play = played(10);
+    refused_play.versions.evaluator += 1;
+    fx.save(&refused_play, "0-1.tprl");
+    let record = &plays[0].1;
+    let live = score_of(&lib, record).unwrap();
+    lib.request_bests_pass().unwrap();
+    fx.pass(&lib);
+    assert_eq!(score_of(&lib, record).as_ref(), Some(&live));
+    let best = live.best.as_ref().unwrap();
+    assert_eq!((live.plays, live.clears), (3, 3));
+    assert_eq!((best.ex, best.play.ex, best.max_combo), (6, 6, 3));
+    assert_eq!(
+        best.play.body_sha256,
+        PlayId::of(String::new(), &plays[2].1, 0, 0).body_sha256
+    );
+    drop(lib);
+    sql(&fx.db(), "UPDATE meta SET bests = bests + 1");
+    let lib = fx.open();
+    fx.pass(&lib);
+    assert_eq!(score_of(&lib, record), Some(live));
+}
+
+/// Two plays of equal EX with different breakdowns keep the same one,
+/// counted live in either order or rebuilt.
+#[test]
+fn equal_ex_plays_keep_one_breakdown() {
+    let early = played(-30);
+    let late = played(30);
+    let lowest = [&early, &late]
+        .map(|r| PlayId::of(String::new(), r, 0, 0).body_sha256)
+        .into_iter()
+        .min()
+        .unwrap();
+    let mut kept = Vec::new();
+    for order in [[&early, &late], [&late, &early]] {
+        let fx = Fixture::new();
+        fx.chart("a.bms", CHART);
+        let lib = fx.open();
+        fx.pass(&lib);
+        for (n, record) in order.iter().enumerate() {
+            let (rel, _) = fx.save(record, &format!("{n}-1.tprl"));
+            fx.live(&lib, &rel, CHART, record);
+        }
+        let live = score_of(&lib, &early).unwrap();
+        drop(lib);
+        sql(&fx.db(), "UPDATE meta SET bests = bests + 1");
+        let lib = fx.open();
+        fx.pass(&lib);
+        assert_eq!(score_of(&lib, &early).as_ref(), Some(&live));
+        kept.push(live.best.unwrap().play);
+    }
+    assert_eq!(kept[0], kept[1]);
+    assert_eq!(kept[0].body_sha256, lowest);
+    // Equal EX, yet different breakdowns: one early, the other late.
+    let [e, l] = [&early, &late].map(|r| {
+        let fx = Fixture::new();
+        fx.chart("a.bms", CHART);
+        let (rel, _) = fx.save(r, "1-1.tprl");
+        contribution(&fx.records, &rel, CHART, r).best.unwrap().play
+    });
+    assert_eq!(e.ex, l.ex);
+    assert_ne!(e.early, l.early);
+}
+
+/// An eligible play whose own lamp is not FAILED is a clear; an eligible
+/// failure after it is not.
+#[test]
+fn clears_count_cleared_plays() {
+    let fx = Fixture::new();
+    let chart = dense_chart();
+    fx.chart("d.bms", &chart);
+    let lib = fx.open();
+    fx.pass(&lib);
+    let cleared = record_of(&chart, 0, dense_hits());
+    let (rel, _) = fx.save(&cleared, "1-1.tprl");
+    let c = contribution(&fx.records, &rel, &chart, &cleared);
+    assert_eq!((c.ineligible, c.clear), (None, true));
+    lib.best_writer().unwrap().ingest(&c).unwrap();
+    let failure = record_of(&chart, 0, Vec::new());
+    let (rel, _) = fx.save(&failure, "2-1.tprl");
+    let c = contribution(&fx.records, &rel, &chart, &failure);
+    assert_eq!((c.ineligible, c.clear), (None, false));
+    lib.best_writer().unwrap().ingest(&c).unwrap();
+    let s = score_of(&lib, &failure).unwrap();
+    assert_eq!((s.plays, s.clears), (2, 1));
+}
+
+/// The ledger counts a play identity once, its recompressed copy at the
+/// same path included; the same body under another name counts again,
+/// with its clear, and keeps the breakdown.
+#[test]
+fn the_ledger_dedupes_by_path_and_body() {
+    let fx = Fixture::new();
+    fx.chart("a.bms", CHART);
+    let lib = fx.open();
+    fx.pass(&lib);
+    let record = played(0);
+    let (rel, path) = fx.save(&record, "1-1.tprl");
+    fx.live(&lib, &rel, CHART, &record);
+    let once = score_of(&lib, &record).unwrap();
+    fs::write(&path, compressed(&record, 1)).unwrap();
+    lib.request_bests_pass().unwrap();
+    fx.pass(&lib);
+    assert_eq!(score_of(&lib, &record).as_ref(), Some(&once));
+    fs::copy(&path, path.with_file_name("2-2.tprl")).unwrap();
+    lib.request_bests_pass().unwrap();
+    fx.pass(&lib);
+    let twice = score_of(&lib, &record).unwrap();
+    assert_eq!((twice.plays, twice.clears), (2, 2));
+    assert_eq!(twice.best, once.best);
+}
+
+/// The `scores` table of bests version 2, as that version created it.
+const SCORES_V2: &str = "CREATE TABLE scores (
+    preset_sha256 BLOB NOT NULL,
+    ln_mode INTEGER NOT NULL,
+    chart_sha256 BLOB NOT NULL,
+    plays INTEGER NOT NULL,
+    best_ex INTEGER,
+    best_bp INTEGER,
+    cleared BLOB,
+    full_combo INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (preset_sha256, ln_mode, chart_sha256)
+) WITHOUT ROWID;";
+
+/// A database of bests version 2, its `scores` in that version's layout
+/// with a row, is opened without reading that row: `scores` is created
+/// again in this version's layout, `counted` and `refused` are cleared and
+/// a catch-up is requested, while the charts and the loudness stay and no
+/// chart is read again.
+#[test]
+fn a_bests_2_database_is_recreated_without_reading_it() {
+    let fx = Fixture::new();
+    fx.chart("a.bms", CHART);
+    let mut lib = fx.open();
+    fx.pass(&lib);
+    let record = played(0);
+    let (rel, _) = fx.save(&record, "1-1.tprl");
+    fx.live(&lib, &rel, CHART, &record);
+    let current = score_of(&lib, &record).unwrap();
+    let mut refused_play = played(0);
+    refused_play.versions.evaluator += 1;
+    fx.save(&refused_play, "2-1.tprl");
+    lib.request_bests_pass().unwrap();
+    fx.pass(&lib);
+    assert_eq!(refused(&fx.db()).len(), 1);
+    let loudness_key = library::LoudnessKey {
+        resolved_hash: [1; 32],
+        sounds: [2; 32],
+        mixer_version: 1,
+        analysis_version: 1,
+        rate: 48_000,
+    };
+    let loudness = library::LoudnessRow {
+        integrated: None,
+        true_peak: 1.0,
+        over_range: false,
+    };
+    lib.store_loudness(&loudness_key, &loudness).unwrap();
+    drop(lib);
+    sql(
+        &fx.db(),
+        &format!(
+            "DROP TABLE scores; {SCORES_V2}
+             INSERT INTO scores VALUES (x'{}', 1, x'{}', 7, 9, 1, x'03', 1);
+             UPDATE meta SET bests = 2;",
+            hex(&record.preset.sha256),
+            hex(&record.chart.identity.sha256),
+        ),
+    );
+
+    let (lib, opened) = library::Library::open(&fx.db()).unwrap();
+    assert_eq!(opened, library::Opened::Current);
+    let BestsState::Invalidated { old: Some(old) } = lib.bests_state() else {
+        panic!("{:?}", lib.bests_state());
+    };
+    assert_eq!(old.bests, 2);
+    assert_eq!(library::BESTS_VERSION, 3);
+    // This version's layout, empty; the other bests tables cleared.
+    sql(
+        &fx.db(),
+        "SELECT clears, best_combo, play_sha256, play FROM scores",
+    );
+    assert_eq!(tables(&fx.db()), (Vec::new(), Vec::new()));
+    assert_eq!(refused(&fx.db()), Vec::<String>::new());
+    assert!(lib.bests_pending().unwrap());
+    assert_eq!(lib.charts().unwrap().len(), 1);
+    assert_eq!(lib.loudness(&loudness_key).unwrap(), Some(loudness));
+    let report = fx.pass(&lib);
+    assert_eq!(report.read, 0);
+    assert_eq!(score_of(&lib, &record), Some(current));
+}
+
+/// A recreation that fails partway, here at the tuple's write after
+/// `scores` was created again, leaves the database as it was: the old
+/// layout with its row, the ledgers and the old tuple; the next open
+/// recreates it whole.
+#[test]
+fn an_interrupted_recreation_leaves_the_old_bests() {
+    let fx = Fixture::new();
+    fx.chart("a.bms", CHART);
+    let lib = fx.open();
+    fx.pass(&lib);
+    let record = played(0);
+    let (rel, _) = fx.save(&record, "1-1.tprl");
+    fx.live(&lib, &rel, CHART, &record);
+    drop(lib);
+    sql(
+        &fx.db(),
+        &format!(
+            "DROP TABLE scores; {SCORES_V2}
+             INSERT INTO scores VALUES (x'{}', 1, x'{}', 7, 9, 1, x'03', 1);
+             UPDATE meta SET bests = 2;
+             CREATE TRIGGER fail BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT, 'injected'); END;",
+            hex(&record.preset.sha256),
+            hex(&record.chart.identity.sha256),
+        ),
+    );
+    assert!(library::Library::open(&fx.db()).is_err());
+    let conn = rusqlite::Connection::open(fx.db()).unwrap();
+    let old: (i64, i64) = conn
+        .query_row("SELECT plays, best_ex FROM scores", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .unwrap();
+    assert_eq!(old, (7, 9));
+    assert!(conn.prepare("SELECT play FROM scores").is_err());
+    let counted: i64 = conn
+        .query_row("SELECT count(*) FROM counted", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(counted, 1);
+    let bests: i64 = conn
+        .query_row("SELECT bests FROM meta", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(bests, 2);
+    conn.execute_batch("DROP TRIGGER fail;").unwrap();
+    drop(conn);
+    let (lib, _) = library::Library::open(&fx.db()).unwrap();
+    assert!(matches!(lib.bests_state(), BestsState::Invalidated { .. }));
+    sql(
+        &fx.db(),
+        "SELECT clears, best_combo, play_sha256, play FROM scores",
+    );
+    assert_eq!(tables(&fx.db()), (Vec::new(), Vec::new()));
 }

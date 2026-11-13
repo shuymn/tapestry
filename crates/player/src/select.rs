@@ -1452,6 +1452,7 @@ impl SelectScreen {
     /// What is known of the chart under the cursor.
     fn selected_chart(&self, e: &ChartEntry) -> SelectedChart {
         let h = &e.header;
+        let stored = self.stored(e);
         let text = |f: &Option<String>| f.clone().unwrap_or_default();
         SelectedChart {
             labels: ChartLabels {
@@ -1474,7 +1475,17 @@ impl SelectScreen {
                 .rank
                 .and_then(skin_beatoraja::JudgeClass::of_listed)
                 .map(skin_beatoraja::JudgeClass::index),
+            clears: stored.map_or(0, |s| s.clears),
+            best: stored
+                .and_then(|s| s.best.as_ref())
+                .map(crate::bests::selected_best),
         }
+    }
+
+    /// The chart's stored score under the chosen preset; none without one.
+    fn stored(&self, e: &ChartEntry) -> Option<&Score> {
+        self.bests_preset.as_ref()?;
+        self.bests.get(&e.sha256)
     }
 
     /// A heading's text: its folder under its root.
@@ -2260,11 +2271,13 @@ mod tests {
                 [1; 32],
                 library::Score {
                     plays: 3,
+                    clears: 0,
                     best: Some(library::Best {
                         ex: 1234,
                         bp: 5,
                         cleared: vec![1 << hard],
                         full_combo: false,
+                        ..Default::default()
                     }),
                 },
             ),
@@ -2272,6 +2285,7 @@ mod tests {
                 [2; 32],
                 library::Score {
                     plays: 2,
+                    clears: 0,
                     best: None,
                 },
             ),
@@ -2381,11 +2395,13 @@ mod tests {
         let easy = 0;
         let best = |ex, bp, cleared: Vec<u8>, full_combo| library::Score {
             plays: 4,
+            clears: 0,
             best: Some(library::Best {
                 ex,
                 bp,
                 cleared,
                 full_combo,
+                ..Default::default()
             }),
         };
         s.set_bests_preset(Some(preset));
@@ -2427,6 +2443,7 @@ mod tests {
             [1; 32],
             library::Score {
                 plays: 2,
+                clears: 0,
                 best: None,
             },
         )]));
@@ -2462,6 +2479,74 @@ mod tests {
     /// the preset's largest EX weight. One that draws has none, even when its
     /// best, from another draw, is past what its summary allows; so has one
     /// without a summary or a preset.
+    /// The selected chart carries its key's clear count, best max combo
+    /// and best EX play under the chosen preset, value for value, and the
+    /// point score takes that play's own max combo, 4, not the best max
+    /// combo 9 another play reached; without a preset nothing of it.
+    #[test]
+    fn the_selected_chart_carries_its_best_play() {
+        let mut e = entry(r"C:\charts\x\1.bms", "a");
+        e.sha256 = [1; 32];
+        let score = library::Score {
+            plays: 5,
+            clears: 2,
+            best: Some(library::Best {
+                ex: 10,
+                bp: 1,
+                max_combo: 9,
+                cleared: vec![1],
+                full_combo: false,
+                play: library::Breakdown {
+                    body_sha256: [7; 32],
+                    notes: 7,
+                    ex: 10,
+                    bp: 1,
+                    max_combo: 4,
+                    counts: [4, 2, 0, 1, 0],
+                    early: [1, 2, 0, 0, 0],
+                    late: [3, 0, 0, 1, 0],
+                    empty_poor: 2,
+                    empty_poor_early: 1,
+                    empty_poor_late: 1,
+                },
+            }),
+        };
+        let selected = |preset: Option<rules::RulePreset>| {
+            let mut s = SelectScreen::new(Vec::new());
+            s.set_entries(vec![e.clone()]);
+            s.set_bests_preset(preset);
+            s.set_bests(std::collections::HashMap::from([([1; 32], score.clone())]));
+            s.view(0, 0, true).selected.unwrap()
+        };
+        let c = selected(Some(rules::tapestry()));
+        assert_eq!(c.clears, 2);
+        let b = c.best.unwrap();
+        assert_eq!((b.max_combo, b.play.notes), (9, 7));
+        let t = &b.play.tally;
+        assert_eq!((t.ex_score, t.bp, t.max_combo, t.combo), (10, 1, 4, 0));
+        assert_eq!(
+            [
+                t.counts.perfect,
+                t.counts.great,
+                t.counts.good,
+                t.counts.bad,
+                t.counts.poor
+            ],
+            [4, 2, 0, 1, 0]
+        );
+        assert_eq!(
+            [t.early.perfect, t.early.great, t.late.perfect, t.late.bad],
+            [1, 2, 3, 1]
+        );
+        assert_eq!(
+            (t.empty_poor, t.empty_poor_early, t.empty_poor_late),
+            (2, 1, 1)
+        );
+        assert_eq!(b.play.point(), 142_856);
+        let none = selected(None);
+        assert_eq!((none.clears, none.best), (0, None));
+    }
+
     #[test]
     fn the_largest_ex_needs_one_draw_a_summary_and_a_preset() {
         use bms_model::{ChartSummary, Tempo, TimeUs};
@@ -2486,11 +2571,13 @@ mod tests {
                 [1; 32],
                 library::Score {
                     plays: 1,
+                    clears: 0,
                     best: Some(library::Best {
                         ex: 40,
                         bp: 0,
                         cleared: Vec::new(),
                         full_combo: false,
+                        ..Default::default()
                     }),
                 },
             )]));
