@@ -6600,13 +6600,6 @@ impl Run {
                     {
                         self.decision_faults = f;
                     }
-                    // A fault due for this build (dev-tools).
-                    #[cfg(feature = "dev-tools")]
-                    if shown.slot.is_some()
-                        && let Some(refuse) = self.decision_faults.build()
-                    {
-                        screen.allocate_in_next_decision(refuse);
-                    }
                     // The decision skin's build, an app region of its own
                     // (design.md "Scope of No Allocation"): from the label
                     // lookup through the staging, left before its outcome
@@ -6624,6 +6617,8 @@ impl Run {
                         active,
                         shown,
                         frame_at,
+                        #[cfg(feature = "dev-tools")]
+                        &mut self.decision_faults,
                     );
                     #[cfg(feature = "dev-tools")]
                     {

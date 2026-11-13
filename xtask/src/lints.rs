@@ -548,6 +548,9 @@ pub const IN_PLAY: &[Site] = &[
         "crates/player/src/decision_side.rs",
         &["decision_frame_of", "decision_build", "DecisionSide::store"],
     ),
+    // A decision skin build's and submission's injected faults
+    // (dev-tools), counted on the render thread at each.
+    Site::File("crates/player/src/dev/decision_faults.rs"),
     // The selection frame's timers, the lifetime check before the
     // frame's build and the live settings.
     Site::Fns(

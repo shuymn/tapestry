@@ -859,16 +859,28 @@ struct Ran {
     stamps: Vec<(u64, DecisionDrawnAs)>,
     /// Why the select screen's script failed, if it did.
     failure: Option<String>,
+    /// Each saved play's figures and its measure file's text, when the
+    /// run saves its plays.
+    measured: Vec<(crate::measure::Figures, String)>,
 }
 
 /// What a run starts with beyond its set: the decision faults the first
-/// decision screen takes, the select screen's script, and whether the
-/// decision labels' work is held at its gate from the start.
+/// decision screen takes, the select screen's script, whether the
+/// decision labels' work is held at its gate from the start, and whether
+/// the plays are saved with their measure files, as `measure play` saves
+/// them.
 #[derive(Default)]
 struct Opts {
     faults: Option<crate::dev::DecisionFaults>,
     script: Option<crate::dev::SelectScript>,
     hold_labels: bool,
+    saved: bool,
+    /// A scenario file's steps (TOML `[[step]]` bodies, its first a
+    /// `select` or `practice`), loaded by production's loader in place of
+    /// `script`: the select screen runs its first step through the choice.
+    scenario: Option<&'static [&'static str]>,
+    /// A scenario's choice held at its ready gate from the start.
+    hold_ready: bool,
 }
 
 /// `set` installed by production's startup on a render thread of
@@ -957,6 +969,9 @@ fn run_with(
     if opts.hold_labels {
         label_gate.hold(true);
     }
+    if opts.hold_ready {
+        ready_gate.hold(true);
+    }
     let charts = tempfile::tempdir().unwrap();
     // A 7-key chart (its invisible note on key 6) with one note to play.
     let root = charts.path().join("root0");
@@ -971,6 +986,11 @@ fn run_with(
     let chart = sel.screen.selected().unwrap().path.clone();
     let menu = Arc::clone(&sel.menu);
     sel.script = opts.script;
+    if let Some(steps) = opts.scenario {
+        sel.script = Some(loaded(charts.path(), steps));
+    }
+    let saved = opts.saved;
+    let measured: crate::play::MeasuredPlays = Arc::default();
     sel.started(started.notice, started.selection);
     let settings = game::Settings {
         device: game::DeviceSettings::default(),
@@ -1016,6 +1036,9 @@ fn run_with(
             .with_scripts(rig.render.scripts().clone());
         rig.result_skin.set_wake(rig.controls.game_thread());
         rig.selection = Some(sel);
+        if saved {
+            rig.measured_plays = Some(Arc::clone(&measured));
+        }
         let controls = rig.controls;
         let side = Side {
             seen: &seen,
@@ -1030,11 +1053,19 @@ fn run_with(
             ready_checks: Box::new(ready_checks),
             decisions_sent: Box::new(decisions_sent),
         };
+        let root = game::DataRoot::new(charts.path().join("app"));
+        let parts = root.clone();
         let mut app = game::App::new(
-            game::DataRoot::new(charts.path().join("app")),
+            root,
             app_settings,
             crate::session_config(replay::ReceiveMethod::Scripted, None),
-            Box::new(|s: &game::Settings| game::Parts::unsaved(&s.player)),
+            Box::new(move |s: &game::Settings| {
+                if saved {
+                    game::Parts::standard(&parts, &s.player)
+                } else {
+                    game::Parts::unsaved(&s.player)
+                }
+            }),
             Box::new(game::NoSessionEvents),
         );
         let ran = std::thread::scope(|s| {
@@ -1061,6 +1092,17 @@ fn run_with(
         (ran, ended, failure)
     });
     let (ran, ended, failure) = ran;
+    // Read while the run's data folder stands.
+    let measured = measured
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .iter()
+        .map(|(path, fig)| {
+            let text = std::fs::read_to_string(crate::measure::measure_path(path))
+                .expect("the measure file beside the saved record");
+            (fig.clone(), text)
+        })
+        .collect();
     let records = decided
         .records
         .lock()
@@ -1078,6 +1120,7 @@ fn run_with(
         records,
         stamps,
         failure,
+        measured,
     }
 }
 
@@ -1440,12 +1483,16 @@ fn a_decision_skin_screen_allocates_nothing() {
 }
 
 /// The third decision skin build made to allocate inside the skin's own
-/// build: the allocation is counted, once, and the fault fired.
+/// build: the allocation is counted, once, and the fault fired. The play
+/// the screen led, saved, carries that record: its decision count is the
+/// allocation and its own frames' count holds none of it, in its figures
+/// and in its measure file.
 #[test]
 fn a_later_decision_build_made_to_allocate_is_counted() {
     let set = Set::new("s.luaskin");
     let opts = Opts {
         faults: Some(crate::dev::DecisionFaults::parse("alloc3")),
+        saved: true,
         ..Opts::default()
     };
     let ran = run_with(&set, None, opts, |side| {
@@ -1454,12 +1501,28 @@ fn a_later_decision_build_made_to_allocate_is_counted() {
         side.frames_until(chosen, "four decision skin frames", |f| skin_frames(f) >= 4);
         assert_eq!((side.fired)(), 1, "the fault fired");
         side.to_loading();
+        side.seen.until("the result skin", |d| {
+            d.iter()
+                .any(|d| matches!(d.frame, Frame::Result { quads, .. } if quads > 0))
+        });
     });
     let (r, _) = one_record(&ran);
     assert_eq!(r.app, 1, "{r:?}");
     assert!(r.builds >= 4, "{r:?}");
     assert_eq!(r.presentation(), "skin");
     assert!(!r.skin_allocates_nothing());
+    let [(fig, text)] = &ran.measured[..] else {
+        panic!("one saved play: {:?}", ran.measured);
+    };
+    assert_eq!(
+        fig.decision,
+        Some(r),
+        "the play carries the screen's record"
+    );
+    assert_eq!(fig.render_app_allocations, Some(0), "{fig:?}");
+    for line in ["decision_app = 1", "render_app = 0"] {
+        assert!(text.lines().any(|l| l == line), "{line}: {text}");
+    }
 }
 
 /// The second build made to allocate inside the skin's build, then
@@ -1558,31 +1621,70 @@ fn select_origin() -> crate::dev::scenario::Origin {
     }
 }
 
-/// A script that waits for the decision skin's labels (`decision =
-/// "skin"`), then chooses with `choose`.
-fn ready_script(choose: crate::dev::SelectStep) -> crate::dev::SelectScript {
-    let o = select_origin();
-    crate::dev::SelectScript::compiled(vec![
-        (crate::dev::SelectStep::DecisionReady, o),
-        (choose, o),
-    ])
+/// A scenario file of `steps` written in the run's folder `dir` (its
+/// library `root0`, an input log of no events beside it), loaded and
+/// compiled by production's loader: its script through the first step's
+/// choice (Enter, or P), what it waits for before it included. The steps
+/// after (the play, the practice's rounds) run on screens the rig does
+/// not script.
+fn loaded(dir: &std::path::Path, steps: &[&str]) -> crate::dev::SelectScript {
+    use crate::dev::SelectStep;
+    crate::dev::scenario::tests::write_log(dir);
+    let mut text = "version = 8\n[library]\nroots = [\"root0\"]\n".to_owned();
+    for s in steps {
+        text.push_str("[[step]]\n");
+        text.push_str(s);
+        text.push('\n');
+    }
+    let file = dir.join("scenario.toml");
+    std::fs::write(&file, text).unwrap();
+    let mut script = crate::dev::scenario::load(&file)
+        .expect("the scenario loads")
+        .script;
+    let mut first = Vec::new();
+    while let (Some(step), Some(origin)) = (script.front().cloned(), script.origin()) {
+        script.done();
+        let chose = matches!(step, SelectStep::Enter | SelectStep::PracticeKey(_));
+        first.push((step, origin));
+        if chose {
+            break;
+        }
+    }
+    assert!(
+        first.iter().all(|(_, o)| o.index == 1)
+            && first.iter().any(|(s, _)| *s == SelectStep::DecisionReady),
+        "{first:?}"
+    );
+    crate::dev::SelectScript::compiled(first)
 }
 
-/// A scenario's choice with `decision = "skin"` (its compiled steps, run
-/// by the select screen's script on the rig), its labels' work held at
-/// its gate: the script asks the readiness again and again and sends no
-/// decision screen; let go, the labels are prepared and the choice pins
-/// them, the skin chosen. For a play (Enter) and a practice (P).
+/// A `select` with `decision = "skin"` on the rig's chart, then its play.
+const SELECT: &[&str] = &[
+    "select = { path = \"root0/a.bms\", decision = \"skin\" }",
+    "play = { input = \"auto\", until = \"end\" }",
+    "quit = {}",
+];
+
+/// A `practice` with `decision = "skin"` on the rig's chart.
+const PRACTICE: &[&str] = &[
+    "practice = { path = \"root0/a.bms\", from = 1, to = 1, speed = 100, \
+     lead_in_ms = 2500, gauge = 20, repeat = true, input = \"log.tprl\", rounds = 1, \
+     decision = \"skin\" }",
+    "quit = {}",
+];
+
+/// A scenario's choice with `decision = "skin"` (its file loaded by
+/// production's loader, run by the select screen's script on the rig),
+/// its labels' work held at its gate: the script asks the readiness again
+/// and again and sends no decision screen; let go, the labels are
+/// prepared and the choice pins them, the skin chosen. For a `select`
+/// (Enter) and a `practice` (P).
 #[test]
 fn a_scenario_choice_waits_for_its_labels() {
-    for choose in [
-        crate::dev::SelectStep::Enter,
-        crate::dev::SelectStep::PracticeKey(crate::dev::scenario::InputRef::Auto),
-    ] {
+    for (what, steps) in [("select", SELECT), ("practice", PRACTICE)] {
         let set = Set::new("s.luaskin");
-        let what = format!("{choose:?}");
         let opts = Opts {
-            script: Some(ready_script(choose)),
+            scenario: Some(steps),
             hold_labels: true,
             ..Opts::default()
         };
@@ -1614,23 +1716,19 @@ fn a_scenario_choice_waits_for_its_labels() {
 }
 
 /// The labels found ready, then gone before the choice (the book marked
-/// unhealthy while the script waits at its ready gate): the choice pins
-/// nothing, and the script fails naming the step. For a play and a
-/// practice.
+/// unhealthy while the script waits at its ready gate, held before the
+/// run starts): the choice pins nothing, and the script fails naming the
+/// scenario's step. For a `select` and a `practice`.
 #[test]
 fn a_pin_lost_after_readiness_fails_its_step() {
-    for choose in [
-        crate::dev::SelectStep::Enter,
-        crate::dev::SelectStep::PracticeKey(crate::dev::scenario::InputRef::Auto),
-    ] {
+    for (what, steps) in [("select", SELECT), ("practice", PRACTICE)] {
         let set = Set::new("s.luaskin");
-        let what = format!("{choose:?}");
         let opts = Opts {
-            script: Some(ready_script(choose)),
+            scenario: Some(steps),
+            hold_ready: true,
             ..Opts::default()
         };
         let ran = run_with(&set, None, opts, |side| {
-            side.ready_gate.hold(true);
             assert!(
                 wait_until(|| side.ready_gate.waiting()),
                 "{what}: found ready"
@@ -1648,7 +1746,7 @@ fn a_pin_lost_after_readiness_fails_its_step() {
             "{what}: {failure}"
         );
         assert!(
-            failure.contains(&format!("{}", select_origin())),
+            failure.contains(&format!("step 1 ({what})")),
             "{what}: {failure}"
         );
         assert!(
