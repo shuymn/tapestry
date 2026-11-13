@@ -192,7 +192,7 @@ fn callbacks_run_on_the_kept_vm() {
         "local req = require\nlocal held = { d = dofile }",
         &[
             "function() return ms.number(77) / 2 end",
-            "function() return ms.number(410) + 7 end",
+            "function() return ms.number(333) + 7 end",
             "function() return ms.number(283) end",
             "function() req(\"x\") return 5 end",
             "function() held.d(\"x\") return 5 end",
@@ -238,7 +238,7 @@ fn callbacks_run_on_the_kept_vm() {
     let (notes, dropped) = runtime(&mut i).notes();
     assert_eq!(dropped, 0);
     assert!(notes.contains(&RuntimeNote::ImportOnly), "{notes:?}");
-    for (api, id, value) in [("number", 410, 0), ("number", 283, i32::MIN)] {
+    for (api, id, value) in [("number", 333, 0), ("number", 283, i32::MIN)] {
         assert!(
             notes.contains(&RuntimeNote::Absent { api, id, value }),
             "{notes:?}"
@@ -1286,5 +1286,73 @@ fn the_runtime_reads_number_27_from_the_prepared_frame() {
         let (fields, timers) = s.sel.runtime_parts();
         rt.frame(fields, timers);
         assert_eq!(s.digits(0).trim_start_matches('0'), want, "{uptime_us}");
+    }
+}
+
+/// Number 27 through the kept VM on the result's production sequence: a
+/// callback no expression represents (a division) is routed to the
+/// runtime; the frame prepared with the application's readouts, the
+/// runtime run over that state, then the build of the same frame draws
+/// the callback's whole hours, following each frame's readouts.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_result_runtime_reads_number_27_from_the_prepared_frame() {
+    untimed();
+    let tables = "local ms = require(\"main_state\")\n\
+        skin.value[2] = { id = \"r\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, \
+            digit = 4, value = function() return ms.number(27) / 1 end }";
+    let dsts = "{ id = \"r\", dst = { { x = 0, y = 120, w = 4, h = 8 } } },";
+    let d = common::result::sheet();
+    common::write(
+        d.path(),
+        "s.luaskin",
+        common::result::graph_lua(tables, dsts).as_bytes(),
+    );
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let facts = common::result::facts(None);
+    let LuaOutcome::Imported(mut i) = h
+        .import_runtime(&Config::defaults(h.header()), &facts, &cancel)
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        i.callbacks
+            .iter()
+            .filter(|d| **d == Disposition::Runtime)
+            .count(),
+        1,
+        "{:?}",
+        i.callbacks
+    );
+    let mut rt = i.runtime.take().expect("a runtime");
+    let mut r = common::result::Res::new(i.imported.skin);
+    r.view(&common::result::ready(
+        1_000,
+        true,
+        skin_model::BestView::Unavailable,
+    ));
+    let top = 1_080.0 - 120.0 - 8.0;
+    for (k, (uptime_us, want)) in [(3_725_999_000, "1"), (7_200_000_000, "2")]
+        .into_iter()
+        .enumerate()
+    {
+        let ms = i64::try_from(k).unwrap() * 16;
+        r.app = skin_model::AppReadouts {
+            uptime_us,
+            ..skin_model::AppReadouts::LAUNCH
+        };
+        r.skin
+            .prepare_result_frame(&mut r.res, bms_model::TimeUs(ms * 1_000), &r.timers, &r.app)
+            .unwrap();
+        let (fields, timers) = r.res.runtime_parts();
+        rt.frame(fields, timers);
+        assert_eq!(rt.status()[0], CallStatus::Ok, "{uptime_us}");
+        assert_eq!(
+            r.digits(ms, top).trim_start_matches('0'),
+            want,
+            "{uptime_us}"
+        );
     }
 }

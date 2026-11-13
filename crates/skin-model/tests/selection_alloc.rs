@@ -5,10 +5,13 @@
 //! the timers move, over views that change between frames; and the
 //! settings applied every frame (docs/stage3.md S10-09e), the volume's
 //! number and ratio bar drawing them, and the application's readouts
-//! changing every frame, numbers drawing them; and the cursor's chart's
+//! changing every frame, numbers drawing them; the cursor's chart's
 //! stage file and banner with an element under `selected.stagefile`, over
 //! tables that change between frames (one of the live array, none, and
-//! one of another array), their fields written every frame.
+//! one of another array), their fields written every frame; and pointer
+//! input (docs/stage3.md S10-09e): frames whose pointer moves across hover
+//! rects, presses hitting chart and folder rows whose paths are long, an
+//! action, and drags on a slider.
 //!
 //! A counting global allocator counts allocations made on threads that opt
 //! in (a thread-local flag), so the test harness's own threads do not
@@ -18,19 +21,21 @@ mod selection_support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::TimeUs;
 use selection_support::{
     Fx, all, boolean, chart, digits, element, features, folder, int, labels, lamps, levels, list,
-    list_element, load, ratio, row_text, view,
+    list_element, load, ratio, rect, row_text, view,
 };
 use skin_model::chart_image::{ChartImage, ChartKey, ChartStretch, ChartTable, ChartUv};
 use skin_model::{
-    AppReadouts, FontRef, FrameUv, GaugeLook, LocalTime, MasterVolume, NumberDef, OwnLamp,
-    RatioBarDef, RatioForm, RatioSource, RowScore, SelectionDefs, SelectionOrder,
-    SelectionSettings, SliderDirection, Source, SpeedReference, SpeedView, TextDef, TextField,
-    TextImage, TextTable, TextValue, WidgetDefs,
+    ActionDef, AppReadouts, Button, ClickType, FolderId, FontRef, FrameUv, GaugeLook, HoverRect,
+    LocalTime, NumberDef, OwnLamp, PointerDef, PointerHit, RatioBarDef, RatioForm, RatioSource,
+    RowKey, RowRef, RowRefKind, RowScore, SelectionDefs, SelectionOrder, SelectionSettings,
+    SliderDirection, Source, SpeedReference, SpeedView, TextDef, TextField, TextImage, TextTable,
+    TextValue, VolumeReading, WidgetDefs,
 };
 
 struct Counting;
@@ -89,6 +94,7 @@ fn skin() -> Fx {
     def.lamp = lamps([0, -10, 10, 10]);
     def.level = levels([20, -10, 10, 10], 3);
     def.label = labels([40, -10, 10, 10]);
+    def.clickable = (0..24).rev().collect();
     let elements = vec![
         list_element(),
         element(Source::Number(0), [500, 0, 10, 10]),
@@ -121,7 +127,22 @@ fn skin() -> Fx {
             e.visible = Some(boolean("selected.stagefile"));
             e
         },
+        // An action shown only under the pointer; the first number is too.
+        element(Source::Image(5), [1_300, 0, 100, 40]),
+        // The best play's numbers and bars.
+        element(Source::Number(4), [500, 180, 10, 10]),
+        element(Source::Number(5), [500, 200, 10, 10]),
+        element(Source::Number(6), [500, 220, 10, 10]),
+        element(Source::Number(7), [500, 240, 10, 10]),
+        element(Source::RatioBar(3), [1_100, 0, 200, 20]),
+        element(Source::RatioBar(4), [1_100, 40, 200, 20]),
     ];
+    let hover = HoverRect {
+        x: 0,
+        y: 0,
+        w: 100,
+        h: 40,
+    };
     let text = |value| TextDef {
         value,
         font: FontRef::Default,
@@ -138,7 +159,7 @@ fn skin() -> Fx {
                 },
                 NumberDef {
                     digits: digits(6),
-                    value: int("settings.volume"),
+                    value: int("settings.volume_system"),
                 },
                 NumberDef {
                     digits: digits(6),
@@ -147,6 +168,22 @@ fn skin() -> Fx {
                 NumberDef {
                     digits: digits(6),
                     value: int("clock.second"),
+                },
+                NumberDef {
+                    digits: digits(6),
+                    value: int("selected.point"),
+                },
+                NumberDef {
+                    digits: digits(6),
+                    value: int("selected.max_combo"),
+                },
+                NumberDef {
+                    digits: digits(6),
+                    value: int("selected.count.fast"),
+                },
+                NumberDef {
+                    digits: digits(6),
+                    value: int("selected.rate.perfect"),
                 },
             ],
             texts: vec![
@@ -157,6 +194,27 @@ fn skin() -> Fx {
         },
         SelectionDefs {
             song_list: Some(def),
+            pointer: vec![
+                PointerDef {
+                    element: 10,
+                    action: Some(ActionDef {
+                        event: 12,
+                        click: ClickType::Halves,
+                    }),
+                    hover: Some(hover),
+                    search: false,
+                    // Its region sampled each frame, as an imported
+                    // stretched image's.
+                    region: Some(rect([1_300, 0, 100, 40])),
+                },
+                PointerDef {
+                    element: 1,
+                    action: None,
+                    hover: Some(hover),
+                    search: false,
+                    region: None,
+                },
+            ],
             ratio_bars: vec![
                 RatioBarDef {
                     image: 3,
@@ -175,7 +233,17 @@ fn skin() -> Fx {
                 RatioBarDef {
                     image: 3,
                     form: RatioForm::Bar { vertical: false },
-                    source: RatioSource::MasterVolume,
+                    source: RatioSource::SystemVolume,
+                },
+                RatioBarDef {
+                    image: 3,
+                    form: RatioForm::Bar { vertical: false },
+                    source: RatioSource::JudgeRate(0),
+                },
+                RatioBarDef {
+                    image: 3,
+                    form: RatioForm::Bar { vertical: false },
+                    source: RatioSource::ComboRate,
                 },
             ],
         },
@@ -207,7 +275,11 @@ fn settings(ms: i64) -> SelectionSettings {
     let k = u32::try_from(ms / 16).unwrap();
     SelectionSettings {
         display_offset_ms: i32::try_from(ms).unwrap() - 1_000,
-        master_volume: MasterVolume::of_gain(f32::from(u8::try_from(k % 101).unwrap()) / 100.0),
+        system_volume: VolumeReading::of_gain(f32::from(u8::try_from(k % 101).unwrap()) / 100.0),
+        key_volume: VolumeReading::of_gain(f32::from(u8::try_from(k % 101).unwrap()) / 100.0),
+        background_volume: VolumeReading::of_gain(
+            f32::from(u8::try_from(k % 101).unwrap()) / 100.0,
+        ),
         speed: if k % 2 == 0 {
             SpeedView::Classic
         } else {
@@ -308,6 +380,23 @@ fn a_selection_build_allocates_nothing() {
         if let Some(c) = v.selected.as_mut() {
             c.max_ex = Some(300);
             c.judge_class = u8::try_from(cursor % 5).ok();
+            c.summary = Some(selection_support::summary(200, 30, 0, 90, 150, 150));
+            c.clears = 1;
+            let mut tally = eval::Tally::default();
+            tally.counts.perfect = 120;
+            tally.counts.great = 80;
+            tally.early.great = 50;
+            tally.max_combo = 150;
+            c.best = Some(skin_model::SelectedBest {
+                max_combo: 190,
+                play: skin_model::BestPlay { tally, notes: 230 },
+            });
+        }
+        // The same view without a best, made before any count.
+        let mut bare = v.clone();
+        if let Some(c) = bare.selected.as_mut() {
+            c.best = None;
+            c.clears = 0;
         }
         fx.view(&v);
         let texts = TextTable::new(vec![line; fx.skin.text_slots()]);
@@ -321,6 +410,17 @@ fn a_selection_build_allocates_nothing() {
         fx.sel.set_chart_live(Some(KEY));
         fx.frame(0);
         assert_eq!(fx.batch.quads().iter().filter(|q| q.layer == 9).count(), 2);
+        // A view change, its strings' capacity reached: the fields, the
+        // best play's numbers and the bars' ratios are filled in place.
+        // The labels are made before the count, as the player keeps its own.
+        let labels = selection_support::labels_of();
+        total += counted(|| {
+            for view in [&bare, &v] {
+                fx.skin
+                    .update_selection(&mut fx.sel, view, &labels)
+                    .unwrap();
+            }
+        });
         for ms in (0..2_000).step_by(16) {
             fx.timers.change = Some(TimeUs(0));
             fx.timers.panels[0] = (ms > 1_000).then_some(TimeUs(1_000_000));
@@ -333,7 +433,7 @@ fn a_selection_build_allocates_nothing() {
                 fx.sel.set_chart_live(Some(KEY));
                 fx.sel.write_chart_fields();
                 fx.frame(ms);
-                std::hint::black_box(fx.skin.slider_at(&fx.sel, [910.0, 30.0], fx.target));
+                std::hint::black_box(fx.skin.drag_at(&fx.sel, [910.0, 30.0], fx.target));
             });
         }
     }
@@ -360,6 +460,85 @@ fn a_selection_build_allocates_nothing() {
         }
     }
     assert_eq!(bitmap_total, 0);
+    // Pointer input over 30 chart rows and 30 folder rows whose paths are
+    // 260 bytes: a press names a row by its fixed-size identity, never its
+    // path.
+    let mut fx = crate::skin();
+    let long = |i: usize| PathBuf::from(format!("{}{i:03}", "p".repeat(257)));
+    let rows: Vec<_> = (0..60)
+        .map(|i| {
+            let mut r = if i < 30 {
+                chart(&format!("c{i}"))
+            } else {
+                folder(&format!("f{i}"), 2)
+            };
+            assert_eq!(long(i).as_os_str().len(), 260);
+            r.key = if i < 30 {
+                RowKey::Chart(long(i))
+            } else {
+                RowKey::Folder(FolderId::new(long(i)))
+            };
+            r.index = Some(u32::try_from(i).unwrap());
+            r
+        })
+        .collect();
+    let mut pointer_total = 0;
+    let (mut actions, mut drags) = (0, 0);
+    let mut hits = [0_u32; 2];
+    // The cursor at 11 puts chart rows 0 to 23 in the slots, at 41 folder
+    // rows 30 to 53.
+    for (cursor, kind, first) in [(11, RowRefKind::Chart, 0), (41, RowRefKind::Folder, 30)] {
+        let mut v = view(rows.clone(), Some(cursor));
+        v.position = ratio(u64::try_from(cursor).unwrap(), 59);
+        v.list_revision = 9;
+        fx.view(&v);
+        let texts = TextTable::new(vec![line; fx.skin.text_slots()]);
+        let row_texts = TextTable::new(vec![line; fx.skin.song_list_slots()]);
+        fx.skin
+            .attach_selection_text(&mut fx.sel, texts, row_texts)
+            .unwrap();
+        fx.frame(0);
+        pointer_total += counted(|| {
+            // The pointer in and out of the hover rects, frame by frame.
+            for k in 0..100_u16 {
+                let x = if k % 2 == 0 { 1_350.0 } else { 1_500.0 };
+                fx.pointer = Some([x, 20.0 + f32::from(k % 20)]);
+                fx.frame(i64::from(k) * 16);
+                let press = fx
+                    .skin
+                    .hit_at(&fx.sel, [1_310.0, 20.0], fx.target, Button::Right);
+                if let Some(PointerHit::Action { event: 12, .. }) = press.hit {
+                    actions += 1;
+                }
+            }
+            // 50 presses on the rows, slot by slot.
+            for k in 0..50_u16 {
+                let slot = k % 24;
+                let want = PointerHit::Row {
+                    row: RowRef {
+                        list_revision: 9,
+                        index: first + u32::from(slot),
+                        kind,
+                    },
+                    button: Button::Left,
+                };
+                let at = [110.0, 100.0 * f32::from(slot) + 25.0];
+                if fx.skin.hit_at(&fx.sel, at, fx.target, Button::Left).hit == Some(want) {
+                    hits[usize::from(kind == RowRefKind::Folder)] += 1;
+                }
+            }
+            // 25 drags along the list's slider.
+            for k in 0..25_u16 {
+                let at = [910.0, 20.0 + 10.0 * f32::from(k)];
+                if fx.skin.drag_at(&fx.sel, at, fx.target).is_some() {
+                    drags += 1;
+                }
+            }
+        });
+    }
+    assert_eq!(pointer_total, 0);
+    assert_eq!((actions, hits, drags), (100, [50, 50], 50));
+    assert_eq!(size_of::<RowRef>(), 16);
     // The positive control: the counter sees an allocation on this thread
     // (design.md "Scope of No Allocation").
     assert!(

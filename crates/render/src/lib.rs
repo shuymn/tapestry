@@ -52,6 +52,7 @@ mod test_common;
 mod test_decl;
 
 mod atlas;
+mod decision_labels;
 mod decl;
 mod gpu;
 pub mod measure;
@@ -71,6 +72,11 @@ mod text_cache;
 mod text_upload;
 
 pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows, solid_uv};
+pub use decision_labels::{
+    CoolFrom, DECISION_TEXT_WRITE_BUDGET, DecisionMemory, FillProgress, FillStep, Gen, LABEL_SLOTS,
+    LabelBook, LabelContent, LabelJob, LabelKey, LabelOutput, LabelRow, LabelScratch, LabelState,
+    LabelStore, LabelWorker, Publish, RowPlan, Settled, StagedLabels, Watch, lock, row_height,
+};
 pub use decl::{
     AttemptText, BundleError, DeclSkin, Installation, LoadingPresentation, SkinBundle, pages_bytes,
     pages_texels, skin_frame,
@@ -88,7 +94,7 @@ pub use renderer::UploadTiming;
 #[cfg(feature = "dev-tools")]
 pub use renderer::take_build_start;
 pub use renderer::{
-    Admission, ChartOutcome, ChartTarget, CommitError, FrameTiming, LoadingTextError,
+    Admission, ChartOutcome, ChartTarget, CommitError, FrameTiming, LoadingOn, LoadingTextError,
     LoadingTextKey, MAX_SPRITES, MemoryWitness, PreparedToken, RESULT_STRIP_SPRITES, RenderError,
     Renderer, ResultChartTarget, SHARED_TEXELS, STRIP_SPRITES, Target, VM_TEXELS, letterbox,
 };

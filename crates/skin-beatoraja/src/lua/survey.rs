@@ -207,10 +207,7 @@ fn decision_frames(skin: &skin_model::Skin, widget_quads: u32) -> Option<Frames>
             now,
             target: [1_920, 1_080],
             layout: &layout,
-            timers: DecisionTimers {
-                screen: Some(TimeUs(0)),
-                fadeout: (now >= t.scene).then_some(t.scene),
-            },
+            timers: DecisionTimers::at(TimeUs(0), &t, now),
         };
         skin.build_decision(&mut dec, &frame, atlas.uvs(), &mut batch)
             .ok()?;
@@ -255,6 +252,7 @@ fn frames(
                 screen: Some(bms_model::TimeUs(0)),
                 fadeout: None,
             },
+            app: skin_model::AppReadouts::LAUNCH,
         };
         skin.build_result(&mut res, &frame, atlas.uvs(), &mut batch)
             .ok()?;

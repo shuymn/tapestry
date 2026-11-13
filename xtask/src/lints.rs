@@ -282,6 +282,8 @@ pub const IN_PLAY: &[Site] = &[
         &[
             "Adjust::is_input_offset",
             "Tuning::adjust",
+            "Tuning::channel",
+            "Tuning::set_volume",
             "Tuning::volume",
         ],
     ),
@@ -300,6 +302,7 @@ pub const IN_PLAY: &[Site] = &[
             "PlayerRig::send_end",
             "PlayerRig::now",
             "PlayerRig::wait",
+            "PlayerRig::wait_parked",
             "PlayerRig::take",
             "PlayerRig::take_closing",
             "PlayerRig::declared_close",
@@ -397,6 +400,9 @@ pub const IN_PLAY: &[Site] = &[
     ),
     Site::File("crates/player/src/audio_side.rs"),
     // The render thread's frame.
+    // The decision label slots: a frame borrows a slot's content, and the
+    // boundary's writes and settling run beside the frames.
+    Site::File("crates/render/src/decision_labels.rs"),
     Site::File("crates/render/src/decl.rs"),
     Site::File("crates/render/src/measure.rs"),
     Site::File("crates/render/src/overlay.rs"),
@@ -429,10 +435,18 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/select/schema.rs"),
     Site::File("crates/skin-model/src/result/mod.rs"),
     Site::File("crates/skin-model/src/result/schema.rs"),
-    // The master gain a selection frame shows, from the gain that plays.
+    // The decision screen's timers and the labels a build borrows.
+    Site::File("crates/skin-model/src/decision/mod.rs"),
+    Site::File("crates/skin-model/src/decision/schema.rs"),
+    // A decision frame draws a slot's bitmap lines.
+    Site::Fns(
+        "crates/skin-model/src/widget/glyphs.rs",
+        &["BitmapLines::len", "BitmapLines::lines"],
+    ),
+    // The system volume a selection frame shows, from the gain that plays.
     Site::Fns(
         "crates/skin-model/src/selection.rs",
-        &["Ratio::of_f32", "MasterVolume::of_gain"],
+        &["Ratio::of_f32", "VolumeReading::of_gain"],
     ),
     // A frame of an image from its cycle and its place in the atlas.
     Site::File("crates/skin-model/src/atlas/uv.rs"),
@@ -441,6 +455,8 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/layout.rs"),
     Site::File("crates/skin-model/src/pixmap.rs"),
     Site::File("crates/skin-model/src/place.rs"),
+    // A selection skin's pointer targets, hit tests and hover rects.
+    Site::File("crates/skin-model/src/pointer.rs"),
     Site::File("crates/skin-model/src/widget/mod.rs"),
     Site::File("crates/skin-model/src/widget/bar.rs"),
     Site::File("crates/skin-model/src/widget/bpm_graph.rs"),
@@ -488,6 +504,10 @@ pub const IN_PLAY: &[Site] = &[
     // The application clock: each frame's readouts and every present.
     Site::File("crates/player/src/app_clock.rs"),
     Site::File("crates/player/src/turntable.rs"),
+    // The pointer on the select screen: the hover's point, the batch's
+    // answers and the drag the render thread writes each selection frame,
+    // and the window's capture and the game thread's dispatch beside them.
+    Site::File("crates/player/src/pointer.rs"),
     // The play and loading frames' calls through the screen the render
     // thread keeps; its menu preparation runs on menus only, and the
     // loading lines' before the loading frame is built.
@@ -495,6 +515,9 @@ pub const IN_PLAY: &[Site] = &[
         "crates/player/src/menu_screen.rs",
         &[
             "MenuScreen::loading",
+            "MenuScreen::loading_staged",
+            "MenuScreen::loading_on",
+            "MenuScreen::staged_token",
             "MenuScreen::chosen_text",
             "fields_changed",
             "text_plan",
@@ -514,8 +537,17 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::selection_chart_key",
             "MenuScreen::build_selection_frame",
             "MenuScreen::build_page_frame",
+            "MenuScreen::build_decision",
             "strip_sprites",
         ],
+    ),
+    // A skinned decision frame: its timers from the choice and its build
+    // from the pinned slot's labels, read through `DecisionSide::store`;
+    // the label preparation's boundary work in the same file runs
+    // beside the frames.
+    Site::Fns(
+        "crates/player/src/decision_side.rs",
+        &["decision_frame_of", "decision_build", "DecisionSide::store"],
     ),
     // The selection frame's timers, the lifetime check before the
     // frame's build and the live settings.

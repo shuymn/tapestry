@@ -1262,3 +1262,149 @@ fn the_image_options_read_the_attempts_availability_in_lua() {
     assert!(i.facts.holds(&facts(Some(&with_stage))));
     assert!(!i.facts.holds(&facts(Some(&without))));
 }
+
+/// Readouts whose every part is told apart: 1 024 presents, 30 827-12-31
+/// 23:59:58 and 600 h of uptime exactly.
+const APP: skin_model::AppReadouts = skin_model::AppReadouts {
+    fps: 1_024,
+    uptime_us: 2_160_000_000_000,
+    local: skin_model::LocalTime {
+        year: 30_827,
+        month: 12,
+        day: 31,
+        hour: 23,
+        minute: 59,
+        second: 58,
+    },
+};
+
+/// The top of the row number `id` of 20 to 29 draws at.
+fn app_top(id: i32) -> f32 {
+    top(
+        400.0 + 10.0 * f32::from(u8::try_from(id - 20).unwrap()),
+        8.0,
+    )
+}
+
+/// A JSON result skin's numbers 20 to 29 by `ref` read the frame's
+/// application readouts, as play and selection read them, with no note;
+/// the uptime's split follows a later frame's readouts
+/// (`skin/property/IntegerPropertyFactory.java:98-107`).
+#[test]
+fn a_json_result_skin_shows_numbers_20_to_29() {
+    let mut values = vec![value("ex", r#""ref": 71"#)];
+    let mut dsts = vec![dst("ex", ""), dst("dot", r#""op": [90],"#)];
+    for id in 20..=29 {
+        values.push(format!(
+            r#"{{"id": "a{id}", {DIGITS}, "digit": 6, "ref": {id}}}"#
+        ));
+        dsts.push(format!(
+            r#"{{"id": "a{id}", "dst": [{{"x": 0, "y": {}, "w": 4, "h": 8}}]}}"#,
+            400 + 10 * (id - 20)
+        ));
+    }
+    let d = folder(&format!(
+        r#""value": [{}], "destination": [{}]"#,
+        values.join(", "),
+        dsts.join(", ")
+    ));
+    let i = import_result(d.path()).unwrap();
+    assert!(
+        !i.report.notes.iter().any(|n| matches!(
+            n.kind,
+            NoteKind::UnsupportedProperty {
+                id: Some(20..=29),
+                ..
+            }
+        )),
+        "{:?}",
+        i.report.notes
+    );
+    let mut r = Res::new(i.skin);
+    r.view(&ready(1_000, true, BestView::Unavailable));
+    r.app = APP;
+    for (id, want) in [
+        (20, "1024"),
+        (21, "30827"),
+        (22, "12"),
+        (23, "31"),
+        (24, "23"),
+        (25, "59"),
+        (26, "58"),
+        (27, "600"),
+        (28, "0"),
+        (29, "0"),
+    ] {
+        assert_eq!(r.digits(0, app_top(id)), want, "{id}");
+    }
+    // 3 725 999 ms: 1 h, 2 min, 5 s.
+    r.app.uptime_us = 3_725_999_000;
+    for (id, want) in [(27, "1"), (28, "2"), (29, "5")] {
+        assert_eq!(r.digits(16, app_top(id)), want, "{id}");
+    }
+}
+
+/// A Lua result skin's callbacks reading 27 and 28 lower to the frame's
+/// uptime: the value shows its whole hours and the `draw` holds at 2 min,
+/// each following the next frame's readouts.
+#[test]
+fn a_lua_result_skin_lowers_its_uptime_reads() {
+    let values = [
+        lua_value("ex", 4, "ref = 71"),
+        lua_value("up", 4, "value = function() return ms.number(27) end"),
+    ]
+    .join(", ");
+    let dsts = [
+        lua_dst("ex", 100, 4, ""),
+        lua_dst("dot", 300, 8, "op = { 90 },"),
+        lua_dst("up", 400, 4, ""),
+        lua_dst(
+            "dot",
+            500,
+            8,
+            "draw = function() return ms.number(28) == 2 end,",
+        ),
+    ]
+    .join(", ");
+    let d = sheet();
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin("", &values, "", &dsts).as_bytes(),
+    );
+    let i = lua_result(d.path(), &facts(None)).unwrap();
+    assert_eq!(
+        i.callbacks,
+        [
+            skin_beatoraja::lua::Disposition::Lowered,
+            skin_beatoraja::lua::Disposition::Lowered
+        ]
+    );
+    let mut r = Res::new(i.imported.skin);
+    r.view(&ready(1_000, true, BestView::Unavailable));
+    r.app.uptime_us = 3_725_999_000;
+    assert_eq!(r.digits(0, top(400.0, 8.0)), "1");
+    assert_eq!(r.at(0, top(500.0, 8.0)).len(), 1, "2 min");
+    r.app.uptime_us = 7_200_000_000;
+    assert_eq!(r.digits(16, top(400.0, 8.0)), "2");
+    assert!(r.at(16, top(500.0, 8.0)).is_empty(), "0 min");
+}
+
+/// While a Lua result skin loads, a read of any of 20 to 29 is live state,
+/// as on selection: the frame fills them, never the view, so the pass
+/// refuses rather than answer the view's 0 (design.md "beatoraja Lua
+/// Skins", import facts).
+#[test]
+fn a_load_time_read_of_20_to_29_is_live_state() {
+    let view = ready(1_000, true, BestView::Unavailable);
+    for id in 20..=29 {
+        let d = minimal_lua(&format!("local x = ms.number({id})"));
+        match lua_outcome(d.path(), &facts(Some(&view))) {
+            Err(ImportError::Lua {
+                why: LuaWhy::LiveState { .. },
+                ..
+            }) => {}
+            other => panic!("{id}: {other:?}"),
+        }
+    }
+}

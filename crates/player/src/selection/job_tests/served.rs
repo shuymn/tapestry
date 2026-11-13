@@ -381,7 +381,7 @@ fn decision_screen_lost_within(
             }],
             caret: None,
         };
-        rig.render.show_decision(page);
+        rig.render.show_decision(page, None);
         until("the decision page drawn", || {
             screens
                 .menu_frames
@@ -684,7 +684,7 @@ fn the_opening_reports_a_saved_rebuild_failure_before_its_preparation() {
             }],
             caret: None,
         };
-        rig.render.show_decision(page);
+        rig.render.show_decision(page, None);
         until("the decision page drawn", || {
             installers
                 .menu_frames

@@ -25,6 +25,8 @@ struct Sent {
     pinned: Option<ViewKey>,
     /// The presented view's timing, as the render thread would give it.
     timing: Option<skin_model::ResultTiming>,
+    /// The lifetime's origin, as the render thread would give it.
+    origin: Option<TimeUs>,
 }
 
 impl Publish for Sent {
@@ -57,6 +59,9 @@ impl Publish for Sent {
     fn timing(&self) -> Option<skin_model::ResultTiming> {
         self.timing
     }
+    fn origin(&self) -> Option<TimeUs> {
+        self.origin
+    }
 }
 
 fn snapshot(line: &str) -> Snapshot {
@@ -79,7 +84,7 @@ fn bundle() -> Arc<render::SkinBundle> {
 fn the_slot_keeps_only_the_newest_of_its_lifetime() {
     let mut sent = Sent::default();
     let mut p = Presenter::default();
-    p.begin(&mut sent, TimeUs(0));
+    p.begin(&mut sent);
     p.want(snapshot("a"));
     p.land(&mut sent, Some(&Published::BuiltIn), None);
     p.lines(&mut sent, vec!["n".to_owned()]);
@@ -118,7 +123,7 @@ fn a_switch_under_the_same_bundle_publishes_a_new_revision() {
     let mut sent = Sent::default();
     let mut p = Presenter::default();
     let b = bundle();
-    p.begin(&mut sent, TimeUs(5));
+    p.begin(&mut sent);
     let k1 = p.want(snapshot("v1"));
     p.land(
         &mut sent,
@@ -150,7 +155,22 @@ fn a_switch_under_the_same_bundle_publishes_a_new_revision() {
             .all(|s| s.payload.skin.as_ref().is_some_and(|s| Arc::ptr_eq(s, &b)))
     );
     assert_eq!(sent.shown[1].payload.lines, ["v2"]);
-    assert_eq!(sent.shown[0].overlay.screen, TimeUs(5));
+}
+
+/// The result's origin is the render thread's, given only while a
+/// lifetime is current (design.md "Rendering and Skins", Timers).
+#[test]
+fn the_origin_is_the_render_threads_within_a_lifetime() {
+    let mut sent = Sent {
+        origin: Some(TimeUs(7)),
+        ..Sent::default()
+    };
+    let mut p = Presenter::default();
+    assert_eq!(p.origin(&sent), None, "no lifetime");
+    p.begin(&mut sent);
+    assert_eq!(p.origin(&sent), Some(TimeUs(7)));
+    p.end(&mut sent);
+    assert_eq!(p.origin(&sent), None, "the lifetime ended");
 }
 
 /// A view refused by the render thread shows the built-in result for that
@@ -162,7 +182,7 @@ fn a_view_fallback_applies_to_its_own_view_only() {
     let mut p = Presenter::default();
     let b = bundle();
     let skin = Published::Skin(Arc::clone(&b), None, None);
-    p.begin(&mut sent, TimeUs(0));
+    p.begin(&mut sent);
     let k1 = p.want(snapshot("v1"));
     p.land(&mut sent, Some(&skin), None);
     let k2 = p.want(snapshot("v2"));
@@ -205,7 +225,7 @@ fn attempt_and_run_fallbacks_show_the_built_in_result() {
     let mut p = Presenter::default();
     let skin = Published::Skin(bundle(), None, None);
     p.attempt_fallback("refused upload".to_owned());
-    p.begin(&mut sent, TimeUs(0));
+    p.begin(&mut sent);
     p.want(snapshot("v1"));
     p.land(&mut sent, Some(&skin), None);
     p.want(snapshot("v2"));
@@ -214,7 +234,7 @@ fn attempt_and_run_fallbacks_show_the_built_in_result() {
         && s.payload.why == Some((Scope::Attempt, "refused upload".to_owned()))));
     p.next_attempt();
     p.end(&mut sent);
-    p.begin(&mut sent, TimeUs(0));
+    p.begin(&mut sent);
     p.want(snapshot("v3"));
     p.land(&mut sent, Some(&skin), None);
     assert!(sent.shown.last().unwrap().payload.skin.is_some());
@@ -238,7 +258,7 @@ fn the_barrier_keeps_the_view_and_merges_the_overlay() {
     let mut sent = Sent::default();
     let mut p = Presenter::default();
     let skin = Published::Skin(bundle(), None, None);
-    p.begin(&mut sent, TimeUs(0));
+    p.begin(&mut sent);
     let k1 = p.want(snapshot("v1"));
     p.land(&mut sent, Some(&skin), None);
     assert_eq!(p.pin(&mut sent, TimeUs(40), None).unwrap().0, Some(k1));
@@ -364,7 +384,7 @@ fn the_timing_is_the_presented_views_while_a_lifetime_is() {
         Some((None, None)),
         "no lifetime"
     );
-    p.begin(&mut sent, TimeUs(0));
+    p.begin(&mut sent);
     assert_eq!(p.timing(&sent), Some(t));
     // A payload published last has no say: built-in here.
     p.want(snapshot("v1"));
@@ -403,7 +423,7 @@ fn a_payload_carries_its_attempts_chart_images() {
     let c = Arc::new(crate::chart_images::ChartImages::absent(
         &skin_model::chart_image::Absent::NoHeader,
     ));
-    p.begin(&mut sent, TimeUs(5));
+    p.begin(&mut sent);
     p.want(snapshot("v1"));
     p.land(&mut sent, Some(&skin), Some(Arc::clone(&a)));
     p.land(&mut sent, Some(&skin), Some(Arc::clone(&a)));

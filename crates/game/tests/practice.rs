@@ -187,7 +187,7 @@ struct Rounds {
 
 impl Rounds {
     fn new(
-        schedule: Vec<bms_model::BgmEvent>,
+        schedule: Vec<audio::ScheduledSound>,
         queued: u32,
         log: &Log,
         clock: &Rc<Cell<i64>>,
@@ -878,6 +878,7 @@ fn a_rounds_result_compares_with_no_best() {
             plays: 1,
             ex: Some(16),
             bp: Some(0),
+            max_combo: None,
             clear: Some(game::BestLamp::FullCombo),
         }),
         asked: Rc::clone(&asked),
@@ -1459,7 +1460,12 @@ fn a_schedule_mismatch_refuses_the_round_before_opening() {
     // (the BGM with the key sounds of the notes outside the section) that
     // the engine plays.
     let (err, rig, records, events) = refused_round(
-        |e| Some(Restorer::new(e.seek_source(), example_chart().bgm)),
+        |e| {
+            Some(Restorer::new(
+                e.seek_source(),
+                example_chart().bgm.iter().map(|&e| e.into()).collect(),
+            ))
+        },
         None,
     );
     assert!(

@@ -165,6 +165,14 @@ pub trait Screen: Send {
     /// Drops what a preparation staged and was not committed. The default
     /// has nothing to drop.
     fn discard(&mut self) {}
+    /// Drops the staging `token` names, if the screen still holds it, and
+    /// nothing else: a staging of another kind or request made since
+    /// stays. The default drops what is staged ([`discard`](Self::discard)),
+    /// for a screen that keeps no tokens.
+    fn discard_token(&mut self, token: PreparedToken) {
+        let _ = token;
+        self.discard();
+    }
     /// Publishes the chart's images into `target`
     /// ([`render::Renderer::publish_chart_images`]). The default draws no
     /// declarative skin, so it has no chart layer.
@@ -408,6 +416,90 @@ pub trait Screen: Send {
     fn submit_result(&mut self) -> Result<FrameTiming, RenderError> {
         self.draw()
     }
+    /// The committed decision installation's label rows at the target
+    /// ([`render::Renderer::decision_rows`]); `None` without one, the
+    /// default.
+    fn decision_rows(&self) -> Option<Result<render::RowPlan, RenderError>> {
+        None
+    }
+    /// One frame boundary's writes of `store`'s filling slot
+    /// ([`render::Renderer::write_decision_labels`]). Nothing by default.
+    fn write_decision_labels(&mut self, store: &mut render::LabelStore) -> render::FillStep {
+        let _ = store;
+        render::FillStep::Idle
+    }
+    /// Settles `store` at a frame boundary
+    /// ([`render::Renderer::settle_decision_labels`]). Nothing by default.
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's: the device's failure, or a refusal of the kind.
+    fn settle_decision_labels(
+        &mut self,
+        store: &mut render::LabelStore,
+    ) -> Result<render::Settled, RenderError> {
+        let _ = store;
+        Ok(render::Settled::Pending)
+    }
+    /// Rebuilds pinned slot `slot`'s content from `staged` on a screen
+    /// built again ([`render::Renderer::restore_decision_labels`]). The
+    /// default has no label region and refuses.
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's: the device's failure, or a refusal of the kind.
+    fn restore_decision_labels(
+        &mut self,
+        store: &mut render::LabelStore,
+        slot: usize,
+        staged: render::StagedLabels,
+    ) -> Result<(), RenderError> {
+        let _ = (store, slot, staged);
+        Err(RenderError::LabelRegion { needed: 0, band: 0 })
+    }
+    /// A flag set once the work submitted so far completed
+    /// ([`render::Renderer::watch_completion`]); set already by default,
+    /// which submits nothing.
+    fn watch_completion(&self) -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(true))
+    }
+    /// Whether the device was lost ([`render::Renderer::device_lost`]);
+    /// never by default.
+    fn device_lost(&self) -> bool {
+        false
+    }
+    /// Builds a decision frame of the committed decision installation:
+    /// `dec` at `frame`, its lines borrowed from `labels`, with no call
+    /// into wgpu. Allocates nothing. The default refuses.
+    ///
+    /// # Errors
+    ///
+    /// The skin's refusal of the frame: nothing of it is staged.
+    fn build_decision(
+        &mut self,
+        dec: &mut skin_model::DecisionScreen,
+        labels: skin_model::DecisionLabels<'_>,
+        frame: &skin_model::DecisionFrame<'_>,
+    ) -> Result<(), BuildError> {
+        let _ = (dec, labels, frame);
+        Err(BuildError::Kind)
+    }
+    /// Draws the decision frame [`build_decision`](Self::build_decision)
+    /// built, as [`draw`](Self::draw).
+    ///
+    /// # Errors
+    ///
+    /// As [`draw`](Self::draw).
+    fn submit_decision(&mut self) -> Result<FrameTiming, RenderError> {
+        self.draw()
+    }
+    /// Refuses the next decision frame, or fails the next settling of the
+    /// decision labels as a poll fails with `settle` (dev-tools tests).
+    /// Nothing by default.
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn decision_fault(&mut self, settle: bool) {
+        let _ = settle;
+    }
 
     /// The result frame last built, its quads (dev-tools tests); none by
     /// default.
@@ -545,6 +637,7 @@ pub trait Screen: Send {
             .map(|timing| SelectionDrawn {
                 timing,
                 refused: None,
+                skinned: false,
             })
     }
     /// The lines the selection skin's text last asked for, and how many
@@ -602,8 +695,32 @@ pub trait Screen: Send {
         let _ = (update, frame);
         self.menu(page, changed).map(Ok)
     }
+    /// [`loading`](Self::loading) drawn from the play staging `token`
+    /// names, before its commit (design.md "beatoraja Lua Skins", the
+    /// pending presentation). The default draws as `loading`.
+    ///
+    /// # Errors
+    ///
+    /// As [`loading`](Self::loading).
+    fn loading_staged(
+        &mut self,
+        page: &MenuPage,
+        update: Option<&LoadingUpdate>,
+        changed: bool,
+        frame: &LoadingFrame<'_>,
+        token: PreparedToken,
+    ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
+        let _ = token;
+        self.loading(page, update, changed, frame)
+    }
+    /// The play staging the screen holds, if any: what a staged loading
+    /// frame may draw. None by default.
+    fn staged_token(&self) -> Option<PreparedToken> {
+        None
+    }
     /// Draws the play screen's loading state while play's skin is pending
-    /// and no specialization of it was committed in the loading lifetime:
+    /// and no specialization of it is staged for or committed in the
+    /// loading lifetime:
     /// a cleared canvas with `page`, the load's lines, where
     /// [`loading`](Self::loading) puts them, laid out again when `changed`.
     /// No skin's frame is drawn. The default draws the lines as a menu
@@ -691,9 +808,17 @@ pub struct Extent {
     size: AtomicU64,
     /// A [`RenderMsg::Resize`] is on its way for [`size`](Self::size).
     queued: AtomicBool,
+    /// Every size notice published so far, the same size again included:
+    /// counted after its size is stored, so a count read comes with its
+    /// size or a newer one.
+    notices: AtomicU64,
     /// Where the wake goes, once a render thread follows the slot
     /// ([`RenderLink::follow`]).
     wake: Mutex<Option<Sender<RenderMsg>>>,
+    /// A publish waits here between its size and its count while a test
+    /// holds it (tests).
+    #[cfg(test)]
+    counting: TestGate,
 }
 
 /// No size published yet.
@@ -704,18 +829,25 @@ impl Default for Extent {
         Self {
             size: AtomicU64::new(UNKNOWN),
             queued: AtomicBool::new(false),
+            notices: AtomicU64::new(0),
             wake: Mutex::new(None),
+            #[cfg(test)]
+            counting: TestGate::default(),
         }
     }
 }
 
 impl Extent {
     /// Publishes the window's client size in physical pixels, zero sides
-    /// when minimized, and wakes the render thread unless a wake is on its
-    /// way already.
+    /// when minimized, counts the notice, and wakes the render thread
+    /// unless a wake is on its way already.
     pub fn publish(&self, width: u32, height: u32) {
         let packed = (u64::from(width) << 32) | u64::from(height);
         self.size.store(packed, Ordering::Release);
+        #[cfg(test)]
+        self.counting.pass();
+        // After the size: a count read with `Acquire` sees its size.
+        self.notices.fetch_add(1, Ordering::Release);
         // Under the sender's lock, so a wake is marked only when it is
         // sent: before a render thread follows, none is, and the
         // [`RenderMsg::Follow`] that comes after reads the newest size.
@@ -735,6 +867,12 @@ impl Extent {
     /// the flag it set, so its size is the one read next.
     fn acknowledge(&self) {
         self.queued.swap(false, Ordering::AcqRel);
+    }
+
+    /// The size notices published so far: read before the size, a count
+    /// comes with its size or a newer one.
+    fn notices(&self) -> u64 {
+        self.notices.load(Ordering::Acquire)
     }
 
     /// The newest size published, if any. Reading it takes no wake, so a
@@ -849,6 +987,10 @@ pub enum RenderMsg {
     /// The settings keys' values, which every selection frame reads the
     /// volume and the display offset from. Sent once, at the start.
     Tuning(Arc<LiveTuning>),
+    /// The pointer's shared state, which every selection frame reads the
+    /// hover's point from and answers the pointer's batches and drags
+    /// through. Sent once, at the start.
+    Pointer(Arc<crate::pointer::PointerShared>),
     /// Make sure the screen can draw, building it again if it failed (the
     /// device's recovery, for a play and the menus alike), and answer when
     /// it can. It prepares no attempt.
@@ -860,6 +1002,10 @@ pub enum RenderMsg {
     PrepareAttempt {
         /// The request's number.
         request: u64,
+        /// The loading lifetime current when the request was published,
+        /// none for a retry or a round: its staging draws that lifetime's
+        /// loading frames only.
+        lifetime: Option<u64>,
         /// The attempt, owned.
         attempt: Box<AttemptContext>,
         /// The play skin it is prepared with.
@@ -954,9 +1100,14 @@ pub enum RenderMsg {
     },
     /// Draw the select screen's page instead of a play.
     Menu(Box<MenuPage>),
-    /// Draw the decision screen's built-in presentation: a page kept
-    /// through its chart's load and the screen's preparations.
-    Decision(Box<MenuPage>),
+    /// Draw the decision screen: its built-in presentation `page`, or
+    /// with `shown` pinning a label slot the decision skin, the page
+    /// drawn when the skin cannot draw; kept through its chart's load and
+    /// the screen's preparations.
+    Decision {
+        page: Box<MenuPage>,
+        shown: Option<crate::decision_side::ShownDecision>,
+    },
     /// Draw the practice page: a [`Menu`](Self::Menu) that is its play
     /// state's presentation, so the play state's turntable is adopted,
     /// resumed when the game resumed it, and ticked on its frames.
@@ -1164,6 +1315,17 @@ impl Shared {
     }
 }
 
+/// What wakes the game thread for a decision takeover
+/// ([`RenderLink::set_game_wake`]).
+#[derive(Default)]
+struct GameWake(Mutex<Option<Arc<dyn Fn() + Send + Sync>>>);
+
+impl std::fmt::Debug for GameWake {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("GameWake")
+    }
+}
+
 #[derive(Debug)]
 struct Shared {
     failed: AtomicBool,
@@ -1253,6 +1415,10 @@ struct Shared {
     /// [`hook_bound`] (tests).
     #[cfg(test)]
     hold_declaration: AtomicBool,
+    /// While set, the render thread waits before it takes an attempt's
+    /// request, at most [`hook_bound`] (tests).
+    #[cfg(test)]
+    hold_receipt: AtomicBool,
     #[cfg(test)]
     declaration_held: AtomicBool,
     /// Set when a held declaration let go at [`hook_bound`] instead of
@@ -1268,6 +1434,42 @@ struct Shared {
     /// Why the selection skin was refused at runtime, until the game
     /// thread takes it for its notice ([`RenderLink::take_selection_refusal`]).
     selection_refused: Mutex<Option<String>>,
+    /// The decision labels' slot states: the render thread prepares them,
+    /// the game thread pins one at the choice.
+    labels: Arc<Mutex<render::LabelBook>>,
+    /// The strings each label slot's generation was prepared from, which
+    /// the choice compares before it pins.
+    prepared: Arc<crate::decision_side::PreparedStrings>,
+    /// The active decision lifetime's takeover, until the game thread
+    /// takes it ([`RenderLink::take_decision_takeover`]).
+    decision_takeover: Mutex<Option<game::DecisionTakeover>>,
+    /// Why the decision skin was refused for the run, until the game
+    /// thread takes it for its notice ([`RenderLink::take_decision_refusal`]).
+    decision_refused: Mutex<Option<String>>,
+    /// What wakes the game thread for a takeover.
+    game_wake: GameWake,
+    /// The takeovers produced, each counted at its wake (tests).
+    #[cfg(test)]
+    takeovers_woken: AtomicU64,
+    /// The decision presentation sent last (tests).
+    #[cfg(test)]
+    decision_sent: Mutex<Option<crate::decision_side::ShownDecision>>,
+    /// The render thread waits here before it takes a decision
+    /// presentation (tests).
+    #[cfg(test)]
+    decision_gate: Arc<TestGate>,
+    /// A takeover waits here between its lifetime's check and its
+    /// publication while a test holds it (tests).
+    #[cfg(test)]
+    takeover_gate: TestGate,
+    /// The game thread's looks for a takeover and the render thread's
+    /// drained frame loops (tests).
+    #[cfg(test)]
+    takeover_acks: Arc<TakeoverAcks>,
+    /// The decision kind's refusal waits here before its notice is
+    /// stored while a test holds it (tests).
+    #[cfg(test)]
+    notice_gate: TestGate,
     /// How long the launch screen has shown, in place of the clock's
     /// reading, while set (tests: [`RenderLink::set_launch_elapsed`]).
     #[cfg(test)]
@@ -1283,10 +1485,53 @@ struct Shared {
     /// whether one holds (tests).
     #[cfg(test)]
     result_frame_hold: [AtomicBool; 2],
+    /// Each result frame's time and the `screen` timer reading its running
+    /// runtime's host read in it, after its visit (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    result_runtime_timers: Mutex<Vec<(TimeUs, Option<i32>)>>,
     /// Select frames stall 2 ms after their instant is sampled while set
     /// (tests): a second clock reading in the frame would differ from it.
     #[cfg(test)]
     selection_stall: AtomicBool,
+    /// Result frames stall 2 ms after their instant is sampled while set
+    /// (tests): a second clock reading in the frame would differ from it.
+    #[cfg(test)]
+    result_stall: AtomicBool,
+    /// The first loading frame's hold bound in place of
+    /// [`FIRST_FRAME_HOLD`], in µs (tests).
+    #[cfg(test)]
+    hold_bound: AtomicI64,
+    /// The held iterations, and their waits (tests).
+    #[cfg(test)]
+    held: [AtomicU64; 2],
+    /// The render thread's own allocations so far, read as each held
+    /// iteration begins (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    held_allocations: AtomicU64,
+    /// A frame waits here before it takes its token, after its extent
+    /// read and resize, and before its image's stamp, while a test holds
+    /// each (tests).
+    #[cfg(test)]
+    frame_gates: [TestGate; 3],
+    /// The time since the showing the hold reads in place of the clock's,
+    /// in µs; `i64::MIN` reads the clock (tests).
+    #[cfg(test)]
+    hold_elapsed: AtomicI64,
+    /// The lifetime whose first frame was visited last, and its showing
+    /// (tests).
+    #[cfg(test)]
+    first_shown: Mutex<Option<(u64, TimeUs)>>,
+    /// An attempt's preparation waits here after its answer, before any
+    /// frame, while a test holds it (tests).
+    #[cfg(test)]
+    answer_gate: TestGate,
+    /// The frames paced by the clock so far (tests).
+    #[cfg(test)]
+    clock_paced: AtomicU64,
+    /// The stamps so far, and whether the last left the image valid,
+    /// right after it (tests).
+    #[cfg(test)]
+    stamps: [AtomicU64; 2],
 }
 
 impl Shared {
@@ -1333,12 +1578,31 @@ impl Shared {
             #[cfg(test)]
             hold_declaration: AtomicBool::new(false),
             #[cfg(test)]
+            hold_receipt: AtomicBool::new(false),
+            #[cfg(test)]
             declaration_held: AtomicBool::new(false),
             #[cfg(test)]
             declaration_expired: AtomicBool::new(false),
             packing: Mutex::new(None),
             selection: Mutex::new(SelectionSlot::default()),
             selection_refused: Mutex::new(None),
+            labels: render::LabelBook::shared([1_920, 1_080]),
+            prepared: Arc::default(),
+            decision_takeover: Mutex::new(None),
+            decision_refused: Mutex::new(None),
+            game_wake: GameWake::default(),
+            #[cfg(test)]
+            takeovers_woken: AtomicU64::new(0),
+            #[cfg(test)]
+            decision_sent: Mutex::new(None),
+            #[cfg(test)]
+            decision_gate: Arc::default(),
+            #[cfg(test)]
+            takeover_gate: TestGate::default(),
+            #[cfg(test)]
+            takeover_acks: Arc::default(),
+            #[cfg(test)]
+            notice_gate: TestGate::default(),
             #[cfg(test)]
             launch_elapsed: Mutex::new(None),
             result: Mutex::new(ResultSlot::default()),
@@ -1346,8 +1610,30 @@ impl Shared {
             result_status: Mutex::new(ResultReport::default()),
             #[cfg(test)]
             result_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
+            #[cfg(all(test, feature = "dev-tools"))]
+            result_runtime_timers: Mutex::new(Vec::new()),
             #[cfg(test)]
             selection_stall: AtomicBool::new(false),
+            #[cfg(test)]
+            result_stall: AtomicBool::new(false),
+            #[cfg(test)]
+            hold_bound: AtomicI64::new(FIRST_FRAME_HOLD.0),
+            #[cfg(test)]
+            held: [AtomicU64::new(0), AtomicU64::new(0)],
+            #[cfg(all(test, feature = "dev-tools"))]
+            held_allocations: AtomicU64::new(0),
+            #[cfg(test)]
+            frame_gates: Default::default(),
+            #[cfg(test)]
+            hold_elapsed: AtomicI64::new(i64::MIN),
+            #[cfg(test)]
+            first_shown: Mutex::new(None),
+            #[cfg(test)]
+            answer_gate: TestGate::default(),
+            #[cfg(test)]
+            clock_paced: AtomicU64::new(0),
+            #[cfg(test)]
+            stamps: [AtomicU64::new(0), AtomicU64::new(0)],
         }
     }
 
@@ -1355,11 +1641,12 @@ impl Shared {
     /// play skin declaring the loading time `loadend`: the first of its
     /// lifetime is acknowledged at the clock's `now()`, tagged with the
     /// lifetime it was drawn for; a later one of the same lifetime changes
-    /// only the declared time. Allocates nothing.
+    /// only the declared time (`None`: the frame drew no skin, and declares
+    /// nothing, [`LoadingAck::declare`]). Allocates nothing.
     fn presented_loading(
         &self,
         lifetime: u64,
-        loadend: Option<TimeUs>,
+        loadend: Option<Option<TimeUs>>,
         now: impl FnOnce() -> TimeUs,
     ) {
         #[cfg(test)]
@@ -1383,7 +1670,7 @@ impl Shared {
                 .loading_ack
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
-            ack.loadend = loadend;
+            ack.declare(lifetime, loadend);
             if ack.first.is_none_or(|(l, _)| l != lifetime) {
                 ack.first = Some((lifetime, now()));
             }
@@ -1392,14 +1679,26 @@ impl Shared {
         self.loading_acked.fetch_add(1, Ordering::SeqCst);
     }
 
-    /// A specialization committed in the current loading lifetime declares
-    /// the loading time `loadend`: the declaration from now on, before any
-    /// frame draws with it. Allocates nothing.
-    fn committed_loading(&self, loadend: Option<TimeUs>) {
+    /// A specialization committed in loading lifetime `lifetime`, the
+    /// current one, declares the loading time `loadend`: the declaration
+    /// from now on, before any frame draws with it. Allocates nothing.
+    fn committed_loading(&self, lifetime: u64, loadend: Option<TimeUs>) {
         self.loading_ack
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .loadend = loadend;
+            .declare(lifetime, Some(loadend));
+    }
+
+    /// The loading lifetime current, if one is begun (a held one
+    /// included): its producer's state is the slot's lifetime's. Takes the
+    /// producer's lock, then the slot's, as every lifetime change does.
+    fn current_lifetime(&self) -> Option<u64> {
+        let producer = self.producer();
+        let current = self.loading_slot().lifetime;
+        producer
+            .as_ref()
+            .filter(|s| s.lifetime() == current)
+            .map(LifetimeState::lifetime)
     }
 
     /// The skin refused a loading frame of lifetime `lifetime` for `why`:
@@ -1532,17 +1831,35 @@ impl TestGate {
 
 /// The render thread's acknowledgement of the loading state's frames: the
 /// latest lifetime whose first frame was presented, with when, and the
-/// play skin's declared loading time ([`skin_model::Skin::loadend`]) as
-/// the last presented loading frame drew with it, or as a specialization
-/// committed since in the current lifetime declares it: the installed
-/// skin's, or none while a pending skin has no specialization committed
-/// in the lifetime. With them, the latest lifetime whose loading frame the
-/// skin refused, and why.
+/// play skin's declared loading time ([`skin_model::Skin::loadend`]), the
+/// skin drawn's latest declaration in the lifetime `loadend_of` (design.md
+/// "Play Lifecycle", the minimum): what the last presented loading frame
+/// drawing a skin drew with, or what a specialization committed since
+/// declares; a frame of the pending presentation changes nothing, and
+/// another lifetime starts with none. With them, the latest lifetime
+/// whose loading frame the skin refused, and why.
 #[derive(Clone, Copy, Debug, Default)]
 struct LoadingAck {
     first: Option<(u64, TimeUs)>,
     loadend: Option<TimeUs>,
+    loadend_of: Option<u64>,
     refused: Option<(u64, BuildError)>,
+}
+
+impl LoadingAck {
+    /// Lifetime `lifetime` declares `loadend`, `None` for a frame drawing
+    /// no skin: it replaces the declaration of the same lifetime, shorter
+    /// or longer, and another lifetime's starts afresh. Allocates nothing.
+    const fn declare(&mut self, lifetime: u64, loadend: Option<Option<TimeUs>>) {
+        let same = matches!(self.loadend_of, Some(l) if l == lifetime);
+        if !same {
+            self.loadend_of = Some(lifetime);
+            self.loadend = None;
+        }
+        if let Some(declared) = loadend {
+            self.loadend = declared;
+        }
+    }
 }
 
 /// The last request committed and the last whose commit the game thread
@@ -1567,7 +1884,9 @@ struct Commits {
 struct Receipt {
     request: u64,
     declared: Declared,
-    loadend: Option<Option<TimeUs>>,
+    /// What its commit declared for the loading lifetime it was the
+    /// current one of.
+    loadend: Option<(u64, Option<TimeUs>)>,
 }
 
 /// What the play skin an attempt draws with declares for the play's
@@ -2123,10 +2442,11 @@ impl RenderLink {
     /// point holds, so the view returned is the one presented at that
     /// instant.
     ///
-    /// With `gate` (a pressed command: the result's start), the view
-    /// presented judges it first under the same lock: while its input time
-    /// has not passed from `gate` at `at`, nothing is set and `None` is
-    /// given (the S10-09i design's D6).
+    /// With `gate` (a pressed command: the result's start as the flow last
+    /// read it), the view presented judges it first under the same lock:
+    /// while its input time has not passed at `at` from the lifetime's
+    /// origin, recorded with that view's timing (else `gate`), nothing is
+    /// set and `None` is given (the S10-09i design's D6).
     pub fn pin_result(
         &self,
         at: TimeUs,
@@ -2140,6 +2460,9 @@ impl RenderLink {
                 ..ResultBarrier::default()
             };
         }
+        // A flow that read the start before the first commit pins after
+        // it: the origin recorded with the timing is the start.
+        let gate = gate.map(|g| b.origin.unwrap_or(g));
         if game::gated(b.timing.map(crate::play::flow_timing), at, gate) == game::Outro::Gated {
             return None;
         }
@@ -2155,6 +2478,17 @@ impl RenderLink {
         let lifetime = self.result_lifetimes.load(Ordering::Relaxed);
         let b = self.shared.barrier();
         b.timing.filter(|_| b.lifetime == lifetime)
+    }
+
+    /// The current result lifetime's origin (design.md "Rendering and
+    /// Skins", Timers): the sampled instant of the frame that committed
+    /// its first view, `None` before it. Recorded under the same lock as
+    /// the timing and never later, so a timing read first and then this
+    /// pairs with an origin.
+    pub fn presented_origin(&self) -> Option<TimeUs> {
+        let lifetime = self.result_lifetimes.load(Ordering::Relaxed);
+        let b = self.shared.barrier();
+        b.origin.filter(|_| b.lifetime == lifetime)
     }
 
     /// What the render thread shows of the result kind, and the run's
@@ -2364,8 +2698,13 @@ impl RenderLink {
     pub fn begin_attempt(&self, attempt: AttemptContext, skin: AttemptSkin) -> PendingAttempt {
         let request = self.requests.fetch_add(1, Ordering::Relaxed) + 1;
         let (reply, rx) = mpsc::sync_channel(1);
+        // Read where the request is published: every lifetime change is
+        // this thread's, so it is the one the request belongs to however
+        // late the render thread takes it.
+        let lifetime = self.shared.current_lifetime();
         self.send(RenderMsg::PrepareAttempt {
             request,
+            lifetime,
             attempt: Box::new(attempt),
             skin,
             reply,
@@ -2535,8 +2874,8 @@ impl RenderLink {
                     // Declared before the opener reads the minimum again,
                     // outside the commits' lock, whether or not the
                     // render thread has declared it yet.
-                    if let Some(loadend) = r.loadend {
-                        self.shared.committed_loading(loadend);
+                    if let Some((lifetime, loadend)) = r.loadend {
+                        self.shared.committed_loading(lifetime, loadend);
                     }
                     return Ok(r.declared);
                 }
@@ -2551,6 +2890,12 @@ impl RenderLink {
     /// selection frame reads the volume and the display offset from.
     pub fn tuning(&self, tuning: Arc<LiveTuning>) {
         self.send(RenderMsg::Tuning(tuning));
+    }
+
+    /// Hands the render thread the pointer's shared state: every selection
+    /// frame draws its hover and answers its batches and drags.
+    pub fn pointer(&self, pointer: Arc<crate::pointer::PointerShared>) {
+        self.send(RenderMsg::Pointer(pointer));
     }
 
     /// Hands the render thread the adjustments' snapshots, which every
@@ -2758,6 +3103,24 @@ impl RenderLink {
         self.shared.loading_acked.load(Ordering::SeqCst)
     }
 
+    /// Holds the loading state's first frame for at most `bound` in place
+    /// of [`FIRST_FRAME_HOLD`] (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn set_first_frame_hold(&self, bound: TimeUs) {
+        self.shared.hold_bound.store(bound.0, Ordering::SeqCst);
+    }
+
+    /// The first frame's held iterations' waits so far, read from any
+    /// thread (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn held_waits(&self) -> impl Fn() -> u64 + Send + Sync + 'static {
+        let shared = Arc::clone(&self.shared);
+        move || {
+            let [_, waits] = &shared.held;
+            waits.load(Ordering::SeqCst)
+        }
+    }
+
     /// Where the current loading lifetime's lines and state are shown
     /// from, on any thread.
     pub fn loading(&self) -> LoadingSink {
@@ -2826,13 +3189,144 @@ impl RenderLink {
         move || reveal(&shared, clock, &tx)
     }
 
-    /// The decision screen's built-in presentation, `page`, drawn until
-    /// the next screen: kept through the chart's load and the screen's
-    /// recovery, and not a loading lifetime.
-    pub fn show_decision(&self, page: MenuPage) {
+    /// The decision screen drawn until the next screen: its built-in
+    /// presentation `page`, or the decision skin from the label slot
+    /// `shown` pinned, `page` drawn when the skin cannot draw; kept
+    /// through the chart's load and the screen's recovery, and not a
+    /// loading lifetime.
+    pub fn show_decision(
+        &self,
+        page: MenuPage,
+        shown: Option<crate::decision_side::ShownDecision>,
+    ) {
         #[cfg(test)]
-        self.shared.decisions_sent.fetch_add(1, Ordering::SeqCst);
-        self.send(RenderMsg::Decision(Box::new(page)));
+        {
+            self.shared.decisions_sent.fetch_add(1, Ordering::SeqCst);
+            *self
+                .shared
+                .decision_sent
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = shown;
+        }
+        self.send(RenderMsg::Decision {
+            page: Box::new(page),
+            shown,
+        });
+    }
+
+    /// The decision labels' slot states, shared with the game thread,
+    /// which pins one at the choice (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn label_book(&self) -> Arc<Mutex<render::LabelBook>> {
+        Arc::clone(&self.shared.labels)
+    }
+
+    /// The choice of `chart`, its labels `strings` at `revision`, in
+    /// decision lifetime `lifetime` (design.md "Play Lifecycle", the
+    /// decision screen): the ready label slot holding them pinned and the
+    /// lifetime made the active one in one lock, without waiting for any
+    /// preparation; its slot, generation and the skin's timing. None, with
+    /// nothing changed, when none is ready, the ready slot of that
+    /// revision was prepared from other strings (equal digests of other
+    /// labels), or the device is not healthy.
+    pub fn pin_decision(
+        &self,
+        chart: &std::path::Path,
+        revision: u64,
+        strings: &skin_model::DecisionStrings,
+        lifetime: u64,
+    ) -> Option<(usize, render::Gen, skin_model::DecisionTiming)> {
+        let mut book = render::lock(&self.shared.labels);
+        // The slot the pin takes: the first ready one of that revision.
+        let (slot, generation) = (0..render::LABEL_SLOTS).find_map(|i| match book.state(i) {
+            Some(render::LabelState::Ready {
+                generation, key, ..
+            }) if key.chart == chart && key.revision == revision => Some((i, *generation)),
+            _ => None,
+        })?;
+        if !crate::decision_side::prepared_holds(&self.shared.prepared, slot, generation, strings) {
+            return None;
+        }
+        book.pin(chart, revision, lifetime)
+    }
+
+    /// The strings the label slots were prepared from, as the choice reads
+    /// them (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn prepared_strings(&self) -> Arc<crate::decision_side::PreparedStrings> {
+        Arc::clone(&self.shared.prepared)
+    }
+
+    /// Decision lifetime `lifetime` begins with no slot pinned (the
+    /// built-in presentation): the active one, so the render thread's
+    /// takeover and retirement are judged against it.
+    pub fn begin_decision(&self, lifetime: u64) {
+        render::lock(&self.shared.labels).begin(lifetime);
+    }
+
+    /// Decision lifetime `lifetime` ended (its step, the practice page's
+    /// entry, a leave): no lifetime is active if it was, so its pinned
+    /// slot is retired at the render thread's next boundary.
+    pub fn end_decision(&self, lifetime: u64) {
+        render::lock(&self.shared.labels).end(lifetime);
+    }
+
+    /// The decision skin of the active lifetime could not draw: its
+    /// takeover, once ([`game::Decision::apply_takeover`]).
+    pub fn take_decision_takeover(&self) -> Option<game::DecisionTakeover> {
+        take_takeover(&self.shared)
+    }
+
+    /// The presentation last sent with [`show_decision`](Self::show_decision)
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn decision_sent(&self) -> Option<crate::decision_side::ShownDecision> {
+        *self
+            .shared
+            .decision_sent
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Where the render thread waits before it takes a decision
+    /// presentation while a test holds it (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn decision_gate(&self) -> Arc<TestGate> {
+        Arc::clone(&self.shared.decision_gate)
+    }
+
+    /// The game thread's looks for a takeover and the render thread's
+    /// drained frame loops (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn takeover_acks(&self) -> Arc<TakeoverAcks> {
+        Arc::clone(&self.shared.takeover_acks)
+    }
+
+    /// The takeovers whose producer woke the game thread (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn takeovers_woken(&self) -> u64 {
+        self.shared.takeovers_woken.load(Ordering::Acquire)
+    }
+
+    /// Why the decision skin was refused for the run, once: the select
+    /// screen's notice says it from the next update.
+    pub fn take_decision_refusal(&self) -> Option<String> {
+        self.shared
+            .decision_refused
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take()
+    }
+
+    /// What wakes the game thread when the decision skin's takeover is
+    /// produced ([`crate::controls::Controls::wake_game`]).
+    pub fn set_game_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
+        *self
+            .shared
+            .game_wake
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(wake);
     }
 
     /// How many decision presentations were sent, readable from another
@@ -3011,6 +3505,9 @@ impl crate::result_present::Publish for RenderLink {
     }
     fn timing(&self) -> Option<skin_model::ResultTiming> {
         self.presented_timing()
+    }
+    fn origin(&self) -> Option<TimeUs> {
+        self.presented_origin()
     }
 }
 
@@ -3386,6 +3883,7 @@ pub fn spawn(
                 section.as_ref(),
                 false,
                 &mut None,
+                &mut None,
             ) {
                 Ok(screen) => {
                     thread_shared.built(screen.as_ref());
@@ -3411,6 +3909,8 @@ pub fn spawn(
                 shared: thread_shared,
                 end_page: (0, EndPage::default()),
                 granted: false,
+                image: Image::default(),
+                first_frame: None,
                 extent: None,
                 applied: None,
                 selected: None,
@@ -3434,7 +3934,15 @@ pub fn spawn(
                 app: crate::app_clock::AppClock::new(),
                 page_turns: false,
                 decision: None,
+                decision_shown: None,
+                decision_screen: None,
+                decision_side: None,
+                decision_want: None,
+                decision_disabled: None,
+                decision_next: 1,
                 tuning: None,
+                pointer: None,
+                drag_seen: crate::pointer::Seen::default(),
                 current: None,
                 #[cfg(feature = "dev-tools")]
                 ready: None,
@@ -3649,20 +4157,78 @@ const fn screen_kind(mode: &Mode, decision: bool, page_turns: bool) -> crate::me
         Mode::Menu {
             loading: Some(_), ..
         } => K::Loading,
+        Mode::Decision => K::Decision,
         Mode::Menu { .. } if decision => K::Decision,
         Mode::Menu { .. } if page_turns => K::Practice,
         Mode::Menu { .. } => K::Page,
     }
 }
 
-/// Whether loading lifetime `lifetime` draws the pending presentation:
-/// play's skin is pending, and no specialization of it is kept that was
-/// committed while `lifetime` was current (`specialized_in`). Allocates
-/// nothing.
+/// The token a play attempt's staging of request `request` bears on the
+/// screen of device `device`.
+const fn attempt_token(request: u64, device: u64) -> PreparedToken {
+    PreparedToken {
+        request,
+        device,
+        kind: ScreenKind::Play,
+    }
+}
+
+/// What a loading frame draws (design.md "beatoraja Lua Skins", the
+/// pending presentation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Presented {
+    /// Play's skin is not pending: its installed skin, or the built-in
+    /// presentation, as for any skin.
+    Ordinary,
+    /// The specialization committed in the lifetime.
+    Committed,
+    /// The play staging `token` names, declaring `loadend`.
+    Staged {
+        token: PreparedToken,
+        loadend: Option<TimeUs>,
+    },
+    /// The pending presentation: the cleared canvas and the load's lines.
+    Placeholder,
+}
+
+/// What loading lifetime `lifetime` draws: the ordinary presentation while
+/// play's skin is not pending; else the staging answered for a request
+/// published in that lifetime, while it is the newest play request, on
+/// the screen's device and still held by the screen (`staged`); else the
+/// specialization committed in it (`specialized_in`); else the pending
+/// presentation. One value per frame feeds its drawing, its declared
+/// loading time and its records. Allocates nothing.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-fn pending_presentation(committed: &Committed, specialized_in: Option<u64>, lifetime: u64) -> bool {
-    committed.pending(ScreenKind::Play)
-        && (committed.get(ScreenKind::Play).is_none() || specialized_in != Some(lifetime))
+fn presentation_of(
+    committed: &Committed,
+    specialized_in: Option<u64>,
+    prepared: Option<Candidate>,
+    requested: u64,
+    (staged, device): (Option<PreparedToken>, u64),
+    lifetime: u64,
+) -> Presented {
+    if !committed.pending(ScreenKind::Play) {
+        return Presented::Ordinary;
+    }
+    if let Some(p) = prepared
+        && p.declarative
+        && p.lifetime == Some(lifetime)
+        && p.token.kind == ScreenKind::Play
+        && p.token.request == requested
+        && p.token.device == device
+        && staged == Some(p.token)
+    {
+        return Presented::Staged {
+            token: p.token,
+            loadend: p.loadend,
+        };
+    }
+    if specialized_in == Some(lifetime) && committed.get(ScreenKind::Play).is_some() {
+        Presented::Committed
+    } else {
+        Presented::Placeholder
+    }
 }
 
 /// What a preparation or a load leaves drawn: the splash stays until what
@@ -3675,11 +4241,20 @@ impl Run {
     /// the latest mode left nothing drawn: built again, it draws that page
     /// again, the presentation of the state the render thread is in. A
     /// later mode message has dropped the page by then, so no decision
-    /// frame is drawn after the render thread took one.
+    /// frame is drawn after the render thread took one. The skinned
+    /// decision screen is kept the same way, and drawn again on a screen
+    /// built again while its slot is pinned.
     fn after_preparing(&self, mode: Mode) -> Mode {
+        let skinned = self.decision.is_some()
+            && self
+                .decision_shown
+                .as_ref()
+                .is_some_and(|s| s.slot.is_some());
         match mode {
+            Mode::Decision if skinned => Mode::Decision,
             decision @ Mode::Menu { loading: None, .. } if self.decision.is_some() => decision,
-            Mode::Idle if self.screen.is_some() => match &self.decision {
+            Mode::Idle if self.screen.is_some() && skinned => Mode::Decision,
+            Mode::Idle | Mode::Decision if self.screen.is_some() => match &self.decision {
                 Some(page) => Mode::Menu {
                     page: page.clone(),
                     update: None,
@@ -3835,6 +4410,83 @@ impl RecoveryHandle {
     pub fn look(&self) {
         let _ = serve_recovery(&self.shared, &self.tx, self.timeout, None, false);
     }
+
+    /// The active decision lifetime's takeover, once, for a look inside a
+    /// rig's wait ([`RenderLink::take_decision_takeover`]).
+    pub fn take_decision_takeover(&self) -> Option<game::DecisionTakeover> {
+        take_takeover(&self.shared)
+    }
+
+    /// Decision lifetime `lifetime` ended inside a rig's wait
+    /// ([`RenderLink::end_decision`]).
+    pub fn end_decision(&self, lifetime: u64) {
+        render::lock(&self.shared.labels).end(lifetime);
+    }
+
+    /// A takeover left for the game thread as the render thread leaves
+    /// one (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn leave_takeover(&self, takeover: game::DecisionTakeover) {
+        *self
+            .shared
+            .decision_takeover
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(takeover);
+    }
+}
+
+/// The active decision lifetime's takeover in `shared`, taken.
+fn take_takeover(shared: &Shared) -> Option<game::DecisionTakeover> {
+    let mut slot = shared
+        .decision_takeover
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    let taken = slot.take();
+    #[cfg(test)]
+    shared.takeover_acks.look(taken.is_some());
+    drop(slot);
+    taken
+}
+
+/// What a test reads to know a takeover was processed (tests): the game
+/// thread's looks for a takeover, each counted as it takes the slot's
+/// lock, and the render thread's frame loops that found no message
+/// waiting. The game's looks at a decision screen run one after another,
+/// each taking the slot once: a look counted after the one that took a
+/// takeover began once that look, and what it routed, had ended. A frame
+/// loop drained after that took every message the game sent before.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct TakeoverAcks {
+    /// The looks so far.
+    looks: AtomicU64,
+    /// The look that took the last takeover, counted from 1; 0 before any.
+    took: AtomicU64,
+    /// The frame loops that found no message waiting.
+    drained: AtomicU64,
+}
+
+#[cfg(test)]
+impl TakeoverAcks {
+    fn look(&self, took: bool) {
+        let n = self.looks.fetch_add(1, Ordering::AcqRel).saturating_add(1);
+        if took {
+            self.took.store(n, Ordering::Release);
+        }
+    }
+
+    /// Whether a takeover was taken and the game looked again since.
+    #[cfg(feature = "dev-tools")]
+    pub fn looked_after(&self) -> bool {
+        let took = self.took.load(Ordering::Acquire);
+        took != 0 && self.looks.load(Ordering::Acquire) > took
+    }
+
+    /// The frame loops so far that found no message waiting.
+    #[cfg(feature = "dev-tools")]
+    pub fn drained(&self) -> u64 {
+        self.drained.load(Ordering::Acquire)
+    }
 }
 
 fn ended(shared: &Shared) -> ScreenError {
@@ -3971,6 +4623,7 @@ fn build(
     section: Option<&Section>,
     disabled: bool,
     result_refused: &mut Option<String>,
+    decision_refused: &mut Option<String>,
 ) -> Result<Box<dyn Screen>, RenderError> {
     let mut s = make()?;
     if disabled {
@@ -4032,6 +4685,12 @@ fn build(
                         Chain(&e)
                     ));
                 }
+                if kind == ScreenKind::Decision {
+                    *decision_refused = Some(format!(
+                        "the decision skin was not restored on the screen built again: {}",
+                        Chain(&e)
+                    ));
+                }
             }
             Err(e) => return Err(e),
         }
@@ -4081,6 +4740,10 @@ enum Mode {
         changed: bool,
         loading: Option<u64>,
     },
+    /// The decision skin of the screen shown ([`Run::decision_shown`]),
+    /// its labels borrowed from their pinned slot; its page
+    /// ([`Run::decision`]) draws when the skin cannot.
+    Decision,
     /// The select screen from its newest update: [`Run::selection`].
     Selection,
     /// The result screen from its presentations: [`Run::result`].
@@ -4100,6 +4763,8 @@ struct ShownSelection {
 /// An attempt's preparation the screen has not answered yet.
 struct Preparing {
     request: u64,
+    /// The loading lifetime its request was published in.
+    lifetime: Option<u64>,
     attempt: Box<AttemptContext>,
     /// The declarative skin it stages, if one is chosen.
     skin: Option<Arc<SkinBundle>>,
@@ -4132,8 +4797,36 @@ pub enum ReadyAnswer {
 
 /// An attempt's preparation answered ready: its token and whether it
 /// staged a declarative skin.
+/// What the draw rule reads of the preparation answered ready
+/// ([`Prepared::candidate`]): a copy, allocating nothing.
+#[derive(Clone, Copy, Debug)]
+struct Candidate {
+    token: PreparedToken,
+    lifetime: Option<u64>,
+    declarative: bool,
+    loadend: Option<TimeUs>,
+}
+
+impl Prepared {
+    /// What the draw rule reads of it.
+    const fn candidate(&self) -> Candidate {
+        Candidate {
+            token: self.token,
+            lifetime: self.lifetime,
+            declarative: self.declarative,
+            loadend: self.loadend,
+        }
+    }
+}
+
 struct Prepared {
     token: PreparedToken,
+    /// The loading lifetime its request was published in: only that
+    /// lifetime's loading frames draw it, and its commit is that
+    /// lifetime's.
+    lifetime: Option<u64>,
+    /// The loading time its skin declares, a declarative one's.
+    loadend: Option<TimeUs>,
     /// The screen's structural inputs it was staged with.
     screen: game::ScreenKey,
     declarative: bool,
@@ -4156,6 +4849,127 @@ struct Prepared {
     /// The attempt's gauges' looks, in the preset's order (dev-tools).
     #[cfg(feature = "dev-tools")]
     gauge_looks: Vec<skin_model::GaugeLook>,
+}
+
+/// The longest the loading state's first frame is held while it would be
+/// the pending presentation, from the showing (design.md "The pending
+/// presentation").
+const FIRST_FRAME_HOLD: TimeUs = TimeUs(500_000);
+
+/// The longest a held iteration waits before it looks again.
+const HELD_PACE: TimeUs = TimeUs(4_000);
+
+/// A frame's token: the target changes applied and the size notices
+/// published when it began, before it read the window's size.
+type FrameToken = (u64, u64);
+
+/// Whether the image on the screen is still the one last presented, on
+/// the target it was drawn for (design.md "The pending presentation"):
+/// valid only while no target change was applied, no size notice was
+/// published and no frame failed to present since that presentation, and
+/// only if none came between its frame's beginning and its presentation.
+#[derive(Clone, Copy, Debug, Default)]
+struct Image {
+    /// The target changes applied: each resize, each screen built or
+    /// dropped.
+    target: u64,
+    /// The token of the frame last presented while it still matched;
+    /// `None` after any break.
+    stamp: Option<FrameToken>,
+}
+
+impl Image {
+    /// A frame beginning now, with `notices` published.
+    const fn token(&self, notices: u64) -> FrameToken {
+        (self.target, notices)
+    }
+
+    /// A target change applied: the image no longer fits it.
+    const fn changed(&mut self) {
+        self.target = self.target.wrapping_add(1);
+        self.stamp = None;
+    }
+
+    /// A frame failed to present, or the device was lost.
+    const fn broken(&mut self) {
+        self.stamp = None;
+    }
+
+    /// The frame begun with `token` was presented, `notices` published
+    /// now: valid only if nothing changed since it began.
+    fn presented(&mut self, token: FrameToken, notices: u64) {
+        self.stamp = (token == self.token(notices)).then_some(token);
+    }
+
+    /// Whether the image is valid, `notices` published now.
+    fn valid(&self, notices: u64) -> bool {
+        self.stamp == Some(self.token(notices))
+    }
+}
+
+/// The size notices `extent` published, none without one.
+fn notices_of(extent: Option<&Arc<Extent>>) -> u64 {
+    extent.map_or(0, |e| e.notices())
+}
+
+/// A loading lifetime's first frame: when it was shown, and whether its
+/// hold ended, never to begin again in the lifetime.
+#[derive(Clone, Copy, Debug)]
+struct FirstFrame {
+    lifetime: u64,
+    shown_at: TimeUs,
+    ended: bool,
+}
+
+/// The first frame's hold bound: [`FIRST_FRAME_HOLD`], or a test's.
+fn first_frame_bound(shared: &Shared) -> TimeUs {
+    #[cfg(test)]
+    {
+        TimeUs(shared.hold_bound.load(Ordering::SeqCst))
+    }
+    #[cfg(not(test))]
+    {
+        let _ = shared;
+        FIRST_FRAME_HOLD
+    }
+}
+
+/// The hold's reading of the clock, `now`, or the showing plus a test's
+/// time since it (tests).
+#[cfg(test)]
+fn hold_now(shared: &Shared, now: TimeUs, shown_at: TimeUs) -> TimeUs {
+    match shared.hold_elapsed.load(Ordering::SeqCst) {
+        i64::MIN => now,
+        elapsed => TimeUs(shown_at.0.saturating_add(elapsed)),
+    }
+}
+
+/// How long the render thread stalls as it takes a loading lifetime's
+/// signal, in ms, from `TAPESTRY_TEST_DESCHEDULE_MS` (tests: a render
+/// thread descheduled right after the showing).
+#[cfg(test)]
+fn deschedule() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("TAPESTRY_TEST_DESCHEDULE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
+/// How long a held iteration at `now` waits before it looks again: at
+/// most [`HELD_PACE`], never past `shown_at + bound`; `None` once that is
+/// reached, which ends the hold.
+const fn held_wait(now: TimeUs, shown_at: TimeUs, bound: TimeUs) -> Option<TimeUs> {
+    let remaining = shown_at.0.saturating_add(bound.0).saturating_sub(now.0);
+    if remaining <= 0 {
+        None
+    } else if remaining < HELD_PACE.0 {
+        Some(TimeUs(remaining))
+    } else {
+        Some(HELD_PACE)
+    }
 }
 
 struct Run {
@@ -4182,6 +4996,10 @@ struct Run {
     /// frame of latency), so the next frame takes it instead of waiting
     /// again, which would never end; until a new screen is built.
     granted: bool,
+    /// The image on the screen and its validity.
+    image: Image,
+    /// The current loading lifetime's first frame, once visited.
+    first_frame: Option<FirstFrame>,
     /// The window's size followed, if any.
     extent: Option<Arc<Extent>>,
     /// The size last applied to the screen; `None` until one is, and for
@@ -4256,8 +5074,30 @@ struct Run {
     /// message drops it. A chart's load or a preparation keeps its page,
     /// and a screen built again draws it again ([`Run::after_preparing`]).
     decision: Option<Box<MenuPage>>,
+    /// The decision screen shown with it, while it is the latest mode:
+    /// its lifetime, choice, timing and pinned slot, `None` for the slot
+    /// once the built-in presentation took over.
+    decision_shown: Option<crate::decision_side::ShownDecision>,
+    /// The decision skin's state for the screen shown, made at its
+    /// message.
+    decision_screen: Option<skin_model::DecisionScreen>,
+    /// The committed decision installation's label preparation.
+    decision_side: Option<crate::decision_side::DecisionSide>,
+    /// The chart the selection cursor rests on, its labels asked of the
+    /// preparation; kept after selection is left.
+    decision_want: Option<crate::decision_side::Want>,
+    /// Why the decision kind is disabled for the run: no request is posted
+    /// and no slot is pinned from then on.
+    decision_disabled: Option<String>,
+    /// The next decision label preparation's generation, unique for the
+    /// run.
+    decision_next: render::Gen,
     /// The settings keys' values ([`RenderMsg::Tuning`]).
     tuning: Option<Arc<LiveTuning>>,
+    /// The pointer's shared state ([`RenderMsg::Pointer`]).
+    pointer: Option<Arc<crate::pointer::PointerShared>>,
+    /// The drag cell's movement last taken: one drag a frame.
+    drag_seen: crate::pointer::Seen,
     /// The committed attempt's tempo and presentation epoch, which its
     /// play frames project the snapshot with.
     current: Option<(game::AttemptTempo, u64)>,
@@ -4351,6 +5191,7 @@ impl Run {
                 });
             }
         }
+        self.want_decision_labels();
     }
 
     /// The selection skin's state for `shown`'s lifetime on the committed
@@ -4384,7 +5225,7 @@ impl Run {
         loop {
             self.sync_chart();
             let idle = matches!(mode, Mode::Idle) || self.screen.is_none();
-            let msg = if idle && self.attempt.is_some() {
+            let msg = if idle && (self.attempt.is_some() || self.decision_busy()) {
                 // A preparation not yet answered is asked again between
                 // messages.
                 rx.recv_timeout(CANCEL_POLL).map_err(|e| match e {
@@ -4512,34 +5353,48 @@ impl Run {
                     // A generic page (a preparation's wait, a notice) is
                     // no play state's presentation: no turntable.
                     self.page_turns = false;
-                    self.decision = None;
+                    self.clear_decision();
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);
                 }
-                Ok(RenderMsg::Decision(page)) => {
+                Ok(RenderMsg::Decision { page, shown }) => {
+                    #[cfg(test)]
+                    self.shared.decision_gate.pass();
                     // The decision screen is no play state's presentation:
                     // the turntable is not adopted or ticked (design.md
                     // "State Model").
                     self.page_turns = false;
                     self.decision = Some(page.clone());
-                    mode = Self::menu_mode(mode, page, &self.shared, self.started);
+                    // The presentation chosen at the choice is not checked
+                    // again here: a later invalidation is a recovery or a
+                    // takeover, never a retrospective revision.
+                    self.decision_shown = shown;
+                    self.decision_screen = None;
+                    if shown.is_some_and(|s| s.slot.is_some()) {
+                        self.enter_skinned_decision();
+                    }
+                    mode = if self.decision_skinned() {
+                        Mode::Decision
+                    } else {
+                        Self::menu_mode(mode, page, &self.shared, self.started)
+                    };
                 }
                 Ok(RenderMsg::PracticePage(page)) => {
                     // The practice page begins or resumes its play
                     // state's presentation.
                     self.page_turns = true;
-                    self.decision = None;
+                    self.clear_decision();
                     self.turntable.practice_page();
                     mode = Self::menu_mode(mode, page, &self.shared, self.started);
                 }
                 Ok(RenderMsg::ResultChanged) => {
                     self.take_result();
-                    if self.result.is_some() {
-                        self.decision = None;
+                    if self.current_result().is_some() {
+                        self.clear_decision();
                         mode = Mode::Result;
                     }
                 }
                 Ok(RenderMsg::SelectionChanged) => {
-                    self.decision = None;
+                    self.clear_decision();
                     self.take_selection();
                     mode = match mode {
                         // The launch screen shows out its time, the
@@ -4554,7 +5409,9 @@ impl Run {
                     };
                 }
                 Ok(RenderMsg::Loading(lifetime)) => {
-                    self.decision = None;
+                    #[cfg(test)]
+                    std::thread::sleep(Duration::from_millis(deschedule()));
+                    self.clear_decision();
                     self.turntable.begin_presentation();
                     // Lines the slot no longer holds (taken, or their
                     // lifetime ended) change nothing, and neither do the
@@ -4651,20 +5508,32 @@ impl Run {
                     let _ = reply.send(ready);
                     mode = self.after_preparing(mode);
                     // A result lifetime draws on from what it presented.
-                    if self.result.as_ref().is_some_and(ResultSide::shows) {
+                    if self.current_result().is_some_and(ResultSide::shows) {
                         mode = Mode::Result;
                     }
                     continue;
                 }
                 Ok(RenderMsg::PrepareAttempt {
                     request,
+                    lifetime,
                     attempt,
                     skin,
                     reply,
                 }) => {
+                    #[cfg(test)]
+                    {
+                        let deadline = Instant::now() + hook_bound();
+                        while self.shared.hold_receipt.load(Ordering::Acquire)
+                            && Instant::now() < deadline
+                        {
+                            std::thread::sleep(Duration::from_millis(1));
+                        }
+                    }
                     self.turntable.begin_presentation();
-                    self.begin_attempt(request, attempt, skin, reply);
+                    self.begin_attempt(request, lifetime, attempt, skin, reply);
                     mode = self.after_preparing(mode);
+                    #[cfg(test)]
+                    self.shared.answer_gate.pass();
                     continue;
                 }
                 Ok(RenderMsg::PlayState(state)) => {
@@ -4697,6 +5566,10 @@ impl Run {
                 }
                 Ok(RenderMsg::Tuning(tuning)) => {
                     self.tuning = Some(tuning);
+                    continue;
+                }
+                Ok(RenderMsg::Pointer(pointer)) => {
+                    self.pointer = Some(pointer);
                     continue;
                 }
                 Ok(RenderMsg::Commit { request, reply }) => {
@@ -4782,6 +5655,7 @@ impl Run {
                 // Its page, or a newer one an earlier signal took; whether
                 // it may still be drawn is checked before every end frame.
                 Ok(RenderMsg::End) => {
+                    let shows = self.current_result().is_some_and(ResultSide::shows);
                     if let Some(page) = self.shared.take_end() {
                         self.end_page = page;
                         if let Some(side) = &mut self.result {
@@ -4790,11 +5664,7 @@ impl Run {
                     }
                     // A result skin's presentation draws instead while its
                     // lifetime is current: the page is its built-in rows'.
-                    mode = if self.result.as_ref().is_some_and(ResultSide::shows) {
-                        Mode::Result
-                    } else {
-                        Mode::End
-                    };
+                    mode = if shows { Mode::Result } else { Mode::End };
                 }
                 Ok(RenderMsg::Finish { end, reply }) => {
                     // Judgments still queued were never drawn in this play:
@@ -4816,6 +5686,8 @@ impl Run {
                     // the channel, after this: it is taken there.
                     self.extent = Some(extent);
                     self.applied = None;
+                    // Another slot's notices: none of them stamped the image.
+                    self.image.changed();
                 }
                 // Applied below, as every loop applies the newest size.
                 Ok(RenderMsg::Resize) => {
@@ -4836,7 +5708,13 @@ impl Run {
                     });
                 }
                 Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => return,
-                Err(TryRecvError::Empty) => {}
+                Err(TryRecvError::Empty) => {
+                    #[cfg(test)]
+                    self.shared
+                        .takeover_acks
+                        .drained
+                        .fetch_add(1, Ordering::AcqRel);
+                }
             }
             // The whole frames of a selection lifetime that ended, before
             // any frame of what follows: updates, rebuilds and resizes of
@@ -4872,13 +5750,119 @@ impl Run {
             let Some(screen) = &mut self.screen else {
                 continue;
             };
+            #[cfg(test)]
+            self.shared.frame_gates[0].pass();
+            // The frame's token, before it reads the window's size: a
+            // notice or a target change from here on leaves what it
+            // presents invalid.
+            let token = self.image.token(notices_of(self.extent.as_ref()));
             // The window's newest size, between frames.
             if let Some(size) = self.extent.as_ref().and_then(|e| e.latest())
                 && self.applied != Some(size)
             {
                 screen.resize(size.0, size.1);
                 self.applied = Some(size);
+                self.image.changed();
             }
+            #[cfg(test)]
+            self.shared.frame_gates[1].pass();
+            // The decision labels' work at this frame boundary, outside
+            // every frame, after the newest size: a device or poll failure
+            // drops the screen, which the game builds again.
+            if self.decision_boundary() {
+                mode = Mode::Idle;
+                continue;
+            }
+            let Some(screen) = &mut self.screen else {
+                continue;
+            };
+            // The lifetime's first frame is held while it would be the
+            // pending presentation and the image on the screen is still
+            // valid, for a bound from the showing (design.md "The pending
+            // presentation"): nothing is built or presented. Before the
+            // frame's pacing, so a held iteration waits only its own wait,
+            // and a frame granted stays so for the frame drawn after it.
+            if let Mode::Menu {
+                loading: Some(lifetime),
+                update,
+                ..
+            } = &mode
+            {
+                // Loading ended or cleared since: nothing of it is drawn,
+                // and no frame's pacing is taken for it; a frame granted
+                // stays so for what comes next.
+                if !self.shared.loading_current(*lifetime) {
+                    mode = Mode::Idle;
+                    continue;
+                }
+                let lifetime = *lifetime;
+                let now = self.clock.now();
+                let mut first = match self.first_frame {
+                    Some(f) if f.lifetime == lifetime => f,
+                    _ => {
+                        let shown_at = update.as_deref().map_or(now, |u| u.origin);
+                        #[cfg(test)]
+                        {
+                            *self
+                                .shared
+                                .first_shown
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner) =
+                                Some((lifetime, shown_at));
+                        }
+                        FirstFrame {
+                            lifetime,
+                            shown_at,
+                            ended: false,
+                        }
+                    }
+                };
+                let pending = !first.ended
+                    && presentation_of(
+                        &self.committed,
+                        self.specialized_in,
+                        self.prepared.as_ref().map(Prepared::candidate),
+                        self.requested,
+                        (screen.staged_token(), screen.device()),
+                        lifetime,
+                    ) == Presented::Placeholder;
+                if pending && screen.device_lost() {
+                    // The screen's failure, as a frame's.
+                    first.ended = true;
+                    self.first_frame = Some(first);
+                    eprintln!("render: {}", Chain(&RenderError::DeviceLost));
+                    self.drop_screen();
+                    self.shared.failed.store(true, Ordering::Release);
+                    mode = Mode::Idle;
+                    continue;
+                }
+                if pending {
+                    #[cfg(test)]
+                    let now = hold_now(&self.shared, now, first.shown_at);
+                    match held_wait(now, first.shown_at, first_frame_bound(&self.shared))
+                        .filter(|_| self.image.valid(notices_of(self.extent.as_ref())))
+                    {
+                        Some(wait) => {
+                            self.first_frame = Some(first);
+                            #[cfg(all(test, feature = "dev-tools"))]
+                            self.shared
+                                .held_allocations
+                                .store(crate::alloc_count::this_thread(), Ordering::SeqCst);
+                            #[cfg(test)]
+                            self.shared.held[0].fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_micros(wait.0.unsigned_abs()));
+                            #[cfg(test)]
+                            self.shared.held[1].fetch_add(1, Ordering::SeqCst);
+                            continue;
+                        }
+                        None => first.ended = true,
+                    }
+                }
+                self.first_frame = Some(first);
+            }
+            let Some(screen) = &mut self.screen else {
+                continue;
+            };
             // Minimized, nothing is presented, so the swap chain's waitable
             // object would not be signaled: frames are paced by the clock
             // instead, and a frame granted before stays granted.
@@ -4889,6 +5873,8 @@ impl Run {
                 }
                 self.granted = true;
             } else {
+                #[cfg(test)]
+                self.shared.clock_paced.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(16));
             }
             // The end screen was left (its pages cleared): the page drawn
@@ -4943,6 +5929,11 @@ impl Run {
             {
                 self.selection = None;
                 mode = Mode::Idle;
+                // A batch in flight is answered with no build: nothing
+                // waits on a selection no longer drawn.
+                if let Some(pointer) = &self.pointer {
+                    pointer.serve(None, None, screen.target(), &mut self.drag_seen);
+                }
                 continue;
             }
             // The result was left during the wait: nothing of it is drawn.
@@ -4973,6 +5964,9 @@ impl Run {
             let mut view_stamp = None;
             #[cfg(feature = "dev-tools")]
             let mut loading_stamp = None;
+            // What the loading frame drew, as its drawing decided it.
+            #[cfg(feature = "dev-tools")]
+            let mut frame_presented: Option<Presented> = None;
             #[cfg(feature = "dev-tools")]
             let mut screen_stamp = None;
             // The frame's one instant: a play frame's chart time and the
@@ -4996,6 +5990,11 @@ impl Run {
             // before any cleanup (dev-tools: matched against the capture).
             #[cfg(feature = "dev-tools")]
             let mut presented_at: Option<TimeUs> = None;
+            // A skinned decision frame the skin refused, for its takeover.
+            let mut decision_refused = None;
+            // A decision frame that drew its page without a refusal (its
+            // lifetime ended): the page mode takes the screen.
+            let mut decision_fallback = false;
             // The select update a selection frame applied, and what a
             // result frame drew (dev-tools: a scenario's captures).
             #[cfg(feature = "dev-tools")]
@@ -5165,9 +6164,21 @@ impl Run {
                     // out again.
                     #[cfg(feature = "dev-tools")]
                     let [_, _, _, before] = crate::alloc_count::counts();
-                    let pending = loading_frame.is_some_and(|l| {
-                        pending_presentation(&self.committed, self.specialized_in, l)
+                    let presented = loading_frame.map(|l| {
+                        presentation_of(
+                            &self.committed,
+                            self.specialized_in,
+                            self.prepared.as_ref().map(Prepared::candidate),
+                            self.requested,
+                            (screen.staged_token(), screen.device()),
+                            l,
+                        )
                     });
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        frame_presented = presented;
+                    }
+                    let pending = presented == Some(Presented::Placeholder);
                     let sampled = self.clock.now();
                     #[cfg(feature = "dev-tools")]
                     {
@@ -5191,7 +6202,17 @@ impl Run {
                             self.turntable.angle(),
                             app,
                         );
-                        match screen.loading(page, update.as_deref(), *changed, &frame) {
+                        let drawn = match presented {
+                            Some(Presented::Staged { token, .. }) => screen.loading_staged(
+                                page,
+                                update.as_deref(),
+                                *changed,
+                                &frame,
+                                token,
+                            ),
+                            _ => screen.loading(page, update.as_deref(), *changed, &frame),
+                        };
+                        match drawn {
                             Ok(Ok(t)) => Ok(t),
                             Ok(Err(e)) => {
                                 // Refused: nothing of it was drawn, the
@@ -5215,16 +6236,26 @@ impl Run {
                     if let (Some(lifetime), Ok((t, _))) = (loading_frame, &drawn)
                         && t.presented
                     {
-                        let loadend = if pending {
-                            None
-                        } else {
-                            self.committed
-                                .get(ScreenKind::Play)
-                                .and_then(|i| i.bundle().skin().loadend())
+                        // The skin drawn declares; the pending presentation
+                        // draws none and changes nothing.
+                        let loadend = match presented {
+                            Some(Presented::Staged { loadend, .. }) => Some(loadend),
+                            Some(Presented::Placeholder) | None => None,
+                            Some(Presented::Ordinary | Presented::Committed) => Some(
+                                self.committed
+                                    .get(ScreenKind::Play)
+                                    .and_then(|i| i.bundle().skin().loadend()),
+                            ),
                         };
                         let clock = self.clock;
                         self.shared
                             .presented_loading(lifetime, loadend, || clock.now());
+                        // Presented: the hold has ended for the lifetime.
+                        if let Some(f) = &mut self.first_frame
+                            && f.lifetime == lifetime
+                        {
+                            f.ended = true;
+                        }
                     }
                     #[cfg(feature = "dev-tools")]
                     if let Ok((t, _)) = &drawn {
@@ -5280,6 +6311,12 @@ impl Run {
                     if let Some(logic) = shown.logic.as_mut() {
                         logic
                             .apply_settings(shown.update.settings.as_ref(), self.tuning.as_deref());
+                        // The hover's point as the window last saw it.
+                        logic.pointer = self
+                            .pointer
+                            .as_ref()
+                            .and_then(|p| p.position())
+                            .map(crate::pointer::point);
                     }
                     // The frame's one reading: its timers age on the instant
                     // the readouts were sampled at.
@@ -5329,6 +6366,27 @@ impl Run {
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner) = Some(why.clone());
                     }
+                    // The pointer's batch and drag, on what this frame built.
+                    if let Some(pointer) = &self.pointer {
+                        let u = &shown.update;
+                        let built = drawn.as_ref().ok().map(|d| crate::pointer::Built {
+                            lifetime: u.lifetime,
+                            revision: u.revision,
+                            list_revision: u.list_revision,
+                            cursor: u
+                                .view
+                                .cursor
+                                .and_then(|c| u.view.rows.get(c))
+                                .and_then(|r| r.index),
+                            skinned: d.skinned && d.refused.is_none() && shown.logic.is_some(),
+                        });
+                        pointer.serve(
+                            built,
+                            shown.logic.as_ref(),
+                            screen.target(),
+                            &mut self.drag_seen,
+                        );
+                    }
                     #[cfg(feature = "dev-tools")]
                     if let Ok(d) = &drawn {
                         let [_, _, _, after] = crate::alloc_count::counts();
@@ -5347,13 +6405,20 @@ impl Run {
                     drawn.map(|d| (d.timing, None))
                 }
                 Mode::Result => {
+                    #[cfg(test)]
+                    if self.shared.result_stall.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
                     #[cfg(feature = "dev-tools")]
                     {
                         frame_began = Some(Instant::now());
                         let _ = crate::dev::take_build_mark();
                         let _ = crate::screens::take_visit();
                     }
-                    let now = self.clock.now();
+                    // The frame's one instant, its readouts' reading, as a
+                    // selection frame's: its timers age on the same clock
+                    // reading as its clock and uptime numbers.
+                    let now = frame_at;
                     if let Some(side) = &mut self.result {
                         side.drain();
                     }
@@ -5362,10 +6427,24 @@ impl Run {
                         self.result.as_mut(),
                         &self.shared,
                         &self.scripts,
+                        now,
                     );
-                    Self::result_visit(self.result.as_mut(), now, fadeout);
-                    let built =
-                        Self::result_build(screen.as_mut(), self.result.as_mut(), now, fadeout);
+                    Self::result_visit(self.result.as_mut(), now, fadeout, &app);
+                    #[cfg(all(test, feature = "dev-tools"))]
+                    if let Some(h) = self.result.as_ref().and_then(|s| s.presented.as_ref()) {
+                        self.shared
+                            .result_runtime_timers
+                            .lock()
+                            .unwrap_or_else(PoisonError::into_inner)
+                            .push((now, h.script.running_frame_timer(0)));
+                    }
+                    let built = Self::result_build(
+                        screen.as_mut(),
+                        self.result.as_mut(),
+                        now,
+                        fadeout,
+                        &app,
+                    );
                     // A frame under the barrier refused (dev-tools: the
                     // fallback during an outro).
                     #[cfg(feature = "dev-tools")]
@@ -5420,9 +6499,11 @@ impl Run {
                             view: held.map(|h| h.payload.key),
                             sampled: now,
                             // Only a frame its skin drew has its timers.
-                            timer_origin: held
+                            timer_origin: self
+                                .result
+                                .as_ref()
                                 .filter(|_| matches!(built, ResultDrawn::Built))
-                                .map(|h| h.overlay.screen),
+                                .and_then(|s| s.origin),
                         });
                     }
                     match built {
@@ -5466,6 +6547,49 @@ impl Run {
                         }
                     }
                 }
+                Mode::Decision => {
+                    let (Some(shown), Some(dec)) =
+                        (self.decision_shown.as_ref(), self.decision_screen.as_mut())
+                    else {
+                        mode = Mode::Idle;
+                        continue;
+                    };
+                    let active = render::lock(&self.shared.labels).active();
+                    let built = crate::decision_side::decision_build(
+                        screen.as_mut(),
+                        dec,
+                        self.decision_side
+                            .as_ref()
+                            .map(crate::decision_side::DecisionSide::store),
+                        active,
+                        shown,
+                        frame_at,
+                    );
+                    match built {
+                        crate::decision_side::DecisionDrawn::Built => {
+                            screen.submit_decision().map(|t| (t, None))
+                        }
+                        other => {
+                            // Refused on a healthy device: the page draws in
+                            // this frame, and the built-in presentation takes
+                            // over from now on. A screen whose lifetime ended
+                            // (or with no slot) draws the page, refusing
+                            // nothing, and the page mode takes it from then
+                            // on: its layout is prepared once, not each frame.
+                            match other {
+                                crate::decision_side::DecisionDrawn::Refused(e) => {
+                                    decision_refused = Some(e);
+                                }
+                                _ => decision_fallback = true,
+                            }
+                            let Some(page) = &self.decision else {
+                                mode = Mode::Idle;
+                                continue;
+                            };
+                            screen.menu(page, true).map(|t| (t, None))
+                        }
+                    }
+                }
                 Mode::End => {
                     #[cfg(feature = "dev-tools")]
                     {
@@ -5493,9 +6617,48 @@ impl Run {
                 }
                 other => other,
             };
+            // The page drew in place of the skin: the page mode takes the
+            // screen from the next frame, its layout kept (prepared once).
+            // A refusal is the takeover's; an ended lifetime's screen only
+            // stops reading its slot.
+            if decision_fallback || decision_refused.is_some() {
+                if let Some(e) = decision_refused {
+                    self.decision_frame_refused(e, frame_at);
+                } else {
+                    if let Some(shown) = self.decision_shown.as_mut() {
+                        shown.slot = None;
+                    }
+                    self.decision_screen = None;
+                }
+                if matches!(mode, Mode::Decision) {
+                    mode = Mode::Menu {
+                        page: self.decision.clone().unwrap_or_default(),
+                        update: None,
+                        changed: false,
+                        loading: None,
+                    };
+                }
+            }
             // Any other frame's present: right after its draw returned.
             #[cfg(feature = "dev-tools")]
             let presented_at = presented_at.unwrap_or_else(|| self.clock.now());
+            #[cfg(test)]
+            self.shared.frame_gates[2].pass();
+            // The image's validity: a presented frame is valid only if
+            // nothing changed since its token; any other result breaks it.
+            match &drawn {
+                Ok((t, _)) if t.presented => self
+                    .image
+                    .presented(token, notices_of(self.extent.as_ref())),
+                _ => self.image.broken(),
+            }
+            #[cfg(test)]
+            {
+                let valid = self.image.valid(notices_of(self.extent.as_ref()));
+                let [count, last] = &self.shared.stamps;
+                last.store(u64::from(valid), Ordering::SeqCst);
+                count.fetch_add(1, Ordering::SeqCst);
+            }
             if !minimized {
                 self.granted = false;
             }
@@ -5567,8 +6730,8 @@ impl Run {
                         #[cfg(feature = "dev-tools")]
                         presented_at,
                         #[cfg(feature = "dev-tools")]
-                        skin_loading: loading_frame.filter(|&l| {
-                            !pending_presentation(&self.committed, self.specialized_in, l)
+                        skin_loading: loading_frame.filter(|_| {
+                            frame_presented.is_some_and(|p| p != Presented::Placeholder)
                         }),
                         timing,
                         statistics: screen.statistics(),
@@ -5761,7 +6924,7 @@ impl Run {
             // The committed bundle, from memory: never read again from its
             // files, never another skin in its place.
             let disabled = self.result_disabled.is_some();
-            let mut refused = None;
+            let (mut refused, mut decision_refused) = (None, None);
             let built = build(
                 &mut self.make,
                 &mut self.committed,
@@ -5769,17 +6932,23 @@ impl Run {
                 None,
                 disabled,
                 &mut refused,
+                &mut decision_refused,
             );
             // A restore refused stands for the run, whatever the build.
             if let Some(why) = refused {
                 self.disable_result(&why);
             }
+            if let Some(why) = &decision_refused {
+                self.disable_decision(why.clone());
+            }
             let screen = built?;
             self.built(screen.as_ref());
             self.screen = Some(screen);
+            self.image.changed();
             self.result_rebuilt();
             // The new screen takes the window's size afresh.
             self.applied = None;
+            self.decision_rebuilt(decision_refused)?;
         }
         self.shared.failed.store(false, Ordering::Release);
         Ok(())
@@ -5795,6 +6964,7 @@ impl Run {
     fn begin_attempt(
         &mut self,
         request: u64,
+        lifetime: Option<u64>,
         attempt: Box<AttemptContext>,
         skin: AttemptSkin,
         reply: mpsc::SyncSender<Result<Answered, RenderError>>,
@@ -5827,6 +6997,7 @@ impl Run {
         let offer = self.carries.offer(attempt.carry_key(), &installed);
         let p = Preparing {
             request,
+            lifetime,
             attempt,
             skin,
             offer,
@@ -5898,6 +7069,8 @@ impl Run {
                     device: screen.device(),
                     kind: ScreenKind::Play,
                 },
+                lifetime: p.lifetime,
+                loadend: p.skin.as_ref().and_then(|b| b.skin().loadend()),
                 screen: game::ScreenKey {
                     device: screen.device(),
                     target: screen.target(),
@@ -6190,16 +7363,9 @@ impl Run {
     /// attempt draws with, staged or in use, declares.
     fn commit(&mut self, request: u64) -> Result<Declared, CommitError> {
         // The loading lifetime current, if one is begun: a pending skin's
-        // specialization committed now draws its loading frames. Read
+        // specialization committed in it declares its loading time. Read
         // before the commits' lock, which no loading lock nests in.
-        let lifetime = {
-            let producer = self.shared.producer();
-            let current = self.shared.loading_slot().lifetime;
-            producer
-                .as_ref()
-                .filter(|s| s.lifetime() == current)
-                .map(LifetimeState::lifetime)
-        };
+        let current = self.shared.current_lifetime();
         // Held through the installation: a withdrawal waits for it, or it
         // sees the withdrawal and installs nothing.
         let shared = Arc::clone(&self.shared);
@@ -6231,7 +7397,7 @@ impl Run {
             return Err(CommitError::Device);
         };
         if let Err(e) = screen.commit(p.token) {
-            screen.discard();
+            screen.discard_token(p.token);
             return Err(e);
         }
         // Its key is the committed layer's now, the generation's whatever
@@ -6251,13 +7417,17 @@ impl Run {
             // loading frames of the lifetime it was committed in.
             self.committed
                 .pend(ScreenKind::Play, screen.installation(ScreenKind::Play));
-            self.specialized_in = lifetime;
-            if lifetime.is_some() {
-                declared = Some(
+            // The lifetime its request was published in, which its frames
+            // drew: a request of an earlier lifetime committed in a later
+            // one is neither drawn nor declared for that one.
+            self.specialized_in = p.lifetime;
+            if let Some(lifetime) = p.lifetime.filter(|&l| Some(l) == current) {
+                declared = Some((
+                    lifetime,
                     self.committed
                         .get(ScreenKind::Play)
                         .and_then(|i| i.bundle().skin().loadend()),
-                );
+                ));
             }
         } else if p.declarative {
             self.committed
@@ -6315,8 +7485,8 @@ impl Run {
         // Before the answer, outside the commits' lock: the opener reads
         // the minimum again once the commit is answered (or, past the
         // bound, once it read the receipt, which carries it too).
-        if let Some(loadend) = declared {
-            self.shared.committed_loading(loadend);
+        if let Some((lifetime, loadend)) = declared {
+            self.shared.committed_loading(lifetime, loadend);
         }
         Ok(drawn)
     }
@@ -6390,7 +7560,11 @@ impl Run {
                 let shared = Arc::clone(&self.shared);
                 let mut commits = shared.commits();
                 if commits.withdrawn >= request {
-                    screen.discard();
+                    screen.discard_token(PreparedToken {
+                        request,
+                        device: screen.device(),
+                        kind,
+                    });
                     return Ok(Preparation::Cancelled);
                 }
                 let token = PreparedToken {
@@ -6399,7 +7573,11 @@ impl Run {
                     kind,
                 };
                 if let Err(e) = screen.commit(token) {
-                    screen.discard();
+                    screen.discard_token(PreparedToken {
+                        request,
+                        device: screen.device(),
+                        kind,
+                    });
                     return Ok(refusal(e.to_string()));
                 }
                 commits.committed = commits.committed.max(request);
@@ -6418,10 +7596,17 @@ impl Run {
                 if kind == ScreenKind::Result {
                     let _ = screen.drain_retired();
                 }
+                if kind == ScreenKind::Decision {
+                    self.ensure_decision();
+                }
                 Ok(Preparation::Ready)
             }
             Ok(refused) => {
-                screen.discard();
+                screen.discard_token(PreparedToken {
+                    request,
+                    device: screen.device(),
+                    kind,
+                });
                 Ok(refused)
             }
             Err(e) => {
@@ -6440,7 +7625,7 @@ impl Run {
         if let Some(p) = self.attempt.take() {
             let _ = p.reply.send(Ok(self.answered(refusal(why))));
             if let Some(screen) = &mut self.screen {
-                screen.discard();
+                screen.discard_token(attempt_token(p.request, screen.device()));
             }
         }
         self.drop_prepared();
@@ -6456,11 +7641,14 @@ impl Run {
     /// skin selected for later attempts, and no specialization drawn by
     /// any loading lifetime yet. A withdrawal changes nothing.
     fn pend(&mut self, request: u64, kind: ScreenKind) -> Result<Preparation, RenderError> {
-        if !self.newest(request) {
-            return Ok(refusal("a newer request superseded it"));
-        }
+        // Refused before it is the newest: a request that changes nothing
+        // supersedes nothing, so no staging stays resident while no longer
+        // the newest request's.
         if kind != ScreenKind::Play {
             return Ok(refusal(format!("the {kind} skin cannot be pending")));
+        }
+        if !self.newest(request) {
+            return Ok(refusal("a newer request superseded it"));
         }
         self.supersede_attempts("a newer skin selection superseded it");
         if let Err(e) = self.recover() {
@@ -6504,6 +7692,9 @@ impl Run {
         screen.remove(kind);
         self.committed.clear(kind);
         self.scripts.retire_kind(kind);
+        if kind == ScreenKind::Decision {
+            self.decision_side = None;
+        }
         commits.committed = commits.committed.max(request);
         Ok(Preparation::Ready)
     }
@@ -6514,7 +7705,7 @@ impl Run {
         if self.attempt.as_ref().is_some_and(|p| p.request == request) {
             self.attempt = None;
             if let Some(screen) = &mut self.screen {
-                screen.discard();
+                screen.discard_token(attempt_token(request, screen.device()));
             }
         }
         if self
@@ -6528,10 +7719,10 @@ impl Run {
 
     /// Drops the preparation answered ready and not committed, if any.
     fn drop_prepared(&mut self) {
-        if self.prepared.take().is_some()
+        if let Some(p) = self.prepared.take()
             && let Some(screen) = &mut self.screen
         {
-            screen.discard();
+            screen.discard_token(p.token);
         }
     }
 
@@ -6540,7 +7731,7 @@ impl Run {
     fn prepare(&mut self) -> Result<(), RenderError> {
         let chart = self.chart.as_deref();
         let section = self.section.as_ref();
-        let mut refused = None;
+        let (mut refused, mut decision_refused) = (None, None);
         let ready = match (&mut self.screen, chart) {
             (Some(s), Some(chart)) => s.load(chart, section),
             (Some(_), None) => Ok(()),
@@ -6552,17 +7743,23 @@ impl Run {
                     section,
                     self.result_disabled.is_some(),
                     &mut refused,
+                    &mut decision_refused,
                 );
                 // A restore refused stands for the run, whatever the build.
                 if let Some(why) = refused.take() {
                     self.disable_result(&why);
                 }
-                built.map(|s| {
+                if let Some(why) = &decision_refused {
+                    self.disable_decision(why.clone());
+                }
+                built.and_then(|s| {
                     self.built(s.as_ref());
                     self.screen = Some(s);
+                    self.image.changed();
                     // The new screen takes the window's size afresh.
                     self.applied = None;
                     self.result_rebuilt();
+                    self.decision_rebuilt(decision_refused.take())
                 })
             }
         };
@@ -6570,9 +7767,325 @@ impl Run {
             self.shared.failed.store(false, Ordering::Release);
         } else {
             self.screen = None;
+            self.image.changed();
             self.granted = false;
         }
         ready
+    }
+}
+
+/// The decision screen on the render thread (design.md "Play Lifecycle",
+/// the decision screen): its labels prepared at frame boundaries for the
+/// chart under the cursor, its skin drawn from the slot the choice pinned,
+/// the built-in presentation taking over when the skin cannot draw for the
+/// active lifetime, and the kind disabled for the run on a refusal.
+impl Run {
+    /// Whether the decision screen shown draws its skin.
+    fn decision_skinned(&self) -> bool {
+        self.decision.is_some()
+            && self
+                .decision_shown
+                .as_ref()
+                .is_some_and(|s| s.slot.is_some())
+    }
+
+    /// A later mode drops the decision screen: its page, what it shows
+    /// and its skin's state. Its slot is retired once the game ends its
+    /// lifetime.
+    fn clear_decision(&mut self) {
+        self.decision = None;
+        self.decision_shown = None;
+        self.decision_screen = None;
+    }
+
+    /// The skinned decision screen begins: the skin's state made afresh,
+    /// on the installation kept for its pin even when the kind was refused
+    /// since (a retiring side refuses only later preparations and
+    /// choices); without the installation, the built-in presentation takes
+    /// over at once.
+    fn enter_skinned_decision(&mut self) {
+        match &self.decision_side {
+            Some(side) => {
+                self.decision_screen = Some(side.bundle().skin().prepare_decision());
+            }
+            None => {
+                let now = self.clock.now();
+                self.take_over(now, "the decision skin is not installed".to_owned());
+            }
+        }
+    }
+
+    /// Whether the decision labels have work for a later boundary.
+    fn decision_busy(&self) -> bool {
+        let target = self.screen.as_ref().map_or([0, 0], |s| s.target());
+        self.decision_side
+            .as_ref()
+            .is_some_and(|side| side.busy(target, self.decision_want.as_ref()))
+    }
+
+    /// The decision labels' work at a frame boundary
+    /// ([`crate::decision_side::DecisionSide::boundary`]): a refusal disables the kind, a
+    /// device or poll failure drops the screen. Whether the screen was
+    /// dropped.
+    fn decision_boundary(&mut self) -> bool {
+        let (Some(screen), Some(side)) = (self.screen.as_deref_mut(), self.decision_side.as_mut())
+        else {
+            return false;
+        };
+        let book = Arc::clone(&self.shared.labels);
+        match side.boundary(screen, self.decision_want.as_ref()) {
+            crate::decision_side::Boundary::Quiet => {}
+            crate::decision_side::Boundary::Refused(e) => {
+                self.disable_decision(format!("{}", Chain(&e)));
+            }
+            crate::decision_side::Boundary::Failed(e) => {
+                eprintln!("render: the decision labels' device failed: {}", Chain(&e));
+                self.drop_screen();
+                self.granted = false;
+                self.shared.failed.store(true, Ordering::Release);
+                return true;
+            }
+        }
+        // Refused while a lifetime was active: dropped once none is and
+        // the render left the skinned screen, which draws from its store
+        // until then.
+        if self.decision_side.as_ref().is_some_and(|s| s.retiring)
+            && render::lock(&book).active().is_none()
+            && !self.decision_skinned()
+        {
+            self.drop_decision_side();
+        }
+        false
+    }
+
+    /// The decision skin refused its frame at `at` on a healthy device:
+    /// the kind is disabled for the run, then the built-in presentation
+    /// takes over for the active lifetime. The notice is stored before the
+    /// takeover is published and the game thread woken, so a game thread
+    /// woken for a refusal's takeover finds its notice.
+    fn decision_frame_refused(&mut self, e: BuildError, at: TimeUs) {
+        let why = format!("the decision skin refused its frame: {}", Chain(&e));
+        self.disable_decision(why.clone());
+        self.take_over(at, why);
+    }
+
+    /// The decision skin of the screen shown cannot draw from `at`: its
+    /// page draws from now on, and a takeover for its lifetime waits for
+    /// the game thread, which is woken, only while that lifetime is the
+    /// active one; another lifetime's is dropped.
+    fn take_over(&mut self, at: TimeUs, why: String) {
+        let Some(shown) = self.decision_shown.as_mut() else {
+            return;
+        };
+        shown.slot = None;
+        self.decision_screen = None;
+        let lifetime = shown.lifetime;
+        {
+            // Published under the book's lock, which the game ends a
+            // lifetime under: never once it ended.
+            let book = render::lock(&self.shared.labels);
+            if book.active() != Some(lifetime) {
+                eprintln!("render: a takeover of an ended decision lifetime was dropped: {why}");
+                return;
+            }
+            #[cfg(test)]
+            self.shared.takeover_gate.pass();
+            eprintln!("render: the built-in decision presentation takes over: {why}");
+            *self
+                .shared
+                .decision_takeover
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(game::DecisionTakeover {
+                lifetime: game::DecisionLifetime(lifetime),
+                at,
+                why,
+            });
+            drop(book);
+        }
+        let wake = self
+            .shared
+            .game_wake
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        if let Some(wake) = wake {
+            #[cfg(test)]
+            self.shared.takeovers_woken.fetch_add(1, Ordering::AcqRel);
+            wake();
+        }
+    }
+
+    /// The decision kind is refused for the run, for `why`: the game
+    /// thread's notice says it, no request is posted and no slot pinned
+    /// from now on, and no screen built again restores it. The
+    /// installation and its slots go now, or while a lifetime is active or
+    /// the skin still draws, once neither holds (its end and the render
+    /// leaving the screen), so the pinned presentation keeps drawing.
+    fn disable_decision(&mut self, why: String) {
+        eprintln!("render: the decision skin is disabled for the run: {why}");
+        if self.decision_disabled.is_none() {
+            self.decision_disabled = Some(why.clone());
+            #[cfg(test)]
+            self.shared.notice_gate.pass();
+            *self
+                .shared
+                .decision_refused
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner) = Some(why);
+        }
+        self.committed.clear(ScreenKind::Decision);
+        let active = {
+            let mut book = render::lock(&self.shared.labels);
+            book.set_unhealthy();
+            book.active()
+        };
+        if let Some(side) = &mut self.decision_side {
+            side.retiring = true;
+            match self.screen.as_deref() {
+                Some(screen) => side.stop(&mut || screen.watch_completion()),
+                // No device: nothing written is in flight.
+                None => side.stop(&mut || Arc::new(AtomicBool::new(true))),
+            }
+        }
+        if active.is_none() && !self.decision_skinned() {
+            self.drop_decision_side();
+        }
+    }
+
+    /// The decision installation and its label preparation go.
+    fn drop_decision_side(&mut self) {
+        if let Some(side) = self.decision_side.take() {
+            self.decision_next = self.decision_next.max(side.next());
+        }
+        if let Some(screen) = &mut self.screen {
+            screen.remove(ScreenKind::Decision);
+        }
+    }
+
+    /// The committed decision installation's label preparation, made for
+    /// a newly committed one: the book's slots of an earlier one freed, its
+    /// rows asked at the target; a misfit disables the kind.
+    fn ensure_decision(&mut self) {
+        let Some(bundle) = self
+            .committed
+            .get(ScreenKind::Decision)
+            .map(|i| Arc::clone(i.bundle()))
+        else {
+            self.decision_side = None;
+            return;
+        };
+        if self.decision_disabled.is_some()
+            || self
+                .decision_side
+                .as_ref()
+                .is_some_and(|s| s.is_for(&bundle))
+        {
+            return;
+        }
+        let Some(screen) = self.screen.as_deref() else {
+            return;
+        };
+        if let Some(old) = self.decision_side.take() {
+            self.decision_next = self.decision_next.max(old.next());
+        }
+        render::lock(&self.shared.labels).reset();
+        match crate::decision_side::DecisionSide::new(
+            &bundle,
+            &self.shared.labels,
+            self.decision_next,
+            screen,
+        ) {
+            Ok(mut side) => {
+                side.prepared = Arc::clone(&self.shared.prepared);
+                self.decision_side = Some(side);
+            }
+            Err(why) => self.disable_decision(why),
+        }
+    }
+
+    /// The screen was built again (a recovery or a chart load's retry),
+    /// its kinds restored, a refused decision restore saying why in
+    /// `refused` (its refusal of the kind already stood, recorded before
+    /// the build's result was known): the label slots reset, the pinned
+    /// slot's content rebuilt at the new target under its generation and
+    /// the skin drawing on; a refused restore, a refusal of the labels'
+    /// rebuild on the healthy device, or no decision installation left to
+    /// restore while the skin draws, is a takeover; a device or poll
+    /// failure drops the screen again.
+    ///
+    /// # Errors
+    ///
+    /// The device's failure while the pinned labels were rebuilt.
+    fn decision_rebuilt(&mut self, refused: Option<String>) -> Result<(), RenderError> {
+        // Target identity: the screen built again takes the window's live
+        // size before anything is restored, so the book's target, the rows
+        // and the restored pin's key all name the target its lines are
+        // rasterized at (the factory makes the screen at its first size).
+        if let (Some(screen), Some(size)) = (
+            self.screen.as_deref_mut(),
+            self.extent.as_ref().and_then(|e| e.latest()),
+        ) {
+            screen.resize(size.0, size.1);
+            self.applied = Some(size);
+            self.image.changed();
+        }
+        let now = self.clock.now();
+        if let Some(why) = refused
+            && self.decision_skinned()
+        {
+            self.take_over(now, why);
+        }
+        let installed = self.committed.get(ScreenKind::Decision).is_some();
+        let (Some(side), Some(screen), true) = (
+            self.decision_side.as_mut(),
+            self.screen.as_deref_mut(),
+            installed,
+        ) else {
+            // Nothing to restore the skin from: what drew it takes over.
+            {
+                let mut book = render::lock(&self.shared.labels);
+                book.reset();
+                book.set_unhealthy();
+            }
+            if self.decision_skinned() {
+                self.take_over(now, "no decision skin was left to restore".to_owned());
+            }
+            if let Some(side) = self.decision_side.take() {
+                self.decision_next = self.decision_next.max(side.next());
+            }
+            return Ok(());
+        };
+        match side.rebuilt(screen) {
+            crate::decision_side::Rebuilt::Restored => Ok(()),
+            crate::decision_side::Rebuilt::Refused(e) => {
+                let why = format!(
+                    "the decision labels were not restored on the screen built again: {}",
+                    Chain(&e)
+                );
+                // The notice first, then the takeover and its wake.
+                let skinned = self.decision_skinned();
+                self.disable_decision(why.clone());
+                if skinned {
+                    self.take_over(now, why);
+                }
+                Ok(())
+            }
+            crate::decision_side::Rebuilt::Failed(e) => {
+                self.screen = None;
+                self.image.changed();
+                self.granted = false;
+                Err(e)
+            }
+        }
+    }
+
+    /// The cursor's chart from the selection update held, asked of the
+    /// decision labels' preparation.
+    fn want_decision_labels(&mut self) {
+        if let Some(shown) = &self.selection {
+            crate::decision_side::update_want(&mut self.decision_want, &shown.update.view);
+        }
     }
 }
 
@@ -6659,6 +8172,12 @@ struct ResultSide {
     incoming: Option<Box<ResultPresentation>>,
     prepared: Option<PreparedView>,
     presented: Option<HeldView>,
+    /// The lifetime's origin, its `screen` timer's start (design.md
+    /// "Rendering and Skins", Timers): the sampled instant of the frame
+    /// whose commit point first held a view presented, a built-in one
+    /// included; kept through frames not presented, every view after it
+    /// and a screen built again.
+    origin: Option<TimeUs>,
     /// The newest overlay not yet merged, with its revision.
     overlay: Option<(u64, Overlay)>,
     /// What the commit point replaced or discarded, dropped after the
@@ -6674,8 +8193,9 @@ struct ResultSide {
     stop: Option<ScriptStop>,
     /// The stop came this frame: the strip is prepared again after it.
     restrip: bool,
-    /// A staging the commit point discarded, dropped after the frame.
-    discard: bool,
+    /// A staging the commit point discarded, dropped after the frame: its
+    /// token, so no other staging goes with it.
+    discard: Option<PreparedToken>,
     /// A commit happened: what it replaced is drained after the frame.
     drain: bool,
     /// A commit happened: what the result kind keeps to restore is
@@ -6699,13 +8219,14 @@ impl ResultSide {
             incoming: None,
             prepared: None,
             presented: None,
+            origin: None,
             overlay: None,
             dropped: [None, None],
             overflow: None,
             notes: ScriptNotes::default(),
             stop: None,
             restrip: false,
-            discard: false,
+            discard: None,
             drain: false,
             reconcile: false,
             reapply: false,
@@ -6803,6 +8324,22 @@ impl Run {
         }
     }
 
+    /// The result side, while its lifetime is current: what a message
+    /// asks before it enters [`Mode::Result`]. One whose lifetime ended
+    /// (left, or another begun) before a frame of it checked is dropped
+    /// here, so the mode the message chooses otherwise stands, not a
+    /// result frame that would only find it gone and draw nothing.
+    fn current_result(&mut self) -> Option<&ResultSide> {
+        if self
+            .result
+            .as_ref()
+            .is_some_and(|r| !self.shared.result_slot().current(r.lifetime))
+        {
+            self.drop_result();
+        }
+        self.result.as_ref()
+    }
+
     /// The render loop ended (dev-tools): the select and result screens'
     /// whole frames still held are reported, and the run's present log is
     /// handed to `tapestry measure select`.
@@ -6824,10 +8361,10 @@ impl Run {
             self.frames_view = None;
         }
         if let Some(side) = self.result.take()
-            && side.prepared.as_ref().is_some_and(|p| p.token.is_some())
+            && let Some(token) = side.prepared.and_then(|p| p.token)
             && let Some(screen) = &mut self.screen
         {
-            screen.discard();
+            screen.discard_token(token);
         }
     }
 
@@ -6904,6 +8441,7 @@ impl Run {
     fn drop_screen(&mut self) {
         self.reconcile_result();
         self.screen = None;
+        self.image.changed();
         // The attempt is abandoned: its preparation before a wait is no
         // recovered frame's (dev-tools: the whole frames).
         #[cfg(feature = "dev-tools")]
@@ -6974,6 +8512,18 @@ impl Run {
             self.drop_result();
             return;
         }
+        // A view newer than every request becomes the newest, and its
+        // staging takes the screen's one slot: the play attempt preparing
+        // or answered is superseded first, so no staging stays answered
+        // once another request is the newest.
+        if self
+            .result
+            .as_ref()
+            .and_then(|r| r.incoming.as_ref())
+            .is_some_and(|p| p.request > self.requested)
+        {
+            self.supersede_attempts("a result view superseded it");
+        }
         let disabled = self.result_disabled.is_some();
         let Some(side) = &mut self.result else {
             return;
@@ -7022,14 +8572,14 @@ impl Run {
             if presented && side.prepared.as_ref().is_some_and(|v| !same(&v.held)) {
                 // The newest is the view presented again: the other one
                 // prepared goes, so it is not committed after it.
-                if side.prepared.take().is_some_and(|v| v.token.is_some()) {
-                    screen.discard();
+                if let Some(token) = side.prepared.take().and_then(|v| v.token) {
+                    screen.discard_token(token);
                 }
             }
             if !known {
                 // A new view payload: the one prepared before goes.
-                if side.prepared.take().is_some_and(|v| v.token.is_some()) {
-                    screen.discard();
+                if let Some(token) = side.prepared.take().and_then(|v| v.token) {
+                    screen.discard_token(token);
                 }
                 let request = p.request;
                 let restaged = std::mem::take(&mut side.restaged);
@@ -7062,7 +8612,11 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     let installed = match installed {
                         Ok(Preparation::Ready) if crate::dev::refuse_result_staging() => {
-                            screen.discard();
+                            screen.discard_token(PreparedToken {
+                                request,
+                                device: screen.device(),
+                                kind: ScreenKind::Result,
+                            });
                             Ok(refusal("dev: the view's staging was refused"))
                         }
                         other => other,
@@ -7152,8 +8706,8 @@ impl Run {
                         ));
                     }
                     side.prepared = Some(PreparedView { held, token });
-                } else if token.is_some() {
-                    screen.discard();
+                } else if let Some(token) = token {
+                    screen.discard_token(token);
                 }
             }
             side.overlay = Some((p.revision, p.overlay));
@@ -7222,14 +8776,18 @@ impl Run {
     /// one hold of the result runtimes' lock with its generation checked
     /// live first ([`Scripts::commit_view`]), and becomes the one
     /// presented, the running runtime moving to it when it keeps the
-    /// presented generation; then the overlay merges. Nothing is
-    /// destroyed. Returns the fade-out's start. Allocates nothing.
+    /// presented generation; then the overlay merges. The first commit
+    /// point of the lifetime that leaves a view presented, built-in or
+    /// not, sets the lifetime's origin to `now`, the frame's sampled
+    /// instant, recorded with the view's timing. Nothing is destroyed.
+    /// Returns the fade-out's start. Allocates nothing.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn result_commit(
         screen: &mut dyn Screen,
         side: Option<&mut ResultSide>,
         shared: &Shared,
         scripts: &Scripts,
+        now: TimeUs,
     ) -> Option<TimeUs> {
         let side = side?;
         let fadeout;
@@ -7243,7 +8801,7 @@ impl Run {
             }
             if b.fadeout.is_some() {
                 if let Some(v) = side.prepared.take() {
-                    side.discard |= v.token.is_some();
+                    side.discard = v.token.or(side.discard);
                     side.drop_later(v.held);
                 }
                 if let (Some((revision, overlay)), Some(h)) =
@@ -7279,13 +8837,13 @@ impl Run {
                         // Its generation was evicted: it never commits,
                         // its staging discarded after the frame.
                         ViewCommit::Gone => {
-                            side.discard |= v.token.is_some();
+                            side.discard = v.token.or(side.discard);
                             side.drop_later(v.held);
                         }
                         // Its commit refused: its staging, still pending,
                         // is discarded after the frame, as an evicted one.
                         ViewCommit::Refused => {
-                            side.discard |= v.token.is_some();
+                            side.discard = v.token.or(side.discard);
                             side.drop_later(v.held);
                         }
                     }
@@ -7312,7 +8870,11 @@ impl Run {
                     screen.use_result_strip(STRIP_PRESENTED);
                 }
             }
+            if side.origin.is_none() && side.presented.is_some() {
+                side.origin = Some(now);
+            }
             b.presented = side.presented.as_ref().map(|h| h.payload.key);
+            b.origin = side.origin;
             b.timing = side
                 .presented
                 .as_ref()
@@ -7330,7 +8892,12 @@ impl Run {
     /// commit point and its build, outside both counted spans
     /// ([`crate::screens::result_visit`]); a stop's notice is latched for
     /// the lifetime and its strip prepared again after the frame.
-    fn result_visit(side: Option<&mut ResultSide>, now: TimeUs, fadeout: Option<TimeUs>) {
+    fn result_visit(
+        side: Option<&mut ResultSide>,
+        now: TimeUs,
+        fadeout: Option<TimeUs>,
+        app: &skin_model::AppReadouts,
+    ) {
         let Some(side) = side else {
             return;
         };
@@ -7341,7 +8908,7 @@ impl Run {
             return;
         };
         let timers = skin_model::ResultTimers {
-            screen: Some(h.overlay.screen),
+            screen: side.origin,
             fadeout,
         };
         if let Ok(Some(stop)) = crate::screens::result_visit(
@@ -7351,6 +8918,7 @@ impl Run {
             state,
             now,
             &timers,
+            app,
         ) && side.stop.is_none()
         {
             side.stop = Some(stop);
@@ -7366,8 +8934,13 @@ impl Run {
         side: Option<&mut ResultSide>,
         now: TimeUs,
         fadeout: Option<TimeUs>,
+        app: &skin_model::AppReadouts,
     ) -> ResultDrawn {
-        let Some(h) = side.and_then(|s| s.presented.as_mut()) else {
+        let Some(side) = side else {
+            return ResultDrawn::BuiltIn;
+        };
+        let origin = side.origin;
+        let Some(h) = side.presented.as_mut() else {
             return ResultDrawn::BuiltIn;
         };
         if let Some(state) = h.state.as_mut().filter(|_| h.payload.skin.is_some()) {
@@ -7376,9 +8949,10 @@ impl Run {
                 target: screen.target(),
                 layout: &skin_model::Layout::AUTHOR,
                 timers: skin_model::ResultTimers {
-                    screen: Some(h.overlay.screen),
+                    screen: origin,
                     fadeout,
                 },
+                app: *app,
             };
             // The frame's preparation ends here (dev-tools: the S7-07d
             // gate's whole frames).
@@ -7435,8 +9009,8 @@ impl Run {
             }
         }
         if let Some(screen) = &mut self.screen {
-            if std::mem::take(&mut side.discard) {
-                screen.discard();
+            if let Some(token) = side.discard.take() {
+                screen.discard_token(token);
             }
             if std::mem::take(&mut side.drain) {
                 let _ = screen.drain_retired();
@@ -7590,7 +9164,11 @@ impl Run {
                 let shared = Arc::clone(&self.shared);
                 let mut commits = shared.commits();
                 if commits.withdrawn >= request {
-                    screen.discard();
+                    screen.discard_token(PreparedToken {
+                        request,
+                        device: screen.device(),
+                        kind,
+                    });
                     return Ok(Preparation::Cancelled);
                 }
                 let token = PreparedToken {
@@ -7599,7 +9177,11 @@ impl Run {
                     kind,
                 };
                 if let Err(e) = screen.commit(token) {
-                    screen.discard();
+                    screen.discard_token(PreparedToken {
+                        request,
+                        device: screen.device(),
+                        kind,
+                    });
                     return Ok(refusal(e.to_string()));
                 }
                 let _ = screen.drain_retired();
@@ -7608,7 +9190,11 @@ impl Run {
                 Ok(Preparation::Ready)
             }
             Ok(refused) => {
-                screen.discard();
+                screen.discard_token(PreparedToken {
+                    request,
+                    device: screen.device(),
+                    kind,
+                });
                 Ok(refused)
             }
             Err(e) => {
@@ -9188,7 +10774,11 @@ pub(crate) mod tests {
     /// A render thread on the screens `make` builds, with no chart, no
     /// section and no frame sink.
     pub(crate) fn spawn_empty(make: MakeScreen) -> super::RenderLink {
-        let clock = QpcClock::start();
+        spawn_empty_on(make, QpcClock::start())
+    }
+
+    /// [`spawn_empty`] on `clock`, a game rig's.
+    pub(crate) fn spawn_empty_on(make: MakeScreen, clock: QpcClock) -> super::RenderLink {
         spawn(
             make,
             None,
@@ -9854,6 +11444,57 @@ pub(crate) mod tests {
         link.exit();
     }
 
+    /// The draw rule and the drawn skin's declaration allocate nothing: a
+    /// staged, a shorter successor's and a placeholder frame's
+    /// acknowledgements and a commit's declaration, lifetime after
+    /// lifetime.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_drawn_skin_s_declaration_alloc() {
+        use super::{Candidate, Committed, Presented, presentation_of};
+        let shared = super::Shared::new();
+        let clock = QpcClock::start();
+        // Made before counting: an ordinary play skin, and a pending one
+        // with a specialization committed in lifetime 2 and a staging of
+        // request 5 answered for lifetime 3.
+        let ordinary = Committed::default();
+        let mut pending = Committed::default();
+        pending.pend(ScreenKind::Play, Some(render::Installation::new(bundle())));
+        let token = render::PreparedToken {
+            request: 5,
+            device: 1,
+            kind: ScreenKind::Play,
+        };
+        let staged = Candidate {
+            token,
+            lifetime: Some(3),
+            declarative: true,
+            loadend: Some(TimeUs(2_700_000)),
+        };
+        shared.presented_loading(1, Some(Some(TimeUs(2_700_000))), || clock.now());
+        let before = crate::alloc_count::this_thread();
+        for lifetime in 2..10 {
+            let drawn = presentation_of(&ordinary, None, None, 0, (None, 1), lifetime);
+            assert_eq!(drawn, Presented::Ordinary);
+            let at = |l| presentation_of(&pending, Some(2), Some(staged), 5, (Some(token), 1), l);
+            assert_eq!(
+                at(3),
+                Presented::Staged {
+                    token,
+                    loadend: Some(TimeUs(2_700_000))
+                }
+            );
+            assert_eq!(at(2), Presented::Committed);
+            assert_eq!(at(4), Presented::Placeholder);
+            shared.presented_loading(lifetime, Some(Some(TimeUs(2_700_000))), || clock.now());
+            shared.presented_loading(lifetime, Some(Some(TimeUs(600_000))), || clock.now());
+            shared.presented_loading(lifetime, None, || clock.now());
+            shared.committed_loading(lifetime, Some(TimeUs(1_500_000)));
+            assert_eq!(shared.loading_ack().loadend, Some(TimeUs(1_500_000)));
+        }
+        assert_eq!(crate::alloc_count::this_thread() - before, 0);
+    }
+
     /// The render thread's acknowledgement of a presented loading frame,
     /// the first of a lifetime and a later one, allocates nothing, nor
     /// does the game thread's read of it.
@@ -9865,8 +11506,8 @@ pub(crate) mod tests {
         shared.presented_loading(1, None, || clock.now());
         let before = crate::alloc_count::this_thread();
         for lifetime in 2..10 {
-            shared.presented_loading(lifetime, Some(TimeUs(1_500_000)), || clock.now());
-            shared.presented_loading(lifetime, Some(TimeUs(1_500_000)), || clock.now());
+            shared.presented_loading(lifetime, Some(Some(TimeUs(1_500_000))), || clock.now());
+            shared.presented_loading(lifetime, None, || clock.now());
             let read = shared.loading_ack();
             assert_eq!(read.first.map(|(l, _)| l), Some(lifetime));
             assert_eq!(read.loadend, Some(TimeUs(1_500_000)));
@@ -12421,6 +14062,9 @@ pub(crate) mod tests {
         /// them.
         staged_play: Option<FakePlay>,
         held_play: Option<FakePlay>,
+        /// The token of the play staging a specialization made, neither
+        /// committed nor discarded.
+        staged_token: Option<render::PreparedToken>,
     }
 
     /// An attempt's `Play` as the carry sees it: its slots and whether its
@@ -12535,6 +14179,11 @@ pub(crate) mod tests {
                     render::Installation::new(Arc::clone(skin)),
                 ));
                 *self.shared.staging.lock().unwrap() = Some(Arc::clone(skin));
+                self.staged_token = Some(render::PreparedToken {
+                    request,
+                    device: self.device,
+                    kind: ScreenKind::Play,
+                });
             }
             // A screen may stage and answer later.
             if hold {
@@ -12555,6 +14204,7 @@ pub(crate) mod tests {
                 self.shared.commit_held.store(true, Ordering::Release);
                 std::thread::sleep(Duration::from_millis(1));
             }
+            self.staged_token = None;
             if let Some((kind, staged)) = self.staged.take() {
                 if kind == ScreenKind::Play {
                     *self.shared.play.lock().unwrap() = Some(Arc::clone(staged.bundle()));
@@ -12593,6 +14243,7 @@ pub(crate) mod tests {
             self.note("discard");
             self.staged = None;
             self.staged_play = None;
+            self.staged_token = None;
             *self.shared.staging.lock().unwrap() = None;
         }
         fn install(
@@ -12725,6 +14376,7 @@ pub(crate) mod tests {
             }
             // The skin's frame at `now`, built by the model alone, when the
             // skin is a selection skin.
+            let mut skinned = false;
             if let Some(logic) = logic.filter(|_| state.is_some()) {
                 let skin = Arc::clone(logic.bundle.skin());
                 if skin
@@ -12741,11 +14393,13 @@ pub(crate) mod tests {
                         layout: &skin_model::Layout::AUTHOR,
                         timers: update.events.timers(),
                         app,
+                        pointer: logic.pointer,
                     };
                     if skin
                         .build_selection(&mut logic.sel, &frame, logic.bundle.uvs(), &mut batch)
                         .is_ok()
                     {
+                        skinned = true;
                         let rects = batch.quads().iter().map(|q| q.rect).collect();
                         self.shared.built.lock().unwrap().push((seen, now, rects));
                     }
@@ -12755,6 +14409,7 @@ pub(crate) mod tests {
                 .then(|| "refused for the test".to_owned());
             Ok(crate::selection_skin::SelectionDrawn {
                 timing: timing(true),
+                skinned: skinned && refused.is_none(),
                 refused,
             })
         }
@@ -12787,7 +14442,7 @@ pub(crate) mod tests {
                 .first()
                 .map_or_else(String::new, |l| l.text.clone());
             self.shared.menu_frames.lock().unwrap().push(first);
-            Ok(timing(true))
+            Ok(timing(!self.shared.unpresented.load(Ordering::Acquire)))
         }
         fn loading(
             &mut self,
@@ -12813,7 +14468,25 @@ pub(crate) mod tests {
             if self.shared.refuse_loading.load(Ordering::Acquire) {
                 return Ok(Err(skin_model::BuildError::InvalidReadouts));
             }
-            Ok(Ok(timing(true)))
+            Ok(Ok(timing(!self.shared.unpresented.load(Ordering::Acquire))))
+        }
+        fn loading_staged(
+            &mut self,
+            page: &crate::menu_screen::MenuPage,
+            update: Option<&LoadingUpdate>,
+            changed: bool,
+            frame: &render::LoadingFrame<'_>,
+            token: render::PreparedToken,
+        ) -> Result<Result<FrameTiming, skin_model::BuildError>, RenderError> {
+            self.shared
+                .staged_frames
+                .lock()
+                .unwrap()
+                .push((frame.lifetime, token.request));
+            self.loading(page, update, changed, frame)
+        }
+        fn staged_token(&self) -> Option<render::PreparedToken> {
+            self.staged_token
         }
         fn pending_loading(
             &mut self,
@@ -12824,7 +14497,10 @@ pub(crate) mod tests {
                 return Err(RenderError::SurfaceLost);
             }
             self.shared.pending.fetch_add(1, Ordering::AcqRel);
-            Ok(timing(true))
+            Ok(timing(!self.shared.unpresented.load(Ordering::Acquire)))
+        }
+        fn device_lost(&self) -> bool {
+            self.shared.lost.load(Ordering::Acquire)
         }
         #[cfg(feature = "dev-tools")]
         fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
@@ -12839,6 +14515,11 @@ pub(crate) mod tests {
         /// The screens built so far.
         pub(crate) builds: Arc<AtomicU32>,
         hold: Arc<AtomicBool>,
+        /// Menu and loading frames return not presented while set, as on
+        /// an outdated swap chain.
+        unpresented: Arc<AtomicBool>,
+        /// The device reports itself lost while set.
+        lost: Arc<AtomicBool>,
         /// Every frame and installation fails as a lost device while set.
         pub(crate) fail: Arc<AtomicBool>,
         /// Loading frames drawn, refused ones included.
@@ -12862,7 +14543,7 @@ pub(crate) mod tests {
         /// with it.
         pub(crate) chart_loads: Arc<std::sync::Mutex<Vec<(usize, bool)>>>,
         /// Loading frames drawn as the pending presentation.
-        pending: Arc<AtomicU32>,
+        pub(crate) pending: Arc<AtomicU32>,
         stall: Arc<AtomicBool>,
         /// Set while a loading frame is held by `stall`.
         stalled: Arc<AtomicBool>,
@@ -12924,6 +14605,9 @@ pub(crate) mod tests {
         /// The skin an attempt's preparation staged and neither committed
         /// nor discarded, on the screen built last.
         staging: Arc<std::sync::Mutex<Option<Arc<render::SkinBundle>>>>,
+        /// Each loading frame drawn from a play staging: its lifetime and
+        /// the staging's request.
+        pub(crate) staged_frames: Arc<std::sync::Mutex<Vec<(u64, u64)>>>,
         /// The request whose preparation stages, then does not answer; 0
         /// for none.
         hold_staged: Arc<std::sync::atomic::AtomicU64>,
@@ -13027,6 +14711,7 @@ pub(crate) mod tests {
                     target: [1_920, 1_080],
                     staged_play: None,
                     held_play: None,
+                    staged_token: None,
                 }) as Box<dyn Screen>)
             });
             let clock = QpcClock::start();
@@ -13766,6 +15451,7 @@ pub(crate) mod tests {
             let (reply, rx) = std::sync::mpsc::sync_channel(1);
             link.send(RenderMsg::PrepareAttempt {
                 request,
+                lifetime: None,
                 attempt: Box::new(titled(&chart)),
                 skin: super::AttemptSkin::Specialized(Arc::clone(&held)),
                 reply,
@@ -13859,12 +15545,446 @@ pub(crate) mod tests {
         link.exit();
     }
 
+    /// A specialization staged for the loading lifetime draws its loading
+    /// frames from its answer, before any commit, and the pending
+    /// presentation stops; nothing is committed.
+    #[test]
+    fn a_staged_specialization_draws_before_its_commit() {
+        let (chart, screens, link) = pending_link();
+        let pending = || screens.pending.load(Ordering::Acquire);
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| pending() >= 3));
+        let (lifetime, _) = link.loading_ack().unwrap();
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        let staged = || screens.staged_frames.lock().unwrap().clone();
+        assert!(wait_until(|| staged().len() >= 3));
+        let from = pending();
+        assert!(wait_until(|| staged().len() >= 6));
+        assert!(pending() <= from + 1, "{from} {}", pending());
+        assert!(
+            staged().iter().all(|&(l, _)| l == lifetime),
+            "{:?}",
+            staged()
+        );
+        assert!(screens.play.lock().unwrap().is_none(), "nothing committed");
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A play skin that is not pending draws its loading frames as before,
+    /// whatever is staged: on a selected declarative skin and on the
+    /// built-in presentation, an attempt staged with a specialization
+    /// draws no staged frame and no pending presentation, and the
+    /// declaration stays the installed skin's.
+    #[test]
+    fn an_ordinary_skin_draws_its_loading_frames_as_before() {
+        for selected in [true, false] {
+            let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
+            let screens = Installers::default();
+            let link = screens.spawn_bare();
+            link.load(Arc::clone(&chart), None).unwrap();
+            if selected {
+                assert_eq!(
+                    link.select(
+                        ScreenKind::Play,
+                        Some(bundle_declaring(None, Some(TimeUs(2_000_000))))
+                    )
+                    .wait()
+                    .unwrap(),
+                    Preparation::Ready
+                );
+            }
+            link.loading().show(one_line("one"));
+            let frames = || screens.loading.load(Ordering::Acquire);
+            assert!(wait_until(|| frames() >= 2), "{selected}");
+            assert_eq!(
+                specialized(
+                    &link,
+                    &chart,
+                    &bundle_declaring(None, Some(TimeUs(600_000)))
+                )
+                .unwrap(),
+                Preparation::Ready
+            );
+            let from = frames();
+            assert!(wait_until(|| frames() >= from + 3), "{selected}");
+            assert!(
+                screens.staged_frames.lock().unwrap().is_empty(),
+                "{selected}"
+            );
+            assert_eq!(screens.pending.load(Ordering::Acquire), 0, "{selected}");
+            let installed = selected.then_some(TimeUs(2_000_000));
+            assert_eq!(link.loading_loadend(), installed, "{selected}");
+            link.end_loading().unwrap();
+            link.exit();
+        }
+    }
+
+    /// A staging comes before the specialization committed earlier in the
+    /// lifetime: R1 committed, then R2 staged draws R2's; R2 discarded,
+    /// the lifetime's frames draw R1's again (committed, not staged).
+    #[test]
+    fn a_staging_after_a_commit_in_the_lifetime_draws() {
+        let (chart, screens, link) = pending_link();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| screens.pending.load(Ordering::Acquire) >= 2));
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        link.commit_attempt().unwrap();
+        // R1's own staged frames, drawn before its commit, come first.
+        let from = screens.staged_frames.lock().unwrap().len();
+        let staged = || screens.staged_frames.lock().unwrap()[from..].to_vec();
+        let mut r2 = link.begin_attempt(titled(&chart), super::AttemptSkin::Specialized(bundle()));
+        let answer = loop {
+            if let Some(a) = r2.wait_until(None, || false) {
+                break a.unwrap();
+            }
+        };
+        assert_eq!(answer.preparation, Preparation::Ready);
+        assert!(wait_until(|| staged().len() >= 3));
+        let request = staged().last().unwrap().1;
+        drop(r2);
+        link.discard_attempt();
+        // Discarded: the committed one again, no staged frame more.
+        let skin = screens.loading.load(Ordering::Acquire);
+        assert!(wait_until(
+            || screens.loading.load(Ordering::Acquire) >= skin + 3
+        ));
+        let after = staged();
+        assert!(wait_until(
+            || screens.loading.load(Ordering::Acquire) >= skin + 6
+        ));
+        assert!(
+            staged().len() <= after.len() + 1,
+            "{after:?} {:?}",
+            staged()
+        );
+        assert!(staged().iter().all(|&(_, r)| r == request));
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A request belongs to the lifetime current when it is published:
+    /// published in lifetime 1 and taken by the render thread only after
+    /// lifetime 2 began, its staging never draws lifetime 2's frames, its
+    /// commit is lifetime 1's and declares nothing for lifetime 2, whose
+    /// minimum stays the floor; a request published in lifetime 2 draws.
+    #[test]
+    fn a_staging_draws_only_in_its_request_s_lifetime() {
+        let (chart, screens, link) = pending_link();
+        let pending = || screens.pending.load(Ordering::Acquire);
+        let staged = || screens.staged_frames.lock().unwrap().clone();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| pending() >= 2));
+        link.shared.hold_receipt.store(true, Ordering::Release);
+        let mut r1 = link.begin_attempt(
+            titled(&chart),
+            super::AttemptSkin::Specialized(bundle_declaring(None, Some(TimeUs(3_000_000)))),
+        );
+        link.clear_loading();
+        link.loading().show(one_line("two"));
+        link.shared.hold_receipt.store(false, Ordering::Release);
+        let answer = loop {
+            if let Some(a) = r1.wait_until(None, || false) {
+                break a.unwrap();
+            }
+        };
+        assert_eq!(answer.preparation, Preparation::Ready);
+        let p = pending();
+        assert!(wait_until(|| pending() >= p + 3));
+        assert!(staged().is_empty(), "{:?}", staged());
+        let (two, _) = link.loading_ack().unwrap();
+        link.commit_attempt().unwrap();
+        let p = pending();
+        assert!(
+            wait_until(|| pending() >= p + 3),
+            "lifetime 2 stays pending"
+        );
+        assert!(staged().is_empty(), "{:?}", staged());
+        assert_eq!(
+            link.loading_loadend(),
+            None,
+            "nothing declared for lifetime 2"
+        );
+        // Published in lifetime 2: drawn.
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| !staged().is_empty()));
+        assert!(staged().iter().all(|&(l, _)| l == two), "{:?}", staged());
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// The drawn skin's declaration governs the minimum, from the
+    /// lifetime's first frame: a staging declaring 2 700 ms, then a
+    /// successor declaring 600 ms drawn in the same lifetime, gives the
+    /// floor (the source's current skin); the successor discarded, the
+    /// pending presentation drawn changes nothing; 600 then 2 700 gives
+    /// 2 700 ms.
+    #[test]
+    fn the_drawn_skin_s_loadend_governs_the_minimum() {
+        let (chart, screens, link) = pending_link();
+        let staged = || screens.staged_frames.lock().unwrap().len();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| link.loading_acked() >= 2));
+        let (_, at) = link.loading_ack().unwrap();
+        let minimum = || game::minimum_ends(at, link.loading_loadend()).0 - at.0;
+        let stage = |ms: i64| {
+            let n = staged();
+            assert_eq!(
+                specialized(
+                    &link,
+                    &chart,
+                    &bundle_declaring(None, Some(TimeUs(ms * 1_000)))
+                )
+                .unwrap(),
+                Preparation::Ready
+            );
+            assert!(wait_until(|| staged() >= n + 2));
+        };
+        stage(2_700);
+        assert_eq!(minimum(), 2_700_000);
+        stage(600);
+        assert_eq!(minimum(), 1_000_000, "the shorter skin drawn");
+        stage(2_700);
+        assert_eq!(minimum(), 2_700_000);
+        link.discard_attempt();
+        let p = screens.pending.load(Ordering::Acquire);
+        assert!(wait_until(
+            || screens.pending.load(Ordering::Acquire) >= p + 3
+        ));
+        assert_eq!(minimum(), 2_700_000, "the placeholder changes nothing");
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A staging answered and committed before any loading frame drew it
+    /// (its lifetime held, drawing nothing) is declared by the commit, in
+    /// the lifetime its request was published in.
+    #[test]
+    fn a_commit_before_any_staged_frame_declares_at_the_commit() {
+        let (chart, screens, link) = pending_link();
+        link.begin_loading_held(&chosen("One"), None);
+        assert_eq!(
+            specialized(
+                &link,
+                &chart,
+                &bundle_declaring(None, Some(TimeUs(2_700_000)))
+            )
+            .unwrap(),
+            Preparation::Ready
+        );
+        assert_eq!(link.loading_loadend(), None, "no frame drew it");
+        link.commit_attempt().unwrap();
+        assert_eq!(link.loading_loadend(), Some(TimeUs(2_700_000)));
+        assert!(screens.staged_frames.lock().unwrap().is_empty());
+        link.reveal_loading();
+        assert!(wait_until(|| link.loading_acked() >= 2));
+        assert_eq!(link.loading_loadend(), Some(TimeUs(2_700_000)));
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// Each drop of a staging stops its drawing from the next frame: its
+    /// discard, a newer request (the staging superseded while the newer
+    /// one is unanswered) and a skin selection's `pend` each send the
+    /// lifetime's frames back to the pending presentation, never R's token
+    /// again; a late discard of an older request, unanswered, leaves the
+    /// newer staging drawn.
+    #[test]
+    fn each_drop_of_a_staging_stops_its_drawing() {
+        // A way to drop the staging, on the link, its screens and the chart.
+        type DropIt = Box<dyn Fn(&super::RenderLink, &Installers, &Chart)>;
+        let drops: [(&str, DropIt); 3] =
+            [
+                ("discard", Box::new(|link, _, _| link.discard_attempt())),
+                (
+                    "newer request",
+                    Box::new(|link, screens, chart| {
+                        let next = link.requests.load(Ordering::Relaxed) + 1;
+                        screens.hold_staged.store(next, Ordering::Release);
+                        std::mem::forget(link.begin_attempt(
+                            titled(chart),
+                            super::AttemptSkin::Specialized(bundle()),
+                        ));
+                    }),
+                ),
+                (
+                    "pend",
+                    Box::new(|link, _, _| {
+                        assert_eq!(
+                            link.pend(ScreenKind::Play).wait().unwrap(),
+                            Preparation::Ready
+                        );
+                    }),
+                ),
+            ];
+        for (name, drop_it) in drops {
+            let (chart, screens, link) = pending_link();
+            let staged = || screens.staged_frames.lock().unwrap().clone();
+            let pending = || screens.pending.load(Ordering::Acquire);
+            link.loading().show(one_line("one"));
+            assert!(wait_until(|| pending() >= 2), "{name}");
+            assert_eq!(
+                specialized(&link, &chart, &bundle()).unwrap(),
+                Preparation::Ready
+            );
+            assert!(wait_until(|| staged().len() >= 2), "{name}");
+            drop_it(&link, &screens, &chart);
+            let p = pending();
+            assert!(wait_until(|| pending() >= p + 3), "{name}");
+            let after = staged().len();
+            let p = pending();
+            assert!(wait_until(|| pending() >= p + 3), "{name}");
+            assert!(staged().len() <= after + 1, "{name}: {:?}", staged());
+            screens.hold_staged.store(0, Ordering::Release);
+            link.end_loading().unwrap();
+            link.exit();
+        }
+
+        // A late discard of an older, unanswered request leaves R2 drawn.
+        let (chart, screens, link) = pending_link();
+        let staged = || screens.staged_frames.lock().unwrap().clone();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| screens.pending.load(Ordering::Acquire) >= 2));
+        let r1 = link.requests.load(Ordering::Relaxed) + 1;
+        screens.hold_staged.store(r1, Ordering::Release);
+        let older = link.begin_attempt(titled(&chart), super::AttemptSkin::Specialized(bundle()));
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| staged().len() >= 2));
+        let r2 = staged().last().unwrap().1;
+        assert_ne!(r2, r1);
+        drop(older);
+        let n = staged().len();
+        assert!(wait_until(|| staged().len() >= n + 3), "R2 still drawn");
+        assert!(staged().iter().all(|&(_, r)| r == r2));
+        screens.hold_staged.store(0, Ordering::Release);
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A refused request changes nothing: `pend` of a kind that cannot be
+    /// pending, asked while a play staging is drawn, neither becomes the
+    /// newest request nor supersedes the staging, which stays resident
+    /// and goes on drawing.
+    #[test]
+    fn a_refused_pend_leaves_the_drawn_staging() {
+        let (chart, screens, link) = pending_link();
+        let staged = || screens.staged_frames.lock().unwrap().clone();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| screens.pending.load(Ordering::Acquire) >= 2));
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| staged().len() >= 2));
+        let request = staged().last().unwrap().1;
+        assert!(matches!(
+            link.pend(ScreenKind::Result).wait().unwrap(),
+            Preparation::Refused(_)
+        ));
+        let n = staged().len();
+        assert!(wait_until(|| staged().len() >= n + 3), "still drawn");
+        assert!(staged().iter().all(|&(_, r)| r == request));
+        assert!(screens.staging.lock().unwrap().is_some(), "still resident");
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A staging whose device is lost is never drawn on the screen built
+    /// again: the lifetime's frames draw the pending presentation until a
+    /// staging on the new device is answered, which draws.
+    #[test]
+    fn a_lost_device_never_draws_the_old_staging() {
+        let (chart, screens, link) = pending_link();
+        let staged = || screens.staged_frames.lock().unwrap().clone();
+        let pending = || screens.pending.load(Ordering::Acquire);
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| pending() >= 2));
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| staged().len() >= 2));
+        let old = staged().last().unwrap().1;
+        let builds = screens.builds.load(Ordering::Acquire);
+        screens.fail.store(true, Ordering::Release);
+        assert!(wait_until(|| link.failed()));
+        screens.fail.store(false, Ordering::Release);
+        // Built again, as the loading wait builds a lost screen.
+        link.prepare().unwrap();
+        assert!(screens.builds.load(Ordering::Acquire) > builds);
+        // The lifetime's page shown again on it.
+        link.loading().show(one_line("one"));
+        let p = pending();
+        assert!(
+            wait_until(|| pending() >= p + 3),
+            "the pending presentation"
+        );
+        let n = staged().len();
+        let p = pending();
+        assert!(wait_until(|| pending() >= p + 3));
+        assert!(staged().len() <= n, "{:?}", staged());
+        // Staged again on the new device: drawn.
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| staged().len() >= n + 2));
+        assert!(staged().last().unwrap().1 > old);
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A result skin selected while a play staging is drawn supersedes the
+    /// attempt first: the staging is released, the frames go back to the
+    /// pending presentation, and the attempt's commit finds nothing staged.
+    #[test]
+    fn a_result_selection_supersedes_a_drawn_staging() {
+        let (chart, screens, link) = pending_link();
+        let staged = || screens.staged_frames.lock().unwrap().len();
+        let pending = || screens.pending.load(Ordering::Acquire);
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| pending() >= 2));
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| staged() >= 2));
+        assert_eq!(
+            link.select(ScreenKind::Result, Some(bundle()))
+                .wait()
+                .unwrap(),
+            Preparation::Ready
+        );
+        assert!(screens.staging.lock().unwrap().is_none(), "released");
+        let p = pending();
+        assert!(wait_until(|| pending() >= p + 3));
+        let n = staged();
+        let p = pending();
+        assert!(wait_until(|| pending() >= p + 3));
+        assert!(staged() <= n + 1);
+        assert!(link.commit_attempt().is_err(), "nothing staged");
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
     /// L5: a pending play skin's base import stops at the fact it reads,
     /// inside the configured pass and before the skin's table exists, so
-    /// it declares no loading time: until a specialization commits in the
+    /// it declares no loading time: until a specialization is drawn in the
     /// lifetime the minimum is the floor, a second from the first frame;
-    /// a specialization declaring 3 000 ms then moves it to 3 s from that
-    /// same frame.
+    /// a specialization declaring 3 000 ms, from its first staged frame,
+    /// then moves it to 3 s from that same frame.
     #[test]
     fn a_pending_skin_uses_the_floor_until_its_specialization_commits() {
         let (chart, _screens, link) = pending_link();
@@ -13881,9 +16001,12 @@ pub(crate) mod tests {
             specialized(&link, &chart, &declared).unwrap(),
             Preparation::Ready
         );
-        assert_eq!(link.loading_loadend(), None, "staged, not committed");
+        // Staged: the first loading frame drawing it declares it, before
+        // the commit.
+        assert!(wait_until(
+            || link.loading_loadend() == Some(TimeUs(3_000_000))
+        ));
         link.commit_attempt().unwrap();
-        // Declared with the commit's answer, before a frame draws with it.
         assert_eq!(link.loading_loadend(), Some(TimeUs(3_000_000)));
         // A frame acknowledged after the commit's answer drew after it.
         let committed = link.loading_acked();
@@ -13905,13 +16028,14 @@ pub(crate) mod tests {
     #[test]
     fn a_timed_out_commit_declares_its_loading_time_from_the_receipt() {
         let (chart, _screens, mut link) = pending_link();
-        link.loading().show(one_line("one"));
-        assert!(wait_until(|| link.loading_acked() >= 2));
+        // Held: no loading frame draws the staging before the commit.
+        link.begin_loading_held(&chosen("One"), None);
         let declared = bundle_declaring(None, Some(TimeUs(3_000_000)));
         assert_eq!(
             specialized(&link, &chart, &declared).unwrap(),
             Preparation::Ready
         );
+        assert_eq!(link.loading_loadend(), None, "no frame drew it");
         /// Lets the render thread go when dropped, the test failing
         /// included.
         struct Hold(Arc<super::Shared>);
@@ -14248,7 +16372,9 @@ pub(crate) mod tests {
         };
         let settings = skin_model::SelectionSettings {
             display_offset_ms: 0,
-            master_volume: skin_model::MasterVolume::of_gain(0.0),
+            system_volume: skin_model::VolumeReading::of_gain(0.0),
+            key_volume: skin_model::VolumeReading::of_gain(0.0),
+            background_volume: skin_model::VolumeReading::of_gain(0.0),
             speed: skin_model::SpeedView::Classic,
             order: skin_model::SelectionOrder::Title,
             gauge: None,
@@ -14274,7 +16400,18 @@ pub(crate) mod tests {
             .model();
             assert_eq!((f.display_offset, f.fix_hispeed), (TimeUs(us), 3), "{us}");
             let tuning = crate::tuning::LiveTuning::new(game::Tuning {
-                volume_percent: 100,
+                system: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
+                key: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
+                background: game::Volume {
+                    percent: 100,
+                    intent: false,
+                },
                 display_offset_us: us,
                 input_offset_us: 0,
             });
@@ -14559,7 +16696,7 @@ pub(crate) mod tests {
                     .filter(|l| *l == "decision")
                     .count()
             };
-            link.show_decision(one_line("decision"));
+            link.show_decision(one_line("decision"), None);
             assert!(wait_until(|| decisions(0) > 0), "{next:?}: the page drawn");
             screens.fail.store(true, Ordering::Release);
             assert!(wait_until(|| link.failed()), "{next:?}");
@@ -15646,6 +17783,7 @@ pub(crate) mod tests {
         let (reply, rx) = std::sync::mpsc::sync_channel(1);
         link.send(RenderMsg::PrepareAttempt {
             request: 2,
+            lifetime: None,
             attempt: Box::new(titled(&chart)),
             skin: super::AttemptSkin::InUse,
             reply,
@@ -17668,6 +19806,10 @@ pub(crate) mod tests {
     mod screen_clock;
     // The chart images' tables: their generation, attempt and target.
     mod chart;
+    // The decision labels' preparation, the skinned decision screen, its
+    // takeover and the kind's refusal for the run.
+    #[cfg(feature = "dev-tools")]
+    mod decision;
     // The result screen's presentations through the slot, the commit
     // point and the barrier into the skin or the built-in page.
     #[cfg(feature = "dev-tools")]
@@ -17676,6 +19818,10 @@ pub(crate) mod tests {
     // staging and reapply, drawn from its first frame.
     #[cfg(feature = "dev-tools")]
     mod result_chart;
+    // The loading state's first frame held while it would be the pending
+    // presentation, and the validity of the image it holds.
+    #[cfg(feature = "dev-tools")]
+    mod first_frame;
 }
 
 /// Which screen each mode's frame is of (dev-tools).

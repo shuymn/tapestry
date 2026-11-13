@@ -129,6 +129,16 @@ pub fn best(bp_diff: ResultNumber) -> BestView {
         },
         bp_diff,
         clear: LampKey::Hard,
+        // A best max combo of 100, this view's 120, with a BP; hidden
+        // with it, as a best max combo of 0 is.
+        max_combo: match bp_diff {
+            ResultNumber::Shown(_) => ResultNumber::Shown(100),
+            ResultNumber::Hidden => ResultNumber::Hidden,
+        },
+        max_combo_diff: match bp_diff {
+            ResultNumber::Shown(_) => ResultNumber::Shown(20),
+            ResultNumber::Hidden => ResultNumber::Hidden,
+        },
         ex_updated: true,
         bp_updated: matches!(bp_diff, ResultNumber::Shown(d) if d < 0),
         rate: Some(BestRate {
@@ -205,6 +215,8 @@ pub fn other() -> ResultView {
             bp: ResultNumber::Hidden,
             bp_diff: ResultNumber::Hidden,
             clear: LampKey::NoPlay,
+            max_combo: ResultNumber::Hidden,
+            max_combo_diff: ResultNumber::Hidden,
             ex_updated: true,
             bp_updated: true,
             rate: None,
@@ -238,6 +250,8 @@ pub struct RFx {
     pub target: [u32; 2],
     pub layout: Layout,
     pub timers: ResultTimers,
+    /// The application's readouts each frame is built with.
+    pub app: skin_model::AppReadouts,
 }
 
 impl RFx {
@@ -255,6 +269,7 @@ impl RFx {
                 screen: Some(TimeUs(0)),
                 fadeout: None,
             },
+            app: skin_model::AppReadouts::LAUNCH,
         }
     }
 
@@ -272,6 +287,7 @@ impl RFx {
             target: self.target,
             layout: &self.layout,
             timers: self.timers,
+            app: self.app,
         };
         self.skin
             .build_result(&mut self.res, &frame, &self.uvs, &mut self.batch)

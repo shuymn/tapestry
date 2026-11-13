@@ -35,7 +35,10 @@ fn replanning_a_restore_allocates_nothing_and_matches_a_fresh_plan() {
     for _ in 0..3 {
         engine.step(&mut out, &mut cmds).unwrap();
     }
-    let restorer = Restorer::new(engine.seek_source(), chart.bgm.clone());
+    let restorer = Restorer::new(
+        engine.seek_source(),
+        chart.bgm.iter().map(|&e| e.into()).collect(),
+    );
     let line = |origin: i64| engine.frame_line_at(TimeUs(origin * MS));
     let mut restore = restorer.plan(line(100), TimeUs(8_000 * MS)).unwrap();
 

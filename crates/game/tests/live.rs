@@ -141,7 +141,7 @@ struct Fake {
     /// screen: each waits for the next play.
     offset_changes: Vec<(i64, i64)>,
     pending_offset: Option<i64>,
-    /// Master volumes the player sets at these clock times, each taken by
+    /// Key volumes the player sets at these clock times, each taken by
     /// the next play's starting settings.
     volume_changes: Vec<(i64, f32)>,
     /// Every step's measurement, by play.
@@ -283,6 +283,9 @@ struct Fake {
     /// clock (a fallback), then none.
     timing: Option<game::ResultTiming>,
     timing_until: i64,
+    /// The result's origin the rig gives, this long after the last show
+    /// ([`Rig::result_origin`]); `None` gives none.
+    origin_delay: Option<i64>,
     /// The result's outro steps in order, with their clock times: `outro`
     /// ([`Rig::begin_outro`], with its start) and `accept`
     /// ([`Rig::accept_leaving`]).
@@ -484,6 +487,7 @@ impl Fake {
             compared: 0,
             timing: None,
             timing_until: i64::MAX,
+            origin_delay: None,
             result_order: Vec::new(),
             served: Vec::new(),
             turntable: Vec::new(),
@@ -597,6 +601,11 @@ impl Rig for Fake {
     fn result_timing(&self) -> Option<game::ResultTiming> {
         self.timing
             .filter(|_| self.clock.now().0 < self.timing_until)
+    }
+
+    fn result_origin(&self) -> Option<TimeUs> {
+        let shown = *self.shown_at.last()?;
+        self.origin_delay.map(|d| TimeUs(shown + d))
     }
 
     fn begin_outro(&mut self, at: TimeUs, gate: Option<TimeUs>) -> game::Outro {
@@ -1004,7 +1013,7 @@ impl Rig for Fake {
         }
         let now = self.clock.now().0;
         while let Some(i) = self.volume_changes.iter().position(|&(at, _)| at <= now) {
-            settings.device.master_volume = self.volume_changes.remove(i).1;
+            settings.device.key_volume = self.volume_changes.remove(i).1;
         }
     }
 }
@@ -3916,7 +3925,7 @@ fn a_volume_or_offset_change_keeps_the_key() {
     game::live::run_chart(&mut loaded, &mut rig).unwrap();
     // Both reached the retry's settings.
     assert_eq!(loaded.settings().device.input_offset_us, 8_000);
-    assert!((loaded.settings().device.master_volume - 0.25).abs() < f32::EPSILON);
+    assert!((loaded.settings().device.key_volume - 0.25).abs() < f32::EPSILON);
     let [one, two] = &rig.reports[..] else {
         panic!("{} plays", rig.reports.len());
     };
@@ -5577,6 +5586,7 @@ fn best(ex: u32, bp: u32, clear: game::BestLamp) -> game::BestScore {
         plays: 3,
         ex: Some(ex),
         bp: Some(bp),
+        max_combo: None,
         clear: Some(clear),
     }
 }
@@ -5659,6 +5669,8 @@ fn each_view_compares_with_its_presets_best_before_the_play() {
             bp: Some(5),
             bp_diff: Some(i64::from(bp) - 5),
             clear: Some(BestLamp::Cleared { gauge: 0 }),
+            max_combo: None,
+            max_combo_diff: None,
             ex_updated: true,
             bp_updated: true,
             rate: rate(1),
@@ -5674,6 +5686,8 @@ fn each_view_compares_with_its_presets_best_before_the_play() {
             bp: Some(0),
             bp_diff: Some(i64::from(beatoraja.tally.bp)),
             clear: Some(BestLamp::FullCombo),
+            max_combo: None,
+            max_combo_diff: None,
             ex_updated: beatoraja.tally.ex_score > 3,
             bp_updated: false,
             rate: Some(BestRate {
@@ -5692,6 +5706,8 @@ fn each_view_compares_with_its_presets_best_before_the_play() {
             bp: None,
             bp_diff: None,
             clear: None,
+            max_combo: None,
+            max_combo_diff: None,
             ex_updated: lr2.tally.ex_score > 0,
             bp_updated: true,
             rate: Some(BestRate {
@@ -5945,6 +5961,40 @@ fn the_scene_time_accepts_back_with_its_outro() {
     assert_eq!(rig.accepted, [game::MenuCommand::Back]);
     assert_eq!(rig.result_order[0], ("outro", s + 3_000_000));
     assert_eq!(rig.clock.now().0, s + 3_500_000);
+}
+
+/// The skin's input and scene times count from the result's origin, the
+/// render thread's first commit of a view, not from its show (design.md
+/// "Rendering and Skins", Timers; "State Model", Result): a press after
+/// the input time from the show but before it from the origin is dropped,
+/// one at it accepted, and the scene time accepts back from the origin.
+#[test]
+fn input_and_scene_count_from_the_rigs_origin() {
+    use game::MenuCommand::Back;
+    let s = result_start();
+    let o = s + 300_000;
+    let dir = tempfile::tempdir().unwrap();
+    let mut loaded = loaded(dir.path());
+    let mut rig = outro_rig(timing(0, 2_000_000, None), i64::MAX);
+    rig.origin_delay = Some(300_000);
+    press(&mut rig, &[(s + 2_100_000, Back), (o + 2_000_000, Back)]);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    assert_eq!(
+        rig.result_order,
+        [
+            ("gated", s + 2_100_000),
+            ("outro", o + 2_000_000),
+            ("accept", o + 2_000_000)
+        ]
+    );
+
+    let mut loaded = self::loaded(dir.path());
+    let mut rig = outro_rig(timing(0, 0, Some(3_000_000)), i64::MAX);
+    rig.origin_delay = Some(300_000);
+    let left = game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(left, game::Leave::Back);
+    assert_eq!(rig.result_order[0], ("outro", o + 3_000_000));
 }
 
 /// C18: with the built-in presentation (no timing) a command takes effect

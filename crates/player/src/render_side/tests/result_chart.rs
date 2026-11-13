@@ -838,8 +838,15 @@ fn result_chart_frame_alloc() {
         });
         let now = TimeUs(1_000_000 + 16_000 * i64::try_from(cycle).unwrap());
         let before = crate::alloc_count::this_thread();
-        let fadeout = Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts);
-        let drawn = Run::result_build(&mut screen, Some(&mut side), now, fadeout);
+        let fadeout =
+            Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts, TimeUs(0));
+        let drawn = Run::result_build(
+            &mut screen,
+            Some(&mut side),
+            now,
+            fadeout,
+            &skin_model::AppReadouts::LAUNCH,
+        );
         counts.push(crate::alloc_count::this_thread() - before);
         assert_eq!(drawn, ResultDrawn::Built);
         let quads = screen.result_quads().unwrap();

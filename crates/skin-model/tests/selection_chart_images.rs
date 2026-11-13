@@ -201,7 +201,9 @@ fn the_image_fields_read_before_the_settings() {
     };
     let settings = skin_model::SelectionSettings {
         display_offset_ms: -7,
-        master_volume: skin_model::MasterVolume::of_gain(0.5),
+        system_volume: skin_model::VolumeReading::of_gain(0.5),
+        key_volume: skin_model::VolumeReading::of_gain(0.25),
+        background_volume: skin_model::VolumeReading::of_gain(0.75),
         speed: skin_model::SpeedView::Classic,
         order: skin_model::SelectionOrder::Title,
         gauge: None,
@@ -218,18 +220,23 @@ fn the_image_fields_read_before_the_settings() {
         let f = fx.sel.state().fields;
         [
             field::SETTINGS_DISPLAY_OFFSET,
-            field::SETTINGS_VOLUME,
+            field::SETTINGS_VOLUME_SYSTEM,
             field::SETTINGS_SUDDEN,
+            field::SETTINGS_VOLUME_BACKGROUND,
             field::APP_FPS,
         ]
         .map(|s| f[usize::from(s)])
     };
-    assert_eq!(kept(&fx), [-7, 50, 1, 57]);
+    assert_eq!(kept(&fx), [-7, 50, 1, 75, 57]);
     fx.sel
         .set_chart_images(Some(ChartTable::new(None, None, Some(BANNER)).keyed(KEY)));
     fx.view(&view(vec![chart("b")], Some(0)));
-    assert_eq!(kept(&fx), [-7, 50, 1, 57], "a view moved them");
+    assert_eq!(kept(&fx), [-7, 50, 1, 75, 57], "a view moved them");
     fx.sel.write_chart_fields();
     assert_eq!(fields(&fx), [0, 1]);
-    assert_eq!(kept(&fx), [-7, 50, 1, 57], "the image fields moved them");
+    assert_eq!(
+        kept(&fx),
+        [-7, 50, 1, 75, 57],
+        "the image fields moved them"
+    );
 }

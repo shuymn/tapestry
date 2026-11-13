@@ -231,6 +231,7 @@ pub fn list(slots: usize, center: u8) -> SongListDef {
         level: std::array::from_fn(|_| None),
         lamp: std::array::from_fn(|_| None),
         label: [None, None, None],
+        clickable: Vec::new(),
     }
 }
 
@@ -403,6 +404,8 @@ pub struct Fx {
     pub timers: SelectionTimers,
     /// The application's readouts each frame gives.
     pub app: AppReadouts,
+    /// The pointer each frame gives, in target pixels.
+    pub pointer: Option<[f32; 2]>,
 }
 
 impl Fx {
@@ -421,6 +424,7 @@ impl Fx {
                 ..SelectionTimers::default()
             },
             app: AppReadouts::LAUNCH,
+            pointer: None,
         }
     }
 
@@ -439,6 +443,7 @@ impl Fx {
             layout: &self.layout,
             timers: self.timers,
             app: self.app,
+            pointer: self.pointer,
         };
         self.skin
             .build_selection(&mut self.sel, &frame, &self.uvs, &mut self.batch)
@@ -468,6 +473,7 @@ pub fn chart(title: &str) -> RowView {
     RowView {
         key: RowKey::Chart(PathBuf::from(format!("{title}.bms"))),
         kind: RowKind::Chart,
+        index: None,
         title: title.to_owned(),
         subtitle: String::new(),
         artist: String::new(),
@@ -542,6 +548,8 @@ pub fn view(rows: Vec<RowView>, cursor: Option<usize>) -> SelectionView {
             max_ex: None,
             score: r.score,
             judge_class: None,
+            clears: 0,
+            best: None,
         });
     SelectionView {
         position: None,
@@ -550,6 +558,7 @@ pub fn view(rows: Vec<RowView>, cursor: Option<usize>) -> SelectionView {
         place: SelectionPlace::Top,
         query: String::new(),
         selected,
+        list_revision: 0,
     }
 }
 

@@ -133,6 +133,7 @@ fn pixels(r: &mut Renderer, sel: &mut Selection) -> Vec<u8> {
             ..SelectionTimers::default()
         },
         app: skin_model::AppReadouts::LAUNCH,
+        pointer: None,
     };
     r.build_selection(sel, &frame, &[]).unwrap();
     assert!(r.submit_selection(&[]).unwrap().presented);

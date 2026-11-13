@@ -72,6 +72,10 @@ pub struct ResultFrame<'a> {
     /// The player's layout.
     pub layout: &'a crate::layout::Layout,
     pub timers: ResultTimers,
+    /// The application's readouts at the frame, sampled at the reading
+    /// that gave `now`: the frames presented in the last second, the local
+    /// date and time, and the uptime.
+    pub app: crate::AppReadouts,
 }
 
 /// Why a result call was refused.
@@ -381,14 +385,26 @@ impl ResultScreen {
         self.strings.set(labels);
     }
 
-    /// Fills this frame's timers: the built-in ones from `timers`, then
-    /// each `when` timer over the fields. Allocates nothing.
+    /// Fills this frame's application readouts from `app`, then its
+    /// timers: the built-in ones from `timers`, then each `when` timer over
+    /// the fields. Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`BuildError::InvalidReadouts`](crate::BuildError::InvalidReadouts)
+    /// for a readout outside its field's range: nothing is filled.
     pub(crate) fn fill(
         &mut self,
         now: TimeUs,
         timers: &ResultTimers,
+        app: &crate::AppReadouts,
         whens: &[crate::expr::Program],
-    ) {
+    ) -> Result<(), crate::BuildError> {
+        let app = crate::play::timers::app_fields(app).ok_or(crate::BuildError::InvalidReadouts)?;
+        let at = usize::from(field::APP_FPS);
+        if let Some(to) = self.fields.get_mut(at..at + app.len()) {
+            to.copy_from_slice(&app);
+        }
         for (start, at) in self.starts.iter_mut().zip([timers.screen, timers.fadeout]) {
             *start = at;
         }
@@ -401,6 +417,7 @@ impl ResultScreen {
             whens,
             |_| true,
         );
+        Ok(())
     }
 }
 
@@ -571,6 +588,8 @@ fn fields(view: &ResultView) -> [i32; field::COUNT] {
         set(field::BEST_BP, number(b.bp));
         set(field::BEST_BP_DIFF, number(b.bp_diff));
         set(field::BEST_CLEAR, b.clear.clear_type());
+        set(field::BEST_MAX_COMBO, number(b.max_combo));
+        set(field::BEST_MAX_COMBO_DIFF, number(b.max_combo_diff));
         set(field::BEST_EX_UPDATED, i32::from(b.ex_updated));
         set(field::BEST_BP_UPDATED, i32::from(b.bp_updated));
         if let Some(r) = b.rate {

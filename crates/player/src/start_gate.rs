@@ -429,10 +429,10 @@ mod tests {
             48_000,
             vec![Sound::mono(vec![1_000; 4 * 48_000])],
         ));
-        let schedule = vec![BgmEvent {
+        let schedule = vec![audio::ScheduledSound::from(BgmEvent {
             time: TimeUs(5_000_000),
             sound: SoundId(0),
-        }];
+        })];
         let engine =
             AudioEngine::with_schedule(bank, schedule.clone(), 48_000, 480, 16, 0).unwrap();
         let (mut control, mut worker) = audio_control(engine);
@@ -545,10 +545,10 @@ mod tests {
             48_000,
             vec![Sound::mono(vec![1_000; 4_800])],
         ));
-        let schedule = vec![BgmEvent {
+        let schedule = vec![audio::ScheduledSound::from(BgmEvent {
             time: TimeUs(0),
             sound: SoundId(0),
-        }];
+        })];
         let engine = AudioEngine::with_schedule(bank, schedule, 48_000, 480, 16, 0).unwrap();
         let (mut control, mut worker) = audio_control(engine);
         let mut out = RecordingOutput::new(

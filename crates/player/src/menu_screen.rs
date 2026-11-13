@@ -33,8 +33,9 @@ use eval::Section;
 use game::Preparation;
 use render::text::{Fonts, MenuText, TextBlock, TextStyle};
 use render::{
-    AttemptInput, Blend, CommitError, FrameTiming, Installation, LoadingFrame, LoadingTextError,
-    LoadingTextKey, PreparedToken, RenderError, Renderer, SkinBundle, Sprite, solid_uv,
+    AttemptInput, Blend, CommitError, FrameTiming, Installation, LoadingFrame, LoadingOn,
+    LoadingTextError, LoadingTextKey, PreparedToken, RenderError, Renderer, SkinBundle, Sprite,
+    solid_uv,
 };
 use skin_model::{BuildError, ChartText, ScreenKind, TextField, TextSlots};
 
@@ -582,6 +583,7 @@ impl MenuScreen {
             layout: &skin_model::Layout::AUTHOR,
             timers: u.events.timers(),
             app,
+            pointer: logic.pointer,
         };
         // The frame's preparation ends here (dev-tools: the S7-07d
         // gate's whole frames).
@@ -609,10 +611,15 @@ impl MenuScreen {
     /// The device failing while the text is prepared (not a refusal,
     /// [`RenderError::is_refusal`]): the screen is dropped and built again.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn chosen_text(&mut self, update: &LoadingUpdate, lifetime: u64) -> Result<(), RenderError> {
-        self.renderer.enter_loading(lifetime);
+    fn chosen_text(
+        &mut self,
+        update: &LoadingUpdate,
+        lifetime: u64,
+        on: LoadingOn,
+    ) -> Result<(), RenderError> {
+        self.renderer.enter_loading_on(on, lifetime);
         if let Some(staged) = self.chosen.staged.take() {
-            match self.renderer.install_staged_loading_text() {
+            match self.renderer.install_staged_loading_text_on(on) {
                 // Every slot holds what was asked: a refusal before it no
                 // longer describes them, so it is forgotten.
                 Ok(true) => {
@@ -630,7 +637,7 @@ impl MenuScreen {
                 Err(_) => {}
             }
         }
-        let Some(key) = self.renderer.loading_text_key() else {
+        let Some(key) = self.renderer.loading_text_key_on(on) else {
             self.chosen = ChosenTextState::default();
             return Ok(());
         };
@@ -648,7 +655,7 @@ impl MenuScreen {
         ) else {
             return Ok(());
         };
-        self.renderer.clear_loading_text(which);
+        self.renderer.clear_loading_text_on(on, which);
         let c = &update.chart;
         fn field(f: &Option<String>) -> &str {
             f.as_deref().unwrap_or_default()
@@ -662,7 +669,7 @@ impl MenuScreen {
         };
         match self
             .renderer
-            .prepare_loading_text(lifetime, update.revision, which, &chart)
+            .prepare_loading_text_on(on, lifetime, update.revision, which, &chart)
         {
             Ok(()) => self.chosen.staged = Some(asked),
             Err(e) if e.is_refusal() => {
@@ -677,6 +684,37 @@ impl MenuScreen {
             Err(e) => return Err(e),
         }
         Ok(())
+    }
+
+    /// The skin's loading frame `frame` of the installation `on` names, the
+    /// installed one or a staging before its commit, then the lines over
+    /// it ([`Screen::loading`]). The chosen chart's text is brought to the
+    /// lifetime's state `update` for that installation
+    /// ([`chosen_text`](Self::chosen_text)) and the lines are laid out
+    /// before the frame is built, outside its work.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn loading_on(
+        &mut self,
+        on: LoadingOn,
+        page: &MenuPage,
+        update: Option<&LoadingUpdate>,
+        changed: bool,
+        frame: &LoadingFrame<'_>,
+    ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
+        if let Some(update) = update {
+            self.chosen_text(update, frame.lifetime, on)?;
+        }
+        if changed || self.stale || self.text.is_none() {
+            self.prepare(page, LOADING_LEFT, LOADING_TOP)?;
+        }
+        let Some(text) = &self.text else {
+            return Err(RenderError::OtherRenderersText);
+        };
+        let timing = self.renderer.loading_frame_on(on, frame, text)?;
+        if let Ok(t) = &timing {
+            self.shown(t.presented);
+        }
+        Ok(timing)
     }
 
     /// Tells `sink` of its first frame presented and the caret's area of
@@ -1068,6 +1106,70 @@ impl Screen for MenuScreen {
         Ok(timing)
     }
 
+    fn decision_rows(&self) -> Option<Result<render::RowPlan, RenderError>> {
+        self.renderer.decision_rows()
+    }
+
+    fn write_decision_labels(&mut self, store: &mut render::LabelStore) -> render::FillStep {
+        self.renderer.write_decision_labels(store)
+    }
+
+    fn settle_decision_labels(
+        &mut self,
+        store: &mut render::LabelStore,
+    ) -> Result<render::Settled, RenderError> {
+        self.renderer.settle_decision_labels(store)
+    }
+
+    fn restore_decision_labels(
+        &mut self,
+        store: &mut render::LabelStore,
+        slot: usize,
+        staged: render::StagedLabels,
+    ) -> Result<(), RenderError> {
+        // Not restoring at that generation: nothing was written, and the
+        // slot's content stays undrawable.
+        match self.renderer.restore_decision_labels(store, slot, staged)? {
+            true => Ok(()),
+            false => Err(RenderError::LabelRegion { needed: 0, band: 0 }),
+        }
+    }
+
+    fn watch_completion(&self) -> Arc<AtomicBool> {
+        self.renderer.watch_completion()
+    }
+
+    fn device_lost(&self) -> bool {
+        self.renderer.device_lost()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn build_decision(
+        &mut self,
+        dec: &mut skin_model::DecisionScreen,
+        labels: skin_model::DecisionLabels<'_>,
+        frame: &skin_model::DecisionFrame<'_>,
+    ) -> Result<(), BuildError> {
+        #[cfg(all(test, feature = "dev-tools"))]
+        self.probe_alloc();
+        self.renderer.build_decision(dec, labels, frame)
+    }
+
+    fn submit_decision(&mut self) -> Result<FrameTiming, RenderError> {
+        let timing = self.renderer.submit_decision(&[])?;
+        self.shown(timing.presented);
+        Ok(timing)
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn decision_fault(&mut self, settle: bool) {
+        if settle {
+            self.renderer.fail_next_decision_settle();
+        } else {
+            self.renderer.refuse_next_decision();
+        }
+    }
+
     #[cfg(feature = "dev-tools")]
     fn atlas_uploads(&self) -> u64 {
         self.renderer.atlas_uploads()
@@ -1175,20 +1277,30 @@ impl Screen for MenuScreen {
         changed: bool,
         frame: &LoadingFrame<'_>,
     ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
-        if let Some(update) = update {
-            self.chosen_text(update, frame.lifetime)?;
+        self.loading_on(LoadingOn::Installed, page, update, changed, frame)
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn loading_staged(
+        &mut self,
+        page: &MenuPage,
+        update: Option<&LoadingUpdate>,
+        changed: bool,
+        frame: &LoadingFrame<'_>,
+        token: PreparedToken,
+    ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
+        self.loading_on(LoadingOn::Staged(token), page, update, changed, frame)
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn staged_token(&self) -> Option<PreparedToken> {
+        self.renderer.staged()
+    }
+
+    fn discard_token(&mut self, token: PreparedToken) {
+        if self.renderer.staged() == Some(token) {
+            self.renderer.discard();
         }
-        if changed || self.stale || self.text.is_none() {
-            self.prepare(page, LOADING_LEFT, LOADING_TOP)?;
-        }
-        let Some(text) = &self.text else {
-            return Err(RenderError::OtherRenderersText);
-        };
-        let timing = self.renderer.loading_frame(frame, text)?;
-        if let Ok(t) = &timing {
-            self.shown(t.presented);
-        }
-        Ok(timing)
     }
 
     /// The cleared canvas with the load's lines where a skin's loading
@@ -1239,6 +1351,7 @@ impl Screen for MenuScreen {
             return Ok(SelectionDrawn {
                 timing,
                 refused: None,
+                skinned: false,
             });
         };
         let refused = match self.prepare_selection(u, logic, changed)? {
@@ -1271,7 +1384,11 @@ impl Screen for MenuScreen {
             self.send(self.page_caret);
             let timing = self.menu_frame(&u.page, false)?;
             self.shown(timing.presented);
-            return Ok(SelectionDrawn { timing, refused });
+            return Ok(SelectionDrawn {
+                timing,
+                refused,
+                skinned: false,
+            });
         }
         let drawn = self.strip.as_ref().filter(|_| self.strip_lines > 0);
         #[cfg(all(test, feature = "dev-tools"))]
@@ -1286,6 +1403,7 @@ impl Screen for MenuScreen {
         Ok(SelectionDrawn {
             timing,
             refused: None,
+            skinned: true,
         })
     }
 
@@ -1444,6 +1562,29 @@ impl MenuScreen {
         if self.alloc_probe {
             drop(std::hint::black_box(Box::new(0_u8)));
         }
+    }
+
+    /// A skinned selection frame of `u` with `logic` at `now` for the
+    /// allocation guards outside this module (tests): its preparation
+    /// (`changed` as [`selection`](Screen::selection) takes it), the app's
+    /// build ([`build_selection_frame`](Self::build_selection_frame)) and
+    /// the GPU submission. Returns the build's allocations alone.
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn selection_build_count(
+        &mut self,
+        u: &SelectionUpdate,
+        logic: &mut SelectionLogic,
+        changed: bool,
+        now: bms_model::TimeUs,
+    ) -> u64 {
+        use crate::alloc_count::this_thread;
+        self.prepare_selection(u, logic, changed).unwrap().unwrap();
+        let before = this_thread();
+        self.build_selection_frame(u, logic, now, skin_model::AppReadouts::LAUNCH)
+            .unwrap();
+        let built = this_thread() - before;
+        self.renderer.submit_selection(&[]).unwrap();
+        built
     }
 }
 

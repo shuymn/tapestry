@@ -356,6 +356,12 @@ pub struct Selection {
     pub menu: Arc<MenuQueue>,
     /// The window's keys the queue dropped, as last reported.
     pub dropped: u64,
+    /// The pointer's side on the game thread: its shared state and the
+    /// batch in flight.
+    pub pointer: crate::pointer::PointerPass,
+    /// The pointer's presses and notches the queue refused, as last
+    /// reported.
+    pub dropped_pointer: u64,
     /// Whether the notice shown is a refusal because the shelf of presets
     /// would not open: it goes once the shelf opens.
     pub preset_refusal: bool,
@@ -383,6 +389,13 @@ pub struct Selection {
     /// Steps of the play preset taken and not yet applied: the flow takes
     /// them after each look ([`AppRig::take_preset_step`]).
     pub preset_steps: std::collections::VecDeque<game::PresetStep>,
+    /// The cover switches (SUDDEN+, LIFT, HIDDEN+) the skin turned over an
+    /// odd number of times since the rig last took them
+    /// ([`PlayerRig::turn_covers`]).
+    pub covers_turned: [bool; 3],
+    /// The volumes the skin's sliders set since the last look, by
+    /// [`game::Channel::index`]: the newest percent of each.
+    pub volumes_set: [Option<u32>; 3],
     /// What the render thread is given of each change: the lifetime, the
     /// timers' starts and the skin's window.
     pub feed: SkinFeed,
@@ -616,6 +629,9 @@ impl Selection {
                 None
             }
             Acted::Focus(on) => {
+                // Given or taken, the focus is no box's until a press on
+                // one names it ([`Self::dispatch_pointer`]).
+                self.pointer.search_box = None;
                 if let Some(ime) = &self.ime {
                     ime.set(on);
                 }
@@ -660,21 +676,8 @@ impl Selection {
             );
         }
         pad.report_dropped("select");
-        while let Some(input) = self.menu.pop() {
-            let shown = self.shown_panel();
-            let acts = match input {
-                MenuInput::Key(key) => crate::select::acts_under_panel(key, shown),
-                MenuInput::Pad { panel, .. } => shown
-                    .or(panel.filter(|_| !self.screen.searching()))
-                    .is_none(),
-                MenuInput::Text(_) | MenuInput::Preedit(_) => true,
-            };
-            if !acts {
-                continue;
-            }
-            if let Some(pick) = self.take_reading(input, level, now) {
-                return Some(pick);
-            }
+        if let Some(pick) = self.pass(level, now) {
+            return Some(pick);
         }
         if self.search_pending {
             self.refresh();
@@ -688,6 +691,221 @@ impl Selection {
             eprintln!("{line}");
             log::warn!("{line}");
             self.dropped = dropped;
+        }
+        let refused = self.pointer.shared.dropped();
+        if refused > self.dropped_pointer {
+            let line = format!(
+                "select: {} pointer presses or notches refused, the window's queue was full",
+                refused - self.dropped_pointer
+            );
+            eprintln!("{line}");
+            log::warn!("{line}");
+            self.dropped_pointer = refused;
+        }
+        None
+    }
+
+    /// One pass over the queue (design.md "Input", **Pointer input**): the
+    /// answers of the batch in flight first, once the render thread has
+    /// answered it, then at most [`MENU_PASS`](crate::select::MENU_PASS)
+    /// entries in order, a run of pointer entries handed to the render
+    /// thread as one batch, after which nothing more is taken until it is
+    /// answered (the barrier); then a drag, once no batch is in flight and
+    /// the press that began its hold was dispatched.
+    fn pass(&mut self, level: Option<&input::PanelLevel>, now: TimeUs) -> Option<Pick> {
+        if self.pointer.take() == crate::pointer::Taken::Waiting {
+            return None;
+        }
+        // The answers in order; a pick leaves the rest for the next pass,
+        // which dispatches them if the pick was refused and selection
+        // stays.
+        while let Some((slot, built)) = self.pointer.next_answer() {
+            if let Some(pick) = self.dispatch_pointer(slot, built, level, now) {
+                return Some(pick);
+            }
+        }
+        let mut taken = 0;
+        while taken < crate::select::MENU_PASS {
+            if self.menu.front_is_pointer() {
+                let menu = &self.menu;
+                let mut left = crate::select::MENU_PASS - taken;
+                self.pointer.flight = self.pointer.shared.submit(self.feed.lifetime, || {
+                    while left > 0 && menu.front_is_pointer() {
+                        left -= 1;
+                        match menu.pop_observed() {
+                            Some(Some((input, _))) => {
+                                return crate::pointer::PointerRequest::of(&input);
+                            }
+                            Some(None) => {}
+                            None => return None,
+                        }
+                    }
+                    None
+                });
+                taken = crate::select::MENU_PASS - left;
+                if self.pointer.flight.is_some() {
+                    return None;
+                }
+                continue;
+            }
+            let Some(entry) = self.menu.pop_observed() else {
+                break;
+            };
+            taken += 1;
+            let Some((input, _)) = entry else {
+                continue;
+            };
+            let shown = self.shown_panel();
+            let acts = match input {
+                MenuInput::Key(key) => crate::select::acts_under_panel(key, shown),
+                MenuInput::Pad { panel, .. } => shown
+                    .or(panel.filter(|_| !self.screen.searching()))
+                    .is_none(),
+                MenuInput::Text(_) | MenuInput::Preedit(_) => true,
+                // The pointer's are taken as batches above.
+                MenuInput::Pointer { .. } | MenuInput::Wheel { .. } => false,
+            };
+            if !acts {
+                continue;
+            }
+            let pick = self.take_reading(input, level, now);
+            #[cfg(test)]
+            self.dispatched(crate::pointer::Dispatched::Input);
+            if pick.is_some() {
+                return pick;
+            }
+        }
+        if let Some(drag) = self.pointer.shared.take_drag(self.menu.presses_taken()) {
+            self.refresh_pending();
+            let facts = self.pointer_facts();
+            let act = crate::pointer::resolve_drag(&drag, &facts);
+            let pick = self.pointer_act(act, level, now);
+            #[cfg(test)]
+            self.dispatched(crate::pointer::Dispatched::Drag(act));
+            return pick;
+        }
+        None
+    }
+
+    /// Records a dispatched input and the cursor after it, while the log
+    /// is kept (tests).
+    #[cfg(test)]
+    fn dispatched(&mut self, what: crate::pointer::Dispatched) {
+        let cursor = self.screen.cursor();
+        if let Some(log) = &mut self.pointer.log {
+            log.push((what, cursor));
+        }
+    }
+
+    /// What the select screen is to a pointer input now.
+    fn pointer_facts(&self) -> crate::pointer::Facts {
+        // The panel the screen shows: none while the search box has
+        // focus, where the pointer acts as without a panel.
+        let held = self.shown_panel();
+        crate::pointer::Facts {
+            lifetime: self.feed.lifetime,
+            word: self.pointer.shared.word(),
+            list_revision: self.feed.list_revision,
+            count: self.screen.selectable(),
+            cursor: self.screen.cursor(),
+            searching: self.screen.searching(),
+            search_box: self.pointer.search_box,
+            composing: self.screen.composing(),
+            panel: held.is_some(),
+        }
+    }
+
+    /// A changed search or order is searched before a pointer input, which
+    /// acts on the list it makes (a row drawn before it is then stale).
+    fn refresh_pending(&mut self) {
+        if self.search_pending {
+            self.refresh();
+        }
+    }
+
+    /// Acts on one answered press or notch.
+    fn dispatch_pointer(
+        &mut self,
+        slot: crate::pointer::PointerSlot,
+        built: Option<crate::pointer::Built>,
+        level: Option<&input::PanelLevel>,
+        now: TimeUs,
+    ) -> Option<Pick> {
+        self.refresh_pending();
+        let facts = self.pointer_facts();
+        let screen = &self.screen;
+        let press = skin_model::PressHit {
+            hit: slot.hit,
+            inside_search: slot.inside_search,
+        };
+        let resolved = crate::pointer::resolve(slot.request, press, built, &facts, |i| {
+            screen.row_kind_at(i)
+        });
+        if resolved.unfocus {
+            // As Tab in the box: the focus goes, and the IME with it.
+            let _ = self.take_reading(MenuInput::Key(MenuKey::Tab), level, now);
+        }
+        let pick = self.pointer_act(resolved.act, level, now);
+        // A press that focused a search box names it: its bounds keep the
+        // focus from here.
+        if let (
+            crate::pointer::PointerAct::Key(MenuKey::Tab),
+            Some(skin_model::PointerHit::Search { index }),
+        ) = (resolved.act, slot.hit)
+            && self.screen.searching()
+        {
+            self.pointer.search_box = Some(index);
+        }
+        #[cfg(test)]
+        self.dispatched(match slot.request {
+            crate::pointer::PointerRequest::Press { .. } => {
+                crate::pointer::Dispatched::Press(resolved.act)
+            }
+            crate::pointer::PointerRequest::Wheel { .. } => {
+                crate::pointer::Dispatched::Notch(resolved.act)
+            }
+        });
+        pick
+    }
+
+    /// Carries out what a pointer input does.
+    fn pointer_act(
+        &mut self,
+        act: crate::pointer::PointerAct,
+        level: Option<&input::PanelLevel>,
+        now: TimeUs,
+    ) -> Option<Pick> {
+        let to = match act {
+            crate::pointer::PointerAct::Nothing => return None,
+            crate::pointer::PointerAct::Key(key) => {
+                return self.take_reading(MenuInput::Key(key), level, now);
+            }
+            crate::pointer::PointerAct::Cover(kind) => {
+                if let Some(turned) = self.covers_turned.get_mut(cover_index(kind)) {
+                    *turned = !*turned;
+                }
+                return None;
+            }
+            crate::pointer::PointerAct::Volume(channel, percent) => {
+                // The newest of a channel's settings counts.
+                if let Some(set) = self.volumes_set.get_mut(channel.index()) {
+                    *set = Some(percent);
+                }
+                return None;
+            }
+            crate::pointer::PointerAct::MoveTo(index) => index,
+            crate::pointer::PointerAct::Rows(rows) => {
+                let last = self.screen.selectable().saturating_sub(1);
+                let rows_abs = usize::try_from(rows.unsigned_abs()).unwrap_or(usize::MAX);
+                if rows < 0 {
+                    self.screen.cursor().saturating_sub(rows_abs)
+                } else {
+                    self.screen.cursor().saturating_add(rows_abs).min(last)
+                }
+            }
+        };
+        if self.screen.move_to(to) {
+            self.dirty = true;
         }
         None
     }
@@ -1193,6 +1411,16 @@ impl Selection {
         self.script
             .as_ref()
             .and_then(|s| s.failure().map(str::to_owned))
+    }
+}
+
+/// The place of cover `kind` in [`Selection::covers_turned`] and
+/// [`skin_model::SelectionSettings::covers_on`].
+const fn cover_index(kind: game::CoverKind) -> usize {
+    match kind {
+        game::CoverKind::Sudden => 0,
+        game::CoverKind::Lift => 1,
+        game::CoverKind::Hidden => 2,
     }
 }
 
@@ -1802,6 +2030,23 @@ fn loading_text(sel: &Selection, chart: &std::path::Path, autoplay: bool) -> Loa
     }
 }
 
+/// The strings a decision skin shows of a chart, from its library
+/// header as the select screen's view gives them
+/// ([`crate::select::SelectScreen`]), so their revision
+/// ([`crate::decision_side::labels_revision`]) is the one its cursor's
+/// preparation was asked for.
+fn decision_labels(h: &library::Header) -> skin_model::ChartLabels {
+    let text = |f: &Option<String>| f.clone().unwrap_or_default();
+    skin_model::ChartLabels {
+        title: text(&h.title),
+        subtitle: text(&h.subtitle),
+        artist: text(&h.artist),
+        subartist: text(&h.subartist),
+        genre: text(&h.genre),
+        ..skin_model::ChartLabels::default()
+    }
+}
+
 /// What a loading frame may show of a chart, from its library entry.
 fn chosen_chart(e: &library::ChartEntry) -> ChosenChart {
     let h = &e.header;
@@ -1944,6 +2189,23 @@ fn hold(
 }
 
 impl PlayerRig<'_> {
+    /// Selection is left (the decision screen, loading or the practice
+    /// page), the one departure (D2, SC5): the worker's selection side first
+    /// ([`crate::chart_images::ChartImageWorker::leave_selection`]: its
+    /// request, starter and set go, its job is cancelled, its publication
+    /// retires), then the render thread's, so nothing of it is drawn again;
+    /// the window queues no pointer input until the next entry, nothing in
+    /// flight dispatched.
+    fn left_selection(&mut self) {
+        if let Some(sel) = &self.selection {
+            self.chart_images.leave_selection(&sel.coord);
+        }
+        self.render.leave_selection();
+        if let Some(sel) = &mut self.selection {
+            sel.pointer.leave();
+        }
+    }
+
     /// The release barrier (design.md "Load Pipeline"), on the game thread
     /// before a bank decode begins: every earlier bank's owners go first.
     /// The scoped jobs of the previous load were joined when it returned;
@@ -2069,22 +2331,81 @@ impl PlayerRig<'_> {
         }
     }
 
+    /// Turns over the cover switches the skin turned (design.md "Play
+    /// Adjustments"): in the driver, or in the options `player.toml` is to
+    /// hold where there is none, each written at the next settings write
+    /// (design.md "Settings Files"); then the next update shows them.
+    fn turn_covers(&mut self) {
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
+        let turned = std::mem::take(&mut sel.covers_turned);
+        if turned == [false; 3] {
+            return;
+        }
+        let kinds = [
+            game::CoverKind::Sudden,
+            game::CoverKind::Lift,
+            game::CoverKind::Hidden,
+        ];
+        for (kind, _) in kinds.into_iter().zip(turned).filter(|&(_, t)| t) {
+            let failed = match &mut self.adjust {
+                Some(driver) => {
+                    let on = !driver.options().covers().get(kind).on;
+                    driver.set_cover_on(kind, on).err().map(|e| e.to_string())
+                }
+                // Startup refuses options out of range, so there are some.
+                None => self.files.play_options().and_then(|mut options| {
+                    let mut covers = options.covers();
+                    let cover = covers.get_mut(kind);
+                    cover.on = !cover.on;
+                    match options.set_covers(covers) {
+                        Ok(()) => {
+                            self.files.set_options(options);
+                            None
+                        }
+                        Err(e) => Some(e.to_string()),
+                    }
+                }),
+            };
+            if let Some(why) = failed {
+                log::warn!("select: the {kind:?} switch was not turned: {why}");
+            }
+        }
+        self.feed_settings();
+        if let Some(sel) = &mut self.selection {
+            sel.dirty = true;
+        }
+    }
+
+    /// Sets the volumes the skin's sliders set (design.md "Audio", the
+    /// three volumes), each through the tuning's native setter: it plays
+    /// from the next sync and is written at the next settings write
+    /// (design.md "Settings Files"); then the next update shows it.
+    fn set_volumes(&mut self) {
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
+        let set = std::mem::take(&mut sel.volumes_set);
+        if set == [None; 3] {
+            return;
+        }
+        let tuning = self.controls.tuning();
+        for (channel, percent) in game::Channel::ALL.into_iter().zip(set) {
+            if let Some(percent) = percent {
+                tuning.set_volume(channel, percent);
+            }
+        }
+        self.feed_settings();
+        if let Some(sel) = &mut self.selection {
+            sel.dirty = true;
+        }
+    }
+
     /// Whether a loading lifetime runs: from the choice or a practice's
     /// Start until loading ends.
     pub(crate) fn loading_active(&self) -> bool {
         self.selection.as_ref().is_some_and(|s| s.loading.is_some())
-    }
-
-    /// Selection is left (D2, SC5): the one departure. The worker's
-    /// selection side first ([`crate::chart_images::ChartImageWorker::leave_selection`]:
-    /// its request, starter and set go, its job is cancelled, its
-    /// publication retires), then the render thread's: nothing of selection
-    /// is drawn again.
-    pub(crate) fn leave_selection(&mut self) {
-        if let Some(sel) = &self.selection {
-            self.chart_images.leave_selection(&sel.coord);
-        }
-        self.render.leave_selection();
     }
 
     /// Looks at the library and the window's input on the select screen,
@@ -2099,6 +2420,16 @@ impl PlayerRig<'_> {
         if let Some(why) = self.render.take_selection_refusal() {
             log::warn!("select: the selection skin was refused, the built-in page draws: {why}");
             let notice = crate::imports::notice(skin_model::ScreenKind::Selection, &why);
+            sel.screen.set_notice(Some(notice));
+            sel.dirty = true;
+        }
+        // The decision skin refused for the run: the built-in presentation
+        // draws from the next choice on, and the notice says why.
+        if let Some(why) = self.render.take_decision_refusal() {
+            log::warn!(
+                "select: the decision skin was refused, the built-in presentation draws: {why}"
+            );
+            let notice = crate::imports::notice(skin_model::ScreenKind::Decision, &why);
             sel.screen.set_notice(Some(notice));
             sel.dirty = true;
         }
@@ -2130,6 +2461,11 @@ impl PlayerRig<'_> {
                 self.clock.now(),
             );
         }
+        // The switches the skin turned and the volumes its sliders set,
+        // shown with this look's update.
+        self.turn_covers();
+        self.set_volumes();
+        let sel = self.selection.as_mut()?;
         // Before anything of the choice: no chart without its skin.
         let now = self.clock.now();
         let images = CursorImages {
@@ -2601,6 +2937,17 @@ enum PageBegin {
 }
 
 impl PlayerRig<'_> {
+    /// The decision lifetime the choice claimed ended (its step, the
+    /// practice page's entry, a leave, a refused load's return):
+    /// the label book is told, so the render thread retires its pinned
+    /// slot at its next boundary. Once per claim; a lifetime a look inside
+    /// a rig's wait ended already is ended again with no effect.
+    fn end_decision(&mut self) {
+        if let Some(claim) = self.decision_claim.take() {
+            self.render.end_decision(claim.lifetime);
+        }
+    }
+
     /// The page's waiting 1× bank ([`PageJobs::defer`]) begins once its
     /// prerequisites hold, each looked at with no wait, so the decision
     /// screen and the page are served meanwhile and the page opens at its
@@ -3074,7 +3421,7 @@ impl AppRig for PlayerRig<'_> {
     fn entered_loading(&mut self, chart: &std::path::Path) {
         // Selection is left, its images before the play generation's
         // renewal (SC5): nothing of selection's begins after it.
-        self.leave_selection();
+        self.left_selection();
         // A new generation of the chart's images before the loading
         // lifetime begins: none of the last one's draws in it.
         self.chart_images.renew();
@@ -3103,13 +3450,61 @@ impl AppRig for PlayerRig<'_> {
         cancelled(self.controls)
     }
 
-    /// The built-in presentation, for every choice.
+    /// The decision skin when the chosen chart's labels are ready in a
+    /// label slot on a healthy device: that slot pinned under `lifetime`,
+    /// without waiting for any preparation, and the skin's scene and
+    /// fade-out; else the built-in presentation, `lifetime` made the
+    /// active one all the same (design.md "Play Lifecycle", the decision
+    /// screen).
     fn decision_shown(
         &mut self,
-        _pick: &Pick,
-        _lifetime: game::DecisionLifetime,
+        pick: &Pick,
+        lifetime: game::DecisionLifetime,
     ) -> Option<game::DecisionShown> {
-        Some(game::DecisionShown::BuiltIn)
+        let (Pick::Play(chart) | Pick::Practice(chart)) = pick;
+        // The chart's labels as the cursor's preparation asked for them:
+        // their revision, and their strings, which the slot pinned must
+        // have been prepared from.
+        let labels = self
+            .selection
+            .as_ref()
+            .and_then(|s| s.screen.selected())
+            .filter(|e| e.path == *chart)
+            .map(|e| decision_labels(&e.header));
+        let pinned = labels.and_then(|l| {
+            let strings = crate::decision_side::decision_strings(&l);
+            let revision = crate::decision_side::labels_revision(&l);
+            self.render
+                .pin_decision(chart, revision, &strings, lifetime.0)
+        });
+        let (slot, shown, timing) = match pinned {
+            Some((slot, generation, timing)) => (
+                Some((slot, generation)),
+                game::DecisionShown::Skin {
+                    slot: u8::try_from(slot).unwrap_or(u8::MAX),
+                    generation,
+                    scene: timing.scene,
+                    fadeout: timing.fadeout,
+                },
+                timing,
+            ),
+            None => {
+                self.render.begin_decision(lifetime.0);
+                (
+                    None,
+                    game::DecisionShown::BuiltIn,
+                    skin_model::DecisionTiming::default(),
+                )
+            }
+        };
+        // Its choice is App's, set at the entry.
+        self.decision_claim = Some(crate::decision_side::ShownDecision {
+            lifetime: lifetime.0,
+            origin: TimeUs(0),
+            timing,
+            slot,
+        });
+        Some(shown)
     }
 
     /// The decision screen begins: the input epoch first, so nothing
@@ -3121,7 +3516,7 @@ impl AppRig for PlayerRig<'_> {
     fn entered_decision(&mut self, pick: &Pick, d: game::Decision) -> game::Decision {
         // Selection is left, its images before the play generation's
         // renewal (SC5).
-        self.leave_selection();
+        self.left_selection();
         // A new generation of the chart's images before the held loading
         // lifetime begins: none of the last choice's draws when the
         // deadline reveals it.
@@ -3137,7 +3532,16 @@ impl AppRig for PlayerRig<'_> {
         let page = loading_text(sel, chart, self.autoplay);
         println!("decision: {} chosen", file_name(chart));
         let shown = page.decision();
-        self.render.show_decision(shown.clone());
+        // What the choice claimed for this lifetime, from its choice.
+        let claimed = self
+            .decision_claim
+            .as_mut()
+            .filter(|c| d.lifetime().is_some_and(|l| l.0 == c.lifetime))
+            .map(|c| {
+                c.origin = d.origin();
+                *c
+            });
+        self.render.show_decision(shown.clone(), claimed);
         sel.decision = Some((shown, file_name(chart)));
         self.audio.control.play_tone();
         if matches!(pick, Pick::Play(_)) {
@@ -3159,6 +3563,12 @@ impl AppRig for PlayerRig<'_> {
             }
         });
         d
+    }
+
+    /// The render thread's takeover of the active decision lifetime's
+    /// skin, once.
+    fn take_decision_takeover(&mut self) -> Option<game::DecisionTakeover> {
+        self.render.take_decision_takeover()
     }
 
     fn screen_load_failed(&mut self) -> Option<ScreenError> {
@@ -3195,6 +3605,7 @@ impl AppRig for PlayerRig<'_> {
     /// epoch's end, the held lifetime shown, and a new scene. Waits for
     /// nothing.
     fn deadline_step(&mut self) {
+        self.end_decision();
         if let Some((_, name)) = self.selection.as_ref().and_then(|s| s.decision.as_ref()) {
             println!("load: the play screen loads {name}");
         }
@@ -3207,6 +3618,7 @@ impl AppRig for PlayerRig<'_> {
     /// The decision screen is left for the practice page or selection: the
     /// input epoch ends, and the page's jobs are the page's from here.
     fn closed_epoch(&mut self) {
+        self.end_decision();
         self.controls.open_epoch();
         if let Some(sel) = &mut self.selection {
             sel.decision = None;
@@ -3287,6 +3699,13 @@ impl AppRig for PlayerRig<'_> {
             .ok()
             .map(game::Shelf::chosen_name)
             .filter(|n| *n != self.files.preset());
+        // The play options as the game holds them, a switch the skin
+        // turned included, are written with the preset.
+        if chosen.is_some()
+            && let Some(driver) = &self.adjust
+        {
+            self.files.set_options(driver.options());
+        }
         // Said once written, or once the write failed.
         let failed = chosen.is_some_and(|n| {
             let t = self.controls.tuning().get();
@@ -3351,6 +3770,13 @@ impl AppRig for PlayerRig<'_> {
         // Another scene: held adjustment controls act no more until
         // pressed afresh.
         self.enter_scene();
+        // A load left before its play (cancelled while decoding or
+        // measuring, refused, or Back) leaves no attempt pending: the
+        // switches a skin turns from here reach the next attachment.
+        if let Some(driver) = &mut self.adjust {
+            driver.invalidate();
+        }
+        self.show_cursor(true);
         recover(
             &mut self.result_input,
             Owner::Select,
@@ -3379,6 +3805,8 @@ impl AppRig for PlayerRig<'_> {
         // A panel held at the entry opens with it.
         sel.panels(self.panels.as_ref(), now);
         self.render.enter_selection(sel.feed.lifetime);
+        // The window takes the pointer for this lifetime from now on.
+        sel.pointer.enter(sel.feed.lifetime);
         println!("select: {} charts listed", sel.screen.listed());
         sel.show(&self.render, images, None, now);
     }
@@ -3474,7 +3902,8 @@ impl AppRig for PlayerRig<'_> {
         // Start's candidates.
         self.result_skin.drop_images();
         self.enter_scene();
-        self.leave_selection();
+        self.left_selection();
+        self.show_cursor(true);
         recover(
             &mut self.result_input,
             Owner::Practice,
@@ -3605,6 +4034,9 @@ use page_start::Got;
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(feature = "dev-tools")]
+    mod pointer;
+
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -3954,6 +4386,8 @@ pub(crate) mod tests {
             screen,
             menu: Arc::new(MenuQueue::default()),
             dropped: 0,
+            pointer: crate::pointer::PointerPass::default(),
+            dropped_pointer: 0,
             feed: crate::selection_skin::SkinFeed::default(),
             preset_refusal: false,
             ime: None,
@@ -3966,6 +4400,8 @@ pub(crate) mod tests {
             dirty: false,
             search_pending: false,
             preset_steps: std::collections::VecDeque::new(),
+            covers_turned: [false; 3],
+            volumes_set: [None; 3],
             #[cfg(feature = "dev-tools")]
             script: None,
             coord: crate::shelf::tests::coordinator(),
@@ -4787,6 +5223,74 @@ pub(crate) mod tests {
             assert_eq!(d.left(), None);
             assert!(!rig.controls.ingress().is_open());
         });
+    }
+
+    /// O6 inside a rig's wait: a takeover of the skinned screen's lifetime
+    /// left by the render thread while the choice's own wait (its entry
+    /// fence, held at the input thread's gate) serves the screen is applied
+    /// there, to the decision the wait watches, with no look of App's: it
+    /// comes back with the built-in presentation and the deadline 1,500 ms
+    /// from the original choice.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn takeover_inside_a_rig_wait_reaches_the_watched_decision() {
+        use bms_model::TimeSource as _;
+        let dir = tempfile::tempdir().unwrap();
+        let sel = selection(dir.path());
+        let chart = dir.path().join("x.bms");
+        crate::tests::on_rig_hooked(
+            game::Settings {
+                device: game::DeviceSettings::default(),
+                player: game::PlayerSettings::default(),
+            },
+            crate::render_side::tests::Installers::default().spawn_bare(),
+            input::QpcClock::start(),
+            |rig, _, end| {
+                rig.selection = Some(sel);
+                let (thread, _jobs, _waker, _clock) = input_thread(end);
+                let origin = rig.clock.now();
+                let lifetime = game::DecisionLifetime(4);
+                let decision = game::Decision::begin(
+                    origin,
+                    lifetime,
+                    Some(game::DecisionShown::Skin {
+                        slot: 0,
+                        generation: 1,
+                        scene: TimeUs(2_500_000),
+                        fadeout: TimeUs(500_000),
+                    }),
+                    false,
+                );
+                // Left once the input thread holds the entry's fence: the
+                // wait is serving the screen, and only its looks can take
+                // it.
+                let handle = rig.render.recovery_handle();
+                let leave = move |_: &crate::controls::Controls| {
+                    handle.leave_takeover(game::DecisionTakeover {
+                        lifetime,
+                        at: origin,
+                        why: "refused".to_owned(),
+                    });
+                };
+                let taken = |c: &crate::controls::Controls| {
+                    c.with_watched(|d| {
+                        d.is_none_or(|d| d.shown() == Some(game::DecisionShown::BuiltIn))
+                    })
+                };
+                let d = entry_held(
+                    rig,
+                    &game::Pick::Play(chart.clone()),
+                    decision,
+                    Some((&leave, &taken)),
+                );
+                assert_eq!(d.shown(), Some(game::DecisionShown::BuiltIn));
+                assert_eq!(d.deadline(), Some(TimeUs(origin.0 + 1_500_000)));
+                assert_eq!(d.origin(), origin);
+                assert_eq!(d.left(), None);
+                assert_eq!(rig.render.take_decision_takeover(), None, "taken twice");
+                thread.stop().unwrap();
+            },
+        );
     }
 
     /// Finding 10 at the fence (START on E as installed): START pressed
@@ -5773,7 +6277,16 @@ pub(crate) mod tests {
                 bp: 0,
                 cleared: vec![0b1],
                 full_combo: false,
+                // Its own play, as a counted one is: the read refuses a
+                // best whose EX is not its play's.
+                play: library::Breakdown {
+                    body_sha256: [7; 32],
+                    ex: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
             }),
+            clear: true,
             ineligible: None,
         };
         sel.shelf.best_writer().unwrap().ingest(&c).unwrap();
@@ -6162,6 +6675,8 @@ pub(crate) mod tests {
             screen: SelectScreen::new(roots.clone()),
             menu: Arc::new(MenuQueue::default()),
             dropped: 0,
+            pointer: crate::pointer::PointerPass::default(),
+            dropped_pointer: 0,
             feed: crate::selection_skin::SkinFeed::default(),
             preset_refusal: false,
             ime: None,
@@ -6174,6 +6689,8 @@ pub(crate) mod tests {
             dirty: false,
             search_pending: false,
             preset_steps: std::collections::VecDeque::new(),
+            covers_turned: [false; 3],
+            volumes_set: [None; 3],
             #[cfg(feature = "dev-tools")]
             script: None,
             coord: crate::shelf::tests::coordinator(),
@@ -7495,11 +8012,13 @@ pub(crate) mod tests {
             c.sha256,
             library::Score {
                 plays: 3,
+                clears: 0,
                 best: Some(library::Best {
                     ex: 3,
                     bp: 1,
                     cleared: vec![1],
                     full_combo: false,
+                    ..Default::default()
                 }),
             },
         )]));

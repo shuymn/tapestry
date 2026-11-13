@@ -100,6 +100,8 @@ pub(crate) struct State {
     styles: Vec<Program>,
     pub(crate) ratio_bars: Vec<RatioBarDef>,
     pub(crate) bar_spans: Vec<Span>,
+    /// The elements' pointer input, by element.
+    pub(crate) pointer: Vec<skin_model::PointerDef>,
     /// The `imageset`, `text` and `value` tables by id, the first record
     /// of an id winning, each built once when the song list first needs
     /// it.
@@ -380,6 +382,31 @@ impl Cx<'_> {
         }
     }
 
+    /// The song list's `clickable` field: the slots a press tries, in its
+    /// order (`select/BarRenderer.java:80-101`). An entry naming no slot
+    /// of `slots` is dropped with one note, as one that is no array.
+    fn clickable(
+        &mut self,
+        at: Span,
+        f: Option<u32>,
+        slots: usize,
+    ) -> Result<Vec<u8>, ImportError> {
+        let note = NoteKind::Ignored { field: "clickable" };
+        if f.is_some_and(|f| !self.def.arena.is_array(f)) {
+            self.ignored(at, note);
+            return Ok(Vec::new());
+        }
+        let entries = self.ints(f, "clickable")?;
+        let kept: Vec<u8> = entries
+            .iter()
+            .filter_map(|&i| u8::try_from(i).ok().filter(|&i| usize::from(i) < slots))
+            .collect();
+        if kept.len() < entries.len() {
+            self.ignored(at, note);
+        }
+        Ok(kept)
+    }
+
     /// The `songlist` record `rec` as the model's song list: its
     /// placements, center and styles.
     fn song_list(&mut self, rec: u32) -> Result<(), ImportError> {
@@ -446,8 +473,8 @@ impl Cx<'_> {
                 Ok(placements)
             },
         )?;
+        let clickable = self.clickable(at, clickable, slots)?;
         for (f, field) in [
-            (clickable, "clickable"),
             (playerlamp, "playerlamp"),
             (rivallamp, "rivallamp"),
             (trophy, "trophy"),
@@ -478,6 +505,7 @@ impl Cx<'_> {
             level,
             lamp,
             label,
+            clickable,
         };
         // The visibilities each element charges, as the model evaluates
         // them: every arm's, and every style's, a style two row kinds

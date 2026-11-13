@@ -13,11 +13,11 @@ use rtrb::Consumer;
 use crate::CHANNELS;
 use crate::bank::SoundBank;
 use crate::clock::MixClock;
-use crate::mixer::{InvalidGain, InvalidVolume, Mixer};
+use crate::mixer::{Channel, InvalidGain, InvalidVolume, Mixer};
 use crate::output::{AudioOutput, OutputError};
-use crate::seek::{BgmSchedule, FrameLine, SeekPlan, SeekSource, schedule_hash};
+use crate::seek::{BgmSchedule, FrameLine, ScheduledSound, SeekPlan, SeekSource, schedule_hash};
 
-/// A key sound to play, from the logic thread.
+/// A key sound to play, from the logic thread, on the key channel.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SoundCmd {
     /// The sound.
@@ -164,7 +164,7 @@ pub struct AudioEngine {
     rate: u32,
     period: u32,
     period_us: i64,
-    bgm: Vec<BgmEvent>,
+    bgm: Vec<ScheduledSound>,
     /// [`schedule_hash`] of `bgm`.
     bgm_hash: u64,
     next_bgm: usize,
@@ -196,7 +196,8 @@ pub struct AudioEngine {
 
 /// The decision tone's partials: frequency in Hz and weight.
 const TONE_PARTIALS: [(f32, f32); 2] = [(880.0, 0.6), (1_320.0, 0.4)];
-/// The decision tone's length, its attack and its level before the volume.
+/// The decision tone's length, its attack and its level before the system
+/// volume.
 const TONE_SECONDS: f32 = 0.6;
 const TONE_ATTACK_SECONDS: f32 = 0.005;
 const TONE_LEVEL: f32 = 0.25;
@@ -205,7 +206,8 @@ const TONE_LEVEL: f32 = 0.25;
 /// sound): a short chime the engine makes itself, outside the mixer and
 /// the bank, so no bank's installation or release, stop, restart, seek or
 /// ring-out cuts it. It is added after the mixer's output stage at the
-/// master volume only, not the play's gain, and allocates nothing.
+/// system volume only, not the key or background volume or the play's
+/// gain, and allocates nothing.
 #[derive(Debug)]
 struct Tone {
     rate: f32,
@@ -281,7 +283,8 @@ impl Tone {
 
 impl AudioEngine {
     /// An engine for an output at `rate` with `period`-frame passes,
-    /// playing `bgm` (sorted by time) and key sounds from `bank` with
+    /// playing `bgm` (sorted by time) on the background channel and key
+    /// sounds from `bank` with
     /// `voices` voices. Up to `schedule_log` scheduled starts are kept for
     /// [`AudioEngine::drain_scheduled`].
     ///
@@ -296,19 +299,21 @@ impl AudioEngine {
         voices: usize,
         schedule_log: usize,
     ) -> Result<Self, EngineError> {
-        Self::with_schedule(bank, bgm.to_vec(), rate, period, voices, schedule_log)
+        let bgm = bgm.iter().map(|&e| ScheduledSound::from(e)).collect();
+        Self::with_schedule(bank, bgm, rate, period, voices, schedule_log)
     }
 
     /// [`new`](Self::new) with the schedule moved in rather than copied:
     /// for a schedule built for this engine alone, such as an autoplay
-    /// session's BGM merged with its key sounds.
+    /// session's BGM merged with its key sounds, each start on its own
+    /// channel.
     ///
     /// # Errors
     ///
     /// As [`new`](Self::new).
     pub fn with_schedule(
         bank: Arc<SoundBank>,
-        bgm: Vec<BgmEvent>,
+        bgm: Vec<ScheduledSound>,
         rate: u32,
         period: u32,
         voices: usize,
@@ -400,14 +405,16 @@ impl AudioEngine {
         self.tone.sounding()
     }
 
-    /// Sets the master volume.
+    /// Sets `channel`'s volume: the system volume scales the decision
+    /// tone, the key and background volumes the chart's voices on their
+    /// channels ([`Mixer::set_volume`]), from the next block.
     ///
     /// # Errors
     ///
     /// [`InvalidVolume`] for a volume outside `0.0..=MAX_VOLUME`, which is
     /// not applied.
-    pub fn set_volume(&mut self, volume: f32) -> Result<(), InvalidVolume> {
-        self.mixer.set_volume(volume)
+    pub fn set_volume(&mut self, channel: Channel, volume: f32) -> Result<(), InvalidVolume> {
+        self.mixer.set_volume(channel, volume)
     }
 
     /// Sets the play's fixed gain on the sum ([`Mixer::set_gain`]).
@@ -478,7 +485,7 @@ impl AudioEngine {
     /// The BGM schedule the engine plays (sorted by time), for planning
     /// its seeks ([`SeekPlan::new`]).
     #[must_use]
-    pub fn schedule(&self) -> &[BgmEvent] {
+    pub fn schedule(&self) -> &[ScheduledSound] {
         &self.bgm
     }
 
@@ -646,11 +653,17 @@ impl AudioEngine {
         self.scheduled.clear();
     }
 
-    /// Starts `sound` at output frame `target` (or the first unwritten
-    /// frame) and logs where it started; `false` if the mixer took no
-    /// start.
-    fn start(&mut self, sound: SoundId, kind: ScheduledKind, target: u64) -> bool {
-        let Some(frame) = self.mixer.trigger(&self.bank, sound, target) else {
+    /// Starts `sound` on `channel` at output frame `target` (or the first
+    /// unwritten frame) and logs where it started; `false` if the mixer
+    /// took no start.
+    fn start(
+        &mut self,
+        sound: SoundId,
+        channel: Channel,
+        kind: ScheduledKind,
+        target: u64,
+    ) -> bool {
+        let Some(frame) = self.mixer.trigger(&self.bank, sound, target, channel) else {
             return false;
         };
         if self.scheduled.len() < self.scheduled.capacity() {
@@ -705,7 +718,7 @@ impl AudioEngine {
             out.write(|buf| {
                 report.frames = (buf.len() / CHANNELS) as u32;
                 self.mixer.render(&self.bank, buf);
-                self.tone.add(buf, self.mixer.volume());
+                self.tone.add(buf, self.mixer.volume(Channel::System));
             })?;
             report.active_voices = self.mixer.sounding();
             report.bgm_left = self.bgm.len() - self.next_bgm;
@@ -729,7 +742,7 @@ impl AudioEngine {
             report.commands += 1;
             let target = self.clock.frame_at(cmd.origin).unwrap_or(0);
             let kind = ScheduledKind::Key { origin: cmd.origin };
-            self.start(cmd.sound, kind, target);
+            self.start(cmd.sound, Channel::Key, kind, target);
         }
         let mut deferred = !self.mixer.can_start() && !cmds.is_empty();
         out.write(|buf| {
@@ -801,13 +814,14 @@ impl AudioEngine {
                 }
                 self.next_bgm += 1;
                 report.bgm_started += 1;
-                if self.start(event.sound, ScheduledKind::Bgm { time: event.time }, target) {
+                let kind = ScheduledKind::Bgm { time: event.time };
+                if self.start(event.sound, event.channel, kind, target) {
                     budget -= 1;
                 }
             }
             report.frames = (buf.len() / CHANNELS) as u32;
             self.mixer.render(&self.bank, buf);
-            self.tone.add(buf, self.mixer.volume());
+            self.tone.add(buf, self.mixer.volume(Channel::System));
             // Rendering reached a ring-out's end: everything stopped there,
             // a seek still waiting included, and nothing of the schedule
             // starts any more.
@@ -833,7 +847,7 @@ mod tests {
 
     use super::AudioEngine;
     use crate::bank::SoundBank;
-    use crate::seek::{BgmSchedule, HASHED};
+    use crate::seek::{BgmSchedule, HASHED, ScheduledSound};
 
     /// The schedule is hashed where it is built, once; taking it in walks
     /// none of it, however long it is.
@@ -841,10 +855,12 @@ mod tests {
     fn replace_does_not_hash_the_schedule() {
         let bank = || Arc::new(SoundBank::from_sounds(48_000, Vec::new()));
         let mut e = AudioEngine::new(bank(), &[], 48_000, 480, 4, 4).unwrap();
-        let events: Vec<BgmEvent> = (0..500_000)
-            .map(|k| BgmEvent {
-                time: TimeUs(k),
-                sound: SoundId(0),
+        let events: Vec<ScheduledSound> = (0..500_000)
+            .map(|k| {
+                ScheduledSound::from(BgmEvent {
+                    time: TimeUs(k),
+                    sound: SoundId(0),
+                })
             })
             .collect();
         let before = HASHED.with(std::cell::Cell::get);

@@ -737,7 +737,7 @@ const SETTING_INDICES: [i32; 38] = [
 
 /// The settings fixture: a number per id of [`SETTING_NUMBERS`] on row
 /// `i` (y up `10 · i`), an image of eleven entries per id of
-/// [`SETTING_INDICES`] at x `10 · i` (its first 32), the master volume's
+/// [`SETTING_INDICES`] at x `10 · i` (its first 32), the system volume's
 /// slider (range 100 to the right, at y 600) and graph (100 wide, at
 /// y 500).
 fn settings_skin() -> String {
@@ -847,7 +847,9 @@ fn settings(
 ) -> skin_model::SelectionSettings {
     skin_model::SelectionSettings {
         display_offset_ms,
-        master_volume: skin_model::MasterVolume::of_gain(gain),
+        system_volume: skin_model::VolumeReading::of_gain(gain),
+        key_volume: skin_model::VolumeReading::of_gain(gain),
+        background_volume: skin_model::VolumeReading::of_gain(gain),
         speed,
         order,
         gauge,
@@ -1187,4 +1189,373 @@ fn the_settings_indices_follow_the_players_settings() {
         assert_eq!(at(&mut s, &chart_row, &on)[1..4], want, "{id}");
         assert_eq!(at(&mut s, &folder_row, &on)[1..4], want, "{id}");
     }
+}
+
+/// The ids of the best play's breakdown, the best max combo and the clear
+/// counts, each a number on its own row.
+const BEST_NUMBERS: [i32; 40] = [
+    75, 77, 78, 79, 80, 81, 82, 83, 84, 85, 86, 87, 88, 89, 100, 105, 110, 111, 112, 113, 114, 174,
+    410, 411, 412, 413, 414, 415, 416, 417, 418, 419, 420, 421, 422, 423, 424, 425, 426, 427,
+];
+
+/// A skin with a 6-digit number per id of [`BEST_NUMBERS`] on row `i`.
+fn best_numbers_skin() -> String {
+    let values: Vec<String> = BEST_NUMBERS
+        .iter()
+        .map(|id| format!(r#"{{"id": "n{id}", {DIGITS}, "digit": 6, "ref": {id}}}"#))
+        .collect();
+    let dsts: Vec<String> = BEST_NUMBERS
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            format!(
+                r#"{{"id": "n{id}", "dst": [{}]}}"#,
+                at(0, 10 * i as i32, 4, 8)
+            )
+        })
+        .collect();
+    let list = song_list(&[&at(0, 900, 300, 40)], &[&at(0, 900, 300, 40)], 0, TITLE);
+    format!(
+        r#""imageset": [{SET}], "text": [{TEXT_T}], "value": [{}], {list},
+           "image": [{}],
+           "destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}, {}]"#,
+        values.join(","),
+        common::selection::IMAGES,
+        dsts.join(",")
+    )
+}
+
+/// Each drawn number of [`best_numbers_skin`] by its id.
+fn best_numbers(s: &mut Sel) -> BTreeMap<i32, String> {
+    let mut numbers: BTreeMap<i32, String> = BTreeMap::new();
+    for (t, r) in s.drawn(0) {
+        if let Some(d) = digit_of(t) {
+            let i = ((1072.0 - r[1]) / 10.0) as usize;
+            numbers
+                .entry(BEST_NUMBERS[i])
+                .or_default()
+                .push(char::from(b'0' + d));
+        }
+    }
+    numbers
+}
+
+/// A view of one chart played 5 times, 2 of them clears; with a best, its
+/// play of 7 notes judged PERFECT 4 (1 early), GREAT 2 (early), BAD 1
+/// (late) and 2 empty POORs (1 early, 1 late), max combo 4, while the best
+/// max combo, another play's, is 9.
+fn best_view(with_best: bool) -> skin_model::SelectionView {
+    let mut row = chart("a");
+    row.score = if with_best {
+        RowScore::Best {
+            plays: 5,
+            ex: 10,
+            bp: 1,
+            lamp: OwnLamp::Failed,
+        }
+    } else {
+        RowScore::NoBest { plays: 5 }
+    };
+    let mut v = view(vec![row], Some(0), None, None);
+    let c = v.selected.as_mut().unwrap();
+    c.clears = if with_best { 2 } else { 0 };
+    let per = |perfect, great, bad| rules::PerJudgment {
+        perfect,
+        great,
+        good: 0,
+        bad,
+        poor: 0,
+    };
+    c.best = with_best.then(|| skin_model::SelectedBest {
+        max_combo: 9,
+        play: skin_model::BestPlay {
+            tally: eval::Tally {
+                counts: per(4, 2, 1),
+                ex_score: 10,
+                bp: 1,
+                max_combo: 4,
+                empty_poor: 2,
+                early: per(1, 2, 0),
+                late: per(3, 0, 1),
+                empty_poor_early: 1,
+                empty_poor_late: 1,
+                ..eval::Tally::default()
+            },
+            notes: 7,
+        },
+    });
+    v
+}
+
+/// The selected chart's best play draws through the production path as
+/// the source draws its stored score (`skin/property/
+/// IntegerPropertyFactory.java` at `0.8.9`): the best max combo for 75, 105
+/// and 174 (`:627-631`), the clears and the plays less them (`:140-152`),
+/// the play's counts with their early and late splits (`:444-467`,
+/// `:500-519`), their whole percent of its notes, and its point score from
+/// its own max combo (`ScoreDataProperty.java:75-78`).
+#[test]
+fn the_best_play_breakdown_draws() {
+    let d = folder(&best_numbers_skin());
+    let mut s = Sel::new(import_selection(d.path()).unwrap().skin);
+    s.view(&best_view(true));
+    let want: BTreeMap<i32, String> = [
+        (75, "9"),
+        (77, "5"),
+        (78, "2"),
+        (79, "3"),
+        (80, "4"),
+        (81, "2"),
+        (82, "0"),
+        (83, "1"),
+        (84, "0"),
+        (85, "57"),
+        (86, "28"),
+        (87, "0"),
+        (88, "14"),
+        (89, "0"),
+        (100, "142856"),
+        (105, "9"),
+        (110, "4"),
+        (111, "2"),
+        (112, "0"),
+        (113, "1"),
+        (114, "0"),
+        (174, "9"),
+        (410, "1"),
+        (411, "3"),
+        (412, "2"),
+        (413, "0"),
+        (414, "0"),
+        (415, "0"),
+        (416, "0"),
+        (417, "1"),
+        (418, "0"),
+        (419, "0"),
+        (420, "2"),
+        (421, "1"),
+        (422, "1"),
+        (423, "3"),
+        (424, "2"),
+        (425, "1"),
+        (426, "2"),
+        (427, "3"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k, v.to_owned()))
+    .collect();
+    assert_eq!(best_numbers(&mut s), want);
+}
+
+/// Without a best play the source's empty values draw: with a score row
+/// (plays, no best) the max combo, clears and the score's counts read 0
+/// and the fails the plays, the rates nothing; unplayed, those draw
+/// nothing; the point score and the judge counts read 0 either way
+/// (`ScoreDataProperty.java:90-91`, `MainState.java:141-144`). A best play
+/// of no notes draws its counts and no rate, as the source's hidden rate
+/// with no notes (`IntegerPropertyFactory.java:505-511`).
+#[test]
+fn a_chart_without_a_best_play_shows_the_sources_empty_values() {
+    let d = folder(&best_numbers_skin());
+    let mut s = Sel::new(import_selection(d.path()).unwrap().skin);
+    let zero_counts = [100, 110, 111, 112, 113, 114]
+        .into_iter()
+        .chain(410..=427)
+        .map(|id| (id, "0".to_owned()));
+    s.view(&best_view(false));
+    let mut want: BTreeMap<i32, String> = zero_counts.clone().collect();
+    for (id, v) in [
+        (75, "0"),
+        (77, "5"),
+        (78, "0"),
+        (79, "5"),
+        (80, "0"),
+        (81, "0"),
+        (82, "0"),
+        (83, "0"),
+        (84, "0"),
+        (105, "0"),
+        (174, "0"),
+    ] {
+        want.insert(id, v.to_owned());
+    }
+    assert_eq!(best_numbers(&mut s), want);
+    s.view(&view(vec![chart("u")], Some(0), None, None));
+    assert_eq!(best_numbers(&mut s), zero_counts.collect());
+    // A best play of no notes: its point score 0, its counts drawn, no
+    // rate.
+    let mut v = best_view(true);
+    if let Some(b) = v.selected.as_mut().and_then(|c| c.best.as_mut()) {
+        b.play.notes = 0;
+    }
+    s.view(&v);
+    let drawn = best_numbers(&mut s);
+    assert_eq!(drawn.get(&100).map(String::as_str), Some("0"));
+    assert_eq!(drawn.get(&80).map(String::as_str), Some("4"));
+    assert!((85..=89).all(|id| !drawn.contains_key(&id)), "{drawn:?}");
+}
+
+/// The volumes fixture: numbers 57, 58 and 59 on rows 0 to 2 (y up
+/// `10 · i`), and per channel 17, 18 and 19 a slider (range 100 to the
+/// right, at y 600, 620 and 640) and a graph (100 wide, at y 500, 520 and
+/// 540).
+fn volumes_skin() -> String {
+    const IDS: [i32; 3] = [17, 18, 19];
+    let values: Vec<String> = [57, 58, 59]
+        .iter()
+        .map(|id| format!(r#"{{"id": "n{id}", {DIGITS}, "digit": 5, "ref": {id}}}"#))
+        .collect();
+    let sliders: Vec<String> = IDS
+        .iter()
+        .map(|ty| {
+            format!(
+                r#"{{"id": "vs{ty}", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": {ty}, "angle": 1, "range": 100}}"#
+            )
+        })
+        .collect();
+    let graphs: Vec<String> = IDS
+        .iter()
+        .map(|ty| {
+            format!(
+                r#"{{"id": "vg{ty}", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": {ty}, "angle": 0}}"#
+            )
+        })
+        .collect();
+    let mut dsts: Vec<String> = [57, 58, 59]
+        .iter()
+        .enumerate()
+        .map(|(i, id)| {
+            format!(
+                r#"{{"id": "n{id}", "dst": [{}]}}"#,
+                at(0, 10 * i as i32, 4, 8)
+            )
+        })
+        .collect();
+    for (i, ty) in IDS.iter().enumerate() {
+        let i = i as i32;
+        dsts.push(format!(
+            r#"{{"id": "vs{ty}", "dst": [{}]}}"#,
+            at(0, 600 + 20 * i, 10, 10)
+        ));
+        dsts.push(format!(
+            r#"{{"id": "vg{ty}", "dst": [{}]}}"#,
+            at(0, 500 + 20 * i, 100, 10)
+        ));
+    }
+    let list = song_list(&[&at(0, 900, 300, 40)], &[&at(0, 900, 300, 40)], 0, TITLE);
+    format!(
+        r#""imageset": [{SET}], "text": [{TEXT_T}], "value": [{}], {list},
+           "image": [{}],
+           "slider": [{}],
+           "graph": [{}],
+           "destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}, {}]"#,
+        values.join(","),
+        common::selection::IMAGES,
+        sliders.join(","),
+        graphs.join(","),
+        dsts.join(",")
+    )
+}
+
+/// What the volumes fixture draws: numbers 57 to 59's digits, and each
+/// channel's slider thumb x and graph width, by channel 17 to 19.
+/// Numbers 57 to 59's digits, then the sliders' thumb x and the graphs'
+/// widths, by channel.
+type VolumesFrame = (BTreeMap<i32, String>, [Option<f32>; 3], [Option<f32>; 3]);
+
+fn volumes_frame(s: &mut Sel) -> VolumesFrame {
+    let mut numbers = BTreeMap::new();
+    let (mut sliders, mut graphs) = ([None; 3], [None; 3]);
+    for (t, r) in s.drawn(0) {
+        if let Some(d) = digit_of(t) {
+            let i = ((1072.0 - r[1]) / 10.0) as usize;
+            numbers
+                .entry([57, 58, 59][i])
+                .or_insert_with(String::new)
+                .push(char::from(b'0' + d));
+        } else if t[1] < 8 && (40..48).contains(&t[0]) {
+            // y down: a slider's top at 1080 − 610 − 20 · i, a graph's at
+            // 1080 − 510 − 20 · i.
+            for i in 0..3 {
+                if r[1] == 470.0 - 20.0 * i as f32 {
+                    sliders[i] = Some(r[0]);
+                } else if r[1] == 570.0 - 20.0 * i as f32 {
+                    graphs[i] = Some(r[2]);
+                }
+            }
+        }
+    }
+    (numbers, sliders, graphs)
+}
+
+/// Numbers 57, 58 and 59 show the system, key and background volume's
+/// `(int)(gain · 100f)`, truncated, and sliders and graphs 17, 18 and 19
+/// each that channel's exact ratio, through the production path; a change
+/// of one channel moves only its own number, slider and graph.
+#[test]
+fn each_volume_draws_on_its_own_number_slider_and_graph() {
+    let d = folder(&volumes_skin());
+    let i = import_selection(d.path()).unwrap();
+    let unavailable: Vec<i32> = common::kinds(&i.report)
+        .into_iter()
+        .filter_map(|k| match k {
+            skin_beatoraja::NoteKind::Unavailable { id, .. } => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(unavailable, Vec::<i32>::new());
+    let mut s = Sel::new(i.skin);
+    s.view(&view(vec![chart("a")], Some(0), None, None));
+    let volumes = |system: f32, key: f32, background: f32| skin_model::SelectionSettings {
+        system_volume: skin_model::VolumeReading::of_gain(system),
+        key_volume: skin_model::VolumeReading::of_gain(key),
+        background_volume: skin_model::VolumeReading::of_gain(background),
+        ..settings(
+            0,
+            1.0,
+            skin_model::SpeedView::Classic,
+            skin_model::SelectionOrder::Title,
+            None,
+            [false; 3],
+        )
+    };
+    // A gain's exact ratio as the bars draw it: 100 of travel or width.
+    let x = |gain: f32| (100.0 * f64::from(gain)) as f32;
+    let close = |got: [Option<f32>; 3], want: [f32; 3]| {
+        got.iter()
+            .zip(want)
+            .all(|(g, w)| g.is_some_and(|g| (g - w).abs() < 1e-3))
+    };
+    s.skin
+        .update_selection_settings(&mut s.sel, &volumes(0.45, 0.2, 0.999))
+        .unwrap();
+    let (numbers, sliders, graphs) = volumes_frame(&mut s);
+    assert_eq!(
+        numbers,
+        BTreeMap::from([
+            (57, "45".to_owned()),
+            (58, "20".to_owned()),
+            (59, "99".to_owned()),
+        ])
+    );
+    let want = [x(0.45), x(0.2), x(0.999)];
+    assert!(close(sliders, want), "{sliders:?} {want:?}");
+    assert!(close(graphs, want), "{graphs:?} {want:?}");
+
+    // The key volume alone at unity.
+    s.skin
+        .update_selection_settings(&mut s.sel, &volumes(0.45, 1.0, 0.999))
+        .unwrap();
+    let (numbers, sliders, graphs) = volumes_frame(&mut s);
+    assert_eq!(
+        numbers,
+        BTreeMap::from([
+            (57, "45".to_owned()),
+            (58, "100".to_owned()),
+            (59, "99".to_owned()),
+        ])
+    );
+    let want = [x(0.45), 100.0, x(0.999)];
+    assert!(close(sliders, want), "{sliders:?} {want:?}");
+    assert!(close(graphs, want), "{graphs:?} {want:?}");
 }

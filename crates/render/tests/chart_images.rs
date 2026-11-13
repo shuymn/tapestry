@@ -20,7 +20,9 @@ use decl_support::{BACK_MARK, CHART_BACK, CHART_STAGE, Look, NO_BACK_MARK, bundl
 use render::text::MenuText;
 use std::sync::Arc;
 
-use render::{ChartOutcome, ChartTarget, ClipTable, LoadingFrame, RenderError, SkinBundle};
+use render::{
+    ChartOutcome, ChartTarget, ClipTable, LoadingFrame, LoadingOn, RenderError, SkinBundle,
+};
 use skin_model::chart_image::{ChartDir, ChartImage, ChartTable, Fitted, read};
 
 const BLACK: [u8; 3] = [0; 3];
@@ -461,6 +463,75 @@ fn a_staged_array_takes_its_images_at_its_commit() {
     r.commit(token).unwrap();
     let p = play_frame(&mut r);
     assert_eq!(at(&p, NO_BACK_MARK), BLUE);
+}
+
+/// A staging's own chart images draw in its loading frames before its
+/// commit, keyed for it: the committed installation's images do not, nor
+/// do the staging's in the installed frames; the commit moves them with
+/// its resources, the installed frames drawing them with no
+/// republication. An absent table staged draws the "no image" mark from
+/// the staging's frames on.
+#[test]
+fn staged_chart_images_draw_before_the_commit_and_move_with_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let other_dir = tempfile::tempdir().unwrap();
+    let chart = chart();
+    let mut r = offscreen(1_920, 1_080);
+    let text = MenuText::new(&r);
+    let (b, _) = bundle(&r, dir.path(), &chart_look());
+    install(&mut r, &b, 1);
+    let stage = picture(ChartImage::Stage, b.side(), [640, 480], GREEN);
+    r.publish_chart_images(ChartTarget::Committed, [Some(&stage), None, None])
+        .unwrap();
+    let ctx = context(&GAUGES, false);
+    let staged = |r: &mut render::Renderer, on: LoadingOn| {
+        let t = r.loading_frame_on(on, &frame(1), &text).unwrap().unwrap();
+        assert!(t.presented);
+        read_back(r)
+    };
+
+    let (b2, _) = bundle(&r, other_dir.path(), &other_look());
+    let back = picture(ChartImage::Back, b2.side(), [512, 384], RED);
+    let token = r.stage(&b2, &attempt(&r, &chart, &ctx), 2).unwrap();
+    let on = LoadingOn::Staged(token);
+    let p = staged(&mut r, on);
+    assert_eq!(
+        at(&p, CHART_BACK),
+        BLACK,
+        "unavailable before its publication"
+    );
+    assert_eq!(at(&p, CHART_STAGE), BLACK, "never the committed one's");
+    r.publish_chart_images(ChartTarget::Staged(token), [None, Some(&back), None])
+        .unwrap();
+    let p = staged(&mut r, on);
+    assert_eq!(at(&p, CHART_BACK), RED);
+    assert_eq!(at(&p, CHART_STAGE), BLACK);
+    assert_eq!(at(&p, BACK_MARK), BLUE);
+    let p = loading(&mut r, &text, &frame(1));
+    assert_eq!(
+        at(&p, CHART_STAGE),
+        GREEN,
+        "the installed frames keep theirs"
+    );
+    assert_eq!(at(&p, CHART_BACK), BLACK);
+    r.commit(token).unwrap();
+    let p = loading(&mut r, &text, &frame(1));
+    assert_eq!(at(&p, CHART_BACK), RED, "moved with the commit");
+    assert_eq!(at(&p, CHART_STAGE), BLACK);
+    assert_eq!(at(&p, BACK_MARK), BLUE);
+
+    // An absent table staged: "no image" from the staging's frames on.
+    let (b3, _) = bundle(&r, dir.path(), &chart_look());
+    let token = r.stage(&b3, &attempt(&r, &chart, &ctx), 3).unwrap();
+    let on = LoadingOn::Staged(token);
+    r.publish_chart_absent(ChartTarget::Staged(token)).unwrap();
+    let p = staged(&mut r, on);
+    assert_eq!(at(&p, NO_BACK_MARK), RED);
+    assert_eq!(at(&p, CHART_BACK), BLACK);
+    // A new choice's invalidation: unavailable again in the staged frames.
+    r.invalidate_chart_images();
+    let p = staged(&mut r, on);
+    assert_eq!(at(&p, NO_BACK_MARK), BLACK);
 }
 
 /// A chart layer is charged with the atlas: one more layer of its side.

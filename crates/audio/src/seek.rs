@@ -9,11 +9,42 @@
 use std::hash::{DefaultHasher, Hasher};
 use std::sync::Arc;
 
-use bms_model::{BgmEvent, TimeUs};
+use bms_model::{BgmEvent, SoundId, TimeUs};
 
 use crate::bank::SoundBank;
 use crate::engine::SeekError;
-use crate::mixer::{Counts, MAX_PENDING_STARTS, Slots, Voice, fade_frames};
+use crate::mixer::{Channel, Counts, MAX_PENDING_STARTS, Slots, Voice, fade_frames};
+
+/// A start of a schedule the engine plays: a chart time, the sound and the
+/// channel whose volume it plays at (design.md "Audio", the three volumes).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScheduledSound {
+    /// The chart time it starts at.
+    pub time: TimeUs,
+    /// The sound.
+    pub sound: SoundId,
+    /// The channel it plays on.
+    pub channel: Channel,
+}
+
+impl ScheduledSound {
+    /// `event` on `channel`.
+    #[must_use]
+    pub const fn on(event: BgmEvent, channel: Channel) -> Self {
+        Self {
+            time: event.time,
+            sound: event.sound,
+            channel,
+        }
+    }
+}
+
+impl From<BgmEvent> for ScheduledSound {
+    /// A chart's BGM-lane event, on the background channel.
+    fn from(event: BgmEvent) -> Self {
+        Self::on(event, Channel::Background)
+    }
+}
 
 /// What an engine plays, for planning its seeks where the play is prepared
 /// ([`AudioEngine::seek_source`](crate::AudioEngine::seek_source)): which
@@ -36,7 +67,7 @@ impl SeekSource {
     /// from any other is refused ([`SeekPlan::new`]). Work in proportion to
     /// the schedule, off the audio thread.
     #[must_use]
-    pub fn matches(&self, schedule: &[BgmEvent]) -> bool {
+    pub fn matches(&self, schedule: &[ScheduledSound]) -> bool {
         schedule_hash(schedule) == self.schedule
     }
 }
@@ -47,12 +78,12 @@ thread_local! {
     pub(crate) static HASHED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
-/// A BGM schedule (sorted by time) with its [`schedule_hash`], computed once
+/// A schedule (sorted by time) with its [`schedule_hash`], computed once
 /// where it is built, so the audio thread that takes it in
 /// ([`AudioEngine::replace`](crate::AudioEngine::replace)) never walks it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct BgmSchedule {
-    events: Vec<BgmEvent>,
+    events: Vec<ScheduledSound>,
     hash: u64,
 }
 
@@ -60,33 +91,33 @@ impl BgmSchedule {
     /// `events` with their hash: work in proportion to them, off the audio
     /// thread.
     #[must_use]
-    pub fn new(events: Vec<BgmEvent>) -> Self {
+    pub fn new(events: Vec<ScheduledSound>) -> Self {
         let hash = schedule_hash(&events);
         Self { events, hash }
     }
 
     /// The events.
     #[must_use]
-    pub fn events(&self) -> &[BgmEvent] {
+    pub fn events(&self) -> &[ScheduledSound] {
         &self.events
     }
 
     /// The events and their hash, taken apart without work.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub(crate) fn into_parts(self) -> (Vec<BgmEvent>, u64) {
+    pub(crate) fn into_parts(self) -> (Vec<ScheduledSound>, u64) {
         (self.events, self.hash)
     }
 
     /// A schedule from parts that belong together, without work.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub(crate) const fn from_parts(events: Vec<BgmEvent>, hash: u64) -> Self {
+    pub(crate) const fn from_parts(events: Vec<ScheduledSound>, hash: u64) -> Self {
         Self { events, hash }
     }
 }
 
-/// A hash of every start of `schedule`, in order (SipHash with fixed keys);
-/// it allocates nothing.
-pub(crate) fn schedule_hash(schedule: &[BgmEvent]) -> u64 {
+/// A hash of every start of `schedule`, its channel included, in order
+/// (SipHash with fixed keys); it allocates nothing.
+pub(crate) fn schedule_hash(schedule: &[ScheduledSound]) -> u64 {
     #[cfg(test)]
     HASHED.with(|n| n.set(n.get() + 1));
     let mut h = DefaultHasher::new();
@@ -94,6 +125,7 @@ pub(crate) fn schedule_hash(schedule: &[BgmEvent]) -> u64 {
     for e in schedule {
         h.write_i64(e.time.0);
         h.write_u16(e.sound.0);
+        h.write_usize(e.channel.index());
     }
     h.finish()
 }
@@ -171,7 +203,7 @@ impl SeekPlan {
     /// [`SeekError::Source`] for a schedule other than the engine's.
     pub fn new(
         source: &SeekSource,
-        schedule: &[BgmEvent],
+        schedule: &[ScheduledSound],
         line: FrameLine,
         t: TimeUs,
     ) -> Result<Self, SeekError> {
@@ -201,7 +233,7 @@ impl SeekPlan {
     pub fn replan(
         &mut self,
         source: &SeekSource,
-        schedule: &[BgmEvent],
+        schedule: &[ScheduledSound],
         line: FrameLine,
         t: TimeUs,
     ) -> Result<(), SeekError> {
@@ -254,6 +286,7 @@ impl SeekPlan {
             let voice = Voice {
                 active: true,
                 id: e.sound,
+                channel: e.channel,
                 sound,
                 start,
                 seq,

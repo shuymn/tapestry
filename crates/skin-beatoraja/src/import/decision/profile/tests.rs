@@ -44,10 +44,9 @@ fn every_profile_id_has_its_class() {
     for id in 190..=195 {
         assert_eq!(option(id), None, "option {id}");
     }
+    assert_eq!(timer(1), Timer::Builtin(decision_timer::INPUT));
     assert_eq!(timer(2), Timer::Builtin(decision_timer::FADEOUT));
-    for id in [0, 1] {
-        assert_eq!(timer(id), Timer::Unset, "{id}");
-    }
+    assert_eq!(timer(0), Timer::Unset);
     let supported = (0..3_000)
         .filter(|&id| !matches!(timer(id), Timer::Unsupported))
         .count();

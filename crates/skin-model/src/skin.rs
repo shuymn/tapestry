@@ -4,7 +4,6 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use std::cell::Cell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use bms_model::{Chart, LANE_COUNT, TimeUs};
@@ -17,19 +16,24 @@ use crate::atlas::{Atlas, AtlasError, AtlasLimits, KeptLayers, Variant};
 use crate::canvas::{Canvas, Fit, MAX_CANVAS, f32_of};
 use crate::chart_image::{ChartImage, ChartStretch, ChartTable};
 use crate::decision::schema::timer as decision_timer;
-use crate::decision::{DecisionError, DecisionFrame, DecisionScreen};
+use crate::decision::{
+    DecisionError, DecisionFrame, DecisionLabels, DecisionScreen, DecisionStrings,
+};
 use crate::expr::State;
 use crate::expr::{CompileError, Program, SkinOps};
 use crate::image::Sheet;
 use crate::layout::{Controls, Layout, Region, RegionDef};
 use crate::place::{
-    AngleFollow, Bind, Bounds, Fill, Follow, Native, Place, Placement, Regions, union,
+    Affine, AngleFollow, Bind, Bounds, Fill, Follow, Native, Place, Placement, Regions, union,
 };
 use crate::play::loading::{Loading, LoadingFrame, LoadingGauge, Need, loading_rate};
 use crate::play::schema::timer::BUILTIN;
 use crate::play::schema::{Grade, field};
 use crate::play::timers::elapsed_us;
 use crate::play::{BuildError, Continuation, Play, PlayContext, PrepareError, SkinFrame};
+use crate::pointer::{
+    self, ActionDef, Button, HoverRect, PointerDef, PointerError, PressHit, SearchBounds, Target,
+};
 use crate::present::{OutTy, Present, PresentDef, PresentError};
 use crate::quad::{Blend, ClipId, Filter, QuadBatch, RunKey};
 use crate::result::schema::timer as result_timer;
@@ -74,8 +78,8 @@ use crate::widget::song_list::{
 };
 use crate::widget::text::clean;
 use crate::widget::text::{
-    self, ChartText, FontRef, MAX_TEXT_ELEMENTS, MAX_TEXT_EM_PX, Overflow, Text, TextDef,
-    TextError, TextRequest, TextSlots, TextTable, TextTableError, TextValue,
+    self, ChartText, FontRef, MAX_TEXT_ELEMENTS, MAX_TEXT_EM_PX, Overflow, SelectionText, Text,
+    TextDef, TextError, TextRequest, TextSlots, TextTable, TextTableError, TextValue,
 };
 use crate::widget::timing_graph::{TimingGraph, TimingGraphDef, TimingGraphDraw};
 use crate::widget::timing_vis::{
@@ -227,12 +231,16 @@ pub enum VisualizerError {
     Alpha,
 }
 
-/// The widgets only a selection skin draws.
+/// The widgets only a selection skin draws, and the pointer input its
+/// elements take.
 #[derive(Clone, Debug, Default)]
 pub struct SelectionDefs {
     /// The song list [`Source::SongList`] draws.
     pub song_list: Option<SongListDef>,
     pub ratio_bars: Vec<RatioBarDef>,
+    /// Per element at most one entry: its action, hover rect or search
+    /// box.
+    pub pointer: Vec<PointerDef>,
 }
 
 /// The widgets elements draw by index.
@@ -418,6 +426,12 @@ pub enum LoadError {
     SourceKind { element: usize, kind: ScreenKind },
     #[error("the song list")]
     SongList(#[source] SongListError),
+    #[error("pointer entry {entry}")]
+    Pointer {
+        entry: usize,
+        #[source]
+        error: PointerError,
+    },
     #[error("judge graph {graph}'s image does not exist")]
     JudgeGraphImage { graph: usize },
     #[error("graph element {element} names a native size: its graph sizes itself")]
@@ -486,6 +500,21 @@ enum Kind {
     ChartImage(ChartImage, Filter, ChartStretch),
 }
 
+/// What a press on an element other than a slider gives, recorded in its
+/// pointer target's slot when it draws.
+#[derive(Clone, Copy, Debug)]
+enum Press {
+    Action(ActionDef),
+    /// Search text `index`'s input box (its order among the search texts).
+    Search {
+        index: u8,
+    },
+    /// A song list, its slots' row hits from `first`.
+    List {
+        first: u16,
+    },
+}
+
 #[derive(Clone, Debug)]
 struct Element {
     kind: Kind,
@@ -505,6 +534,17 @@ struct Element {
     /// What its visibility and its number's value or image selector need
     /// to be read while loading.
     loading: Need,
+    /// A selection skin's hover rect: it draws only while the pointer is
+    /// inside it.
+    hover: Option<HoverRect>,
+    /// Its press and its pointer target's slot; a slider's slot is its
+    /// kind's.
+    press: Option<(usize, Press)>,
+    /// Its pointer region ([`PointerDef::region`]), which its press and
+    /// hover rects are placed on: the pointer entry's region, else its own
+    /// track (never an image choice entry's); `None` without a pointer
+    /// entry, its sampled rect.
+    pointer_region: Option<Track>,
 }
 
 /// The runtime state a frame draws from: a play's, or the loading
@@ -559,8 +599,12 @@ enum Phase<'a> {
         gauge: Option<LoadingGauge>,
         chosen: u8,
     },
-    /// A selection frame: its rows, ratios and slider hits.
-    Selection { sel: &'a Selection },
+    /// A selection frame: its rows, ratios and pointer targets, and the
+    /// pointer in target pixels.
+    Selection {
+        sel: &'a Selection,
+        pointer: Option<[f32; 2]>,
+    },
     /// A result frame: the view's state.
     Result { res: &'a ResultScreen },
     /// A decision frame: its timers and text alone.
@@ -619,8 +663,13 @@ pub struct Skin {
     /// graph and pixmap size, each timing and hit-error visualizer
     /// element's definition.
     plan: GraphPlan,
-    /// The slider elements that take a press.
-    sliders: usize,
+    /// The pointer targets in draw order: the changeable sliders, the
+    /// action elements, the search texts and the song list elements.
+    targets: usize,
+    /// The row hit cells: the song list's slots per song list element.
+    row_hits: usize,
+    /// The search texts, each with its kept input box.
+    search_boxes: usize,
     /// The callbacks whose outputs a selection or result state carries
     /// after its fields ([`crate::output`]): the screen's runtime writes
     /// them (docs/stage3.md S7-07).
@@ -631,6 +680,14 @@ pub struct Skin {
     /// Its chart layer was given up because the atlas could not hold it
     /// ([`without_chart_layer`](Skin::without_chart_layer)).
     chart_layer_dropped: bool,
+}
+
+/// `rect` (reference pixels) placed by `affine` and then on `canvas`'s
+/// target: left, top, width, height in target pixels, unrotated.
+fn on_target(canvas: &Canvas, affine: Affine, rect: [f32; 4]) -> [f32; 4] {
+    let ([ox, oy], s) = (canvas.origin(), canvas.scale());
+    let [x, y, w, h] = affine.rect(rect);
+    [ox + x * s, oy + y * s, w * s, h * s]
 }
 
 /// The next skin's identity.
@@ -1623,6 +1680,9 @@ fn check_selection_widgets(
         if usize::from(l.center) >= n {
             return fail(SongListError::Center { center: l.center });
         }
+        if let Some(&slot) = l.clickable.iter().find(|&&c| usize::from(c) >= n) {
+            return fail(SongListError::Clickable { slot });
+        }
         for p in l.parts() {
             if screen_slot_of(p.timer, whens, builtin).is_none() {
                 return fail(SongListError::UnknownTimer);
@@ -1670,6 +1730,62 @@ fn check_selection_widgets(
         };
         if let Some(error) = error {
             return Err(LoadError::RatioBar { bar, error });
+        }
+    }
+    Ok(())
+}
+
+/// The pointer entries' checks of [`Skin::new_selection`]: each names an
+/// element of `def` that no other entry names, an action only on an image
+/// or an image choice, a search box only on text showing the query, and a
+/// hover rect and a region within the coordinate range, the region keyed
+/// as the element's track; an image choice's entries keyed as it is too,
+/// since its region is its own track whichever entry draws. Search texts
+/// are text elements, so at most
+/// [`MAX_SEARCH_BOXES`](crate::MAX_SEARCH_BOXES).
+fn check_pointer(def: &SkinDef, entries: &[PointerDef]) -> Result<(), LoadError> {
+    let mut named = vec![false; def.elements.len()];
+    for (entry, p) in entries.iter().enumerate() {
+        let fail = |error| Err(LoadError::Pointer { entry, error });
+        let i = index(p.element);
+        let (Some(e), Some(seen)) = (def.elements.get(i), named.get_mut(i)) else {
+            return fail(PointerError::UnknownElement);
+        };
+        if std::mem::replace(seen, true) {
+            return fail(PointerError::Duplicate);
+        }
+        if p.action.is_some() && !matches!(e.source, Source::Image(_) | Source::ImageChoice(_)) {
+            return fail(PointerError::ActionSource);
+        }
+        let query = match e.source {
+            Source::Text(t) => def
+                .widgets
+                .texts
+                .get(index(t))
+                .is_some_and(|t| t.value == TextValue::Selection(SelectionText::Query)),
+            _ => false,
+        };
+        if p.search && !query {
+            return fail(PointerError::SearchSource);
+        }
+        // An entry's own track places what it draws, never its pointer
+        // region: that is the element's track, sampled at the same times.
+        if choice_of(def, e.source).is_some_and(|c| {
+            c.choices
+                .iter()
+                .flatten()
+                .filter_map(|c| c.track.as_ref())
+                .any(|t| !t.same_timing(&e.track))
+        }) {
+            return fail(PointerError::RegionTiming);
+        }
+        if p.hover.is_some_and(|h| !pointer::hover_in(h, MAX_COORD))
+            || p.region.as_ref().is_some_and(track_outside)
+        {
+            return fail(PointerError::Coordinates);
+        }
+        if p.region.as_ref().is_some_and(|r| !r.same_timing(&e.track)) {
+            return fail(PointerError::RegionTiming);
         }
     }
     Ok(())
@@ -1726,6 +1842,7 @@ fn song_list_of(
         }),
         lamp: l.lamp.map(|v| v.map(picture)),
         label: l.label.map(|v| v.map(picture)),
+        clickable: l.clickable.into_boxed_slice(),
     }
 }
 
@@ -1864,6 +1981,7 @@ impl Skin {
         let sel = SelectionDefs {
             song_list: None,
             ratio_bars,
+            pointer: Vec::new(),
         };
         let res = ResultDefs {
             judge_graphs,
@@ -2192,6 +2310,7 @@ impl Skin {
         }
         check_play_widgets(&play, &exists)?;
         check_selection_widgets(&sel, &frames, whens.len(), builtin, &def.sheet)?;
+        check_pointer(&def, &sel.pointer)?;
         for (element, e) in elements.iter().enumerate() {
             let fonts = [def.sheet.font_count(), def.sheet.bitmap_font_count()];
             check_widget_images(element, e.source, w, &frames, fonts)?;
@@ -2432,12 +2551,26 @@ impl Skin {
             .collect();
         // Text slots in draw order; at most `MAX_TEXT_ELEMENTS`.
         let mut text_slots = 0_u16;
-        let mut sliders = 0_usize;
+        // Pointer targets in draw order, and the row hit cells: at most
+        // 16 384 / 5 song list slots in all, since each slot's quads count
+        // against `MAX_WIDGET_QUADS`, so a list's first cell fits a `u16`.
+        let (mut targets, mut row_hits) = (0_usize, 0_usize);
+        // Search texts in draw order: text elements, so at most
+        // `MAX_SEARCH_BOXES`.
+        let mut search_boxes = 0_usize;
         let SelectionDefs {
             song_list,
             ratio_bars,
+            pointer,
         } = sel;
+        let mut pointers = vec![None; def.elements.len()];
+        for p in pointer {
+            if let Some(slot) = pointers.get_mut(index(p.element)) {
+                *slot = Some(p);
+            }
+        }
         let song_list = song_list.map(|l| song_list_of(l, &image, &slot));
+        let list_slots = song_list.as_ref().map_or(0, |l| l.placements.len());
         let ratio_bars: Box<[RatioBar]> = ratio_bars
             .into_iter()
             .map(|def| RatioBar {
@@ -2531,7 +2664,14 @@ impl Skin {
             .elements
             .into_iter()
             .zip(slots)
-            .map(|(e, slot)| Element {
+            .zip(pointers)
+            .map(|((e, slot), pointer)| Element {
+                // Before the track moves: an interactive element's region
+                // is its own, never the sampled rect of an image choice's
+                // entry, whichever entry draws.
+                pointer_region: pointer
+                    .as_ref()
+                    .map(|p| p.region.clone().unwrap_or_else(|| e.track.clone())),
                 loading: {
                     let choice = |i: usize| image_choices.get(i).map(|c| &c.value);
                     let value = match e.source {
@@ -2579,10 +2719,7 @@ impl Skin {
                                 ..
                             })
                         );
-                        let hit = changeable.then(|| {
-                            sliders += 1;
-                            sliders - 1
-                        });
+                        let hit = changeable.then(|| next(&mut targets));
                         Kind::RatioBar(index(i), hit)
                     }
                     Source::JudgeGraph(i) => Kind::JudgeGraph(index(i)),
@@ -2627,6 +2764,26 @@ impl Skin {
                 native: e.place.native,
                 follow: e.place.follow,
                 angle: e.place.angle,
+                hover: pointer.as_ref().and_then(|p| p.hover),
+                press: {
+                    let press = match e.source {
+                        Source::SongList => {
+                            let first = u16::try_from(row_hits).unwrap_or(u16::MAX);
+                            row_hits = row_hits.saturating_add(list_slots);
+                            Some(Press::List { first })
+                        }
+                        Source::Text(_) if pointer.as_ref().is_some_and(|p| p.search) => {
+                            Some(Press::Search {
+                                index: u8::try_from(next(&mut search_boxes)).unwrap_or(u8::MAX),
+                            })
+                        }
+                        Source::Image(_) | Source::ImageChoice(_) => {
+                            pointer.as_ref().and_then(|p| p.action).map(Press::Action)
+                        }
+                        _ => None,
+                    };
+                    press.map(|p| (next(&mut targets), p))
+                },
             })
             .collect();
         let whens_need = def.whens.iter().map(|w| Need::of(Some(w))).collect();
@@ -2665,7 +2822,9 @@ impl Skin {
             timing_visualizers,
             hit_errors,
             plan,
-            sliders,
+            targets,
+            search_boxes,
+            row_hits,
             outputs: 0,
             id: NEXT_SKIN.fetch_add(1, Ordering::Relaxed),
             chart_layer_dropped: false,
@@ -3632,7 +3791,7 @@ impl Skin {
             self.whens.len(),
             self.text_slots(),
             self.song_list_slots(),
-            self.sliders,
+            [self.targets, self.row_hits, self.search_boxes],
             self.outputs,
         )
     }
@@ -3644,7 +3803,9 @@ impl Skin {
             && sel.skin == self.id
             && sel.slots() == usize::from(selection_timer::BUILTIN) + self.whens.len()
             && sel.rows.len() == self.song_list_slots()
-            && sel.hits.len() == self.sliders
+            && sel.targets.len() == self.targets
+            && sel.row_hits.len() == self.row_hits
+            && sel.search.len() == self.search_boxes
             && sel.text.len() == self.text_slots()
     }
 
@@ -3672,7 +3833,7 @@ impl Skin {
         Ok(())
     }
 
-    /// Fills `sel`'s settings' fields and the master volume's ratio from
+    /// Fills `sel`'s settings' fields and the system volume's ratio from
     /// `settings`, apart from the view, which a later
     /// [`update_selection`](Self::update_selection) leaves as they are.
     /// Writes fields only: no string, no allocation, so a frame may call
@@ -3895,8 +4056,12 @@ impl Skin {
     /// prepared them for this frame's time, places the regions, then appends each drawn element's
     /// quads to `out` in draw order (the caller clears `out`): images,
     /// image choices, numbers, text, the song list's slots and the ratio
-    /// bars, recording each changeable slider's travel for
-    /// [`slider_at`](Self::slider_at). Allocates nothing.
+    /// bars, an element with a hover rect only while the frame's pointer is
+    /// inside it. Records each pointer target it draws for
+    /// [`hit_at`](Self::hit_at) and [`drag_at`](Self::drag_at): each
+    /// changeable slider's travel, each action element's rect, each search
+    /// text's box and each song list slot whose bar drew. Allocates
+    /// nothing.
     ///
     /// A state this skin did not make, or a uv table of another sheet or
     /// length, draws nothing.
@@ -3919,8 +4084,11 @@ impl Skin {
         if !self.owns(sel) {
             return Ok(());
         }
-        for h in &sel.hits {
-            h.set(None);
+        for t in &sel.targets {
+            t.set(None);
+        }
+        for r in &sel.row_hits {
+            r.set(None);
         }
         if uvs.sheet_id() != self.sheet_id || uvs.frames().len() != self.frame_count {
             return Ok(());
@@ -3945,22 +4113,75 @@ impl Skin {
             lanes: LaneView::NONE,
             complete: false,
             hidden_enabled: false,
-            phase: Phase::Selection { sel },
+            phase: Phase::Selection {
+                sel,
+                pointer: frame.pointer,
+            },
         };
         self.draw(&rt, &scene, None, uvs, &canvas, &placement, out);
         Ok(())
     }
 
-    /// What a press at `point` (target pixels) on a `target`-pixel target
+    /// What a press of `button` at `point` (target pixels) on a
+    /// `target`-pixel target hits among the pointer targets the last
+    /// [`build_selection`](Self::build_selection) of `sel` drew, topmost
+    /// first (`skin/Skin.java:394-410`):
+    ///
+    /// - search text's input box, its region moved by its alignment, its
+    ///   edges included: [`PointerHit::Search`](crate::PointerHit::Search),
+    ///   with its order among the search texts;
+    /// - a changeable slider's travel: the ratio under the point, as
+    ///   [`drag_at`](Self::drag_at) reads it; off its travel the walk goes
+    ///   on;
+    /// - an action element's region, its destination before any stretch:
+    ///   its event, its argument by its [`ClickType`](crate::ClickType) and
+    ///   `button` (`skin/SkinObject.java:671-700`);
+    /// - a song list: the first of its clickable slots, in their order,
+    ///   whose bar drew over the point, with that row's identity
+    ///   (`select/BarRenderer.java:80-101`); none, and the walk goes on.
+    ///
+    /// The hit is `None` when nothing is hit. Apart from it, the answer
+    /// says which search texts' input boxes, as the last build to sample
+    /// each placed it (drawn now or hidden since), hold the point
+    /// ([`SearchBoxes`](crate::SearchBoxes)), which decides the focused
+    /// box's blur whatever is hit (`skin/Skin.java:394-397`,
+    /// `skin/SkinTextInput.java:77-81`). [`PressHit::NONE`] for a state of
+    /// another skin; a box placed at another target size holds no point.
+    /// Changes nothing; allocates nothing.
+    #[must_use]
+    pub fn hit_at(
+        &self,
+        sel: &Selection,
+        point: [f32; 2],
+        target: [u32; 2],
+        button: Button,
+    ) -> PressHit {
+        if !self.owns(sel) {
+            return PressHit::NONE;
+        }
+        let clickable = self.song_list.as_ref().map_or(&[][..], |l| &l.clickable);
+        pointer::hit(
+            &sel.targets,
+            &sel.row_hits,
+            &sel.search,
+            clickable,
+            point,
+            target,
+            button,
+        )
+    }
+
+    /// What dragging to `point` (target pixels) on a `target`-pixel target
     /// asks of a changeable slider drawn by the last
     /// [`build_selection`](Self::build_selection) of `sel`: the ratio under
     /// it on the topmost such slider's travel, as the source reads it
-    /// (`skin/SkinSlider.java:124-178`), the ends snapped within one
-    /// reference pixel. `None` off every travel, for a slider that did not
-    /// draw in that build, or when that build was at another target size.
-    /// Changes nothing.
+    /// (`skin/SkinSlider.java:124-178`, `skin/Skin.java:412-419`), the ends
+    /// snapped within one reference pixel. Every other target is passed
+    /// over. `None` off every travel, for a slider that did not draw in
+    /// that build, or when that build was at another target size. Changes
+    /// nothing; allocates nothing.
     #[must_use]
-    pub fn slider_at(
+    pub fn drag_at(
         &self,
         sel: &Selection,
         point: [f32; 2],
@@ -3969,12 +4190,7 @@ impl Skin {
         if !self.owns(sel) {
             return None;
         }
-        sel.hits
-            .iter()
-            .rev()
-            .filter_map(Cell::get)
-            .filter(|h| h.target == target)
-            .find_map(|h| h.at(point))
+        pointer::drag(&sel.targets, point, target)
     }
 
     /// A fresh result state ([`ResultScreen`]): every timer off, every
@@ -4076,26 +4292,32 @@ impl Skin {
         res.bitmap = self.bitmap_lines(&res.strings.chart());
     }
 
-    /// Prepares the timers of `res`'s frame at `now` from `timers`, as
+    /// Prepares `res`'s frame at `now`: the application's readouts from
+    /// `app`, then the timers from `timers`, as
     /// [`prepare_selection_frame`](Self::prepare_selection_frame) does a
-    /// selection's: the build of the same frame (the same `now`) then takes
-    /// them as they are, so the screen's runtime between the two reads the
-    /// state the build draws (docs/stage3.md S7-07). Allocates nothing.
+    /// selection's: the build of the same frame (the same `now`, with the
+    /// same `app`) then takes them as they are, so the screen's runtime
+    /// between the two reads the state the build draws (docs/stage3.md
+    /// S7-07). Allocates nothing.
     ///
     /// # Errors
     ///
-    /// [`BuildError::Kind`] for a skin that is not a result skin.
+    /// [`BuildError::Kind`] for a skin that is not a result skin;
+    /// [`BuildError::InvalidReadouts`] for a readout of `app` outside its
+    /// field's range, which leaves nothing prepared.
     pub fn prepare_result_frame(
         &self,
         res: &mut ResultScreen,
         now: TimeUs,
         timers: &ResultTimers,
+        app: &AppReadouts,
     ) -> Result<(), BuildError> {
         if self.kind != ScreenKind::Result {
             return Err(BuildError::Kind);
         }
         if self.owns_result(res) {
-            res.fill(now, timers, &self.whens);
+            res.prepared = None;
+            res.fill(now, timers, app, &self.whens)?;
             res.prepared = Some(now);
         }
         Ok(())
@@ -4117,8 +4339,9 @@ impl Skin {
     ///
     /// # Errors
     ///
-    /// [`BuildError::Kind`] for a skin that is not a result skin; nothing
-    /// is appended.
+    /// [`BuildError::Kind`] for a skin that is not a result skin;
+    /// [`BuildError::InvalidReadouts`] for a readout of the frame's `app`
+    /// outside its field's range. Nothing is appended.
     pub fn build_result(
         &self,
         res: &mut ResultScreen,
@@ -4130,7 +4353,7 @@ impl Skin {
             return Ok(());
         }
         if res.prepared.take() != Some(frame.now) {
-            res.fill(frame.now, &frame.timers, &self.whens);
+            res.fill(frame.now, &frame.timers, &frame.app, &self.whens)?;
         }
         let res = &*res;
         let rt = Runtime {
@@ -4203,6 +4426,55 @@ impl Skin {
         self.text_requests(&dec.strings.chart(), target, layout)
     }
 
+    /// The rows a decision preparation reserves for its rasterized lines
+    /// on a `target`-pixel target with `layout`: each text element
+    /// [`text_requests`](Self::text_requests) may ask a line for, as
+    /// `(slot, em)` in slot order, whatever its string. It allocates.
+    #[must_use]
+    pub fn outline_rows(&self, target: [u32; 2], layout: &Layout) -> Vec<(u16, f32)> {
+        let (fit, ..) = self.fit(target);
+        self.elements
+            .iter()
+            .filter_map(|e| {
+                let Kind::Text(i, t) = e.kind else {
+                    return None;
+                };
+                let hidden = e.visible.as_ref().and_then(Program::constant) == Some(0);
+                (!hidden && t.bitmap.is_none() && self.texts.get(i).is_some())
+                    .then(|| (t.slot, self.em_px(&e.track, e.region, fit, layout)))
+            })
+            .collect()
+    }
+
+    /// The lines to rasterize for `strings` on a `target`-pixel target
+    /// with `layout`, as [`decision_text_requests`](Self::decision_text_requests)
+    /// makes them, without a decision state: for a worker. It allocates.
+    /// A skin that is not a decision skin gives none.
+    #[must_use]
+    pub fn decision_text_requests_for(
+        &self,
+        strings: &DecisionStrings,
+        target: [u32; 2],
+        layout: &Layout,
+    ) -> Vec<TextRequest> {
+        if self.kind != ScreenKind::Decision {
+            return Vec::new();
+        }
+        self.text_requests(&strings.chart(), target, layout)
+    }
+
+    /// The lines in bitmap fonts of `strings`, chosen and cleaned as
+    /// [`attach_decision_bitmap_text`](Self::attach_decision_bitmap_text)
+    /// lays them out, without a decision state: for a worker. It
+    /// allocates. A skin that is not a decision skin gives no slot.
+    #[must_use]
+    pub fn decision_bitmap_lines(&self, strings: &DecisionStrings) -> BitmapLines {
+        if self.kind != ScreenKind::Decision {
+            return BitmapLines::default();
+        }
+        BitmapLines::new(self.bitmap_lines(&strings.chart()))
+    }
+
     /// Attaches the rasterized lines for `dec`'s text elements; a slot in
     /// a bitmap font draws its bitmap line instead.
     ///
@@ -4259,6 +4531,46 @@ impl Skin {
             state: dec.state(),
             text: &dec.text,
             bitmap: &dec.bitmap,
+            chart: None,
+        };
+        let at = (frame.now, frame.target, frame.layout);
+        self.draw_screen(&rt, Phase::Decision, at, uvs, out);
+        Ok(())
+    }
+
+    /// Builds one decision frame of `dec` as
+    /// [`build_decision`](Self::build_decision) does, its lines drawn from
+    /// `labels`, borrowed from their owner, in place of `dec`'s own:
+    /// nothing is moved or copied. Allocates nothing.
+    ///
+    /// A state this skin did not make, labels whose tables are not one
+    /// line per text slot, or a uv table of another sheet or length, draws
+    /// nothing.
+    ///
+    /// # Errors
+    ///
+    /// [`BuildError::Kind`] for a skin that is not a decision skin;
+    /// nothing is appended.
+    pub fn build_decision_with(
+        &self,
+        dec: &mut DecisionScreen,
+        labels: DecisionLabels<'_>,
+        frame: &DecisionFrame<'_>,
+        uvs: &UvTable,
+        out: &mut QuadBatch,
+    ) -> Result<(), BuildError> {
+        let slots = self.text_slots();
+        let fits = labels.text.len() == slots && labels.bitmap.len() == slots;
+        if !self.screen_draws(ScreenKind::Decision, fits && self.owns_decision(dec), uvs)? {
+            return Ok(());
+        }
+        dec.fill(frame.now, &frame.timers, &self.whens);
+        let dec = &*dec;
+        let rt = Runtime {
+            starts: dec.starts(),
+            state: dec.state(),
+            text: labels.text,
+            bitmap: labels.bitmap.lines(),
             chart: None,
         };
         let at = (frame.now, frame.target, frame.layout);
@@ -4373,11 +4685,37 @@ impl Skin {
             | Phase::Result { .. }
             | Phase::Decision => None,
         };
-        let sel = match scene.phase {
-            Phase::Selection { sel } => Some(sel),
+        let (sel, pointer) = match scene.phase {
+            Phase::Selection { sel, pointer } => (Some(sel), pointer),
             Phase::Play { .. } | Phase::Loading { .. } | Phase::Result { .. } | Phase::Decision => {
-                None
+                (None, None)
             }
+        };
+        // Records what pointer target `slot` drew this build.
+        let record = |slot: usize, t: Target| {
+            if let Some(cell) = sel.and_then(|s| s.targets.get(slot)) {
+                cell.set(Some(t));
+            }
+        };
+        // An element's pointer region at its local time `t`, its sampled
+        // rect `rect` there: its destination before any stretch or text
+        // alignment. The source computes `region` from the destination in
+        // `SkinObject.prepare` and tests the hover rect and a press against
+        // it (`skin/SkinObject.java:591-607, 671-700`); only `draw`
+        // stretches the rect it draws (`skin/SkinObject.java:623-643`).
+        let region_at = |e: &Element, t: i64, rect: [f32; 4]| {
+            e.pointer_region
+                .as_ref()
+                .and_then(|r| r.sample(t))
+                .map_or(rect, |r| r.rect)
+        };
+        // Whether an element of hover rect `hover` and region `rect` under
+        // `affine` is hovered; one without a hover rect always is.
+        let hovered = |hover: Option<HoverRect>, affine: Affine, rect: [f32; 4]| {
+            hover.is_none_or(|h| {
+                let scale = affine.scale.map(|s| s * canvas.scale());
+                pointer::hovered(h, on_target(canvas, affine, rect), scale, pointer)
+            })
         };
         #[cfg(feature = "dev-tools")]
         let mut element = 0_u32;
@@ -4399,10 +4737,24 @@ impl Skin {
                 if !placement.region(e.region).visible {
                     continue;
                 }
-                let Some((_t, s)) =
+                let Some((t, s)) =
                     sample(rt.starts, now, state, e.slot, e.visible.as_ref(), &e.track)
                 else {
                     continue;
+                };
+                let affine = placement.affine(e.region, e.fill);
+                if !hovered(e.hover, affine, region_at(e, t, s.rect)) {
+                    #[cfg(feature = "dev-tools")]
+                    out.observed(crate::observation::Outcome::PointerOutside);
+                    continue;
+                }
+                let first = match e.press {
+                    Some((slot, Press::List { first })) => {
+                        let target = canvas.target();
+                        record(slot, Target::List { first, target });
+                        usize::from(first)
+                    }
+                    _ => sel.row_hits.len(),
                 };
                 let d = ListDraw {
                     starts: rt.starts,
@@ -4414,7 +4766,7 @@ impl Skin {
                     uvs,
                     brush: Brush {
                         key: e.key,
-                        affine: placement.affine(e.region, e.fill),
+                        affine,
                         map: placement.bind(e.bind),
                         pivot: e.pivot,
                         angle: 0.0,
@@ -4422,6 +4774,8 @@ impl Skin {
                         native: None,
                         scale: canvas.scale(),
                     },
+                    hits: sel.row_hits.get(first..).unwrap_or_default(),
+                    origin: canvas.origin(),
                 };
                 list.draw(&d, out);
                 continue;
@@ -4513,6 +4867,9 @@ impl Skin {
             };
             #[cfg(feature = "dev-tools")]
             out.observed_time(t);
+            // Its pointer region, before a chart image's stretch below, and
+            // moved with the covers as its rect is.
+            let region = e.follow.translate(region_at(e, t, s.rect), lanes.as_ref());
             // A chart image: its uv, and its stretch against its native
             // size, applied to the sampled rect as an imported image's is
             // baked into its keys; absent, or unavailable, it draws nothing.
@@ -4529,6 +4886,25 @@ impl Skin {
                 _ => (s, None),
             };
             let affine = placement.affine(e.region, e.fill);
+            // A search text's input box, the region moved by the alignment
+            // (`skin/SkinText.java:162-169`), kept in the state as sampled
+            // here, before a hover rect hides it: the source prepares its
+            // `region` before its `mouseRect` test, and a condition or a
+            // timer that hides it leaves the last one
+            // (`skin/SkinObject.java:348-356, 591-607`).
+            let search_box = match (e.press, e.kind) {
+                (Some((slot, Press::Search { index })), Kind::Text(_, text)) => {
+                    let rect = on_target(canvas, affine, pointer::input_box(text.align, region));
+                    if let Some(cell) = sel.and_then(|s| s.search.get(usize::from(index))) {
+                        cell.set(Some(SearchBounds {
+                            rect,
+                            target: canvas.target(),
+                        }));
+                    }
+                    Some((slot, index, rect))
+                }
+                _ => None,
+            };
             let map = placement.bind(e.bind);
             // The covers' motion, after the track and before the lane map
             // and the region; lanes and judges never follow. A paint also
@@ -4589,6 +4965,11 @@ impl Skin {
                 }
                 None => (e.follow.translate(s.rect, lanes.as_ref()), None),
             };
+            if !hovered(e.hover, affine, region) {
+                #[cfg(feature = "dev-tools")]
+                out.observed(crate::observation::Outcome::PointerOutside);
+                continue;
+            }
             // A text keeps its own angle but never turns with the
             // turntable, as the source draws text unrotated by it.
             let turn = match e.kind {
@@ -4629,6 +5010,19 @@ impl Skin {
                         && let Some(f) = image.frame(rt.starts, now, uvs)
                     {
                         brush.push_clipped(out, rect, f, image.filter, trim);
+                        // The source tests a press against the region, not
+                        // the stretched rect drawn
+                        // (`skin/SkinObject.java:671-700`).
+                        if let Some((slot, Press::Action(def))) = e.press {
+                            record(
+                                slot,
+                                Target::Action {
+                                    rect: on_target(canvas, affine, region),
+                                    def,
+                                    target: canvas.target(),
+                                },
+                            );
+                        }
                     }
                 }
                 Kind::ChartImage(_, filter, _) => {
@@ -4693,6 +5087,17 @@ impl Skin {
                     }
                 }
                 Kind::Text(_, t) => {
+                    // The box takes a press whether or not its line drew.
+                    if let Some((slot, index, rect)) = search_box {
+                        record(
+                            slot,
+                            Target::Search {
+                                rect,
+                                index,
+                                target: canvas.target(),
+                            },
+                        );
+                    }
                     if t.bitmap.is_some() {
                         if let Some(Some(line)) =
                             rt.bitmap.get(usize::from(t.slot)).filter(|_| bitmaps)
@@ -4708,10 +5113,24 @@ impl Skin {
                         let image = b.image;
                         let b = &b.def;
                         let value = match (b.source, scene.phase) {
-                            (RatioSource::ListPosition, Phase::Selection { sel }) => sel.position,
-                            (RatioSource::ExRate, Phase::Selection { sel }) => sel.ex_rate,
-                            (RatioSource::MasterVolume, Phase::Selection { sel }) => {
-                                sel.master_volume
+                            (RatioSource::ListPosition, Phase::Selection { sel, .. }) => {
+                                sel.position
+                            }
+                            (RatioSource::ExRate, Phase::Selection { sel, .. }) => sel.ex_rate,
+                            (RatioSource::JudgeRate(k), Phase::Selection { sel, .. }) => {
+                                sel.judge_rates.get(usize::from(k)).copied().flatten()
+                            }
+                            (RatioSource::ComboRate, Phase::Selection { sel, .. }) => {
+                                sel.combo_rate
+                            }
+                            (RatioSource::SystemVolume, Phase::Selection { sel, .. }) => {
+                                sel.system_volume
+                            }
+                            (RatioSource::KeyVolume, Phase::Selection { sel, .. }) => {
+                                sel.key_volume
+                            }
+                            (RatioSource::BackgroundVolume, Phase::Selection { sel, .. }) => {
+                                sel.background_volume
                             }
                             (RatioSource::Score(r), Phase::Play { play, .. }) => {
                                 play.score_ratio(r)
@@ -4735,30 +5154,30 @@ impl Skin {
                         if let Some(v) = value {
                             draw_ratio(b, image, v, rect, &brush, &at, out);
                             if let (
-                                Some(h),
+                                Some(slot),
                                 RatioForm::Slider {
                                     direction, range, ..
                                 },
-                            ) = (hit.and_then(|h| sel?.hits.get(h)), b.form)
+                            ) = (hit, b.form)
                             {
-                                let [ox, oy] = canvas.origin();
-                                let sc = canvas.scale();
-                                let [x, y, w, h_] = affine.rect(rect);
                                 let [sx, sy] = affine.scale;
                                 let axis = match direction {
                                     SliderDirection::Up | SliderDirection::Down => sy,
                                     SliderDirection::Right | SliderDirection::Left => sx,
-                                } * sc;
+                                } * canvas.scale();
                                 #[expect(clippy::cast_precision_loss, reason = "within ±2^20")]
                                 let range = range as f32 * axis;
-                                h.set(Some(Hit {
-                                    source: b.source,
-                                    direction,
-                                    rect: [ox + x * sc, oy + y * sc, w * sc, h_ * sc],
-                                    range,
-                                    scale: axis,
-                                    target: canvas.target(),
-                                }));
+                                record(
+                                    slot,
+                                    Target::Slider(Hit {
+                                        source: b.source,
+                                        direction,
+                                        rect: on_target(canvas, affine, rect),
+                                        range,
+                                        scale: axis,
+                                        target: canvas.target(),
+                                    }),
+                                );
                             }
                         }
                     }

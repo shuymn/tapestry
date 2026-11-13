@@ -184,6 +184,8 @@ fn dense_view() -> ResultView {
             bp: ResultNumber::Shown(23),
             bp_diff: ResultNumber::Shown(-3),
             clear: LampKey::Hard,
+            max_combo: ResultNumber::Shown(150),
+            max_combo_diff: ResultNumber::Shown(-20),
             ex_updated: true,
             bp_updated: true,
             rate: Some(BestRate {

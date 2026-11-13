@@ -7,6 +7,12 @@ license = "GPL-3.0-or-later"
 repository.workspace = true
 publish.workspace = true
 
+[features]
+default = []
+# Development features: a clock a test holds. Never enabled in production
+# builds (R3).
+dev-tools = []
+
 [dependencies]
 bms-model.workspace = true
 eval.workspace = true

@@ -30,6 +30,10 @@ pub struct SelectionView {
     pub query: String,
     /// The chart under the cursor; `None` on any other row.
     pub selected: Option<SelectedChart>,
+    /// The list's revision: it changes whenever the list's rows may have
+    /// changed, so a [`RowRef`](crate::RowRef) drawn from an earlier list
+    /// names no row of this one.
+    pub list_revision: u64,
 }
 
 /// An exact ratio `numerator / denominator`, the denominator never zero.
@@ -98,20 +102,20 @@ impl Ratio {
     }
 }
 
-/// The master gain as a selection skin shows it: the gain that plays,
+/// A volume as a selection skin shows it: the gain that plays,
 /// as an exact ratio for the sliders and graphs, and the number the
 /// source's system volume number draws, `(int)(gain · 100f)`: the `f32`
 /// product truncated toward zero, which is not always the exact floor
 /// (0.01 shows 1, 0.53 shows 52).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct MasterVolume {
+pub struct VolumeReading {
     /// The gain, exactly ([`Ratio::of_f32`]).
     pub ratio: Ratio,
     /// `(int)(gain · 100f)`.
     pub number: i32,
 }
 
-impl MasterVolume {
+impl VolumeReading {
     /// The volume of `gain`, a gain from 0 to 1 (`device.toml`'s range);
     /// one outside it reads as 0.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -175,8 +179,12 @@ pub struct SelectionSettings {
     /// The display offset in whole ms, its sign the settings': a positive
     /// one draws the chart as if later, as the source's judge timing.
     pub display_offset_ms: i32,
-    /// The master gain that plays.
-    pub master_volume: MasterVolume,
+    /// The system volume that plays.
+    pub system_volume: VolumeReading,
+    /// The key volume that plays.
+    pub key_volume: VolumeReading,
+    /// The background volume that plays.
+    pub background_volume: VolumeReading,
     pub speed: SpeedView,
     pub order: SelectionOrder,
     /// The chosen preset's displayed gauge's look; `None` without a
@@ -253,6 +261,10 @@ pub enum RowKind {
 pub struct RowView {
     pub key: RowKey,
     pub kind: RowKind,
+    /// The row's index among the list's selectable rows, the cursor's
+    /// space; `None` for a heading, and where the view does not number
+    /// its rows.
+    pub index: Option<u32>,
     /// A chart's `#TITLE` as stored, a folder's directory name, a heading's
     /// folder under its root; empty for the "all charts" row and a chart
     /// without a title.
@@ -368,6 +380,52 @@ pub struct SelectedChart {
     /// 4 the easiest; `None` without one, or for a rank in no class. A
     /// value above 4 is none.
     pub judge_class: Option<u8>,
+    /// The counted plays that were clears under the chosen preset: eligible
+    /// plays whose own lamp is not FAILED (design.md "Personal Bests"); 0
+    /// when unplayed.
+    pub clears: u64,
+    /// The best's values beyond `score`'s; `None` without a best.
+    pub best: Option<SelectedBest>,
+}
+
+/// What the bests keep of the selected chart beside its EX, BP and lamp
+/// (design.md "Personal Bests").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SelectedBest {
+    /// The best max combo, of any counted play: not necessarily `play`'s.
+    pub max_combo: u32,
+    /// The one play that set the best EX score.
+    pub play: BestPlay,
+}
+
+/// The play that set a best EX score, every figure from that one play.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BestPlay {
+    /// Its evaluation's counts: judgments, their early and late splits,
+    /// empty POORs, EX score, BP and max combo; the current combo is 0.
+    pub tally: eval::Tally,
+    /// The judged notes of the chart as it drew them.
+    pub notes: u32,
+}
+
+impl BestPlay {
+    /// The source's point score of a 7-key play
+    /// (`ScoreDataProperty.java:75-78` at `0.8.9`): `⌊(150 000·PERFECT +
+    /// 100 000·GREAT + 20 000·GOOD) / n⌋ + ⌊50 000·combo / n⌋`, two floors,
+    /// with this play's own max combo where the source takes the best max
+    /// combo, so every figure is one play's; 0 with no notes.
+    #[must_use]
+    pub fn point(&self) -> u64 {
+        let n = u64::from(self.notes);
+        if n == 0 {
+            return 0;
+        }
+        let c = &self.tally.counts;
+        let judged = 150_000 * u64::from(c.perfect)
+            + 100_000 * u64::from(c.great)
+            + 20_000 * u64::from(c.good);
+        judged / n + 50_000 * u64::from(self.tally.max_combo) / n
+    }
 }
 
 #[cfg(test)]
@@ -394,6 +452,33 @@ mod tests {
         assert_eq!(RowFeatures::of(&summary(1, 0)), f(true, false));
         assert_eq!(RowFeatures::of(&summary(0, 1)), f(false, true));
         assert_eq!(RowFeatures::of(&summary(5, 9)), f(true, true));
+    }
+
+    /// The point score floors its two terms apart, as the source's: notes
+    /// 7, PERFECT 4, GREAT 2, BAD 1, combo 4 give 114 285 + 28 571, where
+    /// one floor over the sum gives 142 857; no notes give 0.
+    #[test]
+    fn the_point_score_floors_its_two_terms_apart() {
+        let mut tally = eval::Tally::default();
+        tally.counts.perfect = 4;
+        tally.counts.great = 2;
+        tally.counts.bad = 1;
+        tally.max_combo = 4;
+        let play = |notes| super::BestPlay { tally, notes };
+        assert_eq!(play(7).point(), 142_856);
+        assert_eq!(play(0).point(), 0);
+        // GOOD weighs 20 000: one GOOD of one note, its combo 1.
+        let mut good = eval::Tally::default();
+        good.counts.good = 1;
+        good.max_combo = 1;
+        assert_eq!(
+            super::BestPlay {
+                tally: good,
+                notes: 1
+            }
+            .point(),
+            70_000
+        );
     }
 
     #[test]
@@ -474,10 +559,10 @@ mod tests {
             (0.81, 81),
             (1.0, 100),
         ] {
-            let v = super::MasterVolume::of_gain(gain);
+            let v = super::VolumeReading::of_gain(gain);
             assert_eq!(v.number, number, "{gain}");
             assert_eq!(Some(v.ratio), Ratio::of_f32(gain), "{gain}");
         }
-        assert_eq!(super::MasterVolume::of_gain(1.5).number, 0);
+        assert_eq!(super::VolumeReading::of_gain(1.5).number, 0);
     }
 }

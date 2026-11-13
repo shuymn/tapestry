@@ -344,7 +344,18 @@ fn selection_frame_alloc() {
     s.set_notice(Some("refused".to_owned()));
     // The settings, applied each frame with the settings keys' values.
     let tuning = crate::tuning::LiveTuning::new(game::Tuning {
-        volume_percent: 50,
+        system: game::Volume {
+            percent: 100,
+            intent: false,
+        },
+        key: game::Volume {
+            percent: 50,
+            intent: false,
+        },
+        background: game::Volume {
+            percent: 50,
+            intent: false,
+        },
         display_offset_us: 0,
         input_offset_us: 0,
     });
@@ -440,6 +451,7 @@ fn rows_at(at: usize, n: usize) -> SelectionView {
         .map(|i| RowView {
             key: RowKey::Chart(std::path::PathBuf::from(format!("{i}.bms"))),
             kind: RowKind::Chart,
+            index: None,
             title: title(i),
             subtitle: String::new(),
             artist: String::new(),
@@ -458,6 +470,7 @@ fn rows_at(at: usize, n: usize) -> SelectionView {
         place: SelectionPlace::All,
         query: String::new(),
         selected: None,
+        list_revision: 0,
     }
 }
 

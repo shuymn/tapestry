@@ -12,13 +12,17 @@ use std::time::{Duration, Instant};
 use bms_model::Chart;
 use eval::Section;
 use skin_model::{
-    AtlasId, AtlasLimits, BitmapLines, BuildError, ChartText, Layout, PackedPages, ResultFrame,
-    ResultScreen, ScreenKind, Selection, SelectionFrame, TextSlots, TextTable, TextTableError,
+    AtlasId, AtlasLimits, BitmapLines, BuildError, ChartText, DecisionFrame, DecisionLabels,
+    DecisionScreen, Layout, PackedPages, ResultFrame, ResultScreen, ScreenKind, Selection,
+    SelectionFrame, TextSlots, TextTable, TextTableError,
 };
 use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
+use crate::decision_labels::{
+    self, DecisionMemory, FillStep, LabelRegion, LabelStore, LabelTarget, RowPlan, Settled,
+};
 use crate::decl::{DeclSkin, Installation, SkinBundle, page_levels, pages_bytes, pages_texels};
 use crate::gpu::{self, AdapterChoice, Gpu};
 use crate::measure::{FrameStatistics, Presentation};
@@ -367,6 +371,11 @@ pub enum RenderError {
     /// chart images were written: they stay unavailable.
     #[error("chart images: the installation changed during the write")]
     ChartChanged,
+    /// A loading frame asked of a play staging the renderer no longer
+    /// holds, or one that is not play's own or the installed bundle's: it
+    /// draws nothing.
+    #[error("loading: the staging asked for is not staged")]
+    NotStaged,
     /// A skin's sprites do not fit the device's largest buffer; the skin
     /// in use stays.
     #[error("capacity: {sprites} sprites, past the device's {max} bytes")]
@@ -415,6 +424,15 @@ pub enum RenderError {
     /// committed or restored.
     #[error("the result skin is disabled for this run")]
     ResultDisabled,
+    /// The decision installation's label rows at the target pass half its
+    /// text layer: its labels cannot be prepared, and the kind is refused.
+    #[error("the decision labels need {needed} rows of a {band}-row band")]
+    LabelRegion {
+        /// The rows' heights together.
+        needed: u64,
+        /// Half the text layer's side.
+        band: u32,
+    },
     /// A pages-only installation asked for a kind other than the result's,
     /// the only kind that has one ([`Renderer::install_pages`]).
     #[error("the {kind} screen has no pages-only installation")]
@@ -442,6 +460,8 @@ impl RenderError {
             | Self::Admission { .. }
             | Self::ResultDisabled
             | Self::PagesKind { .. }
+            | Self::NotStaged
+            | Self::LabelRegion { .. }
             | Self::ChartImage { .. } => true,
             Self::Atlas(UploadError::Device(e)) => matches!(
                 e,
@@ -451,6 +471,29 @@ impl RenderError {
             _ => false,
         }
     }
+}
+
+/// Which play installation a loading frame draws
+/// ([`Renderer::loading_frame_on`]) and its loading text is prepared for:
+/// the one installed, or the staging `token` names, before its commit
+/// (design.md "beatoraja Lua Skins", the pending presentation).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LoadingOn {
+    /// The installed play skin.
+    Installed,
+    /// The staged play installation `token` names.
+    Staged(PreparedToken),
+}
+
+/// Which resources a frame is drawn from ([`Renderer::draw_on`]).
+#[derive(Clone, Copy, Debug)]
+enum Draw {
+    /// Play's installed resources.
+    Play,
+    /// Another kind's committed slot.
+    Slot(usize),
+    /// The play staging's own resources.
+    Pending,
 }
 
 /// Where chart images are published ([`Renderer::publish_chart_images`]):
@@ -581,12 +624,20 @@ struct PublishedChart {
 /// together: its atlas array and bind group, and the staging and instance
 /// buffer sized for its capacities, with its clips.
 struct Resources {
+    /// Its number, given at its making and kept when it is installed: the
+    /// loading text's and the chart images' keys name it, so what was
+    /// prepared on a staging's resources stays valid when its commit
+    /// installs them ([`Renderer::replace_resources`]).
+    id: u64,
     atlas: AtlasTexture,
     atlas_bind: wgpu::BindGroup,
     staging: Staging,
     instances: wgpu::Buffer,
-    /// The text layer's cache: empty with the atlas.
+    /// The text layer's cache: empty with the atlas; none for the
+    /// decision installation, whose layer is its label region.
     text_cache: TextCache,
+    /// The decision installation's label region over its text layer.
+    labels: Option<LabelRegion>,
 }
 
 /// The result kind's pages-only installation ([`Renderer::install_pages`]):
@@ -675,10 +726,17 @@ struct Pending {
     /// The lines its attempt's table draws, in its resources' cache or the
     /// installed one.
     text: Holder,
+    /// The lines its loading presentation's text slots draw while it is
+    /// drawn staged, in its own resources' cache: the commit moves them
+    /// into the installed loading lines with that cache. Empty for a
+    /// staging on the installed resources, whose loading lines are the
+    /// installed ones.
+    loading: Holder,
     /// The chart images published into its own array
-    /// ([`ChartTarget::Staged`]), of no array yet: its commit keys them
-    /// with the generation it makes, so they are valid from the commit
-    /// on, and a discard drops them with it.
+    /// ([`ChartTarget::Staged`]), keyed at publication with its own key
+    /// ([`Renderer::staged_chart_key`]), which its commit keeps: its
+    /// loading frames draw them before the commit and the installed ones
+    /// after it, and a discard drops them with it.
     chart: Option<skin_model::chart_image::ChartTable>,
 }
 
@@ -816,6 +874,18 @@ pub struct MemoryWitness {
     /// installation on another array (its array, layout, text cache,
     /// lines and own CPU description) or a pages-only one.
     pub retired: u64,
+    /// The decision label slots' contents: their strings, tables and
+    /// bitmap lines ([`with_decision`](Self::with_decision)).
+    pub decision_labels: u64,
+    /// The decision labels' levels staged and not yet written: the
+    /// worker's, the waiting output's and the filling slot's remainder.
+    pub decision_staged: u64,
+    /// The decision worker's A8 buffer and its producer's glyph mask
+    /// bound, apart from the renderer's own ([`text_mask`](Self::text_mask)).
+    pub decision_text_mask: u64,
+    /// The bytes the queue staged for the decision labels' last boundary
+    /// of writes, until the fill ends.
+    pub decision_upload: u64,
 }
 
 impl MemoryWitness {
@@ -849,6 +919,23 @@ impl MemoryWitness {
             .saturating_add(self.result_text)
             .saturating_add(self.result_loading)
             .saturating_add(self.retired)
+            .saturating_add(self.decision_labels)
+            .saturating_add(self.decision_staged)
+            .saturating_add(self.decision_text_mask)
+            .saturating_add(self.decision_upload)
+    }
+
+    /// The witness with the decision labels' bytes, which their owner
+    /// keeps apart from the renderer ([`LabelStore::memory`]).
+    #[must_use]
+    pub const fn with_decision(self, d: DecisionMemory) -> Self {
+        Self {
+            decision_labels: d.labels,
+            decision_staged: d.staged,
+            decision_text_mask: d.text_mask,
+            decision_upload: d.upload,
+            ..self
+        }
     }
 }
 
@@ -1021,9 +1108,12 @@ pub struct Renderer {
     /// discard or refusal, and so never below `committed`: no staging of
     /// a request up to it is taken.
     requested: u64,
-    /// Bumped each time the atlas and the staging are replaced: a test of
-    /// whether an installation reused them.
+    /// The number of the atlas and staging in use, a new one each time they
+    /// are replaced ([`Resources::id`]): a test of whether an installation
+    /// reused them.
     resources: u64,
+    /// The last number given to resources made.
+    resource_ids: u64,
     /// The installation staged and not yet committed.
     pending: Option<Pending>,
     /// The result kind's pages-only installation, in place of its slot.
@@ -1133,6 +1223,27 @@ pub struct Renderer {
     /// preparation, is refused as a skin refuses one.
     #[cfg(any(test, feature = "dev-tools"))]
     result_faults: (bool, bool),
+    /// Tests and development builds: the next decision frame is refused
+    /// as a skin refuses one.
+    #[cfg(any(test, feature = "dev-tools"))]
+    decision_fault: bool,
+    /// Tests and development builds: the next settling of the decision
+    /// labels fails as a poll fails.
+    #[cfg(any(test, feature = "dev-tools"))]
+    decision_settle_fault: bool,
+    /// Run by a decision label fill after its submission and the scopes'
+    /// pop, before its completion is registered: a unit test makes the
+    /// device fail there.
+    #[cfg(test)]
+    pub(crate) decision_after_submit: Option<fn(&Gpu)>,
+    /// Run by a decision label fill inside a boundary's scopes, after its
+    /// writes: a unit test makes a scope report an error.
+    #[cfg(test)]
+    pub(crate) decision_in_scope: Option<fn(&Gpu)>,
+    /// Unit tests: the pairs of error scopes the decision label fills
+    /// opened.
+    #[cfg(test)]
+    pub(crate) decision_scope_pairs: std::cell::Cell<usize>,
     /// Tests and development builds: the charges stated for bundles
     /// ([`state_charge`](Self::state_charge)).
     #[cfg(any(test, feature = "dev-tools"))]
@@ -1231,6 +1342,7 @@ impl Renderer {
             committed: 0,
             requested: 0,
             resources: 0,
+            resource_ids: 0,
             pending: None,
             result_pages: None,
             retired: None,
@@ -1280,6 +1392,16 @@ impl Renderer {
             selection_faults: (false, false),
             #[cfg(any(test, feature = "dev-tools"))]
             result_faults: (false, false),
+            #[cfg(any(test, feature = "dev-tools"))]
+            decision_fault: false,
+            #[cfg(any(test, feature = "dev-tools"))]
+            decision_settle_fault: false,
+            #[cfg(test)]
+            decision_after_submit: None,
+            #[cfg(test)]
+            decision_in_scope: None,
+            #[cfg(test)]
+            decision_scope_pairs: std::cell::Cell::new(0),
             #[cfg(any(test, feature = "dev-tools"))]
             stated: Vec::new(),
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
@@ -1347,6 +1469,19 @@ impl Renderer {
         for slot in self.screens.iter_mut().flatten() {
             let canvas = slot.installation.bundle().skin().canvas(target);
             slot.resources.staging.project(&canvas);
+        }
+        // A play staging on its own resources, which its loading frames
+        // draw before its commit; one on the installed resources shares
+        // the staging projected above.
+        if let Some(Pending {
+            token,
+            skin: Some(skin),
+            res: PendingRes::Own(r),
+            ..
+        }) = &mut self.pending
+            && token.kind == ScreenKind::Play
+        {
+            r.staging.project(&skin.canvas(target));
         }
     }
 
@@ -1477,7 +1612,8 @@ impl Renderer {
         self.atlas_bind = bind;
         self.staging.set_clips(clips);
         self.atlas = atlas;
-        self.advance_resources();
+        self.resources = self.next_resources_id();
+        self.cancel_built();
         Ok(())
     }
 
@@ -1821,7 +1957,7 @@ impl Renderer {
             }
             None => (
                 Installation::new(Arc::clone(bundle)),
-                PendingRes::Own(Box::new(self.resources_for(bundle)?)),
+                PendingRes::Own(Box::new(self.resources_for(kind, bundle)?)),
             ),
         };
         let mut skin = DeclSkin::of(&installation);
@@ -1890,6 +2026,7 @@ impl Renderer {
             pages: None,
             res,
             text,
+            loading: Holder::default(),
             chart: None,
         });
         #[cfg(test)]
@@ -1911,21 +2048,36 @@ impl Renderer {
     /// uploaded with its bind group and an instance buffer for the staging,
     /// all finished on the GPU. A device refusing any of them (memory,
     /// validation) is answered as a refusal, never an uncaptured error.
-    fn resources_for(&mut self, bundle: &Arc<SkinBundle>) -> Result<Resources, RenderError> {
+    /// The decision kind's text layer is its label region, with no cache.
+    fn resources_for(
+        &mut self,
+        kind: ScreenKind,
+        bundle: &Arc<SkinBundle>,
+    ) -> Result<Resources, RenderError> {
         let staging = self.staging_for(bundle)?;
         let (atlas, atlas_bind, buffer, text_cache) =
             self.upload_array(bundle.atlas_pages(), Some(staging.instance_capacity()))?;
+        let (text_cache, labels) = if kind == ScreenKind::Decision {
+            let region = atlas
+                .text_layer()
+                .map(|layer| LabelRegion::new(atlas.side(), layer));
+            (TextCache::none(), region)
+        } else {
+            (text_cache, None)
+        };
         #[expect(
             clippy::expect_used,
             reason = "upload_array makes the instance buffer it is given a size for"
         )]
         let instances = buffer.expect("an instance buffer was asked for");
         Ok(Resources {
+            id: self.next_resources_id(),
             atlas,
             atlas_bind,
             staging,
             instances,
             text_cache,
+            labels,
         })
     }
 
@@ -2071,7 +2223,7 @@ impl Renderer {
             return Err(RenderError::Superseded { request, newer });
         }
         self.requested = request;
-        self.pending = None;
+        self.drop_pending();
         self.retired = None;
         Ok(())
     }
@@ -2121,6 +2273,7 @@ impl Renderer {
             pages: Some(Arc::clone(pages)),
             res,
             text: Holder::default(),
+            loading: Holder::default(),
             chart: None,
         });
         Ok(token)
@@ -2203,17 +2356,21 @@ impl Renderer {
                 let staged_chart = pending.chart;
                 if let PendingRes::Own(r) = pending.res {
                     self.replace_resources(*r);
+                    // The staged presentation's loading lines, in the cache
+                    // that moved with its resources: its key unchanged,
+                    // nothing is prepared again.
+                    self.installed_loading = pending.loading;
                 }
                 self.installed_text = pending.text;
                 if let Some(skin) = pending.skin {
                     self.activate_decl_skin(skin);
                 }
-                // Images published into the staged array, keyed only now:
-                // after the activation, the live key names the incoming
-                // installation and its atlas with the generation this
-                // commit made (before it, `installed` was still the
-                // outgoing one), so the attempt takes them from its commit
-                // on (S10-12 design P12).
+                // Images published into the staged array, keyed for it at
+                // publication: after the activation the live key names the
+                // incoming installation, its atlas and the resources' number
+                // the commit kept, the same key, so the attempt takes them
+                // from its commit on with nothing written again
+                // (S10-12 design P12).
                 if let Some(table) = staged_chart
                     && let Some(key) = self.chart_key()
                 {
@@ -2271,27 +2428,31 @@ impl Renderer {
                                     s.resources.atlas,
                                     s.resources.atlas_bind,
                                     s.resources.text_cache,
+                                    s.resources.labels,
                                     s.text,
                                 ))
                             }
                             (None, Some(p)) => {
-                                Some((p.atlas, p.atlas_bind, p.text_cache, Holder::default()))
+                                Some((p.atlas, p.atlas_bind, p.text_cache, None, Holder::default()))
                             }
                             (None, None) => None,
                         };
                         let canvas = installation.bundle().skin().canvas(target);
                         staging.project(&canvas);
-                        if let (Some((atlas, atlas_bind, text_cache, text)), Some(slot)) =
+                        if let (Some((atlas, atlas_bind, text_cache, labels, text)), Some(slot)) =
                             (held, self.screens.get_mut(i))
                         {
                             *slot = Some(Slot {
                                 installation,
                                 resources: Resources {
+                                    // Another kind's: no key names it.
+                                    id: 0,
                                     atlas,
                                     atlas_bind,
                                     staging: *staging,
                                     instances,
                                     text_cache,
+                                    labels,
                                 },
                                 text,
                             });
@@ -2335,10 +2496,11 @@ impl Renderer {
     }
 
     /// Replaces the atlas, its bind group, the staging and the instance
-    /// buffer with `r`, together. The installed loading lines' holder goes
-    /// with the cache it held lines in: the new resources' key makes the
-    /// presentation's loading text stale, and the player clears it before
-    /// the next loading frame is built.
+    /// buffer with `r`, together, taking its number. The installed loading
+    /// lines' holder goes with the cache it held lines in: a commit moves
+    /// the staging's own in after ([`commit`](Self::commit)); otherwise the
+    /// new key makes the presentation's loading text stale, and the player
+    /// clears it before the next loading frame is built.
     fn replace_resources(&mut self, r: Resources) {
         self.atlas = r.atlas;
         self.atlas_bind = r.atlas_bind;
@@ -2346,23 +2508,43 @@ impl Renderer {
         self.instances = r.instances;
         self.text_cache = r.text_cache;
         self.installed_loading = Holder::default();
-        self.advance_resources();
+        self.resources = r.id;
+        self.cancel_built();
     }
 
-    /// The one step every replacement of the play array passes: a new
-    /// resource generation, and any frame built against the old one
-    /// cancelled, so no staged quad, a chart image's included, is
-    /// submitted against an array it was not built for (S10-12 design
-    /// §5.3).
-    fn advance_resources(&mut self) {
-        self.resources += 1;
+    /// The step every replacement of the play array passes: any frame
+    /// built against the old one is cancelled, so no staged quad, a chart
+    /// image's included, is submitted against an array it was not built
+    /// for (S10-12 design §5.3).
+    const fn cancel_built(&mut self) {
         self.started = None;
+    }
+
+    /// Drops the staging, if any, and the loading text staged on its own
+    /// resources, whose lines go with their cache: text staged for the
+    /// installation in use stays.
+    fn drop_pending(&mut self) {
+        self.pending = None;
+        let installed = self.loading_text_key();
+        if self
+            .staged_text
+            .as_ref()
+            .is_some_and(|t| Some(t.key) != installed)
+        {
+            self.staged_text = None;
+        }
+    }
+
+    /// A number for resources made now, never given before.
+    const fn next_resources_id(&mut self) -> u64 {
+        self.resource_ids += 1;
+        self.resource_ids
     }
 
     /// Drops the staged installation, if any: its resources go, and the
     /// installation in use stays.
     pub fn discard(&mut self) {
-        self.pending = None;
+        self.drop_pending();
     }
 
     /// Installs `installation` as `kind`'s with no attempt prepared, at
@@ -2383,12 +2565,12 @@ impl Renderer {
         kind: ScreenKind,
         installation: &Installation,
     ) -> Result<(), RenderError> {
-        self.pending = None;
+        self.drop_pending();
         if kind == ScreenKind::Result && self.result_disabled {
             return Err(RenderError::ResultDisabled);
         }
         self.admit(kind, installation.bundle())?;
-        let r = self.resources_for(installation.bundle())?;
+        let r = self.resources_for(kind, installation.bundle())?;
         match Self::screen(kind) {
             None => {
                 self.replace_resources(r);
@@ -2418,7 +2600,7 @@ impl Renderer {
         }
         self.release(kind);
         if self.pending.as_ref().is_some_and(|p| p.token.kind == kind) {
-            self.pending = None;
+            self.drop_pending();
         }
     }
 
@@ -2435,7 +2617,7 @@ impl Renderer {
         kind: ScreenKind,
         pages: &Arc<PackedPages>,
     ) -> Result<(), RenderError> {
-        self.pending = None;
+        self.drop_pending();
         if kind != ScreenKind::Result {
             return Err(RenderError::PagesKind { kind });
         }
@@ -2482,8 +2664,8 @@ impl Renderer {
     ///
     /// `target` names the array: the committed installation's, or a staged
     /// installation's own ([`ChartTarget::Staged`]), whose table is held
-    /// with the staging, of no array, and keyed at its commit; a staging's
-    /// table is not presented before it, so step 1 there only drops it.
+    /// with the staging under the staging's own key and drawn by its
+    /// loading presentation from then on; its commit keeps the key.
     /// [`ChartTarget::Selection`] writes as
     /// [`write_selection_chart`](Self::write_selection_chart) does, with
     /// no set recorded, so the next write is never skipped.
@@ -2520,6 +2702,7 @@ impl Renderer {
                 };
                 let out = self.publish_staged_chart(&mut pending, token, images);
                 self.pending = Some(pending);
+                self.sync_staged_chart();
                 out
             }
         }
@@ -2654,6 +2837,14 @@ impl Renderer {
             return Err(RenderError::NoChartLayer);
         };
         let bundle = Arc::clone(skin.installation().bundle());
+        // Keyed now, with the staging's own key: its loading frames draw
+        // them before the commit, which keeps the key.
+        let staged_key = skin_model::chart_image::ChartKey {
+            renderer: self.id,
+            installation: skin.installation().loading().id(),
+            atlas: bundle.atlas_id().0,
+            generation: res.id,
+        };
         let (Some(layer), Some(at)) = (bundle.chart_layer(), res.atlas.chart_layer()) else {
             return Err(RenderError::NoChartLayer);
         };
@@ -2717,9 +2908,10 @@ impl Renderer {
             }
         }
         // 3. The staging is the one written into: it was held out for the
-        // write. 4. Held with it, keyed at its commit.
+        // write. 4. Held with it under its own key, which its commit keeps,
+        // and drawn by its loading presentation meanwhile.
         let [stage, back, banner] = uvs;
-        let table = ChartTable::new(stage, back, banner);
+        let table = ChartTable::new(stage, back, banner).keyed(staged_key);
         pending.chart = Some(table);
         Ok(table)
     }
@@ -2774,10 +2966,30 @@ impl Renderer {
                 Some(p) if p.token == token && self.gpu.lost() => Err(RenderError::DeviceLost),
                 Some(p) if p.token == token => {
                     p.chart = Some(ChartTable::ABSENT);
+                    self.sync_staged_chart();
                     Ok(ChartTable::ABSENT)
                 }
                 _ => Err(RenderError::ChartChanged),
             },
+        }
+    }
+
+    /// Copies a play staging's own chart table, keyed with its own key
+    /// ([`staged_chart_key`](Self::staged_chart_key)), into its loading
+    /// presentation, none without one: what its frames draw before its
+    /// commit, absent images included. Nothing for a staging on the
+    /// installed resources, whose presentation is the installed one.
+    fn sync_staged_chart(&mut self) {
+        let Some(p) = self.pending.as_ref() else {
+            return;
+        };
+        if p.token.kind != ScreenKind::Play || !matches!(p.res, PendingRes::Own(_)) {
+            return;
+        }
+        let key = self.staged_chart_key(p.token);
+        if let Some(skin) = &p.skin {
+            let table = p.chart.zip(key).map(|(t, k)| t.keyed(k));
+            skin.installation().loading().set_chart_images(table);
         }
     }
 
@@ -3012,6 +3224,7 @@ impl Renderer {
         if let Some(p) = self.pending.as_mut() {
             p.chart = None;
         }
+        self.sync_staged_chart();
         self.sync_chart();
     }
 
@@ -3334,8 +3547,9 @@ impl Renderer {
                 &self.text_cache,
                 &[&self.installed_text, &self.installed_loading],
             ),
-            staged_text_cache: staged_cache
-                .saturating_add(pending.map_or(0, |p| bytes(p.text.bytes()))),
+            staged_text_cache: staged_cache.saturating_add(pending.map_or(0, |p| {
+                bytes(p.text.bytes()).saturating_add(bytes(p.loading.bytes()))
+            })),
             committed_cpu: installed.map_or(0, |i| i.bundle().resident_bytes()),
             staged_cpu: staged_cpu.map_or(0, |s| s.bundle().resident_bytes()),
             loading: installed.map_or(0, |i| i.loading().bytes()),
@@ -3369,6 +3583,11 @@ impl Renderer {
                 .saturating_add(staged_result_text.map_or(0, |h| bytes(h.bytes()))),
             result_loading,
             retired,
+            // Kept apart from the renderer: `with_decision` adds them.
+            decision_labels: 0,
+            decision_staged: 0,
+            decision_text_mask: 0,
+            decision_upload: 0,
         }
     }
 
@@ -3556,6 +3775,151 @@ impl Renderer {
         self.draw(start, Some(text), projection).map(Ok)
     }
 
+    /// [`loading_frame`](Self::loading_frame) of the installation `on`
+    /// names: for a staging, its skin's loading frame built into its own
+    /// staging (or the installed one, for the installed bundle restaged)
+    /// against its chart images' key, and drawn from its resources, before
+    /// its commit. Allocates nothing.
+    ///
+    /// # Errors
+    ///
+    /// As [`loading_frame`](Self::loading_frame), and
+    /// [`RenderError::NotStaged`] for a token the renderer does not hold
+    /// staged for play, its own resources or the installed ones.
+    pub fn loading_frame_on(
+        &mut self,
+        on: LoadingOn,
+        f: &LoadingFrame<'_>,
+        text: &MenuText,
+    ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
+        let LoadingOn::Staged(_) = on else {
+            return self.loading_frame(f, text);
+        };
+        if text.owner() != self.id {
+            return Err(RenderError::OtherRenderersText);
+        }
+        let start = Instant::now();
+        if let Err(e) = self.build_loading_on(on, f)? {
+            return Ok(Err(e));
+        }
+        let (projection, draw) = match self.pending.as_ref().map(|p| &p.res) {
+            Some(PendingRes::Own(r)) => (r.staging.projection(), Draw::Pending),
+            _ => (self.staging.projection(), Draw::Play),
+        };
+        self.draw_on(start, &[text], projection, draw).map(Ok)
+    }
+
+    /// The app's share of a loading frame of the installation `on` names
+    /// ([`build_loading`](Self::build_loading)): for a staging, its skin
+    /// enters the frame's lifetime and builds `f` into its own staging (or
+    /// the installed one, for the installed bundle restaged) against its
+    /// chart images' key, with no call into wgpu; nothing allocates, the
+    /// refusal included.
+    ///
+    /// # Errors
+    ///
+    /// The outer error is [`RenderError::NotStaged`] for a token the
+    /// renderer does not hold staged for play, its own resources or the
+    /// installed ones. The inner one is the skin's refusal of this frame,
+    /// or of an earlier one of its lifetime: the staging is left empty.
+    pub fn build_loading_on(
+        &mut self,
+        on: LoadingOn,
+        f: &LoadingFrame<'_>,
+    ) -> Result<Result<(), BuildError>, RenderError> {
+        let LoadingOn::Staged(token) = on else {
+            return Ok(self.build_loading(f));
+        };
+        let live = self.staged_chart_key(token);
+        self.cancel_built();
+        if self.loading_refused.is_some_and(|(l, _)| l != f.lifetime) {
+            self.loading_refused = None;
+        }
+        let refused = self.loading_refused(f.lifetime);
+        let target = self.target();
+        let Some(p) = self
+            .pending
+            .as_mut()
+            .filter(|p| p.token == token && token.kind == ScreenKind::Play)
+        else {
+            return Err(RenderError::NotStaged);
+        };
+        let Some(skin) = p.skin.as_mut() else {
+            return Err(RenderError::NotStaged);
+        };
+        let staging = match &mut p.res {
+            PendingRes::Own(r) => &mut r.staging,
+            PendingRes::Installed => &mut self.staging,
+            PendingRes::Layout { .. } | PendingRes::Pages(_) => {
+                return Err(RenderError::NotStaged);
+            }
+        };
+        skin.enter_loading(f.lifetime);
+        if let Some(e) = refused {
+            staging.fill(|_| {});
+            return Ok(Err(e));
+        }
+        let f = LoadingFrame { target, ..*f };
+        skin.set_chart_live(live);
+        if let Err(e) = staging.build_loading(skin, &f) {
+            self.loading_refused = Some((f.lifetime, e));
+            return Ok(Err(e));
+        }
+        Ok(Ok(()))
+    }
+
+    /// Whether `token` names a play staging on its own resources, which its
+    /// loading frames and text use before its commit.
+    fn staged_own(&self, token: PreparedToken) -> bool {
+        self.pending.as_ref().is_some_and(|p| {
+            p.token == token
+                && token.kind == ScreenKind::Play
+                && p.skin.is_some()
+                && matches!(p.res, PendingRes::Own(_))
+        })
+    }
+
+    /// The key a staged frame's chart images are built against: the
+    /// staging's installation, its atlas and its own resources' number, or
+    /// for the installed bundle restaged the installed key; `None` for
+    /// another token or once the device is lost.
+    fn staged_chart_key(&self, token: PreparedToken) -> Option<skin_model::chart_image::ChartKey> {
+        let p = self.pending.as_ref().filter(|p| p.token == token)?;
+        let skin = p.skin.as_ref()?;
+        match &p.res {
+            PendingRes::Own(r) => (!self.gpu.lost()).then(|| skin_model::chart_image::ChartKey {
+                renderer: self.id,
+                installation: skin.installation().loading().id(),
+                atlas: skin.installation().bundle().atlas_id().0,
+                generation: r.id,
+            }),
+            PendingRes::Installed => self.chart_key(),
+            PendingRes::Layout { .. } | PendingRes::Pages(_) => None,
+        }
+    }
+
+    /// [`enter_loading`](Self::enter_loading) for the installation `on`
+    /// names: a staging's skin enters the lifetime its frames draw, the
+    /// installed one is left as it is.
+    pub fn enter_loading_on(&mut self, on: LoadingOn, lifetime: u64) {
+        let LoadingOn::Staged(token) = on else {
+            self.enter_loading(lifetime);
+            return;
+        };
+        if self.loading_refused.is_some_and(|(l, _)| l != lifetime) {
+            self.loading_refused = None;
+        }
+        if let Some(Pending {
+            token: t,
+            skin: Some(skin),
+            ..
+        }) = self.pending.as_mut()
+            && *t == token
+        {
+            skin.enter_loading(lifetime);
+        }
+    }
+
     /// Loading lifetime `lifetime` draws next, between frames: a skin's
     /// loading state of another lifetime starts afresh
     /// ([`PlaySkin::enter_loading`]), in place, and a refusal of
@@ -3595,6 +3959,29 @@ impl Renderer {
             return Err(e);
         }
         Ok(())
+    }
+
+    /// [`loading_text_key`](Self::loading_text_key) of the installation
+    /// `on` names: a staging on its own resources has its own key (its
+    /// installation, the device, its resources' number), which its commit
+    /// keeps; the installed bundle restaged has the installed key; another
+    /// token none.
+    #[must_use]
+    pub fn loading_text_key_on(&self, on: LoadingOn) -> Option<LoadingTextKey> {
+        let LoadingOn::Staged(token) = on else {
+            return self.loading_text_key();
+        };
+        let p = self.pending.as_ref().filter(|p| p.token == token)?;
+        let skin = p.skin.as_ref()?;
+        match &p.res {
+            PendingRes::Own(r) => Some(LoadingTextKey {
+                installation: skin.installation().loading().id(),
+                device: self.id,
+                resources: r.id,
+            }),
+            PendingRes::Installed => self.loading_text_key(),
+            PendingRes::Layout { .. } | PendingRes::Pages(_) => None,
+        }
     }
 
     /// What loading text laid out for the installation in use now is
@@ -3671,6 +4058,30 @@ impl Renderer {
         which: TextSlots,
         chart: &ChartText<'_>,
     ) -> Result<(), RenderError> {
+        self.prepare_loading_text_on(LoadingOn::Installed, lifetime, revision, which, chart)
+    }
+
+    /// [`prepare_loading_text`](Self::prepare_loading_text) for the
+    /// installation `on` names: for a staging on its own resources, the
+    /// lines are placed in its own cache, holding its attempt's and its
+    /// loading lines, and staged under its key.
+    ///
+    /// # Errors
+    ///
+    /// As [`prepare_loading_text`](Self::prepare_loading_text).
+    pub fn prepare_loading_text_on(
+        &mut self,
+        on: LoadingOn,
+        lifetime: u64,
+        revision: u64,
+        which: TextSlots,
+        chart: &ChartText<'_>,
+    ) -> Result<(), RenderError> {
+        if let LoadingOn::Staged(token) = on
+            && self.staged_own(token)
+        {
+            return self.prepare_staged_own_text(token, lifetime, revision, which, chart);
+        }
         self.staged_text = None;
         let (Some(key), Some(installed)) = (self.loading_text_key(), self.installed.as_ref())
         else {
@@ -3766,6 +4177,50 @@ impl Renderer {
     ///
     /// Why the staged text was dropped.
     pub fn install_staged_loading_text(&mut self) -> Result<bool, LoadingTextError> {
+        self.install_staged_loading_text_on(LoadingOn::Installed)
+    }
+
+    /// [`install_staged_loading_text`](Self::install_staged_loading_text)
+    /// into the installation `on` names: a staging on its own resources
+    /// takes the lines into its presentation and its own loading holder.
+    ///
+    /// # Errors
+    ///
+    /// Why the staged text was dropped.
+    pub fn install_staged_loading_text_on(
+        &mut self,
+        on: LoadingOn,
+    ) -> Result<bool, LoadingTextError> {
+        if let LoadingOn::Staged(token) = on
+            && self.staged_own(token)
+        {
+            let Some(staged) = self.staged_text.take() else {
+                return Ok(false);
+            };
+            if self.loading_text_key_on(on) != Some(staged.key) {
+                return Err(LoadingTextError::Stale);
+            }
+            let Some(Pending {
+                skin: Some(skin),
+                loading,
+                ..
+            }) = self.pending.as_mut()
+            else {
+                return Err(LoadingTextError::Stale);
+            };
+            let installation = skin.installation();
+            installation.loading().install_revision(
+                installation.bundle(),
+                staged.lifetime,
+                staged.revision,
+                staged.which,
+                staged.table.as_ref(),
+                staged.bitmap,
+            )?;
+            loading.release_named(installation.bundle().skin(), staged.which);
+            loading.extend(staged.holder);
+            return Ok(true);
+        }
         let Some(staged) = self.staged_text.take() else {
             return Ok(false);
         };
@@ -3790,11 +4245,98 @@ impl Renderer {
         Ok(true)
     }
 
+    /// The staged loading text of a staging on its own resources
+    /// ([`prepare_loading_text_on`](Self::prepare_loading_text_on)).
+    fn prepare_staged_own_text(
+        &mut self,
+        token: PreparedToken,
+        lifetime: u64,
+        revision: u64,
+        which: TextSlots,
+        chart: &ChartText<'_>,
+    ) -> Result<(), RenderError> {
+        self.staged_text = None;
+        let Some(key) = self.loading_text_key_on(LoadingOn::Staged(token)) else {
+            return Ok(());
+        };
+        let target = self.target();
+        let Some(p) = self.pending.as_mut() else {
+            return Ok(());
+        };
+        let (Some(skin), PendingRes::Own(r)) = (&p.skin, &mut p.res) else {
+            return Ok(());
+        };
+        let bundle = Arc::clone(skin.installation().bundle());
+        let sk = bundle.skin();
+        let (table, holder) = match bundle.text_producer() {
+            Some(producer) => {
+                self.text_report = TextReport::default();
+                let mut requests = sk.text_requests(chart, target, &Layout::AUTHOR);
+                requests.retain(|q| sk.names_text_slot(which, q.slot));
+                let held = [&p.text, &p.loading];
+                let (table, holder, report) = text_upload::prepare(
+                    text_upload::Prepare {
+                        gpu: &self.gpu,
+                        atlas: &r.atlas,
+                        cache: &mut r.text_cache,
+                        scratch: &mut self.text_scratch,
+                        producer: producer.as_ref(),
+                        scope: bundle.text_scope(),
+                        held: &held,
+                        #[cfg(test)]
+                        hooks: &mut self.text_hooks,
+                        #[cfg(feature = "dev-tools")]
+                        wait_fault: &mut self.text_wait_fault,
+                    },
+                    &requests,
+                    sk.text_slots(),
+                )?;
+                self.text_report = report;
+                (Some(table), holder)
+            }
+            None => (None, Holder::default()),
+        };
+        let bitmap = sk.loading_bitmap_lines(which, chart);
+        self.staged_text = Some(StagedText {
+            key,
+            lifetime,
+            revision,
+            which,
+            table,
+            bitmap,
+            holder,
+        });
+        Ok(())
+    }
+
     /// Clears the installed presentation's slots `which` names, so they
     /// draw nothing from its next loading frame until text is installed
     /// for them again, and lets go of their lines in the text layer; no
     /// timer changes. Nothing without a declarative installation.
     pub fn clear_loading_text(&mut self, which: TextSlots) {
+        self.clear_loading_text_on(LoadingOn::Installed, which);
+    }
+
+    /// [`clear_loading_text`](Self::clear_loading_text) of the installation
+    /// `on` names.
+    pub fn clear_loading_text_on(&mut self, on: LoadingOn, which: TextSlots) {
+        if let LoadingOn::Staged(token) = on
+            && self.staged_own(token)
+        {
+            if let Some(Pending {
+                skin: Some(skin),
+                loading,
+                ..
+            }) = self.pending.as_mut()
+            {
+                let installation = skin.installation();
+                installation
+                    .loading()
+                    .clear_text(installation.bundle(), which);
+                loading.release_named(installation.bundle().skin(), which);
+            }
+            return;
+        }
         if let Some(installed) = &self.installed {
             installed.loading().clear_text(installed.bundle(), which);
             self.installed_loading
@@ -4066,7 +4608,12 @@ impl Renderer {
             return Ok(none);
         };
         let projection = slot.resources.staging.projection();
-        self.draw_on(start, texts, projection, screen)
+        self.draw_on(
+            start,
+            texts,
+            projection,
+            screen.map_or(Draw::Play, Draw::Slot),
+        )
     }
 
     /// Development builds: the next selection frame is refused
@@ -4331,6 +4878,199 @@ impl Renderer {
         }
     }
 
+    /// The committed decision installation's bundle, if any.
+    #[must_use]
+    pub fn decision_bundle(&self) -> Option<&Arc<SkinBundle>> {
+        self.committed_installation(ScreenKind::Decision)
+            .map(Installation::bundle)
+    }
+
+    /// The committed decision installation's label rows at the current
+    /// target ([`RowPlan`]); `None` without a decision installation. An
+    /// installation without rasterized text has none.
+    ///
+    /// # Errors
+    ///
+    /// [`RenderError::LabelRegion`]: the rows do not fit half its text
+    /// layer, a refusal of the kind.
+    pub fn decision_rows(&self) -> Option<Result<RowPlan, RenderError>> {
+        let slot = self.decision_slot()?;
+        let skin = slot.installation.bundle().skin();
+        let rows = skin.outline_rows(self.target(), &Layout::AUTHOR);
+        let side = slot
+            .resources
+            .labels
+            .map_or(0, |_| slot.resources.atlas.side());
+        Some(RowPlan::new(&rows, side, skin.text_slots(), self.target()))
+    }
+
+    /// The decision slot, if committed.
+    fn decision_slot(&self) -> Option<&Slot> {
+        Self::screen(ScreenKind::Decision)
+            .and_then(|i| self.screens.get(i))
+            .and_then(Option::as_ref)
+    }
+
+    /// Where `store`'s fill writes: the decision slot's array and region.
+    fn label_target(&self) -> Option<LabelTarget<'_>> {
+        let slot = self.decision_slot()?;
+        Some(LabelTarget {
+            gpu: &self.gpu,
+            atlas: &slot.resources.atlas,
+            region: slot.resources.labels,
+            #[cfg(test)]
+            after_submit: self.decision_after_submit,
+            #[cfg(test)]
+            in_scope: self.decision_in_scope,
+            #[cfg(test)]
+            scope_pairs: &self.decision_scope_pairs,
+        })
+    }
+
+    /// One frame boundary's writes of `store`'s filling slot into the
+    /// decision installation's label region: at most
+    /// [`DECISION_TEXT_WRITE_BUDGET`](crate::DECISION_TEXT_WRITE_BUDGET)
+    /// bytes, each line's levels dropped once written; after the last,
+    /// one submission and one completion watched. Outside every frame.
+    pub fn write_decision_labels(&mut self, store: &mut LabelStore) -> FillStep {
+        match self.label_target() {
+            Some(t) => decision_labels::write_rows(&t, store),
+            None => FillStep::Idle,
+        }
+    }
+
+    /// Settles `store` at a frame boundary: polls without blocking,
+    /// settles the cooling slots, and publishes the filling slot once its
+    /// writes completed, the device healthy, its key current and every
+    /// write's scope empty. Outside every frame.
+    ///
+    /// # Errors
+    ///
+    /// A poll's failure ([`RenderError::Poll`]) or the device lost
+    /// ([`RenderError::DeviceLost`]), not refusals; a refused write
+    /// ([`RenderError::Atlas`]), a refusal of the kind.
+    pub fn settle_decision_labels(
+        &mut self,
+        store: &mut LabelStore,
+    ) -> Result<Settled, RenderError> {
+        #[cfg(any(test, feature = "dev-tools"))]
+        if std::mem::take(&mut self.decision_settle_fault) {
+            return Err(RenderError::Poll(wgpu::PollError::Timeout));
+        }
+        match self.label_target() {
+            Some(t) => decision_labels::settle(&t, store),
+            None => Ok(Settled::Pending),
+        }
+    }
+
+    /// Restores pinned slot `slot`'s content in `store` from `staged` (its
+    /// generation's strings, [`LabelStore::restore_strings`], staged
+    /// again at the current target, [`LabelWorker::restage`](crate::LabelWorker::restage))
+    /// on this renderer, built again: every row written at once and waited
+    /// for, installed under the same generation and drawable again; the
+    /// slot stays pinned. Until then, after the store's and the book's
+    /// resets, the slot's content is not drawable. `Ok(false)`, nothing
+    /// written, when the slot is not restoring at `staged`'s generation.
+    ///
+    /// # Errors
+    ///
+    /// Without a decision installation, [`RenderError::LabelRegion`] with
+    /// no band (a refusal); otherwise as
+    /// [`settle_decision_labels`](Self::settle_decision_labels): the
+    /// device's failure, or a refusal of the kind.
+    pub fn restore_decision_labels(
+        &mut self,
+        store: &mut LabelStore,
+        slot: usize,
+        staged: decision_labels::StagedLabels,
+    ) -> Result<bool, RenderError> {
+        match self.label_target() {
+            Some(t) => decision_labels::restore_pinned(&t, store, slot, staged),
+            None => Err(RenderError::LabelRegion { needed: 0, band: 0 }),
+        }
+    }
+
+    /// Whether the device was lost: read after the poll that saw a label
+    /// preparation's completion.
+    #[must_use]
+    pub fn device_lost(&self) -> bool {
+        self.gpu.lost()
+    }
+
+    /// Tests and development builds: the next settling of the decision
+    /// labels fails as a poll fails, the device's failure (not a refusal).
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub fn fail_next_decision_settle(&mut self) {
+        self.decision_settle_fault = true;
+    }
+
+    /// Submits what is queued and registers one flag-only completion for
+    /// the work submitted so far, its flag returned: a label slot's watch
+    /// ([`LabelBook::retire`](crate::LabelBook::retire),
+    /// [`LabelStore::cancel`]).
+    #[must_use]
+    pub fn watch_completion(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        decision_labels::watch(&self.gpu)
+    }
+
+    /// The app's share of a decision frame: the decision installation's
+    /// skin builds `f` of `dec` into its slot's staging, its lines drawn
+    /// from `labels`, borrowed from their slot, with no call into wgpu.
+    /// Nothing allocates, the refusal included.
+    ///
+    /// # Errors
+    ///
+    /// The skin's refusal of the frame, or [`BuildError::Kind`] without a
+    /// decision installation: nothing of it is staged.
+    pub fn build_decision(
+        &mut self,
+        dec: &mut DecisionScreen,
+        labels: DecisionLabels<'_>,
+        f: &DecisionFrame<'_>,
+    ) -> Result<(), BuildError> {
+        self.started = None;
+        let start = Instant::now();
+        let target = self.target();
+        #[cfg(any(test, feature = "dev-tools"))]
+        if std::mem::take(&mut self.decision_fault) {
+            return Err(BuildError::Kind);
+        }
+        let Some(Some(slot)) =
+            Self::screen(ScreenKind::Decision).and_then(|i| self.screens.get_mut(i))
+        else {
+            return Err(BuildError::Kind);
+        };
+        let f = DecisionFrame { target, ..*f };
+        let bundle = slot.installation.bundle();
+        let uvs = bundle.uvs();
+        let skin = bundle.skin();
+        slot.resources.staging.build_with(
+            |quads| skin.build_decision_with(dec, labels, &f, uvs, quads),
+            &[],
+        )?;
+        self.started = Some(start);
+        Ok(())
+    }
+
+    /// Submits and presents the decision frame
+    /// [`build_decision`](Self::build_decision) staged, then each of
+    /// `texts` in a pass of its own over it. Without a frame built since,
+    /// nothing is acquired or submitted, as [`submit`](Self::submit).
+    ///
+    /// # Errors
+    ///
+    /// As [`menu_frame`](Self::menu_frame).
+    pub fn submit_decision(&mut self, texts: &[&MenuText]) -> Result<FrameTiming, RenderError> {
+        self.submit_screen(ScreenKind::Decision, texts)
+    }
+
+    /// Tests and development builds: the next decision frame is refused
+    /// ([`build_decision`](Self::build_decision)) as a skin refuses one.
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub fn refuse_next_decision(&mut self) {
+        self.decision_fault = true;
+    }
+
     /// Development builds: the result frame last built, the skin's quads
     /// in drawing order; `None` without a result layout.
     #[cfg(feature = "dev-tools")]
@@ -4382,7 +5122,7 @@ impl Renderer {
         text: Option<&MenuText>,
         projection: Projection,
     ) -> Result<FrameTiming, RenderError> {
-        self.draw_on(start, text.as_slice(), projection, None)
+        self.draw_on(start, text.as_slice(), projection, Draw::Play)
     }
 
     /// [`draw`](Self::draw) of the staging, instances and atlas of
@@ -4393,21 +5133,29 @@ impl Renderer {
         start: Instant,
         texts: &[&MenuText],
         projection: Projection,
-        screen: Option<usize>,
+        on: Draw,
     ) -> Result<FrameTiming, RenderError> {
         // Whatever is drawn now, a play frame built before it is not
         // submitted again.
         self.started = None;
-        let (staging, instances, atlas_bind) = match screen
-            .and_then(|i| self.screens.get(i))
-            .and_then(Option::as_ref)
-        {
-            Some(slot) => (
-                &slot.resources.staging,
-                &slot.resources.instances,
-                &slot.resources.atlas_bind,
-            ),
-            None => (&self.staging, &self.instances, &self.atlas_bind),
+        let play = (&self.staging, &self.instances, &self.atlas_bind);
+        let (staging, instances, atlas_bind) = match on {
+            Draw::Play => play,
+            Draw::Slot(i) => match self.screens.get(i).and_then(Option::as_ref) {
+                Some(slot) => (
+                    &slot.resources.staging,
+                    &slot.resources.instances,
+                    &slot.resources.atlas_bind,
+                ),
+                None => play,
+            },
+            Draw::Pending => match &self.pending {
+                Some(Pending {
+                    res: PendingRes::Own(r),
+                    ..
+                }) => (&r.staging, &r.instances, &r.atlas_bind),
+                _ => play,
+            },
         };
         let sprites = staging.instances().len();
         let staged = u32::try_from(sprites).unwrap_or(u32::MAX);
@@ -5047,6 +5795,10 @@ fn pipelines(
 
 /// The projection's uniform: half the canvas's size, padded to 16 bytes.
 const PROJECTION_BYTES: u64 = 16;
+
+#[cfg(test)]
+#[path = "decision_label_tests.rs"]
+mod decision_label_tests;
 
 #[cfg(test)]
 mod tests {

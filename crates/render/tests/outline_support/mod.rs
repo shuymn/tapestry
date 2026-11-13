@@ -187,3 +187,75 @@ pub fn text(font: &'static str, size: i32, value: Value, rect: [i32; 4]) -> Text
         rect,
     }
 }
+
+/// [`folder`] as a decision skin's (the source's type 6).
+pub fn decision_folder(
+    files: &[(&str, Vec<u8>)],
+    fonts: &[FontRec],
+    texts: &[TextSpec],
+) -> TempDir {
+    let dir = folder(files, fonts, texts);
+    let path = dir.path().join("s.json");
+    let json = fs::read_to_string(&path).unwrap();
+    fs::write(&path, json.replacen(r#""type": 0"#, r#""type": 6"#, 1)).unwrap();
+    dir
+}
+
+/// The decision skin of `dir` as a bundle for `r`: imported into the
+/// decision slot, its atlas for a 1920×1080 target, with a producer of
+/// `default` when it has rasterized text.
+pub fn decision_bundle_in(r: &Renderer, dir: &Path, default: &Arc<DefaultFont>) -> Arc<SkinBundle> {
+    let (mut def, header) = skin_beatoraja::read_header(dir, "s.json").unwrap();
+    let config = skin_beatoraja::Config::defaults(&header);
+    let imported =
+        skin_beatoraja::import(&mut def, &header, &config, skin_model::ScreenKind::Decision)
+            .unwrap();
+    let skin = imported.skin;
+    let variant = skin.variant([1_920, 1_080], &Layout::AUTHOR);
+    let atlas = skin.atlas(variant, r.atlas_limits(), &|| false).unwrap();
+    let outline = skin.kept_layers().text;
+    let text: Option<Arc<dyn AttemptText>> =
+        outline.then(|| Arc::new(producer(&skin, default).unwrap()) as Arc<dyn AttemptText>);
+    let bundle = SkinBundle::new(Arc::new(skin), atlas, ClipTable::default(), Side::Left).unwrap();
+    Arc::new(match text {
+        Some(t) => bundle.with_text(t).unwrap(),
+        None => bundle,
+    })
+}
+
+/// A bitmap font record `g` of `g.fnt`.
+pub fn bitmap() -> FontRec {
+    FontRec {
+        id: "g",
+        path: "g.fnt",
+        kind: None,
+    }
+}
+
+/// The bitmap font [`bitmap`] names and its page: size 8, `A` and `B`
+/// each an opaque white 8 × 8 cell of a 16 × 8 page.
+pub fn bitmap_files() -> Vec<(&'static str, Vec<u8>)> {
+    let mut fnt = String::from(
+        "info face=\"g\" size=8 padding=0,0,0,0\n\
+         common lineHeight=8 base=8 scaleW=16 scaleH=8 pages=1\n\
+         page id=0 file=\"g.png\"\n\
+         chars count=2\n",
+    );
+    for (i, code) in [65, 66].into_iter().enumerate() {
+        fnt += &format!(
+            "char id={code} x={} y=0 width=8 height=8 xoffset=0 yoffset=0 xadvance=8 page=0\n",
+            i * 8
+        );
+    }
+    let mut png_bytes = Vec::new();
+    {
+        let mut e = png::Encoder::new(&mut png_bytes, 16, 8);
+        e.set_color(png::ColorType::Rgba);
+        e.set_depth(png::BitDepth::Eight);
+        e.write_header()
+            .unwrap()
+            .write_image_data(&[255; 16 * 8 * 4])
+            .unwrap();
+    }
+    vec![("g.fnt", fnt.into_bytes()), ("g.png", png_bytes)]
+}

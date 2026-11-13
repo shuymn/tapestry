@@ -20,13 +20,13 @@ use crate::chart_image::{ChartImage, ChartKey, ChartTable};
 use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
 use crate::play::timers::app_fields;
+use crate::pointer::{RowHit, SearchBounds, Target};
 use crate::selection::{
     ChartLabels, Ratio, RowKind, RowScore, RowView, SelectionLabels, SelectionOrder,
     SelectionPlace, SelectionSettings, SelectionView, SpeedReference, SpeedView,
 };
 use crate::widget::Starts;
 use crate::widget::glyphs::{self, GlyphLine};
-use crate::widget::ratio_bar::Hit;
 use crate::widget::song_list::{LampKey, RowBind, RowStyle};
 use crate::widget::text::{ChartText, MAX_TEXT_BYTES, TextTable};
 use crate::{AppReadouts, BuildError, GaugeLook};
@@ -59,6 +59,10 @@ pub struct SelectionFrame<'a> {
     /// numbers 20 to 29 read them. A value outside its field's range
     /// refuses the frame.
     pub app: AppReadouts,
+    /// The pointer, in target pixels; `None` while there is none over the
+    /// window. A hover-gated element draws only while it is inside the
+    /// element's hover rect.
+    pub pointer: Option<[f32; 2]>,
 }
 
 /// Why a selection call was refused.
@@ -121,10 +125,30 @@ pub struct Selection {
     pub(crate) row_bitmap: Box<[Option<GlyphLine>]>,
     pub(crate) position: Option<Ratio>,
     pub(crate) ex_rate: Option<Ratio>,
-    /// The master gain, as of the last settings; `None` before any.
-    pub(crate) master_volume: Option<Ratio>,
-    /// Per slider element in draw order: its travel as last built.
-    pub(crate) hits: Box<[Cell<Option<Hit>>]>,
+    /// The best EX play's PERFECT to POOR over its own notes (graphs 140
+    /// to 144); `None` without one or with no notes.
+    pub(crate) judge_rates: [Option<Ratio>; 5],
+    /// The best max combo over the chart's summary notes (graph 145), as
+    /// the source divides it by the chart's notes for every chart
+    /// (`FloatPropertyFactory.java:155-176`, `:308` at `0.8.9`); `None`
+    /// without a summary or with no notes.
+    pub(crate) combo_rate: Option<Ratio>,
+    /// The system, key and background volumes, as of the last settings;
+    /// `None` before any.
+    pub(crate) system_volume: Option<Ratio>,
+    pub(crate) key_volume: Option<Ratio>,
+    pub(crate) background_volume: Option<Ratio>,
+    /// Per pointer target in draw order (each changeable slider, action
+    /// element, search text and song list element): as the last build
+    /// drew it, `None` when it did not draw.
+    pub(crate) targets: Box<[Cell<Option<Target>>]>,
+    /// Per song list element and slot: the slot's bar as the last build
+    /// drew it, `None` when it did not.
+    pub(crate) row_hits: Box<[Cell<Option<RowHit>>]>,
+    /// Per search text: its input box as the last build that sampled it
+    /// placed it, kept across builds (a build that hides it keeps the
+    /// bounds before); `None` until one does.
+    pub(crate) search: Box<[Cell<Option<SearchBounds>>]>,
     /// The frame time [`Skin::prepare_selection_frame`](crate::Skin::prepare_selection_frame)
     /// last prepared the timers for, which that frame's build takes
     /// without refilling them.
@@ -139,15 +163,16 @@ pub struct Selection {
 
 impl Selection {
     /// A fresh state with `whens` `when` timers, `text_slots` text slots,
-    /// `rows` song list slots and `sliders` slider elements; `live` when a
-    /// selection skin makes it.
+    /// `rows` song list slots, and `targets` pointer targets, row hit cells
+    /// and `search` search texts' kept bounds; `live` when a selection skin
+    /// makes it.
     pub(crate) fn new(
         skin: u64,
         live: bool,
         whens: usize,
         text_slots: usize,
         rows: usize,
-        sliders: usize,
+        [targets, row_hits, search]: [usize; 3],
         outputs: usize,
     ) -> Self {
         let slots = usize::from(timer::BUILTIN).saturating_add(whens);
@@ -167,18 +192,24 @@ impl Selection {
             row_bitmap: vec![None; rows].into_boxed_slice(),
             position: None,
             ex_rate: None,
-            master_volume: None,
-            hits: vec![Cell::new(None); sliders].into_boxed_slice(),
+            judge_rates: [None; 5],
+            combo_rate: None,
+            system_volume: None,
+            key_volume: None,
+            background_volume: None,
+            targets: vec![Cell::new(None); targets].into_boxed_slice(),
+            row_hits: vec![Cell::new(None); row_hits].into_boxed_slice(),
+            search: vec![Cell::new(None); search].into_boxed_slice(),
             prepared: None,
             chart: None,
             chart_live: None,
         }
     }
 
-    /// A state with no timer, text, row or slider slot, which a skin of
+    /// A state with no timer, text, row or pointer slot, which a skin of
     /// another kind gives: nothing accepts it.
     pub(crate) fn inert(skin: u64) -> Self {
-        let mut s = Self::new(skin, false, 0, 0, 0, 0, 0);
+        let mut s = Self::new(skin, false, 0, 0, 0, [0, 0, 0], 0);
         s.starts = Box::default();
         s.ms = Box::default();
         s
@@ -220,7 +251,9 @@ impl Selection {
             + strings
             + self.row_text.heap_bytes()
             + glyphs::lines_bytes(&self.row_bitmap)
-            + size_of_val(&*self.hits);
+            + size_of_val(&*self.targets)
+            + size_of_val(&*self.row_hits)
+            + size_of_val(&*self.search);
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 
@@ -297,7 +330,8 @@ impl Selection {
     }
 
     /// Fills the fields, strings, rows and ratios from `view`, the rows
-    /// placed around the cursor at `center`. Allocates only to grow a
+    /// placed around the cursor at `center`, each with its identity in the
+    /// view's list. Allocates only to grow a
     /// string past its capacity, each string at most twice
     /// [`MAX_TEXT_BYTES`].
     pub(crate) fn update(&mut self, view: &SelectionView, labels: &SelectionLabels, center: usize) {
@@ -324,7 +358,7 @@ impl Selection {
             let row = at
                 .and_then(|c| (c + i).checked_sub(center))
                 .and_then(|r| view.rows.get(r));
-            *bind = row.map_or_else(RowBind::default, RowBind::of);
+            *bind = row.map_or_else(RowBind::default, |r| RowBind::of(r, view.list_revision));
             s.clear();
             if let Some(row) = row {
                 row_text(row, labels, s);
@@ -339,6 +373,20 @@ impl Selection {
                 (RowScore::Best { ex, .. }, Some(max)) => Ratio::new(u64::from(ex), max),
                 _ => None,
             });
+        let selected = view.selected.as_ref();
+        let play = selected.and_then(|c| c.best).map(|b| b.play);
+        let counts = play.map(|p| judgments(&p.tally));
+        for (i, rate) in self.judge_rates.iter_mut().enumerate() {
+            *rate = play.zip(counts).and_then(|(p, counts)| {
+                let count = counts.get(i).copied().unwrap_or(0);
+                Ratio::new(u64::from(count), u64::from(p.notes))
+            });
+        }
+        self.combo_rate = selected.and_then(|c| {
+            let s = c.summary?;
+            let combo = c.best.map_or(0, |b| b.max_combo);
+            Ratio::new(u64::from(combo), u64::from(s.taps) + u64::from(s.longs))
+        });
     }
 
     /// The text strings of the cursor's row and the place (docs/stage3.md
@@ -403,7 +451,7 @@ impl Selection {
         }
     }
 
-    /// Fills the settings' fields and the master volume's ratio from `s`,
+    /// Fills the settings' fields and the three volumes' ratios from `s`,
     /// leaving the view's as they are. Allocates nothing.
     pub(crate) fn settings(&mut self, s: &SelectionSettings) {
         let mut set = |slot: u16, v: i32| {
@@ -415,7 +463,10 @@ impl Selection {
             field::SETTINGS_DISPLAY_OFFSET,
             s.display_offset_ms.clamp(-VALUE_MAX, VALUE_MAX),
         );
-        set(field::SETTINGS_VOLUME, s.master_volume.number.clamp(0, 100));
+        set(
+            field::SETTINGS_VOLUME_SYSTEM,
+            s.system_volume.number.clamp(0, 100),
+        );
         let (floating, duration, green, fix) = match s.speed {
             SpeedView::Classic => (0, 0, 0, 0),
             SpeedView::Floating { reference, green } => {
@@ -464,7 +515,17 @@ impl Selection {
                 None => -1,
             },
         );
-        self.master_volume = Some(s.master_volume.ratio);
+        set(
+            field::SETTINGS_VOLUME_KEY,
+            s.key_volume.number.clamp(0, 100),
+        );
+        set(
+            field::SETTINGS_VOLUME_BACKGROUND,
+            s.background_volume.number.clamp(0, 100),
+        );
+        self.system_volume = Some(s.system_volume.ratio);
+        self.key_volume = Some(s.key_volume.ratio);
+        self.background_volume = Some(s.background_volume.ratio);
     }
 
     /// Fills this frame's application readouts from `app`, then its
@@ -576,6 +637,12 @@ pub(crate) fn next_rank(ex: u64, max: u64) -> u64 {
     u64::try_from(next).unwrap_or(u64::MAX)
 }
 
+/// The judgments of `t`, PERFECT to POOR.
+const fn judgments(t: &eval::Tally) -> [u32; 5] {
+    let c = &t.counts;
+    [c.perfect, c.great, c.good, c.bad, c.poor]
+}
+
 /// The fields of `view`, its cursor's row `cursor`.
 fn fields(view: &SelectionView, cursor: Option<&RowView>) -> [i32; field::COUNT] {
     let mut f = [0; field::COUNT];
@@ -611,6 +678,58 @@ fn fields(view: &SelectionView, cursor: Option<&RowView>) -> [i32; field::COUNT]
             set(field::SELECTED_BEST, 1);
             set(field::SELECTED_EX, value(u64::from(ex)));
             set(field::SELECTED_BP, value(u64::from(bp)));
+        }
+    }
+    if let RowScore::NoBest { plays } | RowScore::Best { plays, .. } = c.score {
+        set(field::SELECTED_CLEARS, value(c.clears));
+        set(field::SELECTED_FAILS, value(plays.saturating_sub(c.clears)));
+    }
+    if let Some(b) = c.best {
+        set(field::SELECTED_MAX_COMBO, value(u64::from(b.max_combo)));
+        let p = &b.play;
+        let t = &p.tally;
+        set(field::SELECTED_POINT, value(p.point()));
+        let [perfect, great, good, bad, poor] = judgments(t).map(u64::from);
+        let empty = u64::from(t.empty_poor);
+        let counts = [
+            perfect,
+            great,
+            good,
+            bad,
+            poor,
+            empty,
+            u64::from(t.fast()),
+            u64::from(t.slow()),
+            u64::from(t.early.perfect),
+            u64::from(t.late.perfect),
+            u64::from(t.early.great),
+            u64::from(t.late.great),
+            u64::from(t.early.good),
+            u64::from(t.late.good),
+            u64::from(t.early.bad),
+            u64::from(t.late.bad),
+            u64::from(t.early.poor),
+            u64::from(t.late.poor),
+            u64::from(t.empty_poor_early),
+            u64::from(t.empty_poor_late),
+            bad + poor,
+            poor + empty,
+            bad + poor + empty,
+        ];
+        for (slot, v) in (field::SELECTED_COUNT_PERFECT..).zip(counts) {
+            set(slot, value(v));
+        }
+        // Each count's whole percent of the play's notes, as the source's
+        // `getJudgeCount(i) * 100 / getNotes()`
+        // (`skin/property/IntegerPropertyFactory.java:503-509` at `0.8.9`).
+        let notes = u64::from(p.notes);
+        if notes > 0 {
+            set(field::SELECTED_PLAY_NOTES_VALID, 1);
+        }
+        for (slot, n) in (field::SELECTED_RATE_PERFECT..).zip([perfect, great, good, bad, poor]) {
+            if let Some(rate) = (n * 100).checked_div(notes) {
+                set(slot, value(rate));
+            }
         }
     }
     let lamp = LampKey::of(c.score).index();

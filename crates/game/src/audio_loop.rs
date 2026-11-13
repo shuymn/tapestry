@@ -26,8 +26,8 @@ use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use ::audio::{
-    AudioEngine, AudioOutput, BgmSchedule, FrameLine, Gain, InvalidVolume, MAX_VOLUME, OutputError,
-    ScheduledKind, SeekSource, SoundBank,
+    AudioEngine, AudioOutput, BgmSchedule, Channel, FrameLine, Gain, InvalidVolume, MAX_VOLUME,
+    OutputError, ScheduledKind, SeekSource, SoundBank,
 };
 use bms_model::TimeUs;
 
@@ -365,10 +365,10 @@ impl AudioCounters {
 
 #[derive(Debug, Default)]
 struct Shared {
-    /// A volume to apply: its `f32` bits with bit 32 set; 0 when none is
-    /// waiting. Only the newest counts, so volume keys never fill the
-    /// control queue.
-    volume: AtomicU64,
+    /// A volume to apply per channel, in [`Channel::ALL`] order: its `f32`
+    /// bits with bit 32 set; 0 when none is waiting. Only the newest
+    /// counts, so volume keys never fill the control queue.
+    volumes: [AtomicU64; 3],
     /// The decision tone asked to start: not a control message, so it
     /// never waits behind one.
     tone: AtomicBool,
@@ -1096,19 +1096,22 @@ impl AudioControl {
         OutputProbe(Arc::clone(&self.shared))
     }
 
-    /// Sets the master volume from the next engine step on, whatever the
-    /// play's state; a newer volume replaces one not yet taken.
+    /// Sets `channel`'s volume from the next engine step on, whatever the
+    /// play's state; a newer volume of that channel replaces one not yet
+    /// taken.
     ///
     /// # Errors
     ///
     /// [`InvalidVolume`] for a volume outside `0.0..=MAX_VOLUME`, which is
     /// not sent.
-    pub fn set_volume(&self, volume: f32) -> Result<(), InvalidVolume> {
+    pub fn set_volume(&self, channel: Channel, volume: f32) -> Result<(), InvalidVolume> {
         if !(0.0..=MAX_VOLUME).contains(&volume) {
             return Err(InvalidVolume(volume));
         }
         let pending = u64::from(volume.to_bits()) | 1 << 32;
-        self.shared.volume.store(pending, Ordering::Release);
+        if let Some(word) = self.shared.volumes.get(channel.index()) {
+            word.store(pending, Ordering::Release);
+        }
         Ok(())
     }
 
@@ -1154,10 +1157,14 @@ impl AudioWorker {
     fn control(&mut self) -> bool {
         #[cfg(debug_assertions)]
         let _in_step = InStep::enter();
-        let volume = self.shared.volume.swap(0, Ordering::Acquire);
-        if volume != 0 {
-            // Checked by `set_volume`.
-            let _ = self.engine.set_volume(f32::from_bits(volume as u32));
+        for (word, channel) in self.shared.volumes.iter().zip(Channel::ALL) {
+            let volume = word.swap(0, Ordering::Acquire);
+            if volume != 0 {
+                // Checked by `set_volume`.
+                let _ = self
+                    .engine
+                    .set_volume(channel, f32::from_bits(volume as u32));
+            }
         }
         if self.shared.tone.swap(false, Ordering::Acquire) {
             self.engine.play_tone();

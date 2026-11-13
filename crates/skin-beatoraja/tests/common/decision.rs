@@ -154,6 +154,7 @@ impl Dec {
             timers: DecisionTimers {
                 screen: Some(TimeUs(0)),
                 fadeout: None,
+                input: None,
             },
         }
     }
@@ -184,9 +185,14 @@ impl Dec {
 
     /// The quads of the frame at `ms`.
     pub fn frame(&mut self, ms: i64) -> Vec<Quad> {
+        self.frame_at(TimeUs(ms * 1_000))
+    }
+
+    /// The quads of the frame at `now`.
+    pub fn frame_at(&mut self, now: TimeUs) -> Vec<Quad> {
         self.batch.clear();
         let frame = DecisionFrame {
-            now: TimeUs(ms * 1_000),
+            now,
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
             timers: self.timers,
@@ -212,7 +218,12 @@ impl Dec {
 
     /// The tops of the quads drawn at `ms`, sorted.
     pub fn tops(&mut self, ms: i64) -> Vec<f32> {
-        let mut t: Vec<f32> = self.frame(ms).iter().map(|q| q.rect[1]).collect();
+        self.tops_at(TimeUs(ms * 1_000))
+    }
+
+    /// The tops of the quads drawn at `now`, sorted.
+    pub fn tops_at(&mut self, now: TimeUs) -> Vec<f32> {
+        let mut t: Vec<f32> = self.frame_at(now).iter().map(|q| q.rect[1]).collect();
         t.sort_by(f32::total_cmp);
         t
     }

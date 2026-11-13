@@ -8,8 +8,8 @@
 //!   converts them for a practice [`Speed`] in a second [`Stage`], with each
 //!   stage's workspace bound charged before it is built.
 //! - [`Mixer`] sums preallocated voices in `f32`, steals the oldest voice
-//!   with a short fade when all are busy, applies the volume and the play's
-//!   fixed gain (0.5, or the chart's normalization gain), and a static soft
+//!   with a short fade when all are busy, scales each voice by its
+//!   channel's volume (key or background), applies the play's fixed gain (0.5, or the chart's normalization gain), and a static soft
 //!   clipper that keeps the sum within full scale without riding its gain
 //!   or adding latency.
 //! - [`MixClock`] maps output frames to the judgment timeline from the
@@ -61,12 +61,12 @@ pub use loudness::{
     normalization_gain,
 };
 pub use mixer::{
-    Gain, HEADROOM, InvalidGain, InvalidVolume, MAX_GAIN, MAX_PENDING_STARTS, MAX_VOICES,
+    Channel, Gain, HEADROOM, InvalidGain, InvalidVolume, MAX_GAIN, MAX_PENDING_STARTS, MAX_VOICES,
     MAX_VOLUME, Mixer, SOFT_CLIP_KNEE, STEAL_FADE_MS, soft_clip,
 };
 pub use output::{AudioOutput, MAX_QUEUE_PERIODS, OutputError, RecordingOutput, Wake};
 pub use run::{RunReport, run_audio};
-pub use seek::{BgmSchedule, FrameLine, SeekPlan, SeekSource};
+pub use seek::{BgmSchedule, FrameLine, ScheduledSound, SeekPlan, SeekSource};
 pub use sim::{Resume, SHIFT_HISTORY, SimConfig, SimDevice};
 #[cfg(windows)]
 pub use wasapi::{

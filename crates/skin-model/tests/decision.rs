@@ -120,6 +120,7 @@ impl DFx {
             timers: DecisionTimers {
                 screen: Some(TimeUs(0)),
                 fadeout: None,
+                input: None,
             },
         }
     }
@@ -286,6 +287,7 @@ fn decision_entry_points_refuse_other_kinds() {
         target: fx.target,
         layout: &fx.layout,
         timers: skin_model::ResultTimers::default(),
+        app: skin_model::AppReadouts::LAUNCH,
     };
     assert_eq!(
         fx.skin
@@ -462,6 +464,7 @@ fn decision_bitmap_text_follows_the_labels() {
             timers: DecisionTimers {
                 screen: Some(TimeUs(0)),
                 fadeout: None,
+                input: None,
             },
         };
         skin.build_decision(dec, &frame, uvs, &mut batch).unwrap();

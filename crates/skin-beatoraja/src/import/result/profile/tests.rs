@@ -37,7 +37,7 @@ fn rows(spans: &[(i32, i32, C)]) -> Vec<(i32, C)> {
 /// §A's numeric ids, the source's bundled skin's five more (S10-09i) and
 /// the ids equal to or derived from bridged ones (S7-07c).
 const NUMERIC: &[(i32, i32, C)] = &[
-    (21, 25, C::D),
+    (20, 29, C::N),
     (45, 49, C::N),
     (71, 72, C::N),
     (74, 76, C::N),
@@ -53,9 +53,9 @@ const NUMERIC: &[(i32, i32, C)] = &[
     (152, 156, C::N),
     (157, 158, C::D),
     (170, 172, C::N),
-    (173, 173, C::D),
+    (173, 173, C::N),
     (174, 174, C::N),
-    (175, 175, C::D),
+    (175, 175, C::N),
     (176, 178, C::N),
     (179, 180, C::D),
     (182, 182, C::D),
@@ -142,7 +142,7 @@ fn every_profile_id_has_its_class() {
             .filter(|&id| of(number(id)) == Some(c))
             .count()
     };
-    assert_eq!((count(C::N), count(C::D)), (83, 33));
+    assert_eq!((count(C::N), count(C::D)), (95, 26));
     let n = OPTION_N.iter().flat_map(|&(a, b)| a..=b);
     let d = OPTION_D.iter().flat_map(|&(a, b, _)| a..=b);
     // 160 to 164 are N (constant per kind) with constant values.
@@ -259,6 +259,41 @@ fn the_mean_truncates_toward_zero() {
         panic!()
     };
     assert_eq!(read_number(&v, &none), Read::Unavailable);
+}
+
+/// 173 is the best max combo before this play and 175 this play's less
+/// it, each drawn only with a known best and hidden as `i32::MIN` while
+/// the comparison hides it (a best max combo of 0), as the source's
+/// (`IntegerPropertyFactory.java:734-752`).
+#[test]
+fn best_max_combo_reads_173_and_175() {
+    use skin_model::result_field as f;
+    let mut a = [0; f::COUNT];
+    a[usize::from(f::RESULT_VALID)] = 1;
+    a[usize::from(f::BEST_KNOWN)] = 1;
+    a[usize::from(f::BEST_MAX_COMBO)] = 100;
+    a[usize::from(f::BEST_MAX_COMBO_DIFF)] = 20;
+    let get = |a: &[i32; f::COUNT], id| match number(id) {
+        Some(Class::Bridge(v)) => read_number(&v, &ResultFields(*a)),
+        _ => Read::Unavailable,
+    };
+    assert_eq!(
+        (get(&a, 173), get(&a, 175)),
+        (Read::Value(100), Read::Value(20))
+    );
+    a[usize::from(f::BEST_MAX_COMBO_DIFF)] = -20;
+    assert_eq!(get(&a, 175), Read::Value(-20));
+    a[usize::from(f::BEST_MAX_COMBO)] = i32::MIN;
+    a[usize::from(f::BEST_MAX_COMBO_DIFF)] = i32::MIN;
+    assert_eq!(
+        (get(&a, 173), get(&a, 175)),
+        (Read::Value(i32::MIN), Read::Value(i32::MIN))
+    );
+    a[usize::from(f::BEST_KNOWN)] = 0;
+    assert_eq!(
+        (get(&a, 173), get(&a, 175)),
+        (Read::Unavailable, Read::Unavailable)
+    );
 }
 
 /// 72 is twice the notes; 85 to 89 each grade's whole percent of the

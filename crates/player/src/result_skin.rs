@@ -368,6 +368,8 @@ pub(crate) fn probe_view(chart: ResultChart) -> ResultView {
             bp: ResultNumber::Shown(1),
             bp_diff: ResultNumber::Shown(1),
             clear: LampKey::Normal,
+            max_combo: ResultNumber::Shown(1),
+            max_combo_diff: ResultNumber::Shown(1),
             ex_updated: true,
             bp_updated: true,
             rate: Some(BestRate {

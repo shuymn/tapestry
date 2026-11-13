@@ -523,6 +523,7 @@ fn bar_skin(bars: Vec<RatioBarDef>) -> Fx {
             WidgetDefs::default(),
             SelectionDefs {
                 song_list: None,
+                pointer: Vec::new(),
                 ratio_bars: bars,
             },
         )
@@ -630,39 +631,39 @@ fn a_slider_press_gives_a_command_and_changes_nothing() {
         let at = |d: f32| [start[0] + along[0] * d, start[1] + along[1] * d];
         let before = format!("{:?}", fx.sel);
         assert_eq!(
-            fx.skin.slider_at(&fx.sel, at(0.5), fx.target),
+            fx.skin.drag_at(&fx.sel, at(0.5), fx.target),
             cmd(0),
             "{direction:?}"
         );
         assert_eq!(
-            fx.skin.slider_at(&fx.sel, at(100.0), fx.target),
+            fx.skin.drag_at(&fx.sel, at(100.0), fx.target),
             cmd(third),
             "{direction:?}"
         );
         assert_eq!(
-            fx.skin.slider_at(&fx.sel, at(299.5), fx.target),
+            fx.skin.drag_at(&fx.sel, at(299.5), fx.target),
             cmd(skin_model::SLIDER_STEPS),
             "{direction:?}"
         );
         assert_eq!(
-            fx.skin.slider_at(&fx.sel, at(301.0), fx.target),
+            fx.skin.drag_at(&fx.sel, at(301.0), fx.target),
             None,
             "{direction:?}"
         );
         assert_eq!(format!("{:?}", fx.sel), before);
         // A resize not yet drawn gives nothing; the next build does.
-        assert_eq!(fx.skin.slider_at(&fx.sel, at(100.0), [1_280, 720]), None);
+        assert_eq!(fx.skin.drag_at(&fx.sel, at(100.0), [1_280, 720]), None);
         // With no ratio the slider does not draw, so it takes no press.
         fx.view(&view(Vec::new(), None));
         fx.frame(0);
-        assert_eq!(fx.skin.slider_at(&fx.sel, at(100.0), fx.target), None);
+        assert_eq!(fx.skin.drag_at(&fx.sel, at(100.0), fx.target), None);
     }
     let mut fx = bar_skin(vec![bar(slider(SliderDirection::Right, false), src)]);
     let mut v = view(Vec::new(), None);
     v.position = ratio(1, 2);
     fx.view(&v);
     fx.frame(0);
-    assert_eq!(fx.skin.slider_at(&fx.sel, [150.0, 110.0], fx.target), None);
+    assert_eq!(fx.skin.drag_at(&fx.sel, [150.0, 110.0], fx.target), None);
     // A slider hidden by its visibility takes no press.
     let mut skin_fx = {
         let mut e = element(Source::RatioBar(0), [100, 100, 40, 20]);
@@ -673,6 +674,7 @@ fn a_slider_press_gives_a_command_and_changes_nothing() {
                 WidgetDefs::default(),
                 SelectionDefs {
                     song_list: None,
+                    pointer: Vec::new(),
                     ratio_bars: vec![bar(slider(SliderDirection::Right, true), src)],
                 },
             )
@@ -684,7 +686,7 @@ fn a_slider_press_gives_a_command_and_changes_nothing() {
     assert_eq!(
         skin_fx
             .skin
-            .slider_at(&skin_fx.sel, [150.0, 110.0], skin_fx.target),
+            .drag_at(&skin_fx.sel, [150.0, 110.0], skin_fx.target),
         None
     );
     // A slider whose track moves is pressed where the last build put it.
@@ -696,6 +698,7 @@ fn a_slider_press_gives_a_command_and_changes_nothing() {
             WidgetDefs::default(),
             SelectionDefs {
                 song_list: None,
+                pointer: Vec::new(),
                 ratio_bars: vec![bar(slider(SliderDirection::Right, true), src)],
             },
         )
@@ -704,13 +707,13 @@ fn a_slider_press_gives_a_command_and_changes_nothing() {
     fx.view(&v);
     fx.frame(0);
     assert_eq!(
-        fx.skin.slider_at(&fx.sel, [200.0, 110.0], fx.target),
+        fx.skin.drag_at(&fx.sel, [200.0, 110.0], fx.target),
         cmd(third)
     );
     fx.frame(100);
-    assert_eq!(fx.skin.slider_at(&fx.sel, [200.0, 110.0], fx.target), None);
+    assert_eq!(fx.skin.drag_at(&fx.sel, [200.0, 110.0], fx.target), None);
     assert_eq!(
-        fx.skin.slider_at(&fx.sel, [600.0, 110.0], fx.target),
+        fx.skin.drag_at(&fx.sel, [600.0, 110.0], fx.target),
         cmd(third)
     );
 }
@@ -947,10 +950,7 @@ fn the_topmost_slider_takes_the_press() {
     v.position = ratio(1, 2);
     fx.view(&v);
     fx.frame(0);
-    let got = fx
-        .skin
-        .slider_at(&fx.sel, [200.0, 110.0], fx.target)
-        .unwrap();
+    let got = fx.skin.drag_at(&fx.sel, [200.0, 110.0], fx.target).unwrap();
     assert_eq!(got.source, RatioSource::ExRate);
 }
 
@@ -971,8 +971,8 @@ fn a_state_belongs_to_its_skin() {
     v.position = ratio(1, 2);
     a.view(&v);
     a.frame(0);
-    assert!(a.skin.slider_at(&a.sel, [200.0, 110.0], a.target).is_some());
-    assert_eq!(b.skin.slider_at(&a.sel, [200.0, 110.0], a.target), None);
+    assert!(a.skin.drag_at(&a.sel, [200.0, 110.0], a.target).is_some());
+    assert_eq!(b.skin.drag_at(&a.sel, [200.0, 110.0], a.target), None);
     assert_eq!(
         b.skin.update_selection(&mut a.sel, &v, &labels_of()),
         Err(SelectionError::Kind)
@@ -992,6 +992,7 @@ fn a_state_belongs_to_its_skin() {
         layout: &layout,
         timers: a.timers,
         app: a.app,
+        pointer: None,
     };
     let mut out = skin_model::QuadBatch::with_capacity(8, 8);
     b.skin
@@ -1000,7 +1001,7 @@ fn a_state_belongs_to_its_skin() {
     assert!(out.quads().is_empty());
     // A clone keeps its skin's identity.
     let clone = a.skin.clone();
-    assert!(clone.slider_at(&a.sel, [200.0, 110.0], a.target).is_some());
+    assert!(clone.drag_at(&a.sel, [200.0, 110.0], a.target).is_some());
 }
 
 /// The cursor's row kind and a folder's count read as fields.
@@ -1240,6 +1241,7 @@ fn each_kind_draws_its_own_widgets() {
     };
     let sel = || SelectionDefs {
         song_list: Some(list(1, 0)),
+        pointer: Vec::new(),
         ratio_bars: vec![bar(RatioForm::Bar { vertical: false }, RatioSource::ExRate)],
     };
     for source in [Source::SongList, Source::RatioBar(0)] {
@@ -1272,6 +1274,7 @@ fn each_kind_draws_its_own_widgets() {
             WidgetDefs::default(),
             SelectionDefs {
                 song_list: None,
+                pointer: Vec::new(),
                 ratio_bars: vec![bar(
                     RatioForm::Bar { vertical: false },
                     RatioSource::Score(ScoreRate::Best),
@@ -1420,6 +1423,7 @@ fn the_other_kinds_entry_points_draw_nothing() {
         layout: &layout,
         timers: skin_model::SelectionTimers::default(),
         app: skin_model::AppReadouts::LAUNCH,
+        pointer: None,
     };
     let play_uvs = selection_support::uvs(&play);
     assert_eq!(
@@ -1504,6 +1508,7 @@ fn the_song_lists_bounds_are_checked() {
             WidgetDefs::default(),
             SelectionDefs {
                 song_list: None,
+                pointer: Vec::new(),
                 ratio_bars: vec![bar(RatioForm::Bar { vertical: false }, RatioSource::ExRate); n],
             },
         )
@@ -1721,6 +1726,7 @@ fn an_invalid_readout_refuses_the_selection_frame() {
         layout: &fx.layout,
         timers: fx.timers,
         app: bad,
+        pointer: None,
     };
     assert_eq!(
         fx.skin
@@ -1754,7 +1760,9 @@ fn the_selected_charts_class_reads_before_the_settings() {
     assert_eq!(class(&fx), [2, 1]);
     let settings = skin_model::SelectionSettings {
         display_offset_ms: -7,
-        master_volume: skin_model::MasterVolume::of_gain(0.5),
+        system_volume: skin_model::VolumeReading::of_gain(0.5),
+        key_volume: skin_model::VolumeReading::of_gain(0.5),
+        background_volume: skin_model::VolumeReading::of_gain(0.5),
         speed: skin_model::SpeedView::Classic,
         order: skin_model::SelectionOrder::Title,
         gauge: None,
@@ -1781,4 +1789,178 @@ fn the_selected_charts_class_reads_before_the_settings() {
         -7,
         "a view left the settings"
     );
+}
+
+/// A chart with a best whose play of 7 notes judged PERFECT 4 (1 early,
+/// 3 late), GREAT 2 (early), BAD 1 (late) and 2 empty POORs (1 early, 1
+/// late), its max combo 4, while the best max combo, another play's, is 9;
+/// 5 plays, 2 of them clears; a summary of `summary_notes`.
+fn breakdown_view(random: bool, summary_notes: u32) -> skin_model::SelectionView {
+    let mut row = chart("a");
+    row.random = random;
+    row.score = RowScore::Best {
+        plays: 5,
+        ex: 10,
+        bp: 1,
+        lamp: OwnLamp::Cleared {
+            gauge: 0,
+            rank: 0,
+            look: GaugeLook::Normal,
+        },
+    };
+    let mut v = view(vec![row], Some(0));
+    let c = v.selected.as_mut().unwrap();
+    c.summary = Some(summary(summary_notes, 0, 0, 60, 120, 120));
+    c.clears = 2;
+    let per = |perfect, great, bad| rules::PerJudgment {
+        perfect,
+        great,
+        good: 0,
+        bad,
+        poor: 0,
+    };
+    let tally = eval::Tally {
+        counts: per(4, 2, 1),
+        ex_score: 10,
+        bp: 1,
+        max_combo: 4,
+        empty_poor: 2,
+        early: per(1, 2, 0),
+        late: per(3, 0, 1),
+        empty_poor_early: 1,
+        empty_poor_late: 1,
+        ..eval::Tally::default()
+    };
+    c.best = Some(skin_model::SelectedBest {
+        max_combo: 9,
+        play: skin_model::BestPlay { tally, notes: 7 },
+    });
+    v
+}
+
+/// Each number of the best play reads that one play, the clears and the
+/// best max combo the key's; the point score takes the play's own combo:
+/// `⌊(150 000 · 4 + 100 000 · 2) / 7⌋ + ⌊50 000 · 4 / 7⌋` = 114 285 +
+/// 28 571, where one floor would give 142 857 and the best max combo 9
+/// another value (design.md "Personal Bests").
+#[test]
+fn the_best_play_breakdown_fills_the_fields() {
+    let v = breakdown_view(false, 7);
+    for (field, guard, want) in [
+        ("selected.point", "true", vec![1, 4, 2, 8, 5, 6]),
+        ("selected.max_combo", "selected.played", vec![9]),
+        ("selected.clears", "selected.played", vec![2]),
+        ("selected.fails", "selected.played", vec![3]),
+        ("selected.count.perfect", "true", vec![4]),
+        ("selected.count.great", "true", vec![2]),
+        ("selected.count.bad", "true", vec![1]),
+        ("selected.count.empty_poor", "true", vec![2]),
+        ("selected.count.fast", "true", vec![3]),
+        ("selected.count.slow", "true", vec![2]),
+        ("selected.count.early.perfect", "true", vec![1]),
+        ("selected.count.late.perfect", "true", vec![3]),
+        ("selected.count.early.great", "true", vec![2]),
+        ("selected.count.late.bad", "true", vec![1]),
+        ("selected.count.early.empty_poor", "true", vec![1]),
+        ("selected.count.late.empty_poor", "true", vec![1]),
+        ("selected.count.bad_poor", "true", vec![1]),
+        ("selected.count.poor_miss", "true", vec![2]),
+        ("selected.count.bad_poor_miss", "true", vec![3]),
+        // ⌊400 / 7⌋, ⌊200 / 7⌋ and ⌊100 / 7⌋.
+        (
+            "selected.rate.perfect",
+            "selected.play_notes_valid",
+            vec![5, 7],
+        ),
+        (
+            "selected.rate.great",
+            "selected.play_notes_valid",
+            vec![2, 8],
+        ),
+        ("selected.rate.bad", "selected.play_notes_valid", vec![1, 4]),
+    ] {
+        let mut fx = number_skin(field, guard);
+        fx.view(&v);
+        fx.frame(0);
+        assert_eq!(shown(&fx), want, "{field}");
+    }
+    // Without a best, the counts and the point read 0, and the rates'
+    // validity is false; unplayed, nothing of the key is known.
+    let mut no_best = v.clone();
+    let c = no_best.selected.as_mut().unwrap();
+    c.best = None;
+    c.clears = 0;
+    c.score = RowScore::NoBest { plays: 5 };
+    for (field, guard, want) in [
+        ("selected.point", "true", vec![0]),
+        ("selected.count.perfect", "true", vec![0]),
+        ("selected.max_combo", "selected.played", vec![0]),
+        ("selected.fails", "selected.played", vec![5]),
+        ("selected.rate.perfect", "selected.play_notes_valid", vec![]),
+    ] {
+        let mut fx = number_skin(field, guard);
+        fx.view(&no_best);
+        fx.frame(0);
+        assert_eq!(shown(&fx), want, "no best: {field}");
+    }
+    let mut unplayed = no_best;
+    unplayed.selected.as_mut().unwrap().score = RowScore::Unplayed;
+    let mut fx = number_skin("selected.clears", "selected.played");
+    fx.view(&unplayed);
+    fx.frame(0);
+    assert!(shown(&fx).is_empty());
+}
+
+/// The rate bars of the best play divide each count by the play's own
+/// notes, not the summary's (here 20, as a chart that draws may have),
+/// and the best max combo's by the summary's notes for every chart, as the
+/// source's (`FloatPropertyFactory.java:155-176`, `:308` at `0.8.9`).
+#[test]
+fn the_best_play_bars_divide_by_its_own_notes() {
+    let mut fx = bar_skin(
+        (0..5)
+            .map(|k| {
+                bar(
+                    RatioForm::Bar { vertical: false },
+                    RatioSource::JudgeRate(k),
+                )
+            })
+            .chain([bar(
+                RatioForm::Bar { vertical: false },
+                RatioSource::ComboRate,
+            )])
+            .collect(),
+    );
+    let widths = |fx: &mut Fx, v: &skin_model::SelectionView| {
+        fx.view(v);
+        fx.frame(0);
+        fx.batch
+            .quads()
+            .iter()
+            .map(|q| q.rect[2])
+            .collect::<Vec<f32>>()
+    };
+    let close = |got: Vec<f32>, want: &[f32]| {
+        assert_eq!(got.len(), want.len(), "{got:?}");
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-3, "{got:?} {want:?}");
+        }
+    };
+    // PERFECT 4, GREAT 2, GOOD 0, BAD 1 and POOR 0 of 7, and the best
+    // max combo 9 of the summary's 20.
+    let per = |n: f32| 40.0 * n / 7.0;
+    close(
+        widths(&mut fx, &breakdown_view(false, 20)),
+        &[per(4.0), per(2.0), 0.0, per(1.0), 0.0, 40.0 * 9.0 / 20.0],
+    );
+    // A chart that draws: the play's own notes still, and the best max
+    // combo 9 over the summary's 20 (0.45), as for any chart.
+    close(
+        widths(&mut fx, &breakdown_view(true, 20)),
+        &[per(4.0), per(2.0), 0.0, per(1.0), 0.0, 40.0 * 0.45],
+    );
+    // Without a best: no judgment bar, and the combo bar at 0.
+    let mut v = breakdown_view(false, 20);
+    v.selected.as_mut().unwrap().best = None;
+    close(widths(&mut fx, &v), &[0.0]);
 }

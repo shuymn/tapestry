@@ -31,6 +31,7 @@ mod carry;
 mod chart_currency;
 mod chart_images;
 mod controls;
+mod decision_side;
 #[cfg(feature = "dev-tools")]
 mod dev;
 mod end_screen;
@@ -46,6 +47,7 @@ mod measure;
 mod menu_screen;
 mod page_jobs;
 mod play;
+mod pointer;
 mod power;
 mod practice_page;
 #[cfg(feature = "dev-tools")]
@@ -98,7 +100,7 @@ use std::time::SystemTime;
 
 use anyhow::Context as _;
 use audio::{AudioEngine, BankLimits, MAX_VOICES, load_bank_at};
-use bms_model::{BgmEvent, TimeUs};
+use bms_model::TimeUs;
 use eval::ControlId;
 use game::{
     AutoKeySounds, DataRoot, DeviceSettings, Loaded, Parts, SessionConfig, Settings, Tuning,
@@ -566,7 +568,7 @@ struct Prepared {
     /// The source set the input thread keeps.
     sources: SourceSet,
     /// The audio schedule, when it is not the chart's BGM (autoplay).
-    schedule: Option<Vec<BgmEvent>>,
+    schedule: Option<Vec<audio::ScheduledSound>>,
     /// The controls every keyboard records, when they are not the key
     /// config's (autoplay).
     keyboard: Option<Vec<ControlId>>,
@@ -654,7 +656,7 @@ fn generated(loaded: Loaded, chart: &Path) -> anyhow::Result<Prepared> {
 /// load measures, and nothing is stored). A close cancels the measurement.
 fn start_engine(
     loaded: &Loaded,
-    schedule: Option<Vec<BgmEvent>>,
+    schedule: Option<Vec<audio::ScheduledSound>>,
     audio: audio_side::AudioThread,
     opened: audio_side::Opened,
     probe: rtrb::Producer<game::AudioProbe>,
@@ -801,7 +803,7 @@ fn view() -> View {
 /// (design.md "Play Lifecycle", "Audio tail"); only closing the window
 /// latches quitting.
 fn controls(s: &Settings, clock: QpcClock) -> Arc<Controls> {
-    let tuning = LiveTuning::new(Tuning::of(s)).with_loaded_volume(s.device.master_volume);
+    let tuning = LiveTuning::new(Tuning::of(s)).with_loaded_volumes(&s.device);
     let controls = Controls::with_tuning(clock, Arc::new(tuning));
     controls.quit_leaves();
     controls.set_game(std::thread::current());
@@ -934,6 +936,7 @@ fn rig<'a>(
         load_start: TimeUs(0),
         pending_retry: None,
         window: None,
+        cursor: None,
         retry_from: None,
         state_clock: state_clock::StateClock::default(),
         result_retries: play::ResultRetries::default(),
@@ -995,10 +998,13 @@ fn rig<'a>(
         #[cfg(feature = "dev-tools")]
         views_shown: 0,
         result_outro: None,
+        decision_claim: None,
         #[cfg(feature = "dev-tools")]
         probe_ready: None,
         #[cfg(test)]
         relooked: std::sync::Arc::default(),
+        #[cfg(test)]
+        park_probe: std::sync::Arc::default(),
         #[cfg(all(test, feature = "dev-tools"))]
         audio_lost,
         #[cfg(test)]
@@ -1010,6 +1016,10 @@ fn rig<'a>(
         .context("the adjustment controls cannot be installed")?;
     // What a selection skin shows of the settings keys, read each frame.
     rig.render.tuning(Arc::clone(controls.tuning()));
+    // A decision takeover wakes the game thread, as `Controls::wake_game`.
+    if let Some(game) = controls.game_thread() {
+        rig.render.set_game_wake(Arc::new(move || game.unpark()));
+    }
     Ok(rig)
 }
 
@@ -1038,10 +1048,11 @@ fn open_window_and_input(
     wake: impl FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     keys: (Option<u32>, Option<u32>),
     monitor: Option<String>,
-    menu: Option<Arc<MenuQueue>>,
+    menu: Option<(Arc<MenuQueue>, Arc<pointer::PointerShared>)>,
 ) -> anyhow::Result<(window::WindowThread, window::Surface, InputThread)> {
+    let (menu, pointer) = menu.map_or_else(|| (None, Arc::default()), |(m, p)| (Some(m), p));
     let (window_thread, surface) =
-        window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu)?;
+        window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu, pointer)?;
     let input = InputThread::spawn(clock, sources, capture, waker, wake);
     let input = match input {
         Ok(i) => i,
@@ -1076,10 +1087,11 @@ fn open_window_and_clocked(
     wake: impl FnMut(&mut SourceSet, TimeUs) -> Phase + Send + 'static,
     keys: (Option<u32>, Option<u32>),
     monitor: Option<String>,
-    menu: Option<Arc<MenuQueue>>,
+    menu: Option<(Arc<MenuQueue>, Arc<pointer::PointerShared>)>,
 ) -> anyhow::Result<(window::WindowThread, window::Surface, ClockedThread)> {
+    let (menu, pointer) = menu.map_or_else(|| (None, Arc::default()), |(m, p)| (Some(m), p));
     let (window_thread, surface) =
-        window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu)?;
+        window::open(Arc::clone(controls), keys.0, keys.1, monitor, menu, pointer)?;
     match ClockedThread::spawn(clock, sources, waker, wake) {
         Ok(input) => Ok((window_thread, surface, input)),
         Err(e) => {
@@ -1178,7 +1190,7 @@ fn play(
             wake,
             keys,
             monitor,
-            Some(Arc::clone(&menu)),
+            Some((Arc::clone(&menu), Arc::default())),
         )
         .map(|(w, s, t)| (w, s, Some(t), None))
     } else {
@@ -1190,7 +1202,7 @@ fn play(
             wake,
             keys,
             monitor,
-            Some(Arc::clone(&menu)),
+            Some((Arc::clone(&menu), Arc::default())),
         )
         .map(|(w, s, t)| (w, s, None, Some(t)))
     };
@@ -1264,6 +1276,7 @@ fn play(
         rig.recorded.keyboard = keyboard;
     }
     rig.window = Some(window_thread.shown());
+    rig.cursor = Some(window_thread.cursor());
     rig.restorer = restorer(&loaded, &rig);
     rig.gain = gain;
     rig.result_input = menus;
@@ -1528,6 +1541,9 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         axis_mode(&mut sources, &settings.device);
     }
     let (menu, menus) = menu_input(&settings.device, autoplay, &mut sources, controls.tuning());
+    // The pointer's state, which the window, the select screen and the
+    // render thread share.
+    let pointer = Arc::new(pointer::PointerShared::default());
     controls.set_latch(sources.gate().handle());
     controls.set_waker(waker.clone());
     let mode = if autoplay {
@@ -1556,7 +1572,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
                     wake,
                     keys,
                     monitor,
-                    Some(Arc::clone(&menu)),
+                    Some((Arc::clone(&menu), Arc::clone(&pointer))),
                 )
                 .map(|(w, s, t)| (Some(w), Some(s), None, Some(t)))
             } else {
@@ -1569,7 +1585,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
                     wake,
                     keys,
                     monitor,
-                    Some(Arc::clone(&menu)),
+                    Some((Arc::clone(&menu), Arc::clone(&pointer))),
                 )
                 .map(|(w, s, t)| (Some(w), Some(s), Some(t), None))
             }
@@ -1673,6 +1689,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     };
     let mut rig = rig(&root, &settings, autoplay, threads, &controls, clock)?;
     rig.window = window_thread.as_ref().map(window::WindowThread::shown);
+    rig.cursor = window_thread.as_ref().map(window::WindowThread::cursor);
+    rig.render.pointer(Arc::clone(&pointer));
     rig.queue_most = opened.most_queued_periods;
     rig.result_input = menus;
     #[cfg_attr(not(feature = "dev-tools"), allow(unused_mut))]
@@ -1687,9 +1705,13 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         screen,
         menu,
         dropped: 0,
+        pointer: crate::pointer::PointerPass::new(Arc::clone(&pointer)),
+        dropped_pointer: 0,
         preset_refusal: false,
         search_pending: false,
         preset_steps: std::collections::VecDeque::new(),
+        covers_turned: [false; 3],
+        volumes_set: [None; 3],
         feed: selection_skin::SkinFeed::default(),
         ime,
         rate: opened.rate,
@@ -2197,6 +2219,31 @@ mod tests {
         gate: Option<Arc<crate::dev::AudioGate>>,
         f: impl FnOnce(&mut crate::play::PlayerRig<'_>, &game::Settings, InputEnd) -> R,
     ) -> (R, bool) {
+        let silent = |rate, _| {
+            (
+                Arc::new(audio::SoundBank::from_sounds(rate, Vec::new())),
+                Vec::new(),
+            )
+        };
+        on_rig_playing(settings, render, clock, gate, (silent, 1), |_| {}, f)
+    }
+
+    /// [`on_rig_gated`] whose engine plays the bank and schedule `chart`
+    /// makes at the output's rate and period, recording up to `seconds`,
+    /// and whose output is given to `done` when the audio thread ends.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn on_rig_playing<R>(
+        settings: game::Settings,
+        render: crate::render_side::RenderLink,
+        clock: QpcClock,
+        gate: Option<Arc<crate::dev::AudioGate>>,
+        (chart, seconds): (
+            impl FnOnce(u32, u32) -> (Arc<audio::SoundBank>, Vec<audio::ScheduledSound>),
+            usize,
+        ),
+        done: impl FnOnce(&crate::dev::Paced<audio::RecordingOutput<audio::SimDevice>>) + Send + 'static,
+        f: impl FnOnce(&mut crate::play::PlayerRig<'_>, &game::Settings, InputEnd) -> R,
+    ) -> (R, bool) {
         let dir = tempfile::tempdir().unwrap();
         let root = game::DataRoot::new(dir.path().join("data"));
         let controls = super::controls(&settings, clock);
@@ -2204,17 +2251,17 @@ mod tests {
         let (hook, input) = input_side::link(Arc::clone(&controls), Mode::Clock, waker.clone());
         let (audio, opened) = crate::audio_side::spawn(
             move || {
-                let mut out = crate::dev::recording_output(clock, 1);
+                let mut out = crate::dev::recording_output(clock, seconds);
                 out.gate = gate;
                 Ok::<_, std::convert::Infallible>((out, None))
             },
-            |_| {},
+            done,
         )
         .unwrap();
-        let bank = audio::SoundBank::from_sounds(opened.rate, Vec::new());
-        let engine = audio::AudioEngine::new(
-            Arc::new(bank),
-            &[],
+        let (bank, schedule) = chart(opened.rate, opened.period);
+        let engine = audio::AudioEngine::with_schedule(
+            bank,
+            schedule,
             opened.rate,
             opened.period,
             audio::MAX_VOICES,
@@ -2233,6 +2280,143 @@ mod tests {
         let gated = rig.gate.is_some() && rig.adjust.is_some();
         let _ = rig.shut_down();
         (out, gated)
+    }
+
+    /// The game thread's sync sends each of the three volumes to the audio
+    /// thread, and F3 the stepped key and background volumes: a key sound
+    /// (left channel only) plays at the key volume, a BGM-lane sound (right
+    /// only) at the background volume, and the decision tone at the system
+    /// volume, each read from what the real output recorded. The audio
+    /// thread is held at its gate while the test acts, and each phase ends
+    /// when the output has written enough frames after it, so no phase
+    /// depends on how long a thread sleeps; the wall clock only bounds a
+    /// stalled audio thread.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn sync_sends_each_volume_to_the_audio_thread() {
+        use std::sync::Mutex;
+        use std::time::{Duration, Instant};
+        const SECONDS: usize = 20;
+        let settings = game::Settings {
+            device: game::DeviceSettings {
+                system_volume: 0.45,
+                key_volume: 0.2,
+                background_volume: 0.8,
+                ..game::DeviceSettings::default()
+            },
+            player: game::PlayerSettings::default(),
+        };
+        // A quarter of full scale on one side each, from the play's start
+        // for as long as the recording: every phase sounds both.
+        let chart = |rate: u32, _| {
+            let frames = rate as usize * SECONDS;
+            let side = |left: bool| {
+                audio::Sound::stereo(
+                    (0..frames)
+                        .flat_map(|_| if left { [8_192, 0] } else { [0, 8_192] })
+                        .collect(),
+                )
+            };
+            let bank = audio::SoundBank::from_sounds(rate, vec![side(true), side(false)]);
+            let at = |sound, channel| audio::ScheduledSound {
+                time: bms_model::TimeUs(0),
+                sound: bms_model::SoundId(sound),
+                channel,
+            };
+            (
+                Arc::new(bank),
+                vec![at(0, game::Channel::Key), at(1, game::Channel::Background)],
+            )
+        };
+        let recorded = Arc::new(Mutex::new(Vec::new()));
+        let kept = Arc::clone(&recorded);
+        let done = move |out: &crate::dev::Paced<audio::RecordingOutput<audio::SimDevice>>| {
+            *kept.lock().unwrap() = out.samples().to_vec();
+        };
+        let gate = Arc::new(crate::dev::AudioGate::default());
+        on_rig_playing(
+            settings,
+            crate::render_side::tests::Installers::default().spawn_bare(),
+            QpcClock::start(),
+            Some(Arc::clone(&gate)),
+            (chart, SECONDS),
+            done,
+            |rig, _, input| {
+                let written = |rig: &crate::play::PlayerRig<'_>| {
+                    rig.audio
+                        .control
+                        .counters()
+                        .frame_line(bms_model::TimeUs(0))
+                        .block_start
+                };
+                // Waits for `done`: the wall clock only catches a stall.
+                let until = |done: &dyn Fn() -> bool| {
+                    let began = Instant::now();
+                    while !done() {
+                        assert!(
+                            began.elapsed() < Duration::from_secs(10),
+                            "the audio thread stalled"
+                        );
+                        std::thread::yield_now();
+                    }
+                };
+                // Acts with the audio thread held at its gate, then lets it
+                // write `frames` past where it stopped: a step that began
+                // after the action took its volumes, and at least one whole
+                // block was mixed with them.
+                let phase = |rig: &mut crate::play::PlayerRig<'_>,
+                             act: &dyn Fn(&mut crate::play::PlayerRig<'_>),
+                             frames: u64| {
+                    gate.hold();
+                    until(&|| gate.stopped());
+                    act(rig);
+                    let from = written(rig);
+                    gate.release();
+                    until(&|| written(rig) >= from + frames);
+                };
+                // The play starts now: its sounds start at its chart time 0.
+                use bms_model::TimeSource as _;
+                let now = input.clock.now();
+                let (_sink, queue) = game::audio_link_at(8, now);
+                rig.audio.control.play(now, queue).unwrap();
+                let blocks = 4 * 480;
+                phase(rig, &|rig| rig.sync(), blocks);
+                phase(
+                    rig,
+                    &|rig| {
+                        assert!(rig.controls.tuning().adjust(game::Adjust::VolumeDown));
+                        rig.sync();
+                    },
+                    blocks,
+                );
+                // The tone lasts 0.6 s.
+                phase(rig, &|rig| rig.audio.control.play_tone(), 48_000 * 7 / 10);
+            },
+        );
+        let samples = recorded.lock().unwrap().clone();
+        assert!(!samples.is_empty());
+        // The headroom halves the sum; the levels pass no knee.
+        let level = |volume: f32| 0.25 * volume * 0.5;
+        let close = |a: f32, b: f32| (a - b).abs() < 1e-6;
+        let frames: Vec<(f32, f32)> = samples.chunks(2).map(|f| (f[0], f[1])).collect();
+        let shows = |key: f32, background: f32| {
+            frames
+                .iter()
+                .any(|&(l, r)| close(l, level(key)) && close(r, level(background)))
+        };
+        assert!(shows(0.2, 0.8), "the loaded volumes");
+        assert!(shows(0.15, 0.75), "F3's volumes");
+        // The tone over F3's volumes: the same on both sides, at the
+        // system volume, under its unity peak.
+        let tone: Vec<f32> = frames
+            .iter()
+            .map(|&(l, r)| (l - level(0.15), r - level(0.75)))
+            .filter(|&(d, e)| d.abs() > 1e-4 && (d - e).abs() < 1e-6)
+            .map(|(d, _)| d.abs())
+            .collect();
+        let peak = tone.iter().copied().fold(0.0, f32::max);
+        assert!(tone.len() > 1_000, "{} tone frames", tone.len());
+        assert!(peak > 0.05 && peak <= 0.25 * 0.45 + 1e-6, "peak {peak}");
     }
 
     /// A retry pressed in Closing with the quit key, in either order, is

@@ -159,6 +159,16 @@ pub fn best(bp_diff: ResultNumber) -> BestView {
         },
         bp_diff,
         clear: LampKey::Hard,
+        // A best max combo of 100, this view's 120, with a BP; hidden
+        // with it, as a best max combo of 0 is.
+        max_combo: match bp_diff {
+            ResultNumber::Shown(_) => ResultNumber::Shown(100),
+            ResultNumber::Hidden => ResultNumber::Hidden,
+        },
+        max_combo_diff: match bp_diff {
+            ResultNumber::Shown(_) => ResultNumber::Shown(20),
+            ResultNumber::Hidden => ResultNumber::Hidden,
+        },
         ex_updated: true,
         bp_updated: matches!(bp_diff, ResultNumber::Shown(d) if d < 0),
         rate: Some(BestRate {
@@ -219,6 +229,8 @@ pub struct Res {
     pub res: ResultScreen,
     pub batch: QuadBatch,
     pub timers: ResultTimers,
+    /// The application's readouts each frame is built with.
+    pub app: skin_model::AppReadouts,
 }
 
 impl Res {
@@ -237,6 +249,7 @@ impl Res {
                 screen: Some(TimeUs(0)),
                 fadeout: None,
             },
+            app: skin_model::AppReadouts::LAUNCH,
         }
     }
 
@@ -254,6 +267,7 @@ impl Res {
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
             timers: self.timers,
+            app: self.app,
         };
         self.skin
             .build_result(&mut self.res, &frame, &self.uvs, &mut self.batch)

@@ -16,7 +16,7 @@ use audio::OutputError;
 use bms_model::{TimeSource, TimeUs};
 use eval::JudgeEvent;
 use game::{
-    Advance, AudioQueue, AudioWaitError, Chain, Closing, Command, InputWaitError, Loaded,
+    Advance, AudioQueue, AudioWaitError, Chain, Channel, Closing, Command, InputWaitError, Loaded,
     MenuCommand, Opening, PlayReport, Preparation, RenderSide, RestoreError, Restored,
     ResultScreen, Rig, Settings, Tuning,
 };
@@ -204,6 +204,9 @@ pub struct PlayerRig<'a> {
     /// Whether the window was shown: recording opens once it is. `None`
     /// without a window (headless).
     pub window: Option<crate::window::WindowShown>,
+    /// The window's cursor: hidden while a play runs, shown on every other
+    /// screen. `None` without a window (headless).
+    pub cursor: Option<crate::window::CursorSwitch>,
     /// The clock, started with the process.
     pub clock: QpcClock,
     /// What each play records.
@@ -404,6 +407,12 @@ pub struct PlayerRig<'a> {
     /// When the accepted leaving command's outro began (the view pinned),
     /// while the lifetime is current: no view's layout is asked for.
     pub result_outro: Option<TimeUs>,
+    /// The decision screen the choice claimed, from its presentation's
+    /// choice ([`game::AppRig::decision_shown`]) to its entry, and its
+    /// lifetime until it ends: what the render thread is told to draw
+    /// (its choice set at the entry), and the lifetime the label book is
+    /// told has ended.
+    pub decision_claim: Option<crate::decision_side::ShownDecision>,
     /// Development builds: G2's start (the S10-09i design's §8.1), when
     /// the attempt's `commit_ready` returned, and what its result step
     /// did, until the opening prints it.
@@ -414,6 +423,9 @@ pub struct PlayerRig<'a> {
     /// looks again.
     #[cfg(test)]
     pub relooked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Tests: set by the idle wait right before it parks.
+    #[cfg(test)]
+    pub park_probe: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Tests: the audio output reads as lost while set, from any thread.
     #[cfg(all(test, feature = "dev-tools"))]
     pub audio_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -505,6 +517,14 @@ pub struct Shutdown {
 }
 
 impl PlayerRig<'_> {
+    /// Shows the window's cursor, or hides it: hidden while a play runs,
+    /// shown on every other screen (design.md "Input", **Pointer input**).
+    pub(crate) fn show_cursor(&self, shown: bool) {
+        if let Some(cursor) = &self.cursor {
+            cursor.set(shown);
+        }
+    }
+
     /// The chart layer side of the play installation `skin` draws with:
     /// the skin in use's, or a pending skin's specialization's; `None`
     /// without a chart layer.
@@ -944,7 +964,7 @@ impl PlayerRig<'_> {
             return;
         }
         if !self.presenter.current() {
-            self.presenter.begin(&mut self.render, self.clock.now());
+            self.presenter.begin(&mut self.render);
             self.result_leaving = false;
             self.result_offset = Some((self.controls.tuning().get().input_offset_us, false));
         }
@@ -1427,7 +1447,7 @@ impl PlayerRig<'_> {
     /// Writes the settings keys' values to `device.toml` and
     /// `player.toml`, each atomically and only if it changed. Called when a
     /// play ends and when the run ends, never during a play.
-    fn persist(&mut self) {
+    pub(crate) fn persist(&mut self) {
         if let Some(driver) = &self.adjust {
             self.files.set_options(driver.options());
         }
@@ -1464,17 +1484,19 @@ impl PlayerRig<'_> {
         self.queue_line = Some(line);
     }
 
-    /// Acts on changed settings keys' values: the volume goes to the
+    /// Acts on changed settings keys' values: the volumes go to the
     /// audio thread, and a shown end screen is drawn again.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn sync(&mut self) {
         let tuned = self.seen.take_new(self.controls.tuning());
         if tuned.is_some() {
-            // Always within 0 to unity: loading and `Tuning` keep it there.
-            let _ = self
-                .audio
-                .control
-                .set_volume(self.controls.tuning().volume());
+            // Always within 0 to unity: loading and `Tuning` keep them there.
+            for channel in Channel::ALL {
+                let _ = self
+                    .audio
+                    .control
+                    .set_volume(channel, self.controls.tuning().volume(channel));
+            }
         }
         // The end screen's hi-speed line follows the adjustments too.
         let speed = self.speed_line();
@@ -1710,22 +1732,12 @@ pub(crate) const fn until_due(origin: TimeUs, at: TimeUs, now: TimeUs) -> bool {
     now.0 - origin.0 >= at.0
 }
 
-impl Rig for PlayerRig<'_> {
-    type Reader = SourceReader;
-    type ScreenError = ScreenError;
-    type ResultPrep = ();
-
+impl PlayerRig<'_> {
+    /// Parks for `park` at most (the input thread unparks it earlier),
+    /// then serves what a step's wait serves ([`game::Rig::wait`]).
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn now(&self) -> TimeUs {
-        let now = self.clock.now();
-        #[cfg(test)]
-        self.opening_gates.read_clock(now);
-        now
-    }
-
-    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn wait(&mut self) {
-        thread::park_timeout(if self.in_play { PARK } else { IDLE_PARK });
+    fn wait_parked(&mut self, park: Duration) {
+        thread::park_timeout(park);
         self.serve_adjustments();
         // A scenario's `until`: the command, sent once, as its key would.
         #[cfg(feature = "dev-tools")]
@@ -1763,9 +1775,43 @@ impl Rig for PlayerRig<'_> {
         self.sync();
     }
 
+    /// How long a loading wait parks: the idle wake at most, never past
+    /// `until` on the rig's clock ([`game::wait_slice`]).
+    fn loading_park_slice(&self, until: Option<TimeUs>) -> Duration {
+        game::wait_slice(until, self.clock.now(), IDLE_PARK)
+    }
+
+    /// A loading wait's park, for [`loading_park_slice`](Self::loading_park_slice).
+    pub(crate) fn loading_park(&mut self, until: Option<TimeUs>) {
+        let park = self.loading_park_slice(until);
+        self.wait_parked(park);
+    }
+}
+
+impl Rig for PlayerRig<'_> {
+    type Reader = SourceReader;
+    type ScreenError = ScreenError;
+    type ResultPrep = ();
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn now(&self) -> TimeUs {
+        let now = self.clock.now();
+        #[cfg(test)]
+        self.opening_gates.read_clock(now);
+        now
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn wait(&mut self) {
+        self.wait_parked(if self.in_play { PARK } else { IDLE_PARK });
+    }
+
     fn idle_wait(&mut self, deadline: TimeUs) {
         let left = deadline.0 - self.clock.now().0;
         if left > 0 {
+            #[cfg(test)]
+            self.park_probe
+                .store(true, std::sync::atomic::Ordering::SeqCst);
             thread::park_timeout(Duration::from_micros(left.unsigned_abs()));
         }
         // A switch's layout lands when its job is done: the job wakes this
@@ -1899,6 +1945,11 @@ impl Rig for PlayerRig<'_> {
     /// once.
     fn result_timing(&self) -> Option<game::ResultTiming> {
         self.presenter.timing(&self.render).map(flow_timing)
+    }
+
+    /// The result's origin: the render thread's first commit of a view.
+    fn result_origin(&self) -> Option<TimeUs> {
+        self.presenter.origin(&self.render)
     }
 
     /// The barrier is set at `at` (D4), for every accepted command: the
@@ -2279,6 +2330,7 @@ impl Rig for PlayerRig<'_> {
         if let Some(window) = &self.window {
             window.wait_to_open();
         }
+        self.show_cursor(false);
         self.in_play = true;
         // A round's opening is not the full play's READY state: READY
         // and a scenario's `until` run from it.
@@ -2348,6 +2400,7 @@ impl Rig for PlayerRig<'_> {
         if let Some((driver, mut pump)) = self.adjustments() {
             driver.before_opening(&mut pump)?;
         }
+        self.show_cursor(false);
         self.in_play = true;
         self.lead_in = lead_in;
         let opened = self.input.open_candidate(Request::Open {
@@ -2625,6 +2678,7 @@ impl Rig for PlayerRig<'_> {
         // The tail is over: nothing reads the input thread's publications
         // or its focus checks until the next play opens.
         self.in_play = false;
+        self.show_cursor(true);
         self.input.idle();
     }
 
@@ -2780,6 +2834,7 @@ impl Rig for PlayerRig<'_> {
             game::probe::stamp(&game::probe::RESULT_BEGAN);
             game::probe::clear(&game::probe::STEP_ACCEPTED);
         }
+        self.show_cursor(true);
         if self.result_input.enter() {
             self.viewed = None;
             self.evaluated = 0;
@@ -3064,10 +3119,10 @@ mod restore_tests {
             48_000,
             vec![Sound::mono(vec![1_000; 4 * 48_000])],
         ));
-        let schedule = vec![BgmEvent {
+        let schedule = vec![audio::ScheduledSound::from(BgmEvent {
             time: TimeUs(5_000_000),
             sound: SoundId(0),
-        }];
+        })];
         let engine =
             AudioEngine::with_schedule(bank, schedule.clone(), 48_000, 480, 16, 0).unwrap();
         let (mut control, mut worker) = audio_control(engine);
@@ -3131,7 +3186,29 @@ mod tests {
 
     use game::Command;
 
-    use super::{until_due, until_fired};
+    use super::{IDLE_PARK, until_due, until_fired};
+    use bms_model::TimeSource;
+
+    /// A loading wait parks until a near `until` on the rig's clock, the
+    /// idle wake without one, and nothing for one passed
+    /// ([`game::wait_slice`]); nothing parks here.
+    #[test]
+    fn a_loading_park_ends_at_its_until() {
+        use std::time::Duration;
+        let ((near, none, passed), _) =
+            crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+                let now = rig.clock.now();
+                (
+                    rig.loading_park_slice(Some(TimeUs(now.0 + 30_000))),
+                    rig.loading_park_slice(None),
+                    rig.loading_park_slice(Some(TimeUs(now.0 - 1))),
+                )
+            });
+        assert!(near <= Duration::from_millis(30), "{near:?}");
+        assert!(near < IDLE_PARK, "{near:?}");
+        assert_eq!(none, IDLE_PARK);
+        assert_eq!(passed, Duration::ZERO);
+    }
 
     /// The player's rig's preparation (design.md "Play Lifecycle",
     /// preparing each attempt): it owns its jobs, and its answer stays

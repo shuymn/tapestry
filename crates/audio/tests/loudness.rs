@@ -8,8 +8,8 @@
 use std::sync::Arc;
 
 use audio::{
-    Analysis, BLOCK_FRAMES, HEADROOM, MAX_GAIN, MAX_VOICES, Measurement, Mixer, Sound, SoundBank,
-    Step, normalization_gain,
+    Analysis, BLOCK_FRAMES, Channel, HEADROOM, MAX_GAIN, MAX_VOICES, Measurement, Mixer, Sound,
+    SoundBank, Step, normalization_gain,
 };
 use bms_model::{BgmEvent, SoundId, TimeUs};
 use ebur128::{EbuR128, Mode};
@@ -54,7 +54,7 @@ fn raw_mix(bank: &SoundBank, events: &[BgmEvent], frames: u64) -> Vec<f32> {
     let mut m = Mixer::new(MAX_VOICES, bank.rate());
     for e in events {
         let at = u64::try_from(e.time.0).unwrap() * u64::from(bank.rate()) / 1_000_000;
-        m.trigger(bank, e.sound, at);
+        m.trigger(bank, e.sound, at, Channel::Background);
     }
     let mut out = Vec::new();
     while (out.len() / 2) < frames as usize {
@@ -139,11 +139,11 @@ fn overlapping_full_scale_sounds_measure_above_full_scale() {
     assert!(m.integrated.is_some());
 }
 
-/// The master volume and the play's gain do not reach `mix_raw`: its
-/// samples are the same bits at any volume and gain, and the analysis
+/// The volumes and the play's gain do not reach `mix_raw`: its samples
+/// are the same bits at any volumes and gain, and the analysis
 /// measures exactly what a meter in its mode makes of that raw sum.
 #[test]
-fn analysis_ignores_master_volume() {
+fn analysis_ignores_the_volumes() {
     const RATE: u32 = 8_000;
     let bank = Arc::new(SoundBank::from_sounds(
         RATE,
@@ -153,14 +153,25 @@ fn analysis_ignores_master_volume() {
         ],
     ));
     let events = [event(0, 0), event(500_000, 1), event(1_500_000, 1)];
-    let mixes: Vec<Vec<f32>> = [(1.0, HEADROOM), (0.25, 1.9), (16.0, 0.01)]
+    let mixes: Vec<Vec<f32>> = [(1.0, 1.0, HEADROOM), (0.2, 0.999, 1.9), (16.0, 0.0, 0.01)]
         .into_iter()
-        .map(|(volume, gain)| {
+        .map(|(key, background, gain)| {
             let mut m = Mixer::new(MAX_VOICES, RATE);
-            m.set_volume(volume).unwrap();
+            m.set_volume(Channel::Key, key).unwrap();
+            m.set_volume(Channel::Background, background).unwrap();
             m.set_gain(gain).unwrap();
             for e in &events {
-                m.trigger(&bank, e.sound, u64::try_from(e.time.0).unwrap() * 8 / 1_000);
+                let channel = if e.sound.0 == 0 {
+                    Channel::Key
+                } else {
+                    Channel::Background
+                };
+                m.trigger(
+                    &bank,
+                    e.sound,
+                    u64::try_from(e.time.0).unwrap() * 8 / 1_000,
+                    channel,
+                );
             }
             let mut out = vec![0.0; 8 * BLOCK_FRAMES * 2];
             for block in out.chunks_mut(BLOCK_FRAMES * 2) {

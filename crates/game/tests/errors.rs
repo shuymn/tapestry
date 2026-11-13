@@ -138,7 +138,8 @@ fn settings_errors_chain_to_their_causes() {
             name: "input_offset_us",
             value: 2_000_000,
         },
-        DeviceSettingsError::MasterVolume {
+        DeviceSettingsError::Volume {
+            key: "system_volume",
             bits: 2.0_f32.to_bits(),
         },
         DeviceSettingsError::QueuedPeriods(9),
@@ -146,11 +147,12 @@ fn settings_errors_chain_to_their_causes() {
         assert!(leaf.source().is_none(), "{leaf:?}");
     }
     assert_eq!(
-        DeviceSettingsError::MasterVolume {
+        DeviceSettingsError::Volume {
+            key: "key_volume",
             bits: 1.5_f32.to_bits()
         }
         .to_string(),
-        "master_volume 1.5 is outside 0.0 to 1.0"
+        "key_volume 1.5 is outside 0.0 to 1.0"
     );
 }
 

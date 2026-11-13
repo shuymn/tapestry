@@ -194,16 +194,18 @@ fn on_loading<R>(
     held_ack: bool,
     f: impl FnOnce(&mut PlayerRig<'_>, &Side<'_>, &mut game::Loaded) -> R,
 ) -> R {
-    on_loading_with(loaded, pending, held_ack, false, f)
+    on_loading_with(loaded, pending, held_ack, false, None, f)
 }
 
 /// [`on_loading`], with every loading frame refused from before the
-/// lifetime begins while `refused`.
+/// lifetime begins while `refused`, and the first frame's hold bound
+/// `hold` when given, from before the lifetime begins.
 fn on_loading_with<R>(
     loaded: &mut game::Loaded,
     pending: Option<&str>,
     held_ack: bool,
     refused: bool,
+    hold: Option<TimeUs>,
     f: impl FnOnce(&mut PlayerRig<'_>, &Side<'_>, &mut game::Loaded) -> R,
 ) -> R {
     let _serial = imports::serial();
@@ -226,6 +228,14 @@ fn on_loading_with<R>(
     } else {
         screens.spawn(&chart, &bundle())
     };
+    if let Some(bound) = hold {
+        render.set_first_frame_hold(bound);
+        // A page presented before the lifetime: the image the hold keeps.
+        render.show_decision(crate::menu_screen::MenuPage::default(), None);
+        until("the page presented", || {
+            screens.menu_frames.lock().unwrap().len() >= 2
+        });
+    }
     on_input_rig_with(covers(), render, |rig, keys| {
         let dir = tempfile::tempdir().unwrap();
         let (sel, _) = crate::selection::tests::tree(dir.path(), &[&["b.bms"]]);
@@ -357,6 +367,7 @@ fn the_committed_play_skin_has_the_plays_best_and_target() {
         plays: 1,
         ex: Some(40),
         bp: Some(0),
+        max_combo: None,
         clear: None,
     });
     let cases = [
@@ -570,7 +581,7 @@ fn ends(side: &Side<'_>) -> Vec<TimeUs> {
 #[test]
 fn a_refused_first_loading_frame_ends_the_run() {
     let (_dir, mut loaded) = plain();
-    on_loading_with(&mut loaded, None, false, true, |rig, side, loaded| {
+    on_loading_with(&mut loaded, None, false, true, None, |rig, side, loaded| {
         let lifetime = rig.render.loading_lifetime();
         let frames = || {
             side.screens
@@ -642,6 +653,56 @@ fn the_opener_counts_the_minimum_from_the_render_ack() {
         };
         assert!(end.0 >= at.0 + 1_000_000, "{end:?} {at:?}");
     });
+}
+
+/// TB12: a pending play skin's first loading frame held while its
+/// specialization runs, over the selection frames presented before: no
+/// frame of the lifetime is presented or acknowledged during the hold, the
+/// opening waits for it, and the first acknowledged frame is the staged
+/// skin's, the minimum counting from it.
+#[test]
+fn the_opening_waits_for_the_held_first_frame() {
+    let (_dir, mut loaded) = plain();
+    let never = Some(TimeUs(3_600_000_000));
+    on_loading_with(
+        &mut loaded,
+        Some("local lv = ms.number(96)"),
+        false,
+        false,
+        never,
+        |rig, side, loaded| {
+            let lifetime = rig.render.loading_lifetime();
+            let held = rig.render.held_waits();
+            let acked = rig.render.ack_hold();
+            // The specialization's job does not end until let go.
+            skin_beatoraja::vm_hooks::hold();
+            side.loading_end.hold(true);
+            let ended = open_with(loaded, rig, side, || {
+                until("the specialization held", || {
+                    skin_beatoraja::vm_hooks::waiting() > 0
+                });
+                until("the first frame held", || held() >= 3);
+                assert!(!acked.held(), "a held frame was presented");
+                skin_beatoraja::vm_hooks::release();
+                side.quit_at_the_end_of_loading();
+            });
+            skin_beatoraja::vm_hooks::release();
+            assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+            let pending = side
+                .screens
+                .pending
+                .load(std::sync::atomic::Ordering::Acquire);
+            assert_eq!(pending, 0, "the placeholder drawn");
+            let staged = side.screens.staged_frames.lock().unwrap().clone();
+            assert_eq!(staged.first().map(|&(l, _)| l), Some(lifetime));
+            let (first, at) = rig.render.loading_ack().unwrap();
+            assert_eq!(first, lifetime);
+            let [end] = ends(side)[..] else {
+                panic!("{:?}", ends(side));
+            };
+            assert!(end.0 >= at.0 + 1_000_000, "{end:?} {at:?}");
+        },
+    );
 }
 
 /// The one close after a deferral or a commit: the time the flow decided
@@ -1036,5 +1097,76 @@ fn an_audio_failure_during_the_quits_settle_ends_the_run() {
         skin_beatoraja::vm_hooks::release();
         imports::hold_exit(false);
         until("every job thread ended", || imports::workers() == 0);
+    });
+}
+
+/// P10: the cursor is hidden as the play opens and shown again once its
+/// result shows, and at the play's end.
+#[test]
+fn the_cursor_hides_for_the_play_and_shows_at_its_result() {
+    let (_dir, mut loaded) = plain();
+    on_loading(&mut loaded, None, false, |rig, side, loaded| {
+        let (switch, seen) = crate::window::CursorSwitch::recording();
+        rig.cursor = Some(switch);
+        let during = std::sync::Mutex::new(Vec::new());
+        let at_result = std::sync::Mutex::new(Vec::new());
+        let ended = open_with(loaded, rig, side, || {
+            until("recording opened", || {
+                side.loading_end.passed() >= 1 && side.tuning.acceptance() == Acceptance::Open
+            });
+            *during.lock().unwrap() = seen.lock().unwrap().clone();
+            side.controls.focus(false);
+            side.keys.key(super::SELECT, 0);
+            until("the result", || side.tuning.end_screen_shown());
+            *at_result.lock().unwrap() = seen.lock().unwrap().clone();
+            side.controls.focus(true);
+            side.quit_until_returned();
+        });
+        assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+        assert_eq!(*during.lock().unwrap(), [false]);
+        // Shown once the result began, and again at the play's end.
+        assert!(at_result.lock().unwrap().starts_with(&[false, true]));
+        assert_eq!(*seen.lock().unwrap(), [false, true, true]);
+    });
+}
+
+/// K1 and K5 end to end, and the cancelled load: a load attached and then
+/// left before its play (as a cancel while decoding or measuring, a
+/// refusal or Back leave it) leaves nothing pending once selection is
+/// entered, so SUDDEN+ turned from the skin there is taken; the next load
+/// attaches with it, the play opens with it, and the
+/// play's end writes it to `player.toml`, which did not hold it before.
+#[test]
+fn a_cover_turned_after_a_cancelled_load_reaches_the_next_play() {
+    let (_dir, mut loaded) = plain();
+    on_loading(&mut loaded, None, false, |rig, side, loaded| {
+        let player_toml = |rig: &PlayerRig<'_>| {
+            let path = rig.files.root().player_settings();
+            path.exists()
+                .then(|| game::load_settings::<game::PlayerSettings>(&path).unwrap())
+                .is_some_and(|p| p.covers.sudden_on)
+        };
+        assert!(rig.adjust.as_ref().unwrap().has_pending());
+        rig.left_chart().unwrap();
+        rig.entered_selection();
+        assert!(!rig.adjust.as_ref().unwrap().has_pending());
+        rig.selection.as_mut().unwrap().covers_turned[0] = true;
+        // The look that takes them.
+        assert!(rig.choose().is_none());
+        assert!(rig.adjust.as_ref().unwrap().options().covers().sudden.on);
+        assert!(!player_toml(rig));
+        // The next play, loaded, attached and played to its end.
+        rig.entered_loading(loaded.path());
+        if let Some((driver, mut pump)) = rig.adjustments() {
+            assert_eq!(driver.attach_loaded(loaded, &mut pump).unwrap(), None);
+        }
+        let ended = open_with(loaded, rig, side, || side.quit_the_play(1));
+        assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+        assert_eq!(rig.ended_plays.len(), 1);
+        // The state the play's opening started with.
+        let driver = rig.adjust.as_ref().unwrap();
+        let opened = (0..8).find_map(|g| driver.opened(g)).expect("an opening");
+        assert!(opened.sudden.on);
+        assert!(player_toml(rig));
     });
 }

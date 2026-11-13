@@ -2,7 +2,7 @@
 //! exact ratio of its axis, or moved along a slider's travel by it. A
 //! slider never changes state: a press on it gives the ratio under the
 //! pointer as a command for the screen to carry out
-//! ([`Skin::slider_at`](crate::Skin::slider_at)).
+//! ([`Skin::drag_at`](crate::Skin::drag_at), [`Skin::hit_at`](crate::Skin::hit_at)).
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -20,10 +20,21 @@ pub enum RatioSource {
     /// The selected chart's best EX score over the largest its summary
     /// allows; none without both or with a largest of 0.
     ExRate,
-    /// The master gain that plays, exactly
-    /// ([`MasterVolume::ratio`](crate::MasterVolume::ratio)); none before
+    /// The selected chart's best EX play's judgments of one kind,
+    /// PERFECT (0) to POOR (4), over its own notes; none without one.
+    JudgeRate(u8),
+    /// The selected chart's best max combo over its summary's notes, a
+    /// chart that draws included; none without a summary.
+    ComboRate,
+    /// The system volume that plays, exactly
+    /// ([`VolumeReading::ratio`](crate::VolumeReading::ratio)); none before
     /// the settings.
-    MasterVolume,
+    SystemVolume,
+    /// The key volume that plays, exactly; none before the settings.
+    KeyVolume,
+    /// The background volume that plays, exactly; none before the
+    /// settings.
+    BackgroundVolume,
     /// A play's score rate: a play skin's source, and only a play skin's,
     /// as the two below.
     Score(ScoreRate),
@@ -56,7 +67,14 @@ impl RatioSource {
                 field::TIME_PROGRESS_PPM,
                 u64::from(crate::play::schema::PROGRESS_FULL.unsigned_abs()),
             )),
-            Self::ListPosition | Self::ExRate | Self::MasterVolume | Self::Score(_) => None,
+            Self::ListPosition
+            | Self::ExRate
+            | Self::JudgeRate(_)
+            | Self::ComboRate
+            | Self::SystemVolume
+            | Self::KeyVolume
+            | Self::BackgroundVolume
+            | Self::Score(_) => None,
         }
     }
 }
