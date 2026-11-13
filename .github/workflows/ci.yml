@@ -420,11 +420,13 @@ jobs:
         run: mise exec -- cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
       - name: Test (fuzz seed smoke cases)
         run: mise exec -- cargo test --manifest-path fuzz/Cargo.toml --locked
-      # An unreadable registry index only warns and skips the yanked check.
+      # An unreadable registry index only warns and skips the yanked check;
+      # dep-check.sh fails on it after three tries (docs/setup.md
+      # "Dependency Checks").
       - name: cargo-deny
         run: |
-          mise exec -- cargo deny check --deny index-failure
-          mise exec -- cargo deny --manifest-path fuzz/Cargo.toml --config deny.toml check --deny index-failure
+          scripts/dep-check.sh deny check --deny index-failure
+          scripts/dep-check.sh deny --manifest-path fuzz/Cargo.toml --config deny.toml check --deny index-failure
       # `--with-metadata` also covers dev-, build- and target-specific
       # dependencies. cargo-machete exits 0 when it cannot read a manifest or
       # run cargo metadata, so its error lines fail the step; it runs cargo
@@ -435,14 +437,12 @@ jobs:
           mise exec -- cargo machete --with-metadata 2>&1 | tee "$RUNNER_TEMP/machete.log"
           if grep '^error when handling' "$RUNNER_TEMP/machete.log"; then exit 1; fi
           git diff --exit-code Cargo.lock fuzz/Cargo.lock
-      # cargo-audit only logs index failures (on stderr, which the guard scans).
+      # cargo-audit only logs index failures (on stderr, which dep-check.sh
+      # scans).
       - name: cargo-audit
         run: |
-          set -o pipefail
-          for lock in Cargo.lock fuzz/Cargo.lock; do
-            { mise exec -- cargo audit --file "$lock" --deny warnings 2>&1 1>&3 | tee "$RUNNER_TEMP/audit.log" >&2; } 3>&1
-            if grep -E "couldn't (update|open) crates.io index|couldn't check if the package is yanked" "$RUNNER_TEMP/audit.log"; then exit 1; fi
-          done
+          scripts/dep-check.sh audit --file Cargo.lock --deny warnings
+          scripts/dep-check.sh audit --file fuzz/Cargo.lock --deny warnings
       - name: Disk usage
         if: ${{ !cancelled() }}
         run: |
