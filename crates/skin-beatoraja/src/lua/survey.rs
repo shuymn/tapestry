@@ -24,7 +24,7 @@ use super::{
 use crate::error::{ImportError, Loc};
 use crate::import::ledger;
 pub use crate::import::ledger::{Became, DestinationEntry, DestinationNote};
-use crate::import::{Config, DeviationId, NoteKind};
+use crate::import::{Config, NoteKind};
 use crate::tree::{Arena, CallableKind};
 
 /// One import's outcome under allowlisted labels.
@@ -93,6 +93,11 @@ pub struct Survey {
     pub atlas: Vec<String>,
     /// An imported play skin's declared ending, as read.
     pub play_ending: Option<skin_model::PlayEnding>,
+    /// An imported play skin's elements, and how many run on each timer
+    /// by its play schema name, `when` for a `when` timer and `program`
+    /// for a compiled timer callback, the zero counts left out
+    /// (dev-tools).
+    pub play_elements: Option<(usize, BTreeMap<String, usize>)>,
     /// A result import drawn over [`Choice::result`], when one was given
     /// and the import completed, or a decision import that completed,
     /// drawn over its declared timing ([`decision_frames`]).
@@ -247,6 +252,7 @@ fn frames(
                 screen: Some(bms_model::TimeUs(0)),
                 fadeout: None,
             },
+            app: skin_model::AppReadouts::LAUNCH,
         };
         skin.build_result(&mut res, &frame, atlas.uvs(), &mut batch)
             .ok()?;
@@ -507,7 +513,6 @@ fn note(kind: &NoteKind) -> String {
         NoteKind::Ignored { field } => format!("Ignored {field}"),
         NoteKind::Callback { field, why } => format!("Callback {field} {}", unsupported(why)),
         NoteKind::OverCap { cap } => format!("OverCap {cap}"),
-        NoteKind::Deviation(DeviationId::D20) => "Deviation D20 entrance lost".to_owned(),
         other => variant(other),
     }
 }
@@ -801,6 +806,28 @@ fn atlas_plans(skin: &skin_model::Skin) -> Vec<String> {
     lines
 }
 
+/// A play skin's element count and its elements per timer, by the play
+/// schema's timer name, `when` for a `when` timer and `program` for a
+/// compiled timer callback.
+#[cfg(feature = "dev-tools")]
+fn play_elements(skin: &skin_model::Skin) -> (usize, BTreeMap<String, usize>) {
+    use skin_model::TimerRef;
+    let timers = skin.element_timers();
+    let mut by = BTreeMap::new();
+    for t in &timers {
+        let name = match *t {
+            TimerRef::Builtin(s) => skin_model::PLAY
+                .timers
+                .get(usize::from(s))
+                .map_or("builtin", |t| t.name),
+            TimerRef::When(_) => "when",
+            TimerRef::Output(_) => "program",
+        };
+        *by.entry(name.to_owned()).or_default() += 1;
+    }
+    (timers.len(), by)
+}
+
 /// Records an import that completed: its outcome, its notes by kind, and
 /// its frames for a `kind` result skin with [`Choice::result`] or a
 /// decision skin.
@@ -811,6 +838,10 @@ fn imported_into(s: &mut Survey, imported: &crate::Imported, kind: ScreenKind, c
         imported.skin.program_callbacks(),
     ));
     s.play_ending = (kind == ScreenKind::Play).then(|| imported.skin.play_ending());
+    #[cfg(feature = "dev-tools")]
+    if kind == ScreenKind::Play {
+        s.play_elements = Some(play_elements(&imported.skin));
+    }
     #[cfg(feature = "dev-tools")]
     {
         s.atlas = atlas_plans(&imported.skin);
@@ -1538,7 +1569,7 @@ return { type = 0 }",
     }
 
     #[test]
-    fn an_entrance_lost_has_its_label_and_a_looping_track_stops() {
+    fn a_settling_track_imports_and_a_looping_track_stops() {
         let entry = |gauge_loop: i32| {
             format!(
                 "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
@@ -1572,7 +1603,8 @@ return { type = 0 }",
         };
         let settled = run(&entry(250));
         assert_eq!(settled.outcome, "imported");
-        assert_eq!(settled.notes.get("Deviation D20 entrance lost"), Some(&2));
+        // Each destination's D10 and its D3, under one label.
+        assert_eq!(settled.notes.get("Deviation"), Some(&4));
         let looping = run(&entry(100));
         assert_eq!(looping.outcome, "critical Gauge: Timer");
     }

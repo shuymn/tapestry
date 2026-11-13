@@ -111,6 +111,10 @@ pub fn chart() -> ResultChart {
         length: Some(TimeUs(123_456_789)),
         notes: Some(600),
         judge_class: None,
+        images: skin_model::ImageFacts {
+            stage: true,
+            back: false,
+        },
     }
 }
 
@@ -234,6 +238,8 @@ pub struct RFx {
     pub target: [u32; 2],
     pub layout: Layout,
     pub timers: ResultTimers,
+    /// The application's readouts each frame is built with.
+    pub app: skin_model::AppReadouts,
 }
 
 impl RFx {
@@ -251,6 +257,7 @@ impl RFx {
                 screen: Some(TimeUs(0)),
                 fadeout: None,
             },
+            app: skin_model::AppReadouts::LAUNCH,
         }
     }
 
@@ -268,6 +275,7 @@ impl RFx {
             target: self.target,
             layout: &self.layout,
             timers: self.timers,
+            app: self.app,
         };
         self.skin
             .build_result(&mut self.res, &frame, &self.uvs, &mut self.batch)

@@ -244,10 +244,10 @@ pub(crate) fn prepare(
     report.submission = submission.clone();
     // A device lost while its writes are queued is not detected here: on
     // the pinned wgpu, a destroyed device drops the writes and the wait
-    // still returns, so the lines are published unwritten. The renderer
-    // has no device-loss detection on its uploads (the atlas's included:
-    // no device-lost callback is registered), a gap left open here. Only a
-    // failing wait is treated as the device's failure below.
+    // still returns, so the lines are published unwritten. A device-lost
+    // callback is registered (`Gpu::lost`), but this path does not read
+    // it after its wait, a gap left open here. Only a failing wait is
+    // treated as the device's failure below.
     let waited = if submission.is_some() {
         // A unit test, or a development build, may make the wait fail in
         // place of waiting.

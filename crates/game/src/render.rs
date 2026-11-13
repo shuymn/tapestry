@@ -55,6 +55,11 @@ pub struct PlayView {
     /// Closing, and never [`GaugeState::failed_at`], which stays the
     /// evaluator's.
     pub closing: Option<TimeUs>,
+    /// Where a completed full play's fade-out started, on its play clock
+    /// (design.md "Play Lifecycle", Audio tail): the skin's fade-out
+    /// timer's start; `None` before it, in Closing and in a practice
+    /// round, which never fade out.
+    pub fading: Option<TimeUs>,
     /// The number of events this candidate emitted so far: its effects
     /// with a lower sequence number are the ones this view includes.
     pub events: u64,
@@ -447,6 +452,7 @@ mod tests {
             complete: false,
             playing: false,
             closing: None,
+            fading: None,
             events: 0,
             offsets: super::OffsetRing::EMPTY,
         }

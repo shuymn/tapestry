@@ -232,6 +232,8 @@ pub struct Logic<'a, R = SourceReader> {
     playing: bool,
     /// Where the play entered Closing ([`PlayView::closing`]).
     closing: Option<TimeUs>,
+    /// Where the play's fade-out started ([`PlayView::fading`]).
+    fading: Option<TimeUs>,
     finalized: Option<TimeUs>,
     overflowed: bool,
     aborted: Option<AbortCause>,
@@ -326,6 +328,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             complete: false,
             playing: false,
             closing: None,
+            fading: None,
             events: 0,
             offsets: OffsetRing::EMPTY,
         };
@@ -355,6 +358,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             origin: None,
             playing: false,
             closing: None,
+            fading: None,
             finalized: None,
             overflowed: false,
             aborted: None,
@@ -669,6 +673,16 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         self.publish_view();
     }
 
+    /// A full play's fade-out started at play time `at` (design.md "Play
+    /// Lifecycle", Audio tail): publishes the view again with
+    /// [`PlayView::fading`] at `at`, so every later frame draws the
+    /// fade-out from `at`. Closing never calls it.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn enter_fade(&mut self, at: TimeUs) {
+        self.fading = Some(at);
+        self.publish_view();
+    }
+
     /// The events emitted by the last step.
     #[must_use]
     pub fn events(&self) -> &[JudgeEvent] {
@@ -734,6 +748,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             complete: self.evaluator.is_complete(),
             playing: self.playing,
             closing: self.closing,
+            fading: self.fading,
             events: self.emitted,
             offsets: self.offsets,
         }
@@ -820,6 +835,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         self.offsets.clear();
         self.playing = false;
         self.closing = None;
+        self.fading = None;
         self.finalized = None;
         self.overflowed = false;
         self.aborted = None;
@@ -876,6 +892,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         v.complete = self.evaluator.is_complete();
         v.playing = self.playing;
         v.closing = self.closing;
+        v.fading = self.fading;
         v.events = self.emitted;
         v.offsets = self.offsets;
         self.view.publish();

@@ -678,11 +678,16 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
     rep.carry_safe = run.carry_safe;
     for (i, r) in run.rounds.iter().enumerate() {
         rep.rounds.push(format!(
-            "round {} {:?}: slots run {}, terminal {}",
+            "round {} {:?}: slots run {}, terminal {}{}",
             i + 1,
             r.carried,
             r.slots_run,
-            r.terminal
+            r.terminal,
+            if r.ending_cut {
+                ", ending replayed 30 s past the last note of a longer declaration"
+            } else {
+                ""
+            }
         ));
     }
     if run.frames.len() != obs.frames.len() {

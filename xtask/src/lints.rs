@@ -231,6 +231,12 @@ pub const IN_PLAY: &[Site] = &[
             "run_tail",
             "TailStage::begin",
             "TailStage::over",
+            "FadeStage::begin",
+            "FadeStage::over",
+            "tail_exit",
+            "tail_stepped",
+            "hold_until",
+            "fade_deadline",
             "TailAction::of",
             "TailEnd::of",
             "TailEnd::cut",
@@ -258,6 +264,7 @@ pub const IN_PLAY: &[Site] = &[
         "crates/game/src/session.rs",
         &[
             "Loaded::closes_on",
+            "Loaded::finish_anchor",
             "Command::cause",
             "arrival",
             "replay_kind",
@@ -293,6 +300,7 @@ pub const IN_PLAY: &[Site] = &[
             "PlayerRig::send_end",
             "PlayerRig::now",
             "PlayerRig::wait",
+            "PlayerRig::wait_parked",
             "PlayerRig::take",
             "PlayerRig::take_closing",
             "PlayerRig::declared_close",
@@ -445,6 +453,8 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/layout.rs"),
     Site::File("crates/skin-model/src/pixmap.rs"),
     Site::File("crates/skin-model/src/place.rs"),
+    // A selection skin's pointer targets, hit tests and hover rects.
+    Site::File("crates/skin-model/src/pointer.rs"),
     Site::File("crates/skin-model/src/widget/mod.rs"),
     Site::File("crates/skin-model/src/widget/bar.rs"),
     Site::File("crates/skin-model/src/widget/bpm_graph.rs"),
@@ -483,6 +493,8 @@ pub const IN_PLAY: &[Site] = &[
         &["glyph_uv", "solid_uv", "texels", "cell_of"],
     ),
     Site::Fns("crates/render/src/gpu.rs", &["Gpu::device", "Gpu::queue"]),
+    // A result frame's live chart key reads its array's number.
+    Site::Fns("crates/render/src/skin_atlas.rs", &["AtlasTexture::serial"]),
     Site::File("crates/player/src/measure.rs"),
     Site::File("crates/player/src/render_side.rs"),
     // The chart images' currency, which the render thread asks per frame.
@@ -490,6 +502,10 @@ pub const IN_PLAY: &[Site] = &[
     // The application clock: each frame's readouts and every present.
     Site::File("crates/player/src/app_clock.rs"),
     Site::File("crates/player/src/turntable.rs"),
+    // The pointer on the select screen: the hover's point, the batch's
+    // answers and the drag the render thread writes each selection frame,
+    // and the window's capture and the game thread's dispatch beside them.
+    Site::File("crates/player/src/pointer.rs"),
     // The play and loading frames' calls through the screen the render
     // thread keeps; its menu preparation runs on menus only, and the
     // loading lines' before the loading frame is built.
@@ -520,19 +536,19 @@ pub const IN_PLAY: &[Site] = &[
         ],
     ),
     // A skinned decision frame: its timers from the choice and its build
-    // from the pinned slot's labels; the label preparation's boundary
-    // work in the same file runs beside the frames.
+    // from the pinned slot's labels, read through `DecisionSide::store`;
+    // the label preparation's boundary work in the same file runs
+    // beside the frames.
     Site::Fns(
         "crates/player/src/decision_side.rs",
-        &["decision_frame_of", "decision_build"],
+        &["decision_frame_of", "decision_build", "DecisionSide::store"],
     ),
-    // The selection frame's timers, the strip's preset line, the
-    // lifetime check before the frame's build and the live settings.
+    // The selection frame's timers, the lifetime check before the
+    // frame's build and the live settings.
     Site::Fns(
         "crates/player/src/selection_skin.rs",
         &[
             "SelectionEvents::timers",
-            "SelectionEvents::preset_shown",
             "SelectionSlot::current",
             "live_settings",
             "SelectionLogic::apply_settings",

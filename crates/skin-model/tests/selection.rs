@@ -523,6 +523,7 @@ fn bar_skin(bars: Vec<RatioBarDef>) -> Fx {
             WidgetDefs::default(),
             SelectionDefs {
                 song_list: None,
+                pointer: Vec::new(),
                 ratio_bars: bars,
             },
         )
@@ -630,39 +631,39 @@ fn a_slider_press_gives_a_command_and_changes_nothing() {
         let at = |d: f32| [start[0] + along[0] * d, start[1] + along[1] * d];
         let before = format!("{:?}", fx.sel);
         assert_eq!(
-            fx.skin.slider_at(&fx.sel, at(0.5), fx.target),
+            fx.skin.drag_at(&fx.sel, at(0.5), fx.target),
             cmd(0),
             "{direction:?}"
         );
         assert_eq!(
-            fx.skin.slider_at(&fx.sel, at(100.0), fx.target),
+            fx.skin.drag_at(&fx.sel, at(100.0), fx.target),
             cmd(third),
             "{direction:?}"
         );
         assert_eq!(
-            fx.skin.slider_at(&fx.sel, at(299.5), fx.target),
+            fx.skin.drag_at(&fx.sel, at(299.5), fx.target),
             cmd(skin_model::SLIDER_STEPS),
             "{direction:?}"
         );
         assert_eq!(
-            fx.skin.slider_at(&fx.sel, at(301.0), fx.target),
+            fx.skin.drag_at(&fx.sel, at(301.0), fx.target),
             None,
             "{direction:?}"
         );
         assert_eq!(format!("{:?}", fx.sel), before);
         // A resize not yet drawn gives nothing; the next build does.
-        assert_eq!(fx.skin.slider_at(&fx.sel, at(100.0), [1_280, 720]), None);
+        assert_eq!(fx.skin.drag_at(&fx.sel, at(100.0), [1_280, 720]), None);
         // With no ratio the slider does not draw, so it takes no press.
         fx.view(&view(Vec::new(), None));
         fx.frame(0);
-        assert_eq!(fx.skin.slider_at(&fx.sel, at(100.0), fx.target), None);
+        assert_eq!(fx.skin.drag_at(&fx.sel, at(100.0), fx.target), None);
     }
     let mut fx = bar_skin(vec![bar(slider(SliderDirection::Right, false), src)]);
     let mut v = view(Vec::new(), None);
     v.position = ratio(1, 2);
     fx.view(&v);
     fx.frame(0);
-    assert_eq!(fx.skin.slider_at(&fx.sel, [150.0, 110.0], fx.target), None);
+    assert_eq!(fx.skin.drag_at(&fx.sel, [150.0, 110.0], fx.target), None);
     // A slider hidden by its visibility takes no press.
     let mut skin_fx = {
         let mut e = element(Source::RatioBar(0), [100, 100, 40, 20]);
@@ -673,6 +674,7 @@ fn a_slider_press_gives_a_command_and_changes_nothing() {
                 WidgetDefs::default(),
                 SelectionDefs {
                     song_list: None,
+                    pointer: Vec::new(),
                     ratio_bars: vec![bar(slider(SliderDirection::Right, true), src)],
                 },
             )
@@ -684,7 +686,7 @@ fn a_slider_press_gives_a_command_and_changes_nothing() {
     assert_eq!(
         skin_fx
             .skin
-            .slider_at(&skin_fx.sel, [150.0, 110.0], skin_fx.target),
+            .drag_at(&skin_fx.sel, [150.0, 110.0], skin_fx.target),
         None
     );
     // A slider whose track moves is pressed where the last build put it.
@@ -696,6 +698,7 @@ fn a_slider_press_gives_a_command_and_changes_nothing() {
             WidgetDefs::default(),
             SelectionDefs {
                 song_list: None,
+                pointer: Vec::new(),
                 ratio_bars: vec![bar(slider(SliderDirection::Right, true), src)],
             },
         )
@@ -704,13 +707,13 @@ fn a_slider_press_gives_a_command_and_changes_nothing() {
     fx.view(&v);
     fx.frame(0);
     assert_eq!(
-        fx.skin.slider_at(&fx.sel, [200.0, 110.0], fx.target),
+        fx.skin.drag_at(&fx.sel, [200.0, 110.0], fx.target),
         cmd(third)
     );
     fx.frame(100);
-    assert_eq!(fx.skin.slider_at(&fx.sel, [200.0, 110.0], fx.target), None);
+    assert_eq!(fx.skin.drag_at(&fx.sel, [200.0, 110.0], fx.target), None);
     assert_eq!(
-        fx.skin.slider_at(&fx.sel, [600.0, 110.0], fx.target),
+        fx.skin.drag_at(&fx.sel, [600.0, 110.0], fx.target),
         cmd(third)
     );
 }
@@ -947,10 +950,7 @@ fn the_topmost_slider_takes_the_press() {
     v.position = ratio(1, 2);
     fx.view(&v);
     fx.frame(0);
-    let got = fx
-        .skin
-        .slider_at(&fx.sel, [200.0, 110.0], fx.target)
-        .unwrap();
+    let got = fx.skin.drag_at(&fx.sel, [200.0, 110.0], fx.target).unwrap();
     assert_eq!(got.source, RatioSource::ExRate);
 }
 
@@ -971,8 +971,8 @@ fn a_state_belongs_to_its_skin() {
     v.position = ratio(1, 2);
     a.view(&v);
     a.frame(0);
-    assert!(a.skin.slider_at(&a.sel, [200.0, 110.0], a.target).is_some());
-    assert_eq!(b.skin.slider_at(&a.sel, [200.0, 110.0], a.target), None);
+    assert!(a.skin.drag_at(&a.sel, [200.0, 110.0], a.target).is_some());
+    assert_eq!(b.skin.drag_at(&a.sel, [200.0, 110.0], a.target), None);
     assert_eq!(
         b.skin.update_selection(&mut a.sel, &v, &labels_of()),
         Err(SelectionError::Kind)
@@ -992,6 +992,7 @@ fn a_state_belongs_to_its_skin() {
         layout: &layout,
         timers: a.timers,
         app: a.app,
+        pointer: None,
     };
     let mut out = skin_model::QuadBatch::with_capacity(8, 8);
     b.skin
@@ -1000,7 +1001,7 @@ fn a_state_belongs_to_its_skin() {
     assert!(out.quads().is_empty());
     // A clone keeps its skin's identity.
     let clone = a.skin.clone();
-    assert!(clone.slider_at(&a.sel, [200.0, 110.0], a.target).is_some());
+    assert!(clone.drag_at(&a.sel, [200.0, 110.0], a.target).is_some());
 }
 
 /// The cursor's row kind and a folder's count read as fields.
@@ -1240,6 +1241,7 @@ fn each_kind_draws_its_own_widgets() {
     };
     let sel = || SelectionDefs {
         song_list: Some(list(1, 0)),
+        pointer: Vec::new(),
         ratio_bars: vec![bar(RatioForm::Bar { vertical: false }, RatioSource::ExRate)],
     };
     for source in [Source::SongList, Source::RatioBar(0)] {
@@ -1272,6 +1274,7 @@ fn each_kind_draws_its_own_widgets() {
             WidgetDefs::default(),
             SelectionDefs {
                 song_list: None,
+                pointer: Vec::new(),
                 ratio_bars: vec![bar(
                     RatioForm::Bar { vertical: false },
                     RatioSource::Score(ScoreRate::Best),
@@ -1420,6 +1423,7 @@ fn the_other_kinds_entry_points_draw_nothing() {
         layout: &layout,
         timers: skin_model::SelectionTimers::default(),
         app: skin_model::AppReadouts::LAUNCH,
+        pointer: None,
     };
     let play_uvs = selection_support::uvs(&play);
     assert_eq!(
@@ -1504,6 +1508,7 @@ fn the_song_lists_bounds_are_checked() {
             WidgetDefs::default(),
             SelectionDefs {
                 song_list: None,
+                pointer: Vec::new(),
                 ratio_bars: vec![bar(RatioForm::Bar { vertical: false }, RatioSource::ExRate); n],
             },
         )
@@ -1721,6 +1726,7 @@ fn an_invalid_readout_refuses_the_selection_frame() {
         layout: &fx.layout,
         timers: fx.timers,
         app: bad,
+        pointer: None,
     };
     assert_eq!(
         fx.skin
@@ -1759,6 +1765,8 @@ fn the_selected_charts_class_reads_before_the_settings() {
         order: skin_model::SelectionOrder::Title,
         gauge: None,
         covers_on: [false; 3],
+        play_to_end: false,
+        assignment: None,
     };
     fx.skin
         .update_selection_settings(&mut fx.sel, &settings)

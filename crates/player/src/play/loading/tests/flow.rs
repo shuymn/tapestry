@@ -1038,3 +1038,33 @@ fn an_audio_failure_during_the_quits_settle_ends_the_run() {
         until("every job thread ended", || imports::workers() == 0);
     });
 }
+
+/// P10: the cursor is hidden as the play opens and shown again once its
+/// result shows, and at the play's end.
+#[test]
+fn the_cursor_hides_for_the_play_and_shows_at_its_result() {
+    let (_dir, mut loaded) = plain();
+    on_loading(&mut loaded, None, false, |rig, side, loaded| {
+        let (switch, seen) = crate::window::CursorSwitch::recording();
+        rig.cursor = Some(switch);
+        let during = std::sync::Mutex::new(Vec::new());
+        let at_result = std::sync::Mutex::new(Vec::new());
+        let ended = open_with(loaded, rig, side, || {
+            until("recording opened", || {
+                side.loading_end.passed() >= 1 && side.tuning.acceptance() == Acceptance::Open
+            });
+            *during.lock().unwrap() = seen.lock().unwrap().clone();
+            side.controls.focus(false);
+            side.keys.key(super::SELECT, 0);
+            until("the result", || side.tuning.end_screen_shown());
+            *at_result.lock().unwrap() = seen.lock().unwrap().clone();
+            side.controls.focus(true);
+            side.quit_until_returned();
+        });
+        assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+        assert_eq!(*during.lock().unwrap(), [false]);
+        // Shown once the result began, and again at the play's end.
+        assert!(at_result.lock().unwrap().starts_with(&[false, true]));
+        assert_eq!(*seen.lock().unwrap(), [false, true, true]);
+    });
+}

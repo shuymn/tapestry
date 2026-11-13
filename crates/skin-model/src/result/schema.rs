@@ -12,6 +12,7 @@
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
 use crate::JUDGE_CLASS_MAX;
+use crate::play::schema::{FPS_MAX, YEAR_MAX};
 use crate::schema::{Export, Field, FieldTy, Schema, TimerDef};
 
 /// The largest magnitude a shown value reads: one inside `i32::MIN` and
@@ -127,6 +128,18 @@ pub static RESULT: Schema = Schema {
         value("duration_10us"),
         int("chart.judge_class", 0, JUDGE_CLASS_MAX),
         flag("chart.judge_class_valid"),
+        flag("chart.stagefile"),
+        flag("chart.backbmp"),
+        int("app.fps", 0, FPS_MAX),
+        int("clock.year", 0, YEAR_MAX),
+        int("clock.month", 0, 12),
+        int("clock.day", 0, 31),
+        int("clock.hour", 0, 23),
+        int("clock.minute", 0, 59),
+        int("clock.second", 0, 59),
+        int("app.uptime_h", 0, i32::MAX),
+        int("app.uptime_m", 0, 59),
+        int("app.uptime_s", 0, 59),
     ],
     timers: &[timer("screen"), timer("fadeout")],
     enums: &[],
@@ -233,8 +246,25 @@ pub mod field {
     /// Whether [`CHART_JUDGE_CLASS`] is known: the chart's rank is in a
     /// class.
     pub const CHART_JUDGE_CLASS_VALID: u16 = 62;
+    /// Whether the chart's stage file and back image are images, as the
+    /// attempt resolved them before any result import (options 190, 191,
+    /// 194 and 195).
+    pub const CHART_STAGEFILE: u16 = 63;
+    pub const CHART_BACKBMP: u16 = 64;
+    /// The application's readouts of the frame
+    /// ([`ResultFrame::app`](crate::ResultFrame::app)), as play's and
+    /// selection's fields of the same names: the frames presented in the
+    /// last second, the local year, month (1 to 12), day, 24-hour hour,
+    /// minute and second, then the uptime's whole hours (unwrapped), its
+    /// minutes within the hour and its seconds within the minute. Filled
+    /// per frame, never from the view: a view's fields leave them 0.
+    pub const APP_FPS: u16 = 65;
+    pub const CLOCK_YEAR: u16 = APP_FPS + 1;
+    pub const CLOCK_SECOND: u16 = APP_FPS + 6;
+    pub const APP_UPTIME_H: u16 = APP_FPS + 7;
+    pub const APP_UPTIME_S: u16 = APP_FPS + 9;
     /// The number of fields.
-    pub const COUNT: usize = 63;
+    pub const COUNT: usize = APP_UPTIME_S as usize + 1;
 }
 
 /// The built-in timer slots of [`RESULT`]; `when` timers follow from
@@ -281,9 +311,26 @@ mod tests {
             (field::DURATION_10US, "duration_10us"),
             (field::CHART_JUDGE_CLASS, "chart.judge_class"),
             (field::CHART_JUDGE_CLASS_VALID, "chart.judge_class_valid"),
+            (field::CHART_STAGEFILE, "chart.stagefile"),
+            (field::CHART_BACKBMP, "chart.backbmp"),
+            (field::APP_FPS, "app.fps"),
+            (field::CLOCK_YEAR, "clock.year"),
+            (field::CLOCK_SECOND, "clock.second"),
+            (field::APP_UPTIME_H, "app.uptime_h"),
+            (field::APP_UPTIME_S, "app.uptime_s"),
         ] {
             assert_eq!(names[usize::from(slot)], name);
         }
         assert_eq!(RESULT.timers[usize::from(timer::FADEOUT)].name, "fadeout");
+        // The application's readouts read as play's fields of the same
+        // names, with the same ranges.
+        for f in RESULT
+            .fields
+            .get(usize::from(field::APP_FPS)..=usize::from(field::APP_UPTIME_S))
+            .unwrap()
+        {
+            let (_, play) = crate::PLAY.field(f.name).unwrap();
+            assert_eq!(f.ty, play.ty, "{}", f.name);
+        }
     }
 }

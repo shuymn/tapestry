@@ -5,7 +5,10 @@ use std::fs::{self, File};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
-use library::{HEADER_FIELD_BYTES, Library, Opened, SCHEMA_VERSION, ScanOptions, ScanReport};
+use library::{
+    ChartNames, HEADER_FIELD_BYTES, IMAGE_NAME_BYTES, Library, Name, Opened, SCHEMA_VERSION,
+    ScanOptions, ScanReport,
+};
 use tempfile::TempDir;
 
 /// A summary comes with its row: it follows the file, to none when the loader
@@ -748,5 +751,144 @@ fn schema_7_reads_ranks_again() {
     assert_eq!(
         lib.charts().unwrap()[0].rank,
         Some(Some(rules::JudgeRank::Rank(1)))
+    );
+}
+
+fn named(name: &str) -> Name {
+    Name::Named(name.to_owned())
+}
+
+fn images(lib: &Library) -> Vec<Option<ChartNames>> {
+    lib.charts()
+        .unwrap()
+        .into_iter()
+        .map(|c| c.images)
+        .collect()
+}
+
+/// The scan stores the stage file and banner names of the seed-0 branch's
+/// labels, as written (trimmed): both, neither, a `#RANDOM` branch's, and
+/// none for a refused branch; a changed file's names follow it.
+#[test]
+fn the_scan_stores_each_charts_image_names() {
+    let fx = Fixture::new();
+    let body = "#BPM 120\n#00111:01\n";
+    fx.write(
+        "a-both.bms",
+        format!("#STAGEFILE  st\\age.png \n#BANNER ban.bmp\n{body}").as_bytes(),
+    );
+    fx.write("b-neither.bms", format!("#STAGEFILE \n{body}").as_bytes());
+    // Seed 0 draws 2 from `#RANDOM 2`.
+    fx.write(
+        "c-random.bms",
+        format!(
+            "#BANNER top.png\n#RANDOM 2\n#IF 1\n#STAGEFILE one.png\n#ENDIF\n\
+             #IF 2\n#STAGEFILE two.png\n#ENDIF\n#ENDRANDOM\n{body}"
+        )
+        .as_bytes(),
+    );
+    fx.write("d-refused.bms", b"#STAGEFILE a.png\n#BPM 0\n#00138:01\n");
+    let (lib, _) = fx.open();
+    scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!(
+        images(&lib),
+        [
+            Some(ChartNames {
+                stagefile: named("st\\age.png"),
+                banner: named("ban.bmp"),
+            }),
+            Some(ChartNames {
+                stagefile: Name::None,
+                banner: Name::None,
+            }),
+            Some(ChartNames {
+                stagefile: named("two.png"),
+                banner: named("top.png"),
+            }),
+            None,
+        ]
+    );
+    // A changed file (another size): its names follow it.
+    fx.write(
+        "a-both.bms",
+        format!("#BANNER other.jpg\n{body}#00112:01\n").as_bytes(),
+    );
+    scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!(
+        images(&lib)[0],
+        Some(ChartNames {
+            stagefile: Name::None,
+            banner: named("other.jpg"),
+        }),
+        "the old names kept"
+    );
+}
+
+/// An image name of `IMAGE_NAME_BYTES` is kept whole; one byte more is
+/// stored as overlong, never cut to the header cap, whose prefix would name
+/// another file; each name's overlength is its own.
+#[test]
+fn an_overlong_image_name_is_stored_overlong_never_shortened() {
+    assert_eq!(IMAGE_NAME_BYTES, HEADER_FIELD_BYTES, "a cut would fit");
+    let fx = Fixture::new();
+    let at = format!("{}.png", "a".repeat(IMAGE_NAME_BYTES - 4));
+    let over = format!("{}.png", "a".repeat(IMAGE_NAME_BYTES + 1 - 4));
+    let body = "#BPM 120\n#00111:01\n";
+    fx.write(
+        "a.bms",
+        format!("#STAGEFILE {at}\n#BANNER {over}\n{body}").as_bytes(),
+    );
+    fx.write(
+        "b.bms",
+        format!("#STAGEFILE {over}\n#BANNER b.png\n{body}").as_bytes(),
+    );
+    let (lib, _) = fx.open();
+    scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!(
+        images(&lib),
+        [
+            Some(ChartNames {
+                stagefile: Name::Named(at),
+                banner: Name::Overlong,
+            }),
+            Some(ChartNames {
+                stagefile: Name::Overlong,
+                banner: named("b.png"),
+            }),
+        ]
+    );
+}
+
+/// A file of schema 8, the version before the image names, is rebuilt: its
+/// charts are read again, with their names.
+#[test]
+fn schema_8_reads_image_names_again() {
+    let fx = Fixture::new();
+    fx.write("a.bms", b"#STAGEFILE s.png\n#BPM 120\n#00111:01\n");
+    {
+        let (lib, _) = fx.open();
+        scan(&lib, std::slice::from_ref(&fx.root));
+    }
+    {
+        let old = rusqlite::Connection::open(fx.db()).unwrap();
+        old.execute_batch(
+            "ALTER TABLE charts DROP COLUMN stagefile;
+             ALTER TABLE charts DROP COLUMN banner;
+             ALTER TABLE charts DROP COLUMN image_names;
+             PRAGMA user_version = 8;",
+        )
+        .unwrap();
+    }
+    let (lib, opened) = fx.open();
+    assert_eq!(opened, Opened::Rebuilt { old_version: 8 });
+    assert_eq!(lib.charts().unwrap(), Vec::new());
+    let report = scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!((report.found, report.read), (1, 1), "a full scan");
+    assert_eq!(
+        images(&lib),
+        [Some(ChartNames {
+            stagefile: named("s.png"),
+            banner: Name::None,
+        })]
     );
 }

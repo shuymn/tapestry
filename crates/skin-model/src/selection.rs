@@ -30,6 +30,10 @@ pub struct SelectionView {
     pub query: String,
     /// The chart under the cursor; `None` on any other row.
     pub selected: Option<SelectedChart>,
+    /// The list's revision: it changes whenever the list's rows may have
+    /// changed, so a [`RowRef`](crate::RowRef) drawn from an earlier list
+    /// names no row of this one.
+    pub list_revision: u64,
 }
 
 /// An exact ratio `numerator / denominator`, the denominator never zero.
@@ -184,6 +188,11 @@ pub struct SelectionSettings {
     pub gauge: Option<GaugeLook>,
     /// Whether SUDDEN+, LIFT and HIDDEN+ are on.
     pub covers_on: [bool; 3],
+    /// Whether a failed play goes on to the end (`player.toml`'s
+    /// `on_failure`), rather than closing.
+    pub play_to_end: bool,
+    /// The chosen preset's press assignment; `None` without a preset.
+    pub assignment: Option<rules::Assignment>,
 }
 
 /// Where selection is.
@@ -248,6 +257,10 @@ pub enum RowKind {
 pub struct RowView {
     pub key: RowKey,
     pub kind: RowKind,
+    /// The row's index among the list's selectable rows, the cursor's
+    /// space; `None` for a heading, and where the view does not number
+    /// its rows.
+    pub index: Option<u32>,
     /// A chart's `#TITLE` as stored, a folder's directory name, a heading's
     /// folder under its root; empty for the "all charts" row and a chart
     /// without a title.

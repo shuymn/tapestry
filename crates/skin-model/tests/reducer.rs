@@ -236,10 +236,11 @@ const EXPECTED: [&[(u16, i64)]; 16] = [
 /// lead-in: `ready` at −1 s, `play` at 0, `beat` at the first µs whose
 /// display position reaches beat 6 (2.4 s at 150 BPM; the map floors each
 /// µs's position, so the crossing is 1 µs later), and the reducer's
-/// timers.
+/// timers; `screen` from its own origin, 2 345 ms before READY, never
+/// READY's.
 const FINAL: &[(u16, i64)] = &[
     (timer::READY, -1_000 * MS),
-    (timer::SCREEN, -1_000 * MS),
+    (timer::SCREEN, SCREEN_FROM),
     (timer::PLAY, 0),
     (timer::BEAT, 2_400 * MS + 1),
     // No bar line: 2 500 ms at 150 BPM is 6 250 ms of the rhythm clock.
@@ -261,6 +262,10 @@ fn effect_sourced(slot: u16) -> bool {
     !matches!(slot, 0..=3 | 6) && slot != timer::SCREEN && slot != timer::RHYTHM
 }
 
+/// Where the screen clock starts in the split test's frames: 2 345 ms
+/// before READY.
+const SCREEN_FROM: i64 = -3_345 * MS;
+
 #[track_caller]
 fn check_prefix(h: &Harness, k: usize, context: &str) {
     let on = EXPECTED[k];
@@ -281,6 +286,7 @@ fn every_split_of_the_script_reaches_the_same_states() {
     let events = script();
     let n = events.len();
     let mut h = Harness::new(mine_when_skin(), &chart, &full(1_000));
+    h.screen_from = SCREEN_FROM;
     // The snapshot's gauge stays at the maximum, so `gauge_max` shows the
     // reducer's state.
     h.gauges[0] = state(GaugeValue::FULL);
@@ -742,6 +748,46 @@ fn failed_comes_from_the_closing_start_not_a_fail_time() {
     h.closing = Some(TimeUs(2_004 * MS));
     h.frame(2_100, &[]);
     assert_eq!(h.start_ms(timer::FAILED), Some(2_004));
+}
+
+/// `fadeout` starts at the play's published fade-out start (the frame's
+/// `fading`) and only there: off through the completed play's hold, and
+/// off in Closing, which never publishes one. `full_combo` keeps its
+/// start through the hold and the fade-out.
+#[test]
+fn fadeout_comes_from_the_published_fade_out_start() {
+    use Judgment::Perfect;
+    let chart = taps_chart();
+    let mut h = Harness::empty(&chart, &full(0));
+    h.frame(
+        3_000,
+        &[
+            ev(1_000, judged(1, 0, Perfect, Some(0), None, 1)),
+            ev(2_000, judged(1, 1, Perfect, Some(0), None, 2)),
+            ev(3_000, judged(1, 2, Perfect, Some(0), None, 3)),
+        ],
+    );
+    assert_eq!(h.start_ms(timer::FULL_COMBO), Some(3_000));
+    // The completed play's hold.
+    h.complete = true;
+    h.playing = false;
+    h.frame(8_000, &[]);
+    assert_eq!(h.start_ms(timer::FADEOUT), None);
+    assert_eq!(h.start_ms(timer::FULL_COMBO), Some(3_000));
+    // Its fade-out, started at 11 s.
+    h.fading = Some(TimeUs(11_000 * MS));
+    h.frame(11_500, &[]);
+    assert_eq!(h.start_ms(timer::FADEOUT), Some(11_000));
+    assert_eq!(h.elapsed(timer::FADEOUT), 500);
+    assert_eq!(h.start_ms(timer::FULL_COMBO), Some(3_000));
+
+    // Closing starts `failed` and never `fadeout`.
+    let mut h = Harness::empty(&chart, &full(0));
+    h.playing = false;
+    h.closing = Some(TimeUs(1_500 * MS));
+    h.frame(2_000, &[]);
+    assert_eq!(h.start_ms(timer::FAILED), Some(1_500));
+    assert_eq!(h.start_ms(timer::FADEOUT), None);
 }
 
 #[test]

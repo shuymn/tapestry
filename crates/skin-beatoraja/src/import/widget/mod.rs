@@ -17,7 +17,9 @@ pub(super) mod system;
 pub(super) mod text;
 pub(super) mod visualizer;
 
-use skin_model::{CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, Track};
+use skin_model::{
+    ActionDef, ClickType, CycleDef, ImageDef, MAX_SKIN_FRAMES, Native, Source, Track,
+};
 
 use super::asset::{Axis, Crop, Failed, ImageKey, NotAdded, Path};
 use super::budget::ImportLimit;
@@ -66,13 +68,6 @@ pub(super) struct SrcImage {
     pub(super) timing: [u32; 2],
 }
 
-impl SrcImage {
-    /// The `source` id its `src` names.
-    pub(super) fn src_name(&self) -> Option<&str> {
-        self.src.as_deref()
-    }
-}
-
 impl Cx<'_> {
     /// The frames of a `div` grid. A grid of more than the skin's frames
     /// is the aggregate frame limit, refused before anything reads it.
@@ -85,11 +80,14 @@ impl Cx<'_> {
     }
 
     /// Whether `c`, critical and without a timer, is refused (owner
-    /// decision 7, D3, [`policy::untimed_ok`]). An admitted one whose
-    /// presentation phase depends on the start is noted once it is
-    /// retained (`Cx::untimed_phase`).
+    /// decision 7, D3): unless only its presentation phase varies
+    /// ([`policy::untimed_ok`]) or it settles ([`policy::settles`]). An
+    /// admitted one whose presentation phase depends on the start is noted
+    /// once it is retained (`Cx::untimed_phase`).
     fn untimed_refused(&self, c: &Common) -> bool {
-        c.untimed && matches!(c.role, Role::Critical(_)) && !policy::untimed_ok(&c.track)
+        c.untimed
+            && matches!(c.role, Role::Critical(_))
+            && !(policy::untimed_ok(&c.track) || policy::settles(&c.track))
     }
 
     /// Records that `c` keeps an image cycling on `cycle`, for its D3
@@ -104,7 +102,7 @@ impl Cx<'_> {
     /// The cycle of `s` over `frames` for `c`, resolved before its sheet
     /// is admitted, or why `c` is dropped: its timer or cycle refused, or
     /// `c` critical and untimed where it moves or changes a colour
-    /// channel other than alpha (D3).
+    /// channel other than alpha, unless it settles (D3).
     pub(super) fn src_cycle(
         &mut self,
         c: &Common,
@@ -504,10 +502,10 @@ impl Cx<'_> {
     }
 
     /// An image object.
-    pub(super) fn image(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
+    pub(super) fn image(&mut self, mut dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
         let s = self.src_image(rec)?;
-        let [len, act, r] = self.def.fields(rec, ["len", "act", "ref"]);
+        let [len, act, click, r] = self.def.fields(rec, ["len", "act", "click", "ref"]);
         // A group (`len` above 1) selects its run of frames by its `ref`
         // in the image-index namespace (`JsonSkinObjectLoader.java:49-64`);
         // a `len` of 1 or less is an ordinary image whatever its `ref`.
@@ -520,7 +518,7 @@ impl Cx<'_> {
         if group && self.kind == skin_model::ScreenKind::Result {
             role = super::result::index_role(role, r);
         }
-        self.actions(at, act)?;
+        dst.action = self.actions(at, act, click)?;
         if lowered == Lowered::Paint && !group {
             return self.cover_paint_image(dst, rec, &s, role, None);
         }
@@ -709,10 +707,12 @@ impl Cx<'_> {
     /// property, else by its `ref` as an image-index property
     /// (`JsonSkinObjectLoader.java:91`), entry 0 when neither does. Its
     /// images' `len`, `ref` and actions are unused; its own action is
-    /// ignored.
-    pub(super) fn image_set(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
+    /// read as an image's ([`Self::actions`]).
+    pub(super) fn image_set(&mut self, mut dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
-        let [r, value, images, act] = self.def.fields(rec, ["ref", "value", "images", "act"]);
+        let [r, value, images, act, click] = self
+            .def
+            .fields(rec, ["ref", "value", "images", "act", "click"]);
         let r = self.int_or(r, "ref", 0)?;
         let value = self.callback_prop(value, "value")?;
         let selector = image_choice::set_selector(self.kind, &value, r);
@@ -778,40 +778,73 @@ impl Cx<'_> {
         self.install.availability |= guard;
         self.gate_by_value(&src, None, Conv::Index);
         self.prepare = super::prepare::Prepare::Selector((!non_negative).then(|| src.clone()));
-        self.actions(at, act)?;
+        dst.action = self.actions(at, act, click)?;
         if Stretch::of(dst.stretch) == Stretch::Trimmed {
             return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
         }
         self.image_set_choices(dst, images, &src, deviates, charged, (lowered, role))
     }
 
-    /// An image's or an image set's `act`: no action has a hit target. On
-    /// play it is ignored; on selection its id is noted by its class
-    /// ([`super::selection::profile::event`]), an E action as unavailable
-    /// until the native actions exist and any other as ignored.
-    fn actions(&mut self, at: Span, act: Option<u32>) -> Result<(), ImportError> {
+    /// An image's or an image set's `act` and `click`
+    /// (`JsonSkinObjectLoader.java:68-69, 93-94`): the action its element
+    /// takes. Only a selection skin's has one: an `act` the profile
+    /// classes ([`super::selection::profile::event`]) with a `click` of 0
+    /// to 3 (absent: 0) is a target; an N action is noted nothing, an E
+    /// one as unavailable and a D one as ignored, each consuming the
+    /// press. Another `click` is noted and has no target, as the source
+    /// takes no press with it (`skin/SkinObject.java:671-700`); any other
+    /// `act` (an unknown id, a name, a Lua function) is ignored. On play,
+    /// decision and result every `act` is ignored.
+    fn actions(
+        &mut self,
+        at: Span,
+        act: Option<u32>,
+        click: Option<u32>,
+    ) -> Result<Option<ActionDef>, ImportError> {
+        use super::selection::profile::{Class, event};
         let Some(f) = act else {
-            return Ok(());
+            return Ok(None);
         };
-        let event = if self.kind == skin_model::ScreenKind::Selection {
-            match self.callback_prop(Some(f), "act")? {
-                Prop::Id(id) => super::selection::profile::event(id)
-                    .filter(|c| *c == super::selection::profile::Class::Unavailable)
-                    .map(|_| id),
-                _ => None,
-            }
-        } else {
-            None
-        };
-        let why = match event {
-            Some(id) => NoteKind::Unavailable {
-                kind: super::PropertyKind::Event,
-                id,
+        let ignored = NoteKind::Ignored { field: "act" };
+        if self.kind != skin_model::ScreenKind::Selection {
+            self.ignored(at, ignored);
+            return Ok(None);
+        }
+        let (id, class) = match self.callback_prop(Some(f), "act")? {
+            Prop::Id(id) => match (u16::try_from(id), event(id)) {
+                (Ok(n), Some(class)) => (n, class),
+                _ => {
+                    self.ignored(at, ignored);
+                    return Ok(None);
+                }
             },
-            None => NoteKind::Ignored { field: "act" },
+            _ => {
+                self.ignored(at, ignored);
+                return Ok(None);
+            }
         };
-        self.ignored(at, why);
-        Ok(())
+        let click = match self.int_or(click, "click", 0)? {
+            0 => ClickType::Plus,
+            1 => ClickType::Minus,
+            2 => ClickType::Halves,
+            3 => ClickType::TopBottom,
+            _ => {
+                self.ignored(at, NoteKind::Ignored { field: "click" });
+                return Ok(None);
+            }
+        };
+        match class {
+            Class::Bridge(()) => {}
+            Class::Unavailable => self.ignored(
+                at,
+                NoteKind::Unavailable {
+                    kind: super::PropertyKind::Event,
+                    id: i32::from(id),
+                },
+            ),
+            Class::Omit => self.ignored(at, ignored),
+        }
+        Ok(Some(ActionDef { event: id, click }))
     }
 }
 

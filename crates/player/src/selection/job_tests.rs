@@ -125,8 +125,18 @@ fn bench(dir: &Path, decodes: Decodes, spawner: Spawner) -> Bench {
     bench_on(coordinator(), dir, decodes, spawner)
 }
 
+/// `spawner` with the chart-images job's thread refused: that job begins
+/// at each choice beside the load on a foreground permit of its own and
+/// ends when its thread does, so with it running a bench's permit counts
+/// would be the load's or one more by timing. Refused, its images are
+/// absent at once and the load goes on (design.md "Play Lifecycle").
+fn quiet(spawner: Spawner) -> Spawner {
+    spawner.also_refusing_owned(&[JobKind::ChartImages])
+}
+
 /// [`bench`] on `coord`.
 fn bench_on(coord: Coordinator, dir: &Path, decodes: Decodes, spawner: Spawner) -> Bench {
+    let spawner = quiet(spawner);
     let mode = Arc::new(Mode::default());
     let (shelf, stepper) = stepped_shelf(dir, &coord, &mode);
     let decodes = Arc::new(decodes);
@@ -136,6 +146,8 @@ fn bench_on(coord: Coordinator, dir: &Path, decodes: Decodes, spawner: Spawner) 
         screen: SelectScreen::new(Vec::new()),
         menu: Arc::new(MenuQueue::default()),
         dropped: 0,
+        pointer: crate::pointer::PointerPass::default(),
+        dropped_pointer: 0,
         feed: crate::selection_skin::SkinFeed::default(),
         preset_refusal: false,
         ime: None,
@@ -1149,7 +1161,7 @@ fn a_cached_gain_begins_no_measure_job() {
             assert_ne!(measured, Gain::HEADROOM);
             let again = Arc::new(Decodes::default());
             sel(rig).decodes = Some(Arc::clone(&again));
-            sel(rig).spawner = Spawner::refusing(&[JobKind::Measure]);
+            sel(rig).spawner = quiet(Spawner::refusing(&[JobKind::Measure]));
             assert_eq!(
                 outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
                 Loading::Ready
@@ -1157,6 +1169,42 @@ fn a_cached_gain_begins_no_measure_job() {
             assert_eq!(sel(rig).shelf.gain(), measured);
             assert_eq!(begun(&again).len(), 1);
             assert_eq!(analysis(&again), None);
+        },
+    );
+    assert_eq!(b.coord.held(Class::Foreground), 0);
+}
+
+/// A bench's load, at a choice and at a load again, leaves no chart-images
+/// job's thread alive, even one whose read would never end: no permit the
+/// bench counts is that job's ([`quiet`]).
+#[test]
+fn a_bench_load_leaves_no_chart_images_job() {
+    /// Lets the images' reads go, the test failed or not.
+    struct LetGo;
+    impl Drop for LetGo {
+        fn drop(&mut self) {
+            crate::chart_images::HOLD.store(false, Ordering::Release);
+        }
+    }
+    let _serial = crate::imports::tests::serial();
+    crate::chart_images::HOLD.store(true, Ordering::Release);
+    let _let_go = LetGo;
+    let dir = tempfile::tempdir().unwrap();
+    let path = song(dir.path(), "");
+    let loaded = loaded(dir.path(), &path, Speed::NORMAL);
+    let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            for _ in 0..2 {
+                assert_eq!(
+                    outcome(rig.load_chart(&loaded, &mut game::Decision::off())),
+                    Loading::Ready
+                );
+                assert!(rig.chart_images.idle(), "a chart-images job runs");
+            }
         },
     );
     assert_eq!(b.coord.held(Class::Foreground), 0);

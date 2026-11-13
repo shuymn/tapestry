@@ -2,11 +2,12 @@
 //! bounded runtime; docs/stage3.md S7-07; s7-07-design §3.7.1).
 
 use bms_model::TimeUs;
-use skin_model::{BuildError, ResultScreen, ResultTimers, Skin};
+use skin_model::{AppReadouts, BuildError, ResultScreen, ResultTimers, Skin};
 
 use super::script::{ScriptNotes, ScriptSlot, ScriptStop};
 
-/// Prepares `res`'s frame at `now` for `skin`, its timers from `timers`
+/// Prepares `res`'s frame at `now` for `skin`, its application readouts
+/// from `app` and its timers from `timers`
 /// ([`Skin::prepare_result_frame`]), then runs the runtime of the
 /// presented view's `slot`, if any, against that state, writing every
 /// callback's output slot, its notes going to the lifetime's `notes`;
@@ -20,7 +21,9 @@ use super::script::{ScriptNotes, ScriptSlot, ScriptStop};
 ///
 /// # Errors
 ///
-/// [`BuildError::Kind`] for a skin that is not a result skin.
+/// [`BuildError::Kind`] for a skin that is not a result skin;
+/// [`BuildError::InvalidReadouts`] for a readout of `app` outside its
+/// field's range, and no runtime runs.
 pub(crate) fn result_visit(
     slot: &mut ScriptSlot,
     notes: &ScriptNotes,
@@ -28,8 +31,9 @@ pub(crate) fn result_visit(
     res: &mut ResultScreen,
     now: TimeUs,
     timers: &ResultTimers,
+    app: &AppReadouts,
 ) -> Result<Option<ScriptStop>, BuildError> {
-    skin.prepare_result_frame(res, now, timers)?;
+    skin.prepare_result_frame(res, now, timers, app)?;
     // The switches' `off` (dev-tools): no runtime taken.
     #[cfg(feature = "dev-tools")]
     if super::probe::off() {
