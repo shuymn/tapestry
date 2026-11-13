@@ -783,7 +783,16 @@ fn reason_hits(lines: &[&str], i: usize) -> bool {
     let Some(reason) = reason(&text) else {
         return false;
     };
-    let reason = reason
+    // A backslash ending a line continues the string without the line
+    // break or the next line's leading whitespace, as Rust reads it.
+    let mut joined = String::new();
+    let mut rest = reason;
+    while let Some((line, next)) = rest.split_once("\\\n") {
+        joined.push_str(line);
+        rest = next.trim_start();
+    }
+    joined.push_str(rest);
+    let reason = joined
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")

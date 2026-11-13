@@ -619,6 +619,13 @@ fn a_reason_continued_on_following_lines_is_read() {
 fn float() {}
 ";
     assert_eq!(hits_in(F, continued), [grew(F, "expect-reason", &[1], 0)]);
+    // A continuation inside the phrase joins its words with no backslash.
+    let split = "\
+#[expect(clippy::cast_precision_loss, reason = \"rounds as the \\
+    source does\")]
+fn float() {}
+";
+    assert_eq!(hits_in(F, split), [grew(F, "expect-reason", &[1], 0)]);
 }
 
 #[test]
