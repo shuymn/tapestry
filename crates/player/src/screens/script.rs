@@ -872,6 +872,19 @@ impl ScriptSlot {
         running.as_deref_mut()
     }
 
+    /// The timer reading `slot` the running result runtime's host read in
+    /// its last frame (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn running_frame_timer(&self, slot: usize) -> Option<i32> {
+        let Slot::Result {
+            running: Some(rt), ..
+        } = &self.0
+        else {
+            return None;
+        };
+        rt.frame_timers().get(slot).copied()
+    }
+
     /// Moves the runtime `old` holds into this slot when both are slots of
     /// one result generation: a view switch that keeps its layout, at its
     /// successful commit.

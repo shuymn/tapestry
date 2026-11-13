@@ -1,7 +1,7 @@
 //! A selection skin on a WARP menu screen at set times (dev-tools): the
-//! strip's search line, composition and caret, its notice and the
-//! preset's name for three seconds; a frame's app work allocating
-//! nothing; and the cost of a cursor move's text.
+//! strip's search line, composition and caret and its notice, nothing
+//! over the skin otherwise, a preset step included; a frame's app work
+//! allocating nothing; and the cost of a cursor move's text.
 
 use std::time::{Duration, Instant};
 
@@ -87,6 +87,8 @@ fn drawn(
 /// While the search box has focus, the strip shows the query and the
 /// composition, underlined, and sends the caret's area on its line; the
 /// skin's search text shows the committed query; a notice adds its line.
+/// The strip stages a band per line and the underline: 1, 2, then 3, and
+/// none once focus is gone.
 #[test]
 fn the_strip_shows_the_search_and_its_composition_over_the_skin() {
     let (_dir, mut screen, mut logic, sent) = skinned();
@@ -100,11 +102,13 @@ fn the_strip_shows_the_search_and_its_composition_over_the_skin() {
         true,
         0,
     );
+    assert_eq!(screen.selection_strip_staged(), 1, "the search line's band");
     let composing = searching("abc", "かな");
     let u = update(&mut feed, &composing, 0);
     let with = drawn(&mut screen, &mut logic, &u, true, 0);
     // The underline, one sprite more.
     assert_eq!(with, plain + 1);
+    assert_eq!(screen.selection_strip_staged(), 2);
     let (asked, _) = screen.renderer.selection_requests();
     assert!(asked.iter().any(|a| a == "abc"), "{asked:?}");
     let area = sent.0.lock().unwrap().last().copied().flatten().unwrap();
@@ -115,12 +119,15 @@ fn the_strip_shows_the_search_and_its_composition_over_the_skin() {
     noticed.set_notice(Some("refused".to_owned()));
     let u = update(&mut feed, &noticed, 0);
     assert_eq!(drawn(&mut screen, &mut logic, &u, true, 0), with + 1);
+    assert_eq!(screen.selection_strip_staged(), 3);
     // Focus gone: no caret, no strip.
     let mut idle = searching("abc", "");
     idle.input(crate::select::MenuInput::Key(crate::select::MenuKey::Tab));
     assert!(!idle.searching());
     let u = update(&mut feed, &idle, 0);
     assert_eq!(drawn(&mut screen, &mut logic, &u, true, 0), plain - 1);
+    assert_eq!(screen.selection_strip_staged(), 0);
+    assert_eq!(screen.selection_strip(), (Vec::new(), false));
     assert_eq!(sent.0.lock().unwrap().last(), Some(&None));
 }
 
@@ -150,68 +157,42 @@ fn a_refused_frame_sends_the_pages_caret() {
     }
 }
 
-/// After a preset step at `t` the strip names the preset at `t` and
-/// `t + 2 999 999 µs`, not at `t + 3 000 000 µs`.
-#[test]
-fn the_preset_name_shows_three_seconds_from_its_step() {
-    let (_dir, mut screen, mut logic, _) = skinned();
-    let mut feed = SkinFeed::default();
-    feed.enter(TimeUs(0));
-    let mut s = SelectScreen::new(Vec::new());
-    s.set_preset("ベータ".to_owned(), None);
-    let t = 5_000_000;
-    let before = drawn(&mut screen, &mut logic, &update(&mut feed, &s, t), true, t);
-    feed.preset_step = Some(TimeUs(t));
-    let u = update(&mut feed, &s, t);
-    assert_eq!(u.strip.preset, "ベータ");
-    assert_eq!(drawn(&mut screen, &mut logic, &u, true, t), before + 1);
-    assert_eq!(
-        drawn(&mut screen, &mut logic, &u, false, t + 2_999_999),
-        before + 1
-    );
-    assert_eq!(
-        drawn(&mut screen, &mut logic, &u, false, t + 3_000_000),
-        before
-    );
-}
-
 /// A selection frame submits the skin's frame from the selection
 /// installation's own staging, every quad it built, and the strip's
-/// text over it: the preset's name changes the pixels drawn while it
-/// shows.
+/// text over it: the notice's words change the pixels drawn, its band
+/// staying.
 #[test]
 fn a_selection_frame_draws_the_skins_staging_and_the_strips_text() {
     let (_dir, mut screen, mut logic, _) = skinned();
     let mut feed = SkinFeed::default();
     feed.enter(TimeUs(0));
     let mut s = SelectScreen::new(Vec::new());
-    s.set_preset("ベータ".to_owned(), None);
+    s.set_notice(Some("ベータ".to_owned()));
     let t = 5_000_000;
-    feed.preset_step = Some(TimeUs(t));
-    let named = update(&mut feed, &s, t);
+    let first = update(&mut feed, &s, t);
     let d = screen
-        .selection(&named, Some(&mut logic), true, TimeUs(t), APP)
+        .selection(&first, Some(&mut logic), true, TimeUs(t), APP)
         .unwrap();
     let quads = screen.renderer.selection_quads().unwrap().len();
     assert!(quads > 0);
     assert_eq!(d.timing.sprites, quads);
-    let with_name = screen.read_back().unwrap();
-    s.set_preset(String::new(), None);
-    let unnamed = update(&mut feed, &s, t);
+    let with_first = screen.read_back().unwrap();
+    s.set_notice(Some("Alpha".to_owned()));
+    let second = update(&mut feed, &s, t);
     screen
-        .selection(&unnamed, Some(&mut logic), true, TimeUs(t), APP)
+        .selection(&second, Some(&mut logic), true, TimeUs(t), APP)
         .unwrap();
-    let without = screen.read_back().unwrap();
+    let with_second = screen.read_back().unwrap();
     assert_eq!(screen.renderer.selection_quads().unwrap().len(), quads);
-    assert_ne!(with_name.2, without.2);
+    assert_ne!(with_first.2, with_second.2);
 }
 
-/// A preset step the flow takes reaches the strip through the game
-/// thread's update: the update names the preset the step chose, stamped
-/// with the time the step was taken (`t`), and the frames of that update
-/// draw the name at `t` and `t + 2 999 999 µs`, not at `t + 3 000 000 µs`.
+/// A preset step the flow takes draws nothing over the skin: the update
+/// after it carries no strip text, and its frames at the step's time
+/// `t`, `t + 1 000 µs` and `t + 2 999 999 µs` stage no strip sprite and
+/// submit no strip text, the chosen preset having changed.
 #[test]
-fn a_preset_step_through_the_flow_names_the_preset_for_three_seconds() {
+fn a_preset_step_draws_nothing_over_the_skin() {
     use bms_model::TimeSource as _;
     use game::AppRig as _;
     let dir = tempfile::tempdir().unwrap();
@@ -221,43 +202,34 @@ fn a_preset_step_through_the_flow_names_the_preset_for_three_seconds() {
     let mut shelf = game::Shelf::open(presets, "tapestry").unwrap();
     let screens = crate::render_side::tests::Installers::default();
     let render = screens.spawn_bare();
-    let (u, before, after) = crate::selection::tests::on_selection(sel, &screens, render, |rig| {
-        let sel = rig.selection.as_mut().unwrap();
-        sel.preset_steps.push_back(game::PresetStep::Next);
-        let before = rig.clock.now();
+    let (u, t) = crate::selection::tests::on_selection(sel, &screens, render, |rig| {
+        let latest = || screens.updates.lock().unwrap().last().cloned();
+        assert!(crate::render_side::tests::wait_until(|| latest().is_some()));
+        let revision = latest().unwrap().revision;
+        rig.selection
+            .as_mut()
+            .unwrap()
+            .preset_steps
+            .push_back(game::PresetStep::Next);
         let step = rig.take_preset_step().unwrap();
-        let after = rig.clock.now();
+        let t = rig.clock.now();
         shelf.step(step);
         rig.presets_changed(Ok(&shelf));
         assert!(rig.choose().is_none());
-        let stamped = || {
-            screens
-                .updates
-                .lock()
-                .unwrap()
-                .iter()
-                .find(|u| u.events.preset_step.is_some())
-                .cloned()
-        };
-        assert!(crate::render_side::tests::wait_until(|| stamped().is_some()));
-        (stamped().unwrap(), before, after)
+        assert!(crate::render_side::tests::wait_until(|| latest()
+            .unwrap()
+            .revision
+            > revision));
+        (latest().unwrap(), t)
     });
-    let t = u.events.preset_step.unwrap();
-    assert!(before <= t && t <= after, "{before:?} {t:?} {after:?}");
     assert_ne!(shelf.chosen_name(), "tapestry");
-    assert_eq!(u.strip.preset, shelf.chosen_name());
+    assert_eq!(u.strip, crate::selection_skin::StripText::default());
     let (_dir, mut screen, mut logic, _) = skinned();
-    let t = t.0;
-    let hidden = drawn(&mut screen, &mut logic, &u, true, t - 1);
-    assert_eq!(drawn(&mut screen, &mut logic, &u, false, t), hidden + 1);
-    assert_eq!(
-        drawn(&mut screen, &mut logic, &u, false, t + 2_999_999),
-        hidden + 1
-    );
-    assert_eq!(
-        drawn(&mut screen, &mut logic, &u, false, t + 3_000_000),
-        hidden
-    );
+    for (k, at) in [t.0, t.0 + 1_000, t.0 + 2_999_999].into_iter().enumerate() {
+        drawn(&mut screen, &mut logic, &u, k == 0, at);
+        assert_eq!(screen.selection_strip_staged(), 0, "{at}");
+        assert_eq!(screen.selection_strip(), (Vec::new(), false), "{at}");
+    }
 }
 
 /// A preset step the flow takes gives the next update the newly chosen
@@ -341,12 +313,12 @@ fn the_memory_witness_counts_the_selection_lines_and_state() {
 }
 
 /// A selection frame's app work (the readouts and timers, the skin's
-/// build and the strip's sprites) allocates nothing, the readouts moving
-/// every frame: the first build after the update's
-/// preparation, each later one, the first after a resize prepared outside
-/// the count, and refused, with the fallback page's own build; each is
-/// counted apart from the GPU submission that follows it. An allocation
-/// put into that work (the probe) is counted.
+/// build and the strip's sprites, all three shown) allocates nothing,
+/// the readouts moving every frame: the first build after the update's
+/// preparation, each later one, the first after a resize prepared
+/// outside the count, and refused, with the fallback page's own build;
+/// each is counted apart from the GPU submission that follows it. An
+/// allocation put into that work (the probe) is counted.
 #[test]
 fn selection_frame_alloc() {
     let _warp = crate::warp_turn::take();
@@ -355,7 +327,6 @@ fn selection_frame_alloc() {
     feed.enter(TimeUs(0));
     let mut s = searching("abc", "かな");
     s.set_notice(Some("refused".to_owned()));
-    feed.preset_step = Some(TimeUs(0));
     // The settings, applied each frame with the settings keys' values.
     let tuning = crate::tuning::LiveTuning::new(game::Tuning {
         volume_percent: 50,
@@ -366,6 +337,7 @@ fn selection_frame_alloc() {
         Some(game::PlayerSettings::default().options().unwrap()),
         Some(&rules::tapestry()),
         0,
+        game::FailureAction::PlayToEnd,
         s.order_view(),
         &tuning,
     );
@@ -400,6 +372,9 @@ fn selection_frame_alloc() {
     };
     prepare(&mut screen, &mut logic, true);
     assert_eq!(build(&mut screen, &mut logic, 0), 0, "first");
+    // The search line, the notice and the underline: every strip sprite.
+    assert_eq!(screen.selection_strip_staged(), 3);
+    const { assert!(render::STRIP_SPRITES == 3) };
     for k in 1..100 {
         assert_eq!(build(&mut screen, &mut logic, k), 0, "{k}");
     }
@@ -442,6 +417,7 @@ fn rows_at(at: usize, n: usize) -> SelectionView {
         .map(|i| RowView {
             key: RowKey::Chart(std::path::PathBuf::from(format!("{i}.bms"))),
             kind: RowKind::Chart,
+            index: None,
             title: title(i),
             subtitle: String::new(),
             artist: String::new(),
@@ -460,6 +436,7 @@ fn rows_at(at: usize, n: usize) -> SelectionView {
         place: SelectionPlace::All,
         query: String::new(),
         selected: None,
+        list_revision: 0,
     }
 }
 

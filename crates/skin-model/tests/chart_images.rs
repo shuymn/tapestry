@@ -315,10 +315,11 @@ fn a_chart_image_draws_its_stretched_rect() {
     assert_eq!(drawn(&h.batch)[0].0, [200.0, 100.0, 200.0, 100.0]);
 }
 
-/// A chart image is play's: the other screens refuse it, and a play skin
-/// drawing one keeps a chart layer, counted after the text layer.
+/// A chart image is play's and the result's: selection and decision
+/// refuse it, a result skin drawing one keeps a chart layer, and so does a
+/// play skin, counted after the text layer.
 #[test]
-fn a_chart_image_is_plays_and_keeps_a_chart_layer() {
+fn a_chart_image_is_play_and_results_and_keeps_a_chart_layer() {
     let element = || chart_image(ChartImage::Stage, ChartStretch::Fill, STAGE);
     let selection = Skin::new_selection(
         def(Vec::new(), white_sheet(), vec![element()]),
@@ -332,10 +333,19 @@ fn a_chart_image_is_plays_and_keeps_a_chart_layer() {
         })
     ));
     let result = Skin::new_result(
-        def(Vec::new(), white_sheet(), vec![element()]),
+        def(
+            Vec::new(),
+            white_sheet(),
+            vec![ElementDef {
+                timer: TimerRef::Builtin(skin_model::result_timer::SCREEN),
+                ..element()
+            }],
+        ),
         ResultDefs::default(),
-    );
-    assert!(matches!(result, Err(LoadError::SourceKind { .. })));
+    )
+    .unwrap();
+    assert!(result.has_chart_images());
+    assert!(result.kept_layers().chart);
     let decision = Skin::new_decision(
         def(Vec::new(), white_sheet(), vec![element()]),
         DecisionDefs::default(),

@@ -1079,7 +1079,12 @@ impl Play {
             }
         };
         set(timer::READY, ready);
-        set(timer::SCREEN, ready);
+        // On from the first frame, whatever READY: it runs from the play
+        // state's screen origin, never restarted by READY or a rearm.
+        set(
+            timer::SCREEN,
+            Some(TimeUs(now.0.saturating_sub(frame.screen_us))),
+        );
         set(timer::PLAY, play);
         set(timer::FAILED, failed);
         set(timer::LAST_NOTE, last_note);
@@ -1087,6 +1092,9 @@ impl Play {
         set(timer::GAUGE_MAX, gauge_max);
         set(timer::BEAT, beat);
         set(timer::RHYTHM, rhythm);
+        // From the lifecycle's fade-out start alone, which Closing never
+        // publishes.
+        set(timer::FADEOUT, frame.fading);
         set(timer::JUDGE, judge.map(|(_, at)| at));
         for grade in Grade::ALL {
             let at = judge.filter(|&(g, _)| g == grade).map(|(_, at)| at);

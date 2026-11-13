@@ -420,13 +420,25 @@ pub struct Drawn<'a> {
     /// When a loading frame was sampled (dev-tools: a scenario's captures).
     #[cfg(feature = "dev-tools")]
     pub loading_stamp: Option<LoadingStamp>,
-    /// Whether it was a menu screen (song selection), for the frame dump
-    /// (dev-tools).
+    /// The screen clock a play frame was built with, µs since its play
+    /// state's screen origin (dev-tools: a scenario's captures).
     #[cfg(feature = "dev-tools")]
-    pub menu: bool,
-    /// Whether it was the play screen's loading state (dev-tools).
+    pub screen_us: Option<i64>,
+    /// Which screen drew it (dev-tools: the frame dump and a scenario's
+    /// captures).
     #[cfg(feature = "dev-tools")]
-    pub loading: bool,
+    pub screen: ScreenKind,
+    /// The select screen's update a selection frame applied: its lifetime
+    /// and revision (dev-tools: a scenario's captures).
+    #[cfg(feature = "dev-tools")]
+    pub selection: Option<(u64, u64)>,
+    /// What a result frame drew (dev-tools: a scenario's captures).
+    #[cfg(feature = "dev-tools")]
+    pub result: Option<ResultStamp>,
+    /// When the frame's present returned, on the clock (dev-tools: a
+    /// scenario's captures).
+    #[cfg(feature = "dev-tools")]
+    pub presented_at: TimeUs,
     /// The loading lifetime whose frame the skin drew: not the pending
     /// presentation (dev-tools).
     #[cfg(feature = "dev-tools")]
@@ -475,6 +487,112 @@ pub struct ViewStamp {
     pub gauges: [Option<i64>; MAX_STAMPED_GAUGES],
     /// The shown gauge's look; `None` before an attempt is committed.
     pub look: Option<skin_model::GaugeLook>,
+}
+
+/// Which screen a frame was of (dev-tools).
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ScreenKind {
+    /// The launch screen.
+    Splash,
+    /// Song selection, skinned or its built-in page.
+    Selection,
+    /// The decision screen's built-in presentation.
+    Decision,
+    /// The practice page.
+    Practice,
+    /// A generic page: a preparation's wait, a notice.
+    Page,
+    /// The play screen's loading state.
+    Loading,
+    /// A play.
+    Play,
+    /// A result's presentation: its skin, or the built-in page in its
+    /// place.
+    Result,
+    /// The built-in end page.
+    End,
+}
+
+#[cfg(feature = "dev-tools")]
+impl ScreenKind {
+    /// Its name in a capture's sidecar.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Splash => "splash",
+            Self::Selection => "selection",
+            Self::Decision => "decision",
+            Self::Practice => "practice",
+            Self::Page => "page",
+            Self::Loading => "loading",
+            Self::Play => "play",
+            Self::Result => "result",
+            Self::End => "end",
+        }
+    }
+
+    /// Whether it is a result's frame: a presentation or the end page.
+    #[must_use]
+    pub const fn is_result(self) -> bool {
+        matches!(self, Self::Result | Self::End)
+    }
+}
+
+/// One result, from its preparation to its leaving (dev-tools): `seq`
+/// numbers the run's results and is never reused; `generation` is the
+/// play it follows.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResultId {
+    /// The run's result number, from 1.
+    pub seq: u64,
+    /// The play generation it follows.
+    pub generation: u64,
+}
+
+/// How a result frame was drawn (dev-tools).
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResultPath {
+    /// Its skin.
+    Skin,
+    /// The built-in page.
+    BuiltIn,
+    /// The built-in page, its skin refused in this frame.
+    Refused,
+}
+
+#[cfg(feature = "dev-tools")]
+impl ResultPath {
+    /// Its name in a capture's sidecar.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Skin => "skin",
+            Self::BuiltIn => "built-in",
+            Self::Refused => "refused",
+        }
+    }
+}
+
+/// What a result frame drew (dev-tools): the result of the page or view
+/// it drew, never the newest one.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ResultStamp {
+    /// The result of what it drew; `None` for a page no result names.
+    pub id: Option<ResultId>,
+    /// How it was drawn.
+    pub path: ResultPath,
+    /// The newest end page the render thread had taken, by its number.
+    pub page: u64,
+    /// The view presented, by its key, when a presentation is.
+    pub view: Option<u64>,
+    /// The instant the frame evaluated its skin at.
+    pub sampled: TimeUs,
+    /// The skin's screen timer's origin, when a skin's view is presented.
+    pub timer_origin: Option<TimeUs>,
 }
 
 /// The gauges a [`ViewStamp`] holds; a preset has six.
@@ -1332,9 +1450,15 @@ mod frame_tests {
             #[cfg(feature = "dev-tools")]
             loading_stamp: None,
             #[cfg(feature = "dev-tools")]
-            menu: false,
+            screen_us: None,
             #[cfg(feature = "dev-tools")]
-            loading: false,
+            screen: super::ScreenKind::Play,
+            #[cfg(feature = "dev-tools")]
+            selection: None,
+            #[cfg(feature = "dev-tools")]
+            result: None,
+            #[cfg(feature = "dev-tools")]
+            presented_at: TimeUs(at),
             #[cfg(feature = "dev-tools")]
             skin_loading: None,
             #[cfg(feature = "dev-tools")]

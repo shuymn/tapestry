@@ -386,3 +386,97 @@ fn a_lua_number_27_lowers_to_the_uptime_hours() {
     s.app.uptime_us = 7_200_000_000;
     assert!(!drawn(&mut s));
 }
+
+/// A Lua image's or image set's `act` and `click` become its action as a
+/// JSON one's do, and `mouseRect` its hover rect; a Lua `act` function
+/// calling `main_state.event_exec(15)` is never run and has no target,
+/// ignored with its note, and a `draw` calling it gives none either
+/// (design.md T09).
+#[test]
+fn lua_actions_take_the_json_import() {
+    use skin_model::{Button, PointerHit};
+    let more = "table.insert(skin.image, { id = \"a\", src = \"s\", x = 48, y = 0, w = 8, h = 8, act = 15, click = 2 })\n\
+                table.insert(skin.image, { id = \"t\", src = \"s\", x = 48, y = 0, w = 8, h = 8, act = 12, click = 3 })\n\
+                table.insert(skin.image, { id = \"x\", src = \"s\", x = 48, y = 0, w = 8, h = 8,\n\
+                  act = function() ms.event_exec(15) end })\n\
+                table.insert(skin.imageset, { id = \"is\", images = { \"b0\", \"b1\" }, act = 315, click = 1 })\n\
+                table.insert(skin.destination, { id = \"a\", dst = { { x = 0, y = 0, w = 100, h = 100 } } })\n\
+                table.insert(skin.destination, { id = \"t\", dst = { { x = 200, y = 0, w = 100, h = 100 } } })\n\
+                table.insert(skin.destination, { id = \"x\", dst = { { x = 400, y = 0, w = 100, h = 100 } } })\n\
+                table.insert(skin.destination, { id = \"is\", dst = { { x = 600, y = 0, w = 100, h = 100 } } })\n\
+                table.insert(skin.destination, { id = \"b1\", mouseRect = { x = 0, y = 0, w = 100, h = 50 },\n\
+                  dst = { { x = 800, y = 0, w = 100, h = 100 } } })\n\
+                table.insert(skin.destination, { id = \"b1\",\n\
+                  draw = function() ms.event_exec(15) return true end,\n\
+                  dst = { { x = 1000, y = 0, w = 100, h = 100 } } })";
+    let l = common::selection::folder("");
+    let i = import_lua_in(&l, &lua_skin("", more)).unwrap();
+    let notes: Vec<NoteKind> = i.imported.report.notes.iter().map(|n| n.kind).collect();
+    assert!(
+        notes.contains(&NoteKind::Ignored { field: "act" }),
+        "{notes:?}"
+    );
+    assert!(
+        !notes.contains(&NoteKind::UnsupportedField { field: "mouseRect" }),
+        "{notes:?}"
+    );
+    let mut s = Sel::new(i.imported.skin);
+    s.view(&view(vec![chart("a")], Some(0), None, None));
+    s.frame(0);
+    let hit = |s: &Sel, at| s.skin.hit_at(&s.sel, at, [1_920, 1_080], Button::Left).hit;
+    let action = |event, arg| Some(PointerHit::Action { event, arg });
+    // Type 2 by halves, type 3 by top and bottom, type 1 negated.
+    assert_eq!(hit(&s, [10.0, 1_030.0]), action(15, -1));
+    assert_eq!(hit(&s, [90.0, 1_030.0]), action(15, 1));
+    assert_eq!(hit(&s, [250.0, 990.0]), action(12, 1));
+    assert_eq!(hit(&s, [250.0, 1_070.0]), action(12, -1));
+    assert_eq!(hit(&s, [650.0, 1_030.0]), action(315, -1));
+    // The function: no target, and neither has the `draw` calling it.
+    assert_eq!(hit(&s, [450.0, 1_030.0]), None);
+    assert_eq!(hit(&s, [1_050.0, 1_030.0]), None);
+    // The hover rect: the region's bottom half.
+    let b1_at_800 = |s: &mut Sel, at| {
+        s.pointer = Some(at);
+        s.drawn(0).iter().any(|(_, r)| r[0] == 800.0)
+    };
+    assert!(b1_at_800(&mut s, [850.0, 1_060.0]));
+    assert!(!b1_at_800(&mut s, [850.0, 1_000.0]));
+}
+
+/// A Lua skin's song list image whose file is missing takes the JSON
+/// rule: on a non-center slot the slot draws nothing and the skin
+/// imports with the hole noted; on the center slot it refuses as the
+/// selected row.
+#[test]
+fn a_lua_missing_bar_image_takes_the_json_rule() {
+    let missing = "table.insert(skin.source, { id = \"m\", path = \"m.png\" })\n\
+                   table.insert(skin.image, { id = \"x0\", src = \"m\", x = 0, y = 0, w = 8, h = 8 })\n\
+                   table.insert(skin.imageset, { id = \"gone\", images = { \"x0\" } })\n";
+    let slot = "table.insert(skin.songlist.liston, { id = \"gone\", dst = { { x = 0, y = 800, w = 300, h = 40 } } })\n\
+                table.insert(skin.songlist.listoff, { id = \"gone\", dst = { { x = 0, y = 800, w = 300, h = 40 } } })";
+    let l = common::selection::folder("");
+    let i = import_lua_in(&l, &lua_skin("", &format!("{missing}{slot}"))).unwrap();
+    let holes = i
+        .imported
+        .report
+        .notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::MissingAsset)
+        .count();
+    assert_eq!(holes, 2, "{:?}", i.imported.report);
+    let mut s = Sel::new(i.imported.skin);
+    s.view(&view(vec![chart("a"), chart("b")], Some(0), None, None));
+    // The center's bar alone, at y 900.
+    let bars: Vec<f32> = s.drawn(0).into_iter().map(|(_, r)| r[1]).collect();
+    assert_eq!(bars, [140.0]);
+    // The center's set with the missing image 0.
+    let center = format!("{missing}skin.imageset[1].images = {{ \"x0\" }}");
+    match import_lua(&lua_skin("", &center)) {
+        Err(skin_beatoraja::ImportError::Essential {
+            part: skin_beatoraja::EssentialPart::SelectedRow,
+            why: Some(NoteKind::MissingAsset),
+            ..
+        }) => {}
+        other => panic!("{:?}", other.map(|i| i.imported.report)),
+    }
+}

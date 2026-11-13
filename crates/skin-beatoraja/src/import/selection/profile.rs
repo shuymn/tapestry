@@ -1,11 +1,13 @@
 //! The selection profile (docs/stage3.md §3, Selection): one explicit
 //! `match` per id space over every id the surveyed selection skins read,
 //! each classified. **N** ids are bridged from the selection schema, the
-//! player's settings among them (read-only); **E** ids (actions, and
-//! settings with no native equivalent) are unavailable, drawing nothing
-//! with a note; **D** ids are a truthful constant or an omission with a
-//! note. An id outside the survey
-//! follows the existing rules of its space: an option the source's
+//! player's settings among them (read-only), and the native actions;
+//! **E** ids (actions and settings with no native equivalent yet) are
+//! unavailable, drawing nothing with a note; **D** ids are a truthful
+//! constant or an omission with a note. An action of any class is a
+//! pointer target that takes the press: an N action runs, an E or D one
+//! does nothing, noted as unavailable or as ignored. An id outside the
+//! survey follows the existing rules of its space: an option the source's
 //! factory knows is unsupported, one neither built in nor declared never
 //! draws, and an unknown number, text or image index is unsupported by
 //! its role or resolves to nothing as the factory's does.
@@ -356,7 +358,7 @@ pub(crate) const CLEAR_TYPE: &str = "if cursor.chart && selected.played then \
 
 /// The selection image index `id`: an image's or an image set's `ref`.
 pub(crate) fn image_index(id: i32) -> Option<Class<&'static str>> {
-    use Class::{Bridge, Omit, Unavailable};
+    use Class::{Bridge, Omit};
     Some(match id {
         370 => Bridge(CLEAR_TYPE),
         // The settings: the source's sorter index (none for the
@@ -365,9 +367,28 @@ pub(crate) fn image_index(id: i32) -> Option<Class<&'static str>> {
         12 => Bridge("settings.order"),
         40 => Bridge("settings.gauge"),
         55 => Bridge("settings.fix_hispeed"),
+        // The covers' switches, the hi-speed auto adjustment and the judge
+        // algorithm read the selected bar's play config in the source: a
+        // chart's mode's, else the mode filter's, so a folder row shows them
+        // too (`skin/property/IntegerPropertyFactory.java:1216-1227`,
+        // `:1261-1315`; `select/MusicSelector.java:650-669`); only 7-key
+        // charts are listed, whose settings are the play options.
         330 => Bridge("if settings.sudden then 1 else 0"),
         331 => Bridge("if settings.lift then 1 else 0"),
         332 => Bridge("if settings.hidden then 1 else 0"),
+        // Floating re-solves the hi-speed at the tempo at the head, as the
+        // source's auto adjustment does; Classic has none.
+        342 => Bridge("if settings.floating then 1 else 0"),
+        // Nothing without a preset (−1).
+        340 => Bridge("settings.judge_algorithm"),
+        // The gauge auto shift as the failure handling: none (0) when a
+        // failed play closes, continue (1) when it plays to the end
+        // (`IntegerPropertyFactory.java:1111`; `play/BMSPlayer.java:654-668`).
+        78 => Bridge("settings.gauge_shift"),
+        // The bottom-shiftable gauge: its default, assist easy (0), which
+        // the source reads only under an automatic shift tapestry has not
+        // (`IntegerPropertyFactory.java:1112`; `PlayerConfig.java:175`).
+        341 => Bridge("0"),
         // Truthful constants, at the source's value for what tapestry has
         // or lacks: only 7-key charts are listed (`BEAT_7K`), no BGA is
         // drawn (`BGA_OFF`), no lane option, display-timing auto
@@ -377,9 +398,6 @@ pub(crate) fn image_index(id: i32) -> Option<Class<&'static str>> {
         // No image-index property on selection: the source's image draws
         // its entry 0.
         15 | 16 | 19 | 77 | 315..=318 => Bridge("0"),
-        // The gauge auto shift, the judge algorithm, the bottom-shiftable
-        // gauge and the hi-speed auto adjustment: no native equivalent.
-        78 | 340..=342 => Unavailable,
         // The target's clear type.
         371 => Omit,
         _ => return None,
@@ -412,14 +430,15 @@ pub(crate) fn graph(ty: i32) -> Option<Class<RatioSource>> {
     })
 }
 
-/// The selection event `id`: an image's `act` or `click`, a
-/// `customEvents` action. None has a hit target before the native
-/// actions exist.
+/// The selection event `id`: an image's `act`, a `customEvents` action.
+/// Each is a pointer target that takes the press; only an N event acts.
 pub(crate) fn event(id: i32) -> Option<Class<()>> {
-    use Class::{Omit, Unavailable};
+    use Class::{Bridge, Omit, Unavailable};
     Some(match id {
-        // Sort, play, practice and the cover actions.
-        12 | 15 | 315 | 330..=332 => Unavailable,
+        // Sort, play and practice.
+        12 | 15 | 315 => Bridge(()),
+        // The cover actions, which the settings panel will back.
+        330..=332 => Unavailable,
         // No native contract.
         11 | 13 | 14 | 16 | 17 | 19 | 308 | 316..=318 | 340..=342 => Omit,
         _ => return None,
@@ -543,24 +562,26 @@ mod tests {
         (72, 72, C::K(2)),
         (75, 75, C::K(0)),
         (77, 77, C::K(0)),
-        (78, 78, C::E),
+        (78, 78, C::N),
         (301, 308, C::K(0)),
         (315, 318, C::K(0)),
         (330, 332, C::N),
-        (340, 342, C::E),
+        (340, 340, C::N),
+        (341, 341, C::K(0)),
+        (342, 342, C::N),
         (370, 370, C::N),
         (371, 371, C::D),
     ];
 
     const EVENT: &[(i32, i32, C)] = &[
         (11, 11, C::D),
-        (12, 12, C::E),
+        (12, 12, C::N),
         (13, 14, C::D),
-        (15, 15, C::E),
+        (15, 15, C::N),
         (16, 17, C::D),
         (19, 19, C::D),
         (308, 308, C::D),
-        (315, 315, C::E),
+        (315, 315, C::N),
         (316, 318, C::D),
         (330, 332, C::E),
         (340, 342, C::D),

@@ -18,6 +18,8 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
+use std::cell::Cell;
+
 use bms_model::TimeUs;
 
 use super::digits::{Align, Digits, DigitsDef};
@@ -27,6 +29,7 @@ use super::{Brush, Frame, ImageRef, Starts, sample};
 use crate::atlas::uv::UvTable;
 use crate::expr::{Program, State};
 use crate::layout::Anchor;
+use crate::pointer::{RowHit, RowRef, RowRefKind};
 use crate::quad::{Blend, QuadBatch, RunKey};
 use crate::selection::{OwnLamp, RowKind, RowScore, RowView};
 use crate::skin::TimerRef;
@@ -217,6 +220,10 @@ pub struct SongListDef {
     pub lamp: [Option<ImagePartDef>; LampKey::COUNT],
     /// By [`RowLabel`].
     pub label: [Option<ImagePartDef>; RowLabel::COUNT],
+    /// The slots a press may hit, in the order it tries them, each below
+    /// the placements' count; a slot may repeat
+    /// (`select/BarRenderer.java:80-101`).
+    pub clickable: Vec<u8>,
 }
 
 impl SongListDef {
@@ -280,6 +287,8 @@ pub enum SongListError {
     TooManyPlacements { n: usize },
     #[error("the song list's center slot {center} is past its placements")]
     Center { center: u8 },
+    #[error("the song list's clickable slot {slot} is past its placements")]
+    Clickable { slot: u8 },
     #[error("a song list part's image does not exist")]
     UnknownImage,
     #[error("a song list part's timer does not exist")]
@@ -334,10 +343,12 @@ pub(crate) struct SongList {
     pub(crate) level: [Option<Part<Digits>>; LEVEL_STYLES],
     pub(crate) lamp: [Option<Part<ImageRef>>; LampKey::COUNT],
     pub(crate) label: [Option<Part<ImageRef>>; RowLabel::COUNT],
+    /// The slots a press tries, in order.
+    pub(crate) clickable: Box<[u8]>,
 }
 
-/// What one slot shows: its row's style, lamp, level and labels, set when
-/// the view changes.
+/// What one slot shows: its row's style, lamp, level and labels, and the
+/// row a press on its bar names, set when the view changes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct RowBind {
     pub(crate) style: Option<RowStyle>,
@@ -346,22 +357,36 @@ pub(crate) struct RowBind {
     pub(crate) level: Option<(i32, usize)>,
     /// By [`RowLabel::ALL`]'s order: long notes, mines, random.
     pub(crate) labels: [bool; RowLabel::COUNT],
+    /// The row's identity in the list of revision `list_revision`; `None`
+    /// for a heading or a row the view does not number.
+    pub(crate) row: Option<RowRef>,
 }
 
 impl RowBind {
-    /// What `row` shows; a heading shows nothing.
-    pub(crate) fn of(row: &RowView) -> Self {
+    /// What `row` of the list at `list_revision` shows; a heading shows
+    /// nothing.
+    pub(crate) fn of(row: &RowView, list_revision: u64) -> Self {
         let Some(style) = RowStyle::of(row.kind) else {
             return Self::default();
         };
+        let id = row
+            .index
+            .zip(RowRefKind::of(row.kind))
+            .map(|(index, kind)| RowRef {
+                list_revision,
+                index,
+                kind,
+            });
         if style != RowStyle::Chart {
             return Self {
                 style: Some(style),
+                row: id,
                 ..Self::default()
             };
         }
         let features = row.features;
         Self {
+            row: id,
             style: Some(style),
             lamp: Some(LampKey::of(row.score)),
             level: Some((
@@ -379,7 +404,9 @@ impl RowBind {
 
 /// What a song list's frame reads: the timers, the state its visibilities
 /// read, the rows per slot, the row texts per slot, the uv table and a
-/// brush carrying the element's region, color and clip.
+/// brush carrying the element's region, color and clip; and what it
+/// records: the rect of each slot whose bar drew, per slot, placed on the
+/// target from the canvas's origin at the brush's scale.
 pub(crate) struct ListDraw<'a> {
     pub(crate) starts: Starts<'a>,
     pub(crate) now: TimeUs,
@@ -389,6 +416,10 @@ pub(crate) struct ListDraw<'a> {
     pub(crate) bitmap: &'a [Option<GlyphLine>],
     pub(crate) uvs: &'a UvTable,
     pub(crate) brush: Brush,
+    /// Per slot: the row hit its bar records, cleared before the build.
+    pub(crate) hits: &'a [Cell<Option<RowHit>>],
+    /// The canvas's origin on the target, in target pixels.
+    pub(crate) origin: [f32; 2],
 }
 
 impl SongList {
@@ -409,7 +440,8 @@ impl SongList {
         out
     }
 
-    /// Draws every slot's parts, pass by pass. Allocates nothing.
+    /// Draws every slot's parts, pass by pass, recording the rect and row
+    /// of each slot whose bar drew. Allocates nothing.
     pub(crate) fn draw(&self, d: &ListDraw<'_>, out: &mut QuadBatch) {
         let placed = self.placed(d);
         let at = Frame {
@@ -439,6 +471,15 @@ impl SongList {
             };
             if let Some(f) = image.frame(d.starts, d.now, d.uvs) {
                 brush.push(out, *rect, f, image.filter);
+                if let (Some(cell), Some(row)) = (d.hits.get(i), row.row) {
+                    let [x, y, w, h] = *rect;
+                    let [x, y, w, h] = brush.affine.rect([brush.map.x(x), y, brush.map.w(w), h]);
+                    let ([ox, oy], s) = (d.origin, brush.scale);
+                    cell.set(Some(RowHit {
+                        rect: [ox + x * s, oy + y * s, w * s, h * s],
+                        row,
+                    }));
+                }
             }
         }
         // The row texts.

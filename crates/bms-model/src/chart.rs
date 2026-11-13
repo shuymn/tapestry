@@ -314,6 +314,16 @@ impl ChartSummary {
 }
 
 impl Chart {
+    /// The chart's last resolved object: the latest note end (mines
+    /// included) or background sound start, at least 0. A sound's tail is
+    /// not an object.
+    #[must_use]
+    pub fn last_object(&self) -> TimeUs {
+        let notes = self.lanes.iter().flatten().map(Note::end);
+        let bgm = self.bgm.iter().map(|b| b.time);
+        notes.chain(bgm).fold(TimeUs(0), TimeUs::max)
+    }
+
     /// Checks the invariants consumers rely on. The timeline and its links
     /// are not checked here ([`Chart::validate_presentation_links`]).
     ///

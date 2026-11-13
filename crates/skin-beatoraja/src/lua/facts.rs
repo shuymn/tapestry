@@ -491,8 +491,11 @@ pub(crate) enum NumberRead {
 /// Answers `number(n)` from `facts`.
 pub(crate) fn number(facts: &ImportFacts, n: i32) -> NumberRead {
     // A result scene reads every profile number, the play level among
-    // them, from the result's fields, as its frames do (D12).
+    // them, from the result's fields, as its frames do (D12); the
+    // application's readouts, which the frame fills and no view holds, are
+    // live state, as on selection.
     let fact = if facts.scene == ScreenKind::Result
+        && !profile::APP.contains(&n)
         && matches!(profile::number(n), Some(Class::Bridge(_)))
     {
         FactId::ResultNumber(n)

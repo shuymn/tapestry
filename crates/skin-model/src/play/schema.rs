@@ -379,6 +379,7 @@ pub static PLAY: Schema = Schema {
         timer("loading", E),
         timer("screen", E),
         timer("rhythm", E),
+        timer("fadeout", E),
     ],
     enums: &[EnumDef {
         name: "gauge_kind",
@@ -723,14 +724,19 @@ pub mod timer {
     /// ([`LoadState::since`](crate::LoadState::since)); off in a play.
     pub const LOADING: u16 = 55;
     /// The screen's start, which an untimed element runs on: the loading
-    /// lifetime's origin while loading, `ready`'s start in a play.
+    /// lifetime's origin while loading; in a play the play state's screen
+    /// origin ([`SkinFrame::screen_us`](crate::SkinFrame::screen_us)), on
+    /// from the first frame and never restarted at READY.
     pub const SCREEN: u16 = 56;
     /// The rhythm clock: its start is `now` less the time since the
     /// latest bar line at 1 000 ms per chart beat, from `play`'s start
     /// through the completed tail to the progress end + 5 s, then held.
     pub const RHYTHM: u16 = 57;
+    /// A completed full play's fade-out, from its start (the play view's
+    /// `fading`); off in Closing, in a practice round and while loading.
+    pub const FADEOUT: u16 = 58;
     /// The number of built-in timers.
-    pub const BUILTIN: u16 = 58;
+    pub const BUILTIN: u16 = 59;
 }
 
 /// A judgment as the skin shows it: the five grades and the empty POOR.
@@ -1227,6 +1233,7 @@ mod tests {
             ("loading", timer::LOADING),
             ("screen", timer::SCREEN),
             ("rhythm", timer::RHYTHM),
+            ("fadeout", timer::FADEOUT),
         ];
         for (name, slot) in timers {
             assert_eq!(PLAY.timer(name).map(|(s, _)| s), Some(slot), "{name}");

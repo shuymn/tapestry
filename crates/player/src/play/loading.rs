@@ -95,6 +95,10 @@ impl LoadingRig for PlayerRig<'_> {
         self.render.loading_loadend()
     }
 
+    fn loading_wait(&mut self, until: Option<TimeUs>) {
+        self.loading_park(until);
+    }
+
     fn loading_refusal(&self, lifetime: u64) -> Result<(), crate::render_side::ScreenError> {
         self.render.loading_refused(lifetime).map_or(Ok(()), |why| {
             Err(crate::render_side::ScreenError::LoadingRefused(why))

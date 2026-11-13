@@ -317,3 +317,20 @@ proptest! {
         }
     }
 }
+
+/// The seed-0 branch's labels come with the scan, from which a song list
+/// keeps the image names; a refused branch carries none.
+#[test]
+fn read_scanned_carries_the_seed_0_labels() {
+    let limits = Limits::default();
+    let text = b"#STAGEFILE top.png\n#SETRANDOM 2\n#IF 1\n#BANNER one.png\n#ENDIF\n\
+                 #IF 2\n#BANNER two.png\n#ENDIF\n#ENDRANDOM\n#BPM 120\n#00111:01\n";
+    let labels = read_scanned(text, &limits).unwrap().labels.unwrap();
+    assert_eq!(
+        (labels.stagefile.as_str(), labels.banner.as_str()),
+        ("top.png", "two.png")
+    );
+    let refused = read_scanned(b"#STAGEFILE a.png\n#BPM 0\n#00138:01\n", &limits).unwrap();
+    assert!(refused.summary.is_err());
+    assert_eq!(refused.labels, None);
+}

@@ -162,6 +162,24 @@ impl TuningSnapshot {
         quiet && self.stable && self.focused && !self.held && !self.overflow
     }
 
+    /// When the tuning becomes quiet if nothing happens first: the last
+    /// activity plus [`QUIET`], when that is after `now` and nothing else
+    /// keeps it from being quiet (an unstable observation, focus lost, a
+    /// held control, an overflow, which change only on an event); `None`
+    /// otherwise ([`quiet_at`](Self::quiet_at)).
+    #[must_use]
+    pub const fn quiet_deadline(&self, now: TimeUs) -> Option<TimeUs> {
+        let Some(last) = self.last_activity else {
+            return None;
+        };
+        let at = last.0.saturating_add(QUIET.0);
+        if at > now.0 && self.stable && self.focused && !self.held && !self.overflow {
+            Some(TimeUs(at))
+        } else {
+            None
+        }
+    }
+
     /// Whether nothing changed since `earlier` was taken (both stable, the
     /// same acceptance revision) and the tuning is still quiet at `now`
     /// ([`quiet_at`](Self::quiet_at)).
@@ -205,6 +223,30 @@ pub trait LoadingRig: Rig {
     /// None by default.
     fn loadend(&self) -> Option<TimeUs> {
         None
+    }
+    /// Waits in the loading state for the next look ([`wait_loading`]): as
+    /// [`Rig::wait`] does, but never past `until` on the rig's clock when it
+    /// is given, the next instant a condition of the wait can change by
+    /// time alone (design.md "Play Lifecycle", the loading state's wait). By
+    /// default, one [`Rig::wait`].
+    fn loading_wait(&mut self, until: Option<TimeUs>) {
+        let _ = until;
+        self.wait();
+    }
+    /// Polls the pending preparation in the loading state's wait
+    /// ([`wait_loading`]): as [`Rig::poll_preparation`] with a deadline
+    /// [`PREP_SLICE`] away, but never past `until` on the rig's clock when
+    /// it is given ([`wait_slice`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Rig::poll_preparation`].
+    fn loading_poll(
+        &mut self,
+        handle: &mut PrepHandle,
+        until: Option<TimeUs>,
+    ) -> Result<PrepPoll<Preparation>, Self::ScreenError> {
+        poll_until(self, handle, until)
     }
     /// Whether the skin refused a loading frame of lifetime `lifetime`:
     /// nothing of it is drawn again, so its first frame may never be
@@ -691,17 +733,26 @@ fn wait_loading<R: LoadingRig>(
     opener: &mut LoadingOpener,
     committed: bool,
 ) -> Result<bool, LiveError<R::ScreenError>> {
+    // The next instant the conditions can change by time alone, from the
+    // last look. Each entry looks first, before any wait: a deadline due
+    // sooner than a wait's bound (a minimum a commit lengthened by less
+    // than the idle wake, conditions already met) is never waited past.
+    // Its pending preparation is polled without waiting (until now), so
+    // an answer already in is taken before that look.
+    let mut wake = None;
+    let mut looked = false;
     loop {
+        let first = !std::mem::replace(&mut looked, true);
         if opener.latch == PrepState::Pending {
-            let deadline = std::time::Instant::now() + PREP_SLICE;
+            let until = if first { Some(rig.now()) } else { wake };
             if let PrepPoll::Done(answer) = rig
-                .poll_preparation(&mut opener.handle, deadline)
+                .loading_poll(&mut opener.handle, until)
                 .map_err(LiveError::Screen)?
             {
                 opener.latch = PrepState::of(answer);
             }
-        } else {
-            rig.wait();
+        } else if !first {
+            rig.loading_wait(wake);
         }
         // The exits in order, those that end the run first: a thread's
         // failure, a refusal, a close, a refused loading frame (its
@@ -747,6 +798,64 @@ fn wait_loading<R: LoadingRig>(
         if opener.minimum_passed(rig, now) && tuning.quiet_at(now) {
             return Ok(true);
         }
+        wake = next_wake(opener, rig, now, &tuning);
+    }
+}
+
+/// [`LoadingRig::loading_poll`]'s default: [`Rig::poll_preparation`] with
+/// a deadline [`PREP_SLICE`] away on the monotonic clock, never further
+/// than `until` is on the rig's clock ([`wait_slice`]).
+///
+/// # Errors
+///
+/// As [`Rig::poll_preparation`].
+pub fn poll_until<R: LoadingRig + ?Sized>(
+    rig: &mut R,
+    handle: &mut PrepHandle,
+    until: Option<TimeUs>,
+) -> Result<PrepPoll<Preparation>, R::ScreenError> {
+    let slice = wait_slice(until, rig.now(), PREP_SLICE);
+    rig.poll_preparation(handle, std::time::Instant::now() + slice)
+}
+
+/// How long a wait from `now` may last to end by `until` on the same
+/// clock: `most` at most, never past `until`; `most` without one, and
+/// nothing for one already reached (the look runs at once). The loading
+/// state's wait asks only for instants after its look ([`next_wake`]).
+#[must_use]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub fn wait_slice(
+    until: Option<TimeUs>,
+    now: TimeUs,
+    most: std::time::Duration,
+) -> std::time::Duration {
+    until.map_or(most, |u| {
+        most.min(std::time::Duration::from_micros(
+            u.0.saturating_sub(now.0).max(0).unsigned_abs(),
+        ))
+    })
+}
+
+/// The next instant the loading wait's conditions can change by time
+/// alone, after `now`: the minimum's end while it has not passed, and the
+/// tuning's quiet deadline while quiet time is all it lacks
+/// ([`TuningSnapshot::quiet_deadline`]), the earlier of the two. `None`
+/// when neither: what is left changes only on an event (an
+/// acknowledgement, focus, a held control, an overflow, an answer).
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn next_wake<R: LoadingRig>(
+    opener: &LoadingOpener,
+    rig: &R,
+    now: TimeUs,
+    tuning: &TuningSnapshot,
+) -> Option<TimeUs> {
+    let minimum = opener
+        .ack
+        .map(|ack| minimum_ends(ack, rig.loadend()))
+        .filter(|end| end.0 > now.0);
+    match (minimum, tuning.quiet_deadline(now)) {
+        (Some(a), Some(b)) => Some(TimeUs(a.0.min(b.0))),
+        (a, b) => a.or(b),
     }
 }
 
@@ -800,19 +909,32 @@ fn open_loading<R: LoadingRig>(
         rig.defer();
         rig.reopen_acceptance().map_err(LiveError::Input)?;
         opener.closed = false;
+        // The first wait lets the input side's latches settle; each one
+        // after is the loading state's, until the quiet deadline when quiet
+        // time is all the focus deferral lacks (a held START or SELECT, or
+        // a focus still lost, wakes the thread as it changes).
+        let mut wake = None;
+        let mut waited = false;
         let snapshot = loop {
-            rig.wait();
+            if std::mem::replace(&mut waited, true) {
+                rig.loading_wait(wake);
+            } else {
+                rig.wait();
+            }
             preflight(rig)?;
             if quit_look(rig) {
                 return Ok(None);
             }
             for_focus |= rig.focus_deferred();
             if rig.holding() {
+                wake = None;
                 continue;
             }
             if for_focus {
                 let tuning = rig.tuning_snapshot().map_err(LiveError::Input)?;
-                if !tuning.quiet_at(rig.now()) {
+                let now = rig.now();
+                if !tuning.quiet_at(now) {
+                    wake = tuning.quiet_deadline(now);
                     continue;
                 }
             }
@@ -820,9 +942,11 @@ fn open_loading<R: LoadingRig>(
             opener.closed = true;
             // Deferred for focus, the closed copy is decided quiet itself:
             // an event since the look sends it back to waiting.
-            if !for_focus || snapshot.quiet_at(rig.now()) {
+            let now = rig.now();
+            if !for_focus || snapshot.quiet_at(now) {
                 break snapshot;
             }
+            wake = snapshot.quiet_deadline(now);
             rig.reopen_acceptance().map_err(LiveError::Input)?;
             opener.closed = false;
         };

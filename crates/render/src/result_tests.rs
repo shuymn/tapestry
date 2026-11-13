@@ -339,6 +339,7 @@ fn at_zero(layout: &Layout) -> ResultFrame<'_> {
             screen: Some(TimeUs(0)),
             fadeout: None,
         },
+        app: skin_model::AppReadouts::LAUNCH,
     }
 }
 
@@ -981,4 +982,170 @@ fn staged_result_lines_install_on_their_array() {
     // Its screen timer off, the skin draws nothing: the strip alone,
     // bounded.
     assert_eq!(drawn, RESULT_STRIP_SPRITES, "the strip bounded");
+}
+
+/// A result skin over `dir` drawing the stage file (S10-12) over A's band
+/// (x 0, 400 wide), and a red cell at x `mark` 10 wide when `mark` is set,
+/// so two such skins share pages.
+fn chart_skin(dir: &Path, mark: Option<i32>) -> Skin {
+    let mut b = skin_model::SheetBuilder::new(&Root::new(dir).unwrap());
+    b.add_solid_image(SolidImageDef {
+        size: [16, 16],
+        color: RED,
+        filter: Filter::Nearest,
+        grid: None,
+    })
+    .unwrap();
+    let mut elements = vec![element(
+        Source::ChartImage {
+            which: skin_model::chart_image::ChartImage::Stage,
+            filter: Filter::Nearest,
+            stretch: skin_model::chart_image::ChartStretch::Fill,
+        },
+        [0, 0, 400, 1_080],
+        None,
+    )];
+    if let Some(x) = mark {
+        elements.push(element(Source::Image(0), [x, 0, 10, 10], None));
+    }
+    let def = SkinDef {
+        fit: Fit::Fixed,
+        regions: [RegionDef {
+            anchor: Anchor::TopLeft,
+            optional: false,
+        }; Region::COUNT],
+        whens: Vec::new(),
+        sheet: b.finish(),
+        lanes: None,
+        elements,
+        widgets: WidgetDefs::default(),
+        bomb_up_to: None,
+        close: None,
+        loadend: None,
+        present: None,
+    };
+    Skin::new_result(def, ResultDefs::default()).unwrap()
+}
+
+/// A `w`×`h` picture of `rgb` fitted for the stage slot of a chart layer
+/// of side `side`.
+fn stage_picture(
+    side: u32,
+    [w, h]: [u32; 2],
+    [r, g, b]: [u8; 3],
+) -> skin_model::chart_image::Fitted {
+    use skin_model::chart_image::{ChartDir, ChartImage, read};
+    let d = tempfile::tempdir().unwrap();
+    let file = File::create(d.path().join("p.png")).unwrap();
+    let mut e = png::Encoder::new(BufWriter::new(file), w, h);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let texels = [r, g, b, 255].repeat(usize::try_from(w * h).unwrap());
+    e.write_header().unwrap().write_image_data(&texels).unwrap();
+    let dir = ChartDir::new(d.path()).unwrap();
+    let slot = ChartImage::Stage.slot(side).unwrap().1;
+    read(&dir, "p.png", &[], slot, &|| false, &|_| None)
+        .image
+        .unwrap()
+}
+
+/// The result's chart images and the array's record: a view's images are
+/// written into the array its staging uses and keyed
+/// to its installation, so its first frame after the commit draws them; a
+/// layout staged on the installed array of the same set writes nothing
+/// again and draws them with its own installation's key; the record is the
+/// set's id, so a set whose every copy is gone is still skipped while a
+/// new set writes; a refused write clears the record and leaves the view
+/// to draw nothing; and a restore makes the tables of the old array
+/// undrawable until the images are written again into the new one.
+#[test]
+fn result_chart_images_are_written_into_the_staged_array() {
+    use render::ResultChartTarget;
+    let mut r = offscreen(W, H);
+    let dir = tempfile::tempdir().unwrap();
+    let a_skin = chart_skin(dir.path(), None);
+    let atlas = a_skin
+        .atlas(Variant::Lo, r.atlas_limits(), &|| false)
+        .unwrap();
+    let b_skin = chart_skin(dir.path(), Some(1_800));
+    let kept = b_skin.kept_layers();
+    assert!(kept.chart);
+    let rebound = atlas
+        .rebind_keeping(b_skin.sheet(), Variant::Lo, kept)
+        .unwrap();
+    let a = bundle(a_skin, atlas, Vec::new(), None);
+    let b = bundle(b_skin, rebound, Vec::new(), None);
+    let side = a.side();
+    let red = stage_picture(side, [64, 48], [200, 10, 10]);
+    let green = stage_picture(side, [64, 48], [10, 200, 10]);
+    const RED_PX: [u8; 3] = [200, 10, 10];
+    const GREEN_PX: [u8; 3] = [10, 200, 10];
+
+    // A on its own array: written, keyed to its staging's installation.
+    let token = r.install(ScreenKind::Result, &a, 1).unwrap();
+    let t1 = r
+        .write_result_chart(ResultChartTarget::Staged(token), [Some(&red), None], 1)
+        .unwrap();
+    assert_eq!(r.result_chart_writes(), 1);
+    r.commit(token).unwrap();
+    assert_eq!(
+        t1.key(),
+        r.result_chart_key(),
+        "keyed to the committed array"
+    );
+    let mut sa = state(&a);
+    sa.set_chart_images(t1);
+    assert_eq!(rgb_at(&pixels(&mut r, &mut sa, &[]), W, A_AT), RED_PX);
+
+    // B on A's pages, the same set: nothing written, its own key.
+    let token = r.install(ScreenKind::Result, &b, 2).unwrap();
+    let t2 = r
+        .write_result_chart(ResultChartTarget::Staged(token), [Some(&red), None], 1)
+        .unwrap();
+    assert_eq!(r.result_chart_writes(), 1, "the installed array's set");
+    assert_ne!(t2.key(), t1.key());
+    r.commit(token).unwrap();
+    assert_eq!(t2.key(), r.result_chart_key());
+    let mut sb = state(&b);
+    sb.set_chart_images(t2);
+    assert_eq!(rgb_at(&pixels(&mut r, &mut sb, &[]), W, A_AT), RED_PX);
+    // A's table is of another installation: it draws nothing now.
+    sb.set_chart_images(t1);
+    assert_eq!(rgb_at(&pixels(&mut r, &mut sb, &[]), W, A_AT), BLACK);
+
+    // The record is an id: set 1 gone, still skipped; set 2 writes.
+    drop(red);
+    r.write_result_chart(ResultChartTarget::Committed, [None, None], 1)
+        .unwrap();
+    assert_eq!(r.result_chart_writes(), 1);
+    let t3 = r
+        .write_result_chart(ResultChartTarget::Committed, [Some(&green), None], 2)
+        .unwrap();
+    assert_eq!(r.result_chart_writes(), 2);
+    sb.set_chart_images(t3);
+    assert_eq!(rgb_at(&pixels(&mut r, &mut sb, &[]), W, A_AT), GREEN_PX);
+
+    // A refused write: absent, the record cleared, so set 2 writes again.
+    r.refuse_next_result_chart();
+    let refused = r
+        .write_result_chart(ResultChartTarget::Committed, [Some(&green), None], 4)
+        .unwrap_err();
+    assert_eq!(refused.chart_outcome(), render::ChartOutcome::Absent);
+    assert_eq!(r.result_chart_writes(), 2);
+    r.write_result_chart(ResultChartTarget::Committed, [Some(&green), None], 2)
+        .unwrap();
+    assert_eq!(r.result_chart_writes(), 3, "the record was cleared");
+
+    // A restore: a new array, the old tables undrawable until written.
+    let installation = r.installation(ScreenKind::Result).unwrap();
+    let before = r.result_chart_key();
+    r.restore(ScreenKind::Result, &installation).unwrap();
+    assert_ne!(r.result_chart_key(), before);
+    sb.set_chart_images(t3);
+    assert_eq!(rgb_at(&pixels(&mut r, &mut sb, &[]), W, A_AT), BLACK);
+    let t4 = r
+        .write_result_chart(ResultChartTarget::Committed, [Some(&green), None], 2)
+        .unwrap();
+    sb.set_chart_images(t4);
+    assert_eq!(rgb_at(&pixels(&mut r, &mut sb, &[]), W, A_AT), GREEN_PX);
 }

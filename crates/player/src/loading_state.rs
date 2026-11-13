@@ -123,6 +123,12 @@ impl LifetimeState {
         self.lifetime
     }
 
+    /// The lifetime's origin on the loading clock: where it began, or
+    /// where it was revealed when held.
+    pub const fn origin(&self) -> TimeUs {
+        self.origin
+    }
+
     /// The lifetime is shown from `origin` on the loading clock (a lifetime
     /// made at a choice and revealed at the decision screen's deadline):
     /// the whole state published again under the next sequence number,

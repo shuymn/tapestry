@@ -1271,6 +1271,7 @@ mod tests {
             complete: false,
             playing: true,
             closing: None,
+            fading: None,
             events: 0,
             offsets: game::OffsetRing::EMPTY,
         }
@@ -1351,6 +1352,7 @@ mod tests {
         FrameInput {
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
+            screen_us: 0,
             now: TimeUs(now),
             display_offset: TimeUs(0),
             lanes: LANES,
@@ -1362,6 +1364,20 @@ mod tests {
             target: [1920, 1080],
             turntable: 0,
         }
+    }
+
+    /// A declarative skin's frame ([`crate::skin_frame`]) carries the
+    /// play view's Closing and fade-out starts as they are.
+    #[test]
+    fn a_skin_frame_carries_the_views_closing_and_fade_out() {
+        let v = PlayView {
+            closing: Some(TimeUs(2_500_000)),
+            fading: Some(TimeUs(8_000_000)),
+            ..view()
+        };
+        let f = crate::skin_frame(&frame(&v, 8_500_000, &[]));
+        assert_eq!(f.closing, Some(TimeUs(2_500_000)));
+        assert_eq!(f.fading, Some(TimeUs(8_000_000)));
     }
 
     /// The alpha sprites drawn in `lane`'s column with `color`.

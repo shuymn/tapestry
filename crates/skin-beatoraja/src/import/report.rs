@@ -167,7 +167,7 @@ pub enum TimerWhy {
     CustomBuiltin(i32),
     /// A play-critical element with no timer whose placement or colour
     /// other than alpha changes between keys and that does not settle
-    /// (D3, D20).
+    /// (D3).
     Untimed,
     /// A frame cycle the model cannot run (negative or too long).
     Cycle,
@@ -194,9 +194,6 @@ pub enum DeviationId {
     D12,
     /// A distance-field bitmap font drawn with the default font.
     D13,
-    /// A critical untimed track that settles, drawn at its last key from
-    /// the start: its entrance is lost.
-    D20,
 }
 
 /// How the lanes and their covers are drawn differently from the source:
