@@ -1227,6 +1227,10 @@ pub struct Renderer {
     /// as a skin refuses one.
     #[cfg(any(test, feature = "dev-tools"))]
     decision_fault: bool,
+    /// Development builds: the next decision build allocates inside the
+    /// skin's build, then refuses if `Some(true)` (a development fault).
+    #[cfg(feature = "dev-tools")]
+    decision_alloc: Option<bool>,
     /// Tests and development builds: the next settling of the decision
     /// labels fails as a poll fails.
     #[cfg(any(test, feature = "dev-tools"))]
@@ -1394,6 +1398,8 @@ impl Renderer {
             result_faults: (false, false),
             #[cfg(any(test, feature = "dev-tools"))]
             decision_fault: false,
+            #[cfg(feature = "dev-tools")]
+            decision_alloc: None,
             #[cfg(any(test, feature = "dev-tools"))]
             decision_settle_fault: false,
             #[cfg(test)]
@@ -5040,8 +5046,21 @@ impl Renderer {
         let bundle = slot.installation.bundle();
         let uvs = bundle.uvs();
         let skin = bundle.skin();
+        #[cfg(feature = "dev-tools")]
+        let alloc = self.decision_alloc.take();
         slot.resources.staging.build_with(
-            |quads| skin.build_decision_with(dec, labels, &f, uvs, quads),
+            |quads| {
+                // A development fault: an allocation inside the skin's
+                // build, then a refusal when asked.
+                #[cfg(feature = "dev-tools")]
+                if let Some(refuse) = alloc {
+                    drop(std::hint::black_box(Box::new(0_u8)));
+                    if refuse {
+                        return Err(BuildError::Kind);
+                    }
+                }
+                skin.build_decision_with(dec, labels, &f, uvs, quads)
+            },
             &[],
         )?;
         self.started = Some(start);
@@ -5065,6 +5084,14 @@ impl Renderer {
     #[cfg(any(test, feature = "dev-tools"))]
     pub fn refuse_next_decision(&mut self) {
         self.decision_fault = true;
+    }
+
+    /// Development builds: the next decision build allocates inside the
+    /// skin's build ([`build_decision`](Self::build_decision)), then
+    /// refuses as a skin refuses one when `refuse`.
+    #[cfg(feature = "dev-tools")]
+    pub fn allocate_in_next_decision(&mut self, refuse: bool) {
+        self.decision_alloc = Some(refuse);
     }
 
     /// Development builds: the result frame last built, the skin's quads
