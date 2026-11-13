@@ -2548,6 +2548,7 @@ impl Renderer {
                 };
                 let out = self.publish_staged_chart(&mut pending, token, images);
                 self.pending = Some(pending);
+                self.sync_staged_chart();
                 out
             }
         }
@@ -2758,7 +2759,6 @@ impl Renderer {
         let [stage, back] = uvs;
         let table = ChartTable::new(stage, back).keyed(staged_key);
         pending.chart = Some(table);
-        skin.installation().loading().set_chart_images(Some(table));
         Ok(table)
     }
 
@@ -2799,10 +2799,30 @@ impl Renderer {
                 Some(p) if p.token == token && self.gpu.lost() => Err(RenderError::DeviceLost),
                 Some(p) if p.token == token => {
                     p.chart = Some(ChartTable::ABSENT);
+                    self.sync_staged_chart();
                     Ok(ChartTable::ABSENT)
                 }
                 _ => Err(RenderError::ChartChanged),
             },
+        }
+    }
+
+    /// Copies a play staging's own chart table, keyed with its own key
+    /// ([`staged_chart_key`](Self::staged_chart_key)), into its loading
+    /// presentation, none without one: what its frames draw before its
+    /// commit, absent images included. Nothing for a staging on the
+    /// installed resources, whose presentation is the installed one.
+    fn sync_staged_chart(&mut self) {
+        let Some(p) = self.pending.as_ref() else {
+            return;
+        };
+        if p.token.kind != ScreenKind::Play || !matches!(p.res, PendingRes::Own(_)) {
+            return;
+        }
+        let key = self.staged_chart_key(p.token);
+        if let Some(skin) = &p.skin {
+            let table = p.chart.zip(key).map(|(t, k)| t.keyed(k));
+            skin.installation().loading().set_chart_images(table);
         }
     }
 
@@ -2816,6 +2836,7 @@ impl Renderer {
         if let Some(p) = self.pending.as_mut() {
             p.chart = None;
         }
+        self.sync_staged_chart();
         self.sync_chart();
     }
 
@@ -3378,13 +3399,44 @@ impl Renderer {
         f: &LoadingFrame<'_>,
         text: &MenuText,
     ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
-        let LoadingOn::Staged(token) = on else {
+        let LoadingOn::Staged(_) = on else {
             return self.loading_frame(f, text);
         };
         if text.owner() != self.id {
             return Err(RenderError::OtherRenderersText);
         }
         let start = Instant::now();
+        if let Err(e) = self.build_loading_on(on, f)? {
+            return Ok(Err(e));
+        }
+        let (projection, draw) = match self.pending.as_ref().map(|p| &p.res) {
+            Some(PendingRes::Own(r)) => (r.staging.projection(), Draw::Pending),
+            _ => (self.staging.projection(), Draw::Play),
+        };
+        self.draw_on(start, &[text], projection, draw).map(Ok)
+    }
+
+    /// The app's share of a loading frame of the installation `on` names
+    /// ([`build_loading`](Self::build_loading)): for a staging, its skin
+    /// enters the frame's lifetime and builds `f` into its own staging (or
+    /// the installed one, for the installed bundle restaged) against its
+    /// chart images' key, with no call into wgpu; nothing allocates, the
+    /// refusal included.
+    ///
+    /// # Errors
+    ///
+    /// The outer error is [`RenderError::NotStaged`] for a token the
+    /// renderer does not hold staged for play, its own resources or the
+    /// installed ones. The inner one is the skin's refusal of this frame,
+    /// or of an earlier one of its lifetime: the staging is left empty.
+    pub fn build_loading_on(
+        &mut self,
+        on: LoadingOn,
+        f: &LoadingFrame<'_>,
+    ) -> Result<Result<(), BuildError>, RenderError> {
+        let LoadingOn::Staged(token) = on else {
+            return Ok(self.build_loading(f));
+        };
         let live = self.staged_chart_key(token);
         self.cancel_built();
         if self.loading_refused.is_some_and(|(l, _)| l != f.lifetime) {
@@ -3402,9 +3454,9 @@ impl Renderer {
         let Some(skin) = p.skin.as_mut() else {
             return Err(RenderError::NotStaged);
         };
-        let (staging, draw) = match &mut p.res {
-            PendingRes::Own(r) => (&mut r.staging, Draw::Pending),
-            PendingRes::Installed => (&mut self.staging, Draw::Play),
+        let staging = match &mut p.res {
+            PendingRes::Own(r) => &mut r.staging,
+            PendingRes::Installed => &mut self.staging,
             PendingRes::Layout { .. } | PendingRes::Pages(_) => {
                 return Err(RenderError::NotStaged);
             }
@@ -3420,8 +3472,7 @@ impl Renderer {
             self.loading_refused = Some((f.lifetime, e));
             return Ok(Err(e));
         }
-        let projection = staging.projection();
-        self.draw_on(start, &[text], projection, draw).map(Ok)
+        Ok(Ok(()))
     }
 
     /// Whether `token` names a play staging on its own resources, which its

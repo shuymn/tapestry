@@ -428,6 +428,45 @@ fn staged_loading_lines_move_with_the_commit() {
     assert_eq!(loading_frame(&mut r, &menu), drawn);
 }
 
+/// The committed bundle restaged for another chart (a reused
+/// specialization) draws its staged loading frames from the installed
+/// resources, nothing made or uploaded (the resources' number unchanged),
+/// with the next lifetime's own loading text: drawn once it is installed,
+/// and the very presentation the installed frames draw.
+#[test]
+fn a_reused_specialization_draws_with_no_upload() {
+    let dir = step_skin();
+    let mut r = offscreen(1_920, 1_080);
+    let menu = MenuText::new(&r);
+    let b = outline_support::bundle_in(&r, dir.path(), &default_font());
+    let token = stage(&mut r, &b, &labels("A", "B"), 1);
+    r.commit(token).unwrap();
+    let generation = r.resource_generation();
+    let again = stage(&mut r, &b, &labels("C", "D"), 2);
+    assert_eq!(r.resource_generation(), generation, "restaged in place");
+    let on = render::LoadingOn::Staged(again);
+    assert_eq!(r.loading_text_key_on(on), r.loading_text_key());
+    let lifetime_2 = common::loading_frame(2, TimeUs(0), TimeUs(0));
+    let mut staged = |r: &mut Renderer| {
+        let t = r.loading_frame_on(on, &lifetime_2, &menu).unwrap().unwrap();
+        assert!(t.presented);
+        read_back(r)
+    };
+    let before = staged(&mut r);
+    r.prepare_loading_text_on(on, 2, 1, TextSlots::ALL, &labels("Beta", ""))
+        .unwrap();
+    assert_eq!(r.install_staged_loading_text_on(on), Ok(true));
+    let drawn = staged(&mut r);
+    assert!(lit(&drawn).is_some());
+    assert_ne!(drawn, before, "the lifetime's own text drawn");
+    assert_eq!(r.resource_generation(), generation);
+    assert_eq!(
+        common::loading(&mut r, &menu, &lifetime_2),
+        drawn,
+        "the installed presentation"
+    );
+}
+
 /// The staged loading text and then the installed loading lines keep
 /// their lines while an attempt is staged under pressure: with the
 /// loading lines filling the layer, the attempt's lines evict none of

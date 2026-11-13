@@ -506,6 +506,7 @@ fn frames_do_not_allocate_from_the_first() {
     declarative_frames(&chart, &taps, &overlay, glyphs);
     declarative_lane_frames();
     loading_frames();
+    staged_loading_frames();
     imported_frames(&chart, &overlay, glyphs);
     outline_frames(&chart, &overlay);
     result_frames();
@@ -1114,6 +1115,71 @@ fn loading_frames() {
     });
     assert!(absent.unwrap() > 0);
     assert_eq!(absent_allocs, 0, "a frame with the images absent allocated");
+}
+
+/// A play staging's loading frames, built before its commit
+/// ([`render::Renderer::build_loading_on`]), allocate nothing: the first,
+/// later and refused builds, for a specialization on its own resources
+/// and for the installed bundle restaged on the installed ones.
+fn staged_loading_frames() {
+    let mut r = offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let look = Look {
+        loading: true,
+        chart_text: true,
+        progress: true,
+        ..Look::left([255, 0, 0, 255])
+    };
+    let (installed, _) = bundle(&r, dir.path(), &look);
+    let (own, _) = bundle(&r, dir.path(), &look);
+    let token = r.install(ScreenKind::Play, &installed, 1).unwrap();
+    r.commit(token).unwrap();
+    let chart = ChartBuilder::new(120_000).build().unwrap();
+    let ctx = context(&GAUGES, false);
+    // Each case in a lifetime of its own: the refusal below latches for
+    // its lifetime.
+    for (request, b, what) in [
+        (2, &own, "own resources"),
+        (3, &installed, "installed ones"),
+    ] {
+        let at = |k: i64| common::loading_frame(request, TimeUs(k * FRAME_US), TimeUs(0));
+        let a = attempt(&r, &chart, &ctx);
+        let token = r.stage(b, &a, request).unwrap();
+        let on = render::LoadingOn::Staged(token);
+        r.enter_loading_on(on, request);
+        let (first, first_allocs) = counted(|| r.build_loading_on(on, &at(0)));
+        assert_eq!(first.unwrap(), Ok(()), "{what}");
+        assert_eq!(first_allocs, 0, "the first staged frame allocated: {what}");
+        let (later, later_allocs) = counted(|| {
+            (1..FRAMES)
+                .map(|k| r.build_loading_on(on, &at(k)).map(|b| b.map(|()| 1)))
+                .sum::<Result<Result<usize, BuildError>, render::RenderError>>()
+        });
+        assert!(later.unwrap().unwrap() > 0, "{what}");
+        assert_eq!(later_allocs, 0, "a later staged frame allocated: {what}");
+        let mut bad = at(FRAMES);
+        bad.covers.cover_enabled = true;
+        bad.covers.cover = 100;
+        let (refused, refused_allocs) = counted(|| {
+            let first = r.build_loading_on(on, &bad);
+            (first, r.build_loading_on(on, &at(FRAMES + 1)))
+        });
+        assert!(
+            matches!(
+                refused,
+                (
+                    Ok(Err(BuildError::InvalidReadouts)),
+                    Ok(Err(BuildError::InvalidReadouts))
+                )
+            ),
+            "{what}: {refused:?}"
+        );
+        assert_eq!(
+            refused_allocs, 0,
+            "a refused staged frame allocated: {what}"
+        );
+        r.discard();
+    }
 }
 
 /// A `w`×`h` green picture, read and fitted into `which`'s slot of a
