@@ -3466,6 +3466,12 @@ impl AppRig for PlayerRig<'_> {
         // Another scene: held adjustment controls act no more until
         // pressed afresh.
         self.enter_scene();
+        // A load left before its play (cancelled while decoding or
+        // measuring, refused, or Back) leaves no attempt pending: the
+        // switches a skin turns from here reach the next attachment.
+        if let Some(driver) = &mut self.adjust {
+            driver.invalidate();
+        }
         self.show_cursor(true);
         recover(
             &mut self.result_input,
