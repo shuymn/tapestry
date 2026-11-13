@@ -9874,6 +9874,30 @@ pub(crate) mod tests {
         link.exit();
     }
 
+    /// The draw rule and the drawn skin's declaration allocate nothing: a
+    /// staged, a shorter successor's and a placeholder frame's
+    /// acknowledgements and a commit's declaration, lifetime after
+    /// lifetime.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_drawn_skin_s_declaration_alloc() {
+        let shared = super::Shared::new();
+        let clock = QpcClock::start();
+        let committed = super::Committed::default();
+        shared.presented_loading(1, Some(Some(TimeUs(2_700_000))), || clock.now());
+        let before = crate::alloc_count::this_thread();
+        for lifetime in 2..10 {
+            let drawn = super::presentation_of(&committed, None, None, 0, (None, 1), lifetime);
+            assert_eq!(drawn, super::Presented::Ordinary);
+            shared.presented_loading(lifetime, Some(Some(TimeUs(2_700_000))), || clock.now());
+            shared.presented_loading(lifetime, Some(Some(TimeUs(600_000))), || clock.now());
+            shared.presented_loading(lifetime, None, || clock.now());
+            shared.committed_loading(lifetime, Some(TimeUs(1_500_000)));
+            assert_eq!(shared.loading_ack().loadend, Some(TimeUs(1_500_000)));
+        }
+        assert_eq!(crate::alloc_count::this_thread() - before, 0);
+    }
+
     /// The render thread's acknowledgement of a presented loading frame,
     /// the first of a lifetime and a later one, allocates nothing, nor
     /// does the game thread's read of it.
@@ -14132,6 +14156,190 @@ pub(crate) mod tests {
         link.exit();
     }
 
+    /// A staging answered and committed before any loading frame drew it
+    /// (its lifetime held, drawing nothing) is declared by the commit, in
+    /// the lifetime its request was published in.
+    #[test]
+    fn a_commit_before_any_staged_frame_declares_at_the_commit() {
+        let (chart, screens, link) = pending_link();
+        link.begin_loading_held(&chosen("One"), None);
+        assert_eq!(
+            specialized(
+                &link,
+                &chart,
+                &bundle_declaring(None, Some(TimeUs(2_700_000)))
+            )
+            .unwrap(),
+            Preparation::Ready
+        );
+        assert_eq!(link.loading_loadend(), None, "no frame drew it");
+        link.commit_attempt().unwrap();
+        assert_eq!(link.loading_loadend(), Some(TimeUs(2_700_000)));
+        assert!(screens.staged_frames.lock().unwrap().is_empty());
+        link.reveal_loading();
+        assert!(wait_until(|| link.loading_acked() >= 2));
+        assert_eq!(link.loading_loadend(), Some(TimeUs(2_700_000)));
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// Each drop of a staging stops its drawing from the next frame: its
+    /// discard, a newer request (the staging superseded while the newer
+    /// one is unanswered) and a skin selection's `pend` each send the
+    /// lifetime's frames back to the pending presentation, never R's token
+    /// again; a late discard of an older request, unanswered, leaves the
+    /// newer staging drawn.
+    #[test]
+    fn each_drop_of_a_staging_stops_its_drawing() {
+        let drops: [(&str, Box<dyn Fn(&super::RenderLink, &Installers, &Chart)>); 3] =
+            [
+                ("discard", Box::new(|link, _, _| link.discard_attempt())),
+                (
+                    "newer request",
+                    Box::new(|link, screens, chart| {
+                        let next = link.requests.load(Ordering::Relaxed) + 1;
+                        screens.hold_staged.store(next, Ordering::Release);
+                        std::mem::forget(link.begin_attempt(
+                            titled(chart),
+                            super::AttemptSkin::Specialized(bundle()),
+                        ));
+                    }),
+                ),
+                (
+                    "pend",
+                    Box::new(|link, _, _| {
+                        assert_eq!(
+                            link.pend(ScreenKind::Play).wait().unwrap(),
+                            Preparation::Ready
+                        );
+                    }),
+                ),
+            ];
+        for (name, drop_it) in drops {
+            let (chart, screens, link) = pending_link();
+            let staged = || screens.staged_frames.lock().unwrap().clone();
+            let pending = || screens.pending.load(Ordering::Acquire);
+            link.loading().show(one_line("one"));
+            assert!(wait_until(|| pending() >= 2), "{name}");
+            assert_eq!(
+                specialized(&link, &chart, &bundle()).unwrap(),
+                Preparation::Ready
+            );
+            assert!(wait_until(|| staged().len() >= 2), "{name}");
+            drop_it(&link, &screens, &chart);
+            let p = pending();
+            assert!(wait_until(|| pending() >= p + 3), "{name}");
+            let after = staged().len();
+            let p = pending();
+            assert!(wait_until(|| pending() >= p + 3), "{name}");
+            assert!(staged().len() <= after + 1, "{name}: {:?}", staged());
+            screens.hold_staged.store(0, Ordering::Release);
+            link.end_loading().unwrap();
+            link.exit();
+        }
+
+        // A late discard of an older, unanswered request leaves R2 drawn.
+        let (chart, screens, link) = pending_link();
+        let staged = || screens.staged_frames.lock().unwrap().clone();
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| screens.pending.load(Ordering::Acquire) >= 2));
+        let r1 = link.requests.load(Ordering::Relaxed) + 1;
+        screens.hold_staged.store(r1, Ordering::Release);
+        let older = link.begin_attempt(titled(&chart), super::AttemptSkin::Specialized(bundle()));
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| staged().len() >= 2));
+        let r2 = staged().last().unwrap().1;
+        assert_ne!(r2, r1);
+        drop(older);
+        let n = staged().len();
+        assert!(wait_until(|| staged().len() >= n + 3), "R2 still drawn");
+        assert!(staged().iter().all(|&(_, r)| r == r2));
+        screens.hold_staged.store(0, Ordering::Release);
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A staging whose device is lost is never drawn on the screen built
+    /// again: the lifetime's frames draw the pending presentation until a
+    /// staging on the new device is answered, which draws.
+    #[test]
+    fn a_lost_device_never_draws_the_old_staging() {
+        let (chart, screens, link) = pending_link();
+        let staged = || screens.staged_frames.lock().unwrap().clone();
+        let pending = || screens.pending.load(Ordering::Acquire);
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| pending() >= 2));
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| staged().len() >= 2));
+        let old = staged().last().unwrap().1;
+        let builds = screens.builds.load(Ordering::Acquire);
+        screens.fail.store(true, Ordering::Release);
+        assert!(wait_until(|| link.failed()));
+        screens.fail.store(false, Ordering::Release);
+        // Built again, as the loading wait builds a lost screen.
+        link.prepare().unwrap();
+        assert!(screens.builds.load(Ordering::Acquire) > builds);
+        // The lifetime's page shown again on it.
+        link.loading().show(one_line("one"));
+        let p = pending();
+        assert!(
+            wait_until(|| pending() >= p + 3),
+            "the pending presentation"
+        );
+        let n = staged().len();
+        let p = pending();
+        assert!(wait_until(|| pending() >= p + 3));
+        assert!(staged().len() <= n, "{:?}", staged());
+        // Staged again on the new device: drawn.
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| staged().len() >= n + 2));
+        assert!(staged().last().unwrap().1 > old);
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
+    /// A result skin selected while a play staging is drawn supersedes the
+    /// attempt first: the staging is released, the frames go back to the
+    /// pending presentation, and the attempt's commit finds nothing staged.
+    #[test]
+    fn a_result_selection_supersedes_a_drawn_staging() {
+        let (chart, screens, link) = pending_link();
+        let staged = || screens.staged_frames.lock().unwrap().len();
+        let pending = || screens.pending.load(Ordering::Acquire);
+        link.loading().show(one_line("one"));
+        assert!(wait_until(|| pending() >= 2));
+        assert_eq!(
+            specialized(&link, &chart, &bundle()).unwrap(),
+            Preparation::Ready
+        );
+        assert!(wait_until(|| staged() >= 2));
+        assert_eq!(
+            link.select(ScreenKind::Result, Some(bundle()))
+                .wait()
+                .unwrap(),
+            Preparation::Ready
+        );
+        assert!(screens.staging.lock().unwrap().is_none(), "released");
+        let p = pending();
+        assert!(wait_until(|| pending() >= p + 3));
+        let n = staged();
+        let p = pending();
+        assert!(wait_until(|| pending() >= p + 3));
+        assert!(staged() <= n + 1);
+        assert!(link.commit_attempt().is_err(), "nothing staged");
+        link.end_loading().unwrap();
+        link.exit();
+    }
+
     /// L5: a pending play skin's base import stops at the fact it reads,
     /// inside the configured pass and before the skin's table exists, so
     /// it declares no loading time: until a specialization is drawn in the
@@ -14181,13 +14389,14 @@ pub(crate) mod tests {
     #[test]
     fn a_timed_out_commit_declares_its_loading_time_from_the_receipt() {
         let (chart, _screens, mut link) = pending_link();
-        link.loading().show(one_line("one"));
-        assert!(wait_until(|| link.loading_acked() >= 2));
+        // Held: no loading frame draws the staging before the commit.
+        link.begin_loading_held(&chosen("One"), None);
         let declared = bundle_declaring(None, Some(TimeUs(3_000_000)));
         assert_eq!(
             specialized(&link, &chart, &declared).unwrap(),
             Preparation::Ready
         );
+        assert_eq!(link.loading_loadend(), None, "no frame drew it");
         /// Lets the render thread go when dropped, the test failing
         /// included.
         struct Hold(Arc<super::Shared>);
