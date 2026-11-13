@@ -148,8 +148,22 @@ const fn volume_at(v: i32) -> [i32; 2] {
     [1_050 + v / 5, 630]
 }
 
+/// The point of slider 18 (the key volume) at `v` per mille, over slot 4.
+const fn key_at(v: i32) -> [i32; 2] {
+    [1_050 + v / 5, 540]
+}
+
+/// The point of slider 19 (the background volume) at `v` per mille, over
+/// slot 5.
+const fn background_at(v: i32) -> [i32; 2] {
+    [1_400 + v / 5, 640]
+}
+
 /// The system volume the rig plays at: slider 17 shows it.
 const GAIN: f32 = 0.45;
+/// The key and background volumes the rig plays at: sliders 18 and 19.
+const KEY: f32 = 0.2;
+const BACKGROUND: f32 = 0.999;
 
 /// The settings a selection skin shows, which slider 17 needs to draw; the
 /// gain it shows is the rig's ([`GAIN`]).
@@ -157,6 +171,8 @@ fn shown() -> skin_model::SelectionSettings {
     skin_model::SelectionSettings {
         display_offset_ms: 0,
         system_volume: skin_model::VolumeReading::of_gain(GAIN),
+        key_volume: skin_model::VolumeReading::of_gain(KEY),
+        background_volume: skin_model::VolumeReading::of_gain(BACKGROUND),
         speed: skin_model::SpeedView::Classic,
         order: skin_model::SelectionOrder::Title,
         gauge: None,
@@ -220,6 +236,8 @@ fn on_pointer_from<R>(
     let settings = game::Settings {
         device: game::DeviceSettings {
             system_volume: GAIN,
+            key_volume: KEY,
+            background_volume: BACKGROUND,
             ..game::DeviceSettings::default()
         },
         player: game::PlayerSettings::default(),
@@ -738,37 +756,43 @@ fn an_event_with_no_contract_takes_the_press() {
     });
 }
 
-/// P7: before K-b, slider 17 takes a press or a drag over the row under
-/// it and changes nothing: the gain stays and the cursor stays off that
-/// row; with slider 17 not drawn, the same press moves to the row.
+/// P7: the volume sliders 17, 18 and 19 each take a press or a drag over
+/// the row under it and change nothing: each volume stays and the cursor
+/// stays off that row; with no volume slider drawn, the same press moves
+/// to the row.
 #[test]
 fn the_volume_slider_takes_the_press_and_changes_nothing() {
-    for volume in [true, false] {
-        let dir = tempfile::tempdir().unwrap();
-        let (sel, _) = charts(dir.path(), 3);
-        on_pointer(sel, volume, None, |rig, w, screens| {
-            let c = rig.controls;
-            // Slot 5 holds the third row (2).
-            w.click(c, volume_at(500), Button::Left);
-            act(rig, screens);
-            if !volume {
-                assert_eq!(log(rig), [(Press(MoveTo(2)), 2)]);
-                return;
-            }
-            assert_eq!(log(rig), [(Press(Nothing), 0)]);
-            // A drag from 1.0 to 0.2.
-            w.down(c, volume_at(1_000), Button::Left);
-            act(rig, screens);
-            w.to(c, volume_at(200));
-            dragged(rig, screens);
-            w.up(c, Button::Left);
-            assert_eq!(log(rig), [(Press(Nothing), 0), (Drag(Nothing), 0)]);
-            assert_eq!(rig.controls.tuning().volume(game::Channel::System), GAIN);
-            assert_eq!(
-                sel_of(rig).feed.settings.map(|s| s.system_volume),
-                Some(skin_model::VolumeReading::of_gain(GAIN))
-            );
-        });
+    // Each slider's point at `v` per mille, and the row under it: slots 5
+    // and 4 hold the third (2) and second (1) rows.
+    type At = fn(i32) -> [i32; 2];
+    let sliders: [(At, usize); 3] = [(volume_at, 2), (key_at, 1), (background_at, 2)];
+    for (at, row) in sliders {
+        for volume in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let (sel, _) = charts(dir.path(), 3);
+            on_pointer(sel, volume, None, |rig, w, screens| {
+                let c = rig.controls;
+                w.click(c, at(500), Button::Left);
+                act(rig, screens);
+                if !volume {
+                    assert_eq!(log(rig), [(Press(MoveTo(row)), row)]);
+                    return;
+                }
+                assert_eq!(log(rig), [(Press(Nothing), 0)]);
+                // A drag from 1.0 to 0.2.
+                w.down(c, at(1_000), Button::Left);
+                act(rig, screens);
+                w.to(c, at(200));
+                dragged(rig, screens);
+                w.up(c, Button::Left);
+                assert_eq!(log(rig), [(Press(Nothing), 0), (Drag(Nothing), 0)]);
+                let tuning = rig.controls.tuning();
+                assert_eq!(tuning.volume(game::Channel::System), GAIN);
+                assert_eq!(tuning.volume(game::Channel::Key), KEY);
+                assert_eq!(tuning.volume(game::Channel::Background), BACKGROUND);
+                assert_eq!(sel_of(rig).feed.settings, Some(shown()));
+            });
+        }
     }
 }
 
@@ -961,8 +985,8 @@ fn the_search_text_takes_focus_and_a_press_outside_takes_it_away() {
 /// act: a press on a row, on event 15, on empty space (right) or in search
 /// text 30, a notch and a drag on the list slider do nothing; event 331
 /// turns LIFT over on the chart under the cursor without moving to the row
-/// under it; slider 17 takes the press over the row under it and changes
-/// nothing; the hover image still draws under the pointer. With the search box focused, SELECT held opens
+/// under it; sliders 17 and 18 take the press over the row under them and
+/// change nothing; the hover image still draws under the pointer. With the search box focused, SELECT held opens
 /// no panel (design.md "Input"): a press on empty space acts as without
 /// one, taking the focus away, and the panel opens with it.
 #[test]
@@ -1035,6 +1059,14 @@ fn under_a_panel_only_the_order_button_and_the_covers_act() {
         w.up(c, Button::Left);
         assert_eq!(log(rig), [(Press(Nothing), 1), (Drag(Nothing), 1)]);
         assert_eq!(rig.controls.tuning().volume(game::Channel::System), GAIN);
+        // Slider 18 over row 1 dragged to 0.3.
+        w.down(c, key_at(500), Button::Left);
+        act(rig, screens);
+        w.to(c, key_at(300));
+        dragged(rig, screens);
+        w.up(c, Button::Left);
+        assert_eq!(log(rig), [(Press(Nothing), 1), (Drag(Nothing), 1)]);
+        assert_eq!(rig.controls.tuning().volume(game::Channel::Key), KEY);
         // The hover image draws under the pointer, and not away from it.
         w.to(c, HOVER);
         frames(screens, 2);

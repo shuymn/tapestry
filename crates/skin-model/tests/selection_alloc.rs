@@ -251,6 +251,10 @@ fn settings(ms: i64) -> SelectionSettings {
     SelectionSettings {
         display_offset_ms: i32::try_from(ms).unwrap() - 1_000,
         system_volume: VolumeReading::of_gain(f32::from(u8::try_from(k % 101).unwrap()) / 100.0),
+        key_volume: VolumeReading::of_gain(f32::from(u8::try_from(k % 101).unwrap()) / 100.0),
+        background_volume: VolumeReading::of_gain(
+            f32::from(u8::try_from(k % 101).unwrap()) / 100.0,
+        ),
         speed: if k % 2 == 0 {
             SpeedView::Classic
         } else {

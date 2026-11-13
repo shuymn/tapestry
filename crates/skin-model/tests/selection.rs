@@ -1761,6 +1761,8 @@ fn the_selected_charts_class_reads_before_the_settings() {
     let settings = skin_model::SelectionSettings {
         display_offset_ms: -7,
         system_volume: skin_model::VolumeReading::of_gain(0.5),
+        key_volume: skin_model::VolumeReading::of_gain(0.5),
+        background_volume: skin_model::VolumeReading::of_gain(0.5),
         speed: skin_model::SpeedView::Classic,
         order: skin_model::SelectionOrder::Title,
         gauge: None,

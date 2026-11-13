@@ -15735,6 +15735,8 @@ pub(crate) mod tests {
         let settings = skin_model::SelectionSettings {
             display_offset_ms: 0,
             system_volume: skin_model::VolumeReading::of_gain(0.0),
+            key_volume: skin_model::VolumeReading::of_gain(0.0),
+            background_volume: skin_model::VolumeReading::of_gain(0.0),
             speed: skin_model::SpeedView::Classic,
             order: skin_model::SelectionOrder::Title,
             gauge: None,

@@ -30,6 +30,11 @@ pub enum RatioSource {
     /// ([`VolumeReading::ratio`](crate::VolumeReading::ratio)); none before
     /// the settings.
     SystemVolume,
+    /// The key volume that plays, exactly; none before the settings.
+    KeyVolume,
+    /// The background volume that plays, exactly; none before the
+    /// settings.
+    BackgroundVolume,
     /// A play's score rate: a play skin's source, and only a play skin's,
     /// as the two below.
     Score(ScoreRate),
@@ -67,6 +72,8 @@ impl RatioSource {
             | Self::JudgeRate(_)
             | Self::ComboRate
             | Self::SystemVolume
+            | Self::KeyVolume
+            | Self::BackgroundVolume
             | Self::Score(_) => None,
         }
     }
