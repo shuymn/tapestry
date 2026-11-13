@@ -540,10 +540,10 @@ fn dispose<R: Rig>(loaded: &mut Loaded, rig: &mut R, start: Option<PlayStart>) {
 /// The commit, the end of loading and the last look: `false` when the
 /// player quit or closed before the end of loading or at the last look.
 ///
-/// A pending play skin's specialization declares its loading time only
-/// once committed in the lifetime (design.md "Rendering and Skins", the
-/// pending presentation), so the minimum is looked at again after the
-/// commit. While it still runs, tuning acceptance reopens and the loading
+/// A pending play skin's specialization declares its loading time from
+/// its first loading frame, or at the commit when no frame drew it before
+/// (design.md "Rendering and Skins", the pending presentation), so the
+/// minimum is looked at again after the commit. While it still runs, tuning acceptance reopens and the loading
 /// state waits as before the opening; then acceptance closes again on a
 /// fresh copy, which must be quiet and past the minimum at one time
 /// (else it reopens and waits on) and becomes the starting settings. The

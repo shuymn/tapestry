@@ -713,9 +713,10 @@ struct Pending {
     /// installed ones.
     loading: Holder,
     /// The chart images published into its own array
-    /// ([`ChartTarget::Staged`]), of no array yet: its commit keys them
-    /// with the generation it makes, so they are valid from the commit
-    /// on, and a discard drops them with it.
+    /// ([`ChartTarget::Staged`]), keyed at publication with its own key
+    /// ([`Renderer::staged_chart_key`]), which its commit keeps: its
+    /// loading frames draw them before the commit and the installed ones
+    /// after it, and a discard drops them with it.
     chart: Option<skin_model::chart_image::ChartTable>,
 }
 
@@ -2264,12 +2265,12 @@ impl Renderer {
                 if let Some(skin) = pending.skin {
                     self.activate_decl_skin(skin);
                 }
-                // Images published into the staged array, keyed only now:
-                // after the activation, the live key names the incoming
-                // installation and its atlas with the generation this
-                // commit made (before it, `installed` was still the
-                // outgoing one), so the attempt takes them from its commit
-                // on (S10-12 design P12).
+                // Images published into the staged array, keyed for it at
+                // publication: after the activation the live key names the
+                // incoming installation, its atlas and the resources' number
+                // the commit kept, the same key, so the attempt takes them
+                // from its commit on with nothing written again
+                // (S10-12 design P12).
                 if let Some(table) = staged_chart
                     && let Some(key) = self.chart_key()
                 {
@@ -2561,8 +2562,8 @@ impl Renderer {
     ///
     /// `target` names the array: the committed installation's, or a staged
     /// installation's own ([`ChartTarget::Staged`]), whose table is held
-    /// with the staging, of no array, and keyed at its commit; a staging's
-    /// table is not presented before it, so step 1 there only drops it.
+    /// with the staging under the staging's own key and drawn by its
+    /// loading presentation from then on; its commit keeps the key.
     ///
     /// # Errors
     ///
