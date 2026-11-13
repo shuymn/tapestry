@@ -1,11 +1,13 @@
 //! The selection profile (docs/stage3.md §3, Selection): one explicit
 //! `match` per id space over every id the surveyed selection skins read,
 //! each classified. **N** ids are bridged from the selection schema, the
-//! player's settings among them (read-only); **E** ids (actions, and
-//! settings with no native equivalent) are unavailable, drawing nothing
-//! with a note; **D** ids are a truthful constant or an omission with a
-//! note. An id outside the survey
-//! follows the existing rules of its space: an option the source's
+//! player's settings among them (read-only), and the native actions;
+//! **E** ids (actions and settings with no native equivalent yet) are
+//! unavailable, drawing nothing with a note; **D** ids are a truthful
+//! constant or an omission with a note. An action of any class is a
+//! pointer target that takes the press: an N action runs, an E or D one
+//! does nothing, noted as unavailable or as ignored. An id outside the
+//! survey follows the existing rules of its space: an option the source's
 //! factory knows is unsupported, one neither built in nor declared never
 //! draws, and an unknown number, text or image index is unsupported by
 //! its role or resolves to nothing as the factory's does.
@@ -428,14 +430,15 @@ pub(crate) fn graph(ty: i32) -> Option<Class<RatioSource>> {
     })
 }
 
-/// The selection event `id`: an image's `act` or `click`, a
-/// `customEvents` action. None has a hit target before the native
-/// actions exist.
+/// The selection event `id`: an image's `act`, a `customEvents` action.
+/// Each is a pointer target that takes the press; only an N event acts.
 pub(crate) fn event(id: i32) -> Option<Class<()>> {
-    use Class::{Omit, Unavailable};
+    use Class::{Bridge, Omit, Unavailable};
     Some(match id {
-        // Sort, play, practice and the cover actions.
-        12 | 15 | 315 | 330..=332 => Unavailable,
+        // Sort, play and practice.
+        12 | 15 | 315 => Bridge(()),
+        // The cover actions, which the settings panel will back.
+        330..=332 => Unavailable,
         // No native contract.
         11 | 13 | 14 | 16 | 17 | 19 | 308 | 316..=318 | 340..=342 => Omit,
         _ => return None,
@@ -572,13 +575,13 @@ mod tests {
 
     const EVENT: &[(i32, i32, C)] = &[
         (11, 11, C::D),
-        (12, 12, C::E),
+        (12, 12, C::N),
         (13, 14, C::D),
-        (15, 15, C::E),
+        (15, 15, C::N),
         (16, 17, C::D),
         (19, 19, C::D),
         (308, 308, C::D),
-        (315, 315, C::E),
+        (315, 315, C::N),
         (316, 318, C::D),
         (330, 332, C::E),
         (340, 342, C::D),

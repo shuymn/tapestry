@@ -2,7 +2,7 @@
 //! exact ratio of its axis, or moved along a slider's travel by it. A
 //! slider never changes state: a press on it gives the ratio under the
 //! pointer as a command for the screen to carry out
-//! ([`Skin::slider_at`](crate::Skin::slider_at)).
+//! ([`Skin::drag_at`](crate::Skin::drag_at), [`Skin::hit_at`](crate::Skin::hit_at)).
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 

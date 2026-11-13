@@ -1288,3 +1288,71 @@ fn the_runtime_reads_number_27_from_the_prepared_frame() {
         assert_eq!(s.digits(0).trim_start_matches('0'), want, "{uptime_us}");
     }
 }
+
+/// Number 27 through the kept VM on the result's production sequence: a
+/// callback no expression represents (a division) is routed to the
+/// runtime; the frame prepared with the application's readouts, the
+/// runtime run over that state, then the build of the same frame draws
+/// the callback's whole hours, following each frame's readouts.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_result_runtime_reads_number_27_from_the_prepared_frame() {
+    untimed();
+    let tables = "local ms = require(\"main_state\")\n\
+        skin.value[2] = { id = \"r\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, \
+            digit = 4, value = function() return ms.number(27) / 1 end }";
+    let dsts = "{ id = \"r\", dst = { { x = 0, y = 120, w = 4, h = 8 } } },";
+    let d = common::result::sheet();
+    common::write(
+        d.path(),
+        "s.luaskin",
+        common::result::graph_lua(tables, dsts).as_bytes(),
+    );
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let facts = common::result::facts(None);
+    let LuaOutcome::Imported(mut i) = h
+        .import_runtime(&Config::defaults(h.header()), &facts, &cancel)
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        i.callbacks
+            .iter()
+            .filter(|d| **d == Disposition::Runtime)
+            .count(),
+        1,
+        "{:?}",
+        i.callbacks
+    );
+    let mut rt = i.runtime.take().expect("a runtime");
+    let mut r = common::result::Res::new(i.imported.skin);
+    r.view(&common::result::ready(
+        1_000,
+        true,
+        skin_model::BestView::Unavailable,
+    ));
+    let top = 1_080.0 - 120.0 - 8.0;
+    for (k, (uptime_us, want)) in [(3_725_999_000, "1"), (7_200_000_000, "2")]
+        .into_iter()
+        .enumerate()
+    {
+        let ms = i64::try_from(k).unwrap() * 16;
+        r.app = skin_model::AppReadouts {
+            uptime_us,
+            ..skin_model::AppReadouts::LAUNCH
+        };
+        r.skin
+            .prepare_result_frame(&mut r.res, bms_model::TimeUs(ms * 1_000), &r.timers, &r.app)
+            .unwrap();
+        let (fields, timers) = r.res.runtime_parts();
+        rt.frame(fields, timers);
+        assert_eq!(rt.status()[0], CallStatus::Ok, "{uptime_us}");
+        assert_eq!(
+            r.digits(ms, top).trim_start_matches('0'),
+            want,
+            "{uptime_us}"
+        );
+    }
+}

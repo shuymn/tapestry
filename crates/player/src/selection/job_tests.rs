@@ -146,6 +146,8 @@ fn bench_on(coord: Coordinator, dir: &Path, decodes: Decodes, spawner: Spawner) 
         screen: SelectScreen::new(Vec::new()),
         menu: Arc::new(MenuQueue::default()),
         dropped: 0,
+        pointer: crate::pointer::PointerPass::default(),
+        dropped_pointer: 0,
         feed: crate::selection_skin::SkinFeed::default(),
         preset_refusal: false,
         ime: None,

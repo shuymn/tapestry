@@ -356,6 +356,12 @@ pub struct Selection {
     pub menu: Arc<MenuQueue>,
     /// The window's keys the queue dropped, as last reported.
     pub dropped: u64,
+    /// The pointer's side on the game thread: its shared state and the
+    /// batch in flight.
+    pub pointer: crate::pointer::PointerPass,
+    /// The pointer's presses and notches the queue refused, as last
+    /// reported.
+    pub dropped_pointer: u64,
     /// Whether the notice shown is a refusal because the shelf of presets
     /// would not open: it goes once the shelf opens.
     pub preset_refusal: bool,
@@ -496,6 +502,9 @@ impl Selection {
                 None
             }
             Acted::Focus(on) => {
+                // Given or taken, the focus is no box's until a press on
+                // one names it ([`Self::dispatch_pointer`]).
+                self.pointer.search_box = None;
                 if let Some(ime) = &self.ime {
                     ime.set(on);
                 }
@@ -540,21 +549,8 @@ impl Selection {
             );
         }
         pad.report_dropped("select");
-        while let Some(input) = self.menu.pop() {
-            let shown = self.shown_panel();
-            let acts = match input {
-                MenuInput::Key(key) => crate::select::acts_under_panel(key, shown),
-                MenuInput::Pad { panel, .. } => shown
-                    .or(panel.filter(|_| !self.screen.searching()))
-                    .is_none(),
-                MenuInput::Text(_) | MenuInput::Preedit(_) => true,
-            };
-            if !acts {
-                continue;
-            }
-            if let Some(pick) = self.take_reading(input, level, now) {
-                return Some(pick);
-            }
+        if let Some(pick) = self.pass(level, now) {
+            return Some(pick);
         }
         if self.search_pending {
             self.refresh();
@@ -568,6 +564,208 @@ impl Selection {
             eprintln!("{line}");
             log::warn!("{line}");
             self.dropped = dropped;
+        }
+        let refused = self.pointer.shared.dropped();
+        if refused > self.dropped_pointer {
+            let line = format!(
+                "select: {} pointer presses or notches refused, the window's queue was full",
+                refused - self.dropped_pointer
+            );
+            eprintln!("{line}");
+            log::warn!("{line}");
+            self.dropped_pointer = refused;
+        }
+        None
+    }
+
+    /// One pass over the queue (design.md "Input", **Pointer input**): the
+    /// answers of the batch in flight first, once the render thread has
+    /// answered it, then at most [`MENU_PASS`](crate::select::MENU_PASS)
+    /// entries in order, a run of pointer entries handed to the render
+    /// thread as one batch, after which nothing more is taken until it is
+    /// answered (the barrier); then a drag, once no batch is in flight and
+    /// the press that began its hold was dispatched.
+    fn pass(&mut self, level: Option<&input::PanelLevel>, now: TimeUs) -> Option<Pick> {
+        if self.pointer.take() == crate::pointer::Taken::Waiting {
+            return None;
+        }
+        // The answers in order; a pick leaves the rest for the next pass,
+        // which dispatches them if the pick was refused and selection
+        // stays.
+        while let Some((slot, built)) = self.pointer.next_answer() {
+            if let Some(pick) = self.dispatch_pointer(slot, built, level, now) {
+                return Some(pick);
+            }
+        }
+        let mut taken = 0;
+        while taken < crate::select::MENU_PASS {
+            if self.menu.front_is_pointer() {
+                let menu = &self.menu;
+                let mut left = crate::select::MENU_PASS - taken;
+                self.pointer.flight = self.pointer.shared.submit(self.feed.lifetime, || {
+                    while left > 0 && menu.front_is_pointer() {
+                        left -= 1;
+                        match menu.pop_observed() {
+                            Some(Some((input, _))) => {
+                                return crate::pointer::PointerRequest::of(&input);
+                            }
+                            Some(None) => {}
+                            None => return None,
+                        }
+                    }
+                    None
+                });
+                taken = crate::select::MENU_PASS - left;
+                if self.pointer.flight.is_some() {
+                    return None;
+                }
+                continue;
+            }
+            let Some(entry) = self.menu.pop_observed() else {
+                break;
+            };
+            taken += 1;
+            let Some((input, _)) = entry else {
+                continue;
+            };
+            let shown = self.shown_panel();
+            let acts = match input {
+                MenuInput::Key(key) => crate::select::acts_under_panel(key, shown),
+                MenuInput::Pad { panel, .. } => shown
+                    .or(panel.filter(|_| !self.screen.searching()))
+                    .is_none(),
+                MenuInput::Text(_) | MenuInput::Preedit(_) => true,
+                // The pointer's are taken as batches above.
+                MenuInput::Pointer { .. } | MenuInput::Wheel { .. } => false,
+            };
+            if !acts {
+                continue;
+            }
+            let pick = self.take_reading(input, level, now);
+            #[cfg(test)]
+            self.dispatched(crate::pointer::Dispatched::Input);
+            if pick.is_some() {
+                return pick;
+            }
+        }
+        if let Some(drag) = self.pointer.shared.take_drag(self.menu.presses_taken()) {
+            self.refresh_pending();
+            let facts = self.pointer_facts();
+            let act = crate::pointer::resolve_drag(&drag, &facts);
+            let pick = self.pointer_act(act, level, now);
+            #[cfg(test)]
+            self.dispatched(crate::pointer::Dispatched::Drag(act));
+            return pick;
+        }
+        None
+    }
+
+    /// Records a dispatched input and the cursor after it, while the log
+    /// is kept (tests).
+    #[cfg(test)]
+    fn dispatched(&mut self, what: crate::pointer::Dispatched) {
+        let cursor = self.screen.cursor();
+        if let Some(log) = &mut self.pointer.log {
+            log.push((what, cursor));
+        }
+    }
+
+    /// What the select screen is to a pointer input now.
+    fn pointer_facts(&self) -> crate::pointer::Facts {
+        // The panel the screen shows: none while the search box has
+        // focus, where the pointer acts as without a panel.
+        let held = self.shown_panel();
+        crate::pointer::Facts {
+            lifetime: self.feed.lifetime,
+            word: self.pointer.shared.word(),
+            list_revision: self.feed.list_revision,
+            count: self.screen.selectable(),
+            cursor: self.screen.cursor(),
+            searching: self.screen.searching(),
+            search_box: self.pointer.search_box,
+            composing: self.screen.composing(),
+            panel: held.is_some(),
+        }
+    }
+
+    /// A changed search or order is searched before a pointer input, which
+    /// acts on the list it makes (a row drawn before it is then stale).
+    fn refresh_pending(&mut self) {
+        if self.search_pending {
+            self.refresh();
+        }
+    }
+
+    /// Acts on one answered press or notch.
+    fn dispatch_pointer(
+        &mut self,
+        slot: crate::pointer::PointerSlot,
+        built: Option<crate::pointer::Built>,
+        level: Option<&input::PanelLevel>,
+        now: TimeUs,
+    ) -> Option<Pick> {
+        self.refresh_pending();
+        let facts = self.pointer_facts();
+        let screen = &self.screen;
+        let press = skin_model::PressHit {
+            hit: slot.hit,
+            inside_search: slot.inside_search,
+        };
+        let resolved = crate::pointer::resolve(slot.request, press, built, &facts, |i| {
+            screen.row_kind_at(i)
+        });
+        if resolved.unfocus {
+            // As Tab in the box: the focus goes, and the IME with it.
+            let _ = self.take_reading(MenuInput::Key(MenuKey::Tab), level, now);
+        }
+        let pick = self.pointer_act(resolved.act, level, now);
+        // A press that focused a search box names it: its bounds keep the
+        // focus from here.
+        if let (
+            crate::pointer::PointerAct::Key(MenuKey::Tab),
+            Some(skin_model::PointerHit::Search { index }),
+        ) = (resolved.act, slot.hit)
+            && self.screen.searching()
+        {
+            self.pointer.search_box = Some(index);
+        }
+        #[cfg(test)]
+        self.dispatched(match slot.request {
+            crate::pointer::PointerRequest::Press { .. } => {
+                crate::pointer::Dispatched::Press(resolved.act)
+            }
+            crate::pointer::PointerRequest::Wheel { .. } => {
+                crate::pointer::Dispatched::Notch(resolved.act)
+            }
+        });
+        pick
+    }
+
+    /// Carries out what a pointer input does.
+    fn pointer_act(
+        &mut self,
+        act: crate::pointer::PointerAct,
+        level: Option<&input::PanelLevel>,
+        now: TimeUs,
+    ) -> Option<Pick> {
+        let to = match act {
+            crate::pointer::PointerAct::Nothing => return None,
+            crate::pointer::PointerAct::Key(key) => {
+                return self.take_reading(MenuInput::Key(key), level, now);
+            }
+            crate::pointer::PointerAct::MoveTo(index) => index,
+            crate::pointer::PointerAct::Rows(rows) => {
+                let last = self.screen.selectable().saturating_sub(1);
+                let rows_abs = usize::try_from(rows.unsigned_abs()).unwrap_or(usize::MAX);
+                if rows < 0 {
+                    self.screen.cursor().saturating_sub(rows_abs)
+                } else {
+                    self.screen.cursor().saturating_add(rows_abs).min(last)
+                }
+            }
+        };
+        if self.screen.move_to(to) {
+            self.dirty = true;
         }
         None
     }
@@ -1814,6 +2012,16 @@ fn hold(
 }
 
 impl PlayerRig<'_> {
+    /// Selection is left (the decision screen, loading or the practice
+    /// page): nothing of it is drawn again, and the window queues no
+    /// pointer input until the next entry, nothing in flight dispatched.
+    fn left_selection(&mut self) {
+        self.render.leave_selection();
+        if let Some(sel) = &mut self.selection {
+            sel.pointer.leave();
+        }
+    }
+
     /// The release barrier (design.md "Load Pipeline"), on the game thread
     /// before a bank decode begins: every earlier bank's owners go first.
     /// The scoped jobs of the previous load were joined when it returned;
@@ -2924,7 +3132,7 @@ impl AppRig for PlayerRig<'_> {
         // loading state until released, and steps nothing.
         self.begin_loading_epoch();
         // Selection is left: nothing of it is drawn again.
-        self.render.leave_selection();
+        self.left_selection();
         let Some(sel) = &mut self.selection else {
             return;
         };
@@ -2967,7 +3175,7 @@ impl AppRig for PlayerRig<'_> {
         if let Some(ime) = self.selection.as_ref().and_then(|s| s.ime.as_ref()) {
             ime.set(false);
         }
-        self.render.leave_selection();
+        self.left_selection();
         let (Pick::Play(chart) | Pick::Practice(chart)) = pick;
         let Some(sel) = &mut self.selection else {
             return d;
@@ -3181,6 +3389,7 @@ impl AppRig for PlayerRig<'_> {
         // Another scene: held adjustment controls act no more until
         // pressed afresh.
         self.enter_scene();
+        self.show_cursor(true);
         recover(
             &mut self.result_input,
             Owner::Select,
@@ -3201,6 +3410,8 @@ impl AppRig for PlayerRig<'_> {
         // A panel held at the entry opens with it.
         sel.panels(self.panels.as_ref(), now);
         self.render.enter_selection(sel.feed.lifetime);
+        // The window takes the pointer for this lifetime from now on.
+        sel.pointer.enter(sel.feed.lifetime);
         println!("select: {} charts listed", sel.screen.listed());
         sel.show(&self.render, None, now);
     }
@@ -3292,7 +3503,8 @@ impl AppRig for PlayerRig<'_> {
         // Start's candidates.
         self.result_skin.drop_images();
         self.enter_scene();
-        self.render.leave_selection();
+        self.left_selection();
+        self.show_cursor(true);
         recover(
             &mut self.result_input,
             Owner::Practice,
@@ -3404,6 +3616,9 @@ use page_start::Got;
 
 #[cfg(test)]
 pub(crate) mod tests {
+    #[cfg(feature = "dev-tools")]
+    mod pointer;
+
     use std::sync::Arc;
     use std::time::{Duration, Instant};
 
@@ -3748,6 +3963,8 @@ pub(crate) mod tests {
             screen,
             menu: Arc::new(MenuQueue::default()),
             dropped: 0,
+            pointer: crate::pointer::PointerPass::default(),
+            dropped_pointer: 0,
             feed: crate::selection_skin::SkinFeed::default(),
             preset_refusal: false,
             ime: None,
@@ -5955,6 +6172,8 @@ pub(crate) mod tests {
             screen: SelectScreen::new(roots.clone()),
             menu: Arc::new(MenuQueue::default()),
             dropped: 0,
+            pointer: crate::pointer::PointerPass::default(),
+            dropped_pointer: 0,
             feed: crate::selection_skin::SkinFeed::default(),
             preset_refusal: false,
             ime: None,

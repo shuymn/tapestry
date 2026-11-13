@@ -219,6 +219,8 @@ pub struct Res {
     pub res: ResultScreen,
     pub batch: QuadBatch,
     pub timers: ResultTimers,
+    /// The application's readouts each frame is built with.
+    pub app: skin_model::AppReadouts,
 }
 
 impl Res {
@@ -237,6 +239,7 @@ impl Res {
                 screen: Some(TimeUs(0)),
                 fadeout: None,
             },
+            app: skin_model::AppReadouts::LAUNCH,
         }
     }
 
@@ -254,6 +257,7 @@ impl Res {
             target: [1_920, 1_080],
             layout: &Layout::AUTHOR,
             timers: self.timers,
+            app: self.app,
         };
         self.skin
             .build_result(&mut self.res, &frame, &self.uvs, &mut self.batch)

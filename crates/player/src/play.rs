@@ -200,6 +200,9 @@ pub struct PlayerRig<'a> {
     /// Whether the window was shown: recording opens once it is. `None`
     /// without a window (headless).
     pub window: Option<crate::window::WindowShown>,
+    /// The window's cursor: hidden while a play runs, shown on every other
+    /// screen. `None` without a window (headless).
+    pub cursor: Option<crate::window::CursorSwitch>,
     /// The clock, started with the process.
     pub clock: QpcClock,
     /// What each play records.
@@ -501,6 +504,14 @@ pub struct Shutdown {
 }
 
 impl PlayerRig<'_> {
+    /// Shows the window's cursor, or hides it: hidden while a play runs,
+    /// shown on every other screen (design.md "Input", **Pointer input**).
+    pub(crate) fn show_cursor(&self, shown: bool) {
+        if let Some(cursor) = &self.cursor {
+            cursor.set(shown);
+        }
+    }
+
     /// The chart layer side of the play installation `skin` draws with:
     /// the skin in use's, or a pending skin's specialization's; `None`
     /// without a chart layer.
@@ -2297,6 +2308,7 @@ impl Rig for PlayerRig<'_> {
         if let Some(window) = &self.window {
             window.wait_to_open();
         }
+        self.show_cursor(false);
         self.in_play = true;
         // A round's opening is not the full play's READY state: READY
         // and a scenario's `until` run from it.
@@ -2366,6 +2378,7 @@ impl Rig for PlayerRig<'_> {
         if let Some((driver, mut pump)) = self.adjustments() {
             driver.before_opening(&mut pump)?;
         }
+        self.show_cursor(false);
         self.in_play = true;
         self.lead_in = lead_in;
         let opened = self.input.open_candidate(Request::Open {
@@ -2643,6 +2656,7 @@ impl Rig for PlayerRig<'_> {
         // The tail is over: nothing reads the input thread's publications
         // or its focus checks until the next play opens.
         self.in_play = false;
+        self.show_cursor(true);
         self.input.idle();
     }
 
@@ -2798,6 +2812,7 @@ impl Rig for PlayerRig<'_> {
             game::probe::stamp(&game::probe::RESULT_BEGAN);
             game::probe::clear(&game::probe::STEP_ACCEPTED);
         }
+        self.show_cursor(true);
         if self.result_input.enter() {
             self.viewed = None;
             self.evaluated = 0;

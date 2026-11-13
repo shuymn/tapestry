@@ -669,6 +669,7 @@ fn result_frames() {
                     screen: Some(TimeUs(0)),
                     fadeout: (k >= 30).then_some(TimeUs(30 * 16_667)),
                 },
+                app: skin_model::AppReadouts::LAUNCH,
             };
             r.build_result(&mut res, &f, &strip).unwrap();
         }

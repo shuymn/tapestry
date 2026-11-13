@@ -417,6 +417,7 @@ fn rows_at(at: usize, n: usize) -> SelectionView {
         .map(|i| RowView {
             key: RowKey::Chart(std::path::PathBuf::from(format!("{i}.bms"))),
             kind: RowKind::Chart,
+            index: None,
             title: title(i),
             subtitle: String::new(),
             artist: String::new(),
@@ -435,6 +436,7 @@ fn rows_at(at: usize, n: usize) -> SelectionView {
         place: SelectionPlace::All,
         query: String::new(),
         selected: None,
+        list_revision: 0,
     }
 }
 

@@ -532,6 +532,7 @@ pub trait Screen: Send {
             .map(|timing| SelectionDrawn {
                 timing,
                 refused: None,
+                skinned: false,
             })
     }
     /// The lines the selection skin's text last asked for, and how many
@@ -860,6 +861,10 @@ pub enum RenderMsg {
     /// The settings keys' values, which every selection frame reads the
     /// volume and the display offset from. Sent once, at the start.
     Tuning(Arc<LiveTuning>),
+    /// The pointer's shared state, which every selection frame reads the
+    /// hover's point from and answers the pointer's batches and drags
+    /// through. Sent once, at the start.
+    Pointer(Arc<crate::pointer::PointerShared>),
     /// Make sure the screen can draw, building it again if it failed (the
     /// device's recovery, for a play and the menus alike), and answer when
     /// it can. It prepares no attempt.
@@ -1264,6 +1269,10 @@ struct Shared {
     /// (tests): a second clock reading in the frame would differ from it.
     #[cfg(test)]
     selection_stall: AtomicBool,
+    /// Result frames stall 2 ms after their instant is sampled while set
+    /// (tests): a second clock reading in the frame would differ from it.
+    #[cfg(test)]
+    result_stall: AtomicBool,
 }
 
 impl Shared {
@@ -1328,6 +1337,8 @@ impl Shared {
             result_runtime_timers: Mutex::new(Vec::new()),
             #[cfg(test)]
             selection_stall: AtomicBool::new(false),
+            #[cfg(test)]
+            result_stall: AtomicBool::new(false),
         }
     }
 
@@ -2544,6 +2555,12 @@ impl RenderLink {
         self.send(RenderMsg::Tuning(tuning));
     }
 
+    /// Hands the render thread the pointer's shared state: every selection
+    /// frame draws its hover and answers its batches and drags.
+    pub fn pointer(&self, pointer: Arc<crate::pointer::PointerShared>) {
+        self.send(RenderMsg::Pointer(pointer));
+    }
+
     /// Hands the render thread the adjustments' snapshots, which every
     /// play and loading frame is drawn from from now on.
     pub fn presentation(&self, reader: game::adjustment::PresentationReader) {
@@ -3428,6 +3445,8 @@ pub fn spawn(
                 page_turns: false,
                 decision: None,
                 tuning: None,
+                pointer: None,
+                drag_seen: crate::pointer::Seen::default(),
                 current: None,
                 #[cfg(feature = "dev-tools")]
                 ready: None,
@@ -4321,6 +4340,10 @@ struct Run {
     decision: Option<Box<MenuPage>>,
     /// The settings keys' values ([`RenderMsg::Tuning`]).
     tuning: Option<Arc<LiveTuning>>,
+    /// The pointer's shared state ([`RenderMsg::Pointer`]).
+    pointer: Option<Arc<crate::pointer::PointerShared>>,
+    /// The drag cell's movement last taken: one drag a frame.
+    drag_seen: crate::pointer::Seen,
     /// The committed attempt's tempo and presentation epoch, which its
     /// play frames project the snapshot with.
     current: Option<(game::AttemptTempo, u64)>,
@@ -4771,6 +4794,10 @@ impl Run {
                     self.tuning = Some(tuning);
                     continue;
                 }
+                Ok(RenderMsg::Pointer(pointer)) => {
+                    self.pointer = Some(pointer);
+                    continue;
+                }
                 Ok(RenderMsg::Commit { request, reply }) => {
                     let _ = reply.send(self.commit(request));
                     continue;
@@ -5003,6 +5030,11 @@ impl Run {
             {
                 self.selection = None;
                 mode = Mode::Idle;
+                // A batch in flight is answered with no build: nothing
+                // waits on a selection no longer drawn.
+                if let Some(pointer) = &self.pointer {
+                    pointer.serve(None, None, screen.target(), &mut self.drag_seen);
+                }
                 continue;
             }
             // The result was left during the wait: nothing of it is drawn.
@@ -5369,6 +5401,12 @@ impl Run {
                     if let Some(logic) = shown.logic.as_mut() {
                         logic
                             .apply_settings(shown.update.settings.as_ref(), self.tuning.as_deref());
+                        // The hover's point as the window last saw it.
+                        logic.pointer = self
+                            .pointer
+                            .as_ref()
+                            .and_then(|p| p.position())
+                            .map(crate::pointer::point);
                     }
                     // The frame's one reading: its timers age on the instant
                     // the readouts were sampled at.
@@ -5409,6 +5447,27 @@ impl Run {
                             .lock()
                             .unwrap_or_else(PoisonError::into_inner) = Some(why.clone());
                     }
+                    // The pointer's batch and drag, on what this frame built.
+                    if let Some(pointer) = &self.pointer {
+                        let u = &shown.update;
+                        let built = drawn.as_ref().ok().map(|d| crate::pointer::Built {
+                            lifetime: u.lifetime,
+                            revision: u.revision,
+                            list_revision: u.list_revision,
+                            cursor: u
+                                .view
+                                .cursor
+                                .and_then(|c| u.view.rows.get(c))
+                                .and_then(|r| r.index),
+                            skinned: d.skinned && d.refused.is_none() && shown.logic.is_some(),
+                        });
+                        pointer.serve(
+                            built,
+                            shown.logic.as_ref(),
+                            screen.target(),
+                            &mut self.drag_seen,
+                        );
+                    }
                     #[cfg(feature = "dev-tools")]
                     if let Ok(d) = &drawn {
                         let [_, _, _, after] = crate::alloc_count::counts();
@@ -5427,13 +5486,20 @@ impl Run {
                     drawn.map(|d| (d.timing, None))
                 }
                 Mode::Result => {
+                    #[cfg(test)]
+                    if self.shared.result_stall.load(Ordering::Acquire) {
+                        std::thread::sleep(Duration::from_millis(2));
+                    }
                     #[cfg(feature = "dev-tools")]
                     {
                         frame_began = Some(Instant::now());
                         let _ = crate::dev::take_build_mark();
                         let _ = crate::screens::take_visit();
                     }
-                    let now = self.clock.now();
+                    // The frame's one instant, its readouts' reading, as a
+                    // selection frame's: its timers age on the same clock
+                    // reading as its clock and uptime numbers.
+                    let now = frame_at;
                     if let Some(side) = &mut self.result {
                         side.drain();
                     }
@@ -5444,7 +5510,7 @@ impl Run {
                         &self.scripts,
                         now,
                     );
-                    Self::result_visit(self.result.as_mut(), now, fadeout);
+                    Self::result_visit(self.result.as_mut(), now, fadeout, &app);
                     #[cfg(all(test, feature = "dev-tools"))]
                     if let Some(h) = self.result.as_ref().and_then(|s| s.presented.as_ref()) {
                         self.shared
@@ -5453,8 +5519,13 @@ impl Run {
                             .unwrap_or_else(PoisonError::into_inner)
                             .push((now, h.script.running_frame_timer(0)));
                     }
-                    let built =
-                        Self::result_build(screen.as_mut(), self.result.as_mut(), now, fadeout);
+                    let built = Self::result_build(
+                        screen.as_mut(),
+                        self.result.as_mut(),
+                        now,
+                        fadeout,
+                        &app,
+                    );
                     // A frame under the barrier refused (dev-tools: the
                     // fallback during an outro).
                     #[cfg(feature = "dev-tools")]
@@ -7380,7 +7451,12 @@ impl Run {
     /// commit point and its build, outside both counted spans
     /// ([`crate::screens::result_visit`]); a stop's notice is latched for
     /// the lifetime and its strip prepared again after the frame.
-    fn result_visit(side: Option<&mut ResultSide>, now: TimeUs, fadeout: Option<TimeUs>) {
+    fn result_visit(
+        side: Option<&mut ResultSide>,
+        now: TimeUs,
+        fadeout: Option<TimeUs>,
+        app: &skin_model::AppReadouts,
+    ) {
         let Some(side) = side else {
             return;
         };
@@ -7401,6 +7477,7 @@ impl Run {
             state,
             now,
             &timers,
+            app,
         ) && side.stop.is_none()
         {
             side.stop = Some(stop);
@@ -7416,6 +7493,7 @@ impl Run {
         side: Option<&mut ResultSide>,
         now: TimeUs,
         fadeout: Option<TimeUs>,
+        app: &skin_model::AppReadouts,
     ) -> ResultDrawn {
         let Some(side) = side else {
             return ResultDrawn::BuiltIn;
@@ -7433,6 +7511,7 @@ impl Run {
                     screen: origin,
                     fadeout,
                 },
+                app: *app,
             };
             // The frame's preparation ends here (dev-tools: the S7-07d
             // gate's whole frames).
@@ -12840,6 +12919,7 @@ pub(crate) mod tests {
             }
             // The skin's frame at `now`, built by the model alone, when the
             // skin is a selection skin.
+            let mut skinned = false;
             if let Some(logic) = logic.filter(|_| state.is_some()) {
                 let skin = Arc::clone(logic.bundle.skin());
                 if skin
@@ -12856,11 +12936,13 @@ pub(crate) mod tests {
                         layout: &skin_model::Layout::AUTHOR,
                         timers: update.events.timers(),
                         app,
+                        pointer: logic.pointer,
                     };
                     if skin
                         .build_selection(&mut logic.sel, &frame, logic.bundle.uvs(), &mut batch)
                         .is_ok()
                     {
+                        skinned = true;
                         let rects = batch.quads().iter().map(|q| q.rect).collect();
                         self.shared.built.lock().unwrap().push((seen, now, rects));
                     }
@@ -12870,6 +12952,7 @@ pub(crate) mod tests {
                 .then(|| "refused for the test".to_owned());
             Ok(crate::selection_skin::SelectionDrawn {
                 timing: timing(true),
+                skinned: skinned && refused.is_none(),
                 refused,
             })
         }

@@ -31,6 +31,13 @@
 //! score, the cursor's exact position, the place, the query and the selected
 //! chart's labels, summary and score.
 //!
+//! A selection skin's elements may take the pointer ([`PointerDef`]): an
+//! action, a search box, a hover rect that hides the element while the
+//! pointer is outside it, and the song list's clickable slots. Each build
+//! records the targets it drew, and [`Skin::hit_at`] and [`Skin::drag_at`]
+//! read the [`PointerHit`] a press or a drag gives, a row named by its
+//! [`RowRef`].
+//!
 //! A [`ResultView`] is the result screen's snapshot: one view's result,
 //! its timing statistics and [`Timelines`], its best before the play and
 //! the chart's facts, each value shown, hidden or unavailable. A result
@@ -101,6 +108,7 @@ pub mod output;
 mod pixmap;
 mod place;
 mod play;
+mod pointer;
 pub mod present;
 mod quad;
 mod result;
@@ -124,8 +132,8 @@ pub use atlas::{
 pub use canvas::{Canvas, Fit, MAX_CANVAS};
 pub use decision::schema::{DECISION, timer as decision_timer};
 pub use decision::{
-    DecisionError, DecisionFrame, DecisionScreen, DecisionTimers, DecisionTiming,
-    MAX_DECISION_PHASE,
+    DecisionError, DecisionFrame, DecisionLabels, DecisionScreen, DecisionStrings, DecisionTimers,
+    DecisionTiming, MAX_DECISION_PHASE,
 };
 #[cfg(feature = "dev-tools")]
 pub use expr::evaluations;
@@ -188,6 +196,10 @@ pub use play::{
     DurationRatio, FrameReadouts, GaugeDesc, LoadState, LocalTime, NativeReadouts, NativeValues,
     OFFSET_SLOTS, Offsets, Play, PlayContext, PlayScore, PrepareError, RoundedDuration, ScoreBasis,
     SkinFrame, attempt_targets,
+};
+pub use pointer::{
+    ActionDef, Button, ClickType, HoverRect, MAX_SEARCH_BOXES, PointerDef, PointerError,
+    PointerHit, PressHit, RowRef, RowRefKind, SearchBoxes,
 };
 pub use quad::{Blend, ClipId, ClipRect, Filter, Quad, QuadBatch, Run, RunKey};
 pub use result::schema::{

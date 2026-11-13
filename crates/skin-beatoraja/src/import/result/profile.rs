@@ -79,6 +79,25 @@ const MEAN_WHOLE: &str = "if timing.mean_x100 < 0 then -(abs(timing.mean_x100) /
 const MEAN_HUNDREDTHS: &str = "if timing.mean_x100 < 0 then -(abs(timing.mean_x100) % 100) \
      else timing.mean_x100 % 100";
 
+/// The application's readouts, numbers 20 to 29 (`IntegerPropertyFactory.
+/// java:98-107`): the frames presented in the last second, the local date
+/// and time and the uptime, which every state of the source reads alike.
+/// The frame fills them ([`skin_model::ResultFrame::app`]), never the
+/// view, so a Lua read while the skin loads is live state, as on
+/// selection ([`crate::lua::facts`]).
+pub(crate) const APP: std::ops::RangeInclusive<i32> = 20..=29;
+
+/// Number `id` of [`APP`]: its field of the same name as play's and
+/// selection's, always available, over that field's range.
+fn app(id: i32) -> Option<ResValue> {
+    let expr = super::super::property::app_field(u8::try_from(id - 20).ok()?);
+    let range = match RESULT.field(expr).map(|(_, f)| f.ty) {
+        Some(skin_model::FieldTy::Int { lo, hi }) => (i64::from(lo), i64::from(hi)),
+        _ => return None,
+    };
+    Some(v(expr, "true", range))
+}
+
 /// The result number `id` (`main_state.number` and a value's `ref`).
 pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
     use Class::{Bridge, Omit};
@@ -203,10 +222,11 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
             (0, 59),
         ),
         1164 => v("chart.length_ms / 1000 % 60", "chart.length_valid", (0, 59)),
-        // The clock is no result fact; no score target; no IR. The best's
-        // max combo (173, and 175 the difference from it) is not kept with
-        // a best until stage3.md's row S10-14.
-        21..=25 | 151 | 157 | 158 | 173 | 175 | 179 | 180 | 182 | 380..=399 => {
+        20..=29 => app(id)?,
+        // No score target; no IR. The best's max combo (173, and 175 the
+        // difference from it) is not kept with a best until stage3.md's
+        // row S10-14.
+        151 | 157 | 158 | 173 | 175 | 179 | 180 | 182 | 380..=399 => {
             return Some(Omit);
         }
         _ => return None,

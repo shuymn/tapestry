@@ -247,7 +247,9 @@ impl TextTable {
         size_of_val(&*self.0)
     }
 
-    pub(crate) fn get(&self, slot: u16) -> Option<&TextImage> {
+    /// `slot`'s line, if any.
+    #[must_use]
+    pub fn get(&self, slot: u16) -> Option<&TextImage> {
         self.0.get(usize::from(slot)).and_then(Option::as_ref)
     }
 

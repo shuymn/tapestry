@@ -840,7 +840,13 @@ fn result_chart_frame_alloc() {
         let before = crate::alloc_count::this_thread();
         let fadeout =
             Run::result_commit(&mut screen, Some(&mut side), &shared, &scripts, TimeUs(0));
-        let drawn = Run::result_build(&mut screen, Some(&mut side), now, fadeout);
+        let drawn = Run::result_build(
+            &mut screen,
+            Some(&mut side),
+            now,
+            fadeout,
+            &skin_model::AppReadouts::LAUNCH,
+        );
         counts.push(crate::alloc_count::this_thread() - before);
         assert_eq!(drawn, ResultDrawn::Built);
         let quads = screen.result_quads().unwrap();

@@ -18,9 +18,10 @@ use bms_model::TimeUs;
 use self::schema::timer;
 use crate::expr::{State, TIMER_OFF};
 use crate::result::Strings;
+use crate::result::view::ResultLabels;
 use crate::widget::Starts;
-use crate::widget::glyphs::GlyphLine;
-use crate::widget::text::TextTable;
+use crate::widget::glyphs::{BitmapLines, GlyphLine};
+use crate::widget::text::{ChartText, TextTable};
 
 /// The starts of the decision screen's built-in timers this frame, each
 /// `None` while it is off.
@@ -72,6 +73,48 @@ pub enum DecisionError {
     /// The skin is not a decision skin, or the state is not its.
     #[error("the skin or the state is not a decision skin's")]
     Kind,
+}
+
+/// The chosen chart's strings a decision preparation lays its lines out
+/// from, owned, so a worker thread can lay them out while the labels'
+/// owner goes on ([`Skin::decision_text_requests_for`],
+/// [`Skin::decision_bitmap_lines`]): each label as
+/// [`update_decision`](crate::Skin::update_decision) keeps it.
+///
+/// [`Skin::decision_text_requests_for`]: crate::Skin::decision_text_requests_for
+/// [`Skin::decision_bitmap_lines`]: crate::Skin::decision_bitmap_lines
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DecisionStrings(Strings);
+
+impl DecisionStrings {
+    /// The strings of `labels`. Preparation work: it allocates.
+    #[must_use]
+    pub fn new(labels: &ResultLabels) -> Self {
+        let mut s = Strings::default();
+        s.set(labels);
+        Self(s)
+    }
+
+    pub(crate) fn chart(&self) -> ChartText<'_> {
+        self.0.chart()
+    }
+
+    /// The bytes the strings hold.
+    #[must_use]
+    pub fn heap_bytes(&self) -> usize {
+        self.0.capacity()
+    }
+}
+
+/// A decision frame's labels, borrowed from their owner for the build
+/// ([`Skin::build_decision_with`](crate::Skin::build_decision_with)): the
+/// rasterized lines and the bitmap lines, one per text slot each.
+#[derive(Clone, Copy, Debug)]
+pub struct DecisionLabels<'a> {
+    /// The rasterized lines.
+    pub text: &'a TextTable,
+    /// The lines in bitmap fonts.
+    pub bitmap: &'a BitmapLines,
 }
 
 /// The decision screen's state as of its last labels and build.
