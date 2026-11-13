@@ -21,7 +21,7 @@ use skin_model::{
 use tempfile::TempDir;
 
 use super::super::{Extent, MakeScreen, RenderLink, Screen};
-use super::{one_line, preset_attempt, spawn_empty, wait_until};
+use super::{one_line, preset_attempt, spawn_empty_on, wait_until};
 use crate::decision_side::{
     Boundary, DecisionDrawn, DecisionSide, Rebuilt, ShownDecision, Want, decision_build,
     decision_frame_of, labels_revision, update_want,
@@ -176,6 +176,13 @@ struct Seen {
     removed: AtomicU32,
     /// The next skin frame's lit pixels in the title's box are noted.
     probe: AtomicBool,
+    /// A filling slot whose writes were all submitted is not settled
+    /// while set, as if their completion had not come.
+    hold_settle: AtomicBool,
+    /// The settlings `hold_settle` skipped.
+    skipped_settles: AtomicU32,
+    /// Each skin frame's time and its input and fade-out timers' starts.
+    timers: Mutex<Vec<FrameTimers>>,
     lit: Mutex<Vec<(u64, usize)>>,
     drew: Mutex<Vec<Drew>>,
     /// Signaled, under `drew`'s lock, at each frame noted and each
@@ -185,6 +192,9 @@ struct Seen {
     rows: Mutex<RowsGate>,
     rows_moved: Condvar,
 }
+
+/// A skin frame's time and its input and fade-out timers' starts.
+type FrameTimers = (TimeUs, Option<TimeUs>, Option<TimeUs>);
 
 impl Seen {
     fn skins(&self, from: usize) -> usize {
@@ -360,6 +370,12 @@ impl Screen for Recorder {
         if self.seen.refuse_settle.load(Ordering::Acquire) && store.filling().is_some() {
             return Err(RenderError::LabelRegion { needed: 1, band: 0 });
         }
+        if self.seen.hold_settle.load(Ordering::Acquire)
+            && store.progress().is_some_and(|p| p.complete)
+        {
+            self.seen.skipped_settles.fetch_add(1, Ordering::AcqRel);
+            return Ok(render::Settled::Pending);
+        }
         if self.seen.fail_settle.swap(false, Ordering::AcqRel) {
             self.menu.decision_fault(true);
         }
@@ -392,6 +408,11 @@ impl Screen for Recorder {
             self.menu.decision_fault(false);
         }
         self.menu.build_decision(dec, labels, frame)?;
+        self.seen.timers.lock().unwrap().push((
+            frame.now,
+            frame.timers.input,
+            frame.timers.fadeout,
+        ));
         self.seen.note(Drew::Skin {
             device: self.device,
             now: frame.now,
@@ -482,11 +503,35 @@ impl Rig {
     /// [`new`](Self::new) whose screens are made at `size`, as the
     /// production factory makes them at the window's first size.
     fn sized(dir: &TempDir, size: [u32; 2]) -> Self {
-        let turn = crate::warp_turn::take();
+        Self::at(dir, size, input::QpcClock::start())
+    }
+
+    /// [`new`](Self::new) on `clock`.
+    fn on(dir: &TempDir, clock: input::QpcClock) -> Self {
+        Self::at(dir, TARGET, clock)
+    }
+
+    /// [`sized`](Self::sized) on `clock`.
+    fn at(dir: &TempDir, size: [u32; 2], clock: input::QpcClock) -> Self {
+        let rig = Self::bare_at(crate::warp_turn::take(), size, clock);
         let bundle = {
             let probe = crate::render_common::offscreen(size[0], size[1]);
             decision_bundle_in(&probe, dir.path(), &default_font())
         };
+        let answer = rig.link.select(ScreenKind::Decision, Some(bundle)).wait();
+        assert_eq!(answer.unwrap(), Preparation::Ready);
+        rig
+    }
+
+    /// A render thread on [`Recorder`]s on `clock`, nothing committed,
+    /// holding `turn`, WARP's turn the caller took (before
+    /// `crate::imports::tests::serial` when it takes both).
+    fn bare(turn: crate::warp_turn::Turn, clock: input::QpcClock) -> Self {
+        Self::bare_at(turn, TARGET, clock)
+    }
+
+    /// [`bare`](Self::bare) whose screens are made at `size`.
+    fn bare_at(turn: crate::warp_turn::Turn, size: [u32; 2], clock: input::QpcClock) -> Self {
         let seen = Arc::new(Seen::default());
         let s = Arc::clone(&seen);
         let make: MakeScreen = Box::new(move || {
@@ -504,11 +549,9 @@ impl Rig {
                 seen: Arc::clone(&s),
             }) as Box<dyn Screen>)
         });
-        let link = spawn_empty(make);
+        let link = spawn_empty_on(make, clock);
         let extent = Arc::new(Extent::default());
         link.follow(&extent);
-        let answer = link.select(ScreenKind::Decision, Some(bundle)).wait();
-        assert_eq!(answer.unwrap(), Preparation::Ready);
         let book = link.label_book();
         Self {
             link,
@@ -2141,3 +2184,6 @@ fn recover_refusal_stands_when_the_result_restore_fails() {
     assert!(!ready(&lock(&rig.book), "b", "B"), "the kind not disabled");
     rig.link.exit();
 }
+
+// The decision skin through the player's flow.
+mod flow;
