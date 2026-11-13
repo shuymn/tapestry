@@ -209,49 +209,97 @@ fn the_held_waits_stop_at_the_bound() {
     assert_eq!(held_wait(TimeUs(501 * MS), shown, bound), None);
 }
 
-/// TB4: with no staging the hold ends at its bound from the showing,
-/// and the pending presentation is drawn and acknowledged then.
+/// The hold reads `elapsed` µs since its showing in place of the clock,
+/// from now on.
+fn hold_at(link: &super::super::RenderLink, elapsed: i64) {
+    link.shared.hold_elapsed.store(elapsed, SeqCst);
+}
+
+/// TB4: with no staging the hold ends at its bound from the showing, not
+/// a microsecond before: held at the bound less 1 µs, the pending
+/// presentation drawn and acknowledged once the bound is reached. The
+/// hold reads its time from the test, so a render thread descheduled
+/// anywhere changes no verdict.
 #[test]
 fn the_hold_is_bounded() {
-    let (_chart, screens, link, _extent) = rig(100 * MS);
-    let before = link.clock.now();
-    link.loading().show(one_line("loading"));
+    let (_chart, screens, link, _extent) = rig(FIRST_FRAME_HOLD.0);
+    hold_at(&link, 0);
+    show_held(&link);
+    hold_at(&link, FIRST_FRAME_HOLD.0 - 1);
+    let from = waits(&link);
+    assert!(wait_until(|| waits(&link) >= from + 3));
+    assert_eq!(pending(&screens), 0);
+    assert_eq!(link.loading_ack(), None);
+    hold_at(&link, FIRST_FRAME_HOLD.0);
     assert!(wait_until(|| link.loading_ack().is_some()));
-    let (_, at) = link.loading_ack().unwrap();
-    assert!(at >= TimeUs(before.0 + 100 * MS), "{at:?} {before:?}");
     assert!(pending(&screens) >= 1);
-    assert!(waits(&link) >= 1);
     link.end_loading().unwrap();
     link.exit();
 }
 
-/// TB13: a frame granted is kept through the hold, which waits on the
-/// clock between its looks instead of spinning, and the pending
-/// presentation takes that frame at the bound with no wait of its own.
+/// TB13: the hold waits on the clock between its looks instead of
+/// spinning, and its iterations take no frame of the pacing: a frame's
+/// wait is asked neither while held nor twice after it, so the pending
+/// presentation drawn at the bound takes one wait. Its looks progress
+/// (asserted apart), and no more of them run than one per pace.
 #[test]
 fn the_hold_paces() {
     let (_chart, screens, link, _extent) = rig(NEVER);
+    hold_at(&link, 0);
     screens.permits.store(0, SeqCst);
     screens.pace.store(true, SeqCst);
     assert!(wait_until(|| screens.held.load(SeqCst)));
     let asked = screens.waits.load(SeqCst);
-    link.shared.hold_bound.store(200 * MS, SeqCst);
-    let before = link.clock.now();
     link.loading().show(one_line("loading"));
-    // The page's frame waiting, then the loading state's, granted.
+    // The page's frame waiting, then the frame drawn after the hold.
     screens.permits.store(2, SeqCst);
+    let from = waits(&link);
+    assert!(
+        wait_until(|| waits(&link) >= from + 3),
+        "the hold progresses"
+    );
+    assert_eq!(screens.waits.load(SeqCst), asked, "a wait asked while held");
+    // At most one look per pace over a window, whatever the scheduling.
+    let (began, first) = (Instant::now(), entries(&link));
+    std::thread::sleep(Duration::from_millis(100));
+    let (span, last) = (began.elapsed(), entries(&link));
+    let paces = u64::try_from(span.as_micros()).unwrap() / HELD_PACE.0.unsigned_abs();
+    assert!(
+        last - first <= paces + 2,
+        "{} looks in {span:?}",
+        last - first
+    );
+    hold_at(&link, NEVER);
     assert!(wait_until(|| link.loading_ack().is_some()));
-    let (_, at) = link.loading_ack().unwrap();
-    assert!(at >= TimeUs(before.0 + 200 * MS), "{at:?} {before:?}");
     assert!(wait_until(|| screens.held.load(SeqCst)));
     assert_eq!(pending(&screens), 1);
-    assert_eq!(screens.waits.load(SeqCst), asked + 2, "the grant kept");
-    let (entries, waits) = (entries(&link), waits(&link));
-    assert_eq!(entries, waits);
-    assert!((2..=200 / 4 + 20).contains(&entries), "{entries}");
+    assert_eq!(
+        screens.waits.load(SeqCst),
+        asked + 2,
+        "one wait for the frame"
+    );
     screens.pace.store(false, SeqCst);
     link.end_loading().unwrap();
     link.exit();
+}
+
+/// TB13: on a target paced by the clock (no frame waitable), a held
+/// iteration takes only its own wait, never the frame's 16 ms on top.
+#[test]
+fn an_unpaced_hold_takes_no_frame_pacing() {
+    let (_chart, _screens, link, _extent) = rig(NEVER);
+    hold_at(&link, 0);
+    show_held(&link);
+    let (paced, from) = (link.shared.clock_paced.load(SeqCst), entries(&link));
+    assert!(wait_until(|| entries(&link) >= from + 5));
+    assert_eq!(link.shared.clock_paced.load(SeqCst), paced);
+    link.end_loading().unwrap();
+    link.exit();
+}
+
+/// The lifetime whose first frame was visited last, and its showing.
+fn first_shown(link: &super::super::RenderLink) -> Option<(u64, TimeUs)> {
+    *link.shared.first_shown.lock().unwrap()
 }
 
 /// TB5: the hold counts from the showing: a held lifetime's from its
@@ -261,27 +309,30 @@ fn the_hold_paces() {
 fn the_hold_counts_from_the_showing() {
     let (_chart, _screens, link, _extent) = rig(NEVER);
     link.begin_loading_held(&chosen("One"), None);
-    // Longer than the bound before the reveal.
-    std::thread::sleep(Duration::from_millis(200));
-    link.shared.hold_bound.store(100 * MS, SeqCst);
+    let lifetime = link.loading_lifetime();
+    // Held unshown for a while.
+    std::thread::sleep(Duration::from_millis(50));
     let revealed = link.clock.now();
     link.reveal_loading();
-    assert!(wait_until(|| link.loading_ack().is_some()));
-    let (_, at) = link.loading_ack().unwrap();
-    assert!(at >= TimeUs(revealed.0 + 100 * MS), "{at:?} {revealed:?}");
+    assert!(wait_until(
+        || first_shown(&link).is_some_and(|(l, _)| l == lifetime)
+    ));
+    let (_, shown) = first_shown(&link).unwrap();
+    assert!(shown >= revealed, "{shown:?} {revealed:?}");
+    assert!(waits(&link) > 0 || wait_until(|| waits(&link) > 0));
     link.end_loading().unwrap();
 
     show_page(&link);
     let began = link.clock.now();
     link.begin_loading(&chosen("Two"), None);
+    let lifetime = link.loading_lifetime();
     link.loading()
         .report(LoadInput::Stage(Stage::Chart), Some(one_line("two")));
-    assert!(wait_until(|| {
-        link.loading_ack()
-            .is_some_and(|(l, _)| l == link.loading_lifetime())
-    }));
-    let (_, at) = link.loading_ack().unwrap();
-    assert!(at >= TimeUs(began.0 + 100 * MS), "{at:?} {began:?}");
+    assert!(wait_until(
+        || first_shown(&link).is_some_and(|(l, _)| l == lifetime)
+    ));
+    let (_, shown) = first_shown(&link).unwrap();
+    assert!(shown >= began, "{shown:?} {began:?}");
     link.end_loading().unwrap();
     link.exit();
 }
@@ -430,20 +481,24 @@ fn a_redraw_restores_the_image() {
 /// staging dropped or not.
 #[test]
 fn a_successor_lifetime_holds_on_its_own() {
-    let (chart, screens, link, _extent) = rig(300 * MS);
+    let (chart, screens, link, _extent) = rig(NEVER);
     show_held(&link);
+    let first = link.loading_lifetime();
     link.clear_loading();
-    // Most of the first lifetime's bound passes before the second.
-    std::thread::sleep(Duration::from_millis(200));
     let shown = link.clock.now();
     link.loading().show(one_line("two"));
-    assert!(wait_until(|| link.loading_ack().is_some()));
-    let (second, at) = link.loading_ack().unwrap();
-    assert_eq!(second, link.loading_lifetime());
-    assert!(at >= TimeUs(shown.0 + 300 * MS), "{at:?} {shown:?}");
+    let second = link.loading_lifetime();
+    assert_ne!(first, second);
+    assert!(wait_until(
+        || first_shown(&link).is_some_and(|(l, _)| l == second)
+    ));
+    let (_, at) = first_shown(&link).unwrap();
+    assert!(at >= shown, "its own showing: {at:?} {shown:?}");
+    let from = waits(&link);
+    assert!(wait_until(|| waits(&link) >= from + 3), "held on its own");
+    assert_eq!(link.loading_ack(), None);
     link.end_loading().unwrap();
 
-    link.shared.hold_bound.store(NEVER, SeqCst);
     show_page(&link);
     show_held(&link);
     assert_eq!(
@@ -459,6 +514,57 @@ fn a_successor_lifetime_holds_on_its_own() {
     link.discard_attempt();
     assert!(wait_until(|| pending(&screens) >= from + 2));
     assert_eq!(entries(&link), held, "never held again");
+    link.end_loading().unwrap();
+    link.exit();
+}
+
+/// TB1, TB2: a staging answered during the hold and dropped before any
+/// frame drew it (its discard taken right after the answer) ends
+/// nothing: no frame is built, the hold goes on over the valid image, and
+/// nothing is acknowledged.
+#[test]
+fn a_staging_dropped_before_its_frame_keeps_the_hold() {
+    let (chart, screens, link, _extent) = rig(NEVER);
+    show_held(&link);
+    let answered = &link.shared.answer_gate;
+    answered.hold(true);
+    assert_eq!(
+        specialized(&link, &chart, &bundle()).unwrap(),
+        Preparation::Ready
+    );
+    assert!(wait_until(|| answered.waiting()));
+    link.discard_attempt();
+    answered.hold(false);
+    let from = waits(&link);
+    assert!(wait_until(|| waits(&link) >= from + 3), "still held");
+    assert!(screens.staged_frames.lock().unwrap().is_empty());
+    assert_eq!(pending(&screens), 0);
+    assert_eq!(link.loading_ack(), None);
+    link.end_loading().unwrap();
+    link.exit();
+}
+
+/// TB6: a same-size notice after the outgoing frame's stamp and before
+/// the lifetime's first visit (the loading state's message taken by the
+/// next iteration, held before its token) leaves that frame's image
+/// invalid: the first visit is not held.
+#[test]
+fn a_notice_before_the_first_visit_breaks_the_image() {
+    let (_chart, screens, link, extent) = rig(NEVER);
+    let [before_token, _, before_stamp] = &link.shared.frame_gates;
+    before_stamp.hold(true);
+    assert!(wait_until(|| before_stamp.waiting()));
+    link.loading().show(one_line("loading"));
+    before_token.hold(true);
+    let count = stamps(&link).0;
+    before_stamp.hold(false);
+    assert!(wait_until(|| stamps(&link).0 > count));
+    assert!(stamps(&link).1, "the outgoing frame stamped valid");
+    assert!(wait_until(|| before_token.waiting()));
+    extent.publish(1_920, 1_080);
+    before_token.hold(false);
+    assert!(wait_until(|| pending(&screens) >= 1));
+    assert_eq!(entries(&link), 0);
     link.end_loading().unwrap();
     link.exit();
 }

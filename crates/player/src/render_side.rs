@@ -1432,6 +1432,21 @@ struct Shared {
     /// each (tests).
     #[cfg(test)]
     frame_gates: [TestGate; 3],
+    /// The time since the showing the hold reads in place of the clock's,
+    /// in µs; `i64::MIN` reads the clock (tests).
+    #[cfg(test)]
+    hold_elapsed: AtomicI64,
+    /// The lifetime whose first frame was visited last, and its showing
+    /// (tests).
+    #[cfg(test)]
+    first_shown: Mutex<Option<(u64, TimeUs)>>,
+    /// An attempt's preparation waits here after its answer, before any
+    /// frame, while a test holds it (tests).
+    #[cfg(test)]
+    answer_gate: TestGate,
+    /// The frames paced by the clock so far (tests).
+    #[cfg(test)]
+    clock_paced: AtomicU64,
     /// The stamps so far, and whether the last left the image valid,
     /// right after it (tests).
     #[cfg(test)]
@@ -1520,6 +1535,14 @@ impl Shared {
             held_allocations: AtomicU64::new(0),
             #[cfg(test)]
             frame_gates: Default::default(),
+            #[cfg(test)]
+            hold_elapsed: AtomicI64::new(i64::MIN),
+            #[cfg(test)]
+            first_shown: Mutex::new(None),
+            #[cfg(test)]
+            answer_gate: TestGate::default(),
+            #[cfg(test)]
+            clock_paced: AtomicU64::new(0),
             #[cfg(test)]
             stamps: [AtomicU64::new(0), AtomicU64::new(0)],
         }
@@ -4618,6 +4641,30 @@ fn first_frame_bound(shared: &Shared) -> TimeUs {
     }
 }
 
+/// The hold's reading of the clock, `now`, or the showing plus a test's
+/// time since it (tests).
+#[cfg(test)]
+fn hold_now(shared: &Shared, now: TimeUs, shown_at: TimeUs) -> TimeUs {
+    match shared.hold_elapsed.load(Ordering::SeqCst) {
+        i64::MIN => now,
+        elapsed => TimeUs(shown_at.0.saturating_add(elapsed)),
+    }
+}
+
+/// How long the render thread stalls as it takes a loading lifetime's
+/// signal, in ms, from `TAPESTRY_TEST_DESCHEDULE_MS` (tests: a render
+/// thread descheduled right after the showing).
+#[cfg(test)]
+fn deschedule() -> u64 {
+    static MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *MS.get_or_init(|| {
+        std::env::var("TAPESTRY_TEST_DESCHEDULE_MS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0)
+    })
+}
+
 /// How long a held iteration at `now` waits before it looks again: at
 /// most [`HELD_PACE`], never past `shown_at + bound`; `None` once that is
 /// reached, which ends the hold.
@@ -5059,6 +5106,8 @@ impl Run {
                     };
                 }
                 Ok(RenderMsg::Loading(lifetime)) => {
+                    #[cfg(test)]
+                    std::thread::sleep(Duration::from_millis(deschedule()));
                     self.clear_decision();
                     self.turntable.begin_presentation();
                     // Lines the slot no longer holds (taken, or their
@@ -5180,6 +5229,8 @@ impl Run {
                     self.turntable.begin_presentation();
                     self.begin_attempt(request, lifetime, attempt, skin, reply);
                     mode = self.after_preparing(mode);
+                    #[cfg(test)]
+                    self.shared.answer_gate.pass();
                     continue;
                 }
                 Ok(RenderMsg::PlayState(state)) => {
@@ -5407,6 +5458,87 @@ impl Run {
             let Some(screen) = &mut self.screen else {
                 continue;
             };
+            // The lifetime's first frame is held while it would be the
+            // pending presentation and the image on the screen is still
+            // valid, for a bound from the showing (design.md "The pending
+            // presentation"): nothing is built or presented. Before the
+            // frame's pacing, so a held iteration waits only its own wait,
+            // and a frame granted stays so for the frame drawn after it.
+            if let Mode::Menu {
+                loading: Some(lifetime),
+                update,
+                ..
+            } = &mode
+                && self.shared.loading_current(*lifetime)
+            {
+                let lifetime = *lifetime;
+                let now = self.clock.now();
+                let mut first = match self.first_frame {
+                    Some(f) if f.lifetime == lifetime => f,
+                    _ => {
+                        let shown_at = update.as_deref().map_or(now, |u| u.origin);
+                        #[cfg(test)]
+                        {
+                            *self
+                                .shared
+                                .first_shown
+                                .lock()
+                                .unwrap_or_else(PoisonError::into_inner) =
+                                Some((lifetime, shown_at));
+                        }
+                        FirstFrame {
+                            lifetime,
+                            shown_at,
+                            ended: false,
+                        }
+                    }
+                };
+                let pending = !first.ended
+                    && presentation_of(
+                        &self.committed,
+                        self.specialized_in,
+                        self.prepared.as_ref().map(Prepared::candidate),
+                        self.requested,
+                        (screen.staged_token(), screen.device()),
+                        lifetime,
+                    ) == Presented::Placeholder;
+                if pending && screen.device_lost() {
+                    // The screen's failure, as a frame's.
+                    first.ended = true;
+                    self.first_frame = Some(first);
+                    eprintln!("render: {}", Chain(&RenderError::DeviceLost));
+                    self.drop_screen();
+                    self.shared.failed.store(true, Ordering::Release);
+                    mode = Mode::Idle;
+                    continue;
+                }
+                if pending {
+                    #[cfg(test)]
+                    let now = hold_now(&self.shared, now, first.shown_at);
+                    match held_wait(now, first.shown_at, first_frame_bound(&self.shared))
+                        .filter(|_| self.image.valid(notices_of(self.extent.as_ref())))
+                    {
+                        Some(wait) => {
+                            self.first_frame = Some(first);
+                            #[cfg(all(test, feature = "dev-tools"))]
+                            self.shared
+                                .held_allocations
+                                .store(crate::alloc_count::this_thread(), Ordering::SeqCst);
+                            #[cfg(test)]
+                            self.shared.held[0].fetch_add(1, Ordering::SeqCst);
+                            std::thread::sleep(Duration::from_micros(wait.0.unsigned_abs()));
+                            #[cfg(test)]
+                            self.shared.held[1].fetch_add(1, Ordering::SeqCst);
+                            continue;
+                        }
+                        None => first.ended = true,
+                    }
+                }
+                self.first_frame = Some(first);
+            }
+            let Some(screen) = &mut self.screen else {
+                continue;
+            };
             // Minimized, nothing is presented, so the swap chain's waitable
             // object would not be signaled: frames are paced by the clock
             // instead, and a frame granted before stays granted.
@@ -5417,6 +5549,8 @@ impl Run {
                 }
                 self.granted = true;
             } else {
+                #[cfg(test)]
+                self.shared.clock_paced.fetch_add(1, Ordering::SeqCst);
                 std::thread::sleep(Duration::from_millis(16));
             }
             // The end screen was left (its pages cleared): the page drawn
@@ -5721,48 +5855,6 @@ impl Run {
                         frame_presented = presented;
                     }
                     let pending = presented == Some(Presented::Placeholder);
-                    // The lifetime's first frame is held while it would be
-                    // the pending presentation and the image on the screen
-                    // is still valid, for a bound from the showing
-                    // (design.md "The pending presentation"): nothing is
-                    // built or presented, and a frame granted stays so.
-                    let mut lost = false;
-                    if let Some(lifetime) = loading_frame {
-                        let now = self.clock.now();
-                        let mut first = match self.first_frame {
-                            Some(f) if f.lifetime == lifetime => f,
-                            _ => FirstFrame {
-                                lifetime,
-                                shown_at: update.as_deref().map_or(now, |u| u.origin),
-                                ended: false,
-                            },
-                        };
-                        if pending && !first.ended {
-                            if screen.device_lost() {
-                                // The screen's failure, as a frame's.
-                                lost = true;
-                                first.ended = true;
-                            } else if let Some(wait) =
-                                held_wait(now, first.shown_at, first_frame_bound(&self.shared))
-                                    .filter(|_| self.image.valid(notices_of(self.extent.as_ref())))
-                            {
-                                self.first_frame = Some(first);
-                                #[cfg(all(test, feature = "dev-tools"))]
-                                self.shared
-                                    .held_allocations
-                                    .store(crate::alloc_count::this_thread(), Ordering::SeqCst);
-                                #[cfg(test)]
-                                self.shared.held[0].fetch_add(1, Ordering::SeqCst);
-                                std::thread::sleep(Duration::from_micros(wait.0.unsigned_abs()));
-                                #[cfg(test)]
-                                self.shared.held[1].fetch_add(1, Ordering::SeqCst);
-                                continue;
-                            } else {
-                                first.ended = true;
-                            }
-                        }
-                        self.first_frame = Some(first);
-                    }
                     let sampled = self.clock.now();
                     #[cfg(feature = "dev-tools")]
                     {
@@ -5772,9 +5864,7 @@ impl Run {
                             settled: !pending,
                         });
                     }
-                    let drawn = if lost {
-                        Err(RenderError::DeviceLost)
-                    } else if pending {
+                    let drawn = if pending {
                         // No specialization committed in this lifetime:
                         // the load's lines on a cleared canvas.
                         screen.pending_loading(page, *changed)
