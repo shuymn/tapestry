@@ -39,7 +39,8 @@
 //!    back and waits again, the preparation kept (a local retry); otherwise
 //!    tuning acceptance closes;
 //! 6. the commit; a minimum the commit lengthened (a pending skin's
-//!    specialization declares its loading time only once committed) is
+//!    specialization declares its loading time from its first loading
+//!    frame, or at the commit when no frame drew it before) is
 //!    waited out with acceptance reopened, then closed again on a fresh,
 //!    quiet snapshot applied to the starting settings; the end of loading
 //!    and the last look; then recording opens through the common play
@@ -218,9 +219,10 @@ pub trait LoadingRig: Rig {
     fn loading_ack(&self) -> Option<(u64, TimeUs)> {
         Some((self.loading_lifetime(), TimeUs(i64::MIN)))
     }
-    /// The loading time the play skin declares (`loadend`): the installed
-    /// skin's, or a pending skin's base until its specialization commits.
-    /// None by default.
+    /// The loading time the play skin drawn declares (`loadend`): the
+    /// installed skin's, or for a pending skin the specialization its
+    /// loading frames draw, its latest declaration in the lifetime. None by
+    /// default.
     fn loadend(&self) -> Option<TimeUs> {
         None
     }
