@@ -58,12 +58,13 @@ pub(crate) fn option(id: i32) -> Option<Class<ResOption>> {
     }))
 }
 
-/// The decision timer `id` (built in): the fade-out; 0 and the input
-/// start (1), which never happens here, never set.
+/// The decision timer `id` (built in): the input declaration's end (1)
+/// and the fade-out (2); 0 never set.
 pub(crate) fn timer(id: i32) -> Timer {
     match id {
+        1 => Timer::Builtin(decision_timer::INPUT),
         2 => Timer::Builtin(decision_timer::FADEOUT),
-        0 | 1 => Timer::Unset,
+        0 => Timer::Unset,
         _ => Timer::Unsupported,
     }
 }

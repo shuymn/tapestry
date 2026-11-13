@@ -365,11 +365,7 @@ fn witness_terms_are_disjoint() {
     assert_eq!(r.write_decision_labels(&mut store), FillStep::Complete);
     // A waiting output beside the fill: staged on this thread, as a
     // rebuild's restore stages, since a post would dispose of the fill.
-    store.offer(
-        render::stage_bundle_labels(&db, job(3, "C"))
-            .unwrap()
-            .unwrap(),
-    );
+    store.offer(worker.restage(&db, job(3, "C")).unwrap().unwrap());
     let d = store.memory(Some(&worker));
     assert!(d.labels > 0 && d.staged > 0 && d.upload > 0, "{d:?}");
     assert!(d.staged <= plan.staged_bound(), "{d:?}");

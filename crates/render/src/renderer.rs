@@ -1220,6 +1220,10 @@ pub struct Renderer {
     /// as a skin refuses one.
     #[cfg(any(test, feature = "dev-tools"))]
     decision_fault: bool,
+    /// Tests and development builds: the next settling of the decision
+    /// labels fails as a poll fails.
+    #[cfg(any(test, feature = "dev-tools"))]
+    decision_settle_fault: bool,
     /// Run by a decision label fill after its submission and the scopes'
     /// pop, before its completion is registered: a unit test makes the
     /// device fail there.
@@ -1381,6 +1385,8 @@ impl Renderer {
             result_faults: (false, false),
             #[cfg(any(test, feature = "dev-tools"))]
             decision_fault: false,
+            #[cfg(any(test, feature = "dev-tools"))]
+            decision_settle_fault: false,
             #[cfg(test)]
             decision_after_submit: None,
             #[cfg(test)]
@@ -4891,6 +4897,10 @@ impl Renderer {
         &mut self,
         store: &mut LabelStore,
     ) -> Result<Settled, RenderError> {
+        #[cfg(any(test, feature = "dev-tools"))]
+        if std::mem::take(&mut self.decision_settle_fault) {
+            return Err(RenderError::Poll(wgpu::PollError::Timeout));
+        }
         match self.label_target() {
             Some(t) => decision_labels::settle(&t, store),
             None => Ok(Settled::Pending),
@@ -4899,7 +4909,7 @@ impl Renderer {
 
     /// Restores pinned slot `slot`'s content in `store` from `staged` (its
     /// generation's strings, [`LabelStore::restore_strings`], staged
-    /// again at the current target, [`stage_bundle_labels`](crate::stage_bundle_labels))
+    /// again at the current target, [`LabelWorker::restage`](crate::LabelWorker::restage))
     /// on this renderer, built again: every row written at once and waited
     /// for, installed under the same generation and drawable again; the
     /// slot stays pinned. Until then, after the store's and the book's
@@ -4922,6 +4932,20 @@ impl Renderer {
             Some(t) => decision_labels::restore_pinned(&t, store, slot, staged),
             None => Err(RenderError::LabelRegion { needed: 0, band: 0 }),
         }
+    }
+
+    /// Whether the device was lost: read after the poll that saw a label
+    /// preparation's completion.
+    #[must_use]
+    pub fn device_lost(&self) -> bool {
+        self.gpu.lost()
+    }
+
+    /// Tests and development builds: the next settling of the decision
+    /// labels fails as a poll fails, the device's failure (not a refusal).
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub fn fail_next_decision_settle(&mut self) {
+        self.decision_settle_fault = true;
     }
 
     /// Submits what is queued and registers one flag-only completion for

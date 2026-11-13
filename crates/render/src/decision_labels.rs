@@ -688,18 +688,54 @@ impl LabelBook {
         }
     }
 
-    /// The renderer was built again: a new epoch, every slot free but a
-    /// pinned one, which keeps its generation and is restoring until its
-    /// content is restored ([`restore_pinned`]), the device healthy.
+    /// The renderer was built again: a new epoch, every slot free but the
+    /// active lifetime's pinned one, which keeps its generation and is
+    /// restoring until its content is restored ([`restore_pinned`]), the
+    /// device healthy. A pin of a lifetime that ended is freed: its last
+    /// frames died with the old device, and nothing restores it.
     pub fn reset(&mut self) {
         self.epoch += 1;
+        let active = self.active;
         for s in &mut self.slots {
             match s {
-                LabelState::Pinned { restoring, .. } => *restoring = true,
+                LabelState::Pinned {
+                    restoring,
+                    lifetime,
+                    ..
+                } if active == Some(*lifetime) => *restoring = true,
                 _ => *s = LabelState::Free,
             }
         }
         self.healthy = true;
+    }
+
+    /// The slot pinned by the active lifetime, with its generation and
+    /// key.
+    #[must_use]
+    pub fn active_pin(&self) -> Option<(usize, Gen, &LabelKey)> {
+        let active = self.active?;
+        self.slots.iter().enumerate().find_map(|(i, s)| match s {
+            LabelState::Pinned {
+                generation,
+                key,
+                lifetime,
+                ..
+            } if *lifetime == active => Some((i, *generation, key)),
+            _ => None,
+        })
+    }
+
+    /// Frees ready slot `slot` at `generation`: its content is not the
+    /// labels its key names (equal digests of other strings). Whether it
+    /// was.
+    pub fn forget(&mut self, slot: usize, generation: Gen) -> bool {
+        match self.slots.get_mut(slot) {
+            Some(s @ LabelState::Ready { .. }) if s.generation() == Some(generation) => {
+                *s = LabelState::Free;
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Whether `slot` is pinned at `generation` and restoring: its content
@@ -894,7 +930,7 @@ impl StagedLabels {
 /// # Errors
 ///
 /// The producer's refusal of a line ([`RenderError::Skin`]).
-pub fn stage_labels(
+pub(crate) fn stage_labels(
     skin: &Skin,
     producer: Option<&dyn AttemptText>,
     job: LabelJob,
@@ -956,13 +992,13 @@ pub fn stage_labels(
 
 /// [`stage_labels`] of `job` on this thread with `bundle`'s skin and
 /// producer, never superseded: a rebuild's restaging of a pinned slot's
-/// labels ([`Renderer::restore_decision_labels`](crate::Renderer::restore_decision_labels)).
-/// Preparation work: it allocates.
+/// labels, only through [`LabelWorker::restage`], which quiesces the
+/// worker first. Preparation work: it allocates.
 ///
 /// # Errors
 ///
 /// As [`stage_labels`].
-pub fn stage_bundle_labels(
+pub(crate) fn stage_bundle_labels(
     bundle: &crate::SkinBundle,
     job: LabelJob,
 ) -> Result<Option<StagedLabels>, RenderError> {
@@ -996,6 +1032,8 @@ struct Mailbox {
     /// The job and the ticket its post minted.
     job: Option<(u64, LabelJob)>,
     closed: bool,
+    /// A job taken and not yet ended: its staging may be alive.
+    working: bool,
 }
 
 /// Unit tests: what the worker runs at its steps.
@@ -1013,6 +1051,11 @@ pub(crate) struct WorkerHooks {
 struct WorkerShared {
     mailbox: Mutex<Mailbox>,
     posted: Condvar,
+    /// Notified when a job ends ([`LabelWorker::quiesce`]).
+    idle: Condvar,
+    /// Unit tests: set while a quiesce waits for the job in progress.
+    #[cfg(test)]
+    quiescing: AtomicBool,
     /// The newest ticket: minted by every post and cancel, never reused.
     /// Changed only with `output` locked, which is cleared in the same
     /// lock; the worker's last check before it stores an output is in that
@@ -1099,6 +1142,9 @@ impl LabelWorker {
         let shared = Arc::new(WorkerShared {
             mailbox: Mutex::new(Mailbox::default()),
             posted: Condvar::new(),
+            idle: Condvar::new(),
+            #[cfg(test)]
+            quiescing: AtomicBool::new(false),
             ticket: Arc::new(AtomicU64::new(0)),
             output: Mutex::new(None),
             a8: AtomicU64::new(0),
@@ -1172,6 +1218,49 @@ impl LabelWorker {
     fn cancel(&self) {
         self.supersede();
         locked(&self.shared.mailbox).job = None;
+    }
+
+    /// [`cancel`](Self::cancel), then waits until the job in progress, if
+    /// any, ended and its staging was dropped: the worker holds no staging
+    /// from then on. A superseded job stops at its next line.
+    pub fn quiesce(&self) {
+        self.cancel();
+        let mut m = locked(&self.shared.mailbox);
+        #[cfg(test)]
+        self.shared.quiescing.store(m.working, Ordering::Release);
+        while m.working {
+            m = self
+                .shared
+                .idle
+                .wait(m)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        #[cfg(test)]
+        self.shared.quiescing.store(false, Ordering::Release);
+    }
+
+    /// Unit tests: whether a quiesce waits for the job in progress.
+    #[cfg(test)]
+    pub(crate) fn quiescing(&self) -> bool {
+        self.shared.quiescing.load(Ordering::Acquire)
+    }
+
+    /// `job` staged on this thread with `bundle`'s skin and producer
+    /// ([`stage_bundle_labels`]) once the worker was quiesced
+    /// ([`quiesce`](Self::quiesce)): a rebuild's restaging of the pinned
+    /// slot's labels never stages beside the worker's job. Blocks for the
+    /// worker's line in progress; preparation work, it allocates.
+    ///
+    /// # Errors
+    ///
+    /// As [`stage_labels`].
+    pub fn restage(
+        &self,
+        bundle: &crate::SkinBundle,
+        job: LabelJob,
+    ) -> Result<Option<StagedLabels>, RenderError> {
+        self.quiesce();
+        stage_bundle_labels(bundle, job)
     }
 
     /// The output of the newest job, once returned, `Ok` or `Err`. It is
@@ -1259,6 +1348,7 @@ fn run(
                     return;
                 }
                 if let Some(job) = m.job.take() {
+                    m.working = true;
                     break job;
                 }
                 m = s.posted.wait(m).unwrap_or_else(PoisonError::into_inner);
@@ -1267,6 +1357,9 @@ fn run(
         #[cfg(test)]
         let generation = job.generation;
         let stored = stage_one(s, skin, producer, scratch, ticket, job);
+        // The job ended, its staging stored or dropped.
+        locked(&s.mailbox).working = false;
+        s.idle.notify_all();
         #[cfg(test)]
         if let Some(hook) = &s.hooks.after_job {
             hook(generation, stored);
@@ -1515,6 +1608,17 @@ impl LabelStore {
     #[must_use]
     pub fn restore_strings(&self, slot: usize, generation: Gen) -> Option<&DecisionStrings> {
         match self.contents.get(slot) {
+            Some(Some((g, Held::Restoring(s)))) if *g == generation => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The strings slot `slot`'s content at `generation` was prepared
+    /// from, drawable or waiting to be restored.
+    #[must_use]
+    pub fn strings(&self, slot: usize, generation: Gen) -> Option<&DecisionStrings> {
+        match self.contents.get(slot) {
+            Some(Some((g, Held::Drawable(c)))) if *g == generation => Some(&c.strings),
             Some(Some((g, Held::Restoring(s)))) if *g == generation => Some(s),
             _ => None,
         }
@@ -2291,6 +2395,26 @@ mod tests {
         flags.fire(1);
         b.cool();
         assert!(is_ready(&b, s, 2));
+    }
+
+    /// A reset with two pins, one of a lifetime that ended before a
+    /// boundary retired it and one of the active lifetime: only the active
+    /// one stays pinned (restoring) and is the one to restore; the ended
+    /// one is freed, never restored.
+    #[test]
+    fn reset_keeps_only_the_active_lifetimes_pin() {
+        let mut b = LabelBook::new(T);
+        let a = ready(&mut b, 1, "a");
+        let x = ready(&mut b, 2, "b");
+        b.pin(Path::new("a"), 1, 1).unwrap();
+        b.end(1);
+        b.pin(Path::new("b"), 1, 2).unwrap();
+        b.reset();
+        assert!(is_free(&b, a), "the ended lifetime's pin kept: {b:?}");
+        assert!(b.awaits_restore(x, 2));
+        assert_eq!(b.active_pin().map(|(s, g, _)| (s, g)), Some((x, 2)));
+        b.end(2);
+        assert_eq!(b.active_pin().map(|(s, g, _)| (s, g)), None);
     }
 
     /// The row rule at each of its edges, from the formula's own numbers:

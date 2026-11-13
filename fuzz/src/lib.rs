@@ -563,10 +563,7 @@ fn draw_decision(skin: &skin_model::Skin) -> Vec<usize> {
             now,
             target: [1_920, 1_080],
             layout: &layout,
-            timers: DecisionTimers {
-                screen: Some(TimeUs(0)),
-                fadeout: (now >= t.scene).then_some(t.scene),
-            },
+            timers: DecisionTimers::at(TimeUs(0), &t, now),
         };
         skin.build_decision(&mut dec, &frame, &uvs, &mut batch)
             .expect("an imported decision skin builds");

@@ -2528,13 +2528,16 @@ fn decision_over_an_ended_result() -> (tempfile::TempDir, Rig) {
     let hold = FrameHold::new(&rig.link);
     assert!(wait_until(|| hold.holding()));
     rig.link.end_result();
-    rig.link.show_decision(crate::menu_screen::MenuPage {
-        lines: vec![crate::menu_screen::MenuLine {
-            text: "decision".to_owned(),
-            style: crate::menu_screen::LineStyle::Title,
-        }],
-        caret: None,
-    });
+    rig.link.show_decision(
+        crate::menu_screen::MenuPage {
+            lines: vec![crate::menu_screen::MenuLine {
+                text: "decision".to_owned(),
+                style: crate::menu_screen::LineStyle::Title,
+            }],
+            caret: None,
+        },
+        None,
+    );
     drop(hold);
     assert_eq!(rig.link.mode(), "menu:decision");
     (dir, rig)

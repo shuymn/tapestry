@@ -31,6 +31,7 @@ mod carry;
 mod chart_currency;
 mod chart_images;
 mod controls;
+mod decision_side;
 #[cfg(feature = "dev-tools")]
 mod dev;
 mod end_screen;
@@ -1008,6 +1009,10 @@ fn rig<'a>(
         .context("the adjustment controls cannot be installed")?;
     // What a selection skin shows of the settings keys, read each frame.
     rig.render.tuning(Arc::clone(controls.tuning()));
+    // A decision takeover wakes the game thread, as `Controls::wake_game`.
+    if let Some(game) = controls.game_thread() {
+        rig.render.set_game_wake(Arc::new(move || game.unpark()));
+    }
     Ok(rig)
 }
 

@@ -1093,6 +1093,70 @@ impl Screen for MenuScreen {
         Ok(timing)
     }
 
+    fn decision_rows(&self) -> Option<Result<render::RowPlan, RenderError>> {
+        self.renderer.decision_rows()
+    }
+
+    fn write_decision_labels(&mut self, store: &mut render::LabelStore) -> render::FillStep {
+        self.renderer.write_decision_labels(store)
+    }
+
+    fn settle_decision_labels(
+        &mut self,
+        store: &mut render::LabelStore,
+    ) -> Result<render::Settled, RenderError> {
+        self.renderer.settle_decision_labels(store)
+    }
+
+    fn restore_decision_labels(
+        &mut self,
+        store: &mut render::LabelStore,
+        slot: usize,
+        staged: render::StagedLabels,
+    ) -> Result<(), RenderError> {
+        // Not restoring at that generation: nothing was written, and the
+        // slot's content stays undrawable.
+        match self.renderer.restore_decision_labels(store, slot, staged)? {
+            true => Ok(()),
+            false => Err(RenderError::LabelRegion { needed: 0, band: 0 }),
+        }
+    }
+
+    fn watch_completion(&self) -> Arc<AtomicBool> {
+        self.renderer.watch_completion()
+    }
+
+    fn device_lost(&self) -> bool {
+        self.renderer.device_lost()
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn build_decision(
+        &mut self,
+        dec: &mut skin_model::DecisionScreen,
+        labels: skin_model::DecisionLabels<'_>,
+        frame: &skin_model::DecisionFrame<'_>,
+    ) -> Result<(), BuildError> {
+        #[cfg(all(test, feature = "dev-tools"))]
+        self.probe_alloc();
+        self.renderer.build_decision(dec, labels, frame)
+    }
+
+    fn submit_decision(&mut self) -> Result<FrameTiming, RenderError> {
+        let timing = self.renderer.submit_decision(&[])?;
+        self.shown(timing.presented);
+        Ok(timing)
+    }
+
+    #[cfg(all(test, feature = "dev-tools"))]
+    fn decision_fault(&mut self, settle: bool) {
+        if settle {
+            self.renderer.fail_next_decision_settle();
+        } else {
+            self.renderer.refuse_next_decision();
+        }
+    }
+
     #[cfg(feature = "dev-tools")]
     fn atlas_uploads(&self) -> u64 {
         self.renderer.atlas_uploads()
@@ -1485,6 +1549,29 @@ impl MenuScreen {
         if self.alloc_probe {
             drop(std::hint::black_box(Box::new(0_u8)));
         }
+    }
+
+    /// A skinned selection frame of `u` with `logic` at `now` for the
+    /// allocation guards outside this module (tests): its preparation
+    /// (`changed` as [`selection`](Screen::selection) takes it), the app's
+    /// build ([`build_selection_frame`](Self::build_selection_frame)) and
+    /// the GPU submission. Returns the build's allocations alone.
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn selection_build_count(
+        &mut self,
+        u: &SelectionUpdate,
+        logic: &mut SelectionLogic,
+        changed: bool,
+        now: bms_model::TimeUs,
+    ) -> u64 {
+        use crate::alloc_count::this_thread;
+        self.prepare_selection(u, logic, changed).unwrap().unwrap();
+        let before = this_thread();
+        self.build_selection_frame(u, logic, now, skin_model::AppReadouts::LAUNCH)
+            .unwrap();
+        let built = this_thread() - before;
+        self.renderer.submit_selection(&[]).unwrap();
+        built
     }
 }
 
