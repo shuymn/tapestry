@@ -922,13 +922,16 @@ fn selection_previews_dealloc_alloc() {
     let a_quads = frame(&mut screen, &mut logic, &mut shown, &mut slot, 1);
     assert!(a.upgrade().is_some());
     // A pending update for A superseded while A shows: the pending owner
-    // goes at the offer, A stays.
+    // goes at the offer, A stays. Its owners: the cache, the displayed
+    // update, the skin's state and the pending update, whichever it is.
     assert!(publish(&mut sel, &mut slot).is_some_and(|w| w.ptr_eq(&a)));
-    let (_, freed) = counts(|| {
-        assert!(publish(&mut sel, &mut slot).is_some_and(|w| w.ptr_eq(&a)));
-    });
-    assert!(freed > 0, "the superseded update is freed at the offer");
-    assert!(a.upgrade().is_some());
+    assert_eq!(a.strong_count(), 4);
+    assert!(publish(&mut sel, &mut slot).is_some_and(|w| w.ptr_eq(&a)));
+    assert_eq!(
+        a.strong_count(),
+        4,
+        "the superseded update is released at the offer"
+    );
     assert_eq!(
         frame(&mut screen, &mut logic, &mut shown, &mut slot, 2),
         a_quads
