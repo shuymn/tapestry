@@ -644,32 +644,68 @@ fn a_notes_graph_is_type_0_revealed_over_500_ms() {
     }
 }
 
-/// C31: a timing visualizer's colours as the source reads them. A checked
-/// colour must be hex digits only, so `#00ff00` draws red with a note
-/// (`colorStringValidation`); the empty POOR colour is read by
-/// `Color.valueOf` alone, so `#20304080` is `20304080`; with `transparent`
-/// 1 that band is clear, whatever its colour.
+/// The visualizers' colours read as the result graphs': an optional `#`,
+/// then exactly 6 or 8 hex digits, else opaque red with a note, the empty
+/// POOR band's included; with `transparent` 1 that band is clear, whatever
+/// its colour. Each string is a timing visualizer's line and POOR colour,
+/// drawn by its line at +40 ms and its band at texel 25, and a hit-error
+/// visualizer's line and POOR colour, read by its notes.
 #[test]
-fn timing_visualizer_colours_follow_the_source_s_two_readings() {
-    let dst = r#"{"id": "tv", "dst": [{"x": 100, "y": 1000, "w": 301, "h": 20}]}"#;
-    let (_d, skin, report) = json(
-        r##""timingvisualizer": [{"id": "tv", "lineColor": "#00ff00", "PRColor": "#20304080"}],"##,
-        dst,
-    );
-    assert_eq!(
-        notes(&report),
-        [(
-            Severity::Fallback,
-            NoteKind::InvalidColour { field: "lineColor" }
-        )]
-    );
-    let q = visualized(skin, &[40]);
-    let y = middle(&q);
-    assert_eq!(top(&q, 100.0 + 25.5, y), Some(rgba(0x2030_4080)));
-    assert_eq!(top(&q, 100.0 + 190.5, y), Some(rgba(0xff00_00ff)));
+fn visualizer_colours_read_as_the_graphs_do() {
+    let red = Some(0xff00_00ff);
+    for (s, want) in [
+        ("\"123\"", red),
+        ("\"#123\"", red),
+        ("\"20ff40\"", Some(0x20ff_40ff)),
+        ("\"#20ff40\"", Some(0x20ff_40ff)),
+        ("\"20ff408\"", red),
+        ("\"#20ff408\"", red),
+        ("\"20ff4080\"", Some(0x20ff_4080)),
+        ("\"#20ff4080\"", Some(0x20ff_4080)),
+        ("\"20ff4080aa\"", red),
+        ("\"+10000\"", red),
+        ("\"-10000\"", red),
+        ("\"#+10000\"", red),
+        ("\"+10000ff\"", red),
+        ("\"20ff4g\"", red),
+        ("\"\"", red),
+        ("null", red),
+    ] {
+        let invalid = want == red;
+        let (_d, skin, report) = json(
+            &format!(r#""timingvisualizer": [{{"id": "tv", "lineColor": {s}, "PRColor": {s}}}],"#),
+            r#"{"id": "tv", "dst": [{"x": 100, "y": 1000, "w": 301, "h": 20}]}"#,
+        );
+        let expected: &[_] = if invalid {
+            &[
+                (
+                    Severity::Fallback,
+                    NoteKind::InvalidColour { field: "lineColor" },
+                ),
+                (
+                    Severity::Fallback,
+                    NoteKind::InvalidColour { field: "PRColor" },
+                ),
+            ]
+        } else {
+            &[]
+        };
+        assert_eq!(notes(&report), expected, "timing {s}");
+        let q = visualized(skin, &[40]);
+        let y = middle(&q);
+        assert_eq!(top(&q, 100.0 + 190.5, y), want.map(rgba), "line {s}");
+        assert_eq!(top(&q, 100.0 + 25.5, y), want.map(rgba), "POOR {s}");
+        let (_d, _, report) = json(
+            &format!(
+                r#""hiterrorvisualizer": [{{"id": "he", "lineColor": {s}, "PRColor": {s}}}],"#
+            ),
+            r#"{"id": "he", "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#,
+        );
+        assert_eq!(notes(&report), expected, "hit error {s}");
+    }
     let (_d, skin, report) = json(
         r#""timingvisualizer": [{"id": "tv", "transparent": 1, "PRColor": "zz"}],"#,
-        dst,
+        r#"{"id": "tv", "dst": [{"x": 100, "y": 1000, "w": 301, "h": 20}]}"#,
     );
     assert_eq!(notes(&report), []);
     let q = visualized(skin, &[40]);

@@ -1058,7 +1058,7 @@ fn a_note_offset_off_the_lanes_refuses() {
 }
 
 #[test]
-fn ids_resolve_in_the_source_order() {
+fn ids_resolve_in_table_order() {
     // HIDDEN+ is looked up before the note: the destination is HIDDEN+'s
     // paint, dropped without its file, and there are no lanes.
     let hidden = format!(
@@ -1068,12 +1068,19 @@ fn ids_resolve_in_the_source_order() {
     let l = import_body(&body("", &hidden, &[NOTES]));
     assert_eq!(l.ok().scratch, None);
     assert!(has(l.report(), NoteKind::MissingAsset));
-    // A pmchara sharing the note's id refuses.
+    // So is a pmchara: unsupported, dropped, and there are no lanes.
     let chara = format!(
         r#"{}, "pmchara": [{{"id": "notes", "src": "a"}}]"#,
         note("")
     );
-    refused(import_body(&body("", &chara, &[NOTES])), "id");
+    let l = import_body(&body("", &chara, &[NOTES]));
+    assert_eq!(l.ok().scratch, None);
+    assert!(has(
+        l.report(),
+        NoteKind::Unsupported {
+            object: skin_beatoraja::Object::PmChara
+        }
+    ));
     // A second note destination refuses.
     refused(lanes("", &[NOTES]), "note");
 }

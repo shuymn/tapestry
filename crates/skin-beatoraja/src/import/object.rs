@@ -1,15 +1,15 @@
 //! Object tables by id, built on first use, in the source's lookup order
 //! (`JsonSkinObjectLoader.java:38-~560`, `PlaySkinObjectLoader.java` at
 //! `0.8.9`): the first record of an id wins in each table, and the first
-//! table that has the id wins, except `judgegraph`: a later common table
-//! holding the id (up to the gauge) wins over it, as the source's judge
-//! graph match does not return. The play loader sets `note` and keeps
-//! looking, so a later play object of the same id overrides it
-//! (`JsonPlaySkinObjectLoader.java:37-181`): `note` is looked up last.
-//! The selection loader looks up the common objects, the gauge among
-//! them, then its `songlist` (`JsonSelectSkinObjectLoader.java:30-37`):
-//! the play loader's own objects are never looked up there. The result
-//! and decision loaders look up the common objects alone.
+//! table that has the id wins, whether or not its object's file, texture
+//! or font loads (design.md "Differences from the source", imported
+//! skins). The play loader sets `note` and keeps looking, so a later play
+//! object of the same id overrides it (`JsonPlaySkinObjectLoader.java:
+//! 37-181`): `note` is looked up last. The selection loader looks up the
+//! common objects, the gauge among them, then its `songlist`
+//! (`JsonSelectSkinObjectLoader.java:30-37`): the play loader's own
+//! objects are never looked up there. The result and decision loaders
+//! look up the common objects alone.
 
 use std::collections::HashMap;
 
@@ -114,7 +114,8 @@ pub(crate) struct Objects {
 
 impl Objects {
     /// The object destination id `id` names on a `kind` screen: the kind
-    /// and its record.
+    /// and its record, from the first table the screen looks up that has
+    /// a record of the id.
     pub(crate) fn lookup(
         &mut self,
         def: &mut Definition,
@@ -122,65 +123,17 @@ impl Objects {
         id: &str,
         kind: ScreenKind,
     ) -> Result<Option<(Object, u32)>, ImportError> {
-        // A judge graph match stands only if no later common table holds
-        // the id (`JsonSkinObjectLoader.java:475-555`).
-        let mut judge_graph = None;
         for (i, (slot, &(name, object))) in self.maps.iter_mut().zip(&ORDER).enumerate() {
-            if !looked_up(kind, i) || (judge_graph.is_some() && i >= COMMON) {
+            if !looked_up(kind, i) {
                 continue;
             }
             if slot.is_none() {
                 *slot = Some(index(def, records(tables, name), false)?);
             }
             if let Some(&rec) = slot.as_ref().and_then(|m| m.get(id)) {
-                if object == Object::JudgeGraph {
-                    judge_graph = Some((object, rec));
-                    continue;
-                }
                 return Ok(Some((object, rec)));
             }
         }
-        Ok(judge_graph)
-    }
-
-    /// Whether more than one of the play loader's tables has a record of
-    /// id `id`.
-    pub(crate) fn shared(
-        &mut self,
-        def: &mut Definition,
-        tables: &Tables,
-        id: &str,
-    ) -> Result<bool, ImportError> {
-        let mut found = false;
-        for &(_, object) in ORDER.iter().take(SONG_LIST) {
-            if self.names(def, tables, id, object)? {
-                if found {
-                    return Ok(true);
-                }
-                found = true;
-            }
-        }
-        Ok(false)
-    }
-
-    /// Whether a record of `object`'s table has id `id`.
-    pub(crate) fn names(
-        &mut self,
-        def: &mut Definition,
-        tables: &Tables,
-        id: &str,
-        object: Object,
-    ) -> Result<bool, ImportError> {
-        let Some(slot) = ORDER.iter().position(|&(_, o)| o == object) else {
-            return Ok(false);
-        };
-        let name = ORDER.get(slot).map_or("", |&(n, _)| n);
-        if let Some(m) = self.maps.get_mut(slot) {
-            if m.is_none() {
-                *m = Some(index(def, records(tables, name), false)?);
-            }
-            return Ok(m.as_ref().is_some_and(|m| m.contains_key(id)));
-        }
-        Ok(false)
+        Ok(None)
     }
 }

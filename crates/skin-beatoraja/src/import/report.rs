@@ -270,8 +270,8 @@ pub enum NoteKind {
     Stretch(i32),
     /// An offset the play sets at run time.
     RuntimeOffset(i32),
-    /// An alpha offset on animated colour, or of mixed sign; HIDDEN+'s
-    /// offset 5 is one (−255 while HIDDEN+ is off).
+    /// An alpha offset on animated colour; HIDDEN+'s offset 5 is one (−255
+    /// while HIDDEN+ is off).
     OffsetAlpha,
     Track(TrackWhy),
     Timer(TimerWhy),
@@ -389,7 +389,9 @@ impl fmt::Display for NoteKind {
             Self::Blend(b) => write!(f, "an unsupported blend {b}"),
             Self::Stretch(s) => write!(f, "an unsupported stretch {s}"),
             Self::RuntimeOffset(id) => write!(f, "a run-time offset {id}"),
-            Self::OffsetAlpha => f.write_str("an alpha offset (HIDDEN+'s offset 5 among them) on animated colour or of mixed sign"),
+            Self::OffsetAlpha => {
+                f.write_str("an alpha offset (HIDDEN+'s offset 5 among them) on animated colour")
+            }
             Self::Track(why) => write!(f, "an unsupported track ({why:?})"),
             Self::Timer(why) => write!(f, "an unsupported timer ({why:?})"),
             Self::Deviation(d) => write!(f, "deviation {d:?}"),

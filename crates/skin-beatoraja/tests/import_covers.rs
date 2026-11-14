@@ -120,6 +120,39 @@ fn lift_keeps_its_own_height() {
     assert_eq!(rects(&l, 5_000, 0, 500), [[20, 580, 430, 100]]);
 }
 
+/// A `liftCover` record wrapped in `if`/`value` is LIFT's object while its
+/// option is selected, and no object otherwise.
+#[test]
+fn a_wrapped_lift_draws_when_selected() {
+    let object = lift_object("");
+    let record = object
+        .strip_prefix(r#""liftCover": ["#)
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap();
+    let wrapped = |def: &str| {
+        let objects = format!(
+            r#"{}, "liftCover": [{{"if": 900, "value": {record}}}]"#,
+            note("")
+        );
+        import_body(&format!(
+            r#""property": [{{"name": "p", "item": [{{"name": "on", "op": 900}},
+                {{"name": "off", "op": 901}}], "def": "{def}"}}], {}"#,
+            body("", &objects, &[NOTES, &lift("")])
+        ))
+    };
+    let plain = with(&object, &[&lift("")]);
+    let on = wrapped("on");
+    assert!(!has(on.report(), NoteKind::UndefinedObject));
+    assert_eq!(rects(&on, 5_000, 0, 500), rects(&plain, 5_000, 0, 500));
+    let off = wrapped("off");
+    assert!(has(off.report(), NoteKind::UndefinedObject));
+    assert_eq!(
+        rects(&off, 5_000, 0, 500),
+        rects(&with("", &[]), 5_000, 0, 500)
+    );
+    assert_ne!(rects(&on, 5_000, 0, 500), rects(&off, 5_000, 0, 500));
+}
+
 #[test]
 fn lift_and_sudden_plus_share_the_lane() {
     let l = with(&lift_object(""), &[&cover(""), &lift("")]);

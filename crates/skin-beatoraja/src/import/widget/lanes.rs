@@ -578,7 +578,7 @@ impl Cx<'_> {
         }
         let (o, rotates) = self.configured(&dst.offsets);
         // A probe: the element's own reading draws the colour and reports.
-        let keys = self.read_keys(dst, None, Colour::Unused)?;
+        let keys = self.read_keys(dst, Colour::Unused)?;
         if rotates || keys.keys.iter().any(|k| k.angle != 0) {
             return Ok(false);
         }

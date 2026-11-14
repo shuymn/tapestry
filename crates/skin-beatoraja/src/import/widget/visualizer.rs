@@ -16,14 +16,11 @@
 //! and failing on a pixmap it cannot make. An `alpha` that is not finite
 //! becomes the finite weight that steps the average alike ([`finite`]).
 //!
-//! A colour is the source's `colorStringValidation`: hex digits only, at
-//! least six, else opaque red; then `Color.valueOf`: the first six digits,
-//! and an alpha only from exactly eight. The empty POOR band's colour is
-//! read without that check (`Color.valueOf` alone: an optional `#`, each
-//! pair a signed hex number clamped to 0 to 255), and is clear with
-//! `transparent` 1. A POOR colour `Color.valueOf` refuses fails the
-//! source's skin; here it is red with a note, as a checked colour that
-//! turns red is.
+//! Every colour, the empty POOR band's included, is read as the result
+//! graphs read theirs ([`colour`]): an optional `#`, then exactly 6 or 8
+//! hex digits; anything else, or a JSON `null`, is opaque red with a note
+//! (design.md "Differences from the source", imported skins). The POOR
+//! band is clear with `transparent` 1, its colour then unread.
 //!
 //! Its destination keeps its track, timer, visibility, blend, colour,
 //! alpha and angle. A stretch other than the default and a `filter` are
@@ -38,15 +35,15 @@ use skin_model::{
 use super::super::policy::Role;
 use super::super::report::{NoteKind, Severity, Span};
 use super::super::{Cx, Dst};
+use super::result_graphs::colour;
 use crate::error::ImportError;
 
-/// The source's error colour: opaque red.
+/// The error colour: opaque red.
 const RED: Rgba8 = Rgba8([0xff, 0, 0, 0xff]);
 /// `Color.CLEAR`.
 const CLEAR: Rgba8 = Rgba8([0; 4]);
 
-/// The timing visualizer's checked colours (`JsonSkin.java:312-318`): the
-/// line, the centre, then PERFECT to BAD.
+/// The timing visualizer's colours (`JsonSkin.java:312-318`): the line, the centre, then PERFECT to BAD.
 const TIMING_NAMES: [(&str, &str); 6] = [
     ("lineColor", "00FF00FF"),
     ("centerColor", "FFFFFFFF"),
@@ -58,8 +55,7 @@ const TIMING_NAMES: [(&str, &str); 6] = [
 /// The timing visualizer's POOR colour.
 const TIMING_POOR: &str = "000000FF";
 
-/// The hit-error visualizer's checked colours (`JsonSkin.java:293-300`):
-/// the line, the centre, the average, then PERFECT to BAD.
+/// The hit-error visualizer's colours (`JsonSkin.java:293-300`): the line, the centre, the average, then PERFECT to BAD.
 const HIT_NAMES: [(&str, &str); 7] = [
     ("lineColor", "99CCFF80"),
     ("centerColor", "FFFFFFFF"),
@@ -71,29 +67,6 @@ const HIT_NAMES: [(&str, &str); 7] = [
 ];
 /// The hit-error visualizer's POOR colour.
 const HIT_POOR: &str = "CC292980";
-
-/// libGDX's `Color.valueOf(s)`: one leading `#` dropped, then the first
-/// three pairs, each `Integer.valueOf(pair, 16)` clamped to 0 to 255, and
-/// the fourth pair as alpha when exactly eight characters are left, else
-/// opaque; `None` where it throws.
-pub(crate) fn value_of(s: &str) -> Option<Rgba8> {
-    let hex: Vec<char> = s.strip_prefix('#').unwrap_or(s).chars().collect();
-    let pair = |i: usize| {
-        let p: String = hex.get(i..i + 2)?.iter().collect();
-        let v = i32::from_str_radix(&p, 16).ok()?;
-        u8::try_from(v.clamp(0, 255)).ok()
-    };
-    let a = if hex.len() == 8 { pair(6)? } else { 0xff };
-    Some(Rgba8([pair(0)?, pair(2)?, pair(4)?, a]))
-}
-
-/// The source's checked colour, `Color.valueOf(colorStringValidation(s))`:
-/// `None` where the check gives red.
-pub(crate) fn checked(s: &str) -> Option<Rgba8> {
-    (s.len() >= 6 && s.chars().all(|c| c.is_ascii_hexdigit()))
-        .then(|| value_of(s))
-        .flatten()
-}
 
 /// The EMA mode of `emaMode` (`SkinHitErrorVisualizer.java:165-187`).
 fn ema_mode(mode: i32) -> EmaMode {
@@ -122,9 +95,9 @@ fn within(v: i32, range: std::ops::RangeInclusive<u32>) -> Option<u32> {
 }
 
 impl Cx<'_> {
-    /// The checked colours of `fields` named and defaulted by `names`; a
-    /// colour that does not pass is red with a note.
-    fn checked_colours<const N: usize>(
+    /// The colours of `fields` named and defaulted by `names`; a colour
+    /// that does not read is red with a note.
+    fn colours<const N: usize>(
         &mut self,
         at: Span,
         fields: [Option<u32>; N],
@@ -132,19 +105,18 @@ impl Cx<'_> {
     ) -> Result<[Rgba8; N], ImportError> {
         let mut out = [RED; N];
         for ((slot, field), (name, default)) in out.iter_mut().zip(fields).zip(names) {
-            // An explicit JSON `null` fails the source's skin: red, as an
-            // invalid colour.
+            // An explicit JSON `null` is red, as an invalid colour.
             let s = match (field, self.opt_string(field, name)?) {
                 (Some(_), None) => None,
                 (_, s) => Some(s.unwrap_or_else(|| default.to_owned())),
             };
-            *slot = self.colour_or_red(at, s.as_deref().and_then(checked), name);
+            *slot = self.colour_or_red(at, s.as_deref().and_then(colour), name);
         }
         Ok(out)
     }
 
     /// The POOR band's colour: clear with `transparent` 1, else `field`'s
-    /// (`default` when absent) read by `Color.valueOf` alone.
+    /// (`default` when absent), read as every other colour.
     fn poor_colour(
         &mut self,
         at: Span,
@@ -155,11 +127,8 @@ impl Cx<'_> {
         if transparent {
             return Ok(CLEAR);
         }
-        let s = match (field, self.opt_string(field, "PRColor")?) {
-            (Some(_), None) => None,
-            (_, s) => Some(s.unwrap_or_else(|| default.to_owned())),
-        };
-        Ok(self.colour_or_red(at, s.as_deref().and_then(value_of), "PRColor"))
+        let [c] = self.colours(at, [field], [("PRColor", default)])?;
+        Ok(c)
     }
 
     /// `c`, or red with a note on `name`.
@@ -222,7 +191,7 @@ impl Cx<'_> {
             return self.drop_el(role, at, NoteKind::UnsupportedField { field: "width" });
         };
         let fields = self.def.fields(rec, TIMING_NAMES.map(|(n, _)| n));
-        let [line, center, pg, gr, gd, bd] = self.checked_colours(at, fields, TIMING_NAMES)?;
+        let [line, center, pg, gr, gd, bd] = self.colours(at, fields, TIMING_NAMES)?;
         let pr = self.poor_colour(at, transparent, poor, TIMING_POOR)?;
         let Some(c) = self.common_with(role, &dst, super::judge_graph::follows())? else {
             return Ok(());
@@ -307,7 +276,7 @@ impl Cx<'_> {
             return self.drop_el(role, at, NoteKind::UnsupportedField { field: "width" });
         };
         let fields = self.def.fields(rec, HIT_NAMES.map(|(n, _)| n));
-        let [line, center, ema, pg, gr, gd, bd] = self.checked_colours(at, fields, HIT_NAMES)?;
+        let [line, center, ema, pg, gr, gd, bd] = self.colours(at, fields, HIT_NAMES)?;
         let pr = self.poor_colour(at, transparent, poor, HIT_POOR)?;
         let Some(c) = self.common_with(role, &dst, super::judge_graph::follows())? else {
             return Ok(());
@@ -342,36 +311,9 @@ impl Cx<'_> {
 
 #[cfg(test)]
 mod tests {
-    use skin_model::{EmaMode, Rgba8};
+    use skin_model::EmaMode;
 
-    use super::{checked, ema_mode, finite, value_of};
-
-    /// The checked grammar: hex digits only, at least six; the first six
-    /// digits, alpha only from exactly eight.
-    #[test]
-    fn a_checked_colour_is_hex_of_six_or_more() {
-        assert_eq!(checked("FF00FF80"), Some(Rgba8([0xff, 0, 0xff, 0x80])));
-        assert_eq!(checked("ff00ff"), Some(Rgba8([0xff, 0, 0xff, 0xff])));
-        assert_eq!(checked("FF00FF8"), Some(Rgba8([0xff, 0, 0xff, 0xff])));
-        assert_eq!(checked("FF00FF80AA"), Some(Rgba8([0xff, 0, 0xff, 0xff])));
-        for bad in ["#ff00ff", "ff00f", "", "ff00fg", "+10000", "ff 00ff"] {
-            assert_eq!(checked(bad), None, "{bad}");
-        }
-    }
-
-    /// `Color.valueOf` alone: an optional `#`, signed pairs clamped, alpha
-    /// only from exactly eight; `None` where it throws.
-    #[test]
-    fn value_of_is_libgdx_s_reading() {
-        assert_eq!(value_of("#00000080"), Some(Rgba8([0, 0, 0, 0x80])));
-        assert_eq!(value_of("CC292980"), Some(Rgba8([0xcc, 0x29, 0x29, 0x80])));
-        assert_eq!(value_of("+10000"), Some(Rgba8([1, 0, 0, 0xff])));
-        assert_eq!(value_of("-10000"), Some(Rgba8([0, 0, 0, 0xff])));
-        assert_eq!(value_of("1234567"), Some(Rgba8([0x12, 0x34, 0x56, 0xff])));
-        for bad in ["", "#", "abc", "zz0000", "#12345"] {
-            assert_eq!(value_of(bad), None, "{bad}");
-        }
-    }
+    use super::{ema_mode, finite};
 
     /// A weight that is not finite becomes one the model takes and that
     /// steps alike; a finite one is kept.

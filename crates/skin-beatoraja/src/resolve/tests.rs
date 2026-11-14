@@ -8,7 +8,7 @@ use std::collections::BTreeSet;
 
 use crate::error::{ImportError, InputLimit};
 use crate::limits::Limits;
-use crate::resolve::{Definition, resolve};
+use crate::resolve::{ARRAYS, Definition, resolve};
 
 fn skin(src: &str) -> tempfile::TempDir {
     let d = tempfile::tempdir().unwrap();
@@ -336,5 +336,137 @@ fn a_string_float_rounds_as_a_number_token() {
         let [a] = def.fields(def.top(), ["a"]);
         let v = def.float(a.unwrap(), "alpha").unwrap();
         assert_eq!(v.to_bits(), 0x3f80_0000, "{src}");
+    }
+}
+
+/// The object arrays the source registers no serializer for.
+const OBJECT_ARRAYS: [&str; 4] = ["bpmgraph", "hiddenCover", "liftCover", "pmchara"];
+
+/// The `id` of each record of the top-level array `name` of a play skin
+/// whose `name` is `field`, beside `files`, with option 901 enabled under
+/// `limits`.
+fn object_ids(
+    name: &str,
+    field: &str,
+    files: &[(&str, &str)],
+    limits: Limits,
+) -> Result<Vec<Option<String>>, ImportError> {
+    let d = skin(&format!(r#"{{"type": 0, "{name}": {field}}}"#));
+    for (file, text) in files {
+        let path = d.path().join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, text).unwrap();
+    }
+    let mut def = Definition::read_with(d.path(), "s.json", limits)?;
+    let enabled = BTreeSet::from([901]);
+    let t = resolve(&mut def, &enabled).and_then(|mut r| r.tables(&enabled))?;
+    let i = ARRAYS.iter().position(|a| *a == name).unwrap();
+    t.arrays[i]
+        .iter()
+        .map(|&rec| {
+            let [id] = def.fields(rec, ["id"]);
+            Ok(match id {
+                Some(id) => def.string(id, "id")?,
+                None => None,
+            })
+        })
+        .collect()
+}
+
+fn ids(v: &[&str]) -> Vec<Option<String>> {
+    v.iter().map(|s| Some((*s).to_owned())).collect()
+}
+
+/// `bpmgraph`, `hiddenCover`, `liftCover` and `pmchara` expand as every
+/// array field: a selected `value` and `values`, nested includes each
+/// relative to its own file, a record choice and a plain record, in
+/// order; an unselected branch adds nothing and its include is never
+/// read. At field level an include is the included array and an object
+/// one record.
+#[test]
+fn every_object_array_expands_its_wrappers() {
+    let items = r#"[
+        {"if": 901, "value": {"id": "a"}},
+        {"if": -901, "value": {"id": "x"}},
+        {"if": 901, "values": [{"id": "b"}, {"id": "c"}]},
+        {"include": "d/i.json"},
+        {"if": -901, "values": {"include": "missing.json"}},
+        [{"if": -901, "value": {"id": "x"}}, {"if": 901, "value": {"id": "f"}}],
+        {"id": "g"}
+    ]"#;
+    let files = [
+        ("d/i.json", r#"[{"id": "d"}, {"include": "j.json"}]"#),
+        ("d/j.json", r#"[{"id": "e"}]"#),
+    ];
+    for name in OBJECT_ARRAYS {
+        let standard = |field: &str| object_ids(name, field, &files, Limits::STANDARD).unwrap();
+        assert_eq!(
+            standard(items),
+            ids(&["a", "b", "c", "d", "e", "f", "g"]),
+            "{name}"
+        );
+        assert_eq!(
+            standard(r#"{"include": "d/i.json"}"#),
+            ids(&["d", "e"]),
+            "{name}"
+        );
+        assert_eq!(standard(r#"{"id": "h"}"#), ids(&["h"]), "{name}");
+    }
+}
+
+/// Their expanded records count against the expanded cap: a selected
+/// `values` of two fits a cap of two, one of three does not.
+#[test]
+fn object_arrays_count_against_the_expanded_cap() {
+    let limits = Limits {
+        expanded: 2,
+        ..Limits::STANDARD
+    };
+    for name in OBJECT_ARRAYS {
+        assert_eq!(
+            object_ids(
+                name,
+                r#"[{"if": 901, "values": [{"id": "a"}, {"id": "b"}]}]"#,
+                &[],
+                limits
+            )
+            .unwrap(),
+            ids(&["a", "b"]),
+            "{name}"
+        );
+        let over = object_ids(
+            name,
+            r#"[{"if": 901, "values": [{"id": "a"}, {"id": "b"}, {"id": "c"}]}]"#,
+            &[],
+            limits,
+        );
+        assert!(
+            matches!(
+                over,
+                Err(ImportError::Input {
+                    limit: InputLimit::Expanded,
+                    ..
+                })
+            ),
+            "{name}: {over:?}"
+        );
+    }
+}
+
+/// An include of a missing file there refuses, as an item or as the
+/// field.
+#[test]
+fn a_missing_object_array_include_refuses() {
+    for name in OBJECT_ARRAYS {
+        for field in [
+            r#"[{"include": "missing.json"}]"#,
+            r#"{"include": "missing.json"}"#,
+        ] {
+            let r = object_ids(name, field, &[], Limits::STANDARD);
+            assert!(
+                matches!(r, Err(ImportError::Read { .. })),
+                "{name} {field}: {r:?}"
+            );
+        }
     }
 }

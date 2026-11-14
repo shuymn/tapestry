@@ -413,21 +413,57 @@ fn a_system_image_is_removed_too() {
     assert_eq!(invoked(&mut p, 1_000, &[]), 1);
 }
 
-/// A missing image sharing a valid judge's id keeps the existing refusal
-/// rather than being removed.
+/// An image whose `src` names no source, its id held by a later table too
+/// (a number, or the judge): the image is the destination's object, and
+/// the source makes none of it, so the destination draws nothing and its
+/// `draw` is never consumed: not compiled, and no schedule note.
 #[test]
-fn a_missing_image_sharing_a_judge_s_id_still_refuses() {
-    let body = format!(
-        "table.insert(skin.image, {{ id = \"j\", src = \"nope\", x = 0, y = 0, w = 8, h = 8 }})\n{}",
-        judge(&[], "", 1)
-    );
-    assert!(matches!(
-        import(&body),
-        Err(ImportError::Critical {
-            part: skin_beatoraja::CriticalPart::Judge,
-            ..
-        })
-    ));
+fn a_shared_destination_without_a_source_compiles_nothing() {
+    use skin_beatoraja::NoteKind;
+    let image =
+        "table.insert(skin.image, { id = \"x\", src = \"nope\", x = 0, y = 0, w = 8, h = 8 })\n";
+    let draw = "draw = function() return ms.time() >= 0 end,";
+    for later in [
+        "skin.value = { { id = \"x\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 1, ref = 71 } }\n"
+            .to_owned(),
+        judge(&[], "", 1).replace("id = \"j\"", "id = \"x\""),
+    ] {
+        let i = import(&format!("{image}{later}{}", dst("x", draw)))
+            .unwrap_or_else(|e| panic!("{later}: {e:?}"));
+        assert_eq!(
+            i.callbacks,
+            [Disposition::ClassifiedOnly],
+            "{later}"
+        );
+        let kinds = common::kinds(&i.imported.report);
+        assert!(kinds.contains(&NoteKind::UndefinedSource), "{later}: {kinds:?}");
+        assert!(
+            !kinds.iter().any(|k| matches!(k, NoteKind::Schedule { .. })),
+            "{later}: {kinds:?}"
+        );
+    }
+}
+
+/// A callable used by such a removed destination and by a kept one keeps
+/// the kept use's outcome, read before or after it, and runs once a frame,
+/// for the kept destination alone.
+#[test]
+fn a_removed_shared_destination_keeps_another_use() {
+    let shared = "table.insert(skin.image, { id = \"x\", src = \"nope\", x = 0, y = 0, w = 8, h = 8 })\n\
+         skin.value = { { id = \"x\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 1, ref = 71 } }\n\
+         local function f() return ms.time() >= 0 end\n";
+    for body in [
+        format!("{shared}{}{}", dst("x", "draw = f,"), dst("i", "draw = f,")),
+        format!("{shared}{}{}", dst("i", "draw = f,"), dst("x", "draw = f,")),
+    ] {
+        let i = import(&body).unwrap();
+        assert_eq!(i.callbacks, [Disposition::Compiled], "{body}");
+        #[cfg(feature = "dev-tools")]
+        {
+            let mut p = played(&body);
+            assert_eq!(invoked(&mut p, 1_000, &[]), 1, "{body}");
+        }
+    }
 }
 
 /// A use on a kept destination keeps its outcome when the same callable
