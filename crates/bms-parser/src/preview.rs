@@ -3,8 +3,8 @@
 //! the 1× times of its hidden notes, BGA and layer events and scroll
 //! changes, which the loader neither plays nor draws, and a timeline that
 //! keeps the tempo changes and STOPs before them and runs at least to the
-//! bar line of the last measure holding a poor-BGA event (channel 06),
-//! which is no shown object.
+//! bar line of the last measure a channel line writes, whatever its channel
+//! or data, which is no shown object.
 //!
 //! They are timed by the loader's own timing over the chart's objects and
 //! the preview's together, a timeline of their own apart from the play
@@ -31,21 +31,22 @@ pub fn inputs(source: &Source, limits: &Limits) -> Option<PreviewInputs> {
         .filter(|o| matches!(o.kind, ObjectKind::Bgm(id) if source.scroll_defs.contains_key(&id)))
         .cloned()
         .collect();
-    if source.shown.is_empty()
-        && scrolls.is_empty()
-        && source.poor_bar.is_none()
-        && !timing::has_tail(source)
-    {
+    // Only a measure past the chart's objects and measure lengths adds a
+    // bar line.
+    let bar = source
+        .written_bar
+        .filter(|b| b.measure > timing::last_measure(source));
+    if source.shown.is_empty() && scrolls.is_empty() && bar.is_none() && !timing::has_tail(source) {
         return Some(PreviewInputs::default());
     }
     let first_shown = source.objects.len();
     let first_scroll = first_shown + source.shown.len();
-    let first_poor = first_scroll + scrolls.len();
-    let mut objects = Vec::with_capacity(first_poor + 1);
+    let first_bar = first_scroll + scrolls.len();
+    let mut objects = Vec::with_capacity(first_bar + 1);
     objects.extend_from_slice(&source.objects);
     objects.extend_from_slice(&source.shown);
     objects.extend(scrolls);
-    objects.extend(source.poor_bar);
+    objects.extend(bar);
     let both = Source {
         bpm: source.bpm.clone(),
         bpm_defs: source.bpm_defs.clone(),
@@ -60,7 +61,7 @@ pub fn inputs(source: &Source, limits: &Limits) -> Option<PreviewInputs> {
     let mut inputs = PreviewInputs::default();
     let mut scroll: Vec<(TimelineId, i128)> = Vec::new();
     for o in &timed.objects {
-        if o.seq >= first_poor {
+        if o.seq >= first_bar {
             // A point at its bar line alone.
             continue;
         } else if o.seq >= first_scroll {
