@@ -30,11 +30,8 @@ pub fn recovery_fs() -> Box<dyn RecoveryFs> {
 /// admits only a regular file, so the open never reaches a pipe or a
 /// device. The handle asks only to read attributes, which no share mode
 /// guards, so a file another process holds without sharing still counts
-/// rather than changing its set's identity for that launch.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "nothing opens the sound sets' recovery state yet")
-)]
+/// rather than changing its set's identity for that launch. The writers in
+/// the data root count a link's names with it too ([`game::clear_link`]).
 pub fn link_count(path: &Path) -> Option<u64> {
     let file = OpenOptions::new()
         .access_mode(FILE_READ_ATTRIBUTES.0)

@@ -46,6 +46,7 @@ use crate::loudness::Loudness;
 #[cfg(test)]
 use crate::priority::Unchanged;
 use crate::priority::{Checked, ThreadMode};
+use crate::sound_sets_disk::link_count;
 use crate::ui_text::{Label, Message};
 
 /// How often a load's wait for its chart's background measurement looks
@@ -72,8 +73,27 @@ pub fn database(root: &DataRoot) -> PathBuf {
     root.path().join("library.db")
 }
 
-/// Why the library cannot be opened: another process holds it, or the
-/// library refused.
+/// The files SQLite and the [`Library`] keep beside the database.
+const BESIDE: [&str; 4] = ["-wal", "-shm", "-journal", ".lock"];
+
+/// Removes a link at the database's name and at each of its files'
+/// ([`BESIDE`]), so neither the library, which follows a link at its
+/// file, nor SQLite writes through one into another file, such as a sound
+/// set's when the data root lies in one (design.md "Threat Model", T18).
+/// The library is derived from the charts and the records, so a database
+/// that was a link is rebuilt.
+fn clear_links(database: &Path) -> std::io::Result<()> {
+    game::clear_link(database, link_count)?;
+    for suffix in BESIDE {
+        let mut name = database.as_os_str().to_owned();
+        name.push(suffix);
+        game::clear_link(Path::new(&name), link_count)?;
+    }
+    Ok(())
+}
+
+/// Why the library cannot be opened: another process holds it, a link
+/// at its files cannot be removed, or the library refused.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
     /// Another player process runs on this data root.
@@ -90,6 +110,15 @@ pub enum OpenError {
     Folder {
         /// The data root.
         root: PathBuf,
+        /// Why.
+        #[source]
+        source: std::io::Error,
+    },
+    /// A link at the database or a file beside it cannot be removed.
+    #[error("the link {} cannot be removed", path.display())]
+    Link {
+        /// The link.
+        path: PathBuf,
         /// Why.
         #[source]
         source: std::io::Error,
@@ -111,7 +140,12 @@ pub fn open(root: &DataRoot) -> Result<(Library, Opened), OpenError> {
         root: root.path().to_owned(),
         source,
     })?;
-    let (library, opened) = Library::open(&database(root)).map_err(|e| match e {
+    let database = database(root);
+    clear_links(&database).map_err(|source| OpenError::Link {
+        path: database.clone(),
+        source,
+    })?;
+    let (library, opened) = Library::open(&database).map_err(|e| match e {
         LibraryError::AlreadyOpen { .. } => OpenError::Running {
             root: root.path().to_owned(),
         },
@@ -1232,6 +1266,58 @@ pub(crate) mod tests {
         let e = open(&root).unwrap_err();
         assert!(matches!(e, OpenError::Running { .. }), "{e:?}");
         assert!(e.to_string().contains(&root.path().display().to_string()));
+    }
+
+    /// The data root is a sound set, and links stand at the library's
+    /// files: `library.db` a symbolic link to the set's empty
+    /// `scratch.wav`, `library.db-shm` one to its `select.wav`,
+    /// `library.db.lock` a dangling one to its missing `fail.wav`, and
+    /// `library.db-wal` a second name of its `clear.wav`. Opening the
+    /// library removes each link and builds its own files, so the set's
+    /// files keep their bytes and times and none is added (design.md
+    /// T18). Making the symbolic links needs the right to; without it the
+    /// test says so and checks nothing.
+    // Covers: T18
+    #[test]
+    fn the_library_never_writes_through_a_link_into_a_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = DataRoot::new(dir.path().join("data"));
+        let set = root.path();
+        std::fs::create_dir_all(set).unwrap();
+        let files = [
+            ("scratch.wav", &b""[..]),
+            ("select.wav", b"a select sound"),
+            ("clear.wav", b"a clear sound"),
+        ];
+        for (name, bytes) in files {
+            std::fs::write(set.join(name), bytes).unwrap();
+        }
+        let stamp = |name: &str| {
+            let path = set.join(name);
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            (std::fs::read(&path).unwrap(), modified)
+        };
+        let before: Vec<_> = files.iter().map(|(name, _)| stamp(name)).collect();
+        for (link, target) in [
+            ("library.db", "scratch.wav"),
+            ("library.db-shm", "select.wav"),
+            ("library.db.lock", "fail.wav"),
+        ] {
+            if !crate::log_file::tests::symlink(target, &set.join(link)) {
+                return;
+            }
+        }
+        std::fs::hard_link(set.join("clear.wav"), set.join("library.db-wal")).unwrap();
+
+        let (library, _) = open(&root).unwrap();
+        drop(library);
+        let after: Vec<_> = files.iter().map(|(name, _)| stamp(name)).collect();
+        assert_eq!(after, before, "a set file was written");
+        assert!(!set.join("fail.wav").exists(), "fail.wav was created");
+        for name in ["library.db", "library.db.lock"] {
+            let meta = std::fs::symlink_metadata(set.join(name)).unwrap();
+            assert!(meta.is_file() && !meta.is_symlink(), "{name}");
+        }
     }
 
     /// A gate the scan thread waits at before any work, so the pass cannot
