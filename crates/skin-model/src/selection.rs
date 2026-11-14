@@ -6,8 +6,9 @@
 //! screen reads it, with the player's own strings in [`SelectionLabels`].
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use bms_model::ChartSummary;
+use bms_model::{ChartSummary, NOTE_CATEGORIES, SpeedRow, Tempo};
 
 use crate::GaugeLook;
 
@@ -389,6 +390,28 @@ pub struct SelectedChart {
     /// The scan's preview numbers of its draw with seed 0; `None` when
     /// that draw is refused.
     pub info: Option<SelectedInfo>,
+    /// The scan's preview graphs of the same draw; `None` without a stored
+    /// profile current for the file. Shared: an update carries the same
+    /// graphs while the cursor's chart is unchanged.
+    pub graphs: Option<Arc<ChartGraphs>>,
+}
+
+/// What a song list's notes and BPM graphs draw of a chart (design.md
+/// "Loading and Song Selection", Summaries): the scan's stored preview
+/// profile, decoded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChartGraphs {
+    /// The notes by category, a bin each, of `bin_seconds` 1× seconds.
+    pub bins: Vec<[u16; NOTE_CATEGORIES]>,
+    pub bin_seconds: u32,
+    /// The content's length in whole ms, which the BPM graph spans.
+    pub length_ms: u32,
+    /// The tempo rows; `None` when the profile left them out (past its
+    /// bounds).
+    pub rows: Option<Vec<SpeedRow>>,
+    /// The exact MAIN tempo: `Some(None)` when no note weighs, `None` when
+    /// it is unknown.
+    pub main: Option<Option<Tempo>>,
 }
 
 /// The preview numbers the scan stores for a chart (design.md "Loading and

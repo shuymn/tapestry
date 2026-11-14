@@ -1480,6 +1480,7 @@ impl SelectScreen {
                 .and_then(|s| s.best.as_ref())
                 .map(crate::bests::selected_best),
             info: e.info.map(selected_info),
+            graphs: None,
         }
     }
 

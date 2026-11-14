@@ -126,6 +126,7 @@ fn the_topmost_target_takes_the_press() {
                 song_list: Some(def),
                 ratio_bars: vec![slider()],
                 pointer: vec![action(at, 12, ClickType::Plus)],
+                ..SelectionDefs::default()
             },
             &v,
         );

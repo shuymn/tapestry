@@ -222,8 +222,8 @@ pub use select::schema::{SELECTION, VALUE_MAX as SELECTION_VALUE_MAX};
 pub use select::schema::{field as selection_field, timer as selection_timer};
 pub use select::{Selection, SelectionError, SelectionFrame, SelectionTimers};
 pub use selection::{
-    BestPlay, ChartLabels, FolderId, MAX_VISIBLE_ROWS, OwnLamp, Ratio, RowFeatures, RowKey,
-    RowKind, RowScore, RowView, SelectedBest, SelectedChart, SelectedInfo, SelectionLabels,
+    BestPlay, ChartGraphs, ChartLabels, FolderId, MAX_VISIBLE_ROWS, OwnLamp, Ratio, RowFeatures,
+    RowKey, RowKind, RowScore, RowView, SelectedBest, SelectedChart, SelectedInfo, SelectionLabels,
     SelectionOrder, SelectionPlace, SelectionSettings, SelectionView, SpeedReference, SpeedView,
     VolumeReading,
 };

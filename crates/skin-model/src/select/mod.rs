@@ -12,8 +12,9 @@
 pub(crate) mod schema;
 
 use std::cell::Cell;
+use std::sync::Arc;
 
-use bms_model::{Tempo, TimeUs};
+use bms_model::{NOTE_CATEGORIES, Tempo, TimeUs};
 
 use self::schema::{VALUE_MAX, field, timer};
 use crate::chart_image::{ChartImage, ChartKey, ChartTable};
@@ -21,11 +22,13 @@ use crate::expr::{State, TIMER_OFF};
 use crate::layout::Layout;
 use crate::play::timers::app_fields;
 use crate::pointer::{RowHit, SearchBounds, Target};
+use crate::selection::ChartGraphs;
 use crate::selection::{
     ChartLabels, Ratio, RowKind, RowScore, RowView, SelectionLabels, SelectionOrder,
     SelectionPlace, SelectionSettings, SelectionView, SpeedReference, SpeedView,
 };
 use crate::widget::Starts;
+use crate::widget::bpm_graph::{BpmGraphDef, BpmInput, BpmRaster};
 use crate::widget::glyphs::{self, GlyphLine};
 use crate::widget::song_list::{LampKey, RowBind, RowStyle};
 use crate::widget::text::{ChartText, MAX_TEXT_BYTES, TextTable};
@@ -159,6 +162,12 @@ pub struct Selection {
     /// The live key of the array its frames draw from, set by the frame's
     /// renderer before each build.
     chart_live: Option<ChartKey>,
+    /// The cursor's chart's preview graphs as of the last view, and each
+    /// BPM graph element's pixmap prepared from them (empty without
+    /// graphs, rows or a MAIN above 0). Prepared at the view, released at
+    /// the next view with other graphs or with the state, never in a build.
+    graphs: Option<Arc<ChartGraphs>>,
+    bpm: Box<[BpmRaster]>,
 }
 
 impl Selection {
@@ -203,6 +212,8 @@ impl Selection {
             prepared: None,
             chart: None,
             chart_live: None,
+            graphs: None,
+            bpm: Box::default(),
         }
     }
 
@@ -253,7 +264,8 @@ impl Selection {
             + glyphs::lines_bytes(&self.row_bitmap)
             + size_of_val(&*self.targets)
             + size_of_val(&*self.row_hits)
-            + size_of_val(&*self.search);
+            + size_of_val(&*self.search)
+            + self.graph_bytes();
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }
 
@@ -279,6 +291,66 @@ impl Selection {
 
     pub(crate) fn slots(&self) -> usize {
         self.ms.len()
+    }
+
+    /// Takes `graphs` for its graph elements: when they are not the graphs
+    /// it holds (by identity), prepares each BPM graph element of `plan`
+    /// from them, releasing the old pixmaps. Called with the view, never in
+    /// a build: it allocates.
+    pub(crate) fn take_graphs(
+        &mut self,
+        graphs: Option<&Arc<ChartGraphs>>,
+        plan: &[(BpmGraphDef, [u32; 2])],
+    ) {
+        let same = match (&self.graphs, graphs) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same && self.bpm.len() == plan.len() {
+            return;
+        }
+        self.graphs = graphs.cloned();
+        self.bpm = plan
+            .iter()
+            .map(|(def, [cols, rows])| match self.graphs.as_deref() {
+                Some(g) => bpm_raster(def, g, *cols, *rows),
+                None => BpmRaster::default(),
+            })
+            .collect();
+    }
+
+    /// The notes graph's bins, with no cursor; `None` without graphs.
+    pub(crate) fn notes_graph(
+        &self,
+    ) -> Option<(
+        &[[u16; NOTE_CATEGORIES]],
+        crate::widget::judge_graph::Cursors,
+    )> {
+        let g = self.graphs.as_deref()?;
+        let cursors = crate::widget::judge_graph::Cursors {
+            seconds: u32::try_from(g.bins.len())
+                .unwrap_or(u32::MAX)
+                .saturating_mul(g.bin_seconds.max(1)),
+            play: None,
+            section: None,
+        };
+        Some((&g.bins, cursors))
+    }
+
+    /// BPM graph element `slot`'s prepared pixmap.
+    pub(crate) fn bpm_raster(&self, slot: usize) -> Option<&BpmRaster> {
+        self.bpm.get(slot)
+    }
+
+    /// The bytes its graphs' pixmaps hold.
+    fn graph_bytes(&self) -> usize {
+        size_of_val(&*self.bpm)
+            + self
+                .bpm
+                .iter()
+                .map(|b| size_of_val(&*b.runs))
+                .sum::<usize>()
     }
 
     /// Sets the cursor's chart's images its frames draw and its image
@@ -559,6 +631,26 @@ impl Selection {
             |_| true,
         );
         Ok(())
+    }
+}
+
+/// BPM graph element `def`'s pixmap of `cols` × `rows` texels from the
+/// selected chart's `graphs`: empty without its rows (left out past the
+/// profile's bounds), or without a MAIN above 0, as a chart whose notes
+/// weigh nothing has none to scale by (design.md "Rendering and Skins",
+/// selection graphs).
+fn bpm_raster(def: &BpmGraphDef, graphs: &ChartGraphs, cols: u32, rows: u32) -> BpmRaster {
+    match (&graphs.rows, graphs.main) {
+        (Some(data), Some(Some(main))) => def.prepare(
+            &BpmInput {
+                rows: data,
+                main,
+                length_ms: i64::from(graphs.length_ms),
+            },
+            cols,
+            rows,
+        ),
+        _ => BpmRaster::default(),
     }
 }
 

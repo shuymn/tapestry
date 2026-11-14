@@ -247,6 +247,7 @@ fn skin() -> Fx {
                     source: RatioSource::ComboRate,
                 },
             ],
+            ..SelectionDefs::default()
         },
     )
     .unwrap();

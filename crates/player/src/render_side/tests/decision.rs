@@ -88,6 +88,7 @@ fn view_on(chart: &str, title: &str) -> SelectionView {
             clears: 0,
             best: None,
             info: None,
+            graphs: None,
         }),
         ..SelectionView::default()
     }

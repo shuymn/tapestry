@@ -186,6 +186,9 @@ impl Cx<'_> {
             Object::Slider => self.ratio_bar(dst, rec, false),
             Object::Graph => self.ratio_bar(dst, rec, true),
             Object::SongList => self.song_list_element(dst, rec),
+            // The cursor's chart's notes graph (type 0) and BPM graph.
+            Object::JudgeGraph => self.judge_graph(dst, rec),
+            Object::BpmGraph => self.bpm_graph(dst, rec),
             _ => self.drop_el(Role::Decorative, at, NoteKind::Unsupported { object }),
         };
         self.end_value_gate();

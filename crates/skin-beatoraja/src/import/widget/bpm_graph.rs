@@ -117,7 +117,7 @@ impl Cx<'_> {
                 ),
             }
         }
-        let Some(common) = self.common_with(role, &dst, super::judge_graph::follows())? else {
+        let Some(common) = self.common_with(role, &dst, self.graph_opts())? else {
             return Ok(());
         };
         if dst.filter != 0 {
