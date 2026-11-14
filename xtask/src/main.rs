@@ -95,7 +95,7 @@ fn main() -> ExitCode {
             report("check-fidelity", fidelity::run(&workspace_manifest(), mode))
         }
         Some("check-fmt") if rest.is_empty() => {
-            report("check-fmt", fmt::run(&workspace_manifest()))
+            fmt::main(&workspace_manifest(), |line| eprintln!("{line}"))
         }
         Some("banned-words") => banned_words::run(&rest),
         Some("portable") => portable::run(&workspace_manifest(), &rest),
@@ -110,20 +110,29 @@ fn main() -> ExitCode {
 }
 
 fn report(name: &str, result: anyhow::Result<Vec<String>>) -> ExitCode {
+    report_with(name, result, |line| eprintln!("{line}"))
+}
+
+/// [`report`], each line given to `line` instead of printed.
+fn report_with(
+    name: &str,
+    result: anyhow::Result<Vec<String>>,
+    mut line: impl FnMut(String),
+) -> ExitCode {
     match result {
         Ok(diagnostics) if diagnostics.is_empty() => {
-            eprintln!("{name}: ok");
+            line(format!("{name}: ok"));
             ExitCode::SUCCESS
         }
         Ok(diagnostics) => {
             for d in &diagnostics {
-                eprintln!("{name}: {d}");
+                line(format!("{name}: {d}"));
             }
-            eprintln!("{name}: {} violation(s)", diagnostics.len());
+            line(format!("{name}: {} violation(s)", diagnostics.len()));
             ExitCode::from(1)
         }
         Err(e) => {
-            eprintln!("{name}: error: {e:#}");
+            line(format!("{name}: error: {e:#}"));
             ExitCode::from(2)
         }
     }
