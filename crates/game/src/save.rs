@@ -13,7 +13,7 @@ use replay::PlayRecord;
 use rules::RulePreset;
 use tempfile::NamedTempFile;
 
-use crate::bests::{BestKey, BestLookup, BestView, SavedPlay};
+use crate::bests::{BestKey, BestLookup, BestView, PlayerTotals, SavedPlay};
 use crate::error::IoFailure;
 
 /// A complete temporary file in `dir`, under a name no other writer uses; it
@@ -185,6 +185,14 @@ pub trait RecordSink {
     fn best_before(&mut self, key: &BestKey, preset: &RulePreset) -> BestLookup {
         let _ = (key, preset);
         BestLookup::Unavailable
+    }
+
+    /// The player's totals, this play counted, for a result's views
+    /// (design.md "Personal Bests", skin projections). One read per result,
+    /// on the result's thread. `None` by default, and when the read fails:
+    /// a sink that keeps no bests knows none.
+    fn totals(&mut self) -> Option<PlayerTotals> {
+        None
     }
 }
 

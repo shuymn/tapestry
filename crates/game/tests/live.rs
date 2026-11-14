@@ -281,6 +281,8 @@ struct Fake {
     accepted: Vec<game::MenuCommand>,
     /// The preparations whose view was final ([`Rig::result_compared`]).
     compared: usize,
+    /// Where [`Rig::result_compared`] notes itself, shared with a sink.
+    compared_order: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
     /// The result skin's timing the rig gives, until `timing_until` on its
     /// clock (a fallback), then none.
     timing: Option<game::ResultTiming>,
@@ -488,6 +490,7 @@ impl Fake {
             withdraw_calls: 0,
             accepted: Vec::new(),
             compared: 0,
+            compared_order: std::sync::Arc::default(),
             timing: None,
             timing_until: i64::MAX,
             origin_delay: None,
@@ -637,6 +640,7 @@ impl Rig for Fake {
 
     fn result_compared(&mut self, _report: &PlayReport, _screen: &ResultScreen) {
         self.compared += 1;
+        self.compared_order.lock().unwrap().push("result_compared");
     }
 
     fn prepare_screen(&mut self) -> Result<(), SurfaceLost> {
@@ -5586,6 +5590,107 @@ impl game::RecordSink for BestsSink {
             .iter()
             .find(|(h, _)| *h == key.preset_sha256)
             .map_or(game::BestLookup::Unavailable, |(_, a)| a.clone())
+    }
+}
+
+/// A record sink that saves locally and answers the player's totals as
+/// `answer` says, noting in `order` when it counts a play and when it is
+/// asked for them.
+struct TotalsSink {
+    local: game::LocalRecords,
+    answer: Option<game::PlayerTotals>,
+    order: std::sync::Arc<std::sync::Mutex<Vec<&'static str>>>,
+}
+
+impl game::RecordSink for TotalsSink {
+    fn save(&mut self, rec: &replay::PlayRecord) -> Result<game::RecordRef, game::SaveError> {
+        self.local.save(rec)
+    }
+
+    fn after_result(&mut self, _: &game::SavedPlay<'_>) -> Option<game::BestView> {
+        self.order.lock().unwrap().push("after_result");
+        None
+    }
+
+    fn totals(&mut self) -> Option<game::PlayerTotals> {
+        self.order.lock().unwrap().push("totals");
+        self.answer
+    }
+}
+
+/// C12: a result reads the player's totals once, after its play was
+/// counted and before its own view's layout is asked for, whatever the
+/// sink answers; every view shows the same, and a read answered
+/// unavailable is not asked again.
+#[test]
+fn the_result_reads_the_totals_once_after_the_count() {
+    use game::MenuCommand::{NextPreset, PrevPreset};
+    let totals = game::PlayerTotals {
+        plays: 7,
+        clears: 3,
+        counts: [101, 202, 303, 404, 505],
+        play_us: 12_345_900_000,
+    };
+    for answer in [Some(totals), None] {
+        let dir = tempfile::tempdir().unwrap();
+        let root = DataRoot::new(dir.path().to_owned());
+        let mut settings = tapestry_settings(&root);
+        settings.device.input_offset_us = OFFSET;
+        let chart_path = dir.path().join("play.chart");
+        std::fs::write(&chart_path, b"built in code").unwrap();
+        let order = std::sync::Arc::<std::sync::Mutex<Vec<&'static str>>>::default();
+        let parts = Parts {
+            ingest: Box::new(Built(chart())),
+            records: Some(Box::new(TotalsSink {
+                local: game::LocalRecords::new(root.records()),
+                answer,
+                order: std::sync::Arc::clone(&order),
+            })),
+            ..Parts::standard(&root, &settings.player)
+        };
+        let config = SessionConfig {
+            lead_in: TimeUs(1_000 * MS),
+            step: TimeUs(MS),
+            start: TimeUs(0),
+            effects: 4_096,
+            seed: 11,
+            speed: bms_model::Speed::NORMAL,
+            app_version: "0.0.0-test".to_owned(),
+            provenance: BuildProvenance::Development,
+            receive: ReceiveMethod::Scripted,
+            autoplay: None,
+        };
+        let mut loaded = Loaded::load(root, settings, &chart_path, config, parts).unwrap();
+        let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+        let mut rig = Fake::new(items, &[(18_000_000, Command::Quit)], 21_000_000);
+        rig.compared_order = std::sync::Arc::clone(&order);
+        rig.menu = vec![
+            (16_000_000, NextPreset),
+            (16_100_000, NextPreset),
+            (16_200_000, PrevPreset),
+        ];
+        game::live::run_chart(&mut loaded, &mut rig).unwrap();
+        assert_eq!(
+            *order.lock().unwrap(),
+            ["after_result", "totals", "result_compared"],
+            "{answer:?}"
+        );
+        // Every view shown, the own and the others, holds the one read.
+        let views: Vec<_> = [15_999_000, 16_050_000, 16_150_000, 16_250_000]
+            .map(|at| shown(&rig, at))
+            .to_vec();
+        assert_ne!(viewed(views[0]), viewed(views[1]));
+        for screen in &views {
+            assert_eq!(screen.totals(), Some(answer), "{answer:?}");
+        }
+        // Read: not asked again, an unavailable answer included.
+        let mut again = views[3].clone();
+        let mut asked = 0;
+        again.read_totals(&mut || {
+            asked += 1;
+            Some(game::PlayerTotals::default())
+        });
+        assert_eq!((asked, again.totals()), (0, Some(answer)), "{answer:?}");
     }
 }
 

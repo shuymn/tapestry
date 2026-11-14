@@ -33,7 +33,9 @@ use rules::{GaugeKind, GaugeValue, RulePreset};
 
 use crate::attempt::{Attempt, NoteEnd, ScoreBasis, finish_anchor};
 use crate::autoplay::{Autoplay, AutoplayError};
-use crate::bests::{BestKey, BestLookup, BestView, SavedPlay, TargetPlay, score_target};
+use crate::bests::{
+    BestKey, BestLookup, BestView, PlayerTotals, SavedPlay, TargetPlay, score_target,
+};
 use crate::live::{Closing, ClosingEnd, InputWaitError, LiveError, Opening, Rig};
 use crate::logic::{AbortCause, LogicConfig, LogicError, Record};
 use crate::policy::{
@@ -790,6 +792,12 @@ impl Loaded {
             .records
             .as_mut()
             .map_or(BestLookup::Unavailable, |s| s.best_before(key, preset))
+    }
+
+    /// The player's totals, as the record sink answers
+    /// ([`RecordSink::totals`]); unavailable without a sink (an autoplay).
+    pub(crate) fn totals(&mut self) -> Option<PlayerTotals> {
+        self.parts.records.as_mut().and_then(|s| s.totals())
     }
 
     /// Opens the shelf with the preset named in `player.toml` chosen (a

@@ -31,7 +31,7 @@ use replay::verify::Coverage;
 use rules::{GaugeValue, RulePreset};
 use rules_toml::PresetFileError;
 
-use crate::bests::{BestCompare, BestKey, BestLookup, BestView};
+use crate::bests::{BestCompare, BestKey, BestLookup, BestView, PlayerTotals};
 use crate::presets::Shelf;
 use crate::result_figures::{ResultBasis, ResultFigures};
 use crate::result_graphs::{Axis, ResultGraphs, listed};
@@ -280,6 +280,9 @@ pub struct ResultScreen {
     budget: usize,
     evaluations: u64,
     last_evaluation: Option<Duration>,
+    /// The player's totals every view shows: `None` until read, then the
+    /// read's answer, `None` within when they are unavailable.
+    totals: Option<Option<PlayerTotals>>,
 }
 
 impl ResultScreen {
@@ -360,6 +363,7 @@ impl ResultScreen {
             budget,
             evaluations: 0,
             last_evaluation: None,
+            totals: None,
         };
         screen.entries = screen.snapshot(report, shelf);
         // A folder that could not be listed before the result showed is
@@ -542,6 +546,22 @@ impl ResultScreen {
     #[must_use]
     pub const fn basis(&self) -> ResultBasis {
         self.basis
+    }
+
+    /// Reads the player's totals through `read` while they are unread:
+    /// once per result, every view sharing the answer, an unavailable one
+    /// included (design.md "Personal Bests", skin projections).
+    pub fn read_totals(&mut self, read: &mut dyn FnMut() -> Option<PlayerTotals>) {
+        if self.totals.is_none() {
+            self.totals = Some(read());
+        }
+    }
+
+    /// The player's totals every view shows: `None` while unread, `Some`
+    /// of `None` when they were read as unavailable.
+    #[must_use]
+    pub const fn totals(&self) -> Option<Option<PlayerTotals>> {
+        self.totals
     }
 
     /// Compares the viewed result with the best under the viewed preset
