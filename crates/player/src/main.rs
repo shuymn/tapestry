@@ -1834,9 +1834,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             // latch) joins the skins' notices.
             let mut notices: Vec<String> = started.notice.into_iter().collect();
             notices.extend(rig.receive_system_sounds());
-            let notice = (!notices.is_empty()).then(|| notices.join(" / "));
             if let Some(sel) = &mut rig.selection {
-                sel.started(notice, started.selection);
+                sel.started(notices, started.selection);
             }
             (true, None)
         }

@@ -734,7 +734,7 @@ fn a_look_that_publishes_nothing_keeps_the_notices() {
     let (mut sel, _) = crate::selection::tests::tree(dir.path(), &[&["a.bms"]]);
     sel.shelf.set_rescan_after(Duration::from_secs(3_600));
     let refused = crate::imports::notice(ScreenKind::Selection, "refused at startup for the test");
-    sel.started(Some(refused.clone()), None);
+    sel.started(vec![refused.clone()], None);
     with_a_held_refusal(&screens, render, sel, |rig, name| {
         assert_eq!(published_notice(rig, &screens), Some(refused.clone()));
         let entered = rig.selection.as_ref().unwrap().feed.published();

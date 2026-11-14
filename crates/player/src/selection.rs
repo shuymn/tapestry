@@ -641,8 +641,17 @@ impl Selection {
                 self.dirty = true;
                 None
             }
-            Acted::Choose(path) => Some(Pick::Play(path)),
-            Acted::Practice(path) => Some(Pick::Practice(path)),
+            // A choice clears the notices (`SelectScreen::clear_notice`),
+            // the preset refusal among them: a later refusal is not the
+            // shelf's to clear.
+            Acted::Choose(path) => {
+                self.preset_refusal = false;
+                Some(Pick::Play(path))
+            }
+            Acted::Practice(path) => {
+                self.preset_refusal = false;
+                Some(Pick::Practice(path))
+            }
             Acted::Preset(step) => {
                 self.preset_steps.push_back(step);
                 None
@@ -984,11 +993,12 @@ impl Selection {
         self.drain_at(&mut menus.pad, level, now)
     }
 
-    /// What startup left the select screen: a skin's refusal `notice`, and
+    /// What startup left the select screen: its `notices` (a skin's
+    /// refusal, what the system sounds named), each set on its own, and
     /// the installed selection skin's song list (`window`, its center slot
     /// and its placements), which the screen's view is made for.
-    pub fn started(&mut self, notice: Option<String>, window: Option<(usize, usize)>) {
-        if let Some(notice) = notice {
+    pub fn started(&mut self, notices: Vec<String>, window: Option<(usize, usize)>) {
+        for notice in notices {
             self.notice(notice);
         }
         self.feed.window = window;
@@ -6160,6 +6170,25 @@ pub(crate) mod tests {
         assert_eq!(notice(&sel), "presets: denied");
     }
 
+    /// A choice clears the preset refusal with the notices: a refusal of
+    /// the chart set after it, shown with the next page, stays when the
+    /// shelf then opens.
+    #[test]
+    fn a_choice_retires_the_preset_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let notice = |sel: &Selection| sel.screen.page("").lines[2].text.clone();
+        let chart = dir.path().join("charts").join("a.bms");
+        sel.presets("-".to_owned(), Some("mine.toml: broken".to_owned()), false);
+        sel.refused(&chart, "a.bms: the preset cannot open".to_owned(), true);
+        keys(&mut sel, &[MenuKey::Enter]).expect("Enter chooses");
+        sel.refused(&chart, "a.bms: no adapter reads it".to_owned(), false);
+        sel.notice_shown();
+        assert_eq!(notice(&sel), "a.bms: no adapter reads it");
+        sel.presets("mine".to_owned(), None, true);
+        assert_eq!(notice(&sel), "a.bms: no adapter reads it");
+    }
+
     /// The play preset keys step it while the list has the keys: F11 and
     /// F12 step back and forth, in order, and Enter after them chooses
     /// with the steps taken. With the search box focused, or the IME
@@ -7080,7 +7109,7 @@ pub(crate) mod tests {
     fn startup_gives_the_updates_the_skins_window_and_the_notice() {
         let dir = tempfile::tempdir().unwrap();
         let (mut sel, _) = tree(dir.path(), &[&["a.bms", "b.bms", "c.bms"]]);
-        sel.started(Some("refused".to_owned()), Some((3, 7)));
+        sel.started(vec!["refused".to_owned()], Some((3, 7)));
         sel.feed.enter(TimeUs(0));
         let page = sel.screen.page("");
         let u = sel.feed.update(&sel.screen, page, TimeUs(0));

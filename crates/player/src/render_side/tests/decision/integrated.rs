@@ -1074,7 +1074,7 @@ fn run_with(
     }
     let saved = opts.saved;
     let measured: crate::play::MeasuredPlays = Arc::default();
-    sel.started(started.notice, started.selection);
+    sel.started(started.notice.into_iter().collect(), started.selection);
     let settings = game::Settings {
         device: game::DeviceSettings::default(),
         player: game::PlayerSettings::default(),
