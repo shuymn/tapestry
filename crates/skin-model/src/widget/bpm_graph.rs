@@ -27,8 +27,7 @@ pub const MAX_BPM_COLUMNS: u32 = 2_048;
 pub const RUNS_PER_COLUMN: u32 = 4;
 /// The widest stroke a BPM graph takes, in texels (provisional, owner
 /// pattern 7): it bounds how many columns a stroke overhangs its row's
-/// span, so how many strokes one column holds in a preparation, and keeps
-/// the source's `int` stroke arithmetic exact.
+/// span, so how many strokes one column holds in a preparation (T08).
 pub const MAX_BPM_LINE_WIDTH: u32 = 16;
 
 /// A BPM graph's colours, the source's defaults first.
