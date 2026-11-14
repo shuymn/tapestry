@@ -308,8 +308,9 @@ struct Readouts {
 }
 
 /// The cover fields of one frame, `field::COVER_PERMILLE` to
-/// `field::COVER_ADJUSTING`: the stored settings, a play's and a loading
-/// frame's alike.
+/// `field::COVER_ADJUSTING`: the stored settings and the lane cover over
+/// the lane above the lift the lanes draw, a play's and a loading frame's
+/// alike.
 #[derive(Clone, Copy)]
 pub(crate) struct Covers {
     pub(crate) cover: i32,
@@ -343,18 +344,26 @@ pub(crate) fn covers(lanes: &LaneView, c: &CoverSettings) -> Option<Covers> {
     {
         return None;
     }
-    let (cover, lift) = (i32::from(c.cover), i32::from(c.lift));
     Some(Covers {
-        cover,
-        lift,
+        cover: i32::from(c.cover),
+        lift: i32::from(c.lift),
         hidden: i32::from(c.hidden),
-        // Both at most 1 000, so the product fits.
-        absolute: (COVER_PERMILLE - lift) * cover / COVER_PERMILLE,
+        absolute: i32::from(over_lane(lanes.lift, c.cover)),
         cover_enabled: i32::from(c.cover_enabled),
         lift_enabled: i32::from(c.lift_enabled),
         hidden_enabled: i32::from(c.hidden_enabled),
         adjusting: i32::from(c.adjusting),
     })
+}
+
+/// `v` ‰ of the lane above a lift of `lift` ‰, as ‰ of the whole lane:
+/// `⌊(1 000 − l) · v / 1 000⌋` for `l` the lift capped at 1 000, so SUDDEN+'s
+/// and HIDDEN+'s white numbers and `cover.absolute_permille` agree. `v` is
+/// at most 1 000 (checked by every caller), so the product fits and the
+/// result is at most 1 000.
+fn over_lane(lift: u16, v: u16) -> u16 {
+    let left = 1_000 - u32::from(lift.min(1_000));
+    u16::try_from(left * u32::from(v) / 1_000).unwrap_or(0)
 }
 
 /// Reads every timer at `now` from `starts` into `ms`: the built-in ones,
@@ -657,9 +666,7 @@ pub fn native_values(lanes: &LaneView, r: &FrameReadouts) -> Result<NativeValues
         let (num, den) = (u128::from(g.num()), u128::from(g.den()));
         u32::try_from((200 * num + den) / (2 * den)).ok()
     });
-    // Each product is at most 1 000 · 1 000.
-    let left = 1_000 - u32::from(lanes.lift.min(1_000));
-    let white = |v: u16| u16::try_from(left * u32::from(v) / 1_000).unwrap_or(0);
+    let white = |v: u16| over_lane(lanes.lift, v);
     Ok(NativeValues {
         hispeed_x100,
         duration,

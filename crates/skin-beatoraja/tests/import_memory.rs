@@ -374,7 +374,7 @@ fn check_f2(_: &Header, i: Imported) {
     #[rustfmt::skip]
     let shown = [
         "100", "0", "0", "0", "0", "0", "300", "75", "150", "0", "0", "0", "1",
-        "500", "250", "120", "375", "105", "1", "5", "668", "400",
+        "500", "250", "120", "500", "105", "1", "5", "668", "400",
     ];
     let mut d = Drawn::over_with(i.skin, &chart, Some(range), None);
     d.readouts = Some(known);

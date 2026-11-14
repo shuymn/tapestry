@@ -862,6 +862,10 @@ fn rates_and_ranks_need_a_positive_largest() {
     fx_next.view(&at(54, Some(54)));
     fx_next.frame(0);
     assert_eq!(shown(&fx_next), [0]);
+    // Below 1/9 to the next grade, 6/27: 12.
+    fx_next.view(&at(0, Some(54)));
+    fx_next.frame(0);
+    assert_eq!(shown(&fx_next), [1, 2]);
     for (ex, max) in [(0, Some(0)), (12, None)] {
         for fx in [&mut fx_rate, &mut fx_rank, &mut fx_next, &mut fx_bar] {
             fx.view(&at(ex, max));

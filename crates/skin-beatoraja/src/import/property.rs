@@ -340,9 +340,10 @@ pub(crate) enum Value {
     /// added second and margin.
     RemainingMinutes,
     RemainingSeconds,
-    /// The configured lane cover, lift and hidden cover in ‰, and the lane
-    /// cover over the whole lane (`lanecover1`, `lift1`, `hidden1`,
-    /// `lanecover2`, `:68-89`), whatever their switches.
+    /// The configured lane cover, lift and hidden cover in ‰, whatever
+    /// their switches, and the configured lane cover over the whole lane
+    /// above the lift the lanes draw (`lanecover1`, `lift1`, `hidden1`,
+    /// `lanecover2`, `:68-89`).
     CoverPermille,
     LiftPermille,
     HiddenPermille,

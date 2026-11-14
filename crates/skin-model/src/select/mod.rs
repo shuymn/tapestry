@@ -616,15 +616,18 @@ pub(crate) fn rank(ex: u64, max: u64) -> i32 {
     i32::try_from(k).unwrap_or(0)
 }
 
-/// The EX score from `ex` to the next rank of 3/27 steps over `max`
-/// (positive), or to `max` past the last (`ScoreDataProperty.java:100-109`).
+/// The EX score from `ex` to the next rank over `max` (positive), the
+/// smallest gain that raises [`rank`]: `⌈low · max / 27⌉ − ex` for the
+/// first threshold `low` of `RANK_LOW` above F that `ex` does not meet, or
+/// `max − ex` at the top rank, 0 at or past `max`.
 pub(crate) fn next_rank(ex: u64, max: u64) -> u64 {
     let (e, m) = (u128::from(ex), u128::from(max));
-    let next = (0..27_u128)
-        .step_by(3)
-        .find(|&i| 27 * e < i * m)
-        .map_or(m.saturating_sub(e), |i| {
-            (i * m).div_ceil(27).saturating_sub(e)
+    let next = RANK_LOW
+        .iter()
+        .skip(1)
+        .find(|&&low| 27 * e < low * m)
+        .map_or(m.saturating_sub(e), |&low| {
+            (low * m).div_ceil(27).saturating_sub(e)
         });
     u64::try_from(next).unwrap_or(u64::MAX)
 }
@@ -811,13 +814,47 @@ mod tests {
         assert_eq!(rank(47, max), 6);
         assert_eq!(rank(48, max), 7);
         assert_eq!(rank(54, max), 7);
-        // The next multiple of 3/27 above: 6/27 is 12.
-        assert_eq!(next_rank(0, max), 6);
+        // The next grade's threshold: 6/27 is 12, 9/27 18.
         assert_eq!(next_rank(11, max), 1);
         assert_eq!(next_rank(12, max), 6);
         // Past 24/27, to the largest.
         assert_eq!(next_rank(49, max), 5);
-        // A threshold between two points rounds up.
-        assert_eq!(next_rank(0, 10), 2);
+        // The rows `game`'s figures pin (`result_figures_tests.rs`): below
+        // 1/9 to 6/27, a threshold between two points rounded up.
+        for (ex, max, next) in [
+            (0, 54, 12),
+            (5, 54, 7),
+            (6, 54, 6),
+            (48, 54, 6),
+            (54, 54, 0),
+            (55, 54, 0),
+            (0, 27, 6),
+            (2, 27, 4),
+            (0, 5, 2),
+            (0, 10, 3),
+            (1, 10, 2),
+            (0, 4, 1),
+            (0, 0, 0),
+        ] {
+            assert_eq!(next_rank(ex, max), next, "ex {ex} of {max}");
+        }
+    }
+
+    /// Below the top rank the next rank is the smallest gain that raises
+    /// it; at the top rank the gain to the largest.
+    #[test]
+    fn the_next_rank_is_the_smallest_gain_that_raises_it() {
+        for max in 1..=300 {
+            for ex in 0..=max {
+                let (n, r) = (next_rank(ex, max), rank(ex, max));
+                if r == 7 {
+                    assert_eq!(n, max - ex, "ex {ex} of {max}");
+                } else {
+                    assert!(n > 0, "ex {ex} of {max}");
+                    assert!(rank(ex + n, max) > r, "ex {ex} of {max}");
+                    assert_eq!(rank(ex + n - 1, max), r, "ex {ex} of {max}");
+                }
+            }
+        }
     }
 }

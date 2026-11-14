@@ -78,7 +78,9 @@ impl LaneJudge {
     /// The code of a judgment other than a miss whose timing, in the
     /// source's sign (note time minus press), is `source_us`:
     /// `j == 0 ? 1 : 2j + (late ? 1 : 0)` for the source's index `j`, late
-    /// meaning a timing of 0 or less, so on time is late (`:671-672`). An
+    /// meaning a timing below 0 (`:671-672`), so a timing of 0 is early, the
+    /// side the counts take, where the source's lane code alone tests `> 0`
+    /// (design.md "Rendering and Skins", differences from the source). An
     /// empty POOR is index 5. `None` for a miss, index 4, which leaves the
     /// code (`:671`).
     fn code(grade: Grade, source_us: i64) -> Option<u8> {
@@ -90,7 +92,7 @@ impl LaneJudge {
             Grade::Poor => return None,
             Grade::EmptyPoor => 5,
         };
-        Some(2 * j + u8::from(source_us <= 0))
+        Some(2 * j + u8::from(source_us < 0))
     }
 
     /// What lane input `input` reads with this state: 0 when a press

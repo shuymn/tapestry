@@ -1072,6 +1072,25 @@ fn a_refused_loading_state_builds_no_more() {
     assert_eq!(l.count(BACKGROUND), 1);
 }
 
+/// While loading the lanes draw no lift, so the lane cover over the lane
+/// is the configured cover: 500 and 250 stored, both off, read 500.
+#[test]
+fn the_cover_over_the_lane_reads_the_lift_drawn_while_loading() {
+    let mut l = Loader::new(structural());
+    l.covers = CoverSettings {
+        cover: 500,
+        lift: 250,
+        hidden: 0,
+        cover_enabled: false,
+        lift_enabled: false,
+        hidden_enabled: false,
+        adjusting: false,
+    };
+    l.build(100);
+    assert_eq!(l.field(field::COVER_ABSOLUTE_PERMILLE), 500);
+    assert_eq!(l.field(field::LIFT_PERMILLE), 250);
+}
+
 /// A loading number draws nothing for `i32::MIN` and `i32::MAX`, as a
 /// play number does (`SkinNumber.java:135-146` at `0.8.9`).
 #[test]
