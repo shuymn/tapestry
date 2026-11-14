@@ -1408,3 +1408,34 @@ fn a_load_time_read_of_20_to_29_is_live_state() {
         }
     }
 }
+
+/// Numbers 1163 and 1164 on the result screen are the chart's 1× length's
+/// whole minutes and seconds within the minute: 3 690 000 ms (an hour, a
+/// minute and a half) shows 61 and 30; 125 400 ms, 2 and 5.
+#[test]
+fn the_result_length_reads_whole_minutes() {
+    let d = folder(&format!(
+        r#""value": [{{"id": "ex", {DIGITS}, "digit": 4, "ref": 71}},
+                     {{"id": "min", {DIGITS}, "digit": 3, "ref": 1163}},
+                     {{"id": "sec", {DIGITS}, "digit": 2, "ref": 1164}}],
+           "destination": [
+               {{"id": "ex", "dst": [{{"x": 0, "y": 100, "w": 4, "h": 8}}]}},
+               {{"id": "min", "dst": [{{"x": 0, "y": 150, "w": 4, "h": 8}}]}},
+               {{"id": "sec", "dst": [{{"x": 0, "y": 200, "w": 4, "h": 8}}]}},
+               {{"id": "dot", "op": [90], "dst": [{{"x": 0, "y": 300, "w": 8, "h": 8}}]}}]"#
+    ));
+    let skin = import_result(d.path())
+        .unwrap_or_else(|e| panic!("{e:?}"))
+        .skin;
+    let mut r = Res::new(skin);
+    for (ms, min, sec) in [(3_690_000, "61", "30"), (125_400, "2", "5")] {
+        let mut v = ready(1_000, true, best(ResultNumber::Shown(-3)));
+        v.chart.length = Some(TimeUs(ms * 1_000));
+        r.view(&v);
+        assert_eq!(
+            (r.digits(0, EX3), r.digits(0, BPD)),
+            (min.to_owned(), sec.to_owned()),
+            "{ms}"
+        );
+    }
+}

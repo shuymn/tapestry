@@ -944,11 +944,10 @@ fn point_after(h: &mut Harness, [pg, gr, gd]: [u32; 3], max: u32) -> i32 {
     h.field(field::POINT)
 }
 
-/// The source's 7-key point with its intermediate widths
-/// (`ScoreDataProperty.java:76-79` at `0.8.9`); each expected value was
-/// computed by that expression in Java.
+/// The 7-key point, `⌊(150 000·PG + 100 000·GR + 20 000·GD) / N⌋ +
+/// ⌊50 000·M / N⌋`, computed exactly and saturated at `i32::MAX`.
 #[test]
-fn the_point_follows_the_source_s_widths() {
+fn the_point_is_exact_and_saturates() {
     let chart = |n: i64| taps(&(1..=n).map(|i| i * 10).collect::<Vec<_>>());
     let mut four = Harness::empty(&chart(4), &full(0));
     // Every target PERFECT, the maximum combo all of them.
@@ -962,20 +961,19 @@ fn the_point_follows_the_source_s_widths() {
     four.frame(0, &[]);
     assert_eq!(four.field(field::POINT), 187_500);
     let mut seven = Harness::empty(&chart(7), &full(0));
+    // 270 000 / 7 = 38 571, 50 000 / 7 = 7 142.
     assert_eq!(point_after(&mut seven, [1, 1, 1], 1), 45_713);
-    // GREAT's product wraps as an `int`: the r2 witness.
+    // 22 000 GREATs: 100 000 · 22 000 / 22 000 + 50 000.
     let mut many = Harness::empty(&chart(22_000), &full(0));
-    assert_eq!(point_after(&mut many, [0, 22_000, 0], 22_000), -45_225);
-    // GOOD's product wraps as an `int`.
-    assert_eq!(point_after(&mut many, [0, 0, 107_375], 0), -97_612);
-    // The PERFECT sum is a `long` whose quotient keeps its low 32 bits,
-    // and the last addition wraps.
+    assert_eq!(point_after(&mut many, [0, 22_000, 0], 22_000), 150_000);
+    // 107 375 GOODs: ⌊2 147 500 000 / 22 000⌋.
+    assert_eq!(point_after(&mut many, [0, 0, 107_375], 0), 97_613);
     let mut one = Harness::empty(&chart(1), &full(0));
-    assert_eq!(point_after(&mut one, [14_316, 0, 0], 2), -2_147_467_296);
-    // The PERFECT quotient past `i32` keeps its low 32 bits.
-    assert_eq!(point_after(&mut one, [14_317, 0, 0], 0), -2_147_417_296);
-    // The maximum combo's quotient keeps its low 32 bits.
-    assert_eq!(point_after(&mut one, [0, 0, 0], 50_000), -1_794_967_296);
+    // 2 147 400 000 + 50 000, just within `i32`.
+    assert_eq!(point_after(&mut one, [14_316, 0, 0], 1), 2_147_450_000);
+    // 2 147 400 000 + 100 000 is past `i32::MAX`.
+    assert_eq!(point_after(&mut one, [14_316, 0, 0], 2), i32::MAX);
+    assert_eq!(point_after(&mut one, [0, 0, 0], 50_000), i32::MAX);
     // No target: 0, whatever the counts.
     let none = ChartBuilder::new(BPM_150)
         .mine(lane(4), TimeUs(1_000 * MS), 10)

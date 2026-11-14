@@ -1019,16 +1019,16 @@ fn the_hit_error_pixmap_turns_under_the_destination() {
     fx.empty(495.5, 305.0);
 }
 
-/// The source's average after `values`, from 0.
+/// The average after `values` strictly inside ±150, from 0, unrounded,
+/// as the column [`ema_only`] draws it: truncated toward 0.
 fn reference_ema(alpha: f32, values: impl IntoIterator<Item = i32>) -> i64 {
-    let mut ema = 0_i64;
+    let mut ema = 0.0_f64;
     for v in values {
-        let v = i64::from(v);
         if -150 < v && v < 150 {
-            ema = ema.wrapping_add((alpha * v.wrapping_sub(ema) as f32) as i64);
+            ema += f64::from(alpha) * (f64::from(v) - ema);
         }
     }
-    ema
+    (ema * 2_001.0 / 2_001.0).trunc() as i64
 }
 
 /// An average-only visualizer over 2 001 texels at jw 1 000 (`x = 1 000 −
@@ -1109,15 +1109,37 @@ fn each_average_consumes_the_ring_once() {
     assert_eq!(shown_ema(&fresh, 0), 0);
 }
 
-/// C26: any weight the source takes steps as its `long` arithmetic does,
-/// never overflowing. At 1e20 after 1, `(long)(1e20 · 1)` saturates to
-/// `i64::MAX`; after −2 the difference `−2 − MAX` wraps to `MAX`, the
-/// product is past `float`'s range and saturates to `MAX` again, and the
-/// sum wraps to −2: texel 1 002. At −0.5 after 40 the average is −20:
-/// texel 1 020.
+/// C26: the average is kept unrounded. At the weight 0.1, five offsets of
+/// +5 bring it to `5 · (1 − 0.9^5)` = 2.05: texel 998; a sixth, to 2.34;
+/// four more, to 3.26: texel 997. Each step is below 1 ms, which a
+/// per-step truncation would drop, leaving the line at 0.
 #[test]
-fn extreme_weights_step_as_the_source_does() {
-    for (alpha, values, want) in [(1e20_f32, vec![1, -2], -2), (-0.5, vec![40], -20)] {
+fn the_average_moves_by_steps_below_one_ms() {
+    let mut fx = hit_fx(vec![ema_only(0.1)], &[[0, 300, 2_001, 20]], 255, 0);
+    for (n, want) in [(5, 2), (1, 2), (4, 3)] {
+        for _ in 0..n {
+            fx.h.record(5);
+        }
+        fx.frame(0);
+        assert_eq!(shown_ema(&fx, 0), want);
+    }
+    // −5 ten times from 0: −3.26, texel 1 003.
+    let mut late = hit_fx(vec![ema_only(0.1)], &[[0, 300, 2_001, 20]], 255, 0);
+    for _ in 0..10 {
+        late.h.record(-5);
+    }
+    late.frame(0);
+    assert_eq!(shown_ema(&late, 0), -3);
+}
+
+/// C26: any finite weight steps by plain arithmetic and the average is
+/// drawn within the judge width. At 1e20 after 1 and then −2 it is held at
+/// −2^53 (the value itself is pinned by `ema_step`'s unit tests in
+/// `widget/hit_error.rs`), drawn at −1 000: texel 2 000. At −0.5 after 40
+/// the average is −20: texel 1 020.
+#[test]
+fn extreme_weights_stay_finite() {
+    for (alpha, values, want) in [(1e20_f32, vec![1, -2], -1_000), (-0.5, vec![40], -20)] {
         let mut fx = hit_fx(vec![ema_only(alpha)], &[[0, 300, 2_001, 20]], 255, 0);
         for v in values {
             fx.h.record(v);

@@ -228,8 +228,8 @@ pub struct BestFigures {
     /// The BP minus the best's.
     pub bp_diff: ResultNumber,
     pub clear: LampKey,
-    /// The best's max combo, of any counted play; hidden unless above 0,
-    /// as the source draws its old combo only then.
+    /// The best's max combo, of any counted play, 0 included; hidden
+    /// while no play counts for the best.
     pub max_combo: ResultNumber,
     /// The view's max combo minus it; hidden as `max_combo`.
     pub max_combo_diff: ResultNumber,
