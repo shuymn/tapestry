@@ -443,7 +443,7 @@ fn device_and_player_settings_round_trip() {
          hidden = 40\nhidden_on = true\n\
          [skins.play]\nroot = 'D:\\skins\\Mine'\nentry = 'play/play7.luaskin'\n\
          options = { \"Lane cover\" = \"On\" }\nfiles = { \"Background\" = \"bg2.png\" }\n\
-         [sounds]\nbgm_root = ''\n"
+         [sounds]\nbgm_root = ''\nloop_result = true\n"
             .to_owned()
             + &format!("sound_root = '{}'\n", absolute("sets/sound").display()),
     )
