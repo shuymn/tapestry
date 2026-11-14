@@ -191,56 +191,20 @@ pub(crate) fn defines_bga(body: &str) -> bool {
         && body.encode_utf16().nth(6).is_some()
 }
 
-/// The first code point of each run of ten decimal digits, zero to nine,
-/// in the Basic Multilingual Plane: the characters of general category Nd
-/// there (Unicode 15.0), which `Character.digit(c, 10)` accepts.
-const DIGIT_ZEROS: [u32; 37] = [
-    0x0030, 0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66, 0x0CE6,
-    0x0D66, 0x0DE6, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80,
-    0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0,
-    0xFF10,
-];
-
-/// `c`'s value as a decimal digit, as `Character.digit(c, 10)` gives it
-/// for a UTF-16 code unit: a character outside the Basic Multilingual
-/// Plane is two surrogates, neither a digit.
-fn digit(c: char) -> Option<i64> {
-    let c = u32::from(c);
-    DIGIT_ZEROS
-        .iter()
-        .find(|&&zero| (zero..zero + 10).contains(&c))
-        .map(|&zero| i64::from(c - zero))
+/// A header value read as an integer (design.md "Play Lifecycle", the
+/// chart's labels): an integer token, one optional `+` or `-` and then
+/// one or more ASCII digits `0`-`9`, within `i32`; `None` for anything
+/// else, other scripts' digits, inner whitespace and a value past `i32`
+/// included. `text` is the header's value as [`split_header`] trims it.
+pub fn header_integer(text: &str) -> Option<i32> {
+    text.parse().ok()
 }
 
-/// `text` read as the reference decoder's `Integer.parseInt` reads a
-/// header value: one optional `+` or `-`, then one or more decimal digits
-/// ([`digit`]), the value within `i32`; `None` for anything else, the
-/// empty text and surrounding whitespace included.
-pub fn java_int(text: &str) -> Option<i32> {
-    let (negative, digits) = match text.strip_prefix('-') {
-        Some(digits) => (true, digits),
-        None => (false, text.strip_prefix('+').unwrap_or(text)),
-    };
-    if digits.is_empty() {
-        return None;
-    }
-    let mut value: i64 = 0;
-    for c in digits.chars() {
-        // Past `i32`'s magnitude the value is out of range either way.
-        value = value * 10 + digit(c)?;
-        if value > i64::from(i32::MAX) + 1 {
-            return None;
-        }
-    }
-    i32::try_from(if negative { -value } else { value }).ok()
-}
-
-/// Whether `#DIFFICULTY value` replaces the difficulty so far: the
-/// reference decoder sets it only when `Integer.parseInt` reads the value
-/// (jbms-parser `CommandWord.DIFFICULTY`, a `NumberFormatException` only
-/// warned), so a later line it cannot read keeps the earlier value.
+/// Whether `#DIFFICULTY value` replaces the difficulty so far: the last
+/// `#DIFFICULTY` that reads as an integer counts, and a later line that
+/// does not keeps the earlier one (design.md "Play Lifecycle").
 pub(crate) fn sets_difficulty(value: &str) -> bool {
-    java_int(value).is_some()
+    header_integer(value).is_some()
 }
 
 /// Splits `NAME value`, trimming the value.

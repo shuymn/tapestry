@@ -416,6 +416,57 @@ fn schema_6_reads_bga_flags_again() {
     assert_eq!(flags(&lib), want);
 }
 
+/// The level and the difficulty read as integer tokens: a signed level
+/// sorts by its value, and a fullwidth `#DIFFICULTY` keeps the one before
+/// it. A library of schema 10 read them by other rules: opening it under
+/// this version rebuilds it, so the next scan reads every chart again.
+#[test]
+fn schema_10_reads_levels_and_difficulties_again() {
+    let fx = Fixture::new();
+    // An invisible key 6 object, so both list as 7-key charts.
+    let minus = fx.write(
+        "minus.bms",
+        format!(
+            "{}#PLAYLEVEL -1\n#DIFFICULTY 4\n#DIFFICULTY \u{FF13}\n#00138:01\n",
+            chart_text("Minus")
+        )
+        .as_bytes(),
+    );
+    let seven = fx.write(
+        "seven.bms",
+        format!("{}#00138:01\n", chart_text("Seven")).as_bytes(),
+    );
+    let read = |lib: &Library| -> Vec<(PathBuf, Option<String>)> {
+        lib.search(&library::Search {
+            text: "",
+            sort: library::Sort::Level,
+            by_folder: false,
+            limit: 10,
+        })
+        .unwrap()
+        .into_iter()
+        .map(|c| (c.path, c.header.difficulty))
+        .collect()
+    };
+    let want = vec![(minus, Some("4".to_owned())), (seven, None)];
+    {
+        let (lib, _) = fx.open();
+        scan(&lib, std::slice::from_ref(&fx.root));
+        assert_eq!(read(&lib), want);
+    }
+    {
+        let old = rusqlite::Connection::open(fx.db()).unwrap();
+        old.execute_batch("ALTER TABLE charts DROP COLUMN level; PRAGMA user_version = 10;")
+            .unwrap();
+    }
+    let (lib, opened) = fx.open();
+    assert_eq!(opened, Opened::Rebuilt { old_version: 10 });
+    assert_eq!(lib.charts().unwrap(), Vec::new());
+    let report = scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!((report.found, report.read), (2, 2), "a full scan");
+    assert_eq!(read(&lib), want);
+}
+
 /// Loader version 9 kept the last `#DIFFICULTY` whether or not it read
 /// and took a `#BMPxx` by its trimmed name and value; the current loader
 /// keeps the last readable difficulty and reads a `#BMPxx` line by

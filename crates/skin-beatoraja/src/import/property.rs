@@ -1613,7 +1613,7 @@ mod range_tests {
                     v.expr()
                 );
                 let (lo, hi) = v.range();
-                // The play level is signed, as `Integer.parseInt` is, the
+                // The play level is signed, as an integer token is, the
                 // recent timing, as a note time minus a press is, and the
                 // point, whose wrapped terms reach all of `i32`.
                 let least = match v {
