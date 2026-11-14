@@ -607,6 +607,30 @@ fn an_undefined_scroll_change_is_no_point() {
     );
 }
 
+/// Fixture SU-cap: a `#999SC:01` line by itself writes measure 999, whose
+/// bar line at 60 BPM (999 measures of 4 s) is past the 60-minute cap, so
+/// the preview falls back to the play chart's: its seconds and rows are
+/// play's, not the 6 seconds the hidden note at 4 s gives, and the play
+/// chart and its length are the ones without the line. A colon-less
+/// `#999 comment` is no channel line, so it writes no measure and the
+/// preview stays the one without it.
+#[test]
+fn a_written_measure_past_the_cap_leaves_the_preview_as_plays() {
+    let tail = "#BPM 60\n#00011:01\n#00131:01\n";
+    let plain = load(tail, 0).unwrap();
+    let past = format!("{tail}#999SC:01\n");
+    let p = preview(&past);
+    assert_eq!(p.seconds(), plain.profile.seconds());
+    assert_eq!(p.speeds(), plain.profile.speeds());
+    assert_eq!(p.length_ms(), plain.profile.length_ms());
+    let loaded = load(&past, 0).unwrap();
+    assert_eq!(loaded.profile, plain.profile);
+    assert_eq!(loaded.chart.meta.length, plain.chart.meta.length);
+    let comment = preview(&format!("{tail}#999 comment\n"));
+    assert_eq!(comment.seconds().len(), 6);
+    assert_eq!(comment, preview(tail));
+}
+
 /// Fixture SR: a scroll change applies at its own row, not at the first
 /// row of its µs: measure 0 is 4·10⁻⁷ beats long, so its tap, its tempo
 /// change and its scroll change all floor to 0 µs; the change to ×0.5
