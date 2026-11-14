@@ -907,13 +907,14 @@ fn run_with(
     let make: MakeScreen = {
         let seen = Arc::clone(&seen);
         Box::new(move || {
-            let r = render::Renderer::new(
+            let mut r = render::Renderer::new(
                 render::Target::Offscreen {
                     width: 1_920,
                     height: 1_080,
                 },
                 render::AdapterChoice::Warp,
             )?;
+            r.set_offscreen_frame_wait(super::FRAME_WAIT);
             Ok(Box::new(Noted {
                 menu: MenuScreen::new(r, Some(render::text::Fonts::runtime()?)),
                 seen: Arc::clone(&seen),

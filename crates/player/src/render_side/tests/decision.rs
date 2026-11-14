@@ -552,6 +552,13 @@ struct Rig {
     _turn: crate::warp_turn::Turn,
 }
 
+/// How long the rigs' offscreen frames wait for the frame before them on
+/// WARP before one is skipped, in place of the renderer's 100 ms: the
+/// tests count the frames that reached the target, and a loaded machine
+/// slows a software adapter past the renderer's wait, skipping a frame
+/// the test lets through (`presented` false, noted nowhere).
+const FRAME_WAIT: Duration = Duration::from_secs(60);
+
 impl Rig {
     fn new(dir: &TempDir) -> Self {
         Self::sized(dir, TARGET)
@@ -592,13 +599,14 @@ impl Rig {
         let seen = Arc::new(Seen::default());
         let s = Arc::clone(&seen);
         let make: MakeScreen = Box::new(move || {
-            let r = render::Renderer::new(
+            let mut r = render::Renderer::new(
                 render::Target::Offscreen {
                     width: size[0],
                     height: size[1],
                 },
                 render::AdapterChoice::Warp,
             )?;
+            r.set_offscreen_frame_wait(FRAME_WAIT);
             let device = s.builds.fetch_add(1, Ordering::AcqRel) + 1;
             Ok(Box::new(Recorder {
                 menu: MenuScreen::new(r, Some(render::text::Fonts::runtime()?)),
