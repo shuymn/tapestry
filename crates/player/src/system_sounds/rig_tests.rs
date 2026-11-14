@@ -459,19 +459,8 @@ fn the_shutdown_ends_the_system_sounds_before_the_audio_thread() {
 
     // The close's stops.
     let _fx = arm_bgm(&Seam::new(Arc::new(RealClock)), &Arc::default());
-    let settings = game::Settings {
-        device: game::DeviceSettings::default(),
-        player: game::PlayerSettings::default(),
-    };
-    let render = crate::render_side::tests::Installers::default().spawn_bare();
-    let ((probe, before, numbered), _) = crate::tests::on_rig_playing(
-        settings,
-        render,
-        input::QpcClock::start(),
-        None,
-        (silent, 1),
-        |_| {},
-        |rig, _, _| {
+    let ((probe, before, numbered), _) =
+        crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
             let dir = tempfile::tempdir().unwrap();
             one_chart(rig, dir.path());
             let probe = rig.audio.control.failure_probe();
@@ -490,8 +479,7 @@ fn the_shutdown_ends_the_system_sounds_before_the_audio_thread() {
             let numbered = rig.audio.control.system_seq_word();
             let before = [SystemKind::Select, SystemKind::Decide].map(|k| probe.system_stops(k));
             (probe, before, numbered)
-        },
-    );
+        });
     let kinds = [SystemKind::Select, SystemKind::Decide];
     assert_eq!(
         kinds.map(|k| probe.system_stops(k)),
