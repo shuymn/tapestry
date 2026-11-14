@@ -560,7 +560,9 @@ impl SystemVoices {
         self.current.as_ref().map(SystemGeneration::id)
     }
 
-    /// The sound the current generation plays for `kind`, if it has one.
+    /// The sound the current generation plays for `kind`, if it has one
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
     #[must_use]
     pub fn current_sound(&self, kind: SystemKind) -> Option<&Arc<Sound>> {
         self.current.as_ref()?.sound(kind)

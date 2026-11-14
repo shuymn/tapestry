@@ -357,9 +357,10 @@ fn work(mut setup: Setup, asks: Receiver<Ask>, replies: Sender<Reply>) {
 }
 
 /// Plays `kind`'s built-in sound, if it has one, without a set: whether it
-/// did. It allocates and frees nothing.
+/// did. Every fallback to a built-in sound comes here. It allocates and
+/// frees nothing.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-fn built_in(control: &AudioControl, kind: SystemKind) -> bool {
+pub fn built_in(control: &AudioControl, kind: SystemKind) -> bool {
     match kind.built_in() {
         Some(BuiltIn::Tone) => {
             control.play_tone();
@@ -491,7 +492,6 @@ impl SystemSounds {
             self.polls += 1;
         }
         self.service(control);
-        self.name_latch();
     }
 
     /// The entry to selection's re-roll: stops every set kind of the last
@@ -636,7 +636,6 @@ impl SystemSounds {
         self.name_latch();
         self.end_worker();
         self.take_returns(control);
-        self.name_latch();
         if self.skipped_rerolls > 0 {
             let n = self.skipped_rerolls;
             (self.hooks.log)(&format!(

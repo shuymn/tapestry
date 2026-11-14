@@ -1557,12 +1557,14 @@ impl PickBudget {
         self.used.load(Ordering::Relaxed)
     }
 
-    /// Charges `bytes` outside [`decode_one`] (a test's stand-in decoder).
+    /// Charges `bytes` outside [`decode_one`], as a test's stand-in decoder
+    /// does (dev-tools).
     ///
     /// # Errors
     ///
     /// [`FileRefusal::OverCap`] with [`Cap::BankMemory`] when they do not
     /// fit in what remains; nothing is charged then.
+    #[cfg(feature = "dev-tools")]
     pub fn charge(&self, bytes: u64) -> Result<(), FileRefusal> {
         self.used
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {

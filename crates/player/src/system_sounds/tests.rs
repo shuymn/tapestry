@@ -4,17 +4,20 @@
 //! large sound, a set picker, a test clock and a spawner.
 
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "dev-tools")]
+use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "dev-tools")]
+use audio::Sound;
 use audio::{
     AudioEngine, BankLimits, Decoded, FileRefusal, GenId, PickBudget, RecordingOutput, SimConfig,
-    SimDevice, Sound, SoundBank, SystemKind, SystemVoices,
+    SimDevice, SoundBank, SystemKind, SystemVoices,
 };
 use bms_model::TimeUs;
 use game::sound_sets::{
@@ -25,6 +28,7 @@ use game::{AudioWaitError, AudioWorker, DataRoot, SoundSettings, audio_control};
 use super::{Clock, Event, Hooks, RealClock, Reason, Settled, Setup, Spawn, SystemSounds};
 
 const RATE: u32 = 48_000;
+#[cfg(feature = "dev-tools")]
 const MIB: u64 = 1024 * 1024;
 /// How long a test waits for real work (a decode, a step) before failing.
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -251,7 +255,9 @@ pub(crate) struct Rule {
     /// Decodes on after a cancel.
     pub(crate) ignore_cancel: bool,
     pub(crate) panic: bool,
-    /// A silent sound of this many mono samples, not read from the file.
+    /// A silent sound of this many mono samples, not read from the file
+    /// (dev-tools: charged through `PickBudget::charge`).
+    #[cfg(feature = "dev-tools")]
     pub(crate) fake: Option<usize>,
     pub(crate) delay: Option<Duration>,
 }
@@ -351,20 +357,8 @@ impl DecodeFile for Seam {
         assert!(!rule.panic, "a seamed decoder panic");
         let decoded = if !rule.ignore_cancel && cancel() {
             Err(FileRefusal::Cancelled)
-        } else if let Some(n) = rule.fake {
-            budget.charge(n as u64 * 2).map(|()| {
-                let mut h = DefaultHasher::new();
-                path.hash(&mut h);
-                let mut digest = [0_u8; 32];
-                for (i, chunk) in digest.chunks_mut(8).enumerate() {
-                    i.hash(&mut h);
-                    chunk.copy_from_slice(&h.finish().to_le_bytes());
-                }
-                Decoded::Sound {
-                    sound: Sound::mono(vec![0; n]),
-                    digest,
-                }
-            })
+        } else if let Some(decoded) = fake(rule, path, budget) {
+            decoded
         } else if rule.ignore_cancel {
             OneFile.decode(path, rate, budget, limits, &|| false)
         } else {
@@ -373,6 +367,33 @@ impl DecodeFile for Seam {
         self.log(path, true);
         decoded
     }
+}
+
+/// `rule`'s fake sound for `path`, charged to `budget` (dev-tools).
+#[cfg(feature = "dev-tools")]
+fn fake(rule: Rule, path: &Path, budget: &PickBudget) -> Option<Result<Decoded, FileRefusal>> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let n = rule.fake?;
+    Some(budget.charge(n as u64 * 2).map(|()| {
+        let mut h = DefaultHasher::new();
+        path.hash(&mut h);
+        let mut digest = [0_u8; 32];
+        for (i, chunk) in digest.chunks_mut(8).enumerate() {
+            i.hash(&mut h);
+            chunk.copy_from_slice(&h.finish().to_le_bytes());
+        }
+        Decoded::Sound {
+            sound: Sound::mono(vec![0; n]),
+            digest,
+        }
+    }))
+}
+
+/// No fake sound without dev-tools.
+#[cfg(not(feature = "dev-tools"))]
+const fn fake(_: Rule, _: &Path, _: &PickBudget) -> Option<Result<Decoded, FileRefusal>> {
+    None
 }
 
 /// The recovery state in memory, a write failing from a chosen one on.
@@ -611,6 +632,7 @@ impl Run {
     }
 
     /// The sound the audio thread's current generation plays for `kind`.
+    #[cfg(feature = "dev-tools")]
     fn playing(&self, kind: SystemKind) -> Option<Arc<Sound>> {
         self.audio.system(|v| v.current_sound(kind).cloned())
     }
@@ -629,6 +651,7 @@ impl Run {
 /// at another path are stored and charged once; a kind the new pick has no
 /// file for is silent, charged nothing, and the previous pick's PCM is
 /// freed on this thread once its generation is back.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn a_pick_reserves_then_charges_its_bytes() {
     // The charges: A of 100 MiB current, nothing retired; B of 90 MiB.
@@ -743,6 +766,7 @@ fn a_pick_reserves_then_charges_its_bytes() {
 
 /// The level of every sample of `kind`'s file in the source numbered
 /// `source` (1 set A, 2 set B, 3 `defaultsound\`).
+#[cfg(feature = "dev-tools")]
 fn level(source: i16, kind: SystemKind) -> i16 {
     source * 1_000 + i16::try_from(kind.index()).unwrap() + 1
 }
@@ -753,6 +777,7 @@ fn level(source: i16, kind: SystemKind) -> i16 {
 /// every kind plays B's file or the defaults', never A's: `o-open` starts no
 /// voice, `decide` sounds the tone, `o-close` the defaults' sound, and A's
 /// PCM is freed with A's generation.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn a_new_pick_plays_none_of_the_previous_one() {
     let fx = Fixture::new();
@@ -1312,11 +1337,14 @@ fn worker_failures() {
     let mut run = Run::with_seam(visits(), Opts::default(), panics);
     run.settle();
     assert!(run.sounds.latched.is_none());
-    assert!(run.playing(SystemKind::Clear).is_none());
-    assert!(
-        run.playing(SystemKind::Select).is_some(),
-        "the rest installed"
-    );
+    #[cfg(feature = "dev-tools")]
+    {
+        assert!(run.playing(SystemKind::Clear).is_none());
+        assert!(
+            run.playing(SystemKind::Select).is_some(),
+            "the rest installed"
+        );
+    }
     assert_eq!(run.sounds.skipped.len(), 1);
     assert!(
         run.said()
