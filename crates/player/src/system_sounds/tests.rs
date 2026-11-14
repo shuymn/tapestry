@@ -1706,3 +1706,118 @@ fn system_sounds_start_and_stop_alloc() {
         assert_eq!(named, 1);
     }
 }
+
+/// Waits, at most 10 s, until `gate` holds the audio thread after at
+/// least one pass since its last stop: whatever the start ring held when
+/// it was released has been taken.
+#[cfg(feature = "dev-tools")]
+fn one_pass(gate: &crate::dev::AudioGate) {
+    let until = Instant::now() + Duration::from_secs(10);
+    gate.release();
+    while gate.stopped() {
+        assert!(
+            Instant::now() < until,
+            "the audio thread never left the gate"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    gate.hold();
+    while !gate.stopped() {
+        assert!(Instant::now() < until, "the audio thread never came back");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// C26-4: READY's and Closing's sounds allocate and free nothing on the
+/// game thread, on the player's rig as `rig()` makes it: 1 000 hook calls,
+/// READY's and Closing's in turn, the start ring taken by the audio thread
+/// after every 50, then the hook that finds the request sequence
+/// exhausted, latching the run, and hooks refused after it. Only the hooks
+/// are counted, with a positive control first.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn ready_and_closing_sounds_alloc() {
+    use game::{Rig as _, SEQ_LIMIT};
+
+    use crate::alloc_count::{this_thread, this_thread_frees};
+    use crate::play::PlayerRig;
+
+    let fx = Fixture::new();
+    for kind in [
+        SystemKind::Clear,
+        SystemKind::PlayReady,
+        SystemKind::PlayStop,
+    ] {
+        fx.sound("sound/A", kind, 24_000);
+    }
+    let root = fx.root();
+    super::arm(move |setup, _| {
+        setup.root = root;
+        setup.fs = Box::new(MemFs::new());
+    });
+    let gate = Arc::new(crate::dev::AudioGate::default());
+    let settings = game::Settings {
+        device: game::DeviceSettings::default(),
+        player: game::PlayerSettings::default(),
+    };
+    let render = crate::render_side::tests::Installers::default().spawn_bare();
+    let held = Arc::clone(&gate);
+    let _ = crate::tests::on_rig_gated(
+        settings,
+        render,
+        input::QpcClock::start(),
+        Some(held),
+        |rig, _, _| {
+            rig.adjust = None;
+            let probe = rig.audio.control.failure_probe();
+            wait("the set installed", || {
+                rig.poll_system_sounds();
+                rig.audio.control.system_installed().is_some()
+            });
+            gate.hold();
+            one_pass(&gate);
+            // Positive control: an allocation and its free, counted.
+            let (allocs, frees) = (this_thread(), this_thread_frees());
+            drop(std::hint::black_box(vec![1_u8; 8]));
+            assert_eq!(this_thread() - allocs, 1, "the allocation was not counted");
+            assert_eq!(this_thread_frees() - frees, 1, "the free was not counted");
+            let (mut allocated, mut freed) = (0, 0);
+            let mut counted = |rig: &mut PlayerRig<'_>, ready: bool| {
+                let (allocs, frees) = (this_thread(), this_thread_frees());
+                if ready {
+                    rig.ready_began();
+                } else {
+                    rig.closing_began();
+                }
+                allocated += this_thread() - allocs;
+                freed += this_thread_frees() - frees;
+            };
+            for i in 0..1_000 {
+                counted(rig, i % 2 == 0);
+                if i % 50 == 49 {
+                    one_pass(&gate);
+                }
+            }
+            // Every start was queued: none refused for a full ring.
+            assert_eq!(probe.system_starts(SystemKind::PlayReady), 500);
+            assert_eq!(probe.system_starts(SystemKind::PlayStop), 500);
+            // The exhaustion latch, inside the counted hooks.
+            rig.audio.control.seed_system_seq(SEQ_LIMIT);
+            counted(rig, false);
+            let sounds = |rig: &mut PlayerRig<'_>| {
+                let s = rig.system_sounds.as_ref().expect("rig() made the owner");
+                (s.latched.clone(), s.refused)
+            };
+            let (latched, refused) = sounds(rig);
+            assert_eq!(latched, Some(Reason::SequenceExhausted));
+            for i in 0..10 {
+                counted(rig, i % 2 == 0);
+            }
+            assert_eq!(sounds(rig).1, refused + 10);
+            assert_eq!(probe.system_starts(SystemKind::PlayStop), 500);
+            gate.release();
+            assert_eq!(allocated, 0, "the hooks allocated");
+            assert_eq!(freed, 0, "the hooks freed");
+        },
+    );
+}
