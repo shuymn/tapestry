@@ -1008,7 +1008,7 @@ impl Selection {
     /// notices set since the page of a look that chose nothing last showed
     /// the notice, in the order they were set, never in place of one
     /// (design.md "Screen skins"); one that page showed is replaced
-    /// ([`Screen::add_notice`]).
+    /// ([`SelectScreen::add_notice`]).
     fn notice(&mut self, text: String) {
         if self.screen.add_notice(text) {
             self.preset_refusal = false;

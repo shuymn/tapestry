@@ -631,9 +631,10 @@ pub struct SelectScreen {
     searching: bool,
     /// The order, by index into [`SORTS`].
     sort: usize,
-    /// Why the chart last chosen or a skin was refused, until the next
-    /// choice: the notices set since a look's page last showed one, each
-    /// text once and at most [`NOTICES`], in the order they were set
+    /// The notices the page shows (a chart's or a skin's refusal, a line the
+    /// system sounds named): the ones a look's page last showed until a
+    /// clear or the next one set replaces them, else the ones set since,
+    /// each text once and at most [`NOTICES`], in the order they were set
     /// ([`add_notice`](Self::add_notice)).
     notices: Vec<String>,
     /// Whether a notice was dropped from `notices`, all [`NOTICES`] set:

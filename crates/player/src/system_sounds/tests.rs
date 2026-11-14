@@ -42,7 +42,7 @@ pub(crate) fn wait(what: &str, mut cond: impl FnMut() -> bool) {
 }
 
 /// A mono 16-bit WAV at [`RATE`] of `frames` frames at `level`.
-pub(crate) fn wav(frames: usize, level: i16) -> Vec<u8> {
+fn wav(frames: usize, level: i16) -> Vec<u8> {
     let data = u32::try_from(frames * 2).unwrap();
     let mut b = Vec::with_capacity(44 + frames * 2);
     b.extend_from_slice(b"RIFF");

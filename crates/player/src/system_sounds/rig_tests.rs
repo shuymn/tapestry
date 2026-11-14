@@ -490,10 +490,7 @@ fn with_a_held_refusal<R>(
     let name = |rig: &mut PlayerRig<'_>| {
         seam.open_gate();
         wait("the refusal named", || {
-            rig.system_sounds
-                .as_mut()
-                .expect("rig() made the system sounds")
-                .poll(&mut rig.audio.control);
+            rig.poll_system_sounds();
             !rig.system_notices.lock().unwrap().is_empty()
         });
         let named = rig.system_notices.lock().unwrap().clone();
@@ -829,14 +826,7 @@ fn refuse_selection(screens: &crate::render_side::tests::Installers) {
 /// healthy device; the reason it was refused for.
 fn refuse_decision(screens: &crate::render_side::tests::Installers, rig: &PlayerRig<'_>) -> String {
     *screens.refuse_restore.lock().unwrap() = Some(ScreenKind::Decision);
-    screens.fail.store(true, Ordering::Release);
-    rig.render
-        .send(crate::render_side::RenderMsg::Menu(Box::default()));
-    assert!(crate::render_side::tests::wait_until(|| rig
-        .render
-        .failed()));
-    screens.fail.store(false, Ordering::Release);
-    rig.render.prepare().unwrap();
+    crate::render_side::tests::rebuild(screens, &rig.render).unwrap();
     *screens.refuse_restore.lock().unwrap() = None;
     decision_refused()
 }

@@ -17064,7 +17064,10 @@ pub(crate) mod tests {
     /// Fails the installers' screen and builds it again through the render
     /// thread's own recovery (a preparation of the chart): what the new
     /// screen's build answers.
-    fn rebuild(screens: &Installers, link: &super::RenderLink) -> Result<(), ScreenError> {
+    pub(crate) fn rebuild(
+        screens: &Installers,
+        link: &super::RenderLink,
+    ) -> Result<(), ScreenError> {
         screens.fail.store(true, Ordering::Release);
         link.send(RenderMsg::Menu(Box::default()));
         assert!(wait_until(|| link.failed()));
