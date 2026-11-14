@@ -12,9 +12,9 @@
 //!   over; nothing else does.
 //! - **Pause and resume**: by number, whatever is presented.
 //! - **Frames**: each presented frame draws the angle the clock holds,
-//!   then updates autoplay at the frame's chart and state times (a play
-//!   frame), reads the direction the devices and autoplay give at the
-//!   frame's time, and ticks.
+//!   then updates autoplay at the frame's chart time (a play frame),
+//!   reads the direction the devices and autoplay give at the frame's
+//!   time, and ticks.
 //!
 //! Nothing here allocates after an attempt's notes are handed over.
 
@@ -30,8 +30,6 @@ pub(crate) struct Turntable {
     /// The play state the game created, adopted when its presentation
     /// begins.
     pending: Option<PlayState>,
-    /// The adopted play state's origin on the shared clock.
-    origin: TimeUs,
     autoplay: AutoplayScratch,
     /// The committed attempt's scratch notes, for autoplay; none for a
     /// play by hand.
@@ -60,7 +58,6 @@ impl Turntable {
             && self.clock.number() != Some(s.number)
         {
             self.clock.adopt(s.number);
-            self.origin = s.origin;
         }
         if let Some(n) = self.resume.take() {
             self.clock.resume(n);
@@ -95,7 +92,7 @@ impl Turntable {
     }
 
     /// A play starts, a round or a rearmed READY candidate: autoplay's
-    /// presses start over, as its judge's do.
+    /// presses start over.
     pub(crate) const fn play_starts(&mut self) {
         self.autoplay.reset();
     }
@@ -109,12 +106,11 @@ impl Turntable {
     /// at chart time `chart` when it is a play frame, with the devices'
     /// `scratch`: autoplay updates first, then the clock ticks.
     pub(crate) fn presented(&mut self, at: TimeUs, chart: Option<TimeUs>, scratch: ScratchInput) {
-        // Autoplay's judge starts with the play: READY's frames (before
-        // chart time 0) tick but update nothing.
+        // Autoplay presses from chart time 0: READY's frames (before it)
+        // tick but press nothing.
         let auto = match chart {
             Some(t) if t.0 >= 0 => {
-                let ms = game::state_ms(at, self.origin);
-                self.autoplay.update(&self.notes, t, ms);
+                self.autoplay.update(&self.notes, t);
                 self.autoplay.pressed()
             }
             _ => [false; 2],
@@ -237,9 +233,8 @@ mod tests {
         assert_eq!(t.angle(), 210 * 1_000, "resumed");
     }
 
-    /// READY's frames tick the clock but update no autoplay: a scratch
-    /// note at chart time 0 is never crossed, as the source's judge
-    /// starts at 0 with its previous time at 0.
+    /// READY's frames tick the clock but press nothing; a scratch tap at
+    /// chart time 0 turns Positive from the play's first frame.
     #[test]
     fn ready_frames_tick_but_autoplay_waits_for_the_play() {
         let mut t = Turntable::default();
@@ -255,7 +250,11 @@ mod tests {
         for chart in [-20, -10, 0, 10] {
             turned.push(play_tick(&mut t, chart * MS, 1_000_000));
         }
-        assert_eq!(turned, [0, 10_000, 10_000, 10_000], "idle throughout");
+        assert_eq!(
+            turned,
+            [0, 10_000, 30_000, 30_000],
+            "idle on READY's frames, Positive from chart time 0"
+        );
     }
 
     /// Autoplay presses on play frames only: a tap turns Positive and,
@@ -299,13 +298,13 @@ mod tests {
         (i64::from(t.angle()) - before).rem_euclid(2_160_000)
     }
 
-    /// Presses are stamped and expire on the play state's floored ms, not
-    /// on chart time: with the state origin 999.6 ms before chart 0, a CN
-    /// end at chart 1 000 ms stamps 1 999 and has expired by chart
-    /// 1 080.5 ms (state 2 080), so the LN from 1 082 ms turns Positive.
+    /// Presses follow chart time, not the play state's clock: with the
+    /// state origin 0 or 999.6 ms before chart 0, a CN end at chart
+    /// 1 000 ms turns Negative to chart 1 080 ms, so a frame at 1 080.5 ms
+    /// is idle and the LN from 1 082 ms turns Positive at 1 100 ms.
     #[test]
-    fn autoplay_presses_on_the_play_states_ms() {
-        for (delta, positive) in [(0, false), (999_600, true)] {
+    fn autoplay_presses_by_chart_time_whatever_the_state_origin() {
+        for delta in [0, 999_600] {
             let mut t = Turntable::default();
             t.created(state(1, 0));
             t.begin_presentation();
@@ -332,12 +331,10 @@ mod tests {
                 note(5_000, ScratchNoteKind::LongEnd { charge: false }),
             ]);
             t.play_starts();
-            for chart in [1_000_000, 1_080_500, 1_090_000] {
-                play_tick(&mut t, chart, delta);
-            }
-            let turned = play_tick(&mut t, 1_100_000, delta);
-            let want = if positive { 30_000 } else { 2_160_000 - 10_000 };
-            assert_eq!(turned, want, "delta {delta}");
+            play_tick(&mut t, 1_000_000, delta);
+            assert_eq!(play_tick(&mut t, 1_080_500, delta), 80_500, "delta {delta}");
+            play_tick(&mut t, 1_090_000, delta);
+            assert_eq!(play_tick(&mut t, 1_100_000, delta), 30_000, "delta {delta}");
         }
     }
 
