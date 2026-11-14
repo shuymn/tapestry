@@ -302,6 +302,10 @@ pub enum NoteKind {
     Ignored {
         field: &'static str,
     },
+    /// Blend 3 (subtract), drawn additive as the source draws its quads.
+    SubtractBlend,
+    /// A Lua skin's `op` that is not a table, read as no condition.
+    ScalarOp,
     /// A note part array the lanes cannot be built from.
     NotePart {
         field: &'static str,
@@ -397,6 +401,8 @@ impl fmt::Display for NoteKind {
             Self::SourceRect => f.write_str("a mirrored or out-of-file source rectangle"),
             Self::BitmapFont(e) => write!(f, "a bitmap font refused ({e})"),
             Self::Ignored { field } => write!(f, "`{field}` ignored"),
+            Self::SubtractBlend => f.write_str("blend 3 drawn additive"),
+            Self::ScalarOp => f.write_str("a Lua `op` that is not a table, read as no condition"),
             Self::NotePart { field, why } => write!(f, "note part `{field}`: {why}"),
             Self::ColourClamped => f.write_str("a colour channel outside 0 to 255, clamped"),
             Self::OutroClamped { declared_ms } => write!(

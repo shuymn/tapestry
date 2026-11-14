@@ -88,9 +88,16 @@
 //!   there.
 //! - **`#DEFEXRANK`'s percentage is not truncated.** The source stores
 //!   `n × 75 / 100` as an `int` (`play/BMSPlayerRule.java:59-65`, under a
-//!   TODO); here each edge takes it as it is. `#DEFEXRANK 1` is 0 % there,
-//!   zero-width windows, and 0.75 % here (PERFECT ±150 µs); `#DEFEXRANK 101`
-//!   gives PERFECT ±15 ms there, ±15.15 ms here.
+//!   TODO); here each edge takes it as it is. `#DEFEXRANK 101` gives
+//!   PERFECT ±15 ms there, ±15.15 ms here. A percentage truncated to 0 is
+//!   not kept there either: the source validates a chart's rank when it
+//!   loads the chart (`PlayerResource.java:215`) and again when the song
+//!   data takes it (`PlayerResource.java:172-176`,
+//!   `song/SongData.java:150`), and the second pass reads the stored
+//!   percentage as a bmson judge rank, whose 0 is 100 %
+//!   (`play/BMSPlayerRule.java:64`). So `#DEFEXRANK 1` plays at 100 %
+//!   there (PERFECT ±20 ms), as `#RANK 3` does, and at 0.75 % here
+//!   (PERFECT ±150 µs).
 //! - **The note scan's far end.** The source scans a lane's notes up to the
 //!   farthest early edge of the scaled note and scratch tables, their MS
 //!   pairs' 500 ms included, and stops at a note exactly that far
