@@ -292,15 +292,69 @@ const fn wide(a: u128, b: u128) -> (u128, u128) {
     (hi, lo)
 }
 
-/// A state's effective speed as a sign and a 256-bit magnitude: the tempo's
-/// units times the factor's, 0 while stopped.
-fn effective(tempo: Option<Tempo>, scroll: i128) -> (i8, (u128, u128)) {
+/// A state's effective speed: the tempo's units times the factor's, 0
+/// while stopped.
+const fn effective(tempo: Option<Tempo>, scroll: i128) -> RowSpeed {
     match tempo {
-        Some(t) if scroll != 0 => (
-            if scroll < 0 { -1 } else { 1 },
-            wide(t.units(), scroll.unsigned_abs()),
-        ),
-        _ => (0, (0, 0)),
+        Some(t) if scroll != 0 => RowSpeed {
+            sign: if scroll < 0 { -1 } else { 1 },
+            magnitude: wide(t.units(), scroll.unsigned_abs()),
+        },
+        _ => RowSpeed {
+            sign: 0,
+            magnitude: (0, 0),
+        },
+    }
+}
+
+/// A [`SpeedRow`]'s effective speed, its tempo times its scroll factor,
+/// exactly: 0 while a STOP holds. Ordered as the speeds are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowSpeed {
+    /// −1, 0 or 1.
+    sign: i8,
+    /// The tempo's units times the factor's, as 256 bits, high then low.
+    magnitude: (u128, u128),
+}
+
+impl RowSpeed {
+    /// The speed of `tempo` at a factor of 1.
+    #[must_use]
+    pub const fn of_tempo(tempo: Tempo) -> Self {
+        effective(Some(tempo), SCROLL_ONE)
+    }
+
+    /// Whether it is above 0.
+    #[must_use]
+    pub const fn is_positive(self) -> bool {
+        self.sign > 0
+    }
+}
+
+impl Ord for RowSpeed {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.sign.cmp(&other.sign).then_with(|| {
+            let by_magnitude = self.magnitude.cmp(&other.magnitude);
+            if self.sign < 0 {
+                by_magnitude.reverse()
+            } else {
+                by_magnitude
+            }
+        })
+    }
+}
+
+impl PartialOrd for RowSpeed {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl SpeedRow {
+    /// Its effective speed.
+    #[must_use]
+    pub const fn speed(&self) -> RowSpeed {
+        effective(self.tempo, self.scroll)
     }
 }
 
@@ -573,5 +627,32 @@ mod tests {
             Some(&row(5_000, 120, 2 * SCROLL_ONE))
         );
         assert_eq!(ChartProfile::of(&chart, &[]).length_ms(), 3_000);
+    }
+
+    /// A row's speed is its tempo times its factor, exactly, ordered as
+    /// the speeds are: a STOP and a factor of 0 are both 0, below every
+    /// positive speed and above every negative one; a more negative factor
+    /// is the slower; a tempo at a factor of 1 equals it as a tempo.
+    #[test]
+    fn row_speeds_order_as_the_speeds() {
+        let stop = SpeedRow {
+            ms: 0,
+            tempo: None,
+            scroll: SCROLL_ONE,
+        };
+        let speeds = [
+            row(0, 120, -2 * SCROLL_ONE).speed(),
+            row(0, 120, -SCROLL_ONE).speed(),
+            stop.speed(),
+            row(0, 60, SCROLL_ONE / 2).speed(),
+            row(0, 120, SCROLL_ONE / 2).speed(),
+            row(0, 120, SCROLL_ONE).speed(),
+        ];
+        assert!(speeds.windows(2).all(|w| w[0] < w[1]), "{speeds:?}");
+        assert_eq!(row(0, 120, 0).speed(), stop.speed());
+        assert_eq!(row(0, 240, SCROLL_ONE / 2).speed(), speeds[5]);
+        let tempo = Tempo::from_milli(120_000).unwrap();
+        assert_eq!(super::RowSpeed::of_tempo(tempo), speeds[5]);
+        assert!(speeds[3].is_positive() && !speeds[2].is_positive() && !speeds[1].is_positive());
     }
 }
