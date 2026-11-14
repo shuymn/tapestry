@@ -89,10 +89,13 @@ fn beside(database: &Path, suffix: &str) -> PathBuf {
 /// its file, nor SQLite writes through one into another file, such as a
 /// sound set's when the data root lies in one (design.md "Threat Model",
 /// T18). A journal may hold committed transactions the database lacks, so
-/// once any of the database's files is removed, every one's name in this
-/// folder is (their other names keep their bytes) and the library is
-/// rebuilt: it is derived from the charts and the records (design.md
-/// "Loading and Song Selection").
+/// when any of the database's files is a link, every one's name in this
+/// folder is removed (their other names keep their bytes) and the library
+/// is rebuilt: it is derived from the charts and the records (design.md
+/// "Loading and Song Selection"). Nothing is removed until all are
+/// checked, and the database goes first, so a removal that fails, or a
+/// run that stops between them, never leaves the database without its
+/// journal: the next opening finds the link again or no database.
 fn clear_links(database: &Path) -> Result<(), OpenError> {
     let failed = |path: &Path| {
         let path = path.to_owned();
@@ -103,11 +106,11 @@ fn clear_links(database: &Path) -> Result<(), OpenError> {
     let files: Vec<PathBuf> = std::iter::once(database.to_owned())
         .chain(MEMBERS.iter().map(|suffix| beside(database, suffix)))
         .collect();
-    let mut removed = false;
+    let mut linked = false;
     for file in &files {
-        removed |= game::clear_link(file, link_count).map_err(failed(file))?;
+        linked |= game::is_link(file, link_count).map_err(failed(file))?;
     }
-    if removed {
+    if linked {
         for file in &files {
             game::remove_name(file).map_err(failed(file))?;
         }
@@ -1427,32 +1430,37 @@ pub(crate) mod tests {
         }
     }
 
-    /// A database file that cannot be removed is named in the error: the
-    /// journal, held open without sharing its deletion, both when it is
-    /// the second name and when the shared memory file was.
+    /// A database file that cannot be removed is named in the error, and
+    /// the database is never left without its journal: the journal or the
+    /// database is held open without sharing its deletion, and the
+    /// journal or the shared memory file is the second name. Once the
+    /// hold ends, the next opening still rebuilds the library.
     #[test]
     fn a_file_that_cannot_be_removed_is_named() {
         use std::os::windows::fs::OpenOptionsExt as _;
-        for linked in ["-wal", "-shm"] {
+        for (linked, held) in [("-wal", "-wal"), ("-shm", "-wal"), ("-wal", "")] {
             let dir = tempfile::tempdir().unwrap();
             let root = DataRoot::new(dir.path().join("data"));
             let db = crashed_library(&root);
-            let wal = super::beside(&db, "-wal");
+            let held = super::beside(&db, held);
             let backup = root.path().join(format!("backup{linked}"));
             std::fs::hard_link(super::beside(&db, linked), backup).unwrap();
-            let held = std::fs::OpenOptions::new()
+            let hold = std::fs::OpenOptions::new()
                 .read(true)
                 .share_mode(windows::Win32::Storage::FileSystem::FILE_SHARE_READ.0)
-                .open(&wal)
+                .open(&held)
                 .unwrap();
             let e = open(&root).unwrap_err();
-            drop(held);
+            drop(hold);
             match &e {
-                OpenError::Link { path, .. } => assert_eq!(path, &wal, "{linked:?}"),
+                OpenError::Link { path, .. } => assert_eq!(path, &held, "{linked:?}"),
                 e => panic!("{linked:?}: {e:?}"),
             }
-            let named = wal.display().to_string();
+            let named = held.display().to_string();
             assert!(e.to_string().contains(&named), "{linked:?}: {e}");
+            let (library, opened) = open(&root).unwrap();
+            drop(library);
+            assert_eq!(opened, Opened::Created, "{linked:?}, {held:?} held");
         }
     }
 

@@ -158,7 +158,7 @@ pub use rules_toml::{
 pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
 pub use save::{
     LinkCount, LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, clear_link,
-    create_fresh, open_lock, remove_name, write_atomic,
+    create_fresh, is_link, open_lock, remove_name, write_atomic,
 };
 pub use session::{
     AutoKeySounds, ChartReader, ChartSource, ClosingReport, Command, GateStorage, Loaded,

@@ -45,30 +45,39 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
 /// portably only on Unix, so the caller supplies it.
 pub type LinkCount = fn(&Path) -> Option<u64>;
 
-/// Removes the entry at `path` when it is a link: a symbolic link or a
-/// junction (to a file or a folder), or a file that also has another name
-/// by `links`. Removing a link removes the link, never its target, and
-/// removing one name of a file leaves its other names. A missing entry, a
-/// folder, and a file with one name or whose count is unknown are left
-/// alone, so a lock file another process holds is never removed. Returns
-/// whether it removed the entry.
+/// Whether the entry at `path` is a link: a symbolic link or a junction
+/// (to a file or a folder), or a file that also has another name by
+/// `links`. A missing entry, a folder, and a file with one name or whose
+/// count is unknown are not.
+///
+/// # Errors
+///
+/// The I/O error of reading the entry.
+pub fn is_link(path: &Path, links: LinkCount) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            Ok(meta.file_type().is_symlink()
+                || (meta.is_file() && links(path).is_some_and(|n| n > 1)))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Removes the entry at `path` when it is a link ([`is_link`]). Removing a
+/// link removes the link, never its target, and removing one name of a
+/// file leaves its other names. Anything else is left alone, so a lock
+/// file another process holds is never removed. Returns whether it
+/// removed the entry.
 ///
 /// # Errors
 ///
 /// The I/O error of reading the entry or removing it.
 pub fn clear_link(path: &Path, links: LinkCount) -> io::Result<bool> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
-        Err(e) => return Err(e),
-    };
-    if meta.file_type().is_symlink() {
-        remove_link(path).map(|()| true)
-    } else if meta.is_file() && links(path).is_some_and(|n| n > 1) {
-        fs::remove_file(path).map(|()| true)
-    } else {
-        Ok(false)
+    if !is_link(path, links)? {
+        return Ok(false);
     }
+    remove_name(path).map(|()| true)
 }
 
 /// Removes the entry at `path` unless it is a folder: a link (only the
