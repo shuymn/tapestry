@@ -255,5 +255,6 @@ tests = [
     "crates/player/src/system_sounds/tests.rs::result_sounds_per_outcome",
     "crates/player/src/system_sounds/rig_tests.rs::the_first_result_sound_follows_the_own_view",
     "crates/player/src/system_sounds/rig_tests.rs::a_view_switch_keeps_the_result_sounds",
+    "crates/player/src/render_side/tests/decision/integrated.rs::result_sounds_through_a_run",
     "crates/player/src/system_sounds/rig_tests.rs::loop_result_is_read_at_startup",
 ]
