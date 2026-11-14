@@ -810,13 +810,15 @@ fn search(element: u32) -> PointerDef {
     }
 }
 
-/// Each press says which search texts' input boxes, as last sampled, hold
-/// it, by their order. A box its condition hides since, or its track's
-/// end, takes no press but keeps its last bounds: a press there is still
-/// inside it, one off it is not (`skin/SkinObject.java:348-356, 591-602`,
-/// `skin/SkinTextInput.java:77-81`).
+/// Each press says which search texts' input boxes, as the last build
+/// sampled them, hold it, by their order. A box that build did not
+/// sample, hidden by its condition or past its track's end, has no
+/// bounds: a press at its earlier place is inside no box, and the box
+/// holds presses again once a build samples it. A box its hover rect
+/// hides is sampled, so it keeps its bounds, and a build refused for
+/// another skin's state leaves that state's bounds as they were.
 #[test]
-fn a_search_box_keeps_its_last_bounds_while_hidden() {
+fn a_hidden_search_box_holds_no_press() {
     let mut by_condition = element(Source::Text(0), [100, 100, 300, 20]);
     by_condition.visible = Some(boolean("cursor.chart"));
     let mut by_time = element(Source::Text(1), [100, 300, 300, 20]);
@@ -824,23 +826,57 @@ fn a_search_box_keeps_its_last_bounds_while_hidden() {
         &[(0, [100, 300, 300, 20]), (1_000, [100, 300, 300, 20])],
         skin_model::End::Hide,
     );
-    let skin = load(
-        vec![by_condition, by_time],
-        WidgetDefs {
-            texts: vec![query_text(), query_text()],
-            ..WidgetDefs::default()
-        },
-        SelectionDefs {
-            pointer: vec![search(0), search(1)],
-            ..SelectionDefs::default()
-        },
-    )
-    .unwrap();
-    let mut fx = Fx::new(skin);
+    let by_hover = element(Source::Text(2), [100, 500, 300, 20]);
+    let skin = || {
+        load(
+            vec![by_condition.clone(), by_time.clone(), by_hover.clone()],
+            WidgetDefs {
+                texts: vec![query_text(), query_text(), query_text()],
+                ..WidgetDefs::default()
+            },
+            SelectionDefs {
+                pointer: vec![
+                    search(0),
+                    search(1),
+                    // Drawn only under a pointer, which no frame here has.
+                    PointerDef {
+                        hover: Some(HoverRect {
+                            x: 0,
+                            y: 0,
+                            w: 300,
+                            h: 20,
+                        }),
+                        ..search(2)
+                    },
+                ],
+                ..SelectionDefs::default()
+            },
+        )
+        .unwrap()
+    };
+    let mut fx = Fx::new(skin());
     let press = |fx: &Fx, p| fx.skin.hit_at(&fx.sel, p, fx.target, Button::Left);
+    let hover_kept = PressHit {
+        hit: None,
+        inside_search: SearchBoxes(0b100),
+    };
     // Both drawn: each takes a press in its box, inside it alone.
     fx.view(&numbered(vec![chart("a")]));
     fx.frame(0);
+    // The hover rect hides the third, which is sampled: inside its box,
+    // with no target drawn there.
+    assert!(fx.batch.quads().iter().all(|q| q.rect[1] < 500.0));
+    assert_eq!(
+        press(&fx, [120.0, 510.0]),
+        hover_kept,
+        "the box its hover rect hid"
+    );
+    // Another skin's build of this state is refused before it clears
+    // anything.
+    let mut other = Fx::new(skin());
+    std::mem::swap(&mut other.sel, &mut fx.sel);
+    other.frame(1);
+    std::mem::swap(&mut other.sel, &mut fx.sel);
     assert_eq!(
         press(&fx, [120.0, 110.0]),
         PressHit {
@@ -860,21 +896,27 @@ fn a_search_box_keeps_its_last_bounds_while_hidden() {
     fx.frame(2_000);
     assert_eq!(
         press(&fx, [120.0, 110.0]),
-        PressHit {
-            hit: None,
-            inside_search: SearchBoxes(0b01),
-        },
-        "inside the box its condition hid"
+        PressHit::NONE,
+        "the box its condition hid"
     );
     assert_eq!(
         press(&fx, [120.0, 310.0]),
-        PressHit {
-            hit: None,
-            inside_search: SearchBoxes(0b10),
-        },
-        "inside the box its track's end hid"
+        PressHit::NONE,
+        "the box its track's end hid"
     );
     assert_eq!(press(&fx, [500.0, 110.0]), PressHit::NONE);
+    assert_eq!(press(&fx, [120.0, 510.0]), hover_kept);
+    // The chart back: the first is sampled again, the second still not.
+    fx.view(&numbered(vec![chart("a")]));
+    fx.frame(3_000);
+    assert_eq!(
+        press(&fx, [120.0, 110.0]),
+        PressHit {
+            hit: Some(PointerHit::Search { index: 0 }),
+            inside_search: SearchBoxes(0b01),
+        }
+    );
+    assert_eq!(press(&fx, [120.0, 310.0]), PressHit::NONE);
 }
 
 /// The load refuses an image choice entry keyed otherwise than its

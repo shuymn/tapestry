@@ -5334,7 +5334,7 @@ fn closing_time_and_deadline_saturate() {
 }
 
 /// A full play's hold deadline is its anchor plus 5 s and the skin's
-/// finish margin, without the margin when the fadeout is negative, and
+/// finish margin, a negative one read as 0, whatever the fadeout is, and
 /// saturates at the end of the clock.
 #[test]
 fn hold_until_adds_the_margins_saturating() {
@@ -5353,6 +5353,14 @@ fn hold_until_adds_the_margins_saturating() {
     };
     assert_eq!(
         game::hold_until(TimeUs(1_234_567), negative),
+        TimeUs(9_234_567)
+    );
+    let negative_margin = game::PlayEnding {
+        finish_margin: TimeUs(-3_000_000),
+        ..ending
+    };
+    assert_eq!(
+        game::hold_until(TimeUs(1_234_567), negative_margin),
         TimeUs(6_234_567)
     );
     assert_eq!(
