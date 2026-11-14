@@ -10293,8 +10293,8 @@ pub(crate) mod tests {
     /// play state adopted at its attempt's preparation takes its baseline
     /// from the first READY frame (0); each frame's angle is the previous
     /// frames' ticks, idle at one unit a µs of the frame clock; and the
-    /// committed attempt's autoplay notes press the scratch from the play's
-    /// start, turning it three times as fast (Positive) after a tap.
+    /// committed attempt's autoplay notes press the scratch by chart time,
+    /// turning it three times as fast (Positive) for a tap's 80 ms.
     #[test]
     fn play_frames_carry_the_turntable_and_autoplay() {
         let chart = ChartBuilder::new(120_000)
@@ -10373,19 +10373,15 @@ pub(crate) mod tests {
                 rates.push((f[k].1, turned as f64 / dt as f64));
             }
         }
-        // The tap is crossed at the first frame at or after 150 ms and
-        // pressed while its age in state ms is at most 80: rate 3 there,
-        // 1 before it and after the expiry (a millisecond's floor apart).
-        let crossed = f.iter().find(|x| x.1.0 >= 150_000).unwrap().1.0;
+        // The tap at 150 ms is pressed while chart time is in [150, 230)
+        // ms: rate 3 there, 1 elsewhere.
         let mut pressed = 0;
         for (now, r) in &rates {
-            let expected = if now.0 >= crossed && now.0 <= crossed + 79_000 {
+            let expected = if (150_000..230_000).contains(&now.0) {
                 pressed += 1;
                 3.0
-            } else if now.0 < crossed || now.0 > crossed + 82_000 {
-                1.0
             } else {
-                continue;
+                1.0
             };
             assert!((r - expected).abs() < 1e-9, "rate {r} at {now:?}");
         }

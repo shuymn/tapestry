@@ -14,7 +14,8 @@
 //!   its play state), each numbered and stamped with its origin on the
 //!   shared clock.
 //! - **Autoplay notes** ([`scratch_notes`]): the scratch lane's taps and
-//!   long notes as events, built before READY.
+//!   long notes as events, built before READY, which autoplay's presses
+//!   ([`AutoplayScratch`]) read by chart time alone.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -399,26 +400,36 @@ impl TurntableClock {
     }
 }
 
-/// How long autoplay's presentation keeps a press, ms
-/// (`JudgeManager.java:107`, `auto_minduration`).
-const AUTO_MIN_MS: i64 = 80;
+/// How long autoplay turns the turntable for a tap, and at least for a
+/// long note: the time its generated input holds a tap (design.md
+/// "Autoplay", Input).
+const AUTO_HOLD: TimeUs = TimeUs(80_000);
 
-/// Autoplay's scratch presses as the source's judge keeps them
-/// (`JudgeManager.java:212-339, 562-576`), for the turntable: a press time
-/// per direction, in whole ms of the play state, and the long note being
-/// processed. Updated once per presented frame from the play's start with
-/// the frame's chart time and state time; fixed size, allocation-free.
+/// Autoplay's scratch presses for the turntable, by chart time alone
+/// (design.md "Autoplay", Turntable): at chart time `t`, Positive while
+/// `t` is in `[n, n + 80 ms)` for a tap at `n` or in `[s, max(e, s +
+/// 80 ms))` for a long note from `s` to `e`, and Negative while it is in
+/// `[e, e + 80 ms)` for a charge note's (CN or HCN) end `e`. The answer
+/// is the union of those intervals at `t`, whatever frames came before.
+///
+/// Every note crossed starts at or before `t`, so `t` is in the union of
+/// the crossed notes' intervals exactly when it is below the largest of
+/// their ends: the state is that running maximum per direction. An end
+/// saturates at `i64::MAX`; note times within the evaluator's domain
+/// (±2^32 µs) never reach it. Fixed size, allocation-free.
+///
+/// The notes are in time order, as [`scratch_notes`] builds them, and a
+/// caller [`reset`](Self::reset)s it when it hands over other notes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct AutoplayScratch {
     /// The next note not yet crossed.
     cursor: usize,
-    /// The previous update's chart time.
-    previous: TimeUs,
-    /// Positive's and Negative's press, in state ms.
-    press: [Option<i64>; 2],
-    /// The long note processing: its end, and whether it is a charge
-    /// note.
-    processing: Option<(TimeUs, bool)>,
+    /// The last update's chart time.
+    at: TimeUs,
+    /// The largest end of the crossed notes' Positive intervals.
+    positive_until: TimeUs,
+    /// The largest end of the crossed charge ends' Negative intervals.
+    negative_until: TimeUs,
 }
 
 impl Default for AutoplayScratch {
@@ -428,13 +439,13 @@ impl Default for AutoplayScratch {
 }
 
 impl AutoplayScratch {
-    /// Nothing crossed or pressed: the state at a play's start or a
-    /// round's (`JudgeManager.init`).
+    /// Nothing crossed or pressed: the state before a play's first frame
+    /// or a round's.
     pub const NEW: Self = Self {
         cursor: 0,
-        previous: TimeUs(0),
-        press: [None; 2],
-        processing: None,
+        at: TimeUs(i64::MIN),
+        positive_until: TimeUs(i64::MIN),
+        negative_until: TimeUs(i64::MIN),
     };
 
     /// Back to [`NEW`](Self::NEW), in place.
@@ -443,68 +454,47 @@ impl AutoplayScratch {
         *self = Self::NEW;
     }
 
-    /// One update at chart time `t` and state time `ms` over `notes`, in
-    /// the source's order: every note crossed (after the previous update's
-    /// chart time, at or before `t`), then each press older than 80 ms
-    /// cleared while nothing processes, then a plain long note whose end
-    /// is before `t` completed.
+    /// Takes chart time `t` over `notes`: crosses every note at or before
+    /// `t` not yet crossed. A `t` before the previous update's starts over
+    /// from the first note, so the answer never depends on earlier calls.
+    /// Over updates whose times do not decrease, each note is crossed
+    /// once.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    pub fn update(&mut self, notes: &[ScratchNote], t: TimeUs, ms: i64) {
-        let [positive, negative] = &mut self.press;
+    pub fn update(&mut self, notes: &[ScratchNote], t: TimeUs) {
+        if t < self.at {
+            *self = Self::NEW;
+        }
+        self.at = t;
         while let Some(note) = notes.get(self.cursor) {
             if note.time > t {
                 break;
             }
             self.cursor += 1;
-            if note.time <= self.previous {
-                continue;
-            }
+            let held = TimeUs(note.time.0.saturating_add(AUTO_HOLD.0));
             match note.kind {
-                ScratchNoteKind::Tap => *positive = Some(ms),
-                ScratchNoteKind::LongStart { end, charge } => {
-                    if self.processing.is_none() {
-                        *positive = Some(ms);
-                        self.processing = Some((end, charge));
-                    }
+                ScratchNoteKind::Tap => self.positive_until = self.positive_until.max(held),
+                ScratchNoteKind::LongStart { end, .. } => {
+                    self.positive_until = self.positive_until.max(end.max(held));
                 }
+                // Source: SF-010
                 ScratchNoteKind::LongEnd { charge: true } => {
-                    *positive = None;
-                    *negative = Some(ms);
-                    self.processing = None;
+                    self.negative_until = self.negative_until.max(held);
                 }
                 ScratchNoteKind::LongEnd { charge: false } => {}
             }
         }
-        if self.processing.is_none() {
-            for p in &mut self.press {
-                if p.is_some_and(|at| ms.saturating_sub(at) > AUTO_MIN_MS) {
-                    *p = None;
-                }
-            }
-        }
-        if let Some((end, false)) = self.processing
-            && end < t
-        {
-            self.processing = None;
-        }
-        self.previous = t;
     }
 
-    /// Whether Positive and Negative are pressed.
+    /// Whether Positive and Negative are pressed at the last update's
+    /// chart time.
     #[must_use]
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn pressed(&self) -> [bool; 2] {
-        let [p, n] = self.press;
-        [p.is_some(), n.is_some()]
+        [
+            self.positive_until.0 > self.at.0,
+            self.negative_until.0 > self.at.0,
+        ]
     }
-}
-
-/// A frame's state time: whole ms since the play state's origin, floored,
-/// as the source's state timer counts them (`TimerManager.java:33-35`).
-#[must_use]
-#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-pub const fn state_ms(now: TimeUs, origin: TimeUs) -> i64 {
-    now.0.saturating_sub(origin.0).div_euclid(1_000)
 }
 
 #[cfg(test)]
