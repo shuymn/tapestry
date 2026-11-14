@@ -3599,6 +3599,12 @@ impl AppRig for PlayerRig<'_> {
                 c.origin = d.origin();
                 *c
             });
+        // The scenario's decision captures armed are this screen's, before
+        // the render thread is told to show it (dev-tools).
+        #[cfg(feature = "dev-tools")]
+        if let (Some(sc), Some(c)) = (&self.scenario, claimed) {
+            sc.captures.bind_decision(c.lifetime, c.origin);
+        }
         self.render.show_decision(shown.clone(), claimed);
         sel.decision = Some((shown, file_name(chart)));
         self.audio.control.play_tone();
@@ -8170,7 +8176,9 @@ pub(crate) mod tests {
 
     /// A scenario's state over `captures`, a selection's.
     #[cfg(feature = "dev-tools")]
-    fn capture_state(captures: crate::dev::scenario::Captures) -> crate::dev::scenario::State {
+    pub(crate) fn capture_state(
+        captures: crate::dev::scenario::Captures,
+    ) -> crate::dev::scenario::State {
         crate::dev::scenario::State {
             logs: Vec::new(),
             captures,
