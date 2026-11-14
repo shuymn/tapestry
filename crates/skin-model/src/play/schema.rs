@@ -440,7 +440,9 @@ pub mod field {
     /// The configured hidden cover, in ‰, kept while it is off.
     pub const HIDDEN_PERMILLE: u16 = 26;
     /// The configured lane cover over the lane's whole length, in ‰:
-    /// `⌊(1 000 − lift) · cover / 1 000⌋` from the configured amounts.
+    /// `⌊(1 000 − l) · cover / 1 000⌋` for the lift `l` the lanes draw (the
+    /// configured lift while LIFT is on, 0 while it is off), SUDDEN+'s
+    /// white number.
     pub const COVER_ABSOLUTE_PERMILLE: u16 = 27;
     /// Whether the lane cover is on.
     pub const COVER_ENABLED: u16 = 28;

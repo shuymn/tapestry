@@ -1705,13 +1705,20 @@ fn the_duration_rounds_half_up_before_the_green_number() {
     }
 }
 
-/// Configured amounts show as stored whatever their switches, the
-/// absolute cover from the stored amounts; a switch on at 0 reads on.
+/// Configured amounts show as stored whatever their switches; the cover
+/// over the lane is the configured lane cover over the lane above the lift
+/// the lanes draw, the value the native SUDDEN+ white number computes,
+/// under every switch; a switch on at 0 reads on.
 #[test]
-fn configured_covers_show_as_stored() {
+fn covers_show_as_stored_and_the_cover_over_the_lane() {
     let chart = taps(&[1_000]);
     let mut h = Harness::empty(&chart, &full(0));
     let covers = |h: &Harness| {
+        assert_eq!(
+            h.field(field::COVER_ABSOLUTE_PERMILLE),
+            h.field(field::NATIVE_SUDDEN_WHITE),
+            "the native white"
+        );
         [
             field::COVER_PERMILLE,
             field::LIFT_PERMILLE,
@@ -1724,17 +1731,43 @@ fn configured_covers_show_as_stored() {
         ]
         .map(|f| h.field(f))
     };
-    // Both off, the lanes drawing none of them.
-    h.readouts = Some(FrameReadouts {
-        covers: CoverSettings {
-            cover: 500,
-            lift: 250,
-            ..COVERS_OFF
-        },
-        ..UNKNOWN
-    });
-    h.frame(0, &[]);
-    assert_eq!(covers(&h), [500, 250, 0, 375, 0, 0, 0, 0]);
+    // 500 and 250 stored under each pair of SUDDEN+'s and LIFT's
+    // switches, the lanes drawing what is on: the cover over the lane is
+    // scaled by the lift only while LIFT is on.
+    for (ms, sudden, lift, over) in [
+        (0, false, false, 500),
+        (4, true, false, 500),
+        (8, false, true, 375),
+        (12, true, true, 375),
+    ] {
+        h.view = LaneView {
+            cover: if sudden { 500 } else { 0 },
+            lift: if lift { 250 } else { 0 },
+            ..h.view
+        };
+        h.readouts = Some(FrameReadouts {
+            covers: CoverSettings {
+                cover: 500,
+                lift: 250,
+                cover_enabled: sudden,
+                lift_enabled: lift,
+                ..COVERS_OFF
+            },
+            ..UNKNOWN
+        });
+        h.frame(ms, &[]);
+        let (s, l) = (i32::from(sudden), i32::from(lift));
+        assert_eq!(
+            covers(&h),
+            [500, 250, 0, over, s, l, 0, 0],
+            "SUDDEN+ {sudden}, LIFT {lift}"
+        );
+    }
+    h.view = LaneView {
+        cover: 0,
+        lift: 0,
+        ..h.view
+    };
     // On at 0, and the adjustment mode.
     h.readouts = Some(FrameReadouts {
         covers: CoverSettings {
