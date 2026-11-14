@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use audio::{BankLimits, Decoded, FileRefusal, GenId, PickBudget, SystemKind};
 use game::DataRoot;
 use game::sound_sets::{
-    DecodeFile, DiskFs, KeptSounds, OneFile, PickDecode, Recovery, RecoveryFs, Refused, Resolution,
-    Resolved, ScanCap, ScanLimits, SetPick, SetRole, Source, Unavailable, Why, choose, decode_pick,
-    random_index, resolve, scan,
+    DecodeFile, KeptSounds, LinkCount, OneFile, PickDecode, Recovery, RecoveryFs, Refused,
+    Resolution, Resolved, ScanCap, ScanLimits, SetPick, SetRole, Source, Unavailable, Why, choose,
+    decode_pick, random_index, resolve, scan,
 };
 
 fn tmp() -> tempfile::TempDir {
@@ -93,6 +93,79 @@ fn link_file(link: &Path, target: &Path) -> Option<()> {
         // elevation.
         Err(e) if cfg!(windows) && e.raw_os_error() == Some(1314) => None,
         Err(e) => panic!("cannot create a file link: {e}"),
+    }
+}
+
+/// The hard links the tests made, as pairs of canonical names. The
+/// standard library reads a file's count of names only on Unix, and `game`
+/// holds no Windows code, so on Windows the count is this record's (the
+/// player's own count is tested in `player`).
+#[cfg(windows)]
+static LINKED: Mutex<Vec<(PathBuf, PathBuf)>> = Mutex::new(Vec::new());
+
+/// The count of names of `path`'s file: the system's on Unix; on Windows 1
+/// plus the hard links [`hard_link`] recorded with it.
+fn links(path: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        fs::metadata(path).ok().map(|m| m.nlink())
+    }
+    #[cfg(windows)]
+    {
+        let path = path.canonicalize().ok()?;
+        let linked = LINKED.lock().unwrap();
+        let others = linked.iter().filter(|(a, b)| *a == path || *b == path);
+        Some(1 + u64::try_from(others.count()).unwrap())
+    }
+}
+
+/// The probe every test reads identities with.
+const LINKS: LinkCount = links;
+
+/// Makes `link` a second name of `original`'s file.
+fn hard_link(original: &Path, link: &Path) {
+    fs::hard_link(original, link).unwrap();
+    #[cfg(windows)]
+    LINKED.lock().unwrap().push((canon(original), canon(link)));
+}
+
+/// Renames `from` over `to`, ending any hard link `to` was a name of.
+fn rename_over(from: &Path, to: &Path) {
+    #[cfg(windows)]
+    {
+        let to = canon(to);
+        LINKED.lock().unwrap().retain(|(a, b)| *a != to && *b != to);
+    }
+    fs::rename(from, to).unwrap();
+}
+
+/// The disk with [`LINKS`]: every test opens the recovery state through
+/// it, so a pick's identities count names as [`resolve`]'s here do.
+#[derive(Debug)]
+struct DiskFs(game::sound_sets::DiskFs);
+
+impl Default for DiskFs {
+    fn default() -> Self {
+        Self(game::sound_sets::DiskFs::new(LINKS))
+    }
+}
+
+impl RecoveryFs for DiskFs {
+    fn lock(&mut self, path: &Path) -> io::Result<bool> {
+        self.0.lock(path)
+    }
+
+    fn read(&mut self, path: &Path) -> io::Result<Option<Vec<u8>>> {
+        self.0.read(path)
+    }
+
+    fn write(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()> {
+        self.0.write(path, bytes)
+    }
+
+    fn links(&self) -> LinkCount {
+        self.0.links()
     }
 }
 
@@ -260,7 +333,11 @@ fn resolution_follows_the_sources_order() {
     put(&bgm, "select.wav");
     put(&defaults, "decide.wav");
     put(&defaults, "clear.ogg");
-    let r = resolve(&pick(Some(&sound), Some(&bgm), &defaults), &mut |_| false);
+    let r = resolve(
+        &pick(Some(&sound), Some(&bgm), &defaults),
+        LINKS,
+        &mut |_| false,
+    );
     assert_eq!(
         found(&r, SystemKind::Fail),
         (canon(&sound.join("fail.flac")), Source::SoundSet)
@@ -282,7 +359,7 @@ fn resolution_follows_the_sources_order() {
 
     let only = base.path().join("only-defaults");
     put(&only, "select.ogg");
-    let r = resolve(&pick(None, None, &only), &mut |_| false);
+    let r = resolve(&pick(None, None, &only), LINKS, &mut |_| false);
     assert_eq!(
         found(&r, SystemKind::Select),
         (canon(&only.join("select.ogg")), Source::Defaults)
@@ -295,7 +372,7 @@ fn resolution_follows_the_sources_order() {
         put(&four, &format!("scratch.{ext}"));
     }
     for (ext, next) in [("wav", "flac"), ("flac", "ogg"), ("ogg", "mp3")] {
-        let r = resolve(&pick(Some(&four), None, &only), &mut |_| false);
+        let r = resolve(&pick(Some(&four), None, &only), LINKS, &mut |_| false);
         assert_eq!(
             found(&r, SystemKind::Scratch),
             (
@@ -304,7 +381,7 @@ fn resolution_follows_the_sources_order() {
             )
         );
         fs::remove_file(four.join(format!("scratch.{ext}"))).unwrap();
-        let r = resolve(&pick(Some(&four), None, &only), &mut |_| false);
+        let r = resolve(&pick(Some(&four), None, &only), LINKS, &mut |_| false);
         assert_eq!(
             found(&r, SystemKind::Scratch).0,
             canon(&four.join(format!("scratch.{next}")))
@@ -341,7 +418,7 @@ fn refused_candidates_are_named_and_skipped() {
     // Resolution opens nothing, so a FIFO cannot block it.
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
-        let _ = tx.send(resolve(&p, &mut |_| false));
+        let _ = tx.send(resolve(&p, LINKS, &mut |_| false));
     });
     let r = rx
         .recv_timeout(std::time::Duration::from_secs(10))
@@ -434,6 +511,10 @@ impl RecoveryFs for SeamFs {
         drop(seen);
         self.disk.write(path, bytes)
     }
+
+    fn links(&self) -> LinkCount {
+        self.disk.links()
+    }
 }
 
 /// The real decode, with each file logged.
@@ -499,7 +580,7 @@ fn run(
 }
 
 fn identity_of(f: &Fixture) -> game::sound_sets::SourceIdentity {
-    resolve(&set_pick(f), &mut |_| false).sources[0]
+    resolve(&set_pick(f), LINKS, &mut |_| false).sources[0]
         .clone()
         .unwrap()
 }
@@ -675,7 +756,7 @@ fn recovery_cases() {
     let f = fixture();
     put(&f.data.default_sounds(), "decide.wav");
     let defaults = pick(None, None, &f.data.default_sounds());
-    let marker = resolve(&defaults, &mut |_| false).sources[2]
+    let marker = resolve(&defaults, LINKS, &mut |_| false).sources[2]
         .clone()
         .unwrap();
     {
@@ -1098,8 +1179,98 @@ fn the_recovery_state_in_a_set_cannot_expire_its_quarantine() {
     }
 }
 
+/// A candidate that shares its file with another name, as a hard link
+/// does, counts by its name alone: a set whose `scratch.wav` is a hard
+/// link to a file rewritten in place at each launch (as the log is when
+/// its rotation is blocked) stays quarantined across those launches. A
+/// candidate with one name still expires it when edited (`recovery_cases`,
+/// Q8).
+// Covers: T18
+#[test]
+fn a_hard_link_to_a_written_file_cannot_expire_its_quarantine() {
+    let f = fixture();
+    let outside = tmp();
+    let log = put_bytes(outside.path(), "tapestry.log", b"run 0\n");
+    hard_link(&log, &f.set.join("scratch.wav"));
+
+    let identity = identity_of(&f);
+    {
+        let mut r = Recovery::open(&f.data, Box::new(DiskFs::default()))
+            .unwrap()
+            .recovery;
+        r.mark(&identity).unwrap();
+    }
+    for launch in 2..=4 {
+        // Truncated and rewritten in place: longer, and later.
+        let mut file = fs::File::create(&log).unwrap();
+        io::Write::write_all(&mut file, "run\n".repeat(launch).as_bytes()).unwrap();
+        let then = file.metadata().unwrap().modified().unwrap();
+        let later = std::time::Duration::from_secs(61 * u64::try_from(launch).unwrap());
+        file.set_modified(then + later).unwrap();
+        drop(file);
+
+        let opened = Recovery::open(&f.data, Box::new(DiskFs::default())).unwrap();
+        if launch == 2 {
+            assert_eq!(opened.quarantined.as_ref(), Some(&identity));
+        }
+        let mut recovery = opened.recovery;
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let report = run(&f, &mut recovery, &seen);
+        assert_eq!(
+            ops(&seen),
+            Vec::<String>::new(),
+            "launch {launch}: the quarantined set was read"
+        );
+        assert!(matches!(report.decode, PickDecode::Ready(_)));
+        assert_eq!(
+            recovery.quarantined(),
+            std::slice::from_ref(&identity),
+            "launch {launch}: the quarantine dropped"
+        );
+    }
+}
+
+/// Ending a hard link (a rename over its other name, as log rotation does)
+/// changes the set's identity once, from the candidate's name alone to its
+/// file's stamp. The name renamed over is then another file, so later
+/// writes to it change nothing: a link made by hand costs at most one more
+/// launch.
+// Covers: T18
+#[test]
+fn ending_a_hard_link_changes_the_identity_once() {
+    let f = fixture();
+    let outside = tmp();
+    let other = put_bytes(outside.path(), "tapestry.2.log", b"run 0\n");
+    hard_link(&other, &f.set.join("scratch.wav"));
+    let linked = identity_of(&f);
+
+    let rotated = put_bytes(outside.path(), "tapestry.1.log", b"run 1\n");
+    rename_over(&rotated, &other);
+    let ended = identity_of(&f);
+    assert_ne!(ended, linked, "ending the link left the identity");
+    for i in 2..=4 {
+        let rotated = put_bytes(
+            outside.path(),
+            "tapestry.1.log",
+            "run\n".repeat(i).as_bytes(),
+        );
+        rename_over(&rotated, &other);
+        put_bytes(
+            outside.path(),
+            "tapestry.2.log",
+            "more\n".repeat(i).as_bytes(),
+        );
+        assert_eq!(identity_of(&f), ended, "rotation {i} changed the identity");
+    }
+}
+
 fn identity_of_set(set: &Path) -> game::sound_sets::SourceIdentity {
-    resolve(&pick(Some(set), None, Path::new("absent")), &mut |_| false).sources[0]
+    resolve(
+        &pick(Some(set), None, Path::new("absent")),
+        LINKS,
+        &mut |_| false,
+    )
+    .sources[0]
         .clone()
         .unwrap()
 }

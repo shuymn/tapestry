@@ -354,8 +354,10 @@ fn locate(folder: &Path, kind: SystemKind, refused: &mut Vec<Refused>) -> Option
 /// the canonical `folder`, named with `ext`, when it is admitted: once
 /// canonicalized it stays inside the folder, is a regular file and keeps
 /// the extension `ext`. tapestry writes no file with an audio extension,
-/// so a link never admits one of its own files, whose writes would change
-/// a [`SourceIdentity`].
+/// so a symbolic link or junction never admits one of its own files. A
+/// hard link can: it is a second name of the file, with the name's own
+/// extension. So [`SourceIdentity`] stamps an admitted file only while it
+/// has no other name.
 fn admit(folder: &Path, joined: &Path, ext: &str) -> Result<(PathBuf, fs::Metadata), Why> {
     let canonical = joined.canonicalize().map_err(|_| Why::Unresolved)?;
     if !canonical.starts_with(folder) {
@@ -420,13 +422,17 @@ pub struct FileStamp {
 
 /// A source's identity (design.md T18): its canonical folder with a stamp
 /// of each candidate file of every kind that exists in it, sorted by name.
-/// A candidate lookup admits ([`admit`]) is stamped with the size and
-/// modification time of the file it resolves to, so a link is followed
-/// only to a regular file inside the folder. Any other candidate (a link
-/// or junction to a folder, out of the folder or that cannot be resolved,
-/// a folder, a device) is stamped by its name alone: none of it is read,
-/// and its times can move with whatever is written in or through it, the
-/// recovery state included when the data root lies in the set. It covers
+/// A candidate lookup admits ([`admit`]) and whose file has no other name
+/// is stamped with the size and modification time of the file it resolves
+/// to, so a link is followed only to a regular file inside the folder.
+/// Any other candidate (a link or junction to a folder, out of the folder
+/// or that cannot be resolved, a folder, a device, a file that also has
+/// another name or whose count of names cannot be read) is stamped by its
+/// name alone: none of it is read, and its size and times can move with
+/// whatever is written in or through it, the recovery state included when
+/// the data root lies in the set, and the log or any file a hard link
+/// shares. tapestry makes no link, so its writes can at most end one,
+/// which changes the identity once. It covers
 /// every kind whatever role the folder serves, so a folder that is a sound
 /// set, a BGM set and `defaultsound\` at once has one identity, and its
 /// quarantine holds for every role. A change of any stamp makes another
@@ -441,8 +447,9 @@ pub struct SourceIdentity {
 }
 
 impl SourceIdentity {
-    /// The identity of the canonical `folder`.
-    fn of(folder: &Path) -> Self {
+    /// The identity of the canonical `folder`, `links` giving the count of
+    /// names of an admitted candidate's file.
+    fn of(folder: &Path, links: LinkCount) -> Self {
         let mut files = Vec::new();
         for kind in SystemKind::ALL {
             for ext in EXTENSIONS {
@@ -452,8 +459,10 @@ impl SourceIdentity {
                     continue;
                 }
                 let (size, mtime_ns) = match admit(folder, &path, ext) {
-                    Ok((_, meta)) => (meta.len(), mtime_ns(&meta)),
-                    Err(_) => (0, 0),
+                    Ok((canonical, meta)) if links(&canonical) == Some(1) => {
+                        (meta.len(), mtime_ns(&meta))
+                    }
+                    _ => (0, 0),
                 };
                 files.push(FileStamp {
                     name,
@@ -558,8 +567,13 @@ pub struct Resolution {
 /// Resolves each kind of `pick`: its `.wav` name, then `.flac`, `.ogg` and
 /// `.mp3`, in the picked set of its role and then in `defaultsound\`. A
 /// source that `excluded` names (quarantined or skipped) takes no part, as
-/// if absent.
-pub fn resolve(pick: &SetPick, excluded: &mut dyn FnMut(&SourceIdentity) -> bool) -> Resolution {
+/// if absent. `links` counts the names of a candidate's file, for its
+/// source's identity.
+pub fn resolve(
+    pick: &SetPick,
+    links: LinkCount,
+    excluded: &mut dyn FnMut(&SourceIdentity) -> bool,
+) -> Resolution {
     let mut sources: [Option<SourceIdentity>; 3] = Default::default();
     for (source, folder) in [
         (Source::SoundSet, pick.sound_set.as_deref()),
@@ -569,7 +583,7 @@ pub fn resolve(pick: &SetPick, excluded: &mut dyn FnMut(&SourceIdentity) -> bool
         let Some(folder) = folder.and_then(|f| f.canonicalize().ok()) else {
             continue;
         };
-        let identity = SourceIdentity::of(&folder);
+        let identity = SourceIdentity::of(&folder, links);
         if !excluded(&identity)
             && let Some(slot) = sources.get_mut(source.index())
         {
@@ -623,12 +637,13 @@ pub fn choose(
     skipped: &[SourceIdentity],
     index: &mut dyn FnMut(usize) -> usize,
 ) -> Option<PathBuf> {
+    let links = recovery.fs.links();
     let open: Vec<&PathBuf> = sets
         .iter()
         .filter(|set| {
             let named = recovery.names(set) || skipped.iter().any(|s| &s.path == *set);
             !named || {
-                let identity = SourceIdentity::of(set);
+                let identity = SourceIdentity::of(set, links);
                 recovery.admits(&identity) && !skipped.contains(&identity)
             }
         })
@@ -664,12 +679,46 @@ pub trait RecoveryFs: Send {
     ///
     /// The I/O error of the write.
     fn write(&mut self, path: &Path, bytes: &[u8]) -> io::Result<()>;
+
+    /// How a candidate's count of names is read for a [`SourceIdentity`].
+    /// The standard library reads it portably only on Unix, so the caller
+    /// supplies it.
+    fn links(&self) -> LinkCount;
 }
 
-/// The recovery state on disk, with an OS lock held by its file handle.
-#[derive(Debug, Default)]
+/// The count of names of the file at `path`, more than 1 when hard links
+/// share it, `None` when it cannot be read.
+pub type LinkCount = fn(&Path) -> Option<u64>;
+
+/// A [`LinkCount`] that reads nothing: every candidate counts by its name
+/// alone.
+const fn no_count(_: &Path) -> Option<u64> {
+    None
+}
+
+/// The recovery state on disk, with an OS lock held by its file handle,
+/// and the [`LinkCount`] it was given.
+#[derive(Debug)]
 pub struct DiskFs {
     lock: Option<File>,
+    links: LinkCount,
+}
+
+impl DiskFs {
+    /// The disk, counting a candidate's names with `links`.
+    #[must_use]
+    pub fn new(links: LinkCount) -> Self {
+        Self { lock: None, links }
+    }
+}
+
+impl Default for DiskFs {
+    /// The disk with no count of names: an identity then stamps every
+    /// candidate by its name alone, so a quarantine expires only when a
+    /// candidate is added, removed or renamed.
+    fn default() -> Self {
+        Self::new(no_count)
+    }
 }
 
 impl RecoveryFs for DiskFs {
@@ -706,6 +755,10 @@ impl RecoveryFs for DiskFs {
             fs::create_dir_all(dir)?;
         }
         write_atomic(path, bytes)
+    }
+
+    fn links(&self) -> LinkCount {
+        self.links
     }
 }
 
@@ -1104,7 +1157,8 @@ fn pick_body(
     cancel: &(dyn Fn() -> bool + Sync),
     decoder: &dyn DecodeFile,
 ) -> PickReport {
-    let resolution = resolve(pick, &mut |id| {
+    let links = recovery.fs.links();
+    let resolution = resolve(pick, links, &mut |id| {
         !recovery.admits(id) || pick.skipped.contains(id)
     });
     let mut refused = resolution.refused;

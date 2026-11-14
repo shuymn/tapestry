@@ -969,4 +969,63 @@ mod tests {
         assert!(diag.starts_with(&prefix), "{diag}");
         assert!(open(&logs, "play", &mut Scripted::new(&[Step::Fail])).is_none());
     }
+
+    /// The data root is a sound set whose `scratch.wav` is a hard link to
+    /// this log, and folders at the rotated names block rotation, so each
+    /// run truncates and rewrites the log in place. The set's identity
+    /// counts `scratch.wav` by its name alone, so those runs leave the set
+    /// quarantined after a launch that crashed decoding it (design.md
+    /// T18).
+    // Covers: T18
+    #[test]
+    fn a_set_linked_to_the_log_keeps_its_quarantine() {
+        use audio::{BankLimits, GenId};
+        use game::DataRoot;
+        use game::sound_sets::{Recovery, ScanLimits, SetPick, SetRole, choose, resolve, scan};
+
+        use crate::sound_sets_disk::{link_count, recovery_fs};
+
+        let dir = tempfile::tempdir().unwrap();
+        let set = dir.path().join("data");
+        let logs = set.join("logs");
+        run(&logs, 0);
+        for n in 1..super::KEPT {
+            fs::create_dir_all(logs.join(name(n)).join("held")).unwrap();
+        }
+        fs::write(set.join("clear.wav"), b"a sound that crashes").unwrap();
+        fs::hard_link(logs.join(name(0)), set.join("scratch.wav")).unwrap();
+        let data = DataRoot::new(set.clone());
+        let sets = scan(&set, SetRole::Sound, &ScanLimits::default()).sets;
+        assert_eq!(sets, [set.canonicalize().unwrap()]);
+        let pick = SetPick {
+            sound_set: Some(set.clone()),
+            bgm_set: None,
+            defaults: data.default_sounds(),
+            id: GenId(1),
+            rate: 48_000,
+            limits: BankLimits::default(),
+            skipped: Vec::new(),
+        };
+        // The launch that crashed decoding the set left its marker.
+        {
+            let mut recovery = Recovery::open(&data, recovery_fs()).unwrap().recovery;
+            let identity = resolve(&pick, link_count, &mut |_| false).sources[0]
+                .clone()
+                .unwrap();
+            recovery.mark(&identity).unwrap();
+        }
+        for i in [1, 22, 333] {
+            run(&logs, i);
+            let mut recovery = Recovery::open(&data, recovery_fs()).unwrap().recovery;
+            assert_eq!(
+                choose(&sets, &mut recovery, &[], &mut |_| 0),
+                None,
+                "run {i}: the quarantined set chosen"
+            );
+            assert_eq!(recovery.quarantined().len(), 1, "run {i}");
+            let linked = fs::read_to_string(set.join("scratch.wav")).unwrap();
+            assert!(linked.contains(&format!("run {i}\n")), "{linked}");
+            assert!(!linked.contains("run 0\n"), "the log was rotated: {linked}");
+        }
+    }
 }

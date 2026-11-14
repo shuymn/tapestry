@@ -64,6 +64,7 @@ mod select;
 mod selection;
 mod selection_skin;
 mod shelf;
+mod sound_sets_disk;
 mod start_gate;
 mod state_clock;
 mod tuning;
