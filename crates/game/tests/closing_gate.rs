@@ -225,6 +225,7 @@ fn failing_watermark(chart: &Chart) -> TimeUs {
 /// which would complete the play at 2.68 s, never overtakes it; at the
 /// commit (3 s) the play enters Closing, ended midway at the failing
 /// watermark, and re-evaluates to its live result.
+// Source: SF-012
 #[test]
 fn a_failure_before_the_commit_closes_the_play_at_the_commit() {
     let chart = notes(16);
@@ -246,6 +247,14 @@ fn a_failure_before_the_commit_closes_the_play_at_the_commit() {
     assert!(result.matches_live);
     let gauges = &result.evaluation.as_ref().unwrap().gauges;
     assert_eq!(gauges[1].failed_at, Some(TimeUs(2_580 * MS)));
+    // C26-2: the retained failure, acted on at the commit, asks Closing's
+    // sound once, after the chart's audio was cut.
+    #[cfg(feature = "dev-tools")]
+    {
+        let hooks = s.sound_hooks();
+        assert_eq!((hooks.ready, hooks.closing), (1, 1));
+        assert!(hooks.cuts_at_closing >= 1, "{hooks:?}");
+    }
 }
 
 /// The same failure in a play of fifteen notes, whose last miss both
@@ -281,6 +290,39 @@ fn a_cancellation_and_its_rearm_discard_a_retained_failure() {
     let record = report.record.as_ref().unwrap();
     assert_eq!(record.status.end, EndStatus::PlayedToEnd);
     assert_eq!(record.history.openings.len(), 1);
+    // C26-1, C26-2: the rearm opens a second READY; the discarded failure
+    // asks no closing sound.
+    #[cfg(feature = "dev-tools")]
+    {
+        let hooks = s.sound_hooks();
+        assert_eq!((hooks.ready, hooks.closing), (2, 0));
+    }
+}
+
+/// C26-1: every rearm opens a fresh READY, whose sound is asked again: two
+/// holds of START before the transport commits make three READY states,
+/// the two cancelled openings kept in the history; the third, every note
+/// missed, fails and closes once, after the cut.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn each_rearm_opens_a_ready() {
+    let (_dir, root) = temp_root();
+    let mut s = session(&root, &notes(16), ZERO + 3_000);
+    // The first rearmed READY's chart time 0 is 3.8 s, before which the
+    // second hold cancels it.
+    let items = vec![
+        connect(),
+        raw(2_700, E, 1),
+        raw(2_800, E, 0),
+        raw(3_300, E, 1),
+        raw(3_400, E, 0),
+    ];
+    let report = s.play(script(items, &[])).unwrap();
+    assert_eq!(report.end, PlayEnd::Aborted(AbortCause::GaugeFailed));
+    assert_eq!(report.record.as_ref().unwrap().history.openings.len(), 2);
+    let hooks = s.sound_hooks();
+    assert_eq!((hooks.ready, hooks.closing), (3, 1));
+    assert!(hooks.cuts_at_closing >= 1, "{hooks:?}");
 }
 
 /// The last device removed during the frozen steps aborts the play as an
@@ -329,6 +371,10 @@ fn a_quit_while_cached_uncommitted_follows_the_settled_gate() {
             .unwrap();
         assert_eq!(report.end, PlayEnd::Aborted(AbortCause::Quit), "{quit}");
         assert_eq!(report.closing.is_some(), closes, "{quit}");
+        // C26-2: Closing's sound only for the play that closes, not for
+        // the cancelled candidate's abort.
+        #[cfg(feature = "dev-tools")]
+        assert_eq!(s.sound_hooks().closing, u32::from(closes), "{quit}");
         assert_eq!(
             status(&report).end,
             if closes {

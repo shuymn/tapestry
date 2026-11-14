@@ -760,6 +760,8 @@ struct Side<'a> {
     cleanup_gate: Arc<crate::render_side::TestGate>,
     /// The decision screens the render thread left so far.
     decided: Arc<Decided>,
+    /// The audio output's probe, read while the run goes on.
+    probe: game::OutputProbe,
 }
 
 impl Side<'_> {
@@ -1142,6 +1144,7 @@ fn run_with(
             decisions_sent: Box::new(decisions_sent),
             cleanup_gate: Arc::clone(&cleanup_gate),
             decided: Arc::clone(&decided),
+            probe: rig.audio.control.failure_probe(),
         };
         let root = game::DataRoot::new(charts.path().join("app"));
         let parts = root.clone();
@@ -2378,4 +2381,63 @@ fn the_practice_page_leaves_the_decision_screen() {
     assert!(ran.ran.is_ok(), "{:?}", ran.ran);
     let why = failed(&c, 0);
     assert!(why.contains("its decision screen ended"), "{why}");
+}
+
+/// C26-1, C26-2, C26-3 through the whole run, the system sounds armed with
+/// a sound set holding `playready` and `playstop`: the chart chosen, the
+/// quit key during its play enters Closing, a retry in Closing opens the
+/// second READY, and the second play runs to its result. Read on the result,
+/// before the run's close: two `playready` and one `playstop` asked, and
+/// neither ever stopped, the retry and the chart's start included.
+/// `tapestry play <chart>` makes the same owner in `rig()` and plays
+/// through the same `open_and_play`.
+// Source: SF-012
+#[test]
+fn ready_and_closing_sounds_through_a_run() {
+    use audio::SystemKind::{Clear, PlayReady, PlayStop};
+    use game::Command;
+
+    let fx = crate::system_sounds::tests::Fixture::new();
+    for kind in [Clear, PlayReady, PlayStop] {
+        fx.sound("sound/A", kind, 48_000);
+    }
+    let root = fx.root();
+    crate::system_sounds::arm(move |setup, _| setup.root = root);
+    let set = Set::new("s.json");
+    let Ran { ran, ended, .. } = run(&set, None, |side| {
+        // As the song selection launch sets it: the quit key leaves the
+        // play it arrives in.
+        side.controls.quit_leaves();
+        let probe = &side.probe;
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            assert!(wait_until(done), "never {what}");
+        };
+        side.prepared();
+        side.press(MenuKey::Enter);
+        until("the first READY", &|| probe.system_starts(PlayReady) == 1);
+        assert_eq!(probe.system_starts(PlayStop), 0, "a closing sound in READY");
+        // READY lasts 1 s and the chart's one note is at 2 s: the quit key
+        // lands in the play, about 500 ms in.
+        std::thread::sleep(Duration::from_millis(1_500));
+        side.controls.command(Command::Quit);
+        until("Closing", &|| probe.system_starts(PlayStop) == 1);
+        side.controls.command(Command::Retry);
+        until("the retry's READY", &|| probe.system_starts(PlayReady) == 2);
+        side.seen.until("the second play's result", |d| {
+            d.iter()
+                .any(|d| matches!(d.frame, Frame::Result { .. } | Frame::End))
+        });
+        assert_eq!(probe.system_starts(PlayReady), 2);
+        assert_eq!(probe.system_starts(PlayStop), 1);
+        assert_eq!(probe.system_stops(PlayReady), 0, "the ready sound stopped");
+        assert_eq!(probe.system_stops(PlayStop), 0, "the closing sound stopped");
+    });
+    assert!(ran.is_ok(), "{ran:?}");
+    assert_eq!(
+        ended,
+        [
+            game::PlayEnd::Aborted(game::AbortCause::Quit),
+            game::PlayEnd::Completed
+        ]
+    );
 }

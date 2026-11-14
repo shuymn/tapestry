@@ -2713,6 +2713,27 @@ impl Rig for PlayerRig<'_> {
         });
     }
 
+    /// The ready sound, as each READY's timer starts: never stopped, so a
+    /// retry's plays over the closing sound (design.md "State Model",
+    /// system sounds, READY). Its generation settled before READY.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn ready_began(&mut self) {
+        // Source: SF-012
+        if let Some(sounds) = self.system_sounds.as_mut() {
+            sounds.start(&mut self.audio.control, audio::SystemKind::PlayReady, None);
+        }
+    }
+
+    /// The closing sound at Closing's start, after the chart's audio was
+    /// cut, for a failure and a quit alike; never stopped (design.md
+    /// "State Model", system sounds, Closing).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn closing_began(&mut self) {
+        if let Some(sounds) = self.system_sounds.as_mut() {
+            sounds.start(&mut self.audio.control, audio::SystemKind::PlayStop, None);
+        }
+    }
+
     fn restore_ready(&mut self, at: TimeUs) -> Result<(), RestoreError> {
         self.restore = None;
         self.restore_at = None;
