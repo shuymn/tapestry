@@ -657,6 +657,42 @@ fn a_selection_and_a_decision_refusal_share_the_page() {
     });
 }
 
+/// design.md "Screen skins": a selection skin refused before a look whose
+/// Enter chooses a chart, which sends no page, and a file the pick refused,
+/// named before it: both on the page of the first look back on the select
+/// screen that chooses nothing, the refusal first; neither the choice nor
+/// that look's line replaces the refusal.
+#[test]
+fn a_refusal_taken_by_a_choice_shows_on_the_return() {
+    use crate::render_side::tests::{Installers, bundle};
+    use crate::select::MenuKey;
+    use crate::selection::image_tests::press;
+    let screens = Installers::default();
+    let render = screens.spawn_bare();
+    assert_eq!(
+        render
+            .select(ScreenKind::Selection, Some(bundle()))
+            .wait()
+            .unwrap(),
+        game::Preparation::Ready
+    );
+    with_a_named_refusal(&screens, render, |rig, line| {
+        refuse_selection(&screens);
+        press(rig, MenuKey::Enter);
+        assert!(
+            matches!(rig.choose(), Some(game::Pick::Play(_))),
+            "nothing chosen"
+        );
+        rig.entered_selection();
+        let refused = crate::imports::notice(ScreenKind::Selection, SELECTION_REFUSED);
+        assert_eq!(
+            notice_of_the_look(rig, &screens),
+            Some(format!("{refused} / {line}"))
+        );
+        assert!(rig.system_notices.lock().unwrap().is_empty());
+    });
+}
+
 /// Why a selection frame of the tests' screens refuses the selection skin.
 const SELECTION_REFUSED: &str = "refused for the test";
 
