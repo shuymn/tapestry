@@ -51,8 +51,8 @@ pub struct Header {
     pub genre: Option<String>,
     /// `#PLAYLEVEL`.
     pub playlevel: Option<String>,
-    /// `#DIFFICULTY`, the last one [`java_int`](crate::java_int) reads, as
-    /// the loader keeps it.
+    /// `#DIFFICULTY`, the last one [`header_integer`](crate::header_integer)
+    /// reads, as the loader keeps it.
     pub difficulty: Option<String>,
     /// `#BPM`, the start tempo as written.
     pub bpm: Option<String>,
@@ -135,10 +135,7 @@ pub(crate) fn listing(text: &str) -> Listing {
                 continue;
             }
             _ if depth > 0 => continue,
-            _ if crate::parse::defines_bga(
-                raw_line.trim_start().strip_prefix('#').unwrap_or(body),
-            ) =>
-            {
+            _ if crate::parse::defines_bga(&upper, value) => {
                 bga = true;
                 continue;
             }

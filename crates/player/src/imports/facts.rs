@@ -25,13 +25,12 @@ pub fn attempt_facts(loaded: &Loaded, autoplay: bool) -> ImportFacts {
     }
 }
 
-/// The difficulty `text` gives as `chart.difficulty` reads it: the
-/// source's integer, `#DIFFICULTY` read by `Integer.parseInt` as the play
-/// level is ([`level_of`]; jbms-parser `CommandWord`, where an unreadable
-/// line keeps the value before it, as the loader keeps the last readable
-/// text, none leaving 0), from 1 to 5, and 0 for any other
+/// The difficulty `text` gives as `chart.difficulty` reads it:
+/// `#DIFFICULTY` read as an integer token as the play level is
+/// ([`level_of`]), from 1 to 5, and 0 for any other or none
 /// (`BooleanPropertyFactory.java:442-447`, option 150 holding for
-/// `d <= 0 || d > 5`).
+/// `d <= 0 || d > 5`). The loader keeps the last declaration that
+/// reads, so a later one that does not keeps the earlier value.
 pub fn difficulty_of(text: &str) -> u8 {
     u8::try_from(level_of(text))
         .ok()
@@ -39,12 +38,12 @@ pub fn difficulty_of(text: &str) -> u8 {
         .unwrap_or(0)
 }
 
-/// The play level `text` gives, as the source's `Integer.parseInt` reads
-/// `#PLAYLEVEL` (design.md "beatoraja Lua Skins", import facts;
-/// [`bms_parser::java_int`]); anything it does not read, the empty text
-/// and surrounding whitespace included, is 0.
+/// The play level `text` gives: `#PLAYLEVEL` read as an integer token
+/// ([`bms_parser::header_integer`]: an optional `+` or `-` and ASCII
+/// digits, within `i32`); anything else, the empty text and other
+/// scripts' digits included, is 0.
 pub fn level_of(text: &str) -> i32 {
-    bms_parser::java_int(text).unwrap_or(0)
+    bms_parser::header_integer(text).unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -90,10 +90,11 @@
 //! - **Headers:** headers for what stage 1 does not show or use (`#BASEBPM`,
 //!   `#CHARFILE`, `#EXTCHR`, `#MAKER`, `#BMPxx`, `#BGAxx`,
 //!   `#TEXTxx`, `#EXRANKxx` and descriptive ones) are ignored silently; any
-//!   other unknown header is a warning. Of these, `#DIFFICULTY` and whether
-//!   a `#BMPxx` the reference decoder registers is defined are kept as
-//!   labels ([`Labels`]),
-//!   which the chart does not hold.
+//!   other unknown header is a warning. Of these, `#DIFFICULTY` (the last
+//!   one that reads as an integer, [`header_integer`]) and whether a
+//!   `#BMPxx` names a file are kept as labels ([`Labels`]), which the chart
+//!   does not hold, so this version does not cover how they are read
+//!   (design.md "Chart Loading").
 //! - **`#LNOBJ`:** a channel 1x object with that id ends a long note started
 //!   by the previous plain note in its lane, if that note sits at an
 //!   earlier position. The end plays no sound. An empty `#LNOBJ` is
@@ -179,7 +180,7 @@ use bms_model::{
 
 pub use error::{LoadError, Warning, WarningKind};
 pub use header::{ChartMode, Header, Listing, read_header, read_listing};
-pub use parse::java_int;
+pub use parse::header_integer;
 
 /// Version of the loader rules recorded in [`ChartIdentity::loader_version`].
 pub const LOADER_VERSION: u32 = 10;
@@ -259,12 +260,11 @@ pub struct Labels {
     pub banner: String,
     /// `#PLAYLEVEL`, as text: a reader parses it by its own rules.
     pub playlevel: String,
-    /// `#DIFFICULTY`, as text: the last one [`java_int`] reads, as the
-    /// reference decoder keeps its last readable value; empty when none.
+    /// `#DIFFICULTY`, as text: the last one [`header_integer`] reads;
+    /// empty when none.
     pub difficulty: String,
-    /// Whether it defines a BGA image: a `#BMPxx` line the reference
-    /// decoder registers, read by its fixed positions, whether or not a
-    /// channel shows it.
+    /// Whether it defines a BGA image: a `#BMPxx` definition naming a
+    /// file, in the branches taken, whether or not a channel shows it.
     pub bga: bool,
 }
 
