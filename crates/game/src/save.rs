@@ -50,23 +50,41 @@ pub type LinkCount = fn(&Path) -> Option<u64>;
 /// by `links`. Removing a link removes the link, never its target, and
 /// removing one name of a file leaves its other names. A missing entry, a
 /// folder, and a file with one name or whose count is unknown are left
-/// alone, so a lock file another process holds is never removed.
+/// alone, so a lock file another process holds is never removed. Returns
+/// whether it removed the entry.
 ///
 /// # Errors
 ///
 /// The I/O error of reading the entry or removing it.
-pub fn clear_link(path: &Path, links: LinkCount) -> io::Result<()> {
+pub fn clear_link(path: &Path, links: LinkCount) -> io::Result<bool> {
     let meta = match fs::symlink_metadata(path) {
         Ok(meta) => meta,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
     if meta.file_type().is_symlink() {
-        remove_link(path)
+        remove_link(path).map(|()| true)
     } else if meta.is_file() && links(path).is_some_and(|n| n > 1) {
-        fs::remove_file(path)
+        fs::remove_file(path).map(|()| true)
     } else {
-        Ok(())
+        Ok(false)
+    }
+}
+
+/// Removes the entry at `path` unless it is a folder: a link (only the
+/// link, never its target) or a file (only this name, so its other names
+/// keep their bytes). A missing entry and a folder are left alone.
+///
+/// # Errors
+///
+/// The I/O error of reading the entry or removing it.
+pub fn remove_name(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => remove_link(path),
+        Ok(meta) if !meta.is_dir() => fs::remove_file(path),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
     }
 }
 
@@ -88,13 +106,7 @@ fn remove_link(path: &Path) -> io::Result<()> {
 ///
 /// The I/O error of removing the entry or creating the file.
 pub fn create_fresh(path: &Path) -> io::Result<File> {
-    match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => remove_link(path)?,
-        Ok(meta) if !meta.is_dir() => fs::remove_file(path)?,
-        Ok(_) => {}
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
+    remove_name(path)?;
     OpenOptions::new().write(true).create_new(true).open(path)
 }
 
