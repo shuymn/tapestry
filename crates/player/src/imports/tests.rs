@@ -985,10 +985,10 @@ pub(crate) fn class_skin() -> tempfile::TempDir {
 }
 
 /// A pending skin reading the judgment class, specialized for the facts of
-/// loaded charts, draws its class's image: red for `#RANK 2` (normal) and
-/// for no rank, blue for `#RANK 3` and `#DEFEXRANK 120` (easy, 90 once the
-/// reference normalizes it) and for `#DEFEXRANK 1` (0, then 100), under
-/// either preset; each specialization records the class it read, which
+/// loaded charts, draws its class's image: red for `#RANK 2` (normal), for
+/// no rank and for `#DEFEXRANK 1` (very hard, 0), blue for `#RANK 3` and
+/// `#DEFEXRANK 120` (easy, 90 once validated), under either preset; each
+/// specialization records the class it read, which
 /// another chart of the class holds. A frame staged for the same loaded
 /// chart reads the same class: the image at [`FRAME_CLASS`] is drawn for
 /// the easy charts alone.
@@ -1014,7 +1014,12 @@ fn a_specialization_draws_its_charts_class() {
             JudgeClass::Easy,
         ),
         ("#DEFEXRANK 120\n", "tapestry", BLUE, JudgeClass::Easy),
-        ("#DEFEXRANK 1\n", "beatoraja-style", BLUE, JudgeClass::Easy),
+        (
+            "#DEFEXRANK 1\n",
+            "beatoraja-style",
+            RED,
+            JudgeClass::VeryHard,
+        ),
     ] {
         let loaded = super::facts::tests::loaded(text, preset);
         let f = super::facts::attempt_facts(&loaded, false);

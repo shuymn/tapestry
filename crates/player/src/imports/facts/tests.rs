@@ -105,16 +105,18 @@ fn an_attempt_reads_the_loaders_level() {
     }
 }
 
-/// The judgment class for a chart of these headers: first the reference's,
-/// the output of the decoder (jbms-parser) and validation
-/// (`BMSPlayerRule.validate`, twice, as the song data takes the chart)
-/// banded as options 180 to 184 band them, at beatoraja's `0.8.9` tag, run
-/// on these inputs with a 7-key chart; then the one shown here, from the
-/// beatoraja-style header policy's reading (`JudgeClass::of_headers`). The
-/// validated rank is in each comment, and where the policy reads the
-/// headers otherwise than that decoder (a decimal `#DEFEXRANK`, one past
-/// `i32`, a `#DEFEXRANK` before a `#RANK`, a non-ASCII digit), what it
-/// reads.
+/// The judgment class for a chart of these headers: first the reference's
+/// on its play and result screens, the output of the decoder (jbms-parser)
+/// and validation (`BMSPlayerRule.validate`, twice, as the song data takes
+/// the chart) banded as options 180 to 184 band them, at beatoraja's `0.8.9`
+/// tag, run on these inputs with a 7-key chart; then the one shown here on
+/// every screen, from the beatoraja-style header policy's reading and one
+/// validation in plain arithmetic (`JudgeClass::of_headers`). The
+/// reference's validated rank is in each comment, and where the policy
+/// reads the headers otherwise than that decoder (a decimal `#DEFEXRANK`,
+/// one past `i32`, a `#DEFEXRANK` before a `#RANK`, a non-ASCII digit), what
+/// it reads; where tapestry's one validation differs from the reference's
+/// two (a first pass of 0) or its `i32` product wraps, tapestry's rank.
 pub(crate) const REFERENCE_CLASSES: &[(&str, Option<JudgeClass>, Option<JudgeClass>)] = {
     use JudgeClass::{Easy, Hard, Normal, VeryEasy, VeryHard};
     &[
@@ -135,7 +137,7 @@ pub(crate) const REFERENCE_CLASSES: &[(&str, Option<JudgeClass>, Option<JudgeCla
         ("#RANK -0\n", Some(VeryHard), Some(VeryHard)),              // 25
         ("#rank 3\n", Some(Easy), Some(Easy)),                       // 100
         ("#RANK 3 4\n", Some(Normal), Some(Normal)),                 // refused: 75
-        ("#DEFEXRANK 1\n", Some(Easy), Some(Easy)),                  // 0, then 100
+        ("#DEFEXRANK 1\n", Some(Easy), Some(VeryHard)),              // 0, then 100; here 0
         ("#DEFEXRANK 2\n", Some(Hard), Some(Hard)),                  // 1
         ("#DEFEXRANK 10\n", None, None),                             // 7
         ("#DEFEXRANK 13\n", None, None),                             // 9
@@ -161,16 +163,16 @@ pub(crate) const REFERENCE_CLASSES: &[(&str, Option<JudgeClass>, Option<JudgeCla
         ("#DEFEXRANK x\n", Some(Normal), Some(Normal)),      // refused: 75
         ("#DEFEXRANK 120 x\n", Some(Normal), Some(Normal)),  // refused: 75
         ("#DEFEXRANK 3000000000\n", Some(Normal), Some(VeryEasy)), // refused: 75; here read past i32: 2250000000
-        ("#DEFEXRANK 2147483647\n", Some(VeryEasy), Some(VeryEasy)), // wraps: 21474835
-        ("#DEFEXRANK 28633115\n", Some(VeryEasy), Some(VeryEasy)), // 21474836
-        ("#DEFEXRANK 28633116\n", Some(Easy), Some(Easy)),         // wraps: -21474835, then 100
-        ("#DEFEXRANK 57266231\n", Some(Easy), Some(Easy)),         // wraps: 0, then 100
-        ("#DEFEXRANK 57266232\n", Some(Hard), Some(Hard)),         // wraps: 1
+        ("#DEFEXRANK 2147483647\n", Some(VeryEasy), Some(VeryEasy)), // wraps: 21474835; here 1610612735
+        ("#DEFEXRANK 28633115\n", Some(VeryEasy), Some(VeryEasy)),   // 21474836
+        ("#DEFEXRANK 28633116\n", Some(Easy), Some(VeryEasy)), // wraps: -21474835, then 100; here 21474837
+        ("#DEFEXRANK 57266231\n", Some(Easy), Some(VeryEasy)), // wraps: 0, then 100; here 42949673
+        ("#DEFEXRANK 57266232\n", Some(Hard), Some(VeryEasy)), // wraps: 1; here 42949674
         // A decimal below 1, whose whole part 0 the policy reads, and a
         // non-ASCII digit, which `Integer.parseInt` reads and the policy's
         // decimal grammar does not (`crates/rules/src/beatoraja_style.rs:106`).
-        ("#DEFEXRANK 0.5\n", Some(Normal), Some(Easy)), // refused: 75; here 0 read: 0, then 100
-        ("#RANK \u{ff13}\n", Some(Easy), Some(Normal)), // 100; here refused: 75
+        ("#DEFEXRANK 0.5\n", Some(Normal), Some(VeryHard)), // refused: 75; here 0 read: 0
+        ("#RANK \u{ff13}\n", Some(Easy), Some(Normal)),     // 100; here refused: 75
         // The last header accepted counts, whichever it is.
         ("#RANK 3\n#DEFEXRANK 120\n", Some(Easy), Some(Easy)), // 90
         ("#DEFEXRANK 120\n#RANK 3\n", Some(Easy), Some(Easy)), // 100; here #DEFEXRANK read: 90

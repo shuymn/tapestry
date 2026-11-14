@@ -1562,11 +1562,11 @@ impl SelectScreen {
             random: e.random,
             max_ex: max_ex(e, self.bests_preset.as_ref()),
             score: self.score_of(e),
-            // One validation, as the reference's song database computes
-            // it (design.md "Rendering and Skins", chart metadata).
+            // The class play and result show for the chart (design.md
+            // "Rendering and Skins", chart metadata).
             judge_class: e
                 .rank
-                .and_then(skin_beatoraja::JudgeClass::of_listed)
+                .and_then(skin_beatoraja::JudgeClass::of_rank)
                 .map(skin_beatoraja::JudgeClass::index),
             clears: stored.map_or(0, |s| s.clears),
             best: stored
@@ -1697,9 +1697,10 @@ mod tests {
     }
 
     /// The selected chart's judgment class from its library entry's rank,
-    /// with one validation, as the reference's song database computes it:
-    /// `#RANK 3` easy, `#DEFEXRANK 1` very hard (0), `#DEFEXRANK 10` in no
-    /// class (7), no header normal, a refused draw none.
+    /// with one validation in plain arithmetic: `#RANK 3` easy,
+    /// `#DEFEXRANK 1` very hard (0), `#DEFEXRANK 10` in no class (7),
+    /// `#DEFEXRANK 30000000` and `57266231` very easy (22 500 000 and
+    /// 42 949 673, past `i32`), no header normal, a refused draw none.
     #[test]
     fn the_selected_charts_class_takes_one_validation() {
         use rules::JudgeRank::{DefExRankMilli, Rank};
@@ -1708,6 +1709,8 @@ mod tests {
             (Some(Some(Rank(3))), Some(3)),
             (Some(Some(DefExRankMilli(1_000))), Some(0)),
             (Some(Some(DefExRankMilli(10_000))), None),
+            (Some(Some(DefExRankMilli(30_000_000_000))), Some(4)),
+            (Some(Some(DefExRankMilli(57_266_231_000))), Some(4)),
             (Some(None), Some(2)),
             (None, None),
         ] {
@@ -1716,6 +1719,46 @@ mod tests {
                 ..entry(r"C:\charts\a\1.bms", "a")
             };
             assert_eq!(s.selected_chart(&e).judge_class, class, "{rank:?}");
+        }
+    }
+
+    /// A chart shows one judgment class on every screen: selection's, from
+    /// the rank the library scan stored for the chart's file, is the class
+    /// its play's import facts and its result's chart give, for a
+    /// `#DEFEXRANK` whose one validation is 0 (`1`, very hard) or whose
+    /// product passes `i32` (`30000000` and `57266231`, very easy), and for
+    /// ranks every screen agreed on before.
+    #[test]
+    fn every_screen_shows_one_class() {
+        let s = SelectScreen::new(Vec::new());
+        for (head, class) in [
+            ("#DEFEXRANK 1\n", Some(0)),
+            ("#DEFEXRANK 30000000\n", Some(4)),
+            ("#DEFEXRANK 57266231\n", Some(4)),
+            ("#DEFEXRANK 120\n", Some(3)),
+            ("#RANK 1\n", Some(1)),
+            ("#RANK 4\n", Some(4)),
+            ("", Some(2)),
+        ] {
+            let (dir, loaded) = crate::imports::facts::tests::loaded_kept(head, "beatoraja-style");
+            let db = tempfile::tempdir().unwrap();
+            let (library, _) = library::Library::open(&db.path().join("library.db")).unwrap();
+            library
+                .scan(&[dir.path().to_owned()], library::ScanOptions::default())
+                .unwrap()
+                .finish()
+                .unwrap();
+            let charts = library.charts().unwrap();
+            assert_eq!(charts.len(), 1, "{head:?}");
+            let selection = s.selected_chart(&charts[0]).judge_class;
+            let play = match crate::imports::facts::attempt_facts(&loaded, false).judge_class {
+                skin_beatoraja::Fact::Known(c) => c.map(skin_beatoraja::JudgeClass::index),
+                f => panic!("{head:?}: {f:?}"),
+            };
+            let result = crate::result_skin::attempt_chart(&loaded)
+                .resolved(skin_model::ImageFacts::default())
+                .judge_class;
+            assert_eq!((selection, play, result), (class, class, class), "{head:?}");
         }
     }
 
