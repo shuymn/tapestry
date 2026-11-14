@@ -666,6 +666,10 @@ pub struct ScreenRuntime {
     import_peak: u64,
     #[cfg(feature = "dev-tools")]
     _open: Option<super::vm_hooks::Open>,
+    /// Its frames' time budget in place of the thread's
+    /// ([`set_frame_time`](Self::set_frame_time), dev-tools).
+    #[cfg(feature = "dev-tools")]
+    frame_time: Option<std::time::Duration>,
     permit: Option<Permit>,
 }
 
@@ -773,6 +777,8 @@ impl ScreenRuntime {
             import_peak,
             #[cfg(feature = "dev-tools")]
             _open: open,
+            #[cfg(feature = "dev-tools")]
+            frame_time: None,
             permit: None,
         }))
     }
@@ -796,6 +802,16 @@ impl ScreenRuntime {
     #[must_use]
     pub fn holds_permit(&self) -> bool {
         self.permit.is_some()
+    }
+
+    /// Gives its frames `t` of time in place of the thread's frame time
+    /// (`None`: the thread's again; dev-tools), on whichever thread runs
+    /// them: a test of what the callbacks give, whose outcome a loaded
+    /// machine's clock must not decide, sets a time no frame reaches.
+    /// [`super::vm_hooks::expire_frame_at`] still spends it.
+    #[cfg(feature = "dev-tools")]
+    pub fn set_frame_time(&mut self, t: Option<std::time::Duration>) {
+        self.frame_time = t;
     }
 
     /// Calls `f` when the VM is destroyed, from the VM's own teardown
@@ -946,6 +962,12 @@ impl ScreenRuntime {
                 s.timers.extend_from_slice(timers);
             }
         }
+        #[cfg(feature = "dev-tools")]
+        match self.frame_time {
+            Some(t) => self.pass.ledger.begin_frame_within(t),
+            None => self.pass.ledger.begin_frame(),
+        }
+        #[cfg(not(feature = "dev-tools"))]
         self.pass.ledger.begin_frame();
         let mut out_of_budget = false;
         for k in 0..n {
