@@ -230,7 +230,6 @@ struct Worker {
 #[derive(Debug)]
 struct InFlight {
     id: GenId,
-    reserved: u64,
     cancel: Arc<AtomicBool>,
     /// An entry gave up waiting for it: its report is dropped.
     superseded: bool,
@@ -824,10 +823,11 @@ impl SystemSounds {
     }
 
     /// A report not pushed: its generation dropped here, uncharged.
+    #[cfg_attr(
+        not(test),
+        expect(unused_variables, reason = "only the test event names the generation")
+    )]
     fn dropped(&mut self, id: GenId, report: PickReport) {
-        if self.in_flight.as_ref().is_some_and(|f| f.id == id) {
-            self.in_flight = None;
-        }
         drop(report);
         #[cfg(test)]
         self.events.push(Event::Dropped(id));
@@ -915,7 +915,6 @@ impl SystemSounds {
         }
         self.in_flight = Some(InFlight {
             id,
-            reserved: PICK_BYTES,
             cancel,
             superseded: false,
         });
@@ -953,7 +952,7 @@ impl SystemSounds {
     )]
     pub fn charged(&self) -> u64 {
         self.alive.iter().map(|&(_, b)| b).sum::<u64>()
-            + self.in_flight.as_ref().map_or(0, |f| f.reserved)
+            + self.in_flight.as_ref().map_or(0, |_| PICK_BYTES)
     }
 }
 

@@ -32,6 +32,15 @@ const PATIENCE: Duration = Duration::from_secs(20);
 /// end.
 const SLICES: Duration = Duration::from_millis(10);
 
+/// Waits until `cond` holds, without polling the owner.
+fn wait(what: &str, mut cond: impl FnMut() -> bool) {
+    let until = Instant::now() + PATIENCE;
+    while !cond() {
+        assert!(Instant::now() < until, "waited too long for {what}");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
 /// A mono 16-bit WAV at [`RATE`] of `frames` frames at `level`.
 fn wav(frames: usize, level: i16) -> Vec<u8> {
     let data = u32::try_from(frames * 2).unwrap();
@@ -157,11 +166,9 @@ impl Audio {
     /// Waits for `n` steps of the stepping thread.
     fn steps(&self, n: u64) {
         let from = self.shared.steps.load(Ordering::Acquire);
-        let until = Instant::now() + PATIENCE;
-        while self.shared.steps.load(Ordering::Acquire) < from + n {
-            assert!(Instant::now() < until, "the audio worker did not step");
-            thread::sleep(Duration::from_millis(1));
-        }
+        wait("the audio worker's steps", || {
+            self.shared.steps.load(Ordering::Acquire) >= from + n
+        });
     }
 
     fn system<R>(&self, f: impl FnOnce(&SystemVoices) -> R) -> R {
@@ -535,6 +542,20 @@ impl Run {
         self.sounds.poll(&mut self.audio.control);
     }
 
+    /// A installed, then B admitted and acknowledged; A's scratch started
+    /// before B installs, so A retires holding it. Returns A and B.
+    fn retire_holding_scratch(&mut self) -> (GenId, GenId) {
+        let a = self.entry();
+        self.audio.hold(true);
+        self.pick(1);
+        let b = self.entry();
+        self.start(SystemKind::Scratch, None);
+        self.until("B's push", |s| s.unacked == Some(b));
+        self.audio.hold(false);
+        self.until("B acknowledged", |s| s.unacked.is_none());
+        (a, b)
+    }
+
     /// Polls until `cond` holds.
     fn until(&mut self, what: &str, cond: impl Fn(&SystemSounds) -> bool) {
         let until = Instant::now() + PATIENCE;
@@ -569,11 +590,7 @@ impl Run {
     /// Waits until the worker's decode of the file ending with `suffix`
     /// has begun: a read blocked there is under way.
     fn entered(&self, suffix: &str) {
-        let until = Instant::now() + PATIENCE;
-        while self.seam.opens(suffix) == 0 {
-            assert!(Instant::now() < until, "{suffix} was never read");
-            thread::sleep(Duration::from_millis(1));
-        }
+        wait(suffix, || self.seam.opens(suffix) > 0);
     }
 
     fn said(&self) -> Vec<String> {
@@ -932,16 +949,8 @@ fn the_sequence_exhausted_latches_with_the_terminal_install() {
 
     let mut run = Run::new(visits(), Opts::default());
     run.settle();
-    let a = run.entry();
-    // B admitted; A's scratch started before B installs, so A retires
-    // holding it; then B's loop.
-    run.audio.hold(true);
-    run.pick(1);
-    let b = run.entry();
-    run.start(SystemKind::Scratch, None);
-    run.until("B's push", |s| s.unacked == Some(b));
-    run.audio.hold(false);
-    run.until("B acknowledged", |s| s.unacked.is_none());
+    let (a, b) = run.retire_holding_scratch();
+    // Then B's loop.
     run.start(SystemKind::Select, Some(b));
     run.audio.steps(2);
     assert_eq!(run.sounding(), 2);
@@ -1159,14 +1168,7 @@ fn an_entry_that_cannot_settle_skips_its_reroll() {
     // after the entry's stop.
     let (mut run, clock) = virtual_run(visits(), |_| {});
     run.settle();
-    run.entry();
-    run.audio.hold(true);
-    run.pick(1);
-    let b = run.entry();
-    run.start(SystemKind::Scratch, None);
-    run.until("B's push", |s| s.unacked == Some(b));
-    run.audio.hold(false);
-    run.until("B acknowledged", |s| s.unacked.is_none());
+    let (_, b) = run.retire_holding_scratch();
     assert_eq!(run.sounds.retired_count(), 1);
     run.audio.hold(true);
     let from = clock.elapsed();
@@ -1285,11 +1287,7 @@ fn close_drains_the_slot_before_the_returns() {
     run.sounds
         .latch(&mut run.audio.control, Reason::SequenceExhausted);
     let empty = run.sounds.newest;
-    let until = Instant::now() + PATIENCE;
-    while run.installed() != Some(empty) {
-        assert!(Instant::now() < until, "the empty install never applied");
-        thread::sleep(Duration::from_millis(1));
-    }
+    wait("the empty install", || run.installed() == Some(empty));
     run.audio.steps(2);
     assert!(!run.events().contains(&Event::Drained));
     run.sounds.close(&mut run.audio.control);
@@ -1315,17 +1313,13 @@ fn a_latch_found_while_receiving_is_drained_before_the_returns() {
     panic.store(true, Ordering::Release);
     run.pick(1);
     run.entry();
-    let until = Instant::now() + PATIENCE;
-    while !run
-        .sounds
-        .worker
-        .as_ref()
-        .and_then(|w| w.handle.as_ref())
-        .is_some_and(thread::JoinHandle::is_finished)
-    {
-        assert!(Instant::now() < until, "the worker never ended");
-        thread::sleep(Duration::from_millis(1));
-    }
+    wait("the worker's end", || {
+        run.sounds
+            .worker
+            .as_ref()
+            .and_then(|w| w.handle.as_ref())
+            .is_some_and(thread::JoinHandle::is_finished)
+    });
     assert!(run.sounds.latched.is_none());
     run.sounds.service(&mut run.audio.control);
     assert_eq!(run.sounds.latched, Some(Reason::WorkerGone));

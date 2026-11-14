@@ -128,14 +128,8 @@ impl SystemKind {
     }
 
     /// Its reserved voice's place in [`RESERVED_KINDS`], if it has one.
-    const fn reserved(self) -> Option<usize> {
-        match self {
-            Self::Select => Some(0),
-            Self::Clear => Some(1),
-            Self::Fail => Some(2),
-            Self::Decide => Some(3),
-            _ => None,
-        }
+    fn reserved(self) -> Option<usize> {
+        RESERVED_KINDS.iter().position(|&k| k == self)
     }
 }
 
