@@ -128,17 +128,19 @@ impl Rate {
     }
 }
 
-/// The EX score from `ex` to the next grade step of 3/27 over `max_ex`, or
-/// to `max_ex` past the last step: the first `i` of 0, 3, …, 24 that `ex`
-/// does not meet gives `⌈i · max_ex / 27⌉ − ex`.
+/// The EX score from `ex` to the next grade over `max_ex`, the smallest
+/// gain that raises the grade: the first threshold `low` of 6, 9, …, 24
+/// 27ths that `ex` does not meet gives `⌈low · max_ex / 27⌉ − ex`; at the
+/// top grade it is `max_ex − ex`, 0 at or past `max_ex`.
 #[must_use]
 pub fn next_rank(ex: u32, max_ex: u32) -> u32 {
     let (e, m) = (u128::from(ex), u128::from(max_ex));
-    let next = (0..27_u128)
-        .step_by(3)
-        .find(|&i| 27 * e < i * m)
-        .map_or(m.saturating_sub(e), |i| {
-            (i * m).div_ceil(27).saturating_sub(e)
+    let next = RANK_LOW
+        .iter()
+        .skip(1)
+        .find(|&&low| 27 * e < low * m)
+        .map_or(m.saturating_sub(e), |&low| {
+            (low * m).div_ceil(27).saturating_sub(e)
         });
     u32::try_from(next).unwrap_or(u32::MAX)
 }

@@ -14,9 +14,10 @@ use super::{Rate, TimelineAxis, TimingStats, next_rank};
 /// the largest EX score `notes * 2`; every row agrees with the exact
 /// figures, rates truncated, a grade boundary at `27 · ex = k · max_ex`
 /// met and one below it not, except 1333 of 2000, whose 66.65 % the
-/// source's float rate shows as 66.64 ([`FLOAT_RATES`]), and 29 of 54,
+/// source's float rate shows as 66.64 ([`FLOAT_RATES`]); 29 of 54,
 /// whose next grade the source's float product puts 2 away
-/// ([`FLOAT_NEXT`]).
+/// ([`FLOAT_NEXT`]); and the scores below 1/9, whose next grade the
+/// source counts to 3/27 ([`GRADE_NEXT`]).
 const SOURCE_RANKS: [(u32, u32, u32, u32, u8, u32); 26] = [
     (0, 270, 0, 0, 0, 30),
     (59, 270, 21, 85, 0, 1),
@@ -57,13 +58,23 @@ const FLOAT_RATES: [(u32, u32, u32); 1] = [(1333, 2000, 65)];
 /// value, a stated deviation.
 const FLOAT_NEXT: [(u32, u32, u32); 1] = [(29, 54, 1)];
 
+/// The rows below 1/9 of the largest: `(ex, max_ex, the 154 shown)`. The
+/// source's loop also stops at 3/27, which is not a grade
+/// (`ScoreDataProperty.java:100-105`); tapestry counts to the next grade,
+/// 6/27, a stated deviation.
+const GRADE_NEXT: [(u32, u32, u32); 2] = [(0, 270, 60), (1, 2000, 444)];
+
 #[test]
 fn rates_grades_and_next_grade_match_the_source() {
     for (ex, max, whole, mut hundredths, grade, mut next) in SOURCE_RANKS {
         if let Some(&(_, _, exact)) = FLOAT_RATES.iter().find(|r| (r.0, r.1) == (ex, max)) {
             hundredths = exact;
         }
-        if let Some(&(_, _, exact)) = FLOAT_NEXT.iter().find(|r| (r.0, r.1) == (ex, max)) {
+        if let Some(&(_, _, exact)) = FLOAT_NEXT
+            .iter()
+            .chain(&GRADE_NEXT)
+            .find(|r| (r.0, r.1) == (ex, max))
+        {
             next = exact;
         }
         let r = Rate::of(ex, max).unwrap();
@@ -92,6 +103,49 @@ fn rates_grades_and_next_grade_match_the_source() {
     assert_eq!(Rate::of(1, 2_000).unwrap().rate_bp, 5);
     assert_eq!(Rate::of(1, 2_001).unwrap().rate_bp, 4);
 }
+
+/// Number 154 is the smallest EX gain that raises the grade below the top
+/// grade, though one gain may skip a grade at a small largest, and the gain
+/// to the largest at the top grade; an EX score past the largest reads 0.
+#[test]
+fn the_next_grade_is_the_smallest_gain_that_raises_the_grade() {
+    let grade = |ex, max| Rate::of(ex, max).unwrap().grade;
+    for max in 1..=300 {
+        for ex in 0..=max {
+            let (n, g) = (next_rank(ex, max), grade(ex, max));
+            if g == 7 {
+                assert_eq!(n, max - ex, "ex {ex} of {max}");
+            } else {
+                assert!(n > 0, "ex {ex} of {max}");
+                assert!(grade(ex + n, max) > g, "ex {ex} of {max}");
+                assert_eq!(grade(ex + n - 1, max), g, "ex {ex} of {max}");
+            }
+        }
+    }
+    for (ex, max, next) in NEXT_GRADE_ROWS {
+        assert_eq!(next_rank(ex, max), next, "ex {ex} of {max}");
+    }
+}
+
+/// `(ex, max_ex, 154)` at and around the grades, mirrored in
+/// `skin_model::select`: below 1/9 to 6/27 rounded up, at a threshold to
+/// the next, at the top grade to the largest, past it and at a largest of
+/// 0 nothing.
+const NEXT_GRADE_ROWS: [(u32, u32, u32); 13] = [
+    (0, 54, 12),
+    (5, 54, 7),
+    (6, 54, 6),
+    (48, 54, 6),
+    (54, 54, 0),
+    (55, 54, 0),
+    (0, 27, 6),
+    (2, 27, 4),
+    (0, 5, 2),
+    (0, 10, 3),
+    (1, 10, 2),
+    (0, 4, 1),
+    (0, 0, 0),
+];
 
 /// A press `d` µs from its note (press − note), judged GREAT.
 fn press(d: i64) -> JudgeEvent {

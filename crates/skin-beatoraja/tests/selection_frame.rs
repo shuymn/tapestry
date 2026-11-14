@@ -369,6 +369,19 @@ fn the_profile_draws_the_view_through_the_production_path() {
     assert!(options.contains(&100));
 }
 
+/// 154 counts to the next grade: a best of EX 10 of 150, below 1/9, is
+/// `⌈6 · 150 / 27⌉ − 10` from grade E.
+#[test]
+fn the_next_rank_below_one_ninth_counts_to_the_next_grade() {
+    let d = folder(&profile_skin());
+    let mut s = Sel::of(d.path());
+    let mut row = chart("a");
+    row.score = best(10, 5, 7);
+    s.view(&view(vec![row], Some(0), Some(150), None));
+    let (numbers, _, _) = profile_frame(&mut s);
+    assert_eq!(numbers.get(&154).map(String::as_str), Some("24"));
+}
+
 /// C11: with `max_ex` 0 no rate, rank or next rank draws; 72 draws 0.
 #[test]
 fn a_zero_maximum_draws_no_rate() {

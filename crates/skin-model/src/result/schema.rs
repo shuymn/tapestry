@@ -182,7 +182,7 @@ pub mod field {
     pub const RATE_CURRENT_BP: u16 = 27;
     /// The grade, 0 (F) to 7 (AAA).
     pub const RESULT_GRADE: u16 = 28;
-    /// The EX score to the next grade step, or to the largest.
+    /// The EX score to the next grade, or to the largest at the top grade.
     pub const RESULT_NEXT_RANK: u16 = 29;
     /// The clear type, the source's index ([`LampKey::clear_type`](crate::LampKey::clear_type)).
     pub const RESULT_CLEAR: u16 = 30;

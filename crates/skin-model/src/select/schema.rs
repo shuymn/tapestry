@@ -187,7 +187,7 @@ pub mod field {
     /// The rank, 0 (lowest) to 7 (highest): the greatest `k` with
     /// `27 · ex ≥ low_k · max_ex`, `low` being 0, 6, 9, 12, 15, 18, 21, 24.
     pub const SELECTED_RANK: u16 = 15;
-    /// The EX score to the next rank of 3/27 steps, or to the largest.
+    /// The EX score to the next rank, or to the largest at the top rank.
     pub const SELECTED_NEXT_RANK: u16 = 16;
     /// Whether the chart has a summary.
     pub const SELECTED_SUMMARY: u16 = 17;
