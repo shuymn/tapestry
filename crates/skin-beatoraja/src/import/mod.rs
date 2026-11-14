@@ -2065,10 +2065,8 @@ impl<'d> Cx<'d> {
     /// tail), from the top-level `finishmargin` and `fadeout` in ms
     /// (`JsonSkin.java:14, 21`, each 0 when absent; a Lua skin's table
     /// converts to the same fields, `LuaSkinLoader.java:90-91`), in µs
-    /// over the source's whole `int` range, with no cap: a negative
-    /// `finishmargin` is 0, and `fadeout` keeps its sign, since the
-    /// source leaves on a negative one before its finish margin
-    /// (`BMSPlayer.java:756`). `finishmargin` is read whether or not the
+    /// up to the source's largest `int`, with no cap: each is a length,
+    /// and a negative one is 0. `finishmargin` is read whether or not the
     /// skin defines a note, as `close` is, where the source sets it only
     /// while loading the note's destination
     /// (`JsonPlaySkinObjectLoader.java:37-44`). Each is read as every
@@ -2078,7 +2076,7 @@ impl<'d> Cx<'d> {
         let fadeout = self.top_int("fadeout", 0)?;
         Ok(PlayEnding {
             finish_margin: TimeUs(i64::from(finish_margin.max(0)) * 1_000),
-            fadeout: TimeUs(i64::from(fadeout) * 1_000),
+            fadeout: TimeUs(i64::from(fadeout.max(0)) * 1_000),
         })
     }
 

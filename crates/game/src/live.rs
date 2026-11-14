@@ -809,10 +809,8 @@ pub struct PlayEnding {
     /// How long the play screen holds past the finish point before its
     /// fade-out, at least 0: a negative declaration is read as 0.
     pub finish_margin: TimeUs,
-    /// How long the fade-out lasts, as declared: 0 or less has no
-    /// fade-out, and a negative value also leaves the finish margin out,
-    /// as the source's timer that is off reads 0
-    /// (`play/BMSPlayer.java:756`, `TimerManager.java:37-42` at 0.8.9).
+    /// How long the fade-out lasts: 0 or less has no fade-out, and the
+    /// finish margin is held whatever it is.
     pub fadeout: TimeUs,
 }
 
@@ -831,18 +829,18 @@ pub const FINISH_MARGIN: TimeUs = TimeUs(5_000_000);
 
 /// Where a full play's hold may end at the earliest, for a play whose
 /// finish anchor is `anchor`: [`FINISH_MARGIN`] after it, plus the skin's
-/// finish margin unless its fadeout is negative (the source's timer that
-/// is off reads 0, so it leaves before the margin, `BMSPlayer.java:756`),
+/// finish margin, a negative one read as 0, whatever its fadeout is,
 /// saturating.
 #[must_use]
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 pub const fn hold_until(anchor: TimeUs, ending: PlayEnding) -> TimeUs {
     let finished = anchor.0.saturating_add(FINISH_MARGIN.0);
-    if ending.fadeout.0 < 0 {
-        TimeUs(finished)
+    let margin = if ending.finish_margin.0 > 0 {
+        ending.finish_margin.0
     } else {
-        TimeUs(finished.saturating_add(ending.finish_margin.0))
-    }
+        0
+    };
+    TimeUs(finished.saturating_add(margin))
 }
 
 /// Where a full play's fade-out started at play time `start` ends, or

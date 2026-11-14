@@ -196,7 +196,7 @@ pub struct DecisionDefs {
 pub struct PlayEnding {
     /// The hold past the finish point before the fade-out, at least 0.
     pub finish_margin: TimeUs,
-    /// The fade-out's length as declared, which may be negative.
+    /// The fade-out's length, at least 0 as the importer reads it.
     pub fadeout: TimeUs,
 }
 
