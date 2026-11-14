@@ -66,14 +66,16 @@ fn one_tap() -> Chart {
 }
 
 /// C11: the histogram holds the timing statistics' samples (early
-/// positive) by ms truncated toward 0: 150 999 µs early in slot 300, as
-/// late in slot 0, 151 000 µs either way in none; 999 µs either way in
-/// slot 150; a long note by the tally's side (its release when farther,
-/// or on a tie, else its head); a miss and an empty POOR in none. It
-/// counts as many samples as the statistics, and the built-in 2 ms
-/// histogram is the presses' as before.
+/// positive) in centred 1 ms bins, each from 500 µs below its ms up to
+/// 500 µs above, excluded: 150 000 µs early in slot 300, as late in slot
+/// 0, 150 001 µs either way in none; 499 µs either way and 500 µs late in
+/// slot 150; 500 µs and 999 µs early in slot 151; 999 µs late in slot
+/// 149; a long note by the tally's side (its release when farther, or on
+/// a tie, else its head); a miss and an empty POOR in none. It counts as
+/// many samples as the statistics, and the built-in 2 ms histogram is the
+/// presses' as before.
 #[test]
-fn the_histogram_holds_the_timing_samples_by_truncated_ms() {
+fn the_histogram_holds_the_timing_samples_by_centred_ms() {
     let empty_poor = JudgeEvent {
         kind: JudgeEventKind::EmptyPoor {
             lane: lane(1),
@@ -83,14 +85,16 @@ fn the_histogram_holds_the_timing_samples_by_truncated_ms() {
         ..judged(None, None)
     };
     let events = vec![
-        judged(Some(-150_999), None),
-        judged(Some(150_999), None),
-        judged(Some(-151_000), None),
-        judged(Some(151_000), None),
+        judged(Some(-150_000), None),
+        judged(Some(150_000), None),
+        judged(Some(-150_001), None),
+        judged(Some(150_001), None),
+        judged(Some(-499), None),
+        judged(Some(499), None),
+        judged(Some(-500), None),
+        judged(Some(500), None),
         judged(Some(-999), None),
         judged(Some(999), None),
-        judged(Some(-1_000), None),
-        judged(Some(1_000), None),
         // The release 40 ms early is farther than the head 30 ms late.
         judged(Some(30_000), Some(-40_000)),
         // The head 50 ms late is farther than the release 10 ms early.
@@ -106,8 +110,8 @@ fn the_histogram_holds_the_timing_samples_by_truncated_ms() {
     let mut want = [0_u32; DEVIATION_SLOTS];
     want[300] = 1;
     want[0] = 1;
-    want[150] = 2;
-    want[151] = 1;
+    want[150] = 3;
+    want[151] = 2;
     want[149] = 1;
     want[150 + 40] = 1;
     want[150 - 50] = 1;
@@ -116,7 +120,7 @@ fn the_histogram_holds_the_timing_samples_by_truncated_ms() {
     let samples: u32 = s.graphs.deviations.iter().sum();
     assert_eq!(Some(samples), s.figures.timing.map(|t| t.samples));
     assert_eq!(s.graphs.timing, Timing::of(&e.events));
-    assert_eq!(s.graphs.timing.samples(), 11);
+    assert_eq!(s.graphs.timing.samples(), 13);
 }
 
 /// A preset whose key and scratch tables differ, each edge asymmetric,

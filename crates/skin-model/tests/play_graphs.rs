@@ -471,24 +471,31 @@ fn tempo_chart() -> (Chart, ChartProfile) {
 }
 
 /// C22: the BPM graph over 100 × 100 texels with 2-texel strokes. The
-/// rows are 150 at 0, 300 at 1 000, stopped at 2 000, 75 at 3 000 and 75 at
-/// 4 000 (the last point); `last` is `4 000 + 1 000`, so x is `⌊ms/50⌋`: 0,
-/// 20, 40, 60, 80. y over MAIN 150 is `⌊(log10 r + log10 8)/(2 log10 8) ·
-/// 98⌋`: 150 → 49, 300 → 65, stop (1/8) → 0, 75 → 32. The strokes: green
-/// 150 over columns 0-21 rows 49-50; a grey change at 20-21 rows 51-64; red
-/// 300 over 20-41 rows 65-66; a grey change at 40-41 rows 2-64; magenta stop
-/// over 40-61 rows 0-1; a grey change at 60-61 rows 2-31; blue 75 (the
-/// lowest) over 60-81 and, as the last row, 80-99, rows 32-33.
+/// rows are 150 at 0, 300 at 1 000, stopped at 2 000, 300 again at the
+/// STOP's end (2 500), 75 at 3 000 and 75 at 4 000 (the last point); `last`
+/// is `4 000 + 1 000`, so x is `⌊ms/50⌋`: 0, 20, 40, 50, 60, 80. y over MAIN
+/// 150 is `⌊(log10 r + log10 8)/(2 log10 8) · 98⌋`: 150 → 49, 300 → 65,
+/// stop (1/8) → 0, 75 → 32. The strokes: green 150 over columns 0-21 rows
+/// 49-50; a grey change at 20-21 rows 51-64; red 300 over 20-41 rows 65-66;
+/// a grey change at 40-41 rows 2-64; magenta stop over 40-51 rows 0-1; a
+/// grey change at 50-51 rows 2-64; red 300 over 50-61 rows 65-66; a grey
+/// change at 60-61 rows 34-64; blue 75 (the lowest) over 60-81 and, as the
+/// last row, 80-99, rows 32-33.
 #[test]
 fn the_bpm_graph_draws_the_sources_strokes() {
     let (chart, profile) = tempo_chart();
-    let row = |ms, t| bms_model::SpeedRow { ms, tempo: t };
+    let row = |ms, t| bms_model::SpeedRow {
+        ms,
+        tempo: t,
+        scroll: bms_model::SCROLL_ONE,
+    };
     assert_eq!(
-        profile.speeds(),
+        profile.speeds().to_vec(),
         [
             row(0, Some(tempo(150))),
             row(1_000, Some(tempo(300))),
             row(2_000, None),
+            row(2_500, Some(tempo(300))),
             row(3_000, Some(tempo(75))),
             row(4_000, Some(tempo(75))),
         ]
@@ -529,8 +536,13 @@ fn the_bpm_graph_draws_the_sources_strokes() {
     check(&fx, 21.0, 58.0, Some(0x7f_7f7f));
     check(&fx, 30.0, 66.0, Some(0xff_0000));
     check(&fx, 41.0, 30.0, Some(0x7f_7f7f));
+    check(&fx, 45.0, 1.0, Some(0xff_00ff));
     check(&fx, 50.0, 1.0, Some(0xff_00ff));
-    check(&fx, 61.0, 20.0, Some(0x7f_7f7f));
+    check(&fx, 55.0, 1.0, None);
+    check(&fx, 51.0, 30.0, Some(0x7f_7f7f));
+    check(&fx, 55.0, 66.0, Some(0xff_0000));
+    check(&fx, 61.0, 50.0, Some(0x7f_7f7f));
+    check(&fx, 61.0, 20.0, None);
     check(&fx, 70.0, 33.0, Some(0x00_00ff));
     check(&fx, 90.0, 33.0, Some(0x00_00ff));
     check(&fx, 90.0, 35.0, None);
@@ -1019,16 +1031,16 @@ fn the_hit_error_pixmap_turns_under_the_destination() {
     fx.empty(495.5, 305.0);
 }
 
-/// The source's average after `values`, from 0.
+/// The average after `values` strictly inside ±150, from 0, unrounded,
+/// as the column [`ema_only`] draws it: truncated toward 0.
 fn reference_ema(alpha: f32, values: impl IntoIterator<Item = i32>) -> i64 {
-    let mut ema = 0_i64;
+    let mut ema = 0.0_f64;
     for v in values {
-        let v = i64::from(v);
         if -150 < v && v < 150 {
-            ema = ema.wrapping_add((alpha * v.wrapping_sub(ema) as f32) as i64);
+            ema += f64::from(alpha) * (f64::from(v) - ema);
         }
     }
-    ema
+    (ema * 2_001.0 / 2_001.0).trunc() as i64
 }
 
 /// An average-only visualizer over 2 001 texels at jw 1 000 (`x = 1 000 −
@@ -1109,15 +1121,37 @@ fn each_average_consumes_the_ring_once() {
     assert_eq!(shown_ema(&fresh, 0), 0);
 }
 
-/// C26: any weight the source takes steps as its `long` arithmetic does,
-/// never overflowing. At 1e20 after 1, `(long)(1e20 · 1)` saturates to
-/// `i64::MAX`; after −2 the difference `−2 − MAX` wraps to `MAX`, the
-/// product is past `float`'s range and saturates to `MAX` again, and the
-/// sum wraps to −2: texel 1 002. At −0.5 after 40 the average is −20:
-/// texel 1 020.
+/// C26: the average is kept unrounded. At the weight 0.1, five offsets of
+/// +5 bring it to `5 · (1 − 0.9^5)` = 2.05: texel 998; a sixth, to 2.34;
+/// four more, to 3.26: texel 997. Each step is below 1 ms, which a
+/// per-step truncation would drop, leaving the line at 0.
 #[test]
-fn extreme_weights_step_as_the_source_does() {
-    for (alpha, values, want) in [(1e20_f32, vec![1, -2], -2), (-0.5, vec![40], -20)] {
+fn the_average_moves_by_steps_below_one_ms() {
+    let mut fx = hit_fx(vec![ema_only(0.1)], &[[0, 300, 2_001, 20]], 255, 0);
+    for (n, want) in [(5, 2), (1, 2), (4, 3)] {
+        for _ in 0..n {
+            fx.h.record(5);
+        }
+        fx.frame(0);
+        assert_eq!(shown_ema(&fx, 0), want);
+    }
+    // −5 ten times from 0: −3.26, texel 1 003.
+    let mut late = hit_fx(vec![ema_only(0.1)], &[[0, 300, 2_001, 20]], 255, 0);
+    for _ in 0..10 {
+        late.h.record(-5);
+    }
+    late.frame(0);
+    assert_eq!(shown_ema(&late, 0), -3);
+}
+
+/// C26: any finite weight steps by plain arithmetic and the average is
+/// drawn within the judge width. At 1e20 after 1 and then −2 it is held at
+/// −2^53 (the value itself is pinned by `ema_step`'s unit tests in
+/// `widget/hit_error.rs`), drawn at −1 000: texel 2 000. At −0.5 after 40
+/// the average is −20: texel 1 020.
+#[test]
+fn extreme_weights_stay_finite() {
+    for (alpha, values, want) in [(1e20_f32, vec![1, -2], -1_000), (-0.5, vec![40], -20)] {
         let mut fx = hit_fx(vec![ema_only(alpha)], &[[0, 300, 2_001, 20]], 255, 0);
         for v in values {
             fx.h.record(v);

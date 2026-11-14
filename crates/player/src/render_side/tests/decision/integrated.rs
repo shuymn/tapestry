@@ -27,7 +27,7 @@ use tempfile::TempDir;
 use crate::controls::Controls;
 use crate::measure::{DecisionDrawnAs, DecisionFallback, DecisionRecord};
 
-use super::{Decided, DecidedSink};
+use super::{Decided, DecidedSink, RigSink};
 use crate::menu_screen::{MenuPage, MenuScreen};
 use crate::render_side::tests::wait_until;
 use crate::render_side::{EndPage, MakeScreen, Screen, TakeoverAcks};
@@ -99,6 +99,12 @@ struct GateState {
     permits: u32,
     waits: u64,
     held: bool,
+    /// Every frame wait answers that no frame is due, after a park of at
+    /// most a millisecond: nothing is drawn, and the render thread goes on
+    /// taking its messages.
+    suppress: bool,
+    /// The waits answered so while suppressed.
+    refused: u64,
 }
 
 /// The render thread's frames held and let through one at a time.
@@ -143,20 +149,74 @@ impl Gate {
         });
     }
 
+    /// One frame let through, the gate held, until `done` holds.
+    #[track_caller]
+    fn step_into(&self, done: impl Fn() -> bool) {
+        self.lock().permits = 1;
+        self.changed.notify_all();
+        assert!(wait_until(done), "the frame let through never got there");
+    }
+
     /// Frames go free again.
     fn release(&self) {
         self.lock().pace = false;
         self.changed.notify_all();
     }
 
-    /// The render thread's frame wait.
-    fn wait(&self) {
+    /// No frame is drawn from now (`true`) while the render thread keeps
+    /// taking its messages: every frame wait, a held one woken included,
+    /// answers that none is due, and the screen counts as paced, so the
+    /// clock's pacing never draws either. Turned on, it waits until one
+    /// wait was answered so after the call: the render thread asks for a
+    /// wait only without a frame granted, so none granted before survives.
+    fn suppress(&self, on: bool) {
+        let before = {
+            let mut s = self.lock();
+            s.suppress = on;
+            s.refused
+        };
+        self.changed.notify_all();
+        if on {
+            self.until("answered a frame wait with none due", |s| {
+                s.refused > before
+            });
+        }
+    }
+
+    /// From suppressed to held, in one step: the render thread parks at
+    /// its next frame wait and takes no message until let go, no frame
+    /// drawn in between.
+    fn block(&self) {
+        {
+            let mut s = self.lock();
+            s.pace = true;
+            s.permits = 0;
+            s.suppress = false;
+        }
+        self.changed.notify_all();
+        self.until("held a frame", |s| s.held);
+    }
+
+    /// The render thread's frame wait: whether a frame is due.
+    fn wait(&self) -> bool {
         let mut s = self.lock();
         s.waits += 1;
-        while s.pace && s.permits == 0 {
+        while s.pace && s.permits == 0 && !s.suppress {
             s.held = true;
             self.changed.notify_all();
             s = self.changed.wait(s).unwrap_or_else(PoisonError::into_inner);
+        }
+        if s.suppress {
+            s.held = false;
+            // A short park, so the render thread's loop does not spin.
+            let (mut s, _) = self
+                .changed
+                .wait_timeout(s, Duration::from_millis(1))
+                .unwrap_or_else(PoisonError::into_inner);
+            s.refused += 1;
+            drop(s);
+            self.changed.notify_all();
+            return false;
         }
         if s.pace {
             s.permits -= 1;
@@ -164,10 +224,14 @@ impl Gate {
         s.held = false;
         drop(s);
         self.changed.notify_all();
+        true
     }
 
+    /// Whether the frames are paced by the gate: held or suppressed, the
+    /// clock's pacing never draws.
     fn pacing(&self) -> bool {
-        self.lock().pace
+        let s = self.lock();
+        s.pace || s.suppress
     }
 }
 
@@ -181,6 +245,8 @@ struct Seen {
     refused_at: Mutex<Option<TimeUs>>,
     /// The next decision frame's fade marker is read back.
     probe: AtomicBool,
+    /// A chart's load on the render thread waits here while held.
+    load_gate: crate::render_side::TestGate,
     drawn: Mutex<Vec<Drawn>>,
     more: Condvar,
 }
@@ -267,6 +333,7 @@ impl Screen for Noted {
         chart: &bms_model::Chart,
         section: Option<&eval::Section>,
     ) -> Result<(), RenderError> {
+        self.seen.load_gate.pass();
         self.menu.load(chart, section)
     }
     fn prepare_attempt(
@@ -472,7 +539,9 @@ impl Screen for Noted {
         self.menu.refuse_next_result(text);
     }
     fn wait(&self) -> bool {
-        self.seen.gate.wait();
+        if !self.seen.gate.wait() {
+            return false;
+        }
         !self.menu.paced() || self.menu.wait()
     }
     fn allocate_in_next_decision(&mut self, refuse: bool) {
@@ -666,6 +735,8 @@ impl Set {
 /// What a run's helper reaches beside the game thread.
 struct Side<'a> {
     seen: &'a Seen,
+    /// The game thread's controls: the decision screen its waits watch.
+    controls: &'a Controls,
     menu: &'a MenuQueue,
     book: &'a Mutex<LabelBook>,
     /// The chart under the cursor, as the library lists it.
@@ -685,6 +756,10 @@ struct Side<'a> {
     ready_checks: Box<dyn Fn() -> u64 + Send + Sync>,
     /// The decision screens sent so far.
     decisions_sent: Box<dyn Fn() -> u64 + Send + Sync>,
+    /// A refused decision frame waits here, its present sampled.
+    cleanup_gate: Arc<crate::render_side::TestGate>,
+    /// The decision screens the render thread left so far.
+    decided: Arc<Decided>,
 }
 
 impl Side<'_> {
@@ -863,14 +938,17 @@ struct Ran {
 
 /// What a run starts with beyond its set: the decision faults the first
 /// decision screen takes, the select screen's script, whether the
-/// decision labels' work is held at its gate from the start, and whether
-/// the plays are saved with their measure files, as `measure play` saves
-/// them.
+/// decision labels' work is held at its gate from the start, whether the
+/// plays are saved with their measure files, as `measure play` saves
+/// them, and a scenario's captures.
 #[derive(Default)]
 struct Opts {
     faults: Option<crate::dev::DecisionFaults>,
     script: Option<crate::dev::SelectScript>,
     hold_labels: bool,
+    /// A scenario's captures, written by its frame sink, which the run's
+    /// choices bind.
+    captures: Option<crate::dev::scenario::Captures>,
     saved: bool,
     /// A scenario file's steps (TOML `[[step]]` bodies, its first a
     /// `select` or `practice`), loaded by production's loader in place of
@@ -907,13 +985,14 @@ fn run_with(
     let make: MakeScreen = {
         let seen = Arc::clone(&seen);
         Box::new(move || {
-            let r = render::Renderer::new(
+            let mut r = render::Renderer::new(
                 render::Target::Offscreen {
                     width: 1_920,
                     height: 1_080,
                 },
                 render::AdapterChoice::Warp,
             )?;
+            r.set_offscreen_frame_wait(super::FRAME_WAIT);
             Ok(Box::new(Noted {
                 menu: MenuScreen::new(r, Some(render::text::Fonts::runtime()?)),
                 seen: Arc::clone(&seen),
@@ -927,8 +1006,15 @@ fn run_with(
     let link = crate::render_side::tests::spawn_on_with(
         make,
         clock,
-        Box::new(DecidedSink(Arc::clone(&decided))),
+        Box::new(RigSink {
+            decided: DecidedSink(Arc::clone(&decided)),
+            frames: opts
+                .captures
+                .clone()
+                .map(crate::dev::scenario::ScenarioFrames::new),
+        }),
     );
+    let cleanup_gate = link.decision_cleanup_gate();
     if let Some(f) = opts.faults {
         link.set_decision_faults(f);
     }
@@ -1033,12 +1119,14 @@ fn run_with(
             .with_scripts(rig.render.scripts().clone());
         rig.result_skin.set_wake(rig.controls.game_thread());
         rig.selection = Some(sel);
+        rig.scenario = opts.captures.map(crate::selection::tests::capture_state);
         if saved {
             rig.measured_plays = Some(Arc::clone(&measured));
         }
         let controls = rig.controls;
         let side = Side {
             seen: &seen,
+            controls,
             menu: &menu,
             book: &book,
             chart,
@@ -1049,6 +1137,8 @@ fn run_with(
             ready_gate: Arc::clone(&ready_gate),
             ready_checks: Box::new(ready_checks),
             decisions_sent: Box::new(decisions_sent),
+            cleanup_gate: Arc::clone(&cleanup_gate),
+            decided: Arc::clone(&decided),
         };
         let root = game::DataRoot::new(charts.path().join("app"));
         let parts = root.clone();
@@ -1426,6 +1516,11 @@ impl Side<'_> {
         );
     }
 
+    /// The decision screens the render thread left so far.
+    fn decided_count(&self) -> usize {
+        self.decided.records().len()
+    }
+
     /// The decision screen left for the loading state: the clock let run
     /// and the frames let go until the loading state draws.
     fn to_loading(&self) {
@@ -1778,4 +1873,477 @@ fn a_choice_without_the_option_does_not_wait() {
     assert!(ran.failure.is_none(), "{:?}", ran.failure);
     let r = ran.records.first().expect("the decision screen left");
     assert!(!r.skin, "{r:?}");
+}
+
+/// Captures of the decision axis at each of `ms`, written under `dir`,
+/// none armed.
+fn decision_captures(dir: &std::path::Path, ms: &[i64]) -> crate::dev::scenario::Captures {
+    let axes: Vec<_> = ms
+        .iter()
+        .map(|&m| (crate::dev::scenario::Axis::Decision(TimeUs(m * MS)), false))
+        .collect();
+    crate::dev::scenario::tests::screen_captures(dir, &axes)
+}
+
+/// Capture `k`'s state.
+fn state_of(c: &crate::dev::scenario::Captures, k: u16) -> crate::dev::scenario::CaptureState {
+    c.status(k).expect("a capture").state
+}
+
+/// Capture `k` written: its sidecar.
+#[track_caller]
+fn written(c: &crate::dev::scenario::Captures, dir: &std::path::Path, k: u16) -> String {
+    assert!(
+        wait_until(|| state_of(c, k) == crate::dev::scenario::CaptureState::Succeeded),
+        "{:?}",
+        state_of(c, k)
+    );
+    std::fs::read_to_string(dir.join(format!("{k}.json"))).unwrap()
+}
+
+/// A number field of a sidecar.
+#[track_caller]
+fn field(side: &str, key: &str) -> String {
+    let rest = side
+        .split(&format!("\"{key}\":"))
+        .nth(1)
+        .unwrap_or_else(|| panic!("{key} in {side}"));
+    rest.split([',', '}']).next().unwrap().to_owned()
+}
+
+/// Capture `k` failed, and why.
+#[track_caller]
+fn failed(c: &crate::dev::scenario::Captures, k: u16) -> String {
+    assert!(
+        wait_until(|| matches!(
+            state_of(c, k),
+            crate::dev::scenario::CaptureState::Failed(_)
+        )),
+        "{:?}",
+        state_of(c, k)
+    );
+    match state_of(c, k) {
+        crate::dev::scenario::CaptureState::Failed(why) => why,
+        _ => unreachable!(),
+    }
+}
+
+/// Capture `k` failed already: the render thread drew `next`, so it took
+/// the message that left the decision screen, and the screen's departure
+/// came before that frame.
+#[track_caller]
+fn settled_by_now(c: &crate::dev::scenario::Captures, k: u16, next: &str) {
+    assert!(
+        matches!(
+            state_of(c, k),
+            crate::dev::scenario::CaptureState::Failed(_)
+        ),
+        "not failed when {next} drew: {:?}",
+        state_of(c, k)
+    );
+}
+
+/// A decision skin frame at 300 ms from the choice is captured: the frame
+/// let through at 100 ms is not taken, the one at 300 ms is, its sidecar
+/// naming the skin, the screen's lifetime and the time since the choice.
+#[test]
+fn a_decision_skin_frame_is_captured() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = decision_captures(dir.path(), &[300]);
+    c.arm(0);
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        captures: Some(c.clone()),
+        ..Opts::default()
+    };
+    let mut chosen_at = None;
+    let ran = run_with(&set, None, opts, |side| {
+        side.prepared();
+        let (chosen, ..) = side.choose(MenuKey::Enter);
+        chosen_at = Some(chosen);
+        side.seen.gate.hold();
+        side.clock.set(TimeUs(chosen.0 + 100 * MS));
+        side.step_until("a frame at 100 ms", |_, d| !d.is_empty());
+        assert!(
+            matches!(
+                state_of(&c, 0),
+                crate::dev::scenario::CaptureState::Deciding { .. }
+            ),
+            "{:?}",
+            state_of(&c, 0)
+        );
+        side.clock.set(TimeUs(chosen.0 + 300 * MS));
+        side.step_until("a frame at 300 ms", |_, d| !d.is_empty());
+        side.to_loading();
+    });
+    assert!(ran.ran.is_ok(), "{:?}", ran.ran);
+    let side = written(&c, dir.path(), 0);
+    let chosen = chosen_at.unwrap();
+    assert_eq!(field(&side, "decision_presentation"), "\"skin\"", "{side}");
+    assert_eq!(field(&side, "decision_us"), "300000", "{side}");
+    assert_eq!(
+        field(&side, "decision_origin_us"),
+        chosen.0.to_string(),
+        "{side}"
+    );
+    assert_eq!(
+        field(&side, "presented_us"),
+        (chosen.0 + 300 * MS).to_string(),
+        "{side}"
+    );
+    assert_eq!(field(&side, "screen"), "\"decision\"", "{side}");
+    let r = ran.records.first().expect("the screen left");
+    assert_eq!(
+        field(&side, "decision_lifetime"),
+        r.lifetime.to_string(),
+        "{side}"
+    );
+}
+
+/// The built-in presentation's frame is captured the same way: its labels
+/// held unprepared, the choice draws the built-in presentation.
+#[test]
+fn a_built_in_decision_frame_is_captured() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = decision_captures(dir.path(), &[0]);
+    c.arm(0);
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        captures: Some(c.clone()),
+        hold_labels: true,
+        script: Some(crate::dev::SelectScript::compiled(vec![(
+            crate::dev::SelectStep::Enter,
+            select_origin(),
+        )])),
+        ..Opts::default()
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        assert!(wait_until(|| (side.decisions_sent)() == 1), "chosen");
+        // Chosen with no labels ready: the built-in presentation for this
+        // screen, whatever is prepared after.
+        side.label_gate.hold(false);
+        side.seen.until("a decision page", |d| {
+            d.iter().any(|d| matches!(d.frame, Frame::Page(_)))
+        });
+    });
+    assert!(ran.ran.is_ok(), "{:?}", ran.ran);
+    let side = written(&c, dir.path(), 0);
+    assert_eq!(
+        field(&side, "decision_presentation"),
+        "\"built-in\"",
+        "{side}"
+    );
+}
+
+/// A capture past the decision screen's time fails when the render thread
+/// leaves the screen for the loading state, with frames drawn before it:
+/// failed once a loading frame is drawn, before the run ends.
+#[test]
+fn a_decision_capture_past_its_screen_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = decision_captures(dir.path(), &[600_000]);
+    c.arm(0);
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        captures: Some(c.clone()),
+        ..Opts::default()
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        side.prepared();
+        side.choose(MenuKey::Enter);
+        side.to_loading();
+        settled_by_now(&c, 0, "the loading state");
+    });
+    assert!(ran.ran.is_ok(), "{:?}", ran.ran);
+    let why = failed(&c, 0);
+    assert!(
+        why.contains("its decision screen ended before a frame at 600000 ms"),
+        "{why}"
+    );
+}
+
+/// The present a capture is judged by is the one sampled right after the
+/// frame's draw, before a refusal's report and takeover: the refused frame
+/// drawn at T - 1 µs, held after its draw while the clock moves to T, is
+/// not taken by a capture at T; the next frame, at T + 1 ms, is, drawn as
+/// the fallback.
+#[test]
+fn the_present_time_is_sampled_before_cleanup() {
+    let dir = tempfile::tempdir().unwrap();
+    let t_ms = 400;
+    let c = decision_captures(dir.path(), &[t_ms]);
+    c.arm(0);
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        captures: Some(c.clone()),
+        ..Opts::default()
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        side.prepared();
+        let (chosen, ..) = side.choose(MenuKey::Enter);
+        let t = TimeUs(chosen.0 + t_ms * MS);
+        side.seen.gate.hold();
+        side.cleanup_gate.hold(true);
+        side.clock.set(TimeUs(t.0 - 1));
+        side.seen.refuse.store(true, Ordering::Release);
+        // Let one frame through: the refused one, parked after its draw.
+        side.seen.gate.step_into(|| side.cleanup_gate.waiting());
+        side.clock.set(t);
+        side.cleanup_gate.hold(false);
+        assert!(wait_until(|| side.seen.gate.lock().held));
+        assert!(
+            matches!(
+                state_of(&c, 0),
+                crate::dev::scenario::CaptureState::Deciding { .. }
+            ),
+            "the refused frame taken: {:?}",
+            state_of(&c, 0)
+        );
+        side.clock.set(TimeUs(t.0 + MS));
+        side.step_until("a frame after the refusal", |_, d| !d.is_empty());
+        side.to_loading();
+    });
+    assert!(ran.ran.is_ok(), "{:?}", ran.ran);
+    let side = written(&c, dir.path(), 0);
+    assert_eq!(
+        field(&side, "decision_presentation"),
+        "\"fallback\"",
+        "{side}"
+    );
+    assert_eq!(
+        field(&side, "decision_us"),
+        ((t_ms + 1) * MS).to_string(),
+        "{side}"
+    );
+}
+
+/// A decision screen that presents no frame at all still settles its
+/// capture when the render thread leaves it. Drawing is suppressed from
+/// before the choice (no frame granted survives), the render thread still
+/// taking its messages; the real choice binds the capture and the real
+/// departure fails it: (a) at the loading state's reveal, past the
+/// deadline; (b) at the return to selection after a refused load.
+#[test]
+fn zero_presented_frames_fail_at_departure() {
+    for refused in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let c = decision_captures(dir.path(), &[0]);
+        c.arm(0);
+        let set = Set::new("s.luaskin");
+        let opts = Opts {
+            captures: Some(c.clone()),
+            ..Opts::default()
+        };
+        let preset = refused.then_some("missing");
+        let ran = run_with(&set, preset, opts, |side| {
+            side.prepared();
+            side.seen.gate.suppress(true);
+            let chosen = side.hold_clock();
+            side.press(MenuKey::Enter);
+            assert!(
+                wait_until(|| matches!(
+                    state_of(&c, 0),
+                    crate::dev::scenario::CaptureState::Deciding { .. }
+                )),
+                "bound at the choice: {:?}",
+                state_of(&c, 0)
+            );
+            side.clock.set(TimeUs(chosen.0 + 4_000 * MS));
+            let _ = failed(&c, 0);
+            side.clock.run();
+            side.seen.gate.suppress(false);
+        });
+        assert!(ran.ran.is_ok(), "{refused}: {:?}", ran.ran);
+        let why = failed(&c, 0);
+        assert!(
+            why.contains("its decision screen ended"),
+            "{refused}: {why}"
+        );
+        let r = ran.records.first().expect("the screen left");
+        assert_eq!(
+            (r.skin_frames, r.page_frames, r.ended_frames),
+            (0, 0, 0),
+            "{refused}: {r:?}"
+        );
+        assert!(
+            ran.stamps.iter().all(|(l, _)| *l != r.lifetime),
+            "{refused}: {:?}",
+            ran.stamps
+        );
+    }
+}
+
+/// Two choices in quick succession, each with its own capture: the first
+/// screen's departure fails only its own capture. The render thread is
+/// held from taking any message after the first choice (drawing
+/// suppressed, so none of either screen presents); the game returns to
+/// selection after the first load is refused, and the second choice binds
+/// the second capture while the render thread still draws the first
+/// screen. Let go, the first screen's departure fails the first capture
+/// and leaves the second pending; the second fails at its own departure.
+#[test]
+fn a_departure_fails_only_its_own_screen_s_capture() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = decision_captures(dir.path(), &[0, 0]);
+    c.arm(0);
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        captures: Some(c.clone()),
+        ..Opts::default()
+    };
+    let deciding = |k: u16| {
+        matches!(
+            state_of(&c, k),
+            crate::dev::scenario::CaptureState::Deciding { .. }
+        )
+    };
+    let ran = run_with(&set, Some("missing"), opts, |side| {
+        side.prepared();
+        side.seen.gate.suppress(true);
+        let chosen = side.hold_clock();
+        side.press(MenuKey::Enter);
+        assert!(wait_until(|| deciding(0)), "the first bound");
+        // The second capture armed once the first is bound.
+        c.arm(1);
+        // From here the render thread takes no message.
+        side.seen.gate.block();
+        let first = side.decided_count();
+        side.clock.set(TimeUs(chosen.0 + 4_000 * MS));
+        // The second choice, once the game is back on selection: Enter is
+        // dropped until then, so it is pressed again until a second
+        // decision screen is sent.
+        let start = Instant::now();
+        while (side.decisions_sent)() < 2 {
+            assert!(start.elapsed() < BOUND, "never chose again");
+            side.press(MenuKey::Enter);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            wait_until(|| deciding(1)),
+            "the second bound: {:?}",
+            state_of(&c, 1)
+        );
+        assert_eq!(side.decided_count(), first, "a screen left while held");
+        side.seen.gate.suppress(true);
+        // Let go: the first screen is left, then the second shown.
+        assert!(
+            wait_until(|| side.decided_count() > first),
+            "the first screen left"
+        );
+        assert!(
+            matches!(
+                state_of(&c, 0),
+                crate::dev::scenario::CaptureState::Failed(_)
+            ),
+            "{:?}",
+            state_of(&c, 0)
+        );
+        assert!(
+            deciding(1),
+            "the second failed by the first departure: {:?}",
+            state_of(&c, 1)
+        );
+        side.clock.set(TimeUs(chosen.0 + 8_000 * MS));
+        let _ = failed(&c, 1);
+        side.clock.run();
+        side.seen.gate.suppress(false);
+    });
+    assert!(ran.ran.is_ok(), "{:?}", ran.ran);
+    // The two screens presented nothing (an Enter pressed again may have
+    // made a later choice after them).
+    let two = ran.records.get(..2).expect("both screens left");
+    for r in two {
+        assert_eq!((r.skin_frames, r.page_frames), (0, 0), "{r:?}");
+        assert!(
+            ran.stamps.iter().all(|(l, _)| *l != r.lifetime),
+            "{:?}",
+            ran.stamps
+        );
+    }
+}
+
+/// The deadline reached while the game thread waits for the chart's load
+/// (the render thread held inside it): the wait's own look steps the
+/// screen and reveals the loading state, and the render thread's
+/// departure, when it takes that message after the load, fails the
+/// capture; before it, the capture stands.
+#[test]
+fn a_deadline_inside_a_watched_wait_departs() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = decision_captures(dir.path(), &[600_000]);
+    c.arm(0);
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        captures: Some(c.clone()),
+        ..Opts::default()
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        side.prepared();
+        side.seen.load_gate.hold(true);
+        let chosen = side.hold_clock();
+        side.press(MenuKey::Enter);
+        assert!(
+            wait_until(|| side.seen.load_gate.waiting()),
+            "the chart's load never reached the render thread"
+        );
+        let left = side.decided_count();
+        side.clock.set(TimeUs(chosen.0 + 4_000 * MS));
+        assert!(
+            wait_until(|| side
+                .controls
+                .with_watched(|d| d.is_some_and(game::Decision::stepped))),
+            "the deadline not stepped inside the load's wait"
+        );
+        assert!(
+            matches!(
+                state_of(&c, 0),
+                crate::dev::scenario::CaptureState::Deciding { .. }
+            ),
+            "settled before the render thread left the screen: {:?}",
+            state_of(&c, 0)
+        );
+        assert_eq!(side.decided_count(), left, "left inside the load");
+        side.seen.load_gate.hold(false);
+        let why = failed(&c, 0);
+        assert!(
+            why.contains("its decision screen ended before a frame at 600000 ms"),
+            "{why}"
+        );
+        side.clock.run();
+    });
+    assert!(ran.ran.is_ok(), "{:?}", ran.ran);
+    let r = ran.records.first().expect("the screen left");
+    assert!(
+        ran.stamps.iter().filter(|(l, _)| *l == r.lifetime).count()
+            == usize::try_from(r.skin_frames + r.page_frames + r.ended_frames).unwrap(),
+        "{r:?} {:?}",
+        ran.stamps
+    );
+}
+
+/// The practice page's entry leaves the decision screen: a capture past
+/// its time fails there.
+#[test]
+fn the_practice_page_leaves_the_decision_screen() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = decision_captures(dir.path(), &[600_000]);
+    c.arm(0);
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        captures: Some(c.clone()),
+        ..Opts::default()
+    };
+    let practice = crate::ui_text::Message::PracticeTitle { name: "a" }.text();
+    let ran = run_with(&set, None, opts, |side| {
+        side.prepared();
+        side.choose(MenuKey::Practice);
+        side.clock.run();
+        side.seen.until("the practice page", |d| {
+            d.iter().any(|d| d.frame == Frame::Page(practice.clone()))
+        });
+        settled_by_now(&c, 0, "the practice page");
+    });
+    assert!(ran.ran.is_ok(), "{:?}", ran.ran);
+    let why = failed(&c, 0);
+    assert!(why.contains("its decision screen ended"), "{why}");
 }

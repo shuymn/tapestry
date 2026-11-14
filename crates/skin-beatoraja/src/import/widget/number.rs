@@ -184,6 +184,7 @@ impl Cx<'_> {
         // ten, else eleven padded with the eleventh, its `padding` and
         // `zeropadding` unread and no digit offsets
         // (`JsonSelectSkinObjectLoader.java:181-196`).
+        // Source: SF-004
         let (set, pad, d) = if value.is_none() {
             if frames.is_multiple_of(10) {
                 (GlyphSet::Ten, Pad::Blank, 10)

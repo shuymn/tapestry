@@ -289,6 +289,7 @@ fn a_missing_active_listoff_refuses() {
 /// cycle and the first timer given, here image 1's timer 11 for image 0's
 /// two frames. The same image drawn on its own keeps its own timing,
 /// whichever is read first.
+// Source: SF-005
 #[test]
 fn placements_take_their_set_s_timing() {
     let images = r#""image": [

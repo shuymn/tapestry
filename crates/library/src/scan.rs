@@ -513,6 +513,14 @@ fn read_chart(root: i64, path: String, limits: &Limits, options: &ScanOptions) -
         }),
         summary: scanned.summary.ok(),
         images: scanned.labels.as_ref().map(crate::ChartNames::of),
+        info: scanned
+            .profile
+            .as_ref()
+            .map(|p| crate::ChartInfoView::of(p, &scanned.judgment_headers, scanned.main)),
+        profile: scanned
+            .profile
+            .as_ref()
+            .and_then(|p| crate::stored_profile::encode(p, scanned.main)),
     })
 }
 

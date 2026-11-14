@@ -266,7 +266,7 @@ fn a_result_build_allocates_nothing() {
         // The best max combo shown, 100 and +20.
         with_graphs(ready(1_000, best(ResultNumber::Shown(-3)), 512)),
         fewer,
-        // Hidden, as a best max combo of 0.
+        // Hidden, as with no play counted for the best.
         ready(1_200, best(ResultNumber::Hidden), 300),
         unavailable,
         with_graphs(ready(1_400, BestView::Unavailable, 1)),

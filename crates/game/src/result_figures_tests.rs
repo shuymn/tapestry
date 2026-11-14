@@ -178,14 +178,14 @@ fn timing_samples_are_presses_in_us_within_the_range() {
     assert_eq!(numbers(stats), (0, 75, 0, 75));
     assert_eq!(stats.samples, 2);
     let edge = TimingStats::of(&[
-        press(-150_999),
-        press(150_999),
-        press(151_000),
-        press(-151_000),
+        press(-150_000),
+        press(150_000),
+        press(150_001),
+        press(-150_001),
     ])
     .unwrap();
     assert_eq!(edge.samples, 2);
-    assert_eq!(numbers(edge), (0, 0, 150, 99));
+    assert_eq!(numbers(edge), (0, 0, 150, 0));
     let mut events = vec![press(-2_000), judged(None, None)];
     events.push(JudgeEvent {
         kind: JudgeEventKind::EmptyPoor {

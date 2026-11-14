@@ -105,10 +105,9 @@ fn ema_mode(mode: i32) -> EmaMode {
     }
 }
 
-/// A weight the model takes that steps the average as `alpha` steps the
-/// source's (`ema += (long)(alpha · d)` over a whole `d`): NaN steps 0, as
-/// 0 does; an infinity saturates every non-zero step, as the largest finite
-/// weight of its sign does.
+/// A finite weight the model takes for `alpha`: NaN steps 0, as 0 does;
+/// an infinity is the largest finite weight of its sign, whose every
+/// non-zero step holds the average at its bound.
 fn finite(alpha: f32) -> f32 {
     if alpha.is_nan() {
         0.0

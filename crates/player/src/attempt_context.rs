@@ -205,14 +205,10 @@ pub(crate) fn bpm_range(meta: &bms_model::TempoMeta) -> Option<BpmRange> {
 }
 
 /// Whether the chart's original lowest and highest tempos differ in whole
-/// BPMs, each truncated and saturating at `i32::MAX` as the source's
-/// integer song data does, uncapped by the readouts' maximum (design.md
-/// "Play readouts").
+/// BPMs, each floored, uncapped by the readouts' maximum (design.md "Play
+/// readouts").
 pub(crate) fn bpm_whole_change(meta: &bms_model::TempoMeta) -> bool {
-    // `Tempo::MAX` is below 10^12 BPM, so the quotient never overflows.
-    let whole = |t: bms_model::Tempo| {
-        (t.units() / bms_model::Tempo::UNITS_PER_BPM).min(u128::from(i32::MAX.unsigned_abs()))
-    };
+    let whole = |t: bms_model::Tempo| t.units() / bms_model::Tempo::UNITS_PER_BPM;
     whole(meta.min) < whole(meta.max)
 }
 
@@ -319,11 +315,10 @@ mod tests {
         );
     }
 
-    /// The BPM-change fact compares the chart's whole extremes, each
-    /// truncated and saturating at `i32::MAX`, apart from the capped BPM
-    /// range.
+    /// The BPM-change fact compares the chart's floored extremes, uncapped,
+    /// apart from the capped BPM range.
     #[test]
-    fn the_bpm_change_fact_compares_saturated_whole_extremes() {
+    fn the_bpm_change_fact_compares_uncapped_whole_extremes() {
         let preset = rules::tapestry();
         let context = |initial: i64, change: i64| {
             let chart = bms_model::ChartBuilder::new(initial)
@@ -351,9 +346,11 @@ mod tests {
         assert_eq!(change, Some(true), "150 -> 30 000 000");
         assert_eq!(range, None, "past the readouts' maximum");
         let (change, _) = context(3_000_000_000_000, 4_000_000_000_000);
-        assert_eq!(change, Some(false), "both saturate");
+        assert_eq!(change, Some(true), "3e9 -> 4e9, both past `i32`");
+        let (change, _) = context(3_000_000_000_000, 3_000_000_000_500);
+        assert_eq!(change, Some(false), "3e9 -> 3e9 + 0.5");
         let (change, _) = context(2_147_483_646_000, 2_147_483_647_000);
-        assert_eq!(change, Some(true), "the last whole BPM below saturation");
+        assert_eq!(change, Some(true), "2 147 483 646 -> 2 147 483 647");
     }
 
     /// The context hands the skin the attempt's best and target, the

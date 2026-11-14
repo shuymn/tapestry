@@ -520,6 +520,37 @@ impl crate::render_side::FrameSink for DecidedSink {
     }
 }
 
+/// The rig's frame sink: the decision screens' records, and a scenario's
+/// captures when it has some.
+pub(super) struct RigSink {
+    pub(super) decided: DecidedSink,
+    pub(super) frames: Option<crate::dev::scenario::ScenarioFrames>,
+}
+
+impl crate::render_side::FrameSink for RigSink {
+    fn frame(&mut self, screen: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
+        self.decided.frame(screen, drawn);
+        if let Some(f) = &mut self.frames {
+            f.frame(screen, drawn);
+        }
+    }
+
+    fn finish(&mut self) {
+        if let Some(f) = &mut self.frames {
+            f.finish();
+        }
+    }
+
+    /// Settles the scenario's captures before publishing the record, so a
+    /// test that sees the record sees the settlement too.
+    fn decision_left(&mut self, record: &crate::measure::DecisionRecord) {
+        if let Some(f) = &mut self.frames {
+            f.decision_left(record);
+        }
+        self.decided.decision_left(record);
+    }
+}
+
 impl Decided {
     /// The decision screens left so far.
     pub(super) fn records(&self) -> Vec<crate::measure::DecisionRecord> {
@@ -552,6 +583,13 @@ struct Rig {
     _turn: crate::warp_turn::Turn,
 }
 
+/// The rigs' offscreen frames wait for the frame before them on WARP
+/// until it is done, never the renderer's 100 ms: the tests count the
+/// frames that reached the target, and past that wait a frame is skipped
+/// (`presented` false), which a loaded machine slowing the software
+/// adapter would decide.
+const FRAME_WAIT: Option<Duration> = None;
+
 impl Rig {
     fn new(dir: &TempDir) -> Self {
         Self::sized(dir, TARGET)
@@ -571,12 +609,29 @@ impl Rig {
     /// [`sized`](Self::sized) on `clock`.
     fn at(dir: &TempDir, size: [u32; 2], clock: input::QpcClock) -> Self {
         let rig = Self::bare_at(crate::warp_turn::take(), size, clock);
+        rig.install(dir, size);
+        rig
+    }
+
+    /// The decision skin of `dir` committed, made at `size`.
+    fn install(&self, dir: &TempDir, size: [u32; 2]) {
         let bundle = {
             let probe = crate::render_common::offscreen(size[0], size[1]);
             decision_bundle_in(&probe, dir.path(), &default_font())
         };
-        let answer = rig.link.select(ScreenKind::Decision, Some(bundle)).wait();
+        let answer = self.link.select(ScreenKind::Decision, Some(bundle)).wait();
         assert_eq!(answer.unwrap(), Preparation::Ready);
+    }
+
+    /// [`on`](Self::on), its frames also given to `captures`' frame sink.
+    fn capturing(
+        dir: &TempDir,
+        clock: input::QpcClock,
+        captures: &crate::dev::scenario::Captures,
+    ) -> Self {
+        let frames = crate::dev::scenario::ScenarioFrames::new(captures.clone());
+        let rig = Self::bare_with(crate::warp_turn::take(), TARGET, clock, Some(frames));
+        rig.install(dir, TARGET);
         rig
     }
 
@@ -589,16 +644,27 @@ impl Rig {
 
     /// [`bare`](Self::bare) whose screens are made at `size`.
     fn bare_at(turn: crate::warp_turn::Turn, size: [u32; 2], clock: input::QpcClock) -> Self {
+        Self::bare_with(turn, size, clock, None)
+    }
+
+    /// [`bare_at`](Self::bare_at), its frames also given to `frames`.
+    fn bare_with(
+        turn: crate::warp_turn::Turn,
+        size: [u32; 2],
+        clock: input::QpcClock,
+        frames: Option<crate::dev::scenario::ScenarioFrames>,
+    ) -> Self {
         let seen = Arc::new(Seen::default());
         let s = Arc::clone(&seen);
         let make: MakeScreen = Box::new(move || {
-            let r = render::Renderer::new(
+            let mut r = render::Renderer::new(
                 render::Target::Offscreen {
                     width: size[0],
                     height: size[1],
                 },
                 render::AdapterChoice::Warp,
             )?;
+            r.set_offscreen_frame_wait(FRAME_WAIT);
             let device = s.builds.fetch_add(1, Ordering::AcqRel) + 1;
             Ok(Box::new(Recorder {
                 menu: MenuScreen::new(r, Some(render::text::Fonts::runtime()?)),
@@ -607,7 +673,14 @@ impl Rig {
             }) as Box<dyn Screen>)
         });
         let decided = Arc::new(Decided::default());
-        let link = super::spawn_on_with(make, clock, Box::new(DecidedSink(Arc::clone(&decided))));
+        let link = super::spawn_on_with(
+            make,
+            clock,
+            Box::new(RigSink {
+                decided: DecidedSink(Arc::clone(&decided)),
+                frames,
+            }),
+        );
         let extent = Arc::new(Extent::default());
         link.follow(&extent);
         let book = link.label_book();
@@ -1104,6 +1177,54 @@ fn labels_not_ready_at_the_choice_per_key_part() {
         ready(k, "a", "A")
     });
     assert!(lock(&book).pin(Path::new("a"), revision, 1).is_some());
+}
+
+/// The choice's readiness and its pin answer for the same slot: the first
+/// ready one of the chart's key, as the book pins it. With two ready slots
+/// for one key, a later slot prepared from the chart's strings does not make
+/// the choice ready while the first was prepared from others (equal digests
+/// of other labels).
+#[test]
+fn readiness_checks_the_slot_the_pin_takes() {
+    let rig = Rig::bare(crate::warp_turn::take(), input::QpcClock::start());
+    let chart = Path::new("a");
+    let revision = labels_revision(&labels("A"));
+    let ours = want("a", "A").unwrap().strings;
+    let others = want("a", "B").unwrap().strings;
+    let slots = {
+        let mut book = lock(&rig.book);
+        let target = book.current().0;
+        [1, 2].map(|generation| {
+            let key = render::LabelKey {
+                chart: chart.to_owned(),
+                revision,
+                target,
+            };
+            let slot = book
+                .claim(generation, key, DecisionTiming::default())
+                .expect("a free slot");
+            assert_eq!(book.publish(slot, generation), render::Publish::Published);
+            (slot, generation)
+        })
+    };
+    assert_eq!(slots.map(|(slot, _)| slot), [0, 1]);
+    let prepare = |first: &skin_model::DecisionStrings| {
+        *rig.link.shared.prepared.lock().unwrap() =
+            [Some((1, first.clone())), Some((2, ours.clone()))];
+    };
+    prepare(&others);
+    assert!(
+        !rig.link.decision_ready(chart, revision, &ours),
+        "ready on the later slot"
+    );
+    assert_eq!(rig.link.pin_decision(chart, revision, &ours, 1), None);
+    prepare(&ours);
+    assert!(rig.link.decision_ready(chart, revision, &ours));
+    let (slot, generation, _) = rig
+        .link
+        .pin_decision(chart, revision, &ours, 1)
+        .expect("the first slot pinned");
+    assert_eq!((slot, generation), (0, 1));
 }
 
 /// R0.1 (C12): each key part's own event re-schedules without a cursor
@@ -2092,6 +2213,68 @@ fn ended_resized_decision_draws_the_page_without_refusal() {
             .all(|s| *s == crate::measure::DecisionDrawnAs::Ended),
         "{stamps:?}"
     );
+}
+
+/// A capture due after the screen's labels went with its lifetime: the
+/// resized screen's frames since (stamped `Ended`) are not taken, though
+/// presented at and past its time, and it fails when the render thread
+/// leaves the screen.
+#[test]
+fn ended_frames_are_not_captured() {
+    use crate::dev::scenario::{Axis, CaptureState, Captures};
+    use crate::measure::DecisionDrawnAs;
+    let dir = skin_dir();
+    let out = tempfile::tempdir().unwrap();
+    let c = Captures::of(vec![(TimeUs(0), out.path().join("0.png"))]);
+    c.set_axis(0, Axis::Decision(TimeUs(1_000_000)));
+    c.arm(0);
+    let clock = input::QpcClock::holdable();
+    let rig = Rig::capturing(&dir, clock, &c);
+    rig.prepared("a", "A");
+    // The game's side: the capture bound at the choice, on the held clock.
+    let origin = clock.hold();
+    c.bind_decision(5, origin);
+    let shown = rig.choose("a", "A", 5);
+    assert_eq!(shown.origin, origin);
+    rig.skin_frames(0, 3);
+    let (slot, generation) = shown.slot.unwrap();
+    rig.extent.publish(1_280, 720);
+    assert!(wait_until(|| lock(&rig.book).current().0 == [1_280, 720]));
+    lock(&rig.book).end(5);
+    assert!(wait_until(|| {
+        lock(&rig.book).state(slot).and_then(LabelState::generation) != Some(generation)
+    }));
+    // Every frame from here is drawn past the capture's time.
+    clock.set(TimeUs(origin.0 + 1_500_000));
+    let from = rig.decided.stamps_of(5).len();
+    assert!(wait_until(|| rig.decided.stamps_of(5).len() >= from + 3));
+    let since = rig.decided.stamps_of(5).split_off(from);
+    assert!(
+        since.iter().all(|s| *s == DecisionDrawnAs::Ended),
+        "{since:?}"
+    );
+    assert!(
+        matches!(c.status(0).unwrap().state, CaptureState::Deciding { .. }),
+        "an ended frame taken: {:?}",
+        c.status(0)
+    );
+    rig.link.exit();
+    clock.run();
+    assert!(wait_until(|| matches!(
+        c.status(0).unwrap().state,
+        CaptureState::Failed(_)
+    )));
+    let CaptureState::Failed(why) = c.status(0).unwrap().state else {
+        panic!("{:?}", c.status(0));
+    };
+    assert_eq!(
+        why,
+        "its decision screen ended before a frame at 1000 ms on its decision axis"
+    );
+    let [r] = rig.decided.records()[..] else {
+        panic!("{:?}", rig.decided.records());
+    };
+    assert!(r.ended_frames >= 3, "{r:?}");
 }
 
 /// R4.5, O8: a decision restore refused on a healthy device stands for
