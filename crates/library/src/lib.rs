@@ -57,10 +57,14 @@
 //!   ([`Tuple`]), and the catch-up counters.
 //! - `scores(preset_sha256, ln_mode, chart_sha256, plays, clears, best_ex,
 //!   best_bp, best_combo, cleared, full_combo, play_sha256, play,
-//!   sum_perfect, sum_great, sum_good, sum_bad, sum_poor, sum_play_us)`: one
+//!   sum_perfect, sum_great, sum_good, sum_bad, sum_poor, sum_play_us,
+//!   practice_plays, practice_sum_perfect, ..., practice_sum_play_us)`: one
 //!   [`Score`] per [`Key`], the best play's [`Breakdown`] in `play`
-//!   ([`BREAKDOWN_BYTES`]), and the [`Sums`] of every play counted under
-//!   the key, which [`Library::totals`] adds over every key. Its layout belongs to [`BESTS_VERSION`], not to
+//!   ([`BREAKDOWN_BYTES`]), and the play count and [`Sums`] of every play
+//!   counted under the key, kept per [`PlayKind`] (`plays` and `sum_*` for
+//!   normal plays, `practice_*` for practice rounds), which
+//!   [`Library::totals_by_kind`] adds over every key and
+//!   [`Library::totals`] adds across the kinds. Its layout belongs to [`BESTS_VERSION`], not to
 //!   the schema version: opening a database of another bests tuple creates
 //!   the table again, unread, so a change of its columns scans no chart.
 //! - `counted(path, body_sha256, size, mtime_ns)`: each play counted
@@ -134,7 +138,8 @@ use rusqlite::Connection;
 
 pub use bests::{
     BESTS_VERSION, BREAKDOWN_BYTES, Best, Breakdown, Contribution, Ineligible, Ingested, Key,
-    LN_MODE, PlayId, Score, Sums, Totals, Verified, counts_for_best, ineligible,
+    LN_MODE, PlayId, PlayKind, Score, Sums, Totals, TotalsByKind, Verified, counts_for_best,
+    ineligible,
 };
 pub use bms_model::ChartSummary;
 pub use bms_parser::{ChartMode, Header};
@@ -527,7 +532,9 @@ impl BestWriter {
     /// [`LibraryError::Database`] when SQLite refuses the query, a stored
     /// count or sum is negative or a total overflows.
     pub fn totals(&self) -> Result<Totals, LibraryError> {
-        bests::totals(&self.conn).map_err(|e| self.database(e))
+        bests::totals(&self.conn)
+            .map(|t| t.sum())
+            .map_err(|e| self.database(e))
     }
 
     /// Requests a catch-up ([`Library::request_bests_pass`]).
@@ -644,13 +651,25 @@ impl Library {
     }
 
     /// The player's totals over every key, every preset and LN mode
-    /// included: one query (design.md "Personal Bests").
+    /// included, both kinds of play added ([`Library::totals_by_kind`]):
+    /// one query (design.md "Personal Bests").
     ///
     /// # Errors
     ///
     /// [`LibraryError::Database`] when SQLite refuses the query, a stored
-    /// count or sum is negative or a total overflows.
+    /// count or sum is negative or a part's total overflows.
     pub fn totals(&self) -> Result<Totals, LibraryError> {
+        self.totals_by_kind().map(|t| t.sum())
+    }
+
+    /// The player's totals over every key, kept apart per [`PlayKind`]:
+    /// one query (design.md "Personal Bests").
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when SQLite refuses the query, a stored
+    /// count or sum is negative or a part's total overflows.
+    pub fn totals_by_kind(&self) -> Result<TotalsByKind, LibraryError> {
         bests::totals(&self.reader).map_err(|e| self.database(e))
     }
 

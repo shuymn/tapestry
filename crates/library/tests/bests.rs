@@ -1141,9 +1141,9 @@ fn the_ledger_dedupes_by_path_and_body() {
     assert_eq!(lib.totals().unwrap(), on_time(2));
 }
 
-/// The `scores` table of bests version 3, as that version created it (its
-/// breakdown 88 bytes).
-const SCORES_V3: &str = "CREATE TABLE scores (
+/// The `scores` table of bests version 4, as that version created it (its
+/// breakdown 88 bytes, one set of sums for every kind of play).
+const SCORES_V4: &str = "CREATE TABLE scores (
     preset_sha256 BLOB NOT NULL,
     ln_mode INTEGER NOT NULL,
     chart_sha256 BLOB NOT NULL,
@@ -1156,6 +1156,12 @@ const SCORES_V3: &str = "CREATE TABLE scores (
     full_combo INTEGER NOT NULL DEFAULT 0,
     play_sha256 BLOB CHECK (play_sha256 IS NULL OR length(play_sha256) = 32),
     play BLOB CHECK (play IS NULL OR length(play) = 88),
+    sum_perfect INTEGER NOT NULL DEFAULT 0 CHECK (sum_perfect >= 0),
+    sum_great INTEGER NOT NULL DEFAULT 0 CHECK (sum_great >= 0),
+    sum_good INTEGER NOT NULL DEFAULT 0 CHECK (sum_good >= 0),
+    sum_bad INTEGER NOT NULL DEFAULT 0 CHECK (sum_bad >= 0),
+    sum_poor INTEGER NOT NULL DEFAULT 0 CHECK (sum_poor >= 0),
+    sum_play_us INTEGER NOT NULL DEFAULT 0 CHECK (sum_play_us >= 0),
     CHECK ((best_ex IS NULL) = (best_bp IS NULL)
         AND (best_ex IS NULL) = (best_combo IS NULL)
         AND (best_ex IS NULL) = (play_sha256 IS NULL)
@@ -1163,9 +1169,9 @@ const SCORES_V3: &str = "CREATE TABLE scores (
     PRIMARY KEY (preset_sha256, ln_mode, chart_sha256)
 ) WITHOUT ROWID;";
 
-/// A row valid in [`SCORES_V3`] for `record`'s key: 7 plays, 1 clear, a
-/// best EX of 9 from its breakdown.
-fn v3_row(record: &PlayRecord) -> String {
+/// A row valid in [`SCORES_V4`] for `record`'s key: 7 plays, 1 clear, a
+/// best EX of 9 from its breakdown, and sums.
+fn v4_row(record: &PlayRecord) -> String {
     let play = library::Breakdown {
         body_sha256: [5; 32],
         notes: 5,
@@ -1175,7 +1181,8 @@ fn v3_row(record: &PlayRecord) -> String {
         ..library::Breakdown::default()
     };
     format!(
-        "INSERT INTO scores VALUES (x'{}', 1, x'{}', 7, 1, 9, 1, 4, x'03', 1, x'{}', x'{}');",
+        "INSERT INTO scores VALUES (x'{}', 1, x'{}', 7, 1, 9, 1, 4, x'03', 1, x'{}', x'{}',
+             9, 8, 7, 6, 5, 4000000);",
         hex(&record.preset.sha256),
         hex(&record.chart.identity.sha256),
         hex(&play.body_sha256),
@@ -1183,13 +1190,13 @@ fn v3_row(record: &PlayRecord) -> String {
     )
 }
 
-/// A database of bests version 3, its `scores` in that version's layout
+/// A database of bests version 4, its `scores` in that version's layout
 /// with a row, is opened without reading that row: `scores` is created
 /// again in this version's layout, `counted` and `refused` are cleared and
 /// a catch-up is requested, while the charts and the loudness stay and no
 /// chart is read again.
 #[test]
-fn a_bests_3_database_is_recreated_without_reading_it() {
+fn a_bests_4_database_is_recreated_without_reading_it() {
     let fx = Fixture::new();
     fx.chart("a.bms", CHART);
     let mut lib = fx.open();
@@ -1221,9 +1228,9 @@ fn a_bests_3_database_is_recreated_without_reading_it() {
     sql(
         &fx.db(),
         &format!(
-            "DROP TABLE scores; {SCORES_V3} {}
-             UPDATE meta SET bests = 3;",
-            v3_row(&record),
+            "DROP TABLE scores; {SCORES_V4} {}
+             UPDATE meta SET bests = 4;",
+            v4_row(&record),
         ),
     );
 
@@ -1232,12 +1239,14 @@ fn a_bests_3_database_is_recreated_without_reading_it() {
     let BestsState::Invalidated { old: Some(old) } = lib.bests_state() else {
         panic!("{:?}", lib.bests_state());
     };
-    assert_eq!(old.bests, 3);
-    assert_eq!(library::BESTS_VERSION, 4);
+    assert_eq!(old.bests, 4);
+    assert_eq!(library::BESTS_VERSION, 5);
     // This version's layout, empty; the other bests tables cleared.
     sql(
         &fx.db(),
-        "SELECT sum_perfect, sum_great, sum_good, sum_bad, sum_poor, sum_play_us FROM scores",
+        "SELECT sum_perfect, sum_great, sum_good, sum_bad, sum_poor, sum_play_us,
+             practice_plays, practice_sum_perfect, practice_sum_great, practice_sum_good,
+             practice_sum_bad, practice_sum_poor, practice_sum_play_us FROM scores",
     );
     assert_eq!(lib.totals().unwrap(), Totals::default());
     assert_eq!(tables(&fx.db()), (Vec::new(), Vec::new()));
@@ -1268,10 +1277,10 @@ fn an_interrupted_recreation_leaves_the_old_bests() {
     sql(
         &fx.db(),
         &format!(
-            "DROP TABLE scores; {SCORES_V3} {}
-             UPDATE meta SET bests = 3;
+            "DROP TABLE scores; {SCORES_V4} {}
+             UPDATE meta SET bests = 4;
              CREATE TRIGGER fail BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT, 'injected'); END;",
-            v3_row(&record),
+            v4_row(&record),
         ),
     );
     assert!(library::Library::open(&fx.db()).is_err());
@@ -1282,7 +1291,10 @@ fn an_interrupted_recreation_leaves_the_old_bests() {
         })
         .unwrap();
     assert_eq!(old, (7, 9));
-    assert!(conn.prepare("SELECT sum_play_us FROM scores").is_err());
+    assert!(
+        conn.prepare("SELECT practice_sum_play_us FROM scores")
+            .is_err()
+    );
     let counted: i64 = conn
         .query_row("SELECT count(*) FROM counted", [], |r| r.get(0))
         .unwrap();
@@ -1290,12 +1302,12 @@ fn an_interrupted_recreation_leaves_the_old_bests() {
     let bests: i64 = conn
         .query_row("SELECT bests FROM meta", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(bests, 3);
+    assert_eq!(bests, 4);
     conn.execute_batch("DROP TRIGGER fail;").unwrap();
     drop(conn);
     let (lib, _) = library::Library::open(&fx.db()).unwrap();
     assert!(matches!(lib.bests_state(), BestsState::Invalidated { .. }));
-    sql(&fx.db(), "SELECT sum_play_us FROM scores");
+    sql(&fx.db(), "SELECT practice_sum_play_us FROM scores");
     assert_eq!(tables(&fx.db()), (Vec::new(), Vec::new()));
 }
 
@@ -1400,6 +1412,22 @@ const FIXED_TOTALS: Totals = Totals {
     play_us: 5_750_000 + 5_750_000 + 1_750_000 + 3_833_333 + 3_500_000 + 5_750_000,
 };
 
+/// The practice part of [`FIXED_TOTALS`]: the section round `3-1` alone.
+const FIXED_PRACTICE: Totals = Totals {
+    plays: 1,
+    clears: 0,
+    counts: [0, 3, 0, 0, 1],
+    play_us: 1_750_000,
+};
+
+/// The normal part of [`FIXED_TOTALS`]: every other record.
+const FIXED_NORMAL: Totals = Totals {
+    plays: 5,
+    clears: 3,
+    counts: [13, 1, 3, 1, 7],
+    play_us: 5_750_000 + 5_750_000 + 3_833_333 + 3_500_000 + 5_750_000,
+};
+
 /// Every counted play adds its PERFECT to POOR counts and its play time to
 /// the totals, eligible or not (a section round, a play at another speed,
 /// one ended midway, one with no hit), under every preset; the plays and
@@ -1426,6 +1454,13 @@ fn totals_sum_a_fixed_set_of_records() {
     let totals = lib.totals().unwrap();
     assert_eq!(totals, FIXED_TOTALS);
     assert_eq!(totals.play_us, 26_333_333);
+    // Kept per kind: the section round apart from the other five plays.
+    let parts = lib.totals_by_kind().unwrap();
+    assert_eq!(
+        (parts.normal, parts.practice),
+        (FIXED_NORMAL, FIXED_PRACTICE)
+    );
+    assert_eq!(parts.sum(), FIXED_TOTALS);
     // The writer's connection reads the same.
     assert_eq!(lib.best_writer().unwrap().totals().unwrap(), FIXED_TOTALS);
     // Number 30 is the sum of every key's plays, 31 of the clears: the
@@ -1440,7 +1475,8 @@ fn totals_sum_a_fixed_set_of_records() {
 }
 
 /// Rebuilt from the same records in another order, by a catch-up and by a
-/// recreation of the bests, the totals equal those counted live.
+/// recreation of the bests, the totals equal those counted live, each kind
+/// of play's part included (the section round in the practice part).
 #[test]
 fn rebuilt_totals_equal_live_totals() {
     let fx = Fixture::new();
@@ -1452,16 +1488,18 @@ fn rebuilt_totals_equal_live_totals() {
         let (rel, _) = fx.save(record, name);
         fx.live(&lib, &rel, TOTALS_CHART, record);
     }
-    let live = lib.totals().unwrap();
-    assert_eq!(live, FIXED_TOTALS);
+    let live = lib.totals_by_kind().unwrap();
+    assert_eq!((live.normal, live.practice), (FIXED_NORMAL, FIXED_PRACTICE));
+    assert_eq!(lib.totals().unwrap(), FIXED_TOTALS);
     lib.request_bests_pass().unwrap();
     fx.pass(&lib);
-    assert_eq!(lib.totals().unwrap(), live);
+    assert_eq!(lib.totals_by_kind().unwrap(), live);
     drop(lib);
     sql(&fx.db(), "UPDATE meta SET bests = bests + 1");
     let lib = fx.open();
     assert_eq!(lib.totals().unwrap(), Totals::default(), "recreated empty");
     let report = fx.pass(&lib);
     assert_eq!(report.bests.counted, 6);
-    assert_eq!(lib.totals().unwrap(), live);
+    assert_eq!(lib.totals_by_kind().unwrap(), live);
+    assert_eq!(lib.totals().unwrap(), FIXED_TOTALS);
 }

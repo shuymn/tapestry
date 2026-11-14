@@ -6614,6 +6614,7 @@ pub(crate) mod tests {
             clear: true,
             ineligible: None,
             sums: library::Sums::default(),
+            kind: library::PlayKind::Normal,
         };
         sel.shelf.best_writer().unwrap().ingest(&c).unwrap();
         // Unchanged until selection is entered.
@@ -6669,6 +6670,7 @@ pub(crate) mod tests {
                     counts: [v, 2 * v, 3 * v, 4 * v, 5 * v],
                     play_us: 1_000_000 * u64::from(n),
                 },
+                kind: library::PlayKind::Normal,
             };
             sel.shelf.best_writer().unwrap().ingest(&c).unwrap();
         };
