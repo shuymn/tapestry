@@ -1264,6 +1264,24 @@ fn ending_a_hard_link_changes_the_identity_once() {
     }
 }
 
+/// A candidate whose count of names cannot be read counts by its name
+/// alone, as with the disk's default probe: a size change leaves the
+/// identity, and only a change of names makes another.
+// Covers: T18
+#[test]
+fn a_candidate_with_no_count_counts_by_its_name() {
+    let f = fixture();
+    let unknown = game::sound_sets::DiskFs::default().links();
+    let p = set_pick(&f);
+    let of = |links: LinkCount| resolve(&p, links, &mut |_| false).sources[0].clone();
+    let (before, counted) = (of(unknown), of(LINKS));
+    put_bytes(&f.set, "fail.wav", &wav(250, -200));
+    assert_eq!(of(unknown), before, "a size change read without a count");
+    assert_ne!(of(LINKS), counted);
+    put(&f.set, "scratch.wav");
+    assert_ne!(of(unknown), before, "a new candidate left the identity");
+}
+
 fn identity_of_set(set: &Path) -> game::sound_sets::SourceIdentity {
     resolve(
         &pick(Some(set), None, Path::new("absent")),

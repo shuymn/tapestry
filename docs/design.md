@@ -1592,7 +1592,7 @@ Which tests check part of each row's mitigation. `Tagged tests` is generated fro
 | T15 | Unverified | |
 | T16 | Unverified | |
 | T17 | Unverified | |
-| T18 | `crates/game/tests/sound_sets.rs`: `a_copy_of_a_refused_file_is_named_too`, `a_folder_quarantined_in_one_role_stays_so_in_every_role`, `a_hard_link_to_a_written_file_cannot_expire_its_quarantine`, `a_link_out_of_the_set_cannot_expire_its_quarantine`, `ending_a_hard_link_changes_the_identity_once`, `recovery_cases`, `refused_candidates_are_named_and_skipped`, `scan_finds_sets_at_any_depth_and_never_enters_links`, `the_recovery_state_in_a_set_cannot_expire_its_quarantine`; `crates/player/src/log_file.rs`: `a_set_linked_to_the_log_keeps_its_quarantine`; `crates/player/src/sound_sets_disk.rs`: `link_count_counts_hard_links`, `the_recovery_state_counts_names` | |
+| T18 | `crates/game/tests/sound_sets.rs`: `a_candidate_with_no_count_counts_by_its_name`, `a_copy_of_a_refused_file_is_named_too`, `a_folder_quarantined_in_one_role_stays_so_in_every_role`, `a_hard_link_to_a_written_file_cannot_expire_its_quarantine`, `a_link_out_of_the_set_cannot_expire_its_quarantine`, `ending_a_hard_link_changes_the_identity_once`, `recovery_cases`, `refused_candidates_are_named_and_skipped`, `scan_finds_sets_at_any_depth_and_never_enters_links`, `the_recovery_state_in_a_set_cannot_expire_its_quarantine`; `crates/player/src/log_file.rs`: `a_set_linked_to_the_log_keeps_its_quarantine`; `crates/player/src/sound_sets_disk.rs`: `link_count_counts_hard_links`, `the_recovery_state_counts_names` | |
 
 ### Privacy
 
