@@ -167,7 +167,7 @@ impl Config {
     }
 
     /// Every selected item's number: what the source tree's conditions
-    /// see (`JSONSkinLoader.java:254-260`).
+    /// (`JSONSkinLoader.java:254-260`) and a destination's ops see.
     #[must_use]
     pub fn enabled(&self) -> BTreeSet<i32> {
         self.options.iter().flatten().copied().collect()
@@ -458,9 +458,8 @@ pub(crate) struct Cx<'d> {
     assets: Assets,
     choices: Choices,
     /// What a destination's numeric op reads of each declared option
-    /// item: whether it is its option's selection, a later option's entry
-    /// replacing an earlier one's for a shared number
-    /// (`JSONSkinLoader.java:291-297`).
+    /// item: whether any option selects it, the enabled set `if` reads
+    /// (design.md "Differences from the source", imported skins).
     items: BTreeMap<i32, bool>,
     whens: Vec<Program>,
     when_spans: Vec<Span>,
@@ -598,12 +597,10 @@ impl<'d> Cx<'d> {
     ) -> Result<Self, ImportError> {
         let entry_dir = def.entry_dir().to_owned();
         let assets = Assets::new(def.root());
+        let enabled = config.enabled();
         let mut items = BTreeMap::new();
-        for (i, o) in header.options.iter().enumerate() {
-            let selected = config.options.get(i).copied().flatten();
-            for item in &o.items {
-                items.insert(item.op, Some(item.op) == selected);
-            }
+        for item in header.options.iter().flat_map(|o| &o.items) {
+            items.insert(item.op, enabled.contains(&item.op));
         }
         #[cfg(feature = "dev-tools")]
         crate::lua::replay::record_items(&items);
