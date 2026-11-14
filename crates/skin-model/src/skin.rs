@@ -4068,6 +4068,9 @@ impl Skin {
         for r in &sel.row_hits {
             r.set(None);
         }
+        for b in &sel.search {
+            b.set(None);
+        }
         if uvs.sheet_id() != self.sheet_id || uvs.frames().len() != self.frame_count {
             return Ok(());
         }
@@ -4119,8 +4122,8 @@ impl Skin {
     ///   (`select/BarRenderer.java:80-101`); none, and the walk goes on.
     ///
     /// The hit is `None` when nothing is hit. Apart from it, the answer
-    /// says which search texts' input boxes, as the last build to sample
-    /// each placed it (drawn now or hidden since), hold the point
+    /// says which search texts' input boxes, as the last build sampled
+    /// them (a box it did not sample holds no point), hold the point
     /// ([`SearchBoxes`](crate::SearchBoxes)), which decides the focused
     /// box's blur whatever is hit (`skin/Skin.java:394-397`,
     /// `skin/SkinTextInput.java:77-81`). [`PressHit::NONE`] for a state of
@@ -4867,9 +4870,9 @@ impl Skin {
             // A search text's input box, the region moved by the alignment
             // (`skin/SkinText.java:162-169`), kept in the state as sampled
             // here, before a hover rect hides it: the source prepares its
-            // `region` before its `mouseRect` test, and a condition or a
-            // timer that hides it leaves the last one
-            // (`skin/SkinObject.java:348-356, 591-607`).
+            // `region` before its `mouseRect` test
+            // (`skin/SkinObject.java:591-607`). A build that does not
+            // sample it leaves none.
             let search_box = match (e.press, e.kind) {
                 (Some((slot, Press::Search { index })), Kind::Text(_, text)) => {
                     let rect = on_target(canvas, affine, pointer::input_box(text.align, region));

@@ -19,12 +19,12 @@
 //! `draw` draws (`skin/SkinObject.java:623-643`). A search text's input box
 //! is that region moved by its alignment (`skin/SkinText.java:162-169`).
 //!
-//! Apart from the targets, which each build clears, the state keeps each
-//! search text's input box as the last build that sampled it placed it:
-//! a press says which of those boxes hold its point ([`SearchBoxes`]), and
+//! Beside the targets, the state keeps each search text's input box as
+//! the last build sampled it, and each build clears them all first: a
+//! press says which of those boxes hold its point ([`SearchBoxes`]), and
 //! the screen, which alone knows the focus and which box gave it, blurs a
-//! press outside the focused box's bounds, drawn or hidden since
-//! (`skin/SkinTextInput.java:77-81`).
+//! press outside the focused box's bounds, so a box the last build did
+//! not sample takes any press as outside (`skin/SkinTextInput.java:77-81`).
 //!
 //! A hit never changes the skin's state: the screen carries the command out
 //! and validates a row by its [`RowRef`], a fixed-size `Copy` identity that
@@ -193,12 +193,11 @@ pub enum PointerError {
 pub const MAX_SEARCH_BOXES: usize = crate::widget::text::MAX_TEXT_ELEMENTS;
 const _: () = assert!(MAX_SEARCH_BOXES <= 64, "a search box is a bit of a u64");
 
-/// The search texts whose input box, as last prepared, holds a press's
-/// point: bit `i` for search text `i` (its order among the skin's search
-/// texts, [`PointerHit::Search`]). A box keeps the bounds of the last
-/// build that sampled it, so one its condition or timer hides since is
-/// still tested at its previous bounds, as the source keeps a hidden
-/// text's `region` (`skin/SkinObject.java:348-356, 591-602`). `Copy`.
+/// The search texts whose input box, as the last build sampled it,
+/// holds a press's point: bit `i` for search text `i` (its order among
+/// the skin's search texts, [`PointerHit::Search`]). A box that build did
+/// not sample, one its condition or timer hides included, holds no
+/// point. `Copy`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub struct SearchBoxes(pub u64);
 
@@ -221,11 +220,12 @@ impl SearchBoxes {
 }
 
 /// What a press hits ([`Skin::hit_at`](crate::Skin::hit_at)): the topmost
-/// target, and apart from it the search texts whose last prepared input
-/// box holds the point ([`SearchBoxes`]), whatever it hit, so a target
-/// drawn over the focused box takes the press with the focus kept. The
-/// focus itself is the screen's: the answer says which boxes hold the
-/// point, and the screen blurs by the box it focused. `Copy`.
+/// target, and apart from it the search texts whose input box, as the
+/// last build sampled it, holds the point ([`SearchBoxes`]), whatever it
+/// hit, so a target drawn over the focused box takes the press with the
+/// focus kept. The focus itself is the screen's: the answer says which
+/// boxes hold the point, and the screen blurs by the box it focused.
+/// `Copy`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct PressHit {
     pub hit: Option<PointerHit>,
@@ -241,8 +241,8 @@ impl PressHit {
     };
 }
 
-/// A search text's input box as the last build that sampled it placed it,
-/// in target pixels, with that build's target size: kept across builds.
+/// A search text's input box as the last build sampled it, in target
+/// pixels, with that build's target size.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct SearchBounds {
     pub(crate) rect: [f32; 4],
@@ -315,7 +315,8 @@ fn arg(click: ClickType, [x, y, w, h]: [f32; 4], [px, py]: [f32; 2], button: But
 /// `target`, topmost first; a song list tries its slots in `clickable`
 /// order among `rows`. A slider or a song list the point misses lets the
 /// walk go on, as the source's do. Which search boxes hold the point is
-/// read apart from the walk, on their kept bounds `search`.
+/// read apart from the walk, on their bounds `search` from the last
+/// build.
 pub(crate) fn hit(
     targets: &[Cell<Option<Target>>],
     rows: &[Cell<Option<RowHit>>],

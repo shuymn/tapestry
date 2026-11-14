@@ -145,9 +145,8 @@ pub struct Selection {
     /// Per song list element and slot: the slot's bar as the last build
     /// drew it, `None` when it did not.
     pub(crate) row_hits: Box<[Cell<Option<RowHit>>]>,
-    /// Per search text: its input box as the last build that sampled it
-    /// placed it, kept across builds (a build that hides it keeps the
-    /// bounds before); `None` until one does.
+    /// Per search text: its input box as the last build sampled it,
+    /// `None` when that build did not.
     pub(crate) search: Box<[Cell<Option<SearchBounds>>]>,
     /// The frame time [`Skin::prepare_selection_frame`](crate::Skin::prepare_selection_frame)
     /// last prepared the timers for, which that frame's build takes
@@ -164,7 +163,7 @@ pub struct Selection {
 impl Selection {
     /// A fresh state with `whens` `when` timers, `text_slots` text slots,
     /// `rows` song list slots, and `targets` pointer targets, row hit cells
-    /// and `search` search texts' kept bounds; `live` when a selection skin
+    /// and `search` search texts' bounds; `live` when a selection skin
     /// makes it.
     pub(crate) fn new(
         skin: u64,
