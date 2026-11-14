@@ -880,31 +880,19 @@ fn fields(view: &SelectionView, cursor: Option<&RowView>) -> [i32; field::COUNT]
     );
     if let Some(i) = c.info {
         set(field::SELECTED_INFO_VALID, 1);
-        for (slot, v) in (field::SELECTED_KEY_TAPS..).zip([
-            i.key_taps,
-            i.key_longs,
-            i.scratch_taps,
-            i.scratch_longs,
-            i.density_peak,
-            i.density_end,
-            i.density_end_hundredths,
-            i.density_average,
-            i.density_average_hundredths,
-            i.total,
+        for (slot, (v, max)) in (field::SELECTED_KEY_TAPS..).zip([
+            (i.key_taps, VALUE_MAX),
+            (i.key_longs, VALUE_MAX),
+            (i.scratch_taps, VALUE_MAX),
+            (i.scratch_longs, VALUE_MAX),
+            (i.density_peak, VALUE_MAX),
+            (i.density_end, VALUE_MAX),
+            (i.density_end_hundredths, 99),
+            (i.density_average, VALUE_MAX),
+            (i.density_average_hundredths, 99),
+            (i.total, VALUE_MAX),
         ]) {
-            set(slot, v.clamp(0, VALUE_MAX));
-        }
-        for (slot, v) in [
-            (
-                field::SELECTED_DENSITY_END_HUNDREDTHS,
-                i.density_end_hundredths,
-            ),
-            (
-                field::SELECTED_DENSITY_AVERAGE_HUNDREDTHS,
-                i.density_average_hundredths,
-            ),
-        ] {
-            set(slot, v.clamp(0, 99));
+            set(slot, v.clamp(0, max));
         }
         if let Some(bpm) = i.main_bpm {
             set(field::SELECTED_MAIN_BPM, bpm.clamp(0, VALUE_MAX));
