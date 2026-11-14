@@ -11,6 +11,7 @@ mod demo;
 mod fidelity;
 #[cfg(test)]
 mod fixture;
+mod fmt;
 // Lint fixtures under the workspace lints: `cargo xtask check-lints`.
 #[cfg(tapestry_lint_fixtures)]
 #[path = "../lint-fixtures/mod.rs"]
@@ -44,6 +45,8 @@ commands:
                                           against xtask/fidelity-baseline.txt;
                                           --update lowers the baseline, --init
                                           writes an absent one
+  check-fmt                               run `cargo fmt --check` on each workspace
+                                          package and on the fuzz crate
   banned-words (--staged|--all) [--list <path>]
                                           check paths and contents in the index for
                                           terms in banned-words.txt
@@ -90,6 +93,9 @@ fn main() -> ExitCode {
                 _ => return usage_error("check-fidelity takes --update or --init"),
             };
             report("check-fidelity", fidelity::run(&workspace_manifest(), mode))
+        }
+        Some("check-fmt") if rest.is_empty() => {
+            report("check-fmt", fmt::run(&workspace_manifest()))
         }
         Some("banned-words") => banned_words::run(&rest),
         Some("portable") => portable::run(&workspace_manifest(), &rest),
