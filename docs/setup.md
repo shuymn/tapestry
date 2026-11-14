@@ -183,6 +183,17 @@ Keep separate baselines without OBS and with OBS (encoder, resolution, and fps f
 
 The game's own figures ([design.md](design.md), "Latency Figures") show in an overlay that F9 toggles during play and are written after each saved play as `<record>.measure.toml` beside the record, numbers only, with a figure that lacks evidence left out (N/A, never 0). The development command `tapestry measure play <chart>` (built with `dev-tools`) also captures the play's presents with PresentMon and adds the lost refreshes, off-grid and never-displayed counts of the play span to that file. `tapestry measure play --perfect <chart>` does the same with generated input that hits every note on time and key sounds sent from judgments (design.md "Autoplay"), to measure charts too heavy to play by hand. PresentMon is installed by hand and never downloaded: set `TAPESTRY_PRESENTMON` to the path of its executable, or put `PresentMon.exe` on `PATH`. It runs unelevated, so the user must be in the Performance Log Users group; its capture goes to `measure\` under the data root. The game opens on the system's primary monitor; to measure on another one without changing Windows settings, set `monitor` in `device.toml` to its display device name (for example `monitor = '\\.\DISPLAY1'`). The game prints the monitor and refresh rate it opened on, and the names it knows when the setting matches none.
 
+## Reference Sources
+
+Where code and documents follow another player's source, they cite it at these pins, which `docs/fidelity.toml` names as `@<pin>`. None of these sources enters the repository.
+
+| Pin | Source |
+| --- | --- |
+| `beatoraja-0.8.9` | beatoraja at tag `0.8.9` (commit `83574048`) |
+| `jbms-parser-e19bcc2` | jbms-parser at commit `e19bcc2`, which the `lib/jbms-parser.jar` bundled with beatoraja 0.8.9 was built from (2026-08-01); later commits are not followed (design.md "What the Loader Reads") |
+| `luaj-jse-3.0.2-custom` | the LuaJ jar bundled with beatoraja 0.8.9, `lib/luaj-jse-3.0.2-custom.jar` |
+| `libgdx-1.9.9` | libGDX at tag `gdx-parent-1.9.9` |
+
 ## Other
 
 - Your own charts never enter the repository. To check the loader and autoplay against them, run the local chart sweep on the development PC (Git Bash): `TAPESTRY_CHARTS_DIR=<dir> mise exec -- cargo test -p game --test local_charts -- --ignored --nocapture`. The sweep prints one line per chart with counts and warnings, never titles or paths (the game's own log does record the paths of charts it plays).
