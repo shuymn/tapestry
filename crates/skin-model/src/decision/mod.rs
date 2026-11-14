@@ -32,7 +32,7 @@ pub struct DecisionTimers {
     /// The fade-out's start: the choice plus the declared scene time.
     pub fadeout: Option<TimeUs>,
     /// The input declaration's end: the choice plus the declared input
-    /// time, on only strictly after it.
+    /// time, on from that instant.
     pub input: Option<TimeUs>,
 }
 
@@ -40,8 +40,7 @@ impl DecisionTimers {
     /// The timers at `now` of a screen chosen at `choice` with `timing`:
     /// the screen's from the choice, the fade-out's from the choice plus
     /// `scene` once `now` reaches it, and the input's from the choice plus
-    /// `input` once `now` passes it (the source switches it on past
-    /// `input`: off at that instant, on 1 µs later). Allocates nothing.
+    /// `input` once `now` reaches it. Allocates nothing.
     #[must_use]
     pub const fn at(choice: TimeUs, timing: &DecisionTiming, now: TimeUs) -> Self {
         let fadeout = TimeUs(choice.0.saturating_add(timing.scene.0));
@@ -53,7 +52,7 @@ impl DecisionTimers {
             } else {
                 None
             },
-            input: if now.0 > input.0 { Some(input) } else { None },
+            input: if now.0 >= input.0 { Some(input) } else { None },
         }
     }
 }

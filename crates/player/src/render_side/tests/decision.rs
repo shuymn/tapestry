@@ -790,7 +790,7 @@ impl Rig {
 
 /// C4: a skinned frame's timers run from the choice (7,000 ms), not from
 /// the frame's time: `screen` at the choice throughout, the fade-out from
-/// 2,500 ms after it, the input timer past 500 ms.
+/// 2,500 ms after it, the input timer from 500 ms.
 #[test]
 fn decision_frame_timers_at_0_2499_2500_2999() {
     let origin = TimeUs(7_000_000);
@@ -815,7 +815,7 @@ fn decision_frame_timers_at_0_2499_2500_2999() {
         assert_eq!(f.now, at(ms));
         assert_eq!(f.timers.screen, Some(origin), "{ms} ms");
         assert_eq!(f.timers.fadeout, fadeout, "{ms} ms");
-        assert_eq!(f.timers.input, (ms > 500).then_some(at(500)), "{ms} ms");
+        assert_eq!(f.timers.input, (ms >= 500).then_some(at(500)), "{ms} ms");
     }
 }
 
