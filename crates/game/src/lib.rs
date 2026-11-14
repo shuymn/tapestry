@@ -156,7 +156,10 @@ pub use rules_toml::{
     load_preset_toml, preset_to_toml,
 };
 pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
-pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, write_atomic};
+pub use save::{
+    LinkCount, LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, clear_link,
+    create_fresh, open_lock, write_atomic,
+};
 pub use session::{
     AutoKeySounds, ChartReader, ChartSource, ClosingReport, Command, GateStorage, Loaded,
     MenuCommand, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport, PlayScript, PlayStart,

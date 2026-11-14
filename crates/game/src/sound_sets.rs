@@ -26,7 +26,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::hash::{BuildHasher as _, Hasher as _, RandomState};
 use std::io;
 use std::panic::{self, AssertUnwindSafe};
@@ -41,7 +41,8 @@ use ::audio::{
 use serde::{Deserialize, Serialize};
 
 use crate::error::IoFailure;
-use crate::save::write_atomic;
+pub use crate::save::LinkCount;
+use crate::save::{open_lock, write_atomic};
 use crate::settings::{DataRoot, PlayerSettingsError};
 
 /// The decoded bytes one pick may hold (design.md "Memory Budget").
@@ -428,15 +429,16 @@ pub struct FileStamp {
 /// Any other candidate (a link or junction to a folder, out of the folder
 /// or that cannot be resolved, a folder, a device, a file that also has
 /// another name or whose count of names cannot be read) is stamped by its
-/// name alone: none of it is read, and its size and times can move with
-/// whatever is written in or through it, the recovery state included when
-/// the data root lies in the set, and the log or any file a hard link
-/// shares. tapestry makes no link, so its writes can at most end one,
-/// which changes the identity once. It covers
-/// every kind whatever role the folder serves, so a folder that is a sound
-/// set, a BGM set and `defaultsound\` at once has one identity, and its
-/// quarantine holds for every role. A change of any stamp makes another
-/// identity.
+/// name alone: the identity reads none of its size and times, which can
+/// move with whatever is written in or through it, the recovery state
+/// included when the data root lies in the set. (An admitted file with
+/// another name or no count still decodes; only its stamp is its name.)
+/// tapestry makes no link, and its writes never go through one
+/// ([`crate::create_fresh`], [`crate::open_lock`]), so they can at most
+/// end one, which changes the identity once. It covers every kind
+/// whatever role the folder serves, so a folder that is a sound set, a BGM
+/// set and `defaultsound\` at once has one identity, and its quarantine
+/// holds for every role. A change of any stamp makes another identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceIdentity {
@@ -686,10 +688,6 @@ pub trait RecoveryFs: Send {
     fn links(&self) -> LinkCount;
 }
 
-/// The count of names of the file at `path`, more than 1 when hard links
-/// share it, `None` when it cannot be read.
-pub type LinkCount = fn(&Path) -> Option<u64>;
-
 /// A [`LinkCount`] that reads nothing: every candidate counts by its name
 /// alone.
 const fn no_count(_: &Path) -> Option<u64> {
@@ -726,12 +724,7 @@ impl RecoveryFs for DiskFs {
         if let Some(dir) = path.parent() {
             fs::create_dir_all(dir)?;
         }
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        let file = open_lock(path, self.links)?;
         match file.try_lock() {
             Ok(()) => {
                 self.lock = Some(file);

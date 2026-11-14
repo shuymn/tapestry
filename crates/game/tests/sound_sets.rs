@@ -1476,3 +1476,159 @@ fn a_copy_of_a_refused_file_is_named_too() {
     assert_eq!(named, want, "each refused file named once");
     assert_eq!(budget.used(), 0);
 }
+
+/// Whether `path` is a symbolic link or junction itself.
+fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// A file each run writes afresh is a new file with no other name: a link
+/// to a set's file, a junction to a set's folder, a dangling link and
+/// another file's second name are each removed, never written through, so
+/// the set's files keep their bytes and times (design.md T18). A folder
+/// at the name is refused. The file link cases need the right to make
+/// one; without it they are skipped and the rest still run.
+// Covers: T18
+#[test]
+fn a_fresh_file_never_writes_through_a_link() {
+    let dir = tmp();
+    let set = dir.path().join("set");
+    let logs = dir.path().join("logs");
+    fs::create_dir_all(&logs).unwrap();
+    let scratch = put(&set, "scratch.wav");
+    let stamp = |p: &Path| {
+        let m = fs::metadata(p).unwrap();
+        (fs::read(p).unwrap(), m.modified().unwrap())
+    };
+    let kept = stamp(&scratch);
+
+    let written = |name: &str| {
+        let path = logs.join(name);
+        let mut file = game::create_fresh(&path).unwrap();
+        io::Write::write_all(&mut file, b"run 1\n").unwrap();
+        drop(file);
+        assert!(!is_link(&path), "{name} is still a link");
+        assert_eq!(fs::read(&path).unwrap(), b"run 1\n", "{name}");
+    };
+
+    // A junction to the set's folder.
+    link_dir(&logs.join("junction.log"), &set);
+    written("junction.log");
+    assert_eq!(stamp(&scratch), kept, "the set's file through the junction");
+    assert!(set.is_dir());
+
+    // A second name of the set's file.
+    fs::hard_link(&scratch, logs.join("hard.log")).unwrap();
+    written("hard.log");
+    assert_eq!(stamp(&scratch), kept, "the set's file through a hard link");
+
+    // An old file of its own.
+    put_bytes(&logs, "old.log", b"run 0, a longer line\n");
+    written("old.log");
+
+    // A folder.
+    fs::create_dir(logs.join("folder.log")).unwrap();
+    assert!(game::create_fresh(&logs.join("folder.log")).is_err());
+    assert!(logs.join("folder.log").is_dir());
+
+    // A link to the set's file, and a dangling one into the set.
+    if link_file(&logs.join("linked.log"), &scratch).is_none() {
+        println!("skipped the file links: no right to make one here");
+        return;
+    }
+    written("linked.log");
+    assert_eq!(stamp(&scratch), kept, "the set's file through a link");
+    let missing = set.join("fail.wav");
+    link_file(&logs.join("dangling.log"), &missing).unwrap();
+    written("dangling.log");
+    assert!(!missing.exists(), "the link's target was created");
+}
+
+/// A lock file is opened only once a link at its name is removed: a link
+/// to a set's file, a dangling link into the set, a junction and a second
+/// name of a set's file (counted by the probe). The set's files keep their
+/// bytes, none is created, and none is held by the lock (design.md T18).
+/// A lock file with one name keeps its bytes, so a lock another process
+/// holds is never removed. The file link cases need the right to make
+/// one; without it they are skipped and the rest still run.
+// Covers: T18
+#[test]
+fn a_lock_never_lands_on_another_file() {
+    let dir = tmp();
+    let set = dir.path().join("set");
+    let locks = dir.path().join("locks");
+    fs::create_dir_all(&locks).unwrap();
+    let scratch = put(&set, "scratch.wav");
+    let kept = fs::read(&scratch).unwrap();
+    let locked = |name: &str| {
+        let path = locks.join(name);
+        let file = game::open_lock(&path, LINKS).unwrap();
+        file.try_lock().unwrap();
+        assert!(!is_link(&path), "{name} is still a link");
+        file
+    };
+
+    put_bytes(&locks, "own.lock", b"held");
+    let own = locked("own.lock");
+    let len = own.metadata().unwrap().len();
+    assert_eq!(len, 4, "a lock file truncated or replaced");
+
+    link_dir(&locks.join("junction.lock"), &set);
+    let _junction = locked("junction.lock");
+    assert!(set.is_dir());
+
+    let other = put(&set, "clear.wav");
+    hard_link(&other, &locks.join("hard.lock"));
+    let _hard = locked("hard.lock");
+    assert_eq!(
+        fs::read(&other).ok().as_ref(),
+        Some(&kept),
+        "the set's file is held"
+    );
+
+    // Without a count, a second name is left as it is.
+    put_bytes(&locks, "unknown.lock", b"held");
+    let unknown = game::sound_sets::DiskFs::default().links();
+    game::clear_link(&locks.join("unknown.lock"), unknown).unwrap();
+    assert_eq!(fs::read(locks.join("unknown.lock")).unwrap(), b"held");
+
+    if link_file(&locks.join("linked.lock"), &scratch).is_none() {
+        println!("skipped the file links: no right to make one here");
+        return;
+    }
+    let _linked = locked("linked.lock");
+    assert_eq!(
+        fs::read(&scratch).ok().as_ref(),
+        Some(&kept),
+        "the set's file is held"
+    );
+    let missing = set.join("fail.wav");
+    link_file(&locks.join("dangling.lock"), &missing).unwrap();
+    let _dangling = locked("dangling.lock");
+    assert!(!missing.exists(), "the link's target was created");
+}
+
+/// With the data root in a set, `sound-sets.lock` as a dangling link into
+/// the set does not add a candidate: the recovery state removes the link
+/// and locks its own file, so the set's identity is unchanged (design.md
+/// T18). Making the link needs the right to; without it the test is
+/// skipped.
+// Covers: T18
+#[test]
+fn the_recovery_lock_adds_no_candidate() {
+    let base = tmp();
+    let set = base.path().join("set");
+    put_bytes(&set, "clear.wav", &wav(480, 200));
+    let data = DataRoot::new(set.clone());
+    let missing = set.join("scratch.wav");
+    if link_file(&data.sound_sets_lock(), &missing).is_none() {
+        println!("skipped: no right to make a file link here");
+        return;
+    }
+    let before = identity_of_set(&set);
+    let opened = Recovery::open(&data, Box::new(DiskFs::default())).unwrap();
+    assert!(!missing.exists(), "the lock created scratch.wav in the set");
+    assert!(!is_link(&data.sound_sets_lock()));
+    assert_eq!(identity_of_set(&set), before);
+    drop(opened);
+}
