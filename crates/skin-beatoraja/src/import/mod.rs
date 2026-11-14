@@ -2273,6 +2273,8 @@ impl<'d> Cx<'d> {
                 ratio_bars: std::mem::take(&mut self.sel.ratio_bars),
                 // Kept: a refusal names its entry's element.
                 pointer: self.sel.pointer.clone(),
+                judge_graphs: std::mem::take(&mut self.judge_graphs),
+                bpm_graphs: std::mem::take(&mut self.bpm_graphs),
             };
             Skin::new_selection(def, widgets)
         } else if result {

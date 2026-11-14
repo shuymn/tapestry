@@ -550,6 +550,8 @@ pub fn view(rows: Vec<RowView>, cursor: Option<usize>) -> SelectionView {
             judge_class: None,
             clears: 0,
             best: None,
+            info: None,
+            graphs: None,
         });
     SelectionView {
         position: None,

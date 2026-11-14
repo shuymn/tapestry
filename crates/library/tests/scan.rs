@@ -502,6 +502,41 @@ fn schema_11_reads_bga_flags_again() {
     assert_eq!(bga_flags(&lib), want);
 }
 
+/// A measure written only by poor-BGA lines keeps its bar line in the stored
+/// preview's tempo rows: at 150 BPM, 200 BPM halfway into measure 1
+/// (2 400 ms), so measure 3 starts at 4 200 ms. A library of schema 12
+/// stored rows that stopped at the tempo change: opening it under this
+/// version rebuilds it, so the next scan stores every chart's profile again.
+#[test]
+fn schema_12_reads_preview_profiles_again() {
+    let fx = Fixture::new();
+    fx.write(
+        "poor.bms",
+        format!("{}#00103:00C8\n#00306:01\n", chart_text("Poor")).as_bytes(),
+    );
+    let ms = |lib: &Library| -> Vec<u32> {
+        let entry = lib.charts().unwrap().remove(0);
+        let stored = lib.profile(&entry).unwrap().unwrap();
+        stored.rows.unwrap().iter().map(|r| r.ms).collect()
+    };
+    let want = vec![0, 2_400, 4_200];
+    {
+        let (lib, _) = fx.open();
+        scan(&lib, std::slice::from_ref(&fx.root));
+        assert_eq!(ms(&lib), want);
+    }
+    {
+        let old = rusqlite::Connection::open(fx.db()).unwrap();
+        old.execute_batch("PRAGMA user_version = 12;").unwrap();
+    }
+    let (lib, opened) = fx.open();
+    assert_eq!(opened, Opened::Rebuilt { old_version: 12 });
+    assert_eq!(lib.charts().unwrap(), Vec::new());
+    let report = scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!((report.found, report.read), (1, 1), "a full scan");
+    assert_eq!(ms(&lib), want);
+}
+
 /// A row an older loader version wrote, holding that version's reading of
 /// an unchanged file, is read again by the next scan, and only that row.
 #[test]
