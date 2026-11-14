@@ -11,11 +11,11 @@ use result_support::labels;
 use selection_support::{frame_of, rect, skin_def, uvs};
 use skin_model::{
     Attempt, Blend, BuildError, ChartMetadata, ChartText, DECISION, DecisionDefs, DecisionError,
-    DecisionFrame, DecisionScreen, DecisionTimers, ElementDef, FontRef, ImageChoiceDef,
-    ImageChoicePart, ImageSpan, KeyDef, Layout, LoadError, Overflow, PastTable, Place, PlayContext,
-    PrepareError, Program, QuadBatch, ResultLabels, Scope, ScreenKind, SelectionText, Side, Skin,
-    SkinDef, Source, TextDef, TextField, TextImage, TextTable, TextTableError, TextValue, TimerRef,
-    Ty, UvTable, WidgetDefs, compile, decision_timer,
+    DecisionFrame, DecisionScreen, DecisionTimers, DecisionTiming, ElementDef, FontRef,
+    ImageChoiceDef, ImageChoicePart, ImageSpan, KeyDef, Layout, LoadError, Overflow, PastTable,
+    Place, PlayContext, PrepareError, Program, QuadBatch, ResultLabels, Scope, ScreenKind,
+    SelectionText, Side, Skin, SkinDef, Source, TextDef, TextField, TextImage, TextTable,
+    TextTableError, TextValue, TimerRef, Ty, UvTable, WidgetDefs, compile, decision_timer,
 };
 
 fn dint(src: &str) -> Program {
@@ -600,6 +600,31 @@ fn the_fade_out_starts_at_the_scene() {
             None => assert_eq!(want, 0.0, "{ms} ms"),
         }
     }
+}
+
+/// Timer 1 is on from the choice plus `input`, started at that instant, as
+/// the fade-out's is from the choice plus `scene`: off 1 µs before, on at
+/// it; with `input` 0 it is on at the choice, and a start past `i64::MAX`
+/// saturates.
+#[test]
+fn the_input_timer_is_on_from_its_deadline() {
+    let timing = |input: i64| DecisionTiming {
+        scene: TimeUs(2_500_000),
+        fadeout: TimeUs(500_000),
+        input: TimeUs(input),
+    };
+    let choice = TimeUs(7_000_000);
+    let deadline = TimeUs(7_700_000);
+    let input_at =
+        |t: &DecisionTiming, choice: TimeUs, now: TimeUs| DecisionTimers::at(choice, t, now).input;
+    let t = timing(700_000);
+    assert_eq!(input_at(&t, choice, TimeUs(deadline.0 - 1)), None);
+    assert_eq!(input_at(&t, choice, deadline), Some(deadline));
+    assert_eq!(input_at(&t, choice, TimeUs(deadline.0 + 1)), Some(deadline));
+    assert_eq!(input_at(&timing(0), choice, choice), Some(choice));
+    let late = TimeUs(i64::MAX - 100);
+    assert_eq!(input_at(&t, late, TimeUs(i64::MAX - 1)), None);
+    assert_eq!(input_at(&t, late, TimeUs(i64::MAX)), Some(TimeUs(i64::MAX)));
 }
 
 /// A decision skin's output slots start after the decision schema's

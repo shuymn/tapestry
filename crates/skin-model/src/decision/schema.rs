@@ -27,7 +27,7 @@ pub mod timer {
     /// The fade-out's start (the source's timer 2); off until it starts.
     pub const FADEOUT: u16 = 1;
     /// The end of the skin's input declaration (the source's timer 1):
-    /// on only after the choice plus `input`. It drives the skin's drawing
+    /// on from the choice plus `input`. It drives the skin's drawing
     /// and changes nothing else.
     pub const INPUT: u16 = 2;
     /// The number of built-in timers.
