@@ -332,6 +332,11 @@ pub enum NoteKind {
         field: &'static str,
         declared_ms: i32,
     },
+    /// A BPM graph's `lineWidth` of `declared` texels past
+    /// [`skin_model::MAX_BPM_LINE_WIDTH`], drawn at it.
+    LineWidthClamped {
+        declared: i32,
+    },
     /// A colour in `field` that is not an optional `#` and 6 or 8 hex
     /// digits, drawn opaque red, as the source's distribution draws one.
     InvalidColour {
@@ -416,6 +421,11 @@ impl fmt::Display for NoteKind {
                 f,
                 "a `{field}` of {declared_ms} ms, honoured for {} ms",
                 skin_model::MAX_DECISION_PHASE.0 / 1_000
+            ),
+            Self::LineWidthClamped { declared } => write!(
+                f,
+                "a `lineWidth` of {declared} texels, drawn at {}",
+                skin_model::MAX_BPM_LINE_WIDTH
             ),
             Self::Callback { field, why } => {
                 write!(f, "a callback in `{field}` replaced by its constant: {why}")
