@@ -23,8 +23,8 @@ pub const GAUGE_KIND_ENUM: EnumId = EnumId(0);
 pub const READOUT_MAX: i32 = i32::MAX - 1;
 /// [`READOUT_MAX`] as a `u32`.
 pub(crate) const READOUT_MAX_U32: u32 = READOUT_MAX.unsigned_abs();
-/// The largest lane visual state, `judge.lane.N`: an empty POOR at or
-/// after its note, `5 · 2 + 1` (`play/JudgeManager.java:671-672`).
+/// The largest lane visual state, `judge.lane.N`: an empty POOR after its
+/// note, `5 · 2 + 1` (`play/JudgeManager.java:671-672`).
 pub const LANE_JUDGE_MAX: i32 = 11;
 /// The whole attempt in `time.progress_ppm`'s unit, parts per million.
 pub const PROGRESS_FULL: i32 = 1_000_000;

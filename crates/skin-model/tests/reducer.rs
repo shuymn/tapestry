@@ -1011,7 +1011,7 @@ fn stamped(mut kind: JudgeEventKind, n: u32) -> JudgeEventKind {
 
 /// Every lane's visual state (stage3.md R3, the source's per-lane judge
 /// value) after each effect and press: a judgment sets `j == 0 ? 1 : 2j +
-/// late` with on time late, an empty POOR as index 5; a miss leaves it; a
+/// late` with on time early, as the counts take it, an empty POOR as index 5; a miss leaves it; a
 /// held long note is 8. A press clears it unless the effect that set it
 /// counted that press: a later press, or one in the same µs past the
 /// effect's count (`presses`). A rearm reads 0 on every lane.
@@ -1046,7 +1046,7 @@ fn each_lane_follows_its_judgments_and_presses() {
         (1_000, Perfect, 1_999, 1),
         (1_010, Great, -30_000, 2),
         (1_020, Great, 5_000, 3),
-        (1_030, Great, 0, 3),
+        (1_030, Great, 0, 2),
         (1_040, Good, -1, 4),
         (1_050, Good, 1, 5),
         (1_060, Bad, -200_000, 6),
@@ -1068,9 +1068,9 @@ fn each_lane_follows_its_judgments_and_presses() {
     h.input.press(lane(1), TimeUs(1_210 * MS));
     let e = at(1_210 * MS, 1, miss);
     assert_eq!(step(&mut h, 1_210 * MS, Some(e))[1], 0, "the press clears");
-    // Empty POORs, each with its press: before the note 10, at or after
+    // Empty POORs, each with its press: at or before the note 10, after
     // it 11.
-    for (ms, dev, code) in [(1_300, -1_500, 10), (1_310, 0, 11), (1_320, 500, 11)] {
+    for (ms, dev, code) in [(1_300, -1_500, 10), (1_310, 0, 10), (1_320, 500, 11)] {
         let us = ms * MS;
         h.input.press(lane(1), TimeUs(us));
         let e = JudgeEventKind::EmptyPoor {
