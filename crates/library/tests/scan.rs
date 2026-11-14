@@ -940,7 +940,10 @@ fn the_scan_stores_each_charts_previews() {
     .unwrap();
     assert_eq!(stored.bins, loaded.profile.bins());
     assert_eq!(stored.bin_seconds, loaded.profile.bin_seconds());
-    assert_eq!(stored.rows.as_deref(), Some(loaded.profile.speeds()));
+    assert_eq!(
+        stored.rows.as_deref(),
+        Some(loaded.profile.speeds().to_vec().as_slice())
+    );
     let taps: Vec<_> = stored.bins.iter().map(|b| b[bms_model::KEY_TAP]).collect();
     assert_eq!(taps, [5, 13, 11, 10, 0]);
 

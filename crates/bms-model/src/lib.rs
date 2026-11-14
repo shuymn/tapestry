@@ -32,7 +32,7 @@ pub use main_tempo::{MAIN_HISTOGRAM_LIMIT, MainError, main_tempo};
 pub use profile::{
     ChartProfile, KEY_LONG_BODY, KEY_LONG_HEAD, KEY_TAP, MINE, NOTE_BINS, NOTE_CATEGORIES,
     PreviewInputs, PreviewTimeline, SCRATCH_LONG_BODY, SCRATCH_LONG_HEAD, SCRATCH_TAP, SCROLL_ONE,
-    SpeedRow,
+    SpeedRow, SpeedRows,
 };
 pub use scroll::{BEAT, DOMAIN, FRAC_BITS, Position, ScrollChange, ScrollMap, ScrollSegment};
 pub use speed::Speed;

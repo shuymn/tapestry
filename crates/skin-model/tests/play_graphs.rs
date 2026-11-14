@@ -490,7 +490,7 @@ fn the_bpm_graph_draws_the_sources_strokes() {
         scroll: bms_model::SCROLL_ONE,
     };
     assert_eq!(
-        profile.speeds(),
+        profile.speeds().to_vec(),
         [
             row(0, Some(tempo(150))),
             row(1_000, Some(tempo(300))),

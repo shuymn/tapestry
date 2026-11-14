@@ -95,7 +95,7 @@ pub fn encode(profile: &ChartProfile, main: Option<Option<Tempo>>) -> Option<Vec
         profile.length_ms(),
         profile.bin_seconds(),
         profile.bins(),
-        profile.speeds(),
+        profile.speeds().iter(),
     )
 }
 
@@ -105,7 +105,7 @@ fn encode_parts(
     length_ms: u32,
     bin_seconds: u32,
     bins: &[[u16; NOTE_CATEGORIES]],
-    rows: &[SpeedRow],
+    rows: impl ExactSizeIterator<Item = SpeedRow>,
 ) -> Option<Vec<u8>> {
     if bins.len() > NOTE_BINS {
         return None;
