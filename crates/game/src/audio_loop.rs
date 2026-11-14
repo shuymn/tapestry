@@ -1368,7 +1368,8 @@ impl AudioControl {
     /// [`RESERVED_HEADROOM`] free places, before any number is drawn; and
     /// [`SystemStartError::Exhausted`] once the sequence is; each is
     /// counted ([`AudioCounters::system_refused`]), except an exhausted
-    /// decision sound's.
+    /// start of a kind with a built-in sound, which the caller sounds
+    /// instead ([`SystemKind::built_in`]).
     pub fn system_start(
         &mut self,
         kind: SystemKind,
@@ -1376,7 +1377,7 @@ impl AudioControl {
         generation: Option<GenId>,
     ) -> Result<u64, SystemStartError> {
         let refused = |e: SystemStartError| {
-            if !(e == SystemStartError::Exhausted && kind == SystemKind::Decide) {
+            if !(e == SystemStartError::Exhausted && kind.built_in().is_some()) {
                 self.shared
                     .system_refused_requests
                     .fetch_add(1, Ordering::AcqRel);

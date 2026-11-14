@@ -71,13 +71,21 @@ fn stopped(stops: &[u64; SYSTEM_KINDS], kind: SystemKind, seq: u64) -> bool {
     stops.get(kind.index()).is_some_and(|&word| seq < word)
 }
 
+/// A sound tapestry builds in, played for a kind the installed pick has no
+/// sound for ([`SystemKind::built_in`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BuiltIn {
+    /// The synthesized decision tone, outside every generation.
+    Tone,
+}
+
 /// A kind of system sound: the source's sound files of selection, the
 /// decision, the ready and closing sounds, and the result's.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum SystemKind {
     /// Selection's BGM (a loop).
     Select,
-    /// The decision sound; the synthesized tone when a generation has none.
+    /// The decision sound; its built-in sound is the synthesized tone.
     Decide,
     /// Selection's scroll.
     Scratch,
@@ -125,6 +133,18 @@ impl SystemKind {
     #[must_use]
     pub const fn index(self) -> usize {
         self as usize
+    }
+
+    /// The built-in sound it plays when the installed pick has no sound for
+    /// it, as a built-in skin stands in for a missing one: only the
+    /// decision sound has one so far, and every other kind is then silent.
+    /// A kind's built-in is added here.
+    #[must_use]
+    pub const fn built_in(self) -> Option<BuiltIn> {
+        match self {
+            Self::Decide => Some(BuiltIn::Tone),
+            _ => None,
+        }
     }
 
     /// Whether it has a reserved voice ([`RESERVED_KINDS`]).
@@ -540,6 +560,12 @@ impl SystemVoices {
         self.current.as_ref().map(SystemGeneration::id)
     }
 
+    /// The sound the current generation plays for `kind`, if it has one.
+    #[must_use]
+    pub fn current_sound(&self, kind: SystemKind) -> Option<&Arc<Sound>> {
+        self.current.as_ref()?.sound(kind)
+    }
+
     /// The retired generation's id.
     #[must_use]
     pub fn retired(&self) -> Option<GenId> {
@@ -797,17 +823,18 @@ impl SystemVoices {
 
     /// Starts `s` from the current generation, in its kind's reserved voice
     /// or one of the one-shot part's, dropped and counted when that voice
-    /// sounds or the part is full: the decision sound falls back to the
-    /// tone, which takes no voice, when the generation has none; any other
-    /// kind is silent.
+    /// sounds or the part is full. When the generation has no sound for the
+    /// kind, its built-in sound plays ([`SystemKind::built_in`]: the tone,
+    /// which takes no voice), and a kind with none is silent.
     fn play(&mut self, s: SystemStart) {
         let found = self
             .current
             .as_ref()
             .and_then(|g| Some((g.id(), g.index(s.kind)?)));
         let Some((generation, sound)) = found else {
-            if s.kind == SystemKind::Decide {
-                self.sound_tone();
+            match s.kind.built_in() {
+                Some(BuiltIn::Tone) => self.sound_tone(),
+                None => {}
             }
             return;
         };

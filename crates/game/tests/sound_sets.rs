@@ -11,9 +11,9 @@ use std::sync::{Arc, Mutex};
 use audio::{BankLimits, Decoded, FileRefusal, GenId, PickBudget, SystemKind};
 use game::DataRoot;
 use game::sound_sets::{
-    DecodeFile, KeptSounds, LinkCount, OneFile, PickDecode, Recovery, RecoveryFs, Refused,
-    Resolution, Resolved, ScanCap, ScanLimits, SetPick, SetRole, Source, Unavailable, Why, choose,
-    decode_pick, random_index, resolve, scan,
+    DecodeFile, LinkCount, OneFile, PickDecode, Recovery, RecoveryFs, Refused, Resolution,
+    Resolved, ScanCap, ScanLimits, SetPick, SetRole, Source, Unavailable, Why, choose, decode_pick,
+    random_index, resolve, scan,
 };
 
 fn tmp() -> tempfile::TempDir {
@@ -354,7 +354,7 @@ fn resolution_follows_the_sources_order() {
         found(&r, SystemKind::Decide),
         (canon(&defaults.join("decide.wav")), Source::Defaults)
     );
-    assert_eq!(resolved(&r, SystemKind::Scratch), &Resolved::Missing);
+    assert_eq!(resolved(&r, SystemKind::Scratch), &Resolved::Silent);
     assert_eq!(r.refused, []);
 
     let only = base.path().join("only-defaults");
@@ -364,7 +364,7 @@ fn resolution_follows_the_sources_order() {
         found(&r, SystemKind::Select),
         (canon(&only.join("select.ogg")), Source::Defaults)
     );
-    assert_eq!(resolved(&r, SystemKind::Decide), &Resolved::Missing);
+    assert_eq!(resolved(&r, SystemKind::Decide), &Resolved::Silent);
 
     // One kind with all four: each removed in turn gives the next.
     let four = base.path().join("four");
@@ -420,7 +420,7 @@ fn refused_candidates_are_named_and_skipped() {
         },
     ];
     assert_eq!(found(&r, SystemKind::Clear).1, Source::Defaults);
-    assert_eq!(resolved(&r, SystemKind::Scratch), &Resolved::Refused);
+    assert_eq!(resolved(&r, SystemKind::Scratch), &Resolved::Silent);
     if linked {
         want.push(Refused {
             path: csound.join("fail.wav"),
@@ -549,7 +549,6 @@ fn run(
     let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
     decode_pick(
         &set_pick(f),
-        &KeptSounds::default(),
         &budget,
         recovery,
         &|| false,
@@ -708,7 +707,6 @@ fn recovery_cases() {
         let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
         let report = decode_pick(
             &pick(Some(&set), None, &f.data.default_sounds()),
-            &KeptSounds::default(),
             &budget,
             &mut recovery,
             &|| false,
@@ -749,7 +747,6 @@ fn recovery_cases() {
     let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
     let report = decode_pick(
         &defaults,
-        &KeptSounds::default(),
         &budget,
         &mut recovery,
         &|| false,
@@ -833,7 +830,6 @@ fn a_cancelled_pick_clears_its_marker() {
         let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
         let report = decode_pick(
             &set_pick(&f),
-            &KeptSounds::default(),
             &budget,
             &mut recovery,
             &cancel,
@@ -955,14 +951,7 @@ fn a_folder_quarantined_in_one_role_stays_so_in_every_role() {
             .unwrap()
             .recovery;
         let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
-        decode_pick(
-            &both,
-            &KeptSounds::default(),
-            &budget,
-            &mut recovery,
-            &|| false,
-            &crash,
-        );
+        decode_pick(&both, &budget, &mut recovery, &|| false, &crash);
     }
     let left = crash
         .left
@@ -998,7 +987,6 @@ fn a_folder_quarantined_in_one_role_stays_so_in_every_role() {
         let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
         let report = decode_pick(
             &pick(sound.as_deref(), bgm.as_deref(), &shared),
-            &KeptSounds::default(),
             &budget,
             &mut recovery,
             &|| false,
@@ -1109,14 +1097,7 @@ fn the_recovery_state_in_a_set_cannot_expire_its_quarantine() {
                 .unwrap()
                 .recovery;
             let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
-            decode_pick(
-                &the_pick,
-                &KeptSounds::default(),
-                &budget,
-                &mut recovery,
-                &|| false,
-                &crash,
-            );
+            decode_pick(&the_pick, &budget, &mut recovery, &|| false, &crash);
         }
         let left = crash.left.lock().unwrap().take();
         fs::write(data.sound_sets(), left.expect("clear.wav decoded")).unwrap();
@@ -1137,7 +1118,6 @@ fn the_recovery_state_in_a_set_cannot_expire_its_quarantine() {
             let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
             decode_pick(
                 &the_pick,
-                &KeptSounds::default(),
                 &budget,
                 &mut recovery,
                 &|| false,
@@ -1271,143 +1251,89 @@ fn identity_of_set(set: &Path) -> game::sound_sets::SourceIdentity {
         .unwrap()
 }
 
-/// A kind the new pick finds no candidate for keeps the previous pick's
-/// sound, the same PCM charged to the new pick; a kind whose candidate is
-/// refused is silent; a kept sound whose source is skipped is not kept.
-#[test]
-fn a_kind_with_no_candidate_keeps_its_sound() {
-    let f = fixture();
-    put(&f.set, "scratch.wav");
-    let mut recovery = Recovery::open(&f.data, Box::new(DiskFs::default()))
-        .unwrap()
-        .recovery;
-    let first = PickBudget::new(game::sound_sets::PICK_BYTES);
-    let a = decode_pick(
-        &set_pick(&f),
-        &KeptSounds::default(),
-        &first,
-        &mut recovery,
-        &|| false,
-        &OneFile,
-    );
-    let PickDecode::Ready(a_gen) = a.decode else {
-        panic!()
-    };
-    let b_set = f.data.sound().join("b");
-    put_bytes(&b_set, "clear.wav", &wav(96, 50));
-    // A byte copy of A's `scratch.wav`.
-    put(&b_set, "o-close.wav");
-    fs::create_dir_all(b_set.join("fail.wav")).unwrap();
-    let b_pick = pick(Some(&b_set), None, &f.data.default_sounds());
-    let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
-    let b = decode_pick(
-        &b_pick,
-        &a.kept,
-        &budget,
-        &mut recovery,
-        &|| false,
-        &OneFile,
-    );
-    let PickDecode::Ready(b_gen) = b.decode else {
-        panic!()
-    };
-    let kept = b_gen.sound(SystemKind::Scratch).expect("scratch kept");
-    assert!(Arc::ptr_eq(kept, a_gen.sound(SystemKind::Scratch).unwrap()));
-    assert_eq!(
-        b_gen.sound(SystemKind::Fail),
-        None,
-        "a refused candidate keeps nothing"
-    );
-    assert!(
-        b_gen
-            .sound(SystemKind::OptionClose)
-            .is_some_and(|s| Arc::ptr_eq(s, kept)),
-        "a copy of a kept sound's bytes does not play the kept sound"
-    );
-    assert_eq!(budget.used(), b_gen.bytes());
-    assert_eq!(
-        b_gen.bytes(),
-        kept.bytes() + b_gen.sound(SystemKind::Clear).unwrap().bytes()
-    );
-
-    let mut skipping = b_pick.clone();
-    skipping
-        .skipped
-        .push(a.kept.get(SystemKind::Scratch).unwrap().source.clone());
-    let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
-    let c = decode_pick(
-        &skipping,
-        &a.kept,
-        &budget,
-        &mut recovery,
-        &|| false,
-        &OneFile,
-    );
-    let PickDecode::Ready(c_gen) = c.decode else {
-        panic!()
-    };
-    assert_eq!(
-        c_gen.sound(SystemKind::Scratch),
-        None,
-        "a skipped source's sound kept"
-    );
+/// The level of every sample of the WAV a test writes for `kind` in the
+/// source numbered `source` (1 the first pick, 2 the second, 3
+/// `defaultsound\`): what a decoded sound's samples say it came from.
+fn level(source: i16, kind: SystemKind) -> i16 {
+    source * 1_000 + i16::try_from(kind.index()).unwrap() + 1
 }
 
-/// A kept sound of 80 MiB and a file the new pick finds with the same bytes
-/// fit a 128 MiB budget: the content is charged once, and the file shares
-/// the kept sound.
+/// A pick is a whole: after a pick of sets A (every kind), the next pick of
+/// sets B (the sound set with `clear`, `scratch` and `fail`, the BGM set
+/// with `select`) plays B's files, `defaultsound\`'s where B lacks the kind
+/// (here `o-close.flac` and `playstop.ogg`), and nothing for every other
+/// kind (the decision sound then falls back to the tone): none of A's
+/// sounds, and only B's and the defaults' bytes charged.
 #[test]
-fn a_copy_of_a_kept_sound_is_charged_once() {
-    const MIB: usize = 1024 * 1024;
-    let f = fixture();
-    let big = wav(40 * MIB, 7);
-    put_bytes(&f.set, "scratch.wav", &big);
-    let mut a_pick = set_pick(&f);
-    a_pick.limits.max_sound_seconds = 1_000;
-    let mut recovery = Recovery::open(&f.data, Box::new(DiskFs::default()))
+fn a_pick_plays_only_its_sets_and_defaults() {
+    let base = tmp();
+    let data = DataRoot::new(base.path().join("data"));
+    let put_kind = |dir: &Path, source: i16, kind: SystemKind, ext: &str| {
+        let name = format!("{}.{ext}", game::sound_sets::file_stem(kind));
+        put_bytes(dir, &name, &wav(64 + kind.index(), level(source, kind)));
+    };
+    let (a_sound, a_bgm) = (data.sound().join("a"), data.bgm().join("a"));
+    for kind in SystemKind::ALL {
+        let dir = match SetRole::of(kind) {
+            SetRole::Sound => &a_sound,
+            SetRole::Bgm => &a_bgm,
+        };
+        put_kind(dir, 1, kind, "wav");
+    }
+    let (b_sound, b_bgm) = (data.sound().join("b"), data.bgm().join("b"));
+    for kind in [SystemKind::Clear, SystemKind::Scratch, SystemKind::Fail] {
+        put_kind(&b_sound, 2, kind, "wav");
+    }
+    put_kind(&b_bgm, 2, SystemKind::Select, "wav");
+    let defaults = data.default_sounds();
+    put_kind(&defaults, 3, SystemKind::OptionClose, "flac");
+    put_kind(&defaults, 3, SystemKind::PlayStop, "ogg");
+
+    let mut recovery = Recovery::open(&data, Box::new(DiskFs::default()))
         .unwrap()
         .recovery;
-    let first = PickBudget::new(game::sound_sets::PICK_BYTES);
-    let a = decode_pick(
-        &a_pick,
-        &KeptSounds::default(),
-        &first,
-        &mut recovery,
-        &|| false,
-        &OneFile,
-    );
-    let kept = Arc::clone(&a.kept.get(SystemKind::Scratch).expect("scratch").sound);
-    assert_eq!(kept.bytes(), 80 * 1024 * 1024);
-
-    // B has no `scratch` and a byte copy of it as `fail.wav`.
-    let b_set = f.data.sound().join("b");
-    put_bytes(&b_set, "clear.wav", &wav(96, 50));
-    put_bytes(&b_set, "fail.wav", &big);
-    drop(big);
-    let mut b_pick = pick(Some(&b_set), None, &f.data.default_sounds());
-    b_pick.limits.max_sound_seconds = 1_000;
-    let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
-    let b = decode_pick(
-        &b_pick,
-        &a.kept,
-        &budget,
-        &mut recovery,
-        &|| false,
-        &OneFile,
-    );
-    assert_eq!(b.refused, [], "the copy was charged again");
-    let PickDecode::Ready(b_gen) = b.decode else {
-        panic!("{:?}", b.decode)
+    let decode = |pick: &SetPick, recovery: &mut Recovery| {
+        let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
+        let report = decode_pick(pick, &budget, recovery, &|| false, &OneFile);
+        assert_eq!(report.refused, []);
+        let PickDecode::Ready(generation) = report.decode else {
+            panic!("{:?}", report.decode)
+        };
+        assert_eq!(budget.used(), generation.bytes());
+        generation
     };
-    for kind in [SystemKind::Scratch, SystemKind::Fail] {
-        assert!(
-            b_gen.sound(kind).is_some_and(|s| Arc::ptr_eq(s, &kept)),
-            "{kind:?} does not play the kept sound"
-        );
+    let from = |generation: &audio::SystemGeneration, kind| {
+        generation.sound(kind).map(|s| {
+            let samples = s.samples();
+            assert!(samples.iter().all(|&v| v == samples[0]));
+            samples[0]
+        })
+    };
+
+    let a = decode(
+        &pick(Some(&a_sound), Some(&a_bgm), &defaults),
+        &mut recovery,
+    );
+    for kind in SystemKind::ALL {
+        assert_eq!(from(&a, kind), Some(level(1, kind)), "A's {kind:?}");
     }
-    let clear = b_gen.sound(SystemKind::Clear).unwrap().bytes();
-    assert_eq!(budget.used(), kept.bytes() + clear);
-    assert_eq!(b_gen.bytes(), kept.bytes() + clear);
+    let b = decode(
+        &pick(Some(&b_sound), Some(&b_bgm), &defaults),
+        &mut recovery,
+    );
+    let mut bytes = 0;
+    for kind in SystemKind::ALL {
+        let want = match kind {
+            SystemKind::Clear | SystemKind::Scratch | SystemKind::Fail | SystemKind::Select => {
+                Some(level(2, kind))
+            }
+            SystemKind::OptionClose | SystemKind::PlayStop => Some(level(3, kind)),
+            _ => None,
+        };
+        assert_eq!(from(&b, kind), want, "B's {kind:?}");
+        bytes += b.sound(kind).map_or(0, |s| s.bytes());
+    }
+    assert_eq!(b.bytes(), bytes, "only B's and the defaults' sounds");
 }
 
 /// A file with the same bytes as a refused one is refused and named too,
@@ -1425,14 +1351,7 @@ fn a_copy_of_a_refused_file_is_named_too() {
         .unwrap()
         .recovery;
     let budget = PickBudget::new(game::sound_sets::PICK_BYTES);
-    let report = decode_pick(
-        &set_pick(&f),
-        &KeptSounds::default(),
-        &budget,
-        &mut recovery,
-        &|| false,
-        &OneFile,
-    );
+    let report = decode_pick(&set_pick(&f), &budget, &mut recovery, &|| false, &OneFile);
     let mut named: Vec<PathBuf> = report
         .refused
         .iter()
