@@ -1521,11 +1521,10 @@ pub fn load_bank_width(
 }
 
 /// The decoded bytes one pick of system sounds may hold, shared by every
-/// [`decode_one`] call of the pick and by the sounds it keeps from the
-/// previous one: each charge is taken before its allocation, as the bank
-/// cap's are, and a charge past what remains refuses that file. It also
-/// remembers the contents it has taken, so identical bytes at different
-/// paths are decoded and charged once.
+/// [`decode_one`] call of the pick: each charge is taken before its
+/// allocation, as the bank cap's are, and a charge past what remains
+/// refuses that file. It also remembers the contents it has taken, so
+/// identical bytes at different paths are decoded and charged once.
 #[derive(Debug)]
 pub struct PickBudget {
     limit: u64,
@@ -1558,12 +1557,14 @@ impl PickBudget {
         self.used.load(Ordering::Relaxed)
     }
 
-    /// Charges `bytes` already decoded (a kept sound).
+    /// Charges `bytes` outside [`decode_one`], as a test's stand-in decoder
+    /// does (dev-tools).
     ///
     /// # Errors
     ///
     /// [`FileRefusal::OverCap`] with [`Cap::BankMemory`] when they do not
     /// fit in what remains; nothing is charged then.
+    #[cfg(feature = "dev-tools")]
     pub fn charge(&self, bytes: u64) -> Result<(), FileRefusal> {
         self.used
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |used| {
@@ -1571,25 +1572,6 @@ impl PickBudget {
             })
             .map(|_| ())
             .map_err(|_| FileRefusal::OverCap(Cap::BankMemory))
-    }
-
-    /// Charges a kept sound of `bytes`, decoded from a file whose bytes
-    /// hash to `digest`, and takes that content: a file of the same bytes
-    /// comes back from [`decode_one`] as [`Decoded::Same`]. A content
-    /// already taken is charged nothing more.
-    ///
-    /// # Errors
-    ///
-    /// [`FileRefusal::OverCap`] with [`Cap::BankMemory`] when they do not
-    /// fit in what remains; nothing is charged or taken then.
-    pub fn keep(&self, digest: [u8; 32], bytes: u64) -> Result<(), FileRefusal> {
-        let mut taken = self.taken.lock().unwrap_or_else(|e| e.into_inner());
-        if taken.contains_key(&digest) {
-            return Ok(());
-        }
-        self.charge(bytes)?;
-        taken.insert(digest, self.files.fetch_add(1, Ordering::Relaxed));
-        Ok(())
     }
 }
 

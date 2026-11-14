@@ -11,9 +11,10 @@ use std::time::{Duration, Instant};
 
 use bms_model::{TimeSource as _, TimeUs};
 use game::AppRig as _;
+use input::QpcClock;
 use skin_model::chart_image::ChartImage;
 
-use super::tests::{keys, on_selection, over, settle};
+use super::tests::{keys, on_selection_at, over, settle};
 use super::{CursorImages, REST, Selection};
 use crate::chart_images::{ChartImageWorker, ChartImages, HELD_HARD, HOLD_HARD};
 use crate::render_side::RenderLink;
@@ -296,7 +297,7 @@ pub(crate) fn look_until(
 }
 
 /// The select screen of two charts with images, on a rig whose selection
-/// skin keeps a chart layer.
+/// skin keeps a chart layer and whose clock a test may hold.
 fn on_charts<R>(f: impl FnOnce(&mut crate::play::PlayerRig<'_>) -> R) -> R {
     let dir = tempfile::tempdir().unwrap();
     let (sel, _) = library(
@@ -308,7 +309,7 @@ fn on_charts<R>(f: impl FnOnce(&mut crate::play::PlayerRig<'_>) -> R) -> R {
     );
     let screens = Installers::default();
     let render = screens.spawn_bare();
-    on_selection(sel, &screens, render, |rig| {
+    on_selection_at(sel, &screens, render, QpcClock::holdable(), |rig| {
         rig.selection_chart = Some(SIDE);
         f(rig)
     })
@@ -342,18 +343,21 @@ fn a_deferred_request_wakes_the_select_screen_within_a_slice() {
     let _let_go = LetGo;
     on_charts(|rig| {
         HOLD_HARD.store(true, Ordering::Release);
+        // Held: the move's look and the wake read one time, however long
+        // the look took.
+        let moved = rig.clock.hold();
         press(rig, MenuKey::Down);
         assert!(rig.choose().is_none());
         // Before the rest, the wake is the rest.
         let rest = rig.selection_wake().unwrap();
-        assert!(rest.0 > rig.clock.now().0 + REST.0 / 2, "{rest:?}");
-        past_rest();
+        assert_eq!(rest.0, moved.0 + REST.0, "{rest:?} {moved:?}");
+        rig.clock.set(rest);
         assert!(rig.choose().is_none());
         assert_eq!(rig.chart_images.begun(), 1);
         assert!(wait_until(|| HELD_HARD.load(Ordering::Acquire)));
         press(rig, MenuKey::Down);
         assert!(rig.choose().is_none());
-        past_rest();
+        rig.clock.set(TimeUs(rest.0 + REST.0));
         assert!(rig.choose().is_none());
         assert!(rig.chart_images.cursor_waiting());
         let wake = rig
@@ -363,6 +367,7 @@ fn a_deferred_request_wakes_the_select_screen_within_a_slice() {
         let slice = i64::try_from(crate::play::IMAGE_SLICE.as_micros()).unwrap();
         assert!(wake.0 <= after.0 + slice, "{wake:?} {after:?}");
         HOLD_HARD.store(false, Ordering::Release);
+        rig.clock.run();
         look_until(rig, |w| w.begun() == 2);
         look_until(rig, |w| w.current_selection().is_some());
         let set = rig.chart_images.current_selection().unwrap();
@@ -384,11 +389,14 @@ fn a_return_reads_the_chart_again_after_its_rest() {
     );
     let screens = Installers::default();
     let render = screens.spawn_bare();
-    on_selection(sel, &screens, render, |rig| {
+    on_selection_at(sel, &screens, render, QpcClock::holdable(), |rig| {
         rig.selection_chart = Some(SIDE);
+        // Held: the rest is reached by moving the clock, and the entry and
+        // the looks after it read the times set, however long they took.
+        let moved = rig.clock.hold();
         press(rig, MenuKey::Down);
         assert!(rig.choose().is_none());
-        past_rest();
+        rig.clock.set(TimeUs(moved.0 + REST.0));
         look_until(rig, |w| w.current_selection().is_some() && w.idle());
         let (decodes, begun) = (rig.chart_images.counts().0, rig.chart_images.begun());
         assert_eq!(decodes, 2);
@@ -405,8 +413,17 @@ fn a_return_reads_the_chart_again_after_its_rest() {
         assert!(rig.choose().is_none());
         assert_eq!(rig.chart_images.begun(), begun, "requested at the entry");
         let wake = rig.selection_wake().unwrap();
-        assert!(wake.0 >= entered.0 + REST.0, "{wake:?} {entered:?}");
-        past_rest();
+        assert_eq!(wake.0, entered.0 + REST.0, "{wake:?} {entered:?}");
+        // The request is made at the rest, not before (its job may begin
+        // in a later look).
+        let due = |rig: &crate::play::PlayerRig<'_>| rig.selection.as_ref().unwrap().rest_due();
+        rig.clock.set(TimeUs(wake.0 - 1));
+        assert!(rig.choose().is_none());
+        assert_eq!(due(rig), Some(wake), "requested before the rest");
+        rig.clock.set(wake);
+        assert!(rig.choose().is_none());
+        assert_eq!(due(rig), None, "no request at the rest");
+        rig.clock.run();
         look_until(rig, |w| w.current_selection().is_some() && w.idle());
         assert_eq!(rig.chart_images.counts().0, decodes + 2);
         let set = rig.chart_images.current_selection().unwrap();

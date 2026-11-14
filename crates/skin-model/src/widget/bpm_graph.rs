@@ -14,7 +14,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use bms_model::{SpeedRows, Tempo, TimeUs};
+use bms_model::{RowSpeed, SCROLL_ONE, SpeedRow, SpeedRows, Tempo, TimeUs};
 
 use super::compose::{self, Fill, Raster, Run};
 use super::{Brush, Frame, ImageRef};
@@ -27,8 +27,7 @@ pub const MAX_BPM_COLUMNS: u32 = 2_048;
 pub const RUNS_PER_COLUMN: u32 = 4;
 /// The widest stroke a BPM graph takes, in texels (provisional, owner
 /// pattern 7): it bounds how many columns a stroke overhangs its row's
-/// span, so how many strokes one column holds in a preparation, and keeps
-/// the source's `int` stroke arithmetic exact.
+/// span, so how many strokes one column holds in a preparation (T08).
 pub const MAX_BPM_LINE_WIDTH: u32 = 16;
 
 /// A BPM graph's colours, the source's defaults first.
@@ -100,7 +99,8 @@ pub(crate) struct BpmRaster {
 
 /// What a BPM graph is prepared from.
 pub(crate) struct BpmInput<'a> {
-    /// The tempo rows, in time order.
+    /// The tempo rows, in time order, each drawn at its effective speed
+    /// (its tempo times its scroll factor, 0 while stopped).
     pub(crate) rows: &'a SpeedRows,
     /// The whole chart's MAIN tempo.
     pub(crate) main: Tempo,
@@ -125,15 +125,33 @@ fn int_of(v: f64) -> i64 {
     i
 }
 
+/// A row's effective speed in BPM, `f64`: its tempo times its scroll
+/// factor (design.md "Loading and Song Selection", Summaries). It only
+/// places a stroke on the graph's log scale; the rows' classes compare the
+/// exact speeds ([`SpeedRow::speed`]). A factor of 1 is exactly 1.0, so a
+/// play's rows read their tempos.
+fn speed(row: &SpeedRow) -> f64 {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a stroke's height on a log scale"
+    )]
+    let factor = row.scroll as f64 / SCROLL_ONE as f64;
+    bpm(row.tempo) * factor
+}
+
 /// A row's class colour, in the source's order: MAIN, the lowest positive,
-/// the highest, a stop, else other.
-fn class(row: Option<Tempo>, main: Tempo, [min, max]: [Option<Tempo>; 2], c: &BpmColors) -> Rgba8 {
-    match row {
-        Some(t) if t == main => c.main,
-        Some(t) if Some(t) == min => c.min,
-        Some(t) if Some(t) == max => c.max,
-        None => c.stop,
-        Some(_) => c.other,
+/// the highest, a stop or a speed below 0, else other.
+fn class(row: RowSpeed, main: RowSpeed, [min, max]: [Option<RowSpeed>; 2], c: &BpmColors) -> Rgba8 {
+    if row == main {
+        c.main
+    } else if Some(row) == min {
+        c.min
+    } else if Some(row) == max {
+        c.max
+    } else if !row.is_positive() {
+        c.stop
+    } else {
+        c.other
     }
 }
 
@@ -153,10 +171,11 @@ impl BpmGraphDef {
         if data.len() < 2 || cols == 0 || rows == 0 {
             return raster;
         }
-        // The lowest positive and the highest tempo; a stop is 0, below
-        // every tempo.
-        let tempos = data.iter().filter_map(|r| r.tempo);
-        let range = [tempos.clone().min(), tempos.max()];
+        // The lowest and the highest positive speed: a stop is 0, and the
+        // source's highest starts above 0 (`skin/SkinBPMGraph.java:111-118`).
+        let positive = data.iter().map(|r| r.speed()).filter(|s| s.is_positive());
+        let range = [positive.clone().min(), positive.max()];
+        let main_speed = RowSpeed::of_tempo(input.main);
         let main = bpm(Some(input.main));
         let lw = i64::from(self.line_width.max(1));
         let (w, h) = (i64::from(cols), i64::from(rows));
@@ -171,8 +190,8 @@ impl BpmGraphDef {
         let (lo, hi) = ((1.0_f64 / 8.0).log10(), 8.0_f64.log10());
         #[expect(clippy::cast_precision_loss, reason = "sizes within 2^31")]
         let (wf, hl) = (w as f64, (h - lw) as f64);
-        let y = |t: Option<Tempo>| {
-            let r = (bpm(t) / main).clamp(1.0 / 8.0, 8.0);
+        let y = |row: &SpeedRow| {
+            let r = (speed(row) / main).clamp(1.0 / 8.0, 8.0);
             int_of((r.log10() - lo) / (hi - lo) * hl)
         };
         let x = |ms: u32| int_of(wf * f64::from(ms) / last_time);
@@ -181,7 +200,7 @@ impl BpmGraphDef {
         // texels from the bottom left.
         let mut fills: Vec<(i64, i64, i64, i64, Rgba8)> = Vec::with_capacity(2 * data.len());
         for (a, b) in data.iter().zip(data.iter().skip(1)) {
-            let (y1, y2) = (y(a.tempo), y(b.tempo));
+            let (y1, y2) = (y(&a), y(&b));
             let x1 = x(b.ms);
             if (y2 - y1).abs() - lw > 0 {
                 let bottom = y1.min(y2) + lw;
@@ -194,11 +213,11 @@ impl BpmGraphDef {
                 ));
             }
             let x0 = x(a.ms);
-            let color = class(a.tempo, input.main, range, colors);
+            let color = class(a.speed(), main_speed, range, colors);
             fills.push((x0, x1 + lw, y1, y1 + lw, color));
         }
-        let yl = y(last.tempo);
-        let color = class(last.tempo, input.main, range, colors);
+        let yl = y(&last);
+        let color = class(last.speed(), main_speed, range, colors);
         fills.push((x(last.ms), w + lw, yl, yl + lw, color));
         raster.runs = compose_columns(&fills, cols, rows, colors.transition);
         raster

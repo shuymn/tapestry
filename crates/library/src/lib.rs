@@ -6,7 +6,7 @@
 //! the bests phase of a scan pass; and the cached loudness measurements of
 //! the charts played (design.md "Algorithms").
 //!
-//! # Schema version 12
+//! # Schema version 13
 //!
 //! [`SCHEMA_VERSION`] is kept in `PRAGMA user_version`.
 //!
@@ -145,7 +145,7 @@ pub use search::{FolderKey, FolderRow, Level, SEPARATOR, Search, Sort};
 pub use stored_profile::{MAX_PROFILE_BYTES, MAX_ROWS, StoredProfile};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 12;
+pub const SCHEMA_VERSION: i64 = 13;
 
 /// Why the library database cannot be opened, read or scanned.
 #[derive(Debug, thiserror::Error)]

@@ -17,8 +17,8 @@
 //!   before any of its files is read for decoding and cleared after, and a
 //!   marker found at startup quarantines that identity.
 //! - [`decode_pick`] decodes a pick source by source under its marker,
-//!   charging one [`PickBudget`], and carries a kind with no candidate over
-//!   from the previous pick ([`KeptSounds`]).
+//!   charging one [`PickBudget`]. A pick is a whole: a kind it finds no
+//!   file for is silent in it, whatever an earlier pick played.
 //!
 //! The candidates' names are this module's constants, so they pass the
 //! chart sounds' name rules ("Loading Limits") by construction; their
@@ -554,10 +554,9 @@ pub enum Resolved {
         /// Where it comes from.
         source: Source,
     },
-    /// Every candidate that exists was refused: the kind is silent.
-    Refused,
-    /// No candidate exists: the kind keeps its previous sound.
-    Missing,
+    /// No candidate exists, or every one that exists was refused: the
+    /// kind is silent in the pick (the decision sound: the tone).
+    Silent,
 }
 
 /// One pick's resolution.
@@ -604,7 +603,6 @@ pub fn resolve(
             SetRole::Sound => Source::SoundSet,
             SetRole::Bgm => Source::BgmSet,
         };
-        let before = refused.len();
         for source in [set, Source::Defaults] {
             let Some(Some(identity)) = sources.get(source.index()) else {
                 continue;
@@ -613,11 +611,7 @@ pub fn resolve(
                 return Resolved::Found { path, source };
             }
         }
-        if refused.len() > before {
-            Resolved::Refused
-        } else {
-            Resolved::Missing
-        }
+        Resolved::Silent
     });
     Resolution {
         kinds,
@@ -1005,46 +999,6 @@ impl Recovery {
     }
 }
 
-/// A sound a later pick may keep: its PCM, shared, its file's content and
-/// its source.
-#[derive(Clone, Debug)]
-pub struct Kept {
-    /// The sound.
-    pub sound: Arc<Sound>,
-    /// The SHA-256 of the bytes of the file it was decoded from.
-    pub digest: [u8; 32],
-    /// The identity of the source it was decoded from.
-    pub source: SourceIdentity,
-}
-
-/// The sounds a generation plays, per kind, with their sources: what the
-/// next pick keeps for a kind it finds no candidate for. Its empty value
-/// holds nothing on the heap.
-#[derive(Clone, Debug, Default)]
-pub struct KeptSounds {
-    kinds: [Option<Kept>; SYSTEM_KINDS],
-}
-
-impl KeptSounds {
-    /// `kind`'s sound, if it has one.
-    #[must_use]
-    pub fn get(&self, kind: SystemKind) -> Option<&Kept> {
-        self.kinds.get(kind.index())?.as_ref()
-    }
-
-    /// Whether no kind has a sound.
-    #[must_use]
-    pub fn is_empty(&self) -> bool {
-        self.kinds.iter().all(Option::is_none)
-    }
-
-    fn set(&mut self, kind: SystemKind, kept: Kept) {
-        if let Some(slot) = self.kinds.get_mut(kind.index()) {
-            *slot = Some(kept);
-        }
-    }
-}
-
 /// How a pick decodes one file: [`audio::decode_one`], or a test's seam.
 pub trait DecodeFile: Sync {
     /// Decodes `path` as [`audio::decode_one`] does.
@@ -1099,9 +1053,6 @@ pub struct PickReport {
     /// The recovery state's: `Err` when a marker could not be committed or
     /// cleared, so no set may decode for the rest of the run.
     pub recovery: Result<(), Unavailable>,
-    /// The ready generation's sounds per kind with their sources (empty
-    /// unless ready).
-    pub kept: KeptSounds,
     /// Files refused, each to be named once.
     pub refused: Vec<Refused>,
     /// Sources whose decode panicked: their kinds are silent, and they are
@@ -1109,29 +1060,26 @@ pub struct PickReport {
     pub panicked: Vec<SourceIdentity>,
 }
 
-/// Per kind, its sound and source in the pick being made.
-type Slots = [Option<Kept>; SYSTEM_KINDS];
+/// Per kind, its sound in the pick being made.
+type Slots = [Option<Arc<Sound>>; SYSTEM_KINDS];
 
 /// Decodes `pick` into a generation, under `budget`: every kind is resolved
-/// first; a kind with no candidate keeps `kept`'s sound, charged before any
-/// file is decoded, unless that sound's source is quarantined or skipped;
-/// then each source with a file to decode is decoded under its marker,
-/// committed before its first byte is read and cleared after, whatever the
-/// outcome. Identical bytes at different paths are decoded and charged
-/// once, a kept sound's file's bytes included: a file the pick finds with
-/// them shares the kept sound. A cancel stops at the next check; a marker that cannot be
-/// committed stops the pick before that source is read; one that cannot be
-/// cleared stops it after.
+/// first, then each source with a file to decode is decoded under its
+/// marker, committed before its first byte is read and cleared after,
+/// whatever the outcome. Every sound of the generation is decoded from the
+/// pick's own sources: a kind with no file is silent in it. Identical bytes
+/// at different paths are decoded and charged once. A cancel stops at the
+/// next check; a marker that cannot be committed stops the pick before that
+/// source is read; one that cannot be cleared stops it after.
 pub fn decode_pick(
     pick: &SetPick,
-    kept: &KeptSounds,
     budget: &PickBudget,
     recovery: &mut Recovery,
     cancel: &(dyn Fn() -> bool + Sync),
     decoder: &dyn DecodeFile,
 ) -> PickReport {
     let body = panic::catch_unwind(AssertUnwindSafe(|| {
-        pick_body(pick, kept, budget, recovery, cancel, decoder)
+        pick_body(pick, budget, recovery, cancel, decoder)
     }));
     body.unwrap_or_else(|_| {
         let recovery = match recovery.decoding() {
@@ -1141,7 +1089,6 @@ pub fn decode_pick(
         PickReport {
             decode: PickDecode::Panicked,
             recovery,
-            kept: KeptSounds::default(),
             refused: Vec::new(),
             panicked: Vec::new(),
         }
@@ -1150,7 +1097,6 @@ pub fn decode_pick(
 
 fn pick_body(
     pick: &SetPick,
-    kept: &KeptSounds,
     budget: &PickBudget,
     recovery: &mut Recovery,
     cancel: &(dyn Fn() -> bool + Sync),
@@ -1161,37 +1107,10 @@ fn pick_body(
         !recovery.admits(id) || pick.skipped.contains(id)
     });
     let mut slots: Slots = Default::default();
-    // The kept sounds first, each content charged once and taken, so a file
-    // of the same bytes shares the kept sound.
     let mut digests: HashMap<[u8; 32], Arc<Sound>> = HashMap::new();
-    for kind in SystemKind::ALL {
-        if !matches!(resolution.kinds.get(kind.index()), Some(Resolved::Missing)) {
-            continue;
-        }
-        let Some(k) = kept.get(kind) else { continue };
-        if recovery.quarantined().contains(&k.source) || pick.skipped.contains(&k.source) {
-            continue;
-        }
-        if budget.keep(k.digest, k.sound.bytes()).is_err() {
-            continue;
-        }
-        let sound = Arc::clone(
-            digests
-                .entry(k.digest)
-                .or_insert_with(|| Arc::clone(&k.sound)),
-        );
-        if let Some(slot) = slots.get_mut(kind.index()) {
-            *slot = Some(Kept {
-                sound,
-                digest: k.digest,
-                source: k.source.clone(),
-            });
-        }
-    }
     let mut report = PickReport {
         decode: PickDecode::Cancelled,
         recovery: Ok(()),
-        kept: KeptSounds::default(),
         refused: resolution.refused,
         panicked: Vec::new(),
     };
@@ -1231,13 +1150,9 @@ fn pick_body(
                 cancelled: c,
             }) => {
                 report.refused.extend(r);
-                for (kind, sound, digest) in sounds {
+                for (kind, sound) in sounds {
                     if let Some(slot) = slots.get_mut(kind.index()) {
-                        *slot = Some(Kept {
-                            sound,
-                            digest,
-                            source: identity.clone(),
-                        });
+                        *slot = Some(sound);
                     }
                 }
                 cancelled = c;
@@ -1257,9 +1172,8 @@ fn pick_body(
     }
     let mut generation = SystemGeneration::new(pick.id, pick.rate);
     for (kind, slot) in SystemKind::ALL.into_iter().zip(slots) {
-        if let Some(k) = slot {
-            generation = generation.with(kind, Arc::clone(&k.sound));
-            report.kept.set(kind, k);
+        if let Some(sound) = slot {
+            generation = generation.with(kind, sound);
         }
     }
     report.decode = PickDecode::Ready(generation);
@@ -1268,7 +1182,7 @@ fn pick_body(
 
 /// What one source's decode made.
 struct SourceDecode {
-    sounds: Vec<(SystemKind, Arc<Sound>, [u8; 32])>,
+    sounds: Vec<(SystemKind, Arc<Sound>)>,
     refused: Vec<Refused>,
     cancelled: bool,
 }
@@ -1291,11 +1205,11 @@ fn decode_source(
             Ok(Decoded::Sound { sound, digest }) => {
                 let sound = Arc::new(sound);
                 digests.insert(digest, Arc::clone(&sound));
-                out.sounds.push((kind, sound, digest));
+                out.sounds.push((kind, sound));
             }
             Ok(Decoded::Same { digest }) => {
                 if let Some(sound) = digests.get(&digest) {
-                    out.sounds.push((kind, Arc::clone(sound), digest));
+                    out.sounds.push((kind, Arc::clone(sound)));
                 }
             }
             Err(FileRefusal::Cancelled) => {
@@ -1339,17 +1253,16 @@ mod tests {
         b
     }
 
-    fn decode(pick: &SetPick, kept: &KeptSounds, recovery: &mut Recovery) -> PickReport {
+    fn decode(pick: &SetPick, recovery: &mut Recovery) -> PickReport {
         let budget = PickBudget::new(PICK_BYTES);
-        decode_pick(pick, kept, &budget, recovery, &|| false, &OneFile)
+        decode_pick(pick, &budget, recovery, &|| false, &OneFile)
     }
 
     /// A candidate whose metadata cannot be read is refused and named once,
     /// not taken as absent: lookup moves on to the next candidate, and a
-    /// kind left with no other is silent, not given the previous pick's
-    /// sound (design.md T18).
+    /// kind left with no other is silent (design.md T18).
     #[test]
-    fn an_unreadable_candidate_is_refused_not_missing() {
+    fn an_unreadable_candidate_is_refused_and_named() {
         let tmp = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
         fs::create_dir_all(&tmp).unwrap();
         let dir = tempfile::tempdir_in(tmp).unwrap();
@@ -1376,15 +1289,11 @@ mod tests {
         let mut recovery = Recovery::open(&data, Box::new(DiskFs::default()))
             .unwrap()
             .recovery;
-        let a = decode(&pick, &KeptSounds::default(), &mut recovery);
-        assert!(matches!(a.decode, PickDecode::Ready(_)), "{:?}", a.decode);
-        assert!(a.kept.get(SystemKind::Fail).is_some());
-
         let set = set.canonicalize().unwrap();
         for name in ["fail.wav", "scratch.wav"] {
             inject::fail_metadata(&set.join(name), ErrorKind::PermissionDenied);
         }
-        let b = decode(&pick, &a.kept, &mut recovery);
+        let b = decode(&pick, &mut recovery);
         let PickDecode::Ready(generation) = b.decode else {
             panic!("{:?}", b.decode)
         };
@@ -1399,17 +1308,9 @@ mod tests {
             [unreadable("fail.wav"), unreadable("scratch.wav")],
             "each refused once"
         );
-        assert_eq!(
-            generation.sound(SystemKind::Fail),
-            None,
-            "the refused kind kept the previous sound"
-        );
-        assert!(b.kept.get(SystemKind::Fail).is_none());
-        let scratch = b.kept.get(SystemKind::Scratch).expect("scratch.flac");
-        assert!(!Arc::ptr_eq(
-            &scratch.sound,
-            &a.kept.get(SystemKind::Scratch).unwrap().sound
-        ));
+        assert_eq!(generation.sound(SystemKind::Fail), None);
+        // `scratch.wav` refused, so its sound is `scratch.flac`'s.
+        assert!(generation.sound(SystemKind::Scratch).is_some());
         assert!(generation.sound(SystemKind::Clear).is_some());
     }
 }

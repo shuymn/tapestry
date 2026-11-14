@@ -240,9 +240,9 @@ class = "rule"
 reason = """
 A player hears the result answer the play: `clear` when the play's own \
 view cleared and `fail` otherwise as the result first shows, looping when \
-`[sounds] loop_result` asks; at a result skin's fade-out a set with \
-`resultclose` stops them and plays it, and a set without leaves them \
-playing; leaving Result stops all three."""
+`[sounds] loop_result` asks; at a result skin's fade-out a pick with \
+`resultclose`, in its sound set or `defaultsound\\`, stops them and plays \
+it, and one without leaves them playing; leaving Result stops all three."""
 source = [
     "src/bms/player/beatoraja/result/MusicResult.java:149-158 @beatoraja-0.8.9",
     "src/bms/player/beatoraja/result/MusicResult.java:250-256 @beatoraja-0.8.9",
@@ -253,6 +253,7 @@ sites = ["crates/player/src/play.rs", "crates/player/src/system_sounds.rs"]
 tests = [
     "crates/game/tests/result_graphs.rs::the_own_view_lamp_per_outcome",
     "crates/player/src/system_sounds/tests.rs::result_sounds_per_outcome",
+    "crates/player/src/system_sounds/tests.rs::the_fade_out_asks_the_installed_pick",
     "crates/player/src/system_sounds/rig_tests.rs::the_first_result_sound_follows_the_own_view",
     "crates/player/src/system_sounds/rig_tests.rs::a_view_switch_keeps_the_result_sounds",
     "crates/player/src/render_side/tests/decision/integrated.rs::result_sounds_through_a_run",

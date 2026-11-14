@@ -344,14 +344,15 @@ fn a_bpm_graph_reads_its_colours_as_the_source() {
     );
 }
 
-/// C32: a BPM graph's line width is kept up to 16 texels and drops the
-/// graph with a note past it. At 16 over 100 rows the rows of 150 (MAIN)
-/// and 300 sit at `⌊0.5 · 84⌋ = 42` and `⌊(log10 2 + log10 8)/(2 log10 8) ·
-/// 84⌋ = 56`, 14 apart, less than the stroke, so no transition is drawn:
-/// only the default MAIN `00ff00` and highest `ff0000`. At 17 nothing is
-/// drawn, with the note.
+/// C32: a BPM graph's line width is kept up to 16 texels and drawn at 16,
+/// with a deviation note, past it. At 16 over 100 rows the rows of 150
+/// (MAIN) and 300 sit at `⌊0.5 · 84⌋ = 42` and `⌊(log10 2 + log10 8)/(2
+/// log10 8) · 84⌋ = 56`, 14 apart, less than the stroke, so no transition
+/// is drawn: only the default MAIN `00ff00` and highest `ff0000`, each
+/// column's run 16 tall (15 at 15). At 40 the graph draws exactly as at
+/// 16, with the note, also on the failure presentation.
 #[test]
-fn a_bpm_graph_keeps_line_widths_up_to_16() {
+fn a_bpm_graph_draws_line_widths_past_16_at_16() {
     let (chart, profile) = tempo_chart();
     let main = Tempo::from_units(150 * Tempo::UNITS_PER_BPM).unwrap();
     let score = PlayScore {
@@ -364,15 +365,40 @@ fn a_bpm_graph_keeps_line_widths_up_to_16() {
     assert_eq!(notes(&report), []);
     let q = Drawn::over_score(skin, &chart, score).frame(0, &[]);
     assert_eq!(colours(&q), [rgba(0x00ff_00ff), rgba(0xff00_00ff)]);
-    let (_d, skin, report) = json(r#""bpmgraph": [{"id": "bg", "lineWidth": 17}],"#, dst);
-    assert_eq!(
-        notes(&report),
-        [(
-            Severity::Dropped,
-            NoteKind::UnsupportedField { field: "lineWidth" }
-        )]
-    );
-    assert_eq!(Drawn::over_score(skin, &chart, score).frame(0, &[]), []);
+    assert_eq!(tallest(&q), 16.0);
+    let (_d, skin, _) = json(r#""bpmgraph": [{"id": "bg", "lineWidth": 15}],"#, dst);
+    let fifteen = Drawn::over_score(skin, &chart, score).frame(0, &[]);
+    assert_eq!(tallest(&fifteen), 15.0);
+    let clamped = [(
+        Severity::Deviation,
+        NoteKind::LineWidthClamped { declared: 40 },
+    )];
+    let (_d, skin, report) = json(r#""bpmgraph": [{"id": "bg", "lineWidth": 40}],"#, dst);
+    assert_eq!(notes(&report), []);
+    assert_eq!(deviations(&report), clamped);
+    let wide = Drawn::over_score(skin, &chart, score).frame(0, &[]);
+    assert_eq!(tallest(&wide), 16.0);
+    assert_eq!(wide, q);
+    // On the failure presentation's timer (failed, 3) it is kept as well,
+    // where a dropped graph would refuse the skin.
+    let failed = r#"{"id": "bg", "timer": 3, "dst": [{"x": 0, "y": 0, "w": 200, "h": 100}]}"#;
+    let (_d, _, report) = json(r#""bpmgraph": [{"id": "bg", "lineWidth": 40}],"#, failed);
+    assert_eq!(deviations(&report), clamped);
+}
+
+/// The height of the tallest of `quads`: a BPM graph's stroke width, each
+/// column's run of a row one quad as tall as its stroke.
+fn tallest(quads: &[Quad]) -> f32 {
+    quads.iter().map(|q| q.rect[3]).fold(0.0, f32::max)
+}
+
+/// The deviation notes of a report.
+fn deviations(r: &Report) -> Vec<(Severity, NoteKind)> {
+    r.notes
+        .iter()
+        .filter(|n| n.severity == Severity::Deviation)
+        .map(|n| (n.severity, n.kind))
+        .collect()
 }
 
 /// C32: a BPM graph whose stretch is not the default drops with a note:
