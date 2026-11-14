@@ -257,8 +257,8 @@ pub(crate) enum Conv {
     /// the off value, for the program's `tolong()`.
     Timer,
     /// A slider's `value`: numbers kept, nil and booleans 0, a string known
-    /// here folded to the double the source's `tofloat()` rounds
-    /// ([`super::num_scan::todouble`]), for the program's `tofloat()`.
+    /// here read as a numeral ([`crate::numeral::number`], none 0), for the
+    /// program's `tofloat()`.
     Float,
 }
 
@@ -1357,9 +1357,9 @@ impl<'a> Eval<'a> {
     }
 
     /// Node `v` as a slider's value: numbers kept, nil and booleans 0, a
-    /// known string as the double `tofloat()` rounds (a −0 kept, as the
-    /// source's string gives one); the off value out of range, anything
-    /// else (a table, a function) refused, as for a number's value.
+    /// known string read as a numeral, none 0 (a −0 kept); the off value
+    /// out of range, anything else (a table, a function) refused, as for a
+    /// number's value.
     fn float(&mut self, v: u32) -> R<u32> {
         self.visit()?;
         let k = self.kind(v);
@@ -1371,12 +1371,12 @@ impl<'a> Eval<'a> {
         }
         if let Some(Val::Str(s)) = self.val(v) {
             let d = match s {
-                S::Empty => super::num_scan::todouble(b""),
+                S::Empty => 0.0,
                 S::Lit { file, id } => {
                     let b = self.bytes(file, id);
                     charge(self.an, "str", units(b.len()))?;
                     did("str");
-                    super::num_scan::todouble(b)
+                    crate::numeral::number(b).unwrap_or(0.0)
                 }
                 S::Name(n) => {
                     charge(self.an, "str", units(self.an.names.len()))?;
@@ -1391,7 +1391,7 @@ impl<'a> Eval<'a> {
                         return refuse(Unsupported::Type);
                     };
                     charge(self.an, "str", units(b.len()))?;
-                    super::num_scan::todouble(b)
+                    crate::numeral::number(b).unwrap_or(0.0)
                 }
             };
             return self.known(Val::Float(d.to_bits()));

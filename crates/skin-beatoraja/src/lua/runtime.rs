@@ -15,14 +15,16 @@
 //!   them.
 //! - **Frame.** Each callback is called in import order, after its gate
 //!   (the conditions before it in its element's `dstdraw`, evaluated on
-//!   the same frame's fields); its result is converted as the source's
-//!   consumer converts it ([`to_int`], [`to_bool`]) and written to its
+//!   the same frame's fields); its result is converted as the play
+//!   program's consumer converts it ([`to_int`], [`to_bool`]) and written to its
 //!   output slot. Every slot is written every frame.
 //! - **Budgets.** One frame's callbacks share
 //!   [`limits::RUNTIME_INSTRUCTIONS`], [`limits::RUNTIME_HOST_CALLS`] and
 //!   [`limits::RUNTIME_FRAME_TIME`]; the VM's memory is capped at
-//!   [`limits::RUNTIME_MEMORY`]. A call past the budget, and every later
-//!   call that frame, gives its constant; after
+//!   [`limits::RUNTIME_MEMORY`]. A string result read as a number's
+//!   numeral is charged one instruction per byte before it is read, so
+//!   its read is within the frame's instructions. A call past the budget,
+//!   and every later call that frame, gives its constant; after
 //!   [`limits::RUNTIME_STOP_FRAMES`] such frames in a row, the memory cap,
 //!   or a panic, the runtime stops, every slot its constant from then on.
 //! - **Failures.** A callback that raises an ordinary error gives the
@@ -43,6 +45,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use mlua::{Function, Lua, Value};
 use skin_model::output::OutTy;
+use skin_model::present::{Val, num};
 use skin_model::{Program, RESULT, SELECTION, Scope, ScreenKind, State, Ty, compile};
 
 use super::{LuaLimit, LuaWhy, Pass, limits};
@@ -437,97 +440,20 @@ pub fn absent(kind: ScreenKind, id: i32) -> Option<i32> {
     }
 }
 
-/// A Lua value as the source's `toint` converts a number's value
-/// (`SkinLuaAccessor.java:644-650`, LuaJ 3.0.2): a number by `d2l; l2i`;
-/// a string scanned as LuaJ's `LuaString.scannumber` scans it
-/// ([`scan_number`]), then the same, 0 when it is no numeral; anything
-/// else 0.
-///
-/// The play presentation program (S7-06d) has the same conversion in its
-/// numerics; the second of the two to land keeps one shared function.
+/// A Lua value as a number's value reads it: a number as the play
+/// program converts it ([`num::to_int`], truncated and saturated to
+/// `i32`); a string read as a numeral ([`crate::numeral::number`]), then
+/// the same, 0 when it is none; anything else 0.
 #[must_use]
 pub fn to_int(v: &Value) -> i32 {
     match v {
-        Value::Integer(i) => d2l_l2i(*i as f64),
-        Value::Number(n) => d2l_l2i(*n),
-        Value::String(s) => scan_number(&s.as_bytes()).map_or(0, d2l_l2i),
+        Value::Integer(i) => num::to_int(Val::Int(*i)),
+        Value::Number(n) => num::to_int(Val::Float(*n)),
+        Value::String(s) => {
+            crate::numeral::number(&s.as_bytes()).map_or(0, |d| num::to_int(Val::Float(d)))
+        }
         _ => 0,
     }
-}
-
-/// LuaJ 3.0.2's `LuaString.scannumber` over a string's bytes: spaces (only
-/// `' '`) trimmed at both ends; `0x`/`0X` and hexadecimal digits as a
-/// `long`; else decimal digits as a `long`, else at most the first 64
-/// bytes, all of `-+.eE0-9`, as Java's `parseDouble`. `None` where LuaJ
-/// gives NaN, or throws (a bare `0x`), which the source's accessor turns
-/// into 0.
-fn scan_number(b: &[u8]) -> Option<f64> {
-    let start = b.iter().position(|c| *c != b' ')?;
-    let end = b.iter().rposition(|c| *c != b' ')?.saturating_add(1);
-    let b = b.get(start..end)?;
-    if let [b'0', b'x' | b'X', rest @ ..] = b {
-        return scan_long(16, rest);
-    }
-    scan_long(10, b).or_else(|| scan_double(b))
-}
-
-/// LuaJ's `scanlong`: an optional `-`, then digits of `base`, accumulated
-/// in a wrapping `long`; NaN (`None`) at a non-digit or once the
-/// accumulator is negative.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "the source converts its long to a double"
-)]
-fn scan_long(base: i64, b: &[u8]) -> Option<f64> {
-    let (neg, digits) = match b {
-        [] => return None,
-        [b'-', rest @ ..] => (true, rest),
-        _ => (false, b),
-    };
-    let mut x: i64 = 0;
-    for c in digits {
-        let base_of = |b: u8| i64::from(*c) - i64::from(b);
-        let digit = if base <= 10 || c.is_ascii_digit() {
-            base_of(b'0')
-        } else if c.is_ascii_uppercase() {
-            base_of(b'A') + 10
-        } else {
-            base_of(b'a') + 10
-        };
-        if !(0..base).contains(&digit) {
-            return None;
-        }
-        x = x.wrapping_mul(base).wrapping_add(digit);
-        if x < 0 {
-            return None;
-        }
-    }
-    Some(if neg { -(x as f64) } else { x as f64 })
-}
-
-/// LuaJ's `scandouble`: the first 64 bytes at most, each one of
-/// `-+.eE0-9`, parsed as a double (Java's `parseDouble` and Rust's parse
-/// agree on that alphabet); `None` otherwise.
-fn scan_double(b: &[u8]) -> Option<f64> {
-    let b = b.get(..b.len().min(64))?;
-    if !b
-        .iter()
-        .all(|c| matches!(c, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'))
-    {
-        return None;
-    }
-    std::str::from_utf8(b).ok()?.parse().ok()
-}
-
-/// Java's `(int) (long) d`: NaN 0, the long saturating, then its low 32
-/// bits.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the source's l2i keeps the low 32 bits"
-)]
-fn d2l_l2i(d: f64) -> i32 {
-    // `as` from f64 to i64 saturates and maps NaN to 0, as Java's d2l.
-    (d as i64) as i32
 }
 
 /// A Lua value as the source's `toboolean` converts a draw: nil and false
@@ -989,15 +915,11 @@ impl ScreenRuntime {
                 CallStatus::Skipped
             } else {
                 self.calls = self.calls.saturating_add(1);
-                let r = std::panic::catch_unwind(AssertUnwindSafe(|| f.call::<Value>(())));
+                let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    f.call::<Value>(()).and_then(|v| self.convert(site.ty, &v))
+                }));
                 match r {
-                    Ok(Ok(v)) => {
-                        let out = match site.ty {
-                            OutTy::Bool => i32::from(to_bool(&v)),
-                            OutTy::Int => to_int(&v),
-                            // Only a play program gives a timer or a float.
-                            OutTy::Timer | OutTy::Float => 0,
-                        };
+                    Ok(Ok(out)) => {
                         write(fields, base, k, out);
                         CallStatus::Ok
                     }
@@ -1052,6 +974,29 @@ impl ScreenRuntime {
         } else {
             self.over_budget = 0;
         }
+    }
+
+    /// A call's result `v` as an output of type `ty` reads it. A string
+    /// read as a number's numeral is charged first, one instruction per
+    /// byte, to the frame's instruction budget, so a read past it fails as
+    /// the call would, with the frame's time checked first. The read is
+    /// a few linear passes (the grammar's scan, the standard library's
+    /// parse), under 1 ns a byte in a release build, where the average
+    /// instruction takes about 4 ns ([`limits::MAX_LUA_TIME`]); the
+    /// library's own numeral check meters each byte as Lua instructions.
+    fn convert(&self, ty: OutTy, v: &Value) -> mlua::Result<i32> {
+        Ok(match ty {
+            OutTy::Bool => i32::from(to_bool(v)),
+            OutTy::Int => {
+                if let Value::String(s) = v {
+                    let n = u64::try_from(s.as_bytes().len()).unwrap_or(u64::MAX);
+                    self.pass.ledger.instructions(&self._lua, n)?;
+                }
+                to_int(v)
+            }
+            // Only a play program gives a timer or a float.
+            OutTy::Timer | OutTy::Float => 0,
+        })
     }
 
     fn note(&self, note: RuntimeNote) {
@@ -1258,43 +1203,46 @@ mod tests {
         assert_ne!(c.id, id);
     }
 
-    /// C12: the source's `toint` (`d2l; l2i`) and `toboolean`.
+    /// C12: a number's value truncated toward zero and saturated to `i32`,
+    /// and `toboolean`.
     #[test]
-    fn results_convert_as_the_source_does() {
+    fn results_convert() {
         let lua = Lua::new();
         let s = |t: &str| Value::String(lua.create_string(t).unwrap());
         for (v, want) in [
             (Value::Number(4.5), 4),
             (Value::Number(-4.5), -4),
             (Value::Number(-0.0), 0),
-            (Value::Number(4_294_967_296.0), 0),
-            (Value::Number(2_147_483_648.0), i32::MIN),
-            (Value::Number(-2_147_483_649.0), i32::MAX),
-            (Value::Number(f64::INFINITY), -1),
-            (Value::Number(f64::NEG_INFINITY), 0),
+            (Value::Number(4_294_967_296.0), i32::MAX),
+            (Value::Number(2_147_483_648.0), i32::MAX),
+            (Value::Number(-2_147_483_649.0), i32::MIN),
+            (Value::Number(f64::INFINITY), i32::MAX),
+            (Value::Number(f64::NEG_INFINITY), i32::MIN),
             (Value::Number(f64::NAN), 0),
             (Value::Integer(7), 7),
-            (Value::Integer(1 << 32), 0),
+            (Value::Integer(1 << 32), i32::MAX),
+            (Value::Integer(-(1 << 40)), i32::MIN),
             (s("12"), 12),
             (s(" 2.5 "), 2),
             (s("x"), 0),
-            // Strings, as the pinned LuaJ jar converts them (`toint`, its
-            // exception taken as the source's accessor takes it: 0).
+            // Strings read as numerals: whitespace trimmed, a sign, a
+            // decimal or `0x` hexadecimal within `u64`; none 0.
             (s(" 12 "), 12),
-            (s("\t12\t"), 0),
-            (s("\t12"), 0),
-            (s("12\n"), 0),
+            (s("\t12\t"), 12),
+            (s("\t12"), 12),
+            (s("12\n"), 12),
             (s("0x10"), 16),
             (s("0X1f"), 31),
-            (s("0x80000000"), i32::MIN),
-            (s("0xffffffff"), -1),
-            (s("0x100000000"), 0),
+            (s("0x80000000"), i32::MAX),
+            (s("0xffffffff"), i32::MAX),
+            (s("0x100000000"), i32::MAX),
             (s("0x"), 0),
-            (s("-0x10"), 0),
-            (s("0x-10"), -16),
-            (s("0x7fffffffffffffff"), -1),
-            (s("0x8000000000000000"), 0),
-            (s("0x10000000000000001"), 1),
+            (s("-0x10"), -16),
+            (s("0x-10"), 0),
+            (s("0x["), 0),
+            (s("0x7fffffffffffffff"), i32::MAX),
+            (s("0x8000000000000000"), i32::MAX),
+            (s("0x10000000000000001"), 0),
             (s("0x1g"), 0),
             (s(" 0x10 "), 16),
             (s("-"), 0),
@@ -1310,22 +1258,22 @@ mod tests {
             (s("."), 0),
             (s("1e"), 0),
             (s("--5"), 0),
-            (s("2147483648"), i32::MIN),
-            (s("-2147483649"), i32::MAX),
-            (s("9223372036854775807"), -1),
-            (s("9223372036854775808"), -1),
-            (s("99999999999999999999"), -1),
-            (s("1e400"), -1),
-            (s("-1e400"), 0),
+            (s("2147483648"), i32::MAX),
+            (s("-2147483649"), i32::MIN),
+            (s("9223372036854775807"), i32::MAX),
+            (s("9223372036854775808"), i32::MAX),
+            (s("99999999999999999999"), i32::MAX),
+            (s("1e400"), i32::MAX),
+            (s("-1e400"), i32::MIN),
             (s("12abc"), 0),
             (s("1.5e3"), 1500),
             (s("3.9"), 3),
             (s("-3.9"), -3),
             (s("00012"), 12),
-            (s(&"1234567890".repeat(7)), -1),
+            (s(&"1234567890".repeat(7)), i32::MAX),
             (s(&format!("{}1234", "0".repeat(63))), 1234),
-            // 68 bytes, parsed as the first 64: "0.000…0".
-            (s(&format!("0.{}1e80", "0".repeat(62))), 0),
+            // 68 bytes, read whole: 1e17.
+            (s(&format!("0.{}1e80", "0".repeat(62))), i32::MAX),
             (s("1_0"), 0),
             (s("\u{661}\u{662}"), 0),
             (Value::Boolean(true), 0),

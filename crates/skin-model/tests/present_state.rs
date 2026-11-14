@@ -1,10 +1,9 @@
 //! The presentation program's timer callbacks and slots through
 //! `Skin::new` and the play frame build (design.md "beatoraja Lua Skins",
-//! the program and its state): a timer callback runs again only when its
-//! first run was on, each run's stores kept (`SkinObject.java:350-357`,
-//! `TimerProperty.java:8-10`, `SkinLuaAccessor.java:736-747` at `0.8.9`);
-//! its elapsed time is the source's two truncating divisions, capped at
-//! 4 h; and the verifier refuses what V5, V7 and V8 check.
+//! the program and its state): a timer callback runs once a frame, its one
+//! result both whether it is on and its start; its age is one
+//! subtraction in µs, capped at 4 h; and the verifier refuses what V5, V7
+//! and V8 check.
 
 mod lanes_support;
 mod play_support;
@@ -15,11 +14,11 @@ use bms_model::TimeUs;
 use present_support::{Builder, Cb, load, read};
 use skin_model::present::{
     Arith, Cmp, Conv, Domain, Insn, MAX_CALLBACK_OPS, MAX_SLOTS, OFF, OutTy, PresentError, SlotDef,
-    Val, elapsed_ms,
+    Val,
 };
 use skin_model::{
-    Ease, ElementDef, End, KeyDef, LoadError, MAX_ELAPSED_MS, MAX_KEY_US, MAX_SKIN_OPS, Place,
-    Skin, Source, TimerRef, Track, Ty, WidgetDefs, timer,
+    Ease, ElementDef, End, KeyDef, LoadError, MAX_KEY_US, MAX_SKIN_OPS, Place, Skin, Source,
+    TimerRef, Track, Ty, WidgetDefs, timer,
 };
 use widget_support::{drawn, element, harness};
 
@@ -124,34 +123,35 @@ fn count(h: &play_support::Harness) -> Val {
 }
 
 /// V5's cost for a slot-owning timer callback, written out by hand
-/// (design.md "beatoraja Lua Skins", V5): per invocation its 11
-/// instructions and the one slot it loads and stores (counted once), and
-/// a timer callback invoked twice; it is the skin's only work.
+/// (design.md "beatoraja Lua Skins", V5): its 11 instructions and the one
+/// slot it loads and stores (counted once), for its one run a frame; it is
+/// the skin's only work.
 #[test]
-fn a_timer_callback_is_charged_for_both_runs_and_its_slot() {
+fn a_timer_callback_is_charged_for_one_run_and_its_slot() {
     let mut b = Builder::default();
     counter(&mut b);
     let k = b.push(counted(0, Cmp::Lt, 0, OFF));
-    let want = 2 * (11 + 1);
+    let want = 11 + 1;
     let d = &b.0;
     let cb = d.callbacks[usize::from(k)];
     let span = &d.code[cb.start as usize..][..usize::from(cb.len)];
     assert_eq!(span.len(), 11);
     assert_eq!(
-        skin_model::present::callback_cost(span, &d.reads, cb.conv, None),
+        skin_model::present::callback_cost(span, &d.reads, None),
         want
     );
     let skin = timed(b, &[k], held).unwrap();
     assert_eq!(skin.ops().total(), want);
 }
 
-/// A timer callback off at its first run runs once and is off; on at its
-/// first and off at its second, it runs twice, both runs' stores kept,
-/// and its start is the off value's, whose elapsed time is capped; two
-/// objects sharing one closure run four times a frame while both are on.
+/// A timer callback runs once a frame and its one result is both whether
+/// it is on and its start: off, and it is off; on (it saw 0, so its start
+/// is 0) and its element ages from that start, the next frame off (it saw
+/// 1); two objects sharing one closure run twice a frame while both are
+/// on.
 #[test]
-fn a_timer_runs_again_only_when_on() {
-    // Off first: one run a frame, nothing drawn.
+fn a_timer_runs_once() {
+    // Off: one run a frame, nothing drawn.
     let mut b = Builder::default();
     counter(&mut b);
     let k = b.push(counted(0, Cmp::Lt, 0, OFF));
@@ -163,23 +163,22 @@ fn a_timer_runs_again_only_when_on() {
     h.frame(1_016, &[]);
     assert_eq!(count(&h), Val::Int(2));
 
-    // On at the first run (it saw 0), off at the second (it saw 1).
+    // On at its run (it saw 0): started at 0 µs on the state clock, 1.234 567
+    // s ago; off at the next frame's run (it saw 1).
     let mut b = Builder::default();
     counter(&mut b);
     let k = b.push(counted(0, Cmp::Eq, 0, OFF));
     let mut h = harness(timed(b, &[k], held).unwrap());
     h.state_us = 1_234_567;
     h.frame(1_000, &[]);
-    assert_eq!(count(&h), Val::Int(2));
-    let capped = 1_000_000 - i64::from(MAX_ELAPSED_MS) * 1_000;
-    assert_eq!(h.play.timer(program_timer(0)), Some(TimeUs(capped)));
+    assert_eq!(count(&h), Val::Int(1));
+    assert_eq!(h.play.timer(program_timer(0)), Some(TimeUs(-234_567)));
     assert_eq!(drawn(&h).len(), 1);
-    // Then off at the first run: one more.
     h.frame(1_016, &[]);
-    assert_eq!(count(&h), Val::Int(3));
+    assert_eq!(count(&h), Val::Int(2));
     assert_eq!(h.play.timer(program_timer(0)), None);
 
-    // Two objects of one closure, both on: four runs a frame.
+    // Two objects of one closure, both on: two runs a frame.
     let mut b = Builder::default();
     counter(&mut b);
     let k = b.push(counted(0, Cmp::Le, 0, Val::Int(0)));
@@ -187,7 +186,7 @@ fn a_timer_runs_again_only_when_on() {
     let mut h = harness(timed(b, &[k, j], held).unwrap());
     h.state_us = 5_000;
     h.frame(1_000, &[]);
-    assert_eq!(count(&h), Val::Int(4));
+    assert_eq!(count(&h), Val::Int(2));
     // Started at 0 µs on the state clock, 5 ms ago.
     for i in [0, 1] {
         assert_eq!(
@@ -198,22 +197,126 @@ fn a_timer_runs_again_only_when_on() {
     assert_eq!(drawn(&h).len(), 2);
 }
 
-/// The elapsed time is two truncating divisions: a start 1 µs before the
-/// clock in another millisecond is 1 ms ago; the off value as a start is
-/// `state_us / 1000 + 9223372036854775`.
+/// A timer callback whose run raises a Lua error, or reads a value that
+/// is unavailable, after it counts itself: it runs once that frame, its
+/// timer is off (the start of the frame before cleared) and its element
+/// not drawn; a timer `after` it does not run, while an unrelated
+/// callback does.
 #[test]
-fn the_elapsed_time_is_the_sources() {
-    assert_eq!(elapsed_ms(2_000, 1_999), 1);
-    assert_eq!(elapsed_ms(1_999, 1_000), 0);
-    assert_eq!(elapsed_ms(1_234_567, i64::MIN), 9_223_372_036_856_009);
-    assert_eq!(elapsed_ms(1_000, -999), 1);
+fn a_failing_timer_runs_once_and_is_off() {
+    let fails = [
+        // `nil + 1`.
+        Insn::Arith {
+            op: Arith::Add,
+            dst: 3,
+            a: 4,
+            b: 1,
+        },
+        // The combo, unavailable below 100.
+        Insn::Read { dst: 3, read: 0 },
+    ];
+    for fail in fails {
+        let mut b = Builder::default();
+        counter(&mut b);
+        // Counts itself; gives the start 0 when it saw 0, else fails.
+        let k = b.push(Cb::code(
+            vec![
+                Insn::LoadSlot { dst: 0, slot: 0 },
+                Insn::Const { dst: 1, k: 0 },
+                Insn::Arith {
+                    op: Arith::Add,
+                    dst: 1,
+                    a: 0,
+                    b: 1,
+                },
+                Insn::StoreSlot {
+                    slot: 0,
+                    src: 1,
+                    domain: 0,
+                },
+                Insn::Const { dst: 2, k: 1 },
+                Insn::Cmp {
+                    op: Cmp::Eq,
+                    dst: 2,
+                    a: 0,
+                    b: 2,
+                },
+                Insn::Test {
+                    cond: 2,
+                    when: true,
+                    to: 8,
+                },
+                fail,
+                Insn::Const { dst: 3, k: 1 },
+                Insn::Ret { src: 3 },
+            ],
+            vec![Val::Int(1), Val::Int(0)],
+            vec![read("combo", Ty::Int, Some("combo > 100"))],
+            Conv::Timer,
+        ));
+        let after = b.push(Cb::ret(Val::Int(0), Conv::Timer).after(k));
+        let other = b.push(Cb::ret(Val::Int(7), Conv::Int));
+        let mut h = harness(timed(b, &[k, after], held).unwrap());
+        h.state_us = 5_000;
+        h.frame(1_000, &[]);
+        assert_eq!(count(&h), Val::Int(1), "{fail:?}");
+        assert_eq!(h.play.timer(program_timer(0)), Some(TimeUs(995_000)));
+        assert_eq!(h.play.timer(program_timer(1)), Some(TimeUs(995_000)));
+        for t in [1_016, 1_032] {
+            h.frame(t, &[]);
+            assert_eq!(h.play.timer(program_timer(0)), None, "{fail:?}");
+            assert_eq!(h.play.timer(program_timer(1)), None, "{fail:?}");
+            assert!(drawn(&h).is_empty(), "{fail:?}");
+            let f = h.play.state().fields;
+            let at = present_support::slot(usize::from(other));
+            assert_eq!([f[at], f[at + 1]], [7, 1], "{fail:?}");
+        }
+        assert_eq!(count(&h), Val::Int(3), "{fail:?}");
+    }
 }
 
-/// A start after the clock is not drawn (the source's `starttime > time`);
-/// one at the clock is drawn at elapsed 0.
+/// The elapsed time is one subtraction in µs: a start 1 µs before the
+/// clock is 1 µs old, in another millisecond or not; a start far enough
+/// below the clock that the subtraction saturates (`i64::MIN + 1 024`, a
+/// float the program holds exactly, and not the off value) is capped at
+/// 4 h.
+#[test]
+fn the_elapsed_time_is_one_subtraction() {
+    for (state_us, start, installed) in [
+        (2_000, Val::Int(1_999), 1_000_000 - 1),
+        (2_001, Val::Int(2_000), 1_000_000 - 1),
+        (1_999, Val::Int(1_001), 1_000_000 - 998),
+        (
+            2_000,
+            Val::Float(-9_223_372_036_854_774_784.0),
+            1_000_000 - MAX_KEY_US,
+        ),
+    ] {
+        let mut b = Builder::default();
+        let k = b.push(Cb::ret(start, Conv::Timer));
+        let mut h = harness(timed(b, &[k], held).unwrap());
+        h.state_us = state_us;
+        h.frame(1_000, &[]);
+        assert_eq!(
+            h.play.timer(program_timer(0)),
+            Some(TimeUs(installed)),
+            "{start:?}"
+        );
+    }
+}
+
+/// A start after the clock is not drawn (the source's `starttime > time`),
+/// even within the same millisecond; one at the clock is drawn at elapsed
+/// 0.
 #[test]
 fn a_start_after_the_clock_is_not_drawn() {
-    for (start, shown) in [(3_000, false), (2_000, true), (1_999, true)] {
+    for (start, shown) in [
+        (3_000, false),
+        (2_500, false),
+        (2_001, false),
+        (2_000, true),
+        (1_999, true),
+    ] {
         let mut b = Builder::default();
         let k = b.push(Cb::ret(Val::Int(start), Conv::Timer));
         let mut h = harness(timed(b, &[k], held).unwrap());
@@ -351,7 +454,7 @@ fn a_timer_after_a_false_draw_does_not_run() {
         let mut h = harness(timed(b, &[k], held).unwrap());
         h.tally.combo = combo;
         h.frame(1_000, &[]);
-        assert_eq!(count(&h) == Val::Int(2), on, "{combo}");
+        assert_eq!(count(&h) == Val::Int(1), on, "{combo}");
         assert_eq!(h.play.timer(program_timer(0)).is_some(), on, "{combo}");
     }
 }
@@ -363,16 +466,16 @@ fn refused(r: Result<Skin, LoadError>) -> PresentError {
     }
 }
 
-/// V5 charges each slot a callback touches, and a timer callback for both
-/// its runs; V7 refuses too many slots, an initial value or a store
+/// V5 charges each slot a callback touches, and a timer callback for its
+/// one run; V7 refuses too many slots, an initial value or a store
 /// outside its slot's domain and an unknown slot; V8 refuses an element
 /// timer naming no timer callback and an expression reading a timer's
 /// output.
 #[test]
 fn the_verifier_refuses_slots_and_timers() {
     let plain = |b: Builder| load(Some(b.0), Vec::new(), Vec::new(), WidgetDefs::default());
-    // V5: `n` callbacks of 256 instructions fit; one slot more each, or a
-    // second run each, does not.
+    // V5: `n` callbacks of 256 instructions fit, timer callbacks too; one
+    // slot more each does not.
     let n = MAX_SKIN_OPS / MAX_CALLBACK_OPS;
     let long = |touch: bool, conv: Conv| {
         let mut code = vec![Insn::Const { dst: 0, k: 0 }; MAX_CALLBACK_OPS - 1];
@@ -390,7 +493,7 @@ fn the_verifier_refuses_slots_and_timers() {
     };
     assert!(plain(long(false, Conv::Int)).is_ok());
     assert_eq!(refused(plain(long(true, Conv::Int))), PresentError::Cost);
-    assert_eq!(refused(plain(long(false, Conv::Timer))), PresentError::Cost);
+    assert!(plain(long(false, Conv::Timer)).is_ok());
 
     // V7.
     let mut b = Builder::default();

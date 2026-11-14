@@ -5,7 +5,7 @@
 
 use crate::inputs::FrameInputs;
 use crate::isolation;
-use crate::observed::{Cause, Observed, Outcome, Point, Raw};
+use crate::observed::{Cause, Observed, Outcome, Point};
 use crate::report::Report;
 use crate::script::Script;
 use crate::tests::{dst, folder, options, run_with};
@@ -92,7 +92,7 @@ fn rounds_of(inputs: &[FrameInputs]) -> Vec<Vec<usize>> {
     out
 }
 
-/// The reference's converted `toint` of every `value` invocation on frame
+/// The reference's converted value of every `value` invocation on frame
 /// `i`, in schedule order.
 fn values_on(obs: &Observed, i: usize) -> Vec<i32> {
     obs.frames[i]
@@ -101,22 +101,11 @@ fn values_on(obs: &Observed, i: usize) -> Vec<i32> {
         .filter_map(|p| match p {
             Point::Ran {
                 key,
-                call: 1,
                 outcome: Outcome::Value(r),
-            } if key.field == "value" => Some(toint(*r)),
+            } if key.field == "value" => Some(crate::production::compare::toint(*r)),
             _ => None,
         })
         .collect()
-}
-
-/// LuaJ's `toint()`, as the comparator converts.
-fn toint(r: Raw) -> i32 {
-    #[expect(clippy::cast_possible_truncation, reason = "Java's d2l then l2i")]
-    match r {
-        Raw::Int(n) => (n as f64) as i64 as i32,
-        Raw::Float(f) => f as i64 as i32,
-        _ => 0,
-    }
 }
 
 fn lowered(r: &Report, field: &str) -> usize {

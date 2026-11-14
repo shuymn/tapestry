@@ -469,21 +469,21 @@ impl Definition {
     }
 
     /// A `float` field (`JsonValue.asFloat`, Lua's `tofloat`): a number
-    /// token's double, or a Lua number, rounded to `f32` as Java's `(float)`
-    /// rounds it; a JSON string as Java's `Float.parseFloat` reads it
-    /// ([`crate::java_float::parse_float`]); a Lua
-    /// string as LuaJ converts it ([`crate::lua::num_scan::todouble`]). The
-    /// value may be non-finite; the caller decides.
+    /// token's double, or a Lua number, rounded to the nearest `f32`; a
+    /// string read as a numeral and rounded the same way, a JSON one as a
+    /// decimal numeral ([`crate::numeral::decimal`], none refused), a Lua one
+    /// as a decimal or hexadecimal numeral ([`crate::numeral::number`], none
+    /// 0). The value may be non-finite; the caller decides.
     pub(crate) fn float(&mut self, id: u32, field: &'static str) -> Result<f32, ImportError> {
-        // Java's `(float)` of a `double` or a `long`: round to nearest.
+        // A `double` or a `long` to the nearest `f32`.
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "Java's (float) narrows a double by rounding, as `as` does"
+            reason = "a double narrows to the nearest `f32`, as `as` does"
         )]
         let narrow = |v: f64| v as f32;
         #[expect(
             clippy::cast_precision_loss,
-            reason = "Java's (float) of a long rounds, as `as` does"
+            reason = "a long rounds to the nearest `f32`, as `as` does"
         )]
         let long = |v: i64| v as f32;
         match self.arena.scalar(id) {
@@ -506,13 +506,11 @@ impl Definition {
                 } else {
                     raw
                 };
-                // A Lua string is LuaJ's `tofloat()`: its `todouble()`
-                // (an integer scan that wraps, NaN read as 0) narrowed.
                 if lua {
-                    return Ok(narrow(crate::lua::num_scan::todouble(s.as_bytes())));
+                    return Ok(crate::numeral::number(s.as_bytes()).map_or(0.0, narrow));
                 }
-                // A JSON string is Java's `Float.parseFloat`.
-                crate::java_float::parse_float(s)
+                crate::numeral::decimal(s.as_bytes())
+                    .map(narrow)
                     .ok_or_else(|| self.type_error(id, field, "a number"))
             }
             Scalar::Callable => Err(self.callable_error(id, field)),

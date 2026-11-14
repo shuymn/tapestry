@@ -432,16 +432,22 @@ fn a_null_colour_is_noted() {
     assert_eq!(top(&q, 100.0 + 25.5, y), Some(rgba(0xff00_00ff)));
 }
 
-/// C31: a Lua string `alpha` is LuaJ's `tofloat()`: `"18446744073709551616"`
-/// scans as a wrapping `long`, 0, so the average stays at 0, its line on
-/// the centre's column 150 (drawn after the centre); `" 0.5 "` is 0.5, the
-/// average `0.5 · 40 = 20`, its line at 130. The same JSON string is
-/// `Float.parseFloat`, about 1.8e19: the step holds the average at +2^53
-/// ms, the line at the judge width's early edge, column 0.
+/// C31: a Lua string `alpha` is read as a numeral, none 0:
+/// `"18446744073709551616"` is about 1.8e19, so the step holds the average
+/// at +2^53 ms and the line at the judge width's early edge, column 0, as
+/// the same JSON string does; `" 0.5 "` and `"\t0.5"` are 0.5, the average
+/// `0.5 · 40 = 20`, its line at 130; `"0x["` is none, 0, so the average
+/// stays at 0, its line on the centre's column 150 (drawn after the
+/// centre).
 #[test]
-fn a_lua_alpha_string_is_luaj_s_float() {
+fn a_lua_alpha_string_is_a_numeral() {
     let dst = "{ id = \"he\", dst = { { x = 100, y = 800, w = 301, h = 60 } } }";
-    for (alpha, column) in [("18446744073709551616", 150.5), (" 0.5 ", 130.5)] {
+    for (alpha, column) in [
+        ("18446744073709551616", 0.5),
+        (" 0.5 ", 130.5),
+        ("\\t0.5", 130.5),
+        ("0x[", 150.5),
+    ] {
         let (_d, skin, report) = lua(
             &format!("skin.hiterrorvisualizer = {{ {{ id = \"he\", alpha = \"{alpha}\" }} }}"),
             dst,
@@ -462,14 +468,15 @@ fn a_lua_alpha_string_is_luaj_s_float() {
     assert_eq!(top(&q, 100.0 + 0.5, middle(&q)), Some(rgba(0xff00_00ff)));
 }
 
-/// C31: a JSON string `alpha` is Java's `Float.parseFloat`: `0.5f`,
-/// `0x1p-1` and ` 0.5D ` are all 0.5, so the average after +40 ms is
-/// `0.5 · 40 = 20`, its line at `150 − 20 = 130`; `0.5ff` is no float,
-/// and the import refuses the field as the source's skin fails.
+/// C31: a JSON string `alpha` is a decimal numeral: `0.5` and ` 0.5 ` are
+/// 0.5, so the average after +40 ms is `0.5 · 40 = 20`, its line at
+/// `150 − 20 = 130`; a suffix, a hexadecimal float, `NaN`, `Infinity`, a
+/// control character and `0.5ff` are no numeral, and the import refuses
+/// the field, as it refuses any other string that is no number.
 #[test]
-fn a_json_alpha_string_is_java_s_float() {
+fn a_json_alpha_string_is_a_decimal_numeral() {
     let dst = r#"{"id": "he", "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#;
-    for alpha in ["0.5f", "0x1p-1", " 0.5D "] {
+    for alpha in ["0.5", " 0.5 "] {
         let (_d, skin, report) = json(
             &format!(r#""hiterrorvisualizer": [{{"id": "he", "alpha": "{alpha}"}}],"#),
             dst,
@@ -482,20 +489,30 @@ fn a_json_alpha_string_is_java_s_float() {
             "{alpha}"
         );
     }
-    let l = import_sized(
-        [1_920, 1_080],
-        &format!(
-            r#""hiterrorvisualizer": [{{"id": "he", "alpha": "0.5ff"}}], "destination": [{dst}]"#
-        ),
-        &[],
-    );
-    assert!(
-        matches!(
-            l.err(),
-            skin_beatoraja::ImportError::Type { field: "alpha", .. }
-        ),
-        "0.5ff"
-    );
+    for alpha in [
+        "0.5f",
+        " 0.5D ",
+        "0x1p-1",
+        "NaN",
+        "Infinity",
+        "\\u0001 0.5",
+        "0.5ff",
+    ] {
+        let l = import_sized(
+            [1_920, 1_080],
+            &format!(
+                r#""hiterrorvisualizer": [{{"id": "he", "alpha": "{alpha}"}}], "destination": [{dst}]"#
+            ),
+            &[],
+        );
+        assert!(
+            matches!(
+                l.err(),
+                skin_beatoraja::ImportError::Type { field: "alpha", .. }
+            ),
+            "{alpha}"
+        );
+    }
 }
 
 /// A BPM graph's `filter` is noted and ignored: the source draws a scaled

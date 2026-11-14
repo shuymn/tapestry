@@ -8,10 +8,10 @@
 //! pair, each a value and its two decimals), the lane cover's green
 //! number and duration (two destinations each) and the adjusted rate. The
 //! product of the duration and the tempo can pass 2^53 over the reads'
-//! ranges, where the source computes it as a double; each value is the
-//! source's, hand-computed with its interpreter's rules (int products
-//! rounded once into doubles, `/` and `math.floor` of doubles, `toint`'s
-//! low 32 bits).
+//! ranges, where the source computes it as a double; each value is
+//! hand-computed with the source interpreter's rules (int products
+//! rounded once into doubles, `/` and `math.floor` of doubles), each
+//! converted as a number's value is: truncated and saturated to `i32`.
 
 mod common;
 
@@ -177,7 +177,7 @@ fn outputs(i: &LuaImported, r: Reads) -> Vec<[i32; 2]> {
         .collect()
 }
 
-/// A case: its name, its reads, and the source's `toint` of the relative
+/// A case: its name, its reads, and the converted value of the relative
 /// value and decimals, the absolute value and decimals, the green number,
 /// the duration and the adjusted rate.
 type Case = (&'static str, Reads, [i32; 7]);
@@ -194,7 +194,7 @@ const fn reads(fix: u8, on: bool, duration: u128, current: u32, max: u32, main: 
     }
 }
 
-/// The cases, each value hand-computed with the source's rules.
+/// The cases, each value hand-computed with the program's rules.
 const CASES: [Case; 13] = [
     // The hidden cover and the tempo change off: the duration whatever
     // the fix, `625 · 0.6` 375 (shown `375.00`); the rate nil, 0.
@@ -245,28 +245,29 @@ const CASES: [Case; 13] = [
         reads(2, true, 500, 120, 150, 180),
         [240, 24_000, 400, 40_000, 240, 400, 80],
     ),
-    // A maximum of 0: the duration itself; the rate ⌊+inf⌋, `toint` −1.
+    // A maximum of 0: the duration itself; the rate ⌊+inf⌋, saturated to
+    // `i32::MAX`, which no number draws.
     (
         "fix MAX, maximum 0",
         reads(2, true, 312, 150, 0, 180),
-        [187, 18_720, 312, 31_200, 187, 312, -1],
+        [187, 18_720, 312, 31_200, 187, 312, i32::MAX],
     ),
-    // 0 / 0 is NaN, `toint` 0.
+    // 0 / 0 is NaN, converted 0.
     (
         "fix MAX, 0 over 0",
         reads(2, true, 312, 0, 0, 180),
         [187, 18_720, 312, 31_200, 187, 312, 0],
     ),
     // The product past 2^53, a multiple of 8, exact: 2 147 483 646; the
-    // decimals' floors past `i32`, their low 32 bits.
+    // decimals' floors past `i32`, saturated.
     (
         "past 2^53, exact",
         reads(2, true, 2_147_483_646, 21_474_836, 21_474_836, 180),
         [
             1_288_490_187,
-            -120,
+            i32::MAX,
             2_147_483_646,
-            -200,
+            i32::MAX,
             1_288_490_187,
             2_147_483_646,
             100,
@@ -279,39 +280,38 @@ const CASES: [Case; 13] = [
         reads(2, true, 2_147_483_645, 21_474_836, 21_474_836, 180),
         [
             1_288_490_186,
-            -180,
+            i32::MAX,
             2_147_483_644,
-            -300,
+            i32::MAX,
             1_288_490_186,
             2_147_483_644,
             100,
         ],
     ),
-    // MAIN 1: the rounded product itself, its low 32 bits −64 424 512
-    // (exactly, −64 424 508); the absolute decimals `i32::MIN`, which no
-    // number draws.
+    // MAIN 1: the rounded product itself, 46 116 859 089 057 216, and every
+    // value of it past `i32`, saturated; the rate clamped at 100.
     (
         "past 2^53, MAIN 1",
         reads(3, true, 2_147_483_645, 21_474_836, 21_474_836, 1),
         [
-            -897_648_168,
-            429_496_320,
-            -64_424_512,
-            i32::MIN,
-            -897_648_168,
-            -64_424_512,
+            i32::MAX,
+            i32::MAX,
+            i32::MAX,
+            i32::MAX,
+            i32::MAX,
+            i32::MAX,
             100,
         ],
     ),
 ];
 
 /// Under either hi-speed type every value compiles into the program, its
-/// destinations retained, and gives the source's value: the relative or
-/// the absolute pair, then the green number and duration twice and the
-/// adjusted rate, each available but `i32::MIN`, which the source draws
-/// as nothing.
+/// destinations retained, and gives the hand-computed value: the relative
+/// or the absolute pair, then the green number and duration twice and the
+/// adjusted rate, each available but at either end of `i32`, which no
+/// number draws.
 #[test]
-fn the_hispeed_values_are_the_source_s() {
+fn the_hispeed_values_are_computed_in_doubles() {
     let d = folder();
     for (op, pair) in [(905, 0), (906, 2)] {
         let i = import(&d, op);
@@ -322,8 +322,8 @@ fn the_hispeed_values_are_the_source_s() {
         for (name, r, v) in CASES {
             let want: Vec<[i32; 2]> = [v[pair], v[pair + 1], v[4], v[5], v[4], v[5], v[6]]
                 .into_iter()
-                // `i32::MIN` is no value a number draws: unavailable.
-                .map(|x| [x, i32::from(x != i32::MIN)])
+                // Either end of `i32` is no value a number draws: unavailable.
+                .map(|x| [x, i32::from(x != i32::MIN && x != i32::MAX)])
                 .collect();
             assert_eq!(outputs(&i, r), want, "{op}: {name}");
         }

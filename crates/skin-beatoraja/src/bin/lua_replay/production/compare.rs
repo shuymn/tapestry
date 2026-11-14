@@ -10,16 +10,46 @@ use skin_beatoraja::lua::replay::{LoweredRecord, Occurrence};
 use skin_beatoraja::lua::survey::Became;
 use skin_model::present::trace::{Converted, Event, Skip};
 use skin_model::present::{Fail, Val};
-use skin_model::{MAX_ELAPSED_MS, PLAY, Program, Scope, State, Ty, compile};
+use skin_model::{MAX_KEY_US, PLAY, Program, Scope, State, Ty, compile};
 
 use super::{FrameKind, ProductionRun, last_records};
 use crate::isolation::{Entry, same_file};
 use crate::observed::{Cause, Key, Observed, Outcome, Point, Raw, RefFrame, TimerOut, intern};
 use crate::report::{Finding, Report, Stopped};
 
+/// A number's value as tapestry converts it (design.md "beatoraja Lua
+/// Skins", Built): the number truncated toward zero and saturated to
+/// `i32` (NaN 0); nil and booleans 0. Restated here, not called, so the
+/// comparator checks production's conversion against the rule.
+pub(crate) fn toint(r: Raw) -> i32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "`as` truncates toward zero and saturates"
+    )]
+    match r {
+        Raw::Int(n) => {
+            i32::try_from(n.clamp(i64::from(i32::MIN), i64::from(i32::MAX))).unwrap_or(0)
+        }
+        Raw::Float(f) => f as i32,
+        _ => 0,
+    }
+}
+
+/// What an intended difference from the source is counted under: a
+/// number's value whose LuaJ `toint()` differs from [`toint`].
+pub const TOINT_PAST_I32: &str = "toint past i32";
+
+/// Whether the source's `toint()` of the reference's outcome `o` for
+/// consumer `field` differs from tapestry's [`toint`]: an intended
+/// difference (design.md "Differences from the source", number values
+/// past `i32`), counted, never a finding.
+fn toint_differs(field: &str, o: Outcome) -> bool {
+    matches!(o, Outcome::Value(r) if field == "value" && luaj_toint(r) != toint(r))
+}
+
 /// LuaJ's `toint()` of a value (`SkinLuaAccessor.java:640-651`): the
 /// double saturated to a `long` (NaN 0), then its low 32 bits; nil and
-/// booleans 0.
+/// booleans 0. Only counts intended differences ([`toint_differs`]).
 fn luaj_toint(r: Raw) -> i32 {
     #[expect(clippy::cast_possible_truncation, reason = "Java's d2l then l2i")]
     match r {
@@ -90,7 +120,7 @@ fn converted(field: &str, o: Outcome) -> Option<Converted> {
         ("timer", Outcome::Error) => Converted::Long(Some(i64::MIN)),
         ("timer", Outcome::Unavailable) => Converted::Long(None),
         ("value", Outcome::Value(r)) => {
-            let n = luaj_toint(r);
+            let n = toint(r);
             Converted::Int(n, n != i32::MIN && n != i32::MAX)
         }
         ("value", Outcome::Error) => Converted::Int(0, true),
@@ -181,7 +211,7 @@ fn compile_lowered(field: &str, l: &LoweredRecord) -> Result<LoweredExpr, String
 /// The first difference between a lowered occurrence's expression on
 /// `fields` and `timers` and the reference's invocation: the class (a
 /// false guard is unavailable), then the converted value (`toboolean` for
-/// a `draw` or an `op`, `toint` for a `value`, by the reference
+/// a `draw` or an `op`, [`toint`] for a `value`, by the reference
 /// occurrence's own consumer `field`, whatever the record says). An
 /// invocation that could not complete or raised has no expression
 /// counterpart.
@@ -210,7 +240,7 @@ fn lowered_differ(
             let (got, want) = if field != "value" {
                 (i32::from(v != 0), i32::from(luaj_bool(r)))
             } else {
-                (v, luaj_toint(r))
+                (v, toint(r))
             };
             (got != want).then(|| format!("lowered: production {got}, reference {want} ({r:?})"))
         }
@@ -271,14 +301,14 @@ impl<'a> Cx<'a> {
     }
 }
 
-/// A timer callback's trace: on, its start, its elapsed ms and the start
+/// A timer callback's trace: on, its start, its elapsed µs and the start
 /// installed.
 type TimerTrace = (bool, Option<i64>, Option<i64>, Option<bms_model::TimeUs>);
 
 /// One invocation's raw result and its conversion.
 type Invocation = (Result<Val, Fail>, Converted);
 
-/// A program callback's call-1 event.
+/// A program callback's event: its invocation or its skip.
 #[derive(Clone, Copy)]
 enum First {
     Ran(Invocation),
@@ -290,10 +320,9 @@ enum First {
 #[derive(Default)]
 struct Prod {
     first: BTreeMap<u16, First>,
-    second: BTreeMap<u16, Invocation>,
     timer: BTreeMap<u16, TimerTrace>,
     /// Every invocation, in order.
-    order: Vec<(u16, u8)>,
+    order: Vec<u16>,
     sampled: BTreeMap<usize, Vec<i64>>,
 }
 
@@ -310,18 +339,12 @@ struct Schema<'a> {
     slotted: &'a [bool],
 }
 
-/// Whether a timer invocation's conversion is on: given, and not the off
-/// value.
-fn on(c: Converted) -> bool {
-    matches!(c, Converted::Long(Some(v)) if v != i64::MIN)
-}
-
 /// Production's events of one frame, checked against the program's
 /// schema before anything is compared (s7-06e-1-r1-tables.md, A2): every
-/// callback within the program; one call-1 event (an invocation or a
-/// skip) each; a call 2 exactly when a timer's call 1 was on, tagged 2;
-/// a timer event exactly when a timer callback ran; a program slot
-/// sampled only with an installed start.
+/// callback within the program; one event (an invocation or a skip)
+/// each, a timer callback invoked once like any other; a timer event
+/// exactly when a timer callback ran; a program slot sampled only with an
+/// installed start.
 fn production_shapes(events: &[Event], s: &Schema<'_>) -> (Prod, Vec<Misshapen>) {
     let mut p = Prod::default();
     let mut bad: Vec<Misshapen> = Vec::new();
@@ -341,44 +364,29 @@ fn production_shapes(events: &[Event], s: &Schema<'_>) -> (Prod, Vec<Misshapen>)
             continue;
         }
         match *e {
-            Event::Ran {
-                k,
-                call,
-                result,
-                conv,
-            } => {
-                p.order.push((k, call));
-                match call {
-                    1 => {
-                        if p.first.insert(k, First::Ran((result, conv))).is_some() {
-                            kbad(k, format!("callback {k}: a second call-1 event"));
-                        }
-                    }
-                    2 if (s.is_timer)(k) => {
-                        if p.second.insert(k, (result, conv)).is_some() {
-                            kbad(k, format!("callback {k}: a second call-2 event"));
-                        }
-                    }
-                    _ => kbad(k, format!("callback {k}: call {call}")),
+            Event::Ran { k, result, conv } => {
+                p.order.push(k);
+                if p.first.insert(k, First::Ran((result, conv))).is_some() {
+                    kbad(k, format!("callback {k}: a second event"));
                 }
             }
             Event::Skipped { k, why } => {
                 if p.first.insert(k, First::Skipped(why)).is_some() {
-                    kbad(k, format!("callback {k}: skipped and another call-1 event"));
+                    kbad(k, format!("callback {k}: a second event"));
                 }
             }
             Event::Timer {
                 k,
                 on,
                 start,
-                elapsed_ms,
+                elapsed_us,
                 installed,
             } => {
                 if !(s.is_timer)(k) {
                     kbad(k, format!("callback {k}: a timer event of a non-timer"));
                 } else if p
                     .timer
-                    .insert(k, (on, start, elapsed_ms, installed))
+                    .insert(k, (on, start, elapsed_us, installed))
                     .is_some()
                 {
                     kbad(k, format!("timer {k}: a second timer event"));
@@ -390,17 +398,7 @@ fn production_shapes(events: &[Event], s: &Schema<'_>) -> (Prod, Vec<Misshapen>)
     for k in 0..s.callbacks {
         let first = p.first.get(&k).copied();
         if first.is_none() {
-            kbad(k, format!("callback {k}: no call-1 event"));
-        }
-        let ran_on = matches!(first, Some(First::Ran((_, c))) if on(c));
-        if (s.is_timer)(k) && ran_on != p.second.contains_key(&k) {
-            kbad(
-                k,
-                format!(
-                    "timer {k}: call 1 on {ran_on}, call 2 {}",
-                    p.second.contains_key(&k)
-                ),
-            );
+            kbad(k, format!("callback {k}: no event"));
         }
         let ran = matches!(first, Some(First::Ran(_)));
         if (s.is_timer)(k) && ran != p.timer.contains_key(&k) {
@@ -435,25 +433,14 @@ fn production_shapes(events: &[Event], s: &Schema<'_>) -> (Prod, Vec<Misshapen>)
 struct Occ {
     key: Key,
     first: Point,
-    second: Option<Outcome>,
     summary: Option<TimerOut>,
-}
-
-/// Whether the source's timer invocation was on: its `tolong()` not the
-/// off value.
-fn ref_on(o: Outcome) -> bool {
-    match o {
-        Outcome::Value(r) => luaj_long(r) != i64::MIN,
-        _ => false,
-    }
 }
 
 /// The source's frame as one catalogue of the installed objects'
 /// expected occurrences (s7-06e-1-r1-tables.md, A2): the object ranges an
 /// ordered partition of the points, one range per installed object; in
-/// each, exactly its consumers in schedule order, each with one first
-/// point, a timer's call 2 right after it exactly when its call 1 was on
-/// and tagged 2; one summary per invoked timer and none elsewhere. An
+/// each, exactly its consumers in schedule order, each with one point, a
+/// timer's too; one summary per invoked timer and none elsewhere. An
 /// object whose points break this is reported and left out.
 fn catalogue(rf: &RefFrame, installed: &[Vec<Key>]) -> (Vec<Vec<Occ>>, Vec<Misshapen>) {
     let mut bad: Vec<Misshapen> = Vec::new();
@@ -478,42 +465,20 @@ fn catalogue(rf: &RefFrame, installed: &[Vec<Key>]) -> (Vec<Vec<Occ>>, Vec<Missh
         let mut broken = None;
         for &key in keys {
             let first = match pts.get(at) {
-                Some(
-                    p @ (Point::Ran {
-                        key: k, call: 1, ..
-                    }
-                    | Point::NotReached { key: k, .. }),
-                ) if *k == key => *p,
+                Some(p @ (Point::Ran { key: k, .. } | Point::NotReached { key: k, .. }))
+                    if *k == key =>
+                {
+                    *p
+                }
                 _ => {
-                    broken = Some((key, "an expected occurrence has no first point"));
+                    broken = Some((key, "an expected occurrence has no point"));
                     break;
                 }
             };
             at += 1;
-            let mut second = None;
-            if key.field == "timer"
-                && let Point::Ran { outcome, .. } = first
-                && ref_on(outcome)
-            {
-                match pts.get(at) {
-                    Some(Point::Ran {
-                        key: k,
-                        call: 2,
-                        outcome,
-                    }) if *k == key => {
-                        second = Some(*outcome);
-                        at += 1;
-                    }
-                    _ => {
-                        broken = Some((key, "a timer on at call 1 with no call 2"));
-                        break;
-                    }
-                }
-            }
             occs.push(Occ {
                 key,
                 first,
-                second,
                 summary: None,
             });
         }
@@ -747,39 +712,32 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 let bucket = format!("outside ({label})");
                 for occ in cat.iter().flatten() {
                     let key = occ.key;
-                    let calls: Vec<Outcome> = match occ.first {
-                        Point::Ran { outcome, .. } => {
-                            std::iter::once(outcome).chain(occ.second).collect()
-                        }
-                        Point::NotReached { .. } => Vec::new(),
+                    rep.points += 1;
+                    let Point::Ran { outcome, .. } = occ.first else {
+                        continue;
                     };
-                    rep.points += calls.len().max(1);
-                    for outcome in calls {
-                        let api = match outcome {
-                            Outcome::Unanswered(a) => Some(a),
-                            Outcome::Budget => Some("budget"),
-                            _ => None,
-                        };
-                        let Some(api) = api else {
-                            *rep.buckets.entry(bucket.clone()).or_default() += 1;
-                            continue;
-                        };
-                        match cx.compiled(&key) {
-                            Some(k)
-                                if run.slotted.get(usize::from(k)).copied().unwrap_or(false) =>
-                            {
-                                find(
-                                    key,
-                                    i,
-                                    format!("a slotted root stopped on an outside frame ({api})"),
-                                );
-                            }
-                            _ => {
-                                stopped
-                                    .entry(("outside", key.callable))
-                                    .or_insert((api, 0, key))
-                                    .1 += 1;
-                            }
+                    let api = match outcome {
+                        Outcome::Unanswered(a) => Some(a),
+                        Outcome::Budget => Some("budget"),
+                        _ => None,
+                    };
+                    let Some(api) = api else {
+                        *rep.buckets.entry(bucket.clone()).or_default() += 1;
+                        continue;
+                    };
+                    match cx.compiled(&key) {
+                        Some(k) if run.slotted.get(usize::from(k)).copied().unwrap_or(false) => {
+                            find(
+                                key,
+                                i,
+                                format!("a slotted root stopped on an outside frame ({api})"),
+                            );
+                        }
+                        _ => {
+                            stopped
+                                .entry(("outside", key.callable))
+                                .or_insert((api, 0, key))
+                                .1 += 1;
                         }
                     }
                 }
@@ -804,9 +762,9 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
             find(key.unwrap_or_else(|| k.map_or(UNKNOWN, key_k)), i, what);
         }
         rep.production_runs += p.order.len();
-        let mut used: BTreeSet<(u16, u8)> = BTreeSet::new();
+        let mut used: BTreeSet<u16> = BTreeSet::new();
         let mut seen: BTreeSet<u16> = BTreeSet::new();
-        let mut order: Vec<(u16, u8)> = Vec::new();
+        let mut order: Vec<u16> = Vec::new();
         let mut outs: BTreeMap<u16, (i32, i32)> = BTreeMap::new();
         // Each installed object's occurrences, once, in schedule order;
         // `blocked`: the last compiled consumer before did not allow what
@@ -816,35 +774,29 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
             for occ in occs {
                 let key = occ.key;
                 let k = cx.compiled(&key);
-                let calls = match occ.first {
-                    Point::Ran { outcome, .. } => {
-                        let mut v = vec![(1_u8, outcome)];
-                        v.extend(occ.second.map(|o| (2, o)));
-                        v
-                    }
-                    Point::NotReached { .. } => Vec::new(),
+                let call = match occ.first {
+                    Point::Ran { outcome, .. } => Some(outcome),
+                    Point::NotReached { .. } => None,
                 };
-                // Points: an invocation each, or one not reached.
-                rep.points += calls.len().max(1);
+                // Points: the invocation, or the one not reached.
+                rep.points += 1;
                 let lowered_rec = cx
                     .rec(&key)
                     .filter(|o| k.is_none() && o.disposition == "lowered");
                 let lowered_here = lowered_rec.is_some();
-                for &(_, outcome) in &calls {
-                    let api = match outcome {
-                        Outcome::Unanswered(a) => Some(a),
-                        Outcome::Budget => Some("budget"),
-                        _ => None,
-                    };
-                    if let Some(api) = api
-                        && k.is_none()
-                        && !lowered_here
-                    {
-                        stopped
-                            .entry(("play", key.callable))
-                            .or_insert((api, 0, key))
-                            .1 += 1;
-                    }
+                let api = match call {
+                    Some(Outcome::Unanswered(a)) => Some(a),
+                    Some(Outcome::Budget) => Some("budget"),
+                    _ => None,
+                };
+                if let Some(api) = api
+                    && k.is_none()
+                    && !lowered_here
+                {
+                    stopped
+                        .entry(("play", key.callable))
+                        .or_insert((api, 0, key))
+                        .1 += 1;
                 }
                 // A lowered occurrence: its expression on this frame's
                 // production state against the closure (s7-06e-3-design.md
@@ -856,8 +808,11 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                             .ok_or_else(|| "a lowered occurrence with no expression".to_owned())
                             .and_then(|l| compile_lowered(key.field, l))
                     });
-                    for &(_, outcome) in &calls {
+                    if let Some(outcome) = call {
                         rep.matched += 1;
+                        if toint_differs(key.field, outcome) {
+                            *rep.intended.entry(TOINT_PAST_I32).or_default() += 1;
+                        }
                         let e = match expr {
                             Ok(e) => e,
                             Err(why) => {
@@ -876,16 +831,16 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                     continue;
                 }
                 let Some(k) = k else {
-                    if !calls.is_empty() {
+                    if call.is_some() {
                         match cx.attribute(&key) {
-                            Some(b) => *rep.buckets.entry(b).or_default() += calls.len(),
+                            Some(b) => *rep.buckets.entry(b).or_default() += 1,
                             None => find(key, i, "no production record of this occurrence".into()),
                         }
                     }
                     continue;
                 };
                 seen.insert(k);
-                rep.matched += calls.len().max(1);
+                rep.matched += 1;
                 if let Point::NotReached { why, .. } = occ.first {
                     let was_blocked = blocked;
                     if key.field != "timer" {
@@ -894,8 +849,7 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                     outs.insert(k, (0, 0));
                     match (p.first.get(&k), allowed(why, was_blocked)) {
                         (Some(First::Ran(_)), _) => {
-                            used.insert((k, 1));
-                            used.insert((k, 2));
+                            used.insert(k);
                             find(
                                 key,
                                 i,
@@ -917,52 +871,41 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                     }
                     continue;
                 }
-                for (call, outcome) in calls {
-                    order.push((k, call));
-                    if call == 1 && key.field != "timer" {
+                if let Some(outcome) = call {
+                    order.push(k);
+                    if key.field != "timer" {
                         blocked = !allows(key.field, outcome);
                         outs.insert(k, expected_out(key.field, outcome));
                     }
-                    if let Outcome::Unanswered(api) = outcome {
-                        find(key, i, format!("reference could not complete ({api})"));
-                        used.insert((k, call));
-                        continue;
-                    }
-                    if outcome == Outcome::Budget {
-                        find(key, i, "reference could not complete (budget)".into());
-                        used.insert((k, call));
-                        continue;
-                    }
-                    let prod = if call == 1 {
-                        match p.first.get(&k) {
-                            Some(First::Ran(inv)) => Some(*inv),
-                            Some(First::Skipped(s)) => {
-                                find(
-                                    key,
-                                    i,
-                                    format!("ran in the source, skipped in production ({s:?})"),
-                                );
-                                continue;
-                            }
-                            None => None,
+                    match (outcome, p.first.get(&k)) {
+                        (Outcome::Unanswered(api), _) => {
+                            find(key, i, format!("reference could not complete ({api})"));
+                            used.insert(k);
                         }
-                    } else {
-                        p.second.get(&k).copied()
-                    };
-                    let Some(prod) = prod else {
-                        find(
+                        (Outcome::Budget, _) => {
+                            find(key, i, "reference could not complete (budget)".into());
+                            used.insert(k);
+                        }
+                        (_, Some(First::Skipped(s))) => find(
                             key,
                             i,
-                            format!("ran in the source, call {call} not traced in production"),
-                        );
-                        continue;
-                    };
-                    used.insert((k, call));
-                    match differ(key.field, prod, outcome) {
-                        None => rep.agreed += 1,
-                        Some(d) => {
-                            let hint = luaj_hint(obs, key.callable);
-                            find(key, i, format!("{d}{hint}"));
+                            format!("ran in the source, skipped in production ({s:?})"),
+                        ),
+                        (_, None) => {
+                            find(key, i, "ran in the source, not traced in production".into());
+                        }
+                        (_, Some(First::Ran(prod))) => {
+                            used.insert(k);
+                            if toint_differs(key.field, outcome) {
+                                *rep.intended.entry(TOINT_PAST_I32).or_default() += 1;
+                            }
+                            match differ(key.field, *prod, outcome) {
+                                None => rep.agreed += 1,
+                                Some(d) => {
+                                    let hint = luaj_hint(obs, key.callable);
+                                    find(key, i, format!("{d}{hint}"));
+                                }
+                            }
                         }
                     }
                 }
@@ -971,14 +914,11 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 let Some(t) = occ.summary else {
                     continue;
                 };
-                let elapsed = t
-                    .start
-                    .map(|s| (pf.state_us / 1_000).saturating_sub(s / 1_000));
+                let elapsed = t.start.map(|s| pf.state_us.saturating_sub(s));
                 let installed_ok = t.on && elapsed.is_some_and(|e| e >= 0);
-                let cap = i64::from(MAX_ELAPSED_MS);
-                let installed = elapsed.filter(|_| installed_ok).map(|e| {
-                    bms_model::TimeUs(pf.now.0.saturating_sub(e.min(cap).saturating_mul(1_000)))
-                });
+                let installed = elapsed
+                    .filter(|_| installed_ok)
+                    .map(|e| bms_model::TimeUs(pf.now.0.saturating_sub(e.min(MAX_KEY_US))));
                 outs.insert(k, (i32::from(t.on), 1));
                 let want = (
                     t.on,
@@ -1010,7 +950,7 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                         "the selected source's fact is unknown: sampling undecided".into(),
                     ),
                     (Some(e), Some(true)) => {
-                        let age = e.min(cap).saturating_mul(1_000);
+                        let age = e.min(MAX_KEY_US);
                         if ages.is_empty() {
                             find(key, i, "no sampled age where the source draws".into());
                         } else if ages.iter().any(|&a| a != age) {
@@ -1039,15 +979,15 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 );
             }
         }
-        // The full order of invocations: both calls.
-        let prod_order: Vec<(u16, u8)> = p
+        // The full order of invocations.
+        let prod_order: Vec<u16> = p
             .order
             .iter()
             .copied()
-            .filter(|(k, _)| seen.contains(k))
+            .filter(|k| seen.contains(k))
             .collect();
         if prod_order != order {
-            let key = order.first().map_or(UNKNOWN, |&(k, _)| key_k(k));
+            let key = order.first().map_or(UNKNOWN, |&k| key_k(k));
             find(
                 key,
                 i,
@@ -1055,12 +995,12 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
             );
         }
         // Production invocations with no source occurrence.
-        for &(k, call) in &p.order {
-            if !used.contains(&(k, call)) && !listed_k.contains(&k) {
+        for &k in &p.order {
+            if !used.contains(&k) && !listed_k.contains(&k) {
                 find(
                     key_k(k),
                     i,
-                    format!("production invocation {k} call {call} with no source point"),
+                    format!("production invocation {k} with no source point"),
                 );
             }
         }
@@ -1212,6 +1152,80 @@ mod tests {
         }
     }
 
+    /// Where the source's `toint()` differs from the rule, counting that
+    /// difference lets no wrong production conversion pass: on the frames
+    /// whose value is past `i32`, a changed converted value, a changed
+    /// valid flag and a changed raw value (still past `i32`) are each
+    /// found.
+    #[test]
+    fn a_wrong_conversion_past_i32_is_found() {
+        use skin_model::present::{Fail, Val};
+
+        use super::TOINT_PAST_I32;
+        use crate::tests::PAST_I32;
+
+        let (run, obs) = pieces(PAST_I32);
+        // Production hides 2e10 (the source's low 32 bits: −1 474 836 480).
+        assert!(
+            run.frames.iter().flat_map(|f| &f.events).any(|e| matches!(
+                e,
+                Event::Ran {
+                    result: Ok(Val::Float(v)),
+                    conv: Converted::Int(i32::MAX, false),
+                    ..
+                } if *v == 2e10
+            )),
+            "no value of 2e10 hidden"
+        );
+        let r = compare(&run, &obs, &[]);
+        assert!(r.passes(), "{}", r.text(0, true, true));
+        assert!(r.intended.get(TOINT_PAST_I32).is_some_and(|&n| n > 0));
+        let found = |f: &dyn Fn(&mut Result<Val, Fail>, &mut Converted)| {
+            let (mut run, obs) = pieces(PAST_I32);
+            let mut tampered = 0;
+            for fr in &mut run.frames {
+                for e in &mut fr.events {
+                    if let Event::Ran { result, conv, .. } = e
+                        && *conv == Converted::Int(i32::MAX, false)
+                    {
+                        f(result, conv);
+                        tampered += 1;
+                    }
+                }
+            }
+            assert!(tampered > 0);
+            let r = compare(&run, &obs, &[]);
+            assert!(!r.findings.is_empty(), "{}", r.text(0, true, true));
+        };
+        found(&|_, c| *c = Converted::Int(i32::MIN, false));
+        found(&|_, c| *c = Converted::Int(i32::MAX, true));
+        found(&|r, _| {
+            if let Ok(Val::Float(v)) = r {
+                *v *= 2.0;
+            }
+        });
+    }
+
+    /// R13 in production's trace: the frame 1 µs after a latch set at a
+    /// state clock of …999 µs is sampled 1 µs old, where two truncating
+    /// divisions would say 1 000.
+    #[test]
+    fn a_sub_ms_start_is_sampled_at_1_us() {
+        let (body, script) = crate::tests::sub_ms();
+        let (run, _) = crate::tests::pieces_over(&body, script);
+        let ages: Vec<i64> = run
+            .frames
+            .iter()
+            .flat_map(|f| &f.events)
+            .filter_map(|e| match e {
+                Event::Sampled { age_us, .. } => Some(*age_us),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(ages.first(), Some(&0), "{ages:?}");
+        assert_eq!(ages.get(1), Some(&1), "{ages:?}");
+    }
+
     /// The untouched run agrees; each alteration of production's side is
     /// found.
     #[test]
@@ -1265,20 +1279,13 @@ mod tests {
         // An extra invocation, and a missing one.
         found(&|run| {
             if let Some(f) = run.frames.first_mut()
-                && let Some(Event::Ran {
-                    k, result, conv, ..
-                }) = f
+                && let Some(e) = f
                     .events
                     .iter()
                     .find(|e| matches!(e, Event::Ran { .. }))
                     .copied()
             {
-                f.events.push(Event::Ran {
-                    k,
-                    call: 2,
-                    result,
-                    conv,
-                });
+                f.events.push(e);
             }
         });
         found(&|run| {
@@ -1320,7 +1327,7 @@ mod tests {
     }
 
     /// Completeness (s7-06e-1-r1-tables.md, A): a duplicated invocation,
-    /// a deleted or changed skip, reordered second calls, a changed output
+    /// a deleted or changed skip, reordered invocations, a changed output
     /// cell, a missing frame and a missing source point are each found.
     #[test]
     fn incomplete_or_extra_events_are_found() {
@@ -1366,13 +1373,13 @@ mod tests {
                 }
             }
         });
-        found("second calls reordered", &|run, _| {
+        found("invocations reordered", &|run, _| {
             for f in &mut run.frames {
                 let at: Vec<usize> = f
                     .events
                     .iter()
                     .enumerate()
-                    .filter(|(_, e)| matches!(e, Event::Ran { call: 2, .. }))
+                    .filter(|(_, e)| matches!(e, Event::Ran { .. }))
                     .map(|(i, _)| i)
                     .collect();
                 if let [a, b, ..] = at[..] {
@@ -1406,7 +1413,7 @@ mod tests {
                         k,
                         on: false,
                         start: None,
-                        elapsed_ms: None,
+                        elapsed_us: None,
                         installed: None,
                     });
                 }
@@ -1469,13 +1476,6 @@ mod tests {
         let fine = [
             Event::Ran {
                 k: 0,
-                call: 1,
-                result: Ok(skin_model::present::Val::Int(5)),
-                conv: Converted::Long(Some(5)),
-            },
-            Event::Ran {
-                k: 0,
-                call: 2,
                 result: Ok(skin_model::present::Val::Int(5)),
                 conv: Converted::Long(Some(5)),
             },
@@ -1483,27 +1483,13 @@ mod tests {
                 k: 0,
                 on: true,
                 start: Some(5),
-                elapsed_ms: Some(0),
+                elapsed_us: Some(0),
                 installed: Some(bms_model::TimeUs(0)),
             },
             Event::Sampled { slot: 7, age_us: 0 },
         ];
         let (_, bad) = production_shapes(&fine, &schema);
         assert!(bad.is_empty(), "{bad:?}");
-    }
-
-    /// Removes the points `drop` selects from a source frame, keeping its
-    /// object ranges a partition of what is left.
-    fn drop_points(f: &mut crate::observed::RefFrame, drop: &dyn Fn(&Point) -> bool) {
-        let mut points = Vec::new();
-        let mut objects = Vec::new();
-        for r in &f.objects {
-            let start = points.len();
-            points.extend(f.points[r.clone()].iter().copied().filter(|p| !drop(p)));
-            objects.push(start..points.len());
-        }
-        f.points = points;
-        f.objects = objects;
     }
 
     /// Inserts `pt` after the point at `at` in a source frame, its object
@@ -1520,18 +1506,16 @@ mod tests {
         }
     }
 
-    fn is_off_timer(p: &Point) -> bool {
-        matches!(p, Point::Ran { key, call: 1, outcome }
-            if key.field == "timer" && !super::ref_on(*outcome))
+    fn is_timer(p: &Point) -> bool {
+        matches!(p, Point::Ran { key, .. } if key.field == "timer")
     }
 
     /// A2 (r3): each direction's catalogue is checked by itself. Every
     /// mutation of the source's frame and every mutation of production's
-    /// events is found, including those made on both sides alike.
+    /// events is found, a timer invoked twice on either side included.
     #[test]
     #[expect(clippy::too_many_lines, reason = "one case per mutation")]
     fn catalogue_mutations_are_found() {
-        type Tamper = dyn Fn(&mut super::ProductionRun, &mut crate::observed::Observed);
         let found =
             |what: &str,
              needle: &str,
@@ -1548,15 +1532,8 @@ mod tests {
         let (run, obs) = pieces(TAMPERED);
         assert!(compare(&run, &obs, &[]).passes());
         assert!(
-            obs.frames.iter().any(|f| f.points.iter().any(is_off_timer)),
-            "the fixture has an off timer"
-        );
-        assert!(
-            obs.frames.iter().any(|f| f
-                .points
-                .iter()
-                .any(|p| matches!(p, Point::Ran { call: 2, .. }))),
-            "the fixture has a second call"
+            obs.frames.iter().any(|f| f.points.iter().any(is_timer)),
+            "the fixture runs a timer"
         );
         // Source: an installed writer omitted, its points and its range.
         found("omitted writer", "do not partition", &|_, obs| {
@@ -1578,88 +1555,36 @@ mod tests {
                 }
             }
         });
-        // Source and production: a second call tagged 0 or 3.
-        for tag in [0_u8, 3] {
-            found("source tag", "with no call 2", &|_, obs| {
-                for f in &mut obs.frames {
-                    for p in &mut f.points {
-                        if let Point::Ran { call: c @ 2, .. } = p {
-                            *c = tag;
-                        }
-                    }
-                }
-            });
-            found("production tag", &format!(": call {tag}"), &|run, _| {
-                for f in &mut run.frames {
-                    for e in &mut f.events {
-                        if let Event::Ran { call: c @ 2, .. } = e {
-                            *c = tag;
-                        }
-                    }
-                }
-            });
-        }
-        // Source and production: a second call after an off call 1.
-        found("source second after off", "do not expect", &|_, obs| {
+        // Source and production: a timer invoked twice.
+        found("source: a timer point twice", "do not expect", &|_, obs| {
             for f in &mut obs.frames {
-                if let Some(at) = f.points.iter().position(is_off_timer)
-                    && let Point::Ran { key, outcome, .. } = f.points[at]
-                {
-                    insert_point(
-                        f,
-                        at,
-                        Point::Ran {
-                            key,
-                            call: 2,
-                            outcome,
-                        },
-                    );
+                if let Some(at) = f.points.iter().position(is_timer) {
+                    let pt = f.points[at];
+                    insert_point(f, at, pt);
                 }
             }
         });
         found(
-            "production second after off",
-            "call 1 on false, call 2 true",
+            "production: a timer invoked twice",
+            "a second event",
             &|run, _| {
                 for f in &mut run.frames {
-                    let off = f.events.iter().find_map(|e| match *e {
-                        Event::Ran {
-                            k,
-                            call: 1,
-                            result,
-                            conv: conv @ Converted::Long(Some(i64::MIN)),
-                        } => Some(Event::Ran {
-                            k,
-                            call: 2,
-                            result,
-                            conv,
-                        }),
-                        _ => None,
-                    });
-                    f.events.extend(off);
+                    let timer = f
+                        .events
+                        .iter()
+                        .find(|e| {
+                            matches!(
+                                e,
+                                Event::Ran {
+                                    conv: Converted::Long(_),
+                                    ..
+                                }
+                            )
+                        })
+                        .copied();
+                    f.events.extend(timer);
                 }
             },
-        );
-        // Both sides: the second call missing alike; each side's
-        // catalogue finds it.
-        let both: &Tamper = &|run, obs| {
-            for f in &mut obs.frames {
-                drop_points(f, &|p| matches!(p, Point::Ran { call: 2, .. }));
-            }
-            for f in &mut run.frames {
-                f.events
-                    .retain(|e| !matches!(e, Event::Ran { call: 2, .. }));
-            }
-        };
-        found(
-            "second missing on both sides (source)",
-            "with no call 2",
-            both,
-        );
-        found(
-            "second missing on both sides (production)",
-            "call 1 on true, call 2 false",
-            both,
         );
         // Source and production: a summary of a non-timer.
         found(
@@ -1692,7 +1617,7 @@ mod tests {
                         k,
                         on: false,
                         start: None,
-                        elapsed_ms: None,
+                        elapsed_us: None,
                         installed: None,
                     });
                 }

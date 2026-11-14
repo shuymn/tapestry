@@ -323,11 +323,19 @@ impl Ledger {
 
     /// The instruction hook: one step of [`INSTRUCTION_STEP`] charged.
     pub(crate) fn step(&self, lua: &Lua) -> mlua::Result<()> {
+        self.instructions(lua, u64::from(INSTRUCTION_STEP))?;
+        self.memory(lua.used_memory());
+        Ok(())
+    }
+
+    /// `n` instructions charged before the work they stand for, against
+    /// [`MAX_INSTRUCTIONS`] or, in a runtime frame,
+    /// [`RUNTIME_INSTRUCTIONS`](super::limits::RUNTIME_INSTRUCTIONS): an
+    /// instruction step, or a runtime result's numeral read one per byte
+    /// ([`super::runtime`]).
+    pub(crate) fn instructions(&self, lua: &Lua, n: u64) -> mlua::Result<()> {
         self.check(lua)?;
-        let next = self
-            .counts()
-            .instructions
-            .saturating_add(u64::from(INSTRUCTION_STEP));
+        let next = self.counts().instructions.saturating_add(n);
         let cap = self.frame.get().map_or(MAX_INSTRUCTIONS, |f| {
             f.start
                 .instructions
@@ -337,7 +345,6 @@ impl Ledger {
             return Err(self.fail_lua(lua, LuaWhy::Limit(LuaLimit::Instructions)));
         }
         self.update(|c| c.instructions = next);
-        self.memory(lua.used_memory());
         Ok(())
     }
 

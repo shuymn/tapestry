@@ -4909,9 +4909,10 @@ fn programs_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
 /// reads at `i32::MAX` multiplied past ±2^53 and past `i64`, promoted to
 /// the double; that product divided; the floor of 2^60 kept a float;
 /// negation and `abs` of ±2^53; and the state clock read as the source's
-/// double, past 2^53 µs and negative, each converted by `to_int`. Every
-/// frame's outputs are the numerics' own values, so each path ran; with a
-/// positive control.
+/// double, past 2^53 µs and negative, each converted by `to_int` (the
+/// results past `i32` saturating to its ends, the clock's brought back
+/// within it). Every frame's outputs are the numerics' own values, so each
+/// path ran; with a positive control.
 fn promoted_numerics_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     use present_support::{Builder, Cb, read, slot};
     use skin_model::present::num::{arith, clock, math, neg, to_int};
@@ -5024,6 +5025,30 @@ fn promoted_numerics_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     want.push(Box::new(|us| {
         to_int(arith(Arith::Add, clock(us), Val::Int(3)).unwrap())
     }));
+    // The state clock plus 3, less 2^53: within `i32` again past 2^53 µs.
+    b.push(Cb::code(
+        vec![
+            Insn::StateUs { dst: 0 },
+            Insn::Const { dst: 1, k: 0 },
+            ar(Arith::Add, 0, 0, 1),
+            Insn::Const { dst: 1, k: 1 },
+            ar(Arith::Sub, 0, 0, 1),
+            Insn::Ret { src: 0 },
+        ],
+        vec![Val::Int(3), two_53],
+        vec![],
+        Conv::Int,
+    ));
+    want.push(Box::new(move |us| {
+        to_int(
+            arith(
+                Arith::Sub,
+                arith(Arith::Add, clock(us), Val::Int(3)).unwrap(),
+                two_53,
+            )
+            .unwrap(),
+        )
+    }));
     let sig = b.signature();
     let n = sig.len();
     let elements = (0..n)
@@ -5106,8 +5131,8 @@ fn promoted_numerics_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         }
     }
     // The clock past 2^53 µs and negative ran: -1 + 3 is 2, and 2^53 + 1
-    // µs reads as 2^53, plus 3 rounding to 2^53 + 4.
-    assert_eq!(outs[n - 1], [2, 1]);
+    // µs reads as 2^53, plus 3 rounding to 2^53 + 4, less 2^53 4.
+    assert_eq!(outs[n - 2], [2, 1]);
     assert_eq!(outs[2 * n + n - 1], [4, 1]);
     // The positive control: an allocation on this thread is counted.
     TRACK.with(|t| t.set(true));
@@ -5299,7 +5324,7 @@ fn app_readouts_do_not_allocate(
 
 /// A latch on a slot, the timer of two objects of one closure, built
 /// frame after frame as its condition comes and goes, through a rearm:
-/// slots, timer callbacks' two runs and their timers allocate nothing;
+/// slots, timer callbacks' runs and their timers allocate nothing;
 /// with a positive control.
 fn slots_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     use present_support::{Builder, Cb, read};

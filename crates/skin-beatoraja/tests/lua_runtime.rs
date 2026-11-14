@@ -811,6 +811,121 @@ fn a_sentinel_number_draws_nothing_on_selection() {
     assert_eq!(digits.trim_start_matches('0'), "42", "{digits}");
 }
 
+/// P12: a runtime value past `i32`, the integer `1 << 32` or the float
+/// `2^32`, converts to `i32::MAX`, truncated and saturated, which no
+/// number draws: its number shows no digit and its draws are skipped,
+/// where the low 32 bits (0) would draw a 0 and run them.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_value_past_i32_saturates_and_draws_nothing() {
+    untimed();
+    for value in [
+        "function() return ms.number(77) * 0 + (1 << 32) end",
+        "function() return ms.number(77) * 0 + 2^32 end",
+    ] {
+        let (_d, mut i) = import_in(&entry_with(
+            "local calls = 0",
+            &[value, "function() return calls + 5 end"],
+            "function() calls = calls + 1 return true end",
+            "function() return true end",
+        ));
+        let n = runtime(&mut i).outputs();
+        assert_eq!(n, 3, "{value}");
+        let mut f = fields(
+            n,
+            &[
+                ("selected.plays", 3),
+                ("selected.played", 1),
+                ("cursor.chart", 1),
+            ],
+        );
+        runtime(&mut i).frame(&mut f, &[]);
+        assert_eq!(runtime(&mut i).status()[1], CallStatus::Skipped, "{value}");
+        assert_eq!(outputs(&f), [i32::MAX, 0, 5], "{value}");
+        let mut s = common::selection::Sel::new(i.imported.skin);
+        s.sel
+            .outputs_mut()
+            .copy_from_slice(&f[SELECTION.fields.len()..]);
+        // Only the second number's 5: no digit of the first.
+        assert_eq!(s.digits(0), "5", "{value}");
+    }
+}
+
+/// P6: a runtime value that is a string is read as a numeral, then
+/// converted as a number: whitespace trimmed (a tab too), a sign before
+/// `0x`; a string that is none, `0x[`, is 0.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_runtime_string_value_is_read_as_a_numeral() {
+    untimed();
+    let (_d, mut i) = import_in(&entry(
+        "",
+        &[
+            "function() if ms.number(77) >= 0 then return \"\\t12\" end end",
+            "function() if ms.number(77) >= 0 then return \"-0x10\" end end",
+            "function() if ms.number(77) >= 0 then return \"0x[\" end end",
+        ],
+        "function() return true end",
+    ));
+    let n = runtime(&mut i).outputs();
+    assert_eq!(n, 3);
+    let mut f = fields(
+        n,
+        &[
+            ("selected.plays", 3),
+            ("selected.played", 1),
+            ("cursor.chart", 1),
+        ],
+    );
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(outputs(&f), [12, -16, 0]);
+}
+
+/// A value's string is charged one instruction per byte before it is read
+/// as a numeral (design.md "Threat Model", T09): `"1."` and 8 MiB of
+/// zeros, built once at load, is past the frame's instructions, so its
+/// call gives its constant with the budget's status, unread, and after
+/// three such frames the runtime stops. With no time budget in the way,
+/// only the charge refuses it.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_long_numeral_string_is_charged_before_it_is_read() {
+    untimed();
+    let (_d, mut i) = import_in(&entry(
+        "local zeros = '0' for _ = 1, 23 do zeros = zeros .. zeros end local s = '1.' .. zeros zeros = nil",
+        &["function() return s end"],
+        "nil",
+    ));
+    let n = runtime(&mut i).outputs();
+    assert_eq!(n, 1);
+    let mut f = fields(n, &[]);
+    for frame in 0..3 {
+        assert_eq!(runtime(&mut i).stopped(), None, "{frame}");
+        runtime(&mut i).frame(&mut f, &[]);
+        assert_eq!(outputs(&f), [0], "{frame}");
+        assert_eq!(runtime(&mut i).status(), [CallStatus::Budget], "{frame}");
+    }
+    assert_eq!(runtime(&mut i).stopped(), Some(Stopped::Budget));
+}
+
+/// A numeral string within the frame's instructions is read whole: 65 536
+/// leading zeros and `123`.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_numeral_string_within_the_budget_is_read_whole() {
+    untimed();
+    let (_d, mut i) = import_in(&entry(
+        "local z = '0' for _ = 1, 16 do z = z .. z end local s = z .. '123'",
+        &["function() return s end"],
+        "nil",
+    ));
+    let n = runtime(&mut i).outputs();
+    let mut f = fields(n, &[]);
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(runtime(&mut i).status()[0], CallStatus::Ok);
+    assert_eq!(outputs(&f), [123]);
+}
+
 /// `text` with two image sets of one `dot` appended, chosen by `a` and
 /// `b`, each drawn by its own draw callback.
 #[cfg(feature = "dev-tools")]

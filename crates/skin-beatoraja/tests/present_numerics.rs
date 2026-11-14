@@ -5,11 +5,12 @@
 //!   comparisons, unary minus, `math.floor`, `ceil`, `abs`, `max`, `min`)
 //!   and the consumers' `toint()` of a number's value and `tofloat()` of a
 //!   slider's (numbers as the value the source builds from them, a numeric
-//!   −0 its integer 0; strings folded at import as luaj's `scannumber`)
+//!   −0 its integer 0; strings read at import as numerals, none 0)
 //!   are checked against `luaj_numerics.txt`, the source's results over a
 //!   grid of integers and floats (zeros of both signs, infinities, NaN,
 //!   values near 2^31 and 2^53), generated from the source's pinned
-//!   interpreter by `xtask/luaj/luaj_table.sh`.
+//!   interpreter by `xtask/luaj/luaj_table.sh`, except the rows listed in
+//!   [`INTENDED`], where tapestry's rule differs on purpose.
 //! - Where the Lua 5.4 VM the sandbox runs agrees with it (`+ - *` of
 //!   integers within ±2^53 whose result stays within it, or with a float,
 //!   `//`, which the source does not have, and the `math` functions by
@@ -22,7 +23,7 @@
 //! integer outside ±2^53, even where its double matches.
 
 use mlua::{Function, Lua, Value};
-use skin_beatoraja::lua::num_scan::todouble;
+use skin_beatoraja::numeral;
 use skin_model::present::num::{arith, compare, extreme, math, neg, to_float, to_int};
 use skin_model::present::{Arith, Cmp, Fail, MathFn, Val};
 
@@ -73,68 +74,195 @@ fn wide_int(r: Result<Val, Fail>) -> bool {
     matches!(r, Ok(Val::Int(n)) if n.unsigned_abs() > TWO_53.unsigned_abs())
 }
 
-#[test]
-fn every_operation_matches_the_source_interpreter() {
-    let table = include_str!("luaj_numerics.txt");
+/// The rows where tapestry's rule differs from the source's on purpose,
+/// each with tapestry's value (design.md "beatoraja Lua Skins",
+/// "Differences from the source": number values past `i32`, numeric
+/// strings). The table
+/// stays as the source's interpreter wrote it; each listed row must exist
+/// and differ from it, so a stale entry fails.
+const INTENDED: &[(&str, &str)] = &[
+    // A number's value truncated and saturated to `i32`, where the source
+    // keeps the low 32 bits of its saturated `long`.
+    ("toint i:9007199254740991", "i:2147483647"),
+    ("toint i:-9007199254740991", "i:-2147483648"),
+    ("toint f:7ff0000000000000", "i:2147483647"),
+    ("toint f:fff0000000000000", "i:-2147483648"),
+    ("toint f:4340000000000000", "i:2147483647"),
+    ("toint f:c340000000000000", "i:-2147483648"),
+    ("toint f:41f0000000000000", "i:2147483647"),
+    ("toint f:41e0000000000000", "i:2147483647"),
+    ("toint f:7e37e43c8800759c", "i:2147483647"),
+    ("toint f:43647ae13f851eb8", "i:2147483647"),
+    ("toint f:43cffffff3400000", "i:2147483647"),
+    ("toint f:435b4e81aa3d70a4", "i:2147483647"),
+    // A string read as a plain numeral: Lua's whitespace trimmed, the sign
+    // before `0x`, hexadecimal digits alone, no wrap past 64 bits, the
+    // whole fraction, a −0 kept; where the source trims only spaces, reads
+    // the sign after `0x` and `[` as a hexadecimal digit, wraps its `long`
+    // and keeps the first 64 bytes.
+    ("tofloats x0931", "g:3f800000"),
+    ("tofloats x30782d31", "g:0"),
+    ("tofloats x2d307831", "g:bf800000"),
+    ("tofloats x30785b", "g:0"),
+    ("tofloats x2d30", "g:80000000"),
+    (
+        "tofloats x3138343436373434303733373039353531363136",
+        "g:5f800000",
+    ),
+    (
+        "tofloats x312e303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303078",
+        "g:0",
+    ),
+];
+
+/// A table result: a value (`i:`, `f:`, a boolean, nil) or an error, or a
+/// slider's `f32` (`g:<bits>`, or `caught`, the consumer's `0f`).
+#[derive(Clone, Copy, Debug)]
+enum Res {
+    Val(Result<Val, Fail>),
+    Float(f32),
+}
+
+impl Res {
+    fn read(s: &str) -> Self {
+        if s == "caught" {
+            return Self::Float(0.0);
+        }
+        if let Some(g) = s.strip_prefix("g:") {
+            return Self::Float(f32::from_bits(u32::from_str_radix(g, 16).unwrap()));
+        }
+        Self::Val(parse(s).ok_or(Fail::Error))
+    }
+
+    /// Whether `self` is `other`: [`same`] for values, an error for an
+    /// error, a float's bits (any NaN equal to any NaN).
+    fn agrees(self, other: Self) -> bool {
+        match (self, other) {
+            (Self::Val(Ok(a)), Self::Val(Ok(b))) => same(a, b),
+            (Self::Val(Err(Fail::Error)), Self::Val(Err(Fail::Error))) => true,
+            (Self::Float(a), Self::Float(b)) => {
+                (a.is_nan() && b.is_nan()) || a.to_bits() == b.to_bits()
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Checks every row of `table` against tapestry's operations, and each
+/// row `intended` lists against its listed value instead, which must
+/// differ from the table's; every listed row must be in the table. Gives
+/// the rows checked.
+fn check_table(table: &str, intended: &[(&str, &str)]) -> usize {
+    let mut seen = vec![false; intended.len()];
     let mut checked = 0;
     for line in table.lines() {
         let (lhs, rhs) = line.split_once(" = ").unwrap();
-        let words: Vec<&str> = lhs.split(' ').collect();
-        if words[0].starts_with("tofloat") {
-            check_tofloat(&words, rhs);
-            checked += 1;
-            continue;
+        let ours = result(lhs);
+        if let Res::Val(r) = ours {
+            assert!(!wide_int(r), "{lhs}: {r:?} is an integer past ±2^53");
         }
-        let theirs = parse(rhs);
-        let ours: Result<Val, Fail> = match words[..] {
-            [op, a, b] => {
-                let (a, b) = (parse(a).unwrap(), parse(b).unwrap());
-                let arith_op = |o| arith(o, a, b);
-                match op {
-                    "add" => arith_op(Arith::Add),
-                    "sub" => arith_op(Arith::Sub),
-                    "mul" => arith_op(Arith::Mul),
-                    "div" => arith_op(Arith::Div),
-                    "mod" => arith_op(Arith::Mod),
-                    "lt" => compare(Cmp::Lt, a, b).map(Val::Bool),
-                    "le" => compare(Cmp::Le, a, b).map(Val::Bool),
-                    "eq" => compare(Cmp::Eq, a, b).map(Val::Bool),
-                    "max" => extreme(true, a, b),
-                    "min" => extreme(false, a, b),
-                    other => panic!("{other}"),
-                }
+        let theirs = Res::read(rhs);
+        match intended.iter().position(|(row, _)| *row == lhs) {
+            Some(i) => {
+                assert!(!seen[i], "{lhs}: twice in the table");
+                seen[i] = true;
+                let want = Res::read(intended[i].1);
+                assert!(ours.agrees(want), "{lhs}: {ours:?} vs the listed {want:?}");
+                assert!(
+                    !ours.agrees(theirs),
+                    "{lhs}: listed as intended but agrees with the table's {theirs:?}"
+                );
             }
-            [op, a] => {
-                let a = parse(a).unwrap();
-                match op {
-                    "neg" => neg(a),
-                    "floor" => math(MathFn::Floor, a),
-                    "ceil" => math(MathFn::Ceil, a),
-                    "abs" => math(MathFn::Abs, a),
-                    "toint" => Ok(Val::Int(i64::from(to_int(a)))),
-                    other => panic!("{other}"),
-                }
-            }
-            _ => panic!("{line}"),
-        };
-        assert!(!wide_int(ours), "{lhs}: {ours:?} is an integer past ±2^53");
-        match (ours, theirs) {
-            (Ok(o), Some(t)) => assert!(same(o, t), "{lhs}: {o:?} vs the source's {t:?}"),
-            (Err(Fail::Error), None) => {}
-            (o, t) => panic!("{lhs}: {o:?} vs the source's {t:?}"),
+            None => assert!(
+                ours.agrees(theirs),
+                "{lhs}: {ours:?} vs the source's {theirs:?}"
+            ),
         }
         checked += 1;
     }
+    for ((row, _), seen) in intended.iter().zip(seen) {
+        assert!(seen, "{row}: listed as intended but not in the table");
+    }
+    checked
+}
+
+/// Tapestry's result for the table row `lhs`.
+fn result(lhs: &str) -> Res {
+    let words: Vec<&str> = lhs.split(' ').collect();
+    if words[0].starts_with("tofloat") {
+        return Res::Float(tofloat(&words));
+    }
+    Res::Val(match words[..] {
+        [op, a, b] => {
+            let (a, b) = (parse(a).unwrap(), parse(b).unwrap());
+            let arith_op = |o| arith(o, a, b);
+            match op {
+                "add" => arith_op(Arith::Add),
+                "sub" => arith_op(Arith::Sub),
+                "mul" => arith_op(Arith::Mul),
+                "div" => arith_op(Arith::Div),
+                "mod" => arith_op(Arith::Mod),
+                "lt" => compare(Cmp::Lt, a, b).map(Val::Bool),
+                "le" => compare(Cmp::Le, a, b).map(Val::Bool),
+                "eq" => compare(Cmp::Eq, a, b).map(Val::Bool),
+                "max" => extreme(true, a, b),
+                "min" => extreme(false, a, b),
+                other => panic!("{other}"),
+            }
+        }
+        [op, a] => {
+            let a = parse(a).unwrap();
+            match op {
+                "neg" => neg(a),
+                "floor" => math(MathFn::Floor, a),
+                "ceil" => math(MathFn::Ceil, a),
+                "abs" => math(MathFn::Abs, a),
+                "toint" => Ok(Val::Int(i64::from(to_int(a)))),
+                other => panic!("{other}"),
+            }
+        }
+        _ => panic!("{lhs}"),
+    })
+}
+
+#[test]
+fn every_operation_agrees_with_the_table() {
+    let checked = check_table(include_str!("luaj_numerics.txt"), INTENDED);
     assert!(checked > 9_800, "{checked}");
 }
 
-/// A slider value's `tofloat()` line: `tofloat <operand> as <value the
-/// source built> = g:<f32 bits>`, converted from that value (a numeric
-/// −0 is the source's integer 0, as the importer normalizes it), or
-/// `tofloats x<hex bytes> = g:<bits>` (or `caught`, the consumer's `0f`),
-/// a string folded at import and then converted.
-fn check_tofloat(words: &[&str], rhs: &str) {
-    let ours = match words {
+/// The checker fails on a listed row that agrees with the table (stale),
+/// on one the table lacks, on a wrong listed value, on a row listed with
+/// no listed difference left, and on an unlisted row that differs.
+#[test]
+fn the_intended_list_is_checked() {
+    let table = "toint f:41f0000000000000 = i:0\ntoint i:7 = i:7\n";
+    let good = [("toint f:41f0000000000000", "i:2147483647")];
+    assert_eq!(check_table(table, &good), 2);
+    let bad: [&[(&str, &str)]; 5] = [
+        // Stale: tapestry agrees with the table there.
+        &[good[0], ("toint i:7", "i:7")],
+        // Not a row of the table.
+        &[good[0], ("toint i:8", "i:2147483647")],
+        // The table's own value listed.
+        &[("toint f:41f0000000000000", "i:0")],
+        // A wrong listed value.
+        &[("toint f:41f0000000000000", "i:2147483646")],
+        // A difference not listed.
+        &[],
+    ];
+    for list in bad {
+        let run = std::panic::catch_unwind(|| check_table(table, list));
+        assert!(run.is_err(), "{list:?} passed");
+    }
+}
+
+/// A slider value's `tofloat()` row: `tofloat <operand> as <value the
+/// source built>`, converted from that value (a numeric −0 is the
+/// source's integer 0, as the importer normalizes it), or `tofloats
+/// x<hex bytes>`, a string folded at import and then converted.
+fn tofloat(words: &[&str]) -> f32 {
+    match words {
         ["tofloat", _, "as", built] => to_float(parse(built).unwrap()),
         ["tofloats", hex] => {
             let hex = hex.strip_prefix('x').unwrap();
@@ -142,18 +270,10 @@ fn check_tofloat(words: &[&str], rhs: &str) {
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
                 .collect();
-            to_float(Val::Float(todouble(&bytes)))
+            to_float(Val::Float(numeral::number(&bytes).unwrap_or(0.0)))
         }
         _ => panic!("{words:?}"),
-    };
-    let theirs = match rhs {
-        "caught" => 0.0_f32,
-        g => f32::from_bits(u32::from_str_radix(g.strip_prefix("g:").unwrap(), 16).unwrap()),
-    };
-    assert!(
-        (ours.is_nan() && theirs.is_nan()) || ours.to_bits() == theirs.to_bits(),
-        "{words:?}: {ours:?} vs the source's {theirs:?}"
-    );
+    }
 }
 
 #[test]
@@ -361,19 +481,25 @@ fn representation(what: &str, f: MathFn, a: Val, ours: Result<Val, Fail>) {
     }
 }
 
-/// The source's `toint()` (Java's `(int) (long) d` of a double, an
-/// integer's low 32 bits; nil and booleans 0), pinned by value.
+/// A number's value truncated toward zero and saturated to `i32` (NaN,
+/// nil and booleans 0), pinned by value.
 #[test]
-fn a_number_value_converts_as_the_source() {
+fn a_number_value_truncates_and_saturates() {
     for (v, want) in [
-        (Val::Float(4_294_967_296.0), 0),
+        (Val::Float(4_294_967_296.0), i32::MAX),
         (Val::Float(f64::NAN), 0),
         (Val::Float(-0.5), 0),
-        (Val::Float(2_147_483_648.0), i32::MIN),
-        (Val::Float(1e300), -1),
-        (Val::Float(-1e300), 0),
+        (Val::Float(2_147_483_648.0), i32::MAX),
+        (Val::Float(2_147_483_647.9), i32::MAX),
+        (Val::Float(-2_147_483_648.9), i32::MIN),
+        (Val::Float(1e300), i32::MAX),
+        (Val::Float(-1e300), i32::MIN),
         (Val::Float(99.9), 99),
-        (Val::Int((1 << 32) + 5), 5),
+        (Val::Float(-99.9), -99),
+        (Val::Int((1 << 32) + 5), i32::MAX),
+        (Val::Int(-(1 << 32) - 5), i32::MIN),
+        (Val::Int(i64::MAX), i32::MAX),
+        (Val::Int(i64::MIN), i32::MIN),
         (Val::Nil, 0),
         (Val::Bool(true), 0),
     ] {
