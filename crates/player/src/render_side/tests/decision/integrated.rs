@@ -2579,7 +2579,7 @@ fn result_cell(outcome: Outcome, exit: Exit, close: bool, looped: bool) {
     let ran = run_with(&set, None, opts, |side| {
         let probe = &side.probe;
         side.prepared();
-        side.choose(MenuKey::Enter);
+        let (chosen, ..) = side.choose(MenuKey::Enter);
         // Before the play: what the selection's entry and exit drew.
         let (starts0, stops0) = result_counts(probe);
         assert_eq!(starts0, [0, 0, 0], "{case}: before the play");
@@ -2593,18 +2593,32 @@ fn result_cell(outcome: Outcome, exit: Exit, close: bool, looped: bool) {
         if exit == Exit::Withdrawn {
             side.result_gate.hold(true);
         }
+        // The decision screen's scene (2.5 s) and fade-out (0.5 s) over at
+        // once.
+        side.clock.set(TimeUs(chosen.0 + 3_000 * MS));
         side.to_loading();
+        // The play's first frame, then, once recording is open (READY's 1 s
+        // lead-in over), its clock moved on to 4 s past that frame: past the
+        // first note at 2 s, before the midway chart's second at 8 s, and
+        // before the end of a full play's tail, which then runs on the
+        // running clock. The audio thread catches up the 2.5 s skipped
+        // during that tail, seconds before the result's sounds start.
+        let frames = side
+            .seen
+            .until("a play frame", |d| d.iter().any(|d| d.frame == Frame::Play));
+        let first = frames
+            .iter()
+            .find(|d| d.frame == Frame::Play)
+            .map(|d| d.at)
+            .unwrap();
+        side.seen.until("a play frame past READY", |d| {
+            d.iter()
+                .any(|d| d.frame == Frame::Play && d.at.0 >= first.0 + 1_500 * MS)
+        });
+        let held = side.hold_clock();
+        side.clock.set(TimeUs(held.0.max(first.0 + 4_000 * MS)));
+        side.clock.run();
         if outcome == Outcome::Midway {
-            // The play screen drew 4 s after its first frame, on the running
-            // clock: past READY's 1 s lead-in and before the second note.
-            let frames = side
-                .seen
-                .until("a play frame", |d| d.iter().any(|d| d.frame == Frame::Play));
-            let first = frames
-                .iter()
-                .find(|d| d.frame == Frame::Play)
-                .map(|d| d.at)
-                .unwrap();
             side.seen.until("a play frame 4 s on", |d| {
                 d.iter()
                     .any(|d| d.frame == Frame::Play && d.at.0 >= first.0 + 4_000 * MS)
