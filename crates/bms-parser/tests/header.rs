@@ -130,9 +130,10 @@ fn the_loaders_labels_come_from_the_taken_branches() {
     assert!(!listing.bga);
 }
 
-/// A `#DIFFICULTY` the reference decoder's `Integer.parseInt` cannot read
-/// keeps the one before it, in the loader and the listing alike; one it
-/// reads replaces it, whatever its value.
+/// A `#DIFFICULTY` that does not read as an integer token keeps the one
+/// before it, in the loader and the listing alike, fullwidth digits
+/// included; one that reads replaces it, whatever its value, kept as its
+/// trimmed text.
 #[test]
 fn an_unreadable_difficulty_keeps_the_one_before() {
     let chart = |defs: &str| format!("#PLAYER 1\n#TITLE t\n#BPM 120\n{defs}\n#00111:01\n");
@@ -150,23 +151,72 @@ fn an_unreadable_difficulty_keeps_the_one_before() {
         ("#DIFFICULTY 4\n#DIFFICULTY -1", some("-1")),
         ("#DIFFICULTY 4\n#DIFFICULTY 99999999999", some("4")),
         ("#DIFFICULTY broken", (String::new(), None)),
+        ("#DIFFICULTY 4\n#DIFFICULTY \u{FF13}", some("4")),
+        ("#DIFFICULTY \u{FF13}", (String::new(), None)),
+        ("#DIFFICULTY 4\n#DIFFICULTY +3", some("+3")),
+        ("#DIFFICULTY 4\n#difficulty \u{3000}2\u{3000}", some("2")),
     ] {
         assert_eq!(read(&chart(defs)), want, "{defs:?}");
     }
-    assert_eq!(bms_parser::java_int("+\u{FF13}"), Some(3));
-    assert_eq!(bms_parser::java_int("-2147483648"), Some(i32::MIN));
-    assert_eq!(bms_parser::java_int("2147483648"), None);
-    assert_eq!(bms_parser::java_int("-"), None);
 }
 
-/// A chart has a BGA when a line the reference decoder registers as a
-/// `#BMPxx` stands in what is read: the loader's taken branches, the
-/// listing's top level. The decoder reads it by fixed position: `BMP` in
-/// any case, an object id in the next two characters, and at least eight
-/// characters in the line, the path from the eighth on, kept even when it
-/// is only spaces. Whether a channel shows it does not matter.
+/// A header value reads as an integer when it is an integer token: one
+/// optional `+` or `-`, then ASCII digits `0`-`9`, within `i32`. Anything
+/// else, other scripts' digits and surrounding whitespace included, reads
+/// none.
 #[test]
-fn a_bmp_definition_with_a_path_is_a_bga() {
+fn a_header_integer_is_an_ascii_token() {
+    use bms_parser::header_integer;
+    for (text, want) in [
+        ("12", 12),
+        ("+12", 12),
+        ("-1", -1),
+        ("-0", 0),
+        ("+0", 0),
+        ("0000000000000000000012", 12),
+        ("2147483647", i32::MAX),
+        ("-2147483648", i32::MIN),
+    ] {
+        assert_eq!(header_integer(text), Some(want), "{text:?}");
+    }
+    for text in [
+        "2147483648",
+        "-2147483649",
+        "99999999999999999999",
+        "",
+        "+",
+        "-",
+        "+-1",
+        "--1",
+        "\u{FF11}\u{FF12}",
+        "+\u{FF13}",
+        "\u{661}\u{662}",
+        "1\u{662}",
+        "\u{1D7CF}\u{1D7D0}",
+        " 12",
+        "12 ",
+        "1 2",
+        "12a",
+        "1.5",
+        "12.0",
+        "1e1",
+        "0x0C",
+        "1_2",
+        "NaN",
+        "\u{216B}",
+        "\u{BD}",
+    ] {
+        assert_eq!(header_integer(text), None, "{text:?}");
+    }
+}
+
+/// A chart has a BGA when a `#BMPxx` definition naming a file stands in
+/// what is read: the loader's taken branches, the listing's top level. It
+/// is read as every header is: the name `BMP` and a two-character object
+/// id, any case, then whitespace and the file name, trimmed. Whether a
+/// channel shows it does not matter.
+#[test]
+fn a_bmp_definition_naming_a_file_is_a_bga() {
     let chart = |defs: &str| format!("#PLAYER 1\n#TITLE t\n#BPM 120\n{defs}\n#00111:01\n");
     let read = |text: &str| {
         let dir = tempfile::tempdir().unwrap();
@@ -178,35 +228,50 @@ fn a_bmp_definition_with_a_path_is_a_bga() {
     for (defs, want) in [
         ("#BMP00 poor.bmp", (true, true)),
         ("#bmpZZ  a.png ", (true, true)),
+        ("#BMP01\ta.bmp", (true, true)),
+        ("#BmP01 a", (true, true)),
         ("#BMP01", (false, false)),
         ("#BMP01 ", (false, false)),
-        ("#BMP01  ", (true, true)),
-        ("#BmP01xa", (true, true)),
-        // Counted in UTF-16 units, as Java's `String.length` counts.
+        // No file name once the value is trimmed.
+        ("#BMP01  ", (false, false)),
+        ("#BMP01 \u{3000}", (false, false)),
+        // Names other than `BMP` and a two-character id.
+        ("#BmP01xa", (false, false)),
+        ("#BMP01\u{1F600}", (false, false)),
         ("#BMP01\u{e9}", (false, false)),
-        ("#BMP01\u{1F600}", (true, true)),
+        ("#BMP001 a.bmp", (false, false)),
         ("#BMP0! a.bmp", (false, false)),
-        ("#BMP001 a.bmp", (true, true)),
         ("#BMP001", (false, false)),
         ("#BGA01 01 0 0 10 10 0 0", (false, false)),
+        ("#BMP01 a.bmp\n#BMP01", (true, true)),
         ("#SETRANDOM 1\n#IF 1\n#BMP01 a.bmp\n#ENDIF", (true, false)),
         ("#SETRANDOM 1\n#IF 2\n#BMP01 a.bmp\n#ENDIF", (false, false)),
     ] {
         assert_eq!(read(&chart(defs)), want, "{defs:?}");
     }
-    // A registered definition is no unknown header.
-    let dir = tempfile::tempdir().unwrap();
-    let text = chart("#BMP001 a.bmp");
-    let loaded =
-        bms_parser::load_bms(text.as_bytes(), dir.path(), &LoadOptions::default()).unwrap();
-    assert!(
-        !loaded
+}
+
+/// A `#BMPxx` definition is no unknown header, with a file name or
+/// without; a name with a three-character id is one, as `#WAV001` is.
+#[test]
+fn a_bmp_definition_is_no_unknown_header() {
+    let unknown = |defs: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let text = format!("#PLAYER 1\n#TITLE t\n#BPM 120\n{defs}\n#00111:01\n");
+        let loaded =
+            bms_parser::load_bms(text.as_bytes(), dir.path(), &LoadOptions::default()).unwrap();
+        loaded
             .warnings
-            .iter()
-            .any(|w| matches!(w.kind, bms_parser::WarningKind::UnknownHeader(_))),
-        "{:?}",
-        loaded.warnings
-    );
+            .into_iter()
+            .filter_map(|w| match w.kind {
+                bms_parser::WarningKind::UnknownHeader(name) => Some(name),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(unknown("#BMP01 a.bmp"), Vec::<String>::new());
+    assert_eq!(unknown("#BMP01"), Vec::<String>::new());
+    assert_eq!(unknown("#BMP001 a.bmp"), ["BMP001"]);
 }
 
 /// The stage file and back image are labels: the last declaration in the

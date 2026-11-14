@@ -413,35 +413,39 @@ fn a_system_image_is_removed_too() {
     assert_eq!(invoked(&mut p, 1_000, &[]), 1);
 }
 
-/// An image whose `src` names no source, its id held by a later table too
-/// (a number, or the judge): the image is the destination's object, and
-/// the source makes none of it, so the destination draws nothing and its
-/// `draw` is never consumed: not compiled, and no schedule note.
+/// An image whose `src` names no source, its id held by a later number
+/// too: the image is the destination's object, and the source makes none
+/// of it, so the destination draws nothing and its `draw` is never
+/// consumed: not compiled, and no schedule note. A judge holding that id
+/// would have no destination, so the skin is refused.
 #[test]
 fn a_shared_destination_without_a_source_compiles_nothing() {
-    use skin_beatoraja::NoteKind;
+    use skin_beatoraja::{CriticalPart, NoteKind, Object};
     let image =
         "table.insert(skin.image, { id = \"x\", src = \"nope\", x = 0, y = 0, w = 8, h = 8 })\n";
     let draw = "draw = function() return ms.time() >= 0 end,";
-    for later in [
-        "skin.value = { { id = \"x\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 1, ref = 71 } }\n"
-            .to_owned(),
-        judge(&[], "", 1).replace("id = \"j\"", "id = \"x\""),
-    ] {
-        let i = import(&format!("{image}{later}{}", dst("x", draw)))
-            .unwrap_or_else(|e| panic!("{later}: {e:?}"));
-        assert_eq!(
-            i.callbacks,
-            [Disposition::ClassifiedOnly],
-            "{later}"
-        );
-        let kinds = common::kinds(&i.imported.report);
-        assert!(kinds.contains(&NoteKind::UndefinedSource), "{later}: {kinds:?}");
-        assert!(
-            !kinds.iter().any(|k| matches!(k, NoteKind::Schedule { .. })),
-            "{later}: {kinds:?}"
-        );
-    }
+    let value = "skin.value = { { id = \"x\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 1, ref = 71 } }\n";
+    let i = import(&format!("{image}{value}{}", dst("x", draw))).unwrap();
+    assert_eq!(i.callbacks, [Disposition::ClassifiedOnly]);
+    let kinds = common::kinds(&i.imported.report);
+    assert!(kinds.contains(&NoteKind::UndefinedSource), "{kinds:?}");
+    assert!(
+        !kinds.iter().any(|k| matches!(k, NoteKind::Schedule { .. })),
+        "{kinds:?}"
+    );
+    let judge = judge(&[], "", 1).replace("id = \"j\"", "id = \"x\"");
+    let r = import(&format!("{image}{judge}{}", dst("x", draw)));
+    assert!(
+        matches!(
+            r,
+            Err(ImportError::IdTaken {
+                part: CriticalPart::Judge,
+                by: Object::Image,
+                ..
+            })
+        ),
+        "{r:?}"
+    );
 }
 
 /// A callable used by such a removed destination and by a kept one keeps

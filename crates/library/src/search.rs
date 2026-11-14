@@ -52,9 +52,10 @@ pub enum Sort {
     Title,
     /// By normalized artist, then as [`Sort::Title`]; no artist last.
     Artist,
-    /// By `#PLAYLEVEL`: levels of ASCII digits only, by their value at any
-    /// length, then any other level by its text, then no level; equal
-    /// values by their text (`07` before `7`), then as [`Sort::Title`].
+    /// By `#PLAYLEVEL`: a level that reads as an integer
+    /// ([`bms_parser::header_integer`]) by its value, then any other level
+    /// by its text, then no level; equal values by their text (`07` before
+    /// `7`), then as [`Sort::Title`].
     Level,
     /// By file modification time, newest first.
     Modified,
@@ -171,14 +172,6 @@ impl Filter {
     }
 }
 
-/// A level of ASCII digits only.
-const NUMERIC_LEVEL: &str = "c.playlevel <> '' AND c.playlevel NOT GLOB '*[^0-9]*'";
-
-/// The significant digits of a numeric level. Ordered by their count, then
-/// as text, they order the values at any length, where a cast to an integer
-/// would saturate.
-const LEVEL_DIGITS: &str = "ltrim(c.playlevel, '0')";
-
 /// The `ORDER BY` terms of `sort`, after the folder when grouping.
 fn order(sort: Sort, by_folder: bool) -> String {
     let mut terms = String::new();
@@ -196,10 +189,8 @@ fn order(sort: Sort, by_folder: bool) -> String {
         Sort::Level => {
             let _ = write!(
                 terms,
-                "CASE WHEN c.playlevel IS NULL THEN 2 WHEN {NUMERIC_LEVEL} THEN 0 ELSE 1 END, \
-                 CASE WHEN {NUMERIC_LEVEL} THEN length({LEVEL_DIGITS}) END, \
-                 CASE WHEN {NUMERIC_LEVEL} THEN {LEVEL_DIGITS} END, \
-                 c.playlevel, {by_title}"
+                "CASE WHEN c.playlevel IS NULL THEN 2 WHEN c.level IS NULL THEN 1 ELSE 0 END, \
+                 c.level, c.playlevel, {by_title}"
             );
         }
         Sort::Modified => terms.push_str("c.mtime_ns DESC, c.path"),

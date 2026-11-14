@@ -159,6 +159,7 @@ pub fn create(conn: &Connection) -> rusqlite::Result<()> {
              subartist TEXT,
              genre TEXT,
              playlevel TEXT,
+             level INTEGER,
              difficulty TEXT,
              bpm TEXT,
              norm_text TEXT NOT NULL,
@@ -557,10 +558,10 @@ pub fn commit(
                  length_us, tempo_start, tempo_min, tempo_max, rank_kind, rank_value,
                  stagefile, banner, image_names, key_taps, key_longs, scratch_taps,
                  scratch_longs, density_peak, density_end, density_end_x100, density_average,
-                 density_average_x100, gauge_total, main_bpm)
+                 density_average_x100, gauge_total, main_bpm, level)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
                  ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
-                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)
+                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46)
              ON CONFLICT (path) DO UPDATE SET root = excluded.root, size = excluded.size,
                  mtime_ns = excluded.mtime_ns, sha256 = excluded.sha256, md5 = excluded.md5,
                  title = excluded.title, subtitle = excluded.subtitle,
@@ -583,7 +584,8 @@ pub fn commit(
                  density_end_x100 = excluded.density_end_x100,
                  density_average = excluded.density_average,
                  density_average_x100 = excluded.density_average_x100,
-                 gauge_total = excluded.gauge_total, main_bpm = excluded.main_bpm
+                 gauge_total = excluded.gauge_total, main_bpm = excluded.main_bpm,
+                 level = excluded.level
              RETURNING id",
         )?;
         let mut put_profile = tx.prepare(
@@ -649,6 +651,7 @@ pub fn commit(
                     info.map(|i| i.density_average_hundredths),
                     info.map(|i| i.total),
                     info.and_then(|i| i.main_bpm),
+                    h.playlevel.as_deref().and_then(bms_parser::header_integer),
                 ],
                 |r| r.get(0),
             )?;

@@ -183,6 +183,57 @@ sites = ["crates/game/src/turntable.rs"]
 tests = ["crates/game/src/turntable/tests.rs::a_charge_end_turns_back_for_80_ms"]
 
 [[entry]]
+id = "SF-011"
+summary = "Selection's entry picks the sets again and loops their `select`"
+class = "rule"
+reason = """
+A player hears a set picked anew at each visit to selection, and its BGM \
+looping while selection shows: each entry stops every set sound, picks the \
+sets again and loops the BGM set's `select` from that pick once it is ready, \
+never from the previous pick's, until selection is left."""
+source = [
+    "src/bms/player/beatoraja/select/MusicSelector.java:157 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/select/MusicSelector.java:173-174 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/select/MusicSelector.java:187-188 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/select/PreviewMusicProcessor.java:83 @beatoraja-0.8.9",
+]
+sites = ["crates/player/src/selection.rs", "crates/player/src/system_sounds.rs"]
+tests = [
+    "crates/player/src/system_sounds/rig_tests.rs::each_entry_stops_rerolls_and_loops_its_pick",
+    "crates/player/src/system_sounds/rig_tests.rs::leaving_selection_stops_the_loop",
+    "crates/player/src/system_sounds/tests.rs::the_entry_loop_waits_for_its_pick",
+]
+
+[[entry]]
+id = "SF-012"
+summary = "Selection's cue sounds for the cursor, places, panels and options"
+class = "rule"
+reason = """
+A player hears selection answer each input: `scratch` for each row a \
+one-row step moves the cursor, `f-open` for a place entered, `f-close` for \
+a place left for its parent, `o-open` and `o-close` as an option panel \
+shows and goes, and `o-change` for an order step, a preset step or a cover \
+switch turned."""
+source = [
+    "src/bms/player/beatoraja/select/BarRenderer.java:471-480 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/select/MusicSelectInputProcessor.java:100-122 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/select/MusicSelectInputProcessor.java:194-212 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/select/MusicSelectInputProcessor.java:241-249 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/select/MusicSelectInputProcessor.java:308-311 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/select/BarManager.java:496-500 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/property/EventFactory.java:201 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/property/EventFactory.java:682-700 @beatoraja-0.8.9",
+]
+sites = ["crates/player/src/select.rs", "crates/player/src/selection.rs"]
+tests = [
+    "crates/player/src/selection.rs::each_input_path_asks_for_its_cues",
+    "crates/player/src/selection.rs::the_panel_cues_follow_the_panel_shown",
+    "crates/player/src/selection/tests/pointer.rs::the_wheel_sounds_a_row_a_notch",
+    "crates/player/src/selection/tests/pointer.rs::a_choice_after_a_cue_burst_sounds_decide",
+    "crates/player/src/system_sounds/rig_tests.rs::a_look_requests_its_cues",
+]
+
+[[entry]]
 id = "SF-014"
 summary = "Play time adds how far into the chart each play's judged notes reached"
 class = "rule"

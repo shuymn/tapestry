@@ -207,11 +207,9 @@ pub struct ImportFacts {
     /// `None` when it is in no class; [`Fact::Unavailable`] when there is
     /// no chart.
     pub judge_class: Fact<Option<JudgeClass>>,
-    /// The chart's play level as the source parses `#PLAYLEVEL` (Java's
-    /// `Integer.parseInt`: an optional `+` or `-`, then one or more
-    /// characters `Character.digit(c, 10)` accepts, over UTF-16 code
-    /// units, within `i32`; anything else 0); [`Fact::Unavailable`] when
-    /// there is no chart.
+    /// The chart's play level, `#PLAYLEVEL` read as an integer token (an
+    /// optional `+` or `-` and ASCII digits, within `i32`; anything else
+    /// 0); [`Fact::Unavailable`] when there is no chart.
     pub play_level: Fact<i32>,
     /// The viewed result's fields, as its frames read them
     /// ([`ResultFields::of`] the view); read on [`ScreenKind::Result`]

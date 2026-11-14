@@ -4,7 +4,7 @@ use std::fmt;
 
 use skin_model::{CompileError, ImageError, LoadError, RootError, ScreenKind};
 
-use crate::import::{CriticalPart, EssentialPart, ImportLimit, NoteKind};
+use crate::import::{CriticalPart, EssentialPart, ImportLimit, NoteKind, Object, table_name};
 use crate::lua::LuaWhy;
 
 use crate::limits::{
@@ -204,6 +204,17 @@ pub enum ImportError {
         part: CriticalPart,
         why: NoteKind,
     },
+    /// A play destination, at `at`, whose id `id` names the judge
+    /// (`part` [`CriticalPart::Judge`]) or the notes
+    /// ([`CriticalPart::Lanes`]) while an earlier table's object, `by`,
+    /// takes it ([`Object::System`]: a negative number's built-in image),
+    /// leaving that part with no destination.
+    IdTaken {
+        at: Loc,
+        id: String,
+        part: CriticalPart,
+        by: Object,
+    },
     /// A selection or result skin's essential part is missing (`why` is `None`) or
     /// cannot be reproduced (`why` is what it met), judged after the
     /// configured options are folded; `at` is where it was met, when one
@@ -289,6 +300,13 @@ impl fmt::Display for ImportError {
             Self::Limit { at, limit } => write!(f, "{}{limit}", At(at)),
             Self::Critical { at, part, why } => {
                 write!(f, "{at}: the {part} cannot be imported: {why}")
+            }
+            Self::IdTaken { at, id, part, by } => {
+                write!(f, "{at}: the {part} cannot be imported: its id {id:?} ")?;
+                match table_name(*by) {
+                    Some(table) => write!(f, "is taken first by the `{table}` table"),
+                    None => f.write_str("is a built-in image's"),
+                }
             }
             Self::Essential {
                 at,

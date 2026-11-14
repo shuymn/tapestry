@@ -6,13 +6,13 @@
 //! the bests phase of a scan pass; and the cached loudness measurements of
 //! the charts played (design.md "Algorithms").
 //!
-//! # Schema version 10
+//! # Schema version 12
 //!
 //! [`SCHEMA_VERSION`] is kept in `PRAGMA user_version`.
 //!
 //! - `roots(id, path UNIQUE)`: the roots of the latest scan.
 //! - `charts(id, root, path UNIQUE, size, mtime_ns, sha256, md5, title,
-//!   subtitle, artist, subartist, genre, playlevel, difficulty, bpm,
+//!   subtitle, artist, subartist, genre, playlevel, level, difficulty, bpm,
 //!   norm_text, title_key, artist_key, folder, mode, random, bga, loader,
 //!   taps, longs, mines, length_us, tempo_start, tempo_min, tempo_max,
 //!   rank_kind, rank_value, stagefile, banner, image_names, key_taps,
@@ -20,7 +20,10 @@
 //!   density_end_x100, density_average, density_average_x100, gauge_total,
 //!   main_bpm)`: the
 //!   header values as [`bms_parser::read_scanned`] reads them, `NULL` when
-//!   undeclared; the searched fields normalized and joined ([`Search`]); the
+//!   undeclared; the integer `playlevel` reads as `level`
+//!   ([`bms_parser::header_integer`]), `NULL` when it reads none or is
+//!   undeclared, by which [`Sort::Level`] orders; the searched fields
+//!   normalized and joined ([`Search`]); the
 //!   normalized title and artist, by which [`Sort::Title`] and [`Sort::Artist`]
 //!   order; the folder of the path, by which [`Search::by_folder`] groups; the
 //!   mode ([`ChartMode`]), of which only 7-key is ever listed; the flag of
@@ -154,7 +157,7 @@ pub use search::{FolderKey, FolderRow, Level, SEPARATOR, Search, Sort};
 pub use stored_profile::{MAX_PROFILE_BYTES, MAX_ROWS, StoredProfile};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 10;
+pub const SCHEMA_VERSION: i64 = 12;
 
 /// Why the library database cannot be opened, read or scanned.
 #[derive(Debug, thiserror::Error)]

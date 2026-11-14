@@ -396,6 +396,11 @@ pub struct Selection {
     /// The volumes the skin's sliders set since the last look, by
     /// [`game::Channel::index`]: the newest percent of each.
     pub volumes_set: [Option<u32>; 3],
+    /// The cue sounds the input asked for since the last look, and the
+    /// visit's panel baseline: every input path adds to it, and the look
+    /// starts them once, after the drain and the switches it turns
+    /// ([`PlayerRig::play_cues`]).
+    pub cues: crate::select::SelectCues,
     /// What the render thread is given of each change: the lifetime, the
     /// timers' starts and the skin's window.
     pub feed: SkinFeed,
@@ -633,7 +638,7 @@ impl Selection {
     /// Acts on one input; the chart it chose, if it did. A changed search
     /// or order is searched once all queued input is taken.
     fn act(&mut self, input: MenuInput) -> Option<Pick> {
-        match self.screen.input(input) {
+        match self.screen.input_cued(input, &mut self.cues) {
             Acted::Nothing => None,
             Acted::Changed => {
                 self.dirty = true;
@@ -667,6 +672,9 @@ impl Selection {
             }
             Acted::Preset(step) => {
                 self.preset_steps.push_back(step);
+                // A preset step changes an option the screen shows.
+                // Source: SF-012
+                self.cues.add(audio::SystemKind::OptionChange, 1);
                 None
             }
         }
@@ -893,7 +901,9 @@ impl Selection {
         pick
     }
 
-    /// Carries out what a pointer input does.
+    /// Carries out what a pointer input does: a wheel's notches sound
+    /// `scratch` once for each row the cursor moves, a click or the list
+    /// slider none (design.md "State Model", system sounds, Selection).
     fn pointer_act(
         &mut self,
         act: crate::pointer::PointerAct,
@@ -918,7 +928,12 @@ impl Selection {
                 }
                 return None;
             }
-            crate::pointer::PointerAct::MoveTo(index) => index,
+            crate::pointer::PointerAct::MoveTo(index) => {
+                if self.screen.move_to(index) {
+                    self.dirty = true;
+                }
+                return None;
+            }
             crate::pointer::PointerAct::Rows(rows) => {
                 let last = self.screen.selectable().saturating_sub(1);
                 let rows_abs = usize::try_from(rows.unsigned_abs()).unwrap_or(usize::MAX);
@@ -929,8 +944,12 @@ impl Selection {
                 }
             }
         };
+        let from = self.screen.cursor();
         if self.screen.move_to(to) {
             self.dirty = true;
+            let moved = u32::try_from(from.abs_diff(to)).unwrap_or(u32::MAX);
+            // Source: SF-012
+            self.cues.add(audio::SystemKind::Scratch, moved);
         }
         None
     }
@@ -981,7 +1000,8 @@ impl Selection {
     }
 
     /// The panels' `level` read at `now`: an update is due when the panel
-    /// the screen shows changed.
+    /// the screen shows changed, and `o-open` or `o-close` sounds when it
+    /// went from none to one or back (the search box's focus hides it).
     fn panels(&mut self, level: Option<&input::PanelLevel>, now: TimeUs) {
         let Some(level) = level else {
             return;
@@ -989,6 +1009,8 @@ impl Selection {
         if self.feed.panels(level.read(), self.screen.searching(), now) {
             self.dirty = true;
         }
+        // Source: SF-012
+        self.cues.panel(self.shown_panel().is_some());
     }
 
     /// [`drain_at`](Self::drain_at) while selection owns the menus' queues
@@ -2281,7 +2303,10 @@ impl PlayerRig<'_> {
     /// request, starter and set go, its job is cancelled, its publication
     /// retires), then the render thread's, so nothing of it is drawn again;
     /// the window queues no pointer input until the next entry, nothing in
-    /// flight dispatched.
+    /// flight dispatched. Selection's BGM stops at once, a loop still
+    /// waiting for its generation included (design.md "State Model",
+    /// system sounds, Selection, a difference from the source's deferred
+    /// stop).
     fn left_selection(&mut self) {
         if let Some(sel) = &self.selection {
             self.chart_images.leave_selection(&sel.coord);
@@ -2289,6 +2314,9 @@ impl PlayerRig<'_> {
         self.render.leave_selection();
         if let Some(sel) = &mut self.selection {
             sel.pointer.leave();
+        }
+        if let Some(sounds) = &mut self.system_sounds {
+            sounds.stop(&mut self.audio.control, audio::SystemKind::Select);
         }
     }
 
@@ -2420,7 +2448,8 @@ impl PlayerRig<'_> {
     /// Turns over the cover switches the skin turned (design.md "Play
     /// Adjustments"): in the driver, or in the options `player.toml` is to
     /// hold where there is none, each written at the next settings write
-    /// (design.md "Settings Files"); then the next update shows them.
+    /// (design.md "Settings Files"); then the next update shows them. Each
+    /// switch turned sounds `o-change`, one that failed to turn none.
     fn turn_covers(&mut self) {
         let Some(sel) = &mut self.selection else {
             return;
@@ -2434,6 +2463,7 @@ impl PlayerRig<'_> {
             game::CoverKind::Lift,
             game::CoverKind::Hidden,
         ];
+        let mut changed = 0;
         for (kind, _) in kinds.into_iter().zip(turned).filter(|&(_, t)| t) {
             let failed = match &mut self.adjust {
                 Some(driver) => {
@@ -2454,13 +2484,33 @@ impl PlayerRig<'_> {
                     }
                 }),
             };
-            if let Some(why) = failed {
-                log::warn!("select: the {kind:?} switch was not turned: {why}");
+            match failed {
+                Some(why) => log::warn!("select: the {kind:?} switch was not turned: {why}"),
+                None => changed += 1,
             }
         }
         self.feed_settings();
         if let Some(sel) = &mut self.selection {
             sel.dirty = true;
+            // Source: SF-012
+            sel.cues.add(audio::SystemKind::OptionChange, changed);
+        }
+    }
+
+    /// Starts the cue sounds the look's input asked for, once each and in
+    /// one place, after the drain and the switches it turned: so an entry's
+    /// cues follow its re-roll's stop of every set sound (design.md "State
+    /// Model", system sounds, Selection). Each plays from the installed
+    /// generation; a start past the start ring's one-shot room, or while
+    /// the run's sets are off, is refused and counted.
+    fn play_cues(&mut self) {
+        let Some(sel) = &mut self.selection else {
+            return;
+        };
+        let control = &mut self.audio.control;
+        match self.system_sounds.as_mut() {
+            Some(sounds) => sel.cues.take(|kind| sounds.start(control, kind, None)),
+            None => sel.cues.take(|_| {}),
         }
     }
 
@@ -2560,6 +2610,8 @@ impl PlayerRig<'_> {
         // shown with this look's update.
         self.turn_covers();
         self.set_volumes();
+        // The cue sounds of the look's input, the choice's included.
+        self.play_cues();
         let sel = self.selection.as_mut()?;
         // Before anything of the choice: no chart without its skin.
         let now = self.clock.now();
@@ -3934,26 +3986,43 @@ impl AppRig for PlayerRig<'_> {
         self.render.clear_loading();
         // The play options as the play before left them.
         self.feed_settings();
-        let Some(sel) = &mut self.selection else {
-            return;
-        };
-        let now = self.clock.now();
-        let images = CursorImages {
-            worker: &self.chart_images,
-            side: self.selection_chart,
-        };
-        // A new cursor generation before the list is read again: a table
-        // of the last visit draws nothing, and the rest counts from now,
-        // whatever the cursor is on (SX17).
-        sel.rest_entered(images, now);
-        sel.entered(now);
-        // A panel held at the entry opens with it.
-        sel.panels(self.panels.as_ref(), now);
-        self.render.enter_selection(sel.feed.lifetime);
-        // The window takes the pointer for this lifetime from now on.
-        sel.pointer.enter(sel.feed.lifetime);
-        println!("select: {} charts listed", sel.screen.listed());
-        sel.show(&self.render, images, None, now);
+        if let Some(sel) = &mut self.selection {
+            let now = self.clock.now();
+            let images = CursorImages {
+                worker: &self.chart_images,
+                side: self.selection_chart,
+            };
+            // A new cursor generation before the list is read again: a
+            // table of the last visit draws nothing, and the rest counts
+            // from now, whatever the cursor is on (SX17).
+            sel.rest_entered(images, now);
+            sel.entered(now);
+            // A panel held at the entry opens with it.
+            sel.panels(self.panels.as_ref(), now);
+            self.render.enter_selection(sel.feed.lifetime);
+            // The window takes the pointer for this lifetime from now on.
+            sel.pointer.enter(sel.feed.lifetime);
+            println!("select: {} charts listed", sel.screen.listed());
+            sel.show(&self.render, images, None, now);
+        }
+        // The system sounds' entry last, the page already out: every set
+        // sound stops, the sets are picked again within the entry's wait,
+        // and the BGM loops from that pick once it is ready.
+        let PlayerRig {
+            system_sounds,
+            audio,
+            controls,
+            input,
+            failures,
+            ..
+        } = self;
+        let controls: &crate::controls::Controls = controls;
+        if let Some(sounds) = system_sounds {
+            // Source: SF-011
+            sounds.enter_selection(&mut audio.control, || {
+                crate::play::run_ends(controls, input, failures)
+            });
+        }
     }
 
     /// The system sounds' entry's wait was ended by a close or a thread
@@ -4139,6 +4208,10 @@ impl Selection {
     fn entered(&mut self, now: TimeUs) {
         self.entered_at = now;
         self.feed.enter(now);
+        // The visit's cues from here, against no panel shown (a panel the
+        // last visit left open is the feed's, not the baseline).
+        // Source: SF-012
+        self.cues.entered();
         self.loading = None;
         self.screen.end_composition();
         self.shelf.release();
@@ -4327,7 +4400,7 @@ pub(crate) mod tests {
             chosen_chart(&entry(header, false)).play_level
         };
         assert_eq!(level(Some("12")), Some(12));
-        assert_eq!(level(Some("１２")), Some(12));
+        assert_eq!(level(Some("１２")), Some(0));
         assert_eq!(level(Some("12+")), Some(0));
         assert_eq!(level(None), Some(0));
     }
@@ -4347,7 +4420,14 @@ pub(crate) mod tests {
         };
         assert_eq!(chosen(Some("4"), true), (Some(4), Some(true)));
         assert_eq!(chosen(Some("+5"), false), (Some(5), Some(false)));
-        for text in [Some("6"), Some("0"), Some("-1"), Some("2a"), None] {
+        for text in [
+            Some("6"),
+            Some("0"),
+            Some("-1"),
+            Some("2a"),
+            Some("４"),
+            None,
+        ] {
             assert_eq!(chosen(text, false), (Some(0), Some(false)), "{text:?}");
         }
     }
@@ -4560,6 +4640,7 @@ pub(crate) mod tests {
             preset_steps: std::collections::VecDeque::new(),
             covers_turned: [false; 3],
             volumes_set: [None; 3],
+            cues: crate::select::SelectCues::default(),
             #[cfg(feature = "dev-tools")]
             script: None,
             coord: crate::shelf::tests::coordinator(),
@@ -4891,6 +4972,199 @@ pub(crate) mod tests {
         keys(&mut sel, &[MenuKey::Tab]);
         assert!(!sel.screen.searching());
         assert_eq!(panels(&mut sel, 40), [Some(TimeUs(40)), None, None]);
+    }
+
+    /// The cue sounds `sel` asked for since the last call, taken as a look
+    /// takes them: `scratch`, `f-open`, `f-close`, `o-open`, `o-close` and
+    /// `o-change`, in that order.
+    fn took(sel: &mut Selection) -> [u32; 6] {
+        use audio::SystemKind;
+        let kinds = [
+            SystemKind::Scratch,
+            SystemKind::FolderOpen,
+            SystemKind::FolderClose,
+            SystemKind::OptionOpen,
+            SystemKind::OptionClose,
+            SystemKind::OptionChange,
+        ];
+        let counted = kinds.map(|k| sel.cues.count(k));
+        let mut taken = [0; 6];
+        sel.cues.take(|k| {
+            if let Some(i) = kinds.iter().position(|&x| x == k) {
+                taken[i] += 1;
+            }
+        });
+        assert_eq!(taken, counted, "a take starts each counted cue once");
+        taken
+    }
+
+    /// C24-5, C24-6, C24-8 (design.md "State Model", system sounds,
+    /// Selection): over five charts in the all-chart list, each input path
+    /// asks for the cues where the source plays them. A one-row step sounds
+    /// `scratch` once a row moved and none at the list's end; a key jump
+    /// once however far it goes; a controller's step (a turntable step
+    /// comes as one) once; the wheel's rows (`pointer_act`, the pointer's
+    /// own path is `the_wheel_sounds_a_row_a_notch`) once a row moved, the
+    /// list's end cutting the count; a click's `MoveTo` and a volume
+    /// slider none. Entering a place sounds `f-open`, leaving it for its
+    /// parent `f-close`, Back at Top or clearing a query none; an order
+    /// step and a preset step `o-change` each.
+    // Source: SF-012
+    #[test]
+    fn each_input_path_asks_for_its_cues() {
+        use crate::pointer::PointerAct;
+        use eval::ControlId;
+        use input::{MenuAction, MenuBindings, MenuEvent};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(
+            dir.path(),
+            &[&["c1.bms", "c2.bms", "c3.bms", "c4.bms", "c5.bms"]],
+        );
+        let (mut tap, receiver) = input::menu_queue(MenuBindings {
+            product: controller_product(),
+            controls: vec![(ControlId(2), MenuAction::Press(MenuEvent::Down))],
+            step: 1,
+            relative: None,
+            wrap: None,
+        });
+        tap.set_active(true);
+        let mut pad = Pad {
+            receiver: Some(receiver),
+            dropped: 0,
+        };
+        // The all-chart row, then into it.
+        assert_eq!(sel.screen.cursor(), 0);
+        assert_eq!(sel.screen.row_kind_at(0), Some(skin_model::RowRefKind::All));
+        keys(&mut sel, &[MenuKey::Enter]);
+        assert_eq!(took(&mut sel), [0, 1, 0, 0, 0, 0], "Enter on a place");
+        keys(&mut sel, &[MenuKey::Up]);
+        assert_eq!(sel.screen.selectable(), 5);
+        assert_eq!(took(&mut sel), [0; 6], "Up on the first row");
+        keys(&mut sel, &[MenuKey::Down; 3]);
+        assert_eq!(took(&mut sel), [3, 0, 0, 0, 0, 0], "three rows down");
+        keys(&mut sel, &[MenuKey::Down; 3]);
+        assert_eq!(sel.screen.cursor(), 4);
+        assert_eq!(took(&mut sel), [1, 0, 0, 0, 0, 0], "one row, then the end");
+        keys(&mut sel, &[MenuKey::Home]);
+        assert_eq!(took(&mut sel), [1, 0, 0, 0, 0, 0], "Home over four rows");
+        // The controller's step, off the first row.
+        tap.offer(
+            &input::Packet {
+                device: input::DeviceId(7),
+                control: ControlId(2),
+                value: 1,
+                background: false,
+            },
+            None,
+            TimeUs(0),
+        );
+        assert_eq!(sel.drain(&mut pad), None);
+        assert_eq!(sel.screen.cursor(), 1);
+        assert_eq!(took(&mut sel), [1, 0, 0, 0, 0, 0], "a controller step");
+        keys(&mut sel, &[MenuKey::PageDown]);
+        assert_eq!(sel.screen.cursor(), 4);
+        assert_eq!(took(&mut sel), [1, 0, 0, 0, 0, 0], "Page Down over three");
+        // The wheel's rows, a click and the volume slider.
+        let none = None;
+        assert_eq!(sel.pointer_act(PointerAct::Rows(-3), none, TimeUs(0)), None);
+        assert_eq!(sel.screen.cursor(), 1);
+        assert_eq!(took(&mut sel), [3, 0, 0, 0, 0, 0], "three notches up");
+        sel.pointer_act(PointerAct::MoveTo(3), none, TimeUs(0));
+        assert_eq!(sel.screen.cursor(), 3);
+        sel.pointer_act(
+            PointerAct::Volume(game::Channel::System, 17),
+            none,
+            TimeUs(0),
+        );
+        assert_eq!(took(&mut sel), [0; 6], "a click and a volume slider");
+        sel.pointer_act(PointerAct::Rows(-5), none, TimeUs(0));
+        assert_eq!(sel.screen.cursor(), 0);
+        assert_eq!(
+            took(&mut sel),
+            [3, 0, 0, 0, 0, 0],
+            "five notches, three rows"
+        );
+        // Back to Top, then Back at Top.
+        keys(&mut sel, &[MenuKey::Escape]);
+        assert_eq!(took(&mut sel), [0, 0, 1, 0, 0, 0], "a place left");
+        keys(&mut sel, &[MenuKey::Escape, MenuKey::Backspace]);
+        assert_eq!(took(&mut sel), [0; 6], "Back at Top");
+        // A query typed, then Back clearing it.
+        keys(&mut sel, &[MenuKey::Tab]);
+        sel.menu.push(MenuInput::Text("c2".to_owned()));
+        keys(&mut sel, &[MenuKey::Enter]);
+        assert!(!sel.screen.searching());
+        assert_eq!(sel.screen.selectable(), 1, "the query's one chart");
+        keys(&mut sel, &[MenuKey::Escape]);
+        assert_eq!(sel.screen.selectable(), 6, "Top again");
+        assert_eq!(took(&mut sel), [0; 6], "a query cleared");
+        // The order and the preset.
+        keys(&mut sel, &[MenuKey::Right, MenuKey::Left]);
+        assert_eq!(took(&mut sel), [0, 0, 0, 0, 0, 2], "two order steps");
+        keys(&mut sel, &[MenuKey::NextPreset]);
+        assert_eq!(sel.preset_steps.len(), 1);
+        assert_eq!(took(&mut sel), [0, 0, 0, 0, 0, 1], "a preset step");
+    }
+
+    /// C24-7 (design.md "State Model", system sounds, Selection): `o-open`
+    /// and `o-close` follow the panel the screen shows, none to one and
+    /// back; a change between panels sounds nothing; the search box taking
+    /// focus hides the panel, so it closes, and giving it up shows it
+    /// again. Each entry's baseline is no panel: a panel held as selection
+    /// was left closes nothing at the next entry when released meanwhile,
+    /// and opens anew when still held.
+    // Source: SF-012
+    #[test]
+    fn the_panel_cues_follow_the_panel_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = selection(dir.path());
+        let (mut set, level) = panel_keys();
+        sel.feed.enter(TimeUs(0));
+        let look = |sel: &mut Selection, set: &mut input::SourceSet, code, value| {
+            panel_key(set, code, value);
+            sel.panels(Some(&level), TimeUs(1));
+            took(sel)
+        };
+        assert_eq!(
+            look(&mut sel, &mut set, 0x12, 1),
+            [0, 0, 0, 1, 0, 0],
+            "START"
+        );
+        assert_eq!(look(&mut sel, &mut set, 0x11, 1), [0; 6], "both: panel 3");
+        assert_eq!(sel.feed.panel(), Some(2));
+        assert_eq!(look(&mut sel, &mut set, 0x12, 0), [0; 6], "SELECT: panel 2");
+        assert_eq!(
+            look(&mut sel, &mut set, 0x11, 0),
+            [0, 0, 0, 0, 1, 0],
+            "none"
+        );
+        // START held, then the search box's focus taken and given up, each
+        // in a pass that reads the panels again.
+        assert_eq!(look(&mut sel, &mut set, 0x12, 1), [0, 0, 0, 1, 0, 0]);
+        let tab = |sel: &mut Selection| {
+            sel.menu.push(MenuInput::Key(MenuKey::Tab));
+            assert_eq!(
+                sel.drain_at(&mut Pad::default(), Some(&level), TimeUs(2)),
+                None
+            );
+            took(sel)
+        };
+        assert_eq!(tab(&mut sel), [0, 0, 0, 0, 1, 0], "focus hides the panel");
+        assert!(sel.screen.searching());
+        assert_eq!(tab(&mut sel), [0, 0, 0, 1, 0, 0], "and shows it again");
+        // Selection left with START held, entered with it released.
+        assert_eq!(sel.feed.panel(), Some(0));
+        sel.entered(TimeUs(3));
+        assert_eq!(
+            look(&mut sel, &mut set, 0x12, 0),
+            [0; 6],
+            "released meanwhile"
+        );
+        // Left with it held again, entered with it still held.
+        assert_eq!(look(&mut sel, &mut set, 0x12, 1), [0, 0, 0, 1, 0, 0]);
+        sel.entered(TimeUs(4));
+        sel.panels(Some(&level), TimeUs(4));
+        assert_eq!(took(&mut sel), [0, 0, 0, 1, 0, 0], "held through the entry");
     }
 
     /// The search box's focus changing within one look moves the panel
@@ -7136,6 +7410,7 @@ pub(crate) mod tests {
             preset_steps: std::collections::VecDeque::new(),
             covers_turned: [false; 3],
             volumes_set: [None; 3],
+            cues: crate::select::SelectCues::default(),
             #[cfg(feature = "dev-tools")]
             script: None,
             coord: crate::shelf::tests::coordinator(),

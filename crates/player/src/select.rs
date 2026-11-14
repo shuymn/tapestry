@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
+use audio::SystemKind;
 use eval::ControlId;
 use input::hid::{HidProduct, is_axis};
 use input::{MenuAction, MenuBindings, MenuEvent};
@@ -502,6 +503,85 @@ pub enum Acted {
     /// The play preset is to step: the game thread's flow, which holds
     /// the presets, takes it.
     Preset(game::PresetStep),
+}
+
+/// The cue sounds selection's own sounds play, in the order a look starts
+/// them.
+const CUE_KINDS: [SystemKind; 6] = [
+    SystemKind::Scratch,
+    SystemKind::FolderOpen,
+    SystemKind::FolderClose,
+    SystemKind::OptionOpen,
+    SystemKind::OptionClose,
+    SystemKind::OptionChange,
+];
+
+/// The cue sounds selection's input asked for since the last look
+/// (design.md "State Model", system sounds, Selection): a count per kind,
+/// which the look after the input starts once each, and whether the visit
+/// showed an option panel at the last read, which `o-open` and `o-close`
+/// follow. Every input path adds here; nothing else starts a cue.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SelectCues {
+    counts: [u32; CUE_KINDS.len()],
+    /// A panel showed at the last read, no panel at each entry.
+    panel: bool,
+}
+
+impl SelectCues {
+    /// `n` more of `kind`; a kind no cue plays is not counted.
+    pub fn add(&mut self, kind: SystemKind, n: u32) {
+        if let Some(i) = CUE_KINDS.iter().position(|&k| k == kind)
+            && let Some(c) = self.counts.get_mut(i)
+        {
+            *c = c.saturating_add(n);
+        }
+    }
+
+    /// The `kind`s asked for and not yet taken (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn count(&self, kind: SystemKind) -> u32 {
+        CUE_KINDS
+            .iter()
+            .position(|&k| k == kind)
+            .and_then(|i| self.counts.get(i))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Whether the screen shows an option panel now: `o-open` when it
+    /// shows one after none, `o-close` when it shows none after one; a
+    /// change between panels plays nothing.
+    pub fn panel(&mut self, shown: bool) {
+        if shown != std::mem::replace(&mut self.panel, shown) {
+            self.add(
+                if shown {
+                    SystemKind::OptionOpen
+                } else {
+                    SystemKind::OptionClose
+                },
+                1,
+            );
+        }
+    }
+
+    /// Selection is entered: nothing asked for, and no panel shown, so a
+    /// panel still held from the last visit opens anew and one released
+    /// meanwhile closes nothing.
+    pub fn entered(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Takes the counts: `start` once for each cue asked for, in
+    /// [`CUE_KINDS`] order.
+    pub fn take(&mut self, mut start: impl FnMut(SystemKind)) {
+        for (kind, n) in CUE_KINDS.into_iter().zip(std::mem::take(&mut self.counts)) {
+            for _ in 0..n {
+                start(kind);
+            }
+        }
+    }
 }
 
 /// The orders, in the order Left and Right cycle them, with their labels.
@@ -1162,10 +1242,21 @@ impl SelectScreen {
         self.totals = totals;
     }
 
-    /// Acts on one input.
+    /// Acts on one input, its cue sounds dropped (tests).
+    #[cfg(test)]
     pub fn input(&mut self, input: MenuInput) -> Acted {
+        self.input_cued(input, &mut SelectCues::default())
+    }
+
+    /// Acts on one input, adding the cue sounds it asks for to `cues`: one
+    /// `scratch` for a key that moves the cursor (a one-row step moves one
+    /// row, and a jump, which the source has no key for, sounds once
+    /// however far it goes), `f-open` for a place entered, `f-close` for a
+    /// place left for its parent (none when Back clears a query, which
+    /// leaves no place, or finds Top), and `o-change` for an order step.
+    pub fn input_cued(&mut self, input: MenuInput, cues: &mut SelectCues) -> Acted {
         if let MenuInput::Pad { event, .. } = input {
-            return self.input(MenuInput::Key(event_key(event)));
+            return self.input_cued(MenuInput::Key(event_key(event)), cues);
         }
         if self.searching {
             return self.search_input(input);
@@ -1190,16 +1281,33 @@ impl SelectScreen {
                 } else {
                     (self.sort + n - 1) % n
                 };
+                // Source: SF-012
+                cues.add(SystemKind::OptionChange, 1);
                 return Acted::Search;
             }
             MenuKey::Tab => {
                 self.searching = true;
                 return Acted::Focus(true);
             }
-            MenuKey::Enter | MenuKey::Practice => return self.act_on_row(key),
+            MenuKey::Enter | MenuKey::Practice => {
+                let acted = self.act_on_row(key);
+                if acted == Acted::Search {
+                    // Source: SF-012
+                    cues.add(SystemKind::FolderOpen, 1);
+                }
+                return acted;
+            }
             MenuKey::PrevPreset => return Acted::Preset(game::PresetStep::Prev),
             MenuKey::NextPreset => return Acted::Preset(game::PresetStep::Next),
-            MenuKey::Backspace | MenuKey::Escape => return self.back(),
+            MenuKey::Backspace | MenuKey::Escape => {
+                let left = self.stack.len();
+                let acted = self.back();
+                if self.stack.len() < left {
+                    // Source: SF-012
+                    cues.add(SystemKind::FolderClose, 1);
+                }
+                return acted;
+            }
             MenuKey::BackspaceHeld => return Acted::Nothing,
         };
         if to == self.cursor {
@@ -1207,6 +1315,8 @@ impl SelectScreen {
         }
         self.cursor = to;
         self.scroll(CURSOR_LINE);
+        // Source: SF-012
+        cues.add(SystemKind::Scratch, 1);
         Acted::Changed
     }
 
@@ -1639,16 +1749,17 @@ pub fn labels() -> SelectionLabels {
     }
 }
 
-/// `#PLAYLEVEL` as a number, as a skin draws it: what Java's
-/// `Integer.parseInt` reads ([`crate::imports::facts::level_of`]), 0 when
-/// it is absent or reads none.
+/// `#PLAYLEVEL` as a number, as a skin draws it
+/// ([`crate::imports::facts::level_of`]), 0 when it is absent or reads
+/// none.
 fn level_value(text: Option<&str>) -> i32 {
     text.map_or(0, crate::imports::facts::level_of)
 }
 
-/// `#DIFFICULTY` when it is 1 to 5.
+/// `#DIFFICULTY` when it is 1 to 5, read as an attempt's is
+/// ([`crate::imports::facts::difficulty_of`]).
 fn difficulty(text: Option<&str>) -> Option<u8> {
-    text.and_then(|d| d.trim().parse().ok())
+    text.map(crate::imports::facts::difficulty_of)
         .filter(|d| (1..=5).contains(d))
 }
 
@@ -2557,15 +2668,18 @@ mod tests {
         assert_eq!(s.view(1, 1, true).rows[1].score, RowScore::Unplayed);
     }
 
-    /// A row's difficulty is `#DIFFICULTY` when it is 1 to 5, spaces aside.
+    /// A row's difficulty is `#DIFFICULTY` when it reads as an integer
+    /// from 1 to 5.
     #[test]
     fn a_difficulty_is_one_to_five() {
         for (text, want) in [
             ("1", Some(1)),
-            (" 5 ", Some(5)),
+            ("+5", Some(5)),
+            ("05", Some(5)),
             ("0", None),
             ("6", None),
             ("x", None),
+            ("５", None),
         ] {
             let mut e = entry(r"C:\charts\x\1.bms", "a");
             e.header.difficulty = Some(text.to_owned());
@@ -2794,10 +2908,10 @@ mod tests {
         assert_eq!(s.input(press(skin_model::Button::Left, 3)), Acted::Nothing);
     }
 
-    /// A chart row carries its level as a skin draws it, as the source's
-    /// `Integer.parseInt` reads `#PLAYLEVEL` (0 when it reads none), its
-    /// summary's long notes and mines, unknown without a summary, and
-    /// whether it draws; the chart under the cursor carries the same level.
+    /// A chart row carries its level as a skin draws it, `#PLAYLEVEL` read
+    /// as an integer token (0 when it reads none), its summary's long notes
+    /// and mines, unknown without a summary, and whether it draws; the
+    /// chart under the cursor carries the same level.
     #[test]
     fn a_chart_row_carries_its_level_value_features_and_random() {
         use bms_model::{ChartSummary, Tempo, TimeUs};
@@ -2828,6 +2942,7 @@ mod tests {
             chart(4, None, Some(summary(0, 0)), false),
             chart(5, Some("-3"), None, false),
             chart(6, Some("2147483648"), None, false),
+            chart(7, Some("１２"), None, false),
         ]);
         let v = s.view(0, 10, false);
         let read: Vec<_> = v
@@ -2845,6 +2960,7 @@ mod tests {
                 (0, None, true),
                 (0, f(false, false), false),
                 (-3, None, false),
+                (0, None, false),
                 (0, None, false),
             ]
         );

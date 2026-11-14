@@ -158,14 +158,7 @@ pub fn parse(
                 });
             }
             if !branches.directive(&upper, value, line, warnings)? && branches.active() {
-                // The image is not shown; that one is defined is a label,
-                // read from the line as the reference decoder reads it.
-                let untrimmed = raw_line.trim_start().strip_prefix('#').unwrap_or(body);
-                if defines_bga(untrimmed) {
-                    source.labels.bga = true;
-                } else {
-                    parse_header(&mut source, line, &upper, value, warnings)?;
-                }
+                parse_header(&mut source, line, &upper, value, warnings)?;
             }
         }
     }
@@ -175,72 +168,38 @@ pub fn parse(
     Ok(source)
 }
 
-/// Whether a command line, `body` after its `#` (its start trimmed, its
-/// end kept), defines a BGA image as the reference decoder registers one
-/// (jbms-parser `BMSDecoder`): `BMP` in any case, an object id in the next
-/// two characters, and at least seven UTF-16 units in all, the path read
-/// from the seventh on, whatever the sixth is, and kept even when it is
-/// only spaces. So `#BMP01` and two spaces registers, with one space it
-/// does not, and `#BMP001 a.bmp` registers id `00`. Its list holds every
-/// definition, whether or not a channel shows it, and a chart with one has
-/// a BGA (beatoraja `song/SongData.java:216`).
-pub(crate) fn defines_bga(body: &str) -> bool {
-    body.get(..3)
-        .is_some_and(|word| word.eq_ignore_ascii_case("BMP"))
-        && body.as_bytes().get(3..5).and_then(parse_base36).is_some()
-        && body.encode_utf16().nth(6).is_some()
+/// The object id a numbered definition's header name `upper` (upper-cased)
+/// defines: `prefix` and then exactly two base-36 characters.
+fn defined_id(upper: &str, prefix: &str) -> Option<u16> {
+    upper
+        .strip_prefix(prefix)
+        .filter(|rest| rest.len() == 2)
+        .and_then(|rest| parse_base36(rest.as_bytes()))
 }
 
-/// The first code point of each run of ten decimal digits, zero to nine,
-/// in the Basic Multilingual Plane: the characters of general category Nd
-/// there (Unicode 15.0), which `Character.digit(c, 10)` accepts.
-const DIGIT_ZEROS: [u32; 37] = [
-    0x0030, 0x0660, 0x06F0, 0x07C0, 0x0966, 0x09E6, 0x0A66, 0x0AE6, 0x0B66, 0x0BE6, 0x0C66, 0x0CE6,
-    0x0D66, 0x0DE6, 0x0E50, 0x0ED0, 0x0F20, 0x1040, 0x1090, 0x17E0, 0x1810, 0x1946, 0x19D0, 0x1A80,
-    0x1A90, 0x1B50, 0x1BB0, 0x1C40, 0x1C50, 0xA620, 0xA8D0, 0xA900, 0xA9D0, 0xA9F0, 0xAA50, 0xABF0,
-    0xFF10,
-];
-
-/// `c`'s value as a decimal digit, as `Character.digit(c, 10)` gives it
-/// for a UTF-16 code unit: a character outside the Basic Multilingual
-/// Plane is two surrogates, neither a digit.
-fn digit(c: char) -> Option<i64> {
-    let c = u32::from(c);
-    DIGIT_ZEROS
-        .iter()
-        .find(|&&zero| (zero..zero + 10).contains(&c))
-        .map(|&zero| i64::from(c - zero))
+/// Whether the header `upper` (its name, upper-cased) with `value`
+/// defines a BGA image: a `#BMPxx` definition, read as every numbered
+/// definition is, naming a file. Any such definition sets the chart's
+/// BGA flag, whether or not a channel shows it (design.md "Play
+/// Lifecycle", the chart's labels).
+pub(crate) fn defines_bga(upper: &str, value: &str) -> bool {
+    defined_id(upper, "BMP").is_some() && !value.is_empty()
 }
 
-/// `text` read as the reference decoder's `Integer.parseInt` reads a
-/// header value: one optional `+` or `-`, then one or more decimal digits
-/// ([`digit`]), the value within `i32`; `None` for anything else, the
-/// empty text and surrounding whitespace included.
-pub fn java_int(text: &str) -> Option<i32> {
-    let (negative, digits) = match text.strip_prefix('-') {
-        Some(digits) => (true, digits),
-        None => (false, text.strip_prefix('+').unwrap_or(text)),
-    };
-    if digits.is_empty() {
-        return None;
-    }
-    let mut value: i64 = 0;
-    for c in digits.chars() {
-        // Past `i32`'s magnitude the value is out of range either way.
-        value = value * 10 + digit(c)?;
-        if value > i64::from(i32::MAX) + 1 {
-            return None;
-        }
-    }
-    i32::try_from(if negative { -value } else { value }).ok()
+/// A header value read as an integer (design.md "Play Lifecycle", the
+/// chart's labels): an integer token, one optional `+` or `-` and then
+/// one or more ASCII digits `0`-`9`, within `i32`; `None` for anything
+/// else, other scripts' digits, inner whitespace and a value past `i32`
+/// included. `text` is the header's value as [`split_header`] trims it.
+pub fn header_integer(text: &str) -> Option<i32> {
+    text.parse().ok()
 }
 
-/// Whether `#DIFFICULTY value` replaces the difficulty so far: the
-/// reference decoder sets it only when `Integer.parseInt` reads the value
-/// (jbms-parser `CommandWord.DIFFICULTY`, a `NumberFormatException` only
-/// warned), so a later line it cannot read keeps the earlier value.
+/// Whether `#DIFFICULTY value` replaces the difficulty so far: the last
+/// `#DIFFICULTY` that reads as an integer counts, and a later line that
+/// does not keeps the earlier one (design.md "Play Lifecycle").
 pub(crate) fn sets_difficulty(value: &str) -> bool {
-    java_int(value).is_some()
+    header_integer(value).is_some()
 }
 
 /// Splits `NAME value`, trimming the value.
@@ -395,12 +354,6 @@ fn parse_header(
     value: &str,
     warnings: &mut Vec<Warning>,
 ) -> Result<(), LoadError> {
-    let defined_id = |prefix: &str| {
-        upper
-            .strip_prefix(prefix)
-            .filter(|rest| rest.len() == 2)
-            .and_then(|rest| parse_base36(rest.as_bytes()))
-    };
     let invalid =
         |what: &'static str, reason: &'static str| LoadError::InvalidValue { line, what, reason };
     let ignore = |warnings: &mut Vec<Warning>, what: &'static str| {
@@ -498,14 +451,16 @@ fn parse_header(
                 });
             }
         }
+        // The image is not shown; that one is defined is a label.
+        _ if defines_bga(upper, value) => source.labels.bga = true,
         _ if IGNORED_HEADERS.contains(&upper)
             || IGNORED_DEFINITIONS
                 .iter()
-                .any(|prefix| defined_id(prefix).is_some()) => {}
+                .any(|prefix| defined_id(upper, prefix).is_some()) => {}
         _ => {
-            if let Some(id) = defined_id("BPM") {
+            if let Some(id) = defined_id(upper, "BPM") {
                 source.bpm_defs.insert(id, bpm(value, line, "#BPMxx")?);
-            } else if let Some(id) = defined_id("STOP") {
+            } else if let Some(id) = defined_id(upper, "STOP") {
                 let v = parse_decimal(value).map_err(|e| invalid("#STOPxx", e.reason()))?;
                 if v.is_negative() {
                     return Err(LoadError::Unsupported {
@@ -514,7 +469,7 @@ fn parse_header(
                     });
                 }
                 source.stop_defs.insert(id, v);
-            } else if let Some(id) = defined_id("SCROLL") {
+            } else if let Some(id) = defined_id(upper, "SCROLL") {
                 // Read for a song list's preview alone; play ignores scroll
                 // changes, as the warning says.
                 if let Some(v) = header_value(value).number() {
@@ -524,7 +479,7 @@ fn parse_header(
                     line: Some(line),
                     kind: WarningKind::UnknownHeader(upper.to_owned()),
                 });
-            } else if let Some(id) = defined_id("WAV") {
+            } else if let Some(id) = defined_id(upper, "WAV") {
                 source.wavs.insert(
                     id,
                     Defined {

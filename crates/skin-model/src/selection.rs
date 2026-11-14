@@ -288,9 +288,9 @@ pub struct RowView {
     pub artist: String,
     /// `#PLAYLEVEL` as stored; empty when there is none.
     pub level: String,
-    /// `level` as a number, as a skin draws it: what Java's
-    /// `Integer.parseInt` reads, 0 when it reads none; 0 on a row that is
-    /// not a chart.
+    /// `level` as a number, as a skin draws it: `#PLAYLEVEL` read as an
+    /// integer token (an optional `+` or `-` and ASCII digits, within
+    /// `i32`), 0 when it reads none; 0 on a row that is not a chart.
     pub level_value: i32,
     /// `#DIFFICULTY` when it is 1 to 5.
     pub difficulty: Option<u8>,

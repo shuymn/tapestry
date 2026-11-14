@@ -9,7 +9,11 @@
 //! common objects, the gauge among them, then its `songlist`
 //! (`JsonSelectSkinObjectLoader.java:30-37`): the play loader's own
 //! objects are never looked up there. The result and decision loaders
-//! look up the common objects alone.
+//! look up the common objects alone. A play destination whose id the
+//! judge or the note also holds is refused by the caller
+//! (`Cx::destination`), which asks [`Objects::holds`]; so is failure
+//! presentation that draws nothing of its first object while a later
+//! table holds its id ([`Objects::held_after`]).
 
 use std::collections::HashMap;
 
@@ -136,4 +140,66 @@ impl Objects {
         }
         Ok(None)
     }
+
+    /// Whether `object`'s table has a record of id `id`. Unlike
+    /// [`Self::lookup`] it reports no record's error: a table that does
+    /// not index (an `id` that is an object, an array or a Lua float, or
+    /// the decoded-byte bound) is scanned record by record, uncached, its
+    /// error left to the lookup that reaches that table.
+    pub(crate) fn holds(
+        &mut self,
+        def: &mut Definition,
+        tables: &Tables,
+        id: &str,
+        object: Object,
+    ) -> bool {
+        let Some((slot, &(name, _))) = ORDER.iter().enumerate().find(|(_, (_, o))| *o == object)
+        else {
+            return false;
+        };
+        let Some(map) = self.maps.get_mut(slot) else {
+            return false;
+        };
+        if map.is_none() {
+            match index(def, records(tables, name), false) {
+                Ok(m) => *map = Some(m),
+                Err(_) => {
+                    return records(tables, name)
+                        .iter()
+                        .any(|&rec| matches!(id_of(def, rec), Ok(Some(s)) if s == id));
+                }
+            }
+        }
+        map.as_ref().is_some_and(|m| m.contains_key(id))
+    }
+
+    /// Whether a table a `kind` screen looks up after `first`'s has a
+    /// record of id `id` ([`Self::holds`], no record's error reported).
+    pub(crate) fn held_after(
+        &mut self,
+        def: &mut Definition,
+        tables: &Tables,
+        id: &str,
+        kind: ScreenKind,
+        first: Object,
+    ) -> bool {
+        let Some(start) = ORDER.iter().position(|&(_, o)| o == first) else {
+            return false;
+        };
+        ORDER
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .filter(|&(slot, _)| looked_up(kind, slot))
+            .any(|(_, &(_, object))| self.holds(def, tables, id, object))
+    }
+}
+
+/// The table name of `object`'s records, `None` for an object no table
+/// holds (a built-in image, a movie).
+pub(crate) fn table_name(object: Object) -> Option<&'static str> {
+    ORDER
+        .iter()
+        .find(|&&(_, o)| o == object)
+        .map(|&(name, _)| name)
 }

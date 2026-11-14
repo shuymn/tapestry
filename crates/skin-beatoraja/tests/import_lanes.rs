@@ -11,8 +11,8 @@ use common::{Loaded, d3_notes, dst, has, import_body, import_config, import_size
 use eval::{JudgeEvent, JudgeEventKind};
 use rules::Judgment;
 use skin_beatoraja::{
-    Config, CriticalPart, DeviationId, ImportError, Imported, LaneApprox, NoteKind, OffsetValue,
-    Severity, TrackWhy,
+    Config, CriticalPart, DeviationId, ImportError, Imported, LaneApprox, NoteKind, Object,
+    OffsetValue, Severity, TrackWhy,
 };
 use skin_model::{BarGroupError, LanesError, LoadError, Side};
 
@@ -1057,32 +1057,137 @@ fn a_note_offset_off_the_lanes_refuses() {
     );
 }
 
+/// The part and the object of a shared-id refusal.
+#[track_caller]
+fn id_taken(l: Loaded) -> (CriticalPart, Object) {
+    match l.err() {
+        ImportError::IdTaken { part, by, .. } => (part, by),
+        e => panic!("{e:?}"),
+    }
+}
+
+/// Every table is looked up before the note, so one holding the note's
+/// id takes it, whatever its asset does, and the lanes would have no
+/// destination: the skin is refused at the note destination.
 #[test]
-fn ids_resolve_in_table_order() {
-    // HIDDEN+ is looked up before the note: the destination is HIDDEN+'s
-    // paint, dropped without its file, and there are no lanes.
-    let hidden = format!(
-        r#"{}, "hiddenCover": [{{"id": "notes", "src": "a"}}]"#,
-        note("")
-    );
-    let l = import_body(&body("", &hidden, &[NOTES]));
-    assert_eq!(l.ok().scratch, None);
-    assert!(has(l.report(), NoteKind::MissingAsset));
-    // So is a pmchara: unsupported, dropped, and there are no lanes.
-    let chara = format!(
-        r#"{}, "pmchara": [{{"id": "notes", "src": "a"}}]"#,
-        note("")
-    );
-    let l = import_body(&body("", &chara, &[NOTES]));
-    assert_eq!(l.ok().scratch, None);
-    assert!(has(
-        l.report(),
-        NoteKind::Unsupported {
-            object: skin_beatoraja::Object::PmChara
-        }
+fn a_table_before_the_note_taking_its_id_refuses() {
+    let l = import_body(&body(
+        "",
+        &format!(
+            r#"{}, "pmchara": [{{"id": "notes", "src": "a"}}]"#,
+            note("")
+        ),
+        &[NOTES],
     ));
+    // `NOTES` opens line 20 of the definition, after the parts and the
+    // note member.
+    assert_eq!(
+        l.err().to_string(),
+        r#"s.json:20:466: the note lanes cannot be imported: its id "notes" is taken first by the `pmchara` table"#
+    );
+    for (objects, by) in [
+        (
+            r#""hiddenCover": [{"id": "notes", "src": "a"}]"#,
+            Object::HiddenCover,
+        ),
+        (
+            r#""judge": [{"id": "notes", "index": 0, "images": [], "numbers": []}]"#,
+            Object::Judge,
+        ),
+        (r#""bga": {"id": "notes"}"#, Object::Bga),
+    ] {
+        let objects = format!("{}, {objects}", note(""));
+        assert_eq!(
+            id_taken(import_body(&body("", &objects, &[NOTES]))),
+            (CriticalPart::Lanes, by),
+            "{objects}"
+        );
+    }
+    // An image, whether or not its file loads.
+    for src in ["a", "zz"] {
+        let image = format!(r#"{{"id": "notes", "src": "{src}", "w": 8, "h": 8}}"#);
+        assert_eq!(
+            id_taken(import_body(&body(&image, &note(""), &[NOTES]))),
+            (CriticalPart::Lanes, Object::Image),
+            "{src}"
+        );
+    }
+    // A negative id is a built-in image before any object.
+    let negative = note("").replace(r#""id": "notes""#, r#""id": "-111""#);
+    let dst = r#"{"id": "-111", "dst": [{"x": 0, "y": 0, "w": 0, "h": 0}]}"#;
+    assert_eq!(
+        id_taken(import_body(&body("", &negative, &[dst]))),
+        (CriticalPart::Lanes, Object::System)
+    );
     // A second note destination refuses.
     refused(lanes("", &[NOTES]), "note");
+}
+
+/// A judge or note record no drawable destination names changes nothing:
+/// a skin without them, one whose records no destination names, and one
+/// whose only destination of a shared id the configured options remove
+/// import as before, and a record's malformed `id` is reported only when
+/// a lookup reaches its table.
+#[test]
+fn unnamed_judge_or_notes_import_as_before() {
+    let deco = r#"{"id": "deco", "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;
+    let judge = r#""judge": [{"id": "j", "index": 0, "images": [], "numbers": []}]"#;
+    for objects in [
+        note(""),
+        judge.to_owned(),
+        String::new(),
+        r#""judge": [{"id": {}}]"#.to_owned(),
+        r#""note": {"id": {}}"#.to_owned(),
+    ] {
+        let l = import_body(&body(
+            r#"{"id": "deco", "src": "a", "w": 8, "h": 8}"#,
+            &objects,
+            &[deco],
+        ));
+        assert_eq!(l.ok().scratch, None, "{objects}");
+        assert!(l.report().notes.is_empty(), "{objects}: {:?}", l.report());
+    }
+    // An image `notes` with no `note` record is drawn.
+    let l = import_body(&body(
+        r#"{"id": "notes", "src": "a", "w": 8, "h": 8}"#,
+        "",
+        &[NOTES],
+    ));
+    assert_eq!(l.ok().scratch, None);
+    assert!(l.report().notes.is_empty(), "{:?}", l.report());
+    // The lanes and a judge `good`, and an alternative of option item 901,
+    // not selected, whose image set takes the id of a second judge.
+    let objects = format!(
+        r#""property": [{{"name": "p", "item": [{{"name": "on", "op": 900}},
+            {{"name": "off", "op": 901}}], "def": "on"}}], {},
+           "judge": [{{"id": "good", "index": 0, "numbers": [],
+                      "images": [{{"id": "g0", "dst": [{{"x": 100, "y": 500, "w": 80, "h": 20}}]}}]}},
+                     {{"id": "unused", "index": 1, "images": [], "numbers": []}}],
+           "imageset": [{{"id": "unused", "images": ["deco"]}}]"#,
+        note("")
+    );
+    let good = r#"{"id": "good", "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;
+    let unused = r#"{"id": "unused", "op": [901], "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;
+    let l = import_body(&body(
+        r#"{"id": "deco", "src": "a", "w": 8, "h": 8}"#,
+        &objects,
+        &[NOTES, good, unused],
+    ));
+    assert!(l.ok().scratch.is_some());
+    assert!(has(l.report(), NoteKind::Ignored { field: "op" }));
+    // Selected, the alternative takes the second judge's id.
+    let on = |c: &mut Config| c.options = vec![Some(901)];
+    let l = import_config(
+        [1_920, 1_080],
+        &body(
+            r#"{"id": "deco", "src": "a", "w": 8, "h": 8}"#,
+            &objects,
+            &[NOTES, good, unused],
+        ),
+        &[],
+        on,
+    );
+    assert_eq!(id_taken(l), (CriticalPart::Judge, Object::ImageSet));
 }
 
 #[test]
