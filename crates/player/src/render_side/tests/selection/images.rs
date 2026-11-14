@@ -254,6 +254,10 @@ fn a_selection_publication_draws_only_for_its_cursor_generation() {
     // Another cursor generation: the table is dropped before the next
     // frame, though nothing was published.
     cursor.store(2, Ordering::SeqCst);
+    // The render thread takes the fence between frames: a frame drawn
+    // before another cursor generation is pushed by then, so every frame after the clear
+    // began after it.
+    assert!(r.link.fence(Duration::from_secs(60)));
     r.frames.clear();
     assert!(r.frames.next(3, None).iter().all(draws_none));
     // A publication of the older generation publishes nothing.
@@ -435,6 +439,10 @@ fn a_rested_cursors_images_are_drawn() {
     r.frames.sample.store(false, Ordering::Release);
     // A move: not current from the next frame.
     w.cursor_changed(&coord);
+    // The render thread takes the fence between frames: a frame drawn
+    // before the move is pushed by then, so every frame after the clear
+    // began after it.
+    assert!(r.link.fence(Duration::from_secs(60)));
     r.frames.clear();
     assert!(r.frames.next(3, None).iter().all(draws_none));
     // A chart naming no image.
