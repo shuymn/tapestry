@@ -11,7 +11,7 @@ use common::play::{Drawn, MS, judged, tally};
 use common::{Loaded, d3_notes, has, import_sized};
 use eval::{JudgeEvent, JudgeEventKind};
 use rules::{GaugeValue, Judgment};
-use skin_beatoraja::{CriticalPart, ImportError, NoteKind};
+use skin_beatoraja::{CriticalPart, ImportError, NoteKind, Object};
 
 /// Grade `k`'s destination: image `gk` with `extra` fields.
 fn grade(k: usize, extra: &str) -> String {
@@ -827,62 +827,108 @@ fn shared_id(table: &str, record: &str) -> Loaded {
     import_sized([1_920, 1_080], &body, &[])
 }
 
-/// An image, text, slider, graph or LIFT holding the judge's id comes
-/// first in the lookup, so it is the destination's object whether or not
-/// its file, texture or font loads: an image that loads is drawn, one
-/// that does not draws nothing, and no judge is drawn either way.
+/// The part and the object of a shared-id refusal.
+fn id_taken(l: Loaded) -> (CriticalPart, Object) {
+    match l.err() {
+        ImportError::IdTaken { part, by, .. } => (part, by),
+        e => panic!("{e:?}"),
+    }
+}
+
+/// A table before the judge holding its id takes it, whether or not its
+/// file, texture or font loads, so the judge would have no destination:
+/// the skin is refused at the destination, which names the id, the part
+/// and the table.
 #[test]
-fn the_first_table_takes_a_judge_s_id() {
+fn a_table_before_the_judge_taking_its_id_refuses() {
     let l = shared_id("image", r#"{"id": "j", "src": "a", "w": 8, "h": 8}"#);
-    assert!(l.report().notes.is_empty(), "{:?}", l.report());
+    // The destination opens line 4 after 11 spaces and `"destination": [`.
     assert_eq!(
-        shown(&l, of(Judgment::Perfect, 12), 12, false),
-        [[0, 1_070, 10, 10]]
+        l.err().to_string(),
+        r#"s.json:4:28: the judgment display cannot be imported: its id "j" is taken first by the `image` table"#
     );
-    for (table, record, why) in [
+    for (table, record, by) in [
         (
             "image",
             r#"{"id": "j", "src": "gone", "w": 8, "h": 8}"#,
-            NoteKind::UndefinedSource,
+            Object::Image,
         ),
         (
             "image",
             r#"{"id": "j", "src": "zz", "w": 8, "h": 8}"#,
-            NoteKind::MissingAsset,
+            Object::Image,
         ),
         (
             "text",
             r#"{"id": "j", "font": "none", "ref": 12}"#,
-            NoteKind::Ignored { field: "font" },
+            Object::Text,
         ),
-        (
-            "slider",
-            r#"{"id": "j", "src": "gone"}"#,
-            NoteKind::UndefinedSource,
-        ),
+        ("slider", r#"{"id": "j", "src": "gone"}"#, Object::Slider),
         (
             "graph",
             r#"{"id": "j", "src": "gone", "type": -1}"#,
-            NoteKind::UndefinedSource,
-        ),
-        (
-            "graph",
-            r#"{"id": "j", "src": "gone", "type": 0}"#,
-            NoteKind::UndefinedSource,
+            Object::Graph,
         ),
         (
             "liftCover",
             r#"{"id": "j", "src": "gone"}"#,
-            NoteKind::UndefinedSource,
+            Object::LiftCover,
+        ),
+        (
+            "imageset",
+            r#"{"id": "j", "images": ["g0"]}"#,
+            Object::ImageSet,
+        ),
+        (
+            "hiddenCover",
+            r#"{"id": "j", "src": "a", "w": 8, "h": 8}"#,
+            Object::HiddenCover,
         ),
     ] {
-        let l = shared_id(table, record);
-        assert!(has(l.report(), why), "{record}: {:?}", l.report());
-        assert!(
-            shown(&l, of(Judgment::Perfect, 12), 12, false).is_empty(),
+        assert_eq!(
+            id_taken(shared_id(table, record)),
+            (CriticalPart::Judge, by),
             "{record}"
         );
     }
+}
+
+/// An id an image, the judge and the note all hold reports the judge.
+#[test]
+fn the_judge_is_reported_before_the_notes() {
+    use common::lanes::{body, note};
+    let objects = format!(
+        r#"{}, "judge": [{}]"#,
+        note("").replace(r#""id": "notes""#, r#""id": "x""#),
+        judge_rec(&grades(1), &[], "").replace(r#""id": "j""#, r#""id": "x""#)
+    );
+    let l = import_sized(
+        [1_920, 1_080],
+        &body(
+            r#"{"id": "x", "src": "a", "w": 8, "h": 8}"#,
+            &objects,
+            &[r#"{"id": "x", "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#],
+        ),
+        &[],
+    );
+    assert_eq!(id_taken(l), (CriticalPart::Judge, Object::Image));
+}
+
+/// A negative destination id is a built-in image before any object, so
+/// a judge of that id has no destination either.
+#[test]
+fn a_built_in_image_taking_the_judge_s_id_refuses() {
+    let body = format!(
+        r#"{}, "value": [], "judge": [{}],
+           "destination": [{{"id": "-110", "dst": [{{"x": 0, "y": 0, "w": 10, "h": 10}}]}}]"#,
+        images(),
+        judge_rec(&grades(1), &[], "").replace(r#""id": "j""#, r#""id": "-110""#)
+    );
+    let l = import_sized([1_920, 1_080], &body, &[]);
+    assert_eq!(
+        l.err().to_string(),
+        r#"s.json:4:28: the judgment display cannot be imported: its id "-110" is a built-in image's"#
+    );
 }
 
 #[test]
