@@ -295,6 +295,9 @@ pub struct SystemSounds {
     skipped_rerolls: u64,
     /// Starts refused while latched.
     refused: u64,
+    /// `[sounds] loop_result`, read once, in [`new`](Self::new): whether
+    /// the result's `clear` or `fail` loops.
+    loop_result: bool,
     named: HashSet<String>,
     #[cfg(test)]
     events: Vec<Event>,
@@ -376,6 +379,7 @@ impl SystemSounds {
     /// pushes once ready. A worker that cannot start latches the run, with
     /// nothing reserved.
     pub fn new(control: &mut AudioControl, setup: Setup, hooks: Hooks) -> Self {
+        let loop_result = setup.sounds.loop_result;
         let (ask_tx, ask_rx) = mpsc::sync_channel::<Ask>(1);
         let (reply_tx, reply_rx) = mpsc::channel::<Reply>();
         let spawned = (hooks.spawn)(Box::new(move || work(setup, ask_rx, reply_tx)));
@@ -399,6 +403,7 @@ impl SystemSounds {
             skipped: Vec::new(),
             skipped_rerolls: 0,
             refused: 0,
+            loop_result,
             named: HashSet::new(),
             #[cfg(test)]
             events: Vec::new(),
@@ -594,6 +599,52 @@ impl SystemSounds {
     /// Whether an entry's wait ended the run's way: taken once.
     pub const fn take_entry_end(&mut self) -> bool {
         mem::replace(&mut self.entry_ended, false)
+    }
+
+    /// Whether the newest generation pushed has a sound for `kind`, the
+    /// run unlatched. At Result that generation is the installed one: every
+    /// pick settled before READY and none is admitted until the next entry
+    /// to selection.
+    pub fn has(&self, kind: SystemKind) -> bool {
+        self.latched.is_none() && self.mapping.get(kind).is_some()
+    }
+
+    /// The result first shows (design.md "State Model", system sounds,
+    /// Result): `clear` when its own view cleared, `fail` otherwise, a
+    /// result with no lamp of its own included; looped and bound to the
+    /// newest generation pushed when `[sounds] loop_result` was set at
+    /// startup.
+    pub fn result_shown(&mut self, control: &mut AudioControl, cleared: bool) {
+        let kind = if cleared {
+            SystemKind::Clear
+        } else {
+            SystemKind::Fail
+        };
+        // Source: SF-015
+        self.start(control, kind, self.loop_result.then_some(self.newest));
+    }
+
+    /// The result's fade-out starts: with a skin's fade-out (`skinned`) and
+    /// a set that has `resultclose`, `clear` and `fail` stop and
+    /// `resultclose` starts; otherwise nothing, so `clear` or `fail` plays
+    /// on, and the built-in presentation, whose leaving is at once, plays
+    /// no `resultclose`.
+    pub fn result_fading(&mut self, control: &mut AudioControl, skinned: bool) {
+        // Source: SF-015
+        if !skinned || !self.has(SystemKind::ResultClose) {
+            return;
+        }
+        self.stop(control, SystemKind::Clear);
+        self.stop(control, SystemKind::Fail);
+        self.start(control, SystemKind::ResultClose, None);
+    }
+
+    /// Result is left: `clear`, `fail` and `resultclose` stop.
+    pub fn result_left(&mut self, control: &mut AudioControl) {
+        // Source: SF-015
+        for kind in [SystemKind::Clear, SystemKind::Fail, SystemKind::ResultClose] {
+            self.stop(control, kind);
+        }
     }
 
     /// Before recording opens: waits, in slices and with no time bound, for

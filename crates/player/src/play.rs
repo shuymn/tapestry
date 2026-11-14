@@ -425,6 +425,10 @@ pub struct PlayerRig<'a> {
     /// preparation leaves its lifetime. Until then a screen built again
     /// keeps it, an outro playing included.
     pub result_leaving: bool,
+    /// The result's `clear` or `fail` was asked for at its first show,
+    /// and Result has not been left since: a later show (a view switch, a
+    /// screen built again) starts none, and leaving stops them.
+    pub result_sounding: bool,
     /// The views the result has changed to so far, each printed once
     /// (dev-tools: a scripted view command is over once its view shows).
     #[cfg(feature = "dev-tools")]
@@ -458,6 +462,10 @@ pub struct PlayerRig<'a> {
     /// them.
     #[cfg(test)]
     pub opening_gates: std::sync::Arc<loading::OpeningGates>,
+    /// Tests: where the result's preparation waits at each poll while a
+    /// test holds it.
+    #[cfg(test)]
+    pub result_gate: std::sync::Arc<crate::render_side::TestGate>,
     /// Tests: each ended play's end and record, in order.
     #[cfg(test)]
     pub ended_plays: Vec<(game::PlayEnd, Option<replay::PlayRecord>)>,
@@ -1105,6 +1113,25 @@ impl PlayerRig<'_> {
     /// tuning while loading) whether selection, the practice page or a
     /// retry's preparation comes next.
     pub(crate) fn leave_result(&mut self) {
+        self.end_result_sounds();
+        self.end_result();
+    }
+
+    /// Result is left: its `clear`, `fail` and `resultclose` stop, once a
+    /// result sound was asked for (design.md "State Model", system sounds,
+    /// Result).
+    fn end_result_sounds(&mut self) {
+        if !std::mem::take(&mut self.result_sounding) {
+            return;
+        }
+        if let Some(sounds) = self.system_sounds.as_mut() {
+            // Source: SF-015
+            sounds.result_left(&mut self.audio.control);
+        }
+    }
+
+    /// [`leave_result`](Self::leave_result) but for the result's sounds.
+    fn end_result(&mut self) {
         let _ = self.controls.tuning().close_end_screen();
         #[cfg(feature = "dev-tools")]
         if self.presenter.current() {
@@ -2066,6 +2093,13 @@ impl Rig for PlayerRig<'_> {
         println!("dev: result outro began, view {pinned:?} pinned");
         #[cfg(not(feature = "dev-tools"))]
         let _ = pinned;
+        // The fade-out's start: a skin's (its timing given) swaps the
+        // result's sound for `resultclose` when the set has one; the
+        // built-in presentation's leaving, at once, plays none.
+        if let Some(sounds) = self.system_sounds.as_mut() {
+            // Source: SF-015
+            sounds.result_fading(&mut self.audio.control, timing.is_some());
+        }
         game::Outro::Begun(timing.map(flow_timing))
     }
 
@@ -2970,6 +3004,8 @@ impl Rig for PlayerRig<'_> {
 
     fn poll_result(&mut self, _prep: &mut (), deadline: TimeUs) -> game::Polled {
         loop {
+            #[cfg(test)]
+            self.result_gate.pass();
             // A script's step on the layout (dev-tools), at every look.
             #[cfg(feature = "dev-tools")]
             crate::dev::specialization_signal(self.controls, || self.input.fail_for_script());
@@ -3028,6 +3064,15 @@ impl Rig for PlayerRig<'_> {
         // draw before it.
         self.present_view(report, screen);
         self.send_end(tuning.get());
+        // The result's sound, at its first show only, by the play's own
+        // view's lamp whichever view shows; with no lamp of its own the play
+        // did not clear (design.md "State Model", system sounds, Result).
+        if !std::mem::replace(&mut self.result_sounding, true)
+            && let Some(sounds) = self.system_sounds.as_mut()
+        {
+            // Source: SF-015
+            sounds.result_shown(&mut self.audio.control, screen.own_cleared() == Some(true));
+        }
 
         self.result_shown();
         #[cfg(feature = "dev-tools")]
@@ -3131,7 +3176,12 @@ impl PlayerRig<'_> {
         if self.result_leaving {
             self.finish_result(crate::dev::scenario::Leaving::Left);
         }
-        self.leave_result();
+        // A built-in result's screen built again is no leaving either: its
+        // sound plays on, and the show after the rebuild starts none.
+        if self.result_leaving {
+            self.end_result_sounds();
+        }
+        self.end_result();
         self.retry_from = self.pending_retry.take();
         self.result_retries = ResultRetries::default();
         #[cfg(feature = "dev-tools")]

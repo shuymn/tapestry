@@ -1006,6 +1006,7 @@ fn rig<'a>(
         result_facts: None,
         result_offset: None,
         result_leaving: false,
+        result_sounding: false,
         #[cfg(feature = "dev-tools")]
         views_shown: 0,
         result_outro: None,
@@ -1020,6 +1021,8 @@ fn rig<'a>(
         audio_lost,
         #[cfg(test)]
         opening_gates: std::sync::Arc::default(),
+        #[cfg(test)]
+        result_gate: std::sync::Arc::default(),
         #[cfg(test)]
         ended_plays: Vec::new(),
         system_sounds: None,

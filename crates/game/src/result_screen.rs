@@ -390,6 +390,18 @@ impl ResultScreen {
         self.played
     }
 
+    /// Whether the play's own view cleared: its lamp is not failed
+    /// ([`ResultFigures::cleared`](crate::ResultFigures::cleared)),
+    /// whichever view is shown; `None` when the play has no lamp of its
+    /// own (no record, or its own evaluation failed).
+    #[must_use]
+    pub fn own_cleared(&self) -> Option<bool> {
+        match &self.own {
+            Some(Ok(own)) => Some(own.figures.cleared),
+            _ => None,
+        }
+    }
+
     /// The viewed entry.
     #[must_use]
     pub fn viewed(&self) -> Option<&ViewEntry> {

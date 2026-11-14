@@ -987,6 +987,82 @@ fn the_entry_loop_waits_for_its_pick() {
     run.audio.hold(false);
 }
 
+/// C27-1, C27-2, C27-3 (design.md "State Model", system sounds, Result):
+/// per outcome, `[sounds] loop_result` and whether the set has
+/// `resultclose`, stepped by hand: the result's show starts `clear` or
+/// `fail` in its reserved voice from the installed generation, looped
+/// under `loop_result`; the built-in presentation's leaving changes
+/// nothing; a skin's fade-out swaps it for `resultclose` when the set has
+/// one and otherwise leaves it playing; leaving Result ends every voice.
+// Source: SF-015
+#[cfg(feature = "dev-tools")]
+#[test]
+fn result_sounds_per_outcome() {
+    for cleared in [true, false] {
+        for looped in [false, true] {
+            for close in [false, true] {
+                let case = format!("cleared {cleared}, loop_result {looped}, resultclose {close}");
+                let fx = Fixture::new();
+                fx.sound("sound/A", SystemKind::Clear, 60_000);
+                fx.sound("sound/A", SystemKind::Fail, 40_000);
+                if close {
+                    fx.sound("sound/A", SystemKind::ResultClose, 30_000);
+                }
+                let opts = Opts {
+                    sounds: SoundSettings {
+                        loop_result: looped,
+                        ..SoundSettings::default()
+                    },
+                    ..Opts::default()
+                };
+                let mut run = Run::new(fx, opts);
+                run.settle();
+                let a = run.installed().expect("A installed");
+                assert_eq!(run.sounds.has(SystemKind::ResultClose), close, "{case}");
+                let (kind, other) = if cleared {
+                    (SystemKind::Clear, SystemKind::Fail)
+                } else {
+                    (SystemKind::Fail, SystemKind::Clear)
+                };
+                let voice = |run: &Run, k| run.audio.system(|v| v.reserved_voice(k));
+                run.audio.hold(true);
+                // Positive control: nothing sounds before the show.
+                assert_eq!(voice(&run, kind), None, "{case}");
+                assert_eq!(run.sounding(), 0, "{case}");
+                run.sounds.result_shown(&mut run.audio.control, cleared);
+                run.audio.step_now(1);
+                assert_eq!(voice(&run, kind), Some((a, looped)), "{case}: the show");
+                assert_eq!(voice(&run, other), None, "{case}: the show");
+                assert_eq!(run.sounding(), 1, "{case}: the show");
+                // The built-in presentation's leaving.
+                run.sounds.result_fading(&mut run.audio.control, false);
+                run.audio.step_now(1);
+                assert_eq!(voice(&run, kind), Some((a, looped)), "{case}: built-in");
+                assert_eq!(run.sounding(), 1, "{case}: built-in");
+                // A skin's fade-out.
+                run.sounds.result_fading(&mut run.audio.control, true);
+                run.audio.step_now(1);
+                if close {
+                    assert_eq!(voice(&run, kind), None, "{case}: the fade-out");
+                    assert_eq!(
+                        run.audio.system(SystemVoices::reserved_sounding),
+                        0,
+                        "{case}: the fade-out"
+                    );
+                    assert_eq!(run.sounding(), 1, "{case}: resultclose");
+                } else {
+                    assert_eq!(voice(&run, kind), Some((a, looped)), "{case}: the fade-out");
+                    assert_eq!(run.sounding(), 1, "{case}: the fade-out");
+                }
+                run.sounds.result_left(&mut run.audio.control);
+                run.audio.step_now(1);
+                assert_eq!(run.sounding(), 0, "{case}: Result left");
+                run.audio.hold(false);
+            }
+        }
+    }
+}
+
 /// S5, S7: an entry whose stop finds the sequence exhausted stops every
 /// kind at the terminal number, latches and returns the terminal empty
 /// generation, which ends the loop and the retired one-shot; set starts are
