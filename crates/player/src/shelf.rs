@@ -887,6 +887,13 @@ impl Shelf {
         self.stop_timeout = Some(bound);
     }
 
+    /// The next pass starts `after` the last one ended (tests: a library
+    /// no pass changes).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn set_rescan_after(&mut self, after: Duration) {
+        self.rescan_after = after;
+    }
+
     /// How long the end waits for the pass and the background measurement
     /// to stop.
     fn stop_timeout(&self) -> Duration {

@@ -224,6 +224,8 @@ struct Fake {
     ready_fails: bool,
     /// The audio output failed.
     output_failed: bool,
+    /// Audio's readiness answers `Cancelled`, this happening as it does.
+    audio_cancels: Option<FirstPoll>,
     /// Waits each preparation takes, a quit or a close during which
     /// cancels it.
     prepare_waits: usize,
@@ -460,6 +462,7 @@ impl Fake {
             poll_fails: false,
             ready_fails: false,
             output_failed: false,
+            audio_cancels: None,
             prepare_waits: 0,
             side: None,
             phases: Vec::new(),
@@ -668,9 +671,14 @@ impl Rig for Fake {
         Ok(())
     }
 
-    fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
+    fn prepare_audio(&mut self) -> Result<game::AudioReadiness, AudioWaitError> {
         self.steps.push("audio");
-        self.audio.as_mut().map_or(Ok(()), AudioControl::ready)
+        if let Some(what) = self.audio_cancels {
+            self.happen(what);
+            return Ok(game::AudioReadiness::Cancelled);
+        }
+        self.audio.as_mut().map_or(Ok(()), AudioControl::ready)?;
+        Ok(game::AudioReadiness::Ready)
     }
 
     fn begin_preparation(&mut self, loaded: &Loaded, key: game::PrepKey) -> game::PrepHandle {
@@ -4146,6 +4154,40 @@ fn a_terminal_event_at_a_stale_readiness_ends_the_play_at_once() {
             assert_eq!(rig.opens, 0, "{case}");
             assert!(!rig.steps.contains(&"commit"), "{case}: {:?}", rig.steps);
             assert!(rig.steps.contains(&"discard"), "{case}: {:?}", rig.steps);
+        }
+    }
+}
+
+/// ST15b: audio's readiness answering `Cancelled` (the quit key, a close
+/// or a thread failure during the system sounds' settlement) begins no
+/// preparation of the attempt: a quit or a close leaves the play, its
+/// quit taken, and a thread's failure ends the run with its own cause,
+/// never as an audio error. Recording never opens.
+#[test]
+fn cancelled_audio_readiness_begins_no_preparation() {
+    let cases = [
+        ("quit key", FirstPoll::Command(Command::Quit)),
+        ("close", FirstPoll::Close),
+        ("input", FirstPoll::InputFails),
+        ("audio", FirstPoll::AudioFails),
+    ];
+    for (case, what) in cases {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+        let mut rig = Fake::new(items, &[], 12_500_000);
+        rig.audio_cancels = Some(what);
+        let ran = game::live::run_chart(&mut loaded, &mut rig);
+        match case {
+            "input" => assert!(matches!(ran, Err(LiveError::Input(_))), "{case}: {ran:?}"),
+            "audio" => assert!(matches!(ran, Err(LiveError::Output(_))), "{case}: {ran:?}"),
+            _ => assert!(ran.is_ok(), "{case}: {ran:?}"),
+        }
+        assert!(rig.begun.is_empty(), "{case}: {:?}", rig.steps);
+        assert!(!rig.steps.contains(&"attempt"), "{case}: {:?}", rig.steps);
+        assert_eq!(rig.opens, 0, "{case}");
+        if case == "quit key" {
+            assert!(rig.commands.is_empty(), "{case}: the quit was not taken");
         }
     }
 }

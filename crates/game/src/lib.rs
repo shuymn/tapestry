@@ -97,9 +97,9 @@ pub use keys::{
     LearntRange, Press, ROLES, Refusal, SETTLE_TIME, capture_keys, capture_keys_within,
 };
 pub use live::{
-    CLOSE_FLOOR, Closing, ClosingEnd, FINISH_MARGIN, InputWaitError, Leave, LiveError, Opening,
-    Outro, PlayEnding, Polled, Rearm, ResultTiming, Rig, closing_deadline, closing_time,
-    fade_deadline, gated, hold_until,
+    AudioReadiness, CLOSE_FLOOR, Closing, ClosingEnd, FINISH_MARGIN, InputWaitError, Leave,
+    LiveError, Opening, Outro, PlayEnding, Polled, Rearm, ResultTiming, Rig, closing_deadline,
+    closing_time, fade_deadline, gated, hold_until,
 };
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,

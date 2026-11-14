@@ -310,13 +310,17 @@ pub trait Rig {
         Ok(())
     }
     /// Waits until audio is ready for a play: the previous play's switch
-    /// taken. Before recording opens.
+    /// taken and, where the rig has system sounds, every pick of theirs
+    /// settled (design.md "Play Lifecycle", preparing each attempt). Before
+    /// recording opens. [`AudioReadiness::Cancelled`] when the quit key, a
+    /// close or a thread failure ended the wait: no preparation of the
+    /// attempt follows.
     ///
     /// # Errors
     ///
     /// Why audio cannot play, which ends the run.
-    fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
-        Ok(())
+    fn prepare_audio(&mut self) -> Result<AudioReadiness, AudioWaitError> {
+        Ok(AudioReadiness::Ready)
     }
     /// Opens recording at the next input boundary, with chart time 0
     /// `lead_in` after it.
@@ -722,6 +726,32 @@ pub enum LiveError<S> {
     /// (design.md "Play Lifecycle", who loads).
     #[error("the chart's load failed")]
     Load(#[source] crate::coord::LoadFailure),
+}
+
+/// How audio's wait before recording opens ended
+/// ([`Rig::prepare_audio`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AudioReadiness {
+    /// Audio is ready for the play.
+    Ready,
+    /// The quit key, a close or a thread failure ended the wait.
+    Cancelled,
+}
+
+/// Audio's readiness before an attempt's preparation, for both of its
+/// callers (the attempt's commit and the loading state's opening):
+/// `Ok(true)` when ready; `Ok(false)` when the wait was cancelled and no
+/// thread failed, the caller's preparation then cancelled as its own
+/// cancellation is. A thread failure that ended the wait ends the run with
+/// its own cause ([`threads_over`]).
+pub(crate) fn audio_ready<R: Rig>(rig: &mut R) -> Result<bool, LiveError<R::ScreenError>> {
+    match rig.prepare_audio().map_err(LiveError::Audio)? {
+        AudioReadiness::Ready => Ok(true),
+        AudioReadiness::Cancelled => {
+            threads_over(rig)?;
+            Ok(false)
+        }
+    }
 }
 
 /// How the run ends when nothing else stopped it: with the input thread's
@@ -1385,7 +1415,11 @@ fn ready_to_commit<R: Rig>(
     number: u32,
     rig: &mut R,
 ) -> Result<bool, LiveError<R::ScreenError>> {
-    rig.prepare_audio().map_err(LiveError::Audio)?;
+    // Audio's wait left the way the preparation's own cancellation does.
+    if !audio_ready(rig)? {
+        while rig.take().is_some() {}
+        return Ok(false);
+    }
     match prepare_attempt(loaded, number, rig)? {
         Preparation::Ready => {}
         // The player left, or another thread failed: a failure is the

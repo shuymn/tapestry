@@ -107,6 +107,13 @@ pub trait AppRig: LoadingRig {
     fn recovered_selection(&mut self) {
         self.entered_selection();
     }
+    /// Whether the wait of the entry to selection just made
+    /// ([`entered_selection`](Self::entered_selection)) was ended by a
+    /// close or a thread failure, which then ends the run before
+    /// selection's first look; taken once. The default never is.
+    fn entry_ended(&mut self) -> bool {
+        false
+    }
     /// The shelf, or why it cannot open: called on every entry into
     /// selection, right after [`entered_selection`](Self::entered_selection)
     /// or [`recovered_selection`](Self::recovered_selection),
@@ -507,6 +514,12 @@ impl App {
                 rig.recovered_selection();
             } else {
                 rig.entered_selection();
+                // A close or a thread failure ended the entry's wait: the
+                // run ends here with the failure's cause, or, for a close,
+                // at the first look below.
+                if rig.entry_ended() {
+                    threads_over(rig)?;
+                }
             }
             rig.presets_changed(self.shelf.as_ref());
             self.events.on_event(&SessionEvent::Select);

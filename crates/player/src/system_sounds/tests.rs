@@ -33,7 +33,7 @@ const PATIENCE: Duration = Duration::from_secs(20);
 const SLICES: Duration = Duration::from_millis(10);
 
 /// Waits until `cond` holds, without polling the owner.
-fn wait(what: &str, mut cond: impl FnMut() -> bool) {
+pub(crate) fn wait(what: &str, mut cond: impl FnMut() -> bool) {
     let until = Instant::now() + PATIENCE;
     while !cond() {
         assert!(Instant::now() < until, "waited too long for {what}");
@@ -62,34 +62,34 @@ fn wav(frames: usize, level: i16) -> Vec<u8> {
 }
 
 /// A data root in a temporary folder.
-struct Fixture {
+pub(crate) struct Fixture {
     dir: tempfile::TempDir,
 }
 
 impl Fixture {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             dir: tempfile::tempdir().unwrap(),
         }
     }
 
-    fn root(&self) -> DataRoot {
+    pub(crate) fn root(&self) -> DataRoot {
         DataRoot::new(self.dir.path().to_owned())
     }
 
-    fn path(&self, rel: &str) -> PathBuf {
+    pub(crate) fn path(&self, rel: &str) -> PathBuf {
         self.dir.path().join(rel)
     }
 
     /// Writes `bytes` at `rel` under the data root.
-    fn write(&self, rel: &str, bytes: &[u8]) {
+    pub(crate) fn write(&self, rel: &str, bytes: &[u8]) {
         let p = self.path(rel);
         std::fs::create_dir_all(p.parent().unwrap()).unwrap();
         std::fs::write(p, bytes).unwrap();
     }
 
     /// `kind`'s `.wav` in `folder` (under the data root), `frames` long.
-    fn sound(&self, folder: &str, kind: SystemKind, frames: usize) {
+    pub(crate) fn sound(&self, folder: &str, kind: SystemKind, frames: usize) {
         self.write(
             &format!("{folder}/{}.wav", file_stem(kind)),
             &wav(frames, 1_000),
@@ -245,15 +245,15 @@ impl Clock for CountingClock {
 
 /// What the decoder seam does with a file.
 #[derive(Clone, Copy, Debug, Default)]
-struct Rule {
+pub(crate) struct Rule {
     /// Waits until the gate opens (a blocked read).
-    block: bool,
+    pub(crate) block: bool,
     /// Decodes on after a cancel.
-    ignore_cancel: bool,
-    panic: bool,
+    pub(crate) ignore_cancel: bool,
+    pub(crate) panic: bool,
     /// A silent sound of this many mono samples, not read from the file.
-    fake: Option<usize>,
-    delay: Option<Duration>,
+    pub(crate) fake: Option<usize>,
+    pub(crate) delay: Option<Duration>,
 }
 
 /// One decode's entry or return, at the seam clock's time.
@@ -266,7 +266,7 @@ struct Call {
 
 /// The worker's decoder: `OneFile` unless a rule names the file.
 #[derive(Clone)]
-struct Seam(Arc<SeamState>);
+pub(crate) struct Seam(Arc<SeamState>);
 
 struct SeamState {
     rules: Mutex<Vec<(PathBuf, Rule)>>,
@@ -277,7 +277,7 @@ struct SeamState {
 }
 
 impl Seam {
-    fn new(clock: Arc<dyn Clock>) -> Self {
+    pub(crate) fn new(clock: Arc<dyn Clock>) -> Self {
         Self(Arc::new(SeamState {
             rules: Mutex::new(Vec::new()),
             calls: Mutex::new(Vec::new()),
@@ -288,13 +288,13 @@ impl Seam {
     }
 
     /// `rule` for the file whose path ends with `suffix` (`B/clear.wav`).
-    fn rule(&self, suffix: &str, rule: Rule) {
+    pub(crate) fn rule(&self, suffix: &str, rule: Rule) {
         let mut rules = self.0.rules.lock().unwrap();
         rules.retain(|(p, _)| p != Path::new(suffix));
         rules.push((PathBuf::from(suffix), rule));
     }
 
-    fn open_gate(&self) {
+    pub(crate) fn open_gate(&self) {
         *self.0.gate.lock().unwrap() = true;
         self.0.opened.notify_all();
     }
@@ -304,7 +304,7 @@ impl Seam {
     }
 
     /// The decodes entered of the file ending with `suffix`.
-    fn opens(&self, suffix: &str) -> usize {
+    pub(crate) fn opens(&self, suffix: &str) -> usize {
         self.calls()
             .iter()
             .filter(|c| !c.returned && c.path.ends_with(suffix))
@@ -377,7 +377,7 @@ impl DecodeFile for Seam {
 
 /// The recovery state in memory, a write failing from a chosen one on.
 #[derive(Clone)]
-struct MemFs(Arc<MemState>);
+pub(crate) struct MemFs(Arc<MemState>);
 
 struct MemState {
     files: Mutex<HashMap<PathBuf, Vec<u8>>>,
@@ -388,7 +388,7 @@ struct MemState {
 }
 
 impl MemFs {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self(Arc::new(MemState {
             files: Mutex::new(HashMap::new()),
             writes: AtomicUsize::new(0),
@@ -521,8 +521,10 @@ impl Run {
             }),
         };
         let lines = Arc::clone(&said);
+        let logged = Arc::clone(&said);
         let hooks = Hooks {
             say: Box::new(move |line| lines.lock().unwrap().push(line.to_owned())),
+            log: Box::new(move |line| logged.lock().unwrap().push(line.to_owned())),
             clock: opts.clock,
             spawn: opts.spawn,
         };

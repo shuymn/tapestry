@@ -3057,6 +3057,21 @@ impl RenderLink {
         self.shared.loading_drawn.load(Ordering::Relaxed)
     }
 
+    /// What reads, from any thread, the stage the current loading
+    /// lifetime last reported (tests); `None` without one.
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn loading_stage(&self) -> impl Fn() -> Option<Stage> + Send + Sync + use<> {
+        let shared = Arc::clone(&self.shared);
+        move || {
+            let lifetime = shared.loading_slot().lifetime;
+            shared
+                .producer()
+                .as_ref()
+                .filter(|s| s.lifetime() == lifetime)
+                .map(LifetimeState::stage)
+        }
+    }
+
     /// The current loading lifetime: after [`begin_loading`](Self::begin_loading),
     /// the one it began.
     pub fn loading_lifetime(&self) -> u64 {
@@ -14782,7 +14797,7 @@ pub(crate) mod tests {
         /// Each restore that installed, with its kind, in order.
         restored: Arc<std::sync::Mutex<Vec<(ScreenKind, render::Installation)>>>,
         /// Restores of this kind are refused as on a healthy device.
-        refuse_restore: Arc<std::sync::Mutex<Option<ScreenKind>>>,
+        pub(crate) refuse_restore: Arc<std::sync::Mutex<Option<ScreenKind>>>,
         /// Restores of this kind fail as a lost surface.
         fail_restore: Arc<std::sync::Mutex<Option<ScreenKind>>>,
         /// Each loading frame's device, lifetime and origin.
@@ -17049,7 +17064,10 @@ pub(crate) mod tests {
     /// Fails the installers' screen and builds it again through the render
     /// thread's own recovery (a preparation of the chart): what the new
     /// screen's build answers.
-    fn rebuild(screens: &Installers, link: &super::RenderLink) -> Result<(), ScreenError> {
+    pub(crate) fn rebuild(
+        screens: &Installers,
+        link: &super::RenderLink,
+    ) -> Result<(), ScreenError> {
         screens.fail.store(true, Ordering::Release);
         link.send(RenderMsg::Menu(Box::default()));
         assert!(wait_until(|| link.failed()));

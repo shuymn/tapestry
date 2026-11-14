@@ -29,10 +29,11 @@
 //! outside play drops it and names the latch, before that call releases
 //! any return's charge.
 //!
-//! Lines this owner names (refused files, skipped re-rolls, the latch) go
-//! to the `say` hook its caller gives; this file never names the log
-//! facade, since [`SystemSounds::start`], [`SystemSounds::stop`] and
-//! [`SystemSounds::latch`] are in-play code.
+//! Lines this owner names for the player (refused files, a quarantined or
+//! skipped source, the latch) go to the `say` hook its caller gives, and
+//! lines only for the log (skipped re-rolls) to the `log` hook; this file
+//! never names the log facade, since [`SystemSounds::start`],
+//! [`SystemSounds::stop`] and [`SystemSounds::latch`] are in-play code.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -95,13 +96,6 @@ impl fmt::Display for Reason {
 
 /// How the settlement before recording ended.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "the settlement is wired into the attempt's preparation later"
-    )
-)]
 pub enum Settled {
     /// Every pick reported and what was pushed is acknowledged.
     Ready,
@@ -119,10 +113,6 @@ pub trait Clock: Send + Sync {
 
 /// The system's clock.
 #[derive(Clone, Copy, Debug, Default)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "nothing makes the system sounds' owner yet")
-)]
 pub struct RealClock;
 
 impl Clock for RealClock {
@@ -139,10 +129,6 @@ impl Clock for RealClock {
 pub type Spawn = fn(Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>>;
 
 /// Starts `body` on a thread named `system-sounds`.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "nothing makes the system sounds' owner yet")
-)]
 pub fn spawn_worker(body: Box<dyn FnOnce() + Send>) -> std::io::Result<JoinHandle<()>> {
     thread::Builder::new()
         .name("system-sounds".to_owned())
@@ -172,7 +158,6 @@ pub struct Setup {
 
 impl Setup {
     /// The run's setup: the disk, the decoders and a random pick.
-    #[expect(dead_code, reason = "nothing makes the system sounds' owner yet")]
     pub fn new(root: DataRoot, sounds: SoundSettings, rate: u32) -> Self {
         Self {
             root,
@@ -189,12 +174,41 @@ impl Setup {
 
 /// How the owner waits, starts its worker and names what it names.
 pub struct Hooks {
-    /// Takes each line the owner names, once each.
+    /// Takes each line the owner names for the player, once each.
     pub say: Box<dyn FnMut(&str) + Send>,
+    /// Takes each line only for the log: an entry's skipped re-roll, and
+    /// the run's count of them.
+    pub log: Box<dyn FnMut(&str) + Send>,
     /// The waits' clock.
     pub clock: Arc<dyn Clock>,
     /// Starts the worker.
     pub spawn: Spawn,
+}
+
+/// Tests: what sets up an owner the rig makes.
+#[cfg(test)]
+type Arming = Box<dyn FnOnce(&mut Setup, &mut Hooks)>;
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: what arms the next owner made on this thread, through the
+    /// rig ([`arm`]).
+    static ARMED: std::cell::RefCell<Option<Arming>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: the next owner the rig makes on this thread is set up through
+/// `f` (its sets, decoder, recovery state and clock).
+#[cfg(all(test, feature = "dev-tools"))]
+pub fn arm(f: impl FnOnce(&mut Setup, &mut Hooks) + 'static) {
+    ARMED.with_borrow_mut(|a| *a = Some(Box::new(f)));
+}
+
+/// Tests: applies what [`arm`] set, once.
+#[cfg(test)]
+pub fn take_armed(setup: &mut Setup, hooks: &mut Hooks) {
+    if let Some(f) = ARMED.with_borrow_mut(Option::take) {
+        f(setup, hooks);
+    }
 }
 
 /// What the game thread asks the worker.
@@ -293,6 +307,9 @@ pub struct SystemSounds {
     /// Empty installs the latch pushed.
     #[cfg(test)]
     latch_installs: u32,
+    /// Calls of [`poll`](Self::poll).
+    #[cfg(test)]
+    polls: u32,
 }
 
 /// The worker's loop: open the recovery state, then one pick per ask.
@@ -362,10 +379,6 @@ impl SystemSounds {
     /// Starts the worker and admits the startup pick, whose generation it
     /// pushes once ready. A worker that cannot start latches the run, with
     /// nothing reserved.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "nothing makes the system sounds' owner yet")
-    )]
     pub fn new(control: &mut AudioControl, setup: Setup, hooks: Hooks) -> Self {
         let (ask_tx, ask_rx) = mpsc::sync_channel::<Ask>(1);
         let (reply_tx, reply_rx) = mpsc::channel::<Reply>();
@@ -397,6 +410,8 @@ impl SystemSounds {
             max_retired: 0,
             #[cfg(test)]
             latch_installs: 0,
+            #[cfg(test)]
+            polls: 0,
         };
         match spawned {
             Ok(handle) => {
@@ -488,11 +503,11 @@ impl SystemSounds {
     /// a report, pushing a ready generation at once; the acknowledgement;
     /// the returned generations, dropped here and uncharged. Never admits.
     /// Called outside play only.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "selection's look calls it once the owner is made")
-    )]
     pub fn poll(&mut self, control: &mut AudioControl) {
+        #[cfg(test)]
+        {
+            self.polls += 1;
+        }
         self.service(control);
         self.drain_deferred();
     }
@@ -567,14 +582,13 @@ impl SystemSounds {
             "the retired generation's return"
         };
         self.skipped_rerolls += 1;
-        (self.hooks.say)(&format!(
+        (self.hooks.log)(&format!(
             "system sounds: the sets were not picked again at this entry: {what} did not come within {} s",
             ENTRY_SETTLE_WAIT.as_secs()
         ));
     }
 
     /// Whether an entry's wait ended the run's way: taken once.
-    #[expect(dead_code, reason = "App::run asks it once the owner is made")]
     pub const fn take_entry_end(&mut self) -> bool {
         mem::replace(&mut self.entry_ended, false)
     }
@@ -591,13 +605,6 @@ impl SystemSounds {
     /// [`AudioWaitError::Timeout`] when the acknowledgement does not come
     /// within [`SWITCH_TIMEOUT`], [`AudioWaitError::Gone`] when the audio
     /// thread has ended.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the settlement is wired into the attempt's preparation later"
-        )
-    )]
     pub fn settle_before_recording(
         &mut self,
         control: &mut AudioControl,
@@ -641,13 +648,6 @@ impl SystemSounds {
     /// [`STOP_WAIT`], then left to end with the process), drops what the
     /// game thread holds and takes the returns, the deferred-drop slot
     /// drained before any return's charge is released. Idempotent.
-    #[cfg_attr(
-        not(test),
-        expect(
-            dead_code,
-            reason = "the rig's shutdown closes it once the owner is made"
-        )
-    )]
     pub fn close(&mut self, control: &mut AudioControl) {
         if self.closed {
             return;
@@ -658,7 +658,7 @@ impl SystemSounds {
         self.drain_deferred();
         if self.skipped_rerolls > 0 {
             let n = self.skipped_rerolls;
-            (self.hooks.say)(&format!(
+            (self.hooks.log)(&format!(
                 "system sounds: {n} selection entries kept the sets they had"
             ));
         }
@@ -948,11 +948,32 @@ impl SystemSounds {
     /// and the reservation of the pick decoding.
     #[cfg_attr(
         not(test),
-        expect(dead_code, reason = "nothing makes the system sounds' owner yet")
+        expect(dead_code, reason = "only the tests read the charge")
     )]
     pub fn charged(&self) -> u64 {
         self.alive.iter().map(|&(_, b)| b).sum::<u64>()
             + self.in_flight.as_ref().map_or(0, |_| PICK_BYTES)
+    }
+}
+
+#[cfg(all(test, feature = "dev-tools"))]
+impl SystemSounds {
+    /// Whether a pick is decoding, and whether it was asked to stop.
+    pub(crate) fn pick_running(&self) -> Option<bool> {
+        self.in_flight
+            .as_ref()
+            .map(|f| f.cancel.load(Ordering::Acquire))
+    }
+
+    /// The generations pushed, in order.
+    pub(crate) fn pushed(&self) -> Vec<GenId> {
+        self.events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Pushed(id) => Some(*id),
+                _ => None,
+            })
+            .collect()
     }
 }
 
@@ -966,5 +987,7 @@ impl Drop for SystemSounds {
     }
 }
 
+#[cfg(all(test, feature = "dev-tools"))]
+mod rig_tests;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

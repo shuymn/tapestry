@@ -489,6 +489,11 @@ struct Headless {
     /// The plays saved when each pause came.
     paused_before_save: Vec<usize>,
     entries: usize,
+    /// The entries whose wait a run-ending signal ended, by entry number
+    /// (1 the first): `entry_ended` answers true once for each.
+    entry_ends: Vec<usize>,
+    /// Calls of `choose`.
+    chose: usize,
     /// The idle waits made so far at each pass of the practice page that
     /// polled its jobs.
     page_polls: Vec<usize>,
@@ -774,6 +779,8 @@ impl Headless {
             turntable: Vec::new(),
             paused_before_save: Vec::new(),
             entries: 0,
+            entry_ends: Vec::new(),
+            chose: 0,
             violations: Vec::new(),
             loads: Vec::new(),
             refusals: Vec::new(),
@@ -1102,11 +1109,11 @@ impl Rig for Headless {
         Ok(())
     }
 
-    fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
+    fn prepare_audio(&mut self) -> Result<game::AudioReadiness, AudioWaitError> {
         if self.audio_gone {
             return Err(AudioWaitError::Gone);
         }
-        Ok(())
+        Ok(game::AudioReadiness::Ready)
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
@@ -1359,6 +1366,7 @@ impl AppRig for Headless {
     }
 
     fn choose(&mut self) -> Option<Pick> {
+        self.chose += 1;
         // The steps due before a choice are taken with it, as one batch.
         while let Some(Act::Preset(step)) = self.due_act() {
             self.consume();
@@ -1569,6 +1577,13 @@ impl AppRig for Headless {
         self.in_selection = true;
         self.entries += 1;
         self.seen.push(Seen::Select);
+    }
+
+    fn entry_ended(&mut self) -> bool {
+        let entry = self.entries;
+        let ended = self.entry_ends.contains(&entry);
+        self.entry_ends.retain(|&e| e != entry);
+        ended
     }
 
     fn practice_read(
@@ -2570,6 +2585,50 @@ fn audio_failure_ends_the_run() {
     );
     assert!(rig.refusals.is_empty());
     assert_eq!(rig.starts, 0);
+}
+
+/// ST7f: an entry whose wait a run-ending signal ended ends the run before
+/// selection's first look, with the signal's cause: an audio output
+/// failure as `LiveError::Output`, an input failure as `LiveError::Input`,
+/// a close as the run's ordinary end; selection never chooses. An entry
+/// that did not end keeps today's contract: an output failure set at the
+/// entry is found at the chosen chart's preparation, after selection chose.
+#[test]
+fn an_entry_a_signal_ended_ends_the_run() {
+    for case in ["output", "input", "close"] {
+        let acts = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
+        let (rig, _, ran) = run(Refusal::Missing, acts, |r| {
+            r.entry_ends = vec![1];
+            match case {
+                "output" => r.output_failed = true,
+                "input" => r.input_fails_at = CLOCK_START,
+                _ => r.quitting = true,
+            }
+        });
+        match case {
+            "output" => assert!(
+                matches!(ran, Err(LiveError::Output(audio::OutputError::DeviceLost))),
+                "{case}: {ran:?}"
+            ),
+            "input" => assert!(
+                matches!(ran, Err(LiveError::Input(InputWaitError::Gone))),
+                "{case}: {ran:?}"
+            ),
+            _ => assert!(ran.is_ok(), "{case}: {ran:?}"),
+        }
+        assert_eq!(rig.chose, 0, "{case}");
+        assert_eq!(rig.seen, [Seen::Select], "{case}");
+    }
+    // Not ended: selection chooses, and the chart's preparation finds the
+    // failure.
+    let acts = vec![(0, Act::Choose(0)), (4_000, Act::Close)];
+    let (rig, _, ran) = run(Refusal::Missing, acts, |r| r.output_failed = true);
+    assert!(
+        matches!(ran, Err(LiveError::Output(audio::OutputError::DeviceLost))),
+        "{ran:?}"
+    );
+    assert!(rig.chose > 0);
+    assert_eq!(rig.seen, [Seen::Select, Seen::Load(0)]);
 }
 
 /// The window closes while a chart loads: no play opens and the run ends.

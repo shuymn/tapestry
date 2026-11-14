@@ -1353,12 +1353,19 @@ fn auto_play_saves_nothing_and_judges_every_note_perfect() {
         .map(|p| p.strip_prefix(&root).unwrap().display().to_string())
         .collect();
     kept.sort();
-    // The settings and the run's log are kept; no play is (design.md
-    // "Autoplay", "Log File"), and the built-in preset is never written
+    // The settings, the run's log and the system sounds' recovery state
+    // with its lock are kept; no play is (design.md "Autoplay", "Log
+    // File", "Threat Model" T18), and the built-in preset is never written
     // (design.md "Standard Presets").
     assert_eq!(
         kept,
-        ["device.toml", "logs\\tapestry.lock", "logs\\tapestry.log"],
+        [
+            "device.toml",
+            "logs\\tapestry.lock",
+            "logs\\tapestry.log",
+            "sound-sets.lock",
+            "sound-sets.toml"
+        ],
         "{kept:?}"
     );
 }

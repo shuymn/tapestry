@@ -397,9 +397,9 @@ impl SkinFeed {
         self.seen = None;
     }
 
-    /// The lifetime and revision of the update published last
-    /// (dev-tools: a selection capture is armed with it).
-    #[cfg(feature = "dev-tools")]
+    /// The lifetime and revision of the update published last: a look
+    /// tells by it whether it published a page (and, in dev-tools, a
+    /// selection capture is armed with it).
     #[must_use]
     pub const fn published(&self) -> (u64, u64) {
         (self.lifetime, self.revision)
