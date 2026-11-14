@@ -1464,7 +1464,7 @@ mod system_sounds {
         SimDevice, Sound, SoundBank, SystemGeneration, SystemKind, Wake,
     };
     use bms_model::TimeUs;
-    use game::{AudioControl, AudioWorker, SystemStartError, audio_control};
+    use game::{AudioControl, AudioWorker, RESERVED_HEADROOM, SystemStartError, audio_control};
 
     use super::common::{PERIOD, RATE};
 
@@ -1644,8 +1644,9 @@ mod system_sounds {
     }
 
     /// S7: a stop is a word of its own, never queued behind starts: with
-    /// the start ring full, a stop still ends its kind's loop in the
-    /// retired generation at the next step, which then goes back; the
+    /// the start ring full (one-shots up to the reserved kinds' headroom,
+    /// reserved starts in the rest), a stop still ends its kind's loop in
+    /// the retired generation at the next step, which then goes back; the
     /// start the full ring refused is counted, and a start after the stop
     /// plays.
     #[test]
@@ -1662,13 +1663,16 @@ mod system_sounds {
         let b = install(&mut control, b);
         steps(&mut worker, &mut out, 1);
         assert_eq!(worker.engine().system().retired(), Some(a));
-        for _ in 0..audio::SYSTEM_STARTS {
-            control
-                .system_start(SystemKind::Scratch, false, None)
-                .unwrap();
+        for n in 0..audio::SYSTEM_STARTS {
+            let kind = if n < audio::SYSTEM_STARTS - RESERVED_HEADROOM {
+                SystemKind::Scratch
+            } else {
+                SystemKind::Fail
+            };
+            control.system_start(kind, false, None).unwrap();
         }
         assert_eq!(
-            control.system_start(SystemKind::Scratch, false, None),
+            control.system_start(SystemKind::Fail, false, None),
             Err(SystemStartError::Full)
         );
         assert_eq!(control.counters().system_refused(), 1);
@@ -1683,6 +1687,71 @@ mod system_sounds {
         steps(&mut worker, &mut out, 1);
         assert_eq!(sounding(&worker), 1, "a start after the stop plays");
         assert_eq!(control.counters().system_refused(), 1);
+    }
+
+    /// R1 (design.md "Audio", Mixing): one-shot starts never take the
+    /// start ring's last four places. With the audio thread not stepped,
+    /// 70 scroll starts queue 60 and refuse 10, counted; the four reserved
+    /// kinds still queue, a fifth reserved start finds the ring full, and
+    /// once a step has taken the ring a scroll start queues again. The step
+    /// starts each reserved kind in its own voice and fills the one-shot
+    /// part, the starts beyond it dropped and counted.
+    #[test]
+    fn one_shots_leave_room_for_the_reserved_kinds() {
+        let (mut control, mut worker, mut out) = rig();
+        let long = constant(1_000, 10 * RATE as usize);
+        let kinds = [
+            SystemKind::Scratch,
+            SystemKind::Decide,
+            SystemKind::Select,
+            SystemKind::Clear,
+            SystemKind::Fail,
+        ];
+        let a = pick(&control, &kinds.map(|k| (k, Arc::clone(&long))));
+        let a = install(&mut control, a);
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(control.system_installed(), Some(a));
+        assert_eq!(control.counters().system_refused(), 0);
+        let scrolls: Vec<_> = (0..70)
+            .map(|_| control.system_start(SystemKind::Scratch, false, None))
+            .collect();
+        let queued = scrolls.iter().filter(|r| r.is_ok()).count();
+        assert_eq!(queued, 60);
+        assert!(scrolls[..60].iter().all(Result::is_ok), "{scrolls:?}");
+        assert!(
+            scrolls[60..]
+                .iter()
+                .all(|r| *r == Err(SystemStartError::Full)),
+            "{scrolls:?}"
+        );
+        assert_eq!(control.counters().system_refused(), 10);
+        for kind in [
+            SystemKind::Decide,
+            SystemKind::Select,
+            SystemKind::Clear,
+            SystemKind::Fail,
+        ] {
+            assert!(
+                control.system_start(kind, false, None).is_ok(),
+                "{kind:?} refused"
+            );
+        }
+        assert_eq!(
+            control.system_start(SystemKind::Decide, false, None),
+            Err(SystemStartError::Full)
+        );
+        assert_eq!(control.counters().system_refused(), 11);
+        steps(&mut worker, &mut out, 1);
+        let system = worker.engine().system();
+        assert_eq!(system.reserved_sounding(), 4);
+        assert_eq!(system.sounding(), audio::SYSTEM_VOICES + 4);
+        // 60 scroll starts taken by 32 voices: 28 dropped.
+        assert_eq!(control.counters().system_refused(), 11 + 28);
+        assert!(
+            control
+                .system_start(SystemKind::Scratch, false, None)
+                .is_ok()
+        );
     }
 
     /// S5, S11, S13: the empty install alone, with no stop raised, is the

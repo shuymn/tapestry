@@ -118,6 +118,13 @@ pub const SEQ_LIMIT: u64 = 1 << 63;
 /// The number never issued: the stop of a kind whose stop was asked for
 /// once the sequence was exhausted, and the empty install's number then.
 pub const TERMINAL: u64 = u64::MAX;
+/// The start ring's last places, which a start of a kind without a
+/// reserved voice never takes: one for each reserved kind
+/// ([`RESERVED_KINDS`]). A state starts at most one reserved kind per
+/// visit and the audio thread takes the ring at every step, so a burst of
+/// one-shots never refuses a reserved kind's start (design.md "Audio",
+/// Mixing).
+pub const RESERVED_HEADROOM: usize = RESERVED_KINDS.len();
 
 /// Why a system sound's start was not queued.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
@@ -1345,12 +1352,17 @@ impl AudioControl {
     /// bound to `generation` when given (it plays only from that one), and
     /// publishes the number. Returns the number.
     ///
+    /// A kind without a reserved voice leaves the ring's last
+    /// [`RESERVED_HEADROOM`] places to the reserved kinds.
+    ///
     /// # Errors
     ///
-    /// [`SystemStartError::Full`] when the start ring is full, before any
-    /// number is drawn, and [`SystemStartError::Exhausted`] once the
-    /// sequence is; each is counted ([`AudioCounters::system_refused`]),
-    /// except an exhausted decision sound's.
+    /// [`SystemStartError::Full`] when the start ring is full, or, for a
+    /// kind without a reserved voice, holds no more than
+    /// [`RESERVED_HEADROOM`] free places, before any number is drawn; and
+    /// [`SystemStartError::Exhausted`] once the sequence is; each is
+    /// counted ([`AudioCounters::system_refused`]), except an exhausted
+    /// decision sound's.
     pub fn system_start(
         &mut self,
         kind: SystemKind,
@@ -1365,7 +1377,12 @@ impl AudioControl {
             }
             Err(e)
         };
-        if self.system_starts.is_full() {
+        let room = if kind.is_reserved() {
+            0
+        } else {
+            RESERVED_HEADROOM
+        };
+        if self.system_starts.slots() <= room {
             return refused(SystemStartError::Full);
         }
         let Some(seq) = self.system_seq() else {
