@@ -25,23 +25,21 @@ type GraphKey = (PathBuf, [u8; 32]);
 #[derive(Debug, Default)]
 pub struct GraphCache {
     cached: Option<(GraphKey, Option<Arc<ChartGraphs>>)>,
-    /// A list refresh came since the last sync: an absence is read again.
-    retry: bool,
 }
 
 impl GraphCache {
-    /// The list was read again: an absence held is read again at the next
-    /// sync.
+    /// The list was read again: an absence held is dropped, so the next
+    /// sync reads it again.
     pub fn refreshed(&mut self) {
-        self.retry = true;
+        if matches!(self.cached, Some((_, None))) {
+            self.cached = None;
+        }
     }
 
     /// The graphs of `entry`, the chart under the cursor, from `shelf`:
-    /// the cached ones while its key is the same and they are not an
-    /// absence a refresh came after; none, releasing the cache, without a
-    /// chart.
+    /// the cached ones while its key is the same; none, releasing the
+    /// cache, without a chart.
     pub fn sync(&mut self, entry: Option<&ChartEntry>, shelf: &Shelf) -> Option<Arc<ChartGraphs>> {
-        let retry = std::mem::replace(&mut self.retry, false);
         let Some(entry) = entry else {
             self.cached = None;
             return None;
@@ -49,7 +47,6 @@ impl GraphCache {
         if let Some(((path, sha256), graphs)) = &self.cached
             && *path == entry.path
             && *sha256 == entry.sha256
-            && (graphs.is_some() || !retry)
         {
             return graphs.clone();
         }
@@ -71,7 +68,6 @@ impl GraphCache {
     /// Selection is left: the cache goes with it.
     pub fn clear(&mut self) {
         self.cached = None;
-        self.retry = false;
     }
 
     /// What the cache holds (tests): `None` empty, `Some(false)` an
