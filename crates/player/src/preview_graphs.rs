@@ -76,7 +76,7 @@ impl GraphCache {
 
     /// What the cache holds (tests): `None` empty, `Some(false)` an
     /// absence, `Some(true)` graphs.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dev-tools"))]
     pub fn state(&self) -> Option<bool> {
         self.cached.as_ref().map(|(_, g)| g.is_some())
     }

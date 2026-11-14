@@ -188,3 +188,34 @@ fn a_stationary_cursor_follows_a_changed_file() {
         assert_ne!(after.1, before.1, "the key changed");
     });
 }
+
+/// Chart C as scanned: 150.5 BPM with ten taps in measure 0, then 200
+/// (channel 03) from measure 1 with three: the published graphs carry the
+/// exact MAIN 150.5 and the rows 150.5 and 200 through the library's
+/// store, while 92 shows the whole 150.
+#[test]
+fn the_scanned_graphs_keep_the_exact_main() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = "#TITLE a\n#BPM 150.5\n#00018:01010101010101010101\n#00103:C8\n#00119:010101\n";
+    let (sel, _) = on_chart(dir.path(), c);
+    let screens = Installers::default();
+    on_selection(sel, &screens, screens.spawn_bare(), |rig| {
+        let u = drawn(rig, &screens);
+        let selected = u.view.selected.as_ref().unwrap();
+        assert_eq!(selected.info.and_then(|i| i.main_bpm), Some(150));
+        let graphs = selected.graphs.as_ref().expect("graphs");
+        let bpm = |units: u128| bms_model::Tempo::from_units(units).unwrap();
+        let exact =
+            bpm(150 * bms_model::Tempo::UNITS_PER_BPM + bms_model::Tempo::UNITS_PER_BPM / 2);
+        assert_eq!(graphs.main, Some(Some(exact)));
+        let tempos: Vec<_> = graphs
+            .rows
+            .as_ref()
+            .unwrap()
+            .iter()
+            .map(|r| r.tempo)
+            .collect();
+        let fast = bpm(200 * bms_model::Tempo::UNITS_PER_BPM);
+        assert_eq!(tempos, [Some(exact), Some(fast), Some(fast)]);
+    });
+}
