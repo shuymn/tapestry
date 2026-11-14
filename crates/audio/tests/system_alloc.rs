@@ -1,6 +1,7 @@
 //! The system voices' control step and mix neither allocate nor free
 //! (design.md "Scope of No Allocation"): starts, refused starts, decision
-//! sounds resolved both ways, stops, a waiting loop, installs merged with
+//! sounds resolved both ways, the reserved voices' starts and refusals,
+//! stops, a waiting loop, installs merged with
 //! starts through a cutoff, requests above it left queued, the empty
 //! install, a blocked install, tone requests, retirements, returns, an
 //! output failure and control-only steps, over 3 000 steps; and a full
@@ -30,12 +31,15 @@ fn system_steps_neither_allocate_nor_free() {
     let scratch = constant(2_000, 2_400);
     let select = constant(1_000, 4_800);
     let decide = constant(3_000, 960);
+    let result = constant(500, 4_800);
     // Even ids have a decision sound, odd ones fall back to the tone.
     let picks: Vec<SystemGeneration> = (0..STEPS / EVERY + 2)
         .map(|k| {
             let g = SystemGeneration::new(GenId(1_000 * (k + 1)), RATE)
                 .with(SystemKind::Scratch, Arc::clone(&scratch))
-                .with(SystemKind::Select, Arc::clone(&select));
+                .with(SystemKind::Select, Arc::clone(&select))
+                .with(SystemKind::Clear, Arc::clone(&result))
+                .with(SystemKind::Fail, Arc::clone(&result));
             if k % 2 == 0 {
                 g.with(SystemKind::Decide, Arc::clone(&decide))
             } else {
@@ -52,6 +56,7 @@ fn system_steps_neither_allocate_nor_free() {
     let mut seq = 0_u64;
     let mut current = GenId(0);
     let mut blocked = 0;
+    let mut reserved = 0;
     let _serial = SERIAL
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -83,8 +88,30 @@ fn system_steps_neither_allocate_nor_free() {
         if step % EVERY == 3 {
             // The loop kind stopped: the retired generation goes back.
             let n = next();
-            rig.stop(n, SystemKind::Select);
-            rig.stop(n, SystemKind::Scratch);
+            for kind in [
+                SystemKind::Select,
+                SystemKind::Scratch,
+                SystemKind::Clear,
+                SystemKind::Fail,
+                SystemKind::Decide,
+            ] {
+                rig.stop(n, kind);
+            }
+        }
+        if step % EVERY == 7 {
+            // The result's sounds in their reserved voices, a second start
+            // of each refused while the first sounds, and a decision sound
+            // twice.
+            let n = next();
+            rig.looped(n, SystemKind::Clear, current);
+            for _ in 0..2 {
+                let n = next();
+                rig.start(n, SystemKind::Fail);
+                let n = next();
+                rig.looped(n, SystemKind::Clear, current);
+                let n = next();
+                rig.start(n, SystemKind::Decide);
+            }
         }
         if step % EVERY == 5 {
             // A burst past the pool, and requests above the cutoff.
@@ -120,6 +147,7 @@ fn system_steps_neither_allocate_nor_free() {
         // waits in its ring for the next step.
         let cutoff = if step % 2 == 1 { seq - 1 } else { seq };
         rig.apply(&mut voices, cutoff);
+        reserved = reserved.max(voices.reserved_sounding());
         if step < STEPS - 100 {
             voices.mix_into(&mut buf, 0.5);
         }
@@ -136,6 +164,7 @@ fn system_steps_neither_allocate_nor_free() {
     assert_eq!(counted, (0, 0), "allocations and frees in the window");
     // What the window was meant to exercise did happen.
     assert!(voices.refused() > 0);
+    assert!(reserved >= 3, "{reserved} reserved voices at most");
     assert!(voices.install_waits() > 0 && blocked > 0);
     assert!(returned.len() > 200, "{} returned", returned.len());
     assert_eq!(

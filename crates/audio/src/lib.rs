@@ -75,9 +75,9 @@ pub use run::{RunReport, run_audio};
 pub use seek::{BgmSchedule, FrameLine, ScheduledSound, SeekPlan, SeekSource};
 pub use sim::{Resume, SHIFT_HISTORY, SimConfig, SimDevice};
 pub use system::{
-    ApplyReport, GenId, SYSTEM_INSTALLS, SYSTEM_KINDS, SYSTEM_RETURNS, SYSTEM_STARTS,
-    SYSTEM_VOICES, SystemGeneration, SystemInstall, SystemKind, SystemSnapshot, SystemStart,
-    SystemVoices,
+    ApplyReport, GenId, RESERVED_KINDS, SYSTEM_INSTALLS, SYSTEM_KINDS, SYSTEM_RETURNS,
+    SYSTEM_STARTS, SYSTEM_VOICES, SystemGeneration, SystemInstall, SystemKind, SystemSnapshot,
+    SystemStart, SystemVoices,
 };
 #[cfg(windows)]
 pub use wasapi::{
