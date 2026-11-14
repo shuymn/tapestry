@@ -70,7 +70,8 @@ fn decode_one_shares_its_budget() {
     );
 }
 
-/// A kept sound's charge fits in what remains or is refused whole.
+/// A charge fits in what remains or is refused whole.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn a_budget_charge_past_what_remains_is_refused() {
     let budget = PickBudget::new(1_000);

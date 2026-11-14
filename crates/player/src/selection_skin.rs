@@ -556,6 +556,17 @@ fn fixture_of(widgets: &str, drawn: &str) -> tempfile::TempDir {
     dir
 }
 
+/// The fixture with a notes graph (`judgegraph` type 0) at x 10, y-down
+/// top 880, and a BPM graph at top 680, each 300×100: the cursor's chart's.
+#[cfg(all(test, feature = "dev-tools"))]
+pub(crate) fn graphs_fixture() -> tempfile::TempDir {
+    fixture_of(
+        r#""judgegraph": [{"id": "ng"}], "bpmgraph": [{"id": "bg"}],"#,
+        r#", {"id": "ng", "dst": [{"x": 10, "y": 100, "w": 300, "h": 100}]},
+            {"id": "bg", "dst": [{"x": 10, "y": 300, "w": 300, "h": 100}]}"#,
+    )
+}
+
 /// A folder holding the fixtures' image `s.png` (16×16, white) and font
 /// `f.ttf`.
 #[cfg(test)]
