@@ -75,6 +75,15 @@ fn titles(lib: &Library) -> Vec<(PathBuf, String)> {
         .collect()
 }
 
+/// Each chart's path and BGA flag, in path order.
+fn bga_flags(lib: &Library) -> Vec<(PathBuf, bool)> {
+    lib.charts()
+        .unwrap()
+        .into_iter()
+        .map(|c| (c.path, c.bga))
+        .collect()
+}
+
 struct Fixture {
     dir: TempDir,
     root: PathBuf,
@@ -390,18 +399,11 @@ fn schema_6_reads_bga_flags_again() {
         format!("{}#BMP01 back.bmp\n", chart_text("With")).as_bytes(),
     );
     let without = fx.write("without.bms", chart_text("Without").as_bytes());
-    let flags = |lib: &Library| -> Vec<(PathBuf, bool)> {
-        lib.charts()
-            .unwrap()
-            .into_iter()
-            .map(|c| (c.path, c.bga))
-            .collect()
-    };
     let want = vec![(with, true), (without, false)];
     {
         let (lib, _) = fx.open();
         scan(&lib, std::slice::from_ref(&fx.root));
-        assert_eq!(flags(&lib), want);
+        assert_eq!(bga_flags(&lib), want);
     }
     {
         let old = rusqlite::Connection::open(fx.db()).unwrap();
@@ -413,7 +415,7 @@ fn schema_6_reads_bga_flags_again() {
     assert_eq!(lib.charts().unwrap(), Vec::new());
     let report = scan(&lib, std::slice::from_ref(&fx.root));
     assert_eq!((report.found, report.read), (2, 2), "a full scan");
-    assert_eq!(flags(&lib), want);
+    assert_eq!(bga_flags(&lib), want);
 }
 
 /// The level and the difficulty read as integer tokens: a signed level
@@ -467,18 +469,48 @@ fn schema_10_reads_levels_and_difficulties_again() {
     assert_eq!(read(&lib), want);
 }
 
-/// Loader version 9 kept the last `#DIFFICULTY` whether or not it read
-/// and took a `#BMPxx` by its trimmed name and value; the current loader
-/// keeps the last readable difficulty and reads a `#BMPxx` line by
-/// position. A row version 9 wrote, holding its reading of an unchanged
-/// file, is read again by the next scan, and only that row.
+/// A `#BMPxx` definition with no file name defines no BGA image. A library
+/// of schema 11 read the flag by the line's fixed positions: opening it
+/// under this version rebuilds it, so the next scan reads every chart's
+/// flag again.
 #[test]
-fn a_row_of_loader_version_9_reads_difficulty_and_bga_again() {
+fn schema_11_reads_bga_flags_again() {
+    let fx = Fixture::new();
+    let named = fx.write(
+        "named.bms",
+        format!("{}#BMP01 back.bmp\n", chart_text("Named")).as_bytes(),
+    );
+    let spaces = fx.write(
+        "spaces.bms",
+        format!("{}#BMP01  \n", chart_text("Spaces")).as_bytes(),
+    );
+    let want = vec![(named, true), (spaces, false)];
+    {
+        let (lib, _) = fx.open();
+        scan(&lib, std::slice::from_ref(&fx.root));
+        assert_eq!(bga_flags(&lib), want);
+    }
+    {
+        let old = rusqlite::Connection::open(fx.db()).unwrap();
+        old.execute_batch("PRAGMA user_version = 11;").unwrap();
+    }
+    let (lib, opened) = fx.open();
+    assert_eq!(opened, Opened::Rebuilt { old_version: 11 });
+    assert_eq!(lib.charts().unwrap(), Vec::new());
+    let report = scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!((report.found, report.read), (2, 2), "a full scan");
+    assert_eq!(bga_flags(&lib), want);
+}
+
+/// A row an older loader version wrote, holding that version's reading of
+/// an unchanged file, is read again by the next scan, and only that row.
+#[test]
+fn a_row_of_an_older_loader_version_is_read_again() {
     let fx = Fixture::new();
     let changed = fx.write(
         "changed.bms",
         format!(
-            "{}#DIFFICULTY 4\n#DIFFICULTY broken\n#BMP01  \n",
+            "{}#DIFFICULTY 4\n#DIFFICULTY broken\n#BMP01 back.bmp\n",
             chart_text("Changed")
         )
         .as_bytes(),

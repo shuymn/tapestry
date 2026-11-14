@@ -25,4 +25,3 @@ source-name 1 crates/skin-model/tests/judge_graph.rs
 source-name 1 crates/skin-model/tests/present.rs
 source-name 1 crates/skin-model/tests/present_num.rs
 source-name 2 crates/skin-model/tests/timing_graph.rs
-utf16 1 crates/bms-parser/src/parse.rs

@@ -158,14 +158,7 @@ pub fn parse(
                 });
             }
             if !branches.directive(&upper, value, line, warnings)? && branches.active() {
-                // The image is not shown; that one is defined is a label,
-                // read from the line as the reference decoder reads it.
-                let untrimmed = raw_line.trim_start().strip_prefix('#').unwrap_or(body);
-                if defines_bga(untrimmed) {
-                    source.labels.bga = true;
-                } else {
-                    parse_header(&mut source, line, &upper, value, warnings)?;
-                }
+                parse_header(&mut source, line, &upper, value, warnings)?;
             }
         }
     }
@@ -175,20 +168,22 @@ pub fn parse(
     Ok(source)
 }
 
-/// Whether a command line, `body` after its `#` (its start trimmed, its
-/// end kept), defines a BGA image as the reference decoder registers one
-/// (jbms-parser `BMSDecoder`): `BMP` in any case, an object id in the next
-/// two characters, and at least seven UTF-16 units in all, the path read
-/// from the seventh on, whatever the sixth is, and kept even when it is
-/// only spaces. So `#BMP01` and two spaces registers, with one space it
-/// does not, and `#BMP001 a.bmp` registers id `00`. Its list holds every
-/// definition, whether or not a channel shows it, and a chart with one has
-/// a BGA (beatoraja `song/SongData.java:216`).
-pub(crate) fn defines_bga(body: &str) -> bool {
-    body.get(..3)
-        .is_some_and(|word| word.eq_ignore_ascii_case("BMP"))
-        && body.as_bytes().get(3..5).and_then(parse_base36).is_some()
-        && body.encode_utf16().nth(6).is_some()
+/// The object id a numbered definition's header name `upper` (upper-cased)
+/// defines: `prefix` and then exactly two base-36 characters.
+fn defined_id(upper: &str, prefix: &str) -> Option<u16> {
+    upper
+        .strip_prefix(prefix)
+        .filter(|rest| rest.len() == 2)
+        .and_then(|rest| parse_base36(rest.as_bytes()))
+}
+
+/// Whether the header `upper` (its name, upper-cased) with `value`
+/// defines a BGA image: a `#BMPxx` definition, read as every numbered
+/// definition is, naming a file. Any such definition sets the chart's
+/// BGA flag, whether or not a channel shows it (design.md "Play
+/// Lifecycle", the chart's labels).
+pub(crate) fn defines_bga(upper: &str, value: &str) -> bool {
+    defined_id(upper, "BMP").is_some() && !value.is_empty()
 }
 
 /// A header value read as an integer (design.md "Play Lifecycle", the
@@ -359,12 +354,6 @@ fn parse_header(
     value: &str,
     warnings: &mut Vec<Warning>,
 ) -> Result<(), LoadError> {
-    let defined_id = |prefix: &str| {
-        upper
-            .strip_prefix(prefix)
-            .filter(|rest| rest.len() == 2)
-            .and_then(|rest| parse_base36(rest.as_bytes()))
-    };
     let invalid =
         |what: &'static str, reason: &'static str| LoadError::InvalidValue { line, what, reason };
     let ignore = |warnings: &mut Vec<Warning>, what: &'static str| {
@@ -462,14 +451,16 @@ fn parse_header(
                 });
             }
         }
+        // The image is not shown; that one is defined is a label.
+        _ if defines_bga(upper, value) => source.labels.bga = true,
         _ if IGNORED_HEADERS.contains(&upper)
             || IGNORED_DEFINITIONS
                 .iter()
-                .any(|prefix| defined_id(prefix).is_some()) => {}
+                .any(|prefix| defined_id(upper, prefix).is_some()) => {}
         _ => {
-            if let Some(id) = defined_id("BPM") {
+            if let Some(id) = defined_id(upper, "BPM") {
                 source.bpm_defs.insert(id, bpm(value, line, "#BPMxx")?);
-            } else if let Some(id) = defined_id("STOP") {
+            } else if let Some(id) = defined_id(upper, "STOP") {
                 let v = parse_decimal(value).map_err(|e| invalid("#STOPxx", e.reason()))?;
                 if v.is_negative() {
                     return Err(LoadError::Unsupported {
@@ -478,7 +469,7 @@ fn parse_header(
                     });
                 }
                 source.stop_defs.insert(id, v);
-            } else if let Some(id) = defined_id("SCROLL") {
+            } else if let Some(id) = defined_id(upper, "SCROLL") {
                 // Read for a song list's preview alone; play ignores scroll
                 // changes, as the warning says.
                 if let Some(v) = header_value(value).number() {
@@ -488,7 +479,7 @@ fn parse_header(
                     line: Some(line),
                     kind: WarningKind::UnknownHeader(upper.to_owned()),
                 });
-            } else if let Some(id) = defined_id("WAV") {
+            } else if let Some(id) = defined_id(upper, "WAV") {
                 source.wavs.insert(
                     id,
                     Defined {

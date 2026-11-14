@@ -92,9 +92,9 @@
 //!   `#TEXTxx`, `#EXRANKxx` and descriptive ones) are ignored silently; any
 //!   other unknown header is a warning. Of these, `#DIFFICULTY` (the last
 //!   one that reads as an integer, [`header_integer`]) and whether a
-//!   `#BMPxx` the reference decoder registers is defined are kept as labels
-//!   ([`Labels`]), which the chart does not hold, so this version does not
-//!   cover how they are read (design.md "Chart Loading").
+//!   `#BMPxx` names a file are kept as labels ([`Labels`]), which the chart
+//!   does not hold, so this version does not cover how they are read
+//!   (design.md "Chart Loading").
 //! - **`#LNOBJ`:** a channel 1x object with that id ends a long note started
 //!   by the previous plain note in its lane, if that note sits at an
 //!   earlier position. The end plays no sound. An empty `#LNOBJ` is
@@ -263,9 +263,8 @@ pub struct Labels {
     /// `#DIFFICULTY`, as text: the last one [`header_integer`] reads;
     /// empty when none.
     pub difficulty: String,
-    /// Whether it defines a BGA image: a `#BMPxx` line the reference
-    /// decoder registers, read by its fixed positions, whether or not a
-    /// channel shows it.
+    /// Whether it defines a BGA image: a `#BMPxx` definition naming a
+    /// file, in the branches taken, whether or not a channel shows it.
     pub bga: bool,
 }
 
