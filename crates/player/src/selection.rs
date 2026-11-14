@@ -3746,7 +3746,9 @@ impl AppRig for PlayerRig<'_> {
         // Source: SF-009
         match self.system_sounds.as_mut() {
             Some(sounds) => sounds.start(&mut self.audio.control, audio::SystemKind::Decide, None),
-            None => self.audio.control.play_tone(),
+            None => {
+                crate::system_sounds::built_in(&self.audio.control, audio::SystemKind::Decide);
+            }
         }
         if matches!(pick, Pick::Play(_)) {
             let gauge = sel

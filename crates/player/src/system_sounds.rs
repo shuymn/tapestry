@@ -16,18 +16,17 @@
 //! Nothing else admits: [`poll`](SystemSounds::poll) and the settlement
 //! before recording only receive.
 //!
-//! **The mapping.** The sounds of the newest generation pushed, per kind,
-//! are what the next pick keeps for a kind it finds no candidate for.
+//! **A pick is a whole.** Each generation holds only the sounds its own
+//! pick decoded; nothing of a replaced pick is carried into the next, so
+//! its sounds are freed with its generation once that comes back.
 //!
 //! **The latch.** Once recovery is unavailable (the lock, the state file,
 //! a commit or a clear failed, the worker is gone, or the request sequence
 //! is exhausted) every set sound stops for the rest of the run through the
 //! empty generation, and the decision sound is the tone. The latch runs in
 //! play too (a refused draw of [`start`](SystemSounds::start) or
-//! [`stop`](SystemSounds::stop)), so it frees and allocates nothing: it
-//! moves the mapping into a slot made with the owner, and the next drain
-//! outside play drops it and names the latch, before that call releases
-//! any return's charge.
+//! [`stop`](SystemSounds::stop)), so it frees and allocates nothing: the
+//! next call outside play names it.
 //!
 //! Lines this owner names for the player (refused files, a quarantined or
 //! skipped source, the latch) go to the `say` hook its caller gives, and
@@ -45,11 +44,11 @@ use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use audio::{BankLimits, GenId, PickBudget, SystemGeneration, SystemKind};
+use audio::{BankLimits, BuiltIn, GenId, PickBudget, SystemGeneration, SystemKind};
 use game::sound_sets::{
-    DecodeFile, KeptSounds, OneFile, PICK_BYTES, PickDecode, PickReport, Recovery, RecoveryFs,
-    ScanCap, ScanLimits, SetPick, SetRole, SourceIdentity, Unavailable, choose, decode_pick,
-    random_index, scan,
+    DecodeFile, OneFile, PICK_BYTES, PickDecode, PickReport, Recovery, RecoveryFs, ScanCap,
+    ScanLimits, SetPick, SetRole, SourceIdentity, Unavailable, choose, decode_pick, random_index,
+    scan,
 };
 use game::{
     AudioControl, AudioWaitError, DataRoot, SWITCH_TIMEOUT, SoundSettings, SystemStartError,
@@ -210,7 +209,6 @@ pub fn take_armed(setup: &mut Setup, hooks: &mut Hooks) {
 /// What the game thread asks the worker.
 struct Ask {
     id: GenId,
-    kept: KeptSounds,
     skipped: Vec<SourceIdentity>,
     cancel: Arc<AtomicBool>,
 }
@@ -255,8 +253,6 @@ pub enum Event {
     Pushed(GenId),
     /// A report dropped unpushed.
     Dropped(GenId),
-    /// The deferred-drop slot dropped.
-    Drained,
     /// A returned generation's charge released.
     Released(GenId),
 }
@@ -277,10 +273,6 @@ pub struct SystemSounds {
     installed: Option<GenId>,
     /// The newest generation pushed, the empty one included.
     newest: GenId,
-    /// The sounds of the newest generation pushed, per kind.
-    mapping: KeptSounds,
-    /// The mapping a latch invalidated, dropped by the next drain.
-    deferred: Option<KeptSounds>,
     latched: Option<Reason>,
     latch_named: bool,
     /// An entry's wait timed out and I3 has not held since.
@@ -324,7 +316,6 @@ fn work(mut setup: Setup, asks: Receiver<Ask>, replies: Sender<Reply>) {
     let defaults = setup.root.default_sounds();
     while let Ok(Ask {
         id,
-        kept,
         skipped,
         cancel,
     }) = asks.recv()
@@ -349,17 +340,7 @@ fn work(mut setup: Setup, asks: Receiver<Ask>, replies: Sender<Reply>) {
         };
         let budget = PickBudget::new(PICK_BYTES);
         let cancelled = move || cancel.load(Ordering::Acquire);
-        let report = decode_pick(
-            &pick,
-            &kept,
-            &budget,
-            &mut recovery,
-            &cancelled,
-            &*setup.decoder,
-        );
-        // The kept sounds' clones go before the report, so the game thread
-        // holds every share of them once it has the report.
-        drop((kept, pick, budget));
+        let report = decode_pick(&pick, &budget, &mut recovery, &cancelled, &*setup.decoder);
         let reply = Reply::Picked {
             id,
             report: Box::new(report),
@@ -368,6 +349,20 @@ fn work(mut setup: Setup, asks: Receiver<Ask>, replies: Sender<Reply>) {
         if replies.send(reply).is_err() {
             return;
         }
+    }
+}
+
+/// Plays `kind`'s built-in sound, if it has one, without a set: whether it
+/// did. Every fallback to a built-in sound comes here. It allocates and
+/// frees nothing.
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub fn built_in(control: &AudioControl, kind: SystemKind) -> bool {
+    match kind.built_in() {
+        Some(BuiltIn::Tone) => {
+            control.play_tone();
+            true
+        }
+        None => false,
     }
 }
 
@@ -388,8 +383,6 @@ impl SystemSounds {
             unacked: None,
             installed: None,
             newest: GenId(0),
-            mapping: KeptSounds::default(),
-            deferred: None,
             latched: None,
             latch_named: false,
             stalled: false,
@@ -424,21 +417,20 @@ impl SystemSounds {
                 sounds.latch(control, Reason::WorkerGone);
             }
         }
-        sounds.drain_deferred();
+        sounds.name_latch();
         sounds
     }
 
     /// Starts `kind`, looped and bound to generation `looped` when given
     /// (it plays only from that one). Once latched every set kind's start
-    /// is refused and counted, and the decision sound is the tone. A start
-    /// whose number is refused latches the run; a decision sound then
-    /// sounds the tone. It allocates and frees nothing.
+    /// is refused and counted, and a kind with a built-in sound plays that
+    /// ([`SystemKind::built_in`]: the decision sound's tone). A start whose
+    /// number is refused latches the run, and its built-in sound plays. It
+    /// allocates and frees nothing.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn start(&mut self, control: &mut AudioControl, kind: SystemKind, looped: Option<GenId>) {
         if self.latched.is_some() {
-            if kind == SystemKind::Decide {
-                control.play_tone();
-            } else {
+            if !built_in(control, kind) {
                 self.refused += 1;
             }
             return;
@@ -447,9 +439,7 @@ impl SystemSounds {
             control.system_start(kind, looped.is_some(), looped)
         {
             self.latch(control, Reason::SequenceExhausted);
-            if kind == SystemKind::Decide {
-                control.play_tone();
-            }
+            built_in(control, kind);
         }
     }
 
@@ -465,10 +455,8 @@ impl SystemSounds {
 
     /// Latches the run for `reason`, once: every set kind stops under one
     /// number and the empty generation is pushed, so no set sound plays
-    /// again and the decision sound is the tone; the mapping moves into the
-    /// deferred-drop slot, so a later pick keeps nothing. It allocates and
-    /// frees nothing: the slot is dropped, and the latch named, by the next
-    /// drain outside play.
+    /// again and the decision sound is the tone. It allocates and frees
+    /// nothing: the next call outside play names the latch.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn latch(&mut self, control: &mut AudioControl, reason: Reason) {
         if self.latched.is_some() {
@@ -484,7 +472,6 @@ impl SystemSounds {
                 self.latch_installs += 1;
             }
         }
-        self.deferred = Some(mem::take(&mut self.mapping));
     }
 
     /// Receives what the worker and the audio thread have given back:
@@ -497,7 +484,6 @@ impl SystemSounds {
             self.polls += 1;
         }
         self.service(control);
-        self.drain_deferred();
     }
 
     /// The entry to selection's re-roll: stops every set kind of the last
@@ -514,7 +500,7 @@ impl SystemSounds {
             self.latch(control, Reason::SequenceExhausted);
         }
         let id = self.entry(control, &mut ends);
-        self.drain_deferred();
+        self.name_latch();
         id
     }
 
@@ -615,7 +601,7 @@ impl SystemSounds {
         mut ends: impl FnMut() -> bool,
     ) -> Result<Settled, AudioWaitError> {
         let settled = self.settle(control, &mut quit, &mut ends);
-        self.drain_deferred();
+        self.name_latch();
         settled
     }
 
@@ -649,9 +635,8 @@ impl SystemSounds {
 
     /// Stops every set sound, then ends the worker (its pick cancelled,
     /// waited for within [`STOP_WAIT`], then left to end with the
-    /// process), drops what the game thread holds and takes the returns,
-    /// the deferred-drop slot drained before any return's charge is
-    /// released. Idempotent.
+    /// process), drops what the game thread holds and takes the returns.
+    /// Idempotent.
     pub fn close(&mut self, control: &mut AudioControl) {
         if self.closed {
             return;
@@ -659,10 +644,9 @@ impl SystemSounds {
         // Every set sound, a loop still sounding included, ends before the
         // audio thread does; a refused number stops them all the same.
         let _ = control.system_stop_all();
-        self.drain_deferred();
+        self.name_latch();
         self.end_worker();
         self.take_returns(control);
-        self.drain_deferred();
         if self.skipped_rerolls > 0 {
             let n = self.skipped_rerolls;
             (self.hooks.log)(&format!(
@@ -707,12 +691,11 @@ impl SystemSounds {
         self.in_flight = None;
     }
 
-    /// The receivers' work, in the order the drain needs: the slot after
-    /// the replies (which can latch) and before the returns, so a latch's
-    /// mapping is dropped before any return's charge is released.
+    /// The receivers' work: the replies (which can latch), the latch's
+    /// line, the acknowledgement and the returns.
     fn service(&mut self, control: &mut AudioControl) {
         self.receive(control);
-        self.drain_deferred();
+        self.name_latch();
         self.acknowledge(control);
         self.take_returns(control);
         #[cfg(test)]
@@ -721,13 +704,8 @@ impl SystemSounds {
         }
     }
 
-    /// Drops the deferred-drop slot and names a new latch, once.
-    fn drain_deferred(&mut self) {
-        if let Some(kept) = self.deferred.take() {
-            drop(kept);
-            #[cfg(test)]
-            self.events.push(Event::Drained);
-        }
+    /// Names a new latch, once.
+    fn name_latch(&mut self) {
         if !self.latch_named
             && let Some(reason) = &self.latched
         {
@@ -826,7 +804,7 @@ impl SystemSounds {
         let PickDecode::Ready(generation) = report.decode else {
             return;
         };
-        self.push(control, generation, report.kept);
+        self.push(control, generation);
     }
 
     /// A report not pushed: its generation dropped here, uncharged.
@@ -840,7 +818,7 @@ impl SystemSounds {
         self.events.push(Event::Dropped(id));
     }
 
-    fn push(&mut self, control: &mut AudioControl, generation: SystemGeneration, kept: KeptSounds) {
+    fn push(&mut self, control: &mut AudioControl, generation: SystemGeneration) {
         let id = generation.id();
         let bytes = generation.bytes();
         match control.install_system(generation) {
@@ -848,8 +826,6 @@ impl SystemSounds {
                 self.alive.push((id, bytes));
                 self.unacked = Some(id);
                 self.newest = id;
-                // The previous mapping is dropped here, outside play.
-                self.mapping = kept;
                 #[cfg(test)]
                 self.events.push(Event::Pushed(id));
             }
@@ -901,7 +877,6 @@ impl SystemSounds {
         let cancel = Arc::new(AtomicBool::new(false));
         let ask = Ask {
             id,
-            kept: self.mapping.clone(),
             skipped: self.skipped.clone(),
             cancel: Arc::clone(&cancel),
         };
