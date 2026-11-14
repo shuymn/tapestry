@@ -14797,7 +14797,7 @@ pub(crate) mod tests {
         /// Each restore that installed, with its kind, in order.
         restored: Arc<std::sync::Mutex<Vec<(ScreenKind, render::Installation)>>>,
         /// Restores of this kind are refused as on a healthy device.
-        refuse_restore: Arc<std::sync::Mutex<Option<ScreenKind>>>,
+        pub(crate) refuse_restore: Arc<std::sync::Mutex<Option<ScreenKind>>>,
         /// Restores of this kind fail as a lost surface.
         fail_restore: Arc<std::sync::Mutex<Option<ScreenKind>>>,
         /// Each loading frame's device, lifetime and origin.

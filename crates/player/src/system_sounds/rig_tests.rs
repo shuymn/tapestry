@@ -11,13 +11,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use audio::{GenId, SystemKind};
-use game::{AudioReadiness, Command, DataRoot, LiveError, Rig as _};
+use game::{AppRig as _, AudioReadiness, Command, DataRoot, LiveError, Rig as _};
 
 use super::tests::{Fixture, MemFs, Rule, Seam, wait};
 use super::{Event, Hooks, RealClock, Setup, SystemSounds, arm};
 use crate::dev::AudioGate;
 use crate::imports::STOP_WAIT;
 use crate::play::PlayerRig;
+use skin_model::ScreenKind;
 
 /// How long after a signal a wait that reads it at each 1 ms slice may
 /// take to leave on a loaded machine: far below every bound it could
@@ -446,17 +447,17 @@ fn the_shutdown_ends_the_system_sounds_before_the_audio_thread() {
     seam.open_gate();
 }
 
-/// T18, design.md "Audio" (Loading): a file the pick refused, named
-/// before the look whose Enter chooses a chart, is not lost with that
-/// look, which sends no page: the select screen returned to shows it on
-/// its notice line, once.
-// Covers: T18
-#[test]
-fn a_refusal_named_before_a_choice_shows_on_the_return() {
-    use crate::render_side::tests::{Installers, wait_until};
+/// The select screen of `screens` on a rig whose startup pick refuses
+/// a file, its report held until the screen is up: `f` with the rig and
+/// the refusal's line, received and queued as the receipt at the head of
+/// a look's `choose` leaves it, before any look took it.
+fn with_a_named_refusal<R>(
+    screens: &crate::render_side::tests::Installers,
+    render: crate::render_side::RenderLink,
+    f: impl FnOnce(&mut PlayerRig<'_>, String) -> R,
+) -> R {
     use crate::select::MenuKey;
     use crate::selection::image_tests::press;
-    use game::AppRig as _;
     let fx = Fixture::new();
     fx.sound("sound/A", SystemKind::Clear, 10);
     fx.write("sound/A/scratch.wav", b"not a sound");
@@ -466,22 +467,10 @@ fn a_refusal_named_before_a_choice_shows_on_the_return() {
     arm_run(&fx, &seam, &Arc::default(), Some(MemFs::new()));
     let dir = tempfile::tempdir().unwrap();
     let (sel, _) = crate::selection::tests::tree(dir.path(), &[&["a.bms"]]);
-    let screens = Installers::default();
-    let render = screens.spawn_bare();
-    let notice = || {
-        screens
-            .updates
-            .lock()
-            .unwrap()
-            .last()
-            .and_then(|u| u.strip.notice.clone())
-    };
-    crate::selection::tests::on_selection(sel, &screens, render, |rig| {
+    crate::selection::tests::on_selection(sel, screens, render, |rig| {
         // The cursor onto the chart; nothing named yet.
         press(rig, MenuKey::Down);
         assert!(rig.choose().is_none());
-        // The report received, its refusal named and queued, as the
-        // receipt at the head of the choosing look's `choose` leaves it.
         seam.open_gate();
         wait("the refusal named", || {
             rig.system_sounds
@@ -497,25 +486,143 @@ fn a_refusal_named_before_a_choice_shows_on_the_return() {
                 .any(|l| l.contains("scratch.wav") && l.contains("was refused")),
             "{named:?}"
         );
-        let line = named.join(" / ");
+        f(rig, named.join(" / "))
+    })
+}
+
+/// A look on `rig` that chooses nothing: the notice of the page it
+/// publishes, once a selection frame of `screens` applied that page.
+fn notice_of_the_look(
+    rig: &mut PlayerRig<'_>,
+    screens: &crate::render_side::tests::Installers,
+) -> Option<String> {
+    assert!(rig.choose().is_none());
+    let published = rig
+        .selection
+        .as_ref()
+        .expect("on the select screen")
+        .feed
+        .published();
+    let page = || {
+        screens
+            .updates
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|u| (u.lifetime, u.revision) == published)
+            .cloned()
+    };
+    assert!(
+        crate::render_side::tests::wait_until(|| page().is_some()),
+        "{published:?} never drawn"
+    );
+    page().and_then(|u| u.strip.notice)
+}
+
+/// T18, design.md "Audio" (Loading): a file the pick refused, named
+/// before the look whose Enter chooses a chart, is not lost with that
+/// look, which sends no page: the first look on the select screen
+/// returned to that chooses nothing (`entered_selection` publishes a page
+/// of its own before it) shows it on its page's notice line, and the
+/// next look's page shows it again, not twice over.
+// Covers: T18
+#[test]
+fn a_refusal_named_before_a_choice_shows_on_the_return() {
+    use crate::render_side::tests::Installers;
+    use crate::select::MenuKey;
+    use crate::selection::image_tests::press;
+    let screens = Installers::default();
+    let render = screens.spawn_bare();
+    with_a_named_refusal(&screens, render, |rig, line| {
         // The look that chooses the chart.
         press(rig, MenuKey::Enter);
         assert!(
             matches!(rig.choose(), Some(game::Pick::Play(_))),
             "nothing chosen"
         );
-        // Back on the select screen: its first look's page shows the
-        // line, and the next look's shows it again, not twice over.
         rig.entered_selection();
-        let before = screens.updates.lock().unwrap().len();
-        assert!(rig.choose().is_none());
-        assert!(wait_until(|| screens.updates.lock().unwrap().len() > before));
-        assert_eq!(notice().as_deref(), Some(line.as_str()));
+        assert_eq!(notice_of_the_look(rig, &screens), Some(line.clone()));
         assert!(rig.system_notices.lock().unwrap().is_empty());
         rig.selection.as_mut().unwrap().dirty = true;
-        let before = screens.updates.lock().unwrap().len();
-        assert!(rig.choose().is_none());
-        assert!(wait_until(|| screens.updates.lock().unwrap().len() > before));
-        assert_eq!(notice().as_deref(), Some(line.as_str()));
+        assert_eq!(notice_of_the_look(rig, &screens), Some(line));
     });
+}
+
+/// T18, design.md "Screen skins": a skin refused at runtime and a file
+/// the pick refused, both taken by one look that chooses nothing, are
+/// both on its page's notice line, the skin's reason first; neither
+/// replaces the other, as each is taken once.
+fn a_skin_refusal_and_a_named_file_share_the_page(
+    kind: ScreenKind,
+    refuse: impl FnOnce(&crate::render_side::tests::Installers, &PlayerRig<'_>),
+    why: &str,
+) {
+    use crate::render_side::tests::{Installers, bundle};
+    let screens = Installers::default();
+    let render = screens.spawn_bare();
+    assert_eq!(
+        render.select(kind, Some(bundle())).wait().unwrap(),
+        game::Preparation::Ready
+    );
+    with_a_named_refusal(&screens, render, |rig, line| {
+        refuse(&screens, rig);
+        let refused = crate::imports::notice(kind, why);
+        assert_eq!(
+            notice_of_the_look(rig, &screens),
+            Some(format!("{refused} / {line}")),
+            "{kind:?}"
+        );
+        assert!(rig.system_notices.lock().unwrap().is_empty());
+    });
+}
+
+/// The selection skin refused by a selection frame.
+#[test]
+fn a_selection_refusal_and_a_named_file_share_the_page() {
+    a_skin_refusal_and_a_named_file_share_the_page(
+        ScreenKind::Selection,
+        |screens, _| {
+            screens.refuse_selection.store(true, Ordering::Release);
+            assert!(crate::render_side::tests::wait_until(|| {
+                screens
+                    .selections
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|s| s.state.is_none())
+            }));
+        },
+        "refused for the test",
+    );
+}
+
+/// The decision skin refused by the restore of a screen built again on a
+/// healthy device.
+#[test]
+fn a_decision_refusal_and_a_named_file_share_the_page() {
+    let admission = render::RenderError::Admission {
+        kind: ScreenKind::Decision,
+        needed: render::SHARED_TEXELS + 1,
+        limit: render::SHARED_TEXELS,
+    };
+    let why = format!(
+        "the decision skin was not restored on the screen built again: {}",
+        game::Chain(&admission)
+    );
+    a_skin_refusal_and_a_named_file_share_the_page(
+        ScreenKind::Decision,
+        |screens, rig| {
+            *screens.refuse_restore.lock().unwrap() = Some(ScreenKind::Decision);
+            screens.fail.store(true, Ordering::Release);
+            rig.render
+                .send(crate::render_side::RenderMsg::Menu(Box::default()));
+            assert!(crate::render_side::tests::wait_until(|| rig
+                .render
+                .failed()));
+            screens.fail.store(false, Ordering::Release);
+            rig.render.prepare().unwrap();
+            *screens.refuse_restore.lock().unwrap() = None;
+        },
+        &why,
+    );
 }

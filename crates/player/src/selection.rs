@@ -2456,12 +2456,16 @@ impl PlayerRig<'_> {
         if sel.shelf.poll(Instant::now()) {
             sel.refresh();
         }
+        // The refusal this look took for its notice, which the system
+        // sounds' lines join below rather than replace: it is taken once.
+        let mut refused = None;
         // The selection skin refused at runtime: the page draws from now
         // on, and says why.
         if let Some(why) = self.render.take_selection_refusal() {
             log::warn!("select: the selection skin was refused, the built-in page draws: {why}");
             let notice = crate::imports::notice(skin_model::ScreenKind::Selection, &why);
-            sel.screen.set_notice(Some(notice));
+            sel.screen.set_notice(Some(notice.clone()));
+            refused = Some(notice);
             sel.dirty = true;
         }
         // The decision skin refused for the run: the built-in presentation
@@ -2471,7 +2475,8 @@ impl PlayerRig<'_> {
                 "select: the decision skin was refused, the built-in presentation draws: {why}"
             );
             let notice = crate::imports::notice(skin_model::ScreenKind::Decision, &why);
-            sel.screen.set_notice(Some(notice));
+            sel.screen.set_notice(Some(notice.clone()));
+            refused = Some(notice);
             sel.dirty = true;
         }
         // The panel the keys find open, then the one they leave (a search
@@ -2547,11 +2552,13 @@ impl PlayerRig<'_> {
             // The decision screen follows at once (`entered_decision`).
         } else {
             // What the system sounds named since the last page, on this
-            // one: a look that chose sends no page, so it leaves them
+            // one, after the refusal this look took (design.md "Screen
+            // skins"): a look that chose sends no page, so it leaves them
             // queued (design.md "Audio", Loading).
             let named = crate::play::take_notices(&self.system_notices);
             if !named.is_empty() {
-                sel.screen.set_notice(Some(named.join(" / ")));
+                let lines: Vec<String> = refused.into_iter().chain(named).collect();
+                sel.screen.set_notice(Some(lines.join(" / ")));
                 sel.dirty = true;
             }
             sel.show(&self.render, images, None, now);
