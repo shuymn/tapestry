@@ -244,7 +244,7 @@ fn events(source: &Source, last_measure: u16) -> Vec<(Spot, Event)> {
 }
 
 /// The measure of the last object or measure length of `source`.
-fn last_measure(source: &Source) -> u16 {
+pub fn last_measure(source: &Source) -> u16 {
     source
         .objects
         .iter()

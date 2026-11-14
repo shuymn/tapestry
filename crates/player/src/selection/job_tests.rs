@@ -168,6 +168,7 @@ fn bench_on(coord: Coordinator, dir: &Path, decodes: Decodes, spawner: Spawner) 
         spawner,
         page: crate::page_jobs::PageJobs::new(Arc::new(crate::priority::Unchanged)),
         rest: crate::selection::CursorRest::default(),
+        graphs: crate::preview_graphs::GraphCache::default(),
         decodes: Some(Arc::clone(&decodes)),
         after_bank: None,
         unload_fault: None,

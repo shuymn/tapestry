@@ -222,10 +222,10 @@ pub use select::schema::{SELECTION, VALUE_MAX as SELECTION_VALUE_MAX};
 pub use select::schema::{field as selection_field, timer as selection_timer};
 pub use select::{Selection, SelectionError, SelectionFrame, SelectionTimers};
 pub use selection::{
-    BestPlay, ChartLabels, FolderId, MAX_VISIBLE_ROWS, OwnLamp, PlayerTotals, Ratio, RowFeatures,
-    RowKey, RowKind, RowScore, RowView, SelectedBest, SelectedChart, SelectionLabels,
-    SelectionOrder, SelectionPlace, SelectionSettings, SelectionView, SpeedReference, SpeedView,
-    VolumeReading,
+    BestPlay, ChartGraphs, ChartLabels, FolderId, MAX_VISIBLE_ROWS, OwnLamp, PlayerTotals, Ratio,
+    RowFeatures, RowKey, RowKind, RowScore, RowView, SelectedBest, SelectedChart, SelectedInfo,
+    SelectionLabels, SelectionOrder, SelectionPlace, SelectionSettings, SelectionView,
+    SpeedReference, SpeedView, VolumeReading,
 };
 pub use skin::{
     DecisionDefs, ElementDef, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_SKIN_KEYS, MAX_WHEN_TIMERS,

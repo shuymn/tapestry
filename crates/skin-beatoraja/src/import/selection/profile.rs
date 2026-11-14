@@ -92,7 +92,30 @@ pub(crate) enum SelValue {
     /// [`player_field`](super::super::property::player_field), on every
     /// row kind.
     Player(&'static str),
+    /// The scan's preview numbers, [`INFO`]'s entry `n`.
+    Info(u8),
+    /// The peak density's hundredths: 0, as the peak is a whole count of
+    /// notes (`song/SongInformation.java:152-156` at `0.8.9`).
+    PeakHundredths,
+    /// The MAIN tempo in whole BPM.
+    MainBpm,
 }
+
+/// The scan's preview numbers as the selection schema gives them: the
+/// key taps, key long notes, scratch taps and scratch long notes, the peak,
+/// end and average densities with their hundredths, and the TOTAL.
+const INFO: [&str; 10] = [
+    "selected.key_taps",
+    "selected.key_longs",
+    "selected.scratch_taps",
+    "selected.scratch_longs",
+    "selected.density_peak",
+    "selected.density_end",
+    "selected.density_end_hundredths",
+    "selected.density_average",
+    "selected.density_average_hundredths",
+    "selected.total",
+];
 
 /// The best EX play's counts as the selection schema gives them: PERFECT
 /// to POOR, the empty POORs, FAST, SLOW, the early and late pairs, then
@@ -170,6 +193,12 @@ impl SelValue {
                 .copied()
                 .unwrap_or("selected.rate.perfect"),
             Self::Player(field) => field,
+            Self::Info(n) => INFO
+                .get(usize::from(n))
+                .copied()
+                .unwrap_or("selected.key_taps"),
+            Self::PeakHundredths => "0",
+            Self::MainBpm => "selected.main_bpm",
         }
     }
 
@@ -190,6 +219,10 @@ impl SelValue {
                 "selected.summary"
             }
             Self::Level => "cursor.chart",
+            // The source's song information exists on a chart row only
+            // (`IntegerPropertyFactory.java:167-173, 319-395`).
+            Self::Info(_) | Self::PeakHundredths => "cursor.chart && selected.info_valid",
+            Self::MainBpm => "cursor.chart && selected.info_valid && selected.main_bpm_valid",
             Self::RatePercent | Self::RateHundredths | Self::NextRank => "selected.rate_valid",
             Self::Charts => "cursor.folder || cursor.all",
             Self::ExDifference
@@ -274,21 +307,18 @@ pub(crate) fn number(id: i32) -> Option<Class<SelValue>> {
         17..=19 | 30..=37 | 333 => {
             Bridge(SelValue::Player(super::super::property::player_field(id)?))
         }
-        // Session statistics; rivals and IR; per-lane-class note counts
-        // the summary does not split; density metrics.
-        92
-        | 179
-        | 180
-        | 227
-        | 241
-        | 271
-        | 283
-        | 284
-        | 350..=354
-        | 360
-        | 362..=365
-        | 368
-        | 380..=384 => Omit,
+        // The scan's preview numbers (`IntegerPropertyFactory.java:167-173,
+        // 319-395`): the counts by kind, the peak, end and average
+        // densities with their hundredths, the TOTAL and the MAIN tempo.
+        350..=353 => Bridge(SelValue::Info(u8::try_from(id - 350).ok()?)),
+        360 => Bridge(SelValue::Info(4)),
+        361 => Bridge(SelValue::PeakHundredths),
+        362..=365 => Bridge(SelValue::Info(u8::try_from(id - 362 + 5).ok()?)),
+        368 => Bridge(SelValue::Info(9)),
+        92 => Bridge(SelValue::MainBpm),
+        // Session statistics; rivals and IR; the mines, which the
+        // source's number has no value for (`:42-48`).
+        179 | 180 | 227 | 241 | 271 | 283 | 284 | 354 | 380..=384 => Omit,
         _ => return None,
     })
 }
@@ -631,7 +661,7 @@ mod tests {
         (76, 77, C::N),
         (78, 89, C::N),
         (90, 91, C::N),
-        (92, 92, C::D),
+        (92, 92, C::N),
         (96, 96, C::N),
         (100, 100, C::N),
         (102, 103, C::N),
@@ -646,10 +676,10 @@ mod tests {
         (300, 300, C::N),
         (312, 313, C::N),
         (333, 333, C::N),
-        (350, 354, C::D),
-        (360, 360, C::D),
-        (362, 365, C::D),
-        (368, 368, C::D),
+        (350, 353, C::N),
+        (354, 354, C::D),
+        (360, 365, C::N),
+        (368, 368, C::N),
         (380, 384, C::D),
         (410, 427, C::N),
         (1163, 1164, C::N),

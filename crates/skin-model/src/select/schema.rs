@@ -124,6 +124,19 @@ pub static SELECTION: Schema = Schema {
         value("player.notes"),
         flag("selected.stagefile"),
         flag("selected.banner"),
+        flag("selected.info_valid"),
+        value("selected.key_taps"),
+        value("selected.key_longs"),
+        value("selected.scratch_taps"),
+        value("selected.scratch_longs"),
+        value("selected.density_peak"),
+        value("selected.density_end"),
+        int("selected.density_end_hundredths", 0, 99),
+        value("selected.density_average"),
+        int("selected.density_average_hundredths", 0, 99),
+        value("selected.total"),
+        value("selected.main_bpm"),
+        flag("selected.main_bpm_valid"),
         int("settings.display_offset", -VALUE_MAX, VALUE_MAX),
         int("settings.volume_system", 0, 100),
         flag("settings.floating"),
@@ -275,11 +288,33 @@ pub mod field {
     /// player writes them after the view's fields, which reset them.
     pub const SELECTED_STAGEFILE: u16 = PLAYER_NOTES + 1;
     pub const SELECTED_BANNER: u16 = SELECTED_STAGEFILE + 1;
+    /// Whether the chart has the scan's preview numbers: its draw with
+    /// seed 0 loaded (design.md "Loading and Song Selection", Summaries).
+    pub const SELECTED_INFO_VALID: u16 = SELECTED_BANNER + 1;
+    /// Its key taps, key long notes, scratch taps and scratch long notes,
+    /// then the rest of its preview numbers; each 0 while
+    /// `selected.info_valid` is false.
+    pub const SELECTED_KEY_TAPS: u16 = SELECTED_INFO_VALID + 1;
+    pub const SELECTED_SCRATCH_LONGS: u16 = SELECTED_INFO_VALID + 4;
+    /// The most notes in any 1× second.
+    pub const SELECTED_DENSITY_PEAK: u16 = SELECTED_INFO_VALID + 5;
+    /// The end density's whole notes per second, and its hundredths.
+    pub const SELECTED_DENSITY_END: u16 = SELECTED_INFO_VALID + 6;
+    pub const SELECTED_DENSITY_END_HUNDREDTHS: u16 = SELECTED_INFO_VALID + 7;
+    /// The average density's whole notes per second, and its hundredths.
+    pub const SELECTED_DENSITY_AVERAGE: u16 = SELECTED_INFO_VALID + 8;
+    pub const SELECTED_DENSITY_AVERAGE_HUNDREDTHS: u16 = SELECTED_INFO_VALID + 9;
+    /// The gauge's TOTAL as the source validates it, truncated.
+    pub const SELECTED_TOTAL: u16 = SELECTED_INFO_VALID + 10;
+    /// The MAIN tempo in whole BPM, rounded down: 0 for a chart whose
+    /// notes weigh nothing; not valid while it is unknown.
+    pub const SELECTED_MAIN_BPM: u16 = SELECTED_INFO_VALID + 11;
+    pub const SELECTED_MAIN_BPM_VALID: u16 = SELECTED_INFO_VALID + 12;
     /// The settings' fields, then the application's readouts, from here
     /// on, which a view leaves as they are
     /// ([`SelectionSettings`](crate::SelectionSettings),
     /// [`SelectionFrame::app`](crate::SelectionFrame::app)).
-    pub const SETTINGS: u16 = SELECTED_BANNER + 1;
+    pub const SETTINGS: u16 = SELECTED_MAIN_BPM_VALID + 1;
     /// The display offset in whole ms.
     pub const SETTINGS_DISPLAY_OFFSET: u16 = SETTINGS;
     /// The system volume's number, its whole percent rounded half up.
@@ -404,6 +439,23 @@ mod tests {
             (field::PLAYER_NOTES, "player.notes"),
             (field::SELECTED_STAGEFILE, "selected.stagefile"),
             (field::SELECTED_BANNER, "selected.banner"),
+            (field::SELECTED_INFO_VALID, "selected.info_valid"),
+            (field::SELECTED_KEY_TAPS, "selected.key_taps"),
+            (field::SELECTED_SCRATCH_LONGS, "selected.scratch_longs"),
+            (field::SELECTED_DENSITY_PEAK, "selected.density_peak"),
+            (field::SELECTED_DENSITY_END, "selected.density_end"),
+            (
+                field::SELECTED_DENSITY_END_HUNDREDTHS,
+                "selected.density_end_hundredths",
+            ),
+            (field::SELECTED_DENSITY_AVERAGE, "selected.density_average"),
+            (
+                field::SELECTED_DENSITY_AVERAGE_HUNDREDTHS,
+                "selected.density_average_hundredths",
+            ),
+            (field::SELECTED_TOTAL, "selected.total"),
+            (field::SELECTED_MAIN_BPM, "selected.main_bpm"),
+            (field::SELECTED_MAIN_BPM_VALID, "selected.main_bpm_valid"),
             (field::SETTINGS, "settings.display_offset"),
             (field::SETTINGS_DISPLAY_OFFSET, "settings.display_offset"),
             (field::SETTINGS_VOLUME_SYSTEM, "settings.volume_system"),
@@ -425,12 +477,17 @@ mod tests {
         ] {
             assert_eq!(names[usize::from(slot)], name);
         }
-        // The image fields are the selected chart's, the last before the
+        // The image fields, then the preview fields, the last before the
         // settings, which a view leaves as they are.
         assert_eq!(
-            names[usize::from(field::SETTINGS) - 2..usize::from(field::SETTINGS)],
-            ["selected.stagefile", "selected.banner"]
+            names[usize::from(field::SELECTED_STAGEFILE)..=usize::from(field::SELECTED_INFO_VALID)],
+            [
+                "selected.stagefile",
+                "selected.banner",
+                "selected.info_valid"
+            ]
         );
+        assert_eq!(field::SETTINGS, field::SELECTED_MAIN_BPM_VALID + 1);
         assert_eq!(
             SELECTION.timers[usize::from(timer::CHANGE)].name,
             "select.change"

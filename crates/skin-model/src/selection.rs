@@ -6,8 +6,9 @@
 //! screen reads it, with the player's own strings in [`SelectionLabels`].
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use bms_model::ChartSummary;
+use bms_model::{ChartSummary, NOTE_CATEGORIES, SpeedRows, Tempo};
 
 use crate::GaugeLook;
 
@@ -401,6 +402,54 @@ pub struct SelectedChart {
     pub clears: u64,
     /// The best's values beyond `score`'s; `None` without a best.
     pub best: Option<SelectedBest>,
+    /// The scan's preview numbers of its draw with seed 0; `None` when
+    /// that draw is refused.
+    pub info: Option<SelectedInfo>,
+    /// The scan's preview graphs of the same draw; `None` without a stored
+    /// profile current for the file. Shared: an update carries the same
+    /// graphs while the cursor's chart is unchanged.
+    pub graphs: Option<Arc<ChartGraphs>>,
+}
+
+/// What a song list's notes and BPM graphs draw of a chart (design.md
+/// "Loading and Song Selection", Summaries): the scan's stored preview
+/// profile, decoded.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ChartGraphs {
+    /// The notes by category, a bin each, of `bin_seconds` 1× seconds.
+    pub bins: Vec<[u16; NOTE_CATEGORIES]>,
+    pub bin_seconds: u32,
+    /// The content's length in whole ms, which the BPM graph spans.
+    pub length_ms: u32,
+    /// The tempo rows; `None` when the profile left them out (past its
+    /// bounds).
+    pub rows: Option<SpeedRows>,
+    /// The exact MAIN tempo: `Some(None)` when no note weighs, `None` when
+    /// it is unknown.
+    pub main: Option<Option<Tempo>>,
+}
+
+/// The preview numbers the scan stores for a chart (design.md "Loading and
+/// Song Selection", Summaries), each as a skin draws it.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SelectedInfo {
+    pub key_taps: i32,
+    pub key_longs: i32,
+    pub scratch_taps: i32,
+    pub scratch_longs: i32,
+    /// The most notes in any 1× second.
+    pub density_peak: i32,
+    /// The end density's whole notes per second, and its hundredths.
+    pub density_end: i32,
+    pub density_end_hundredths: i32,
+    /// The average density's whole notes per second, and its hundredths.
+    pub density_average: i32,
+    pub density_average_hundredths: i32,
+    /// The gauge's TOTAL as the source validates it, truncated.
+    pub total: i32,
+    /// The MAIN tempo in whole BPM, rounded down: 0 when no note weighs;
+    /// `None` when it is unknown.
+    pub main_bpm: Option<i32>,
 }
 
 /// What the bests keep of the selected chart beside its EX, BP and lamp

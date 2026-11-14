@@ -46,6 +46,13 @@ thread_local! {
     /// This thread's frees, for the allocation tests.
     #[cfg(test)]
     static FREED: Cell<u64> = const { Cell::new(0) };
+    /// The address whose free this thread watches (0 for none), for the
+    /// release witnesses.
+    #[cfg(test)]
+    static WATCHED: Cell<usize> = const { Cell::new(0) };
+    /// Whether this thread freed the watched address since it was set.
+    #[cfg(test)]
+    static WATCHED_FREED: Cell<bool> = const { Cell::new(false) };
 }
 
 /// Counts this thread's allocations under `t` from now on.
@@ -99,6 +106,21 @@ pub fn this_thread_frees() -> u64 {
     FREED.with(Cell::get)
 }
 
+/// Watches this thread's free of the allocation at `addr` from now on: a
+/// release witness for one identified allocation, which no other can share
+/// while it lives.
+#[cfg(test)]
+pub fn watch_free(addr: usize) {
+    WATCHED.with(|w| w.set(addr));
+    WATCHED_FREED.with(|f| f.set(false));
+}
+
+/// Whether this thread freed the watched allocation since [`watch_free`].
+#[cfg(test)]
+pub fn watched_freed() -> bool {
+    WATCHED_FREED.with(Cell::get)
+}
+
 fn note() {
     #[cfg(test)]
     let _ = MINE.try_with(|m| m.set(m.get() + 1));
@@ -133,6 +155,13 @@ unsafe impl GlobalAlloc for Counting {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         #[cfg(test)]
         let _ = FREED.try_with(|f| f.set(f.get() + 1));
+        #[cfg(test)]
+        if WATCHED
+            .try_with(Cell::get)
+            .is_ok_and(|w| w != 0 && w == ptr.addr())
+        {
+            let _ = WATCHED_FREED.try_with(|f| f.set(true));
+        }
         // SAFETY: same contract as the caller's.
         unsafe { System.dealloc(ptr, layout) }
     }

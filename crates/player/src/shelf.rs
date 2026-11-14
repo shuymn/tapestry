@@ -413,6 +413,19 @@ impl Shelf {
         self.library.level(key, sort, limit)
     }
 
+    /// `entry`'s stored preview profile, when one is current for its file
+    /// ([`Library::profile`]).
+    ///
+    /// # Errors
+    ///
+    /// Why the database refused the query.
+    pub fn profile(
+        &self,
+        entry: &ChartEntry,
+    ) -> Result<Option<library::StoredProfile>, LibraryError> {
+        self.library.profile(entry)
+    }
+
     fn start_pass(&mut self) {
         if self.roots.is_empty() {
             self.outcome = Outcome::NoRoots;
