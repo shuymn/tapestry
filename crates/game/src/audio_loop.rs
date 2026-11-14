@@ -558,6 +558,15 @@ impl Shared {
                 .then_some(OutputError::DeviceLost)
         })
     }
+
+    /// `kind`'s stop word (dev-tools): the one reading of it, from the
+    /// game thread's control and through an [`OutputProbe`].
+    #[cfg(feature = "dev-tools")]
+    fn system_stop_word(&self, kind: SystemKind) -> u64 {
+        self.system_stops
+            .get(kind.index())
+            .map_or(0, |word| word.load(Ordering::Acquire))
+    }
 }
 
 /// The output's latched failure, from any thread
@@ -607,10 +616,7 @@ impl OutputProbe {
     #[cfg(feature = "dev-tools")]
     #[must_use]
     pub fn system_stop_word(&self, kind: SystemKind) -> u64 {
-        self.0
-            .system_stops
-            .get(kind.index())
-            .map_or(0, |word| word.load(Ordering::Acquire))
+        self.0.system_stop_word(kind)
     }
 
     /// How many tones the audio thread started, by a tone request or by a
@@ -1527,10 +1533,7 @@ impl AudioControl {
     #[cfg(feature = "dev-tools")]
     #[must_use]
     pub fn system_stop_word(&self, kind: SystemKind) -> u64 {
-        self.shared
-            .system_stops
-            .get(kind.index())
-            .map_or(0, |word| word.load(Ordering::Acquire))
+        self.shared.system_stop_word(kind)
     }
 
     /// The current play's number: 0 before the first play, then one more
