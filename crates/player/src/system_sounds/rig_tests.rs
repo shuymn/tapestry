@@ -458,19 +458,36 @@ fn with_a_named_refusal<R>(
 ) -> R {
     use crate::select::MenuKey;
     use crate::selection::image_tests::press;
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = crate::selection::tests::tree(dir.path(), &[&["a.bms"]]);
+    with_a_held_refusal(screens, render, sel, |rig, name| {
+        // The cursor onto the chart; nothing named yet.
+        press(rig, MenuKey::Down);
+        assert!(rig.choose().is_none());
+        let line = name(rig);
+        f(rig, line)
+    })
+}
+
+/// `sel` on the select screen of `screens`, on a rig whose startup pick
+/// refuses a file, its report held: `f` with the rig and `name`, which
+/// lets the report in and gives the refusal's line once it is received
+/// and queued as the receipt at the head of a look's `choose` leaves it,
+/// before any look took it.
+fn with_a_held_refusal<R>(
+    screens: &crate::render_side::tests::Installers,
+    render: crate::render_side::RenderLink,
+    sel: crate::selection::Selection,
+    f: impl FnOnce(&mut PlayerRig<'_>, &dyn Fn(&mut PlayerRig<'_>) -> String) -> R,
+) -> R {
     let fx = Fixture::new();
     fx.sound("sound/A", SystemKind::Clear, 10);
     fx.write("sound/A/scratch.wav", b"not a sound");
     let seam = Seam::new(Arc::new(RealClock));
-    // The report waits until the select screen is up.
+    // The report waits until `name`.
     seam.rule("A/clear.wav", BLOCKED);
     arm_run(&fx, &seam, &Arc::default(), Some(MemFs::new()));
-    let dir = tempfile::tempdir().unwrap();
-    let (sel, _) = crate::selection::tests::tree(dir.path(), &[&["a.bms"]]);
-    crate::selection::tests::on_selection(sel, screens, render, |rig| {
-        // The cursor onto the chart; nothing named yet.
-        press(rig, MenuKey::Down);
-        assert!(rig.choose().is_none());
+    let name = |rig: &mut PlayerRig<'_>| {
         seam.open_gate();
         wait("the refusal named", || {
             rig.system_sounds
@@ -486,8 +503,9 @@ fn with_a_named_refusal<R>(
                 .any(|l| l.contains("scratch.wav") && l.contains("was refused")),
             "{named:?}"
         );
-        f(rig, named.join(" / "))
-    })
+        named.join(" / ")
+    };
+    crate::selection::tests::on_selection(sel, screens, render, |rig| f(rig, &name))
 }
 
 /// A look on `rig` that chooses nothing: the notice of the page it
@@ -497,6 +515,15 @@ fn notice_of_the_look(
     screens: &crate::render_side::tests::Installers,
 ) -> Option<String> {
     assert!(rig.choose().is_none());
+    published_notice(rig, screens)
+}
+
+/// The notice of the page `rig` published last, once a selection frame
+/// of `screens` applied that page.
+fn published_notice(
+    rig: &PlayerRig<'_>,
+    screens: &crate::render_side::tests::Installers,
+) -> Option<String> {
     let published = rig
         .selection
         .as_ref()
@@ -690,6 +717,95 @@ fn a_refusal_taken_by_a_choice_shows_on_the_return() {
             Some(format!("{refused} / {line}"))
         );
         assert!(rig.system_notices.lock().unwrap().is_empty());
+    });
+}
+
+/// design.md "Screen skins": a skin refused at startup is on the entry's
+/// page, which is no look's; a look that publishes no page leaves it for
+/// the next look's page, where a file the pick refused, named after that
+/// look, joins it rather than replacing it.
+#[test]
+fn a_look_that_publishes_nothing_keeps_the_notices() {
+    use crate::render_side::tests::Installers;
+    let screens = Installers::default();
+    let render = screens.spawn_bare();
+    let dir = tempfile::tempdir().unwrap();
+    // No pass runs again: a look with no input publishes nothing.
+    let (mut sel, _) = crate::selection::tests::tree(dir.path(), &[&["a.bms"]]);
+    sel.shelf.set_rescan_after(Duration::from_secs(3_600));
+    let refused = crate::imports::notice(ScreenKind::Selection, "refused at startup for the test");
+    sel.started(Some(refused.clone()), None);
+    with_a_held_refusal(&screens, render, sel, |rig, name| {
+        assert_eq!(published_notice(rig, &screens), Some(refused.clone()));
+        let entered = rig.selection.as_ref().unwrap().feed.published();
+        assert!(rig.choose().is_none());
+        let quiet = rig.selection.as_ref().unwrap().feed.published();
+        assert_eq!(quiet, entered, "the quiet look published a page");
+        let line = name(rig);
+        assert_eq!(
+            notice_of_the_look(rig, &screens),
+            Some(format!("{refused} / {line}"))
+        );
+        assert_ne!(
+            rig.selection.as_ref().unwrap().feed.published(),
+            quiet,
+            "the look after the line published no page"
+        );
+    });
+}
+
+/// design.md "Screen skins", "Play Lifecycle" (Selection): a chart
+/// refused because the shelf would not open, its refusal on no look's page
+/// yet, and the shelf opened by a preset step taken in the look that
+/// chooses a chart: back on the select screen, with no other shelf change,
+/// the first look's page shows the refusal and the next look's page has
+/// none.
+#[test]
+fn a_preset_refusal_goes_after_the_page_that_showed_it() {
+    use crate::render_side::tests::Installers;
+    use crate::select::MenuKey;
+    use crate::selection::image_tests::press;
+    let screens = Installers::default();
+    let render = screens.spawn_bare();
+    let dir = tempfile::tempdir().unwrap();
+    let (mut sel, roots) = crate::selection::tests::tree(dir.path(), &[&["a.bms"]]);
+    // No pass runs again: a look with no input publishes nothing.
+    sel.shelf.set_rescan_after(Duration::from_secs(3_600));
+    let presets = dir.path().join("presets");
+    std::fs::create_dir_all(&presets).unwrap();
+    let broken = || game::Shelf::open(presets.clone(), "missing").unwrap_err();
+    crate::selection::tests::on_selection(sel, &screens, render, |rig| {
+        let published = |rig: &PlayerRig<'_>| rig.selection.as_ref().unwrap().feed.published();
+        // Back from the refused load, as the flow reports it.
+        rig.presets_changed(Err(&broken()));
+        rig.show_refusal(&game::LoadRefusal {
+            chart: roots[0].join("a.bms"),
+            reason: game::Refused::Chart(game::SessionError::Preset(broken())),
+        });
+        let refused = published_notice(rig, &screens).expect("the refusal shows");
+        assert!(refused.contains("a.bms"), "{refused}");
+        // F12, then Enter, taken by one look: the flow opens the shelf
+        // with the step and reports it before the chart's load.
+        press(rig, MenuKey::NextPreset);
+        press(rig, MenuKey::Enter);
+        assert!(
+            matches!(rig.choose(), Some(game::Pick::Play(_))),
+            "nothing chosen"
+        );
+        while rig.take_preset_step().is_some() {}
+        let opened = game::Shelf::open(presets.clone(), rig.files.preset()).unwrap();
+        rig.presets_changed(Ok(&opened));
+        // Back on the select screen, the shelf reported at the entry.
+        rig.entered_selection();
+        rig.presets_changed(Ok(&opened));
+        let entered = published(rig);
+        let first = notice_of_the_look(rig, &screens);
+        let shown = published(rig);
+        let next = notice_of_the_look(rig, &screens);
+        assert_eq!(first.as_deref(), Some(refused.as_str()));
+        assert_eq!(next, None);
+        assert_ne!(shown, entered, "the first look published no page");
+        assert_ne!(published(rig), shown, "the next look published no page");
     });
 }
 
