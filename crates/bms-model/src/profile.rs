@@ -52,8 +52,9 @@ pub struct SpeedRow {
 pub struct PreviewInputs {
     /// The preview's own timeline, the chart's objects and the preview's
     /// timed together, which keeps the tempo changes and STOPs a play's
-    /// timeline drops after its last object; `None` when the chart has no
-    /// preview object, or timing them failed, so the play chart's is used.
+    /// timeline drops after its last object; `None` when the chart has neither
+    /// a preview object nor a timing tail, or timing them failed, so the play
+    /// chart's is used.
     pub timeline: Option<PreviewTimeline>,
     /// The latest hidden note (channels 31–39), BGA event (04) or layer
     /// event (07), which lengthen the seconds the preview counts over.
@@ -603,7 +604,7 @@ mod tests {
     }
 
     /// A scroll change applies at its own row, never at another row of the
-    /// same µs: rows 1 (120 BPM) and 2 (240 BPM) are both at 500 µs, and a
+    /// same µs: rows 1 (120 BPM) and 2 (240 BPM) are both at 500 ms, and a
     /// factor of 2 from row 2 gives one row (240, ×2), where keying it by
     /// time would give (120, ×2) first.
     #[test]
