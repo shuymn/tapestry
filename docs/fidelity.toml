@@ -163,3 +163,21 @@ tests = [
     "crates/player/src/selection.rs::the_decision_screen_is_out_before_its_fence",
     "crates/player/src/system_sounds/rig_tests.rs::decide_plays_on_into_loading",
 ]
+
+[[entry]]
+id = "SF-010"
+summary = "Autoplay turns the turntable back for 80 ms at a charge note's end"
+class = "rule"
+decision = "#538"
+reason = """
+A rule a player sees: a charge scratch's end is played on the other scratch \
+direction, so autoplay turns the turntable back for a moment there. No chart \
+reaches it while CN and HCN are refused; it stays to be settled with the rule \
+that tells the scratch directions apart. Its 80 ms is tapestry's own tap hold \
+(design.md "Autoplay"), not a copy."""
+source = [
+    "src/bms/player/beatoraja/play/JudgeManager.java:272-284 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/play/JudgeManager.java:359-370 @beatoraja-0.8.9",
+]
+sites = ["crates/game/src/turntable.rs"]
+tests = ["crates/game/src/turntable/tests.rs::a_charge_end_turns_back_for_80_ms"]

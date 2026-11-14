@@ -183,5 +183,5 @@ pub use tuning::{
 };
 pub use turntable::{
     AnalogTurn, AutoplayScratch, PlayState, PlayStates, ScratchInput, ScratchNote, ScratchNoteKind,
-    Turn, TurntableClock, scratch_notes, state_ms,
+    Turn, TurntableClock, scratch_notes,
 };
