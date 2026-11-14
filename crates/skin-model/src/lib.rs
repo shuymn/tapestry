@@ -239,8 +239,8 @@ pub use widget::bpm_graph::{
     BpmColors, BpmGraphDef, MAX_BPM_COLUMNS, MAX_BPM_LINE_WIDTH, RUNS_PER_COLUMN, bpm_columns,
 };
 pub use widget::cover_paint::{
-    CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim, MAX_SLIDE, Slider,
-    SliderRate,
+    CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim, MAX_RANGE_DENOMINATOR,
+    MAX_SLIDE, Slider, SliderRate,
 };
 pub use widget::digits::{
     Align, DigitOffset, DigitsDef, GlyphSet, I32_DIGITS, MAX_CELLS, MAX_DIGIT_OFFSETS, NumberDef,

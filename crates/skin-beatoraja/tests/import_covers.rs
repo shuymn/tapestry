@@ -1276,41 +1276,39 @@ fn a_type_four_slider_paints_sudden_plus() {
 }
 
 #[test]
-fn a_slider_range_scales_to_the_reference_height() {
-    // ⌊1080 × range / height⌋: 499.5 truncates to 499 on a 720 px skin;
-    // 1 000 ‰ moves it exactly that far.
-    let (object, d) = slider(r#", "type": 4, "angle": 2, "range": 333"#, "");
-    let l = import_sized(
-        [1_280, 720],
-        &body("", &format!("{}, {object}", note("")), &[NOTES, &d]),
-        &[],
-    );
-    // The paint is drawn last, after any note 1 000 ‰ uncovers.
-    let at = |c: u16| rects(&l, 5_000, c, 0).last().unwrap()[1];
-    assert_eq!(at(1_000) - at(0), 499);
-    // Truncated once at the reference height (D1): range 5 of a 720 px
-    // skin is 7 reference pixels, and 3/8 of the lane moves it 2.625,
-    // 1.75 pixels of a 1 280×720 target; the source keeps 5 at that
-    // resolution and moves it 1.875.
-    let (object, d) = slider(r#", "type": 4, "angle": 2, "range": 5"#, "");
-    let l = import_sized(
-        [1_280, 720],
-        &body("", &format!("{}, {object}", note("")), &[NOTES, &d]),
-        &[],
-    );
-    let chart = ChartBuilder::new(150_000).build().unwrap();
-    let mut drawn = Drawn::over(l.ok().skin.clone(), &chart);
-    let mut y = |c: u16| {
-        drawn.view.cover = c;
-        drawn.frame(1_000, &[]).last().unwrap().rect[1]
+fn a_slider_range_scales_exactly() {
+    // A 720 px skin with one type-4 slider of `range`.
+    let sized = |range: i32| {
+        let (object, d) = slider(&format!(r#", "type": 4, "angle": 2, "range": {range}"#), "");
+        import_sized(
+            [1_280, 720],
+            &body("", &format!("{}, {object}", note("")), &[NOTES, &d]),
+            &[],
+        )
     };
-    let (still, moved) = (y(0), y(375));
-    assert!((moved - still - 2.625).abs() < 1e-3, "{still} {moved}");
-    // A range beyond the coordinates refuses.
-    let (object, d) = slider(r#", "type": 4, "angle": 2, "range": 2000000000"#, "");
-    match with(&object, &[&d]).err() {
-        ImportError::Range { field, .. } => assert_eq!(field, "range"),
-        e => panic!("{e:?}"),
+    // The paint's y at cover `c`, drawn last, after any note it uncovers.
+    let ys = |l: &Loaded, covers: [u16; 2]| {
+        let chart = ChartBuilder::new(150_000).build().unwrap();
+        let mut drawn = Drawn::over(l.ok().skin.clone(), &chart);
+        covers.map(|c| {
+            drawn.view.cover = c;
+            drawn.frame(1_000, &[]).last().unwrap().rect[1]
+        })
+    };
+    // `1080 · range / h` exactly: 333 is 499.5, which 1 000 ‰ moves it.
+    let [still, moved] = ys(&sized(333), [0, 1_000]);
+    assert_eq!(moved - still, 499.5);
+    // Range 5 is 7.5 reference pixels, so 3/8 of the lane moves it
+    // 2.8125, 1.875 pixels of a 1 280×720 target.
+    let [still, moved] = ys(&sized(5), [0, 375]);
+    assert!((moved - still - 2.8125).abs() < 1e-3, "{still} {moved}");
+    // A range past the coordinates refuses, its exact value counting:
+    // 699 051 is 1 048 576.5, half a pixel past `MAX_COORD`.
+    for range in [699_051, 2_000_000_000] {
+        match sized(range).err() {
+            ImportError::Range { field, .. } => assert_eq!(field, "range", "{range}"),
+            e => panic!("{range}: {e:?}"),
+        }
     }
 }
 

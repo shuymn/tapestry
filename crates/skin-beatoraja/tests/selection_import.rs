@@ -264,6 +264,44 @@ fn ratio_bars_draw_their_ratios() {
     assert_eq!(4 * hit.value.numerator, 3 * hit.value.denominator);
 }
 
+/// A slider's range scales exactly, as a play slider's: on a 1 280×720
+/// skin range 1 is 3/2 reference pixels across or down, so half the list
+/// moves each 3/4 from its place, `[0, 915, 15, 15]`.
+#[test]
+fn a_selection_slider_range_is_exact() {
+    let body = minimal(
+        r#""slider": [{"id": "across", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": 1, "angle": 1, "range": 1},
+                      {"id": "up", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": 1, "angle": 0, "range": 1}],
+           "destination": [{"id": "list", "dst": [{"x": 0, "y": 0, "w": 0, "h": 0}]},
+               {"id": "across", "dst": [{"x": 0, "y": 100, "w": 10, "h": 10}]},
+               {"id": "up", "dst": [{"x": 0, "y": 100, "w": 10, "h": 10}]}]"#,
+    );
+    let d = folder("");
+    let json =
+        common::selection::json(&body).replace(r#""w": 1920, "h": 1080"#, r#""w": 1280, "h": 720"#);
+    common::write(d.path(), "s.json", json.as_bytes());
+    let i = import_selection(d.path()).unwrap();
+    let mut s = Sel::new(i.skin);
+    let mut v = view(
+        vec![chart("a"), chart("b"), chart("c")],
+        Some(0),
+        None,
+        None,
+    );
+    v.position = ratio(1, 2);
+    s.view(&v);
+    let sliders: Vec<[f32; 4]> = s
+        .drawn(0)
+        .into_iter()
+        .filter(|(t, _)| t[1] < 8 && (40..48).contains(&t[0]))
+        .map(|(_, r)| r)
+        .collect();
+    assert_eq!(
+        sliders,
+        [[0.75, 915.0, 15.0, 15.0], [0.0, 914.25, 15.0, 15.0]]
+    );
+}
+
 /// An active `listoff` the list does not give: slot 1's unselected arm
 /// with only slot 0's `listoff` written refuses the song list, where
 /// the inactive `listoff` of the center slot missing is only noted.

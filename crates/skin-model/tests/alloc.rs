@@ -1202,7 +1202,10 @@ fn cover_paints() -> Vec<CoverPaintDef> {
         },
         CoverPaintDef {
             slider: Some(skin_model::Slider {
-                range: 400,
+                range: skin_model::Ratio {
+                    numerator: 801,
+                    denominator: 2,
+                },
                 rate: skin_model::SliderRate::Progress,
                 direction: skin_model::SliderDirection::Right,
             }),
@@ -4761,7 +4764,10 @@ fn programs_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         .map(|&k| CoverPaintDef {
             image: CoverImage::Image(0),
             slider: Some(skin_model::Slider {
-                range: 100,
+                range: skin_model::Ratio {
+                    numerator: 201,
+                    denominator: 2,
+                },
                 rate: skin_model::SliderRate::Program(k),
                 direction: skin_model::SliderDirection::Down,
             }),

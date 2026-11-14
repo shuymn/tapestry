@@ -509,7 +509,10 @@ fn the_progress_reads_zero_while_loading() {
     let slider = skin_model::CoverPaintDef {
         image: skin_model::CoverImage::Image(MARK),
         slider: Some(skin_model::Slider {
-            range: 400,
+            range: skin_model::Ratio {
+                numerator: 400,
+                denominator: 1,
+            },
             rate: skin_model::SliderRate::Progress,
             direction: skin_model::SliderDirection::Right,
         }),

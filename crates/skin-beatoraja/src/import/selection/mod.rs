@@ -266,18 +266,9 @@ impl Cx<'_> {
             if range < 0 {
                 return self.drop_el(role, at, field("range"));
             }
-            // The range scaled to the reference window along its axis and
-            // truncated once, exactly
-            // (`JsonSkinObjectLoader.java:398-413`).
-            let scaled = if matches!(direction, SliderDirection::Right | SliderDirection::Left) {
-                Q::int(range).mul(self.r).and_then(Q::integer)
-            } else {
-                (HEIGHT * i128::from(range)).checked_div(i128::from(self.height))
-            };
-            let range = scaled
-                .and_then(|r| u32::try_from(r).ok())
-                .filter(|&r| r <= skin_model::MAX_COORD.unsigned_abs())
-                .ok_or_else(|| self.range(at, "range"))?;
+            // The range scaled exactly to the reference window, as a play
+            // slider's (`JsonSkinObjectLoader.java:398-413`).
+            let range = self.slider_range(at, range)?;
             if event.is_some() {
                 self.ignored(at, NoteKind::Ignored { field: "event" });
             }

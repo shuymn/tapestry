@@ -37,7 +37,7 @@ pub struct SelectionView {
 }
 
 /// An exact ratio `numerator / denominator`, the denominator never zero.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct Ratio {
     pub numerator: u64,
     pub denominator: u64,

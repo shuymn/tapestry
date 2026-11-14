@@ -61,7 +61,10 @@ fn slider() -> RatioBarDef {
         image: 4,
         form: RatioForm::Slider {
             direction: SliderDirection::Right,
-            range: 100,
+            range: skin_model::Ratio {
+                numerator: 100,
+                denominator: 1,
+            },
             changeable: true,
         },
         source: RatioSource::ListPosition,
