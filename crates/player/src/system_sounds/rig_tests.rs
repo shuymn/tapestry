@@ -382,3 +382,49 @@ fn a_close_abandons_a_blocked_pick() {
             .unwrap()
     });
 }
+
+/// The shutdown order: `shut_down` closes the system sounds before the
+/// audio thread ends, so with a pick's read blocked the audio thread ends
+/// only after the close's bounded wait for the worker, and what the game
+/// thread held of theirs was dropped before it.
+#[test]
+fn the_shutdown_ends_the_system_sounds_before_the_audio_thread() {
+    let fx = Fixture::new();
+    fx.sound("sound/A", SystemKind::Clear, 10);
+    let seam = Seam::new(Arc::new(RealClock));
+    seam.rule("A/clear.wav", BLOCKED);
+    arm_run(&fx, &seam, &Arc::default(), Some(MemFs::new()));
+    let ended = Arc::new(std::sync::Mutex::new(None::<Instant>));
+    let theirs = Arc::clone(&ended);
+    let silent = |rate, _| {
+        (
+            Arc::new(audio::SoundBank::from_sounds(rate, Vec::new())),
+            Vec::new(),
+        )
+    };
+    let settings = game::Settings {
+        device: game::DeviceSettings::default(),
+        player: game::PlayerSettings::default(),
+    };
+    let render = crate::render_side::tests::Installers::default().spawn_bare();
+    let (shut_from, _) = crate::tests::on_rig_playing(
+        settings,
+        render,
+        input::QpcClock::start(),
+        None,
+        (silent, 1),
+        move |_| *theirs.lock().unwrap() = Some(Instant::now()),
+        |rig, _, _| {
+            wait("A's read", || seam.opens("A/clear.wav") > 0);
+            assert!(sounds(rig).pick_running().is_some());
+            Instant::now()
+        },
+    );
+    let ended = ended.lock().unwrap().expect("the audio thread ended");
+    let after = ended.saturating_duration_since(shut_from);
+    assert!(
+        after >= STOP_WAIT,
+        "the audio thread ended {after:?} into the shutdown"
+    );
+    seam.open_gate();
+}
