@@ -1466,7 +1466,9 @@ impl<'d> Cx<'d> {
             }
         }
         let mut offset = Offset::default();
-        let mut alpha: Vec<i64> = Vec::new();
+        // The configured alpha deltas: their sum, whether any is not 0 and
+        // whether any is above 0.
+        let (mut alpha, mut alpha_set, mut alpha_raised) = (0_i64, false, false);
         let (mut lift, mut cover, mut hidden) = (false, false, false);
         let mut turntable = false;
         if o.no_offsets && !ids.is_empty() {
@@ -1535,40 +1537,42 @@ impl<'d> Cx<'d> {
             offset.w += i64::from(v.w);
             offset.h += i64::from(v.h);
             offset.r += i64::from(v.r);
-            if v.a != 0 {
-                alpha.push(i64::from(v.a));
-            }
+            alpha += i64::from(v.a);
+            alpha_set |= v.a != 0;
+            alpha_raised |= v.a > 0;
         }
         let mut track = track;
-        if o.neutral && !alpha.is_empty() {
+        if o.neutral && alpha_set {
             self.ignored(
                 at,
                 NoteKind::Ignored {
                     field: "offset alpha",
                 },
             );
-            alpha.clear();
+            (alpha, alpha_set, alpha_raised) = (0, false, false);
         }
         // Offset 5 is an alpha offset too: −255 while HIDDEN+ is off, which
         // the model reproduces by not drawing the follower. The source
         // skips every alpha offset at an interpolated colour
-        // (`SkinObject.java:489-504`) and clamps each in turn (`:474-481`),
-        // so a follower of HIDDEN+ needs a fixed colour and no configured
-        // alpha above 0, or it would show where the model hides it.
-        if hidden && (!track.fixed_color() || alpha.iter().any(|&a| a > 0)) {
+        // (`SkinObject.java:489-504`), and a configured delta above 0 could
+        // lift the follower's alpha past HIDDEN+'s −255, so a follower of
+        // HIDDEN+ needs a fixed colour and no configured alpha above 0, or
+        // it could show where the model hides it.
+        if hidden && (!track.fixed_color() || alpha_raised) {
             self.drop_el(role, at, NoteKind::OffsetAlpha)?;
             return Ok(None);
         }
-        if !alpha.is_empty() {
-            let same_sign = alpha.iter().all(|&a| a > 0) || alpha.iter().all(|&a| a < 0);
-            if !track.fixed_color() || !same_sign {
+        // Configured deltas add up, and the key's alpha plus their sum is
+        // clamped once (design.md "Differences from the source", imported
+        // skins).
+        if alpha_set {
+            if !track.fixed_color() {
                 self.drop_el(role, at, NoteKind::OffsetAlpha)?;
                 return Ok(None);
             }
-            let sum: i64 = alpha.iter().sum();
             for k in &mut track.keys {
                 let [a, ..] = &mut k.color;
-                *a = i32::try_from((i64::from(*a) + sum).clamp(0, 255)).unwrap_or(255);
+                *a = i32::try_from((i64::from(*a) + alpha).clamp(0, 255)).unwrap_or(255);
             }
         }
 
