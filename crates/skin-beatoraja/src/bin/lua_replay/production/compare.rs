@@ -21,7 +21,7 @@ use crate::report::{Finding, Report, Stopped};
 /// Skins", Built): the number truncated toward zero and saturated to
 /// `i32` (NaN 0); nil and booleans 0. Restated here, not called, so the
 /// comparator checks production's conversion against the rule.
-fn toint(r: Raw) -> i32 {
+pub(crate) fn toint(r: Raw) -> i32 {
     #[expect(
         clippy::cast_possible_truncation,
         reason = "`as` truncates toward zero and saturates"
@@ -712,37 +712,32 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 let bucket = format!("outside ({label})");
                 for occ in cat.iter().flatten() {
                     let key = occ.key;
-                    let calls: Vec<Outcome> = match occ.first {
-                        Point::Ran { outcome, .. } => vec![outcome],
-                        Point::NotReached { .. } => Vec::new(),
+                    rep.points += 1;
+                    let Point::Ran { outcome, .. } = occ.first else {
+                        continue;
                     };
-                    rep.points += calls.len().max(1);
-                    for outcome in calls {
-                        let api = match outcome {
-                            Outcome::Unanswered(a) => Some(a),
-                            Outcome::Budget => Some("budget"),
-                            _ => None,
-                        };
-                        let Some(api) = api else {
-                            *rep.buckets.entry(bucket.clone()).or_default() += 1;
-                            continue;
-                        };
-                        match cx.compiled(&key) {
-                            Some(k)
-                                if run.slotted.get(usize::from(k)).copied().unwrap_or(false) =>
-                            {
-                                find(
-                                    key,
-                                    i,
-                                    format!("a slotted root stopped on an outside frame ({api})"),
-                                );
-                            }
-                            _ => {
-                                stopped
-                                    .entry(("outside", key.callable))
-                                    .or_insert((api, 0, key))
-                                    .1 += 1;
-                            }
+                    let api = match outcome {
+                        Outcome::Unanswered(a) => Some(a),
+                        Outcome::Budget => Some("budget"),
+                        _ => None,
+                    };
+                    let Some(api) = api else {
+                        *rep.buckets.entry(bucket.clone()).or_default() += 1;
+                        continue;
+                    };
+                    match cx.compiled(&key) {
+                        Some(k) if run.slotted.get(usize::from(k)).copied().unwrap_or(false) => {
+                            find(
+                                key,
+                                i,
+                                format!("a slotted root stopped on an outside frame ({api})"),
+                            );
+                        }
+                        _ => {
+                            stopped
+                                .entry(("outside", key.callable))
+                                .or_insert((api, 0, key))
+                                .1 += 1;
                         }
                     }
                 }
@@ -779,31 +774,29 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
             for occ in occs {
                 let key = occ.key;
                 let k = cx.compiled(&key);
-                let calls = match occ.first {
-                    Point::Ran { outcome, .. } => vec![outcome],
-                    Point::NotReached { .. } => Vec::new(),
+                let call = match occ.first {
+                    Point::Ran { outcome, .. } => Some(outcome),
+                    Point::NotReached { .. } => None,
                 };
-                // Points: an invocation each, or one not reached.
-                rep.points += calls.len().max(1);
+                // Points: the invocation, or the one not reached.
+                rep.points += 1;
                 let lowered_rec = cx
                     .rec(&key)
                     .filter(|o| k.is_none() && o.disposition == "lowered");
                 let lowered_here = lowered_rec.is_some();
-                for &outcome in &calls {
-                    let api = match outcome {
-                        Outcome::Unanswered(a) => Some(a),
-                        Outcome::Budget => Some("budget"),
-                        _ => None,
-                    };
-                    if let Some(api) = api
-                        && k.is_none()
-                        && !lowered_here
-                    {
-                        stopped
-                            .entry(("play", key.callable))
-                            .or_insert((api, 0, key))
-                            .1 += 1;
-                    }
+                let api = match call {
+                    Some(Outcome::Unanswered(a)) => Some(a),
+                    Some(Outcome::Budget) => Some("budget"),
+                    _ => None,
+                };
+                if let Some(api) = api
+                    && k.is_none()
+                    && !lowered_here
+                {
+                    stopped
+                        .entry(("play", key.callable))
+                        .or_insert((api, 0, key))
+                        .1 += 1;
                 }
                 // A lowered occurrence: its expression on this frame's
                 // production state against the closure (s7-06e-3-design.md
@@ -815,7 +808,7 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                             .ok_or_else(|| "a lowered occurrence with no expression".to_owned())
                             .and_then(|l| compile_lowered(key.field, l))
                     });
-                    for &outcome in &calls {
+                    if let Some(outcome) = call {
                         rep.matched += 1;
                         if toint_differs(key.field, outcome) {
                             *rep.intended.entry(TOINT_PAST_I32).or_default() += 1;
@@ -838,16 +831,16 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                     continue;
                 }
                 let Some(k) = k else {
-                    if !calls.is_empty() {
+                    if call.is_some() {
                         match cx.attribute(&key) {
-                            Some(b) => *rep.buckets.entry(b).or_default() += calls.len(),
+                            Some(b) => *rep.buckets.entry(b).or_default() += 1,
                             None => find(key, i, "no production record of this occurrence".into()),
                         }
                     }
                     continue;
                 };
                 seen.insert(k);
-                rep.matched += calls.len().max(1);
+                rep.matched += 1;
                 if let Point::NotReached { why, .. } = occ.first {
                     let was_blocked = blocked;
                     if key.field != "timer" {
@@ -878,46 +871,41 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                     }
                     continue;
                 }
-                for outcome in calls {
+                if let Some(outcome) = call {
                     order.push(k);
                     if key.field != "timer" {
                         blocked = !allows(key.field, outcome);
                         outs.insert(k, expected_out(key.field, outcome));
                     }
-                    if let Outcome::Unanswered(api) = outcome {
-                        find(key, i, format!("reference could not complete ({api})"));
-                        used.insert(k);
-                        continue;
-                    }
-                    if outcome == Outcome::Budget {
-                        find(key, i, "reference could not complete (budget)".into());
-                        used.insert(k);
-                        continue;
-                    }
-                    let prod = match p.first.get(&k) {
-                        Some(First::Ran(inv)) => *inv,
-                        Some(First::Skipped(s)) => {
-                            find(
-                                key,
-                                i,
-                                format!("ran in the source, skipped in production ({s:?})"),
-                            );
-                            continue;
+                    match (outcome, p.first.get(&k)) {
+                        (Outcome::Unanswered(api), _) => {
+                            find(key, i, format!("reference could not complete ({api})"));
+                            used.insert(k);
                         }
-                        None => {
+                        (Outcome::Budget, _) => {
+                            find(key, i, "reference could not complete (budget)".into());
+                            used.insert(k);
+                        }
+                        (_, Some(First::Skipped(s))) => find(
+                            key,
+                            i,
+                            format!("ran in the source, skipped in production ({s:?})"),
+                        ),
+                        (_, None) => {
                             find(key, i, "ran in the source, not traced in production".into());
-                            continue;
                         }
-                    };
-                    used.insert(k);
-                    if toint_differs(key.field, outcome) {
-                        *rep.intended.entry(TOINT_PAST_I32).or_default() += 1;
-                    }
-                    match differ(key.field, prod, outcome) {
-                        None => rep.agreed += 1,
-                        Some(d) => {
-                            let hint = luaj_hint(obs, key.callable);
-                            find(key, i, format!("{d}{hint}"));
+                        (_, Some(First::Ran(prod))) => {
+                            used.insert(k);
+                            if toint_differs(key.field, outcome) {
+                                *rep.intended.entry(TOINT_PAST_I32).or_default() += 1;
+                            }
+                            match differ(key.field, *prod, outcome) {
+                                None => rep.agreed += 1,
+                                Some(d) => {
+                                    let hint = luaj_hint(obs, key.callable);
+                                    find(key, i, format!("{d}{hint}"));
+                                }
+                            }
                         }
                     }
                 }

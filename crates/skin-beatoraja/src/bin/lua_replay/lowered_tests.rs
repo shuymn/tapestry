@@ -5,7 +5,7 @@
 
 use crate::inputs::FrameInputs;
 use crate::isolation;
-use crate::observed::{Cause, Observed, Outcome, Point, Raw};
+use crate::observed::{Cause, Observed, Outcome, Point};
 use crate::report::Report;
 use crate::script::Script;
 use crate::tests::{dst, folder, options, run_with};
@@ -102,26 +102,10 @@ fn values_on(obs: &Observed, i: usize) -> Vec<i32> {
             Point::Ran {
                 key,
                 outcome: Outcome::Value(r),
-            } if key.field == "value" => Some(toint(*r)),
+            } if key.field == "value" => Some(crate::production::compare::toint(*r)),
             _ => None,
         })
         .collect()
-}
-
-/// A number's value truncated toward zero and saturated to `i32`, as the
-/// comparator converts.
-fn toint(r: Raw) -> i32 {
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "`as` truncates toward zero and saturates"
-    )]
-    match r {
-        Raw::Int(n) => {
-            i32::try_from(n.clamp(i64::from(i32::MIN), i64::from(i32::MAX))).unwrap_or(0)
-        }
-        Raw::Float(f) => f as i32,
-        _ => 0,
-    }
 }
 
 fn lowered(r: &Report, field: &str) -> usize {
