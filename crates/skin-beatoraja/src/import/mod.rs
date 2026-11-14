@@ -377,9 +377,6 @@ struct Opts<'a> {
     neutral: bool,
     /// The offsets are not consumed: noted, never refused.
     no_offsets: bool,
-    /// A judge's combo: its digits; each key gives `x` and `w` together
-    /// or neither ([`track::read`]).
-    digits: Option<i32>,
     /// The keys as written were charged before this read.
     charged: bool,
     /// The keys' clip is unused: noted, never refused.
@@ -1219,13 +1216,8 @@ impl<'d> Cx<'d> {
     /// caller uses. Colour is clamped rather than refused, so the skin
     /// looks as its author saw it; when `colour` is drawn, a clamped
     /// channel is reported once, as a `Fallback` note at its first key.
-    fn read_keys(
-        &mut self,
-        dst: &Dst,
-        digits: Option<i32>,
-        colour: Colour,
-    ) -> Result<track::Keys, ImportError> {
-        let keys = track::read(self.def, &dst.keys, digits)?;
+    fn read_keys(&mut self, dst: &Dst, colour: Colour) -> Result<track::Keys, ImportError> {
+        let keys = track::read(self.def, &dst.keys)?;
         if colour == Colour::Drawn
             && let Some(k) = keys.clamped
         {
@@ -1270,7 +1262,7 @@ impl<'d> Cx<'d> {
         } else {
             Colour::Drawn
         };
-        let mut keys = self.read_keys(dst, o.digits, drawn)?;
+        let mut keys = self.read_keys(dst, drawn)?;
         if o.neutral {
             // The emitted keys, at 0 and at the last time, charged before
             // the constructor's key joins.

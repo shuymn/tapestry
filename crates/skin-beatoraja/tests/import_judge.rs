@@ -278,20 +278,69 @@ fn combo_keys(keys: &str) -> String {
 }
 
 #[test]
-fn a_combo_key_gives_x_and_w_together() {
-    let range = |keys: &str, field: &str| {
+fn a_combo_shift_past_the_coordinates_refuses() {
+    let range = |keys: &str| {
         let l = judge(&grades(1), &[combo_keys(keys)]);
         assert!(
-            matches!(l.err(), ImportError::Range { field: f, .. } if f == field),
+            matches!(l.err(), ImportError::Range { field: "dst", .. }),
             "{keys}"
         );
     };
-    // Only one of the two is given.
-    range(r#"{"x": 10, "y": 0, "h": 20}"#, "x");
-    range(r#"{"y": 0, "w": 10, "h": 20}"#, "x");
     // A shift past `i32` is exact, and only its edges leave the model.
-    range(r#"{"x": 0, "y": 0, "w": 2147483647, "h": 20}"#, "dst");
-    range(r#"{"x": -2147483647, "y": 0, "w": 10, "h": 20}"#, "dst");
+    range(r#"{"x": 0, "y": 0, "w": 2147483647, "h": 20}"#);
+    range(r#"{"x": -2147483647, "y": 0, "w": 10, "h": 20}"#);
+}
+
+/// The combo `ten` (three digits) under `keys`, held from 2 s by its
+/// `loop`, its rects at each of `elapsed` ms after a PERFECT at combo 12.
+fn combo_frames(keys: &str, elapsed: &[i64]) -> Vec<Vec<[i32; 4]>> {
+    let combo = format!(r#"{{"id": "ten", "loop": 2000, "dst": [{keys}]}}"#);
+    let l = judge(&grades(1), &[combo]);
+    let mut d = Drawn::new(l.ok().skin.clone(), 100);
+    d.tally = tally(0, 12);
+    d.frame(1_000, &[event(1_000, of(Judgment::Perfect, 12))]);
+    elapsed.iter().map(|&e| d.rects(1_000 + e)).collect()
+}
+
+/// A combo key giving only `x` or only `w` inherits the other from the
+/// previous key, then moves left by its own `w` × digits / 2: it draws as
+/// the same key with the inherited field written. A first key inherits 0:
+/// `w` alone at x 0 moves to −15 ("12" a half cell right of it: 90 and
+/// 100); `x` alone has no width, so its glyphs are empty at x 10.
+#[test]
+fn a_combo_key_inherits_x_or_w_alone() {
+    const FIRST: &str = r#"{"time": 0, "x": 10, "y": 0, "w": 10, "h": 20}"#;
+    let times = [1, 1_000, 2_000, 4_000, 5_000];
+    for (alone, written) in [
+        (
+            r#"{"time": 2000, "x": 40}"#,
+            r#"{"time": 2000, "x": 40, "y": 0, "w": 10, "h": 20}"#,
+        ),
+        (
+            r#"{"time": 2000, "w": 20}"#,
+            r#"{"time": 2000, "x": 10, "y": 0, "w": 20, "h": 20}"#,
+        ),
+    ] {
+        let got = combo_frames(&format!("{FIRST}, {alone}"), &times);
+        assert_eq!(
+            got,
+            combo_frames(&format!("{FIRST}, {written}"), &times),
+            "{alone}"
+        );
+        assert_ne!(got, combo_frames(FIRST, &times), "{alone}");
+    }
+    let first = |keys: &str| {
+        let l = judge(&grades(1), &[combo_keys(keys)]);
+        shown(&l, of(Judgment::Perfect, 12), 12, false)
+    };
+    assert_eq!(
+        first(r#"{"y": 0, "w": 10, "h": 20}"#),
+        [[90, 560, 10, 20], [100, 560, 10, 20], [100, 560, 80, 20]]
+    );
+    assert_eq!(
+        first(r#"{"x": 10, "y": 0, "h": 20}"#),
+        [[110, 560, 0, 20], [110, 560, 0, 20], [100, 560, 80, 20]]
+    );
 }
 
 /// The shift is exact on a 1280 px skin: the raw x 10 less half of three
