@@ -522,6 +522,39 @@ fn a_trailing_stop_reaches_the_preview() {
     );
 }
 
+/// Fixture PB: a measure written only by poor-BGA lines (06) keeps its bar
+/// line in the preview, as the source puts a measure's poor-BGA events on
+/// its bar line's timeline: a tap at 0 at 150 BPM, 200 BPM (03 `C8`)
+/// halfway into the measure (800 ms), so measure 1 starts at 1 400 ms and
+/// measure 3 at 3 800 ms, and a poor-BGA event two thirds into measure 3
+/// (4 600 ms). The rows end at measure 3's bar line, not at the event; the
+/// length and seconds stay the play chart's, as the source's last time
+/// leaves the event out; and the play chart is the one without it.
+#[test]
+fn a_poor_bga_measure_keeps_its_bar_line_in_the_preview() {
+    let base = "#BPM 150\n#00019:01\n#00003:00C8\n";
+    let text = format!("{base}#00306:000001\n");
+    let one = bms_model::SCROLL_ONE;
+    let p = preview(&text);
+    assert_eq!(
+        p.speeds().to_vec(),
+        [
+            speed_row(0, 150, one),
+            speed_row(800, 200, one),
+            speed_row(3_800, 200, one)
+        ]
+    );
+    assert_eq!(p.length_ms(), 0);
+    assert_eq!(p.seconds(), preview(base).seconds());
+    let (with, without) = (load(&text, 0).unwrap(), load(base, 0).unwrap());
+    assert_eq!(with.profile, without.profile);
+    assert_eq!(with.chart.meta.length, without.chart.meta.length);
+    assert_eq!(
+        with.chart.identity.resolved_hash,
+        without.chart.identity.resolved_hash
+    );
+}
+
 /// Fixture SU: a scroll change naming no `#SCROLLxx` is left out before
 /// timing: it adds no point, so the rows and seconds are those without it,
 /// and one past the duration cap (999 measures of 4 s at 60 BPM) does not

@@ -78,6 +78,12 @@ pub struct Source {
     /// Scroll changes (channel `SC`), each as [`ObjectKind::Bgm`] of its
     /// `#SCROLLxx` id, in file order, for the preview alone.
     pub scrolls: Vec<RawObject>,
+    /// The bar line of the last measure holding a poor-BGA event (channel
+    /// 06), as [`ObjectKind::Bgm`] of id 0 at that measure's start: the
+    /// preview's timeline runs to it, as the source puts a measure's
+    /// poor-BGA events on its bar line's timeline (jbms-parser
+    /// `Section.makeTimeLines`), but it is no shown object.
+    pub poor_bar: Option<RawObject>,
     /// `#SCROLLxx` factors in units of `10^-18`, those that are numbers.
     pub scroll_defs: BTreeMap<u16, i128>,
 }
@@ -323,6 +329,13 @@ fn parse_channel(
             [b'0', b'4' | b'7'] => source.shown.push(preview(0)),
             [b'3', d] if lane_of(d).is_some() => source.shown.push(preview(0)),
             [b'S', b'C'] => source.scrolls.push(preview(id)),
+            [b'0', b'6'] if source.poor_bar.as_ref().is_none_or(|b| b.measure < measure) => {
+                source.poor_bar = Some(RawObject {
+                    index: 0,
+                    count: 1,
+                    ..preview(0)
+                });
+            }
             _ => {}
         }
         match kind {
