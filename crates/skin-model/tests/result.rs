@@ -957,3 +957,46 @@ fn an_invalid_readout_refuses_the_result_frame() {
     fx.frame(16);
     assert_eq!(app_digits(&fx), [1, 2]);
 }
+
+/// C14: a result's fields hold the player's totals under every status,
+/// an unavailable view's too, split from the full total as on selection.
+#[test]
+fn the_player_totals_fill_the_result_fields() {
+    let totals = |play_us: u64| skin_model::PlayerTotals {
+        plays: 7,
+        clears: 3,
+        counts: [101, 202, 303, 404, 505],
+        play_us,
+    };
+    let player = |view: &ResultView| {
+        ResultFields::of(view).0
+            [usize::from(field::PLAYER_TIME_H)..=usize::from(field::PLAYER_NOTES)]
+            .to_vec()
+    };
+    let mut ready_view = ready(1_000, BestView::Unavailable, 1);
+    ready_view.totals = totals(12_345_900_000);
+    let mut unavailable = ready_view.clone();
+    unavailable.status = ResultStatus::Unavailable(Unavailable::Failed);
+    let full = [3, 25, 45, 7, 3, 4, 101, 202, 303, 404, 505, 1_010];
+    assert_eq!(player(&ready_view), full);
+    assert_eq!(player(&unavailable), full, "unavailable");
+    assert_eq!(
+        ResultFields::of(&unavailable).0[usize::from(field::RESULT_VALID)],
+        0
+    );
+    // A state reads them after the view, as the fields give them.
+    let mut fx = RFx::new(rload(vec![], WidgetDefs::default()).unwrap());
+    fx.view(&unavailable);
+    assert_eq!(
+        fx.res.state().fields[usize::from(field::PLAYER_TIME_H)..=usize::from(field::PLAYER_NOTES)],
+        full
+    );
+    // The time's boundaries.
+    unavailable.totals = totals(2_147_483_647 * 1_000_000);
+    assert_eq!(player(&unavailable)[..3], [596_523, 14, 7]);
+    unavailable.totals = totals(u64::MAX);
+    assert_eq!(
+        player(&unavailable)[..3],
+        [skin_model::RESULT_VALUE_MAX, 1, 49]
+    );
+}

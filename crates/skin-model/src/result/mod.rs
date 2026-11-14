@@ -529,6 +529,9 @@ fn fields(view: &ResultView) -> [i32; field::COUNT] {
     }
     set(field::CHART_STAGEFILE, i32::from(c.images.stage));
     set(field::CHART_BACKBMP, i32::from(c.images.back));
+    for (slot, v) in (field::PLAYER_TIME_H..).zip(crate::select::player_fields(&view.totals)) {
+        set(slot, v);
+    }
     if view.status != ResultStatus::Ready {
         return f;
     }

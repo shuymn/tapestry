@@ -559,6 +559,7 @@ pub fn view(rows: Vec<RowView>, cursor: Option<usize>) -> SelectionView {
         query: String::new(),
         selected,
         list_revision: 0,
+        totals: Default::default(),
     }
 }
 

@@ -471,6 +471,7 @@ fn rows_at(at: usize, n: usize) -> SelectionView {
         query: String::new(),
         selected: None,
         list_revision: 0,
+        totals: Default::default(),
     }
 }
 

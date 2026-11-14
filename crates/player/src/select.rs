@@ -1445,6 +1445,7 @@ impl SelectScreen {
             query: self.query.clone(),
             selected: self.selected().map(|e| self.selected_chart(e)),
             list_revision: 0,
+            totals: Default::default(),
         }
     }
 

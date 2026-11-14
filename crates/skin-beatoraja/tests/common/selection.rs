@@ -389,6 +389,7 @@ pub fn view(
         query: String::new(),
         selected,
         list_revision: 0,
+        totals: Default::default(),
     }
 }
 

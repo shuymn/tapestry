@@ -632,6 +632,36 @@ pub(crate) fn next_rank(ex: u64, max: u64) -> u64 {
     u64::try_from(next).unwrap_or(u64::MAX)
 }
 
+/// The fields `player.time_h` to `player.notes` of `t`, in their slots'
+/// order: the play time's hours, minutes and seconds, each split from the
+/// full total in whole seconds; the plays, the clears and the plays less
+/// them; the PERFECT to POOR totals; and PERFECT to BAD. Each is computed
+/// in `u64`, saturating, before it saturates at [`VALUE_MAX`], so the time
+/// of `VALUE_MAX + 1` seconds reads 596 523 h 14 min 7 s.
+pub(crate) fn player_fields(t: &crate::PlayerTotals) -> [i32; 12] {
+    let secs = t.play_us / 1_000_000;
+    let [perfect, great, good, bad, poor] = t.counts;
+    let notes = perfect
+        .saturating_add(great)
+        .saturating_add(good)
+        .saturating_add(bad);
+    [
+        secs / 3_600,
+        secs / 60 % 60,
+        secs % 60,
+        t.plays,
+        t.clears,
+        t.plays.saturating_sub(t.clears),
+        perfect,
+        great,
+        good,
+        bad,
+        poor,
+        notes,
+    ]
+    .map(value)
+}
+
 /// The judgments of `t`, PERFECT to POOR.
 const fn judgments(t: &eval::Tally) -> [u32; 5] {
     let c = &t.counts;
@@ -657,6 +687,9 @@ fn fields(view: &SelectionView, cursor: Option<&RowView>) -> [i32; field::COUNT]
             set(field::CURSOR_CHARTS, value(u64::from(charts)));
         }
         Some(RowKind::Heading) | None => {}
+    }
+    for (slot, v) in (field::PLAYER_TIME_H..).zip(player_fields(&view.totals)) {
+        set(slot, v);
     }
     let Some(c) = view.selected.as_ref() else {
         return f;

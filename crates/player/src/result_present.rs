@@ -388,6 +388,7 @@ pub fn view_of(screen: &ResultScreen, chart: ResultChart) -> ResultView {
                 gauge: parts.gauge,
                 deviations: Some(parts.deviations),
                 timing_areas: Some(parts.timing_areas),
+                totals: Default::default(),
             };
         }
         (ViewStatus::NothingRecorded, _) => Unavailable::NothingRecorded,

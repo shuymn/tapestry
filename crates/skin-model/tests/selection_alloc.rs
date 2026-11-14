@@ -381,6 +381,13 @@ fn a_selection_build_allocates_nothing() {
     for cursor in [0_usize, 5, 20, 39] {
         let mut v = view(rows.clone(), Some(cursor));
         v.position = ratio(u64::try_from(cursor).unwrap(), 39);
+        // The player's totals, filled with the view's fields.
+        v.totals = skin_model::PlayerTotals {
+            plays: 7 + u64::try_from(cursor).unwrap(),
+            clears: 3,
+            counts: [101, 202, 303, 404, 505],
+            play_us: 12_345_900_000,
+        };
         if let Some(c) = v.selected.as_mut() {
             c.max_ex = Some(300);
             c.judge_class = u8::try_from(cursor % 5).ok();

@@ -2043,3 +2043,59 @@ fn the_best_play_bars_divide_by_its_own_notes() {
     v.selected.as_mut().unwrap().best = None;
     close(widths(&mut fx, &v), &[0.0]);
 }
+
+/// The player's totals over every counted play, as C8 and the result's
+/// fields read them: 7 plays, 3 clears, PERFECT to POOR 101 to 505, and
+/// 12 345.9 s of play time.
+fn totals(play_us: u64, plays: u64) -> skin_model::PlayerTotals {
+    skin_model::PlayerTotals {
+        plays,
+        clears: 3,
+        counts: [101, 202, 303, 404, 505],
+        play_us,
+    }
+}
+
+/// C8: selection's fields hold the player's totals on every row kind, a
+/// folder's too: 3 h 25 min 45 s, 7 plays, 3 clears, 4 fails, PERFECT to
+/// POOR, and 1 010 PERFECT to BAD. Each value is split from the full total
+/// and only then saturates: 2 147 483 647 s reads 596 523:14:07 (clamping
+/// the seconds first would give :06), `u64::MAX` µs reads the largest
+/// hours with its exact minutes and seconds (18 446 744 073 709 s: 1 and
+/// 49), and plays past `i32::MAX` read the largest value.
+#[test]
+fn the_player_totals_fill_the_fields() {
+    use skin_model::{SELECTION_VALUE_MAX as MAX, selection_field as field};
+    let mut fx = number_skin("player.plays", "true");
+    let mut read = |v: &skin_model::SelectionView| {
+        fx.view(v);
+        fx.frame(0);
+        let f = fx.sel.state().fields;
+        let shown = shown(&fx);
+        (
+            f[usize::from(field::PLAYER_TIME_H)..=usize::from(field::PLAYER_NOTES)].to_vec(),
+            shown,
+        )
+    };
+    let full = [3, 25, 45, 7, 3, 4, 101, 202, 303, 404, 505, 1_010];
+    let mut on_chart = three(1);
+    on_chart.totals = totals(12_345_900_000, 7);
+    assert!(on_chart.selected.is_some());
+    assert_eq!(read(&on_chart), (full.to_vec(), vec![7]));
+    let mut on_folder = view(vec![folder("f", 2), chart("a")], Some(0));
+    on_folder.totals = totals(12_345_900_000, 7);
+    assert!(on_folder.selected.is_none());
+    assert_eq!(read(&on_folder), (full.to_vec(), vec![7]), "a folder");
+    // The time's boundaries.
+    let mut v = three(0);
+    v.totals = totals(2_147_483_647 * 1_000_000, 7);
+    assert_eq!(read(&v).0[..3], [596_523, 14, 7]);
+    v.totals = totals(u64::MAX, 7);
+    assert_eq!(read(&v).0[..3], [MAX, 1, 49]);
+    // Plays past `i32::MAX` saturate, the fails with them.
+    v.totals = totals(0, u64::MAX);
+    assert_eq!(read(&v).0[3..6], [MAX, 3, MAX]);
+    // The notes sum saturates in `u64` before the field does.
+    v.totals.counts = [u64::MAX, 1, 0, 0, 9];
+    assert_eq!(read(&v).0[6..], [MAX, 1, 0, 0, 9, MAX]);
+}

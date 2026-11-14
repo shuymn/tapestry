@@ -142,6 +142,18 @@ pub static RESULT: Schema = Schema {
         int("app.uptime_s", 0, 59),
         hideable("best.max_combo"),
         hideable("best.max_combo_diff"),
+        value("player.time_h"),
+        int("player.time_m", 0, 59),
+        int("player.time_s", 0, 59),
+        value("player.plays"),
+        value("player.clears"),
+        value("player.fails"),
+        value("player.count.perfect"),
+        value("player.count.great"),
+        value("player.count.good"),
+        value("player.count.bad"),
+        value("player.count.poor"),
+        value("player.notes"),
     ],
     timers: &[timer("screen"), timer("fadeout")],
     enums: &[],
@@ -270,8 +282,24 @@ pub mod field {
     /// the best.
     pub const BEST_MAX_COMBO: u16 = APP_UPTIME_S + 1;
     pub const BEST_MAX_COMBO_DIFF: u16 = APP_UPTIME_S + 2;
+    /// The player's totals over every counted play
+    /// ([`PlayerTotals`](crate::PlayerTotals)), on every view and status, this play included once it was counted, 0
+    /// when they cannot be read: their play
+    /// time's whole hours, minutes and seconds, each split from the full
+    /// total; the plays, the clears and the plays less them; the PERFECT
+    /// to POOR totals; and PERFECT to BAD. Each saturates at
+    /// [`VALUE_MAX`](super::VALUE_MAX).
+    pub const PLAYER_TIME_H: u16 = BEST_MAX_COMBO_DIFF + 1;
+    pub const PLAYER_TIME_M: u16 = PLAYER_TIME_H + 1;
+    pub const PLAYER_TIME_S: u16 = PLAYER_TIME_H + 2;
+    pub const PLAYER_PLAYS: u16 = PLAYER_TIME_H + 3;
+    pub const PLAYER_CLEARS: u16 = PLAYER_TIME_H + 4;
+    pub const PLAYER_FAILS: u16 = PLAYER_TIME_H + 5;
+    pub const PLAYER_COUNT_PERFECT: u16 = PLAYER_TIME_H + 6;
+    pub const PLAYER_COUNT_POOR: u16 = PLAYER_TIME_H + 10;
+    pub const PLAYER_NOTES: u16 = PLAYER_TIME_H + 11;
     /// The number of fields.
-    pub const COUNT: usize = BEST_MAX_COMBO_DIFF as usize + 1;
+    pub const COUNT: usize = PLAYER_NOTES as usize + 1;
 }
 
 /// The built-in timer slots of [`RESULT`]; `when` timers follow from
@@ -327,6 +355,15 @@ mod tests {
             (field::APP_UPTIME_S, "app.uptime_s"),
             (field::BEST_MAX_COMBO, "best.max_combo"),
             (field::BEST_MAX_COMBO_DIFF, "best.max_combo_diff"),
+            (field::PLAYER_TIME_H, "player.time_h"),
+            (field::PLAYER_TIME_M, "player.time_m"),
+            (field::PLAYER_TIME_S, "player.time_s"),
+            (field::PLAYER_PLAYS, "player.plays"),
+            (field::PLAYER_CLEARS, "player.clears"),
+            (field::PLAYER_FAILS, "player.fails"),
+            (field::PLAYER_COUNT_PERFECT, "player.count.perfect"),
+            (field::PLAYER_COUNT_POOR, "player.count.poor"),
+            (field::PLAYER_NOTES, "player.notes"),
         ] {
             assert_eq!(names[usize::from(slot)], name);
         }

@@ -110,6 +110,18 @@ pub static SELECTION: Schema = Schema {
         value("selected.rate.good"),
         value("selected.rate.bad"),
         value("selected.rate.poor"),
+        value("player.time_h"),
+        int("player.time_m", 0, 59),
+        int("player.time_s", 0, 59),
+        value("player.plays"),
+        value("player.clears"),
+        value("player.fails"),
+        value("player.count.perfect"),
+        value("player.count.great"),
+        value("player.count.good"),
+        value("player.count.bad"),
+        value("player.count.poor"),
+        value("player.notes"),
         flag("selected.stagefile"),
         flag("selected.banner"),
         int("settings.display_offset", -VALUE_MAX, VALUE_MAX),
@@ -242,11 +254,26 @@ pub mod field {
     /// `selected.play_notes_valid` is false.
     pub const SELECTED_RATE_PERFECT: u16 = 55;
     pub const SELECTED_RATE_POOR: u16 = 59;
+    /// The player's totals over every counted play
+    /// ([`PlayerTotals`](crate::PlayerTotals)), on every row kind, a folder's too: their play
+    /// time's whole hours, minutes and seconds, each split from the full
+    /// total; the plays, the clears and the plays less them; the PERFECT
+    /// to POOR totals; and PERFECT to BAD. Each saturates at
+    /// [`VALUE_MAX`](super::VALUE_MAX).
+    pub const PLAYER_TIME_H: u16 = SELECTED_RATE_POOR + 1;
+    pub const PLAYER_TIME_M: u16 = PLAYER_TIME_H + 1;
+    pub const PLAYER_TIME_S: u16 = PLAYER_TIME_H + 2;
+    pub const PLAYER_PLAYS: u16 = PLAYER_TIME_H + 3;
+    pub const PLAYER_CLEARS: u16 = PLAYER_TIME_H + 4;
+    pub const PLAYER_FAILS: u16 = PLAYER_TIME_H + 5;
+    pub const PLAYER_COUNT_PERFECT: u16 = PLAYER_TIME_H + 6;
+    pub const PLAYER_COUNT_POOR: u16 = PLAYER_TIME_H + 10;
+    pub const PLAYER_NOTES: u16 = PLAYER_TIME_H + 11;
     /// Whether the cursor's chart's stage file and banner are drawable:
     /// true only while the selection's chart table is current for the
     /// cursor generation and holds that image (options 190 to 193). The
     /// player writes them after the view's fields, which reset them.
-    pub const SELECTED_STAGEFILE: u16 = SELECTED_RATE_POOR + 1;
+    pub const SELECTED_STAGEFILE: u16 = PLAYER_NOTES + 1;
     pub const SELECTED_BANNER: u16 = SELECTED_STAGEFILE + 1;
     /// The settings' fields, then the application's readouts, from here
     /// on, which a view leaves as they are
@@ -366,6 +393,15 @@ mod tests {
             ),
             (field::SELECTED_RATE_PERFECT, "selected.rate.perfect"),
             (field::SELECTED_RATE_POOR, "selected.rate.poor"),
+            (field::PLAYER_TIME_H, "player.time_h"),
+            (field::PLAYER_TIME_M, "player.time_m"),
+            (field::PLAYER_TIME_S, "player.time_s"),
+            (field::PLAYER_PLAYS, "player.plays"),
+            (field::PLAYER_CLEARS, "player.clears"),
+            (field::PLAYER_FAILS, "player.fails"),
+            (field::PLAYER_COUNT_PERFECT, "player.count.perfect"),
+            (field::PLAYER_COUNT_POOR, "player.count.poor"),
+            (field::PLAYER_NOTES, "player.notes"),
             (field::SELECTED_STAGEFILE, "selected.stagefile"),
             (field::SELECTED_BANNER, "selected.banner"),
             (field::SETTINGS, "settings.display_offset"),
