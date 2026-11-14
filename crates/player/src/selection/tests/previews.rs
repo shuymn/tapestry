@@ -5,6 +5,7 @@
 //! update with no cursor move. The render thread is a real one over stub
 //! screens that record each update they draw.
 
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::{Selection, keys, on_selection, over};
@@ -217,5 +218,34 @@ fn the_scanned_graphs_keep_the_exact_main() {
             .collect();
         let fast = bpm(200 * bms_model::Tempo::UNITS_PER_BPM);
         assert_eq!(tempos, [Some(exact), Some(fast), Some(fast)]);
+    });
+}
+
+/// Selection left by a choice, through the production transition to the
+/// decision screen, which takes the one departure every exit takes: the
+/// game thread's graph cache, the selection slot and the render side's held
+/// update all let the chart's graphs go, so nothing keeps them past the
+/// departure. The stub screens' record of drawn updates, the test's own
+/// owner, is emptied first.
+#[test]
+fn leaving_selection_retires_the_graphs() {
+    use game::AppRig as _;
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, path) = on_chart(dir.path(), THREE);
+    let screens = Installers::default();
+    on_selection(sel, &screens, screens.spawn_bare(), |rig| {
+        let u = drawn(rig, &screens);
+        let graphs = u.view.selected.as_ref().unwrap().graphs.as_ref();
+        let a = Arc::downgrade(graphs.expect("graphs"));
+        drop(u);
+        screens.updates.lock().unwrap().clear();
+        assert_eq!(rig.selection.as_ref().unwrap().graphs.state(), Some(true));
+        assert!(a.upgrade().is_some());
+        let _ = rig.entered_decision(&game::Pick::Play(path), game::Decision::off());
+        assert!(
+            wait_until(|| a.upgrade().is_none()),
+            "the graphs retired on leaving: {} owners left",
+            a.strong_count()
+        );
     });
 }

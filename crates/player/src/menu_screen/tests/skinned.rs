@@ -825,7 +825,7 @@ fn selection_previews_dealloc_alloc() {
 
     use skin_model::ChartGraphs;
 
-    use crate::alloc_count::{this_thread, this_thread_frees};
+    use crate::alloc_count::{this_thread, this_thread_frees, watch_free, watched_freed};
     use crate::select::MenuKey;
     use crate::selection::Selection;
     use crate::selection::tests::{keys, over};
@@ -937,16 +937,23 @@ fn selection_previews_dealloc_alloc() {
         a_quads
     );
     // The skin's state made afresh with the cursor on A, as an
-    // installation rebuilt: the old pixmaps are freed here, the new ones
-    // prepared from A's graphs at the view, and A stays.
+    // installation rebuilt: the old BPM pixmap's runs, watched by their
+    // address, are freed here, the new ones prepared from A's graphs at
+    // the view, and A stays.
     let bundle = Arc::clone(&logic.bundle);
     let fresh = SelectionLogic::new(&bundle, 2);
-    let (_, freed) = counts(|| logic = fresh);
-    assert!(freed > 0, "the old state's pixmaps");
+    let runs = logic.sel.bpm_runs_addr(0).expect("A's BPM pixmap");
+    watch_free(runs);
+    logic = fresh;
+    assert!(watched_freed(), "the old state's BPM pixmap is released");
     assert!(a.upgrade().is_some());
     assert_eq!(
         frame(&mut screen, &mut logic, &mut shown, &mut slot, 3),
         a_quads
+    );
+    assert!(
+        logic.sel.bpm_runs_addr(0).is_some(),
+        "A's pixmap prepared again"
     );
     assert!(a.upgrade().is_some());
     // A to B: the cache moves to B at the update; the displayed update
@@ -972,7 +979,9 @@ fn selection_previews_dealloc_alloc() {
     frame(&mut screen, &mut logic, &mut shown, &mut slot, 5);
     assert!(b.upgrade().is_none(), "B retired");
     // Back on A, then selection left: the cache clears, the slot empties
-    // and the render side drops what it held.
+    // and the render side drops what it held. The game side's departure
+    // is driven here by its parts; the production one is witnessed by
+    // `selection::tests::previews::leaving_selection_retires_the_graphs`.
     while on(&sel).as_deref() != Some("a.bms") {
         keys(&mut sel, &[MenuKey::Down]);
     }
@@ -986,7 +995,15 @@ fn selection_previews_dealloc_alloc() {
     drop(logic);
     assert!(shown.is_none());
     assert!(a.upgrade().is_none(), "A retired on leaving");
-    // The positive control: a free counts.
+    // The positive controls: a free counts, and the watch sees the watched
+    // allocation's free and no other.
     let boxed = std::hint::black_box(Box::new(7_u64));
     assert_eq!(counts(|| drop(boxed)).1, 1);
+    let kept = std::hint::black_box(Box::new(7_u64));
+    let other = std::hint::black_box(Box::new(8_u64));
+    watch_free(std::ptr::from_ref(&*kept).addr());
+    drop(other);
+    assert!(!watched_freed(), "another allocation's free");
+    drop(kept);
+    assert!(watched_freed(), "the watched allocation's free");
 }

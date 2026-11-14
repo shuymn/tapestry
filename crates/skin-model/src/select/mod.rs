@@ -342,6 +342,17 @@ impl Selection {
         self.bpm.get(slot)
     }
 
+    /// The address of BPM graph `slot`'s prepared runs, the allocation a
+    /// release witness watches; `None` without runs.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn bpm_runs_addr(&self, slot: usize) -> Option<usize> {
+        self.bpm
+            .get(slot)
+            .filter(|r| !r.runs.is_empty())
+            .map(|r| r.runs.as_ptr().addr())
+    }
+
     /// The bytes its graphs' pixmaps hold.
     fn graph_bytes(&self) -> usize {
         size_of_val(&*self.bpm)
