@@ -581,18 +581,8 @@ fn a_skin_refusal_and_a_named_file_share_the_page(
 fn a_selection_refusal_and_a_named_file_share_the_page() {
     a_skin_refusal_and_a_named_file_share_the_page(
         ScreenKind::Selection,
-        |screens, _| {
-            screens.refuse_selection.store(true, Ordering::Release);
-            assert!(crate::render_side::tests::wait_until(|| {
-                screens
-                    .selections
-                    .lock()
-                    .unwrap()
-                    .iter()
-                    .any(|s| s.state.is_none())
-            }));
-        },
-        "refused for the test",
+        |screens, _| refuse_selection(screens),
+        SELECTION_REFUSED,
     );
 }
 
@@ -600,29 +590,114 @@ fn a_selection_refusal_and_a_named_file_share_the_page() {
 /// healthy device.
 #[test]
 fn a_decision_refusal_and_a_named_file_share_the_page() {
+    a_skin_refusal_and_a_named_file_share_the_page(
+        ScreenKind::Decision,
+        |screens, rig| {
+            refuse_decision(screens, rig);
+        },
+        &decision_refused(),
+    );
+}
+
+/// design.md "Play Lifecycle" (Selection), "Screen skins": a look whose
+/// Enter the play skin refuses shows the refusal and the file the pick
+/// refused, named before it, both on its page's notice line in the order
+/// they were set; the next look's refusal then replaces what that look
+/// set, as a page showed it.
+#[test]
+fn an_admission_refusal_and_a_named_file_share_the_page() {
+    use crate::render_side::SkinState;
+    use crate::render_side::tests::Installers;
+    use crate::select::MenuKey;
+    use crate::selection::image_tests::press;
+    let screens = Installers::default();
+    let render = screens.spawn_bare();
+    with_a_named_refusal(&screens, render, |rig, line| {
+        let refused = "the play skin was refused for the test";
+        rig.skin = SkinState::Refused(refused.to_owned());
+        press(rig, MenuKey::Enter);
+        assert_eq!(
+            notice_of_the_look(rig, &screens),
+            Some(format!("{refused} / {line}"))
+        );
+        assert!(rig.system_notices.lock().unwrap().is_empty());
+        // An earlier look's notice gives way to the next look's.
+        let again = "the play skin was refused again";
+        rig.skin = SkinState::Refused(again.to_owned());
+        press(rig, MenuKey::Enter);
+        assert_eq!(notice_of_the_look(rig, &screens), Some(again.to_owned()));
+    });
+}
+
+/// design.md "Screen skins": the selection skin and the decision skin,
+/// both refused before one look that chooses nothing, and a file the pick
+/// refused: all three on its page's notice line, in the order the look
+/// took them.
+#[test]
+fn a_selection_and_a_decision_refusal_share_the_page() {
+    use crate::render_side::tests::{Installers, bundle};
+    let screens = Installers::default();
+    let render = screens.spawn_bare();
+    for kind in [ScreenKind::Selection, ScreenKind::Decision] {
+        assert_eq!(
+            render.select(kind, Some(bundle())).wait().unwrap(),
+            game::Preparation::Ready
+        );
+    }
+    with_a_named_refusal(&screens, render, |rig, line| {
+        refuse_selection(&screens);
+        let why = refuse_decision(&screens, rig);
+        let selection = crate::imports::notice(ScreenKind::Selection, SELECTION_REFUSED);
+        let decision = crate::imports::notice(ScreenKind::Decision, &why);
+        assert_eq!(
+            notice_of_the_look(rig, &screens),
+            Some(format!("{selection} / {decision} / {line}"))
+        );
+        assert!(rig.system_notices.lock().unwrap().is_empty());
+    });
+}
+
+/// Why a selection frame of the tests' screens refuses the selection skin.
+const SELECTION_REFUSED: &str = "refused for the test";
+
+/// The selection skin refused by a selection frame of `screens`.
+fn refuse_selection(screens: &crate::render_side::tests::Installers) {
+    screens.refuse_selection.store(true, Ordering::Release);
+    assert!(crate::render_side::tests::wait_until(|| {
+        screens
+            .selections
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|s| s.state.is_none())
+    }));
+}
+
+/// The decision skin refused by the restore of a screen built again on a
+/// healthy device; the reason it was refused for.
+fn refuse_decision(screens: &crate::render_side::tests::Installers, rig: &PlayerRig<'_>) -> String {
+    *screens.refuse_restore.lock().unwrap() = Some(ScreenKind::Decision);
+    screens.fail.store(true, Ordering::Release);
+    rig.render
+        .send(crate::render_side::RenderMsg::Menu(Box::default()));
+    assert!(crate::render_side::tests::wait_until(|| rig
+        .render
+        .failed()));
+    screens.fail.store(false, Ordering::Release);
+    rig.render.prepare().unwrap();
+    *screens.refuse_restore.lock().unwrap() = None;
+    decision_refused()
+}
+
+/// Why the restore in [`refuse_decision`] refuses the decision skin.
+fn decision_refused() -> String {
     let admission = render::RenderError::Admission {
         kind: ScreenKind::Decision,
         needed: render::SHARED_TEXELS + 1,
         limit: render::SHARED_TEXELS,
     };
-    let why = format!(
+    format!(
         "the decision skin was not restored on the screen built again: {}",
         game::Chain(&admission)
-    );
-    a_skin_refusal_and_a_named_file_share_the_page(
-        ScreenKind::Decision,
-        |screens, rig| {
-            *screens.refuse_restore.lock().unwrap() = Some(ScreenKind::Decision);
-            screens.fail.store(true, Ordering::Release);
-            rig.render
-                .send(crate::render_side::RenderMsg::Menu(Box::default()));
-            assert!(crate::render_side::tests::wait_until(|| rig
-                .render
-                .failed()));
-            screens.fail.store(false, Ordering::Release);
-            rig.render.prepare().unwrap();
-            *screens.refuse_restore.lock().unwrap() = None;
-        },
-        &why,
-    );
+    )
 }
