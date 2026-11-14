@@ -1480,6 +1480,69 @@ mod tests {
         assert_eq!((score.plays, score.clears), (2, 1));
     }
 
+    /// A mid-chart start and a section repeat are practice rounds at 1×,
+    /// at another speed and when quit midway; a play of the whole chart at
+    /// another speed or quit midway is a normal play.
+    #[test]
+    fn a_plays_kind_is_practice_only_for_a_practice_round() {
+        let full = common::record_of("#BPM 120\n#00111:01\n", 0, Vec::new());
+        let preset = rules::tapestry();
+        let practice = replay::Practice {
+            start: bms_model::TimeUs(1_500 * common::MS),
+            end: bms_model::TimeUs(4_500 * common::MS),
+            lead_in: bms_model::TimeUs(1_000 * common::MS),
+            attempt: 1,
+            initial_gauges: preset
+                .gauges
+                .iter()
+                .map(|g| replay::InitialGauge {
+                    id: g.id.clone(),
+                    value: g.start,
+                })
+                .collect(),
+        };
+        let variant = |play_type: replay::PlayType, speed: bms_model::Speed, midway: bool| {
+            let mut r = full.clone();
+            r.play_type = play_type;
+            r.speed = speed;
+            if midway {
+                r.status.end = replay::EndStatus::EndedMidway;
+            }
+            r
+        };
+        let (normal, fastest) = (bms_model::Speed::NORMAL, bms_model::Speed::FASTEST);
+        for (round, name) in [
+            (
+                replay::PlayType::MidChartStart(practice.clone()),
+                "mid-chart start",
+            ),
+            (replay::PlayType::SectionRepeat(practice), "section repeat"),
+        ] {
+            for (speed, midway, how) in [
+                (normal, false, "at 1x"),
+                (fastest, false, "at another speed"),
+                (normal, true, "quit midway"),
+            ] {
+                assert_eq!(
+                    PlayKind::of(&variant(round.clone(), speed, midway)),
+                    PlayKind::Practice,
+                    "{name} {how}"
+                );
+            }
+        }
+        for (speed, midway, how) in [
+            (normal, false, "at 1x"),
+            (fastest, false, "at another speed"),
+            (normal, true, "quit midway"),
+        ] {
+            assert_eq!(
+                PlayKind::of(&variant(replay::PlayType::Full, speed, midway)),
+                PlayKind::Normal,
+                "full play {how}"
+            );
+        }
+    }
+
     /// Only an eligible play whose own lamp is not FAILED is a clear.
     #[test]
     fn only_eligible_clears_count() {
