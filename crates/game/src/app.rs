@@ -154,7 +154,7 @@ pub trait AppRig: LoadingRig {
         None
     }
     /// The decision screen begins for `pick` (design.md "Play Lifecycle",
-    /// the decision screen): its presentation and tone, its input epoch,
+    /// the decision screen): its presentation and sound, its input epoch,
     /// and the attempt's reset at the choice, whose wait serves `d`, moved
     /// there and returned: a leaving verdict a look returned there is left
     /// in it ([`Decision::leave`]) for App to route before the chart is

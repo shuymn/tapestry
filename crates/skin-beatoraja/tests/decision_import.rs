@@ -534,9 +534,9 @@ fn a_built_in_wins_over_a_configured_option_of_its_id() {
 }
 
 /// Timer 0 never starts on the decision screen, and timer 1 is the
-/// input timer: off at the choice plus `input` and on 1 µs later, its
-/// start the choice plus `input` (the source switches it on past
-/// `input`), whether named directly, by a custom timer's alias in JSON or
+/// input timer: off 1 µs before the choice plus `input` and on from it,
+/// its start the choice plus `input`, whether named directly, by a custom
+/// timer's alias in JSON or
 /// read by a Lua callback; timer 2 is the fade-out. The choice is at
 /// 7,000 ms, `input` 700 ms.
 #[test]
@@ -553,8 +553,8 @@ fn decision_timer_1_starts_at_input() {
     let check = |mut d: Dec, what: &str| {
         for (us, want) in [
             (0, vec![]),
-            (700_000, vec![]),
-            (700_001, vec![top(110, 8)]),
+            (699_999, vec![]),
+            (700_000, vec![top(110, 8)]),
             (2_500_000, vec![top(110, 8), top(120, 8)]),
         ] {
             d.timers = DecisionTimers::at(choice, &timing, at(us));
@@ -563,7 +563,7 @@ fn decision_timer_1_starts_at_input() {
             assert_eq!(d.tops_at(at(us)), want, "{what} at {us} µs");
         }
         // Its start is the choice plus `input`, not the frame's time.
-        d.timers = DecisionTimers::at(choice, &timing, at(700_001));
+        d.timers = DecisionTimers::at(choice, &timing, at(700_000));
         assert_eq!(d.timers.input, Some(at(700_000)), "{what}");
     };
     let json = r#""input": 700, "scene": 2500, "fadeout": 500,
