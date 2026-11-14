@@ -14,7 +14,7 @@
 //! the play chart's. A scroll change naming no `#SCROLLxx` is left out
 //! before timing, as the source skips it.
 
-use bms_model::{PreviewInputs, PreviewTimeline, Speed, TimeUs, TimelineId};
+use bms_model::{PreviewInputs, PreviewTimeline, Speed, TimelineId};
 
 use crate::Limits;
 use crate::parse::{ObjectKind, Source};
@@ -66,7 +66,7 @@ pub fn inputs(source: &Source, limits: &Limits) -> Option<PreviewInputs> {
                 _ => scroll.push((o.id, factor)),
             }
         } else if o.seq >= first_shown {
-            inputs.last_shown = Some(inputs.last_shown.map_or(o.time, |t: TimeUs| t.max(o.time)));
+            inputs.last_shown = inputs.last_shown.max(Some(o.time));
         }
     }
     inputs.timeline = Some(PreviewTimeline {

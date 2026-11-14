@@ -140,11 +140,8 @@ impl ChartInfoView {
         headers: &[JudgmentHeader],
         main: Option<Option<Tempo>>,
     ) -> Self {
-        let mut total = None;
         let info = ChartInfo::analyze(profile, |notes| {
-            let t = GaugeTotal::of(headers, notes);
-            total = Some(t);
-            t.border_start(notes)
+            GaugeTotal::of(headers, notes).border_start(notes)
         });
         let count = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
         let (density_end, density_end_hundredths) = shown_mean(info.end_notes, info.end_seconds);
@@ -161,7 +158,7 @@ impl ChartInfoView {
             density_end_hundredths,
             density_average,
             density_average_hundredths,
-            total: total.map_or(0, GaugeTotal::whole),
+            total: GaugeTotal::of(headers, info.notes).whole(),
             main_bpm: main
                 .map(|m| m.map_or(0, |t| i32::try_from(t.units() / one).unwrap_or(i32::MAX))),
         }

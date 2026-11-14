@@ -385,22 +385,20 @@ fn scroll_changes_reach_the_preview_rows() {
     let text = "#BPM 120\n#SCROLL01 0.5\n#SCROLL02 2\n\
          #00011:01010101\n#000SC:0001\n#00111:01\n#001SC:0203\n#00211:01\n";
     let one = bms_model::SCROLL_ONE;
-    let at = |ms, scroll| bms_model::SpeedRow {
-        ms,
-        tempo: Some(Tempo::from_milli(120_000).unwrap()),
-        scroll,
-    };
     assert_eq!(
         preview(text).speeds(),
         [
-            at(0, one),
-            at(1_000, one / 2),
-            at(2_000, 2 * one),
-            at(4_000, 2 * one)
+            speed_row(0, 120, one),
+            speed_row(1_000, 120, one / 2),
+            speed_row(2_000, 120, 2 * one),
+            speed_row(4_000, 120, 2 * one)
         ]
     );
     let loaded = load(text, 0).unwrap();
-    assert_eq!(loaded.profile.speeds(), [at(0, one), at(4_000, one)]);
+    assert_eq!(
+        loaded.profile.speeds(),
+        [speed_row(0, 120, one), speed_row(4_000, 120, one)]
+    );
     let plain = "#BPM 120\n#00011:01010101\n#00111:01\n#00211:01\n";
     assert_eq!(
         load(plain, 0).unwrap().chart.identity.resolved_hash,

@@ -27,7 +27,7 @@ pub const KEY_TAP: usize = 5;
 pub const MINE: usize = 6;
 
 /// [`SpeedRow::scroll`]'s factor 1, in its units of `10^-18`.
-pub const SCROLL_ONE: i128 = 1_000_000_000_000_000_000;
+pub const SCROLL_ONE: i128 = crate::HeaderValue::ONE;
 
 /// One tempo row of [`ChartProfile::speeds`]: from `ms`, the chart's 1×
 /// time in whole ms truncated, the chart scrolls at `tempo` times `scroll`,
@@ -96,16 +96,7 @@ impl ChartProfile {
     /// times cannot tell from a point at the same position.
     #[must_use]
     pub fn of(chart: &Chart, stops: &[TimelineId]) -> Self {
-        let seconds = seconds(chart, chart.meta.length);
-        let (bins, bin_seconds) = condense(&seconds);
-        let timeline = &chart.timeline;
-        Self {
-            seconds,
-            bins,
-            bin_seconds,
-            speeds: speeds(timeline.points(), timeline.meta().initial, stops, &[], None),
-            length_ms: ms_of(chart.meta.length),
-        }
+        Self::preview(chart, stops, &PreviewInputs::default())
     }
 
     /// A song list's preview profile of `chart` ([`of`](Self::of)'s
@@ -340,10 +331,7 @@ fn speeds(
         last = Some(ms);
     }
     let shown = last_shown.map(ms_of);
-    let last = match (last, shown) {
-        (Some(a), Some(b)) => Some(a.max(b)),
-        (a, b) => a.or(b),
-    };
+    let last = last.max(shown);
     if let Some(ms) = last
         && rows.last().is_none_or(|r| r.ms != ms)
     {
