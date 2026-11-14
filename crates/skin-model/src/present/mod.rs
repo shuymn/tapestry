@@ -266,7 +266,8 @@ pub struct ReadDef {
 pub enum Conv {
     /// A `draw`: Lua's truthiness.
     Truthy,
-    /// A number's `value`: the source's `toint()`.
+    /// A number's `value`: truncated toward zero and saturated to `i32`
+    /// ([`num::to_int`]).
     Int,
     /// A destination's `timer`: `tolong()`, run once a frame for both
     /// whether it is on and its start.
