@@ -91,18 +91,20 @@ pub(crate) const APP: std::ops::RangeInclusive<i32> = 20..=29;
 /// field over that field's range, drawn in every view and status, this
 /// play included once it was counted, 0 when they cannot be read.
 fn player(id: i32) -> Option<ResValue> {
-    let expr = super::super::property::player_field(id)?;
-    let range = match RESULT.field(expr).map(|(_, f)| f.ty) {
-        Some(skin_model::FieldTy::Int { lo, hi }) => (i64::from(lo), i64::from(hi)),
-        _ => return None,
-    };
-    Some(v(expr, "true", range))
+    always(super::super::property::player_field(id)?)
 }
 
 /// Number `id` of [`APP`]: its field of the same name as play's and
 /// selection's, always available, over that field's range.
 fn app(id: i32) -> Option<ResValue> {
-    let expr = super::super::property::app_field(u8::try_from(id - 20).ok()?);
+    always(super::super::property::app_field(
+        u8::try_from(id - 20).ok()?,
+    ))
+}
+
+/// The integer field `expr`, always available, over its range; none when
+/// the result schema has no integer field of that name.
+fn always(expr: &'static str) -> Option<ResValue> {
     let range = match RESULT.field(expr).map(|(_, f)| f.ty) {
         Some(skin_model::FieldTy::Int { lo, hi }) => (i64::from(lo), i64::from(hi)),
         _ => return None,
