@@ -889,7 +889,7 @@ impl Shelf {
 
     /// The next pass starts `after` the last one ended (tests: a library
     /// no pass changes).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dev-tools"))]
     pub fn set_rescan_after(&mut self, after: Duration) {
         self.rescan_after = after;
     }
