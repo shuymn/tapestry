@@ -1,7 +1,7 @@
 //! A destination's `op` that is not a table, through the import path:
 //! one of a Lua skin's converted table reads as no condition, as the
 //! source's Lua loader reads any array field
-//! (`skin/lua/LuaSkinLoader.java:171-186` at `0.8.9`), with an ignored
+//! (`skin/lua/LuaSkinLoader.java:171-186` at `0.8.9`), with a scalar `op`
 //! note at the value. Tables and JSON values keep their handling: a Lua
 //! table with string keys, whose entries the source reads, and a JSON
 //! value, a file the Lua skin includes too, still fail the skin
@@ -91,11 +91,7 @@ fn a_lua_op_that_is_not_a_table_is_no_condition() {
             .iter()
             .map(|n| (n.severity, n.kind))
             .collect();
-        assert_eq!(
-            notes,
-            [(Severity::Ignored, NoteKind::Ignored { field: "op" })],
-            "{op}"
-        );
+        assert_eq!(notes, [(Severity::Ignored, NoteKind::ScalarOp)], "{op}");
         let rects = common::play::Drawn::new(i.imported.skin, 100).rects(0);
         assert_eq!(rects, [[0, 1_016, 64, 64]], "{op}");
     }
@@ -213,7 +209,7 @@ fn a_lua_op_read_twice_is_noted_once() {
         .report
         .notes
         .iter()
-        .filter(|n| n.kind == NoteKind::Ignored { field: "op" })
+        .filter(|n| n.kind == NoteKind::ScalarOp)
         .count();
     assert_eq!(notes, 1, "{:?}", i.imported.report.notes);
 }
