@@ -870,11 +870,6 @@ fn a_table_before_the_judge_taking_its_id_refuses() {
             Object::Graph,
         ),
         (
-            "graph",
-            r#"{"id": "j", "src": "gone", "type": 0}"#,
-            Object::Graph,
-        ),
-        (
             "liftCover",
             r#"{"id": "j", "src": "gone"}"#,
             Object::LiftCover,

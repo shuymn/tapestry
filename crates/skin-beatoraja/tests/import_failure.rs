@@ -982,3 +982,45 @@ fn a_failure_destination_sharing_its_id_refuses_without_a_source() {
         NoteKind::Ignored { field: "font" },
     );
 }
+
+/// A failure text naming no font while a later table holds its id
+/// refuses whatever its string, even one that draws nothing (absent or
+/// empty), which would otherwise end its import first; with its id its
+/// own, or off the failure presentation, it stays ignored.
+#[test]
+fn a_shared_failure_text_without_a_font_refuses_whatever_its_string() {
+    let bga = r#""bga": {"id": "u"}"#;
+    let plain = format!(r#"{{"id": "u", "dst": [{KEY}]}}"#);
+    for text in [
+        r#"{"id": "u", "font": "none"}"#,
+        r#"{"id": "u", "font": "none", "constantText": ""}"#,
+    ] {
+        let r = run(&format!(
+            r#""text": [{text}], {bga}, "destination": [{}]"#,
+            fail("u", "")
+        ));
+        refused_as_failure(r, &at("u"), NoteKind::Ignored { field: "font" });
+        for body in [
+            format!(r#""text": [{text}], "destination": [{}]"#, fail("u", "")),
+            format!(r#""text": [{text}], {bga}, "destination": [{plain}]"#),
+        ] {
+            let l = run(&body).loaded;
+            let notes: Vec<(Severity, NoteKind)> = l
+                .report()
+                .notes
+                .iter()
+                .map(|n| (n.severity, n.kind))
+                .collect();
+            assert_eq!(
+                notes,
+                [(
+                    Severity::Ignored,
+                    NoteKind::Ignored {
+                        field: "constantText"
+                    }
+                )],
+                "{body}"
+            );
+        }
+    }
+}

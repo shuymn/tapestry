@@ -11,7 +11,7 @@ use super::super::asset::{self, FntFailure, Font};
 use super::super::budget::ImportLimit;
 use super::super::callback::TextFold;
 use super::super::geom::{Q, coords};
-use super::super::policy::{CriticalPart, Role};
+use super::super::policy::Role;
 use super::super::property::{self, StrProp};
 use super::super::report::{DeviationId, NoteKind, PropertyKind, Severity, Span};
 use super::super::{Common, Cx, Dst, Opts, Prop};
@@ -221,6 +221,18 @@ impl Cx<'_> {
         Ok(())
     }
 
+    /// The `font` record text record `rec` names, `None` when it names
+    /// none.
+    pub(in super::super) fn font_rec(&mut self, rec: u32) -> Result<Option<u32>, ImportError> {
+        let [font] = self.def.fields(rec, ["font"]);
+        let name = self.opt_string(font, "font")?;
+        if self.fonts.is_none() {
+            let recs = super::super::object::records(&self.tables, "font").to_vec();
+            self.fonts = Some(super::super::object::index(self.def, &recs, false)?);
+        }
+        Ok(name.and_then(|n| self.fonts.as_ref().and_then(|m| m.get(&n)).copied()))
+    }
+
     /// Text record `rec`'s style for destination `dst` of `role`: its
     /// alignment, overflow, font and box track, with the D6, D12 and D13
     /// notes; `None` when the element was dropped or is never drawn. A
@@ -233,20 +245,9 @@ impl Cx<'_> {
         rec: u32,
     ) -> Result<Option<TextStyle>, ImportError> {
         let at = dst.span;
-        let [
-            font,
-            size,
-            align,
-            editable,
-            wrapping,
-            overflow,
-            outline,
-            sx,
-            sy,
-        ] = self.def.fields(
+        let [size, align, editable, wrapping, overflow, outline, sx, sy] = self.def.fields(
             rec,
             [
-                "font",
                 "size",
                 "align",
                 "editable",
@@ -305,26 +306,8 @@ impl Cx<'_> {
             self.ignored(at, NoteKind::Ignored { field: "editable" });
         }
         let size = self.int_or(size, "size", 0)?;
-        let font_name = self.opt_string(font, "font")?;
-        if self.fonts.is_none() {
-            let recs = super::super::object::records(&self.tables, "font").to_vec();
-            self.fonts = Some(super::super::object::index(self.def, &recs, false)?);
-        }
-        let font_rec = font_name.and_then(|n| self.fonts.as_ref().and_then(|m| m.get(&n)).copied());
-        let Some(font_rec) = font_rec else {
-            let why = NoteKind::Ignored { field: "font" };
-            // The source makes no text and its lookup may go on to a later
-            // table's object (`JsonSkinObjectLoader.java:387-391`,
-            // `JsonPlaySkinObjectLoader.java:31-34`): failure presentation
-            // is reproduced or refused (design.md "Failure presentation").
-            if dst.shared {
-                return Err(ImportError::Critical {
-                    at: self.loc(at),
-                    part: CriticalPart::Failure,
-                    why,
-                });
-            }
-            self.ignored(at, why);
+        let Some(font_rec) = self.font_rec(rec)? else {
+            self.ignored(at, NoteKind::Ignored { field: "font" });
             return Ok(None);
         };
         let [path] = self.def.fields(font_rec, ["path"]);

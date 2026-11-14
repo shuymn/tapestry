@@ -290,8 +290,8 @@ fn an_image_set_entry_whose_source_is_undefined_is_a_hole() {
 }
 
 /// A shared id is the first table's object, an undefined `src` there
-/// ignored whatever the role and whatever later table holds the id:
-/// HIDDEN+ or LIFT before a BGA. HIDDEN+ before the note would leave the
+/// ignored on a destination that is not failure presentation, whatever
+/// later table holds the id: HIDDEN+ or LIFT before a BGA. HIDDEN+ before the note would leave the
 /// lanes with no destination, which refuses.
 #[test]
 fn a_shared_id_s_undefined_source_is_ignored() {

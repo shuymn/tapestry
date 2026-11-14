@@ -877,6 +877,13 @@ pub fn skin_jsons() -> Vec<Seed> {
             ),
         ),
         (
+            "shared_id_failure_text",
+            play_skin(
+                r#""text": [{"id": "u", "font": "none"}], "bga": {"id": "u"},
+                "destination": [{"id": "u", "timer": 3, "dst": [{"w": 10, "h": 10}]}]"#,
+            ),
+        ),
+        (
             "syntax",
             skin_input(&[r#"{"type": 0, "property": [{} {}]}"#]),
         ),

@@ -375,6 +375,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "shared_id_unaddressed",
             "shared_id_judge",
             "shared_id_failure",
+            "shared_id_failure_text",
             "bar_groups",
             "paints",
             "followers",
@@ -593,6 +594,19 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
                     Some(Err(ImportError::Critical {
                         part: skin_beatoraja::CriticalPart::Failure,
                         why: NoteKind::UndefinedSource,
+                        ..
+                    }))
+                ),
+                "{name}: {:?}",
+                imported.map(|r| r.map(|i| i.report))
+            ),
+            // So does a failure-timed text with no string and no font.
+            "shared_id_failure_text" => assert!(
+                matches!(
+                    imported,
+                    Some(Err(ImportError::Critical {
+                        part: skin_beatoraja::CriticalPart::Failure,
+                        why: NoteKind::Ignored { field: "font" },
                         ..
                     }))
                 ),

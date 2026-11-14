@@ -304,10 +304,6 @@ struct Dst {
     action: Option<ActionDef>,
     /// Whether it is failure presentation ([`Cx::failure`]).
     failure: bool,
-    /// Whether it is failure presentation whose id a table looked up
-    /// after its object's holds too, set before a text is imported: with
-    /// no font it refuses rather than being ignored.
-    shared: bool,
 }
 
 /// A property field as the source's script serializer reads it
@@ -975,7 +971,6 @@ impl<'d> Cx<'d> {
             nested: false,
             action: None,
             failure,
-            shared: false,
         };
         Ok((id, dst))
     }
@@ -1162,13 +1157,23 @@ impl<'d> Cx<'d> {
         // object's, drawing nothing (design.md "Differences from the
         // source", imported skins), but the source's lookup may go on to
         // that table's object, so failure presentation refuses there
-        // (design.md "Failure presentation"); a text without its font is
-        // handled alike ([`Self::text`]).
-        dst.shared = dst.failure
+        // (design.md "Failure presentation"). So does a text naming no
+        // font, which the source makes no text of either
+        // (`JsonSkinObjectLoader.java:387-391`), decided before its string,
+        // whose emptiness would otherwise end its import first.
+        if dst.failure
             && object == Object::Text
             && self
                 .objects
-                .held_after(self.def, &self.tables, &id, self.kind, object);
+                .held_after(self.def, &self.tables, &id, self.kind, object)
+            && self.font_rec(orec)?.is_none()
+        {
+            return self.drop_el(
+                Role::Critical(CriticalPart::Failure),
+                at,
+                NoteKind::Ignored { field: "font" },
+            );
+        }
         if matches!(
             object,
             Object::Image
@@ -1185,11 +1190,11 @@ impl<'d> Cx<'d> {
                         .objects
                         .held_after(self.def, &self.tables, &id, self.kind, object)
                 {
-                    return Err(ImportError::Critical {
-                        at: self.loc(at),
-                        part: CriticalPart::Failure,
-                        why: NoteKind::UndefinedSource,
-                    });
+                    return self.drop_el(
+                        Role::Critical(CriticalPart::Failure),
+                        at,
+                        NoteKind::UndefinedSource,
+                    );
                 }
                 self.ignored(at, NoteKind::UndefinedSource);
                 return Ok(());
