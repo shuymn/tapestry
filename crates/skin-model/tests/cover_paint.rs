@@ -569,7 +569,9 @@ fn a_slider_range_is_checked() {
     let p = |y: i32| paint(0, [0, y, 10, 10], Follow::NONE);
     let max = u64::from(MAX_COORD.unsigned_abs());
     let top = MAX_RANGE_DENOMINATOR;
-    // The denominator, before the reach divides by it.
+    // The denominator, before the reach divides by it: 0/0 passes the
+    // value bound, so only the denominator's refuses it.
+    assert!(refused(load(vec![p(0)], 0, 0)));
     assert!(refused(load(vec![p(0)], 1, 0)));
     assert!(refused(load(vec![p(0)], 1, top + 1)));
     assert!(load(vec![p(0)], 1, top).is_ok());

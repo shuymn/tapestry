@@ -655,6 +655,8 @@ fn a_slider_range_is_exact() {
     };
     let max = u64::from(skin_model::MAX_COORD.unsigned_abs());
     let top = skin_model::MAX_RANGE_DENOMINATOR;
+    // 0/0 passes the value bound, so only the denominator's refuses it.
+    assert!(refused(load_one(slider(0, 0))));
     assert!(refused(load_one(slider(1, 0))));
     assert!(refused(load_one(slider(1, top + 1))));
     assert!(refused(load_one(slider(2 * max + 1, 2))));

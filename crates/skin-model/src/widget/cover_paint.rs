@@ -350,3 +350,38 @@ impl CoverPaint {
         ClipRect::new(rect).map_or(TrimOutcome::Suppressed, TrimOutcome::Clipped)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{CoverMotion, CoverPaint, CoverTrim, PaintImage, Slider, SliderRate, range_within};
+    use crate::selection::Ratio;
+    use crate::widget::lanes::LaneView;
+    use crate::widget::ratio_bar::SliderDirection;
+
+    /// A rate's motion rounds once: `n · rate / (d · 10⁶)`, here
+    /// 380511.90072836366, where dividing by `d` first rounds twice and
+    /// gives 380511.9007283636.
+    #[test]
+    fn a_rate_s_motion_rounds_once() {
+        let range = Ratio {
+            numerator: 15_402_619,
+            denominator: 22,
+        };
+        assert!(range_within(range));
+        let paint = CoverPaint {
+            image: PaintImage::Choice(0),
+            slider: Some(Slider {
+                range,
+                rate: SliderRate::Progress,
+                direction: SliderDirection::Down,
+            }),
+            motion: CoverMotion::None,
+            trim: CoverTrim::None,
+            gate: None,
+        };
+        assert_eq!(
+            paint.slider_offset(LaneView::NONE, 543_496, &[], 0),
+            Ok([0.0, 380_511.900_728_363_66])
+        );
+    }
+}
