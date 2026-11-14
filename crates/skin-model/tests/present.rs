@@ -430,11 +430,12 @@ fn mixed_backends_give_the_source_results() {
     }
 }
 
-/// Each result reaches its consumer as the source converts it: a draw by
-/// truthiness, a value by `toint()`; a caught error gives false or 0; an
-/// unavailable read, an overflow or a sentinel gives no value.
+/// Each result reaches its consumer converted: a draw by truthiness, a
+/// value truncated and saturated to `i32`; a caught error gives false or 0;
+/// an unavailable read, or a value at or past either end of `i32` (a
+/// sentinel), gives no value.
 #[test]
-fn results_convert_as_the_source() {
+fn results_convert() {
     let nan = Val::Float(f64::NAN);
     let error = |conv| {
         Cb::code(
@@ -462,13 +463,20 @@ fn results_convert_as_the_source() {
             conv,
         )
     };
-    // 2^53 + 7 rounds to 2^53 + 8, whose low 32 bits are 8.
+    // 2^53 + 7 rounds to 2^53 + 8; less 2^53, 8.
     let promoted = Cb::code(
         vec![
             Insn::Const { dst: 0, k: 0 },
             Insn::Const { dst: 1, k: 1 },
             Insn::Arith {
                 op: Arith::Add,
+                dst: 0,
+                a: 0,
+                b: 1,
+            },
+            Insn::Const { dst: 1, k: 0 },
+            Insn::Arith {
+                op: Arith::Sub,
                 dst: 0,
                 a: 0,
                 b: 1,
@@ -494,17 +502,21 @@ fn results_convert_as_the_source() {
         Conv::Int,
     );
     let cases = [
-        (Cb::ret(Val::Float(4_294_967_296.0), Conv::Int), [0, 1]),
+        (
+            Cb::ret(Val::Float(4_294_967_296.0), Conv::Int),
+            [i32::MAX, 0],
+        ),
         (Cb::ret(nan, Conv::Int), [0, 1]),
         (Cb::ret(Val::Float(-0.5), Conv::Int), [0, 1]),
         (Cb::ret(Val::Float(99.9), Conv::Int), [99, 1]),
         (
             Cb::ret(Val::Float(2_147_483_648.0), Conv::Int),
-            [i32::MIN, 0],
+            [i32::MAX, 0],
         ),
+        (Cb::ret(Val::Float(-1e300), Conv::Int), [i32::MIN, 0]),
         (Cb::ret(Val::Nil, Conv::Int), [0, 1]),
         (Cb::ret(Val::Bool(true), Conv::Int), [0, 1]),
-        (Cb::ret(Val::Int((1 << 32) + 7), Conv::Int), [7, 1]),
+        (Cb::ret(Val::Int((1 << 32) + 7), Conv::Int), [i32::MAX, 0]),
         (Cb::ret(Val::Float(0.0), Conv::Truthy), [1, 1]),
         (Cb::ret(Val::Int(0), Conv::Truthy), [1, 1]),
         (Cb::ret(Val::Nil, Conv::Truthy), [0, 1]),
@@ -605,7 +617,8 @@ fn a_chain_of_reads_rounds_at_each_operation() {
     let combo = 9_999_999;
     let plus = |n: i64| read(&format!("combo + {}", n - combo), Ty::Int, None);
     let two = |x: i64, y: i64| vec![plus(x), plus(y)];
-    // (a * b) * 3.
+    // Each result less a float near it, so the double it is shows within
+    // `i32`. (a * b) * 3 - 27 021 604 194 090 000.
     let a = Cb::code(
         vec![
             Insn::Read { dst: 0, read: 0 },
@@ -613,13 +626,15 @@ fn a_chain_of_reads_rounds_at_each_operation() {
             op(Arith::Mul, 0, 0, 1),
             Insn::Const { dst: 1, k: 0 },
             op(Arith::Mul, 0, 0, 1),
+            Insn::Const { dst: 1, k: 1 },
+            op(Arith::Sub, 0, 0, 1),
             Insn::Ret { src: 0 },
         ],
-        vec![Val::Int(3)],
+        vec![Val::Int(3), Val::Float(27_021_604_194_090_000.0)],
         two(2_147_483_647, 4_194_305),
         Conv::Int,
     );
-    // n = 2^27 * 2^26 = 2^53; (n + 1) + k.
+    // n = 2^27 * 2^26 = 2^53; (n + 1) + k - 2^53.
     let b = |k: i64| {
         Cb::code(
             vec![
@@ -630,14 +645,16 @@ fn a_chain_of_reads_rounds_at_each_operation() {
                 op(Arith::Add, 0, 0, 1),
                 Insn::Const { dst: 1, k: 1 },
                 op(Arith::Add, 0, 0, 1),
+                Insn::Const { dst: 1, k: 2 },
+                op(Arith::Sub, 0, 0, 1),
                 Insn::Ret { src: 0 },
             ],
-            vec![Val::Int(1), Val::Int(k)],
+            vec![Val::Int(1), Val::Int(k), Val::Int(1 << 53)],
             two(134_217_728, 67_108_864),
             Conv::Int,
         )
     };
-    // floor(2^60) + 1, the float kept past 2^53.
+    // floor(2^60) + 1 - 2^60, the float kept past 2^53.
     let floor = Cb::code(
         vec![
             Insn::Const { dst: 0, k: 0 },
@@ -648,6 +665,8 @@ fn a_chain_of_reads_rounds_at_each_operation() {
             },
             Insn::Const { dst: 1, k: 1 },
             op(Arith::Add, 0, 0, 1),
+            Insn::Const { dst: 1, k: 0 },
+            op(Arith::Sub, 0, 0, 1),
             Insn::Ret { src: 0 },
         ],
         vec![Val::Float(2.0_f64.powi(60)), Val::Int(1)],
@@ -661,7 +680,8 @@ fn a_chain_of_reads_rounds_at_each_operation() {
     p.push(floor);
     assert_eq!(
         outputs(plain(p).unwrap(), 4, 9_999_999),
-        [[2_134_900_736, 1], [0, 1], [2, 1], [0, 1]]
+        // Rounded once at the end: 1 004, 2, 4 and 1.
+        [[1_008, 1], [0, 1], [2, 1], [0, 1]]
     );
 }
 
@@ -678,8 +698,9 @@ fn a_constant_past_2_53_is_refused() {
             "{k}"
         );
     }
-    for k in [1 << 53, -(1 << 53)] {
-        assert_eq!(outputs(ret(k).unwrap(), 1, 0), [[0, 1]], "{k}");
+    // Past `i32`, each saturates to its end, which gives no value.
+    for (k, end) in [(1 << 53, i32::MAX), (-(1 << 53), i32::MIN)] {
+        assert_eq!(outputs(ret(k).unwrap(), 1, 0), [[end, 0]], "{k}");
     }
     let mut b = Builder::default();
     b.push(Cb::code(
@@ -700,7 +721,8 @@ fn one_ret(v: Val) -> Builder {
 
 /// The state clock is the source's `main_state.time()`: an integer within
 /// ±2^53 and past it the double the source holds (2^53 + 1 rounding to
-/// 2^53, 2^53 + 2 exact), negative values kept.
+/// 2^53, 2^53 + 2 exact), negative values kept: the clock, and the clock
+/// less 2^53, which shows a clock past 2^53 within `i32`.
 #[test]
 fn the_state_clock_reads_as_the_source_s_double() {
     let mut b = Builder::default();
@@ -710,18 +732,32 @@ fn the_state_clock_reads_as_the_source_s_double() {
         vec![],
         Conv::Int,
     ));
+    b.push(Cb::code(
+        vec![
+            Insn::StateUs { dst: 0 },
+            Insn::Const { dst: 1, k: 0 },
+            op(Arith::Sub, 0, 0, 1),
+            Insn::Ret { src: 0 },
+        ],
+        vec![Val::Int(1 << 53)],
+        vec![],
+        Conv::Int,
+    ));
     let mut h = harness(plain(b).unwrap());
-    for (us, shown) in [
-        (-1, -1),
-        (-7_000_003, -7_000_003),
-        (1 << 53, 0),
-        ((1 << 53) + 1, 0),
-        ((1 << 53) + 2, 2),
-        ((1 << 53) + 6, 6),
+    let past = |n: i32| [n, 1];
+    let below = [i32::MIN, 0];
+    for (us, shown, less) in [
+        (-1, [-1, 1], below),
+        (-7_000_003, [-7_000_003, 1], below),
+        (1 << 53, [i32::MAX, 0], past(0)),
+        ((1 << 53) + 1, [i32::MAX, 0], past(0)),
+        ((1 << 53) + 2, [i32::MAX, 0], past(2)),
+        ((1 << 53) + 6, [i32::MAX, 0], past(6)),
     ] {
         h.state_us = us;
         h.frame(1_000, &[]);
         let f = h.play.state().fields;
-        assert_eq!([f[slot(0)], f[slot(0) + 1]], [shown, 1], "{us}");
+        assert_eq!([f[slot(0)], f[slot(0) + 1]], shown, "{us}");
+        assert_eq!([f[slot(1)], f[slot(1) + 1]], less, "{us}");
     }
 }

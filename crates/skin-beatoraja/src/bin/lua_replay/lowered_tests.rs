@@ -109,12 +109,18 @@ fn values_on(obs: &Observed, i: usize) -> Vec<i32> {
         .collect()
 }
 
-/// LuaJ's `toint()`, as the comparator converts.
+/// A number's value truncated toward zero and saturated to `i32`, as the
+/// comparator converts.
 fn toint(r: Raw) -> i32 {
-    #[expect(clippy::cast_possible_truncation, reason = "Java's d2l then l2i")]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "`as` truncates toward zero and saturates"
+    )]
     match r {
-        Raw::Int(n) => (n as f64) as i64 as i32,
-        Raw::Float(f) => f as i64 as i32,
+        Raw::Int(n) => {
+            i32::try_from(n.clamp(i64::from(i32::MIN), i64::from(i32::MAX))).unwrap_or(0)
+        }
+        Raw::Float(f) => f as i32,
         _ => 0,
     }
 }

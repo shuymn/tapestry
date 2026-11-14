@@ -394,6 +394,34 @@ fn a_perturbed_read_is_found() {
     assert!(!r.findings.is_empty(), "{}", r.text(0, true, true));
 }
 
+/// A number's value past `i32`: the point times 1e5, 2e10 at 200 000
+/// points.
+pub const PAST_I32: &str = "skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2,\n\
+       value = function() return ms.number(100) * 1e5 end } }\n\
+     table.insert(skin.destination, { id = \"v\", dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n";
+
+/// P13: a number's value past `i32` converts to `i32::MAX` on both sides,
+/// so nothing is drawn; where the source's `toint()` would keep the low
+/// 32 bits (2e10 at 200 000 points: −1 474 836 480), the run counts an
+/// intended difference and passes.
+#[test]
+fn a_value_past_i32_is_an_intended_difference() {
+    let r = run(PAST_I32);
+    agrees(&r, 1);
+    let counted = r
+        .intended
+        .get(crate::production::compare::TOINT_PAST_I32)
+        .copied()
+        .unwrap_or(0);
+    assert!(counted > 0, "{}", r.text(0, true, true));
+    assert!(
+        r.text(0, true, true)
+            .contains(&format!("intended difference toint past i32: {counted}")),
+        "{}",
+        r.text(0, true, true)
+    );
+}
+
 /// A writer stopped by a read the reference cannot answer, and a draw
 /// reading what it writes.
 const WRITER: &str = "local n\n\

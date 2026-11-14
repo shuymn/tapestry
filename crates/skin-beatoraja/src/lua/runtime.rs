@@ -15,8 +15,8 @@
 //!   them.
 //! - **Frame.** Each callback is called in import order, after its gate
 //!   (the conditions before it in its element's `dstdraw`, evaluated on
-//!   the same frame's fields); its result is converted as the source's
-//!   consumer converts it ([`to_int`], [`to_bool`]) and written to its
+//!   the same frame's fields); its result is converted as the play
+//!   program's consumer converts it ([`to_int`], [`to_bool`]) and written to its
 //!   output slot. Every slot is written every frame.
 //! - **Budgets.** One frame's callbacks share
 //!   [`limits::RUNTIME_INSTRUCTIONS`], [`limits::RUNTIME_HOST_CALLS`] and
@@ -43,6 +43,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use mlua::{Function, Lua, Value};
 use skin_model::output::OutTy;
+use skin_model::present::{Val, num};
 use skin_model::{Program, RESULT, SELECTION, Scope, ScreenKind, State, Ty, compile};
 
 use super::{LuaLimit, LuaWhy, Pass, limits};
@@ -437,20 +438,17 @@ pub fn absent(kind: ScreenKind, id: i32) -> Option<i32> {
     }
 }
 
-/// A Lua value as the source's `toint` converts a number's value
-/// (`SkinLuaAccessor.java:644-650`, LuaJ 3.0.2): a number by `d2l; l2i`;
-/// a string scanned as LuaJ's `LuaString.scannumber` scans it
+/// A Lua value as a number's value reads it: a number as the play
+/// program converts it ([`num::to_int`], truncated and saturated to
+/// `i32`); a string scanned as LuaJ's `LuaString.scannumber` scans it
 /// ([`scan_number`]), then the same, 0 when it is no numeral; anything
 /// else 0.
-///
-/// The play presentation program (S7-06d) has the same conversion in its
-/// numerics; the second of the two to land keeps one shared function.
 #[must_use]
 pub fn to_int(v: &Value) -> i32 {
     match v {
-        Value::Integer(i) => d2l_l2i(*i as f64),
-        Value::Number(n) => d2l_l2i(*n),
-        Value::String(s) => scan_number(&s.as_bytes()).map_or(0, d2l_l2i),
+        Value::Integer(i) => num::to_int(Val::Int(*i)),
+        Value::Number(n) => num::to_int(Val::Float(*n)),
+        Value::String(s) => scan_number(&s.as_bytes()).map_or(0, |d| num::to_int(Val::Float(d))),
         _ => 0,
     }
 }
@@ -517,17 +515,6 @@ fn scan_double(b: &[u8]) -> Option<f64> {
         return None;
     }
     std::str::from_utf8(b).ok()?.parse().ok()
-}
-
-/// Java's `(int) (long) d`: NaN 0, the long saturating, then its low 32
-/// bits.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "the source's l2i keeps the low 32 bits"
-)]
-fn d2l_l2i(d: f64) -> i32 {
-    // `as` from f64 to i64 saturates and maps NaN to 0, as Java's d2l.
-    (d as i64) as i32
 }
 
 /// A Lua value as the source's `toboolean` converts a draw: nil and false
@@ -1258,23 +1245,25 @@ mod tests {
         assert_ne!(c.id, id);
     }
 
-    /// C12: the source's `toint` (`d2l; l2i`) and `toboolean`.
+    /// C12: a number's value truncated toward zero and saturated to `i32`,
+    /// and `toboolean`.
     #[test]
-    fn results_convert_as_the_source_does() {
+    fn results_convert() {
         let lua = Lua::new();
         let s = |t: &str| Value::String(lua.create_string(t).unwrap());
         for (v, want) in [
             (Value::Number(4.5), 4),
             (Value::Number(-4.5), -4),
             (Value::Number(-0.0), 0),
-            (Value::Number(4_294_967_296.0), 0),
-            (Value::Number(2_147_483_648.0), i32::MIN),
-            (Value::Number(-2_147_483_649.0), i32::MAX),
-            (Value::Number(f64::INFINITY), -1),
-            (Value::Number(f64::NEG_INFINITY), 0),
+            (Value::Number(4_294_967_296.0), i32::MAX),
+            (Value::Number(2_147_483_648.0), i32::MAX),
+            (Value::Number(-2_147_483_649.0), i32::MIN),
+            (Value::Number(f64::INFINITY), i32::MAX),
+            (Value::Number(f64::NEG_INFINITY), i32::MIN),
             (Value::Number(f64::NAN), 0),
             (Value::Integer(7), 7),
-            (Value::Integer(1 << 32), 0),
+            (Value::Integer(1 << 32), i32::MAX),
+            (Value::Integer(-(1 << 40)), i32::MIN),
             (s("12"), 12),
             (s(" 2.5 "), 2),
             (s("x"), 0),
@@ -1286,13 +1275,13 @@ mod tests {
             (s("12\n"), 0),
             (s("0x10"), 16),
             (s("0X1f"), 31),
-            (s("0x80000000"), i32::MIN),
-            (s("0xffffffff"), -1),
-            (s("0x100000000"), 0),
+            (s("0x80000000"), i32::MAX),
+            (s("0xffffffff"), i32::MAX),
+            (s("0x100000000"), i32::MAX),
             (s("0x"), 0),
             (s("-0x10"), 0),
             (s("0x-10"), -16),
-            (s("0x7fffffffffffffff"), -1),
+            (s("0x7fffffffffffffff"), i32::MAX),
             (s("0x8000000000000000"), 0),
             (s("0x10000000000000001"), 1),
             (s("0x1g"), 0),
@@ -1310,19 +1299,19 @@ mod tests {
             (s("."), 0),
             (s("1e"), 0),
             (s("--5"), 0),
-            (s("2147483648"), i32::MIN),
-            (s("-2147483649"), i32::MAX),
-            (s("9223372036854775807"), -1),
-            (s("9223372036854775808"), -1),
-            (s("99999999999999999999"), -1),
-            (s("1e400"), -1),
-            (s("-1e400"), 0),
+            (s("2147483648"), i32::MAX),
+            (s("-2147483649"), i32::MIN),
+            (s("9223372036854775807"), i32::MAX),
+            (s("9223372036854775808"), i32::MAX),
+            (s("99999999999999999999"), i32::MAX),
+            (s("1e400"), i32::MAX),
+            (s("-1e400"), i32::MIN),
             (s("12abc"), 0),
             (s("1.5e3"), 1500),
             (s("3.9"), 3),
             (s("-3.9"), -3),
             (s("00012"), 12),
-            (s(&"1234567890".repeat(7)), -1),
+            (s(&"1234567890".repeat(7)), i32::MAX),
             (s(&format!("{}1234", "0".repeat(63))), 1234),
             // 68 bytes, parsed as the first 64: "0.000…0".
             (s(&format!("0.{}1e80", "0".repeat(62))), 0),

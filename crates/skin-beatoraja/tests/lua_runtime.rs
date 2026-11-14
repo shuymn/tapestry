@@ -811,6 +811,46 @@ fn a_sentinel_number_draws_nothing_on_selection() {
     assert_eq!(digits.trim_start_matches('0'), "42", "{digits}");
 }
 
+/// P12: a runtime value past `i32`, the integer `1 << 32` or the float
+/// `2^32`, converts to `i32::MAX`, truncated and saturated, which no
+/// number draws: its number shows no digit and its draws are skipped,
+/// where the low 32 bits (0) would draw a 0 and run them.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_value_past_i32_saturates_and_draws_nothing() {
+    untimed();
+    for value in [
+        "function() return ms.number(77) * 0 + (1 << 32) end",
+        "function() return ms.number(77) * 0 + 2^32 end",
+    ] {
+        let (_d, mut i) = import_in(&entry_with(
+            "local calls = 0",
+            &[value, "function() return calls + 5 end"],
+            "function() calls = calls + 1 return true end",
+            "function() return true end",
+        ));
+        let n = runtime(&mut i).outputs();
+        assert_eq!(n, 3, "{value}");
+        let mut f = fields(
+            n,
+            &[
+                ("selected.plays", 3),
+                ("selected.played", 1),
+                ("cursor.chart", 1),
+            ],
+        );
+        runtime(&mut i).frame(&mut f, &[]);
+        assert_eq!(runtime(&mut i).status()[1], CallStatus::Skipped, "{value}");
+        assert_eq!(outputs(&f), [i32::MAX, 0, 5], "{value}");
+        let mut s = common::selection::Sel::new(i.imported.skin);
+        s.sel
+            .outputs_mut()
+            .copy_from_slice(&f[SELECTION.fields.len()..]);
+        // Only the second number's 5: no digit of the first.
+        assert_eq!(s.digits(0), "5", "{value}");
+    }
+}
+
 /// `text` with two image sets of one `dot` appended, chosen by `a` and
 /// `b`, each drawn by its own draw callback.
 #[cfg(feature = "dev-tools")]

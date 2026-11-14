@@ -29,7 +29,9 @@
 //!   first of equal arguments and NaN only where it comes first, as the
 //!   source's do.
 //! - A result is converted as its consumer converts it
-//!   ([`to_bool`], [`to_int`], `SkinLuaAccessor.java:612-651` at `0.8.9`).
+//!   ([`to_bool`], [`to_float`], `SkinLuaAccessor.java:612-673` at
+//!   `0.8.9`), but a number's value is truncated and saturated to `i32`
+//!   ([`to_int`]) where the source keeps the low 32 bits of its `long`.
 //!
 //! The differential table `crates/skin-beatoraja/tests/luaj_numerics.txt`,
 //! generated from the source's interpreter by `xtask/luaj/Probe.java`,
@@ -294,18 +296,21 @@ pub fn to_bool(a: Val) -> bool {
     truthy(a)
 }
 
-/// The source's `toint()` as a number's `value` reads it: an integer's low
-/// 32 bits; a float saturated to `i64` (NaN 0), then its low 32 bits; nil
-/// and booleans 0.
+/// A number's `value` as its consumer reads it: the number truncated
+/// toward zero and saturated to `i32` (NaN 0); nil and booleans 0. Both
+/// ends of the range are a number's no-value markers, so a value past
+/// either draws nothing.
 #[must_use]
 #[expect(
     clippy::cast_possible_truncation,
-    reason = "Java's d2l saturates and l2i keeps the low 32 bits, as these casts do"
+    reason = "a float to `i32` by `as` truncates toward zero and saturates, NaN 0"
 )]
 pub fn to_int(a: Val) -> i32 {
     match a {
-        Val::Int(n) => n as i32,
-        Val::Float(f) => (f as i64) as i32,
+        Val::Int(n) => {
+            i32::try_from(n.clamp(i64::from(i32::MIN), i64::from(i32::MAX))).unwrap_or(0)
+        }
+        Val::Float(f) => f as i32,
         Val::Nil | Val::Bool(_) => 0,
     }
 }

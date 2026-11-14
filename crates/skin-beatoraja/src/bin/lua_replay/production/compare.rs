@@ -17,9 +17,39 @@ use crate::isolation::{Entry, same_file};
 use crate::observed::{Cause, Key, Observed, Outcome, Point, Raw, RefFrame, TimerOut, intern};
 use crate::report::{Finding, Report, Stopped};
 
+/// A number's value as tapestry converts it (design.md "beatoraja Lua
+/// Skins", Built): the number truncated toward zero and saturated to
+/// `i32` (NaN 0); nil and booleans 0. Restated here, not called, so the
+/// comparator checks production's conversion against the rule.
+fn toint(r: Raw) -> i32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "`as` truncates toward zero and saturates"
+    )]
+    match r {
+        Raw::Int(n) => {
+            i32::try_from(n.clamp(i64::from(i32::MIN), i64::from(i32::MAX))).unwrap_or(0)
+        }
+        Raw::Float(f) => f as i32,
+        _ => 0,
+    }
+}
+
+/// What an intended difference from the source is counted under: a
+/// number's value whose LuaJ `toint()` differs from [`toint`].
+pub const TOINT_PAST_I32: &str = "toint past i32";
+
+/// Whether the source's `toint()` of the reference's outcome `o` for
+/// consumer `field` differs from tapestry's [`toint`]: an intended
+/// difference (design.md "Differences from the source", number values
+/// past `i32`), counted, never a finding.
+fn toint_differs(field: &str, o: Outcome) -> bool {
+    matches!(o, Outcome::Value(r) if field == "value" && luaj_toint(r) != toint(r))
+}
+
 /// LuaJ's `toint()` of a value (`SkinLuaAccessor.java:640-651`): the
 /// double saturated to a `long` (NaN 0), then its low 32 bits; nil and
-/// booleans 0.
+/// booleans 0. Only counts intended differences ([`toint_differs`]).
 fn luaj_toint(r: Raw) -> i32 {
     #[expect(clippy::cast_possible_truncation, reason = "Java's d2l then l2i")]
     match r {
@@ -90,7 +120,7 @@ fn converted(field: &str, o: Outcome) -> Option<Converted> {
         ("timer", Outcome::Error) => Converted::Long(Some(i64::MIN)),
         ("timer", Outcome::Unavailable) => Converted::Long(None),
         ("value", Outcome::Value(r)) => {
-            let n = luaj_toint(r);
+            let n = toint(r);
             Converted::Int(n, n != i32::MIN && n != i32::MAX)
         }
         ("value", Outcome::Error) => Converted::Int(0, true),
@@ -181,7 +211,7 @@ fn compile_lowered(field: &str, l: &LoweredRecord) -> Result<LoweredExpr, String
 /// The first difference between a lowered occurrence's expression on
 /// `fields` and `timers` and the reference's invocation: the class (a
 /// false guard is unavailable), then the converted value (`toboolean` for
-/// a `draw` or an `op`, `toint` for a `value`, by the reference
+/// a `draw` or an `op`, [`toint`] for a `value`, by the reference
 /// occurrence's own consumer `field`, whatever the record says). An
 /// invocation that could not complete or raised has no expression
 /// counterpart.
@@ -210,7 +240,7 @@ fn lowered_differ(
             let (got, want) = if field != "value" {
                 (i32::from(v != 0), i32::from(luaj_bool(r)))
             } else {
-                (v, luaj_toint(r))
+                (v, toint(r))
             };
             (got != want).then(|| format!("lowered: production {got}, reference {want} ({r:?})"))
         }
@@ -858,6 +888,9 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                     });
                     for &(_, outcome) in &calls {
                         rep.matched += 1;
+                        if toint_differs(key.field, outcome) {
+                            *rep.intended.entry(TOINT_PAST_I32).or_default() += 1;
+                        }
                         let e = match expr {
                             Ok(e) => e,
                             Err(why) => {
@@ -958,6 +991,9 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                         continue;
                     };
                     used.insert((k, call));
+                    if toint_differs(key.field, outcome) {
+                        *rep.intended.entry(TOINT_PAST_I32).or_default() += 1;
+                    }
                     match differ(key.field, prod, outcome) {
                         None => rep.agreed += 1,
                         Some(d) => {
@@ -1210,6 +1246,60 @@ mod tests {
             let d = differ("value", (Ok(v), Converted::Int(7, true)), Outcome::Value(r));
             assert!(d.as_deref().is_some_and(|d| d.starts_with("raw:")), "{d:?}");
         }
+    }
+
+    /// Where the source's `toint()` differs from the rule, counting that
+    /// difference lets no wrong production conversion pass: on the frames
+    /// whose value is past `i32`, a changed converted value, a changed
+    /// valid flag and a changed raw value (still past `i32`) are each
+    /// found.
+    #[test]
+    fn a_wrong_conversion_past_i32_is_found() {
+        use skin_model::present::{Fail, Val};
+
+        use super::TOINT_PAST_I32;
+        use crate::tests::PAST_I32;
+
+        let (run, obs) = pieces(PAST_I32);
+        // Production hides 2e10 (the source's low 32 bits: −1 474 836 480).
+        assert!(
+            run.frames.iter().flat_map(|f| &f.events).any(|e| matches!(
+                e,
+                Event::Ran {
+                    result: Ok(Val::Float(v)),
+                    conv: Converted::Int(i32::MAX, false),
+                    ..
+                } if *v == 2e10
+            )),
+            "no value of 2e10 hidden"
+        );
+        let r = compare(&run, &obs, &[]);
+        assert!(r.passes(), "{}", r.text(0, true, true));
+        assert!(r.intended.get(TOINT_PAST_I32).is_some_and(|&n| n > 0));
+        let found = |f: &dyn Fn(&mut Result<Val, Fail>, &mut Converted)| {
+            let (mut run, obs) = pieces(PAST_I32);
+            let mut tampered = 0;
+            for fr in &mut run.frames {
+                for e in &mut fr.events {
+                    if let Event::Ran { result, conv, .. } = e
+                        && *conv == Converted::Int(i32::MAX, false)
+                    {
+                        f(result, conv);
+                        tampered += 1;
+                    }
+                }
+            }
+            assert!(tampered > 0);
+            let r = compare(&run, &obs, &[]);
+            assert!(!r.findings.is_empty(), "{}", r.text(0, true, true));
+        };
+        found(&|_, c| *c = Converted::Int(i32::MIN, false));
+        found(&|_, c| *c = Converted::Int(i32::MAX, true));
+        found(&|r, _| {
+            if let Ok(Val::Float(v)) = r {
+                *v *= 2.0;
+            }
+        });
     }
 
     /// The untouched run agrees; each alteration of production's side is
