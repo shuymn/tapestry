@@ -1302,6 +1302,40 @@ fn close_drains_the_slot_before_the_returns() {
     assert!(drained < released, "{events:?}");
 }
 
+/// S5: a latch the receivers find (here the worker's end, with A
+/// installed) is drained in the same service, before the returns its
+/// empty install sends back are taken.
+#[test]
+fn a_latch_found_while_receiving_is_drained_before_the_returns() {
+    let opts = Opts::default();
+    let panic = Arc::clone(&opts.picker_panics);
+    let mut run = Run::new(visits(), opts);
+    run.settle();
+    run.entry();
+    panic.store(true, Ordering::Release);
+    run.pick(1);
+    run.entry();
+    let until = Instant::now() + PATIENCE;
+    while !run
+        .sounds
+        .worker
+        .as_ref()
+        .and_then(|w| w.handle.as_ref())
+        .is_some_and(thread::JoinHandle::is_finished)
+    {
+        assert!(Instant::now() < until, "the worker never ended");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(run.sounds.latched.is_none());
+    run.sounds.service(&mut run.audio.control);
+    assert_eq!(run.sounds.latched, Some(Reason::WorkerGone));
+    assert!(
+        run.sounds.deferred.is_none(),
+        "the slot outlived the receivers"
+    );
+    assert!(run.events().contains(&Event::Drained));
+}
+
 /// S5: a panic in one source's decode leaves its kinds silent, skips it
 /// for the run and installs the rest; with its clear failing too, the run
 /// latches; a worker that cannot start latches with nothing reserved; a

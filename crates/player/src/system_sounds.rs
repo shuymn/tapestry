@@ -701,12 +701,12 @@ impl SystemSounds {
         self.in_flight = None;
     }
 
-    /// The receivers' work, in the order the drain needs: the slot first,
-    /// so a latch's mapping is dropped before any return's charge is
-    /// released.
+    /// The receivers' work, in the order the drain needs: the slot after
+    /// the replies (which can latch) and before the returns, so a latch's
+    /// mapping is dropped before any return's charge is released.
     fn service(&mut self, control: &mut AudioControl) {
-        self.drain_deferred();
         self.receive(control);
+        self.drain_deferred();
         self.acknowledge(control);
         self.take_returns(control);
         #[cfg(test)]
