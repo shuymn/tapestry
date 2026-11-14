@@ -17,10 +17,6 @@ use crate::chart_images::file_information;
 
 /// The recovery state on disk, counting a candidate's names with
 /// [`link_count`].
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "nothing opens the sound sets' recovery state yet")
-)]
 pub fn recovery_fs() -> Box<dyn RecoveryFs> {
     Box::new(DiskFs::new(link_count))
 }

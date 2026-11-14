@@ -625,7 +625,12 @@ fn before_commit<R: LoadingRig>(
     if let Some(refusal) = rig.refresh_presentation(loaded).map_err(LiveError::Input)? {
         return Err(LiveError::Preparation(refusal));
     }
-    rig.prepare_audio().map_err(LiveError::Audio)?;
+    // Audio's wait left the way the preparation's own cancellation does
+    // (`PrepState::Cancelled` below).
+    if !crate::live::audio_ready(rig)? {
+        let _ = quit_look(rig);
+        return Ok(Before::Left);
+    }
     loop {
         // The key, built outside any lock: one moved since the
         // preparation began (a gauge resolved anew, a preset reloaded)

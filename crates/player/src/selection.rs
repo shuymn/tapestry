@@ -3456,6 +3456,7 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn choose(&mut self) -> Option<Pick> {
+        self.poll_system_sounds();
         self.look()
     }
 
@@ -3873,6 +3874,14 @@ impl AppRig for PlayerRig<'_> {
         sel.pointer.enter(sel.feed.lifetime);
         println!("select: {} charts listed", sel.screen.listed());
         sel.show(&self.render, images, None, now);
+    }
+
+    /// The system sounds' entry's wait was ended by a close or a thread
+    /// failure (design.md "State Model", Selection): taken once.
+    fn entry_ended(&mut self) -> bool {
+        self.system_sounds
+            .as_mut()
+            .is_some_and(crate::system_sounds::SystemSounds::take_entry_end)
     }
 
     /// The same entry on a screen built again: its lifetime, its timers'

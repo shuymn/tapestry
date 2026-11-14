@@ -3057,6 +3057,21 @@ impl RenderLink {
         self.shared.loading_drawn.load(Ordering::Relaxed)
     }
 
+    /// What reads, from any thread, the stage the current loading
+    /// lifetime last reported (tests); `None` without one.
+    #[cfg(test)]
+    pub(crate) fn loading_stage(&self) -> impl Fn() -> Option<Stage> + Send + Sync + use<> {
+        let shared = Arc::clone(&self.shared);
+        move || {
+            let lifetime = shared.loading_slot().lifetime;
+            shared
+                .producer()
+                .as_ref()
+                .filter(|s| s.lifetime() == lifetime)
+                .map(LifetimeState::stage)
+        }
+    }
+
     /// The current loading lifetime: after [`begin_loading`](Self::begin_loading),
     /// the one it began.
     pub fn loading_lifetime(&self) -> u64 {

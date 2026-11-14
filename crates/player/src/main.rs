@@ -1022,6 +1022,10 @@ fn rig<'a>(
         opening_gates: std::sync::Arc::default(),
         #[cfg(test)]
         ended_plays: Vec::new(),
+        system_sounds: None,
+        system_notices: Arc::default(),
+        #[cfg(test)]
+        system_polls_in_play: 0,
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;
@@ -1031,7 +1035,52 @@ fn rig<'a>(
     if let Some(game) = controls.game_thread() {
         rig.render.set_game_wake(Arc::new(move || game.unpark()));
     }
+    // Last, so no later step of the rig fails with the worker started; the
+    // startup pick is admitted here, on both launch paths.
+    rig.system_sounds = Some(system_sounds(
+        root,
+        settings,
+        &mut rig.audio,
+        &rig.system_notices,
+    ));
     Ok(rig)
+}
+
+/// The run's system sounds (design.md "Audio", system sounds): their
+/// worker started and the startup pick admitted, decoded at the output's
+/// rate. Each line they name for the player is logged and kept in
+/// `notices` for selection's notice line; each line only for the log is
+/// logged.
+fn system_sounds(
+    root: &DataRoot,
+    settings: &Settings,
+    audio: &mut audio_side::AudioLink,
+    notices: &Arc<std::sync::Mutex<Vec<String>>>,
+) -> system_sounds::SystemSounds {
+    #[cfg_attr(not(test), expect(unused_mut, reason = "a test arms the setup"))]
+    let mut setup =
+        system_sounds::Setup::new(root.clone(), settings.player.sounds.clone(), audio.rate);
+    let theirs = Arc::clone(notices);
+    #[cfg_attr(not(test), expect(unused_mut, reason = "a test arms the hooks"))]
+    let mut hooks = system_sounds::Hooks {
+        say: Box::new(move |line| {
+            println!("{line}");
+            log::warn!("{line}");
+            theirs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(line.to_owned());
+        }),
+        log: Box::new(|line| {
+            println!("{line}");
+            log::info!("{line}");
+        }),
+        clock: Arc::new(system_sounds::RealClock),
+        spawn: system_sounds::spawn_worker,
+    };
+    #[cfg(test)]
+    system_sounds::take_armed(&mut setup, &mut hooks);
+    system_sounds::SystemSounds::new(&mut audio.control, setup, hooks)
 }
 
 /// Opens the window, then starts the input thread, and checks that the
@@ -1781,8 +1830,13 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             rig.result_skin = crate::result_skin::ResultSkin::new(started.result)
                 .with_scripts(rig.render.scripts().clone());
             rig.result_skin.set_wake(rig.controls.game_thread());
+            // What the system sounds named so far (a quarantined set, the
+            // latch) joins the skins' notices.
+            let mut notices: Vec<String> = started.notice.into_iter().collect();
+            notices.extend(rig.receive_system_sounds());
+            let notice = (!notices.is_empty()).then(|| notices.join(" / "));
             if let Some(sel) = &mut rig.selection {
-                sel.started(started.notice, started.selection);
+                sel.started(notice, started.selection);
             }
             (true, None)
         }

@@ -410,6 +410,8 @@ struct Loader {
     refresh_refuses: bool,
     restore_refuses: bool,
     audio_fails: bool,
+    /// Audio's readiness answers `Cancelled`, this happening as it does.
+    audio_cancels: Option<Happen>,
     commit_waits: usize,
     commit_fails: bool,
     end_loading_waits: usize,
@@ -492,6 +494,7 @@ impl Loader {
             refresh_refuses: false,
             restore_refuses: false,
             audio_fails: false,
+            audio_cancels: None,
             commit_waits: 0,
             commit_fails: false,
             end_loading_waits: 0,
@@ -795,12 +798,16 @@ impl Rig for Loader {
         Ok(())
     }
 
-    fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
+    fn prepare_audio(&mut self) -> Result<game::AudioReadiness, AudioWaitError> {
         self.step("audio");
         if self.audio_fails {
             return Err(AudioWaitError::Gone);
         }
-        Ok(())
+        if let Some(what) = self.audio_cancels {
+            self.happen(what);
+            return Ok(game::AudioReadiness::Cancelled);
+        }
+        Ok(game::AudioReadiness::Ready)
     }
 
     fn before_play(&mut self, settings: &mut Settings) {
@@ -2301,6 +2308,47 @@ fn opening_o6_audio_error_disposes_of_the_handle() {
         ["audio", "discard", "end presentation"]
     );
     assert_eq!(loaded.attempt().number, 0);
+}
+
+/// ST15b: audio's readiness answering `Cancelled` (the quit key, a close
+/// or a thread failure during the system sounds' settlement) leaves the
+/// loading state as a cancelled preparation does: the preparation begun at
+/// load-ready is not begun again, a quit is taken, and a thread's failure
+/// ends the run with its own cause, never as an audio error.
+#[test]
+fn cancelled_audio_readiness_begins_no_preparation() {
+    for (case, what) in [
+        ("quit key", Happen::Quit),
+        ("close", Happen::Close),
+        ("input", Happen::InputFails),
+        ("audio", Happen::AudioFails),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let mut rig = Loader::new(&loaded);
+        rig.audio_cancels = Some(what);
+        let ran = run(&mut loaded, &mut rig);
+        match case {
+            "input" => assert!(matches!(ran, Err(LiveError::Input(_))), "{case}: {ran:?}"),
+            "audio" => assert!(matches!(ran, Err(LiveError::Output(_))), "{case}: {ran:?}"),
+            _ => assert!(ran.is_ok(), "{case}: {ran:?}"),
+        }
+        let steps: Vec<_> = rig.log.iter().map(|&(_, n)| n).collect();
+        let audio = steps.iter().position(|&n| n == "audio").unwrap();
+        assert_eq!(
+            steps.iter().filter(|&&n| n == "begin").count(),
+            1,
+            "{case}: {steps:?}"
+        );
+        assert!(
+            !steps[audio..].contains(&"begin") && !steps.contains(&"commit"),
+            "{case}: {steps:?}"
+        );
+        assert_eq!(loaded.attempt().number, 0, "{case}");
+        if case == "quit key" {
+            assert!(rig.commands.is_empty(), "{case}: the quit was not taken");
+        }
+    }
 }
 
 /// O-6 to O-8 (the flow's part; each stage's settle is the player's): a

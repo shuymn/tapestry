@@ -55,6 +55,8 @@ pub enum Label {
     ScanPauseWait,
     /// A play skin being prepared or specialized.
     SkinPreparing,
+    /// A READY state waiting for the system sounds' pick.
+    SystemSoundsWait,
     /// A play skin's preparation withdrawn.
     SkinCancelled,
     /// The screen kinds, in a skin's notice.
@@ -222,6 +224,7 @@ mod ja {
             Label::ScanFailed => "スキャンに失敗しました",
             Label::ScanPauseWait => "ライブラリのスキャンの一時停止を待っています",
             Label::SkinPreparing => "スキンを準備しています",
+            Label::SystemSoundsWait => "システム音を準備しています",
             Label::SkinCancelled => "スキンの準備は取り消されました",
             Label::ScreenPlay => "プレイ",
             Label::ScreenSelection => "選曲",
