@@ -78,6 +78,13 @@ pub struct Source {
     /// Scroll changes (channel `SC`), each as [`ObjectKind::Bgm`] of its
     /// `#SCROLLxx` id, in file order, for the preview alone.
     pub scrolls: Vec<RawObject>,
+    /// The bar line of the last measure a channel line in a taken branch
+    /// writes, whatever its channel or data, as [`ObjectKind::Bgm`] of id 0
+    /// at that measure's start: the preview's timeline runs to it, as the
+    /// source makes every measure up to the last one its lines write
+    /// (jbms-parser `BMSDecoder.decode`) and gives each a bar line
+    /// (`Section.makeTimeLines`), but it is no shown object.
+    pub written_bar: Option<RawObject>,
     /// `#SCROLLxx` factors in units of `10^-18`, those that are numbers.
     pub scroll_defs: BTreeMap<u16, i128>,
 }
@@ -138,6 +145,15 @@ pub fn parse(
                 .ok()
                 .filter(|&m| m <= limits.max_measure)
                 .ok_or(LoadError::MeasureOutOfRange { line, measure })?;
+            if source.written_bar.is_none_or(|b| b.measure < measure) {
+                source.written_bar = Some(RawObject {
+                    measure,
+                    index: 0,
+                    count: 1,
+                    kind: ObjectKind::Bgm(0),
+                    line,
+                });
+            }
             parse_channel(
                 &mut source,
                 limits,

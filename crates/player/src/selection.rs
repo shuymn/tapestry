@@ -417,6 +417,8 @@ pub struct Selection {
     /// The cursor's chart and its rest, which its images are asked for
     /// after (S10-12 plan D2).
     pub rest: CursorRest,
+    /// The cursor's preview graphs, read from the library.
+    pub graphs: crate::preview_graphs::GraphCache,
     /// What the load's decodes report (tests).
     #[cfg(test)]
     pub decodes: Option<Arc<Decodes>>,
@@ -594,6 +596,7 @@ impl Selection {
     fn refresh(&mut self) {
         self.search_pending = false;
         self.feed.list_revision = self.feed.list_revision.saturating_add(1);
+        self.graphs.refreshed();
         match self.read_list() {
             Ok(()) => {}
             Err(e) => {
@@ -1152,8 +1155,24 @@ impl Selection {
                     }
                 }
             }
-            render.show_selection(self.feed.update(&self.screen, page, now));
+            render.show_selection(self.update_of(page, now));
         }
+    }
+
+    /// The update of the screen showing `page` at `now`
+    /// ([`SkinFeed::update`](crate::selection_skin::SkinFeed::update)),
+    /// with the cursor's chart's graphs read for it.
+    pub(crate) fn update_of(
+        &mut self,
+        page: crate::menu_screen::MenuPage,
+        now: TimeUs,
+    ) -> crate::selection_skin::SelectionUpdate {
+        let mut update = self.feed.update(&self.screen, page, now);
+        let graphs = self.graphs.sync(self.screen.selected(), &self.shelf);
+        if let Some(selected) = update.view.selected.as_mut() {
+            selected.graphs = graphs;
+        }
+        update
     }
 
     /// A scenario's `decision = "skin"` step due (dev-tools): done once the
@@ -2301,6 +2320,7 @@ impl PlayerRig<'_> {
         self.render.leave_selection();
         if let Some(sel) = &mut self.selection {
             sel.pointer.leave();
+            sel.graphs.clear();
         }
         if let Some(sounds) = &mut self.system_sounds {
             sounds.stop(&mut self.audio.control, audio::SystemKind::Select);
@@ -4249,6 +4269,8 @@ use page_start::Got;
 pub(crate) mod tests {
     #[cfg(feature = "dev-tools")]
     mod pointer;
+    #[cfg(feature = "dev-tools")]
+    mod previews;
 
     use std::sync::Arc;
     use std::time::{Duration, Instant};
@@ -4634,6 +4656,7 @@ pub(crate) mod tests {
             spawner: game::coord::Spawner::SYSTEM,
             page: crate::page_jobs::PageJobs::new(Arc::new(crate::priority::Unchanged)),
             rest: crate::selection::CursorRest::default(),
+            graphs: crate::preview_graphs::GraphCache::default(),
             decodes: None,
             after_bank: None,
             unload_fault: None,
@@ -7284,6 +7307,7 @@ pub(crate) mod tests {
             spawner: game::coord::Spawner::SYSTEM,
             page: crate::page_jobs::PageJobs::new(Arc::new(crate::priority::Unchanged)),
             rest: crate::selection::CursorRest::default(),
+            graphs: crate::preview_graphs::GraphCache::default(),
             decodes: None,
             after_bank: None,
             unload_fault: None,

@@ -52,6 +52,16 @@ pub(super) fn follows() -> Opts<'static> {
 }
 
 impl Cx<'_> {
+    /// A graph's destination options: [`follows`] on play; elsewhere the
+    /// screen's own, as there are no lane covers to follow.
+    pub(super) fn graph_opts(&self) -> Opts<'static> {
+        if self.kind == ScreenKind::Play {
+            follows()
+        } else {
+            Opts::default()
+        }
+    }
+
     /// The judge graph record `rec` at `dst`.
     pub(in super::super) fn judge_graph(&mut self, dst: Dst, rec: u32) -> Result<(), ImportError> {
         let at = dst.span;
@@ -68,7 +78,7 @@ impl Cx<'_> {
             ],
         );
         let kind = match (self.kind, self.int_or(ty, "type", 0)?) {
-            (ScreenKind::Play, 0) => JudgeGraphKind::Notes,
+            (ScreenKind::Play | ScreenKind::Selection, 0) => JudgeGraphKind::Notes,
             (ScreenKind::Result, 1) => JudgeGraphKind::Judgment,
             (ScreenKind::Result, 2) => JudgeGraphKind::EarlyLate,
             _ => return self.drop_el(role, at, NoteKind::UnsupportedField { field: "type" }),
@@ -78,7 +88,7 @@ impl Cx<'_> {
         let reverse = self.int_or(reverse, "orderReverse", 0)? == 1;
         let no_gap = self.int_or(no_gap, "noGap", 0)? == 1;
         let no_gap_x = self.int_or(no_gap_x, "noGapX", 0)? == 1;
-        let Some(c) = self.common_with(role, &dst, follows())? else {
+        let Some(c) = self.common_with(role, &dst, self.graph_opts())? else {
             return Ok(());
         };
         let fit = fit(dst.stretch);
