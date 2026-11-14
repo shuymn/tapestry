@@ -369,8 +369,12 @@ pub fn compose_page(view: &EndPage, latest: &EndPage, why: Option<&str>) -> EndP
 }
 
 /// The view of `screen` a skin is updated with, with `chart`: its parts
-/// while it is ready, else the chart's facts under its unavailability.
+/// while it is ready, else the chart's facts under its unavailability;
+/// under every status, the player's totals the screen read, 0 when they
+/// are unavailable or unread (design.md "Personal Bests", skin
+/// projections).
 pub fn view_of(screen: &ResultScreen, chart: ResultChart) -> ResultView {
+    let totals = crate::bests::view_totals(screen.totals().flatten().unwrap_or_default());
     let preset = screen.viewed().and_then(|e| e.preset.as_deref());
     let why = match (screen.status(), preset) {
         (ViewStatus::Ready(summary), Some(preset)) => {
@@ -388,7 +392,7 @@ pub fn view_of(screen: &ResultScreen, chart: ResultChart) -> ResultView {
                 gauge: parts.gauge,
                 deviations: Some(parts.deviations),
                 timing_areas: Some(parts.timing_areas),
-                totals: Default::default(),
+                totals,
             };
         }
         (ViewStatus::NothingRecorded, _) => Unavailable::NothingRecorded,
@@ -398,6 +402,7 @@ pub fn view_of(screen: &ResultScreen, chart: ResultChart) -> ResultView {
     };
     ResultView {
         status: ResultStatus::Unavailable(why),
+        totals,
         ..crate::result_skin::probe_view(chart)
     }
 }
