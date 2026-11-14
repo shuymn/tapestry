@@ -522,11 +522,74 @@ fn a_trailing_stop_reaches_the_preview() {
     );
 }
 
+/// Fixture PB: the preview's timeline runs to the bar line of the last
+/// measure a channel line in a taken branch writes, whatever its channel or
+/// data, as the source makes every measure up to the last one its lines
+/// write and gives each a bar line: a tap at 0 at 150 BPM, 200 BPM (03
+/// `C8`) halfway into the measure (800 ms), so measure 1 starts at
+/// 1 400 ms and measure 3 at 3 800 ms. Measure 3 written only by a
+/// poor-BGA event (06) two thirds in (4 600 ms), a channel the loader does
+/// not read (99, 17), data that is empty or all `00`, a measure length, or
+/// a line in a taken branch ends the rows at its bar line, not at an event;
+/// a line in a branch not taken writes nothing. The length and seconds stay
+/// the play chart's, as the source's last time leaves these out, and the
+/// play chart is the one without the line.
+#[test]
+fn a_written_measure_keeps_its_bar_line_in_the_preview() {
+    let base = "#BPM 150\n#00019:01\n#00003:00C8\n";
+    let one = bms_model::SCROLL_ONE;
+    let to_bar = [
+        speed_row(0, 150, one),
+        speed_row(800, 200, one),
+        speed_row(3_800, 200, one),
+    ];
+    let cases = [
+        ("#00306:000001\n", true),
+        ("#00399:0102\n", true),
+        ("#00317:01\n", true),
+        ("#00301:\n", true),
+        ("#00304:0000\n", true),
+        ("#00302:0.75\n", true),
+        ("#SETRANDOM 1\n#IF 1\n#00306:01\n#ENDIF\n", true),
+        ("#SETRANDOM 1\n#IF 2\n#00306:01\n#ENDIF\n", false),
+    ];
+    // Each case's last row, all compared at once.
+    let ends = |pick: &dyn Fn(&str, bool) -> Option<bms_model::SpeedRow>| -> Vec<_> {
+        cases
+            .iter()
+            .map(|&(line, w)| (line, pick(line, w)))
+            .collect()
+    };
+    assert_eq!(
+        ends(&|line, _| preview(&format!("{base}{line}")).speeds().last()),
+        ends(&|_, writes| Some(if writes { to_bar[2] } else { to_bar[1] }))
+    );
+    for (line, writes) in cases {
+        let text = format!("{base}{line}");
+        let p = preview(&text);
+        let rows = if writes { &to_bar[..] } else { &to_bar[..2] };
+        assert_eq!(p.speeds().to_vec(), rows, "{line:?}");
+        assert_eq!(p.length_ms(), 0, "{line:?}");
+        assert_eq!(p.seconds(), preview(base).seconds(), "{line:?}");
+        let (with, without) = (load(&text, 0).unwrap(), load(base, 0).unwrap());
+        assert_eq!(with.profile, without.profile, "{line:?}");
+        assert_eq!(
+            with.chart.meta.length, without.chart.meta.length,
+            "{line:?}"
+        );
+    }
+    let poor = format!("{base}#00306:000001\n");
+    assert_eq!(
+        load(&poor, 0).unwrap().chart.identity.resolved_hash,
+        load(base, 0).unwrap().chart.identity.resolved_hash
+    );
+}
+
 /// Fixture SU: a scroll change naming no `#SCROLLxx` is left out before
-/// timing: it adds no point, so the rows and seconds are those without it,
-/// and one past the duration cap (999 measures of 4 s at 60 BPM) does not
-/// leave the preview as the play chart's, so a hidden note at 4 s still
-/// lengthens it to 6 seconds.
+/// timing: it adds no point, so the rows and seconds are those without it.
+/// Its line still writes its measure (Fixture PB): at 60 BPM, a measure of
+/// 4 s, one in measure 4 ends the rows at that bar line (16 s), and the
+/// hidden note at 4 s still lengthens the seconds to 6.
 #[test]
 fn an_undefined_scroll_change_is_no_point() {
     let base = "#BPM 120\n#STOP01 48\n#00011:01\n#00009:00000001\n#00111:00000100\n#00131:01\n";
@@ -535,7 +598,37 @@ fn an_undefined_scroll_change_is_no_point() {
     assert_eq!(preview(&with).seconds(), preview(base).seconds());
     let tail = "#BPM 60\n#00011:01\n#00131:01\n";
     assert_eq!(preview(tail).seconds().len(), 6);
-    assert_eq!(preview(&format!("{tail}#999SC:01\n")).seconds().len(), 6);
+    let written = preview(&format!("{tail}#004SC:01\n"));
+    assert_eq!(written.seconds().len(), 6);
+    let one = bms_model::SCROLL_ONE;
+    assert_eq!(
+        written.speeds().to_vec(),
+        [speed_row(0, 60, one), speed_row(16_000, 60, one)]
+    );
+}
+
+/// Fixture SU-cap: a `#999SC:01` line by itself writes measure 999, whose
+/// bar line at 60 BPM (999 measures of 4 s) is past the 60-minute cap, so
+/// the preview falls back to the play chart's: its seconds and rows are
+/// play's, not the 6 seconds the hidden note at 4 s gives, and the play
+/// chart and its length are the ones without the line. A colon-less
+/// `#999 comment` is no channel line, so it writes no measure and the
+/// preview stays the one without it.
+#[test]
+fn a_written_measure_past_the_cap_leaves_the_preview_as_plays() {
+    let tail = "#BPM 60\n#00011:01\n#00131:01\n";
+    let plain = load(tail, 0).unwrap();
+    let past = format!("{tail}#999SC:01\n");
+    let p = preview(&past);
+    assert_eq!(p.seconds(), plain.profile.seconds());
+    assert_eq!(p.speeds(), plain.profile.speeds());
+    assert_eq!(p.length_ms(), plain.profile.length_ms());
+    let loaded = load(&past, 0).unwrap();
+    assert_eq!(loaded.profile, plain.profile);
+    assert_eq!(loaded.chart.meta.length, plain.chart.meta.length);
+    let comment = preview(&format!("{tail}#999 comment\n"));
+    assert_eq!(comment.seconds().len(), 6);
+    assert_eq!(comment, preview(tail));
 }
 
 /// Fixture SR: a scroll change applies at its own row, not at the first

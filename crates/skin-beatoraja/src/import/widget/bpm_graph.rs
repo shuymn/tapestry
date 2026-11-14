@@ -5,9 +5,9 @@
 //!
 //! As the source reads them: `delay` in ms, not positive showing the graph
 //! at once; `lineWidth` not positive is 2. A `lineWidth` past
-//! [`MAX_BPM_LINE_WIDTH`] drops the graph with a note: the source draws
-//! it, but its `int` stroke arithmetic wraps for the largest widths and the
-//! model bounds its preparation by this width. A colour keeps its hex
+//! [`MAX_BPM_LINE_WIDTH`] is drawn at it with a deviation note, its
+//! strokes thinner than authored: the model bounds its preparation's
+//! storage by this width (T08). A colour keeps its hex
 //! digits, wherever they are, up to the first six, always opaque
 //! (`normalizeColorString`, `:230-233`); none left keeps the default. One
 //! to five left, or a JSON `null`, fails the source's skin; here the
@@ -83,11 +83,18 @@ impl Cx<'_> {
         let delay = TimeUs(i64::from(self.int_or(delay, "delay", 0)?.max(0)) * 1_000);
         let line_width = self.int_or(line_width, "lineWidth", 2)?;
         let line_width = if line_width > 0 { line_width } else { 2 };
-        let Some(line_width) = u32::try_from(line_width)
-            .ok()
-            .filter(|&w| w <= MAX_BPM_LINE_WIDTH)
-        else {
-            return self.drop_el(role, at, NoteKind::UnsupportedField { field: "lineWidth" });
+        let line_width = match u32::try_from(line_width) {
+            Ok(w) if w <= MAX_BPM_LINE_WIDTH => w,
+            _ => {
+                self.note(
+                    Some(at),
+                    Severity::Deviation,
+                    NoteKind::LineWidthClamped {
+                        declared: line_width,
+                    },
+                );
+                MAX_BPM_LINE_WIDTH
+            }
         };
         if !matches!(dst.stretch, -1 | 0) {
             return self.drop_el(role, at, NoteKind::Stretch(dst.stretch));
@@ -117,7 +124,7 @@ impl Cx<'_> {
                 ),
             }
         }
-        let Some(common) = self.common_with(role, &dst, super::judge_graph::follows())? else {
+        let Some(common) = self.common_with(role, &dst, self.graph_opts())? else {
             return Ok(());
         };
         if dst.filter != 0 {
