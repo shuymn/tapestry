@@ -949,7 +949,7 @@ impl<'d> Cx<'d> {
         {
             let at = self.arena_span(op);
             if self.ignored_ops.insert(at) {
-                self.ignored(at, NoteKind::Ignored { field: "op" });
+                self.ignored(at, NoteKind::ScalarOp);
             }
         }
         let blend = self.int_or(blend, "blend", 0)?;
@@ -1585,7 +1585,12 @@ impl<'d> Cx<'d> {
 
         // Blend (`Skin.java:655-665`). A neutral outer destination draws
         // nothing of its own: its parts keep their blend, so its own is
-        // ignored.
+        // ignored. Blend 3 draws additive: the source sets the subtract
+        // equation and resets it to add before its quads draw
+        // (`:657-662`); the quads queued before it, which its batch
+        // flushes under subtract when that changes its blend factors, keep
+        // their own blend here.
+        // Source: SF-006
         let blend = match dst.blend {
             2..=4 | 9 if o.neutral => {
                 self.ignored(at, NoteKind::Ignored { field: "blend" });
@@ -1593,7 +1598,7 @@ impl<'d> Cx<'d> {
             }
             2 => Blend::Add,
             3 => {
-                self.ignored(at, NoteKind::Ignored { field: "blend 3" });
+                self.ignored(at, NoteKind::SubtractBlend);
                 Blend::Add
             }
             4 | 9 if text => {

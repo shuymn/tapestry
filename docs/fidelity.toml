@@ -19,13 +19,13 @@
 # - `@luaj-jse-3.0.2-custom`: the LuaJ jar bundled with beatoraja 0.8.9,
 #   `lib/luaj-jse-3.0.2-custom.jar`.
 #
-# The classes of SF-001 to SF-005 are proposals until the owner confirms them
-# in issue #534.
+# docs/setup.md "Reference Sources" names the same pins.
 
 [[entry]]
 id = "SF-001"
 summary = "A Lua skin's `op` that is not a table is no condition"
 class = "compatibility"
+decision = "#534"
 reason = """
 A Lua skin's converted table may hold a number, string, boolean or function \
 as a destination's `op`, which the source reads as no condition; a surveyed \
@@ -39,6 +39,7 @@ tests = ["crates/skin-beatoraja/tests/lua_op.rs::a_lua_op_that_is_not_a_table_is
 id = "SF-002"
 summary = "JSON wrapper names match ignoring ASCII case, and the first match wins"
 class = "compatibility"
+decision = "#534"
 reason = """
 Part of the libGDX JSON dialect the reader already follows: skins that load \
 today may spell a wrapper name in any case, and dropping the match could only \
@@ -51,6 +52,7 @@ tests = ["crates/skin-beatoraja/tests/resolve.rs::wrapper_names_ignore_ascii_cas
 id = "SF-003"
 summary = "JSON reader edges: `[1\\n,]` refused, `]` may start an unquoted name, `true`, `false` and `null` typed after unescaping"
 class = "compatibility"
+decision = "#534"
 reason = """
 Skins are written against the pinned reader's grammar, which the reader takes \
 as the format's description: with these edges a skin file reads here as it \
@@ -75,6 +77,7 @@ tests = [
 id = "SF-004"
 summary = "A song list's level strip ignores `padding`, `zeropadding` and digit offsets"
 class = "compatibility"
+decision = "#534"
 reason = """
 The selection loader builds every level strip this way, so skins draw their \
 song-list levels for a blank-padded ten-glyph or eleven-glyph strip without \
@@ -87,9 +90,60 @@ tests = ["crates/skin-beatoraja/tests/selection_frame.rs::level_strips_follow_th
 id = "SF-005"
 summary = "A song-list bar's image set shares the first timer and the first cycle of its images that load"
 class = "rule"
+decision = "#534"
 reason = """
 A song-list rule a player sees: the images of one bar set animate together, \
 on one timer and one cycle."""
 source = ["src/bms/player/beatoraja/skin/json/JsonSelectSkinObjectLoader.java:50-63 @beatoraja-0.8.9"]
 sites = ["crates/skin-beatoraja/src/import/selection/mod.rs"]
 tests = ["crates/skin-beatoraja/tests/selection_import.rs::placements_take_their_set_s_timing"]
+
+[[entry]]
+id = "SF-006"
+summary = "Blend 3 draws additive, as blend 2"
+class = "compatibility"
+decision = "#534"
+reason = """
+Skins are authored against what the source draws for blend 3: it sets the \
+subtract equation and resets it to add before the element's quads draw, so \
+they draw additive. The quads queued before them, which its batch flushes \
+under subtract when that changes its blend factors, are its graphics \
+library's batch state and keep their own blend here."""
+source = ["src/bms/player/beatoraja/skin/Skin.java:657-662 @beatoraja-0.8.9"]
+sites = ["crates/skin-beatoraja/src/import/mod.rs"]
+tests = ["crates/skin-beatoraja/tests/import_multiply.rs::blend_three_draws_additive"]
+
+[[entry]]
+id = "SF-007"
+summary = "`#RANDOM` and `#IF` are two flat stacks: `#ENDIF` pops the top flag, and an `#IF` with no open `#RANDOM` pushes none"
+class = "rule"
+decision = "#534"
+reason = """
+The rule charts are written and tested against (#67): each `#IF` is read by \
+the latest `#RANDOM` value, a line by the top flag alone, so nested and \
+unclosed blocks read as the reference decoder reads them, and an `#ENDIF` \
+after an `#IF` with no value to test closes the enclosing block."""
+source = ["src/bms/model/BMSDecoder.java:194-230 @jbms-parser-e19bcc2"]
+sites = ["crates/bms-parser/src/branch.rs"]
+tests = [
+    "crates/bms-parser/tests/random.rs::nested_blocks_read_by_the_top_flag_only",
+    "crates/bms-parser/tests/random.rs::stray_directives_warn_and_bad_values_fail",
+    "crates/bms-parser/tests/random.rs::if_flags_stack_as_charts_expect",
+]
+
+[[entry]]
+id = "SF-008"
+summary = "A chart profile counts its notes over `floor(length / 1 s) + 2` seconds"
+class = "rule"
+decision = "#534"
+reason = """
+The song information's distribution length, which a player sees twice: the \
+densities a song list shows divide by it, and the notes graph spans it, so \
+the last notes sit short of the graph's right edge. A chart shows the \
+densities and the graph its players know."""
+source = [
+    "src/bms/player/beatoraja/song/SongInformation.java:94-103 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/SkinNoteDistributionGraph.java:171-172 @beatoraja-0.8.9",
+]
+sites = ["crates/bms-model/src/profile.rs"]
+tests = ["crates/bms-model/src/profile.rs::a_shown_object_lengthens_the_preview"]

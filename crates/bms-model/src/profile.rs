@@ -262,6 +262,9 @@ fn second_of(t: TimeUs, count: usize) -> Option<usize> {
         .filter(|&s| t.0 >= 0 && s < count)
 }
 
+/// The notes of each 1× second over `⌊end / 1 s⌋ + 2` seconds, the
+/// distribution length the densities divide by and the notes graph spans.
+// Source: SF-008
 fn seconds(chart: &Chart, end: TimeUs) -> Vec<[u32; NOTE_CATEGORIES]> {
     let whole = usize::try_from(end.0.max(0) / 1_000_000).unwrap_or(0);
     let count = whole.saturating_add(2);
@@ -507,6 +510,7 @@ mod tests {
 
     /// Fixture H: a hidden note or BGA event at 4.2 s lengthens the seconds
     /// to 6 (`4 + 2`) and ends the rows there; the play profile keeps 5.
+    // Source: SF-008
     #[test]
     fn a_shown_object_lengthens_the_preview() {
         let chart = four_taps();

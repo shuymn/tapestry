@@ -82,6 +82,7 @@ impl Branches {
 
     /// Handles a branch directive, whether or not lines are read here.
     /// Returns `Ok(false)` when `name` is not one.
+    // Source: SF-007
     pub fn directive(
         &mut self,
         name: &str,
