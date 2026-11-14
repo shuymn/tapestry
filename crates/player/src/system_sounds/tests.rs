@@ -398,7 +398,7 @@ impl MemFs {
     }
 
     /// Another instance holds the lock: it is refused.
-    fn hold_lock(&self) {
+    pub(crate) fn hold_lock(&self) {
         self.0.held.store(true, Ordering::Release);
     }
 

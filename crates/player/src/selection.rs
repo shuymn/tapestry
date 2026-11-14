@@ -3626,8 +3626,8 @@ impl AppRig for PlayerRig<'_> {
     }
 
     /// The decision screen begins: the input epoch first, so nothing
-    /// observed before the choice acts after it, then the built-in
-    /// presentation and its tone, and a play's loading lifetime, made now
+    /// observed before the choice acts after it, then the presentation and
+    /// the decision sound, and a play's loading lifetime, made now
     /// and held until the deadline reveals it; then the attempt's entry
     /// (its loading-time adjustments are its own), whose fence waits on the
     /// input thread with the screen already showing.
@@ -3667,7 +3667,15 @@ impl AppRig for PlayerRig<'_> {
         }
         self.render.show_decision(shown.clone(), claimed);
         sel.decision = Some((shown, file_name(chart)));
-        self.audio.control.play_tone();
+        // The decision sound, once per decision screen whichever
+        // presentation draws: the set's `decide`, or the tone when it has
+        // none or the run's sets are off. Nothing stops it, so it plays on
+        // into loading (design.md "State Model", system sounds).
+        // Source: SF-009
+        match self.system_sounds.as_mut() {
+            Some(sounds) => sounds.start(&mut self.audio.control, audio::SystemKind::Decide, None),
+            None => self.audio.control.play_tone(),
+        }
         if matches!(pick, Pick::Play(_)) {
             let gauge = sel
                 .screen
@@ -3678,7 +3686,7 @@ impl AppRig for PlayerRig<'_> {
             sel.loading = Some(page);
         }
         // The attempt's entry last: its fence waits on the input thread with
-        // the screen and its tone already out, serving the decision screen
+        // the screen and its sound already out, serving the decision screen
         // (a leaving verdict is left in `d` for App to route).
         let ((), d) = self.watching(chart, d, |rig| {
             rig.next_window_scene();
@@ -5144,15 +5152,41 @@ pub(crate) mod tests {
     }
 
     /// The choice's decision screen is out before its input fence: at the
-    /// fence, held before its answer, its presentation and its tone were
-    /// already sent (a fence that takes the whole time still shows the
-    /// screen). A second choice sounds its tone again (ND1); a screen built
-    /// again shows the presentation from the render thread, with no tone
-    /// (ND2, `the_render_thread_draws_the_latest_mode_after_a_rebuild`).
+    /// fence, held before its answer, its presentation and its decision
+    /// sound's start were already sent (a fence that takes the whole time
+    /// still shows the screen). A second choice starts the decision sound
+    /// again (ND1); a screen built again shows the presentation from the
+    /// render thread, with no second start (ND2,
+    /// `the_render_thread_draws_the_latest_mode_after_a_rebuild`). C25-1
+    /// (design.md "State Model", system sounds): with no set the decision
+    /// sound is the tone the audio thread starts for a generation with no
+    /// `decide`, never a tone request; with a BGM set holding `decide`, the
+    /// installed generation's `decide` sounds once in its reserved voice,
+    /// not looped, and no tone.
+    // Source: SF-009
     #[cfg(feature = "dev-tools")]
     #[test]
     fn the_decision_screen_is_out_before_its_fence() {
+        use audio::SystemKind;
+        decision_sound_per_choice(None);
+        let fx = crate::system_sounds::tests::Fixture::new();
+        fx.sound("bgm/A", SystemKind::Select, 96_000);
+        fx.sound("bgm/A", SystemKind::Decide, 48_000);
+        decision_sound_per_choice(Some(&fx));
+    }
+
+    /// Two choices on a rig whose system sounds come from `set` (none: no
+    /// set), each through `entered_decision`: what each requests and what
+    /// the audio thread sounds for it.
+    #[cfg(feature = "dev-tools")]
+    fn decision_sound_per_choice(set: Option<&crate::system_sounds::tests::Fixture>) {
+        use crate::system_sounds::tests::wait;
+        use audio::SystemKind;
         use game::AppRig as _;
+        if let Some(fx) = set {
+            let root = fx.root();
+            crate::system_sounds::arm(move |setup, _| setup.root = root);
+        }
         let dir = tempfile::tempdir().unwrap();
         let sel = selection(dir.path());
         let chart = dir.path().join("x.bms");
@@ -5166,15 +5200,49 @@ pub(crate) mod tests {
             |rig, _, end| {
                 rig.selection = Some(sel);
                 let (thread, _jobs, _waker, _clock) = input_thread(end);
+                let probe = rig.audio.control.failure_probe();
+                let decide = |p: &game::OutputProbe| p.reserved(SystemKind::Decide);
+                // Positive controls: a known request moves each probe read.
+                let installed = if set.is_some() {
+                    wait("the set installed", || {
+                        rig.poll_system_sounds();
+                        rig.audio.control.system_installed().is_some()
+                    });
+                    let a = rig.audio.control.system_installed().unwrap();
+                    rig.audio
+                        .control
+                        .system_start(SystemKind::Select, true, Some(a))
+                        .unwrap();
+                    assert_eq!(probe.system_starts(SystemKind::Select), 1);
+                    wait("the control loop", || {
+                        probe.reserved(SystemKind::Select) == Some((a, true))
+                    });
+                    rig.audio.control.system_stop(SystemKind::Select);
+                    wait("the control loop's stop", || {
+                        probe.reserved(SystemKind::Select).is_none()
+                    });
+                    Some(a)
+                } else {
+                    rig.audio.control.play_tone();
+                    wait("the control tone", || probe.tones_started() == 1);
+                    None
+                };
+                let (tones, requests) = (probe.tones_started(), probe.tone_requests());
+                let sounded = |n: u64| match installed {
+                    Some(a) => {
+                        wait("the set's decision sound", || decide(&probe).is_some());
+                        assert_eq!(decide(&probe), Some((a, false)), "choice {n}");
+                    }
+                    None => wait("the tone", || probe.tones_started() == tones + n),
+                };
                 let sent = rig.render.decisions_sent();
-                let tones = rig.audio.control.failure_probe();
-                let tones_now = tones.clone();
+                let fenced = probe.clone();
                 let (seen_tx, seen) = std::sync::mpsc::channel();
                 let pick = game::Pick::Play(chart.clone());
                 at_fence(
                     rig,
                     Box::new(move |_| {
-                        let _ = seen_tx.send((sent(), tones_now.tone_requests()));
+                        let _ = seen_tx.send((sent(), fenced.system_starts(SystemKind::Decide)));
                     }),
                     &mut |rig| {
                         let _ = rig.entered_decision(&pick, game::Decision::off());
@@ -5184,13 +5252,27 @@ pub(crate) mod tests {
                 assert_eq!(
                     seen.recv_timeout(Duration::from_secs(60)).unwrap(),
                     (1, 1),
-                    "the presentation and the tone before the fence"
+                    "the presentation and the decision sound before the fence"
                 );
+                sounded(1);
+                if installed.is_some() {
+                    // Its voice free again, so the next start is heard.
+                    wait("the decision sound's end", || decide(&probe).is_none());
+                }
                 let sent = rig.render.decisions_sent();
                 rig.closed_epoch();
                 let _ = rig
                     .entered_decision(&game::Pick::Practice(chart.clone()), game::Decision::off());
-                assert_eq!((sent(), tones.tone_requests()), (2, 2), "a tone a choice");
+                assert_eq!(
+                    (sent(), probe.system_starts(SystemKind::Decide)),
+                    (2, 2),
+                    "a decision sound a choice"
+                );
+                sounded(2);
+                assert_eq!(probe.tone_requests(), requests, "a tone request");
+                if installed.is_some() {
+                    assert_eq!(probe.tones_started(), tones, "a tone");
+                }
                 thread.stop().unwrap();
             },
         );

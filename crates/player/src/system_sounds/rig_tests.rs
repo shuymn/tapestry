@@ -843,3 +843,93 @@ fn decision_refused() -> String {
         game::Chain(&admission)
     )
 }
+
+/// Arms the next rig's owner with a BGM set `bgm/A` whose `decide` sounds
+/// for 1 s (48 000 frames), its recovery state in `fs`; the set's root
+/// lives as long as the returned fixture.
+fn arm_decide(fs: MemFs) -> Fixture {
+    let fx = Fixture::new();
+    fx.sound("bgm/A", SystemKind::Select, 96_000);
+    fx.sound("bgm/A", SystemKind::Decide, 48_000);
+    arm_run(
+        &fx,
+        &Seam::new(Arc::new(RealClock)),
+        &Arc::default(),
+        Some(fs),
+    );
+    fx
+}
+
+/// The select screen's selection over a library of one chart, on `rig`:
+/// the chart.
+fn one_chart(rig: &mut PlayerRig<'_>, dir: &std::path::Path) -> std::path::PathBuf {
+    let (sel, roots) = crate::selection::tests::tree(dir, &[&["a.bms"]]);
+    rig.selection = Some(sel);
+    roots[0].join("a.bms")
+}
+
+/// C25-3, T18: a choice while the run is latched (the recovery state's
+/// lock held by another instance) asks for the tone and queues no
+/// decision sound.
+#[test]
+fn a_latched_choice_sounds_the_tone() {
+    let fs = MemFs::new();
+    fs.hold_lock();
+    let _fx = arm_decide(fs);
+    on_rig(None, |rig| {
+        let dir = tempfile::tempdir().unwrap();
+        let chart = one_chart(rig, dir.path());
+        let probe = rig.audio.control.failure_probe();
+        wait("the latch", || {
+            rig.poll_system_sounds();
+            sounds(rig).latched.is_some()
+        });
+        // Positive controls: a start queued and a tone asked for move
+        // their counts.
+        rig.audio
+            .control
+            .system_start(SystemKind::Scratch, false, None)
+            .unwrap();
+        assert_eq!(probe.system_starts(SystemKind::Scratch), 1);
+        rig.audio.control.play_tone();
+        assert_eq!(probe.tone_requests(), 1);
+        let _ = rig.entered_decision(&game::Pick::Play(chart), game::Decision::off());
+        assert_eq!(probe.tone_requests(), 2, "the choice's tone");
+        assert_eq!(probe.system_starts(SystemKind::Decide), 0);
+    });
+}
+
+/// C25-4: the decision screen ending for loading stops no decision
+/// sound: the set's `decide`, sounding in its reserved voice, has no stop
+/// drawn for it through the decision screen's entry and loading's.
+// Source: SF-009
+#[test]
+fn decide_plays_on_into_loading() {
+    let _fx = arm_decide(MemFs::new());
+    on_rig(None, |rig| {
+        let dir = tempfile::tempdir().unwrap();
+        let chart = one_chart(rig, dir.path());
+        let probe = rig.audio.control.failure_probe();
+        wait("the set installed", || {
+            rig.poll_system_sounds();
+            rig.audio.control.system_installed().is_some()
+        });
+        let a = rig.audio.control.system_installed().unwrap();
+        // Positive control: a stop drawn moves its kind's count.
+        rig.audio.control.system_stop(SystemKind::Scratch);
+        assert_eq!(probe.system_stops(SystemKind::Scratch), 1);
+        let (stops, word) = (
+            probe.system_stops(SystemKind::Decide),
+            probe.system_stop_word(SystemKind::Decide),
+        );
+        let _ = rig.entered_decision(&game::Pick::Play(chart.clone()), game::Decision::off());
+        assert_eq!(probe.system_starts(SystemKind::Decide), 1);
+        wait("the decision sound", || {
+            probe.reserved(SystemKind::Decide).is_some()
+        });
+        assert_eq!(probe.reserved(SystemKind::Decide), Some((a, false)));
+        rig.entered_loading(&chart);
+        assert_eq!(probe.system_stops(SystemKind::Decide), stops);
+        assert_eq!(probe.system_stop_word(SystemKind::Decide), word);
+    });
+}

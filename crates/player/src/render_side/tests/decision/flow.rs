@@ -303,7 +303,8 @@ fn fresh_press_needed_after_skin_decision_epoch() {
 
 /// R4.1, R4.3 (stage3's list): the skin's build refused at 1,000 ms gives
 /// the built-in presentation at once, the deadline at 1,500 ms from the
-/// original choice, no presentation sent again and no second tone; at
+/// original choice, no presentation sent again and no second decision
+/// sound (C25-2: the choice's one start, none for the takeover); at
 /// 2,000 ms the screen ends at once on its route: the loading state on
 /// the play path, the practice page once its chart is read.
 #[test]
@@ -312,9 +313,11 @@ fn takeover_restarts_no_clock_and_plays_no_tone() {
         let dir = listed();
         flow(&dir, |rig, f| {
             f.prepared();
-            let tones = rig.audio.control.failure_probe();
+            let probe = rig.audio.control.failure_probe();
             let sent = rig.render.decisions_sent();
             let mut d = choose(rig, &f.pick(practice), 3);
+            // The choice's start moves the probe.
+            assert_eq!(probe.system_starts(audio::SystemKind::Decide), 1);
             let origin = d.origin();
             assert!(wait_until(|| skins_after(&f.seen, 0) > 0));
             until_clock(rig, TimeUs(origin.0 + refused_ms * MS));
@@ -340,7 +343,12 @@ fn takeover_restarts_no_clock_and_plays_no_tone() {
             assert!(wait_until(|| f.seen.len() > from + 2));
             assert_eq!(skins_after(&f.seen, from), 0);
             assert_eq!(sent(), 1, "a presentation sent again");
-            assert_eq!(tones.tone_requests(), 1, "a second tone");
+            assert_eq!(
+                probe.system_starts(audio::SystemKind::Decide),
+                1,
+                "a second decision sound"
+            );
+            assert_eq!(probe.tone_requests(), 0, "a tone request");
             if refused_ms == 1_000 {
                 let at = |us| TimeUs(origin.0 + us);
                 assert_eq!(
