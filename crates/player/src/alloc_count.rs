@@ -43,6 +43,9 @@ thread_local! {
     /// This thread's allocations, for the allocation tests.
     #[cfg(test)]
     static MINE: Cell<u64> = const { Cell::new(0) };
+    /// This thread's frees, for the allocation tests.
+    #[cfg(test)]
+    static FREED: Cell<u64> = const { Cell::new(0) };
 }
 
 /// Counts this thread's allocations under `t` from now on.
@@ -90,6 +93,12 @@ pub fn this_thread() -> u64 {
     MINE.with(Cell::get)
 }
 
+/// This thread's frees so far, whatever its tag.
+#[cfg(test)]
+pub fn this_thread_frees() -> u64 {
+    FREED.with(Cell::get)
+}
+
 fn note() {
     #[cfg(test)]
     let _ = MINE.try_with(|m| m.set(m.get() + 1));
@@ -122,6 +131,8 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        #[cfg(test)]
+        let _ = FREED.try_with(|f| f.set(f.get() + 1));
         // SAFETY: same contract as the caller's.
         unsafe { System.dealloc(ptr, layout) }
     }

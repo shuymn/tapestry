@@ -13,8 +13,8 @@
 //!
 //! The average consumes every offset recorded since the element last read
 //! the ring, in order, that is still in the ring (the source applies only
-//! the newest a frame): `ema += trunc(α · (v − ema))` for each one strictly
-//! inside the BAD window.
+//! the newest a frame): `ema += α · (v − ema)` for each one strictly
+//! inside the BAD window, kept unrounded.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -62,9 +62,9 @@ pub struct HitErrorDef {
     pub band_colors: bool,
     pub ema_mode: EmaMode,
     /// The average's weight of each new offset: any finite value, as the
-    /// source takes any (`ema += (long)(alpha · (v − ema))`, Java's
-    /// arithmetic, so a weight outside 0 to 1 overshoots or wraps as the
-    /// source's does).
+    /// source takes any (`ema += alpha · (v − ema)`, so a weight outside 0
+    /// to 1 overshoots, the average held within ±2^53 ms, an infinite
+    /// weight's step at that bound).
     pub alpha: f32,
     pub line: Rgba8,
     pub center: Rgba8,
@@ -111,7 +111,7 @@ pub(crate) struct HitError {
 #[derive(Clone, Debug)]
 pub(crate) struct HitErrorState {
     def: HitErrorDef,
-    ema: i64,
+    ema: f64,
     seen: u32,
     composed: Option<u32>,
     runs: Vec<Run>,
@@ -132,7 +132,7 @@ impl HitErrorState {
         let fills = def.window + 2 + 2 * def.half() + 1;
         Self {
             def,
-            ema: 0,
+            ema: 0.0,
             seen: 0,
             composed: None,
             runs: Vec::with_capacity(room(def.quads())),
@@ -145,7 +145,7 @@ impl HitErrorState {
 
     /// Starts over as [`new`](Self::new) does, keeping the buffers.
     pub(crate) fn reset(&mut self) {
-        self.ema = 0;
+        self.ema = 0.0;
         self.seen = 0;
         self.composed = None;
         self.runs.clear();
@@ -172,9 +172,8 @@ impl HitErrorState {
         let [bad_lo, bad_hi] = areas.get(3).copied().unwrap_or([0; 2]).map(i64::from);
         if self.def.ema_mode != EmaMode::Off {
             for v in offsets.since(self.seen) {
-                let v = i64::from(v);
-                if bad_lo < v && v < bad_hi {
-                    self.ema = ema_step(self.ema, v, self.def.alpha);
+                if bad_lo < i64::from(v) && i64::from(v) < bad_hi {
+                    self.ema = ema_step(self.ema, f64::from(v), self.def.alpha);
                 }
             }
         }
@@ -192,6 +191,21 @@ impl HitErrorState {
         let jw = i64::from(d.judge_width);
         let w = i64::from(d.width);
         (w - i64::from(d.line_width)) / 2 + (-v.clamp(-jw, jw) * w) / (2 * jw + 1)
+    }
+
+    /// The x of the average `ema`, as [`x_of`](Self::x_of) places an
+    /// offset: its scaled distance truncated toward 0. Within ±`jw` the
+    /// quotient is within ±`w`, so the cast is exact.
+    fn x_of_ema(&self, ema: f64) -> i64 {
+        let d = &self.def;
+        let jw = f64::from(d.judge_width);
+        let w = f64::from(d.width);
+        #[expect(
+            clippy::cast_possible_truncation,
+            reason = "a quotient within ±w, truncated toward 0"
+        )]
+        let off = ((-ema.clamp(-jw, jw) * w) / (2.0 * jw + 1.0)).trunc() as i64;
+        (i64::from(d.width) - i64::from(d.line_width)) / 2 + off
     }
 
     /// The pixmap's fills in paint order, composed per column into `runs`.
@@ -243,10 +257,7 @@ impl HitErrorState {
         let center = (i64::from(w) - i64::from(lw)) / 2;
         push(&mut self.fills, center, lw, 0, rows, d.center.unit());
         if d.ema_mode != EmaMode::Off {
-            // `Long.intValue()`: the low 32 bits.
-            #[expect(clippy::cast_possible_truncation, reason = "Java's intValue")]
-            let ema = i64::from(self.ema as i32);
-            let x = self.x_of(ema);
+            let x = self.x_of_ema(self.ema);
             let color = d.ema.unit();
             if matches!(d.ema_mode, EmaMode::Line | EmaMode::Both) {
                 push(&mut self.fills, x, lw, 0, rows, color);
@@ -292,19 +303,22 @@ impl HitErrorState {
     }
 }
 
-/// The source's average step, `ema + (long)(alpha * (value - ema))`, with
-/// Java's semantics for every weight it accepts: the `long` difference and
-/// sum wrap, the difference widens to `float` rounding to nearest, and the
-/// cast saturates (NaN to 0), as Rust's `as` does. So no weight, however
-/// large or negative, overflows.
-pub(crate) fn ema_step(ema: i64, value: i64, alpha: f32) -> i64 {
-    #[expect(
-        clippy::cast_precision_loss,
-        clippy::cast_possible_truncation,
-        reason = "the source's float weight and long cast"
-    )]
-    let step = (alpha * value.wrapping_sub(ema) as f32) as i64;
-    ema.wrapping_add(step)
+/// The farthest the average goes from 0, in ms (2^53): a weight outside 0
+/// to 1 can push it past any offset, and this keeps every step finite.
+pub(crate) const EMA_BOUND: f64 = 9_007_199_254_740_992.0;
+
+/// One step of the average, `ema + alpha · (value − ema)`, unrounded and
+/// held within ±[`EMA_BOUND`]. With `|ema|` at most 2^53 and `alpha` a
+/// finite `f32`, the product is finite; an infinite weight's step is
+/// infinite and held at the bound, and a step that is no number (an
+/// infinite weight times no difference) leaves the average as it was.
+pub(crate) fn ema_step(ema: f64, value: f64, alpha: f32) -> f64 {
+    let next = ema + f64::from(alpha) * (value - ema);
+    if next.is_nan() {
+        ema
+    } else {
+        next.clamp(-EMA_BOUND, EMA_BOUND)
+    }
 }
 
 /// What one hit-error visualizer's frame reads besides its element's.
@@ -334,5 +348,32 @@ impl HitError {
             pivot: super::judge_graph::drawn_pivot(region, None, brush.pivot),
         };
         r.draw(d.state.runs(), u32::MAX, brush, f, self.solid.filter, out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{EMA_BOUND, ema_step};
+
+    /// The bound is 2^53 ms either way: 1.5 · 2^52 (weight 2^40 after
+    /// 6 144) is kept as it is, 3 · 2^52 (weight 2^41) is held at 2^53, and
+    /// a step from 2^53 to `2^53 + 1e20 · (−2 − 2^53)` at −2^53.
+    #[test]
+    fn the_average_is_held_at_two_to_the_53() {
+        let two_52 = 4_503_599_627_370_496.0;
+        assert_eq!(EMA_BOUND, 2.0 * two_52);
+        assert_eq!(ema_step(0.0, 6_144.0, 1_099_511_627_776.0), 1.5 * two_52);
+        assert_eq!(ema_step(0.0, 6_144.0, 2_199_023_255_552.0), 2.0 * two_52);
+        assert_eq!(ema_step(0.0, 1.0, 1e20), 2.0 * two_52);
+        assert_eq!(ema_step(2.0 * two_52, -2.0, 1e20), -2.0 * two_52);
+    }
+
+    /// An infinite weight's step is held at the bound; one that is no
+    /// number (an infinite weight times no difference) keeps the average.
+    #[test]
+    fn an_infinite_weight_is_held_and_no_number_keeps_the_average() {
+        assert_eq!(ema_step(0.0, 40.0, f32::INFINITY), EMA_BOUND);
+        assert_eq!(ema_step(0.0, -40.0, f32::INFINITY), -EMA_BOUND);
+        assert_eq!(ema_step(5.0, 5.0, f32::INFINITY), 5.0);
     }
 }

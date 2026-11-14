@@ -1470,6 +1470,10 @@ struct Shared {
     /// The decision faults fired so far (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     decision_faults_fired: AtomicU64,
+    /// A refused decision frame waits here after its present was sampled,
+    /// before its refusal is reported, while a test holds it (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    decision_cleanup_gate: Arc<TestGate>,
     /// The decision labels' work waits here at a frame boundary with work
     /// to do, while a test holds it (tests).
     #[cfg(test)]
@@ -1624,6 +1628,8 @@ impl Shared {
             decision_faults: Mutex::new(None),
             #[cfg(all(test, feature = "dev-tools"))]
             decision_faults_fired: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            decision_cleanup_gate: Arc::default(),
             #[cfg(test)]
             label_gate: Arc::default(),
             #[cfg(all(test, feature = "dev-tools"))]
@@ -3051,6 +3057,21 @@ impl RenderLink {
         self.shared.loading_drawn.load(Ordering::Relaxed)
     }
 
+    /// What reads, from any thread, the stage the current loading
+    /// lifetime last reported (tests); `None` without one.
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn loading_stage(&self) -> impl Fn() -> Option<Stage> + Send + Sync + use<> {
+        let shared = Arc::clone(&self.shared);
+        move || {
+            let lifetime = shared.loading_slot().lifetime;
+            shared
+                .producer()
+                .as_ref()
+                .filter(|s| s.lifetime() == lifetime)
+                .map(LifetimeState::stage)
+        }
+    }
+
     /// The current loading lifetime: after [`begin_loading`](Self::begin_loading),
     /// the one it began.
     pub fn loading_lifetime(&self) -> u64 {
@@ -3264,13 +3285,7 @@ impl RenderLink {
         lifetime: u64,
     ) -> Option<(usize, render::Gen, skin_model::DecisionTiming)> {
         let mut book = render::lock(&self.shared.labels);
-        // The slot the pin takes: the first ready one of that revision.
-        let (slot, generation) = (0..render::LABEL_SLOTS).find_map(|i| match book.state(i) {
-            Some(render::LabelState::Ready {
-                generation, key, ..
-            }) if key.chart == chart && key.revision == revision => Some((i, *generation)),
-            _ => None,
-        })?;
+        let (slot, generation) = ready_slot(&book, chart, revision)?;
         if !crate::decision_side::prepared_holds(&self.shared.prepared, slot, generation, strings) {
             return None;
         }
@@ -3293,13 +3308,8 @@ impl RenderLink {
         if !book.healthy() {
             return false;
         }
-        (0..render::LABEL_SLOTS).any(|i| match book.state(i) {
-            Some(render::LabelState::Ready {
-                generation, key, ..
-            }) if key.chart == chart && key.revision == revision => {
-                crate::decision_side::prepared_holds(&self.shared.prepared, i, *generation, strings)
-            }
-            _ => false,
+        ready_slot(&book, chart, revision).is_some_and(|(slot, generation)| {
+            crate::decision_side::prepared_holds(&self.shared.prepared, slot, generation, strings)
         })
     }
 
@@ -3319,6 +3329,13 @@ impl RenderLink {
     pub fn decision_faults_fired(&self) -> impl Fn() -> u64 + Send + Sync + 'static {
         let shared = Arc::clone(&self.shared);
         move || shared.decision_faults_fired.load(Ordering::SeqCst)
+    }
+
+    /// The gate a refused decision frame waits at between its present and
+    /// its refusal's report (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn decision_cleanup_gate(&self) -> Arc<TestGate> {
+        Arc::clone(&self.shared.decision_cleanup_gate)
     }
 
     /// The decision labels' readiness asked so far, read from any thread
@@ -3601,6 +3618,24 @@ impl crate::result_present::Publish for RenderLink {
     fn origin(&self) -> Option<TimeUs> {
         self.presented_origin()
     }
+}
+
+/// The slot [`LabelBook::pin`](render::LabelBook::pin) takes for `chart`'s
+/// labels of `revision` in `book`: the first ready one holding them, and
+/// its generation. The choice ([`RenderLink::pin_decision`]) and its
+/// readiness ([`RenderLink::decision_ready`]) check the prepared strings on
+/// this slot, so both answer for the same one.
+fn ready_slot(
+    book: &render::LabelBook,
+    chart: &std::path::Path,
+    revision: u64,
+) -> Option<(usize, render::Gen)> {
+    (0..render::LABEL_SLOTS).find_map(|i| match book.state(i) {
+        Some(render::LabelState::Ready {
+            generation, key, ..
+        }) if key.chart == chart && key.revision == revision => Some((i, *generation)),
+        _ => None,
+    })
 }
 
 /// A chart's load the render thread was asked for ([`RenderLink::begin_load`]).
@@ -6788,6 +6823,19 @@ impl Run {
                     screen.end(&self.end_page.1).map(|p| (timing_of(p), None))
                 }
             };
+            // A decision frame's present: right after its draw returned,
+            // before a refusal's report and takeover (dev-tools: matched
+            // against a capture's time since the choice).
+            #[cfg(feature = "dev-tools")]
+            if decision_as.is_some() && presented_at.is_none() {
+                presented_at = Some(self.clock.now());
+            }
+            // A test holds a refused decision frame here, its present
+            // sampled, before the refusal is reported (tests).
+            #[cfg(all(test, feature = "dev-tools"))]
+            if decision_refused.is_some() {
+                self.shared.decision_cleanup_gate.pass();
+            }
             // A result or end frame lost as a device loss (dev-tools: a
             // recovery while a result shows).
             #[cfg(feature = "dev-tools")]
@@ -14749,7 +14797,7 @@ pub(crate) mod tests {
         /// Each restore that installed, with its kind, in order.
         restored: Arc<std::sync::Mutex<Vec<(ScreenKind, render::Installation)>>>,
         /// Restores of this kind are refused as on a healthy device.
-        refuse_restore: Arc<std::sync::Mutex<Option<ScreenKind>>>,
+        pub(crate) refuse_restore: Arc<std::sync::Mutex<Option<ScreenKind>>>,
         /// Restores of this kind fail as a lost surface.
         fail_restore: Arc<std::sync::Mutex<Option<ScreenKind>>>,
         /// Each loading frame's device, lifetime and origin.
@@ -17016,7 +17064,10 @@ pub(crate) mod tests {
     /// Fails the installers' screen and builds it again through the render
     /// thread's own recovery (a preparation of the chart): what the new
     /// screen's build answers.
-    fn rebuild(screens: &Installers, link: &super::RenderLink) -> Result<(), ScreenError> {
+    pub(crate) fn rebuild(
+        screens: &Installers,
+        link: &super::RenderLink,
+    ) -> Result<(), ScreenError> {
         screens.fail.store(true, Ordering::Release);
         link.send(RenderMsg::Menu(Box::default()));
         assert!(wait_until(|| link.failed()));

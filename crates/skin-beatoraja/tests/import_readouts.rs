@@ -266,6 +266,41 @@ fn lift_1000_hides_hs_numbers_keeps_whites() {
     assert_eq!(&r[7..], ["200", "1000", "300", "0", "", "", "", "", ""]);
 }
 
+/// 316 is the configured lane cover over the lane above the lift the
+/// lanes draw: 500 and 250 stored, it reads 500, as 14 does, while LIFT
+/// is off and `⌊750 · 500 / 1 000⌋` = 375 while it is on, whatever
+/// SUDDEN+'s switch.
+#[test]
+fn number_316_follows_the_lift_drawn() {
+    let loaded = numbers_of(&[
+        ("cov", r#""ref": 14"#, 4, false),
+        ("abs", r#""ref": 316"#, 4, false),
+    ]);
+    let mut d = Drawn::over(loaded.ok().skin.clone(), &chart());
+    for (ms, sudden, lift, want) in [
+        (0, false, false, ["500", "500"]),
+        (16, true, false, ["500", "500"]),
+        (32, false, true, ["500", "375"]),
+        (48, true, true, ["500", "375"]),
+    ] {
+        d.view.cover = if sudden { 500 } else { 0 };
+        d.view.lift = if lift { 250 } else { 0 };
+        d.readouts = Some(FrameReadouts {
+            covers: CoverSettings {
+                cover_enabled: sudden,
+                lift_enabled: lift,
+                ..KNOWN.covers
+            },
+            ..KNOWN
+        });
+        assert_eq!(
+            rows_of(&mut d, ms, 2),
+            want,
+            "SUDDEN+ {sudden}, LIFT {lift}"
+        );
+    }
+}
+
 /// 502.5 ms: 312 rounds it half up to 503, 313 takes the source's order,
 /// ⌊3 · 503 / 5⌋ = 301, and 1313 the green number half up from the exact
 /// ratio, 301.5 → 302 (design.md "Play readouts").
@@ -303,7 +338,7 @@ fn readouts_show_their_fields() {
     #[rustfmt::skip]
     let at_start = [
         "300", "75", "150", "0", "00", "2", "05",
-        "500", "250", "120", "375", "105", "1", "05", "668", "400",
+        "500", "250", "120", "500", "105", "1", "05", "668", "400",
     ];
     assert_eq!(rows(&mut d, 0), at_start);
     // At 61.5 s: 61 s played, 63.5 s left, shown as 64.
@@ -320,7 +355,7 @@ fn readouts_show_their_fields() {
     #[rustfmt::skip]
     let unknown = [
         "", "", "", "0", "00", "2", "05",
-        "500", "250", "120", "375", "", "", "", "", "",
+        "500", "250", "120", "500", "", "", "", "", "",
     ];
     assert_eq!(rows(&mut d, 0), unknown);
     // A duration without a hi-speed: the duration draws, the hi-speed not.

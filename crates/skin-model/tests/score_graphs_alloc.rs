@@ -637,16 +637,24 @@ fn ema_inputs(at: &str) -> Vec<i64> {
     }
 }
 
-/// The average after `values` at weight 0.1, by the source's arithmetic,
-/// over the BAD window (−150, 150).
-fn ema_of(values: &[i64]) -> i64 {
-    let mut ema = 0_i64;
+/// The average after `values` at weight 0.1, unrounded, over the BAD
+/// window (−150, 150).
+fn ema_of(values: &[i64]) -> f64 {
+    let mut ema = 0.0_f64;
     for &v in values {
         if -150 < v && v < 150 {
-            ema = ema.wrapping_add((0.1_f32 * v.wrapping_sub(ema) as f32) as i64);
+            ema += f64::from(0.1_f32) * (v as f64 - ema);
         }
     }
     ema
+}
+
+/// The texel of the average `ema` over `w` texels at judge width `jw`,
+/// lines `lw` wide: the centre less its scaled distance, truncated toward
+/// 0.
+fn ema_texel(ema: f64, w: i64, jw: i64, lw: i64) -> i64 {
+    let (wf, jwf) = (w as f64, jw as f64);
+    (w - lw) / 2 + ((-ema.clamp(-jwf, jwf) * wf) / (2.0 * jwf + 1.0)).trunc() as i64
 }
 
 /// Skin C's hit-error output: the newest line in its band's colour at the
@@ -658,8 +666,7 @@ fn hit_error_output(h: &Harness, atlas: &Atlas, at: &str) {
         graph_support::composite(h.batch.quads(), atlas, x as f32, (100.0 + row) as f32, None)
     };
     let green = [0.0, 255.0, 0.0];
-    let ema = i64::from(ema_of(&ema_inputs(at)) as i32);
-    let ema_x = hit_x(ema);
+    let ema_x = ema_texel(ema_of(&ema_inputs(at)), 4_096, 1_000, 4);
     let ring: Vec<i64> = (0..h.ring_count.min(100))
         .map(|age| {
             let slot = (h.ring_count - 1 - age) % 100;
@@ -899,7 +906,7 @@ fn skin_d() {
         // its tip (its first row 0.4 px tall: 100 rows over 40 px), and the
         // newest line white.
         let x_of = |v: i64| 149 + (-v.clamp(-150, 150) * 300) / 301;
-        let ema_x = x_of(i64::from(ema_of(&ema_inputs(at)) as i32));
+        let ema_x = ema_texel(ema_of(&ema_inputs(at)), 300, 150, 2);
         near(px(ema_x as f32 + 0.5, 319.5), [0.0, 255.0, 0.0]);
         near(px((ema_x + 1 - 4) as f32 + 0.5, 280.2), [0.0, 255.0, 0.0]);
         if h.ring_count > 0 {

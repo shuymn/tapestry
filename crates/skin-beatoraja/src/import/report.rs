@@ -270,8 +270,8 @@ pub enum NoteKind {
     Stretch(i32),
     /// An offset the play sets at run time.
     RuntimeOffset(i32),
-    /// An alpha offset on animated colour, or of mixed sign; HIDDEN+'s
-    /// offset 5 is one (−255 while HIDDEN+ is off).
+    /// An alpha offset on animated colour; HIDDEN+'s offset 5 is one (−255
+    /// while HIDDEN+ is off).
     OffsetAlpha,
     Track(TrackWhy),
     Timer(TimerWhy),
@@ -302,6 +302,10 @@ pub enum NoteKind {
     Ignored {
         field: &'static str,
     },
+    /// Blend 3 (subtract), drawn additive as the source draws its quads.
+    SubtractBlend,
+    /// A Lua skin's `op` that is not a table, read as no condition.
+    ScalarOp,
     /// A note part array the lanes cannot be built from.
     NotePart {
         field: &'static str,
@@ -385,7 +389,9 @@ impl fmt::Display for NoteKind {
             Self::Blend(b) => write!(f, "an unsupported blend {b}"),
             Self::Stretch(s) => write!(f, "an unsupported stretch {s}"),
             Self::RuntimeOffset(id) => write!(f, "a run-time offset {id}"),
-            Self::OffsetAlpha => f.write_str("an alpha offset (HIDDEN+'s offset 5 among them) on animated colour or of mixed sign"),
+            Self::OffsetAlpha => {
+                f.write_str("an alpha offset (HIDDEN+'s offset 5 among them) on animated colour")
+            }
             Self::Track(why) => write!(f, "an unsupported track ({why:?})"),
             Self::Timer(why) => write!(f, "an unsupported timer ({why:?})"),
             Self::Deviation(d) => write!(f, "deviation {d:?}"),
@@ -397,6 +403,8 @@ impl fmt::Display for NoteKind {
             Self::SourceRect => f.write_str("a mirrored or out-of-file source rectangle"),
             Self::BitmapFont(e) => write!(f, "a bitmap font refused ({e})"),
             Self::Ignored { field } => write!(f, "`{field}` ignored"),
+            Self::SubtractBlend => f.write_str("blend 3 drawn additive"),
+            Self::ScalarOp => f.write_str("a Lua `op` that is not a table, read as no condition"),
             Self::NotePart { field, why } => write!(f, "note part `{field}`: {why}"),
             Self::ColourClamped => f.write_str("a colour channel outside 0 to 255, clamped"),
             Self::OutroClamped { declared_ms } => write!(

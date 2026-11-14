@@ -397,9 +397,9 @@ impl SkinFeed {
         self.seen = None;
     }
 
-    /// The lifetime and revision of the update published last
-    /// (dev-tools: a selection capture is armed with it).
-    #[cfg(feature = "dev-tools")]
+    /// The lifetime and revision of the update published last: a look
+    /// tells by it whether it published a page (and, in dev-tools, a
+    /// selection capture is armed with it).
     #[must_use]
     pub const fn published(&self) -> (u64, u64) {
         (self.lifetime, self.revision)
@@ -1069,9 +1069,10 @@ mod tests {
             );
             assert_eq!(s.covers_on, [covers.sudden.on, true, covers.hidden.on]);
             assert_eq!(s.display_offset_ms, -12);
-            // 53 % plays as the f32 0.53, which the source shows as 52.
+            // 53 % plays as the f32 0.529 999 97, shown as its whole
+            // percent rounded half up: 53.
             assert_eq!(s.system_volume, VolumeReading::of_gain(0.53));
-            assert_eq!(s.system_volume.number, 52);
+            assert_eq!(s.system_volume.number, 53);
             // The key and background volumes, each its own (20 % and 99 %).
             assert_eq!(s.key_volume, VolumeReading::of_gain(0.2));
             assert_eq!(s.background_volume, VolumeReading::of_gain(0.99));

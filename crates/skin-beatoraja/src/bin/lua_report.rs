@@ -790,7 +790,7 @@ mod tests {
     }
 
     /// A play skin's report prints its declared ending as read: the
-    /// margin in ms, the fade-out with its sign.
+    /// margin and the fade-out in ms, a negative fade-out read as 0.
     #[test]
     fn a_play_skins_report_prints_its_ending() {
         let d = tempfile::tempdir().unwrap();
@@ -814,7 +814,7 @@ mod tests {
         );
         let out = report(0, &s);
         assert!(
-            out.contains("\n  ending: finishmargin 3000 ms, fadeout -250 ms\n"),
+            out.contains("\n  ending: finishmargin 3000 ms, fadeout 0 ms\n"),
             "{out}"
         );
     }

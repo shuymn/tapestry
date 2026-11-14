@@ -16,16 +16,30 @@ use skin_model::present::num::to_float;
 use skin_model::present::{Arith, Conv, Insn, OutTy, Val};
 use skin_model::{
     CoverImage, CoverMotion, CoverPaintDef, CoverTrim, ElementDef, LoadError, MAX_SLIDE, PLAY,
-    Place, Quad, Scope, Skin, Slider, SliderDirection, SliderRate, Source, Ty, WidgetDefs, compile,
+    Place, Quad, Ratio, Scope, Skin, Slider, SliderDirection, SliderRate, Source, Ty, WidgetDefs,
+    compile,
 };
 use widget_support::{element, harness};
 
 /// The paint's rect: x 100, y 500, 20×20.
 const AT: [i32; 4] = [100, 500, 20, 20];
 
+/// A paint of image 0 moved by callback `k`'s value times `range` whole
+/// reference pixels toward `direction`.
+fn paint(k: u16, range: u32, direction: SliderDirection) -> CoverPaintDef {
+    exact_paint(
+        k,
+        Ratio {
+            numerator: u64::from(range),
+            denominator: 1,
+        },
+        direction,
+    )
+}
+
 /// A paint of image 0 moved by callback `k`'s value times `range` toward
 /// `direction`.
-fn paint(k: u16, range: u32, direction: SliderDirection) -> CoverPaintDef {
+fn exact_paint(k: u16, range: Ratio, direction: SliderDirection) -> CoverPaintDef {
     CoverPaintDef {
         image: CoverImage::Image(0),
         slider: Some(Slider {
@@ -146,6 +160,32 @@ fn no_value_is_not_drawn() {
     let code = vec![Insn::Read { dst: 0, read: 0 }, Insn::Ret { src: 0 }];
     let r = read("combo", Ty::Int, Some("false"));
     assert_eq!(y(Cb::code(code, Vec::new(), vec![r], Conv::Float)), None);
+}
+
+/// The y of a down slider of `n / d` moved by `value`, `None` when not
+/// drawn.
+fn exact_y(n: u64, d: u64, value: f64) -> Option<f32> {
+    let mut b = Builder::default();
+    let k = b.push(float(value));
+    let range = Ratio {
+        numerator: n,
+        denominator: d,
+    };
+    let s = skin(b, vec![exact_paint(k, range, SliderDirection::Down)]).unwrap();
+    let mut h = harness(s);
+    h.frame(1_000, &[]);
+    h.batch.quads().first().map(|q| q.rect[1])
+}
+
+#[test]
+fn a_fractional_range_moves_the_paint_exactly() {
+    // 15/2 · ±1/2 = ±3.75: not a floored 7's 3.5 nor the numerator's 7.5.
+    assert_eq!(exact_y(15, 2, 0.5), Some(503.75));
+    assert_eq!(exact_y(15, 2, -0.5), Some(496.25));
+    // The bound applies after the division: 1/2 of 1.5 · 2^40 is drawn,
+    // 1/2 of 2.5 · 2^40 is past it.
+    assert!(exact_y(1, 2, MAX_SLIDE * 1.5).is_some());
+    assert_eq!(exact_y(1, 2, MAX_SLIDE * 2.5), None);
 }
 
 #[test]

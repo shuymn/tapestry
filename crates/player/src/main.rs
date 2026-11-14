@@ -64,8 +64,10 @@ mod select;
 mod selection;
 mod selection_skin;
 mod shelf;
+mod sound_sets_disk;
 mod start_gate;
 mod state_clock;
+mod system_sounds;
 mod tuning;
 mod turntable;
 mod ui_text;
@@ -293,14 +295,14 @@ fn measure_select(clock: QpcClock) -> anyhow::Result<()> {
     // The game's side of the pairing, beside the capture.
     let log = dir.join(format!("{stamp}.select.presents.txt"));
     let text: String = measured.presents.iter().map(|t| format!("{t}\n")).collect();
-    std::fs::write(&log, text).with_context(|| log.display().to_string())?;
+    write_fresh(&log, &text)?;
     // The capture on the game's clock: present, displayed (or -1).
     let pm = dir.join(format!("{stamp}.select.capture.txt"));
     let text: String = frames
         .iter()
         .map(|f| format!("{} {}\n", f.present_us, f.display_us.unwrap_or(-1)))
         .collect();
-    std::fs::write(&pm, text).with_context(|| pm.display().to_string())?;
+    write_fresh(&pm, &text)?;
     for s in &measured.screens {
         let span = dev::screen_span(s.presents, &measured.presents);
         let counted = s.period_ns.map(|period| {
@@ -312,6 +314,16 @@ fn measure_select(clock: QpcClock) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Writes `text` to a new file at `path` in the data root, never through
+/// a link there ([`game::create_fresh`]).
+#[cfg(feature = "dev-tools")]
+fn write_fresh(path: &Path, text: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    game::create_fresh(path)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .with_context(|| path.display().to_string())
 }
 
 /// `tapestry measure play [--perfect] <chart>` (dev-tools): one play
@@ -1010,6 +1022,10 @@ fn rig<'a>(
         opening_gates: std::sync::Arc::default(),
         #[cfg(test)]
         ended_plays: Vec::new(),
+        system_sounds: None,
+        system_notices: Arc::default(),
+        #[cfg(test)]
+        system_polls_in_play: 0,
     };
     install_adjustments(&mut rig, settings)
         .context("the adjustment controls cannot be installed")?;
@@ -1019,7 +1035,52 @@ fn rig<'a>(
     if let Some(game) = controls.game_thread() {
         rig.render.set_game_wake(Arc::new(move || game.unpark()));
     }
+    // Last, so no later step of the rig fails with the worker started; the
+    // startup pick is admitted here, on both launch paths.
+    rig.system_sounds = Some(system_sounds(
+        root,
+        settings,
+        &mut rig.audio,
+        &rig.system_notices,
+    ));
     Ok(rig)
+}
+
+/// The run's system sounds (design.md "Audio", system sounds): their
+/// worker started and the startup pick admitted, decoded at the output's
+/// rate. Each line they name for the player is logged and kept in
+/// `notices` for selection's notice line; each line only for the log is
+/// logged.
+fn system_sounds(
+    root: &DataRoot,
+    settings: &Settings,
+    audio: &mut audio_side::AudioLink,
+    notices: &Arc<std::sync::Mutex<Vec<String>>>,
+) -> system_sounds::SystemSounds {
+    #[cfg_attr(not(test), expect(unused_mut, reason = "a test arms the setup"))]
+    let mut setup =
+        system_sounds::Setup::new(root.clone(), settings.player.sounds.clone(), audio.rate);
+    let theirs = Arc::clone(notices);
+    #[cfg_attr(not(test), expect(unused_mut, reason = "a test arms the hooks"))]
+    let mut hooks = system_sounds::Hooks {
+        say: Box::new(move |line| {
+            println!("{line}");
+            log::warn!("{line}");
+            theirs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(line.to_owned());
+        }),
+        log: Box::new(|line| {
+            println!("{line}");
+            log::info!("{line}");
+        }),
+        clock: Arc::new(system_sounds::RealClock),
+        spawn: system_sounds::spawn_worker,
+    };
+    #[cfg(test)]
+    system_sounds::take_armed(&mut setup, &mut hooks);
+    system_sounds::SystemSounds::new(&mut audio.control, setup, hooks)
 }
 
 /// Opens the window, then starts the input thread, and checks that the
@@ -1769,8 +1830,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             rig.result_skin = crate::result_skin::ResultSkin::new(started.result)
                 .with_scripts(rig.render.scripts().clone());
             rig.result_skin.set_wake(rig.controls.game_thread());
+            // What the system sounds named so far (a quarantined set, the
+            // latch) joins the skins' notices.
+            let mut notices: Vec<String> = started.notice.into_iter().collect();
+            notices.extend(rig.receive_system_sounds());
             if let Some(sel) = &mut rig.selection {
-                sel.started(started.notice, started.selection);
+                sel.started(notices, started.selection);
             }
             (true, None)
         }
@@ -2287,15 +2352,34 @@ mod tests {
     /// only) at the background volume, and the decision tone at the system
     /// volume, each read from what the real output recorded. The audio
     /// thread is held at its gate while the test acts, and each phase ends
-    /// when the output has written enough frames after it, so no phase
-    /// depends on how long a thread sleeps; the wall clock only bounds a
-    /// stalled audio thread.
+    /// when the output has written enough frames after it, and the first
+    /// after the frame its sounds start on, so no phase depends on how long
+    /// a thread sleeps; the wall clock only bounds a stalled audio thread.
     #[cfg(feature = "dev-tools")]
     #[test]
     fn sync_sends_each_volume_to_the_audio_thread() {
+        sends_each_volume(std::time::Duration::ZERO);
+    }
+
+    /// [`sync_sends_each_volume_to_the_audio_thread`] with the audio thread
+    /// behind the clock when the play starts: the play's chart time 0 falls
+    /// on a frame many periods after those written, and the first phase
+    /// still records its volumes there.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn sync_sends_each_volume_to_a_late_audio_thread() {
+        sends_each_volume(std::time::Duration::from_millis(200));
+    }
+
+    /// The volume test, the audio thread held for `late` (wall clock) just
+    /// before the play starts, so its output lags the clock by that much.
+    #[cfg(feature = "dev-tools")]
+    fn sends_each_volume(late: std::time::Duration) {
         use std::sync::Mutex;
         use std::time::{Duration, Instant};
         const SECONDS: usize = 20;
+        // `recording_output`'s period.
+        const PERIOD: u64 = 480;
         let settings = game::Settings {
             device: game::DeviceSettings {
                 system_volume: 0.45,
@@ -2360,26 +2444,52 @@ mod tests {
                     }
                 };
                 // Acts with the audio thread held at its gate, then lets it
-                // write `frames` past where it stopped: a step that began
-                // after the action took its volumes, and at least one whole
-                // block was mixed with them.
-                let phase = |rig: &mut crate::play::PlayerRig<'_>,
-                             act: &dyn Fn(&mut crate::play::PlayerRig<'_>),
-                             frames: u64| {
+                // write `frames` past where it stopped and past the frame
+                // `sounding` gives, read two periods after the release. The
+                // gate sits after a step's control messages, so the step it
+                // lets go mixes without the action and a later step takes
+                // it: at least `frames` less the released step's frames are
+                // mixed with what the action sent.
+                let phase =
+                    |rig: &mut crate::play::PlayerRig<'_>,
+                     act: &dyn Fn(&mut crate::play::PlayerRig<'_>),
+                     frames: u64,
+                     sounding: &dyn Fn(&crate::play::PlayerRig<'_>) -> u64| {
+                        gate.hold();
+                        until(&|| gate.stopped());
+                        act(rig);
+                        let from = written(rig);
+                        gate.release();
+                        until(&|| written(rig) >= from + 2 * PERIOD);
+                        let from = from.max(sounding(rig));
+                        until(&|| written(rig) >= from + frames);
+                    };
+                // A late audio thread: held at its gate while the clock runs
+                // on, and kept held through the play's start until the first
+                // phase lets it go, so it cannot catch up before the play
+                // starts.
+                if !late.is_zero() {
                     gate.hold();
                     until(&|| gate.stopped());
-                    act(rig);
-                    let from = written(rig);
-                    gate.release();
-                    until(&|| written(rig) >= from + frames);
-                };
-                // The play starts now: its sounds start at its chart time 0.
+                    std::thread::sleep(late);
+                }
+                // The play starts now: its sounds start at its chart time 0,
+                // on the frame its frame line puts it, which an audio thread
+                // behind the clock puts past the frames it has written.
                 use bms_model::TimeSource as _;
                 let now = input.clock.now();
                 let (_sink, queue) = game::audio_link_at(8, now);
                 rig.audio.control.play(now, queue).unwrap();
-                let blocks = 4 * 480;
-                phase(rig, &|rig| rig.sync(), blocks);
+                // The frame where the play's chart time 0 falls, from the
+                // frame line at the play's own `now`.
+                let starts = |rig: &crate::play::PlayerRig<'_>| {
+                    let line = rig.audio.control.counters().frame_line(now);
+                    u64::try_from(line.frame(bms_model::TimeUs(0))).unwrap_or(0)
+                };
+                let blocks = 4 * PERIOD;
+                phase(rig, &|rig| rig.sync(), blocks, &starts);
+                // The sounds play through every later phase.
+                let sounding = |_: &crate::play::PlayerRig<'_>| 0;
                 phase(
                     rig,
                     &|rig| {
@@ -2387,9 +2497,15 @@ mod tests {
                         rig.sync();
                     },
                     blocks,
+                    &sounding,
                 );
                 // The tone lasts 0.6 s.
-                phase(rig, &|rig| rig.audio.control.play_tone(), 48_000 * 7 / 10);
+                phase(
+                    rig,
+                    &|rig| rig.audio.control.play_tone(),
+                    48_000 * 7 / 10,
+                    &sounding,
+                );
             },
         );
         let samples = recorded.lock().unwrap().clone();

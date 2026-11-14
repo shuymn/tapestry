@@ -41,22 +41,21 @@ pub enum Converted {
 /// One thing a frame's build did.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Event {
-    /// Callback `k` invoked: its `call` (2 for a timer's second), its raw
-    /// result and its conversion.
+    /// Callback `k` invoked: its raw result and its conversion.
     Ran {
         k: u16,
-        call: u8,
         result: Result<Val, Fail>,
         conv: Converted,
     },
-    /// Timer callback `k` after its invocations: whether it was on, the
-    /// second invocation's start, the elapsed ms before the cap, and the
-    /// start installed in the play's timers (`None` while off).
+    /// Timer callback `k` after its invocation: whether it was on, its
+    /// start, the elapsed µs before the cap, and the start installed in the
+    /// play's timers (`None` while off or while the start is after the
+    /// state clock).
     Timer {
         k: u16,
         on: bool,
         start: Option<i64>,
-        elapsed_ms: Option<i64>,
+        elapsed_us: Option<i64>,
         installed: Option<TimeUs>,
     },
     /// Callback `k` not invoked.

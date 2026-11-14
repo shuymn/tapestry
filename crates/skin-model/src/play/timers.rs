@@ -64,34 +64,21 @@ fn judged_targets(tally: &Tally, empty_poor_counted: bool) -> Option<u64> {
     )
 }
 
-/// The source's 7-key point of `t` over `targets`
-/// (`ScoreDataProperty.java:76-79` at `0.8.9`), with Java's intermediate
-/// widths: 0 with no target, else
-/// `(int)((150000L·PG + (int)(100000·GR) + (int)(20000·GD)) / N)
-/// + (int)(50000L·M / N)`, the last `+` wrapping, `M` the maximum combo.
-/// The `long` sum is below 2^50 and `50000 · M` below 2^47, so neither
-/// overflows `i64`.
-#[expect(
-    clippy::cast_possible_truncation,
-    reason = "Java's `(int)` of a `long`: its low 32 bits"
-)]
+/// The 7-key point of `t` over `targets`: 0 with no target, else
+/// `⌊(150 000·PG + 100 000·GR + 20 000·GD) / N⌋ + ⌊50 000·M / N⌋`,
+/// `M` the maximum combo, computed exactly and saturated to the field's
+/// `i32`. The sum is below 2^51 and `50 000 · M` below 2^48, so neither
+/// overflows `u64`; nor does their total.
 fn point(t: &Tally, targets: u32) -> i32 {
-    // The source's `int` counts; a count past `i32` never comes from a
-    // chart within the parser's caps.
-    let int = |n: u32| i32::try_from(n).unwrap_or(i32::MAX);
-    let n = i64::from(int(targets));
-    if n <= 0 {
+    let n = u64::from(targets);
+    if n == 0 {
         return 0;
     }
     let c = &t.counts;
-    // `(long)150000 * PG + 100000 * GR + 20000 * GD`: the GREAT and GOOD
-    // products are `int`s, wrapping, then widened.
-    let sum = 150_000 * i64::from(int(c.perfect))
-        + i64::from(100_000_i32.wrapping_mul(int(c.great)))
-        + i64::from(20_000_i32.wrapping_mul(int(c.good)));
-    // Each `(int)` keeps the low 32 bits of a quotient truncated toward 0.
-    let low = |v: i64| v as i32;
-    low(sum / n).wrapping_add(low(50_000 * i64::from(int(t.max_combo)) / n))
+    let sum =
+        150_000 * u64::from(c.perfect) + 100_000 * u64::from(c.great) + 20_000 * u64::from(c.good);
+    let point = sum / n + 50_000 * u64::from(t.max_combo) / n;
+    i32::try_from(point).unwrap_or(i32::MAX)
 }
 
 /// The attempt's score data (`ScoreDataProperty` at `0.8.9`) as a frame
@@ -321,8 +308,9 @@ struct Readouts {
 }
 
 /// The cover fields of one frame, `field::COVER_PERMILLE` to
-/// `field::COVER_ADJUSTING`: the stored settings, a play's and a loading
-/// frame's alike.
+/// `field::COVER_ADJUSTING`: the stored settings and the lane cover over
+/// the lane above the lift the lanes draw, a play's and a loading frame's
+/// alike.
 #[derive(Clone, Copy)]
 pub(crate) struct Covers {
     pub(crate) cover: i32,
@@ -356,18 +344,26 @@ pub(crate) fn covers(lanes: &LaneView, c: &CoverSettings) -> Option<Covers> {
     {
         return None;
     }
-    let (cover, lift) = (i32::from(c.cover), i32::from(c.lift));
     Some(Covers {
-        cover,
-        lift,
+        cover: i32::from(c.cover),
+        lift: i32::from(c.lift),
         hidden: i32::from(c.hidden),
-        // Both at most 1 000, so the product fits.
-        absolute: (COVER_PERMILLE - lift) * cover / COVER_PERMILLE,
+        absolute: i32::from(over_lane(lanes.lift, c.cover)),
         cover_enabled: i32::from(c.cover_enabled),
         lift_enabled: i32::from(c.lift_enabled),
         hidden_enabled: i32::from(c.hidden_enabled),
         adjusting: i32::from(c.adjusting),
     })
+}
+
+/// `v` ‰ of the lane above a lift of `lift` ‰, as ‰ of the whole lane:
+/// `⌊(1 000 − l) · v / 1 000⌋` for `l` the lift capped at 1 000, so SUDDEN+'s
+/// and HIDDEN+'s white numbers and `cover.absolute_permille` agree. `v` is
+/// at most 1 000 (checked by every caller), so the product fits and the
+/// result is at most 1 000.
+fn over_lane(lift: u16, v: u16) -> u16 {
+    let left = 1_000 - u32::from(lift.min(1_000));
+    u16::try_from(left * u32::from(v) / 1_000).unwrap_or(0)
 }
 
 /// Reads every timer at `now` from `starts` into `ms`: the built-in ones,
@@ -670,9 +666,7 @@ pub fn native_values(lanes: &LaneView, r: &FrameReadouts) -> Result<NativeValues
         let (num, den) = (u128::from(g.num()), u128::from(g.den()));
         u32::try_from((200 * num + den) / (2 * den)).ok()
     });
-    // Each product is at most 1 000 · 1 000.
-    let left = 1_000 - u32::from(lanes.lift.min(1_000));
-    let white = |v: u16| u16::try_from(left * u32::from(v) / 1_000).unwrap_or(0);
+    let white = |v: u16| over_lane(lanes.lift, v);
     Ok(NativeValues {
         hispeed_x100,
         duration,

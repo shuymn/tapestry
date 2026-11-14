@@ -15,16 +15,14 @@
 //! source's number draws nothing for those (`SkinNumber.java:139-143` at
 //! `0.8.9`). No heap, no recursion, no indexing.
 //!
-//! A timer callback ([`Conv::Timer`]) runs as the source's timer property
-//! (`SkinObject.java:350-357`, `TimerProperty.java:8-10`,
-//! `SkinLuaAccessor.java:736-747`): once, its result `tolong()`, a Lua
-//! error the off value; off, or no value, and its timer is off; on, and it
-//! runs again, the second result its start, never checked for off. Its
-//! elapsed ms is `state_us / 1000 - start / 1000`; negative, the timer is
-//! off (the source's `starttime > time`); otherwise it is capped at
-//! [`MAX_ELAPSED_MS`] and the timer's start placed that far before the
-//! frame's chart time, so the element's track ages by it. Its outputs are
-//! whether it was on, and 1 once it ran.
+//! A timer callback ([`Conv::Timer`]) runs once a frame, its result
+//! `tolong()` (`SkinLuaAccessor.java:736-747` at `0.8.9`): off, a Lua
+//! error or no value, and its timer is off; any other value is its start
+//! on the state clock, in µs. Its age is `state_us - start` (saturating);
+//! negative, the element is not drawn; otherwise it is capped at
+//! [`MAX_KEY_US`] and the timer's start placed that far before the frame's
+//! chart time, so the element's track ages by it. Its outputs are whether
+//! it was on, and 1 once it ran.
 //!
 //! Slots are loaded and stored in the bank in place: the compiler emits a
 //! callback's stores together at its end, after every value they store is
@@ -35,7 +33,8 @@
 
 use super::num;
 use super::{Bank, CallbackDef, Clock, Conv, Fail, Insn, MAX_REGISTERS, Present, ReadDef, Val};
-use crate::expr::{MAX_ELAPSED_MS, State};
+use crate::MAX_KEY_US;
+use crate::expr::State;
 use crate::schema::Ty;
 use bms_model::TimeUs;
 
@@ -132,7 +131,6 @@ impl Present {
                 #[cfg(feature = "dev-tools")]
                 super::trace::record(|| super::trace::Event::Ran {
                     k: id,
-                    call: 1,
                     result: r,
                     conv: if cb.conv == Conv::Truthy {
                         super::trace::Converted::Bool(out.0 != 0)
@@ -154,53 +152,37 @@ impl Present {
         }
     }
 
-    /// Timer callback `cb`'s two invocations: `None` when the first gave
-    /// off or no value; otherwise `Some` of its start against the frame,
-    /// `None` within when the second gave no value or the elapsed time is
-    /// negative.
+    /// Timer callback `cb`'s one invocation: `None` when it gave off, a
+    /// Lua error or no value; otherwise `Some` of its start against the
+    /// frame, `None` within while that start is after the state clock.
     fn timer(
         &self,
         cb: &CallbackDef,
         io: &mut Io<'_, '_>,
         #[cfg(feature = "dev-tools")] k: u16,
     ) -> Option<Option<TimeUs>> {
-        let call = |n: u8, io: &mut Io<'_, '_>| {
-            let r = self.invoke(cb, io.state, io.clock, io.bank);
-            let v = start_of(r);
-            #[cfg(feature = "dev-tools")]
-            super::trace::record(|| super::trace::Event::Ran {
-                k,
-                call: n,
-                result: r,
-                conv: super::trace::Converted::Long(v),
-            });
-            #[cfg(not(feature = "dev-tools"))]
-            let _ = n;
-            v
-        };
-        let first = call(1, io);
-        let out = match first {
-            None => None,
-            Some(i64::MIN) => None,
-            Some(_) => match call(2, io) {
-                None => Some((None, None)),
-                Some(start) => Some((Some(start), Some(elapsed_ms(io.clock.state_us, start)))),
-            },
-        };
-        let installed = out.and_then(|(_, elapsed)| {
-            let elapsed = elapsed.filter(|&e| e >= 0)?;
-            let us = elapsed.min(i64::from(MAX_ELAPSED_MS)).saturating_mul(1_000);
-            Some(TimeUs(io.clock.now.0.saturating_sub(us)))
+        let r = self.invoke(cb, io.state, io.clock, io.bank);
+        let v = start_of(r);
+        #[cfg(feature = "dev-tools")]
+        super::trace::record(|| super::trace::Event::Ran {
+            k,
+            result: r,
+            conv: super::trace::Converted::Long(v),
         });
+        let start = v.filter(|&s| s != i64::MIN);
+        let elapsed = start.map(|s| io.clock.state_us.saturating_sub(s));
+        let installed = elapsed
+            .filter(|&e| e >= 0)
+            .map(|e| TimeUs(io.clock.now.0.saturating_sub(e.min(MAX_KEY_US))));
         #[cfg(feature = "dev-tools")]
         super::trace::record(|| super::trace::Event::Timer {
             k,
-            on: out.is_some(),
-            start: out.and_then(|(s, _)| s),
-            elapsed_ms: out.and_then(|(_, e)| e),
+            on: start.is_some(),
+            start,
+            elapsed_us: elapsed,
             installed,
         });
-        out.map(|_| installed)
+        start.map(|_| installed)
     }
 
     /// Why `cb` does not run this frame, if it does not: the callback it
@@ -327,18 +309,9 @@ impl Held {
     }
 }
 
-/// A program timer's elapsed ms at the state clock `state_us` from its
-/// start `start` (µs): `state_us / 1000 - start / 1000`, the source's two
-/// `long` divisions, each truncating toward zero (`TimerProperty.java:8-10`,
-/// `SkinObject.java:353-357` at `0.8.9`).
-#[must_use]
-pub fn elapsed_ms(state_us: i64, start: i64) -> i64 {
-    (state_us / 1_000).saturating_sub(start / 1_000)
-}
-
-/// A timer invocation's result as the source's `tolong()` gives it, a
-/// Lua error the off value (`SkinLuaAccessor.java:740-745`); `None` for
-/// no value.
+/// A timer invocation's result as `tolong()` gives it, a Lua error the
+/// off value (`SkinLuaAccessor.java:740-745` at `0.8.9`); `None` for no
+/// value.
 fn start_of(r: Result<Val, Fail>) -> Option<i64> {
     match r {
         Ok(v) => Some(num::to_long(v)),

@@ -167,7 +167,7 @@ pub struct ResultScore {
     pub cleared: bool,
     /// `None` when the largest EX score is 0.
     pub rate: Option<ResultRate>,
-    /// The EX score to the next grade step, or to the largest.
+    /// The EX score to the next grade, or to the largest at the top grade.
     pub next_rank: u32,
     /// The mean absolute duration of the result's notes in µs, the
     /// source's penalized mean (numbers 372 and 373); `None` with no note.
@@ -228,8 +228,8 @@ pub struct BestFigures {
     /// The BP minus the best's.
     pub bp_diff: ResultNumber,
     pub clear: LampKey,
-    /// The best's max combo, of any counted play; hidden unless above 0,
-    /// as the source draws its old combo only then.
+    /// The best's max combo, of any counted play, 0 included; hidden
+    /// while no play counts for the best.
     pub max_combo: ResultNumber,
     /// The view's max combo minus it; hidden as `max_combo`.
     pub max_combo_diff: ResultNumber,

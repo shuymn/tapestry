@@ -509,7 +509,10 @@ fn the_progress_reads_zero_while_loading() {
     let slider = skin_model::CoverPaintDef {
         image: skin_model::CoverImage::Image(MARK),
         slider: Some(skin_model::Slider {
-            range: 400,
+            range: skin_model::Ratio {
+                numerator: 400,
+                denominator: 1,
+            },
             rate: skin_model::SliderRate::Progress,
             direction: skin_model::SliderDirection::Right,
         }),
@@ -1067,6 +1070,25 @@ fn a_refused_loading_state_builds_no_more() {
     l.loading = l.skin.prepare_loading(skin_model::Side::Left);
     assert_eq!(l.try_build_us(400 * MS), Ok(()));
     assert_eq!(l.count(BACKGROUND), 1);
+}
+
+/// While loading the lanes draw no lift, so the lane cover over the lane
+/// is the configured cover: 500 and 250 stored, both off, read 500.
+#[test]
+fn the_cover_over_the_lane_reads_the_lift_drawn_while_loading() {
+    let mut l = Loader::new(structural());
+    l.covers = CoverSettings {
+        cover: 500,
+        lift: 250,
+        hidden: 0,
+        cover_enabled: false,
+        lift_enabled: false,
+        hidden_enabled: false,
+        adjusting: false,
+    };
+    l.build(100);
+    assert_eq!(l.field(field::COVER_ABSOLUTE_PERMILLE), 500);
+    assert_eq!(l.field(field::LIFT_PERMILLE), 250);
 }
 
 /// A loading number draws nothing for `i32::MIN` and `i32::MAX`, as a

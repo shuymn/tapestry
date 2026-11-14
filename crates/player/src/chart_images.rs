@@ -343,10 +343,12 @@ fn fitted_from(fit: &Read, source: &Read) -> bool {
         }
 }
 
-/// An open file's identity: its volume's serial number and its file
-/// index (the NTFS file id), `None` when the system cannot give it.
+/// An open file's information from its handle, `None` when the system
+/// cannot give it.
 #[must_use]
-pub fn file_identity(file: &File) -> Option<FileIdentity> {
+pub fn file_information(
+    file: &File,
+) -> Option<windows::Win32::Storage::FileSystem::BY_HANDLE_FILE_INFORMATION> {
     use std::os::windows::io::AsRawHandle;
     use windows::Win32::Foundation::HANDLE;
     use windows::Win32::Storage::FileSystem::{
@@ -356,6 +358,14 @@ pub fn file_identity(file: &File) -> Option<FileIdentity> {
     // SAFETY: the handle is the open file's for the call's duration, and
     // `info` is a valid out-parameter of the call's type.
     unsafe { GetFileInformationByHandle(HANDLE(file.as_raw_handle()), &raw mut info) }.ok()?;
+    Some(info)
+}
+
+/// An open file's identity: its volume's serial number and its file
+/// index (the NTFS file id), `None` when the system cannot give it.
+#[must_use]
+pub fn file_identity(file: &File) -> Option<FileIdentity> {
+    let info = file_information(file)?;
     Some(FileIdentity(
         (u128::from(info.dwVolumeSerialNumber) << 64)
             | (u128::from(info.nFileIndexHigh) << 32)

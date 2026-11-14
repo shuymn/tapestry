@@ -1055,9 +1055,10 @@ fn defexrank_and_rank_4_scale_like_the_source() {
 /// Known difference (the preset module): `#DEFEXRANK n` scales every edge
 /// by `n × 75 / 100` % as it is. The source stores that percentage as an
 /// `int` (play/BMSPlayerRule.java:59-65, under a TODO), so it truncates it
-/// first: `#DEFEXRANK 1` is 0 % there, zero-width windows, and 0.75 % here
-/// (the keys' PERFECT ±150 µs, the scratch's ±225 µs); `#DEFEXRANK 101` is
-/// 75 % there (PERFECT ±15 ms) and 75.75 % here (±15.15 ms).
+/// first: `#DEFEXRANK 101` is 75 % there (PERFECT ±15 ms) and 75.75 % here
+/// (±15.15 ms). `#DEFEXRANK 1` is 0.75 % here (the keys' PERFECT ±150 µs,
+/// the scratch's ±225 µs); there its 0 becomes 100 % when the song data
+/// validates the chart again (song/SongData.java:150).
 #[test]
 fn defexrank_scales_by_its_exact_percentage() {
     let chart = scratch_and_key(Some(common::defexrank(1)));

@@ -136,11 +136,12 @@ pub enum RatioForm {
     /// (`skin/SkinGraph.java:98-106`).
     Bar { vertical: bool },
     /// The image moved `range` reference pixels times the ratio
-    /// (`skin/SkinSlider.java:117-119`); a press on its travel gives a
-    /// command when `changeable`.
+    /// (`skin/SkinSlider.java:117-119`), the range exact as a cover
+    /// paint's slider's ([`Slider`](crate::Slider)); a press on its travel
+    /// gives a command when `changeable`.
     Slider {
         direction: SliderDirection,
-        range: u32,
+        range: Ratio,
         changeable: bool,
     },
 }
@@ -166,7 +167,10 @@ pub(crate) struct RatioBar {
 pub enum RatioBarError {
     #[error("the ratio bar's image does not exist")]
     UnknownImage,
-    #[error("the slider's range is past the coordinate range")]
+    #[error(
+        "the slider's range is past the coordinate range or its denominator outside 1 to {}",
+        crate::MAX_RANGE_DENOMINATOR
+    )]
     Range,
 }
 
@@ -217,15 +221,20 @@ pub(crate) fn cut(
     (rect, FrameUv { uv, ..frame })
 }
 
-/// A slider's rect `[x, y, w, h]` moved by `f` of `range`.
+/// A slider's rect `[x, y, w, h]` moved by `f` of `range`, a checked
+/// range: `f · n`, at most 24 + 28 significant bits, is exact in `f64`,
+/// then divided by `d` and rounded to `f32`.
 pub(crate) fn slide(
     direction: SliderDirection,
-    range: u32,
+    range: Ratio,
     [x, y, w, h]: [f32; 4],
     f: f32,
 ) -> [f32; 4] {
-    #[expect(clippy::cast_precision_loss, reason = "a range within ±2^20 is exact")]
-    let d = range as f32 * f;
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a checked range's terms are at most 2^28, exact in f64"
+    )]
+    let d = f32_of(f64::from(f) * range.numerator as f64 / range.denominator as f64);
     match direction {
         SliderDirection::Up => [x, y - d, w, h],
         SliderDirection::Right => [x + d, y, w, h],

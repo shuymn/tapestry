@@ -306,6 +306,9 @@ fn a_cycle_through_another_spelling_is_found_by_identity() {
     }
 }
 
+/// Include names that leave the skin folder are refused in the header's
+/// `property` and in every object array the import reads with them, the
+/// four the source registers no serializer for among them.
 #[test]
 fn include_names_leaving_the_folder_are_refused() {
     let outer = tempfile::tempdir().unwrap();
@@ -320,6 +323,12 @@ fn include_names_leaving_the_folder_are_refused() {
         common::write(&root, "s.json", text.as_bytes());
         common::header_of(&root, "s.json")
     };
+    let imported = |field: &str, name: &str| {
+        let text = play(&format!(r#""{field}": [{{"include": {name:?}}}]"#));
+        common::write(&root, "s.json", text.as_bytes());
+        common::import_dir(&root).map(|_| ())
+    };
+    let arrays = ["bpmgraph", "hiddenCover", "liftCover", "pmchara"];
     for (name, want) in [
         (outside.to_str().unwrap(), "rejected"),
         ("/x.json", "rejected"),
@@ -333,29 +342,33 @@ fn include_names_leaving_the_folder_are_refused() {
         ("a/../../x.json", "underflow"),
         ("out/x.json", "escapes"),
     ] {
-        match (want, check(name)) {
-            (
-                "rejected",
-                Err(ImportError::Read {
-                    source: RootError::Rejected,
-                    ..
-                }),
-            )
-            | (
-                "underflow",
-                Err(ImportError::Read {
-                    source: RootError::Underflow,
-                    ..
-                }),
-            )
-            | (
-                "escapes",
-                Err(ImportError::Read {
-                    source: RootError::Escapes,
-                    ..
-                }),
-            ) => {}
-            (_, other) => panic!("{name}: {other:?}"),
+        let mut results = vec![("property", check(name).map(|_| ()))];
+        results.extend(arrays.map(|f| (f, imported(f, name))));
+        for (field, r) in results {
+            match (want, r) {
+                (
+                    "rejected",
+                    Err(ImportError::Read {
+                        source: RootError::Rejected,
+                        ..
+                    }),
+                )
+                | (
+                    "underflow",
+                    Err(ImportError::Read {
+                        source: RootError::Underflow,
+                        ..
+                    }),
+                )
+                | (
+                    "escapes",
+                    Err(ImportError::Read {
+                        source: RootError::Escapes,
+                        ..
+                    }),
+                ) => {}
+                (_, other) => panic!("{field} {name}: {other:?}"),
+            }
         }
     }
     assert_eq!(names(&check("loop/in.json").unwrap()), ["in"]);
@@ -363,6 +376,15 @@ fn include_names_leaving_the_folder_are_refused() {
         check("*.json"),
         Err(ImportError::IncludeWildcard { .. })
     ));
+    for field in arrays {
+        assert!(
+            matches!(
+                imported(field, "*.json"),
+                Err(ImportError::IncludeWildcard { .. })
+            ),
+            "{field}"
+        );
+    }
 }
 
 /// Opening a FIFO with no writer blocks: the include must be refused from

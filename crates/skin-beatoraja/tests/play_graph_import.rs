@@ -262,8 +262,8 @@ fn a_visualizer_past_its_caps_drops_with_a_note() {
     }
 }
 
-/// A hit-error visualizer's average weight that is not finite is the
-/// finite weight that steps alike: the skin imports with no note.
+/// A hit-error visualizer's average weight that is not finite imports
+/// with no note.
 #[test]
 fn an_infinite_average_weight_imports() {
     let (_d, skin, report) = json(
@@ -271,12 +271,11 @@ fn an_infinite_average_weight_imports() {
         r#"{"id": "he", "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#,
     );
     assert_eq!(notes(&report), []);
-    // The step of +40 saturates, `(long) (∞ · 40)`, to `Long.MAX_VALUE`;
-    // the average's line reads its low 32 bits (`intValue`), −1, so it is
-    // at column `150 + 1 = 151`.
+    // The step of +40, `∞ · 40`, holds the average at +2^53 ms, drawn at
+    // the judge width's early edge: column `150 − 150 = 0`.
     let q = visualized(skin, &[40]);
     let y = middle(&q);
-    assert_eq!(top(&q, 100.0 + 151.5, y), Some(rgba(0xff00_00ff)));
+    assert_eq!(top(&q, 100.0 + 0.5, y), Some(rgba(0xff00_00ff)));
 }
 
 /// 150 BPM, 300 from 1 s; notes at 0.1 to 0.5 s (five at 150, so MAIN)
@@ -433,16 +432,22 @@ fn a_null_colour_is_noted() {
     assert_eq!(top(&q, 100.0 + 25.5, y), Some(rgba(0xff00_00ff)));
 }
 
-/// C31: a Lua string `alpha` is LuaJ's `tofloat()`: `"18446744073709551616"`
-/// scans as a wrapping `long`, 0, so the average stays at 0, its line on
-/// the centre's column 150 (drawn after the centre); `" 0.5 "` is 0.5, the
-/// average `⌊0.5 · 40⌋ = 20`, its line at 130. The same JSON string is
-/// `Float.parseFloat`, about 1.8e19: the step saturates to `Long.MAX_VALUE`,
-/// whose low 32 bits are −1, the line at 151.
+/// C31: a Lua string `alpha` is read as a numeral, none 0:
+/// `"18446744073709551616"` is about 1.8e19, so the step holds the average
+/// at +2^53 ms and the line at the judge width's early edge, column 0, as
+/// the same JSON string does; `" 0.5 "` and `"\t0.5"` are 0.5, the average
+/// `0.5 · 40 = 20`, its line at 130; `"0x["` is none, 0, so the average
+/// stays at 0, its line on the centre's column 150 (drawn after the
+/// centre).
 #[test]
-fn a_lua_alpha_string_is_luaj_s_float() {
+fn a_lua_alpha_string_is_a_numeral() {
     let dst = "{ id = \"he\", dst = { { x = 100, y = 800, w = 301, h = 60 } } }";
-    for (alpha, column) in [("18446744073709551616", 150.5), (" 0.5 ", 130.5)] {
+    for (alpha, column) in [
+        ("18446744073709551616", 0.5),
+        (" 0.5 ", 130.5),
+        ("\\t0.5", 130.5),
+        ("0x[", 150.5),
+    ] {
         let (_d, skin, report) = lua(
             &format!("skin.hiterrorvisualizer = {{ {{ id = \"he\", alpha = \"{alpha}\" }} }}"),
             dst,
@@ -460,17 +465,18 @@ fn a_lua_alpha_string_is_luaj_s_float() {
         r#"{"id": "he", "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#,
     );
     let q = visualized(skin, &[40]);
-    assert_eq!(top(&q, 100.0 + 151.5, middle(&q)), Some(rgba(0xff00_00ff)));
+    assert_eq!(top(&q, 100.0 + 0.5, middle(&q)), Some(rgba(0xff00_00ff)));
 }
 
-/// C31: a JSON string `alpha` is Java's `Float.parseFloat`: `0.5f`,
-/// `0x1p-1` and ` 0.5D ` are all 0.5, so the average after +40 ms is
-/// `⌊0.5 · 40⌋ = 20`, its line at `150 − 20 = 130`; `0.5ff` is no float,
-/// and the import refuses the field as the source's skin fails.
+/// C31: a JSON string `alpha` is a decimal numeral: `0.5` and ` 0.5 ` are
+/// 0.5, so the average after +40 ms is `0.5 · 40 = 20`, its line at
+/// `150 − 20 = 130`; a suffix, a hexadecimal float, `NaN`, `Infinity`, a
+/// control character and `0.5ff` are no numeral, and the import refuses
+/// the field, as it refuses any other string that is no number.
 #[test]
-fn a_json_alpha_string_is_java_s_float() {
+fn a_json_alpha_string_is_a_decimal_numeral() {
     let dst = r#"{"id": "he", "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#;
-    for alpha in ["0.5f", "0x1p-1", " 0.5D "] {
+    for alpha in ["0.5", " 0.5 "] {
         let (_d, skin, report) = json(
             &format!(r#""hiterrorvisualizer": [{{"id": "he", "alpha": "{alpha}"}}],"#),
             dst,
@@ -483,20 +489,30 @@ fn a_json_alpha_string_is_java_s_float() {
             "{alpha}"
         );
     }
-    let l = import_sized(
-        [1_920, 1_080],
-        &format!(
-            r#""hiterrorvisualizer": [{{"id": "he", "alpha": "0.5ff"}}], "destination": [{dst}]"#
-        ),
-        &[],
-    );
-    assert!(
-        matches!(
-            l.err(),
-            skin_beatoraja::ImportError::Type { field: "alpha", .. }
-        ),
-        "0.5ff"
-    );
+    for alpha in [
+        "0.5f",
+        " 0.5D ",
+        "0x1p-1",
+        "NaN",
+        "Infinity",
+        "\\u0001 0.5",
+        "0.5ff",
+    ] {
+        let l = import_sized(
+            [1_920, 1_080],
+            &format!(
+                r#""hiterrorvisualizer": [{{"id": "he", "alpha": "{alpha}"}}], "destination": [{dst}]"#
+            ),
+            &[],
+        );
+        assert!(
+            matches!(
+                l.err(),
+                skin_beatoraja::ImportError::Type { field: "alpha", .. }
+            ),
+            "{alpha}"
+        );
+    }
 }
 
 /// A BPM graph's `filter` is noted and ignored: the source draws a scaled
@@ -539,12 +555,10 @@ fn a_bpm_graph_notes_its_filter_and_keeps_hard_edges() {
 }
 
 /// C33: a timing visualizer following HIDDEN+ (offset 5) over lanes: with
-/// HIDDEN+ on both its band and its lines draw; with HIDDEN+ off the source
-/// sets its destination's alpha to 0, which hides the band, while the
-/// lines, in their own colour and alpha, still draw: the line of +40 ms in
-/// `00FF00` and no band colour.
+/// HIDDEN+ on both its band and its lines draw (the line of +40 ms in
+/// `00FF00`); with HIDDEN+ off it is skipped whole, neither drawing.
 #[test]
-fn a_timing_visualizer_s_lines_outlast_hidden_plus() {
+fn a_timing_visualizer_hides_whole_with_hidden_plus_off() {
     let l = common::lanes::with(
         r#""timingvisualizer": [{"id": "tv"}]"#,
         &[r#"{"id": "tv", "offset": 5, "dst": [{"x": 500, "y": 1000, "w": 301, "h": 20}]}"#],
@@ -574,7 +588,7 @@ fn a_timing_visualizer_s_lines_outlast_hidden_plus() {
     assert!(band(&on) && line(&on));
     let off = frame(false);
     assert!(
-        !band(&off) && line(&off),
+        !band(&off) && !line(&off),
         "HIDDEN+ off: {:?}",
         colours(&off)
     );
@@ -628,32 +642,68 @@ fn a_notes_graph_is_type_0_revealed_over_500_ms() {
     }
 }
 
-/// C31: a timing visualizer's colours as the source reads them. A checked
-/// colour must be hex digits only, so `#00ff00` draws red with a note
-/// (`colorStringValidation`); the empty POOR colour is read by
-/// `Color.valueOf` alone, so `#20304080` is `20304080`; with `transparent`
-/// 1 that band is clear, whatever its colour.
+/// The visualizers' colours read as the result graphs': an optional `#`,
+/// then exactly 6 or 8 hex digits, else opaque red with a note, the empty
+/// POOR band's included; with `transparent` 1 that band is clear, whatever
+/// its colour. Each string is a timing visualizer's line and POOR colour,
+/// drawn by its line at +40 ms and its band at texel 25, and a hit-error
+/// visualizer's line and POOR colour, read by its notes.
 #[test]
-fn timing_visualizer_colours_follow_the_source_s_two_readings() {
-    let dst = r#"{"id": "tv", "dst": [{"x": 100, "y": 1000, "w": 301, "h": 20}]}"#;
-    let (_d, skin, report) = json(
-        r##""timingvisualizer": [{"id": "tv", "lineColor": "#00ff00", "PRColor": "#20304080"}],"##,
-        dst,
-    );
-    assert_eq!(
-        notes(&report),
-        [(
-            Severity::Fallback,
-            NoteKind::InvalidColour { field: "lineColor" }
-        )]
-    );
-    let q = visualized(skin, &[40]);
-    let y = middle(&q);
-    assert_eq!(top(&q, 100.0 + 25.5, y), Some(rgba(0x2030_4080)));
-    assert_eq!(top(&q, 100.0 + 190.5, y), Some(rgba(0xff00_00ff)));
+fn visualizer_colours_read_as_the_graphs_do() {
+    let red = Some(0xff00_00ff);
+    for (s, want) in [
+        ("\"123\"", red),
+        ("\"#123\"", red),
+        ("\"20ff40\"", Some(0x20ff_40ff)),
+        ("\"#20ff40\"", Some(0x20ff_40ff)),
+        ("\"20ff408\"", red),
+        ("\"#20ff408\"", red),
+        ("\"20ff4080\"", Some(0x20ff_4080)),
+        ("\"#20ff4080\"", Some(0x20ff_4080)),
+        ("\"20ff4080aa\"", red),
+        ("\"+10000\"", red),
+        ("\"-10000\"", red),
+        ("\"#+10000\"", red),
+        ("\"+10000ff\"", red),
+        ("\"20ff4g\"", red),
+        ("\"\"", red),
+        ("null", red),
+    ] {
+        let invalid = want == red;
+        let (_d, skin, report) = json(
+            &format!(r#""timingvisualizer": [{{"id": "tv", "lineColor": {s}, "PRColor": {s}}}],"#),
+            r#"{"id": "tv", "dst": [{"x": 100, "y": 1000, "w": 301, "h": 20}]}"#,
+        );
+        let expected: &[_] = if invalid {
+            &[
+                (
+                    Severity::Fallback,
+                    NoteKind::InvalidColour { field: "lineColor" },
+                ),
+                (
+                    Severity::Fallback,
+                    NoteKind::InvalidColour { field: "PRColor" },
+                ),
+            ]
+        } else {
+            &[]
+        };
+        assert_eq!(notes(&report), expected, "timing {s}");
+        let q = visualized(skin, &[40]);
+        let y = middle(&q);
+        assert_eq!(top(&q, 100.0 + 190.5, y), want.map(rgba), "line {s}");
+        assert_eq!(top(&q, 100.0 + 25.5, y), want.map(rgba), "POOR {s}");
+        let (_d, _, report) = json(
+            &format!(
+                r#""hiterrorvisualizer": [{{"id": "he", "lineColor": {s}, "PRColor": {s}}}],"#
+            ),
+            r#"{"id": "he", "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#,
+        );
+        assert_eq!(notes(&report), expected, "hit error {s}");
+    }
     let (_d, skin, report) = json(
         r#""timingvisualizer": [{"id": "tv", "transparent": 1, "PRColor": "zz"}],"#,
-        dst,
+        r#"{"id": "tv", "dst": [{"x": 100, "y": 1000, "w": 301, "h": 20}]}"#,
     );
     assert_eq!(notes(&report), []);
     let q = visualized(skin, &[40]);
@@ -664,7 +714,7 @@ fn timing_visualizer_colours_follow_the_source_s_two_readings() {
 
 /// C31: a hit-error visualizer's `hiterrorMode` 0 draws no line, and its
 /// `alpha` is a float in JSON, as a string, and in Lua: 0.5 steps the
-/// average by `⌊0.5 · 40⌋ = 20`, its line at `150 − 20 = 130`.
+/// average by `0.5 · 40 = 20`, its line at `150 − 20 = 130`.
 #[test]
 fn hit_error_lines_and_weight_read_as_the_source() {
     let dst = r#"{"id": "he", "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#;

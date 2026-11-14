@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use audio::{
     AudioEngine, Channel, GenId, RecordingOutput, SYSTEM_VOICES, SimConfig, SimDevice, Sound,
-    SoundBank, SoundCmd, SystemGeneration, SystemKind, SystemVoices,
+    SoundBank, SoundCmd, SystemGeneration, SystemKind, SystemStart, SystemVoices,
 };
 use bms_model::TimeUs;
 use system_rig::{RATE, Rig, constant, mix};
@@ -510,4 +510,406 @@ fn decide_resolves_against_the_generation_it_plays_from() {
     rig.apply(&mut voices, 10);
     assert_eq!(voices.sounding(), 1);
     assert_eq!(level(&mut voices), b_level);
+}
+
+/// The volume the reserved-voice tests mix at: 32 ramps and four more
+/// voices stay far below full scale, so no sample is clamped.
+const PART_VOLUME: f32 = 1.0 / 64.0;
+
+/// A ramp from `-amplitude` up to `amplitude` every `period` frames, a
+/// second long: a voice restarted or moved changes its samples.
+fn ramp(amplitude: i16, period: i16) -> Arc<Sound> {
+    let step = 2 * i32::from(amplitude) / i32::from(period);
+    Arc::new(Sound::mono(
+        (0..48_000)
+            .map(|i| i16::try_from(i % i32::from(period) * step - i32::from(amplitude)).unwrap())
+            .collect(),
+    ))
+}
+
+/// Generation `id` with a ramp for `scratch` and each reserved kind but
+/// `decide`, each of its own shape.
+fn reserved_kit(id: u64) -> SystemGeneration {
+    generation(
+        id,
+        &[
+            (SystemKind::Scratch, ramp(1_500, 3_000)),
+            (SystemKind::Select, ramp(4_000, 1_000)),
+            (SystemKind::Clear, ramp(3_000, 700)),
+            (SystemKind::Fail, ramp(2_000, 900)),
+        ],
+    )
+}
+
+/// Voices with `g` installed at 1, and the last number used.
+fn installed(g: SystemGeneration) -> (SystemVoices, Rig, u64) {
+    let mut voices = SystemVoices::new(RATE);
+    let mut rig = Rig::new();
+    rig.install(1, g);
+    rig.apply(&mut voices, 1);
+    (voices, rig, 1)
+}
+
+/// Fills the one-shot part with `scratch` starts at 32 phases, each
+/// followed by three frames.
+fn fill(voices: &mut SystemVoices, rig: &mut Rig, seq: &mut u64) {
+    for _ in 0..SYSTEM_VOICES {
+        *seq += 1;
+        rig.start(*seq, SystemKind::Scratch);
+        rig.apply(voices, *seq);
+        mix(voices, 3, PART_VOLUME);
+    }
+}
+
+/// `start` numbered after `seq`, applied in a step of its own.
+fn step(voices: &mut SystemVoices, rig: &mut Rig, seq: &mut u64, start: SystemStart) {
+    *seq += 1;
+    rig.push(SystemStart { seq: *seq, ..start });
+    rig.apply(voices, *seq);
+}
+
+const fn once(kind: SystemKind) -> SystemStart {
+    SystemStart {
+        kind,
+        looped: false,
+        generation: None,
+        seq: 0,
+    }
+}
+
+const fn looping(kind: SystemKind, generation: u64) -> SystemStart {
+    SystemStart {
+        kind,
+        looped: true,
+        generation: Some(GenId(generation)),
+        seq: 0,
+    }
+}
+
+/// Whether two outputs are the same, bit for bit.
+fn same(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+}
+
+/// Whether `sum` is `a` plus `b`, sample for sample, to rounding.
+fn sums(sum: &[f32], a: &[f32], b: &[f32]) -> bool {
+    sum.len() == a.len()
+        && a.len() == b.len()
+        && sum
+            .iter()
+            .zip(a.iter().zip(b))
+            .all(|(s, (x, y))| (s - (x + y)).abs() < 1e-6)
+}
+
+/// S16: a loop kind's start takes its own reserved voice, so a burst that
+/// fills the one-shot part never refuses it, and the one-shots never take
+/// a reserved voice; a second start of a reserved kind while its voice
+/// sounds is dropped and counted, never restarting it, and a start above
+/// its kind's stop sounds; a loop waiting for its generation starts at the
+/// install whatever the one-shot part holds; and each part fills apart.
+#[test]
+fn a_one_shot_burst_never_refuses_a_loop() {
+    let full = || {
+        let (mut voices, mut rig, mut seq) = installed(reserved_kit(1));
+        fill(&mut voices, &mut rig, &mut seq);
+        (voices, rig, seq)
+    };
+    let with_select = || {
+        let (mut voices, mut rig, mut seq) = full();
+        step(
+            &mut voices,
+            &mut rig,
+            &mut seq,
+            looping(SystemKind::Select, 1),
+        );
+        (voices, rig, seq)
+    };
+
+    // The part full, then a looped `select`: it sounds, and the 32 sound
+    // on as they would without it.
+    let (mut voices, mut rig, mut seq) = with_select();
+    let (mut part, _, _) = full();
+    let (mut alone, mut alone_rig, mut alone_seq) = installed(reserved_kit(1));
+    step(
+        &mut alone,
+        &mut alone_rig,
+        &mut alone_seq,
+        looping(SystemKind::Select, 1),
+    );
+    assert_eq!(
+        (
+            voices.sounding(),
+            voices.reserved_sounding(),
+            voices.refused()
+        ),
+        (SYSTEM_VOICES + 1, 1, 0)
+    );
+    let both = mix(&mut voices, 480, PART_VOLUME);
+    let part = mix(&mut part, 480, PART_VOLUME);
+    let select = mix(&mut alone, 480, PART_VOLUME);
+    assert!(select.iter().any(|&x| x != 0.0));
+    assert!(sums(&both, &part, &select), "a voice changed");
+
+    // A 33rd `scratch`: refused and counted, `select` and the 32 unchanged.
+    let (mut burst, mut burst_rig, mut burst_seq) = with_select();
+    let (mut without, _, _) = with_select();
+    step(
+        &mut burst,
+        &mut burst_rig,
+        &mut burst_seq,
+        once(SystemKind::Scratch),
+    );
+    assert_eq!(burst.refused(), 1);
+    assert!(same(
+        &mix(&mut burst, 480, PART_VOLUME),
+        &mix(&mut without, 480, PART_VOLUME)
+    ));
+
+    // A looped `clear` and a `fail` that does not loop: both sound.
+    step(
+        &mut voices,
+        &mut rig,
+        &mut seq,
+        looping(SystemKind::Clear, 1),
+    );
+    step(&mut voices, &mut rig, &mut seq, once(SystemKind::Fail));
+    assert_eq!(
+        (
+            voices.sounding(),
+            voices.reserved_sounding(),
+            voices.refused()
+        ),
+        (SYSTEM_VOICES + 3, 3, 0)
+    );
+
+    // A second `select` while the first sounds: refused and counted, the
+    // first's samples unchanged.
+    let second = |again: bool| {
+        let (mut voices, mut rig, mut seq) = with_select();
+        mix(&mut voices, 480, PART_VOLUME);
+        if again {
+            step(
+                &mut voices,
+                &mut rig,
+                &mut seq,
+                looping(SystemKind::Select, 1),
+            );
+        }
+        (voices.refused(), mix(&mut voices, 2_400, PART_VOLUME))
+    };
+    let (refused, again) = second(true);
+    let (none, once_only) = second(false);
+    assert_eq!((refused, none), (1, 0));
+    assert!(same(&again, &once_only), "the sounding select changed");
+
+    // A stop of `select`, then a `select` above it, in one snapshot: the
+    // new one sounds, from its start.
+    let restarted = |stop: bool| {
+        let (mut voices, mut rig, seq) = with_select();
+        mix(&mut voices, 480, PART_VOLUME);
+        if stop {
+            rig.stop(seq + 1, SystemKind::Select);
+            rig.looped(seq + 2, SystemKind::Select, GenId(1));
+            rig.apply(&mut voices, seq + 2);
+        }
+        (
+            voices.refused(),
+            voices.reserved_sounding(),
+            mix(&mut voices, 480, PART_VOLUME),
+        )
+    };
+    let (refused, reserved, fresh) = restarted(true);
+    let (_, _, on) = restarted(false);
+    assert_eq!((refused, reserved), (0, 1));
+    assert!(!same(&fresh, &on), "the new select starts from its start");
+
+    // The waiting loop: the 32 sound from A, a `select` bound to B waits,
+    // and B's install starts it from B.
+    let (mut voices, mut rig, mut seq) = full();
+    step(
+        &mut voices,
+        &mut rig,
+        &mut seq,
+        looping(SystemKind::Select, 2),
+    );
+    assert!(voices.pending().is_some());
+    assert_eq!(voices.reserved_sounding(), 0);
+    seq += 1;
+    rig.install(seq, reserved_kit(2));
+    rig.apply(&mut voices, seq);
+    assert_eq!(
+        (voices.current(), voices.retired()),
+        (Some(GenId(2)), Some(GenId(1)))
+    );
+    assert!(voices.pending().is_none());
+    assert_eq!(
+        (voices.reserved_sounding(), voices.refused()),
+        (1, 0),
+        "the loop started at the install"
+    );
+
+    // Each part apart: with `select`, `clear` and `fail` sounding, 32
+    // `scratch` starts all sound and a 33rd is refused.
+    let (mut voices, mut rig, mut seq) = installed(reserved_kit(1));
+    step(
+        &mut voices,
+        &mut rig,
+        &mut seq,
+        looping(SystemKind::Select, 1),
+    );
+    step(
+        &mut voices,
+        &mut rig,
+        &mut seq,
+        looping(SystemKind::Clear, 1),
+    );
+    step(&mut voices, &mut rig, &mut seq, once(SystemKind::Fail));
+    fill(&mut voices, &mut rig, &mut seq);
+    assert_eq!(
+        (voices.sounding(), voices.refused()),
+        (SYSTEM_VOICES + 3, 0)
+    );
+    step(&mut voices, &mut rig, &mut seq, once(SystemKind::Scratch));
+    assert_eq!(voices.refused(), 1);
+}
+
+/// The decision sound's level and length in the reserved-voice test.
+const DECIDE_LEVEL: i16 = 9_830;
+const DECIDE_FRAMES: usize = 9_600;
+
+/// S16, S13: the decision sound takes its own reserved voice, so it sounds
+/// over a full one-shot part and beside the three loop kinds; a second one
+/// while it sounds is dropped and counted, never restarting it; one above
+/// its kind's stop sounds; and a decision that falls back to the tone takes
+/// no voice.
+#[test]
+fn decide_sounds_over_a_full_one_shot_part() {
+    let kit =
+        |id: u64| reserved_kit(id).with(SystemKind::Decide, constant(DECIDE_LEVEL, DECIDE_FRAMES));
+    let decide = f32::from(DECIDE_LEVEL) / 32_768.0;
+    let full = || {
+        let (mut voices, mut rig, mut seq) = installed(kit(1));
+        fill(&mut voices, &mut rig, &mut seq);
+        (voices, rig, seq)
+    };
+    let with_decide = || {
+        let (mut voices, mut rig, mut seq) = full();
+        step(&mut voices, &mut rig, &mut seq, once(SystemKind::Decide));
+        (voices, rig, seq)
+    };
+
+    // Over the full part: the output gains the decision sound's level at
+    // the volume, the 32 unchanged.
+    let (mut voices, _, _) = with_decide();
+    let (mut part, _, _) = full();
+    assert_eq!(
+        (voices.reserved_sounding(), voices.refused()),
+        (1, 0),
+        "the decision sound took its reserved voice"
+    );
+    let with = mix(&mut voices, 480, PART_VOLUME);
+    let without = mix(&mut part, 480, PART_VOLUME);
+    assert!(
+        with.iter()
+            .zip(&without)
+            .all(|(a, b)| (a - b - decide * PART_VOLUME).abs() < 1e-6),
+        "{} {}",
+        with[0],
+        without[0]
+    );
+
+    // A 33rd `scratch`: refused, the decision sound unchanged to its end.
+    let thirty_third = |start: bool| {
+        let (mut voices, mut rig, mut seq) = with_decide();
+        if start {
+            step(&mut voices, &mut rig, &mut seq, once(SystemKind::Scratch));
+        }
+        (voices.refused(), mix(&mut voices, DECIDE_FRAMES + 480, 1.0))
+    };
+    let (refused, with) = thirty_third(true);
+    let (none, without) = thirty_third(false);
+    assert_eq!((refused, none), (1, 0));
+    assert!(same(&with, &without));
+
+    // Beside `select`, `clear` and `fail`, over the full part: it sounds.
+    let (mut voices, mut rig, mut seq) = installed(kit(1));
+    step(
+        &mut voices,
+        &mut rig,
+        &mut seq,
+        looping(SystemKind::Select, 1),
+    );
+    step(
+        &mut voices,
+        &mut rig,
+        &mut seq,
+        looping(SystemKind::Clear, 1),
+    );
+    step(
+        &mut voices,
+        &mut rig,
+        &mut seq,
+        looping(SystemKind::Fail, 1),
+    );
+    fill(&mut voices, &mut rig, &mut seq);
+    step(&mut voices, &mut rig, &mut seq, once(SystemKind::Decide));
+    assert_eq!(
+        (
+            voices.sounding(),
+            voices.reserved_sounding(),
+            voices.refused()
+        ),
+        (SYSTEM_VOICES + 4, 4, 0)
+    );
+
+    // A second decision sound while the first sounds: refused and counted,
+    // the first ending where it would have.
+    let second = |again: bool| {
+        let (mut voices, mut rig, mut seq) = with_decide();
+        mix(&mut voices, 4_800, 1.0);
+        if again {
+            step(&mut voices, &mut rig, &mut seq, once(SystemKind::Decide));
+        }
+        (voices.refused(), mix(&mut voices, DECIDE_FRAMES, 1.0))
+    };
+    let (refused, again) = second(true);
+    let (none, once_only) = second(false);
+    assert_eq!((refused, none), (1, 0));
+    assert!(same(&again, &once_only), "the sounding decide changed");
+
+    // A stop of `decide`, then one above it, in one snapshot: the new one
+    // sounds from its start, past where the first would have ended.
+    let restarted = |stop: bool| {
+        let (mut voices, mut rig, seq) = with_decide();
+        mix(&mut voices, 4_800, 1.0);
+        if stop {
+            rig.stop(seq + 1, SystemKind::Decide);
+            rig.start(seq + 2, SystemKind::Decide);
+            rig.apply(&mut voices, seq + 2);
+        }
+        (
+            voices.refused(),
+            voices.reserved_sounding(),
+            mix(&mut voices, DECIDE_FRAMES, 1.0),
+        )
+    };
+    let (refused, reserved, fresh) = restarted(true);
+    let (_, _, on) = restarted(false);
+    assert_eq!((refused, reserved), (0, 1));
+    assert!(!same(&fresh, &on), "the new decide sounds from its start");
+
+    // The tone takes no reserved voice: B lacks `decide`, the part is full,
+    // and a decision sound is the tone.
+    let (mut voices, mut rig, mut seq) = installed(reserved_kit(2));
+    fill(&mut voices, &mut rig, &mut seq);
+    step(&mut voices, &mut rig, &mut seq, once(SystemKind::Decide));
+    assert!(voices.tone_sounding());
+    assert_eq!(
+        (
+            voices.sounding(),
+            voices.reserved_sounding(),
+            voices.refused()
+        ),
+        (SYSTEM_VOICES, 0, 0)
+    );
 }

@@ -54,17 +54,7 @@ pub(crate) struct Keys {
 /// key's. Colour is clamped per key, as libGDX's `Color` constructor
 /// does (`Color.java:88` at 1.9.9), so an imported skin looks as its
 /// author saw it rather than being refused.
-///
-/// With `digits`, as for a judge's combo, whose raw `x` moves left by
-/// half its raw `w` times its digits (`JsonPlaySkinObjectLoader.java:
-/// 268-270`), a key gives `x` and `w` together or omits both, so the
-/// moved `x` it inherits is the moved one; one omitted alone is a range
-/// error. The move itself is exact, at placement.
-pub(crate) fn read(
-    def: &mut Definition,
-    ids: &[u32],
-    digits: Option<i32>,
-) -> Result<Keys, ImportError> {
+pub(crate) fn read(def: &mut Definition, ids: &[u32]) -> Result<Keys, ImportError> {
     const FIELDS: [&str; 15] = [
         "time", "x", "y", "w", "h", "acc", "a", "r", "g", "b", "angle", "clip_x", "clip_y",
         "clip_w", "clip_h",
@@ -96,14 +86,6 @@ pub(crate) fn read(
             if let Some(f) = field {
                 *slot = def.int(f, name)?;
             }
-        }
-        if let (Some(_), [_, x, _, w, ..]) = (digits, &v)
-            && (*x == i32::MIN) != (*w == i32::MIN)
-        {
-            return Err(ImportError::Range {
-                at: def.loc(id),
-                field: "x",
-            });
         }
         for (i, slot) in v.iter_mut().enumerate() {
             if *slot == i32::MIN {

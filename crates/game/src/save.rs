@@ -1,7 +1,8 @@
-//! The saving extension point and local records, and the atomic file writes
-//! that settings and records share.
+//! The saving extension point and local records, the atomic file writes
+//! that settings and records share, and the writes that never go through a
+//! link into another file (design.md "Threat Model", T18).
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::hash::{BuildHasher as _, Hasher as _, RandomState};
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -37,6 +38,103 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         .persist(path)
         .map(|_| ())
         .map_err(|e| e.error)
+}
+
+/// The count of names of the file at `path`, more than 1 when hard links
+/// share it, `None` when it cannot be read. The standard library reads it
+/// portably only on Unix, so the caller supplies it.
+pub type LinkCount = fn(&Path) -> Option<u64>;
+
+/// Whether the entry at `path` is a link: a symbolic link or a junction
+/// (to a file or a folder), or a file that also has another name by
+/// `links`. A missing entry, a folder, and a file with one name or whose
+/// count is unknown are not.
+///
+/// # Errors
+///
+/// The I/O error of reading the entry.
+pub fn is_link(path: &Path, links: LinkCount) -> io::Result<bool> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) => {
+            Ok(meta.file_type().is_symlink()
+                || (meta.is_file() && links(path).is_some_and(|n| n > 1)))
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+/// Removes the entry at `path` when it is a link ([`is_link`]). Removing a
+/// link removes the link, never its target, and removing one name of a
+/// file leaves its other names. Anything else is left alone, so a lock
+/// file another process holds is never removed. Returns whether it
+/// removed the entry.
+///
+/// # Errors
+///
+/// The I/O error of reading the entry or removing it.
+pub fn clear_link(path: &Path, links: LinkCount) -> io::Result<bool> {
+    if !is_link(path, links)? {
+        return Ok(false);
+    }
+    remove_name(path).map(|()| true)
+}
+
+/// Removes the entry at `path` unless it is a folder: a link (only the
+/// link, never its target) or a file (only this name, so its other names
+/// keep their bytes). A missing entry and a folder are left alone.
+///
+/// # Errors
+///
+/// The I/O error of reading the entry or removing it.
+pub fn remove_name(path: &Path) -> io::Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => remove_link(path),
+        Ok(meta) if !meta.is_dir() => fs::remove_file(path),
+        Ok(_) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Removes the symbolic link or junction at `path`: a file link is removed
+/// as a file, a folder link or junction as a folder; either removes only
+/// the link.
+fn remove_link(path: &Path) -> io::Result<()> {
+    fs::remove_file(path).or_else(|e| fs::remove_dir(path).map_err(|_| e))
+}
+
+/// A new, empty file at `path` that no other name shares, for a file each
+/// run writes afresh (the log). Any entry there that is not a folder (a
+/// link, another file's second name or an old file) is removed first, and
+/// the file is then made with `create_new`, so the write never goes through
+/// an existing entry: one that reappears in between fails it, and so does
+/// a folder there. The folders above `path` are followed.
+///
+/// # Errors
+///
+/// The I/O error of removing the entry or creating the file.
+pub fn create_fresh(path: &Path) -> io::Result<File> {
+    remove_name(path)?;
+    OpenOptions::new().write(true).create_new(true).open(path)
+}
+
+/// Opens the lock file at `path` for an exclusive lock, creating it when
+/// missing and never truncating it, once [`clear_link`] has removed a link
+/// there, so neither the file it creates nor the lock lands on another
+/// file.
+///
+/// # Errors
+///
+/// The I/O error of clearing the entry or opening the file.
+pub fn open_lock(path: &Path, links: LinkCount) -> io::Result<File> {
+    clear_link(path, links)?;
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
 }
 
 /// Where a saved record went.

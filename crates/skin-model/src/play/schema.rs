@@ -23,8 +23,8 @@ pub const GAUGE_KIND_ENUM: EnumId = EnumId(0);
 pub const READOUT_MAX: i32 = i32::MAX - 1;
 /// [`READOUT_MAX`] as a `u32`.
 pub(crate) const READOUT_MAX_U32: u32 = READOUT_MAX.unsigned_abs();
-/// The largest lane visual state, `judge.lane.N`: an empty POOR at or
-/// after its note, `5 · 2 + 1` (`play/JudgeManager.java:671-672`).
+/// The largest lane visual state, `judge.lane.N`: an empty POOR after its
+/// note, `5 · 2 + 1` (`play/JudgeManager.java:671-672`).
 pub const LANE_JUDGE_MAX: i32 = 11;
 /// The whole attempt in `time.progress_ppm`'s unit, parts per million.
 pub const PROGRESS_FULL: i32 = 1_000_000;
@@ -440,7 +440,9 @@ pub mod field {
     /// The configured hidden cover, in ‰, kept while it is off.
     pub const HIDDEN_PERMILLE: u16 = 26;
     /// The configured lane cover over the lane's whole length, in ‰:
-    /// `⌊(1 000 − lift) · cover / 1 000⌋` from the configured amounts.
+    /// `⌊(1 000 − l) · cover / 1 000⌋` for the lift `l` the lanes draw (the
+    /// configured lift while LIFT is on, 0 while it is off), SUDDEN+'s
+    /// white number.
     pub const COVER_ABSOLUTE_PERMILLE: u16 = 27;
     /// Whether the lane cover is on.
     pub const COVER_ENABLED: u16 = 28;

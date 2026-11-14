@@ -386,7 +386,7 @@ fn scroll_changes_reach_the_preview_rows() {
          #00011:01010101\n#000SC:0001\n#00111:01\n#001SC:0203\n#00211:01\n";
     let one = bms_model::SCROLL_ONE;
     assert_eq!(
-        preview(text).speeds(),
+        preview(text).speeds().to_vec(),
         [
             speed_row(0, 120, one),
             speed_row(1_000, 120, one / 2),
@@ -396,7 +396,7 @@ fn scroll_changes_reach_the_preview_rows() {
     );
     let loaded = load(text, 0).unwrap();
     assert_eq!(
-        loaded.profile.speeds(),
+        loaded.profile.speeds().to_vec(),
         [speed_row(0, 120, one), speed_row(4_000, 120, one)]
     );
     let plain = "#BPM 120\n#00011:01010101\n#00111:01\n#00211:01\n";
@@ -440,7 +440,7 @@ fn a_tempo_change_past_plays_end_reaches_the_preview() {
     let one = bms_model::SCROLL_ONE;
     let p = preview(text);
     assert_eq!(
-        p.speeds(),
+        p.speeds().to_vec(),
         [
             speed_row(0, 120, one),
             speed_row(2_000, 240, one),
@@ -449,7 +449,7 @@ fn a_tempo_change_past_plays_end_reaches_the_preview() {
     );
     assert_eq!(p.length_ms(), 3_000);
     let loaded = load(text, 0).unwrap();
-    assert_eq!(loaded.profile.speeds(), [speed_row(0, 120, one)]);
+    assert_eq!(loaded.profile.speeds().to_vec(), [speed_row(0, 120, one)]);
     assert_eq!(loaded.chart.meta.length, TimeUs(0));
 }
 
@@ -462,7 +462,7 @@ fn a_late_scroll_change_does_not_lengthen_the_content() {
     assert_eq!(p.length_ms(), 3_000);
     assert_eq!(
         p.speeds().last(),
-        Some(&speed_row(4_000, 240, 2 * bms_model::SCROLL_ONE))
+        Some(speed_row(4_000, 240, 2 * bms_model::SCROLL_ONE))
     );
 }
 
@@ -474,7 +474,7 @@ fn zero_and_negative_scroll_reach_the_rows() {
          #001SC:02\n#00111:01\n";
     let one = bms_model::SCROLL_ONE;
     assert_eq!(
-        preview(text).speeds(),
+        preview(text).speeds().to_vec(),
         [
             speed_row(0, 120, one),
             speed_row(1_000, 120, 0),
@@ -492,11 +492,11 @@ fn a_trailing_tempo_change_reaches_the_preview() {
     let text = "#BPM 120\n#00019:01\n#00003:00F00000\n";
     let one = bms_model::SCROLL_ONE;
     assert_eq!(
-        preview(text).speeds(),
+        preview(text).speeds().to_vec(),
         [speed_row(0, 120, one), speed_row(500, 240, one)]
     );
     assert_eq!(
-        load(text, 0).unwrap().profile.speeds(),
+        load(text, 0).unwrap().profile.speeds().to_vec(),
         [speed_row(0, 120, one)]
     );
 }
@@ -513,11 +513,11 @@ fn a_trailing_stop_reaches_the_preview() {
         scroll: one,
     };
     assert_eq!(
-        preview(text).speeds(),
+        preview(text).speeds().to_vec(),
         [speed_row(0, 120, one), stopped, speed_row(1_500, 120, one)]
     );
     assert_eq!(
-        load(text, 0).unwrap().profile.speeds(),
+        load(text, 0).unwrap().profile.speeds().to_vec(),
         [speed_row(0, 120, one)]
     );
 }
@@ -549,7 +549,7 @@ fn a_scroll_change_applies_at_its_own_row() {
                 #000SC:00010000\n#00119:0001\n";
     let one = bms_model::SCROLL_ONE;
     assert_eq!(
-        preview(text).speeds(),
+        preview(text).speeds().to_vec(),
         [speed_row(0, 120, one), speed_row(500, 240, one / 2)]
     );
 }
@@ -561,7 +561,7 @@ fn scroll_changes_inside_one_microsecond_stay_apart() {
     let text = "#BPM 120\n#SCROLL01 0.5\n#SCROLL02 2\n#00002:0.0000001\n#000SC:0102\n#00111:01\n";
     let one = bms_model::SCROLL_ONE;
     assert_eq!(
-        preview(text).speeds(),
+        preview(text).speeds().to_vec(),
         [
             speed_row(0, 120, one),
             speed_row(0, 120, one / 2),
@@ -577,7 +577,7 @@ fn the_later_scroll_change_at_a_position_wins() {
     let text = "#BPM 120\n#SCROLL01 0.5\n#SCROLL02 2\n#00011:01\n#001SC:01\n#001SC:02\n#00111:01\n";
     let one = bms_model::SCROLL_ONE;
     assert_eq!(
-        preview(text).speeds(),
+        preview(text).speeds().to_vec(),
         [speed_row(0, 120, one), speed_row(2_000, 120, 2 * one)]
     );
 }

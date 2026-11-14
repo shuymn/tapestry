@@ -200,7 +200,7 @@ pub mod field {
     /// The rank, 0 (lowest) to 7 (highest): the greatest `k` with
     /// `27 · ex ≥ low_k · max_ex`, `low` being 0, 6, 9, 12, 15, 18, 21, 24.
     pub const SELECTED_RANK: u16 = 15;
-    /// The EX score to the next rank of 3/27 steps, or to the largest.
+    /// The EX score to the next rank, or to the largest at the top rank.
     pub const SELECTED_NEXT_RANK: u16 = 16;
     /// Whether the chart has a summary.
     pub const SELECTED_SUMMARY: u16 = 17;
@@ -290,7 +290,7 @@ pub mod field {
     pub const SETTINGS: u16 = SELECTED_MAIN_BPM_VALID + 1;
     /// The display offset in whole ms.
     pub const SETTINGS_DISPLAY_OFFSET: u16 = SETTINGS;
-    /// The system volume's number, `(int)(gain · 100f)`.
+    /// The system volume's number, its whole percent rounded half up.
     pub const SETTINGS_VOLUME_SYSTEM: u16 = SETTINGS + 1;
     /// Whether the hi-speed is Floating.
     pub const SETTINGS_FLOATING: u16 = SETTINGS + 2;
@@ -319,7 +319,8 @@ pub mod field {
     /// assignment: 0 (combo) for combo priority, 1 (duration) for the
     /// nearest note, earlier at a tie; −1 without a preset.
     pub const SETTINGS_JUDGE_ALGORITHM: u16 = SETTINGS_GAUGE_SHIFT + 1;
-    /// The key and background volumes' numbers, `(int)(gain · 100f)`.
+    /// The key and background volumes' numbers, each its whole percent
+    /// rounded half up.
     pub const SETTINGS_VOLUME_KEY: u16 = SETTINGS_JUDGE_ALGORITHM + 1;
     pub const SETTINGS_VOLUME_BACKGROUND: u16 = SETTINGS_VOLUME_KEY + 1;
     /// The application's readouts of the frame

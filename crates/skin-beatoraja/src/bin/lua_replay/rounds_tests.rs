@@ -161,8 +161,9 @@ fn ready_frames_are_play_frames() {
             r.text(0, true, true)
         );
     }
-    assert_eq!(r.buckets.get("outside (loading)"), Some(&240));
-    assert_eq!(r.buckets.get("outside (page)"), Some(&960));
+    // One timer invocation an outside frame.
+    assert_eq!(r.buckets.get("outside (loading)"), Some(&120));
+    assert_eq!(r.buckets.get("outside (page)"), Some(&480));
 }
 
 /// O3, C3: FAILED and Closing frames are play frames, compared.

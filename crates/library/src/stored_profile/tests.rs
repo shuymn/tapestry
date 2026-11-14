@@ -33,7 +33,7 @@ fn rows(n: u32) -> Vec<SpeedRow> {
 }
 
 fn round_trip(bins: &[Bin], rows: &[SpeedRow]) -> (usize, StoredProfile) {
-    let bytes = encode_parts(MAIN, 7, 1, bins, rows).unwrap();
+    let bytes = encode_parts(MAIN, 7, 1, bins, rows.iter().copied()).unwrap();
     (bytes.len(), decode(&bytes).unwrap())
 }
 
@@ -102,7 +102,9 @@ fn the_byte_bound_is_inclusive() {
         })
         .collect();
     let zero = vec![[0_u16; NOTE_CATEGORIES]; NOTE_BINS];
-    let base = encode_parts(MAIN, 7, 1, &zero, &rows).unwrap().len();
+    let base = encode_parts(MAIN, 7, 1, &zero, rows.iter().copied())
+        .unwrap()
+        .len();
     assert!(base < MAX_PROFILE_BYTES, "{base}");
     // Each count of 128 takes 2 bytes where 0 takes 1: `extra` of them
     // make a profile of `base + extra` bytes, rows kept.
@@ -117,12 +119,12 @@ fn the_byte_bound_is_inclusive() {
     assert!(fill < NOTE_BINS * NOTE_CATEGORIES, "{fill}");
     assert_eq!(MAX_PROFILE_BYTES, 24_576);
     let bins = widened(fill);
-    let bytes = encode_parts(MAIN, 7, 1, &bins, &rows).unwrap();
+    let bytes = encode_parts(MAIN, 7, 1, &bins, rows.iter().copied()).unwrap();
     assert_eq!(bytes.len(), MAX_PROFILE_BYTES);
     let at_bound = decode(&bytes).unwrap();
     assert_eq!(at_bound.rows.as_deref(), Some(rows.as_slice()));
     let bins = widened(fill + 1);
-    let past = decode(&encode_parts(MAIN, 7, 1, &bins, &rows).unwrap()).unwrap();
+    let past = decode(&encode_parts(MAIN, 7, 1, &bins, rows.iter().copied()).unwrap()).unwrap();
     assert_eq!(past.rows, None);
     assert_eq!(past.bins, bins);
 }
@@ -132,7 +134,7 @@ fn the_byte_bound_is_inclusive() {
 #[test]
 fn the_main_tempo_round_trips_exactly() {
     for main in [None, Some(None), Some(tempo(1_805 * BPM / 10))] {
-        let bytes = encode_parts(main, 7, 1, &[], &rows(2)).unwrap();
+        let bytes = encode_parts(main, 7, 1, &[], rows(2).into_iter()).unwrap();
         assert_eq!(decode(&bytes).unwrap().main, main);
     }
 }
@@ -156,7 +158,7 @@ fn scroll_factors_round_trip() {
 /// What this build did not write within the bounds is refused.
 #[test]
 fn damaged_blobs_are_refused() {
-    let good = encode_parts(MAIN, 7, 1, &[[1; NOTE_CATEGORIES]], &rows(3)).unwrap();
+    let good = encode_parts(MAIN, 7, 1, &[[1; NOTE_CATEGORIES]], rows(3).into_iter()).unwrap();
     assert!(decode(&good).is_some());
     // Truncated, or with a byte more.
     assert_eq!(decode(&good[..good.len() - 1]), None);
@@ -204,7 +206,7 @@ fn damaged_blobs_are_refused() {
 /// The content length reads back.
 #[test]
 fn the_length_round_trips() {
-    let bytes = encode_parts(MAIN, 4_200, 1, &[], &rows(2)).unwrap();
+    let bytes = encode_parts(MAIN, 4_200, 1, &[], rows(2).into_iter()).unwrap();
     assert_eq!(decode(&bytes).unwrap().length_ms, 4_200);
 }
 
@@ -256,5 +258,8 @@ fn a_real_overflow_drops_the_rows_and_a_redundant_one_does_not() {
     let redundant = profile(true);
     assert_eq!(redundant.speeds().len(), 2);
     let stored = decode(&super::encode(&redundant, MAIN).unwrap()).unwrap();
-    assert_eq!(stored.rows.as_deref(), Some(redundant.speeds()));
+    assert_eq!(
+        stored.rows.as_deref(),
+        Some(redundant.speeds().to_vec().as_slice())
+    );
 }

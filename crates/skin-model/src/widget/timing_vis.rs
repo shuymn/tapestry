@@ -6,7 +6,9 @@
 //! destination's colour, alpha, blend and angle as disjoint composed runs.
 //! Each line is a quad of its own in the line colour at alpha `a·(i+1)/100`,
 //! oldest first, unrotated and untinted, under the destination's blend
-//! alone, as the source draws it with its own colour and angle 0.
+//! alone, as the source draws it with its own colour and angle 0. In a
+//! play skin with lanes, a visualizer that follows HIDDEN+ is skipped
+//! whole, band and lines, while HIDDEN+ is off, before it draws.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 

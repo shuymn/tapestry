@@ -14,7 +14,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use bms_model::{RowSpeed, SCROLL_ONE, SpeedRow, Tempo, TimeUs};
+use bms_model::{RowSpeed, SCROLL_ONE, SpeedRow, SpeedRows, Tempo, TimeUs};
 
 use super::compose::{self, Fill, Raster, Run};
 use super::{Brush, Frame, ImageRef};
@@ -102,7 +102,7 @@ pub(crate) struct BpmRaster {
 pub(crate) struct BpmInput<'a> {
     /// The tempo rows, in time order, each drawn at its effective speed
     /// (its tempo times its scroll factor, 0 while stopped).
-    pub(crate) rows: &'a [SpeedRow],
+    pub(crate) rows: &'a SpeedRows,
     /// The whole chart's MAIN tempo.
     pub(crate) main: Tempo,
     /// The chart's length at 1×, in whole ms.
@@ -174,7 +174,7 @@ impl BpmGraphDef {
         }
         // The lowest and the highest positive speed: a stop is 0, and the
         // source's highest starts above 0 (`skin/SkinBPMGraph.java:111-118`).
-        let positive = data.iter().map(SpeedRow::speed).filter(|s| s.is_positive());
+        let positive = data.iter().map(|r| r.speed()).filter(|s| s.is_positive());
         let range = [positive.clone().min(), positive.max()];
         let main_speed = RowSpeed::of_tempo(input.main);
         let main = bpm(Some(input.main));
@@ -200,11 +200,8 @@ impl BpmGraphDef {
         // The fills in paint order: (left, right, bottom, top, colour), in
         // texels from the bottom left.
         let mut fills: Vec<(i64, i64, i64, i64, Rgba8)> = Vec::with_capacity(2 * data.len());
-        for pair in data.windows(2) {
-            let (Some(a), Some(b)) = (pair.first(), pair.get(1)) else {
-                continue;
-            };
-            let (y1, y2) = (y(a), y(b));
+        for (a, b) in data.iter().zip(data.iter().skip(1)) {
+            let (y1, y2) = (y(&a), y(&b));
             let x1 = x(b.ms);
             if (y2 - y1).abs() - lw > 0 {
                 let bottom = y1.min(y2) + lw;
@@ -220,7 +217,7 @@ impl BpmGraphDef {
             let color = class(a.speed(), main_speed, range, colors);
             fills.push((x0, x1 + lw, y1, y1 + lw, color));
         }
-        let yl = y(last);
+        let yl = y(&last);
         let color = class(last.speed(), main_speed, range, colors);
         fills.push((x(last.ms), w + lw, yl, yl + lw, color));
         raster.runs = compose_columns(&fills, cols, rows, colors.transition);

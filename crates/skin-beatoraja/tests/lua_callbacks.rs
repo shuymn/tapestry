@@ -1873,17 +1873,22 @@ fn a_slot_is_taken_only_when_proven() {
 }
 
 /// A slot-owning timer callback is charged as the skin counts it (V5:
-/// both runs and the slot it touches): nothing is dropped, so the
-/// operations charged are the ones kept.
+/// its one run a frame and the slot it touches): nothing is dropped, so
+/// the operations charged are the ones kept. The latch's run, its code
+/// with its point read and slot, is 35 operations, the skin's only work;
+/// two destinations are two callbacks, each charged once.
 #[test]
 fn a_timer_callback_is_charged_as_the_skin_counts_it() {
-    let i = import(&timer_skin(STATE, LATCH_BODY, 1), 905).unwrap();
-    assert_eq!(i.callbacks, [Disposition::Compiled]);
-    assert_eq!(i.imported.skin.program_callbacks(), 1);
-    assert_eq!(
-        i.imported.report.usage.ops as usize,
-        i.imported.skin.ops().total()
-    );
+    for (n, ops) in [(1, 35), (2, 70)] {
+        let i = import(&timer_skin(STATE, LATCH_BODY, n), 905).unwrap();
+        assert_eq!(i.callbacks, [Disposition::Compiled]);
+        assert_eq!(i.imported.skin.program_callbacks(), n);
+        assert_eq!(
+            i.imported.report.usage.ops as usize,
+            i.imported.skin.ops().total()
+        );
+        assert_eq!(i.imported.skin.ops().total(), ops, "{n}");
+    }
 }
 
 /// The loading proof reads a slot at its initial value: an integer start

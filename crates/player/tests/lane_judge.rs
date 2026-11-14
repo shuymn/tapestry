@@ -299,7 +299,7 @@ impl<'a> Rig<'a> {
 /// held (8); its release 140 ms before its end, GOOD by the release,
 /// early (4); key 3 100 ms late, GOOD (5), then 150 ms early, BAD (6);
 /// key 4 40 ms early, GREAT (2), then a press on its note's time, an
-/// empty POOR on time, which is late (11); the scratch's long note held
+/// empty POOR on time, which is early (10); the scratch's long note held
 /// by its axis (8), then a reversal 100 ms before its end, whose release
 /// judges it and whose press, at the same µs and after it, matches nothing
 /// (0), and stays so through the release deadline after it; key 5's head
@@ -373,18 +373,18 @@ fn each_lane_reaches_the_skin_through_logic_and_the_frame() {
     assert_eq!(s, [1, 0, 4, 6, 2, 0, 0, 0], "early GREAT");
     r.tap(6_000, 4);
     let s = r.step(&skin, &uvs, 6_000);
-    assert_eq!(s, [1, 0, 4, 6, 11, 0, 0, 0], "empty POOR on time");
+    assert_eq!(s, [1, 0, 4, 6, 10, 0, 0, 0], "empty POOR on time");
     // The axis at rest, then +2, a press on the head's time.
     r.set(6_200, AXIS, 100);
     r.set(6_500, AXIS, 102);
     let s = r.step(&skin, &uvs, 6_500);
-    assert_eq!(s, [8, 0, 4, 6, 11, 0, 0, 0], "scratch held");
+    assert_eq!(s, [8, 0, 4, 6, 10, 0, 0, 0], "scratch held");
     // Held by a step forward every 60 ms, inside the release time.
     for (k, ms) in (6_560..=6_860).step_by(60).enumerate() {
         r.set(ms, AXIS, 103 + i32::try_from(k).unwrap());
     }
     let s = r.step(&skin, &uvs, 6_880);
-    assert_eq!(s, [8, 0, 4, 6, 11, 0, 0, 0], "still held");
+    assert_eq!(s, [8, 0, 4, 6, 10, 0, 0, 0], "still held");
     // Back by 2: a release, which judges the long note, then a press, in
     // one µs.
     r.set(6_900, AXIS, 106);
@@ -396,16 +396,16 @@ fn each_lane_reaches_the_skin_through_logic_and_the_frame() {
         "{:?}",
         r.effects
     );
-    assert_eq!(s, [0, 0, 4, 6, 11, 0, 0, 0], "reversal");
+    assert_eq!(s, [0, 0, 4, 6, 10, 0, 0, 0], "reversal");
     // Key 5's head pressed on its time and released in the same µs, the
     // other order: the release, after the press, judges the long note BAD
     // early (6), which stays.
     r.set(7_500, 5, 1);
     r.set(7_500, 5, 0);
     let s = r.step(&skin, &uvs, 7_500);
-    assert_eq!(s, [0, 0, 4, 6, 11, 6, 0, 0], "press, release");
+    assert_eq!(s, [0, 0, 4, 6, 10, 6, 0, 0], "press, release");
     let s = r.step(&skin, &uvs, 7_600);
-    assert_eq!(s, [0, 0, 4, 6, 11, 6, 0, 0], "press, release, later");
+    assert_eq!(s, [0, 0, 4, 6, 10, 6, 0, 0], "press, release, later");
     // Key 4 20 ms early, GREAT, its effects held back for a frame: the
     // view's press is ahead of them, so the lane reads 0 until they
     // arrive, then their code (2).

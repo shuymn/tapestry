@@ -79,6 +79,7 @@ fn seeded_branches_match_reference_values() {
     }
 }
 
+// Source: SF-007
 #[test]
 fn nested_blocks_read_by_the_top_flag_only() {
     let text = chart("random_nested.bms");
@@ -168,6 +169,7 @@ fn headers_apply_only_in_the_branch_taken() {
     }
 }
 
+// Source: SF-007
 #[test]
 fn stray_directives_warn_and_bad_values_fail() {
     let warned = |text: &str| {
@@ -300,6 +302,7 @@ fn branch_records_do_not_change_the_resolved_hash() {
     assert_eq!(a.resolved_hash, b.resolved_hash);
 }
 
+// Source: SF-007
 #[test]
 fn if_flags_stack_as_charts_expect() {
     let warned = |text: &str| {

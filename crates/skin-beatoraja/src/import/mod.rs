@@ -167,7 +167,7 @@ impl Config {
     }
 
     /// Every selected item's number: what the source tree's conditions
-    /// see (`JSONSkinLoader.java:254-260`).
+    /// (`JSONSkinLoader.java:254-260`) and a destination's ops see.
     #[must_use]
     pub fn enabled(&self) -> BTreeSet<i32> {
         self.options.iter().flatten().copied().collect()
@@ -377,9 +377,6 @@ struct Opts<'a> {
     neutral: bool,
     /// The offsets are not consumed: noted, never refused.
     no_offsets: bool,
-    /// A judge's combo: its digits; each key gives `x` and `w` together
-    /// or neither ([`track::read`]).
-    digits: Option<i32>,
     /// The keys as written were charged before this read.
     charged: bool,
     /// The keys' clip is unused: noted, never refused.
@@ -458,9 +455,8 @@ pub(crate) struct Cx<'d> {
     assets: Assets,
     choices: Choices,
     /// What a destination's numeric op reads of each declared option
-    /// item: whether it is its option's selection, a later option's entry
-    /// replacing an earlier one's for a shared number
-    /// (`JSONSkinLoader.java:291-297`).
+    /// item: whether any option selects it, the enabled set `if` reads
+    /// (design.md "Differences from the source", imported skins).
     items: BTreeMap<i32, bool>,
     whens: Vec<Program>,
     when_spans: Vec<Span>,
@@ -598,12 +594,10 @@ impl<'d> Cx<'d> {
     ) -> Result<Self, ImportError> {
         let entry_dir = def.entry_dir().to_owned();
         let assets = Assets::new(def.root());
+        let enabled = config.enabled();
         let mut items = BTreeMap::new();
-        for (i, o) in header.options.iter().enumerate() {
-            let selected = config.options.get(i).copied().flatten();
-            for item in &o.items {
-                items.insert(item.op, Some(item.op) == selected);
-            }
+        for item in header.options.iter().flat_map(|o| &o.items) {
+            items.insert(item.op, enabled.contains(&item.op));
         }
         #[cfg(feature = "dev-tools")]
         crate::lua::replay::record_items(&items);
@@ -949,7 +943,7 @@ impl<'d> Cx<'d> {
         {
             let at = self.arena_span(op);
             if self.ignored_ops.insert(at) {
-                self.ignored(at, NoteKind::Ignored { field: "op" });
+                self.ignored(at, NoteKind::ScalarOp);
             }
         }
         let blend = self.int_or(blend, "blend", 0)?;
@@ -1100,7 +1094,7 @@ impl<'d> Cx<'d> {
             if let Some(e) = &mut self.element {
                 e.kind = Some("SystemImage".to_owned());
             }
-            self.install(&mut dst, None, false)?;
+            self.install(&mut dst, None)?;
             self.system(dst, n)?;
             self.installed();
             return Ok(());
@@ -1123,47 +1117,13 @@ impl<'d> Cx<'d> {
             ScreenKind::Decision => return self.decision_destination(dst, object, orec),
             ScreenKind::Play => {}
         }
-        // The source draws the character when its file exists and the
-        // notes otherwise: one id cannot be both.
-        if object == Object::PmChara
-            && self
-                .objects
-                .names(self.def, &self.tables, &id, Object::Note)?
-        {
-            return Err(ImportError::Critical {
-                at: self.loc(at),
-                part: CriticalPart::Lanes,
-                why: NoteKind::UnsupportedField { field: "id" },
-            });
-        }
-        // Likewise the source falls through to the judge, and makes its
-        // region, when an image's or LIFT's file or a text's font does not
-        // load or a slider or graph has no texture
-        // (`JsonSkinObjectLoader.java:71, 387-391, 396-416, 420-453, 628`,
-        // `JsonPlaySkinObjectLoader.java:31, 200-213, 283`): one id cannot
-        // be both.
-        if matches!(
-            object,
-            Object::Image | Object::Text | Object::Slider | Object::Graph | Object::LiftCover
-        ) && self
-            .objects
-            .names(self.def, &self.tables, &id, Object::Judge)?
-        {
-            return Err(ImportError::Critical {
-                at: self.loc(at),
-                part: CriticalPart::Judge,
-                why: NoteKind::UnsupportedField { field: "id" },
-            });
-        }
-        // An id another table names too: the source may make the other
-        // object when this one's source is missing, so that is uncertain.
-        let shared = self.objects.shared(self.def, &self.tables, &id)?;
-        self.install(&mut dst, Some((object, orec)), !shared)?;
+        self.install(&mut dst, Some((object, orec)))?;
         // The source makes no object of these when `src` names no source,
         // and skips the destination (`JSONSkinLoader.java:326-338,
         // 484-492`, `JsonSkinObjectLoader.java:42-72, 394-455`,
         // `JsonPlaySkinObjectLoader.java:183-214`), whatever its role. An
-        // id another table names keeps the role's handling.
+        // id a later table holds too stays this object's, drawing nothing
+        // (design.md "Differences from the source", imported skins).
         if matches!(
             object,
             Object::Image
@@ -1174,9 +1134,7 @@ impl<'d> Cx<'d> {
         ) {
             let [src] = self.def.fields(orec, ["src"]);
             let src = self.opt_string(src, "src")?;
-            if self.source_rec(src.as_deref())?.is_none()
-                && !self.objects.shared(self.def, &self.tables, &id)?
-            {
+            if self.source_rec(src.as_deref())?.is_none() {
                 self.ignored(at, NoteKind::UndefinedSource);
                 return Ok(());
             }
@@ -1222,13 +1180,8 @@ impl<'d> Cx<'d> {
     /// caller uses. Colour is clamped rather than refused, so the skin
     /// looks as its author saw it; when `colour` is drawn, a clamped
     /// channel is reported once, as a `Fallback` note at its first key.
-    fn read_keys(
-        &mut self,
-        dst: &Dst,
-        digits: Option<i32>,
-        colour: Colour,
-    ) -> Result<track::Keys, ImportError> {
-        let keys = track::read(self.def, &dst.keys, digits)?;
+    fn read_keys(&mut self, dst: &Dst, colour: Colour) -> Result<track::Keys, ImportError> {
+        let keys = track::read(self.def, &dst.keys)?;
         if colour == Colour::Drawn
             && let Some(k) = keys.clamped
         {
@@ -1273,7 +1226,7 @@ impl<'d> Cx<'d> {
         } else {
             Colour::Drawn
         };
-        let mut keys = self.read_keys(dst, o.digits, drawn)?;
+        let mut keys = self.read_keys(dst, drawn)?;
         if o.neutral {
             // The emitted keys, at 0 and at the last time, charged before
             // the constructor's key joins.
@@ -1477,7 +1430,9 @@ impl<'d> Cx<'d> {
             }
         }
         let mut offset = Offset::default();
-        let mut alpha: Vec<i64> = Vec::new();
+        // The configured alpha deltas: their sum, whether any is not 0 and
+        // whether any is above 0.
+        let (mut alpha, mut alpha_set, mut alpha_raised) = (0_i64, false, false);
         let (mut lift, mut cover, mut hidden) = (false, false, false);
         let mut turntable = false;
         if o.no_offsets && !ids.is_empty() {
@@ -1546,46 +1501,53 @@ impl<'d> Cx<'d> {
             offset.w += i64::from(v.w);
             offset.h += i64::from(v.h);
             offset.r += i64::from(v.r);
-            if v.a != 0 {
-                alpha.push(i64::from(v.a));
-            }
+            alpha += i64::from(v.a);
+            alpha_set |= v.a != 0;
+            alpha_raised |= v.a > 0;
         }
         let mut track = track;
-        if o.neutral && !alpha.is_empty() {
+        if o.neutral && alpha_set {
             self.ignored(
                 at,
                 NoteKind::Ignored {
                     field: "offset alpha",
                 },
             );
-            alpha.clear();
+            (alpha, alpha_set, alpha_raised) = (0, false, false);
         }
         // Offset 5 is an alpha offset too: −255 while HIDDEN+ is off, which
         // the model reproduces by not drawing the follower. The source
         // skips every alpha offset at an interpolated colour
-        // (`SkinObject.java:489-504`) and clamps each in turn (`:474-481`),
-        // so a follower of HIDDEN+ needs a fixed colour and no configured
-        // alpha above 0, or it would show where the model hides it.
-        if hidden && (!track.fixed_color() || alpha.iter().any(|&a| a > 0)) {
+        // (`SkinObject.java:489-504`), and a configured delta above 0 could
+        // lift the follower's alpha past HIDDEN+'s −255, so a follower of
+        // HIDDEN+ needs a fixed colour and no configured alpha above 0, or
+        // it could show where the model hides it.
+        if hidden && (!track.fixed_color() || alpha_raised) {
             self.drop_el(role, at, NoteKind::OffsetAlpha)?;
             return Ok(None);
         }
-        if !alpha.is_empty() {
-            let same_sign = alpha.iter().all(|&a| a > 0) || alpha.iter().all(|&a| a < 0);
-            if !track.fixed_color() || !same_sign {
+        // Configured deltas add up, and the key's alpha plus their sum is
+        // clamped once (design.md "Differences from the source", imported
+        // skins).
+        if alpha_set {
+            if !track.fixed_color() {
                 self.drop_el(role, at, NoteKind::OffsetAlpha)?;
                 return Ok(None);
             }
-            let sum: i64 = alpha.iter().sum();
             for k in &mut track.keys {
                 let [a, ..] = &mut k.color;
-                *a = i32::try_from((i64::from(*a) + sum).clamp(0, 255)).unwrap_or(255);
+                *a = i32::try_from((i64::from(*a) + alpha).clamp(0, 255)).unwrap_or(255);
             }
         }
 
         // Blend (`Skin.java:655-665`). A neutral outer destination draws
         // nothing of its own: its parts keep their blend, so its own is
-        // ignored.
+        // ignored. Blend 3 draws additive: the source sets the subtract
+        // equation and resets it to add before its quads draw
+        // (`:657-662`); the quads queued before it, which its batch
+        // flushes under subtract when that changes its blend factors, keep
+        // their own blend here.
+        // Source: SF-006
         let blend = match dst.blend {
             2..=4 | 9 if o.neutral => {
                 self.ignored(at, NoteKind::Ignored { field: "blend" });
@@ -1593,7 +1555,7 @@ impl<'d> Cx<'d> {
             }
             2 => Blend::Add,
             3 => {
-                self.ignored(at, NoteKind::Ignored { field: "blend 3" });
+                self.ignored(at, NoteKind::SubtractBlend);
                 Blend::Add
             }
             4 | 9 if text => {
@@ -2103,10 +2065,8 @@ impl<'d> Cx<'d> {
     /// tail), from the top-level `finishmargin` and `fadeout` in ms
     /// (`JsonSkin.java:14, 21`, each 0 when absent; a Lua skin's table
     /// converts to the same fields, `LuaSkinLoader.java:90-91`), in µs
-    /// over the source's whole `int` range, with no cap: a negative
-    /// `finishmargin` is 0, and `fadeout` keeps its sign, since the
-    /// source leaves on a negative one before its finish margin
-    /// (`BMSPlayer.java:756`). `finishmargin` is read whether or not the
+    /// up to the source's largest `int`, with no cap: each is a length,
+    /// and a negative one is 0. `finishmargin` is read whether or not the
     /// skin defines a note, as `close` is, where the source sets it only
     /// while loading the note's destination
     /// (`JsonPlaySkinObjectLoader.java:37-44`). Each is read as every
@@ -2116,7 +2076,7 @@ impl<'d> Cx<'d> {
         let fadeout = self.top_int("fadeout", 0)?;
         Ok(PlayEnding {
             finish_margin: TimeUs(i64::from(finish_margin.max(0)) * 1_000),
-            fadeout: TimeUs(i64::from(fadeout) * 1_000),
+            fadeout: TimeUs(i64::from(fadeout.max(0)) * 1_000),
         })
     }
 
@@ -2364,11 +2324,11 @@ fn draw_cond(kind: ScreenKind, n: i32) -> Option<Cond> {
         .then(|| ops::numeric_in(kind, n, &BTreeMap::new()))
 }
 
-/// The pivot of `center` (`SkinObject.java:80-81, 228-233`): honoured
-/// for 0..=9, bottom left otherwise.
+/// The pivot of `center`: 1..=9 as the table of `SkinObject.java:80-81,
+/// 228-233`, the centre for 0 and anything else (design.md "Differences
+/// from the source", imported skins).
 fn pivot(center: i32) -> Anchor {
     match center {
-        0 | 5 => Anchor::Center,
         1 => Anchor::BottomLeft,
         2 => Anchor::Bottom,
         3 => Anchor::BottomRight,
@@ -2377,7 +2337,7 @@ fn pivot(center: i32) -> Anchor {
         7 => Anchor::TopLeft,
         8 => Anchor::Top,
         9 => Anchor::TopRight,
-        _ => Anchor::BottomLeft,
+        _ => Anchor::Center,
     }
 }
 

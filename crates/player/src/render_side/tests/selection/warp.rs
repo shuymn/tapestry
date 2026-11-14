@@ -817,6 +817,7 @@ fn the_runtime_draws_each_frame_and_rests_through_a_play() {
     link.exit();
 
     let (_dir, skin, script) = scripted("rt.luaskin");
+    let script = script.untimed();
     let gone = Arc::new(AtomicBool::new(false));
     script.on_vm_drop(&gone);
     let (link, frames) = warp_link(None);

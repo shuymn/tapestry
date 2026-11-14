@@ -1,6 +1,7 @@
 //! Offsets: ids from both fields once each, values from the
-//! configuration in unscaled reference pixels, alpha folded only on fixed
-//! colour with one sign, cover ids followed, other run-time ids refused.
+//! configuration in unscaled reference pixels, alpha deltas folded as
+//! their sum, clamped once, only on fixed colour, cover ids followed,
+//! other run-time ids refused.
 
 mod common;
 
@@ -10,10 +11,11 @@ use common::play::round;
 use common::{has, import_config};
 use skin_beatoraja::{Config, DeviationId, LaneApprox, NoteKind, OffsetValue};
 
-/// Offsets 40 (axis flags all off) and 41 declared.
+/// Offsets 40 (axis flags all off), 41 and 42 declared.
 const HEADER: &str = r#""offset": [
     {"name": "a", "id": 40, "x": false, "y": false, "w": false, "h": false},
     {"name": "b", "id": 41, "x": true, "w": true},
+    {"name": "e", "id": 42},
     {"name": "c", "id": 4},
     {"name": "d", "id": 10}
 ]"#;
@@ -89,7 +91,7 @@ fn the_angle_offset_adds_before_negation() {
 }
 
 #[test]
-fn alpha_folds_on_fixed_colour_with_one_sign() {
+fn alpha_folds_only_on_fixed_colour() {
     let alpha = |a| OffsetValue {
         a,
         ..OffsetValue::default()
@@ -104,13 +106,7 @@ fn alpha_folds_on_fixed_colour_with_one_sign() {
     // Clamped at 0.
     let loaded = load([1_920, 1_080], fixed, |c| set(c, 40, alpha(-300)));
     assert!(loaded.ok().report.notes.is_empty());
-    // Mixed signs, or animated colour: unsupported.
-    let loaded = load([1_920, 1_080], fixed, |c| {
-        set(c, 40, alpha(10));
-        set(c, 41, alpha(-10));
-    });
-    assert!(has(loaded.report(), NoteKind::OffsetAlpha));
-    assert!(loaded.quads(0).is_empty());
+    // Animated colour: unsupported.
     let animated = r#""offset": 40, "dst": [{"time": 0, "w": 10, "h": 10, "a": 255},
                                              {"time": 100, "a": 100}]"#;
     let loaded = load([1_920, 1_080], animated, |c| set(c, 40, alpha(-10)));
@@ -132,6 +128,48 @@ fn alpha_folds_on_fixed_colour_with_one_sign() {
     let loaded = load([1_920, 1_080], &plain, |c| set(c, 40, alpha(50)));
     assert!(loaded.ok().report.notes.is_empty());
     assert!((loaded.quads(0)[0].color[3] - 150.0 / 255.0).abs() < 1e-6);
+}
+
+/// Alpha deltas of mixed sign on a fixed colour add up, and the key's
+/// alpha 200 plus their sum is clamped once to 0–255, in either order:
+/// clamping after each would give 205 for +100 then −50, 255 − 50 = 205
+/// for +400 then −50, and 50 for +50, −300, +50.
+#[test]
+fn mixed_alpha_offsets_sum_then_clamp_once() {
+    let alpha = |a| OffsetValue {
+        a,
+        ..OffsetValue::default()
+    };
+    for (deltas, want) in [
+        (&[10, -10][..], 200_u8),
+        (&[100, -50], 250),
+        (&[400, -50], 255),
+        (&[50, -300, 50], 0),
+    ] {
+        for reversed in [false, true] {
+            let mut ids = vec![40, 41, 42];
+            ids.truncate(deltas.len());
+            if reversed {
+                ids.reverse();
+            }
+            let ids: Vec<String> = ids.iter().map(ToString::to_string).collect();
+            let dst = format!(
+                r#""offsets": [{}], "dst": [{{"w": 10, "h": 10, "a": 200}}]"#,
+                ids.join(", ")
+            );
+            let loaded = load([1_920, 1_080], &dst, |c| {
+                for (id, &a) in [40, 41, 42].into_iter().zip(deltas) {
+                    set(c, id, alpha(a));
+                }
+            });
+            assert!(loaded.ok().report.notes.is_empty(), "{deltas:?} {reversed}");
+            let got = loaded.quads(0)[0].color[3];
+            assert!(
+                (got - f32::from(want) / 255.0).abs() < 1e-6,
+                "{deltas:?} {reversed}: {got}"
+            );
+        }
+    }
 }
 
 #[test]

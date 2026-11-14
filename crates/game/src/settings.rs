@@ -27,6 +27,7 @@ use crate::policy::FailureAction;
 use crate::presets::UnknownPreset;
 use crate::queue::{DEFAULT_QUEUED_PERIODS, QUEUED_PERIODS};
 use crate::save::write_atomic;
+use crate::sound_sets::{SOUND_KEYS, SoundSettings};
 use crate::tuning::{Adjust, OFFSET_LIMIT_US, SPEED_KEYS};
 
 /// The directory holding every settings file, the presets and the records.
@@ -68,6 +69,38 @@ impl DataRoot {
     #[must_use]
     pub fn records(&self) -> PathBuf {
         self.0.join("records")
+    }
+
+    /// `sound/`, the sound sets' root when `[sounds]` names none.
+    #[must_use]
+    pub fn sound(&self) -> PathBuf {
+        self.0.join("sound")
+    }
+
+    /// `bgm/`, the BGM sets' root when `[sounds]` names none.
+    #[must_use]
+    pub fn bgm(&self) -> PathBuf {
+        self.0.join("bgm")
+    }
+
+    /// `defaultsound/`, the single files looked up after the picked set.
+    #[must_use]
+    pub fn default_sounds(&self) -> PathBuf {
+        self.0.join("defaultsound")
+    }
+
+    /// `sound-sets.toml`, the sound sets' recovery state (design.md
+    /// "Threat Model", T18).
+    #[must_use]
+    pub fn sound_sets(&self) -> PathBuf {
+        self.0.join("sound-sets.toml")
+    }
+
+    /// `sound-sets.lock`, the exclusive lock of the instance that owns
+    /// `sound-sets.toml`.
+    #[must_use]
+    pub fn sound_sets_lock(&self) -> PathBuf {
+        self.0.join("sound-sets.lock")
     }
 }
 
@@ -197,6 +230,20 @@ pub enum PlayerSettingsError {
     SkinKey {
         /// The table: `skins` or `skins.<kind>`.
         table: String,
+        /// The key.
+        key: String,
+    },
+    /// A `[sounds]` root that is neither empty nor absolute.
+    #[error("[sounds] {key} '{value}' is not an absolute path")]
+    SoundRoot {
+        /// The key: `sound_root` or `bgm_root`.
+        key: &'static str,
+        /// The value refused.
+        value: String,
+    },
+    /// A key `[sounds]` does not take.
+    #[error("[sounds] has no key {key}; [sounds] takes sound_root and bgm_root")]
+    SoundKey {
         /// The key.
         key: String,
     },
@@ -889,6 +936,10 @@ pub struct PlayerSettings {
     /// (design.md "Settings Files").
     #[serde(skip_serializing_if = "SkinChoices::is_empty")]
     pub skins: SkinChoices,
+    /// Where the sound sets are found, `[sounds]` (design.md "Settings
+    /// Files"; "Audio", system sounds).
+    #[serde(skip_serializing_if = "SoundSettings::is_default")]
+    pub sounds: SoundSettings,
 }
 
 impl Default for PlayerSettings {
@@ -902,6 +953,7 @@ impl Default for PlayerSettings {
             hispeed: HiSpeedSettings::default(),
             covers: CoverSettings::default(),
             skins: SkinChoices::default(),
+            sounds: SoundSettings::default(),
         }
     }
 }
@@ -1120,6 +1172,7 @@ impl PlayerSettings {
     /// [`Shelf`]: crate::presets::Shelf
     pub fn validate(&self) -> Result<(), PlayerSettingsError> {
         self.options()?;
+        self.sounds.check()?;
         for (kind, choice) in self.skins.by_kind() {
             if let Some(choice) = choice {
                 choice.check(kind)?;
@@ -1168,7 +1221,8 @@ impl SettingsFile for DeviceSettings {
 
 impl SettingsFile for PlayerSettings {
     /// Refuses a `visible_time_ms`
-    /// ([`PlayerSettingsError::VisibleTimeRemoved`]), and an unknown key
+    /// ([`PlayerSettingsError::VisibleTimeRemoved`]), an unknown key in
+    /// `[sounds]` ([`PlayerSettingsError::SoundKey`]), and an unknown key
     /// in `[skins]` or a `[skins.<kind>]` table by its table and key
     /// ([`PlayerSettingsError::SkinKey`]). A value of another type is left
     /// to the typed parse.
@@ -1176,6 +1230,13 @@ impl SettingsFile for PlayerSettings {
         if table.contains_key("visible_time_ms") {
             return Err(SettingsError::InvalidPlayer(
                 PlayerSettingsError::VisibleTimeRemoved,
+            ));
+        }
+        if let Some(toml::Value::Table(sounds)) = table.get("sounds")
+            && let Some(key) = sounds.keys().find(|k| !SOUND_KEYS.contains(&k.as_str()))
+        {
+            return Err(SettingsError::InvalidPlayer(
+                PlayerSettingsError::SoundKey { key: key.clone() },
             ));
         }
         let Some(toml::Value::Table(skins)) = table.get("skins") else {

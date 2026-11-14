@@ -129,6 +129,12 @@ impl LifetimeState {
         self.origin
     }
 
+    /// The stage last reported (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub const fn stage(&self) -> Stage {
+        self.stage
+    }
+
     /// The lifetime is shown from `origin` on the loading clock (a lifetime
     /// made at a choice and revealed at the decision screen's deadline):
     /// the whole state published again under the next sequence number,

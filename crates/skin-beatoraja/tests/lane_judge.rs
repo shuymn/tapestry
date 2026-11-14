@@ -96,17 +96,15 @@ fn inputs() -> Vec<PhysicalInputEvent> {
     out2
 }
 
-/// The evaluator's events for the scripted play under the
-/// beatoraja-style preset.
-fn evaluated() -> Vec<JudgeEvent> {
+/// The evaluation of `inputs` over `chart` under the beatoraja-style
+/// preset.
+fn evaluate(chart: &Chart, inputs: &[PhysicalInputEvent]) -> eval::Evaluation {
     let input = EvalInput {
-        events: inputs(),
+        events: inputs.to_vec(),
         device: device(),
         ..EvalInput::default()
     };
-    eval::evaluate(&chart(), &input, &rules::beatoraja_style())
-        .unwrap()
-        .events
+    eval::evaluate(chart, &input, &rules::beatoraja_style()).unwrap()
 }
 
 /// A play of `skin` over the chart, its frames fed the events and the lane
@@ -122,8 +120,15 @@ struct Play {
 }
 
 impl Play {
+    /// The scripted play of [`inputs`] over [`chart`].
     fn new(skin: Skin) -> Self {
-        let mut d = Drawn::over(skin, &chart());
+        Self::of(skin, &chart(), inputs())
+    }
+
+    /// The play of `inputs` over `chart`.
+    fn of(skin: Skin, chart: &Chart, inputs: Vec<PhysicalInputEvent>) -> Self {
+        let events = evaluate(chart, &inputs).events;
+        let mut d = Drawn::over(skin, chart);
         let quads = d.frame(0, &[]);
         let zero = std::array::from_fn(|l| {
             let q = Self::of_lane(&quads, l);
@@ -133,8 +138,8 @@ impl Play {
         Self {
             d,
             zero,
-            events: evaluated(),
-            inputs: inputs(),
+            events,
+            inputs,
             next: (0, 0),
         }
     }
@@ -263,6 +268,27 @@ fn json_skin() -> common::Loaded {
 #[test]
 fn a_json_skin_shows_each_lane() {
     walk(&mut Play::new(json_skin().ok().skin.clone()));
+}
+
+/// An empty POOR pressed at the exact time of its already judged note
+/// reads early (10), the side its count takes, not late (11).
+#[test]
+fn an_empty_poor_on_its_note_reads_early() {
+    let c = ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .build()
+        .unwrap();
+    // A GREAT 30 ms early, then a press at the note's exact time.
+    let ins = vec![set(970, 1, 1), set(975, 1, 0), set(1_000, 1, 1)];
+    let tally = evaluate(&c, &ins).tally;
+    assert_eq!(
+        (tally.empty_poor_early, tally.empty_poor_late),
+        (1, 0),
+        "the count's side"
+    );
+    let mut p = Play::of(json_skin().ok().skin.clone(), &c, ins);
+    assert_eq!(p.at(980), lanes([0, 2, 0, 0, 0, 0, 0, 0]), "early GREAT");
+    assert_eq!(p.at(1_000), lanes([0, 10, 0, 0, 0, 0, 0, 0]), "on time");
 }
 
 /// A rearmed READY and a retry read 0 on every lane, until the next

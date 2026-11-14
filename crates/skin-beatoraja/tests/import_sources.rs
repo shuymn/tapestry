@@ -289,33 +289,26 @@ fn an_image_set_entry_whose_source_is_undefined_is_a_hole() {
     assert_eq!(l.ok().skin.choice_ref_count(), 2);
 }
 
+/// A shared id is the first table's object, an undefined `src` there
+/// ignored whatever the role and whatever later table holds the id: HIDDEN+
+/// before the note, LIFT before a BGA.
 #[test]
-fn a_shared_id_keeps_its_handling() {
-    // HIDDEN+ sharing the note's id: the source would fall through to the
-    // note; the existing handling drops it.
+fn a_shared_id_s_undefined_source_is_ignored() {
+    let ignored = |l: &Loaded| {
+        l.report()
+            .notes
+            .iter()
+            .any(|n| n.severity == Severity::Ignored && n.kind == NoteKind::UndefinedSource)
+    };
     let hidden = r#""hiddenCover": [{"id": "notes", "w": 16, "h": 16, "disapearLine": 200}]"#;
     let l = lanes_with("", hidden, "");
-    let r = l.report();
-    assert!(
-        r.notes
-            .iter()
-            .any(|n| n.severity == Severity::Dropped && n.kind == NoteKind::UndefinedSource),
-        "{:?}",
-        r.notes
-    );
-    // LIFT sharing a BGA's id: the source keeps looking; LIFT refuses.
+    assert!(ignored(&l), "{:?}", l.report().notes);
     let lift = r#""liftCover": [{"id": "b", "w": 16, "h": 16, "disapearLine": 200}],
                   "bga": {"id": "b"}"#;
-    match lanes_with(
+    let l = lanes_with(
         "",
         lift,
         r#"{"id": "b", "dst": [{"x": 20, "y": 0, "w": 430, "h": 200}]}"#,
-    )
-    .err()
-    {
-        ImportError::Critical { part, why, .. } => {
-            assert_eq!((part, why), (CriticalPart::Lift, NoteKind::UndefinedSource));
-        }
-        e => panic!("{e:?}"),
-    }
+    );
+    assert!(ignored(&l), "{:?}", l.report().notes);
 }

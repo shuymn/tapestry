@@ -1076,6 +1076,28 @@ impl ScriptSlot {
             rt.on_vm_drop(f);
         }
     }
+
+    /// The slot with the runtime it holds, if any, given a frame time no
+    /// frame reaches, on whichever thread its frames run: a test of what
+    /// the callbacks give, whose outcome a loaded machine's clock must not
+    /// decide. Under the limit's a frame a busy machine delays past it
+    /// gives the rest of its callbacks their constants (design.md
+    /// "beatoraja Lua Skins", the runtime).
+    #[must_use]
+    pub(crate) fn untimed(mut self) -> Self {
+        let rt = match &mut self.0 {
+            Slot::Staged(rt)
+            | Slot::Result {
+                running: Some(rt), ..
+            } => Some(rt),
+            Slot::Bound { running, .. } => running.as_mut().map(|(rt, _)| rt),
+            Slot::Empty | Slot::Result { .. } => None,
+        };
+        if let Some(rt) = rt {
+            rt.set_frame_time(Some(std::time::Duration::from_secs(3_600)));
+        }
+        self
+    }
 }
 
 impl Drop for ScriptSlot {

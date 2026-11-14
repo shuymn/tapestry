@@ -161,13 +161,12 @@ fn json_and_lua_judge_graphs_draw_the_same_frames() {
     );
 }
 
-/// C23: a shared id resolves as the source's lookup does. An id in
-/// `image` and `judgegraph` is the image (an earlier table returns); one
-/// in `judgegraph`, `timingdistributiongraph` and `bpmgraph` is the
-/// `bpmgraph` (the first later table); one in `judgegraph` and the
-/// `gauge` alone is the gauge; one in `judgegraph` alone stands.
+/// C23: a shared id is the first table's that holds it. An id in `image`
+/// and `judgegraph` is the image; one in `judgegraph` and any later table,
+/// `bpmgraph` and `timingdistributiongraph` or the `gauge`, is the judge
+/// graph, as is one in `judgegraph` alone.
 #[test]
-fn a_shared_id_resolves_as_the_source_looks_it_up() {
+fn a_shared_id_is_the_first_table_s() {
     let dst = |id: &str| {
         format!(r#"{{"id": "{id}", "dst": [{{"x": 100, "y": 200, "w": 520, "h": 82}}]}}"#)
     };
@@ -177,12 +176,12 @@ fn a_shared_id_resolves_as_the_source_looks_it_up() {
         (
             "x",
             r#""bpmgraph": [{"id": "x"}], "timingdistributiongraph": [{"id": "x"}],"#,
-            Some(Object::BpmGraph),
+            Some(Object::JudgeGraph),
         ),
         (
             "x",
             r#""gauge": {"id": "x", "nodes": ["b0"]},"#,
-            Some(Object::Gauge),
+            Some(Object::JudgeGraph),
         ),
         ("x", "", Some(Object::JudgeGraph)),
     ];
@@ -211,13 +210,9 @@ fn a_shared_id_resolves_as_the_source_looks_it_up() {
                     1
                 );
             }
-            Some(Object::JudgeGraph) => {
-                assert!(!chips.is_empty());
-                assert!(unsupported.is_empty(), "{unsupported:?}");
-            }
-            Some(o) => {
-                assert!(chips.is_empty(), "{o:?}");
-                assert_eq!(unsupported, [o]);
+            Some(_) => {
+                assert!(!chips.is_empty(), "{more}");
+                assert!(unsupported.is_empty(), "{more}: {unsupported:?}");
             }
         }
     }

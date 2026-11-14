@@ -217,6 +217,12 @@ impl Q {
         (self.n as f64 / self.d as f64) as f32
     }
 
+    /// The value as the model's exact ratio, in lowest terms; `None` when
+    /// it is negative or a term passes `u64`.
+    pub(crate) fn ratio(self) -> Option<skin_model::Ratio> {
+        skin_model::Ratio::new(u64::try_from(self.n).ok()?, u64::try_from(self.d).ok()?)
+    }
+
     /// The value when it is a whole number.
     pub(crate) fn integer(self) -> Option<i128> {
         (self.d == 1).then_some(self.n)

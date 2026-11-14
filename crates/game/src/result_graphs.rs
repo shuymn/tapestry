@@ -250,12 +250,14 @@ impl ResultGraphs {
     }
 }
 
-/// Counts the timing statistics' samples of `events` into `slots` by ms,
-/// truncated toward 0 ([`ResultGraphs::deviations`]).
+/// Counts the timing statistics' samples of `events` into `slots` by
+/// centred 1 ms bins ([`ResultGraphs::deviations`]): bin `k` holds the
+/// samples from `k` ms − 500 µs up to `k` ms + 500 µs, the upper bound
+/// excluded.
 fn deviations(events: &[JudgeEvent], slots: &mut [u32; DEVIATION_SLOTS]) {
     let low = TIMING_RANGE_US / 1_000;
     for s in events.iter().filter_map(timing_sample) {
-        let slot = usize::try_from(s / 1_000 + low)
+        let slot = usize::try_from((s + 500).div_euclid(1_000) + low)
             .ok()
             .and_then(|i| slots.get_mut(i));
         if let Some(n) = slot {

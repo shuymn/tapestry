@@ -160,6 +160,26 @@ fn a_bar_cut_past_its_file_s_edge_repeats_its_edge() {
     assert_eq!((at(0.5), at(0.995), at(791.0 / 810.0)), (0, 255, 255));
 }
 
+/// The selection screen looks up the common tables and its song list only:
+/// a play table holding the list's id, earlier in the lookup order, is
+/// not the destination's object.
+#[test]
+fn a_play_table_sharing_the_list_s_id_is_not_looked_up() {
+    let list = song_list(&[&at(0, 900, 300, 40)], &[&at(0, 900, 300, 40)], 0, TITLE);
+    for play in [
+        r#""hiddenCover": [{"id": "list", "src": "s"}]"#,
+        r#""judge": [{"id": "list", "index": 0, "images": [], "numbers": []}]"#,
+        r#""pmchara": [{"id": "list", "src": "s"}]"#,
+        r#""note": {"id": "list"}"#,
+    ] {
+        let d = folder(&with_option(&format!("{list}, {play}"), TEXT_T));
+        let i = import_selection(d.path()).unwrap_or_else(|e| panic!("{play}: {e:?}"));
+        let mut s = Sel::new(i.skin);
+        s.view(&view(vec![chart("a")], Some(0), None, None));
+        assert!(!s.images(0).is_empty(), "{play}");
+    }
+}
+
 /// The selected row's image file missing: refused as the selected row,
 /// naming the missing file, not as a play-critical image.
 #[test]
@@ -262,6 +282,44 @@ fn ratio_bars_draw_their_ratios() {
     assert_eq!(hit.source, skin_model::RatioSource::ListPosition);
     // 150 of the 200 travel from the slider's place: 3/4.
     assert_eq!(4 * hit.value.numerator, 3 * hit.value.denominator);
+}
+
+/// A slider's range scales exactly, as a play slider's: on a 1 280×720
+/// skin range 1 is 3/2 reference pixels across or down, so half the list
+/// moves each 3/4 from its place, `[0, 915, 15, 15]`.
+#[test]
+fn a_selection_slider_range_is_exact() {
+    let body = minimal(
+        r#""slider": [{"id": "across", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": 1, "angle": 1, "range": 1},
+                      {"id": "up", "src": "s", "x": 40, "y": 0, "w": 8, "h": 8, "type": 1, "angle": 0, "range": 1}],
+           "destination": [{"id": "list", "dst": [{"x": 0, "y": 0, "w": 0, "h": 0}]},
+               {"id": "across", "dst": [{"x": 0, "y": 100, "w": 10, "h": 10}]},
+               {"id": "up", "dst": [{"x": 0, "y": 100, "w": 10, "h": 10}]}]"#,
+    );
+    let d = folder("");
+    let json =
+        common::selection::json(&body).replace(r#""w": 1920, "h": 1080"#, r#""w": 1280, "h": 720"#);
+    common::write(d.path(), "s.json", json.as_bytes());
+    let i = import_selection(d.path()).unwrap();
+    let mut s = Sel::new(i.skin);
+    let mut v = view(
+        vec![chart("a"), chart("b"), chart("c")],
+        Some(0),
+        None,
+        None,
+    );
+    v.position = ratio(1, 2);
+    s.view(&v);
+    let sliders: Vec<[f32; 4]> = s
+        .drawn(0)
+        .into_iter()
+        .filter(|(t, _)| t[1] < 8 && (40..48).contains(&t[0]))
+        .map(|(_, r)| r)
+        .collect();
+    assert_eq!(
+        sliders,
+        [[0.75, 915.0, 15.0, 15.0], [0.0, 914.25, 15.0, 15.0]]
+    );
 }
 
 /// An active `listoff` the list does not give: slot 1's unselected arm

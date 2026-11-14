@@ -954,15 +954,24 @@ fn a_full_play_without_a_declaration_holds_five_seconds() {
     assert_eq!(rig.shown_at(), Some(T + 5_000 * MS));
 }
 
-/// A negative fadeout drops the finish margin and the fade-out, as the
-/// source's timer that is off reads 0.
+/// A negative fadeout is read as 0: the play holds its finish margin and
+/// shows the result at the hold's end, with no fade-out.
 #[test]
-fn a_negative_fadeout_skips_the_finish_margin() {
+fn a_negative_fadeout_keeps_the_finish_margin() {
     let (mut rig, _) = ending(all_hits(), 500, declared(3_000, -1));
     assert!(rig.seen.iter().all(|s| s.fading.is_none()));
     // Nor the view kept after the tail: no fade-out was ever published.
     assert_eq!(rig.side.as_mut().unwrap().view().fading, None);
-    assert_eq!(rig.shown_at(), Some(T + 5_000 * MS));
+    assert_eq!(rig.shown_at(), Some(T + 8_000 * MS));
+}
+
+/// A negative finish margin is read as 0: the fade-out starts 5 s past
+/// the anchor and the result follows the fadeout after it.
+#[test]
+fn a_negative_finish_margin_holds_as_none() {
+    let (rig, _) = ending(all_hits(), 500, declared(-3_000, 1_000));
+    assert_eq!(rig.fading(), Some(TimeUs(T + 5_000 * MS)));
+    assert_eq!(rig.shown_at(), Some(T + 6_000 * MS));
 }
 
 /// A declaration past 10 s is honoured whole, and the quit key still shows

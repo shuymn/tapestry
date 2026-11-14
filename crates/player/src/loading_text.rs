@@ -28,6 +28,8 @@ pub enum Stage {
     Scan,
     /// Building a pending play skin for the chart.
     Skin,
+    /// Waiting for the system sounds' pick to settle before READY.
+    SystemSounds,
 }
 
 impl Stage {
@@ -50,6 +52,7 @@ impl Stage {
             Self::Screen => "preparing the screen",
             Self::Scan => "waiting for the scan to pause",
             Self::Skin => "building the play skin",
+            Self::SystemSounds => "waiting for the system sounds",
         }
     }
 
@@ -63,6 +66,7 @@ impl Stage {
             Self::Screen => Label::PreparingScreen.text().to_owned(),
             Self::Scan => Label::ScanPauseWait.text().to_owned(),
             Self::Skin => Label::SkinPreparing.text().to_owned(),
+            Self::SystemSounds => Label::SystemSoundsWait.text().to_owned(),
         }
     }
 }
@@ -214,6 +218,7 @@ mod tests {
             Stage::Screen,
             Stage::Scan,
             Stage::Skin,
+            Stage::SystemSounds,
         ] {
             let p = text.lines(stage);
             assert!(p.lines.len() <= PAGE_LINES);
@@ -253,6 +258,7 @@ mod tests {
             (Stage::Screen, "画面を準備しています"),
             (Stage::Scan, "ライブラリのスキャンの一時停止を待っています"),
             (Stage::Skin, "スキンを準備しています"),
+            (Stage::SystemSounds, "システム音を準備しています"),
         ] {
             assert_eq!(
                 strings(&text, stage),

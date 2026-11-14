@@ -49,7 +49,7 @@ use crate::widget::bar::{BarGroupError, BarScratch, MAX_BAR_GROUPS};
 use crate::widget::bpm_graph::{BpmDraw, BpmGraph, BpmGraphDef, bpm_columns};
 use crate::widget::cover_paint::{
     CoverImage, CoverMotion, CoverPaint, CoverPaintDef, CoverPaintError, CoverTrim, PaintImage,
-    SliderRate, TrimOutcome,
+    SliderRate, TrimOutcome, range_within,
 };
 use crate::widget::digits::{Align, Digits, MAX_DIGIT_OFFSETS, Number, NumberDef, NumberError};
 use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError, Shown};
@@ -196,7 +196,7 @@ pub struct DecisionDefs {
 pub struct PlayEnding {
     /// The hold past the finish point before the fade-out, at least 0.
     pub finish_margin: TimeUs,
-    /// The fade-out's length as declared, which may be negative.
+    /// The fade-out's length, at least 0 as the importer reads it.
     pub fadeout: TimeUs,
 }
 
@@ -936,9 +936,11 @@ fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
             _ => None,
         };
         let slider = paint.and_then(|p| p.slider);
-        // The slider's reach toward each side: up, down, left, right.
+        // The slider's reach toward each side: up, down, left, right, its
+        // checked range rounded up.
         let [s_up, s_down, s_left, s_right] = slider.map_or([0; 4], |s| {
-            let r = i64::from(s.range);
+            let r = s.range.numerator.div_ceil(s.range.denominator.max(1));
+            let r = i64::try_from(r).unwrap_or(i64::MAX);
             match s.direction {
                 SliderDirection::Up => [r, 0, 0, 0],
                 SliderDirection::Down => [0, r, 0, 0],
@@ -1426,8 +1428,10 @@ fn check_image_choices(
 
 /// The paint checks of [`Skin::new`], every definition in order,
 /// referenced or not: its image or choice table exists, its slider's range
-/// is at most [`MAX_COORD`] and comes without a motion, a trim or a gate
-/// track, a gate track comes with a trim, its keys lie within
+/// has a denominator from 1 to
+/// [`MAX_RANGE_DENOMINATOR`](crate::MAX_RANGE_DENOMINATOR), is at most
+/// [`MAX_COORD`] and comes without a motion, a trim or a gate track, a
+/// gate track comes with a trim, its keys lie within
 /// ±[`MAX_COORD`] with no negative width or height, and a trim base lies
 /// within ±[`MAX_COORD`].
 fn check_cover_paints(w: &WidgetDefs, images: usize) -> Result<(), LoadError> {
@@ -1440,7 +1444,7 @@ fn check_cover_paints(w: &WidgetDefs, images: usize) -> Result<(), LoadError> {
             }
             CoverImage::Image(_) | CoverImage::Choice(_) => None,
         };
-        let range = p.slider.is_some_and(|s| i64::from(s.range) > max);
+        let range = p.slider.is_some_and(|s| !range_within(s.range));
         let slider_moves = p.slider.is_some()
             && (p.motion != CoverMotion::None
                 || p.trim != CoverTrim::None
@@ -1727,8 +1731,7 @@ fn check_selection_widgets(
     for (bar, b) in sel.ratio_bars.iter().enumerate() {
         let error = if frames(b.image).is_none() {
             Some(RatioBarError::UnknownImage)
-        } else if matches!(b.form, RatioForm::Slider { range, .. } if range > MAX_COORD.unsigned_abs())
-        {
+        } else if matches!(b.form, RatioForm::Slider { range, .. } if !range_within(range)) {
             Some(RatioBarError::Range)
         } else {
             None
@@ -1970,7 +1973,9 @@ impl Skin {
     /// image exists, its source is a play's ([`RatioSource::play`]: an element
     /// drawing one of another source is refused,
     /// [`LoadError::SourceKind`]) and a slider's range is at most
-    /// [`MAX_COORD`]. A play records no slider press.
+    /// [`MAX_COORD`] over a denominator from 1 to
+    /// [`MAX_RANGE_DENOMINATOR`](crate::MAX_RANGE_DENOMINATOR). A play
+    /// records no slider press.
     ///
     /// # Errors
     ///
@@ -2010,8 +2015,10 @@ impl Skin {
     /// [`MAX_PLACEMENTS`] placements and its center among them, every
     /// part's image, timer, font and strip exists, each visibility is a
     /// bool and each key lies within ±[`MAX_COORD`]; every ratio bar's
-    /// image exists and a slider's range is at most [`MAX_COORD`]. Each
-    /// song list element is charged its parts' visibilities once per slot,
+    /// image exists and a slider's range is at most [`MAX_COORD`] over a
+    /// denominator from 1 to
+    /// [`MAX_RANGE_DENOMINATOR`](crate::MAX_RANGE_DENOMINATOR). Each song
+    /// list element is charged its parts' visibilities once per slot,
     /// and its worst quads per slot.
     ///
     /// # Errors
@@ -4073,6 +4080,9 @@ impl Skin {
         for r in &sel.row_hits {
             r.set(None);
         }
+        for b in &sel.search {
+            b.set(None);
+        }
         if uvs.sheet_id() != self.sheet_id || uvs.frames().len() != self.frame_count {
             return Ok(());
         }
@@ -4124,8 +4134,8 @@ impl Skin {
     ///   (`select/BarRenderer.java:80-101`); none, and the walk goes on.
     ///
     /// The hit is `None` when nothing is hit. Apart from it, the answer
-    /// says which search texts' input boxes, as the last build to sample
-    /// each placed it (drawn now or hidden since), hold the point
+    /// says which search texts' input boxes, as the last build sampled
+    /// them (a box it did not sample holds no point), hold the point
     /// ([`SearchBoxes`](crate::SearchBoxes)), which decides the focused
     /// box's blur whatever is hit (`skin/Skin.java:394-397`,
     /// `skin/SkinTextInput.java:77-81`). [`PressHit::NONE`] for a state of
@@ -4811,13 +4821,11 @@ impl Skin {
                 _ => None,
             };
             // HIDDEN+'s paint, and what follows HIDDEN+, show only while
-            // HIDDEN+ is on, at any amount. The source hides a follower by
-            // its destination's alpha (`play/LaneRenderer.java:334-345`), so
-            // a timing visualizer's lines, drawn in their own colour and
-            // alpha, still show; its band does not.
+            // HIDDEN+ is on, at any amount; a timing visualizer is skipped
+            // whole, its lines with its band.
             let hidden_off = e.follow.hides(lanes.as_ref());
             if (paint.is_some_and(|p| p.motion == CoverMotion::Hidden) && !scene.hidden_enabled)
-                || (hidden_off && !matches!(e.kind, Kind::TimingVisualizer(..)))
+                || hidden_off
             {
                 #[cfg(feature = "dev-tools")]
                 out.observed(crate::observation::Outcome::HiddenOff);
@@ -4872,9 +4880,9 @@ impl Skin {
             // A search text's input box, the region moved by the alignment
             // (`skin/SkinText.java:162-169`), kept in the state as sampled
             // here, before a hover rect hides it: the source prepares its
-            // `region` before its `mouseRect` test, and a condition or a
-            // timer that hides it leaves the last one
-            // (`skin/SkinObject.java:348-356, 591-607`).
+            // `region` before its `mouseRect` test
+            // (`skin/SkinObject.java:591-607`). A build that does not
+            // sample it leaves none.
             let search_box = match (e.press, e.kind) {
                 (Some((slot, Press::Search { index })), Kind::Text(_, text)) => {
                     let rect = on_target(canvas, affine, pointer::input_box(text.align, region));
@@ -4965,11 +4973,7 @@ impl Skin {
                 map,
                 pivot: e.pivot,
                 angle: radians(s.angle + turn),
-                color: if hidden_off {
-                    [s.color[0], s.color[1], s.color[2], 0.0]
-                } else {
-                    s.color
-                },
+                color: s.color,
                 native: match chart {
                     Some((_, native)) => native,
                     None => choice.map_or(e.native, |p| p.native),
@@ -5148,8 +5152,14 @@ impl Skin {
                                     SliderDirection::Up | SliderDirection::Down => sy,
                                     SliderDirection::Right | SliderDirection::Left => sx,
                                 } * canvas.scale();
-                                #[expect(clippy::cast_precision_loss, reason = "within ±2^20")]
-                                let range = range as f32 * axis;
+                                #[expect(
+                                    clippy::cast_precision_loss,
+                                    reason = "a checked range's terms are at most 2^28, exact"
+                                )]
+                                let range = f32_of(
+                                    range.numerator as f64 * f64::from(axis)
+                                        / range.denominator as f64,
+                                );
                                 record(
                                     slot,
                                     Target::Slider(Hit {

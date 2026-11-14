@@ -75,7 +75,12 @@ impl Frames {
     /// Waits for `n` frames drawn on `device` (any, for `None`) since the
     /// last [`clear`](Self::clear), and returns them.
     fn next(&self, n: usize, device: Option<u64>) -> Vec<Seen> {
-        let on = |s: &Seen| device.is_none_or(|d| s.device == d);
+        self.next_of(n, |s| device.is_none_or(|d| s.device == d))
+    }
+
+    /// Waits for `n` frames drawn since the last [`clear`](Self::clear)
+    /// for which `on` holds, and returns them.
+    fn next_of(&self, n: usize, on: impl Fn(&Seen) -> bool) -> Vec<Seen> {
         assert!(
             wait_until(|| self.seen.lock().unwrap().iter().filter(|s| on(s)).count() >= n),
             "no {n} selection frames"
@@ -166,7 +171,7 @@ fn chart_skin() -> (
     let limits = crate::render_common::offscreen(1_920, 1_080).atlas_limits();
     let (skin, script) =
         crate::selection_skin::fixture_scripted(limits, dir.path(), "chart.luaskin");
-    (dir, skin, script)
+    (dir, skin, script.untimed())
 }
 
 /// A render thread on WARP with the chart fixture's selection skin
@@ -249,6 +254,10 @@ fn a_selection_publication_draws_only_for_its_cursor_generation() {
     // Another cursor generation: the table is dropped before the next
     // frame, though nothing was published.
     cursor.store(2, Ordering::SeqCst);
+    // The render thread takes the fence between frames: a frame drawn
+    // before another cursor generation is pushed by then, so every frame after the clear
+    // began after it.
+    assert!(r.link.fence(Duration::from_secs(60)));
     r.frames.clear();
     assert!(r.frames.next(3, None).iter().all(draws_none));
     // A publication of the older generation publishes nothing.
@@ -430,6 +439,10 @@ fn a_rested_cursors_images_are_drawn() {
     r.frames.sample.store(false, Ordering::Release);
     // A move: not current from the next frame.
     w.cursor_changed(&coord);
+    // The render thread takes the fence between frames: a frame drawn
+    // before the move is pushed by then, so every frame after the clear
+    // began after it.
+    assert!(r.link.fence(Duration::from_secs(60)));
     r.frames.clear();
     assert!(r.frames.next(3, None).iter().all(draws_none));
     // A chart naming no image.
@@ -591,7 +604,8 @@ fn an_entry_with_no_departure_draws_nothing_of_the_last_visit() {
             w.current_selection().is_some() && w.idle() && !w.selection_pending()
         });
         frames.clear();
-        frames.until(|s| draws_images(s, layer));
+        let last = frames.until(|s| draws_images(s, layer));
+        let (last, _) = last.update.expect("a selection frame's update");
         // Refused before the departure: the chart left and selection
         // entered again, the cursor on the all-charts row meanwhile.
         assert!(rig.selection.as_mut().unwrap().screen.move_to(0));
@@ -600,8 +614,10 @@ fn an_entry_with_no_departure_draws_nothing_of_the_last_visit() {
         for _ in 0..3 {
             assert!(rig.choose().is_none());
         }
-        frames.clear();
-        let seen = frames.next(3, None);
-        assert!(seen.iter().all(draws_none), "{:?}", seen.last());
+        // The new visit's frames: one the render thread drew before it
+        // took the entry is the last visit's, however late it lands.
+        let seen = frames.next_of(3, |s| s.update.is_some_and(|(lifetime, _)| lifetime > last));
+        let drew = seen.iter().find(|s| !draws_none(s));
+        assert!(drew.is_none(), "{drew:?}");
     });
 }

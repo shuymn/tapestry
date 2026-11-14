@@ -24,6 +24,7 @@ use crate::canvas::f32_of;
 use crate::place::{Affine, LaneMap};
 use crate::play::schema::PROGRESS_FULL;
 use crate::quad::ClipRect;
+use crate::selection::Ratio;
 use crate::track::Track;
 
 /// What a cover paint shows.
@@ -94,25 +95,46 @@ pub struct CoverPaintDef {
 }
 
 /// A paint's slider (`skin/SkinSlider.java:116-120` at `0.8.9`): moved by
-/// `range` reference pixels, at most [`MAX_COORD`](crate::MAX_COORD), times
-/// its rate, from 0 to 1, toward `direction`.
+/// `range` reference pixels times its rate, from 0 to 1, toward
+/// `direction`. The range is exact ([`range_within`]): its denominator
+/// from 1 to [`MAX_RANGE_DENOMINATOR`], its value at most
+/// [`MAX_COORD`](crate::MAX_COORD).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slider {
-    pub range: u32,
+    pub range: Ratio,
     pub rate: SliderRate,
     pub direction: SliderDirection,
 }
 
 impl Slider {
-    /// SUDDEN+'s slider: down by `range` times SUDDEN+'s share.
+    /// SUDDEN+'s slider: down by `range` whole reference pixels times
+    /// SUDDEN+'s share.
     #[must_use]
     pub const fn sudden(range: u32) -> Self {
         Self {
-            range,
+            range: Ratio {
+                numerator: range as u64,
+                denominator: 1,
+            },
             rate: SliderRate::Sudden,
             direction: SliderDirection::Down,
         }
     }
+}
+
+/// The largest denominator of a slider's range. With the range at most
+/// [`MAX_COORD`](crate::MAX_COORD) (2^20), its numerator is at most 2^28,
+/// so its product with an `f32`, 24 significant bits, has at most 52 and
+/// is exact in `f64`.
+pub const MAX_RANGE_DENOMINATOR: u64 = 256;
+
+/// Whether a slider's range `r` is one a skin may hold: its denominator
+/// from 1 to [`MAX_RANGE_DENOMINATOR`] and its value at most
+/// [`MAX_COORD`](crate::MAX_COORD). Checked before any reach or motion is
+/// computed from it.
+pub(crate) fn range_within(r: Ratio) -> bool {
+    (1..=MAX_RANGE_DENOMINATOR).contains(&r.denominator)
+        && r.numerator <= u64::from(crate::MAX_COORD.unsigned_abs()) * r.denominator
 }
 
 /// The rate a slider moves by.
@@ -151,7 +173,10 @@ pub enum CoverPaintError {
     UnknownImage,
     #[error("its image choice table does not exist")]
     UnknownChoice,
-    #[error("its slider range is above {}", crate::MAX_COORD)]
+    #[error(
+        "its slider range is above {} or its denominator outside 1 to {MAX_RANGE_DENOMINATOR}",
+        crate::MAX_COORD
+    )]
     Range,
     #[error("it has a slider and a motion, a trim or a gate track")]
     SliderMotion,
@@ -205,16 +230,19 @@ pub(crate) enum TrimOutcome {
 
 impl CoverPaint {
     /// The slider's displacement `[dx, dy]` this frame in reference
-    /// pixels, y down: `R` times its rate toward its direction
-    /// (`skin/SkinSlider.java:116-120` at `0.8.9`). SUDDEN+'s rate is
-    /// `c · (1000 − l) / 10⁶` of the view's effective amounts, each at most
-    /// 1 000 ‰ (`skin/property/FloatPropertyFactory.java:139-151`); the
-    /// progress's `p / 10⁶` of `progress`, `time.progress_ppm` clamped to
-    /// 0..=10⁶. Each numerator is exact in `u64` and `f64` (below 2^41);
-    /// only the division rounds. A program rate reads its output from
-    /// `fields` (`base` the slot of output 0): not drawn without a value
-    /// (its `ok` not 1), else its `f32` bits, a non-finite value as 0,
-    /// `R · value` exact in `f64`, and not drawn past [`MAX_SLIDE`].
+    /// pixels, y down: `R = n / d` times its rate toward its direction
+    /// (`skin/SkinSlider.java:116-120` at `0.8.9`), `R` a checked range
+    /// ([`range_within`]: `n` at most 2^28, `d` at most 2^8). SUDDEN+'s rate
+    /// is `c · (1000 − l) / 10⁶` of the view's effective amounts, each at
+    /// most 1 000 ‰ (`skin/property/FloatPropertyFactory.java:139-151`);
+    /// the progress's `p / 10⁶` of `progress`, `time.progress_ppm` clamped
+    /// to 0..=10⁶. `n` times either rate (below 2^48) and `d · 10⁶` are
+    /// exact in `u64` and `f64`; only their division rounds. A program
+    /// rate reads its output from `fields` (`base` the slot of output 0):
+    /// not drawn without a value (its `ok` not 1), else its `f32` bits, a
+    /// non-finite value as 0; `n · value` has at most 24 + 28 significant
+    /// bits and is finite, so it is exact in `f64` and only its division
+    /// by `d` rounds; past [`MAX_SLIDE`] it is not drawn.
     pub(crate) fn slider_offset(
         &self,
         view: LaneView,
@@ -225,6 +253,11 @@ impl CoverPaint {
         let Some(s) = self.slider else {
             return Ok([0.0, 0.0]);
         };
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "a checked range's terms are at most 2^28, exact in f64"
+        )]
+        let (n, den) = (s.range.numerator as f64, s.range.denominator as f64);
         let d = match s.rate {
             SliderRate::Sudden | SliderRate::Progress => {
                 let rate = if s.rate == SliderRate::Sudden {
@@ -234,10 +267,9 @@ impl CoverPaint {
                 } else {
                     u64::from(progress.clamp(0, PROGRESS_FULL).unsigned_abs())
                 };
-                let n = u64::from(s.range) * rate;
-                #[expect(clippy::cast_precision_loss, reason = "below 2^41, exact in f64")]
-                let n = n as f64;
-                n / 1_000_000.0
+                #[expect(clippy::cast_precision_loss, reason = "below 2^20, exact in f64")]
+                let rate = rate as f64;
+                n * rate / (den * 1_000_000.0)
             }
             SliderRate::Program(k) => {
                 let at = base.saturating_add(usize::from(k).saturating_mul(2));
@@ -250,7 +282,7 @@ impl CoverPaint {
                 )]
                 let v = f32::from_bits(fields.get(at).copied().unwrap_or(0) as u32);
                 let v = if v.is_finite() { f64::from(v) } else { 0.0 };
-                let d = v * f64::from(s.range);
+                let d = v * n / den;
                 if d.abs() > MAX_SLIDE {
                     return Err(SlideStop::Beyond);
                 }
@@ -316,5 +348,40 @@ impl CoverPaint {
         }
         let rect = affine.rect([map.x(x), f32_of(top), map.w(w), f32_of(t - top)]);
         ClipRect::new(rect).map_or(TrimOutcome::Suppressed, TrimOutcome::Clipped)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CoverMotion, CoverPaint, CoverTrim, PaintImage, Slider, SliderRate, range_within};
+    use crate::selection::Ratio;
+    use crate::widget::lanes::LaneView;
+    use crate::widget::ratio_bar::SliderDirection;
+
+    /// A rate's motion rounds once: `n · rate / (d · 10⁶)`, here
+    /// 380511.90072836366, where dividing by `d` first rounds twice and
+    /// gives 380511.9007283636.
+    #[test]
+    fn a_rate_s_motion_rounds_once() {
+        let range = Ratio {
+            numerator: 15_402_619,
+            denominator: 22,
+        };
+        assert!(range_within(range));
+        let paint = CoverPaint {
+            image: PaintImage::Choice(0),
+            slider: Some(Slider {
+                range,
+                rate: SliderRate::Progress,
+                direction: SliderDirection::Down,
+            }),
+            motion: CoverMotion::None,
+            trim: CoverTrim::None,
+            gate: None,
+        };
+        assert_eq!(
+            paint.slider_offset(LaneView::NONE, 543_496, &[], 0),
+            Ok([0.0, 380_511.900_728_363_66])
+        );
     }
 }

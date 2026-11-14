@@ -192,6 +192,49 @@ fn a_gradient_of_blend_four_multiplies_what_is_under_it() {
     near(f.at_row(50), 128.0 * 212.0 / 255.0);
 }
 
+/// Blend 3 draws as blend 2, additive, in a JSON skin and a Lua skin
+/// alike, with one note at its destination: the source sets the
+/// subtract equation and resets it to add before its quads draw
+/// (`skin/Skin.java:657-662` at `0.8.9`).
+// Source: SF-006
+#[test]
+fn blend_three_draws_additive() {
+    let notes = |r: &skin_beatoraja::Report| -> Vec<_> {
+        r.notes.iter().map(|n| (n.severity, n.kind)).collect()
+    };
+    let add = Frame::clean(skin(&header(r#", "blend": 2"#)), 0);
+    let l = skin(&header(r#", "blend": 3"#));
+    assert_eq!(
+        notes(l.report()),
+        [(Severity::Ignored, NoteKind::SubtractBlend)]
+    );
+    let f = Frame::of(l, 0);
+    assert_eq!(f.blends, [Blend::Alpha, Blend::Add]);
+    for row in [0, 50, 99] {
+        near(f.at_row(row), 255.0 + f32::from(grey(row)));
+        assert_eq!(f.at_row(row), add.at_row(row), "{row}");
+    }
+    let lua = "local skin = { type = 0, name = \"t\", w = 1920, h = 1080 }\n\
+        if not skin_config then return skin end\n\
+        skin.source = { { id = \"a\", path = \"a.png\" } }\n\
+        skin.image = { { id = \"w\", src = \"a\", x = 0, y = 0, w = 64, h = 64 } }\n\
+        skin.destination = {\n\
+          { id = \"w\", dst = { { x = 0, y = 0, w = 64, h = 64 } } },\n\
+          { id = \"w\", blend = 3, dst = { { x = 0, y = 0, w = 64, h = 64 } } } }\n\
+        return skin\n";
+    let d = common::skin(&[("s.luaskin", lua)]);
+    common::png(d.path(), "a.png", 64, 64);
+    let i = common::lua_import(d.path()).unwrap_or_else(|e| panic!("{e:?}"));
+    assert_eq!(
+        notes(&i.imported.report),
+        [(Severity::Ignored, NoteKind::SubtractBlend)]
+    );
+    let mut d = common::play::Drawn::new(i.imported.skin, 0);
+    d.frame(0, &[]);
+    let blends: Vec<_> = d.batch.runs().iter().map(|r| r.key.blend).collect();
+    assert_eq!(blends, [Blend::Alpha, Blend::Add]);
+}
+
 #[test]
 fn multiply_ignores_the_tint_alpha_but_not_its_colour() {
     // A tint of 128 grey at alpha 64: the white times 212/255 times

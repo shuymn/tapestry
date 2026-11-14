@@ -21,6 +21,7 @@ use anyhow::Context as _;
 use render::measure::{SpanCount, count_span};
 
 use crate::measure::Figures;
+use crate::sound_sets_disk::link_count;
 
 /// The setting that names PresentMon's executable.
 pub const ENV: &str = "TAPESTRY_PRESENTMON";
@@ -90,13 +91,17 @@ pub struct Capture {
 
 impl Capture {
     /// Starts PresentMon capturing `process` into `csv`, its output into
-    /// `log`, and waits until its session runs.
+    /// `log`, and waits until its session runs. Both are in the data root,
+    /// so neither is written through a link: the log is a new file, and a
+    /// link at `csv` is removed before PresentMon, which opens its file
+    /// itself, starts.
     ///
     /// # Errors
     ///
     /// Why it did not start, or that it exited while starting.
     pub fn start(exe: &Path, process: &str, csv: &Path, log: &Path) -> anyhow::Result<Self> {
-        let out = std::fs::File::create(log).with_context(|| log.display().to_string())?;
+        game::clear_link(csv, link_count).with_context(|| csv.display().to_string())?;
+        let out = game::create_fresh(log).with_context(|| log.display().to_string())?;
         let err = out.try_clone()?;
         let child = Command::new(exe)
             .args(args(process, csv))
@@ -443,7 +448,7 @@ mod tests {
 
     use render::measure::Presentation;
 
-    use super::{PlayCapture, PmError, PmFrame, count_play, locate, parse};
+    use super::{Capture, PlayCapture, PmError, PmFrame, count_play, locate, parse};
     use crate::measure::Figures;
 
     const HEADER: &str = "Application,ProcessID,SwapChainAddress,PresentRuntime,SyncInterval,PresentFlags,AllowsTearing,PresentMode,CPUStartQPC,MsBetweenSimulationStart,MsPCLatency,MsBetweenPresents,MsBetweenAppStart,MsCPUBusy,MsCPUWait,MsInPresentAPI,MsGPULatency,MsGPUTime,MsGPUBusy,MsGPUWait,MsVideoBusy,MsAnimationError,AnimationTime,MsFlipDelay,DisplayLatency,DisplayedTime,MsUntilDisplayed,MsBetweenDisplayChange";
@@ -462,6 +467,41 @@ mod tests {
     /// A 10 MHz QPC with its origin at 1 000 000 000 ticks.
     fn to_us(ticks: i64) -> i64 {
         (ticks - 1_000_000_000) / 10
+    }
+
+    /// A capture into `measure\` in the data root writes through no link
+    /// there: links at its log and its CSV, to files of a sound set when
+    /// the data root lies in one, are removed before PresentMon starts, so
+    /// those files keep their bytes (design.md T18). PresentMon itself is
+    /// a missing program here, so the start fails after the files are
+    /// prepared. Making the links needs the right to; without it the test
+    /// says so and checks nothing.
+    // Covers: T18
+    #[test]
+    fn a_capture_never_writes_through_a_link() {
+        let dir = tempfile::tempdir().unwrap();
+        let measure = dir.path().join("measure");
+        std::fs::create_dir_all(&measure).unwrap();
+        let log = measure.join("1.presentmon.log");
+        let csv = measure.join("1.presentmon.csv");
+        for (link, name) in [(&log, "scratch.wav"), (&csv, "select.wav")] {
+            let target = dir.path().join(name);
+            std::fs::write(&target, name).unwrap();
+            if !crate::log_file::tests::symlink(&target, link) {
+                return;
+            }
+        }
+        let missing = dir.path().join("no-presentmon.exe");
+        assert!(Capture::start(&missing, "tapestry.exe", &csv, &log).is_err());
+        for name in ["scratch.wav", "select.wav"] {
+            let bytes = std::fs::read(dir.path().join(name)).unwrap();
+            assert_eq!(bytes, name.as_bytes(), "{name} was written");
+        }
+        assert!(!std::fs::symlink_metadata(&log).unwrap().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&csv).is_err(),
+            "the CSV link stays"
+        );
     }
 
     #[test]

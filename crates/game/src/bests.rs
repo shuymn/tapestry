@@ -115,9 +115,8 @@ pub struct BestFigures {
     pub bp_diff: Option<i64>,
     /// The best's lamp; `None` when empty.
     pub clear: Option<BestLamp>,
-    /// The best's max combo; `None` (nothing drawn) unless it is above 0,
-    /// as the source draws its old combo only then
-    /// (`IntegerPropertyFactory.java:734-752` at `0.8.9`).
+    /// The best's max combo, 0 included; `None` (nothing drawn) while
+    /// no play counts for the best.
     pub max_combo: Option<u32>,
     /// The view's max combo minus it; `None` as `max_combo`.
     pub max_combo_diff: Option<i64>,
@@ -150,12 +149,7 @@ impl BestCompare {
         let (best_ex, best_bp, best_combo, clear) = match before {
             BestLookup::Unavailable => return Self::Unavailable,
             BestLookup::KnownEmpty => (0, None, None, None),
-            BestLookup::Known(b) => (
-                b.ex.unwrap_or(0),
-                b.bp,
-                b.max_combo.filter(|c| *c > 0),
-                b.clear,
-            ),
+            BestLookup::Known(b) => (b.ex.unwrap_or(0), b.bp, b.max_combo, b.clear),
         };
         let rate = (!random)
             .then(|| Rate::of(best_ex, figures.max_ex))
@@ -455,11 +449,20 @@ mod tests {
         assert_eq!((b.max_combo, b.max_combo_diff), (Some(100), Some(-20)));
     }
 
-    /// A best max combo of 0, an empty best and one without a best draw
-    /// nothing, as the source draws its old combo only above 0.
+    /// A known best max combo of 0 is drawn: 0, and 50 − 0 for a view of
+    /// 50.
     #[test]
-    fn a_zero_previous_combo_hides_173_and_175() {
-        for before in [known(Some(0)), known(None), super::BestLookup::KnownEmpty] {
+    fn a_zero_previous_combo_shows_173_and_175() {
+        let super::BestCompare::Known(b) = compare_combo(&known(Some(0)), 50) else {
+            panic!("unavailable");
+        };
+        assert_eq!((b.max_combo, b.max_combo_diff), (Some(0), Some(50)));
+    }
+
+    /// An empty best and one with no max combo draw nothing.
+    #[test]
+    fn no_previous_combo_hides_173_and_175() {
+        for before in [known(None), super::BestLookup::KnownEmpty] {
             let super::BestCompare::Known(b) = compare_combo(&before, 50) else {
                 panic!("unavailable");
             };

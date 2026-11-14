@@ -224,7 +224,7 @@ fn on_pointer_from<R>(
             .unwrap(),
         game::Preparation::Ready
     );
-    sel.started(None, Some((3, 7)));
+    sel.started(Vec::new(), Some((3, 7)));
     sel.pointer.log = Some(Vec::new());
     let shared = Arc::clone(&sel.pointer.shared);
     render.pointer(Arc::clone(&shared));
@@ -1597,7 +1597,7 @@ fn pointer_dispatch_alloc() {
     );
     // Top: all charts (0), folders f0 to f2 (1 to 3), charts d to h (4 to
     // 7); the cursor on f2, drawn at slot 3.
-    sel.started(None, Some((3, 7)));
+    sel.started(Vec::new(), Some((3, 7)));
     sel.feed.enter(TimeUs(0));
     let lifetime = sel.feed.lifetime;
     sel.pointer.enter(lifetime);

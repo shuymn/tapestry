@@ -2,12 +2,15 @@
 //! for one set of enabled options, field by field, by the type each field
 //! expects.
 //!
-//! The source enables the wrappers only for the types it registers
-//! serializers for (`JsonSkinSerializer.java:34-97` at the `0.8.9` tag);
-//! of those the header reads `Property`, `Filepath` and `Offset` and their
-//! arrays. Every other field, `category` and option items included, is
-//! read literally or not at all: a wrapper there is an ordinary member and
-//! nothing it names is read.
+//! The wrappers expand in every top-level array and record the import
+//! reads ([`ARRAYS`], [`RECORDS`]) and, in the header, in `Property`,
+//! `Filepath` and `Offset` and their arrays: the types the source
+//! registers serializers for (`JsonSkinSerializer.java:34-97` at the
+//! `0.8.9` tag), and `bpmgraph`, `hiddenCover`, `liftCover` and `pmchara`,
+//! which it registers none for (design.md "Differences from the source",
+//! imported skins). Every other field, `category` and option items
+//! included, is read literally or not at all: a wrapper there is an
+//! ordinary member and nothing it names is read.
 //!
 //! - An array field (`ArraySerializer.read`, JsonSkinSerializer.java:278-
 //!   324): each item that is an object with `if` and `value` or `values`
@@ -469,21 +472,21 @@ impl Definition {
     }
 
     /// A `float` field (`JsonValue.asFloat`, Lua's `tofloat`): a number
-    /// token's double, or a Lua number, rounded to `f32` as Java's `(float)`
-    /// rounds it; a JSON string as Java's `Float.parseFloat` reads it
-    /// ([`crate::java_float::parse_float`]); a Lua
-    /// string as LuaJ converts it ([`crate::lua::num_scan::todouble`]). The
-    /// value may be non-finite; the caller decides.
+    /// token's double, or a Lua number, rounded to the nearest `f32`; a
+    /// string read as a numeral and rounded the same way, a JSON one as a
+    /// decimal numeral ([`crate::numeral::decimal`], none refused), a Lua one
+    /// as a decimal or hexadecimal numeral ([`crate::numeral::number`], none
+    /// 0). The value may be non-finite; the caller decides.
     pub(crate) fn float(&mut self, id: u32, field: &'static str) -> Result<f32, ImportError> {
-        // Java's `(float)` of a `double` or a `long`: round to nearest.
+        // A `double` or a `long` to the nearest `f32`.
         #[expect(
             clippy::cast_possible_truncation,
-            reason = "Java's (float) narrows a double by rounding, as `as` does"
+            reason = "a double narrows to the nearest `f32`, as `as` does"
         )]
         let narrow = |v: f64| v as f32;
         #[expect(
             clippy::cast_precision_loss,
-            reason = "Java's (float) of a long rounds, as `as` does"
+            reason = "a long rounds to the nearest `f32`, as `as` does"
         )]
         let long = |v: i64| v as f32;
         match self.arena.scalar(id) {
@@ -506,13 +509,11 @@ impl Definition {
                 } else {
                     raw
                 };
-                // A Lua string is LuaJ's `tofloat()`: its `todouble()`
-                // (an integer scan that wraps, NaN read as 0) narrowed.
                 if lua {
-                    return Ok(narrow(crate::lua::num_scan::todouble(s.as_bytes())));
+                    return Ok(crate::numeral::number(s.as_bytes()).map_or(0.0, narrow));
                 }
-                // A JSON string is Java's `Float.parseFloat`.
-                crate::java_float::parse_float(s)
+                crate::numeral::decimal(s.as_bytes())
+                    .map(narrow)
                     .ok_or_else(|| self.type_error(id, field, "a number"))
             }
             Scalar::Callable => Err(self.callable_error(id, field)),
@@ -680,10 +681,8 @@ pub fn resolve<'d>(
     })
 }
 
-/// The top-level fields the import reads, in [`Tables::arrays`] order.
-/// Every one has an array serializer (JsonSkinSerializer.java:73-97)
-/// except `bpmgraph`, `hiddenCover`, `liftCover` and `pmchara`, which are
-/// read literally ([`LITERAL`]).
+/// The top-level fields the import reads, in [`Tables::arrays`] order,
+/// each resolved as an array field.
 pub(crate) const ARRAYS: [&str; 22] = [
     "source",
     "font",
@@ -708,10 +707,6 @@ pub(crate) const ARRAYS: [&str; 22] = [
     "customEvents",
     "destination",
 ];
-
-/// The fields of [`ARRAYS`] with no array serializer: their items are
-/// records as written, no wrapper expanded.
-const LITERAL: [&str; 4] = ["bpmgraph", "hiddenCover", "liftCover", "pmchara"];
 
 /// The top-level records the import reads (`ObjectSerializer`), in
 /// [`Tables::records`] order.
@@ -760,9 +755,9 @@ pub(crate) struct Tables {
 
 impl Resolved<'_> {
     /// Resolves the fields the import reads with the options in `enabled`,
-    /// the same ones this resolution used: the registered arrays and
+    /// the same ones this resolution used: the top-level arrays and
     /// records, and each destination's `dst` (an `Animation[]` with its own
-    /// array serializer). Literal arrays keep their items as written.
+    /// array serializer).
     ///
     /// # Errors
     ///
@@ -789,19 +784,7 @@ impl Resolved<'_> {
             let Some(id) = r.def.arena.last_member(top, name) else {
                 continue;
             };
-            if LITERAL.contains(name) {
-                if r.def.arena.is_mixed(id) {
-                    return Err(r.def.mixed_error(id));
-                }
-                if r.def.arena.is_array(id) {
-                    let items: Vec<u32> = r.def.arena.children(id).collect();
-                    for item in items {
-                        r.emit(item, out)?;
-                    }
-                }
-            } else {
-                r.array(id, 2, out)?;
-            }
+            r.array(id, 2, out)?;
         }
         for (name, out) in RECORDS.iter().zip(&mut t.records) {
             if !read(name) {

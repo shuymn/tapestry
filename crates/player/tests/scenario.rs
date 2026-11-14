@@ -3618,3 +3618,77 @@ fn a_saved_play_s_measure_carries_its_decision_screen() {
     assert!(retry.get("decision").is_none(), "{retry:?}");
     assert_eq!(int(&retry, "allocations", "decision_app"), None);
 }
+
+/// A decision capture through the whole scenario run: written, its
+/// sidecar names the presentation the stdout record of its screen gives;
+/// or, if the screen was left first, the run fails naming the capture's
+/// step, and that screen presented no frame the capture could take (at
+/// `decision_at = 0` any would have). Only consistency is checked, so no
+/// frame's timing decides it.
+#[test]
+fn a_decision_capture_agrees_with_its_screen_s_record() {
+    let fx = Fixture::new();
+    let chart = write_chart(&fx.library(), "a", "譜面A");
+    write_log(
+        &fx.base.join("logs").join("all.tprl"),
+        &hits(&chart, |_| true),
+        1,
+    );
+    let skin = fx.base.join("decision");
+    fs::create_dir_all(&skin).unwrap();
+    fs::write(
+        skin.join("s.luaskin"),
+        "local skin = { type = 6, name = \"d\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         skin.scene = 20000 skin.input = 500 skin.fadeout = 500\n\
+         return skin\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.decision]\nroot = '{}'\nentry = 's.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "capture = { decision_at = 0, file = \"d.png\" }",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"logs/all.tprl\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    let left = lines(&stdout, "dev: decision ");
+    let [left] = left[..] else {
+        panic!("one decision screen left: {stdout}");
+    };
+    let side = fs::read_to_string(fx.base.join("out").join("d.json"));
+    match side {
+        Ok(side) => {
+            assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+            let drew = side_value(&side, "decision_presentation");
+            // `dev: decision <lifetime>: <presentation>, builds …`.
+            let presentation = left.split(": ").nth(2).unwrap().split(',').next().unwrap();
+            let expected = match presentation {
+                "skin" => "skin",
+                "built-in" => "built-in",
+                _ => "fallback",
+            };
+            assert_eq!(drew, expected, "{side}\n{left}");
+            assert!(side_num(&side, "decision_us") >= 0, "{side}");
+        }
+        Err(_) => {
+            assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+            assert!(
+                stderr.contains("its decision screen ended before a frame at 0 ms"),
+                "{stderr}"
+            );
+            assert!(
+                left.contains("skin frames 0, page frames 0"),
+                "a frame it could take: {left}"
+            );
+        }
+    }
+}

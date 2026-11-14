@@ -384,9 +384,9 @@ impl AudioCounters {
     }
 
     /// System sound starts refused since the engine started: a full start
-    /// ring or an exhausted sequence on the requesting side, a full voice
-    /// pool, and every start or tone request after the output failed on
-    /// the audio thread.
+    /// ring or an exhausted sequence on the requesting side, a full
+    /// one-shot part or a sounding reserved voice, and every start or tone
+    /// request after the output failed on the audio thread.
     #[must_use]
     pub fn system_refused(&self) -> u64 {
         self.0.system_refused.load(Ordering::Acquire)
@@ -1325,6 +1325,25 @@ impl AudioControl {
             word.fetch_max(seq.unwrap_or(TERMINAL), Ordering::Release);
         }
         seq
+    }
+
+    /// Stops every voice of every kind started before now, in every
+    /// generation, at the audio thread's next step, under one number: every
+    /// stop word rises to it, or to [`TERMINAL`] once the sequence is
+    /// exhausted, so it is never refused. Returns the number drawn.
+    pub fn system_stop_all(&self) -> Option<u64> {
+        let seq = self.system_seq();
+        for word in &self.shared.system_stops {
+            word.fetch_max(seq.unwrap_or(TERMINAL), Ordering::Release);
+        }
+        seq
+    }
+
+    /// Whether the audio thread has ended: nothing it was handed is
+    /// acknowledged any more.
+    #[must_use]
+    pub fn gone(&self) -> bool {
+        self.shared.gone.load(Ordering::Acquire)
     }
 
     /// Queues `generation` to become the current system generation under

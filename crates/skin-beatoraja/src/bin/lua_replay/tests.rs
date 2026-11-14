@@ -331,7 +331,7 @@ fn an_index_55_read_agrees() {
     }
 }
 
-/// R12: a latch agrees on every frame, both invocations, start, elapsed,
+/// R12: a latch agrees on every frame, its invocation, start, elapsed,
 /// installed start and sampled age; a latch returning its old value on
 /// two destinations agrees too.
 #[test]
@@ -358,12 +358,10 @@ fn a_latch_agrees_across_frames() {
     agrees(&run(&body), 2);
 }
 
-/// R13: a start with a sub-ms remainder: the latch sets at the first
-/// judgment, pressed 999 µs late (a state clock of …999 µs), and the
-/// frame 1 µs later is 1 ms old by the source's two divisions, where
-/// subtracting first would give 0.
-#[test]
-fn a_timer_age_with_a_sub_ms_start_agrees() {
+/// R13's skin and script: a start with a sub-ms remainder, the latch set
+/// at the first judgment, pressed 999 µs late (a state clock of …999 µs),
+/// and a frame 1 µs later.
+pub(crate) fn sub_ms() -> (String, Script) {
     let latch = "local latch = (function()\n\
            local state = ms.timer_off_value\n\
            return function()\n\
@@ -377,9 +375,19 @@ fn a_timer_age_with_a_sub_ms_start_agrees() {
     r.presses[0] = Some(999);
     r.extra = vec![pressed + 1];
     assert_eq!((pressed + STATE_AT_ZERO) % 1_000, 999);
+    let body = format!("{latch}{}", dst("\"i\"", 0, "timer = latch, loop = -1,"));
+    (body, s)
+}
+
+/// R13: the frame 1 µs after a start with a sub-ms remainder is 1 µs old,
+/// one subtraction, on both sides (the source's two truncating divisions
+/// say 1 ms); production's trace samples it at 1 µs
+/// (`production::compare`'s `a_sub_ms_start_is_sampled_at_1_us`).
+#[test]
+fn a_timer_age_with_a_sub_ms_start_agrees() {
+    let (body, s) = sub_ms();
     let mut o = options(s);
     o.local = true;
-    let body = format!("{latch}{}", dst("\"i\"", 0, "timer = latch, loop = -1,"));
     let r = run_with(&body, &o);
     agrees(&r, 1);
 }
@@ -392,6 +400,34 @@ fn a_perturbed_read_is_found() {
     o.perturb = vec![(100, -1)];
     let r = run_with(&body, &o);
     assert!(!r.findings.is_empty(), "{}", r.text(0, true, true));
+}
+
+/// A number's value past `i32`: the point times 1e5, 2e10 at 200 000
+/// points.
+pub const PAST_I32: &str = "skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2,\n\
+       value = function() return ms.number(100) * 1e5 end } }\n\
+     table.insert(skin.destination, { id = \"v\", dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n";
+
+/// P13: a number's value past `i32` converts to `i32::MAX` on both sides,
+/// so nothing is drawn; where the source's `toint()` would keep the low
+/// 32 bits (2e10 at 200 000 points: −1 474 836 480), the run counts an
+/// intended difference and passes.
+#[test]
+fn a_value_past_i32_is_an_intended_difference() {
+    let r = run(PAST_I32);
+    agrees(&r, 1);
+    let counted = r
+        .intended
+        .get(crate::production::compare::TOINT_PAST_I32)
+        .copied()
+        .unwrap_or(0);
+    assert!(counted > 0, "{}", r.text(0, true, true));
+    assert!(
+        r.text(0, true, true)
+            .contains(&format!("intended difference toint past i32: {counted}")),
+        "{}",
+        r.text(0, true, true)
+    );
 }
 
 /// A writer stopped by a read the reference cannot answer, and a draw
@@ -695,7 +731,8 @@ fn a_numeric_draw_the_factory_does_not_know_adds_no_condition() {
     );
     let r = run(&body);
     agrees(&r, 2);
-    assert_eq!(r.matched, r.frames * 4, "{}", r.text(0, true, true));
+    // Two timers, each invoked once a frame.
+    assert_eq!(r.matched, r.frames * 2, "{}", r.text(0, true, true));
 }
 
 /// B2: a grouped image with fewer cells than groups (`divx = divy = 1`,

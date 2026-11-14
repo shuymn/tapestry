@@ -182,7 +182,7 @@ pub mod field {
     pub const RATE_CURRENT_BP: u16 = 27;
     /// The grade, 0 (F) to 7 (AAA).
     pub const RESULT_GRADE: u16 = 28;
-    /// The EX score to the next grade step, or to the largest.
+    /// The EX score to the next grade, or to the largest at the top grade.
     pub const RESULT_NEXT_RANK: u16 = 29;
     /// The clear type, the source's index ([`LampKey::clear_type`](crate::LampKey::clear_type)).
     pub const RESULT_CLEAR: u16 = 30;
@@ -266,8 +266,8 @@ pub mod field {
     pub const APP_UPTIME_H: u16 = APP_FPS + 7;
     pub const APP_UPTIME_S: u16 = APP_FPS + 9;
     /// The best's max combo, of any counted play, and the view's max combo
-    /// minus it; each [`HIDDEN`](super::HIDDEN) unless that best max combo
-    /// is above 0.
+    /// minus it; each [`HIDDEN`](super::HIDDEN) while no play counts for
+    /// the best.
     pub const BEST_MAX_COMBO: u16 = APP_UPTIME_S + 1;
     pub const BEST_MAX_COMBO_DIFF: u16 = APP_UPTIME_S + 2;
     /// The number of fields.

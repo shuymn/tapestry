@@ -1698,6 +1698,23 @@ fn every_function_in_the_definition_is_classified_and_consumed_where_read() {
     assert_eq!(import(&d).unwrap().callbacks, [Disposition::ClassifiedOnly]);
 }
 
+/// A function as an item of `bpmgraph`, `hiddenCover`, `liftCover` or
+/// `pmchara`, or as a branch of a record choice there, is refused where
+/// the import reads it, as in every other object array.
+#[test]
+fn a_function_in_an_object_array_is_refused() {
+    for name in ["bpmgraph", "hiddenCover", "liftCover", "pmchara"] {
+        for items in ["{ function() end }", "{ { function() end } }"] {
+            let d = configured(&format!("skin.{name} = {items}"));
+            assert_eq!(
+                why(import(&d)),
+                LuaWhy::Callable { field: "other" },
+                "{name} {items}"
+            );
+        }
+    }
+}
+
 #[test]
 fn the_header_pass_refuses_a_function_only_where_it_reads() {
     // Where it does not: a field outside the header. The header pass

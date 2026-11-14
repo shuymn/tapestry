@@ -565,6 +565,20 @@ pub enum DecisionDrawnAs {
     Ended,
 }
 
+#[cfg(feature = "dev-tools")]
+impl DecisionDrawnAs {
+    /// Its name in a capture's sidecar.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Skin => "skin",
+            Self::BuiltIn => "built-in",
+            Self::Fallback => "fallback",
+            Self::Ended => "ended",
+        }
+    }
+}
+
 /// Why a skin-chosen decision screen fell back to the built-in
 /// presentation (dev-tools).
 #[cfg(feature = "dev-tools")]

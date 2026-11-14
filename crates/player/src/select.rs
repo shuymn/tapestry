@@ -42,6 +42,10 @@ const LIST_LINES: usize = PAGE_LINES - 4;
 const PAGE_STEP: usize = LIST_LINES - 2;
 /// The list's line a moved cursor shows on, where the list allows.
 const CURSOR_LINE: usize = LIST_LINES / 3;
+/// The most notices the page joins between two looks' pages that showed
+/// them: the first ones set stay, as later ones repeat or follow from
+/// them, and the strip says that more came after.
+pub const NOTICES: usize = 8;
 
 /// A key the select screen acts on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -627,8 +631,22 @@ pub struct SelectScreen {
     searching: bool,
     /// The order, by index into [`SORTS`].
     sort: usize,
-    /// Why the chart last chosen was refused, until the next choice.
-    notice: Option<String>,
+    /// The notices the page shows (a chart's or a skin's refusal, a line the
+    /// system sounds named): the ones a look's page last showed until a
+    /// clear or the next one set replaces them, else the ones set since,
+    /// each text once and at most [`NOTICES`], in the order they were set
+    /// ([`add_notice`](Self::add_notice)).
+    notices: Vec<String>,
+    /// Whether a notice was dropped from `notices`, all [`NOTICES`] set:
+    /// the page says so after them.
+    notices_dropped: bool,
+    /// Whether `notices` were set since a look's page last showed them
+    /// ([`notice_shown`](Self::notice_shown)): nothing set or cleared
+    /// before that page replaces them.
+    unshown: bool,
+    /// How many of `notices` a clear asked for before a look's page showed
+    /// them: they go once it did ([`clear_notice`](Self::clear_notice)).
+    clear_waiting: usize,
     /// The chosen preset's name, for the title.
     preset: String,
     /// The chosen preset file's error, or why the shelf cannot open.
@@ -1018,9 +1036,85 @@ impl SelectScreen {
         self.preedit.clear();
     }
 
-    /// Shows why the chosen chart was refused, or nothing.
+    /// Shows `notice` as one a look's page showed, or nothing.
+    #[cfg(test)]
     pub fn set_notice(&mut self, notice: Option<String>) {
-        self.notice = notice;
+        self.notices = notice.into_iter().collect();
+        self.notices_dropped = false;
+        self.unshown = false;
+        self.clear_waiting = 0;
+    }
+
+    /// A page of a look that chose nothing carries the notices: from now
+    /// on the next notice replaces them, and a clear removes them; the
+    /// ones a clear asked for before go now. Whether any went.
+    pub fn notice_shown(&mut self) -> bool {
+        self.unshown = false;
+        let asked = std::mem::take(&mut self.clear_waiting);
+        if asked == 0 {
+            return false;
+        }
+        self.notices.drain(..asked.min(self.notices.len()));
+        if self.notices.is_empty() {
+            self.notices_dropped = false;
+        }
+        true
+    }
+
+    /// Shows `notice` after the ones set since a look's page last showed
+    /// them, joined with " / " in the order they were set, unless it is
+    /// one of them (one a clear asked for moves here, out of the clear);
+    /// after [`NOTICES`] it is dropped, and the page says so. Ones that
+    /// page showed are replaced. Whether they were (or nothing showed).
+    pub fn add_notice(&mut self, notice: String) -> bool {
+        let replaced = !self.unshown;
+        if replaced {
+            self.notices.clear();
+            self.notices_dropped = false;
+        }
+        match self.notices.iter().position(|n| *n == notice) {
+            Some(at) if at < self.clear_waiting => {
+                self.notices.remove(at);
+                self.clear_waiting = self.clear_waiting.saturating_sub(1);
+                self.notices.push(notice);
+            }
+            Some(_) => {}
+            None if self.notices.len() < NOTICES => self.notices.push(notice),
+            None => self.notices_dropped = true,
+        }
+        self.unshown = true;
+        replaced
+    }
+
+    /// Clears the notices a look's page showed; ones set since stay for
+    /// the next such page, and go after it ([`notice_shown`]).
+    ///
+    /// [`notice_shown`]: Self::notice_shown
+    pub fn clear_notice(&mut self) {
+        if self.unshown {
+            self.clear_waiting = self.notices.len();
+        } else {
+            self.notices.clear();
+            self.notices_dropped = false;
+        }
+    }
+
+    /// Whether a clear waits for a look's page to show the notices it
+    /// clears ([`clear_notice`](Self::clear_notice)).
+    pub const fn clear_waits(&self) -> bool {
+        self.clear_waiting > 0
+    }
+
+    /// The notices the page shows, joined.
+    fn notice(&self) -> Option<String> {
+        if self.notices.is_empty() {
+            return None;
+        }
+        let mut text = self.notices.join(" / ");
+        if self.notices_dropped {
+            text.push_str(" / …");
+        }
+        Some(text)
     }
 
     /// Shows the chosen preset in the title and, while no refusal shows,
@@ -1117,7 +1211,7 @@ impl SelectScreen {
                 let Some(path) = self.entries.get(i).map(|e| e.path.clone()) else {
                     return Acted::Nothing;
                 };
-                self.notice = None;
+                self.clear_notice();
                 if key == MenuKey::Practice {
                     Acted::Practice(path)
                 } else {
@@ -1246,8 +1340,7 @@ impl SelectScreen {
             )
         });
         lines.push(line(
-            self.notice
-                .clone()
+            self.notice()
                 .or_else(|| self.save_error.clone())
                 .or_else(|| self.preset_error.clone())
                 .unwrap_or_default(),

@@ -29,10 +29,28 @@ use rtrb::{Consumer, Producer};
 use crate::CHANNELS;
 use crate::bank::Sound;
 
-/// System voices: a start that finds them all sounding is refused and
-/// counted, never stealing one. Provisional: 32 voices hold a scroll sound
-/// started every 50 ms for 1.6 s.
+/// The one-shot part of the system voices, shared by every kind without a
+/// reserved voice ([`RESERVED_KINDS`]): a start that finds them all
+/// sounding is dropped and counted, and never ends or restarts a sounding
+/// voice, so a held scroll or a burst never cuts a sound already playing
+/// and what is heard does not depend on which voice started first.
+/// Provisional: 32 voices hold a scroll sound started at every 50 ms key
+/// repeat for 1.6 s.
 pub const SYSTEM_VOICES: usize = 32;
+/// The kinds with one reserved voice each, apart from the one-shot part and
+/// taken by no other kind, so a burst of one-shots never refuses or cuts
+/// them: `select`, `clear` and `fail`, which may loop, and `decide`, which
+/// confirms the player's choice. Each is started at most once per visit of
+/// its state and stopped by the next entry to selection at the latest, so
+/// one voice is enough: a second start while it sounds is dropped and
+/// counted, never restarting it. A decision sound that falls back to the
+/// tone takes none.
+pub const RESERVED_KINDS: [SystemKind; 4] = [
+    SystemKind::Select,
+    SystemKind::Clear,
+    SystemKind::Fail,
+    SystemKind::Decide,
+];
 /// Entries of a producer's start ring. Provisional.
 pub const SYSTEM_STARTS: usize = 64;
 /// Entries of the install ring: one pick's install and the empty install of
@@ -107,6 +125,11 @@ impl SystemKind {
     #[must_use]
     pub const fn index(self) -> usize {
         self as usize
+    }
+
+    /// Its reserved voice's place in [`RESERVED_KINDS`], if it has one.
+    fn reserved(self) -> Option<usize> {
+        RESERVED_KINDS.iter().position(|&k| k == self)
     }
 }
 
@@ -423,7 +446,10 @@ impl Tone {
 /// [`new`](Self::new) allocates or frees.
 #[derive(Debug)]
 pub struct SystemVoices {
+    /// The one-shot part.
     voices: [Voice; SYSTEM_VOICES],
+    /// One voice per reserved kind, in [`RESERVED_KINDS`] order.
+    reserved: [Voice; RESERVED_KINDS.len()],
     current: Option<SystemGeneration>,
     /// The replaced generation a voice still plays from.
     retired: Option<SystemGeneration>,
@@ -435,7 +461,8 @@ pub struct SystemVoices {
     tone_held: bool,
     /// The output failed: no voice sounds again.
     failed: bool,
-    /// Starts refused: a full pool, or after the failure.
+    /// Starts refused: a full one-shot part or a sounding reserved voice,
+    /// or after the failure.
     refused: u64,
     /// Steps whose merge ended at an install the taken retired slot or a
     /// full return ring held.
@@ -463,6 +490,7 @@ impl SystemVoices {
     pub fn new(rate: u32) -> Self {
         Self {
             voices: [Voice::IDLE; SYSTEM_VOICES],
+            reserved: [Voice::IDLE; RESERVED_KINDS.len()],
             current: None,
             retired: None,
             pending: None,
@@ -474,10 +502,25 @@ impl SystemVoices {
         }
     }
 
-    /// Voices sounding.
+    /// Voices sounding, the reserved ones included.
     #[must_use]
     pub fn sounding(&self) -> usize {
-        self.voices.iter().filter(|v| v.active).count()
+        self.every().filter(|v| v.active).count()
+    }
+
+    /// Reserved voices sounding.
+    #[must_use]
+    pub fn reserved_sounding(&self) -> usize {
+        self.reserved.iter().filter(|v| v.active).count()
+    }
+
+    /// Every voice: the one-shot part, then the reserved ones.
+    fn every(&self) -> impl Iterator<Item = &Voice> {
+        self.voices.iter().chain(&self.reserved)
+    }
+
+    fn every_mut(&mut self) -> impl Iterator<Item = &mut Voice> {
+        self.voices.iter_mut().chain(&mut self.reserved)
     }
 
     /// The current generation's id.
@@ -510,7 +553,8 @@ impl SystemVoices {
         self.tone_held
     }
 
-    /// Starts refused so far: a full pool, or any after the output failed.
+    /// Starts refused so far: a full one-shot part, a sounding reserved
+    /// voice, or any after the output failed.
     #[must_use]
     pub const fn refused(&self) -> u64 {
         self.refused
@@ -626,7 +670,7 @@ impl SystemVoices {
     /// Ends every voice, and discards the waiting loop, started below its
     /// kind's stop.
     fn stop_below(&mut self, stops: &[u64; SYSTEM_KINDS]) {
-        for v in self.voices.iter_mut().filter(|v| v.active) {
+        for v in self.every_mut().filter(|v| v.active) {
             if stopped(stops, v.kind, v.seq) {
                 v.active = false;
             }
@@ -712,8 +756,11 @@ impl SystemVoices {
         }
     }
 
-    /// Starts `s` from the current generation: the decision sound falls
-    /// back to the tone when it has none, any other kind is silent.
+    /// Starts `s` from the current generation, in its kind's reserved voice
+    /// or one of the one-shot part's, dropped and counted when that voice
+    /// sounds or the part is full: the decision sound falls back to the
+    /// tone, which takes no voice, when the generation has none; any other
+    /// kind is silent.
     fn play(&mut self, s: SystemStart) {
         let found = self
             .current
@@ -725,7 +772,11 @@ impl SystemVoices {
             }
             return;
         };
-        let Some(v) = self.voices.iter_mut().find(|v| !v.active) else {
+        let free = match s.kind.reserved() {
+            Some(at) => self.reserved.get_mut(at).filter(|v| !v.active),
+            None => self.voices.iter_mut().find(|v| !v.active),
+        };
+        let Some(v) = free else {
             self.refused += 1;
             return;
         };
@@ -741,7 +792,7 @@ impl SystemVoices {
     }
 
     fn has_voice(&self, id: GenId) -> bool {
-        self.voices.iter().any(|v| v.active && v.generation == id)
+        self.every().any(|v| v.active && v.generation == id)
     }
 
     /// What an install, empty or not, would send back now: the empty
@@ -771,7 +822,7 @@ impl SystemVoices {
         let id = generation.id();
         if generation.is_empty() {
             // Its stop ended every set voice already; none plays on.
-            for v in &mut self.voices {
+            for v in self.every_mut() {
                 v.active = false;
             }
         }
@@ -819,7 +870,7 @@ impl SystemVoices {
     /// request is discarded and counted, while stops, installs and the
     /// sweep still apply.
     pub fn fail(&mut self) {
-        for v in &mut self.voices {
+        for v in self.every_mut() {
             v.active = false;
         }
         if self.pending.take().is_some() {
@@ -835,16 +886,17 @@ impl SystemVoices {
     /// leaves `buf` untouched when nothing sounds.
     pub fn mix_into(&mut self, buf: &mut [f32], volume: f32) {
         let _stepping = Stepping::enter();
-        if !self.tone.sounding() && !self.voices.iter().any(|v| v.active) {
+        if !self.tone.sounding() && !self.every().any(|v| v.active) {
             return;
         }
         let Self {
             voices,
+            reserved,
             current,
             retired,
             ..
         } = self;
-        for v in voices.iter_mut().filter(|v| v.active) {
+        for v in voices.iter_mut().chain(reserved).filter(|v| v.active) {
             let sound = [current.as_ref(), retired.as_ref()]
                 .into_iter()
                 .flatten()

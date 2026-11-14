@@ -44,6 +44,89 @@ pub struct SpeedRow {
     pub scroll: i128,
 }
 
+/// [`ChartProfile::speeds`]: the tempo rows, held in 12 bytes each.
+///
+/// A row is its ms with indices into the tempos and the scroll factors it
+/// uses, each table growing only where a row's value differs from the last
+/// one stored, so a chart's rows cost little more than their count: a
+/// STOP's start and end alternate between a stop and one tempo.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SpeedRows {
+    /// Each row's ms, tempo index ([`STOPPED`] while a STOP holds) and
+    /// scroll index.
+    rows: Vec<[u32; 3]>,
+    tempos: Vec<Tempo>,
+    scrolls: Vec<i128>,
+}
+
+/// [`SpeedRows`]' tempo index of a row where a STOP holds.
+const STOPPED: u32 = u32::MAX;
+
+impl SpeedRows {
+    /// The rows' count.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.rows.len()
+    }
+
+    /// Whether there is no row.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.rows.is_empty()
+    }
+
+    /// The rows in time order.
+    pub fn iter(&self) -> impl ExactSizeIterator<Item = SpeedRow> + Clone + '_ {
+        self.rows.iter().map(|&r| self.row(r))
+    }
+
+    /// The last row.
+    #[must_use]
+    pub fn last(&self) -> Option<SpeedRow> {
+        self.rows.last().map(|&r| self.row(r))
+    }
+
+    /// The rows as a vector.
+    #[must_use]
+    pub fn to_vec(&self) -> Vec<SpeedRow> {
+        self.iter().collect()
+    }
+
+    fn row(&self, [ms, tempo, scroll]: [u32; 3]) -> SpeedRow {
+        let at = |i: u32| usize::try_from(i).unwrap_or(usize::MAX);
+        SpeedRow {
+            ms,
+            tempo: self.tempos.get(at(tempo)).copied(),
+            scroll: self.scrolls.get(at(scroll)).copied().unwrap_or(SCROLL_ONE),
+        }
+    }
+
+    fn push(&mut self, row: SpeedRow) {
+        /// The index of `v` in `table`, stored after its last entry unless
+        /// it is that entry.
+        fn index<T: PartialEq>(table: &mut Vec<T>, v: T) -> u32 {
+            if table.last() != Some(&v) {
+                table.push(v);
+            }
+            u32::try_from(table.len().saturating_sub(1)).unwrap_or(STOPPED - 1)
+        }
+        let tempo = row.tempo.map_or(STOPPED, |t| index(&mut self.tempos, t));
+        let scroll = index(&mut self.scrolls, row.scroll);
+        self.rows.push([row.ms, tempo, scroll]);
+    }
+}
+
+/// Rows in time order, as a stored profile decodes them.
+impl FromIterator<SpeedRow> for SpeedRows {
+    fn from_iter<I: IntoIterator<Item = SpeedRow>>(iter: I) -> Self {
+        let mut rows = Self::default();
+        for row in iter {
+            rows.push(row);
+        }
+        rows
+    }
+}
+
 /// What a song list's preview reads of a chart beyond its notes and tempo
 /// rows (design.md "Loading and Song Selection", Summaries), all at 1×: the
 /// loader times these objects for the preview alone and neither plays nor
@@ -85,7 +168,7 @@ pub struct ChartProfile {
     seconds: Vec<[u32; NOTE_CATEGORIES]>,
     bins: Vec<[u16; NOTE_CATEGORIES]>,
     bin_seconds: u32,
-    speeds: Vec<SpeedRow>,
+    speeds: SpeedRows,
     length_ms: u32,
 }
 
@@ -178,7 +261,7 @@ impl ChartProfile {
     /// compared exactly; and the state at the last point unless a row is
     /// already there.
     #[must_use]
-    pub fn speeds(&self) -> &[SpeedRow] {
+    pub fn speeds(&self) -> &SpeedRows {
         &self.speeds
     }
 }
@@ -190,6 +273,9 @@ fn second_of(t: TimeUs, count: usize) -> Option<usize> {
         .filter(|&s| t.0 >= 0 && s < count)
 }
 
+/// The notes of each 1× second over `⌊end / 1 s⌋ + 2` seconds, the
+/// distribution length the densities divide by and the notes graph spans.
+// Source: SF-008
 fn seconds(chart: &Chart, end: TimeUs) -> Vec<[u32; NOTE_CATEGORIES]> {
     let whole = usize::try_from(end.0.max(0) / 1_000_000).unwrap_or(0);
     let count = whole.saturating_add(2);
@@ -347,15 +433,16 @@ fn speeds(
     stops: &[TimelineId],
     scroll: &[(TimelineId, i128)],
     last_shown: Option<TimeUs>,
-) -> Vec<SpeedRow> {
+) -> SpeedRows {
     let mut state = (Some(initial), SCROLL_ONE);
-    let mut rows = vec![SpeedRow {
+    let mut rows = SpeedRows::default();
+    rows.push(SpeedRow {
         ms: 0,
         tempo: state.0,
         scroll: state.1,
-    }];
+    });
     // A row where the effective speed changes.
-    let emit = |rows: &mut Vec<SpeedRow>, ms, state: (Option<Tempo>, i128)| {
+    let emit = |rows: &mut SpeedRows, ms, state: (Option<Tempo>, i128)| {
         let changed = rows
             .last()
             .is_none_or(|r| effective(r.tempo, r.scroll) != effective(state.0, state.1));
@@ -395,6 +482,9 @@ fn speeds(
             scroll: state.1,
         });
     }
+    rows.rows.shrink_to_fit();
+    rows.tempos.shrink_to_fit();
+    rows.scrolls.shrink_to_fit();
     rows
 }
 
@@ -485,6 +575,7 @@ mod tests {
 
     /// Fixture H: a hidden note or BGA event at 4.2 s lengthens the seconds
     /// to 6 (`4 + 2`) and ends the rows there; the play profile keeps 5.
+    // Source: SF-008
     #[test]
     fn a_shown_object_lengthens_the_preview() {
         let chart = four_taps();
@@ -495,7 +586,7 @@ mod tests {
         let preview = ChartProfile::preview(&chart, &[], &inputs);
         assert_eq!(preview.seconds().len(), 6);
         assert_eq!(ChartProfile::of(&chart, &[]).seconds().len(), 5);
-        assert_eq!(preview.speeds().last(), Some(&row(4_200, 120, SCROLL_ONE)));
+        assert_eq!(preview.speeds().last(), Some(row(4_200, 120, SCROLL_ONE)));
         // A shown object before the length changes nothing.
         let early = PreviewInputs {
             timeline: None,
@@ -523,7 +614,9 @@ mod tests {
             ],
         );
         assert_eq!(
-            ChartProfile::preview(&chart, &[], &inputs).speeds(),
+            ChartProfile::preview(&chart, &[], &inputs)
+                .speeds()
+                .to_vec(),
             [
                 row(0, 120, SCROLL_ONE),
                 row(1_000, 120, SCROLL_ONE / 2),
@@ -533,7 +626,7 @@ mod tests {
             ]
         );
         assert_eq!(
-            ChartProfile::of(&chart, &[]).speeds(),
+            ChartProfile::of(&chart, &[]).speeds().to_vec(),
             [row(0, 120, SCROLL_ONE), row(3_000, 120, SCROLL_ONE)]
         );
     }
@@ -547,7 +640,7 @@ mod tests {
         let speeds = ChartProfile::preview(&chart, &[], &inputs);
         assert_eq!(
             speeds.speeds().last(),
-            Some(&row(5_000, 120, 3 * SCROLL_ONE))
+            Some(row(5_000, 120, 3 * SCROLL_ONE))
         );
     }
 
@@ -568,7 +661,9 @@ mod tests {
         let chart = chart(b.tap(lane, TimeUs(6_000_000)));
         let inputs = with_scroll(&chart, None, &scroll);
         assert_eq!(
-            ChartProfile::preview(&chart, &[], &inputs).speeds(),
+            ChartProfile::preview(&chart, &[], &inputs)
+                .speeds()
+                .to_vec(),
             [row(0, 120, SCROLL_ONE), row(6_000, 120, SCROLL_ONE)]
         );
     }
@@ -588,7 +683,9 @@ mod tests {
             ],
         );
         assert_eq!(
-            ChartProfile::preview(&chart, &[], &inputs).speeds(),
+            ChartProfile::preview(&chart, &[], &inputs)
+                .speeds()
+                .to_vec(),
             [
                 row(0, 120, SCROLL_ONE),
                 row(500, 120, 0),
@@ -613,7 +710,7 @@ mod tests {
         assert_eq!(preview.length_ms(), 4_200);
         assert_eq!(
             preview.speeds().last(),
-            Some(&row(5_000, 120, 2 * SCROLL_ONE))
+            Some(row(5_000, 120, 2 * SCROLL_ONE))
         );
         assert_eq!(ChartProfile::of(&chart, &[]).length_ms(), 3_000);
     }

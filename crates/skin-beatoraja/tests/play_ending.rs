@@ -1,7 +1,7 @@
 //! The top-level `finishmargin` and `fadeout` of a play skin: the play's
 //! declared ending (design.md "Play Lifecycle", Audio tail), read from
-//! JSON and Lua skins with or without a note destination, over the
-//! source's whole `int` range with no cap.
+//! JSON and Lua skins with or without a note destination, up to the
+//! source's largest `int` with no cap, a negative value read as 0.
 
 mod common;
 
@@ -47,8 +47,8 @@ const fn ending(finish_margin_ms: i64, fadeout_ms: i64) -> PlayEnding {
 }
 
 /// Each is its milliseconds in µs, widened before the product so the
-/// whole `i32` range fits with no cap: `finishmargin` at least 0, a
-/// negative `fadeout` kept. The skins have no note destination.
+/// whole `i32` range fits with no cap; each is at least 0, a negative
+/// value read as 0. The skins have no note destination.
 #[test]
 fn a_play_skins_ending_is_read_in_microseconds() {
     for (margin, fadeout, read) in [
@@ -56,18 +56,15 @@ fn a_play_skins_ending_is_read_in_microseconds() {
         (Some("3000"), Some("1000"), ending(3_000, 1_000)),
         (Some("3000"), None, ending(3_000, 0)),
         (None, Some("1200"), ending(0, 1_200)),
-        (Some("-5"), Some("-5"), ending(0, -5)),
+        (Some("-5"), Some("-5"), ending(0, 0)),
+        (Some("3000"), Some("-1"), ending(3_000, 0)),
         (Some("12000"), Some("11000"), ending(12_000, 11_000)),
         (
             Some("2147483647"),
             Some("2147483647"),
             ending(2_147_483_647, 2_147_483_647),
         ),
-        (
-            Some("-2147483648"),
-            Some("-2147483648"),
-            ending(0, -2_147_483_648),
-        ),
+        (Some("-2147483648"), Some("-2147483648"), ending(0, 0)),
     ] {
         let mut fields = String::new();
         let mut body = String::new();

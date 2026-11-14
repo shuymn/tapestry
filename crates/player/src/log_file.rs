@@ -14,13 +14,15 @@
 //! xtask check-lints`).
 
 use std::fmt::{self, Display, Write as _};
-use std::fs::{self, File, OpenOptions, TryLockError};
+use std::fs::{self, File, TryLockError};
 use std::io::{self, Write};
 use std::path::Path;
 use std::sync::Mutex;
 use std::time::{Instant, SystemTime};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
+
+use crate::sound_sets_disk::link_count;
 
 /// Files kept: this run's and the two before it.
 const KEPT: usize = 3;
@@ -271,13 +273,13 @@ fn open(dir: &Path, command: &str, diag: &mut impl Write) -> Option<Logged<File>
         failed(diag, dir, &e);
         return None;
     }
+    // Neither the lease nor the log is opened through a link at its name
+    // into another file, such as a sound set's when the data root lies in
+    // one (design.md "Threat Model", T18): a link there is removed first,
+    // and the log is a new file, so a rotation that failed leaves nothing
+    // to truncate.
     let lock = dir.join(LOCK);
-    let lease = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock);
+    let lease = game::open_lock(&lock, link_count);
     let lease = match lease {
         Ok(f) => f,
         Err(e) => {
@@ -299,7 +301,7 @@ fn open(dir: &Path, command: &str, diag: &mut impl Write) -> Option<Logged<File>
         let _ = fs::rename(dir.join(name(n - 1)), dir.join(name(n)));
     }
     let path = dir.join(name(0));
-    let file = match File::create(&path) {
+    let file = match game::create_fresh(&path) {
         Ok(f) => f,
         Err(e) => {
             failed(diag, &path, &e);
@@ -474,7 +476,7 @@ impl fmt::Write for Cut<'_> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs::{self, File, OpenOptions, TryLockError};
     use std::io::{self, Write};
     use std::path::Path;
@@ -968,5 +970,179 @@ mod tests {
         let prefix = format!("log: {}: ", logs.display());
         assert!(diag.starts_with(&prefix), "{diag}");
         assert!(open(&logs, "play", &mut Scripted::new(&[Step::Fail])).is_none());
+    }
+
+    /// Makes `link` a symbolic link to the file `target`, true once made.
+    /// Without the right to make one (Developer Mode or elevation) it says
+    /// so and gives false; any other failure fails the test.
+    pub(crate) fn symlink(target: impl AsRef<Path>, link: &Path) -> bool {
+        // ERROR_PRIVILEGE_NOT_HELD: no right to make symbolic links.
+        const PRIVILEGE_NOT_HELD: i32 = 1314;
+        match std::os::windows::fs::symlink_file(target, link) {
+            Ok(()) => true,
+            Err(e) if e.raw_os_error() == Some(PRIVILEGE_NOT_HELD) => {
+                println!("skipped: no right to make a symbolic link here ({e})");
+                false
+            }
+            Err(e) => panic!("the symbolic link cannot be made: {e}"),
+        }
+    }
+
+    /// The data root as a sound set holding a crashing `clear.wav` and a
+    /// `scratch.wav`, the log in its `logs\` with folders at the rotated
+    /// names, so rotation fails at every run.
+    struct InSet {
+        _dir: tempfile::TempDir,
+        set: std::path::PathBuf,
+        logs: std::path::PathBuf,
+        data: game::DataRoot,
+        sets: Vec<std::path::PathBuf>,
+        pick: game::sound_sets::SetPick,
+    }
+
+    impl InSet {
+        fn new() -> Self {
+            use audio::{BankLimits, GenId};
+            use game::sound_sets::{ScanLimits, SetPick, SetRole, scan};
+
+            let dir = tempfile::tempdir().unwrap();
+            let set = dir.path().join("data");
+            let logs = set.join("logs");
+            fs::create_dir_all(&logs).unwrap();
+            for n in 1..super::KEPT {
+                fs::create_dir_all(logs.join(name(n)).join("held")).unwrap();
+            }
+            fs::write(set.join("clear.wav"), b"a sound that crashes").unwrap();
+            fs::write(set.join("scratch.wav"), b"a sound").unwrap();
+            let data = game::DataRoot::new(set.clone());
+            let sets = scan(&set, SetRole::Sound, &ScanLimits::default()).sets;
+            assert_eq!(sets, [set.canonicalize().unwrap()]);
+            let pick = SetPick {
+                sound_set: Some(set.clone()),
+                bgm_set: None,
+                defaults: data.default_sounds(),
+                id: GenId(1),
+                rate: 48_000,
+                limits: BankLimits::default(),
+                skipped: Vec::new(),
+            };
+            Self {
+                _dir: dir,
+                set,
+                logs,
+                data,
+                sets,
+                pick,
+            }
+        }
+
+        /// The set's identity, names counted by the player's probe.
+        fn identity(&self) -> game::sound_sets::SourceIdentity {
+            use crate::sound_sets_disk::link_count;
+            game::sound_sets::resolve(&self.pick, link_count, &mut |_| false).sources[0]
+                .clone()
+                .unwrap()
+        }
+
+        /// The launch that crashed decoding the set: its marker.
+        fn crash(&self) {
+            let opened =
+                game::sound_sets::Recovery::open(&self.data, crate::sound_sets_disk::recovery_fs());
+            opened.unwrap().recovery.mark(&self.identity()).unwrap();
+        }
+
+        /// After run `i`, the set is still quarantined, and `scratch.wav`
+        /// still holds `kept` and is not this run's log.
+        fn assert_quarantined(&self, i: usize, kept: &[u8]) {
+            use game::sound_sets::{Recovery, choose};
+
+            let opened = Recovery::open(&self.data, crate::sound_sets_disk::recovery_fs());
+            let mut recovery = opened.unwrap().recovery;
+            assert_eq!(
+                choose(&self.sets, &mut recovery, &[], &mut |_| 0),
+                None,
+                "run {i}: the quarantined set chosen"
+            );
+            assert_eq!(recovery.quarantined().len(), 1, "run {i}");
+            assert_eq!(
+                fs::read(self.set.join("scratch.wav")).unwrap(),
+                kept,
+                "run {i}"
+            );
+            let log = fs::read_to_string(self.logs.join(name(0))).unwrap();
+            assert!(log.contains(&format!("run {i}\n")), "{log}");
+        }
+    }
+
+    /// The data root is a sound set, and `logs\tapestry.log` a symbolic
+    /// link to its `scratch.wav`, a file with one name, while folders at
+    /// the rotated names block rotation. Each run removes the link and
+    /// writes a new log, so `scratch.wav` keeps its bytes and times and the
+    /// set stays quarantined after a launch that crashed decoding it
+    /// (design.md T18). Making the link needs the right to make symbolic
+    /// links; without it the test says so and checks nothing.
+    // Covers: T18
+    #[test]
+    fn a_log_linked_into_a_set_keeps_its_quarantine() {
+        let s = InSet::new();
+        let log = s.logs.join(name(0));
+        if !symlink(r"..\scratch.wav", &log) {
+            return;
+        }
+        assert_eq!(fs::read(&log).unwrap(), b"a sound", "the link resolves");
+        s.crash();
+        for i in [1, 22, 333] {
+            run(&s.logs, i);
+            s.assert_quarantined(i, b"a sound");
+            assert!(!fs::symlink_metadata(&log).unwrap().is_symlink());
+        }
+    }
+
+    /// The data root is a sound set whose `scratch.wav` is a hard link to
+    /// the log, and folders at the rotated names block rotation. The next
+    /// run removes the log's name and writes a new file, which ends the
+    /// link and changes the set's identity once (`scratch.wav` is then
+    /// stamped by its own file); from then on runs leave `scratch.wav`
+    /// as it was, so the set stays quarantined after a launch that crashed
+    /// decoding it (design.md T18).
+    // Covers: T18
+    #[test]
+    fn a_set_linked_to_the_log_keeps_its_quarantine() {
+        let s = InSet::new();
+        fs::remove_file(s.set.join("scratch.wav")).unwrap();
+        run(&s.logs, 0);
+        fs::hard_link(s.logs.join(name(0)), s.set.join("scratch.wav")).unwrap();
+        let kept = fs::read(s.set.join("scratch.wav")).unwrap();
+        let linked = s.identity();
+        run(&s.logs, 1);
+        assert_eq!(
+            fs::read(s.set.join("scratch.wav")).unwrap(),
+            kept,
+            "run 1 wrote through the link"
+        );
+        assert_ne!(s.identity(), linked, "ending the link left the identity");
+        s.crash();
+        for i in [22, 333] {
+            run(&s.logs, i);
+            s.assert_quarantined(i, &kept);
+        }
+    }
+
+    /// A dangling link at the lease's name, pointing to a sound file the
+    /// set lacks, does not make that file: the lease removes the link and
+    /// takes its own (design.md T18). Making the link needs the right to;
+    /// without it the test says so and checks nothing.
+    // Covers: T18
+    #[test]
+    fn the_lease_adds_no_file_to_a_set() {
+        let s = InSet::new();
+        let missing = s.set.join("fail.wav");
+        if !symlink(r"..\fail.wav", &s.logs.join(super::LOCK)) {
+            return;
+        }
+        let before = s.identity();
+        run(&s.logs, 1);
+        assert!(!missing.exists(), "the lease created fail.wav in the set");
+        assert_eq!(s.identity(), before);
     }
 }

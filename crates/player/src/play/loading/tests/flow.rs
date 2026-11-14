@@ -1100,6 +1100,76 @@ fn an_audio_failure_during_the_quits_settle_ends_the_run() {
     });
 }
 
+/// ST15, through `load_and_open` in a selection's loading state: the
+/// startup pick's read blocked when the chart was chosen holds READY: the
+/// loading state shows the system sounds' wait, recording does not open,
+/// and the play opens once the read returns, after the pick's report and
+/// its install's acknowledgement. No receipt of the system sounds is made
+/// while the play runs. The quit key during that wait returns to selection
+/// without waiting for the pick, the preparation begun at load-ready never
+/// begun again and the pick running on.
+#[test]
+fn the_pick_settles_before_recording() {
+    use crate::system_sounds::tests::{Fixture, Rule, Seam};
+    for quit in [false, true] {
+        let fx = Fixture::new();
+        fx.sound("sound/A", audio::SystemKind::Clear, 10);
+        let seam = Seam::new(Arc::new(crate::system_sounds::RealClock));
+        seam.rule(
+            "A/clear.wav",
+            Rule {
+                block: true,
+                ..Rule::default()
+            },
+        );
+        let (root, theirs) = (fx.root(), seam.clone());
+        crate::system_sounds::arm(move |setup, _| {
+            setup.root = root;
+            setup.decoder = Box::new(theirs);
+        });
+        let (_dir, mut loaded) = plain();
+        on_loading(&mut loaded, None, false, |rig, side, loaded| {
+            let stage = rig.render.loading_stage();
+            let opened = || side.loading_end.passed() > 0;
+            let ended = open_with(loaded, rig, side, || {
+                until("the system sounds' wait shown", || {
+                    stage() == Some(crate::loading_text::Stage::SystemSounds)
+                });
+                assert!(seam.opens("A/clear.wav") > 0);
+                std::thread::sleep(Duration::from_millis(300));
+                assert!(
+                    !opened(),
+                    "the loading state ended with the pick's read blocked"
+                );
+                assert_eq!(side.gates.revalidate.passed(), 0, "the preparation went on");
+                if quit {
+                    side.controls.command(Command::Quit);
+                } else {
+                    seam.open_gate();
+                    side.quit_the_play(1);
+                }
+            });
+            let sounds = rig.system_sounds.as_ref().unwrap();
+            if quit {
+                assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+                assert_eq!(side.gates.revalidate.passed(), 0, "the preparation went on");
+                assert_eq!(side.loading_end.passed(), 0);
+                assert_eq!(sounds.pick_running(), Some(false), "the pick was stopped");
+                seam.open_gate();
+            } else {
+                assert!(ended.is_ok(), "{ended:?}");
+                let pushed = sounds.pushed();
+                assert_eq!(pushed.len(), 1, "{pushed:?}");
+                assert_eq!(
+                    rig.audio.control.system_installed(),
+                    pushed.first().copied()
+                );
+                assert_eq!(rig.system_polls_in_play, 0, "received in play");
+            }
+        });
+    }
+}
+
 /// P10: the cursor is hidden as the play opens and shown again once its
 /// result shows, and at the play's end.
 #[test]

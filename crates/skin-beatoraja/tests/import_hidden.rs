@@ -446,3 +446,36 @@ fn a_follower_of_hidden_plus_needs_a_fixed_colour_and_no_raised_alpha() {
     assert_eq!(shown_held(&l, [0, 0, 0], true, false).len(), 1);
     assert!(shown_held(&l, [0, 0, 0], false, false).is_empty());
 }
+
+/// Mixed alpha deltas on a follower of HIDDEN+ still refuse when one is
+/// above 0, though their sum is below: +64 and −128.
+#[test]
+fn a_follower_of_hidden_plus_refuses_mixed_alpha_raising_it() {
+    let number = r#""value": [{"id": "num", "src": "a", "w": 60, "h": 6, "divx": 10, "digit": 1, "ref": 71}]"#;
+    let objects = format!(
+        r#""offset": [{{"name": "a", "id": 42, "a": true}}, {{"name": "b", "id": 43, "a": true}}], {}, {number}"#,
+        note("")
+    );
+    let num =
+        r#"{"id": "num", "offsets": [5, 42, 43], "dst": [{"x": 0, "y": 0, "w": 10, "h": 10}]}"#;
+    let l = common::import_config(
+        [1_920, 1_080],
+        &body("", &objects, &[NOTES, num]),
+        &[],
+        |c: &mut Config| {
+            for (id, a) in [(42, 64), (43, -128)] {
+                c.offsets.insert(
+                    id,
+                    OffsetValue {
+                        a,
+                        ..OffsetValue::default()
+                    },
+                );
+            }
+        },
+    );
+    match l.err() {
+        ImportError::Critical { why, .. } => assert_eq!(why, NoteKind::OffsetAlpha),
+        e => panic!("{e:?}"),
+    }
+}

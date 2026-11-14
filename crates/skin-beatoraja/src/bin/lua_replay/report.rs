@@ -60,6 +60,9 @@ pub struct Report {
     pub first_agreed: Vec<usize>,
     /// Lowered invocations compared and agreed, by frame kind and consumer.
     pub lowered: BTreeMap<(&'static str, &'static str), usize>,
+    /// Compared invocations where tapestry's rule differs from the
+    /// source's on purpose, by difference: counted, never a finding.
+    pub intended: BTreeMap<&'static str, usize>,
 }
 
 impl Report {
@@ -111,6 +114,9 @@ impl Report {
         }
         for ((kind, field), n) in &self.lowered {
             let _ = writeln!(o, "lowered {field} agreed on {kind} frames: {n}");
+        }
+        for (what, n) in &self.intended {
+            let _ = writeln!(o, "intended difference {what}: {n}");
         }
         let listed = |o: &mut String, label: &str, l: &[Listed]| {
             let mut by: BTreeMap<&str, (usize, usize)> = BTreeMap::new();

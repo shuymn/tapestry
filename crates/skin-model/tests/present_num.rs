@@ -5,7 +5,7 @@
 //! by `crates/skin-beatoraja/tests/luaj_numerics.txt`; these pin the
 //! representation, which no comparison by value sees.
 
-use skin_model::present::num::{arith, clock, extreme, math, neg, to_int};
+use skin_model::present::num::{arith, clock, extreme, math, neg};
 use skin_model::present::{Arith, Fail, MathFn, Val};
 
 const TWO_53: i64 = 1 << 53;
@@ -85,7 +85,8 @@ fn integer_arithmetic_past_2_53_is_the_rounded_double() {
 fn a_chain_rounds_at_each_operation() {
     let p = arith(Arith::Mul, Val::Int(2_147_483_647), Val::Int(4_194_305)).unwrap();
     let a = arith(Arith::Mul, p, Val::Int(3)).unwrap();
-    assert_eq!(to_int(a), 2_134_900_736);
+    // Rounded once at the end: 27 021 604 194 091 004.
+    assert_eq!(bits(a), bits(Val::Float(27_021_604_194_091_008.0)));
     let n = Val::Int(TWO_53);
     let b = arith(
         Arith::Add,
@@ -93,14 +94,16 @@ fn a_chain_rounds_at_each_operation() {
         Val::Int(1),
     )
     .unwrap();
-    assert_eq!(to_int(b), 0);
+    // Rounded once at the end: 2^53 + 2.
+    assert_eq!(bits(b), bits(Val::Float(TWO_53_F)));
     let c = arith(
         Arith::Add,
         arith(Arith::Add, n, Val::Int(1)).unwrap(),
         Val::Int(2),
     )
     .unwrap();
-    assert_eq!(to_int(c), 2);
+    // Rounded once at the end: 2^53 + 4.
+    assert_eq!(bits(c), bits(Val::Float(TWO_53_F + 2.0)));
 }
 
 /// `floor` and `ceil` of a float give an integer only within ±2^53, the

@@ -1716,9 +1716,10 @@ pub(crate) mod tests {
             name: "a.bms".to_owned(),
         };
         let path = job.path().to_owned();
-        // The measurement's third check is the first packet's, inside the
-        // first sound's decoding (the first is before the read, the second
-        // before the first file): held there until the test has demoted.
+        // The measurement's check 6 is the first packet's, inside the
+        // first sound's decoding (before it: the read, then the first file,
+        // its read's return, the probe and the codec): held there until the
+        // test has demoted.
         let (at_tx, at) = mpsc::channel::<()>();
         let (go, go_rx) = mpsc::channel::<()>();
         let go_rx = Mutex::new(go_rx);
@@ -1727,7 +1728,7 @@ pub(crate) mod tests {
         let measure: Measure = Box::new(move |job, stop| {
             let checks = &counted;
             let gated = || {
-                if checks.fetch_add(1, Ordering::SeqCst) + 1 == 3 {
+                if checks.fetch_add(1, Ordering::SeqCst) + 1 == 6 {
                     let _ = at_tx.send(());
                     let _ = go_rx.lock().unwrap().recv();
                 }
@@ -1759,7 +1760,7 @@ pub(crate) mod tests {
         assert_eq!(worker.queue(job), Queued::Ended);
         // The next check (before the second sound) stops the measurement:
         // nothing more is decoded or analyzed.
-        assert_eq!(checks.load(Ordering::SeqCst), 4);
+        assert_eq!(checks.load(Ordering::SeqCst), 7);
         assert!(calls.none());
         assert_eq!(held(&coord), (0, 0));
     }

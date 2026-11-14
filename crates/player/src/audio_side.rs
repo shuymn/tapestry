@@ -29,12 +29,15 @@ pub struct Opened {
 pub struct AudioThread {
     worker: SyncSender<AudioWorker>,
     handle: JoinHandle<()>,
+    rate: u32,
 }
 
 /// The running audio thread and its control.
 pub struct AudioLink {
     /// The play control.
     pub control: AudioControl,
+    /// The output's rate: what the system sounds are decoded at.
+    pub rate: u32,
     handle: JoinHandle<()>,
 }
 
@@ -47,6 +50,7 @@ impl AudioThread {
         let _ = self.worker.send(worker);
         AudioLink {
             control,
+            rate: self.rate,
             handle: self.handle,
         }
     }
@@ -119,6 +123,7 @@ where
             AudioThread {
                 worker: worker_tx,
                 handle,
+                rate: opened.rate,
             },
             opened,
         )),

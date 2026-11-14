@@ -172,6 +172,31 @@ pub(crate) fn serve_adjustments(
 #[cfg(feature = "dev-tools")]
 pub type MeasuredPlays = std::sync::Arc<std::sync::Mutex<Vec<(std::path::PathBuf, Figures)>>>;
 
+/// Whether the run ends: the window's close, the input thread's failure
+/// or the audio output's (a development script's signal first). What
+/// every wait before recording opens asks of the run.
+pub(crate) fn run_ends(
+    controls: &Controls,
+    input: &InputLink,
+    failures: &crate::failures::Failures,
+) -> bool {
+    #[cfg(feature = "dev-tools")]
+    crate::dev::specialization_signal(controls, || input.fail_for_script());
+    #[cfg(not(feature = "dev-tools"))]
+    let _ = input;
+    controls.quitting() || failures.input().is_some() || failures.output().is_some()
+}
+
+/// The lines the system sounds named for the player since the last take,
+/// once each, taken from `queue` (the rig's `system_notices`).
+pub(crate) fn take_notices(queue: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+    std::mem::take(
+        &mut *queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
 /// The game's threads as a rig.
 pub struct PlayerRig<'a> {
     /// The input and audio threads' failures, as one state every reader
@@ -436,6 +461,16 @@ pub struct PlayerRig<'a> {
     /// Tests: each ended play's end and record, in order.
     #[cfg(test)]
     pub ended_plays: Vec<(game::PlayEnd, Option<replay::PlayRecord>)>,
+    /// The system sounds (design.md "Audio", system sounds): made last in
+    /// the rig, received from at selection's looks and settled before
+    /// recording opens, closed before the audio thread ends.
+    pub system_sounds: Option<crate::system_sounds::SystemSounds>,
+    /// What the system sounds name for the player, not yet shown:
+    /// selection's notice line takes them.
+    pub system_notices: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+    /// Tests: the system sounds' receipts made while a play ran.
+    #[cfg(test)]
+    pub system_polls_in_play: u32,
 }
 
 /// An attempt's preparation begun on the player's rig
@@ -909,9 +944,71 @@ impl PlayerRig<'_> {
     /// or audio thread. A script's step on a specialization's job
     /// (dev-tools) acts at every look.
     fn run_ends(&self) -> bool {
-        #[cfg(feature = "dev-tools")]
-        crate::dev::specialization_signal(self.controls, || self.input.fail_for_script());
-        self.controls.quitting() || self.input_failure().is_some() || self.audio_failure().is_some()
+        run_ends(self.controls, &self.input, &self.failures)
+    }
+
+    /// The system sounds' settlement before recording opens (design.md
+    /// "Play Lifecycle", preparing each attempt): every outstanding pick's
+    /// report, with no time bound, then the acknowledgement of what it
+    /// pushed, so no decoder of a pick runs while recording is open. The
+    /// quit key (the adjustments served meanwhile, as in the pending
+    /// skin's wait) and the run's end leave it within a slice, the pick
+    /// left as it is. A wait past its first slice shows as the loading
+    /// state's line.
+    ///
+    /// # Errors
+    ///
+    /// The acknowledgement's: the audio thread did not answer.
+    fn settle_system_sounds(&mut self) -> Result<crate::system_sounds::Settled, AudioWaitError> {
+        let Some(sounds) = self.system_sounds.as_mut() else {
+            return Ok(crate::system_sounds::Settled::Ready);
+        };
+        let mut adjust = self.adjust.take();
+        let (controls, input, failures) = (self.controls, &self.input, &self.failures);
+        let (render, selection) = (&self.render, &self.selection);
+        let mut looks = 0_u32;
+        let quit = || {
+            looks = looks.saturating_add(1);
+            if looks == 2 {
+                println!("system sounds: waiting for the pick before READY");
+                if let Some(sel) = selection {
+                    crate::selection::show_stage(
+                        render,
+                        sel.loading.as_ref(),
+                        crate::loading_text::Stage::SystemSounds,
+                    );
+                }
+            }
+            #[cfg(feature = "dev-tools")]
+            crate::dev::press_due(controls, crate::dev::LoadPhase::Preparing);
+            serve_adjustments(adjust.as_mut(), input, controls.tuning());
+            controls.leaving()
+        };
+        let ends = || run_ends(controls, input, failures);
+        let settled = sounds.settle_before_recording(&mut self.audio.control, quit, ends);
+        self.adjust = adjust;
+        settled
+    }
+
+    /// The system sounds' receipt outside play (at selection's looks):
+    /// a report pushed, the acknowledgement read, the returned generations
+    /// dropped. What they named stays queued in `system_notices` until a
+    /// look sends selection's page ([`take_notices`]).
+    pub(crate) fn poll_system_sounds(&mut self) {
+        #[cfg(test)]
+        if self.in_play {
+            self.system_polls_in_play += 1;
+        }
+        if let Some(sounds) = self.system_sounds.as_mut() {
+            sounds.poll(&mut self.audio.control);
+        }
+    }
+
+    /// The system sounds' receipt outside play, and the lines they named
+    /// for the player since the last one, once each.
+    pub(crate) fn receive_system_sounds(&mut self) -> Vec<String> {
+        self.poll_system_sounds();
+        take_notices(&self.system_notices)
     }
 
     /// The atlases the render thread retains for the result go to the
@@ -1435,6 +1532,12 @@ impl PlayerRig<'_> {
         // The images' worker, stopped within its bound; its panic is never
         // the run's.
         self.chart_images.end();
+        // The system sounds' worker, ended within its bound, and what the
+        // game thread holds of theirs dropped, before the audio thread
+        // ends: what it holds drops with it, after its last step.
+        if let Some(mut sounds) = self.system_sounds.take() {
+            sounds.close(&mut self.audio.control);
+        }
         self.persist();
         let rendered = self.render.exit();
         self.audio.exit();
@@ -1982,13 +2085,16 @@ impl Rig for PlayerRig<'_> {
         self.controls.quitting()
     }
 
-    fn prepare_audio(&mut self) -> Result<(), AudioWaitError> {
+    fn prepare_audio(&mut self) -> Result<game::AudioReadiness, AudioWaitError> {
         // With selection, the scan has acknowledged its pause before
         // recording opens and READY starts; so has every screen runtime its
         // parking (a render thread that ended holds none).
         self.pause_scan();
         if !self.render.park_scripts() {
             eprintln!("render: the screens' runtimes were not acknowledged parked");
+        }
+        if self.settle_system_sounds()? == crate::system_sounds::Settled::Cancelled {
+            return Ok(game::AudioReadiness::Cancelled);
         }
         self.audio.control.ready()?;
         // Between plays, before recording opens: the change never lands
@@ -2000,7 +2106,7 @@ impl Rig for PlayerRig<'_> {
         // A volume changed before the first play (during startup) or on
         // the end screen reaches the engine before the play starts.
         self.sync();
-        Ok(())
+        Ok(game::AudioReadiness::Ready)
     }
 
     /// The render thread answers once it draws no loading frame any more;

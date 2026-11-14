@@ -35,12 +35,9 @@ fn ignored(field: &'static str) -> NoteKind {
 }
 
 /// Two options sharing item 900: the first selects it, the later one
-/// selects 902. The source tree's conditions see every selection
-/// (`JSONSkinLoader.java:254-260`); a destination's op sees the later
-/// option's entry, which replaced the first's (`JSONSkinLoader.java:
-/// 291-297`).
+/// selects 902. A destination's op sees every selection, as `if` does.
 #[test]
-fn a_later_option_overrides_a_shared_item_for_ops() {
+fn ops_see_every_selected_item() {
     let shared = r#""property": [
         {"name": "a", "item": [{"name": "x", "op": 900}, {"name": "y", "op": 901}], "def": "x"},
         {"name": "b", "item": [{"name": "s", "op": 900}, {"name": "z", "op": 902}], "def": "z"}
@@ -58,10 +55,27 @@ fn a_later_option_overrides_a_shared_item_for_ops() {
         drawn(&format!(r#"{{"if": 900, "value": {{"id": "i", {key}}}}}"#)),
         1
     );
-    assert_eq!(drawn(&format!(r#"{{"id": "i", "op": [900], {key}}}"#)), 0);
-    assert_eq!(drawn(&format!(r#"{{"id": "i", "op": [-900], {key}}}"#)), 1);
+    assert_eq!(drawn(&format!(r#"{{"id": "i", "op": [900], {key}}}"#)), 1);
+    assert_eq!(drawn(&format!(r#"{{"id": "i", "op": [-900], {key}}}"#)), 0);
     assert_eq!(drawn(&format!(r#"{{"id": "i", "op": [902], {key}}}"#)), 1);
     assert_eq!(drawn(&format!(r#"{{"id": "i", "op": [901], {key}}}"#)), 0);
+}
+
+/// Two options that both declare and select 241: the op is still the
+/// built-in perfect, which follows the latest judgment.
+#[test]
+fn a_built_in_wins_over_options_sharing_it() {
+    let loaded = import_body(
+        r#""property": [
+            {"name": "a", "item": [{"name": "x", "op": 241}], "def": "x"},
+            {"name": "b", "item": [{"name": "y", "op": 241}], "def": "y"}
+        ], "image": [{"id": "i", "src": "a", "w": 64, "h": 64}],
+        "destination": [{"id": "i", "timer": 41, "op": [241], "dst": [{"w": 10, "h": 10}]}]"#,
+    );
+    let mut d = loaded.drawn();
+    assert!(d.frame(0, &[]).is_empty());
+    assert_eq!(d.frame(10, &[judged(10, Judgment::Perfect, 1)]).len(), 1);
+    assert!(d.frame(20, &[judged(20, Judgment::Great, 2)]).is_empty());
 }
 
 #[test]
