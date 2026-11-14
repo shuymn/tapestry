@@ -1163,11 +1163,11 @@ pub struct Renderer {
     /// An offscreen target's frame left pending on the GPU: at most one,
     /// as a swap chain's frame latency bounds a window's.
     pacer: Pacer<wgpu::SubmissionIndex>,
-    /// How long an offscreen frame waits for the frame before it, in place
-    /// of [`OFFSCREEN_FRAME_WAIT`] (dev-tools,
+    /// How long an offscreen frame waits for the frame before it, `None`
+    /// without a bound, in place of [`OFFSCREEN_FRAME_WAIT`] (dev-tools,
     /// [`set_offscreen_frame_wait`](Self::set_offscreen_frame_wait)).
     #[cfg(feature = "dev-tools")]
-    offscreen_wait: Duration,
+    offscreen_wait: Option<Duration>,
     /// What each frame is cleared to: opaque black. A unit test clears to
     /// transparent black to read the blends' alpha channel.
     clear: wgpu::Color,
@@ -1374,7 +1374,7 @@ impl Renderer {
             staged_text: None,
             pacer: Pacer::default(),
             #[cfg(feature = "dev-tools")]
-            offscreen_wait: OFFSCREEN_FRAME_WAIT,
+            offscreen_wait: Some(OFFSCREEN_FRAME_WAIT),
             clear: wgpu::Color::BLACK,
             #[cfg(test)]
             atlas_fault: None,
@@ -3629,11 +3629,12 @@ impl Renderer {
 
     /// Makes an offscreen frame wait up to `wait` for the frame before it
     /// on the GPU, in place of [`OFFSCREEN_FRAME_WAIT`], before it is
-    /// skipped (dev-tools): a test that counts the frames that reached the
-    /// target, on a software adapter a loaded machine slows, sets a wait
-    /// no frame reaches, so its outcome is not the machine's clock's.
+    /// skipped; `None` waits until that frame is done, so no frame is
+    /// skipped (dev-tools). A test that counts the frames that reached the
+    /// target, on a software adapter a loaded machine slows, waits without
+    /// a bound: whether a frame is skipped is then never the clock's.
     #[cfg(feature = "dev-tools")]
-    pub fn set_offscreen_frame_wait(&mut self, wait: Duration) {
+    pub fn set_offscreen_frame_wait(&mut self, wait: Option<Duration>) {
         self.offscreen_wait = wait;
     }
 
@@ -5241,12 +5242,12 @@ impl Renderer {
                 #[cfg(feature = "dev-tools")]
                 let wait = self.offscreen_wait;
                 #[cfg(not(feature = "dev-tools"))]
-                let wait = OFFSCREEN_FRAME_WAIT;
+                let wait = Some(OFFSCREEN_FRAME_WAIT);
                 let admitted = self.pacer.admit(|previous| {
                     !matches!(
                         device.poll(wgpu::PollType::Wait {
                             submission_index: Some(previous.clone()),
-                            timeout: Some(wait),
+                            timeout: wait,
                         }),
                         Err(wgpu::PollError::Timeout)
                     )

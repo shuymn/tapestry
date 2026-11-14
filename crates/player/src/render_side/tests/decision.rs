@@ -552,12 +552,12 @@ struct Rig {
     _turn: crate::warp_turn::Turn,
 }
 
-/// How long the rigs' offscreen frames wait for the frame before them on
-/// WARP before one is skipped, in place of the renderer's 100 ms: the
-/// tests count the frames that reached the target, and a loaded machine
-/// slows a software adapter past the renderer's wait, skipping a frame
-/// the test lets through (`presented` false, noted nowhere).
-const FRAME_WAIT: Duration = Duration::from_secs(60);
+/// The rigs' offscreen frames wait for the frame before them on WARP
+/// until it is done, never the renderer's 100 ms: the tests count the
+/// frames that reached the target, and past that wait a frame is skipped
+/// (`presented` false), which a loaded machine slowing the software
+/// adapter would decide.
+const FRAME_WAIT: Option<Duration> = None;
 
 impl Rig {
     fn new(dir: &TempDir) -> Self {
