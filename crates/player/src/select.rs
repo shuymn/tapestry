@@ -1741,16 +1741,17 @@ pub fn labels() -> SelectionLabels {
     }
 }
 
-/// `#PLAYLEVEL` as a number, as a skin draws it: what Java's
-/// `Integer.parseInt` reads ([`crate::imports::facts::level_of`]), 0 when
-/// it is absent or reads none.
+/// `#PLAYLEVEL` as a number, as a skin draws it
+/// ([`crate::imports::facts::level_of`]), 0 when it is absent or reads
+/// none.
 fn level_value(text: Option<&str>) -> i32 {
     text.map_or(0, crate::imports::facts::level_of)
 }
 
-/// `#DIFFICULTY` when it is 1 to 5.
+/// `#DIFFICULTY` when it is 1 to 5, read as an attempt's is
+/// ([`crate::imports::facts::difficulty_of`]).
 fn difficulty(text: Option<&str>) -> Option<u8> {
-    text.and_then(|d| d.trim().parse().ok())
+    text.map(crate::imports::facts::difficulty_of)
         .filter(|d| (1..=5).contains(d))
 }
 
@@ -2659,15 +2660,18 @@ mod tests {
         assert_eq!(s.view(1, 1, true).rows[1].score, RowScore::Unplayed);
     }
 
-    /// A row's difficulty is `#DIFFICULTY` when it is 1 to 5, spaces aside.
+    /// A row's difficulty is `#DIFFICULTY` when it reads as an integer
+    /// from 1 to 5.
     #[test]
     fn a_difficulty_is_one_to_five() {
         for (text, want) in [
             ("1", Some(1)),
-            (" 5 ", Some(5)),
+            ("+5", Some(5)),
+            ("05", Some(5)),
             ("0", None),
             ("6", None),
             ("x", None),
+            ("５", None),
         ] {
             let mut e = entry(r"C:\charts\x\1.bms", "a");
             e.header.difficulty = Some(text.to_owned());
@@ -2896,10 +2900,10 @@ mod tests {
         assert_eq!(s.input(press(skin_model::Button::Left, 3)), Acted::Nothing);
     }
 
-    /// A chart row carries its level as a skin draws it, as the source's
-    /// `Integer.parseInt` reads `#PLAYLEVEL` (0 when it reads none), its
-    /// summary's long notes and mines, unknown without a summary, and
-    /// whether it draws; the chart under the cursor carries the same level.
+    /// A chart row carries its level as a skin draws it, `#PLAYLEVEL` read
+    /// as an integer token (0 when it reads none), its summary's long notes
+    /// and mines, unknown without a summary, and whether it draws; the
+    /// chart under the cursor carries the same level.
     #[test]
     fn a_chart_row_carries_its_level_value_features_and_random() {
         use bms_model::{ChartSummary, Tempo, TimeUs};
@@ -2930,6 +2934,7 @@ mod tests {
             chart(4, None, Some(summary(0, 0)), false),
             chart(5, Some("-3"), None, false),
             chart(6, Some("2147483648"), None, false),
+            chart(7, Some("１２"), None, false),
         ]);
         let v = s.view(0, 10, false);
         let read: Vec<_> = v
@@ -2947,6 +2952,7 @@ mod tests {
                 (0, None, true),
                 (0, f(false, false), false),
                 (-3, None, false),
+                (0, None, false),
                 (0, None, false),
             ]
         );

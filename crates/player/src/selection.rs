@@ -4387,7 +4387,7 @@ pub(crate) mod tests {
             chosen_chart(&entry(header, false)).play_level
         };
         assert_eq!(level(Some("12")), Some(12));
-        assert_eq!(level(Some("１２")), Some(12));
+        assert_eq!(level(Some("１２")), Some(0));
         assert_eq!(level(Some("12+")), Some(0));
         assert_eq!(level(None), Some(0));
     }
@@ -4407,7 +4407,14 @@ pub(crate) mod tests {
         };
         assert_eq!(chosen(Some("4"), true), (Some(4), Some(true)));
         assert_eq!(chosen(Some("+5"), false), (Some(5), Some(false)));
-        for text in [Some("6"), Some("0"), Some("-1"), Some("2a"), None] {
+        for text in [
+            Some("6"),
+            Some("0"),
+            Some("-1"),
+            Some("2a"),
+            Some("４"),
+            None,
+        ] {
             assert_eq!(chosen(text, false), (Some(0), Some(false)), "{text:?}");
         }
     }
