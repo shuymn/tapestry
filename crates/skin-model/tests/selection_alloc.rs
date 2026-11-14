@@ -11,29 +11,34 @@
 //! one of another array), their fields written every frame; and pointer
 //! input (docs/stage3.md S10-09e): frames whose pointer moves across hover
 //! rects, presses hitting chart and folder rows whose paths are long, an
-//! action, and drags on a slider.
+//! action, and drags on a slider; and the cursor's chart's notes and BPM
+//! graphs (design.md "Rendering and Skins", the selection graphs), their
+//! pixmaps prepared at the view. Nor does it free anything.
 //!
-//! A counting global allocator counts allocations made on threads that opt
-//! in (a thread-local flag), so the test harness's own threads do not
-//! disturb the count. This file holds a single test for the same reason.
+//! A counting global allocator counts allocations and frees made on
+//! threads that opt in (a thread-local flag), so the test harness's own
+//! threads do not disturb the count. This file holds a single test for the
+//! same reason.
 
 mod selection_support;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use bms_model::TimeUs;
+use bms_model::{ChartBuilder, ChartProfile, ChartSummary, Lane, Tempo, TimeUs};
 use selection_support::{
     Fx, all, boolean, chart, digits, element, features, folder, int, labels, lamps, levels, list,
     list_element, load, ratio, rect, row_text, view,
 };
 use skin_model::chart_image::{ChartImage, ChartKey, ChartStretch, ChartTable, ChartUv};
 use skin_model::{
-    ActionDef, AppReadouts, Button, ClickType, FolderId, FontRef, FrameUv, GaugeLook, HoverRect,
-    LocalTime, NumberDef, OwnLamp, PointerDef, PointerHit, RatioBarDef, RatioForm, RatioSource,
-    RowKey, RowRef, RowRefKind, RowScore, SelectionDefs, SelectionOrder, SelectionSettings,
+    ActionDef, AppReadouts, BpmColors, BpmGraphDef, Button, ChartGraphs, ClickType, FolderId,
+    FontRef, FrameUv, GaugeLook, GraphFit, HoverRect, JudgeGraphDef, JudgeGraphKind, LocalTime,
+    NumberDef, OwnLamp, PointerDef, PointerHit, RatioBarDef, RatioForm, RatioSource, RowKey,
+    RowRef, RowRefKind, RowScore, SelectionDefs, SelectionOrder, SelectionSettings,
     SliderDirection, Source, SpeedReference, SpeedView, TextDef, TextField, TextImage, TextTable,
     TextValue, VolumeReading, WidgetDefs,
 };
@@ -41,6 +46,7 @@ use skin_model::{
 struct Counting;
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
+static FREES: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
     static TRACK: Cell<bool> = const { Cell::new(false) };
@@ -61,6 +67,9 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        if TRACK.try_with(Cell::get).unwrap_or(false) {
+            FREES.fetch_add(1, Ordering::Relaxed);
+        }
         // SAFETY: same contract as the caller's.
         unsafe { System.dealloc(ptr, layout) }
     }
@@ -75,14 +84,48 @@ unsafe impl GlobalAlloc for Counting {
 #[global_allocator]
 static GLOBAL: Counting = Counting;
 
-/// The allocations `f` makes on this thread.
+/// The allocations and frees `f` makes on this thread, together.
 fn counted(f: impl FnOnce()) -> u64 {
-    let before = ALLOCS.load(Ordering::Relaxed);
+    let [allocs, frees] = [&ALLOCS, &FREES].map(|c| c.load(Ordering::Relaxed));
     TRACK.with(|t| t.set(true));
     f();
     TRACK.with(|t| t.set(false));
-    ALLOCS.load(Ordering::Relaxed) - before
+    ALLOCS.load(Ordering::Relaxed) - allocs + FREES.load(Ordering::Relaxed) - frees
 }
+
+/// The frees `f` makes on this thread.
+fn freed(f: impl FnOnce()) -> u64 {
+    let before = FREES.load(Ordering::Relaxed);
+    TRACK.with(|t| t.set(true));
+    f();
+    TRACK.with(|t| t.set(false));
+    FREES.load(Ordering::Relaxed) - before
+}
+
+/// The graphs of a chart at 150 BPM, `fast` (in thousandths) from 1 s,
+/// its notes before and after: rows at 150 (MAIN) and `fast`.
+fn graphs(fast: i64) -> Arc<ChartGraphs> {
+    let lane = |l| Lane::new(l).unwrap();
+    let mut b = ChartBuilder::new(150_000).bpm(TimeUs(1_000_000), fast);
+    for k in 1..=9 {
+        b = b.tap(lane(1 + k % 7), TimeUs(100_000 * i64::from(k)));
+    }
+    let mut chart = b.tap(lane(2), TimeUs(3_000_000)).build().unwrap();
+    chart.meta.length = ChartSummary::of(&chart).length;
+    let p = ChartProfile::of(&chart, &[]);
+    Arc::new(ChartGraphs {
+        bins: p.bins().to_vec(),
+        bin_seconds: p.bin_seconds(),
+        length_ms: p.length_ms(),
+        rows: Some(p.speeds().clone()),
+        main: Some(Some(Tempo::from_units(150 * Tempo::UNITS_PER_BPM).unwrap())),
+    })
+}
+
+/// The graphs' places, each 300 × 60 from its left top, clear of every
+/// other element: the notes graph's and the BPM graph's.
+const NOTES_AT: [i32; 2] = [1_500, 1_000];
+const BPM_AT: [i32; 2] = [1_500, 820];
 
 fn skin() -> Fx {
     let mut def = list(24, 11);
@@ -137,6 +180,9 @@ fn skin() -> Fx {
             e.visible = Some(boolean("selected.stagefile"));
             e
         },
+        // The cursor's chart's notes and BPM graphs.
+        element(Source::JudgeGraph(0), [NOTES_AT[0], NOTES_AT[1], 300, 60]),
+        element(Source::BpmGraph(0), [BPM_AT[0], BPM_AT[1], 300, 60]),
     ];
     let hover = HoverRect {
         x: 0,
@@ -250,6 +296,21 @@ fn skin() -> Fx {
                     source: RatioSource::ComboRate,
                 },
             ],
+            judge_graphs: vec![JudgeGraphDef {
+                kind: JudgeGraphKind::Notes,
+                delay: TimeUs(0),
+                reverse: false,
+                back: true,
+                chips: 0,
+                solid: 0,
+                fit: GraphFit::Stretch,
+            }],
+            bpm_graphs: vec![BpmGraphDef {
+                delay: TimeUs(0),
+                line_width: 2,
+                colors: BpmColors::DEFAULT,
+                solid: 0,
+            }],
             ..SelectionDefs::default()
         },
     )
@@ -396,6 +457,8 @@ fn a_selection_build_allocates_nothing() {
                 max_combo: 190,
                 play: skin_model::BestPlay { tally, notes: 230 },
             });
+            // Each cursor's chart its own graphs.
+            c.graphs = Some(graphs(200_000 + 10_000 * i64::try_from(cursor).unwrap()));
         }
         // The same view without a best, made before any count.
         let mut bare = v.clone();
@@ -415,6 +478,24 @@ fn a_selection_build_allocates_nothing() {
         fx.sel.set_chart_live(Some(KEY));
         fx.frame(0);
         assert_eq!(fx.batch.quads().iter().filter(|q| q.layer == 9).count(), 2);
+        // A chart row draws both graphs; a folder or the all-charts row
+        // neither.
+        let in_graphs = |fx: &Fx, [x, y]: [i32; 2]| {
+            fx.batch
+                .quads()
+                .iter()
+                .filter(|q| {
+                    q.rect[0] >= x as f32 && q.rect[1] >= y as f32 && q.rect[1] < (y + 60) as f32
+                })
+                .count()
+        };
+        let drawn = v.selected.is_some();
+        assert_eq!(
+            in_graphs(&fx, NOTES_AT) > 0,
+            drawn,
+            "{cursor}: the notes graph"
+        );
+        assert_eq!(in_graphs(&fx, BPM_AT) > 0, drawn, "{cursor}: the BPM graph");
         // A view change, its strings' capacity reached: the fields, the
         // best play's numbers and the bars' ratios are filled in place.
         // The labels are made before the count, as the player keeps its own.
@@ -544,11 +625,13 @@ fn a_selection_build_allocates_nothing() {
     assert_eq!(pointer_total, 0);
     assert_eq!((actions, hits, drags), (100, [50, 50], 50));
     assert_eq!(size_of::<RowRef>(), 16);
-    // The positive control: the counter sees an allocation on this thread
-    // (design.md "Scope of No Allocation").
+    // The positive controls: the counter sees an allocation on this thread
+    // (design.md "Scope of No Allocation"), and a free.
     assert!(
         counted(|| {
             std::hint::black_box(vec![0_u8; 1]);
         }) > 0
     );
+    let boxed = std::hint::black_box(Box::new(7_u64));
+    assert_eq!(freed(|| drop(boxed)), 1);
 }
