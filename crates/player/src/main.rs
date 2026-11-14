@@ -2427,8 +2427,8 @@ mod tests {
                 let now = input.clock.now();
                 let (_sink, queue) = game::audio_link_at(8, now);
                 rig.audio.control.play(now, queue).unwrap();
-                // Sent before the first phase holds the gate, the start is
-                // in when that phase reads its frame line.
+                // The frame where the play's chart time 0 falls, from the
+                // frame line at the play's own `now`.
                 let starts = |rig: &crate::play::PlayerRig<'_>| {
                     let line = rig.audio.control.counters().frame_line(now);
                     u64::try_from(line.frame(bms_model::TimeUs(0))).unwrap_or(0)
