@@ -7966,7 +7966,9 @@ pub(crate) mod tests {
 
     /// A scenario's state over `captures`, a selection's.
     #[cfg(feature = "dev-tools")]
-    fn capture_state(captures: crate::dev::scenario::Captures) -> crate::dev::scenario::State {
+    pub(crate) fn capture_state(
+        captures: crate::dev::scenario::Captures,
+    ) -> crate::dev::scenario::State {
         crate::dev::scenario::State {
             logs: Vec::new(),
             captures,

@@ -1121,7 +1121,7 @@ fn run_with(
             .with_scripts(rig.render.scripts().clone());
         rig.result_skin.set_wake(rig.controls.game_thread());
         rig.selection = Some(sel);
-        rig.scenario = opts.captures.map(scenario_state);
+        rig.scenario = opts.captures.map(crate::selection::tests::capture_state);
         if saved {
             rig.measured_plays = Some(Arc::clone(&measured));
         }
@@ -1210,30 +1210,6 @@ fn run_with(
         stamps,
         failure,
         measured,
-    }
-}
-
-/// A scenario's state over `captures` alone, as the game thread keeps it.
-fn scenario_state(captures: crate::dev::scenario::Captures) -> crate::dev::scenario::State {
-    crate::dev::scenario::State {
-        logs: Vec::new(),
-        captures,
-        recorded: crate::input_side::Recorded {
-            keyboard: Vec::new(),
-            controller: Vec::new(),
-            controller_device: None,
-            scratch: game::ScratchConfig::default(),
-        },
-        chart_input: None,
-        pending: None,
-        until: None,
-        sent: None,
-        practice: None,
-        shown: false,
-        rounds: 0,
-        nearest: None,
-        result_id: None,
-        result_seq: 0,
     }
 }
 
@@ -1904,15 +1880,11 @@ fn a_choice_without_the_option_does_not_wait() {
 /// Captures of the decision axis at each of `ms`, written under `dir`,
 /// none armed.
 fn decision_captures(dir: &std::path::Path, ms: &[i64]) -> crate::dev::scenario::Captures {
-    let c = crate::dev::scenario::Captures::of(
-        (0..ms.len())
-            .map(|i| (TimeUs(0), dir.join(format!("{i}.png"))))
-            .collect(),
-    );
-    for (i, &m) in ms.iter().enumerate() {
-        c.set_axis(i, crate::dev::scenario::Axis::Decision(TimeUs(m * MS)));
-    }
-    c
+    let axes: Vec<_> = ms
+        .iter()
+        .map(|&m| (crate::dev::scenario::Axis::Decision(TimeUs(m * MS)), false))
+        .collect();
+    crate::dev::scenario::tests::screen_captures(dir, &axes)
 }
 
 /// Capture `k`'s state.
@@ -2108,11 +2080,9 @@ fn the_present_time_is_sampled_before_cleanup() {
         captures: Some(c.clone()),
         ..Opts::default()
     };
-    let mut chosen_at = None;
     let ran = run_with(&set, None, opts, |side| {
         side.prepared();
         let (chosen, ..) = side.choose(MenuKey::Enter);
-        chosen_at = Some(chosen);
         let t = TimeUs(chosen.0 + t_ms * MS);
         side.seen.gate.hold();
         side.cleanup_gate.hold(true);
@@ -2147,7 +2117,6 @@ fn the_present_time_is_sampled_before_cleanup() {
         ((t_ms + 1) * MS).to_string(),
         "{side}"
     );
-    let _ = chosen_at;
 }
 
 /// A decision screen that presents no frame at all still settles its

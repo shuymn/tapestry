@@ -4567,7 +4567,7 @@ pub(crate) mod tests {
     }
 
     /// Captures under `dir` waiting on `axes`, each holding as given.
-    fn screen_captures(dir: &Path, axes: &[(super::Axis, bool)]) -> Captures {
+    pub(crate) fn screen_captures(dir: &Path, axes: &[(super::Axis, bool)]) -> Captures {
         let c = Captures::of(
             (0..axes.len())
                 .map(|i| (TimeUs(0), dir.join(format!("{i}.png"))))
