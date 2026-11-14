@@ -636,6 +636,8 @@ fn draw_selection(skin: &skin_model::Skin) -> Vec<usize> {
             judge_class: Some(3),
             clears: 0,
             best: None,
+            info: None,
+            graphs: None,
         });
         let view = SelectionView {
             rows: rows.clone(),
