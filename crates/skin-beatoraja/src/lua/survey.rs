@@ -448,6 +448,7 @@ fn label(e: &ImportError) -> String {
         ImportError::Resolution { w, h, .. } => format!("size {w}x{h}"),
         ImportError::Limit { limit, .. } => format!("limit {limit:?}"),
         ImportError::Critical { part, why, .. } => format!("critical {part:?}: {}", note(why)),
+        ImportError::IdTaken { part, by, .. } => format!("critical {part:?}: IdTaken {by:?}"),
         ImportError::Essential {
             part,
             why: Some(why),
@@ -542,6 +543,7 @@ fn at_of(e: &ImportError) -> Option<&Loc> {
         | ImportError::Type { at, .. }
         | ImportError::Range { at, .. }
         | ImportError::Critical { at, .. }
+        | ImportError::IdTaken { at, .. }
         | ImportError::Expr { at, .. }
         | ImportError::Asset { at, .. } => Some(at),
     }

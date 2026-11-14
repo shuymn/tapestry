@@ -44,6 +44,7 @@ use skin_model::{
 };
 
 pub use budget::ImportLimit;
+pub(crate) use object::table_name;
 pub use policy::{CriticalPart, EssentialPart};
 pub(crate) use property::{int_by_name, str_by_name};
 pub use report::{
@@ -1065,6 +1066,32 @@ impl<'d> Cx<'d> {
         (n != 0).then(|| ops::numeric_in(self.kind, n, &self.items))
     }
 
+    /// Refuses a play destination `dst` the configured options leave
+    /// drawable ([`Self::can_draw`]) whose id `id` the judge or the note
+    /// holds while `by`, an earlier table's object or a built-in image,
+    /// takes it: that part would have no destination (design.md
+    /// "Differences from the source", imported skins, shared ids). The
+    /// judge is checked first.
+    fn id_taken(&mut self, dst: &Dst, id: &str, by: Object) -> Result<(), ImportError> {
+        if !self.can_draw(&dst.ops) {
+            return Ok(());
+        }
+        for (lost, part) in [
+            (Object::Judge, CriticalPart::Judge),
+            (Object::Note, CriticalPart::Lanes),
+        ] {
+            if by != lost && self.objects.holds(self.def, &self.tables, id, lost) {
+                return Err(ImportError::IdTaken {
+                    at: self.loc(dst.span),
+                    id: id.to_owned(),
+                    part,
+                    by,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// One destination, in source order.
     fn destination(&mut self, index: usize, rec: u32) -> Result<(), ImportError> {
         let at = self.arena_span(rec);
@@ -1094,6 +1121,9 @@ impl<'d> Cx<'d> {
             if let Some(e) = &mut self.element {
                 e.kind = Some("SystemImage".to_owned());
             }
+            if self.kind == ScreenKind::Play {
+                self.id_taken(&dst, &id, Object::System)?;
+            }
             self.install(&mut dst, None)?;
             self.system(dst, n)?;
             self.installed();
@@ -1117,6 +1147,7 @@ impl<'d> Cx<'d> {
             ScreenKind::Decision => return self.decision_destination(dst, object, orec),
             ScreenKind::Play => {}
         }
+        self.id_taken(&dst, &id, object)?;
         self.install(&mut dst, Some((object, orec)))?;
         // The source makes no object of these when `src` names no source,
         // and skips the destination (`JSONSkinLoader.java:326-338,

@@ -9,7 +9,7 @@ mod common;
 
 use common::lanes::{NOTES, body, cover, note};
 use common::{Loaded, import_body, import_dir, kinds, png, skin_with, write};
-use skin_beatoraja::{CriticalPart, ImportError, NoteKind, Severity};
+use skin_beatoraja::{CriticalPart, ImportError, NoteKind, Object, Severity};
 
 /// A failure-timed destination of `id`, off the lanes.
 fn failed(id: &str) -> String {
@@ -290,8 +290,9 @@ fn an_image_set_entry_whose_source_is_undefined_is_a_hole() {
 }
 
 /// A shared id is the first table's object, an undefined `src` there
-/// ignored whatever the role and whatever later table holds the id: HIDDEN+
-/// before the note, LIFT before a BGA.
+/// ignored whatever the role and whatever later table holds the id:
+/// HIDDEN+ or LIFT before a BGA. HIDDEN+ before the note would leave the
+/// lanes with no destination, which refuses.
 #[test]
 fn a_shared_id_s_undefined_source_is_ignored() {
     let ignored = |l: &Loaded| {
@@ -301,7 +302,21 @@ fn a_shared_id_s_undefined_source_is_ignored() {
             .any(|n| n.severity == Severity::Ignored && n.kind == NoteKind::UndefinedSource)
     };
     let hidden = r#""hiddenCover": [{"id": "notes", "w": 16, "h": 16, "disapearLine": 200}]"#;
-    let l = lanes_with("", hidden, "");
+    assert!(matches!(
+        lanes_with("", hidden, "").err(),
+        ImportError::IdTaken {
+            part: CriticalPart::Lanes,
+            by: Object::HiddenCover,
+            ..
+        }
+    ));
+    let hidden = r#""hiddenCover": [{"id": "b", "w": 16, "h": 16, "disapearLine": 200}],
+                    "bga": {"id": "b"}"#;
+    let l = lanes_with(
+        "",
+        hidden,
+        r#"{"id": "b", "dst": [{"x": 20, "y": 0, "w": 430, "h": 200}]}"#,
+    );
     assert!(ignored(&l), "{:?}", l.report().notes);
     let lift = r#""liftCover": [{"id": "b", "w": 16, "h": 16, "disapearLine": 200}],
                   "bga": {"id": "b"}"#;

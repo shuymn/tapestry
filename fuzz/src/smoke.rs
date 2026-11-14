@@ -371,6 +371,9 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "offsets",
             "choices_default",
             "lanes",
+            "shared_id_unselected",
+            "shared_id_unaddressed",
+            "shared_id_judge",
             "bar_groups",
             "paints",
             "followers",
@@ -566,6 +569,20 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "size" => assert!(
                 matches!(result, Err(ImportError::Resolution { .. })),
                 "{name}: {result:?}"
+            ),
+            // The image takes the judge's id, which leaves the judge with
+            // no destination.
+            "shared_id_judge" => assert!(
+                matches!(
+                    imported,
+                    Some(Err(ImportError::IdTaken {
+                        part: skin_beatoraja::CriticalPart::Judge,
+                        by: skin_beatoraja::Object::Image,
+                        ..
+                    }))
+                ),
+                "{name}: {:?}",
+                imported.map(|r| r.map(|i| i.report))
             ),
             "syntax" => assert!(
                 matches!(
@@ -953,6 +970,20 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 // At rest SUDDEN+'s paint and three trimmed paints draw;
                 // the rest lie at or past their lines.
                 assert_eq!(drawn, [4, 4, 15, 4], "{name}");
+            }
+            "shared_id_unselected" => {
+                // The judge; the unselected alternative, whose image set
+                // takes a second judge's id, is no authored judge.
+                assert_eq!(u.widget_quads, 1, "{name}");
+                assert_eq!(kinds(&i), [NoteKind::Ignored { field: "op" }]);
+                assert_eq!(drawn, [1, 1, 1, 1], "{name}");
+            }
+            "shared_id_unaddressed" => {
+                // No destination names the judge or the note, whose
+                // malformed ids no lookup reaches.
+                assert_eq!(kinds(&i), [], "{name}");
+                assert!(i.scratch.is_none(), "{name}");
+                assert_eq!(drawn, [1, 1, 1, 1], "{name}");
             }
             "judge" => {
                 // Seven grades, combos of slots 0, 1, 2 and 6 (slots 3-5
