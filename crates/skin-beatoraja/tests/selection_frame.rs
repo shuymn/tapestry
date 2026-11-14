@@ -1214,11 +1214,16 @@ const BEST_NUMBERS: [i32; 40] = [
 
 /// A skin with a 6-digit number per id of [`BEST_NUMBERS`] on row `i`.
 fn best_numbers_skin() -> String {
-    let values: Vec<String> = BEST_NUMBERS
+    numbers_skin(&BEST_NUMBERS)
+}
+
+/// A skin with a 6-digit number per id of `ids` on row `i`.
+fn numbers_skin(ids: &[i32]) -> String {
+    let values: Vec<String> = ids
         .iter()
         .map(|id| format!(r#"{{"id": "n{id}", {DIGITS}, "digit": 6, "ref": {id}}}"#))
         .collect();
-    let dsts: Vec<String> = BEST_NUMBERS
+    let dsts: Vec<String> = ids
         .iter()
         .enumerate()
         .map(|(i, id)| {
@@ -1241,12 +1246,17 @@ fn best_numbers_skin() -> String {
 
 /// Each drawn number of [`best_numbers_skin`] by its id.
 fn best_numbers(s: &mut Sel) -> BTreeMap<i32, String> {
+    numbers(s, &BEST_NUMBERS)
+}
+
+/// Each drawn number of [`numbers_skin`] of `ids` by its id.
+fn numbers(s: &mut Sel, ids: &[i32]) -> BTreeMap<i32, String> {
     let mut numbers: BTreeMap<i32, String> = BTreeMap::new();
     for (t, r) in s.drawn(0) {
         if let Some(d) = digit_of(t) {
             let i = ((1072.0 - r[1]) / 10.0) as usize;
             numbers
-                .entry(BEST_NUMBERS[i])
+                .entry(ids[i])
                 .or_default()
                 .push(char::from(b'0' + d));
         }
@@ -1572,4 +1582,62 @@ fn each_volume_draws_on_its_own_number_slider_and_graph() {
     let want = [x(0.53), 100.0, x(0.994)];
     assert!(close(sliders, want), "{sliders:?} {want:?}");
     assert!(close(graphs, want), "{graphs:?} {want:?}");
+}
+
+/// The player's totals' numbers: the play time's hours, minutes and
+/// seconds, the plays, clears and fails, PERFECT to POOR, and PERFECT to
+/// BAD.
+const PLAYER_NUMBERS: [i32; 12] = [17, 18, 19, 30, 31, 32, 33, 34, 35, 36, 37, 333];
+
+/// C10: a JSON selection skin reading numbers 17 to 19, 30 to 37 and 333
+/// draws the player's totals (`IntegerPropertyFactory.java:94-120` at
+/// `0.8.9`), none of them unsupported, with the cursor on a chart and on
+/// a folder alike.
+#[test]
+fn the_player_totals_draw() {
+    let d = folder(&numbers_skin(&PLAYER_NUMBERS));
+    let imported = import_selection(d.path()).unwrap();
+    assert!(
+        !imported.report.notes.iter().any(|n| matches!(
+            n.kind,
+            skin_beatoraja::NoteKind::UnsupportedProperty { id: Some(id), .. }
+                if PLAYER_NUMBERS.contains(&id)
+        )),
+        "{:?}",
+        imported.report.notes
+    );
+    let mut s = Sel::new(imported.skin);
+    let want: BTreeMap<i32, String> = [
+        (17, "3"),
+        (18, "25"),
+        (19, "45"),
+        (30, "7"),
+        (31, "3"),
+        (32, "4"),
+        (33, "101"),
+        (34, "202"),
+        (35, "303"),
+        (36, "404"),
+        (37, "505"),
+        (333, "1010"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k, v.to_owned()))
+    .collect();
+    for (what, mut v) in [
+        ("chart", view(vec![chart("a")], Some(0), None, None)),
+        (
+            "folder",
+            view(vec![folder_row("f", 2)], Some(0), None, None),
+        ),
+    ] {
+        v.totals = skin_model::PlayerTotals {
+            plays: 7,
+            clears: 3,
+            counts: [101, 202, 303, 404, 505],
+            play_us: 12_345_900_000,
+        };
+        s.view(&v);
+        assert_eq!(numbers(&mut s, &PLAYER_NUMBERS), want, "{what}");
+    }
 }

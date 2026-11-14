@@ -88,6 +88,10 @@ pub(crate) enum SelValue {
     ScoreCount(u8),
     /// The best EX play's PERFECT to POOR in whole percent of its notes.
     Rate(u8),
+    /// The player's totals over every counted play: the field of
+    /// [`player_field`](super::super::property::player_field), on every
+    /// row kind.
+    Player(&'static str),
 }
 
 /// The best EX play's counts as the selection schema gives them: PERFECT
@@ -165,6 +169,7 @@ impl SelValue {
                 .get(usize::from(n))
                 .copied()
                 .unwrap_or("selected.rate.perfect"),
+            Self::Player(field) => field,
         }
     }
 
@@ -188,6 +193,7 @@ impl SelValue {
             Self::RatePercent | Self::RateHundredths | Self::NextRank => "selected.rate_valid",
             Self::Charts => "cursor.folder || cursor.all",
             Self::ExDifference
+            | Self::Player(_)
             | Self::DisplayOffset
             | Self::SystemVolume
             | Self::KeyVolume
@@ -262,12 +268,15 @@ pub(crate) fn number(id: i32) -> Option<Class<SelValue>> {
         423 => Bridge(SelValue::Count(6)),
         424 => Bridge(SelValue::Count(7)),
         425..=427 => Bridge(SelValue::Count(u8::try_from(id - 425 + 20).ok()?)),
-        // Session and global statistics; rivals and IR; per-lane-class
-        // note counts the summary does not split; density metrics.
-        17..=19
-        | 30
-        | 31
-        | 92
+        // The player's totals over every counted play, every chart and
+        // preset, as the source's player data (`:94-120`): drawn on every
+        // row kind, as the source's have no condition.
+        17..=19 | 30..=37 | 333 => {
+            Bridge(SelValue::Player(super::super::property::player_field(id)?))
+        }
+        // Session statistics; rivals and IR; per-lane-class note counts
+        // the summary does not split; density metrics.
+        92
         | 179
         | 180
         | 227
@@ -275,7 +284,6 @@ pub(crate) fn number(id: i32) -> Option<Class<SelValue>> {
         | 271
         | 283
         | 284
-        | 333
         | 350..=354
         | 360
         | 362..=365
@@ -613,9 +621,9 @@ mod tests {
         (171, 172, C::N),
         (174, 174, C::N),
         (177, 177, C::N),
-        (17, 19, C::D),
+        (17, 19, C::N),
         (20, 29, C::N),
-        (30, 31, C::D),
+        (30, 37, C::N),
         (57, 59, C::N),
         (71, 72, C::N),
         (74, 74, C::N),
@@ -637,7 +645,7 @@ mod tests {
         (283, 284, C::D),
         (300, 300, C::N),
         (312, 313, C::N),
-        (333, 333, C::D),
+        (333, 333, C::N),
         (350, 354, C::D),
         (360, 360, C::D),
         (362, 365, C::D),
@@ -865,5 +873,56 @@ mod tests {
             }
         }
         compile(CLEAR_TYPE, &scope, Ty::Int).unwrap();
+    }
+
+    /// The player's totals read as their fields, on every row kind (their
+    /// availability is `true`): the C8 totals (3 h 25 min 45 s, 7 plays,
+    /// 3 clears, PERFECT to POOR 101 to 505), then 2 147 483 647 s, where
+    /// 17 reads 596 523, 18 the minutes 14 and 19 the seconds 7.
+    #[test]
+    fn the_player_totals_read_as_the_fields() {
+        use skin_model::{State, selection_field as field};
+        let scope = Scope::new(&SELECTION);
+        let read = |time: [i32; 3], id: i32| {
+            let mut fields = [0; field::COUNT];
+            let values = [
+                time[0], time[1], time[2], 7, 3, 4, 101, 202, 303, 404, 505, 1_010,
+            ];
+            for (slot, v) in (field::PLAYER_TIME_H..).zip(values) {
+                fields[usize::from(slot)] = v;
+            }
+            let state = State {
+                fields: &fields,
+                timers: &[],
+            };
+            let Some(Class::Bridge(v)) = number(id) else {
+                panic!("{id}");
+            };
+            assert!(
+                compile(v.availability(), &scope, Ty::Bool)
+                    .unwrap()
+                    .eval_bool(&state),
+                "{id}"
+            );
+            compile(v.expr(), &scope, Ty::Int).unwrap().eval(&state)
+        };
+        for (id, want) in [
+            (17, 3),
+            (18, 25),
+            (19, 45),
+            (30, 7),
+            (31, 3),
+            (32, 4),
+            (33, 101),
+            (34, 202),
+            (35, 303),
+            (36, 404),
+            (37, 505),
+            (333, 1_010),
+        ] {
+            assert_eq!(read([3, 25, 45], id), want, "{id}");
+        }
+        let boundary = [596_523, 14, 7];
+        assert_eq!([17, 18, 19].map(|id| read(boundary, id)), [596_523, 14, 7]);
     }
 }

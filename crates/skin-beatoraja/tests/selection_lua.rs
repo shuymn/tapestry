@@ -10,13 +10,13 @@ use skin_beatoraja::{
 };
 use skin_model::ScreenKind;
 
-/// The JSON skin: number 71 by `ref`, number 333, an image under op 2 and
+/// The JSON skin: number 71 by `ref`, number 354, an image under op 2 and
 /// one under `draw` 625.
 fn json_body() -> String {
     format!(
         r#""imageset": [{SET}], "text": [{TEXT_T}],
            "value": [{{"id": "ex", {DIGITS}, "digit": 4, "ref": 71}},
-                     {{"id": "ep", {DIGITS}, "digit": 4, "ref": 333}}],
+                     {{"id": "ep", {DIGITS}, "digit": 4, "ref": 354}}],
            "songlist": {{"id": "list", "center": 0,
                "liston": [{{"id": "set", "dst": [{{"x": 0, "y": 900, "w": 300, "h": 40}}]}}],
                "listoff": [{{"id": "set", "dst": [{{"x": 0, "y": 900, "w": 300, "h": 40}}]}}],
@@ -58,7 +58,7 @@ fn lua_entry() -> String {
            {{ id = \"ex\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, digit = 4,\n\
              value = function() return ms.number(71) end }},\n\
            {{ id = \"ep\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, digit = 4,\n\
-             value = function() return ms.number(333) end }} }}\n\
+             value = function() return ms.number(354) end }} }}\n\
          skin.songlist = {{ id = \"list\", center = 0,\n\
            liston = {{ {{ id = \"set\", dst = {{ {{ x = 0, y = 900, w = 300, h = 40 }} }} }} }},\n\
            listoff = {{ {{ id = \"set\", dst = {{ {{ x = 0, y = 900, w = 300, h = 40 }} }} }} }},\n\
@@ -91,8 +91,8 @@ fn lua_reads_and_json_fields_draw_the_same_frames() {
         LuaOutcome::Imported(i) => i,
         LuaOutcome::Pending(p) => panic!("{p:?}"),
     };
-    // 71, option 2 and option 625 lower; 333 (notes played over all charts) does not, and is dropped as
-    // the JSON `ref` is.
+    // 71, option 2 and option 625 lower; 354 (a density metric, omitted on
+    // selection) does not, and is dropped as the JSON `ref` is.
     let lowered = lua
         .callbacks
         .iter()
@@ -109,7 +109,7 @@ fn lua_reads_and_json_fields_draw_the_same_frames() {
     };
     let note = NoteKind::UnsupportedProperty {
         kind: PropertyKind::Integer,
-        id: Some(333),
+        id: Some(354),
     };
     assert_eq!(dropped(&json.report), [note]);
     assert_eq!(dropped(&lua.imported.report), [note]);
@@ -348,7 +348,7 @@ fn json_numbers_20_to_29_read_the_application_readouts() {
 }
 
 /// A Lua selection callback's `number(27)` lowers and reads the frame's
-/// uptime hours: drawn at 1 h, not at 2 h; number 30 stays omitted, noted
+/// uptime hours: drawn at 1 h, not at 2 h; number 354 stays omitted, noted
 /// as its JSON `ref` is.
 #[test]
 fn a_lua_number_27_lowers_to_the_uptime_hours() {
@@ -356,7 +356,7 @@ fn a_lua_number_27_lowers_to_the_uptime_hours() {
                   draw = function() return ms.number(27) == 1 end,\n\
                   dst = { { x = 700, y = 0, w = 8, h = 8 } } })\n\
                 table.insert(skin.destination, { id = \"b1\",\n\
-                  draw = function() return ms.number(30) == 0 end,\n\
+                  draw = function() return ms.number(354) == 0 end,\n\
                   dst = { { x = 800, y = 0, w = 8, h = 8 } } })";
     let l = common::selection::folder("");
     let i = import_lua_in(&l, &lua_skin("", more)).unwrap();
@@ -371,7 +371,7 @@ fn a_lua_number_27_lowers_to_the_uptime_hours() {
     );
     let omitted = NoteKind::UnsupportedProperty {
         kind: PropertyKind::Integer,
-        id: Some(30),
+        id: Some(354),
     };
     assert!(
         i.imported.report.notes.iter().any(|n| n.kind == omitted),

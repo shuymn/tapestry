@@ -37,7 +37,9 @@ fn rows(spans: &[(i32, i32, C)]) -> Vec<(i32, C)> {
 /// §A's numeric ids, the source's bundled skin's five more (S10-09i) and
 /// the ids equal to or derived from bridged ones (S7-07c).
 const NUMERIC: &[(i32, i32, C)] = &[
+    (17, 19, C::N),
     (20, 29, C::N),
+    (30, 37, C::N),
     (45, 49, C::N),
     (71, 72, C::N),
     (74, 76, C::N),
@@ -65,6 +67,7 @@ const NUMERIC: &[(i32, i32, C)] = &[
     (380, 399, C::D),
     (407, 407, C::N),
     (410, 427, C::N),
+    (333, 333, C::N),
     (1163, 1164, C::N),
 ];
 
@@ -142,7 +145,7 @@ fn every_profile_id_has_its_class() {
             .filter(|&id| of(number(id)) == Some(c))
             .count()
     };
-    assert_eq!((count(C::N), count(C::D)), (95, 26));
+    assert_eq!((count(C::N), count(C::D)), (107, 26));
     let n = OPTION_N.iter().flat_map(|&(a, b)| a..=b);
     let d = OPTION_D.iter().flat_map(|&(a, b, _)| a..=b);
     // 160 to 164 are N (constant per kind) with constant values.
@@ -293,6 +296,41 @@ fn best_max_combo_reads_173_and_175() {
         (get(&a, 173), get(&a, 175)),
         (Read::Unavailable, Read::Unavailable)
     );
+}
+
+/// The player's totals read as their fields in every view and status,
+/// without the result's validity: at 2 147 483 647 s, 17 reads 596 523, 18
+/// the minutes 14 and 19 the seconds 7; 30 to 37 and 333 the plays, clears,
+/// fails, PERFECT to POOR and PERFECT to BAD.
+#[test]
+fn the_player_totals_read_as_the_fields() {
+    use skin_model::result_field as f;
+    let mut a = [0; f::COUNT];
+    let values = [596_523, 14, 7, 7, 3, 4, 101, 202, 303, 404, 505, 1_010];
+    for (slot, v) in (f::PLAYER_TIME_H..).zip(values) {
+        a[usize::from(slot)] = v;
+    }
+    assert_eq!(a[usize::from(f::RESULT_VALID)], 0);
+    let get = |id| match number(id) {
+        Some(Class::Bridge(v)) => read_number(&v, &ResultFields(a)),
+        _ => Read::Unavailable,
+    };
+    for (id, want) in [
+        (17, 596_523),
+        (18, 14),
+        (19, 7),
+        (30, 7),
+        (31, 3),
+        (32, 4),
+        (33, 101),
+        (34, 202),
+        (35, 303),
+        (36, 404),
+        (37, 505),
+        (333, 1_010),
+    ] {
+        assert_eq!(get(id), Read::Value(want), "{id}");
+    }
 }
 
 /// 72 is twice the notes; 85 to 89 each grade's whole percent of the

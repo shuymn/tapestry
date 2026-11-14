@@ -192,7 +192,7 @@ fn callbacks_run_on_the_kept_vm() {
         "local req = require\nlocal held = { d = dofile }",
         &[
             "function() return ms.number(77) / 2 end",
-            "function() return ms.number(333) + 7 end",
+            "function() return ms.number(354) + 7 end",
             "function() return ms.number(283) end",
             "function() req(\"x\") return 5 end",
             "function() held.d(\"x\") return 5 end",
@@ -238,7 +238,7 @@ fn callbacks_run_on_the_kept_vm() {
     let (notes, dropped) = runtime(&mut i).notes();
     assert_eq!(dropped, 0);
     assert!(notes.contains(&RuntimeNote::ImportOnly), "{notes:?}");
-    for (api, id, value) in [("number", 333, 0), ("number", 283, i32::MIN)] {
+    for (api, id, value) in [("number", 354, 0), ("number", 283, i32::MIN)] {
         assert!(
             notes.contains(&RuntimeNote::Absent { api, id, value }),
             "{notes:?}"
@@ -1470,4 +1470,61 @@ fn a_result_runtime_reads_number_27_from_the_prepared_frame() {
             "{uptime_us}"
         );
     }
+}
+
+/// C10: callbacks on the kept VM read the player's totals as the fields
+/// the view filled: number 30 the plays, 19 the play time's seconds and
+/// 333 PERFECT to BAD, on any row, none of them absent.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_kept_vm_reads_the_player_totals() {
+    untimed();
+    let mut i = import(&entry(
+        "local req = require",
+        &[
+            "function() return ms.number(30) / 1 end",
+            "function() return ms.number(19) / 1 end",
+            "function() return ms.number(333) / 1 end",
+        ],
+        "function() return ms.number(30) / 1 > 0 end",
+    ));
+    let routed = i
+        .callbacks
+        .iter()
+        .filter(|d| **d == Disposition::Runtime)
+        .count();
+    assert_eq!(routed, 4, "{:?}", i.callbacks);
+    let n = runtime(&mut i).outputs();
+    let mut f = fields(
+        n,
+        &[
+            ("player.plays", 7),
+            ("player.time_s", 45),
+            ("player.notes", 1_010),
+        ],
+    );
+    runtime(&mut i).frame(&mut f, &[]);
+    // No row is a chart here: the numbers are read all the same, and the
+    // draw, behind op 2, is skipped.
+    let st = runtime(&mut i).status().to_vec();
+    assert_eq!(outputs(&f), [7, 45, 1_010, 0], "{st:?}");
+    assert_eq!(st[..3], [CallStatus::Ok; 3]);
+    // On a chart row, the draw reads 30 too.
+    let mut f = fields(
+        n,
+        &[
+            ("player.plays", 7),
+            ("cursor.chart", 1),
+            ("selected.played", 1),
+        ],
+    );
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(outputs(&f), [7, 0, 0, 1]);
+    let (notes, _) = runtime(&mut i).notes();
+    assert!(
+        !notes
+            .iter()
+            .any(|n| matches!(n, RuntimeNote::Absent { .. })),
+        "{notes:?}"
+    );
 }
