@@ -2546,6 +2546,14 @@ impl PlayerRig<'_> {
             }
             // The decision screen follows at once (`entered_decision`).
         } else {
+            // What the system sounds named since the last page, on this
+            // one: a look that chose sends no page, so it leaves them
+            // queued (design.md "Audio", Loading).
+            let named = crate::play::take_notices(&self.system_notices);
+            if !named.is_empty() {
+                sel.screen.set_notice(Some(named.join(" / ")));
+                sel.dirty = true;
+            }
             sel.show(&self.render, images, None, now);
             // The cursor's images, only with no choice in this pass, so no
             // selection job begins in the pass that chose (D2): the
@@ -3456,6 +3464,8 @@ impl AppRig for PlayerRig<'_> {
     }
 
     fn choose(&mut self) -> Option<Pick> {
+        // Received only: the look that sends the page takes what they
+        // named.
         self.poll_system_sounds();
         self.look()
     }

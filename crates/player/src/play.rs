@@ -187,6 +187,16 @@ pub(crate) fn run_ends(
     controls.quitting() || failures.input().is_some() || failures.output().is_some()
 }
 
+/// The lines the system sounds named for the player since the last take,
+/// once each, taken from `queue` (the rig's `system_notices`).
+pub(crate) fn take_notices(queue: &std::sync::Mutex<Vec<String>>) -> Vec<String> {
+    std::mem::take(
+        &mut *queue
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
+}
+
 /// The game's threads as a rig.
 pub struct PlayerRig<'a> {
     /// The input and audio threads' failures, as one state every reader
@@ -982,20 +992,9 @@ impl PlayerRig<'_> {
 
     /// The system sounds' receipt outside play (at selection's looks):
     /// a report pushed, the acknowledgement read, the returned generations
-    /// dropped; what they named since shown on selection's notice line.
+    /// dropped. What they named stays queued in `system_notices` until a
+    /// look sends selection's page ([`take_notices`]).
     pub(crate) fn poll_system_sounds(&mut self) {
-        let named = self.receive_system_sounds();
-        if let Some(sel) = self.selection.as_mut()
-            && !named.is_empty()
-        {
-            sel.screen.set_notice(Some(named.join(" / ")));
-            sel.dirty = true;
-        }
-    }
-
-    /// The system sounds' receipt outside play, and the lines they named
-    /// for the player since the last one, once each.
-    pub(crate) fn receive_system_sounds(&mut self) -> Vec<String> {
         #[cfg(test)]
         if self.in_play {
             self.system_polls_in_play += 1;
@@ -1003,12 +1002,13 @@ impl PlayerRig<'_> {
         if let Some(sounds) = self.system_sounds.as_mut() {
             sounds.poll(&mut self.audio.control);
         }
-        std::mem::take(
-            &mut *self
-                .system_notices
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-        )
+    }
+
+    /// The system sounds' receipt outside play, and the lines they named
+    /// for the player since the last one, once each.
+    pub(crate) fn receive_system_sounds(&mut self) -> Vec<String> {
+        self.poll_system_sounds();
+        take_notices(&self.system_notices)
     }
 
     /// The atlases the render thread retains for the result go to the

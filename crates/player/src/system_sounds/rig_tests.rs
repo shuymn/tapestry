@@ -445,3 +445,77 @@ fn the_shutdown_ends_the_system_sounds_before_the_audio_thread() {
     );
     seam.open_gate();
 }
+
+/// T18, design.md "Audio" (Loading): a file the pick refused, named
+/// before the look whose Enter chooses a chart, is not lost with that
+/// look, which sends no page: the select screen returned to shows it on
+/// its notice line, once.
+// Covers: T18
+#[test]
+fn a_refusal_named_before_a_choice_shows_on_the_return() {
+    use crate::render_side::tests::{Installers, wait_until};
+    use crate::select::MenuKey;
+    use crate::selection::image_tests::press;
+    use game::AppRig as _;
+    let fx = Fixture::new();
+    fx.sound("sound/A", SystemKind::Clear, 10);
+    fx.write("sound/A/scratch.wav", b"not a sound");
+    let seam = Seam::new(Arc::new(RealClock));
+    // The report waits until the select screen is up.
+    seam.rule("A/clear.wav", BLOCKED);
+    arm_run(&fx, &seam, &Arc::default(), Some(MemFs::new()));
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = crate::selection::tests::tree(dir.path(), &[&["a.bms"]]);
+    let screens = Installers::default();
+    let render = screens.spawn_bare();
+    let notice = || {
+        screens
+            .updates
+            .lock()
+            .unwrap()
+            .last()
+            .and_then(|u| u.strip.notice.clone())
+    };
+    crate::selection::tests::on_selection(sel, &screens, render, |rig| {
+        // The cursor onto the chart; nothing named yet.
+        press(rig, MenuKey::Down);
+        assert!(rig.choose().is_none());
+        // The report received, its refusal named and queued, as the
+        // receipt at the head of the choosing look's `choose` leaves it.
+        seam.open_gate();
+        wait("the refusal named", || {
+            rig.system_sounds
+                .as_mut()
+                .expect("rig() made the system sounds")
+                .poll(&mut rig.audio.control);
+            !rig.system_notices.lock().unwrap().is_empty()
+        });
+        let named = rig.system_notices.lock().unwrap().clone();
+        assert!(
+            named
+                .iter()
+                .any(|l| l.contains("scratch.wav") && l.contains("was refused")),
+            "{named:?}"
+        );
+        let line = named.join(" / ");
+        // The look that chooses the chart.
+        press(rig, MenuKey::Enter);
+        assert!(
+            matches!(rig.choose(), Some(game::Pick::Play(_))),
+            "nothing chosen"
+        );
+        // Back on the select screen: its first look's page shows the
+        // line, and the next look's shows it again, not twice over.
+        rig.entered_selection();
+        let before = screens.updates.lock().unwrap().len();
+        assert!(rig.choose().is_none());
+        assert!(wait_until(|| screens.updates.lock().unwrap().len() > before));
+        assert_eq!(notice().as_deref(), Some(line.as_str()));
+        assert!(rig.system_notices.lock().unwrap().is_empty());
+        rig.selection.as_mut().unwrap().dirty = true;
+        let before = screens.updates.lock().unwrap().len();
+        assert!(rig.choose().is_none());
+        assert!(wait_until(|| screens.updates.lock().unwrap().len() > before));
+        assert_eq!(notice().as_deref(), Some(line.as_str()));
+    });
+}
