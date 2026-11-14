@@ -13,7 +13,6 @@ source-name 1 crates/player/src/imports/facts/tests.rs
 source-name 1 crates/skin-beatoraja/src/import/property.rs
 source-name 1 crates/skin-beatoraja/src/import/result/profile/tests.rs
 source-name 1 crates/skin-beatoraja/src/import/widget/gauge.rs
-source-name 1 crates/skin-beatoraja/src/import/widget/visualizer.rs
 source-name 1 crates/skin-beatoraja/src/lua/residual_tests.rs
 source-name 1 crates/skin-beatoraja/src/lua/root_tests.rs
 source-name 1 crates/skin-beatoraja/src/lua/schema.rs
@@ -21,7 +20,7 @@ source-name 1 crates/skin-beatoraja/tests/import_gauge.rs
 source-name 2 crates/skin-beatoraja/tests/import_lanes.rs
 source-name 1 crates/skin-beatoraja/tests/import_slider_value.rs
 source-name 4 crates/skin-beatoraja/tests/import_track.rs
-source-name 4 crates/skin-beatoraja/tests/play_graph_import.rs
+source-name 3 crates/skin-beatoraja/tests/play_graph_import.rs
 source-name 1 crates/skin-beatoraja/tests/result_graph_import.rs
 source-name 1 crates/skin-beatoraja/tests/result_graphs.rs
 source-name 1 crates/skin-model/tests/gauge_graph.rs
