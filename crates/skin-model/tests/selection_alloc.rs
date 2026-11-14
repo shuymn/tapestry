@@ -311,7 +311,6 @@ fn skin() -> Fx {
                 colors: BpmColors::DEFAULT,
                 solid: 0,
             }],
-            ..SelectionDefs::default()
         },
     )
     .unwrap();
