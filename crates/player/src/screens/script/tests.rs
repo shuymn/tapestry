@@ -587,12 +587,6 @@ fn selection_of(entry: &str) -> (tempfile::TempDir, Arc<render::SkinBundle>, Scr
     selection_slot_of(entry, |slot| slot)
 }
 
-/// [`selection_of`] with its runtime's frames untimed
-/// ([`ScriptSlot::untimed`]).
-fn untimed_selection_of(entry: &str) -> (tempfile::TempDir, Arc<render::SkinBundle>, Scripts) {
-    selection_slot_of(entry, ScriptSlot::untimed)
-}
-
 /// [`selection_of`] with its slot made of the import's by `slot`.
 fn selection_slot_of(
     entry: &str,
@@ -698,7 +692,7 @@ fn the_off_switch_takes_no_runtime() {
 #[test]
 fn the_collect_switch_collects_once_after_each_frame() {
     let _serial = crate::imports::tests::serial();
-    let (_dir, bundle, scripts) = untimed_selection_of("rt.luaskin");
+    let (_dir, bundle, scripts) = selection_slot_of("rt.luaskin", ScriptSlot::untimed);
     let _s = Switches::set(crate::dev::ScriptSwitches {
         collect: true,
         ..Default::default()
