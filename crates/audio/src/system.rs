@@ -127,6 +127,12 @@ impl SystemKind {
         self as usize
     }
 
+    /// Whether it has a reserved voice ([`RESERVED_KINDS`]).
+    #[must_use]
+    pub fn is_reserved(self) -> bool {
+        self.reserved().is_some()
+    }
+
     /// Its reserved voice's place in [`RESERVED_KINDS`], if it has one.
     fn reserved(self) -> Option<usize> {
         RESERVED_KINDS.iter().position(|&k| k == self)
@@ -467,6 +473,9 @@ pub struct SystemVoices {
     /// Steps whose merge ended at an install the taken retired slot or a
     /// full return ring held.
     install_waits: u64,
+    /// Tones started so far (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    tones_started: u64,
 }
 
 /// What an install sends back: the old current unless it retires, and, at
@@ -499,6 +508,8 @@ impl SystemVoices {
             failed: false,
             refused: 0,
             install_waits: 0,
+            #[cfg(feature = "dev-tools")]
+            tones_started: 0,
         }
     }
 
@@ -571,8 +582,36 @@ impl SystemVoices {
     /// taken tone request does; nothing after the output failed.
     pub const fn start_tone(&mut self) {
         if !self.failed {
-            self.tone.start();
+            self.sound_tone();
         }
+    }
+
+    /// Starts the tone from its beginning, counted (dev-tools).
+    const fn sound_tone(&mut self) {
+        self.tone.start();
+        #[cfg(feature = "dev-tools")]
+        {
+            self.tones_started += 1;
+        }
+    }
+
+    /// Tones started so far, by any of the three ways (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn tones_started(&self) -> u64 {
+        self.tones_started
+    }
+
+    /// The sounding voice reserved for `kind`: its generation and whether
+    /// it loops (dev-tools). `None` when `kind` has no reserved voice or it
+    /// is silent.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn reserved_voice(&self, kind: SystemKind) -> Option<(GenId, bool)> {
+        self.reserved
+            .get(kind.reserved()?)
+            .filter(|v| v.active)
+            .map(|v| (v.generation, v.looped))
     }
 
     /// One step's requests (the control step): every empty install the
@@ -621,7 +660,7 @@ impl SystemVoices {
             if report.blocked {
                 self.tone_held = true;
             } else {
-                self.tone.start();
+                self.sound_tone();
                 self.tone_held = false;
                 report.tone = true;
             }
@@ -768,7 +807,7 @@ impl SystemVoices {
             .and_then(|g| Some((g.id(), g.index(s.kind)?)));
         let Some((generation, sound)) = found else {
             if s.kind == SystemKind::Decide {
-                self.tone.start();
+                self.sound_tone();
             }
             return;
         };

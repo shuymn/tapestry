@@ -27,9 +27,9 @@ use std::time::{Duration, Instant};
 
 use ::audio::{
     AudioEngine, AudioOutput, BgmSchedule, Channel, FrameLine, Gain, GenId, InvalidVolume,
-    MAX_VOLUME, OutputError, SYSTEM_INSTALLS, SYSTEM_KINDS, SYSTEM_RETURNS, SYSTEM_STARTS,
-    ScheduledKind, SeekSource, SoundBank, SystemGeneration, SystemInstall, SystemKind,
-    SystemSnapshot, SystemStart,
+    MAX_VOLUME, OutputError, RESERVED_KINDS, SYSTEM_INSTALLS, SYSTEM_KINDS, SYSTEM_RETURNS,
+    SYSTEM_STARTS, ScheduledKind, SeekSource, SoundBank, SystemGeneration, SystemInstall,
+    SystemKind, SystemSnapshot, SystemStart,
 };
 use bms_model::TimeUs;
 
@@ -478,6 +478,22 @@ struct Shared {
     system_refused: AtomicU64,
     /// System starts the requesting side refused so far.
     system_refused_requests: AtomicU64,
+    /// Per [`SystemKind`], the starts queued so far (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    starts_queued: [AtomicU64; SYSTEM_KINDS],
+    /// Per [`SystemKind`], the stops drawn so far, each stop of every
+    /// kind counted for each (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    stops_drawn: [AtomicU64; SYSTEM_KINDS],
+    /// The tones the audio thread started so far, as of its latest
+    /// control step (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    tones_started: AtomicU64,
+    /// Per kind of [`RESERVED_KINDS`], its reserved voice as of the audio
+    /// thread's latest control step: the generation's id shifted left one
+    /// bit, with bit 0 set when it loops; 0 when silent (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    reserved: [AtomicU64; RESERVED_KINDS.len()],
     /// Steps so far whose system requests waited behind a blocked install.
     system_install_waits: AtomicU64,
     /// The latest report that the sealed play's audio has ended: its
@@ -555,6 +571,59 @@ impl OutputProbe {
     #[must_use]
     pub fn tone_requests(&self) -> u64 {
         self.0.tones.load(Ordering::Acquire)
+    }
+
+    /// How many starts of `kind` were queued
+    /// ([`AudioControl::system_start`] answered `Ok`; dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn system_starts(&self, kind: SystemKind) -> u64 {
+        self.0
+            .starts_queued
+            .get(kind.index())
+            .map_or(0, |n| n.load(Ordering::Acquire))
+    }
+
+    /// How many stops reached `kind` ([`AudioControl::system_stop`] of
+    /// it, and every [`AudioControl::system_stop_all`]; dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn system_stops(&self, kind: SystemKind) -> u64 {
+        self.0
+            .stops_drawn
+            .get(kind.index())
+            .map_or(0, |n| n.load(Ordering::Acquire))
+    }
+
+    /// `kind`'s stop word ([`AudioControl::system_stop_word`]), readable
+    /// after the control is gone (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn system_stop_word(&self, kind: SystemKind) -> u64 {
+        self.0
+            .system_stops
+            .get(kind.index())
+            .map_or(0, |word| word.load(Ordering::Acquire))
+    }
+
+    /// How many tones the audio thread started, by a tone request or by a
+    /// decision sound its generation has none for, as of its latest control
+    /// step (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn tones_started(&self) -> u64 {
+        self.0.tones_started.load(Ordering::Acquire)
+    }
+
+    /// The sounding voice reserved for `kind` as of the audio thread's
+    /// latest control step: its generation and whether it loops; `None`
+    /// when silent or when `kind` has no reserved voice (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub fn reserved(&self, kind: SystemKind) -> Option<(GenId, bool)> {
+        let at = RESERVED_KINDS.iter().position(|&k| k == kind)?;
+        let word = self.0.reserved.get(at)?.load(Ordering::Acquire);
+        (word != 0).then_some((GenId(word >> 1), word & 1 == 1))
     }
 }
 
@@ -1312,6 +1381,10 @@ impl AudioControl {
             return refused(SystemStartError::Full);
         }
         self.shared.system_published.store(seq, Ordering::Release);
+        #[cfg(feature = "dev-tools")]
+        if let Some(n) = self.shared.starts_queued.get(kind.index()) {
+            n.fetch_add(1, Ordering::AcqRel);
+        }
         Ok(seq)
     }
 
@@ -1324,6 +1397,10 @@ impl AudioControl {
         if let Some(word) = self.shared.system_stops.get(kind.index()) {
             word.fetch_max(seq.unwrap_or(TERMINAL), Ordering::Release);
         }
+        #[cfg(feature = "dev-tools")]
+        if let Some(n) = self.shared.stops_drawn.get(kind.index()) {
+            n.fetch_add(1, Ordering::AcqRel);
+        }
         seq
     }
 
@@ -1335,6 +1412,10 @@ impl AudioControl {
         let seq = self.system_seq();
         for word in &self.shared.system_stops {
             word.fetch_max(seq.unwrap_or(TERMINAL), Ordering::Release);
+        }
+        #[cfg(feature = "dev-tools")]
+        for n in &self.shared.stops_drawn {
+            n.fetch_add(1, Ordering::AcqRel);
         }
         seq
     }
@@ -1694,6 +1775,18 @@ impl AudioWorker {
         shared
             .system_install_waits
             .store(system.install_waits(), Ordering::Release);
+        #[cfg(feature = "dev-tools")]
+        {
+            shared
+                .tones_started
+                .store(system.tones_started(), Ordering::Release);
+            for (word, kind) in shared.reserved.iter().zip(RESERVED_KINDS) {
+                let voice = system
+                    .reserved_voice(kind)
+                    .map_or(0, |(id, looped)| (id.0 << 1) | u64::from(looped));
+                word.store(voice, Ordering::Release);
+            }
+        }
     }
 
     /// Hands a silent retired system generation back: after the mix, and

@@ -26,7 +26,7 @@ triple_buffer.workspace = true
 [features]
 default = []
 # Development features. Never enabled in production builds (R3).
-dev-tools = []
+dev-tools = ["audio/dev-tools"]
 
 [lints]
 workspace = true
