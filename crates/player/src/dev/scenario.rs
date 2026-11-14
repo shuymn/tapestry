@@ -5132,4 +5132,77 @@ pub(crate) mod tests {
             ["loading.png"]
         );
     }
+
+    /// A screen whose read-back is one black pixel.
+    struct Still;
+
+    impl crate::render_side::Screen for Still {
+        fn load(
+            &mut self,
+            _chart: &bms_model::Chart,
+            _section: Option<&eval::Section>,
+        ) -> Result<(), render::RenderError> {
+            Ok(())
+        }
+        fn wait(&self) -> bool {
+            true
+        }
+        fn paced(&self) -> bool {
+            false
+        }
+        fn build(&mut self, _f: &render::FrameInput<'_>) -> Result<(), skin_model::BuildError> {
+            Ok(())
+        }
+        fn draw(&mut self) -> Result<render::FrameTiming, render::RenderError> {
+            Err(render::RenderError::SurfaceLost)
+        }
+        fn text(&mut self, _lines: &[&str]) -> Result<bool, render::RenderError> {
+            Ok(true)
+        }
+        fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
+            Some((1, 1, vec![0, 0, 0, 255]))
+        }
+    }
+
+    /// The frame dump's folder lies in a sound set, `frames\select.png` a
+    /// second name of the set's `clear.wav` and `frames\end.png` a
+    /// symbolic link to its `scratch.wav`: each frame replaces the entry
+    /// at its name, so the set's files keep their bytes (design.md
+    /// "Threat Model", T18). Making the symbolic link needs the right to;
+    /// without it only the second name is checked.
+    // Covers: T18
+    #[test]
+    fn the_frame_dump_never_writes_through_a_link() {
+        use crate::measure::ScreenKind;
+        use crate::render_side::FrameSink as _;
+        const PNG: &[u8] = b"\x89PNG\r\n\x1a\n";
+        let dir = tempfile::tempdir().unwrap();
+        let set = dir.path();
+        let frames = set.join("frames");
+        fs::create_dir_all(&frames).unwrap();
+        fs::write(set.join("clear.wav"), b"a clear sound").unwrap();
+        fs::write(set.join("scratch.wav"), b"a scratch sound").unwrap();
+        fs::hard_link(set.join("clear.wav"), frames.join("select.png")).unwrap();
+        let linked = crate::log_file::tests::symlink(r"..\scratch.wav", &frames.join("end.png"));
+
+        let mut dump = crate::dev::FrameDump::new(frames.clone(), TimeUs(1_000_000));
+        dump.frame(&Still, &screen_drawn(ScreenKind::Selection, 0));
+        dump.frame(&Still, &screen_drawn(ScreenKind::Result, 0));
+
+        assert_eq!(fs::read(set.join("clear.wav")).unwrap(), b"a clear sound");
+        assert_eq!(
+            fs::read(set.join("scratch.wav")).unwrap(),
+            b"a scratch sound"
+        );
+        let mut written = vec!["select.png"];
+        if linked {
+            written.push("end.png");
+        }
+        for name in written {
+            let path = frames.join(name);
+            assert!(!fs::symlink_metadata(&path).unwrap().is_symlink(), "{name}");
+            assert_eq!(crate::sound_sets_disk::link_count(&path), Some(1), "{name}");
+            assert!(fs::read(&path).unwrap().starts_with(PNG), "{name}");
+        }
+    }
 }

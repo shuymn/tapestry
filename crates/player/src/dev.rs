@@ -2628,7 +2628,11 @@ impl FrameDump {
         let encoded = png(w, h, &pixels);
         for name in names {
             let path = self.dir.join(name);
-            let written = fs::create_dir_all(&self.dir).and_then(|()| fs::write(&path, &encoded));
+            // Renamed over its name, so an entry already there (a link, or
+            // another file's second name) is replaced and never written
+            // through (design.md "Threat Model", T18).
+            let written =
+                fs::create_dir_all(&self.dir).and_then(|()| game::write_atomic(&path, &encoded));
             match written {
                 Ok(()) => println!("dev: frame {}", path.display()),
                 Err(e) => eprintln!("dev: {}: {e}", path.display()),
