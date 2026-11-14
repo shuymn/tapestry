@@ -79,7 +79,8 @@ fn sounds<'r>(rig: &'r mut PlayerRig<'_>) -> &'r mut SystemSounds {
 }
 
 /// An entry's re-roll on the rig, its wait ended by the signals the rig's
-/// other waits read (what S10-24's call in `entered_selection` passes).
+/// other waits read (what `entered_selection` passes), with no loop
+/// started.
 fn entry(rig: &mut PlayerRig<'_>) -> GenId {
     let PlayerRig {
         system_sounds,
@@ -141,11 +142,11 @@ fn raise_later<'a>(
 
 /// ST7e (c), I8: a close, an input failure or an audio output failure
 /// during an entry's wait ends it at the next slice, admitting nothing and
-/// counting no skip, with the current generation's id; `App::run`'s entry
-/// then ends the run before selection's first look, with the signal's
-/// cause, and selection never chooses. The test calls the rig's `repick`
-/// just before `App::run`, standing in for the call S10-24 puts last in
-/// `entered_selection`.
+/// counting no skip, the current generation still the newest; `App::run`'s
+/// entry then ends the run before selection's first look, with the
+/// signal's cause, and selection never chooses. Both waits are
+/// `entered_selection`'s, and C24-1: an entry whose wait ended starts no
+/// `select`.
 #[test]
 fn a_signal_in_the_entrys_wait_ends_the_run_through_app_run() {
     for signal in [Signal::Close, Signal::Input, Signal::Output] {
@@ -166,15 +167,17 @@ fn a_signal_in_the_entrys_wait_ends_the_run_through_app_run() {
             let b = entry(rig);
             assert_ne!(a, b, "{signal:?}");
             wait("B's read", || seam.opens("B/clear.wav") > 0);
-            // The third entry waits for B's report; the signal comes
-            // during that wait.
+            // The third entry, selection's own, waits for B's report; the
+            // signal comes during that wait.
             let polls = sounds(rig).polls;
+            let probe = rig.audio.control.failure_probe();
+            let loops = probe.system_starts(SystemKind::Select);
             let raise = raise_later(rig, signal, Duration::from_millis(100));
-            let (ended, raised, returned) = std::thread::scope(|s| {
+            let (raised, returned) = std::thread::scope(|s| {
                 let raiser = s.spawn(raise);
-                let ended = entry(rig);
+                rig.entered_selection();
                 let returned = Instant::now();
-                (ended, raiser.join().unwrap(), returned)
+                (raiser.join().unwrap(), returned)
             });
             assert!(
                 returned.saturating_duration_since(raised) < LEAVES_WITHIN,
@@ -182,7 +185,7 @@ fn a_signal_in_the_entrys_wait_ends_the_run_through_app_run() {
                 returned.saturating_duration_since(raised)
             );
             let s = sounds(rig);
-            assert_eq!(ended, a, "{signal:?}: the current generation");
+            assert_eq!(s.newest, a, "{signal:?}: the current generation");
             assert_eq!(s.skipped_rerolls, 0, "{signal:?}");
             let admitted = s
                 .events
@@ -231,6 +234,11 @@ fn a_signal_in_the_entrys_wait_ends_the_run_through_app_run() {
             let s = sounds(rig);
             assert_eq!(s.polls, polls, "{signal:?}: selection chose");
             assert!(!s.entry_ended, "{signal:?}: the entry's end was not taken");
+            assert_eq!(
+                probe.system_starts(SystemKind::Select),
+                loops,
+                "{signal:?}: an ended entry's loop"
+            );
             seam.open_gate();
         });
     }
@@ -404,7 +412,10 @@ fn a_close_abandons_a_blocked_pick() {
 /// The shutdown order: `shut_down` closes the system sounds before the
 /// audio thread ends, so with a pick's read blocked the audio thread ends
 /// only after the close's bounded wait for the worker, and what the game
-/// thread held of theirs was dropped before it.
+/// thread held of theirs was dropped before it. C24-4: the close stops
+/// every set sound first: with `select` looping and `decide` sounding,
+/// the shutdown's own stops (counted from just before it, after every
+/// earlier stop) are one of each, numbered above both starts.
 #[test]
 fn the_shutdown_ends_the_system_sounds_before_the_audio_thread() {
     let fx = Fixture::new();
@@ -445,6 +456,42 @@ fn the_shutdown_ends_the_system_sounds_before_the_audio_thread() {
         "the audio thread ended {after:?} into the shutdown"
     );
     seam.open_gate();
+
+    // The close's stops.
+    let _fx = arm_bgm(&Seam::new(Arc::new(RealClock)), &Arc::default());
+    let ((probe, before, numbered), _) =
+        crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            let dir = tempfile::tempdir().unwrap();
+            one_chart(rig, dir.path());
+            let probe = rig.audio.control.failure_probe();
+            let a = installed_past(rig, None);
+            rig.entered_selection();
+            rig.system_sounds.as_mut().unwrap().start(
+                &mut rig.audio.control,
+                SystemKind::Decide,
+                None,
+            );
+            wait("both sounding", || {
+                probe.reserved(SystemKind::Select) == Some((a, true))
+                    && probe.reserved(SystemKind::Decide) == Some((a, false))
+            });
+            // Every start so far is numbered below this.
+            let numbered = rig.audio.control.system_seq_word();
+            let before = [SystemKind::Select, SystemKind::Decide].map(|k| probe.system_stops(k));
+            (probe, before, numbered)
+        });
+    let kinds = [SystemKind::Select, SystemKind::Decide];
+    assert_eq!(
+        kinds.map(|k| probe.system_stops(k)),
+        before.map(|n| n + 1),
+        "the shutdown's stops"
+    );
+    for kind in kinds {
+        assert!(
+            probe.system_stop_word(kind) >= numbered,
+            "{kind:?}'s stop is not above its start"
+        );
+    }
 }
 
 /// The select screen of `screens` on a rig whose startup pick refuses
@@ -935,5 +982,269 @@ fn decide_plays_on_into_loading() {
         rig.entered_loading(&chart);
         assert_eq!(probe.system_stops(SystemKind::Decide), stops);
         assert_eq!(probe.system_stop_word(SystemKind::Decide), word);
+    });
+}
+
+/// BGM sets A and B, each with a `select` longer than any test's look at
+/// it (A 2 s, B 1.5 s) and A with a 10 s `decide`, armed for the next rig
+/// with `seam`'s decoder and `pick`; the sets' root lives as long as the
+/// returned fixture.
+fn arm_bgm(seam: &Seam, pick: &Arc<AtomicUsize>) -> Fixture {
+    let fx = Fixture::new();
+    fx.sound("bgm/A", SystemKind::Select, 96_000);
+    fx.sound("bgm/A", SystemKind::Decide, 480_000);
+    fx.sound("bgm/B", SystemKind::Select, 72_000);
+    arm_run(&fx, seam, pick, Some(MemFs::new()));
+    fx
+}
+
+/// Receives until the audio thread acknowledges a generation other than
+/// `not`, and returns it.
+fn installed_past(rig: &mut PlayerRig<'_>, not: Option<GenId>) -> GenId {
+    wait("an install", || {
+        rig.poll_system_sounds();
+        rig.audio
+            .control
+            .system_installed()
+            .is_some_and(|g| Some(g) != not)
+    });
+    rig.audio.control.system_installed().unwrap()
+}
+
+/// Every kind's stop count on `probe`.
+fn stops(probe: &game::OutputProbe) -> [u64; audio::SYSTEM_KINDS] {
+    SystemKind::ALL.map(|k| probe.system_stops(k))
+}
+
+/// C24-1 (design.md "State Model", system sounds, Selection): each entry
+/// stops every set sound, picks again and loops `select` from that pick:
+/// the first entry's from the startup pick A, the next entry's, after a
+/// choice, from B once it installs.
+// Source: SF-011
+#[test]
+fn each_entry_stops_rerolls_and_loops_its_pick() {
+    let pick = Arc::new(AtomicUsize::new(0));
+    let _fx = arm_bgm(&Seam::new(Arc::new(RealClock)), &pick);
+    on_rig(None, |rig| {
+        let dir = tempfile::tempdir().unwrap();
+        let chart = one_chart(rig, dir.path());
+        let probe = rig.audio.control.failure_probe();
+        let a = installed_past(rig, None);
+        // Positive control: a stop drawn moves its kind's count.
+        rig.audio.control.system_stop(SystemKind::Scratch);
+        assert_eq!(probe.system_stops(SystemKind::Scratch), 1);
+        let before = stops(&probe);
+        rig.entered_selection();
+        assert_eq!(stops(&probe), before.map(|n| n + 1), "every kind stopped");
+        assert_eq!(probe.system_starts(SystemKind::Select), 1);
+        wait("A's loop", || probe.reserved(SystemKind::Select).is_some());
+        assert_eq!(probe.reserved(SystemKind::Select), Some((a, true)));
+        pick.store(1, Ordering::Release);
+        let _ = rig.entered_decision(&game::Pick::Play(chart), game::Decision::off());
+        wait("the loop's stop", || {
+            probe.reserved(SystemKind::Select).is_none()
+        });
+        let before = stops(&probe);
+        rig.entered_selection();
+        assert_eq!(stops(&probe), before.map(|n| n + 1), "every kind stopped");
+        assert_eq!(probe.system_starts(SystemKind::Select), 2);
+        let b = installed_past(rig, Some(a));
+        assert!(b > a, "B picked at the entry");
+        wait("B's loop", || probe.reserved(SystemKind::Select).is_some());
+        assert_eq!(probe.reserved(SystemKind::Select), Some((b, true)));
+    });
+}
+
+/// C24-3 (design.md "State Model", system sounds, Selection): leaving
+/// selection for the decision screen, the practice page or loading stops
+/// `select` at once, a loop still waiting for its generation included:
+/// with B's read blocked at the entry, the loop bound to B never sounds
+/// once B installs after the way out.
+// Source: SF-011
+#[test]
+fn leaving_selection_stops_the_loop() {
+    for way in ["decision", "practice", "loading"] {
+        let seam = Seam::new(Arc::new(RealClock));
+        let pick = Arc::new(AtomicUsize::new(0));
+        let _fx = arm_bgm(&seam, &pick);
+        on_rig(None, |rig| {
+            let dir = tempfile::tempdir().unwrap();
+            let chart = one_chart(rig, dir.path());
+            let probe = rig.audio.control.failure_probe();
+            let a = installed_past(rig, None);
+            rig.entered_selection();
+            wait("A's loop", || probe.reserved(SystemKind::Select).is_some());
+            // B admitted at the next entry, its read blocked.
+            seam.rule("B/select.wav", BLOCKED);
+            pick.store(1, Ordering::Release);
+            rig.entered_loading(&chart);
+            rig.entered_selection();
+            wait("B's read", || seam.opens("B/select.wav") > 0);
+            assert_eq!(probe.system_starts(SystemKind::Select), 2, "{way}");
+            let stopped = probe.system_stops(SystemKind::Select);
+            match way {
+                "decision" => {
+                    let _ = rig.entered_decision(&game::Pick::Play(chart), game::Decision::off());
+                }
+                "practice" => {
+                    let c = bms_model::ChartBuilder::new(120_000).build().unwrap();
+                    rig.entered_practice(&game::PracticeScreen::new(&c, &rules::tapestry(), 0));
+                }
+                _ => rig.entered_loading(&chart),
+            }
+            assert_eq!(probe.system_stops(SystemKind::Select), stopped + 1, "{way}");
+            seam.open_gate();
+            let b = installed_past(rig, Some(a));
+            // Long enough for the control loop to have started a loop
+            // still waiting: it would start at the install's own step.
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(rig.audio.control.system_installed(), Some(b), "{way}");
+            assert_eq!(probe.reserved(SystemKind::Select), None, "{way}");
+        });
+    }
+}
+
+/// C24-1, the latch (design.md "Audio", tone-only recovery): a latched
+/// run's entry queues no `select`; the owner refuses the start and counts
+/// it.
+#[test]
+fn a_latched_entry_starts_no_loop() {
+    let fs = MemFs::new();
+    fs.hold_lock();
+    let fx = Fixture::new();
+    fx.sound("bgm/A", SystemKind::Select, 96_000);
+    arm_run(
+        &fx,
+        &Seam::new(Arc::new(RealClock)),
+        &Arc::default(),
+        Some(fs),
+    );
+    on_rig(None, |rig| {
+        let probe = rig.audio.control.failure_probe();
+        wait("the latch", || {
+            rig.poll_system_sounds();
+            sounds(rig).latched.is_some()
+        });
+        // Positive control: a start queued moves its count.
+        rig.audio
+            .control
+            .system_start(SystemKind::Select, false, None)
+            .unwrap();
+        assert_eq!(probe.system_starts(SystemKind::Select), 1);
+        let refused = sounds(rig).refused;
+        rig.entered_selection();
+        assert_eq!(probe.system_starts(SystemKind::Select), 1, "a loop queued");
+        assert_eq!(sounds(rig).refused, refused + 1, "the refused start");
+    });
+}
+
+/// C24-9 (design.md "State Model", system sounds, Selection): selection
+/// recovered on a screen built again goes on with its entry: nothing is
+/// stopped, picked or started, and the loop plays on.
+#[test]
+fn a_recovered_selection_keeps_its_loop() {
+    let _fx = arm_bgm(&Seam::new(Arc::new(RealClock)), &Arc::default());
+    on_rig(None, |rig| {
+        let dir = tempfile::tempdir().unwrap();
+        one_chart(rig, dir.path());
+        let probe = rig.audio.control.failure_probe();
+        let a = installed_past(rig, None);
+        rig.entered_selection();
+        wait("A's loop", || probe.reserved(SystemKind::Select).is_some());
+        let admitted = |rig: &mut PlayerRig<'_>| {
+            sounds(rig)
+                .events
+                .iter()
+                .filter(|e| matches!(e, Event::Admitted(_)))
+                .count()
+        };
+        let before = (
+            stops(&probe),
+            probe.system_starts(SystemKind::Select),
+            admitted(rig),
+        );
+        rig.recovered_selection();
+        let after = (
+            stops(&probe),
+            probe.system_starts(SystemKind::Select),
+            admitted(rig),
+        );
+        assert_eq!(after, before, "a stop, a start or a re-roll");
+        std::thread::sleep(Duration::from_millis(100));
+        assert_eq!(probe.reserved(SystemKind::Select), Some((a, true)));
+    });
+}
+
+/// C24-1, design.md "Audio" (Mixing): the decision sound plays on into
+/// loading, and the next entry to selection stops it with every set sound.
+#[test]
+fn the_next_entry_stops_decide() {
+    let _fx = arm_bgm(&Seam::new(Arc::new(RealClock)), &Arc::default());
+    on_rig(None, |rig| {
+        let dir = tempfile::tempdir().unwrap();
+        let chart = one_chart(rig, dir.path());
+        let probe = rig.audio.control.failure_probe();
+        let a = installed_past(rig, None);
+        rig.entered_selection();
+        let _ = rig.entered_decision(&game::Pick::Play(chart.clone()), game::Decision::off());
+        rig.entered_loading(&chart);
+        wait("the decision sound", || {
+            probe.reserved(SystemKind::Decide).is_some()
+        });
+        assert_eq!(probe.reserved(SystemKind::Decide), Some((a, false)));
+        let stopped = probe.system_stops(SystemKind::Decide);
+        rig.entered_selection();
+        assert_eq!(probe.system_stops(SystemKind::Decide), stopped + 1);
+        wait("its stop", || probe.reserved(SystemKind::Decide).is_none());
+    });
+}
+
+/// C24-5, C24-6, C24-8 through the rig's look: the keys a look drains ask
+/// for their cues, and the look starts each once, from the select screen's
+/// input to the audio thread's requests; a look with no input starts none.
+// Source: SF-012
+#[test]
+fn a_look_requests_its_cues() {
+    use crate::select::MenuKey;
+    use crate::selection::image_tests::press;
+    let screens = crate::render_side::tests::Installers::default();
+    let render = screens.spawn_bare();
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = crate::selection::tests::tree(
+        dir.path(),
+        &[&["c1.bms", "c2.bms", "c3.bms", "c4.bms", "c5.bms"]],
+    );
+    crate::selection::tests::on_selection(sel, &screens, render, |rig| {
+        let probe = rig.audio.control.failure_probe();
+        let kinds = [
+            SystemKind::Scratch,
+            SystemKind::FolderOpen,
+            SystemKind::FolderClose,
+            SystemKind::OptionChange,
+        ];
+        let starts = |p: &game::OutputProbe| kinds.map(|k| p.system_starts(k));
+        // Positive control: a start queued moves its count.
+        rig.audio
+            .control
+            .system_start(SystemKind::FolderClose, false, None)
+            .unwrap();
+        assert_eq!(probe.system_starts(SystemKind::FolderClose), 1);
+        let before = starts(&probe);
+        for key in [
+            MenuKey::Enter,
+            MenuKey::Down,
+            MenuKey::Down,
+            MenuKey::Down,
+            MenuKey::Right,
+            MenuKey::NextPreset,
+        ] {
+            press(rig, key);
+        }
+        assert!(rig.choose().is_none());
+        let after = starts(&probe);
+        let took: Vec<u64> = after.iter().zip(before).map(|(a, b)| a - b).collect();
+        assert_eq!(took, [3, 1, 0, 2], "scratch, f-open, f-close, o-change");
+        assert!(rig.choose().is_none());
+        assert_eq!(starts(&probe), after, "an empty look");
     });
 }

@@ -85,7 +85,10 @@
 //!     timer chain) is reproduced or refuses the skin, never dropped. Its
 //!     role is fixed before any of its fields is mapped; a part with a
 //!     role of its own (EX score, max combo, the covers, the play
-//!     objects) keeps it ([`Role::or_failure`], `Cx::failure`).
+//!     objects) keeps it ([`Role::or_failure`], `Cx::failure`). One whose
+//!     first object has an undefined source, or is a text naming no font,
+//!     is ignored when no later table holds its id and refuses as failure
+//!     presentation when one does (`Cx::destination`).
 
 use std::fmt;
 
