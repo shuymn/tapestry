@@ -64,6 +64,7 @@ mod select;
 mod selection;
 mod selection_skin;
 mod shelf;
+mod sound_sets_disk;
 mod start_gate;
 mod state_clock;
 mod tuning;
@@ -293,14 +294,14 @@ fn measure_select(clock: QpcClock) -> anyhow::Result<()> {
     // The game's side of the pairing, beside the capture.
     let log = dir.join(format!("{stamp}.select.presents.txt"));
     let text: String = measured.presents.iter().map(|t| format!("{t}\n")).collect();
-    std::fs::write(&log, text).with_context(|| log.display().to_string())?;
+    write_fresh(&log, &text)?;
     // The capture on the game's clock: present, displayed (or -1).
     let pm = dir.join(format!("{stamp}.select.capture.txt"));
     let text: String = frames
         .iter()
         .map(|f| format!("{} {}\n", f.present_us, f.display_us.unwrap_or(-1)))
         .collect();
-    std::fs::write(&pm, text).with_context(|| pm.display().to_string())?;
+    write_fresh(&pm, &text)?;
     for s in &measured.screens {
         let span = dev::screen_span(s.presents, &measured.presents);
         let counted = s.period_ns.map(|period| {
@@ -312,6 +313,16 @@ fn measure_select(clock: QpcClock) -> anyhow::Result<()> {
         );
     }
     Ok(())
+}
+
+/// Writes `text` to a new file at `path` in the data root, never through
+/// a link there ([`game::create_fresh`]).
+#[cfg(feature = "dev-tools")]
+fn write_fresh(path: &Path, text: &str) -> anyhow::Result<()> {
+    use std::io::Write as _;
+    game::create_fresh(path)
+        .and_then(|mut f| f.write_all(text.as_bytes()))
+        .with_context(|| path.display().to_string())
 }
 
 /// `tapestry measure play [--perfect] <chart>` (dev-tools): one play

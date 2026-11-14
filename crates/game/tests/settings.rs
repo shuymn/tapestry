@@ -1,15 +1,17 @@
 //! Settings files, local records and the atomic write they share.
 
 use std::fs;
+use std::path::PathBuf;
 
 use bms_model::{Lane, TimeUs};
 use eval::{AxisBinding, AxisMode, Binding, ControlId, ScratchSettings, SourceProfile};
+use game::sound_sets::SetRole;
 use game::{
     Adjust, Chain, Channel, ControllerDevice, CoverSettings, DataRoot, DeviceSettings,
     FailureAction, HiSpeedReference, HiSpeedSettings, KeyConfig, KeyError, LaneKey, Language,
     LibrarySettings, LocalRecords, PlayerSettings, PlayerSettingsError, RecordSink, Role,
-    ScoreTarget, ScratchConfig, Settings, SettingsError, SkinChoice, SkinChoices, SpeedMode,
-    Tuning, Volume, load_settings, save_settings, write_atomic,
+    ScoreTarget, ScratchConfig, Settings, SettingsError, SkinChoice, SkinChoices, SoundSettings,
+    SpeedMode, Tuning, Volume, load_settings, save_settings, write_atomic,
 };
 use input::DeviceKind;
 use input::hid::AxisCap;
@@ -124,7 +126,82 @@ fn changed() -> Settings {
                 play: Some(play_choice()),
                 ..SkinChoices::default()
             },
+            sounds: SoundSettings {
+                sound_root: Some(absolute("sets/sound")),
+                bgm_root: Some(PathBuf::new()),
+            },
         },
+    }
+}
+
+/// An absolute path on this system ending in `tail`.
+fn absolute(tail: &str) -> PathBuf {
+    if cfg!(windows) {
+        PathBuf::from(r"D:\").join(tail)
+    } else {
+        PathBuf::from("/").join(tail)
+    }
+}
+
+/// ST23: `[sounds]` takes absolute roots; an empty one finds no set of its
+/// kind and an absent one is the data root's folder; a relative root and an
+/// unknown key are refused naming the table and key; a file without
+/// `[sounds]` writes none back.
+#[test]
+fn sounds_load_and_refuse_by_table_and_key() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    let load = |text: &str| {
+        fs::write(root.player_settings(), text).unwrap();
+        Settings::load(&root)
+    };
+    let sets = absolute("sets/sound");
+    let bgm = absolute("sets/bgm");
+    let text = format!(
+        "[sounds]\nsound_root = '{}'\nbgm_root = '{}'\n",
+        sets.display(),
+        bgm.display()
+    );
+    let s = load(&text).unwrap();
+    assert_eq!(s.player.sounds.root(SetRole::Sound, &root), Some(sets));
+    assert_eq!(s.player.sounds.root(SetRole::Bgm, &root), Some(bgm));
+    save_settings(&root.player_settings(), &s.player).unwrap();
+    assert_eq!(Settings::load(&root).unwrap().player, s.player);
+
+    let s = load("[sounds]\nsound_root = ''\n").unwrap();
+    assert_eq!(s.player.sounds.root(SetRole::Sound, &root), None);
+    assert_eq!(s.player.sounds.root(SetRole::Bgm, &root), Some(root.bgm()));
+    let s = load("").unwrap();
+    assert_eq!(s.player.sounds, SoundSettings::default());
+    assert_eq!(
+        s.player.sounds.root(SetRole::Sound, &root),
+        Some(root.sound())
+    );
+    save_settings(&root.player_settings(), &s.player).unwrap();
+    let text = fs::read_to_string(root.player_settings()).unwrap();
+    assert!(!text.contains("sounds"), "{text}");
+
+    for (text, says) in [
+        (
+            "[sounds]\nsound_root = 'rel'\n",
+            "player.toml: [sounds] sound_root 'rel' is not an absolute path",
+        ),
+        (
+            "[sounds]\nbgm_root = 'a/b'\n",
+            "player.toml: [sounds] bgm_root 'a/b' is not an absolute path",
+        ),
+        (
+            "[sounds]\nvolume = 1\n",
+            "player.toml: [sounds] has no key volume;",
+        ),
+    ] {
+        match load(text) {
+            Err(e @ SettingsError::InvalidPlayer(_)) => {
+                let e = Chain(&e).to_string();
+                assert!(e.contains(says), "{e} lacks {says}");
+            }
+            other => panic!("{other:?} for {text}"),
+        }
     }
 }
 
@@ -324,7 +401,10 @@ fn device_and_player_settings_round_trip() {
          [covers]\nsudden = 120\nsudden_on = true\nlift = 80\nlift_on = true\n\
          hidden = 40\nhidden_on = true\n\
          [skins.play]\nroot = 'D:\\skins\\Mine'\nentry = 'play/play7.luaskin'\n\
-         options = { \"Lane cover\" = \"On\" }\nfiles = { \"Background\" = \"bg2.png\" }\n",
+         options = { \"Lane cover\" = \"On\" }\nfiles = { \"Background\" = \"bg2.png\" }\n\
+         [sounds]\nbgm_root = ''\n"
+            .to_owned()
+            + &format!("sound_root = '{}'\n", absolute("sets/sound").display()),
     )
     .unwrap();
     assert_eq!(Settings::load(&root).unwrap().player, s.player);

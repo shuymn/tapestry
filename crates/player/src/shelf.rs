@@ -46,6 +46,7 @@ use crate::loudness::Loudness;
 #[cfg(test)]
 use crate::priority::Unchanged;
 use crate::priority::{Checked, ThreadMode};
+use crate::sound_sets_disk::link_count;
 use crate::ui_text::{Label, Message};
 
 /// How often a load's wait for its chart's background measurement looks
@@ -72,7 +73,53 @@ pub fn database(root: &DataRoot) -> PathBuf {
     root.path().join("library.db")
 }
 
-/// Why the library cannot be opened: another process holds it, or the
+/// The suffixes of the files SQLite keeps beside the database, which hold
+/// its state with it.
+const MEMBERS: [&str; 3] = ["-wal", "-shm", "-journal"];
+
+/// `database`'s name with `suffix` added.
+fn beside(database: &Path, suffix: &str) -> PathBuf {
+    let mut name = database.as_os_str().to_owned();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Removes a link at the library's lock and at the database or any of its
+/// members ([`MEMBERS`]), so neither the library, which follows a link at
+/// its file, nor SQLite writes through one into another file, such as a
+/// sound set's when the data root lies in one (design.md "Threat Model",
+/// T18). A journal may hold committed transactions the database lacks, so
+/// when any of the database's files is a link, every one's name in this
+/// folder is removed (their other names keep their bytes) and the library
+/// is rebuilt: it is derived from the charts and the records (design.md
+/// "Loading and Song Selection"). Nothing is removed until all are
+/// checked, and the database goes first, so a removal that fails, or a
+/// run that stops between them, never leaves the database without its
+/// journal: the next opening finds the link again or no database.
+fn clear_links(database: &Path) -> Result<(), OpenError> {
+    let failed = |path: &Path| {
+        let path = path.to_owned();
+        move |source| OpenError::Link { path, source }
+    };
+    let lock = beside(database, ".lock");
+    game::clear_link(&lock, link_count).map_err(failed(&lock))?;
+    let files: Vec<PathBuf> = std::iter::once(database.to_owned())
+        .chain(MEMBERS.iter().map(|suffix| beside(database, suffix)))
+        .collect();
+    let mut linked = false;
+    for file in &files {
+        linked |= game::is_link(file, link_count).map_err(failed(file))?;
+    }
+    if linked {
+        for file in &files {
+            game::remove_name(file).map_err(failed(file))?;
+        }
+    }
+    Ok(())
+}
+
+/// Why the library cannot be opened: another process holds it, a link
+/// at its files, or a database file after one, cannot be removed, or the
 /// library refused.
 #[derive(Debug, thiserror::Error)]
 pub enum OpenError {
@@ -94,6 +141,16 @@ pub enum OpenError {
         #[source]
         source: std::io::Error,
     },
+    /// A link at the library's files, or a database file once one of them
+    /// was a link, cannot be removed.
+    #[error("{} cannot be removed", path.display())]
+    Link {
+        /// The name that cannot be removed.
+        path: PathBuf,
+        /// Why.
+        #[source]
+        source: std::io::Error,
+    },
     /// The library refused.
     #[error(transparent)]
     Library(#[from] LibraryError),
@@ -111,7 +168,9 @@ pub fn open(root: &DataRoot) -> Result<(Library, Opened), OpenError> {
         root: root.path().to_owned(),
         source,
     })?;
-    let (library, opened) = Library::open(&database(root)).map_err(|e| match e {
+    let database = database(root);
+    clear_links(&database)?;
+    let (library, opened) = Library::open(&database).map_err(|e| match e {
         LibraryError::AlreadyOpen { .. } => OpenError::Running {
             root: root.path().to_owned(),
         },
@@ -981,12 +1040,12 @@ pub fn file_name(path: &Path) -> String {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use std::path::Path;
+    use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     use game::DataRoot;
     use game::coord::{Caps, Coordinator};
-    use library::{Search, Sort};
+    use library::{Opened, Search, Sort};
 
     use super::{OpenError, PAUSE_SLICE, Paused, Shelf, maintenance, open};
     use crate::priority::{PriorityError, ThreadMode, Unchanged};
@@ -1234,6 +1293,177 @@ pub(crate) mod tests {
         assert!(e.to_string().contains(&root.path().display().to_string()));
     }
 
+    /// The data root is a sound set, and links stand at the library's
+    /// files: `library.db` a symbolic link to the set's empty
+    /// `scratch.wav`, `library.db-shm` one to its `select.wav`,
+    /// `library.db.lock` a dangling one to its missing `fail.wav`, and
+    /// `library.db-wal` a second name of its `clear.wav`. Opening the
+    /// library removes each link and builds its own files, so the set's
+    /// files keep their bytes and times and none is added (design.md
+    /// T18). Making the symbolic links needs the right to; without it the
+    /// test says so and checks nothing.
+    // Covers: T18
+    #[test]
+    fn the_library_never_writes_through_a_link_into_a_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = DataRoot::new(dir.path().join("data"));
+        let set = root.path();
+        std::fs::create_dir_all(set).unwrap();
+        let files = [
+            ("scratch.wav", &b""[..]),
+            ("select.wav", b"a select sound"),
+            ("clear.wav", b"a clear sound"),
+        ];
+        for (name, bytes) in files {
+            std::fs::write(set.join(name), bytes).unwrap();
+        }
+        let stamp = |name: &str| {
+            let path = set.join(name);
+            let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+            (std::fs::read(&path).unwrap(), modified)
+        };
+        let before: Vec<_> = files.iter().map(|(name, _)| stamp(name)).collect();
+        for (link, target) in [
+            ("library.db", "scratch.wav"),
+            ("library.db-shm", "select.wav"),
+            ("library.db.lock", "fail.wav"),
+        ] {
+            if !crate::log_file::tests::symlink(target, &set.join(link)) {
+                return;
+            }
+        }
+        std::fs::hard_link(set.join("clear.wav"), set.join("library.db-wal")).unwrap();
+
+        let (library, _) = open(&root).unwrap();
+        drop(library);
+        let after: Vec<_> = files.iter().map(|(name, _)| stamp(name)).collect();
+        assert_eq!(after, before, "a set file was written");
+        assert!(!set.join("fail.wav").exists(), "fail.wav was created");
+        for name in ["library.db", "library.db.lock"] {
+            let meta = std::fs::symlink_metadata(set.join(name)).unwrap();
+            assert!(meta.is_file() && !meta.is_symlink(), "{name}");
+        }
+    }
+
+    /// The root path the crashed library's journal alone holds.
+    const JOURNALED: &str = "committed only in the journal";
+
+    /// The count of roots named [`JOURNALED`] in the database at `db`.
+    fn journaled(db: &Path) -> i64 {
+        let conn = rusqlite::Connection::open(db).unwrap();
+        conn.query_row(
+            "SELECT count(*) FROM roots WHERE path = ?1",
+            [JOURNALED],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A current library under `root` left as a crash leaves it: a
+    /// committed row ([`JOURNALED`]) is in `library.db-wal` and not yet in
+    /// `library.db`. Returns the database's path.
+    fn crashed_library(root: &DataRoot) -> PathBuf {
+        drop(open(root).unwrap());
+        let db = super::database(root);
+        let wal = super::beside(&db, "-wal");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        conn.execute("INSERT INTO roots (path) VALUES (?1)", [JOURNALED])
+            .unwrap();
+        let held = (std::fs::read(&db).unwrap(), std::fs::read(&wal).unwrap());
+        // Closing checkpoints the journal and deletes it: the files are
+        // put back as they were before the close.
+        drop(conn);
+        std::fs::write(&db, &held.0).unwrap();
+        std::fs::write(&wal, &held.1).unwrap();
+        std::fs::write(super::beside(&db, "-shm"), [0u8; 64]).unwrap();
+        db
+    }
+
+    /// The crashed library ([`crashed_library`]) is real: its database
+    /// alone lacks the committed row, and the journal holds it.
+    #[test]
+    fn a_crashed_library_holds_a_row_only_in_its_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crashed_library(&DataRoot::new(dir.path().join("data")));
+        let alone = dir.path().join("alone.db");
+        std::fs::copy(&db, &alone).unwrap();
+        assert_eq!(journaled(&alone), 0, "the database holds the row");
+        let both = dir.path().join("both.db");
+        std::fs::copy(&db, &both).unwrap();
+        std::fs::copy(super::beside(&db, "-wal"), super::beside(&both, "-wal")).unwrap();
+        assert_eq!(journaled(&both), 1, "the journal lacks the row");
+    }
+
+    /// A crashed library ([`crashed_library`]) whose database, journal or
+    /// shared memory file also has a second name, a backup's: opening
+    /// removes the name of every one of the database's files, never
+    /// keeping the database without the journal holding its committed
+    /// rows, and rebuilds the library, which is whole; the backup keeps
+    /// its bytes (design.md "Loading and Song Selection", T18).
+    // Covers: T18
+    #[test]
+    fn a_linked_database_file_rebuilds_the_whole_library() {
+        for member in ["", "-wal", "-shm"] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = DataRoot::new(dir.path().join("data"));
+            let db = crashed_library(&root);
+            let backup = root.path().join(format!("backup{member}"));
+            std::fs::hard_link(super::beside(&db, member), &backup).unwrap();
+            let kept = std::fs::read(&backup).unwrap();
+
+            let (library, opened) = open(&root).unwrap();
+            drop(library);
+            assert_eq!(opened, Opened::Created, "{member:?}");
+            assert_eq!(std::fs::read(&backup).unwrap(), kept, "{member:?}");
+            assert_eq!(
+                crate::sound_sets_disk::link_count(&db),
+                Some(1),
+                "{member:?}"
+            );
+            assert_eq!(journaled(&db), 0, "{member:?}");
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            let check: String = conn
+                .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+                .unwrap();
+            assert_eq!(check, "ok", "{member:?}");
+        }
+    }
+
+    /// A database file that cannot be removed is named in the error, and
+    /// the database is never left without its journal: the journal or the
+    /// database is held open without sharing its deletion, and the
+    /// journal or the shared memory file is the second name. Once the
+    /// hold ends, the next opening still rebuilds the library.
+    #[test]
+    fn a_file_that_cannot_be_removed_is_named() {
+        use std::os::windows::fs::OpenOptionsExt as _;
+        for (linked, held) in [("-wal", "-wal"), ("-shm", "-wal"), ("-wal", "")] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = DataRoot::new(dir.path().join("data"));
+            let db = crashed_library(&root);
+            let held = super::beside(&db, held);
+            let backup = root.path().join(format!("backup{linked}"));
+            std::fs::hard_link(super::beside(&db, linked), backup).unwrap();
+            let hold = std::fs::OpenOptions::new()
+                .read(true)
+                .share_mode(windows::Win32::Storage::FileSystem::FILE_SHARE_READ.0)
+                .open(&held)
+                .unwrap();
+            let e = open(&root).unwrap_err();
+            drop(hold);
+            match &e {
+                OpenError::Link { path, .. } => assert_eq!(path, &held, "{linked:?}"),
+                e => panic!("{linked:?}: {e:?}"),
+            }
+            let named = held.display().to_string();
+            assert!(e.to_string().contains(&named), "{linked:?}: {e}");
+            let (library, opened) = open(&root).unwrap();
+            drop(library);
+            assert_eq!(opened, Opened::Created, "{linked:?}, {held:?} held");
+        }
+    }
+
     /// A gate the scan thread waits at before any work, so the pass cannot
     /// acknowledge a pause until the test opens it.
     type Gate = std::sync::Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>;
@@ -1363,7 +1593,6 @@ pub(crate) mod tests {
         }
     }
 
-    use std::path::PathBuf;
     use std::sync::Arc;
 
     use game::coord::Class;

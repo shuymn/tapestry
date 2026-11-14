@@ -52,6 +52,7 @@ mod save;
 mod session;
 mod settings;
 mod sound;
+pub mod sound_sets;
 mod start_gate;
 mod tempo;
 mod tuning;
@@ -155,7 +156,10 @@ pub use rules_toml::{
     load_preset_toml, preset_to_toml,
 };
 pub use runner::{HANDOFF_WAKES, RunOutcome, Runner};
-pub use save::{LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, write_atomic};
+pub use save::{
+    LinkCount, LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, clear_link,
+    create_fresh, is_link, open_lock, remove_name, write_atomic,
+};
 pub use session::{
     AutoKeySounds, ChartReader, ChartSource, ClosingReport, Command, GateStorage, Loaded,
     MenuCommand, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport, PlayScript, PlayStart,
@@ -171,6 +175,7 @@ pub use settings::{
     save_settings, volume_key,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
+pub use sound_sets::SoundSettings;
 pub use tempo::{AttemptTempo, MAIN_HISTOGRAM_LIMIT, ReferenceError};
 pub use tuning::{
     Adjust, MAX_VOLUME_PERCENT, OFFSET_LIMIT_US, OFFSET_STEP_US, SPEED_KEYS, Tuning,
