@@ -4902,7 +4902,7 @@ fn play_to_end_keeps_playing_after_a_displayed_failure() {
 /// with cause `Quit` under either `on_failure`: nothing is evaluated during
 /// it, the record ends at the step before the quit, and the result shows
 /// once it ran out: Start, End, Result.
-// Source: SF-012
+// Source: SF-013
 #[test]
 fn the_quit_key_during_play_enters_closing() {
     for on_failure in [FailureAction::Close, FailureAction::PlayToEnd] {

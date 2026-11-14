@@ -225,7 +225,7 @@ fn failing_watermark(chart: &Chart) -> TimeUs {
 /// which would complete the play at 2.68 s, never overtakes it; at the
 /// commit (3 s) the play enters Closing, ended midway at the failing
 /// watermark, and re-evaluates to its live result.
-// Source: SF-012
+// Source: SF-013
 #[test]
 fn a_failure_before_the_commit_closes_the_play_at_the_commit() {
     let chart = notes(16);

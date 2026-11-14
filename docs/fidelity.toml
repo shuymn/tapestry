@@ -183,7 +183,7 @@ sites = ["crates/game/src/turntable.rs"]
 tests = ["crates/game/src/turntable/tests.rs::a_charge_end_turns_back_for_80_ms"]
 
 [[entry]]
-id = "SF-012"
+id = "SF-013"
 summary = "READY's and Closing's sounds: `playready` at each READY, `playstop` after the cut"
 class = "rule"
 reason = """

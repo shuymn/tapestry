@@ -2391,7 +2391,7 @@ fn the_practice_page_leaves_the_decision_screen() {
 /// neither ever stopped, the retry and the chart's start included.
 /// `tapestry play <chart>` makes the same owner in `rig()` and plays
 /// through the same `open_and_play`.
-// Source: SF-012
+// Source: SF-013
 #[test]
 fn ready_and_closing_sounds_through_a_run() {
     use audio::SystemKind::{Clear, PlayReady, PlayStop};

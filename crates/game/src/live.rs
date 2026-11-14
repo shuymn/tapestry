@@ -1757,7 +1757,7 @@ pub(crate) fn open_and_play<R: Rig>(
     logic.add_sink(Box::new(sink));
     let mut live = Vec::with_capacity(logic.max_events());
     rig.start(origin, sounds, screen);
-    // Source: SF-012
+    // Source: SF-013
     rig.ready_began();
     let round = restore_at.is_some();
     // The tail stage, once the play completed.
@@ -1967,7 +1967,7 @@ pub(crate) fn open_and_play<R: Rig>(
     let closing_at = admit.map(|_| TimeUs(rig.now().0 - origin.0));
     match closing_at {
         Some(at) => {
-            // Source: SF-012
+            // Source: SF-013
             rig.closing_began();
             logic.enter_closing(at);
         }

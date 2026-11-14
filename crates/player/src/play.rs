@@ -2718,7 +2718,7 @@ impl Rig for PlayerRig<'_> {
     /// system sounds, READY). Its generation settled before READY.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn ready_began(&mut self) {
-        // Source: SF-012
+        // Source: SF-013
         if let Some(sounds) = self.system_sounds.as_mut() {
             sounds.start(&mut self.audio.control, audio::SystemKind::PlayReady, None);
         }
