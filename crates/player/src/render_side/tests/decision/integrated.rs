@@ -2411,7 +2411,9 @@ fn the_practice_page_leaves_the_decision_screen() {
 /// quit key during its play enters Closing, a retry in Closing opens the
 /// second READY, and the second play runs to its result. Read on the result,
 /// before the run's close: two `playready` and one `playstop` asked, and
-/// neither ever stopped, the retry and the chart's start included.
+/// neither stopped from the first READY on, the retry and the chart's start
+/// included. Selection's entry stops every set kind before that, so the
+/// stops are counted from the first READY.
 /// `tapestry play <chart>` makes the same owner in `rig()` and plays
 /// through the same `open_and_play`.
 ///
@@ -2466,6 +2468,8 @@ fn ready_and_closing_sounds_through_a_run() {
         side.press(MenuKey::Enter);
         until("the first READY", &|| probe.system_starts(PlayReady) == 1);
         assert_eq!(probe.system_starts(PlayStop), 0, "a closing sound in READY");
+        let stops = |kind| probe.system_stops(kind);
+        let before = [stops(PlayReady), stops(PlayStop)];
         until("the first play playing", &|| {
             side.seen.playing.load(Ordering::Acquire) > 0
         });
@@ -2488,8 +2492,8 @@ fn ready_and_closing_sounds_through_a_run() {
         until("the second play's result", &|| results() > 0);
         assert_eq!(probe.system_starts(PlayReady), 2);
         assert_eq!(probe.system_starts(PlayStop), 1);
-        assert_eq!(probe.system_stops(PlayReady), 0, "the ready sound stopped");
-        assert_eq!(probe.system_stops(PlayStop), 0, "the closing sound stopped");
+        assert_eq!(stops(PlayReady) - before[0], 0, "the ready sound stopped");
+        assert_eq!(stops(PlayStop) - before[1], 0, "the closing sound stopped");
     });
     assert!(ran.is_ok(), "{ran:?}");
     assert_eq!(
