@@ -22,7 +22,6 @@ source-name 1 crates/skin-beatoraja/tests/import_slider_value.rs
 source-name 4 crates/skin-beatoraja/tests/import_track.rs
 source-name 3 crates/skin-beatoraja/tests/play_graph_import.rs
 source-name 1 crates/skin-beatoraja/tests/result_graph_import.rs
-source-name 1 crates/skin-beatoraja/tests/result_graphs.rs
 source-name 1 crates/skin-model/tests/gauge_graph.rs
 source-name 1 crates/skin-model/tests/judge_graph.rs
 source-name 1 crates/skin-model/tests/present.rs

@@ -1094,7 +1094,7 @@ impl<'d> Cx<'d> {
             if let Some(e) = &mut self.element {
                 e.kind = Some("SystemImage".to_owned());
             }
-            self.install(&mut dst, None, false)?;
+            self.install(&mut dst, None)?;
             self.system(dst, n)?;
             self.installed();
             return Ok(());
@@ -1117,47 +1117,13 @@ impl<'d> Cx<'d> {
             ScreenKind::Decision => return self.decision_destination(dst, object, orec),
             ScreenKind::Play => {}
         }
-        // The source draws the character when its file exists and the
-        // notes otherwise: one id cannot be both.
-        if object == Object::PmChara
-            && self
-                .objects
-                .names(self.def, &self.tables, &id, Object::Note)?
-        {
-            return Err(ImportError::Critical {
-                at: self.loc(at),
-                part: CriticalPart::Lanes,
-                why: NoteKind::UnsupportedField { field: "id" },
-            });
-        }
-        // Likewise the source falls through to the judge, and makes its
-        // region, when an image's or LIFT's file or a text's font does not
-        // load or a slider or graph has no texture
-        // (`JsonSkinObjectLoader.java:71, 387-391, 396-416, 420-453, 628`,
-        // `JsonPlaySkinObjectLoader.java:31, 200-213, 283`): one id cannot
-        // be both.
-        if matches!(
-            object,
-            Object::Image | Object::Text | Object::Slider | Object::Graph | Object::LiftCover
-        ) && self
-            .objects
-            .names(self.def, &self.tables, &id, Object::Judge)?
-        {
-            return Err(ImportError::Critical {
-                at: self.loc(at),
-                part: CriticalPart::Judge,
-                why: NoteKind::UnsupportedField { field: "id" },
-            });
-        }
-        // An id another table names too: the source may make the other
-        // object when this one's source is missing, so that is uncertain.
-        let shared = self.objects.shared(self.def, &self.tables, &id)?;
-        self.install(&mut dst, Some((object, orec)), !shared)?;
+        self.install(&mut dst, Some((object, orec)))?;
         // The source makes no object of these when `src` names no source,
         // and skips the destination (`JSONSkinLoader.java:326-338,
         // 484-492`, `JsonSkinObjectLoader.java:42-72, 394-455`,
         // `JsonPlaySkinObjectLoader.java:183-214`), whatever its role. An
-        // id another table names keeps the role's handling.
+        // id a later table holds too stays this object's, drawing nothing
+        // (design.md "Differences from the source", imported skins).
         if matches!(
             object,
             Object::Image
@@ -1168,9 +1134,7 @@ impl<'d> Cx<'d> {
         ) {
             let [src] = self.def.fields(orec, ["src"]);
             let src = self.opt_string(src, "src")?;
-            if self.source_rec(src.as_deref())?.is_none()
-                && !self.objects.shared(self.def, &self.tables, &id)?
-            {
+            if self.source_rec(src.as_deref())?.is_none() {
                 self.ignored(at, NoteKind::UndefinedSource);
                 return Ok(());
             }

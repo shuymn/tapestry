@@ -267,14 +267,12 @@ impl Cx<'_> {
     /// Destination `dst`'s installation on play, its object `object` with
     /// record `orec` (`None` for a system image): removed in the cases the
     /// source proves, else installed or uncertain, with the chart facts it
-    /// is pruned by; its sources are checked only with `sources` (an id no
-    /// other table names). A keyless judge or note keeps its object, its
+    /// is pruned by. A keyless judge or note keeps its object, its
     /// authored conditions and timer inert (cleared from `dst`).
     pub(super) fn install(
         &mut self,
         dst: &mut Dst,
         object: Option<(Object, u32)>,
-        sources: bool,
     ) -> Result<(), ImportError> {
         self.install = Install {
             elements: self.elements.len(),
@@ -285,7 +283,7 @@ impl Cx<'_> {
         if self.kind != ScreenKind::Play {
             return Ok(());
         }
-        let removal = self.removal(dst, object, sources)?;
+        let removal = self.removal(dst, object)?;
         self.install.certain = removal.is_none()
             && matches!(object, None | Some((Object::Judge | Object::Note, _)))
             && !self.undecided(dst);
@@ -378,7 +376,6 @@ impl Cx<'_> {
         &mut self,
         dst: &Dst,
         object: Option<(Object, u32)>,
-        sources: bool,
     ) -> Result<Option<Removal>, ImportError> {
         if dst.keys.is_empty() {
             return Ok((!self.inert(dst, object)).then_some(Removal::NoKeys));
@@ -435,7 +432,7 @@ impl Cx<'_> {
         {
             return Ok(Some(Removal::Static));
         }
-        if let Some((object, rec)) = object.filter(|_| sources)
+        if let Some((object, rec)) = object
             && self.no_source(object, rec, dst.span)?
         {
             return Ok(Some(Removal::NoSource));

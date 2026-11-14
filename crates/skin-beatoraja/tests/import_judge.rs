@@ -811,61 +811,77 @@ fn native_grades_keep_the_combos_anchor() {
     );
 }
 
-/// The refusal of a skin whose judge `j` shares its id with `record`
-/// in `table` (the image table gets it beside the grades).
-fn shared_id(table: &str, record: &str) -> (CriticalPart, NoteKind) {
+/// A skin whose judge `j` shares its id with `record` in `table` (the
+/// image table gets it beside the grades), drawn by a 10×10 destination.
+fn shared_id(table: &str, record: &str) -> Loaded {
     let images = if table == "image" {
         images().replacen(r#""image": ["#, &format!(r#""image": [{record}, "#), 1)
     } else {
         format!(r#"{}, "{table}": [{record}]"#, images())
     };
     let body = format!(
-        r#"{images}, "value": [], "judge": [{}], "destination": [{DST}]"#,
+        r#"{images}, "value": [], "judge": [{}],
+           "destination": [{{"id": "j", "dst": [{{"x": 0, "y": 0, "w": 10, "h": 10}}]}}]"#,
         judge_rec(&grades(1), &[], "")
     );
-    critical(import_sized([1_920, 1_080], &body, &[]))
+    import_sized([1_920, 1_080], &body, &[])
 }
 
-const SHARED: (CriticalPart, NoteKind) = (
-    CriticalPart::Judge,
-    NoteKind::UnsupportedField { field: "id" },
-);
-
-// The source makes the judge, and its region, for an id it shares when
-// the earlier object comes out null; whether it does is a load-order rule
-// not reproduced, so the id is refused.
-
+/// An image, text, slider, graph or LIFT holding the judge's id comes
+/// first in the lookup, so it is the destination's object whether or not
+/// its file, texture or font loads: an image that loads is drawn, one
+/// that does not draws nothing, and no judge is drawn either way.
 #[test]
-fn an_image_may_not_share_the_judges_id() {
-    // Null when its file fails to load (`JsonSkinObjectLoader.java:71`).
-    for src in ["gone", "a"] {
-        let image = format!(r#"{{"id": "j", "src": "{src}", "w": 8, "h": 8}}"#);
-        assert_eq!(shared_id("image", &image), SHARED, "{src}");
-    }
-}
-
-#[test]
-fn a_text_may_not_share_the_judges_id() {
-    // Null when no font has its id (`JsonSkinObjectLoader.java:387-391, 628`).
+fn the_first_table_takes_a_judge_s_id() {
+    let l = shared_id("image", r#"{"id": "j", "src": "a", "w": 8, "h": 8}"#);
+    assert!(l.report().notes.is_empty(), "{:?}", l.report());
     assert_eq!(
-        shared_id("text", r#"{"id": "j", "font": "none", "ref": 12}"#),
-        SHARED
+        shown(&l, of(Judgment::Perfect, 12), 12, false),
+        [[0, 1_070, 10, 10]]
     );
-}
-
-#[test]
-fn a_slider_may_not_share_the_judges_id() {
-    // Null without a texture (`JsonSkinObjectLoader.java:396-416`).
-    assert_eq!(shared_id("slider", r#"{"id": "j", "src": "gone"}"#), SHARED);
-}
-
-#[test]
-fn a_graph_may_not_share_the_judges_id() {
-    // Null without a texture, on either branch
-    // (`JsonSkinObjectLoader.java:420-453`).
-    for kind in [-1, 0] {
-        let graph = format!(r#"{{"id": "j", "src": "gone", "type": {kind}}}"#);
-        assert_eq!(shared_id("graph", &graph), SHARED, "{kind}");
+    for (table, record, why) in [
+        (
+            "image",
+            r#"{"id": "j", "src": "gone", "w": 8, "h": 8}"#,
+            NoteKind::UndefinedSource,
+        ),
+        (
+            "image",
+            r#"{"id": "j", "src": "zz", "w": 8, "h": 8}"#,
+            NoteKind::MissingAsset,
+        ),
+        (
+            "text",
+            r#"{"id": "j", "font": "none", "ref": 12}"#,
+            NoteKind::Ignored { field: "font" },
+        ),
+        (
+            "slider",
+            r#"{"id": "j", "src": "gone"}"#,
+            NoteKind::UndefinedSource,
+        ),
+        (
+            "graph",
+            r#"{"id": "j", "src": "gone", "type": -1}"#,
+            NoteKind::UndefinedSource,
+        ),
+        (
+            "graph",
+            r#"{"id": "j", "src": "gone", "type": 0}"#,
+            NoteKind::UndefinedSource,
+        ),
+        (
+            "liftCover",
+            r#"{"id": "j", "src": "gone"}"#,
+            NoteKind::UndefinedSource,
+        ),
+    ] {
+        let l = shared_id(table, record);
+        assert!(has(l.report(), why), "{record}: {:?}", l.report());
+        assert!(
+            shown(&l, of(Judgment::Perfect, 12), 12, false).is_empty(),
+            "{record}"
+        );
     }
 }
 
@@ -956,15 +972,6 @@ fn a_grade_following_hidden_plus_hides_alone() {
     assert_eq!(at(300, true), raised);
     // The combo's two cells, unmoved; no grade.
     assert_eq!(at(300, false), still[..2]);
-}
-
-#[test]
-fn a_lift_may_not_share_the_judges_id() {
-    // Skipped without a texture (`JsonPlaySkinObjectLoader.java:200-213`).
-    assert_eq!(
-        shared_id("liftCover", r#"{"id": "j", "src": "gone"}"#),
-        SHARED
-    );
 }
 
 #[test]

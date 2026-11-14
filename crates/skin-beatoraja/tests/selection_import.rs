@@ -160,6 +160,26 @@ fn a_bar_cut_past_its_file_s_edge_repeats_its_edge() {
     assert_eq!((at(0.5), at(0.995), at(791.0 / 810.0)), (0, 255, 255));
 }
 
+/// The selection screen looks up the common tables and its song list only:
+/// a play table holding the list's id, earlier in the lookup order, is
+/// not the destination's object.
+#[test]
+fn a_play_table_sharing_the_list_s_id_is_not_looked_up() {
+    let list = song_list(&[&at(0, 900, 300, 40)], &[&at(0, 900, 300, 40)], 0, TITLE);
+    for play in [
+        r#""hiddenCover": [{"id": "list", "src": "s"}]"#,
+        r#""judge": [{"id": "list", "index": 0, "images": [], "numbers": []}]"#,
+        r#""pmchara": [{"id": "list", "src": "s"}]"#,
+        r#""note": {"id": "list"}"#,
+    ] {
+        let d = folder(&with_option(&format!("{list}, {play}"), TEXT_T));
+        let i = import_selection(d.path()).unwrap_or_else(|e| panic!("{play}: {e:?}"));
+        let mut s = Sel::new(i.skin);
+        s.view(&view(vec![chart("a")], Some(0), None, None));
+        assert!(!s.images(0).is_empty(), "{play}");
+    }
+}
+
 /// The selected row's image file missing: refused as the selected row,
 /// naming the missing file, not as a play-critical image.
 #[test]
