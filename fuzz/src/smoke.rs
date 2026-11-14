@@ -374,6 +374,7 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
             "shared_id_unselected",
             "shared_id_unaddressed",
             "shared_id_judge",
+            "shared_id_failure",
             "bar_groups",
             "paints",
             "followers",
@@ -578,6 +579,20 @@ fn skin_json_seeds_resolve_or_fail_as_built() {
                     Some(Err(ImportError::IdTaken {
                         part: skin_beatoraja::CriticalPart::Judge,
                         by: skin_beatoraja::Object::Image,
+                        ..
+                    }))
+                ),
+                "{name}: {:?}",
+                imported.map(|r| r.map(|i| i.report))
+            ),
+            // A failure-timed slider with no source shares its id with a
+            // later table: refused, never ignored.
+            "shared_id_failure" => assert!(
+                matches!(
+                    imported,
+                    Some(Err(ImportError::Critical {
+                        part: skin_beatoraja::CriticalPart::Failure,
+                        why: NoteKind::UndefinedSource,
                         ..
                     }))
                 ),

@@ -869,6 +869,14 @@ pub fn skin_jsons() -> Vec<Seed> {
             ),
         ),
         (
+            "shared_id_failure",
+            play_skin(
+                r#""customTimers": [{"id": 10000, "timer": 3}],
+                "slider": [{"id": "u", "src": "none", "w": 4, "h": 4}], "bga": {"id": "u"},
+                "destination": [{"id": "u", "timer": 10000, "dst": [{"w": 10, "h": 10}]}]"#,
+            ),
+        ),
+        (
             "syntax",
             skin_input(&[r#"{"type": 0, "property": [{} {}]}"#]),
         ),

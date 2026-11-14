@@ -11,7 +11,7 @@ use super::super::asset::{self, FntFailure, Font};
 use super::super::budget::ImportLimit;
 use super::super::callback::TextFold;
 use super::super::geom::{Q, coords};
-use super::super::policy::Role;
+use super::super::policy::{CriticalPart, Role};
 use super::super::property::{self, StrProp};
 use super::super::report::{DeviationId, NoteKind, PropertyKind, Severity, Span};
 use super::super::{Common, Cx, Dst, Opts, Prop};
@@ -312,7 +312,19 @@ impl Cx<'_> {
         }
         let font_rec = font_name.and_then(|n| self.fonts.as_ref().and_then(|m| m.get(&n)).copied());
         let Some(font_rec) = font_rec else {
-            self.ignored(at, NoteKind::Ignored { field: "font" });
+            let why = NoteKind::Ignored { field: "font" };
+            // The source makes no text and its lookup may go on to a later
+            // table's object (`JsonSkinObjectLoader.java:387-391`,
+            // `JsonPlaySkinObjectLoader.java:31-34`): failure presentation
+            // is reproduced or refused (design.md "Failure presentation").
+            if dst.shared {
+                return Err(ImportError::Critical {
+                    at: self.loc(at),
+                    part: CriticalPart::Failure,
+                    why,
+                });
+            }
+            self.ignored(at, why);
             return Ok(None);
         };
         let [path] = self.def.fields(font_rec, ["path"]);

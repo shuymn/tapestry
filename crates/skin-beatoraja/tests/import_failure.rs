@@ -888,3 +888,97 @@ fn lua_callbacks_on_failure_presentation_lower_or_refuse() {
         );
     }
 }
+
+/// Failure presentation whose first object draws nothing (an undefined
+/// source, or a text naming no font) while a later table holds its id
+/// refuses, the source's lookup possibly going on to that table's object;
+/// with its id its own, or off the failure presentation, it is ignored.
+#[test]
+fn a_failure_destination_sharing_its_id_refuses_without_a_source() {
+    let image = r#""image": [{"id": "u", "src": "none", "w": 8, "h": 8}]"#;
+    let value = r#""value": [{"id": "u", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 4, "ref": 110}]"#;
+    let bga = r#""bga": {"id": "u"}"#;
+    let objects = |parts: &[&str]| parts.join(", ");
+    let shared = [
+        objects(&[image, value]),
+        objects(&[image, bga]),
+        objects(&[
+            r#""graph": [{"id": "u", "src": "none", "w": 8, "h": 8}]"#,
+            bga,
+        ]),
+        objects(&[
+            r#""slider": [{"id": "u", "src": "none", "w": 8, "h": 8}]"#,
+            bga,
+        ]),
+        objects(&[r#""hiddenCover": [{"id": "u", "w": 8, "h": 8}]"#, bga]),
+        objects(&[
+            r#""liftCover": [{"id": "u", "w": 8, "h": 8, "disapearLine": 200}]"#,
+            bga,
+        ]),
+    ];
+    for objects in &shared {
+        let r = run(&format!(r#"{objects}, "destination": [{}]"#, fail("u", "")));
+        refused_as_failure(r, &at("u"), NoteKind::UndefinedSource);
+    }
+    // A custom timer aliasing `failed` is failure presentation too.
+    let slider = objects(&[
+        r#""customTimers": [{"id": 10000, "timer": 3}]"#,
+        r#""slider": [{"id": "u", "src": "none", "w": 8, "h": 8}]"#,
+        bga,
+    ]);
+    let marker = r#"{"id": "u", "timer": 10000"#;
+    let r = run(&format!(
+        r#"{slider}, "destination": [{marker}, "dst": [{KEY}]}}]"#
+    ));
+    refused_as_failure(r, marker, NoteKind::UndefinedSource);
+    // A text whose font names no font record.
+    let text = r#""text": [{"id": "u", "font": "none", "ref": 12}]"#;
+    let r = run(&format!(
+        r#"{}, "destination": [{}]"#,
+        objects(&[text, bga]),
+        fail("u", "")
+    ));
+    refused_as_failure(r, &at("u"), NoteKind::Ignored { field: "font" });
+    // Its id its own, or off the failure presentation (no `failed` timer,
+    // or an option not selected): ignored.
+    let ignored = |body: String, why: NoteKind| {
+        let l = run(&body).loaded;
+        let notes: Vec<(Severity, NoteKind)> = l
+            .report()
+            .notes
+            .iter()
+            .map(|n| (n.severity, n.kind))
+            .collect();
+        assert!(
+            notes.contains(&(Severity::Ignored, why)),
+            "{body}: {notes:?}"
+        );
+    };
+    for (objects, why) in [
+        (image.to_owned(), NoteKind::UndefinedSource),
+        (text.to_owned(), NoteKind::Ignored { field: "font" }),
+    ] {
+        ignored(
+            format!(r#"{objects}, "destination": [{}]"#, fail("u", "")),
+            why,
+        );
+    }
+    let plain = format!(r#"{{"id": "u", "dst": [{KEY}]}}"#);
+    for objects in &shared {
+        ignored(
+            format!(r#"{objects}, "destination": [{plain}]"#),
+            NoteKind::UndefinedSource,
+        );
+        ignored(
+            format!(
+                r#"{HEADER}, {objects}, "destination": [{}]"#,
+                fail("u", r#""op": [901]"#)
+            ),
+            NoteKind::UndefinedSource,
+        );
+    }
+    ignored(
+        format!(r#"{}, "destination": [{plain}]"#, objects(&[text, bga])),
+        NoteKind::Ignored { field: "font" },
+    );
+}

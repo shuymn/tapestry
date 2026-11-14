@@ -304,6 +304,10 @@ struct Dst {
     action: Option<ActionDef>,
     /// Whether it is failure presentation ([`Cx::failure`]).
     failure: bool,
+    /// Whether it is failure presentation whose id a table looked up
+    /// after its object's holds too, set before a text is imported: with
+    /// no font it refuses rather than being ignored.
+    shared: bool,
 }
 
 /// A property field as the source's script serializer reads it
@@ -971,6 +975,7 @@ impl<'d> Cx<'d> {
             nested: false,
             action: None,
             failure,
+            shared: false,
         };
         Ok((id, dst))
     }
@@ -1149,12 +1154,21 @@ impl<'d> Cx<'d> {
         }
         self.id_taken(&dst, &id, object)?;
         self.install(&mut dst, Some((object, orec)))?;
-        // The source makes no object of these when `src` names no source,
-        // and skips the destination (`JSONSkinLoader.java:326-338,
-        // 484-492`, `JsonSkinObjectLoader.java:42-72, 394-455`,
-        // `JsonPlaySkinObjectLoader.java:183-214`), whatever its role. An
-        // id a later table holds too stays this object's, drawing nothing
-        // (design.md "Differences from the source", imported skins).
+        // The source makes no object of these when `src` names no source
+        // (`JSONSkinLoader.java:326-338, 484-492`, `JsonSkinObjectLoader.
+        // java:42-72, 394-455`, `JsonPlaySkinObjectLoader.java:183-214`):
+        // with its id its own, it skips the destination, which is ignored
+        // whatever its role. An id a later table holds too stays this
+        // object's, drawing nothing (design.md "Differences from the
+        // source", imported skins), but the source's lookup may go on to
+        // that table's object, so failure presentation refuses there
+        // (design.md "Failure presentation"); a text without its font is
+        // handled alike ([`Self::text`]).
+        dst.shared = dst.failure
+            && object == Object::Text
+            && self
+                .objects
+                .held_after(self.def, &self.tables, &id, self.kind, object);
         if matches!(
             object,
             Object::Image
@@ -1166,6 +1180,17 @@ impl<'d> Cx<'d> {
             let [src] = self.def.fields(orec, ["src"]);
             let src = self.opt_string(src, "src")?;
             if self.source_rec(src.as_deref())?.is_none() {
+                if dst.failure
+                    && self
+                        .objects
+                        .held_after(self.def, &self.tables, &id, self.kind, object)
+                {
+                    return Err(ImportError::Critical {
+                        at: self.loc(at),
+                        part: CriticalPart::Failure,
+                        why: NoteKind::UndefinedSource,
+                    });
+                }
                 self.ignored(at, NoteKind::UndefinedSource);
                 return Ok(());
             }

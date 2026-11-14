@@ -11,7 +11,9 @@
 //! objects are never looked up there. The result and decision loaders
 //! look up the common objects alone. A play destination whose id the
 //! judge or the note also holds is refused by the caller
-//! (`Cx::destination`), which asks [`Objects::holds`].
+//! (`Cx::destination`), which asks [`Objects::holds`]; so is failure
+//! presentation that draws nothing of its first object while a later
+//! table holds its id ([`Objects::held_after`]).
 
 use std::collections::HashMap;
 
@@ -169,6 +171,27 @@ impl Objects {
             }
         }
         map.as_ref().is_some_and(|m| m.contains_key(id))
+    }
+
+    /// Whether a table a `kind` screen looks up after `first`'s has a
+    /// record of id `id` ([`Self::holds`], no record's error reported).
+    pub(crate) fn held_after(
+        &mut self,
+        def: &mut Definition,
+        tables: &Tables,
+        id: &str,
+        kind: ScreenKind,
+        first: Object,
+    ) -> bool {
+        let Some(start) = ORDER.iter().position(|&(_, o)| o == first) else {
+            return false;
+        };
+        ORDER
+            .iter()
+            .enumerate()
+            .skip(start + 1)
+            .filter(|&(slot, _)| looked_up(kind, slot))
+            .any(|(_, &(_, object))| self.holds(def, tables, id, object))
     }
 }
 
