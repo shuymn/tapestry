@@ -367,7 +367,7 @@ pub struct Totals {
 /// range's start (0 for a full play, the section's start for a practice
 /// round); 0 when it judged none. `chart` is the one evaluated, at the
 /// record's speed, so the time is the time played.
-// Source: SF-009
+// Source: SF-014
 #[must_use]
 pub fn play_us(record: &PlayRecord, evaluation: &Evaluation, chart: &Chart) -> u64 {
     let last = evaluation
@@ -1264,7 +1264,7 @@ mod tests {
     /// end, where the source counts its head: 2 s in the first three
     /// cases), never past an aborted play's finalized watermark, less a
     /// practice round's section start, and is 0 with no judged note.
-    // Source: SF-009
+    // Source: SF-014
     #[test]
     fn a_plays_time_reaches_its_last_judged_note() {
         use common::{MS, key, record_of};

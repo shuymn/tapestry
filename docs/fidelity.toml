@@ -149,7 +149,7 @@ sites = ["crates/bms-model/src/profile.rs"]
 tests = ["crates/bms-model/src/profile.rs::a_shown_object_lengthens_the_preview"]
 
 [[entry]]
-id = "SF-009"
+id = "SF-014"
 summary = "Play time adds how far into the chart each play's judged notes reached"
 class = "rule"
 reason = """
