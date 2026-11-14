@@ -894,8 +894,12 @@ fn a_latched_choice_sounds_the_tone() {
         rig.audio.control.play_tone();
         assert_eq!(probe.tone_requests(), 1);
         let _ = rig.entered_decision(&game::Pick::Play(chart), game::Decision::off());
+        assert_eq!(
+            probe.system_starts(SystemKind::Decide),
+            0,
+            "a decision sound queued"
+        );
         assert_eq!(probe.tone_requests(), 2, "the choice's tone");
-        assert_eq!(probe.system_starts(SystemKind::Decide), 0);
     });
 }
 
