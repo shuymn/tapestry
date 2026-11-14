@@ -2299,15 +2299,34 @@ mod tests {
     /// only) at the background volume, and the decision tone at the system
     /// volume, each read from what the real output recorded. The audio
     /// thread is held at its gate while the test acts, and each phase ends
-    /// when the output has written enough frames after it, so no phase
-    /// depends on how long a thread sleeps; the wall clock only bounds a
-    /// stalled audio thread.
+    /// when the output has written enough frames after it, and the first
+    /// after the frame its sounds start on, so no phase depends on how long
+    /// a thread sleeps; the wall clock only bounds a stalled audio thread.
     #[cfg(feature = "dev-tools")]
     #[test]
     fn sync_sends_each_volume_to_the_audio_thread() {
+        sends_each_volume(std::time::Duration::ZERO);
+    }
+
+    /// [`sync_sends_each_volume_to_the_audio_thread`] with the audio thread
+    /// behind the clock when the play starts: the play's chart time 0 falls
+    /// on a frame many periods after those written, and the first phase
+    /// still records its volumes there.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn sync_sends_each_volume_to_a_late_audio_thread() {
+        sends_each_volume(std::time::Duration::from_millis(200));
+    }
+
+    /// The volume test, the audio thread held for `late` (wall clock) just
+    /// before the play starts, so its output lags the clock by that much.
+    #[cfg(feature = "dev-tools")]
+    fn sends_each_volume(late: std::time::Duration) {
         use std::sync::Mutex;
         use std::time::{Duration, Instant};
         const SECONDS: usize = 20;
+        // `recording_output`'s period.
+        const PERIOD: u64 = 480;
         let settings = game::Settings {
             device: game::DeviceSettings {
                 system_volume: 0.45,
@@ -2372,26 +2391,49 @@ mod tests {
                     }
                 };
                 // Acts with the audio thread held at its gate, then lets it
-                // write `frames` past where it stopped: a step that began
-                // after the action took its volumes, and at least one whole
-                // block was mixed with them.
-                let phase = |rig: &mut crate::play::PlayerRig<'_>,
-                             act: &dyn Fn(&mut crate::play::PlayerRig<'_>),
-                             frames: u64| {
+                // write `frames` past where it stopped and past the frame
+                // `sounding` gives. The gate sits after a step's control
+                // messages, so the step it lets go mixes without the action
+                // and the next takes it: two steps on, what the action sent
+                // and the frame line it moves are in, and at least `frames`
+                // less two periods were mixed with them.
+                let phase =
+                    |rig: &mut crate::play::PlayerRig<'_>,
+                     act: &dyn Fn(&mut crate::play::PlayerRig<'_>),
+                     frames: u64,
+                     sounding: &dyn Fn(&crate::play::PlayerRig<'_>) -> u64| {
+                        gate.hold();
+                        until(&|| gate.stopped());
+                        act(rig);
+                        let from = written(rig);
+                        gate.release();
+                        until(&|| written(rig) >= from + 2 * PERIOD);
+                        let from = from.max(sounding(rig));
+                        until(&|| written(rig) >= from + frames);
+                    };
+                if !late.is_zero() {
                     gate.hold();
                     until(&|| gate.stopped());
-                    act(rig);
-                    let from = written(rig);
+                    std::thread::sleep(late);
                     gate.release();
-                    until(&|| written(rig) >= from + frames);
-                };
-                // The play starts now: its sounds start at its chart time 0.
+                }
+                // The play starts now: its sounds start at its chart time 0,
+                // on the frame its frame line puts it, which an audio thread
+                // behind the clock puts past the frames it has written.
                 use bms_model::TimeSource as _;
                 let now = input.clock.now();
                 let (_sink, queue) = game::audio_link_at(8, now);
                 rig.audio.control.play(now, queue).unwrap();
-                let blocks = 4 * 480;
-                phase(rig, &|rig| rig.sync(), blocks);
+                // Sent before the first phase holds the gate, the start is
+                // in when that phase reads its frame line.
+                let starts = |rig: &crate::play::PlayerRig<'_>| {
+                    let line = rig.audio.control.counters().frame_line(now);
+                    u64::try_from(line.frame(bms_model::TimeUs(0))).unwrap_or(0)
+                };
+                let blocks = 4 * PERIOD;
+                phase(rig, &|rig| rig.sync(), blocks, &starts);
+                // The sounds play through every later phase.
+                let sounding = |_: &crate::play::PlayerRig<'_>| 0;
                 phase(
                     rig,
                     &|rig| {
@@ -2399,9 +2441,15 @@ mod tests {
                         rig.sync();
                     },
                     blocks,
+                    &sounding,
                 );
                 // The tone lasts 0.6 s.
-                phase(rig, &|rig| rig.audio.control.play_tone(), 48_000 * 7 / 10);
+                phase(
+                    rig,
+                    &|rig| rig.audio.control.play_tone(),
+                    48_000 * 7 / 10,
+                    &sounding,
+                );
             },
         );
         let samples = recorded.lock().unwrap().clone();
