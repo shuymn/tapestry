@@ -947,6 +947,8 @@ struct Ran {
     probe: game::OutputProbe,
     frames: Vec<Drawn>,
     ended: Vec<game::PlayEnd>,
+    /// Each ended play's Closing, in order (`None` without one).
+    closings: Vec<Option<game::ClosingReport>>,
     records: Vec<DecisionRecord>,
     stamps: Vec<(u64, DecisionDrawnAs)>,
     /// Why the select screen's script failed, if it did.
@@ -1196,14 +1198,15 @@ fn run_with(
         });
         thread.stop().unwrap();
         let ended = rig.ended_plays.iter().map(|(end, _)| *end).collect();
+        let closings = rig.ended_closings.clone();
         let failure = rig
             .selection
             .as_ref()
             .and_then(|s| s.script.as_ref())
             .and_then(|s| s.failure().map(str::to_owned));
-        (ran, ended, failure, probe)
+        (ran, ended, closings, failure, probe)
     });
-    let (ran, ended, failure, probe) = ran;
+    let (ran, ended, closings, failure, probe) = ran;
     // Read while the run's data folder stands.
     let measured = measured
         .lock()
@@ -1230,6 +1233,7 @@ fn run_with(
         probe,
         frames: seen.frames(),
         ended,
+        closings,
         records,
         stamps,
         failure,
@@ -2415,9 +2419,11 @@ fn the_practice_page_leaves_the_decision_screen() {
 /// wall clock: the quit key once a play frame shows the play playing (so
 /// its transport committed), with 70 s of chart left; the retry once
 /// Closing asked its sound, with the 90 s of Closing the play skin
-/// declares left. Both windows outlast every wait's 60 s hang bound, so a
-/// helper delayed past one fails as a hang first. The second play, once a
-/// frame shows it playing, is moved past its end on the held clock.
+/// declares left. The first play's Closing report then shows it ended by
+/// the retry, so a retry that landed after Closing ran out (taken by the
+/// result's preparation, which also retries) fails the test instead of
+/// passing it. The second play, once a frame shows it playing, is moved
+/// past its end on the held clock.
 // Source: SF-013
 #[test]
 fn ready_and_closing_sounds_through_a_run() {
@@ -2436,7 +2442,12 @@ fn ready_and_closing_sounds_through_a_run() {
         chart: Some("#TITLE a\n#BPM 120\n#03511:01\n#03538:01\n"),
         ..Opts::default()
     };
-    let Ran { ran, ended, .. } = run_with(&set, None, opts, |side| {
+    let Ran {
+        ran,
+        ended,
+        closings,
+        ..
+    } = run_with(&set, None, opts, |side| {
         // As the song selection launch sets it: the quit key leaves the
         // play it arrives in.
         side.controls.quit_leaves();
@@ -2487,5 +2498,14 @@ fn ready_and_closing_sounds_through_a_run() {
             game::PlayEnd::Aborted(game::AbortCause::Quit),
             game::PlayEnd::Completed
         ]
+    );
+    // The retry ended the first play's Closing; the second play had none.
+    assert_eq!(
+        closings
+            .iter()
+            .map(|c| c.map(|c| c.end))
+            .collect::<Vec<_>>(),
+        [Some(game::ClosingEnd::Retry), None],
+        "the retry did not land in Closing"
     );
 }
