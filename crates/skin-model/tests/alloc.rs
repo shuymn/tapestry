@@ -5324,7 +5324,7 @@ fn app_readouts_do_not_allocate(
 
 /// A latch on a slot, the timer of two objects of one closure, built
 /// frame after frame as its condition comes and goes, through a rearm:
-/// slots, timer callbacks' two runs and their timers allocate nothing;
+/// slots, timer callbacks' runs and their timers allocate nothing;
 /// with a positive control.
 fn slots_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     use present_support::{Builder, Cb, read};

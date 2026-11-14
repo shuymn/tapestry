@@ -155,7 +155,7 @@ fn a_negative_selector_skips_its_timer() {
     assert_eq!(invoked(&mut p, 1_000, &[]), 0);
     perfects(&mut p, 2);
     p.state_us = 2_000_000;
-    assert_eq!(invoked(&mut p, 2_000, &[]), 2);
+    assert_eq!(invoked(&mut p, 2_000, &[]), 1);
 }
 
 /// A judge of grades `g0`..`g6`, grade `k`'s destination with `fields`,
@@ -247,7 +247,7 @@ fn a_removed_site_does_not_hide_a_drop() {
     let i = import(&body).unwrap();
     assert_eq!(i.callbacks, [Disposition::Compiled]);
     let mut p = Drawn::new(i.imported.skin, 4);
-    // Off: invoked once, not twice.
+    // Off: invoked once.
     assert_eq!(invoked(&mut p, 1_000, &[]), 1);
 }
 
@@ -529,8 +529,49 @@ fn selecting_a_hole_still_runs_its_callbacks() {
         "skin.imageset = {{ {{ id = \"s\", images = {{ \"nope\", \"i\" }}, value = function() return 0 end }} }}\n{}",
         dst("s", "timer = clock,")
     ));
-    assert_eq!(invoked(&mut p, 1_000, &[]), 2);
+    assert_eq!(invoked(&mut p, 1_000, &[]), 1);
     assert!(p.rects(1_001).is_empty());
+}
+
+/// A timer function's start later than the state clock is not drawn, even
+/// within the same millisecond: at 2 000 µs a start 500 µs ahead is not
+/// drawn (two truncating divisions would make it 0 ms old), one 500 µs
+/// behind is.
+#[test]
+fn a_start_after_the_clock_is_not_drawn() {
+    for (offset, shown) in [("+ 500", false), ("- 500", true)] {
+        let mut p = played(&dst(
+            "i",
+            &format!("timer = function() return ms.time() {offset} end,"),
+        ));
+        p.state_us = 2_000;
+        assert_eq!(!p.rects(1_000).is_empty(), shown, "{offset}");
+    }
+}
+
+/// A latch whose function returns 0 on the frame it sets and its slot
+/// afterwards ages from that one result: set at a state clock of 1.5 s,
+/// its element, keyed from x 0 at 0 to x 200 at 2 s, is at x 150 (a
+/// second run, returning the slot, would start it at 1.5 s, x 0).
+#[test]
+fn a_latch_ages_from_its_one_result() {
+    let mut p = played(
+        "local state = ms.timer_off_value\n\
+         local function seta()\n\
+           if state == ms.timer_off_value and ms.number(100) > 0 then state = ms.time() return 0 end\n\
+           return state\n\
+         end\n\
+         table.insert(skin.destination, { id = \"i\", timer = seta, loop = 2000,\n\
+           dst = { { time = 0, x = 0, y = 0, w = 8, h = 8 }, { time = 2000, x = 200, y = 0, w = 8, h = 8 } } })\n",
+    );
+    p.state_us = 1_000_000;
+    assert!(p.rects(1_000).is_empty());
+    perfects(&mut p, 1);
+    p.state_us = 1_500_000;
+    assert_eq!(p.rects(1_500).first().map(|r| r[0]), Some(150));
+    // The next frame returns the slot, 1.5 s: 16 ms old.
+    p.state_us = 1_516_000;
+    assert_eq!(p.rects(1_516).first().map(|r| r[0]), Some(2));
 }
 
 /// A program callback after a read the source sees as a pre-judgment

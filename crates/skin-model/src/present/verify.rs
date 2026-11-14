@@ -8,7 +8,7 @@
 //! | V2 | each span inside the code, 1 to [`MAX_CALLBACK_OPS`] long, with at most [`MAX_REGISTERS`] registers |
 //! | V3 | every register below the callback's count, every constant and read index valid, every integer a `Const` loads within ±2^53, every jump forward and within the span (`pc < to <= len`; the end returns nil) |
 //! | V4 | each read's value an integer or a boolean, each guard and gate a boolean, every read set within the schema's fields; `after` names an earlier `Int` callback, for a timer callback an earlier `draw` or timer, or for a slider's `Float` value an earlier `draw` |
-//! | V5 | the per-frame cost (every instruction, every read's and guard's operations at each `Read`, each gate's, and every slot the callback loads or stores; a timer callback's twice, for its two invocations) charged to the skin's [`SkinOps`] |
+//! | V5 | the per-frame cost (every instruction, every read's and guard's operations at each `Read`, each gate's, and every slot the callback loads or stores) charged to the skin's [`SkinOps`] |
 //! | V7 | at most [`MAX_SLOTS`] slots, each domain's bounds ordered and within ±2^53, each initial value within its slot's domain, every slot and domain index valid, and each store's domain within its slot's |
 //!
 //! V6, that each consumer reads an output inside the signature at its type,
@@ -319,23 +319,18 @@ fn read_cost(r: Option<&ReadDef>) -> usize {
 /// The most work a frame's run of `cb` does, as [`callback_cost`].
 fn cost_of(def: &PresentDef, cb: &CallbackDef, code: &[Insn]) -> usize {
     let gate = cb.gate.and_then(|g| def.reads.get(usize::from(g)));
-    callback_cost(code, &def.reads, cb.conv, gate)
+    callback_cost(code, &def.reads, gate)
 }
 
 /// The most work a frame's run of a callback does, both arms of every
-/// branch counted: per invocation its instructions `code`, each `Read`'s
-/// operations (the read it names in `reads`, its value's and its
-/// guard's) and each slot it loads or stores; a callback of conversion
-/// `conv` [`Conv::Timer`] invoked twice; and its `gate` read's. V5
+/// branch counted: its instructions `code`, each `Read`'s operations (the
+/// read it names in `reads`, its value's and its guard's), each slot it
+/// loads or stores, and its `gate` read's; every callback, a timer
+/// callback too, runs once a frame. V5
 /// charges this; an importer charges the same before it keeps the
 /// callback, so its count of the skin's operations covers the program's.
 #[must_use]
-pub fn callback_cost(
-    code: &[Insn],
-    reads: &[ReadDef],
-    conv: Conv,
-    gate: Option<&ReadDef>,
-) -> usize {
+pub fn callback_cost(code: &[Insn], reads: &[ReadDef], gate: Option<&ReadDef>) -> usize {
     let at_reads = code.iter().fold(0_usize, |n, insn| match *insn {
         Insn::Read { read, .. } => n.saturating_add(read_cost(reads.get(usize::from(read)))),
         _ => n,
@@ -351,7 +346,8 @@ pub fn callback_cost(
             _ => false,
         })
         .count();
-    let once = code.len().saturating_add(at_reads).saturating_add(touched);
-    let runs = if conv == Conv::Timer { 2 } else { 1 };
-    once.saturating_mul(runs).saturating_add(read_cost(gate))
+    code.len()
+        .saturating_add(at_reads)
+        .saturating_add(touched)
+        .saturating_add(read_cost(gate))
 }

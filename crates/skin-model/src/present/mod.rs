@@ -38,9 +38,9 @@ mod verify;
 use crate::expr::Program;
 
 pub use crate::output::OutTy;
+pub use exec::Io;
 #[cfg(feature = "dev-tools")]
 pub use exec::invocations;
-pub use exec::{Io, elapsed_ms};
 pub use verify::{PresentError, callback_cost};
 
 /// The most instructions in one callback ([`crate::MAX_OPS`]).
@@ -268,8 +268,8 @@ pub enum Conv {
     Truthy,
     /// A number's `value`: the source's `toint()`.
     Int,
-    /// A destination's `timer`: the source's `tolong()`, run once to see
-    /// whether it is on and again for its start.
+    /// A destination's `timer`: `tolong()`, run once a frame for both
+    /// whether it is on and its start.
     Timer,
     /// A slider's `value`: the source's `tofloat()` ([`num::to_float`]),
     /// stored as the `f32`'s bits.

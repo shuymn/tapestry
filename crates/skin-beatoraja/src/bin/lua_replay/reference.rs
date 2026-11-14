@@ -829,7 +829,6 @@ fn prepare(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut Ref
             let c = vm.call(f);
             out.points.push(Point::Ran {
                 key: *k,
-                call: 1,
                 outcome: outcome(&c),
             });
             match &c {
@@ -864,7 +863,6 @@ fn prepare(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut Ref
                 let r = vm.call(f);
                 out.points.push(Point::Ran {
                     key: *k,
-                    call: 1,
                     outcome: outcome(&r),
                 });
                 match &r {
@@ -881,35 +879,21 @@ fn prepare(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut Ref
             Err(why) => return not_reached(o, i + 1, why, out),
         }
     }
-    // 4. The timer: once, and again unless off (`TimerProperty.java:8-22`).
+    // 4. The timer: once, its one result both whether it is on and its
+    // start, as the program runs it (design.md "beatoraja Lua Skins",
+    // Differences from the source, timer callbacks run once).
     if let Some((f, k)) = &o.timer {
-        let first = vm.call(f);
+        let c = vm.call(f);
         out.points.push(Point::Ran {
             key: *k,
-            call: 1,
-            outcome: outcome(&first),
+            outcome: outcome(&c),
         });
-        let first = match &first {
+        let start = match &c {
             Called::Value(v) => Some(to_long(v)),
             Called::Error => Some(i64::MIN),
             _ => None,
         };
-        let on = first.is_some_and(|v| v != i64::MIN);
-        let start = if on {
-            let second = vm.call(f);
-            out.points.push(Point::Ran {
-                key: *k,
-                call: 2,
-                outcome: outcome(&second),
-            });
-            match &second {
-                Called::Value(v) => Some(to_long(v)),
-                Called::Error => Some(i64::MIN),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let on = start.is_some_and(|v| v != i64::MIN);
         // 5. The chosen source (`SkinImage.java:133-139`): past the end
         // selects 0; a hole hides the object after all this.
         let shown = if o.entries.is_empty() {

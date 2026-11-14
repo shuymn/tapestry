@@ -2656,14 +2656,8 @@ impl Cx<'_> {
             }
         };
         // Charged as V5 counts it: the instructions, each read at every
-        // `Read` of it and each slot touched, twice for a timer, and the
-        // gate.
-        let cost = callback_cost(
-            &prog.code,
-            &reads,
-            prog.conv,
-            gate.and_then(|g| reads.get(g)),
-        );
+        // `Read` of it and each slot touched, and the gate.
+        let cost = callback_cost(&prog.code, &reads, gate.and_then(|g| reads.get(g)));
         self.budget
             .callback_ops(cost)
             .map_err(|l| self.limit(at, l))?;

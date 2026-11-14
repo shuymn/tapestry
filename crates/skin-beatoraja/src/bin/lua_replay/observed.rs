@@ -59,20 +59,23 @@ pub enum Cause {
 pub enum Point {
     Ran {
         key: Key,
-        call: u8,
         outcome: Outcome,
     },
     /// Not invoked for `why`.
-    NotReached { key: Key, why: Cause },
+    NotReached {
+        key: Key,
+        why: Cause,
+    },
 }
 
-/// A timer callback's invocations, as the source uses them.
+/// A timer callback's invocation, as the reference uses it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TimerOut {
     pub key: Key,
-    /// The first invocation's `tolong()` was not off.
+    /// The invocation's `tolong()` was not off.
     pub on: bool,
-    /// The second invocation's `tolong()`.
+    /// The invocation's `tolong()`, a Lua error the off value; `None` for
+    /// no value.
     pub start: Option<i64>,
     /// Whether the object's selected source is available, so it draws
     /// once its region does (`SkinImage.java:133-139`); `None` when the

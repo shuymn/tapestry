@@ -92,7 +92,7 @@ fn rounds_of(inputs: &[FrameInputs]) -> Vec<Vec<usize>> {
     out
 }
 
-/// The reference's converted `toint` of every `value` invocation on frame
+/// The reference's converted value of every `value` invocation on frame
 /// `i`, in schedule order.
 fn values_on(obs: &Observed, i: usize) -> Vec<i32> {
     obs.frames[i]
@@ -101,7 +101,6 @@ fn values_on(obs: &Observed, i: usize) -> Vec<i32> {
         .filter_map(|p| match p {
             Point::Ran {
                 key,
-                call: 1,
                 outcome: Outcome::Value(r),
             } if key.field == "value" => Some(toint(*r)),
             _ => None,
