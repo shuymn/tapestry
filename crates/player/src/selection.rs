@@ -7509,12 +7509,25 @@ pub(crate) mod tests {
         render: crate::render_side::RenderLink,
         f: impl FnOnce(&mut crate::play::PlayerRig<'_>) -> R,
     ) -> R {
+        on_selection_at(sel, screens, render, input::QpcClock::start(), f)
+    }
+
+    /// [`on_selection`] on `clock`, which a test may hold
+    /// ([`input::QpcClock::holdable`]) (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn on_selection_at<R>(
+        sel: Selection,
+        screens: &crate::render_side::tests::Installers,
+        render: crate::render_side::RenderLink,
+        clock: input::QpcClock,
+        f: impl FnOnce(&mut crate::play::PlayerRig<'_>) -> R,
+    ) -> R {
         use game::AppRig as _;
         let settings = game::Settings {
             device: game::DeviceSettings::default(),
             player: game::PlayerSettings::default(),
         };
-        let (out, _) = crate::tests::on_rig_with(settings, render, |rig, _| {
+        let (out, _) = crate::tests::on_rig_hooked(settings, render, clock, |rig, _, _| {
             // No adjustment waits on the input thread, which none serves.
             rig.adjust = None;
             rig.selection = Some(sel);
