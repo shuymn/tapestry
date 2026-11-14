@@ -14,6 +14,15 @@ pub(crate) fn loaded(text: &str, preset: &str) -> game::Loaded {
 
 /// As [`loaded`], with the directory its chart file stays in while kept.
 pub(crate) fn loaded_kept(text: &str, preset: &str) -> (tempfile::TempDir, game::Loaded) {
+    loaded_seeded(text, preset, 1)
+}
+
+/// As [`loaded_kept`], the session's seed `seed`.
+pub(crate) fn loaded_seeded(
+    text: &str,
+    preset: &str,
+    seed: u64,
+) -> (tempfile::TempDir, game::Loaded) {
     let dir = tempfile::tempdir().unwrap();
     let settings = game::Settings {
         device: game::DeviceSettings::default(),
@@ -30,7 +39,7 @@ pub(crate) fn loaded_kept(text: &str, preset: &str) -> (tempfile::TempDir, game:
         step: bms_model::TimeUs(1_000),
         start: bms_model::TimeUs(0),
         effects: 64,
-        seed: 1,
+        seed,
         speed: bms_model::Speed::NORMAL,
         app_version: "0.0.0-test".to_owned(),
         provenance: replay::BuildProvenance::Development,
@@ -109,10 +118,10 @@ fn an_attempt_reads_the_loaders_level() {
 /// on its play and result screens, the output of the decoder (jbms-parser)
 /// and validation (`BMSPlayerRule.validate`, twice, as the song data takes
 /// the chart) banded as options 180 to 184 band them, at beatoraja's `0.8.9`
-/// tag, run on these inputs with a 7-key chart; then the one shown here on
-/// every screen, from the beatoraja-style header policy's reading and one
-/// validation in plain arithmetic (`JudgeClass::of_headers`). The
-/// reference's validated rank is in each comment, and where the policy
+/// tag, run on these inputs with a 7-key chart; then the one shown here by
+/// the rule every screen uses, from the beatoraja-style header policy's
+/// reading and one validation in plain arithmetic (`JudgeClass::of_headers`).
+/// The reference's validated rank is in each comment, and where the policy
 /// reads the headers otherwise than that decoder (a decimal `#DEFEXRANK`,
 /// one past `i32`, a `#DEFEXRANK` before a `#RANK`, a non-ASCII digit), what
 /// it reads; where tapestry's one validation differs from the reference's

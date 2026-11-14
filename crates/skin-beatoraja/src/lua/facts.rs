@@ -102,17 +102,17 @@ impl JudgeClass {
     /// `headers` (in file order), from the chart alone, whatever the play
     /// preset: [`of_rank`](Self::of_rank) of the rank the beatoraja-style
     /// header policy ([`HeaderPolicy::DefExRankFirst`]) reads, the policy
-    /// the library stores each chart's rank with, so a chart's play and
-    /// result show the class its library entry shows.
+    /// the library stores each chart's rank with, so a parse of these
+    /// headers and a library entry of the same rank give the same class.
     #[must_use]
     pub fn of_headers(headers: &[JudgmentHeader]) -> Option<Self> {
         Self::of_rank(HeaderPolicy::DefExRankFirst.read(headers).rank)
     }
 
     /// The class of a chart of rank `rank` (the beatoraja-style header
-    /// policy's reading, `None` for no rank header), on every screen: the
-    /// song data's judge rank (`BooleanPropertyFactory.java:448-452`)
-    /// after one 7-key validation.
+    /// policy's reading, `None` for no rank header), by the rule every
+    /// screen uses: the song data's judge rank
+    /// (`BooleanPropertyFactory.java:448-452`) after one 7-key validation.
     ///
     /// - The validation (`play/BMSPlayerRule.java:59-66`) makes the rank a
     ///   percentage `j`: `#RANK r` is 25, 50, 75, 100 or 125, none is

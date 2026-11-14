@@ -10,8 +10,8 @@ use skin_model::ScreenKind;
 
 /// The facts of an attempt at `loaded`'s chart with autoplay as
 /// `autoplay`: the play scene, autoplay known, the chart's judgment class
-/// from its own rank, as every screen shows it ([`JudgeClass::of_headers`],
-/// whatever the play preset judges with), and
+/// from its own rank, by the rule every screen uses
+/// ([`JudgeClass::of_headers`], whatever the play preset judges with), and
 /// the chart's play level parsed by [`level_of`].
 pub fn attempt_facts(loaded: &Loaded, autoplay: bool) -> ImportFacts {
     ImportFacts {

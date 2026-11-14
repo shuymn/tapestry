@@ -1700,7 +1700,7 @@ pub fn attempt_chart(loaded: &game::Loaded) -> PendingChart {
 }
 
 /// The judgment class of the chart at `loaded` (options 180-184), from the
-/// chart's own rank, as every screen shows it.
+/// chart's own rank, by the rule every screen uses.
 pub fn attempt_class(loaded: &game::Loaded) -> Option<JudgeClass> {
     JudgeClass::of_headers(&loaded.chart().meta.judgment_headers)
 }
