@@ -11,6 +11,7 @@ mod demo;
 mod fidelity;
 #[cfg(test)]
 mod fixture;
+mod fmt;
 // Lint fixtures under the workspace lints: `cargo xtask check-lints`.
 #[cfg(tapestry_lint_fixtures)]
 #[path = "../lint-fixtures/mod.rs"]
@@ -44,6 +45,8 @@ commands:
                                           against xtask/fidelity-baseline.txt;
                                           --update lowers the baseline, --init
                                           writes an absent one
+  check-fmt                               run `cargo fmt --check` on each workspace
+                                          package and on the fuzz crate
   banned-words (--staged|--all) [--list <path>]
                                           check paths and contents in the index for
                                           terms in banned-words.txt
@@ -91,6 +94,9 @@ fn main() -> ExitCode {
             };
             report("check-fidelity", fidelity::run(&workspace_manifest(), mode))
         }
+        Some("check-fmt") if rest.is_empty() => {
+            fmt::main(&workspace_manifest(), |line| eprintln!("{line}"))
+        }
         Some("banned-words") => banned_words::run(&rest),
         Some("portable") => portable::run(&workspace_manifest(), &rest),
         Some("check-binary") => binary::run(&rest),
@@ -104,20 +110,29 @@ fn main() -> ExitCode {
 }
 
 fn report(name: &str, result: anyhow::Result<Vec<String>>) -> ExitCode {
+    report_with(name, result, |line| eprintln!("{line}"))
+}
+
+/// [`report`], each line given to `line` instead of printed.
+fn report_with(
+    name: &str,
+    result: anyhow::Result<Vec<String>>,
+    mut line: impl FnMut(String),
+) -> ExitCode {
     match result {
         Ok(diagnostics) if diagnostics.is_empty() => {
-            eprintln!("{name}: ok");
+            line(format!("{name}: ok"));
             ExitCode::SUCCESS
         }
         Ok(diagnostics) => {
             for d in &diagnostics {
-                eprintln!("{name}: {d}");
+                line(format!("{name}: {d}"));
             }
-            eprintln!("{name}: {} violation(s)", diagnostics.len());
+            line(format!("{name}: {} violation(s)", diagnostics.len()));
             ExitCode::from(1)
         }
         Err(e) => {
-            eprintln!("{name}: error: {e:#}");
+            line(format!("{name}: error: {e:#}"));
             ExitCode::from(2)
         }
     }

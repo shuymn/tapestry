@@ -171,8 +171,8 @@ fn skins_after(seen: &Seen, from: usize) -> usize {
 /// the player: the choice pins the ready slot and its screen lasts
 /// 3,000 ms from the choice; the render thread is told the choice, the
 /// timing and the slot; every skin frame drawn runs its timers from the
-/// choice, timer 1 on only past 500 ms (off at 500,000 µs, on 1 µs later)
-/// and timer 2 from 2,500 ms; the transition comes at 3,000 ms, not
+/// choice, timer 1 from 500 ms (off 1 µs before, on at 500,000 µs) and
+/// timer 2 from 2,500 ms; the transition comes at 3,000 ms, not
 /// before; the step ends the lifetime and the slot is retired.
 #[test]
 fn skin_decision_timeline_through_the_player() {
@@ -202,8 +202,8 @@ fn skin_decision_timeline_through_the_player() {
         );
         assert_eq!(sent.timing.input, TimeUs(500 * MS));
         let input = |us| decision_frame_of(&sent, at(us), [1_920, 1_080]).timers;
-        assert_eq!(input(500 * MS).input, None, "timer 1 at 500,000 µs");
-        assert_eq!(input(500 * MS + 1).input, Some(at(500 * MS)));
+        assert_eq!(input(500 * MS - 1).input, None, "timer 1 before 500 ms");
+        assert_eq!(input(500 * MS).input, Some(at(500 * MS)));
         assert_eq!(input(2_500 * MS - 1).fadeout, None);
         assert_eq!(input(2_500 * MS).fadeout, Some(at(2_500 * MS)));
         // The frames drawn through the fade-out run their timers from the
@@ -218,7 +218,7 @@ fn skin_decision_timeline_through_the_player() {
         }));
         for &(now, input, fadeout) in f.seen.timers.lock().unwrap().iter() {
             let late = now.0 - origin.0;
-            assert_eq!(input, (late > 500 * MS).then_some(at(500 * MS)), "{late}");
+            assert_eq!(input, (late >= 500 * MS).then_some(at(500 * MS)), "{late}");
             assert_eq!(fadeout, (late >= 2_500 * MS).then_some(at(2_500 * MS)));
         }
         assert_eq!(
