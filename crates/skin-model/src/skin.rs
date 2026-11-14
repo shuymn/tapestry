@@ -238,6 +238,11 @@ pub struct SelectionDefs {
     /// The song list [`Source::SongList`] draws.
     pub song_list: Option<SongListDef>,
     pub ratio_bars: Vec<RatioBarDef>,
+    /// The notes graphs [`Source::JudgeGraph`] draws, each of
+    /// [`JudgeGraphKind::Notes`], and the BPM graphs [`Source::BpmGraph`]
+    /// draws: the cursor's chart's.
+    pub judge_graphs: Vec<JudgeGraphDef>,
+    pub bpm_graphs: Vec<BpmGraphDef>,
     /// Per element at most one entry: its action, hover rect or search
     /// box.
     pub pointer: Vec<PointerDef>,
@@ -1608,16 +1613,16 @@ fn check_kind(
             ScreenKind::Selection => match e.source {
                 Source::RatioBar(i) => score(i) != Some(true),
                 Source::ChartImage { which, .. } => which != ChartImage::Back,
+                // The cursor's chart's notes graph, never a result's.
+                Source::JudgeGraph(i) => notes(i) == Some(true),
                 _ => !matches!(
                     e.source,
                     Source::Lanes
                         | Source::Gauge(_)
                         | Source::Judge(_)
                         | Source::CoverPaint(_)
-                        | Source::JudgeGraph(_)
                         | Source::GaugeGraph(_)
                         | Source::TimingGraph(_)
-                        | Source::BpmGraph(_)
                         | Source::TimingVisualizer(_)
                         | Source::HitErrorVisualizer(_)
                 ),
@@ -1987,6 +1992,7 @@ impl Skin {
             song_list: None,
             ratio_bars,
             pointer: Vec::new(),
+            ..SelectionDefs::default()
         };
         let res = ResultDefs {
             judge_graphs,
@@ -2018,14 +2024,16 @@ impl Skin {
     /// # Errors
     ///
     /// The first check that fails.
-    pub fn new_selection(def: SkinDef, widgets: SelectionDefs) -> Result<Self, LoadError> {
-        Self::load(
-            def,
-            ScreenKind::Selection,
-            widgets,
-            ResultDefs::default(),
-            PlayDefs::default(),
-        )
+    pub fn new_selection(def: SkinDef, mut widgets: SelectionDefs) -> Result<Self, LoadError> {
+        let res = ResultDefs {
+            judge_graphs: std::mem::take(&mut widgets.judge_graphs),
+            ..ResultDefs::default()
+        };
+        let play = PlayDefs {
+            bpm_graphs: std::mem::take(&mut widgets.bpm_graphs),
+            ..PlayDefs::default()
+        };
+        Self::load(def, ScreenKind::Selection, widgets, res, play)
     }
 
     /// Loads a result skin: the checks of [`new`](Self::new) over the
@@ -2569,6 +2577,8 @@ impl Skin {
             song_list,
             ratio_bars,
             pointer,
+            judge_graphs: _,
+            bpm_graphs: _,
         } = sel;
         let mut pointers = vec![None; def.elements.len()];
         for p in pointer {
@@ -3808,6 +3818,8 @@ impl Skin {
             return Err(SelectionError::Kind);
         }
         sel.update(view, labels, self.song_list_center());
+        let graphs = view.selected.as_ref().and_then(|c| c.graphs.as_ref());
+        sel.take_graphs(graphs, &self.plan.bpm);
         Ok(())
     }
 
@@ -5169,7 +5181,10 @@ impl Skin {
                         Phase::Play { play, .. } => play
                             .notes_graph(now)
                             .map(|(bins, cursors)| GraphData::Notes { bins, cursors }),
-                        Phase::Loading { .. } | Phase::Selection { .. } | Phase::Decision => None,
+                        Phase::Selection { sel, .. } => sel
+                            .notes_graph()
+                            .map(|(bins, cursors)| GraphData::Notes { bins, cursors }),
+                        Phase::Loading { .. } | Phase::Decision => None,
                     };
                     if let (Some(g), Some(data)) = (self.judge_graphs.get(i), data) {
                         let screen = match scene.phase {
@@ -5181,15 +5196,17 @@ impl Skin {
                     }
                 }
                 Kind::BpmGraph(i, slot) => {
-                    if let (Some(g), Phase::Play { play, .. }) =
-                        (self.bpm_graphs.get(i), scene.phase)
-                        && let Some(raster) = play.bpm_raster(slot)
-                    {
-                        let d = BpmDraw {
-                            at,
-                            raster,
-                            screen: play_screen_elapsed(rt.starts, now),
-                        };
+                    let drawn = match scene.phase {
+                        Phase::Play { play, .. } => play
+                            .bpm_raster(slot)
+                            .map(|r| (r, play_screen_elapsed(rt.starts, now))),
+                        Phase::Selection { sel, .. } => sel
+                            .bpm_raster(slot)
+                            .map(|r| (r, screen_elapsed(rt.starts, now))),
+                        Phase::Loading { .. } | Phase::Result { .. } | Phase::Decision => None,
+                    };
+                    if let (Some(g), Some((raster, screen))) = (self.bpm_graphs.get(i), drawn) {
+                        let d = BpmDraw { at, raster, screen };
                         g.draw(&d, rect, &brush, out);
                     }
                 }

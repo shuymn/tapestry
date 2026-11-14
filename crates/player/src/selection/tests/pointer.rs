@@ -204,9 +204,21 @@ fn on_pointer<R>(
 /// kept when `driver` (otherwise none, as before the first play's).
 fn on_pointer_from<R>(
     dir: &tempfile::TempDir,
+    sel: Selection,
+    panels: Option<input::PanelLevel>,
+    driver: bool,
+    f: impl FnOnce(&mut PlayerRig<'_>, &mut Window, &Installers) -> R,
+) -> R {
+    on_pointer_gated(dir, sel, panels, driver, None, f)
+}
+
+/// [`on_pointer_from`], the rig's audio thread held by `gate` while it is.
+fn on_pointer_gated<R>(
+    dir: &tempfile::TempDir,
     mut sel: Selection,
     panels: Option<input::PanelLevel>,
     driver: bool,
+    gate: Option<Arc<crate::dev::AudioGate>>,
     f: impl FnOnce(&mut PlayerRig<'_>, &mut Window, &Installers) -> R,
 ) -> R {
     let limits = skin_model::AtlasLimits {
@@ -242,7 +254,8 @@ fn on_pointer_from<R>(
         },
         player: game::PlayerSettings::default(),
     };
-    let (out, _) = crate::tests::on_rig_with(settings, render, |rig, _| {
+    let clock = input::QpcClock::start();
+    let (out, _) = crate::tests::on_rig_gated(settings, render, clock, gate, |rig, _, _| {
         if !driver {
             rig.adjust = None;
         }
@@ -2120,5 +2133,120 @@ fn a_slot_or_row_without_its_bar_takes_no_click() {
         w.click(c, slot(0), Button::Left);
         act(rig, screens);
         assert_eq!(log(rig), [(Press(MoveTo(0)), 0)]);
+    });
+}
+
+/// C24-5, C24-8 through the pointer's own path (design.md "State Model",
+/// system sounds, Selection): each look's requests to the audio thread.
+/// The wheel sounds `scratch` once for each row it moves; a click on a
+/// row, the list slider and a volume slider move or set without a sound;
+/// the order button and a cover switch sound `o-change`.
+// Source: SF-012
+#[test]
+fn the_wheel_sounds_a_row_a_notch() {
+    use audio::SystemKind;
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 8);
+    let skin = crate::selection_skin::pointer_fixture(true);
+    on_pointer_from(&skin, sel, None, true, |rig, w, screens| {
+        let c = rig.controls;
+        let probe = rig.audio.control.failure_probe();
+        let starts = |p: &game::OutputProbe| {
+            [SystemKind::Scratch, SystemKind::OptionChange].map(|k| p.system_starts(k))
+        };
+        // Positive control: a start queued moves its count.
+        rig.audio
+            .control
+            .system_start(SystemKind::OptionChange, false, None)
+            .unwrap();
+        assert_eq!(probe.system_starts(SystemKind::OptionChange), 1);
+        let mut last = starts(&probe);
+        let mut took = |p: &game::OutputProbe| {
+            let now = starts(p);
+            let d = [now[0] - last[0], now[1] - last[1]];
+            last = now;
+            d
+        };
+        w.wheel(c, 3);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Notch(Rows(3)), 3)]);
+        assert_eq!(took(&probe), [3, 0], "three notches down");
+        w.wheel(c, -1);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Notch(Rows(-1)), 2)]);
+        assert_eq!(took(&probe), [1, 0], "a notch up");
+        w.click(c, row(2, 5), Button::Left);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(MoveTo(5)), 5)]);
+        w.click(c, list_slider(0), Button::Left);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(MoveTo(0)), 0)]);
+        w.click(c, volume_at(200), Button::Left);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(Volume(game::Channel::System, 20)), 0)]);
+        assert_eq!(took(&probe), [0, 0], "a click and two sliders");
+        w.click(c, ORDER, Button::Left);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(Key(MenuKey::Right)), 0)]);
+        assert_eq!(took(&probe), [0, 1], "the order button");
+        w.click(c, COVER_ON_ROW, Button::Left);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Press(Cover(CoverKind::Lift)), 0)]);
+        assert_eq!(took(&probe), [0, 1], "a cover switch turned");
+    });
+}
+
+/// C24-5 and C25-5 (design.md "Audio", Mixing: one-shot starts leave the
+/// start ring's last four places to the reserved kinds): a wheel of 70
+/// notches on a list of 100 charts and Enter, taken by one look while the
+/// audio thread takes no request: the look asks for 70 `scratch`, of which
+/// the ring takes 60 and refuses 10, counted; the choice's decision sound
+/// still finds its place, and sounds the installed set's `decide` once
+/// the audio thread runs again.
+// Source: SF-012
+#[test]
+fn a_choice_after_a_cue_burst_sounds_decide() {
+    use crate::system_sounds::tests::{Fixture, wait};
+    use audio::SystemKind;
+    let fx = Fixture::new();
+    fx.sound("bgm/A", SystemKind::Select, 96_000);
+    fx.sound("bgm/A", SystemKind::Decide, 480_000);
+    let root = fx.root();
+    crate::system_sounds::arm(move |setup, _| setup.root = root);
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 100);
+    let gate = Arc::new(crate::dev::AudioGate::default());
+    let skin = crate::selection_skin::pointer_fixture(true);
+    let held = Arc::clone(&gate);
+    on_pointer_gated(&skin, sel, None, false, Some(held), |rig, w, _| {
+        let c = rig.controls;
+        let probe = rig.audio.control.failure_probe();
+        wait("A installed", || {
+            rig.poll_system_sounds();
+            rig.audio.control.system_installed().is_some()
+        });
+        let a = rig.audio.control.system_installed().unwrap();
+        // The entry's loop sounding: the start ring holds nothing.
+        wait("A's loop", || {
+            probe.reserved(SystemKind::Select) == Some((a, true))
+        });
+        gate.hold();
+        wait("the audio thread held", || gate.stopped());
+        let scratch = probe.system_starts(SystemKind::Scratch);
+        let refused = rig.audio.control.counters().system_refused();
+        w.wheel(c, 70);
+        w.key(MenuKey::Enter);
+        let pick = take_all(rig).expect("Enter chooses");
+        assert_eq!(cursor(rig), 70);
+        assert_eq!(log(rig), [(Notch(Rows(70)), 70), (Input, 70)]);
+        assert_eq!(probe.system_starts(SystemKind::Scratch) - scratch, 60);
+        assert_eq!(rig.audio.control.counters().system_refused() - refused, 10);
+        let _ = rig.entered_decision(&pick, game::Decision::off());
+        assert_eq!(probe.system_starts(SystemKind::Decide), 1);
+        gate.release();
+        wait("the decision sound", || {
+            probe.reserved(SystemKind::Decide).is_some()
+        });
+        assert_eq!(probe.reserved(SystemKind::Decide), Some((a, false)));
     });
 }

@@ -44,6 +44,7 @@ use skin_model::{
 };
 
 pub use budget::ImportLimit;
+pub(crate) use object::table_name;
 pub use policy::{CriticalPart, EssentialPart};
 pub(crate) use property::{int_by_name, str_by_name};
 pub use report::{
@@ -1065,6 +1066,32 @@ impl<'d> Cx<'d> {
         (n != 0).then(|| ops::numeric_in(self.kind, n, &self.items))
     }
 
+    /// Refuses a play destination `dst` the configured options leave
+    /// drawable ([`Self::can_draw`]) whose id `id` the judge or the note
+    /// holds while `by`, an earlier table's object or a built-in image,
+    /// takes it: that part would have no destination (design.md
+    /// "Differences from the source", imported skins, shared ids). The
+    /// judge is checked first.
+    fn id_taken(&mut self, dst: &Dst, id: &str, by: Object) -> Result<(), ImportError> {
+        if !self.can_draw(&dst.ops) {
+            return Ok(());
+        }
+        for (lost, part) in [
+            (Object::Judge, CriticalPart::Judge),
+            (Object::Note, CriticalPart::Lanes),
+        ] {
+            if by != lost && self.objects.holds(self.def, &self.tables, id, lost) {
+                return Err(ImportError::IdTaken {
+                    at: self.loc(dst.span),
+                    id: id.to_owned(),
+                    part,
+                    by,
+                });
+            }
+        }
+        Ok(())
+    }
+
     /// One destination, in source order.
     fn destination(&mut self, index: usize, rec: u32) -> Result<(), ImportError> {
         let at = self.arena_span(rec);
@@ -1094,6 +1121,9 @@ impl<'d> Cx<'d> {
             if let Some(e) = &mut self.element {
                 e.kind = Some("SystemImage".to_owned());
             }
+            if self.kind == ScreenKind::Play {
+                self.id_taken(&dst, &id, Object::System)?;
+            }
             self.install(&mut dst, None)?;
             self.system(dst, n)?;
             self.installed();
@@ -1117,13 +1147,33 @@ impl<'d> Cx<'d> {
             ScreenKind::Decision => return self.decision_destination(dst, object, orec),
             ScreenKind::Play => {}
         }
+        self.id_taken(&dst, &id, object)?;
         self.install(&mut dst, Some((object, orec)))?;
-        // The source makes no object of these when `src` names no source,
-        // and skips the destination (`JSONSkinLoader.java:326-338,
-        // 484-492`, `JsonSkinObjectLoader.java:42-72, 394-455`,
-        // `JsonPlaySkinObjectLoader.java:183-214`), whatever its role. An
-        // id a later table holds too stays this object's, drawing nothing
-        // (design.md "Differences from the source", imported skins).
+        // The source makes no object of these when `src` names no source
+        // (`JSONSkinLoader.java:326-338, 484-492`, `JsonSkinObjectLoader.
+        // java:42-72, 394-455`, `JsonPlaySkinObjectLoader.java:183-214`):
+        // with its id its own, it skips the destination, which is ignored
+        // whatever its role. An id a later table holds too stays this
+        // object's, drawing nothing (design.md "Differences from the
+        // source", imported skins), but the source's lookup may go on to
+        // that table's object, so failure presentation refuses there
+        // (design.md "Failure presentation"). So does a text naming no
+        // font, which the source makes no text of either
+        // (`JsonSkinObjectLoader.java:387-391`), decided before its string,
+        // whose emptiness would otherwise end its import first.
+        if dst.failure
+            && object == Object::Text
+            && self
+                .objects
+                .held_after(self.def, &self.tables, &id, self.kind, object)
+            && self.font_rec(orec)?.is_none()
+        {
+            return self.drop_el(
+                Role::Critical(CriticalPart::Failure),
+                at,
+                NoteKind::Ignored { field: "font" },
+            );
+        }
         if matches!(
             object,
             Object::Image
@@ -1135,6 +1185,17 @@ impl<'d> Cx<'d> {
             let [src] = self.def.fields(orec, ["src"]);
             let src = self.opt_string(src, "src")?;
             if self.source_rec(src.as_deref())?.is_none() {
+                if dst.failure
+                    && self
+                        .objects
+                        .held_after(self.def, &self.tables, &id, self.kind, object)
+                {
+                    return self.drop_el(
+                        Role::Critical(CriticalPart::Failure),
+                        at,
+                        NoteKind::UndefinedSource,
+                    );
+                }
                 self.ignored(at, NoteKind::UndefinedSource);
                 return Ok(());
             }
@@ -2212,6 +2273,8 @@ impl<'d> Cx<'d> {
                 ratio_bars: std::mem::take(&mut self.sel.ratio_bars),
                 // Kept: a refusal names its entry's element.
                 pointer: self.sel.pointer.clone(),
+                judge_graphs: std::mem::take(&mut self.judge_graphs),
+                bpm_graphs: std::mem::take(&mut self.bpm_graphs),
             };
             Skin::new_selection(def, widgets)
         } else if result {

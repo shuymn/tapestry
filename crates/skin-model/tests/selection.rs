@@ -525,6 +525,7 @@ fn bar_skin(bars: Vec<RatioBarDef>) -> Fx {
                 song_list: None,
                 pointer: Vec::new(),
                 ratio_bars: bars,
+                ..SelectionDefs::default()
             },
         )
         .unwrap(),
@@ -641,6 +642,7 @@ fn a_slider_range_is_exact() {
                 song_list: None,
                 pointer: Vec::new(),
                 ratio_bars: vec![bar],
+                ..SelectionDefs::default()
             },
         )
     };
@@ -745,6 +747,7 @@ fn a_slider_press_gives_a_command_and_changes_nothing() {
                     song_list: None,
                     pointer: Vec::new(),
                     ratio_bars: vec![bar(slider(SliderDirection::Right, true), src)],
+                    ..SelectionDefs::default()
                 },
             )
             .unwrap(),
@@ -769,6 +772,7 @@ fn a_slider_press_gives_a_command_and_changes_nothing() {
                 song_list: None,
                 pointer: Vec::new(),
                 ratio_bars: vec![bar(slider(SliderDirection::Right, true), src)],
+                ..SelectionDefs::default()
             },
         )
         .unwrap(),
@@ -1322,6 +1326,7 @@ fn each_kind_draws_its_own_widgets() {
         song_list: Some(list(1, 0)),
         pointer: Vec::new(),
         ratio_bars: vec![bar(RatioForm::Bar { vertical: false }, RatioSource::ExRate)],
+        ..SelectionDefs::default()
     };
     for source in [Source::SongList, Source::RatioBar(0)] {
         kind(
@@ -1358,6 +1363,7 @@ fn each_kind_draws_its_own_widgets() {
                     RatioForm::Bar { vertical: false },
                     RatioSource::Score(ScoreRate::Best),
                 )],
+                ..SelectionDefs::default()
             },
         ),
         ScreenKind::Selection,
@@ -1589,6 +1595,7 @@ fn the_song_lists_bounds_are_checked() {
                 song_list: None,
                 pointer: Vec::new(),
                 ratio_bars: vec![bar(RatioForm::Bar { vertical: false }, RatioSource::ExRate); n],
+                ..SelectionDefs::default()
             },
         )
     };

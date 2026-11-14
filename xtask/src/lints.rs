@@ -359,6 +359,7 @@ pub const IN_PLAY: &[Site] = &[
             "SystemSounds::start",
             "SystemSounds::stop",
             "SystemSounds::latch",
+            "built_in",
         ],
     ),
     // The audio thread.

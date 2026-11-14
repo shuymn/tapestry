@@ -51,6 +51,7 @@ mod power;
 mod practice_page;
 #[cfg(feature = "dev-tools")]
 mod presentmon;
+mod preview_graphs;
 mod priority;
 #[cfg(feature = "dev-tools")]
 mod recording;
@@ -1772,6 +1773,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         preset_steps: std::collections::VecDeque::new(),
         covers_turned: [false; 3],
         volumes_set: [None; 3],
+        cues: crate::select::SelectCues::default(),
         feed: selection_skin::SkinFeed::default(),
         ime,
         rate: opened.rate,
@@ -1787,6 +1789,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         spawner: game::coord::Spawner::SYSTEM,
         page: crate::page_jobs::PageJobs::new(Arc::new(crate::priority::Checked::SYSTEM)),
         rest: crate::selection::CursorRest::default(),
+        graphs: crate::preview_graphs::GraphCache::default(),
         #[cfg(test)]
         decodes: None,
         #[cfg(test)]
