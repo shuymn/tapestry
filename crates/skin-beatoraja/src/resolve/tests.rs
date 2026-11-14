@@ -319,3 +319,22 @@ fn song_list_fields_and_custom_events_are_read_on_selection_only() {
         }
     }
 }
+
+/// A JSON string in a float field reads as the same text written as a
+/// number token does: its decimal numeral rounded to the nearest `f64`,
+/// then to the nearest `f32`. `1.0000000596046448` is the `f64` 1 + 2^-24,
+/// a tie that rounds to 1, where rounding the text straight to `f32` gives
+/// the next float up (`0x3f80_0001`).
+#[test]
+fn a_string_float_rounds_as_a_number_token() {
+    for src in [
+        r#"{"a": "1.0000000596046448"}"#,
+        r#"{"a": 1.0000000596046448}"#,
+    ] {
+        let d = skin(src);
+        let mut def = Definition::read_with(d.path(), "s.json", Limits::STANDARD).unwrap();
+        let [a] = def.fields(def.top(), ["a"]);
+        let v = def.float(a.unwrap(), "alpha").unwrap();
+        assert_eq!(v.to_bits(), 0x3f80_0000, "{src}");
+    }
+}

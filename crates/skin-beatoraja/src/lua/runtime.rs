@@ -440,81 +440,18 @@ pub fn absent(kind: ScreenKind, id: i32) -> Option<i32> {
 
 /// A Lua value as a number's value reads it: a number as the play
 /// program converts it ([`num::to_int`], truncated and saturated to
-/// `i32`); a string scanned as LuaJ's `LuaString.scannumber` scans it
-/// ([`scan_number`]), then the same, 0 when it is no numeral; anything
-/// else 0.
+/// `i32`); a string read as a numeral ([`crate::numeral::number`]), then
+/// the same, 0 when it is none; anything else 0.
 #[must_use]
 pub fn to_int(v: &Value) -> i32 {
     match v {
         Value::Integer(i) => num::to_int(Val::Int(*i)),
         Value::Number(n) => num::to_int(Val::Float(*n)),
-        Value::String(s) => scan_number(&s.as_bytes()).map_or(0, |d| num::to_int(Val::Float(d))),
+        Value::String(s) => {
+            crate::numeral::number(&s.as_bytes()).map_or(0, |d| num::to_int(Val::Float(d)))
+        }
         _ => 0,
     }
-}
-
-/// LuaJ 3.0.2's `LuaString.scannumber` over a string's bytes: spaces (only
-/// `' '`) trimmed at both ends; `0x`/`0X` and hexadecimal digits as a
-/// `long`; else decimal digits as a `long`, else at most the first 64
-/// bytes, all of `-+.eE0-9`, as Java's `parseDouble`. `None` where LuaJ
-/// gives NaN, or throws (a bare `0x`), which the source's accessor turns
-/// into 0.
-fn scan_number(b: &[u8]) -> Option<f64> {
-    let start = b.iter().position(|c| *c != b' ')?;
-    let end = b.iter().rposition(|c| *c != b' ')?.saturating_add(1);
-    let b = b.get(start..end)?;
-    if let [b'0', b'x' | b'X', rest @ ..] = b {
-        return scan_long(16, rest);
-    }
-    scan_long(10, b).or_else(|| scan_double(b))
-}
-
-/// LuaJ's `scanlong`: an optional `-`, then digits of `base`, accumulated
-/// in a wrapping `long`; NaN (`None`) at a non-digit or once the
-/// accumulator is negative.
-#[expect(
-    clippy::cast_precision_loss,
-    reason = "the source converts its long to a double"
-)]
-fn scan_long(base: i64, b: &[u8]) -> Option<f64> {
-    let (neg, digits) = match b {
-        [] => return None,
-        [b'-', rest @ ..] => (true, rest),
-        _ => (false, b),
-    };
-    let mut x: i64 = 0;
-    for c in digits {
-        let base_of = |b: u8| i64::from(*c) - i64::from(b);
-        let digit = if base <= 10 || c.is_ascii_digit() {
-            base_of(b'0')
-        } else if c.is_ascii_uppercase() {
-            base_of(b'A') + 10
-        } else {
-            base_of(b'a') + 10
-        };
-        if !(0..base).contains(&digit) {
-            return None;
-        }
-        x = x.wrapping_mul(base).wrapping_add(digit);
-        if x < 0 {
-            return None;
-        }
-    }
-    Some(if neg { -(x as f64) } else { x as f64 })
-}
-
-/// LuaJ's `scandouble`: the first 64 bytes at most, each one of
-/// `-+.eE0-9`, parsed as a double (Java's `parseDouble` and Rust's parse
-/// agree on that alphabet); `None` otherwise.
-fn scan_double(b: &[u8]) -> Option<f64> {
-    let b = b.get(..b.len().min(64))?;
-    if !b
-        .iter()
-        .all(|c| matches!(c, b'-' | b'+' | b'.' | b'e' | b'E' | b'0'..=b'9'))
-    {
-        return None;
-    }
-    std::str::from_utf8(b).ok()?.parse().ok()
 }
 
 /// A Lua value as the source's `toboolean` converts a draw: nil and false
@@ -1267,23 +1204,24 @@ mod tests {
             (s("12"), 12),
             (s(" 2.5 "), 2),
             (s("x"), 0),
-            // Strings, as the pinned LuaJ jar converts them (`toint`, its
-            // exception taken as the source's accessor takes it: 0).
+            // Strings read as numerals: whitespace trimmed, a sign, a
+            // decimal or `0x` hexadecimal within `u64`; none 0.
             (s(" 12 "), 12),
-            (s("\t12\t"), 0),
-            (s("\t12"), 0),
-            (s("12\n"), 0),
+            (s("\t12\t"), 12),
+            (s("\t12"), 12),
+            (s("12\n"), 12),
             (s("0x10"), 16),
             (s("0X1f"), 31),
             (s("0x80000000"), i32::MAX),
             (s("0xffffffff"), i32::MAX),
             (s("0x100000000"), i32::MAX),
             (s("0x"), 0),
-            (s("-0x10"), 0),
-            (s("0x-10"), -16),
+            (s("-0x10"), -16),
+            (s("0x-10"), 0),
+            (s("0x["), 0),
             (s("0x7fffffffffffffff"), i32::MAX),
-            (s("0x8000000000000000"), 0),
-            (s("0x10000000000000001"), 1),
+            (s("0x8000000000000000"), i32::MAX),
+            (s("0x10000000000000001"), 0),
             (s("0x1g"), 0),
             (s(" 0x10 "), 16),
             (s("-"), 0),
@@ -1313,8 +1251,8 @@ mod tests {
             (s("00012"), 12),
             (s(&"1234567890".repeat(7)), i32::MAX),
             (s(&format!("{}1234", "0".repeat(63))), 1234),
-            // 68 bytes, parsed as the first 64: "0.000…0".
-            (s(&format!("0.{}1e80", "0".repeat(62))), 0),
+            // 68 bytes, read whole: 1e17.
+            (s(&format!("0.{}1e80", "0".repeat(62))), i32::MAX),
             (s("1_0"), 0),
             (s("\u{661}\u{662}"), 0),
             (Value::Boolean(true), 0),

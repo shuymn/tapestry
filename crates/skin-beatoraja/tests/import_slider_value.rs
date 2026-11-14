@@ -232,11 +232,17 @@ fn an_unavailable_value_is_not_drawn() {
     assert!(near(q.rect[1], TOP + 0.5 * RANGE), "{q:?}");
 }
 
+/// A known string is read as a numeral, none 0: whitespace trimmed (a
+/// tab too), a sign before `0x`, hexadecimal digits only.
 #[test]
-fn a_known_string_is_read_as_the_source_reads_it() {
+fn a_known_string_is_read_as_a_numeral() {
     for (body, v) in [
         ("return \"0.25\"", 0.25),
+        ("return \"\\t0.25\"", 0.25),
         ("return \" 0x10 \"", 16.0),
+        ("return \"-0x1\"", -1.0),
+        ("return \"0x-1\"", 0.0),
+        ("return \"0x[\"", 0.0),
         ("return \"abc\"", 0.0),
         (
             "if ms.number(14) > 0 then return \"0.5\" end return 0.25",
@@ -279,6 +285,7 @@ fn signed_zero_follows_the_source_s_values() {
     assert_eq!(bits(&captured), 0, "captured −0");
     assert_eq!(bits(&i), 0, "a local −0");
     assert_eq!(bits(&down("return \"-0.0\"")), (-0.0_f32).to_bits());
+    assert_eq!(bits(&down("return \"-0\"")), (-0.0_f32).to_bits());
     assert_eq!(bits(&down("return -1e-300")), (-0.0_f32).to_bits());
 }
 

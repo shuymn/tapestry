@@ -1,13 +1,10 @@
 # The heuristic lint hits of `cargo xtask check-fidelity`, per lint and file:
 # `<lint> <count> <file>`. `--update` lowers a count and drops a zero; a
 # count never rises.
-expect-reason 2 crates/skin-beatoraja/src/lua/num_scan.rs
-expect-reason 2 crates/skin-beatoraja/src/resolve.rs
 expect-reason 3 crates/skin-model/src/present/num.rs
 expect-reason 2 crates/skin-model/src/widget/bpm_graph.rs
 expect-reason 1 crates/skin-model/tests/play.rs
 java-name 1 crates/bms-parser/src/parse.rs
-java-name 1 crates/skin-beatoraja/src/lib.rs
 source-name 4 crates/eval/tests/style_beatoraja.rs
 source-name 5 crates/eval/tests/style_lr2.rs
 source-name 2 crates/game/src/result_figures_tests.rs
@@ -17,15 +14,14 @@ source-name 1 crates/skin-beatoraja/src/import/property.rs
 source-name 1 crates/skin-beatoraja/src/import/result/profile/tests.rs
 source-name 1 crates/skin-beatoraja/src/import/widget/gauge.rs
 source-name 1 crates/skin-beatoraja/src/import/widget/visualizer.rs
-source-name 1 crates/skin-beatoraja/src/java_float.rs
 source-name 1 crates/skin-beatoraja/src/lua/residual_tests.rs
 source-name 1 crates/skin-beatoraja/src/lua/root_tests.rs
 source-name 1 crates/skin-beatoraja/src/lua/schema.rs
 source-name 1 crates/skin-beatoraja/tests/import_gauge.rs
 source-name 2 crates/skin-beatoraja/tests/import_lanes.rs
-source-name 2 crates/skin-beatoraja/tests/import_slider_value.rs
+source-name 1 crates/skin-beatoraja/tests/import_slider_value.rs
 source-name 4 crates/skin-beatoraja/tests/import_track.rs
-source-name 6 crates/skin-beatoraja/tests/play_graph_import.rs
+source-name 4 crates/skin-beatoraja/tests/play_graph_import.rs
 source-name 1 crates/skin-beatoraja/tests/result_graph_import.rs
 source-name 1 crates/skin-beatoraja/tests/result_graphs.rs
 source-name 1 crates/skin-model/tests/gauge_graph.rs

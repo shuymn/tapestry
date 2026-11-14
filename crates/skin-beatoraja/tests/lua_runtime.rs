@@ -851,6 +851,36 @@ fn a_value_past_i32_saturates_and_draws_nothing() {
     }
 }
 
+/// P6: a runtime value that is a string is read as a numeral, then
+/// converted as a number: whitespace trimmed (a tab too), a sign before
+/// `0x`; a string that is none, `0x[`, is 0.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_runtime_string_value_is_read_as_a_numeral() {
+    untimed();
+    let (_d, mut i) = import_in(&entry(
+        "",
+        &[
+            "function() if ms.number(77) >= 0 then return \"\\t12\" end end",
+            "function() if ms.number(77) >= 0 then return \"-0x10\" end end",
+            "function() if ms.number(77) >= 0 then return \"0x[\" end end",
+        ],
+        "function() return true end",
+    ));
+    let n = runtime(&mut i).outputs();
+    assert_eq!(n, 3);
+    let mut f = fields(
+        n,
+        &[
+            ("selected.plays", 3),
+            ("selected.played", 1),
+            ("cursor.chart", 1),
+        ],
+    );
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(outputs(&f), [12, -16, 0]);
+}
+
 /// `text` with two image sets of one `dot` appended, chosen by `a` and
 /// `b`, each drawn by its own draw callback.
 #[cfg(feature = "dev-tools")]

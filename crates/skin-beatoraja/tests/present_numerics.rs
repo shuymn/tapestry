@@ -5,7 +5,7 @@
 //!   comparisons, unary minus, `math.floor`, `ceil`, `abs`, `max`, `min`)
 //!   and the consumers' `toint()` of a number's value and `tofloat()` of a
 //!   slider's (numbers as the value the source builds from them, a numeric
-//!   −0 its integer 0; strings folded at import as luaj's `scannumber`)
+//!   −0 its integer 0; strings read at import as numerals, none 0)
 //!   are checked against `luaj_numerics.txt`, the source's results over a
 //!   grid of integers and floats (zeros of both signs, infinities, NaN,
 //!   values near 2^31 and 2^53), generated from the source's pinned
@@ -23,7 +23,7 @@
 //! integer outside ±2^53, even where its double matches.
 
 use mlua::{Function, Lua, Value};
-use skin_beatoraja::lua::num_scan::todouble;
+use skin_beatoraja::numeral;
 use skin_model::present::num::{arith, compare, extreme, math, neg, to_float, to_int};
 use skin_model::present::{Arith, Cmp, Fail, MathFn, Val};
 
@@ -76,7 +76,8 @@ fn wide_int(r: Result<Val, Fail>) -> bool {
 
 /// The rows where tapestry's rule differs from the source's on purpose,
 /// each with tapestry's value (design.md "beatoraja Lua Skins",
-/// "Differences from the source": number values past `i32`). The table
+/// "Differences from the source": number values past `i32`, numeric
+/// strings). The table
 /// stays as the source's interpreter wrote it; each listed row must exist
 /// and differ from it, so a stale entry fails.
 const INTENDED: &[(&str, &str)] = &[
@@ -94,6 +95,24 @@ const INTENDED: &[(&str, &str)] = &[
     ("toint f:43647ae13f851eb8", "i:2147483647"),
     ("toint f:43cffffff3400000", "i:2147483647"),
     ("toint f:435b4e81aa3d70a4", "i:2147483647"),
+    // A string read as a plain numeral: Lua's whitespace trimmed, the sign
+    // before `0x`, hexadecimal digits alone, no wrap past 64 bits, the
+    // whole fraction, a −0 kept; where the source trims only spaces, reads
+    // the sign after `0x` and `[` as a hexadecimal digit, wraps its `long`
+    // and keeps the first 64 bytes.
+    ("tofloats x0931", "g:3f800000"),
+    ("tofloats x30782d31", "g:0"),
+    ("tofloats x2d307831", "g:bf800000"),
+    ("tofloats x30785b", "g:0"),
+    ("tofloats x2d30", "g:80000000"),
+    (
+        "tofloats x3138343436373434303733373039353531363136",
+        "g:5f800000",
+    ),
+    (
+        "tofloats x312e303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303030303078",
+        "g:0",
+    ),
 ];
 
 /// A table result: a value (`i:`, `f:`, a boolean, nil) or an error, or a
@@ -251,7 +270,7 @@ fn tofloat(words: &[&str]) -> f32 {
                 .step_by(2)
                 .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
                 .collect();
-            to_float(Val::Float(todouble(&bytes)))
+            to_float(Val::Float(numeral::number(&bytes).unwrap_or(0.0)))
         }
         _ => panic!("{words:?}"),
     }
