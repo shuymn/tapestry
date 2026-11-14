@@ -126,12 +126,16 @@ fn int_of(v: f64) -> i64 {
     i
 }
 
-/// A row's effective speed in BPM, `f64`: its tempo times its factor, as
-/// the source's `bpm · scroll` (`song/SongInformation.java:180-210` at
-/// `0.8.9`). A factor of 1 is exactly 1.0, so a play's rows read their
-/// tempos.
+/// A row's effective speed in BPM, `f64`: its tempo times its scroll
+/// factor (design.md "Loading and Song Selection", Summaries). It only
+/// places a stroke on the graph's log scale; the rows' classes compare the
+/// exact speeds ([`SpeedRow::speed`]). A factor of 1 is exactly 1.0, so a
+/// play's rows read their tempos.
 fn speed(row: &SpeedRow) -> f64 {
-    #[expect(clippy::cast_precision_loss, reason = "the source's double scroll")]
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a stroke's height on a log scale"
+    )]
     let factor = row.scroll as f64 / SCROLL_ONE as f64;
     bpm(row.tempo) * factor
 }

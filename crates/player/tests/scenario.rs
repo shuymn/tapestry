@@ -3542,3 +3542,79 @@ fn a_saving_capture_survives_departure() {
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
     assert!(fx.base.join("out").join("r.png").exists());
 }
+
+/// The decision screen before a saved play reaches the play's
+/// `.measure.toml` (design.md "Scope of No Allocation"): the stdout record
+/// the render thread printed when it left the screen and the file's
+/// `[decision]` table and `decision_app` say the same, whichever
+/// presentation drew; a retry, which no decision screen leads, carries
+/// none. Only consistency is checked, so no frame's timing decides it.
+#[test]
+fn a_saved_play_s_measure_carries_its_decision_screen() {
+    let fx = Fixture::new();
+    let chart = write_chart(&fx.library(), "a", "譜面A");
+    write_log(
+        &fx.base.join("logs").join("all.tprl"),
+        &hits(&chart, |_| true),
+        1,
+    );
+    let skin = fx.base.join("decision");
+    fs::create_dir_all(&skin).unwrap();
+    fs::write(
+        skin.join("s.luaskin"),
+        "local skin = { type = 6, name = \"d\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         skin.scene = 20000 skin.input = 500 skin.fadeout = 500\n\
+         return skin\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.decision]\nroot = '{}'\nentry = 's.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"logs/all.tprl\", until = \"end\" }",
+        "result = \"retry\"",
+        "play = { input = \"logs/all.tprl\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let left = lines(&stdout, "dev: decision ");
+    let [left] = left[..] else {
+        panic!("one decision screen left: {stdout}");
+    };
+    let records = fx.records();
+    assert_eq!(records.len(), 2, "{records:?}");
+    let measured = |path: &PathBuf| -> toml::Table {
+        fs::read_to_string(path.with_extension("measure.toml"))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    let (first, retry) = (measured(&records[0]), measured(&records[1]));
+    let d = first.get("decision").expect("the decision screen's table");
+    let n = |key: &str| d.get(key).and_then(toml::Value::as_integer).unwrap();
+    let presentation = d.get("presentation").and_then(toml::Value::as_str).unwrap();
+    let app = int(&first, "allocations", "decision_app").expect("decision_app");
+    assert_eq!(
+        left,
+        format!(
+            "dev: decision {}: {presentation}, builds {}, skin frames {}, page frames {}, after its end {}, app allocations {app}",
+            n("lifetime"),
+            n("builds"),
+            n("skin_frames"),
+            n("page_frames"),
+            n("ended_frames"),
+        ),
+        "{stdout}"
+    );
+    assert!(retry.get("decision").is_none(), "{retry:?}");
+    assert_eq!(int(&retry, "allocations", "decision_app"), None);
+}

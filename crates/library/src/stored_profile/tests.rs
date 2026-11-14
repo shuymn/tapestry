@@ -101,21 +101,27 @@ fn the_byte_bound_is_inclusive() {
             scroll: SCROLL_ONE,
         })
         .collect();
-    let mut bins = vec![[0_u16; NOTE_CATEGORIES]; NOTE_BINS];
-    let len = |bins: &[Bin]| encode_parts(MAIN, 7, 1, bins, &rows).unwrap().len();
-    // Widen counts from 1 byte to 2 until the profile is exactly the bound.
-    let mut cells = 0;
-    let mut kept = len(&bins);
-    while kept < MAX_PROFILE_BYTES {
-        bins[cells / NOTE_CATEGORIES][cells % NOTE_CATEGORIES] = 128;
-        cells += 1;
-        kept = len(&bins);
-    }
-    assert_eq!(kept, MAX_PROFILE_BYTES);
+    let zero = vec![[0_u16; NOTE_CATEGORIES]; NOTE_BINS];
+    let base = encode_parts(MAIN, 7, 1, &zero, &rows).unwrap().len();
+    assert!(base < MAX_PROFILE_BYTES, "{base}");
+    // Each count of 128 takes 2 bytes where 0 takes 1: `extra` of them
+    // make a profile of `base + extra` bytes, rows kept.
+    let widened = |extra: usize| {
+        let mut bins = zero.clone();
+        for cell in 0..extra {
+            bins[cell / NOTE_CATEGORIES][cell % NOTE_CATEGORIES] = 128;
+        }
+        bins
+    };
+    let fill = MAX_PROFILE_BYTES - base;
+    assert!(fill < NOTE_BINS * NOTE_CATEGORIES, "{fill}");
     assert_eq!(MAX_PROFILE_BYTES, 24_576);
-    let at_bound = decode(&encode_parts(MAIN, 7, 1, &bins, &rows).unwrap()).unwrap();
+    let bins = widened(fill);
+    let bytes = encode_parts(MAIN, 7, 1, &bins, &rows).unwrap();
+    assert_eq!(bytes.len(), MAX_PROFILE_BYTES);
+    let at_bound = decode(&bytes).unwrap();
     assert_eq!(at_bound.rows.as_deref(), Some(rows.as_slice()));
-    bins[cells / NOTE_CATEGORIES][cells % NOTE_CATEGORIES] = 128;
+    let bins = widened(fill + 1);
     let past = decode(&encode_parts(MAIN, 7, 1, &bins, &rows).unwrap()).unwrap();
     assert_eq!(past.rows, None);
     assert_eq!(past.bins, bins);
@@ -222,10 +228,23 @@ fn a_real_overflow_drops_the_rows_and_a_redundant_one_does_not() {
         }
         let mut chart = b.tap(lane, bms_model::TimeUs(6_000_000)).build().unwrap();
         chart.meta.length = bms_model::ChartSummary::of(&chart).length;
+        // Each change at its tempo change's row.
+        let points = chart.timeline.points().to_vec();
+        let scroll = scroll
+            .into_iter()
+            .map(|(at, f)| {
+                let i = points.iter().position(|p| p.at == at).unwrap();
+                (bms_model::TimelineId(u32::try_from(i).unwrap()), f)
+            })
+            .collect();
         let inputs = bms_model::PreviewInputs {
-            timeline: None,
+            timeline: Some(bms_model::PreviewTimeline {
+                points,
+                stops: Vec::new(),
+                scroll,
+                initial: chart.timeline.meta().initial,
+            }),
             last_shown: None,
-            scroll,
         };
         bms_model::ChartProfile::preview(&chart, &[], &inputs)
     };

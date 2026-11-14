@@ -989,6 +989,7 @@ impl<'d> Cx<'d> {
     /// included file's too), fails the skin as before: the source reads
     /// such a table's entries, and its JSON loader fails
     /// (`skin/json/JSONSkinLoader.java:109`).
+    // Source: SF-001
     fn ops(&mut self, op: Option<u32>) -> Result<Vec<Op>, ImportError> {
         let mut ops = Vec::new();
         if let Some(op) = op {

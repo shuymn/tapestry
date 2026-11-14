@@ -123,6 +123,7 @@ fn a_conditional_item_adds_its_value_then_its_values() {
     assert_eq!(options(body, &[], &[]), ["first", "not 1", "", "last"]);
 }
 
+// Source: SF-002
 #[test]
 fn wrapper_names_ignore_ascii_case_and_the_first_wins() {
     let a = r#"[{"name": "from a"}]"#;

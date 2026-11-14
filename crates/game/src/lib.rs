@@ -67,9 +67,12 @@ pub use attempt::{
     Attempt, AttemptKind, NoteEnd, Preparation, PreparationRefusal, ScoreBasis, finish_anchor,
     song_total,
 };
+#[cfg(feature = "dev-tools")]
+pub use audio_loop::SnapshotPoint;
 pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioLoadError, AudioProbe, AudioWaitError, AudioWorker,
-    OutputProbe, Probed, SWITCH_TIMEOUT, Switch, SwitchPoll, TransportGate, audio_control,
+    OutputProbe, Probed, SEQ_LIMIT, SWITCH_TIMEOUT, Switch, SwitchPoll, SystemInstallError,
+    SystemStartError, TERMINAL, TransportGate, audio_control,
 };
 pub use autoplay::{Autoplay, AutoplayError, schedule_iter};
 pub use bests::{

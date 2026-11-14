@@ -398,6 +398,15 @@ impl Step {
 struct SelectSpec {
     path: Option<PathBuf>,
     search: Option<String>,
+    decision: Option<DecisionSpec>,
+}
+
+/// What a choice's decision screen must draw: `decision = "skin"`, the
+/// decision skin, its labels ready before the choice and pinned by it.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum DecisionSpec {
+    Skin,
 }
 
 #[derive(Deserialize)]
@@ -490,6 +499,7 @@ struct Empty {}
 struct PracticeSpec {
     path: Option<PathBuf>,
     search: Option<String>,
+    decision: Option<DecisionSpec>,
     from: i64,
     to: i64,
     speed: i64,
@@ -870,11 +880,19 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                     }
                     _ => return Err(at("give either path or search".to_owned())),
                 }
+                if s.decision == Some(DecisionSpec::Skin) {
+                    steps.push((SelectStep::DecisionReady, o));
+                }
                 steps.push((SelectStep::Enter, o));
                 chart_input = None;
                 Seq::Chosen
             }
             (Seq::Select, Step::Cursor(s)) => {
+                if s.decision.is_some() {
+                    return Err(at(
+                        "a cursor step makes no choice: decision belongs on select".to_owned(),
+                    ));
+                }
                 match (&s.path, &s.search) {
                     (Some(p), None) => {
                         let target = target(base, p, roots).map_err(at)?;
@@ -1073,6 +1091,9 @@ fn compile(file: &File, base: &Path, roots: &[(PathBuf, PathBuf)]) -> Result<Com
                     .ok()
                     .filter(|&n| n >= 1 && n.checked_add(1).is_some())
                     .ok_or_else(|| at(format!("rounds must be 1 to {}", u16::MAX - 1)))?;
+                if p.decision == Some(DecisionSpec::Skin) {
+                    steps.push((SelectStep::DecisionReady, o));
+                }
                 steps.push((SelectStep::PracticeKey(goal.input), o));
                 steps.push((SelectStep::PracticeSet(goal), o));
                 steps.push((SelectStep::PracticeStart, o));
@@ -2599,7 +2620,7 @@ pub fn conclude<E: std::error::Error + 'static>(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fmt::Write as _;
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -3970,7 +3991,7 @@ mod tests {
     }
 
     /// An input log of no events at `dir/log.tprl`.
-    fn write_log(dir: &Path) {
+    pub(crate) fn write_log(dir: &Path) {
         use replay::{
             BuildProvenance, ChartRecord, DeviceRecord, EndStatus, PlayRecord, PlayType,
             PresetRecord, ReceiveMethod, SourceRecord, Status, Versions,
@@ -4026,6 +4047,77 @@ mod tests {
     /// The fields of a valid `practice` step, but `rounds`.
     const FIELDS: &str = "from = 2, to = 3, speed = 75, lead_in_ms = 2500, gauge = 20, \
                           repeat = true, input = \"log.tprl\"";
+
+    /// `decision = "skin"` on `select` and `practice` compiles to a wait
+    /// for the decision skin's labels right before the choice (Enter, or
+    /// P), naming the step; without it there is none; another value is
+    /// refused when the file is loaded.
+    #[test]
+    fn the_decision_option_survives_parsing() {
+        let dir = folder();
+        write_log(dir.path());
+        let compiled = |steps: &[&str]| {
+            let mut script = parse(&file(None, steps), dir.path()).unwrap().script;
+            let mut got = Vec::new();
+            while let Some(step) = script.front().cloned() {
+                got.push((step, script.origin().unwrap()));
+                script.done();
+            }
+            got
+        };
+        let got = compiled(&[
+            "select = { path = \"library/a/a.bms\", decision = \"skin\" }",
+            "play = { input = \"log.tprl\", until = \"end\" }",
+            "result = \"back\"",
+            &practice(&format!("{FIELDS}, rounds = 1, decision = \"skin\"")),
+            "quit = {}",
+        ]);
+        let (select, practised) = (origin(1, StepKind::Select), origin(4, StepKind::Practice));
+        let at = |o, step: &SelectStep| got.iter().position(|(s, so)| *so == o && s == step);
+        let ready = at(select, &SelectStep::DecisionReady).expect("the select's wait");
+        assert_eq!(at(select, &SelectStep::Enter), Some(ready + 1), "{got:?}");
+        let ready = at(practised, &SelectStep::DecisionReady).expect("the practice's wait");
+        assert!(
+            matches!(got[ready + 1], (SelectStep::PracticeKey(_), o) if o == practised),
+            "{got:?}"
+        );
+        let without = compiled(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"log.tprl\", until = \"end\" }",
+            "result = \"back\"",
+            &practice(&format!("{FIELDS}, rounds = 1")),
+            "quit = {}",
+        ]);
+        assert!(
+            !without.iter().any(|(s, _)| *s == SelectStep::DecisionReady),
+            "{without:?}"
+        );
+        let e = parse(
+            &file(
+                None,
+                &[
+                    "select = { path = \"library/a/a.bms\", decision = \"built-in\" }",
+                    "play = { input = \"log.tprl\", until = \"end\" }",
+                    "quit = {}",
+                ],
+            ),
+            dir.path(),
+        )
+        .expect_err("refused");
+        assert!(e.contains("built-in"), "{e}");
+        let e = parse(
+            &file(
+                None,
+                &[
+                    "cursor = { path = \"library/a/a.bms\", decision = \"skin\" }",
+                    "quit = {}",
+                ],
+            ),
+            dir.path(),
+        )
+        .expect_err("a cursor step makes no choice");
+        assert!(e.contains("decision belongs on select"), "{e}");
+    }
 
     /// A `practice` step picks its chart as `select` does, presses P, sets
     /// the page through its keys, starts, plays its rounds and goes back,
@@ -4319,6 +4411,7 @@ mod tests {
             screen: crate::measure::ScreenKind::Play,
             selection: None,
             result: None,
+            decision: None,
             presented_at: TimeUs(0),
             skin_loading: None,
             generation: Some(generation),

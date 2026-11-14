@@ -23,6 +23,10 @@ pre-commit:
     contract:
       glob: "{docs/design.md,crates/**/*.rs}"
       run: mise exec -- cargo xtask check-contract
+    # A ledger entry, a Source: tag, a lint hit or the check itself changed.
+    fidelity:
+      glob: "{docs/fidelity.toml,crates/**/*.rs,xtask/src/**,xtask/fidelity-baseline.txt,lefthook.yml,.github/workflows/ci.yml}"
+      run: mise exec -- cargo xtask check-fidelity
     shellcheck:
       glob: "**/*.sh"
       run: mise exec -- shellcheck {staged_files}

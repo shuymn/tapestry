@@ -41,6 +41,25 @@ fn portable_reports_a_missing_cargo_once() {
     assert_fails_without_cargo(&["portable", "test"], "xtask portable: ");
 }
 
+/// `check-fidelity` with a flag it does not take exits 2 naming the ones
+/// it does, before reading anything.
+#[test]
+fn check_fidelity_refuses_an_unknown_flag() {
+    for args in [&["--bogus"][..], &["--update", "--init"]] {
+        let out = Command::new(env!("CARGO_BIN_EXE_xtask"))
+            .arg("check-fidelity")
+            .args(args)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{stderr}");
+        assert!(
+            stderr.contains("xtask: check-fidelity takes --update or --init"),
+            "{stderr}"
+        );
+    }
+}
+
 /// `portable nextest` without nextest's own command exits 2 naming it,
 /// before running anything.
 #[test]

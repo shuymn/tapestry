@@ -747,6 +747,7 @@ impl Cx<'_> {
         // load, in order (`JsonSelectSkinObjectLoader.java:50-63`): the
         // first timer that is given, and the first cycle other than -1,
         // each with the record it comes from. A hole is passed over.
+        // Source: SF-005
         let mut timer: Option<(Prop, u32)> = None;
         let mut cycle: Option<(i32, u32)> = None;
         for j in 0..recs.len() {

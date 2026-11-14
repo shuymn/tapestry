@@ -77,6 +77,7 @@ fn comments_are_whitespace() {
     assert_eq!(read("[1 / 2]"), "[1 / 2]");
 }
 
+// Source: SF-003
 #[test]
 fn one_comma_may_open_or_close_a_container() {
     assert_eq!(read("[1,2,]"), "[1,2]");
@@ -111,6 +112,7 @@ fn a_line_break_separates_where_a_comma_is_missing() {
     assert_eq!(refused(b"[\"a\"/*\n*/\"b\"]").0, Syntax::ExpectedSeparator);
 }
 
+// Source: SF-003
 #[test]
 fn unquoted_names_end_at_a_colon_line_break_or_comment() {
     assert_eq!(read("{a b:1}"), "{a b=1}");
@@ -199,11 +201,13 @@ fn members_keep_their_order_and_duplicates() {
     assert_eq!(read("{b:1,a:2,b:3}"), "{b=1,a=2,b=3}");
 }
 
+// Source: SF-003
 #[test]
 fn tokens_are_typed_as_the_pinned_reader_types_them() {
-    // The last token is `tru` and an escaped `e`: `true` once unescaped.
+    // The last tokens are `tru`, `f` and `nul` with an escaped letter:
+    // `true`, `false` and `null` once unescaped.
     let src = format!(
-        r#"[1, -2, +3, 1.5, -.5e3, 2., 1-2, 1.5x, 99999999999999999999, true, false, null, "1", tru{}u0065]"#,
+        r#"[1, -2, +3, 1.5, -.5e3, 2., 1-2, 1.5x, 99999999999999999999, true, false, null, "1", tru{0}u0065, f{0}u0061lse, nul{0}u006c]"#,
         '\\'
     );
     let mut a = arena(src.as_bytes());
@@ -237,6 +241,8 @@ fn tokens_are_typed_as_the_pinned_reader_types_them() {
             "null",
             "str 1",
             "bool true",
+            "bool false",
+            "null",
         ]
     );
 }

@@ -1,13 +1,14 @@
 //! The previews' worked values (the fixtures of design.md "Loading and
-//! Song Selection", Summaries), each against the reference's `double`
-//! arithmetic, computed with IEEE doubles.
+//! Song Selection", Summaries), each computed exactly (Python's
+//! `fractions`), where the reference's `double` arithmetic is noted when it
+//! differs.
 
 use bms_model::{
     ChartBuilder, ChartProfile, ChartSummary, HeaderValue, JudgmentHeader, JudgmentHeaderName,
-    Lane, MAIN_HISTOGRAM_LIMIT, TimeUs, main_tempo,
+    Lane, MAIN_HISTOGRAM_LIMIT, Tempo, TimeUs, main_tempo,
 };
 
-use super::{ChartInfoView, border_start, decimal_text, gauge_total};
+use super::{ChartInfoView, GaugeTotal};
 
 const SECOND: i64 = 1_000_000;
 
@@ -77,14 +78,15 @@ fn the_average_floor_is_an_integer_division() {
     assert_eq!((v.density_average, v.density_average_hundredths), (3, 80));
 }
 
-/// Fixture D: 87 notes over 20 seconds is 4.35, whose `double` times 100
-/// is 434.99999999999994, so the hundredths are 34, not an exact 35.
+/// Fixture D: 87 notes over 20 seconds is 4.35 exactly, hundredths 35;
+/// the reference's `double` times 100 is 434.99999999999994, which shows
+/// 34.
 #[test]
-fn hundredths_are_the_double_ones() {
+fn hundredths_are_exact() {
     let mut seconds = vec![4; 16];
     seconds.extend([6, 6, 6, 5]);
     let v = view(taps(&seconds), &[]);
-    assert_eq!((v.density_average, v.density_average_hundredths), (4, 34));
+    assert_eq!((v.density_average, v.density_average_hundredths), (4, 35));
 }
 
 /// Fixture E: mines are not notes: 4 then 2 notes over 3 seconds, the most
@@ -132,7 +134,11 @@ fn the_border_uses_the_whole_default_total() {
     let v = view(taps(&[213, 1, 50, 50, 31]), &[]);
     assert_eq!(v.total, 263);
     assert_eq!((v.density_end, v.density_end_hundredths), (33, 0));
-    assert_eq!(border_start(345, 263.0), 213);
+    assert_eq!(GaugeTotal::of(&[], 345).border_start(345), 214);
+    assert_eq!(
+        GaugeTotal::of(&[total(263 * ONE)], 345).border_start(345),
+        213
+    );
 }
 
 /// Fixture T3913: 3 913 notes and no `#TOTAL` give 652.1666…, whose
@@ -140,11 +146,15 @@ fn the_border_uses_the_whole_default_total() {
 /// Floored to thousandths (652.166) it would be 3 312, reached in second
 /// 0: 3 913 / 3 = 1 304.33.
 #[test]
-fn the_border_uses_the_default_total_in_double() {
+fn the_border_uses_the_exact_default_total() {
     let v = view(taps(&[3_312, 1, 600]), &[]);
     assert_eq!(v.total, 652);
     assert_eq!((v.density_end, v.density_end_hundredths), (300, 50));
-    assert_eq!(border_start(3_913, 652.166), 3_312);
+    let thousandths = total(652_166 * (ONE / 1_000));
+    assert_eq!(
+        GaugeTotal::of(&[thousandths], 3_913).border_start(3_913),
+        3_312
+    );
 }
 
 /// Fixture T1115: `#TOTAL 111.1115` starts the border at 1 for 10 notes,
@@ -157,7 +167,8 @@ fn the_border_uses_the_declared_total_exactly() {
     let v = view(taps(&[0, 0, 10]), &[precise]);
     assert_eq!(v.total, 111);
     assert_eq!((v.density_end, v.density_end_hundredths), (10, 0));
-    assert_eq!(border_start(10, 111.111), 0);
+    let thousandths = total(111_111 * (ONE / 1_000));
+    assert_eq!(GaugeTotal::of(&[thousandths], 10).border_start(10), 0);
 }
 
 /// Fixture B: scratch and keys, taps and long notes count apart; 28 notes
@@ -196,20 +207,19 @@ fn main_in_whole_bpm() {
     assert_eq!(view(b, &[]).main_bpm, Some(180));
 }
 
-/// The exact decimal reads back as the nearest `double` of its text.
+/// A declared total is its exact value; one not above 0 is the default.
+/// The border's start truncates toward 0 on both sides of it: `#TOTAL 50`
+/// gives `10 · (1 − 2) = −10`, and `#TOTAL 30` for 10 notes `−23.3…`,
+/// −23.
 #[test]
-fn a_declared_total_is_its_nearest_double() {
-    assert_eq!(decimal_text(1_111_115 * (ONE / 10_000)), "111.1115");
-    assert_eq!(decimal_text(200 * ONE), "200");
-    assert_eq!(
-        decimal_text(ONE / 1_000_000_000_000_000_000),
-        "0.000000000000000001"
-    );
-    assert_eq!(decimal_text(-(ONE + ONE / 2)), "-1.5");
+fn a_declared_total_is_exact() {
     let header = [total(1_111_115 * (ONE / 10_000))];
-    assert_eq!(gauge_total(&header, 10).to_bits(), 111.1115_f64.to_bits());
-    // Not positive: the default.
-    assert_eq!(gauge_total(&[total(0)], 28).to_bits(), 260.0_f64.to_bits());
+    assert_eq!(GaugeTotal::of(&header, 10).whole(), 111);
+    assert_eq!(GaugeTotal::of(&[total(0)], 28), GaugeTotal::of(&[], 28));
+    assert_eq!(GaugeTotal::of(&[total(0)], 28).whole(), 260);
+    assert_eq!(GaugeTotal::of(&[total(50 * ONE)], 10).border_start(10), -10);
+    assert_eq!(GaugeTotal::of(&[total(30 * ONE)], 10).border_start(10), -23);
+    assert_eq!(GaugeTotal::of(&[total(100 * ONE)], 10).border_start(10), 0);
 }
 
 /// Fixture E600: `#TOTAL 600` starts the border at 5 for 6 notes; counting
@@ -226,22 +236,43 @@ fn mines_count_down_the_border() {
 }
 
 /// Fixture T31291: 31 291 notes and no `#TOTAL` give 745.0238…, whose
-/// border start in `double` is 27 090, reached in second 0, so the window
-/// is three seconds: 31 291 / 3 = 10 430.33. The exact quotient would
-/// start it at 27 091, reached in second 1: 4 201 / 2 = 2 100.50.
+/// exact border start is 27 091, reached in second 1, so the window is two
+/// seconds: 4 201 / 2 = 2 100.50. The reference's `double` starts it at
+/// 27 090, reached in second 0: 31 291 / 3 = 10 430.33.
 #[test]
-fn the_default_total_is_a_double() {
+fn the_default_total_is_exact() {
     let v = view(taps(&[27_090, 1, 4_200]), &[]);
     assert_eq!(v.total, 745);
-    assert_eq!((v.density_end, v.density_end_hundredths), (10_430, 33));
+    assert_eq!((v.density_end, v.density_end_hundredths), (2_100, 50));
 }
 
-/// Fixture T200: `#TOTAL 199.99999999999999999` is 200.0 as a `double`, so
-/// it shows 200, where play's thousandths show 199.
+/// Fixture T4420: 4 420 notes and no `#TOTAL` give exactly 663, which the
+/// reference's `double` shows as 662.
 #[test]
-fn a_declared_total_shows_its_double() {
+fn the_default_total_shows_its_exact_whole() {
+    assert_eq!(GaugeTotal::of(&[], 4_420).whole(), 663);
+    assert_eq!(view(taps(&[4_420]), &[]).total, 663);
+    assert_eq!(GaugeTotal::of(&[], 4_419).whole(), 662);
+}
+
+/// Fixture T200: `#TOTAL 199.99999999999999999` shows 199, as play does;
+/// the reference's `double` is 200.0.
+#[test]
+fn a_declared_total_shows_its_exact_whole() {
     let declared = total(200 * ONE - 10);
-    assert_eq!(view(taps(&[10]), &[declared]).total, 200);
+    assert_eq!(view(taps(&[10]), &[declared]).total, 199);
+}
+
+/// Fixture B200: a MAIN of 199.99999999999999999 BPM shows 199; the
+/// reference's `double` is 200.0.
+#[test]
+fn main_shows_its_exact_whole() {
+    let mut chart = taps(&[3]).build().unwrap();
+    chart.meta.length = ChartSummary::of(&chart).length;
+    let main = Tempo::from_units(200 * Tempo::UNITS_PER_BPM - 10).unwrap();
+    let profile = ChartProfile::of(&chart, &[]);
+    let v = ChartInfoView::of(&profile, &[], Some(Some(main)));
+    assert_eq!(v.main_bpm, Some(199));
 }
 
 /// Fixture M: a chart of mines alone weighs no tempo, so its MAIN shows 0,

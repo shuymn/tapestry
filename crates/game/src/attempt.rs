@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use bms_model::{Chart, ChartProfile, JudgmentHeader, NoteKind, Speed, Tempo, TimeUs};
 use eval::Section;
-use rules::{GaugeRule, HeaderPolicy, LnMode, RulePreset};
+use rules::{DefaultTotal, GaugeRule, HeaderPolicy, LnMode, RulePreset};
 
 use crate::policy::GaugeIndex;
 use crate::practice::mapped;
@@ -241,11 +241,11 @@ impl Attempt {
 /// (0.01 n + 6.5))` (`play/BMSPlayerRule.java:68-80`). `n` is the whole
 /// chart's notes as the reference counts them in its default long-note
 /// mode, each tap and each long note once and no mine (jbms-parser
-/// `TimeLine.getTotalNotes`). The default is computed in `f64` in the
-/// reference's order of operations, so its truncation is the reference's
-/// (an exact quotient differs at 4 420 notes: 663 exactly, 662 in `f64`);
-/// a `#TOTAL` is truncated exactly, and past `i32` saturates, as the
-/// reference's cast does.
+/// `TimeLine.getTotalNotes`). Both are truncated exactly, the default as
+/// the gauge computes it ([`DefaultTotal::NotesCurve`]); the reference's
+/// `double` default shows one less at 4 420 notes (663 exactly, 662 in
+/// `double`), a byproduct not reproduced (design.md "Design Principles").
+/// Past `i32` it saturates.
 #[must_use]
 pub fn song_total(chart: &Chart) -> i32 {
     if let Some(milli) = HeaderPolicy::DefExRankFirst
@@ -260,18 +260,7 @@ pub fn song_total(chart: &Chart) -> i32 {
         .flatten()
         .filter(|n| !matches!(n.kind, NoteKind::Mine { .. }))
         .count();
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "a note count is far below 2^53, where f64 is exact"
-    )]
-    let n = notes as f64;
-    let total = f64::max(260.0, 7.605 * n / (0.01 * n + 6.5));
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "the reference truncates (`(int)`); the value is at most 760.5"
-    )]
-    let total = total as i32;
-    total
+    i32::try_from(DefaultTotal::NotesCurve.milli(notes) / 1_000).unwrap_or(i32::MAX)
 }
 
 #[cfg(test)]
@@ -379,10 +368,10 @@ mod tests {
     }
 
     /// The song total is the `#TOTAL` the reference decoder reads (above 0,
-    /// the last such one), truncated, else `(int) max(260, 7.605 n /
-    /// (0.01 n + 6.5))` in `f64` over the taps and long notes, each once,
-    /// no mine: 260 to 337 notes, the reference's truncation at 4 420 notes
-    /// (662, where the exact quotient is 663), whatever the preset.
+    /// the last such one), truncated, else `max(260, 7.605 n / (0.01 n +
+    /// 6.5))` truncated exactly over the taps and long notes, each once, no
+    /// mine: 260 to 337 notes, 663 at 4 420 notes (the reference's `double`
+    /// shows 662), whatever the preset.
     #[test]
     fn the_song_total_is_the_references() {
         use bms_model::HeaderValue;
@@ -393,7 +382,7 @@ mod tests {
         assert_eq!(total(337, &[]), 260);
         // 1 000 notes: 460.909.
         assert_eq!(total(999, &[]), 460);
-        assert_eq!(total(4_419, &[]), 662);
+        assert_eq!(total(4_419, &[]), 663);
         assert_eq!(total(4_418, &[]), 662);
         assert_eq!(total(4_420, &[]), 663);
         assert_eq!(

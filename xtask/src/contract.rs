@@ -92,7 +92,7 @@ fn temporary(path: &Path) -> std::path::PathBuf {
 
 /// Replaces the contents of `path` with `text` by writing a file beside it
 /// and renaming it over `path`, so a failed write leaves `path` whole.
-fn replace(path: &Path, text: &str) -> io::Result<()> {
+pub(crate) fn replace(path: &Path, text: &str) -> io::Result<()> {
     let tmp = temporary(path);
     let written = std::fs::write(&tmp, text).and_then(|()| std::fs::rename(&tmp, path));
     if written.is_err() {
@@ -104,6 +104,14 @@ fn replace(path: &Path, text: &str) -> io::Result<()> {
 /// The `.rs` files under [`TAGGED`] that hold a tag, as (path relative to
 /// `root` with `/` separators, contents), in path order.
 pub fn sources(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let mut out = rust_files(root)?;
+    out.retain(|(_, text)| text.contains(TAG));
+    Ok(out)
+}
+
+/// Every `.rs` file under [`TAGGED`], as (path relative to `root` with `/`
+/// separators, contents), in path order.
+pub(crate) fn rust_files(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
     let mut out = Vec::new();
     let mut dirs = vec![(root.join(TAGGED), TAGGED.to_owned())];
     while let Some((dir, rel)) = dirs.pop() {
@@ -120,9 +128,7 @@ pub fn sources(root: &Path) -> anyhow::Result<Vec<(String, String)>> {
             } else if kind.is_file() && name.ends_with(".rs") {
                 let text = std::fs::read_to_string(entry.path())
                     .with_context(|| format!("cannot read `{path}`"))?;
-                if text.contains(TAG) {
-                    out.push((path, text));
-                }
+                out.push((path, text));
             }
         }
     }
@@ -531,7 +537,7 @@ fn citations(spec: &str) -> Option<Vec<(&str, &str)>> {
 
 /// Checks that `source` defines `fn test` once, as a test that is not
 /// ignored.
-fn check_test(at: &str, file: &str, test: &str, source: &str, diags: &mut Vec<String>) {
+pub(crate) fn check_test(at: &str, file: &str, test: &str, source: &str, diags: &mut Vec<String>) {
     let lines: Vec<&str> = source.lines().collect();
     let defs: Vec<usize> = (0..lines.len())
         .filter(|&i| lines.get(i).is_some_and(|l| defines(l, test)))
@@ -558,7 +564,7 @@ fn check_test(at: &str, file: &str, test: &str, source: &str, diags: &mut Vec<St
     }
 }
 
-fn is_test(attrs: &[String]) -> bool {
+pub(crate) fn is_test(attrs: &[String]) -> bool {
     attrs.iter().any(|a| a == "#[test]")
 }
 
@@ -575,7 +581,7 @@ fn defines(line: &str, name: &str) -> bool {
 }
 
 /// The name of the fn whose definition `line` starts.
-fn fn_name(line: &str) -> Option<&str> {
+pub(crate) fn fn_name(line: &str) -> Option<&str> {
     let mut rest = line.trim_start();
     'prefixes: loop {
         for prefix in [

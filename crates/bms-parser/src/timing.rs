@@ -104,11 +104,10 @@ pub struct Timeline {
     pub real_rows: Option<Vec<TimeUs>>,
     /// Each bar line's row, beside `bar_lines`.
     pub bar_ids: Vec<TimelineId>,
-    /// The rows where a STOP of at least 1 000 µs starts, its exact length
-    /// truncated to µs (a whole ms, as the source's STOP is), in row order:
-    /// the floored times around a fractional start cannot tell 999.5 µs
-    /// from 1 000.
-    pub long_stops: Vec<TimelineId>,
+    /// The rows where a STOP of any positive length starts, in row order:
+    /// a STOP's end row has its start's position, which the floored times
+    /// of the rows cannot tell from another point there.
+    pub stops: Vec<TimelineId>,
     /// The tempo of the `#BPM` header, or the default.
     pub initial_tempo: Tempo,
     /// The scroll rate before time 0, from the `#BPM` header.
@@ -213,12 +212,93 @@ enum Event {
     Object(usize),
 }
 
+/// What a timeline keeps after the chart's last note, mine or BGM object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tail {
+    /// Nothing: the play chart's timeline.
+    Dropped,
+    /// Every bar line, tempo change and STOP: a preview's timeline, whose
+    /// tempo rows run on to the last of them as the source's
+    /// (`song/SongInformation.java:180-210` at `0.8.9`).
+    Kept,
+}
+
+/// The events of `source`, bar lines first at a position, then file order.
+fn events(source: &Source, last_measure: u16) -> Vec<(Spot, Event)> {
+    let mut events = Vec::with_capacity(source.objects.len() + usize::from(last_measure) + 1);
+    for m in 0..=last_measure {
+        events.push((Spot::start(m), Event::Bar));
+    }
+    for (i, o) in source.objects.iter().enumerate() {
+        let spot = Spot {
+            measure: o.measure,
+            index: o.index,
+            count: o.count,
+        };
+        events.push((spot, Event::Object(i)));
+    }
+    // Stable: equal positions keep bar lines first, then file order. The
+    // time cap is checked on this canonical order of additions.
+    events.sort_by(|a, b| a.0.order(&b.0));
+    events
+}
+
+/// The measure of the last object or measure length of `source`.
+fn last_measure(source: &Source) -> u16 {
+    source
+        .objects
+        .iter()
+        .map(|o| o.measure)
+        .chain(source.measure_lengths.keys().copied())
+        .max()
+        .unwrap_or(0)
+}
+
+/// The position of the chart's last note, mine or BGM object among
+/// `events`: bar lines, tempo changes and STOPs do not end it.
+fn content_end(events: &[(Spot, Event)], source: &Source) -> Spot {
+    events
+        .iter()
+        .rev()
+        .find(|(_, e)| match *e {
+            Event::Object(i) => !source.objects.get(i).is_some_and(|o| {
+                matches!(
+                    o.kind,
+                    ObjectKind::BpmHex(_) | ObjectKind::BpmRef(_) | ObjectKind::StopRef(_)
+                )
+            }),
+            Event::Bar => false,
+        })
+        .map_or_else(|| Spot::start(0), |(spot, _)| *spot)
+}
+
+/// Whether `source` has a bar line, tempo change or STOP after its last
+/// note, mine or BGM object, which only [`Tail::Kept`] times.
+pub fn has_tail(source: &Source) -> bool {
+    let events = events(source, last_measure(source));
+    let end = content_end(&events, source);
+    events
+        .last()
+        .is_some_and(|(spot, _)| spot.order(&end) == Ordering::Greater)
+}
+
 /// The chart's timeline at 1× and, at another `speed`, on the real
 /// timeline too, both from one exact time.
 pub fn compute(
     source: &Source,
     limits: &Limits,
     speed: Speed,
+    warnings: &mut Vec<Warning>,
+) -> Result<Timeline, LoadError> {
+    compute_with(source, limits, speed, Tail::Dropped, warnings)
+}
+
+/// [`compute`], with what `tail` keeps after the chart's content.
+pub fn compute_with(
+    source: &Source,
+    limits: &Limits,
+    speed: Speed,
+    tail: Tail,
     warnings: &mut Vec<Warning>,
 ) -> Result<Timeline, LoadError> {
     let initial_bpm = if let Some(bpm) = &source.bpm {
@@ -236,13 +316,7 @@ pub fn compute(
     // Each measure's length in beats. These values and the segments below are
     // bounded by the text limits (design.md "Chart Time"), so only the running
     // time needs a cap.
-    let last_measure = source
-        .objects
-        .iter()
-        .map(|o| o.measure)
-        .chain(source.measure_lengths.keys().copied())
-        .max()
-        .unwrap_or(0);
+    let last_measure = last_measure(source);
     let spans: Vec<Rational> = (0..=last_measure)
         .map(|m| {
             let length = source
@@ -265,36 +339,16 @@ pub fn compute(
         })
         .collect();
 
-    let mut events = Vec::with_capacity(source.objects.len() + usize::from(last_measure) + 1);
-    for m in 0..=last_measure {
-        events.push((Spot::start(m), Event::Bar));
-    }
-    for (i, o) in source.objects.iter().enumerate() {
-        let spot = Spot {
-            measure: o.measure,
-            index: o.index,
-            count: o.count,
-        };
-        events.push((spot, Event::Object(i)));
-    }
-    // Stable: equal positions keep bar lines first, then file order. The
-    // time cap is checked on this canonical order of additions.
-    events.sort_by(|a, b| a.0.order(&b.0));
-    // The chart ends with its last note, mine or BGM object: bar lines and BPM
-    // changes or STOPs after it are dropped, so empty trailing measures neither
-    // count toward the duration cap nor draw bar lines (design.md "Loading
-    // Limits").
-    let end = events
-        .iter()
-        .rev()
-        .find(|(_, e)| match *e {
-            Event::Object(i) => !matches!(
-                source.objects[i].kind,
-                ObjectKind::BpmHex(_) | ObjectKind::BpmRef(_) | ObjectKind::StopRef(_)
-            ),
-            Event::Bar => false,
-        })
-        .map_or_else(|| Spot::start(0), |(spot, _)| *spot);
+    let mut events = events(source, last_measure);
+    // The play chart ends with its last note, mine or BGM object: bar lines
+    // and BPM changes or STOPs after it are dropped, so empty trailing
+    // measures neither count toward the duration cap nor draw bar lines
+    // (design.md "Loading Limits"). A preview keeps them, held to the same
+    // cap.
+    let end = match tail {
+        Tail::Dropped => content_end(&events, source),
+        Tail::Kept => events.last().map_or_else(|| Spot::start(0), |e| e.0),
+    };
     events.truncate(events.partition_point(|e| e.0.order(&end) != Ordering::Greater));
     let charge = TimelineCharge::count(&events, source, limits)?;
 
@@ -331,7 +385,7 @@ pub fn compute(
         rows: Vec::with_capacity(charge.rows),
         real_rows: real.as_ref().map(|_| Vec::with_capacity(charge.rows)),
         bar_ids: Vec::with_capacity(charge.bars),
-        long_stops: Vec::new(),
+        stops: Vec::new(),
         initial_tempo,
         initial_rate,
         segments: vec![first(initial_rate)],
@@ -504,9 +558,7 @@ pub fn compute(
             let stop = segment(&here, &us_per_beat, 0).ok_or_else(out_of_range)?;
             push(&mut timeline.segments, stop);
             let length = units * &us_per_beat / BigInt::from(STOP_UNITS_PER_BEAT);
-            if length >= int(1_000) {
-                timeline.long_stops.push(id);
-            }
+            timeline.stops.push(id);
             time.add(&length, max_bits).map_err(|()| overflow())?;
             let (end, remainder) = to_micros(&time, &cap, measure)?;
             let change = Change {

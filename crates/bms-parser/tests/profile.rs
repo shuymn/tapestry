@@ -135,29 +135,52 @@ fn past_512_seconds_a_bin_takes_its_fullest_second() {
     assert_eq!(drawn, 6);
 }
 
-/// A STOP of 2 ms and a change to 240 BPM at one point give only the
-/// stopped row; the speed comes back at the next point. A STOP's length
-/// takes the tempo after a change at its point (0.384 units at 240 BPM).
+/// A STOP of 2 ms and a change to 240 BPM at one point give the stopped
+/// row, and the new tempo's at the STOP's end. A STOP's length takes the
+/// tempo after a change at its point (0.384 units at 240 BPM).
 #[test]
-fn a_stop_with_a_tempo_change_gives_only_the_stopped_row() {
+fn a_stop_with_a_tempo_change_stops_until_its_end() {
     let p = load("#BPM 120\n#STOP01 0.384\n#00011:01000001\n#00003:0000F000\n#00009:00000100\n");
-    assert_eq!(rows(&p), [(0, bpm(120)), (1_000, None), (1_252, bpm(240))]);
+    assert_eq!(
+        rows(&p),
+        [
+            (0, bpm(120)),
+            (1_000, None),
+            (1_002, bpm(240)),
+            (1_252, bpm(240))
+        ]
+    );
 }
 
-/// A STOP below 1 ms is no stop: with a change at its point, the tempo's
-/// row (500 µs); alone, no row at all (999 µs), even from a fractional
-/// start whose floored end lies 1 000 µs after its floored start (999.5 µs
-/// from 666 666⅔ µs at 180 BPM).
+/// A STOP below 1 ms stops the rows too, where the source's whole-ms STOP
+/// (`(int)(stop / 1000)`) has none: with a change at its point, a stopped
+/// row and the tempo's at its end in the same ms (500 µs);
+/// alone, the same (999 µs); and from a fractional start, from its
+/// floored start's ms to its floored end's (999.5 µs from 666 666⅔ µs at
+/// 180 BPM).
 #[test]
-fn a_sub_ms_stop_stops_nothing() {
+fn any_positive_stop_stops_the_rows() {
     let with_change =
         load("#BPM 120\n#STOP01 0.096\n#00011:01000001\n#00003:0000F000\n#00009:00000100\n");
     assert_eq!(
         rows(&with_change),
-        [(0, bpm(120)), (1_000, bpm(240)), (1_250, bpm(240))]
+        [
+            (0, bpm(120)),
+            (1_000, None),
+            (1_000, bpm(240)),
+            (1_250, bpm(240))
+        ]
     );
     let alone = load("#BPM 120\n#STOP01 0.095904\n#00011:01000001\n#00009:00000100\n");
-    assert_eq!(rows(&alone), [(0, bpm(120)), (1_500, bpm(120))]);
+    assert_eq!(
+        rows(&alone),
+        [
+            (0, bpm(120)),
+            (1_000, None),
+            (1_000, bpm(120)),
+            (1_500, bpm(120))
+        ]
+    );
     let fractional = load_at(
         "#BPM 180\n#STOP01 0.143928\n#00011:01000001\n#00009:00000100\n",
         20,
@@ -172,21 +195,25 @@ fn a_sub_ms_stop_stops_nothing() {
     assert_eq!(points, [0, 666_666, 667_666, 1_000_999]);
     assert_eq!(
         rows(&fractional.profile),
-        [(0, bpm(180)), (1_000, bpm(180))]
+        [
+            (0, bpm(180)),
+            (666, None),
+            (667, bpm(180)),
+            (1_000, bpm(180))
+        ]
     );
 }
 
-/// A STOP of 500 ms from 1.5 s: its end (2.0 s) is no point, so the speed
-/// comes back at measure 1's bar line (2.5 s), a point with nothing else,
-/// before the tap at 3.5 s. The rows are the same, at 1× ms, loaded at
-/// ×1.5 and ×0.5.
+/// A STOP of 500 ms from 1.5 s ends at its own end (2.0 s), not at the
+/// next point (measure 1's bar line at 2.5 s), before the tap at 3.5 s.
+/// The rows are the same, at 1× ms, loaded at ×1.5 and ×0.5.
 #[test]
-fn a_stop_resumes_at_the_next_point_a_bar_line_included() {
+fn a_stop_resumes_at_its_end() {
     let text = "#BPM 120\n#STOP01 48\n#00011:01\n#00009:00000001\n#00111:00000100\n";
     let expected = [
         (0, bpm(120)),
         (1_500, None),
-        (2_500, bpm(120)),
+        (2_000, bpm(120)),
         (3_500, bpm(120)),
     ];
     assert_eq!(rows(&load(text)), expected);

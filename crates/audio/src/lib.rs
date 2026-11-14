@@ -20,6 +20,9 @@
 //!   device in tests and headless runs. [`SeekPlan`] works out, off the audio
 //!   thread, the sounds still playing partway into a schedule, and
 //!   [`AudioEngine::seek`] starts a play there.
+//! - [`SystemVoices`] plays the player's own sounds and the decision tone
+//!   after the chart's mix, from generations installed and returned through
+//!   preallocated rings, in the order their requests were numbered.
 //!
 //! [`run_audio`] is the audio thread loop: one step per buffer event until
 //! asked to stop. On Windows, `WasapiShared` is the device: WASAPI shared
@@ -41,6 +44,7 @@ mod output;
 mod run;
 mod seek;
 mod sim;
+mod system;
 #[cfg(windows)]
 #[allow(unsafe_code)]
 mod wasapi;
@@ -68,6 +72,11 @@ pub use output::{AudioOutput, MAX_QUEUE_PERIODS, OutputError, RecordingOutput, W
 pub use run::{RunReport, run_audio};
 pub use seek::{BgmSchedule, FrameLine, ScheduledSound, SeekPlan, SeekSource};
 pub use sim::{Resume, SHIFT_HISTORY, SimConfig, SimDevice};
+pub use system::{
+    ApplyReport, GenId, SYSTEM_INSTALLS, SYSTEM_KINDS, SYSTEM_RETURNS, SYSTEM_STARTS,
+    SYSTEM_VOICES, SystemGeneration, SystemInstall, SystemKind, SystemSnapshot, SystemStart,
+    SystemVoices,
+};
 #[cfg(windows)]
 pub use wasapi::{
     EVENT_TIMEOUT_MS, EnginePeriods, Fallback, Grant, QUEUE_PERIODS, WakeTrace, WasapiError,

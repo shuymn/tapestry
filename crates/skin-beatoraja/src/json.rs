@@ -131,6 +131,7 @@ impl Parser<'_> {
     }
 
     /// `main := ws* value ws*` (rl:302).
+    // Source: SF-003
     fn document(&mut self) -> Result<u32, Fail> {
         self.skip_ws(true)?;
         let mut stack: Vec<Frame> = Vec::with_capacity(MAX_DEPTH as usize);

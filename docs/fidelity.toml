@@ -1,0 +1,95 @@
+# Source behaviour tapestry keeps on purpose (design.md "Design Principles",
+# "Reproduce a source's rules, not its byproducts"). Behaviour it does not
+# copy is a "Differences from the source" entry instead; when a change stops
+# a copy, its entry goes and a difference is recorded.
+#
+# Each entry: `id` (SF- and three digits, never reused), `summary`, `class`
+# (`rule`, `compatibility` or `kept-byproduct`), `decision` (`#N`, the
+# owner's decision; required for `kept-byproduct`), `reason` (why the copy
+# stays: the rule a player can see or the compatibility it keeps), `source`
+# (`<path>:<line>[-<line>] @<pin>`), `sites` (files that copy it) and `tests`
+# (`<file>::<fn>`, tests that pin it). Each site and test carries a
+# `// Source: SF-ddd` line; `cargo xtask check-fidelity` checks both sides.
+#
+# Pins, as `source` names them:
+# - `@beatoraja-0.8.9`: beatoraja at tag `0.8.9`;
+# - `@jbms-parser-e19bcc2`: jbms-parser at commit `e19bcc2`, which the
+#   bundled jar was built from;
+# - `@libgdx-1.9.9`: libGDX at tag `gdx-parent-1.9.9`;
+# - `@luaj-jse-3.0.2-custom`: the LuaJ jar bundled with beatoraja 0.8.9,
+#   `lib/luaj-jse-3.0.2-custom.jar`.
+#
+# The classes of SF-001 to SF-005 are proposals until the owner confirms them
+# in issue #534.
+
+[[entry]]
+id = "SF-001"
+summary = "A Lua skin's `op` that is not a table is no condition"
+class = "compatibility"
+reason = """
+A Lua skin's converted table may hold a number, string, boolean or function \
+as a destination's `op`, which the source reads as no condition; a surveyed \
+play skin was refused without this (#382). Any other `op` that is not an \
+array, and every JSON one, still fails the skin."""
+source = ["src/bms/player/beatoraja/skin/lua/LuaSkinLoader.java:171-186 @beatoraja-0.8.9"]
+sites = ["crates/skin-beatoraja/src/import/mod.rs"]
+tests = ["crates/skin-beatoraja/tests/lua_op.rs::a_lua_op_that_is_not_a_table_is_no_condition"]
+
+[[entry]]
+id = "SF-002"
+summary = "JSON wrapper names match ignoring ASCII case, and the first match wins"
+class = "compatibility"
+reason = """
+Part of the libGDX JSON dialect the reader already follows: skins that load \
+today may spell a wrapper name in any case, and dropping the match could only \
+break them."""
+source = ["gdx/src/com/badlogic/gdx/utils/JsonValue.java:95-99 @libgdx-1.9.9"]
+sites = ["crates/skin-beatoraja/src/tree.rs"]
+tests = ["crates/skin-beatoraja/tests/resolve.rs::wrapper_names_ignore_ascii_case_and_the_first_wins"]
+
+[[entry]]
+id = "SF-003"
+summary = "JSON reader edges: `[1\\n,]` refused, `]` may start an unquoted name, `true`, `false` and `null` typed after unescaping"
+class = "compatibility"
+reason = """
+Skins are written against the pinned reader's grammar, which the reader takes \
+as the format's description: with these edges a skin file reads here as it \
+reads there, and no file that loads changes its meaning."""
+source = [
+    "gdx/src/com/badlogic/gdx/utils/JsonReader.rl:108-109 @libgdx-1.9.9",
+    "gdx/src/com/badlogic/gdx/utils/JsonReader.rl:118-128 @libgdx-1.9.9",
+    "gdx/src/com/badlogic/gdx/utils/JsonReader.rl:216-268 @libgdx-1.9.9",
+    "gdx/src/com/badlogic/gdx/utils/JsonReader.rl:291-301 @libgdx-1.9.9",
+]
+sites = [
+    "crates/skin-beatoraja/src/json.rs",
+    "crates/skin-beatoraja/src/tree.rs",
+]
+tests = [
+    "crates/skin-beatoraja/src/json/tests.rs::one_comma_may_open_or_close_a_container",
+    "crates/skin-beatoraja/src/json/tests.rs::unquoted_names_end_at_a_colon_line_break_or_comment",
+    "crates/skin-beatoraja/src/json/tests.rs::tokens_are_typed_as_the_pinned_reader_types_them",
+]
+
+[[entry]]
+id = "SF-004"
+summary = "A song list's level strip ignores `padding`, `zeropadding` and digit offsets"
+class = "compatibility"
+reason = """
+The selection loader builds every level strip this way, so skins draw their \
+song-list levels for a blank-padded ten-glyph or eleven-glyph strip without \
+offsets, whatever the record's other fields say."""
+source = ["src/bms/player/beatoraja/skin/json/JsonSelectSkinObjectLoader.java:181-196 @beatoraja-0.8.9"]
+sites = ["crates/skin-beatoraja/src/import/widget/number.rs"]
+tests = ["crates/skin-beatoraja/tests/selection_frame.rs::level_strips_follow_the_selection_loader"]
+
+[[entry]]
+id = "SF-005"
+summary = "A song-list bar's image set shares the first timer and the first cycle of its images that load"
+class = "rule"
+reason = """
+A song-list rule a player sees: the images of one bar set animate together, \
+on one timer and one cycle."""
+source = ["src/bms/player/beatoraja/skin/json/JsonSelectSkinObjectLoader.java:50-63 @beatoraja-0.8.9"]
+sites = ["crates/skin-beatoraja/src/import/selection/mod.rs"]
+tests = ["crates/skin-beatoraja/tests/selection_import.rs::placements_take_their_set_s_timing"]

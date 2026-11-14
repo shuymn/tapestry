@@ -65,6 +65,7 @@ fn drawn(d: &TempDir) -> Vec<[i32; 4]> {
     common::play::Drawn::new(i.imported.skin, 100).rects(0)
 }
 
+// Source: SF-001
 #[test]
 fn a_lua_op_that_is_not_a_table_is_no_condition() {
     // The control: as a table, 901 is a condition the default leaves off.

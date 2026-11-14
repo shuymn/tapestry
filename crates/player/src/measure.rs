@@ -227,6 +227,11 @@ pub struct Figures {
     /// (dev-tools): its own per-frame work, which allocates nothing
     /// (design.md "Scope of No Allocation").
     pub render_app_allocations: Option<u64>,
+    /// The decision screen that led to the play, counted apart from it
+    /// (dev-tools: design.md "Scope of No Allocation"); `None` when no
+    /// decision screen preceded the play.
+    #[cfg(feature = "dev-tools")]
+    pub decision: Option<DecisionRecord>,
     /// Logic step samples the full queue refused: input to judgment and
     /// finalization delay are missing that many.
     pub steps_dropped: u64,
@@ -435,6 +440,10 @@ pub struct Drawn<'a> {
     /// What a result frame drew (dev-tools: a scenario's captures).
     #[cfg(feature = "dev-tools")]
     pub result: Option<ResultStamp>,
+    /// What a decision frame of a tracked decision screen drew: its
+    /// lifetime and presentation (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub decision: Option<(u64, DecisionDrawnAs)>,
     /// When the frame's present returned, on the clock (dev-tools: a
     /// scenario's captures).
     #[cfg(feature = "dev-tools")]
@@ -536,6 +545,137 @@ impl ScreenKind {
     #[must_use]
     pub const fn is_result(self) -> bool {
         matches!(self, Self::Result | Self::End)
+    }
+}
+
+/// What one decision frame drew (dev-tools).
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecisionDrawnAs {
+    /// The decision skin, through its own submission.
+    Skin,
+    /// The built-in presentation, chosen at the choice.
+    BuiltIn,
+    /// The built-in presentation drawn for a skin-chosen screen after its
+    /// skin could not draw: the refusal's own frame and every later one.
+    Fallback,
+    /// The page drawn after the screen's lifetime ended and its label
+    /// content went (a resize or recovery retired it), before the render
+    /// thread left the screen: no refusal, no takeover.
+    Ended,
+}
+
+/// Why a skin-chosen decision screen fell back to the built-in
+/// presentation (dev-tools).
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecisionFallback {
+    /// The skin refused a frame.
+    Refused,
+    /// The built-in presentation took over (a lost skin state, a restore
+    /// the screen could not make).
+    TakenOver,
+    /// No decision installation was there to draw.
+    NotInstalled,
+}
+
+#[cfg(feature = "dev-tools")]
+impl DecisionFallback {
+    /// Its name in a report.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Refused => "refused",
+            Self::TakenOver => "taken-over",
+            Self::NotInstalled => "not-installed",
+        }
+    }
+}
+
+/// One decision screen as the render thread drew it, from the message
+/// that showed it to the one that left it (dev-tools: design.md "Scope of
+/// No Allocation"): which presentation was chosen and whether it fell
+/// back, the skin's builds and the allocations inside them, counted as an
+/// app region of their own, and the frames presented of each kind.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DecisionRecord {
+    /// The decision lifetime.
+    pub lifetime: u64,
+    /// Whether the skin was chosen at the choice.
+    pub skin: bool,
+    /// Why a skin-chosen screen fell back, once it did.
+    pub fell_back: Option<DecisionFallback>,
+    /// Whether its label content went after its lifetime ended.
+    pub ended: bool,
+    /// The skin's builds: each frame that found its labels and called
+    /// the skin, built or refused.
+    pub builds: u64,
+    /// Allocations inside those builds.
+    pub app: u64,
+    /// Presented frames the skin drew.
+    pub skin_frames: u64,
+    /// Presented frames of the built-in presentation, chosen or fallen
+    /// back to.
+    pub page_frames: u64,
+    /// Presented frames drawn after its content went.
+    pub ended_frames: u64,
+}
+
+#[cfg(feature = "dev-tools")]
+impl DecisionRecord {
+    /// A record for lifetime `lifetime`, the skin chosen when `skin`.
+    #[must_use]
+    pub const fn new(lifetime: u64, skin: bool) -> Self {
+        Self {
+            lifetime,
+            skin,
+            fell_back: None,
+            ended: false,
+            builds: 0,
+            app: 0,
+            skin_frames: 0,
+            page_frames: 0,
+            ended_frames: 0,
+        }
+    }
+
+    /// What it presented: `skin`, `built-in`, or `fallback:<why>`.
+    #[must_use]
+    pub fn presentation(&self) -> String {
+        match (self.skin, self.fell_back) {
+            (_, Some(why)) => format!("fallback:{}", why.name()),
+            (true, None) => "skin".to_owned(),
+            (false, None) => "built-in".to_owned(),
+        }
+    }
+
+    /// Whether it shows a decision skin that drew and allocated nothing:
+    /// the skin chosen and never fallen back, built and presented at
+    /// least once, with no allocation in its builds.
+    #[cfg(test)]
+    #[must_use]
+    pub const fn skin_allocates_nothing(&self) -> bool {
+        self.skin
+            && self.fell_back.is_none()
+            && self.builds > 0
+            && self.skin_frames > 0
+            && self.app == 0
+    }
+
+    /// The development line printed when the render thread leaves it.
+    #[must_use]
+    pub fn line(&self) -> String {
+        format!(
+            "dev: decision {}: {}, builds {}, skin frames {}, page frames {}, after its end {}, app allocations {}",
+            self.lifetime,
+            self.presentation(),
+            self.builds,
+            self.skin_frames,
+            self.page_frames,
+            self.ended_frames,
+            self.app
+        )
     }
 }
 
@@ -679,6 +819,10 @@ pub struct Measure {
     /// thread's app region tests.
     #[cfg(all(test, feature = "dev-tools"))]
     allocate_in_frames: bool,
+    /// The decision screen that led to the play being measured
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    decision: Option<DecisionRecord>,
 }
 
 impl Measure {
@@ -733,6 +877,8 @@ impl Measure {
             app_base: None,
             #[cfg(all(test, feature = "dev-tools"))]
             allocate_in_frames: false,
+            #[cfg(feature = "dev-tools")]
+            decision: None,
         }
     }
 
@@ -766,7 +912,18 @@ impl Measure {
             audio.queued_periods = Some(q);
         }
         self.play = Some(play);
+        #[cfg(feature = "dev-tools")]
+        {
+            self.decision = None;
+        }
         self.drain();
+    }
+
+    /// The decision screen that led to the play just started, which its
+    /// figures report (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub const fn led_by(&mut self, decision: Option<DecisionRecord>) {
+        self.decision = decision;
     }
 
     /// The measured play's generation, until its figures are taken
@@ -865,6 +1022,8 @@ impl Measure {
             render_app_allocations: app_allocations()
                 .zip(self.app_base)
                 .map(|(now, base)| now.saturating_sub(base)),
+            #[cfg(feature = "dev-tools")]
+            decision: self.decision,
             steps_dropped: 0,
             ready_state: self.play.as_ref().map(|p| ReadyState {
                 setup_us: p.started.0 - p.ready_state_at.0,
@@ -1200,6 +1359,23 @@ pub fn to_toml(fig: &Figures, load: (Option<u64>, Option<u64>)) -> String {
         if let Some(app) = fig.render_app_allocations {
             let _ = writeln!(out, "render_app = {app}");
         }
+        #[cfg(feature = "dev-tools")]
+        if let Some(d) = &fig.decision {
+            let _ = writeln!(out, "decision_app = {}", d.app);
+        }
+    }
+    #[cfg(feature = "dev-tools")]
+    if let Some(d) = &fig.decision {
+        let _ = writeln!(
+            out,
+            "\n[decision]\nlifetime = {}\npresentation = \"{}\"\nbuilds = {}\nskin_frames = {}\npage_frames = {}\nended_frames = {}",
+            d.lifetime,
+            d.presentation(),
+            d.builds,
+            d.skin_frames,
+            d.page_frames,
+            d.ended_frames
+        );
     }
     out
 }
@@ -1457,6 +1633,8 @@ mod frame_tests {
             selection: None,
             #[cfg(feature = "dev-tools")]
             result: None,
+            #[cfg(feature = "dev-tools")]
+            decision: None,
             #[cfg(feature = "dev-tools")]
             presented_at: TimeUs(at),
             #[cfg(feature = "dev-tools")]

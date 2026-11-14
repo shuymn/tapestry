@@ -1450,3 +1450,791 @@ fn a_full_control_queue_keeps_the_switch_unsent() {
     .unwrap();
     assert!(Arc::ptr_eq(worker.engine().bank(), &next));
 }
+
+/// The system sounds' requests (design.md "Audio", system sounds): starts,
+/// stops and installs from the game thread, numbered from one sequence,
+/// taken by the audio thread's control step through the cutoff the game
+/// thread publishes, and generations handed back through the return ring.
+mod system_sounds {
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use audio::{
+        AudioEngine, AudioOutput, GenId, MAX_VOICES, OutputError, RecordingOutput, SimConfig,
+        SimDevice, Sound, SoundBank, SystemGeneration, SystemKind, Wake,
+    };
+    use bms_model::TimeUs;
+    use game::{AudioControl, AudioWorker, SystemStartError, audio_control};
+
+    use super::common::{PERIOD, RATE};
+
+    /// A silent chart's engine, its control and worker over a recorded
+    /// simulated device.
+    fn rig() -> (AudioControl, AudioWorker, RecordingOutput<SimDevice>) {
+        let bank = Arc::new(SoundBank::from_sounds(RATE, Vec::new()));
+        let engine = AudioEngine::new(bank, &[], RATE, PERIOD, MAX_VOICES, 0).unwrap();
+        let (control, worker) = audio_control(engine);
+        let out = RecordingOutput::new(
+            SimDevice::new(SimConfig::steady(RATE, PERIOD, TimeUs(0))),
+            RATE as usize * 8,
+        );
+        (control, worker, out)
+    }
+
+    /// `frames` frames of the constant `level`.
+    fn constant(level: i16, frames: usize) -> Arc<Sound> {
+        Arc::new(Sound::mono(vec![level; frames]))
+    }
+
+    /// A generation under an id drawn now, holding `kinds`.
+    fn pick(control: &AudioControl, kinds: &[(SystemKind, Arc<Sound>)]) -> SystemGeneration {
+        let id = GenId(control.system_seq().unwrap());
+        kinds
+            .iter()
+            .fold(SystemGeneration::new(id, RATE), |g, (k, s)| {
+                g.with(*k, Arc::clone(s))
+            })
+    }
+
+    /// Installs `generation` and returns its id.
+    fn install(control: &mut AudioControl, generation: SystemGeneration) -> GenId {
+        let id = generation.id();
+        control.install_system(generation).unwrap();
+        id
+    }
+
+    fn steps(worker: &mut AudioWorker, out: &mut RecordingOutput<SimDevice>, n: usize) {
+        for _ in 0..n {
+            worker.step(out).unwrap();
+        }
+    }
+
+    /// The ids of the generations handed back so far, taken.
+    fn returned(control: &mut AudioControl) -> Vec<GenId> {
+        std::iter::from_fn(|| control.take_system_return().map(|g| g.id())).collect()
+    }
+
+    fn sounding(worker: &AudioWorker) -> usize {
+        worker.engine().system().sounding()
+    }
+
+    /// S6: the empty install sends the current and the retired generation
+    /// back in the step that takes it, each still holding a voice; and in
+    /// an install held behind the taken retired slot the return ring takes
+    /// all three it is sized for, which wait through 1 000 steps undrained
+    /// without loss.
+    #[test]
+    fn the_return_ring_holds_the_latch() {
+        let (mut control, mut worker, mut out) = rig();
+        let long = constant(1_000, 10 * RATE as usize);
+        let r = pick(&control, &[(SystemKind::Select, Arc::clone(&long))]);
+        let r = install(&mut control, r);
+        control
+            .system_start(SystemKind::Select, true, Some(r))
+            .unwrap();
+        steps(&mut worker, &mut out, 2);
+        let c = pick(&control, &[(SystemKind::Scratch, Arc::clone(&long))]);
+        let c = install(&mut control, c);
+        control
+            .system_start(SystemKind::Scratch, false, None)
+            .unwrap();
+        steps(&mut worker, &mut out, 2);
+        let system = worker.engine().system();
+        assert_eq!((system.current(), system.retired()), (Some(c), Some(r)));
+        assert_eq!(system.sounding(), 2);
+        let empty = GenId(control.system_seq().unwrap());
+        control
+            .install_system(SystemGeneration::empty(empty))
+            .unwrap();
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(control.system_installed(), Some(empty));
+        assert_eq!(sounding(&worker), 0);
+        let mut back = returned(&mut control);
+        back.sort();
+        assert_eq!(back, [r, c]);
+
+        // R retired with a voice, A current, B's install held behind R:
+        // the stops raised to the empty install below it end R's voice, R
+        // goes back at the sweep, and the next step sends A and B back.
+        let (mut control, mut worker, mut out) = rig();
+        let r = pick(&control, &[(SystemKind::Select, Arc::clone(&long))]);
+        let r = install(&mut control, r);
+        control
+            .system_start(SystemKind::Select, true, Some(r))
+            .unwrap();
+        steps(&mut worker, &mut out, 1);
+        let a = pick(&control, &[(SystemKind::Scratch, Arc::clone(&long))]);
+        let a = install(&mut control, a);
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(worker.engine().system().retired(), Some(r));
+        let b = pick(&control, &[(SystemKind::Scratch, Arc::clone(&long))]);
+        let b = install(&mut control, b);
+        let empty = GenId(control.system_seq().unwrap());
+        for kind in SystemKind::ALL {
+            control.system_stop(kind);
+        }
+        control
+            .install_system(SystemGeneration::empty(empty))
+            .unwrap();
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(control.counters().system_install_waits(), 1);
+        assert_eq!(control.system_installed(), Some(a));
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(control.system_installed(), Some(empty));
+        steps(&mut worker, &mut out, 1_000);
+        assert_eq!(returned(&mut control), [r, a, b]);
+    }
+
+    /// S6: a voice of a generation replaced while it sounds plays on from
+    /// the retired generation exactly as if nothing were installed, and
+    /// the generation goes back in the step its last voice ends, not
+    /// before.
+    #[test]
+    fn a_retired_generation_plays_out_and_returns() {
+        let voice = Arc::new(Sound::mono(
+            (0..RATE as usize / 2)
+                .map(|i| i16::try_from(i % 4_000).unwrap() - 2_000)
+                .collect(),
+        ));
+        let run = |replace: bool| {
+            let (mut control, mut worker, mut out) = rig();
+            let a = pick(&control, &[(SystemKind::Scratch, Arc::clone(&voice))]);
+            let a = install(&mut control, a);
+            control
+                .system_start(SystemKind::Scratch, false, None)
+                .unwrap();
+            let from = out.samples().len();
+            steps(&mut worker, &mut out, 3);
+            let mut back_at = None;
+            let mut ended_at = None;
+            if replace {
+                let b = pick(&control, &[(SystemKind::Select, constant(100, 480))]);
+                install(&mut control, b);
+            }
+            for k in 0..80 {
+                worker.step(&mut out).unwrap();
+                let back = returned(&mut control);
+                if replace && sounding(&worker) > 0 {
+                    assert_eq!(worker.engine().system().retired(), Some(a));
+                    assert!(back.is_empty(), "returned at step {k} while sounding");
+                } else if !back.is_empty() {
+                    assert_eq!(back, [a]);
+                    back_at.get_or_insert(k);
+                }
+                if sounding(&worker) == 0 {
+                    ended_at.get_or_insert(k);
+                }
+            }
+            (out.samples()[from..].to_vec(), back_at, ended_at)
+        };
+        let (alone, never, _) = run(false);
+        let (replaced, back_at, ended_at) = run(true);
+        assert_eq!(never, None);
+        // 0.5 s is 50 periods: it ends some 45 steps after the install,
+        // and goes back in that step.
+        assert!(ended_at.is_some_and(|k| k > 40), "{ended_at:?}");
+        assert_eq!(back_at, ended_at);
+        assert!(
+            replaced
+                .iter()
+                .zip(&alone)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "the retired voice changed"
+        );
+    }
+
+    /// S7: a stop is a word of its own, never queued behind starts: with
+    /// the start ring full, a stop still ends its kind's loop in the
+    /// retired generation at the next step, which then goes back; the
+    /// start the full ring refused is counted, and a start after the stop
+    /// plays.
+    #[test]
+    fn a_stop_behind_a_full_ring_wins() {
+        let (mut control, mut worker, mut out) = rig();
+        let long = constant(1_000, 10 * RATE as usize);
+        let a = pick(&control, &[(SystemKind::Select, Arc::clone(&long))]);
+        let a = install(&mut control, a);
+        control
+            .system_start(SystemKind::Select, true, Some(a))
+            .unwrap();
+        steps(&mut worker, &mut out, 1);
+        let b = pick(&control, &[(SystemKind::Select, Arc::clone(&long))]);
+        let b = install(&mut control, b);
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(worker.engine().system().retired(), Some(a));
+        for _ in 0..audio::SYSTEM_STARTS {
+            control
+                .system_start(SystemKind::Scratch, false, None)
+                .unwrap();
+        }
+        assert_eq!(
+            control.system_start(SystemKind::Scratch, false, None),
+            Err(SystemStartError::Full)
+        );
+        assert_eq!(control.counters().system_refused(), 1);
+        control.system_stop(SystemKind::Select);
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(sounding(&worker), 0, "the loop ended");
+        assert_eq!(returned(&mut control), [a]);
+        assert_eq!(control.system_installed(), Some(b));
+        control
+            .system_start(SystemKind::Select, false, None)
+            .unwrap();
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(sounding(&worker), 1, "a start after the stop plays");
+        assert_eq!(control.counters().system_refused(), 1);
+    }
+
+    /// S5, S11, S13: the empty install alone, with no stop raised, is the
+    /// latch: every set voice ends in both generations, a waiting loop and
+    /// an older queued start are discarded, both generations go back, and
+    /// the tone plays on; a decision sound after it is the tone.
+    #[test]
+    fn the_empty_install_is_the_latch() {
+        let (mut control, mut worker, mut out) = rig();
+        let long = constant(1_000, 10 * RATE as usize);
+        let a = pick(&control, &[(SystemKind::Scratch, Arc::clone(&long))]);
+        let a = install(&mut control, a);
+        control
+            .system_start(SystemKind::Scratch, false, None)
+            .unwrap();
+        steps(&mut worker, &mut out, 1);
+        let kinds = [
+            (SystemKind::Select, Arc::clone(&long)),
+            (SystemKind::Fail, Arc::clone(&long)),
+            (SystemKind::Decide, Arc::clone(&long)),
+        ];
+        let b = pick(&control, &kinds);
+        let b = install(&mut control, b);
+        control
+            .system_start(SystemKind::Select, true, Some(b))
+            .unwrap();
+        let later = GenId(control.system_seq().unwrap());
+        control
+            .system_start(SystemKind::Fail, true, Some(later))
+            .unwrap();
+        control.play_tone();
+        steps(&mut worker, &mut out, 1);
+        let system = worker.engine().system();
+        assert_eq!((system.current(), system.retired()), (Some(b), Some(a)));
+        assert_eq!(system.sounding(), 2);
+        assert!(system.pending().is_some());
+        assert!(system.tone_sounding());
+        control.system_start(SystemKind::Fail, false, None).unwrap();
+        let empty = GenId(control.system_seq().unwrap());
+        control
+            .install_system(SystemGeneration::empty(empty))
+            .unwrap();
+        steps(&mut worker, &mut out, 1);
+        let system = worker.engine().system();
+        assert_eq!(system.sounding(), 0, "every set voice ended");
+        assert_eq!(system.pending(), None, "the waiting loop discarded");
+        assert_eq!(system.retired(), None);
+        assert!(system.tone_sounding(), "the tone plays on");
+        let mut back = returned(&mut control);
+        back.sort();
+        assert_eq!(back, [a, b]);
+        steps(&mut worker, &mut out, 70);
+        assert!(!worker.engine().tone_sounding());
+        control
+            .system_start(SystemKind::Decide, false, None)
+            .unwrap();
+        steps(&mut worker, &mut out, 1);
+        assert!(
+            worker.engine().tone_sounding(),
+            "the decision sound is the tone"
+        );
+        assert_eq!(sounding(&worker), 0);
+    }
+
+    /// S7, S9: a loop bound to a generation plays only from it: it waits
+    /// for a later one and starts at its install, is discarded by a stop
+    /// above it while it waits, by an install later than its own, and when
+    /// its generation is already earlier than the current.
+    #[test]
+    fn a_loop_binds_to_its_generation() {
+        let long = constant(1_000, 10 * RATE as usize);
+        let kinds = [(SystemKind::Select, Arc::clone(&long))];
+        let (mut control, mut worker, mut out) = rig();
+        let a = pick(&control, &kinds);
+        let a = install(&mut control, a);
+        steps(&mut worker, &mut out, 1);
+        // Waits for B, then starts at B's install.
+        let b = pick(&control, &kinds);
+        control
+            .system_start(SystemKind::Select, true, Some(b.id()))
+            .unwrap();
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(sounding(&worker), 0);
+        assert!(worker.engine().system().pending().is_some());
+        let b = install(&mut control, b);
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(sounding(&worker), 1);
+        assert_eq!(worker.engine().system().pending(), None);
+        // A loop for an earlier generation: discarded.
+        control
+            .system_start(SystemKind::Select, true, Some(a))
+            .unwrap();
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(sounding(&worker), 1);
+        assert_eq!(worker.engine().system().pending(), None);
+        control.system_stop(SystemKind::Select);
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(sounding(&worker), 0);
+        // A loop for C with a stop above it: nothing starts at C's install.
+        let c = pick(&control, &kinds);
+        control
+            .system_start(SystemKind::Select, true, Some(c.id()))
+            .unwrap();
+        steps(&mut worker, &mut out, 1);
+        control.system_stop(SystemKind::Select);
+        install(&mut control, c);
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(sounding(&worker), 0);
+        assert_eq!(worker.engine().system().pending(), None);
+        // A loop for D when E, later than D, installs: discarded there.
+        let d = GenId(control.system_seq().unwrap());
+        control
+            .system_start(SystemKind::Select, true, Some(d))
+            .unwrap();
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(
+            worker
+                .engine()
+                .system()
+                .pending()
+                .and_then(|p| p.generation),
+            Some(d)
+        );
+        // A and B are back; taken, they make room for E (the fourth).
+        assert_eq!(returned(&mut control), [a, b]);
+        let e = pick(&control, &kinds);
+        install(&mut control, e);
+        steps(&mut worker, &mut out, 10);
+        assert_eq!(sounding(&worker), 0);
+        assert_eq!(worker.engine().system().pending(), None);
+    }
+
+    /// An output that fails every write once told to.
+    struct Failing {
+        inner: RecordingOutput<SimDevice>,
+        fail: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl AudioOutput for Failing {
+        fn rate(&self) -> u32 {
+            self.inner.rate()
+        }
+
+        fn period(&self) -> u32 {
+            self.inner.period()
+        }
+
+        fn wait(&mut self) -> Wake {
+            self.inner.wait()
+        }
+
+        fn write(&mut self, f: impl FnOnce(&mut [f32])) -> Result<(), OutputError> {
+            if self.fail.load(std::sync::atomic::Ordering::Acquire) {
+                return Err(OutputError::DeviceLost);
+            }
+            self.inner.write(f)
+        }
+    }
+
+    /// Waits up to 5 s for `done`.
+    fn until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "{what} never happened");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// S6, S14: at an output failure every system voice and the tone end;
+    /// the control-only steps after it discard a waiting loop and every
+    /// start, counted, but still apply installs and send a silent retired
+    /// generation back; at the exit, the current generation and one still
+    /// in the install ring drop on the audio thread after its loop has
+    /// returned, outside any step.
+    #[test]
+    fn output_failure_and_shutdown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (mut control, mut worker, out) = rig();
+        let fail = Arc::new(AtomicBool::new(false));
+        let mut out = Failing {
+            inner: out,
+            fail: Arc::clone(&fail),
+        };
+        let long = constant(1_000, 10 * RATE as usize);
+        let kinds = [
+            (SystemKind::Select, Arc::clone(&long)),
+            (SystemKind::Scratch, Arc::clone(&long)),
+        ];
+        let a = pick(&control, &kinds);
+        let a = install(&mut control, a);
+        control
+            .system_start(SystemKind::Scratch, false, None)
+            .unwrap();
+        worker.step(&mut out).unwrap();
+        let b = pick(&control, &kinds);
+        let b = install(&mut control, b);
+        control
+            .system_start(SystemKind::Select, true, Some(b))
+            .unwrap();
+        control.play_tone();
+        worker.step(&mut out).unwrap();
+        let c_sound = constant(2_000, 480);
+        let c = pick(&control, &[(SystemKind::Select, Arc::clone(&c_sound))]);
+        control
+            .system_start(SystemKind::Select, true, Some(c.id()))
+            .unwrap();
+        worker.step(&mut out).unwrap();
+        let system = worker.engine().system();
+        assert_eq!((system.current(), system.retired()), (Some(b), Some(a)));
+        assert_eq!(system.sounding(), 2);
+        assert!(system.tone_sounding());
+        assert!(system.pending().is_some());
+        let c_probe = Arc::downgrade(&c_sound);
+        drop(c_sound);
+        let d_sound = constant(3_000, 480);
+        let d_probe = Arc::downgrade(&d_sound);
+        let d = pick(&control, &[(SystemKind::Select, d_sound)]);
+
+        fail.store(true, Ordering::Release);
+        let (ran_tx, ran_rx) = std::sync::mpsc::channel();
+        let (drop_tx, drop_rx) = std::sync::mpsc::channel::<()>();
+        let audio = std::thread::spawn(move || {
+            worker.run(&mut out, Duration::from_millis(1));
+            let system = worker.engine().system();
+            ran_tx
+                .send((system.sounding(), system.tone_sounding()))
+                .unwrap();
+            drop_rx.recv().unwrap();
+            let held = (c_probe.upgrade().is_some(), d_probe.upgrade().is_some());
+            drop(worker);
+            let dropped = (c_probe.upgrade().is_none(), d_probe.upgrade().is_none());
+            (held, dropped, std::thread::current().id())
+        });
+        let counters = control.counters();
+        until("the failure", || control.failure().is_some());
+        // The waiting loop was discarded at the failure, counted.
+        until("A's return", || {
+            control.take_system_return().map(|g| g.id()) == Some(a)
+        });
+        for _ in 0..5 {
+            control
+                .system_start(SystemKind::Scratch, false, None)
+                .unwrap();
+        }
+        until("the starts' discard", || counters.system_refused() == 6);
+        let c = install(&mut control, c);
+        control
+            .system_start(SystemKind::Select, false, None)
+            .unwrap();
+        until("C's install", || control.system_installed() == Some(c));
+        until("B's return", || {
+            control.take_system_return().map(|g| g.id()) == Some(b)
+        });
+        until("the start's discard", || counters.system_refused() == 7);
+        control.exit();
+        let (sounding, tone) = ran_rx.recv().unwrap();
+        assert_eq!((sounding, tone), (0, false));
+        // The exit was taken: D stays in the install ring, and the control
+        // goes, so the ring's last owner is the worker.
+        install(&mut control, d);
+        drop(control);
+        drop_tx.send(()).unwrap();
+        let (held, dropped, thread) = audio.join().unwrap();
+        assert_eq!(held, (true, true), "C and D held until the worker drops");
+        assert_eq!(dropped, (true, true), "C and D dropped with the worker");
+        assert_ne!(thread, std::thread::current().id());
+    }
+
+    /// A decision sound of `level`.
+    #[cfg(feature = "dev-tools")]
+    fn decide(level: i16) -> Vec<(SystemKind, Arc<Sound>)> {
+        vec![(SystemKind::Decide, constant(level, RATE as usize))]
+    }
+
+    /// The decision sound of `level` when `has`, else none.
+    #[cfg(feature = "dev-tools")]
+    fn decide_if(has: bool, level: i16) -> Vec<(SystemKind, Arc<Sound>)> {
+        if has { decide(level) } else { Vec::new() }
+    }
+
+    /// The control shared with a snapshot hook.
+    #[cfg(feature = "dev-tools")]
+    type Shared = Arc<std::sync::Mutex<AudioControl>>;
+
+    /// A hook that runs `at` once, at the first `point` reached, the game
+    /// side's pushes made from a thread of their own.
+    #[cfg(feature = "dev-tools")]
+    fn once_at(
+        worker: &mut AudioWorker,
+        control: &Shared,
+        point: game::SnapshotPoint,
+        at: impl FnOnce(&mut AudioControl) + Send + 'static,
+    ) {
+        let control = Arc::clone(control);
+        let mut at = Some(at);
+        worker.set_snapshot_hook(move |reached| {
+            if reached == point
+                && let Some(at) = at.take()
+            {
+                let control = Arc::clone(&control);
+                std::thread::spawn(move || at(&mut control.lock().unwrap()))
+                    .join()
+                    .unwrap();
+            }
+        });
+    }
+
+    /// S7: each step takes what its snapshot saw, and no more: starts and
+    /// a stop published after it wait for the next step, which discards
+    /// the starts older than the stop; a start taken a step after a stop
+    /// numbered above it is discarded, a newer one plays. The sequence is
+    /// checked and sticky: it issues numbers up to 2^63 - 1, refuses every
+    /// draw from there without moving, and never wraps; a stop drawn then
+    /// raises its kind's word to the terminal number, which ends its voices
+    /// in every generation, and a start is refused and counted.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_snapshot_orders_and_bounds_each_step() {
+        use game::{SEQ_LIMIT, SnapshotPoint, TERMINAL};
+
+        let (control, mut worker, mut out) = rig();
+        let control: Shared = Arc::new(std::sync::Mutex::new(control));
+        let long = constant(1_000, 10 * RATE as usize);
+        let kinds = [
+            (SystemKind::Scratch, Arc::clone(&long)),
+            (SystemKind::Fail, Arc::clone(&long)),
+            (SystemKind::Select, Arc::clone(&long)),
+        ];
+        {
+            let mut c = control.lock().unwrap();
+            let a = pick(&c, &kinds);
+            install(&mut c, a);
+        }
+        steps(&mut worker, &mut out, 1);
+        for _ in 0..10 {
+            control
+                .lock()
+                .unwrap()
+                .system_start(SystemKind::Scratch, false, None)
+                .unwrap();
+        }
+        once_at(&mut worker, &control, SnapshotPoint::AfterSnapshot, |c| {
+            for _ in 0..20 {
+                c.system_start(SystemKind::Scratch, false, None).unwrap();
+            }
+            c.system_stop(SystemKind::Scratch);
+        });
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(sounding(&worker), 10, "this step's ten, nothing after");
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(sounding(&worker), 0, "the stop, and the twenty below it");
+
+        // A fail stop with nothing sounding, then an older fail start taken
+        // at the next step: discarded; a newer one plays.
+        once_at(&mut worker, &control, SnapshotPoint::AfterCutoff, |c| {
+            c.system_start(SystemKind::Fail, false, None).unwrap();
+            c.system_stop(SystemKind::Fail);
+        });
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(sounding(&worker), 0);
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(sounding(&worker), 0, "the older start discarded");
+        control
+            .lock()
+            .unwrap()
+            .system_start(SystemKind::Fail, false, None)
+            .unwrap();
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(sounding(&worker), 1, "a newer one plays");
+
+        // Exhaustion.
+        let c = control.lock().unwrap();
+        c.seed_system_seq(SEQ_LIMIT - 1);
+        assert_eq!(c.system_seq(), Some(SEQ_LIMIT - 1));
+        assert_eq!(c.system_seq(), None);
+        for _ in 0..1_000 {
+            assert_eq!(c.system_seq(), None);
+        }
+        assert_eq!(c.system_seq_word(), SEQ_LIMIT, "no advance, no wrap");
+        c.seed_system_seq(u64::MAX - 1);
+        assert_eq!(c.system_seq(), None);
+        assert_eq!(c.system_seq_word(), u64::MAX - 1);
+        drop(c);
+
+        // A select loop in the retired and in the current generation, then
+        // a select stop with the sequence exhausted.
+        let (mut c, mut worker, mut out) = rig();
+        let r = pick(&c, &kinds);
+        let r = install(&mut c, r);
+        c.system_start(SystemKind::Select, true, Some(r)).unwrap();
+        steps(&mut worker, &mut out, 1);
+        let a = pick(&c, &kinds);
+        let a = install(&mut c, a);
+        c.system_start(SystemKind::Select, true, Some(a)).unwrap();
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(worker.engine().system().retired(), Some(r));
+        assert_eq!(sounding(&worker), 2);
+        c.seed_system_seq(SEQ_LIMIT);
+        assert_eq!(c.system_stop(SystemKind::Select), None);
+        assert_eq!(c.system_stop_word(SystemKind::Select), TERMINAL);
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(sounding(&worker), 0);
+        assert_eq!(returned(&mut c), [r]);
+        assert_eq!(
+            c.system_start(SystemKind::Scratch, false, None),
+            Err(SystemStartError::Exhausted)
+        );
+        assert_eq!(c.counters().system_refused(), 1);
+        // A decision sound's refusal is its caller's to turn into the tone.
+        assert_eq!(
+            c.system_start(SystemKind::Decide, false, None),
+            Err(SystemStartError::Exhausted)
+        );
+        assert_eq!(c.counters().system_refused(), 1);
+    }
+
+    /// S7, S13: the cutoff orders the game thread's starts and installs
+    /// across threads, whichever ring a push lands in between the
+    /// snapshot's reads: nothing published after the cutoff is taken in
+    /// that step, and the next applies it in number order, so a decision
+    /// sound plays from the generation current at its number; the latch's
+    /// stops and empty install discard a decision sound below them, and
+    /// the tone asked for with them starts in the step that applies the
+    /// empty install and not in the step before it. The order inside that
+    /// step, the install and then the tone, is `SystemVoices::apply`'s,
+    /// which no snapshot hook reaches; the audio crate's apply test checks
+    /// that a tone behind a blocked install waits for it.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_cutoff_orders_starts_and_installs_across_threads() {
+        use game::SnapshotPoint;
+
+        // A current, holding a decision sound when `a_has`.
+        let setup = |a_has: bool| {
+            let (control, mut worker, mut out) = rig();
+            let control: Shared = Arc::new(std::sync::Mutex::new(control));
+            let a = {
+                let mut c = control.lock().unwrap();
+                let a = pick(&c, &decide_if(a_has, 1_000));
+                install(&mut c, a)
+            };
+            steps(&mut worker, &mut out, 1);
+            (control, worker, out, a)
+        };
+
+        for a_has in [true, false] {
+            let b_has = !a_has;
+            // (a) install B then a decision sound, at the hook between the
+            // ring reads, and (c) both at the hook after the cutoff: neither
+            // taken; the next step installs B, then plays B's or the tone.
+            for point in [SnapshotPoint::BetweenRings, SnapshotPoint::AfterCutoff] {
+                let (control, mut worker, mut out, a) = setup(a_has);
+                once_at(&mut worker, &control, point, move |c| {
+                    let b = pick(c, &decide_if(b_has, 2_000));
+                    install(c, b);
+                    c.system_start(SystemKind::Decide, false, None).unwrap();
+                });
+                steps(&mut worker, &mut out, 1);
+                let c = control.lock().unwrap();
+                assert_eq!(c.system_installed(), Some(a), "{point:?}");
+                drop(c);
+                assert_eq!(sounding(&worker), 0);
+                assert!(!worker.engine().tone_sounding());
+                steps(&mut worker, &mut out, 1);
+                assert_ne!(control.lock().unwrap().system_installed(), Some(a));
+                assert_eq!(sounding(&worker), usize::from(b_has), "{point:?}");
+                assert_eq!(worker.engine().tone_sounding(), !b_has, "{point:?}");
+            }
+
+            // (b) a decision sound then install B, between the ring reads:
+            // at the next step, A's or the tone.
+            let (control, mut worker, mut out, a) = setup(a_has);
+            once_at(
+                &mut worker,
+                &control,
+                SnapshotPoint::BetweenRings,
+                move |c| {
+                    c.system_start(SystemKind::Decide, false, None).unwrap();
+                    let b = pick(c, &decide_if(b_has, 2_000));
+                    install(c, b);
+                },
+            );
+            steps(&mut worker, &mut out, 1);
+            assert_eq!(sounding(&worker), 0);
+            assert!(!worker.engine().tone_sounding());
+            steps(&mut worker, &mut out, 1);
+            assert_eq!(sounding(&worker), usize::from(a_has));
+            assert_eq!(worker.engine().tone_sounding(), !a_has);
+            if a_has {
+                assert_eq!(worker.engine().system().retired(), Some(a));
+            }
+        }
+
+        // (d) the latch: B and a decision sound after the cutoff, then the
+        // stops, the empty install and the tone between the ring reads.
+        let (control, mut worker, mut out, a) = setup(true);
+        let shared = Arc::clone(&control);
+        let ids = Arc::new(std::sync::Mutex::new(None));
+        let ids_in = Arc::clone(&ids);
+        let mut first = Some(move |c: &mut AudioControl| {
+            let b = pick(c, &decide(2_000));
+            let b = install(c, b);
+            c.system_start(SystemKind::Decide, false, None).unwrap();
+            *ids_in.lock().unwrap() = Some(b);
+        });
+        let mut second = Some(|c: &mut AudioControl| {
+            let empty = GenId(c.system_seq().unwrap());
+            for kind in SystemKind::ALL {
+                c.system_stop(kind);
+            }
+            c.install_system(SystemGeneration::empty(empty)).unwrap();
+            c.play_tone();
+        });
+        worker.set_snapshot_hook(move |point| {
+            let run = |f: &mut (dyn FnMut(&mut AudioControl) + Send)| {
+                let shared = Arc::clone(&shared);
+                std::thread::scope(|s| {
+                    s.spawn(|| f(&mut shared.lock().unwrap())).join().unwrap();
+                });
+            };
+            match point {
+                SnapshotPoint::AfterCutoff => {
+                    if let Some(mut f) = first.take() {
+                        run(&mut f);
+                    }
+                }
+                SnapshotPoint::BetweenRings => {
+                    if let Some(mut f) = second.take() {
+                        run(&mut f);
+                    }
+                }
+                SnapshotPoint::AfterSnapshot => {}
+            }
+        });
+        steps(&mut worker, &mut out, 1);
+        assert_eq!(control.lock().unwrap().system_installed(), Some(a));
+        assert!(
+            !worker.engine().tone_sounding(),
+            "no tone before the empty install"
+        );
+        assert_eq!(sounding(&worker), 0);
+        steps(&mut worker, &mut out, 1);
+        let b = ids.lock().unwrap().unwrap();
+        let mut c = control.lock().unwrap();
+        let installed = c.system_installed().unwrap();
+        assert!(installed > b, "the empty install is current");
+        assert_eq!(sounding(&worker), 0, "the decision sound below the stops");
+        assert!(
+            worker.engine().tone_sounding(),
+            "the tone, after the empty install"
+        );
+        assert_eq!(returned(&mut c), [a, b]);
+    }
+}
