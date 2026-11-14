@@ -130,7 +130,7 @@ impl LifetimeState {
     }
 
     /// The stage last reported (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dev-tools"))]
     pub const fn stage(&self) -> Stage {
         self.stage
     }

@@ -198,7 +198,7 @@ thread_local! {
 
 /// Tests: the next owner the rig makes on this thread is set up through
 /// `f` (its sets, decoder, recovery state and clock).
-#[cfg(test)]
+#[cfg(all(test, feature = "dev-tools"))]
 pub fn arm(f: impl FnOnce(&mut Setup, &mut Hooks) + 'static) {
     ARMED.with_borrow_mut(|a| *a = Some(Box::new(f)));
 }
@@ -956,7 +956,7 @@ impl SystemSounds {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "dev-tools"))]
 impl SystemSounds {
     /// Whether a pick is decoding, and whether it was asked to stop.
     pub(crate) fn pick_running(&self) -> Option<bool> {

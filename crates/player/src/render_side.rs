@@ -3059,7 +3059,7 @@ impl RenderLink {
 
     /// What reads, from any thread, the stage the current loading
     /// lifetime last reported (tests); `None` without one.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dev-tools"))]
     pub(crate) fn loading_stage(&self) -> impl Fn() -> Option<Stage> + Send + Sync + use<> {
         let shared = Arc::clone(&self.shared);
         move || {
