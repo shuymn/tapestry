@@ -627,8 +627,14 @@ pub struct SelectScreen {
     searching: bool,
     /// The order, by index into [`SORTS`].
     sort: usize,
-    /// Why the chart last chosen was refused, until the next choice.
+    /// Why the chart last chosen or a skin was refused, until the next
+    /// choice: the notices set in one look, joined in the order they were
+    /// set ([`add_notice`](Self::add_notice)).
     notice: Option<String>,
+    /// Whether `notice` was set in the current look
+    /// ([`begin_look`](Self::begin_look)), which nothing set or cleared
+    /// later in that look replaces: no page may have shown it yet.
+    look_notice: bool,
     /// The chosen preset's name, for the title.
     preset: String,
     /// The chosen preset file's error, or why the shelf cannot open.
@@ -1018,9 +1024,43 @@ impl SelectScreen {
         self.preedit.clear();
     }
 
-    /// Shows why the chosen chart was refused, or nothing.
+    /// Shows `notice` as one an earlier look set, or nothing.
+    #[cfg(test)]
     pub fn set_notice(&mut self, notice: Option<String>) {
         self.notice = notice;
+        self.look_notice = false;
+    }
+
+    /// Starts a look: the notice shown is from then on an earlier look's,
+    /// which the next notice replaces and a clear removes.
+    pub fn begin_look(&mut self) {
+        self.look_notice = false;
+    }
+
+    /// Shows `notice` after the ones set in the same look, joined with
+    /// " / " in the order they were set; one an earlier look set is
+    /// replaced. Whether it replaced one (or nothing).
+    pub fn add_notice(&mut self, notice: String) -> bool {
+        let replaced = !self.look_notice;
+        match &mut self.notice {
+            Some(shown) if !replaced => {
+                shown.push_str(" / ");
+                shown.push_str(&notice);
+            }
+            shown => *shown = Some(notice),
+        }
+        self.look_notice = true;
+        replaced
+    }
+
+    /// Clears the notice an earlier look set; one set in the current look
+    /// stays for its page. Whether it was cleared (or none showed).
+    pub fn clear_notice(&mut self) -> bool {
+        if self.look_notice {
+            return false;
+        }
+        self.notice = None;
+        true
     }
 
     /// Shows the chosen preset in the title and, while no refusal shows,
@@ -1117,7 +1157,7 @@ impl SelectScreen {
                 let Some(path) = self.entries.get(i).map(|e| e.path.clone()) else {
                     return Acted::Nothing;
                 };
-                self.notice = None;
+                self.clear_notice();
                 if key == MenuKey::Practice {
                     Acted::Practice(path)
                 } else {
