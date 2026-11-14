@@ -937,6 +937,55 @@ fn an_entry_waits_then_rerolls() {
     assert_eq!(run.audio.control.counters().system_install_waits(), 0);
 }
 
+/// C24-2 (design.md "State Model", system sounds, Selection): the entry's
+/// loop belongs to its pick. A installed and its `select` looping, the
+/// next entry picks B, whose `select` takes 300 ms to decode: stepped by
+/// hand, no step before B's install sounds `select` (A's stopped, B's not
+/// ready), and the step that installs B starts B's loop.
+// Source: SF-010
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_entry_loop_waits_for_its_pick() {
+    let fx = Fixture::new();
+    fx.sound("bgm/A", SystemKind::Select, 96_000);
+    fx.sound("bgm/B", SystemKind::Select, 72_000);
+    let mut run = Run::with_seam(fx, Opts::default(), |seam| {
+        seam.rule(
+            "B/select.wav",
+            Rule {
+                delay: Some(Duration::from_millis(300)),
+                ..Rule::default()
+            },
+        );
+    });
+    run.settle();
+    let select = |run: &Run| run.audio.system(|v| v.reserved_voice(SystemKind::Select));
+    let a = run.sounds.enter_selection(&mut run.audio.control, || false);
+    assert_eq!(run.installed(), Some(a));
+    run.audio.steps(2);
+    assert_eq!(select(&run), Some((a, true)), "A's loop");
+    run.audio.hold(true);
+    run.pick(1);
+    let b = run.sounds.enter_selection(&mut run.audio.control, || false);
+    assert!(b > a, "B admitted");
+    let until = Instant::now() + PATIENCE;
+    let mut steps = 0;
+    loop {
+        run.poll();
+        run.audio.step_now(1);
+        steps += 1;
+        if run.installed() == Some(b) {
+            break;
+        }
+        assert_eq!(select(&run), None, "step {steps}, before B's install");
+        assert!(Instant::now() < until, "B never installed");
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(steps > 1, "B installed at the entry's first step");
+    assert_eq!(select(&run), Some((b, true)), "B's loop at its install");
+    run.audio.hold(false);
+}
+
 /// S5, S7: an entry whose stop finds the sequence exhausted stops every
 /// kind at the terminal number, latches and returns the terminal empty
 /// generation, which ends the loop and the retired one-shot; set starts are

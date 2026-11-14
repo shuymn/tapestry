@@ -62,10 +62,6 @@ use crate::imports::STOP_WAIT;
 /// (its report, its install's acknowledgement and the return of the
 /// generation it retired) before it keeps the current sets for that visit.
 /// Provisional.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "the selection entry's re-roll is wired later")
-)]
 pub const ENTRY_SETTLE_WAIT: Duration = Duration::from_secs(2);
 
 /// One slice of the owner's waits.
@@ -461,10 +457,6 @@ impl SystemSounds {
     /// refused; one whose number is refused latches the run. It allocates
     /// and frees nothing.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    #[cfg_attr(
-        not(all(test, feature = "dev-tools")),
-        expect(dead_code, reason = "the triggers come with their screens")
-    )]
     pub fn stop(&mut self, control: &mut AudioControl, kind: SystemKind) {
         if control.system_stop(kind).is_none() {
             self.latch(control, Reason::SequenceExhausted);
@@ -517,16 +509,31 @@ impl SystemSounds {
     /// [`take_entry_end`](Self::take_entry_end)), the newest pushed. An
     /// entry while an earlier one's timeout is still outstanding skips at
     /// once.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the selection entry's re-roll is wired later")
-    )]
     pub fn repick(&mut self, control: &mut AudioControl, mut ends: impl FnMut() -> bool) -> GenId {
         if control.system_stop_all().is_none() {
             self.latch(control, Reason::SequenceExhausted);
         }
         let id = self.entry(control, &mut ends);
         self.drain_deferred();
+        id
+    }
+
+    /// Selection is entered (not recovered): the re-roll
+    /// ([`repick`](Self::repick)), then, unless `ends` ended its wait,
+    /// selection's BGM looped and bound to the generation it returned, so
+    /// it sounds from that pick once it installs and never from an earlier
+    /// one (design.md "State Model", system sounds, Selection). Returns
+    /// that generation.
+    pub fn enter_selection(
+        &mut self,
+        control: &mut AudioControl,
+        ends: impl FnMut() -> bool,
+    ) -> GenId {
+        let id = self.repick(control, ends);
+        if !self.entry_ended {
+            // Source: SF-010
+            self.start(control, SystemKind::Select, Some(id));
+        }
         id
     }
 
@@ -640,14 +647,18 @@ impl SystemSounds {
         }
     }
 
-    /// Ends the worker (its pick cancelled, waited for within
-    /// [`STOP_WAIT`], then left to end with the process), drops what the
-    /// game thread holds and takes the returns, the deferred-drop slot
-    /// drained before any return's charge is released. Idempotent.
+    /// Stops every set sound, then ends the worker (its pick cancelled,
+    /// waited for within [`STOP_WAIT`], then left to end with the
+    /// process), drops what the game thread holds and takes the returns,
+    /// the deferred-drop slot drained before any return's charge is
+    /// released. Idempotent.
     pub fn close(&mut self, control: &mut AudioControl) {
         if self.closed {
             return;
         }
+        // Every set sound, a loop still sounding included, ends before the
+        // audio thread does; a refused number stops them all the same.
+        let _ = control.system_stop_all();
         self.drain_deferred();
         self.end_worker();
         self.take_returns(control);
