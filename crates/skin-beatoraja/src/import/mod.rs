@@ -2367,11 +2367,11 @@ fn draw_cond(kind: ScreenKind, n: i32) -> Option<Cond> {
         .then(|| ops::numeric_in(kind, n, &BTreeMap::new()))
 }
 
-/// The pivot of `center` (`SkinObject.java:80-81, 228-233`): honoured
-/// for 0..=9, bottom left otherwise.
+/// The pivot of `center`: 1..=9 as the table of `SkinObject.java:80-81,
+/// 228-233`, the centre for 0 and anything else (design.md "Differences
+/// from the source", imported skins).
 fn pivot(center: i32) -> Anchor {
     match center {
-        0 | 5 => Anchor::Center,
         1 => Anchor::BottomLeft,
         2 => Anchor::Bottom,
         3 => Anchor::BottomRight,
@@ -2380,7 +2380,7 @@ fn pivot(center: i32) -> Anchor {
         7 => Anchor::TopLeft,
         8 => Anchor::Top,
         9 => Anchor::TopRight,
-        _ => Anchor::BottomLeft,
+        _ => Anchor::Center,
     }
 }
 

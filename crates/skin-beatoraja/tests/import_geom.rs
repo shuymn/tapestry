@@ -43,11 +43,12 @@ fn an_asymmetric_rect_turns_about_its_pivot() {
 }
 
 #[test]
-fn centers_outside_0_to_9_pivot_at_the_bottom_left() {
+fn centers_outside_0_to_9_pivot_at_the_centre() {
     for (center, pivot) in [
-        (-1, [15.0, 1_050.0]),
-        (10, [15.0, 1_050.0]),
-        (11, [15.0, 1_050.0]),
+        (-1, [37.5, 1_020.0]),
+        (10, [37.5, 1_020.0]),
+        (11, [37.5, 1_020.0]),
+        (i32::MIN, [37.5, 1_020.0]),
         (0, [37.5, 1_020.0]),
         (3, [60.0, 1_050.0]),
         (9, [60.0, 990.0]),
