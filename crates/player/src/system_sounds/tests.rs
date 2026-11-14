@@ -779,6 +779,7 @@ fn a_pick_reserves_then_charges_its_bytes() {
         sounds: SoundSettings {
             sound_root: Some(sets.clone()),
             bgm_root: Some(sets),
+            ..SoundSettings::default()
         },
         ..Opts::default()
     };

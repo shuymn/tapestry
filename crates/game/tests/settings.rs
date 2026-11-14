@@ -129,6 +129,7 @@ fn changed() -> Settings {
             sounds: SoundSettings {
                 sound_root: Some(absolute("sets/sound")),
                 bgm_root: Some(PathBuf::new()),
+                loop_result: true,
             },
         },
     }
@@ -202,6 +203,46 @@ fn sounds_load_and_refuse_by_table_and_key() {
             }
             other => panic!("{other:?} for {text}"),
         }
+    }
+}
+
+/// C27-5 (design.md "Settings Files"): `[sounds] loop_result` reads as
+/// written, is `false` when absent, is written back only when `true`, and
+/// leaves an unknown `[sounds]` key refused.
+#[test]
+fn loop_result_reads_and_defaults_to_false() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    let load = |text: &str| {
+        fs::write(root.player_settings(), text).unwrap();
+        Settings::load(&root)
+    };
+    let on = load("[sounds]\nloop_result = true\n").unwrap();
+    assert!(on.player.sounds.loop_result);
+    assert!(!on.player.sounds.is_default());
+    save_settings(&root.player_settings(), &on.player).unwrap();
+    let text = fs::read_to_string(root.player_settings()).unwrap();
+    assert!(text.contains("loop_result = true"), "{text}");
+    assert_eq!(Settings::load(&root).unwrap().player, on.player);
+
+    let absent = load("[sounds]\nsound_root = ''\n").unwrap();
+    assert!(!absent.player.sounds.loop_result);
+    assert!(!SoundSettings::default().loop_result);
+    let off = load("[sounds]\nloop_result = false\n").unwrap();
+    assert!(off.player.sounds.is_default());
+    save_settings(&root.player_settings(), &off.player).unwrap();
+    let text = fs::read_to_string(root.player_settings()).unwrap();
+    assert!(!text.contains("sounds"), "{text}");
+
+    match load("[sounds]\nloop_result = true\nloop_select = true\n") {
+        Err(e @ SettingsError::InvalidPlayer(_)) => {
+            let e = Chain(&e).to_string();
+            assert!(
+                e.contains("[sounds] has no key loop_select;"),
+                "{e} lacks the key"
+            );
+        }
+        other => panic!("{other:?}"),
     }
 }
 
