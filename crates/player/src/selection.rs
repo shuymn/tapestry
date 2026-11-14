@@ -995,9 +995,10 @@ impl Selection {
     }
 
     /// Shows `text` on the page, the one way a notice is set: after the
-    /// notices set in the same look, in the order they were set, never in
-    /// place of one (design.md "Screen skins"); one an earlier look set,
-    /// which a page showed, is replaced ([`Screen::add_notice`]).
+    /// notices set since the page of a look that chose nothing last showed
+    /// the notice, in the order they were set, never in place of one
+    /// (design.md "Screen skins"); one that page showed is replaced
+    /// ([`Screen::add_notice`]).
     fn notice(&mut self, text: String) {
         if self.screen.add_notice(text) {
             self.preset_refusal = false;
@@ -1015,7 +1016,7 @@ impl Selection {
 
     /// Shows the chosen preset `name` and its file's `error`; once the
     /// shelf is `opened`, a refusal because it would not open is over, and
-    /// its notice goes once a look after the one that set it began.
+    /// its notice goes once a look's page showed it.
     fn presets(&mut self, name: String, error: Option<String>, opened: bool) {
         self.screen.set_preset(name, error);
         if opened && self.preset_refusal && self.screen.clear_notice() {
@@ -1025,9 +1026,9 @@ impl Selection {
     }
 
     /// Shows why `player.toml` could not be written (`error`), or nothing
-    /// once it was; a write that failed `now` replaces the refusal shown
-    /// when an earlier look set it. One set in the current look stays,
-    /// and the error shows once it goes.
+    /// once it was; a write that failed `now` replaces the refusal a
+    /// look's page showed. One set since stays, and the error shows once
+    /// it goes.
     fn save_error(&mut self, error: Option<&str>, now: bool) {
         if now && self.screen.clear_notice() {
             self.preset_refusal = false;
@@ -2462,10 +2463,6 @@ impl PlayerRig<'_> {
     /// and sends the page if it changed; the chart chosen, if one was.
     fn look(&mut self) -> Option<Pick> {
         let sel = self.selection.as_mut()?;
-        // The notices this look sets join each other, in the order set,
-        // and what an earlier look set gives way to them: each is taken
-        // once, and every one reaches the page.
-        sel.screen.begin_look();
         if sel.shelf.poll(Instant::now()) {
             sel.refresh();
         }
@@ -2569,6 +2566,10 @@ impl PlayerRig<'_> {
                 sel.notice(line);
             }
             sel.show(&self.render, images, None, now);
+            // The notices set since the last such page, each taken once and
+            // joined in the order set, are on this one; the next notice
+            // replaces them.
+            sel.screen.notice_shown();
             // The cursor's images, only with no choice in this pass, so no
             // selection job begins in the pass that chose (D2): the
             // request once the cursor rested, then the worker's step.
@@ -4382,7 +4383,6 @@ pub(crate) mod tests {
         let mut skin = SkinState::Ready;
         // One look's keys and gate, as `look` takes them.
         let choose = |sel: &mut Selection, skin: &mut SkinState, keys: &[MenuKey]| {
-            sel.screen.begin_look();
             for key in keys {
                 sel.menu.push(MenuInput::Key(*key));
             }
@@ -4395,6 +4395,9 @@ pub(crate) mod tests {
             };
             let admitted = sel.admit(chosen, skin, &render, images, TimeUs(0));
             assert!(began.elapsed() < Duration::from_secs(1), "a look waited");
+            if admitted.is_none() {
+                sel.screen.notice_shown();
+            }
             admitted
         };
 
@@ -6091,10 +6094,9 @@ pub(crate) mod tests {
     }
 
     /// A chart refused because the shelf would not open shows why on the
-    /// notice line; once the shelf opens, that notice goes, from the look
-    /// after the one that set it. Another refusal stays when the shelf
-    /// changes, and a folder that cannot be listed shows with a built-in
-    /// chosen.
+    /// notice line; once the shelf opens, that notice goes, once a look's
+    /// page showed it. Another refusal stays when the shelf changes, and a
+    /// folder that cannot be listed shows with a built-in chosen.
     #[test]
     fn a_preset_refusal_clears_once_the_shelf_opens() {
         let dir = tempfile::tempdir().unwrap();
@@ -6104,17 +6106,17 @@ pub(crate) mod tests {
         sel.presets("-".to_owned(), Some("mine.toml: broken".to_owned()), false);
         sel.refused(&chart, "a.bms: the preset cannot open".to_owned(), true);
         assert_eq!(notice(&sel), "a.bms: the preset cannot open");
-        // Opened in the look that set it: no page may have shown it yet.
+        // Opened before a look's page showed it: it stays for that page.
         sel.presets("mine".to_owned(), None, true);
         assert_eq!(notice(&sel), "a.bms: the preset cannot open");
-        sel.screen.begin_look();
+        sel.screen.notice_shown();
         sel.presets("-".to_owned(), Some("mine.toml: broken".to_owned()), false);
         assert_eq!(notice(&sel), "a.bms: the preset cannot open");
         sel.presets("mine".to_owned(), None, true);
         assert_eq!(notice(&sel), "");
         // A refusal of the chart itself is not the shelf's to clear.
         sel.refused(&chart, "a.bms: no adapter reads it".to_owned(), false);
-        sel.screen.begin_look();
+        sel.screen.notice_shown();
         sel.presets(
             "tapestry".to_owned(),
             Some("presets: denied".to_owned()),
@@ -6241,9 +6243,9 @@ pub(crate) mod tests {
     }
 
     /// A write of `player.toml` that failed shows on the select screen in
-    /// place of the refusal an earlier look set, and goes once the file is
-    /// written; a later refusal shows over it, and so does one the look of
-    /// the failed write set, until it goes.
+    /// place of the refusal a look's page showed, and goes once the file is
+    /// written; a later refusal shows over it, and so does one no page
+    /// showed yet, until it goes.
     #[test]
     fn a_save_error_replaces_the_refusal_until_written() {
         let dir = tempfile::tempdir().unwrap();
@@ -6252,7 +6254,7 @@ pub(crate) mod tests {
         let chart = dir.path().join("charts").join("a.bms");
         // The shelf would not open; a step opened it, and the write failed.
         sel.refused(&chart, "a.bms: the preset cannot open".to_owned(), true);
-        sel.screen.begin_look();
+        sel.screen.notice_shown();
         sel.presets("beatoraja-style".to_owned(), None, true);
         sel.save_error(Some("denied"), true);
         assert_eq!(notice(&sel), "player.toml を保存できません: denied");
@@ -6265,18 +6267,18 @@ pub(crate) mod tests {
         assert_eq!(notice(&sel), "player.toml を保存できません: denied");
         sel.save_error(None, false);
         assert_eq!(notice(&sel), "");
-        // A chart's refusal shows; a write that fails in a later look
-        // replaces it.
+        // A chart's refusal shows; a write that fails once a look's page
+        // showed it replaces it.
         sel.refused(&chart, "a.bms: no adapter reads it".to_owned(), false);
-        sel.screen.begin_look();
+        sel.screen.notice_shown();
         sel.save_error(Some("denied"), true);
         assert_eq!(notice(&sel), "player.toml を保存できません: denied");
-        // One that fails in the look of the refusal leaves it shown, and
+        // One that fails before that page leaves it for the page, and
         // shows once it goes.
         sel.refused(&chart, "a.bms: no adapter reads it".to_owned(), false);
         sel.save_error(Some("denied"), true);
         assert_eq!(notice(&sel), "a.bms: no adapter reads it");
-        sel.screen.begin_look();
+        sel.screen.notice_shown();
         sel.screen.clear_notice();
         assert_eq!(notice(&sel), "player.toml を保存できません: denied");
     }

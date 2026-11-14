@@ -628,13 +628,13 @@ pub struct SelectScreen {
     /// The order, by index into [`SORTS`].
     sort: usize,
     /// Why the chart last chosen or a skin was refused, until the next
-    /// choice: the notices set in one look, joined in the order they were
-    /// set ([`add_notice`](Self::add_notice)).
+    /// choice: the notices set since a look's page last showed one, joined
+    /// in the order they were set ([`add_notice`](Self::add_notice)).
     notice: Option<String>,
-    /// Whether `notice` was set in the current look
-    /// ([`begin_look`](Self::begin_look)), which nothing set or cleared
-    /// later in that look replaces: no page may have shown it yet.
-    look_notice: bool,
+    /// Whether `notice` was set since a look's page last showed it
+    /// ([`notice_shown`](Self::notice_shown)): nothing set or cleared
+    /// before that page replaces it.
+    unshown: bool,
     /// The chosen preset's name, for the title.
     preset: String,
     /// The chosen preset file's error, or why the shelf cannot open.
@@ -1024,24 +1024,24 @@ impl SelectScreen {
         self.preedit.clear();
     }
 
-    /// Shows `notice` as one an earlier look set, or nothing.
+    /// Shows `notice` as one a look's page showed, or nothing.
     #[cfg(test)]
     pub fn set_notice(&mut self, notice: Option<String>) {
         self.notice = notice;
-        self.look_notice = false;
+        self.unshown = false;
     }
 
-    /// Starts a look: the notice shown is from then on an earlier look's,
-    /// which the next notice replaces and a clear removes.
-    pub fn begin_look(&mut self) {
-        self.look_notice = false;
+    /// The page of a look that chose nothing carries the notice: from now
+    /// on the next notice replaces it, and a clear removes it.
+    pub fn notice_shown(&mut self) {
+        self.unshown = false;
     }
 
-    /// Shows `notice` after the ones set in the same look, joined with
-    /// " / " in the order they were set; one an earlier look set is
-    /// replaced. Whether it replaced one (or nothing).
+    /// Shows `notice` after the ones set since a look's page last showed
+    /// the notice, joined with " / " in the order they were set; one that
+    /// page showed is replaced. Whether it replaced one (or nothing).
     pub fn add_notice(&mut self, notice: String) -> bool {
-        let replaced = !self.look_notice;
+        let replaced = !self.unshown;
         match &mut self.notice {
             Some(shown) if !replaced => {
                 shown.push_str(" / ");
@@ -1049,14 +1049,14 @@ impl SelectScreen {
             }
             shown => *shown = Some(notice),
         }
-        self.look_notice = true;
+        self.unshown = true;
         replaced
     }
 
-    /// Clears the notice an earlier look set; one set in the current look
-    /// stays for its page. Whether it was cleared (or none showed).
+    /// Clears the notice a look's page showed; one set since stays for the
+    /// next. Whether it was cleared (or none showed).
     pub fn clear_notice(&mut self) -> bool {
-        if self.look_notice {
+        if self.unshown {
             return false;
         }
         self.notice = None;
