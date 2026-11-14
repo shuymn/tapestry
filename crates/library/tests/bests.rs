@@ -1358,19 +1358,18 @@ fn totals_records() -> Vec<(&'static str, PlayRecord)> {
 }
 
 /// `record` as a section-repeat round from `start_ms` to `end_ms`.
-fn with_section(mut record: PlayRecord, start_ms: i64, end_ms: i64) -> PlayRecord {
-    let mut round = section_round(record.clone());
-    if let PlayType::SectionRepeat(p) = &mut round.play_type {
+fn with_section(record: PlayRecord, start_ms: i64, end_ms: i64) -> PlayRecord {
+    let mut record = section_round(record);
+    if let PlayType::SectionRepeat(p) = &mut record.play_type {
         p.start = bms_model::TimeUs(start_ms * MS);
         p.end = bms_model::TimeUs(end_ms * MS);
     }
-    record.play_type = round.play_type;
     record
 }
 
 /// `TOTALS_CHART` at 1.5x, every note on time in real time.
 fn totals_at_speed() -> PlayRecord {
-    let mut record = at_speed();
+    let speed = Speed::FASTEST;
     let mut played = record_of(TOTALS_CHART, 0, totals_hits([Some(0); 4], Some(0)));
     played.events = played
         .events
@@ -1382,16 +1381,15 @@ fn totals_at_speed() -> PlayRecord {
         .collect();
     let dir = tempfile::tempdir().unwrap();
     let opts = bms_parser::LoadOptions {
-        speed: record.speed,
+        speed,
         ..bms_parser::LoadOptions::default()
     };
     let chart = bms_parser::load_bms(TOTALS_CHART.as_bytes(), dir.path(), &opts)
         .unwrap()
         .chart;
     played.chart.identity = chart.identity;
-    played.speed = record.speed;
-    record = played;
-    record
+    played.speed = speed;
+    played
 }
 
 /// The totals of the fixed records, by hand (`totals_records`).
