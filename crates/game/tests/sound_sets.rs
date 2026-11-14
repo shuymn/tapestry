@@ -389,9 +389,10 @@ fn resolution_follows_the_sources_order() {
     }
 }
 
-/// ST5: a candidate that is a folder, a link out of its folder or a FIFO is
+/// ST5: a candidate that is a folder or a link out of its folder is
 /// refused without being opened, named once, and the next location is
 /// tried; a kind whose every candidate is refused is silent, not missing.
+/// A FIFO is `sound_sets_fifo`'s.
 // Covers: T18
 #[test]
 fn refused_candidates_are_named_and_skipped() {
@@ -403,26 +404,10 @@ fn refused_candidates_are_named_and_skipped() {
     fs::create_dir_all(sound.join("scratch.wav")).unwrap();
     let out = put(&outside, "fail.wav");
     let linked = link_file(&sound.join("fail.wav"), &out).is_some();
-    #[cfg(unix)]
-    {
-        let status = std::process::Command::new("mkfifo")
-            .arg(sound.join("o-open.wav"))
-            .status()
-            .expect("this test needs `mkfifo`");
-        assert!(status.success());
-    }
-    for name in ["clear.wav", "fail.wav", "o-open.wav"] {
+    for name in ["clear.wav", "fail.wav"] {
         put(&defaults, name);
     }
-    let p = pick(Some(&sound), None, &defaults);
-    // Resolution opens nothing, so a FIFO cannot block it.
-    let (tx, rx) = std::sync::mpsc::channel();
-    std::thread::spawn(move || {
-        let _ = tx.send(resolve(&p, LINKS, &mut |_| false));
-    });
-    let r = rx
-        .recv_timeout(std::time::Duration::from_secs(10))
-        .expect("resolution blocked");
+    let r = resolve(&pick(Some(&sound), None, &defaults), LINKS, &mut |_| false);
     let csound = canon(&sound);
     let mut want: Vec<Refused> = vec![
         Refused {
@@ -442,13 +427,6 @@ fn refused_candidates_are_named_and_skipped() {
             why: Why::Escapes,
         });
         assert_eq!(found(&r, SystemKind::Fail).1, Source::Defaults);
-    }
-    if cfg!(unix) {
-        want.push(Refused {
-            path: csound.join("o-open.wav"),
-            why: Why::NotAFile,
-        });
-        assert_eq!(found(&r, SystemKind::OptionOpen).1, Source::Defaults);
     }
     let mut got = r.refused.clone();
     got.sort_by(|a, b| a.path.cmp(&b.path));
