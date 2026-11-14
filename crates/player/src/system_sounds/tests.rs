@@ -942,7 +942,7 @@ fn an_entry_waits_then_rerolls() {
 /// next entry picks B, whose `select` takes 300 ms to decode: stepped by
 /// hand, no step before B's install sounds `select` (A's stopped, B's not
 /// ready), and the step that installs B starts B's loop.
-// Source: SF-010
+// Source: SF-011
 #[cfg(feature = "dev-tools")]
 #[test]
 fn the_entry_loop_waits_for_its_pick() {

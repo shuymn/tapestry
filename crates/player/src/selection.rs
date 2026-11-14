@@ -660,7 +660,7 @@ impl Selection {
             Acted::Preset(step) => {
                 self.preset_steps.push_back(step);
                 // A preset step changes an option the screen shows.
-                // Source: SF-011
+                // Source: SF-012
                 self.cues.add(audio::SystemKind::OptionChange, 1);
                 None
             }
@@ -935,7 +935,7 @@ impl Selection {
         if self.screen.move_to(to) {
             self.dirty = true;
             let moved = u32::try_from(from.abs_diff(to)).unwrap_or(u32::MAX);
-            // Source: SF-011
+            // Source: SF-012
             self.cues.add(audio::SystemKind::Scratch, moved);
         }
         None
@@ -996,7 +996,7 @@ impl Selection {
         if self.feed.panels(level.read(), self.screen.searching(), now) {
             self.dirty = true;
         }
-        // Source: SF-011
+        // Source: SF-012
         self.cues.panel(self.shown_panel().is_some());
     }
 
@@ -2479,7 +2479,7 @@ impl PlayerRig<'_> {
         self.feed_settings();
         if let Some(sel) = &mut self.selection {
             sel.dirty = true;
-            // Source: SF-011
+            // Source: SF-012
             sel.cues.add(audio::SystemKind::OptionChange, changed);
         }
     }
@@ -4005,7 +4005,7 @@ impl AppRig for PlayerRig<'_> {
         } = self;
         let controls: &crate::controls::Controls = controls;
         if let Some(sounds) = system_sounds {
-            // Source: SF-010
+            // Source: SF-011
             sounds.enter_selection(&mut audio.control, || {
                 crate::play::run_ends(controls, input, failures)
             });
@@ -4197,7 +4197,7 @@ impl Selection {
         self.feed.enter(now);
         // The visit's cues from here, against no panel shown (a panel the
         // last visit left open is the feed's, not the baseline).
-        // Source: SF-011
+        // Source: SF-012
         self.cues.entered();
         self.loading = None;
         self.screen.end_composition();
@@ -4989,7 +4989,7 @@ pub(crate) mod tests {
     /// slider none. Entering a place sounds `f-open`, leaving it for its
     /// parent `f-close`, Back at Top or clearing a query none; an order
     /// step and a preset step `o-change` each.
-    // Source: SF-011
+    // Source: SF-012
     #[test]
     fn each_input_path_asks_for_its_cues() {
         use crate::pointer::PointerAct;
@@ -5093,7 +5093,7 @@ pub(crate) mod tests {
     /// again. Each entry's baseline is no panel: a panel held as selection
     /// was left closes nothing at the next entry when released meanwhile,
     /// and opens anew when still held.
-    // Source: SF-011
+    // Source: SF-012
     #[test]
     fn the_panel_cues_follow_the_panel_shown() {
         let dir = tempfile::tempdir().unwrap();

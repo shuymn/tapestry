@@ -1020,7 +1020,7 @@ fn stops(probe: &game::OutputProbe) -> [u64; audio::SYSTEM_KINDS] {
 /// stops every set sound, picks again and loops `select` from that pick:
 /// the first entry's from the startup pick A, the next entry's, after a
 /// choice, from B once it installs.
-// Source: SF-010
+// Source: SF-011
 #[test]
 fn each_entry_stops_rerolls_and_loops_its_pick() {
     let pick = Arc::new(AtomicUsize::new(0));
@@ -1060,7 +1060,7 @@ fn each_entry_stops_rerolls_and_loops_its_pick() {
 /// `select` at once, a loop still waiting for its generation included:
 /// with B's read blocked at the entry, the loop bound to B never sounds
 /// once B installs after the way out.
-// Source: SF-010
+// Source: SF-011
 #[test]
 fn leaving_selection_stops_the_loop() {
     for way in ["decision", "practice", "loading"] {
@@ -1202,7 +1202,7 @@ fn the_next_entry_stops_decide() {
 /// C24-5, C24-6, C24-8 through the rig's look: the keys a look drains ask
 /// for their cues, and the look starts each once, from the select screen's
 /// input to the audio thread's requests; a look with no input starts none.
-// Source: SF-011
+// Source: SF-012
 #[test]
 fn a_look_requests_its_cues() {
     use crate::select::MenuKey;

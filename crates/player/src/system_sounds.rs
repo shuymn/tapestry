@@ -531,7 +531,7 @@ impl SystemSounds {
     ) -> GenId {
         let id = self.repick(control, ends);
         if !self.entry_ended {
-            // Source: SF-010
+            // Source: SF-011
             self.start(control, SystemKind::Select, Some(id));
         }
         id

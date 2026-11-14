@@ -165,7 +165,7 @@ tests = [
 ]
 
 [[entry]]
-id = "SF-010"
+id = "SF-011"
 summary = "Selection's entry picks the sets again and loops their `select`"
 class = "rule"
 reason = """
@@ -187,7 +187,7 @@ tests = [
 ]
 
 [[entry]]
-id = "SF-011"
+id = "SF-012"
 summary = "Selection's cue sounds for the cursor, places, panels and options"
 class = "rule"
 reason = """

@@ -2141,7 +2141,7 @@ fn a_slot_or_row_without_its_bar_takes_no_click() {
 /// The wheel sounds `scratch` once for each row it moves; a click on a
 /// row, the list slider and a volume slider move or set without a sound;
 /// the order button and a cover switch sound `o-change`.
-// Source: SF-011
+// Source: SF-012
 #[test]
 fn the_wheel_sounds_a_row_a_notch() {
     use audio::SystemKind;
@@ -2203,7 +2203,7 @@ fn the_wheel_sounds_a_row_a_notch() {
 /// the ring takes 60 and refuses 10, counted; the choice's decision sound
 /// still finds its place, and sounds the installed set's `decide` once
 /// the audio thread runs again.
-// Source: SF-011
+// Source: SF-012
 #[test]
 fn a_choice_after_a_cue_burst_sounds_decide() {
     use crate::system_sounds::tests::{Fixture, wait};

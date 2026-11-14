@@ -1274,7 +1274,7 @@ impl SelectScreen {
                 } else {
                     (self.sort + n - 1) % n
                 };
-                // Source: SF-011
+                // Source: SF-012
                 cues.add(SystemKind::OptionChange, 1);
                 return Acted::Search;
             }
@@ -1285,7 +1285,7 @@ impl SelectScreen {
             MenuKey::Enter | MenuKey::Practice => {
                 let acted = self.act_on_row(key);
                 if acted == Acted::Search {
-                    // Source: SF-011
+                    // Source: SF-012
                     cues.add(SystemKind::FolderOpen, 1);
                 }
                 return acted;
@@ -1296,7 +1296,7 @@ impl SelectScreen {
                 let left = self.stack.len();
                 let acted = self.back();
                 if self.stack.len() < left {
-                    // Source: SF-011
+                    // Source: SF-012
                     cues.add(SystemKind::FolderClose, 1);
                 }
                 return acted;
@@ -1308,7 +1308,7 @@ impl SelectScreen {
         }
         self.cursor = to;
         self.scroll(CURSOR_LINE);
-        // Source: SF-011
+        // Source: SF-012
         cues.add(SystemKind::Scratch, 1);
         Acted::Changed
     }
