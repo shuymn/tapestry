@@ -72,8 +72,8 @@ pub use attempt::{
 pub use audio_loop::SnapshotPoint;
 pub use audio_loop::{
     AudioControl, AudioCounters, AudioCtl, AudioLoadError, AudioProbe, AudioWaitError, AudioWorker,
-    OutputProbe, Probed, SEQ_LIMIT, SWITCH_TIMEOUT, Switch, SwitchPoll, SystemInstallError,
-    SystemStartError, TERMINAL, TransportGate, audio_control,
+    OutputProbe, Probed, RESERVED_HEADROOM, SEQ_LIMIT, SWITCH_TIMEOUT, Switch, SwitchPoll,
+    SystemInstallError, SystemStartError, TERMINAL, TransportGate, audio_control,
 };
 pub use autoplay::{Autoplay, AutoplayError, schedule_iter};
 pub use bests::{

@@ -147,3 +147,19 @@ source = [
 ]
 sites = ["crates/bms-model/src/profile.rs"]
 tests = ["crates/bms-model/src/profile.rs::a_shown_object_lengthens_the_preview"]
+
+[[entry]]
+id = "SF-009"
+summary = "The decision sound at the decision screen's start, never stopped by it"
+class = "rule"
+reason = """
+A player hears the choice confirmed: the BGM set's `decide` (the tone when \
+the set has none) starts once as the decision screen begins, whichever \
+presentation draws, and the screen's end stops nothing, so the sound plays \
+on into loading."""
+source = ["src/bms/player/beatoraja/decide/MusicDecide.java:32-35 @beatoraja-0.8.9"]
+sites = ["crates/player/src/selection.rs"]
+tests = [
+    "crates/player/src/selection.rs::the_decision_screen_is_out_before_its_fence",
+    "crates/player/src/system_sounds/rig_tests.rs::decide_plays_on_into_loading",
+]

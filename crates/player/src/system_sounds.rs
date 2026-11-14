@@ -438,10 +438,6 @@ impl SystemSounds {
     /// whose number is refused latches the run; a decision sound then
     /// sounds the tone. It allocates and frees nothing.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "the triggers come with their screens")
-    )]
     pub fn start(&mut self, control: &mut AudioControl, kind: SystemKind, looped: Option<GenId>) {
         if self.latched.is_some() {
             if kind == SystemKind::Decide {

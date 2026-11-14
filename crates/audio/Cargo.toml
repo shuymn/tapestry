@@ -35,6 +35,11 @@ proptest.workspace = true
 tempfile.workspace = true
 toml.workspace = true
 
+[features]
+default = []
+# Development features. Never enabled in production builds (R3).
+dev-tools = []
+
 [[bench]]
 name = "loudness"
 harness = false
