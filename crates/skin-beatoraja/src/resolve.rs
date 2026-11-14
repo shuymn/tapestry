@@ -2,12 +2,15 @@
 //! for one set of enabled options, field by field, by the type each field
 //! expects.
 //!
-//! The source enables the wrappers only for the types it registers
-//! serializers for (`JsonSkinSerializer.java:34-97` at the `0.8.9` tag);
-//! of those the header reads `Property`, `Filepath` and `Offset` and their
-//! arrays. Every other field, `category` and option items included, is
-//! read literally or not at all: a wrapper there is an ordinary member and
-//! nothing it names is read.
+//! The wrappers expand in every top-level array and record the import
+//! reads ([`ARRAYS`], [`RECORDS`]) and, in the header, in `Property`,
+//! `Filepath` and `Offset` and their arrays: the types the source
+//! registers serializers for (`JsonSkinSerializer.java:34-97` at the
+//! `0.8.9` tag), and `bpmgraph`, `hiddenCover`, `liftCover` and `pmchara`,
+//! which it registers none for (design.md "Differences from the source",
+//! imported skins). Every other field, `category` and option items
+//! included, is read literally or not at all: a wrapper there is an
+//! ordinary member and nothing it names is read.
 //!
 //! - An array field (`ArraySerializer.read`, JsonSkinSerializer.java:278-
 //!   324): each item that is an object with `if` and `value` or `values`
@@ -678,10 +681,8 @@ pub fn resolve<'d>(
     })
 }
 
-/// The top-level fields the import reads, in [`Tables::arrays`] order.
-/// Every one has an array serializer (JsonSkinSerializer.java:73-97)
-/// except `bpmgraph`, `hiddenCover`, `liftCover` and `pmchara`, which are
-/// read literally ([`LITERAL`]).
+/// The top-level fields the import reads, in [`Tables::arrays`] order,
+/// each resolved as an array field.
 pub(crate) const ARRAYS: [&str; 22] = [
     "source",
     "font",
@@ -706,10 +707,6 @@ pub(crate) const ARRAYS: [&str; 22] = [
     "customEvents",
     "destination",
 ];
-
-/// The fields of [`ARRAYS`] with no array serializer: their items are
-/// records as written, no wrapper expanded.
-const LITERAL: [&str; 4] = ["bpmgraph", "hiddenCover", "liftCover", "pmchara"];
 
 /// The top-level records the import reads (`ObjectSerializer`), in
 /// [`Tables::records`] order.
@@ -758,9 +755,9 @@ pub(crate) struct Tables {
 
 impl Resolved<'_> {
     /// Resolves the fields the import reads with the options in `enabled`,
-    /// the same ones this resolution used: the registered arrays and
+    /// the same ones this resolution used: the top-level arrays and
     /// records, and each destination's `dst` (an `Animation[]` with its own
-    /// array serializer). Literal arrays keep their items as written.
+    /// array serializer).
     ///
     /// # Errors
     ///
@@ -787,19 +784,7 @@ impl Resolved<'_> {
             let Some(id) = r.def.arena.last_member(top, name) else {
                 continue;
             };
-            if LITERAL.contains(name) {
-                if r.def.arena.is_mixed(id) {
-                    return Err(r.def.mixed_error(id));
-                }
-                if r.def.arena.is_array(id) {
-                    let items: Vec<u32> = r.def.arena.children(id).collect();
-                    for item in items {
-                        r.emit(item, out)?;
-                    }
-                }
-            } else {
-                r.array(id, 2, out)?;
-            }
+            r.array(id, 2, out)?;
         }
         for (name, out) in RECORDS.iter().zip(&mut t.records) {
             if !read(name) {
