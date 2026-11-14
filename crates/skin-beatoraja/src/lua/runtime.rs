@@ -21,8 +21,10 @@
 //! - **Budgets.** One frame's callbacks share
 //!   [`limits::RUNTIME_INSTRUCTIONS`], [`limits::RUNTIME_HOST_CALLS`] and
 //!   [`limits::RUNTIME_FRAME_TIME`]; the VM's memory is capped at
-//!   [`limits::RUNTIME_MEMORY`]. A call past the budget, and every later
-//!   call that frame, gives its constant; after
+//!   [`limits::RUNTIME_MEMORY`]. A string result read as a number's
+//!   numeral is charged one instruction per byte before it is read, so
+//!   its read is within the frame's instructions. A call past the budget,
+//!   and every later call that frame, gives its constant; after
 //!   [`limits::RUNTIME_STOP_FRAMES`] such frames in a row, the memory cap,
 //!   or a panic, the runtime stops, every slot its constant from then on.
 //! - **Failures.** A callback that raises an ordinary error gives the
@@ -913,15 +915,11 @@ impl ScreenRuntime {
                 CallStatus::Skipped
             } else {
                 self.calls = self.calls.saturating_add(1);
-                let r = std::panic::catch_unwind(AssertUnwindSafe(|| f.call::<Value>(())));
+                let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    f.call::<Value>(()).and_then(|v| self.convert(site.ty, &v))
+                }));
                 match r {
-                    Ok(Ok(v)) => {
-                        let out = match site.ty {
-                            OutTy::Bool => i32::from(to_bool(&v)),
-                            OutTy::Int => to_int(&v),
-                            // Only a play program gives a timer or a float.
-                            OutTy::Timer | OutTy::Float => 0,
-                        };
+                    Ok(Ok(out)) => {
                         write(fields, base, k, out);
                         CallStatus::Ok
                     }
@@ -976,6 +974,29 @@ impl ScreenRuntime {
         } else {
             self.over_budget = 0;
         }
+    }
+
+    /// A call's result `v` as an output of type `ty` reads it. A string
+    /// read as a number's numeral is charged first, one instruction per
+    /// byte, to the frame's instruction budget, so a read past it fails as
+    /// the call would, with the frame's time checked first. The read is
+    /// a few linear passes (the grammar's scan, the standard library's
+    /// parse), under 1 ns a byte in a release build, where the average
+    /// instruction takes about 4 ns ([`limits::MAX_LUA_TIME`]); the
+    /// library's own numeral check meters each byte as Lua instructions.
+    fn convert(&self, ty: OutTy, v: &Value) -> mlua::Result<i32> {
+        Ok(match ty {
+            OutTy::Bool => i32::from(to_bool(v)),
+            OutTy::Int => {
+                if let Value::String(s) = v {
+                    let n = u64::try_from(s.as_bytes().len()).unwrap_or(u64::MAX);
+                    self.pass.ledger.instructions(&self._lua, n)?;
+                }
+                to_int(v)
+            }
+            // Only a play program gives a timer or a float.
+            OutTy::Timer | OutTy::Float => 0,
+        })
     }
 
     fn note(&self, note: RuntimeNote) {

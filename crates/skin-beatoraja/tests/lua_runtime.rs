@@ -881,6 +881,50 @@ fn a_runtime_string_value_is_read_as_a_numeral() {
     assert_eq!(outputs(&f), [12, -16, 0]);
 }
 
+/// A value's string is charged one instruction per byte before it is read
+/// as a numeral (design.md "Threat Model", T09): `"1."` and 8 MiB of
+/// zeros, built once at load, is past the frame's instructions, so its
+/// call gives its constant with the budget's status, unread, and after
+/// three such frames the runtime stops. With no time budget in the way,
+/// only the charge refuses it.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_long_numeral_string_is_charged_before_it_is_read() {
+    untimed();
+    let (_d, mut i) = import_in(&entry(
+        "local zeros = '0' for _ = 1, 23 do zeros = zeros .. zeros end local s = '1.' .. zeros zeros = nil",
+        &["function() return s end"],
+        "nil",
+    ));
+    let n = runtime(&mut i).outputs();
+    assert_eq!(n, 1);
+    let mut f = fields(n, &[]);
+    for frame in 0..3 {
+        assert_eq!(runtime(&mut i).stopped(), None, "{frame}");
+        runtime(&mut i).frame(&mut f, &[]);
+        assert_eq!(outputs(&f), [0], "{frame}");
+    }
+    assert_eq!(runtime(&mut i).stopped(), Some(Stopped::Budget));
+}
+
+/// A numeral string within the frame's instructions is read whole: 65 536
+/// leading zeros and `123`.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_numeral_string_within_the_budget_is_read_whole() {
+    untimed();
+    let (_d, mut i) = import_in(&entry(
+        "local z = '0' for _ = 1, 16 do z = z .. z end local s = z .. '123'",
+        &["function() return s end"],
+        "nil",
+    ));
+    let n = runtime(&mut i).outputs();
+    let mut f = fields(n, &[]);
+    runtime(&mut i).frame(&mut f, &[]);
+    assert_eq!(runtime(&mut i).status()[0], CallStatus::Ok);
+    assert_eq!(outputs(&f), [123]);
+}
+
 /// `text` with two image sets of one `dot` appended, chosen by `a` and
 /// `b`, each drawn by its own draw callback.
 #[cfg(feature = "dev-tools")]
