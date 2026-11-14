@@ -861,6 +861,29 @@ pub fn skin_jsons() -> Vec<Seed> {
         ("header_result", skin_input(&[r#"{"type": 7}"#])),
         ("size", skin_input(&[r#"{"type": 0, "w": 1366, "h": 768}"#])),
         (
+            "shared_id_judge",
+            play_skin(
+                r#""image": [{"id": "j", "src": "grid", "w": 4, "h": 4}],
+                "judge": [{"id": "j", "index": 0, "images": [], "numbers": []}],
+                "destination": [{"id": "j", "dst": [{"w": 10, "h": 10}]}]"#,
+            ),
+        ),
+        (
+            "shared_id_failure",
+            play_skin(
+                r#""customTimers": [{"id": 10000, "timer": 3}],
+                "slider": [{"id": "u", "src": "none", "w": 4, "h": 4}], "bga": {"id": "u"},
+                "destination": [{"id": "u", "timer": 10000, "dst": [{"w": 10, "h": 10}]}]"#,
+            ),
+        ),
+        (
+            "shared_id_failure_text",
+            play_skin(
+                r#""text": [{"id": "u", "font": "none"}], "bga": {"id": "u"},
+                "destination": [{"id": "u", "timer": 3, "dst": [{"w": 10, "h": 10}]}]"#,
+            ),
+        ),
+        (
             "syntax",
             skin_input(&[r#"{"type": 0, "property": [{} {}]}"#]),
         ),
@@ -1361,6 +1384,29 @@ pub fn skin_imports() -> Vec<Seed> {
             ),
         ),
         ("lanes", play_skin(&lanes_body())),
+        (
+            "shared_id_unselected",
+            play_skin(
+                r#""property": [{"name": "alt", "item": [{"name": "on", "op": 900}, {"name": "off", "op": 901}], "def": "on"}],
+                "image": [{"id": "g0", "src": "grid", "w": 4, "h": 4}],
+                "imageset": [{"id": "alt", "images": ["g0"]}],
+                "judge": [
+                    {"id": "j", "index": 0, "numbers": [],
+                     "images": [{"id": "g0", "dst": [{"x": 600, "y": 500, "w": 80, "h": 20}]}]},
+                    {"id": "alt", "index": 1, "images": [], "numbers": []}],
+                "destination": [
+                    {"id": "j", "dst": [{"w": 0, "h": 0}]},
+                    {"id": "alt", "op": [901], "dst": [{"w": 10, "h": 10}]}]"#,
+            ),
+        ),
+        (
+            "shared_id_unaddressed",
+            play_skin(
+                r#""image": [{"id": "b", "src": "grid", "w": 4, "h": 4}],
+                "judge": [{"id": {}}], "note": {"id": []},
+                "destination": [{"id": "b", "dst": [{"w": 10, "h": 10}]}]"#,
+            ),
+        ),
         (
             "lanes_overlap",
             play_skin(&lanes_body_over(OVERLAPPING_LANES)),
