@@ -903,6 +903,7 @@ fn a_long_numeral_string_is_charged_before_it_is_read() {
         assert_eq!(runtime(&mut i).stopped(), None, "{frame}");
         runtime(&mut i).frame(&mut f, &[]);
         assert_eq!(outputs(&f), [0], "{frame}");
+        assert_eq!(runtime(&mut i).status(), [CallStatus::Budget], "{frame}");
     }
     assert_eq!(runtime(&mut i).stopped(), Some(Stopped::Budget));
 }
