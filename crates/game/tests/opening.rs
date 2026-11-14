@@ -2340,8 +2340,12 @@ fn cancelled_audio_readiness_begins_no_preparation() {
             1,
             "{case}: {steps:?}"
         );
+        // Nothing of the attempt's preparation after audio's wait: no
+        // begin, poll, final readiness or commit.
         assert!(
-            !steps[audio..].contains(&"begin") && !steps.contains(&"commit"),
+            !steps[audio..]
+                .iter()
+                .any(|n| ["begin", "poll", "ready", "commit"].contains(n)),
             "{case}: {steps:?}"
         );
         assert_eq!(loaded.attempt().number, 0, "{case}");

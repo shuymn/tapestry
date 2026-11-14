@@ -200,7 +200,24 @@ fn a_signal_in_the_entrys_wait_ends_the_run_through_app_run() {
                 Box::new(|s: &game::Settings| game::Parts::unsaved(&s.player)),
                 Box::new(game::NoSessionEvents),
             );
-            let ran = app.run(rig);
+            // A run selection's looks would not end is closed after 10 s,
+            // so a missed entry's end fails below rather than hanging.
+            let controls = rig.controls;
+            let done = std::sync::atomic::AtomicBool::new(false);
+            let ran = std::thread::scope(|s| {
+                s.spawn(|| {
+                    let until = Instant::now() + Duration::from_secs(10);
+                    while !done.load(Ordering::Acquire) && Instant::now() < until {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    if !done.load(Ordering::Acquire) {
+                        controls.close();
+                    }
+                });
+                let ran = app.run(rig);
+                done.store(true, Ordering::Release);
+                ran
+            });
             match signal {
                 Signal::Input => {
                     assert!(matches!(ran, Err(LiveError::Input(_))), "{ran:?}");
