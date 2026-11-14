@@ -106,9 +106,9 @@ decision = "#534"
 reason = """
 Skins are authored against what the source draws for blend 3: it sets the \
 subtract equation and resets it to add before the element's quads draw, so \
-they draw additive. The quads queued before them, which its batch then \
-flushes under subtract, are its graphics library's batch state and keep \
-their own blend here."""
+they draw additive. The quads queued before them, which its batch flushes \
+under subtract when that changes its blend factors, are its graphics \
+library's batch state and keep their own blend here."""
 source = ["src/bms/player/beatoraja/skin/Skin.java:657-662 @beatoraja-0.8.9"]
 sites = ["crates/skin-beatoraja/src/import/mod.rs"]
 tests = ["crates/skin-beatoraja/tests/import_multiply.rs::blend_three_draws_additive"]

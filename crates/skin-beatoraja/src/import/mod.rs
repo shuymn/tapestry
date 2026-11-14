@@ -1587,8 +1587,9 @@ impl<'d> Cx<'d> {
         // nothing of its own: its parts keep their blend, so its own is
         // ignored. Blend 3 draws additive: the source sets the subtract
         // equation and resets it to add before its quads draw
-        // (`:657-662`); the quads queued before it, which its batch then
-        // flushes under subtract, keep their own blend here.
+        // (`:657-662`); the quads queued before it, which its batch
+        // flushes under subtract when that changes its blend factors, keep
+        // their own blend here.
         // Source: SF-006
         let blend = match dst.blend {
             2..=4 | 9 if o.neutral => {
