@@ -262,8 +262,8 @@ fn a_visualizer_past_its_caps_drops_with_a_note() {
     }
 }
 
-/// A hit-error visualizer's average weight that is not finite is the
-/// finite weight that steps alike: the skin imports with no note.
+/// A hit-error visualizer's average weight that is not finite imports
+/// with no note.
 #[test]
 fn an_infinite_average_weight_imports() {
     let (_d, skin, report) = json(
@@ -271,12 +271,11 @@ fn an_infinite_average_weight_imports() {
         r#"{"id": "he", "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#,
     );
     assert_eq!(notes(&report), []);
-    // The step of +40 saturates, `(long) (∞ · 40)`, to `Long.MAX_VALUE`;
-    // the average's line reads its low 32 bits (`intValue`), −1, so it is
-    // at column `150 + 1 = 151`.
+    // The step of +40, `∞ · 40`, holds the average at +2^53 ms, drawn at
+    // the judge width's early edge: column `150 − 150 = 0`.
     let q = visualized(skin, &[40]);
     let y = middle(&q);
-    assert_eq!(top(&q, 100.0 + 151.5, y), Some(rgba(0xff00_00ff)));
+    assert_eq!(top(&q, 100.0 + 0.5, y), Some(rgba(0xff00_00ff)));
 }
 
 /// 150 BPM, 300 from 1 s; notes at 0.1 to 0.5 s (five at 150, so MAIN)
@@ -436,9 +435,9 @@ fn a_null_colour_is_noted() {
 /// C31: a Lua string `alpha` is LuaJ's `tofloat()`: `"18446744073709551616"`
 /// scans as a wrapping `long`, 0, so the average stays at 0, its line on
 /// the centre's column 150 (drawn after the centre); `" 0.5 "` is 0.5, the
-/// average `⌊0.5 · 40⌋ = 20`, its line at 130. The same JSON string is
-/// `Float.parseFloat`, about 1.8e19: the step saturates to `Long.MAX_VALUE`,
-/// whose low 32 bits are −1, the line at 151.
+/// average `0.5 · 40 = 20`, its line at 130. The same JSON string is
+/// `Float.parseFloat`, about 1.8e19: the step holds the average at +2^53
+/// ms, the line at the judge width's early edge, column 0.
 #[test]
 fn a_lua_alpha_string_is_luaj_s_float() {
     let dst = "{ id = \"he\", dst = { { x = 100, y = 800, w = 301, h = 60 } } }";
@@ -460,12 +459,12 @@ fn a_lua_alpha_string_is_luaj_s_float() {
         r#"{"id": "he", "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#,
     );
     let q = visualized(skin, &[40]);
-    assert_eq!(top(&q, 100.0 + 151.5, middle(&q)), Some(rgba(0xff00_00ff)));
+    assert_eq!(top(&q, 100.0 + 0.5, middle(&q)), Some(rgba(0xff00_00ff)));
 }
 
 /// C31: a JSON string `alpha` is Java's `Float.parseFloat`: `0.5f`,
 /// `0x1p-1` and ` 0.5D ` are all 0.5, so the average after +40 ms is
-/// `⌊0.5 · 40⌋ = 20`, its line at `150 − 20 = 130`; `0.5ff` is no float,
+/// `0.5 · 40 = 20`, its line at `150 − 20 = 130`; `0.5ff` is no float,
 /// and the import refuses the field as the source's skin fails.
 #[test]
 fn a_json_alpha_string_is_java_s_float() {
@@ -664,7 +663,7 @@ fn timing_visualizer_colours_follow_the_source_s_two_readings() {
 
 /// C31: a hit-error visualizer's `hiterrorMode` 0 draws no line, and its
 /// `alpha` is a float in JSON, as a string, and in Lua: 0.5 steps the
-/// average by `⌊0.5 · 40⌋ = 20`, its line at `150 − 20 = 130`.
+/// average by `0.5 · 40 = 20`, its line at `150 − 20 = 130`.
 #[test]
 fn hit_error_lines_and_weight_read_as_the_source() {
     let dst = r#"{"id": "he", "dst": [{"x": 100, "y": 800, "w": 301, "h": 60}]}"#;

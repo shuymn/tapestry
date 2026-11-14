@@ -103,15 +103,13 @@ impl Ratio {
 }
 
 /// A volume as a selection skin shows it: the gain that plays,
-/// as an exact ratio for the sliders and graphs, and the number the
-/// source's system volume number draws, `(int)(gain · 100f)`: the `f32`
-/// product truncated toward zero, which is not always the exact floor
-/// (0.01 shows 1, 0.53 shows 52).
+/// as an exact ratio for the sliders and graphs, and its number, the
+/// whole percent of that ratio rounded half up (0.53 shows 53).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct VolumeReading {
     /// The gain, exactly ([`Ratio::of_f32`]).
     pub ratio: Ratio,
-    /// `(int)(gain · 100f)`.
+    /// The whole percent, rounded half up.
     pub number: i32,
 }
 
@@ -130,11 +128,11 @@ impl VolumeReading {
                 number: 0,
             };
         };
-        #[expect(
-            clippy::cast_possible_truncation,
-            reason = "the source's `(int)` cast: a gain from 0 to 1 gives 0 to 100"
-        )]
-        let number = (gain * 100.0) as i32;
+        // ⌊(200·n + d) / (2·d)⌋ with n ≤ d < 2^64: within `u128`, and at
+        // most 100 since the gain is at most 1.
+        let n = u128::from(ratio.numerator);
+        let d = u128::from(ratio.denominator);
+        let number = i32::try_from((200 * n + d) / (2 * d)).unwrap_or(0);
         Self { ratio, number }
     }
 }
@@ -539,24 +537,23 @@ mod tests {
         }
     }
 
-    /// The volume's number is the source's `(int)(gain · 100f)`, as its
-    /// own runtime gives it for each gain (a run of the source's
-    /// expression): not the exact floor where the `f32` product rounds up
-    /// to a whole number, nor where it rounds down below one.
+    /// The volume's number is the whole percent of the exact gain,
+    /// rounded half up: the `f32` nearest 0.53 is 0.529 999 97, 53 %.
     #[test]
-    fn the_volume_number_is_the_sources_truncated_f32_product() {
+    fn the_volume_number_is_the_whole_percent_rounded_half_up() {
         for (gain, number) in [
             (0.0_f32, 0),
             (0.01, 1),
+            (0.005, 0),
+            (0.015, 1),
             (0.07, 7),
-            (0.29, 29),
-            (0.45, 45),
+            (0.125, 13),
+            (0.375, 38),
             (0.5, 50),
-            (0.53, 52),
-            (0.57, 57),
-            (0.59, 58),
+            (0.53, 53),
+            (0.59, 59),
             (0.7649, 76),
-            (0.81, 81),
+            (0.995, 100),
             (1.0, 100),
         ] {
             let v = super::VolumeReading::of_gain(gain);

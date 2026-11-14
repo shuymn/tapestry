@@ -326,9 +326,9 @@ pub(crate) enum Value {
     /// tapestry's load, where the source averages its BGA's and audio's
     /// loaders.
     LoadPercent,
-    /// The chart's 1× length's minutes within the hour and seconds within
-    /// the minute (`chartlength_minute`, `chartlength_second`,
-    /// `:473-478`), from its notes' ends and its background sounds.
+    /// The chart's 1× length's whole minutes and seconds within the
+    /// minute (`chartlength_minute`, `chartlength_second`, `:473-478`),
+    /// from its notes' ends and its background sounds.
     LengthMinutes,
     LengthSeconds,
     /// The elapsed play time's minutes and seconds (`playtime_minute`,
@@ -528,7 +528,7 @@ impl Value {
             Self::BpmMain => "chart.main_bpm",
             Self::BpmNow => "bpm.current_x100 / 100",
             Self::LoadPercent => "load.percent",
-            Self::LengthMinutes => "chart.length_ms / 60000 % 60",
+            Self::LengthMinutes => "chart.length_ms / 60000",
             Self::LengthSeconds => "chart.length_ms / 1000 % 60",
             Self::ElapsedMinutes => "time.elapsed_s / 60",
             Self::ElapsedSeconds => "time.elapsed_s % 60",
@@ -1394,8 +1394,8 @@ mod tests {
                 1_163,
                 "chartlength_minute",
                 Value::LengthMinutes,
-                "chart.length_ms / 60000 % 60",
-                59,
+                "chart.length_ms / 60000",
+                35_791,
             ),
             (
                 1_164,
