@@ -25,7 +25,7 @@ fn chart() -> Chart {
 /// Four type-6 sliders on a 1 280 × 720 skin, one per angle (0 up, 1
 /// right, 2 down, 3 left), ranges 200 down and 300 across, each drawn at
 /// `x 100, y 300, 20 × 10`: in reference pixels `[150, 615, 30, 15]`,
-/// ranges `⌊1080 · 200 / 720⌋ = 300` and `⌊1920 · 300 / 1280⌋ = 450`.
+/// ranges `1080 · 200 / 720 = 300` and `1080 · 300 / 720 = 450`.
 const SLIDERS: &str = r#""slider": [
     {"id": "u", "src": "a", "w": 8, "h": 8, "type": 6, "angle": 0, "range": 200},
     {"id": "r", "src": "a", "w": 8, "h": 8, "type": 6, "angle": 1, "range": 300},
@@ -158,6 +158,24 @@ fn other_type_six_sliders_are_dropped() {
         == NoteKind::Unsupported {
             object: Object::Slider
         }));
+}
+
+/// A range scales exactly, as every length: range 7 of a 1 600×900 skin
+/// is `1080 · 7 / 900 = 8.4` reference pixels, so half the progress moves
+/// it 4.2.
+#[test]
+fn a_progress_range_is_exact_at_900() {
+    let l = import_sized(
+        [1_600, 900],
+        r#""slider": [{"id": "r", "src": "a", "w": 8, "h": 8, "type": 6, "angle": 1, "range": 7}],
+           "destination": [{"id": "r", "dst": [{"x": 100, "y": 300, "w": 20, "h": 10}]}]"#,
+        &[],
+    );
+    let mut d = Drawn::over(l.ok().skin.clone(), &chart());
+    let mut x = |ms| d.frame(ms, &[]).first().unwrap().rect[0];
+    let (still, moved) = (x(0), x(1_000));
+    assert_eq!(still, 120.0);
+    assert!((moved - still - 4.2).abs() < 1e-4, "{still} {moved}");
 }
 
 /// A Lua skin's type-6 slider takes the same path.

@@ -49,7 +49,7 @@ use crate::widget::bar::{BarGroupError, BarScratch, MAX_BAR_GROUPS};
 use crate::widget::bpm_graph::{BpmDraw, BpmGraph, BpmGraphDef, bpm_columns};
 use crate::widget::cover_paint::{
     CoverImage, CoverMotion, CoverPaint, CoverPaintDef, CoverPaintError, CoverTrim, PaintImage,
-    SliderRate, TrimOutcome,
+    SliderRate, TrimOutcome, range_within,
 };
 use crate::widget::digits::{Align, Digits, MAX_DIGIT_OFFSETS, Number, NumberDef, NumberError};
 use crate::widget::gauge::{Gauge, GaugeDef, GaugeDraw, GaugeError, Shown};
@@ -931,9 +931,11 @@ fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
             _ => None,
         };
         let slider = paint.and_then(|p| p.slider);
-        // The slider's reach toward each side: up, down, left, right.
+        // The slider's reach toward each side: up, down, left, right, its
+        // checked range rounded up.
         let [s_up, s_down, s_left, s_right] = slider.map_or([0; 4], |s| {
-            let r = i64::from(s.range);
+            let r = s.range.numerator.div_ceil(s.range.denominator.max(1));
+            let r = i64::try_from(r).unwrap_or(i64::MAX);
             match s.direction {
                 SliderDirection::Up => [r, 0, 0, 0],
                 SliderDirection::Down => [0, r, 0, 0],
@@ -1421,8 +1423,10 @@ fn check_image_choices(
 
 /// The paint checks of [`Skin::new`], every definition in order,
 /// referenced or not: its image or choice table exists, its slider's range
-/// is at most [`MAX_COORD`] and comes without a motion, a trim or a gate
-/// track, a gate track comes with a trim, its keys lie within
+/// has a denominator from 1 to
+/// [`MAX_RANGE_DENOMINATOR`](crate::MAX_RANGE_DENOMINATOR), is at most
+/// [`MAX_COORD`] and comes without a motion, a trim or a gate track, a
+/// gate track comes with a trim, its keys lie within
 /// ±[`MAX_COORD`] with no negative width or height, and a trim base lies
 /// within ±[`MAX_COORD`].
 fn check_cover_paints(w: &WidgetDefs, images: usize) -> Result<(), LoadError> {
@@ -1435,7 +1439,7 @@ fn check_cover_paints(w: &WidgetDefs, images: usize) -> Result<(), LoadError> {
             }
             CoverImage::Image(_) | CoverImage::Choice(_) => None,
         };
-        let range = p.slider.is_some_and(|s| i64::from(s.range) > max);
+        let range = p.slider.is_some_and(|s| !range_within(s.range));
         let slider_moves = p.slider.is_some()
             && (p.motion != CoverMotion::None
                 || p.trim != CoverTrim::None
@@ -1722,8 +1726,7 @@ fn check_selection_widgets(
     for (bar, b) in sel.ratio_bars.iter().enumerate() {
         let error = if frames(b.image).is_none() {
             Some(RatioBarError::UnknownImage)
-        } else if matches!(b.form, RatioForm::Slider { range, .. } if range > MAX_COORD.unsigned_abs())
-        {
+        } else if matches!(b.form, RatioForm::Slider { range, .. } if !range_within(range)) {
             Some(RatioBarError::Range)
         } else {
             None
@@ -1965,7 +1968,9 @@ impl Skin {
     /// image exists, its source is a play's ([`RatioSource::play`]: an element
     /// drawing one of another source is refused,
     /// [`LoadError::SourceKind`]) and a slider's range is at most
-    /// [`MAX_COORD`]. A play records no slider press.
+    /// [`MAX_COORD`] over a denominator from 1 to
+    /// [`MAX_RANGE_DENOMINATOR`](crate::MAX_RANGE_DENOMINATOR). A play
+    /// records no slider press.
     ///
     /// # Errors
     ///
@@ -2004,8 +2009,10 @@ impl Skin {
     /// [`MAX_PLACEMENTS`] placements and its center among them, every
     /// part's image, timer, font and strip exists, each visibility is a
     /// bool and each key lies within ±[`MAX_COORD`]; every ratio bar's
-    /// image exists and a slider's range is at most [`MAX_COORD`]. Each
-    /// song list element is charged its parts' visibilities once per slot,
+    /// image exists and a slider's range is at most [`MAX_COORD`] over a
+    /// denominator from 1 to
+    /// [`MAX_RANGE_DENOMINATOR`](crate::MAX_RANGE_DENOMINATOR). Each song
+    /// list element is charged its parts' visibilities once per slot,
     /// and its worst quads per slot.
     ///
     /// # Errors
@@ -5136,8 +5143,14 @@ impl Skin {
                                     SliderDirection::Up | SliderDirection::Down => sy,
                                     SliderDirection::Right | SliderDirection::Left => sx,
                                 } * canvas.scale();
-                                #[expect(clippy::cast_precision_loss, reason = "within ±2^20")]
-                                let range = range as f32 * axis;
+                                #[expect(
+                                    clippy::cast_precision_loss,
+                                    reason = "a checked range's terms are at most 2^28, exact"
+                                )]
+                                let range = f32_of(
+                                    range.numerator as f64 * f64::from(axis)
+                                        / range.denominator as f64,
+                                );
                                 record(
                                     slot,
                                     Target::Slider(Hit {

@@ -546,7 +546,10 @@ fn bar(form: RatioForm, source: RatioSource) -> RatioBarDef {
 fn ratio_bars_draw_the_exact_ratio() {
     let slider = |direction| RatioForm::Slider {
         direction,
-        range: 300,
+        range: skin_model::Ratio {
+            numerator: 300,
+            denominator: 1,
+        },
         changeable: false,
     };
     let mut fx = bar_skin(vec![
@@ -597,6 +600,67 @@ fn ratio_bars_draw_the_exact_ratio() {
     assert!(fx.batch.quads().is_empty());
 }
 
+/// A slider's range is exact: 401/2 at half moves it 100.25, and a press
+/// 100.25 along its travel gives half, where a floored 200 would draw at
+/// 100 and give 0.50125. A range past `MAX_COORD` or with a denominator
+/// outside 1 to `MAX_RANGE_DENOMINATOR` is refused.
+#[test]
+fn a_slider_range_is_exact() {
+    let slider = |numerator, denominator| {
+        bar(
+            RatioForm::Slider {
+                direction: SliderDirection::Right,
+                range: Ratio {
+                    numerator,
+                    denominator,
+                },
+                changeable: true,
+            },
+            RatioSource::ListPosition,
+        )
+    };
+    let mut fx = bar_skin(vec![slider(401, 2)]);
+    let mut v = view(Vec::new(), None);
+    v.position = ratio(1, 2);
+    fx.view(&v);
+    fx.frame(0);
+    let rects: Vec<[f32; 4]> = fx.batch.quads().iter().map(|q| q.rect).collect();
+    assert_eq!(rects, [[200.25, 100.0, 40.0, 20.0]]);
+    assert_eq!(
+        fx.skin.drag_at(&fx.sel, [200.25, 110.0], fx.target),
+        Some(SliderCommand {
+            source: RatioSource::ListPosition,
+            value: Ratio::new(skin_model::SLIDER_STEPS / 2, skin_model::SLIDER_STEPS).unwrap(),
+        })
+    );
+    let load_one = |bar| {
+        load(
+            vec![element(Source::RatioBar(0), [100, 100, 40, 20])],
+            WidgetDefs::default(),
+            SelectionDefs {
+                song_list: None,
+                pointer: Vec::new(),
+                ratio_bars: vec![bar],
+            },
+        )
+    };
+    let refused = |r: Result<Skin, LoadError>| {
+        matches!(
+            r,
+            Err(LoadError::RatioBar {
+                bar: 0,
+                error: skin_model::RatioBarError::Range
+            })
+        )
+    };
+    let max = u64::from(skin_model::MAX_COORD.unsigned_abs());
+    let top = skin_model::MAX_RANGE_DENOMINATOR;
+    assert!(refused(load_one(slider(1, 0))));
+    assert!(refused(load_one(slider(1, top + 1))));
+    assert!(refused(load_one(slider(2 * max + 1, 2))));
+    assert!(load_one(slider(top * max, top)).is_ok());
+}
+
 /// A press on a changeable slider's travel, as last built, gives the exact
 /// ratio under it, snapped at the ends; off the travel, on a slider that did
 /// not draw, one that is not changeable, or after a resize not yet drawn, it
@@ -605,7 +669,10 @@ fn ratio_bars_draw_the_exact_ratio() {
 fn a_slider_press_gives_a_command_and_changes_nothing() {
     let slider = |direction, changeable| RatioForm::Slider {
         direction,
-        range: 300,
+        range: skin_model::Ratio {
+            numerator: 300,
+            denominator: 1,
+        },
         changeable,
     };
     let src = RatioSource::ListPosition;
@@ -931,7 +998,10 @@ fn a_huge_rate_saturates() {
 fn the_topmost_slider_takes_the_press() {
     let slider = RatioForm::Slider {
         direction: SliderDirection::Right,
-        range: 300,
+        range: skin_model::Ratio {
+            numerator: 300,
+            denominator: 1,
+        },
         changeable: true,
     };
     let mut fx = bar_skin(vec![
@@ -961,7 +1031,10 @@ fn the_topmost_slider_takes_the_press() {
 fn a_state_belongs_to_its_skin() {
     let slider = RatioForm::Slider {
         direction: SliderDirection::Right,
-        range: 300,
+        range: skin_model::Ratio {
+            numerator: 300,
+            denominator: 1,
+        },
         changeable: true,
     };
     let make = || bar_skin(vec![bar(slider, RatioSource::ListPosition)]);

@@ -226,7 +226,10 @@ fn skin() -> Fx {
                     image: 4,
                     form: RatioForm::Slider {
                         direction: SliderDirection::Down,
-                        range: 300,
+                        range: skin_model::Ratio {
+                            numerator: 300,
+                            denominator: 1,
+                        },
                         changeable: true,
                     },
                     source: RatioSource::ListPosition,

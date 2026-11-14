@@ -19,8 +19,9 @@ use play_support::{Harness, MS, REGIONS, bool_program, full, lane, readouts_for}
 use skin_model::{
     Blend, ClipId, CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim, CycleDef,
     ElementDef, Follow, ImageChoiceDef, ImageChoicePart, ImageSpan, LANE_QUADS, LANE_RESERVED,
-    LaneView, LanesDef, Layout, LoadError, MAX_COORD, MAX_ELEMENTS, Native, PLAY, Place, Scope,
-    Skin, Slider, SliderDirection, SliderRate, TimerRef, Ty, Variant, WidgetDefs, compile, timer,
+    LaneView, LanesDef, Layout, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_RANGE_DENOMINATOR, Native,
+    PLAY, Place, Ratio, Scope, Skin, Slider, SliderDirection, SliderRate, TimerRef, Ty, Variant,
+    WidgetDefs, compile, timer,
 };
 
 /// A skin over `REGIONS` with `lanes`, `elements` and `widgets`.
@@ -89,11 +90,21 @@ fn offsets_and_sliders_add_their_motion() {
     assert_eq!(ys(&h), [-320.0, 0.0, 0.0]);
 }
 
-/// A slider of `range` moved by the progress toward `direction`.
+/// A slider of `range` whole reference pixels moved by the progress
+/// toward `direction`.
 fn progress_paint(range: u32, direction: SliderDirection) -> CoverPaintDef {
+    exact_progress_paint(u64::from(range), 1, direction)
+}
+
+/// A slider of `n / d` reference pixels moved by the progress toward
+/// `direction`.
+fn exact_progress_paint(n: u64, d: u64, direction: SliderDirection) -> CoverPaintDef {
     CoverPaintDef {
         slider: Some(Slider {
-            range,
+            range: Ratio {
+                numerator: n,
+                denominator: d,
+            },
             rate: SliderRate::Progress,
             direction,
         }),
@@ -535,6 +546,46 @@ fn chosen_paint_keeps_each_entry_track_and_native_size() {
     h.tally.combo = 2;
     h.frame(700, &[]);
     assert!(rects(&h, COVER).is_empty() && rects(&h, LIFT).is_empty());
+}
+
+/// A slider's range is exact: its denominator from 1 to
+/// `MAX_RANGE_DENOMINATOR` and its value at most `MAX_COORD`, checked
+/// before its reach, which is the range rounded up.
+#[test]
+fn a_slider_range_is_checked() {
+    let load = |elements: Vec<ElementDef>, n: u64, d: u64| {
+        let widgets = paints(vec![exact_progress_paint(n, d, SliderDirection::Down)]);
+        def(None, elements, widgets)
+    };
+    let refused = |r: Result<Skin, LoadError>| {
+        matches!(
+            r,
+            Err(LoadError::CoverPaint {
+                paint: 0,
+                error: CoverPaintError::Range
+            })
+        )
+    };
+    let p = |y: i32| paint(0, [0, y, 10, 10], Follow::NONE);
+    let max = u64::from(MAX_COORD.unsigned_abs());
+    let top = MAX_RANGE_DENOMINATOR;
+    // The denominator, before the reach divides by it.
+    assert!(refused(load(vec![p(0)], 1, 0)));
+    assert!(refused(load(vec![p(0)], 1, top + 1)));
+    assert!(load(vec![p(0)], 1, top).is_ok());
+    // The value: MAX_COORD + 1/2 is past it, MAX_COORD over 2 or over the
+    // largest denominator is not.
+    assert!(refused(load(Vec::new(), 2 * max + 1, 2)));
+    assert!(load(vec![p(0)], 2 * max, 2).is_ok());
+    assert!(load(vec![p(0)], top * max, top).is_ok());
+    assert!(refused(load(Vec::new(), top * max + 1, top)));
+    // The reach rounds up: MAX_COORD − 1/2 down from y 1 ends at
+    // MAX_COORD + 1/2, outside, which a floored reach would admit.
+    assert!(load(vec![p(0)], 2 * max - 1, 2).is_ok());
+    assert!(matches!(
+        load(vec![p(1)], 2 * max - 1, 2),
+        Err(LoadError::Coordinates { element: 0 })
+    ));
 }
 
 #[test]

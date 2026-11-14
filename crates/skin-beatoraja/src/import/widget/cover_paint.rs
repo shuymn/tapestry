@@ -34,8 +34,8 @@
 //! leave off, is dropped with a note unless it is failure presentation.
 
 use skin_model::{
-    CoverImage, CoverMotion, CoverPaintDef, CoverTrim, Follow, MAX_COORD, Native, ScreenKind,
-    Slider, SliderDirection, SliderRate, Source, Track,
+    CoverImage, CoverMotion, CoverPaintDef, CoverTrim, Follow, MAX_COORD, MAX_RANGE_DENOMINATOR,
+    Native, Ratio, ScreenKind, Slider, SliderDirection, SliderRate, Source, Track,
 };
 
 use super::super::geom::{HEIGHT, Q, Rect};
@@ -86,13 +86,17 @@ impl Cx<'_> {
         &mut self,
         c: Common,
         image: CoverImage,
-        range: Option<u32>,
+        range: Option<Ratio>,
         track: Track,
         native: Option<Native>,
     ) -> Result<(), ImportError> {
         let def = CoverPaintDef {
             image,
-            slider: range.map(Slider::sudden),
+            slider: range.map(|range| Slider {
+                range,
+                rate: SliderRate::Sudden,
+                direction: SliderDirection::Down,
+            }),
             motion: CoverMotion::None,
             trim: CoverTrim::None,
             gate_track: None,
@@ -157,7 +161,7 @@ impl Cx<'_> {
         rec: u32,
         s: &SrcImage,
         role: Role,
-        range: Option<u32>,
+        range: Option<Ratio>,
     ) -> Result<(), ImportError> {
         self.cover_paint_with(dst, role, range, |cx, c| cx.paint_image(c, rec, s))
     }
@@ -169,7 +173,7 @@ impl Cx<'_> {
         &mut self,
         dst: Dst,
         role: Role,
-        range: Option<u32>,
+        range: Option<Ratio>,
         paint: impl FnOnce(&mut Self, &Common) -> Result<Option<Painted>, ImportError>,
     ) -> Result<(), ImportError> {
         let Some(c) = self.image_common(&dst, true, role)? else {
@@ -412,15 +416,23 @@ impl Cx<'_> {
         self.cover_paint_image(dst, rec, &s, role, Some(r))
     }
 
-    /// A slider's range `range` (0 or more) in reference pixels:
-    /// `⌊1080 · range / height⌋`, at most `MAX_COORD`. Every size the
-    /// importer takes is 16:9, so the source's width scale for a
-    /// horizontal slider is the same ratio.
-    fn slider_range(&self, at: Span, range: i32) -> Result<u32, ImportError> {
-        (HEIGHT * i128::from(range))
-            .checked_div(i128::from(self.height))
-            .and_then(|r| u32::try_from(r).ok())
-            .filter(|&r| i128::from(r) <= i128::from(MAX_COORD))
+    /// A slider's range `range` (0 or more) in reference pixels, scaled
+    /// exactly as every length is: `1080 · range / height`, at most
+    /// `MAX_COORD`, else a range error. Every size the importer takes is
+    /// 16:9, so a horizontal slider's width scale is the same ratio, and
+    /// its reduced denominator is 1, 2, 4 or 5. Play's sliders and
+    /// selection's take it alike.
+    pub(in crate::import) fn slider_range(
+        &self,
+        at: Span,
+        range: i32,
+    ) -> Result<Ratio, ImportError> {
+        Q::new(HEIGHT * i128::from(range), i128::from(self.height))
+            .and_then(Q::ratio)
+            .filter(|r| {
+                r.denominator <= MAX_RANGE_DENOMINATOR
+                    && r.numerator <= u64::from(MAX_COORD.unsigned_abs()) * r.denominator
+            })
             .ok_or_else(|| self.range(at, "range"))
     }
 
