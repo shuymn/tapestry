@@ -1093,8 +1093,8 @@ pub(crate) mod tests {
         s.crash();
         for i in [1, 22, 333] {
             run(&s.logs, i);
-            assert!(!fs::symlink_metadata(&log).unwrap().is_symlink());
             s.assert_quarantined(i, b"a sound");
+            assert!(!fs::symlink_metadata(&log).unwrap().is_symlink());
         }
     }
 
