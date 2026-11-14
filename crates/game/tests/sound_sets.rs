@@ -1504,7 +1504,9 @@ fn a_fresh_file_never_writes_through_a_link() {
 
     let written = |name: &str| {
         let path = logs.join(name);
-        let mut file = game::create_fresh(&path).unwrap();
+        let made = game::create_fresh(&path);
+        assert!(made.is_ok(), "{name}: no new file: {made:?}");
+        let mut file = made.unwrap();
         io::Write::write_all(&mut file, b"run 1\n").unwrap();
         drop(file);
         assert!(!is_link(&path), "{name} is still a link");
@@ -1562,8 +1564,10 @@ fn a_lock_never_lands_on_another_file() {
     let kept = fs::read(&scratch).unwrap();
     let locked = |name: &str| {
         let path = locks.join(name);
-        let file = game::open_lock(&path, LINKS).unwrap();
-        file.try_lock().unwrap();
+        let opened = game::open_lock(&path, LINKS);
+        assert!(opened.is_ok(), "{name}: no lock file: {opened:?}");
+        let file = opened.unwrap();
+        assert!(file.try_lock().is_ok(), "{name}: not locked");
         assert!(!is_link(&path), "{name} is still a link");
         file
     };
