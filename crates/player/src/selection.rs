@@ -6518,6 +6518,7 @@ pub(crate) mod tests {
             }),
             clear: true,
             ineligible: None,
+            sums: library::Sums::default(),
         };
         sel.shelf.best_writer().unwrap().ingest(&c).unwrap();
         // Unchanged until selection is entered.

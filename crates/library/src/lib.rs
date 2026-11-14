@@ -56,9 +56,11 @@
 //!   requested, completed)`: the interpretation the bests were derived under
 //!   ([`Tuple`]), and the catch-up counters.
 //! - `scores(preset_sha256, ln_mode, chart_sha256, plays, clears, best_ex,
-//!   best_bp, best_combo, cleared, full_combo, play_sha256, play)`: one
+//!   best_bp, best_combo, cleared, full_combo, play_sha256, play,
+//!   sum_perfect, sum_great, sum_good, sum_bad, sum_poor, sum_play_us)`: one
 //!   [`Score`] per [`Key`], the best play's [`Breakdown`] in `play`
-//!   ([`BREAKDOWN_BYTES`]). Its layout belongs to [`BESTS_VERSION`], not to
+//!   ([`BREAKDOWN_BYTES`]), and the [`Sums`] of every play counted under
+//!   the key, which [`Library::totals`] adds over every key. Its layout belongs to [`BESTS_VERSION`], not to
 //!   the schema version: opening a database of another bests tuple creates
 //!   the table again, unread, so a change of its columns scans no chart.
 //! - `counted(path, body_sha256, size, mtime_ns)`: each play counted
@@ -106,6 +108,11 @@
 #[cfg(test)]
 extern crate self as library;
 
+// That fixture, shared by the unit tests of the bests and of their phase.
+#[cfg(test)]
+#[path = "../tests/common/mod.rs"]
+mod test_common;
+
 mod bests;
 mod db;
 mod loudness;
@@ -127,7 +134,7 @@ use rusqlite::Connection;
 
 pub use bests::{
     BESTS_VERSION, BREAKDOWN_BYTES, Best, Breakdown, Contribution, Ineligible, Ingested, Key,
-    LN_MODE, PlayId, Score, Verified, counts_for_best, ineligible,
+    LN_MODE, PlayId, Score, Sums, Totals, Verified, counts_for_best, ineligible,
 };
 pub use bms_model::ChartSummary;
 pub use bms_parser::{ChartMode, Header};
@@ -511,6 +518,18 @@ impl BestWriter {
         bests::score(&self.conn, key).map_err(|e| self.database(e))
     }
 
+    /// The player's totals over every key, on this writer's connection: a
+    /// result's read after its play was counted (design.md "Personal
+    /// Bests", skin projections).
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when SQLite refuses the query, a stored
+    /// count or sum is negative or a total overflows.
+    pub fn totals(&self) -> Result<Totals, LibraryError> {
+        bests::totals(&self.conn).map_err(|e| self.database(e))
+    }
+
     /// Requests a catch-up ([`Library::request_bests_pass`]).
     ///
     /// # Errors
@@ -622,6 +641,17 @@ impl Library {
         ln_mode: i64,
     ) -> Result<HashMap<[u8; 32], Score>, LibraryError> {
         bests::scores(&self.reader, preset_sha256, ln_mode).map_err(|e| self.database(e))
+    }
+
+    /// The player's totals over every key, every preset and LN mode
+    /// included: one query (design.md "Personal Bests").
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when SQLite refuses the query, a stored
+    /// count or sum is negative or a total overflows.
+    pub fn totals(&self) -> Result<Totals, LibraryError> {
+        bests::totals(&self.reader).map_err(|e| self.database(e))
     }
 
     /// The loudness measured under `key`, if one is stored.
