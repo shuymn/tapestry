@@ -1133,13 +1133,24 @@ impl Selection {
                     }
                 }
             }
-            let mut update = self.feed.update(&self.screen, page, now);
-            let graphs = self.graphs.sync(self.screen.selected(), &self.shelf);
-            if let Some(selected) = update.view.selected.as_mut() {
-                selected.graphs = graphs;
-            }
-            render.show_selection(update);
+            render.show_selection(self.update_of(page, now));
         }
+    }
+
+    /// The update of the screen showing `page` at `now`
+    /// ([`SkinFeed::update`](crate::selection_skin::SkinFeed::update)),
+    /// with the cursor's chart's graphs read for it.
+    pub(crate) fn update_of(
+        &mut self,
+        page: crate::menu_screen::MenuPage,
+        now: TimeUs,
+    ) -> crate::selection_skin::SelectionUpdate {
+        let mut update = self.feed.update(&self.screen, page, now);
+        let graphs = self.graphs.sync(self.screen.selected(), &self.shelf);
+        if let Some(selected) = update.view.selected.as_mut() {
+            selected.graphs = graphs;
+        }
+        update
     }
 
     /// A scenario's `decision = "skin"` step due (dev-tools): done once the

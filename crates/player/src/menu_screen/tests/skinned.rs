@@ -799,3 +799,191 @@ fn the_selection_image_options_agree_in_frames_callbacks_and_conditions() {
     let q = frame(&mut screen, &mut logic, &u, false, Some(absent), 5);
     check(&q, false, false, "absent");
 }
+
+/// V10 (design.md "Scope of No Allocation"): every selection frame's build
+/// with the cursor's chart's graphs allocates and frees nothing, and each
+/// owner of a chart's `Arc<ChartGraphs>` releases it at its own site,
+/// outside any build. The game side is the real select screen over a
+/// scanned library with charts A and B, its graph cache read through
+/// [`update_of`](crate::selection::Selection::update_of); the updates pass
+/// through a [`SelectionSlot`](crate::selection_skin::SelectionSlot), and
+/// the render side's take (the held update replaced), view and build run on
+/// a WARP menu screen. A `Weak` per chart witnesses its graphs:
+///
+/// - partial releases keep A alive: a pending update for A superseded
+///   while A shows, and the skin's state made afresh (an installation
+///   rebuilt) with the cursor still on A, whose old pixmaps are freed
+///   outside the build and whose new ones are prepared from the same
+///   graphs;
+/// - retirements destroy them: the cursor moving from A to B, B's update
+///   taken; from B to the all-charts row; and leaving selection.
+///
+/// The free counter's positive control: a `Box` dropped is one free.
+#[test]
+fn selection_previews_dealloc_alloc() {
+    use std::sync::{Arc, Weak};
+
+    use skin_model::ChartGraphs;
+
+    use crate::alloc_count::{this_thread, this_thread_frees};
+    use crate::select::MenuKey;
+    use crate::selection::Selection;
+    use crate::selection::tests::{keys, over};
+    use crate::selection_skin::SelectionSlot;
+
+    /// The counts of `f` on this thread: allocations and frees.
+    fn counts(f: impl FnOnce()) -> (u64, u64) {
+        let before = (this_thread(), this_thread_frees());
+        f();
+        (this_thread() - before.0, this_thread_frees() - before.1)
+    }
+
+    /// The screen's update, offered to `slot`: its chart's graphs, if any.
+    fn publish(sel: &mut Selection, slot: &mut SelectionSlot) -> Option<Weak<ChartGraphs>> {
+        let page = sel.screen.page("");
+        let u = sel.update_of(page, TimeUs(0));
+        let graphs = u
+            .view
+            .selected
+            .as_ref()
+            .and_then(|c| c.graphs.as_ref())
+            .map(Arc::downgrade);
+        slot.offer(u);
+        graphs
+    }
+
+    /// The render side's frame `k`: the take (the held update replaced)
+    /// and the view, then the build, counted: none of either. Its quads.
+    fn frame(
+        screen: &mut MenuScreen,
+        logic: &mut SelectionLogic,
+        shown: &mut Option<Box<SelectionUpdate>>,
+        slot: &mut SelectionSlot,
+        k: i64,
+    ) -> Vec<[f32; 4]> {
+        let taken = slot.take();
+        let changed = taken.is_some();
+        if let Some(u) = taken {
+            *shown = Some(u);
+        }
+        let u = shown.as_ref().unwrap();
+        screen
+            .prepare_selection(u, logic, changed)
+            .unwrap()
+            .unwrap();
+        let built = counts(|| {
+            screen
+                .build_selection_frame(u, logic, TimeUs(k * 16_667), app(k))
+                .unwrap();
+        });
+        assert_eq!(built, (0, 0), "frame {k}");
+        let quads = screen.renderer.selection_quads().unwrap();
+        screen.renderer.submit_selection(&[]).unwrap();
+        quads.iter().map(|q| q.rect).collect()
+    }
+
+    /// The cursor's chart's file name.
+    fn on(sel: &Selection) -> Option<String> {
+        sel.screen
+            .selected()
+            .and_then(|e| e.path.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+    }
+
+    let _warp = crate::warp_turn::take();
+    let (_skin, mut screen, mut logic, _) =
+        skinned_with(warp(), crate::selection_skin::graphs_fixture(), "s.json");
+    let lib = tempfile::tempdir().unwrap();
+    let root = lib.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    for (name, body) in [
+        (
+            "a.bms",
+            "#TITLE a\n#BPM 120\n#00118:0101\n#00103:F0\n#00119:01\n",
+        ),
+        (
+            "b.bms",
+            "#TITLE b\n#BPM 150\n#00118:01\n#00103:64\n#00119:010101\n",
+        ),
+    ] {
+        std::fs::write(root.join(name), body).unwrap();
+    }
+    let (mut sel, _) = over(lib.path(), vec![root]);
+    sel.feed.window = Some((3, 7));
+    sel.feed.enter(TimeUs(0));
+    let mut slot = SelectionSlot::default();
+    slot.enter(sel.feed.published().0);
+    let mut shown: Option<Box<SelectionUpdate>> = None;
+    // The cursor onto A.
+    while on(&sel).as_deref() != Some("a.bms") {
+        keys(&mut sel, &[MenuKey::Down]);
+    }
+    let a = publish(&mut sel, &mut slot).expect("A's graphs");
+    let a_quads = frame(&mut screen, &mut logic, &mut shown, &mut slot, 1);
+    assert!(a.upgrade().is_some());
+    // A pending update for A superseded while A shows: the pending owner
+    // goes at the offer, A stays.
+    assert!(publish(&mut sel, &mut slot).is_some_and(|w| w.ptr_eq(&a)));
+    let (_, freed) = counts(|| {
+        assert!(publish(&mut sel, &mut slot).is_some_and(|w| w.ptr_eq(&a)));
+    });
+    assert!(freed > 0, "the superseded update is freed at the offer");
+    assert!(a.upgrade().is_some());
+    assert_eq!(
+        frame(&mut screen, &mut logic, &mut shown, &mut slot, 2),
+        a_quads
+    );
+    // The skin's state made afresh with the cursor on A, as an
+    // installation rebuilt: the old pixmaps are freed here, the new ones
+    // prepared from A's graphs at the view, and A stays.
+    let bundle = Arc::clone(&logic.bundle);
+    let fresh = SelectionLogic::new(&bundle, 2);
+    let (_, freed) = counts(|| logic = fresh);
+    assert!(freed > 0, "the old state's pixmaps");
+    assert!(a.upgrade().is_some());
+    assert_eq!(
+        frame(&mut screen, &mut logic, &mut shown, &mut slot, 3),
+        a_quads
+    );
+    assert!(a.upgrade().is_some());
+    // A to B: the cache moves to B at the update; the displayed update
+    // and the pixmaps' source go at B's take and view. A is gone, outside
+    // the build.
+    keys(&mut sel, &[MenuKey::Down]);
+    assert_eq!(on(&sel).as_deref(), Some("b.bms"));
+    let b = publish(&mut sel, &mut slot).expect("B's graphs");
+    assert!(!b.ptr_eq(&a));
+    assert!(a.upgrade().is_some(), "the displayed update still holds A");
+    assert_ne!(
+        frame(&mut screen, &mut logic, &mut shown, &mut slot, 4),
+        a_quads
+    );
+    assert!(a.upgrade().is_none(), "A retired");
+    assert!(b.upgrade().is_some());
+    // B to the all-charts row: no chart, so no graphs anywhere.
+    while on(&sel).is_some() {
+        keys(&mut sel, &[MenuKey::Up]);
+    }
+    assert!(publish(&mut sel, &mut slot).is_none());
+    assert!(b.upgrade().is_some(), "the displayed update still holds B");
+    frame(&mut screen, &mut logic, &mut shown, &mut slot, 5);
+    assert!(b.upgrade().is_none(), "B retired");
+    // Back on A, then selection left: the cache clears, the slot empties
+    // and the render side drops what it held.
+    while on(&sel).as_deref() != Some("a.bms") {
+        keys(&mut sel, &[MenuKey::Down]);
+    }
+    let a = publish(&mut sel, &mut slot).expect("A's graphs again");
+    frame(&mut screen, &mut logic, &mut shown, &mut slot, 6);
+    assert!(a.upgrade().is_some());
+    sel.graphs.clear();
+    slot.leave();
+    assert!(a.upgrade().is_some(), "the render side still holds A");
+    shown = None;
+    drop(logic);
+    assert!(shown.is_none());
+    assert!(a.upgrade().is_none(), "A retired on leaving");
+    // The positive control: a free counts.
+    let boxed = std::hint::black_box(Box::new(7_u64));
+    assert_eq!(counts(|| drop(boxed)).1, 1);
+}
