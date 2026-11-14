@@ -892,3 +892,194 @@ fn schema_8_reads_image_names_again() {
         })]
     );
 }
+
+/// Fixture A as a file: 240 BPM, so a measure is a second, holding 5, 13,
+/// 11 and 10 key taps, `#TOTAL 200`.
+const PREVIEWED: &str = "#BPM 240\n#TOTAL 200\n#00011:0101010101\n\
+     #00111:01010101010101010101010101\n#00211:0101010101010101010101\n\
+     #00311:01010101010101010101\n";
+
+fn rows_in(db: &std::path::Path, table: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    conn.query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+        .unwrap()
+}
+
+/// The scan stores each chart's previewed values and its profile, the
+/// loader's, stamped with the file it was read from.
+#[test]
+fn the_scan_stores_each_charts_previews() {
+    let fx = Fixture::new();
+    let path = fx.write("a.bms", PREVIEWED.as_bytes());
+    let (lib, _) = fx.open();
+    scan(&lib, std::slice::from_ref(&fx.root));
+    let entry = lib.charts().unwrap().remove(0);
+    assert_eq!(
+        entry.info,
+        Some(library::ChartInfoView {
+            key_taps: 39,
+            key_longs: 0,
+            scratch_taps: 0,
+            scratch_longs: 0,
+            density_peak: 13,
+            density_end: 10,
+            density_end_hundredths: 50,
+            density_average: 9,
+            density_average_hundredths: 75,
+            total: 200,
+            main_bpm: Some(240),
+        })
+    );
+    let stored = lib.profile(&entry).unwrap().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let loaded = bms_parser::load_bms(
+        PREVIEWED.as_bytes(),
+        dir.path(),
+        &bms_parser::LoadOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(stored.bins, loaded.profile.bins());
+    assert_eq!(stored.bin_seconds, loaded.profile.bin_seconds());
+    assert_eq!(
+        stored.rows.as_deref(),
+        Some(loaded.profile.speeds().to_vec().as_slice())
+    );
+    let taps: Vec<_> = stored.bins.iter().map(|b| b[bms_model::KEY_TAP]).collect();
+    assert_eq!(taps, [5, 13, 11, 10, 0]);
+
+    // Another file's stamp, or another loader's, is no profile.
+    let mut other = entry.clone();
+    other.sha256[0] ^= 1;
+    assert_eq!(lib.profile(&other).unwrap(), None);
+    {
+        let conn = rusqlite::Connection::open(fx.db()).unwrap();
+        conn.execute("UPDATE profiles SET loader = loader + 1", [])
+            .unwrap();
+    }
+    assert_eq!(lib.profile(&entry).unwrap(), None);
+
+    // A changed file is read again, its values and profile with it.
+    fs::write(&path, "#BPM 240\n#00011:0101\n").unwrap();
+    scan(&lib, std::slice::from_ref(&fx.root));
+    let entry = lib.charts().unwrap().remove(0);
+    let info = entry.info.unwrap();
+    assert_eq!((info.key_taps, info.density_peak, info.total), (2, 2, 260));
+    let stored = lib.profile(&entry).unwrap().unwrap();
+    assert_eq!(stored.bins.len(), 2);
+}
+
+/// A refused seed-0 branch keeps its chart row, listed, with no values and
+/// no profile row; only a removed file's row goes, its profile with it.
+#[test]
+fn a_refused_branch_keeps_its_row_without_previews() {
+    let fx = Fixture::new();
+    let path = fx.write("a.bms", PREVIEWED.as_bytes());
+    let (lib, _) = fx.open();
+    scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!(rows_in(&fx.db(), "profiles"), 1);
+    // Seed 0 draws 2 from `#RANDOM 2`, whose branch the loader refuses.
+    let branch = "#BPM 120\n#00111:01\n#00138:01\n#RANDOM 2\n#IF 2\n#LNTYPE 2\n#ENDIF\n";
+    fs::write(&path, branch).unwrap();
+    scan(&lib, std::slice::from_ref(&fx.root));
+    let entries = lib.charts().unwrap();
+    assert_eq!(entries.len(), 1, "still listed");
+    assert_eq!(entries[0].info, None);
+    assert_eq!(lib.profile(&entries[0]).unwrap(), None);
+    assert_eq!(rows_in(&fx.db(), "profiles"), 0, "the profile row goes");
+
+    fs::write(&path, PREVIEWED).unwrap();
+    scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!(rows_in(&fx.db(), "profiles"), 1);
+    fs::remove_file(&path).unwrap();
+    scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!(lib.charts().unwrap(), Vec::new());
+    assert_eq!(rows_in(&fx.db(), "profiles"), 0, "removed with its chart");
+}
+
+/// A file of schema 9, the version before the previews, is rebuilt: its
+/// charts are read again, with their values and profiles.
+#[test]
+fn schema_9_reads_previews_again() {
+    let fx = Fixture::new();
+    fx.write("a.bms", PREVIEWED.as_bytes());
+    {
+        let (lib, _) = fx.open();
+        scan(&lib, std::slice::from_ref(&fx.root));
+    }
+    {
+        let old = rusqlite::Connection::open(fx.db()).unwrap();
+        let mut drop = String::from("DROP TABLE profiles;");
+        for column in [
+            "key_taps",
+            "key_longs",
+            "scratch_taps",
+            "scratch_longs",
+            "density_peak",
+            "density_end",
+            "density_end_x100",
+            "density_average",
+            "density_average_x100",
+            "gauge_total",
+            "main_bpm",
+        ] {
+            drop.push_str(&format!("ALTER TABLE charts DROP COLUMN {column};"));
+        }
+        drop.push_str("PRAGMA user_version = 9;");
+        old.execute_batch(&drop).unwrap();
+    }
+    let (lib, opened) = fx.open();
+    assert_eq!(opened, Opened::Rebuilt { old_version: 9 });
+    assert_eq!(lib.charts().unwrap(), Vec::new());
+    let report = scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!((report.found, report.read), (1, 1), "a full scan");
+    let entry = lib.charts().unwrap().remove(0);
+    assert_eq!(entry.info.map(|i| i.density_peak), Some(13));
+    assert!(lib.profile(&entry).unwrap().is_some());
+}
+
+/// Fixture C: the exact MAIN reaches the stored profile, a fractional one
+/// included, while number 92 shows it truncated; a chart of mines alone
+/// stores none weighted and shows 0.
+#[test]
+fn the_exact_main_tempo_is_stored() {
+    let fx = Fixture::new();
+    fx.write("c/c.bms", b"#BPM 180.5\n#00011:01010101\n");
+    fx.write("m/m.bms", b"#BPM 150\n#000D1:010101\n");
+    let (lib, _) = fx.open();
+    scan(&lib, std::slice::from_ref(&fx.root));
+    let entries = lib.charts().unwrap();
+    let main = |name: &str| {
+        let entry = entries.iter().find(|e| e.path.ends_with(name)).unwrap();
+        let stored = lib.profile(entry).unwrap().unwrap().main;
+        (entry.info.unwrap().main_bpm, stored)
+    };
+    let exact = bms_model::Tempo::from_milli(180_500).unwrap();
+    assert_eq!(main("c.bms"), (Some(180), Some(Some(exact))));
+    assert_eq!(main("m.bms"), (Some(0), Some(None)));
+}
+
+/// Fixtures H and SC through the scan: a hidden note lengthens the stored
+/// bins, and the stored rows carry the scroll factor.
+#[test]
+fn the_scan_stores_the_preview_profile() {
+    let fx = Fixture::new();
+    fx.write(
+        "h.bms",
+        b"#BPM 240\n#00011:010101010101010101\n#00431:0001000000\n#SCROLL01 0.5\n#001SC:01\n",
+    );
+    let (lib, _) = fx.open();
+    scan(&lib, std::slice::from_ref(&fx.root));
+    let entry = lib.charts().unwrap().remove(0);
+    let info = entry.info.unwrap();
+    assert_eq!(
+        (info.density_average, info.density_average_hundredths),
+        (1, 50)
+    );
+    let stored = lib.profile(&entry).unwrap().unwrap();
+    assert_eq!(stored.bins.len(), 6);
+    assert_eq!(stored.length_ms, 4_200);
+    let rows = stored.rows.unwrap();
+    assert_eq!(rows[1].ms, 1_000);
+    assert_eq!(rows[1].scroll, bms_model::SCROLL_ONE / 2);
+    assert_eq!(rows.last().unwrap().ms, 4_200);
+}

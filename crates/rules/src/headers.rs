@@ -119,6 +119,27 @@ impl HeaderPolicy {
         read.rank = defexrank.or(read.rank);
         read
     }
+
+    /// The `#TOTAL` declaration that counts in `headers`, as its exact
+    /// value: the one [`read`](Self::read) takes its `total_milli` from,
+    /// before the thousandths. A song list shows the gauge total from it
+    /// at the precision the chart wrote; evaluation reads the thousandths.
+    #[must_use]
+    pub fn total_header(&self, headers: &[JudgmentHeader]) -> Option<HeaderValue> {
+        let accepts = |v: i128| match self {
+            Self::Decimals => v >= 0,
+            Self::DefExRankFirst => v > 0,
+        };
+        let total = headers
+            .iter()
+            .rfind(|h| h.name == JudgmentHeaderName::Total && h.value.number().is_some_and(accepts))
+            .map(|h| h.value);
+        match self {
+            // A #TOTAL whose thousandths are 0 counts as absent.
+            Self::Decimals => total.filter(|v| v.number().and_then(milli).is_some_and(|m| m > 0)),
+            Self::DefExRankFirst => total,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -365,6 +386,48 @@ mod tests {
             (vec![t200, (Total, Decimal(1))], Some(0)),
         ] {
             assert_eq!(total(DefExRankFirst, &headers), expected, "{headers:?}");
+        }
+    }
+
+    /// `total_header` is the declaration `total_milli` floors: `#TOTAL
+    /// 111.1115` keeps its last digit, which evaluation's thousandths drop.
+    #[test]
+    fn total_header_is_the_exact_declaration_that_counts() {
+        let precise = (Total, Decimal(1_111_115 * (ONE / 10_000)));
+        assert_eq!(
+            DefExRankFirst.total_header(&[JudgmentHeader {
+                name: precise.0,
+                value: precise.1
+            }]),
+            Some(precise.1)
+        );
+        assert_eq!(total(DefExRankFirst, &[precise]), Some(111_111));
+        let t200 = (Total, HeaderValue::integer(200));
+        for headers in [
+            vec![t200],
+            vec![precise],
+            vec![t200, precise],
+            vec![precise, t200],
+            vec![t200, (Total, Integer(0))],
+            vec![t200, (Total, HeaderValue::integer(-5))],
+            vec![t200, (Total, NotANumber)],
+            vec![(Total, Integer(0))],
+            vec![t200, (Total, Decimal(1))],
+            vec![(Total, Decimal(1))],
+            vec![(Rank, HeaderValue::integer(2))],
+            vec![],
+        ] {
+            let declared: Vec<_> = headers
+                .iter()
+                .map(|&(name, value)| JudgmentHeader { name, value })
+                .collect();
+            for policy in [Decimals, DefExRankFirst] {
+                let floored = policy
+                    .total_header(&declared)
+                    .and_then(HeaderValue::number)
+                    .map(|v| i64::try_from(v.div_euclid(ONE / 1_000)).unwrap());
+                assert_eq!(floored, total(policy, &headers), "{policy:?} {headers:?}");
+            }
         }
     }
 }

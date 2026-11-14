@@ -259,6 +259,21 @@ fn read_scanned_is_the_listing_and_the_summary() {
     assert!(refused.summary.is_err());
 }
 
+/// The scan's profile and MAIN tempo are the loader's: the profile a
+/// play's graphs draw and the MAIN of every note.
+#[test]
+fn read_scanned_carries_the_profile_and_main_tempo() {
+    let limits = Limits::default();
+    let scanned = read_scanned(CHART.as_bytes(), &limits).unwrap();
+    let loaded = load(CHART, 0).unwrap();
+    assert_eq!(scanned.profile.as_ref(), Some(&loaded.profile));
+    let main = bms_model::main_tempo(&loaded.chart, |_| true, bms_model::MAIN_HISTOGRAM_LIMIT).ok();
+    assert!(main.is_some());
+    assert_eq!(scanned.main, main);
+    let refused = read_scanned(b"#BPM 0\n#00138:01\n", &limits).unwrap();
+    assert!(refused.profile.is_none() && refused.main.is_none());
+}
+
 /// The seed-0 branch's judgment-header declarations come with the scan, in
 /// file order, which a song list reads the rank from; a refused branch
 /// carries none.
@@ -333,4 +348,236 @@ fn read_scanned_carries_the_seed_0_labels() {
     let refused = read_scanned(b"#STAGEFILE a.png\n#BPM 0\n#00138:01\n", &limits).unwrap();
     assert!(refused.summary.is_err());
     assert_eq!(refused.labels, None);
+}
+
+/// The preview profile of `text`'s seed-0 branch.
+fn preview(text: &str) -> bms_model::ChartProfile {
+    read_scanned(text.as_bytes(), &Limits::default())
+        .unwrap()
+        .profile
+        .unwrap()
+}
+
+/// Nine taps in second 0 at 240 BPM (a measure a second).
+const NINE: &str = "#BPM 240\n#00011:010101010101010101\n";
+
+/// Fixtures H and BGA: a hidden note (31-39), a BGA event (04) or a layer
+/// event (07) at 4.2 s lengthens the preview's seconds to 6, as the
+/// reference's last time counts them; a poor-BGA event (06) does not, nor
+/// any of them the play profile.
+#[test]
+fn hidden_notes_and_bga_lengthen_the_preview() {
+    for (channel, seconds) in [("31", 6), ("39", 6), ("04", 6), ("07", 6), ("06", 2)] {
+        let text = format!("{NINE}#004{channel}:0001000000\n");
+        assert_eq!(preview(&text).seconds().len(), seconds, "channel {channel}");
+        let loaded = load(&text, 0).unwrap();
+        assert_eq!(loaded.profile.seconds().len(), 2, "play keeps its length");
+        assert_eq!(loaded.chart.meta.length, TimeUs(888_888));
+    }
+    assert_eq!(preview(NINE).seconds().len(), 2);
+}
+
+/// Fixture SC: the preview's rows carry `#SCROLLxx`'s factors at channel
+/// `SC`'s times; an undefined id changes nothing; the play profile and the
+/// play chart read no scroll.
+#[test]
+fn scroll_changes_reach_the_preview_rows() {
+    let text = "#BPM 120\n#SCROLL01 0.5\n#SCROLL02 2\n\
+         #00011:01010101\n#000SC:0001\n#00111:01\n#001SC:0203\n#00211:01\n";
+    let one = bms_model::SCROLL_ONE;
+    assert_eq!(
+        preview(text).speeds().to_vec(),
+        [
+            speed_row(0, 120, one),
+            speed_row(1_000, 120, one / 2),
+            speed_row(2_000, 120, 2 * one),
+            speed_row(4_000, 120, 2 * one)
+        ]
+    );
+    let loaded = load(text, 0).unwrap();
+    assert_eq!(
+        loaded.profile.speeds().to_vec(),
+        [speed_row(0, 120, one), speed_row(4_000, 120, one)]
+    );
+    let plain = "#BPM 120\n#00011:01010101\n#00111:01\n#00211:01\n";
+    assert_eq!(
+        load(plain, 0).unwrap().chart.identity.resolved_hash,
+        loaded.chart.identity.resolved_hash,
+        "the play chart is the same without them"
+    );
+}
+
+/// The preview's objects are timed apart: one past the duration cap
+/// leaves the preview as the play chart's, and the chart still loads.
+#[test]
+fn a_preview_object_past_the_cap_is_left_out() {
+    // 999 measures of 4 s at 60 BPM pass the 60-minute cap.
+    let text = "#BPM 60
+#00011:01
+#99904:01
+";
+    let scanned = read_scanned(text.as_bytes(), &Limits::default()).unwrap();
+    assert!(scanned.summary.is_ok());
+    assert_eq!(scanned.profile.unwrap().seconds().len(), 2);
+    assert!(load(text, 0).is_ok());
+}
+
+fn speed_row(ms: u32, bpm: i64, scroll: i128) -> bms_model::SpeedRow {
+    bms_model::SpeedRow {
+        ms,
+        tempo: Some(Tempo::from_milli(bpm * 1_000).unwrap()),
+        scroll,
+    }
+}
+
+/// Fixture TB: a tempo change after play's last object reaches the preview
+/// through its own timeline: a note at 0 at 120 BPM, 240 BPM (03 `F0`) at
+/// measure 1 (2 s) and a hidden note at measure 2 (3 s). Play's rows stop
+/// at its note.
+#[test]
+fn a_tempo_change_past_plays_end_reaches_the_preview() {
+    let text = "#BPM 120\n#00011:01\n#00103:F0\n#00231:01\n";
+    let one = bms_model::SCROLL_ONE;
+    let p = preview(text);
+    assert_eq!(
+        p.speeds().to_vec(),
+        [
+            speed_row(0, 120, one),
+            speed_row(2_000, 240, one),
+            speed_row(3_000, 240, one)
+        ]
+    );
+    assert_eq!(p.length_ms(), 3_000);
+    let loaded = load(text, 0).unwrap();
+    assert_eq!(loaded.profile.speeds().to_vec(), [speed_row(0, 120, one)]);
+    assert_eq!(loaded.chart.meta.length, TimeUs(0));
+}
+
+/// Fixture HS: a later scroll change ends the rows but not the length,
+/// which stays at the hidden note's 3 s.
+#[test]
+fn a_late_scroll_change_does_not_lengthen_the_content() {
+    let text = "#BPM 120\n#SCROLL01 2\n#00011:01\n#00103:F0\n#00231:01\n#003SC:01\n";
+    let p = preview(text);
+    assert_eq!(p.length_ms(), 3_000);
+    assert_eq!(
+        p.speeds().last(),
+        Some(speed_row(4_000, 240, 2 * bms_model::SCROLL_ONE))
+    );
+}
+
+/// Fixture Z/N: a scroll of 0 and a negative scroll reach the rows as
+/// written.
+#[test]
+fn zero_and_negative_scroll_reach_the_rows() {
+    let text = "#BPM 120\n#SCROLL01 0\n#SCROLL02 -1\n#00011:01010101\n#000SC:0001\n\
+         #001SC:02\n#00111:01\n";
+    let one = bms_model::SCROLL_ONE;
+    assert_eq!(
+        preview(text).speeds().to_vec(),
+        [
+            speed_row(0, 120, one),
+            speed_row(1_000, 120, 0),
+            speed_row(2_000, 120, -one)
+        ]
+    );
+}
+
+/// Fixture TT: a tempo change after the last object reaches the preview's
+/// rows with no shown object at all, as the source's speed list keeps every
+/// timeline: a tap at 0 at 120 BPM, 240 BPM a quarter into the measure
+/// (500 ms). Play's rows stop at the tap.
+#[test]
+fn a_trailing_tempo_change_reaches_the_preview() {
+    let text = "#BPM 120\n#00019:01\n#00003:00F00000\n";
+    let one = bms_model::SCROLL_ONE;
+    assert_eq!(
+        preview(text).speeds().to_vec(),
+        [speed_row(0, 120, one), speed_row(500, 240, one)]
+    );
+    assert_eq!(
+        load(text, 0).unwrap().profile.speeds().to_vec(),
+        [speed_row(0, 120, one)]
+    );
+}
+
+/// Fixture TS: a STOP after the last object stops the preview's rows and
+/// ends at its own end: a tap at 0 at 120 BPM, a STOP of 500 ms at 1 s.
+#[test]
+fn a_trailing_stop_reaches_the_preview() {
+    let text = "#BPM 120\n#STOP01 48\n#00019:01\n#00009:0001\n";
+    let one = bms_model::SCROLL_ONE;
+    let stopped = bms_model::SpeedRow {
+        ms: 1_000,
+        tempo: None,
+        scroll: one,
+    };
+    assert_eq!(
+        preview(text).speeds().to_vec(),
+        [speed_row(0, 120, one), stopped, speed_row(1_500, 120, one)]
+    );
+    assert_eq!(
+        load(text, 0).unwrap().profile.speeds().to_vec(),
+        [speed_row(0, 120, one)]
+    );
+}
+
+/// Fixture SU: a scroll change naming no `#SCROLLxx` is left out before
+/// timing: it adds no point, so the rows and seconds are those without it,
+/// and one past the duration cap (999 measures of 4 s at 60 BPM) does not
+/// leave the preview as the play chart's, so a hidden note at 4 s still
+/// lengthens it to 6 seconds.
+#[test]
+fn an_undefined_scroll_change_is_no_point() {
+    let base = "#BPM 120\n#STOP01 48\n#00011:01\n#00009:00000001\n#00111:00000100\n#00131:01\n";
+    let with = format!("{base}#001SC:0001\n");
+    assert_eq!(preview(&with).speeds(), preview(base).speeds());
+    assert_eq!(preview(&with).seconds(), preview(base).seconds());
+    let tail = "#BPM 60\n#00011:01\n#00131:01\n";
+    assert_eq!(preview(tail).seconds().len(), 6);
+    assert_eq!(preview(&format!("{tail}#999SC:01\n")).seconds().len(), 6);
+}
+
+/// Fixture SR: a scroll change applies at its own row, not at the first
+/// row of its µs: measure 0 is 4·10⁻⁷ beats long, so its tap, its tempo
+/// change and its scroll change all floor to 0 µs; the change to ×0.5
+/// sits with the 240 BPM change at a quarter, so the rows are (0, 120)
+/// and (500, 240 × 0.5), never 120 × 0.5 at the tap's row.
+#[test]
+fn a_scroll_change_applies_at_its_own_row() {
+    let text = "#BPM 120\n#SCROLL01 0.5\n#00002:0.0000001\n#00019:01\n#00003:00F00000\n\
+                #000SC:00010000\n#00119:0001\n";
+    let one = bms_model::SCROLL_ONE;
+    assert_eq!(
+        preview(text).speeds().to_vec(),
+        [speed_row(0, 120, one), speed_row(500, 240, one / 2)]
+    );
+}
+
+/// Two scroll changes at distinct positions inside one µs each apply at
+/// their own row: ×0.5 then ×2, both at 0 ms, in position order.
+#[test]
+fn scroll_changes_inside_one_microsecond_stay_apart() {
+    let text = "#BPM 120\n#SCROLL01 0.5\n#SCROLL02 2\n#00002:0.0000001\n#000SC:0102\n#00111:01\n";
+    let one = bms_model::SCROLL_ONE;
+    assert_eq!(
+        preview(text).speeds().to_vec(),
+        [
+            speed_row(0, 120, one),
+            speed_row(0, 120, one / 2),
+            speed_row(0, 120, 2 * one)
+        ]
+    );
+}
+
+/// Two scroll changes at one position apply in file order: the later one
+/// is the factor from that row on.
+#[test]
+fn the_later_scroll_change_at_a_position_wins() {
+    let text = "#BPM 120\n#SCROLL01 0.5\n#SCROLL02 2\n#00011:01\n#001SC:01\n#001SC:02\n#00111:01\n";
+    let one = bms_model::SCROLL_ONE;
+    assert_eq!(
+        preview(text).speeds().to_vec(),
+        [speed_row(0, 120, one), speed_row(2_000, 120, 2 * one)]
+    );
 }

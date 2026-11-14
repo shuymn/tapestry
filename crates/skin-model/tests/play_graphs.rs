@@ -471,24 +471,31 @@ fn tempo_chart() -> (Chart, ChartProfile) {
 }
 
 /// C22: the BPM graph over 100 × 100 texels with 2-texel strokes. The
-/// rows are 150 at 0, 300 at 1 000, stopped at 2 000, 75 at 3 000 and 75 at
-/// 4 000 (the last point); `last` is `4 000 + 1 000`, so x is `⌊ms/50⌋`: 0,
-/// 20, 40, 60, 80. y over MAIN 150 is `⌊(log10 r + log10 8)/(2 log10 8) ·
-/// 98⌋`: 150 → 49, 300 → 65, stop (1/8) → 0, 75 → 32. The strokes: green
-/// 150 over columns 0-21 rows 49-50; a grey change at 20-21 rows 51-64; red
-/// 300 over 20-41 rows 65-66; a grey change at 40-41 rows 2-64; magenta stop
-/// over 40-61 rows 0-1; a grey change at 60-61 rows 2-31; blue 75 (the
-/// lowest) over 60-81 and, as the last row, 80-99, rows 32-33.
+/// rows are 150 at 0, 300 at 1 000, stopped at 2 000, 300 again at the
+/// STOP's end (2 500), 75 at 3 000 and 75 at 4 000 (the last point); `last`
+/// is `4 000 + 1 000`, so x is `⌊ms/50⌋`: 0, 20, 40, 50, 60, 80. y over MAIN
+/// 150 is `⌊(log10 r + log10 8)/(2 log10 8) · 98⌋`: 150 → 49, 300 → 65,
+/// stop (1/8) → 0, 75 → 32. The strokes: green 150 over columns 0-21 rows
+/// 49-50; a grey change at 20-21 rows 51-64; red 300 over 20-41 rows 65-66;
+/// a grey change at 40-41 rows 2-64; magenta stop over 40-51 rows 0-1; a
+/// grey change at 50-51 rows 2-64; red 300 over 50-61 rows 65-66; a grey
+/// change at 60-61 rows 34-64; blue 75 (the lowest) over 60-81 and, as the
+/// last row, 80-99, rows 32-33.
 #[test]
 fn the_bpm_graph_draws_the_sources_strokes() {
     let (chart, profile) = tempo_chart();
-    let row = |ms, t| bms_model::SpeedRow { ms, tempo: t };
+    let row = |ms, t| bms_model::SpeedRow {
+        ms,
+        tempo: t,
+        scroll: bms_model::SCROLL_ONE,
+    };
     assert_eq!(
-        profile.speeds(),
+        profile.speeds().to_vec(),
         [
             row(0, Some(tempo(150))),
             row(1_000, Some(tempo(300))),
             row(2_000, None),
+            row(2_500, Some(tempo(300))),
             row(3_000, Some(tempo(75))),
             row(4_000, Some(tempo(75))),
         ]
@@ -529,8 +536,13 @@ fn the_bpm_graph_draws_the_sources_strokes() {
     check(&fx, 21.0, 58.0, Some(0x7f_7f7f));
     check(&fx, 30.0, 66.0, Some(0xff_0000));
     check(&fx, 41.0, 30.0, Some(0x7f_7f7f));
+    check(&fx, 45.0, 1.0, Some(0xff_00ff));
     check(&fx, 50.0, 1.0, Some(0xff_00ff));
-    check(&fx, 61.0, 20.0, Some(0x7f_7f7f));
+    check(&fx, 55.0, 1.0, None);
+    check(&fx, 51.0, 30.0, Some(0x7f_7f7f));
+    check(&fx, 55.0, 66.0, Some(0xff_0000));
+    check(&fx, 61.0, 50.0, Some(0x7f_7f7f));
+    check(&fx, 61.0, 20.0, None);
     check(&fx, 70.0, 33.0, Some(0x00_00ff));
     check(&fx, 90.0, 33.0, Some(0x00_00ff));
     check(&fx, 90.0, 35.0, None);

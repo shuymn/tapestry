@@ -14,7 +14,8 @@ use bms_parser::{ChartMode, Header};
 use rusqlite::{Connection, OpenFlags, OptionalExtension as _, params};
 
 use crate::search::Keys;
-use crate::{ChartEntry, ChartNames, LibraryError, Name, SCHEMA_VERSION};
+use crate::stored_profile::{self, MAX_PROFILE_BYTES, StoredProfile};
+use crate::{ChartEntry, ChartInfoView, ChartNames, LibraryError, Name, SCHEMA_VERSION};
 
 /// How long a connection waits for another one's lock, such as a checkpoint.
 const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
@@ -163,7 +164,24 @@ pub fn create(conn: &Connection) -> rusqlite::Result<()> {
              rank_value INTEGER,
              stagefile TEXT,
              banner TEXT,
-             image_names INTEGER
+             image_names INTEGER,
+             key_taps INTEGER,
+             key_longs INTEGER,
+             scratch_taps INTEGER,
+             scratch_longs INTEGER,
+             density_peak INTEGER,
+             density_end INTEGER,
+             density_end_x100 INTEGER,
+             density_average INTEGER,
+             density_average_x100 INTEGER,
+             gauge_total INTEGER,
+             main_bpm INTEGER
+         );
+         CREATE TABLE profiles (
+             chart_id INTEGER PRIMARY KEY REFERENCES charts(id) ON DELETE CASCADE,
+             sha256 BLOB NOT NULL CHECK (length(sha256) = 32),
+             loader INTEGER NOT NULL,
+             data BLOB NOT NULL CHECK (length(data) <= {MAX_PROFILE_BYTES})
          );
          CREATE INDEX charts_root ON charts(root);
          CREATE INDEX charts_title ON charts(mode, title_key IS NULL, title_key, path);
@@ -357,6 +375,11 @@ pub struct Row {
     pub rank: Option<Option<rules::JudgeRank>>,
     /// [`ChartEntry::images`].
     pub images: Option<ChartNames>,
+    /// [`ChartEntry::info`].
+    pub info: Option<ChartInfoView>,
+    /// The seed-0 branch's profile in its stored form
+    /// ([`stored_profile::encode`]); none when the branch is refused.
+    pub profile: Option<Vec<u8>>,
 }
 
 /// A rank as `charts.rank_kind` and `rank_value` store it: no kind when the
@@ -498,6 +521,11 @@ pub fn prepare(conn: &mut Connection, roots: &[PathBuf]) -> rusqlite::Result<Pre
 
 /// Writes `upserts` and deletes the charts at `removals` in one
 /// transaction. Returns how many rows the deletions removed.
+///
+/// Each upsert writes its chart's profile row too, stamped with the file's
+/// SHA-256 and the loader version, or deletes it when the row has none (a
+/// refused seed-0 branch), so a chart row never keeps another file's
+/// profile; a removed chart's profile goes with it (`ON DELETE CASCADE`).
 pub fn commit(
     conn: &mut Connection,
     upserts: &[Row],
@@ -511,10 +539,12 @@ pub fn commit(
                  artist, subartist, genre, playlevel, difficulty, bpm, norm_text, title_key,
                  artist_key, folder, mode, random, bga, loader, taps, longs, mines,
                  length_us, tempo_start, tempo_min, tempo_max, rank_kind, rank_value,
-                 stagefile, banner, image_names)
+                 stagefile, banner, image_names, key_taps, key_longs, scratch_taps,
+                 scratch_longs, density_peak, density_end, density_end_x100, density_average,
+                 density_average_x100, gauge_total, main_bpm)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
                  ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
-                 ?33, ?34)
+                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45)
              ON CONFLICT (path) DO UPDATE SET root = excluded.root, size = excluded.size,
                  mtime_ns = excluded.mtime_ns, sha256 = excluded.sha256, md5 = excluded.md5,
                  title = excluded.title, subtitle = excluded.subtitle,
@@ -530,53 +560,95 @@ pub fn commit(
                  tempo_min = excluded.tempo_min, tempo_max = excluded.tempo_max,
                  rank_kind = excluded.rank_kind, rank_value = excluded.rank_value,
                  stagefile = excluded.stagefile, banner = excluded.banner,
-                 image_names = excluded.image_names",
+                 image_names = excluded.image_names, key_taps = excluded.key_taps,
+                 key_longs = excluded.key_longs, scratch_taps = excluded.scratch_taps,
+                 scratch_longs = excluded.scratch_longs,
+                 density_peak = excluded.density_peak, density_end = excluded.density_end,
+                 density_end_x100 = excluded.density_end_x100,
+                 density_average = excluded.density_average,
+                 density_average_x100 = excluded.density_average_x100,
+                 gauge_total = excluded.gauge_total, main_bpm = excluded.main_bpm
+             RETURNING id",
         )?;
+        let mut put_profile = tx.prepare(
+            "INSERT INTO profiles (chart_id, sha256, loader, data) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT (chart_id) DO UPDATE SET sha256 = excluded.sha256,
+                 loader = excluded.loader, data = excluded.data",
+        )?;
+        let mut drop_profile = tx.prepare("DELETE FROM profiles WHERE chart_id = ?1")?;
         for row in upserts {
             let h = &row.header;
             let keys = Keys::of(h);
             let summary = row.summary.as_ref();
             let (rank_kind, rank_value) = rank_columns(row.rank);
             let (stagefile, banner, image_names) = image_columns(row.images.as_ref());
-            upsert.execute(params![
-                row.root,
-                row.path,
-                row.size,
-                row.mtime_ns,
-                row.sha256,
-                row.md5,
-                h.title,
-                h.subtitle,
-                h.artist,
-                h.subartist,
-                h.genre,
-                h.playlevel,
-                h.difficulty,
-                h.bpm,
-                keys.text,
-                keys.title,
-                keys.artist,
-                Path::new(&row.path)
-                    .parent()
-                    .and_then(Path::to_str)
-                    .unwrap_or_default(),
-                mode_value(row.mode),
-                row.random,
-                row.bga,
-                i64::from(bms_parser::LOADER_VERSION),
-                summary.map(|s| s.taps),
-                summary.map(|s| s.longs),
-                summary.map(|s| s.mines),
-                summary.map(|s| s.length.0),
-                summary.map(|s| tempo_bytes(s.tempo_start)),
-                summary.map(|s| tempo_bytes(s.tempo_min)),
-                summary.map(|s| tempo_bytes(s.tempo_max)),
-                rank_kind,
-                rank_value,
-                stagefile,
-                banner,
-                image_names,
-            ])?;
+            let info = row.info.as_ref();
+            let id: i64 = upsert.query_row(
+                params![
+                    row.root,
+                    row.path,
+                    row.size,
+                    row.mtime_ns,
+                    row.sha256,
+                    row.md5,
+                    h.title,
+                    h.subtitle,
+                    h.artist,
+                    h.subartist,
+                    h.genre,
+                    h.playlevel,
+                    h.difficulty,
+                    h.bpm,
+                    keys.text,
+                    keys.title,
+                    keys.artist,
+                    Path::new(&row.path)
+                        .parent()
+                        .and_then(Path::to_str)
+                        .unwrap_or_default(),
+                    mode_value(row.mode),
+                    row.random,
+                    row.bga,
+                    i64::from(bms_parser::LOADER_VERSION),
+                    summary.map(|s| s.taps),
+                    summary.map(|s| s.longs),
+                    summary.map(|s| s.mines),
+                    summary.map(|s| s.length.0),
+                    summary.map(|s| tempo_bytes(s.tempo_start)),
+                    summary.map(|s| tempo_bytes(s.tempo_min)),
+                    summary.map(|s| tempo_bytes(s.tempo_max)),
+                    rank_kind,
+                    rank_value,
+                    stagefile,
+                    banner,
+                    image_names,
+                    info.map(|i| i.key_taps),
+                    info.map(|i| i.key_longs),
+                    info.map(|i| i.scratch_taps),
+                    info.map(|i| i.scratch_longs),
+                    info.map(|i| i.density_peak),
+                    info.map(|i| i.density_end),
+                    info.map(|i| i.density_end_hundredths),
+                    info.map(|i| i.density_average),
+                    info.map(|i| i.density_average_hundredths),
+                    info.map(|i| i.total),
+                    info.and_then(|i| i.main_bpm),
+                ],
+                |r| r.get(0),
+            )?;
+            match &row.profile {
+                Some(data) => {
+                    put_profile.execute(params![
+                        id,
+                        row.sha256,
+                        i64::from(bms_parser::LOADER_VERSION),
+                        data
+                    ])?;
+                }
+                None => {
+                    drop_profile.execute([id])?;
+                }
+            }
         }
         let mut delete = tx.prepare("DELETE FROM charts WHERE path = ?1")?;
         for path in removals {
@@ -591,7 +663,9 @@ pub fn commit(
 pub const ENTRY_COLUMNS: &str = "c.path, c.size, c.mtime_ns, c.sha256, c.md5, c.title, \
      c.subtitle, c.artist, c.subartist, c.genre, c.playlevel, c.difficulty, c.bpm, c.random, \
      c.bga, c.taps, c.longs, c.mines, c.length_us, c.tempo_start, c.tempo_min, c.tempo_max, \
-     c.rank_kind, c.rank_value, c.stagefile, c.banner, c.image_names";
+     c.rank_kind, c.rank_value, c.stagefile, c.banner, c.image_names, c.key_taps, c.key_longs, \
+     c.scratch_taps, c.scratch_longs, c.density_peak, c.density_end, c.density_end_x100, \
+     c.density_average, c.density_average_x100, c.gauge_total, c.main_bpm";
 
 /// A tempo as a summary column stores it: `u128` does not fit an integer.
 const fn tempo_bytes(tempo: Tempo) -> [u8; 16] {
@@ -629,6 +703,43 @@ fn summary(r: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Option<Chart
     }))
 }
 
+/// The info in the columns from `first` of [`ENTRY_COLUMNS`]; none when any
+/// but MAIN is missing, which only a refused branch's row holds.
+fn info(r: &rusqlite::Row<'_>, first: usize) -> rusqlite::Result<Option<ChartInfoView>> {
+    let mut values = [0_i32; 10];
+    for (i, v) in values.iter_mut().enumerate() {
+        match r.get::<_, Option<i32>>(first + i)? {
+            Some(x) => *v = x,
+            None => return Ok(None),
+        }
+    }
+    let [
+        key_taps,
+        key_longs,
+        scratch_taps,
+        scratch_longs,
+        density_peak,
+        density_end,
+        density_end_hundredths,
+        density_average,
+        density_average_hundredths,
+        total,
+    ] = values;
+    Ok(Some(ChartInfoView {
+        key_taps,
+        key_longs,
+        scratch_taps,
+        scratch_longs,
+        density_peak,
+        density_end,
+        density_end_hundredths,
+        density_average,
+        density_average_hundredths,
+        total,
+        main_bpm: r.get(first + 10)?,
+    }))
+}
+
 /// A chart from a row of [`ENTRY_COLUMNS`].
 pub fn entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChartEntry> {
     let size: i64 = r.get(1)?;
@@ -653,7 +764,30 @@ pub fn entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChartEntry> {
         summary: summary(r, 15)?,
         rank: rank_of(r.get(22)?, r.get(23)?),
         images: images_of(r.get(24)?, r.get(25)?, r.get(26)?),
+        info: info(r, 27)?,
     })
+}
+
+/// The stored profile of the chart at `path`, if its row is this file's
+/// (`sha256`) by this build's loader and decodes within the bounds; none
+/// otherwise, which the song list shows as no graphs.
+pub fn profile(
+    conn: &Connection,
+    path: &str,
+    sha256: &[u8; 32],
+) -> rusqlite::Result<Option<StoredProfile>> {
+    let row: Option<([u8; 32], i64, Vec<u8>)> = conn
+        .query_row(
+            "SELECT p.sha256, p.loader, p.data FROM profiles p
+             JOIN charts c ON c.id = p.chart_id WHERE c.path = ?1",
+            [path],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .optional()?;
+    Ok(row.and_then(|(stamp, loader, data)| {
+        let current = loader == i64::from(bms_parser::LOADER_VERSION) && stamp == *sha256;
+        current.then(|| stored_profile::decode(&data)).flatten()
+    }))
 }
 
 /// Every indexed chart, by path.

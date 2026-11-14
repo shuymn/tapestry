@@ -14,7 +14,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use bms_model::{SpeedRow, Tempo, TimeUs};
+use bms_model::{SpeedRows, Tempo, TimeUs};
 
 use super::compose::{self, Fill, Raster, Run};
 use super::{Brush, Frame, ImageRef};
@@ -101,7 +101,7 @@ pub(crate) struct BpmRaster {
 /// What a BPM graph is prepared from.
 pub(crate) struct BpmInput<'a> {
     /// The tempo rows, in time order.
-    pub(crate) rows: &'a [SpeedRow],
+    pub(crate) rows: &'a SpeedRows,
     /// The whole chart's MAIN tempo.
     pub(crate) main: Tempo,
     /// The chart's length at 1×, in whole ms.
@@ -180,10 +180,7 @@ impl BpmGraphDef {
         // The fills in paint order: (left, right, bottom, top, colour), in
         // texels from the bottom left.
         let mut fills: Vec<(i64, i64, i64, i64, Rgba8)> = Vec::with_capacity(2 * data.len());
-        for pair in data.windows(2) {
-            let (Some(a), Some(b)) = (pair.first(), pair.get(1)) else {
-                continue;
-            };
+        for (a, b) in data.iter().zip(data.iter().skip(1)) {
             let (y1, y2) = (y(a.tempo), y(b.tempo));
             let x1 = x(b.ms);
             if (y2 - y1).abs() - lw > 0 {
