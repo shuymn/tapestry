@@ -555,12 +555,10 @@ fn a_bpm_graph_notes_its_filter_and_keeps_hard_edges() {
 }
 
 /// C33: a timing visualizer following HIDDEN+ (offset 5) over lanes: with
-/// HIDDEN+ on both its band and its lines draw; with HIDDEN+ off the source
-/// sets its destination's alpha to 0, which hides the band, while the
-/// lines, in their own colour and alpha, still draw: the line of +40 ms in
-/// `00FF00` and no band colour.
+/// HIDDEN+ on both its band and its lines draw (the line of +40 ms in
+/// `00FF00`); with HIDDEN+ off it is skipped whole, neither drawing.
 #[test]
-fn a_timing_visualizer_s_lines_outlast_hidden_plus() {
+fn a_timing_visualizer_hides_whole_with_hidden_plus_off() {
     let l = common::lanes::with(
         r#""timingvisualizer": [{"id": "tv"}]"#,
         &[r#"{"id": "tv", "offset": 5, "dst": [{"x": 500, "y": 1000, "w": 301, "h": 20}]}"#],
@@ -590,7 +588,7 @@ fn a_timing_visualizer_s_lines_outlast_hidden_plus() {
     assert!(band(&on) && line(&on));
     let off = frame(false);
     assert!(
-        !band(&off) && line(&off),
+        !band(&off) && !line(&off),
         "HIDDEN+ off: {:?}",
         colours(&off)
     );
