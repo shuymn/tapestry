@@ -2392,11 +2392,11 @@ mod tests {
                 };
                 // Acts with the audio thread held at its gate, then lets it
                 // write `frames` past where it stopped and past the frame
-                // `sounding` gives. The gate sits after a step's control
-                // messages, so the step it lets go mixes without the action
-                // and the next takes it: two steps on, what the action sent
-                // and the frame line it moves are in, and at least `frames`
-                // less two periods were mixed with them.
+                // `sounding` gives, read two periods after the release. The
+                // gate sits after a step's control messages, so the step it
+                // lets go mixes without the action and a later step takes
+                // it: at least `frames` less the released step's frames are
+                // mixed with what the action sent.
                 let phase =
                     |rig: &mut crate::play::PlayerRig<'_>,
                      act: &dyn Fn(&mut crate::play::PlayerRig<'_>),
@@ -2411,11 +2411,14 @@ mod tests {
                         let from = from.max(sounding(rig));
                         until(&|| written(rig) >= from + frames);
                     };
+                // A late audio thread: held at its gate while the clock runs
+                // on, and kept held through the play's start until the first
+                // phase lets it go, so it cannot catch up before the play
+                // starts.
                 if !late.is_zero() {
                     gate.hold();
                     until(&|| gate.stopped());
                     std::thread::sleep(late);
-                    gate.release();
                 }
                 // The play starts now: its sounds start at its chart time 0,
                 // on the frame its frame line puts it, which an audio thread
