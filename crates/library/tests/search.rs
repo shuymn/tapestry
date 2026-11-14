@@ -290,8 +290,11 @@ fn sort_by_artist_then_title_with_no_artist_last() {
     );
 }
 
+/// Levels that read as integers (an optional sign and ASCII digits, within
+/// `i32`) by their value, equal values by their text; then other text,
+/// longer digit strings and other scripts' digits included; then none.
 #[test]
-fn sort_by_level_numbers_then_text_then_none() {
+fn sort_by_level_integers_then_text_then_none() {
     let fx = Fixture::new();
     let twelve = fx.chart("0.bms", &["TITLE a", "PLAYLEVEL 12"]);
     let two = fx.chart("1.bms", &["TITLE b", "PLAYLEVEL 2"]);
@@ -300,17 +303,46 @@ fn sort_by_level_numbers_then_text_then_none() {
     let star = fx.chart("4.bms", &["TITLE a", "PLAYLEVEL ★3"]);
     let question = fx.chart("5.bms", &["TITLE a", "PLAYLEVEL ?"]);
     let none = fx.chart("6.bms", &["TITLE a"]);
-    // Past i64, where a cast saturates: by significant digits, then text.
+    // Past `i32`, so text, as the level they show is 0.
     let over_b = fx.chart("7.bms", &["TITLE a", "PLAYLEVEL 10000000000000000000"]);
     let over_a = fx.chart("8.bms", &["TITLE b", "PLAYLEVEL 9223372036854775808"]);
     let over_a0 = fx.chart("9.bms", &["TITLE c", "PLAYLEVEL 0009223372036854775808"]);
     let zero = fx.chart("10.bms", &["TITLE b", "PLAYLEVEL 0"]);
     let zero0 = fx.chart("11.bms", &["TITLE a", "PLAYLEVEL 00"]);
+    let minus = fx.chart("12.bms", &["TITLE a", "PLAYLEVEL -1"]);
+    let minus_twelve = fx.chart("13.bms", &["TITLE a", "PLAYLEVEL -12"]);
+    let minus_zero = fx.chart("14.bms", &["TITLE a", "PLAYLEVEL -0"]);
+    let under = fx.chart("15.bms", &["TITLE a", "PLAYLEVEL -2147483649"]);
+    let plus_three = fx.chart("16.bms", &["TITLE a", "PLAYLEVEL +3"]);
+    let max = fx.chart("17.bms", &["TITLE a", "PLAYLEVEL 2147483647"]);
+    let past = fx.chart("18.bms", &["TITLE a", "PLAYLEVEL 2147483648"]);
+    let signs = fx.chart("19.bms", &["TITLE a", "PLAYLEVEL +-1"]);
+    let fullwidth = fx.chart("20.bms", &["TITLE a", "PLAYLEVEL \u{FF11}\u{FF12}"]);
     let lib = fx.scanned();
     assert_eq!(
         search(&lib, "", Sort::Level, false),
         [
-            zero, zero0, two, seven_a, seven_b, twelve, over_a0, over_a, over_b, question, star,
+            minus_twelve,
+            minus,
+            minus_zero,
+            zero,
+            zero0,
+            two,
+            plus_three,
+            seven_a,
+            seven_b,
+            twelve,
+            max,
+            // The text by its bytes.
+            signs,
+            under,
+            over_a0,
+            over_b,
+            past,
+            over_a,
+            question,
+            star,
+            fullwidth,
             none
         ]
     );

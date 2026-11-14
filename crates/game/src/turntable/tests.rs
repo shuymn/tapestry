@@ -216,9 +216,8 @@ fn scratch_notes_mark_charge_ends_by_the_charts_mode() {
     }
 }
 
-// The probes of the pinned source (`KeyInputProccessor.input` and
-// `JudgeManager.update` at chosen times): the clock and autoplay's state
-// reproduce their printed values.
+// The probes of the pinned source (`KeyInputProccessor.input` at chosen
+// times): the clock reproduces their printed values.
 
 fn clock_at(ticks: impl IntoIterator<Item = (i64, Turn)>) -> super::TurntableClock {
     let mut c = super::TurntableClock::default();
@@ -340,20 +339,6 @@ fn ln(from: i64, to: i64, charge: bool) -> [ScratchNote; 2] {
     ]
 }
 
-/// The direction after each update at chart µs `t`, its state time
-/// floored from `t + delta` µs.
-fn run(notes: &[ScratchNote], delta: i64, times: &[i64]) -> Vec<(i64, i64, Turn)> {
-    let mut s = super::AutoplayScratch::NEW;
-    times
-        .iter()
-        .map(|&t| {
-            let ms = super::state_ms(TimeUs(t + delta), TimeUs(0));
-            s.update(notes, TimeUs(t), ms);
-            (t, ms, ScratchInput::NONE.direction(TimeUs(0), s.pressed()))
-        })
-        .collect()
-}
-
 fn every(from: i64, to: i64, step: i64) -> Vec<i64> {
     (from..=to)
         .step_by(usize::try_from(step).unwrap())
@@ -361,130 +346,239 @@ fn every(from: i64, to: i64, step: i64) -> Vec<i64> {
         .collect()
 }
 
-fn turn_at(out: &[(i64, i64, Turn)], t: i64) -> Turn {
-    out.iter().find(|o| o.0 == t).unwrap().2
+/// One update of `s` at chart µs `t` over `notes`, and the presses it
+/// gives.
+fn update(s: &mut super::AutoplayScratch, notes: &[ScratchNote], t: i64) -> [bool; 2] {
+    s.update(notes, TimeUs(t));
+    s.pressed()
+}
+
+/// The direction autoplay alone gives at each chart µs of `times`,
+/// updated in that order, and at each from a fresh state.
+fn turns(notes: &[ScratchNote], times: &[i64]) -> Vec<Turn> {
+    let direction = |pressed| ScratchInput::NONE.direction(TimeUs(0), pressed);
+    let mut s = super::AutoplayScratch::NEW;
+    times
+        .iter()
+        .map(|&t| {
+            let run = direction(update(&mut s, notes, t));
+            let fresh = direction(update(&mut super::AutoplayScratch::default(), notes, t));
+            assert_eq!(run, fresh, "at {t}");
+            run
+        })
+        .collect()
 }
 
 #[test]
-fn a_tap_expires_after_more_than_80_ms() {
-    let out = run(
-        &[tap(1_000)],
-        0,
-        &[1_000_000, 1_040_000, 1_080_000, 1_081_000, 1_090_000],
-    );
-    let turns: Vec<Turn> = out.iter().map(|o| o.2).collect();
+fn a_tap_turns_for_80_ms() {
     use Turn::{Idle, Positive};
-    assert_eq!(turns, [Positive, Positive, Positive, Idle, Idle]);
+    let times = [999_999, 1_000_000, 1_079_999, 1_080_000];
+    assert_eq!(
+        turns(&[tap(1_000)], &times),
+        [Idle, Positive, Positive, Idle]
+    );
 }
 
 #[test]
-fn a_plain_ln_holds_positive_one_update_past_its_end() {
-    let out = run(&ln(1_000, 2_000, false), 0, &every(990, 2_100, 10));
-    assert_eq!(turn_at(&out, 990_000), Turn::Idle);
-    assert_eq!(turn_at(&out, 1_000_000), Turn::Positive);
-    assert_eq!(turn_at(&out, 2_000_000), Turn::Positive);
-    assert_eq!(turn_at(&out, 2_010_000), Turn::Positive);
-    assert_eq!(turn_at(&out, 2_020_000), Turn::Idle);
+fn a_note_at_the_start_turns() {
+    use Turn::{Idle, Positive};
+    assert_eq!(
+        turns(&[tap(0)], &[0, 79_999, 80_000]),
+        [Positive, Positive, Idle]
+    );
+    assert_eq!(
+        turns(&ln(0, 500, false), &[0, 499_999, 500_000]),
+        [Positive, Positive, Idle]
+    );
 }
 
 #[test]
-fn a_charge_note_end_turns_negative() {
-    let out = run(&ln(1_000, 2_000, true), 0, &every(990, 2_100, 10));
-    assert_eq!(turn_at(&out, 1_500_000), Turn::Positive);
-    assert_eq!(turn_at(&out, 2_000_000), Turn::Negative);
-    assert_eq!(turn_at(&out, 2_080_000), Turn::Negative);
-    assert_eq!(turn_at(&out, 2_090_000), Turn::Idle);
+fn a_long_note_turns_for_its_length_at_least_80_ms() {
+    use Turn::{Idle, Positive};
+    let times = [999_999, 1_000_000, 1_999_999, 2_000_000];
+    assert_eq!(
+        turns(&ln(1_000, 2_000, false), &times),
+        [Idle, Positive, Positive, Idle]
+    );
+    let times = [1_000_000, 1_029_999, 1_030_000, 1_079_999, 1_080_000];
+    assert_eq!(
+        turns(&ln(1_000, 1_030, false), &times),
+        [Positive, Positive, Positive, Positive, Idle]
+    );
 }
 
+/// A charge note's end turns the turntable back, the reverse turn that
+/// end is played with.
+// Source: SF-010
 #[test]
-fn a_tap_after_a_charge_end_stays_negative_through_its_80_ms() {
+fn a_charge_end_turns_back_for_80_ms() {
+    use Turn::{Idle, Negative, Positive};
+    let times = [1_999_999, 2_000_000, 2_079_999, 2_080_000];
+    assert_eq!(
+        turns(&ln(1_000, 2_000, true), &times),
+        [Positive, Negative, Negative, Idle]
+    );
+}
+
+/// Presses closer than 80 ms join, Negative first.
+#[test]
+fn presses_overlap_as_a_union() {
+    use Turn::{Idle, Negative, Positive};
+    // Two taps: Positive over [1 000, 1 120) ms.
+    let times = [
+        999_999, 1_000_000, 1_079_999, 1_080_000, 1_119_999, 1_120_000,
+    ];
+    assert_eq!(
+        turns(&[tap(1_000), tap(1_040)], &times),
+        [Idle, Positive, Positive, Positive, Positive, Idle]
+    );
+    // A charge end, then a tap: Negative over [1 000, 1 080), then
+    // Positive to 1 120.
     let [s, e] = ln(500, 1_000, true);
-    let out = run(&[s, e, tap(1_040)], 0, &every(990, 1_200, 10));
-    assert_eq!(turn_at(&out, 1_000_000), Turn::Negative);
-    assert_eq!(turn_at(&out, 1_040_000), Turn::Negative);
-    assert_eq!(turn_at(&out, 1_080_000), Turn::Negative);
-    assert_eq!(turn_at(&out, 1_090_000), Turn::Positive);
-    assert_eq!(turn_at(&out, 1_130_000), Turn::Idle);
-}
-
-#[test]
-fn an_ln_after_a_charge_end_keeps_negative_through_it() {
-    let [a, b] = ln(500, 1_000, true);
+    assert_eq!(
+        turns(&[s, e, tap(1_040)], &times),
+        [Positive, Negative, Negative, Positive, Positive, Idle]
+    );
+    // A charge end, then a long note: Negative over [1 000, 1 080), then
+    // Positive to 1 500.
     let [c, d] = ln(1_040, 1_500, false);
-    let out = run(&[a, b, c, d], 0, &every(990, 1_600, 10));
-    for t in [1_000, 1_040, 1_500, 1_510] {
-        assert_eq!(turn_at(&out, t * MS), Turn::Negative, "{t}");
-    }
-    assert_eq!(turn_at(&out, 1_520_000), Turn::Idle);
+    let times = [1_000_000, 1_079_999, 1_080_000, 1_499_999, 1_500_000];
+    assert_eq!(
+        turns(&[s, e, c, d], &times),
+        [Negative, Negative, Positive, Positive, Idle]
+    );
 }
 
+/// Plain long notes 1 ms apart, a frame every ms: both turn, idle for the
+/// millisecond between.
 #[test]
-fn two_taps_refresh_positive() {
-    let out = run(&[tap(1_000), tap(1_040)], 0, &every(990, 1_200, 10));
-    assert_eq!(turn_at(&out, 1_120_000), Turn::Positive);
-    assert_eq!(turn_at(&out, 1_130_000), Turn::Idle);
-}
-
-/// A frame crossing an expiry and a head: the head first, so the old
-/// Negative survives the whole LN; a frame at 1 081 ms expires it first;
-/// one at 1 080.5 ms floors to state 1 080 and does not.
-#[test]
-fn a_frame_crossing_an_expiry_and_a_head() {
-    let [a, b] = ln(500, 1_000, true);
-    let [c, d] = ln(1_082, 5_000, false);
-    let notes = [a, b, c, d];
-    let tail = every(1_090, 5_100, 10);
-    let with = |extra: &[i64]| {
-        let mut times = extra.to_vec();
-        times.extend(&tail);
-        run(&notes, 0, &times)
-    };
-    let a = with(&[1_000_000, 1_080_000]);
-    assert_eq!(turn_at(&a, 1_090_000), Turn::Negative);
-    assert_eq!(turn_at(&a, 5_010_000), Turn::Negative);
-    assert_eq!(turn_at(&a, 5_020_000), Turn::Idle);
-    let b = with(&[1_000_000, 1_080_000, 1_081_000]);
-    assert_eq!(turn_at(&b, 1_081_000), Turn::Idle);
-    assert_eq!(turn_at(&b, 1_090_000), Turn::Positive);
-    assert_eq!(turn_at(&b, 5_010_000), Turn::Positive);
-    let c = with(&[1_000_000, 1_080_500]);
-    assert_eq!(turn_at(&c, 1_080_500), Turn::Negative);
-    assert_eq!(turn_at(&c, 2_000_000), Turn::Negative);
-}
-
-/// Adjacent plain LNs, a frame every ms: the first's press lives to
-/// 1 001, clears at 1 002, and the second is never pressed.
-#[test]
-fn adjacent_plain_lns() {
+fn adjacent_long_notes_both_turn() {
     let [a, b] = ln(500, 1_000, false);
     let [c, d] = ln(1_001, 1_500, false);
-    let out = run(&[a, b, c, d], 0, &every(490, 1_600, 1));
-    assert_eq!(turn_at(&out, 1_001_000), Turn::Positive);
-    assert!(
-        out.iter()
-            .filter(|o| o.0 >= 1_002_000)
-            .all(|o| o.2 == Turn::Idle)
-    );
+    let times = every(490, 1_600, 1);
+    let want: Vec<Turn> = times
+        .iter()
+        .map(|&t| {
+            if (500_000..1_000_000).contains(&t) || (1_001_000..1_500_000).contains(&t) {
+                Turn::Positive
+            } else {
+                Turn::Idle
+            }
+        })
+        .collect();
+    assert_eq!(turns(&[a, b, c, d], &times), want);
 }
 
-/// Fractional origins: the chart and state clocks differ by `delta`.
-#[test]
-fn fractional_origins_move_the_expiry() {
-    let [a, b] = ln(500, 1_000, true);
-    let [c, d] = ln(1_082, 5_000, false);
-    let notes = [a, b, c, d];
-    let mut times = vec![1_000_000, 1_080_500];
-    times.extend(every(1_090, 5_100, 10));
-    for (delta, stamp, at_1080_5, through) in [
-        (0, 1_000, 1_080, Turn::Negative),
-        (1_000_400, 2_000, 2_080, Turn::Negative),
-        (999_600, 1_999, 2_080, Turn::Positive),
-    ] {
-        let out = run(&notes, delta, &times);
-        assert_eq!(out[0].1, stamp, "{delta}");
-        assert_eq!(out[1].1, at_1080_5, "{delta}");
-        assert_eq!(turn_at(&out, 2_000_000), through, "{delta}");
+/// The presses at chart µs `t` by definition: the notes' intervals that
+/// hold `t`, over every note.
+fn defined(notes: &[ScratchNote], t: i64) -> [bool; 2] {
+    let hold = 80 * MS;
+    let mut out = [false; 2];
+    for n in notes {
+        let s = n.time.0;
+        let (negative, end) = match n.kind {
+            ScratchNoteKind::Tap => (false, s + hold),
+            ScratchNoteKind::LongStart { end, .. } => (false, end.0.max(s + hold)),
+            ScratchNoteKind::LongEnd { charge: true } => (true, s + hold),
+            ScratchNoteKind::LongEnd { charge: false } => continue,
+        };
+        if s <= t && t < end {
+            out[usize::from(negative)] = true;
+        }
     }
+    out
+}
+
+/// Whatever the calls before, the presses at a chart time are the
+/// definition's: frames every ms, at 60 Hz, irregular with repeated
+/// times and steps back, and first calls late in the chart.
+#[test]
+fn the_press_depends_on_chart_time_alone() {
+    let mut notes = vec![tap(0), tap(1_000), tap(1_040)];
+    notes.extend(ln(1_100, 1_120, false));
+    notes.extend(ln(2_000, 3_000, true));
+    notes.push(tap(3_020));
+    notes.extend(ln(3_050, 4_000, false));
+    notes.extend(ln(4_001, 4_500, false));
+    let [s, e] = ln(5_500, 6_000, true);
+    notes.extend([s, e, tap(6_000)]);
+    let sixty_hz: Vec<i64> = (0..450).map(|i| i * 16_667).collect();
+    let irregular = [
+        0, 0, 999_999, 1_000_000, 1_000_000, 1_079_999, 1_080_000, 3_500_000, 1_050_000, 1_100_000,
+        2_000_000, 2_000_000, 1_999_999, 6_000_000, 5_999_999, 6_079_999, 6_080_000, 7_000_000,
+    ];
+    let histories: [(&str, &[i64]); 5] = [
+        ("every ms", &every(-10, 7_000, 1)),
+        ("60 Hz", &sixty_hz),
+        ("irregular", &irregular),
+        ("first at 5 s", &[5_000_000, 5_500_000, 6_050_000]),
+        (
+            "first inside a long note",
+            &[3_500_000, 3_999_999, 4_000_000],
+        ),
+    ];
+    for (name, times) in histories {
+        let mut st = super::AutoplayScratch::NEW;
+        for &t in times {
+            assert_eq!(
+                update(&mut st, &notes, t),
+                defined(&notes, t),
+                "{name} at {t}"
+            );
+        }
+    }
+    // A first call at 5 s, its tap at 1 s long past: idle.
+    let mut st = super::AutoplayScratch::NEW;
+    assert_eq!(update(&mut st, &[tap(1_000)], 5_000 * MS), [false; 2]);
+}
+
+/// The Positive intervals equal the generated input's presses of the
+/// scratch key: a tap held 80 ms, a long note held to its end.
+#[test]
+fn a_tap_turns_as_long_as_autoplay_holds_it() {
+    let chart = ChartBuilder::new(120_000)
+        .tap(Lane::SCRATCH, TimeUs(1_000 * MS))
+        .long(Lane::SCRATCH, TimeUs(2_000 * MS), TimeUs(2_500 * MS))
+        .build()
+        .unwrap();
+    let control = eval::ControlId(0x100);
+    let profile = eval::SourceProfile {
+        input_offset: TimeUs(0),
+        bindings: vec![eval::Binding {
+            control,
+            lane: Lane::SCRATCH,
+        }],
+        axes: Vec::new(),
+    };
+    let mut held = Vec::new();
+    let mut pressed_at = None;
+    for e in input::autoplay(&chart, &profile).unwrap() {
+        match e.kind {
+            eval::InputKind::Control { value: 0, .. } => {
+                held.push((pressed_at.take().unwrap(), e.received.0));
+            }
+            eval::InputKind::Control { .. } => pressed_at = Some(e.received.0),
+            eval::InputKind::Disconnected => unreachable!(),
+        }
+    }
+    assert_eq!(held.len(), 2);
+    let notes = super::scratch_notes(&chart, None);
+    let mut st = super::AutoplayScratch::NEW;
+    let mut turned = Vec::new();
+    let mut from = None;
+    for t in 0..=3_000 * MS {
+        let [positive, negative] = update(&mut st, &notes, t);
+        assert!(!negative);
+        match (positive, from) {
+            (true, None) => from = Some(t),
+            (false, Some(f)) => {
+                turned.push((f, t));
+                from = None;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(turned, held);
 }
 
 /// A press whose deadline passed before a movement is released first, as

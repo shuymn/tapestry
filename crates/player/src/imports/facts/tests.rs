@@ -42,18 +42,18 @@ pub(crate) fn loaded_kept(text: &str, preset: &str) -> (tempfile::TempDir, game:
     (dir, loaded)
 }
 
-/// The source's `Integer.parseInt` on `#PLAYLEVEL`: an optional sign,
-/// then decimal digits of any script in the Basic Multilingual Plane,
-/// within `i32`; anything else 0.
+/// `#PLAYLEVEL` read as an integer token: an optional sign, then ASCII
+/// digits, within `i32`; anything else 0, other scripts' digits included.
 #[test]
-fn the_level_parses_as_the_source_does() {
+fn the_level_is_an_ascii_integer_token() {
     for (text, level) in [
         ("12", 12),
         ("+12", 12),
         ("-1", -1),
-        ("０１２", 12),
-        ("١٢", 12),
-        ("1٢", 12),
+        ("-0", 0),
+        ("０１２", 0),
+        ("١٢", 0),
+        ("1٢", 0),
         ("", 0),
         (" 12", 0),
         ("12 ", 0),
@@ -68,11 +68,15 @@ fn the_level_parses_as_the_source_does() {
         ("-2147483649", 0),
         ("99999999999999999999", 0),
         ("0000000000000000000012", 12),
-        // Mathematical bold digit one and two: outside the BMP, so two
-        // surrogates each, neither a digit.
+        // Mathematical bold digits one and two: not ASCII.
         ("\u{1D7CF}\u{1D7D0}", 0),
         ("Ⅻ", 0),
         ("½", 0),
+        ("1e1", 0),
+        ("0x0C", 0),
+        ("1_2", 0),
+        ("NaN", 0),
+        ("12.0", 0),
     ] {
         assert_eq!(level_of(text), level, "{text:?}");
     }
@@ -85,7 +89,8 @@ fn the_level_parses_as_the_source_does() {
 fn an_attempt_reads_the_loaders_level() {
     for (text, level) in [
         ("#PLAYLEVEL   12  \n", 12),
-        ("#PLAYLEVEL \u{3000}１２\u{3000}\n", 12),
+        ("#PLAYLEVEL \u{3000}12\u{3000}\n", 12),
+        ("#PLAYLEVEL １２\n", 0),
         ("#PLAYLEVEL 7\n#PLAYLEVEL 9\n", 9),
         (
             "#PLAYLEVEL 1\n#SETRANDOM 2\n#IF 1\n#PLAYLEVEL 3\n#ENDIF\n\

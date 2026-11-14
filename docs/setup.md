@@ -62,7 +62,7 @@ mise install
 mise exec -- lefthook install
 ```
 
-The pre-commit hook runs the banned-word check, the `rustfmt` check (of the workspace and of the fuzz crate), actionlint and shellcheck on staged workflows and scripts, and `cargo xtask check-alloc-tests` when `ci.yml`, a test file or a manifest is staged. The hook is for noticing problems early locally; CI is the final gate.
+The pre-commit hook runs the banned-word check, the `rustfmt` check (`cargo xtask check-fmt`: each workspace package and the fuzz crate, one rustfmt run per package, so a long checkout path on Windows stays under the command-line limit), actionlint and shellcheck on staged workflows and scripts, and `cargo xtask check-alloc-tests` when `ci.yml`, a test file or a manifest is staged. The hook is for noticing problems early locally; CI is the final gate.
 
 ### Lock Updates
 

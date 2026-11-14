@@ -4,12 +4,10 @@
 expect-reason 3 crates/skin-model/src/present/num.rs
 expect-reason 2 crates/skin-model/src/widget/bpm_graph.rs
 expect-reason 1 crates/skin-model/tests/play.rs
-java-name 1 crates/bms-parser/src/parse.rs
 source-name 4 crates/eval/tests/style_beatoraja.rs
 source-name 5 crates/eval/tests/style_lr2.rs
 source-name 2 crates/game/src/result_figures_tests.rs
 source-name 1 crates/game/tests/errors.rs
-source-name 1 crates/player/src/imports/facts/tests.rs
 source-name 1 crates/skin-beatoraja/src/import/property.rs
 source-name 1 crates/skin-beatoraja/src/import/result/profile/tests.rs
 source-name 1 crates/skin-beatoraja/src/import/widget/gauge.rs
@@ -27,4 +25,3 @@ source-name 1 crates/skin-model/tests/judge_graph.rs
 source-name 1 crates/skin-model/tests/present.rs
 source-name 1 crates/skin-model/tests/present_num.rs
 source-name 2 crates/skin-model/tests/timing_graph.rs
-utf16 1 crates/bms-parser/src/parse.rs

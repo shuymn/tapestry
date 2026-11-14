@@ -171,8 +171,8 @@ fn skins_after(seen: &Seen, from: usize) -> usize {
 /// the player: the choice pins the ready slot and its screen lasts
 /// 3,000 ms from the choice; the render thread is told the choice, the
 /// timing and the slot; every skin frame drawn runs its timers from the
-/// choice, timer 1 on only past 500 ms (off at 500,000 µs, on 1 µs later)
-/// and timer 2 from 2,500 ms; the transition comes at 3,000 ms, not
+/// choice, timer 1 from 500 ms (off 1 µs before, on at 500,000 µs) and
+/// timer 2 from 2,500 ms; the transition comes at 3,000 ms, not
 /// before; the step ends the lifetime and the slot is retired.
 #[test]
 fn skin_decision_timeline_through_the_player() {
@@ -202,8 +202,8 @@ fn skin_decision_timeline_through_the_player() {
         );
         assert_eq!(sent.timing.input, TimeUs(500 * MS));
         let input = |us| decision_frame_of(&sent, at(us), [1_920, 1_080]).timers;
-        assert_eq!(input(500 * MS).input, None, "timer 1 at 500,000 µs");
-        assert_eq!(input(500 * MS + 1).input, Some(at(500 * MS)));
+        assert_eq!(input(500 * MS - 1).input, None, "timer 1 before 500 ms");
+        assert_eq!(input(500 * MS).input, Some(at(500 * MS)));
         assert_eq!(input(2_500 * MS - 1).fadeout, None);
         assert_eq!(input(2_500 * MS).fadeout, Some(at(2_500 * MS)));
         // The frames drawn through the fade-out run their timers from the
@@ -218,7 +218,7 @@ fn skin_decision_timeline_through_the_player() {
         }));
         for &(now, input, fadeout) in f.seen.timers.lock().unwrap().iter() {
             let late = now.0 - origin.0;
-            assert_eq!(input, (late > 500 * MS).then_some(at(500 * MS)), "{late}");
+            assert_eq!(input, (late >= 500 * MS).then_some(at(500 * MS)), "{late}");
             assert_eq!(fadeout, (late >= 2_500 * MS).then_some(at(2_500 * MS)));
         }
         assert_eq!(
@@ -303,7 +303,8 @@ fn fresh_press_needed_after_skin_decision_epoch() {
 
 /// R4.1, R4.3 (stage3's list): the skin's build refused at 1,000 ms gives
 /// the built-in presentation at once, the deadline at 1,500 ms from the
-/// original choice, no presentation sent again and no second tone; at
+/// original choice, no presentation sent again and no second decision
+/// sound (C25-2: the choice's one start, none for the takeover); at
 /// 2,000 ms the screen ends at once on its route: the loading state on
 /// the play path, the practice page once its chart is read.
 #[test]
@@ -312,9 +313,11 @@ fn takeover_restarts_no_clock_and_plays_no_tone() {
         let dir = listed();
         flow(&dir, |rig, f| {
             f.prepared();
-            let tones = rig.audio.control.failure_probe();
+            let probe = rig.audio.control.failure_probe();
             let sent = rig.render.decisions_sent();
             let mut d = choose(rig, &f.pick(practice), 3);
+            // The choice's start moves the probe.
+            assert_eq!(probe.system_starts(audio::SystemKind::Decide), 1);
             let origin = d.origin();
             assert!(wait_until(|| skins_after(&f.seen, 0) > 0));
             until_clock(rig, TimeUs(origin.0 + refused_ms * MS));
@@ -340,7 +343,12 @@ fn takeover_restarts_no_clock_and_plays_no_tone() {
             assert!(wait_until(|| f.seen.len() > from + 2));
             assert_eq!(skins_after(&f.seen, from), 0);
             assert_eq!(sent(), 1, "a presentation sent again");
-            assert_eq!(tones.tone_requests(), 1, "a second tone");
+            assert_eq!(
+                probe.system_starts(audio::SystemKind::Decide),
+                1,
+                "a second decision sound"
+            );
+            assert_eq!(probe.tone_requests(), 0, "a tone request");
             if refused_ms == 1_000 {
                 let at = |us| TimeUs(origin.0 + us);
                 assert_eq!(

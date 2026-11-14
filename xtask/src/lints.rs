@@ -204,7 +204,6 @@ pub const IN_PLAY: &[Site] = &[
             "AutoplayScratch::reset",
             "AutoplayScratch::update",
             "AutoplayScratch::pressed",
-            "state_ms",
         ],
     ),
     Site::Fns(

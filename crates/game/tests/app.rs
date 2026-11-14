@@ -586,6 +586,14 @@ struct Headless {
     /// Told at the first decision look that finds the run ending (a close
     /// or a thread's failure).
     ending_seen: Option<mpsc::Sender<()>>,
+    /// With a gated read: the gate the rig opens itself at the `.0`th look
+    /// of the read made while its call is held, or at the first look that
+    /// finds the run ending, so a cancelled read can settle.
+    release_read_at: Option<(usize, mpsc::Sender<()>)>,
+    /// The read's looks made while its call was held at the gate.
+    held_read_looks: usize,
+    /// The held looks and the clock when the rig opened the gate.
+    read_released: Option<(usize, i64)>,
     /// A play's load finishes at its deadline, its bank refused: a reply
     /// in hand with the deadline due.
     refuse_load_at_deadline: bool,
@@ -829,6 +837,9 @@ impl Headless {
             escape_when_waiting: false,
             escapes: 0,
             ending_seen: None,
+            release_read_at: None,
+            held_read_looks: 0,
+            read_released: None,
             refuse_load_at_deadline: false,
             refused_at: Vec::new(),
             page_entered_at: Vec::new(),
@@ -1711,6 +1722,18 @@ impl AppRig for Headless {
         }
         self.tick();
         self.decision_looks.push((origin, self.at()));
+        if origin == game::Origin::Read && self.probe.as_ref().is_some_and(|p| p.held()) {
+            self.held_read_looks += 1;
+        }
+        if self
+            .release_read_at
+            .as_ref()
+            .is_some_and(|&(n, _)| self.held_read_looks >= n || self.quitting())
+            && let Some((_, open)) = self.release_read_at.take()
+        {
+            self.read_released = Some((self.held_read_looks, self.at()));
+            let _ = open.send(());
+        }
         if (self.quitting()
             || game::Rig::input_failure(self).is_some()
             || game::Rig::audio_failure(self).is_some())
@@ -5348,6 +5371,14 @@ fn decided(rig: &mut Headless) {
     rig.shown = Some(DecisionShown::BuiltIn);
 }
 
+/// The decision screen on, its read's looks moving no time: the read's
+/// worker is real, so a test that holds a refusal to the deadline does not
+/// let a slow worker carry the clock to its scripted close.
+fn decided_read_in_time(rig: &mut Headless) {
+    decided(rig);
+    rig.read_step_ms = 0;
+}
+
 /// The choice's clock time on the decision screen of chart `i`.
 fn chosen_at(rig: &Headless, i: usize) -> i64 {
     let [(c, at)] = rig.decisions[..] else {
@@ -5363,7 +5394,7 @@ fn chosen_at(rig: &Headless, i: usize) -> i64 {
 #[test]
 fn a_load_done_in_decision_opens_after_the_deadline() {
     let acts = vec![(0, Act::Choose(0)), (6_000, Act::Close)];
-    let (rig, _events, ran) = run(Refusal::Missing, acts, decided);
+    let (rig, _events, ran) = run(Refusal::Missing, acts, decided_read_in_time);
     ran.unwrap();
     assert!(rig.violations.is_empty(), "{:?}", rig.violations);
     let choice = chosen_at(&rig, 0);
@@ -5424,7 +5455,7 @@ fn a_refusal_in_decision_waits_for_the_deadline() {
         (Refusal::Preset, 0),
     ] {
         let acts = vec![(0, Act::Choose(chart)), (6_000, Act::Close)];
-        let (rig, _events, ran) = run(refusal, acts, decided);
+        let (rig, _events, ran) = run(refusal, acts, decided_read_in_time);
         ran.unwrap();
         assert!(
             rig.violations.is_empty(),
@@ -5446,6 +5477,40 @@ fn a_refusal_in_decision_waits_for_the_deadline() {
         );
         assert_eq!(rig.closed_epochs, 1, "{refusal:?}");
     }
+}
+
+/// E3, with the read held across 80 of its looks, as a slow worker would
+/// be: the clock stays at the choice while it waits, and the bank's refusal
+/// is still held to the deadline, before the scripted close.
+#[test]
+fn a_refusal_in_decision_waits_for_the_deadline_after_a_slow_read() {
+    let acts = vec![(0, Act::Choose(2)), (6_000, Act::Close)];
+    let (started_tx, _started) = mpsc::channel();
+    let (open_tx, open) = mpsc::channel();
+    let run = run_probed(
+        Refusal::Bank,
+        acts,
+        Spawner::SYSTEM,
+        |p| p.gated(0, started_tx, open),
+        |rig, _| {
+            decided_read_in_time(rig);
+            rig.release_read_at = Some((80, open_tx));
+        },
+    );
+    run.ran.as_ref().unwrap();
+    let rig = &run.rig;
+    assert!(rig.violations.is_empty(), "{:?}", rig.violations);
+    let choice = chosen_at(rig, 2);
+    assert_eq!(
+        rig.read_released,
+        Some((80, choice)),
+        "the read was let go by the close, not after its looks"
+    );
+    assert_eq!(run.probe.ended(), 1, "the read finished");
+    assert_eq!(rig.refused_at, [choice + 1_500 * MS], "{:?}", rig.seen);
+    assert!(rig.deadline_steps.is_empty(), "stepped");
+    assert!(rig.loading_pages.is_empty(), "the loading state shown");
+    assert_eq!(rig.closed_epochs, 1);
 }
 
 /// E3b: the bank's refusal in hand with the deadline due at the same look:
@@ -6065,7 +6130,7 @@ fn a_refusal_at_the_deadline_does_not_wait_for_a_rebuild() {
 fn a_screen_failure_in_the_chart_load_ends_the_run() {
     let acts = vec![(0, Act::Choose(0)), (10_000, Act::Close)];
     let (rig, _events, ran) = run(Refusal::Missing, acts, |rig| {
-        decided(rig);
+        decided_read_in_time(rig);
         rig.screen_lost_in_load = true;
     });
     assert!(

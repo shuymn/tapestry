@@ -9,9 +9,11 @@ pre-commit:
     # No glob: file names are checked too.
     banned-words:
       run: mise exec -- cargo xtask banned-words --staged
+    # Per package: `cargo fmt --all` overflows Windows' command-line limit
+    # under a long checkout path.
     rustfmt:
       glob: "**/*.rs"
-      run: mise exec -- cargo fmt --all --check && mise exec -- cargo fmt --manifest-path fuzz/Cargo.toml --check
+      run: mise exec -- cargo xtask check-fmt
     actionlint:
       glob: ".github/workflows/*.{yml,yaml}"
       run: mise exec -- actionlint

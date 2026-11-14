@@ -922,9 +922,11 @@ impl Drop for CloseOnDrop<'_> {
 
 /// What a run gave: how `App::run` ended, the frames drawn and the plays
 /// that ended; each decision screen the render thread left, as its record
-/// says, and each presented decision frame's stamp.
+/// says, and each presented decision frame's stamp; and the audio output's
+/// probe, read after the run.
 struct Ran {
     ran: Result<(), game::LiveError<crate::render_side::ScreenError>>,
+    probe: game::OutputProbe,
     frames: Vec<Drawn>,
     ended: Vec<game::PlayEnd>,
     records: Vec<DecisionRecord>,
@@ -1120,6 +1122,7 @@ fn run_with(
         rig.result_skin.set_wake(rig.controls.game_thread());
         rig.selection = Some(sel);
         rig.scenario = opts.captures.map(crate::selection::tests::capture_state);
+        let probe = rig.audio.control.failure_probe();
         if saved {
             rig.measured_plays = Some(Arc::clone(&measured));
         }
@@ -1176,9 +1179,9 @@ fn run_with(
             .as_ref()
             .and_then(|s| s.script.as_ref())
             .and_then(|s| s.failure().map(str::to_owned));
-        (ran, ended, failure)
+        (ran, ended, failure, probe)
     });
-    let (ran, ended, failure) = ran;
+    let (ran, ended, failure, probe) = ran;
     // Read while the run's data folder stands.
     let measured = measured
         .lock()
@@ -1202,6 +1205,7 @@ fn run_with(
         .clone();
     Ran {
         ran,
+        probe,
         frames: seen.frames(),
         ended,
         records,
@@ -1703,6 +1707,34 @@ fn allocations_before_and_after_recovery_both_count() {
         stamps.iter().all(|s| *s == DecisionDrawnAs::Skin),
         "{stamps:?}"
     );
+}
+
+/// C25-2: a decision screen lost on its third frame is rebuilt through
+/// `App::run`'s recovery (`PlayerRig::begin_recovery`, `poll_recovery`)
+/// and draws the skin again, and the run's one choice requested one
+/// decision sound: with no set, one tone, none for the rebuild.
+#[test]
+fn a_decision_rebuild_plays_no_second_decide() {
+    use audio::SystemKind;
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        faults: Some(crate::dev::DecisionFaults::parse("lost3")),
+        ..Opts::default()
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        side.prepared();
+        let (chosen, ..) = side.choose(MenuKey::Enter);
+        side.frames_until(chosen, "skin frames after the recovery", |f| {
+            skin_frames(f) >= 5
+        });
+        assert_eq!((side.fired)(), 1, "the loss fired");
+        side.to_loading();
+    });
+    let (r, _) = one_record(&ran);
+    assert_eq!(r.presentation(), "skin", "{r:?}");
+    assert_eq!(ran.probe.system_starts(SystemKind::Decide), 1);
+    assert_eq!(ran.probe.tones_started(), 1);
+    assert_eq!(ran.probe.tone_requests(), 0);
 }
 
 /// The origin of a select step, for a script made of compiled steps.
