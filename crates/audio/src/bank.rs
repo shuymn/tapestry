@@ -1925,13 +1925,7 @@ mod tests {
     /// against a 2000-byte bank: the broken one's charges, live and (for a
     /// known length) declared, must be returned for the healthy one to fit.
     fn failure_then_healthy(fault: Fault, known: bool, name: &str) {
-        // The workspace's target directory, as for the integration tests.
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
-        std::fs::create_dir_all(&root).unwrap();
-        let dir = tempfile::Builder::new()
-            .prefix("audio-unit-")
-            .tempdir_in(root)
-            .unwrap();
+        let dir = unit_dir();
         let broken = dir.path().join(format!("{name}.wav"));
         let healthy = dir.path().join("healthy.wav");
         std::fs::write(&broken, wav(&[100; 500], known)).unwrap();
@@ -2176,12 +2170,7 @@ mod tests {
     /// pool; the bank is the one loaded without it.
     #[test]
     fn progress_counts_every_distinct_file_once() {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
-        std::fs::create_dir_all(&root).unwrap();
-        let dir = tempfile::Builder::new()
-            .prefix("audio-unit-")
-            .tempdir_in(root)
-            .unwrap();
+        let dir = unit_dir();
         let files = ["a", "b", "same-as-a", "broken"].map(|n| dir.path().join(format!("{n}.wav")));
         std::fs::write(&files[0], wav(&[100; 400], true)).unwrap();
         std::fs::write(&files[1], wav(&[200; 300], true)).unwrap();
@@ -2227,12 +2216,7 @@ mod tests {
     /// `n` distinct sounds of 400 frames in a fresh directory, and a chart
     /// playing each once.
     fn distinct(n: usize) -> (tempfile::TempDir, Chart) {
-        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
-        std::fs::create_dir_all(&root).unwrap();
-        let dir = tempfile::Builder::new()
-            .prefix("audio-unit-")
-            .tempdir_in(root)
-            .unwrap();
+        let dir = unit_dir();
         let mut builder = ChartBuilder::new(120_000);
         for i in 0..n {
             builder = builder

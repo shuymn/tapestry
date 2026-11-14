@@ -1154,7 +1154,6 @@ fn pick_body(
     let resolution = resolve(pick, links, &mut |id| {
         !recovery.admits(id) || pick.skipped.contains(id)
     });
-    let mut refused = resolution.refused;
     let mut slots: Slots = Default::default();
     // The kept sounds first, each content charged once and taken, so a file
     // of the same bytes shares the kept sound.
@@ -1187,7 +1186,7 @@ fn pick_body(
         decode: PickDecode::Cancelled,
         recovery: Ok(()),
         kept: KeptSounds::default(),
-        refused: Vec::new(),
+        refused: resolution.refused,
         panicked: Vec::new(),
     };
     let mut cancelled = false;
@@ -1225,7 +1224,7 @@ fn pick_body(
                 refused: r,
                 cancelled: c,
             }) => {
-                refused.extend(r);
+                report.refused.extend(r);
                 for (kind, sound, digest) in sounds {
                     if let Some(slot) = slots.get_mut(kind.index()) {
                         *slot = Some(Kept {
@@ -1247,7 +1246,6 @@ fn pick_body(
             break;
         }
     }
-    report.refused = refused;
     if cancelled {
         return report;
     }
