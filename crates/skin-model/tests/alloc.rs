@@ -1973,12 +1973,16 @@ fn build_does_not_allocate() {
     let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
     let mut small = QuadBatch::with_capacity(8, 4);
     let lead_in = 1_000 * MS;
+    // The whole chart's finish point: its last note's end, the long note
+    // ending at 100 s, plus 5 s.
+    let finish = TimeUs(105_000 * MS);
     let full = PlayContext {
         meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: &descs,
         attempt: Attempt::Full {
             lead_in: TimeUs(lead_in),
+            finish,
         },
         empty_poor_breaks_combo: true,
         empty_poor_counted: false,
@@ -2055,7 +2059,13 @@ fn build_does_not_allocate() {
             Attempt::Section(s) => [s.initial_gauges[0], s.initial_gauges[1]],
         };
         let mut gauges = initial.map(state);
-        let to = events.last().unwrap().time.0 + 1_000 * MS;
+        // A whole chart's frames run past its finish point, so its progress
+        // reads the whole too.
+        let last = events.last().unwrap().time.0 + 1_000 * MS;
+        let to = match ctx.attempt {
+            Attempt::Full { finish, .. } => last.max(finish.0 + 1_000 * MS),
+            Attempt::Section(_) => last,
+        };
         let mut w = Witness::new();
         let counted = ctx.empty_poor_counted;
         let mut notes = NoteFacts::new(&chart);
@@ -2098,6 +2108,12 @@ fn build_does_not_allocate() {
         assert!(w.paint, "{name}: SUDDEN+'s paint never drew");
         assert!(w.slider_moved, "{name}: the slider paint never moved");
         assert!(w.progress_moved, "{name}: the progress slider never moved");
+        if matches!(ctx.attempt, Attempt::Full { .. }) {
+            assert_eq!(
+                w.progress_reads, [true; 3],
+                "{name}: the progress never read 0, a share or the whole"
+            );
+        }
         assert_eq!(w.choices, [true; 3], "{name}: an image choice never drew");
         assert!(w.choice_later, "{name}: no image choice entry animated");
         assert!(w.rates_apart, "{name}: the rates never moved apart");
@@ -4015,8 +4031,11 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: descs,
+        // The last note at 4 s plus 5 s; the background sound at 6 s does
+        // not anchor a normal play.
         attempt: Attempt::Full {
             lead_in: TimeUs(1_000 * MS),
+            finish: TimeUs(9_000 * MS),
         },
         empty_poor_breaks_combo: false,
         empty_poor_counted: false,
@@ -4085,7 +4104,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
             let mut results = [Ok(()); 3];
             let (mut first, mut last, mut known) = (None, 0, [false; 2]);
             TRACK.with(|t| t.set(true));
-            for (i, now) in (-1_000 * MS..=8_000 * MS)
+            for (i, now) in (-1_000 * MS..=10_000 * MS)
                 .step_by(16 * MS as usize)
                 .enumerate()
             {
@@ -4104,13 +4123,13 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
             }
             results[1] = skin.build(
                 &mut play,
-                &frame(8_100 * MS, invalid),
+                &frame(10_100 * MS, invalid),
                 &loaded.uvs,
                 &mut batch,
             );
             results[2] = skin.build(
                 &mut play,
-                &frame(8_200 * MS, readouts_for(lanes)),
+                &frame(10_200 * MS, readouts_for(lanes)),
                 &loaded.uvs,
                 &mut batch,
             );
@@ -4146,13 +4165,13 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         assert_eq!(first, Err(BuildError::InvalidReadouts));
         assert_eq!(after, Err(BuildError::InvalidReadouts));
     }
-    // The chart's last object at 6 s, the round's end at 5 s from 1.5 s;
-    // past both nothing remains.
+    // The play's finish at 9 s, the round's end at 5 s from 1.5 s; past
+    // both nothing remains.
     assert_eq!(
         seen,
         [
-            (Some(6), 0, [true; 2]),
-            (Some(6), 0, [true; 2]),
+            (Some(9), 0, [true; 2]),
+            (Some(9), 0, [true; 2]),
             (Some(4), 0, [true; 2]),
             (Some(4), 0, [true; 2])
         ]
@@ -4161,7 +4180,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
 
 /// The rhythm clock (`rhythm`) read by an element and a `when` timer,
 /// frame by frame across bar lines, a tempo change, a STOP, the completed
-/// tail past the progress end + 5 s, a READY rearm whose `now` goes back,
+/// tail past the play's finish point, a READY rearm whose `now` goes back,
 /// Closing and a terminal frame without it: nothing allocates; with a
 /// positive control.
 fn rhythm_does_not_allocate(descs: &[GaugeDesc]) {
@@ -4190,6 +4209,7 @@ fn rhythm_does_not_allocate(descs: &[GaugeDesc]) {
         gauges: descs,
         attempt: Attempt::Full {
             lead_in: TimeUs(1_000 * MS),
+            finish: TimeUs(9_000 * MS),
         },
         empty_poor_breaks_combo: false,
         empty_poor_counted: false,
@@ -4244,7 +4264,7 @@ fn rhythm_does_not_allocate(descs: &[GaugeDesc]) {
     };
     let mut results = Ok(());
     TRACK.with(|t| t.set(true));
-    // READY, playing, then the completed tail to past 4 s + 5 s.
+    // READY, playing, then the completed tail to past the finish at 9 s.
     for now in (-1_000 * MS..=10_000 * MS).step_by(16 * MS as usize) {
         batch.clear();
         let playing = now < 4_100 * MS;
@@ -4331,6 +4351,7 @@ fn main_bpm_does_not_allocate(descs: &[GaugeDesc]) {
     };
     let full = ctx(Attempt::Full {
         lead_in: TimeUs(500 * MS),
+        finish: TimeUs(7_000 * MS),
     });
     let practice = PlayContext {
         score: skin_model::PlayScore {
@@ -4411,10 +4432,11 @@ fn main_bpm_does_not_allocate(descs: &[GaugeDesc]) {
 
 /// The load's and the play's progress bars (graphs 102 and 101) and the
 /// chart's 1× length (`chart.length_ms`, read by a `when` timer's
-/// program), over a play's frames from READY past its end, a rearm, a
-/// practice round at k = 10 and loading frames with and without a chosen
-/// length: nothing allocates; each bar draws, the length reads 125 400
-/// throughout; with a positive control.
+/// program), over a play's frames from READY past its finish point, a
+/// rearm, a practice round at k = 10 and loading frames with and without a
+/// chosen length: nothing allocates; each bar draws, and the length reads
+/// 125 400 in every frame of each attempt, each kept in its own store
+/// reserved before counting; with a positive control.
 fn progress_and_length_do_not_allocate(descs: &[GaugeDesc]) {
     let mut chart = ChartBuilder::new(150_000)
         .tap(lane(1), TimeUs(1_000 * MS))
@@ -4495,9 +4517,11 @@ fn progress_and_length_do_not_allocate(descs: &[GaugeDesc]) {
             ..skin_model::PlayScore::NONE
         },
     };
+    // The tap at 2 s plus 5 s.
     let full = ctx(
         Attempt::Full {
             lead_in: TimeUs(500 * MS),
+            finish: TimeUs(7_000 * MS),
         },
         bms_model::Speed::NORMAL,
     );
@@ -4559,20 +4583,23 @@ fn progress_and_length_do_not_allocate(descs: &[GaugeDesc]) {
         skin.prepare(&chart, &practice).unwrap(),
     ];
     let mut loading = skin.prepare_loading(Side::Left);
-    let (mut read, mut drawn, mut loading_drawn) = (Vec::with_capacity(1_024), 0, 0);
+    let span = (-500 * MS..=8_000 * MS).step_by(16 * MS as usize);
+    // Each attempt's readings, one a frame of its two passes, reserved
+    // before counting starts.
+    let frames = 2 * span.clone().count();
+    let mut read = [Vec::with_capacity(frames), Vec::with_capacity(frames)];
+    let (mut drawn, mut loading_drawn) = (0, 0);
     let mut results = Ok(());
     TRACK.with(|t| t.set(true));
-    for play in &mut plays {
+    for (play, read) in plays.iter_mut().zip(&mut read) {
         for pass in 0..2 {
             if pass == 1 {
                 play.rearm();
             }
-            for now in (-500 * MS..=3_000 * MS).step_by(16 * MS as usize) {
+            for now in span.clone() {
                 batch.clear();
                 results = results.and(skin.build(play, &frame(now), &uvs, &mut batch));
-                if read.len() < read.capacity() {
-                    read.push(play.state().fields[usize::from(field::CHART_LENGTH_MS)]);
-                }
+                read.push(play.state().fields[usize::from(field::CHART_LENGTH_MS)]);
                 drawn += batch.quads().len();
             }
         }
@@ -4590,10 +4617,10 @@ fn progress_and_length_do_not_allocate(descs: &[GaugeDesc]) {
         "progress and length: allocations"
     );
     assert_eq!(results, Ok(()));
-    assert!(
-        !read.is_empty() && read.iter().all(|&r| r == 125_400),
-        "{read:?}"
-    );
+    for (name, read) in ["play", "practice"].into_iter().zip(&read) {
+        assert_eq!(read.len(), frames, "{name}: a frame read nothing");
+        assert!(read.iter().all(|&r| r == 125_400), "{name}: {read:?}");
+    }
     assert!(drawn > 0 && loading_drawn > 0, "{drawn} {loading_drawn}");
     // The positive control: an allocation on this thread is counted.
     TRACK.with(|t| t.set(true));

@@ -14,7 +14,7 @@ use rules::RulePreset;
 use tempfile::NamedTempFile;
 
 use crate::bests::{
-    BestKey, BestLookup, BestView, PlayBest, ProgressLookup, ProgressQuery, SavedPlay,
+    BestKey, BestLookup, BestView, PlayBest, PlayerTotals, ProgressLookup, ProgressQuery, SavedPlay,
 };
 use crate::error::IoFailure;
 
@@ -207,6 +207,14 @@ pub trait RecordSink {
             best: self.best_before(key, preset),
             progress: ProgressLookup::Unavailable,
         }
+    }
+
+    /// The player's totals, this play counted, for a result's views
+    /// (design.md "Personal Bests", skin projections). One read per result,
+    /// on the result's thread. `None` by default, and when the read fails:
+    /// a sink that keeps no bests knows none.
+    fn totals(&mut self) -> Option<PlayerTotals> {
+        None
     }
 }
 

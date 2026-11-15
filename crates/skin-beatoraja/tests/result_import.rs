@@ -1439,3 +1439,100 @@ fn the_result_length_reads_whole_minutes() {
         );
     }
 }
+
+/// The player's totals' numbers, by `ref` on row `i` from y 400.
+const PLAYER_NUMBERS: [i32; 12] = [17, 18, 19, 30, 31, 32, 33, 34, 35, 36, 37, 333];
+
+/// [`ready`] and [`unavailable`] views carrying the player's totals: 7
+/// plays, 3 clears, PERFECT to POOR 101 to 505, 12 345.9 s.
+fn with_totals(mut v: ResultView) -> ResultView {
+    v.totals = skin_model::PlayerTotals {
+        plays: 7,
+        clears: 3,
+        counts: [101, 202, 303, 404, 505],
+        play_us: 12_345_900_000,
+    };
+    v
+}
+
+/// C15: a JSON result skin reading numbers 17 to 19, 30 to 37 and 333
+/// draws the player's totals, none unsupported, in a view with a result
+/// and in one without (`IntegerPropertyFactory.java:94-120` at `0.8.9`).
+#[test]
+fn a_result_skin_draws_the_player_totals() {
+    let mut values = vec![value("ex", r#""ref": 71"#)];
+    let mut dsts = vec![dst("ex", ""), dst("dot", r#""op": [90],"#)];
+    for (i, id) in PLAYER_NUMBERS.iter().enumerate() {
+        values.push(format!(
+            r#"{{"id": "p{id}", {DIGITS}, "digit": 6, "ref": {id}}}"#
+        ));
+        dsts.push(format!(
+            r#"{{"id": "p{id}", "dst": [{{"x": 0, "y": {}, "w": 4, "h": 8}}]}}"#,
+            400 + 10 * i
+        ));
+    }
+    let d = folder(&format!(
+        r#""value": [{}], "destination": [{}]"#,
+        values.join(", "),
+        dsts.join(", ")
+    ));
+    let i = import_result(d.path()).unwrap();
+    assert!(
+        !i.report.notes.iter().any(|n| matches!(
+            n.kind,
+            NoteKind::UnsupportedProperty { id: Some(id), .. } if PLAYER_NUMBERS.contains(&id)
+        )),
+        "{:?}",
+        i.report.notes
+    );
+    let mut r = Res::new(i.skin);
+    let want = [
+        "3", "25", "45", "7", "3", "4", "101", "202", "303", "404", "505", "1010",
+    ];
+    for (what, v) in [
+        (
+            "ready",
+            with_totals(ready(1_000, true, BestView::Unavailable)),
+        ),
+        ("unavailable", with_totals(unavailable())),
+    ] {
+        r.view(&v);
+        for (i, want) in want.iter().enumerate() {
+            let y = top(400.0 + 10.0 * f32::from(u8::try_from(i).unwrap()), 8.0);
+            assert_eq!(r.digits(0, y), *want, "{what} {}", PLAYER_NUMBERS[i]);
+        }
+    }
+}
+
+/// C15: a Lua result skin reading the player's totals while it loads gets
+/// the view's values, recorded as the result's facts, in a view without a
+/// result too: 7 plays and 45 s place its image at 7 · 10 + 45.
+#[test]
+fn a_lua_result_skin_reads_the_totals_while_it_loads() {
+    let pre = "local x = ms.number(30) * 10 + ms.number(19)";
+    let ex = lua_value("ex", 4, "ref = 71");
+    // The status image under op 90, and the image the reads place, drawn
+    // in a view without a result too.
+    let dsts = lua_dst("ex", 100, 4, "")
+        + ", { id = \"dot\", op = { 90 }, dst = { { x = 0, y = 500, w = 8, h = 8 } } }"
+        + ", { id = \"dot\", dst = { { x = x, y = 300, w = 8, h = 8 } } }";
+    let d = sheet();
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin(pre, &ex, "", &dsts).as_bytes(),
+    );
+    let read = |n, v| FactRead {
+        fact: FactId::ResultNumber(n),
+        value: FactValue::Int(v),
+    };
+    for v in [
+        with_totals(ready(1_000, true, best(ResultNumber::Shown(0)))),
+        with_totals(unavailable()),
+    ] {
+        let i = lua_result(d.path(), &facts(Some(&v))).unwrap_or_else(|e| panic!("{e:?}"));
+        assert_eq!(i.facts.reads, [read(30, 7), read(19, 45)]);
+        assert!(i.facts.holds(&facts(Some(&v))));
+        assert_eq!(status_x(i, &v), 115.0);
+    }
+}

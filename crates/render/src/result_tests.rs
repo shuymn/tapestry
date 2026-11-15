@@ -308,6 +308,7 @@ fn view(ex: u32) -> ResultView {
         deviations: None,
         timing_areas: None,
         timelines: None,
+        totals: Default::default(),
     }
 }
 

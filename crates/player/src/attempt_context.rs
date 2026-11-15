@@ -33,6 +33,9 @@ pub struct AttemptContext {
     scratch: Side,
     ln_default: rules::LnMode,
     last_note_end: TimeUs,
+    /// A full play's finish point ([`game::Attempt::finish`]), where the
+    /// skin's readouts end.
+    finish: TimeUs,
     /// The chart's labels, which its prepared text shows.
     labels: ChartLabels,
     /// The tempo provider and references of the chart as loaded at the
@@ -80,6 +83,7 @@ impl AttemptContext {
             scratch,
             ln_default: attempt.ln_default,
             last_note_end: attempt.last_note_end,
+            finish: attempt.finish,
             play_level: level_of(&attempt.labels.playlevel),
             meta: ChartMetadata {
                 difficulty: Some(difficulty_of(&attempt.labels.difficulty)),
@@ -169,7 +173,10 @@ impl AttemptContext {
             autoplay: self.autoplay,
             gauges: &self.gauges,
             attempt: match &self.kind {
-                AttemptKind::Full { lead_in } => skin_model::Attempt::Full { lead_in: *lead_in },
+                AttemptKind::Full { lead_in } => skin_model::Attempt::Full {
+                    lead_in: *lead_in,
+                    finish: self.finish,
+                },
                 AttemptKind::Section(section) => skin_model::Attempt::Section(section),
             },
             empty_poor_breaks_combo: self.empty_poor_breaks_combo,
@@ -220,6 +227,9 @@ pub(crate) fn bpm_whole_change(meta: &bms_model::TempoMeta) -> bool {
 pub(crate) mod meta_tests;
 
 #[cfg(test)]
+mod finish_tests;
+
+#[cfg(test)]
 mod tests {
     use bms_model::TimeUs;
     use game::{Attempt, ChartLabels};
@@ -250,6 +260,7 @@ mod tests {
             TimeUs(2_000_000),
             Some(&section),
             TimeUs(1_000_000),
+            TimeUs(6_000_000),
             &ChartLabels {
                 title: "t".to_owned(),
                 subtitle: "s".to_owned(),
@@ -335,6 +346,7 @@ mod tests {
                 TimeUs(0),
                 None,
                 TimeUs(2_000_000),
+                TimeUs(7_000_000),
                 &ChartLabels::default(),
                 &chart,
             );
@@ -373,6 +385,7 @@ mod tests {
             TimeUs(0),
             None,
             TimeUs(1_000_000),
+            TimeUs(6_000_000),
             &ChartLabels::default(),
             &chart,
         );

@@ -554,6 +554,7 @@ fn paced_attempt(chart: &Chart, pace: Arc<[u32]>) -> AttemptContext {
             TimeUs(1_000_000),
             None,
             game::NoteEnd::Play.of(chart),
+            game::finish_point(game::finish_anchor(chart, false)),
             &game::ChartLabels::default(),
             chart,
         )

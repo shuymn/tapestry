@@ -219,6 +219,7 @@ pub fn ready() -> ResultView {
         gauge: None,
         deviations: None,
         timing_areas: None,
+        totals: Default::default(),
     }
 }
 

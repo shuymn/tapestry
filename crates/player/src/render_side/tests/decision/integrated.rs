@@ -13,7 +13,7 @@
 //! clock limits only detect a hang.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -247,8 +247,16 @@ struct Seen {
     probe: AtomicBool,
     /// A chart's load on the render thread waits here while held.
     load_gate: crate::render_side::TestGate,
+    /// The next result skin frame's submission reports the device lost.
+    lose_result: AtomicBool,
+    /// The losses [`lose_result`](Self::lose_result) made.
+    lost: AtomicU64,
     drawn: Mutex<Vec<Drawn>>,
     more: Condvar,
+    /// Play frames built from a view the game published as playing, and
+    /// as in Closing.
+    playing: AtomicU64,
+    closing: AtomicU64,
 }
 
 impl Seen {
@@ -448,6 +456,10 @@ impl Screen for Noted {
         self.menu.build_result(state, frame)
     }
     fn submit_result(&mut self) -> Result<FrameTiming, RenderError> {
+        if self.seen.lose_result.swap(false, Ordering::AcqRel) {
+            self.seen.lost.fetch_add(1, Ordering::AcqRel);
+            return Err(RenderError::DeviceLost);
+        }
         let t = self.menu.submit_result()?;
         let quads = self
             .menu
@@ -554,6 +566,12 @@ impl Screen for Noted {
         self.menu.rearm();
     }
     fn build(&mut self, f: &render::FrameInput<'_>) -> Result<(), BuildError> {
+        if f.view.playing {
+            self.seen.playing.fetch_add(1, Ordering::AcqRel);
+        }
+        if f.view.closing.is_some() {
+            self.seen.closing.fetch_add(1, Ordering::AcqRel);
+        }
         self.menu.build(f)
     }
     fn draw(&mut self) -> Result<FrameTiming, RenderError> {
@@ -707,17 +725,40 @@ struct Set {
     selection: TempDir,
     decision: TempDir,
     entry: &'static str,
-    result: TempDir,
+    /// None: the built-in result.
+    result: Option<TempDir>,
 }
 
 impl Set {
     fn new(entry: &'static str) -> Self {
+        Self::with_play(entry, "")
+    }
+
+    /// [`new`](Self::new) with `body` in the play skin's script, after
+    /// its table is made (`skin` names it).
+    fn with_play(entry: &'static str, body: &str) -> Self {
+        Self::with_parts(
+            entry,
+            body,
+            Some(crate::render_side::tests::result::lua_skin_scripted("", RESULT_MARK).0),
+        )
+    }
+
+    /// The set with `result` as its result skin's folder, none for the
+    /// built-in result.
+    fn with_result(entry: &'static str, result: Option<TempDir>) -> Self {
+        Self::with_parts(entry, "", result)
+    }
+
+    /// The set with `body` in the play skin's script and `result` as its
+    /// result skin's folder.
+    fn with_parts(entry: &'static str, body: &str, result: Option<TempDir>) -> Self {
         Self {
-            play: crate::imports::tests::lua_skin(""),
+            play: crate::imports::tests::lua_skin(body),
             selection: crate::selection_skin::fixture(),
             decision: decision_dir(),
             entry,
-            result: crate::render_side::tests::result::lua_skin_scripted("", RESULT_MARK).0,
+            result,
         }
     }
 
@@ -727,7 +768,7 @@ impl Set {
             play: Some(choice(self.play.path(), "play.luaskin")),
             selection: Some(choice(self.selection.path(), "s.json")),
             decision: Some(choice(self.decision.path(), self.entry)),
-            result: Some(choice(self.result.path(), "s.luaskin")),
+            result: self.result.as_ref().map(|r| choice(r.path(), "s.luaskin")),
         }
     }
 }
@@ -760,6 +801,14 @@ struct Side<'a> {
     cleanup_gate: Arc<crate::render_side::TestGate>,
     /// The decision screens the render thread left so far.
     decided: Arc<Decided>,
+    /// The audio output's probe, read while the run goes on: the system
+    /// sounds' requests.
+    probe: game::OutputProbe,
+    /// The result's preparation waits here at each poll while held.
+    result_gate: Arc<crate::render_side::TestGate>,
+    /// The game thread's screen rebuilds and the end screen's shows after
+    /// them.
+    rebuilds: Arc<crate::play::RebuildProbe>,
 }
 
 impl Side<'_> {
@@ -929,6 +978,8 @@ struct Ran {
     probe: game::OutputProbe,
     frames: Vec<Drawn>,
     ended: Vec<game::PlayEnd>,
+    /// Each ended play's Closing, in order (`None` without one).
+    closings: Vec<Option<game::ClosingReport>>,
     records: Vec<DecisionRecord>,
     stamps: Vec<(u64, DecisionDrawnAs)>,
     /// Why the select screen's script failed, if it did.
@@ -958,6 +1009,22 @@ struct Opts {
     scenario: Option<&'static [&'static str]>,
     /// A scenario's choice held at its ready gate from the start.
     hold_ready: bool,
+    /// The system sounds' set for the run's owner to pick, and
+    /// `[sounds] loop_result` at startup.
+    sounds: Option<ResultSounds>,
+    /// A user preset written to the App's data root, its play preset.
+    user_preset: Option<rules::RulePreset>,
+    /// The chart's text in place of the one-note chart.
+    chart: Option<&'static str>,
+}
+
+/// The sound set a run's system sounds pick: `clear` (1.25 s) and `fail`
+/// (0.83 s), and `resultclose` (0.63 s) when `close`; `[sounds]
+/// loop_result` as `looped` at startup.
+#[derive(Clone, Copy, Debug, Default)]
+struct ResultSounds {
+    close: bool,
+    looped: bool,
 }
 
 /// `set` installed by production's startup on a render thread of
@@ -1040,11 +1107,12 @@ fn run_with(
     );
     assert!(started.pending.is_none(), "the play skin is fixed");
     assert!(started.selection.is_some(), "the select screen's song list");
-    assert!(
+    assert_eq!(
         matches!(
             started.result,
             Some(crate::result_skin::ResultStart::Fixed(..))
         ),
+        set.result.is_some(),
         "the result skin is fixed"
     );
     let book = link.label_book();
@@ -1063,7 +1131,8 @@ fn run_with(
     std::fs::create_dir_all(&root).unwrap();
     std::fs::write(
         root.join("a.bms"),
-        "#TITLE a\n#BPM 120\n#00111:01\n#00138:01\n",
+        opts.chart
+            .unwrap_or("#TITLE a\n#BPM 120\n#00111:01\n#00138:01\n"),
     )
     .unwrap();
     let (mut sel, roots) = crate::selection::tests::over(charts.path(), vec![root]);
@@ -1077,13 +1146,38 @@ fn run_with(
     let saved = opts.saved;
     let measured: crate::play::MeasuredPlays = Arc::default();
     sel.started(started.notice.into_iter().collect(), started.selection);
-    let settings = game::Settings {
+    let mut settings = game::Settings {
         device: game::DeviceSettings::default(),
         player: game::PlayerSettings::default(),
     };
+    // The set the system sounds pick, armed for the owner the rig makes on
+    // this thread; its folder lives through the run.
+    let _sounds = opts.sounds.map(|s| {
+        use audio::SystemKind;
+        let fx = crate::system_sounds::tests::Fixture::new();
+        fx.sound("sound/A", SystemKind::Clear, 60_000);
+        fx.sound("sound/A", SystemKind::Fail, 40_000);
+        if s.close {
+            fx.sound("sound/A", SystemKind::ResultClose, 30_000);
+        }
+        let root = fx.root();
+        crate::system_sounds::arm(move |setup, _| {
+            setup.root = root;
+            setup.fs = Box::new(crate::system_sounds::tests::MemFs::new());
+        });
+        settings.player.sounds.loop_result = s.looped;
+        fx
+    });
     let mut app_settings = settings.clone();
     if let Some(p) = preset {
         p.clone_into(&mut app_settings.player.preset);
+    }
+    if let Some(p) = &opts.user_preset {
+        p.id.clone_into(&mut app_settings.player.preset);
+        let presets = game::DataRoot::new(charts.path().join("app")).presets();
+        std::fs::create_dir_all(&presets).unwrap();
+        let file = presets.join(format!("{}.toml", p.id));
+        std::fs::write(file, game::preset_to_toml(p)).unwrap();
     }
     let (ran, _) = crate::tests::on_rig_hooked(settings, link, clock, |rig, _, end| {
         use input::{DeviceId, DeviceKind, SourceConfig, SourceSet};
@@ -1123,6 +1217,8 @@ fn run_with(
         rig.selection = Some(sel);
         rig.scenario = opts.captures.map(crate::selection::tests::capture_state);
         let probe = rig.audio.control.failure_probe();
+        let result_gate = Arc::clone(&rig.result_gate);
+        let rebuilds = Arc::clone(&rig.rebuilds);
         if saved {
             rig.measured_plays = Some(Arc::clone(&measured));
         }
@@ -1142,6 +1238,9 @@ fn run_with(
             decisions_sent: Box::new(decisions_sent),
             cleanup_gate: Arc::clone(&cleanup_gate),
             decided: Arc::clone(&decided),
+            probe: probe.clone(),
+            result_gate,
+            rebuilds,
         };
         let root = game::DataRoot::new(charts.path().join("app"));
         let parts = root.clone();
@@ -1174,14 +1273,15 @@ fn run_with(
         });
         thread.stop().unwrap();
         let ended = rig.ended_plays.iter().map(|(end, _)| *end).collect();
+        let closings = rig.ended_closings.clone();
         let failure = rig
             .selection
             .as_ref()
             .and_then(|s| s.script.as_ref())
             .and_then(|s| s.failure().map(str::to_owned));
-        (ran, ended, failure, probe)
+        (ran, ended, closings, failure, probe)
     });
-    let (ran, ended, failure, probe) = ran;
+    let (ran, ended, closings, failure, probe) = ran;
     // Read while the run's data folder stands.
     let measured = measured
         .lock()
@@ -1208,6 +1308,7 @@ fn run_with(
         probe,
         frames: seen.frames(),
         ended,
+        closings,
         records,
         stamps,
         failure,
@@ -2378,4 +2479,460 @@ fn the_practice_page_leaves_the_decision_screen() {
     assert!(ran.ran.is_ok(), "{:?}", ran.ran);
     let why = failed(&c, 0);
     assert!(why.contains("its decision screen ended"), "{why}");
+}
+
+/// The tapestry preset with no judgment changing its gauges: when
+/// `clears`, `lenient`, every gauge starting full, so a play run to its
+/// end clears whatever it missed; otherwise `harsh`, every gauge starting
+/// at its least and clearing only full, so none clears.
+fn user_preset(clears: bool) -> rules::RulePreset {
+    let mut p = rules::tapestry();
+    let id = if clears { "lenient" } else { "harsh" };
+    id.clone_into(&mut p.id);
+    let none = rules::GaugeDelta::Fixed(rules::GaugeValue::EMPTY);
+    for g in &mut p.gauges {
+        if clears {
+            g.start = g.max;
+        } else {
+            g.kind = rules::GaugeKind::EndThreshold { clear: g.max };
+            g.start = g.min;
+        }
+        g.change = rules::PerJudgment {
+            perfect: none,
+            great: none,
+            good: none,
+            bad: none,
+            poor: none,
+        };
+        g.empty_poor = none;
+        g.low_damage.clear();
+    }
+    p
+}
+
+/// How a result cell's play ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Outcome {
+    /// Run to its end under the lenient [`user_preset`]: the own view
+    /// clears.
+    Cleared,
+    /// Run to its end under the harsh [`user_preset`]: the own view fails.
+    Failed,
+    /// The quit key during the play, between its two notes.
+    Midway,
+}
+
+/// How a result cell leaves Result.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Exit {
+    /// Retry, at the skin's input time.
+    Retry,
+    /// The quit key (back) at the skin's input time.
+    Quit,
+    /// The skin's scene time (800 ms) with no command.
+    Scene,
+    /// The quit key on the built-in result (no result skin).
+    BuiltIn,
+    /// A retry pressed while the result prepares: it never shows.
+    Withdrawn,
+    /// The quit key, then the device lost on a result frame during the
+    /// fade-out; served once the outro is over.
+    Lost,
+}
+
+/// The three result kinds, in this order.
+const RESULT_KINDS: [audio::SystemKind; 3] = [
+    audio::SystemKind::Clear,
+    audio::SystemKind::Fail,
+    audio::SystemKind::ResultClose,
+];
+
+/// The result kinds' starts and stops so far.
+fn result_counts(probe: &game::OutputProbe) -> ([u64; 3], [u64; 3]) {
+    (
+        RESULT_KINDS.map(|k| probe.system_starts(k)),
+        RESULT_KINDS.map(|k| probe.system_stops(k)),
+    )
+}
+
+/// The result skin of a cell: input 100 ms, fade-out 500 ms and `scene`
+/// ms (0, never), its marker, and a box on timer 2 drawn only once the
+/// fade-out has begun.
+fn result_skin(scene: i64) -> TempDir {
+    let head = format!("skin.input = 100 skin.fadeout = 500 skin.scene = {scene}\n");
+    let places = format!(
+        "{RESULT_MARK}\n{{ id = \"dot\", timer = 2, dst = {{ {{ x = 0, y = 500, w = 8, h = 8 }} }} }},"
+    );
+    crate::render_side::tests::result::lua_skin_scripted(&head, &places).0
+}
+
+/// The index and quads of the first skinned result frame at or after
+/// `from`.
+fn result_quads(frames: &[Drawn], from: usize) -> Option<(usize, usize)> {
+    frames
+        .iter()
+        .enumerate()
+        .skip(from)
+        .find_map(|(i, d)| match d.frame {
+            Frame::Result { quads, .. } if quads > 0 => Some((i, quads)),
+            _ => None,
+        })
+}
+
+/// A cell: the chart chosen, played to `outcome`, its result left by
+/// `exit`, with a set that has `resultclose` when `close`, `[sounds]
+/// loop_result` as `looped`; the result kinds' starts and stops are read,
+/// in order with the flow, against those before the play.
+#[track_caller]
+fn result_cell(outcome: Outcome, exit: Exit, close: bool, looped: bool) {
+    use audio::SystemKind;
+    use game::Command;
+    let case = format!("{outcome:?}, {exit:?}, resultclose {close}, loop_result {looped}");
+    let skin = match exit {
+        Exit::BuiltIn => None,
+        Exit::Scene => Some(result_skin(800)),
+        _ => Some(result_skin(0)),
+    };
+    let set = Set::with_result("s.luaskin", skin);
+    let opts = Opts {
+        sounds: Some(ResultSounds { close, looped }),
+        user_preset: match outcome {
+            Outcome::Cleared => Some(user_preset(true)),
+            Outcome::Failed => Some(user_preset(false)),
+            Outcome::Midway => None,
+        },
+        // Notes at 2 s and 8 s: the quit key at 4 s on the run's clock
+        // from the first play frame falls between them.
+        chart: (outcome == Outcome::Midway)
+            .then_some("#TITLE a\n#BPM 120\n#00111:01\n#00138:01\n#00411:01\n"),
+        ..Opts::default()
+    };
+    let kind = if outcome == Outcome::Cleared {
+        SystemKind::Clear
+    } else {
+        SystemKind::Fail
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        let probe = &side.probe;
+        side.prepared();
+        let (chosen, ..) = side.choose(MenuKey::Enter);
+        // Before the play: what the selection's entry and exit drew.
+        let (starts0, stops0) = result_counts(probe);
+        assert_eq!(starts0, [0, 0, 0], "{case}: before the play");
+        let delta = |p: &game::OutputProbe| {
+            let (s, t) = result_counts(p);
+            (
+                [0, 1, 2].map(|i| s[i] - starts0[i]),
+                [0, 1, 2].map(|i| t[i] - stops0[i]),
+            )
+        };
+        if exit == Exit::Withdrawn {
+            side.result_gate.hold(true);
+        }
+        // The decision screen's scene (2.5 s) and fade-out (0.5 s) over at
+        // once.
+        side.clock.set(TimeUs(chosen.0 + 3_000 * MS));
+        side.to_loading();
+        // The play's first frame, then, once recording is open (READY's 1 s
+        // lead-in over), its clock moved on to 4 s past that frame: past the
+        // first note at 2 s, before the midway chart's second at 8 s, and
+        // before the end of a full play's tail, which then runs on the
+        // running clock. The audio thread catches up the 2.5 s skipped
+        // during that tail, seconds before the result's sounds start.
+        let frames = side
+            .seen
+            .until("a play frame", |d| d.iter().any(|d| d.frame == Frame::Play));
+        let first = frames
+            .iter()
+            .find(|d| d.frame == Frame::Play)
+            .map(|d| d.at)
+            .unwrap();
+        side.seen.until("a play frame past READY", |d| {
+            d.iter()
+                .any(|d| d.frame == Frame::Play && d.at.0 >= first.0 + 1_500 * MS)
+        });
+        let held = side.hold_clock();
+        side.clock.set(TimeUs(held.0.max(first.0 + 4_000 * MS)));
+        side.clock.run();
+        if outcome == Outcome::Midway {
+            side.seen.until("a play frame 4 s on", |d| {
+                d.iter()
+                    .any(|d| d.frame == Frame::Play && d.at.0 >= first.0 + 4_000 * MS)
+            });
+            side.controls.command(Command::Quit);
+        }
+        if exit == Exit::Withdrawn {
+            assert!(
+                wait_until(|| side.result_gate.waiting()),
+                "{case}: the preparation polled"
+            );
+            let held = side.hold_clock();
+            side.controls.command(Command::Retry);
+            let from = side.seen.frames().len();
+            side.result_gate.hold(false);
+            side.seen.until("the retry's play", |d| {
+                d.iter().skip(from).any(|d| d.frame == Frame::Play)
+            });
+            assert_eq!(side.clock.now(), held, "{case}: the clock held");
+            assert_eq!(delta(probe), ([0; 3], [0; 3]), "{case}: withdrawn");
+            return;
+        }
+        // The result's first frame: its show asked for its sound.
+        let frames = side.seen.until("the result's first frame", |d| {
+            d.iter().any(|d| match d.frame {
+                Frame::Result { quads, .. } => quads > 0,
+                Frame::End => exit == Exit::BuiltIn,
+                _ => false,
+            })
+        });
+        let shown = if exit == Exit::BuiltIn {
+            None
+        } else {
+            Some(result_quads(&frames, 0).expect("a skinned result frame"))
+        };
+        let own = if kind == SystemKind::Clear {
+            [1, 0, 0]
+        } else {
+            [0, 1, 0]
+        };
+        // The show publishes its frame before it asks for its sound: the
+        // ask is waited for apart from the frame.
+        assert!(
+            wait_until(|| delta(probe).0.iter().sum::<u64>() >= 1),
+            "{case}: the show's start"
+        );
+        assert_eq!(delta(probe), (own, [0; 3]), "{case}: the show");
+        assert!(
+            wait_until(|| probe.reserved(kind).is_some()),
+            "{case}: the result's sound sounds"
+        );
+        assert_eq!(
+            probe.reserved(kind).map(|(_, l)| l),
+            Some(looped),
+            "{case}: looped as loop_result"
+        );
+        // The skin's input time passed from its origin, on the held clock.
+        let t0 = side.hold_clock();
+        let at = match exit {
+            Exit::Scene => TimeUs(t0.0 + 900 * MS),
+            _ => TimeUs(t0.0 + 200 * MS),
+        };
+        side.clock.set(at);
+        match exit {
+            Exit::Retry => side.controls.command(Command::Retry),
+            Exit::Quit | Exit::BuiltIn | Exit::Lost => side.controls.command(Command::Quit),
+            Exit::Scene | Exit::Withdrawn => {}
+        }
+        if let Some((first, quads)) = shown {
+            // The fade-out began: the timer-2 box drawn.
+            side.seen.until("the fade-out", |d| {
+                d.iter()
+                    .skip(first + 1)
+                    .any(|d| matches!(d.frame, Frame::Result { quads: q, .. } if q > quads))
+            });
+            let swap = u64::from(close);
+            if close {
+                assert!(
+                    wait_until(|| probe.system_starts(SystemKind::ResultClose) > 0),
+                    "{case}: resultclose at the fade-out"
+                );
+            }
+            let mut fading = own;
+            fading[2] = swap;
+            assert_eq!(
+                delta(probe),
+                (fading, [swap, swap, 0]),
+                "{case}: the fade-out's start"
+            );
+            if exit == Exit::Lost {
+                // Held at a frame wait, every frame drawn before is noted
+                // and none is under way: the next submission after the gate
+                // opens is the lost one, so every frame noted from `from` on
+                // is the rebuilt screen's.
+                side.seen.gate.hold();
+                let from = side.seen.frames().len();
+                let rebuilt = side.rebuilds.rebuilt.load(Ordering::Acquire);
+                side.seen.lose_result.store(true, Ordering::Release);
+                side.seen.gate.release();
+                assert!(
+                    wait_until(|| side.seen.lost.load(Ordering::Acquire) == 1),
+                    "{case}: the loss taken"
+                );
+                // The game thread built the screen again and showed the
+                // result after it, its requests made.
+                assert!(
+                    wait_until(|| side.rebuilds.shown.load(Ordering::Acquire) > rebuilt),
+                    "{case}: the result shown after the rebuild"
+                );
+                side.seen.until("a result frame after the loss", |d| {
+                    d.iter()
+                        .skip(from)
+                        .any(|d| matches!(d.frame, Frame::Result { quads, .. } if quads > 0))
+                });
+                assert_eq!(
+                    delta(probe),
+                    (fading, [swap, swap, 0]),
+                    "{case}: the screen built again mid fade-out"
+                );
+            }
+            // The outro over: the command is served.
+            side.clock.set(TimeUs(at.0 + 600 * MS));
+        }
+        // Leaving Result stops all three: once for a retry, and once more
+        // by the entry to selection after back.
+        let left = if exit == Exit::Retry { 1 } else { 2 };
+        assert!(
+            wait_until(|| delta(probe).1[2] >= left),
+            "{case}: Result left: {:?}",
+            delta(probe)
+        );
+        let swap = u64::from(close && exit != Exit::BuiltIn);
+        let mut starts = own;
+        starts[2] = swap;
+        assert_eq!(
+            delta(probe),
+            (starts, [left + swap, left + swap, left]),
+            "{case}: Result left"
+        );
+    });
+    assert!(ran.ran.is_ok(), "{case}: {:?}", ran.ran);
+}
+
+/// C27-1–C27-4 through `App::run` on the player's rig (design.md "State
+/// Model", system sounds, Result), per exit, each with and without
+/// `resultclose`, `loop_result` on in the cell with it, the outcomes
+/// rotated so each appears in four cells: the result's show starts `clear`
+/// or `fail` by the own view's lamp, looped as `loop_result` says; a
+/// skin's fade-out (a command or the scene time) swaps it for
+/// `resultclose` when the set has one and otherwise leaves it; the
+/// built-in result plays none; a result frame's device loss mid fade-out
+/// starts and stops nothing; leaving stops all three; a retry that
+/// withdraws the preparation starts and stops nothing.
+// Source: SF-015
+#[test]
+fn result_sounds_through_a_run() {
+    let exits = [
+        Exit::Retry,
+        Exit::Quit,
+        Exit::Scene,
+        Exit::BuiltIn,
+        Exit::Withdrawn,
+        Exit::Lost,
+    ];
+    let outcomes = [Outcome::Cleared, Outcome::Failed, Outcome::Midway];
+    let mut i = 0;
+    for exit in exits {
+        for close in [false, true] {
+            result_cell(outcomes[i % 3], exit, close, close);
+            i += 1;
+        }
+    }
+}
+
+/// C26-1, C26-2, C26-3 through the whole run, the system sounds armed with
+/// a sound set holding `playready` and `playstop`: the chart chosen, the
+/// quit key during its play enters Closing, a retry in Closing opens the
+/// second READY, and the second play runs to its result. Read on the result,
+/// before the run's close: two `playready` and one `playstop` asked, and
+/// neither stopped from the first READY on, the retry and the chart's start
+/// included. Selection's entry stops every set kind before that, so the
+/// stops are counted from the first READY.
+/// `tapestry play <chart>` makes the same owner in `rig()` and plays
+/// through the same `open_and_play`.
+///
+/// Each key is placed by what the game published, never by a wait on the
+/// wall clock: the quit key once a play frame shows the play playing (so
+/// its transport committed), with 70 s of chart left; the retry once
+/// Closing asked its sound, with the 90 s of Closing the play skin
+/// declares left. The first play's Closing report then shows it ended by
+/// the retry, so a retry that landed after Closing ran out (taken by the
+/// result's preparation, which also retries) fails the test instead of
+/// passing it. The second play, once a frame shows it playing, is moved
+/// past its end on the held clock.
+// Source: SF-013
+#[test]
+fn ready_and_closing_sounds_through_a_run() {
+    use audio::SystemKind::{Clear, PlayReady, PlayStop};
+    use game::Command;
+
+    let fx = crate::system_sounds::tests::Fixture::new();
+    for kind in [Clear, PlayReady, PlayStop] {
+        fx.sound("sound/A", kind, 48_000);
+    }
+    let root = fx.root();
+    crate::system_sounds::arm(move |setup, _| setup.root = root);
+    let set = Set::with_play("s.json", "skin.close = 90000");
+    let opts = Opts {
+        // Its one note at 70 s (measure 35 at 120 BPM).
+        chart: Some("#TITLE a\n#BPM 120\n#03511:01\n#03538:01\n"),
+        ..Opts::default()
+    };
+    let Ran {
+        ran,
+        ended,
+        closings,
+        ..
+    } = run_with(&set, None, opts, |side| {
+        // As the song selection launch sets it: the quit key leaves the
+        // play it arrives in.
+        side.controls.quit_leaves();
+        let probe = &side.probe;
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            assert!(wait_until(done), "never {what}");
+        };
+        let results = || {
+            side.seen
+                .frames()
+                .iter()
+                .filter(|d| matches!(d.frame, Frame::Result { .. } | Frame::End))
+                .count()
+        };
+        side.prepared();
+        side.press(MenuKey::Enter);
+        until("the first READY", &|| probe.system_starts(PlayReady) == 1);
+        assert_eq!(probe.system_starts(PlayStop), 0, "a closing sound in READY");
+        let stops = |kind| probe.system_stops(kind);
+        let before = [stops(PlayReady), stops(PlayStop)];
+        until("the first play playing", &|| {
+            side.seen.playing.load(Ordering::Acquire) > 0
+        });
+        side.controls.command(Command::Quit);
+        until("Closing's sound", &|| probe.system_starts(PlayStop) == 1);
+        until("a frame of Closing", &|| {
+            side.seen.closing.load(Ordering::Acquire) > 0
+        });
+        side.controls.command(Command::Retry);
+        until("the retry's READY", &|| probe.system_starts(PlayReady) == 2);
+        assert_eq!(results(), 0, "a result showed before the retry");
+        let played = side.seen.playing.load(Ordering::Acquire);
+        until("the second play playing", &|| {
+            side.seen.playing.load(Ordering::Acquire) > played
+        });
+        // Past the chart's end and its five-second hold.
+        let now = side.hold_clock();
+        side.clock.set(TimeUs(now.0 + 90_000 * MS));
+        side.clock.run();
+        until("the second play's result", &|| results() > 0);
+        assert_eq!(probe.system_starts(PlayReady), 2);
+        assert_eq!(probe.system_starts(PlayStop), 1);
+        assert_eq!(stops(PlayReady) - before[0], 0, "the ready sound stopped");
+        assert_eq!(stops(PlayStop) - before[1], 0, "the closing sound stopped");
+    });
+    assert!(ran.is_ok(), "{ran:?}");
+    assert_eq!(
+        ended,
+        [
+            game::PlayEnd::Aborted(game::AbortCause::Quit),
+            game::PlayEnd::Completed
+        ]
+    );
+    // The retry ended the first play's Closing; the second play had none.
+    assert_eq!(
+        closings
+            .iter()
+            .map(|c| c.map(|c| c.end))
+            .collect::<Vec<_>>(),
+        [Some(game::ClosingEnd::Retry), None],
+        "the retry did not land in Closing"
+    );
 }

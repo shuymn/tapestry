@@ -369,18 +369,26 @@ fn check_f2(_: &Header, i: Imported) {
         ..skin_model::FrameReadouts::UNAVAILABLE
     };
     // In ROTATION's order at 0 ms, one note at 1 s: rates 100.00 and 0.00,
-    // BPMs 300, 75 and 150.75, 0 s played, 1 s left, the covers, hi-speed
-    // 1.05 and 667.5 ms.
+    // BPMs 300, 75 and 150.75, 0 s played, 6 s left to the finish (the
+    // note + 5 s), the covers, hi-speed 1.05 and 667.5 ms.
     #[rustfmt::skip]
     let shown = [
-        "100", "0", "0", "0", "0", "0", "300", "75", "150", "0", "0", "0", "1",
+        "100", "0", "0", "0", "0", "0", "300", "75", "150", "0", "0", "0", "6",
         "500", "250", "120", "500", "105", "1", "5", "668", "400",
     ];
-    let mut d = Drawn::over_with(i.skin, &chart, Some(range), None);
+    let mut d = Drawn::over_context(
+        i.skin,
+        &chart,
+        &common::play::finishing(bms_model::TimeUs(6_000_000), Some(range)),
+    );
     d.readouts = Some(known);
     assert_eq!(f2_numbers(&mut d), f2_expected(&shown));
     // Unknown, the tempo, hi-speed and duration numbers draw nothing.
-    let mut d = Drawn::over_with(d.skin, &chart, None, None);
+    let mut d = Drawn::over_context(
+        d.skin,
+        &chart,
+        &common::play::finishing(bms_model::TimeUs(6_000_000), None),
+    );
     d.readouts = Some(skin_model::FrameReadouts {
         bpm_current_x100: None,
         hispeed_x100: None,
