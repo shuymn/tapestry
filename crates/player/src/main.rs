@@ -1725,7 +1725,11 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     );
     #[cfg(feature = "dev-tools")]
     let frames: Box<dyn render_side::FrameSink> = match (&scenario, s.dev.frames) {
-        (Some(sc), _) => Box::new(dev::scenario::ScenarioFrames::from_env(sc.captures.clone())),
+        (Some(sc), _) => Box::new(dev::scenario::ScenarioFrames::from_env(
+            sc.captures.clone(),
+            sc.transitions.clone(),
+            clock,
+        )),
         (None, Some(dir)) => Box::new(dev::FrameDump::new(dir, TimeUs(1_000_000))),
         (None, None) => Box::new(NoFrames),
     };
@@ -1813,6 +1817,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         rig.scenario = Some(dev::scenario::State {
             logs: sc.logs,
             captures: sc.captures,
+            transitions: sc.transitions,
             recorded: rig.recorded.clone(),
             chart_input: None,
             pending: None,
@@ -1920,7 +1925,22 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     }
     #[cfg(feature = "dev-tools")]
     if let Some((sc, script)) = scenario {
-        return dev::scenario::conclude(ran, script.as_ref(), sc.pending, rendered, &sc.captures);
+        // The transition record, printed off the render thread now that
+        // it has ended (design.md "Shortening Launch-Based Checks").
+        let record = sc.transitions.lines();
+        if let Ok((lines, _)) = &record {
+            for l in lines {
+                println!("{l}");
+            }
+        }
+        return dev::scenario::conclude(
+            ran,
+            script.as_ref(),
+            sc.pending,
+            rendered,
+            &sc.captures,
+            record.map(|(_, lost)| lost),
+        );
     }
     ran?;
     #[cfg(feature = "dev-tools")]

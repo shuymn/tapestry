@@ -1280,6 +1280,21 @@ pub trait FrameSink: Send {
     fn decision_left(&mut self, record: &crate::measure::DecisionRecord) {
         let _ = record;
     }
+
+    /// The play's in-play interval ended at `at`, on the clock: its result
+    /// is prepared from now (dev-tools, design.md "State Model",
+    /// ResultPreparing).
+    #[cfg(feature = "dev-tools")]
+    fn play_ended(&mut self, at: TimeUs) {
+        let _ = at;
+    }
+
+    /// The render thread took a result's presentation, or the built-in
+    /// result's page, at `at`, on the clock (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    fn result_taken(&mut self, at: TimeUs) {
+        let _ = at;
+    }
 }
 
 /// No frame sink.
@@ -4296,6 +4311,100 @@ const fn screen_kind(mode: &Mode, decision: bool, page_turns: bool) -> crate::me
     }
 }
 
+/// What a frame's stage is read from, beside its mode (dev-tools).
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, Default)]
+struct StageFacts {
+    /// The decision screen's lifetime and what its frame drew.
+    decision: Option<(u64, crate::measure::DecisionDrawnAs)>,
+    /// Whether a decision screen is shown.
+    deciding: bool,
+    /// Whether the practice page's turntable runs.
+    page_turns: bool,
+    /// The selection lifetime a selection frame drew, and whether it drew
+    /// the skin.
+    selection: Option<(u64, bool)>,
+    /// Whether a loading frame drew the skin's presentation.
+    skin_loading: bool,
+    /// A play frame's chart time.
+    play: Option<TimeUs>,
+    /// The view a play frame acquired.
+    view: Option<crate::measure::ViewStamp>,
+    /// What a result frame drew.
+    result: Option<crate::measure::ResultStamp>,
+}
+
+/// The stage of a frame drawn in `mode` (dev-tools: a scenario's
+/// transition record): its state as the frame drew it (READY, the play,
+/// its tail and Closing apart; a selection frame is selection whether its
+/// skin or its built-in page drew it), the lifetime of that state, and
+/// what drew it.
+#[cfg(feature = "dev-tools")]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+fn stage_of(mode: &Mode, f: &StageFacts) -> crate::measure::Stage {
+    use crate::measure::{DecisionDrawnAs as D, Drew, ResultPath, Stage, State};
+    let stage = |state, lifetime, drew| Stage {
+        state,
+        lifetime,
+        drew,
+    };
+    let result = |path: Option<ResultPath>| {
+        let lifetime = f.result.and_then(|r| r.id).map_or(0, |id| id.seq);
+        let drew = match path {
+            Some(ResultPath::Skin) => Drew::Skin,
+            Some(ResultPath::Refused) => Drew::Refused,
+            Some(ResultPath::BuiltIn) | None => Drew::BuiltIn,
+        };
+        stage(State::Result, lifetime, drew)
+    };
+    let decision = || {
+        let (lifetime, drew) = f.decision.map_or((0, Drew::BuiltIn), |(l, d)| {
+            (
+                l,
+                match d {
+                    D::Skin => Drew::Skin,
+                    D::BuiltIn => Drew::BuiltIn,
+                    D::Fallback => Drew::Fallback,
+                    D::Ended => Drew::Ended,
+                },
+            )
+        });
+        stage(State::Decision, lifetime, drew)
+    };
+    match mode {
+        Mode::Idle | Mode::Splash { .. } => Stage::plain(State::Splash),
+        Mode::Play { state_origin, .. } => {
+            let state = match (f.play, f.view) {
+                (Some(t), Some(v)) => crate::measure::play_phase(t, &v),
+                _ => State::PlayPending,
+            };
+            stage(state, state_origin.0.unsigned_abs(), Drew::Plain)
+        }
+        Mode::End => result(None),
+        Mode::Result => result(f.result.map(|r| r.path)),
+        Mode::Selection => {
+            let (lifetime, skinned) = f.selection.unwrap_or((0, false));
+            let drew = if skinned { Drew::Skin } else { Drew::BuiltIn };
+            stage(State::Selection, lifetime, drew)
+        }
+        Mode::Menu {
+            loading: Some(lifetime),
+            ..
+        } => {
+            let drew = if f.skin_loading {
+                Drew::Skin
+            } else {
+                Drew::Pending
+            };
+            stage(State::Loading, *lifetime, drew)
+        }
+        Mode::Decision => decision(),
+        Mode::Menu { .. } if f.deciding => decision(),
+        Mode::Menu { .. } if f.page_turns => Stage::plain(State::Practice),
+        Mode::Menu { .. } => Stage::plain(State::Page),
+    }
+}
+
 /// The token a play attempt's staging of request `request` bears on the
 /// screen of device `device`.
 const fn attempt_token(request: u64, device: u64) -> PreparedToken {
@@ -5038,6 +5147,34 @@ struct FirstFrame {
     lifetime: u64,
     shown_at: TimeUs,
     ended: bool,
+    /// The time the render thread held the frame, once it has (dev-tools:
+    /// a scenario's transition record).
+    #[cfg(feature = "dev-tools")]
+    hold: Option<crate::measure::HoldStamp>,
+}
+
+#[cfg(feature = "dev-tools")]
+impl FirstFrame {
+    /// A held wait from `from` to `to`.
+    fn held(&mut self, from: TimeUs, to: TimeUs) {
+        let lifetime = self.lifetime;
+        let h = self.hold.get_or_insert(crate::measure::HoldStamp {
+            lifetime,
+            from,
+            to,
+            ended_by: None,
+        });
+        h.to = to;
+    }
+
+    /// The hold, if there was one, ended for `why`.
+    fn hold_ended(&mut self, why: crate::measure::HoldEnd) {
+        if let Some(h) = &mut self.hold
+            && h.ended_by.is_none()
+        {
+            h.ended_by = Some(why);
+        }
+    }
 }
 
 /// The first frame's hold bound: [`FIRST_FRAME_HOLD`], or a test's.
@@ -5528,6 +5665,8 @@ impl Run {
                 Ok(RenderMsg::ResultChanged) => {
                     self.take_result();
                     if self.current_result().is_some() {
+                        #[cfg(feature = "dev-tools")]
+                        self.frames.result_taken(self.clock.now());
                         self.clear_decision();
                         mode = Mode::Result;
                     }
@@ -5794,6 +5933,11 @@ impl Run {
                 // Its page, or a newer one an earlier signal took; whether
                 // it may still be drawn is checked before every end frame.
                 Ok(RenderMsg::End) => {
+                    // The built-in result's page, or a result skin's rows
+                    // before its presentation is taken: either ends the
+                    // result's preparation, whichever comes first.
+                    #[cfg(feature = "dev-tools")]
+                    self.frames.result_taken(self.clock.now());
                     let shows = self.current_result().is_some_and(ResultSide::shows);
                     if let Some(page) = self.shared.take_end() {
                         self.end_page = page;
@@ -5817,7 +5961,10 @@ impl Run {
                     // The frames drawn before the end are written when it
                     // is answered.
                     #[cfg(feature = "dev-tools")]
-                    self.frames.finish();
+                    {
+                        self.frames.play_ended(self.clock.now());
+                        self.frames.finish();
+                    }
                     let _ = reply.send(self.measure.finish(end));
                 }
                 Ok(RenderMsg::Follow(extent)) => {
@@ -5958,6 +6105,8 @@ impl Run {
                             lifetime,
                             shown_at,
                             ended: false,
+                            #[cfg(feature = "dev-tools")]
+                            hold: None,
                         }
                     }
                 };
@@ -5973,6 +6122,8 @@ impl Run {
                 if pending && screen.device_lost() {
                     // The screen's failure, as a frame's.
                     first.ended = true;
+                    #[cfg(feature = "dev-tools")]
+                    first.hold_ended(crate::measure::HoldEnd::DeviceLost);
                     self.first_frame = Some(first);
                     eprintln!("render: {}", Chain(&RenderError::DeviceLost));
                     self.drop_screen();
@@ -5983,11 +6134,13 @@ impl Run {
                 if pending {
                     #[cfg(test)]
                     let now = hold_now(&self.shared, now, first.shown_at);
-                    match held_wait(now, first.shown_at, first_frame_bound(&self.shared))
-                        .filter(|_| self.image.valid(notices_of(self.extent.as_ref())))
-                    {
+                    let wait = held_wait(now, first.shown_at, first_frame_bound(&self.shared));
+                    #[cfg(feature = "dev-tools")]
+                    let bound_passed = wait.is_none();
+                    match wait.filter(|_| self.image.valid(notices_of(self.extent.as_ref()))) {
                         Some(wait) => {
-                            self.first_frame = Some(first);
+                            #[cfg(feature = "dev-tools")]
+                            let from = self.clock.now();
                             #[cfg(all(test, feature = "dev-tools"))]
                             self.shared
                                 .held_allocations
@@ -5995,12 +6148,27 @@ impl Run {
                             #[cfg(test)]
                             self.shared.held[0].fetch_add(1, Ordering::SeqCst);
                             std::thread::sleep(Duration::from_micros(wait.0.unsigned_abs()));
+                            #[cfg(feature = "dev-tools")]
+                            first.held(from, self.clock.now());
+                            self.first_frame = Some(first);
                             #[cfg(test)]
                             self.shared.held[1].fetch_add(1, Ordering::SeqCst);
                             continue;
                         }
-                        None => first.ended = true,
+                        None => {
+                            first.ended = true;
+                            #[cfg(feature = "dev-tools")]
+                            first.hold_ended(if bound_passed {
+                                crate::measure::HoldEnd::Bound
+                            } else {
+                                crate::measure::HoldEnd::Image
+                            });
+                        }
                     }
+                } else {
+                    // Not held, or no longer: the skin's presentation draws.
+                    #[cfg(feature = "dev-tools")]
+                    first.hold_ended(crate::measure::HoldEnd::Skin);
                 }
                 self.first_frame = Some(first);
             }
@@ -6163,6 +6331,10 @@ impl Run {
             let mut selection_stamp: Option<(u64, u64)> = None;
             #[cfg(feature = "dev-tools")]
             let mut result_stamp: Option<crate::measure::ResultStamp> = None;
+            // Whether a selection frame drew the skin (dev-tools: a
+            // scenario's transition record).
+            #[cfg(feature = "dev-tools")]
+            let mut selection_skinned: Option<bool> = None;
             let drawn = match &mut mode {
                 Mode::Idle => continue,
                 Mode::Splash { pending } => {
@@ -6503,6 +6675,7 @@ impl Run {
                         presented_at = Some(self.clock.now());
                         crate::dev::mark_presented();
                         selection_stamp = Some((shown.update.lifetime, shown.update.revision));
+                        selection_skinned = drawn.as_ref().ok().map(|d| d.skinned);
                     }
                     if let Ok(SelectionDrawn {
                         refused: Some(why), ..
@@ -6854,6 +7027,29 @@ impl Run {
                 }
                 other => other,
             };
+            // What the frame drew, fixed before a refused decision frame
+            // hands the screen to its page (dev-tools: a scenario's
+            // transition record).
+            #[cfg(feature = "dev-tools")]
+            let stage = stage_of(
+                &mode,
+                &StageFacts {
+                    decision: self
+                        .decision_record
+                        .as_ref()
+                        .zip(decision_as)
+                        .map(|(r, drew)| (r.lifetime, drew)),
+                    deciding: self.decision.is_some(),
+                    page_turns: self.page_turns,
+                    selection: selection_stamp.map(|(l, _)| l).zip(selection_skinned),
+                    skin_loading: loading_frame
+                        .filter(|_| frame_presented.is_some_and(|p| p != Presented::Placeholder))
+                        .is_some(),
+                    play: drawn.as_ref().ok().and_then(|(_, p)| *p),
+                    view: view_stamp,
+                    result: result_stamp,
+                },
+            );
             // The decision screen's frame counted in its record
             // (dev-tools).
             #[cfg(feature = "dev-tools")]
@@ -6995,6 +7191,13 @@ impl Run {
                         skin_loading: loading_frame.filter(|_| {
                             frame_presented.is_some_and(|p| p != Presented::Placeholder)
                         }),
+                        #[cfg(feature = "dev-tools")]
+                        stage,
+                        #[cfg(feature = "dev-tools")]
+                        hold: self
+                            .first_frame
+                            .filter(|f| loading_frame == Some(f.lifetime))
+                            .and_then(|f| f.hold),
                         timing,
                         statistics: screen.statistics(),
                         presentation: screen.presentation(),
@@ -15013,9 +15216,16 @@ pub(crate) mod tests {
     /// A render thread on new installers with a chart loaded and play's
     /// skin marked pending.
     pub(crate) fn pending_link() -> (Arc<Chart>, Installers, super::RenderLink) {
+        pending_link_with(Box::new(NoFrames))
+    }
+
+    /// [`pending_link`], its frames given to `frames`.
+    pub(crate) fn pending_link_with(
+        frames: Box<dyn super::FrameSink>,
+    ) -> (Arc<Chart>, Installers, super::RenderLink) {
         let chart = Arc::new(ChartBuilder::new(120_000).build().unwrap());
         let screens = Installers::default();
-        let link = screens.spawn_bare();
+        let link = screens.spawn_with(frames);
         link.load(Arc::clone(&chart), None).unwrap();
         assert_eq!(
             link.pend(ScreenKind::Play).wait().unwrap(),
@@ -19556,6 +19766,8 @@ pub(crate) mod tests {
 /// Which screen each mode's frame is of (dev-tools).
 #[cfg(all(test, feature = "dev-tools"))]
 mod screen_kind_tests {
+    use bms_model::TimeUs;
+
     use super::{Mode, screen_kind};
     use crate::measure::ScreenKind as K;
     use crate::menu_screen::MenuPage;
@@ -19583,5 +19795,134 @@ mod screen_kind_tests {
         assert_eq!(screen_kind(&menu(None), false, true), K::Practice);
         assert_eq!(screen_kind(&menu(None), false, false), K::Page);
         assert!(K::Result.is_result() && K::End.is_result() && !K::Selection.is_result());
+    }
+
+    /// A play frame's view: READY from −2.5 s to its start at 0, then
+    /// playing until it is complete.
+    fn view(complete: bool, closing: Option<TimeUs>) -> crate::measure::ViewStamp {
+        crate::measure::ViewStamp {
+            generation: 0,
+            finalized: None,
+            events: 0,
+            playing: !complete,
+            complete,
+            closing,
+            ready: Some((TimeUs(-2_500_000), TimeUs(0))),
+            tally: eval::Tally::default(),
+            shown_gauge: 0,
+            gauges: [None; crate::measure::MAX_STAMPED_GAUGES],
+            look: None,
+        }
+    }
+
+    /// Each mode's frame names its state, the lifetime of that state and
+    /// what drew it, from what the frame drew: READY, the play, its tail
+    /// and Closing apart; a selection frame drawn by its built-in page is
+    /// still selection; a result drawn by its built-in page or refused.
+    #[test]
+    fn stage_of_names_each_state_and_presentation() {
+        use super::{StageFacts, stage_of};
+        use crate::measure::{DecisionDrawnAs as D, Drew, ResultPath, State};
+        let initial = crate::render_common::view(0, 0);
+        let (_, _, side) = game::render_link(4, &initial);
+        let play = Mode::Play {
+            origin: TimeUs(5_000_000),
+            state_origin: TimeUs(4_000_013),
+            screen_origin: TimeUs(4_000_013),
+            side,
+            gauge: 0,
+            first: false,
+            rearms: 0,
+            skipped: 0,
+        };
+        let at = |t: i64, v| StageFacts {
+            play: Some(TimeUs(t)),
+            view: Some(v),
+            ..StageFacts::default()
+        };
+        let of = |m: &Mode, f: StageFacts| {
+            let s = stage_of(m, &f);
+            (s.state, s.lifetime, s.drew)
+        };
+        assert_eq!(
+            of(&play, at(-1_200_000, view(false, None))),
+            (State::Ready, 4_000_013, Drew::Plain)
+        );
+        assert_eq!(of(&play, at(700_000, view(false, None))).0, State::Play);
+        assert_eq!(of(&play, at(9_000_000, view(true, None))).0, State::Tail);
+        assert_eq!(
+            of(&play, at(800_000, view(false, Some(TimeUs(600_000))))).0,
+            State::Closing
+        );
+        assert_eq!(of(&play, StageFacts::default()).0, State::PlayPending);
+        assert_eq!(
+            of(&menu(Some(7)), StageFacts::default()),
+            (State::Loading, 7, Drew::Pending)
+        );
+        let skin_loading = StageFacts {
+            skin_loading: true,
+            ..StageFacts::default()
+        };
+        assert_eq!(
+            of(&menu(Some(7)), skin_loading),
+            (State::Loading, 7, Drew::Skin)
+        );
+        for (drew, expected) in [
+            (D::Skin, Drew::Skin),
+            (D::BuiltIn, Drew::BuiltIn),
+            (D::Fallback, Drew::Fallback),
+            (D::Ended, Drew::Ended),
+        ] {
+            let f = StageFacts {
+                decision: Some((13, drew)),
+                deciding: true,
+                ..StageFacts::default()
+            };
+            assert_eq!(of(&Mode::Decision, f), (State::Decision, 13, expected));
+            assert_eq!(of(&menu(None), f), (State::Decision, 13, expected));
+        }
+        for (skinned, drew) in [(true, Drew::Skin), (false, Drew::BuiltIn)] {
+            let f = StageFacts {
+                selection: Some((21, skinned)),
+                ..StageFacts::default()
+            };
+            assert_eq!(of(&Mode::Selection, f), (State::Selection, 21, drew));
+        }
+        let practice = StageFacts {
+            page_turns: true,
+            ..StageFacts::default()
+        };
+        assert_eq!(of(&menu(None), practice).0, State::Practice);
+        assert_eq!(of(&menu(None), StageFacts::default()).0, State::Page);
+        let result = |path| StageFacts {
+            result: Some(crate::measure::ResultStamp {
+                id: Some(crate::measure::ResultId {
+                    seq: 34,
+                    generation: 2,
+                }),
+                path,
+                page: 1,
+                view: None,
+                sampled: TimeUs(0),
+                timer_origin: None,
+            }),
+            ..StageFacts::default()
+        };
+        assert_eq!(
+            of(&Mode::Result, result(ResultPath::Skin)),
+            (State::Result, 34, Drew::Skin)
+        );
+        assert_eq!(
+            of(&Mode::Result, result(ResultPath::Refused)),
+            (State::Result, 34, Drew::Refused)
+        );
+        assert_eq!(
+            of(&Mode::End, result(ResultPath::BuiltIn)),
+            (State::Result, 34, Drew::BuiltIn)
+        );
+        assert_eq!(
+            of(&Mode::Splash { pending: None }, StageFacts::default()).0,
+            State::Splash
+        );
     }
 }

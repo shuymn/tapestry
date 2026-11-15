@@ -6356,6 +6356,7 @@ pub(crate) mod tests {
         let state = crate::dev::scenario::State {
             logs: Vec::new(),
             captures: crate::dev::scenario::Captures::of(Vec::new()),
+            transitions: crate::dev::transitions::Transitions::default(),
             recorded: crate::input_side::Recorded {
                 keyboard: Vec::new(),
                 controller: Vec::new(),
@@ -8879,6 +8880,7 @@ pub(crate) mod tests {
         crate::dev::scenario::State {
             logs: Vec::new(),
             captures,
+            transitions: crate::dev::transitions::Transitions::default(),
             recorded: crate::input_side::Recorded {
                 keyboard: Vec::new(),
                 controller: Vec::new(),

@@ -667,3 +667,90 @@ fn the_hold_alloc() {
     link.end_loading().unwrap();
     link.exit();
 }
+
+/// The transition record's hold marks (dev-tools): a held lifetime's hold,
+/// on the render thread's clock, ended by its bound, a real 180 ms; and a
+/// successor held until its skin, ended by the skin. Each lifetime gives
+/// one mark however many of its frames are drawn, and the interval into
+/// each loading state is covered only by its own hold: the rest of it is
+/// uncovered.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_record_marks_each_hold_once() {
+    use crate::dev::transitions::{MarkKind, Record, Transitions};
+    use crate::measure::{HoldEnd, State};
+    const BOUND: i64 = 180 * MS;
+    let book = Transitions::with_capacity(256);
+    let frames = crate::dev::scenario::ScenarioFrames::recording(
+        crate::dev::scenario::Captures::of(Vec::new()),
+        book.clone(),
+    );
+    let (chart, _screens, link) = pending_link_with(Box::new(frames));
+    link.shared.hold_bound.store(BOUND, SeqCst);
+    let extent = Arc::new(Extent::default());
+    extent.publish(1_920, 1_080);
+    link.follow(&extent);
+    show_page(&link);
+    show_held(&link);
+    let first = link.loading_lifetime();
+    assert!(wait_until(|| link
+        .loading_ack()
+        .is_some_and(|(l, _)| l == first)));
+    let drawn = stamps(&link).0;
+    assert!(wait_until(|| stamps(&link).0 >= drawn + 3));
+    link.end_loading().unwrap();
+
+    show_page(&link);
+    show_held(&link);
+    let second = link.loading_lifetime();
+    assert_eq!(
+        specialized(&link, &chart, &bundle()).unwrap(),
+        Preparation::Ready
+    );
+    assert!(wait_until(|| link
+        .loading_ack()
+        .is_some_and(|(l, _)| l == second)));
+    let drawn = stamps(&link).0;
+    assert!(wait_until(|| stamps(&link).0 >= drawn + 3));
+    link.end_loading().unwrap();
+    link.exit();
+
+    let records = book.records();
+    let holds: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Mark(m) if matches!(m.kind, MarkKind::Hold(_)) => Some(*m),
+            _ => None,
+        })
+        .collect();
+    let [bound, skin] = holds[..] else {
+        panic!("one hold mark per lifetime: {records:?}");
+    };
+    assert_eq!(bound.kind, MarkKind::Hold(Some(HoldEnd::Bound)));
+    assert_eq!(skin.kind, MarkKind::Hold(Some(HoldEnd::Skin)));
+    assert!(
+        bound.to.0 - bound.from.0 >= BOUND - 30 * MS,
+        "held near the bound: {bound:?}"
+    );
+    let into_loading: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Edge(e) if e.to.state == State::Loading && !e.presentation => Some(*e),
+            _ => None,
+        })
+        .collect();
+    let [one, two] = into_loading[..] else {
+        panic!("two loading states: {records:?}");
+    };
+    assert_eq!((one.to.lifetime, two.to.lifetime), (first, second));
+    for (e, m) in [(one, bound), (two, skin)] {
+        let g = e.gap;
+        let clipped = m.to.0.min(g.to.0) - m.from.0.max(g.from.0);
+        assert!(clipped > 0, "{g:?} {m:?}");
+        assert_eq!(
+            (g.cover.covered, g.cover.uncovered),
+            (clipped, g.len() - clipped),
+            "{g:?} {m:?}"
+        );
+    }
+}
