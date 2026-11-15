@@ -296,6 +296,9 @@ pub(crate) struct Func {
     /// Where the byte after its `end` is.
     pub(crate) end: u32,
     pub(crate) line: u32,
+    /// The column of `start` on its line, in characters from 1
+    /// ([`columns`]).
+    pub(crate) col: u32,
     pub(crate) params: List,
     pub(crate) vararg: bool,
     pub(crate) body: List,
@@ -1259,7 +1262,37 @@ pub(crate) fn parse(src: &[u8], charged: &mut u64, cancel: &dyn Fn() -> bool) ->
         last_dot: (NONE, 0),
     };
     p.chunk()?;
-    Ok(p.ast)
+    let mut ast = p.ast;
+    columns(src, &mut ast.funcs);
+    Ok(ast)
+}
+
+/// Sets each function's column: the characters (UTF-8 lead bytes) from
+/// the last `\n` or `\r` before its `start` up to it, from 1. Every line
+/// end the lexer reads (`\n`, `\r`, `\r\n`, `\n\r`) ends in one of those
+/// bytes, so this is its line's column whatever the file's line ends (a
+/// leading byte order mark never reaches here: the lexer refuses it, as
+/// Lua's own loader does). The
+/// functions are in the order their constructors start, so one walk
+/// forward over `src` serves them all; a function out of that order
+/// starts the walk again.
+fn columns(src: &[u8], funcs: &mut [Func]) {
+    let (mut pos, mut col) = (0_usize, 1_u32);
+    for f in funcs {
+        let start = (f.start as usize).min(src.len());
+        if start < pos {
+            (pos, col) = (0, 1);
+        }
+        for &b in src.get(pos..start).unwrap_or_default() {
+            if b == b'\n' || b == b'\r' {
+                col = 1;
+            } else if b & 0xC0 != 0x80 {
+                col = col.saturating_add(1);
+            }
+        }
+        pos = start;
+        f.col = col;
+    }
 }
 
 impl<'a> Parser<'a, '_> {
@@ -1548,6 +1581,7 @@ impl<'a> Parser<'a, '_> {
             open: 0,
             end: u32::try_from(self.lex.src.len()).unwrap_or(NONE),
             line: 0,
+            col: 0,
             params: (0, 0),
             vararg: true,
             body: (0, 0),
@@ -1957,6 +1991,7 @@ impl<'a> Parser<'a, '_> {
             open: 0,
             end: 0,
             line,
+            col: 0,
             params: (0, 0),
             vararg: false,
             body: (0, 0),

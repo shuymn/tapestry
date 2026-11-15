@@ -7,7 +7,7 @@ mod common;
 
 use skin_beatoraja::lua::Disposition;
 #[cfg(feature = "dev-tools")]
-use skin_beatoraja::lua::runtime::{CallStatus, RuntimeNote, Stopped};
+use skin_beatoraja::lua::runtime::{CallStatus, Gave, RuntimeNote, Stopped};
 use skin_beatoraja::lua::runtime::{Pool, ScreenRuntime};
 use skin_beatoraja::{Cancel, Config, ImportFacts, LuaImported, LuaOutcome, read_lua_header};
 use skin_model::ScreenKind;
@@ -235,12 +235,20 @@ fn callbacks_run_on_the_kept_vm() {
             CallStatus::Ok
         ]
     );
-    let (notes, dropped) = runtime(&mut i).notes();
-    assert_eq!(dropped, 0);
-    assert!(notes.contains(&RuntimeNote::ImportOnly), "{notes:?}");
-    for (api, id, value) in [("number", 333, 0), ("number", 283, i32::MIN)] {
+    let book = runtime(&mut i).notes();
+    let notes = &book.list;
+    assert_eq!(book.dropped, 0);
+    assert!(
+        notes
+            .iter()
+            .any(|n| matches!(n, RuntimeNote::ImportOnly { at: Some(_) })),
+        "{notes:?}"
+    );
+    for (want, value) in [(333, 0), (283, i32::MIN)] {
         assert!(
-            notes.contains(&RuntimeNote::Absent { api, id, value }),
+            notes.iter().any(|n| matches!(n,
+                RuntimeNote::Absent { api: "number", id, gave: Gave::Int(v), .. }
+                    if *id == want && *v == value)),
             "{notes:?}"
         );
     }
@@ -323,8 +331,7 @@ fn the_budget_stops_the_runtime_after_three_frames() {
             .iter()
             .all(|s| *s == CallStatus::Stopped)
     );
-    let (notes, _) = runtime(&mut i).notes();
-    assert!(notes.contains(&RuntimeNote::Stopped(Stopped::Budget)));
+    assert!(runtime(&mut i).notes().stops.budget);
 }
 
 /// One frame of a runtime whose first callback is `body` and whose second
@@ -410,8 +417,7 @@ fn a_poisoned_context_is_read_through() {
         assert_eq!(outputs(&f), [0]);
     }
     assert_eq!(runtime(&mut i).counters().bridges, 1);
-    let (notes, _) = runtime(&mut i).notes();
-    assert!(notes.contains(&RuntimeNote::Stopped(Stopped::Panic)));
+    assert!(runtime(&mut i).notes().stops.panic);
     drop(i);
 }
 
@@ -531,12 +537,13 @@ fn notes_are_capped() {
     // Each frame reads one fresh id: frames run until ten reads past the
     // cap were counted (bounded).
     let mut frames = 0;
-    while runtime(&mut i).notes().1 < 10 && frames < 4 * cap {
+    while runtime(&mut i).notes().dropped < 10 && frames < 4 * cap {
         let mut f = fields(n, &[]);
         runtime(&mut i).frame(&mut f, &[]);
         frames += 1;
     }
-    let (notes, dropped) = runtime(&mut i).notes();
+    let book = runtime(&mut i).notes();
+    let (notes, dropped) = (book.list, book.dropped);
     assert_eq!(notes.len(), cap);
     assert!(dropped >= 10, "{dropped} after {frames} frames");
     // Unknown ids are not cached: no bridge was kept for them.
@@ -560,7 +567,7 @@ fn a_shared_book_keeps_a_sites_error_once_per_lifetime() {
     let (mut a, mut b) = (import(&text), import(&text));
     let errors = |book: &NoteBook| {
         book.notes()
-            .0
+            .list
             .iter()
             .filter(|n| matches!(n, RuntimeNote::CallbackError { .. }))
             .count()
@@ -614,15 +621,16 @@ fn a_shared_book_caps_every_runtime_together() {
     runtime(&mut b).use_notes(&book);
     let cap = skin_beatoraja::limits::MAX_NOTES;
     let mut frames = 0;
-    while book.notes().0.len() < cap && frames < 2 * cap {
+    while book.notes().list.len() < cap && frames < 2 * cap {
         let n = runtime(&mut a).outputs();
         runtime(&mut a).frame(&mut fields(n, &[]), &[]);
         frames += 1;
     }
-    let before = book.notes().1;
+    let before = book.notes().dropped;
     let n = runtime(&mut b).outputs();
     runtime(&mut b).frame(&mut fields(n, &[]), &[]);
-    let (notes, dropped) = book.notes();
+    let held = book.notes();
+    let (notes, dropped) = (held.list, held.dropped);
     assert_eq!(notes.len(), cap);
     assert_eq!(dropped, before + 1);
     assert!(
@@ -733,8 +741,13 @@ fn loaders_raise_at_runtime_however_reached() {
         status[..8].iter().all(|s| *s == CallStatus::Error),
         "{status:?}"
     );
-    let (notes, _) = runtime(&mut i).notes();
-    assert!(notes.contains(&RuntimeNote::ImportOnly), "{notes:?}");
+    let notes = runtime(&mut i).notes().list;
+    assert!(
+        notes
+            .iter()
+            .any(|n| matches!(n, RuntimeNote::ImportOnly { at: Some(_) })),
+        "{notes:?}"
+    );
     // The phase stays: the next frame raises again.
     runtime(&mut i).frame(&mut f, &[]);
     assert_eq!(outputs(&f), [0, 0, 0, 0, 0, 0, 0, 0, 5, 5]);
@@ -1267,8 +1280,7 @@ fn a_host_panic_stops_the_runtime() {
     runtime(&mut i).frame(&mut f, &[]);
     assert_eq!(runtime(&mut i).stopped(), Some(Stopped::Panic));
     assert_eq!(outputs(&f), [0, 0]);
-    let (notes, _) = runtime(&mut i).notes();
-    assert!(notes.contains(&RuntimeNote::Stopped(Stopped::Panic)));
+    assert!(runtime(&mut i).notes().stops.panic);
     let mut f = fields(n, &[("cursor.chart", 1)]);
     runtime(&mut i).frame(&mut f, &[]);
     assert_eq!(outputs(&f), [0, 0]);
@@ -1327,7 +1339,7 @@ fn two_callbacks_on_one_line_are_two_sites() {
     let n = runtime(&mut i).outputs();
     assert_eq!(n, 2);
     runtime(&mut i).frame(&mut fields(n, &[]), &[]);
-    let (notes, _) = runtime(&mut i).notes();
+    let notes = runtime(&mut i).notes().list;
     let errors = notes
         .iter()
         .filter(|n| matches!(n, RuntimeNote::CallbackError { .. }))
@@ -1469,5 +1481,308 @@ fn a_result_runtime_reads_number_27_from_the_prepared_frame() {
             want,
             "{uptime_us}"
         );
+    }
+}
+
+/// A result skin of [`common::result::graph_lua`] with `tables` after its
+/// numbers and one `dot` destination per `draws` entry, each on its own
+/// line, drawn by it.
+#[cfg(feature = "dev-tools")]
+fn result_entry(tables: &str, draws: &[&str]) -> String {
+    let dsts: String = draws
+        .iter()
+        .map(|d| {
+            format!(
+                "{{ id = \"dot\", dst = {{ {{ x = 0, y = 0, w = 8, h = 8 }} }}, draw = {d} }},\n"
+            )
+        })
+        .collect();
+    common::result::graph_lua(
+        &format!("local ms = require(\"main_state\")\n{tables}"),
+        &dsts,
+    )
+}
+
+/// `text` imported as `s.luaskin` into the result slot over the result
+/// fixtures' sheet, its VM kept for the runtime, with `files` beside it.
+#[cfg(feature = "dev-tools")]
+fn import_result_runtime(text: &[u8], files: &[(&str, &[u8])]) -> LuaImported {
+    let d = common::result::sheet();
+    for (name, body) in files {
+        common::write(d.path(), name, body);
+    }
+    common::write(d.path(), "s.luaskin", text);
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    match h
+        .import_runtime(
+            &Config::defaults(h.header()),
+            &common::result::facts(None),
+            &cancel,
+        )
+        .unwrap()
+    {
+        LuaOutcome::Imported(i) => i,
+        LuaOutcome::Pending(p) => panic!("{p:?}"),
+    }
+}
+
+/// One frame of `i`'s runtime over a result state whose fields are 0.
+#[cfg(feature = "dev-tools")]
+fn result_frame(i: &mut LuaImported) {
+    let n = runtime(i).outputs();
+    let mut f = vec![0; RESULT.fields.len() + 2 * n];
+    let timers = vec![0; RESULT.timers.len()];
+    runtime(i).frame(&mut f, &timers);
+}
+
+/// The line and column (characters, from 1) where `needle` starts in
+/// `text`, its lines ended by `\n`.
+#[cfg(feature = "dev-tools")]
+fn place(text: &str, needle: &str) -> (u32, u32) {
+    assert_eq!(text.matches(needle).count(), 1, "{needle:?} once");
+    let at = text.find(needle).unwrap();
+    let before = &text[..at];
+    let line = before.matches('\n').count() + 1;
+    let col = before.rsplit('\n').next().unwrap().chars().count() + 1;
+    (u32::try_from(line).unwrap(), u32::try_from(col).unwrap())
+}
+
+/// A note's kind and its place, file, line and column.
+#[cfg(feature = "dev-tools")]
+type Located = (String, Option<(String, u32, u32)>);
+
+/// Each note's kind and where it was, in the book's order.
+#[cfg(feature = "dev-tools")]
+fn located(notes: &[RuntimeNote]) -> Vec<Located> {
+    let at = |a: &skin_beatoraja::lua::runtime::SiteAt| (a.file.to_string(), a.line, a.col);
+    notes
+        .iter()
+        .map(|n| match n {
+            RuntimeNote::CallbackError { at: a } => ("error".to_owned(), Some(at(a))),
+            RuntimeNote::ImportOnly { at: a } => ("import-only".to_owned(), a.as_ref().map(at)),
+            RuntimeNote::Absent {
+                api,
+                id,
+                gave,
+                at: a,
+            } => (format!("{api} {id} {gave:?}"), a.as_ref().map(at)),
+        })
+        .collect()
+}
+
+/// An id the runtime does not answer is noted once per API and id, with
+/// what the skin read in its place (a number, false, the empty text), at
+/// its first reader in call order; a second reader of the same id adds
+/// nothing, and a later reader of other ids is named for those.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn an_unanswered_id_is_named_once_at_its_first_reader() {
+    untimed();
+    let a = "function() n = n + 1 return ms.number(300) > 0 end";
+    let b = "function() n = n + 2 return ms.number(300) > 0 end";
+    let c = "function() n = n + 3 local o = ms.option(901) local t = ms.text(9001) \
+             return o or t == \"\" end";
+    let text = result_entry("local n = 0", &[a, b, c]);
+    let mut i = import_result_runtime(text.as_bytes(), &[]);
+    assert_eq!(runtime(&mut i).outputs(), 3);
+    result_frame(&mut i);
+    let at = |s: &str| {
+        let (l, c) = place(&text, s);
+        Some(("s.luaskin".to_owned(), l, c))
+    };
+    assert_eq!(
+        located(&runtime(&mut i).notes().list),
+        [
+            (format!("number 300 {:?}", Gave::Int(i32::MIN)), at(a)),
+            (format!("option 901 {:?}", Gave::False), at(c)),
+            (format!("text 9001 {:?}", Gave::EmptyText), at(c)),
+        ]
+    );
+}
+
+/// A callback is located at its constructor's first token, whatever its
+/// form: an expression whose `(` is on a later line, a `local function`
+/// split over lines, a function statement on a dotted name and a method;
+/// two callbacks on one line by their columns in characters, after a
+/// string of multi-byte characters.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn locations_follow_the_constructors_first_token() {
+    untimed();
+    let tables = "local n, M = 0, {}\n\
+        local e1 = function\n  ()\n  n = n + 1 error(\"x1\") end\n\
+        local\nfunction e2() n = n + 1 error(\"x2\") end\n\
+        function M.e3() n = n + 1 error(\"x3\") end\n\
+        function M:e4() n = n + 1 error(\"x4\") end\n\
+        local s = \"譜面\" local e5, e6 = function() n = n + 1 error(\"x5\") end, \
+        function() n = n + 1 error(\"x6\") end";
+    let text = result_entry(tables, &["e1", "e2", "M.e3", "M.e4", "e5", "e6"]);
+    let mut i = import_result_runtime(text.as_bytes(), &[]);
+    assert_eq!(runtime(&mut i).outputs(), 6);
+    result_frame(&mut i);
+    let want: Vec<Located> = [
+        "function\n  ()",
+        "local\nfunction e2",
+        "function M.e3",
+        "function M:e4",
+        "function() n = n + 1 error(\"x5\")",
+        "function() n = n + 1 error(\"x6\")",
+    ]
+    .iter()
+    .map(|s| {
+        let (l, c) = place(&text, s);
+        ("error".to_owned(), Some(("s.luaskin".to_owned(), l, c)))
+    })
+    .collect();
+    assert_eq!(located(&runtime(&mut i).notes().list), want);
+}
+
+/// The same callback is at the same line and column whatever the file's
+/// line ends: `\n`, `\r\n`, `\r` or `\n\r`. A Lua file that starts with a
+/// byte order mark is refused as Lua's own loader refuses it, so no note
+/// is ever located in one.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn newline_variants_give_one_location() {
+    untimed();
+    let parts = "\u{feff}local k = 0 return { e = function() k = k + 1 error(\"x\") end }\n";
+    let text = result_entry("local parts = require(\"parts\")", &["parts.e"]);
+    let d = common::result::sheet();
+    common::write(d.path(), "parts.lua", parts.as_bytes());
+    common::write(d.path(), "s.luaskin", text.as_bytes());
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let refused = h.import_runtime(
+        &Config::defaults(h.header()),
+        &common::result::facts(None),
+        &cancel,
+    );
+    assert!(
+        matches!(
+            &refused,
+            Err(skin_beatoraja::ImportError::Lua {
+                at: Some(at),
+                why: skin_beatoraja::lua::LuaWhy::Syntax,
+            }) if at.file == "parts.lua" && at.line == 1
+        ),
+        "{refused:?}"
+    );
+    line_ends_give_one_location();
+}
+
+#[cfg(feature = "dev-tools")]
+fn line_ends_give_one_location() {
+    untimed();
+    let text = result_entry(
+        "local n = 0\nlocal e = function() n = n + 1 error(\"x\") end",
+        &["e"],
+    );
+    let (l, c) = place(&text, "function() n = n + 1");
+    for end in ["\n", "\r\n", "\r", "\n\r"] {
+        let mut i = import_result_runtime(text.replace('\n', end).as_bytes(), &[]);
+        assert_eq!(runtime(&mut i).outputs(), 1, "{end:?}");
+        result_frame(&mut i);
+        assert_eq!(
+            located(&runtime(&mut i).notes().list),
+            [("error".to_owned(), Some(("s.luaskin".to_owned(), l, c)))],
+            "{end:?}"
+        );
+    }
+}
+
+/// An import-only capability called at runtime is noted at the callback
+/// that called it, beside that call's error at the same place; the
+/// callback's file is the module that defines it.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn an_import_only_call_is_located() {
+    untimed();
+    let parts = "local k = 0\nlocal M = {}\n\
+        M.io = function() k = k + 1 return skin_config.get_path(\"s.png\") ~= nil end\n\
+        return M\n";
+    let text = result_entry("local parts = require(\"parts\")", &["parts.io"]);
+    let mut i = import_result_runtime(text.as_bytes(), &[("parts.lua", parts.as_bytes())]);
+    assert_eq!(runtime(&mut i).outputs(), 1);
+    result_frame(&mut i);
+    let (l, c) = place(parts, "function() k = k + 1");
+    let at = Some(("parts.lua".to_owned(), l, c));
+    assert_eq!(
+        located(&runtime(&mut i).notes().list),
+        [
+            ("import-only".to_owned(), at.clone()),
+            ("error".to_owned(), at)
+        ]
+    );
+}
+
+/// A runtime that has stopped records its stop in a book it is given
+/// later, since it notes nothing more: a retained runtime that stopped in
+/// one lifetime shows the stop in the next one's book. The control, a
+/// runtime that never stopped, gives a fresh book no stop.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_stopped_runtime_reports_its_stop_in_a_new_book() {
+    use skin_beatoraja::lua::runtime::NoteBook;
+    untimed();
+    let looping = result_entry(
+        "local n = 0",
+        &["function() n = n + 1 while true do end end"],
+    );
+    let mut i = import_result_runtime(looping.as_bytes(), &[]);
+    assert_eq!(runtime(&mut i).outputs(), 1);
+    let mut frames = 0;
+    while runtime(&mut i).stopped().is_none() && frames < 10 {
+        result_frame(&mut i);
+        frames += 1;
+    }
+    assert_eq!(runtime(&mut i).stopped(), Some(Stopped::Budget));
+    assert!(runtime(&mut i).notes().stops.budget);
+    let fresh = NoteBook::new();
+    runtime(&mut i).use_notes(&fresh);
+    result_frame(&mut i);
+    let held = fresh.notes();
+    assert!(held.stops.budget, "{held:?}");
+    assert!(held.list.is_empty() && held.complete(), "{held:?}");
+    // The control: an erroring runtime never stops.
+    let raising = result_entry("local n = 0", &["function() n = n + 1 error(\"x\") end"]);
+    let mut j = import_result_runtime(raising.as_bytes(), &[]);
+    result_frame(&mut j);
+    let fresh = NoteBook::new();
+    runtime(&mut j).use_notes(&fresh);
+    result_frame(&mut j);
+    let held = fresh.notes();
+    assert_eq!(held.stops, skin_beatoraja::lua::runtime::Stops::default());
+    assert_eq!(held.list.len(), 1, "{held:?}");
+}
+
+/// A stop after the book is full is kept: the stops are apart from the
+/// capped notes. The book keeps the first `MAX_NOTES` notes and counts the
+/// occurrences past them. The control stops before the cap: every note
+/// kept, nothing counted, the stop kept too.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_stop_after_a_full_book_is_kept() {
+    untimed();
+    let cap = skin_beatoraja::limits::MAX_NOTES;
+    for (after, kept, dropped) in [(cap + 4, cap, 4), (5, 5, 0)] {
+        let draw = format!(
+            "function() c = c + 1 if c > {after} then while true do end end \
+             return ms.number(100000 + c) > 0 end"
+        );
+        let text = result_entry("local c = 0", &[&draw]);
+        let mut i = import_result_runtime(text.as_bytes(), &[]);
+        assert_eq!(runtime(&mut i).outputs(), 1);
+        let mut frames = 0;
+        while runtime(&mut i).stopped().is_none() && frames < cap + 100 {
+            result_frame(&mut i);
+            frames += 1;
+        }
+        assert_eq!(runtime(&mut i).stopped(), Some(Stopped::Budget));
+        let held = runtime(&mut i).notes();
+        assert_eq!(held.list.len(), kept);
+        assert_eq!(held.dropped, dropped);
+        assert_eq!(held.complete(), dropped == 0);
+        assert!(held.stops.budget, "{:?}", held.stops);
     }
 }

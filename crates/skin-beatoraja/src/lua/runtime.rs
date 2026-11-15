@@ -31,10 +31,14 @@
 //!   source's value (0, false), as the source's accessor does, and is
 //!   called again the next frame.
 //! - **Notes.** At most [`crate::limits::MAX_NOTES`] notes are kept,
-//!   each once, a callback's keyed by its source site (chunk and line);
-//!   further occurrences are counted. They go to the runtime's
-//!   [`NoteBook`], its own unless a screen shares one between the
-//!   runtimes of one screen lifetime ([`ScreenRuntime::use_notes`]).
+//!   each once: a callback's error and an import-only call by the
+//!   callback's site (its file, and the line and column of its
+//!   constructor, [`SiteAt`]), an id it does not answer by its API and id,
+//!   located at its first reader in call order. Occurrences past the cap
+//!   are counted, the list then incomplete; the stops are kept apart,
+//!   never capped. They go to the runtime's [`NoteBook`], its own unless
+//!   a screen shares one between the runtimes of one screen lifetime
+//!   ([`ScreenRuntime::use_notes`]).
 //! - **Permits.** A screen that bounds its kept VMs gives each runtime a
 //!   [`Permit`] from its [`Pool`]; the runtime returns it when dropped,
 //!   after its VM is destroyed, on whichever thread drops it.
@@ -91,6 +95,8 @@ pub(crate) struct Site {
     pub(crate) callable: u32,
     /// Its constructor's node in its file's tree ([`SiteAt::func`]).
     pub(crate) func: u32,
+    /// Where it is defined, when the analysis tagged it.
+    pub(crate) at: Option<SiteAt>,
     pub(crate) ty: OutTy,
     /// The conditions before it in its element's `dstdraw`, which the
     /// source evaluates first, stopping at the first false.
@@ -123,33 +129,131 @@ pub enum Stopped {
     Panic,
 }
 
+impl Stopped {
+    /// Its name in the reports.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Budget => "budget",
+            Self::Memory => "memory",
+            Self::Panic => "panic",
+        }
+    }
+}
+
 /// A note of the runtime: a callback's first error, an omitted id's first
-/// read, or the stop.
+/// read, or an import-only call.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum RuntimeNote {
     /// The callback defined `at` raised an ordinary error.
     CallbackError { at: SiteAt },
-    /// A host read of an id the profile omits: `api` (`number` or
-    /// `option`) and the id, answered with `value`.
+    /// A host read of an id the profile omits: `api` (`number`, `option`
+    /// or `text`) and the id, answered with `gave`, first read by the
+    /// callback defined `at`.
     Absent {
         api: &'static str,
         id: i32,
-        value: i32,
+        gave: Gave,
+        at: Option<SiteAt>,
     },
-    /// An import-only capability called at runtime.
-    ImportOnly,
-    /// The runtime stopped.
-    Stopped(Stopped),
+    /// An import-only capability called at runtime by the callback
+    /// defined `at`.
+    ImportOnly { at: Option<SiteAt> },
 }
 
-/// Where a callback is defined: its chunk, the line its definition starts
-/// at, and its constructor's node in the chunk's tree, which tells apart
-/// two callbacks on one line; the same in every import of one skin.
+/// What the runtime gave a skin in place of an id it does not answer, as
+/// the skin read it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Gave {
+    /// A number: the source's value in the feature's absence, else 0.
+    Int(i32),
+    /// An option: false.
+    False,
+    /// A text: the empty text.
+    EmptyText,
+}
+
+/// What a note is kept once by: a callback's site, an id by its API, an
+/// import-only call's site.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+enum Key {
+    Error(SiteAt),
+    Absent(&'static str, i32),
+    ImportOnly(Option<SiteAt>),
+}
+
+impl RuntimeNote {
+    fn key(&self) -> Key {
+        match self {
+            Self::CallbackError { at } => Key::Error(at.clone()),
+            Self::Absent { api, id, .. } => Key::Absent(api, *id),
+            Self::ImportOnly { at } => Key::ImportOnly(at.clone()),
+        }
+    }
+}
+
+/// Where a callback is defined: its file, relative to the skin folder;
+/// the line and column (in characters, from 1) of its constructor's first
+/// token, `function` or `local` for a `local function`; and its
+/// constructor's node in its file's tree. The same in every import of
+/// one skin. A callback the analysis did not tag has its chunk's line of
+/// definition and column 0.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SiteAt {
-    pub chunk: Arc<str>,
-    pub line: usize,
+    pub file: Arc<str>,
+    pub line: u32,
+    pub col: u32,
     pub func: u32,
+}
+
+/// The reasons a book's runtimes stopped, each kept once and never
+/// capped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Stops {
+    pub budget: bool,
+    pub memory: bool,
+    pub panic: bool,
+}
+
+impl Stops {
+    fn set(&mut self, why: Stopped) {
+        match why {
+            Stopped::Budget => self.budget = true,
+            Stopped::Memory => self.memory = true,
+            Stopped::Panic => self.panic = true,
+        }
+    }
+
+    /// The reasons set, in the order budget, memory, panic.
+    #[must_use]
+    pub fn reasons(&self) -> Vec<Stopped> {
+        [
+            (self.budget, Stopped::Budget),
+            (self.memory, Stopped::Memory),
+            (self.panic, Stopped::Panic),
+        ]
+        .into_iter()
+        .filter_map(|(set, why)| set.then_some(why))
+        .collect()
+    }
+}
+
+/// What a book holds: the notes kept, the occurrences past the cap (each
+/// counted again, since a note past the cap is not kept: not how many
+/// notes are missing, only that the list is incomplete), and the stops.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RuntimeNotes {
+    pub list: Vec<RuntimeNote>,
+    pub dropped: u64,
+    pub stops: Stops,
+}
+
+impl RuntimeNotes {
+    /// Whether every note the book was given is in `list`.
+    #[must_use]
+    pub const fn complete(&self) -> bool {
+        self.dropped == 0
+    }
 }
 
 /// Notes shared by the runtimes of one screen lifetime: one cap and one
@@ -165,15 +269,23 @@ impl NoteBook {
         Self::default()
     }
 
-    /// The notes kept, and how many more were dropped past the cap.
+    /// What the book holds.
     #[must_use]
-    pub fn notes(&self) -> (Vec<RuntimeNote>, u64) {
+    pub fn notes(&self) -> RuntimeNotes {
         let n = self.lock();
-        (n.list.clone(), n.dropped)
+        RuntimeNotes {
+            list: n.list.clone(),
+            dropped: n.dropped,
+            stops: n.stops,
+        }
     }
 
     pub(crate) fn add(&self, note: RuntimeNote) {
         self.lock().add(note);
+    }
+
+    fn stop(&self, why: Stopped) {
+        self.lock().stops.set(why);
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Notes> {
@@ -183,38 +295,40 @@ impl NoteBook {
 }
 
 /// The runtime's notes: at most [`crate::limits::MAX_NOTES`], each once;
-/// further occurrences counted.
+/// further occurrences counted; the stops apart.
 #[derive(Debug, Default)]
 pub(crate) struct Notes {
     list: Vec<RuntimeNote>,
-    seen: HashSet<RuntimeNote>,
+    seen: HashSet<Key>,
     dropped: u64,
+    stops: Stops,
 }
 
 impl Notes {
     pub(crate) fn add(&mut self, note: RuntimeNote) {
-        if self.seen.contains(&note) {
+        let key = note.key();
+        if self.seen.contains(&key) {
             return;
         }
         if self.list.len() >= crate::limits::MAX_NOTES {
             self.dropped = self.dropped.saturating_add(1);
             return;
         }
-        self.seen.insert(note.clone());
+        self.seen.insert(key);
         self.list.push(note);
     }
 }
 
-impl std::hash::Hash for RuntimeNote {
-    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        std::mem::discriminant(self).hash(state);
-        match self {
-            Self::CallbackError { at } => at.hash(state),
-            Self::Absent { api, id, .. } => (api, id).hash(state),
-            Self::ImportOnly => {}
-            Self::Stopped(s) => (*s as u8).hash(state),
-        }
-    }
+/// Notes `api`'s read of `id`, answered with `gave`, at the callback the
+/// runtime is calling.
+pub(crate) fn note_absent(pass: &Pass, api: &'static str, id: i32, gave: Gave) {
+    let at = pass
+        .calling
+        .get()
+        .and_then(|k| pass.runtime_sites.borrow().get(k as usize).cloned());
+    pass.runtime_notes
+        .borrow()
+        .add(RuntimeNote::Absent { api, id, gave, at });
 }
 
 /// A host read's bridge, compiled once per id: its guard and its value.
@@ -571,8 +685,6 @@ impl Drop for Permit {
 /// its permit, so a permit returns only once the VM is destroyed.
 pub struct ScreenRuntime {
     sites: Vec<(Site, Function)>,
-    /// Each site's definition, its notes' key.
-    at: Vec<SiteAt>,
     /// The VM, held so its functions stay callable.
     _lua: Lua,
     pass: Arc<Pass>,
@@ -673,22 +785,30 @@ impl ScreenRuntime {
             })
             .collect();
         let status = vec![CallStatus::Skipped; sites.len()];
-        let at = sites
+        // Each site's definition, its notes' key: the analysis's, else
+        // its chunk's name and line of definition.
+        *pass.runtime_sites.borrow_mut() = sites
             .iter()
             .map(|(s, f)| {
-                let info = f.info();
-                SiteAt {
-                    chunk: info.source.unwrap_or_default().into(),
-                    line: info.line_defined.unwrap_or(0),
-                    func: s.func,
-                }
+                s.at.clone().unwrap_or_else(|| {
+                    let info = f.info();
+                    let source = info.source.unwrap_or_default();
+                    SiteAt {
+                        file: source.strip_prefix('@').unwrap_or(&source).into(),
+                        line: info
+                            .line_defined
+                            .and_then(|l| u32::try_from(l).ok())
+                            .unwrap_or(0),
+                        col: 0,
+                        func: s.func,
+                    }
+                })
             })
             .collect();
         #[cfg(feature = "dev-tools")]
         let import_peak = pass.ledger.counts().peak_memory;
         Ok(Some(Self {
             sites,
-            at,
             _lua: lua,
             pass,
             status,
@@ -786,16 +906,21 @@ impl ScreenRuntime {
             .map_or_else(Vec::new, |s| s.timers.clone())
     }
 
-    /// The notes so far in its book, and how many more were dropped past
-    /// the cap.
+    /// What its book holds so far.
     #[must_use]
-    pub fn notes(&self) -> (Vec<RuntimeNote>, u64) {
+    pub fn notes(&self) -> RuntimeNotes {
         self.pass.runtime_notes.borrow().notes()
     }
 
     /// Writes its notes to `book` from now on: the book of the screen
-    /// lifetime it runs in, shared with the lifetime's other runtimes.
+    /// lifetime it runs in, shared with the lifetime's other runtimes. A
+    /// runtime already stopped records its stop in `book`, since it notes
+    /// nothing more: a retained runtime that stopped in one lifetime shows
+    /// in every later one's.
     pub fn use_notes(&self, book: &NoteBook) {
+        if let Some(why) = self.stopped {
+            book.stop(why);
+        }
         *self.pass.runtime_notes.borrow_mut() = book.clone();
     }
 
@@ -915,6 +1040,10 @@ impl ScreenRuntime {
                 CallStatus::Skipped
             } else {
                 self.calls = self.calls.saturating_add(1);
+                // The callback the host's reads note as their reader. Every
+                // runtime host read happens inside such a call: nothing
+                // else here calls Lua, and the sandbox has no finalizers.
+                self.pass.calling.set(u32::try_from(k).ok());
                 let r = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     f.call::<Value>(()).and_then(|v| self.convert(site.ty, &v))
                 }));
@@ -933,7 +1062,7 @@ impl ScreenRuntime {
                             CallStatus::Stopped
                         }
                         Why::ImportOnly => {
-                            self.note(RuntimeNote::ImportOnly);
+                            self.note(RuntimeNote::ImportOnly { at: self.at(k) });
                             self.note_error(k);
                             CallStatus::Error
                         }
@@ -1004,14 +1133,19 @@ impl ScreenRuntime {
     }
 
     fn note_error(&self, k: usize) {
-        if let Some(at) = self.at.get(k) {
-            self.note(RuntimeNote::CallbackError { at: at.clone() });
+        if let Some(at) = self.at(k) {
+            self.note(RuntimeNote::CallbackError { at });
         }
+    }
+
+    /// Where callback `k` is defined.
+    fn at(&self, k: usize) -> Option<SiteAt> {
+        self.pass.runtime_sites.borrow().get(k).cloned()
     }
 
     fn stop(&mut self, why: Stopped) {
         self.stopped = Some(why);
-        self.note(RuntimeNote::Stopped(why));
+        self.pass.runtime_notes.borrow().stop(why);
     }
 
     /// What a call's error was: the frame's budget, the memory cap, an

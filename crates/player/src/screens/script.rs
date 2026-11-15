@@ -246,7 +246,7 @@ pub(crate) struct ScriptNotes(pub(in crate::screens) NoteBook);
 impl ScriptNotes {
     /// The notes kept, and the further ones counted (tests).
     #[cfg(all(test, feature = "dev-tools"))]
-    pub(crate) fn notes(&self) -> (Vec<skin_beatoraja::lua::runtime::RuntimeNote>, u64) {
+    pub(crate) fn notes(&self) -> skin_beatoraja::lua::runtime::RuntimeNotes {
         self.0.notes()
     }
 }
