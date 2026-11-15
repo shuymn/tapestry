@@ -2,8 +2,9 @@
 //! importer (s10-10-design.md C31 and C32; design.md "Rendering and
 //! Skins", play graphs and visualizers): JSON and Lua read the same fields
 //! into the same frames with the source's defaults, judge graph types 1 and
-//! 2 drop with a note, a field the source clamps is clamped, and a
-//! visualizer past the model's caps drops with a note, the skin kept.
+//! 2 are the judgment and early/late graphs, a field the source clamps is
+//! clamped, and a visualizer past the model's caps drops with a note, the
+//! skin kept.
 //! Every expected colour and place is computed here from the source's
 //! defaults (`skin/json/JsonSkin.java:263-321` at `0.8.9`) and rules.
 
@@ -624,7 +625,7 @@ fn a_timing_visualizer_hides_whole_with_hidden_plus_off() {
 /// its default 500 ms from the screen's start (READY, at 0 here): the
 /// chart's notes are in its second second of four, so at 100 ms (a fifth
 /// revealed) they are not drawn yet and at 1 s they are, as at 100 ms with
-/// a `delay` of 0. Types 1 and 2 drop with a note.
+/// a `delay` of 0.
 #[test]
 fn a_notes_graph_is_type_0_revealed_over_500_ms() {
     let dst = r#"{"id": "ng", "dst": [{"x": 0, "y": 0, "w": 300, "h": 100}]}"#;
@@ -652,20 +653,212 @@ fn a_notes_graph_is_type_0_revealed_over_500_ms() {
     assert!(!late.is_empty());
     assert_eq!(chips(frame("", 100)), []);
     assert_eq!(chips(frame(r#", "delay": 0"#, 100)), late);
-    for ty in [1, 2] {
-        let (_d, _skin, report) = json(
-            &format!(r#""judgegraph": [{{"id": "ng", "type": {ty}}}],"#),
-            dst,
+}
+
+/// Bin 1's judgments in the frames of [`judged`]: of its 100 notes, 10
+/// PERFECT, GREAT 5 early and 3 late, GOOD 4 late, BAD 1 late, POOR 2
+/// early and 6 late; 69 not judged.
+const BIN_1: [u32; 9] = [10, 5, 0, 0, 2, 3, 4, 1, 6];
+
+/// `skin` over 100 taps on lane 1 from 1 s (bin 1 of the profile's 3), the
+/// view's 512 judgment bins holding [`BIN_1`] at bin 1: its quads at `ms`.
+fn judged(skin: Skin, ms: i64) -> Vec<Quad> {
+    let mut chart = taps();
+    chart.meta.length = ChartSummary::of(&chart).length;
+    let profile = ChartProfile::of(&chart, &[]);
+    assert_eq!(profile.bins().len(), 3);
+    let score = PlayScore {
+        profile: Some(&profile),
+        ..PlayScore::NONE
+    };
+    let mut d = Drawn::over_score(skin, &chart, score);
+    let mut bins = vec![[0; 9]; 512];
+    bins[1] = BIN_1;
+    d.judgments = Some(bins);
+    d.frame(ms, &[])
+}
+
+/// The colour on top of cell `c` of bin 1, probed at x 140: the graph is
+/// 300 × 500 at the bottom left, 3 bins of 100 px and, at scale 100 (100
+/// notes), cells of 5 px from the bottom.
+fn cell(quads: &[Quad], c: u32) -> Option<[u8; 4]> {
+    top(quads, 140.0, 1_080.0 - 5.0 * c as f32 - 2.5)
+}
+
+/// The colours of bin 1's first 100 cells, bottom up, from `runs` of
+/// (count, colour).
+fn stacked(runs: &[(u32, u32)]) -> Vec<Option<[u8; 4]>> {
+    let cells: Vec<_> = runs
+        .iter()
+        .flat_map(|&(n, c)| std::iter::repeat_n(Some(rgba(c)), n as usize))
+        .collect();
+    assert_eq!(cells.len(), 100);
+    cells
+}
+
+/// C34: on a play skin, `judgegraph` types 1 and 2 are imported as the
+/// judgment and early/late graphs, from JSON and Lua alike, with the
+/// result's fields: set, `orderReverse` 1 stacks bin 1 from its last
+/// channel, `delay` 250 reveals bin 1 (x 100 to 200 of 300) by 125 ms and
+/// `backTexOff` 1 draws no background in empty bin 0; omitted, bin 1
+/// stacks grey first, is not revealed by 125 ms but is by 250 ms (500 ms
+/// by default) and the background shows in bin 0. Both paths draw
+/// the same frames, `noGap` 1 included. On a play skin type 3 drops with a
+/// note, and on a result skin type 0 does.
+#[test]
+fn play_judge_graph_types_1_and_2_are_imported() {
+    let dst_json = r#"{"id": "g", "dst": [{"x": 0, "y": 0, "w": 300, "h": 500}]}"#;
+    let dst_lua = "{ id = \"g\", dst = { { x = 0, y = 0, w = 300, h = 500 } } }";
+    let grey = 0x5555_55ff;
+    let judgment = [
+        (69, grey),
+        (10, 0x0088_ffff),
+        (8, 0x00ff_88ff),
+        (4, 0xffff_00ff),
+        (1, 0xff88_00ff),
+        (8, 0xff00_00ff),
+    ];
+    let early_late = [
+        (69, grey),
+        (10, 0x44ff_44ff),
+        (5, 0x0088_ffff),
+        (2, 0x0022_44ff),
+        (3, 0xff88_00ff),
+        (4, 0xcc66_00ff),
+        (1, 0x8844_00ff),
+        (6, 0x4422_00ff),
+    ];
+    for (ty, runs) in [(1, &judgment[..]), (2, &early_late[..])] {
+        let reversed: Vec<_> = runs.iter().rev().copied().collect();
+        // Set: JSON and Lua draw the same frames.
+        let (_j, set, report) = json(
+            &format!(
+                r#""judgegraph": [{{"id": "g", "type": {ty}, "orderReverse": 1, "noGap": 1,
+                    "delay": 250, "backTexOff": 1}}],"#
+            ),
+            dst_json,
+        );
+        assert_eq!(notes(&report), [], "type {ty}");
+        let (_l, set_lua, report) = lua(
+            &format!(
+                "skin.judgegraph = {{ {{ id = \"g\", type = {ty}, orderReverse = 1, noGap = 1, \
+                 delay = 250, backTexOff = 1 }} }}"
+            ),
+            dst_lua,
+        );
+        assert_eq!(notes(&report), [], "type {ty}");
+        for ms in [0, 125, 250, 3_000] {
+            assert_eq!(
+                judged(set.clone(), ms),
+                judged(set_lua.clone(), ms),
+                "type {ty} at {ms} ms"
+            );
+        }
+        let full = judged(set.clone(), 3_000);
+        let got: Vec<_> = (0..100).map(|c| cell(&full, c)).collect();
+        assert_eq!(got, stacked(&reversed), "type {ty}: reversed");
+        assert_eq!(top(&full, 85.0, 1_077.5), None, "type {ty}: no background");
+        assert_eq!(
+            cell(&judged(set, 125), 0),
+            Some(rgba(reversed[0].1)),
+            "type {ty}: revealed by 125 ms"
+        );
+        // Omitted: the defaults.
+        let (_d, plain, report) = json(
+            &format!(r#""judgegraph": [{{"id": "g", "type": {ty}}}],"#),
+            dst_json,
+        );
+        assert_eq!(notes(&report), [], "type {ty}");
+        let full = judged(plain.clone(), 3_000);
+        let got: Vec<_> = (0..100).map(|c| cell(&full, c)).collect();
+        assert_eq!(got, stacked(runs), "type {ty}: from grey");
+        assert!(
+            top(&full, 85.0, 1_077.5).is_some(),
+            "type {ty}: the background"
+        );
+        // At 125 ms bin 1 shows the background as empty bin 0 does (right
+        // of the play cursor, 3/5 s wide from x 12.5).
+        let early = judged(plain.clone(), 125);
+        assert_eq!(
+            cell(&early, 0),
+            top(&early, 85.0, 1_077.5),
+            "type {ty}: 125 ms"
         );
         assert_eq!(
-            notes(&report),
-            [(
-                Severity::Dropped,
-                NoteKind::UnsupportedField { field: "type" }
-            )],
-            "{ty}"
+            cell(&judged(plain, 250), 0),
+            Some(rgba(grey)),
+            "type {ty}: 250 ms"
         );
     }
+    let type_note = (
+        Severity::Dropped,
+        NoteKind::UnsupportedField { field: "type" },
+    );
+    let (_d, _skin, report) = json(r#""judgegraph": [{"id": "g", "type": 3}],"#, dst_json);
+    assert_eq!(notes(&report), [type_note]);
+    let d = common::result::folder(&common::result::graph_json(
+        r#""judgegraph": [{"id": "g", "type": 0}],"#,
+        r#"{"id": "g", "dst": [{"x": 100, "y": 200, "w": 520, "h": 82}]}"#,
+    ));
+    let imported = common::result::import_result(d.path()).unwrap_or_else(|e| panic!("{e:?}"));
+    assert!(
+        imported
+            .report
+            .notes
+            .iter()
+            .any(|n| (n.severity, n.kind) == type_note),
+        "result type 0"
+    );
+}
+
+/// C39 at import: a play type 2 graph with its background is charged its
+/// 5 120 chips, 582 background quads and 6 cursor quads, 5 708, where a
+/// result one is charged 5 702; two fit the budget of 16 384 and three
+/// (17 124) refuse the skin with the widget quad limit.
+#[test]
+fn a_play_judge_graph_is_charged_its_cursors_at_import() {
+    let play = |n: usize| {
+        let dsts: Vec<String> = (0..n)
+            .map(|_| r#"{"id": "g", "dst": [{"x": 0, "y": 0, "w": 300, "h": 500}]}"#.to_owned())
+            .collect();
+        import_sized(
+            [1_920, 1_080],
+            &format!(
+                r#""judgegraph": [{{"id": "g", "type": 2}}], "destination": [{}]"#,
+                dsts.join(", ")
+            ),
+            &[],
+        )
+        .result
+    };
+    let quads = |r: &Result<skin_beatoraja::Imported, skin_beatoraja::ImportError>| match r {
+        Ok(i) => i.report.usage.widget_quads,
+        Err(e) => panic!("{e:?}"),
+    };
+    let base = quads(&play(0));
+    assert_eq!(quads(&play(1)) - base, 5_708);
+    assert_eq!(quads(&play(2)) - base, 2 * 5_708);
+    match play(3) {
+        Err(skin_beatoraja::ImportError::Limit { limit, .. }) => {
+            assert_eq!(limit, skin_beatoraja::ImportLimit::WidgetQuads);
+        }
+        other => panic!("{:?}", other.map(|i| i.report.usage)),
+    }
+    let result = |graphs: &str| {
+        let d = common::result::folder(&common::result::graph_json(
+            &format!(r#""judgegraph": [{graphs}],"#),
+            r#"{"id": "g", "dst": [{"x": 100, "y": 200, "w": 520, "h": 82}]}"#,
+        ));
+        common::result::import_result(d.path())
+            .unwrap_or_else(|e| panic!("{e:?}"))
+            .report
+            .usage
+            .widget_quads
+    };
+    assert_eq!(
+        result(r#"{"id": "g", "type": 2}"#) - result(r#"{"id": "h", "type": 2}"#),
+        5_702
+    );
 }
 
 /// The visualizers' colours read as the result graphs': an optional `#`,

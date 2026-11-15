@@ -160,6 +160,9 @@ pub struct Drawn {
     /// The application's readouts each frame gives ([`SkinFrame::app`]):
     /// by default [`AppReadouts::LAUNCH`](skin_model::AppReadouts::LAUNCH).
     pub app: skin_model::AppReadouts,
+    /// The judgment bins each frame gives ([`SkinFrame::judgments`]): by
+    /// default none, unavailable.
+    pub judgments: Option<Vec<[u32; skin_model::TIMELINE_CHANNELS]>>,
 }
 
 /// What the evaluator's note facts become after `ev`, for tests that
@@ -527,6 +530,7 @@ impl Drawn {
             ring_count: 0,
             display_offset: TimeUs(0),
             app: skin_model::AppReadouts::LAUNCH,
+            judgments: None,
         }
     }
 
@@ -578,7 +582,7 @@ impl Drawn {
             follow(&mut self.notes, &self.chart, ev);
         }
         let frame = SkinFrame {
-            judgments: None,
+            judgments: self.judgments.as_deref(),
             app: self.app,
             state_us: self.state_us,
             screen_us: (ms * MS).saturating_sub(self.screen_from),
