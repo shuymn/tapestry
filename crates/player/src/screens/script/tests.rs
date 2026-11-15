@@ -556,12 +556,145 @@ fn a_taken_runtime_writes_to_the_lifetimes_notes() {
             rt.frame(fields, timers);
         }
     }
-    let (kept, _) = notes.notes();
-    assert!(
-        kept.iter()
-            .any(|n| matches!(n, skin_beatoraja::lua::runtime::RuntimeNote::Stopped(_))),
-        "{kept:?}"
+    let held = notes.notes();
+    assert!(!held.stops.reasons().is_empty(), "{held:?}");
+}
+
+/// The line and column (characters, from 1) of the runtime fixture's
+/// `draw` callback in `entry`: where its `function` starts.
+fn draw_at(dir: &tempfile::TempDir, entry: &str) -> String {
+    let text = std::fs::read_to_string(dir.path().join(entry)).unwrap();
+    let at = text.find("draw = function()").unwrap() + "draw = ".len();
+    let before = &text[..at];
+    format!(
+        "{entry:?}:{}:{}",
+        before.matches('\n').count() + 1,
+        before.rsplit('\n').next().unwrap().chars().count() + 1
+    )
+}
+
+/// A selection generation replaced by the next commit, or retired, is
+/// queued once with its own book, its notes located; the live
+/// generation's book is taken once, and holds nothing of the old one's.
+#[test]
+fn a_replaced_selection_generations_notes_are_queued_once() {
+    let _serial = crate::imports::tests::serial();
+    let dir = crate::selection_skin::runtime_fixture();
+    let (bundle, slot) =
+        crate::selection_skin::fixture_scripted(LIMITS, dir.path(), "notes.luaskin");
+    assert!(slot.holds(), "the fixture's callback runs in the runtime");
+    let scripts = Scripts::new();
+    scripts.commit(ScreenKind::Selection, 1, slot);
+    let mut sel = bundle.skin().prepare_selection();
+    let mut visit = scripts.slot(ScreenKind::Selection, 1);
+    for _ in 0..2 {
+        let rt = visit.running().expect("the generation's runtime");
+        rt.set_frame_time(Some(Duration::from_secs(3_600)));
+        let (fields, timers) = sel.runtime_parts();
+        rt.frame(fields, timers);
+    }
+    visit.park();
+    drop(visit);
+    let (_, next) = crate::selection_skin::fixture_scripted(LIMITS, dir.path(), "rt.luaskin");
+    scripts.commit(ScreenKind::Selection, 2, next);
+    let ended = scripts.take_ended_notes();
+    let lines: Vec<Vec<String>> = ended
+        .iter()
+        .map(|(owner, book)| super::note_lines(owner, book))
+        .collect();
+    let at = draw_at(&dir, "notes.luaskin");
+    let owner = "selection generation 1";
+    assert_eq!(
+        lines,
+        [vec![
+            format!("dev: runtime notes {owner}: 2 kept, complete, stopped none"),
+            format!("dev: runtime note {owner}: number 122 unanswered (gave 100) at {at}"),
+            format!("dev: runtime note {owner}: callback error at {at}"),
+        ]]
     );
+    assert!(scripts.take_ended_notes().is_empty(), "queued once");
+    let (owner, live) = scripts.take_live_notes().expect("generation 2's book");
+    assert_eq!(
+        super::note_lines(&owner, &live),
+        ["dev: runtime notes selection generation 2: 0 kept, complete, stopped none"]
+    );
+    assert!(scripts.take_live_notes().is_none(), "taken once");
+    // A retired generation is queued too; generation 2's book, taken
+    // live, is not queued again when generation 3 replaces it.
+    let (_, third) = crate::selection_skin::fixture_scripted(LIMITS, dir.path(), "rt.luaskin");
+    scripts.commit(ScreenKind::Selection, 3, third);
+    scripts.retire_kind(ScreenKind::Selection);
+    let owners: Vec<String> = scripts
+        .take_ended_notes()
+        .into_iter()
+        .map(|(owner, _)| owner)
+        .collect();
+    assert_eq!(owners, ["selection generation 3"]);
+}
+
+/// A result lifetime's book lists at most the cap, says it is incomplete
+/// and keeps the runtime's stop; the next lifetime's book, given the
+/// stopped runtime, holds the stop alone. Control: 5 notes, then the
+/// stop, give a complete list.
+#[test]
+fn a_result_lifetimes_listing_stops_at_the_cap_and_keeps_its_stop() {
+    let _serial = crate::imports::tests::serial();
+    let dir = crate::selection_skin::runtime_fixture();
+    let lifetime = |entry: &str| {
+        let (bundle, slot) = crate::selection_skin::fixture_scripted(LIMITS, dir.path(), entry);
+        let scripts = Scripts::new();
+        let g = scripts.offer_result(slot, false).unwrap();
+        let notes = super::ScriptNotes::default();
+        let mut s = scripts.result_slot(Some(g));
+        let mut sel = bundle.skin().prepare_selection();
+        for _ in 0..1_000 {
+            let rt = s.result_running(&notes).expect("the generation's runtime");
+            if rt.stopped().is_some() {
+                break;
+            }
+            rt.set_frame_time(Some(Duration::from_secs(3_600)));
+            let (fields, timers) = sel.runtime_parts();
+            rt.frame(fields, timers);
+        }
+        let lines = notes.lines("result lifetime 7");
+        // The next lifetime: the stopped runtime parked, then taken with
+        // that lifetime's book, and a frame run.
+        s.park();
+        drop(s);
+        let next = super::ScriptNotes::default();
+        let mut s = scripts.result_slot(Some(g));
+        let rt = s.result_running(&next).expect("the parked runtime");
+        let (fields, timers) = sel.runtime_parts();
+        rt.frame(fields, timers);
+        (lines, next.lines("result lifetime 8"))
+    };
+    let (lines, next) = lifetime("cap.luaskin");
+    let header = lines.first().unwrap();
+    let dropped: u64 = header
+        .strip_prefix("dev: runtime notes result lifetime 7: 4096 kept, incomplete (")
+        .and_then(|r| r.strip_suffix(" occurrences past the cap of 4096), stopped budget"))
+        .unwrap_or_else(|| panic!("{header}"))
+        .parse()
+        .unwrap();
+    assert!(dropped >= 4, "{header}");
+    assert_eq!(lines.len(), 1 + 4_096);
+    let read = |id: u32| {
+        lines
+            .iter()
+            .any(|l| l.contains(&format!(": number {id} unanswered")))
+    };
+    assert!(read(100_011) && read(104_106), "the first 4 096 ids");
+    assert!(!read(104_107) && !read(104_120), "the last ids absent");
+    assert_eq!(
+        next,
+        ["dev: runtime notes result lifetime 8: 0 kept, complete, stopped budget"]
+    );
+    let (lines, _) = lifetime("few.luaskin");
+    assert_eq!(
+        lines.first().map(String::as_str),
+        Some("dev: runtime notes result lifetime 7: 5 kept, complete, stopped budget")
+    );
+    assert_eq!(lines.len(), 1 + 5);
 }
 
 /// Sets this thread's script switches until dropped (dev-tools: the

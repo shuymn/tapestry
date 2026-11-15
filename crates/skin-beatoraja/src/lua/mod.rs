@@ -388,6 +388,10 @@ pub(crate) struct Pass {
     pub(crate) screen: SyncRefCell<Option<runtime::Screen>>,
     /// The runtime's notes.
     pub(crate) runtime_notes: SyncRefCell<runtime::NoteBook>,
+    /// Where each of the runtime's callbacks is defined, by its index, and
+    /// the index of the one being called: the reader a host read notes.
+    pub(crate) runtime_sites: SyncRefCell<Vec<runtime::SiteAt>>,
+    pub(crate) calling: SyncCell<Option<u32>>,
     /// A reference's frame inputs (dev-tools, [`replay`]).
     #[cfg(feature = "dev-tools")]
     pub(crate) replay: SyncRefCell<Option<replay::Frame>>,
@@ -454,6 +458,8 @@ impl Pass {
             runtime: SyncCell::new(false),
             screen: SyncRefCell::new(None),
             runtime_notes: SyncRefCell::new(runtime::NoteBook::default()),
+            runtime_sites: SyncRefCell::new(Vec::new()),
+            calling: SyncCell::new(None),
             #[cfg(feature = "dev-tools")]
             replay: SyncRefCell::new(None),
         }

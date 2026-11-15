@@ -6563,6 +6563,12 @@ impl Run {
                         {
                             println!("dev: drawn notice: {}", notice.text);
                         }
+                        // The runtime a refusal retired: its notes are
+                        // listed after the frame's allocations are counted,
+                        // since the listing allocates.
+                        if d.refused.is_some() {
+                            list_ended_notes(&self.scripts);
+                        }
                     }
                     drawn.map(|d| (d.timing, None))
                 }
@@ -7807,6 +7813,8 @@ impl Run {
                 self.committed.set(kind, screen.installation(kind));
                 self.scripts
                     .commit(kind, Arc::as_ptr(&bundle).addr(), script);
+                #[cfg(feature = "dev-tools")]
+                list_ended_notes(&self.scripts);
                 if kind == ScreenKind::Play {
                     self.selected = Some(bundle);
                     self.play_selection = request;
@@ -7907,6 +7915,8 @@ impl Run {
         screen.remove(kind);
         self.committed.clear(kind);
         self.scripts.retire_kind(kind);
+        #[cfg(feature = "dev-tools")]
+        list_ended_notes(&self.scripts);
         if kind == ScreenKind::Decision {
             self.decision_side = None;
         }
@@ -8529,6 +8539,35 @@ impl ResultSide {
     const fn shows(&self) -> bool {
         self.incoming.is_some() || self.prepared.is_some() || self.presented.is_some()
     }
+
+    /// Prints the lifetime's book (dev-tools: a scenario run's runtime
+    /// notes).
+    #[cfg(feature = "dev-tools")]
+    fn print_notes(&self) {
+        print_lines(
+            &self
+                .notes
+                .lines(&format!("result lifetime {}", self.lifetime)),
+        );
+    }
+}
+
+/// Prints a book's lines to stdout (dev-tools: a scenario run's runtime
+/// notes, design.md "Shortening Launch-Based Checks").
+#[cfg(feature = "dev-tools")]
+fn print_lines(lines: &[String]) {
+    for l in lines {
+        println!("{l}");
+    }
+}
+
+/// Lists the books of the selection generations that ended since the
+/// last call, each once (dev-tools: a scenario run's runtime notes).
+#[cfg(feature = "dev-tools")]
+fn list_ended_notes(scripts: &Scripts) {
+    for (owner, book) in scripts.take_ended_notes() {
+        print_lines(&crate::screens::note_lines(&owner, &book));
+    }
 }
 
 /// The strip's lines of a view payload's and an overlay's, in order,
@@ -8600,6 +8639,15 @@ impl Run {
         self.select_frames.report("select", freq);
         self.result_frames.report("result", freq);
         crate::dev::keep_present_log(&mut self.present_log);
+        // The books whose owners are still live: the result lifetime and
+        // the selection generation. Each ended one was listed at its end.
+        list_ended_notes(&self.scripts);
+        if let Some(side) = &self.result {
+            side.print_notes();
+        }
+        if let Some((owner, book)) = self.scripts.take_live_notes() {
+            print_lines(&crate::screens::note_lines(&owner, &book));
+        }
     }
 
     /// The result's lifetime ended: its staging is discarded and nothing
@@ -8610,6 +8658,9 @@ impl Run {
             self.result_frames
                 .report("result", self.clock.frequency().hz());
             self.frames_view = None;
+            if let Some(side) = &self.result {
+                side.print_notes();
+            }
         }
         if let Some(side) = self.result.take()
             && let Some(token) = side.prepared.and_then(|p| p.token)

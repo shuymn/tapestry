@@ -773,7 +773,11 @@ return skin
 /// screen's runtime runs (docs/stage3.md S7-07): `rt.luaskin` draws one
 /// more image, at 1500, 500, while its `draw` callback (counting its
 /// calls in an upvalue) returns true, and `stop.luaskin` draws it under a
-/// callback that never returns (dev-tools tests).
+/// callback that never returns (dev-tools tests). The callbacks of
+/// `notes.luaskin`, `cap.luaskin` and `few.luaskin` give the runtime's
+/// notes: number 122 read and an error raised at each call; ten fresh
+/// unanswered ids read at each of 411 calls (4 110 notes), then a loop
+/// that never returns; one fresh id at each of 5 calls, then the loop.
 #[cfg(test)]
 #[cfg(feature = "dev-tools")]
 pub(crate) fn runtime_fixture() -> tempfile::TempDir {
@@ -786,6 +790,20 @@ pub(crate) fn runtime_fixture() -> tempfile::TempDir {
         (
             "host.luaskin",
             "calls = calls + 1; return ms.number(77) >= 0",
+        ),
+        (
+            "notes.luaskin",
+            r#"calls = calls + 1; local v = ms.number(122); error("s1032-marker")"#,
+        ),
+        (
+            "cap.luaskin",
+            "calls = calls + 1; if calls > 411 then while true do end end; \
+             for i = 1, 10 do ms.number(100000 + calls * 10 + i) end; return true",
+        ),
+        (
+            "few.luaskin",
+            "calls = calls + 1; if calls > 5 then while true do end end; \
+             ms.number(100000 + calls); return true",
         ),
     ] {
         let tail = format!(

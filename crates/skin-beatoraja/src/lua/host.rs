@@ -242,13 +242,7 @@ fn text(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<mlua::LuaStrin
     let n = fact_id(lua, pass, &args, "text")?;
     if pass.in_runtime() {
         // Texts are not bridged at runtime yet: the empty text, noted.
-        pass.runtime_notes
-            .borrow_mut()
-            .add(super::runtime::RuntimeNote::Absent {
-                api: "text",
-                id: n,
-                value: 0,
-            });
+        super::runtime::note_absent(pass, "text", n, super::runtime::Gave::EmptyText);
         return lua.create_string("");
     }
     let Some(snapshot) = &pass.facts else {
@@ -316,13 +310,7 @@ fn runtime_number(pass: &Pass, n: i32) -> i32 {
     }
     let value = super::runtime::absent(s.kind(), n).unwrap_or(0);
     drop(screen);
-    pass.runtime_notes
-        .borrow_mut()
-        .add(super::runtime::RuntimeNote::Absent {
-            api: "number",
-            id: n,
-            value,
-        });
+    super::runtime::note_absent(pass, "number", n, super::runtime::Gave::Int(value));
     value
 }
 
@@ -337,13 +325,7 @@ fn runtime_option(pass: &Pass, n: i32) -> bool {
         return v != (n < 0);
     }
     drop(screen);
-    pass.runtime_notes
-        .borrow_mut()
-        .add(super::runtime::RuntimeNote::Absent {
-            api: "option",
-            id: n,
-            value: 0,
-        });
+    super::runtime::note_absent(pass, "option", n, super::runtime::Gave::False);
     false
 }
 
