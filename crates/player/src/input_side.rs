@@ -3735,6 +3735,8 @@ mod gate_tests {
         let base = game::Reservation {
             fixed: 4_096,
             per_input: 1,
+            judge_bins: 0,
+            note_bins: 0,
         };
         let without = base.with_gate(game::GateStorage {
             held: gate.snapshot(),

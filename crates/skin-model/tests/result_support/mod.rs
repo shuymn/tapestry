@@ -115,6 +115,7 @@ pub fn chart() -> ResultChart {
             stage: true,
             back: false,
         },
+        target: 0,
     }
 }
 

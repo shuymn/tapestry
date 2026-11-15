@@ -2,7 +2,8 @@
 //! column a timeline bin, stacked in chips from the bottom, each note
 //! without a counted judgment grey and the others by their judgment; on
 //! play, the notes graph, the chart's notes by kind over its 1× seconds
-//! (the source's type 0), with the play cursor and a practice round's
+//! (the source's type 0), and the judgment graphs, the play's judgments
+//! over the same bins, each with the play cursor and a practice round's
 //! section lines over it (design.md "Rendering and Skins", result widgets
 //! and play graphs).
 //!
@@ -64,7 +65,7 @@ pub enum JudgeGraphKind {
     /// The source's type 2: PERFECT, then each other grade early, then
     /// late.
     EarlyLate,
-    /// The source's type 0, a play skin's only kind: the chart's notes by
+    /// The source's type 0, on play and selection: the chart's notes by
     /// category ([`bms_model::ChartProfile::bins`]).
     Notes,
 }
@@ -131,6 +132,14 @@ impl JudgeGraphDef {
             0
         };
         back + BINS * channels(self.kind) + cursors
+    }
+
+    /// [`quads`](Self::quads) on a play skin, where every judge graph
+    /// draws the cursors.
+    #[must_use]
+    pub fn play_quads(&self) -> u32 {
+        let back = if self.back { BACK_QUADS } else { 0 };
+        back + BINS * channels(self.kind) + CURSOR_QUADS
     }
 }
 
@@ -223,6 +232,14 @@ pub(crate) enum GraphData<'a> {
     /// The chart's notes by category, a bin a column, and the cursors.
     Notes {
         bins: &'a [[u16; NOTE_CHANNELS]],
+        cursors: Cursors,
+    },
+    /// A play's judgments over the notes graph's bins: each bin's
+    /// judgments by channel and its judgeable notes, a bin a column, and
+    /// the cursors.
+    Live {
+        bins: &'a [[u32; TIMELINE_CHANNELS]],
+        notes: &'a [u32],
         cursors: Cursors,
     },
 }
@@ -372,6 +389,11 @@ impl JudgeGraph {
                 let sum = |b: &[u16; NOTE_CHANNELS]| b.iter().map(|&c| u32::from(c)).sum::<u32>();
                 (bins.len(), bins.iter().map(sum).max().unwrap_or(0))
             }
+            // A bin's chips, grey included, are its notes, whatever has
+            // been judged.
+            GraphData::Live { notes, .. } => {
+                (notes.len(), notes.iter().copied().max().unwrap_or(0))
+            }
         };
         let scale = scale(largest);
         let n = u32::try_from(n).unwrap_or(BINS);
@@ -408,6 +430,9 @@ impl JudgeGraph {
                         *c = u32::from(v);
                     }
                     Some(c)
+                }
+                GraphData::Live { bins, notes, .. } => {
+                    Some(bin_counts(kind, bins.get(i)?, *notes.get(i)?))
                 }
             }
         };
@@ -449,7 +474,7 @@ impl JudgeGraph {
                 }
             }
         }
-        if let GraphData::Notes { cursors, .. } = d.data {
+        if let GraphData::Notes { cursors, .. } | GraphData::Live { cursors, .. } = d.data {
             let filter = self.solid.filter;
             let Some(f) = self.solid.frame(d.at.starts, d.at.now, d.at.uvs) else {
                 return;

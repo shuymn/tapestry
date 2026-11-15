@@ -475,6 +475,7 @@ pub fn record(
                                 now <= end
                             };
                             let frame = SkinFrame {
+                                judgments: None,
                                 app: skin_model::AppReadouts::LAUNCH,
                                 state_us,
                                 screen_us: state_us - screen_origin,

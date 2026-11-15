@@ -26,6 +26,7 @@ pub mod decision;
 mod driver;
 mod error;
 mod hispeed;
+mod judge_bins;
 mod keys;
 pub mod live;
 mod logic;
@@ -93,6 +94,7 @@ pub use hispeed::{
     PlayOptions, PlayOptionsError, Ratio, References, SpeedMode, Unrepresentable, duration_ms,
     green, solve, step_hispeed,
 };
+pub use judge_bins::{JUDGE_BIN_COPIES, JUDGE_CHANNELS, JudgeBins, channel};
 pub use keys::{
     Bound, CANCEL_KEY, KEEP_KEY, KeyConfigEnd, KeyConfigFlow, KeyConfigs, KeyScreen, LEARN_TIME,
     LearntRange, Press, ROLES, Refusal, SETTLE_TIME, capture_keys, capture_keys_within,
