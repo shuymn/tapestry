@@ -556,12 +556,8 @@ fn a_taken_runtime_writes_to_the_lifetimes_notes() {
             rt.frame(fields, timers);
         }
     }
-    let (kept, _) = notes.notes();
-    assert!(
-        kept.iter()
-            .any(|n| matches!(n, skin_beatoraja::lua::runtime::RuntimeNote::Stopped(_))),
-        "{kept:?}"
-    );
+    let held = notes.notes();
+    assert!(!held.stops.reasons().is_empty(), "{held:?}");
 }
 
 /// Sets this thread's script switches until dropped (dev-tools: the

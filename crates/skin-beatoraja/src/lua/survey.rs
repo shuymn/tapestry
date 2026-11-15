@@ -118,8 +118,13 @@ pub struct RuntimeFrame {
     pub outputs: usize,
     /// Their statuses that frame, by name.
     pub status: BTreeMap<String, u32>,
-    /// The notes it kept and the further occurrences it counted.
-    pub notes: (usize, u64),
+    /// The notes its book kept, in the order they came.
+    pub notes: Vec<RuntimeNoteRecord>,
+    /// The occurrences past the cap its book counted: the list is
+    /// incomplete when there are any.
+    pub dropped: u64,
+    /// Why its book's runtimes stopped, by name.
+    pub stops: Vec<&'static str>,
     /// The frame's instruction steps and host calls.
     pub instructions: u64,
     pub host_calls: u64,
@@ -127,6 +132,57 @@ pub struct RuntimeFrame {
     pub micros: u128,
     /// Why it stopped, if it did.
     pub stopped: Option<String>,
+}
+
+/// A runtime note under allowlisted labels: what it is and where, its
+/// file a module index ([`Survey::modules`]) unless asked for
+/// developer-local detail.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeNoteRecord {
+    /// `number`, `option` or `text` for an id the runtime does not
+    /// answer; `callback error`; `import-only call`.
+    pub what: &'static str,
+    /// The id, for an unanswered one.
+    pub id: Option<i32>,
+    /// What the skin read in its place, for an unanswered id: a number,
+    /// `false` or `""`.
+    pub gave: Option<String>,
+    /// Its callback's module index (`None` when the survey does not list
+    /// the file), line and column; `None` without a callback.
+    pub at: Option<(Option<usize>, u32, u32)>,
+    /// Its callback's file, relative to the skin folder, only under
+    /// developer-local detail.
+    pub local: Option<String>,
+}
+
+/// `note` as the report lists it, its file located among `modules`.
+fn note_record(
+    note: &super::runtime::RuntimeNote,
+    modules: &[String],
+    local: bool,
+) -> RuntimeNoteRecord {
+    use super::runtime::{Gave, RuntimeNote};
+    let (what, id, gave, at) = match note {
+        RuntimeNote::Absent { api, id, gave, at } => (
+            *api,
+            Some(*id),
+            Some(match gave {
+                Gave::Int(v) => v.to_string(),
+                Gave::False => "false".to_owned(),
+                Gave::EmptyText => "\"\"".to_owned(),
+            }),
+            at.as_ref(),
+        ),
+        RuntimeNote::CallbackError { at } => ("callback error", None, None, Some(at)),
+        RuntimeNote::ImportOnly { at } => ("import-only call", None, None, at.as_ref()),
+    };
+    RuntimeNoteRecord {
+        what,
+        id,
+        gave,
+        at: at.map(|a| (modules.iter().position(|m| **m == *a.file), a.line, a.col)),
+        local: at.filter(|_| local).map(|a| a.file.to_string()),
+    }
 }
 
 /// A configuration by the names the skin gives it.
@@ -711,7 +767,7 @@ pub fn survey_with(
     s.usage = o.counts;
     s.modules = o.dependencies.len();
     if let Some(rt) = o.runtime.as_mut() {
-        s.runtime = Some(runtime_frame(rt, kind));
+        s.runtime = Some(runtime_frame(rt, kind, &o.dependencies, local));
     }
     match o.result {
         Ok(imported) => {
@@ -726,8 +782,14 @@ pub fn survey_with(
     s
 }
 
-/// One frame of `rt` over a `kind` state whose fields are all 0.
-fn runtime_frame(rt: &mut super::runtime::ScreenRuntime, kind: ScreenKind) -> RuntimeFrame {
+/// One frame of `rt` over a `kind` state whose fields are all 0, its notes
+/// located among `modules`, named under `local`.
+fn runtime_frame(
+    rt: &mut super::runtime::ScreenRuntime,
+    kind: ScreenKind,
+    modules: &[String],
+    local: bool,
+) -> RuntimeFrame {
     let schema = match kind {
         ScreenKind::Result => &skin_model::RESULT,
         _ => &skin_model::SELECTION,
@@ -744,11 +806,17 @@ fn runtime_frame(rt: &mut super::runtime::ScreenRuntime, kind: ScreenKind) -> Ru
     for st in rt.status() {
         *status.entry(format!("{st:?}").to_lowercase()).or_default() += 1;
     }
-    let (notes, dropped) = rt.notes();
+    let book = rt.notes();
     RuntimeFrame {
         outputs: n,
         status,
-        notes: (notes.len(), dropped),
+        notes: book
+            .list
+            .iter()
+            .map(|note| note_record(note, modules, local))
+            .collect(),
+        dropped: book.dropped,
+        stops: book.stops.reasons().iter().map(|s| s.name()).collect(),
         instructions: after.instructions.saturating_sub(before.instructions),
         host_calls: after.host_calls.saturating_sub(before.host_calls),
         micros,

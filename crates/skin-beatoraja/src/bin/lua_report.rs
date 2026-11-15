@@ -26,12 +26,15 @@
 //! roots its configured table holds, a record per callback consumer
 //! (where it is defined, its field, role, disposition and reason, why a
 //! callback classified but never consumed was left, and each inert
-//! function the source never reads), and the import
-//! facts it read and recorded, each skin by its index in the arguments and
-//! each file by its index among those it consulted, then the skins per
-//! kind (`none` for a header refused). It prints no source, name, path,
-//! string or Lua error, except under `--local`: each record is then
-//! followed by a `local` line with its file, the destination it was
+//! function the source never reads), a selection or result runtime's one
+//! frame over a zero state (whether its notes are complete, its stops,
+//! and each note: the id it does not answer with what it gave, or the
+//! callback whose call failed, located), and the import facts it read and
+//! recorded, each skin by its index in the arguments and each file by its
+//! index among those it consulted, then the skins per kind (`none` for a
+//! header refused). It prints no source, name, path, string or Lua error,
+//! except under `--local`: each runtime note is then followed by its file,
+//! and each record by a `local` line with its file, the destination it was
 //! consumed for (its index, the kind its `id` names and that `id`) and,
 //! when it lowered, whether its generated expression is a constant, that
 //! expression and its guards, and the report adds the configuration as
@@ -54,7 +57,7 @@ use bms_model::TimeUs;
 use skin_beatoraja::Cancel;
 use skin_beatoraja::lua::facts::{Fact, ImportFacts, JudgeClass};
 use skin_beatoraja::lua::survey::{
-    Choice, DestinationEntry, Local, Survey, survey_json, survey_with,
+    Choice, DestinationEntry, Local, RuntimeNoteRecord, Survey, survey_json, survey_with,
 };
 use skin_model::{
     BestFigures, BestRate, BestView, DEVIATION_SLOTS, GRAPH_COLUMNS, GaugeColumn, GaugeHistory,
@@ -255,6 +258,35 @@ fn destination_lines(e: &DestinationEntry) -> String {
     s
 }
 
+/// Whether a runtime book's list holds every note it was given: complete,
+/// or incomplete with the occurrences counted past the cap.
+fn completeness(dropped: u64) -> String {
+    if dropped == 0 {
+        "complete".to_owned()
+    } else {
+        format!(
+            "incomplete ({dropped} occurrences past the cap of {})",
+            skin_beatoraja::limits::MAX_NOTES
+        )
+    }
+}
+
+/// A runtime note's line: what it is and where, by module index.
+fn runtime_note(n: &RuntimeNoteRecord) -> String {
+    let what = match (n.id, &n.gave) {
+        (Some(id), Some(gave)) => format!("{} {id} unanswered (gave {gave})", n.what),
+        _ => n.what.to_owned(),
+    };
+    let at = n.at.map_or_else(
+        || "?".to_owned(),
+        |(module, line, col)| {
+            let module = module.map_or_else(|| "?".to_owned(), |m| m.to_string());
+            format!("module {module}, line {line}, column {col}")
+        },
+    );
+    format!("{what} at {at}")
+}
+
 /// Skin `index`'s report, its `local` lines included when they are there.
 fn report(index: usize, survey: &Survey) -> String {
     let mut s = String::new();
@@ -338,8 +370,8 @@ fn report(index: usize, survey: &Survey) -> String {
              instructions {} host calls {} time {} us{}",
             rt.outputs,
             status.join(", "),
-            rt.notes.0,
-            rt.notes.1,
+            rt.notes.len(),
+            rt.dropped,
             rt.instructions,
             rt.host_calls,
             rt.micros,
@@ -347,6 +379,21 @@ fn report(index: usize, survey: &Survey) -> String {
                 .as_deref()
                 .map_or_else(String::new, |s| format!(" stopped {s}"))
         ));
+        line(&format!(
+            "  runtime notes: {}, stopped {}",
+            completeness(rt.dropped),
+            if rt.stops.is_empty() {
+                "none".to_owned()
+            } else {
+                rt.stops.join(", ")
+            }
+        ));
+        for n in &rt.notes {
+            line(&format!("  runtime note: {}", runtime_note(n)));
+            if let Some(file) = &n.local {
+                line(&format!("    local file {file:?}"));
+            }
+        }
     }
     for c in &survey.consumers {
         let at = c.at.map_or_else(
@@ -563,6 +610,240 @@ mod tests {
             printed.contains("  runtime frame (fields 0): outputs 1 status ok 1 "),
             "{printed}"
         );
+    }
+
+    /// The result skin the runtime-note tests import, entry
+    /// `result.luaskin` and module `parts.lua`: its EX score and its clear
+    /// status's image (the profile's essentials), and four runtime
+    /// callbacks in this order: a number's value reading number 300 on its
+    /// first call (78 after), a draw in `parts.lua` reading text 9001 and
+    /// raising, a draw reading option 901, and a draw in `parts.lua`
+    /// calling an import-only capability.
+    const NOTES_ENTRY: &str = "local skin = { type = 7, name = \"t\", w = 1920, h = 1080 }
+if not skin_config then return skin end
+local ms = require(\"main_state\")
+local parts = require(\"parts\")
+local n = 0
+skin.source = { { id = \"a\", path = \"a.png\" } }
+skin.image = { { id = \"dot\", src = \"a\", x = 0, y = 0, w = 8, h = 8 } }
+skin.value = {
+  { id = \"ex\", src = \"a\", x = 0, y = 0, w = 40, h = 8, divx = 10, digit = 4, ref = 71 },
+  { id = \"r\", src = \"a\", x = 0, y = 0, w = 40, h = 8, divx = 10, digit = 4,
+    value = function() n = n + 1 if n == 1 then return ms.number(300) end return ms.number(78) end },
+}
+skin.destination = {
+  { id = \"ex\", dst = { { x = 0, y = 100, w = 4, h = 8 } } },
+  { id = \"dot\", op = { 90 }, dst = { { x = 0, y = 300, w = 8, h = 8 } } },
+  { id = \"r\", dst = { { x = 0, y = 120, w = 4, h = 8 } } },
+  { id = \"dot\", draw = parts.raise, dst = { { x = 0, y = 310, w = 8, h = 8 } } },
+  { id = \"dot\", dst = { { x = 0, y = 320, w = 8, h = 8 } },
+    draw = function() n = n + 0 return ms.option(901) end },
+  { id = \"dot\", draw = parts.import_only, dst = { { x = 0, y = 330, w = 8, h = 8 } } },
+}
+return skin
+";
+
+    /// [`NOTES_ENTRY`]'s module.
+    const NOTES_PARTS: &str = "local ms = require(\"main_state\")
+local k = 0
+local M = {}
+M.raise = function() local t = ms.text(9001) k = k + 1 error(\"s1032-marker\") end
+M.import_only = function() k = k + 1 return skin_config.get_path(\"a.png\") ~= nil end
+return M
+";
+
+    /// A skin folder holding `files` and the 64-pixel sheet `a.png`.
+    fn skin_folder(files: &[(&str, &str)]) -> tempfile::TempDir {
+        let d = tempfile::tempdir().unwrap();
+        image::RgbaImage::from_pixel(64, 64, image::Rgba([255; 4]))
+            .save(d.path().join("a.png"))
+            .unwrap();
+        for (name, text) in files {
+            std::fs::write(d.path().join(name), text).unwrap();
+        }
+        d
+    }
+
+    /// The survey of the result skin `entry` in `d`, its runtime frame's
+    /// time budget out of reach: what the callbacks give is not the
+    /// clock's to decide.
+    fn result_survey(d: &tempfile::TempDir, entry: &str, local: bool) -> Survey {
+        let a = args("root s.luaskin");
+        let (f, choice, _, _) = facts(&a).unwrap();
+        let f = ImportFacts {
+            scene: ScreenKind::Result,
+            ..f
+        };
+        skin_beatoraja::lua::vm_hooks::set_frame_time(Some(std::time::Duration::from_secs(3_600)));
+        survey_with(d.path(), entry, &f, &Cancel::new(), local, &choice)
+    }
+
+    /// The line and column (characters, from 1) where `needle` starts in
+    /// `text`, found once.
+    fn place(text: &str, needle: &str) -> (usize, usize) {
+        assert_eq!(text.matches(needle).count(), 1, "{needle:?} once");
+        let before = &text[..text.find(needle).unwrap()];
+        (
+            before.matches('\n').count() + 1,
+            before.rsplit('\n').next().unwrap().chars().count() + 1,
+        )
+    }
+
+    /// The report's runtime frame names each runtime note: an unanswered
+    /// id with what the skin read in its place, a failed callback, an
+    /// import-only call and its error, each by module index, line and
+    /// column, in the order they came; it says the list is complete and
+    /// that nothing stopped. No file name or Lua error is printed, and
+    /// under `--local` each note's file follows it.
+    #[test]
+    fn a_runtime_frame_names_its_notes() {
+        let d = skin_folder(&[("result.luaskin", NOTES_ENTRY), ("parts.lua", NOTES_PARTS)]);
+        let s = result_survey(&d, "result.luaskin", false);
+        assert_eq!(s.outcome, "imported");
+        assert_eq!(s.outcomes.get("runtime"), Some(&4), "{:?}", s.outcomes);
+        let at = |text: &str, module: usize, needle: &str| {
+            let (l, c) = place(text, needle);
+            format!("at module {module}, line {l}, column {c}")
+        };
+        let value = at(NOTES_ENTRY, 0, "function() n = n + 1");
+        let raise = at(NOTES_PARTS, 1, "function() local t");
+        let option = at(NOTES_ENTRY, 0, "function() n = n + 0");
+        let import_only = at(NOTES_PARTS, 1, "function() k = k + 1 return");
+        let want = [
+            format!("  runtime note: number 300 unanswered (gave -2147483648) {value}"),
+            format!("  runtime note: text 9001 unanswered (gave \"\") {raise}"),
+            format!("  runtime note: callback error {raise}"),
+            format!("  runtime note: option 901 unanswered (gave false) {option}"),
+            format!("  runtime note: import-only call {import_only}"),
+            format!("  runtime note: callback error {import_only}"),
+        ];
+        let printed = report(0, &s);
+        let lines: Vec<&str> = printed
+            .lines()
+            .filter(|l| l.starts_with("  runtime note"))
+            .collect();
+        assert_eq!(
+            lines[0], "  runtime notes: complete, stopped none",
+            "{printed}"
+        );
+        assert_eq!(lines[1..], want, "{printed}");
+        assert!(printed.contains(" notes 6 (+0) "), "{printed}");
+        for hidden in ["result.luaskin", "parts.lua", "s1032-marker"] {
+            assert!(!printed.contains(hidden), "{hidden}: {printed}");
+        }
+        // Under `--local`, each note is followed by its file.
+        let s = result_survey(&d, "result.luaskin", true);
+        let printed = report(0, &s);
+        // The notes' block: the summary, each note and its file, up to the
+        // consumer records (whose `local` lines follow them).
+        let lines: Vec<&str> = printed
+            .lines()
+            .skip_while(|l| !l.starts_with("  runtime notes: "))
+            .take_while(|l| l.starts_with("  runtime note") || l.starts_with("    local file"))
+            .collect();
+        let files = [
+            "result.luaskin",
+            "parts.lua",
+            "parts.lua",
+            "result.luaskin",
+            "parts.lua",
+            "parts.lua",
+        ];
+        let mut want_local = vec!["  runtime notes: complete, stopped none".to_owned()];
+        for (w, f) in want.iter().zip(files) {
+            want_local.push(w.clone());
+            want_local.push(format!("    local file {f:?}"));
+        }
+        assert_eq!(lines, want_local, "{printed}");
+        assert!(!printed.contains("s1032-marker"), "{printed}");
+    }
+
+    /// A result skin whose `count` draws each raise, one per line, then a
+    /// number whose value reads ids 100001 to 100010 in one call: `count`
+    /// + 10 notes in one frame.
+    fn cap_skin(count: usize) -> String {
+        let mut s = String::from(
+            "local skin = { type = 7, name = \"t\", w = 1920, h = 1080 }
+if not skin_config then return skin end
+local ms = require(\"main_state\")
+local k, c = 0, 0
+skin.source = { { id = \"a\", path = \"a.png\" } }
+skin.image = { { id = \"dot\", src = \"a\", x = 0, y = 0, w = 8, h = 8 } }
+skin.value = {
+  { id = \"ex\", src = \"a\", x = 0, y = 0, w = 40, h = 8, divx = 10, digit = 4, ref = 71 },
+  { id = \"r\", src = \"a\", x = 0, y = 0, w = 40, h = 8, divx = 10, digit = 4,
+    value = function() c = c + 1 for i = 1, 10 do ms.number(100000 + i) end return 0 end },
+}
+skin.destination = {
+  { id = \"ex\", dst = { { x = 0, y = 100, w = 4, h = 8 } } },
+  { id = \"dot\", op = { 90 }, dst = { { x = 0, y = 300, w = 8, h = 8 } } },
+",
+        );
+        for _ in 0..count {
+            s.push_str(
+                "  { id = \"dot\", dst = { { x = 0, y = 0, w = 8, h = 8 } }, \
+                 draw = function() k = k + 1 error(\"x\") end },\n",
+            );
+        }
+        s.push_str(
+            "  { id = \"r\", dst = { { x = 0, y = 120, w = 4, h = 8 } } },\n}\nreturn skin\n",
+        );
+        s
+    }
+
+    /// The report lists a full book's notes and no more, says it is
+    /// incomplete with the occurrences past the cap, and keeps the first
+    /// that came: the 4 090 errors, then ids 100001 to 100006. The control,
+    /// five errors fewer, lists all 4 095 notes, every id, and is
+    /// complete.
+    #[test]
+    fn the_report_lists_up_to_the_cap_and_says_it_is_incomplete() {
+        let cap = skin_beatoraja::limits::MAX_NOTES;
+        for (count, kept, ids, summary) in [
+            (
+                4_090,
+                cap,
+                6,
+                format!(
+                    "  runtime notes: incomplete (4 occurrences past the cap of {cap}), stopped none"
+                ),
+            ),
+            (
+                4_085,
+                4_095,
+                10,
+                "  runtime notes: complete, stopped none".to_owned(),
+            ),
+        ] {
+            let d = skin_folder(&[("s.luaskin", &cap_skin(count))]);
+            let s = result_survey(&d, "s.luaskin", false);
+            assert_eq!(s.outcome, "imported");
+            assert_eq!(
+                s.outcomes.get("runtime"),
+                Some(&(count as u32 + 1)),
+                "{:?}",
+                s.outcomes
+            );
+            let printed = report(0, &s);
+            let notes: Vec<&str> = printed
+                .lines()
+                .filter(|l| l.starts_with("  runtime note: "))
+                .collect();
+            assert_eq!(notes.len(), kept);
+            assert!(printed.contains(&format!(" notes {kept} (+{}) ", count + 10 - kept)));
+            assert!(printed.contains(&format!("{summary}\n")), "{count}");
+            let errors = notes
+                .iter()
+                .filter(|l| l.contains("callback error"))
+                .count();
+            assert_eq!(errors, count);
+            for i in 1..=10 {
+                let listed = notes
+                    .iter()
+                    .any(|l| l.starts_with(&format!("  runtime note: number {} ", 100_000 + i)));
+                assert_eq!(listed, i <= ids, "id {i} of {count}");
+            }
+        }
     }
 
     /// `--result dense` makes a result scene's view known, and a result

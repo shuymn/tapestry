@@ -2016,18 +2016,22 @@ impl Cx<'_> {
         self.outputs.push(ty);
         // Its constructor in its file's tree: the same in every import of
         // one skin, apart for two callbacks on one line.
-        let func = self
+        let instance = self
             .def
             .arena
             .lua
             .as_deref()
             .and_then(|l| l.callables.get(c as usize))
-            .and_then(|x| self.analysis()?.instance(x.instance))
+            .map(|x| x.instance);
+        let func = instance
+            .and_then(|i| self.analysis()?.instance(i))
             .map_or(u32::MAX, |i| i.func);
         if let Some(an) = self.analysis() {
+            let at = instance.and_then(|i| an.site_at(i));
             an.runtime.borrow_mut().push(crate::lua::runtime::Site {
                 callable: c,
                 func,
+                at,
                 ty,
                 gate,
             });
