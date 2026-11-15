@@ -270,7 +270,18 @@ fn a_result_build_allocates_nothing() {
         ready(1_200, best(ResultNumber::Hidden), 300),
         unavailable,
         with_graphs(ready(1_400, BestView::Unavailable, 1)),
-    ];
+    ]
+    .map(|mut v| {
+        // The player's totals, the same in every view, filled with the
+        // view's fields.
+        v.totals = skin_model::PlayerTotals {
+            plays: 7,
+            clears: 3,
+            counts: [101, 202, 303, 404, 505],
+            play_us: 12_345_900_000,
+        };
+        v
+    });
     let mut total = 0;
     // The first build after preparation, before any view, on the batch
     // reserved at the skin's capacity.

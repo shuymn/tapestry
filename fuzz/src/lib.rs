@@ -380,6 +380,20 @@ pub fn draw(imported: &Imported, seed: &[u8]) -> Vec<usize> {
     }
 }
 
+/// A normal play's finish point on `chart`, as the game computes it: its
+/// last note's end (0 without notes) plus 5 s, so the readouts' frames
+/// cross it.
+fn finish_of(chart: &bms_model::Chart) -> bms_model::TimeUs {
+    let last = chart
+        .lanes
+        .iter()
+        .flatten()
+        .map(bms_model::Note::end)
+        .max()
+        .unwrap_or(bms_model::TimeUs(0));
+    bms_model::TimeUs(last.0.saturating_add(5_000_000))
+}
+
 /// `skin`'s atlas built within the harness's limits: its uv table.
 ///
 /// # Panics
@@ -466,6 +480,7 @@ pub fn result_view(ready: bool) -> skin_model::ResultView {
         gauge: None,
         deviations: None,
         timing_areas: None,
+        totals: Default::default(),
     }
 }
 
@@ -647,6 +662,7 @@ fn draw_selection(skin: &skin_model::Skin) -> Vec<usize> {
             query: "q".to_owned(),
             selected,
             list_revision: 0,
+            totals: Default::default(),
         };
         skin.update_selection(&mut sel, &view, &labels)
             .expect("an imported selection skin takes a view");
@@ -709,7 +725,10 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
     let ctx = PlayContext {
         autoplay: false,
         gauges: &gauges,
-        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        attempt: Attempt::Full {
+            lead_in: TimeUs(0),
+            finish: finish_of(&chart),
+        },
         empty_poor_breaks_combo: false,
         empty_poor_counted: false,
         scratch: Side::Left,
@@ -1014,7 +1033,10 @@ fn gauge_probes(
         let ctx = PlayContext {
             autoplay: false,
             gauges: &descs,
-            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            attempt: Attempt::Full {
+                lead_in: TimeUs(0),
+                finish: finish_of(chart),
+            },
             empty_poor_breaks_combo: false,
             empty_poor_counted: false,
             scratch: Side::Left,
@@ -1098,7 +1120,10 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
     let ctx = PlayContext {
         autoplay: false,
         gauges: &gauges,
-        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        attempt: Attempt::Full {
+            lead_in: TimeUs(0),
+            finish: finish_of(&chart),
+        },
         empty_poor_breaks_combo: false,
         empty_poor_counted: false,
         scratch: Side::Left,
@@ -1720,7 +1745,10 @@ fn choice_probes(
     let ctx = PlayContext {
         autoplay: false,
         gauges: &descs,
-        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        attempt: Attempt::Full {
+            lead_in: TimeUs(0),
+            finish: finish_of(chart),
+        },
         empty_poor_breaks_combo: false,
         empty_poor_counted: false,
         scratch: Side::Left,
@@ -1838,7 +1866,10 @@ fn rate_and_kind_probes(
         let ctx = PlayContext {
             autoplay: false,
             gauges: &descs,
-            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            attempt: Attempt::Full {
+                lead_in: TimeUs(0),
+                finish: finish_of(chart),
+            },
             empty_poor_breaks_combo: counted,
             empty_poor_counted: counted,
             scratch: Side::Left,
@@ -2119,7 +2150,7 @@ fn readout_probes(
         );
     let (gain, seeded) = seeded_readouts(seed);
     let frames: Vec<_> = frames.chain([(1_000, gain, seeded)]).collect();
-    for range in [
+    let ranges = [
         None,
         Some(BpmRange {
             min_x100: 0,
@@ -2129,11 +2160,18 @@ fn readout_probes(
             min_x100: 15_000,
             max_x100: 15_000,
         }),
-    ] {
+    ];
+    // The chart's own finish point, which the frames pass, then the clock's
+    // end, which no frame reaches.
+    let finishes = [finish_of(chart), TimeUs(i64::MAX)];
+    for (finish, range) in finishes.into_iter().flat_map(|f| ranges.map(|r| (f, r))) {
         let ctx = PlayContext {
             autoplay: false,
             gauges: &descs,
-            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            attempt: Attempt::Full {
+                lead_in: TimeUs(0),
+                finish,
+            },
             empty_poor_breaks_combo: false,
             empty_poor_counted: false,
             scratch: Side::Left,
@@ -3644,7 +3682,10 @@ pub fn present(data: &[u8]) -> Option<usize> {
     let ctx = PlayContext {
         autoplay: false,
         gauges: &gauges,
-        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        attempt: Attempt::Full {
+            lead_in: TimeUs(0),
+            finish: finish_of(&chart),
+        },
         empty_poor_breaks_combo: false,
         empty_poor_counted: false,
         scratch: Side::Left,

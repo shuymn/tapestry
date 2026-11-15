@@ -842,7 +842,7 @@ pub(crate) mod tests {
     }
 
     /// One tap at 1 s on lane 1.
-    fn chart() -> bms_model::Chart {
+    pub(crate) fn chart() -> bms_model::Chart {
         ChartBuilder::new(150_000)
             .tap(Lane::new(1).unwrap(), TimeUs(1_000_000))
             .build()

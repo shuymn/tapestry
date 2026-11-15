@@ -55,10 +55,11 @@ pub const SOUND_SETS_VERSION: i64 = 1;
 pub const EXTENSIONS: [&str; 4] = ["wav", "flac", "ogg", "mp3"];
 
 /// The keys `[sounds]` takes.
-pub(crate) const SOUND_KEYS: [&str; 2] = ["sound_root", "bgm_root"];
+pub(crate) const SOUND_KEYS: [&str; 3] = ["sound_root", "bgm_root", "loop_result"];
 
-/// `[sounds]` of `player.toml`: where the sets are found. Absent, a root is
-/// the data root's `sound\` or `bgm\`; empty, no set of that kind is found.
+/// `[sounds]` of `player.toml`: where the sets are found, and whether the
+/// result's sound loops. Absent, a root is the data root's `sound\` or
+/// `bgm\`; empty, no set of that kind is found.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SoundSettings {
@@ -68,6 +69,11 @@ pub struct SoundSettings {
     /// The BGM sets' root, an absolute path.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bgm_root: Option<PathBuf>,
+    /// Whether the result's `clear` or `fail` loops (design.md "State
+    /// Model", system sounds, Result), `false` by default. Read once, at
+    /// startup.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub loop_result: bool,
 }
 
 impl SoundSettings {

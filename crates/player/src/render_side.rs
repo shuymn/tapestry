@@ -19264,6 +19264,7 @@ pub(crate) mod tests {
             TimeUs(1_000_000),
             section,
             game::NoteEnd::Play.of(chart),
+            game::finish_point(game::finish_anchor(chart, false)),
             &labels,
             chart,
         );

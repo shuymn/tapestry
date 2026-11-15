@@ -1663,3 +1663,61 @@ fn each_volume_draws_on_its_own_number_slider_and_graph() {
     assert!(close(sliders, want), "{sliders:?} {want:?}");
     assert!(close(graphs, want), "{graphs:?} {want:?}");
 }
+
+/// The player's totals' numbers: the play time's hours, minutes and
+/// seconds, the plays, clears and fails, PERFECT to POOR, and PERFECT to
+/// BAD.
+const PLAYER_NUMBERS: [i32; 12] = [17, 18, 19, 30, 31, 32, 33, 34, 35, 36, 37, 333];
+
+/// C10: a JSON selection skin reading numbers 17 to 19, 30 to 37 and 333
+/// draws the player's totals (`IntegerPropertyFactory.java:94-120` at
+/// `0.8.9`), none of them unsupported, with the cursor on a chart and on
+/// a folder alike.
+#[test]
+fn the_player_totals_draw() {
+    let d = folder(&numbers_skin(&PLAYER_NUMBERS));
+    let imported = import_selection(d.path()).unwrap();
+    assert!(
+        !imported.report.notes.iter().any(|n| matches!(
+            n.kind,
+            skin_beatoraja::NoteKind::UnsupportedProperty { id: Some(id), .. }
+                if PLAYER_NUMBERS.contains(&id)
+        )),
+        "{:?}",
+        imported.report.notes
+    );
+    let mut s = Sel::new(imported.skin);
+    let want: BTreeMap<i32, String> = [
+        (17, "3"),
+        (18, "25"),
+        (19, "45"),
+        (30, "7"),
+        (31, "3"),
+        (32, "4"),
+        (33, "101"),
+        (34, "202"),
+        (35, "303"),
+        (36, "404"),
+        (37, "505"),
+        (333, "1010"),
+    ]
+    .into_iter()
+    .map(|(k, v)| (k, v.to_owned()))
+    .collect();
+    for (what, mut v) in [
+        ("chart", view(vec![chart("a")], Some(0), None, None)),
+        (
+            "folder",
+            view(vec![folder_row("f", 2)], Some(0), None, None),
+        ),
+    ] {
+        v.totals = skin_model::PlayerTotals {
+            plays: 7,
+            clears: 3,
+            counts: [101, 202, 303, 404, 505],
+            play_us: 12_345_900_000,
+        };
+        s.view(&v);
+        assert_eq!(numbers(&mut s, &PLAYER_NUMBERS), want, "{what}");
+    }
+}

@@ -210,6 +210,7 @@ pub fn ready(ex: u32, cleared: bool, best: BestView) -> ResultView {
         gauge: None,
         deviations: None,
         timing_areas: None,
+        totals: Default::default(),
     }
 }
 

@@ -86,9 +86,12 @@ pub fn connect(path: &Path) -> rusqlite::Result<Connection> {
 /// their columns needs no schema change. `play` is a [`crate::Breakdown`] in
 /// its fixed layout ([`crate::bests::BREAKDOWN_BYTES`] bytes, the length its
 /// check takes from the layout); the best's values are all set or all null.
-/// `progress` holds the judgments of the play `play_sha256` names, one byte
-/// each ([`crate::bests::MAX_PROGRESS`] at most), beside its key's
-/// breakdown; it keeps rowids, since a row can pass a page.
+/// `plays` and the `sum_*` columns add every counted normal play's count and
+/// [`crate::Sums`], and the `practice_*` columns every practice round's
+/// ([`crate::PlayKind`]). `progress` holds the judgments of the play
+/// `play_sha256` names, one byte each ([`crate::bests::MAX_PROGRESS`] at
+/// most), beside its key's breakdown; it keeps rowids, since a row can pass
+/// a page.
 pub(crate) fn bests_ddl() -> String {
     let len = crate::bests::BREAKDOWN_BYTES;
     let max = crate::bests::MAX_PROGRESS;
@@ -106,6 +109,19 @@ pub(crate) fn bests_ddl() -> String {
              full_combo INTEGER NOT NULL DEFAULT 0,
              play_sha256 BLOB CHECK (play_sha256 IS NULL OR length(play_sha256) = 32),
              play BLOB CHECK (play IS NULL OR length(play) = {len}),
+             sum_perfect INTEGER NOT NULL DEFAULT 0 CHECK (sum_perfect >= 0),
+             sum_great INTEGER NOT NULL DEFAULT 0 CHECK (sum_great >= 0),
+             sum_good INTEGER NOT NULL DEFAULT 0 CHECK (sum_good >= 0),
+             sum_bad INTEGER NOT NULL DEFAULT 0 CHECK (sum_bad >= 0),
+             sum_poor INTEGER NOT NULL DEFAULT 0 CHECK (sum_poor >= 0),
+             sum_play_us INTEGER NOT NULL DEFAULT 0 CHECK (sum_play_us >= 0),
+             practice_plays INTEGER NOT NULL DEFAULT 0 CHECK (practice_plays >= 0),
+             practice_sum_perfect INTEGER NOT NULL DEFAULT 0 CHECK (practice_sum_perfect >= 0),
+             practice_sum_great INTEGER NOT NULL DEFAULT 0 CHECK (practice_sum_great >= 0),
+             practice_sum_good INTEGER NOT NULL DEFAULT 0 CHECK (practice_sum_good >= 0),
+             practice_sum_bad INTEGER NOT NULL DEFAULT 0 CHECK (practice_sum_bad >= 0),
+             practice_sum_poor INTEGER NOT NULL DEFAULT 0 CHECK (practice_sum_poor >= 0),
+             practice_sum_play_us INTEGER NOT NULL DEFAULT 0 CHECK (practice_sum_play_us >= 0),
              CHECK ((best_ex IS NULL) = (best_bp IS NULL)
                  AND (best_ex IS NULL) = (best_combo IS NULL)
                  AND (best_ex IS NULL) = (play_sha256 IS NULL)

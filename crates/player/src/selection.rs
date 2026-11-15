@@ -611,6 +611,19 @@ impl Selection {
 
     /// Reads the bests of the chosen preset again, for the list.
     fn refresh_bests(&mut self) {
+        // The totals are every preset's: read whether or not one is
+        // chosen. A failed read keeps the previous totals.
+        match self.shelf.totals() {
+            Ok(t) => self
+                .screen
+                .set_totals(crate::bests::view_totals(crate::bests::game_totals(&t))),
+            Err(e) => {
+                let line = format!("library: the totals cannot be read: {}", Chain(&e));
+                eprintln!("{line}");
+                log::warn!("{line}");
+            }
+        }
+        self.dirty = true;
         let Some(preset) = self.screen.bests_preset() else {
             return;
         };
@@ -6900,6 +6913,8 @@ pub(crate) mod tests {
             progress: None,
             clear: true,
             ineligible: None,
+            sums: library::Sums::default(),
+            kind: library::PlayKind::Normal,
         };
         sel.shelf.best_writer().unwrap().ingest(&c).unwrap();
         // Unchanged until selection is entered.
@@ -6908,6 +6923,115 @@ pub(crate) mod tests {
         assert_eq!(sel.entered_at, TimeUs(5));
         let lamp = preset.gauges[0].id.to_uppercase();
         assert_eq!(line(&sel), format!("    {lamp:11}     2 ☆-   A  / Z"));
+    }
+
+    /// C11: the select screen's totals are read again from the library on
+    /// each entry, each commit of a catch-up and each preset change, to a
+    /// preset or to none, through the rig's production calls: a play
+    /// counted live, then a record a catch-up counts (a play with no hit
+    /// of the chart's one note: a POOR, 2 s, and a clear, its survival
+    /// gauge surviving the POOR), then one counted before
+    /// each preset change (dev-tools, for the rig).
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_totals_follow_selection_entry_catch_up_and_preset_changes() {
+        use game::AppRig as _;
+        use skin_model::PlayerTotals;
+        let screens = crate::render_side::tests::Installers::default();
+        let render = screens.spawn_bare();
+        let dir = tempfile::tempdir().unwrap();
+        let records = dir.path().join("records");
+        let root = dir.path().join("root0");
+        // One note on key 1 at 2 s.
+        write_chart(&root, "hidden.bms");
+        let (sel, _) = over_with(dir.path(), vec![root.clone()], Some(records.clone()));
+        let presets = dir.path().join("presets");
+        std::fs::create_dir_all(&presets).unwrap();
+        let preset = rules::tapestry();
+        // A play of the `n`th key counted live, its sums `n`-fold.
+        let count = |sel: &Selection, n: u8| {
+            let v = u32::from(n);
+            let c = library::Contribution {
+                key: library::Key {
+                    preset_sha256: replay::preset_hash(&preset),
+                    ln_mode: library::LN_MODE,
+                    chart_sha256: [n; 32],
+                },
+                id: library::PlayId {
+                    path: format!("x/{n}.tprl"),
+                    body_sha256: [n; 32],
+                    size: 1,
+                    mtime_ns: 1,
+                },
+                best: None,
+                progress: None,
+                clear: false,
+                ineligible: Some(library::Ineligible::NotFullPlay),
+                sums: library::Sums {
+                    counts: [v, 2 * v, 3 * v, 4 * v, 5 * v],
+                    play_us: 1_000_000 * u64::from(n),
+                },
+                kind: library::PlayKind::Normal,
+            };
+            sel.shelf.best_writer().unwrap().ingest(&c).unwrap();
+        };
+        let at = |plays: u64, clears: u64, sum: u64, poor: u64, play_us: u64| PlayerTotals {
+            plays,
+            clears,
+            counts: [sum, 2 * sum, 3 * sum, 4 * sum, 5 * sum + poor],
+            play_us,
+        };
+        crate::selection::tests::on_selection(sel, &screens, render, |rig| {
+            let totals = |rig: &crate::play::PlayerRig<'_>| {
+                rig.selection
+                    .as_ref()
+                    .unwrap()
+                    .screen
+                    .view(0, 0, false)
+                    .totals
+            };
+            assert_eq!(totals(rig), PlayerTotals::default());
+            count(rig.selection.as_ref().unwrap(), 1);
+            assert_eq!(totals(rig), PlayerTotals::default(), "not read yet");
+            rig.entered_selection();
+            assert_eq!(totals(rig), at(1, 0, 1, 0, 1_000_000), "entry");
+            // A record of the chart, saved while no play counted it, and a
+            // catch-up: the look that sees its commit reads them again.
+            let text = std::fs::read_to_string(root.join("hidden.bms")).unwrap();
+            let record = crate::bests::common::record_of(&text, 0, Vec::new());
+            let folder = records.join(crate::bests::common::hex(&record.chart.identity.sha256));
+            std::fs::create_dir_all(&folder).unwrap();
+            std::fs::write(folder.join("1-1.tprl"), replay::encode(&record)).unwrap();
+            let sel = rig.selection.as_ref().unwrap();
+            sel.shelf.best_writer().unwrap().request_pass().unwrap();
+            let begun = Instant::now();
+            while totals(rig).plays < 2 {
+                assert!(
+                    begun.elapsed() < Duration::from_secs(600),
+                    "the catch-up never counted the record"
+                );
+                rig.look();
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(totals(rig), at(2, 1, 1, 1, 3_000_000), "catch-up");
+            // A preset chosen, then none (the shelf refused).
+            let shelf = game::Shelf::open(presets.clone(), rig.files.preset()).unwrap();
+            count(rig.selection.as_ref().unwrap(), 2);
+            rig.presets_changed(Ok(&shelf));
+            assert_eq!(totals(rig), at(3, 1, 3, 1, 5_000_000), "a preset");
+            count(rig.selection.as_ref().unwrap(), 3);
+            let broken = game::Shelf::open(presets.clone(), "missing").unwrap_err();
+            rig.presets_changed(Err(&broken));
+            assert!(
+                rig.selection
+                    .as_ref()
+                    .unwrap()
+                    .screen
+                    .bests_preset()
+                    .is_none()
+            );
+            assert_eq!(totals(rig), at(4, 1, 6, 1, 8_000_000), "no preset");
+        });
     }
 
     /// Types `text` into the search box through the window's queue.
@@ -7274,12 +7398,22 @@ pub(crate) mod tests {
         dir: &std::path::Path,
         roots: Vec<std::path::PathBuf>,
     ) -> (Selection, Vec<std::path::PathBuf>) {
+        over_with(dir, roots, None)
+    }
+
+    /// [`over`], its passes catching the bests up with the records under
+    /// `records`.
+    fn over_with(
+        dir: &std::path::Path,
+        roots: Vec<std::path::PathBuf>,
+        records: Option<std::path::PathBuf>,
+    ) -> (Selection, Vec<std::path::PathBuf>) {
         let (library, _) = open(&DataRoot::new(dir.join("data"))).unwrap();
         let shelf = Shelf::new(
             library,
             roots.clone(),
             Duration::ZERO,
-            None,
+            records,
             &crate::shelf::tests::coordinator(),
         );
         let mut sel = Selection {

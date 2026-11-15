@@ -437,3 +437,51 @@ fn a_payload_carries_its_attempts_chart_images() {
     p.land(&mut sent, Some(&Published::BuiltIn), Some(Arc::clone(&a)));
     assert!(sent.shown.last().unwrap().payload.chart.is_none());
 }
+
+/// C13: the real `view_of` puts the totals the screen read into a view of
+/// every status, a ready one and an unavailable one alike, and zeros while
+/// they are unread or were read as unavailable.
+#[test]
+fn view_of_carries_the_totals_in_every_view() {
+    use crate::end_screen::tests::{chart, report};
+    use game::{ResultScreen, ViewStatus};
+    let dir = tempfile::tempdir().unwrap();
+    let played = report(rules::tapestry());
+    let shelf = game::Shelf::open(dir.path().join("presets"), "tapestry").unwrap();
+    let read = game::PlayerTotals {
+        plays: 7,
+        clears: 3,
+        counts: [101, 202, 303, 404, 505],
+        play_us: 12_345_900_000,
+    };
+    let want = skin_model::PlayerTotals {
+        plays: 7,
+        clears: 3,
+        counts: [101, 202, 303, 404, 505],
+        play_us: 12_345_900_000,
+    };
+    // A budget of one byte: the own view is ready, every other refused.
+    let screen = || ResultScreen::new(&played, &shelf, &chart(), 1);
+    let view = |s: &ResultScreen| super::view_of(s, ResultChart::default());
+    let unread = screen();
+    assert!(matches!(unread.status(), ViewStatus::Ready(_)));
+    assert_eq!(view(&unread).totals, skin_model::PlayerTotals::default());
+    for (answer, want) in [
+        (Some(read), want),
+        (None, skin_model::PlayerTotals::default()),
+    ] {
+        let mut s = screen();
+        s.read_totals(&mut || answer);
+        let ready = view(&s);
+        assert_eq!(ready.status, skin_model::ResultStatus::Ready);
+        assert_eq!(ready.totals, want, "{answer:?}");
+        assert!(s.step(1, &played, &chart()));
+        let other = view(&s);
+        assert!(
+            matches!(other.status, skin_model::ResultStatus::Unavailable(_)),
+            "{:?}",
+            other.status
+        );
+        assert_eq!(other.totals, want, "{answer:?}");
+    }
+}

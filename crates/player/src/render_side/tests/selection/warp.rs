@@ -358,6 +358,7 @@ pub(super) fn listed(place: SelectionPlace, query: &str) -> SelectionView {
         query: query.to_owned(),
         selected: None,
         list_revision: 0,
+        totals: Default::default(),
     }
 }
 

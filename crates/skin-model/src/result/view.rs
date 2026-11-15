@@ -55,6 +55,9 @@ pub struct ResultView {
     /// GOOD and BAD as `[−late, early]`, the empty POOR range as
     /// `[−behind, ahead]`. Read only while `Ready`.
     pub timing_areas: Option<[[i16; 2]; 5]>,
+    /// The player's totals, the same in every view and under every
+    /// status: 0 when they cannot be read.
+    pub totals: crate::PlayerTotals,
 }
 
 /// One column of a gauge's history.
