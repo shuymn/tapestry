@@ -53,6 +53,8 @@ pub struct AttemptContext {
     autoplay: bool,
     /// The play's best and target, read when it began.
     score: skin_model::ScoreBasis,
+    /// The best paced by its play, read with the best ([`Attempt::pace`]).
+    pace: Option<Arc<[u32]>>,
     /// The chart's 1× profile, shared with the loaded chart.
     profile: Option<Arc<ChartProfile>>,
     /// The whole chart's MAIN tempo.
@@ -95,6 +97,7 @@ impl AttemptContext {
                 best_known: attempt.score.best_known,
                 target: attempt.score.target,
             },
+            pace: attempt.pace,
             profile: attempt.profile,
             main: attempt.main,
             areas: attempt.areas,
@@ -178,9 +181,7 @@ impl AttemptContext {
             bpm_whole_change: Some(bpm_whole_change(self.tempo.meta())),
             play_level: Some(self.play_level),
             score: PlayScore {
-                // The attempt's pace is wired in when the player reads the
-                // best's progress; until then the best paces by the line.
-                pace: None,
+                pace: self.pace.as_deref(),
                 basis: self.score,
                 profile: self.profile.as_deref(),
                 main: self.main,
@@ -357,8 +358,8 @@ mod tests {
     }
 
     /// The context hands the skin the attempt's best and target, the
-    /// load's shared profile itself (not a copy) and the whole chart's
-    /// MAIN tempo; an attempt made without them gives none.
+    /// best's pace, the load's shared profile itself (not a copy) and the
+    /// whole chart's MAIN tempo; an attempt made without them gives none.
     #[test]
     fn the_context_carries_the_score_basis_and_profile() {
         let preset = rules::tapestry();
@@ -379,6 +380,7 @@ mod tests {
         let ctx = none.context();
         assert_eq!(ctx.score.basis, skin_model::ScoreBasis::default());
         assert!(ctx.score.profile.is_none() && ctx.score.main.is_none());
+        assert!(ctx.score.pace.is_none());
         let profile = std::sync::Arc::new(bms_model::ChartProfile::of(&chart, &[]));
         let main = chart.timeline.meta().initial;
         let attempt = Attempt {
@@ -387,6 +389,7 @@ mod tests {
                 best_known: true,
                 target: 8,
             },
+            pace: Some(std::sync::Arc::from([0, 5])),
             profile: Some(std::sync::Arc::clone(&profile)),
             main: Some(main),
             areas: [[-1, 2], [-3, 4], [-5, 6], [-7, 8], [-9, 10]],
@@ -404,6 +407,7 @@ mod tests {
             }
         );
         assert!(std::ptr::eq(ctx.score.profile.unwrap(), &*profile));
+        assert_eq!(ctx.score.pace, Some(&[0, 5][..]));
         assert_eq!(ctx.score.main, Some(main));
         // The judge areas and the speed the visualizers and the notes
         // graph's cursors read.

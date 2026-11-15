@@ -6678,3 +6678,91 @@ fn a_play_reads_its_best_under_its_refreshed_preset() {
         [replay::preset_hash(&before), replay::preset_hash(&after)]
     );
 }
+
+/// A record sink whose save succeeds at once and which answers each play's
+/// read of its best and progress with the next of `answers`, the last one
+/// again once they run out, counting the reads.
+struct PacedReads {
+    answers: Vec<game::PlayBest>,
+    reads: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl game::RecordSink for PacedReads {
+    fn save(&mut self, _rec: &replay::PlayRecord) -> Result<game::RecordRef, game::SaveError> {
+        Ok(game::RecordRef {
+            path: "saved.tprl".into(),
+        })
+    }
+
+    fn play_best(
+        &mut self,
+        _: &game::BestKey,
+        _: &rules::RulePreset,
+        _: Option<game::ProgressQuery>,
+    ) -> game::PlayBest {
+        let i = self.reads.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        self.answers[i.min(self.answers.len() - 1)].clone()
+    }
+}
+
+/// A retry after a finished play reads the best and its progress again,
+/// so a play counted since paces the next attempt (design.md "Personal
+/// Bests", skin projections): play 1 reads a best of EX 3 paced
+/// `[0, 1, 3]` (GREAT, PERFECT) and is retried at 9.5 s; play 2 reads the
+/// new best of EX 4 paced `[0, 2, 4]`, which differs at p = 1. Every
+/// preparation of a play carries its own read's series.
+#[test]
+fn a_retry_reads_the_best_and_its_pace_again() {
+    use rules::Judgment::{Great, Perfect};
+    let best = |ex, progress: &[rules::Judgment]| game::PlayBest {
+        best: game::BestLookup::Known(game::BestScore {
+            plays: 1,
+            ex: Some(ex),
+            bp: Some(0),
+            max_combo: Some(2),
+            clear: Some(game::BestLamp::FullCombo),
+        }),
+        progress: game::ProgressLookup::Known(progress.into()),
+    };
+    let reads = std::sync::Arc::default();
+    let dir = tempfile::tempdir().unwrap();
+    let events = Events::default();
+    let mut loaded = closing_loaded_with(
+        dir.path(),
+        chart(),
+        0,
+        game::FailureAction::PlayToEnd,
+        &events,
+        None,
+        TimeUs(1_000 * MS),
+        |p| Parts {
+            records: Some(Box::new(PacedReads {
+                answers: vec![best(3, &[Great, Perfect]), best(4, &[Perfect, Perfect])],
+                reads: std::sync::Arc::clone(&reads),
+            })),
+            ..p
+        },
+    );
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[(9_500_000, Command::Retry)], 13_500_000);
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+    assert_eq!(rig.reports.len(), 2);
+    let paces = |number: u32| -> Vec<Option<Vec<u32>>> {
+        rig.attempts
+            .iter()
+            .filter(|a| a.number == number)
+            .map(|a| a.pace.as_deref().map(<[u32]>::to_vec))
+            .collect()
+    };
+    let (one, two) = (paces(1), paces(2));
+    assert!(!one.is_empty() && !two.is_empty(), "{one:?} {two:?}");
+    assert!(
+        one.iter().all(|p| p.as_deref() == Some(&[0, 1, 3][..])),
+        "{one:?}"
+    );
+    assert!(
+        two.iter().all(|p| p.as_deref() == Some(&[0, 2, 4][..])),
+        "{two:?}"
+    );
+    assert_eq!(reads.load(std::sync::atomic::Ordering::SeqCst), 2);
+}
