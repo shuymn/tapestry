@@ -321,7 +321,7 @@ fn the_memory_witness_counts_the_selection_lines_and_state() {
 }
 
 /// A selection frame's app work (the readouts and timers, the skin's
-/// build and the strip's sprites, all three shown) allocates nothing,
+/// build and the strip's sprites, all four shown) allocates nothing,
 /// the readouts moving every frame: the first build after the update's
 /// preparation, each later one, the first after a resize prepared
 /// outside the count, and refused, with the fallback page's own build;
@@ -367,8 +367,16 @@ fn selection_frame_alloc() {
         s.order_view(),
         &tuning,
     );
-    let u = update(&mut feed, &s, 0);
+    let mut u = update(&mut feed, &s, 0);
     assert!(u.settings.is_some());
+    // The list-cut line too (a list past its bound is set apart in
+    // `a_short_list_fills_every_slot_around_the_cursor`).
+    u.strip.cut = Some(
+        crate::ui_text::Message::ListCut {
+            limit: crate::select::LIMIT,
+        }
+        .text(),
+    );
     let counted = |f: &mut dyn FnMut()| {
         let before = crate::alloc_count::this_thread();
         f();
@@ -400,9 +408,11 @@ fn selection_frame_alloc() {
     };
     prepare(&mut screen, &mut logic, true);
     assert_eq!(build(&mut screen, &mut logic, 0), 0, "first");
-    // The search line, the notice and the underline: every strip sprite.
-    assert_eq!(screen.selection_strip_staged(), 3);
-    const { assert!(render::STRIP_SPRITES == 3) };
+    // The search line, the notice, the list-cut line and the underline:
+    // every strip sprite.
+    assert_eq!(screen.selection_strip().0.len(), 3);
+    assert_eq!(screen.selection_strip_staged(), 4);
+    const { assert!(render::STRIP_SPRITES == 4) };
     for k in 1..100 {
         assert_eq!(build(&mut screen, &mut logic, k), 0, "{k}");
         let q = screen.renderer.selection_quads().unwrap();
@@ -434,6 +444,90 @@ fn selection_frame_alloc() {
             screen.build_page_frame();
         }) > 0
     );
+}
+
+/// A list shorter than the song list's slots fills every slot around the
+/// cursor on the list's ring: the selected placement (x 1010) at the
+/// center slot only, the unselected one (x 1000) elsewhere, the copies of
+/// the cursor's row in slots 0 and 6 included. While the list is cut at
+/// its bound, the strip over the skin says so on a band of its own, under
+/// the notice or a stopped script's notice.
+// Source: SF-016
+#[test]
+fn a_short_list_fills_every_slot_around_the_cursor() {
+    use std::path::PathBuf;
+    let entry = |name: &str| library::ChartEntry {
+        path: PathBuf::from(format!(r"C:\charts\a\{name}.bms")),
+        size: 0,
+        mtime_ns: 0,
+        sha256: [0; 32],
+        md5: [0; 16],
+        header: library::Header {
+            title: Some(name.to_owned()),
+            ..library::Header::default()
+        },
+        random: false,
+        bga: false,
+        summary: None,
+        rank: None,
+        images: None,
+        info: None,
+    };
+    let (_dir, mut screen, mut logic, _sent) =
+        skinned_with(warp(), crate::selection_skin::ring_fixture(), "s.json");
+    let mut feed = SkinFeed::default();
+    feed.enter(TimeUs(0));
+    let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+    s.set_entries(["x", "y", "z"].map(entry).to_vec());
+    s.input(crate::select::MenuInput::Key(crate::select::MenuKey::Down));
+    let u = update(&mut feed, &s, 0);
+    drawn(&mut screen, &mut logic, &u, true, 0);
+    let bars: Vec<(f32, f32)> = screen
+        .selection_quads()
+        .unwrap()
+        .iter()
+        .filter(|q| q.rect[2] == 800.0 && q.rect[3] == 80.0)
+        .map(|q| (q.rect[0], q.rect[1]))
+        .collect();
+    let want: Vec<(f32, f32)> = (0..7_u8)
+        .map(|i| {
+            let x = if i == 3 { 1_010.0 } else { 1_000.0 };
+            (x, 100.0 + 100.0 * f32::from(i))
+        })
+        .collect();
+    assert_eq!(bars, want);
+    assert_eq!(screen.selection_strip().0, Vec::<String>::new());
+    // Past the bound: the cut line, under the notice.
+    let charts = (0..=crate::select::LIMIT)
+        .map(|i| entry(&format!("{i:04}")))
+        .collect();
+    s.set_top(
+        library::Level {
+            charts,
+            ..library::Level::default()
+        },
+        5_001,
+    );
+    s.set_notice(Some("refused".to_owned()));
+    let u = update(&mut feed, &s, 10);
+    drawn(&mut screen, &mut logic, &u, true, 10);
+    let cut = crate::ui_text::Message::ListCut {
+        limit: crate::select::LIMIT,
+    }
+    .text();
+    assert_eq!(
+        screen.selection_strip().0,
+        ["refused".to_owned(), cut.clone()]
+    );
+    assert_eq!(screen.selection_strip_staged(), 2, "a band under each line");
+    // A stopped script's notice, with no notice of the strip's own, sits
+    // above the cut line.
+    let strip = crate::selection_skin::StripText {
+        cut: Some(cut.clone()),
+        ..Default::default()
+    };
+    screen.prepare_strip(&strip, Some("stopped")).unwrap();
+    assert_eq!(screen.selection_strip().0, ["stopped".to_owned(), cut]);
 }
 
 /// The rows a cursor at `at` shows: seven around it of `n`, each a long

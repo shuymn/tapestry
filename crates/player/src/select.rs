@@ -986,15 +986,7 @@ impl SelectScreen {
 
     /// The selectable row under the cursor; none while nothing is listed.
     fn row_at_cursor(&self) -> Option<Row> {
-        let all = usize::from(self.all_row.is_some());
-        if self.cursor < all {
-            Some(Row::All)
-        } else if self.cursor < self.lead() {
-            Some(Row::Folder(self.cursor - all))
-        } else {
-            let i = self.cursor - self.lead();
-            (i < self.entries.len()).then_some(Row::Chart(i))
-        }
+        self.row_of(self.cursor)
     }
 
     /// The line of the list the cursor shows on; none while nothing is
@@ -1266,14 +1258,16 @@ impl SelectScreen {
             // lane keys type letters.
             return Acted::Nothing;
         };
-        let last = (self.lead() + self.entries.len()).saturating_sub(1);
+        let last = self.selectable().saturating_sub(1);
+        // A ring step: none with nothing listed.
+        let step = |forward, steps| self.ring_to(forward, steps).map(|to| (to, true));
         let to = match key {
-            MenuKey::Up => self.cursor.saturating_sub(1),
-            MenuKey::Down => (self.cursor + 1).min(last),
-            MenuKey::PageUp => self.cursor.saturating_sub(PAGE_STEP),
-            MenuKey::PageDown => (self.cursor + PAGE_STEP).min(last),
-            MenuKey::Home => 0,
-            MenuKey::End => last,
+            MenuKey::Up => step(false, 1),
+            MenuKey::Down => step(true, 1),
+            MenuKey::PageUp => step(false, PAGE_STEP),
+            MenuKey::PageDown => step(true, PAGE_STEP),
+            MenuKey::Home => Some((0, false)),
+            MenuKey::End => Some((last, false)),
             MenuKey::Left | MenuKey::Right => {
                 let n = SORTS.len();
                 self.sort = if key == MenuKey::Right {
@@ -1310,14 +1304,57 @@ impl SelectScreen {
             }
             MenuKey::BackspaceHeld => return Acted::Nothing,
         };
+        let Some((to, ring)) = to else {
+            return Acted::Nothing;
+        };
+        // A ring step sounds as it is asked for, even back onto its own
+        // row; Home and End only when they move.
+        // Source: SF-012
+        // Source: SF-016
+        if ring || to != self.cursor {
+            cues.add(SystemKind::Scratch, 1);
+        }
         if to == self.cursor {
             return Acted::Nothing;
         }
         self.cursor = to;
         self.scroll(CURSOR_LINE);
-        // Source: SF-012
-        cues.add(SystemKind::Scratch, 1);
         Acted::Changed
+    }
+
+    /// The selectable row `steps` rows forward (or back) of the cursor
+    /// around the list's ring; none while nothing is listed.
+    // Source: SF-016
+    pub fn ring_to(&self, forward: bool, steps: usize) -> Option<usize> {
+        let n = self.selectable();
+        if n == 0 {
+            return None;
+        }
+        let at = self.cursor % n;
+        let steps = steps % n;
+        Some(if forward {
+            (at + steps) % n
+        } else {
+            (at + n - steps) % n
+        })
+    }
+
+    /// The selectable row at `index`; none past the list.
+    fn row_of(&self, index: usize) -> Option<Row> {
+        let all = usize::from(self.all_row.is_some());
+        if index < all {
+            Some(Row::All)
+        } else if index < self.lead() {
+            Some(Row::Folder(index - all))
+        } else {
+            let i = index - self.lead();
+            (i < self.entries.len()).then_some(Row::Chart(i))
+        }
+    }
+
+    /// The line saying the list is cut at [`LIMIT`] rows, while it is.
+    pub fn cut_line(&self) -> Option<String> {
+        self.more.then(|| Message::ListCut { limit: LIMIT }.text())
     }
 
     /// Enter or P on the row under the cursor: a chart is chosen or practiced;
@@ -1518,32 +1555,17 @@ impl SelectScreen {
     /// query and the chart under the cursor. Without `headings` the list's
     /// heading rows are left out, so `before` and `after` count selectable
     /// rows only: a skin's song list shows no headings, which group the
-    /// built-in page's lines.
+    /// built-in page's lines. A skin's window also runs around the list's
+    /// ring: it has exactly `before + 1 + after` rows (capped), the row
+    /// above the first being the last, so a list shorter than the window
+    /// repeats; with nothing listed it has none. The built-in page's
+    /// window stops at the list's ends.
     pub fn view(&self, before: usize, after: usize, headings: bool) -> SelectionView {
-        let lines = || {
-            self.rows
-                .iter()
-                .copied()
-                .filter(move |r| headings || !matches!(r, Row::Heading(_)))
+        let (rows, cursor) = if headings {
+            self.page_window(before, after)
+        } else {
+            self.ring_window(before, after)
         };
-        let at = self
-            .row_at_cursor()
-            .and_then(|row| lines().position(|r| r == row));
-        let (start, end) = at.map_or((0, 0), |at| {
-            let before = before.min(MAX_VISIBLE_ROWS - 1).min(at);
-            let after = after.min(MAX_VISIBLE_ROWS - 1 - before);
-            (at - before, at + after + 1)
-        });
-        let rows = lines()
-            .skip(start)
-            .take(end - start)
-            .map(|row| RowView {
-                // A skin's rows are its selectable ones; the built-in
-                // page's lines name none.
-                index: self.selectable_index(row).filter(|_| !headings),
-                ..self.row_view(row)
-            })
-            .collect();
         let selectable = self.lead() + self.entries.len();
         let position = (selectable > 1)
             .then(|| Ratio::new(self.cursor as u64, selectable as u64 - 1))
@@ -1556,7 +1578,7 @@ impl SelectScreen {
         };
         SelectionView {
             rows,
-            cursor: at.map(|at| at - start),
+            cursor,
             position,
             place,
             query: self.query.clone(),
@@ -1564,6 +1586,55 @@ impl SelectScreen {
             list_revision: 0,
             totals: self.totals,
         }
+    }
+
+    /// The built-in page's window: the cursor's line with up to `before`
+    /// lines above it and `after` below that the list has, headings
+    /// included, and the cursor's place in it.
+    fn page_window(&self, before: usize, after: usize) -> (Vec<RowView>, Option<usize>) {
+        let at = self
+            .row_at_cursor()
+            .and_then(|row| self.rows.iter().position(|r| *r == row));
+        let (start, end) = at.map_or((0, 0), |at| {
+            let before = before.min(MAX_VISIBLE_ROWS - 1).min(at);
+            let after = after.min(MAX_VISIBLE_ROWS - 1 - before);
+            (at - before, at + after + 1)
+        });
+        let rows = self
+            .rows
+            .iter()
+            .skip(start)
+            .take(end - start)
+            // The built-in page's lines name no selectable row.
+            .map(|&row| RowView {
+                index: None,
+                ..self.row_view(row)
+            })
+            .collect();
+        (rows, at.map(|at| at - start))
+    }
+
+    /// A skin's window: `before` rows above the cursor and `after` below,
+    /// capped together at [`MAX_VISIBLE_ROWS`], taken around the list's
+    /// ring of selectable rows, each with its selectable index; none and
+    /// no cursor while nothing is listed.
+    // Source: SF-016
+    fn ring_window(&self, before: usize, after: usize) -> (Vec<RowView>, Option<usize>) {
+        let n = self.selectable();
+        if n == 0 || self.row_at_cursor().is_none() {
+            return (Vec::new(), None);
+        }
+        let before = before.min(MAX_VISIBLE_ROWS - 1);
+        let after = after.min(MAX_VISIBLE_ROWS - 1 - before);
+        let start = (self.cursor % n + n - before % n) % n;
+        let rows = (0..=before + after)
+            .filter_map(|k| self.row_of((start + k) % n))
+            .map(|row| RowView {
+                index: self.selectable_index(row),
+                ..self.row_view(row)
+            })
+            .collect();
+        (rows, Some(before))
     }
 
     /// The names of the folders entered from Top's level to the current
@@ -2122,15 +2193,20 @@ mod tests {
         assert_eq!(event_key(MenuEvent::Extra), MenuKey::NextPreset);
     }
 
-    /// The navigation keys move the cursor within the list, Enter chooses
+    /// The navigation keys move the cursor around the list, Enter chooses
     /// the chart under it, and the order keys cycle the four orders.
     #[test]
     fn menu_keys_move_order_and_choose() {
         let mut s = screen();
-        assert_eq!(s.input(key(MenuKey::Up)), Acted::Nothing);
+        // Up from the first chart is the last.
+        assert_eq!(s.input(key(MenuKey::Up)), Acted::Changed);
+        assert_eq!(
+            s.input(key(MenuKey::Enter)),
+            Acted::Choose(PathBuf::from(r"C:\charts\b\3.bms"))
+        );
+        assert_eq!(s.input(key(MenuKey::Down)), Acted::Changed);
         assert_eq!(s.input(key(MenuKey::Down)), Acted::Changed);
         assert_eq!(s.input(key(MenuKey::End)), Acted::Changed);
-        assert_eq!(s.input(key(MenuKey::Down)), Acted::Nothing);
         assert_eq!(
             s.input(key(MenuKey::Enter)),
             Acted::Choose(PathBuf::from(r"C:\charts\b\3.bms"))
@@ -2690,6 +2766,239 @@ mod tests {
         assert_eq!(v.position, Ratio::new(99, 99));
     }
 
+    /// The cursor's row (or `None`), the step's answer and the `scratch`
+    /// cues it asked for, after `k`.
+    fn step(s: &mut SelectScreen, k: MenuKey) -> (Acted, usize, u32) {
+        let mut cues = super::SelectCues::default();
+        let acted = s.input_cued(key(k), &mut cues);
+        (acted, s.cursor(), cues.count(audio::SystemKind::Scratch))
+    }
+
+    /// Up and Down, Page Up and Page Down step around the list's ring,
+    /// past either end to the other, one `scratch` each; Home and End go
+    /// to the first and last row, sounding only when they move.
+    // Source: SF-016
+    #[test]
+    fn the_arrow_and_page_keys_step_around_the_ring() {
+        use super::PAGE_STEP;
+        let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+        s.set_entries(folder("a", 4));
+        assert_eq!(step(&mut s, MenuKey::Up), (Acted::Changed, 3, 1));
+        assert_eq!(step(&mut s, MenuKey::Down), (Acted::Changed, 0, 1));
+        assert!(s.move_to(2));
+        // A clamped page stops at 3.
+        let down = (2 + PAGE_STEP) % 4;
+        assert_ne!(down, 3);
+        assert_eq!(step(&mut s, MenuKey::PageDown), (Acted::Changed, down, 1));
+        assert!(s.move_to(1));
+        let up = (1 + 4 - PAGE_STEP % 4) % 4;
+        assert_ne!(up, 0);
+        assert_eq!(step(&mut s, MenuKey::PageUp), (Acted::Changed, up, 1));
+        assert_eq!(step(&mut s, MenuKey::Home), (Acted::Changed, 0, 1));
+        assert_eq!(step(&mut s, MenuKey::Home), (Acted::Nothing, 0, 0));
+        assert_eq!(step(&mut s, MenuKey::End), (Acted::Changed, 3, 1));
+        assert_eq!(step(&mut s, MenuKey::End), (Acted::Nothing, 3, 0));
+    }
+
+    /// A step that comes back to the row it left changes nothing but
+    /// still sounds: a one-row list's arrows, and a page of whole laps.
+    // Source: SF-016
+    #[test]
+    fn a_step_back_onto_the_same_row_still_sounds() {
+        use super::PAGE_STEP;
+        let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+        s.set_entries(folder("a", 1));
+        for k in [MenuKey::Down, MenuKey::Up, MenuKey::PageDown] {
+            assert_eq!(step(&mut s, k), (Acted::Nothing, 0, 1), "{k:?}");
+        }
+        // A list of a page's rows: a page is one whole lap.
+        s.set_entries(folder("b", PAGE_STEP));
+        assert!(s.move_to(1));
+        assert_eq!(step(&mut s, MenuKey::PageDown), (Acted::Nothing, 1, 1));
+        assert_eq!(step(&mut s, MenuKey::PageUp), (Acted::Nothing, 1, 1));
+    }
+
+    /// A query whose results become empty lists nothing: no key steps or
+    /// sounds, and a skin's window has no row and no cursor.
+    // Source: SF-016
+    #[test]
+    fn an_empty_list_takes_no_step() {
+        let mut s = screen();
+        assert!(s.move_to(1));
+        assert_eq!(s.input(key(MenuKey::Tab)), Acted::Focus(true));
+        assert_eq!(s.input(MenuInput::Text("zz".to_owned())), Acted::Search);
+        s.set_entries(Vec::new());
+        assert_eq!(s.input(key(MenuKey::Enter)), Acted::Focus(false));
+        assert_eq!(s.selectable(), 0);
+        for k in [
+            MenuKey::Up,
+            MenuKey::Down,
+            MenuKey::PageUp,
+            MenuKey::PageDown,
+            MenuKey::Home,
+            MenuKey::End,
+        ] {
+            assert_eq!(step(&mut s, k), (Acted::Nothing, 0, 0), "{k:?}");
+        }
+        assert_eq!(s.ring_to(true, 1), None);
+        let v = s.view(3, 3, false);
+        assert_eq!((v.rows.len(), v.cursor), (0, None));
+    }
+
+    /// A skin's window has exactly the rows asked for around the cursor,
+    /// on the list's ring: a short list repeats, the row above the first is
+    /// the last and the row below the last the first, an inner window runs
+    /// in order, and the window is capped at `MAX_VISIBLE_ROWS`.
+    // Source: SF-016
+    #[test]
+    fn the_skin_window_runs_around_the_ring() {
+        use skin_model::MAX_VISIBLE_ROWS;
+        let indices = |s: &SelectScreen, before, after| {
+            let v = s.view(before, after, false);
+            let at = v.cursor;
+            (
+                v.rows.iter().map(|r| r.index.unwrap()).collect::<Vec<_>>(),
+                at,
+            )
+        };
+        let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+        s.set_entries(folder("a", 2));
+        assert!(s.move_to(1));
+        assert_eq!(indices(&s, 3, 3), (vec![0, 1, 0, 1, 0, 1, 0], Some(3)));
+        let v = s.view(3, 3, false);
+        assert_eq!(
+            view_keys(&v),
+            [
+                "a00.bms", "a01.bms", "a00.bms", "a01.bms", "a00.bms", "a01.bms", "a00.bms"
+            ]
+        );
+        s.set_entries(folder("b", 10));
+        for (at, want) in [
+            (0, vec![7, 8, 9, 0, 1, 2, 3]),
+            (5, vec![2, 3, 4, 5, 6, 7, 8]),
+            (9, vec![6, 7, 8, 9, 0, 1, 2]),
+        ] {
+            s.move_to(at);
+            assert_eq!(s.cursor(), at);
+            assert_eq!(indices(&s, 3, 3), (want, Some(3)), "cursor {at}");
+        }
+        let (rows, at) = indices(&s, 100, 100);
+        assert_eq!(
+            (rows.len(), at),
+            (MAX_VISIBLE_ROWS, Some(MAX_VISIBLE_ROWS - 1))
+        );
+        assert_eq!(rows[MAX_VISIBLE_ROWS - 1], 9);
+        assert_eq!(rows[MAX_VISIBLE_ROWS - 2], 8);
+        assert_eq!(rows[0], u32::try_from((9 + 640 - 63) % 10).unwrap());
+    }
+
+    /// A skin's update carries the ring: its window repeats a short list
+    /// around the cursor at the center slot; a wrap restarts `change`, a
+    /// step back onto the same row does not; a populated query whose
+    /// results become empty gives no row and no cursor; and while the list
+    /// is cut at its bound, every update's strip says so, under a notice,
+    /// through moves and wraps.
+    // Source: SF-016
+    #[test]
+    fn the_feed_carries_the_ring_its_change_and_the_cut() {
+        use crate::selection_skin::SkinFeed;
+        use bms_model::TimeUs;
+        let mut feed = SkinFeed::default();
+        feed.window = Some((3, 7));
+        feed.enter(TimeUs(5));
+        let mut update = |s: &SelectScreen, now| feed.update(s, s.page(""), TimeUs(now));
+        let index = |u: &crate::selection_skin::SelectionUpdate| -> Vec<u32> {
+            u.view.rows.iter().map(|r| r.index.unwrap()).collect()
+        };
+        let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+        s.set_entries(folder("a", 3));
+        let u = update(&s, 10);
+        assert_eq!(
+            (index(&u), u.view.cursor),
+            (vec![0, 1, 2, 0, 1, 2, 0], Some(3))
+        );
+        assert_eq!(u.events.changed, TimeUs(5));
+        assert_eq!(u.strip.cut, None);
+        // Up at the first row wraps to the last: the cursor's row changed.
+        assert_eq!(s.input(key(MenuKey::Up)), Acted::Changed);
+        let u = update(&s, 20);
+        assert_eq!(index(&u), [2, 0, 1, 2, 0, 1, 2]);
+        assert_eq!(u.events.changed, TimeUs(20));
+        // A one-row list: Down comes back to the row; `change` stays.
+        s.set_entries(folder("b", 1));
+        let u = update(&s, 30);
+        assert_eq!(index(&u), [0; 7]);
+        assert_eq!(u.events.changed, TimeUs(30));
+        assert_eq!(s.input(key(MenuKey::Down)), Acted::Nothing);
+        assert_eq!(update(&s, 40).events.changed, TimeUs(30));
+        // Past the bound: the cut line, under a notice, kept through a
+        // wrap and a step.
+        let charts = (0..=super::LIMIT)
+            .map(|i| entry(&format!(r"C:\charts\{i}.bms"), "t"))
+            .collect();
+        s.set_top(
+            library::Level {
+                charts,
+                ..library::Level::default()
+            },
+            5_001,
+        );
+        let cut = crate::ui_text::Message::ListCut {
+            limit: super::LIMIT,
+        }
+        .text();
+        assert!(cut.contains("5000"), "{cut}");
+        let u = update(&s, 50);
+        assert_eq!(u.strip.cut.as_deref(), Some(cut.as_str()));
+        s.set_notice(Some("refused".to_owned()));
+        assert_eq!(s.input(key(MenuKey::Up)), Acted::Changed);
+        assert_eq!(s.cursor(), super::LIMIT);
+        let u = update(&s, 60);
+        assert_eq!(u.strip.notice.as_deref(), Some("refused"));
+        let lines: Vec<String> = u.strip.page().lines.into_iter().map(|l| l.text).collect();
+        assert_eq!(lines, ["refused".to_owned(), cut.clone()]);
+        assert_eq!(s.input(key(MenuKey::Down)), Acted::Changed);
+        assert_eq!(s.input(key(MenuKey::Down)), Acted::Changed);
+        let u = update(&s, 70);
+        assert_eq!(s.cursor(), 1);
+        assert_eq!(u.strip.cut.as_deref(), Some(cut.as_str()));
+        // A populated query whose results become empty.
+        assert_eq!(s.input(key(MenuKey::Tab)), Acted::Focus(true));
+        assert_eq!(s.input(MenuInput::Text("zz".to_owned())), Acted::Search);
+        s.set_entries(folder("c", 2));
+        let u = update(&s, 80);
+        assert_eq!(index(&u), [1, 0, 1, 0, 1, 0, 1]);
+        assert_eq!(u.strip.cut, None);
+        s.set_entries(Vec::new());
+        let u = update(&s, 90);
+        assert_eq!((u.view.rows.len(), u.view.cursor), (0, None));
+    }
+
+    /// The built-in page's cursor runs around the ring too, but its page
+    /// lists each row once: Up at the first row puts the cursor on the
+    /// last, and no line repeats.
+    // Source: SF-016
+    #[test]
+    fn the_built_in_page_wraps_its_cursor_without_repeating_lines() {
+        let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+        s.set_entries(folder("a", 3));
+        assert_eq!(s.input(key(MenuKey::Up)), Acted::Changed);
+        assert_eq!(s.cursor(), 2);
+        let page = s.page("");
+        for name in ["a00", "a01", "a02"] {
+            let lines = page.lines.iter().filter(|l| l.text.contains(name)).count();
+            assert_eq!(lines, 1, "{name}");
+        }
+        let cursor: Vec<&str> = page
+            .lines
+            .iter()
+            .filter(|l| l.style == LineStyle::Cursor)
+            .map(|l| l.text.as_str())
+            .collect();
+        assert_eq!(cursor.len(), 1);
+        assert!(cursor[0].contains("a02"), "{cursor:?}");
+    }
+
     /// The page drawn from the view is the page the list draws: headings, the
     /// cursor's row, and each chart's lamp, best EX, level, title, subtitle
     /// and artist under the chosen preset. A field present but empty shows as
@@ -2933,14 +3242,15 @@ mod tests {
         assert_eq!(max(&refused, Some(rules::tapestry())), None);
     }
 
-    /// Without headings the window holds the selectable rows alone, and
-    /// counts the rows asked for above and below the cursor among them;
-    /// with headings it is the built-in page's window.
+    /// Without headings the window holds the selectable rows alone, the
+    /// rows asked for above and below the cursor counted among them around
+    /// the list's ring; with headings it is the built-in page's window.
     #[test]
     fn a_view_without_headings_counts_selectable_rows() {
         use skin_model::{MAX_VISIBLE_ROWS, Ratio, RowKind};
-        // A hundred charts in ten folders: at most `MAX_VISIBLE_ROWS` rows,
-        // none a heading, the position exact over the hundred.
+        // A hundred charts in ten folders: `MAX_VISIBLE_ROWS` rows, the
+        // cursor's last, none a heading, the position exact over the
+        // hundred.
         let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
         let names = ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j"];
         s.set_entries(names.iter().flat_map(|f| folder(f, 10)).collect());
@@ -2950,30 +3260,28 @@ mod tests {
             assert!(v.rows.iter().all(|r| r.kind == RowKind::Chart));
             (v.cursor, v.position, view_keys(&v))
         };
+        let last = Some(MAX_VISIBLE_ROWS - 1);
         let (cursor, position, keys) = window(&s);
-        assert_eq!((cursor, position), (Some(0), Ratio::new(0, 99)));
-        assert_eq!(keys.first().map(String::as_str), Some("a00.bms"));
-        assert_eq!(keys.last().map(String::as_str), Some("g03.bms"));
+        assert_eq!((cursor, position), (last, Ratio::new(0, 99)));
+        assert_eq!(keys.first().map(String::as_str), Some("d07.bms"));
+        assert_eq!(keys.last().map(String::as_str), Some("a00.bms"));
         for _ in 0..45 {
             s.input(key(MenuKey::Down));
         }
         let (cursor, position, keys) = window(&s);
-        assert_eq!((cursor, position), (Some(45), Ratio::new(45, 99)));
-        assert_eq!(keys[45], "e05.bms");
+        assert_eq!((cursor, position), (last, Ratio::new(45, 99)));
+        assert_eq!(keys.first().map(String::as_str), Some("i02.bms"));
+        assert_eq!(keys.last().map(String::as_str), Some("e05.bms"));
         s.input(key(MenuKey::End));
         let (cursor, position, keys) = window(&s);
-        assert_eq!(
-            (cursor, position),
-            (Some(MAX_VISIBLE_ROWS - 1), Ratio::new(99, 99))
-        );
+        assert_eq!((cursor, position), (last, Ratio::new(99, 99)));
         assert_eq!(keys.last().map(String::as_str), Some("j09.bms"));
         assert_eq!(keys.first().map(String::as_str), Some("d06.bms"));
 
         let mut s = screen();
-        assert_eq!(
-            view_keys(&s.view(10, 10, false)),
-            ["1.bms", "2.bms", "3.bms"]
-        );
+        let v = s.view(1, 1, false);
+        assert_eq!(view_keys(&v), ["3.bms", "1.bms", "2.bms"]);
+        assert_eq!(v.cursor, Some(1));
         s.input(key(MenuKey::Down));
         s.input(key(MenuKey::Down));
         let v = s.view(1, 0, false);
@@ -2982,11 +3290,13 @@ mod tests {
         let v = s.view(1, 0, true);
         assert_eq!(view_keys(&v), [r"heading C:\charts\b", "3.bms"]);
         assert_eq!(v.cursor, Some(1));
-        let v = s.view(10, 10, false);
+        let v = s.view(2, 2, false);
         assert_eq!(
             (view_keys(&v), v.cursor),
             (
-                vec!["1.bms".to_owned(), "2.bms".to_owned(), "3.bms".to_owned()],
+                ["1.bms", "2.bms", "3.bms", "1.bms", "2.bms"]
+                    .map(str::to_owned)
+                    .to_vec(),
                 Some(2)
             )
         );
@@ -3000,7 +3310,7 @@ mod tests {
         use skin_model::RowRefKind;
         let mut s = screen();
         s.input(key(MenuKey::Down));
-        let v = s.view(10, 10, false);
+        let v = s.view(1, 1, false);
         let index: Vec<Option<u32>> = v.rows.iter().map(|r| r.index).collect();
         assert_eq!(index, [Some(0), Some(1), Some(2)]);
         assert!(s.view(10, 10, true).rows.iter().all(|r| r.index.is_none()));
@@ -3055,7 +3365,7 @@ mod tests {
             chart(6, Some("2147483648"), None, false),
             chart(7, Some("１２"), None, false),
         ]);
-        let v = s.view(0, 10, false);
+        let v = s.view(0, 7, false);
         let read: Vec<_> = v
             .rows
             .iter()

@@ -41,10 +41,12 @@ use crate::{
 };
 
 /// The most sprites the selection screen's strip draws over its skin (a
-/// band under its search line, one under its notice, and the
-/// composition's underline), from the reserve the skin cannot fill
-/// ([`Renderer::build_selection`]).
-pub const STRIP_SPRITES: usize = 3;
+/// band under its search line, one under its notice, one under its
+/// list-cut line, and the composition's underline), from the reserve the
+/// skin cannot fill ([`Renderer::build_selection`]).
+pub const STRIP_SPRITES: usize = 4;
+
+const _: () = assert!(STRIP_SPRITES <= OVERLAY_SPRITES as usize);
 
 /// The most sprites the result screen's strip draws over its skin, one
 /// band per fact that applies, from the same reserve
