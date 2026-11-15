@@ -14,6 +14,16 @@ pub(crate) fn loaded(text: &str, preset: &str) -> game::Loaded {
 
 /// As [`loaded`], with the directory its chart file stays in while kept.
 pub(crate) fn loaded_kept(text: &str, preset: &str) -> (tempfile::TempDir, game::Loaded) {
+    loaded_session(text, preset, false)
+}
+
+/// As [`loaded_kept`], an autoplay session when `autoplay`, as the player
+/// makes one (it saves nothing).
+pub(crate) fn loaded_session(
+    text: &str,
+    preset: &str,
+    autoplay: bool,
+) -> (tempfile::TempDir, game::Loaded) {
     let dir = tempfile::tempdir().unwrap();
     let settings = game::Settings {
         device: game::DeviceSettings::default(),
@@ -35,7 +45,7 @@ pub(crate) fn loaded_kept(text: &str, preset: &str) -> (tempfile::TempDir, game:
         app_version: "0.0.0-test".to_owned(),
         provenance: replay::BuildProvenance::Development,
         receive: replay::ReceiveMethod::Scripted,
-        autoplay: None,
+        autoplay: autoplay.then_some(game::AutoKeySounds::Scheduled),
     };
     let parts = game::Parts::unsaved(&settings.player);
     let loaded = game::Loaded::load(root, settings, &chart_path, config, parts).unwrap();

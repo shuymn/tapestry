@@ -75,6 +75,7 @@ pub fn context(gauges: &[GaugeDesc], counted: bool) -> PlayContext<'_> {
         gauges,
         attempt: Attempt::Full {
             lead_in: TimeUs(1_000 * MS),
+            finish: TimeUs(i64::MAX),
         },
         empty_poor_breaks_combo: false,
         empty_poor_counted: counted,

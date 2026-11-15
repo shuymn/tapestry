@@ -19,6 +19,12 @@ pub const MS: i64 = 1_000;
 /// A notes' end past every frame the tests build: timer 143 stays off.
 pub const NO_END: TimeUs = TimeUs(3_600_000 * MS);
 
+/// A full play's finish point past every frame these tests build, so the
+/// remaining time and the progress never reach their end and the rhythm
+/// clock keeps the tempo through a completed tail, unless a test sets its
+/// own.
+pub const NO_FINISH: TimeUs = TimeUs(3_600_000 * MS);
+
 #[allow(dead_code, reason = "not every test binary reads them")]
 pub const GAUGES: [GaugeDesc; 1] = [desc(GaugeLook::Normal)];
 
@@ -227,7 +233,7 @@ pub fn context() -> PlayContext<'static> {
 /// before chart time 0 or before its section's start.
 pub fn ready_start(ctx: &PlayContext<'_>) -> i64 {
     match ctx.attempt {
-        skin_model::Attempt::Full { lead_in } => -lead_in.0,
+        skin_model::Attempt::Full { lead_in, .. } => -lead_in.0,
         skin_model::Attempt::Section(s) => s.start.0 - s.lead_in.0,
     }
 }
@@ -242,7 +248,10 @@ pub fn context_with(
         meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: &GAUGES,
-        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        attempt: Attempt::Full {
+            lead_in: TimeUs(0),
+            finish: NO_FINISH,
+        },
         empty_poor_breaks_combo: false,
         empty_poor_counted: false,
         scratch: Side::Left,
@@ -252,6 +261,19 @@ pub fn context_with(
         bpm_whole_change,
         play_level: None,
         score: skin_model::PlayScore::NONE,
+    }
+}
+
+/// [`context_with`]'s whole-chart attempt finishing at `finish`, the
+/// chart's BPM range `bpm_range`.
+#[allow(dead_code, reason = "not every test binary reads the readouts' end")]
+pub fn finishing(finish: TimeUs, bpm_range: Option<BpmRange>) -> PlayContext<'static> {
+    PlayContext {
+        attempt: Attempt::Full {
+            lead_in: TimeUs(0),
+            finish,
+        },
+        ..context_with(bpm_range, None)
     }
 }
 

@@ -709,7 +709,10 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
     let ctx = PlayContext {
         autoplay: false,
         gauges: &gauges,
-        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        attempt: Attempt::Full {
+            lead_in: TimeUs(0),
+            finish: TimeUs(i64::MAX),
+        },
         empty_poor_breaks_combo: false,
         empty_poor_counted: false,
         scratch: Side::Left,
@@ -1014,7 +1017,10 @@ fn gauge_probes(
         let ctx = PlayContext {
             autoplay: false,
             gauges: &descs,
-            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            attempt: Attempt::Full {
+                lead_in: TimeUs(0),
+                finish: TimeUs(i64::MAX),
+            },
             empty_poor_breaks_combo: false,
             empty_poor_counted: false,
             scratch: Side::Left,
@@ -1098,7 +1104,10 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
     let ctx = PlayContext {
         autoplay: false,
         gauges: &gauges,
-        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        attempt: Attempt::Full {
+            lead_in: TimeUs(0),
+            finish: TimeUs(i64::MAX),
+        },
         empty_poor_breaks_combo: false,
         empty_poor_counted: false,
         scratch: Side::Left,
@@ -1720,7 +1729,10 @@ fn choice_probes(
     let ctx = PlayContext {
         autoplay: false,
         gauges: &descs,
-        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        attempt: Attempt::Full {
+            lead_in: TimeUs(0),
+            finish: TimeUs(i64::MAX),
+        },
         empty_poor_breaks_combo: false,
         empty_poor_counted: false,
         scratch: Side::Left,
@@ -1838,7 +1850,10 @@ fn rate_and_kind_probes(
         let ctx = PlayContext {
             autoplay: false,
             gauges: &descs,
-            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            attempt: Attempt::Full {
+                lead_in: TimeUs(0),
+                finish: TimeUs(i64::MAX),
+            },
             empty_poor_breaks_combo: counted,
             empty_poor_counted: counted,
             scratch: Side::Left,
@@ -2133,7 +2148,10 @@ fn readout_probes(
         let ctx = PlayContext {
             autoplay: false,
             gauges: &descs,
-            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            attempt: Attempt::Full {
+                lead_in: TimeUs(0),
+                finish: TimeUs(i64::MAX),
+            },
             empty_poor_breaks_combo: false,
             empty_poor_counted: false,
             scratch: Side::Left,
@@ -3644,7 +3662,10 @@ pub fn present(data: &[u8]) -> Option<usize> {
     let ctx = PlayContext {
         autoplay: false,
         gauges: &gauges,
-        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        attempt: Attempt::Full {
+            lead_in: TimeUs(0),
+            finish: TimeUs(i64::MAX),
+        },
         empty_poor_breaks_combo: false,
         empty_poor_counted: false,
         scratch: Side::Left,
