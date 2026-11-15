@@ -696,6 +696,28 @@ fn stacked(runs: &[(u32, u32)]) -> Vec<Option<[u8; 4]>> {
     cells
 }
 
+/// The transparent texel rows down bin 1's grey run in `quads` (69 cells
+/// of 5 texels, 5 px each), sampled in its second texel column (lit with
+/// or without `noGapX`) from `skin`'s atlas: a gap row of each cell is
+/// clear unless `noGap` is 1.
+fn clear_rows(skin: &Skin, quads: &[Quad]) -> usize {
+    let atlas = skin
+        .atlas(skin_model::Variant::Lo, common::play::LIMITS, &|| false)
+        .unwrap();
+    let q = quads
+        .iter()
+        .filter(|q| q.filter == Filter::NearestBase)
+        .find(|q| q.rect[0] <= 140.0 && q.rect[0] + q.rect[2] > 140.0 && q.rect[3] == 69.0 * 5.0)
+        .expect("bin 1's grey run");
+    let rows = 69 * 5;
+    (0..rows)
+        .filter(|&r| {
+            let fv = (r as f32 + 0.5) / rows as f32;
+            common::play::texel_at(&atlas, q, 0.3, fv)[3] == 0
+        })
+        .count()
+}
+
 /// C34: on a play skin, `judgegraph` types 1 and 2 are imported as the
 /// judgment and early/late graphs, from JSON and Lua alike, with the
 /// result's fields: set, `orderReverse` 1 stacks bin 1 from its last
@@ -703,7 +725,8 @@ fn stacked(runs: &[(u32, u32)]) -> Vec<Option<[u8; 4]>> {
 /// `backTexOff` 1 draws no background in empty bin 0; omitted, bin 1
 /// stacks grey first, is not revealed by 125 ms but is by 250 ms (500 ms
 /// by default) and the background shows in bin 0. Both paths draw
-/// the same frames, `noGap` 1 included. On a play skin type 3 drops with a
+/// the same frames, and `noGap` 1 leaves no clear row between cells where
+/// the default leaves one in each. On a play skin type 3 drops with a
 /// note, and on a result skin type 0 does.
 #[test]
 fn play_judge_graph_types_1_and_2_are_imported() {
@@ -755,6 +778,8 @@ fn play_judge_graph_types_1_and_2_are_imported() {
             );
         }
         let full = judged(set.clone(), 3_000);
+        // `noGap` 1: no clear row between bin 1's cells.
+        assert_eq!(clear_rows(&set, &full), 0, "type {ty}: noGap");
         let got: Vec<_> = (0..100).map(|c| cell(&full, c)).collect();
         assert_eq!(got, stacked(&reversed), "type {ty}: reversed");
         assert_eq!(top(&full, 85.0, 1_077.5), None, "type {ty}: no background");
@@ -770,6 +795,8 @@ fn play_judge_graph_types_1_and_2_are_imported() {
         );
         assert_eq!(notes(&report), [], "type {ty}");
         let full = judged(plain.clone(), 3_000);
+        // Gaps on: one clear row in each of the grey run's 69 cells.
+        assert_eq!(clear_rows(&plain, &full), 69, "type {ty}: gaps");
         let got: Vec<_> = (0..100).map(|c| cell(&full, c)).collect();
         assert_eq!(got, stacked(runs), "type {ty}: from grey");
         assert!(
