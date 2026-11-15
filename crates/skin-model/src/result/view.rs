@@ -110,7 +110,8 @@ pub enum Unavailable {
     CancelledBeforePlayback,
 }
 
-/// The chart's facts a result skin shows, each `None` while unknown.
+/// The chart's facts a result skin shows, each `None` while unknown, and
+/// the play's target.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ResultChart {
     /// Its `#PLAYLEVEL` as a number.
@@ -137,6 +138,10 @@ pub struct ResultChart {
     /// Whether its stage file and back image are images, resolved before
     /// any result import, probe or view (options 190, 191, 194 and 195).
     pub images: ImageFacts,
+    /// The play's target EX score, the one it was paced against
+    /// (design.md "Personal Bests", Target): the same in every view and
+    /// under every status, 0 in a practice round.
+    pub target: u32,
 }
 
 /// Whether a chart's stage file and back image are images: each `true`

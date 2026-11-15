@@ -154,6 +154,8 @@ pub static RESULT: Schema = Schema {
         value("player.count.bad"),
         value("player.count.poor"),
         value("player.notes"),
+        value("target.ex"),
+        value("target.rate_bp"),
     ],
     timers: &[timer("screen"), timer("fadeout")],
     enums: &[],
@@ -298,8 +300,15 @@ pub mod field {
     pub const PLAYER_COUNT_PERFECT: u16 = PLAYER_TIME_H + 6;
     pub const PLAYER_COUNT_POOR: u16 = PLAYER_TIME_H + 10;
     pub const PLAYER_NOTES: u16 = PLAYER_TIME_H + 11;
+    /// The play's target EX score
+    /// ([`ResultChart::target`](crate::ResultChart::target)), under every
+    /// status, and its rate over the view's judged notes in basis points,
+    /// `⌊10 000 · T / 2n⌋`, 0 at `n = 0`, as play's `target.rate_bp`;
+    /// the rate is filled only while [`CHART_NOTES_VALID`].
+    pub const TARGET_EX: u16 = PLAYER_NOTES + 1;
+    pub const TARGET_RATE_BP: u16 = PLAYER_NOTES + 2;
     /// The number of fields.
-    pub const COUNT: usize = PLAYER_NOTES as usize + 1;
+    pub const COUNT: usize = TARGET_RATE_BP as usize + 1;
 }
 
 /// The built-in timer slots of [`RESULT`]; `when` timers follow from
@@ -364,6 +373,8 @@ mod tests {
             (field::PLAYER_COUNT_PERFECT, "player.count.perfect"),
             (field::PLAYER_COUNT_POOR, "player.count.poor"),
             (field::PLAYER_NOTES, "player.notes"),
+            (field::TARGET_EX, "target.ex"),
+            (field::TARGET_RATE_BP, "target.rate_bp"),
         ] {
             assert_eq!(names[usize::from(slot)], name);
         }

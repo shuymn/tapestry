@@ -446,6 +446,16 @@ fn signed(v: i64) -> i32 {
     i32::try_from(v.clamp(-i64::from(VALUE_MAX), i64::from(VALUE_MAX))).unwrap_or(0)
 }
 
+/// `target`'s rate over `notes` judged notes in basis points,
+/// `⌊10 000 · target / (2 · notes)⌋` exactly, 0 at no note, as play's
+/// `target.rate_bp`; at most [`VALUE_MAX`].
+fn rate_bp(target: u32, notes: u32) -> i32 {
+    let q = (u128::from(target) * 10_000)
+        .checked_div(u128::from(notes) * 2)
+        .unwrap_or(0);
+    value(u64::try_from(q).unwrap_or(u64::MAX))
+}
+
 /// A best value as its field reads it: shown within ±[`VALUE_MAX`], or
 /// [`HIDDEN`].
 fn number(n: ResultNumber) -> i32 {
@@ -522,7 +532,9 @@ fn fields(view: &ResultView) -> [i32; field::COUNT] {
     if let Some(notes) = c.notes {
         set(field::CHART_NOTES, value(u64::from(notes)));
         set(field::CHART_NOTES_VALID, 1);
+        set(field::TARGET_RATE_BP, rate_bp(c.target, notes));
     }
+    set(field::TARGET_EX, value(u64::from(c.target)));
     if let Some(k) = c.judge_class.filter(|&k| i32::from(k) <= JUDGE_CLASS_MAX) {
         set(field::CHART_JUDGE_CLASS, i32::from(k));
         set(field::CHART_JUDGE_CLASS_VALID, 1);

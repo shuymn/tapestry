@@ -23,9 +23,9 @@ use rules::GaugeValue;
 use skin_model::{
     BestView, DEVIATION_SLOTS, ElementDef, FontRef, FrameUv, GRAPH_COLUMNS, GaugeColumn,
     GaugeGraphColors, GaugeGraphDef, GaugeHistory, GaugeLook, ImageChoiceDef, ImageChoicePart,
-    ImageSpan, JudgeGraphDef, JudgeGraphKind, PastTable, ResultDefs, ResultNumber, ResultStatus,
-    ResultView, Rgba8, Skin, Source, TextDef, TextField, TextImage, TextTable, TextValue, TimerRef,
-    TimingGraphDef, Unavailable, WidgetDefs, result_timer,
+    ImageSpan, JudgeGraphDef, JudgeGraphKind, PastTable, ResultDefs, ResultFields, ResultNumber,
+    ResultStatus, ResultView, Rgba8, Skin, Source, TextDef, TextField, TextImage, TextTable,
+    TextValue, TimerRef, TimingGraphDef, Unavailable, WidgetDefs, result_timer,
 };
 
 struct Counting;
@@ -73,6 +73,10 @@ fn counted(f: impl FnOnce()) -> u64 {
     TRACK.with(|t| t.set(false));
     ALLOCS.load(Ordering::Relaxed) - before
 }
+
+/// The tops of the target's three numbers: T, its rate, and the EX score
+/// less T, which only a view with a result draws.
+const TARGET_AT: [i32; 3] = [200, 220, 240];
 
 fn skin() -> Skin {
     let text = |field| TextDef {
@@ -146,6 +150,14 @@ fn skin() -> Skin {
             // (173 and 175), shown, hidden or negative by the view.
             relement(Source::Number(7), [600, 160, 10, 10], Some("best.known")),
             relement(Source::Number(8), [600, 180, 10, 10], Some("best.known")),
+            // The play's target, its rate and the EX score less it.
+            relement(Source::Number(9), [600, TARGET_AT[0], 10, 10], None),
+            relement(Source::Number(10), [600, TARGET_AT[1], 10, 10], None),
+            relement(
+                Source::Number(11),
+                [600, TARGET_AT[2], 10, 10],
+                Some("result.valid"),
+            ),
         ],
         WidgetDefs {
             numbers: vec![
@@ -158,6 +170,9 @@ fn skin() -> Skin {
                 number("app.fps", 4),
                 number("best.max_combo", 4),
                 number("best.max_combo_diff", 4),
+                number("target.ex", 6),
+                number("target.rate_bp / 100", 3),
+                number("ex_score - target.ex", 6),
             ],
             texts: vec![text(TextField::FullTitle)],
             image_choices: vec![choice],
@@ -272,6 +287,9 @@ fn a_result_build_allocates_nothing() {
         with_graphs(ready(1_400, BestView::Unavailable, 1)),
     ]
     .map(|mut v| {
+        // The play's target over 900 notes, the same in every view.
+        v.chart.target = 1_234;
+        v.chart.notes = Some(900);
         // The player's totals, the same in every view, filled with the
         // view's fields.
         v.totals = skin_model::PlayerTotals {
@@ -282,6 +300,28 @@ fn a_result_build_allocates_nothing() {
         };
         v
     });
+    // The fields' conversion, where the target and its rate are
+    // computed, for a ready and an unavailable view: no allocation, and
+    // the values it gives.
+    for v in [&views[0], &views[3]] {
+        let mut f = None;
+        let n = counted(|| {
+            f = Some(std::hint::black_box(ResultFields::of(
+                std::hint::black_box(v),
+            )));
+        });
+        assert_eq!(n, 0, "{:?}", v.status);
+        let f = f.unwrap().0;
+        assert_eq!(f[usize::from(skin_model::result_field::TARGET_EX)], 1_234);
+        assert_eq!(
+            f[usize::from(skin_model::result_field::TARGET_RATE_BP)],
+            6_855
+        );
+    }
+    assert_eq!(
+        views[3].status,
+        ResultStatus::Unavailable(Unavailable::Failed)
+    );
     let mut total = 0;
     // The first build after preparation, before any view, on the batch
     // reserved at the skin's capacity.
@@ -339,6 +379,18 @@ fn a_result_build_allocates_nothing() {
         total += counted(|| fx.frame(1_600));
         if v.status == ResultStatus::Ready {
             assert!(fx.batch.quads().len() > 2 * 6, "{}", fx.batch.quads().len());
+        }
+        // The target's numbers draw in the measured build: all three
+        // with a result, T and its rate without one.
+        let ready = v.status == ResultStatus::Ready;
+        for (k, top) in TARGET_AT.into_iter().enumerate() {
+            let drawn = fx
+                .batch
+                .quads()
+                .iter()
+                .filter(|q| q.rect[1] == top as f32 && q.rect[0] >= 600.0)
+                .count();
+            assert_eq!(drawn > 0, ready || k < 2, "{k} {:?}", v.status);
         }
         if v.gauge.is_some() {
             assert!(
