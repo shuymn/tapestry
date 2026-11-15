@@ -1730,6 +1730,10 @@ pub(crate) fn open_and_play<R: Rig>(
             return Err(refused(rig, LiveError::Logic(e)));
         }
     };
+    // The judgment bins of the play's profile (design.md "Rendering and
+    // Skins", the note snapshot): unavailable under a chart whose rows are
+    // not the profile's, which then counts nothing.
+    let _ = logic.bin_judgments(loaded.chart(), loaded.profile());
     // A gated play's candidates: the history of cancelled openings and the
     // rearmed snapshot, reserved with the play's setup and reused by every
     // rearm.
