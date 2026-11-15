@@ -79,6 +79,18 @@
 //! [[step]]
 //! quit = {}
 //! ```
+//!
+//! The screens' runtime notes go to stdout, each book once: a result
+//! lifetime's when it ends, a selection installation's when its runtime is
+//! replaced or retired, and those still live when the run ends.
+//!
+//! ```text
+//! dev: runtime notes result lifetime 2: 3 kept, complete, stopped none
+//! dev: runtime note result lifetime 2: number 78 unanswered (gave -2147483648) at "result.luaskin":11:13
+//! dev: runtime note result lifetime 2: text 9001 unanswered (gave "") at "parts.lua":4:11
+//! dev: runtime note result lifetime 2: callback error at "parts.lua":4:11
+//! dev: runtime notes selection generation 1: 4096 kept, incomplete (5 occurrences past the cap of 4096), stopped budget
+//! ```
 
 use std::collections::HashMap;
 use std::fmt;
