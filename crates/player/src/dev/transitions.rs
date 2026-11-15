@@ -478,15 +478,8 @@ impl Recorder {
     /// A presented frame of `stage` at `at`, with its loading lifetime's
     /// hold if the render thread held it.
     pub fn frame(&mut self, stage: Stage, at: TimeUs, hold: Option<HoldStamp>) {
-        if let Some(h) = hold
-            && self.held != Some(h.lifetime)
-        {
-            self.held = Some(h.lifetime);
-            self.mark(Mark {
-                kind: MarkKind::Hold(h.ended_by),
-                from: h.from,
-                to: h.to,
-            });
+        if let Some(h) = hold {
+            self.hold(h);
         }
         // A play that ended without a result: its preparation is no
         // result's, and marks nothing.
@@ -555,6 +548,18 @@ impl Recorder {
             last: at,
             longest: None,
             uncovered: None,
+        }
+    }
+
+    /// The hold of loading lifetime `h.lifetime`, marked once per lifetime.
+    pub fn hold(&mut self, h: HoldStamp) {
+        if self.held != Some(h.lifetime) {
+            self.held = Some(h.lifetime);
+            self.mark(Mark {
+                kind: MarkKind::Hold(h.ended_by),
+                from: h.from,
+                to: h.to,
+            });
         }
     }
 
@@ -799,7 +804,7 @@ mod tests {
     /// the largest uncovered time and where; a book still held is the
     /// run's failure.
     #[test]
-    fn the_record_is_printed_after_the_render_thread() {
+    fn the_record_formats_each_line_and_refuses_while_held() {
         let book = Transitions::with_capacity(16);
         let mut r = Recorder::new(book.clone());
         r.frame(
@@ -843,5 +848,85 @@ mod tests {
             "the transition record is held by the render thread"
         );
         drop(held);
+    }
+
+    /// Every line form, from records of fixed values: a fully covered
+    /// transition (no piece), a presentation change with frames not
+    /// presented, each hold ending and an unended hold, a preparation, a
+    /// dropped mark, and a summary with no uncovered time.
+    #[test]
+    fn every_line_form_is_pinned() {
+        use super::{Coverage, Edge, Gap};
+        let book = Transitions::with_capacity(16);
+        let gap = |from: i64, to: i64, cover: Coverage, unpresented: u32| Gap {
+            from: TimeUs(from),
+            to: TimeUs(to),
+            cover,
+            unpresented,
+        };
+        book.push(Record::Edge(Edge {
+            presentation: false,
+            from: stage(State::Loading, 7, Drew::Skin),
+            to: stage(State::Ready, 90, Drew::Plain),
+            gap: gap(
+                1_000_000,
+                1_200_000,
+                Coverage {
+                    covered: 200_000,
+                    uncovered: 0,
+                    piece: None,
+                },
+                0,
+            ),
+        }));
+        book.push(Record::Edge(Edge {
+            presentation: true,
+            from: stage(State::Decision, 3, Drew::Skin),
+            to: stage(State::Decision, 3, Drew::Fallback),
+            gap: gap(
+                2_000_000,
+                2_016_700,
+                Coverage {
+                    covered: 0,
+                    uncovered: 16_700,
+                    piece: Some((TimeUs(2_000_000), TimeUs(2_016_700))),
+                },
+                2,
+            ),
+        }));
+        for kind in [
+            MarkKind::Hold(Some(HoldEnd::Bound)),
+            MarkKind::Hold(Some(HoldEnd::Skin)),
+            MarkKind::Hold(Some(HoldEnd::Image)),
+            MarkKind::Hold(Some(HoldEnd::DeviceLost)),
+            MarkKind::Hold(None),
+            MarkKind::Preparing,
+        ] {
+            book.push(Record::Mark(Mark {
+                kind,
+                from: TimeUs(10),
+                to: TimeUs(20),
+            }));
+        }
+        book.dropped_mark();
+        let (lines, failure) = book.lines().unwrap();
+        assert_eq!(failure, None);
+        assert_eq!(
+            lines,
+            [
+                "dev: transition loading -> ready: 200000 us, last 1000000 us, first 1200000 us, \
+                 covered 200000 us, uncovered 0 us",
+                "dev: presentation decision 3: skin -> fallback: 16700 us, last 2000000 us, \
+                 first 2016700 us, covered 0 us, uncovered 16700 us (2000000 to 2016700), \
+                 2 not presented",
+                "dev: mark hold 10 to 20 us (ended by bound)",
+                "dev: mark hold 10 to 20 us (ended by skin)",
+                "dev: mark hold 10 to 20 us (ended by image)",
+                "dev: mark hold 10 to 20 us (ended by device-lost)",
+                "dev: mark hold 10 to 20 us",
+                "dev: mark preparing 10 to 20 us",
+                "dev: transitions: 8 records, lost 0, marks dropped 1, largest uncovered none",
+            ]
+        );
     }
 }

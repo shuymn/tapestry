@@ -754,3 +754,138 @@ fn the_record_marks_each_hold_once() {
         );
     }
 }
+
+/// A rig of [`rig`]'s kind whose frames a scenario's sink records into
+/// `book`, the hold's bound `bound`.
+#[cfg(feature = "dev-tools")]
+fn recorded(
+    bound: i64,
+    book: &crate::dev::transitions::Transitions,
+) -> (
+    Arc<Chart>,
+    Installers,
+    super::super::RenderLink,
+    Arc<Extent>,
+) {
+    let frames = crate::dev::scenario::ScenarioFrames::recording(
+        crate::dev::scenario::Captures::of(Vec::new()),
+        book.clone(),
+    );
+    let (chart, screens, link) = pending_link_with(Box::new(frames));
+    link.shared.hold_bound.store(bound, SeqCst);
+    let extent = Arc::new(Extent::default());
+    extent.publish(1_920, 1_080);
+    link.follow(&extent);
+    show_page(&link);
+    (chart, screens, link, extent)
+}
+
+/// Waits until `n` more frames are stamped.
+#[cfg(feature = "dev-tools")]
+fn frames_after(link: &super::super::RenderLink, n: u64) {
+    let drawn = stamps(link).0;
+    assert!(wait_until(|| stamps(link).0 >= drawn + n));
+}
+
+/// The real draw facts record the pending presentation giving way to the
+/// skin: a lifetime whose hold reached its bound draws the pending
+/// presentation, then the skin once its specialization is answered, one
+/// presentation change inside one loading span.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_draw_facts_record_the_pending_presentation_giving_way() {
+    use crate::dev::transitions::{Record, Transitions};
+    use crate::measure::{Drew, State};
+    let book = Transitions::with_capacity(256);
+    let (chart, _screens, link, _extent) = recorded(180 * MS, &book);
+    show_held(&link);
+    let lifetime = link.loading_lifetime();
+    assert!(wait_until(|| link
+        .loading_ack()
+        .is_some_and(|(l, _)| l == lifetime)));
+    frames_after(&link, 3);
+    assert_eq!(
+        specialized(&link, &chart, &bundle()).unwrap(),
+        Preparation::Ready
+    );
+    frames_after(&link, 3);
+    link.end_loading().unwrap();
+    link.exit();
+    let records = book.records();
+    let presentations: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Edge(e) if e.presentation => {
+                Some((e.to.state, e.to.lifetime, e.from.drew, e.to.drew))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        presentations,
+        [(State::Loading, lifetime, Drew::Pending, Drew::Skin)],
+        "{records:?}"
+    );
+}
+
+/// The hold's other endings reach the record: a size notice ends it by
+/// the image (TB4), and a frame of the lifetime carries it; a lost device
+/// ends it by the device (TB6), the screen dropped with no later frame of
+/// the lifetime, and the render thread reports it. One hold mark each.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn image_and_device_loss_end_the_hold_in_the_record() {
+    use crate::dev::transitions::{MarkKind, Record, Transitions};
+    use crate::measure::HoldEnd;
+    for lost in [false, true] {
+        let book = Transitions::with_capacity(256);
+        let (_chart, screens, link, extent) = recorded(NEVER, &book);
+        show_held(&link);
+        if lost {
+            screens.lost.store(true, SeqCst);
+            assert!(wait_until(|| link.failed()));
+            screens.lost.store(false, SeqCst);
+            link.prepare().unwrap();
+        } else {
+            extent.publish(1_280, 720);
+            assert!(wait_until(|| link.loading_ack().is_some()));
+            frames_after(&link, 3);
+        }
+        link.exit();
+        let records = book.records();
+        let holds: Vec<_> = records
+            .iter()
+            .filter_map(|r| match r {
+                Record::Mark(m) if matches!(m.kind, MarkKind::Hold(_)) => Some(m.kind),
+                _ => None,
+            })
+            .collect();
+        let want = if lost {
+            HoldEnd::DeviceLost
+        } else {
+            HoldEnd::Image
+        };
+        assert_eq!(holds, [MarkKind::Hold(Some(want))], "{records:?}");
+    }
+}
+
+/// A page whose text changes keeps its span: the page's frames before and
+/// after new lines are one span, and no record lies between them.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn page_text_keeps_the_span() {
+    use crate::dev::transitions::{Record, Transitions};
+    use crate::measure::State;
+    let book = Transitions::with_capacity(64);
+    let (_chart, _screens, link, _extent) = recorded(NEVER, &book);
+    frames_after(&link, 2);
+    link.send(RenderMsg::Menu(Box::new(one_line("another page"))));
+    frames_after(&link, 3);
+    link.exit();
+    let records = book.records();
+    let [Record::Span(s)] = records[..] else {
+        panic!("one span: {records:?}");
+    };
+    assert_eq!(s.stage.state, State::Page);
+    assert!(s.frames >= 5, "{s:?}");
+}

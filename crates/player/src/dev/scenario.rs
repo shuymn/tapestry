@@ -124,7 +124,7 @@ use input::{QpcClock, ScriptedInput};
 use rules::GaugeValue;
 use serde::Deserialize;
 
-use super::transitions::{Mark, MarkKind, Recorder, Transitions};
+use super::transitions::{MAX_RECORDS, Mark, MarkKind, Recorder, Transitions};
 use super::{SelectScript, SelectStep};
 use crate::args::UsageError;
 use crate::input_side::Recorded;
@@ -759,7 +759,7 @@ fn parse(text: &str, base: &Path) -> Result<Scenario, String> {
             roots: roots.into_iter().map(|(path, _)| path).collect(),
             logs: compiled.logs,
             captures: Captures(Arc::new(Mutex::new(captures))),
-            transitions: Transitions::default(),
+            transitions: Transitions::with_capacity(transition_cap()),
             size,
             adapter,
         },
@@ -1959,6 +1959,19 @@ struct Writer {
     thread: JoinHandle<()>,
 }
 
+/// The environment variable that lowers the transition record's cap, for
+/// tests of its overflow failing the run.
+pub const TRANSITION_CAP_ENV: &str = "TAPESTRY_DEV_TRANSITION_CAP";
+
+/// The transition record's cap: [`MAX_RECORDS`], or lower as
+/// [`TRANSITION_CAP_ENV`] says.
+fn transition_cap() -> usize {
+    std::env::var(TRANSITION_CAP_ENV)
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(MAX_RECORDS)
+}
+
 /// The environment variable that stalls each capture's read-back by its
 /// value in milliseconds, for tests of a stuck render thread.
 pub const STALL_ENV: &str = "TAPESTRY_DEV_CAPTURE_STALL_MS";
@@ -2162,6 +2175,10 @@ impl FrameSink for ScenarioFrames {
 
     fn result_taken(&mut self, at: TimeUs) {
         self.recorder.result_taken(at);
+    }
+
+    fn hold_lost(&mut self, hold: crate::measure::HoldStamp) {
+        self.recorder.hold(hold);
     }
 
     fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>) {
@@ -5353,7 +5370,7 @@ pub(crate) mod tests {
             d.timing.presented = presented;
             sink.frame(&screen, &d);
         }
-        drop(sink);
+        drop_bounded(sink);
         let (spans, edges, _) = records_of(&book);
         let ready = spans
             .iter()
@@ -5424,7 +5441,7 @@ pub(crate) mod tests {
         };
         result.presented_at = TimeUs(b + 816_000);
         sink.frame(&screen, &result);
-        drop(sink);
+        drop_bounded(sink);
         let (spans, edges, marks) = records_of(&book);
         let read_back = marks.iter().find(|m| m.kind == MarkKind::ReadBack).unwrap();
         let held = read_back.to.0 - read_back.from.0;
@@ -5453,6 +5470,222 @@ pub(crate) mod tests {
             into_result.gap.cover.piece,
             Some((TimeUs(b), TimeUs(b + 100_000)))
         );
+    }
+
+    /// Drops `sink` on a helper thread, failing unless its drop, which
+    /// joins its capture writer, ends within 60 s.
+    fn drop_bounded(sink: super::ScenarioFrames) {
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(sink);
+            let _ = done.send(());
+        });
+        assert!(
+            ended
+                .recv_timeout(std::time::Duration::from_secs(60))
+                .is_ok(),
+            "the sink's writer did not end within 60 s"
+        );
+    }
+
+    /// Presents `frames` (a stage and its present) through `sink`.
+    fn present(sink: &mut super::ScenarioFrames, frames: &[(crate::measure::Stage, i64)]) {
+        use super::FrameSink as _;
+        let (_, screen) = released(&Captures::of(Vec::new()));
+        for (i, &(stage, us)) in frames.iter().enumerate() {
+            let mut d = staged(stage, us, i64::try_from(i).unwrap());
+            d.timing.presented = true;
+            sink.frame(&screen, &d);
+        }
+    }
+
+    /// Adjacent frames of one state, drawn alike, of two lifetimes are a
+    /// transition between them, each lifetime its own span.
+    #[test]
+    fn a_new_lifetime_of_the_same_state_is_a_transition() {
+        use crate::measure::{Drew, Stage, State};
+        let book = super::Transitions::with_capacity(32);
+        let mut sink = super::ScenarioFrames::recording(Captures::of(Vec::new()), book.clone());
+        let loading = |lifetime| Stage {
+            state: State::Loading,
+            lifetime,
+            drew: Drew::Skin,
+        };
+        present(
+            &mut sink,
+            &[
+                (loading(7), 1_000_000),
+                (loading(7), 1_016_700),
+                (loading(8), 1_033_400),
+                (loading(8), 1_050_100),
+            ],
+        );
+        drop_bounded(sink);
+        let (spans, edges, _) = records_of(&book);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|s| (s.stage.lifetime, s.frames))
+                .collect::<Vec<_>>(),
+            [(7, 2), (8, 2)]
+        );
+        let [e] = edges[..] else {
+            panic!("one transition: {edges:?}");
+        };
+        assert_eq!(
+            (
+                e.presentation,
+                e.from.lifetime,
+                e.to.lifetime,
+                e.gap.from,
+                e.gap.to
+            ),
+            (false, 7, 8, TimeUs(1_016_700), TimeUs(1_033_400))
+        );
+    }
+
+    /// A play that ends without a result, a practice round left to its
+    /// page, cancels its preparation: a result taken later marks nothing.
+    /// The control, the same play going on to its result, marks it.
+    #[test]
+    fn a_practice_exit_cancels_the_preparation() {
+        use super::FrameSink as _;
+        use crate::dev::transitions::MarkKind;
+        use crate::measure::{Stage, State};
+        for page in [true, false] {
+            let book = super::Transitions::with_capacity(32);
+            let mut sink = super::ScenarioFrames::recording(Captures::of(Vec::new()), book.clone());
+            present(&mut sink, &[(play_stage(State::Tail), 1_000_000)]);
+            sink.play_ended(TimeUs(1_010_000));
+            if page {
+                present(&mut sink, &[(Stage::plain(State::Page), 1_200_000)]);
+            }
+            sink.result_taken(TimeUs(1_300_000));
+            drop_bounded(sink);
+            let (_, _, marks) = records_of(&book);
+            let preparing: Vec<_> = marks
+                .iter()
+                .filter(|m| m.kind == MarkKind::Preparing)
+                .map(|m| (m.from, m.to))
+                .collect();
+            if page {
+                assert_eq!(preparing, [], "{page}");
+            } else {
+                assert_eq!(preparing, [(TimeUs(1_010_000), TimeUs(1_300_000))]);
+            }
+        }
+    }
+
+    /// Through the sink, one tail span whose longest raw gap, largest
+    /// uncovered gap and largest uncovered piece are three gaps: A, 3 s
+    /// mostly marked (100 ms uncovered); B, 1 s with two overlapping marks
+    /// covering 400 ms once, its 600 ms uncovered in two pieces of 300 ms;
+    /// C, 450 ms unmarked; D, 2 s wholly marked. The span keeps A as its
+    /// longest and B as its largest uncovered, and the run's summary names
+    /// the span over its only transition.
+    #[test]
+    fn the_raw_and_the_uncovered_maxima_are_chosen_apart() {
+        use super::FrameSink as _;
+        use crate::measure::{Drew, Stage, State};
+        let book = super::Transitions::with_capacity(64);
+        let mut sink = super::ScenarioFrames::recording(Captures::of(Vec::new()), book.clone());
+        let tail = play_stage(State::Tail);
+        let prepared = |sink: &mut super::ScenarioFrames, from: i64, to: i64| {
+            sink.play_ended(TimeUs(from));
+            sink.result_taken(TimeUs(to));
+        };
+        present(&mut sink, &[(tail, 1_000_000)]);
+        prepared(&mut sink, 1_000_000, 3_900_000);
+        present(&mut sink, &[(tail, 4_000_000)]);
+        prepared(&mut sink, 4_300_000, 4_600_000);
+        prepared(&mut sink, 4_500_000, 4_700_000);
+        present(&mut sink, &[(tail, 5_000_000), (tail, 5_450_000)]);
+        prepared(&mut sink, 5_450_000, 7_450_000);
+        present(&mut sink, &[(tail, 7_450_000)]);
+        let result = Stage {
+            state: State::Result,
+            lifetime: 3,
+            drew: Drew::Skin,
+        };
+        present(&mut sink, &[(result, 7_466_700)]);
+        drop_bounded(sink);
+        let (spans, _, _) = records_of(&book);
+        let s = spans.iter().find(|s| s.stage.state == State::Tail).unwrap();
+        assert_eq!(s.frames, 5);
+        let raw = s.longest.unwrap();
+        assert_eq!(
+            (raw.from, raw.to, raw.cover.uncovered),
+            (TimeUs(1_000_000), TimeUs(4_000_000), 100_000)
+        );
+        let u = s.uncovered.unwrap();
+        assert_eq!(
+            (
+                u.from,
+                u.to,
+                u.cover.covered,
+                u.cover.uncovered,
+                u.cover.piece
+            ),
+            (
+                TimeUs(4_000_000),
+                TimeUs(5_000_000),
+                400_000,
+                600_000,
+                Some((TimeUs(4_000_000), TimeUs(4_300_000)))
+            )
+        );
+        let (lines, _) = book.lines().unwrap();
+        let summary = lines.last().unwrap();
+        assert!(
+            summary.contains("largest uncovered 600000 us (4000000 to 4300000) in span tail 41"),
+            "{summary}"
+        );
+    }
+
+    /// The record's failures reach the run's conclusion: records lost past
+    /// the cap fail it with their count, and a book the render thread
+    /// still holds fails it; a book within its cap concludes clean (the
+    /// control).
+    #[test]
+    fn a_lost_or_held_record_fails_the_run() {
+        use crate::dev::transitions::{Mark, MarkKind, Recorder};
+        let c = Captures::of(Vec::new());
+        let conclude = |record| {
+            super::conclude::<std::io::Error>(
+                Ok(()),
+                None,
+                None,
+                crate::render_side::RenderEnd::Joined,
+                &c,
+                record,
+            )
+        };
+        let filled = |cap: usize| {
+            let book = super::Transitions::with_capacity(cap);
+            let mut r = Recorder::new(book.clone());
+            for k in 0..6 {
+                r.mark(Mark {
+                    kind: MarkKind::ReadBack,
+                    from: TimeUs(k * 1_000),
+                    to: TimeUs(k * 1_000 + 500),
+                });
+            }
+            book
+        };
+        let e = conclude(filled(4).lines().map(|(_, lost)| lost)).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("2 transition records were lost past the cap of 4"),
+            "{e:#}"
+        );
+        assert!(conclude(filled(32).lines().map(|(_, lost)| lost)).is_ok());
+        let book = filled(32);
+        let held = book.hold();
+        let e = conclude(book.lines().map(|(_, lost)| lost)).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("the transition record is held by the render thread"),
+            "{e:#}"
+        );
+        drop(held);
     }
 
     /// The recorder's frame step allocates nothing: the first frame, frames

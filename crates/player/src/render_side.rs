@@ -1295,6 +1295,14 @@ pub trait FrameSink: Send {
     fn result_taken(&mut self, at: TimeUs) {
         let _ = at;
     }
+
+    /// A loading lifetime's hold ended by its device's loss: the screen is
+    /// dropped, so no frame of that lifetime may follow to carry it
+    /// (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    fn hold_lost(&mut self, hold: crate::measure::HoldStamp) {
+        let _ = hold;
+    }
 }
 
 /// No frame sink.
@@ -6123,7 +6131,12 @@ impl Run {
                     // The screen's failure, as a frame's.
                     first.ended = true;
                     #[cfg(feature = "dev-tools")]
-                    first.hold_ended(crate::measure::HoldEnd::DeviceLost);
+                    {
+                        first.hold_ended(crate::measure::HoldEnd::DeviceLost);
+                        if let Some(hold) = first.hold {
+                            self.frames.hold_lost(hold);
+                        }
+                    }
                     self.first_frame = Some(first);
                     eprintln!("render: {}", Chain(&RenderError::DeviceLost));
                     self.drop_screen();
@@ -19849,6 +19862,10 @@ mod screen_kind_tests {
             (State::Ready, 4_000_013, Drew::Plain)
         );
         assert_eq!(of(&play, at(700_000, view(false, None))).0, State::Play);
+        // The exact boundary: READY until the attempt's start (0), the
+        // play from it.
+        assert_eq!(of(&play, at(-1, view(false, None))).0, State::Ready);
+        assert_eq!(of(&play, at(0, view(false, None))).0, State::Play);
         assert_eq!(of(&play, at(9_000_000, view(true, None))).0, State::Tail);
         assert_eq!(
             of(&play, at(800_000, view(false, Some(TimeUs(600_000))))).0,
