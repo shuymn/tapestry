@@ -1274,6 +1274,7 @@ mod tests {
             fading: None,
             events: 0,
             offsets: game::OffsetRing::EMPTY,
+            judge_bins: game::JudgeBins::boxed(),
         }
     }
 
