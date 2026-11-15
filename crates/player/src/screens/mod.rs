@@ -29,6 +29,8 @@ pub(crate) use probe::{VisitSample, collections, runtime_frames, take_visit};
 pub(crate) use result_visit::result_visit;
 #[cfg(all(test, feature = "dev-tools"))]
 pub(crate) use script::GenState;
+#[cfg(feature = "dev-tools")]
+pub(crate) use script::note_lines;
 pub(crate) use script::{
     PlayInterval, Quiet, ScriptGen, ScriptNotes, ScriptPermit, ScriptSlot, ScriptStop, Scripts,
     ViewCommit,
