@@ -2805,8 +2805,13 @@ fn a_protected_probe_learns_nothing_outside_the_folder() {
             assert_eq!(r.unwrap().usage.missing_loads, 1, "{name}");
         }
         if back {
-            std::fs::remove_dir(ext.path().join("back")).unwrap();
-            std::fs::remove_dir(ext.path().join("gone")).unwrap();
+            // A junction is removed as a folder, a Unix link as a file.
+            for link in ["back", "gone"] {
+                #[cfg(windows)]
+                std::fs::remove_dir(ext.path().join(link)).unwrap();
+                #[cfg(unix)]
+                std::fs::remove_file(ext.path().join(link)).unwrap();
+            }
         }
     }
 }
