@@ -469,6 +469,9 @@ pub struct PlayerRig<'a> {
     /// Tests: each ended play's end and record, in order.
     #[cfg(test)]
     pub ended_plays: Vec<(game::PlayEnd, Option<replay::PlayRecord>)>,
+    /// Tests: each ended play's Closing, in order (`None` without one).
+    #[cfg(test)]
+    pub ended_closings: Vec<Option<game::ClosingReport>>,
     /// The system sounds (design.md "Audio", system sounds): made last in
     /// the rig, received from at selection's looks and settled before
     /// recording opens, closed before the audio thread ends.
@@ -2747,6 +2750,27 @@ impl Rig for PlayerRig<'_> {
         });
     }
 
+    /// The ready sound, as each READY's timer starts: never stopped, so a
+    /// retry's plays over the closing sound (design.md "State Model",
+    /// system sounds, READY). Its generation settled before READY.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn ready_began(&mut self) {
+        // Source: SF-013
+        if let Some(sounds) = self.system_sounds.as_mut() {
+            sounds.start(&mut self.audio.control, audio::SystemKind::PlayReady, None);
+        }
+    }
+
+    /// The closing sound at Closing's start, after the chart's audio was
+    /// cut, for a failure and a quit alike; never stopped (design.md
+    /// "State Model", system sounds, Closing).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn closing_began(&mut self) {
+        if let Some(sounds) = self.system_sounds.as_mut() {
+            sounds.start(&mut self.audio.control, audio::SystemKind::PlayStop, None);
+        }
+    }
+
     fn restore_ready(&mut self, at: TimeUs) -> Result<(), RestoreError> {
         self.restore = None;
         self.restore_at = None;
@@ -2919,6 +2943,8 @@ impl Rig for PlayerRig<'_> {
     fn ended(&mut self, report: &PlayReport) {
         #[cfg(test)]
         self.ended_plays.push((report.end, report.record.clone()));
+        #[cfg(test)]
+        self.ended_closings.push(report.closing);
         // The result is another scene: held adjustment controls act no more
         // until pressed afresh.
         self.enter_scene();

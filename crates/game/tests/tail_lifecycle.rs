@@ -247,6 +247,10 @@ struct Tail {
     /// The play time of the first wait after the seal at which the audio
     /// thread reported the audio done.
     audio_done_at: Option<i64>,
+    /// READY states opened ([`Rig::ready_began`]) and plays admitted to
+    /// Closing ([`Rig::closing_began`]).
+    readies: u32,
+    closings: u32,
 }
 
 impl Tail {
@@ -343,6 +347,8 @@ impl Tail {
             shown: Vec::new(),
             feeder: None,
             audio_done_at: None,
+            readies: 0,
+            closings: 0,
         }
     }
 
@@ -470,6 +476,14 @@ impl Rig for Tail {
             .play_at(origin, sounds, Gain::HEADROOM, None)
             .unwrap();
         self.side = Some(screen);
+    }
+
+    fn ready_began(&mut self) {
+        self.readies += 1;
+    }
+
+    fn closing_began(&mut self) {
+        self.closings += 1;
     }
 
     fn stepped(&mut self, _aborted: bool) {
@@ -1004,6 +1018,8 @@ fn a_quit_in_the_hold_shows_the_result_at_once() {
     assert!(report.tail_skipped);
     assert_eq!(rig.cancels, 1);
     assert!(rig.seen.iter().all(|s| s.fading.is_none()));
+    // C26-2: the hold is no Closing.
+    assert_eq!((rig.readies, rig.closings), (1, 0));
 }
 
 /// The quit key during the fade-out shows the result at once, without
@@ -1019,6 +1035,8 @@ fn a_quit_during_the_fade_out_shows_the_result_at_once() {
     assert_eq!(rig.shown_at(), Some(quit));
     assert!(report.tail_skipped);
     assert_eq!(rig.cancels, 1);
+    // C26-2: nor is the fade-out.
+    assert_eq!((rig.readies, rig.closings), (1, 0));
 }
 
 /// A quit once every note is judged but before the final deadline (the
@@ -1050,6 +1068,7 @@ fn a_quit_after_the_last_judgment_before_the_final_deadline_closes() {
     let finalized = rig.seen.iter().filter_map(|s| s.finalized).max().unwrap();
     assert!(finalized < TimeUs(1_280 * MS), "{finalized:?}");
     assert!(rig.seen.iter().all(|s| !s.complete));
+    assert_eq!((rig.readies, rig.closings), (1, 1));
 }
 
 /// A full play's finish anchor is its last note's end; an autoplayed one's

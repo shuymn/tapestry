@@ -331,6 +331,19 @@ pub trait Rig {
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<Self::Reader>, InputWaitError>;
     /// Hands the play to audio and to the screen.
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide);
+    /// A READY state opened and its timer starts (design.md "State
+    /// Model", system sounds, READY): after [`start`](Self::start), for
+    /// the first play, a retry and a practice round, and after each
+    /// rearm's [`restart_candidate`](Self::restart_candidate). In-play
+    /// code: it allocates and frees nothing. Nothing by default.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn ready_began(&mut self) {}
+    /// A play was admitted to Closing (design.md "Play Lifecycle",
+    /// Closing): once, after the chart's audio was cut and before
+    /// Closing's start is published. In-play code: it allocates and frees
+    /// nothing. Nothing by default.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn closing_began(&mut self) {}
     /// Whether the focus gate has tripped since recording opened.
     fn focus_lost(&self) -> bool;
     /// Whether a device that took part is still connected.
@@ -1744,6 +1757,8 @@ pub(crate) fn open_and_play<R: Rig>(
     logic.add_sink(Box::new(sink));
     let mut live = Vec::with_capacity(logic.max_events());
     rig.start(origin, sounds, screen);
+    // Source: SF-013
+    rig.ready_began();
     let round = restore_at.is_some();
     // The tail stage, once the play completed.
     let mut stage = None;
@@ -1836,6 +1851,8 @@ pub(crate) fn open_and_play<R: Rig>(
                         failed = Some(AbortCause::RestoreFailed);
                     }
                     rig.restart_candidate(origin, generation);
+                    // A fresh READY: its timer starts again.
+                    rig.ready_began();
                     continue;
                 }
                 Step::End(cause) => {
@@ -1944,10 +1961,16 @@ pub(crate) fn open_and_play<R: Rig>(
     };
     // Stopped, completed or failed: no frame from here on is playing, the
     // tail's, the ring-out's and Closing's included. Closing starts at its
-    // publication, on the play clock.
+    // publication, on the play clock; its sound is asked first, after the
+    // chart's audio was cut above, so the cut, the sound and the `failed`
+    // timer come in that order.
     let closing_at = admit.map(|_| TimeUs(rig.now().0 - origin.0));
     match closing_at {
-        Some(at) => logic.enter_closing(at),
+        Some(at) => {
+            // Source: SF-013
+            rig.closing_began();
+            logic.enter_closing(at);
+        }
         None => logic.stop_playing(),
     }
 

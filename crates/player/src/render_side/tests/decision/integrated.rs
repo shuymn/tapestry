@@ -13,7 +13,7 @@
 //! clock limits only detect a hang.
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -251,6 +251,10 @@ struct Seen {
     lose_result: AtomicBool,
     drawn: Mutex<Vec<Drawn>>,
     more: Condvar,
+    /// Play frames built from a view the game published as playing, and
+    /// as in Closing.
+    playing: AtomicU64,
+    closing: AtomicU64,
 }
 
 impl Seen {
@@ -559,6 +563,12 @@ impl Screen for Noted {
         self.menu.rearm();
     }
     fn build(&mut self, f: &render::FrameInput<'_>) -> Result<(), BuildError> {
+        if f.view.playing {
+            self.seen.playing.fetch_add(1, Ordering::AcqRel);
+        }
+        if f.view.closing.is_some() {
+            self.seen.closing.fetch_add(1, Ordering::AcqRel);
+        }
         self.menu.build(f)
     }
     fn draw(&mut self) -> Result<FrameTiming, RenderError> {
@@ -718,8 +728,15 @@ struct Set {
 
 impl Set {
     fn new(entry: &'static str) -> Self {
-        Self::with_result(
+        Self::with_play(entry, "")
+    }
+
+    /// [`new`](Self::new) with `body` in the play skin's script, after
+    /// its table is made (`skin` names it).
+    fn with_play(entry: &'static str, body: &str) -> Self {
+        Self::with_parts(
             entry,
+            body,
             Some(crate::render_side::tests::result::lua_skin_scripted("", RESULT_MARK).0),
         )
     }
@@ -727,8 +744,14 @@ impl Set {
     /// The set with `result` as its result skin's folder, none for the
     /// built-in result.
     fn with_result(entry: &'static str, result: Option<TempDir>) -> Self {
+        Self::with_parts(entry, "", result)
+    }
+
+    /// The set with `body` in the play skin's script and `result` as its
+    /// result skin's folder.
+    fn with_parts(entry: &'static str, body: &str, result: Option<TempDir>) -> Self {
         Self {
-            play: crate::imports::tests::lua_skin(""),
+            play: crate::imports::tests::lua_skin(body),
             selection: crate::selection_skin::fixture(),
             decision: decision_dir(),
             entry,
@@ -775,7 +798,8 @@ struct Side<'a> {
     cleanup_gate: Arc<crate::render_side::TestGate>,
     /// The decision screens the render thread left so far.
     decided: Arc<Decided>,
-    /// The audio output's probe: the system sounds' requests.
+    /// The audio output's probe, read while the run goes on: the system
+    /// sounds' requests.
     probe: game::OutputProbe,
     /// The result's preparation waits here at each poll while held.
     result_gate: Arc<crate::render_side::TestGate>,
@@ -948,6 +972,8 @@ struct Ran {
     probe: game::OutputProbe,
     frames: Vec<Drawn>,
     ended: Vec<game::PlayEnd>,
+    /// Each ended play's Closing, in order (`None` without one).
+    closings: Vec<Option<game::ClosingReport>>,
     records: Vec<DecisionRecord>,
     stamps: Vec<(u64, DecisionDrawnAs)>,
     /// Why the select screen's script failed, if it did.
@@ -1239,14 +1265,15 @@ fn run_with(
         });
         thread.stop().unwrap();
         let ended = rig.ended_plays.iter().map(|(end, _)| *end).collect();
+        let closings = rig.ended_closings.clone();
         let failure = rig
             .selection
             .as_ref()
             .and_then(|s| s.script.as_ref())
             .and_then(|s| s.failure().map(str::to_owned));
-        (ran, ended, failure, probe)
+        (ran, ended, closings, failure, probe)
     });
-    let (ran, ended, failure, probe) = ran;
+    let (ran, ended, closings, failure, probe) = ran;
     // Read while the run's data folder stands.
     let measured = measured
         .lock()
@@ -1273,6 +1300,7 @@ fn run_with(
         probe,
         frames: seen.frames(),
         ended,
+        closings,
         records,
         stamps,
         failure,
@@ -2772,4 +2800,112 @@ fn result_sounds_through_a_run() {
             i += 1;
         }
     }
+}
+
+/// C26-1, C26-2, C26-3 through the whole run, the system sounds armed with
+/// a sound set holding `playready` and `playstop`: the chart chosen, the
+/// quit key during its play enters Closing, a retry in Closing opens the
+/// second READY, and the second play runs to its result. Read on the result,
+/// before the run's close: two `playready` and one `playstop` asked, and
+/// neither stopped from the first READY on, the retry and the chart's start
+/// included. Selection's entry stops every set kind before that, so the
+/// stops are counted from the first READY.
+/// `tapestry play <chart>` makes the same owner in `rig()` and plays
+/// through the same `open_and_play`.
+///
+/// Each key is placed by what the game published, never by a wait on the
+/// wall clock: the quit key once a play frame shows the play playing (so
+/// its transport committed), with 70 s of chart left; the retry once
+/// Closing asked its sound, with the 90 s of Closing the play skin
+/// declares left. The first play's Closing report then shows it ended by
+/// the retry, so a retry that landed after Closing ran out (taken by the
+/// result's preparation, which also retries) fails the test instead of
+/// passing it. The second play, once a frame shows it playing, is moved
+/// past its end on the held clock.
+// Source: SF-013
+#[test]
+fn ready_and_closing_sounds_through_a_run() {
+    use audio::SystemKind::{Clear, PlayReady, PlayStop};
+    use game::Command;
+
+    let fx = crate::system_sounds::tests::Fixture::new();
+    for kind in [Clear, PlayReady, PlayStop] {
+        fx.sound("sound/A", kind, 48_000);
+    }
+    let root = fx.root();
+    crate::system_sounds::arm(move |setup, _| setup.root = root);
+    let set = Set::with_play("s.json", "skin.close = 90000");
+    let opts = Opts {
+        // Its one note at 70 s (measure 35 at 120 BPM).
+        chart: Some("#TITLE a\n#BPM 120\n#03511:01\n#03538:01\n"),
+        ..Opts::default()
+    };
+    let Ran {
+        ran,
+        ended,
+        closings,
+        ..
+    } = run_with(&set, None, opts, |side| {
+        // As the song selection launch sets it: the quit key leaves the
+        // play it arrives in.
+        side.controls.quit_leaves();
+        let probe = &side.probe;
+        let until = |what: &str, done: &dyn Fn() -> bool| {
+            assert!(wait_until(done), "never {what}");
+        };
+        let results = || {
+            side.seen
+                .frames()
+                .iter()
+                .filter(|d| matches!(d.frame, Frame::Result { .. } | Frame::End))
+                .count()
+        };
+        side.prepared();
+        side.press(MenuKey::Enter);
+        until("the first READY", &|| probe.system_starts(PlayReady) == 1);
+        assert_eq!(probe.system_starts(PlayStop), 0, "a closing sound in READY");
+        let stops = |kind| probe.system_stops(kind);
+        let before = [stops(PlayReady), stops(PlayStop)];
+        until("the first play playing", &|| {
+            side.seen.playing.load(Ordering::Acquire) > 0
+        });
+        side.controls.command(Command::Quit);
+        until("Closing's sound", &|| probe.system_starts(PlayStop) == 1);
+        until("a frame of Closing", &|| {
+            side.seen.closing.load(Ordering::Acquire) > 0
+        });
+        side.controls.command(Command::Retry);
+        until("the retry's READY", &|| probe.system_starts(PlayReady) == 2);
+        assert_eq!(results(), 0, "a result showed before the retry");
+        let played = side.seen.playing.load(Ordering::Acquire);
+        until("the second play playing", &|| {
+            side.seen.playing.load(Ordering::Acquire) > played
+        });
+        // Past the chart's end and its five-second hold.
+        let now = side.hold_clock();
+        side.clock.set(TimeUs(now.0 + 90_000 * MS));
+        side.clock.run();
+        until("the second play's result", &|| results() > 0);
+        assert_eq!(probe.system_starts(PlayReady), 2);
+        assert_eq!(probe.system_starts(PlayStop), 1);
+        assert_eq!(stops(PlayReady) - before[0], 0, "the ready sound stopped");
+        assert_eq!(stops(PlayStop) - before[1], 0, "the closing sound stopped");
+    });
+    assert!(ran.is_ok(), "{ran:?}");
+    assert_eq!(
+        ended,
+        [
+            game::PlayEnd::Aborted(game::AbortCause::Quit),
+            game::PlayEnd::Completed
+        ]
+    );
+    // The retry ended the first play's Closing; the second play had none.
+    assert_eq!(
+        closings
+            .iter()
+            .map(|c| c.map(|c| c.end))
+            .collect::<Vec<_>>(),
+        [Some(game::ClosingEnd::Retry), None],
+        "the retry did not land in Closing"
+    );
 }

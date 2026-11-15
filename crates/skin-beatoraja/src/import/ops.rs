@@ -300,9 +300,9 @@ const CHART_DIFFICULTY: i32 = 150;
 const SONG_NO_BGA: i32 = 170;
 /// `chart_judge_veryhard` to `chart_judge_veryeasy`
 /// (`BooleanPropertyFactory.java:448-452`): the song data's judgment class,
-/// which `chart.judge_class` holds as the source computes it from the
-/// chart's own rank (`lua::facts::JudgeClass::of_headers`), whatever rank
-/// the play preset judges with; a chart in no class holds none.
+/// which `chart.judge_class` holds, computed from the chart's own rank
+/// (`lua::facts::JudgeClass::of_headers`), whatever rank the play preset
+/// judges with; a chart in no class holds none.
 const CHART_JUDGE: i32 = 180;
 /// The conditions of 180 to 184 by id less 180, on the play and the
 /// result screens alike: 180 under the class's validity, since an unknown

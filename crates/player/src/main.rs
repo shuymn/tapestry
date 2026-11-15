@@ -1026,6 +1026,8 @@ fn rig<'a>(
         result_gate: std::sync::Arc::default(),
         #[cfg(test)]
         ended_plays: Vec::new(),
+        #[cfg(test)]
+        ended_closings: Vec::new(),
         system_sounds: None,
         system_notices: Arc::default(),
         #[cfg(test)]
