@@ -246,8 +246,12 @@ fn logic_does_not_allocate_during_play() {
     // The judgment offsets ring (design.md "Rendering and Skins"): 130
     // judgments through the step and the publish, one step each, with the
     // effect queue full from the first; the render side reads each view's
-    // ring, and a rearm clears it.
-    let (taps, inputs) = offset_taps(130);
+    // ring, and a rearm clears it. The judgment bins likewise: mapped
+    // before the play, each judgment counted and copied into the view,
+    // and cleared by the rearm.
+    let (mut taps, inputs) = offset_taps(130);
+    taps.meta.length = bms_model::ChartSummary::of(&taps).length;
+    let profile = bms_model::ChartProfile::of(&taps, &[]);
     let (mut writer, reader) = source_queue(inputs.len());
     for ev in inputs {
         writer.push(ev).unwrap();
@@ -266,23 +270,42 @@ fn logic_does_not_allocate_during_play() {
         Vec::new(),
     )
     .unwrap();
+    assert!(ringed.bin_judgments(&taps, &profile));
     let mut counts = 0;
+    let mut binned = 0_u64;
     TRACK.with(|t| t.set(true));
     counted();
     for i in 0..130 {
         let t = TimeUs(tap_time(i) + 50 * MS);
         writer.publish(t);
         ringed.advance_to(t);
-        counts += u64::from(side.view().offsets.count());
+        let v = side.view();
+        counts += u64::from(v.offsets.count());
+        binned += v
+            .judge_bins
+            .bins
+            .iter()
+            .flatten()
+            .map(|&c| u64::from(c))
+            .sum::<u64>();
     }
     let full = side.view().offsets;
     ringed.rearm(&InputStart::default(), TimeUs(20_000 * MS));
     let cleared = side.view().offsets;
+    let bins_cleared = side
+        .view()
+        .judge_bins
+        .bins
+        .iter()
+        .flatten()
+        .all(|&c| c == 0);
     TRACK.with(|t| t.set(false));
     assert_eq!(ALLOCS.load(Ordering::Relaxed), 0);
     assert!(side.dropped() > 0);
     // Each step's view counted its own judgment: 1 + 2 + … + 130.
     assert_eq!(counts, 130 * 131 / 2);
+    assert_eq!(binned, 130 * 131 / 2);
+    assert!(bins_cleared);
     assert_eq!(full.count(), 130);
     let newest: Vec<i32> = (30..130)
         .map(|i| i32::try_from(tap_offset_ms(i)).unwrap())
