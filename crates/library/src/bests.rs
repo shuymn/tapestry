@@ -379,7 +379,7 @@ impl Contribution {
         preset: &RulePreset,
     ) -> Self {
         let ineligible = ineligible(record, Some(verified), true);
-        let best = ineligible.is_none().then(|| {
+        let eligible = ineligible.is_none().then(|| {
             let mut cleared = vec![0_u8; evaluation.gauges.len().div_ceil(8)];
             for (i, g) in evaluation.gauges.iter().enumerate() {
                 if g.cleared
@@ -388,15 +388,25 @@ impl Contribution {
                     *byte |= 1 << (i % 8);
                 }
             }
-            let broken = evaluation.events.iter().any(|e| {
-                matches!(e.kind, JudgeEventKind::Judged { judgment, .. }
-                    if *preset.score.breaks_combo.get(judgment))
-            });
+            // The progress, each `Judged` event's judgment in emitted
+            // order, and whether any of them breaks the combo, in one pass.
+            let mut broken = false;
+            let progress: Box<[Judgment]> = evaluation
+                .events
+                .iter()
+                .filter_map(|e| match e.kind {
+                    JudgeEventKind::Judged { judgment, .. } => {
+                        broken |= *preset.score.breaks_combo.get(judgment);
+                        Some(judgment)
+                    }
+                    _ => None,
+                })
+                .collect();
             let empty_poor = preset.empty_poor.breaks_combo && evaluation.tally.empty_poor > 0;
             let t = &evaluation.tally;
             let per = |p: &PerJudgment<u32>| [p.perfect, p.great, p.good, p.bad, p.poor];
             let summary = ChartSummary::of(chart);
-            Best {
+            let best = Best {
                 ex: t.ex_score,
                 bp: t.bp,
                 max_combo: t.max_combo,
@@ -415,8 +425,10 @@ impl Contribution {
                     empty_poor_early: t.empty_poor_early,
                     empty_poor_late: t.empty_poor_late,
                 },
-            }
+            };
+            (best, progress)
         });
+        let (best, progress) = eligible.unzip();
         Self {
             key: Key {
                 preset_sha256: record.preset.sha256,
@@ -425,16 +437,7 @@ impl Contribution {
             },
             id,
             clear: best.as_ref().is_some_and(Best::lamp_cleared),
-            progress: best.is_some().then(|| {
-                evaluation
-                    .events
-                    .iter()
-                    .filter_map(|e| match e.kind {
-                        JudgeEventKind::Judged { judgment, .. } => Some(judgment),
-                        _ => None,
-                    })
-                    .collect()
-            }),
+            progress,
             best,
             ineligible,
         }

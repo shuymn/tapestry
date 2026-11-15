@@ -1417,13 +1417,23 @@ impl Loaded {
             chart_sha256: self.chart_record.identity.sha256,
             preset_sha256: replay::preset_hash(&self.preset),
         };
-        let basis = crate::result_figures::ResultBasis::of(&self.chart, None);
+        // The chart's judged notes, its taps and long notes, and whether it
+        // declares `#RANDOM`, as `ResultBasis` counts them for the whole
+        // chart.
+        let notes = self
+            .chart
+            .lanes
+            .iter()
+            .flatten()
+            .filter(|n| !matches!(n.kind, bms_model::NoteKind::Mine { .. }))
+            .fold(0_u32, |n, _| n.saturating_add(1));
+        let random = !self.chart.identity.random_results.is_empty();
         let (lookup, pace) = match self.coming.take() {
             Some(c) if c.preset == key.preset_sha256 => (c.best, c.pace),
             _ => match self.parts.records.as_mut() {
                 Some(sink) => {
-                    let query = (!basis.random).then_some(ProgressQuery {
-                        targets: basis.notes,
+                    let query = (!random).then_some(ProgressQuery {
+                        targets: notes,
                         empty_poor_counted: self.preset.empty_poor.counted,
                     });
                     let read = sink.play_best(&key, &self.preset, query);
@@ -1432,7 +1442,7 @@ impl Loaded {
                             BestLookup::Known(BestScore { ex: Some(ex), .. }),
                             ProgressLookup::Known(judgments),
                         ) if query.is_some() => {
-                            crate::best_series(judgments, &self.preset, *ex, basis.notes)
+                            crate::best_series(judgments, &self.preset, *ex, notes)
                         }
                         _ => None,
                     };
@@ -1451,7 +1461,7 @@ impl Loaded {
             BestLookup::KnownEmpty => (0, true),
             BestLookup::Unavailable => (0, false),
         };
-        let play = if basis.random {
+        let play = if random {
             TargetPlay::Random
         } else {
             TargetPlay::Fixed
@@ -1459,7 +1469,7 @@ impl Loaded {
         let score = ScoreBasis {
             best,
             best_known,
-            target: score_target(self.settings.player.target, basis.notes, best, play),
+            target: score_target(self.settings.player.target, notes, best, play),
         };
         (score, pace)
     }
