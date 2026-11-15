@@ -429,7 +429,7 @@ pub mod field {
     /// Whether the play context gives the chart's BPM range.
     pub const BPM_RANGE_VALID: u16 = 21;
     /// The whole seconds, rounded up, from the later of now and the
-    /// attempt's start to the last object or the section's end.
+    /// attempt's start to a full play's finish point or the section's end.
     pub const TIME_REMAINING_S: u16 = 22;
     /// The whole seconds, rounded down, since the attempt's start.
     pub const TIME_ELAPSED_S: u16 = 23;
@@ -732,7 +732,8 @@ pub mod timer {
     pub const SCREEN: u16 = 56;
     /// The rhythm clock: its start is `now` less the time since the
     /// latest bar line at 1 000 ms per chart beat, from `play`'s start
-    /// through the completed tail to the progress end + 5 s, then held.
+    /// through the completed tail until the attempt finishes (a full play's
+    /// finish point, a section's whole ring-out), then held.
     pub const RHYTHM: u16 = 57;
     /// A completed full play's fade-out, from its start (the play view's
     /// `fading`); off in Closing, in a practice round and while loading.

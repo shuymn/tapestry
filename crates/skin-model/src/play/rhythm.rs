@@ -16,11 +16,6 @@
 
 use bms_model::{ChartTimeline, Tempo, TimeUs, TimelineId, TimelinePoint};
 
-/// How long after the attempt's progress end the completed tail keeps the
-/// clock at the tempo: the source's play state runs to its last note plus
-/// `TIME_MARGIN` (`play/BMSPlayer.java:66, 199` at `0.8.9`).
-pub(crate) const TAIL_US: i64 = 5_000_000;
-
 /// The divisor of the clock's rate: 20 twentieths, 60 s a minute, and
 /// [`Tempo::UNITS_PER_BPM`].
 const DIVISOR: u128 = 1_200 * Tempo::UNITS_PER_BPM;

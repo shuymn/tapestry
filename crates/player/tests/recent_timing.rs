@@ -292,7 +292,10 @@ fn the_recent_timing_reaches_the_skin_through_logic_and_the_frame() {
         meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: &gauges,
-        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        attempt: Attempt::Full {
+            lead_in: TimeUs(0),
+            finish: TimeUs(i64::MAX),
+        },
         empty_poor_breaks_combo: rule.empty_poor.breaks_combo,
         empty_poor_counted: rule.empty_poor.counted,
         scratch: Side::Left,

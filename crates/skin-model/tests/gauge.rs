@@ -38,7 +38,10 @@ fn harness_with(g: GaugeDef, descs: &[GaugeDesc]) -> Harness {
         meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: descs,
-        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        attempt: Attempt::Full {
+            lead_in: TimeUs(0),
+            finish: TimeUs(i64::MAX),
+        },
         empty_poor_breaks_combo: false,
         empty_poor_counted: false,
         scratch: Side::Left,
@@ -445,7 +448,10 @@ fn narrow_and_degenerate_gauges_keep_their_cells() {
             meta: skin_model::ChartMetadata::UNKNOWN,
             autoplay: false,
             gauges: &[desc(GaugeLook::Normal, 80)],
-            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            attempt: Attempt::Full {
+                lead_in: TimeUs(0),
+                finish: TimeUs(i64::MAX),
+            },
             empty_poor_breaks_combo: false,
             empty_poor_counted: false,
             scratch: Side::Left,

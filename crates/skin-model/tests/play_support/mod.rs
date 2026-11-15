@@ -203,6 +203,12 @@ pub const GAUGES: [GaugeDesc; 2] = [
 /// off unless a test sets its own.
 pub const NO_END: TimeUs = TimeUs(3_600_000 * MS);
 
+/// A full play's finish point past every frame these tests build, so the
+/// remaining time and the progress never reach their end and the rhythm
+/// clock keeps the tempo through a completed tail, unless a test sets its
+/// own.
+pub const NO_FINISH: TimeUs = TimeUs(3_600_000 * MS);
+
 pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
     PlayContext {
         meta: skin_model::ChartMetadata::UNKNOWN,
@@ -210,6 +216,7 @@ pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
         gauges: &GAUGES,
         attempt: Attempt::Full {
             lead_in: TimeUs(lead_in_ms * MS),
+            finish: NO_FINISH,
         },
         empty_poor_breaks_combo: false,
         empty_poor_counted: false,
@@ -227,7 +234,7 @@ pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
 /// before chart time 0 or before its section's start.
 pub fn ready_start(ctx: &PlayContext<'_>) -> i64 {
     match ctx.attempt {
-        skin_model::Attempt::Full { lead_in } => -lead_in.0,
+        skin_model::Attempt::Full { lead_in, .. } => -lead_in.0,
         skin_model::Attempt::Section(s) => s.start.0 - s.lead_in.0,
     }
 }

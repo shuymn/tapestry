@@ -333,19 +333,25 @@ fn readouts_show_their_fields() {
         min_x100: 7_599,
         max_x100: 30_000,
     };
-    let mut d = Drawn::over_with(loaded.ok().skin.clone(), &chart(), Some(range), None);
+    // The finish: the tap at 125 s plus 5 s.
+    let finish = TimeUs(130_000 * MS);
+    let mut d = Drawn::over_context(
+        loaded.ok().skin.clone(),
+        &chart(),
+        &common::play::finishing(finish, Some(range)),
+    );
     d.readouts = Some(KNOWN);
     #[rustfmt::skip]
     let at_start = [
-        "300", "75", "150", "0", "00", "2", "05",
+        "300", "75", "150", "0", "00", "2", "10",
         "500", "250", "120", "500", "105", "1", "05", "668", "400",
     ];
     assert_eq!(rows(&mut d, 0), at_start);
-    // At 61.5 s: 61 s played, 63.5 s left, shown as 64.
+    // At 61.5 s: 61 s played, 68.5 s left, shown as 69.
     let later = rows(&mut d, 61_500);
-    assert_eq!(&later[3..7], ["1", "01", "1", "04"]);
+    assert_eq!(&later[3..7], ["1", "01", "1", "09"]);
     // Unknown values draw nothing, the clocks and covers still do.
-    let mut d = Drawn::over(d.skin, &chart());
+    let mut d = Drawn::over_context(d.skin, &chart(), &common::play::finishing(finish, None));
     d.readouts = Some(FrameReadouts {
         bpm_current_x100: None,
         hispeed_x100: None,
@@ -354,7 +360,7 @@ fn readouts_show_their_fields() {
     });
     #[rustfmt::skip]
     let unknown = [
-        "", "", "", "0", "00", "2", "05",
+        "", "", "", "0", "00", "2", "10",
         "500", "250", "120", "500", "", "", "", "", "",
     ];
     assert_eq!(rows(&mut d, 0), unknown);
