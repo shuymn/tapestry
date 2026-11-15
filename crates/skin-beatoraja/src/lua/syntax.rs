@@ -1272,10 +1272,9 @@ pub(crate) fn parse(src: &[u8], charged: &mut u64, cancel: &dyn Fn() -> bool) ->
 /// end the lexer reads (`\n`, `\r`, `\r\n`, `\n\r`) ends in one of those
 /// bytes, so this is its line's column whatever the file's line ends (a
 /// leading byte order mark never reaches here: the lexer refuses it, as
-/// Lua's own loader does). The
-/// functions are in the order their constructors start, so one walk
-/// forward over `src` serves them all; a function out of that order
-/// starts the walk again.
+/// Lua's own loader does). The functions are in the order their
+/// constructors start, so one walk forward over `src` serves them all; a
+/// function out of that order starts the walk again.
 fn columns(src: &[u8], funcs: &mut [Func]) {
     let (mut pos, mut col) = (0_usize, 1_u32);
     for f in funcs {
