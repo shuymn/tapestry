@@ -258,6 +258,23 @@ tests = [
 ]
 
 [[entry]]
+id = "SF-014"
+summary = "Play time adds how far into the chart each play's judged notes reached"
+class = "rule"
+reason = """
+A player sees the total play time grow by the music played up to the last \
+note judged, misses included, not by the time spent in menus or lead-ins. \
+The source's per-play whole seconds and its long note counted to the head \
+are byproducts not copied (design.md "Personal Bests", differences from \
+the source)."""
+source = [
+    "src/bms/player/beatoraja/PlayDataAccessor.java:287-296 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/play/JudgeManager.java:640-646 @beatoraja-0.8.9",
+]
+sites = ["crates/library/src/bests.rs"]
+tests = ["crates/library/src/bests.rs::a_plays_time_reaches_its_last_judged_note"]
+
+[[entry]]
 id = "SF-015"
 summary = "The result's sounds: `clear` or `fail` by the play's own lamp, `resultclose` at a skin's fade-out, all stopped on leaving"
 class = "rule"

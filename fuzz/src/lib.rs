@@ -480,6 +480,7 @@ pub fn result_view(ready: bool) -> skin_model::ResultView {
         gauge: None,
         deviations: None,
         timing_areas: None,
+        totals: Default::default(),
     }
 }
 
@@ -661,6 +662,7 @@ fn draw_selection(skin: &skin_model::Skin) -> Vec<usize> {
             query: "q".to_owned(),
             selected,
             list_revision: 0,
+            totals: Default::default(),
         };
         skin.update_selection(&mut sel, &view, &labels)
             .expect("an imported selection skin takes a view");

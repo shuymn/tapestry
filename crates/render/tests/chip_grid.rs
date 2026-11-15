@@ -144,6 +144,7 @@ fn quads(skin: &Skin, r: &Renderer, perfect: u32) -> (Vec<Sprite>, skin_model::A
             )
             .unwrap(),
         ),
+        totals: Default::default(),
     };
     skin.update_result(&mut res, &v, &ResultLabels::default())
         .unwrap();

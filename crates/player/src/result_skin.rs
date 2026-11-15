@@ -387,6 +387,7 @@ pub(crate) fn probe_view(chart: ResultChart) -> ResultView {
         gauge: None,
         deviations: None,
         timing_areas: None,
+        totals: Default::default(),
     }
 }
 
