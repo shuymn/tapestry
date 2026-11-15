@@ -151,7 +151,6 @@ fn t2_inputs(num: i64, den: i64) -> Vec<PhysicalInputEvent> {
 
 const PG: usize = 0;
 const GR_E: usize = 1;
-const GD_E: usize = 2;
 const BD_E: usize = 3;
 const GR_L: usize = 5;
 const GD_L: usize = 6;
