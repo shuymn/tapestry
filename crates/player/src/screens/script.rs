@@ -77,6 +77,10 @@ pub(in crate::screens) struct Entry {
     pub(in crate::screens) key: usize,
     pub(in crate::screens) generation: u64,
     pub(in crate::screens) held: Held,
+    /// The book its runtime notes to (dev-tools: listed when the
+    /// generation ends, [`Scripts::take_ended_notes`]).
+    #[cfg(feature = "dev-tools")]
+    pub(in crate::screens) notes: Option<NoteBook>,
 }
 
 /// The result runtimes the cell keeps at most: its permits.
@@ -122,6 +126,10 @@ pub(in crate::screens) struct ScriptHost {
     pub(in crate::screens) open: u32,
     /// The intervals opened so far: a token is good only in its epoch.
     pub(in crate::screens) epoch: u64,
+    /// The books of the selection generations replaced or retired, not
+    /// yet listed, by generation (dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub(in crate::screens) ended: Vec<(u64, NoteBook)>,
 }
 
 impl ScriptHost {
@@ -249,6 +257,69 @@ impl ScriptNotes {
     pub(crate) fn notes(&self) -> skin_beatoraja::lua::runtime::RuntimeNotes {
         self.0.notes()
     }
+
+    /// The book's lines for a scenario run, `owner` naming it
+    /// ([`note_lines`]; dev-tools).
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn lines(&self, owner: &str) -> Vec<String> {
+        note_lines(owner, &self.0)
+    }
+}
+
+/// A book's lines for a scenario run (dev-tools; design.md "Shortening
+/// Launch-Based Checks"): first `dev: runtime notes <owner>: ` with the
+/// count kept, whether the list is complete and the stops, then one
+/// `dev: runtime note <owner>: ` line per note kept, in the order they
+/// came, its file quoted (relative to the skin folder) with line and
+/// column. No Lua error text: a callback's error is named by its place.
+#[cfg(feature = "dev-tools")]
+pub(crate) fn note_lines(owner: &str, book: &NoteBook) -> Vec<String> {
+    use skin_beatoraja::lua::runtime::{Gave, RuntimeNote};
+    let notes = book.notes();
+    let complete = if notes.complete() {
+        "complete".to_owned()
+    } else {
+        format!(
+            "incomplete ({} occurrences past the cap of {})",
+            notes.dropped,
+            skin_beatoraja::limits::MAX_NOTES
+        )
+    };
+    let stops = notes.stops.reasons();
+    let stopped = if stops.is_empty() {
+        "none".to_owned()
+    } else {
+        stops
+            .iter()
+            .map(|s| s.name())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut lines = Vec::with_capacity(notes.list.len() + 1);
+    lines.push(format!(
+        "dev: runtime notes {owner}: {} kept, {complete}, stopped {stopped}",
+        notes.list.len()
+    ));
+    for note in &notes.list {
+        let (what, at) = match note {
+            RuntimeNote::Absent { api, id, gave, at } => {
+                let gave = match gave {
+                    Gave::Int(v) => v.to_string(),
+                    Gave::False => "false".to_owned(),
+                    Gave::EmptyText => "\"\"".to_owned(),
+                };
+                (format!("{api} {id} unanswered (gave {gave})"), at.as_ref())
+            }
+            RuntimeNote::CallbackError { at } => ("callback error".to_owned(), Some(at)),
+            RuntimeNote::ImportOnly { at } => ("import-only call".to_owned(), at.as_ref()),
+        };
+        let at = at.map_or_else(
+            || "?".to_owned(),
+            |a| format!("{:?}:{}:{}", &*a.file, a.line, a.col),
+        );
+        lines.push(format!("dev: runtime note {owner}: {what} at {at}"));
+    }
+    lines
 }
 
 /// The cells made so far: each takes the next number, so a token names
@@ -329,14 +400,27 @@ impl Scripts {
             return;
         };
         let generation = entry.generation.wrapping_add(1);
+        // The generation's own book, so its notes are listed when it ends.
+        #[cfg(feature = "dev-tools")]
+        let notes = rt.as_ref().map(|rt| {
+            let book = NoteBook::new();
+            rt.use_notes(&book);
+            book
+        });
         let old = std::mem::replace(
             entry,
             Entry {
                 key,
                 generation,
                 held: rt.map_or(Held::None, Held::Parked),
+                #[cfg(feature = "dev-tools")]
+                notes,
             },
         );
+        #[cfg(feature = "dev-tools")]
+        if let Some(book) = old.notes {
+            host.ended.push((old.generation, book));
+        }
         if let Held::Parked(old) = old.held {
             host.retire_runtime(old);
         }
@@ -354,9 +438,36 @@ impl Scripts {
             return;
         };
         let held = std::mem::replace(&mut entry.held, Held::Retired);
+        #[cfg(feature = "dev-tools")]
+        if let Some(book) = entry.notes.take() {
+            let generation = entry.generation;
+            host.ended.push((generation, book));
+        }
         if let Held::Parked(rt) = held {
             host.retire_runtime(rt);
         }
+    }
+
+    /// The books of the selection generations replaced or retired since
+    /// the last call, each once, labelled by their owner (dev-tools: a
+    /// scenario run lists them outside the host's lock).
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn take_ended_notes(&self) -> Vec<(String, NoteBook)> {
+        std::mem::take(&mut self.0.host().ended)
+            .into_iter()
+            .map(|(g, book)| (format!("selection generation {g}"), book))
+            .collect()
+    }
+
+    /// The live selection generation's book, labelled by its owner, once:
+    /// a later call, or the generation's end, gives it no more (dev-tools:
+    /// listed at the run's end).
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn take_live_notes(&self) -> Option<(String, NoteBook)> {
+        let mut host = self.0.host();
+        let entry = host.entries.get_mut(0)?;
+        let book = entry.notes.take()?;
+        Some((format!("selection generation {}", entry.generation), book))
     }
 
     /// Opens a play's interval, after the render thread acknowledged its
