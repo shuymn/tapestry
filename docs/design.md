@@ -82,7 +82,7 @@ This is a game, and the correctness of judgment is merely the foundation for "be
 - The first target is a state where "one song can be played pleasantly to the end". IR, distribution, and skin compatibility are added after that.
 - Effects, screens, and the default judgment and gauge values are treated as things tuned by playing. Tuning can be tried without restarting, by reloading presets and skins.
 - The default look and the default judgment are the face of this game. Existing skins become usable first, through the importers, and what they turn out to need is an input to tapestry's own skin format, whose design takes each need in or leaves it out with the reason. The standard skin, written in that format, follows in a stage of its own before IR ("Roadmap"); it is meant to get an editor and a format that image generation can feed, which is too large to put first: tapestry would never reach a usable state. Until it lands, the default play look is the built-in one (`SimpleSkin`). "Fun" is a reminder that this is a game: it cannot be measured and gates no stage.
-- What existing players can do comes before tapestry's own additions (further uses of the input log among them), as far as that is practical, and the state model follows existing players: the standard skin's screens pass through much the same game states, so a model built to match existing players serves it too (https://github.com/shuymn/tapestry/issues/474). Every extension point exists in code from the start, but only the extensions the first playable version needs are plugged into them ("Extension Boundaries"). Variations (other PCs and refresh rates, running alongside other software, skins, presets) are then added one at a time. If a design flaw blocks one of them, the affected part is rebuilt from scratch with that flaw taken into account. This is a personal project, with no business and no hired contributors, so finishing the concept matters more than the effort it takes; other players using tapestry is a goal.
+- What existing players can do comes before tapestry's own additions (further uses of the input log among them), as far as that is practical, and the state model follows existing players: the standard skin's screens pass through much the same game states, so a model built to match existing players serves it too (https://github.com/shuymn/tapestry/issues/474). Every extension point exists in code from the start, but each stage plugs in only the extensions its scope in "Roadmap" needs ("Extension Boundaries"). Variations (other PCs and refresh rates, running alongside other software, skins, presets) are then added one at a time. If a design flaw blocks one of them, the affected part is rebuilt from scratch with that flaw taken into account. This is a personal project, with no business and no hired contributors, so finishing the concept matters more than the effort it takes; other players using tapestry is a goal.
 - Performance comes from doing what game development normally does (the "Performance" section): no wasted resources, and no over-engineering. Measured figures are tracked to find problems; they are not targets that stop work.
 
 ## Overall Architecture
@@ -1423,9 +1423,9 @@ The result screen labels these "as played" (with whether it matches the live pla
 
 Conversely, judgment logic is placed in core and fixed, to preserve fairness and reproducibility. Rule-specific evaluation implementations are only those built into the evaluator, and no mechanism is built for users to extend judgment rules with code.
 
-The extension points exist from the first version as named interfaces in code, and core runs through them; what is kept to a minimum is the extensions plugged into them. The first playable version (stages 1–3) plugs in only what it needs to be played to completion ("How We Build It"), and the rest are added one at a time later:
+The extension points exist from the first version as named interfaces in code, and core runs through them; what is kept to a minimum is the extensions plugged into them. Each stage plugs in only what its scope in "Roadmap" needs ("How We Build It"), and the rest are added one at a time later: stages 1–3 plug in the set below, the beatoraja importer included, and stage 4 adds the declarative custom skin and its beatoraja exporter:
 
-| Extension point | Plugged in for the first version | Added later |
+| Extension point | Plugged in by stages 1–3 (stage 4 where marked) | Added later |
 | --- | --- | --- |
 | Ingestion | BMS adapter for `.bms`, `.bme` and `.bml` files, which read alike, including `#RANDOM`, writing the common chart model | PMS, BMSON, and other formats |
 | Chart transformation | None (the stage exists between ingestion and evaluation and passes the chart through) | MIRROR, RANDOM options and the like |
@@ -1436,9 +1436,9 @@ The extension points exist from the first version as named interfaces in code, a
 | Screen transition and session events | None | The event stream, the local event endpoint, and integrations built on them (OBS, Discord, overlays) |
 | Results | Re-evaluation under other presets (the game's core feature, shipped as the built-in result extension) | Other analysis screens |
 | Saving | Local saving of play records and input logs | Sending to IR, export |
-| Skins (through the runtime model) | The beatoraja importer, the declarative custom skin and its beatoraja exporter | The LR2 importer |
+| Skins (through the runtime model) | The beatoraja importer; the declarative custom skin and its beatoraja exporter (stage 4) | The LR2 importer |
 
-Settings profiles follow the same rule: the first version ships the standard profile, and the low-latency priority and streaming profiles come later.
+Settings profiles follow the same rule: stages 1–3 ship the standard profile, and the low-latency priority and streaming profiles come later.
 
 ### Screen Transition and Session Events
 
