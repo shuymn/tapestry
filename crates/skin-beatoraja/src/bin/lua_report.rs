@@ -29,12 +29,12 @@
 //! function the source never reads), a selection or result runtime's one
 //! frame over a zero state (whether its notes are complete, its stops,
 //! and each note: the id it does not answer with what it gave, or the
-//! callback whose call failed, located), and the import
-//! facts it read and recorded, each skin by its index in the arguments and
-//! each file by its index among those it consulted, then the skins per
-//! kind (`none` for a header refused). It prints no source, name, path,
-//! string or Lua error, except under `--local`: each runtime note is then
-//! followed by its file, and each record by a `local` line with its file, the destination it was
+//! callback whose call failed, located), and the import facts it read and
+//! recorded, each skin by its index in the arguments and each file by its
+//! index among those it consulted, then the skins per kind (`none` for a
+//! header refused). It prints no source, name, path, string or Lua error,
+//! except under `--local`: each runtime note is then followed by its file,
+//! and each record by a `local` line with its file, the destination it was
 //! consumed for (its index, the kind its `id` names and that `id`) and,
 //! when it lowered, whether its generated expression is a constant, that
 //! expression and its guards, and the report adds the configuration as
