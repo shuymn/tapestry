@@ -249,6 +249,8 @@ struct Seen {
     load_gate: crate::render_side::TestGate,
     /// The next result skin frame's submission reports the device lost.
     lose_result: AtomicBool,
+    /// The losses [`lose_result`](Self::lose_result) made.
+    lost: AtomicU64,
     drawn: Mutex<Vec<Drawn>>,
     more: Condvar,
     /// Play frames built from a view the game published as playing, and
@@ -455,6 +457,7 @@ impl Screen for Noted {
     }
     fn submit_result(&mut self) -> Result<FrameTiming, RenderError> {
         if self.seen.lose_result.swap(false, Ordering::AcqRel) {
+            self.seen.lost.fetch_add(1, Ordering::AcqRel);
             return Err(RenderError::DeviceLost);
         }
         let t = self.menu.submit_result()?;
@@ -803,6 +806,9 @@ struct Side<'a> {
     probe: game::OutputProbe,
     /// The result's preparation waits here at each poll while held.
     result_gate: Arc<crate::render_side::TestGate>,
+    /// The game thread's screen rebuilds and the end screen's shows after
+    /// them.
+    rebuilds: Arc<crate::play::RebuildProbe>,
 }
 
 impl Side<'_> {
@@ -1212,6 +1218,7 @@ fn run_with(
         rig.scenario = opts.captures.map(crate::selection::tests::capture_state);
         let probe = rig.audio.control.failure_probe();
         let result_gate = Arc::clone(&rig.result_gate);
+        let rebuilds = Arc::clone(&rig.rebuilds);
         if saved {
             rig.measured_plays = Some(Arc::clone(&measured));
         }
@@ -1233,6 +1240,7 @@ fn run_with(
             decided: Arc::clone(&decided),
             probe: probe.clone(),
             result_gate,
+            rebuilds,
         };
         let root = game::DataRoot::new(charts.path().join("app"));
         let parts = root.clone();
@@ -2687,6 +2695,12 @@ fn result_cell(outcome: Outcome, exit: Exit, close: bool, looped: bool) {
         } else {
             [0, 1, 0]
         };
+        // The show publishes its frame before it asks for its sound: the
+        // ask is waited for apart from the frame.
+        assert!(
+            wait_until(|| delta(probe).0.iter().sum::<u64>() >= 1),
+            "{case}: the show's start"
+        );
         assert_eq!(delta(probe), (own, [0; 3]), "{case}: the show");
         assert!(
             wait_until(|| probe.reserved(kind).is_some()),
@@ -2731,17 +2745,30 @@ fn result_cell(outcome: Outcome, exit: Exit, close: bool, looped: bool) {
                 "{case}: the fade-out's start"
             );
             if exit == Exit::Lost {
+                // Held at a frame wait, every frame drawn before is noted
+                // and none is under way: the next submission after the gate
+                // opens is the lost one, so every frame noted from `from` on
+                // is the rebuilt screen's.
+                side.seen.gate.hold();
                 let from = side.seen.frames().len();
+                let rebuilt = side.rebuilds.rebuilt.load(Ordering::Acquire);
                 side.seen.lose_result.store(true, Ordering::Release);
+                side.seen.gate.release();
+                assert!(
+                    wait_until(|| side.seen.lost.load(Ordering::Acquire) == 1),
+                    "{case}: the loss taken"
+                );
+                // The game thread built the screen again and showed the
+                // result after it, its requests made.
+                assert!(
+                    wait_until(|| side.rebuilds.shown.load(Ordering::Acquire) > rebuilt),
+                    "{case}: the result shown after the rebuild"
+                );
                 side.seen.until("a result frame after the loss", |d| {
                     d.iter()
                         .skip(from)
                         .any(|d| matches!(d.frame, Frame::Result { quads, .. } if quads > 0))
                 });
-                assert!(
-                    !side.seen.lose_result.load(Ordering::Acquire),
-                    "{case}: the loss taken"
-                );
                 assert_eq!(
                     delta(probe),
                     (fading, [swap, swap, 0]),

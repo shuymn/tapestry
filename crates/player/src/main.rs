@@ -1025,6 +1025,8 @@ fn rig<'a>(
         #[cfg(test)]
         result_gate: std::sync::Arc::default(),
         #[cfg(test)]
+        rebuilds: std::sync::Arc::default(),
+        #[cfg(test)]
         ended_plays: Vec::new(),
         #[cfg(test)]
         ended_closings: Vec::new(),

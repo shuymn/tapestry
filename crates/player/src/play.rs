@@ -466,6 +466,9 @@ pub struct PlayerRig<'a> {
     /// test holds it.
     #[cfg(test)]
     pub result_gate: std::sync::Arc<crate::render_side::TestGate>,
+    /// Tests: the screen's rebuilds and the end screen's shows after them.
+    #[cfg(test)]
+    pub rebuilds: std::sync::Arc<RebuildProbe>,
     /// Tests: each ended play's end and record, in order.
     #[cfg(test)]
     pub ended_plays: Vec<(game::PlayEnd, Option<replay::PlayRecord>)>,
@@ -2202,6 +2205,10 @@ impl Rig for PlayerRig<'_> {
 
     fn prepare_screen(&mut self) -> Result<(), ScreenError> {
         self.before_rebuild();
+        #[cfg(test)]
+        self.rebuilds
+            .rebuilt
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         // The screen's rebuild after a loss goes through its one owner: one
         // under way (a decision screen's, left) is taken over and waited
         // for, a failure saved there is reported here, and a lost screen
@@ -3099,6 +3106,14 @@ impl Rig for PlayerRig<'_> {
             // Source: SF-015
             sounds.result_shown(&mut self.audio.control, screen.own_cleared() == Some(true));
         }
+        // Its requests made: the rebuild it follows is over.
+        #[cfg(test)]
+        self.rebuilds.shown.store(
+            self.rebuilds
+                .rebuilt
+                .load(std::sync::atomic::Ordering::Acquire),
+            std::sync::atomic::Ordering::Release,
+        );
 
         self.result_shown();
         #[cfg(feature = "dev-tools")]
@@ -3956,4 +3971,16 @@ mod tests {
             None
         );
     }
+}
+
+/// Tests: the screen's rebuilds begun ([`Rig::prepare_screen`](game::Rig::prepare_screen)),
+/// and the latest of them the end screen has shown after, its requests
+/// made.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct RebuildProbe {
+    /// The rebuilds begun.
+    pub rebuilt: std::sync::atomic::AtomicU64,
+    /// The rebuilds begun before the end screen's latest show.
+    pub shown: std::sync::atomic::AtomicU64,
 }
