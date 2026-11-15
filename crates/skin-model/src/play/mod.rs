@@ -710,7 +710,9 @@ struct Graphs {
     /// The chart's notes by category, a bin each; empty without a notes
     /// graph or a profile.
     bins: Box<[[u16; NOTE_CATEGORIES]]>,
-    /// The chart's 1× seconds the bins span.
+    /// The 1× seconds the bins represent, their count times their width,
+    /// so a time lands in its own bin's column when the last bin is
+    /// padded past the chart (as the selection's preview axis).
     seconds: u32,
     /// The speed the chart is loaded at, as `(num, den)`: a 1× time is a
     /// play time times `num / den`.
@@ -762,7 +764,9 @@ impl Graphs {
         let (bins, seconds) = match profile.filter(|_| plan.notes) {
             Some(p) => (
                 p.bins().into(),
-                u32::try_from(p.seconds().len()).unwrap_or(u32::MAX),
+                u32::try_from(p.bins().len())
+                    .unwrap_or(u32::MAX)
+                    .saturating_mul(p.bin_seconds().max(1)),
             ),
             None => (Box::default(), 0),
         };
