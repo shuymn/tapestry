@@ -900,3 +900,95 @@ fn every_channel_and_the_wide_bins() {
     assert_eq!(lines.used(), &want[..]);
     assert_eq!(lines.uncovered_from, None);
 }
+
+/// C27-1 (design.md "State Model", system sounds, Result): the play's own
+/// lamp, which the result's sound follows, per outcome and whichever view
+/// shows: a full combo clears, a play with no press fails, a play ended
+/// midway fails though every press it had was on time, and a play with no
+/// record has no lamp of its own.
+// Source: SF-015
+#[test]
+fn the_own_view_lamp_per_outcome() {
+    let chart = taps(40);
+    let preset = rules::tapestry();
+    let end = deadline(&chart, &preset);
+    let on_time = |n: i64| {
+        let mut events = Vec::new();
+        for i in 0..n {
+            let t = 1_000 * MS + i * 500 * MS;
+            events.push(press(t, 0, lane(1)));
+            events.push(release(t + 50 * MS, lane(1)));
+        }
+        events
+    };
+    let report = |rec: Option<PlayRecord>, played: game::PlayEnd| {
+        let result = rec.as_ref().map(|rec| {
+            ReEvaluate.on_play_end(&ResultContext {
+                record: rec,
+                chart: &chart,
+                preset: &preset,
+                live: &[],
+                tally: &eval::Tally::default(),
+            })
+        });
+        game::PlayReport {
+            attempt: 1,
+            end: played,
+            tail_cut: None,
+            tail_skipped: false,
+            closing: None,
+            reload_error: None,
+            output_error: None,
+            input_error: None,
+            live: Vec::new(),
+            tally: eval::Tally::default(),
+            displayed_gauge: GaugeIndex(0),
+            record: rec,
+            saved: None,
+            result,
+            best: None,
+            preset: preset.clone(),
+        }
+    };
+    let midway = TimeUs(1_000 * MS + 20 * 500 * MS);
+    let cases = [
+        (
+            "cleared",
+            report(
+                Some(record(&preset, on_time(40), EndStatus::PlayedToEnd, end)),
+                game::PlayEnd::Completed,
+            ),
+            Some(true),
+        ),
+        (
+            "failed",
+            report(
+                Some(record(&preset, Vec::new(), EndStatus::PlayedToEnd, end)),
+                game::PlayEnd::Completed,
+            ),
+            Some(false),
+        ),
+        (
+            "ended midway",
+            report(
+                Some(record(&preset, on_time(20), EndStatus::EndedMidway, midway)),
+                game::PlayEnd::Aborted(game::AbortCause::Quit),
+            ),
+            Some(false),
+        ),
+        ("no record", report(None, game::PlayEnd::Completed), None),
+    ];
+    let dir = tempfile::tempdir().unwrap();
+    let presets = dir.path().join("presets");
+    std::fs::create_dir_all(&presets).unwrap();
+    let shelf = game::Shelf::open(presets, "tapestry").unwrap();
+    for (case, report, own) in cases {
+        let mut screen = ResultScreen::new(&report, &shelf, &chart, game::RECORDING_MEMORY);
+        assert_eq!(screen.own_cleared(), own, "{case}");
+        // Every other view: the own lamp stays.
+        for _ in 1..screen.entries().len() {
+            screen.step(1, &report, &chart);
+            assert_eq!(screen.own_cleared(), own, "{case}: another view");
+        }
+    }
+}
