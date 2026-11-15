@@ -578,6 +578,7 @@ impl Drawn {
             follow(&mut self.notes, &self.chart, ev);
         }
         let frame = SkinFrame {
+            judgments: None,
             app: self.app,
             state_us: self.state_us,
             screen_us: (ms * MS).saturating_sub(self.screen_from),
