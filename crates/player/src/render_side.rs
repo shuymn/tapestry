@@ -6522,8 +6522,6 @@ impl Run {
                         // Parked as the state goes, then retired.
                         shown.logic = None;
                         self.scripts.retire_kind(ScreenKind::Selection);
-                        #[cfg(feature = "dev-tools")]
-                        list_ended_notes(&self.scripts);
                         *self
                             .shared
                             .selection_refused
@@ -6564,6 +6562,12 @@ impl Run {
                             })
                         {
                             println!("dev: drawn notice: {}", notice.text);
+                        }
+                        // The runtime a refusal retired: its notes are
+                        // listed after the frame's allocations are counted,
+                        // since the listing allocates.
+                        if d.refused.is_some() {
+                            list_ended_notes(&self.scripts);
                         }
                     }
                     drawn.map(|d| (d.timing, None))
