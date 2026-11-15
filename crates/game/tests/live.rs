@@ -316,6 +316,12 @@ struct Fake {
     /// those pressed before a preparation begins are dropped there, as the
     /// player's result input drops what was queued before the result.
     menu_pressed: std::sync::Arc<std::sync::Mutex<Vec<game::MenuCommand>>>,
+    /// READY states opened ([`Rig::ready_began`]).
+    readies: u32,
+    /// Each admission to Closing ([`Rig::closing_began`]): the chart
+    /// audio's cuts asked so far, and the Closing start the play's view
+    /// then published.
+    closings: Vec<(usize, Option<TimeUs>)>,
 }
 
 /// What happens during a preparation's first poll ([`Fake::in_first_poll`])
@@ -499,6 +505,8 @@ impl Fake {
             settle_cost: 0,
             pinned_timing: None,
             menu_pressed: std::sync::Arc::default(),
+            readies: 0,
+            closings: Vec::new(),
         }
     }
 
@@ -831,6 +839,15 @@ impl Rig for Fake {
         self.sounds = Some(sounds);
         self.sealed = false;
         self.waits_since_seal = 0;
+    }
+
+    fn ready_began(&mut self) {
+        self.readies += 1;
+    }
+
+    fn closing_began(&mut self) {
+        let closing = self.side.as_mut().and_then(|s| s.view().closing);
+        self.closings.push((self.cancels, closing));
     }
 
     fn focus_lost(&self) -> bool {
@@ -3090,6 +3107,8 @@ fn a_quit_in_the_tail_stops_the_audio_and_shows_the_result_at_once() {
     assert_eq!(rig.shown_at.first(), Some(&10_100_000));
     assert!(matches!(one.saved, Some(Ok(_))), "{:?}", one.saved);
     assert_eq!(status(one).end, replay::EndStatus::PlayedToEnd);
+    // C26-2: a completed play's tail is no Closing, cut or not.
+    assert_eq!((rig.readies, rig.closings.len()), (1, 0));
 }
 
 /// The quit key that arrives as a completed play's recording closes skips
@@ -4739,6 +4758,21 @@ fn closing(report: &PlayReport) -> ClosingReport {
     report.closing.expect("the play entered Closing")
 }
 
+/// C26-2: each of `plays` was admitted to Closing once, its hook called
+/// after the chart's audio was cut and before Closing's start was
+/// published; `rig` opened `readies` READY states (C26-1).
+fn closed_after_the_cut(rig: &Fake, readies: u32, plays: usize) {
+    assert_eq!(rig.readies, readies, "READY states opened");
+    assert_eq!(rig.closings.len(), plays, "{:?}", rig.closings);
+    for &(cuts, published) in &rig.closings {
+        assert!(cuts >= 1, "the closing sound came before the cut");
+        assert_eq!(
+            published, None,
+            "Closing's start published before its sound"
+        );
+    }
+}
+
 fn start(attempt: u32) -> SessionEvent {
     SessionEvent::Start { attempt }
 }
@@ -4784,6 +4818,8 @@ fn a_displayed_survival_failure_closes_the_play() {
     );
     assert_eq!(rig.end_feedbacks, 1);
     assert_eq!(rig.shown_at, [ORIGIN + FAILS_AT + 1_000_000]);
+    // Closing ran out with no second call.
+    closed_after_the_cut(&rig, 1, 1);
     let record = one.record.as_ref().unwrap();
     assert_eq!(record.status.end, replay::EndStatus::EndedMidway);
     assert_eq!(record.status.finalized, TimeUs(FAILING_WATERMARK));
@@ -4866,6 +4902,7 @@ fn play_to_end_keeps_playing_after_a_displayed_failure() {
 /// with cause `Quit` under either `on_failure`: nothing is evaluated during
 /// it, the record ends at the step before the quit, and the result shows
 /// once it ran out: Start, End, Result.
+// Source: SF-013
 #[test]
 fn the_quit_key_during_play_enters_closing() {
     for on_failure in [FailureAction::Close, FailureAction::PlayToEnd] {
@@ -4921,6 +4958,7 @@ fn the_quit_key_during_play_enters_closing() {
                 SessionEvent::Result { attempt: 1 },
             ]
         );
+        closed_after_the_cut(&rig, 1, 1);
     }
 }
 
@@ -4937,6 +4975,7 @@ fn a_quit_in_ready_leaves_without_closing() {
     assert_eq!(rig.reports[0].closing, None);
     assert!(rig.abort_closes.is_empty());
     assert_eq!(rig.shows, 0);
+    closed_after_the_cut(&rig, 1, 0);
 }
 
 /// In autoplay the quit key keeps its meaning: during play it aborts the
@@ -4964,6 +5003,7 @@ fn autoplay_quits_at_once_and_closes_on_failure() {
         assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit), "{at}");
         assert_eq!(one.closing, None, "{at}");
         assert_eq!(rig.shown_at, if shown { vec![at] } else { vec![] });
+        closed_after_the_cut(&rig, 1, 0);
     }
     let dir = tempfile::tempdir().unwrap();
     let events = Events::default();
@@ -4981,6 +5021,7 @@ fn autoplay_quits_at_once_and_closes_on_failure() {
     let one = &rig.reports[0];
     assert_eq!(one.end, PlayEnd::Aborted(AbortCause::GaugeFailed));
     assert_eq!(closing(one).end, ClosingEnd::RanOut);
+    closed_after_the_cut(&rig, 1, 1);
 }
 
 /// Where the sixteen-note play's Closing starts and runs out, on the
@@ -5114,6 +5155,9 @@ fn a_retry_in_closing_saves_and_retries_once() {
             "{case}"
         );
         assert_eq!(events.all()[6..], [SessionEvent::Result { attempt: 2 }]);
+        // The retry's READY is the second; each play closed once, the
+        // retry adding no call to the first's.
+        closed_after_the_cut(&rig, 2, 2);
     }
 }
 
@@ -5166,6 +5210,7 @@ fn a_window_close_during_play_enters_no_closing() {
     assert_eq!(one.end, PlayEnd::Aborted(AbortCause::Quit));
     assert_eq!(one.closing, None);
     assert!(rig.abort_closes.is_empty());
+    closed_after_the_cut(&rig, 1, 0);
 }
 
 /// Focus loss and the removal of the last device during Closing change
@@ -5258,6 +5303,7 @@ fn a_suspend_cuts_closing_and_marks_only_what_recording_saw() {
         assert_eq!(closing(one).ended_at, TimeUs(ended - ORIGIN), "{case}");
         assert_eq!(status(one).incomplete.suspend, marked, "{case}");
         assert_eq!(rig.shown_at, [ended], "{case}");
+        closed_after_the_cut(&rig, 1, 1);
     }
     let dir = tempfile::tempdir().unwrap();
     let mut loaded = failing(dir.path(), FailureAction::Close, &Events::default());
@@ -5295,6 +5341,7 @@ fn failures_cut_closing_with_their_diagnostics() {
         assert_eq!(one.input_error, Some(InputWaitError::Gone));
         assert!(!status(one).incomplete.any());
         assert_eq!(rig.shown_at, [at]);
+        closed_after_the_cut(&rig, 1, 1);
 
         // The audio output.
         let dir = tempfile::tempdir().unwrap();
@@ -5311,6 +5358,7 @@ fn failures_cut_closing_with_their_diagnostics() {
         assert_eq!(closing(one).ended_at, TimeUs(at - ORIGIN));
         assert_eq!(one.output_error, Some(audio::OutputError::DeviceLost));
         assert_eq!(rig.shown_at, [at]);
+        closed_after_the_cut(&rig, 1, 1);
     }
     // The screen: built again before the result shows.
     let dir = tempfile::tempdir().unwrap();
@@ -5321,6 +5369,7 @@ fn failures_cut_closing_with_their_diagnostics() {
     let one = &rig.reports[0];
     assert_eq!(closing(one).end, ClosingEnd::Cut(AbortCause::ScreenFailed));
     assert_eq!(closing(one).ended_at, TimeUs(11_000_000 - ORIGIN));
+    closed_after_the_cut(&rig, 1, 1);
 }
 
 /// Closing lasts the skin's declared close, at least 1 s: none, zero,
