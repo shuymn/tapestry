@@ -1259,13 +1259,14 @@ impl SelectScreen {
             return Acted::Nothing;
         };
         let last = self.selectable().saturating_sub(1);
-        // A ring step: none with nothing listed.
+        // A ring step or a page step: none with nothing listed.
         let step = |forward, steps| self.ring_to(forward, steps).map(|to| (to, true));
+        let page = |forward| self.page_to(forward).map(|to| (to, true));
         let to = match key {
             MenuKey::Up => step(false, 1),
             MenuKey::Down => step(true, 1),
-            MenuKey::PageUp => step(false, PAGE_STEP),
-            MenuKey::PageDown => step(true, PAGE_STEP),
+            MenuKey::PageUp => page(false),
+            MenuKey::PageDown => page(true),
             MenuKey::Home => Some((0, false)),
             MenuKey::End => Some((last, false)),
             MenuKey::Left | MenuKey::Right => {
@@ -1336,6 +1337,20 @@ impl SelectScreen {
             (at + steps) % n
         } else {
             (at + n - steps) % n
+        })
+    }
+
+    /// The row a page step lands on: [`PAGE_STEP`] rows forward (or
+    /// back) of the cursor, stopping at the list's last (or first) row;
+    /// from that end row, the other end. None while nothing is listed.
+    pub fn page_to(&self, forward: bool) -> Option<usize> {
+        let last = self.selectable().checked_sub(1)?;
+        let at = self.cursor.min(last);
+        Some(match (forward, at) {
+            (true, a) if a == last => 0,
+            (true, a) => a.saturating_add(PAGE_STEP).min(last),
+            (false, 0) => last,
+            (false, a) => a.saturating_sub(PAGE_STEP),
         })
     }
 
@@ -2774,26 +2789,26 @@ mod tests {
         (acted, s.cursor(), cues.count(audio::SystemKind::Scratch))
     }
 
-    /// Up and Down, Page Up and Page Down step around the list's ring,
-    /// past either end to the other, one `scratch` each; Home and End go
+    /// Up and Down step around the list's ring, past either end to the
+    /// other; Page Up and Page Down stop at the first or last row and from
+    /// that row go to the other end; one `scratch` each. Home and End go
     /// to the first and last row, sounding only when they move.
     // Source: SF-016
     #[test]
     fn the_arrow_and_page_keys_step_around_the_ring() {
-        use super::PAGE_STEP;
         let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
         s.set_entries(folder("a", 4));
         assert_eq!(step(&mut s, MenuKey::Up), (Acted::Changed, 3, 1));
         assert_eq!(step(&mut s, MenuKey::Down), (Acted::Changed, 0, 1));
+        // A page from row 2 stops at the last row, and from there wraps.
         assert!(s.move_to(2));
-        // A clamped page stops at 3.
-        let down = (2 + PAGE_STEP) % 4;
-        assert_ne!(down, 3);
-        assert_eq!(step(&mut s, MenuKey::PageDown), (Acted::Changed, down, 1));
+        assert_eq!(step(&mut s, MenuKey::PageDown), (Acted::Changed, 3, 1));
+        assert_eq!(step(&mut s, MenuKey::PageDown), (Acted::Changed, 0, 1));
+        // A page back from row 1 stops at the first row, and from there
+        // wraps.
         assert!(s.move_to(1));
-        let up = (1 + 4 - PAGE_STEP % 4) % 4;
-        assert_ne!(up, 0);
-        assert_eq!(step(&mut s, MenuKey::PageUp), (Acted::Changed, up, 1));
+        assert_eq!(step(&mut s, MenuKey::PageUp), (Acted::Changed, 0, 1));
+        assert_eq!(step(&mut s, MenuKey::PageUp), (Acted::Changed, 3, 1));
         assert_eq!(step(&mut s, MenuKey::Home), (Acted::Changed, 0, 1));
         assert_eq!(step(&mut s, MenuKey::Home), (Acted::Nothing, 0, 0));
         assert_eq!(step(&mut s, MenuKey::End), (Acted::Changed, 3, 1));
@@ -2801,21 +2816,47 @@ mod tests {
     }
 
     /// A step that comes back to the row it left changes nothing but
-    /// still sounds: a one-row list's arrows, and a page of whole laps.
+    /// still sounds: a one-row list's arrows and pages. A page on a longer
+    /// list never laps back onto its row: on three rows, a page from row
+    /// 1 stops at the last row (a whole lap of 18 would have stayed on
+    /// row 1), and on a page's 18 rows a page from the first row stops at
+    /// the last and the next wraps to the first; one `scratch` each.
     // Source: SF-016
     #[test]
     fn a_step_back_onto_the_same_row_still_sounds() {
         use super::PAGE_STEP;
         let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
         s.set_entries(folder("a", 1));
-        for k in [MenuKey::Down, MenuKey::Up, MenuKey::PageDown] {
+        for k in [
+            MenuKey::Down,
+            MenuKey::Up,
+            MenuKey::PageDown,
+            MenuKey::PageUp,
+        ] {
             assert_eq!(step(&mut s, k), (Acted::Nothing, 0, 1), "{k:?}");
         }
-        // A list of a page's rows: a page is one whole lap.
-        s.set_entries(folder("b", PAGE_STEP));
+        // Three rows, where 18 is whole laps.
+        s.set_entries(folder("b", 3));
+        assert_eq!(PAGE_STEP % 3, 0);
         assert!(s.move_to(1));
-        assert_eq!(step(&mut s, MenuKey::PageDown), (Acted::Nothing, 1, 1));
-        assert_eq!(step(&mut s, MenuKey::PageUp), (Acted::Nothing, 1, 1));
+        assert_eq!(step(&mut s, MenuKey::PageDown), (Acted::Changed, 2, 1));
+        assert_eq!(step(&mut s, MenuKey::PageDown), (Acted::Changed, 0, 1));
+        assert!(s.move_to(1));
+        assert_eq!(step(&mut s, MenuKey::PageUp), (Acted::Changed, 0, 1));
+        assert_eq!(step(&mut s, MenuKey::PageUp), (Acted::Changed, 2, 1));
+        // A page's rows: 0, then the last row, then 0 again.
+        s.set_entries(folder("c", PAGE_STEP));
+        assert!(s.move_to(0));
+        assert_eq!(
+            step(&mut s, MenuKey::PageDown),
+            (Acted::Changed, PAGE_STEP - 1, 1)
+        );
+        assert_eq!(step(&mut s, MenuKey::PageDown), (Acted::Changed, 0, 1));
+        assert_eq!(
+            step(&mut s, MenuKey::PageUp),
+            (Acted::Changed, PAGE_STEP - 1, 1)
+        );
+        assert_eq!(step(&mut s, MenuKey::PageUp), (Acted::Changed, 0, 1));
     }
 
     /// A query whose results become empty lists nothing: no key steps or
