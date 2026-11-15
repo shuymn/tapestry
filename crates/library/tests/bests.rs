@@ -1167,7 +1167,7 @@ fn a_bests_2_database_is_recreated_without_reading_it() {
         panic!("{:?}", lib.bests_state());
     };
     assert_eq!(old.bests, 2);
-    assert_eq!(library::BESTS_VERSION, 3);
+    assert_eq!(library::BESTS_VERSION, 6);
     // This version's layout, empty; the other bests tables cleared.
     sql(
         &fx.db(),

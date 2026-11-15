@@ -6897,6 +6897,7 @@ pub(crate) mod tests {
                 },
                 ..Default::default()
             }),
+            progress: None,
             clear: true,
             ineligible: None,
         };

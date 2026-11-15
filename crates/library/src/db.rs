@@ -80,14 +80,18 @@ pub fn connect(path: &Path) -> rusqlite::Result<Connection> {
     Ok(conn)
 }
 
-/// The `scores` table of the current bests version ([`crate::BESTS_VERSION`]):
-/// created with the schema, and dropped and created again when the stored
-/// bests tuple is not this build's, so a change of its columns needs no
-/// schema change. `play` is a [`crate::Breakdown`] in its fixed layout
-/// ([`crate::bests::BREAKDOWN_BYTES`] bytes, the length its check takes from
-/// the layout); the best's values are all set or all null.
-pub(crate) fn scores_ddl() -> String {
+/// The bests tables of the current bests version ([`crate::BESTS_VERSION`]),
+/// `scores` and `progress`: created with the schema, and dropped and created
+/// again when the stored bests tuple is not this build's, so a change of
+/// their columns needs no schema change. `play` is a [`crate::Breakdown`] in
+/// its fixed layout ([`crate::bests::BREAKDOWN_BYTES`] bytes, the length its
+/// check takes from the layout); the best's values are all set or all null.
+/// `progress` holds the judgments of the play `play_sha256` names, one byte
+/// each ([`crate::bests::MAX_PROGRESS`] at most), beside its key's
+/// breakdown; it keeps rowids, since a row can pass a page.
+pub(crate) fn bests_ddl() -> String {
     let len = crate::bests::BREAKDOWN_BYTES;
+    let max = crate::bests::MAX_PROGRESS;
     format!(
         "CREATE TABLE scores (
              preset_sha256 BLOB NOT NULL,
@@ -107,7 +111,15 @@ pub(crate) fn scores_ddl() -> String {
                  AND (best_ex IS NULL) = (play_sha256 IS NULL)
                  AND (best_ex IS NULL) = (play IS NULL)),
              PRIMARY KEY (preset_sha256, ln_mode, chart_sha256)
-         ) WITHOUT ROWID;"
+         ) WITHOUT ROWID;
+         CREATE TABLE progress (
+             preset_sha256 BLOB NOT NULL,
+             ln_mode INTEGER NOT NULL,
+             chart_sha256 BLOB NOT NULL,
+             play_sha256 BLOB NOT NULL CHECK (length(play_sha256) = 32),
+             judgments BLOB NOT NULL CHECK (length(judgments) <= {max}),
+             PRIMARY KEY (preset_sha256, ln_mode, chart_sha256)
+         );"
     )
 }
 
@@ -122,7 +134,7 @@ pub(crate) fn scores_ddl() -> String {
 /// a second case folding of its own would make it disagree with `LIKE`;
 /// diacritics are kept, as normalization keeps them.
 pub fn create(conn: &Connection) -> rusqlite::Result<()> {
-    let scores = scores_ddl();
+    let scores = bests_ddl();
     conn.execute_batch(&format!(
         "BEGIN;
          CREATE TABLE roots (
@@ -318,10 +330,11 @@ pub fn check_tuple(conn: &mut Connection) -> rusqlite::Result<Option<Option<Tupl
         return Ok(None);
     }
     // The derived tables of another interpretation are discarded unread;
-    // `scores` is created again in this version's layout.
+    // the bests tables are created again in this version's layout.
     tx.execute_batch(&format!(
-        "DROP TABLE IF EXISTS scores; {} DELETE FROM counted; DELETE FROM refused;",
-        scores_ddl()
+        "DROP TABLE IF EXISTS scores; DROP TABLE IF EXISTS progress; {} DELETE FROM counted;
+         DELETE FROM refused;",
+        bests_ddl()
     ))?;
     tx.execute(
         "INSERT INTO meta (id, replay_format, canonical, evaluator, loader, bests, requested,

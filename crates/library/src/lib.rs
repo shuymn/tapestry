@@ -64,6 +64,11 @@
 //!   ([`BREAKDOWN_BYTES`]). Its layout belongs to [`BESTS_VERSION`], not to
 //!   the schema version: opening a database of another bests tuple creates
 //!   the table again, unread, so a change of its columns scans no chart.
+//! - `progress(preset_sha256, ln_mode, chart_sha256, play_sha256,
+//!   judgments)`: the [`Progress`] of a key's best play, the play
+//!   `play_sha256` names, one byte per judged target (at most
+//!   [`MAX_PROGRESS`]); written with its key's `scores` row when that play's
+//!   breakdown is kept, and created and dropped with `scores`.
 //! - `counted(path, body_sha256, size, mtime_ns)`: each play counted
 //!   ([`PlayId`]).
 //! - `refused(path, size, mtime_ns, reason, waits_for)`: records refused for
@@ -130,7 +135,8 @@ use rusqlite::Connection;
 
 pub use bests::{
     BESTS_VERSION, BREAKDOWN_BYTES, Best, Breakdown, Contribution, Ineligible, Ingested, Key,
-    LN_MODE, PlayId, Score, Verified, counts_for_best, ineligible,
+    LN_MODE, MAX_PROGRESS, PlayBest, PlayId, Progress, ProgressQuery, Score, Verified,
+    counts_for_best, ineligible,
 };
 pub use bms_model::ChartSummary;
 pub use bms_parser::{ChartMode, Header};
@@ -512,6 +518,24 @@ impl BestWriter {
     /// [`LibraryError::Database`] when SQLite refuses the query.
     pub fn score(&self, key: &Key) -> Result<Option<Score>, LibraryError> {
         bests::score(&self.conn, key).map_err(|e| self.database(e))
+    }
+
+    /// The score stored under `key` and, when `query` asks, its best's
+    /// progress, in one statement: one indexed read per play, before it is
+    /// prepared (design.md "Personal Bests", skin projections). A progress
+    /// inconsistent with the best's breakdown is [`Progress::Refused`] and
+    /// leaves the score as read.
+    ///
+    /// # Errors
+    ///
+    /// [`LibraryError::Database`] when SQLite refuses the query, or the
+    /// score is inconsistent.
+    pub fn play_best(
+        &self,
+        key: &Key,
+        query: Option<ProgressQuery>,
+    ) -> Result<PlayBest, LibraryError> {
+        bests::play_best(&self.conn, key, query).map_err(|e| self.database(e))
     }
 
     /// Requests a catch-up ([`Library::request_bests_pass`]).
