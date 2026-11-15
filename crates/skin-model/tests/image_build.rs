@@ -149,6 +149,7 @@ fn the_longest_period_at_the_latest_time_stays_in_range() {
     let ctx = skin_model::PlayContext {
         attempt: skin_model::Attempt::Full {
             lead_in: TimeUs(i64::MAX),
+            finish: TimeUs(i64::MAX),
         },
         ..full(0)
     };

@@ -336,8 +336,8 @@ pub(crate) enum Value {
     ElapsedMinutes,
     ElapsedSeconds,
     /// The remaining time's minutes and seconds (`timeleft_minute`,
-    /// `timeleft_second`, `:207-222`), rounded up without the source's
-    /// added second and margin.
+    /// `timeleft_second`, `:207-222`), rounded up to the play's finish
+    /// point without the source's added second.
     RemainingMinutes,
     RemainingSeconds,
     /// The configured lane cover, lift and hidden cover in ‰, whatever

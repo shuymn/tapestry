@@ -33,8 +33,8 @@ static GLOBAL: counting::Counting = counting::Counting;
 
 /// A rig on a 1 ms clock whose input side is a source set in the test's
 /// thread: each wait publishes an empty batch. Counting runs from the end
-/// of each advance (`measured`) to the next wait, and through Closing's
-/// wakes, until the final close.
+/// of each advance (`measured`) and from each READY's and Closing's hook to
+/// the next wait, and through Closing's wakes, until the final close.
 struct Counted {
     now: i64,
     sources: SourceSet,
@@ -55,6 +55,9 @@ struct Counted {
     generation: u32,
     /// Where the current candidate's chart time 0 lies.
     origin: TimeUs,
+    /// READY's and Closing's hooks, each called with counting on.
+    readies: u32,
+    closings: u32,
 }
 
 impl Counted {
@@ -82,6 +85,8 @@ impl Counted {
             cancel_at: None,
             generation: 0,
             origin: TimeUs(0),
+            readies: 0,
+            closings: 0,
         }
     }
 
@@ -241,6 +246,16 @@ impl Rig for Counted {
         self.screen = Some(screen);
     }
 
+    fn ready_began(&mut self) {
+        self.on();
+        self.readies += 1;
+    }
+
+    fn closing_began(&mut self) {
+        self.on();
+        self.closings += 1;
+    }
+
     fn focus_lost(&self) -> bool {
         false
     }
@@ -339,6 +354,8 @@ fn closing_allocates_nothing() {
     assert_eq!(report.closing.map(|c| c.end), Some(ClosingEnd::RanOut));
     assert!(rig.checked);
     assert_eq!(rig.calls, 0, "the failure's Closing allocated");
+    // C26-4: both hooks ran inside the counted stretch.
+    assert_eq!((rig.readies, rig.closings), (1, 1));
 
     // The quit key at 1.5 s of play time (READY opens at 0), again in
     // Closing, then a retry beside a suspend.
@@ -354,6 +371,7 @@ fn closing_allocates_nothing() {
     assert_eq!(report.end, PlayEnd::Aborted(game::AbortCause::Quit));
     assert_eq!(report.closing.map(|c| c.end), Some(ClosingEnd::Retry));
     assert_eq!(rig.calls, 0, "the quit's Closing allocated");
+    assert_eq!((rig.readies, rig.closings), (1, 1));
 
     // Gated: committed at once, and after the first candidate was
     // cancelled at 0.5 s and rearmed, its opening kept in the history;
@@ -372,6 +390,9 @@ fn closing_allocates_nothing() {
             rig.calls, 0,
             "a gated failure's Closing allocated ({cancel_at:?})"
         );
+        // A rearm's READY too.
+        let readies = 1 + u32::from(cancel_at.is_some());
+        assert_eq!((rig.readies, rig.closings), (readies, 1), "{cancel_at:?}");
 
         let dir = tempfile::tempdir().unwrap();
         let mut quit = loaded(dir.path(), sixteen.clone());
