@@ -658,11 +658,11 @@ fn the_plays_last_bins_and_the_results_timelines_agree_in_totals() {
     assert!(p.logic.bin_judgments(&chart, &profile));
     p.step(6_000 * MS);
     let play = totals(&p.logic.view().judge_bins.bins);
-    assert_eq!(play[GR_E], 2, "the LN's GREAT is early");
     assert_eq!(
         play,
         result_totals(&p.stream, &chart, None, Coverage::Recorded)
     );
+    assert_eq!(play[GR_E], 2, "the LN's GREAT is early");
 
     // Ended at 3 500 ms, the LN held.
     let mut p = Play::new(&chart, &rule, &dev, None, 1_024, t2_inputs(1, 1));
