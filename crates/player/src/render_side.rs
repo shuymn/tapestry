@@ -8539,6 +8539,17 @@ impl ResultSide {
     const fn shows(&self) -> bool {
         self.incoming.is_some() || self.prepared.is_some() || self.presented.is_some()
     }
+
+    /// Prints the lifetime's book (dev-tools: a scenario run's runtime
+    /// notes).
+    #[cfg(feature = "dev-tools")]
+    fn print_notes(&self) {
+        print_lines(
+            &self
+                .notes
+                .lines(&format!("result lifetime {}", self.lifetime)),
+        );
+    }
 }
 
 /// Prints a book's lines to stdout (dev-tools: a scenario run's runtime
@@ -8632,11 +8643,7 @@ impl Run {
         // the selection generation. Each ended one was listed at its end.
         list_ended_notes(&self.scripts);
         if let Some(side) = &self.result {
-            print_lines(
-                &side
-                    .notes
-                    .lines(&format!("result lifetime {}", side.lifetime)),
-            );
+            side.print_notes();
         }
         if let Some((owner, book)) = self.scripts.take_live_notes() {
             print_lines(&crate::screens::note_lines(&owner, &book));
@@ -8652,11 +8659,7 @@ impl Run {
                 .report("result", self.clock.frequency().hz());
             self.frames_view = None;
             if let Some(side) = &self.result {
-                print_lines(
-                    &side
-                        .notes
-                        .lines(&format!("result lifetime {}", side.lifetime)),
-                );
+                side.print_notes();
             }
         }
         if let Some(side) = self.result.take()
