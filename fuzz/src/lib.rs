@@ -2484,6 +2484,10 @@ fn check_lua(usage: &LuaUsage, dependencies: &[String]) {
         usage.requires + usage.dofiles,
         "loads miscounted"
     );
+    assert!(
+        usage.missing_loads <= usage.dofiles,
+        "absent loads miscounted"
+    );
     assert!(usage.input_bytes <= MAX_INPUT_BYTES, "input over the cap");
     assert!(
         usage.ast_nodes <= MAX_AST_NODES,

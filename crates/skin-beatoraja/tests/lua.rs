@@ -1115,7 +1115,7 @@ fn loaders_refuse_names_outside_the_skin_folder() {
         ("dofile(\"m.lua:stream\")", RootError::Rejected),
         ("dofile(\"parts/*.lua\")", RootError::Rejected),
         ("pcall(dofile, \"../x.lua\")", RootError::Underflow),
-        ("pcall(dofile, \"missing.lua\")", RootError::Missing),
+        ("dofile(\"missing.lua\")", RootError::Missing),
         ("require(\"..x\")", RootError::Rejected),
         ("require(\"a/b\")", RootError::Rejected),
         ("pcall(require, \"c:x\")", RootError::Rejected),
@@ -2560,4 +2560,222 @@ fn offset_tables_are_fresh() {
     )]);
     let h = header(&d).unwrap();
     common::lua_play(&h, &offsets_configured(&h), &Cancel::new()).unwrap();
+}
+
+/// The x of each drawn quad of `r`'s skin at 0 ms, sorted.
+#[track_caller]
+fn drawn_xs(r: LuaImported) -> Vec<i32> {
+    let mut xs: Vec<i32> = common::play::Drawn::new(r.imported.skin, 10)
+        .rects(0)
+        .iter()
+        .map(|q| q[0])
+        .collect();
+    xs.sort_unstable();
+    xs
+}
+
+/// A `dofile` whose name leads to no file inside the skin folder raises
+/// an ordinary Lua error, `cannot open <name>`, which a protected call
+/// catches, and the skin goes on without that part: a judge sidecar the
+/// chosen image does not have, a part under a folder choice whose
+/// chosen candidate is a file (the path runs through it), and a folder.
+/// The control configuration finds both parts; each import has its own
+/// counts.
+#[test]
+fn a_protected_probe_of_an_absent_part_goes_on_without_it() {
+    let d = folder(&[
+        (
+            "s.luaskin",
+            &skin(
+                "filepath = {\n\
+                   { name = \"Judge\", path = \"custom/judge/*.png\", def = \"a\" },\n\
+                   { name = \"FC\", path = \"custom/fc/*\", def = \"d\" },\n\
+                 },",
+                "local cannot = function(e) return type(e) == \"string\" and string.sub(e, 1, 12) == \"cannot open \" end\n\
+                 local judge = string.match(skin_config.get_path(\"custom/judge/\" .. skin_config.file_path.Judge), \"(.+)%.png$\") .. \".lua\"\n\
+                 local ok, s = pcall(dofile, judge)\n\
+                 local x = 23\n\
+                 if ok then x = s.offset_x else assert(cannot(s), \"judge message\") end\n\
+                 local ok2, fc = pcall(function() return dofile(skin_config.get_path(\"custom/fc/*\") .. \"/fc.lua\").load() end)\n\
+                 if not ok2 then assert(cannot(fc), \"fc message\") end\n\
+                 local ok3, e3 = pcall(dofile, \"custom\")\n\
+                 assert(not ok3 and cannot(e3), \"folder\")\n\
+                 skin.destination = { { id = \"i\", dst = { { x = x, y = 0, w = 64, h = 64 } } } }\n\
+                 if ok2 then table.insert(skin.destination, { id = \"i\", dst = { { x = fc.x, y = 100, w = 64, h = 64 } } }) end",
+            ),
+        ),
+        ("custom/judge/a.png", ""),
+        ("custom/judge/a.lua", "return { offset_x = 7 }"),
+        ("custom/judge/b.png", ""),
+        (
+            "custom/fc/d/fc.lua",
+            "return { load = function() return { x = 300 } end }",
+        ),
+        (
+            "custom/fc/fc.lua",
+            "return { load = function() return { x = 300 } end }",
+        ),
+    ]);
+    let h = header(&d).unwrap();
+    let configured = |judge: &str, fc: &str| {
+        let mut config = Config::defaults(h.header());
+        config.files.insert("Judge".into(), judge.into());
+        config.files.insert("FC".into(), fc.into());
+        common::lua_play(&h, &config, &Cancel::new())
+    };
+    let r = configured("b.png", "fc.lua");
+    assert!(r.is_ok(), "{r:?}");
+    let r = r.unwrap();
+    assert_eq!((r.usage.missing_loads, r.usage.dofiles), (3, 3));
+    assert_eq!(drawn_xs(r), [23]);
+    let control = configured("a.png", "d").unwrap();
+    assert_eq!((control.usage.missing_loads, control.usage.dofiles), (1, 3));
+    assert_eq!(drawn_xs(control), [7, 300]);
+}
+
+/// An absent `dofile` that no protected call catches refuses the skin
+/// as the read it is, named and located at its call; inside a part, at
+/// the part's call, which the entry's protected call does not catch. A
+/// part that is found and then fails refuses too, its changes to the
+/// globals never left behind a protected call; an absent load's error
+/// raised again as another value is the skin's own error.
+// Covers: T09
+#[test]
+fn an_unprotected_absent_part_refuses_at_its_call() {
+    let read_at = |r: Result<LuaImported, ImportError>| match r {
+        Err(ImportError::Read {
+            at: Some(at),
+            name,
+            source,
+        }) => (at.file, at.line, name, format!("{source:?}")),
+        other => panic!("{other:?}"),
+    };
+    let entry = |body: &str, files: &[(&str, &str)]| {
+        let mut all = vec![("s.luaskin", skin("", &format!("{body}\n{DRAW_I}")))];
+        all.extend(files.iter().map(|&(n, t)| (n, t.to_owned())));
+        let all: Vec<(&str, &str)> = all.iter().map(|(n, t)| (*n, t.as_str())).collect();
+        import(&folder(&all))
+    };
+    assert_eq!(
+        read_at(entry("dofile(\"parts/none.lua\")", &[])),
+        (
+            "s.luaskin".to_owned(),
+            5,
+            "parts/none.lua".to_owned(),
+            "Missing".to_owned()
+        )
+    );
+    assert_eq!(
+        read_at(entry(
+            "local ok = pcall(dofile, \"a.lua\")",
+            &[(
+                "a.lua",
+                "local x = 1\nlocal y = 2\ndofile(\"none.lua\")\nreturn {}"
+            )]
+        )),
+        (
+            "a.lua".to_owned(),
+            3,
+            "none.lua".to_owned(),
+            "Missing".to_owned()
+        )
+    );
+    let r = entry(
+        "local ok = pcall(dofile, \"bad.lua\")\nassert(false, \"resumed\")",
+        &[("bad.lua", "leaked = 1\nerror(\"x\")")],
+    );
+    assert_eq!(located(r), (LuaWhy::Error, "bad.lua".to_owned(), 2));
+    let r = entry(
+        "local ok, e = pcall(dofile, \"none.lua\")\nerror(e .. \"!\", 0)",
+        &[],
+    );
+    assert_eq!(located(r), (LuaWhy::Error, "s.luaskin".to_owned(), 6));
+}
+
+/// A protected probe learns nothing outside the skin folder: under a
+/// link leading out, at the top or below two folders, every name refuses
+/// with the same located `Escapes` whatever lies outside (a way back
+/// in, an absent entry, a dangling child, a file); a link spelled inward
+/// whose own resolution crosses the outward one refuses too; an
+/// unresolved inward link and a target asking for a child under a file
+/// are `Dangling`; only names inside the folder are caught as absent.
+// Covers: T09
+#[test]
+fn a_protected_probe_learns_nothing_outside_the_folder() {
+    let ext = tempfile::tempdir().unwrap();
+    std::fs::write(ext.path().join("x.lua"), "return {}").unwrap();
+    let make = || {
+        let d = folder(&[("real/x.lua", "return { v = 1 }"), ("a/b/keep", "")]);
+        let p = d.path();
+        common::link_dir(&p.join("out"), ext.path());
+        common::link_dir(&p.join("a").join("b").join("out"), ext.path());
+        common::link_dir(&p.join("gone"), &p.join("nothing"));
+        common::link_dir(&p.join("return"), &p.join("out").join("back"));
+        common::link_dir(
+            &p.join("badtarget"),
+            &p.join("real").join("x.lua").join("child"),
+        );
+        d
+    };
+    let probe = |d: &TempDir, name: &str| {
+        common::write(
+            d.path(),
+            "s.luaskin",
+            format!(
+                "{REP}{}",
+                skin(
+                    "",
+                    &format!("local ok = pcall(dofile, \"{name}\")\n{DRAW_I}")
+                )
+            )
+            .as_bytes(),
+        );
+        import(d)
+    };
+    let refusal = |r: Result<LuaImported, ImportError>| match r {
+        Err(ImportError::Read {
+            at: Some(at),
+            source,
+            ..
+        }) => (at.file, at.line, format!("{source:?}")),
+        other => panic!("{other:?}"),
+    };
+    let escapes = ("s.luaskin".to_owned(), 5, "Escapes".to_owned());
+    for back in [false, true] {
+        let d = make();
+        if back {
+            common::link_dir(&ext.path().join("back"), &d.path().join("real"));
+            common::link_dir(&ext.path().join("gone"), &ext.path().join("nothing"));
+        }
+        for top in ["", "a/b/"] {
+            for rest in [
+                "out/back/x.lua",
+                "out/back/none.lua",
+                "out/absent/none.lua",
+                "out/gone/none.lua",
+                "out/x.lua",
+                "out/none.lua",
+            ] {
+                let name = format!("{top}{rest}");
+                assert_eq!(refusal(probe(&d, &name)), escapes, "{name} back {back}");
+            }
+        }
+        assert_eq!(refusal(probe(&d, "return/x.lua")), escapes, "back {back}");
+        for name in ["gone/x.lua", "badtarget/x.lua"] {
+            assert_eq!(
+                refusal(probe(&d, name)),
+                ("s.luaskin".to_owned(), 5, "Dangling".to_owned()),
+                "{name}"
+            );
+        }
+        for name in ["none.lua", "real/x.lua/child", "real/none.lua"] {
+            let r = probe(&d, name);
+            assert!(r.is_ok(), "{name}: {r:?}");
+            assert_eq!(r.unwrap().usage.missing_loads, 1, "{name}");
+        }
+        if back {
+            std::fs::remove_dir(ext.path().join("back")).unwrap();
+            std::fs::remove_dir(ext.path().join("gone")).unwrap();
+        }
+    }
 }

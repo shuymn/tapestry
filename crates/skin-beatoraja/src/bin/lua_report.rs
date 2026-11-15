@@ -330,7 +330,7 @@ fn report(index: usize, survey: &Survey) -> String {
     }
     let u = survey.usage;
     line(&format!(
-        "  usage: instructions {} host calls {} native work {} loads {} (require {}, dofile {}) \
+        "  usage: instructions {} host calls {} native work {} loads {} (require {}, dofile {} (absent {})) \
          input bytes {} protected calls {} metatables {} peak memory {} \
          ast nodes {} captures {} expanded {}",
         u.instructions,
@@ -339,6 +339,7 @@ fn report(index: usize, survey: &Survey) -> String {
         u.loads,
         u.requires,
         u.dofiles,
+        u.missing_loads,
         u.input_bytes,
         u.protected_calls,
         u.metatables,

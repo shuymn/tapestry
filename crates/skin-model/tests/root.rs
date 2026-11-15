@@ -248,3 +248,117 @@ fn a_fifo_is_refused_without_opening_it() {
         Err(mpsc::RecvTimeoutError::Disconnected) => panic!("the reading thread panicked"),
     }
 }
+
+/// What reading `name` gave: the bytes, or the refusal's variant.
+fn outcome(root: &Root, name: &str) -> Result<Vec<u8>, String> {
+    root.read(name, 64)
+        .map(|(bytes, _)| bytes)
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// A name is walked from the folder one component at a time, each link
+/// judged by its own target before anything below it is looked at
+/// (design.md "Threat Model" T08). An outward link refuses its name
+/// whatever lies beyond it: a way back inside, an absent entry, a
+/// dangling child outside, or nothing, also below nested folders; an
+/// inward link is followed; an unresolved one (missing target, a target
+/// asking for a child under a file, a chain over the hop cap, a loop)
+/// is `Dangling`; a name is `Missing` only when its own components run
+/// into an absent entry or a file.
+// Covers: T08
+#[test]
+fn a_name_is_walked_from_the_folder_and_stops_at_an_outward_link() {
+    let outer = dir();
+    let skin = outer.path().join("skin");
+    let ext = outer.path().join("ext");
+    write(&skin, "real/x.lua", b"inside");
+    fs::create_dir_all(skin.join("a/b")).unwrap();
+    write(&ext, "x.lua", b"outside");
+    // O and N: outward links, at the top and below two real folders; the
+    // outside holds a way back in and a dangling child (D).
+    link_dir(&skin.join("out"), &ext);
+    link_dir(&skin.join("a").join("b").join("out"), &ext);
+    link_dir(&ext.join("back"), &skin.join("real"));
+    link_dir(&ext.join("gone"), &ext.join("nothing"));
+    // I, ID, R, F.
+    link_dir(&skin.join("in"), &skin.join("real"));
+    link_dir(&skin.join("gone"), &skin.join("nothing"));
+    link_dir(&skin.join("return"), &skin.join("out").join("back"));
+    link_dir(
+        &skin.join("badtarget"),
+        &skin.join("real").join("x.lua").join("child"),
+    );
+    link_dir(&skin.join("tofile"), &skin.join("real").join("x.lua"));
+    // L: 32 links in a chain, 33, a self-loop and a two-link loop.
+    for (prefix, n) in [("c", 32), ("d", 33)] {
+        for i in 0..n {
+            let target = if i + 1 == n {
+                skin.join("real")
+            } else {
+                skin.join(format!("{prefix}{}", i + 1))
+            };
+            link_dir(&skin.join(format!("{prefix}{i}")), &target);
+        }
+    }
+    link_dir(&skin.join("self"), &skin.join("self"));
+    link_dir(&skin.join("p"), &skin.join("q"));
+    link_dir(&skin.join("q"), &skin.join("p"));
+    let root = Root::new(&skin).unwrap();
+    let err = |e: &str| Err::<Vec<u8>, String>(e.to_owned());
+
+    for top in ["", "a/b/"] {
+        for rest in [
+            "out/back/x.lua",
+            "out/back/none.lua",
+            "out/absent/none.lua",
+            "out/gone/none.lua",
+            "out/x.lua",
+            "out/none.lua",
+        ] {
+            let name = format!("{top}{rest}");
+            assert_eq!(outcome(&root, &name), err("Escapes"), "{name}");
+        }
+    }
+    assert_eq!(outcome(&root, "return/x.lua"), err("Escapes"));
+    assert_eq!(outcome(&root, "in/x.lua"), Ok(b"inside".to_vec()));
+    assert_eq!(
+        root.read("in/x.lua", 64).unwrap().1,
+        root.read("real/x.lua", 64).unwrap().1
+    );
+    assert_eq!(outcome(&root, "in/none.lua"), err("Missing"));
+    assert_eq!(outcome(&root, "gone/x.lua"), err("Dangling"));
+    assert_eq!(outcome(&root, "badtarget/x.lua"), err("Dangling"));
+    assert_eq!(outcome(&root, "tofile/child"), err("Missing"));
+    assert_eq!(outcome(&root, "tofile"), Ok(b"inside".to_vec()));
+    assert_eq!(outcome(&root, "real/x.lua/child"), err("Missing"));
+    assert_eq!(outcome(&root, "a/none/x.lua"), err("Missing"));
+    assert_eq!(outcome(&root, "c0/x.lua"), Ok(b"inside".to_vec()));
+    assert_eq!(outcome(&root, "d0/x.lua"), err("Dangling"));
+    assert_eq!(outcome(&root, "self/x.lua"), err("Dangling"));
+    assert_eq!(outcome(&root, "p/x.lua"), err("Dangling"));
+    #[cfg(windows)]
+    assert_eq!(outcome(&root, "OUT/none.lua"), err("Escapes"));
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("../real", skin.join("a/rel")).unwrap();
+        assert_eq!(outcome(&root, "a/rel/x.lua"), Ok(b"inside".to_vec()));
+    }
+
+    let names: Vec<String> = root
+        .list("", 1_000)
+        .unwrap()
+        .entries
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    let has = |n: &str| names.iter().any(|e| e == n);
+    assert!(!has("return"), "{names:?}");
+    for skipped in ["out", "gone", "badtarget", "d0", "self", "p", "q"] {
+        assert!(!has(skipped), "{skipped}: {names:?}");
+    }
+    for kept in ["in", "c0", "real", "a"] {
+        assert!(has(kept), "{kept}: {names:?}");
+    }
+    assert!(matches!(root.list("out/back", 16), Err(RootError::Escapes)));
+    assert!(matches!(root.list("a/b/out", 16), Err(RootError::Escapes)));
+}

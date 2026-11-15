@@ -11,10 +11,14 @@
 //! Image and font names may not contain `..` at all. A [`Root`] serves a
 //! skin definition's reader: its names may step up with `..` as long as
 //! they stay inside the folder, and its reads and listings are bounded by
-//! the caller.
+//! the caller. A [`Root`] name is walked from the folder one component at
+//! a time, each link judged by its own target before anything below it
+//! is looked at (design.md "Threat Model" T08), so whether a name is
+//! missing never depends on anything outside the folder.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
+use std::collections::VecDeque;
 use std::fs::{self, File};
 use std::hash::{Hash, Hasher};
 use std::io::{self, Read as _};
@@ -126,6 +130,12 @@ pub enum RootError {
     Missing,
     #[error("the name resolves outside the skin folder")]
     Escapes,
+    #[error(
+        "a link on the path leads nowhere inside the skin folder (its target is missing, \
+         asks for a child under a file or is too long, or more than {MAX_LINK_HOPS} links \
+         chain)"
+    )]
+    Dangling,
     #[error("not a regular file")]
     NotAFile,
     #[error("not a folder")]
@@ -148,7 +158,83 @@ pub enum RootError {
 #[derive(Clone, Debug)]
 pub struct Root {
     dir: PathBuf,
+    /// The folder as it was named, made absolute without resolving
+    /// links: a link inside may spell its target this way.
+    as_given: PathBuf,
     source: FileSource,
+}
+
+/// The most links one [`Root`] name's walk expands, a loop included: a
+/// provisional engineering limit, not a measured one (an acyclic chain
+/// of more is refused too).
+pub const MAX_LINK_HOPS: u32 = 32;
+
+/// Where a component a walk has queued came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum From {
+    /// The name the caller asked for.
+    Name,
+    /// A link's target.
+    Link,
+}
+
+/// Whether `e` says an entry is not there: none at that name, or a
+/// component on the way is not a folder.
+fn absent(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::NotFound | io::ErrorKind::NotADirectory
+    )
+}
+
+/// An absolute path split lexically into its anchor (a drive `C:`, a
+/// UNC share `\\server\share`, or `/`) and its normalised components, or
+/// `None` for a form a link's target may not take: a device, a volume
+/// GUID, a drive-relative or a driveless rooted path, or `..` above the
+/// anchor. A verbatim drive or UNC prefix reads as the plain one.
+fn anchored(path: &str) -> Option<(String, Vec<String>)> {
+    let sep = |c: char| c == '/' || c == '\\';
+    let (anchor, rest) = if cfg!(windows) {
+        let plain = if let Some(unc) = path.strip_prefix(r"\\?\UNC\") {
+            format!(r"\\{unc}")
+        } else if let Some(v) = path.strip_prefix(r"\\?\") {
+            v.to_owned()
+        } else if path.starts_with(r"\\.\") || path.starts_with(r"\??\") {
+            return None;
+        } else {
+            path.to_owned()
+        };
+        let bytes = plain.as_bytes();
+        if bytes.len() >= 3
+            && bytes.first().is_some_and(u8::is_ascii_alphabetic)
+            && bytes.get(1) == Some(&b':')
+            && bytes.get(2).is_some_and(|&b| b == b'/' || b == b'\\')
+        {
+            (plain.get(..2)?.to_owned(), plain.get(3..)?.to_owned())
+        } else {
+            let unc = plain.strip_prefix(r"\\").or(plain.strip_prefix("//"))?;
+            let mut parts = unc.splitn(3, sep);
+            let server = parts.next().filter(|s| !s.is_empty())?;
+            let share = parts.next().filter(|s| !s.is_empty())?;
+            (
+                format!(r"\\{server}\{share}"),
+                parts.next().unwrap_or("").to_owned(),
+            )
+        }
+    } else {
+        (String::from("/"), path.strip_prefix('/')?.to_owned())
+    };
+    let mut parts: Vec<String> = Vec::new();
+    for part in rest.split(sep) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop()?;
+            }
+            _ => parts.push(part.to_owned()),
+        }
+    }
+    Some((anchor, parts))
 }
 
 /// The identity of a file a [`Root`] read: equal for every name that
@@ -209,12 +295,14 @@ impl Root {
     /// [`RootError::Folder`] when `dir` cannot be canonicalised, and
     /// [`RootError::NotAFolder`] when it is not a folder.
     pub fn new(dir: &Path) -> Result<Self, RootError> {
+        let as_given = std::path::absolute(dir).map_err(RootError::Folder)?;
         let dir = dir.canonicalize().map_err(RootError::Folder)?;
         if !dir.is_dir() {
             return Err(RootError::NotAFolder);
         }
         Ok(Self {
             dir,
+            as_given,
             source: FileSource::disk(),
         })
     }
@@ -224,6 +312,7 @@ impl Root {
     pub fn with_source(&self, source: FileSource) -> Self {
         Self {
             dir: self.dir.clone(),
+            as_given: self.as_given.clone(),
             source,
         }
     }
@@ -271,19 +360,114 @@ impl Root {
     }
 
     /// The canonical path `name` leads to inside the folder, and the
-    /// normalised name ([`Root::normalise`]); then the canonical path,
-    /// links followed, must stay inside the folder.
+    /// normalised name ([`Root::normalise`]): the name walked from the
+    /// folder ([`Root::walk`]), then the path it reached canonicalised,
+    /// which must still lie inside the folder.
     fn locate(&self, name: &str) -> Result<(PathBuf, String), RootError> {
         let normal = Self::normalise(name)?;
-        let canonical = match self.dir.join(&normal).canonicalize() {
+        let reached = self.walk(&normal)?;
+        // The walk saw every entry; one gone now was removed meanwhile.
+        let canonical = match reached.canonicalize() {
             Ok(c) => c,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Err(RootError::Missing),
+            Err(e) if absent(&e) => return Err(RootError::Missing),
             Err(e) => return Err(RootError::Io(e)),
         };
         if !canonical.starts_with(&self.dir) {
             return Err(RootError::Escapes);
         }
         Ok((canonical, normal))
+    }
+
+    /// Walks the normalised name `normal` from the folder one component
+    /// at a time, and returns the path it reaches: inside the folder, with
+    /// no link on it. Each link met is judged by its own target, read and
+    /// never followed, before anything below it is looked at: a target
+    /// outside the folder ([`Root::inside`]) is [`RootError::Escapes`]
+    /// whatever lies beyond it, and an inward one is walked again from the
+    /// folder. An absent entry is [`RootError::Missing`] when it is the
+    /// name's own, and [`RootError::Dangling`] when a link's target asked
+    /// for it; a file with components left is a path through a file,
+    /// decided the same way by the next component's provenance. More than
+    /// [`MAX_LINK_HOPS`] links in one walk, one counter for the whole of
+    /// it, are [`RootError::Dangling`]: any loop ends so.
+    fn walk(&self, normal: &str) -> Result<PathBuf, RootError> {
+        let mut queue: VecDeque<(String, From)> = normal
+            .split('/')
+            .filter(|p| !p.is_empty())
+            .map(|p| (p.to_owned(), From::Name))
+            .collect();
+        let mut at = self.dir.clone();
+        let mut hops = 0;
+        while let Some((part, from)) = queue.pop_front() {
+            let next = at.join(&part);
+            let meta = match fs::symlink_metadata(&next) {
+                Ok(m) => m,
+                Err(e) if absent(&e) => {
+                    return Err(match from {
+                        From::Name => RootError::Missing,
+                        From::Link => RootError::Dangling,
+                    });
+                }
+                Err(e) => return Err(RootError::Io(e)),
+            };
+            if meta.file_type().is_symlink() {
+                hops += 1;
+                if hops > MAX_LINK_HOPS {
+                    return Err(RootError::Dangling);
+                }
+                let target = fs::read_link(&next).map_err(RootError::Io)?;
+                let rest = self.inside(&at, &target)?;
+                for p in rest.into_iter().rev() {
+                    queue.push_front((p, From::Link));
+                }
+                at.clone_from(&self.dir);
+            } else if meta.is_dir() {
+                at = next;
+            } else if let Some(&(_, after)) = queue.front() {
+                return Err(match after {
+                    From::Name => RootError::Missing,
+                    From::Link => RootError::Dangling,
+                });
+            } else {
+                at = next;
+            }
+        }
+        Ok(at)
+    }
+
+    /// The components below the folder that the link target `target`,
+    /// read in the folder `at`, names, compared lexically and exactly
+    /// with the folder's canonical path and the path it was opened by:
+    /// [`RootError::Escapes`] when it names neither or takes a form a
+    /// target may not ([`anchored`]), [`RootError::Dangling`] when it is
+    /// longer than [`MAX_PATH_BYTES`]. Nothing is looked up.
+    fn inside(&self, at: &Path, target: &Path) -> Result<Vec<String>, RootError> {
+        let target = target.to_str().ok_or(RootError::Escapes)?;
+        if target.len() > MAX_PATH_BYTES {
+            return Err(RootError::Dangling);
+        }
+        let relative = if cfg!(windows) {
+            let b = target.as_bytes();
+            !(target.starts_with(['/', '\\']) || b.get(1) == Some(&b':'))
+        } else {
+            !target.starts_with('/')
+        };
+        let full = if relative {
+            let base = at.to_str().ok_or(RootError::Escapes)?;
+            format!("{base}/{target}")
+        } else {
+            target.to_owned()
+        };
+        let (anchor, parts) = anchored(&full).ok_or(RootError::Escapes)?;
+        for root in [&self.dir, &self.as_given] {
+            let Some((root_anchor, root_parts)) = root.to_str().and_then(anchored) else {
+                continue;
+            };
+            if anchor == root_anchor && parts.starts_with(&root_parts) {
+                return Ok(parts.get(root_parts.len()..).unwrap_or(&[]).to_vec());
+            }
+        }
+        Err(RootError::Escapes)
     }
 
     /// Reads the regular file `name`, at most `max_bytes` long, and
@@ -354,10 +538,10 @@ impl Root {
     /// The first check that fails, [`RootError::TooManyEntries`] at entry
     /// `max_entries + 1`, or [`RootError::Io`].
     pub fn list(&self, dir: &str, max_entries: usize) -> Result<Listing, RootError> {
-        let canonical = if dir.is_empty() {
-            self.dir.clone()
+        let (canonical, normal) = if dir.is_empty() {
+            (self.dir.clone(), String::new())
         } else {
-            self.locate(dir)?.0
+            self.locate(dir)?
         };
         if !fs::metadata(&canonical).map_err(RootError::Io)?.is_dir() {
             return Err(RootError::NotAFolder);
@@ -375,8 +559,17 @@ impl Root {
             };
             let path = entry.path();
             let linked = entry.file_type().map_err(RootError::Io)?.is_symlink();
-            if linked && !path.canonicalize().is_ok_and(|c| c.starts_with(&self.dir)) {
-                continue;
+            // A link is kept only when its walk stays inside: one that
+            // leads out, nowhere, or out and back in is skipped.
+            if linked {
+                let named = if normal.is_empty() {
+                    name.clone()
+                } else {
+                    format!("{normal}/{name}")
+                };
+                if self.walk(&named).is_err() {
+                    continue;
+                }
             }
             let Ok(meta) = fs::metadata(&path) else {
                 continue;
