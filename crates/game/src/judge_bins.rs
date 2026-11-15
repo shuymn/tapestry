@@ -60,12 +60,6 @@ impl JudgeBins {
         self.revision = other.revision;
         self.available = other.available;
     }
-
-    /// Every bin's counts, available or not.
-    #[must_use]
-    pub const fn all(&self) -> &[[u32; JUDGE_CHANNELS]; NOTE_BINS] {
-        &self.bins
-    }
 }
 
 /// The channel of a judgment: PERFECT 0; GREAT to POOR 1 to 4 early and 5

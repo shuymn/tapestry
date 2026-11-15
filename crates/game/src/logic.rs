@@ -783,16 +783,9 @@ impl<'a, R: SourceRead> Logic<'a, R> {
     /// step evaluates. Allocates the per-note table, 2 bytes a chart
     /// object, counted in the reservation.
     pub fn bin_judgments(&mut self, chart: &Chart, profile: &ChartProfile) -> bool {
-        let available = match NoteBins::of(chart, profile) {
-            Some(bins) => {
-                self.note_bins = bins;
-                true
-            }
-            None => {
-                self.note_bins = NoteBins::default();
-                false
-            }
-        };
+        let bins = NoteBins::of(chart, profile);
+        let available = bins.is_some();
+        self.note_bins = bins.unwrap_or_default();
         self.judge_bins.available = available;
         self.judge_bins.revision += 1;
         self.publish_view();
