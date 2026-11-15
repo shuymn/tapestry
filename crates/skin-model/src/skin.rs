@@ -596,6 +596,9 @@ enum Phase<'a> {
         shown: usize,
         /// The view's judgment offsets, which the visualizers draw.
         offsets: crate::play::Offsets<'a>,
+        /// The view's judgments by bin, which the judgment graphs draw;
+        /// `None` while unavailable.
+        judgments: Option<&'a [[u32; crate::result::view::TIMELINE_CHANNELS]]>,
     },
     /// The loading runtime: no chart, the gauge from the frame's
     /// descriptor, if any, and the chosen chart's data the frame gives
@@ -1155,6 +1158,7 @@ fn worst(
     sel: &SelectionDefs,
     res: &ResultDefs,
     play: &PlayDefs,
+    on_play: bool,
 ) -> u32 {
     match e.source {
         Source::BpmGraph(i) => play
@@ -1182,10 +1186,11 @@ fn worst(
             .map_or(0, |n| u32::from(n.digits.cells)),
         Source::Gauge(i) => w.gauges.get(index(i)).map_or(0, GaugeDef::quads),
         Source::Judge(i) => w.judges.get(index(i)).map_or(0, JudgeDef::quads),
+        // On play every judge graph draws the cursors.
         Source::JudgeGraph(i) => res
             .judge_graphs
             .get(index(i))
-            .map_or(0, JudgeGraphDef::quads),
+            .map_or(0, |g| if on_play { g.play_quads() } else { g.quads() }),
         Source::GaugeGraph(i) => res
             .gauge_graphs
             .get(index(i))
@@ -1210,8 +1215,12 @@ fn bpm_size(e: &ElementDef) -> [u32; 2] {
 /// What a play prepares for its graph and visualizer elements, by slot.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct GraphPlan {
-    /// Whether an element draws a notes graph.
+    /// Whether an element draws a judge graph: the notes graph's bins and
+    /// cursors are prepared.
     pub(crate) notes: bool,
+    /// Whether an element draws a judgment or early/late graph: each
+    /// bin's judgeable notes are counted.
+    pub(crate) judgments: bool,
     /// Each BPM graph element's graph and pixmap size.
     pub(crate) bpm: Box<[(BpmGraphDef, [u32; 2])]>,
     pub(crate) timing: Box<[TimingVisualizerDef]>,
@@ -1575,8 +1584,8 @@ fn check_kind(
     res: &ResultDefs,
 ) -> Result<(), LoadError> {
     // Whether a judge graph element's graph is a notes graph, `None` for an
-    // unknown graph: a play skin draws only notes graphs, a result skin
-    // none.
+    // unknown graph: a selection skin draws only notes graphs, a result
+    // skin none, a play skin any.
     let notes = |i: u32| {
         res.judge_graphs
             .get(index(i))
@@ -1648,7 +1657,8 @@ fn check_kind(
             },
             ScreenKind::Play => match e.source {
                 Source::RatioBar(i) => score(i) == Some(true),
-                Source::JudgeGraph(i) => notes(i) == Some(true),
+                // Every kind: the notes graph and the judgment graphs.
+                Source::JudgeGraph(i) => notes(i).is_some(),
                 Source::ChartImage { which, .. } => which != ChartImage::Banner,
                 _ => {
                     !selection_text(def, e.source)
@@ -2449,9 +2459,9 @@ impl Skin {
                 }
             }
         }
-        let widget_quads = elements
-            .iter()
-            .fold(0_u64, |n, e| n + u64::from(worst(e, w, &sel, &res, &play)));
+        let widget_quads = elements.iter().fold(0_u64, |n, e| {
+            n + u64::from(worst(e, w, &sel, &res, &play, kind == ScreenKind::Play))
+        });
         if widget_quads > u64::from(MAX_WIDGET_QUADS) {
             return Err(LoadError::TooManyWidgetQuads { n: widget_quads });
         }
@@ -2626,7 +2636,12 @@ impl Skin {
         let mut hit_plan = Vec::new();
         for e in &def.elements {
             match e.source {
-                Source::JudgeGraph(_) if kind == ScreenKind::Play => plan.notes = true,
+                Source::JudgeGraph(i) if kind == ScreenKind::Play => {
+                    plan.notes = true;
+                    plan.judgments |= judge_graphs
+                        .get(index(i))
+                        .is_some_and(|g| g.def.kind != JudgeGraphKind::Notes);
+                }
                 Source::BpmGraph(i) => {
                     if let Some(&g) = play.bpm_graphs.get(index(i)) {
                         bpm_plan.push((g, bpm_size(e)));
@@ -3637,6 +3652,7 @@ impl Skin {
                 gauges: frame.gauges,
                 shown: frame.gauge,
                 offsets: frame.offsets,
+                judgments: frame.judgments,
             },
         };
         self.draw(&rt, &scene, bars.as_mut(), uvs, &canvas, &placement, out);
@@ -5176,11 +5192,25 @@ impl Skin {
                     }
                 }
                 Kind::JudgeGraph(i) => {
+                    let notes = self
+                        .judge_graphs
+                        .get(i)
+                        .is_some_and(|g| g.def.kind == JudgeGraphKind::Notes);
                     let data = match scene.phase {
                         Phase::Result { res } => Some(GraphData::Timelines(res.timelines())),
-                        Phase::Play { play, .. } => play
+                        Phase::Play { play, .. } if notes => play
                             .notes_graph(now)
                             .map(|(bins, cursors)| GraphData::Notes { bins, cursors }),
+                        // Nothing while the view's bins are unavailable.
+                        Phase::Play {
+                            play, judgments, ..
+                        } => judgments.zip(play.judgment_graph(now)).map(
+                            |(bins, (notes, cursors))| GraphData::Live {
+                                bins,
+                                notes,
+                                cursors,
+                            },
+                        ),
                         Phase::Selection { sel, .. } => sel
                             .notes_graph()
                             .map(|(bins, cursors)| GraphData::Notes { bins, cursors }),
