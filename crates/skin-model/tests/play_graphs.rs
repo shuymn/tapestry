@@ -1416,6 +1416,84 @@ fn the_judgment_graphs_draw_the_cursors() {
     fx.is(70.0, cell30(0.0), rgb(0x55_5555));
 }
 
+/// C38, G25, G26: practice at ×1.5 over the 1× section 2.1 to 3.0 s
+/// (play time 1.4 to 2.0 s). Each round prepares its own play, as every
+/// attempt does, and draws its own view. Round 1 at play time 1.8 s (1×
+/// 2.7 s): bin 2 holds 10 grey, 10 PERFECT and 3 GREAT, bin 1's three
+/// notes outside the section stay grey, and the play cursor covers x 162 to
+/// 198 at 1× (not 108 to 144 at play time). Round 2's READY draws bin 2
+/// all grey, round 1's judgments gone, and then its own: 18 grey and 5
+/// POOR. The section's lines are at 1×: green x 126 to 162, red 180 to
+/// 216.
+#[test]
+fn each_practice_round_draws_its_own_judgments_at_its_speed() {
+    let chart = judged_chart();
+    let profile = ChartProfile::of(&chart, &[]);
+    let section = Section {
+        start: TimeUs(1_400 * MS),
+        end: TimeUs(2_000 * MS),
+        lead_in: TimeUs(1_000 * MS),
+        initial_gauges: GAUGES.iter().map(|g| g.start).collect(),
+    };
+    let practice = PlayContext {
+        attempt: Attempt::Section(&section),
+        score: PlayScore {
+            profile: Some(&profile),
+            speed: Speed::from_twentieths(30).unwrap(),
+            ..PlayScore::NONE
+        },
+        ..full(1_000)
+    };
+    let round = || {
+        let s = skin(
+            vec![el(Source::JudgeGraph(0), [0, 0, 300, 100])],
+            PlayDefs {
+                judge_graphs: vec![judgment_graph(JudgeGraphKind::Judgment, false, 0)],
+                ..PlayDefs::default()
+            },
+        );
+        Fx::new(s, &chart, &practice)
+    };
+    let (grey, pg, gr, pr) = (
+        rgb(0x55_5555),
+        rgb(0x00_88ff),
+        rgb(0x00_ff88),
+        rgb(0xff_0000),
+    );
+    let white = rgb(0xff_ffff);
+    // Bin 2 (x 120 to 180) left of the green line; bin 1 (60 to 120).
+    let x = 123.0;
+    let mut one = round();
+    one.h.judgments = Some(bins(&[(2, [10, 3, 0, 0, 0, 0, 0, 0, 0])]));
+    one.frame(1_800);
+    one.is(x, cell30(9.0), grey);
+    one.is(x, cell30(10.0), pg);
+    one.is(x, cell30(19.0), pg);
+    one.is(x, cell30(20.0), gr);
+    one.is(x, cell30(22.0), gr);
+    one.is(90.0, cell30(2.0), grey);
+    one.is(190.0, 5.0, white);
+    // Not at play time (x 108 to 144).
+    one.empty(110.0, 5.0);
+    one.is(130.0, 5.0, rgb(0x80_ff80));
+    one.is(214.0, 5.0, rgb(0xff_8080));
+
+    let mut two = round();
+    two.h.judgments = Some(bins(&[]));
+    two.frame(-500);
+    for k in [0.0, 10.0, 20.0, 22.0] {
+        two.is(x, cell30(k), grey);
+    }
+    two.empty(x, cell30(23.0));
+    two.h.judgments = Some(bins(&[(2, [0, 0, 0, 0, 0, 0, 0, 0, 5])]));
+    two.frame(1_600);
+    two.is(x, cell30(10.0), grey);
+    two.is(x, cell30(17.0), grey);
+    two.is(x, cell30(18.0), pr);
+    two.is(x, cell30(22.0), pr);
+    two.is(90.0, cell30(2.0), grey);
+}
+
 /// C36: a widened bin sums its seconds' notes: from 511 s the bins are
 /// 2 s wide, and the notes at 510 and 511 s are bin 255's two (the fullest
 /// second would give one): with one judged, grey then PERFECT.
