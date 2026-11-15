@@ -13,9 +13,9 @@
 //!   [`ImportFacts::autoplay`] on [`ScreenKind::Play`], a constant `false` on
 //!   every other scene, as the source's are off the play state;
 //! - 180 to 184, the chart's judgment class (`:448-452`): the snapshot's
-//!   [`ImportFacts::judge_class`], the class the source computes from the
-//!   chart's own rank ([`JudgeClass::of_headers`]), whatever the play
-//!   preset judges with, as `chart.judge_class` gives it at frame time;
+//!   [`ImportFacts::judge_class`], the class of the chart's own rank
+//!   ([`JudgeClass::of_headers`]), whatever the play preset judges with,
+//!   as `chart.judge_class` gives it at frame time;
 //! - 290, course mode (`:523-524`): a constant `false`, as there are no
 //!   courses;
 //! - 1008, `table_song` (`:351-352`): a constant `false`, as there are no
@@ -80,8 +80,8 @@ pub enum JudgeClass {
 /// (`play/JudgeProperty.java:210`, `JudgeWindowRule.NORMAL`'s
 /// `judgerank[r][1]`); `#RANK 2`'s is also the `#DEFEXRANK` multiplier
 /// and the rank of a chart with neither header.
-const RANK_RATES: [i32; 5] = [25, 50, 75, 100, 125];
-const RANK_2_RATE: i32 = 75;
+const RANK_RATES: [i64; 5] = [25, 50, 75, 100, 125];
+const RANK_2_RATE: i64 = 75;
 
 /// The option id of [`JudgeClass::VeryHard`]; the others follow it.
 const JUDGE_CLASS_FIRST: i32 = 180;
@@ -98,68 +98,55 @@ impl JudgeClass {
         Self::VeryEasy,
     ];
 
-    /// The class the reference's skin shows for a chart whose judgment
-    /// headers are `headers` (in file order), from the chart alone,
-    /// whatever the play preset: the song data's judge rank
-    /// (`BooleanPropertyFactory.java:448-452`) as beatoraja's `0.8.9` tag
-    /// computes it.
+    /// The class a skin shows for a chart whose judgment headers are
+    /// `headers` (in file order), from the chart alone, whatever the play
+    /// preset: [`of_rank`](Self::of_rank) of the rank the beatoraja-style
+    /// header policy ([`HeaderPolicy::DefExRankFirst`]) reads, the policy
+    /// the library stores each chart's rank with, so a parse of these
+    /// headers and a library entry of the same rank give the same class.
+    #[must_use]
+    pub fn of_headers(headers: &[JudgmentHeader]) -> Option<Self> {
+        Self::of_rank(HeaderPolicy::DefExRankFirst.read(headers).rank)
+    }
+
+    /// The class of a chart of rank `rank` (the beatoraja-style header
+    /// policy's reading, `None` for no rank header), by the rule every
+    /// screen uses: the song data's judge rank
+    /// (`BooleanPropertyFactory.java:448-452`) after one 7-key validation.
     ///
-    /// - The rank read is the beatoraja-style header policy's
-    ///   ([`HeaderPolicy::DefExRankFirst`]), the reference decoder's rules
-    ///   read as numbers (design.md "Rule Presets"), whatever policy the
-    ///   play preset judges with. None read is `#RANK 2`.
-    /// - The rule's validation (`play/BMSPlayerRule.java:59-66`) makes it a
-    ///   percentage `j`: `#RANK r` is 25, 50, 75, 100 or 125; `#DEFEXRANK
-    ///   n` (its whole part) is `n * 75 / 100` in `i32` arithmetic, which
-    ///   wraps past `i32` and truncates toward 0. Validation runs again
-    ///   when the song data takes the chart (`song/SongData.java:149`), and
-    ///   there a `j` of 0 or less becomes 100. A whole part past `i32`,
-    ///   which the reference cannot hold, is computed without wrapping.
+    /// - The validation (`play/BMSPlayerRule.java:59-66`) makes the rank a
+    ///   percentage `j`: `#RANK r` is 25, 50, 75, 100 or 125, none is
+    ///   `#RANK 2`, and `#DEFEXRANK n` (its whole part) is `n * 75 / 100`
+    ///   in plain integer arithmetic, truncated toward 0.
     /// - The bands: `j == 0 || 10 <= j < 35` very hard, `j == 1 || 35 <= j
     ///   < 60` hard, `j == 2 || 60 <= j < 85` normal, `j == 3 || 85 <= j <
     ///   110` easy, `j == 4 || j >= 110` very easy; `None` for a `j` in no
     ///   band (5 to 9, from `#DEFEXRANK 7` to `13`).
     ///
-    /// So `#DEFEXRANK 120` is easy (90), `#DEFEXRANK 1` easy (0, then 100)
-    /// and `#DEFEXRANK 2` hard (1).
+    /// So `#DEFEXRANK 120` is easy (90), `#DEFEXRANK 2` hard (1) and
+    /// `#DEFEXRANK 1` very hard (0). The source validates its chart twice on
+    /// its play and result screens, and multiplies in `i32`; neither is
+    /// followed (design.md "Rendering and Skins", Differences from the
+    /// source, readouts).
     #[must_use]
-    pub fn of_headers(headers: &[JudgmentHeader]) -> Option<Self> {
-        let j = Self::percent(HeaderPolicy::DefExRankFirst.read(headers).rank);
-        Self::band(if j <= 0 { 100 } else { j })
-    }
-
-    /// The class a song list shows for a chart of rank `rank` (the
-    /// beatoraja-style header policy's reading, `None` for no rank
-    /// header): its percentage after one validation, as the reference's
-    /// song database computes it (`song/SQLiteSongDatabaseAccessor.java:
-    /// 866`, `song/SongData.java:150`), then the bands. Without the second
-    /// validation [`of_headers`](Self::of_headers) takes, every `j` of 0 or
-    /// less differs from it: 0 is very hard (`#DEFEXRANK 1`, and
-    /// `#DEFEXRANK 57266231`, whose product wraps to 29 and gives 0), and
-    /// below 0 (a product that wraps negative) is in no class.
-    #[must_use]
-    pub fn of_listed(rank: Option<JudgeRank>) -> Option<Self> {
+    pub fn of_rank(rank: Option<JudgeRank>) -> Option<Self> {
         Self::band(Self::percent(rank))
     }
 
-    /// The rule's validation of `rank` into a percentage `j`
+    /// The validation of `rank` into a percentage `j`
     /// (`play/BMSPlayerRule.java:59-66`): `#RANK r` is 25, 50, 75, 100 or
     /// 125, none is `#RANK 2`, and `#DEFEXRANK n` (its whole part) is
-    /// `n * 75 / 100` in `i32` arithmetic, wrapping, or computed without
-    /// wrapping past `i32`.
+    /// `n * 75 / 100`, exact: the policy's thousandths fit `i64`, so the
+    /// whole part times 75 does too.
     fn percent(rank: Option<JudgeRank>) -> i64 {
         match rank {
-            None => i64::from(RANK_2_RATE),
+            None => RANK_2_RATE,
             Some(JudgeRank::Rank(r)) => usize::try_from(r)
                 .ok()
                 .and_then(|i| RANK_RATES.get(i))
-                .map_or(i64::from(RANK_2_RATE), |&rate| i64::from(rate)),
+                .map_or(RANK_2_RATE, |&rate| rate),
             Some(JudgeRank::DefExRankMilli(m)) => {
-                let n = m.div_euclid(1_000);
-                match i32::try_from(n) {
-                    Ok(n) => i64::from(n.wrapping_mul(RANK_2_RATE) / 100),
-                    Err(_) => n.saturating_mul(i64::from(RANK_2_RATE)) / 100,
-                }
+                m.div_euclid(1_000).saturating_mul(RANK_2_RATE) / 100
             }
         }
     }
@@ -588,44 +575,49 @@ mod tests {
 }
 
 #[cfg(test)]
-mod listed_tests {
-    use rules::JudgeRank::{DefExRankMilli, Rank};
+mod rank_tests {
+    use bms_model::{HeaderValue, JudgmentHeader, JudgmentHeaderName};
+    use rules::JudgeRank::{self, DefExRankMilli, Rank};
 
-    use super::JudgeClass::{self, Easy, Normal, VeryEasy, VeryHard};
+    use super::JudgeClass::{self, Easy, Hard, Normal, VeryEasy, VeryHard};
 
-    /// The class a song list shows (one validation) and the one an
-    /// attempt shows (two): the same for every rank whose first pass is
-    /// above 0, and different for every one at or below it, which the
-    /// second pass makes 100 (easy): 0 is very hard listed (`#DEFEXRANK 1`,
-    /// and `#DEFEXRANK 57266231`, whose product wraps to 29 and gives 0),
-    /// and below 0 (a product that wraps negative) is in no class listed.
+    /// A chart's class takes one validation in plain arithmetic, the same
+    /// from a stored rank (a song list's) and from the chart's headers (an
+    /// attempt's): `#DEFEXRANK 1` is very hard (0), and a `#DEFEXRANK` whose
+    /// product passes `i32` keeps its value (30 000 000 is 22 500 000,
+    /// 57 266 231 is 42 949 673, 57 266 232 is 42 949 674: all very easy).
     #[test]
-    fn a_listed_class_takes_one_validation() {
-        let played = |r| {
-            let j = JudgeClass::percent(r);
-            JudgeClass::band(if j <= 0 { 100 } else { j })
+    fn a_class_takes_one_validation_in_plain_arithmetic() {
+        let header = |rank: Option<JudgeRank>| {
+            rank.map(|r| match r {
+                Rank(r) => JudgmentHeader {
+                    name: JudgmentHeaderName::Rank,
+                    value: HeaderValue::integer(i64::from(r)),
+                },
+                DefExRankMilli(m) => JudgmentHeader {
+                    name: JudgmentHeaderName::DefExRank,
+                    value: HeaderValue::integer(m / 1_000),
+                },
+            })
         };
-        for (rank, listed, twice) in [
-            (None, Some(Normal), Some(Normal)),
-            (Some(Rank(0)), Some(VeryHard), Some(VeryHard)),
-            (Some(Rank(3)), Some(Easy), Some(Easy)),
-            (Some(DefExRankMilli(1_000)), Some(VeryHard), Some(Easy)),
-            (
-                Some(DefExRankMilli(57_266_231_000)),
-                Some(VeryHard),
-                Some(Easy),
-            ),
-            (Some(DefExRankMilli(10_000)), None, None),
-            (Some(DefExRankMilli(120_000)), Some(Easy), Some(Easy)),
-            (Some(DefExRankMilli(30_000_000_000)), None, Some(Easy)),
-            (
-                Some(DefExRankMilli(3_000_000_000_000)),
-                Some(VeryEasy),
-                Some(VeryEasy),
-            ),
+        for (rank, class) in [
+            (None, Some(Normal)),
+            (Some(Rank(0)), Some(VeryHard)),
+            (Some(Rank(1)), Some(Hard)),
+            (Some(Rank(3)), Some(Easy)),
+            (Some(Rank(4)), Some(VeryEasy)),
+            (Some(DefExRankMilli(1_000)), Some(VeryHard)),
+            (Some(DefExRankMilli(2_000)), Some(Hard)),
+            (Some(DefExRankMilli(10_000)), None),
+            (Some(DefExRankMilli(120_000)), Some(Easy)),
+            (Some(DefExRankMilli(30_000_000_000)), Some(VeryEasy)),
+            (Some(DefExRankMilli(57_266_231_000)), Some(VeryEasy)),
+            (Some(DefExRankMilli(57_266_232_000)), Some(VeryEasy)),
+            (Some(DefExRankMilli(3_000_000_000_000)), Some(VeryEasy)),
         ] {
-            assert_eq!(JudgeClass::of_listed(rank), listed, "{rank:?}");
-            assert_eq!(played(rank), twice, "{rank:?}");
+            assert_eq!(JudgeClass::of_rank(rank), class, "{rank:?}");
+            let headers: Vec<JudgmentHeader> = header(rank).into_iter().collect();
+            assert_eq!(JudgeClass::of_headers(&headers), class, "{rank:?}");
         }
     }
 }
