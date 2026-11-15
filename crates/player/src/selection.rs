@@ -6910,6 +6910,7 @@ pub(crate) mod tests {
                 },
                 ..Default::default()
             }),
+            progress: None,
             clear: true,
             ineligible: None,
             sums: library::Sums::default(),
@@ -6963,6 +6964,7 @@ pub(crate) mod tests {
                     mtime_ns: 1,
                 },
                 best: None,
+                progress: None,
                 clear: false,
                 ineligible: Some(library::Ineligible::NotFullPlay),
                 sums: library::Sums {

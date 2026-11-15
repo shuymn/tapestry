@@ -1141,9 +1141,10 @@ fn the_ledger_dedupes_by_path_and_body() {
     assert_eq!(lib.totals().unwrap(), on_time(2));
 }
 
-/// The `scores` table of bests version 4, as that version created it (its
-/// breakdown 88 bytes, one set of sums for every kind of play).
-const SCORES_V4: &str = "CREATE TABLE scores (
+/// The `scores` table of bests version 5, as that version created it (its
+/// breakdown 88 bytes, practice rounds' sums apart, and no `progress`
+/// table beside it).
+const SCORES_V5: &str = "CREATE TABLE scores (
     preset_sha256 BLOB NOT NULL,
     ln_mode INTEGER NOT NULL,
     chart_sha256 BLOB NOT NULL,
@@ -1162,6 +1163,13 @@ const SCORES_V4: &str = "CREATE TABLE scores (
     sum_bad INTEGER NOT NULL DEFAULT 0 CHECK (sum_bad >= 0),
     sum_poor INTEGER NOT NULL DEFAULT 0 CHECK (sum_poor >= 0),
     sum_play_us INTEGER NOT NULL DEFAULT 0 CHECK (sum_play_us >= 0),
+    practice_plays INTEGER NOT NULL DEFAULT 0 CHECK (practice_plays >= 0),
+    practice_sum_perfect INTEGER NOT NULL DEFAULT 0 CHECK (practice_sum_perfect >= 0),
+    practice_sum_great INTEGER NOT NULL DEFAULT 0 CHECK (practice_sum_great >= 0),
+    practice_sum_good INTEGER NOT NULL DEFAULT 0 CHECK (practice_sum_good >= 0),
+    practice_sum_bad INTEGER NOT NULL DEFAULT 0 CHECK (practice_sum_bad >= 0),
+    practice_sum_poor INTEGER NOT NULL DEFAULT 0 CHECK (practice_sum_poor >= 0),
+    practice_sum_play_us INTEGER NOT NULL DEFAULT 0 CHECK (practice_sum_play_us >= 0),
     CHECK ((best_ex IS NULL) = (best_bp IS NULL)
         AND (best_ex IS NULL) = (best_combo IS NULL)
         AND (best_ex IS NULL) = (play_sha256 IS NULL)
@@ -1169,9 +1177,9 @@ const SCORES_V4: &str = "CREATE TABLE scores (
     PRIMARY KEY (preset_sha256, ln_mode, chart_sha256)
 ) WITHOUT ROWID;";
 
-/// A row valid in [`SCORES_V4`] for `record`'s key: 7 plays, 1 clear, a
-/// best EX of 9 from its breakdown, and sums.
-fn v4_row(record: &PlayRecord) -> String {
+/// A row valid in [`SCORES_V5`] for `record`'s key: 7 plays, 1 clear, a
+/// best EX of 9 from its breakdown, and sums of both kinds.
+fn v5_row(record: &PlayRecord) -> String {
     let play = library::Breakdown {
         body_sha256: [5; 32],
         notes: 5,
@@ -1182,7 +1190,7 @@ fn v4_row(record: &PlayRecord) -> String {
     };
     format!(
         "INSERT INTO scores VALUES (x'{}', 1, x'{}', 7, 1, 9, 1, 4, x'03', 1, x'{}', x'{}',
-             9, 8, 7, 6, 5, 4000000);",
+             9, 8, 7, 6, 5, 4000000, 2, 3, 2, 1, 0, 0, 1000000);",
         hex(&record.preset.sha256),
         hex(&record.chart.identity.sha256),
         hex(&play.body_sha256),
@@ -1190,13 +1198,14 @@ fn v4_row(record: &PlayRecord) -> String {
     )
 }
 
-/// A database of bests version 4, its `scores` in that version's layout
-/// with a row, is opened without reading that row: `scores` is created
-/// again in this version's layout, `counted` and `refused` are cleared and
+/// A database of bests version 5, its `scores` in that version's layout
+/// with a row and no `progress` table, is opened without reading that row:
+/// `scores` and `progress` are created in this version's layout, `counted`
+/// and `refused` are cleared and
 /// a catch-up is requested, while the charts and the loudness stay and no
 /// chart is read again.
 #[test]
-fn a_bests_4_database_is_recreated_without_reading_it() {
+fn a_bests_5_database_is_recreated_without_reading_it() {
     let fx = Fixture::new();
     fx.chart("a.bms", CHART);
     let mut lib = fx.open();
@@ -1228,9 +1237,9 @@ fn a_bests_4_database_is_recreated_without_reading_it() {
     sql(
         &fx.db(),
         &format!(
-            "DROP TABLE scores; {SCORES_V4} {}
-             UPDATE meta SET bests = 4;",
-            v4_row(&record),
+            "DROP TABLE scores; DROP TABLE progress; {SCORES_V5} {}
+             UPDATE meta SET bests = 5;",
+            v5_row(&record),
         ),
     );
 
@@ -1239,14 +1248,15 @@ fn a_bests_4_database_is_recreated_without_reading_it() {
     let BestsState::Invalidated { old: Some(old) } = lib.bests_state() else {
         panic!("{:?}", lib.bests_state());
     };
-    assert_eq!(old.bests, 4);
-    assert_eq!(library::BESTS_VERSION, 5);
+    assert_eq!(old.bests, 5);
+    assert_eq!(library::BESTS_VERSION, 6);
     // This version's layout, empty; the other bests tables cleared.
     sql(
         &fx.db(),
         "SELECT sum_perfect, sum_great, sum_good, sum_bad, sum_poor, sum_play_us,
              practice_plays, practice_sum_perfect, practice_sum_great, practice_sum_good,
-             practice_sum_bad, practice_sum_poor, practice_sum_play_us FROM scores",
+             practice_sum_bad, practice_sum_poor, practice_sum_play_us FROM scores;
+         SELECT play_sha256, judgments FROM progress",
     );
     assert_eq!(lib.totals().unwrap(), Totals::default());
     assert_eq!(tables(&fx.db()), (Vec::new(), Vec::new()));
@@ -1277,10 +1287,10 @@ fn an_interrupted_recreation_leaves_the_old_bests() {
     sql(
         &fx.db(),
         &format!(
-            "DROP TABLE scores; {SCORES_V4} {}
-             UPDATE meta SET bests = 4;
+            "DROP TABLE scores; DROP TABLE progress; {SCORES_V5} {}
+             UPDATE meta SET bests = 5;
              CREATE TRIGGER fail BEFORE UPDATE ON meta BEGIN SELECT RAISE(ABORT, 'injected'); END;",
-            v4_row(&record),
+            v5_row(&record),
         ),
     );
     assert!(library::Library::open(&fx.db()).is_err());
@@ -1291,10 +1301,7 @@ fn an_interrupted_recreation_leaves_the_old_bests() {
         })
         .unwrap();
     assert_eq!(old, (7, 9));
-    assert!(
-        conn.prepare("SELECT practice_sum_play_us FROM scores")
-            .is_err()
-    );
+    assert!(conn.prepare("SELECT judgments FROM progress").is_err());
     let counted: i64 = conn
         .query_row("SELECT count(*) FROM counted", [], |r| r.get(0))
         .unwrap();
@@ -1302,12 +1309,12 @@ fn an_interrupted_recreation_leaves_the_old_bests() {
     let bests: i64 = conn
         .query_row("SELECT bests FROM meta", [], |r| r.get(0))
         .unwrap();
-    assert_eq!(bests, 4);
+    assert_eq!(bests, 5);
     conn.execute_batch("DROP TRIGGER fail;").unwrap();
     drop(conn);
     let (lib, _) = library::Library::open(&fx.db()).unwrap();
     assert!(matches!(lib.bests_state(), BestsState::Invalidated { .. }));
-    sql(&fx.db(), "SELECT practice_sum_play_us FROM scores");
+    sql(&fx.db(), "SELECT judgments FROM progress");
     assert_eq!(tables(&fx.db()), (Vec::new(), Vec::new()));
 }
 

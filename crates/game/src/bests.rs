@@ -3,10 +3,12 @@
 //! best of its chart and preset (design.md "Personal Bests"). The bests
 //! themselves live outside `game`, in whatever the sink keeps them in.
 
+use std::sync::Arc;
+
 use bms_model::Chart;
 use eval::Tally;
 use replay::PlayRecord;
-use rules::RulePreset;
+use rules::{Judgment, RulePreset};
 use serde::{Deserialize, Serialize};
 
 use crate::result_figures::{Rate, ResultFigures};
@@ -105,6 +107,69 @@ impl BestLookup {
             _ => Self::KnownEmpty,
         }
     }
+}
+
+/// What a play asks of its best's progress
+/// ([`RecordSink::play_best`](crate::RecordSink::play_best)): the judged
+/// targets of its chart, and whether its preset counts an empty POOR as a
+/// POOR, by which the best's breakdown counts it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgressQuery {
+    /// The chart's judged targets: its taps and long notes.
+    pub targets: u32,
+    /// The play preset's `empty_poor.counted`.
+    pub empty_poor_counted: bool,
+}
+
+/// The best's progress as a play reads it: the judgment of each judged
+/// target of the play that set the best EX, in the order its evaluation
+/// emitted them (design.md "Personal Bests").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ProgressLookup {
+    /// The best play's judgments, consistent with its breakdown.
+    Known(Box<[Judgment]>),
+    /// No best, or none stored with it.
+    Missing,
+    /// A stored progress refused, for the reason given; the best stays.
+    Refused(String),
+    /// Not known: no store, not asked, or the read failed.
+    Unavailable,
+}
+
+/// A play's best and its progress, from one read
+/// ([`RecordSink::play_best`](crate::RecordSink::play_best)).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayBest {
+    /// The best before this play.
+    pub best: BestLookup,
+    /// Its progress.
+    pub progress: ProgressLookup,
+}
+
+/// The best paced by its play: entry `p` the best play's EX after its
+/// first `p` judged targets, from 0, each judgment weighed by `preset` as
+/// the evaluator scores it (saturating). `None` unless the series has
+/// `targets + 1` entries and ends at `best`, the best's EX, so it belongs
+/// to this chart's best under this preset (design.md "Personal Bests",
+/// skin projections).
+#[must_use]
+pub fn best_series(
+    judgments: &[Judgment],
+    preset: &RulePreset,
+    best: u32,
+    targets: u32,
+) -> Option<Arc<[u32]>> {
+    if u32::try_from(judgments.len()).ok() != Some(targets) {
+        return None;
+    }
+    let mut ex = 0_u32;
+    let series: Arc<[u32]> = std::iter::once(0)
+        .chain(judgments.iter().map(|&j| {
+            ex = ex.saturating_add(*preset.score.ex.get(j));
+            ex
+        }))
+        .collect();
+    (series.last() == Some(&best)).then_some(series)
 }
 
 /// A view's result against the best before this play (design.md "Personal
@@ -324,7 +389,63 @@ pub fn score_target(target: ScoreTarget, notes: u32, best: u32, play: TargetPlay
 
 #[cfg(test)]
 mod tests {
-    use super::{ScoreTarget, TargetPlay, score_target};
+    use rules::Judgment;
+
+    use super::{ScoreTarget, TargetPlay, best_series, score_target};
+
+    /// GREAT, PERFECT, PERFECT, GOOD, PERFECT, BAD, PERFECT, POOR.
+    const PROGRESS: [Judgment; 8] = [
+        Judgment::Great,
+        Judgment::Perfect,
+        Judgment::Perfect,
+        Judgment::Good,
+        Judgment::Perfect,
+        Judgment::Bad,
+        Judgment::Perfect,
+        Judgment::Poor,
+    ];
+
+    /// The series follows the preset's weights: with GREAT weighted 3,
+    /// the entry after the GREAT rises by 3, not by the default 1.
+    #[test]
+    fn the_series_weighs_the_progress_by_the_preset() {
+        let mut preset = rules::tapestry();
+        preset.score.ex.great = 3;
+        assert_eq!(
+            best_series(&PROGRESS, &preset, 11, 8).as_deref(),
+            Some(&[0, 3, 5, 7, 7, 9, 9, 11, 11][..])
+        );
+        // The default weights give another series, ending at 9.
+        assert_eq!(
+            best_series(&PROGRESS, &rules::tapestry(), 9, 8).as_deref(),
+            Some(&[0, 1, 3, 5, 5, 7, 7, 9, 9][..])
+        );
+    }
+
+    /// An empty progress is `[0]`; a series that does not end at the best
+    /// or has another length is none.
+    #[test]
+    fn a_series_not_of_the_best_is_none() {
+        let mut preset = rules::tapestry();
+        preset.score.ex.great = 3;
+        assert_eq!(best_series(&[], &preset, 0, 0).as_deref(), Some(&[0][..]));
+        assert_eq!(best_series(&PROGRESS, &preset, 10, 8), None);
+        assert_eq!(best_series(&PROGRESS, &preset, 12, 8), None);
+        assert_eq!(best_series(&PROGRESS, &preset, 11, 7), None);
+        assert_eq!(best_series(&PROGRESS, &preset, 11, 9), None);
+    }
+
+    /// The sum saturates as the evaluator's EX does.
+    #[test]
+    fn the_series_saturates() {
+        let mut preset = rules::tapestry();
+        preset.score.ex.perfect = u32::MAX - 1;
+        let progress = [Judgment::Perfect; 3];
+        assert_eq!(
+            best_series(&progress, &preset, u32::MAX, 3).as_deref(),
+            Some(&[0, u32::MAX - 1, u32::MAX, u32::MAX][..])
+        );
+    }
 
     const RANKS: [ScoreTarget; 10] = [
         ScoreTarget::AMinus,
