@@ -447,7 +447,7 @@ fn signed(v: i64) -> i32 {
 }
 
 /// `target`'s rate over `notes` judged notes in basis points,
-/// `⌊10 000 · target / 2 · notes⌋` exactly, 0 at no note, as play's
+/// `⌊10 000 · target / (2 · notes)⌋` exactly, 0 at no note, as play's
 /// `target.rate_bp`; at most [`VALUE_MAX`].
 fn rate_bp(target: u32, notes: u32) -> i32 {
     let q = (u128::from(target) * 10_000)
