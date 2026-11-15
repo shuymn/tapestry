@@ -740,6 +740,8 @@ pub struct SelectScreen {
     bests_preset: Option<RulePreset>,
     /// Its scores, by chart SHA-256.
     bests: HashMap<[u8; 32], Score>,
+    /// The player's totals over every counted play, every preset's.
+    totals: skin_model::PlayerTotals,
 }
 
 impl SelectScreen {
@@ -1235,6 +1237,11 @@ impl SelectScreen {
         self.bests = bests;
     }
 
+    /// The player's totals the view shows on every row.
+    pub const fn set_totals(&mut self, totals: skin_model::PlayerTotals) {
+        self.totals = totals;
+    }
+
     /// Acts on one input, its cue sounds dropped (tests).
     #[cfg(test)]
     pub fn input(&mut self, input: MenuInput) -> Acted {
@@ -1555,6 +1562,7 @@ impl SelectScreen {
             query: self.query.clone(),
             selected: self.selected().map(|e| self.selected_chart(e)),
             list_revision: 0,
+            totals: self.totals,
         }
     }
 

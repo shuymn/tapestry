@@ -76,12 +76,10 @@ use bms_model::TimeUs;
 use eval::{InputStart, JudgeEvent};
 use input::{Arrival, DeviceKind};
 use replay::{CancelReason, Incomplete};
-use rules::RulePreset;
 
 use crate::app::IDLE_WAIT;
 use crate::attempt::{Preparation, PreparationRefusal};
 use crate::audio_loop::AudioWaitError;
-use crate::bests::{BestKey, BestLookup};
 use crate::logic::{AbortCause, Advance, Logic, LogicError, SourceRead};
 use crate::opening::{LoadingOpener, LoadingRig};
 use crate::policy::SessionEvent;
@@ -1141,9 +1139,7 @@ fn run_from<R: Rig>(
         // over.
         let mut screen =
             ResultScreen::new(&report, loaded.shelf(), loaded.chart(), RECORDING_MEMORY);
-        let prepared = prepare_result(rig, &report, &mut screen, &mut |k, p| {
-            loaded.best_before(k, p)
-        })?;
+        let prepared = prepare_result(rig, &report, &mut screen, loaded)?;
         match prepared {
             Prepared::Ready => {}
             Prepared::Retry => {
@@ -1311,9 +1307,10 @@ enum Prepared {
 /// ResultPreparing (design.md "State Model"): the play is saved and
 /// counted, and the commands pending then were taken as the play's, so
 /// every command taken here is fresh. Once the rig's preparation has
-/// begun, taking the result's input over, the own view's best is read
-/// through `lookup`, and a command pressed during that read withdraws the
-/// result as one during a pending poll does. The rig's preparation is
+/// begun, taking the result's input over, the own view's best and the
+/// player's totals, this play counted, are read through `loaded`'s record
+/// sink, and a command pressed during those reads withdraws the result as
+/// one during a pending poll does. The rig's preparation is
 /// then polled in short slices; between them a quit or back leaves and a
 /// retry retries, either dropping the preparation unfinished, with the
 /// commands queued behind it; a preset step is dropped, since the result
@@ -1330,10 +1327,11 @@ fn prepare_result<R: Rig>(
     rig: &mut R,
     report: &PlayReport,
     screen: &mut ResultScreen,
-    lookup: &mut dyn FnMut(&BestKey, &RulePreset) -> BestLookup,
+    loaded: &mut Loaded,
 ) -> Result<Prepared, LiveError<R::ScreenError>> {
     let mut prep = rig.begin_result(report, screen);
-    screen.compare_best(report, lookup);
+    screen.compare_best(report, &mut |k, p| loaded.best_before(k, p));
+    screen.read_totals(&mut || loaded.totals());
     if let Some(withdrawn) = withdrawn(rig) {
         return Ok(withdrawn);
     }

@@ -32,6 +32,30 @@ pub const CHART: &str = "#BPM 120\n#LNTYPE 1\n#00111:01\n#00211:01\n#00152:0101\
 pub const RANDOM_CHART: &str = "#BPM 120\n#00111:01\n#00211:01\n#RANDOM 2\n#IF 1\n#00113:01\n\
      #ENDIF\n#IF 2\n#00113:0101\n#ENDIF\n";
 
+/// Taps on key 1 at 2 s, 2.5 s, 3 s and 3.5 s, and a final long note on
+/// key 2 from 4 s to 5.75 s (120 BPM, a measure is 2 s; the taps in 4 slots
+/// of 0.5 s, the long note in 8 of 0.25 s).
+pub const TOTALS_CHART: &str = "#BPM 120\n#LNTYPE 1\n#00111:01010101\n#00252:0100000000000001\n";
+
+/// The input of a play of `TOTALS_CHART`: each tap pressed at its offset in
+/// ms and released 50 ms later, or not pressed; the long note pressed at
+/// its offset and released at 5.76 s, or not pressed.
+pub fn totals_hits(taps: [Option<i64>; 4], long: Option<i64>) -> Vec<PhysicalInputEvent> {
+    let mut events = Vec::new();
+    for (at, offset) in [2_000, 2_500, 3_000, 3_500].into_iter().zip(taps) {
+        if let Some(o) = offset {
+            events.push(key(1, (at + o) * MS, 1));
+            events.push(key(1, (at + o + 50) * MS, 0));
+        }
+    }
+    if let Some(o) = long {
+        events.push(key(2, (4_000 + o) * MS, 1));
+        events.push(key(2, 5_760 * MS, 0));
+    }
+    events.sort_by_key(|e| e.received);
+    events
+}
+
 /// A data root: chart files under `charts`, records under `records` and the
 /// library database, in a temporary folder.
 pub struct Fixture {

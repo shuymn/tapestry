@@ -206,6 +206,7 @@ fn dense_view() -> ResultView {
         gauge: Some(Box::new(gauge)),
         deviations: Some(Box::new(deviations)),
         timing_areas: Some([[-20, 20], [-60, 60], [-160, 160], [-220, 220], [-500, 150]]),
+        totals: Default::default(),
     }
 }
 

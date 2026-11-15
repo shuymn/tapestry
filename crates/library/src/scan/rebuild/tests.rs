@@ -4,8 +4,7 @@
 //! the phase or failing to be written, panics, and what a later catch-up
 //! reads again.
 
-#[path = "../../../tests/common/mod.rs"]
-mod common;
+use crate::test_common as common;
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};

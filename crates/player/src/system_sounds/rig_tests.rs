@@ -54,9 +54,21 @@ fn arm_run(fx: &Fixture, seam: &Seam, pick: &Arc<AtomicUsize>, fs: Option<MemFs>
 /// `f` on a play's rig with the default settings, its audio thread held
 /// by `gate` while it is.
 fn on_rig<R>(gate: Option<Arc<AudioGate>>, f: impl FnOnce(&mut PlayerRig<'_>) -> R) -> R {
+    on_rig_with(game::SoundSettings::default(), gate, f)
+}
+
+/// [`on_rig`] with `player.toml`'s `[sounds]` as `sounds` at startup.
+fn on_rig_with<R>(
+    sounds: game::SoundSettings,
+    gate: Option<Arc<AudioGate>>,
+    f: impl FnOnce(&mut PlayerRig<'_>) -> R,
+) -> R {
     let settings = game::Settings {
         device: game::DeviceSettings::default(),
-        player: game::PlayerSettings::default(),
+        player: game::PlayerSettings {
+            sounds,
+            ..game::PlayerSettings::default()
+        },
     };
     let render = crate::render_side::tests::Installers::default().spawn_bare();
     crate::tests::on_rig_gated(
@@ -1247,4 +1259,215 @@ fn a_look_requests_its_cues() {
         assert!(rig.choose().is_none());
         assert_eq!(starts(&probe), after, "an empty look");
     });
+}
+
+/// A sound set with a 1.25 s `clear` and a 0.83 s `fail`, longer than
+/// any look at them, armed for the next rig; the set's root lives as long
+/// as the returned fixture.
+fn arm_result() -> Fixture {
+    let fx = Fixture::new();
+    fx.sound("sound/A", SystemKind::Clear, 60_000);
+    fx.sound("sound/A", SystemKind::Fail, 40_000);
+    arm_run(
+        &fx,
+        &Seam::new(Arc::new(RealClock)),
+        &Arc::default(),
+        Some(MemFs::new()),
+    );
+    fx
+}
+
+/// A chart of one tap at 1 s, which a record of no input misses.
+fn one_tap() -> bms_model::Chart {
+    bms_model::ChartBuilder::new(150_000)
+        .tap(
+            bms_model::Lane::new(1).unwrap(),
+            bms_model::TimeUs(1_000_000),
+        )
+        .build()
+        .unwrap()
+}
+
+/// A completed play's report under the tapestry preset whose own view's
+/// lamp is cleared when `own` is (its gauges cleared) and failed
+/// otherwise (an evaluation that did not complete), recorded to its end
+/// with no input of [`one_tap`]; its result screen stepped to a user
+/// preset's view, re-evaluated from the record, whose lamp differs: for an
+/// own clear one whose gauges start empty, take no change and clear only
+/// full, and otherwise one whose gauges start full and take no damage.
+fn switched_result(own: bool, dir: &std::path::Path) -> (game::PlayReport, game::ResultScreen) {
+    let chart = one_tap();
+    let presets = dir.join("presets");
+    std::fs::create_dir_all(&presets).unwrap();
+    let mut other = rules::tapestry();
+    "other".clone_into(&mut other.id);
+    let none = rules::GaugeDelta::Fixed(rules::GaugeValue::EMPTY);
+    for g in &mut other.gauges {
+        if own {
+            g.kind = rules::GaugeKind::EndThreshold { clear: g.max };
+            g.start = g.min;
+        } else {
+            g.start = g.max;
+        }
+        g.change = rules::PerJudgment {
+            perfect: none,
+            great: none,
+            good: none,
+            bad: none,
+            poor: none,
+        };
+        g.empty_poor = none;
+        g.low_damage.clear();
+    }
+    std::fs::write(presets.join("other.toml"), game::preset_to_toml(&other)).unwrap();
+    let mut report = crate::end_screen::tests::report(rules::tapestry());
+    let evaluation = report
+        .result
+        .as_mut()
+        .and_then(|r| r.evaluation.as_mut().ok())
+        .expect("an own evaluation");
+    evaluation.completed = own;
+    for g in &mut evaluation.gauges {
+        g.cleared = own;
+    }
+    let rec = report.record.as_mut().expect("a record");
+    rec.status.end = replay::EndStatus::PlayedToEnd;
+    rec.status.finalized = bms_model::TimeUs(10_000_000);
+    let shelf = game::Shelf::open(presets, "tapestry").unwrap();
+    let mut screen = game::ResultScreen::new(&report, &shelf, &chart, game::RECORDING_MEMORY);
+    assert_eq!(screen.own_cleared(), Some(own), "the own view's lamp");
+    // The user preset lists last: one back from the played one.
+    screen.step(-1, &report, &chart);
+    assert_eq!(viewed_cleared(&screen), !own, "the viewed lamp differs");
+    assert_ne!(
+        screen.viewed().and_then(|e| e.hash),
+        Some(screen.played()),
+        "another preset viewed"
+    );
+    (report, screen)
+}
+
+/// Whether `screen`'s viewed view cleared.
+fn viewed_cleared(screen: &game::ResultScreen) -> bool {
+    match screen.status() {
+        game::ViewStatus::Ready(s) => s.figures.cleared,
+        other => panic!("the viewed view: {other:?}"),
+    }
+}
+
+/// C27-1 (design.md "State Model", system sounds, Result): the result's
+/// first show starts the sound of the play's own view's lamp, not the
+/// view on screen's: a screen already switched to another preset whose
+/// lamp differs (cleared against an own failed play, failed against an
+/// own cleared one) starts `fail` and `clear` respectively.
+// Source: SF-015
+#[test]
+fn the_first_result_sound_follows_the_own_view() {
+    for (own, kind) in [(false, SystemKind::Fail), (true, SystemKind::Clear)] {
+        let _fx = arm_result();
+        on_rig(None, |rig| {
+            let dir = tempfile::tempdir().unwrap();
+            let probe = rig.audio.control.failure_probe();
+            let a = installed_past(rig, None);
+            let (report, screen) = switched_result(own, dir.path());
+            // Positive control: a start queued moves its count.
+            rig.audio
+                .control
+                .system_start(SystemKind::Scratch, false, None)
+                .unwrap();
+            assert_eq!(probe.system_starts(SystemKind::Scratch), 1);
+            rig.show_end(&report, &screen);
+            let starts = [SystemKind::Clear, SystemKind::Fail].map(|k| probe.system_starts(k));
+            let want = if own { [1, 0] } else { [0, 1] };
+            assert_eq!(starts, want, "own cleared {own}: clear, fail");
+            wait("the result's sound", || probe.reserved(kind).is_some());
+            assert_eq!(probe.reserved(kind), Some((a, false)), "own cleared {own}");
+        });
+    }
+}
+
+/// C27-3, C27-4 (design.md "State Model", system sounds, Result): the
+/// result's later shows start and stop nothing: a view switch, and the
+/// built-in result's screen built again (the rebuild, then the show the
+/// flow makes after it), `clear` playing on through both; leaving Result
+/// then stops `clear`, `fail` and `resultclose` once.
+// Source: SF-015
+#[test]
+fn a_view_switch_keeps_the_result_sounds() {
+    let one = one_tap();
+    let _fx = arm_result();
+    on_rig(None, |rig| {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = rig.audio.control.failure_probe();
+        let a = installed_past(rig, None);
+        let (report, mut screen) = switched_result(true, dir.path());
+        let kinds = [SystemKind::Clear, SystemKind::Fail, SystemKind::ResultClose];
+        let counts = |p: &game::OutputProbe| {
+            (
+                kinds.map(|k| p.system_starts(k)),
+                kinds.map(|k| p.system_stops(k)),
+            )
+        };
+        // Positive control: the first show starts `clear`.
+        rig.show_end(&report, &screen);
+        let first = counts(&probe);
+        assert_eq!(first, ([1, 0, 0], [0, 0, 0]), "the first show");
+        // A view switch.
+        screen.step(1, &report, &one);
+        rig.show_end(&report, &screen);
+        assert_eq!(counts(&probe), first, "a view switch");
+        // The built-in result's screen built again, then shown again.
+        assert!(!rig.presenter.current(), "the built-in result");
+        rig.before_rebuild();
+        rig.show_end(&report, &screen);
+        assert_eq!(counts(&probe), first, "a rebuild");
+        wait("the result's sound", || {
+            probe.reserved(SystemKind::Clear).is_some()
+        });
+        assert_eq!(probe.reserved(SystemKind::Clear), Some((a, false)));
+        // Leaving Result stops all three, once.
+        rig.leave_result();
+        assert_eq!(counts(&probe).1, [1, 1, 1], "Result left");
+        rig.leave_result();
+        assert_eq!(counts(&probe).1, [1, 1, 1], "left once");
+    });
+}
+
+/// C27-5 (design.md "Settings Files"): `[sounds] loop_result` as read at
+/// startup decides the result's loop, and a change to the settings the rig
+/// holds after startup does not: started with it on, `clear` loops;
+/// started with it off and the rig's settings then holding it on, `clear`
+/// plays once.
+// Source: SF-015
+#[test]
+fn loop_result_is_read_at_startup() {
+    for at_startup in [true, false] {
+        let _fx = arm_result();
+        let sounds = game::SoundSettings {
+            loop_result: at_startup,
+            ..game::SoundSettings::default()
+        };
+        on_rig_with(sounds, None, |rig| {
+            let dir = tempfile::tempdir().unwrap();
+            let probe = rig.audio.control.failure_probe();
+            let a = installed_past(rig, None);
+            // The settings the rig holds, changed after startup.
+            let mut later = game::Settings {
+                device: game::DeviceSettings::default(),
+                player: game::PlayerSettings::default(),
+            };
+            later.player.sounds.loop_result = true;
+            rig.files = crate::tuning::SettingsFiles::new(DataRoot::new(dir.path().into()), later);
+            let (report, screen) = switched_result(true, dir.path());
+            rig.show_end(&report, &screen);
+            wait("the result's sound", || {
+                probe.reserved(SystemKind::Clear).is_some()
+            });
+            assert_eq!(
+                probe.reserved(SystemKind::Clear),
+                Some((a, at_startup)),
+                "loop_result {at_startup} at startup"
+            );
+        });
+    }
 }
