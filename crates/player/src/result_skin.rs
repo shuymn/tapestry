@@ -1677,8 +1677,11 @@ impl Drop for ResultSkin {
 /// readouts take them (numbers 90-91); its length at 1×, to its last
 /// note's end or BGM event, whatever section or speed is played (numbers
 /// 1163-1164); its judged notes (number 74), which a view replaces with
-/// its own; and its judgment class (options 180-184), [`attempt_class`],
-/// the same in every view.
+/// its own; its judgment class (options 180-184), [`attempt_class`],
+/// the same in every view; and the play's target (numbers 151, 157-158,
+/// with 108, 128, 153 and options 352-354 against it), the attempt's own
+/// `score.target`, which its play skin takes too, the same in every view.
+/// A practice round's is 0.
 pub fn attempt_chart(loaded: &game::Loaded) -> PendingChart {
     let attempt = loaded.attempt();
     let labels = &attempt.labels;
@@ -1697,6 +1700,7 @@ pub fn attempt_chart(loaded: &game::Loaded) -> PendingChart {
         notes: Some(game::ResultBasis::of(loaded.chart(), None).notes),
         judge_class: attempt_class(loaded).map(JudgeClass::index),
         images: ImageFacts::default(),
+        target: attempt.score.target,
     })
 }
 
