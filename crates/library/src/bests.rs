@@ -8,15 +8,20 @@ use std::fmt;
 use bms_model::{Chart, ChartSummary, Note, Speed, TimeUs};
 use eval::{Evaluation, JudgeEventKind};
 use replay::{EndStatus, PlayRecord, PlayType};
-use rules::{PerJudgment, RulePreset};
-use rusqlite::types::Type;
+use rules::{Judgment, PerJudgment, RulePreset};
+use rusqlite::types::{Type, ValueRef};
 use rusqlite::{Connection, OptionalExtension as _, params};
 use sha2::{Digest as _, Sha256};
 
-/// The version of the rules bests are derived by: eligibility, the values
-/// and how a play is identified. A change bumps it, and opening the
-/// database then clears every best and rebuilds them from the records.
-pub const BESTS_VERSION: i64 = 5;
+/// The version of the rules bests are derived by: eligibility, the values,
+/// how a play is identified, and the layout of the bests tables. A change
+/// bumps it, and opening the database then clears every best and rebuilds
+/// them from the records.
+pub const BESTS_VERSION: i64 = 6;
+
+/// The most judgments a stored progress holds: the loader's object cap
+/// (design.md "Loading Limits"), which bounds a chart's judged targets.
+pub const MAX_PROGRESS: usize = 500_000;
 
 /// The LN mode bests are keyed by: the only one the evaluator judges, LN.
 pub const LN_MODE: i64 = 1;
@@ -480,6 +485,10 @@ pub struct Contribution {
     pub id: PlayId,
     /// Its values, when it counts for the best.
     pub best: Option<Best>,
+    /// Its progress, when it counts for the best: the judgment of each
+    /// judged target in the order its evaluation emitted them, kept when
+    /// it sets the best's breakdown (design.md "Personal Bests").
+    pub progress: Option<Box<[Judgment]>>,
     /// Whether it counts as a clear: eligible, and its own lamp not FAILED.
     pub clear: bool,
     /// Why it sets no best, when it does not.
@@ -495,7 +504,9 @@ impl Contribution {
     /// accepted with `verified`, from its as-played `evaluation` of `chart`
     /// (as drawn) under its `preset`. A FULL COMBO needs a completed
     /// evaluation, no judgment the preset counts as breaking the combo,
-    /// and, when an empty POOR breaks it, no empty POOR.
+    /// and, when an empty POOR breaks it, no empty POOR. The progress is
+    /// the judgment of each `Judged` event in emitted order: empty POORs
+    /// and mines judge no target and have none.
     #[must_use]
     pub fn of(
         id: PlayId,
@@ -511,7 +522,7 @@ impl Contribution {
             counts: per(&evaluation.tally.counts),
             play_us: play_us(record, evaluation, chart),
         };
-        let best = ineligible.is_none().then(|| {
+        let eligible = ineligible.is_none().then(|| {
             let mut cleared = vec![0_u8; evaluation.gauges.len().div_ceil(8)];
             for (i, g) in evaluation.gauges.iter().enumerate() {
                 if g.cleared
@@ -520,14 +531,24 @@ impl Contribution {
                     *byte |= 1 << (i % 8);
                 }
             }
-            let broken = evaluation.events.iter().any(|e| {
-                matches!(e.kind, JudgeEventKind::Judged { judgment, .. }
-                    if *preset.score.breaks_combo.get(judgment))
-            });
+            // The progress, each `Judged` event's judgment in emitted
+            // order, and whether any of them breaks the combo, in one pass.
+            let mut broken = false;
+            let progress: Box<[Judgment]> = evaluation
+                .events
+                .iter()
+                .filter_map(|e| match e.kind {
+                    JudgeEventKind::Judged { judgment, .. } => {
+                        broken |= *preset.score.breaks_combo.get(judgment);
+                        Some(judgment)
+                    }
+                    _ => None,
+                })
+                .collect();
             let empty_poor = preset.empty_poor.breaks_combo && evaluation.tally.empty_poor > 0;
             let t = &evaluation.tally;
             let summary = ChartSummary::of(chart);
-            Best {
+            let best = Best {
                 ex: t.ex_score,
                 bp: t.bp,
                 max_combo: t.max_combo,
@@ -546,8 +567,10 @@ impl Contribution {
                     empty_poor_early: t.empty_poor_early,
                     empty_poor_late: t.empty_poor_late,
                 },
-            }
+            };
+            (best, progress)
         });
+        let (best, progress) = eligible.unzip();
         Self {
             key: Key {
                 preset_sha256: record.preset.sha256,
@@ -556,11 +579,24 @@ impl Contribution {
             },
             id,
             clear: best.as_ref().is_some_and(Best::lamp_cleared),
+            progress,
             best,
             ineligible,
             sums,
             kind: PlayKind::of(record),
         }
+    }
+}
+
+/// A judgment's stored byte: its index in [`Judgment::ALL`], PERFECT 0 to
+/// POOR 4.
+const fn judgment_byte(j: Judgment) -> u8 {
+    match j {
+        Judgment::Perfect => 0,
+        Judgment::Great => 1,
+        Judgment::Good => 2,
+        Judgment::Bad => 3,
+        Judgment::Poor => 4,
     }
 }
 
@@ -587,9 +623,10 @@ pub enum Ingested {
     },
 }
 
-/// Counts `c` in the caller's transaction, the only writer of `scores` and
-/// `counted`: once per play identity, merging its values into its key's
-/// row. A play counted before only has its stamp refreshed.
+/// Counts `c` in the caller's transaction, the only writer of `scores`,
+/// `progress` and `counted`: once per play identity, merging its values
+/// into its key's row, and storing its progress when its breakdown is the
+/// one kept. A play counted before only has its stamp refreshed.
 pub(crate) fn ingest(conn: &Connection, c: &Contribution) -> rusqlite::Result<Ingested> {
     let id = &c.id;
     let inserted = conn.execute(
@@ -671,6 +708,35 @@ pub(crate) fn ingest(conn: &Connection, c: &Contribution) -> rusqlite::Result<In
         ),
         params.as_slice(),
     )?;
+    // The progress follows the breakdown: replaced whole when this play's
+    // is the one kept, left alone otherwise. A kept play without a
+    // progress to store leaves none, rather than another play's.
+    if c.best.is_some() && b.is_some_and(|b| b.play.body_sha256 == id.body_sha256) {
+        match c.progress.as_deref().filter(|p| p.len() <= MAX_PROGRESS) {
+            Some(p) => {
+                let bytes: Vec<u8> = p.iter().copied().map(judgment_byte).collect();
+                conn.execute(
+                    "INSERT OR REPLACE INTO progress
+                         (preset_sha256, ln_mode, chart_sha256, play_sha256, judgments)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    params![
+                        k.preset_sha256,
+                        k.ln_mode,
+                        k.chart_sha256,
+                        id.body_sha256,
+                        bytes
+                    ],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "DELETE FROM progress
+                     WHERE preset_sha256 = ?1 AND ln_mode = ?2 AND chart_sha256 = ?3",
+                    params![k.preset_sha256, k.ln_mode, k.chart_sha256],
+                )?;
+            }
+        }
+    }
     conn.execute("DELETE FROM refused WHERE path = ?1", [&id.path])?;
     Ok(Ingested::Counted { previous, current })
 }
@@ -792,6 +858,136 @@ pub(crate) fn score(conn: &Connection, key: &Key) -> rusqlite::Result<Option<Sco
         |r| score_of(r, 0),
     )
     .optional()
+}
+
+/// What a play asks of its best's progress: the judged targets of its
+/// chart, and whether its preset counts an empty POOR as a POOR, by which
+/// the breakdown's POOR count includes them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProgressQuery {
+    /// The chart's judged targets, its taps and long notes.
+    pub targets: u32,
+    /// The play preset's `empty_poor.counted`.
+    pub empty_poor_counted: bool,
+}
+
+/// The best's progress as [`play_best`] read it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Progress {
+    /// The judgments of the best's play, consistent with its breakdown.
+    Known(Box<[Judgment]>),
+    /// No best, or none stored with it.
+    Missing,
+    /// A stored progress refused, for the reason given; the best stays.
+    Refused(&'static str),
+}
+
+/// A play's best and its progress, from one statement.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlayBest {
+    /// The stored score, if a row exists.
+    pub score: Option<Score>,
+    /// The progress, when asked for.
+    pub progress: Option<Progress>,
+}
+
+/// The stored score of `key` and, when `query` asks, its best's progress,
+/// read in one statement so both come from one snapshot (design.md
+/// "Personal Bests"). The progress is fetched only when its length is the
+/// query's targets, checked from its borrowed bytes against the breakdown
+/// it is read with, and copied only when accepted. A refused progress
+/// leaves the score as read.
+pub(crate) fn play_best(
+    conn: &Connection,
+    key: &Key,
+    query: Option<ProgressQuery>,
+) -> rusqlite::Result<PlayBest> {
+    let Some(q) = query else {
+        return Ok(PlayBest {
+            score: score(conn, key)?,
+            progress: None,
+        });
+    };
+    conn.query_row(
+        "SELECT s.plays, s.clears, s.best_ex, s.best_bp, s.best_combo, s.cleared,
+             s.full_combo, s.play_sha256, s.play, s.practice_plays, p.play_sha256,
+             length(p.judgments),
+             CASE WHEN length(p.judgments) = ?4 THEN p.judgments END
+         FROM scores s LEFT JOIN progress p USING (preset_sha256, ln_mode, chart_sha256)
+         WHERE s.preset_sha256 = ?1 AND s.ln_mode = ?2 AND s.chart_sha256 = ?3",
+        params![key.preset_sha256, key.ln_mode, key.chart_sha256, q.targets],
+        |r| {
+            let score = score_of(r, 0)?;
+            let progress = match &score.best {
+                None => Progress::Missing,
+                Some(best) => progress_of(r, 10, &best.play, q)?,
+            };
+            Ok(PlayBest {
+                score: Some(score),
+                progress: Some(progress),
+            })
+        },
+    )
+    .optional()
+    .map(|read| {
+        read.unwrap_or(PlayBest {
+            score: None,
+            progress: Some(Progress::Missing),
+        })
+    })
+}
+
+/// The progress in columns `at` (its play's hash), `at + 1` (its length)
+/// and `at + 2` (its bytes, when of the query's length) of `r`, checked
+/// against `play`, the breakdown it is read with.
+fn progress_of(
+    r: &rusqlite::Row<'_>,
+    at: usize,
+    play: &Breakdown,
+    q: ProgressQuery,
+) -> rusqlite::Result<Progress> {
+    let refused = |why| Ok(Progress::Refused(why));
+    let sha = match r.get_ref(at)? {
+        ValueRef::Null => return Ok(Progress::Missing),
+        ValueRef::Blob(sha) => sha,
+        _ => return refused("its play hash is not a hash"),
+    };
+    if sha != play.body_sha256 {
+        return refused("it is another play's than the breakdown's");
+    }
+    let len: i64 = r.get(at + 1)?;
+    if u32::try_from(len).ok() != Some(play.notes) {
+        return refused("its length is not the breakdown's notes");
+    }
+    if len != i64::from(q.targets) {
+        return refused("its length is not the chart's judged targets");
+    }
+    let ValueRef::Blob(bytes) = r.get_ref(at + 2)? else {
+        return refused("its judgments are not bytes");
+    };
+    let mut counts = [0_u32; 5];
+    for &b in bytes {
+        let Some(c) = counts.get_mut(usize::from(b)) else {
+            return refused("a judgment is out of range");
+        };
+        *c = c.saturating_add(1);
+    }
+    // An empty POOR the preset counted is in the breakdown's POOR count
+    // and judged no target.
+    let [p0, p1, p2, p3, poor] = play.counts;
+    let targets_poor = if q.empty_poor_counted {
+        poor.checked_sub(play.empty_poor)
+    } else {
+        Some(poor)
+    };
+    if Some(counts) != targets_poor.map(|poor| [p0, p1, p2, p3, poor]) {
+        return refused("its counts are not the breakdown's");
+    }
+    let judgments = bytes
+        .iter()
+        .filter_map(|&b| Judgment::ALL.get(usize::from(b)).copied())
+        .collect();
+    Ok(Progress::Known(judgments))
 }
 
 /// The player's totals per kind: one sum of each column over every row of
@@ -939,6 +1135,7 @@ mod tests {
                 mtime_ns: 1,
             },
             clear: best.as_ref().is_some_and(Best::lamp_cleared),
+            progress: None,
             ineligible: best.is_none().then_some(super::Ineligible::NotFullPlay),
             best,
             sums: sums(body),
@@ -1050,8 +1247,8 @@ mod tests {
 
     /// The DDL checks the length the layout has.
     #[test]
-    fn the_scores_ddl_checks_the_breakdown_length() {
-        assert!(crate::db::scores_ddl().contains(&format!("length(play) = {BREAKDOWN_BYTES})")));
+    fn the_bests_ddl_checks_the_breakdown_length() {
+        assert!(crate::db::bests_ddl().contains(&format!("length(play) = {BREAKDOWN_BYTES})")));
     }
 
     /// A stored breakdown or play hash of another length is a read error,
@@ -1564,6 +1761,6 @@ mod tests {
         assert_eq!(size_of::<Breakdown>(), 120);
         assert_eq!(size_of::<Best>(), 160);
         assert_eq!(size_of::<Score>(), 176);
-        assert_eq!(size_of::<Contribution>(), 344);
+        assert_eq!(size_of::<Contribution>(), 360);
     }
 }
