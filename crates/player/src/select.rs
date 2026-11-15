@@ -2846,7 +2846,7 @@ mod tests {
         assert_eq!(step(&mut s, MenuKey::PageUp), (Acted::Changed, 2, 1));
         // A page's rows: 0, then the last row, then 0 again.
         s.set_entries(folder("c", PAGE_STEP));
-        assert!(s.move_to(0));
+        assert_eq!(s.cursor(), 0);
         assert_eq!(
             step(&mut s, MenuKey::PageDown),
             (Acted::Changed, PAGE_STEP - 1, 1)
