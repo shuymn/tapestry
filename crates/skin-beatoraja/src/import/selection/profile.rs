@@ -453,6 +453,9 @@ pub(crate) fn option(id: i32) -> Option<Class<SelOption>> {
         193 => Expr("selected.banner"),
         200..=207 => rank(id - 200),
         300..=307 => rank(id - 300),
+        // The BGA setting, answered as off: no BGA is drawn (D33), as index 72 reads `BGA_OFF`.
+        crate::import::ops::BGA_OFF => Constant(true),
+        crate::import::ops::BGA_ON => Constant(false),
         // Offline: no IR, no rivals.
         50 | 624 => Constant(true),
         // No grade rows, courses, IR, replays, option-specific clear
@@ -754,6 +757,8 @@ mod tests {
     ];
     const OPTION_D: &[(i32, i32, bool)] = &[
         (3, 3, false),
+        (40, 40, true),
+        (41, 41, false),
         (50, 50, true),
         (51, 51, false),
         (60, 60, false),
@@ -842,7 +847,7 @@ mod tests {
         }
         let n = OPTION_N.iter().flat_map(|&(a, b)| a..=b);
         let d = OPTION_D.iter().flat_map(|&(a, b, _)| a..=b);
-        assert_eq!(n.clone().count() + d.clone().count(), 98);
+        assert_eq!(n.clone().count() + d.clone().count(), 100);
         for id in 0..=3_000 {
             let class = option(id);
             if n.clone().any(|i| i == id) {

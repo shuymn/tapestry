@@ -536,6 +536,10 @@ pub(crate) struct Cx<'d> {
     /// The Lua scalar `op` values already noted ignored: a destination
     /// read twice (the lanes read ahead, a selected row) notes once.
     ignored_ops: BTreeSet<Span>,
+    /// The destination records already given their D33 note: one per
+    /// record, whichever path reads it and however often (a selected row's
+    /// record is read by its slot and again by its placement).
+    bga_noted: BTreeSet<Span>,
     /// The destination being read, for the conversion report's records.
     #[cfg(feature = "dev-tools")]
     element: Option<crate::lua::survey::Element>,
@@ -655,6 +659,7 @@ impl<'d> Cx<'d> {
             cycled: BTreeSet::new(),
             selectors: HashMap::new(),
             ignored_ops: BTreeSet::new(),
+            bga_noted: BTreeSet::new(),
             #[cfg(feature = "dev-tools")]
             element: None,
             #[cfg(feature = "dev-tools")]
@@ -955,8 +960,21 @@ impl<'d> Cx<'d> {
         let stretch = self.int_or(stretch, "stretch", -1)?;
         let draw = self.callback_prop(draw, "draw")?;
         let failure = self.failure(&timer, &ops);
+        let span = self.arena_span(rec);
+        let bga = ops.iter().any(|op| match op {
+            Op::Id(n) => names_bga(*n),
+            Op::Name(s) => ops::resolve_name(s).is_some_and(|(id, _)| names_bga(id)),
+            Op::Callable(_) => false,
+        }) || match &draw {
+            Prop::Id(n) => names_bga(*n),
+            Prop::Name(s) => ops::resolve_name(s).is_some_and(|(id, _)| names_bga(id)),
+            Prop::Null | Prop::Callable(_) => false,
+        };
+        if bga {
+            self.bga_note(span);
+        }
         let dst = Dst {
-            span: self.arena_span(rec),
+            span,
             blend,
             filter,
             timer,
@@ -1010,6 +1028,54 @@ impl<'d> Cx<'d> {
             }
         }
         Ok(ops)
+    }
+
+    /// Notes D33 at destination record `at` once, however often the
+    /// record is read: its `op` or `draw` names the BGA setting (options
+    /// 40 and 41), answered as off. Noted before anything decides the
+    /// destination, so a destination dropped, ignored or never drawn for
+    /// another reason carries it beside that reason's note.
+    fn bga_note(&mut self, at: Span) {
+        if self.bga_noted.insert(at) {
+            self.note(
+                Some(at),
+                Severity::Deviation,
+                NoteKind::Deviation(DeviationId::D33),
+            );
+        }
+    }
+
+    /// [`Self::bga_note`] for record `rec` whose keys are not read (a
+    /// nested destination past the key cap): its `op` and `draw` fields
+    /// read from the definition as `record_failure` reads them, never its
+    /// `dst` keys, an item that is not a number or a string skipped and no
+    /// error raised, so the exit it precedes is unchanged.
+    fn bga_note_unread(&mut self, rec: u32) {
+        let [op, draw] = self.def.fields(rec, ["op", "draw"]);
+        let items: Vec<u32> = match op {
+            Some(op) if self.def.arena.is_array(op) => self.def.arena.children(op).collect(),
+            _ => Vec::new(),
+        };
+        let named = items
+            .into_iter()
+            .chain(draw)
+            .any(|f| match self.def.arena.scalar(f) {
+                Scalar::Long(_) | Scalar::Double(_) | Scalar::Int(_) | Scalar::Float(_) => {
+                    self.def.int(f, "op").is_ok_and(names_bga)
+                }
+                Scalar::Str { .. } => self
+                    .def
+                    .string(f, "op")
+                    .ok()
+                    .flatten()
+                    .and_then(|s| ops::resolve_name(&s))
+                    .is_some_and(|(id, _)| names_bga(id)),
+                _ => false,
+            });
+        if named {
+            let at = self.arena_span(rec);
+            self.bga_note(at);
+        }
     }
 
     /// Whether destination record `rec` is failure presentation
@@ -2374,6 +2440,12 @@ impl Common {
     fn angle_of(&self, k: &SrcKey) -> i64 {
         -(i64::from(k.angle) + self.offset.r)
     }
+}
+
+/// Whether numeric op or `draw` `n` names the BGA setting, 40 or 41 of
+/// either sign (D33).
+fn names_bga(n: i32) -> bool {
+    i32::try_from(n.unsigned_abs()).is_ok_and(|id| ops::bga_setting(id).is_some())
 }
 
 /// Numeric `draw` `n`'s condition: a boolean property joining the ops
