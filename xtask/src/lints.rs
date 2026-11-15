@@ -264,6 +264,7 @@ pub const IN_PLAY: &[Site] = &[
         &[
             "Loaded::closes_on",
             "Loaded::finish_anchor",
+            "Loaded::finish",
             "Command::cause",
             "arrival",
             "replay_kind",
