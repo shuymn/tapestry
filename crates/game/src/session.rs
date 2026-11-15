@@ -246,6 +246,13 @@ pub enum SessionError {
     ChartChanged(PathBuf),
 }
 
+/// A full play's finish anchor on `chart` and its finish point, for an
+/// autoplay session when `autoplay`: the one place a load computes both.
+fn finish_of(chart: &Chart, autoplay: bool) -> (TimeUs, TimeUs) {
+    let anchor = finish_anchor(chart, autoplay);
+    (anchor, crate::finish_point(anchor))
+}
+
 /// Play's admission of a chart read at `speed` (design.md "Chart Model",
 /// "Timeline"): one playhead can present it. Checked before a loaded chart
 /// is stored, first or at a new speed, so a refusal leaves everything as
@@ -414,6 +421,9 @@ pub struct Loaded {
     /// A full play's finish anchor on `chart`, computed when it is read
     /// ([`finish_anchor`]), so completion reads it without allocating.
     finish_anchor: TimeUs,
+    /// Its finish point ([`crate::finish_point`]), computed with it: what
+    /// the attempt's readouts end at and the hold starts from.
+    finish: TimeUs,
     chart_record: ChartRecord,
     /// The chart's labels, from the ingestion that read `chart`.
     labels: ChartLabels,
@@ -652,7 +662,7 @@ impl PendingLoad {
             }) => {
                 events.on_event(&SessionEvent::Load);
                 let main = crate::tempo::whole_main(&chart, crate::MAIN_HISTOGRAM_LIMIT).ok();
-                let anchor = finish_anchor(&chart, config.autoplay.is_some());
+                let (anchor, finish) = finish_of(&chart, config.autoplay.is_some());
                 let preset = shelf.chosen().clone();
                 let displayed = resolve_displayed(parts.policy.as_ref(), &preset);
                 Ok(Loaded {
@@ -662,6 +672,7 @@ impl PendingLoad {
                     parts,
                     path: chart_path.to_owned(),
                     finish_anchor: anchor,
+                    finish,
                     chart,
                     chart_record,
                     labels,
@@ -943,7 +954,7 @@ impl Loaded {
             speed,
             ..self.config.clone()
         };
-        self.finish_anchor = finish_anchor(&read.chart, self.config.autoplay.is_some());
+        (self.finish_anchor, self.finish) = finish_of(&read.chart, self.config.autoplay.is_some());
         self.chart = read.chart;
         self.chart_record = read.record;
         self.labels = read.labels;
@@ -1178,6 +1189,17 @@ impl Loaded {
         self.finish_anchor
     }
 
+    /// A full play's finish point on the chart as loaded: its
+    /// [`finish_anchor`](Self::finish_anchor) plus
+    /// [`FINISH_MARGIN`](crate::FINISH_MARGIN), computed with it. Its
+    /// readouts end there ([`Attempt::finish`]) and its hold starts from it
+    /// ([`hold_until`](crate::hold_until)).
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub const fn finish(&self) -> TimeUs {
+        self.finish
+    }
+
     /// The practice set up, if any.
     #[must_use]
     pub fn practice(&self) -> Option<&Practice> {
@@ -1341,6 +1363,8 @@ impl Loaded {
             audio,
             sources,
             gate: None,
+            #[cfg(feature = "dev-tools")]
+            hooks: SoundHooks::default(),
         }
     }
 
@@ -1481,6 +1505,7 @@ impl Loaded {
                 self.config.lead_in,
                 self.section(),
                 ends.of(&self.chart),
+                self.finish,
                 &self.labels,
                 &self.chart,
             )
@@ -1979,6 +2004,24 @@ pub struct Session<O> {
     /// The start gate and the adjustment controls, once
     /// [`with_start_gate`](Self::with_start_gate) set them up.
     gate: Option<SessionGate>,
+    /// The READY and Closing hooks every play called.
+    #[cfg(feature = "dev-tools")]
+    hooks: SoundHooks,
+}
+
+/// What a session's plays asked of the system sounds' hooks
+/// ([`Rig::ready_began`], [`Rig::closing_began`]), counted over every play
+/// (development builds).
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SoundHooks {
+    /// READY states opened.
+    pub ready: u32,
+    /// Plays admitted to Closing.
+    pub closing: u32,
+    /// The chart audio's cuts the play had asked when Closing's hook was
+    /// last called: 0 means the closing sound came before the cut.
+    pub cuts_at_closing: u32,
 }
 
 impl<O: AudioOutput + Wakes> Session<O> {
@@ -2016,6 +2059,13 @@ impl<O: AudioOutput + Wakes> Session<O> {
     #[must_use]
     pub const fn audio(&self) -> &RunnerAudio<O> {
         &self.audio
+    }
+
+    /// The system sounds' hooks the plays called so far.
+    #[cfg(feature = "dev-tools")]
+    #[must_use]
+    pub const fn sound_hooks(&self) -> SoundHooks {
+        self.hooks
     }
 
     /// Sets up practice for the next plays, as [`Loaded::set_practice`]
@@ -2128,6 +2178,8 @@ impl<O: AudioOutput + Wakes> Session<O> {
             sources,
             clock,
             gate,
+            #[cfg(feature = "dev-tools")]
+            hooks,
         } = self;
         // The round's schedule, which the engine must be playing.
         let restorer = loaded
@@ -2159,6 +2211,10 @@ impl<O: AudioOutput + Wakes> Session<O> {
             display_offset_us,
             close_at,
             closing: false,
+            #[cfg(feature = "dev-tools")]
+            hooks,
+            #[cfg(feature = "dev-tools")]
+            cuts: 0,
         };
         match crate::live::play(loaded, &mut rig) {
             Ok(report) => Ok(report),
@@ -2288,6 +2344,12 @@ struct SessionRig<'s, O> {
     /// When the window closes, on the script's timeline.
     close_at: Option<TimeUs>,
     closing: bool,
+    /// The session's count of the hooks.
+    #[cfg(feature = "dev-tools")]
+    hooks: &'s mut SoundHooks,
+    /// The chart audio's cuts this play asked.
+    #[cfg(feature = "dev-tools")]
+    cuts: u32,
 }
 
 impl<O: AudioOutput + Wakes> SessionRig<'_, O> {
@@ -2641,8 +2703,29 @@ impl<O: AudioOutput + Wakes> Rig for SessionRig<'_, O> {
     }
 
     fn cancel_audio(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        {
+            self.cuts += 1;
+        }
         if let Some(sounds) = &mut self.sounds {
             self.audio.cancel(sounds);
+        }
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn ready_began(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        {
+            self.hooks.ready += 1;
+        }
+    }
+
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn closing_began(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        {
+            self.hooks.closing += 1;
+            self.hooks.cuts_at_closing = self.cuts;
         }
     }
 

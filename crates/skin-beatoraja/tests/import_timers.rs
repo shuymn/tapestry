@@ -235,6 +235,7 @@ fn the_fade_out_timer_runs_only_in_the_fade_out() {
     let lead_in = PlayContext {
         attempt: Attempt::Full {
             lead_in: TimeUs(2_000 * MS),
+            finish: common::play::NO_FINISH,
         },
         ..context()
     };

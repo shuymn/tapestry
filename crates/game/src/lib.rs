@@ -99,7 +99,7 @@ pub use keys::{
 pub use live::{
     AudioReadiness, CLOSE_FLOOR, Closing, ClosingEnd, FINISH_MARGIN, InputWaitError, Leave,
     LiveError, Opening, Outro, PlayEnding, Polled, Rearm, ResultTiming, Rig, closing_deadline,
-    closing_time, fade_deadline, gated, hold_until,
+    closing_time, fade_deadline, finish_point, gated, hold_until,
 };
 pub use logic::{
     AbortCause, Advance, EventSink, Logic, LogicConfig, LogicError, Record, SourceRead,
@@ -160,6 +160,8 @@ pub use save::{
     LinkCount, LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, clear_link,
     create_fresh, is_link, open_lock, remove_name, write_atomic,
 };
+#[cfg(feature = "dev-tools")]
+pub use session::SoundHooks;
 pub use session::{
     AutoKeySounds, ChartReader, ChartSource, ClosingReport, Command, GateStorage, Loaded,
     MenuCommand, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport, PlayScript, PlayStart,

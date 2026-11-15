@@ -3,8 +3,9 @@
 //! 128-136`), moved by its range times the progress toward its angle
 //! (`skin/SkinSlider.java:116-120`), its range scaled to the reference
 //! canvas across or down (`skin/json/JsonSkinObjectLoader.java:398-415`),
-//! with a D4 note: the progress ends at the last resolved object, where the
-//! source's adds 5 s (`play/BMSPlayer.java:66, 198-199`).
+//! with a D4 note: the progress runs to the play's finish point, its share
+//! in floored parts per million where the source divides in `float`, and
+//! over a practice round's own section.
 
 mod common;
 
@@ -14,7 +15,8 @@ use common::{Loaded, import_sized, write};
 use skin_beatoraja::{Cancel, Config, DeviationId, NoteKind, Object, Severity, read_lua_header};
 use skin_model::{Attempt, PlayContext, Skin};
 
-/// One tap at 2 s, the chart's last object: the progress is half at 1 s.
+/// One tap at 2 s, the chart's last object; the play finishes at 7 s
+/// ([`FINISH`]), so the progress is half at 3.5 s.
 fn chart() -> Chart {
     ChartBuilder::new(150_000)
         .tap(Lane::new(1).unwrap(), TimeUs(2_000 * MS))
@@ -68,27 +70,40 @@ fn a_type_six_slider_is_kept_with_a_d4_note() {
     );
 }
 
+/// The play's finish point: the tap at 2 s plus 5 s.
+const FINISH: TimeUs = TimeUs(7_000 * MS);
+
+/// `skin` prepared over [`chart`] as a whole play finishing at
+/// [`FINISH`], after a READY of `lead_in_ms`.
+fn finishing(skin: Skin, lead_in_ms: i64) -> Drawn {
+    let mut d = Drawn::over(skin.clone(), &chart());
+    let ctx = PlayContext {
+        attempt: Attempt::Full {
+            lead_in: TimeUs(lead_in_ms * MS),
+            finish: FINISH,
+        },
+        ..context()
+    };
+    d.play = skin.prepare(&d.chart, &ctx).unwrap();
+    d
+}
+
 /// The sliders move with the play's progress: nothing in READY and at the
-/// start, half their range at 1 s, the whole range at 2 s and after.
+/// start, a fifth of their range at 1.4 s, half at 3.5 s, the whole range
+/// at the finish (7 s) and after; past the last object (2 s) they go on,
+/// three tenths at 2.1 s.
 #[test]
 fn the_sliders_follow_the_progress() {
     // The import's folder lives until the atlas is built.
     let l = sliders();
-    let skin = l.ok().skin.clone();
-    let mut d = Drawn::over(skin.clone(), &chart());
-    let ready = PlayContext {
-        attempt: Attempt::Full {
-            lead_in: TimeUs(1_000 * MS),
-        },
-        ..context()
-    };
-    d.play = skin.prepare(&d.chart, &ready).unwrap();
+    let mut d = finishing(l.ok().skin.clone(), 1_000);
     for (ms, p) in [
         (-500, 0.0),
         (0, 0.0),
-        (400, 0.2),
-        (1_000, 0.5),
-        (2_000, 1.0),
+        (1_400, 0.2),
+        (2_100, 0.3),
+        (3_500, 0.5),
+        (7_000, 1.0),
         (9_000, 1.0),
     ] {
         assert_eq!(d.rects(ms), moved(p), "{ms} ms");
@@ -162,7 +177,7 @@ fn other_type_six_sliders_are_dropped() {
 
 /// A range scales exactly, as every length: range 7 of a 1 600×900 skin
 /// is `1080 · 7 / 900 = 8.4` reference pixels, so half the progress moves
-/// it 4.2.
+/// it 4.2, at 3.5 s of a play finishing at 7 s.
 #[test]
 fn a_progress_range_is_exact_at_900() {
     let l = import_sized(
@@ -171,9 +186,13 @@ fn a_progress_range_is_exact_at_900() {
            "destination": [{"id": "r", "dst": [{"x": 100, "y": 300, "w": 20, "h": 10}]}]"#,
         &[],
     );
-    let mut d = Drawn::over(l.ok().skin.clone(), &chart());
+    let mut d = Drawn::over_context(
+        l.ok().skin.clone(),
+        &chart(),
+        &common::play::finishing(FINISH, None),
+    );
     let mut x = |ms| d.frame(ms, &[]).first().unwrap().rect[0];
-    let (still, moved) = (x(0), x(1_000));
+    let (still, moved) = (x(0), x(3_500));
     assert_eq!(still, 120.0);
     assert!((moved - still - 4.2).abs() < 1e-4, "{still} {moved}");
 }
@@ -199,8 +218,7 @@ fn a_lua_skins_slider_follows_the_progress() {
     let i = common::lua_play(&h, &Config::default(), &cancel).unwrap();
     let kinds: Vec<NoteKind> = i.imported.report.notes.iter().map(|n| n.kind).collect();
     assert_eq!(kinds, [NoteKind::Deviation(DeviationId::D4)]);
-    let skin: Skin = i.imported.skin;
-    let mut d = Drawn::over(skin, &chart());
-    assert_eq!(d.rects(1_000), [moved(0.5)[1]]);
-    assert_eq!(d.rects(2_000), [moved(1.0)[1]]);
+    let mut d = finishing(i.imported.skin, 0);
+    assert_eq!(d.rects(3_500), [moved(0.5)[1]]);
+    assert_eq!(d.rects(7_000), [moved(1.0)[1]]);
 }

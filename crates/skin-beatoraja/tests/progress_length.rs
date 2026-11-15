@@ -138,7 +138,7 @@ fn calibrate(skin: &skin_model::Skin) -> (HashMap<[u32; 4], char>, Full) {
 }
 
 /// C14, C15: each number and graph is kept with one D4 note (the load's
-/// curve, the progress to the last object, the length from notes and
+/// curve, the progress's floored share and practice span, the length from notes and
 /// background sounds) and nothing else.
 #[test]
 fn the_readouts_and_graphs_import_with_a_d4_note() {
@@ -151,7 +151,8 @@ fn the_readouts_and_graphs_import_with_a_d4_note() {
 
 /// C14: in a play, 165 reads 100 and graph 102 is full both ways; graph
 /// 101 fills `time.progress_ppm / 10⁶` across: 0 wide in READY, 250 000 ppm a
-/// quarter (50 of 200 px), 1 at and after the last object.
+/// quarter (50 of 200 px) at 1.75 s, 1 at and after the play's finish
+/// point at 7 s, the tap at 2 s plus 5 s.
 #[test]
 fn a_play_reads_the_load_full_and_the_progress() {
     for refs in [BY_ID, BY_NAME] {
@@ -162,6 +163,7 @@ fn a_play_reads_the_load_full_and_the_progress() {
         let ready = PlayContext {
             attempt: Attempt::Full {
                 lead_in: TimeUs(1_000 * MS),
+                finish: TimeUs(7_000 * MS),
             },
             ..context()
         };
@@ -172,9 +174,9 @@ fn a_play_reads_the_load_full_and_the_progress() {
         );
         for (ms, song) in [
             (-500, Some(([100, TOP_SONG_ACROSS, 0, 20], 0))),
-            (500, Some(([100, TOP_SONG_ACROSS, 50, 20], 250))),
-            (1_000, Some(([100, TOP_SONG_ACROSS, 100, 20], 500))),
-            (2_000, Some(([100, TOP_SONG_ACROSS, 200, 20], 1_000))),
+            (1_750, Some(([100, TOP_SONG_ACROSS, 50, 20], 250))),
+            (3_500, Some(([100, TOP_SONG_ACROSS, 100, 20], 500))),
+            (7_000, Some(([100, TOP_SONG_ACROSS, 200, 20], 1_000))),
             (9_000, Some(([100, TOP_SONG_ACROSS, 200, 20], 1_000))),
         ] {
             let s = shown(&glyph, full, &d.frame(ms, &[]));
@@ -295,6 +297,7 @@ fn the_length_is_the_1x_charts_from_loading_through_practice() {
     let full_play = PlayContext {
         attempt: Attempt::Full {
             lead_in: TimeUs(1_000 * MS),
+            finish: common::play::NO_FINISH,
         },
         score: skin_model::PlayScore {
             speed: half,
@@ -354,7 +357,8 @@ fn lua_skin() -> (tempfile::TempDir, skin_beatoraja::LuaImported) {
 }
 
 /// C14, C15 through Lua: graph 102 at 45 % while loading is 90 px wide,
-/// graph 101 a quarter of the way is 50 px; the callbacks read 45 while
+/// graph 101 a quarter of the way to the finish (1.75 s of 7 s) is 50 px;
+/// the callbacks read 45 while
 /// loading and 2, 5 for a length of 125 400 ms (never 4).
 #[test]
 fn a_lua_skin_reads_the_progresses_and_the_length() {
@@ -375,8 +379,12 @@ fn a_lua_skin_reads_the_progresses_and_the_length() {
         "{widths:?}"
     );
     assert!(widths.contains(&11) && widths.contains(&12) && widths.contains(&13));
-    let mut d = Drawn::over(skin, &chart(TimeUs(125_400 * MS)));
-    let mut widths: Vec<i32> = d.rects(500).iter().map(|r| r[2]).collect();
+    let mut d = Drawn::over_context(
+        skin,
+        &chart(TimeUs(125_400 * MS)),
+        &common::play::finishing(TimeUs(7_000 * MS), None),
+    );
+    let mut widths: Vec<i32> = d.rects(1_750).iter().map(|r| r[2]).collect();
     widths.sort_unstable();
     // In a play: 102 full, 101 a quarter, 165 reads 100.
     assert_eq!(widths, [12, 13, 50, 200]);

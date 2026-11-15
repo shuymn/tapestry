@@ -4,8 +4,8 @@
 //! into an imported skin's type-6 slider, each frame at a chosen time and
 //! acknowledged before the next advance. The slider's x is the drawn
 //! progress: 0 in READY, the share of the way from the attempt's start to
-//! its last resolved object, 1 at and after it, through manual and
-//! autoplay input, a practice speed, a rearm and a retry.
+//! its finish point, 1 at and after it, through manual and autoplay input,
+//! a practice speed, a rearm and a retry.
 
 use bms_model::{Chart, Lane, Speed, TimeUs};
 use eval::{
@@ -55,8 +55,9 @@ fn device() -> DeviceProfile {
 }
 
 /// The chart at `speed`: 120 BPM, key 1 at 2.0, 2.5, 3.0 and 3.5 s of the
-/// 1× chart and a background sound at 4.0 s, its last object, which a
-/// normal play and an autoplay alike count to (stage3.md D4).
+/// 1× chart and a background sound at 4.0 s, its last object: a normal
+/// play finishes 5 s after its last note (8.5 s), an autoplay 5 s after
+/// its last object (9 s) (design.md "Play Lifecycle", Audio tail).
 fn chart(speed: Speed) -> Chart {
     let text = "#PLAYER 1\n#BPM 120\n#WAV01 key.wav\n#00111:01010101\n#00201:01\n";
     let opts = bms_parser::LoadOptions {
@@ -236,9 +237,10 @@ fn context<'a>(
 
 /// A whole-chart play, manual (key 1 hit on time) and autoplay (the
 /// autoplay input of the production profile): READY reads 0, the slider
-/// moves with the play clock to the last object at 4 s, a quarter at 1 s,
-/// and stays whole after it; judgments move nothing. A rearmed candidate's
-/// READY reads 0 again, and a retry's fresh attempt starts at 0.
+/// moves with the play clock to the finish point, 8.5 s played and 9 s
+/// autoplayed, and stays whole after it; judgments move nothing. A
+/// rearmed candidate's READY reads 0 again, and a retry's fresh attempt
+/// starts at 0.
 #[test]
 fn the_progress_reaches_the_skin_through_logic_and_the_frame() {
     let dir = tempfile::tempdir().unwrap();
@@ -247,10 +249,13 @@ fn the_progress_reaches_the_skin_through_logic_and_the_frame() {
     let rule = rules::beatoraja_style();
     let dev = device();
     let gauges: Vec<GaugeDesc> = rule.gauges.iter().map(GaugeDesc::from_rule).collect();
-    let full = Attempt::Full {
-        lead_in: TimeUs(1_000 * MS),
-    };
-    for autoplay in [false, true] {
+    for (autoplay, finish_ms) in [(false, 8_500), (true, 9_000)] {
+        let full = Attempt::Full {
+            lead_in: TimeUs(1_000 * MS),
+            finish: TimeUs(finish_ms * MS),
+        };
+        // The share at `ms` of the way to the finish.
+        let share = |ms: i64| ms as f64 / finish_ms as f64;
         let ctx = context(&gauges, &rule, autoplay, full);
         let mut r = Rig::new(&chart, &rule, &dev, &skin, &ctx, None);
         let input: Vec<PhysicalInputEvent> = if autoplay {
@@ -278,11 +283,12 @@ fn the_progress_reaches_the_skin_through_logic_and_the_frame() {
         assert_near(ready, at(0.0), &what("READY"));
         for (ms, p) in [
             (0, 0.0),
-            (1_000, 0.25),
-            (2_100, 0.525),
-            (3_000, 0.75),
-            (4_000, 1.0),
-            (6_000, 1.0),
+            (1_000, share(1_000)),
+            (2_100, share(2_100)),
+            (4_000, share(4_000)),
+            (finish_ms - 100, share(finish_ms - 100)),
+            (finish_ms, 1.0),
+            (finish_ms + 2_000, 1.0),
         ] {
             assert_near(r.step(&skin, &uvs, ms), at(p), &what(&format!("{ms} ms")));
         }
@@ -298,7 +304,7 @@ fn the_progress_reaches_the_skin_through_logic_and_the_frame() {
         assert_near(rearmed, at(0.0), &what("rearmed"));
         assert_near(
             r.step(&skin, &uvs, 1_000),
-            at(0.25),
+            at(share(1_000)),
             &what("after the rearm"),
         );
         // A retry: a fresh attempt and preparation.
@@ -310,7 +316,7 @@ fn the_progress_reaches_the_skin_through_logic_and_the_frame() {
         );
         assert_near(
             r.step(&skin, &uvs, 2_000),
-            at(0.5),
+            at(share(2_000)),
             &what("after the retry"),
         );
     }

@@ -256,7 +256,10 @@ fn decision_entry_points_refuse_other_kinds() {
         meta: ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: &[],
-        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        attempt: Attempt::Full {
+            lead_in: TimeUs(0),
+            finish: TimeUs(i64::MAX),
+        },
         empty_poor_breaks_combo: false,
         empty_poor_counted: false,
         scratch: Side::Left,

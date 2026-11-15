@@ -689,6 +689,7 @@ fn a_draw_callback_reads_the_fade_out_timer() {
     let lead_in = PlayContext {
         attempt: Attempt::Full {
             lead_in: TimeUs(2_000 * MS),
+            finish: common::play::NO_FINISH,
         },
         ..context()
     };

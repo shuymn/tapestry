@@ -331,6 +331,19 @@ pub trait Rig {
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<Self::Reader>, InputWaitError>;
     /// Hands the play to audio and to the screen.
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, screen: RenderSide);
+    /// A READY state opened and its timer starts (design.md "State
+    /// Model", system sounds, READY): after [`start`](Self::start), for
+    /// the first play, a retry and a practice round, and after each
+    /// rearm's [`restart_candidate`](Self::restart_candidate). In-play
+    /// code: it allocates and frees nothing. Nothing by default.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn ready_began(&mut self) {}
+    /// A play was admitted to Closing (design.md "Play Lifecycle",
+    /// Closing): once, after the chart's audio was cut and before
+    /// Closing's start is published. In-play code: it allocates and frees
+    /// nothing. Nothing by default.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn closing_began(&mut self) {}
     /// Whether the focus gate has tripped since recording opened.
     fn focus_lost(&self) -> bool;
     /// Whether a device that took part is still connected.
@@ -857,20 +870,29 @@ impl PlayEnding {
 /// hold lasts past its anchor (design.md "Play Lifecycle", Audio tail).
 pub const FINISH_MARGIN: TimeUs = TimeUs(5_000_000);
 
+/// A full play's finish point for a play whose finish anchor is `anchor`
+/// ([`crate::finish_anchor`]): [`FINISH_MARGIN`] after it, saturating.
+/// Its readouts end there and its hold starts from it (design.md "Play
+/// Lifecycle", Audio tail); [`crate::Loaded::finish`] keeps it per load.
+#[must_use]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub const fn finish_point(anchor: TimeUs) -> TimeUs {
+    TimeUs(anchor.0.saturating_add(FINISH_MARGIN.0))
+}
+
 /// Where a full play's hold may end at the earliest, for a play whose
-/// finish anchor is `anchor`: [`FINISH_MARGIN`] after it, plus the skin's
-/// finish margin, a negative one read as 0, whatever its fadeout is,
+/// finish point is `finish` ([`finish_point`]): the skin's finish margin
+/// after it, a negative one read as 0, whatever its fadeout is,
 /// saturating.
 #[must_use]
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-pub const fn hold_until(anchor: TimeUs, ending: PlayEnding) -> TimeUs {
-    let finished = anchor.0.saturating_add(FINISH_MARGIN.0);
+pub const fn hold_until(finish: TimeUs, ending: PlayEnding) -> TimeUs {
     let margin = if ending.finish_margin.0 > 0 {
         ending.finish_margin.0
     } else {
         0
     };
-    TimeUs(finished.saturating_add(margin))
+    TimeUs(finish.0.saturating_add(margin))
 }
 
 /// Where a full play's fade-out started at play time `start` ends, or
@@ -1744,6 +1766,8 @@ pub(crate) fn open_and_play<R: Rig>(
     logic.add_sink(Box::new(sink));
     let mut live = Vec::with_capacity(logic.max_events());
     rig.start(origin, sounds, screen);
+    // Source: SF-013
+    rig.ready_began();
     let round = restore_at.is_some();
     // The tail stage, once the play completed.
     let mut stage = None;
@@ -1836,6 +1860,8 @@ pub(crate) fn open_and_play<R: Rig>(
                         failed = Some(AbortCause::RestoreFailed);
                     }
                     rig.restart_candidate(origin, generation);
+                    // A fresh READY: its timer starts again.
+                    rig.ready_began();
                     continue;
                 }
                 Step::End(cause) => {
@@ -1944,10 +1970,16 @@ pub(crate) fn open_and_play<R: Rig>(
     };
     // Stopped, completed or failed: no frame from here on is playing, the
     // tail's, the ring-out's and Closing's included. Closing starts at its
-    // publication, on the play clock.
+    // publication, on the play clock; its sound is asked first, after the
+    // chart's audio was cut above, so the cut, the sound and the `failed`
+    // timer come in that order.
     let closing_at = admit.map(|_| TimeUs(rig.now().0 - origin.0));
     match closing_at {
-        Some(at) => logic.enter_closing(at),
+        Some(at) => {
+            // Source: SF-013
+            rig.closing_began();
+            logic.enter_closing(at);
+        }
         None => logic.stop_playing(),
     }
 
@@ -2379,7 +2411,7 @@ impl TailStage {
             rig.seal_audio();
             let ending = rig.declared_ending();
             Self {
-                end_at: hold_until(loaded.finish_anchor(), ending),
+                end_at: hold_until(loaded.finish(), ending),
                 fadeout: Some(ending.fadeout),
                 repeats: false,
             }
