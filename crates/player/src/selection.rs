@@ -6964,6 +6964,7 @@ pub(crate) mod tests {
                     mtime_ns: 1,
                 },
                 best: None,
+                progress: None,
                 clear: false,
                 ineligible: Some(library::Ineligible::NotFullPlay),
                 sums: library::Sums {
