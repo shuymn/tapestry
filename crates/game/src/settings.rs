@@ -242,7 +242,7 @@ pub enum PlayerSettingsError {
         value: String,
     },
     /// A key `[sounds]` does not take.
-    #[error("[sounds] has no key {key}; [sounds] takes sound_root and bgm_root")]
+    #[error("[sounds] has no key {key}; [sounds] takes sound_root, bgm_root and loop_result")]
     SoundKey {
         /// The key.
         key: String,
@@ -936,8 +936,9 @@ pub struct PlayerSettings {
     /// (design.md "Settings Files").
     #[serde(skip_serializing_if = "SkinChoices::is_empty")]
     pub skins: SkinChoices,
-    /// Where the sound sets are found, `[sounds]` (design.md "Settings
-    /// Files"; "Audio", system sounds).
+    /// Where the sound sets are found and whether the result's sound
+    /// loops, `[sounds]` (design.md "Settings Files"; "Audio", system
+    /// sounds).
     #[serde(skip_serializing_if = "SoundSettings::is_default")]
     pub sounds: SoundSettings,
 }
