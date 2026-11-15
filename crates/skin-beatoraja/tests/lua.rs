@@ -2633,6 +2633,37 @@ fn a_protected_probe_of_an_absent_part_goes_on_without_it() {
     assert_eq!(drawn_xs(control), [7, 300]);
 }
 
+/// An absent part's ordinary error reaches a protected call by any
+/// route: `xpcall`'s handler sees `cannot open <name>` and the call gives
+/// what the handler returns, a `pcall` of `pcall` gives the inner call's
+/// answer, and so does a protected function returning one. Each answer
+/// moves a drawn image, and each import counts its own absent loads.
+#[test]
+fn an_absent_part_is_caught_through_xpcall_and_a_nested_pcall() {
+    let d = folder(&[(
+        "s.luaskin",
+        &skin(
+            "",
+            "local ok1, e1 = xpcall(dofile, function(e) return \"handled:\" .. e end, \"parts/none.lua\")\n\
+             assert(ok1 == false and e1 == \"handled:cannot open parts/none.lua\", \"xpcall\")\n\
+             local ok2, in2, e2 = pcall(pcall, dofile, \"gone.lua\")\n\
+             assert(ok2 == true and in2 == false and e2 == \"cannot open gone.lua\", \"pcall of pcall\")\n\
+             local ok3, in3, e3 = pcall(function() return pcall(dofile, \"p/q.lua\") end)\n\
+             assert(ok3 == true and in3 == false and e3 == \"cannot open p/q.lua\", \"nested\")\n\
+             skin.destination = {\n\
+               { id = \"i\", dst = { { x = #e1, y = 0, w = 64, h = 64 } } },\n\
+               { id = \"i\", dst = { { x = 100 + #e2, y = 0, w = 64, h = 64 } } },\n\
+               { id = \"i\", dst = { { x = 200 + #e3, y = 0, w = 64, h = 64 } } },\n\
+             }",
+        ),
+    )]);
+    let r = import(&d);
+    assert!(r.is_ok(), "{r:?}");
+    let r = r.unwrap();
+    assert_eq!((r.usage.missing_loads, r.usage.dofiles), (3, 3));
+    assert_eq!(drawn_xs(r), [34, 120, 219]);
+}
+
 /// An absent `dofile` that no protected call catches refuses the skin
 /// as the read it is, named and located at its call; inside a part, at
 /// the part's call, which the entry's protected call does not catch. A
