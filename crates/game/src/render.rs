@@ -10,6 +10,7 @@ use bms_model::TimeUs;
 use eval::{GaugeState, InputFacts, JudgeEvent, JudgeEventKind, NoteFacts, Tally, side_deviation};
 use rules::Judgment;
 
+use crate::judge_bins::JudgeBins;
 use crate::logic::EventSink;
 
 /// The latest state of the play, for drawing. Only the newest one matters,
@@ -66,6 +67,11 @@ pub struct PlayView {
     /// The candidate's newest judgment offsets, copied whole with every
     /// view, so no effect's loss loses one.
     pub offsets: OffsetRing,
+    /// The candidate's judgments by the play profile's bins (design.md
+    /// "Rendering and Skins", the note snapshot), boxed in every buffer
+    /// before the play starts and copied when the buffer's revision is
+    /// stale, so no effect's loss loses a count.
+    pub judge_bins: Box<JudgeBins>,
 }
 
 /// How many judgment offsets an [`OffsetRing`] keeps.
@@ -455,6 +461,7 @@ mod tests {
             fading: None,
             events: 0,
             offsets: super::OffsetRing::EMPTY,
+            judge_bins: crate::JudgeBins::boxed(),
         }
     }
 

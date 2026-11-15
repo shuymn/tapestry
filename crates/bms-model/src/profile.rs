@@ -4,7 +4,7 @@
 //! speed, the only point that holds them (design.md "Practice Speed
 //! Changes").
 
-use crate::{Chart, Lane, NoteKind, Tempo, TimeUs, TimelineId, TimelinePoint};
+use crate::{Chart, ChartTimeline, Lane, NoteKind, Tempo, TimeUs, TimelineId, TimelinePoint};
 
 /// The note categories of a second, in [`ChartProfile::seconds`]' order.
 pub const NOTE_CATEGORIES: usize = 7;
@@ -162,6 +162,62 @@ pub struct PreviewTimeline {
     pub initial: Tempo,
 }
 
+/// [`ChartProfile::row_bins`]' entry for a row past the profile's
+/// seconds, in no bin.
+pub const NO_BIN: u16 = u16::MAX;
+
+/// Which timeline rows a chart has, as far as a row ordinal names one:
+/// their count and a digest of every row's position and tempo in order
+/// (design.md "Chart Model"). The speed remap rewrites only the rows'
+/// times and a lane permutation keeps the timeline whole, so both keep
+/// it; a transform that moves a row's position, adds a row or renumbers
+/// them changes it, at the same count too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct RowIdentity {
+    /// The rows.
+    pub rows: u32,
+    /// Two SipHash-2-4 runs with fixed keys over the count and each row's
+    /// position and tempo, little-endian, in order.
+    pub digest: u128,
+}
+
+impl RowIdentity {
+    /// The identity of `timeline`'s rows. O(rows); allocates nothing.
+    #[must_use]
+    pub fn of(timeline: &ChartTimeline) -> Self {
+        #[expect(
+            deprecated,
+            reason = "SipHash-2-4 with fixed keys: a stable keyed digest the standard library still ships"
+        )]
+        fn hasher(k0: u64, k1: u64) -> std::hash::SipHasher {
+            std::hash::SipHasher::new_with_keys(k0, k1)
+        }
+        use std::hash::Hasher;
+        let points = timeline.points();
+        let rows = u32::try_from(points.len()).unwrap_or(u32::MAX);
+        let mut halves = [
+            hasher(0x7461_7065_7374_7279, 0x726f_7773_0000_0001),
+            hasher(0x7461_7065_7374_7279, 0x726f_7773_0000_0002),
+        ];
+        for h in &mut halves {
+            h.write(
+                &u64::try_from(points.len())
+                    .unwrap_or(u64::MAX)
+                    .to_le_bytes(),
+            );
+            for p in points {
+                h.write(&p.pos.0.to_le_bytes());
+                h.write(&p.tempo.units().to_le_bytes());
+            }
+        }
+        let [a, b] = halves.map(|h| h.finish());
+        Self {
+            rows,
+            digest: (u128::from(a) << 64) | u128::from(b),
+        }
+    }
+}
+
 /// A chart's notes by second and its tempo rows, at 1× times.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ChartProfile {
@@ -170,6 +226,10 @@ pub struct ChartProfile {
     bin_seconds: u32,
     speeds: SpeedRows,
     length_ms: u32,
+    /// A play profile's bin of each timeline row; empty in a preview's.
+    row_bins: Box<[u16]>,
+    /// The rows `row_bins` is of; `None` in a preview's.
+    rows: Option<RowIdentity>,
 }
 
 impl ChartProfile {
@@ -177,9 +237,28 @@ impl ChartProfile {
     /// `meta.length` its summary's length. `stops` are the rows, in order,
     /// where a STOP of any positive length starts, which the rows' floored
     /// times cannot tell from a point at the same position.
+    ///
+    /// A play's profile, unlike a preview's, also holds each timeline
+    /// row's bin and the rows' identity ([`row_bins`](Self::row_bins)), by
+    /// which a play counts its judgments over these bins.
     #[must_use]
     pub fn of(chart: &Chart, stops: &[TimelineId]) -> Self {
-        Self::preview(chart, stops, &PreviewInputs::default())
+        let mut profile = Self::preview(chart, stops, &PreviewInputs::default());
+        let (count, width) = (profile.seconds.len(), profile.bin_seconds);
+        profile.row_bins = chart
+            .timeline
+            .points()
+            .iter()
+            .map(|p| {
+                second_of(p.at, count)
+                    .and_then(|s| {
+                        u16::try_from(s / usize::try_from(width.max(1)).unwrap_or(1)).ok()
+                    })
+                    .unwrap_or(NO_BIN)
+            })
+            .collect();
+        profile.rows = Some(RowIdentity::of(&chart.timeline));
+        profile
     }
 
     /// A song list's preview profile of `chart` ([`of`](Self::of)'s
@@ -214,7 +293,26 @@ impl ChartProfile {
             bin_seconds,
             speeds,
             length_ms: ms_of(end),
+            row_bins: Box::default(),
+            rows: None,
         }
+    }
+
+    /// Each timeline row's bin of [`bins`](Self::bins), by row ordinal:
+    /// the bin of the 1× second holding the row's time, [`NO_BIN`] past
+    /// the seconds. Only a play's profile ([`of`](Self::of)) holds them:
+    /// a preview's is empty. They name the rows of
+    /// [`row_identity`](Self::row_identity) and no others.
+    #[must_use]
+    pub fn row_bins(&self) -> &[u16] {
+        &self.row_bins
+    }
+
+    /// The rows [`row_bins`](Self::row_bins) is of: the 1× chart's as the
+    /// loader built them; `None` in a preview's profile.
+    #[must_use]
+    pub const fn row_identity(&self) -> Option<RowIdentity> {
+        self.rows
     }
 
     /// The content's length in whole ms: the chart's
@@ -490,7 +588,10 @@ fn speeds(
 
 #[cfg(test)]
 mod tests {
-    use super::{ChartProfile, PreviewInputs, PreviewTimeline, SCROLL_ONE, SpeedRow};
+    use super::{
+        ChartProfile, NO_BIN, PreviewInputs, PreviewTimeline, RowIdentity, SCROLL_ONE, SpeedRow,
+    };
+    use crate::ChartTimeline;
     use crate::{
         Chart, ChartBuilder, ChartSummary, Lane, Tempo, TimeUs, TimelineId, TimelinePoint,
     };
@@ -563,13 +664,61 @@ mod tests {
         )
     }
 
-    /// Without inputs the preview is the play profile.
+    /// The play profile of `chart` without its rows' bins, which only a
+    /// play's holds.
+    fn play_without_rows(chart: &Chart) -> ChartProfile {
+        let mut play = ChartProfile::of(chart, &[]);
+        assert!(!play.row_bins.is_empty());
+        play.row_bins = Box::default();
+        play.rows = None;
+        play
+    }
+
+    /// Without inputs the preview is the play profile, less the rows'
+    /// bins and identity it never holds.
     #[test]
     fn a_preview_without_inputs_is_the_play_profile() {
         let chart = four_taps();
+        let preview = ChartProfile::preview(&chart, &[], &PreviewInputs::default());
+        assert!(preview.row_bins().is_empty());
+        assert_eq!(preview.row_identity(), None);
+        assert_eq!(preview, play_without_rows(&chart));
+    }
+
+    /// A play profile's rows: each row's bin of its 1× second, none past
+    /// the seconds; their identity kept by the speed remap, which rewrites
+    /// only the times, and changed by a moved position at the same count.
+    #[test]
+    fn a_play_profile_bins_its_rows_by_their_1x_second() {
+        let chart = four_taps();
+        let play = ChartProfile::of(&chart, &[]);
+        assert_eq!(play.row_bins(), [0, 1, 2, 3]);
+        let rows = play.row_identity().unwrap();
+        assert_eq!(rows, RowIdentity::of(&chart.timeline));
+        assert_eq!(rows.rows, 4);
+        let mut remapped = chart.timeline.clone();
+        let halved: Vec<TimeUs> = remapped
+            .points()
+            .iter()
+            .map(|p| TimeUs(p.at.0 / 2))
+            .collect();
+        remapped
+            .remap(&halved, crate::Speed::from_twentieths(30).unwrap())
+            .unwrap();
+        assert_eq!(RowIdentity::of(&remapped), rows);
+        let mut points = chart.timeline.points().to_vec();
+        points[2].pos.0 += 1;
+        let t = chart.timeline.meta();
+        let moved = ChartTimeline::new(points, Vec::new(), t.initial, t.speed).unwrap();
+        let other = RowIdentity::of(&moved);
+        assert_eq!(other.rows, rows.rows);
+        assert_ne!(other.digest, rows.digest);
+        // A row past the seconds is in no bin: a 0.5 s chart has 2.
+        let mut short = chart.clone();
+        short.meta.length = TimeUs(500_000);
         assert_eq!(
-            ChartProfile::preview(&chart, &[], &PreviewInputs::default()),
-            ChartProfile::of(&chart, &[])
+            ChartProfile::of(&short, &[]).row_bins(),
+            [0, 1, NO_BIN, NO_BIN]
         );
     }
 
@@ -594,7 +743,7 @@ mod tests {
         };
         assert_eq!(
             ChartProfile::preview(&chart, &[], &early),
-            ChartProfile::of(&chart, &[])
+            play_without_rows(&chart)
         );
     }
 

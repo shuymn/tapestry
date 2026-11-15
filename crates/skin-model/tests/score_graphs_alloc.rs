@@ -470,6 +470,7 @@ fn score_frames_do_not_allocate() {
     );
     skin_b();
     skin_notes();
+    skin_live();
     skin_c();
     skin_d();
     one_hour();
@@ -1063,4 +1064,70 @@ fn one_hour() {
         assert_eq!(at_x(h, 900.0), 1, "{at}");
     };
     graph_frames("one hour", skin, &chart, score, &check);
+}
+
+/// A play's early/late graph at its cap: 512 bins of 2 s, ten notes in
+/// each, every bin holding one judgment of each of the nine channels and
+/// one note not judged; with the background and the cursors, each frame
+/// at zero allocations draws 512 × 10 chips.
+fn skin_live() {
+    let mut b = ChartBuilder::new(150_000);
+    for bin in 0..512_i64 {
+        for k in 0..10_i64 {
+            b = b.tap(
+                lane(1 + u8::try_from(k % 7).unwrap()),
+                TimeUs((2_000 * bin + 50 * k) * MS),
+            );
+        }
+    }
+    let mut chart = b.build().unwrap();
+    chart.meta.length = bms_model::ChartSummary::of(&chart).length;
+    let profile = bms_model::ChartProfile::of(&chart, &[]);
+    assert_eq!((profile.bins().len(), profile.bin_seconds()), (512, 2));
+    let score = PlayScore {
+        profile: Some(&profile),
+        ..PlayScore::NONE
+    };
+    let def = skin_model::JudgeGraphDef {
+        kind: skin_model::JudgeGraphKind::EarlyLate,
+        delay: TimeUs(0),
+        reverse: false,
+        back: true,
+        chips: 0,
+        solid: 0,
+        fit: skin_model::GraphFit::Stretch,
+    };
+    let skin = graph_skin(
+        vec![screen_el(Source::JudgeGraph(0), [0, 0, 1_024, 500])],
+        PlayDefs {
+            judge_graphs: vec![def],
+            ..PlayDefs::default()
+        },
+    );
+    let ctx = PlayContext {
+        score,
+        ..full(1_000)
+    };
+    let mut h = Harness::new(skin, &chart, &ctx);
+    h.judgments = Some(vec![[1; 9]; 512]);
+    let colors: [u32; 10] = [
+        0x55_5555, 0x44_ff44, 0x00_88ff, 0x00_66cc, 0x00_4488, 0x00_2244, 0xff_8800, 0xcc_6600,
+        0x88_4400, 0x44_2200,
+    ];
+    let chip = |c: [f32; 4]| {
+        colors.iter().any(|&w| {
+            let w = [(w >> 16) & 0xff, (w >> 8) & 0xff, w & 0xff].map(|v| v as f32 / 255.0);
+            w.iter().zip(c).all(|(a, b)| (a - b).abs() < 1e-3)
+        })
+    };
+    let chips = |h: &Harness| h.batch.quads().iter().filter(|q| chip(q.color)).count();
+    assert_eq!(frame(&mut h, -500, tally(0, 0, 0)), 0, "live: ready");
+    assert_eq!(chips(&h), 512 * 10, "live: ready");
+    assert_eq!(frame(&mut h, 1_300, tally(2, 1, 0)), 0, "live: mid-play");
+    assert_eq!(chips(&h), 512 * 10, "live: mid-play");
+    h.play.rearm();
+    h.judgments = Some(vec![[0; 9]; 512]);
+    assert_eq!(frame(&mut h, -500, tally(0, 0, 0)), 0, "live: rearm");
+    // Every note grey: one run a bin.
+    assert_eq!(chips(&h), 512, "live: rearm");
 }

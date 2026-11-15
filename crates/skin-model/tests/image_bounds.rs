@@ -296,18 +296,18 @@ fn headers_are_checked_before_pixels() {
         write(root, name, &at_cap);
         load_small(root, &[name]).unwrap();
     }
-    // Sixteen at the cap fill the total; one texel more passes it.
+    // Eighteen at the cap fill the total; one texel more passes it.
     write(root, "one.png", &png_header(1, 1));
-    assert_eq!(16 * MAX_IMAGE_TEXELS, MAX_TOTAL_TEXELS);
-    let mut names = vec!["cap.png"; 16];
+    assert_eq!(18 * MAX_IMAGE_TEXELS, MAX_TOTAL_TEXELS);
+    let mut names = vec!["cap.png"; 18];
     names.push("one.png");
-    load_small(root, &names[..16]).unwrap();
+    load_small(root, &names[..18]).unwrap();
     let err = load_small(root, &names).unwrap_err();
     assert!(matches!(
         err,
         ImageError::TotalTooLarge {
             at: FileAt {
-                file: 16,
+                file: 18,
                 hi: false
             }
         }
