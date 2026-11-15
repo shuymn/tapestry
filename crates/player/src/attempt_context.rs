@@ -246,6 +246,7 @@ mod tests {
             TimeUs(2_000_000),
             Some(&section),
             TimeUs(1_000_000),
+            TimeUs(6_000_000),
             &ChartLabels {
                 title: "t".to_owned(),
                 subtitle: "s".to_owned(),
@@ -331,6 +332,7 @@ mod tests {
                 TimeUs(0),
                 None,
                 TimeUs(2_000_000),
+                TimeUs(7_000_000),
                 &ChartLabels::default(),
                 &chart,
             );
@@ -369,6 +371,7 @@ mod tests {
             TimeUs(0),
             None,
             TimeUs(1_000_000),
+            TimeUs(6_000_000),
             &ChartLabels::default(),
             &chart,
         );

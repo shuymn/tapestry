@@ -5375,9 +5375,9 @@ fn closing_time_and_deadline_saturate() {
     );
 }
 
-/// A full play's hold deadline is its anchor plus 5 s and the skin's
-/// finish margin, a negative one read as 0, whatever the fadeout is, and
-/// saturates at the end of the clock.
+/// A full play's hold deadline is its finish point, its anchor plus 5 s,
+/// plus the skin's finish margin, a negative one read as 0, whatever the
+/// fadeout is, and saturates at the end of the clock.
 #[test]
 fn hold_until_adds_the_margins_saturating() {
     let ending = game::PlayEnding {
@@ -5386,7 +5386,7 @@ fn hold_until_adds_the_margins_saturating() {
     };
     assert_eq!(game::FINISH_MARGIN, TimeUs(5_000_000));
     assert_eq!(
-        game::hold_until(TimeUs(1_234_567), ending),
+        game::hold_until(game::finish_point(TimeUs(1_234_567)), ending),
         TimeUs(9_234_567)
     );
     let negative = game::PlayEnding {
@@ -5394,7 +5394,7 @@ fn hold_until_adds_the_margins_saturating() {
         ..ending
     };
     assert_eq!(
-        game::hold_until(TimeUs(1_234_567), negative),
+        game::hold_until(game::finish_point(TimeUs(1_234_567)), negative),
         TimeUs(9_234_567)
     );
     let negative_margin = game::PlayEnding {
@@ -5402,15 +5402,18 @@ fn hold_until_adds_the_margins_saturating() {
         ..ending
     };
     assert_eq!(
-        game::hold_until(TimeUs(1_234_567), negative_margin),
+        game::hold_until(game::finish_point(TimeUs(1_234_567)), negative_margin),
         TimeUs(6_234_567)
     );
     assert_eq!(
-        game::hold_until(TimeUs(1_234_567), game::PlayEnding::NONE),
+        game::hold_until(
+            game::finish_point(TimeUs(1_234_567)),
+            game::PlayEnding::NONE
+        ),
         TimeUs(6_234_567)
     );
     assert_eq!(
-        game::hold_until(TimeUs(i64::MAX - 1), ending),
+        game::hold_until(game::finish_point(TimeUs(i64::MAX - 1)), ending),
         TimeUs(i64::MAX)
     );
 }

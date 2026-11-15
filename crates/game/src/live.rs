@@ -857,20 +857,29 @@ impl PlayEnding {
 /// hold lasts past its anchor (design.md "Play Lifecycle", Audio tail).
 pub const FINISH_MARGIN: TimeUs = TimeUs(5_000_000);
 
+/// A full play's finish point for a play whose finish anchor is `anchor`
+/// ([`crate::finish_anchor`]): [`FINISH_MARGIN`] after it, saturating.
+/// Its readouts end there and its hold starts from it (design.md "Play
+/// Lifecycle", Audio tail); [`crate::Loaded::finish`] keeps it per load.
+#[must_use]
+#[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+pub const fn finish_point(anchor: TimeUs) -> TimeUs {
+    TimeUs(anchor.0.saturating_add(FINISH_MARGIN.0))
+}
+
 /// Where a full play's hold may end at the earliest, for a play whose
-/// finish anchor is `anchor`: [`FINISH_MARGIN`] after it, plus the skin's
-/// finish margin, a negative one read as 0, whatever its fadeout is,
+/// finish point is `finish` ([`finish_point`]): the skin's finish margin
+/// after it, a negative one read as 0, whatever its fadeout is,
 /// saturating.
 #[must_use]
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-pub const fn hold_until(anchor: TimeUs, ending: PlayEnding) -> TimeUs {
-    let finished = anchor.0.saturating_add(FINISH_MARGIN.0);
+pub const fn hold_until(finish: TimeUs, ending: PlayEnding) -> TimeUs {
     let margin = if ending.finish_margin.0 > 0 {
         ending.finish_margin.0
     } else {
         0
     };
-    TimeUs(finished.saturating_add(margin))
+    TimeUs(finish.0.saturating_add(margin))
 }
 
 /// Where a full play's fade-out started at play time `start` ends, or
@@ -2379,7 +2388,7 @@ impl TailStage {
             rig.seal_audio();
             let ending = rig.declared_ending();
             Self {
-                end_at: hold_until(loaded.finish_anchor(), ending),
+                end_at: hold_until(loaded.finish(), ending),
                 fadeout: Some(ending.fadeout),
                 repeats: false,
             }
