@@ -560,6 +560,37 @@ fn a_retry_mid_long_note_starts_over_released() {
     assert_all_perfect(&second, judgeable(&chart));
 }
 
+/// The play's judgment bins on the production route (design.md
+/// "Rendering and Skins", the note snapshot): the play maps its notes to
+/// its profile's bins before READY, so autoplay counts every note PERFECT
+/// in its second's bin, 14 in second 1 and one in second 2; a retry's
+/// attempt starts from empty bins and counts only its own.
+#[test]
+fn the_judgment_bins_count_every_autoplayed_note_and_a_retry_starts_empty() {
+    let mut chart = chart();
+    chart.meta.length = bms_model::ChartSummary::of(&chart).length;
+    let (_dir, root) = temp_root();
+    let mut loaded = load(&root, &chart, &DeviceSettings::default(), false);
+    let mut rig = AutoRig::new(&loaded);
+    rig.retry_at = Some(TimeUs(1_200 * MS));
+    let first = play(&mut loaded, &mut rig);
+    assert_eq!(first.end, PlayEnd::Aborted(game::AbortCause::Retry));
+    let first_bins = rig.screen.as_mut().unwrap().view().judge_bins.clone();
+    let first_judged = live_judgments(&first).len();
+    assert!((1..15).contains(&first_judged), "{first_judged}");
+    let total = |b: &game::JudgeBins| b.bins.iter().flatten().sum::<u32>();
+    assert_eq!(total(&first_bins), u32::try_from(first_judged).unwrap());
+    let second = play(&mut loaded, &mut rig);
+    assert_all_perfect(&second, judgeable(&chart));
+    let bins = rig.screen.as_mut().unwrap().view().judge_bins.clone();
+    assert!(bins.available);
+    let mut want = [[0; game::JUDGE_CHANNELS]; 3];
+    want[1][0] = 14;
+    want[2][0] = 1;
+    assert_eq!(&bins.bins[..3], &want);
+    assert_eq!(total(&bins), 15);
+}
+
 /// The key sounds on the schedule are exactly the sounds the evaluator
 /// plays for the generated input (ids and multiplicities, at the same
 /// times), with taps, long note heads, mines, soundless notes and chords;

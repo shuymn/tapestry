@@ -1536,3 +1536,158 @@ fn a_lua_result_skin_reads_the_totals_while_it_loads() {
         assert_eq!(status_x(i, &v), 115.0);
     }
 }
+
+/// A view `v` with the play's target T 1 234 over 900 notes, whose rate
+/// is `⌊12 340 000 / 1 800⌋` = 6 855 basis points.
+fn with_target(mut v: ResultView) -> ResultView {
+    v.chart.target = 1_234;
+    v.chart.notes = Some(900);
+    v
+}
+
+/// The signed digits drawn at `ms` whose top is `top`: each glyph of a
+/// 12 by 2 grid (the second row the negative one) as its digit, a
+/// leading `-` when any is from the negative row.
+fn signed_digits(r: &mut Res, ms: i64, top: f32) -> String {
+    let texels = r.at(ms, top);
+    let digit = |t: [u8; 2]| (t[0] >= 2 && t[0] < 40).then(|| char::from(b'0' + (t[0] - 2) / 4));
+    let negative = texels.iter().any(|t| t[1] == 44);
+    let digits: String = texels
+        .iter()
+        .filter(|t| t[1] == 36 || t[1] == 44)
+        .filter_map(|&t| digit(t))
+        .collect();
+    if negative {
+        format!("-{digits}")
+    } else {
+        digits
+    }
+}
+
+/// The play's target on the result (design.md "Personal Bests", Target):
+/// number 151 draws T and 157 and 158 its rate's whole percent and
+/// hundredths, under every status; 108, 128 and 153 the EX score less T,
+/// signed, and options 352 to 354 the EX score above, below or equal to
+/// T, only with a result (`IntegerPropertyFactory.java:186`, `:192`,
+/// `:196-203`; `BooleanPropertyFactory.java:658-663`).
+#[test]
+fn the_target_numbers_draw_the_plays_target() {
+    const SIGNED: &str = r#""src": "s", "x": 0, "y": 32, "w": 48, "h": 16, "divx": 12, "divy": 2"#;
+    let signed =
+        |id: &str, r: i32| format!(r#"{{"id": "{id}", {SIGNED}, "digit": 5, "ref": {r}}}"#);
+    let at = |id: &str, y: i32, more: &str| {
+        format!(r#"{{"id": "{id}", {more} "dst": [{{"x": 0, "y": {y}, "w": 4, "h": 8}}]}}"#)
+    };
+    let d = folder(&format!(
+        r#""value": [{}, {}, {}, {}, {}, {}, {}],
+           "destination": [{}, {}, {}, {}, {}, {}, {}, {}, {}, {}, {}]"#,
+        value("ex", r#""ref": 71"#),
+        value("t", r#""ref": 151"#),
+        value("rate", r#""ref": 157"#),
+        value("hund", r#""ref": 158"#),
+        signed("d153", 153),
+        signed("d108", 108),
+        signed("d128", 128),
+        dst("ex", ""),
+        at("t", 400, ""),
+        at("rate", 410, ""),
+        at("hund", 420, ""),
+        at("d153", 430, ""),
+        at("d108", 440, ""),
+        at("d128", 450, ""),
+        dst("dot", r#""op": [90],"#),
+        r#"{"id": "b0", "op": [352], "dst": [{"x": 0, "y": 600, "w": 8, "h": 8}]}"#,
+        r#"{"id": "b1", "op": [353], "dst": [{"x": 0, "y": 610, "w": 8, "h": 8}]}"#,
+        r#"{"id": "lamp", "op": [354], "dst": [{"x": 0, "y": 620, "w": 8, "h": 8}]}"#,
+    ));
+    let i = import_result(d.path()).unwrap_or_else(|e| panic!("{e:?}"));
+    let mut r = Res::new(i.skin);
+    let lit = |r: &mut Res| [600.0, 610.0, 620.0].map(|y| !r.at(1_000, top(y, 8.0)).is_empty());
+    let shown = |r: &mut Res| [400.0, 410.0, 420.0].map(|y| r.digits(1_000, top(y, 8.0)));
+    let diffs = |r: &mut Res| [430.0, 440.0, 450.0].map(|y| signed_digits(r, 1_000, top(y, 8.0)));
+    for (ex, diff, win) in [
+        (1_000, "-234", [false, true, false]),
+        (1_234, "0", [false, false, true]),
+        (1_300, "66", [true, false, false]),
+    ] {
+        r.view(&with_target(ready(ex, true, BestView::Unavailable)));
+        assert_eq!(shown(&mut r), ["1234", "68", "55"], "{ex}");
+        assert_eq!(diffs(&mut r), [diff; 3], "{ex}");
+        assert_eq!(lit(&mut r), win, "{ex}");
+    }
+    // With no result: T and its rate still draw; the differences and the
+    // comparisons do not.
+    r.view(&with_target(unavailable()));
+    assert_eq!(shown(&mut r), ["1234", "68", "55"]);
+    assert_eq!(diffs(&mut r), [""; 3]);
+    assert_eq!(lit(&mut r), [false; 3]);
+}
+
+/// The play's target read while a Lua skin loads: 151, 157 and 158 under
+/// every status; 153, 108 and 128 signed, and options 352 to 354, only
+/// with a result, an unavailable view refusing the read.
+#[test]
+fn the_target_reads_while_a_lua_skin_loads() {
+    let ids = [151, 157, 158, 153, 108, 128];
+    let d = reads(&ids);
+    assert_eq!(
+        read_values(&d, &with_target(ready(1_000, true, BestView::Unavailable))),
+        [
+            (151, 1_234),
+            (157, 68),
+            (158, 55),
+            (153, -234),
+            (108, -234),
+            (128, -234)
+        ]
+    );
+    let none = with_target(unavailable());
+    assert_eq!(
+        read_values(&reads(&[151, 157, 158]), &none),
+        [(151, 1_234), (157, 68), (158, 55)]
+    );
+    for id in [153, 108, 128] {
+        match lua_outcome(reads(&[id]).path(), &facts(Some(&none))) {
+            Err(ImportError::Lua {
+                why: LuaWhy::Unavailable { id: got, .. },
+                ..
+            }) => assert_eq!(got, id),
+            other => panic!("{id}: {other:?}"),
+        }
+    }
+    // The comparisons, each read as 0 or 1.
+    let pre: String = (352..=354)
+        .map(|id| format!("local o{id} = ms.option({id})\n"))
+        .collect();
+    let d = minimal_lua(&pre);
+    let options = |v: &ResultView| -> Vec<(i32, i32)> {
+        lua_result(d.path(), &facts(Some(v)))
+            .unwrap()
+            .facts
+            .reads
+            .iter()
+            .map(|r| match (r.fact, r.value) {
+                (FactId::ResultOption(id), FactValue::Int(v)) => (id, v),
+                other => panic!("{other:?}"),
+            })
+            .collect()
+    };
+    for (ex, want) in [(1_000, [0, 1, 0]), (1_234, [0, 0, 1]), (1_300, [1, 0, 0])] {
+        let got = options(&with_target(ready(ex, true, BestView::Unavailable)));
+        assert_eq!(
+            got,
+            [(352, want[0]), (353, want[1]), (354, want[2])],
+            "{ex}"
+        );
+    }
+    assert!(
+        matches!(
+            lua_outcome(d.path(), &facts(Some(&none))),
+            Err(ImportError::Lua {
+                why: LuaWhy::Unavailable { .. },
+                ..
+            })
+        ),
+        "an unavailable view refuses the comparison"
+    );
+}

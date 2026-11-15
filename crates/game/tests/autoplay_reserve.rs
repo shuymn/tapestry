@@ -195,6 +195,8 @@ fn autoplay_buffers_are_charged_and_admitted_before_they_exist() {
         let charge = Reservation {
             fixed: 0,
             per_input: 0,
+            judge_bins: 0,
+            note_bins: 0,
         }
         .with_autoplay(made.events.len(), made.schedule.len())
         .fixed;

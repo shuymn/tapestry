@@ -212,6 +212,7 @@ pub const IN_PLAY: &[Site] = &[
     ),
     Site::File("crates/game/src/hispeed.rs"),
     Site::File("crates/game/src/readouts.rs"),
+    Site::File("crates/game/src/judge_bins.rs"),
     Site::File("crates/game/src/logic.rs"),
     Site::File("crates/game/src/ready_history.rs"),
     Site::File("crates/game/src/render.rs"),

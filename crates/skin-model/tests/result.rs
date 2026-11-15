@@ -301,6 +301,38 @@ fn the_judgment_class_is_the_charts_under_every_status() {
     }
 }
 
+/// The play's target and its rate are filled under every status (design.md
+/// "Personal Bests", Target): T 1 234 over 900 notes reads 1 234 and
+/// `⌊12 340 000 / 1 800⌋` = 6 855 basis points, ready or unavailable; with
+/// the notes unknown the rate is 0, with no note it is 0, and a target
+/// past the bound reads at [`VALUE_MAX`](skin_model::RESULT_VALUE_MAX).
+#[test]
+fn the_target_and_its_rate_fill_under_every_status() {
+    let fields = |status, target, notes| {
+        let mut v = ready(1_000, BestView::Unavailable, 4);
+        v.status = status;
+        v.chart.target = target;
+        v.chart.notes = notes;
+        let f = ResultFields::of(&v).0;
+        [
+            f[usize::from(field::TARGET_EX)],
+            f[usize::from(field::TARGET_RATE_BP)],
+        ]
+    };
+    let unavailable = ResultStatus::Unavailable(Unavailable::Failed);
+    for status in [ResultStatus::Ready, unavailable] {
+        assert_eq!(
+            fields(status, 1_234, Some(900)),
+            [1_234, 6_855],
+            "{status:?}"
+        );
+        assert_eq!(fields(status, 1_234, None), [1_234, 0], "{status:?}");
+        assert_eq!(fields(status, 7, Some(0)), [7, 0], "{status:?}");
+    }
+    let max = skin_model::RESULT_VALUE_MAX;
+    assert_eq!(fields(unavailable, u32::MAX, Some(1)), [max, max]);
+}
+
 /// The fields a result state reads after a view are exactly
 /// [`ResultFields::of`] that view, the conversion an import reads at load:
 /// for shown, hidden and unavailable values and an unavailable view.
