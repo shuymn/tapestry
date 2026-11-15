@@ -459,6 +459,10 @@ impl Screen {
 /// it reads is absent here, where the pinned source defines one (owner
 /// decision O8; docs/stage3.md S7-07). `None`: no such value, the typed
 /// constant 0 applies. `IntegerPropertyFactory.java` is cited as `IPF`.
+/// The runtime asks this only for an id its screen's profile does not
+/// bridge (`host::runtime_number`), so an entry below whose id that
+/// profile bridges is the source's value without the feature and is
+/// never reached on that screen.
 ///
 /// Both screens:
 /// - 14, 314-316 (lane cover, lift, hidden) and 160, 163, 164 (current BPM,
@@ -475,22 +479,26 @@ impl Screen {
 ///   `:985-986`; `RankingData.java:188-193`, `getScore`, and `:201-206`,
 ///   `getScoreRanking`).
 /// - 92, 350-353, 360-365 (main BPM, note counts per class, density), song
-///   information, which no bridge supplies yet: `Integer.MIN_VALUE`, as
-///   with no song information (`IPF:167-173`, `:319-388`).
+///   information: `Integer.MIN_VALUE`, as with no song information
+///   (`IPF:167-173`, `:319-388`). The result has no bridge for them;
+///   selection's profile bridges them from the scan's previews
+///   (docs/stage3.md S10-10).
 ///
 /// Selection:
 /// - 75, 105, 174 (the best's max combo), 78-89 (its clear and fail
-///   counts, judgment counts and rates), none kept here:
-///   `Integer.MIN_VALUE`, as with no score (`IPF:131`, `:140-153`, `:182`,
-///   `:234`, `:500-511`, `:627-632`).
+///   counts, judgment counts and rates): `Integer.MIN_VALUE`, as with no
+///   score (`IPF:131`, `:140-153`, `:182`, `:234`, `:500-511`,
+///   `:627-632`); the profile bridges them from the best play's breakdown
+///   (docs/stage3.md S10-14).
 /// - 107, 407 (the gauge), 173, 175, 176, 178 (the best's combo and BP and
 ///   their differences) and 370-377 (clear type, timing statistics),
 ///   play or result only: `Integer.MIN_VALUE` (`IPF:184-185`, `:233-238`,
 ///   `:396-440`, `:658-688`, `:712-753`).
 /// - 243-249 (the last play's date), 320-330 (a folder's lamps) and 368
-///   (gauge TOTAL), which no bridge supplies yet: `Integer.MIN_VALUE`, as
-///   with no score, no folder row or no song information (`IPF:281-287`,
-///   `:770-810`, `:389-395`, `:996-999`).
+///   (gauge TOTAL): `Integer.MIN_VALUE`, as with no score, no folder row
+///   or no song information (`IPF:281-287`, `:770-810`, `:389-395`,
+///   `:996-999`). No bridge supplies 243-249 or 320-330 yet; the profile
+///   bridges 368 from the scan's previews (docs/stage3.md S10-10).
 /// - 122, 135, 157, the rival's rate, with no rival: 100, the rate being
 ///   1.0 (`IPF:190`, `:193`, `:202`; `ScoreDataProperty.java:56-60`); 123,
 ///   136, 158 give 0.
@@ -498,12 +506,13 @@ impl Screen {
 ///   `ScoreDataProperty.java:55-58`).
 /// - 410-427, the early and late counts and their sums, with no score: 0
 ///   (`IPF:444-467`, `:516-520`, over `MainState.getJudgeCount`,
-///   `MainState.java:141-144`).
+///   `MainState.java:141-144`); the profile bridges them from the best
+///   play's breakdown (docs/stage3.md S10-14).
 ///
 /// Result:
-/// - 173, 175 (the best's max combo and its difference), which no bridge
-///   supplies yet: `Integer.MIN_VALUE`, as with no best (`IPF:233`,
-///   `:235`, `:734-753`).
+/// - 173, 175 (the best's max combo and its difference):
+///   `Integer.MIN_VALUE`, as with no best (`IPF:233`, `:235`,
+///   `:734-753`); the profile bridges them (docs/stage3.md S10-14).
 /// - 77-79 (play, clear and fail counts), 300 (a folder's songs) and
 ///   320-330 (a folder's lamps), selection only: `Integer.MIN_VALUE`
 ///   (`IPF:133-153`, `:289`, `:800-810`, `:996-999`).
