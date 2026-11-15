@@ -5,7 +5,7 @@
 use std::collections::HashMap;
 use std::fmt;
 
-use bms_model::{Chart, ChartSummary, Speed};
+use bms_model::{Chart, ChartSummary, Note, Speed, TimeUs};
 use eval::{Evaluation, JudgeEventKind};
 use replay::{EndStatus, PlayRecord, PlayType};
 use rules::{PerJudgment, RulePreset};
@@ -16,7 +16,7 @@ use sha2::{Digest as _, Sha256};
 /// The version of the rules bests are derived by: eligibility, the values
 /// and how a play is identified. A change bumps it, and opening the
 /// database then clears every best and rebuilds them from the records.
-pub const BESTS_VERSION: i64 = 3;
+pub const BESTS_VERSION: i64 = 5;
 
 /// The LN mode bests are keyed by: the only one the evaluator judges, LN.
 pub const LN_MODE: i64 = 1;
@@ -336,8 +336,142 @@ pub struct Key {
     pub chart_sha256: [u8; 32],
 }
 
-/// One verified, saved play's contribution: one play to its key, and its
-/// values when it is eligible.
+/// The kind of play a key's play count and sums are kept by, each in its
+/// own columns (design.md "Personal Bests"): a practice round, from a
+/// mid-chart start or a section repeat, or any other play. The totals a
+/// skin reads add both.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PlayKind {
+    /// A play of the whole chart, at any speed, ended midway or not.
+    #[default]
+    Normal,
+    /// A practice round.
+    Practice,
+}
+
+impl PlayKind {
+    /// The kind of `record`'s play.
+    #[must_use]
+    pub const fn of(record: &PlayRecord) -> Self {
+        if record.play_type.practice().is_some() {
+            Self::Practice
+        } else {
+            Self::Normal
+        }
+    }
+
+    /// The columns of its play count and sums: the count, then [`Sums`]'
+    /// order.
+    const fn columns(self) -> [&'static str; 7] {
+        match self {
+            Self::Normal => [
+                "plays",
+                "sum_perfect",
+                "sum_great",
+                "sum_good",
+                "sum_bad",
+                "sum_poor",
+                "sum_play_us",
+            ],
+            Self::Practice => [
+                "practice_plays",
+                "practice_sum_perfect",
+                "practice_sum_great",
+                "practice_sum_good",
+                "practice_sum_bad",
+                "practice_sum_poor",
+                "practice_sum_play_us",
+            ],
+        }
+    }
+}
+
+/// What one counted play adds to its key's sums, eligible or not, and so
+/// to the player's totals (design.md "Personal Bests").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Sums {
+    /// Its PERFECT, GREAT, GOOD, BAD and POOR counts, POOR as the preset's
+    /// tally counts it.
+    pub counts: [u32; 5],
+    /// Its play time in µs ([`play_us`]).
+    pub play_us: u64,
+}
+
+/// The player's totals over every key (design.md "Personal Bests"): the
+/// plays and clears counted, and the [`Sums`] of those plays.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Totals {
+    /// Plays counted, every chart, preset and LN mode included.
+    pub plays: u64,
+    /// The clears among them.
+    pub clears: u64,
+    /// Their PERFECT, GREAT, GOOD, BAD and POOR totals.
+    pub counts: [u64; 5],
+    /// Their play time in µs.
+    pub play_us: u64,
+}
+
+/// The player's totals kept per [`PlayKind`]: practice rounds' apart from
+/// the other plays', so either can be shown alone. A practice round is
+/// never a clear.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct TotalsByKind {
+    /// Every play but practice rounds.
+    pub normal: Totals,
+    /// Practice rounds.
+    pub practice: Totals,
+}
+
+impl TotalsByKind {
+    /// Both kinds added: the totals a skin reads. Each part is at most
+    /// SQLite's largest integer, so the sum never saturates.
+    #[must_use]
+    pub fn sum(&self) -> Totals {
+        let (a, b) = (&self.normal, &self.practice);
+        let mut counts = a.counts;
+        for (c, add) in counts.iter_mut().zip(b.counts) {
+            *c = c.saturating_add(add);
+        }
+        Totals {
+            plays: a.plays.saturating_add(b.plays),
+            clears: a.clears.saturating_add(b.clears),
+            counts,
+            play_us: a.play_us.saturating_add(b.play_us),
+        }
+    }
+}
+
+/// How far into the chart `record`'s play ran, in µs: the latest end (a
+/// long note's end) among the notes `evaluation` judged, misses included,
+/// never past an aborted play's finalized watermark, less its evaluated
+/// range's start (0 for a full play, the section's start for a practice
+/// round); 0 when it judged none. `chart` is the one evaluated, at the
+/// record's speed, so the time is the time played.
+// Source: SF-014
+#[must_use]
+pub fn play_us(record: &PlayRecord, evaluation: &Evaluation, chart: &Chart) -> u64 {
+    let last = evaluation
+        .events
+        .iter()
+        .filter_map(|e| match e.kind {
+            JudgeEventKind::Judged { lane, note, .. } => {
+                chart.lanes.get(lane.index())?.get(note).map(Note::end)
+            }
+            _ => None,
+        })
+        .max();
+    let Some(mut end) = last else {
+        return 0;
+    };
+    if record.status.end == EndStatus::EndedMidway {
+        end = end.min(record.status.finalized);
+    }
+    let start = record.play_type.practice().map_or(TimeUs(0), |p| p.start);
+    u64::try_from(end.0.saturating_sub(start.0)).unwrap_or(0)
+}
+
+/// One verified, saved play's contribution: one play to its key, its sums,
+/// and its values when it is eligible.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Contribution {
     /// Where it counts.
@@ -350,6 +484,10 @@ pub struct Contribution {
     pub clear: bool,
     /// Why it sets no best, when it does not.
     pub ineligible: Option<Ineligible>,
+    /// What it adds to its key's sums, eligible or not.
+    pub sums: Sums,
+    /// The kind whose play count and sums it adds to.
+    pub kind: PlayKind,
 }
 
 impl Contribution {
@@ -368,6 +506,11 @@ impl Contribution {
         preset: &RulePreset,
     ) -> Self {
         let ineligible = ineligible(record, Some(verified), true);
+        let per = |p: &PerJudgment<u32>| [p.perfect, p.great, p.good, p.bad, p.poor];
+        let sums = Sums {
+            counts: per(&evaluation.tally.counts),
+            play_us: play_us(record, evaluation, chart),
+        };
         let best = ineligible.is_none().then(|| {
             let mut cleared = vec![0_u8; evaluation.gauges.len().div_ceil(8)];
             for (i, g) in evaluation.gauges.iter().enumerate() {
@@ -383,7 +526,6 @@ impl Contribution {
             });
             let empty_poor = preset.empty_poor.breaks_combo && evaluation.tally.empty_poor > 0;
             let t = &evaluation.tally;
-            let per = |p: &PerJudgment<u32>| [p.perfect, p.great, p.good, p.bad, p.poor];
             let summary = ChartSummary::of(chart);
             Best {
                 ex: t.ex_score,
@@ -416,9 +558,15 @@ impl Contribution {
             clear: best.as_ref().is_some_and(Best::lamp_cleared),
             best,
             ineligible,
+            sums,
+            kind: PlayKind::of(record),
         }
     }
 }
+
+/// The columns of a key's play counts and sums: [`PlayKind::Normal`]'s,
+/// then [`PlayKind::Practice`]'s.
+const PART_COLUMNS: [[&str; 7]; 2] = [PlayKind::Normal.columns(), PlayKind::Practice.columns()];
 
 /// What [`ingest`] did.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -467,29 +615,61 @@ pub(crate) fn ingest(conn: &Connection, c: &Contribution) -> rusqlite::Result<In
     };
     let b = current.best.as_ref();
     let count = |n: u64| i64::try_from(n).unwrap_or(i64::MAX);
+    // The play adds one play and its sums to its kind's columns and 0 to
+    // the other kind's, each saturating, in the same upsert: addition
+    // commutes, so live counting and a rebuild agree in any order.
+    let parts = PART_COLUMNS.as_flattened();
+    let added = parts.iter().map(|c| {
+        format!(
+            "{c} = CASE WHEN {c} > {max} - excluded.{c} THEN {max} ELSE {c} + excluded.{c} END",
+            max = i64::MAX
+        )
+    });
+    let [s0, s1, s2, s3, s4] = c.sums.counts.map(i64::from);
+    let own = [1, s0, s1, s2, s3, s4, count(c.sums.play_us)];
+    let values =
+        [PlayKind::Normal, PlayKind::Practice].map(|k| if k == c.kind { own } else { [0; 7] });
+    let (cleared, play) = (b.map(|b| b.cleared.clone()), b.map(|b| b.play.to_bytes()));
+    let best: [&dyn rusqlite::ToSql; 11] = [
+        &k.preset_sha256,
+        &k.ln_mode,
+        &k.chart_sha256,
+        &count(current.clears),
+        &b.map(|b| b.ex),
+        &b.map(|b| b.bp),
+        &b.map(|b| b.max_combo),
+        &cleared,
+        &b.is_some_and(|b| b.full_combo),
+        &b.map(|b| b.play.body_sha256),
+        &play,
+    ];
+    let params: Vec<&dyn rusqlite::ToSql> = best
+        .into_iter()
+        .chain(
+            values
+                .as_flattened()
+                .iter()
+                .map(|v| v as &dyn rusqlite::ToSql),
+        )
+        .collect();
+    let placeholders = (1..=params.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
     conn.execute(
-        "INSERT INTO scores (preset_sha256, ln_mode, chart_sha256, plays, clears, best_ex,
-             best_bp, best_combo, cleared, full_combo, play_sha256, play)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
-         ON CONFLICT (preset_sha256, ln_mode, chart_sha256) DO UPDATE SET
-             plays = excluded.plays, clears = excluded.clears, best_ex = excluded.best_ex,
-             best_bp = excluded.best_bp, best_combo = excluded.best_combo,
-             cleared = excluded.cleared, full_combo = excluded.full_combo,
-             play_sha256 = excluded.play_sha256, play = excluded.play",
-        params![
-            k.preset_sha256,
-            k.ln_mode,
-            k.chart_sha256,
-            count(current.plays),
-            count(current.clears),
-            b.map(|b| b.ex),
-            b.map(|b| b.bp),
-            b.map(|b| b.max_combo),
-            b.map(|b| b.cleared.clone()),
-            b.is_some_and(|b| b.full_combo),
-            b.map(|b| b.play.body_sha256),
-            b.map(|b| b.play.to_bytes()),
-        ],
+        &format!(
+            "INSERT INTO scores (preset_sha256, ln_mode, chart_sha256, clears, best_ex,
+                 best_bp, best_combo, cleared, full_combo, play_sha256, play, {parts})
+             VALUES ({placeholders})
+             ON CONFLICT (preset_sha256, ln_mode, chart_sha256) DO UPDATE SET
+                 clears = excluded.clears, best_ex = excluded.best_ex,
+                 best_bp = excluded.best_bp, best_combo = excluded.best_combo,
+                 cleared = excluded.cleared, full_combo = excluded.full_combo,
+                 play_sha256 = excluded.play_sha256, play = excluded.play, {added}",
+            parts = parts.join(", "),
+            added = added.collect::<Vec<_>>().join(", "),
+        ),
+        params.as_slice(),
     )?;
     conn.execute("DELETE FROM refused WHERE path = ?1", [&id.path])?;
     Ok(Ingested::Counted { previous, current })
@@ -516,7 +696,10 @@ fn score_of(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Score> {
         let n: i64 = r.get(at + i)?;
         u64::try_from(n).map_err(|_| inconsistent(i, what))
     };
+    // A best and its clears come from normal plays alone, so they are
+    // checked against those; the score's play count adds both kinds.
     let plays = count(0, "a negative play count")?;
+    let practice_plays = count(9, "a negative play count")?;
     let clears = count(1, "a negative clear count")?;
     if clears > plays {
         return Err(inconsistent(1, "more clears than plays"));
@@ -575,7 +758,7 @@ fn score_of(r: &rusqlite::Row<'_>, at: usize) -> rusqlite::Result<Score> {
         }
     };
     Ok(Score {
-        plays,
+        plays: plays.saturating_add(practice_plays),
         clears,
         best,
     })
@@ -595,8 +778,8 @@ impl fmt::Display for Inconsistent {
 impl std::error::Error for Inconsistent {}
 
 /// The columns [`score_of`] reads, in its order.
-const SCORE_COLUMNS: &str =
-    "plays, clears, best_ex, best_bp, best_combo, cleared, full_combo, play_sha256, play";
+const SCORE_COLUMNS: &str = "plays, clears, best_ex, best_bp, best_combo, cleared, full_combo, \
+     play_sha256, play, practice_plays";
 
 /// The stored score of `key`.
 pub(crate) fn score(conn: &Connection, key: &Key) -> rusqlite::Result<Option<Score>> {
@@ -609,6 +792,60 @@ pub(crate) fn score(conn: &Connection, key: &Key) -> rusqlite::Result<Option<Sco
         |r| score_of(r, 0),
     )
     .optional()
+}
+
+/// The player's totals per kind: one sum of each column over every row of
+/// `scores`, every preset and LN mode included, 0 with no row. A negative
+/// stored count or sum, or a part's total past SQLite's integer range, is
+/// a failed read, never a default.
+pub(crate) fn totals(conn: &Connection) -> rusqlite::Result<TotalsByKind> {
+    let parts = PART_COLUMNS.as_flattened();
+    let sums = parts
+        .iter()
+        .map(|c| format!("SUM({c})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let least = parts.join(", ");
+    conn.query_row(
+        &format!("SELECT MIN(MIN(clears, {least})), SUM(clears), {sums} FROM scores"),
+        [],
+        |r| {
+            let negative = |i: usize| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    i,
+                    Type::Integer,
+                    Box::new(Inconsistent("a negative count or sum")),
+                )
+            };
+            if r.get::<_, Option<i64>>(0)?.is_some_and(|m| m < 0) {
+                return Err(negative(0));
+            }
+            let total = |i: usize| -> rusqlite::Result<u64> {
+                let n: Option<i64> = r.get(i)?;
+                u64::try_from(n.unwrap_or(0)).map_err(|_| negative(i))
+            };
+            // Each kind's play count, five counts and play time, from
+            // column `at` on.
+            let part = |at: usize, clears: u64| -> rusqlite::Result<Totals> {
+                Ok(Totals {
+                    plays: total(at)?,
+                    clears,
+                    counts: [
+                        total(at + 1)?,
+                        total(at + 2)?,
+                        total(at + 3)?,
+                        total(at + 4)?,
+                        total(at + 5)?,
+                    ],
+                    play_us: total(at + 6)?,
+                })
+            };
+            Ok(TotalsByKind {
+                normal: part(2, total(1)?)?,
+                practice: part(9, 0)?,
+            })
+        },
+    )
 }
 
 /// Every chart's score under a preset and LN mode, by chart SHA-256.
@@ -631,7 +868,11 @@ pub(crate) fn scores(
 mod tests {
     use rusqlite::Connection;
 
-    use super::{BREAKDOWN_BYTES, Best, Breakdown, Contribution, Key, LN_MODE, PlayId, Score};
+    use super::{
+        BREAKDOWN_BYTES, Best, Breakdown, Contribution, Key, LN_MODE, PlayId, PlayKind, Score,
+        Sums, Totals, TotalsByKind, Verified,
+    };
+    use crate::test_common as common;
 
     /// A breakdown of EX `ex` and max combo `combo` for the play hashed
     /// `body`, its other values derived from all three so plays differ.
@@ -672,6 +913,16 @@ mod tests {
         c.best.as_ref().unwrap().play
     }
 
+    /// The sums the play hashed `body` adds, each derived from `body` so
+    /// plays differ.
+    fn sums(body: u8) -> Sums {
+        let v = u32::from(body);
+        Sums {
+            counts: [v, v + 1, 2 * v, v * v, 3],
+            play_us: 1_000_003 * u64::from(body),
+        }
+    }
+
     /// A contribution of the play hashed `body`, saved as `c/<body>.tprl`;
     /// ineligible without a best.
     fn contribution(body: u8, best: Option<Best>) -> Contribution {
@@ -690,6 +941,8 @@ mod tests {
             clear: best.as_ref().is_some_and(Best::lamp_cleared),
             ineligible: best.is_none().then_some(super::Ineligible::NotFullPlay),
             best,
+            sums: sums(body),
+            kind: PlayKind::Normal,
         }
     }
 
@@ -703,11 +956,19 @@ mod tests {
     /// The score that counting `cs` in order through [`super::ingest`]
     /// stores, in a database of its own.
     fn fold(cs: &[&Contribution]) -> Score {
+        fold_both(cs).0
+    }
+
+    /// The score and the totals counting `cs` in order stores.
+    fn fold_both(cs: &[&Contribution]) -> (Score, Totals) {
         let conn = database();
         for c in cs {
             super::ingest(&conn, c).unwrap();
         }
-        super::score(&conn, &cs[0].key).unwrap().unwrap()
+        (
+            super::score(&conn, &cs[0].key).unwrap().unwrap(),
+            super::totals(&conn).unwrap().sum(),
+        )
     }
 
     fn permutations<'a>(items: &[&'a Contribution]) -> Vec<Vec<&'a Contribution>> {
@@ -849,12 +1110,20 @@ mod tests {
         super::ingest(&conn, &c).unwrap();
         let score = || super::score(&conn, &c.key);
         assert_eq!(score().unwrap().map(|s| (s.plays, s.clears)), Some((1, 1)));
+        // Past the CHECKs, as a file written by other means could be.
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
         // Each change breaks one relation only, and is read back as that
         // one.
         for (set, undo, why) in [
             (
                 "plays = -1, clears = 0",
                 "plays = 1, clears = 1",
+                "a negative play count",
+            ),
+            (
+                "practice_plays = -1",
+                "practice_plays = 0",
                 "a negative play count",
             ),
             ("clears = -1", "clears = 1", "a negative clear count"),
@@ -975,7 +1244,17 @@ mod tests {
         let refs: Vec<&Contribution> = cs.iter().collect();
         let all = permutations(&refs);
         assert_eq!(all.len(), 120);
-        let first = fold(&all[0]);
+        let (first, totals) = fold_both(&all[0]);
+        // Every play's sums, added: bodies 4 to 8.
+        assert_eq!(
+            totals,
+            Totals {
+                plays: 5,
+                clears: 3,
+                counts: [30, 35, 60, 190, 15],
+                play_us: 30_000_090,
+            }
+        );
         let b = first.best.as_ref().unwrap();
         assert_eq!(
             (first.plays, first.clears, b.ex, b.bp, b.max_combo),
@@ -985,7 +1264,7 @@ mod tests {
         assert_eq!(b.play, play_of(&cs[1]));
         assert_eq!(b.ex, b.play.ex);
         for order in &all[1..] {
-            assert_eq!(fold(order), first);
+            assert_eq!(fold_both(order), (first.clone(), totals));
         }
         let [x, y, z] = [&cs[0], &cs[1], &cs[2]].map(|c| c.best.clone().unwrap());
         assert_eq!(x.merged(&y).merged(&z), x.merged(&y.merged(&z)));
@@ -996,6 +1275,272 @@ mod tests {
     fn a_play_counted_again_changes_nothing() {
         let c = contribution(5, Some(best(play(5, 6, 2), 4, 1, false)));
         assert_eq!(fold(&[&c, &c]), fold(&[&c]));
+    }
+
+    /// A play counted again adds nothing to the totals.
+    #[test]
+    fn a_play_counted_again_adds_no_totals() {
+        let c = contribution(5, None);
+        let once = database();
+        super::ingest(&once, &c).unwrap();
+        let twice = database();
+        super::ingest(&twice, &c).unwrap();
+        assert_eq!(
+            super::ingest(&twice, &c).unwrap(),
+            super::Ingested::AlreadyCounted
+        );
+        let expected = Totals {
+            plays: 1,
+            clears: 0,
+            counts: [5, 6, 10, 25, 3],
+            play_us: 5_000_015,
+        };
+        assert_eq!(super::totals(&once).unwrap().sum(), expected);
+        assert_eq!(super::totals(&twice).unwrap().sum(), expected);
+    }
+
+    /// A sum saturates at the largest stored integer, and the totals of an
+    /// empty table are 0.
+    #[test]
+    fn a_sum_saturates() {
+        let conn = database();
+        assert_eq!(super::totals(&conn).unwrap(), TotalsByKind::default());
+        let first = contribution(5, None);
+        super::ingest(&conn, &first).unwrap();
+        conn.execute(
+            "UPDATE scores SET sum_play_us = ?1, sum_perfect = ?1",
+            [i64::MAX - 1],
+        )
+        .unwrap();
+        super::ingest(&conn, &contribution(6, None)).unwrap();
+        let t = super::totals(&conn).unwrap().sum();
+        assert_eq!((t.play_us, t.counts[0]), (i64::MAX as u64, i64::MAX as u64));
+        assert_eq!((t.plays, t.counts[1]), (2, 13));
+    }
+
+    /// A negative stored count or sum of either kind, even beside a larger
+    /// positive one, or a part's total past SQLite's integer range is a
+    /// failed read of the totals, never a default.
+    #[test]
+    fn a_negative_sum_is_a_read_error() {
+        let conn = database();
+        super::ingest(&conn, &contribution(5, None)).unwrap();
+        let mut other = contribution(6, None);
+        other.key.chart_sha256 = [3; 32];
+        super::ingest(&conn, &other).unwrap();
+        // Past the CHECKs, as a file written by other means could be.
+        conn.execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        for column in super::PART_COLUMNS
+            .as_flattened()
+            .iter()
+            .copied()
+            .chain(["clears"])
+        {
+            conn.execute(
+                &format!("UPDATE scores SET {column} = -1 WHERE chart_sha256 = ?1"),
+                [[2_u8; 32]],
+            )
+            .unwrap();
+            let e = super::totals(&conn).unwrap_err();
+            assert!(
+                matches!(e, rusqlite::Error::FromSqlConversionFailure(..))
+                    && e.to_string().contains("a negative count or sum"),
+                "{column}: {e}"
+            );
+            conn.execute(
+                &format!("UPDATE scores SET {column} = 1 WHERE chart_sha256 = ?1"),
+                [[2_u8; 32]],
+            )
+            .unwrap();
+            assert!(super::totals(&conn).is_ok(), "{column} restored");
+        }
+        conn.execute("UPDATE scores SET sum_play_us = ?1", [i64::MAX])
+            .unwrap();
+        let e = super::totals(&conn).unwrap_err();
+        assert!(e.to_string().contains("integer overflow"), "{e}");
+    }
+
+    /// The play time `Contribution::of` gives `record` of the chart in
+    /// `text`, as the live path makes it.
+    fn time_of(text: &str, record: &replay::PlayRecord) -> u64 {
+        let dir = tempfile::tempdir().unwrap();
+        let chart =
+            replay::verify::load_recorded_chart(record, text.as_bytes(), dir.path()).unwrap();
+        let re = replay::verify::evaluate_record(record, &chart, None).unwrap();
+        let preset = replay::verify::check_record(record).unwrap();
+        let c = Contribution::of(
+            PlayId::of(String::new(), record, 0, 0),
+            record,
+            &Verified {
+                completed: re.evaluation.completed,
+            },
+            &re.evaluation,
+            &chart,
+            &preset,
+        );
+        c.sums.play_us
+    }
+
+    /// A play's time reaches its last judged note's end (a long note's
+    /// end, where the source counts its head: 2 s in the first three
+    /// cases), never past an aborted play's finalized watermark, less a
+    /// practice round's section start, and is 0 with no judged note.
+    // Source: SF-014
+    #[test]
+    fn a_plays_time_reaches_its_last_judged_note() {
+        use common::{MS, key, record_of};
+        // One long note on key 1 from 2 s to 10 s: the chart's last note.
+        let long = "#BPM 120\n#LNTYPE 1\n#00151:01\n#00551:01\n";
+        let at = |ms: i64| bms_model::TimeUs(ms * MS);
+        let held = record_of(long, 0, vec![key(1, 2_000 * MS, 1), key(1, 10_010 * MS, 0)]);
+        assert_eq!(time_of(long, &held), 10_000_000, "held to its end");
+        let missed = record_of(long, 0, Vec::new());
+        assert_eq!(time_of(long, &missed), 10_000_000, "its head missed");
+        let early = record_of(long, 0, vec![key(1, 2_000 * MS, 1), key(1, 6_000 * MS, 0)]);
+        assert_eq!(time_of(long, &early), 10_000_000, "released at 6 s");
+        let mut aborted = record_of(long, 0, Vec::new());
+        aborted.status.end = replay::EndStatus::EndedMidway;
+        aborted.status.finalized = at(3_000);
+        assert_eq!(time_of(long, &aborted), 3_000_000, "aborted at 3 s");
+        // Taps on key 1 at 2 s, 2.5 s and 3 s; ended at 2.9 s, the 2.5 s
+        // tap missed (judged at 2.68 s), the 3 s one not reached.
+        let taps = "#BPM 120\n#00111:01010100\n";
+        let mut midway = record_of(taps, 0, vec![key(1, 2_000 * MS, 1), key(1, 2_050 * MS, 0)]);
+        midway.status.end = replay::EndStatus::EndedMidway;
+        midway.status.finalized = at(2_900);
+        assert_eq!(time_of(taps, &midway), 2_500_000, "the missed tap counts");
+        // A round of the long note from 1.5 s: 10 s less 1.5 s.
+        let mut round = record_of(long, 0, vec![key(1, 2_000 * MS, 1), key(1, 10_010 * MS, 0)]);
+        let preset = rules::tapestry();
+        round.play_type = replay::PlayType::SectionRepeat(replay::Practice {
+            start: at(1_500),
+            end: at(10_500),
+            lead_in: at(1_000),
+            attempt: 1,
+            initial_gauges: preset
+                .gauges
+                .iter()
+                .map(|g| replay::InitialGauge {
+                    id: g.id.clone(),
+                    value: g.start,
+                })
+                .collect(),
+        });
+        assert_eq!(time_of(long, &round), 8_500_000, "less the section's start");
+        // Ended before any note was judged.
+        let mut none = record_of(taps, 0, Vec::new());
+        none.status.end = replay::EndStatus::EndedMidway;
+        none.status.finalized = at(1_000);
+        assert_eq!(time_of(taps, &none), 0, "nothing judged");
+    }
+
+    /// A practice round adds its play, counts and time to the practice part
+    /// only, and a normal play to the normal part only; the totals a skin
+    /// reads add both, and the key's play count (number 77) counts both.
+    #[test]
+    fn a_practice_round_counts_in_its_own_part() {
+        let conn = database();
+        let normal = contribution(5, Some(best(play(5, 6, 2), 4, 1, false)));
+        let mut practice = contribution(7, None);
+        practice.kind = PlayKind::Practice;
+        super::ingest(&conn, &normal).unwrap();
+        super::ingest(&conn, &practice).unwrap();
+        let parts = super::totals(&conn).unwrap();
+        assert_eq!(
+            parts.practice,
+            Totals {
+                plays: 1,
+                clears: 0,
+                counts: [7, 8, 14, 49, 3],
+                play_us: 7_000_021,
+            },
+            "practice"
+        );
+        assert_eq!(
+            parts.normal,
+            Totals {
+                plays: 1,
+                clears: 1,
+                counts: [5, 6, 10, 25, 3],
+                play_us: 5_000_015,
+            },
+            "normal"
+        );
+        assert_eq!(
+            parts.sum(),
+            Totals {
+                plays: 2,
+                clears: 1,
+                counts: [12, 14, 24, 74, 6],
+                play_us: 12_000_036,
+            }
+        );
+        let score = super::score(&conn, &normal.key).unwrap().unwrap();
+        assert_eq!((score.plays, score.clears), (2, 1));
+    }
+
+    /// A mid-chart start and a section repeat are practice rounds at 1×,
+    /// at another speed and when quit midway; a play of the whole chart at
+    /// another speed or quit midway is a normal play.
+    #[test]
+    fn a_plays_kind_is_practice_only_for_a_practice_round() {
+        let full = common::record_of("#BPM 120\n#00111:01\n", 0, Vec::new());
+        let preset = rules::tapestry();
+        let practice = replay::Practice {
+            start: bms_model::TimeUs(1_500 * common::MS),
+            end: bms_model::TimeUs(4_500 * common::MS),
+            lead_in: bms_model::TimeUs(1_000 * common::MS),
+            attempt: 1,
+            initial_gauges: preset
+                .gauges
+                .iter()
+                .map(|g| replay::InitialGauge {
+                    id: g.id.clone(),
+                    value: g.start,
+                })
+                .collect(),
+        };
+        let variant = |play_type: replay::PlayType, speed: bms_model::Speed, midway: bool| {
+            let mut r = full.clone();
+            r.play_type = play_type;
+            r.speed = speed;
+            if midway {
+                r.status.end = replay::EndStatus::EndedMidway;
+            }
+            r
+        };
+        let (normal, fastest) = (bms_model::Speed::NORMAL, bms_model::Speed::FASTEST);
+        for (round, name) in [
+            (
+                replay::PlayType::MidChartStart(practice.clone()),
+                "mid-chart start",
+            ),
+            (replay::PlayType::SectionRepeat(practice), "section repeat"),
+        ] {
+            for (speed, midway, how) in [
+                (normal, false, "at 1x"),
+                (fastest, false, "at another speed"),
+                (normal, true, "quit midway"),
+            ] {
+                assert_eq!(
+                    PlayKind::of(&variant(round.clone(), speed, midway)),
+                    PlayKind::Practice,
+                    "{name} {how}"
+                );
+            }
+        }
+        for (speed, midway, how) in [
+            (normal, false, "at 1x"),
+            (fastest, false, "at another speed"),
+            (normal, true, "quit midway"),
+        ] {
+            assert_eq!(
+                PlayKind::of(&variant(replay::PlayType::Full, speed, midway)),
+                PlayKind::Normal,
+                "full play {how}"
+            );
+        }
     }
 
     /// Only an eligible play whose own lamp is not FAILED is a clear.
@@ -1019,6 +1564,6 @@ mod tests {
         assert_eq!(size_of::<Breakdown>(), 120);
         assert_eq!(size_of::<Best>(), 160);
         assert_eq!(size_of::<Score>(), 176);
-        assert_eq!(size_of::<Contribution>(), 312);
+        assert_eq!(size_of::<Contribution>(), 344);
     }
 }

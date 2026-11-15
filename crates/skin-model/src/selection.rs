@@ -35,6 +35,23 @@ pub struct SelectionView {
     /// changed, so a [`RowRef`](crate::RowRef) drawn from an earlier list
     /// names no row of this one.
     pub list_revision: u64,
+    /// The player's totals, shown on every row kind.
+    pub totals: PlayerTotals,
+}
+
+/// The player's totals over every counted play, every chart and preset
+/// included (design.md "Personal Bests", skin projections), which selection
+/// and every result view carry.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlayerTotals {
+    /// Plays counted.
+    pub plays: u64,
+    /// The clears among them.
+    pub clears: u64,
+    /// Their PERFECT, GREAT, GOOD, BAD and POOR totals.
+    pub counts: [u64; 5],
+    /// Their play time in µs.
+    pub play_us: u64,
 }
 
 /// An exact ratio `numerator / denominator`, the denominator never zero.

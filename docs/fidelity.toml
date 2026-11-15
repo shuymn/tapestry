@@ -256,3 +256,47 @@ tests = [
     "crates/game/tests/closing_gate.rs::a_failure_before_the_commit_closes_the_play_at_the_commit",
     "crates/player/src/render_side/tests/decision/integrated.rs::ready_and_closing_sounds_through_a_run",
 ]
+
+[[entry]]
+id = "SF-014"
+summary = "Play time adds how far into the chart each play's judged notes reached"
+class = "rule"
+reason = """
+A player sees the total play time grow by the music played up to the last \
+note judged, misses included, not by the time spent in menus or lead-ins. \
+The source's per-play whole seconds and its long note counted to the head \
+are byproducts not copied (design.md "Personal Bests", differences from \
+the source)."""
+source = [
+    "src/bms/player/beatoraja/PlayDataAccessor.java:287-296 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/play/JudgeManager.java:640-646 @beatoraja-0.8.9",
+]
+sites = ["crates/library/src/bests.rs"]
+tests = ["crates/library/src/bests.rs::a_plays_time_reaches_its_last_judged_note"]
+
+[[entry]]
+id = "SF-015"
+summary = "The result's sounds: `clear` or `fail` by the play's own lamp, `resultclose` at a skin's fade-out, all stopped on leaving"
+class = "rule"
+reason = """
+A player hears the result answer the play: `clear` when the play's own \
+view cleared and `fail` otherwise as the result first shows, looping when \
+`[sounds] loop_result` asks; at a result skin's fade-out a pick with \
+`resultclose`, in its sound set or `defaultsound\\`, stops them and plays \
+it, and one without leaves them playing; leaving Result stops all three."""
+source = [
+    "src/bms/player/beatoraja/result/MusicResult.java:149-158 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/result/MusicResult.java:250-256 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/result/MusicResult.java:291-296 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/AudioConfig.java:63 @beatoraja-0.8.9",
+]
+sites = ["crates/player/src/play.rs", "crates/player/src/system_sounds.rs"]
+tests = [
+    "crates/game/tests/result_graphs.rs::the_own_view_lamp_per_outcome",
+    "crates/player/src/system_sounds/tests.rs::result_sounds_per_outcome",
+    "crates/player/src/system_sounds/tests.rs::the_fade_out_asks_the_installed_pick",
+    "crates/player/src/system_sounds/rig_tests.rs::the_first_result_sound_follows_the_own_view",
+    "crates/player/src/system_sounds/rig_tests.rs::a_view_switch_keeps_the_result_sounds",
+    "crates/player/src/render_side/tests/decision/integrated.rs::result_sounds_through_a_run",
+    "crates/player/src/system_sounds/rig_tests.rs::loop_result_is_read_at_startup",
+]

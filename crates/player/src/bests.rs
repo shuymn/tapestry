@@ -7,11 +7,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use game::{
-    BestKey, BestLamp, BestLookup, BestScore, BestView, Chain, LocalRecords, RecordRef, RecordSink,
-    SaveError, SavedPlay,
+    BestKey, BestLamp, BestLookup, BestScore, BestView, Chain, LocalRecords, PlayerTotals,
+    RecordRef, RecordSink, SaveError, SavedPlay,
 };
 use library::{
-    Best, BestWriter, Contribution, Ineligible, Ingested, Key, LN_MODE, PlayId, Score, Verified,
+    Best, BestWriter, Contribution, Ineligible, Ingested, Key, LN_MODE, PlayId, Score, Totals,
+    Verified,
 };
 use replay::PlayRecord;
 use rules::RulePreset;
@@ -83,6 +84,45 @@ impl RecordSink for BestsRecords {
                 BestLookup::Unavailable
             }
         }
+    }
+
+    /// The player's totals through the live writer's connection, this play
+    /// counted; a failed read is logged and leaves them unavailable.
+    fn totals(&mut self) -> Option<PlayerTotals> {
+        let read = self
+            .bests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .totals();
+        match read {
+            Ok(t) => Some(game_totals(&t)),
+            Err(e) => {
+                let line = format!("bests: the totals cannot be read: {}", Chain(&e));
+                eprintln!("{line}");
+                log::warn!("{line}");
+                None
+            }
+        }
+    }
+}
+
+/// The library's totals as `game` names them.
+pub const fn game_totals(t: &Totals) -> PlayerTotals {
+    PlayerTotals {
+        plays: t.plays,
+        clears: t.clears,
+        counts: t.counts,
+        play_us: t.play_us,
+    }
+}
+
+/// The player's totals as a skin's view carries them.
+pub const fn view_totals(t: PlayerTotals) -> skin_model::PlayerTotals {
+    skin_model::PlayerTotals {
+        plays: t.plays,
+        clears: t.clears,
+        counts: t.counts,
+        play_us: t.play_us,
     }
 }
 
@@ -352,7 +392,7 @@ pub fn chart_cell(score: &RowScore, preset: Option<&RulePreset>) -> String {
 // relative to this file's folder, which exists on every platform.
 #[cfg(test)]
 #[path = "../../library/tests/common/mod.rs"]
-mod common;
+pub(crate) mod common;
 
 #[cfg(test)]
 mod tests {

@@ -184,6 +184,7 @@ pub fn ready(ex: u32, best: BestView, bins: usize) -> ResultView {
         gauge: None,
         deviations: None,
         timing_areas: None,
+        totals: Default::default(),
     }
 }
 
@@ -238,6 +239,7 @@ pub fn other() -> ResultView {
         gauge: None,
         deviations: None,
         timing_areas: None,
+        totals: Default::default(),
     }
 }
 

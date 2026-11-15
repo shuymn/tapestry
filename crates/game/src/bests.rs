@@ -57,6 +57,22 @@ pub struct BestScore {
     pub clear: Option<BestLamp>,
 }
 
+/// The player's totals over every counted play, every chart and preset
+/// included, as `game` names them (design.md "Personal Bests", skin
+/// projections): what a result skin's numbers 17 to 19, 30 to 37 and 333
+/// read.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PlayerTotals {
+    /// Plays counted.
+    pub plays: u64,
+    /// The clears among them.
+    pub clears: u64,
+    /// Their PERFECT, GREAT, GOOD, BAD and POOR totals.
+    pub counts: [u64; 5],
+    /// Their play time in µs.
+    pub play_us: u64,
+}
+
 /// The key a best is stored under, as `game` names it: the chart file's
 /// and the preset's SHA-256 (the LN mode is the store's one).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
