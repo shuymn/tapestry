@@ -392,6 +392,7 @@ fn an_element_ages_without_overflow() {
     let ctx = PlayContext {
         attempt: Attempt::Full {
             lead_in: TimeUs(i64::MAX),
+            finish: play_support::NO_FINISH,
         },
         ..full(0)
     };
@@ -423,6 +424,7 @@ fn time_extremes_neither_panic_nor_wrap() {
         &PlayContext {
             attempt: Attempt::Full {
                 lead_in: TimeUs(i64::MAX),
+                finish: play_support::NO_FINISH,
             },
             ..full(0)
         },
@@ -463,7 +465,8 @@ fn time_extremes_neither_panic_nor_wrap() {
             &chart,
             &PlayContext {
                 attempt: Attempt::Full {
-                    lead_in: TimeUs(-1)
+                    lead_in: TimeUs(-1),
+                    finish: play_support::NO_FINISH
                 },
                 ..full(0)
             }
@@ -559,7 +562,10 @@ fn targets_match_the_evaluators() {
         meta: skin_model::ChartMetadata::UNKNOWN,
         autoplay: false,
         gauges: &gauges,
-        attempt: Attempt::Full { lead_in: TimeUs(0) },
+        attempt: Attempt::Full {
+            lead_in: TimeUs(0),
+            finish: play_support::NO_FINISH,
+        },
         empty_poor_breaks_combo: preset.empty_poor.breaks_combo,
         empty_poor_counted: preset.empty_poor.counted,
         scratch: Side::Left,
@@ -1229,6 +1235,18 @@ fn readout_fields(h: &Harness) -> &[i32] {
 }
 
 /// `time.remaining_s` and `time.elapsed_s`.
+/// A whole-chart attempt after a READY of `lead_in_ms`, finishing at
+/// `finish_ms` (design.md "Play Lifecycle", Audio tail).
+fn finishing(lead_in_ms: i64, finish_ms: i64) -> PlayContext<'static> {
+    PlayContext {
+        attempt: Attempt::Full {
+            lead_in: TimeUs(lead_in_ms * MS),
+            finish: TimeUs(finish_ms * MS),
+        },
+        ..full(lead_in_ms)
+    }
+}
+
 fn clocks(h: &Harness) -> (i32, i32) {
     (
         h.field(field::TIME_REMAINING_S),
@@ -1383,51 +1401,56 @@ fn the_main_bpm_reads_the_whole_charts_main_truncated() {
     assert_eq!(read(&with_main(last, full(0))), (READOUT_MAX, 1));
 }
 
-/// The remaining time counts to the last resolved object: a background
-/// sound's start past the last note, a mine's time, a long note's end;
-/// completion changes nothing.
+/// The remaining time counts to the play's finish point, not to the last
+/// object: a tap at 17 s and a background sound at 19 s, finishing at
+/// 22 s; READY holds the attempt's length; completion changes nothing; a
+/// long note's end or a mine past the finish does not move it.
 #[test]
-fn the_remaining_time_counts_to_the_last_object() {
+fn the_clocks_count_to_the_finish() {
     let chart = ChartBuilder::new(BPM_150)
         .sound("bgm.wav")
-        .tap(lane(1), TimeUs(10_000 * MS))
-        .bgm(TimeUs(17_000 * MS), bms_model::SoundId(0))
+        .tap(lane(1), TimeUs(17_000 * MS))
+        .bgm(TimeUs(19_000 * MS), bms_model::SoundId(0))
         .build()
         .unwrap();
-    let mut h = Harness::empty(&chart, &full(0));
+    let mut h = Harness::empty(&chart, &finishing(1_000, 22_000));
     h.readouts = Some(UNKNOWN);
-    h.frame(0, &[]);
-    assert_eq!(clocks(&h), (17, 0));
-    h.frame(10_500, &[]);
-    assert_eq!(clocks(&h), (7, 10));
+    h.frame(-500, &[]);
+    assert_eq!(clocks(&h), (22, 0), "READY");
+    for (ms, want) in [
+        (0, (22, 0)),
+        (10_000, (12, 10)),
+        (17_000, (5, 17)),
+        (20_000, (2, 20)),
+    ] {
+        h.frame(ms, &[]);
+        assert_eq!(clocks(&h), want, "{ms} ms");
+    }
     h.complete = true;
-    h.frame(16_000, &[]);
-    assert_eq!(clocks(&h), (1, 16));
-    // Past the end: none remains, and the elapsed time goes on.
+    h.frame(21_500, &[]);
+    assert_eq!(clocks(&h), (1, 21));
+    h.frame(22_000, &[]);
+    assert_eq!(clocks(&h), (0, 22));
+    // Past the finish: none remains, and the elapsed time goes on.
     h.frame(30_000, &[]);
     assert_eq!(clocks(&h), (0, 30));
-    for (chart, end_s) in [
-        (
-            ChartBuilder::new(BPM_150)
-                .tap(lane(1), TimeUs(3_000 * MS))
-                .mine(lane(2), TimeUs(9_000 * MS), 10)
-                .build()
-                .unwrap(),
-            9,
-        ),
-        (
-            ChartBuilder::new(BPM_150)
-                .long(lane(2), TimeUs(1_000 * MS), TimeUs(12_000 * MS))
-                .tap(lane(1), TimeUs(5_000 * MS))
-                .build()
-                .unwrap(),
-            12,
-        ),
-        (ChartBuilder::new(BPM_150).build().unwrap(), 0),
+    for chart in [
+        ChartBuilder::new(BPM_150)
+            .tap(lane(1), TimeUs(3_000 * MS))
+            .mine(lane(2), TimeUs(12_000 * MS), 10)
+            .build()
+            .unwrap(),
+        ChartBuilder::new(BPM_150)
+            .long(lane(2), TimeUs(1_000 * MS), TimeUs(12_000 * MS))
+            .tap(lane(1), TimeUs(5_000 * MS))
+            .build()
+            .unwrap(),
     ] {
-        let mut h = Harness::empty(&chart, &full(0));
+        let mut h = Harness::empty(&chart, &finishing(0, 9_000));
         h.frame(0, &[]);
-        assert_eq!(clocks(&h), (end_s, 0));
+        assert_eq!(clocks(&h), (9, 0));
+        h.frame(9_000, &[]);
+        assert_eq!(clocks(&h), (0, 9));
     }
 }
 
@@ -1436,8 +1459,8 @@ fn the_remaining_time_counts_to_the_last_object() {
 #[test]
 fn the_clocks_round_at_whole_seconds() {
     let chart = taps(&[17_000]);
-    let mut h = Harness::empty(&chart, &full(0));
-    let end = 17_000 * MS;
+    let mut h = Harness::empty(&chart, &finishing(0, 22_000));
+    let end = 22_000 * MS;
     for (left_us, want) in [(0, 0), (1, 1), (999_999, 1), (1_000_000, 1), (1_000_001, 2)] {
         h.frame_us(end - left_us, &[]);
         assert_eq!(h.field(field::TIME_REMAINING_S), want, "{left_us} µs left");
@@ -1454,12 +1477,12 @@ fn the_clocks_round_at_whole_seconds() {
 #[test]
 fn the_clocks_follow_the_attempt_not_the_display() {
     let chart = practice_chart();
-    let mut h = Harness::empty(&chart, &full(3_000));
+    let mut h = Harness::empty(&chart, &finishing(3_000, 30_000));
     h.frame(-2_000, &[]);
-    assert_eq!(clocks(&h), (25, 0));
+    assert_eq!(clocks(&h), (30, 0));
     h.offset = TimeUs(-400 * MS);
     h.frame(2_000, &[]);
-    assert_eq!(clocks(&h), (23, 2));
+    assert_eq!(clocks(&h), (28, 2));
     // [10 s, 20 s) at 50 % is [20 s, 40 s) in real time.
     let s = section(20_000, 40_000, 2_000);
     for _round in 0..2 {
@@ -1484,30 +1507,32 @@ fn the_clocks_follow_the_attempt_not_the_display() {
 
 /// The progress (stage3.md R3, `skin/property/FloatPropertyFactory.java:
 /// 128-136`) runs over the remaining time's own span, from the attempt's
-/// start to the last resolved object, a background sound past the last
-/// note here: 0 in READY and at the start, the share rounded down in
-/// between, the whole at and after the end; neither the display offset nor
-/// completion moves it.
+/// start to the play's finish point, 22 s here, past the tap at 17 s and
+/// the background sound at 19 s: 0 in READY and at the start, the share
+/// rounded down in between, the whole at and after the finish; neither the
+/// display offset nor completion moves it.
 #[test]
-fn the_progress_runs_to_the_last_object() {
+fn the_progress_runs_to_the_finish() {
     let chart = ChartBuilder::new(BPM_150)
         .sound("bgm.wav")
-        .tap(lane(1), TimeUs(10_000 * MS))
-        .bgm(TimeUs(16_000 * MS), bms_model::SoundId(0))
+        .tap(lane(1), TimeUs(17_000 * MS))
+        .bgm(TimeUs(19_000 * MS), bms_model::SoundId(0))
         .build()
         .unwrap();
-    let mut h = Harness::empty(&chart, &full(2_000));
+    let mut h = Harness::empty(&chart, &finishing(2_000, 22_000));
     let progress = |h: &Harness| h.field(field::TIME_PROGRESS_PPM);
     for (now_us, want) in [
         (-2_000 * MS, 0),
         (-1, 0),
         (0, 0),
-        (15, 0),
-        (16, 1),
-        (4_000 * MS, 250_000),
-        (8_000 * MS + 7, 500_000),
-        (16_000 * MS - 1, 999_999),
-        (16_000 * MS, 1_000_000),
+        (21, 0),
+        (22, 1),
+        (10_000 * MS, 454_545),
+        (17_000 * MS, 772_727),
+        (19_000 * MS, 863_636),
+        (20_000 * MS, 909_090),
+        (22_000 * MS - 1, 999_999),
+        (22_000 * MS, 1_000_000),
         (30_000 * MS, 1_000_000),
     ] {
         h.frame_us(now_us, &[]);
@@ -1515,8 +1540,8 @@ fn the_progress_runs_to_the_last_object() {
     }
     h.offset = TimeUs(-700 * MS);
     h.complete = true;
-    h.frame(12_000, &[]);
-    assert_eq!(progress(&h), 750_000);
+    h.frame(11_000, &[]);
+    assert_eq!(progress(&h), 500_000);
 }
 
 /// A section's progress runs over its real-time span, so a practice speed
@@ -1613,7 +1638,8 @@ fn readouts_show_what_the_frame_supplies() {
             min_x100: 7_500,
             max_x100: 30_000,
         }),
-        ..full(0)
+        // The tap at 1 s plus 5 s: 6 s remain at the start.
+        ..finishing(0, 6_000)
     };
     let mut h = Harness::empty(&chart, &ctx);
     // The 600 ms visible duration at the initial tempo: green 360.
@@ -1628,7 +1654,7 @@ fn readouts_show_what_the_frame_supplies() {
     #[rustfmt::skip]
     assert_eq!(
         readout_fields(&h),
-        [15_000, 7_500, 30_000, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 105, 1, 600, 360, 1]
+        [15_000, 7_500, 30_000, 1, 1, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 105, 1, 600, 360, 1]
     );
     // Within the STOP the tempo and duration stay as supplied; a change
     // within it shows at once.
@@ -1664,12 +1690,12 @@ fn readouts_show_what_the_frame_supplies() {
     );
     // Without a range, both bounds read 0 and invalid; the helper's
     // covers are on at 0.
-    let mut h = Harness::empty(&chart, &full(0));
+    let mut h = Harness::empty(&chart, &finishing(0, 6_000));
     h.frame(0, &[]);
     #[rustfmt::skip]
     assert_eq!(
         readout_fields(&h),
-        [0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0]
+        [0, 0, 0, 0, 0, 6, 0, 0, 0, 0, 0, 1, 1, 1, 0, 0, 0, 0, 0, 0]
     );
 }
 
@@ -2377,10 +2403,10 @@ fn the_rhythm_clock_is_off_before_play() {
 }
 
 /// After completion, outside Closing, the clock keeps the tempo and its
-/// bar restarts until the progress end + 5 s; from then its start holds,
-/// so it runs 1:1. The chart is at 150 BPM, its last object a tap at
-/// 10 000 000 µs, with bar lines at 0, 8 000 000 and 10 500 000 (after the
-/// end).
+/// bar restarts until the play's finish point, here 13 500 000 µs; from
+/// then its start holds, so it runs 1:1. The chart is at 150 BPM, its last
+/// object a tap at 10 000 000 µs, with bar lines at 0, 8 000 000 and
+/// 10 500 000 (after the end).
 #[test]
 fn the_rhythm_clock_runs_the_tail_then_holds() {
     let chart = ChartBuilder::new(150_000)
@@ -2390,17 +2416,44 @@ fn the_rhythm_clock_runs_the_tail_then_holds() {
         .tap(lane(1), TimeUs(10_000_000))
         .build()
         .unwrap();
-    let mut h = Harness::empty(&chart, &full(0));
+    let mut h = Harness::empty(&chart, &finishing(0, 13_500));
     // The last playing frame, at the end: 2 000 000 µs at 150 BPM.
     assert_eq!(rhythm_at(&mut h, 10_000_000), Some(5_000_000));
     h.playing = false;
     h.complete = true;
     // Completion + 1 s: 500 000 µs since the bar line after the end.
     assert_eq!(rhythm_at(&mut h, 11_000_000), Some(1_250_000));
-    // The last frame before the end + 5 s, then held from its start.
-    assert_eq!(rhythm_at(&mut h, 14_999_000), Some(11_247_500));
-    assert_eq!(rhythm_at(&mut h, 15_000_000), Some(11_248_500));
-    assert_eq!(rhythm_at(&mut h, 15_500_000), Some(11_748_500));
+    // The last frame before the finish still keeps the tempo, then the
+    // start holds from it.
+    assert_eq!(rhythm_at(&mut h, 13_499_000), Some(7_497_500));
+    assert_eq!(rhythm_at(&mut h, 13_500_000), Some(7_498_500));
+    assert_eq!(rhythm_at(&mut h, 14_000_000), Some(7_998_500));
+}
+
+/// A practice round's completed frames keep the tempo through its whole
+/// ring-out, past its section's end + 5 s: at 150 BPM with a bar line every
+/// 1 600 000 µs, the section [3 s, 6 s) still restarts at the bar line at
+/// 11 200 000 when its ring-out reaches 11 500 000.
+#[test]
+fn a_rounds_ring_out_keeps_the_rhythm() {
+    let chart = (0..=10)
+        .fold(ChartBuilder::new(150_000), |b, k| {
+            b.bar(TimeUs(k * 1_600_000))
+        })
+        .tap(lane(1), TimeUs(4_000_000))
+        .build()
+        .unwrap();
+    let s = section(3_000, 6_000, 1_000);
+    let mut h = Harness::empty(&chart, &in_section(&s));
+    // Playing: 200 000 µs since the bar line at 4 800 000.
+    assert_eq!(rhythm_at(&mut h, 5_000_000), Some(500_000));
+    h.playing = false;
+    h.complete = true;
+    // The ring-out: 100 000 µs since the bar line at 6 400 000.
+    assert_eq!(rhythm_at(&mut h, 6_500_000), Some(250_000));
+    // Before and past the section's end + 5 s, still at the tempo.
+    assert_eq!(rhythm_at(&mut h, 10_900_000), Some(3_250_000));
+    assert_eq!(rhythm_at(&mut h, 11_500_000), Some(750_000));
 }
 
 /// In Closing, and on a terminal frame that admits none (an autoplay

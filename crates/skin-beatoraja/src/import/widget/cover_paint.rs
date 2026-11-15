@@ -318,8 +318,9 @@ impl Cx<'_> {
     /// `skin/property/FloatPropertyFactory.java:128-136`) in any of the
     /// four directions (`skin/SkinSlider.java:116-120`: 0 up, 1 right, 2
     /// down, 3 left, the source's y up) is a decorative paint moved by
-    /// `time.progress_ppm`, with a D4 note: the progress ends at the last
-    /// resolved object, where the source's adds 5 s (stage3.md R3).
+    /// `time.progress_ppm`, with a D4 note: the progress is a floored share
+    /// in parts per million, where the source divides in `float`, and a
+    /// practice round's runs over its own section (stage3.md R3).
     /// `changeable` needs nothing, since the play has no pointer, and
     /// `event` is unused on that path. Its range is scaled from the skin's
     /// height to 1 080 reference pixels, the same ratio as from its width
@@ -534,7 +535,7 @@ impl Cx<'_> {
         let Some(mut c) = self.image_common(&dst, true, role)? else {
             return Ok(());
         };
-        // The progress ends at the last resolved object (D4).
+        // The progress's floored share and practice span (D4).
         c.display_deviation = true;
         let Some((image, rects, native)) = self.paint_image(&c, rec, s)? else {
             return Ok(());

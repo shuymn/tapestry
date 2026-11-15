@@ -413,7 +413,10 @@ pub fn record(
                         attempt: if r.section {
                             Attempt::Section(&section)
                         } else {
-                            Attempt::Full { lead_in: TimeUs(0) }
+                            Attempt::Full {
+                                lead_in: TimeUs(0),
+                                finish: game::finish_point(end),
+                            }
                         },
                         empty_poor_breaks_combo: false,
                         empty_poor_counted: false,

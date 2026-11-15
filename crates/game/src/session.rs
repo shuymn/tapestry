@@ -248,6 +248,13 @@ pub enum SessionError {
     ChartChanged(PathBuf),
 }
 
+/// A full play's finish anchor on `chart` and its finish point, for an
+/// autoplay session when `autoplay`: the one place a load computes both.
+fn finish_of(chart: &Chart, autoplay: bool) -> (TimeUs, TimeUs) {
+    let anchor = finish_anchor(chart, autoplay);
+    (anchor, crate::finish_point(anchor))
+}
+
 /// Play's admission of a chart read at `speed` (design.md "Chart Model",
 /// "Timeline"): one playhead can present it. Checked before a loaded chart
 /// is stored, first or at a new speed, so a refusal leaves everything as
@@ -416,6 +423,9 @@ pub struct Loaded {
     /// A full play's finish anchor on `chart`, computed when it is read
     /// ([`finish_anchor`]), so completion reads it without allocating.
     finish_anchor: TimeUs,
+    /// Its finish point ([`crate::finish_point`]), computed with it: what
+    /// the attempt's readouts end at and the hold starts from.
+    finish: TimeUs,
     chart_record: ChartRecord,
     /// The chart's labels, from the ingestion that read `chart`.
     labels: ChartLabels,
@@ -654,7 +664,7 @@ impl PendingLoad {
             }) => {
                 events.on_event(&SessionEvent::Load);
                 let main = crate::tempo::whole_main(&chart, crate::MAIN_HISTOGRAM_LIMIT).ok();
-                let anchor = finish_anchor(&chart, config.autoplay.is_some());
+                let (anchor, finish) = finish_of(&chart, config.autoplay.is_some());
                 let preset = shelf.chosen().clone();
                 let displayed = resolve_displayed(parts.policy.as_ref(), &preset);
                 Ok(Loaded {
@@ -664,6 +674,7 @@ impl PendingLoad {
                     parts,
                     path: chart_path.to_owned(),
                     finish_anchor: anchor,
+                    finish,
                     chart,
                     chart_record,
                     labels,
@@ -951,7 +962,7 @@ impl Loaded {
             speed,
             ..self.config.clone()
         };
-        self.finish_anchor = finish_anchor(&read.chart, self.config.autoplay.is_some());
+        (self.finish_anchor, self.finish) = finish_of(&read.chart, self.config.autoplay.is_some());
         self.chart = read.chart;
         self.chart_record = read.record;
         self.labels = read.labels;
@@ -1184,6 +1195,17 @@ impl Loaded {
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub const fn finish_anchor(&self) -> TimeUs {
         self.finish_anchor
+    }
+
+    /// A full play's finish point on the chart as loaded: its
+    /// [`finish_anchor`](Self::finish_anchor) plus
+    /// [`FINISH_MARGIN`](crate::FINISH_MARGIN), computed with it. Its
+    /// readouts end there ([`Attempt::finish`]) and its hold starts from it
+    /// ([`hold_until`](crate::hold_until)).
+    #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub const fn finish(&self) -> TimeUs {
+        self.finish
     }
 
     /// The practice set up, if any.
@@ -1491,6 +1513,7 @@ impl Loaded {
                 self.config.lead_in,
                 self.section(),
                 ends.of(&self.chart),
+                self.finish,
                 &self.labels,
                 &self.chart,
             )

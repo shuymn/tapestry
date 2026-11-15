@@ -309,7 +309,7 @@ impl Round {
         if self.section {
             return (last_note + TAIL, None, false);
         }
-        let held = game::hold_until(TimeUs(last_note), ending);
+        let held = game::hold_until(game::finish_point(TimeUs(last_note)), ending);
         let (end, fade) = match game::fade_deadline(held, ending.fadeout) {
             Some(end) => (end.0, Some(held)),
             None => (held.0, None),
