@@ -20,7 +20,10 @@
 //! step, except `next`'s scan of a table's empty slots, which VM memory
 //! bounds (the table below). A native function the library keeps is its private upvalue,
 //! called only with arguments of the exact Lua type it takes, checked
-//! first and never coerced, and only for a result whose size is known
+//! first (a number passed for a string parameter is first made its text
+//! by the library's `number_text`, 24 bytes charged, as Lua's coercion
+//! reads it; a string is never read as a number), and only for a result
+//! whose size is known
 //! and charged in bytes to
 //! [`MAX_NATIVE_WORK`](super::limits::MAX_NATIVE_WORK) first, a result
 //! over [`MAX_PRIMITIVE_BYTES`](super::limits::MAX_PRIMITIVE_BYTES)
@@ -48,7 +51,7 @@
 //! | `type` | any | O(1) | none needed | no |
 //! | `next` (and `pairs`' iterator) | table, key | a key's hash (long strings: once, cached) and a scan of empty slots, O(table capacity) | the table's capacity, held in VM memory: the one native loop over skin data, bounded by memory and not charged | no |
 //! | `pairs` | any | O(1) | none needed | `__pairs`, hooked |
-//! | `tostring` (also `%s`, `concat`'s and `gsub`'s numbers) | any | a number's digits, or `__name` (at most 64 bytes) and an address; a string is returned uncopied | `__name` over 64 bytes refused when the metatable is attached | `__tostring`, hooked |
+//! | `tostring` (also an integer's text in `number_text`) | any | a number's digits, or `__name` (at most 64 bytes) and an address; a string is returned uncopied | `__name` over 64 bytes refused when the metatable is attached | `__tostring`, hooked |
 //! | `select` | an integer or `"#"`, values | O(1): the values stay in place | integer checked in Lua | no |
 //! | `error` | a value, an integer level | with a level, the position and the message copied, O(#message) | each caught message's length charged by the handler, before the skin's runs; an uncaught one ends the pass | no |
 //! | `ipairs` | any | none: the step is Lua (`t[i]`) | integer index checked in Lua | `__index`, hooked |
@@ -58,6 +61,7 @@
 //! | `string.byte` (private) | a string, integer bounds | O(results) | at most 16 results, within a native call's free stack | no |
 //! | `string.char` (private) | integers in 0..255 | O(n) | at most 4 096, charged | no |
 //! | `string.upper`, `string.lower` (private) | a string | O(#s) | at most 1 MiB, charged | no |
+//! | `string.format` `%.14g` (private, `number_text`: a float that is not an integer, NaN or infinite, the text of a number passed for a string, `%s`'s, `gsub`'s and `table.concat`'s numbers) | a float | O(1) | 24 bytes charged first | no |
 //! | `string.format` (private) | the checked format, its arguments | O(format + output + the bytes `%s` reads) | 32 conversions, two-digit widths and precisions, output at most 1 MiB, all charged | `__tostring`, hooked |
 //! | `table.concat` (private) | the library's own table of strings | O(entries + output) | output at most 1 MiB, entries and output charged | no |
 //! | `rawget`, `rawset`, `rawlen` (private) | a plain table | O(1) amortized; a resize O(capacity) | VM memory | no |
