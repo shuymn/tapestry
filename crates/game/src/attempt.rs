@@ -125,6 +125,11 @@ pub struct Attempt {
     /// The play's best and target. [`Attempt::new`] gives none read (0,
     /// unknown, target 0); [`crate::Loaded::attempt`] gives the play's.
     pub score: ScoreBasis,
+    /// The best paced by its play ([`crate::best_series`]): entry `p` the
+    /// best play's EX after `p` judged targets, `targets + 1` entries
+    /// ending at the best. `None` from [`Attempt::new`], and for a play
+    /// whose best has no progress, which paces the best by the line.
+    pub pace: Option<Arc<[u32]>>,
     /// The chart's 1× profile as its ingestion built it, shared by every
     /// attempt of the load; `None` from [`Attempt::new`], `Some` from
     /// [`crate::Loaded::attempt`].
@@ -225,6 +230,7 @@ impl Attempt {
             judgment_headers: chart.meta.judgment_headers.clone(),
             tempo: AttemptTempo::prepare(chart, section),
             score: ScoreBasis::default(),
+            pace: None,
             profile: None,
             main: None,
             areas: crate::judge_areas(chart, preset),
