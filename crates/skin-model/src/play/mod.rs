@@ -443,6 +443,12 @@ pub struct SkinFrame<'a> {
     pub notes: &'a NoteFacts,
     /// The play view's judgment offsets, which the visualizers draw.
     pub offsets: Offsets<'a>,
+    /// The play view's judgments by the notes graph's bins, each bin's
+    /// nine channels (PERFECT, then GREAT to POOR early, then late), which
+    /// the judgment graphs draw; `None` while they are unavailable (the
+    /// attempt's notes not mapped to the profile's bins), which draws
+    /// those graphs empty of everything.
+    pub judgments: Option<&'a [[u32; crate::result::view::TIMELINE_CHANNELS]]>,
     /// The play view's lane input: each lane held or not, with its latest
     /// press and release, from which the `press` and `release` timers
     /// read.
@@ -711,12 +717,41 @@ struct Graphs {
     speed: (u32, u32),
     /// A section attempt's start and end in 1× µs.
     section: Option<[i64; 2]>,
+    /// Each bin's judgeable notes (taps and long-note heads), by the
+    /// profile's row bins; empty without a judgment graph or the rows.
+    judge_notes: Box<[u32]>,
     bpm: Box<[BpmRaster]>,
     bands: Box<[Box<[Run]>]>,
     hits: Box<[HitErrorState]>,
     /// The key judge areas the hit-error visualizers band by; all 0
     /// without any.
     areas: [[i16; 2]; 5],
+}
+
+/// Each of `profile`'s bins' judgeable notes of `chart` (taps and
+/// long-note heads, never mines), by each note's head row's bin
+/// ([`ChartProfile::row_bins`]): a widened bin sums its seconds' notes.
+/// Empty when the profile holds no rows (a preview's).
+fn judge_notes(chart: &Chart, profile: &ChartProfile) -> Box<[u32]> {
+    let rows = profile.row_bins();
+    if rows.is_empty() {
+        return Box::default();
+    }
+    let mut notes = vec![0_u32; profile.bins().len()];
+    for n in chart
+        .lanes
+        .iter()
+        .flatten()
+        .filter(|n| !matches!(n.kind, bms_model::NoteKind::Mine { .. }))
+    {
+        if let Some(c) = rows
+            .get(n.anchors.head.index())
+            .and_then(|&b| notes.get_mut(usize::from(b)))
+        {
+            *c = c.saturating_add(1);
+        }
+    }
+    notes.into_boxed_slice()
 }
 
 impl Graphs {
@@ -730,6 +765,10 @@ impl Graphs {
                 u32::try_from(p.seconds().len()).unwrap_or(u32::MAX),
             ),
             None => (Box::default(), 0),
+        };
+        let judge_notes = match profile.filter(|_| plan.judgments) {
+            Some(p) => judge_notes(chart, p),
+            None => Box::default(),
         };
         let speed = score.speed.ratio();
         let to_1x = |t: TimeUs| {
@@ -768,6 +807,7 @@ impl Graphs {
             seconds,
             speed,
             section,
+            judge_notes,
             bpm,
             bands: plan.timing.iter().map(|t| t.band(score.areas)).collect(),
             hits: plan.hit.iter().map(|&h| HitErrorState::new(h)).collect(),
@@ -778,6 +818,7 @@ impl Graphs {
     /// The bytes its buffers hold.
     fn heap_bytes(&self) -> usize {
         size_of_val(&*self.bins)
+            + size_of_val(&*self.judge_notes)
             + self
                 .bpm
                 .iter()
@@ -990,6 +1031,36 @@ impl Play {
         }
     }
 
+    /// The judgment graphs' notes per bin and their cursors at `now`
+    /// (those of [`notes_graph`](Self::notes_graph)); `None` without
+    /// them.
+    pub(crate) fn judgment_graph(
+        &self,
+        now: TimeUs,
+    ) -> Option<(&[u32], crate::widget::judge_graph::Cursors)> {
+        let g = &self.graphs;
+        if g.judge_notes.is_empty() {
+            return None;
+        }
+        Some((&g.judge_notes, self.cursors(now)))
+    }
+
+    /// The cursors at `now`: the play cursor while the play runs, and a
+    /// section attempt's lines.
+    fn cursors(&self, now: TimeUs) -> crate::widget::judge_graph::Cursors {
+        let g = &self.graphs;
+        let (n, d) = g.speed;
+        let play = (now >= self.play_at).then(|| {
+            let v = i128::from(now.0) * i128::from(n) / i128::from(d.max(1));
+            i64::try_from(v).unwrap_or(0)
+        });
+        crate::widget::judge_graph::Cursors {
+            seconds: g.seconds,
+            play,
+            section: g.section,
+        }
+    }
+
     /// The notes graph's bins and its cursors at `now`: the play cursor
     /// while the play runs; `None` without bins.
     pub(crate) fn notes_graph(
@@ -1003,17 +1074,7 @@ impl Play {
         if g.bins.is_empty() {
             return None;
         }
-        let (n, d) = g.speed;
-        let play = (now >= self.play_at).then(|| {
-            let v = i128::from(now.0) * i128::from(n) / i128::from(d.max(1));
-            i64::try_from(v).unwrap_or(0)
-        });
-        let cursors = crate::widget::judge_graph::Cursors {
-            seconds: g.seconds,
-            play,
-            section: g.section,
-        };
-        Some((&g.bins, cursors))
+        Some((&g.bins, self.cursors(now)))
     }
 
     /// BPM graph element `slot`'s prepared pixmap.
@@ -1348,6 +1409,7 @@ mod tests {
         let mut frame =
             |play: &mut super::Play, now_ms: i64, effects: &[JudgeEvent], notes: &NoteFacts| {
                 let frame = SkinFrame {
+                    judgments: None,
                     app: crate::AppReadouts::LAUNCH,
                     state_us: 0,
                     screen_us: 0,
@@ -1438,6 +1500,7 @@ mod tests {
             ..tally
         };
         let refused = SkinFrame {
+            judgments: None,
             app: crate::AppReadouts::LAUNCH,
             state_us: 0,
             screen_us: 0,
