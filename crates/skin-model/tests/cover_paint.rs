@@ -17,11 +17,11 @@ use lanes_support::{
 };
 use play_support::{Harness, MS, REGIONS, bool_program, full, lane, readouts_for};
 use skin_model::{
-    Blend, ClipId, CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim, CycleDef,
-    ElementDef, Follow, ImageChoiceDef, ImageChoicePart, ImageSpan, LANE_QUADS, LANE_RESERVED,
-    LaneView, LanesDef, Layout, LoadError, MAX_COORD, MAX_ELEMENTS, MAX_RANGE_DENOMINATOR, Native,
-    PLAY, Place, Ratio, Scope, Skin, Slider, SliderDirection, SliderRate, TimerRef, Ty, Variant,
-    WidgetDefs, compile, timer,
+    Attempt, Blend, ClipId, CoverImage, CoverMotion, CoverPaintDef, CoverPaintError, CoverTrim,
+    CycleDef, ElementDef, Follow, ImageChoiceDef, ImageChoicePart, ImageSpan, LANE_QUADS,
+    LANE_RESERVED, LaneView, LanesDef, Layout, LoadError, MAX_COORD, MAX_ELEMENTS,
+    MAX_RANGE_DENOMINATOR, Native, PLAY, Place, PlayContext, Ratio, Scope, Skin, Slider,
+    SliderDirection, SliderRate, TimerRef, Ty, Variant, WidgetDefs, compile, timer,
 };
 
 /// A skin over `REGIONS` with `lanes`, `elements` and `widgets`.
@@ -114,9 +114,9 @@ fn exact_progress_paint(n: u64, d: u64, direction: SliderDirection) -> CoverPain
 
 /// A progress slider moves by its range times `time.progress_ppm / 10⁶`
 /// toward its direction (`skin/SkinSlider.java:116-120`): nothing in
-/// READY or at the start, half of 400 at half the attempt (the chart's
-/// last object at 1.3 s), the whole range at and after the end, whatever
-/// the lane covers.
+/// READY or at the start, half of 400 at half the attempt (its finish
+/// point at 6.3 s, past the chart's last object at 1.3 s), the whole range
+/// at and after the finish, whatever the lane covers.
 #[test]
 fn a_progress_slider_moves_toward_its_direction() {
     let dirs = [
@@ -131,7 +131,14 @@ fn a_progress_slider_moves_toward_its_direction() {
             .collect(),
         dirs.map(|d| progress_paint(400, d)).to_vec(),
     );
-    let mut h = Harness::new(skin, &tap_chart(), &full(1_000));
+    let ctx = PlayContext {
+        attempt: Attempt::Full {
+            lead_in: TimeUs(1_000 * MS),
+            finish: TimeUs(6_300 * MS),
+        },
+        ..full(1_000)
+    };
+    let mut h = Harness::new(skin, &tap_chart(), &ctx);
     h.view.cover = 500;
     let moved = |d: f32| {
         vec![
@@ -144,10 +151,10 @@ fn a_progress_slider_moves_toward_its_direction() {
     for (ms, d) in [
         (-500, 0.0),
         (0, 0.0),
-        (325, 100.0),
-        (650, 200.0),
-        (1_300, 400.0),
-        (5_000, 400.0),
+        (1_575, 100.0),
+        (3_150, 200.0),
+        (6_300, 400.0),
+        (9_000, 400.0),
     ] {
         h.frame(ms, &[]);
         assert_eq!(rects(&h, COVER), moved(d), "{ms} ms");

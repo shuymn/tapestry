@@ -110,6 +110,10 @@ pub struct Attempt {
     /// where a skin's `last_note` timer starts, kept apart from any
     /// remaining-time readout.
     pub last_note_end: TimeUs,
+    /// A full play's finish point ([`crate::Loaded::finish`]): where its
+    /// readouts end and its rhythm clock stops following the tempo; a
+    /// practice round, which has none, does not read it.
+    pub finish: TimeUs,
     /// The chart's labels, from the ingestion that read the chart.
     pub labels: ChartLabels,
     /// The chart's gauge total as the reference player's song information
@@ -194,15 +198,18 @@ pub fn finish_anchor(chart: &Chart, autoplay: bool) -> TimeUs {
 impl Attempt {
     /// The attempt numbered `number` of `chart` under `preset`: the whole
     /// chart with a `lead_in` READY state, or the round of `section`, its
-    /// notes ending at `last_note_end` ([`NoteEnd::of`]), with `chart`'s
+    /// notes ending at `last_note_end` ([`NoteEnd::of`]) and a full play
+    /// finishing at `finish` ([`crate::Loaded::finish`]), with `chart`'s
     /// tempo provider over the same section ([`AttemptTempo::prepare`]).
     #[must_use]
+    #[expect(clippy::too_many_arguments, reason = "each a part of the attempt")]
     pub fn new(
         number: u32,
         preset: &RulePreset,
         lead_in: TimeUs,
         section: Option<&Section>,
         last_note_end: TimeUs,
+        finish: TimeUs,
         labels: &ChartLabels,
         chart: &Chart,
     ) -> Self {
@@ -220,6 +227,7 @@ impl Attempt {
             ln_default: preset.ln_mode.default,
             kind,
             last_note_end,
+            finish,
             labels: labels.clone(),
             song_total: song_total(chart),
             judgment_headers: chart.meta.judgment_headers.clone(),
