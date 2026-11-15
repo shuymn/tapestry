@@ -1450,6 +1450,78 @@ fn a_widened_bin_holds_its_seconds_notes() {
     fx.empty(x, 87.5);
 }
 
+/// C21, C37: with widened bins every column is `bin_seconds` wide, the
+/// last one padded past the chart, so the cursors are placed on the axis
+/// the columns represent, their count times their width (as the source
+/// places a time at its second's column, `skin/SkinNoteDistributionGraph.java`
+/// at `0.8.9`, lines 203-230 and 302). A tap at 513.5 s gives 515 seconds,
+/// 2 s bins and 258 columns of 5 px: 516 s over 1 290 px, 2.5 px a second.
+/// At 513.5 s the play cursor covers x 1 283.75 to 1 285.25, inside the
+/// tap's column 256 (1 280 to 1 285), not 1 286.25 in the padding column
+/// 257 as over the 515 seconds; the section's start at 506 s (green, 1 265
+/// to 1 266.5) and end at 510 s (red, 1 275 to 1 276.5) likewise; on the
+/// notes graph and both judgment graphs.
+#[test]
+fn widened_columns_place_the_cursors_in_their_own_column() {
+    let mut chart = ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .tap(lane(1), TimeUs(513_500 * MS))
+        .build()
+        .unwrap();
+    chart.meta.length = ChartSummary::of(&chart).length;
+    let profile = ChartProfile::of(&chart, &[]);
+    assert_eq!(
+        (
+            profile.seconds().len(),
+            profile.bin_seconds(),
+            profile.bins().len()
+        ),
+        (515, 2, 258)
+    );
+    let section = Section {
+        start: TimeUs(506_000 * MS),
+        end: TimeUs(510_000 * MS),
+        lead_in: TimeUs(1_000 * MS),
+        initial_gauges: GAUGES.iter().map(|g| g.start).collect(),
+    };
+    let practice = PlayContext {
+        attempt: Attempt::Section(&section),
+        score: PlayScore {
+            profile: Some(&profile),
+            ..PlayScore::NONE
+        },
+        ..full(1_000)
+    };
+    let (white, green, red) = (rgb(0xff_ffff), rgb(0x80_ff80), rgb(0xff_8080));
+    for kind in [
+        JudgeGraphKind::Notes,
+        JudgeGraphKind::Judgment,
+        JudgeGraphKind::EarlyLate,
+    ] {
+        let s = skin(
+            vec![el(Source::JudgeGraph(0), [0, 0, 1_290, 100])],
+            PlayDefs {
+                judge_graphs: vec![judgment_graph(kind, false, 0)],
+                ..PlayDefs::default()
+            },
+        );
+        let mut fx = Fx::new(s, &chart, &practice);
+        fx.h.judgments = Some(bins(&[]));
+        fx.frame(513_500);
+        // The graph's top cells hold no chip.
+        let y = 5.0;
+        fx.is(1_284.5, y, white);
+        fx.empty(1_286.75, y);
+        fx.is(1_265.75, y, green);
+        fx.empty(1_268.0, y);
+        fx.is(1_275.75, y, red);
+        fx.empty(1_278.0, y);
+        // The tap's chip in column 256, left of the cursor.
+        assert!(fx.px(1_281.0, 97.5).1 > 0, "{kind:?}");
+        fx.empty(1_287.5, 97.5);
+    }
+}
+
 /// C39: on play a judgment graph is charged its cursors with the
 /// result's quads (type 2 with its background: 5 702 + 6), and three of
 /// them pass the budget, refusing the skin.
