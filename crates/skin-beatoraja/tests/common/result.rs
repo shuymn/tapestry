@@ -145,6 +145,7 @@ pub fn chart() -> ResultChart {
         notes: Some(600),
         judge_class: None,
         images: skin_model::ImageFacts::default(),
+        target: 0,
     }
 }
 
