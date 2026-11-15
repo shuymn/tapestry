@@ -2,8 +2,10 @@
 //! (design.md "Personal Bests"): a chart near the loader's 500,000-object
 //! limit with a record of few inputs, and a record as dense as admission
 //! allows. A pause is acknowledged once the step in hand finishes, so these
-//! bound a READY state's wait for the rebuild. The commit includes the
-//! best's progress, and the play's read of it with its best is timed after.
+//! bound a READY state's wait for the rebuild. The contribution's step
+//! collects the best's progress, the commit writes it, and the play's read
+//! of it with its best is timed after; `game`'s `best_series_time` times
+//! the series a play builds from it.
 //! Indicators, not gates; run in release:
 //!
 //! `cargo test --release -p library --test rebuild_time -- --ignored --nocapture`
@@ -61,6 +63,9 @@ fn time_steps(label: &str, text: &str, record: &PlayRecord) {
     let t = Instant::now();
     let re = replay::verify::evaluate_record(&decoded, &chart, None).unwrap();
     step("evaluation", t);
+    // The contribution's values and its progress, one pass over the
+    // evaluation's events.
+    let t = Instant::now();
     let c = Contribution::of(
         id,
         &decoded,
@@ -71,6 +76,7 @@ fn time_steps(label: &str, text: &str, record: &PlayRecord) {
         &chart,
         &preset,
     );
+    step("contribution", t);
     drop(re);
     let mut writer = lib.best_writer().unwrap();
     let t = Instant::now();
