@@ -858,9 +858,9 @@ impl Play {
         let timers = whens.saturating_add(present.map_or(0, crate::present::Present::timers));
         let bank =
             present.map_or_else(crate::present::Bank::default, crate::present::Present::bank);
-        let (play_at, lead_in, section) = match ctx.attempt {
-            Attempt::Full { lead_in, .. } => (TimeUs(0), lead_in, None),
-            Attempt::Section(s) => (s.start, s.lead_in, Some(s)),
+        let (play_at, lead_in, section, readout_end) = match ctx.attempt {
+            Attempt::Full { lead_in, finish } => (TimeUs(0), lead_in, None, finish),
+            Attempt::Section(s) => (s.start, s.lead_in, Some(s), s.end),
         };
         if lead_in.0 < 0 {
             return Err(PrepareError::NegativeLeadIn);
@@ -885,10 +885,6 @@ impl Play {
         }
         let bounds = section.map(|s| (s.start, s.end));
         let playhead = ExactPlayhead::prepare(chart, bounds)?;
-        let readout_end = match ctx.attempt {
-            Attempt::Full { finish, .. } => finish,
-            Attempt::Section(s) => s.end,
-        };
         let initial = ctx.gauges.iter().enumerate().map(|(i, g)| {
             let value = section
                 .and_then(|s| s.initial_gauges.get(i).copied())
