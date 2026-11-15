@@ -13,7 +13,9 @@ use replay::PlayRecord;
 use rules::RulePreset;
 use tempfile::NamedTempFile;
 
-use crate::bests::{BestKey, BestLookup, BestView, PlayerTotals, SavedPlay};
+use crate::bests::{
+    BestKey, BestLookup, BestView, PlayBest, PlayerTotals, ProgressLookup, ProgressQuery, SavedPlay,
+};
 use crate::error::IoFailure;
 
 /// A complete temporary file in `dir`, under a name no other writer uses; it
@@ -185,6 +187,26 @@ pub trait RecordSink {
     fn best_before(&mut self, key: &BestKey, preset: &RulePreset) -> BestLookup {
         let _ = (key, preset);
         BestLookup::Unavailable
+    }
+
+    /// The best stored under `key` before the coming play and, when
+    /// `progress` asks, its progress, both from one read so they name one
+    /// play (design.md "Personal Bests", skin projections); `preset` is the
+    /// key's. One read per play, on the game thread, before it is
+    /// prepared. By default [`best_before`](Self::best_before)'s lookup
+    /// with an unavailable progress: a sink that keeps no progress paces
+    /// the best by the line.
+    fn play_best(
+        &mut self,
+        key: &BestKey,
+        preset: &RulePreset,
+        progress: Option<ProgressQuery>,
+    ) -> PlayBest {
+        let _ = progress;
+        PlayBest {
+            best: self.best_before(key, preset),
+            progress: ProgressLookup::Unavailable,
+        }
     }
 
     /// The player's totals, this play counted, for a result's views

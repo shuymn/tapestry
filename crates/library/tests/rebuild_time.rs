@@ -2,8 +2,11 @@
 //! (design.md "Personal Bests"): a chart near the loader's 500,000-object
 //! limit with a record of few inputs, and a record as dense as admission
 //! allows. A pause is acknowledged once the step in hand finishes, so these
-//! bound a READY state's wait for the rebuild. Indicators, not gates; run in
-//! release:
+//! bound a READY state's wait for the rebuild. The contribution's step
+//! collects the best's progress, the commit writes it, and the play's read
+//! of it with its best is timed after; `game`'s `best_series_time` times
+//! the series a play builds from it.
+//! Indicators, not gates; run in release:
 //!
 //! `cargo test --release -p library --test rebuild_time -- --ignored --nocapture`
 
@@ -14,7 +17,7 @@ use std::fs;
 use std::time::{Duration, Instant};
 
 use common::{Fixture, MS, key, record_of};
-use library::{Contribution, PlayId, REBUILD_MEMORY, Verified};
+use library::{Contribution, PlayId, Progress, ProgressQuery, REBUILD_MEMORY, Verified};
 use replay::{DecodeLimits, PlayRecord};
 
 /// 999 measures of 71 taps on each of the 7 keys: 496,503 objects.
@@ -60,6 +63,9 @@ fn time_steps(label: &str, text: &str, record: &PlayRecord) {
     let t = Instant::now();
     let re = replay::verify::evaluate_record(&decoded, &chart, None).unwrap();
     step("evaluation", t);
+    // The contribution's values and its progress, one pass over the
+    // evaluation's events.
+    let t = Instant::now();
     let c = Contribution::of(
         id,
         &decoded,
@@ -70,13 +76,24 @@ fn time_steps(label: &str, text: &str, record: &PlayRecord) {
         &chart,
         &preset,
     );
+    step("contribution", t);
     drop(re);
+    let mut writer = lib.best_writer().unwrap();
     let t = Instant::now();
-    lib.best_writer().unwrap().ingest(&c).unwrap();
+    writer.ingest(&c).unwrap();
     step("commit", t);
+    let targets = c.progress.as_ref().map_or(0, |p| p.len());
+    let query = ProgressQuery {
+        targets: u32::try_from(targets).unwrap(),
+        empty_poor_counted: preset.empty_poor.counted,
+    };
+    let t = Instant::now();
+    let read = writer.play_best(&c.key, Some(query)).unwrap();
+    step("progress read", t);
+    assert!(matches!(read.progress, Some(Progress::Known(_))));
     let needed = replay::verify::batch_bytes(&decoded, &chart, &preset).unwrap();
     println!(
-        "{label}: {} objects, {} inputs, {} MiB admitted of {} MiB",
+        "{label}: {} objects, {} inputs, {targets} judgments, {} MiB admitted of {} MiB",
         chart.lanes.iter().map(Vec::len).sum::<usize>(),
         decoded.events.len(),
         needed >> 20,

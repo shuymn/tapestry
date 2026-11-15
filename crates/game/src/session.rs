@@ -34,7 +34,8 @@ use rules::{GaugeKind, GaugeValue, RulePreset};
 use crate::attempt::{Attempt, NoteEnd, ScoreBasis, finish_anchor};
 use crate::autoplay::{Autoplay, AutoplayError};
 use crate::bests::{
-    BestKey, BestLookup, BestView, PlayerTotals, SavedPlay, TargetPlay, score_target,
+    BestKey, BestLookup, BestScore, BestView, PlayerTotals, ProgressLookup, ProgressQuery,
+    SavedPlay, TargetPlay, score_target,
 };
 use crate::live::{Closing, ClosingEnd, InputWaitError, LiveError, Opening, Rig};
 use crate::logic::{AbortCause, LogicConfig, LogicError, Record};
@@ -474,11 +475,25 @@ pub struct Loaded {
     /// The play's best and target, read for it once
     /// ([`read_score`](Self::read_score)).
     score: ScoreBasis,
-    /// The coming play's best as read, under the play preset's SHA-256:
-    /// kept until that play is finished, so a loading opening that begins
-    /// the same play again, or prepares it before it begins, reads no
-    /// more ([`finish_play`](Self::finish_play) forgets it).
-    coming: Option<([u8; 32], BestLookup)>,
+    /// The play's best paced by its play, read with its best.
+    pace: Option<Arc<[u32]>>,
+    /// The coming play's best and its pace as read, under the play
+    /// preset's SHA-256: kept until that play is finished, so a loading
+    /// opening that begins the same play again, or prepares it before it
+    /// begins, reads no more ([`finish_play`](Self::finish_play) forgets
+    /// it).
+    coming: Option<Coming>,
+}
+
+/// The coming play's best as read ([`Loaded::read_score`]).
+#[derive(Debug)]
+struct Coming {
+    /// The play preset's SHA-256 it was read under.
+    preset: [u8; 32],
+    /// The best.
+    best: BestLookup,
+    /// Its pace.
+    pace: Option<Arc<[u32]>>,
 }
 
 /// The identity of the next chart loaded.
@@ -696,6 +711,7 @@ impl PendingLoad {
                     profile: Arc::new(profile),
                     main,
                     score: ScoreBasis::default(),
+                    pace: None,
                     coming: None,
                 })
             }
@@ -1405,7 +1421,7 @@ impl Loaded {
         self.ahead = false;
         let attempt = self.attempt;
         let checked = self.reload_preset();
-        self.score = self.read_score();
+        (self.score, self.pace) = self.read_score();
         let standing = self.first_error.take();
         PlayStart {
             attempt,
@@ -1424,38 +1440,75 @@ impl Loaded {
     /// notes and that best, a chart that declares `#RANDOM` or
     /// `#SETRANDOM` a random one. The coming play reads at most once per
     /// key: a best already read for it under the same key is taken again.
-    fn read_score(&mut self) -> ScoreBasis {
+    ///
+    /// The best's progress is read with it, in the same read
+    /// ([`RecordSink::play_best`]), for a chart that declares no
+    /// `#RANDOM`, whose best always has this chart's notes; the pace is
+    /// [`best_series`](crate::best_series) of it under the play preset, and
+    /// none when the progress is not known or not this best's.
+    fn read_score(&mut self) -> (ScoreBasis, Option<Arc<[u32]>>) {
         if self.practice.is_some() {
-            return ScoreBasis::default();
+            return (ScoreBasis::default(), None);
         }
         let key = BestKey {
             chart_sha256: self.chart_record.identity.sha256,
             preset_sha256: replay::preset_hash(&self.preset),
         };
-        let lookup = match self.coming.take() {
-            Some((preset, lookup)) if preset == key.preset_sha256 => lookup,
+        // The chart's judged notes, its taps and long notes, and whether it
+        // declares `#RANDOM`, as `ResultBasis` counts them for the whole
+        // chart.
+        let notes = self
+            .chart
+            .lanes
+            .iter()
+            .flatten()
+            .filter(|n| !matches!(n.kind, bms_model::NoteKind::Mine { .. }))
+            .fold(0_u32, |n, _| n.saturating_add(1));
+        let random = !self.chart.identity.random_results.is_empty();
+        let (lookup, pace) = match self.coming.take() {
+            Some(c) if c.preset == key.preset_sha256 => (c.best, c.pace),
             _ => match self.parts.records.as_mut() {
-                Some(sink) => sink.best_before(&key, &self.preset),
-                None => BestLookup::Unavailable,
+                Some(sink) => {
+                    let query = (!random).then_some(ProgressQuery {
+                        targets: notes,
+                        empty_poor_counted: self.preset.empty_poor.counted,
+                    });
+                    let read = sink.play_best(&key, &self.preset, query);
+                    let pace = match (&read.best, &read.progress) {
+                        (
+                            BestLookup::Known(BestScore { ex: Some(ex), .. }),
+                            ProgressLookup::Known(judgments),
+                        ) if query.is_some() => {
+                            crate::best_series(judgments, &self.preset, *ex, notes)
+                        }
+                        _ => None,
+                    };
+                    (read.best, pace)
+                }
+                None => (BestLookup::Unavailable, None),
             },
         };
-        self.coming = Some((key.preset_sha256, lookup.clone()));
+        self.coming = Some(Coming {
+            preset: key.preset_sha256,
+            best: lookup.clone(),
+            pace: pace.clone(),
+        });
         let (best, best_known) = match lookup {
             BestLookup::Known(score) => (score.ex.unwrap_or(0), true),
             BestLookup::KnownEmpty => (0, true),
             BestLookup::Unavailable => (0, false),
         };
-        let basis = crate::result_figures::ResultBasis::of(&self.chart, None);
-        let play = if basis.random {
+        let play = if random {
             TargetPlay::Random
         } else {
             TargetPlay::Fixed
         };
-        ScoreBasis {
+        let score = ScoreBasis {
             best,
             best_known,
-            target: score_target(self.settings.player.target, basis.notes, best, play),
-        }
+            target: score_target(self.settings.player.target, notes, best, play),
+        };
+        (score, pace)
     }
 
     /// The coming play's best and target, set before its attempt is first
@@ -1466,7 +1519,7 @@ impl Loaded {
     /// under the same key. Until it begins, the attempt prepared carries
     /// the number the play will have.
     pub(crate) fn prepare_score(&mut self) {
-        self.score = self.read_score();
+        (self.score, self.pace) = self.read_score();
         self.ahead = true;
     }
 
@@ -1507,6 +1560,7 @@ impl Loaded {
         Attempt {
             displayed: self.displayed,
             score: self.score,
+            pace: self.pace.clone(),
             profile: Some(Arc::clone(&self.profile)),
             main: self.main,
             speed: self.config.speed,
