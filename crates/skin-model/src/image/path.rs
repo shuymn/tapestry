@@ -188,10 +188,12 @@ fn absent(e: &io::Error) -> bool {
 }
 
 /// An absolute path split lexically into its anchor (a drive `C:`, a
-/// UNC share `\\server\share`, or `/`) and its normalised components, or
-/// `None` for a form a link's target may not take: a device, a volume
-/// GUID, a drive-relative or a driveless rooted path, or `..` above the
-/// anchor. A verbatim drive or UNC prefix reads as the plain one.
+/// UNC share `\\server\share`, or `/`) and its components, `.` and empty
+/// ones dropped and `..` kept: what a `..` steps up from depends on the
+/// links before it, which only a walk sees. `None` for a form a link's
+/// target may not take: a device, a volume GUID, a drive-relative or a
+/// driveless rooted path. A verbatim drive or UNC prefix reads as the
+/// plain one.
 fn anchored(path: &str) -> Option<(String, Vec<String>)> {
     let sep = |c: char| c == '/' || c == '\\';
     let (anchor, rest) = if cfg!(windows) {
@@ -224,16 +226,11 @@ fn anchored(path: &str) -> Option<(String, Vec<String>)> {
     } else {
         (String::from("/"), path.strip_prefix('/')?.to_owned())
     };
-    let mut parts: Vec<String> = Vec::new();
-    for part in rest.split(sep) {
-        match part {
-            "" | "." => {}
-            ".." => {
-                parts.pop()?;
-            }
-            _ => parts.push(part.to_owned()),
-        }
-    }
+    let parts = rest
+        .split(sep)
+        .filter(|p| !p.is_empty() && *p != ".")
+        .map(str::to_owned)
+        .collect();
     Some((anchor, parts))
 }
 
@@ -384,9 +381,12 @@ impl Root {
     /// never followed, before anything below it is looked at: a target
     /// outside the folder ([`Root::inside`]) is [`RootError::Escapes`]
     /// whatever lies beyond it, and an inward one is walked again from the
-    /// folder. An absent entry is [`RootError::Missing`] when it is the
-    /// name's own, and [`RootError::Dangling`] when a link's target asked
-    /// for it; a file with components left is a path through a file,
+    /// folder. A target's `..` steps up from the folder the walk has
+    /// reached, which holds no link, so the components before it are
+    /// walked first; one above the folder is [`RootError::Escapes`]. An
+    /// absent entry is [`RootError::Missing`] when it is the name's own,
+    /// and [`RootError::Dangling`] when a link's target asked for it; a
+    /// file with components left is a path through a file,
     /// decided the same way by the next component's provenance. More than
     /// [`MAX_LINK_HOPS`] links in one walk, one counter for the whole of
     /// it, are [`RootError::Dangling`]: any loop ends so.
@@ -399,6 +399,13 @@ impl Root {
         let mut at = self.dir.clone();
         let mut hops = 0;
         while let Some((part, from)) = queue.pop_front() {
+            if part == ".." {
+                if at == self.dir {
+                    return Err(RootError::Escapes);
+                }
+                at.pop();
+                continue;
+            }
             let next = at.join(&part);
             let meta = match fs::symlink_metadata(&next) {
                 Ok(m) => m,
@@ -436,8 +443,9 @@ impl Root {
     }
 
     /// The components below the folder that the link target `target`,
-    /// read in the folder `at`, names, compared lexically and exactly
-    /// with the folder's canonical path and the path it was opened by:
+    /// read in the folder `at`, names, its `..` kept for the walk,
+    /// compared lexically and exactly with the folder's canonical path and
+    /// the path it was opened by:
     /// [`RootError::Escapes`] when it names neither or takes a form a
     /// target may not ([`anchored`]), [`RootError::Dangling`] when it is
     /// longer than [`MAX_PATH_BYTES`]. Nothing is looked up.
@@ -557,21 +565,23 @@ impl Root {
             let Ok(name) = entry.file_name().into_string() else {
                 continue;
             };
-            let path = entry.path();
-            let linked = entry.file_type().map_err(RootError::Io)?.is_symlink();
+            let mut path = entry.path();
             // A link is kept only when its walk stays inside: one that
-            // leads out, nowhere, or out and back in is skipped.
-            if linked {
+            // leads out, nowhere, or out and back in is skipped. A kept one
+            // is described by the path its walk reached, never by
+            // following the link again.
+            if entry.file_type().map_err(RootError::Io)?.is_symlink() {
                 let named = if normal.is_empty() {
                     name.clone()
                 } else {
                     format!("{normal}/{name}")
                 };
-                if self.walk(&named).is_err() {
+                let Ok(reached) = self.walk(&named) else {
                     continue;
-                }
+                };
+                path = reached;
             }
-            let Ok(meta) = fs::metadata(&path) else {
+            let Ok(meta) = fs::symlink_metadata(&path) else {
                 continue;
             };
             if meta.is_file() || meta.is_dir() {
