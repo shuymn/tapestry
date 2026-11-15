@@ -1025,7 +1025,7 @@ skin.destination = {
         assert_eq!(
             report(0, &s),
             "skin 0: imported\n  kind: none\n  modules: 0\n  \
-             usage: instructions 0 host calls 0 native work 0 loads 0 (require 0, dofile 0) \
+             usage: instructions 0 host calls 0 native work 0 loads 0 (require 0, dofile 0 (absent 0)) \
              input bytes 0 protected calls 0 metatables 0 peak memory 0 \
              ast nodes 0 captures 0 expanded 0\n  \
              root script: 0\n  root unread: 0\n  \
