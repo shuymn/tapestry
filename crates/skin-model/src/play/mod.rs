@@ -93,11 +93,18 @@ pub struct ScoreBasis {
 }
 
 /// What an attempt's score figures and graphs read: the play's best and
-/// target, the chart's 1× profile and its whole MAIN tempo.
+/// target, the best paced by its play, the chart's 1× profile and its
+/// whole MAIN tempo.
 #[derive(Clone, Copy, Debug)]
 pub struct PlayScore<'a> {
     /// The play's best and target.
     pub basis: ScoreBasis,
+    /// The best paced by its play: entry `p` the best play's EX after its
+    /// first `p` judged targets (design.md "Personal Bests", skin
+    /// projections). Kept only when it has the attempt's targets plus one
+    /// entries and ends at the best; otherwise, and when `None`, the best
+    /// is paced by the line.
+    pub pace: Option<&'a [u32]>,
     /// The chart's notes by second and tempo rows over its 1× times;
     /// `None` when the caller has no chart profile.
     pub profile: Option<&'a ChartProfile>,
@@ -123,6 +130,7 @@ impl PlayScore<'static> {
             best_known: false,
             target: 0,
         },
+        pace: None,
         profile: None,
         main: None,
         areas: None,
@@ -661,6 +669,9 @@ pub struct Play {
     /// The context's play best and target ([`PlayScore::basis`]), which a
     /// rearm keeps.
     score: ScoreBasis,
+    /// The context's [`PlayScore::pace`], when it is this attempt's:
+    /// `targets + 1` entries ending at the best. A rearm keeps it.
+    pace: Option<Box<[u32]>>,
     /// Whether the chart declares `#RANDOM` or `#SETRANDOM`: the values
     /// measured against the best are then not shown (design.md "Personal
     /// Bests", skin projections).
@@ -808,8 +819,9 @@ pub(crate) struct Notes {
 impl Play {
     /// The bytes this attempt's state holds, itself and every buffer it
     /// owns: the reducer, the timers, the playhead's representatives and
-    /// the notes copied for it (the timeline is the chart's, shared), the gauges, the attached and bitmap lines, and
-    /// the bar groups' scratch. For a memory witness; it allocates nothing.
+    /// the notes copied for it (the timeline is the chart's, shared), the gauges, the attached and bitmap lines,
+    /// the bar groups' scratch and the best's pace. For a memory witness; it
+    /// allocates nothing.
     #[must_use]
     pub fn resident_bytes(&self) -> u64 {
         let notes = self.notes.as_deref().map_or(0, |n| {
@@ -828,6 +840,7 @@ impl Play {
             + self.text.heap_bytes()
             + glyphs::lines_bytes(&self.bitmap)
             + self.bars.as_ref().map_or(0, BarScratch::heap_bytes)
+            + self.pace.as_deref().map_or(0, size_of_val)
             + self.graphs.heap_bytes();
         u64::try_from(bytes).unwrap_or(u64::MAX)
     }
@@ -897,6 +910,16 @@ impl Play {
             ctx.empty_poor_breaks_combo,
             bomb_up_to,
         );
+        // The best's pace, only when it is this attempt's: one entry per
+        // judged target and one for none, ending at the best.
+        let entries = usize::try_from(reducer.targets())
+            .ok()
+            .and_then(|n| n.checked_add(1));
+        let pace = ctx
+            .score
+            .pace
+            .filter(|s| Some(s.len()) == entries && s.last() == Some(&ctx.score.basis.best))
+            .map(Box::from);
         let slots = usize::from(timer::BUILTIN).saturating_add(timers);
         let notes = lanes.then(|| {
             let range = std::array::from_fn(|l| {
@@ -941,6 +964,7 @@ impl Play {
             length_ms: timers::length_ms(chart.meta.length),
             autoplay: ctx.autoplay,
             score: ctx.score.basis,
+            pace,
             random: !chart.identity.random_results.is_empty(),
             ratios: [None; 6],
             scratch: ctx.scratch,

@@ -178,6 +178,9 @@ impl AttemptContext {
             bpm_whole_change: Some(bpm_whole_change(self.tempo.meta())),
             play_level: Some(self.play_level),
             score: PlayScore {
+                // The attempt's pace is wired in when the player reads the
+                // best's progress; until then the best paces by the line.
+                pace: None,
                 basis: self.score,
                 profile: self.profile.as_deref(),
                 main: self.main,
