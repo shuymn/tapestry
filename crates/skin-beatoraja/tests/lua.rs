@@ -2690,10 +2690,18 @@ fn a_string_is_never_read_as_a_number() {
 
 #[test]
 fn a_number_s_text_is_charged_before_it_is_made() {
-    // Positive control for the count: the same native call on a string
-    // and on a number differs by the text's charge alone.
+    // Two charges of native work: the conversion's, a fixed 24 bytes taken
+    // before the text is made, and the `upper` result's, the converted
+    // text's length.
     let work = |expr: &str| import(&shown("", expr)).unwrap().usage.native_work;
-    let string = work("string.upper(\"50\")");
+    let two = work("string.upper(\"50\")");
+    let four = work("string.upper(\"50.0\")");
     let number = work("string.upper(50.0)");
-    assert_eq!(number - string, 24);
+    // Positive control: the result's charge tells a 2-byte result from a
+    // 4-byte one.
+    assert_eq!(four - two, 2);
+    // The number costs the conversion's 24 bytes and then the result's
+    // charge for `"50"`, 2 bytes, not Lua 5.4's `"50.0"`, 4 (that would be
+    // 26).
+    assert_eq!(number - two, 24);
 }
