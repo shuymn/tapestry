@@ -160,6 +160,8 @@ pub use save::{
     LinkCount, LocalRecords, RecordRef, RecordSink, SAVE_ATTEMPTS, SaveError, clear_link,
     create_fresh, is_link, open_lock, remove_name, write_atomic,
 };
+#[cfg(feature = "dev-tools")]
+pub use session::SoundHooks;
 pub use session::{
     AutoKeySounds, ChartReader, ChartSource, ClosingReport, Command, GateStorage, Loaded,
     MenuCommand, Parts, PlayEnd, PlayOutcome, PlayPlan, PlayReport, PlayScript, PlayStart,

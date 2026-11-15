@@ -46,8 +46,8 @@ pub struct AttemptContext {
     play_level: i32,
     /// The chart's metadata the `chart.*` fields read: its difficulty and
     /// whether it has a BGA from its labels, its song total from the game,
-    /// its judgment class from its own rank as the reference computes it,
-    /// as the import facts give it ([`JudgeClass::of_headers`]).
+    /// its judgment class from its own rank, as the import facts give it
+    /// ([`JudgeClass::of_headers`]).
     meta: ChartMetadata,
     /// The presentation epoch the attempt was attached as: a snapshot of
     /// another epoch gives its frames no gain.
