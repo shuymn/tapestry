@@ -423,6 +423,10 @@ struct Headless {
     resumed_after: Vec<usize>,
     /// The play's sounds stopped, counted.
     cancels: usize,
+    /// READY states opened ([`Rig::ready_began`]) and plays admitted to
+    /// Closing ([`Rig::closing_began`]).
+    readies: u32,
+    closings: u32,
     /// Recording opened and the play not yet handed over.
     opened: bool,
     in_selection: bool,
@@ -752,6 +756,8 @@ impl Headless {
             withdrawals: Vec::new(),
             resumed_after: Vec::new(),
             cancels: 0,
+            readies: 0,
+            closings: 0,
             opened: false,
             in_selection: false,
             screen_fails_at: i64::MAX,
@@ -1174,6 +1180,14 @@ impl Rig for Headless {
         if self.count_allocs {
             counting::track(true);
         }
+    }
+
+    fn ready_began(&mut self) {
+        self.readies += 1;
+    }
+
+    fn closing_began(&mut self) {
+        self.closings += 1;
     }
 
     fn measured(&mut self, advance: &game::Advance, _: &[eval::JudgeEvent], _: TimeUs) {
@@ -1958,6 +1972,8 @@ fn select_play_retry_back_select_again() {
         ]
     );
     assert_eq!(rig.paused_before_save, [0, 1, 2]);
+    // C26-1: one READY per play, the retry's included; nothing closed.
+    assert_eq!((rig.readies, rig.closings), (3, 0));
     let [(0, a), (1, b)] = &rig.loads[..] else {
         panic!("{:?}", rig.seen);
     };

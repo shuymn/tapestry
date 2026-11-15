@@ -183,6 +183,10 @@ struct Rounds {
     /// Commands pressed by a record sink while a round is saved, taken
     /// first.
     pressed: Rc<RefCell<Vec<Command>>>,
+    /// READY states opened ([`Rig::ready_began`]) and rounds admitted to
+    /// Closing ([`Rig::closing_began`]).
+    readies: u32,
+    closings: u32,
 }
 
 impl Rounds {
@@ -226,6 +230,8 @@ impl Rounds {
             shown: Vec::new(),
             screens: Vec::new(),
             pressed: Rc::default(),
+            readies: 0,
+            closings: 0,
         }
     }
 
@@ -319,6 +325,14 @@ impl Rig for Rounds {
             kinds: self.sources.participants().map(|(_, k)| k).collect(),
             axes: Vec::new(),
         })
+    }
+
+    fn ready_began(&mut self) {
+        self.readies += 1;
+    }
+
+    fn closing_began(&mut self) {
+        self.closings += 1;
     }
 
     fn start(&mut self, origin: TimeUs, sounds: AudioQueue, _screen: RenderSide) {
@@ -762,6 +776,29 @@ fn retry_cuts_the_ring_out_and_saves() {
     assert_eq!(run.records[0].status.finalized, TimeUs(19_680_999));
     // The retry starts the round over.
     assert_eq!(run.reports.len(), 2);
+}
+
+/// C26-1: each practice round opens its own READY: the first, the
+/// automatic repeat after its ring-out (whose ring-out opens none) and a
+/// retry in the repeat's lead-in; the quit in the third's lead-in leaves
+/// with no Closing.
+#[test]
+fn each_round_opens_one_ready() {
+    let run = example_rounds(
+        2,
+        0,
+        &[
+            (2, 8_500 * MS, Command::Retry),
+            (3, 9_000 * MS, Command::Quit),
+        ],
+    );
+    assert_eq!(run.reports.len(), 3);
+    assert_eq!(run.reports[0].end, PlayEnd::Completed);
+    assert_eq!(
+        run.reports[1].end,
+        PlayEnd::Aborted(game::AbortCause::Retry)
+    );
+    assert_eq!((run.rig.readies, run.rig.closings), (3, 0));
 }
 
 /// The quit key during a round's ring-out skips the rest of it to the

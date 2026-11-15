@@ -365,7 +365,9 @@ fn the_chart_facts_are_projected() {
 
 /// The attempt's chart's judgment class (options 180-184) is projected
 /// as play's: `#RANK 3` easy, `#RANK 0` very hard, no header normal,
-/// `#DEFEXRANK 120` easy (90) and `#DEFEXRANK 10` in no class (7).
+/// `#DEFEXRANK 120` easy (90), `#DEFEXRANK 10` in no class (7),
+/// `#DEFEXRANK 1` very hard (0, one validation) and `#DEFEXRANK 30000000`
+/// very easy (22 500 000, past `i32`).
 #[test]
 fn the_charts_judgment_class_is_projected() {
     for (head, class) in [
@@ -374,6 +376,8 @@ fn the_charts_judgment_class_is_projected() {
         ("", Some(2)),
         ("#DEFEXRANK 120\n", Some(3)),
         ("#DEFEXRANK 10\n", None),
+        ("#DEFEXRANK 1\n", Some(0)),
+        ("#DEFEXRANK 30000000\n", Some(4)),
     ] {
         let loaded =
             crate::imports::facts::tests::loaded(&format!("{head}#00111:01\n"), "beatoraja-style");

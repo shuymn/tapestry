@@ -4,17 +4,20 @@
 //! large sound, a set picker, a test clock and a spawner.
 
 use std::collections::HashMap;
-use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "dev-tools")]
+use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Weak};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+#[cfg(feature = "dev-tools")]
+use audio::Sound;
 use audio::{
     AudioEngine, BankLimits, Decoded, FileRefusal, GenId, PickBudget, RecordingOutput, SimConfig,
-    SimDevice, Sound, SoundBank, SystemKind, SystemVoices,
+    SimDevice, SoundBank, SystemKind, SystemVoices,
 };
 use bms_model::TimeUs;
 use game::sound_sets::{
@@ -25,6 +28,7 @@ use game::{AudioWaitError, AudioWorker, DataRoot, SoundSettings, audio_control};
 use super::{Clock, Event, Hooks, RealClock, Reason, Settled, Setup, Spawn, SystemSounds};
 
 const RATE: u32 = 48_000;
+#[cfg(feature = "dev-tools")]
 const MIB: u64 = 1024 * 1024;
 /// How long a test waits for real work (a decode, a step) before failing.
 const PATIENCE: Duration = Duration::from_secs(20);
@@ -251,7 +255,9 @@ pub(crate) struct Rule {
     /// Decodes on after a cancel.
     pub(crate) ignore_cancel: bool,
     pub(crate) panic: bool,
-    /// A silent sound of this many mono samples, not read from the file.
+    /// A silent sound of this many mono samples, not read from the file
+    /// (dev-tools: charged through `PickBudget::charge`).
+    #[cfg(feature = "dev-tools")]
     pub(crate) fake: Option<usize>,
     pub(crate) delay: Option<Duration>,
 }
@@ -351,20 +357,8 @@ impl DecodeFile for Seam {
         assert!(!rule.panic, "a seamed decoder panic");
         let decoded = if !rule.ignore_cancel && cancel() {
             Err(FileRefusal::Cancelled)
-        } else if let Some(n) = rule.fake {
-            budget.charge(n as u64 * 2).map(|()| {
-                let mut h = DefaultHasher::new();
-                path.hash(&mut h);
-                let mut digest = [0_u8; 32];
-                for (i, chunk) in digest.chunks_mut(8).enumerate() {
-                    i.hash(&mut h);
-                    chunk.copy_from_slice(&h.finish().to_le_bytes());
-                }
-                Decoded::Sound {
-                    sound: Sound::mono(vec![0; n]),
-                    digest,
-                }
-            })
+        } else if let Some(decoded) = fake(rule, path, budget) {
+            decoded
         } else if rule.ignore_cancel {
             OneFile.decode(path, rate, budget, limits, &|| false)
         } else {
@@ -373,6 +367,33 @@ impl DecodeFile for Seam {
         self.log(path, true);
         decoded
     }
+}
+
+/// `rule`'s fake sound for `path`, charged to `budget` (dev-tools).
+#[cfg(feature = "dev-tools")]
+fn fake(rule: Rule, path: &Path, budget: &PickBudget) -> Option<Result<Decoded, FileRefusal>> {
+    use std::hash::{DefaultHasher, Hash, Hasher};
+
+    let n = rule.fake?;
+    Some(budget.charge(n as u64 * 2).map(|()| {
+        let mut h = DefaultHasher::new();
+        path.hash(&mut h);
+        let mut digest = [0_u8; 32];
+        for (i, chunk) in digest.chunks_mut(8).enumerate() {
+            i.hash(&mut h);
+            chunk.copy_from_slice(&h.finish().to_le_bytes());
+        }
+        Decoded::Sound {
+            sound: Sound::mono(vec![0; n]),
+            digest,
+        }
+    }))
+}
+
+/// No fake sound without dev-tools.
+#[cfg(not(feature = "dev-tools"))]
+const fn fake(_: Rule, _: &Path, _: &PickBudget) -> Option<Result<Decoded, FileRefusal>> {
+    None
 }
 
 /// The recovery state in memory, a write failing from a chosen one on.
@@ -610,9 +631,10 @@ impl Run {
             .count()
     }
 
-    /// The sound the mapping keeps for `kind`.
-    fn kept(&self, kind: SystemKind) -> Option<Arc<Sound>> {
-        self.sounds.mapping.get(kind).map(|k| Arc::clone(&k.sound))
+    /// The sound the audio thread's current generation plays for `kind`.
+    #[cfg(feature = "dev-tools")]
+    fn playing(&self, kind: SystemKind) -> Option<Arc<Sound>> {
+        self.audio.system(|v| v.current_sound(kind).cloned())
     }
 
     fn sounding(&self) -> usize {
@@ -624,14 +646,12 @@ impl Run {
     }
 }
 
-/// S3, S15: a pick reserves 128 MiB at admission and its generation's bytes
+/// S3: a pick reserves 128 MiB at admission and its generation's bytes
 /// once ready; a refused file leaves only its kind silent; identical bytes
-/// at another path are stored and charged once; a kind with no candidate
-/// keeps the previous sound, the same PCM, read from no file and charged to
-/// the new generation, while a refused candidate's kind is silent, a kind
-/// no pick has found is silent, and a sound from a source skipped for the
-/// run is not kept; the kept PCM is freed on this thread with its last
-/// holder.
+/// at another path are stored and charged once; a kind the new pick has no
+/// file for is silent, charged nothing, and the previous pick's PCM is
+/// freed on this thread once its generation is back.
+#[cfg(feature = "dev-tools")]
 #[test]
 fn a_pick_reserves_then_charges_its_bytes() {
     // The charges: A of 100 MiB current, nothing retired; B of 90 MiB.
@@ -685,15 +705,15 @@ fn a_pick_reserves_then_charges_its_bytes() {
     run.settle();
     let kinds: Vec<SystemKind> = SystemKind::ALL
         .into_iter()
-        .filter(|&k| run.kept(k).is_some())
+        .filter(|&k| run.playing(k).is_some())
         .collect();
     assert_eq!(
         kinds,
         [SystemKind::PlayReady, SystemKind::Clear, SystemKind::Fail]
     );
-    let clear = run.kept(SystemKind::Clear).unwrap();
-    assert!(Arc::ptr_eq(&clear, &run.kept(SystemKind::Fail).unwrap()));
-    let ready = run.kept(SystemKind::PlayReady).unwrap();
+    let clear = run.playing(SystemKind::Clear).unwrap();
+    assert!(Arc::ptr_eq(&clear, &run.playing(SystemKind::Fail).unwrap()));
+    let ready = run.playing(SystemKind::PlayReady).unwrap();
     assert_eq!(run.sounds.charged(), clear.bytes() + ready.bytes());
     let refused = run
         .said()
@@ -703,10 +723,10 @@ fn a_pick_reserves_then_charges_its_bytes() {
     assert_eq!(refused, 2, "{:?}", run.said());
     drop(run);
 
-    // Kept sounds: A with `scratch` and `fail`; B with neither of its own
-    // (its `fail.wav` a folder); C with no `scratch`.
+    // A with `scratch` and `fail`; B with neither of its own (its
+    // `fail.wav` a folder): B's are silent, A's PCM freed.
     let fx = Fixture::new();
-    for (set, frames) in [("A", 10), ("B", 11), ("C", 12)] {
+    for (set, frames) in [("A", 10), ("B", 11)] {
         fx.sound(&format!("sound/{set}"), SystemKind::Clear, frames);
     }
     fx.sound("sound/A", SystemKind::Scratch, 5 * 48_000);
@@ -715,15 +735,15 @@ fn a_pick_reserves_then_charges_its_bytes() {
     let mut run = Run::new(fx, Opts::default());
     run.settle();
     run.entry();
-    let scratch = run.kept(SystemKind::Scratch).unwrap();
-    let weak: Weak<Sound> = Arc::downgrade(&scratch);
+    let weak: Weak<Sound> = Arc::downgrade(&run.playing(SystemKind::Scratch).unwrap());
     run.pick(1);
     run.entry();
     run.settle();
-    let kept = run.kept(SystemKind::Scratch).unwrap();
-    assert!(Arc::ptr_eq(&kept, &scratch), "B plays A's scratch");
-    assert_eq!(run.seam.opens("A/scratch.wav"), 1, "no file read for it");
-    assert!(run.kept(SystemKind::Fail).is_none(), "B's refused fail");
+    assert!(
+        run.playing(SystemKind::Scratch).is_none(),
+        "B has no scratch"
+    );
+    assert!(run.playing(SystemKind::Fail).is_none(), "B's refused fail");
     assert!(
         run.said()
             .iter()
@@ -731,30 +751,9 @@ fn a_pick_reserves_then_charges_its_bytes() {
         "{:?}",
         run.said()
     );
-    let b_clear = run.kept(SystemKind::Clear).unwrap();
-    assert_eq!(run.sounds.charged(), b_clear.bytes() + scratch.bytes());
-    drop((kept, scratch, b_clear));
-    // A is returned and dropped: B's scratch still sounds.
-    assert_eq!(run.sounds.alive.len(), 1);
-    run.start(SystemKind::Scratch, None);
-    run.audio.steps(2);
-    assert_eq!(run.sounding(), 1);
-    run.pick(2);
-    run.entry();
-    run.settle();
-    assert!(Arc::ptr_eq(
-        &run.kept(SystemKind::Scratch).unwrap(),
-        &weak.upgrade().unwrap()
-    ));
-    // A again, its scratch decoded anew: once B and C are returned and the
-    // mapping replaced, the first PCM is freed, here.
-    run.pick(0);
-    run.entry();
-    run.settle();
-    assert!(
-        weak.upgrade().is_none(),
-        "the kept PCM outlived its holders"
-    );
+    let b_clear = run.playing(SystemKind::Clear).unwrap();
+    assert_eq!(run.sounds.charged(), b_clear.bytes());
+    assert!(weak.upgrade().is_none(), "A's scratch outlived A");
     drop(run);
 
     // A startup pick with no `scratch` anywhere: silent.
@@ -762,52 +761,90 @@ fn a_pick_reserves_then_charges_its_bytes() {
     fx.sound("sound/C", SystemKind::Clear, 10);
     let mut run = Run::new(fx, Opts::default());
     run.settle();
-    assert!(run.kept(SystemKind::Scratch).is_none());
-    drop(run);
+    assert!(run.playing(SystemKind::Scratch).is_none());
+}
 
-    // A source skipped for the run: A is both a sound set and the BGM set;
-    // B keeps A's scratch, then A's `select` panics in B's pick, so C keeps
-    // nothing of A.
+/// The level of every sample of `kind`'s file in the source numbered
+/// `source` (1 set A, 2 set B, 3 `defaultsound\`).
+#[cfg(feature = "dev-tools")]
+fn level(source: i16, kind: SystemKind) -> i16 {
+    source * 1_000 + i16::try_from(kind.index()).unwrap() + 1
+}
+
+/// A pick is a whole: with sets A (every kind) installed, an entry picks
+/// sets B, whose sound set lacks `o-open` and `o-close` and whose BGM set
+/// lacks `decide`, with `defaultsound\` giving `o-close`. Once B installs,
+/// every kind plays B's file or the defaults', never A's: `o-open` starts no
+/// voice, `decide` sounds the tone, `o-close` the defaults' sound, and A's
+/// PCM is freed with A's generation.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_new_pick_plays_none_of_the_previous_one() {
     let fx = Fixture::new();
-    for set in ["A", "B", "C"] {
-        fx.sound(&format!("sets/{set}"), SystemKind::Clear, 10);
-    }
-    fx.sound("sets/A", SystemKind::Scratch, 300);
-    fx.sound("sets/A", SystemKind::Select, 300);
-    let sets = fx.path("sets");
-    let opts = Opts {
-        sounds: SoundSettings {
-            sound_root: Some(sets.clone()),
-            bgm_root: Some(sets),
-        },
-        ..Opts::default()
+    let write = |dir: &str, source: i16, kind: SystemKind, ext: &str| {
+        fx.write(
+            &format!("{dir}/{}.{ext}", file_stem(kind)),
+            &wav(48_000, level(source, kind)),
+        );
     };
-    let mut run = Run::new(fx, opts);
+    for kind in SystemKind::ALL {
+        let role = match kind {
+            SystemKind::Select | SystemKind::Decide => "bgm",
+            _ => "sound",
+        };
+        write(&format!("{role}/A"), 1, kind, "wav");
+    }
+    for kind in [SystemKind::Clear, SystemKind::Scratch] {
+        write("sound/B", 2, kind, "wav");
+    }
+    write("bgm/B", 2, SystemKind::Select, "wav");
+    write("defaultsound", 3, SystemKind::OptionClose, "ogg");
+    let mut run = Run::new(fx, Opts::default());
     run.settle();
-    run.entry();
-    assert!(run.kept(SystemKind::Scratch).is_some());
-    run.seam.rule(
-        "A/select.wav",
-        Rule {
-            panic: true,
-            ..Rule::default()
-        },
-    );
+    let a = run.entry();
+    assert_eq!(run.installed(), Some(a));
+    let level_of = |s: &Sound| {
+        let samples = s.samples();
+        assert!(samples.iter().all(|&v| v == samples[0]));
+        samples[0]
+    };
+    let mut a_sounds: Vec<Weak<Sound>> = Vec::new();
+    for kind in SystemKind::ALL {
+        let sound = run.playing(kind).unwrap_or_else(|| panic!("A's {kind:?}"));
+        assert_eq!(level_of(&sound), level(1, kind), "A's {kind:?}");
+        a_sounds.push(Arc::downgrade(&sound));
+    }
+
     run.pick(1);
-    run.entry();
+    let b = run.entry();
     run.settle();
+    assert_eq!(run.installed(), Some(b));
+    for kind in SystemKind::ALL {
+        let want = match kind {
+            SystemKind::Clear | SystemKind::Scratch | SystemKind::Select => Some(level(2, kind)),
+            SystemKind::OptionClose => Some(level(3, kind)),
+            _ => None,
+        };
+        let got = run.playing(kind).map(|s| level_of(&s));
+        assert_eq!(got, want, "B's {kind:?}");
+    }
     assert!(
-        run.kept(SystemKind::Scratch).is_some(),
-        "kept before the panic"
+        a_sounds.iter().all(|w| w.upgrade().is_none()),
+        "A's PCM outlived A's generation"
     );
-    assert_eq!(run.sounds.skipped.len(), 1);
-    run.pick(2);
-    run.entry();
-    run.settle();
-    assert!(
-        run.kept(SystemKind::Scratch).is_none(),
-        "a sound of a skipped source"
-    );
+
+    // What the player hears: `o-open` starts no voice, `decide` sounds
+    // the tone, `o-close` sounds.
+    run.start(SystemKind::OptionOpen, None);
+    run.audio.steps(2);
+    assert_eq!(run.sounding(), 0, "o-open sounded");
+    run.start(SystemKind::Decide, None);
+    run.audio.steps(2);
+    assert_eq!(run.sounding(), 0, "decide sounded a set's sound");
+    assert!(run.audio.system(SystemVoices::tone_sounding), "no tone");
+    run.start(SystemKind::OptionClose, None);
+    run.audio.steps(2);
+    assert_eq!(run.sounding(), 1, "the defaults' o-close");
 }
 
 /// The sets of the visit tests: sound sets A to F, each with `clear`, A
@@ -873,7 +910,9 @@ fn an_entry_waits_then_rerolls() {
         clock: Arc::clone(&clock) as Arc<dyn Clock>,
         ..Opts::default()
     };
-    let mut run = Run::with_seam(visits(), opts, |seam| {
+    let fx = visits();
+    fx.sound("sound/C", SystemKind::Scratch, 20 * 48_000);
+    let mut run = Run::with_seam(fx, opts, |seam| {
         seam.rule(
             "B/clear.wav",
             Rule {
@@ -901,8 +940,8 @@ fn an_entry_waits_then_rerolls() {
     let place = |e: Event| events.iter().position(|&x| x == e).unwrap();
     assert!(place(Event::Pushed(b)) < place(Event::Released(a)));
     assert!(place(Event::Released(a)) < place(Event::Admitted(c)));
-    // (c) C retired holding a one-shot (A's kept 20 s scratch, started
-    // after the entry's stop and before D installs): the next entry's stop
+    // (c) C retired holding a one-shot (its 20 s scratch, started after
+    // the entry's stop and before D installs): the next entry's stop
     // cuts it, C goes back and E is admitted within a few steps.
     run.settle();
     run.pick(3);
@@ -1327,60 +1366,6 @@ fn superseded_values_are_dropped() {
     assert_eq!(run.installed(), Some(a));
 }
 
-/// S5: `close` right after a latch, no poll between: the deferred-drop
-/// slot goes before the charge of the generation the empty install sent
-/// back is released.
-#[test]
-fn close_drains_the_slot_before_the_returns() {
-    let mut run = Run::new(visits(), Opts::default());
-    run.settle();
-    let a = run.entry();
-    run.sounds
-        .latch(&mut run.audio.control, Reason::SequenceExhausted);
-    let empty = run.sounds.newest;
-    wait("the empty install", || run.installed() == Some(empty));
-    run.audio.steps(2);
-    assert!(!run.events().contains(&Event::Drained));
-    run.sounds.close(&mut run.audio.control);
-    let events = run.events();
-    let drained = events.iter().position(|&e| e == Event::Drained).unwrap();
-    let released = events
-        .iter()
-        .position(|&e| e == Event::Released(a))
-        .unwrap();
-    assert!(drained < released, "{events:?}");
-}
-
-/// S5: a latch the receivers find (here the worker's end, with A
-/// installed) is drained in the same service, before the returns its
-/// empty install sends back are taken.
-#[test]
-fn a_latch_found_while_receiving_is_drained_before_the_returns() {
-    let opts = Opts::default();
-    let panic = Arc::clone(&opts.picker_panics);
-    let mut run = Run::new(visits(), opts);
-    run.settle();
-    run.entry();
-    panic.store(true, Ordering::Release);
-    run.pick(1);
-    run.entry();
-    wait("the worker's end", || {
-        run.sounds
-            .worker
-            .as_ref()
-            .and_then(|w| w.handle.as_ref())
-            .is_some_and(thread::JoinHandle::is_finished)
-    });
-    assert!(run.sounds.latched.is_none());
-    run.sounds.service(&mut run.audio.control);
-    assert_eq!(run.sounds.latched, Some(Reason::WorkerGone));
-    assert!(
-        run.sounds.deferred.is_none(),
-        "the slot outlived the receivers"
-    );
-    assert!(run.events().contains(&Event::Drained));
-}
-
 /// S5: a panic in one source's decode leaves its kinds silent, skips it
 /// for the run and installs the rest; with its clear failing too, the run
 /// latches; a worker that cannot start latches with nothing reserved; a
@@ -1401,8 +1386,14 @@ fn worker_failures() {
     let mut run = Run::with_seam(visits(), Opts::default(), panics);
     run.settle();
     assert!(run.sounds.latched.is_none());
-    assert!(run.kept(SystemKind::Clear).is_none());
-    assert!(run.kept(SystemKind::Select).is_some(), "the rest installed");
+    #[cfg(feature = "dev-tools")]
+    {
+        assert!(run.playing(SystemKind::Clear).is_none());
+        assert!(
+            run.playing(SystemKind::Select).is_some(),
+            "the rest installed"
+        );
+    }
     assert_eq!(run.sounds.skipped.len(), 1);
     assert!(
         run.said()
@@ -1637,8 +1628,7 @@ fn a_pick_holds_ready_until_it_reports() {
 /// latch inside the window included: the ring drained, the window's first
 /// call latches by its refused draw, a `start(Scratch)`, a
 /// `start(Decide)` (which asks for the tone) or a `stop`, one per run. The
-/// mapping it invalidates moves into the slot, dropped and named only at
-/// the next poll, before that poll releases the charge of the generation
+/// latch is named only at the next poll, which also drops the generation
 /// the empty install sent back.
 #[cfg(feature = "dev-tools")]
 #[test]
@@ -1666,7 +1656,9 @@ fn system_sounds_start_and_stop_alloc() {
         let mut run = Run::new(fx, Opts::default());
         run.settle();
         let a = run.entry();
-        assert!(run.kept(SystemKind::Scratch).is_some() && run.kept(SystemKind::Fail).is_some());
+        assert!(
+            run.playing(SystemKind::Scratch).is_some() && run.playing(SystemKind::Fail).is_some()
+        );
         run.audio.hold(true);
         let control = &mut run.audio.control;
         let sounds = &mut run.sounds;
@@ -1725,27 +1717,18 @@ fn system_sounds_start_and_stop_alloc() {
             tones + decides + u64::from(first == First::Decide),
             "the tone for each decision sound"
         );
-        assert!(sounds.mapping.is_empty(), "the mapping moved out");
-        assert!(sounds.deferred.is_some(), "the slot holds it, undropped");
-        assert!(!sounds.events.contains(&Event::Drained));
         assert!(
             !run.said().iter().any(|l| l.contains("tone sounds")),
             "named only by the drain"
         );
 
-        // The empty install sends A back; the next poll drops the slot
-        // before it releases A's charge, and names the latch once.
+        // The empty install sends A back; the next poll drops it, releases
+        // its charge and names the latch once.
         run.audio.step_now(2);
         let frees = this_thread_frees();
         run.poll();
         assert!(this_thread_frees() > frees);
-        let events = run.events();
-        let drained = events.iter().position(|&e| e == Event::Drained).unwrap();
-        let released = events
-            .iter()
-            .position(|&e| e == Event::Released(a))
-            .unwrap();
-        assert!(drained < released, "{events:?}");
+        assert!(run.events().contains(&Event::Released(a)));
         run.poll();
         let named = run
             .said()
@@ -1754,4 +1737,119 @@ fn system_sounds_start_and_stop_alloc() {
             .count();
         assert_eq!(named, 1);
     }
+}
+
+/// Waits, at most 10 s, until `gate` holds the audio thread after at
+/// least one pass since its last stop: whatever the start ring held when
+/// it was released has been taken.
+#[cfg(feature = "dev-tools")]
+fn one_pass(gate: &crate::dev::AudioGate) {
+    let until = Instant::now() + Duration::from_secs(10);
+    gate.release();
+    while gate.stopped() {
+        assert!(
+            Instant::now() < until,
+            "the audio thread never left the gate"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    gate.hold();
+    while !gate.stopped() {
+        assert!(Instant::now() < until, "the audio thread never came back");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// C26-4: READY's and Closing's sounds allocate and free nothing on the
+/// game thread, on the player's rig as `rig()` makes it: 1 000 hook calls,
+/// READY's and Closing's in turn, the start ring taken by the audio thread
+/// after every 50, then the hook that finds the request sequence
+/// exhausted, latching the run, and hooks refused after it. Only the hooks
+/// are counted, with a positive control first.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn ready_and_closing_sounds_alloc() {
+    use game::{Rig as _, SEQ_LIMIT};
+
+    use crate::alloc_count::{this_thread, this_thread_frees};
+    use crate::play::PlayerRig;
+
+    let fx = Fixture::new();
+    for kind in [
+        SystemKind::Clear,
+        SystemKind::PlayReady,
+        SystemKind::PlayStop,
+    ] {
+        fx.sound("sound/A", kind, 24_000);
+    }
+    let root = fx.root();
+    super::arm(move |setup, _| {
+        setup.root = root;
+        setup.fs = Box::new(MemFs::new());
+    });
+    let gate = Arc::new(crate::dev::AudioGate::default());
+    let settings = game::Settings {
+        device: game::DeviceSettings::default(),
+        player: game::PlayerSettings::default(),
+    };
+    let render = crate::render_side::tests::Installers::default().spawn_bare();
+    let held = Arc::clone(&gate);
+    let _ = crate::tests::on_rig_gated(
+        settings,
+        render,
+        input::QpcClock::start(),
+        Some(held),
+        |rig, _, _| {
+            rig.adjust = None;
+            let probe = rig.audio.control.failure_probe();
+            wait("the set installed", || {
+                rig.poll_system_sounds();
+                rig.audio.control.system_installed().is_some()
+            });
+            gate.hold();
+            one_pass(&gate);
+            // Positive control: an allocation and its free, counted.
+            let (allocs, frees) = (this_thread(), this_thread_frees());
+            drop(std::hint::black_box(vec![1_u8; 8]));
+            assert_eq!(this_thread() - allocs, 1, "the allocation was not counted");
+            assert_eq!(this_thread_frees() - frees, 1, "the free was not counted");
+            let (mut allocated, mut freed) = (0, 0);
+            let mut counted = |rig: &mut PlayerRig<'_>, ready: bool| {
+                let (allocs, frees) = (this_thread(), this_thread_frees());
+                if ready {
+                    rig.ready_began();
+                } else {
+                    rig.closing_began();
+                }
+                allocated += this_thread() - allocs;
+                freed += this_thread_frees() - frees;
+            };
+            for i in 0..1_000 {
+                counted(rig, i % 2 == 0);
+                if i % 50 == 49 {
+                    one_pass(&gate);
+                }
+            }
+            // Every start was queued: none refused for a full ring.
+            assert_eq!(probe.system_starts(SystemKind::PlayReady), 500);
+            assert_eq!(probe.system_starts(SystemKind::PlayStop), 500);
+            // The exhaustion latch, inside the counted hooks.
+            rig.audio.control.seed_system_seq(SEQ_LIMIT);
+            counted(rig, false);
+            let sounds = |rig: &mut PlayerRig<'_>| {
+                let s = rig.system_sounds.as_ref().expect("rig() made the owner");
+                (s.latched.clone(), s.refused)
+            };
+            let (latched, refused) = sounds(rig);
+            assert_eq!(latched, Some(Reason::SequenceExhausted));
+            for i in 0..10 {
+                counted(rig, i % 2 == 0);
+            }
+            assert_eq!(sounds(rig).1, refused + 10);
+            assert_eq!(probe.system_starts(SystemKind::PlayStop), 500);
+            gate.release();
+            assert_eq!(allocated, 0, "the hooks allocated");
+            assert_eq!(freed, 0, "the hooks freed");
+        },
+    );
 }

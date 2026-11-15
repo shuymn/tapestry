@@ -1680,11 +1680,12 @@ impl SelectScreen {
             random: e.random,
             max_ex: max_ex(e, self.bests_preset.as_ref()),
             score: self.score_of(e),
-            // One validation, as the reference's song database computes
-            // it (design.md "Rendering and Skins", chart metadata).
+            // The stored rank (the seed-0 parse's) classed by the rule
+            // play and result class their parse's rank with (design.md
+            // "Rendering and Skins", chart metadata).
             judge_class: e
                 .rank
-                .and_then(skin_beatoraja::JudgeClass::of_listed)
+                .and_then(skin_beatoraja::JudgeClass::of_rank)
                 .map(skin_beatoraja::JudgeClass::index),
             clears: stored.map_or(0, |s| s.clears),
             best: stored
@@ -1834,9 +1835,10 @@ mod tests {
     }
 
     /// The selected chart's judgment class from its library entry's rank,
-    /// with one validation, as the reference's song database computes it:
-    /// `#RANK 3` easy, `#DEFEXRANK 1` very hard (0), `#DEFEXRANK 10` in no
-    /// class (7), no header normal, a refused draw none.
+    /// with one validation in plain arithmetic: `#RANK 3` easy,
+    /// `#DEFEXRANK 1` very hard (0), `#DEFEXRANK 10` in no class (7),
+    /// `#DEFEXRANK 30000000` and `57266231` very easy (22 500 000 and
+    /// 42 949 673, past `i32`), no header normal, a refused draw none.
     #[test]
     fn the_selected_charts_class_takes_one_validation() {
         use rules::JudgeRank::{DefExRankMilli, Rank};
@@ -1845,6 +1847,8 @@ mod tests {
             (Some(Some(Rank(3))), Some(3)),
             (Some(Some(DefExRankMilli(1_000))), Some(0)),
             (Some(Some(DefExRankMilli(10_000))), None),
+            (Some(Some(DefExRankMilli(30_000_000_000))), Some(4)),
+            (Some(Some(DefExRankMilli(57_266_231_000))), Some(4)),
             (Some(None), Some(2)),
             (None, None),
         ] {
@@ -1854,6 +1858,94 @@ mod tests {
             };
             assert_eq!(s.selected_chart(&e).judge_class, class, "{rank:?}");
         }
+    }
+
+    /// The library entry a scan of `dir` stores for its one chart.
+    fn scanned(dir: &Path) -> ChartEntry {
+        let db = tempfile::tempdir().unwrap();
+        let (library, _) = library::Library::open(&db.path().join("library.db")).unwrap();
+        library
+            .scan(&[dir.to_owned()], library::ScanOptions::default())
+            .unwrap()
+            .finish()
+            .unwrap();
+        let mut charts = library.charts().unwrap();
+        assert_eq!(charts.len(), 1);
+        charts.remove(0)
+    }
+
+    /// The class `loaded`'s play import facts and its result's chart give.
+    fn played_classes(loaded: &game::Loaded) -> (Option<u8>, Option<u8>) {
+        let play = match crate::imports::facts::attempt_facts(loaded, false).judge_class {
+            skin_beatoraja::Fact::Known(c) => c.map(skin_beatoraja::JudgeClass::index),
+            f => panic!("{f:?}"),
+        };
+        let result = crate::result_skin::attempt_chart(loaded)
+            .resolved(skin_model::ImageFacts::default())
+            .judge_class;
+        (play, result)
+    }
+
+    /// Every screen classes a rank by one rule: for a chart whose rank
+    /// every parse reads alike, selection's class, from the rank the
+    /// library scan stored for the chart's file, is the class its play's
+    /// import facts and its result's chart give, for a `#DEFEXRANK` whose
+    /// one validation is 0 (`1`, very hard) or whose product passes `i32`
+    /// (`30000000` and `57266231`, very easy), and for ranks every screen
+    /// agreed on before.
+    #[test]
+    fn every_screen_classes_one_rank_alike() {
+        let s = SelectScreen::new(Vec::new());
+        for (head, class) in [
+            ("#DEFEXRANK 1\n", Some(0)),
+            ("#DEFEXRANK 30000000\n", Some(4)),
+            ("#DEFEXRANK 57266231\n", Some(4)),
+            ("#DEFEXRANK 120\n", Some(3)),
+            ("#RANK 1\n", Some(1)),
+            ("#RANK 4\n", Some(4)),
+            ("", Some(2)),
+        ] {
+            let (dir, loaded) = crate::imports::facts::tests::loaded_kept(head, "beatoraja-style");
+            let selection = s.selected_chart(&scanned(dir.path())).judge_class;
+            let (play, result) = played_classes(&loaded);
+            assert_eq!((selection, play, result), (class, class, class), "{head:?}");
+        }
+    }
+
+    /// A chart whose rank stands in a `#RANDOM` branch has the class of
+    /// each parse's rank: loads under seeds that take its two branches
+    /// (`#RANK 0` and `#RANK 4`) give very hard and very easy, each on play
+    /// and result alike and each `JudgeClass::of_rank` of that load's rank;
+    /// selection gives the class of the library's seed-0 parse, which is
+    /// the seed-0 load's.
+    #[test]
+    fn a_branch_dependent_rank_takes_each_parses_class() {
+        const CHART: &str =
+            "#RANDOM 2\n#IF 1\n#RANK 0\n#ENDIF\n#IF 2\n#RANK 4\n#ENDIF\n#ENDRANDOM\n";
+        let s = SelectScreen::new(Vec::new());
+        let mut seen = Vec::new();
+        for seed in 0..64 {
+            let (dir, loaded) =
+                crate::imports::facts::tests::loaded_seeded(CHART, "beatoraja-style", seed);
+            let rank = rules::HeaderPolicy::DefExRankFirst
+                .read(&loaded.chart().meta.judgment_headers)
+                .rank;
+            let class =
+                skin_beatoraja::JudgeClass::of_rank(rank).map(skin_beatoraja::JudgeClass::index);
+            assert_eq!(played_classes(&loaded), (class, class), "seed {seed}");
+            if seed == 0 {
+                let selection = s.selected_chart(&scanned(dir.path())).judge_class;
+                assert_eq!(selection, class, "seed 0");
+            }
+            if !seen.contains(&class) {
+                seen.push(class);
+            }
+            if seen.len() == 2 {
+                break;
+            }
+        }
+        seen.sort_unstable();
+        assert_eq!(seen, [Some(0), Some(4)]);
     }
 
     fn screen() -> SelectScreen {

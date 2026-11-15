@@ -234,6 +234,30 @@ tests = [
 ]
 
 [[entry]]
+id = "SF-013"
+summary = "READY's and Closing's sounds: `playready` at each READY, `playstop` after the cut"
+class = "rule"
+reason = """
+A player hears each READY and each Closing announced: the set's `playready` \
+starts as every READY's timer starts (the first play, a retry, a practice \
+round and each rearm's fresh READY), and `playstop` starts once at Closing's \
+start, after the chart's audio is cut and before Closing's start is shown, \
+for a failure and a quit alike; nothing stops either, so a retry's \
+`playready` plays over `playstop`."""
+source = [
+    "src/bms/player/beatoraja/play/BMSPlayer.java:514-516 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/play/BMSPlayer.java:591-593 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/play/BMSPlayer.java:654-666 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/play/BMSPlayer.java:966-975 @beatoraja-0.8.9",
+]
+sites = ["crates/game/src/live.rs", "crates/player/src/play.rs"]
+tests = [
+    "crates/game/tests/live.rs::the_quit_key_during_play_enters_closing",
+    "crates/game/tests/closing_gate.rs::a_failure_before_the_commit_closes_the_play_at_the_commit",
+    "crates/player/src/render_side/tests/decision/integrated.rs::ready_and_closing_sounds_through_a_run",
+]
+
+[[entry]]
 id = "SF-014"
 summary = "Play time adds how far into the chart each play's judged notes reached"
 class = "rule"
