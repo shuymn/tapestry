@@ -13,6 +13,9 @@ use eval::{
 use input::SourceReader;
 use rules::RulePreset;
 
+use bms_model::ChartProfile;
+
+use crate::judge_bins::{JudgeBins, NoteBins};
 use crate::render::{OffsetRing, PlayView, RenderSide, RenderSink, ViewWriter, render_link};
 
 /// Receives every judgment event the logic step emits, in order.
@@ -224,6 +227,11 @@ pub struct Logic<'a, R = SourceReader> {
     view: ViewWriter,
     /// The candidate's newest judgment offsets ([`PlayView::offsets`]).
     offsets: OffsetRing,
+    /// The candidate's judgments by bin ([`PlayView::judge_bins`]).
+    judge_bins: Box<JudgeBins>,
+    /// Each note's bin, once [`bin_judgments`](Self::bin_judgments)
+    /// mapped them; empty before.
+    note_bins: NoteBins,
     /// The READY candidate's rearms so far ([`PlayView::generation`]).
     generation: u64,
     /// The latest rearm's origin ([`PlayView::origin`]).
@@ -331,6 +339,7 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             fading: None,
             events: 0,
             offsets: OffsetRing::EMPTY,
+            judge_bins: JudgeBins::boxed(),
         };
         let (render, view, side) = render_link(config.effects, &initial);
         let max_events = evaluator.max_events(budget);
@@ -354,6 +363,8 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             sinks,
             view,
             offsets: OffsetRing::EMPTY,
+            judge_bins: JudgeBins::boxed(),
+            note_bins: NoteBins::default(),
             generation: 0,
             origin: None,
             playing: false,
@@ -489,8 +500,10 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         }
         self.emitted += self.out.len() as u64;
         let mut oldest: Option<TimeUs> = None;
+        let mut counted = false;
         for ev in &self.out {
             self.offsets.record(ev);
+            counted |= self.note_bins.count(ev, &mut self.judge_bins);
             self.render.receive(ev);
             for sink in &mut self.sinks {
                 sink.receive(ev);
@@ -498,6 +511,9 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             if let Some(o) = ev.origin {
                 oldest = Some(oldest.map_or(o, |t| t.min(o)));
             }
+        }
+        if counted {
+            self.judge_bins.revision += 1;
         }
         self.retire_drained();
         self.publish_view();
@@ -751,7 +767,36 @@ impl<'a, R: SourceRead> Logic<'a, R> {
             fading: self.fading,
             events: self.emitted,
             offsets: self.offsets,
+            judge_bins: self.judge_bins.clone(),
         }
+    }
+
+    /// Maps the attempt's notes to the bins of `profile`, the play's 1×
+    /// profile of `chart` (design.md "Rendering and Skins", the note
+    /// snapshot's judgment bins), before READY: each note to its head
+    /// row's bin, when `chart`'s timeline has the rows the profile is of
+    /// ([`ChartProfile::row_identity`]). From then on every judgment
+    /// counts in its note's bin. Returns whether the bins are available:
+    /// `false` leaves them unavailable, so nothing counts and a judgment
+    /// graph draws nothing. Publishes the view, so the frames before the
+    /// first step carry the availability. `chart` must be the chart the
+    /// step evaluates. Allocates the per-note table, 2 bytes a chart
+    /// object, counted in the reservation.
+    pub fn bin_judgments(&mut self, chart: &Chart, profile: &ChartProfile) -> bool {
+        let available = match NoteBins::of(chart, profile) {
+            Some(bins) => {
+                self.note_bins = bins;
+                true
+            }
+            None => {
+                self.note_bins = NoteBins::default();
+                false
+            }
+        };
+        self.judge_bins.available = available;
+        self.judge_bins.revision += 1;
+        self.publish_view();
+        available
     }
 
     /// The record, taking the step apart: its events move rather than
@@ -833,6 +878,8 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         self.record.clear();
         self.emitted = 0;
         self.offsets.clear();
+        self.judge_bins.bins = JudgeBins::EMPTY.bins;
+        self.judge_bins.revision += 1;
         self.playing = false;
         self.closing = None;
         self.fading = None;
@@ -895,6 +942,11 @@ impl<'a, R: SourceRead> Logic<'a, R> {
         v.fading = self.fading;
         v.events = self.emitted;
         v.offsets = self.offsets;
+        // As the note facts: copied only into a buffer holding older
+        // counts, into its own box.
+        if v.judge_bins.revision != self.judge_bins.revision {
+            v.judge_bins.copy_from(&self.judge_bins);
+        }
         self.view.publish();
     }
 }

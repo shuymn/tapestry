@@ -1268,6 +1268,13 @@ impl Loaded {
         &self.chart
     }
 
+    /// The chart's 1× profile as its ingestion built it, which the play's
+    /// judgment bins are of ([`Logic::bin_judgments`](crate::Logic::bin_judgments)).
+    #[must_use]
+    pub fn profile(&self) -> &ChartProfile {
+        &self.profile
+    }
+
     /// The chart's labels, from the ingestion that read
     /// [`chart`](Self::chart).
     #[must_use]
@@ -1652,7 +1659,7 @@ impl Loaded {
         let window = TimeUs(end.0.saturating_sub(self.opens_at().0).max(0));
         let inputs = window_inputs(&device, window, &rates).saturating_add(system);
         if let Ok(probe) = &probe
-            && let r = Reservation::from_probe(probe, &device, self.config.effects)
+            && let r = Reservation::from_probe(probe, &self.chart, &device, self.config.effects)
             && let r = gate.map_or(r, |g| r.with_gate(g))
             && !r.fits(inputs)
         {
@@ -1711,7 +1718,7 @@ impl Loaded {
             0,
         )
         .map_err(LogicError::Eval)?;
-        let r = Reservation::from_probe(&probe, &device, self.config.effects)
+        let r = Reservation::from_probe(&probe, &self.chart, &device, self.config.effects)
             .with_autoplay(inputs, schedule);
         let r = gate.map_or(r, |g| r.with_gate(g));
         if !r.fits(inputs) {
@@ -2859,17 +2866,27 @@ pub const VIEW_NOTE_COPIES: usize = 5;
 /// [`Evaluator::max_events`]. The fixed part holds the chart's share of
 /// those events (its notes, mines and song end), the render effect queue,
 /// the play view's copies of the note facts ([`VIEW_NOTE_COPIES`] of
-/// [`Evaluator::note_bytes`]), and the allowances for tables
+/// [`Evaluator::note_bytes`]), the judgment bins' copies and each note's
+/// bin ([`judge_bins`](Self::judge_bins), [`note_bins`](Self::note_bins)),
+/// and the allowances for tables
 /// ([`Evaluator::table_bytes`], the evaluator's own note facts included)
 /// and small parts. Its components are `eval`'s, which also composes the batch
 /// evaluation's peak from them ([`Evaluator::batch_bytes`]); a play holds
 /// no gauge histories.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Reservation {
-    /// Bytes reserved whatever the capacity.
+    /// Bytes reserved whatever the capacity, `judge_bins` and `note_bins`
+    /// included.
     pub fixed: usize,
     /// Bytes reserved per input of the capacity.
     pub per_input: usize,
+    /// Of `fixed`: the judgment bins' copies,
+    /// [`JUDGE_BIN_COPIES`](crate::JUDGE_BIN_COPIES) of
+    /// [`JudgeBins`](crate::JudgeBins) (design.md "Recording Capacity").
+    pub judge_bins: usize,
+    /// Of `fixed`: each chart object's judgment bin, 2 bytes a note,
+    /// mines included ([`Logic::bin_judgments`](crate::Logic::bin_judgments)).
+    pub note_bins: usize,
 }
 
 impl Reservation {
@@ -2884,13 +2901,18 @@ impl Reservation {
         effects: usize,
     ) -> Option<Self> {
         let probe = Evaluator::new(chart, preset, device, &InputStart::default(), None, 0).ok()?;
-        Some(Self::from_probe(&probe, device, effects))
+        Some(Self::from_probe(&probe, chart, device, effects))
     }
 
-    /// [`of`](Self::of), with an evaluator built for the play's chart and
-    /// preset with no input capacity.
+    /// [`of`](Self::of), with an evaluator built for the play's `chart`
+    /// and preset with no input capacity.
     #[must_use]
-    pub fn from_probe(probe: &Evaluator<'_>, device: &eval::DeviceProfile, effects: usize) -> Self {
+    pub fn from_probe(
+        probe: &Evaluator<'_>,
+        chart: &Chart,
+        device: &eval::DeviceProfile,
+        effects: usize,
+    ) -> Self {
         let sources = device.sources.len();
         let event = 2 * eval::EVENT_BYTES + size_of::<::audio::SoundCmd>();
         let input = eval::INPUT_BYTES;
@@ -2902,13 +2924,20 @@ impl Reservation {
                 + budget * eval::RING_SLOT_BYTES
         };
         let empty = total(0);
+        let judge_bins = crate::JUDGE_BIN_COPIES * size_of::<crate::JudgeBins>();
+        let objects = chart.lanes.iter().map(Vec::len).sum();
+        let note_bins = crate::judge_bins::NoteBins::bytes_for(objects);
         Self {
             fixed: empty
                 + effects * eval::EVENT_BYTES
                 + VIEW_NOTE_COPIES * probe.note_bytes()
+                + judge_bins
+                + note_bins
                 + probe.table_bytes()
                 + SMALL_PARTS_BYTES,
             per_input: total(1) - empty,
+            judge_bins,
+            note_bins,
         }
     }
 
@@ -2933,7 +2962,7 @@ impl Reservation {
             .saturating_add(schedule.saturating_mul(size_of::<ScheduledSound>()));
         Self {
             fixed: self.fixed.saturating_add(own),
-            per_input: self.per_input,
+            ..self
         }
     }
 
@@ -2948,7 +2977,7 @@ impl Reservation {
             fixed: self
                 .fixed
                 .saturating_add(crate::HistoryRecorder::bytes(held)),
-            per_input: self.per_input,
+            ..self
         }
     }
 
@@ -2969,7 +2998,7 @@ impl Reservation {
                 .fixed
                 .saturating_add(snapshots)
                 .saturating_add(gate.exchange),
-            per_input: r.per_input,
+            ..r
         }
     }
 

@@ -2266,6 +2266,8 @@ fn fixed_costs_alone_can_refuse_a_play() {
     let r = game::Reservation {
         fixed: game::RECORDING_MEMORY - 10,
         per_input: 5,
+        judge_bins: 0,
+        note_bins: 0,
     };
     assert!(r.fits(0));
     assert!(r.fits(2));
@@ -2275,6 +2277,8 @@ fn fixed_costs_alone_can_refuse_a_play() {
     let r = game::Reservation {
         fixed: game::RECORDING_MEMORY + 1,
         per_input: 5,
+        judge_bins: 0,
+        note_bins: 0,
     };
     assert!(!r.fits(0));
     assert_eq!(r.capacity(), 0);
