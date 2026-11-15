@@ -10,7 +10,7 @@ use std::path::Path;
 use bms_model::TimeUs;
 use common::{CHART, Fixture, MS, contribution, hex, key, record_of, sql};
 use library::{BestsState, Key, LN_MODE, PlayBest, Progress, ProgressQuery};
-use replay::{PlayRecord, PresetRecord};
+use replay::{InitialGauge, PlayRecord, PlayType, Practice, PresetRecord};
 use rules::{Judgment, RulePreset};
 
 /// 120 BPM, a measure 2 s:
@@ -306,6 +306,53 @@ fn only_a_new_best_replaces_the_progress() {
     let read = read(&lib, &a, TAPS_QUERY);
     assert_eq!(read.score.unwrap().best.unwrap().ex, 6);
     assert_eq!(read.progress, Some(Progress::Known(judgments(&[0, 0, 0]))));
+}
+
+/// `record` as a section-repeat round from 1.5 s to 4.5 s: every note of
+/// `CHART`.
+fn section_round(mut record: PlayRecord) -> PlayRecord {
+    let preset = rules::tapestry();
+    record.play_type = PlayType::SectionRepeat(Practice {
+        start: TimeUs(1_500 * MS),
+        end: TimeUs(4_500 * MS),
+        lead_in: TimeUs(1_000 * MS),
+        attempt: 1,
+        initial_gauges: preset
+            .gauges
+            .iter()
+            .map(|g| InitialGauge {
+                id: g.id.clone(),
+                value: g.start,
+            })
+            .collect(),
+    });
+    record
+}
+
+/// A practice round never sets the best, so it never sets the progress:
+/// a round of every note PERFECT after A leaves A's best and progress, and
+/// a round alone stores none.
+#[test]
+fn a_practice_round_leaves_the_progress() {
+    let fx = Fixture::new();
+    let a = play_a();
+    let lib = counted_live(&fx, CHART, &a, "1-1.tprl");
+    let a_row = Some((body(&a).to_vec(), vec![0, 0, 1]));
+    let round = section_round(taps(0, 0));
+    let (rel, _) = fx.save(&round, "2-1.tprl");
+    fx.live(&lib, &rel, CHART, &round);
+    assert_eq!(row(&fx.db(), &a), a_row);
+    let read = read(&lib, &a, TAPS_QUERY);
+    let score = read.score.unwrap();
+    assert_eq!((score.plays, score.best.unwrap().ex), (2, 5));
+    assert_eq!(read.progress, Some(Progress::Known(judgments(&[0, 0, 1]))));
+    // The round alone.
+    let fx = Fixture::new();
+    let lib = counted_live(&fx, CHART, &round, "1-1.tprl");
+    assert_eq!(row(&fx.db(), &round), None);
+    let read = self::read(&lib, &round, TAPS_QUERY);
+    assert_eq!(read.score.map(|s| (s.plays, s.best)), Some((1, None)));
+    assert_eq!(read.progress, Some(Progress::Missing));
 }
 
 /// A stored progress inconsistent with its best is refused for its own

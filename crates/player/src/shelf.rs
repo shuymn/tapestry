@@ -367,6 +367,16 @@ impl Shelf {
         self.library.bests(preset, library::LN_MODE)
     }
 
+    /// The player's totals over every counted play, every preset's
+    /// (design.md "Personal Bests").
+    ///
+    /// # Errors
+    ///
+    /// Why the database refused the query or the totals contradict.
+    pub fn totals(&self) -> Result<library::Totals, LibraryError> {
+        self.library.totals()
+    }
+
     /// The connection that counts live plays.
     ///
     /// # Errors

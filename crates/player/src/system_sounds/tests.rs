@@ -1025,6 +1025,146 @@ fn the_entry_loop_waits_for_its_pick() {
     run.audio.hold(false);
 }
 
+/// C27-1, C27-2, C27-3 (design.md "State Model", system sounds, Result):
+/// per outcome, `[sounds] loop_result` and whether the set has
+/// `resultclose`, stepped by hand: the result's show starts `clear` or
+/// `fail` in its reserved voice from the installed generation, looped
+/// under `loop_result`; the built-in presentation's leaving changes
+/// nothing; a skin's fade-out swaps it for `resultclose` when the set has
+/// one and otherwise leaves it playing; leaving Result ends every voice.
+// Source: SF-015
+#[cfg(feature = "dev-tools")]
+#[test]
+fn result_sounds_per_outcome() {
+    for cleared in [true, false] {
+        for looped in [false, true] {
+            for close in [false, true] {
+                let case = format!("cleared {cleared}, loop_result {looped}, resultclose {close}");
+                let fx = Fixture::new();
+                fx.sound("sound/A", SystemKind::Clear, 60_000);
+                fx.sound("sound/A", SystemKind::Fail, 40_000);
+                if close {
+                    fx.sound("sound/A", SystemKind::ResultClose, 30_000);
+                }
+                let opts = Opts {
+                    sounds: SoundSettings {
+                        loop_result: looped,
+                        ..SoundSettings::default()
+                    },
+                    ..Opts::default()
+                };
+                let mut run = Run::new(fx, opts);
+                run.settle();
+                let a = run.installed().expect("A installed");
+                assert_eq!(run.sounds.has(SystemKind::ResultClose), close, "{case}");
+                let (kind, other) = if cleared {
+                    (SystemKind::Clear, SystemKind::Fail)
+                } else {
+                    (SystemKind::Fail, SystemKind::Clear)
+                };
+                let voice = |run: &Run, k| run.audio.system(|v| v.reserved_voice(k));
+                run.audio.hold(true);
+                // Positive control: nothing sounds before the show.
+                assert_eq!(voice(&run, kind), None, "{case}");
+                assert_eq!(run.sounding(), 0, "{case}");
+                run.sounds.result_shown(&mut run.audio.control, cleared);
+                run.audio.step_now(1);
+                assert_eq!(voice(&run, kind), Some((a, looped)), "{case}: the show");
+                assert_eq!(voice(&run, other), None, "{case}: the show");
+                assert_eq!(run.sounding(), 1, "{case}: the show");
+                // The built-in presentation's leaving.
+                run.sounds.result_fading(&mut run.audio.control, false);
+                run.audio.step_now(1);
+                assert_eq!(voice(&run, kind), Some((a, looped)), "{case}: built-in");
+                assert_eq!(run.sounding(), 1, "{case}: built-in");
+                // A skin's fade-out.
+                run.sounds.result_fading(&mut run.audio.control, true);
+                run.audio.step_now(1);
+                if close {
+                    assert_eq!(voice(&run, kind), None, "{case}: the fade-out");
+                    assert_eq!(
+                        run.audio.system(SystemVoices::reserved_sounding),
+                        0,
+                        "{case}: the fade-out"
+                    );
+                    assert_eq!(run.sounding(), 1, "{case}: resultclose");
+                } else {
+                    assert_eq!(voice(&run, kind), Some((a, looped)), "{case}: the fade-out");
+                    assert_eq!(run.sounding(), 1, "{case}: the fade-out");
+                }
+                run.sounds.result_left(&mut run.audio.control);
+                run.audio.step_now(1);
+                assert_eq!(run.sounding(), 0, "{case}: Result left");
+                run.audio.hold(false);
+            }
+        }
+    }
+}
+
+/// C27-2 (design.md "State Model", system sounds, Result; "Audio", system
+/// sounds, Sets): the fade-out asks the installed pick for `resultclose`,
+/// never an earlier one. Set A has `resultclose`, set B does not, and
+/// nothing is in `defaultsound\`: once an entry installs B, a skin's
+/// fade-out leaves B's `clear` playing. A set without `resultclose` over a
+/// `defaultsound\` that has it swaps to the defaults' sound.
+// Source: SF-015
+#[cfg(feature = "dev-tools")]
+#[test]
+fn the_fade_out_asks_the_installed_pick() {
+    let fx = Fixture::new();
+    for set in ["A", "B"] {
+        fx.sound(&format!("sound/{set}"), SystemKind::Clear, 60_000);
+    }
+    fx.sound("sound/A", SystemKind::ResultClose, 30_000);
+    let mut run = Run::new(fx, Opts::default());
+    run.settle();
+    let a = run.entry();
+    assert_eq!(run.installed(), Some(a));
+    // Positive control: A's `resultclose` counts, and `decide`, in no set,
+    // sounds its built-in tone.
+    assert!(run.sounds.has(SystemKind::ResultClose), "A's resultclose");
+    assert!(run.sounds.has(SystemKind::Decide), "decide's tone");
+    run.pick(1);
+    let b = run.entry();
+    run.settle();
+    assert_eq!(run.installed(), Some(b));
+    assert!(b > a);
+    assert!(
+        !run.sounds.has(SystemKind::ResultClose),
+        "A's resultclose kept"
+    );
+    let voice = |run: &Run| run.audio.system(|v| v.reserved_voice(SystemKind::Clear));
+    run.audio.hold(true);
+    run.sounds.result_shown(&mut run.audio.control, true);
+    run.audio.step_now(1);
+    assert_eq!(voice(&run), Some((b, false)), "the show");
+    run.sounds.result_fading(&mut run.audio.control, true);
+    run.audio.step_now(1);
+    assert_eq!(voice(&run), Some((b, false)), "the fade-out");
+    assert_eq!(run.sounding(), 1, "the fade-out");
+    run.sounds.result_left(&mut run.audio.control);
+    run.audio.step_now(1);
+    assert_eq!(run.sounding(), 0, "Result left");
+    run.audio.hold(false);
+
+    let fx = Fixture::new();
+    fx.sound("sound/C", SystemKind::Clear, 60_000);
+    fx.sound("defaultsound", SystemKind::ResultClose, 30_000);
+    let mut run = Run::new(fx, Opts::default());
+    run.settle();
+    let c = run.installed().expect("C installed");
+    assert!(run.sounds.has(SystemKind::ResultClose), "the defaults'");
+    run.audio.hold(true);
+    run.sounds.result_shown(&mut run.audio.control, true);
+    run.audio.step_now(1);
+    assert_eq!(voice(&run), Some((c, false)), "C's show");
+    run.sounds.result_fading(&mut run.audio.control, true);
+    run.audio.step_now(1);
+    assert_eq!(voice(&run), None, "C's fade-out");
+    assert_eq!(run.sounding(), 1, "the defaults' resultclose");
+    run.audio.hold(false);
+}
+
 /// S5, S7: an entry whose stop finds the sequence exhausted stops every
 /// kind at the terminal number, latches and returns the terminal empty
 /// generation, which ends the loop and the retired one-shot; set starts are
@@ -1737,4 +1877,119 @@ fn system_sounds_start_and_stop_alloc() {
             .count();
         assert_eq!(named, 1);
     }
+}
+
+/// Waits, at most 10 s, until `gate` holds the audio thread after at
+/// least one pass since its last stop: whatever the start ring held when
+/// it was released has been taken.
+#[cfg(feature = "dev-tools")]
+fn one_pass(gate: &crate::dev::AudioGate) {
+    let until = Instant::now() + Duration::from_secs(10);
+    gate.release();
+    while gate.stopped() {
+        assert!(
+            Instant::now() < until,
+            "the audio thread never left the gate"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    gate.hold();
+    while !gate.stopped() {
+        assert!(Instant::now() < until, "the audio thread never came back");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+/// C26-4: READY's and Closing's sounds allocate and free nothing on the
+/// game thread, on the player's rig as `rig()` makes it: 1 000 hook calls,
+/// READY's and Closing's in turn, the start ring taken by the audio thread
+/// after every 50, then the hook that finds the request sequence
+/// exhausted, latching the run, and hooks refused after it. Only the hooks
+/// are counted, with a positive control first.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn ready_and_closing_sounds_alloc() {
+    use game::{Rig as _, SEQ_LIMIT};
+
+    use crate::alloc_count::{this_thread, this_thread_frees};
+    use crate::play::PlayerRig;
+
+    let fx = Fixture::new();
+    for kind in [
+        SystemKind::Clear,
+        SystemKind::PlayReady,
+        SystemKind::PlayStop,
+    ] {
+        fx.sound("sound/A", kind, 24_000);
+    }
+    let root = fx.root();
+    super::arm(move |setup, _| {
+        setup.root = root;
+        setup.fs = Box::new(MemFs::new());
+    });
+    let gate = Arc::new(crate::dev::AudioGate::default());
+    let settings = game::Settings {
+        device: game::DeviceSettings::default(),
+        player: game::PlayerSettings::default(),
+    };
+    let render = crate::render_side::tests::Installers::default().spawn_bare();
+    let held = Arc::clone(&gate);
+    let _ = crate::tests::on_rig_gated(
+        settings,
+        render,
+        input::QpcClock::start(),
+        Some(held),
+        |rig, _, _| {
+            rig.adjust = None;
+            let probe = rig.audio.control.failure_probe();
+            wait("the set installed", || {
+                rig.poll_system_sounds();
+                rig.audio.control.system_installed().is_some()
+            });
+            gate.hold();
+            one_pass(&gate);
+            // Positive control: an allocation and its free, counted.
+            let (allocs, frees) = (this_thread(), this_thread_frees());
+            drop(std::hint::black_box(vec![1_u8; 8]));
+            assert_eq!(this_thread() - allocs, 1, "the allocation was not counted");
+            assert_eq!(this_thread_frees() - frees, 1, "the free was not counted");
+            let (mut allocated, mut freed) = (0, 0);
+            let mut counted = |rig: &mut PlayerRig<'_>, ready: bool| {
+                let (allocs, frees) = (this_thread(), this_thread_frees());
+                if ready {
+                    rig.ready_began();
+                } else {
+                    rig.closing_began();
+                }
+                allocated += this_thread() - allocs;
+                freed += this_thread_frees() - frees;
+            };
+            for i in 0..1_000 {
+                counted(rig, i % 2 == 0);
+                if i % 50 == 49 {
+                    one_pass(&gate);
+                }
+            }
+            // Every start was queued: none refused for a full ring.
+            assert_eq!(probe.system_starts(SystemKind::PlayReady), 500);
+            assert_eq!(probe.system_starts(SystemKind::PlayStop), 500);
+            // The exhaustion latch, inside the counted hooks.
+            rig.audio.control.seed_system_seq(SEQ_LIMIT);
+            counted(rig, false);
+            let sounds = |rig: &mut PlayerRig<'_>| {
+                let s = rig.system_sounds.as_ref().expect("rig() made the owner");
+                (s.latched.clone(), s.refused)
+            };
+            let (latched, refused) = sounds(rig);
+            assert_eq!(latched, Some(Reason::SequenceExhausted));
+            for i in 0..10 {
+                counted(rig, i % 2 == 0);
+            }
+            assert_eq!(sounds(rig).1, refused + 10);
+            assert_eq!(probe.system_starts(SystemKind::PlayStop), 500);
+            gate.release();
+            assert_eq!(allocated, 0, "the hooks allocated");
+            assert_eq!(freed, 0, "the hooks freed");
+        },
+    );
 }

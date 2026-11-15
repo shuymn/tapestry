@@ -8,7 +8,6 @@ use bms_model::{BEAT, DOMAIN, Lane, Tempo, TimeUs};
 use eval::Tally;
 use rules::GaugeValue;
 
-use super::rhythm::TAIL_US;
 use super::schema::{
     COVER_PERMILLE, DIFFICULTY_MAX, FIX_HISPEED_MAX, FPS_MAX, GAUGE_PERMILLE, Grade,
     JUDGE_CLASS_MAX, LaneTimer, MAX_COUNT, NATIVE_TARGET_MAX, PROGRESS_FULL, RANK_TWENTY_SEVENTHS,
@@ -1099,16 +1098,18 @@ impl Play {
     /// ([`Rhythm`](super::rhythm::Rhythm)) on the play clock, not the
     /// display clock. Off before `play` starts. The clock runs while the
     /// frame is playing, and through the completed tail outside Closing
-    /// until the progress end + 5 s; from then, in Closing and on any
-    /// other frame (a quit that admits no Closing), the last start holds,
-    /// so the timer runs 1:1. Off for a frame whose value overflows.
+    /// until the attempt finishes: a full play's finish point (the
+    /// readouts' end), a section's whole ring-out. From then, in Closing
+    /// and on any other frame (a quit that admits no Closing), the last
+    /// start holds, so the timer runs 1:1. Off for a frame whose value
+    /// overflows.
     fn rhythm_start(&mut self, frame: &SkinFrame<'_>) -> Option<TimeUs> {
         let now = frame.now;
         if now < self.play_at {
             return None;
         }
-        let tail_end = self.readout_end.0.saturating_add(TAIL_US);
-        let tail = frame.complete && now.0 < tail_end;
+        let section = self.graphs.section.is_some();
+        let tail = frame.complete && (section || now < self.readout_end);
         if frame.closing.is_some() || !(frame.playing || tail) {
             return self.timer(timer::RHYTHM);
         }

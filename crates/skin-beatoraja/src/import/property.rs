@@ -336,8 +336,8 @@ pub(crate) enum Value {
     ElapsedMinutes,
     ElapsedSeconds,
     /// The remaining time's minutes and seconds (`timeleft_minute`,
-    /// `timeleft_second`, `:207-222`), rounded up without the source's
-    /// added second and margin.
+    /// `timeleft_second`, `:207-222`), rounded up to the play's finish
+    /// point without the source's added second.
     RemainingMinutes,
     RemainingSeconds,
     /// The configured lane cover, lift and hidden cover in ‰, whatever
@@ -444,6 +444,32 @@ const APP_FIELDS: [&str; 10] = [
     "app.uptime_m",
     "app.uptime_s",
 ];
+
+/// The field of the player's totals number `id` on selection and the
+/// result (design.md "Personal Bests", skin projections), as the source
+/// reads its player data (`skin/property/IntegerPropertyFactory.java:94-120`
+/// at `0.8.9`): 17 to 19 the play time's hours, minutes and seconds
+/// (`:94-96`), 30 to 32 the plays, the clears and the plays less them
+/// (`:109-111`), 33 to 37 the PERFECT to POOR totals (`:112-116`, the
+/// fifth the POOR, not the empty POOR), and 333 PERFECT to BAD
+/// (`:117-120`); `None` for another id.
+pub(super) fn player_field(id: i32) -> Option<&'static str> {
+    Some(match id {
+        17 => "player.time_h",
+        18 => "player.time_m",
+        19 => "player.time_s",
+        30 => "player.plays",
+        31 => "player.clears",
+        32 => "player.fails",
+        33 => "player.count.perfect",
+        34 => "player.count.great",
+        35 => "player.count.good",
+        36 => "player.count.bad",
+        37 => "player.count.poor",
+        333 => "player.notes",
+        _ => return None,
+    })
+}
 
 /// The fields of [`Value::DurationVariant`] by `id − 1312`.
 const DURATION_VARIANTS: [&str; 16] = [
@@ -1242,12 +1268,19 @@ mod tests {
                 .is_ok()
             );
         }
+        // The player's totals: unsupported on play, bridged on selection.
         assert_eq!(int_by_id(19), IntProp::Unsupported(Some(19)));
         assert_eq!(int_by_id(30), IntProp::Unsupported(Some(30)));
-        for id in [17, 18, 19, 30, 31] {
+        for (id, field) in [
+            (17, "player.time_h"),
+            (18, "player.time_m"),
+            (19, "player.time_s"),
+            (30, "player.plays"),
+            (31, "player.clears"),
+        ] {
             assert_eq!(
                 int_in(ScreenKind::Selection, id),
-                IntProp::Unsupported(Some(id)),
+                IntProp::Shown(Value::Selection(SelValue::Player(field))),
                 "selection {id}"
             );
         }

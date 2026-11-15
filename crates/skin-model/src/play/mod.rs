@@ -58,8 +58,11 @@ pub struct GaugeDesc {
 pub enum Attempt<'a> {
     /// The whole chart: `ready` starts `lead_in` before chart time 0 and
     /// `play` at 0, every note is a target and the gauges start at their
-    /// descriptors' `start`.
-    Full { lead_in: TimeUs },
+    /// descriptors' `start`. `finish` is the play's finish point (the
+    /// game's `Loaded::finish`: its finish anchor plus 5 s), where the
+    /// remaining time and the progress end and the rhythm clock stops
+    /// following the tempo (design.md "Play Lifecycle", Audio tail).
+    Full { lead_in: TimeUs, finish: TimeUs },
     /// A section: a practice round, or a start mid-chart (a section whose
     /// end is past the chart). `ready` starts `lead_in` before the
     /// section's start and `play` at it, the targets are the section's and
@@ -639,8 +642,8 @@ pub struct Play {
     play_at: TimeUs,
     /// The context's [`PlayContext::last_note_end`].
     last_note_end: TimeUs,
-    /// Where `time.remaining_s` counts to: the chart's last resolved
-    /// object ([`Chart::last_object`]) or the section's end.
+    /// Where `time.remaining_s` counts to: a full play's finish point
+    /// ([`Attempt::Full`]'s `finish`) or the section's end.
     readout_end: TimeUs,
     /// The context's [`PlayContext::bpm_range`], validated.
     bpm_range: Option<BpmRange>,
@@ -855,9 +858,9 @@ impl Play {
         let timers = whens.saturating_add(present.map_or(0, crate::present::Present::timers));
         let bank =
             present.map_or_else(crate::present::Bank::default, crate::present::Present::bank);
-        let (play_at, lead_in, section) = match ctx.attempt {
-            Attempt::Full { lead_in } => (TimeUs(0), lead_in, None),
-            Attempt::Section(s) => (s.start, s.lead_in, Some(s)),
+        let (play_at, lead_in, section, readout_end) = match ctx.attempt {
+            Attempt::Full { lead_in, finish } => (TimeUs(0), lead_in, None, finish),
+            Attempt::Section(s) => (s.start, s.lead_in, Some(s), s.end),
         };
         if lead_in.0 < 0 {
             return Err(PrepareError::NegativeLeadIn);
@@ -882,7 +885,6 @@ impl Play {
         }
         let bounds = section.map(|s| (s.start, s.end));
         let playhead = ExactPlayhead::prepare(chart, bounds)?;
-        let readout_end = section.map_or_else(|| chart.last_object(), |s| s.end);
         let initial = ctx.gauges.iter().enumerate().map(|(i, g)| {
             let value = section
                 .and_then(|s| s.initial_gauges.get(i).copied())
@@ -1305,7 +1307,10 @@ mod tests {
             meta: crate::ChartMetadata::UNKNOWN,
             autoplay: false,
             gauges: &gauges,
-            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            attempt: Attempt::Full {
+                lead_in: TimeUs(0),
+                finish: TimeUs(i64::MAX),
+            },
             empty_poor_breaks_combo: false,
             empty_poor_counted: false,
             scratch: Side::Left,
@@ -1481,7 +1486,10 @@ mod tests {
             meta: crate::ChartMetadata::UNKNOWN,
             autoplay: false,
             gauges: &[],
-            attempt: Attempt::Full { lead_in: TimeUs(0) },
+            attempt: Attempt::Full {
+                lead_in: TimeUs(0),
+                finish: TimeUs(i64::MAX),
+            },
             empty_poor_breaks_combo: false,
             empty_poor_counted: false,
             scratch: Side::Left,

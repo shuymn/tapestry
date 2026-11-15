@@ -639,6 +639,7 @@ fn result_frames() {
         deviations: None,
         timing_areas: None,
         timelines: None,
+        totals: Default::default(),
     };
     // B prepared beside A: staged on its pages, its state and lines.
     let token = r.install(ScreenKind::Result, &b, 2).unwrap();

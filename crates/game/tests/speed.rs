@@ -288,3 +288,43 @@ fn set_speed_reloads_the_chart_and_keeps_the_session() {
     assert_eq!(loaded.chart().lanes, normal.lanes);
     assert_eq!(loaded.begin_play().attempt, 3);
 }
+
+/// A full play's finish point is computed with its anchor once a load and
+/// again at a new speed, and the attempt carries that one value: the
+/// last note's end + 5 s played, the last object's (a background sound at
+/// 5 s, after the tap at 2 s) + 5 s autoplayed, both doubled in chart time
+/// at 50 % (design.md "Play Lifecycle", Audio tail).
+#[test]
+fn the_finish_point_is_cached_and_refreshed_at_a_new_speed() {
+    const LATE: &str = "#BPM 120\n#WAV01 a.wav\n#00111:01\n#00201:0001\n";
+    for (autoplay, anchors) in [(false, [2_000, 4_000]), (true, [5_000, 10_000])] {
+        let (_dir, root) = temp_root();
+        let settings = tapestry_settings(&root);
+        let parts = if autoplay {
+            Parts::unsaved(&settings.player)
+        } else {
+            Parts::standard(&root, &settings.player)
+        };
+        let path = chart_file(&root, LATE);
+        let config = SessionConfig {
+            autoplay: autoplay.then_some(game::AutoKeySounds::Scheduled),
+            ..config(Speed::NORMAL)
+        };
+        let mut loaded = Loaded::load(root.clone(), settings, &path, config, parts).unwrap();
+        for (i, anchor) in anchors.into_iter().enumerate() {
+            if i == 1 {
+                loaded.set_speed(Speed::SLOWEST).unwrap();
+            }
+            let what = format!("autoplay {autoplay}, reload {i}");
+            // The positive control: the anchor is the chart's at its speed.
+            assert_eq!(loaded.finish_anchor(), TimeUs(anchor * MS), "{what}");
+            assert_eq!(loaded.finish(), TimeUs((anchor + 5_000) * MS), "{what}");
+            assert_eq!(
+                loaded.finish(),
+                game::finish_point(loaded.finish_anchor()),
+                "{what}"
+            );
+            assert_eq!(loaded.attempt().finish, loaded.finish(), "{what}");
+        }
+    }
+}
