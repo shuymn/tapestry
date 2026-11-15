@@ -588,10 +588,12 @@ pub mod field {
     /// The play's target EX score T
     /// ([`ScoreBasis::target`](crate::ScoreBasis::target)).
     pub const TARGET_EX: u16 = 114;
-    /// The EX score less the best paced linearly to the judged targets,
-    /// `ex − ⌊B · p / n⌋` (`p` the judged targets, `n` the attempt's
-    /// targets; 0 at `n = 0`), clamped to ±[`MAX_COUNT`](super::MAX_COUNT).
-    /// Shown only while `best.valid`.
+    /// The EX score less the best paced to the judged targets, clamped to
+    /// ±[`MAX_COUNT`](super::MAX_COUNT): `ex − ghost[p]` by the best play's
+    /// series ([`PlayScore::pace`](crate::PlayScore::pace)) while the
+    /// attempt has one, else `ex − ⌊B · p / n⌋` (`p` the judged targets,
+    /// `n` the attempt's targets; 0 at `n = 0`). Shown only while
+    /// `best.valid`.
     pub const BEST_DIFF: u16 = 115;
     /// The EX score less the target paced alike, `ex − ⌊T · p / n⌋`.
     pub const TARGET_DIFF: u16 = 116;
