@@ -271,6 +271,8 @@ pub(crate) struct Analysis {
     /// The callbacks a selection or result screen's runtime runs, in
     /// import order: their outputs are `lua.<k>` by index.
     pub(crate) runtime: RefCell<Vec<super::runtime::Site>>,
+    /// The runtime sites' file names, one each, by file.
+    site_files: RefCell<HashMap<u16, std::sync::Arc<str>>>,
 }
 
 /// The witness that [`admit`] walked every root of an [`Analysis`]:
@@ -492,6 +494,26 @@ impl Analysis {
             return None;
         }
         self.captured.get(start as usize + k).copied()
+    }
+
+    /// Where instance `i`'s function is defined, as a runtime note names
+    /// it: its file and its constructor's line and column.
+    pub(crate) fn site_at(&self, i: u32) -> Option<super::runtime::SiteAt> {
+        let inst = self.instance(i)?;
+        let parsed = self.files.get(usize::from(inst.file))?;
+        let func = parsed.ast.func(inst.func)?;
+        let file = self
+            .site_files
+            .borrow_mut()
+            .entry(inst.file)
+            .or_insert_with(|| parsed.name.as_str().into())
+            .clone();
+        Some(super::runtime::SiteAt {
+            file,
+            line: func.line,
+            col: func.col,
+            func: inst.func,
+        })
     }
 
     /// The location of `found`.

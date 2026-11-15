@@ -3692,3 +3692,300 @@ fn a_decision_capture_agrees_with_its_screen_s_record() {
         }
     }
 }
+
+/// Writes a `w`×`h` opaque grey PNG at `path`.
+fn write_png(path: &Path, w: u32, h: u32) {
+    let file = fs::File::create(path).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let texels: Vec<u8> = (0..w * h).flat_map(|_| [9, 9, 9, 255]).collect();
+    e.write_header().unwrap().write_image_data(&texels).unwrap();
+}
+
+/// The result skin whose runtime notes the scenario lists: its EX score
+/// and its clear status's image (the profile's essentials), and four
+/// runtime callbacks in this order: a number's value reading number 300
+/// on its first call (78 after), a draw in `parts.lua` reading text 9001
+/// and raising, a draw reading option 901, and a draw in `parts.lua`
+/// calling an import-only capability. It reads nothing while it loads,
+/// so it is installed once, its runtime kept for the run.
+const NOTES_ENTRY: &str = "local skin = { type = 7, name = \"t\", w = 1920, h = 1080 }
+if not skin_config then return skin end
+local ms = require(\"main_state\")
+local parts = require(\"parts\")
+local n = 0
+skin.source = { { id = \"a\", path = \"a.png\" } }
+skin.image = { { id = \"dot\", src = \"a\", x = 0, y = 0, w = 8, h = 8 } }
+skin.value = {
+  { id = \"ex\", src = \"a\", x = 0, y = 0, w = 40, h = 8, divx = 10, digit = 4, ref = 71 },
+  { id = \"r\", src = \"a\", x = 0, y = 0, w = 40, h = 8, divx = 10, digit = 4,
+    value = function() n = n + 1 if n == 1 then return ms.number(300) end return ms.number(78) end },
+}
+skin.destination = {
+  { id = \"ex\", dst = { { x = 0, y = 100, w = 4, h = 8 } } },
+  { id = \"dot\", op = { 90 }, dst = { { x = 0, y = 300, w = 8, h = 8 } } },
+  { id = \"r\", dst = { { x = 0, y = 120, w = 4, h = 8 } } },
+  { id = \"dot\", draw = parts.raise, dst = { { x = 0, y = 310, w = 8, h = 8 } } },
+  { id = \"dot\", dst = { { x = 0, y = 320, w = 8, h = 8 } },
+    draw = function() n = n + 0 return ms.option(901) end },
+  { id = \"dot\", draw = parts.import_only, dst = { { x = 0, y = 330, w = 8, h = 8 } } },
+}
+return skin
+";
+
+/// [`NOTES_ENTRY`]'s module.
+const NOTES_PARTS: &str = "local ms = require(\"main_state\")
+local k = 0
+local M = {}
+M.raise = function() local t = ms.text(9001) k = k + 1 error(\"s1032-marker\") end
+M.import_only = function() k = k + 1 return skin_config.get_path(\"a.png\") ~= nil end
+return M
+";
+
+/// `file`'s quoted name and the line and column (characters, from 1)
+/// where `needle` starts in `text`, found once: a note's place as a
+/// scenario run prints it.
+fn place(file: &str, text: &str, needle: &str) -> String {
+    assert_eq!(text.matches(needle).count(), 1, "{needle:?} once");
+    let before = &text[..text.find(needle).unwrap()];
+    format!(
+        "{file:?}:{}:{}",
+        before.matches('\n').count() + 1,
+        before.rsplit('\n').next().unwrap().chars().count() + 1
+    )
+}
+
+/// Chooses [`NOTES_ENTRY`] as the result skin of `fx`'s data root.
+fn install_notes_result(fx: &Fixture) {
+    let skin = fx.base.join("result");
+    fs::create_dir_all(&skin).unwrap();
+    write_png(&skin.join("a.png"), 64, 64);
+    fs::write(skin.join("result.luaskin"), NOTES_ENTRY).unwrap();
+    fs::write(skin.join("parts.lua"), NOTES_PARTS).unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.result]\nroot = '{}'\nentry = 'result.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// The books a run listed, in order: each owner with its summary and its
+/// note lines (the part after `<owner>: `).
+fn books<'a>(stdout: &'a str, owner: &str) -> Vec<(&'a str, &'a str, Vec<&'a str>)> {
+    let head = format!("dev: runtime notes {owner} ");
+    let note = format!("dev: runtime note {owner} ");
+    let mut found: Vec<(&str, &str, Vec<&str>)> = Vec::new();
+    for l in stdout.lines() {
+        if let Some(rest) = l.strip_prefix(head.as_str()) {
+            let (who, summary) = rest.split_once(": ").unwrap();
+            found.push((who, summary, Vec::new()));
+        } else if let Some(rest) = l.strip_prefix(note.as_str()) {
+            let (who, what) = rest.split_once(": ").unwrap();
+            let last = found.last_mut().unwrap();
+            assert_eq!(last.0, who, "{stdout}");
+            last.2.push(what);
+        }
+    }
+    found
+}
+
+/// A scenario run lists each result lifetime's runtime notes once, when
+/// the lifetime ends, each at its callback's file, line and column. The
+/// fixed skin's runtime is kept across lifetimes, so the second
+/// lifetime's book never sees number 300, read on the first call only;
+/// no Lua error text is printed.
+#[test]
+fn a_scenario_lists_each_results_runtime_notes() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    install_notes_result(&fx);
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let skins = lines(&stdout, "skin: result:");
+    assert!(
+        skins
+            .first()
+            .is_some_and(|l| l.starts_with("skin: result: installed")),
+        "{stdout}"
+    );
+    let value = place("result.luaskin", NOTES_ENTRY, "function() n = n + 1");
+    let raise = place("parts.lua", NOTES_PARTS, "function() local t");
+    let option = place("result.luaskin", NOTES_ENTRY, "function() n = n + 0");
+    let import_only = place("parts.lua", NOTES_PARTS, "function() k = k + 1 return");
+    let rest = [
+        format!("text 9001 unanswered (gave \"\") at {raise}"),
+        format!("callback error at {raise}"),
+        format!("option 901 unanswered (gave false) at {option}"),
+        format!("import-only call at {import_only}"),
+        format!("callback error at {import_only}"),
+    ];
+    let found = books(&stdout, "result");
+    assert_eq!(found.len(), 2, "{stdout}");
+    assert_ne!(found[0].0, found[1].0, "two lifetimes: {stdout}");
+    // Number 78, read from the second call on, is the one note whose
+    // place among the others depends on the frames run.
+    let without_78 = |notes: &[&str]| -> Vec<String> {
+        notes
+            .iter()
+            .filter(|n| !n.starts_with("number 78 "))
+            .map(|n| (*n).to_owned())
+            .collect()
+    };
+    let n78 = format!("number 78 unanswered (gave -2147483648) at {value}");
+    let mut first = vec![format!(
+        "number 300 unanswered (gave -2147483648) at {value}"
+    )];
+    first.extend(rest.iter().cloned());
+    assert_eq!(without_78(&found[0].2), first, "{stdout}");
+    assert!(
+        found[0]
+            .2
+            .iter()
+            .all(|n| !n.starts_with("number 78 ") || *n == n78),
+        "{stdout}"
+    );
+    assert_eq!(without_78(&found[1].2), rest, "{stdout}");
+    assert!(found[1].2.contains(&n78.as_str()), "{stdout}");
+    for (_, summary, notes) in &found {
+        assert_eq!(
+            *summary,
+            format!("{} kept, complete, stopped none", notes.len()),
+            "{stdout}"
+        );
+    }
+    assert!(!stdout.contains("s1032-marker"), "{stdout}");
+}
+
+/// A run that ends on a result lists that lifetime's notes once, at the
+/// loop's end, the lifetime still live.
+#[test]
+fn a_scenario_ending_on_a_result_lists_it_once() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    install_notes_result(&fx);
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let found = books(&stdout, "result");
+    assert_eq!(found.len(), 1, "{stdout}");
+    let notes = &found[0].2;
+    let mut seen = notes.clone();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), notes.len(), "each note once: {stdout}");
+    assert!(
+        notes.iter().any(|n| n.starts_with("number 300 ")),
+        "{stdout}"
+    );
+}
+
+/// The selection skin whose runtime notes the scenario lists: the
+/// profile's essentials (the song list, its slots and its text, in a
+/// self-made bitmap font) and one runtime `draw` that reads number 122
+/// and raises.
+const NOTES_SELECTION: &str = "local skin = { type = 5, name = \"t\", w = 1920, h = 1080 }
+if not skin_config then return skin end
+local ms = require(\"main_state\")
+local k = 0
+skin.source = { { id = \"s\", path = \"s.png\" } }
+skin.font = { { id = \"f\", path = \"f.fnt\" } }
+skin.image = { { id = \"b\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }
+skin.imageset = { { id = \"set\", images = { \"b\", \"b\", \"b\", \"b\", \"b\", \"b\" } } }
+skin.text = { { id = \"t\", font = \"f\", size = 30, ref = 10 } }
+local function slots()
+  local s = {}
+  for i = 0, 6 do
+    s[#s + 1] = { id = \"set\", dst = { { x = 1000, y = 900 - i * 100, w = 800, h = 80 } } }
+  end
+  return s
+end
+skin.songlist = { id = \"list\", center = 3, liston = slots(), listoff = slots(),
+  text = { { id = \"t\", dst = { { x = 10, y = 10, w = 700, h = 40 } } } } }
+skin.destination = {
+  { id = \"list\", dst = { { x = 0, y = 0, w = 0, h = 0 } } },
+  { id = \"b\", dst = { { x = 1500, y = 500, w = 16, h = 16 } },
+    draw = function() k = k + 1 local v = ms.number(122) error(\"s1032-marker\") end },
+}
+return skin
+";
+
+/// A scenario run lists the selection installation's runtime notes once,
+/// at the run's end: one book through both selection visits.
+#[test]
+fn a_scenario_lists_the_selection_runtimes_notes_once() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let skin = fx.base.join("selection");
+    fs::create_dir_all(&skin).unwrap();
+    write_png(&skin.join("s.png"), 64, 16);
+    write_png(&skin.join("f.png"), 16, 16);
+    let glyph = |id: u32| {
+        format!(
+            "char id={id} x=0 y=0 width=16 height=16 xoffset=0 yoffset=0 xadvance=16 page=0 chnl=15\n"
+        )
+    };
+    fs::write(
+        skin.join("f.fnt"),
+        format!(
+            "info face=\"t\" size=16 padding=0,0,0,0\n\
+             common lineHeight=16 base=16 scaleW=16 scaleH=16 pages=1\n\
+             page id=0 file=\"f.png\"\nchars count=2\n{}{}",
+            glyph(97),
+            glyph(98)
+        ),
+    )
+    .unwrap();
+    fs::write(skin.join("s.luaskin"), NOTES_SELECTION).unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.selection]\nroot = '{}'\nentry = 's.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"auto\", until = \"end\" }",
+        "result = \"back\"",
+        "cursor = { path = \"library/a/a.bms\" }",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    assert!(
+        lines(&stdout, "skin: selection:")
+            .first()
+            .is_some_and(|l| l.starts_with("skin: selection: installed")),
+        "{stdout}"
+    );
+    let at = place("s.luaskin", NOTES_SELECTION, "function() k = k + 1 local v");
+    let found = books(&stdout, "selection");
+    assert_eq!(found.len(), 1, "{stdout}");
+    assert_eq!(found[0].1, "2 kept, complete, stopped none", "{stdout}");
+    assert_eq!(
+        found[0].2,
+        [
+            format!("number 122 unanswered (gave 100) at {at}"),
+            format!("callback error at {at}"),
+        ],
+        "{stdout}"
+    );
+    assert!(!stdout.contains("s1032-marker"), "{stdout}");
+}
