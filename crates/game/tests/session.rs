@@ -3087,6 +3087,260 @@ fn a_practice_round_reads_no_best() {
     assert_eq!(asked.lock().unwrap().len(), 1);
 }
 
+/// A record sink that saves locally and answers each read of a play's
+/// best and progress with the next of `answers` (the last one again once
+/// they run out), noting each query; its `best_before` is never the
+/// play's read, and counts its calls.
+struct Paced {
+    local: game::LocalRecords,
+    answers: Vec<game::PlayBest>,
+    asked: Arc<std::sync::Mutex<Vec<Option<game::ProgressQuery>>>>,
+    before: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl game::RecordSink for Paced {
+    fn save(&mut self, rec: &replay::PlayRecord) -> Result<game::RecordRef, SaveError> {
+        self.local.save(rec)
+    }
+
+    fn best_before(&mut self, _: &game::BestKey, _: &rules::RulePreset) -> game::BestLookup {
+        self.before
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        game::BestLookup::Unavailable
+    }
+
+    fn play_best(
+        &mut self,
+        _: &game::BestKey,
+        _: &rules::RulePreset,
+        progress: Option<game::ProgressQuery>,
+    ) -> game::PlayBest {
+        let mut asked = self.asked.lock().unwrap();
+        asked.push(progress);
+        let i = (asked.len() - 1).min(self.answers.len() - 1);
+        self.answers[i].clone()
+    }
+}
+
+/// The queries a [`Paced`] sink was asked, and its `best_before` calls.
+type PacedAsked = (
+    Arc<std::sync::Mutex<Vec<Option<game::ProgressQuery>>>>,
+    Arc<std::sync::atomic::AtomicUsize>,
+);
+
+/// `chart` loaded with its play reads answered by `answers` in turn.
+fn paced(root: &DataRoot, chart: Chart, answers: Vec<game::PlayBest>) -> (Loaded, PacedAsked) {
+    let settings = tapestry_settings(root);
+    let asked = PacedAsked::default();
+    let parts = Parts {
+        ingest: Box::new(Built(chart)),
+        records: Some(Box::new(Paced {
+            local: game::LocalRecords::new(root.records()),
+            answers,
+            asked: Arc::clone(&asked.0),
+            before: Arc::clone(&asked.1),
+        })),
+        ..Parts::standard(root, &settings.player)
+    };
+    let loaded = Loaded::load(root.clone(), settings, &chart_file(root), config(), parts).unwrap();
+    (loaded, asked)
+}
+
+/// A known best of EX `ex`.
+fn known_best(ex: u32) -> game::BestLookup {
+    game::BestLookup::Known(game::BestScore {
+        plays: 3,
+        ex: Some(ex),
+        bp: Some(5),
+        max_combo: Some(9),
+        clear: Some(game::BestLamp::Failed),
+    })
+}
+
+/// 27 judgments of EX 40 under the tapestry preset: `greats` GREATs first,
+/// then PERFECTs and GREATs alternating while both remain, so the series
+/// is not the line.
+fn progress_40(greats_first: usize) -> Box<[rules::Judgment]> {
+    use rules::Judgment::{Great, Perfect};
+    // 13 PERFECTs and 14 GREATs: 26 + 14 = 40.
+    let mut out = vec![Great; greats_first];
+    let (mut p, mut g) = (13, 14 - greats_first);
+    while p + g > 0 {
+        if p > 0 {
+            out.push(Perfect);
+            p -= 1;
+        }
+        if g > 0 {
+            out.push(Great);
+            g -= 1;
+        }
+    }
+    out.into_boxed_slice()
+}
+
+/// The cumulative EX of `judgments` under the tapestry weights, worked
+/// from them one by one.
+fn cumulative(judgments: &[rules::Judgment]) -> Vec<u32> {
+    let mut out = vec![0];
+    for j in judgments {
+        let w = match j {
+            rules::Judgment::Perfect => 2,
+            rules::Judgment::Great => 1,
+            _ => 0,
+        };
+        out.push(out.last().unwrap() + w);
+    }
+    out
+}
+
+/// A play reads its best and its progress in one read when it begins: a
+/// known best with a known progress gives the attempt the progress's
+/// series under the play preset; a chart that declares `#RANDOM` asks for
+/// no progress; a known-empty or unavailable best, a missing or refused
+/// progress, or one that does not end at the best give none, the best
+/// still read. A practice round reads nothing.
+#[test]
+fn the_play_reads_its_progress_with_its_best() {
+    use game::{BestLookup, PlayBest, ProgressLookup, ProgressQuery};
+    let progress = progress_40(6);
+    let series = cumulative(&progress);
+    assert_eq!((series.len(), series[27]), (28, 40));
+    // Not the line: the GREATs first put the series below it at p = 6.
+    assert!(series[6] < 40 * 6 / 27);
+    let query = Some(ProgressQuery {
+        targets: 27,
+        empty_poor_counted: false,
+    });
+    let random = || {
+        let mut chart = taps_n(27);
+        chart.identity.random_results = vec![1];
+        chart
+    };
+    let answer = |best, progress| PlayBest { best, progress };
+    let known = || ProgressLookup::Known(progress.clone());
+    let cases = [
+        (
+            "known",
+            taps_n(27),
+            answer(known_best(40), known()),
+            Some(series.clone()),
+            40,
+            query,
+        ),
+        (
+            "random",
+            random(),
+            answer(known_best(40), known()),
+            None,
+            40,
+            None,
+        ),
+        (
+            "known empty",
+            taps_n(27),
+            answer(BestLookup::KnownEmpty, ProgressLookup::Missing),
+            None,
+            0,
+            query,
+        ),
+        (
+            "unavailable",
+            taps_n(27),
+            answer(BestLookup::Unavailable, ProgressLookup::Unavailable),
+            None,
+            0,
+            query,
+        ),
+        (
+            "missing",
+            taps_n(27),
+            answer(known_best(40), ProgressLookup::Missing),
+            None,
+            40,
+            query,
+        ),
+        (
+            "refused",
+            taps_n(27),
+            answer(known_best(40), ProgressLookup::Refused("why".to_owned())),
+            None,
+            40,
+            query,
+        ),
+        (
+            "another best",
+            taps_n(27),
+            answer(known_best(41), known()),
+            None,
+            41,
+            query,
+        ),
+    ];
+    for (name, chart, answer, pace, best, asked_query) in cases {
+        let (_dir, root) = temp_root();
+        let (mut loaded, (asked, before)) = paced(&root, chart, vec![answer]);
+        loaded.begin_play();
+        let attempt = loaded.attempt();
+        assert_eq!(attempt.pace.as_deref(), pace.as_deref(), "{name}");
+        assert_eq!(attempt.score.best, best, "{name}");
+        assert_eq!(*asked.lock().unwrap(), vec![asked_query], "{name}");
+        assert_eq!(
+            before.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "{name}"
+        );
+    }
+    // A practice round reads nothing; the full play after it does.
+    let (_dir, root) = temp_root();
+    let (mut loaded, (asked, _)) = paced(&root, taps_n(27), vec![answer(known_best(40), known())]);
+    let practice = game::Practice {
+        start: TimeUs(0),
+        end: TimeUs(2_000 * MS),
+        lead_in: TimeUs(1_000 * MS),
+        initial_gauges: loaded.preset().gauges.iter().map(|g| g.start).collect(),
+        repeat: true,
+    };
+    loaded.set_practice(Some(practice)).unwrap();
+    loaded.begin_play();
+    assert_eq!(loaded.attempt().pace, None);
+    assert!(asked.lock().unwrap().is_empty());
+    loaded.set_practice(None).unwrap();
+    loaded.begin_play();
+    assert_eq!(loaded.attempt().pace.as_deref(), Some(&series[..]));
+    assert_eq!(*asked.lock().unwrap(), vec![query]);
+}
+
+/// The best and its progress come from one read: a sink whose state
+/// changes from play A to play B (equal EX, another progress) after each
+/// read gives the attempt A's best and A's series, never B's, and is read
+/// once.
+#[test]
+fn the_best_and_its_pace_come_from_one_read() {
+    use game::{PlayBest, ProgressLookup};
+    let a = progress_40(6);
+    let b = progress_40(0);
+    assert_ne!(cumulative(&a), cumulative(&b));
+    let (_dir, root) = temp_root();
+    let (mut loaded, (asked, before)) = paced(
+        &root,
+        taps_n(27),
+        vec![
+            PlayBest {
+                best: known_best(40),
+                progress: ProgressLookup::Known(a.clone()),
+            },
+            PlayBest {
+                best: known_best(40),
+                progress: ProgressLookup::Known(b),
+            },
+        ],
+    );
+    loaded.begin_play();
+    assert_eq!(loaded.attempt().pace.as_deref(), Some(&cumulative(&a)[..]));
+    assert_eq!(asked.lock().unwrap().len(), 1);
+    assert_eq!(before.load(std::sync::atomic::Ordering::SeqCst), 0);
+}
+
 /// C12: a READY candidate cancelled by a hold of START and rearmed by its
 /// release reads no best again: the play's one read stands.
 #[test]

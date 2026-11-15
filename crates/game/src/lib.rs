@@ -78,7 +78,8 @@ pub use audio_loop::{
 pub use autoplay::{Autoplay, AutoplayError, schedule_iter};
 pub use bests::{
     BestCompare, BestFigures, BestKey, BestLamp, BestLookup, BestRate, BestScore, BestView,
-    PlayerTotals, SavedPlay, ScoreTarget, TargetPlay, score_target,
+    PlayBest, PlayerTotals, ProgressLookup, ProgressQuery, SavedPlay, ScoreTarget, TargetPlay,
+    best_series, score_target,
 };
 pub use decision::{
     DECISION_TIME, Decision, DecisionLifetime, DecisionShown, DecisionTakeover, Origin, Reply,
