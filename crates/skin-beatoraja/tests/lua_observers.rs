@@ -271,6 +271,38 @@ fn a_true_observer_on_a_conditioned_destination_is_refused() {
 }
 
 #[test]
+fn a_true_observer_whose_object_may_skip_its_timer_is_refused() {
+    // A number, at a sentinel value, and an image set whose selector may
+    // be negative (ref 40, the gauge kind) leave their preparation before
+    // the timer is read, so the source's observer may start late.
+    let held = Unsupported::Observer("object holds its timer back");
+    let number = "skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, \
+                  digit = 3, value = function() return 1 end } }\n\
+                  table.insert(skin.destination, { id = \"v\", timer = on, dst = { { w = 6, h = 6 } } })";
+    let set = |r: i32| {
+        format!(
+            "skin.imageset = {{ {{ id = \"s\", ref = {r}, images = {{ \"i\", \"i\" }} }} }}\n\
+             table.insert(skin.destination, {{ id = \"s\", timer = on, dst = {{ {{ w = 8, h = 8 }} }} }})"
+        )
+    };
+    for body in [number.to_owned(), set(40)] {
+        let body = format!("{TWINS}\n{body}");
+        assert_eq!(
+            observer_refused(import_body(&body)),
+            (held, HEAD + 1),
+            "{body}"
+        );
+    }
+    // A selector never negative (ref 42, the random option) prepares on
+    // every frame: the observer folds.
+    let body = format!("{TWINS}\n{}", set(42));
+    assert_eq!(
+        import_body(&body).unwrap().callbacks,
+        [Disposition::Lowered]
+    );
+}
+
+#[test]
 fn an_observer_read_anywhere_but_a_timer_is_refused() {
     let body = format!("{TWINS}\n{}", moving(0, "draw = on,"));
     assert_eq!(

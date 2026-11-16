@@ -1483,17 +1483,31 @@ impl<'d> Cx<'d> {
         // Timer.
         let (timer, untimed) = match dst.timer {
             // A true observer: untimed, as the source's starts at the first
-            // frame its destination is prepared, unless a condition of its
-            // own may hold that frame back.
+            // frame its destination is prepared, unless its object's own
+            // preparation or a condition may hold that frame back: a number
+            // leaves before the timer is read at a sentinel value
+            // (`SkinNumber.java:138-150`), an image choice at a negative
+            // index (`SkinImage.java:127-132`), a judge before its first
+            // judgment (`play/SkinJudge.java:97-103`).
             Prop::Callable(id) if observer.is_some() => {
-                if conds
+                let held = self.number_value.is_some()
+                    || self.sentinel_read
+                    || !matches!(self.prepare.before(), Ok(None));
+                let why = if held {
+                    Some("object holds its timer back")
+                } else if conds
                     .get(own..)
                     .unwrap_or_default()
                     .iter()
                     .any(|c| c != "true")
                 {
+                    Some("destination is conditioned")
+                } else {
+                    None
+                };
+                if let Some(why) = why {
                     let c = observer.map_or(crate::tree::NONE, |(_, c)| c);
-                    let why = crate::lua::Unsupported::Observer("destination is conditioned");
+                    let why = crate::lua::Unsupported::Observer(why);
                     return Err(self.observer_refused(role, (c, id), why));
                 }
                 (self.screen(), true)
