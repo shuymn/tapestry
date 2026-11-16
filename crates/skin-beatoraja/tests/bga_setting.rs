@@ -538,6 +538,38 @@ fn a_value_reading_the_bga_setting_notes_d33_once_per_destination() {
     assert_eq!(at, [Some(callback), Some(blend[0])]);
 }
 
+/// T7c: a number's value that writes, replaced on play and so never
+/// lowered, still notes D33 at its definition, from its option scan,
+/// beside its own `Callback` note.
+#[test]
+fn a_replaced_value_reading_the_bga_setting_notes_d33() {
+    let v = "function() n = 1 return ms.option(40) and 1 or 0 end";
+    let text = lua_play_text(
+        "local n = 0",
+        v,
+        "{ id = \"n\", dst = { { x = 0, y = 0, w = 6, h = 6 } } },",
+    );
+    let (_d, i) = lua_play(&text);
+    assert!(
+        i.callbacks
+            .contains(&Disposition::Replaced(Unsupported::Writes)),
+        "{:?}",
+        i.callbacks
+    );
+    assert!(
+        common::has(
+            &i.imported.report,
+            NoteKind::Callback {
+                field: "value",
+                why: Unsupported::Writes
+            }
+        ),
+        "{:?}",
+        common::kinds(&i.imported.report)
+    );
+    assert_eq!(d33_at(&i.imported), [at_fn(&text, v)]);
+}
+
 /// T2b with a counter: an increment of a written cell opens the
 /// candidate, whose callees no longer resolve, so the import notes no D33
 /// for its reads. On play no part reading the setting then draws without
