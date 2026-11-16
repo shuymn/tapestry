@@ -444,6 +444,7 @@ jobs:
         run: |
           scripts/dep-check.sh deny check --deny index-failure
           scripts/dep-check.sh deny --manifest-path fuzz/Cargo.toml --config deny.toml check --deny index-failure
+          scripts/dep-check.sh deny --manifest-path test-device/firmware/Cargo.toml --config deny.toml check --deny index-failure
       # `--with-metadata` also covers dev-, build- and target-specific
       # dependencies. cargo-machete exits 0 when it cannot read a manifest or
       # run cargo metadata, so its error lines fail the step; it runs cargo
@@ -460,6 +461,7 @@ jobs:
         run: |
           scripts/dep-check.sh audit --file Cargo.lock --deny warnings
           scripts/dep-check.sh audit --file fuzz/Cargo.lock --deny warnings
+          scripts/dep-check.sh audit --file test-device/firmware/Cargo.lock --deny warnings
       - name: Disk usage
         if: ${{ !cancelled() }}
         run: |
