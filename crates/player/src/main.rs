@@ -1734,6 +1734,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         (Some(sc), _) => Box::new(dev::scenario::ScenarioFrames::from_env(
             sc.captures.clone(),
             sc.transitions.clone(),
+            sc.shots.clone(),
             clock,
         )),
         (None, Some(dir)) => Box::new(dev::FrameDump::new(dir, TimeUs(1_000_000))),
@@ -1824,6 +1825,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             logs: sc.logs,
             captures: sc.captures,
             transitions: sc.transitions,
+            shots: sc.shots,
             recorded: rig.recorded.clone(),
             chart_input: None,
             pending: None,
@@ -1946,6 +1948,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
             rendered,
             &sc.captures,
             record.map(|(_, lost)| lost),
+            sc.shots.as_ref(),
         );
     }
     ran?;
