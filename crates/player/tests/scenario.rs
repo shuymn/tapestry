@@ -223,6 +223,61 @@ impl Fixture {
         Some((out, stdout, stderr))
     }
 
+    /// `command` run to its end within `limit`, both streams drained by a
+    /// reader thread each while it runs; past `limit` the child is killed
+    /// and reaped, and the test fails with what it printed so far.
+    fn run_drained(
+        &self,
+        command: &mut Command,
+        limit: std::time::Duration,
+    ) -> (Output, String, String) {
+        use std::io::Read as _;
+        let mut child = command
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let drain = |mut r: Box<dyn std::io::Read + Send>| {
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let mut bytes = Vec::new();
+                let _ = r.read_to_end(&mut bytes);
+                let _ = tx.send(bytes);
+            });
+            rx
+        };
+        let out = drain(Box::new(child.stdout.take().unwrap()));
+        let err = drain(Box::new(child.stderr.take().unwrap()));
+        let begun = std::time::Instant::now();
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                break Some(status);
+            }
+            if begun.elapsed() >= limit {
+                let _ = child.kill();
+                let _ = child.wait();
+                break None;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        };
+        let read = |rx: std::sync::mpsc::Receiver<Vec<u8>>| {
+            let bytes = rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap_or_default();
+            String::from_utf8_lossy(&bytes).into_owned()
+        };
+        let (stdout, stderr) = (read(out), read(err));
+        let Some(status) = status else {
+            panic!("the run did not end within {limit:?}\n{stdout}\n{stderr}");
+        };
+        let output = Output {
+            status,
+            stdout: stdout.clone().into_bytes(),
+            stderr: stderr.clone().into_bytes(),
+        };
+        (output, stdout, stderr)
+    }
+
     fn output(&self, command: &mut Command) -> (Output, String, String) {
         let out = command.output().unwrap();
         let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -271,6 +326,47 @@ fn scenario(steps: &[&str]) -> String {
         text.push('\n');
     }
     text
+}
+
+/// The bound of a run whose test asserts its end.
+const RUN_LIMIT: std::time::Duration = std::time::Duration::from_secs(600);
+
+/// The number after `key ` in the record line `l`.
+fn figure(l: &str, key: &str) -> i64 {
+    l.split(&format!("{key} "))
+        .nth(1)
+        .and_then(|r| r.split(' ').next())
+        .and_then(|n| n.trim_end_matches(',').parse().ok())
+        .unwrap_or_else(|| panic!("no {key} in {l}"))
+}
+
+/// A fixture with chart A and the log `logs/k7.tprl` hitting a one-note
+/// chart's key 7.
+fn practice_fixture() -> Fixture {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let key7 = bms_parser::load_bms(
+        b"#BPM 120\n#00119:0000000000010000\n",
+        &fx.base,
+        &Default::default(),
+    )
+    .unwrap()
+    .chart;
+    write_log(
+        &fx.base.join("logs").join("k7.tprl"),
+        &hits(&key7, |_| true),
+        1,
+    );
+    fx
+}
+
+/// One practice round of chart A with a 2.5 s lead-in, then quit.
+fn practice_scenario() -> String {
+    scenario(&[
+        "practice = { path = \"library/a/a.bms\", from = 1, to = 2, speed = 100, \
+         lead_in_ms = 2500, gauge = 20, repeat = true, input = \"logs/k7.tprl\", rounds = 1 }",
+        "quit = {}",
+    ])
 }
 
 /// The lines of `stdout` that start with `prefix`.
@@ -3988,4 +4084,195 @@ fn a_scenario_lists_the_selection_runtimes_notes_once() {
         "{stdout}"
     );
     assert!(!stdout.contains("s1032-marker"), "{stdout}");
+}
+
+/// The transition record of a whole run: a decision skin, an autoplay
+/// play to its built-in result, back, and one practice round with a
+/// lead-in of 2.5 s. The record is printed after the render thread ends:
+/// each transition leaves the state the one before it entered, each span
+/// ends at the last present its transition names, the practice round's
+/// READY is a state of its own, and with no capture nothing is marked
+/// read back or labelled instrumented. The decision screen's span counts
+/// the frames its own record counts. Only consistency is checked, so no
+/// frame's timing decides it.
+#[test]
+fn a_scenario_records_each_change_with_its_first_frame() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    let key7 = bms_parser::load_bms(
+        b"#BPM 120\n#00119:0000000000010000\n",
+        &fx.base,
+        &Default::default(),
+    )
+    .unwrap()
+    .chart;
+    write_log(
+        &fx.base.join("logs").join("k7.tprl"),
+        &hits(&key7, |_| true),
+        1,
+    );
+    let skin = fx.base.join("decision");
+    fs::create_dir_all(&skin).unwrap();
+    fs::write(
+        skin.join("s.luaskin"),
+        "local skin = { type = 6, name = \"d\", w = 1920, h = 1080 }\n\
+         if not skin_config then return skin end\n\
+         skin.scene = 20000 skin.input = 500 skin.fadeout = 500\n\
+         return skin\n",
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.decision]\nroot = '{}'\nentry = 's.luaskin'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+    let (out, stdout, stderr) = fx.run_drained(
+        &mut fx.command(&scenario(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "practice = { path = \"library/a/a.bms\", from = 1, to = 2, speed = 100, \
+         lead_in_ms = 2500, gauge = 20, repeat = true, input = \"logs/k7.tprl\", rounds = 1 }",
+            "quit = {}",
+        ])),
+        RUN_LIMIT,
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let record: Vec<&str> = stdout
+        .lines()
+        .filter(|l| {
+            [
+                "dev: transition ",
+                "dev: presentation ",
+                "dev: span ",
+                "dev: mark ",
+            ]
+            .iter()
+            .any(|p| l.starts_with(p))
+        })
+        .collect();
+    let [summary] = lines(&stdout, "dev: transitions: ")[..] else {
+        panic!("one summary: {stdout}");
+    };
+    assert!(summary.contains(", lost 0, "), "{summary}");
+    assert_eq!(
+        summary.split(' ').nth(2),
+        Some(record.len().to_string().as_str()),
+        "the summary counts the records printed: {summary}"
+    );
+    for l in record.iter().chain([&summary]) {
+        assert!(!l.ends_with(", instrumented"), "{l}");
+        assert!(!l.starts_with("dev: mark read-back"), "{l}");
+    }
+    // `dev: transition <from> -> <to>: <n> us, last <a> us, first <b> us…`.
+    let number = |l: &str, key: &str| -> i64 {
+        l.split(&format!("{key} "))
+            .nth(1)
+            .and_then(|r| r.split(' ').next())
+            .and_then(|n| n.trim_end_matches(',').parse().ok())
+            .unwrap_or_else(|| panic!("no {key} in {l}"))
+    };
+    let mut entered: Option<&str> = None;
+    let mut span: Option<(&str, i64)> = None;
+    let mut chain = Vec::new();
+    for l in &record {
+        if let Some(rest) = l.strip_prefix("dev: span ") {
+            span = Some((rest.split(' ').next().unwrap(), number(l, "last")));
+        } else if let Some(rest) = l.strip_prefix("dev: transition ") {
+            let (from, rest) = rest.split_once(" -> ").unwrap();
+            let to = rest.split(':').next().unwrap();
+            if let Some(entered) = entered {
+                assert_eq!(from, entered, "{l}\n{stdout}");
+            }
+            let (state, last) = span.take().unwrap_or_else(|| panic!("no span before {l}"));
+            assert_eq!((state, last), (from, number(l, "last")), "{l}\n{stdout}");
+            entered = Some(to);
+            chain.push((from, to));
+        }
+    }
+    assert!(span.is_some(), "the last state's span: {stdout}");
+    // The final state's span is pushed at the render thread's end: printed
+    // after it, it is the last record.
+    assert!(
+        record.last().is_some_and(|l| l.starts_with("dev: span ")),
+        "the final span printed last: {stdout}"
+    );
+    // The states every run of these steps presents, whatever its pace
+    // (a selection the scenario chooses from at once may present nothing).
+    for edge in [
+        ("decision", "loading"),
+        ("loading", "ready"),
+        ("ready", "play"),
+        ("play", "tail"),
+        ("tail", "result"),
+        ("practice", "loading"),
+    ] {
+        assert!(chain.contains(&edge), "{edge:?} in {chain:?}");
+    }
+    // The play's end to its result taken: one preparation, its result's.
+    assert_eq!(lines(&stdout, "dev: mark preparing ").len(), 1, "{stdout}");
+    let decisions = lines(&stdout, "dev: decision ");
+    assert_eq!(
+        decisions.len(),
+        2,
+        "the select's and the practice's: {stdout}"
+    );
+    for decision in decisions {
+        // `dev: decision <lifetime>: <presentation>, builds <n>, skin
+        // frames <n>, page frames <n>, after its end <n>, app allocations
+        // <n>`.
+        let lifetime = decision["dev: decision ".len()..]
+            .split(':')
+            .next()
+            .unwrap();
+        let drawn =
+            number(decision, "frames") + number(decision, "page frames") + number(decision, "end");
+        let spans: Vec<i64> = record
+            .iter()
+            .filter(|l| l.starts_with(&format!("dev: span decision {lifetime}:")))
+            .map(|l| number(l, "frames"))
+            .collect();
+        if drawn == 0 {
+            assert!(spans.is_empty(), "{decision}\n{stdout}");
+        } else {
+            assert_eq!(spans, [drawn], "{decision}\n{stdout}");
+        }
+    }
+}
+
+/// The record's cap reaches the run's exit: with the cap lowered to 3
+/// (`TAPESTRY_DEV_TRANSITION_CAP`), a practice round's record overflows,
+/// its summary counts the records lost, and the run exits 1 naming the
+/// same count; the same run within the cap exits 0 with none lost (the
+/// control).
+#[test]
+fn a_run_past_the_record_s_cap_exits_1() {
+    for cap in [None, Some(3)] {
+        let fx = practice_fixture();
+        let mut command = fx.command(&practice_scenario());
+        if let Some(c) = cap {
+            command.env("TAPESTRY_DEV_TRANSITION_CAP", c.to_string());
+        }
+        let (out, stdout, stderr) = fx.run_drained(&mut command, RUN_LIMIT);
+        let [summary] = lines(&stdout, "dev: transitions: ")[..] else {
+            panic!("one summary: {stdout}\n{stderr}");
+        };
+        let lost = figure(summary, "lost");
+        match cap {
+            None => {
+                assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+                assert_eq!(lost, 0, "{summary}");
+            }
+            Some(c) => {
+                assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+                assert!(lost > 0, "{summary}");
+                let failure = format!("{lost} transition records were lost past the cap of {c}");
+                assert!(stderr.contains(&failure), "{failure} in {stderr}");
+            }
+        }
+    }
 }

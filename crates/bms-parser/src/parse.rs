@@ -87,6 +87,18 @@ pub struct Source {
     pub written_bar: Option<RawObject>,
     /// `#SCROLLxx` factors in units of `10^-18`, those that are numbers.
     pub scroll_defs: BTreeMap<u16, i128>,
+    /// `#BMPxx` definitions naming a file, by id, the last one kept: the
+    /// BGA structure's, read for presentation alone (crate doc,
+    /// "Presentation reads").
+    pub bmp: BTreeMap<u16, String>,
+    /// Base (04) objects, each as [`ObjectKind::Bgm`] of its id, in file
+    /// order, for the BGA structure alone.
+    pub bga_base: Vec<RawObject>,
+    /// Layer (07) objects, as `bga_base`.
+    pub bga_layer: Vec<RawObject>,
+    /// Each measure's poor sequence (channel 06), its frames as
+    /// [`poor_frames`] reads the measure's last line holding an id.
+    pub poor: BTreeMap<u16, Vec<Option<u16>>>,
 }
 
 /// Headers read and ignored without a warning: descriptive ones, and ones
@@ -341,6 +353,11 @@ fn parse_channel(
             [b'S', b'C'] => source.scrolls.push(preview(id)),
             _ => {}
         }
+        match channel {
+            [b'0', b'4'] => source.bga_base.push(preview(id)),
+            [b'0', b'7'] => source.bga_layer.push(preview(id)),
+            _ => {}
+        }
         match kind {
             Some(kind) => source.objects.push(RawObject {
                 measure,
@@ -360,7 +377,36 @@ fn parse_channel(
             }
         }
     }
+    if channel == *b"06"
+        && let Some(frames) = poor_frames(pairs)
+    {
+        source.poor.insert(measure, frames);
+    }
     Ok(())
+}
+
+/// The frames of a channel 06 line's `pairs` (crate doc, "Presentation
+/// reads"): one frame of the line's one id other than `00` when it holds
+/// one, every pair a frame in order when it holds several, a `00` pair or
+/// an invalid one a frame showing nothing; `None` when it holds no id.
+fn poor_frames(pairs: &[[u8; 2]]) -> Option<Vec<Option<u16>>> {
+    let frames: Vec<Option<u16>> = pairs
+        .iter()
+        .map(|pair| {
+            if pair == b"00" {
+                None
+            } else {
+                parse_base36(pair)
+            }
+        })
+        .collect();
+    let mut ids = frames.iter().flatten();
+    let first = *ids.next()?;
+    if ids.all(|&id| id == first) {
+        Some(vec![Some(first)])
+    } else {
+        Some(frames)
+    }
 }
 
 fn parse_header(
@@ -467,8 +513,14 @@ fn parse_header(
                 });
             }
         }
-        // The image is not shown; that one is defined is a label.
-        _ if defines_bga(upper, value) => source.labels.bga = true,
+        // That one is defined is a label; the definition is read into the
+        // BGA structure, for presentation alone.
+        _ if defines_bga(upper, value) => {
+            source.labels.bga = true;
+            if let Some(id) = defined_id(upper, "BMP") {
+                source.bmp.insert(id, value.to_owned());
+            }
+        }
         _ if IGNORED_HEADERS.contains(&upper)
             || IGNORED_DEFINITIONS
                 .iter()
