@@ -877,6 +877,15 @@ fn install_adjustments(rig: &mut PlayerRig<'_>, settings: &Settings) -> anyhow::
     rig.adjust = Some(driver);
     Ok(())
 }
+/// The BGA setting of `settings` fixed for a session that plays by itself
+/// when `autoplay`.
+fn bga_session(settings: &Settings, autoplay: bool) -> game::BgaSession {
+    game::BgaSession {
+        settings: settings.player.bga,
+        autoplay,
+    }
+}
+
 /// The game thread's rig around the started threads, for plays under
 /// `root` with `settings`, by generated input when `autoplay`.
 fn rig<'a>(
@@ -932,6 +941,7 @@ fn rig<'a>(
         gauge: settings.player.displayed_gauge,
         attempt_gauge: settings.player.displayed_gauge,
         autoplay,
+        bga_session: bga_session(settings, autoplay),
         play_states: game::PlayStates::default(),
         input_offset_us: device.input_offset_us,
         files: SettingsFiles::new(root.clone(), settings.clone()),
@@ -1385,10 +1395,7 @@ fn start_skins(
         &rig.render,
         &settings.player.skins,
         launch,
-        imports::SkinSession {
-            autoplay: rig.autoplay,
-            bga: settings.player.bga.mode,
-        },
+        imports::SkinSession::of(rig.bga_session),
         &build,
         || rig.controls.quitting(),
     )

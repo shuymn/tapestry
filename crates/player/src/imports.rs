@@ -491,6 +491,15 @@ pub struct SkinSession {
 }
 
 impl SkinSession {
+    /// The session `bga` fixes: its autoplay, and its BGA mode.
+    #[must_use]
+    pub const fn of(bga: game::BgaSession) -> Self {
+        Self {
+            autoplay: bga.autoplay,
+            bga: bga.settings.mode,
+        }
+    }
+
     /// The BGA setting as the import reads it.
     #[must_use]
     pub const fn bga(self) -> skin_beatoraja::Bga {

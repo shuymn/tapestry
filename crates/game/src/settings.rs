@@ -1000,6 +1000,39 @@ pub enum BgaMode {
     Off,
 }
 
+/// The BGA setting as a session applies it: `[bga]`, read once at
+/// startup, and whether the session plays by itself, both fixed for the
+/// session: the one answer the skin imports' options 40 and 41 and a play's
+/// BGA take (design.md "Differences from the source", BGA setting).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BgaSession {
+    /// `[bga]` as read.
+    pub settings: BgaSettings,
+    /// Whether the session plays by itself (design.md "Autoplay").
+    pub autoplay: bool,
+}
+
+impl BgaSession {
+    /// Whether a play shows the chart's BGA: with `on` always, with
+    /// `autoplay` only in an autoplay session, with `off` never. A play that
+    /// does not show it neither reads nor decodes its pictures.
+    #[must_use]
+    pub const fn shown(self) -> bool {
+        match self.settings.mode {
+            BgaMode::On => true,
+            BgaMode::Autoplay => self.autoplay,
+            BgaMode::Off => false,
+        }
+    }
+
+    /// How a BGA destination without a stretch of its own fits a shown
+    /// picture.
+    #[must_use]
+    pub const fn expand(self) -> BgaExpand {
+        self.settings.expand
+    }
+}
+
 /// `[bga] expand`: how a skin's BGA destination without a stretch of its
 /// own fits the chart's pictures (the source's `bgaExpand`,
 /// `Config.java:157-162` at `0.8.9`, `SkinBGA.java:25-28`).
