@@ -175,6 +175,7 @@ fn note_record(
         ),
         RuntimeNote::CallbackError { at } => ("callback error", None, None, Some(at)),
         RuntimeNote::ImportOnly { at } => ("import-only call", None, None, at.as_ref()),
+        RuntimeNote::BgaSetting { id, at } => ("bga setting", Some(*id), None, at.as_ref()),
     };
     RuntimeNoteRecord {
         what,

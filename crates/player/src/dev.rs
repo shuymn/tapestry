@@ -35,6 +35,7 @@ use crate::render_side::{FrameSink, Screen};
 pub mod checkpoints;
 mod decision_faults;
 pub mod scenario;
+pub mod transitions;
 
 pub use decision_faults::DecisionFaults;
 

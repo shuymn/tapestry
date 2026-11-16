@@ -16,7 +16,7 @@ use skin_model::{AtlasLimits, Quad, ResultChart, ResultLabels, ScreenKind};
 
 use super::{measure, view, wait_until};
 use crate::menu_screen::MenuScreen;
-use crate::render_side::{EndPage, MakeScreen, NoFrames, RenderLink, Screen, spawn};
+use crate::render_side::{EndPage, FrameSink, MakeScreen, NoFrames, RenderLink, Screen, spawn};
 use crate::result_present::{Overlay, ResultPresentation, ViewKey, ViewPayload};
 
 /// What a frame drew: the skin's quads and the strip's lines, or the
@@ -512,6 +512,11 @@ pub(crate) struct Rig {
 
 impl Rig {
     pub(crate) fn new() -> Self {
+        Self::with_sink(Box::new(NoFrames))
+    }
+
+    /// [`new`](Self::new) with `frames` as its frame sink.
+    pub(crate) fn with_sink(frames: Box<dyn FrameSink>) -> Self {
         let gate = Arc::new(Gate::default());
         let faults = Arc::new(Faults::default());
         let drawn = Arc::new(Mutex::new(Vec::new()));
@@ -532,16 +537,7 @@ impl Rig {
             }) as Box<dyn Screen>)
         });
         let clock = QpcClock::start();
-        let link = spawn(
-            make,
-            None,
-            None,
-            clock,
-            view(),
-            measure(clock),
-            Box::new(NoFrames),
-        )
-        .unwrap();
+        let link = spawn(make, None, None, clock, view(), measure(clock), frames).unwrap();
         Self {
             link,
             clock,
@@ -861,6 +857,79 @@ fn every_frame_draws_one_views_number_and_strip() {
     }));
     assert_eq!(rig.link.result_status().revision, 30);
     rig.link.exit();
+}
+
+/// A sink that times each taking of the result and ends, in a transition
+/// recorder, the preparation of a play that ended before the result.
+#[cfg(feature = "dev-tools")]
+struct Taking {
+    recorder: crate::dev::transitions::Recorder,
+    calls: Arc<Mutex<Vec<TimeUs>>>,
+}
+
+#[cfg(feature = "dev-tools")]
+impl FrameSink for Taking {
+    fn frame(&mut self, _screen: &dyn Screen, _drawn: &crate::measure::Drawn<'_>) {}
+
+    fn result_taken(&mut self, at: TimeUs) {
+        self.calls.lock().unwrap().push(at);
+        self.recorder.result_taken(at);
+    }
+}
+
+/// The result's preparation ends at whichever the render thread takes
+/// first, a result skin's presentation (`ResultChanged`) or the built-in
+/// result's page (`End`), in either order: both are taken, and the one
+/// preparing mark ends at the first.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn result_preparing_ends_at_the_first_taker() {
+    use crate::dev::transitions::{MarkKind, Record, Recorder, Transitions};
+    for skin_first in [true, false] {
+        let (_dir, skin) = fixed_skin();
+        let book = Transitions::with_capacity(16);
+        let mut recorder = Recorder::new(book.clone());
+        recorder.play_ended(TimeUs(1));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let rig = Rig::with_sink(Box::new(Taking {
+            recorder,
+            calls: Arc::clone(&calls),
+        }));
+        let lifetime = installed(&rig, &skin);
+        let a = payload(1, Some(&skin), 1_111, &[]);
+        let end = || {
+            rig.link.show_end(EndPage {
+                lines: vec!["end".to_owned()],
+                graphs: None,
+                id: None,
+            });
+        };
+        let taken = |n: usize| wait_until(|| calls.lock().unwrap().len() >= n);
+        if skin_first {
+            show(&rig.link, lifetime, 1, &a, &Overlay::default());
+            assert!(taken(1), "the skin's presentation is taken");
+            end();
+        } else {
+            end();
+            assert!(taken(1), "the built-in page is taken");
+            show(&rig.link, lifetime, 1, &a, &Overlay::default());
+        }
+        assert!(taken(2), "{skin_first}: {:?}", calls.lock().unwrap());
+        rig.link.exit();
+        let first = calls.lock().unwrap()[0];
+        let marks: Vec<_> = book
+            .records()
+            .into_iter()
+            .filter_map(|r| match r {
+                Record::Mark(m) if m.kind == MarkKind::Preparing => Some(m),
+                _ => None,
+            })
+            .collect();
+        let [m] = marks[..] else {
+            panic!("{skin_first}: one preparation: {marks:?}");
+        };
+        assert_eq!((m.from, m.to), (TimeUs(1), first), "{skin_first}");
+    }
 }
 
 /// The barrier keeps the view presented when it is set, a newer view

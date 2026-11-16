@@ -45,6 +45,9 @@ pub(crate) fn option(id: i32) -> Option<Class<ResOption>> {
         // Autoplay on and off: both false off the play screen, as the
         // source answers them (`BooleanPropertyFactory.java:413-416`).
         32 | 33 => Constant(false),
+        // The BGA setting, answered as off: no BGA is drawn (D33).
+        crate::import::ops::BGA_OFF => Constant(true),
+        crate::import::ops::BGA_ON => Constant(false),
         // Offline: no IR.
         50 => Constant(true),
         51 => Constant(false),

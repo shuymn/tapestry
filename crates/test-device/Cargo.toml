@@ -1,0 +1,20 @@
+[package]
+name = "test-device"
+version = "0.0.0"
+description = "The test input device's protocol, report layouts, trace, timing checks and UF2 writer, shared by its firmware and the host (dev tooling, never shipped)."
+edition.workspace = true
+license = "MIT OR Apache-2.0"
+repository.workspace = true
+publish.workspace = true
+
+[features]
+default = ["std"]
+# The host's half: the clock bounds, the matching behind `compare` and the
+# report descriptor parser. The firmware builds without it.
+std = []
+# The firmware's `debug-faults` build: the device logic consults the debug
+# faults (docs/test-device.md "Debug Faults"); without it it never does.
+debug-faults = []
+
+[lints]
+workspace = true

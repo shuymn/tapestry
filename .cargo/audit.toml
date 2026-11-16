@@ -12,4 +12,16 @@ ignore = [
     # the Windows font file under fontdb. Remove when a cosmic-text release
     # under glyphon drops ttf-parser 0.25.
     "RUSTSEC-2026-0192",
+    # `bare-metal` 0.2 deprecated (no advisory against its code), through
+    # cortex-m 0.7 in the test device firmware. Remove when the firmware's
+    # cortex-m drops bare-metal.
+    "RUSTSEC-2026-0110",
+    # `paste` unmaintained (no advisory against its code), a build-time proc
+    # macro under embassy-rp's pio 0.3 in the test device firmware. Remove
+    # when the firmware's pio crates drop paste.
+    "RUSTSEC-2024-0436",
+    # `proc-macro-error2` unmaintained (no advisory against its code), build
+    # time under pio-proc (embassy-rp's pio 0.3) in the test device firmware.
+    # Remove when the firmware's pio-proc drops proc-macro-error2.
+    "RUSTSEC-2026-0173",
 ]

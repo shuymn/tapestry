@@ -22,6 +22,12 @@
 //! roots = ["library"]            # relative to this file
 //! rescan_ms = 50                 # optional
 //!
+//! [transitions]                  # optional
+//! capture = true                 # the first presented frame after each
+//! # transition and presentation change: transitions/<NN>-<change>.png
+//! # under the output, with its JSON; at most 64, the change past them
+//! # failing the run
+//!
 //! [[step]]
 //! capture = { at = 3000, file = "a.png" }   # chart ms, the next play's
 //! # or { ready_at = 500, file = … }: ms since its first candidate's READY
@@ -91,6 +97,23 @@
 //! dev: runtime note result lifetime 2: callback error at "parts.lua":4:11
 //! dev: runtime notes selection generation 1: 4096 kept, incomplete (5 occurrences past the cap of 4096), stopped budget
 //! ```
+//!
+//! The run's transition record ([`super::transitions`]) is kept in a book
+//! allocated before the run and printed once the render thread has ended:
+//! a span line per run of frames of one state and lifetime, a transition
+//! line at each change of either, a presentation line when only what drew
+//! the screen changed, the marks (the pending presentation's hold, the
+//! result's preparation, a capture's read-back), and a summary. Records
+//! lost past the book's cap fail the run. A run that read a frame back
+//! (any capture, a transition capture included) ends every line
+//! `, instrumented`: the read-back stalled the render thread it times.
+//!
+//! ```text
+//! dev: span loading 1: frames 31, not presented 0, first 2618626 us, last 3848330 us, longest gap 60000 us (2618626 to 2678626, uncovered 60000 us, 2618626 to 2678626), largest uncovered gap 60000 us of 60000 us (2618626 to 2678626, 2618626 to 2678626)
+//! dev: transition loading -> ready: 39972 us, last 3848330 us, first 3888302 us, covered 0 us, uncovered 39972 us (3848330 to 3888302)
+//! dev: mark preparing 8574600 to 13400100 us
+//! dev: transitions: 27 records, lost 0, marks dropped 0, largest uncovered 62548 us (35479870 to 35542418) in transition tail -> practice
+//! ```
 
 use std::collections::HashMap;
 use std::fmt;
@@ -103,12 +126,13 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use anyhow::Context as _;
-use bms_model::{Speed, TimeUs};
+use bms_model::{Speed, TimeSource as _, TimeUs};
 use game::Command;
 use input::{QpcClock, ScriptedInput};
 use rules::GaugeValue;
 use serde::Deserialize;
 
+use super::transitions::{Edge, MAX_RECORDS, Mark, MarkKind, Recorder, Transitions};
 use super::{SelectScript, SelectStep};
 use crate::args::UsageError;
 use crate::input_side::Recorded;
@@ -368,8 +392,18 @@ struct File {
     size: Option<[i64; 2]>,
     adapter: Option<Adapter>,
     library: Library,
+    transitions: Option<TransitionsSpec>,
     #[serde(default)]
     step: Vec<Step>,
+}
+
+/// `[transitions]`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TransitionsSpec {
+    /// Whether each change's first presented frame is captured.
+    #[serde(default)]
+    capture: bool,
 }
 
 #[derive(Deserialize)]
@@ -563,6 +597,11 @@ pub struct Session {
     pub logs: Vec<ScriptedInput>,
     /// The captures, by [`SelectStep::Capture`].
     pub captures: Captures,
+    /// The run's transition record, allocated now and read once the render
+    /// thread has ended.
+    pub transitions: Transitions,
+    /// The run's transition captures, when the file asks for them.
+    pub shots: Option<TransitionShots>,
     /// The offscreen target's size, when the file gives one.
     pub size: Option<(u32, u32)>,
     /// What draws the run's screen.
@@ -714,9 +753,21 @@ fn parse(text: &str, base: &Path) -> Result<Scenario, String> {
     let adapter = file.adapter.unwrap_or(Adapter::Warp);
     let roots = roots(&file.library.roots, base)?;
     let compiled = compile(&file, base, &roots)?;
+    let capture_changes = file.transitions.as_ref().is_some_and(|t| t.capture);
+    if capture_changes && file.output.is_none() {
+        return Err("output is required for transition captures".to_owned());
+    }
     let output = match &file.output {
         Some(o) => Some(make_output(base, o, &compiled.captures)?),
         None => None,
+    };
+    let shots = match output.as_deref() {
+        Some(o) if capture_changes => {
+            let dir = o.join(TRANSITIONS_FOLDER);
+            fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+            Some(TransitionShots::new(dir, MAX_TRANSITION_CAPTURES))
+        }
+        _ => None,
     };
     let captures = compiled
         .captures
@@ -740,6 +791,8 @@ fn parse(text: &str, base: &Path) -> Result<Scenario, String> {
             roots: roots.into_iter().map(|(path, _)| path).collect(),
             logs: compiled.logs,
             captures: Captures(Arc::new(Mutex::new(captures))),
+            transitions: Transitions::with_capacity(transition_cap()),
+            shots,
             size,
             adapter,
         },
@@ -1446,6 +1499,9 @@ pub enum Axis {
     /// drawn by its skin or the built-in presentation, at or after this
     /// time since the choice; failed when the screen is left first.
     Decision(TimeUs),
+    /// The first presented frame after a transition or a presentation
+    /// change (`[transitions] capture = true`): no step's.
+    Transition,
 }
 
 impl Axis {
@@ -1459,6 +1515,7 @@ impl Axis {
             Self::Select(_) => "select",
             Self::Result(_) => "result",
             Self::Decision(_) => "decision",
+            Self::Transition => "transition",
         }
     }
 
@@ -1471,7 +1528,7 @@ impl Axis {
             | Self::Select(t)
             | Self::Result(t)
             | Self::Decision(t) => t.0,
-            Self::Loading => 0,
+            Self::Loading | Self::Transition => 0,
         }
     }
 
@@ -1827,6 +1884,110 @@ impl Captures {
     }
 }
 
+/// The output's folder of the transition captures.
+const TRANSITIONS_FOLDER: &str = "transitions";
+
+/// The transition captures a run takes at most (design.md "Shortening
+/// Launch-Based Checks", transition record): a resource cap, not a timing
+/// limit. The change past it fails the run before it is read back.
+pub const MAX_TRANSITION_CAPTURES: usize = 64;
+
+/// A run's transition captures (`[transitions] capture = true`): the first
+/// presented frame after each transition and presentation change, written
+/// by the capture writer under the output's transitions folder. Shared by
+/// the render thread's sink, which takes them, the writer, which puts
+/// their outcomes, and the main thread, which reads how they ended once the
+/// render thread has ended.
+#[derive(Clone, Debug)]
+pub struct TransitionShots(Arc<Mutex<Shots>>);
+
+/// The transition captures' count and outcomes.
+#[derive(Debug)]
+struct Shots {
+    /// Their folder.
+    dir: PathBuf,
+    /// The captures the run may take.
+    cap: usize,
+    /// Those taken so far.
+    taken: usize,
+    /// Those taken and not yet written or failed.
+    pending: usize,
+    /// The changes past the cap, never read back.
+    past_cap: u64,
+    /// Each failed one, with why.
+    failed: Vec<String>,
+}
+
+impl TransitionShots {
+    /// Captures into `dir`, at most `cap`.
+    #[must_use]
+    pub fn new(dir: PathBuf, cap: usize) -> Self {
+        Self(Arc::new(Mutex::new(Shots {
+            dir,
+            cap,
+            taken: 0,
+            pending: 0,
+            past_cap: 0,
+            failed: Vec::new(),
+        })))
+    }
+
+    fn lock(&self) -> MutexGuard<'_, Shots> {
+        self.0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// The file of the next capture, of the change named `name`; `None`
+    /// past the cap, which fails the run.
+    fn next(&self, name: &str) -> Option<PathBuf> {
+        let mut s = self.lock();
+        if s.taken >= s.cap {
+            s.past_cap = s.past_cap.saturating_add(1);
+            return None;
+        }
+        s.taken += 1;
+        s.pending += 1;
+        let file = format!("{:02}-{name}.png", s.taken);
+        Some(s.dir.join(file))
+    }
+
+    /// The capture of `path` ended as `outcome` says.
+    fn ended(&self, path: &Path, outcome: Result<(), String>) {
+        let mut s = self.lock();
+        s.pending = s.pending.saturating_sub(1);
+        if let Err(why) = outcome {
+            s.failed
+                .push(format!("transition capture {}: {why}", path.display()));
+        }
+    }
+
+    /// After the render thread has ended: each capture that failed or did
+    /// not end, and the changes past the cap. Captures the render thread
+    /// still holds (it is stuck) are all unknown.
+    #[must_use]
+    pub fn unfinished(&self) -> Vec<String> {
+        let s = match self.0.try_lock() {
+            Ok(s) => s,
+            Err(TryLockError::Poisoned(p)) => p.into_inner(),
+            Err(TryLockError::WouldBlock) => {
+                return vec!["the transition captures are held by the render thread".to_owned()];
+            }
+        };
+        let mut out = s.failed.clone();
+        if s.pending > 0 {
+            out.push(format!("{} transition captures did not end", s.pending));
+        }
+        if s.past_cap > 0 {
+            out.push(format!(
+                "changes not captured past the cap of {} transition captures: {}",
+                s.cap, s.past_cap
+            ));
+        }
+        out
+    }
+}
+
 /// Writes `bytes` to a new file at `path`: an existing file, folder or
 /// link there fails it, and nothing is ever replaced.
 ///
@@ -1869,6 +2030,15 @@ pub struct ScenarioFrames {
     /// The newest result seen, by its number, and when its first frame
     /// was presented: its captures' origin.
     result_origin: Option<(u64, TimeUs)>,
+    /// The run's transition record.
+    recorder: Recorder,
+    /// The clock of the presents, which times the read-backs.
+    clock: QpcClock,
+    /// The run's transition captures, when the file asks for them.
+    shots: Option<TransitionShots>,
+    /// The state whose frames' captures alone stall ([`STALL_STATE_ENV`]);
+    /// every capture's when none.
+    stall_state: Option<String>,
 }
 
 /// The captured frames that may wait for or be in the writer at once.
@@ -1886,28 +2056,58 @@ struct Backlog {
     bytes: usize,
 }
 
+/// Where a captured frame's outcome goes.
+#[derive(Clone, Copy, Debug)]
+enum Destination {
+    /// A step's capture: its index in the list and the generation it is
+    /// saved under.
+    Step(usize, u64),
+    /// A transition capture.
+    Transition,
+}
+
 /// A captured frame for the writer: its pixels, display list, and each
-/// capture due on it (its index in the list, file, sidecar, generation).
+/// capture due on it (where its outcome goes, its file and sidecar).
 struct Job {
     pixels: Option<(u32, u32, Vec<u8>)>,
     list: Option<Result<String, String>>,
-    due: Vec<(usize, PathBuf, String, u64)>,
+    due: Vec<(Destination, PathBuf, String)>,
+    /// The captures due whose outcome the writer has put.
+    done: usize,
     /// Its reservation in the backlog, released when the job is dropped:
     /// written, discarded by a writer that ended, or never sent.
     bytes: usize,
     backlog: Arc<(Mutex<Backlog>, Condvar)>,
     captures: Captures,
+    shots: Option<TransitionShots>,
 }
 
 impl Job {
-    /// Each of its captures still saving fails, saying `why`.
+    /// Each of its captures whose outcome is not put fails, saying `why`.
     fn fail(&self, why: &str) {
-        let mut list = self.captures.lock();
-        for (i, path, _, generation) in &self.due {
-            if let Some(c) = list.get_mut(*i)
-                && c.state == CaptureState::Saving(*generation)
-            {
-                c.state = CaptureState::Failed(format!("{}: {why}", path.display()));
+        for (target, path, _) in self.due.iter().skip(self.done) {
+            self.put(*target, path, Err(why.to_owned()));
+        }
+    }
+
+    /// Puts the outcome of the capture of `path` where it goes: a step's
+    /// capture still saving takes it.
+    fn put(&self, target: Destination, path: &Path, outcome: Result<(), String>) {
+        match target {
+            Destination::Step(i, generation) => {
+                if let Some(c) = self.captures.lock().get_mut(i)
+                    && c.state == CaptureState::Saving(generation)
+                {
+                    c.state = match outcome {
+                        Ok(()) => CaptureState::Succeeded,
+                        Err(why) => CaptureState::Failed(format!("{}: {why}", path.display())),
+                    };
+                }
+            }
+            Destination::Transition => {
+                if let Some(s) = &self.shots {
+                    s.ended(path, outcome);
+                }
             }
         }
     }
@@ -1935,9 +2135,27 @@ struct Writer {
     thread: JoinHandle<()>,
 }
 
+/// The environment variable that lowers the transition record's cap, for
+/// tests of its overflow failing the run.
+pub const TRANSITION_CAP_ENV: &str = "TAPESTRY_DEV_TRANSITION_CAP";
+
+/// The transition record's cap: [`MAX_RECORDS`], or lower as
+/// [`TRANSITION_CAP_ENV`] says.
+fn transition_cap() -> usize {
+    std::env::var(TRANSITION_CAP_ENV)
+        .ok()
+        .and_then(|n| n.parse().ok())
+        .unwrap_or(MAX_RECORDS)
+}
+
 /// The environment variable that stalls each capture's read-back by its
 /// value in milliseconds, for tests of a stuck render thread.
 pub const STALL_ENV: &str = "TAPESTRY_DEV_CAPTURE_STALL_MS";
+
+/// The environment variable that limits [`STALL_ENV`]'s stall to the
+/// captures of frames of the state it names (`ready`, `loading`, …), for
+/// tests that place the stall.
+pub const STALL_STATE_ENV: &str = "TAPESTRY_DEV_CAPTURE_STALL_STATE";
 
 impl Captures {
     /// Capture `i` waits on `axis` (tests).
@@ -1977,19 +2195,52 @@ impl ScenarioFrames {
     /// The sink of `captures` (tests).
     #[cfg(test)]
     pub fn new(captures: Captures) -> Self {
-        Self::stalled(captures, None)
+        Self::recording(captures, Transitions::default())
     }
 
-    /// The sink of `captures`, stalled as [`STALL_ENV`] says.
-    pub fn from_env(captures: Captures) -> Self {
+    /// The sink of `captures`, recording into `transitions` and taking
+    /// `shots` (tests).
+    #[cfg(test)]
+    pub fn with_shots(
+        captures: Captures,
+        transitions: Transitions,
+        shots: TransitionShots,
+    ) -> Self {
+        let clock = QpcClock::start();
+        Self::stalled(captures, transitions, clock, None, Some(shots))
+    }
+
+    /// The sink of `captures`, recording into `transitions` (tests).
+    #[cfg(test)]
+    pub fn recording(captures: Captures, transitions: Transitions) -> Self {
+        let clock = QpcClock::start();
+        Self::stalled(captures, transitions, clock, None, None)
+    }
+
+    /// The sink of `captures`, recording into `transitions` on `clock` and
+    /// taking `shots`, stalled as [`STALL_ENV`] says.
+    pub fn from_env(
+        captures: Captures,
+        transitions: Transitions,
+        shots: Option<TransitionShots>,
+        clock: QpcClock,
+    ) -> Self {
         let stall = std::env::var(STALL_ENV)
             .ok()
             .and_then(|ms| ms.parse().ok())
             .map(Duration::from_millis);
-        Self::stalled(captures, stall)
+        let mut sink = Self::stalled(captures, transitions, clock, stall, shots);
+        sink.stall_state = std::env::var(STALL_STATE_ENV).ok();
+        sink
     }
 
-    fn stalled(captures: Captures, stall: Option<Duration>) -> Self {
+    fn stalled(
+        captures: Captures,
+        transitions: Transitions,
+        clock: QpcClock,
+        stall: Option<Duration>,
+        shots: Option<TransitionShots>,
+    ) -> Self {
         Self {
             captures,
             stall,
@@ -1998,6 +2249,10 @@ impl ScenarioFrames {
             backlog: Arc::default(),
             write_bytes: WRITE_BYTES,
             result_origin: None,
+            recorder: Recorder::new(transitions),
+            clock,
+            shots,
+            stall_state: None,
         }
     }
 
@@ -2058,6 +2313,8 @@ impl Drop for ScenarioFrames {
     /// the file system holds it, and with it this thread: the render
     /// link's bounds leave both to the process's exit.
     fn drop(&mut self) {
+        // The render thread's end: the open span is recorded.
+        self.recorder.close();
         if let Some(Writer { jobs, thread }) = self.writer.take() {
             drop(jobs);
             let _ = thread.join();
@@ -2078,7 +2335,7 @@ fn write_frame(job: &mut Job) {
     let _held = HOLD_WRITES.read();
     // Tests: a capture named so makes its writer panic.
     #[cfg(test)]
-    if job.due.iter().any(|(_, p, ..)| p.ends_with("panic.png")) {
+    if job.due.iter().any(|(_, p, _)| p.ends_with("panic.png")) {
         panic!("the capture writer fails (a test)");
     }
     // Encoded once, for every capture due.
@@ -2086,7 +2343,7 @@ fn write_frame(job: &mut Job) {
         .pixels
         .take()
         .map(|(w, h, pixels)| super::png(w, h, &pixels));
-    for (i, path, side, generation) in &job.due {
+    for (k, (target, path, side)) in job.due.iter().enumerate() {
         let outcome = match &image {
             None => Err("nothing to read back".to_owned()),
             Some(png) => write_new(path, png)
@@ -2099,14 +2356,8 @@ fn write_frame(job: &mut Job) {
                         .map_err(|e| e.to_string()),
                 }),
         };
-        if let Some(c) = job.captures.lock().get_mut(*i)
-            && c.state == CaptureState::Saving(*generation)
-        {
-            c.state = match outcome {
-                Ok(()) => CaptureState::Succeeded,
-                Err(why) => CaptureState::Failed(format!("{}: {why}", path.display())),
-            };
-        }
+        job.put(*target, path, outcome);
+        job.done = k + 1;
     }
 }
 
@@ -2115,11 +2366,32 @@ impl FrameSink for ScenarioFrames {
         self.captures.leave_decision(record.lifetime);
     }
 
+    fn play_ended(&mut self, at: TimeUs) {
+        self.recorder.play_ended(at);
+    }
+
+    fn result_taken(&mut self, at: TimeUs) {
+        self.recorder.result_taken(at);
+    }
+
+    fn hold_lost(&mut self, hold: crate::measure::HoldStamp) {
+        self.recorder.hold(hold);
+    }
+
     fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>) {
         if !drawn.timing.presented {
+            self.recorder.unpresented();
             return;
         }
+        let change = self
+            .recorder
+            .frame(drawn.stage, drawn.presented_at, drawn.hold);
         self.frame = self.frame.wrapping_add(1);
+        // The first presented frame after a change: this frame, read back
+        // now. Past the cap, the change is counted and not read back.
+        let shot = change
+            .zip(self.shots.as_ref())
+            .and_then(|(e, s)| s.next(&change_name(&e)).map(|path| (path, e)));
         // A result's origin: its first presented frame, whatever drew it.
         if drawn.screen.is_result()
             && let Some(id) = drawn.result.and_then(|r| r.id)
@@ -2144,10 +2416,18 @@ impl FrameSink for ScenarioFrames {
                 })
                 .collect()
         };
-        if due.is_empty() {
+        if due.is_empty() && shot.is_none() {
             return;
         }
-        if let Some(stall) = self.stall {
+        // The sink's own work on the render thread, marked in the record:
+        // the stall a test asks for, the read-back and the display list.
+        let r0 = self.clock.now();
+        if let Some(stall) = self.stall
+            && self
+                .stall_state
+                .as_deref()
+                .is_none_or(|s| s == drawn.stage.state.name())
+        {
             std::thread::sleep(stall);
         }
         // Read back once, for every capture due, and what the frame was.
@@ -2158,6 +2438,11 @@ impl FrameSink for ScenarioFrames {
             .play
             .and_then(|_| screen.display_list())
             .map(|l| display_list_lines(&l, drawn));
+        self.recorder.mark(Mark {
+            kind: MarkKind::ReadBack,
+            from: r0,
+            to: self.clock.now(),
+        });
         let bytes = pixels.as_ref().map_or(0, |p| p.2.len())
             + list
                 .as_ref()
@@ -2171,22 +2456,37 @@ impl FrameSink for ScenarioFrames {
                     c.state = CaptureState::Failed(format!("{}: {why}", path.display()));
                 }
             }
+            if let (Some((path, _)), Some(s)) = (&shot, &self.shots) {
+                s.ended(path, Err(why));
+            }
             return;
         }
-        let due = due
+        let mut due: Vec<(Destination, PathBuf, String)> = due
             .into_iter()
             .map(|(i, path, axis, generation, stamp)| {
                 let side = sidecar(axis, self.frame, drawn, stamp, screen.adapter());
-                (i, path, side, generation)
+                (Destination::Step(i, generation), path, side)
             })
             .collect();
+        if let Some((path, change)) = shot {
+            let side = sidecar(
+                Axis::Transition,
+                self.frame,
+                drawn,
+                Stamp::Transition(change),
+                screen.adapter(),
+            );
+            due.push((Destination::Transition, path, side));
+        }
         self.send(Job {
             pixels,
             list,
             due,
+            done: 0,
             bytes,
             backlog: Arc::clone(&self.backlog),
             captures: self.captures.clone(),
+            shots: self.shots.clone(),
         });
     }
 
@@ -2227,6 +2527,23 @@ enum Stamp {
     },
     /// Its decision screen's choice.
     Decision { origin: TimeUs },
+    /// The change whose first presented frame it is.
+    Transition(Edge),
+}
+
+/// A change's name in its capture's file: a transition's states, or a
+/// presentation change's state and what drew it before and after.
+fn change_name(e: &Edge) -> String {
+    if e.presentation {
+        format!(
+            "{}-{}-{}",
+            e.to.state.name(),
+            e.from.drew.name(),
+            e.to.drew.name()
+        )
+    } else {
+        format!("{}-{}", e.from.state.name(), e.to.state.name())
+    }
 }
 
 /// What `drawn` means for capture `c`, if anything: a selection capture's
@@ -2325,6 +2642,8 @@ fn capture_due(
             return (drawn.presented_at.0 - origin.0 >= since.0)
                 .then_some(Due::Save(SCREEN_SAVE, Stamp::Decision { origin }));
         }
+        // Taken by the sink at its change, never from the list.
+        Axis::Transition => return None,
         Axis::Chart(_) | Axis::Ready(_) | Axis::Closing(_) => {}
     }
     let (Some(generation), Some(t)) = (drawn.generation, drawn.play) else {
@@ -2354,7 +2673,8 @@ fn capture_due(
         | Axis::LoadingAt(_)
         | Axis::Select(_)
         | Axis::Result(_)
-        | Axis::Decision(_) => None,
+        | Axis::Decision(_)
+        | Axis::Transition => None,
     }
 }
 
@@ -2396,6 +2716,27 @@ fn sidecar(
             |(_, drew)| format!("\"{}\"", drew.name())
         ),
     );
+    // A transition capture's change: a transition's states, a presentation
+    // change's presentations; read back, so instrumented.
+    let transition = match stamp {
+        Stamp::Transition(e) => {
+            let (kind, from, to) = if e.presentation {
+                ("presentation", e.from.drew.name(), e.to.drew.name())
+            } else {
+                ("transition", e.from.state.name(), e.to.state.name())
+            };
+            format!(
+                ",\"transition\":\"{kind}\",\"from\":\"{from}\",\"to\":\"{to}\",\"state\":\"{}\",\
+                 \"lifetime\":{},\"drew\":\"{}\",\"last_us\":{},\"first_us\":{},\"instrumented\":true",
+                e.to.state.name(),
+                num(Some(e.to.lifetime)),
+                e.to.drew.name(),
+                e.gap.from.0,
+                e.gap.to.0,
+            )
+        }
+        _ => String::new(),
+    };
     let result = drawn.result;
     let id = result.and_then(|r| r.id);
     let screen = format!(
@@ -2427,7 +2768,7 @@ fn sidecar(
         "{{\"axis\":\"{}\",\"target_us\":{},\"frame\":{frame},\"phase\":\"{}\",\
          \"chart_us\":{},\"ready_us\":{},\"ready_origin_us\":{},\"play_at_us\":{},\
          \"closing_us\":{},\"closing_start_us\":{},\"loading_us\":{},\"loading_origin_us\":{},\"settled\":{},\"screen_us\":{},\"completed_us\":{},\
-         \"generation\":{},\"view_generation\":{},\"finalized_us\":{},\"events\":{},{screen},{decision}}}\n",
+         \"generation\":{},\"view_generation\":{},\"finalized_us\":{},\"events\":{},{screen},{decision}{transition}}}\n",
         axis.name(),
         axis.target(),
         phase(drawn),
@@ -2600,13 +2941,7 @@ fn phase(drawn: &Drawn<'_>) -> &'static str {
             _ => "other",
         };
     };
-    let before_play = v.ready.is_some_and(|(_, start)| t < start);
-    match (v.closing.is_some(), v.complete, v.playing, before_play) {
-        (true, ..) => "closing",
-        (false, _, true, false) => "play",
-        (false, true, ..) | (false, false, false, false) => "tail",
-        (false, false, _, true) => "ready",
-    }
+    crate::measure::play_phase(t, &v).name()
 }
 
 /// The rig's part of a scenario run (dev-tools).
@@ -2616,6 +2951,10 @@ pub struct State {
     pub logs: Vec<ScriptedInput>,
     /// The captures.
     pub captures: Captures,
+    /// The transition record.
+    pub transitions: Transitions,
+    /// The transition captures, when the file asks for them.
+    pub shots: Option<TransitionShots>,
     /// What a play of a log records: the key configs'.
     pub recorded: Recorded,
     /// The loaded chart's input.
@@ -2690,8 +3029,10 @@ fn select_args(
 /// The outcome of a scenario run, from the first failure on: the script's
 /// (which names its step), the run's error (named by the step it came
 /// in), a render thread that did not end cleanly, a capture that did not
-/// end, and the steps that never ran. The first is the error; the others
-/// are printed after it.
+/// end, transition records lost past their cap (or a record the render
+/// thread still holds), transition captures that failed, did not end or
+/// came past their cap, and the steps that never ran. The first is the
+/// error; the others are printed after it.
 ///
 /// # Errors
 ///
@@ -2702,6 +3043,8 @@ pub fn conclude<E: std::error::Error + 'static>(
     pending: Option<Origin>,
     end: RenderEnd,
     captures: &Captures,
+    record: Result<Option<String>, String>,
+    shots: Option<&TransitionShots>,
 ) -> anyhow::Result<()> {
     let mut failures: Vec<String> = Vec::new();
     if let Some(why) = script.and_then(SelectScript::failure) {
@@ -2720,6 +3063,13 @@ pub fn conclude<E: std::error::Error + 'static>(
         failures.push("the render thread did not end cleanly".to_owned());
     }
     failures.extend(captures.unfinished());
+    // The transition record: records lost past its cap, or a book the render
+    // thread still holds.
+    match record {
+        Ok(lost) => failures.extend(lost),
+        Err(held) => failures.push(held),
+    }
+    failures.extend(shots.map(TransitionShots::unfinished).unwrap_or_default());
     if let Some(script) = script {
         failures.extend(
             script
@@ -4493,10 +4843,26 @@ pub(crate) mod tests {
         let settled = c.settle(1, false).unwrap();
         assert!(begun.elapsed() < Duration::from_secs(1));
         assert_eq!(settled.failed[0].1, "the render thread did not answer");
-        let e = super::conclude::<std::io::Error>(Ok(()), None, None, RenderEnd::Joined, &c);
+        let e = super::conclude::<std::io::Error>(
+            Ok(()),
+            None,
+            None,
+            RenderEnd::Joined,
+            &c,
+            Ok(None),
+            None,
+        );
         assert!(e.is_ok(), "a reported failure is the script's to report");
-        let e = super::conclude::<std::io::Error>(Ok(()), None, None, RenderEnd::Stuck, &c)
-            .unwrap_err();
+        let e = super::conclude::<std::io::Error>(
+            Ok(()),
+            None,
+            None,
+            RenderEnd::Stuck,
+            &c,
+            Ok(None),
+            None,
+        )
+        .unwrap_err();
         assert!(e.to_string().contains("did not end cleanly"), "{e}");
         release.send(()).unwrap();
         render.join().unwrap();
@@ -4557,6 +4923,8 @@ pub(crate) mod tests {
             decision: None,
             presented_at: TimeUs(0),
             skin_loading: None,
+            stage: crate::measure::Stage::plain(crate::measure::State::Play),
+            hold: None,
             generation: Some(generation),
             timing: render::FrameTiming {
                 cpu: std::time::Duration::ZERO,
@@ -5011,14 +5379,15 @@ pub(crate) mod tests {
             pixels: Some((1, 1, vec![0; 4])),
             list: None,
             due: vec![(
-                0,
+                super::Destination::Step(0, super::SCREEN_SAVE),
                 dir.path().join("0.png"),
                 "{}\n".to_owned(),
-                super::SCREEN_SAVE,
             )],
+            done: 0,
             bytes: 0,
             backlog,
             captures: c.clone(),
+            shots: None,
         };
         super::write_frame(&mut job);
         drop(job);
@@ -5246,5 +5615,587 @@ pub(crate) mod tests {
             assert_eq!(crate::sound_sets_disk::link_count(&path), Some(1), "{name}");
             assert!(fs::read(&path).unwrap().starts_with(PNG), "{name}");
         }
+    }
+
+    /// A frame of `stage` presented at `presented_us`, its `at` offset by
+    /// an amount that varies with `i`, so a record read from `at` differs.
+    fn staged(
+        stage: crate::measure::Stage,
+        presented_us: i64,
+        i: i64,
+    ) -> crate::measure::Drawn<'static> {
+        let mut d = screen_drawn(crate::measure::ScreenKind::Play, 0);
+        d.stage = stage;
+        d.presented_at = TimeUs(presented_us);
+        d.at = TimeUs(presented_us + 37 + 111 * i);
+        d
+    }
+
+    fn play_stage(state: crate::measure::State) -> crate::measure::Stage {
+        crate::measure::Stage {
+            state,
+            lifetime: 41,
+            drew: crate::measure::Drew::Plain,
+        }
+    }
+
+    fn records_of(
+        t: &super::Transitions,
+    ) -> (
+        Vec<crate::dev::transitions::Span>,
+        Vec<crate::dev::transitions::Edge>,
+        Vec<crate::dev::transitions::Mark>,
+    ) {
+        use crate::dev::transitions::Record;
+        let (mut spans, mut edges, mut marks) = (Vec::new(), Vec::new(), Vec::new());
+        for r in t.records() {
+            match r {
+                Record::Span(s) => spans.push(s),
+                Record::Edge(e) => edges.push(e),
+                Record::Mark(m) => marks.push(m),
+            }
+        }
+        (spans, edges, marks)
+    }
+
+    /// Through the sink: a span keeps its raw longest gap between presents,
+    /// on the present clock, with the frame not presented inside it counted
+    /// and covering nothing; READY's end is its own transition into the
+    /// play.
+    #[test]
+    fn spans_keep_the_raw_gaps_on_the_present_clock() {
+        use super::FrameSink as _;
+        use crate::measure::State;
+        let book = super::Transitions::with_capacity(32);
+        let mut sink = super::ScenarioFrames::recording(Captures::of(Vec::new()), book.clone());
+        let (_, screen) = released(&Captures::of(Vec::new()));
+        let ready = play_stage(State::Ready);
+        let frames = [
+            (ready, 1_000_300, true),
+            (ready, 1_016_700, true),
+            (ready, 2_000_000, false),
+            (ready, 3_533_100, true),
+            (ready, 3_549_900, true),
+            (play_stage(State::Play), 3_566_500, true),
+            (play_stage(State::Play), 3_583_000, true),
+        ];
+        for (i, &(stage, us, presented)) in frames.iter().enumerate() {
+            let mut d = staged(stage, us, i64::try_from(i).unwrap());
+            d.timing.presented = presented;
+            sink.frame(&screen, &d);
+        }
+        drop_bounded(sink);
+        let (spans, edges, _) = records_of(&book);
+        let ready = spans
+            .iter()
+            .find(|s| s.stage.state == State::Ready)
+            .unwrap();
+        assert_eq!((ready.frames, ready.unpresented), (4, 1));
+        let g = ready.longest.unwrap();
+        assert_eq!(
+            (g.len(), g.from, g.to),
+            (2_516_400, TimeUs(1_016_700), TimeUs(3_533_100))
+        );
+        assert_eq!((g.cover.uncovered, g.unpresented), (2_516_400, 1));
+        assert_eq!(ready.uncovered, Some(g));
+        let [e] = edges[..] else {
+            panic!("one transition: {edges:?}");
+        };
+        assert_eq!(
+            (e.from.state, e.to.state, e.gap.len(), e.gap.from, e.gap.to),
+            (
+                State::Ready,
+                State::Play,
+                16_600,
+                TimeUs(3_549_900),
+                TimeUs(3_566_500)
+            )
+        );
+    }
+
+    /// Through the sink, on the real clock: a capture's read-back, stalled
+    /// 400 ms, is marked and covers only its part of the next gap; the
+    /// result's preparation, from the play's end to its presentation taken,
+    /// covers only its part of the interval into the result.
+    #[test]
+    fn marks_reach_the_record_through_the_sink() {
+        use super::FrameSink as _;
+        use crate::dev::transitions::MarkKind;
+        use crate::measure::State;
+        use bms_model::TimeSource as _;
+        let dir = tempfile::tempdir().unwrap();
+        let c = Captures::of(vec![(TimeUs(0), dir.path().join("a.png"))]);
+        c.arm(0);
+        c.bind(1);
+        let clock = input::QpcClock::start();
+        let book = super::Transitions::with_capacity(32);
+        let mut sink = super::ScenarioFrames::stalled(
+            c.clone(),
+            book.clone(),
+            clock,
+            Some(std::time::Duration::from_millis(400)),
+            None,
+        );
+        let (_, screen) = released(&c);
+        let mut first = drawn(1, 0);
+        first.stage = play_stage(State::Play);
+        first.presented_at = clock.now();
+        sink.frame(&screen, &first);
+        let mut second = drawn(1, 16);
+        second.stage = play_stage(State::Play);
+        second.presented_at = clock.now();
+        sink.frame(&screen, &second);
+        let b = second.presented_at.0;
+        sink.play_ended(TimeUs(b + 100_000));
+        sink.result_taken(TimeUs(b + 800_000));
+        let mut result = screen_drawn(crate::measure::ScreenKind::Result, 0);
+        result.stage = crate::measure::Stage {
+            state: State::Result,
+            lifetime: 3,
+            drew: crate::measure::Drew::Skin,
+        };
+        result.presented_at = TimeUs(b + 816_000);
+        sink.frame(&screen, &result);
+        drop_bounded(sink);
+        let (spans, edges, marks) = records_of(&book);
+        let read_back = marks.iter().find(|m| m.kind == MarkKind::ReadBack).unwrap();
+        let held = read_back.to.0 - read_back.from.0;
+        assert!(held >= 400_000, "{read_back:?}");
+        let g = spans[0].longest.unwrap();
+        let clipped = read_back.to.0.min(g.to.0) - read_back.from.0.max(g.from.0);
+        assert_eq!(g.cover.covered, clipped, "{g:?} {read_back:?}");
+        assert_eq!(g.cover.uncovered, g.len() - clipped, "{g:?}");
+        let preparing = marks
+            .iter()
+            .find(|m| m.kind == MarkKind::Preparing)
+            .unwrap();
+        assert_eq!(
+            (preparing.from.0, preparing.to.0),
+            (b + 100_000, b + 800_000)
+        );
+        let into_result = edges.iter().find(|e| e.to.state == State::Result).unwrap();
+        assert_eq!(
+            (
+                into_result.gap.cover.covered,
+                into_result.gap.cover.uncovered
+            ),
+            (700_000, 116_000)
+        );
+        assert_eq!(
+            into_result.gap.cover.piece,
+            Some((TimeUs(b), TimeUs(b + 100_000)))
+        );
+    }
+
+    /// `[transitions] capture = true` makes the transition captures'
+    /// folder under the output, which it needs; `capture = false` takes
+    /// none, and a key the table does not know is refused.
+    #[test]
+    fn transition_settings_are_checked_when_loaded() {
+        let dir = folder();
+        let steps = [
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ];
+        let with = |table: &str, output: Option<&str>| {
+            file(output, &steps).replace("[library]", &format!("[transitions]\n{table}\n[library]"))
+        };
+        let s = parse(&with("capture = true", Some("out")), dir.path()).unwrap();
+        assert!(s.session.shots.is_some());
+        assert!(dir.path().join("out").join("transitions").is_dir());
+        let s = parse(&with("capture = false", Some("out2")), dir.path()).unwrap();
+        assert!(s.session.shots.is_none());
+        assert!(!dir.path().join("out2").join("transitions").exists());
+        let e = parse(&with("capture = true\nevery = 2", Some("out3")), dir.path()).err();
+        assert!(
+            e.as_deref()
+                .is_some_and(|e| e.contains("unknown field `every`")),
+            "{e:?}"
+        );
+        let e = parse(&with("capture = true", None), dir.path()).err();
+        assert_eq!(
+            e.as_deref(),
+            Some("output is required for transition captures")
+        );
+    }
+
+    /// Through the sink: each change's first presented frame is read back
+    /// and written with its change in its JSON, up to the cap; the change
+    /// past it is counted, never read back, and fails the run.
+    #[test]
+    fn transition_captures_past_the_cap_fail_the_run() {
+        use super::FrameSink as _;
+        use crate::dev::transitions::{MarkKind, Record};
+        use crate::measure::State;
+        let dir = tempfile::tempdir().unwrap();
+        let shots = super::TransitionShots::new(dir.path().to_path_buf(), 2);
+        let book = super::Transitions::with_capacity(32);
+        let mut sink = super::ScenarioFrames::with_shots(
+            Captures::of(Vec::new()),
+            book.clone(),
+            shots.clone(),
+        );
+        let (_, screen) = released(&Captures::of(Vec::new()));
+        let states = [State::Ready, State::Play, State::Tail, State::Closing];
+        for (i, &state) in states.iter().enumerate() {
+            let i = i64::try_from(i).unwrap();
+            let mut d = staged(play_stage(state), 1_000_000 + 16_700 * i, i);
+            d.timing.presented = true;
+            sink.frame(&screen, &d);
+        }
+        drop_bounded(sink);
+        let read_backs = book
+            .records()
+            .iter()
+            .filter(|r| matches!(r, Record::Mark(m) if m.kind == MarkKind::ReadBack))
+            .count();
+        assert_eq!(read_backs, 2, "the change past the cap is not read back");
+        let path = |f: &str| dir.path().join(f);
+        assert!(path("01-ready-play.png").is_file());
+        assert!(path("02-play-tail.png").is_file());
+        assert!(!path("03-tail-closing.png").exists());
+        let side = fs::read_to_string(path("01-ready-play.json")).unwrap();
+        for field in [
+            "\"axis\":\"transition\"",
+            "\"presented_us\":1016700,",
+            "\"transition\":\"transition\"",
+            "\"from\":\"ready\"",
+            "\"to\":\"play\"",
+            "\"lifetime\":41,",
+            "\"last_us\":1000000,",
+            "\"first_us\":1016700,",
+            "\"instrumented\":true",
+        ] {
+            assert!(side.contains(field), "{field} in {side}");
+        }
+        let past = "changes not captured past the cap of 2 transition captures: 1";
+        assert_eq!(shots.unfinished(), [past]);
+        let e = super::conclude::<std::io::Error>(
+            Ok(()),
+            None,
+            None,
+            crate::render_side::RenderEnd::Joined,
+            &Captures::of(Vec::new()),
+            Ok(None),
+            Some(&shots),
+        )
+        .unwrap_err();
+        assert!(format!("{e:#}").contains(past), "{e:#}");
+    }
+
+    /// Drops `sink` on a helper thread, failing unless its drop, which
+    /// joins its capture writer, ends within 60 s.
+    fn drop_bounded(sink: super::ScenarioFrames) {
+        drop_within(sink, std::time::Duration::from_secs(60));
+    }
+
+    /// Drops `sink` on a helper thread, failing the test when its writer
+    /// has not ended within `limit`.
+    fn drop_within(sink: super::ScenarioFrames, limit: std::time::Duration) {
+        let (done, ended) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            drop(sink);
+            let _ = done.send(());
+        });
+        assert!(
+            ended.recv_timeout(limit).is_ok(),
+            "the sink's writer did not end within {limit:?}"
+        );
+    }
+
+    /// The bounded drop fails rather than hangs: a writer held past the
+    /// limit gives its timeout assertion, and the sink still ends once the
+    /// writer is released.
+    #[test]
+    fn a_held_writer_fails_the_bounded_drop() {
+        use super::FrameSink as _;
+
+        let (_dir, c, mut sink, screen) = released_sink(1);
+        let hold = super::HOLD_WRITES.write().unwrap();
+        sink.frame(&screen, &drawn(1, 0));
+        assert_eq!(c.states(), [CaptureState::Saving(1)]);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop_within(sink, std::time::Duration::from_millis(200));
+        }));
+        drop(hold);
+        let why = failed.expect_err("a held writer fails the bounded drop");
+        let why = why
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(why.contains("did not end within 200ms"), "{why}");
+        let begun = std::time::Instant::now();
+        while c.states() != [CaptureState::Succeeded] {
+            assert!(
+                begun.elapsed() < std::time::Duration::from_secs(20),
+                "the released writer ends: {:?}",
+                c.states()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    /// Presents `frames` (a stage and its present) through `sink`.
+    fn present(sink: &mut super::ScenarioFrames, frames: &[(crate::measure::Stage, i64)]) {
+        use super::FrameSink as _;
+        let (_, screen) = released(&Captures::of(Vec::new()));
+        for (i, &(stage, us)) in frames.iter().enumerate() {
+            let mut d = staged(stage, us, i64::try_from(i).unwrap());
+            d.timing.presented = true;
+            sink.frame(&screen, &d);
+        }
+    }
+
+    /// Adjacent frames of one state, drawn alike, of two lifetimes are a
+    /// transition between them, each lifetime its own span.
+    #[test]
+    fn a_new_lifetime_of_the_same_state_is_a_transition() {
+        use crate::measure::{Drew, Stage, State};
+        let book = super::Transitions::with_capacity(32);
+        let mut sink = super::ScenarioFrames::recording(Captures::of(Vec::new()), book.clone());
+        let loading = |lifetime| Stage {
+            state: State::Loading,
+            lifetime,
+            drew: Drew::Skin,
+        };
+        present(
+            &mut sink,
+            &[
+                (loading(7), 1_000_000),
+                (loading(7), 1_016_700),
+                (loading(8), 1_033_400),
+                (loading(8), 1_050_100),
+            ],
+        );
+        drop_bounded(sink);
+        let (spans, edges, _) = records_of(&book);
+        assert_eq!(
+            spans
+                .iter()
+                .map(|s| (s.stage.lifetime, s.frames))
+                .collect::<Vec<_>>(),
+            [(7, 2), (8, 2)]
+        );
+        let [e] = edges[..] else {
+            panic!("one transition: {edges:?}");
+        };
+        assert_eq!(
+            (
+                e.presentation,
+                e.from.lifetime,
+                e.to.lifetime,
+                e.gap.from,
+                e.gap.to
+            ),
+            (false, 7, 8, TimeUs(1_016_700), TimeUs(1_033_400))
+        );
+    }
+
+    /// A play that ends without a result, a practice round left to its
+    /// page, cancels its preparation: a result taken later marks nothing.
+    /// The control, the same play going on to its result, marks it.
+    #[test]
+    fn a_practice_exit_cancels_the_preparation() {
+        use super::FrameSink as _;
+        use crate::dev::transitions::MarkKind;
+        use crate::measure::{Stage, State};
+        for page in [true, false] {
+            let book = super::Transitions::with_capacity(32);
+            let mut sink = super::ScenarioFrames::recording(Captures::of(Vec::new()), book.clone());
+            present(&mut sink, &[(play_stage(State::Tail), 1_000_000)]);
+            sink.play_ended(TimeUs(1_010_000));
+            if page {
+                present(&mut sink, &[(Stage::plain(State::Page), 1_200_000)]);
+            }
+            sink.result_taken(TimeUs(1_300_000));
+            drop_bounded(sink);
+            let (_, _, marks) = records_of(&book);
+            let preparing: Vec<_> = marks
+                .iter()
+                .filter(|m| m.kind == MarkKind::Preparing)
+                .map(|m| (m.from, m.to))
+                .collect();
+            if page {
+                assert_eq!(preparing, [], "{page}");
+            } else {
+                assert_eq!(preparing, [(TimeUs(1_010_000), TimeUs(1_300_000))]);
+            }
+        }
+    }
+
+    /// Through the sink, one tail span whose longest raw gap, largest
+    /// uncovered gap and largest uncovered piece are three gaps: A, 3 s
+    /// mostly marked (100 ms uncovered); B, 1 s with two overlapping marks
+    /// covering 400 ms once, its 600 ms uncovered in two pieces of 300 ms;
+    /// C, 450 ms unmarked; D, 2 s wholly marked. The span keeps A as its
+    /// longest and B as its largest uncovered, and the run's summary names
+    /// the span over its only transition.
+    #[test]
+    fn the_raw_and_the_uncovered_maxima_are_chosen_apart() {
+        use super::FrameSink as _;
+        use crate::measure::{Drew, Stage, State};
+        let book = super::Transitions::with_capacity(64);
+        let mut sink = super::ScenarioFrames::recording(Captures::of(Vec::new()), book.clone());
+        let tail = play_stage(State::Tail);
+        let prepared = |sink: &mut super::ScenarioFrames, from: i64, to: i64| {
+            sink.play_ended(TimeUs(from));
+            sink.result_taken(TimeUs(to));
+        };
+        present(&mut sink, &[(tail, 1_000_000)]);
+        prepared(&mut sink, 1_000_000, 3_900_000);
+        present(&mut sink, &[(tail, 4_000_000)]);
+        prepared(&mut sink, 4_300_000, 4_600_000);
+        prepared(&mut sink, 4_500_000, 4_700_000);
+        present(&mut sink, &[(tail, 5_000_000), (tail, 5_450_000)]);
+        prepared(&mut sink, 5_450_000, 7_450_000);
+        present(&mut sink, &[(tail, 7_450_000)]);
+        let result = Stage {
+            state: State::Result,
+            lifetime: 3,
+            drew: Drew::Skin,
+        };
+        present(&mut sink, &[(result, 7_466_700)]);
+        drop_bounded(sink);
+        let (spans, _, _) = records_of(&book);
+        let s = spans.iter().find(|s| s.stage.state == State::Tail).unwrap();
+        assert_eq!(s.frames, 5);
+        let raw = s.longest.unwrap();
+        assert_eq!(
+            (raw.from, raw.to, raw.cover.uncovered),
+            (TimeUs(1_000_000), TimeUs(4_000_000), 100_000)
+        );
+        let u = s.uncovered.unwrap();
+        assert_eq!(
+            (
+                u.from,
+                u.to,
+                u.cover.covered,
+                u.cover.uncovered,
+                u.cover.piece
+            ),
+            (
+                TimeUs(4_000_000),
+                TimeUs(5_000_000),
+                400_000,
+                600_000,
+                Some((TimeUs(4_000_000), TimeUs(4_300_000)))
+            )
+        );
+        let (lines, _) = book.lines().unwrap();
+        let summary = lines.last().unwrap();
+        assert!(
+            summary.contains("largest uncovered 600000 us (4000000 to 4300000) in span tail 41"),
+            "{summary}"
+        );
+    }
+
+    /// The record's failures reach the run's conclusion: records lost past
+    /// the cap fail it with their count, and a book the render thread
+    /// still holds fails it; a book within its cap concludes clean (the
+    /// control).
+    #[test]
+    fn a_lost_or_held_record_fails_the_run() {
+        use crate::dev::transitions::{Mark, MarkKind, Recorder};
+        let c = Captures::of(Vec::new());
+        let conclude = |record| {
+            super::conclude::<std::io::Error>(
+                Ok(()),
+                None,
+                None,
+                crate::render_side::RenderEnd::Joined,
+                &c,
+                record,
+                None,
+            )
+        };
+        let filled = |cap: usize| {
+            let book = super::Transitions::with_capacity(cap);
+            let mut r = Recorder::new(book.clone());
+            for k in 0..6 {
+                r.mark(Mark {
+                    kind: MarkKind::ReadBack,
+                    from: TimeUs(k * 1_000),
+                    to: TimeUs(k * 1_000 + 500),
+                });
+            }
+            book
+        };
+        let e = conclude(filled(4).lines().map(|(_, lost)| lost)).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("2 transition records were lost past the cap of 4"),
+            "{e:#}"
+        );
+        assert!(conclude(filled(32).lines().map(|(_, lost)| lost)).is_ok());
+        let book = filled(32);
+        let held = book.hold();
+        let e = conclude(book.lines().map(|(_, lost)| lost)).unwrap_err();
+        assert!(
+            format!("{e:#}").contains("the transition record is held by the render thread"),
+            "{e:#}"
+        );
+        drop(held);
+    }
+
+    /// The recorder's frame step allocates nothing: the first frame, frames
+    /// of one span, a frame not presented, a transition, a presentation
+    /// change, the play's end and its result taken, and records past a
+    /// full book; a capture bound and not due runs its path too. A growing
+    /// vector made inside the count is counted (the control). Unoptimized
+    /// builds count the standard library's own allocations: CI runs it in
+    /// release.
+    #[test]
+    fn scenario_transitions_record_alloc() {
+        use super::FrameSink as _;
+        use crate::alloc_count::this_thread;
+        use crate::measure::{Drew, Stage, State};
+        let dir = tempfile::tempdir().unwrap();
+        let c = Captures::of(vec![(TimeUs(9_000_000), dir.path().join("a.png"))]);
+        c.arm(0);
+        c.bind(1);
+        let book = super::Transitions::with_capacity(2);
+        let mut sink = super::ScenarioFrames::recording(c.clone(), book.clone());
+        let (_, screen) = released(&c);
+        let frame = |state, drew, us: i64, presented| {
+            let mut d = drawn(1, us / 1_000);
+            d.stage = Stage {
+                state,
+                lifetime: 41,
+                drew,
+            };
+            d.presented_at = TimeUs(us);
+            d.timing.presented = presented;
+            d
+        };
+        let before = this_thread();
+        sink.frame(&screen, &frame(State::Ready, Drew::Plain, 1_000, true));
+        let first = this_thread() - before;
+        let before = this_thread();
+        for k in 1..9 {
+            sink.frame(
+                &screen,
+                &frame(State::Ready, Drew::Plain, 1_000 + k * 16_700, true),
+            );
+        }
+        sink.frame(&screen, &frame(State::Ready, Drew::Plain, 160_000, false));
+        let steady = this_thread() - before;
+        let before = this_thread();
+        sink.frame(&screen, &frame(State::Play, Drew::Plain, 170_000, true));
+        sink.frame(&screen, &frame(State::Play, Drew::Skin, 186_700, true));
+        sink.play_ended(TimeUs(190_000));
+        sink.result_taken(TimeUs(400_000));
+        sink.frame(&screen, &frame(State::Result, Drew::Skin, 416_000, true));
+        sink.frame(&screen, &frame(State::Selection, Drew::Skin, 900_000, true));
+        let changes = this_thread() - before;
+        let before = this_thread();
+        let mut grown: Vec<u64> = Vec::new();
+        for i in 0..64 {
+            grown.push(std::hint::black_box(i));
+        }
+        let control = this_thread() - before;
+        assert_eq!((first, steady, changes), (0, 0, 0));
+        assert!(control > 0, "the counter counts this thread");
+        assert!(book.lost() > 0, "the full book's path ran");
     }
 }

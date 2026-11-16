@@ -3,11 +3,12 @@
 //! Model", T09).
 //!
 //! Five phases count: closing the captured object graph, the effect walk,
-//! admission, each lowering of a callable, and each role scan outside a
-//! lowering (an image set's value). [`AnalysisClock::enter`] and
-//! [`AnalysisClock::leave`] bracket each one, so time between phases (the
-//! common import's other work) does not count. The clock is checked
-//! at every `enter`, at every root of the walk, at the cancellation
+//! admission, each lowering of a callable, and each scan outside a
+//! lowering (an image set's role scan, a callable's option scan).
+//! [`AnalysisClock::enter`] and [`AnalysisClock::leave`] bracket each
+//! one, so time between phases (the common import's other work) does not
+//! count. The clock is checked at every `enter`, at every root of the
+//! walk, at the cancellation
 //! cadence of [`super::callback::Analysis::charge`], and at every `leave`
 //! after the phase's interval is added, so the last phase's time is
 //! checked too. Past the cap, the candidate refuses with
@@ -35,7 +36,8 @@ pub(crate) enum Phase {
     Admit,
     /// One lowering of a callable.
     Lower,
-    /// A role scan outside a lowering: an image set's value.
+    /// A scan outside a lowering: an image set's value's role scan, a
+    /// callable's option scan.
     Scan,
 }
 

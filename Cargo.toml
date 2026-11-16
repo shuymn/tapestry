@@ -1,9 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "xtask"]
-# Its own workspace and lockfile, built with the nightly of the Nix `fuzz`
-# shell (docs/setup.md "Fuzzing").
-exclude = ["fuzz"]
+# Each its own workspace and lockfile: the fuzz targets built with the
+# nightly of the Nix `fuzz` shell (docs/setup.md "Fuzzing"), the test
+# device's firmware for the RP2350 (docs/test-device.md "Building").
+exclude = ["fuzz", "test-device/firmware"]
 
 [workspace.package]
 edition = "2024"
@@ -24,6 +25,7 @@ render = { path = "crates/render" }
 library = { path = "crates/library" }
 skin-model = { path = "crates/skin-model" }
 skin-beatoraja = { path = "crates/skin-beatoraja" }
+test-device = { path = "crates/test-device" }
 
 # bms-parser (md-5 also library)
 chardetng = "1.0.0"
@@ -123,6 +125,21 @@ pulldown-cmark = { version = "0.13.6", default-features = false }
 proc-macro2 = { version = "1.0.107", default-features = false, features = ["span-locations"] }
 quote = { version = "1.0.47", default-features = false }
 syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "printing", "visit"] }
+
+# Debug builds as the Windows CI jobs build them (docs/setup.md "CI"): line
+# tables keep backtraces' files and lines at a fraction of full debug info's
+# size, and optimized dependencies make the CPU-bound tests faster. The Linux
+# jobs restore the dependencies' default opt-level. Full debug info for a
+# debugger: `CARGO_PROFILE_DEV_DEBUG=full` (and `CARGO_PROFILE_TEST_DEBUG=full`
+# for tests).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
 
 # Used by the `cargo xtask` alias (.cargo/config.toml).
 [profile.xtask]

@@ -70,6 +70,7 @@ pub const LICENSES: &[(&str, &str)] = &[
     ("replay", PERMISSIVE),
     ("eval-cli", PERMISSIVE),
     ("xtask", PERMISSIVE),
+    ("test-device", PERMISSIVE),
     ("input", GPL),
     ("audio", GPL),
     ("game", GPL),
