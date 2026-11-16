@@ -20,7 +20,10 @@
 //! step, except `next`'s scan of a table's empty slots, which VM memory
 //! bounds (the table below). A native function the library keeps is its private upvalue,
 //! called only with arguments of the exact Lua type it takes, checked
-//! first and never coerced, and only for a result whose size is known
+//! first (a number passed for a string parameter is first made its text
+//! by the library's `number_text`, 24 bytes charged, as Lua's coercion
+//! reads it; a string is never read as a number), and only for a result
+//! whose size is known
 //! and charged in bytes to
 //! [`MAX_NATIVE_WORK`](super::limits::MAX_NATIVE_WORK) first, a result
 //! over [`MAX_PRIMITIVE_BYTES`](super::limits::MAX_PRIMITIVE_BYTES)
@@ -48,7 +51,7 @@
 //! | `type` | any | O(1) | none needed | no |
 //! | `next` (and `pairs`' iterator) | table, key | a key's hash (long strings: once, cached) and a scan of empty slots, O(table capacity) | the table's capacity, held in VM memory: the one native loop over skin data, bounded by memory and not charged | no |
 //! | `pairs` | any | O(1) | none needed | `__pairs`, hooked |
-//! | `tostring` (also `%s`, `concat`'s and `gsub`'s numbers) | any | a number's digits, or `__name` (at most 64 bytes) and an address; a string is returned uncopied | `__name` over 64 bytes refused when the metatable is attached | `__tostring`, hooked |
+//! | `tostring` (also an integer's text in `number_text`) | any | a number's digits, or `__name` (at most 64 bytes) and an address; a string is returned uncopied | `__name` over 64 bytes refused when the metatable is attached | `__tostring`, hooked |
 //! | `select` | an integer or `"#"`, values | O(1): the values stay in place | integer checked in Lua | no |
 //! | `error` | a value, an integer level | with a level, the position and the message copied, O(#message) | each caught message's length charged by the handler, before the skin's runs; an uncaught one ends the pass | no |
 //! | `ipairs` | any | none: the step is Lua (`t[i]`) | integer index checked in Lua | `__index`, hooked |
@@ -58,6 +61,7 @@
 //! | `string.byte` (private) | a string, integer bounds | O(results) | at most 16 results, within a native call's free stack | no |
 //! | `string.char` (private) | integers in 0..255 | O(n) | at most 4 096, charged | no |
 //! | `string.upper`, `string.lower` (private) | a string | O(#s) | at most 1 MiB, charged | no |
+//! | `string.format` `%.14g` (private, `number_text`: a float that is not an integer, NaN or infinite, the text of a number passed for a string, `%s`'s, `gsub`'s and `table.concat`'s numbers) | a float | O(1) | 24 bytes charged first | no |
 //! | `string.format` (private) | the checked format, its arguments | O(format + output + the bytes `%s` reads) | 32 conversions, two-digit widths and precisions, output at most 1 MiB, all charged | `__tostring`, hooked |
 //! | `table.concat` (private) | the library's own table of strings | O(entries + output) | output at most 1 MiB, entries and output charged | no |
 //! | `rawget`, `rawset`, `rawlen` (private) | a plain table | O(1) amortized; a resize O(capacity) | VM memory | no |
@@ -252,4 +256,110 @@ pub(super) fn install(lua: &Lua, pass: &Arc<Pass>, env: &Table, base: &Table) ->
     }
     lua.set_named_registry_value(STRING_BRIDGE, lib.raw_get::<Function>("string_bridge")?)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use mlua::chunk::ChunkMode;
+    use mlua::{Function, Lua, MultiValue, Table};
+
+    use super::{LIBRARY, MAX_PATH_BYTES, MAX_PRIMITIVE_BYTES};
+
+    #[test]
+    fn a_number_s_text_is_charged_before_it_is_made() -> mlua::Result<()> {
+        // The library over the VM's own natives, its charge counting and
+        // the two natives that make a number's text (`format` for `%.14g`,
+        // `tostring` for an integer's digits) recording the work charged
+        // when they run: each conversion must find its 24 bytes charged.
+        let lua = Lua::new();
+        let charged = Arc::new(AtomicI64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let globals = lua.globals();
+        let string: Table = globals.get("string")?;
+        let math: Table = globals.get("math")?;
+        let native = lua.create_table()?;
+        for name in ["byte", "sub", "char", "upper", "lower"] {
+            native.raw_set(name, string.raw_get::<Function>(name)?)?;
+        }
+        native.raw_set(
+            "concat",
+            globals
+                .get::<Table>("table")?
+                .raw_get::<Function>("concat")?,
+        )?;
+        for name in [
+            "tonumber",
+            "setmetatable",
+            "getmetatable",
+            "select",
+            "error",
+            "next",
+            "rawget",
+            "rawset",
+            "rawlen",
+            "type",
+        ] {
+            native.raw_set(name, globals.raw_get::<Function>(name)?)?;
+        }
+        for name in ["floor", "ceil", "abs", "tointeger"] {
+            native.raw_set(name, math.raw_get::<Function>(name)?)?;
+        }
+        native.raw_set("mathtype", math.raw_get::<Function>("type")?)?;
+        for (name, real) in [
+            ("format", string.raw_get::<Function>("format")?),
+            ("tostring", globals.raw_get::<Function>("tostring")?),
+        ] {
+            let (charged, seen) = (Arc::clone(&charged), Arc::clone(&seen));
+            native.raw_set(
+                name,
+                lua.create_function(move |_, args: MultiValue| {
+                    if let Ok(mut s) = seen.lock() {
+                        s.push((name, charged.load(Ordering::SeqCst)));
+                    }
+                    real.call::<MultiValue>(args)
+                })?,
+            )?;
+        }
+        let c = Arc::clone(&charged);
+        let charge = lua.create_function(move |_, n: i64| {
+            c.fetch_add(n, Ordering::SeqCst);
+            Ok(true)
+        })?;
+        let refuse = lua.create_function(|_, _: i64| Ok(false))?;
+        let bridge = lua.create_table()?;
+        bridge.raw_set("metatable", lua.create_function(|_, ()| Ok(true))?)?;
+        let (string_lib, ..): (Table, Table, Table, Table) = lua
+            .load(LIBRARY)
+            .set_name("=library")
+            .set_mode(ChunkMode::Text)
+            .set_environment(lua.create_table()?)
+            .call((
+                native,
+                charge,
+                refuse,
+                bridge,
+                MAX_PRIMITIVE_BYTES,
+                MAX_PATH_BYTES,
+                super::super::sandbox::FAULT,
+            ))?;
+        let len: Function = string_lib.get("len")?;
+        // A float by `%.14g`, an integer and a whole float by their digits.
+        for (v, native, text) in [
+            (mlua::Value::Number(0.5), "format", 3),
+            (mlua::Value::Integer(-102), "tostring", 4),
+            (mlua::Value::Number(50.0), "tostring", 2),
+        ] {
+            charged.store(0, Ordering::SeqCst);
+            if let Ok(mut s) = seen.lock() {
+                s.clear();
+            }
+            assert_eq!(len.call::<i64>(v)?, text);
+            let s = seen.lock().map(|s| s.clone()).unwrap_or_default();
+            assert_eq!(s, [(native, 24)], "{native}");
+        }
+        Ok(())
+    }
 }
