@@ -941,6 +941,10 @@ pub struct PlayerSettings {
     /// sounds).
     #[serde(skip_serializing_if = "SoundSettings::is_default")]
     pub sounds: SoundSettings,
+    /// The BGA setting, `[bga]` (design.md "Settings Files"). Read once, at
+    /// startup.
+    #[serde(skip_serializing_if = "BgaSettings::is_default")]
+    pub bga: BgaSettings,
 }
 
 impl Default for PlayerSettings {
@@ -955,8 +959,60 @@ impl Default for PlayerSettings {
             covers: CoverSettings::default(),
             skins: SkinChoices::default(),
             sounds: SoundSettings::default(),
+            bga: BgaSettings::default(),
         }
     }
+}
+
+/// `[bga]` of `player.toml`: whether a play shows the chart's BGA, and how
+/// a skin's BGA destination without a stretch of its own fits its
+/// pictures (design.md "Settings Files"). A value naming neither refuses
+/// the file.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct BgaSettings {
+    /// `mode`: `"on"` by default.
+    pub mode: BgaMode,
+    /// `expand`: `"keep-aspect"` by default.
+    pub expand: BgaExpand,
+}
+
+impl BgaSettings {
+    /// Whether both keys hold their defaults, so nothing is written.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// `[bga] mode`: whether a play shows the chart's BGA (the source's
+/// `Config.BGA_ON`, `BGA_AUTO` and `BGA_OFF`, `Config.java:152-155` at
+/// `0.8.9`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BgaMode {
+    /// Every play.
+    #[default]
+    On,
+    /// Only in an autoplay session.
+    Autoplay,
+    /// No play.
+    Off,
+}
+
+/// `[bga] expand`: how a skin's BGA destination without a stretch of its
+/// own fits the chart's pictures (the source's `bgaExpand`,
+/// `Config.java:157-162` at `0.8.9`, `SkinBGA.java:25-28`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BgaExpand {
+    /// Stretched to the destination.
+    Full,
+    /// Fitted inside it, its aspect kept.
+    #[default]
+    KeepAspect,
+    /// At its own size.
+    Off,
 }
 
 /// The language the player's own screen text is shown in (`language` in

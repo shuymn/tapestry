@@ -1385,7 +1385,10 @@ fn start_skins(
         &rig.render,
         &settings.player.skins,
         launch,
-        rig.autoplay,
+        imports::SkinSession {
+            autoplay: rig.autoplay,
+            bga: settings.player.bga.mode,
+        },
         &build,
         || rig.controls.quitting(),
     )

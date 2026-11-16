@@ -13,8 +13,8 @@ use skin_model::ScreenKind;
 
 use super::{choice, critical_skin, options_skin, serial, wait_until};
 use crate::imports::{
-    Build, ImportTarget, KindOutcome, Launch, STOP_WAIT, Started, StartupEnd, Summary, build,
-    startup,
+    Build, ImportTarget, KindOutcome, Launch, STOP_WAIT, SkinSession, Started, StartupEnd, Summary,
+    build, startup,
 };
 use crate::render_side::tests::{Installers, bundle};
 
@@ -41,7 +41,7 @@ impl Builds {
     /// `make` as startup's build, each call counted and noted.
     fn of(
         &self,
-        make: impl Fn(ScreenKind, &SkinChoice, bool, &ImportTarget, &Cancel) -> KindOutcome
+        make: impl Fn(ScreenKind, &SkinChoice, SkinSession, &ImportTarget, &Cancel) -> KindOutcome
         + Send
         + Sync
         + 'static,
@@ -56,7 +56,13 @@ impl Builds {
 }
 
 /// A built bundle, as any installable skin's.
-fn bundled(_: ScreenKind, _: &SkinChoice, _: bool, _: &ImportTarget, _: &Cancel) -> KindOutcome {
+fn bundled(
+    _: ScreenKind,
+    _: &SkinChoice,
+    _: SkinSession,
+    _: &ImportTarget,
+    _: &Cancel,
+) -> KindOutcome {
     KindOutcome::Bundle(
         bundle(),
         Summary {
@@ -131,7 +137,14 @@ fn a_kind_is_built_only_after_the_previous_selection_settles() {
             screens.hold_install.store(false, Ordering::SeqCst);
             midway
         });
-        let started = startup(&link, &choices, Launch::Selection, false, &build, || false);
+        let started = startup(
+            &link,
+            &choices,
+            Launch::Selection,
+            crate::imports::SkinSession::default(),
+            &build,
+            || false,
+        );
         assert_eq!(started.unwrap(), Started::default());
         watcher.join().unwrap()
     });
@@ -165,7 +178,7 @@ fn an_unanswered_installation_ends_startup() {
         &link,
         &choices,
         Launch::Selection,
-        false,
+        crate::imports::SkinSession::default(),
         &build,
         || false,
     ));
@@ -195,7 +208,15 @@ fn a_healthy_refusal_moves_on_to_the_next_kind() {
     let builds = Builds::default();
     let build = builds.of(bundled);
     screens.refuse_install.store(true, Ordering::SeqCst);
-    let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+    let started = startup(
+        &link,
+        &choices,
+        Launch::Selection,
+        crate::imports::SkinSession::default(),
+        &build,
+        || false,
+    )
+    .unwrap();
     assert_eq!(
         started.play.as_deref(),
         Some("スキンを使えません: the skin cannot be installed")
@@ -226,7 +247,15 @@ fn a_missing_play_skin_admits_no_chart() {
         ..SkinChoices::default()
     };
     let build: Build = Arc::new(build);
-    let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+    let started = startup(
+        &link,
+        &choices,
+        Launch::Selection,
+        crate::imports::SkinSession::default(),
+        &build,
+        || false,
+    )
+    .unwrap();
     let notice = started.play.clone().unwrap();
     assert!(
         notice.starts_with("スキンを使えません: cannot read missing.json"),
@@ -266,7 +295,15 @@ fn a_non_play_kind_keeps_its_built_in_screen_with_a_notice() {
             result: Some(choice(dir.path(), entry)),
             ..SkinChoices::default()
         };
-        let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+        let started = startup(
+            &link,
+            &choices,
+            Launch::Selection,
+            crate::imports::SkinSession::default(),
+            &build,
+            || false,
+        )
+        .unwrap();
         assert!(started.play.is_none() && started.pending.is_none());
         assert!(started.selection.is_none() && started.result.is_none());
         let notice = started.notice.unwrap();
@@ -301,7 +338,7 @@ fn a_refused_play_skin_fails_the_direct_path_at_once() {
         result: choices.result.clone(),
         ..SkinChoices::default()
     };
-    type Make = fn(ScreenKind, &SkinChoice, bool, &ImportTarget, &Cancel) -> KindOutcome;
+    type Make = fn(ScreenKind, &SkinChoice, SkinSession, &ImportTarget, &Cancel) -> KindOutcome;
     let importer: Make = build;
     let panics: Make = |_, _, _, _, _| panic!("the build panics");
     let ends: Make = |_, _, _, _, _| std::panic::panic_any(Bomb);
@@ -330,7 +367,7 @@ fn a_refused_play_skin_fails_the_direct_path_at_once() {
             &link,
             choices,
             Launch::Direct,
-            false,
+            crate::imports::SkinSession::default(),
             &build,
             || false,
         ));
@@ -349,7 +386,15 @@ fn a_refused_play_skin_fails_the_direct_path_at_once() {
     let link = screens.spawn_bare();
     let builds = Builds::default();
     let build = builds.of(bundled);
-    let started = startup(&link, &choices, Launch::Direct, false, &build, || false).unwrap();
+    let started = startup(
+        &link,
+        &choices,
+        Launch::Direct,
+        crate::imports::SkinSession::default(),
+        &build,
+        || false,
+    )
+    .unwrap();
     assert_eq!(started, Started::default());
     assert_eq!(builds.events(), ["build Play", "build Result"]);
     // Play's and the fixed result skin's are committed.
@@ -392,7 +437,15 @@ fn a_pending_play_skin_is_marked_pending_at_startup() {
         for launch in [Launch::Selection, Launch::Direct] {
             let screens = Installers::default();
             let link = screens.spawn_bare();
-            let started = startup(&link, &choices, launch, false, &build, || false).unwrap();
+            let started = startup(
+                &link,
+                &choices,
+                launch,
+                crate::imports::SkinSession::default(),
+                &build,
+                || false,
+            )
+            .unwrap();
             assert_eq!(started.play, None, "{launch:?}");
             assert_eq!(started.notice, None, "{launch:?}");
             assert!(started.pending.is_some(), "{launch:?}");
@@ -456,9 +509,14 @@ fn a_close_during_startup_ends_it() {
             stop.store(true, Ordering::SeqCst);
         });
         let from = Instant::now();
-        let r = startup(&link, &choices, Launch::Selection, false, &build, || {
-            stop.load(Ordering::SeqCst)
-        });
+        let r = startup(
+            &link,
+            &choices,
+            Launch::Selection,
+            crate::imports::SkinSession::default(),
+            &build,
+            || stop.load(Ordering::SeqCst),
+        );
         (r, from.elapsed())
     });
     assert!(matches!(r.0, Err(StartupEnd::Closed)), "{:?}", r.0);
@@ -481,9 +539,14 @@ fn a_close_during_startup_ends_it() {
             assert!(wait_until(|| screens.install_held.load(Ordering::SeqCst)));
             stop.store(true, Ordering::SeqCst);
         });
-        startup(&link, &choices, Launch::Selection, false, &build, || {
-            stop.load(Ordering::SeqCst)
-        })
+        startup(
+            &link,
+            &choices,
+            Launch::Selection,
+            crate::imports::SkinSession::default(),
+            &build,
+            || stop.load(Ordering::SeqCst),
+        )
     });
     assert!(matches!(r, Err(StartupEnd::Closed)), "{r:?}");
     screens.hold_install.store(false, Ordering::SeqCst);
@@ -525,9 +588,14 @@ fn a_close_during_a_lua_job_ends_startup() {
                 stop.store(true, Ordering::SeqCst);
             });
             let from = Instant::now();
-            let r = startup(&link, &choices, Launch::Selection, false, &build, || {
-                stop.load(Ordering::SeqCst)
-            });
+            let r = startup(
+                &link,
+                &choices,
+                Launch::Selection,
+                crate::imports::SkinSession::default(),
+                &build,
+                || stop.load(Ordering::SeqCst),
+            );
             (r, from.elapsed())
         });
         let live = vm_hooks::live();
@@ -561,7 +629,15 @@ fn a_selection_skin_installs_with_its_window_or_leaves_a_notice() {
         let screens = Installers::default();
         screens.refuse_install.store(refuse, Ordering::Release);
         let link = screens.spawn_bare();
-        let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+        let started = startup(
+            &link,
+            &choices,
+            Launch::Selection,
+            crate::imports::SkinSession::default(),
+            &build,
+            || false,
+        )
+        .unwrap();
         if refuse {
             assert_eq!(started.selection, None);
             let notice = started.notice.unwrap();
@@ -575,7 +651,15 @@ fn a_selection_skin_installs_with_its_window_or_leaves_a_notice() {
     let screens = Installers::default();
     let link = screens.spawn_bare();
     let none = SkinChoices::default();
-    let started = startup(&link, &none, Launch::Selection, false, &build, || false).unwrap();
+    let started = startup(
+        &link,
+        &none,
+        Launch::Selection,
+        crate::imports::SkinSession::default(),
+        &build,
+        || false,
+    )
+    .unwrap();
     assert_eq!(started, Started::default());
     link.exit();
 }
@@ -595,7 +679,15 @@ fn a_lua_selection_skin_installs_or_leaves_its_located_reason() {
     };
     let screens = Installers::default();
     let link = screens.spawn_bare();
-    let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+    let started = startup(
+        &link,
+        &choices,
+        Launch::Selection,
+        crate::imports::SkinSession::default(),
+        &build,
+        || false,
+    )
+    .unwrap();
     assert_eq!(started.selection, Some((3, 7)));
     assert_eq!(started.notice, None);
     link.exit();
@@ -614,7 +706,15 @@ fn a_lua_selection_skin_installs_or_leaves_its_located_reason() {
     };
     let screens = Installers::default();
     let link = screens.spawn_bare();
-    let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+    let started = startup(
+        &link,
+        &choices,
+        Launch::Selection,
+        crate::imports::SkinSession::default(),
+        &build,
+        || false,
+    )
+    .unwrap();
     assert_eq!(started.selection, None);
     let notice = started.notice.unwrap();
     assert!(notice.ends_with("s.luaskin:3:0: a Lua error"), "{notice}");
@@ -642,7 +742,15 @@ fn a_lua_selection_skin_installs_or_leaves_its_located_reason() {
         };
         let screens = Installers::default();
         let link = screens.spawn_bare();
-        let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+        let started = startup(
+            &link,
+            &choices,
+            Launch::Selection,
+            crate::imports::SkinSession::default(),
+            &build,
+            || false,
+        )
+        .unwrap();
         assert_eq!(started.selection, None, "{read}");
         assert!(started.pending.is_none(), "{read}");
         let notice = started.notice.unwrap();
@@ -683,7 +791,15 @@ fn a_lua_decision_skin_installs_or_is_refused_when_pending() {
         };
         let screens = Installers::default();
         let link = screens.spawn_bare();
-        let started = startup(&link, &choices, Launch::Selection, false, &build, || false).unwrap();
+        let started = startup(
+            &link,
+            &choices,
+            Launch::Selection,
+            crate::imports::SkinSession::default(),
+            &build,
+            || false,
+        )
+        .unwrap();
         link.exit();
         (started, screens.log())
     };

@@ -378,6 +378,7 @@ pub fn view(
             max_ex,
             score: r.score,
             judge_class: None,
+            bga: false,
             clears: 0,
             best: None,
             info: None,

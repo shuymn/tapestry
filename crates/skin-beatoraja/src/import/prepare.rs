@@ -25,7 +25,7 @@ use super::ops::{self, Cond};
 use super::property::IndexProp;
 
 use super::report::{NoteKind, Object, ScheduleWhy, Severity};
-use super::{Common, Cx, Dst, Op, Prop};
+use super::{Bga, Common, Cx, Dst, Op, Prop};
 use crate::error::ImportError;
 use crate::lua::{Disposition, Unsupported};
 use crate::tree::NONE;
@@ -214,8 +214,8 @@ enum Static {
     Dynamic,
     /// Static, and its value is known at import: tapestry has no
     /// difficulty table or course (`table_song`, `:351-352`; `mode_course`,
-    /// `:526-527`; the course stages, `:521-525`), so all are false, and
-    /// plays no BGA (`bgaoff` true, `bgaon` false, `:392-393`; D33).
+    /// `:526-527`; the course stages, `:521-525`), so all are false; the
+    /// BGA setting (`bgaoff`, `bgaon`, `:392-393`) is the session's.
     Known(bool),
     /// Static, read from the chart (`SongDataBooleanProperty`, `:251-265`,
     /// `:435-452`), which the play maps.
@@ -225,15 +225,16 @@ enum Static {
     Unmapped,
 }
 
-/// The class on play of boolean property `id` (its absolute id).
-fn static_class(id: i32) -> Static {
+/// The class on play of boolean property `id` (its absolute id), under
+/// the BGA setting `bga`.
+fn static_class(id: i32, bga: Bga) -> Static {
+    if let Some(on) = ops::bga_setting(id, bga) {
+        return Static::Known(on);
+    }
     match id {
         ops::TABLE_SONG | ops::COURSE_MODE | 280..=283 | 289 => Static::Known(false),
-        // The BGA setting, answered as off (D33).
-        ops::BGA_OFF => Static::Known(true),
-        ops::BGA_ON => Static::Known(false),
-        150..=155 | 170 | 176 | 177 | 180..=184 | 190 | 191 | 194 | 195 => Static::Chart,
-        171..=175
+        150..=155 | 170 | 171 | 176 | 177 | 180..=184 | 190 | 191 | 194 | 195 => Static::Chart,
+        172..=175
         | 178
         | 179
         | 1177
@@ -359,7 +360,9 @@ impl Cx<'_> {
         numeric
             .chain(named)
             .filter_map(|n| i32::try_from(n.unsigned_abs()).ok())
-            .any(|id| ops::is_builtin(id) && matches!(static_class(id), Static::Unmapped))
+            .any(|id| {
+                ops::is_builtin(id) && matches!(static_class(id, self.config.bga), Static::Unmapped)
+            })
     }
 
     /// A timer callable that is no slot root's site: its reference does
@@ -384,12 +387,14 @@ impl Cx<'_> {
         }
         let mut gate: Vec<String> = Vec::new();
         let stat = |id: i32, negative: bool, gate: &mut Vec<String>| {
-            match static_class(id) {
+            match static_class(id, self.config.bga) {
                 Static::Known(v) if v == negative => return true,
                 Static::Chart => {
-                    if let Cond::Expr { src, .. } =
-                        ops::numeric(if negative { -id } else { id }, &self.items)
-                    {
+                    if let Cond::Expr { src, .. } = ops::numeric(
+                        if negative { -id } else { id },
+                        &self.items,
+                        self.config.bga,
+                    ) {
                         gate.push(src);
                     }
                 }

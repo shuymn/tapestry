@@ -480,9 +480,34 @@ pub const fn name(kind: ScreenKind) -> &'static str {
     }
 }
 
-/// Builds kind `kind`'s skin from `choice` for `target`, with autoplay as
-/// `autoplay`, asking `cancel` between its phases, in its Lua passes and
-/// in its atlas. A pure function of its inputs: it installs nothing.
+/// What a skin's import reads of the session, fixed for it: whether it
+/// plays automatically, and `player.toml`'s `[bga] mode`, which options 40
+/// and 41 and selection's image index 72 read with it (design.md
+/// "Differences from the source", BGA setting).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SkinSession {
+    pub autoplay: bool,
+    pub bga: game::BgaMode,
+}
+
+impl SkinSession {
+    /// The BGA setting as the import reads it.
+    #[must_use]
+    pub const fn bga(self) -> skin_beatoraja::Bga {
+        skin_beatoraja::Bga {
+            mode: match self.bga {
+                game::BgaMode::On => skin_beatoraja::BgaMode::On,
+                game::BgaMode::Autoplay => skin_beatoraja::BgaMode::Autoplay,
+                game::BgaMode::Off => skin_beatoraja::BgaMode::Off,
+            },
+            autoplay: self.autoplay,
+        }
+    }
+}
+
+/// Builds kind `kind`'s skin from `choice` for `target` in `session`,
+/// asking `cancel` between its phases, in its Lua passes and in its
+/// atlas. A pure function of its inputs: it installs nothing.
 ///
 /// 1. The folder: `choice.root`, the user's own absolute choice, must be
 ///    an existing folder; it is not checked as a name.
@@ -490,7 +515,7 @@ pub const fn name(kind: ScreenKind) -> &'static str {
 ///    else JSON, read under the folder's name and containment rules, as
 ///    every file the skin names is. A skin of another kind refuses.
 /// 3. The configuration: each option and file choice by name, against the
-///    header; an unknown name refuses.
+///    header; an unknown name refuses; and the session's BGA setting.
 /// 4. The import, Lua against the base facts. A Lua play skin reading a chart fact
 ///    ends pending, built for each attempt ([`specialize`]); a Lua skin of
 ///    another kind reading one refuses.
@@ -498,11 +523,11 @@ pub const fn name(kind: ScreenKind) -> &'static str {
 pub fn build(
     kind: ScreenKind,
     choice: &SkinChoice,
-    autoplay: bool,
+    session: SkinSession,
     target: &ImportTarget,
     cancel: &Cancel,
 ) -> KindOutcome {
-    built(kind, choice, autoplay, target, cancel).unwrap_or_else(KindOutcome::Refused)
+    built(kind, choice, session, target, cancel).unwrap_or_else(KindOutcome::Refused)
 }
 
 /// The header pass's result, by format.
@@ -546,7 +571,7 @@ fn import_json(
 fn built(
     kind: ScreenKind,
     choice: &SkinChoice,
-    autoplay: bool,
+    session: SkinSession,
     target: &ImportTarget,
     cancel: &Cancel,
 ) -> Result<KindOutcome, String> {
@@ -586,7 +611,8 @@ fn built(
     }
     stopped()?;
     // 3. The configuration.
-    let config = config(pass.header(), choice)?;
+    let mut config = config(pass.header(), choice)?;
+    config.bga = session.bga();
     // 4. The import.
     let header = pass.header().clone();
     // A selection or result skin keeps its configured VM for the callbacks
@@ -595,7 +621,7 @@ fn built(
     let imported: Result<Imported, ImportError> = match pass {
         Pass::Json(def, _) => import_json(def, &header, &config, kind, cancel),
         Pass::Lua(h) => {
-            let facts = ImportFacts::base(kind, Fact::Known(autoplay));
+            let facts = ImportFacts::base(kind, Fact::Known(session.autoplay));
             let outcome = if matches!(kind, ScreenKind::Selection | ScreenKind::Result) {
                 h.import_runtime(&config, &facts, cancel)
             } else {
@@ -1280,8 +1306,11 @@ impl Launch {
 }
 
 /// A kind's build as [`startup`] runs it: [`build`] in production.
-pub type Build =
-    Arc<dyn Fn(ScreenKind, &SkinChoice, bool, &ImportTarget, &Cancel) -> KindOutcome + Send + Sync>;
+pub type Build = Arc<
+    dyn Fn(ScreenKind, &SkinChoice, SkinSession, &ImportTarget, &Cancel) -> KindOutcome
+        + Send
+        + Sync,
+>;
 
 /// What startup leaves for the first screen.
 #[derive(Debug, Default)]
@@ -1362,7 +1391,7 @@ pub fn startup(
     render: &RenderLink,
     skins: &SkinChoices,
     launch: Launch,
-    autoplay: bool,
+    session: SkinSession,
     build: &Build,
     mut stop: impl FnMut() -> bool,
 ) -> Result<Started, StartupEnd> {
@@ -1389,7 +1418,7 @@ pub fn startup(
         let job = {
             let build = Arc::clone(build);
             let choice = choice.clone();
-            move |cancel: &Cancel| build(kind, &choice, autoplay, &target, cancel)
+            move |cancel: &Cancel| build(kind, &choice, session, &target, cancel)
         };
         let ran = run_cancellable(job, &mut stop);
         let shown = match ran {

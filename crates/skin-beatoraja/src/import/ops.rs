@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 
 use skin_model::ScreenKind;
 
+use super::Bga;
 use super::selection::profile::{self, Class, SelOption};
 
 /// The ids `BooleanPropertyFactory.getBooleanProperty(int)` knows, with
@@ -298,6 +299,8 @@ const CHART_DIFFICULTY: i32 = 150;
 /// `song_no_bga` (`BooleanPropertyFactory.java:435`): the song data has no
 /// BGA, a chart with no `#BMPxx` image (`song/SongData.java:216`).
 const SONG_NO_BGA: i32 = 170;
+/// `song_bga` (`BooleanPropertyFactory.java:436`): it has one.
+const SONG_BGA: i32 = 171;
 /// `chart_judge_veryhard` to `chart_judge_veryeasy`
 /// (`BooleanPropertyFactory.java:448-452`): the song data's judgment class,
 /// which `chart.judge_class` holds, computed from the chart's own rank
@@ -337,19 +340,18 @@ const COURSE_STAGES: [i32; 5] = [280, 281, 282, 283, 289];
 const CONSTANT: i32 = 400;
 
 /// `bgaoff` and `bgaon` (`BooleanPropertyFactory.java:392-393`): the BGA
-/// setting, answered as off on every screen, as selection's image index
-/// 72 reads `BGA_OFF`, since tapestry plays no BGA yet (D33, until S15).
-/// Static outside selection (`:219`), so on play a part under 41 is
-/// removed at installation.
+/// setting, a constant of the session on every screen ([`Bga::shown`]).
+/// Static outside selection (`:219`), so on play a part under the one that
+/// does not hold is removed at installation.
 pub(crate) const BGA_OFF: i32 = 40;
 pub(crate) const BGA_ON: i32 = 41;
 
-/// The BGA setting's answer to built-in `id` (positive): 40 holds and 41
-/// does not (D33); `None` for any other id.
-pub(crate) fn bga_setting(id: i32) -> Option<bool> {
+/// The BGA setting `bga`'s answer to built-in `id` (positive): 41 holds
+/// when the BGA is shown and 40 when it is not; `None` for any other id.
+pub(crate) const fn bga_setting(id: i32, bga: Bga) -> Option<bool> {
     match id {
-        BGA_OFF => Some(true),
-        BGA_ON => Some(false),
+        BGA_OFF => Some(!bga.shown()),
+        BGA_ON => Some(bga.shown()),
         _ => None,
     }
 }
@@ -488,6 +490,7 @@ fn builtin(id: i32) -> Option<(Body, bool)> {
         154 => (Body::Text("chart.difficulty == 4"), false),
         155 => (Body::Text("chart.difficulty == 5"), false),
         SONG_NO_BGA => (Body::Text("chart.bga_valid && !chart.bga"), false),
+        SONG_BGA => (Body::Text("chart.bga_valid && chart.bga"), false),
         CHART_JUDGE..=184 => (
             Body::Text(JUDGE_CLASSES.get(usize::try_from(id - CHART_JUDGE).ok()?)?),
             false,
@@ -523,11 +526,11 @@ pub(crate) fn is_builtin(id: i32) -> bool {
 /// [`MAX_COND_BYTES`]. The latest judgment's PERFECT reads the judgment
 /// state whichever widget draws it, where the source reads it from a
 /// judge region its judge widget makes (`JudgeManager.java:129, 686`).
-fn built_in_cond(id: i32, negative: bool) -> Cond {
+fn built_in_cond(id: i32, negative: bool, bga: Bga) -> Cond {
     if play_constant_false(id) {
         return Cond::Fold(negative);
     }
-    if let Some(on) = bga_setting(id) {
+    if let Some(on) = bga_setting(id, bga) {
         return Cond::Fold(on != negative);
     }
     match builtin(id) {
@@ -554,14 +557,15 @@ fn built_in_cond(id: i32, negative: bool) -> Cond {
 /// is built.
 pub(crate) const MAX_COND_BYTES: usize = 128;
 
-/// Numeric op `op` (non-zero): built-ins first, then the declared items
-/// `items`, each folded to whether it is selected.
-pub(crate) fn numeric(op: i32, items: &BTreeMap<i32, bool>) -> Cond {
+/// Numeric op `op` (non-zero): built-ins first, the BGA setting's from
+/// `bga`, then the declared items `items`, each folded to whether it is
+/// selected.
+pub(crate) fn numeric(op: i32, items: &BTreeMap<i32, bool>, bga: Bga) -> Cond {
     let Ok(id) = i32::try_from(op.unsigned_abs()) else {
         return Cond::Undefined(op);
     };
     if is_builtin(id) {
-        return built_in_cond(id, op < 0);
+        return built_in_cond(id, op < 0, bga);
     }
     if let Some(&on) = items.get(&id) {
         return Cond::Fold(on == (op > 0));
@@ -572,15 +576,15 @@ pub(crate) fn numeric(op: i32, items: &BTreeMap<i32, bool>) -> Cond {
 /// Numeric op `op` (non-zero) on a `kind` screen: play's [`numeric`], or
 /// the selection, decision or result profile's built-ins before the
 /// declared items, a built-in outside the profile unsupported.
-pub(crate) fn numeric_in(kind: ScreenKind, op: i32, items: &BTreeMap<i32, bool>) -> Cond {
+pub(crate) fn numeric_in(kind: ScreenKind, op: i32, items: &BTreeMap<i32, bool>, bga: Bga) -> Cond {
     if kind == ScreenKind::Play {
-        return numeric(op, items);
+        return numeric(op, items, bga);
     }
     let Ok(id) = i32::try_from(op.unsigned_abs()) else {
         return Cond::Undefined(op);
     };
     if is_builtin(id) {
-        return profile_cond(kind, id, op < 0);
+        return profile_cond(kind, id, op < 0, bga);
     }
     if let Some(&on) = items.get(&id) {
         return Cond::Fold(on == (op > 0));
@@ -598,9 +602,12 @@ pub(crate) fn numeric_in(kind: ScreenKind, op: i32, items: &BTreeMap<i32, bool>)
 /// negation, so neither the option nor its negation holds on a view
 /// without the value. The decision's judgment class is a load-time
 /// fact; the decision schema has no field for it, so a frame condition on
-/// it is unsupported.
-fn profile_cond(kind: ScreenKind, id: i32, negative: bool) -> Cond {
+/// it is unsupported. The BGA setting is `bga`'s on every screen.
+fn profile_cond(kind: ScreenKind, id: i32, negative: bool, bga: Bga) -> Cond {
     use super::result::profile::{self as result, ResOption};
+    if let Some(on) = bga_setting(id, bga) {
+        return Cond::Fold(on != negative);
+    }
     let guard = match result::option_guard(id) {
         g if kind == ScreenKind::Result && g != "true" => Some(g),
         _ => None,
@@ -642,12 +649,12 @@ fn profile_cond(kind: ScreenKind, id: i32, negative: bool) -> Cond {
 
 /// A boolean property named `name` on a `kind` screen ([`named`] through
 /// [`numeric_in`]'s built-ins).
-pub(crate) fn named_in(kind: ScreenKind, name: &str) -> Option<Cond> {
+pub(crate) fn named_in(kind: ScreenKind, name: &str, bga: Bga) -> Option<Cond> {
     if kind == ScreenKind::Play {
-        return named(name);
+        return named(name, bga);
     }
     let (id, negative) = resolve_name(name)?;
-    Some(profile_cond(kind, id, negative))
+    Some(profile_cond(kind, id, negative, bga))
 }
 
 /// The id of boolean property `name`, without `!` prefixes.
@@ -680,14 +687,34 @@ pub(crate) fn resolve_name(name: &str) -> Option<(i32, bool)> {
 /// A boolean property named `name` (`getBooleanProperty(String)`,
 /// `BooleanPropertyFactory.java:69-85`): each leading `!` negates; a name
 /// the factory does not know is a script, `None`.
-pub(crate) fn named(name: &str) -> Option<Cond> {
+pub(crate) fn named(name: &str, bga: Bga) -> Option<Cond> {
     let (id, negative) = resolve_name(name)?;
-    Some(built_in_cond(id, negative))
+    Some(built_in_cond(id, negative, bga))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`super::numeric`] under the default BGA setting (on).
+    fn numeric(op: i32, items: &BTreeMap<i32, bool>) -> Cond {
+        super::numeric(op, items, Bga::default())
+    }
+
+    /// [`super::numeric_in`] under the default BGA setting.
+    fn numeric_in(kind: ScreenKind, op: i32, items: &BTreeMap<i32, bool>) -> Cond {
+        super::numeric_in(kind, op, items, Bga::default())
+    }
+
+    /// [`super::named`] under the default BGA setting.
+    fn named(name: &str) -> Option<Cond> {
+        super::named(name, Bga::default())
+    }
+
+    /// [`super::named_in`] under the default BGA setting.
+    fn named_in(kind: ScreenKind, name: &str) -> Option<Cond> {
+        super::named_in(kind, name, Bga::default())
+    }
 
     #[test]
     fn every_built_in_condition_is_built_once_within_its_bound() {
@@ -1032,16 +1059,6 @@ mod tests {
         assert_eq!(numeric(-900, &items), Cond::Fold(false));
         assert_eq!(numeric(901, &items), Cond::Undefined(901));
         assert_eq!(numeric(300, &items), Cond::Unsupported(300));
-        // The BGA setting, answered as off (D33), wins over items declared
-        // with its numbers and the opposite values.
-        let items = BTreeMap::from([(40, false), (41, true)]);
-        assert_eq!(numeric(40, &items), Cond::Fold(true));
-        assert_eq!(numeric(-40, &items), Cond::Fold(false));
-        assert_eq!(numeric(41, &items), Cond::Fold(false));
-        assert_eq!(numeric(-41, &items), Cond::Fold(true));
-        assert_eq!(named("!bgaon"), Some(Cond::Fold(true)));
-        assert_eq!(named("bgaoff"), Some(Cond::Fold(true)));
-        assert_eq!(named("!!bgaon"), Some(Cond::Fold(false)));
     }
 
     /// `table_song` is a scene constant, false, by number and by name, and

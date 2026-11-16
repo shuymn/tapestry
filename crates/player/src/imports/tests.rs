@@ -486,7 +486,13 @@ pub(crate) fn target(r: &Renderer) -> ImportTarget {
 
 /// Builds `choice` as a play skin for `t`.
 pub(crate) fn play(choice: &SkinChoice, t: &ImportTarget) -> KindOutcome {
-    build(ScreenKind::Play, choice, false, t, &Cancel::new())
+    build(
+        ScreenKind::Play,
+        choice,
+        crate::imports::SkinSession::default(),
+        t,
+        &Cancel::new(),
+    )
 }
 
 #[track_caller]
@@ -581,7 +587,7 @@ fn a_skin_builds_only_for_its_own_kind_and_importer() {
     let as_result = build(
         ScreenKind::Result,
         &choice(dir.path(), "s.json"),
-        false,
+        crate::imports::SkinSession::default(),
         &t,
         &c,
     );
@@ -594,7 +600,7 @@ fn a_skin_builds_only_for_its_own_kind_and_importer() {
     let r = refused(build(
         ScreenKind::Result,
         &choice(dir.path(), "r.json"),
-        false,
+        crate::imports::SkinSession::default(),
         &t,
         &c,
     ));
@@ -624,7 +630,13 @@ fn a_skin_builds_only_for_its_own_kind_and_importer() {
     ] {
         #[cfg(feature = "dev-tools")]
         let passes = skin_beatoraja::vm_hooks::thread_passes();
-        let why = refused(build(ScreenKind::Result, &c2, false, &t, &c));
+        let why = refused(build(
+            ScreenKind::Result,
+            &c2,
+            crate::imports::SkinSession::default(),
+            &t,
+            &c,
+        ));
         assert!(!why.is_empty(), "{entry}");
         #[cfg(feature = "dev-tools")]
         assert_eq!(
@@ -935,7 +947,16 @@ fn a_lua_skin_builds_on_the_base_facts() {
     // Source y 0 is the canvas's bottom: the image lies on rows 1016 to 1079.
     let at = |p: &[u8], x| crate::render_common::rgb_at(p, 1_920, (x, 1_048));
     for (autoplay, x, request) in [(false, 32, 1), (true, 532, 2)] {
-        let (b, _) = bundled(build(ScreenKind::Play, &c, autoplay, &t, &Cancel::new()));
+        let (b, _) = bundled(build(
+            ScreenKind::Play,
+            &c,
+            crate::imports::SkinSession {
+                autoplay,
+                ..Default::default()
+            },
+            &t,
+            &Cancel::new(),
+        ));
         let p = frame(&mut r, &b, request);
         assert_eq!(at(&p, x), RED, "autoplay {autoplay}");
     }
@@ -965,7 +986,13 @@ fn a_play_skin_goes_on_past_a_protected_absent_part() {
          if not ok and type(e) == \"string\" then x = 500 end",
     );
     let c = choice(dir.path(), "play.luaskin");
-    let (b, _) = bundled(build(ScreenKind::Play, &c, false, &t, &Cancel::new()));
+    let (b, _) = bundled(build(
+        ScreenKind::Play,
+        &c,
+        crate::imports::SkinSession::default(),
+        &t,
+        &Cancel::new(),
+    ));
     let p = frame(&mut r, &b, 1);
     let at = |p: &[u8], x| crate::render_common::rgb_at(p, 1_920, (x, 1_048));
     assert_eq!(at(&p, 532), RED);
@@ -974,7 +1001,7 @@ fn a_play_skin_goes_on_past_a_protected_absent_part() {
     let why = refused(build(
         ScreenKind::Play,
         &choice(dir.path(), "play.luaskin"),
-        false,
+        crate::imports::SkinSession::default(),
         &t,
         &Cancel::new(),
     ));
@@ -1264,7 +1291,13 @@ fn looping_job(
             default_font: render::DefaultFont::runtime,
         };
         Witness(
-            Some(build(ScreenKind::Play, &c, false, &t, cancel)),
+            Some(build(
+                ScreenKind::Play,
+                &c,
+                crate::imports::SkinSession::default(),
+                &t,
+                cancel,
+            )),
             dropped,
         )
     }

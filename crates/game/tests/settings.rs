@@ -7,11 +7,12 @@ use bms_model::{Lane, TimeUs};
 use eval::{AxisBinding, AxisMode, Binding, ControlId, ScratchSettings, SourceProfile};
 use game::sound_sets::SetRole;
 use game::{
-    Adjust, Chain, Channel, ControllerDevice, CoverSettings, DataRoot, DeviceSettings,
-    FailureAction, HiSpeedReference, HiSpeedSettings, KeyConfig, KeyError, LaneKey, Language,
-    LibrarySettings, LocalRecords, PlayerSettings, PlayerSettingsError, RecordSink, Role,
-    ScoreTarget, ScratchConfig, Settings, SettingsError, SkinChoice, SkinChoices, SoundSettings,
-    SpeedMode, Tuning, Volume, load_settings, save_settings, write_atomic,
+    Adjust, BgaExpand, BgaMode, BgaSettings, Chain, Channel, ControllerDevice, CoverSettings,
+    DataRoot, DeviceSettings, FailureAction, HiSpeedReference, HiSpeedSettings, KeyConfig,
+    KeyError, LaneKey, Language, LibrarySettings, LocalRecords, PlayerSettings,
+    PlayerSettingsError, RecordSink, Role, ScoreTarget, ScratchConfig, Settings, SettingsError,
+    SkinChoice, SkinChoices, SoundSettings, SpeedMode, Tuning, Volume, load_settings,
+    save_settings, write_atomic,
 };
 use input::DeviceKind;
 use input::hid::AxisCap;
@@ -130,6 +131,10 @@ fn changed() -> Settings {
                 sound_root: Some(absolute("sets/sound")),
                 bgm_root: Some(PathBuf::new()),
                 loop_result: true,
+            },
+            bga: BgaSettings {
+                mode: BgaMode::Autoplay,
+                expand: BgaExpand::Full,
             },
         },
     }
@@ -443,6 +448,7 @@ fn device_and_player_settings_round_trip() {
          hidden = 40\nhidden_on = true\n\
          [skins.play]\nroot = 'D:\\skins\\Mine'\nentry = 'play/play7.luaskin'\n\
          options = { \"Lane cover\" = \"On\" }\nfiles = { \"Background\" = \"bg2.png\" }\n\
+         [bga]\nmode = \"autoplay\"\nexpand = \"full\"\n\
          [sounds]\nbgm_root = ''\nloop_result = true\n"
             .to_owned()
             + &format!("sound_root = '{}'\n", absolute("sets/sound").display()),

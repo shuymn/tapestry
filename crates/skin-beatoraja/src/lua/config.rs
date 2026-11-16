@@ -50,6 +50,9 @@ pub(crate) struct Bridge {
     /// configured value, else zeros.
     offset_ids: BTreeMap<i32, OffsetValue>,
     choices: Choices,
+    /// The BGA setting the configuration carries, which options 40 and 41
+    /// answer from in the configured pass and the runtime.
+    pub(crate) bga: crate::import::Bga,
 }
 
 impl Bridge {
@@ -96,6 +99,7 @@ impl Bridge {
             offsets,
             offset_ids,
             choices,
+            bga: config.bga,
         }
     }
 

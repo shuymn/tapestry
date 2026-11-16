@@ -511,8 +511,10 @@ fn an_open_analysis_still_lowers_literals() {
 
 #[test]
 fn op_functions_join_in_the_source_s_order() {
-    use crate::import::ops::{Cond, named, numeric};
+    use crate::import::ops::Cond;
     use skin_model::{PLAY, Scope, State, Ty, compile};
+    let numeric = |op, items| crate::import::ops::numeric(op, items, Default::default());
+    let named = |name| crate::import::ops::named(name, Default::default());
     let expr = |c: Option<Cond>| match c {
         Some(Cond::Expr { src, .. }) => src,
         other => panic!("{other:?}"),
