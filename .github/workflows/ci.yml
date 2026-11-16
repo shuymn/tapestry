@@ -382,6 +382,7 @@ jobs:
           workspaces: |
             . -> target
             fuzz -> target
+            test-device/firmware -> target
       - name: Format
         run: mise exec -- cargo fmt --all --check
       - name: Architecture rules
@@ -420,6 +421,22 @@ jobs:
         run: mise exec -- cargo clippy --manifest-path fuzz/Cargo.toml --all-targets --locked -- -D warnings
       - name: Test (fuzz seed smoke cases)
         run: mise exec -- cargo test --manifest-path fuzz/Cargo.toml --locked
+      # The test device's firmware is its own workspace for the RP2350
+      # (test-device/firmware/Cargo.toml, docs/test-device.md "Building"),
+      # built with the target mise.toml installs. Its own folder, so its
+      # .cargo/config.toml sets the target.
+      - name: Format (test device firmware)
+        run: mise exec -- cargo fmt --manifest-path test-device/firmware/Cargo.toml --check
+      - name: Clippy (test device firmware)
+        working-directory: test-device/firmware
+        run: |
+          mise exec -- rustup target list --installed | grep -x thumbv8m.main-none-eabihf
+          mise exec -- cargo clippy --release --locked -- -D warnings
+          mise exec -- cargo clippy --release --locked --features debug-faults -- -D warnings
+      - name: Build (test device firmware UF2s)
+        run: |
+          mise exec -- cargo xtask test-device build
+          mise exec -- cargo xtask test-device build --features debug-faults
       # An unreadable registry index only warns and skips the yanked check;
       # dep-check.sh fails on it after three tries (docs/setup.md
       # "Dependency Checks").
@@ -436,7 +453,7 @@ jobs:
           set -o pipefail
           mise exec -- cargo machete --with-metadata 2>&1 | tee "$RUNNER_TEMP/machete.log"
           if grep '^error when handling' "$RUNNER_TEMP/machete.log"; then exit 1; fi
-          git diff --exit-code Cargo.lock fuzz/Cargo.lock
+          git diff --exit-code Cargo.lock fuzz/Cargo.lock test-device/firmware/Cargo.lock
       # cargo-audit only logs index failures (on stderr, which dep-check.sh
       # scans).
       - name: cargo-audit
@@ -486,7 +503,7 @@ jobs:
     needs: changes
     if: ${{ !cancelled() && needs.changes.outputs.code != 'false' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 40
     permissions:
       contents: read
     steps:
@@ -496,11 +513,16 @@ jobs:
       - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
       # The wrapper self-test enters the `fuzz` shell too.
       - name: Prepare the dev shells
-        run: scripts/nix-prepare.sh default fuzz
+        run: scripts/nix-prepare.sh default fuzz test-device
       - name: Test (portable crates, dev shell)
         run: scripts/wsl.sh cargo xtask portable test --locked
       - name: Wrapper self-test
         run: scripts/wsl-selftest.sh
+      # F0 (docs/test-device.md "Verification"): the UF2 xtask writes is
+      # byte-identical to picotool's own conversion, which names the RP2350
+      # and an ARM Secure image.
+      - name: Test device UF2 checked by picotool
+        run: TAPESTRY_NIX_SHELL=test-device scripts/wsl.sh cargo xtask test-device build --picotool
 
   nix-fuzz:
     needs: changes
