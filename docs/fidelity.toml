@@ -332,3 +332,19 @@ tests = [
     "crates/player/src/selection/tests/pointer.rs::the_wheel_steps_around_the_ring",
     "crates/player/src/menu_screen/tests/skinned.rs::a_short_list_fills_every_slot_around_the_cursor",
 ]
+
+[[entry]]
+id = "SF-017"
+summary = "A small BGA picture's canvas margin is black when the picture has no alpha channel"
+class = "rule"
+reason = """
+A player sees an opaque BGA picture stay opaque when it is smaller than its \
+256×256 canvas: the margin around a BMP, a JPEG or a PNG with no alpha is \
+black, as the chart's author saw it, and only a picture with an alpha \
+channel lets the skin show through its margin."""
+source = ["src/bms/player/beatoraja/play/bga/BGImageProcessor.java:46-56 @beatoraja-0.8.9"]
+sites = ["crates/skin-model/src/bga.rs"]
+tests = [
+    "crates/skin-model/tests/bga_images.rs::small_opaque_picture_centres_on_a_black_canvas",
+    "crates/skin-model/tests/bga_images.rs::small_picture_with_alpha_centres_on_a_transparent_canvas",
+]
