@@ -55,7 +55,7 @@ fn write(
             })
         })
         .collect();
-    r.write_bga_cell(key, &place, &texels).unwrap();
+    r.write_bga_cells(key, &[(place, texels)]).unwrap();
     BgaEntry::Picture(BgaCell {
         uv: place.uv(),
         native: [SIDE, SIDE],

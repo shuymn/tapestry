@@ -3345,27 +3345,28 @@ impl Renderer {
         Ok(key)
     }
 
-    /// Writes one cell of `texels` (premultiplied RGBA8 rows of its padded
-    /// size) at `place` of the array `key` names, and waits for the GPU
-    /// before it returns, so the queue's staging of one cell is released
-    /// before the next.
+    /// Writes a batch of cells, each its `texels` (premultiplied RGBA8 rows
+    /// of its padded size) at its place, into the array `key` names, and
+    /// waits for the GPU once before it returns, so the queue's staging of
+    /// one batch is released before the next.
     ///
     /// # Errors
     ///
     /// [`crate::BgaFault::Stale`] when `key` is not the array in use (or the
     /// device is lost), [`crate::BgaFault::Cell`] for a cell off its page,
     /// [`crate::BgaFault::Refused`] when the device refuses the write.
-    pub fn write_bga_cell(
+    pub fn write_bga_cells(
         &mut self,
         key: skin_model::bga::BgaKey,
-        place: &skin_model::bga::CellPlace,
-        texels: &[u8],
+        cells: &[(skin_model::bga::CellPlace, Vec<u8>)],
     ) -> Result<(), crate::BgaFault> {
         if self.bga_key() != Some(key) {
             return Err(crate::BgaFault::Stale);
         }
         let (written, refused) = skin_atlas::scoped(self.gpu.device(), || {
-            let w = self.bga.write(&self.gpu, place, texels);
+            let w = cells
+                .iter()
+                .try_for_each(|(place, texels)| self.bga.write(&self.gpu, place, texels));
             self.gpu.queue().submit([]);
             w
         });

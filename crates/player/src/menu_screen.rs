@@ -935,13 +935,12 @@ impl Screen for MenuScreen {
         self.renderer.begin_bga(pages)
     }
 
-    fn write_bga_cell(
+    fn write_bga_cells(
         &mut self,
         key: skin_model::bga::BgaKey,
-        place: &skin_model::bga::CellPlace,
-        texels: &[u8],
+        cells: &[(skin_model::bga::CellPlace, Vec<u8>)],
     ) -> Result<(), render::BgaFault> {
-        self.renderer.write_bga_cell(key, place, texels)
+        self.renderer.write_bga_cells(key, cells)
     }
 
     fn publish_bga(

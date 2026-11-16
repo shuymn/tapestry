@@ -15,9 +15,11 @@
 //!   ([`reserve`]). It resolves every id by the source's priority order
 //!   ([`bga::resolve`]) and reuses the array the last attempt published
 //!   when every id resolves to the same unchanged file; otherwise it
-//!   probes, packs by the ladder ([`bga::pack`]) and decodes one cell at a
-//!   time, each written and acknowledged, its bytes dropped, before the
-//!   next is decoded.
+//!   probes, packs by the ladder ([`bga::pack`]) and decodes one picture at
+//!   a time into its cell. The cells go to the render thread in batches of
+//!   at most [`BATCH`] bytes: a batch is written, acknowledged and its bytes
+//!   dropped before the picture whose cell would overflow it is decoded, so
+//!   a decode and one batch are all the job holds.
 //! - **Absence.** A refused reservation or allocation, or a refused array
 //!   or write, publishes every picture absent; a picture that cannot be
 //!   read is absent alone. Play starts in every case.
@@ -42,8 +44,8 @@ use crate::render_side::BgaPublisher;
 pub(crate) mod tests;
 
 /// The transient the job states before it reads ("Memory Budget"): one
-/// picture's whole-decode bound, as the chart images', and the one cell in
-/// hand, at most a whole page.
+/// picture's whole-decode bound, as the chart images', and the cells in
+/// hand, at most a whole page's bytes together ([`BATCH`]).
 pub const TERMS: Terms = Terms {
     decode: 161 << 20,
     cell: bga::PAGE_SIDE as u64 * bga::PAGE_SIDE as u64 * 4,
@@ -55,6 +57,16 @@ pub struct Terms {
     pub decode: u64,
     pub cell: u64,
 }
+
+/// The bytes of cells handed to the render thread in one step: the cell
+/// term, a whole page's, so a batch never holds more than the largest cell
+/// could.
+pub const BATCH: u64 = TERMS.cell;
+
+/// Batches are limited to this many bytes instead of [`BATCH`]; 0 for
+/// [`BATCH`] (tests).
+#[cfg(test)]
+pub static BATCH_LIMIT: AtomicU64 = AtomicU64::new(0);
 
 /// The reservation refuses every terms while set (tests).
 #[cfg(test)]
@@ -104,6 +116,18 @@ fn limit() -> Option<u64> {
     None
 }
 
+/// The bytes a batch may hold.
+fn batch_limit() -> u64 {
+    #[cfg(test)]
+    {
+        let l = BATCH_LIMIT.load(Ordering::SeqCst);
+        if l > 0 {
+            return l;
+        }
+    }
+    BATCH
+}
+
 #[cfg(test)]
 fn hold(cancel: &dyn Fn() -> bool) {
     let end = Instant::now() + Duration::from_secs(30);
@@ -143,12 +167,11 @@ pub enum BgaMsg {
         pages: u32,
         reply: mpsc::SyncSender<Result<BgaKey, BgaFault>>,
     },
-    /// Write one cell's texels ([`render::Renderer::write_bga_cell`]),
-    /// then drop them.
-    Cell {
+    /// Write a batch of cells, each its place and texels
+    /// ([`render::Renderer::write_bga_cells`]), then drop them.
+    Cells {
         key: BgaKey,
-        place: CellPlace,
-        texels: Vec<u8>,
+        cells: Vec<(CellPlace, Vec<u8>)>,
         reply: mpsc::SyncSender<Result<(), BgaFault>>,
     },
     /// Publish the table ([`render::Renderer::publish_bga`]).
@@ -223,6 +246,78 @@ impl Kept {
                 .iter()
                 .zip(bindings)
                 .all(|(a, b)| a.same_as(b))
+    }
+}
+
+/// The decoded cells not yet handed to the render thread.
+#[derive(Default)]
+struct Batch {
+    cells: Vec<(CellPlace, Vec<u8>)>,
+    /// Each cell's entry and the picture's native size.
+    shown: Vec<(usize, CellPlace, [u32; 2])>,
+    bytes: u64,
+}
+
+impl Batch {
+    fn push(&mut self, index: usize, place: CellPlace, native: [u32; 2], texels: Vec<u8>) {
+        self.bytes += cell_bytes(&place);
+        self.cells.push((place, texels));
+        self.shown.push((index, place, native));
+    }
+}
+
+/// A cell's bytes at `place`, its gutter included.
+fn cell_bytes(place: &CellPlace) -> u64 {
+    let [w, h] = place.padded();
+    u64::from(w) * u64::from(h) * 4
+}
+
+/// How a batch was handed over.
+enum Handed {
+    /// Written: its entries now name their cells.
+    Written,
+    /// Its generation or array is gone.
+    Stale,
+    Refused(BgaFault),
+    Unanswered,
+}
+
+/// Hands `batch`'s cells to the render thread in one step, leaving it
+/// empty, and enters each written cell in `entries`.
+fn hand_over(
+    link: &BgaPublisher,
+    generation: u64,
+    key: BgaKey,
+    batch: &mut Batch,
+    entries: &mut [BgaEntry],
+) -> Handed {
+    let cells = std::mem::take(&mut batch.cells);
+    let shown = std::mem::take(&mut batch.shown);
+    batch.bytes = 0;
+    #[cfg(feature = "dev-tools")]
+    crate::dev::stage("bga_upload_start");
+    let written = ask(link, generation, |reply| BgaMsg::Cells {
+        key,
+        cells,
+        reply,
+    });
+    #[cfg(feature = "dev-tools")]
+    crate::dev::stage("bga_upload_end");
+    match written {
+        Asked::Answer(Ok(())) => {
+            for (i, place, native) in shown {
+                if let Some(e) = entries.get_mut(i) {
+                    *e = BgaEntry::Picture(BgaCell {
+                        uv: place.uv(),
+                        native: bga::drawn_size(native),
+                    });
+                }
+            }
+            Handed::Written
+        }
+        Asked::Answer(Err(BgaFault::Stale)) => Handed::Stale,
+        Asked::Answer(Err(e)) => Handed::Refused(e),
+        Asked::Unanswered => Handed::Unanswered,
     }
 }
 
@@ -372,11 +467,23 @@ fn read_and_publish(
     };
     #[cfg(test)]
     hold(cancel);
-    for (((b, entry), native), place) in bindings
+    // How a batch's handing over ends the job, if it does.
+    let stop = |handed: Handed| match handed {
+        Handed::Written => None,
+        Handed::Stale => Some(End::Stopped),
+        Handed::Refused(e) => {
+            log::warn!("bga: a write was refused ({e}); the pictures are absent");
+            Some(publish(None, absent()))
+        }
+        Handed::Unanswered => Some(End::Unanswered),
+    };
+    let limit_bytes = batch_limit();
+    let mut batch = Batch::default();
+    for (i, ((b, native), place)) in bindings
         .iter()
-        .zip(&mut entries)
         .zip(&natives)
         .zip(&packing.cells)
+        .enumerate()
     {
         let (
             BgaBinding::Resolved {
@@ -389,6 +496,15 @@ fn read_and_publish(
             continue;
         };
         if cancel() {
+            return out;
+        }
+        // The batch goes before the picture whose cell would overflow it
+        // is decoded.
+        if !batch.cells.is_empty()
+            && batch.bytes + cell_bytes(&place) > limit_bytes
+            && let Some(end) = stop(hand_over(link, generation, key, &mut batch, &mut entries))
+        {
+            out.end = end;
             return out;
         }
         #[cfg(feature = "dev-tools")]
@@ -407,37 +523,15 @@ fn read_and_publish(
             Err(_) => continue,
         };
         out.decoded += 1;
-        let texels = pixels.texels;
-        #[cfg(feature = "dev-tools")]
-        crate::dev::stage("bga_upload_start");
-        let written = ask(link, generation, |reply| BgaMsg::Cell {
-            key,
-            place,
-            texels,
-            reply,
-        });
-        #[cfg(feature = "dev-tools")]
-        crate::dev::stage("bga_upload_end");
-        match written {
-            Asked::Answer(Ok(())) => {
-                *entry = BgaEntry::Picture(BgaCell {
-                    uv: place.uv(),
-                    native: bga::drawn_size(native),
-                });
-            }
-            Asked::Answer(Err(BgaFault::Stale)) => return out,
-            Asked::Answer(Err(e)) => {
-                log::warn!("bga: a write was refused ({e}); the pictures are absent");
-                out.end = publish(None, absent());
-                return out;
-            }
-            Asked::Unanswered => {
-                out.end = End::Unanswered;
-                return out;
-            }
-        }
+        batch.push(i, place, native, pixels.texels);
     }
     if cancel() {
+        return out;
+    }
+    if !batch.cells.is_empty()
+        && let Some(end) = stop(hand_over(link, generation, key, &mut batch, &mut entries))
+    {
+        out.end = end;
         return out;
     }
     out.end = publish(Some(key), entries);

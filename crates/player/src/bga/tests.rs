@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use game::coord::{Caps, Class, Coordinator, JobKey, JobKind, Owner, Scope, Spawner};
 use skin_model::bga::{BgaEntry, BgaTable};
 
-use super::{BgaMsg, BgaWorker, HELD, HOLD, Poll, Want};
+use super::{BATCH, BATCH_LIMIT, BgaMsg, BgaWorker, HELD, HOLD, Poll, Want};
 use crate::render_side::RenderLink;
 use crate::render_side::tests::Installers;
 
@@ -231,4 +231,60 @@ fn bga_set_is_reused_only_on_an_unchanged_key() {
     assert_eq!(entries(&jpeg)[1], Some([500, 260]));
     assert_eq!(w.counts(), (5, 10));
     assert_eq!(begins(), 4);
+}
+
+/// Puts the batch limit back when dropped, a failing test's included.
+struct BatchBack;
+
+impl Drop for BatchBack {
+    fn drop(&mut self) {
+        BATCH_LIMIT.store(0, Ordering::SeqCst);
+    }
+}
+
+/// The cells go to the render thread in batches within the cell term: all
+/// of a small set in one step, and with the limit at two cells' bytes, a
+/// batch handed over before the picture whose cell would overflow it is
+/// decoded, so no batch holds more than the limit.
+#[test]
+fn bga_cells_go_in_batches_within_the_cell_term() {
+    let _serial = crate::imports::tests::serial();
+    let _back = BatchBack;
+    let d = tempfile::tempdir().unwrap();
+    let names = ["1.png", "2.png", "3.png", "4.png", "5.png"];
+    for (i, n) in (0_u8..).zip(names) {
+        png(d.path(), n, [300, 300], [i * 40, 100, 0]);
+    }
+    // A 300×300 picture's cell: its gutter on every side.
+    let cell = 302 * 302 * 4;
+    for (limit, batches) in [(0, vec![5]), (2 * cell, vec![2, 2, 1])] {
+        BATCH_LIMIT.store(u64::try_from(limit).unwrap(), Ordering::SeqCst);
+        let screens = Installers::default();
+        let link = render(&screens);
+        let coord = Coordinator::new(CAPS);
+        let w = worker(&link);
+        w.renew();
+        w.attempt(want(d.path(), &names));
+        let t = ready(&w, &coord);
+        assert!(
+            t.entries().iter().all(|e| native(*e) == Some([300, 300])),
+            "{limit}"
+        );
+        let seen = screens.bga.lock().unwrap();
+        let counts: Vec<usize> = seen.batches.iter().map(|&(n, _)| n).collect();
+        assert_eq!(counts, batches, "{limit}");
+        let bound = if limit == 0 {
+            usize::try_from(BATCH).unwrap()
+        } else {
+            limit
+        };
+        assert!(
+            seen.batches
+                .iter()
+                .all(|&(n, bytes)| bytes == n * cell && bytes <= bound),
+            "{:?}",
+            seen.batches
+        );
+        assert_eq!(seen.cells, 5);
+    }
 }

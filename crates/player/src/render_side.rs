@@ -204,18 +204,17 @@ pub trait Screen: Send {
         let _ = pages;
         Err(render::BgaFault::Refused)
     }
-    /// Writes a BGA cell ([`render::Renderer::write_bga_cell`]).
+    /// Writes a batch of BGA cells ([`render::Renderer::write_bga_cells`]).
     ///
     /// # Errors
     ///
     /// As the renderer's; [`render::BgaFault::Refused`] by default.
-    fn write_bga_cell(
+    fn write_bga_cells(
         &mut self,
         key: skin_model::bga::BgaKey,
-        place: &skin_model::bga::CellPlace,
-        texels: &[u8],
+        cells: &[(skin_model::bga::CellPlace, Vec<u8>)],
     ) -> Result<(), render::BgaFault> {
-        let _ = (key, place, texels);
+        let _ = (key, cells);
         Err(render::BgaFault::Refused)
     }
     /// Publishes the BGA table ([`render::Renderer::publish_bga`]): by
@@ -7853,7 +7852,7 @@ impl Run {
     /// Takes a step of the BGA pictures' publication of `generation`:
     /// refused ([`render::BgaFault::Stale`], nothing published, no array
     /// read as published) unless it is the game thread's current one, and
-    /// answered at once. A cell's bytes are dropped once written.
+    /// answered at once. A batch's bytes are dropped once written.
     fn bga(&mut self, generation: u64, msg: crate::bga::BgaMsg) {
         use crate::bga::BgaMsg;
         let current = self.shared.bga_generation.load(Ordering::SeqCst) == generation;
@@ -7863,14 +7862,9 @@ impl Run {
             BgaMsg::Begin { pages, reply } => {
                 let _ = reply.send(screen.map_or(Err(stale), |s| s.begin_bga(pages)));
             }
-            BgaMsg::Cell {
-                key,
-                place,
-                texels,
-                reply,
-            } => {
-                let written = screen.map_or(Err(stale), |s| s.write_bga_cell(key, &place, &texels));
-                drop(texels);
+            BgaMsg::Cells { key, cells, reply } => {
+                let written = screen.map_or(Err(stale), |s| s.write_bga_cells(key, &cells));
+                drop(cells);
                 let _ = reply.send(written);
             }
             BgaMsg::Publish {
@@ -14878,21 +14872,25 @@ pub(crate) mod tests {
                 array: b.arrays,
             })
         }
-        fn write_bga_cell(
+        fn write_bga_cells(
             &mut self,
             key: skin_model::bga::BgaKey,
-            place: &skin_model::bga::CellPlace,
-            texels: &[u8],
+            cells: &[(skin_model::bga::CellPlace, Vec<u8>)],
         ) -> Result<(), render::BgaFault> {
             let mut b = self.shared.bga.lock().unwrap();
             if b.live != Some(key.array) {
                 return Err(render::BgaFault::Stale);
             }
-            let [w, h] = place.padded();
-            if texels.len() != usize::try_from(u64::from(w) * u64::from(h) * 4).unwrap() {
-                return Err(render::BgaFault::Cell);
+            let mut bytes = 0;
+            for (place, texels) in cells {
+                let [w, h] = place.padded();
+                if texels.len() != usize::try_from(u64::from(w) * u64::from(h) * 4).unwrap() {
+                    return Err(render::BgaFault::Cell);
+                }
+                bytes += texels.len();
             }
-            b.cells += 1;
+            b.cells += u32::try_from(cells.len()).unwrap();
+            b.batches.push((cells.len(), bytes));
             Ok(())
         }
         fn publish_bga(
@@ -15195,6 +15193,8 @@ pub(crate) mod tests {
         pub(crate) begins: Vec<u32>,
         /// The cells written.
         pub(crate) cells: u32,
+        /// Each batch written: its cells and their bytes.
+        pub(crate) batches: Vec<(usize, usize)>,
         /// Each table published, in order.
         pub(crate) published: Vec<Arc<skin_model::bga::BgaTable>>,
         /// The array in use, by its number.
