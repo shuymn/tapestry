@@ -1,9 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/*", "xtask"]
-# Its own workspace and lockfile, built with the nightly of the Nix `fuzz`
-# shell (docs/setup.md "Fuzzing").
-exclude = ["fuzz"]
+# Each its own workspace and lockfile: the fuzz targets built with the
+# nightly of the Nix `fuzz` shell (docs/setup.md "Fuzzing"), the test
+# device's firmware for the RP2350 (docs/test-device.md "Building").
+exclude = ["fuzz", "test-device/firmware"]
 
 [workspace.package]
 edition = "2024"
