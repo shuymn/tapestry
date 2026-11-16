@@ -124,6 +124,21 @@ proc-macro2 = { version = "1.0.107", default-features = false, features = ["span
 quote = { version = "1.0.47", default-features = false }
 syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "printing", "visit"] }
 
+# Debug builds as the Windows CI jobs build them (docs/setup.md "CI"): line
+# tables keep backtraces' files and lines at a fraction of full debug info's
+# size, and optimized dependencies make the CPU-bound tests faster. The Linux
+# jobs restore the dependencies' default opt-level. Full debug info for a
+# debugger: `CARGO_PROFILE_DEV_DEBUG=full` (and `CARGO_PROFILE_TEST_DEBUG=full`
+# for tests).
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 2
+
 # Used by the `cargo xtask` alias (.cargo/config.toml).
 [profile.xtask]
 inherits = "dev"
