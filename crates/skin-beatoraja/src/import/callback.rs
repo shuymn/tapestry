@@ -1578,15 +1578,18 @@ impl Cx<'_> {
     /// destination's `timer`: at a property field of its own, as another
     /// field's callback, or on another screen. Each use is its own node:
     /// one observer held at a timer and elsewhere is refused for the
-    /// other use.
+    /// other use. Only the nodes where the source reads a callback are
+    /// uses; one held anywhere else is inert.
     pub(super) fn close_observers(&mut self) -> Result<(), ImportError> {
         let Some(lua) = self.def.arena.lua.as_deref() else {
             return Ok(());
         };
         let first = crate::lua::callback::callable_nodes(&self.def.arena).find(|&(id, c)| {
-            lua.callables
-                .get(c as usize)
-                .is_some_and(|k| k.root && matches!(k.kind, CallableKind::Observer { .. }))
+            lua.callback_nodes.binary_search(&id).is_ok()
+                && lua
+                    .callables
+                    .get(c as usize)
+                    .is_some_and(|k| matches!(k.kind, CallableKind::Observer { .. }))
                 && !self.observers.contains(&id)
         });
         match first {

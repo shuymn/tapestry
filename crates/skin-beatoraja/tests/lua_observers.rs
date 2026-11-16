@@ -402,6 +402,32 @@ fn an_observer_at_a_destination_the_import_drops_is_no_refusal() {
     import_body(&body).unwrap();
 }
 
+/// An observer held where the source never reads a callback is inert
+/// (design.md "beatoraja Lua Skins": a function outside a callback
+/// position is inert): stored in the skin table, in a table there, or in
+/// a destination field the source does not read, beside its timer use,
+/// it refuses nothing.
+#[test]
+fn an_observer_held_outside_a_callback_position_is_inert() {
+    let mut refused = Vec::new();
+    for (place, store) in [
+        ("a skin field", "skin.saved = on"),
+        ("a table", "skin.saved = { on = on }"),
+        ("an unread destination field", ""),
+    ] {
+        let fields = if store.is_empty() {
+            "timer = on, saved = on,"
+        } else {
+            "timer = on,"
+        };
+        let body = format!("{TWINS}\n{store}\n{}", moving(100, fields));
+        if let Err(e) = import_body(&body) {
+            refused.push(format!("{place}: {e}"));
+        }
+    }
+    assert!(refused.is_empty(), "refused: {refused:#?}");
+}
+
 #[test]
 fn the_observe_call_s_arguments_are_checked_at_the_call() {
     let observe = u16::try_from(

@@ -233,6 +233,7 @@ pub(super) fn convert(
         bytes: Vec::new(),
         values: Vec::new(),
         callables: Vec::new(),
+        callback_nodes: Vec::new(),
         functions: Vec::new(),
         seen: HashMap::new(),
         path: Vec::new(),
@@ -259,6 +260,7 @@ pub(super) fn convert(
         bytes,
         values,
         callables,
+        callback_nodes,
         functions,
         mut analysis,
         ..
@@ -282,6 +284,7 @@ pub(super) fn convert(
         values,
         modules,
         callables,
+        callback_nodes,
         analysis,
         kept: None,
     }));
@@ -335,6 +338,9 @@ struct Conv<'a> {
     bytes: Vec<u8>,
     values: Vec<LuaScalar>,
     callables: Vec<Callable>,
+    /// The nodes holding a function at a property field or an `op` entry
+    /// ([`LuaText::callback_nodes`]).
+    callback_nodes: Vec<u32>,
     /// Each callable's function, by its index: what a screen's runtime
     /// calls when the import keeps the VM.
     functions: Vec<Function>,
@@ -471,10 +477,12 @@ impl Conv<'_> {
                         i
                     }
                 };
+                let id = self.scalar(LuaScalar::Callable(index), span)?;
                 if matches!(pos, Pos::Prop(_)) {
                     self.root(index, f)?;
+                    self.callback_nodes.push(id);
                 }
-                self.scalar(LuaScalar::Callable(index), span)
+                Ok(id)
             }
             _ => Err(self.lua(LuaWhy::Value)),
         }

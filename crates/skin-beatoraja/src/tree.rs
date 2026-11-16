@@ -86,6 +86,10 @@ pub(crate) struct LuaText {
     pub(crate) modules: Vec<String>,
     /// The functions the table held, each instance once.
     pub(crate) callables: Vec<Callable>,
+    /// The nodes holding a function where the source reads a callback (a
+    /// property field or an `op` entry), ascending: a function held
+    /// anywhere else is inert.
+    pub(crate) callback_nodes: Vec<u32>,
     /// The configured pass's trees and captures; `None` for the header
     /// pass's table.
     pub(crate) analysis: Option<Box<crate::lua::callback::Analysis>>,
