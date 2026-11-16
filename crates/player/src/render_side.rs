@@ -14359,6 +14359,8 @@ pub(crate) mod tests {
         /// The best and target the staged attempt's context gave, which
         /// the skin's `Play` keeps ([`skin_model::Play::score`]).
         staged_score: Option<skin_model::ScoreBasis>,
+        /// The best's pace the staged attempt's context gave, copied.
+        staged_pace: Option<Vec<u32>>,
         /// The token of the play staging a specialization made, neither
         /// committed nor discarded.
         staged_token: Option<render::PreparedToken>,
@@ -14440,6 +14442,7 @@ pub(crate) mod tests {
                 a.context.scratch, a.text.title
             ));
             self.staged_score = Some(a.context.score.basis);
+            self.staged_pace = a.context.score.pace.map(<[u32]>::to_vec);
             // The skin given is staged with the attempt, as the renderer
             // stages it, and installed only by the commit.
             if let Some(skin) = skin {
@@ -14486,6 +14489,8 @@ pub(crate) mod tests {
                 && let Some(score) = self.staged_score.take()
             {
                 self.shared.committed_scores.lock().unwrap().push(score);
+                let pace = self.staged_pace.take();
+                self.shared.committed_paces.lock().unwrap().push(pace);
             }
             Ok(())
         }
@@ -14493,6 +14498,7 @@ pub(crate) mod tests {
             self.note("discard");
             self.staged = None;
             self.staged_score = None;
+            self.staged_pace = None;
             self.staged_token = None;
             *self.shared.staging.lock().unwrap() = None;
         }
@@ -14865,6 +14871,8 @@ pub(crate) mod tests {
         pub(crate) panic_prepare: Arc<AtomicBool>,
         /// The best and target of each attempt committed, in order.
         pub(crate) committed_scores: Arc<std::sync::Mutex<Vec<skin_model::ScoreBasis>>>,
+        /// The best's pace of each attempt committed, in order.
+        pub(crate) committed_paces: Arc<std::sync::Mutex<Vec<Option<Vec<u32>>>>>,
         /// Each play frame built: its own sample on the clock, its screen
         /// clock and its chart time; noted only while the vector has room
         /// (a test reserves it), so noting never allocates.
@@ -14941,6 +14949,7 @@ pub(crate) mod tests {
                     held: None,
                     target: [1_920, 1_080],
                     staged_score: None,
+                    staged_pace: None,
                     staged_token: None,
                 }) as Box<dyn Screen>)
             });

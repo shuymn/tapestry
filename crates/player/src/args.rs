@@ -355,9 +355,46 @@ mod tests {
             Some(std::time::Duration::from_secs(90))
         );
         assert_eq!(s.dev.stop_timeout, Some(std::time::Duration::from_secs(30)));
+        assert_eq!(s.dev.window, None);
         assert_eq!(
             s.dev.script,
             Some(crate::dev::SelectScript::parse("pick=a.bms,enter,back,close").unwrap())
+        );
+        assert_eq!(
+            select(&["--dev-window", "1920x1080"]).dev.window,
+            Some((1920, 1080))
+        );
+        assert_eq!(
+            parsed(&["--dev-window", "1920"]).unwrap_err(),
+            UsageError::Usage("--dev-window takes <W>x<H>".to_owned())
+        );
+        // A missing value, a negative side, a zero side and a side past
+        // the largest a target takes are refused, naming the flag or the
+        // bound.
+        assert_eq!(
+            parsed(&["--dev-window"]).unwrap_err(),
+            UsageError::Usage("--dev-window needs a value".to_owned())
+        );
+        let side =
+            |v: &str| UsageError::Usage(format!("a size of {v}: each side must be 1 to 8192"));
+        for v in ["-1x1080", "1920x-1", "0x1080", "8193x1080", "1920x8193"] {
+            assert_eq!(parsed(&["--dev-window", v]).unwrap_err(), side(v), "{v}");
+        }
+        assert_eq!(
+            select(&["--dev-window", "8192x8192"]).dev.window,
+            Some((8192, 8192))
+        );
+        assert_eq!(
+            parsed(&[
+                "--auto",
+                "--dev-headless",
+                "--dev-select",
+                "close",
+                "--dev-window",
+                "1920x1080"
+            ])
+            .unwrap_err(),
+            UsageError::Usage("--dev-window cannot be used with --dev-headless".to_owned())
         );
         let headless = UsageError::Usage("--dev-headless needs --auto and --dev-select".to_owned());
         assert_eq!(parsed(&["--dev-headless"]).unwrap_err(), headless);
