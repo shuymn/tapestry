@@ -158,6 +158,9 @@ pub(crate) struct Lowered {
     /// its guards aside: a visibility known false folds as a JSON
     /// condition does.
     pub(crate) known: Option<i32>,
+    /// Whether its reads map the BGA setting, 40 or 41 of either sign, by
+    /// the ids the evaluation folded (D33, [`Cx::lower`]).
+    pub(crate) bga: bool,
     /// Whether its residual folded to a known value, for the conversion
     /// report.
     #[cfg(feature = "dev-tools")]
@@ -331,6 +334,7 @@ impl<'a> Lower<'a> {
                 deviates: false,
                 sentinel: false,
                 known: None,
+                bga: false,
                 #[cfg(feature = "dev-tools")]
                 constant: false,
             },
@@ -558,6 +562,7 @@ impl Lower<'_> {
             }
             "option" => {
                 let id = id.ok_or_else(unmapped)?;
+                self.out.bga |= super::names_bga(id);
                 // The mapping builds its condition: its bound charged first.
                 charge(self.an, "option", units(ops::MAX_COND_BYTES))?;
                 #[cfg(test)]
@@ -1602,10 +1607,21 @@ impl Cx<'_> {
             .and_then(|l| l.analysis.as_deref())
     }
 
-    /// Lowers the callable at node `id`, converted by `conv`, a phase of
-    /// the analysis's time budget located at it.
-    fn lower(&mut self, id: u32, conv: Conv) -> Result<Lowering, ImportError> {
-        self.lower_phase(id, |cx| cx.lower_in(id, conv))
+    /// Lowers the callable at node `id` of destination record `rec`,
+    /// converted by `conv`, a phase of the analysis's time budget located
+    /// at it. One that lowers or compiles and whose reads map the BGA
+    /// setting notes D33 for `rec` at the callable ([`Self::bga_note`]),
+    /// before its consumer takes it: the evaluation folds ids the option
+    /// scan leaves open, such as `39 + 1` ([`Self::bga_callback`]).
+    fn lower(&mut self, rec: Span, id: u32, conv: Conv) -> Result<Lowering, ImportError> {
+        let l = self.lower_phase(id, |cx| cx.lower_in(id, conv))?;
+        if let Lowering::Lowered(o) | Lowering::Compiled(o, _) = &l
+            && o.bga
+        {
+            let at = self.arena_span(id);
+            self.bga_note(rec, at);
+        }
+        Ok(l)
     }
 
     /// `work` on the callable at node `id`, a phase of the analysis's time
@@ -1834,6 +1850,7 @@ impl Cx<'_> {
                             deviates: false,
                             sentinel: false,
                             known: None,
+                            bga: false,
                             #[cfg(feature = "dev-tools")]
                             constant: matches!(fold, TextFold::Literal(_)),
                         }),
@@ -1985,7 +2002,7 @@ impl Cx<'_> {
     ) -> Result<bool, ImportError> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
         let critical = role != Role::Decorative;
-        let why = match self.lower(id, Conv::Truthy) {
+        let why = match self.lower(at, id, Conv::Truthy) {
             Ok(Lowering::Lowered(l)) => {
                 self.lowered_outcome((c, id), field, role, &l);
                 #[cfg(test)]
@@ -2173,7 +2190,7 @@ impl Cx<'_> {
     ) -> Result<Option<NumberValue>, ImportError> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
         self.bga_callback(at, id)?;
-        let (why, scan) = match self.lower(id, conv) {
+        let (why, scan) = match self.lower(at, id, conv) {
             Ok(Lowering::Lowered(l)) => {
                 let role = l
                     .part
@@ -2271,7 +2288,7 @@ impl Cx<'_> {
     ) -> Result<Option<SliderValue>, ImportError> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
         self.bga_callback(at, id)?;
-        let (why, scan) = match self.lower(id, Conv::Float) {
+        let (why, scan) = match self.lower(at, id, Conv::Float) {
             Ok(Lowering::Compiled(l, prog)) => {
                 let role = l.part.map_or(base, Role::Critical);
                 return Ok(Some(SliderValue {
@@ -2558,7 +2575,7 @@ impl Cx<'_> {
         let (c, inst) = self.callable_at(id).unwrap_or((NONE, NONE));
         let capped = end.settles_by_cap(last.saturating_mul(1000));
         let why = if capped {
-            match self.lower(id, Conv::Timer) {
+            match self.lower(at, id, Conv::Timer) {
                 // An object the source removes never calls it: compiled to
                 // nothing, the element on the screen's timer, by which it
                 // is never drawn.

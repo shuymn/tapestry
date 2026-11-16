@@ -440,6 +440,62 @@ fn a_replaced_callback_reading_the_bga_setting_notes_d33() {
     assert_eq!(d33_at(&i.imported), [at_fn(&text, a)]);
 }
 
+/// T2c: an id the option scan leaves open but the lowering folds (`39 +
+/// 1`, `39 + 2`) notes D33 at its callback once the callback lowers or
+/// compiles: a `draw` lowered, a `timer` compiled into the program and a
+/// number's value. They behave as the answer: on a chart with BGA the
+/// draw and the timer of 40 show and those of 41 do not, and the number
+/// shows 17, two digits, not 3.
+#[test]
+fn a_folded_id_reading_the_bga_setting_notes_d33() {
+    let v = "function() return ms.option(39 + 1) and 17 or 3 end";
+    let d40 = "function() return ms.option(39 + 1) end";
+    let d41 = "function() return ms.option(39 + 2) end";
+    let t40 = "function() if ms.option(39 + 1) then return 0 end return ms.timer_off_value end";
+    let t41 = "function() if ms.option(39 + 2) then return 0 end return ms.timer_off_value end";
+    let text = lua_play_text(
+        "",
+        v,
+        &format!(
+            "{{ id = \"i\", draw = {d40}, dst = {{ {{ w = 10, h = 10 }} }} }},
+             {{ id = \"i\", draw = {d41}, dst = {{ {{ w = 11, h = 10 }} }} }},
+             {{ id = \"i\", timer = {t40}, dst = {{ {{ time = 0, w = 12, h = 10 }} }} }},
+             {{ id = \"i\", timer = {t41}, dst = {{ {{ time = 0, w = 13, h = 10 }} }} }},
+             {{ id = \"n\", dst = {{ {{ w = 6, h = 6 }} }} }},"
+        ),
+    );
+    let (_d, i) = lua_play(&text);
+    assert!(
+        i.callbacks
+            .iter()
+            .all(|d| matches!(d, Disposition::Lowered | Disposition::Compiled)),
+        "{:?}",
+        i.callbacks
+    );
+    let mut at = d33_at(&i.imported);
+    at.sort();
+    let mut want: Vec<_> = [d40, d41, t40, t41, v]
+        .iter()
+        .map(|f| at_fn(&text, f))
+        .collect();
+    want.sort();
+    assert_eq!(at, want);
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    let meta = ChartMetadata {
+        bga: Some(true),
+        ..ChartMetadata::UNKNOWN
+    };
+    let mut p = Drawn::over_meta(i.imported.skin, &chart, meta);
+    for ms in [0, 400] {
+        let r = p.rects(ms);
+        // The images are 10 high, the number's digits 6.
+        let mut w: Vec<i32> = r.iter().filter(|r| r[3] == 10).map(|r| r[2]).collect();
+        w.sort_unstable();
+        assert_eq!(w, [10, 12], "{ms} ms");
+        assert_eq!(r.iter().filter(|r| r[3] == 6).count(), 2, "{ms} ms");
+    }
+}
+
 /// T7: a number's value reading the BGA setting notes D33 at its
 /// definition for a destination that names neither 40 nor 41, and one
 /// D33 alone, at the record (where its subtract blend is noted), for a

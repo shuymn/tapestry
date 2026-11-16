@@ -1071,7 +1071,9 @@ impl<'d> Cx<'d> {
     /// node `id` (its `op`, `draw` or `timer`, or its object's value) when
     /// the callback's option scan finds a read of the BGA setting by an id
     /// it resolves ([`Self::option_scan`]), whatever becomes of the
-    /// callback.
+    /// callback. An id the scan leaves open is noted when the callback
+    /// lowers or compiles and its evaluation folded the id to 40 or 41
+    /// ([`Self::lower`]).
     pub(super) fn bga_callback(&mut self, rec: Span, id: u32) -> Result<(), ImportError> {
         if self.bga_noted.contains(&rec) {
             return Ok(());
