@@ -70,12 +70,42 @@ impl game::RecordSink for Answers {
     }
 }
 
+/// A record sink that saves nothing and answers every read of a play's
+/// best and progress with its one answer.
+struct PacedAnswers(game::PlayBest);
+
+impl game::RecordSink for PacedAnswers {
+    fn save(&mut self, _: &replay::PlayRecord) -> Result<game::RecordRef, game::SaveError> {
+        Err(std::io::Error::other("not saved").into())
+    }
+
+    fn play_best(
+        &mut self,
+        _: &game::BestKey,
+        _: &rules::RulePreset,
+        _: Option<game::ProgressQuery>,
+    ) -> game::PlayBest {
+        self.0.clone()
+    }
+}
+
 /// A chart at 120 BPM with 27 notes, LIFT and HIDDEN on, the player's
 /// target `target`, its best reads answered with `answer` (no library for
 /// `None`).
 fn notes_27(
     target: game::ScoreTarget,
     answer: Option<game::BestLookup>,
+) -> (tempfile::TempDir, game::Loaded) {
+    notes_27_with(
+        target,
+        answer.map(|a| Box::new(Answers(a)) as Box<dyn game::RecordSink>),
+    )
+}
+
+/// [`notes_27`] with the record sink `records`.
+fn notes_27_with(
+    target: game::ScoreTarget,
+    records: Option<Box<dyn game::RecordSink>>,
 ) -> (tempfile::TempDir, game::Loaded) {
     let mut settings = covers();
     settings.player.target = target;
@@ -96,7 +126,7 @@ fn notes_27(
         autoplay: None,
     };
     let parts = game::Parts {
-        records: answer.map(|a| Box::new(Answers(a)) as Box<dyn game::RecordSink>),
+        records,
         ..game::Parts::unsaved(&settings.player)
     };
     let loaded = game::Loaded::load(root, settings, &path, config, parts).unwrap();
@@ -389,6 +419,74 @@ fn the_committed_play_skin_has_the_plays_best_and_target() {
                     target: t,
                 }],
                 "{target:?}"
+            );
+        });
+    }
+}
+
+/// The play skin committed out of the loading state prepares the best
+/// paced by its play, read with the best before the preparation begun at
+/// load-ready (design.md "Personal Bests", skin projections): 27 notes, a
+/// best of 40 whose progress is six GREATs, PERFECT and GREAT in turn
+/// eight times, then five PERFECTs, gives its cumulative EX under the play
+/// preset, 6 at p = 6 where the line gives 8. A refused progress keeps the best of 40 and gives no
+/// series; no library gives neither.
+#[test]
+fn the_committed_play_skin_has_the_best_plays_pace() {
+    use rules::Judgment::{Great, Perfect};
+    let mut progress = vec![Great; 6];
+    for _ in 0..8 {
+        progress.extend([Perfect, Great]);
+    }
+    progress.extend([Perfect; 5]);
+    let counted = |j: &rules::Judgment| match j {
+        Perfect => 2,
+        Great => 1,
+        _ => 0,
+    };
+    let mut series = vec![0_u32];
+    for j in &progress {
+        series.push(series.last().unwrap() + counted(j));
+    }
+    assert_eq!((progress.len(), series[27], series[6]), (27, 40, 6));
+    let best = game::BestLookup::Known(game::BestScore {
+        plays: 2,
+        ex: Some(40),
+        bp: Some(0),
+        max_combo: None,
+        clear: None,
+    });
+    let answer = |progress| {
+        Some(Box::new(PacedAnswers(game::PlayBest {
+            best: best.clone(),
+            progress,
+        })) as Box<dyn game::RecordSink>)
+    };
+    let cases = [
+        (
+            answer(game::ProgressLookup::Known(progress.clone().into())),
+            40,
+            Some(series),
+        ),
+        (
+            answer(game::ProgressLookup::Refused("refused".to_owned())),
+            40,
+            None,
+        ),
+        (None, 0, None),
+    ];
+    for (records, best, pace) in cases {
+        let (_dir, mut loaded) = notes_27_with(game::ScoreTarget::Max, records);
+        on_loading(&mut loaded, None, false, |rig, side, loaded| {
+            side.loading_end.hold(true);
+            let ended = open_with(loaded, rig, side, || side.quit_at_the_end_of_loading());
+            assert!(matches!(ended, Ok(Leave::Back)), "{ended:?}");
+            assert_eq!(rig.preps, 1, "the load-ready preparation");
+            let scores = side.screens.committed_scores.lock().unwrap();
+            assert_eq!(scores.iter().map(|s| s.best).collect::<Vec<_>>(), [best]);
+            assert_eq!(
+                *side.screens.committed_paces.lock().unwrap(),
+                std::slice::from_ref(&pace)
             );
         });
     }
