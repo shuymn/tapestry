@@ -974,7 +974,7 @@ fn a_lua_skin_builds_on_the_base_facts() {
 
 /// The import shows the BGA exactly when the session does: for each mode,
 /// autoplay or not, the import's setting from the session agrees with the
-/// session's answer, and carries its autoplay.
+/// session's answer, and carries its autoplay and its expansion.
 #[test]
 fn the_import_reads_the_session_s_bga_answer() {
     for mode in [
@@ -994,6 +994,27 @@ fn the_import_reads_the_session_s_bga_answer() {
             assert_eq!(session.autoplay, autoplay, "{s:?}");
             assert_eq!(session.bga().shown(), s.shown(), "{s:?}");
         }
+    }
+    for (expand, import) in [
+        (game::BgaExpand::Full, skin_beatoraja::BgaExpand::Full),
+        (
+            game::BgaExpand::KeepAspect,
+            skin_beatoraja::BgaExpand::KeepAspect,
+        ),
+        (game::BgaExpand::Off, skin_beatoraja::BgaExpand::Off),
+    ] {
+        let s = game::BgaSession {
+            settings: game::BgaSettings {
+                mode: game::BgaMode::Off,
+                expand,
+            },
+            autoplay: true,
+        };
+        assert_eq!(
+            crate::imports::SkinSession::of(s).bga().expand,
+            import,
+            "{expand:?}"
+        );
     }
 }
 
