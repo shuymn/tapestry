@@ -192,6 +192,7 @@
     clippy::cast_sign_loss
 )]
 
+mod bga;
 mod branch;
 mod decimal;
 mod error;
@@ -330,7 +331,11 @@ pub fn load_bms(bytes: &[u8], chart_dir: &Path, opts: &LoadOptions) -> Result<Lo
     }
     let mut warnings = Vec::new();
     let text = decode(bytes, &mut warnings);
-    build(&text, Some((bytes, chart_dir)), opts, warnings, false).map(|(loaded, _)| loaded)
+    let reads = Reads {
+        preview: false,
+        bga: true,
+    };
+    build(&text, Some((bytes, chart_dir)), opts, warnings, reads).map(|(loaded, _)| loaded)
 }
 
 /// A chart's listing and, as far as the loader takes its seed-0 branch, its
@@ -430,25 +435,48 @@ fn built_at_1x(
         limits: *limits,
         ..LoadOptions::default()
     };
-    build(text, None, &opts, Vec::new(), preview)
+    let reads = Reads {
+        preview,
+        bga: false,
+    };
+    build(text, None, &opts, Vec::new(), reads)
+}
+
+/// What [`build`] reads for presentation besides the play chart (crate doc,
+/// "Presentation reads").
+#[derive(Clone, Copy)]
+struct Reads {
+    /// The preview profile at 1× ([`ChartProfile::preview`]).
+    preview: bool,
+    /// The BGA structure ([`Chart::bga`]).
+    bga: bool,
 }
 
 /// [`load_bms`]'s pipeline over the decoded `text`. `files` gives the file's
 /// bytes and folder, from which its hashes and its sounds' paths come; with
 /// none the chart has neither, which [`summarize`] does not read. With
-/// `preview`, also the preview profile at 1× ([`ChartProfile::preview`]),
+/// `reads.preview`, also the preview profile at 1× ([`ChartProfile::preview`]),
 /// its objects timed apart ([`preview::inputs`]); one whose timing fails is
-/// the play chart's.
+/// the play chart's. With `reads.bga`, the chart's BGA structure, timed
+/// apart too ([`bga::read`]); without, the chart has none.
 fn build(
     text: &str,
     files: Option<(&[u8], &Path)>,
     opts: &LoadOptions,
     mut warnings: Vec<Warning>,
-    preview: bool,
+    reads: Reads,
 ) -> Result<(Loaded, Option<ChartProfile>), LoadError> {
     let limits = &opts.limits;
     let mut source = parse::parse(text, limits, opts.seed, &mut warnings)?;
-    let inputs = preview.then(|| preview::inputs(&source, limits).unwrap_or_default());
+    let inputs = reads
+        .preview
+        .then(|| preview::inputs(&source, limits).unwrap_or_default());
+    // Before the play chart's timing, so its timeline is dropped first.
+    let bga = if reads.bga {
+        bga::read(&source, limits, opts.speed)
+    } else {
+        None
+    };
     let mut timeline = timing::compute(&source, limits, opts.speed, &mut warnings)?;
 
     let dir = match files {
@@ -540,6 +568,7 @@ fn build(
             loader_version: LOADER_VERSION,
             random_results: source.random_results,
         },
+        bga,
     };
     chart.validate().map_err(LoadError::Model)?;
     chart
