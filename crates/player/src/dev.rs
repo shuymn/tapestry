@@ -590,15 +590,15 @@ pub fn checked_size(w: i64, h: i64) -> Result<(u32, u32), String> {
     }
 }
 
-/// The value of `--dev-size`: `<W>x<H>`.
-fn size(p: &mut lexopt::Parser) -> Result<(u32, u32), UsageError> {
+/// The value of `flag` (`--dev-size` or `--dev-window`): `<W>x<H>`.
+fn size(p: &mut lexopt::Parser, flag: &str) -> Result<(u32, u32), UsageError> {
     let value = p.value()?;
     let value = value.to_string_lossy();
     let parsed = value
         .split_once('x')
         .and_then(|(w, h)| Some((w.parse().ok()?, h.parse().ok()?)));
     let Some((w, h)) = parsed else {
-        return Err(UsageError::Usage("--dev-size takes <W>x<H>".to_owned()));
+        return Err(UsageError::Usage(format!("{flag} takes <W>x<H>")));
     };
     checked_size(w, h).map_err(UsageError::Usage)
 }
@@ -754,7 +754,7 @@ impl Options {
             }
             "dev-scripted-input" => self.scripted_input = Some(PathBuf::from(p.value()?)),
             "dev-frames" => self.frames = Some(PathBuf::from(p.value()?)),
-            "dev-size" => self.size = Some(size(p)?),
+            "dev-size" => self.size = Some(size(p, "--dev-size")?),
             "dev-render-timeout" => self.render_timeout = Some(render_timeout(p)?),
             "dev-start" => self.start = Some(start(p)?),
             "dev-rearm-delay" => {
@@ -808,6 +808,11 @@ pub struct SelectOptions {
     pub frames: Option<PathBuf>,
     /// The offscreen target's size (`--dev-size`), for a headless run.
     pub size: Option<(u32, u32)>,
+    /// A window of this client size, in physical pixels, at the chosen
+    /// monitor's top-left corner in place of the borderless fullscreen one
+    /// (`--dev-window <W>x<H>`): a real-app check at a set render size on
+    /// any monitor, with the window's own input.
+    pub window: Option<(u32, u32)>,
     /// The render thread's bounds, as [`Options::render_timeout`]
     /// (`--dev-render-timeout`).
     pub render_timeout: Option<std::time::Duration>,
@@ -841,7 +846,8 @@ impl SelectOptions {
                 })?);
             }
             "dev-frames" => self.frames = Some(PathBuf::from(p.value()?)),
-            "dev-size" => self.size = Some(size(p)?),
+            "dev-size" => self.size = Some(size(p, "--dev-size")?),
+            "dev-window" => self.window = Some(size(p, "--dev-window")?),
             "dev-render-timeout" => self.render_timeout = Some(render_timeout(p)?),
             "dev-stop-timeout" => {
                 let secs = p.value()?.to_string_lossy().parse().map_err(|_| {
@@ -858,11 +864,17 @@ impl SelectOptions {
     ///
     /// # Errors
     ///
-    /// `--dev-headless` without `--auto` and a script.
+    /// `--dev-headless` without `--auto` and a script, or with
+    /// `--dev-window` (a headless run has no window).
     pub fn check(&self, auto: bool) -> Result<(), UsageError> {
         if self.headless && !(auto && self.script.is_some()) {
             return Err(UsageError::Usage(
                 "--dev-headless needs --auto and --dev-select".to_owned(),
+            ));
+        }
+        if self.headless && self.window.is_some() {
+            return Err(UsageError::Usage(
+                "--dev-window cannot be used with --dev-headless".to_owned(),
             ));
         }
         Ok(())

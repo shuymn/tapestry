@@ -355,9 +355,34 @@ mod tests {
             Some(std::time::Duration::from_secs(90))
         );
         assert_eq!(s.dev.stop_timeout, Some(std::time::Duration::from_secs(30)));
+        assert_eq!(s.dev.window, None);
         assert_eq!(
             s.dev.script,
             Some(crate::dev::SelectScript::parse("pick=a.bms,enter,back,close").unwrap())
+        );
+        assert_eq!(
+            select(&["--dev-window", "1920x1080"]).dev.window,
+            Some((1920, 1080))
+        );
+        assert_eq!(
+            parsed(&["--dev-window", "1920"]).unwrap_err(),
+            UsageError::Usage("--dev-window takes <W>x<H>".to_owned())
+        );
+        assert!(matches!(
+            parsed(&["--dev-window", "0x1080"]),
+            Err(UsageError::Usage(_))
+        ));
+        assert_eq!(
+            parsed(&[
+                "--auto",
+                "--dev-headless",
+                "--dev-select",
+                "close",
+                "--dev-window",
+                "1920x1080"
+            ])
+            .unwrap_err(),
+            UsageError::Usage("--dev-window cannot be used with --dev-headless".to_owned())
         );
         let headless = UsageError::Usage("--dev-headless needs --auto and --dev-select".to_owned());
         assert_eq!(parsed(&["--dev-headless"]).unwrap_err(), headless);
