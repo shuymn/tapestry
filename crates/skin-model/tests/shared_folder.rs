@@ -224,6 +224,8 @@ struct Seen {
     loads: u32,
     missing: u32,
     others: Vec<String>,
+    /// The longest round, whatever its outcome.
+    longest: Duration,
 }
 
 /// What a reader does each round.
@@ -255,9 +257,13 @@ fn chain(e: &dyn std::error::Error) -> String {
     text
 }
 
+/// Reads `dir` round after round until `done`, and at least once.
 fn read_until(dir: &Path, reading: Reading, done: &AtomicBool) -> Seen {
     let mut seen = Seen::default();
-    while !done.load(Ordering::Relaxed) {
+    let mut rounds = 0u32;
+    while rounds == 0 || !done.load(Ordering::Relaxed) {
+        rounds += 1;
+        let round = Instant::now();
         let failed = match reading {
             Reading::Files => open_files(dir)
                 .err()
@@ -269,6 +275,7 @@ fn read_until(dir: &Path, reading: Reading, done: &AtomicBool) -> Seen {
                 })
             }
         };
+        seen.longest = seen.longest.max(round.elapsed());
         match failed {
             None => seen.loads += 1,
             Some((true, _)) => seen.missing += 1,
@@ -384,9 +391,9 @@ fn a_failed_writer_ends_the_race() {
 #[test]
 fn a_reader_never_meets_a_file_being_placed() {
     let base = base();
+    let start = Instant::now();
     let (outputs, seen) = race(base.path(), false);
 
-    // Each writer placed the files while the readers loaded: the race ran.
     let passes: Vec<u32> = outputs
         .iter()
         .map(|out| {
@@ -398,16 +405,15 @@ fn a_reader_never_meets_a_file_being_placed() {
                 .unwrap()
         })
         .collect();
-    assert!(passes.iter().all(|&p| p > 0), "passes {passes:?}");
-    for (i, seen) in seen.iter().enumerate() {
-        assert!(seen.loads > 0, "reader {i} loaded nothing");
-    }
     let loads: Vec<u32> = seen.iter().map(|s| s.loads).collect();
+    let longest: Vec<u128> = seen.iter().map(|s| s.longest.as_millis()).collect();
     let missing: u32 = seen.iter().map(|s| s.missing).sum();
     let others: Vec<&String> = seen.iter().flat_map(|s| &s.others).collect();
     println!(
-        "passes {passes:?}, loads {loads:?}, missing {missing}, other errors {}",
-        others.len()
+        "passes {passes:?}, loads {loads:?}, missing {missing}, other errors {}, \
+         longest rounds {longest:?} ms, in {} ms",
+        others.len(),
+        start.elapsed().as_millis()
     );
     assert_eq!(
         (missing, others.len()),
@@ -415,4 +421,8 @@ fn a_reader_never_meets_a_file_being_placed() {
         "loads {loads:?}; first other errors: {:?}",
         &others[..others.len().min(3)]
     );
+    // The controls: each writer placed the files and each reader loaded
+    // them, so the race ran.
+    assert!(passes.iter().all(|&p| p > 0), "passes {passes:?}");
+    assert!(loads.iter().all(|&l| l > 0), "loads {loads:?}");
 }
