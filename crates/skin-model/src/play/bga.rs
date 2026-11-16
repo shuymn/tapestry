@@ -143,6 +143,10 @@ impl Parts<'_> {
         rect: [f32; 4],
         trim: Option<ClipRect>,
     ) {
+        #[cfg(feature = "dev-tools")]
+        if crate::bga::ALLOCATE_IN_DRAW.load(std::sync::atomic::Ordering::Relaxed) {
+            std::hint::black_box(vec![0_u8; 1]);
+        }
         let placeholder = |out: &mut QuadBatch| {
             let [.., a] = brush.color;
             let b = Brush {

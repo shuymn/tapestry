@@ -623,6 +623,12 @@ impl BgaTable {
 /// The table of no array, every definition absent, to borrow.
 pub static NO_TABLE: BgaTable = BgaTable::ABSENT;
 
+/// While set, each BGA element's draw allocates once (dev-tools: the
+/// positive control of the frame path's allocation count).
+#[cfg(feature = "dev-tools")]
+pub static ALLOCATE_IN_DRAW: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// A shared empty table, for a play before any is set.
 pub(crate) fn absent_table() -> Arc<BgaTable> {
     Arc::new(BgaTable::ABSENT)

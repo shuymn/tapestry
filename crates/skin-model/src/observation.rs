@@ -176,7 +176,12 @@ impl Skin {
                     clip_geometry: run.key.clip.and_then(clips),
                     clip_rect: run.clip_rect.map(crate::ClipRect::rect),
                     filter: q.filter,
-                    source: self.quad_source(uvs, q.layer, q.uv),
+                    // A BGA quad samples the BGA array, not the atlas.
+                    source: if matches!(q.filter, crate::Filter::Bga | crate::Filter::BgaLayer) {
+                        QuadSource::Other
+                    } else {
+                        self.quad_source(uvs, q.layer, q.uv)
+                    },
                 });
             }
         }
