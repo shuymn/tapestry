@@ -753,6 +753,59 @@ fn loaders_raise_at_runtime_however_reached() {
     assert_eq!(outputs(&f), [0, 0, 0, 0, 0, 0, 0, 0, 5, 5]);
 }
 
+/// At runtime a `dofile` of a name that leads to no file is the
+/// import-only fault, never the ordinary error the import gives: a
+/// protected call does not resume after it, through the global, a
+/// retained alias or an upvalue, and `xpcall` runs no handler. Each
+/// callback would return its own non-zero value if control came back;
+/// an ordinary error under `pcall` does resume (29), and a later
+/// callback still runs (5). Each fault is noted at its own callback.
+// Covers: T09
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_runtime_absent_load_stays_the_fault_however_protected() {
+    untimed();
+    let text = entry(
+        "local held = { d = dofile }\n\
+         local function via(f) return function(n) return f(n) end end\n\
+         local up = via(dofile)",
+        &[
+            "function() pcall(dofile, \"none.lua\") return 7 end",
+            "function() pcall(held.d, \"none.lua\") return 11 end",
+            "function() pcall(up, \"none.lua\") return 13 end",
+            "function() local ok, r = xpcall(dofile, function() return 17 end, \"none.lua\") \
+             if not ok and r == 17 then return 19 end return 23 end",
+            "function() pcall(error, \"x\") return 29 end",
+            "function() return 5 + ms.number(77) * 0 end",
+        ],
+        "function() return true end",
+    );
+    let (_d, mut i) = import_with(&text, &[]);
+    let n = runtime(&mut i).outputs();
+    let mut f = fields(n, &[("cursor.chart", 1)]);
+    runtime(&mut i).frame(&mut f, &[]);
+    let status = runtime(&mut i).status().to_vec();
+    assert_eq!(outputs(&f), [0, 0, 0, 0, 29, 5], "{status:?}");
+    assert!(
+        status[..4].iter().all(|s| *s == CallStatus::Error),
+        "{status:?}"
+    );
+    let notes = located(&runtime(&mut i).notes().list);
+    for needle in [
+        "function() pcall(dofile,",
+        "function() pcall(held.d,",
+        "function() pcall(up,",
+        "function() local ok, r = xpcall(",
+    ] {
+        let (l, c) = place(&text, needle);
+        let at = Some(("s.luaskin".to_owned(), l, c));
+        assert!(
+            notes.contains(&("import-only".to_owned(), at)),
+            "{needle}: {notes:?}"
+        );
+    }
+}
+
 /// The source's object order (docs/stage3.md S7-07): a number's value is
 /// read first, and its draws run only when it is not a sentinel
 /// (`SkinNumber.java:138-150`).

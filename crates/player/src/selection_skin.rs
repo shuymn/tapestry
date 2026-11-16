@@ -78,7 +78,8 @@ impl SelectionUpdate {
 }
 
 /// The strip's text: the search line while the search box has focus,
-/// with where its composition lies, and the notice.
+/// with where its composition lies, the notice, and the line saying the
+/// list is cut at its bound while it is.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct StripText {
     /// The search line and its caret's bytes in it, while the box has
@@ -86,6 +87,9 @@ pub struct StripText {
     pub search: Option<(String, usize, usize)>,
     /// The notice, if any.
     pub notice: Option<String>,
+    /// The list-cut line, while the list is cut at its bound
+    /// ([`SelectScreen::cut_line`](crate::select::SelectScreen::cut_line)).
+    pub cut: Option<String>,
 }
 
 impl StripText {
@@ -102,14 +106,18 @@ impl StripText {
             .iter()
             .find(|l| l.style == LineStyle::Notice && !l.text.is_empty())
             .map(|l| l.text.clone());
-        Self { search, notice }
+        Self {
+            search,
+            notice,
+            cut: None,
+        }
     }
 
     /// The strip's lines as a page, top down: the search line with its
-    /// caret, then the notice.
+    /// caret, the notice, then the list-cut line.
     #[must_use]
     pub fn page(&self) -> MenuPage {
-        let mut lines = Vec::with_capacity(2);
+        let mut lines = Vec::with_capacity(3);
         let mut caret = None;
         if let Some((text, start, end)) = &self.search {
             caret = Some(Caret {
@@ -125,6 +133,12 @@ impl StripText {
         if let Some(notice) = &self.notice {
             lines.push(MenuLine {
                 text: notice.clone(),
+                style: LineStyle::Notice,
+            });
+        }
+        if let Some(cut) = &self.cut {
+            lines.push(MenuLine {
+                text: cut.clone(),
                 style: LineStyle::Notice,
             });
         }
@@ -459,7 +473,10 @@ impl SkinFeed {
             lifetime: self.lifetime,
             revision: self.revision,
             list_revision: self.list_revision,
-            strip: StripText::of(&page),
+            strip: StripText {
+                cut: screen.cut_line(),
+                ..StripText::of(&page)
+            },
             page,
             view,
             labels: crate::select::labels(),
@@ -531,10 +548,24 @@ pub(crate) fn panels_fixture() -> tempfile::TempDir {
     )
 }
 
+/// [`fixture`] with its selected placements 10 to the right of the
+/// unselected ones, at x 1010, so a frame tells them apart (dev-tools
+/// tests).
+#[cfg(all(test, feature = "dev-tools"))]
+pub(crate) fn ring_fixture() -> tempfile::TempDir {
+    fixture_lists("", "", &fixture_slots_at(1_010))
+}
+
 /// The fixture with `widgets` declared and `drawn` destinations after its
 /// own.
 #[cfg(test)]
 fn fixture_of(widgets: &str, drawn: &str) -> tempfile::TempDir {
+    fixture_lists(widgets, drawn, &fixture_slots())
+}
+
+/// [`fixture_of`] with the selected placements `liston`.
+#[cfg(test)]
+fn fixture_lists(widgets: &str, drawn: &str, liston: &str) -> tempfile::TempDir {
     let dir = fixture_files();
     let slots = fixture_slots();
     let json = format!(
@@ -546,7 +577,7 @@ fn fixture_of(widgets: &str, drawn: &str) -> tempfile::TempDir {
             "text": [{{"id": "t", "font": "f", "size": 30, "ref": 10}},
                      {{"id": "place", "font": "f", "size": 30, "ref": 1000}},
                      {{"id": "q", "font": "f", "size": 30, "ref": 30}}],
-            "songlist": {{"id": "list", "center": 3, "liston": [{slots}], "listoff": [{slots}],
+            "songlist": {{"id": "list", "center": 3, "liston": [{liston}], "listoff": [{slots}],
                           "text": [{{"id": "t", "dst": [{{"x": 10, "y": 10, "w": 700, "h": 40}}]}}]}},
             "destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}},
                             {{"id": "place", "dst": [{{"x": 100, "y": 1000, "w": 800, "h": 40}}]}},
@@ -588,6 +619,12 @@ fn fixture_files() -> tempfile::TempDir {
 /// top `100 + 100·i`, 800×80.
 #[cfg(test)]
 fn fixture_slots() -> String {
+    fixture_slots_at(1_000)
+}
+
+/// [`fixture_slots`] at x `x`.
+#[cfg(test)]
+fn fixture_slots_at(x: i32) -> String {
     use std::fmt::Write as _;
 
     let mut slots = String::new();
@@ -596,7 +633,7 @@ fn fixture_slots() -> String {
         let y = 900 - i * 100;
         write!(
             slots,
-            r#"{sep}{{"id": "set", "dst": [{{"x": 1000, "y": {y}, "w": 800, "h": 80}}]}}"#
+            r#"{sep}{{"id": "set", "dst": [{{"x": {x}, "y": {y}, "w": 800, "h": 80}}]}}"#
         )
         .unwrap();
     }

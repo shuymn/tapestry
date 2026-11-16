@@ -904,16 +904,17 @@ impl Selection {
         pick
     }
 
-    /// Carries out what a pointer input does: a wheel's notches sound
-    /// `scratch` once for each row the cursor moves, a click or the list
-    /// slider none (design.md "State Model", system sounds, Selection).
+    /// Carries out what a pointer input does: a wheel's notches step the
+    /// cursor around the list's ring and sound `scratch` once a notch, a
+    /// click or the list slider none (design.md "State Model", system
+    /// sounds, Selection).
     fn pointer_act(
         &mut self,
         act: crate::pointer::PointerAct,
         level: Option<&input::PanelLevel>,
         now: TimeUs,
     ) -> Option<Pick> {
-        let to = match act {
+        let rows = match act {
             crate::pointer::PointerAct::Nothing => return None,
             crate::pointer::PointerAct::Key(key) => {
                 return self.take_reading(MenuInput::Key(key), level, now);
@@ -937,22 +938,20 @@ impl Selection {
                 }
                 return None;
             }
-            crate::pointer::PointerAct::Rows(rows) => {
-                let last = self.screen.selectable().saturating_sub(1);
-                let rows_abs = usize::try_from(rows.unsigned_abs()).unwrap_or(usize::MAX);
-                if rows < 0 {
-                    self.screen.cursor().saturating_sub(rows_abs)
-                } else {
-                    self.screen.cursor().saturating_add(rows_abs).min(last)
-                }
-            }
+            crate::pointer::PointerAct::Rows(rows) => rows,
         };
-        let from = self.screen.cursor();
-        if self.screen.move_to(to) {
-            self.dirty = true;
-            let moved = u32::try_from(from.abs_diff(to)).unwrap_or(u32::MAX);
-            // Source: SF-012
-            self.cues.add(audio::SystemKind::Scratch, moved);
+        // The notches step around the list's ring, each sounding as it is
+        // asked for, even back onto the row it left; nothing moves or
+        // sounds with nothing listed.
+        let steps = usize::try_from(rows.unsigned_abs()).unwrap_or(usize::MAX);
+        // Source: SF-012
+        // Source: SF-016
+        if let Some(to) = self.screen.ring_to(rows > 0, steps) {
+            self.cues
+                .add(audio::SystemKind::Scratch, rows.unsigned_abs());
+            if self.screen.move_to(to) {
+                self.dirty = true;
+            }
         }
         None
     }
@@ -4701,9 +4700,9 @@ pub(crate) mod tests {
     }
 
     /// An order change queued before navigation is searched before the
-    /// navigation acts: in artist order A is last, so Down stays there and
-    /// Enter chooses A. Navigating the stale title order first would move
-    /// to B.
+    /// navigation acts: in artist order A is last, so Down wraps to the
+    /// first, C, and Enter chooses it. Navigating the stale title order
+    /// first would move to B.
     #[test]
     fn an_order_change_is_searched_before_the_keys_after_it() {
         let dir = tempfile::tempdir().unwrap();
@@ -4712,7 +4711,7 @@ pub(crate) mod tests {
             sel.menu.push(MenuInput::Key(key));
         }
         let chosen = sel.drain(&mut Pad::default()).expect("Enter chooses");
-        assert_eq!(played(chosen).file_name().unwrap(), "a.bms");
+        assert_eq!(played(chosen).file_name().unwrap(), "c.bms");
     }
 
     /// The controller's events act as the keys they stand for: Down twice
@@ -5026,12 +5025,11 @@ pub(crate) mod tests {
     /// C24-5, C24-6, C24-8 (design.md "State Model", system sounds,
     /// Selection): over five charts in the all-chart list, each input path
     /// asks for the cues where the source plays them. A one-row step sounds
-    /// `scratch` once a row moved and none at the list's end; a key jump
-    /// once however far it goes; a controller's step (a turntable step
-    /// comes as one) once; the wheel's rows (`pointer_act`, the pointer's
-    /// own path is `the_wheel_sounds_a_row_a_notch`) once a row moved, the
-    /// list's end cutting the count; a click's `MoveTo` and a volume
-    /// slider none. Entering a place sounds `f-open`, leaving it for its
+    /// `scratch` once, past the list's end too; a key jump once however
+    /// far it goes; a controller's step (a turntable step comes as one)
+    /// once; the wheel's rows (`pointer_act`, the pointer's own path is
+    /// `the_wheel_sounds_a_row_a_notch`) once a notch, a whole lap
+    /// included; a click's `MoveTo` and a volume slider none. Entering a place sounds `f-open`, leaving it for its
     /// parent `f-close`, Back at Top or clearing a query none; an order
     /// step and a preset step `o-change` each.
     // Source: SF-012
@@ -5064,12 +5062,24 @@ pub(crate) mod tests {
         assert_eq!(took(&mut sel), [0, 1, 0, 0, 0, 0], "Enter on a place");
         keys(&mut sel, &[MenuKey::Up]);
         assert_eq!(sel.screen.selectable(), 5);
-        assert_eq!(took(&mut sel), [0; 6], "Up on the first row");
+        assert_eq!(sel.screen.cursor(), 4);
+        assert_eq!(
+            took(&mut sel),
+            [1, 0, 0, 0, 0, 0],
+            "Up on the first row wraps"
+        );
+        keys(&mut sel, &[MenuKey::Down]);
+        assert_eq!(sel.screen.cursor(), 0);
+        assert_eq!(
+            took(&mut sel),
+            [1, 0, 0, 0, 0, 0],
+            "Down on the last row wraps"
+        );
         keys(&mut sel, &[MenuKey::Down; 3]);
         assert_eq!(took(&mut sel), [3, 0, 0, 0, 0, 0], "three rows down");
-        keys(&mut sel, &[MenuKey::Down; 3]);
+        keys(&mut sel, &[MenuKey::Down]);
         assert_eq!(sel.screen.cursor(), 4);
-        assert_eq!(took(&mut sel), [1, 0, 0, 0, 0, 0], "one row, then the end");
+        assert_eq!(took(&mut sel), [1, 0, 0, 0, 0, 0], "one row, to the end");
         keys(&mut sel, &[MenuKey::Home]);
         assert_eq!(took(&mut sel), [1, 0, 0, 0, 0, 0], "Home over four rows");
         // The controller's step, off the first row.
@@ -5103,11 +5113,11 @@ pub(crate) mod tests {
         );
         assert_eq!(took(&mut sel), [0; 6], "a click and a volume slider");
         sel.pointer_act(PointerAct::Rows(-5), none, TimeUs(0));
-        assert_eq!(sel.screen.cursor(), 0);
+        assert_eq!(sel.screen.cursor(), 3);
         assert_eq!(
             took(&mut sel),
-            [3, 0, 0, 0, 0, 0],
-            "five notches, three rows"
+            [5, 0, 0, 0, 0, 0],
+            "five notches, a whole lap"
         );
         // Back to Top, then Back at Top.
         keys(&mut sel, &[MenuKey::Escape]);
@@ -5129,6 +5139,32 @@ pub(crate) mod tests {
         keys(&mut sel, &[MenuKey::NextPreset]);
         assert_eq!(sel.preset_steps.len(), 1);
         assert_eq!(took(&mut sel), [0, 0, 0, 0, 0, 1], "a preset step");
+    }
+
+    /// With nothing listed the wheel neither moves nor sounds, either way.
+    // Source: SF-016
+    #[test]
+    fn the_wheel_over_an_empty_list_takes_no_step() {
+        use crate::pointer::PointerAct;
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(dir.path(), &[&["a.bms", "b.bms"]]);
+        keys(&mut sel, &[MenuKey::Tab]);
+        sel.menu.push(MenuInput::Text("zz".to_owned()));
+        keys(&mut sel, &[]);
+        sel.screen.set_entries(Vec::new());
+        keys(&mut sel, &[MenuKey::Enter]);
+        assert!(!sel.screen.searching());
+        assert_eq!(sel.screen.selectable(), 0);
+        took(&mut sel);
+        sel.dirty = false;
+        for rows in [2, -1] {
+            assert_eq!(
+                sel.pointer_act(PointerAct::Rows(rows), None, TimeUs(0)),
+                None
+            );
+            assert_eq!(took(&mut sel), [0; 6], "{rows} notches");
+            assert!(!sel.dirty, "{rows} notches");
+        }
     }
 
     /// C24-7 (design.md "State Model", system sounds, Selection): `o-open`
@@ -7372,6 +7408,87 @@ pub(crate) mod tests {
         assert!(failure.contains("never appeared"), "{failure}");
     }
 
+    /// A skin's window runs around a mixed list across its folder and
+    /// chart rows, each row's kind and key its own, and a folder entered
+    /// from its row returns to that row: Top's all charts, folder f and
+    /// charts a and b.
+    // Source: SF-016
+    #[test]
+    fn the_skin_window_wraps_across_folder_and_chart_rows() {
+        use skin_model::{RowKey, RowKind};
+        let dir = tempfile::tempdir().unwrap();
+        let (mut sel, _) = tree(dir.path(), &[&["f/s/x.bms", "a.bms", "b.bms"]]);
+        // Each row's index, and its kind and key read from the row itself.
+        let window = |sel: &Selection| {
+            let v = sel.screen.view(2, 2, false);
+            v.rows
+                .iter()
+                .map(|r| {
+                    let label = match (&r.kind, &r.key) {
+                        (RowKind::All { .. }, RowKey::All) => "all".to_owned(),
+                        (RowKind::Folder { .. }, RowKey::Folder(f)) => {
+                            format!("folder {}", f.path().file_name().unwrap().to_string_lossy())
+                        }
+                        (RowKind::Chart, RowKey::Chart(p)) => {
+                            p.file_name().unwrap().to_string_lossy().into_owned()
+                        }
+                        other => panic!("a row's kind and key disagree: {other:?}"),
+                    };
+                    (r.index.unwrap(), label)
+                })
+                .collect::<Vec<_>>()
+        };
+        let rows = |want: &[(u32, &str)]| {
+            want.iter()
+                .map(|&(i, l)| (i, l.to_owned()))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(sel.screen.selectable(), 4);
+        assert_eq!(
+            window(&sel),
+            rows(&[
+                (2, "a.bms"),
+                (3, "b.bms"),
+                (0, "all"),
+                (1, "folder f"),
+                (2, "a.bms")
+            ])
+        );
+        keys(&mut sel, &[MenuKey::Up]);
+        assert_eq!(sel.screen.cursor(), 3);
+        assert_eq!(
+            window(&sel),
+            rows(&[
+                (1, "folder f"),
+                (2, "a.bms"),
+                (3, "b.bms"),
+                (0, "all"),
+                (1, "folder f")
+            ])
+        );
+        keys(&mut sel, &[MenuKey::Down, MenuKey::Down]);
+        assert_eq!(sel.screen.cursor(), 1);
+        keys(&mut sel, &[MenuKey::Enter]);
+        assert!(matches!(
+            sel.screen.view(0, 0, false).place,
+            skin_model::SelectionPlace::Folder(_)
+        ));
+        // f's one chart repeats over the window.
+        assert_eq!(window(&sel), rows(&[(0, "x.bms"); 5]));
+        keys(&mut sel, &[MenuKey::Escape]);
+        assert_eq!(sel.screen.cursor(), 1);
+        assert_eq!(
+            window(&sel),
+            rows(&[
+                (3, "b.bms"),
+                (0, "all"),
+                (1, "folder f"),
+                (2, "a.bms"),
+                (3, "b.bms")
+            ])
+        );
+    }
+
     /// Listed charts, one per relative path under one root, or several roots,
     /// on a shelf that scans again at once, opened as a run opens (on Top) and
     /// with every chart listed. A file named `hidden*` is 5-key-shaped.
@@ -7546,7 +7663,8 @@ pub(crate) mod tests {
     }
 
     /// The skin's update: its view is the installed song list's window
-    /// (three rows above the cursor, three below, no heading), with the
+    /// (three rows above the cursor, three below, around the list's ring,
+    /// no heading), with the
     /// player's labels; timer `change` starts at the entry and again when
     /// the cursor's row or the place changes, not on a refresh keeping the
     /// row; each entry is a new lifetime with its own starts; a preset step
@@ -7569,15 +7687,16 @@ pub(crate) mod tests {
         let u = at(&mut sel, 100);
         assert_eq!((u.lifetime, u.revision), (1, 1));
         assert_eq!(u.labels, crate::select::labels());
-        // Top: the all-charts row, s1, s2, c, d; three below the cursor.
-        assert_eq!((u.view.rows.len(), u.view.cursor), (4, Some(0)));
+        // Top: the all-charts row, s1, s2, c, d; three on each side of
+        // the cursor around the ring.
+        assert_eq!((u.view.rows.len(), u.view.cursor), (7, Some(3)));
         assert_eq!(
             (u.events.entered, u.events.changed),
             (TimeUs(100), TimeUs(100))
         );
         keys(&mut sel, &[MenuKey::Down]);
         let u = at(&mut sel, 200);
-        assert_eq!((u.view.rows.len(), u.view.cursor), (5, Some(1)));
+        assert_eq!((u.view.rows.len(), u.view.cursor), (7, Some(3)));
         assert_eq!(u.events.changed, TimeUs(200));
         // A refresh keeping the cursor's row: no restart, a new list.
         let lists = u.list_revision;
@@ -7598,7 +7717,7 @@ pub(crate) mod tests {
         keys(&mut sel, &[MenuKey::Escape, MenuKey::Home, MenuKey::Enter]);
         let u = at(&mut sel, 500);
         assert_eq!(u.view.place, skin_model::SelectionPlace::All);
-        assert_eq!((u.view.rows.len(), u.view.cursor), (4, Some(0)));
+        assert_eq!((u.view.rows.len(), u.view.cursor), (7, Some(3)));
         assert!(
             u.view
                 .rows
@@ -7631,8 +7750,9 @@ pub(crate) mod tests {
         sel.feed.enter(TimeUs(0));
         let page = sel.screen.page("");
         let u = sel.feed.update(&sel.screen, page, TimeUs(0));
-        // Top: the all-charts row and the three charts, the cursor first.
-        assert_eq!((u.view.rows.len(), u.view.cursor), (4, Some(0)));
+        // Top: the all-charts row and the three charts around the ring,
+        // the cursor at the center.
+        assert_eq!((u.view.rows.len(), u.view.cursor), (7, Some(3)));
         assert_eq!(u.strip.notice.as_deref(), Some("refused"));
     }
 
