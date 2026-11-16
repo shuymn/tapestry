@@ -5845,7 +5845,7 @@ pub(crate) mod tests {
             d.timing.presented = true;
             sink.frame(&screen, &d);
         }
-        drop(sink);
+        drop_bounded(sink);
         let read_backs = book
             .records()
             .iter()
@@ -5888,17 +5888,53 @@ pub(crate) mod tests {
     /// Drops `sink` on a helper thread, failing unless its drop, which
     /// joins its capture writer, ends within 60 s.
     fn drop_bounded(sink: super::ScenarioFrames) {
+        drop_within(sink, std::time::Duration::from_secs(60));
+    }
+
+    /// Drops `sink` on a helper thread, failing the test when its writer
+    /// has not ended within `limit`.
+    fn drop_within(sink: super::ScenarioFrames, limit: std::time::Duration) {
         let (done, ended) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
             drop(sink);
             let _ = done.send(());
         });
         assert!(
-            ended
-                .recv_timeout(std::time::Duration::from_secs(60))
-                .is_ok(),
-            "the sink's writer did not end within 60 s"
+            ended.recv_timeout(limit).is_ok(),
+            "the sink's writer did not end within {limit:?}"
         );
+    }
+
+    /// The bounded drop fails rather than hangs: a writer held past the
+    /// limit gives its timeout assertion, and the sink still ends once the
+    /// writer is released.
+    #[test]
+    fn a_held_writer_fails_the_bounded_drop() {
+        use super::FrameSink as _;
+
+        let (_dir, c, mut sink, screen) = released_sink(1);
+        let hold = super::HOLD_WRITES.write().unwrap();
+        sink.frame(&screen, &drawn(1, 0));
+        assert_eq!(c.states(), [CaptureState::Saving(1)]);
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            drop_within(sink, std::time::Duration::from_millis(200));
+        }));
+        drop(hold);
+        let why = failed.expect_err("a held writer fails the bounded drop");
+        let why = why
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or_default();
+        assert!(why.contains("did not end within 200ms"), "{why}");
+        let begun = std::time::Instant::now();
+        while c.states() != [CaptureState::Succeeded] {
+            assert!(
+                begun.elapsed() < std::time::Duration::from_secs(20),
+                "the released writer ends: {:?}",
+                c.states()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
     }
 
     /// Presents `frames` (a stage and its present) through `sink`.
