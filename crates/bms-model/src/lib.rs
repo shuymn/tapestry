@@ -8,6 +8,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
+mod bga;
 mod builder;
 mod chart;
 mod clock;
@@ -20,6 +21,7 @@ mod scroll;
 mod speed;
 mod timeline;
 
+pub use bga::{BgaError, BgaEvent, BgaImage, BgaImageId, BgaPart, ChartBga, PoorSequence};
 pub use builder::ChartBuilder;
 pub use chart::{
     BgmEvent, Chart, ChartIdentity, ChartMeta, ChartSummary, HeaderValue, JudgmentHeader,

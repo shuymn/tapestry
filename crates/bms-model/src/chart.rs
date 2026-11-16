@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use crate::{ChartTimeline, ModelError, NoteAnchors, Position, ScrollMap, Tempo, TimeUs};
+use crate::{ChartBga, ChartTimeline, ModelError, NoteAnchors, Position, ScrollMap, Tempo, TimeUs};
 
 /// Number of lanes: the scratch and seven keys.
 pub const LANE_COUNT: usize = 8;
@@ -261,6 +261,11 @@ pub struct Chart {
     pub meta: ChartMeta,
     /// What identifies the chart.
     pub identity: ChartIdentity,
+    /// Its BGA, read for presentation alone, or `None` when it has none
+    /// or its BGA timing failed (design.md "Chart Model"). Nothing judged
+    /// reads it: [`Chart::validate`], the hashes, the summary and
+    /// [`ChartMeta::length`] ignore it.
+    pub bga: Option<ChartBga>,
 }
 
 /// What a song list shows of a chart's content before it is chosen
