@@ -625,10 +625,11 @@ impl State {
 
     /// embassy-rp rewrote `ep`'s buffer control as it enabled or disabled
     /// the endpoint: AVAILABLE clear and the register's PID DATA1, so the
-    /// next report goes as DATA0, where the host restarts too. The host
-    /// did not acknowledge anything: a pending report is dropped, never
-    /// taken (`E`), and the release of whatever the host may still hold
-    /// is owed ahead of any queued input, the current state after it.
+    /// next report goes as DATA0, where the host restarts too. A pending
+    /// report's completion is no longer observable (an ACK may have come
+    /// just before the rewrite, or none): it is dropped, never taken
+    /// (`E`), and the release of whatever the host may still hold is owed
+    /// ahead of any queued input, the current state after it.
     /// The firmware calls this before any completion poll can see the
     /// cleared AVAILABLE. Nothing while recovering.
     fn reinitialised(&mut self, hw: &impl Hardware, ep: Ep) {

@@ -619,6 +619,50 @@ fn a_bus_reset_keeps_the_release_owed() {
     );
 }
 
+/// An ACK that reaches the controller just before a reconfiguration,
+/// whose completion the logic had not yet seen, still counts as dropped
+/// (`E`, no `C`): the release goes first, the current state after it, and
+/// the release at the disarm still reaches the host.
+#[test]
+fn an_ack_just_before_a_reconfiguration_counts_as_dropped() {
+    let mut w = World::new(Rate::Hz125, 3_000);
+    let ep = Ep::Keyboard;
+    assert_eq!(w.send("trace on"), "ok");
+    w.lease();
+    assert_eq!(w.send("key 115 1"), "ok");
+    w.run_until(27_000);
+    let seq = w.state.ep_ref(ep).assoc.pending().unwrap();
+    // The host takes and ACKs the press at its poll at 27 ms; the
+    // configuration comes in the same step, before the writer looks.
+    w.events.push((27_000, Event::Configure));
+    w.step();
+    assert_eq!(w.seen_from(ep, 0), [(F24, true)]);
+    let bodies: Vec<Body> = w.records.iter().map(|r| r.body).collect();
+    assert!(
+        bodies.contains(&Body::Dropped {
+            ep,
+            seq,
+            at: 27_000
+        }),
+        "{bodies:?}"
+    );
+    w.run_for(20_000);
+    assert_eq!(w.send("release"), "ok");
+    w.run_for(20_000);
+    assert_eq!(
+        w.seen_from(ep, 0),
+        [(F24, true), (F24, false), (F24, true), (F24, false)]
+    );
+    let trace = w.trace();
+    assert_eq!(
+        trace
+            .reports
+            .get(&(ep, seq))
+            .map(|r| (r.dropped, r.completion)),
+        Some((true, None))
+    );
+}
+
 /// A pad report after its predecessor was revoked agrees with the trace:
 /// it carries no H and C, since the revoked report has no completion.
 #[test]

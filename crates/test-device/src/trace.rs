@@ -138,8 +138,9 @@ pub enum Body {
     /// `A`: the controller did not acknowledge the abort of report `seq` at
     /// `at`; the report was not revoked and the device reboots.
     Unacknowledged { ep: Ep, seq: u32, at: u64 },
-    /// `E`: report `seq` was dropped at `at` when the host configured its
-    /// endpoint again, without the host's ACK: withdrawn, not taken.
+    /// `E`: report `seq` was pending at `at` when the host configured its
+    /// endpoint again, which left its completion unobserved, whether or not
+    /// an ACK came just before: withdrawn, not taken.
     Dropped { ep: Ep, seq: u32, at: u64 },
     /// `V`: a revocation trial's reports, at k1's handoff.
     Trial(TrialRun),
