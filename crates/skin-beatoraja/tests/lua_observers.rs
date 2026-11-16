@@ -304,16 +304,27 @@ fn a_true_observer_whose_object_may_skip_its_timer_is_refused() {
     );
 }
 
+/// A `draw` is a use the import reads; a custom timer's `timer` is one
+/// the source reads and the import does not follow (it has no target),
+/// beside a play destination's timer use.
 #[test]
 fn an_observer_read_anywhere_but_a_timer_is_refused() {
-    let body = format!("{TWINS}\n{}", moving(0, "draw = on,"));
-    assert_eq!(
-        observer_refused(import_body(&body)),
-        (
-            Unsupported::Observer("timer is no play destination's"),
-            HEAD + 1
-        )
-    );
+    for body in [
+        format!("{TWINS}\n{}", moving(0, "draw = on,")),
+        format!(
+            "{TWINS}\nskin.customTimers = {{ {{ id = 10000, timer = on }} }}\n{}",
+            moving(0, "timer = on,")
+        ),
+    ] {
+        assert_eq!(
+            observer_refused(import_body(&body)),
+            (
+                Unsupported::Observer("timer is no play destination's"),
+                HEAD + 1
+            ),
+            "{body}"
+        );
+    }
 }
 
 /// Each use of one observer is its own: a timer use elsewhere, at a
@@ -472,6 +483,74 @@ fn an_observer_held_outside_a_callback_position_is_inert() {
         };
         let body = format!("{TWINS}\n{store}\n{}", moving(100, fields));
         if let Err(e) = import_body(&body) {
+            refused.push(format!("{place}: {e}"));
+        }
+    }
+    assert!(refused.is_empty(), "refused: {refused:#?}");
+}
+
+/// A record an `if`/`value` wrapper chose is a destination the import
+/// reads, so an observer at its `draw` or in its `op` is a use there,
+/// refused at its call alone or beside a timer use; at its `timer` it is
+/// a play destination's, folding with the other timer use and drawing
+/// untimed with its twin (held only there, its predicate is not captured
+/// and it is refused). In a record no wrapper chose, or in a field the
+/// import does not read, it stays inert.
+#[test]
+fn an_observer_in_a_wrapper_s_chosen_record_is_a_use() {
+    let wrapped = |x: i32, cond: &str, fields: &str| {
+        format!(
+            "table.insert(skin.destination, {{ [\"if\"] = {cond}, value = {{ id = \"i\", {fields} loop = 800, dst = {{\n\
+               {{ time = 0, x = {x}, y = 1103, w = 64, h = 64 }}, {{ time = 200, y = 600 }}, {{ time = 800, y = 133 }} }} }} }})"
+        )
+    };
+    let timer = moving(0, "timer = on,");
+    let mut imported = Vec::new();
+    for (use_, field) in [("draw", "draw = on,"), ("op", "op = { on },")] {
+        for other in ["", timer.as_str()] {
+            let body = format!("{TWINS}\n{other}\n{}", wrapped(100, "{}", field));
+            match import_body(&body) {
+                Ok(i) => imported.push(format!("{use_} beside {other:?}: {:?}", i.callbacks)),
+                r => assert_eq!(
+                    observer_refused(r),
+                    (
+                        Unsupported::Observer("timer is no play destination's"),
+                        HEAD + 1
+                    ),
+                    "{body}"
+                ),
+            }
+        }
+    }
+    assert!(imported.is_empty(), "imported: {imported:#?}");
+    let body = format!(
+        "{TWINS}\n{timer}\n{}\n{}",
+        wrapped(100, "{}", "timer = on,"),
+        moving(200, "")
+    );
+    let i = import_body(&body).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Lowered]);
+    let (_d, skin) = drawable(&body);
+    let rects = at_ready(Drawn::new(skin, 4));
+    let (plain, chosen, twin) = (y_at(&rects, 0), y_at(&rects, 100), y_at(&rects, 200));
+    assert!(
+        twin.is_some() && plain == twin && chosen == twin,
+        "{rects:?}"
+    );
+    let body = format!("{TWINS}\n{}", wrapped(100, "{}", "timer = on,"));
+    assert_eq!(
+        observer_refused(import_body(&body)),
+        (Unsupported::Observer("predicate is not captured"), HEAD + 1)
+    );
+    let mut refused = Vec::new();
+    for (place, record) in [
+        (
+            "a record no wrapper chose",
+            wrapped(100, "999", "draw = on,"),
+        ),
+        ("an unread field", wrapped(100, "{}", "saved = on,")),
+    ] {
+        if let Err(e) = import_body(&format!("{TWINS}\n{timer}\n{record}")) {
             refused.push(format!("{place}: {e}"));
         }
     }

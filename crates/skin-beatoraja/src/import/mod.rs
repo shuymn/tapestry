@@ -473,6 +473,11 @@ pub(crate) struct Cx<'d> {
     /// `timer`, whatever became of the destination
     /// ([`Self::close_observers`]).
     observers: std::collections::HashSet<u32>,
+    /// The nodes holding a function a consumer read as a callback
+    /// ([`Self::callback_prop`]): uses beside the source's schema sites,
+    /// such as the fields of a record a wrapper chose
+    /// ([`Self::close_observers`]).
+    read_callables: std::collections::HashSet<u32>,
     /// Per callable instance, the `timer`s of play destinations whose
     /// object the source removes, or whose timer is inert: no site, and
     /// no reference ([`Cx::close_slots`]).
@@ -645,6 +650,7 @@ impl<'d> Cx<'d> {
             slot_roots: HashMap::new(),
             timer_sites: HashMap::new(),
             observers: std::collections::HashSet::new(),
+            read_callables: std::collections::HashSet::new(),
             removed_refs: HashMap::new(),
             install: prepare::Install::default(),
             prepare: prepare::Prepare::Open,
