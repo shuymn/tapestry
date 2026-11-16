@@ -27,8 +27,16 @@
 //! `#[ignore]`, `include!`, a `#[path]` it cannot follow exactly) is an
 //! error ([`unit_tests`]).
 //!
+//! A step that selects tests by name runs nothing when a test is renamed,
+//! and libtest still exits 0. So every `cargo test` or `cargo nextest run`
+//! command of the workflow that passes test filters must name one package
+//! and its targets (`--test`, `--bin`, `--lib`), and each filter must
+//! select a test of those targets, found by the same walk of the target's
+//! modules ([`selections`], [`check_selections`]).
+//!
 //! The check catches omissions, not adversarial edits: a step a condition
-//! disables (`if: false`) still counts.
+//! disables (`if: false`) still counts, and a shell variable before `--`
+//! (`$DEV_TOOLS`) is taken for flags, not read.
 //!
 //! The workflow is read line by line, enough for its own form: the list
 //! items with a `name:` and a `run:` (inline or a `|` block; a folded `>`
@@ -189,7 +197,270 @@ pub fn run(manifest: &Path) -> anyhow::Result<Vec<String>> {
     let path = root.join(WORKFLOW);
     let workflow = std::fs::read_to_string(&path)
         .with_context(|| format!("cannot read {}", path.display()))?;
-    check(&guards, unit.as_deref(), &workflow)
+    let mut diagnostics = check(&guards, unit.as_deref(), &workflow)?;
+    let tests_of = |package: &str, target: &Target| -> anyhow::Result<Option<Vec<String>>> {
+        let Some(found) = metadata
+            .workspace_packages()
+            .into_iter()
+            .find(|p| p.name.as_str() == package)
+        else {
+            return Ok(None);
+        };
+        let Some(t) = found.targets.iter().find(|t| match target {
+            Target::Test(name) => t.is_test() && t.name == *name,
+            Target::Bin(name) => t.is_bin() && t.name == *name,
+            Target::Lib => t.is_lib(),
+        }) else {
+            return Ok(None);
+        };
+        let root_file = t
+            .src_path
+            .as_std_path()
+            .strip_prefix(root)
+            .context("the target's source is in the workspace")?
+            .to_string_lossy()
+            .replace('\\', "/");
+        let read = |path: &str| -> anyhow::Result<Option<String>> {
+            match std::fs::read_to_string(root.join(path)) {
+                Ok(text) => Ok(Some(text)),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e).with_context(|| format!("cannot read {path}")),
+            }
+        };
+        Ok(Some(
+            unit_tests(&root_file, &read)?
+                .into_iter()
+                .map(|t| t.path)
+                .collect(),
+        ))
+    };
+    diagnostics.extend(check_selections(&selections(&workflow)?, &tests_of)?);
+    Ok(diagnostics)
+}
+
+/// A target of a package a command selects tests from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Target {
+    Test(String),
+    Bin(String),
+    Lib,
+}
+
+impl std::fmt::Display for Target {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Target::Test(name) => write!(f, "--test {name}"),
+            Target::Bin(name) => write!(f, "--bin {name}"),
+            Target::Lib => f.write_str("--lib"),
+        }
+    }
+}
+
+/// A workflow command that selects tests by name.
+#[derive(Debug, PartialEq, Eq)]
+pub struct ByName {
+    step: String,
+    command: String,
+    package: String,
+    targets: Vec<Target>,
+    selection: Selection,
+}
+
+/// The tests of a package's target as libtest names them, `None` when the
+/// package or the target does not exist.
+type TestsOf<'a> = &'a dyn Fn(&str, &Target) -> anyhow::Result<Option<Vec<String>>>;
+
+/// Flags before `--` that take a value, of `cargo test` and `cargo nextest
+/// run`, so the value is not read as a filter.
+const VALUE_FLAGS: &[&str] = &[
+    "-p",
+    "--package",
+    "-F",
+    "--features",
+    "--test",
+    "--bin",
+    "--example",
+    "--bench",
+    "--target",
+    "--target-dir",
+    "--manifest-path",
+    "--profile",
+    "-P",
+    "--cargo-profile",
+    "--run-ignored",
+    "--partition",
+    "-j",
+    "--jobs",
+    "--test-threads",
+    "--message-format",
+    "--retries",
+    "--no-tests",
+    "--color",
+    "--config",
+    "-Z",
+];
+
+/// The commands of `workflow` that select tests by name: a `cargo test` or
+/// `cargo nextest run` with test filters, before or after `--`. Such a
+/// command must name one package and its targets and hold no shell syntax
+/// ([`NOT_PLAIN`], `$`); one that only builds or lists is skipped, and a
+/// nextest filterset (`-E`) or a libtest flag this check does not know is
+/// refused.
+pub fn selections(workflow: &str) -> anyhow::Result<Vec<ByName>> {
+    let mut out = Vec::new();
+    for step in steps(workflow)? {
+        for line in step.run.replace("\\\n", " ").lines() {
+            for command in commands(line) {
+                if let Some(by_name) = by_name(&step.name, command.trim())? {
+                    out.push(by_name);
+                }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// `command`'s by-name selection, if it has one.
+fn by_name(step: &str, command: &str) -> anyhow::Result<Option<ByName>> {
+    let tokens: Vec<&str> = command.split_whitespace().collect();
+    let start = if let Some(i) = tokens.windows(2).position(|w| w == ["cargo", "test"]) {
+        i + 2
+    } else if let Some(i) = tokens
+        .windows(3)
+        .position(|w| w == ["cargo", "nextest", "run"])
+    {
+        i + 3
+    } else {
+        return Ok(None);
+    };
+    let refuse = |why: &str| {
+        anyhow::anyhow!(
+            "{WORKFLOW}: step `{step}` runs `{command}`, which selects tests by name; {why}"
+        )
+    };
+    let args = tokens.get(start..).unwrap_or_default();
+    let (head, tail) = match args.iter().position(|&a| a == "--") {
+        Some(i) => (&args[..i], &args[i + 1..]),
+        None => (args, &[][..]),
+    };
+    let mut packages = Vec::new();
+    let mut targets = Vec::new();
+    let mut selection = Selection::default();
+    let mut head = head.iter().copied();
+    while let Some(arg) = head.next() {
+        if arg == "--no-run" {
+            return Ok(None);
+        }
+        if ["-E", "--filterset", "--filter-expr"].contains(&arg) || arg.starts_with("-E") {
+            return Err(refuse("write its filters after `--`, not as a filterset"));
+        }
+        if arg == "--lib" {
+            targets.push(Target::Lib);
+            continue;
+        }
+        let (flag, inline) = match arg.split_once('=') {
+            Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
+            _ => (arg, None),
+        };
+        if VALUE_FLAGS.contains(&flag) {
+            let value = match inline {
+                Some(v) => Some(v.to_owned()),
+                None => head.next().map(str::to_owned),
+            };
+            match (flag, value) {
+                ("-p" | "--package", Some(p)) => packages.push(p),
+                ("--test", Some(t)) => targets.push(Target::Test(t)),
+                ("--bin", Some(b)) => targets.push(Target::Bin(b)),
+                _ => {}
+            }
+        } else if let Some(p) = arg.strip_prefix("-p").filter(|p| !p.is_empty()) {
+            packages.push(p.to_owned());
+        } else if !arg.starts_with('-') && !arg.starts_with('$') {
+            selection.filters.push(arg.to_owned());
+        }
+    }
+    let mut tail = tail.iter().copied();
+    while let Some(arg) = tail.next() {
+        match arg {
+            "--list" => return Ok(None),
+            "--exact" => selection.exact = true,
+            "--skip" => selection.skips.push(
+                tail.next()
+                    .ok_or_else(|| refuse("its `--skip` has no pattern"))?
+                    .to_owned(),
+            ),
+            "--ignored" | "--include-ignored" | "--nocapture" | "--no-capture"
+            | "--show-output" | "--test" => {}
+            _ if arg.starts_with("--test-threads=") => {}
+            "--test-threads" => {
+                tail.next();
+            }
+            _ if arg.starts_with('-') => {
+                return Err(refuse(&format!("this check does not read `{arg}`")));
+            }
+            _ => selection.filters.push(arg.to_owned()),
+        }
+    }
+    if selection.filters.is_empty() {
+        return Ok(None);
+    }
+    if NOT_PLAIN.iter().any(|m| command.contains(m)) || command.contains('$') {
+        return Err(refuse(
+            "this check reads only plain commands, without shell syntax",
+        ));
+    }
+    let [package] = packages.as_slice() else {
+        return Err(refuse("name exactly one package with `-p`"));
+    };
+    if targets.is_empty() {
+        return Err(refuse("name its targets (`--test`, `--bin` or `--lib`)"));
+    }
+    Ok(Some(ByName {
+        step: step.to_owned(),
+        command: command.to_owned(),
+        package: package.clone(),
+        targets,
+        selection,
+    }))
+}
+
+/// The diagnostics for by-name selections: one per filter that selects no
+/// test of its command's targets, and one per target that does not exist.
+pub fn check_selections(selected: &[ByName], tests_of: TestsOf) -> anyhow::Result<Vec<String>> {
+    let mut diagnostics = Vec::new();
+    for s in selected {
+        let mut tests = Vec::new();
+        for target in &s.targets {
+            match tests_of(&s.package, target)? {
+                Some(found) => tests.extend(found),
+                None => diagnostics.push(format!(
+                    "step `{}` of {WORKFLOW} selects tests of `-p {} {target}`, which does not \
+                     exist",
+                    s.step, s.package
+                )),
+            }
+        }
+        for filter in &s.selection.filters {
+            let one = Selection {
+                filters: vec![filter.clone()],
+                skips: s.selection.skips.clone(),
+                exact: s.selection.exact,
+            };
+            if !tests.iter().any(|t| one.runs(t)) {
+                let targets: Vec<String> = s.targets.iter().map(ToString::to_string).collect();
+                diagnostics.push(format!(
+                    "step `{}` of {WORKFLOW} selects `{filter}`{} in `-p {} {}`, which matches no \
+                     test there, so the step would run nothing: `{}`",
+                    s.step,
+                    if s.selection.exact { " (--exact)" } else { "" },
+                    s.package,
+                    targets.join(" "),
+                    s.command
+                ));
+            }
+        }
+    }
+    Ok(diagnostics)
 }
 
 /// Reads a file by its path relative to the workspace root, `/`-separated:
@@ -1433,6 +1704,185 @@ mod tests {
                      its allocation guards' release command: use `cargo test --release --locked \
                      -p player --features dev-tools --bin tapestry -- <filters>`, with only \
                      `--exact` and `--skip <pattern>` besides the filters"
+                ),
+                "{command}"
+            );
+        }
+    }
+
+    const PEAKS_RUN: &str = "cargo nextest run --release --locked -p bms-parser --test memory \
+                             --run-ignored only -- --exact measure_load_peaks";
+
+    /// `bms-parser`'s `memory` test target holds `measure_load_peaks` and a
+    /// module's test; `player`'s binary the unit guard; nothing else exists.
+    fn tests_of(package: &str, target: &Target) -> anyhow::Result<Option<Vec<String>>> {
+        Ok(match (package, target) {
+            ("bms-parser", Target::Test(t)) if t == "memory" => Some(vec![
+                "measure_load_peaks".into(),
+                "rows::a_row_is_counted".into(),
+            ]),
+            ("player", Target::Bin(b)) if b == "tapestry" => Some(vec![GUARD.into()]),
+            _ => None,
+        })
+    }
+
+    /// A workflow of one step, `Extra`, whose block command is `lines`.
+    fn only_step(lines: &[&str]) -> String {
+        let mut text =
+            String::from("jobs:\n  j:\n    steps:\n      - name: Extra\n        run: |\n");
+        for line in lines {
+            text.push_str("          ");
+            text.push_str(line);
+            text.push('\n');
+        }
+        text
+    }
+
+    fn selection_diagnostics(lines: &[&str]) -> anyhow::Result<Vec<String>> {
+        check_selections(&selections(&only_step(lines))?, &tests_of)
+    }
+
+    #[test]
+    fn a_by_name_command_is_read_with_its_package_targets_and_filters() {
+        let selected = selections(&only_step(&[PEAKS_RUN])).unwrap();
+        assert_eq!(
+            selected,
+            [ByName {
+                step: "Extra".into(),
+                command: PEAKS_RUN.into(),
+                package: "bms-parser".into(),
+                targets: vec![Target::Test("memory".into())],
+                selection: Selection {
+                    filters: vec!["measure_load_peaks".into()],
+                    skips: vec![],
+                    exact: true,
+                },
+            }]
+        );
+    }
+
+    #[test]
+    fn a_filter_that_selects_a_test_passes() {
+        for command in [
+            PEAKS_RUN,
+            "cargo test --release --locked -p bms-parser --test memory -- --ignored --exact \
+             measure_load_peaks",
+            "cargo test -p bms-parser --test=memory -- row --skip other",
+            "cargo nextest run -p bms-parser --test memory a_row_is",
+            &format!("{UNIT_RUN} -- _alloc"),
+        ] {
+            assert_eq!(
+                selection_diagnostics(&[command]).unwrap(),
+                Vec::<String>::new(),
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_filter_that_selects_no_test_fails() {
+        let renamed = PEAKS_RUN.replace("measure_load_peaks", "measure_load_peak");
+        let rows = [
+            // Renamed: with `--exact` a prefix of the name is not the name.
+            (renamed.as_str(), "`measure_load_peak` (--exact)"),
+            // Every match skipped.
+            (
+                "cargo test -p bms-parser --test memory -- row --skip rows::",
+                "`row`",
+            ),
+            // A filter before `--`, nextest's form.
+            (
+                "cargo nextest run -p bms-parser --test memory measure_peaks",
+                "`measure_peaks`",
+            ),
+        ];
+        for (command, filter) in rows {
+            let diags = selection_diagnostics(&[command]).unwrap();
+            assert_eq!(
+                diags,
+                [format!(
+                    "step `Extra` of {WORKFLOW} selects {filter} in `-p bms-parser --test \
+                     memory`, which matches no test there, so the step would run nothing: \
+                     `{command}`"
+                )],
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_selection_from_a_target_that_does_not_exist_fails() {
+        let command = PEAKS_RUN.replace("--test memory", "--test memroy");
+        let diags = selection_diagnostics(&[&command]).unwrap();
+        assert_eq!(
+            diags.first().map(String::as_str),
+            Some(
+                format!(
+                    "step `Extra` of {WORKFLOW} selects tests of `-p bms-parser --test memroy`, \
+                     which does not exist"
+                )
+                .as_str()
+            )
+        );
+    }
+
+    #[test]
+    fn commands_that_select_nothing_by_name_are_not_read() {
+        let selected = selections(&only_step(&[
+            "cargo nextest run $DEV_TOOLS --partition \"slice:$PART/$PARTS\" --no-fail-fast",
+            "cargo nextest run --locked -p skin-beatoraja --features dev-tools --test lua_runtime \
+             --bin lua_replay",
+            "cargo test --release -p bms-parser --test memory --no-run -- measure_load_peaks",
+            "cargo test -p bms-parser --test memory -- measure_load_peaks --list",
+            "cargo nextest list -p bms-parser --test memory measure_load_peaks",
+            "cargo bench -p eval --bench evaluate -- --test",
+        ]))
+        .unwrap();
+        assert_eq!(selected, []);
+    }
+
+    #[test]
+    fn a_by_name_command_of_another_form_is_refused() {
+        let rows = [
+            (
+                "cargo test --workspace -- measure_load_peaks",
+                "name exactly one package with `-p`",
+            ),
+            (
+                "cargo test -p bms-parser -p eval --test memory -- measure_load_peaks",
+                "name exactly one package with `-p`",
+            ),
+            (
+                "cargo test -p bms-parser -- measure_load_peaks",
+                "name its targets (`--test`, `--bin` or `--lib`)",
+            ),
+            (
+                "cargo test -p bms-parser --test memory -- $NAME",
+                "this check reads only plain commands, without shell syntax",
+            ),
+            (
+                "cargo test -p bms-parser --test memory -- \"measure_load_peaks\"",
+                "this check reads only plain commands, without shell syntax",
+            ),
+            (
+                "cargo nextest run -p bms-parser --test memory -E test(=measure_load_peaks)",
+                "write its filters after `--`, not as a filterset",
+            ),
+            (
+                "cargo test -p bms-parser --test memory -- --format=json measure_load_peaks",
+                "this check does not read `--format=json`",
+            ),
+            (
+                "cargo test -p bms-parser --test memory -- measure_load_peaks --skip",
+                "its `--skip` has no pattern",
+            ),
+        ];
+        for (command, why) in rows {
+            let e = selections(&only_step(&[command])).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!(
+                    "{WORKFLOW}: step `Extra` runs `{command}`, which selects tests by name; {why}"
                 ),
                 "{command}"
             );
