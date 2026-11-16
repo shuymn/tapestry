@@ -264,6 +264,16 @@ pub trait PlaySkin: Send {
     /// default: a skin that draws no chart image.
     fn set_chart_live(&mut self, _live: Option<skin_model::chart_image::ChartKey>) {}
 
+    /// The BGA pictures the prepared attempt draws, from the next frame on
+    /// ([`skin_model::Play::set_bga_images`]): the renderer sets them at
+    /// each publication and after each preparation. Nothing by default: a
+    /// skin that draws no BGA.
+    fn set_bga_images(&mut self, _table: std::sync::Arc<skin_model::bga::BgaTable>) {}
+
+    /// The live key of the BGA array the next frames are built against: a
+    /// BGA table draws only when its key equals it. Nothing by default.
+    fn set_bga_live(&mut self, _live: Option<skin_model::bga::BgaKey>) {}
+
     /// The most sprites a frame of the skin pushes: the renderer's batch,
     /// staging and instance buffer hold this many, and never fewer than
     /// [`MAX_SPRITES`], which the built-in screens use, and the

@@ -162,6 +162,7 @@ struct Proj {
 @group(0) @binding(1) var smooth_samp: sampler;
 @group(0) @binding(2) var nearest_samp: sampler;
 @group(0) @binding(3) var<uniform> proj: Proj;
+@group(1) @binding(0) var bga: texture_2d_array<f32>;
 
 // Canvas pixels (origin top left, y down) to clip space; the viewport places
 // the canvas on the target. Each corner turns clockwise on screen by the
@@ -192,7 +193,10 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
 // times 128, exact whatever the array's side. The two implicit-derivative
 // samples are always taken, so they stay in uniform control flow; the
 // base read has an explicit level, which needs no derivatives, so only a
-// sprite with the base bit takes it. One result is chosen.
+// sprite with the base bit takes it. One result is chosen. A sprite with
+// the BGA bit reads the BGA array instead, at level 0 by explicit level:
+// bilinear, or at the nearest texel with the nearest bit, and with the key
+// bit a pure black texel is transparent.
 fn tinted(v: VOut) -> vec4f {
     let layer = i32(v.flags & 0xFFFFu);
     let smoothed = textureSample(atlas, smooth_samp, v.uv, layer);
@@ -203,7 +207,16 @@ fn tinted(v: VOut) -> vec4f {
     if (v.flags & 0x20000u) != 0u {
         page = textureSampleLevel(atlas, nearest_samp, v.uv, layer, 0.0);
     }
-    return select(page, builtin, layer == 0) * v.color;
+    var c = select(page, builtin, layer == 0);
+    if (v.flags & 0x40000u) != 0u {
+        let bs = textureSampleLevel(bga, smooth_samp, v.uv, layer, 0.0);
+        let bn = textureSampleLevel(bga, nearest_samp, v.uv, layer, 0.0);
+        c = select(bs, bn, (v.flags & 0x10000u) != 0u);
+        if (v.flags & 0x80000u) != 0u && all(c.rgb == vec3f(0.0)) {
+            c = vec4f(0.0);
+        }
+    }
+    return c * v.color;
 }
 
 @fragment
@@ -1021,6 +1034,8 @@ struct Bindings {
     /// The nearest texel of the nearest level, for pixel art and, at level
     /// 0, the built-in atlas.
     nearest: wgpu::Sampler,
+    /// The second group's layout: the BGA array.
+    bga: wgpu::BindGroupLayout,
     /// Half the canvas's size ([`Projection::half`]), padded to 16 bytes.
     projection: wgpu::Buffer,
     /// The half last written to [`projection`](Self::projection), `None`
@@ -1079,6 +1094,13 @@ pub struct Renderer {
     bindings: Bindings,
     atlas: AtlasTexture,
     atlas_bind: wgpu::BindGroup,
+    /// The BGA array in use, or its stand-in.
+    bga: crate::bga::BgaArray,
+    /// The last BGA array's serial.
+    bga_serial: u64,
+    /// The BGA table last published, keyed to the array its cells were
+    /// written into ([`publish_bga`](Self::publish_bga)).
+    bga_table: Arc<skin_model::bga::BgaTable>,
     instances: wgpu::Buffer,
     /// The batch, its staging copied into `instances` each frame, and the
     /// play skin's projection and clip scissors.
@@ -1319,6 +1341,7 @@ impl Renderer {
         let (alpha, additive, multiply, bindings) = pipelines(&gpu, format);
         let atlas = AtlasTexture::builtin(&gpu);
         let atlas_bind = bindings.bind(device, &atlas);
+        let bga = crate::bga::BgaArray::stand_in(&gpu, &bindings.bga);
         let skin: Box<dyn PlaySkin> = Box::new(SimpleSkin::new());
         // The simple skin's runs are as many as its sprites, the staging's
         // default.
@@ -1340,6 +1363,9 @@ impl Renderer {
             bindings,
             atlas,
             atlas_bind,
+            bga,
+            bga_serial: 0,
+            bga_table: Arc::new(skin_model::bga::BgaTable::ABSENT),
             instances,
             staging,
             text_cache: TextCache::none(),
@@ -1566,6 +1592,7 @@ impl Renderer {
             }
         }
         self.skin = skin;
+        self.skin.set_bga_images(Arc::clone(&self.bga_table));
         self.installed = None;
         self.chart = None;
         self.installed_text = Holder::default();
@@ -1692,6 +1719,7 @@ impl Renderer {
         self.skin
             .prepare(&self.gpu, &a)
             .map_err(RenderError::Skin)?;
+        self.skin.set_bga_images(Arc::clone(&self.bga_table));
         self.refused = None;
         self.project();
         finish_uploads(&self.gpu)
@@ -1983,6 +2011,7 @@ impl Renderer {
                 ..*a
             };
             skin.prepare(&self.gpu, &a).map_err(RenderError::Skin)?;
+            skin.set_bga_images(Arc::clone(&self.bga_table));
             if let Some(producer) = bundle.text_producer() {
                 let key = self.loading_text_key();
                 // The staging's own resources, or the installed ones,
@@ -2502,6 +2531,7 @@ impl Renderer {
     fn activate_decl_skin(&mut self, skin: DeclSkin) {
         self.installed = Some(skin.installation());
         self.skin = Box::new(skin);
+        self.skin.set_bga_images(Arc::clone(&self.bga_table));
         self.refused = None;
         self.loading_refused = None;
         self.started = None;
@@ -3284,6 +3314,130 @@ impl Renderer {
         })
     }
 
+    /// The live key of the BGA array: this renderer and the array's
+    /// serial; `None` with no array or once the device is lost. Frames are
+    /// built against it ([`PlaySkin::set_bga_live`]).
+    #[must_use]
+    pub fn bga_key(&self) -> Option<skin_model::bga::BgaKey> {
+        if self.gpu.lost() {
+            return None;
+        }
+        self.bga.key(self.id)
+    }
+
+    /// Begins a BGA array of `pages` pages (design.md "Rendering and
+    /// Skins", BGA): the array in use and the table published are dropped
+    /// first, so no frame draws a picture of either from now on. Returns
+    /// the new array's key, which its writes and publication name.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::BgaFault::Pages`] for a page count out of range or past the
+    /// device's limits, [`crate::BgaFault::Refused`] when the device
+    /// refuses the array: no array is left, and the pictures are absent.
+    pub fn begin_bga(&mut self, pages: u32) -> Result<skin_model::bga::BgaKey, crate::BgaFault> {
+        self.drop_bga();
+        self.bga_serial += 1;
+        let array =
+            crate::bga::BgaArray::new(&self.gpu, &self.bindings.bga, pages, self.bga_serial)?;
+        let key = array.key(self.id).ok_or(crate::BgaFault::Stale)?;
+        self.bga = array;
+        Ok(key)
+    }
+
+    /// Writes one cell of `texels` (premultiplied RGBA8 rows of its padded
+    /// size) at `place` of the array `key` names, and waits for the GPU
+    /// before it returns, so the queue's staging of one cell is released
+    /// before the next.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::BgaFault::Stale`] when `key` is not the array in use (or the
+    /// device is lost), [`crate::BgaFault::Cell`] for a cell off its page,
+    /// [`crate::BgaFault::Refused`] when the device refuses the write.
+    pub fn write_bga_cell(
+        &mut self,
+        key: skin_model::bga::BgaKey,
+        place: &skin_model::bga::CellPlace,
+        texels: &[u8],
+    ) -> Result<(), crate::BgaFault> {
+        if self.bga_key() != Some(key) {
+            return Err(crate::BgaFault::Stale);
+        }
+        let (written, refused) = skin_atlas::scoped(self.gpu.device(), || {
+            let w = self.bga.write(&self.gpu, place, texels);
+            self.gpu.queue().submit([]);
+            w
+        });
+        written?;
+        if refused.is_some() || wait_for_gpu(&self.gpu).is_err() {
+            return Err(crate::BgaFault::Refused);
+        }
+        Ok(())
+    }
+
+    /// Publishes `entries` as the BGA table of the array `key` names
+    /// (`None`: no array, every picture absent), which the play skin in
+    /// use, a staged one and every attempt prepared later draw from the
+    /// next frame on.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::BgaFault::Stale`] when `key` is not the array in use: the
+    /// table is not published.
+    pub fn publish_bga(
+        &mut self,
+        key: Option<skin_model::bga::BgaKey>,
+        entries: Vec<skin_model::bga::BgaEntry>,
+    ) -> Result<Arc<skin_model::bga::BgaTable>, crate::BgaFault> {
+        let table = skin_model::bga::BgaTable::new(entries);
+        let table = match key {
+            Some(k) if self.bga_key() == Some(k) => table.keyed(k),
+            Some(_) => return Err(crate::BgaFault::Stale),
+            None => {
+                self.drop_bga();
+                table
+            }
+        };
+        self.set_bga_table(Arc::new(table));
+        Ok(Arc::clone(&self.bga_table))
+    }
+
+    /// The table published for the array `key` names, if it is still the
+    /// array in use with that table: what a later attempt of the same
+    /// pictures reuses without writing anything.
+    #[must_use]
+    pub fn published_bga(
+        &self,
+        key: skin_model::bga::BgaKey,
+    ) -> Option<Arc<skin_model::bga::BgaTable>> {
+        (self.bga_key() == Some(key) && self.bga_table.key() == Some(key))
+            .then(|| Arc::clone(&self.bga_table))
+    }
+
+    /// Drops the BGA array and its table: the stand-in is bound again.
+    pub fn drop_bga(&mut self) {
+        self.set_bga_table(Arc::new(skin_model::bga::BgaTable::ABSENT));
+        self.bga = crate::bga::BgaArray::stand_in(&self.gpu, &self.bindings.bga);
+    }
+
+    /// The BGA array's bytes on the GPU (0 for the stand-in).
+    #[must_use]
+    pub fn bga_bytes(&self) -> u64 {
+        self.bga.key(self.id).map_or(0, |_| self.bga.bytes())
+    }
+
+    fn set_bga_table(&mut self, table: Arc<skin_model::bga::BgaTable>) {
+        self.bga_table = table;
+        self.skin.set_bga_images(Arc::clone(&self.bga_table));
+        if let Some(Pending {
+            skin: Some(skin), ..
+        }) = &mut self.pending
+        {
+            skin.set_bga_images(Arc::clone(&self.bga_table));
+        }
+    }
+
     /// Copies the valid chart images ([`valid_chart`](Self::valid_chart))
     /// into the play installation's loading presentation, `None` without
     /// them, and into the committed attempt, absent without them.
@@ -3693,6 +3847,7 @@ impl Renderer {
         };
         let live = self.chart_key();
         self.skin.set_chart_live(live);
+        self.skin.set_bga_live(self.bga_key());
         if let Err(e) = self.staging.build(self.skin.as_mut(), &f) {
             self.refused = Some(e);
             return Err(e);
@@ -5301,6 +5456,7 @@ impl Renderer {
             });
             pass.set_viewport(x, y, w, h, 0.0, 1.0);
             pass.set_bind_group(0, atlas_bind, &[]);
+            pass.set_bind_group(1, &self.bga.bind, &[]);
             pass.set_vertex_buffer(0, instances.slice(..));
             // The runs in the batch's order, so each sprite is drawn over
             // every sprite pushed before it, whatever their blends. Each run
@@ -5756,13 +5912,14 @@ fn pipelines(
             },
         ],
     });
+    let bga = crate::bga::layout(device);
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("sprites"),
         source: wgpu::ShaderSource::Wgsl(SPRITE_WGSL.into()),
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("sprites"),
-        bind_group_layouts: &[Some(&layout)],
+        bind_group_layouts: &[Some(&layout), Some(&bga)],
         immediate_size: 0,
     });
     let pipeline = |blend, fragment| {
@@ -5840,6 +5997,7 @@ fn pipelines(
         layout,
         smooth,
         nearest,
+        bga,
         projection,
         uploaded: None,
     };
