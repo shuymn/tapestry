@@ -185,6 +185,10 @@ enum RowsGate {
     Held,
 }
 
+/// One tracked skin frame: its time, its `screen` timer's start, and the
+/// leftmost lit column in [`ANIMATED`]'s band.
+type Tracked = (TimeUs, Option<TimeUs>, Option<u32>);
+
 /// What the test sets and reads of the [`Recorder`]s a render thread
 /// builds, their devices numbered from 1.
 #[derive(Default)]
@@ -215,9 +219,8 @@ struct Seen {
     /// While set, each submitted skin frame is read back and its moving
     /// text's place noted in `tracked`.
     track: AtomicBool,
-    /// Each tracked skin frame: its time, its `screen` timer's start, and
-    /// the leftmost lit column in [`ANIMATED`]'s band.
-    tracked: Mutex<Vec<(TimeUs, Option<TimeUs>, Option<u32>)>>,
+    /// Each tracked skin frame.
+    tracked: Mutex<Vec<Tracked>>,
     /// A filling slot whose writes were all submitted is not settled
     /// while set, as if their completion had not come.
     hold_settle: AtomicBool,
