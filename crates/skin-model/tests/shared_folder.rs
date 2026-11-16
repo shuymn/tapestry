@@ -6,17 +6,20 @@
 mod shared_folder_support;
 
 use std::io::Read;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use image::{Rgba, RgbaImage};
-use shared_folder_support::{folder_in, png};
+use shared_folder_support::{create, folder_in, png};
 use skin_model::{AtlasError, AtlasLimits, FileDef, Filter, ImageDef, ImageError, Sheet, Variant};
 
 /// Names the base folder a writer process places the files under.
 const WRITER_BASE: &str = "SKIN_MODEL_SHARED_FOLDER_WRITER_BASE";
+/// Set, a writer process fails at once.
+const WRITER_FAILS: &str = "SKIN_MODEL_SHARED_FOLDER_WRITER_FAILS";
 /// How many writer processes run at once.
 const WRITERS: usize = 4;
 /// How long each writer keeps placing the files.
@@ -89,26 +92,65 @@ fn aged() -> SystemTime {
     SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000)
 }
 
+fn age(path: &Path) {
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(aged())
+        .unwrap();
+}
+
+/// `path` is still the aged file and holds `bytes`.
+fn assert_kept(path: &Path, bytes: &[u8]) {
+    let modified = std::fs::metadata(path).unwrap().modified().unwrap();
+    assert_eq!(modified, aged(), "{path:?} was replaced");
+    assert_eq!(std::fs::read(path).unwrap(), bytes, "{path:?}");
+}
+
 #[test]
 fn placing_again_keeps_each_file() {
     let base = base();
     let files = files();
     let dir = folder_in(base.path(), "shared", &files);
     for (name, _) in &files {
-        std::fs::File::options()
-            .write(true)
-            .open(dir.join(name))
-            .unwrap()
-            .set_modified(aged())
-            .unwrap();
+        age(&dir.join(name));
     }
     assert_eq!(folder_in(base.path(), "shared", &files), dir);
     for (name, bytes) in &files {
-        let path = dir.join(name);
-        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
-        assert_eq!(modified, aged(), "{name} was replaced");
-        assert_eq!(&std::fs::read(&path).unwrap(), bytes, "{name}");
+        assert_kept(&dir.join(name), bytes);
     }
+}
+
+/// Placing a placed folder again writes nothing into it, not even a file
+/// set aside: the folder's own modified time, which a file created and
+/// removed there moves, stays.
+#[test]
+fn placing_a_placed_folder_writes_nothing() {
+    let base = base();
+    let files = files();
+    let dir = folder_in(base.path(), "shared", &files);
+    let modified = || std::fs::metadata(&dir).unwrap().modified().unwrap();
+    let before = modified();
+    std::thread::sleep(Duration::from_millis(50));
+    folder_in(base.path(), "shared", &files);
+    assert_eq!(modified(), before, "the placement wrote into the folder");
+    // The control: a file created and removed there moves the time.
+    drop(tempfile::NamedTempFile::new_in(&dir).unwrap());
+    assert_ne!(modified(), before, "a file set aside left the time");
+}
+
+/// A placement that found the name free, and another process's file there
+/// once it moves its own, keeps that file.
+#[test]
+fn creating_over_a_file_keeps_it() {
+    let base = base();
+    let files = files();
+    let dir = folder_in(base.path(), "shared", &files);
+    let (name, bytes) = &files[0];
+    age(&dir.join(name));
+    create(&dir, name, bytes);
+    assert_kept(&dir.join(name), bytes);
 }
 
 #[test]
@@ -147,6 +189,10 @@ fn a_file_with_other_bytes_is_refused() {
 #[test]
 #[ignore = "a writer process of a_reader_never_meets_a_file_being_placed"]
 fn writer() {
+    assert!(
+        std::env::var_os(WRITER_FAILS).is_none(),
+        "this writer fails as it was asked"
+    );
     let base = PathBuf::from(std::env::var_os(WRITER_BASE).unwrap());
     let files = files();
     let until = Instant::now() + WRITING;
@@ -158,8 +204,12 @@ fn writer() {
     println!("writer passes {passes}");
 }
 
-fn spawn_writer(base: &Path) -> Child {
-    Command::new(std::env::current_exe().unwrap())
+fn spawn_writer(base: &Path, fails: bool) -> Child {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    if fails {
+        command.env(WRITER_FAILS, "1");
+    }
+    command
         .args(["writer", "--exact", "--ignored", "--nocapture"])
         .env(WRITER_BASE, base)
         .stdout(Stdio::piped())
@@ -268,17 +318,15 @@ fn wait_writers(mut writers: Vec<Child>, start: Instant) -> Vec<String> {
     outputs
 }
 
-/// On Windows a file being replaced is absent, or refuses to open, only in
-/// a short window of the replacement, so a placement that replaced files
-/// fails this in some runs, not every: [`placing_again_keeps_each_file`]
-/// checks in every run that a placement replaces nothing.
-#[test]
-fn a_reader_never_meets_a_file_being_placed() {
-    let base = base();
-    let dir = folder_in(base.path(), "shared", &files());
-
+/// Runs [`WRITERS`] writer processes (failing ones with `fails`) against
+/// the reader threads until the writers end; returns each writer's output
+/// and what each reader saw.
+fn race(base: &Path, fails: bool) -> (Vec<String>, Vec<Seen>) {
     let start = Instant::now();
-    let writers = (0..WRITERS).map(|_| spawn_writer(base.path())).collect();
+    let writers = (0..WRITERS).map(|_| spawn_writer(base, fails)).collect();
+    // Placed while the writers start, which place it too: the first
+    // placements race to create the files.
+    let dir = folder_in(base, "shared", &files());
     let done = AtomicBool::new(false);
     let (outputs, seen) = std::thread::scope(|s| {
         let readings = [
@@ -294,11 +342,49 @@ fn a_reader_never_meets_a_file_being_placed() {
                 s.spawn(move || read_until(dir, reading, done))
             })
             .collect();
-        let outputs = wait_writers(writers, start);
+        // The readers stop even when a writer failed, or the scope would
+        // wait for them for good.
+        let outputs = std::panic::catch_unwind(AssertUnwindSafe(|| wait_writers(writers, start)));
         done.store(true, Ordering::Relaxed);
         let seen: Vec<Seen> = readers.into_iter().map(|r| r.join().unwrap()).collect();
         (outputs, seen)
     });
+    let outputs = outputs.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+    (outputs, seen)
+}
+
+/// A writer that fails fails the race, and the readers stop: the race does
+/// not wait for them for good.
+#[test]
+fn a_failed_writer_ends_the_race() {
+    let base = base();
+    let (sent, ended) = std::sync::mpsc::channel();
+    let path = base.path().to_owned();
+    std::thread::spawn(move || {
+        let raced = std::panic::catch_unwind(|| race(&path, true));
+        let payload = raced
+            .err()
+            .map(|p| p.downcast_ref::<String>().cloned().unwrap_or_default());
+        sent.send(payload).unwrap();
+    });
+    let payload = ended
+        .recv_timeout(LIMIT)
+        .expect("the race did not end after its writers failed");
+    let message = payload.expect("the race passed with failing writers");
+    assert!(
+        message.contains("a writer failed") && message.contains("this writer fails"),
+        "{message}"
+    );
+}
+
+/// On Windows a file being replaced is absent, or refuses to open, only in
+/// a short window of the replacement, so a placement that replaced files
+/// fails this in some runs, not every: [`placing_again_keeps_each_file`]
+/// checks in every run that a placement replaces nothing.
+#[test]
+fn a_reader_never_meets_a_file_being_placed() {
+    let base = base();
+    let (outputs, seen) = race(base.path(), false);
 
     // Each writer placed the files while the readers loaded: the race ran.
     let passes: Vec<u32> = outputs

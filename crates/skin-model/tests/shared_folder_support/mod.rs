@@ -5,8 +5,9 @@
 //! another that opens it then, or refuses to open, so no file here is ever
 //! replaced: the folder is named by its files' contents, and each file is
 //! created whole (written aside, then moved to its name only if that name
-//! is free). A process that finds a file already there reads it back and
-//! checks it holds the bytes it would have written.
+//! is free). A process that finds a file already there, before or while
+//! creating it, only reads it and checks it holds the bytes it would have
+//! written.
 
 #![allow(dead_code)]
 
@@ -44,18 +45,36 @@ pub fn folder_in(base: &Path, prefix: &str, files: &[(String, Vec<u8>)]) -> Path
     dir
 }
 
-/// Creates `dir/name` holding `bytes`, or checks the file already there
-/// holds them. Never replaces a file.
+/// Checks the file `dir/name` holds `bytes`, creating it when it is
+/// absent. A folder already placed is only read: no process writes into
+/// it again.
 fn place(dir: &Path, name: &str, bytes: &[u8]) {
     let path = dir.join(name);
-    let mut tmp = tempfile::NamedTempFile::new_in(dir).unwrap();
+    match std::fs::read(&path) {
+        Ok(found) => check(&path, &found, bytes),
+        Err(e) if e.kind() == ErrorKind::NotFound => create(dir, name, bytes),
+        Err(e) => panic!("{path:?}: {e}"),
+    }
+}
+
+/// Creates `dir/name` holding `bytes`: written aside, then moved to the
+/// name only if it is free. When another process created it first, checks
+/// it holds `bytes`. Never replaces a file.
+pub fn create(dir: &Path, name: &str, bytes: &[u8]) {
+    let path = dir.join(name);
+    let mut tmp = tempfile::NamedTempFile::new_in(dir).unwrap_or_else(|e| panic!("{dir:?}: {e}"));
     tmp.write_all(bytes).unwrap();
     match tmp.persist_noclobber(&path) {
-        Ok(_) => return,
-        Err(e) if e.error.kind() == ErrorKind::AlreadyExists => {}
+        Ok(_) => {}
+        Err(e) if e.error.kind() == ErrorKind::AlreadyExists => {
+            let found = std::fs::read(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+            check(&path, &found, bytes);
+        }
         Err(e) => panic!("{path:?}: {}", e.error),
     }
-    let found = std::fs::read(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+}
+
+fn check(path: &Path, found: &[u8], bytes: &[u8]) {
     assert!(
         found == bytes,
         "{path:?} holds other bytes than this build writes there"
