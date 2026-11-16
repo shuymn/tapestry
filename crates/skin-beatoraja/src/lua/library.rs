@@ -257,3 +257,109 @@ pub(super) fn install(lua: &Lua, pass: &Arc<Pass>, env: &Table, base: &Table) ->
     lua.set_named_registry_value(STRING_BRIDGE, lib.raw_get::<Function>("string_bridge")?)?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use mlua::chunk::ChunkMode;
+    use mlua::{Function, Lua, MultiValue, Table};
+
+    use super::{LIBRARY, MAX_PATH_BYTES, MAX_PRIMITIVE_BYTES};
+
+    #[test]
+    fn a_number_s_text_is_charged_before_it_is_made() -> mlua::Result<()> {
+        // The library over the VM's own natives, its charge counting and
+        // the two natives that make a number's text (`format` for `%.14g`,
+        // `tostring` for an integer's digits) recording the work charged
+        // when they run: each conversion must find its 24 bytes charged.
+        let lua = Lua::new();
+        let charged = Arc::new(AtomicI64::new(0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let globals = lua.globals();
+        let string: Table = globals.get("string")?;
+        let math: Table = globals.get("math")?;
+        let native = lua.create_table()?;
+        for name in ["byte", "sub", "char", "upper", "lower"] {
+            native.raw_set(name, string.raw_get::<Function>(name)?)?;
+        }
+        native.raw_set(
+            "concat",
+            globals
+                .get::<Table>("table")?
+                .raw_get::<Function>("concat")?,
+        )?;
+        for name in [
+            "tonumber",
+            "setmetatable",
+            "getmetatable",
+            "select",
+            "error",
+            "next",
+            "rawget",
+            "rawset",
+            "rawlen",
+            "type",
+        ] {
+            native.raw_set(name, globals.raw_get::<Function>(name)?)?;
+        }
+        for name in ["floor", "ceil", "abs", "tointeger"] {
+            native.raw_set(name, math.raw_get::<Function>(name)?)?;
+        }
+        native.raw_set("mathtype", math.raw_get::<Function>("type")?)?;
+        for (name, real) in [
+            ("format", string.raw_get::<Function>("format")?),
+            ("tostring", globals.raw_get::<Function>("tostring")?),
+        ] {
+            let (charged, seen) = (Arc::clone(&charged), Arc::clone(&seen));
+            native.raw_set(
+                name,
+                lua.create_function(move |_, args: MultiValue| {
+                    if let Ok(mut s) = seen.lock() {
+                        s.push((name, charged.load(Ordering::SeqCst)));
+                    }
+                    real.call::<MultiValue>(args)
+                })?,
+            )?;
+        }
+        let c = Arc::clone(&charged);
+        let charge = lua.create_function(move |_, n: i64| {
+            c.fetch_add(n, Ordering::SeqCst);
+            Ok(true)
+        })?;
+        let refuse = lua.create_function(|_, _: i64| Ok(false))?;
+        let bridge = lua.create_table()?;
+        bridge.raw_set("metatable", lua.create_function(|_, ()| Ok(true))?)?;
+        let (string_lib, ..): (Table, Table, Table, Table) = lua
+            .load(LIBRARY)
+            .set_name("=library")
+            .set_mode(ChunkMode::Text)
+            .set_environment(lua.create_table()?)
+            .call((
+                native,
+                charge,
+                refuse,
+                bridge,
+                MAX_PRIMITIVE_BYTES,
+                MAX_PATH_BYTES,
+                super::super::sandbox::FAULT,
+            ))?;
+        let len: Function = string_lib.get("len")?;
+        // A float by `%.14g`, an integer and a whole float by their digits.
+        for (v, native, text) in [
+            (mlua::Value::Number(0.5), "format", 3),
+            (mlua::Value::Integer(-102), "tostring", 4),
+            (mlua::Value::Number(50.0), "tostring", 2),
+        ] {
+            charged.store(0, Ordering::SeqCst);
+            if let Ok(mut s) = seen.lock() {
+                s.clear();
+            }
+            assert_eq!(len.call::<i64>(v)?, text);
+            let s = seen.lock().map(|s| s.clone()).unwrap_or_default();
+            assert_eq!(s, [(native, 24)], "{native}");
+        }
+        Ok(())
+    }
+}

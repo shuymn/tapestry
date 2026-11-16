@@ -2653,7 +2653,8 @@ fn a_number_passed_for_a_string_is_read_as_its_text() {
 
 #[test]
 fn number_text_follows_one_rule() {
-    // Every row of the shared table, through a string function.
+    // Every row of the shared table, through two string functions: the
+    // text `string.sub` returns, and the length `string.len` measures.
     for row in include_str!("number_text.txt")
         .lines()
         .filter(|l| !l.starts_with('#'))
@@ -2661,8 +2662,16 @@ fn number_text_follows_one_rule() {
         let [lua, _, want] = row.split('\t').collect::<Vec<_>>()[..] else {
             panic!("{row}");
         };
-        let expr = format!("string.sub({lua}, 1, -1)");
-        assert_eq!(read_shown(&expr), want, "{lua}");
+        assert_eq!(
+            read_shown(&format!("string.sub({lua}, 1, -1)")),
+            want,
+            "{lua}"
+        );
+        assert_eq!(
+            read_shown(&format!("string.len({lua})")),
+            format!("number:{}", want.len()),
+            "{lua}"
+        );
     }
 }
 
