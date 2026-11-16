@@ -95,6 +95,7 @@ pub fn baseline() -> Vec<Crate> {
             "src/main.rs",
         ),
         lib("xtask", ""),
+        lib("test-device", ""),
     ]
 }
 

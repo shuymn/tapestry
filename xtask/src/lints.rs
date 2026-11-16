@@ -83,6 +83,7 @@ pub const CRATE_ROOT_LINES: &[(&str, &[&str])] = &[
     ("crates/bms-parser/src/lib.rs", &[CAST_LINE]),
     ("crates/skin-model/src/lib.rs", &[CAST_LINE]),
     ("crates/skin-beatoraja/src/lib.rs", &[CAST_LINE]),
+    ("crates/test-device/src/lib.rs", &[CAST_LINE]),
 ];
 
 /// The attribute of an in-play module file, before its first item.

@@ -30,6 +30,7 @@ const REQUIRED_PORTABLE: &[&str] = &[
     "skin-beatoraja",
     "eval-cli",
     "xtask",
+    "test-device",
 ];
 
 pub fn run(manifest: &Path, args: &[OsString]) -> ExitCode {
