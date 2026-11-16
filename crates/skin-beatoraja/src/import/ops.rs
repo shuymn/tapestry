@@ -336,6 +336,24 @@ const COURSE_STAGES: [i32; 5] = [280, 281, 282, 283, 289];
 /// configuration's constant mode, false, as tapestry has none.
 const CONSTANT: i32 = 400;
 
+/// `bgaoff` and `bgaon` (`BooleanPropertyFactory.java:392-393`): the BGA
+/// setting, answered as off on every screen, as selection's image index
+/// 72 reads `BGA_OFF`, since tapestry plays no BGA yet (D33, until S15).
+/// Static outside selection (`:219`), so on play a part under 41 is
+/// removed at installation.
+pub(crate) const BGA_OFF: i32 = 40;
+pub(crate) const BGA_ON: i32 = 41;
+
+/// The BGA setting's answer to built-in `id` (positive): 40 holds and 41
+/// does not (D33); `None` for any other id.
+pub(crate) fn bga_setting(id: i32) -> Option<bool> {
+    match id {
+        BGA_OFF => Some(true),
+        BGA_ON => Some(false),
+        _ => None,
+    }
+}
+
 /// Whether play's built-in `id` (positive) is a constant false: a feature
 /// tapestry does not have, shown in its empty state (stage3.md §1).
 pub(crate) fn play_constant_false(id: i32) -> bool {
@@ -508,6 +526,9 @@ pub(crate) fn is_builtin(id: i32) -> bool {
 fn built_in_cond(id: i32, negative: bool) -> Cond {
     if play_constant_false(id) {
         return Cond::Fold(negative);
+    }
+    if let Some(on) = bga_setting(id) {
+        return Cond::Fold(on != negative);
     }
     match builtin(id) {
         Some((body, display_deviation)) => {
@@ -1011,11 +1032,16 @@ mod tests {
         assert_eq!(numeric(-900, &items), Cond::Fold(false));
         assert_eq!(numeric(901, &items), Cond::Undefined(901));
         assert_eq!(numeric(300, &items), Cond::Unsupported(300));
-        // The BGA built-ins win over items declared with their numbers.
-        let items = BTreeMap::from([(40, true), (41, true)]);
-        assert_eq!(numeric(40, &items), Cond::Unsupported(40));
-        assert_eq!(numeric(-41, &items), Cond::Unsupported(-41));
-        assert_eq!(named("!bgaon"), Some(Cond::Unsupported(-41)));
+        // The BGA setting, answered as off (D33), wins over items declared
+        // with its numbers and the opposite values.
+        let items = BTreeMap::from([(40, false), (41, true)]);
+        assert_eq!(numeric(40, &items), Cond::Fold(true));
+        assert_eq!(numeric(-40, &items), Cond::Fold(false));
+        assert_eq!(numeric(41, &items), Cond::Fold(false));
+        assert_eq!(numeric(-41, &items), Cond::Fold(true));
+        assert_eq!(named("!bgaon"), Some(Cond::Fold(true)));
+        assert_eq!(named("bgaoff"), Some(Cond::Fold(true)));
+        assert_eq!(named("!!bgaon"), Some(Cond::Fold(false)));
     }
 
     /// `table_song` is a scene constant, false, by number and by name, and

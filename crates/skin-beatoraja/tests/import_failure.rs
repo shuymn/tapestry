@@ -639,7 +639,7 @@ fn configured_options_fold_before_the_role() {
         refused_as_failure(r, &at("i"), unsupported_field("mouseRect"));
     }
     // A built-in condition is not folded.
-    let r = images("", &[&fail("i", &with_op("41"))]);
+    let r = images("", &[&fail("i", &with_op("192"))]);
     refused_as_failure(r, &at("i"), unsupported_field("mouseRect"));
     // `draw` never folds an option item: it has no effect there.
     let r = images("", &[&fail("i", &format!(r#""draw": 901, {MOUSE}"#))]);

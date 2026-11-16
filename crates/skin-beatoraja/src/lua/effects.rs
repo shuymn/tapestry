@@ -11,7 +11,13 @@
 //! against the subset by every kind a value may have:
 //!
 //! - statements: `local` without attributes, assignment to a local of the
-//!   same function, `return`, call statements, `if`, `while`, `repeat`, a
+//!   same function (its kind the join of its initializer's and of every
+//!   value the function gives it, found by kind-only passes until a whole
+//!   pass changes none, before the pass that checks: each assignment joins
+//!   its value's kind, read under the kinds found so far, this pass's
+//!   included; the kind-only passes record no effect, and a closure they
+//!   call is walked for its results alone; a local another function
+//!   assigns is unknown), `return`, call statements, `if`, `while`, `repeat`, a
 //!   numeric `for` over numbers, a generic `for` over `pairs(t)`,
 //!   `ipairs(t)` or `next, t` with `t` a table without a metatable, `do`,
 //!   `break`, `goto` and labels;
@@ -174,11 +180,19 @@ impl Tuple {
     }
 }
 
-/// A prototype's walk.
-#[derive(Clone, Debug)]
-enum State {
-    InProgress,
-    Done(Tuple),
+/// What the walk has of a prototype. Its results are fixed by its first
+/// walk, kind-only or diagnosing, so a caller's kind passes and its
+/// diagnosing pass get the same; its effects (open places, writes, call
+/// edges) only by its diagnosing walk.
+#[derive(Debug, Default)]
+struct State {
+    /// Its results, once a walk of its body has found them.
+    results: Option<Tuple>,
+    /// Whether a walk of its body is running: a call meanwhile is a
+    /// recursion, of unknown results.
+    busy: bool,
+    /// Whether its diagnosing walk has run or is running.
+    diagnosed: bool,
 }
 
 /// The kind of captured value `c`, a table with a metatable `None`.
@@ -307,10 +321,27 @@ struct Body<'a> {
     proto: u32,
     /// The kinds of its locals declared so far.
     locals: HashMap<u32, K>,
-    /// Its locals assigned after their declaration.
+    /// Its locals assigned after their declaration in the function itself,
+    /// and in no other function.
     reassigned: HashSet<u32>,
+    /// The kind of each of them: the join of its initializer and every
+    /// value an assignment gives it, as far as the kind passes have found.
+    kinds: HashMap<u32, K>,
+    /// Whether a kind changed in this pass.
+    changed: bool,
+    /// Whether this is a kind-only pass, which records no open place, no
+    /// write and no call edge, and walks a closure it calls kind-only.
+    quiet: bool,
     /// The join of its `return` lists.
     ret: Option<Tuple>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The most kind-only passes one body of this thread took, and whether
+    /// any body reached its bound.
+    pub(crate) static PASSES: std::cell::Cell<(usize, bool)> =
+        const { std::cell::Cell::new((0, false)) };
 }
 
 /// The walk over every root of an analysis.
@@ -352,12 +383,17 @@ impl<'a> Walk<'a> {
     /// Opens at expression or statement line `line` of `b`: the construct
     /// `why` is outside the subset; its value is unknown.
     fn outside(&self, b: &Body<'_>, line: u32, why: Unsupported) -> K {
-        self.open(Site::Code { file: b.file, line }, why);
+        if !b.quiet {
+            self.open(Site::Code { file: b.file, line }, why);
+        }
         K::UNKNOWN
     }
 
     /// [`Self::outside`] for a write: `b`'s prototype writes.
     fn write(&mut self, b: &Body<'_>, line: u32, why: Unsupported) {
+        if b.quiet {
+            return;
+        }
         if let Some(w) = self.writes.get_mut(b.proto as usize) {
             *w = true;
         }
@@ -368,6 +404,9 @@ impl<'a> Walk<'a> {
     /// numeral `int` when it is one: `b`'s prototype writes, and the cell
     /// is recorded with what it gets, the candidate left as it is.
     fn write_cell(&mut self, b: &Body<'_>, d: u32, line: u32, int: Option<i64>) {
+        if b.quiet {
+            return;
+        }
         if let Some(w) = self.writes.get_mut(b.proto as usize) {
             *w = true;
         }
@@ -447,7 +486,7 @@ impl<'a> Walk<'a> {
                 continue;
             }
             self.depth = 0;
-            self.instance(callable.instance)
+            self.instance(callable.instance, false)
                 .map_err(|f| (Some(id), f))?;
             roots.push(callable.instance);
         }
@@ -509,9 +548,15 @@ impl<'a> Walk<'a> {
         Ok(())
     }
 
-    /// Instance `i` walked, once a prototype: its results, unknown while
-    /// it is being walked (a recursion), and its prototype.
-    fn instance(&mut self, i: u32) -> R<(Tuple, Option<u32>)> {
+    /// Instance `i`'s results, unknown while a walk of its body runs (a
+    /// recursion), and its prototype.
+    ///
+    /// Called from a kind-only pass (`quiet`), it walks the body kind-only
+    /// when no walk has found its results yet, and records nothing.
+    /// Otherwise it runs the diagnosing walk once a prototype, which
+    /// records its effects, and still gives the results the first walk
+    /// fixed.
+    fn instance(&mut self, i: u32, quiet: bool) -> R<(Tuple, Option<u32>)> {
         let untagged = Found {
             why: Unsupported::Capture("an untagged closure"),
             file: 0,
@@ -531,35 +576,65 @@ impl<'a> Walk<'a> {
                 let next = u32::try_from(self.states.len()).unwrap_or(u32::MAX);
                 let p = *self.protos.entry(key).or_insert(next);
                 if p == next {
-                    self.states.push(State::InProgress);
+                    self.states.push(State::default());
                     self.writes.push(false);
-                    self.proto_of.insert(i, p);
-                    let r = self.body(i, p)?;
-                    // Its results kept, one unit each.
-                    let n = u64::try_from(r.fixed.len()).unwrap_or(u64::MAX);
-                    self.an.charge(n).map_err(|why| Found { why, ..untagged })?;
-                    if let Some(s) = self.states.get_mut(p as usize) {
-                        *s = State::Done(r.clone());
-                    }
-                    return Ok((r, Some(p)));
                 }
                 self.proto_of.insert(i, p);
                 p
             }
         };
-        match self.states.get(p as usize) {
-            Some(State::Done(t)) => {
-                // Its results copied, one unit each.
-                let n = u64::try_from(t.fixed.len()).unwrap_or(u64::MAX);
-                self.an.charge(n).map_err(|why| Found { why, ..untagged })?;
-                Ok((t.clone(), Some(p)))
-            }
-            _ => Ok((Tuple::unknown(), Some(p))),
+        let Some(s) = self.states.get_mut(p as usize) else {
+            return Ok((Tuple::unknown(), Some(p)));
+        };
+        let walk = if quiet {
+            s.results.is_none() && !s.busy
+        } else {
+            !s.diagnosed
+        };
+        if walk {
+            s.busy = true;
+            s.diagnosed |= !quiet;
+            let r = self.body(i, p, quiet)?;
+            let Some(s) = self.states.get_mut(p as usize) else {
+                self.charge_results(r.fixed.len())
+                    .map_err(|why| Found { why, ..untagged })?;
+                return Ok((r, Some(p)));
+            };
+            s.busy = false;
+            s.results.get_or_insert(r);
         }
+        // Its kept results, one unit each, charged before they are copied.
+        let n = match self.states.get(p as usize).and_then(|s| s.results.as_ref()) {
+            Some(t) => t.fixed.len(),
+            None => return Ok((Tuple::unknown(), Some(p))),
+        };
+        self.charge_results(n)
+            .map_err(|why| Found { why, ..untagged })?;
+        super::residual::did("walk results");
+        let t = self
+            .states
+            .get(p as usize)
+            .and_then(|s| s.results.clone())
+            .unwrap_or_else(Tuple::unknown);
+        Ok((t, Some(p)))
     }
 
-    /// The results of instance `i`'s body, prototype `p`.
-    fn body(&mut self, i: u32, p: u32) -> R<Tuple> {
+    /// `n` results' units charged before they are copied. For a test, the
+    /// charge can be made to meet an exhausted allowance
+    /// ([`super::tests::fail_next`], site `walk results`), so the real
+    /// check refuses it.
+    fn charge_results(&self, n: usize) -> Result<(), Unsupported> {
+        let n = u64::try_from(n).unwrap_or(u64::MAX);
+        #[cfg(test)]
+        if n > 0 && super::tests::fail_at("walk results") {
+            self.an.work.set(super::limits::MAX_ANALYSIS_WORK);
+        }
+        self.an.charge(n)
+    }
+
+    /// The results of instance `i`'s body, prototype `p`: its kind passes,
+    /// then its diagnosing pass, or one more kind-only pass when `quiet`.
+    fn body(&mut self, i: u32, p: u32, quiet: bool) -> R<Tuple> {
         let an = self.an;
         let Some(inst) = an.instance(i).copied() else {
             return Ok(Tuple::unknown());
@@ -578,16 +653,63 @@ impl<'a> Walk<'a> {
             proto: p,
             locals: HashMap::new(),
             reassigned: HashSet::new(),
+            kinds: HashMap::new(),
+            changed: false,
+            quiet,
             ret: None,
         };
         if inst.values.is_none() && f.upvalues.1 > 0 {
             self.outside(&b, f.line, Unsupported::Capture("no reader"));
         }
         self.charge_at(&b, f.line, u64::from(f.params.1))?;
-        for &d in ast.list(f.params) {
+        self.reassigned(&mut b, f.body)?;
+        let params = ast.list(f.params);
+        for &d in params {
+            if b.reassigned.contains(&d) {
+                b.kinds.insert(d, K::UNKNOWN);
+            }
+        }
+        // Kind-only passes until no assigned local's kind changes: a kind
+        // only grows and a refinement is only lost, so each local changes
+        // at most 8 times (7 bits and one refinement). Each pass is charged
+        // as any walk of the body; past the bound every assigned local is
+        // unknown.
+        if !b.reassigned.is_empty() {
+            let bound = b.reassigned.len().saturating_mul(8).saturating_add(1);
+            b.quiet = true;
+            let mut passes = 0_usize;
+            loop {
+                passes += 1;
+                b.changed = false;
+                b.locals.clear();
+                b.ret = None;
+                for &d in params {
+                    b.locals.insert(d, K::UNKNOWN);
+                }
+                self.block(&mut b, f.body)?;
+                #[cfg(test)]
+                PASSES.with(|c| c.set((c.get().0.max(passes), c.get().1)));
+                if !b.changed {
+                    break;
+                }
+                if passes >= bound {
+                    for &d in &b.reassigned {
+                        b.kinds.insert(d, K::UNKNOWN);
+                    }
+                    #[cfg(test)]
+                    PASSES.with(|c| c.set((c.get().0, true)));
+                    break;
+                }
+            }
+            b.quiet = quiet;
+            b.locals.clear();
+            b.ret = None;
+        }
+        // The diagnosing pass, over the converged kinds, or the results'
+        // kind-only pass.
+        for &d in params {
             b.locals.insert(d, K::UNKNOWN);
         }
-        self.reassigned(&mut b, f.body)?;
         self.block(&mut b, f.body)?;
         let ret = b.ret.take().unwrap_or_default();
         let always = returns(an, ast, f.body).map_err(|w| self.fatal(&b, f.line, w))?;
@@ -619,13 +741,13 @@ impl<'a> Walk<'a> {
                 self.charge_at(b, line, u64::from(targets.1))?;
                 for &t in ast.list(targets) {
                     if let Expr::Local(d) = ast.expr(t) {
-                        b.reassigned.insert(d);
+                        Self::reassigned_local(b, d);
                     }
                 }
             }
             Stmt::Function { target, .. } => {
                 if let Expr::Local(d) = ast.expr(target) {
-                    b.reassigned.insert(d);
+                    Self::reassigned_local(b, d);
                 }
             }
             Stmt::If(arms) => {
@@ -645,6 +767,14 @@ impl<'a> Walk<'a> {
         Ok(())
     }
 
+    /// Records `d` as assigned again by `b`'s function, unless another
+    /// function assigns it too, which leaves it unknown.
+    fn reassigned_local(b: &mut Body<'_>, d: u32) {
+        if !b.ast.decl(d).is_some_and(|x| x.assigned_inner) {
+            b.reassigned.insert(d);
+        }
+    }
+
     fn block(&mut self, b: &mut Body<'_>, l: List) -> R<()> {
         let ast = b.ast;
         for &s in ast.list(l) {
@@ -659,14 +789,29 @@ impl<'a> Walk<'a> {
         d != CHUNK_ENV && b.ast.decl(d).is_some_and(|x| x.func == b.func)
     }
 
-    /// Declares local `d` with kind `k`: unknown when it is assigned again.
+    /// Declares local `d` with kind `k`: unknown when another function
+    /// assigns it, and when this one does, the join of `k` and every value
+    /// it is given.
     fn declare(b: &mut Body<'_>, d: u32, k: K) {
-        let k = if b.reassigned.contains(&d) {
+        let k = if b.ast.decl(d).is_some_and(|x| x.assigned_inner) {
             K::UNKNOWN
+        } else if b.reassigned.contains(&d) {
+            Self::assign(b, d, k)
         } else {
             k
         };
         b.locals.insert(d, k);
+    }
+
+    /// Joins `k` into the kind of `d`, a local `b`'s function assigns:
+    /// the joined kind, which `d` then reads.
+    fn assign(b: &mut Body<'_>, d: u32, k: K) -> K {
+        let joined = b.kinds.get(&d).map_or(k, |&p| p.join(k));
+        if b.kinds.get(&d) != Some(&joined) {
+            b.kinds.insert(d, joined);
+            b.changed = true;
+        }
+        joined
     }
 
     fn stmt(&mut self, b: &mut Body<'_>, s: u32, line: u32) -> R<()> {
@@ -702,6 +847,7 @@ impl<'a> Walk<'a> {
                 // Each target one unit.
                 self.charge_at(b, line, u64::from(targets.1))?;
                 let values = ast.list(exprs);
+                let mut own = Vec::new();
                 for (k, &t) in ast.list(targets).iter().enumerate() {
                     // The value an upvalue gets: an integer numeral, when
                     // it is one and the list does not expand past it.
@@ -710,7 +856,7 @@ impl<'a> Walk<'a> {
                         _ => None,
                     };
                     match ast.expr(t) {
-                        Expr::Local(d) if Self::own(b, d) => {}
+                        Expr::Local(d) if Self::own(b, d) => own.push((k, d)),
                         Expr::Index { obj, key } => {
                             self.one(b, obj)?;
                             self.one(b, key)?;
@@ -721,7 +867,14 @@ impl<'a> Walk<'a> {
                         _ => self.write(b, line, Unsupported::Construct("assignment")),
                     }
                 }
-                self.list(b, exprs)?;
+                let given = self.list(b, exprs)?;
+                // Each local of this function takes its value's kind, joined.
+                for (k, d) in own {
+                    if b.reassigned.contains(&d) {
+                        let k = Self::assign(b, d, given.at(k));
+                        b.locals.insert(d, k);
+                    }
+                }
             }
             Stmt::Call(e) => {
                 self.multi(b, e)?;
@@ -781,7 +934,11 @@ impl<'a> Walk<'a> {
             }
             Stmt::Function { target, .. } => match ast.expr(target) {
                 Expr::Local(d) if Self::own(b, d) => {
-                    self.outside(b, line, Unsupported::Construct("function"));
+                    let k = self.outside(b, line, Unsupported::Construct("function"));
+                    if b.reassigned.contains(&d) {
+                        let k = Self::assign(b, d, k);
+                        b.locals.insert(d, k);
+                    }
                 }
                 _ => self.write(b, line, Unsupported::Construct("function")),
             },
@@ -1029,11 +1186,13 @@ impl<'a> Walk<'a> {
                 let r = if self.depth > MAX_AST_DEPTH {
                     Err(self.fatal(b, line, TOO_DEEP))
                 } else {
-                    self.instance(j)
+                    self.instance(j, b.quiet)
                 };
                 self.depth -= 1;
                 let (t, p) = r?;
-                if let Some(p) = p {
+                if let Some(p) = p
+                    && !b.quiet
+                {
                     self.edges.push((b.proto, p));
                 }
                 Ok(t)
