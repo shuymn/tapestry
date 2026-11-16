@@ -85,16 +85,17 @@
 //!   long notes (`#LNTYPE 1`, consecutive objects pair up); D1-D9 mines,
 //!   with the object id as damage. Channel 17 and other unused channels are
 //!   ignored with a warning; BGA channels 04, 06 and 07 and invisible notes
-//!   (31-39) silently. A 2P lane object (21-29, 61-69, E1-E9) is an
-//!   `Unsupported` error.
+//!   (31-39) silently, the BGA channels read for presentation alone
+//!   ("Presentation reads" below). A 2P lane object (21-29, 61-69, E1-E9)
+//!   is an `Unsupported` error.
 //! - **Headers:** headers for what stage 1 does not show or use (`#BASEBPM`,
 //!   `#CHARFILE`, `#EXTCHR`, `#MAKER`, `#BMPxx`, `#BGAxx`,
 //!   `#TEXTxx`, `#EXRANKxx` and descriptive ones) are ignored silently; any
 //!   other unknown header is a warning. Of these, `#DIFFICULTY` (the last
 //!   one that reads as an integer, [`header_integer`]) and whether a
 //!   `#BMPxx` names a file are kept as labels ([`Labels`]), which the chart
-//!   does not hold, so this version does not cover how they are read
-//!   (design.md "Chart Loading").
+//!   does not hold, and `#BMPxx` is read into the BGA structure, so this
+//!   version does not cover how they are read (design.md "Chart Loading").
 //! - **`#LNOBJ`:** a channel 1x object with that id ends a long note started
 //!   by the previous plain note in its lane, if that note sits at an
 //!   earlier position. The end plays no sound. An empty `#LNOBJ` is
@@ -149,6 +150,39 @@
 //!   its own tag and with the speed's k; the resolved hash at 1×. Two
 //!   files can resolve alike at 1× and floor apart at a speed, so a record
 //!   pins the real timeline it was played on with it.
+//!
+//! # Presentation reads
+//!
+//! These reads only present the chart, so [`LOADER_VERSION`] does not cover
+//! them (design.md "Chart Loading"): the play chart's objects, timeline,
+//! length and hashes are those of the chart without them, and their
+//! channels and headers warn as the rules above say. What the library
+//! stores from one is versioned by its own schema.
+//!
+//! - **Labels:** [`Labels`], from the headers above.
+//! - **Previews:** the objects a song list's preview times
+//!   ([`ChartProfile::preview`], [`read_scanned`]).
+//! - **BGA:** [`load_bms`] reads the chart's BGA structure into
+//!   [`Chart::bga`](bms_model::Chart::bga) (design.md "What the Loader
+//!   Reads"). A `#BMPxx` defines its id when it names a file, read as every
+//!   numbered header is (the [`Labels::bga`] rule: `BMP` and exactly two
+//!   base-36 characters as the name, any case, the value trimmed); the last
+//!   definition of an id, in the branches taken, wins for all its events.
+//!   A channel 04 (base) or 07 (layer) object is an event at its position,
+//!   naming its definition or, for an id no `#BMPxx` defines, clearing its
+//!   layer; at one position the later object in the file wins. A channel
+//!   06 line is one poor sequence at its measure's start: its pairs, an
+//!   invalid pair read as `00`, are one frame of the line's one id other
+//!   than `00` when it holds one, every pair a frame in order when it holds
+//!   several (a `00` frame shows nothing), and nothing when it holds none;
+//!   a later 06 line of the same measure replaces it. A frame naming an id
+//!   no `#BMPxx` defines shows nothing. The events and sequences are timed
+//!   as the play chart's objects are, over the chart's objects and theirs
+//!   together on a timeline of their own, at the load's speed and floored
+//!   once; a chart with no definition and no event, or one whose BGA
+//!   timing breaks a limit (the duration among them), has no BGA, and
+//!   still loads. Their objects count toward [`Limits::max_objects`] as
+//!   every channel's do.
 
 #![forbid(unsafe_code)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
