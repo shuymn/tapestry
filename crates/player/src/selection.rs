@@ -9703,6 +9703,36 @@ pub(crate) mod tests {
         );
     }
 
+    /// Each command waits for the gate on a deadline of its own: a view
+    /// command held before back does not spend back's wait. Next waits
+    /// 100 ms of a 300 ms bound; back comes 350 ms after next first found
+    /// the gate closed, and is sent.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn each_command_waits_for_the_gate_on_its_own_deadline() {
+        use crate::dev::SelectStep;
+        let (mut script, menu) = result_steps(vec![SelectStep::Next, SelectStep::Back]);
+        script.set_hold_bound(Duration::from_millis(300));
+        crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            let controls = rig.controls;
+            let mut run = |at| super::script_result(&mut script, controls, &menu, None, at);
+            run(before_input());
+            std::thread::sleep(Duration::from_millis(100));
+            run(after_input());
+            assert_eq!(menu.pop(), Some(MenuInput::Key(MenuKey::Right)));
+            std::thread::sleep(Duration::from_millis(250));
+            // Next's view published and drawn: back is due, the gate open.
+            run(super::ResultAt {
+                page: 4,
+                view: Some(8),
+                views: 8,
+                ..after_input()
+            });
+            assert_eq!(controls.take(), Some(game::Command::Quit));
+        });
+        assert_eq!(script.failure(), None);
+    }
+
     /// The wait for the gate has one deadline, from when the command first
     /// found it closed: a gate that opens only after it does not release
     /// the command, which fails instead; one that opens before it does.
@@ -9760,28 +9790,37 @@ pub(crate) mod tests {
     #[cfg(feature = "dev-tools")]
     #[test]
     fn a_leaving_command_not_accepted_fails_its_step() {
-        for (leaving, failed) in [
-            (
-                false,
-                Some(
-                    "step 1 (capture): the result did not accept the command within the render \
-                     bound: sent 0 ms before, the bound 0 ms; no input time in force",
-                ),
-            ),
-            (true, None),
-        ] {
+        for leaving in [false, true] {
             let (mut script, menu) = result_steps(vec![crate::dev::SelectStep::Back]);
             script.set_hold_bound(Duration::ZERO);
             crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
                 let controls = rig.controls;
                 let mut run = |at| super::script_result(&mut script, controls, &menu, None, at);
-                run(result_at(3, 7, true, false));
+                run(after_input());
                 assert_eq!(controls.take(), Some(game::Command::Quit));
                 assert!(!controls.quitting());
-                run(result_leaving(3, 7, true, false, 7, leaving));
-                assert_eq!(controls.quitting(), failed.is_some(), "leaving {leaving}");
+                run(super::ResultAt {
+                    leaving,
+                    ..after_input()
+                });
+                assert_eq!(controls.quitting(), !leaving, "leaving {leaving}");
             });
-            assert_eq!(script.failure(), failed, "leaving {leaving}");
+            let failure = script.failure().map(str::to_owned);
+            if leaving {
+                assert_eq!(failure, None);
+            } else {
+                // Named: how long ago it was sent, the bound, and the gate.
+                assert!(
+                    failure.as_deref().is_some_and(|f| f.starts_with(
+                        "step 1 (capture): the result did not accept the command within the \
+                         render bound: sent "
+                    ) && f.ends_with(
+                        " ms before, the bound 0 ms; its input time 1000 ms from its start at \
+                         5000 ms, now 1100 ms after the start"
+                    )),
+                    "{failure:?}"
+                );
+            }
         }
     }
 
