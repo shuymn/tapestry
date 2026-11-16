@@ -179,7 +179,7 @@ specifiers = ["1"]
 [tools.rust.options]
 components = "clippy,rustfmt"
 profile = "minimal"
-targets = "wasm32-unknown-unknown"
+targets = "thumbv8m.main-none-eabihf,wasm32-unknown-unknown"
 
 [[tools.shellcheck]]
 version = "0.11.0"

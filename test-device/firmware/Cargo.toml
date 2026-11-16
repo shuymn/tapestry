@@ -1,0 +1,61 @@
+# The test input device's firmware (docs/test-device.md), for the Pico 2's
+# RP2350. Its own workspace and lockfile, built for the RP2350 only, outside
+# the player's workspace (as `fuzz/` is); `cargo xtask test-device build`
+# builds it and writes the UF2.
+[package]
+name = "test-device-firmware"
+version = "0.0.0"
+description = "Firmware of the test input device: a composite USB keyboard, game pad and control link whose input is synthesized from scenarios."
+edition = "2024"
+# It links no GPL crate and is never shipped (design.md "Licenses").
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/shuymn/tapestry"
+publish = false
+
+[workspace]
+
+[[bin]]
+name = "test-device-firmware"
+test = false
+bench = false
+
+# The workspace's clippy level, and the cast lints its permissive crates
+# deny (xtask/src/lints.rs).
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+undocumented_unsafe_blocks = "deny"
+
+[features]
+# The debug faults the negative rows use (docs/test-device.md "Debug
+# faults"); never in the build the device normally runs.
+debug-faults = ["test-device/debug-faults"]
+
+[dependencies]
+test-device = { path = "../../crates/test-device", default-features = false }
+embassy-executor = { version = "0.9.1", features = ["arch-cortex-m", "executor-thread"] }
+embassy-rp = { version = "0.10.0", features = ["rp235xa", "time-driver", "critical-section-impl", "unstable-pac"] }
+embassy-time = "0.5.1"
+embassy-usb = "0.6.0"
+embassy-futures = "0.1.2"
+embassy-sync = "0.8.0"
+cortex-m = { version = "0.7.10", features = ["inline-asm"] }
+cortex-m-rt = "0.7.7"
+static_cell = "2.1.1"
+heapless = "0.9.3"
+
+[profile.release]
+debug = 2
+lto = true
+opt-level = "s"
+codegen-units = 1
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
+
+[package.metadata.cargo-machete]
+# Linked for its startup code and `link.x`; the source never names it.
+ignored = ["cortex-m-rt"]
