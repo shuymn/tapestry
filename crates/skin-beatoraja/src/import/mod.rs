@@ -1480,7 +1480,7 @@ impl<'d> Cx<'d> {
         // never draws, whatever they are, as the source's never starts
         // (`TimerUtility.java:89-108`).
         let observer = match dst.timer {
-            Prop::Callable(id) => self.observer_timer(role, id)?,
+            Prop::Callable(id) => self.observer_timer(role, dst.span, id)?,
             _ => None,
         };
         if let Some((false, _)) = observer {

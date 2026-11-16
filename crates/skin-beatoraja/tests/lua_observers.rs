@@ -10,7 +10,9 @@ mod common;
 
 use common::play::{Drawn, Loader};
 use skin_beatoraja::lua::{Disposition, HOST_APIS, Unsupported};
-use skin_beatoraja::{Cancel, Config, ImportError, LuaImported, LuaWhy, read_lua_header};
+use skin_beatoraja::{
+    Cancel, Config, DeviationId, ImportError, LuaImported, LuaWhy, NoteKind, read_lua_header,
+};
 use skin_model::timer;
 use tempfile::TempDir;
 
@@ -400,6 +402,52 @@ fn an_observer_at_a_destination_the_import_drops_is_no_refusal() {
         moving(100, "")
     );
     import_body(&body).unwrap();
+}
+
+/// A predicate that reads the BGA setting and discards it folds to its
+/// constant and notes D33 at its destination record once, as a lowered
+/// callback does (docs/stage3.md D33): an id the option scan resolves
+/// (40) and one only the evaluation folds (`39 + 1`). The setting is a
+/// static condition of the lowering, no constant of the capture proof, so
+/// a predicate whose value it is does not fold.
+#[test]
+fn a_predicate_reading_the_bga_setting_notes_d33() {
+    let mut body = String::new();
+    for (x, predicate) in [
+        (0, "local _ = ms.option(40) return true"),
+        (100, "local _ = ms.option(39 + 1) return true"),
+    ] {
+        body.push_str(&format!(
+            "local o{x} = tu.timer_observe_boolean(function() {predicate} end)\n{}\n",
+            moving(x, &format!("timer = o{x},"))
+        ));
+    }
+    let i = import_body(&body).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Lowered, Disposition::Lowered]);
+    let d33: Vec<u32> = i
+        .imported
+        .report
+        .notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::Deviation(DeviationId::D33))
+        .map(|n| n.at.expect("located").line)
+        .collect();
+    // Each at its observer's call.
+    assert_eq!(d33, [HEAD + 1, HEAD + 4]);
+    let (_d, skin) = drawable(&body);
+    let rects = at_ready(Drawn::new(skin, 4));
+    assert!(
+        y_at(&rects, 0).is_some() && y_at(&rects, 100).is_some(),
+        "{rects:?}"
+    );
+    let body = format!(
+        "local on = tu.timer_observe_boolean(function() return ms.option(40) end)\n{}",
+        moving(0, "timer = on,")
+    );
+    assert_eq!(
+        observer_refused(import_body(&body)),
+        (Unsupported::Observer("predicate is not constant"), HEAD + 1)
+    );
 }
 
 /// An observer held where the source never reads a callback is inert

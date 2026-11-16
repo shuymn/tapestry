@@ -1477,13 +1477,16 @@ impl Cx<'_> {
         }
     }
 
-    /// The observer at node `id`, read as a destination's `timer`, for an
-    /// element of `role`: `None` for no observer; what its predicate folds
-    /// to, and its callable, for one that folds; a refusal at its call
-    /// for any other (design.md "beatoraja Lua Skins", observers).
+    /// The observer at node `id`, read as destination record `rec`'s
+    /// `timer`, for an element of `role`: `None` for no observer; what its
+    /// predicate folds to, and its callable, for one that folds, noting D33
+    /// for `rec` when its reads map the BGA setting as a lowered callback's
+    /// do ([`Self::lower`]); a refusal at its call for any other (design.md
+    /// "beatoraja Lua Skins", observers).
     pub(super) fn observer_timer(
         &mut self,
         role: Role,
+        rec: Span,
         id: u32,
     ) -> Result<Option<(bool, u32)>, ImportError> {
         let Some((c, k)) = self.callable_kind_at(id) else {
@@ -1499,7 +1502,11 @@ impl Cx<'_> {
             Err(Unsupported::Observer("timer is no play destination's"))
         };
         match fold {
-            Ok(b) => {
+            Ok((b, bga)) => {
+                if bga {
+                    let at = self.arena_span(id);
+                    self.bga_note(rec, at);
+                }
                 self.record(
                     (c, id),
                     "timer",
@@ -1514,7 +1521,7 @@ impl Cx<'_> {
                             deviates: false,
                             sentinel: false,
                             known: Some(i32::from(b)),
-                            bga: false,
+                            bga,
                             #[cfg(feature = "dev-tools")]
                             constant: true,
                         }),
@@ -1534,8 +1541,13 @@ impl Cx<'_> {
     /// would: every read it reaches mapped and every operation checked,
     /// discarded ones included, and no read with an availability guard,
     /// which the constant cannot keep (design.md "beatoraja Lua Skins",
-    /// the expression acceptance proof).
-    fn fold_observer(&self, id: u32, inst: u32) -> Result<Result<bool, Unsupported>, ImportError> {
+    /// the expression acceptance proof). With the value, whether its reads
+    /// map the BGA setting.
+    fn fold_observer(
+        &self,
+        id: u32,
+        inst: u32,
+    ) -> Result<Result<(bool, bool), Unsupported>, ImportError> {
         let def: &crate::resolve::Definition = self.def;
         let Some(an) = def.arena.lua.as_deref().and_then(|l| l.analysis.as_deref()) else {
             return Ok(Err(Unsupported::Observer("predicate is not captured")));
@@ -1588,7 +1600,7 @@ impl Cx<'_> {
             )));
         }
         Ok(match res.val(res.root) {
-            Some(Val::Bool(b)) => Ok(b),
+            Some(Val::Bool(b)) => Ok((b, l.out.bga)),
             _ => Err(Unsupported::Observer("predicate is not constant")),
         })
     }
