@@ -728,7 +728,70 @@ fn a_refused_first_loading_frame_ends_the_run() {
 #[test]
 fn the_opener_counts_the_minimum_from_the_render_ack() {
     let (_dir, mut loaded) = plain();
-    on_loading(&mut loaded, None, true, |rig, side, loaded| {
+    opens_on_the_held_ack(&mut loaded, |_, _| {}, |_| {});
+}
+
+/// A chart naming one BGA picture, which its folder holds: a job that
+/// runs publishes it in an array.
+fn with_bga() -> (tempfile::TempDir, game::Loaded) {
+    let (dir, loaded) = chart(
+        "#PLAYLEVEL 13\n#BPM 120\n#BMP01 a.png\n#00104:01\n#00111:01\n",
+        covers(),
+    );
+    crate::bga::tests::png(dir.path(), "a.png", [8, 8], [200, 0, 0]);
+    (dir, loaded)
+}
+
+/// Lets the BGA job run again when dropped, a failing test's included.
+struct JobRuns;
+
+impl Drop for JobRuns {
+    fn drop(&mut self) {
+        crate::bga::FAIL.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// A BGA job whose thread is refused, or which panics, leaves the
+/// pictures absent without the game thread waiting for the render
+/// thread's answer: the absent table is sent and its answer taken later,
+/// so the first frame's held acknowledgement does not hold the opening.
+/// The refusal comes at the preparation's step; the panicking job is
+/// begun at the choice and has ended before that step, which takes its
+/// panic, both while the first frame is held.
+#[test]
+fn a_bga_job_refused_or_panicking_waits_for_no_render_answer() {
+    for fail in [crate::bga::FAIL_SPAWN, crate::bga::FAIL_PANIC] {
+        let _runs = JobRuns;
+        crate::bga::FAIL.store(fail, std::sync::atomic::Ordering::SeqCst);
+        let (_dir, mut loaded) = with_bga();
+        let at_choice = |rig: &mut PlayerRig<'_>, loaded: &game::Loaded| {
+            if fail == crate::bga::FAIL_PANIC {
+                rig.chart_images_at_choice(loaded);
+                until("the job panicked", || rig.bga.job_ended());
+            }
+        };
+        opens_on_the_held_ack(&mut loaded, at_choice, |side| {
+            let seen = side.screens.bga.lock().unwrap();
+            let table = seen.published.last().expect("a table published");
+            assert_eq!(
+                table.entries(),
+                [skin_model::bga::BgaEntry::Absent],
+                "{fail}"
+            );
+            assert_eq!(table.key(), None, "{fail}");
+        });
+    }
+}
+
+/// [`the_opener_counts_the_minimum_from_the_render_ack`] on `loaded`,
+/// `before` the opening with the first frame held, then `check`.
+fn opens_on_the_held_ack(
+    loaded: &mut game::Loaded,
+    before: impl FnOnce(&mut PlayerRig<'_>, &game::Loaded),
+    check: impl FnOnce(&Side<'_>),
+) {
+    on_loading(loaded, None, true, |rig, side, loaded| {
+        before(rig, loaded);
         let lifetime = rig.render.loading_lifetime();
         side.loading_end.hold(true);
         let mut looked = TimeUs(0);
@@ -750,6 +813,7 @@ fn the_opener_counts_the_minimum_from_the_render_ack() {
             panic!("{:?}", ends(side));
         };
         assert!(end.0 >= at.0 + 1_000_000, "{end:?} {at:?}");
+        check(side);
     });
 }
 

@@ -89,6 +89,27 @@ pub static HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::
 #[cfg(test)]
 pub static HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// The job fails while set (tests): [`FAIL_SPAWN`], its thread refused;
+/// [`FAIL_PANIC`], it panics as it begins.
+#[cfg(test)]
+pub static FAIL: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg(test)]
+pub const FAIL_SPAWN: u8 = 1;
+#[cfg(test)]
+pub const FAIL_PANIC: u8 = 2;
+
+/// Whether the job's spawn is refused (tests: [`FAIL`]).
+fn spawn_refused() -> bool {
+    #[cfg(test)]
+    {
+        FAIL.load(Ordering::SeqCst) == FAIL_SPAWN
+    }
+    #[cfg(not(test))]
+    {
+        false
+    }
+}
+
 /// States `terms` to the reservation the ledger will answer (design.md
 /// "Load Pipeline"): granted until the ledger exists.
 #[must_use]
@@ -345,6 +366,12 @@ pub(crate) fn run(
 ) -> JobOut {
     #[cfg(feature = "dev-tools")]
     crate::dev::stage("bga_start");
+    #[cfg(test)]
+    assert_ne!(
+        FAIL.load(Ordering::SeqCst),
+        FAIL_PANIC,
+        "bga: a failing job"
+    );
     let out = read_and_publish(want, generation, prior, link, cancel);
     #[cfg(feature = "dev-tools")]
     crate::dev::stage("bga_end");
@@ -574,19 +601,20 @@ struct Core {
     obsolete: Vec<OwnedJob<Arc<JobOut>>>,
     /// How the current generation's job ended.
     done: Option<End>,
-    /// The current generation's empty table (a want without pictures),
-    /// sent with no job, its answer not yet taken.
-    empty: Option<EmptyAnswer>,
+    /// The current generation's absent table (a want without pictures,
+    /// or a job that could not start or panicked), sent from this thread,
+    /// its answer not yet taken.
+    absent: Option<AbsentAnswer>,
     kept: Option<Kept>,
     ended: bool,
     begun: u64,
     decoded: u64,
 }
 
-/// The render thread's answer to an empty table, taken by a later step
+/// The render thread's answer to an absent table, taken by a later step
 /// or poll, never waited for: the game thread sends it while the render
 /// thread may be held (a loading frame awaiting its acknowledgement).
-struct EmptyAnswer {
+struct AbsentAnswer {
     rx: mpsc::Receiver<Result<Arc<BgaTable>, BgaFault>>,
     /// The link's bound from the send: unanswered past it.
     by: Instant,
@@ -628,7 +656,7 @@ impl BgaWorker {
                 job: None,
                 obsolete: Vec::new(),
                 done: None,
-                empty: None,
+                absent: None,
                 kept: None,
                 ended: false,
                 begun: 0,
@@ -691,7 +719,8 @@ impl BgaWorker {
     /// begins the job the current want needs once no job's thread is alive.
     /// A want without pictures has nothing to read: no job begins and no
     /// permit is taken, so the load beside it keeps them all; its empty
-    /// table is sent here and its answer taken by a later step or poll.
+    /// table is sent here, as an absent table is for a job that cannot
+    /// start, and the answer taken by a later step or poll.
     /// `coord`
     /// `None` (the direct launch) runs the job now on this thread, asking
     /// `cancel`.
@@ -701,7 +730,7 @@ impl BgaWorker {
         if c.ended
             || c.done.is_some()
             || c.job.is_some()
-            || c.empty.is_some()
+            || c.absent.is_some()
             || !c.obsolete.is_empty()
         {
             return;
@@ -710,7 +739,7 @@ impl BgaWorker {
             return;
         };
         if want.names.is_empty() {
-            c.publish_empty();
+            c.publish_absent(0);
             return;
         }
         let generation = c.current();
@@ -732,18 +761,25 @@ impl BgaWorker {
         };
         let shared = Arc::clone(&c.generation);
         let n = want.names.len();
-        let spawned = coord.spawn_owned(
-            spawner,
-            key,
-            (Class::Foreground, false, Owner::Foreground),
-            coord.subscriber(Scope::Choice),
-            |_| {},
-            move |ctx| {
-                Arc::new(run(&want, generation, prior.as_ref(), &link, &|| {
-                    ctx.cancelled() || shared.load(Ordering::SeqCst) != generation
-                }))
-            },
-        );
+        let spawned = if spawn_refused() {
+            Err(game::coord::LoadFailure {
+                job: JobKind::BgaImages,
+                cause: game::coord::Failure::ThreadStart("refused (tests)".to_owned()),
+            })
+        } else {
+            coord.spawn_owned(
+                spawner,
+                key,
+                (Class::Foreground, false, Owner::Foreground),
+                coord.subscriber(Scope::Choice),
+                |_| {},
+                move |ctx| {
+                    Arc::new(run(&want, generation, prior.as_ref(), &link, &|| {
+                        ctx.cancelled() || shared.load(Ordering::SeqCst) != generation
+                    }))
+                },
+            )
+        };
         match spawned {
             Ok(job) => c.job = Some(Running { generation, job }),
             Err(e) => {
@@ -781,6 +817,14 @@ impl BgaWorker {
     #[must_use]
     pub fn generation(&self) -> u64 {
         self.core().current()
+    }
+
+    /// Whether the current job's thread ended, its end not yet taken
+    /// (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    #[must_use]
+    pub fn job_ended(&self) -> bool {
+        self.core().job.as_ref().is_some_and(|j| j.job.finished())
     }
 
     /// Jobs begun and cells decoded (tests).
@@ -830,24 +874,26 @@ impl Core {
     fn renew(&mut self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.done = None;
-        self.empty = None;
+        self.absent = None;
         self.used = false;
         if let Some(j) = self.job.take() {
             self.obsolete.push(j.job);
         }
     }
 
-    /// Sends the current generation's empty table, its answer taken by
-    /// [`take_finished`](Self::take_finished).
-    fn publish_empty(&mut self) {
+    /// Sends the current generation's table of `n` pictures absent (none:
+    /// the empty table), never waiting: its answer is taken by
+    /// [`take_finished`](Self::take_finished), unanswered past the link's
+    /// bound.
+    fn publish_absent(&mut self, n: usize) {
         let (reply, rx) = mpsc::sync_channel(1);
         let message = BgaMsg::Publish {
             key: None,
-            entries: Vec::new(),
+            entries: vec![BgaEntry::Absent; n],
             reply,
         };
         if self.link.send(self.current(), message) {
-            self.empty = Some(EmptyAnswer {
+            self.absent = Some(AbsentAnswer {
                 rx,
                 by: Instant::now() + self.link.bound(),
             });
@@ -857,39 +903,26 @@ impl Core {
         self.kept = None;
     }
 
-    /// Publishes `n` pictures absent from this thread, for the current
-    /// generation.
-    fn publish_absent(&mut self, n: usize) {
-        let generation = self.current();
-        self.done = Some(
-            match ask(&self.link, generation, |reply| BgaMsg::Publish {
-                key: None,
-                entries: vec![BgaEntry::Absent; n],
-                reply,
-            }) {
-                Asked::Answer(Ok(t)) => End::Published(t),
-                Asked::Answer(Err(_)) => End::Stopped,
-                Asked::Unanswered => End::Unanswered,
-            },
-        );
-        self.kept = None;
+    /// Takes the absent table's answer once it came, or once the link's
+    /// bound passed without it.
+    fn take_absent(&mut self) {
+        let Some(absent) = &self.absent else {
+            return;
+        };
+        let answer = match absent.rx.try_recv() {
+            Ok(Ok(t)) => End::Published(t),
+            Ok(Err(_)) => End::Stopped,
+            Err(mpsc::TryRecvError::Empty) if Instant::now() < absent.by => return,
+            Err(_) => End::Unanswered,
+        };
+        self.done = Some(answer);
+        self.absent = None;
     }
 
     /// Takes the jobs that ended: an older generation's are settled and
     /// dropped; the current one's output adopted.
     fn take_finished(&mut self) {
-        if let Some(empty) = &self.empty {
-            let answer = match empty.rx.try_recv() {
-                Ok(Ok(t)) => Some(End::Published(t)),
-                Ok(Err(_)) => Some(End::Stopped),
-                Err(mpsc::TryRecvError::Empty) if Instant::now() < empty.by => None,
-                Err(_) => Some(End::Unanswered),
-            };
-            if answer.is_some() {
-                self.done = answer;
-                self.empty = None;
-            }
-        }
+        self.take_absent();
         let (ended, live): (Vec<_>, Vec<_>) = std::mem::take(&mut self.obsolete)
             .into_iter()
             .partition(OwnedJob::finished);
