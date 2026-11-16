@@ -522,6 +522,7 @@ fn label(e: &ImportError) -> String {
             LuaWhy::Critical { field, why } => {
                 format!("lua critical {field} {}", unsupported(why))
             }
+            LuaWhy::Observer(why) => format!("lua observer {why}"),
             why => format!("lua {why:?}"),
         },
     }
@@ -544,6 +545,7 @@ pub(crate) fn unsupported(why: &Unsupported) -> String {
         Unsupported::Unmapped { api: a, id } => format!("Unmapped {} {id}", api(*a)),
         Unsupported::Consumer(c) => format!("Consumer {c}"),
         Unsupported::Unresolved(w) => format!("Unresolved {w}"),
+        Unsupported::Observer(w) => format!("Observer {w}"),
         other => variant(other),
     }
 }
@@ -724,6 +726,7 @@ pub fn survey_with(
                         format!("{m}.{n}")
                     }
                     CallableKind::Library => "library".to_owned(),
+                    CallableKind::Observer { .. } => "observer".to_owned(),
                 };
                 *s.callables.entry((field, kind)).or_default() += 1;
             }

@@ -469,6 +469,9 @@ pub(crate) struct Cx<'d> {
     slot_roots: HashMap<u32, callback::SlotRoot>,
     /// Per callable instance, the play destinations whose `timer` it is.
     timer_sites: HashMap<u32, u32>,
+    /// The observer callables met at a play destination's `timer`, folded
+    /// or with their destination removed or inert ([`Self::close_observers`]).
+    observers: std::collections::HashSet<u32>,
     /// Per callable instance, the `timer`s of play destinations whose
     /// object the source removes, or whose timer is inert: no site, and
     /// no reference ([`Cx::close_slots`]).
@@ -631,6 +634,7 @@ impl<'d> Cx<'d> {
             present: skin_model::present::PresentDef::default(),
             slot_roots: HashMap::new(),
             timer_sites: HashMap::new(),
+            observers: std::collections::HashSet::new(),
             removed_refs: HashMap::new(),
             install: prepare::Install::default(),
             prepare: prepare::Prepare::Open,
@@ -1349,8 +1353,37 @@ impl<'d> Cx<'d> {
             }
         };
 
+        // An observer at `timer` folds before the conditions: a false one
+        // never draws, whatever they are, as the source's never starts
+        // (`TimerUtility.java:89-108`).
+        let observer = match dst.timer {
+            Prop::Callable(id) => self.observer_timer(role, id)?,
+            _ => None,
+        };
+        if let Some((false, _)) = observer {
+            #[cfg(feature = "dev-tools")]
+            {
+                self.folded = true;
+                let callables = dst.ops.iter().filter_map(|op| match op {
+                    Op::Callable(id) => Some(*id),
+                    _ => None,
+                });
+                let draw = match dst.draw {
+                    Prop::Callable(id) => Some(id),
+                    _ => None,
+                };
+                for id in callables.chain(draw) {
+                    self.unused(id, crate::lua::callback::Unused::FoldedFalse);
+                }
+            }
+            self.ignored(at, NoteKind::Ignored { field: "timer" });
+            return Ok(None);
+        }
+
         // Conditions, after the value's availability.
         let mut conds: Vec<String> = o.guard.into_iter().map(str::to_owned).collect();
+        // The destination's own conditions start here.
+        let own = conds.len();
         let mut deviates = false;
         let mut seen = BTreeSet::new();
         // The source's order: the numeric ids first, then the names and
@@ -1442,6 +1475,22 @@ impl<'d> Cx<'d> {
 
         // Timer.
         let (timer, untimed) = match dst.timer {
+            // A true observer: untimed, as the source's starts at the first
+            // frame its destination is prepared, unless a condition of its
+            // own may hold that frame back.
+            Prop::Callable(id) if observer.is_some() => {
+                if conds
+                    .get(own..)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|c| c != "true")
+                {
+                    let c = observer.map_or(crate::tree::NONE, |(_, c)| c);
+                    let why = crate::lua::Unsupported::Observer("destination is conditioned");
+                    return Err(self.observer_refused(role, (c, id), why));
+                }
+                (self.screen(), true)
+            }
             Prop::Null => (self.screen(), true),
             Prop::Id(n) if n < 0 => (self.screen(), true),
             Prop::Name(_) => {
@@ -2264,6 +2313,7 @@ impl<'d> Cx<'d> {
             loadend,
             present: {
                 self.close_slots()?;
+                self.close_observers()?;
                 (!self.present.callbacks.is_empty()).then(|| std::mem::take(&mut self.present))
             },
         };

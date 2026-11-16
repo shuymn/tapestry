@@ -116,13 +116,16 @@ pub(crate) enum LuaScalar {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Callable {
     /// The module that defined it, an index of [`LuaText::modules`];
-    /// `None` for a host or library function.
+    /// `None` for a host or library function. An observer's is the module
+    /// it was called in.
     pub(crate) module: Option<u16>,
-    /// The line its definition starts on, 0 for a host function.
+    /// The line its definition starts on, 0 for a host function; an
+    /// observer's call line.
     pub(crate) line: u32,
     /// What it is.
     pub(crate) kind: CallableKind,
-    /// Its closure instance in [`LuaText::analysis`], `NONE` without one.
+    /// Its closure instance in [`LuaText::analysis`], `NONE` without one;
+    /// an observer's is its predicate's.
     pub(crate) instance: u32,
     /// Whether the source reads it: it is met at a property field or an
     /// `op` entry ([`crate::lua::convert`]'s schema). Any other is inert.
@@ -139,6 +142,10 @@ pub enum CallableKind {
     Host(u16),
     /// A library function (`string`, `table`, `math` or a base function).
     Library,
+    /// The function a construction-time `timer_util.timer_observe_boolean`
+    /// returned: host API `api`, the pass's observer `observer`, in call
+    /// order.
+    Observer { api: u16, observer: u32 },
 }
 
 /// A value as a field reads it, following the pinned reader's typing:

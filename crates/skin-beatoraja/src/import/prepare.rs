@@ -283,6 +283,11 @@ impl Cx<'_> {
         if self.kind != ScreenKind::Play {
             return Ok(());
         }
+        // An observer at this `timer` is met at a play destination's, even
+        // where the source removes the object or never installs it.
+        if let Prop::Callable(id) = dst.timer {
+            self.observer_met(id);
+        }
         let removal = self.removal(dst, object)?;
         self.install.certain = removal.is_none()
             && matches!(object, None | Some((Object::Judge | Object::Note, _)))
