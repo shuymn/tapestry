@@ -95,6 +95,21 @@ fn import_with(text: &str, files: &[(&str, &str)]) -> (tempfile::TempDir, LuaImp
     }
 }
 
+/// D33 on selection: its configured pass reads the BGA setting as off,
+/// 40 and −41 true and 41 and −40 false, a scene constant that records no
+/// fact (the reads' facts equal those of the same skin reading nothing).
+#[test]
+fn the_selection_configured_pass_reads_bga_off() {
+    let reads = entry(
+        "assert(ms.option(40) == true and ms.option(-41) == true, \"BGA off holds\")
+         assert(ms.option(41) == false and ms.option(-40) == false, \"BGA on does not\")",
+        &[],
+        "nil",
+    );
+    let none = entry("", &[], "nil");
+    assert_eq!(import(&reads).facts, import(&none).facts);
+}
+
 /// A selection state's fields for `skin`'s outputs, with `set` named
 /// fields given.
 #[cfg(feature = "dev-tools")]

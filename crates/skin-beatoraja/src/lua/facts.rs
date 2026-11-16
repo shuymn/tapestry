@@ -424,10 +424,8 @@ pub(crate) fn option(facts: &ImportFacts, n: i32) -> OptionRead {
         _ if facts.scene == ScreenKind::Play && crate::import::ops::play_constant_false(id) => {
             return constant(false);
         }
-        // The BGA setting, answered as off (D33).
-        crate::import::ops::BGA_OFF | crate::import::ops::BGA_ON
-            if facts.scene == ScreenKind::Play =>
-        {
+        // The BGA setting, answered as off on every scene (D33).
+        crate::import::ops::BGA_OFF | crate::import::ops::BGA_ON => {
             return constant(id == crate::import::ops::BGA_OFF);
         }
         AUTOPLAY_OFF | AUTOPLAY_ON => FactId::Autoplay,
