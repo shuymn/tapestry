@@ -28,12 +28,16 @@ pub const ABORT_POLLS: u32 = 100_000;
 /// How long the device keeps running after an unacknowledged abort before
 /// it reboots, so the link can carry the `A` record.
 pub const RECOVERY_US: u64 = 20_000;
+/// Neutral reports a disarm owes after a revocation: the withdrawn report
+/// may have reached the host with only its ACK lost, so the host expects
+/// either DATA PID; one of two reports in a row carries the one it expects.
+pub const OWED_AFTER_REVOCATION: u8 = 2;
 
 /// An IN endpoint's buffer control in the controller's DPRAM.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Buffer {
-    /// Handed to the controller; it clears the bit when the host takes the
-    /// report.
+    /// Handed to the controller; it clears the bit when the host's ACK
+    /// reaches it.
     pub available: bool,
     /// The DATA PID of the report in the buffer, DATA1 when set. A write
     /// sends the opposite of what the register holds.
@@ -141,9 +145,9 @@ struct Endpoint {
     /// Send the current state once without a change: at configuration,
     /// which identifies the endpoint.
     dirty: bool,
-    /// After a disarm: a neutral report the host must take before this
-    /// endpoint sends anything else. Only its completion clears it.
-    owe_neutral: bool,
+    /// After a disarm: neutral reports the host must take before this
+    /// endpoint sends anything else. Each completion of one takes one off.
+    owed: u8,
     /// The owed neutral report while it is handed.
     neutral_seq: Option<u32>,
     /// Held changes from commands, each sent as its own report.
@@ -164,7 +168,7 @@ impl Endpoint {
             delivered_neutral: true,
             last_done: None,
             dirty: false,
-            owe_neutral: false,
+            owed: 0,
             neutral_seq: None,
             changes: Fifo::new(),
             identified: false,
@@ -199,7 +203,8 @@ pub enum Revocation {
     Nothing,
     /// The host had taken the pending report.
     Taken,
-    /// The pending report was withdrawn before the host took it.
+    /// The pending report was withdrawn while the controller still held
+    /// it: the host never took it, or took it and its ACK was lost.
     Revoked,
     /// The controller never acknowledged the abort: nothing was touched.
     Unacknowledged,
@@ -531,9 +536,9 @@ impl State {
         }
     }
 
-    /// What `ep` sends next, applying its change to the held state. A
-    /// neutral report a disarm owes goes before anything else and holds
-    /// everything back until the host takes it; then the revocation
+    /// What `ep` sends next, applying its change to the held state. The
+    /// neutral reports a disarm owes go before anything else and hold
+    /// everything back until the host has taken them; then the revocation
     /// trial's report, a held change, a due pattern item, a requested
     /// resend, a continuous report.
     pub fn next_report(&mut self, hw: &impl Hardware, ep: Ep) -> Next {
@@ -542,7 +547,7 @@ impl State {
         }
         let t = hw.now();
         let e = self.ep_ref(ep);
-        if e.owe_neutral {
+        if e.owed > 0 {
             return if e.neutral_seq.is_none() {
                 Next::Now(Kind::Neutral)
             } else {
@@ -742,7 +747,7 @@ impl State {
         e.last_done = Some(done);
         if e.neutral_seq == Some(done.seq) {
             e.neutral_seq = None;
-            e.owe_neutral = false;
+            e.owed = e.owed.saturating_sub(1);
         }
         self.trace(
             hw,
@@ -808,7 +813,8 @@ impl State {
         if b.available {
             // Withdraw it, restoring the DATA PID of the last report
             // delivered: the next write sends the opposite, the toggle the
-            // host expects.
+            // host expects unless it took this report and only the ACK was
+            // lost ([`OWED_AFTER_REVOCATION`]).
             hw.set_buffer(
                 ep,
                 Buffer {
@@ -845,8 +851,8 @@ impl State {
 
     /// Ends the lease for `reason`, in the order of docs/test-device.md
     /// "Lease and Disarm": drop the pattern and the held input, revoke what
-    /// the host has not taken, then owe a neutral report wherever the host
-    /// last saw something pressed or a report was revoked.
+    /// the controller still holds, then owe a neutral report wherever the
+    /// host last saw something pressed, and two after a revocation.
     pub fn disarm(&mut self, hw: &impl Hardware, reason: Reason) {
         if self.fault(hw, Fault::IgnoreDisarm).is_some() {
             return;
@@ -868,8 +874,13 @@ impl State {
             let revocation = self.revoke(hw, ep);
             let e = self.ep(ep);
             let pending_pressed = e.assoc.pending().is_some() && !e.pending_neutral;
-            if revocation == Revocation::Revoked || !e.delivered_neutral || pending_pressed {
-                e.owe_neutral = true;
+            let owed = if revocation == Revocation::Revoked {
+                OWED_AFTER_REVOCATION
+            } else {
+                u8::from(!e.delivered_neutral || pending_pressed)
+            };
+            if owed > e.owed {
+                e.owed = owed;
                 hw.kick(ep);
             }
         }
@@ -1037,7 +1048,7 @@ impl State {
             return Answer::Err(Error::Lease(Refusal::NoLease));
         }
         let e = self.ep_ref(ep);
-        let idle = e.changes.is_empty() && !e.owe_neutral && e.assoc.pending().is_none();
+        let idle = e.changes.is_empty() && e.owed == 0 && e.assoc.pending().is_none();
         if self.busy() || self.lease.armed() || !idle || !self.held_neutral(ep) {
             return Answer::Err(Error::Playing);
         }

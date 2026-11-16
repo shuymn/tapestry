@@ -1,10 +1,13 @@
 //! The device's logic against a simulated controller and host: the host
-//! polls each endpoint at the report interval, takes a report whose
-//! AVAILABLE is set unless the endpoint is aborting, and discards a report
-//! whose DATA PID repeats the last one it accepted, as a USB host does with
-//! a duplicate. The writers follow the firmware's loops: wait for the next
-//! report, write it as embassy-rp does (the opposite PID of the register,
-//! then AVAILABLE), then wait for its completion.
+//! polls each endpoint at the report interval and receives a report whose
+//! AVAILABLE is set unless the endpoint is aborting. It accepts a report
+//! whose DATA PID is the one it expects and discards one that repeats the
+//! last it accepted, as a USB host does with a duplicate, and ACKs both;
+//! the controller clears AVAILABLE when the ACK reaches it, so a lost ACK
+//! leaves a report the host accepted AVAILABLE. The writers follow the
+//! firmware's loops: wait for the next report, write it as embassy-rp does
+//! (the opposite PID of the register, then AVAILABLE), then wait for its
+//! completion.
 
 use std::cell::{Cell, RefCell};
 
@@ -126,6 +129,8 @@ struct World {
     expect: [bool; 2],
     accepted: Vec<Accepted>,
     discarded: usize,
+    /// ACKs to lose on each endpoint, from its next poll.
+    lose_ack: [u32; 2],
     records: Vec<Record>,
 }
 
@@ -152,6 +157,7 @@ impl World {
             expect: [false; 2],
             accepted: Vec::new(),
             discarded: 0,
+            lose_ack: [0; 2],
             records: Vec::new(),
         };
         w.state.configured(&w.hw);
@@ -174,7 +180,6 @@ impl World {
         if !b.control.available {
             return;
         }
-        b.control.available = false;
         if b.control.pid == self.expect[i] {
             self.expect[i] = !self.expect[i];
             self.accepted.push(Accepted {
@@ -184,6 +189,12 @@ impl World {
             });
         } else {
             self.discarded += 1;
+        }
+        // The host ACKs; the report stays AVAILABLE when the ACK is lost.
+        if self.lose_ack[i] > 0 {
+            self.lose_ack[i] -= 1;
+        } else {
+            b.control.available = false;
         }
     }
 
@@ -392,6 +403,35 @@ fn an_owed_neutral_report_revoked_in_turn_is_sent_again() {
     w.run_for(20_000);
     assert_eq!(w.seen_from(Ep::Keyboard, 0), [(F24, true), (F24, false)]);
     assert_eq!(w.discarded, 0);
+}
+
+/// A pressed report the host accepted whose ACK was lost is still
+/// AVAILABLE at the disarm, so it is withdrawn and the host expects either
+/// DATA PID: the release still reaches the host, and new input after it.
+#[test]
+fn a_release_reaches_the_host_after_a_lost_ack() {
+    let mut w = World::new(Rate::Hz125, 3_000);
+    w.lease();
+    assert_eq!(w.send("key 115 1"), "ok");
+    w.lose_ack[index(Ep::Keyboard)] = 1;
+    w.run_for(10_000);
+    assert_eq!(w.seen_from(Ep::Keyboard, 0), [(F24, true)]);
+    assert!(w.hw.buffer(Ep::Keyboard).available, "the ACK was lost");
+    assert_eq!(w.send("release"), "ok");
+    w.run_for(30_000);
+    assert_eq!(
+        w.seen_from(Ep::Keyboard, 0),
+        [(F24, true), (F24, false)],
+        "the release"
+    );
+    assert_eq!(w.discarded, 1, "the first neutral report repeats the PID");
+    w.lease();
+    assert_eq!(w.send("key 4 1"), "ok");
+    w.run_for(10_000);
+    assert_eq!(
+        w.seen_from(Ep::Keyboard, 0),
+        [(F24, true), (F24, false), (Control::Key(4), true)]
+    );
 }
 
 /// A pad report after its predecessor was revoked agrees with the trace:

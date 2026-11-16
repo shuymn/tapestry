@@ -1,7 +1,7 @@
 //! The phase-controlled revocation trial (docs/test-device.md "Revocation
 //! Trial"): `revoke-test` makes the device hand a report it then revokes,
 //! at a known point of the host's polling, so a run shows that a revoked
-//! report never arrives, that the release after it does, and that nothing
+//! report never arrives, that the releases after it do, and that nothing
 //! plays before the host arms again.
 //!
 //! The device's phases are in [`crate::device`]; with `std`, [`judge`]
@@ -81,8 +81,12 @@ mod host {
         NotExercised,
         /// The listener saw the revoked report's control.
         RevokedArrived,
+        /// The trace does not show both neutral reports the disarm owes
+        /// taken.
+        NeutralMissing,
         /// The next change after the sentinel's press is not its release,
-        /// or the neutral report was not taken.
+        /// or the release came only with the second neutral report: the
+        /// toggle was not restored.
         SentinelBreakMissing,
         /// Something was handed, or the probe seen, before the host armed
         /// again.
@@ -96,6 +100,7 @@ mod host {
                 Self::Missing => "k1 is not in the trace",
                 Self::NotExercised => "not exercised",
                 Self::RevokedArrived => "revoked report arrived",
+                Self::NeutralMissing => "neutral reports not taken",
                 Self::SentinelBreakMissing => "sentinel break missing after revocation",
                 Self::ItemBeforeRearm => "item before rearm",
             }
@@ -160,10 +165,14 @@ mod host {
     /// 1. k1 was still queued at the abort: its `X` shows AVAILABLE and its
     ///    report's LENGTH ([`Failure::NotExercised`] otherwise).
     /// 2. The listener never saw the revoked control.
-    /// 3. The next change after the sentinel's press is its release, and
-    ///    the trace shows the report after k1 (the neutral one) taken.
-    /// 4. Until [`REARM_AFTER_PROBE`] after the probe's due time, nothing
-    ///    after the neutral report was handed on the endpoint and the
+    /// 3. The trace shows the two reports after k1, the neutral ones the
+    ///    disarm owes, taken.
+    /// 4. The next change after the sentinel's press is its release, seen
+    ///    before the second neutral report's completion: k1 was withdrawn
+    ///    between polls, so the host still expects its DATA PID, and the
+    ///    first neutral report carries it once the toggle is restored.
+    /// 5. Until [`REARM_AFTER_PROBE`] after the probe's due time, nothing
+    ///    after the neutral reports was handed on the endpoint and the
     ///    listener saw no probe.
     ///
     /// # Errors
@@ -181,17 +190,25 @@ mod host {
         if seen.iter().any(|s| s.control == c.revoked && s.down) {
             return Err(Failure::RevokedArrived);
         }
+        let taken = |after: u32| {
+            trace
+                .reports
+                .get(&(run.ep, run.k1.wrapping_add(after)))
+                .and_then(|e| e.completion)
+        };
+        let (Some(_), Some(second)) = (taken(1), taken(2)) else {
+            return Err(Failure::NeutralMissing);
+        };
         let make = seen.iter().position(|s| s.control == c.sentinel && s.down);
         let next = make.and_then(|i| seen.get(i + 1));
-        let neutral = trace.reports.get(&(run.ep, run.k1.wrapping_add(1)));
-        let released = next.is_some_and(|s| s.control == c.sentinel && !s.down);
-        if !released || !neutral.is_some_and(|n| n.completion.is_some()) {
+        let released = next.is_some_and(|s| s.control == c.sentinel && !s.down && s.at < second);
+        if !released {
             return Err(Failure::SentinelBreakMissing);
         }
         let rearm = run.probe.saturating_add(REARM_AFTER_PROBE);
         let handed_early = trace.reports.iter().any(|(&(ep, seq), e)| {
             let after = seq.wrapping_sub(run.k1);
-            ep == run.ep && (2..0x8000_0000).contains(&after) && e.handoff < rearm
+            ep == run.ep && (3..0x8000_0000).contains(&after) && e.handoff < rearm
         });
         let probe_early = seen
             .iter()
@@ -216,9 +233,10 @@ mod tests {
         probe: 30_000,
     };
 
-    /// A trial's trace: k0 taken, k1 revoked while queued, the neutral
-    /// report taken, then `more` reports handed at the given times.
-    fn trace(k1_available: bool, more: &[u64]) -> Trace {
+    /// A trial's trace: k0 taken, k1 revoked while queued, the two neutral
+    /// reports taken at 13 000 and 21 000 µs (`neutrals` of them), then
+    /// `more` reports handed at the given times.
+    fn trace(k1_available: bool, neutrals: usize, more: &[u64]) -> Trace {
         let ep = Ep::Keyboard;
         let mut bodies = vec![
             Body::Handoff {
@@ -246,19 +264,23 @@ mod tests {
                 len: 17,
                 at: 9_000,
             },
-            Body::Handoff {
-                ep,
-                seq: 12,
-                ready: 9_100,
-                handoff: 9_100,
-            },
-            Body::Completion {
-                ep,
-                seq: 12,
-                at: 13_000,
-            },
         ];
-        for (seq, &at) in (13..).zip(more) {
+        let mut seqs = 12..;
+        // The array first: `seqs` stops at the last neutral report.
+        for ((handoff, at), seq) in [(9_100, 13_000), (13_100, 21_000)]
+            .into_iter()
+            .take(neutrals)
+            .zip(seqs.by_ref())
+        {
+            bodies.push(Body::Handoff {
+                ep,
+                seq,
+                ready: handoff,
+                handoff,
+            });
+            bodies.push(Body::Completion { ep, seq, at });
+        }
+        for (seq, &at) in seqs.zip(more) {
             bodies.push(Body::Handoff {
                 ep,
                 seq,
@@ -297,23 +319,34 @@ mod tests {
             (13_000, F23, false),
             (60_000, F22, true),
         ]);
-        assert_eq!(judge(&RUN, &trace(true, &[59_900]), &good), Ok(()));
+        assert_eq!(judge(&RUN, &trace(true, 2, &[59_900]), &good), Ok(()));
         assert_eq!(
-            judge(&RUN, &trace(false, &[]), &good),
+            judge(&RUN, &trace(false, 2, &[]), &good),
             Err(Failure::NotExercised)
         );
         let arrived = seen(&[(5_000, F23, true), (13_000, F24, true)]);
         assert_eq!(
-            judge(&RUN, &trace(true, &[]), &arrived).map_err(Failure::message),
+            judge(&RUN, &trace(true, 2, &[]), &arrived).map_err(Failure::message),
             Err("revoked report arrived")
+        );
+        assert_eq!(
+            judge(&RUN, &trace(true, 1, &[]), &good).map_err(Failure::message),
+            Err("neutral reports not taken"),
+            "one neutral report"
         );
         let stuck = seen(&[(5_000, F23, true)]);
         assert_eq!(
-            judge(&RUN, &trace(true, &[]), &stuck).map_err(Failure::message),
+            judge(&RUN, &trace(true, 2, &[]), &stuck).map_err(Failure::message),
             Err("sentinel break missing after revocation")
         );
+        let second = seen(&[(5_000, F23, true), (21_000, F23, false)]);
         assert_eq!(
-            judge(&RUN, &trace(true, &[46_000]), &good).map_err(Failure::message),
+            judge(&RUN, &trace(true, 2, &[]), &second).map_err(Failure::message),
+            Err("sentinel break missing after revocation"),
+            "the release with the second neutral report"
+        );
+        assert_eq!(
+            judge(&RUN, &trace(true, 2, &[46_000]), &good).map_err(Failure::message),
             Err("item before rearm"),
             "a handoff inside the withheld window"
         );
@@ -323,7 +356,7 @@ mod tests {
             (46_000, F22, true),
         ]);
         assert_eq!(
-            judge(&RUN, &trace(true, &[]), &early).map_err(Failure::message),
+            judge(&RUN, &trace(true, 2, &[]), &early).map_err(Failure::message),
             Err("item before rearm"),
             "the probe seen inside the withheld window"
         );
