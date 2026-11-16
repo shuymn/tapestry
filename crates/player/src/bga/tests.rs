@@ -91,9 +91,10 @@ fn native(e: BgaEntry) -> Option<[u32; 2]> {
     }
 }
 
-/// A chart without BGA pictures reads nothing: its empty table is
-/// published at the step, with no job begun and no permit taken, so the
-/// load beside it keeps every foreground permit.
+/// A chart without BGA pictures reads nothing: its empty table is sent at
+/// the step, with no job begun and no permit taken, so the load beside it
+/// keeps every foreground permit; the render thread's answer is taken by a
+/// later step.
 #[test]
 fn a_chart_without_bga_begins_no_job() {
     let _serial = crate::imports::tests::serial();
@@ -106,9 +107,7 @@ fn a_chart_without_bga_begins_no_job() {
     w.attempt(want(d.path(), &[]));
     w.step(Some((&coord, Spawner::SYSTEM)), &|| false);
     assert_eq!(coord.held(Class::Foreground), 0, "no permit taken");
-    let Poll::Ready(t) = w.poll() else {
-        panic!("not published at the step: {w:?}");
-    };
+    let t = ready(&w, &coord);
     assert!(t.entries().is_empty());
     assert_eq!(screens.bga.lock().unwrap().published.len(), 1);
     assert_eq!(w.counts().0, 0, "no job begun");

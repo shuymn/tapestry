@@ -574,10 +574,22 @@ struct Core {
     obsolete: Vec<OwnedJob<Arc<JobOut>>>,
     /// How the current generation's job ended.
     done: Option<End>,
+    /// The current generation's empty table (a want without pictures),
+    /// sent with no job, its answer not yet taken.
+    empty: Option<EmptyAnswer>,
     kept: Option<Kept>,
     ended: bool,
     begun: u64,
     decoded: u64,
+}
+
+/// The render thread's answer to an empty table, taken by a later step
+/// or poll, never waited for: the game thread sends it while the render
+/// thread may be held (a loading frame awaiting its acknowledgement).
+struct EmptyAnswer {
+    rx: mpsc::Receiver<Result<Arc<BgaTable>, BgaFault>>,
+    /// The link's bound from the send: unanswered past it.
+    by: Instant,
 }
 
 /// The BGA pictures' worker: what the game thread asks, the one job, and
@@ -616,6 +628,7 @@ impl BgaWorker {
                 job: None,
                 obsolete: Vec::new(),
                 done: None,
+                empty: None,
                 kept: None,
                 ended: false,
                 begun: 0,
@@ -677,21 +690,27 @@ impl BgaWorker {
     /// Advances the worker without waiting for a job: takes what ended, and
     /// begins the job the current want needs once no job's thread is alive.
     /// A want without pictures has nothing to read: no job begins and no
-    /// permit is taken, so the load beside it keeps them all, and its empty
-    /// table is published here, on the render thread's answer. `coord`
+    /// permit is taken, so the load beside it keeps them all; its empty
+    /// table is sent here and its answer taken by a later step or poll.
+    /// `coord`
     /// `None` (the direct launch) runs the job now on this thread, asking
     /// `cancel`.
     pub fn step(&self, coord: Option<(&Coordinator, Spawner)>, cancel: &dyn Fn() -> bool) {
         let mut c = self.core();
         c.take_finished();
-        if c.ended || c.done.is_some() || c.job.is_some() || !c.obsolete.is_empty() {
+        if c.ended
+            || c.done.is_some()
+            || c.job.is_some()
+            || c.empty.is_some()
+            || !c.obsolete.is_empty()
+        {
             return;
         }
         let Some(want) = c.want.clone() else {
             return;
         };
         if want.names.is_empty() {
-            c.publish_absent(0);
+            c.publish_empty();
             return;
         }
         let generation = c.current();
@@ -811,10 +830,31 @@ impl Core {
     fn renew(&mut self) {
         self.generation.fetch_add(1, Ordering::SeqCst);
         self.done = None;
+        self.empty = None;
         self.used = false;
         if let Some(j) = self.job.take() {
             self.obsolete.push(j.job);
         }
+    }
+
+    /// Sends the current generation's empty table, its answer taken by
+    /// [`take_finished`](Self::take_finished).
+    fn publish_empty(&mut self) {
+        let (reply, rx) = mpsc::sync_channel(1);
+        let message = BgaMsg::Publish {
+            key: None,
+            entries: Vec::new(),
+            reply,
+        };
+        if self.link.send(self.current(), message) {
+            self.empty = Some(EmptyAnswer {
+                rx,
+                by: Instant::now() + self.link.bound(),
+            });
+        } else {
+            self.done = Some(End::Unanswered);
+        }
+        self.kept = None;
     }
 
     /// Publishes `n` pictures absent from this thread, for the current
@@ -838,6 +878,18 @@ impl Core {
     /// Takes the jobs that ended: an older generation's are settled and
     /// dropped; the current one's output adopted.
     fn take_finished(&mut self) {
+        if let Some(empty) = &self.empty {
+            let answer = match empty.rx.try_recv() {
+                Ok(Ok(t)) => Some(End::Published(t)),
+                Ok(Err(_)) => Some(End::Stopped),
+                Err(mpsc::TryRecvError::Empty) if Instant::now() < empty.by => None,
+                Err(_) => Some(End::Unanswered),
+            };
+            if answer.is_some() {
+                self.done = answer;
+                self.empty = None;
+            }
+        }
         let (ended, live): (Vec<_>, Vec<_>) = std::mem::take(&mut self.obsolete)
             .into_iter()
             .partition(OwnedJob::finished);
