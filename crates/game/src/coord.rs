@@ -193,6 +193,10 @@ pub enum JobKind {
     /// The chosen chart's stage file and back image read and fitted (its
     /// owned image worker, S10-12).
     ChartImages,
+    /// The chosen chart's BGA pictures read, packed and handed to the
+    /// render thread (their owned job, design.md "Rendering and Skins",
+    /// BGA).
+    BgaImages,
 }
 
 /// What tells jobs apart: two of one key are one job. The speed is
@@ -270,15 +274,29 @@ impl Owner {
     }
 }
 
+/// What is told of each job's work as it starts (`true`) and ends
+/// (`false`), by its kind (dev-tools: the load stages a measurement
+/// records). Set once.
+#[cfg(feature = "dev-tools")]
+static JOB_OBSERVER: std::sync::OnceLock<fn(JobKind, bool)> = std::sync::OnceLock::new();
+
+/// Tells `f` of each job's work as it starts and ends, from the job's
+/// thread (dev-tools); a second call changes nothing.
+#[cfg(feature = "dev-tools")]
+pub fn observe_jobs(f: fn(JobKind, bool)) {
+    let _ = JOB_OBSERVER.set(f);
+}
+
 /// A job's published outcome, with who answered for it as it published:
 /// its owner then, and whether a promotion of the live job had made a
 /// waiter responsible for it (nothing withdraws that). The callers'
 /// rule: a panic is fatal when the owner was [`Owner::Foreground`] or the
 /// job `responsible`, otherwise recoverable; a cancellation is no failure.
-/// One exception: a [`JobKind::ChartImages`] job's panic is that job's own
-/// terminal absence (its images not yet finished are absent) and never the
-/// run's, whatever its owner, as the chart's images are decorative and the
-/// source catches their failures (S10-12, design C13).
+/// One exception: a [`JobKind::ChartImages`] or [`JobKind::BgaImages`]
+/// job's panic is that job's own terminal absence (its images not yet
+/// finished are absent) and never the run's, whatever its owner, as the
+/// chart's images are decorative and the source catches their failures
+/// (S10-12, design C13).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observed<T> {
     /// How it ended.
@@ -1056,7 +1074,28 @@ impl<T> Runner<T> {
             mode: Mutex::new(self.mode),
             fault: Mutex::new(None),
         };
-        let computed = catch(|| ctx.admit().then(|| work(&ctx)));
+        #[cfg(feature = "dev-tools")]
+        let kind = self
+            .coord
+            .shared
+            .lock()
+            .jobs
+            .get(&self.id)
+            .and_then(|j| j.key.as_ref().map(|k| k.kind));
+        let computed = catch(|| {
+            ctx.admit().then(|| {
+                #[cfg(feature = "dev-tools")]
+                if let (Some(f), Some(kind)) = (JOB_OBSERVER.get(), kind) {
+                    f(kind, true);
+                }
+                let value = work(&ctx);
+                #[cfg(feature = "dev-tools")]
+                if let (Some(f), Some(kind)) = (JOB_OBSERVER.get(), kind) {
+                    f(kind, false);
+                }
+                value
+            })
+        });
         // A hook's panic stays the job's even when its work caught it.
         let fault = ctx
             .fault
