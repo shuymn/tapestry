@@ -10,7 +10,9 @@ use bms_model::ChartBuilder;
 use common::play::Drawn;
 use common::{import_with, skin_with};
 use skin_beatoraja::BgaMode::{Autoplay, Off, On};
-use skin_beatoraja::{Bga, Cancel, Config, Imported, NoteKind, read_header, read_lua_header};
+use skin_beatoraja::{
+    Bga, BgaExpand, Cancel, Config, Imported, NoteKind, read_header, read_lua_header,
+};
 use skin_model::{ChartMetadata, ScreenKind};
 
 /// Each setting the tests run under, and whether it shows the BGA: `on`
@@ -21,6 +23,7 @@ const SETTINGS: [(Bga, bool); 4] = [
         Bga {
             mode: On,
             autoplay: false,
+            expand: BgaExpand::Full,
         },
         true,
     ),
@@ -28,6 +31,7 @@ const SETTINGS: [(Bga, bool); 4] = [
         Bga {
             mode: Off,
             autoplay: true,
+            expand: BgaExpand::Full,
         },
         false,
     ),
@@ -35,6 +39,7 @@ const SETTINGS: [(Bga, bool); 4] = [
         Bga {
             mode: Autoplay,
             autoplay: true,
+            expand: BgaExpand::Full,
         },
         true,
     ),
@@ -42,6 +47,7 @@ const SETTINGS: [(Bga, bool); 4] = [
         Bga {
             mode: Autoplay,
             autoplay: false,
+            expand: BgaExpand::Full,
         },
         false,
     ),

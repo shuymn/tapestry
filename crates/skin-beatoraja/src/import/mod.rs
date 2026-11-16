@@ -83,12 +83,28 @@ pub struct Config {
 }
 
 /// The player's BGA setting as a skin reads it (design.md "Differences
-/// from the source", BGA setting): `[bga] mode` in `player.toml`, and
-/// whether the session plays automatically, which its `Autoplay` reads.
+/// from the source", BGA setting): `[bga]` in `player.toml`, and whether
+/// the session plays automatically, which its `Autoplay` reads.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Bga {
     pub mode: BgaMode,
     pub autoplay: bool,
+    /// `[bga] expand`, settled when the skin loads as the source binds it
+    /// (`play/SkinBGA.java:24-31` at `0.8.9`).
+    pub expand: BgaExpand,
+}
+
+/// `[bga] expand`: how a BGA destination without a stretch of its own
+/// fits the chart's pictures.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BgaExpand {
+    /// Stretched to the destination.
+    Full,
+    /// Fitted inside it, its aspect kept, the default.
+    #[default]
+    KeepAspect,
+    /// At its own size, its aspect kept.
+    Off,
 }
 
 /// `[bga] mode`: whether a play shows the chart's BGA.

@@ -1769,7 +1769,11 @@ fn selection_72_170_171_follow_setting_and_chart() {
     ] {
         let at = format!("{mode:?} {autoplay}");
         let i = common::selection::import_selection_with(d.path(), |c| {
-            c.bga = Bga { mode, autoplay };
+            c.bga = Bga {
+                mode,
+                autoplay,
+                ..Bga::default()
+            };
         })
         .unwrap();
         let mut s = Sel::new(i.skin);

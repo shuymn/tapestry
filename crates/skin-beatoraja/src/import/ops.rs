@@ -1079,7 +1079,11 @@ mod tests {
             (Autoplay, true, true),
             (Autoplay, false, false),
         ] {
-            let bga = Bga { mode, autoplay };
+            let bga = Bga {
+                mode,
+                autoplay,
+                ..Bga::default()
+            };
             let at = format!("{mode:?} {autoplay}");
             for kind in [
                 ScreenKind::Play,

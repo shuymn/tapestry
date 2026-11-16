@@ -1908,6 +1908,7 @@ fn bga_settings() -> [(skin_beatoraja::Bga, bool); 4] {
             Bga {
                 mode: On,
                 autoplay: false,
+                ..Bga::default()
             },
             true,
         ),
@@ -1915,6 +1916,7 @@ fn bga_settings() -> [(skin_beatoraja::Bga, bool); 4] {
             Bga {
                 mode: Off,
                 autoplay: true,
+                ..Bga::default()
             },
             false,
         ),
@@ -1922,6 +1924,7 @@ fn bga_settings() -> [(skin_beatoraja::Bga, bool); 4] {
             Bga {
                 mode: Autoplay,
                 autoplay: true,
+                ..Bga::default()
             },
             true,
         ),
@@ -1929,6 +1932,7 @@ fn bga_settings() -> [(skin_beatoraja::Bga, bool); 4] {
             Bga {
                 mode: Autoplay,
                 autoplay: false,
+                ..Bga::default()
             },
             false,
         ),

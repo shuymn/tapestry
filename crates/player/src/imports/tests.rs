@@ -1018,7 +1018,11 @@ fn the_session_s_bga_setting_reaches_the_import() {
     .into_iter()
     .enumerate()
     {
-        let session = crate::imports::SkinSession { autoplay, bga };
+        let session = crate::imports::SkinSession {
+            autoplay,
+            bga,
+            ..Default::default()
+        };
         let (b, _) = bundled(build(ScreenKind::Play, &c, session, &t, &Cancel::new()));
         let p = frame(&mut r, &b, u64::try_from(request).unwrap() + 1);
         assert_eq!(at(&p, x), RED, "{bga:?}, autoplay {autoplay}");

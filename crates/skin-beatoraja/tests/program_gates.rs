@@ -442,7 +442,11 @@ fn an_image_under_a_false_bga_option_is_removed() {
         (Autoplay, true, true),
         (Autoplay, false, false),
     ] {
-        let bga = Bga { mode, autoplay };
+        let bga = Bga {
+            mode,
+            autoplay,
+            ..Bga::default()
+        };
         for (fields, holds) in [
             (format!("op = {{ {program}, \"bgaon\" }},"), shown),
             (format!("op = {{ {program} }}, draw = 41,"), shown),

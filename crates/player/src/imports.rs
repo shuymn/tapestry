@@ -481,22 +481,24 @@ pub const fn name(kind: ScreenKind) -> &'static str {
 }
 
 /// What a skin's import reads of the session, fixed for it: whether it
-/// plays automatically, and `player.toml`'s `[bga] mode`, which options 40
-/// and 41 and selection's image index 72 read with it (design.md
-/// "Differences from the source", BGA setting).
+/// plays automatically, `player.toml`'s `[bga] mode`, which options 40
+/// and 41 and selection's image index 72 read with it, and `[bga] expand`
+/// (design.md "Differences from the source", BGA setting).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SkinSession {
     pub autoplay: bool,
     pub bga: game::BgaMode,
+    pub expand: game::BgaExpand,
 }
 
 impl SkinSession {
-    /// The session `bga` fixes: its autoplay, and its BGA mode.
+    /// The session `bga` fixes: its autoplay, and its BGA setting.
     #[must_use]
     pub const fn of(bga: game::BgaSession) -> Self {
         Self {
             autoplay: bga.autoplay,
             bga: bga.settings.mode,
+            expand: bga.settings.expand,
         }
     }
 
@@ -510,6 +512,11 @@ impl SkinSession {
                 game::BgaMode::Off => skin_beatoraja::BgaMode::Off,
             },
             autoplay: self.autoplay,
+            expand: match self.expand {
+                game::BgaExpand::Full => skin_beatoraja::BgaExpand::Full,
+                game::BgaExpand::KeepAspect => skin_beatoraja::BgaExpand::KeepAspect,
+                game::BgaExpand::Off => skin_beatoraja::BgaExpand::Off,
+            },
         }
     }
 }
