@@ -570,6 +570,9 @@ pub const IN_PLAY: &[Site] = &[
     // A decision skin build's and submission's injected faults
     // (dev-tools), counted on the render thread at each.
     Site::File("crates/player/src/dev/decision_faults.rs"),
+    // The transition record (dev-tools): its recorder runs in the
+    // scenario's frame sink on the render thread, at each frame.
+    Site::File("crates/player/src/dev/transitions.rs"),
     // The selection frame's timers, the lifetime check before the
     // frame's build and the live settings.
     Site::Fns(

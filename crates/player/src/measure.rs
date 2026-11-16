@@ -452,6 +452,15 @@ pub struct Drawn<'a> {
     /// presentation (dev-tools).
     #[cfg(feature = "dev-tools")]
     pub skin_loading: Option<u64>,
+    /// The state, lifetime and presentation the frame drew (dev-tools: a
+    /// scenario's transition record).
+    #[cfg(feature = "dev-tools")]
+    pub stage: Stage,
+    /// The hold of a loading lifetime's first frame, on that lifetime's
+    /// frames, once the render thread has waited (dev-tools: a scenario's
+    /// transition record).
+    #[cfg(feature = "dev-tools")]
+    pub hold: Option<HoldStamp>,
     /// The generation of the play whose figures the frame counts in, until
     /// they are taken (dev-tools: a scenario's captures).
     #[cfg(feature = "dev-tools")]
@@ -506,7 +515,8 @@ pub enum ScreenKind {
     Splash,
     /// Song selection, skinned or its built-in page.
     Selection,
-    /// The decision screen's built-in presentation.
+    /// The decision screen, drawn by its skin or its built-in
+    /// presentation.
     Decision,
     /// The practice page.
     Practice,
@@ -545,6 +555,182 @@ impl ScreenKind {
     #[must_use]
     pub const fn is_result(self) -> bool {
         matches!(self, Self::Result | Self::End)
+    }
+}
+
+/// A frame's lifecycle state (dev-tools: a scenario's transition record,
+/// design.md "Shortening Launch-Based Checks").
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum State {
+    /// The launch screen.
+    Splash,
+    /// Song selection.
+    Selection,
+    /// The decision screen.
+    Decision,
+    /// The practice page.
+    Practice,
+    /// A generic page: a preparation's wait, a notice.
+    Page,
+    /// The play screen's loading state.
+    Loading,
+    /// A play frame before its view is acquired.
+    PlayPending,
+    /// READY.
+    Ready,
+    /// The play.
+    Play,
+    /// The audio tail.
+    Tail,
+    /// Closing.
+    Closing,
+    /// The result: its skin or the built-in page.
+    Result,
+}
+
+#[cfg(feature = "dev-tools")]
+impl State {
+    /// Its name in a record's line and a capture's sidecar.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Splash => "splash",
+            Self::Selection => "selection",
+            Self::Decision => "decision",
+            Self::Practice => "practice",
+            Self::Page => "page",
+            Self::Loading => "loading",
+            Self::PlayPending => "play-pending",
+            Self::Ready => "ready",
+            Self::Play => "play",
+            Self::Tail => "tail",
+            Self::Closing => "closing",
+            Self::Result => "result",
+        }
+    }
+}
+
+/// What drew a frame of its state (dev-tools).
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Drew {
+    /// Nothing the state distinguishes.
+    Plain,
+    /// The state's skin.
+    Skin,
+    /// The built-in presentation.
+    BuiltIn,
+    /// The loading state's pending presentation.
+    Pending,
+    /// The built-in presentation after the skin could not draw.
+    Fallback,
+    /// The built-in page, its skin refused in this frame.
+    Refused,
+    /// The decision screen's page after its lifetime ended.
+    Ended,
+}
+
+#[cfg(feature = "dev-tools")]
+impl Drew {
+    /// Its name in a record's line.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::Skin => "skin",
+            Self::BuiltIn => "built-in",
+            Self::Pending => "pending",
+            Self::Fallback => "fallback",
+            Self::Refused => "refused",
+            Self::Ended => "ended",
+        }
+    }
+}
+
+/// A frame's state, the lifetime of that state it belongs to, and what drew
+/// it (dev-tools).
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Stage {
+    /// The state.
+    pub state: State,
+    /// Its lifetime: the selection's, the decision screen's, the loading
+    /// state's, the play state's origin in µs, the result's number; 0 for
+    /// a state without one.
+    pub lifetime: u64,
+    /// What drew it.
+    pub drew: Drew,
+}
+
+#[cfg(feature = "dev-tools")]
+impl Stage {
+    /// A stage of `state` with no lifetime, drawn plainly.
+    #[must_use]
+    pub const fn plain(state: State) -> Self {
+        Self {
+            state,
+            lifetime: 0,
+            drew: Drew::Plain,
+        }
+    }
+}
+
+/// Why the hold of a loading lifetime's first frame ended (dev-tools).
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HoldEnd {
+    /// The skin's loading presentation could draw.
+    Skin,
+    /// Its bound passed.
+    Bound,
+    /// The image on the screen was no longer the one last presented.
+    Image,
+    /// The device was lost.
+    DeviceLost,
+}
+
+#[cfg(feature = "dev-tools")]
+impl HoldEnd {
+    /// Its name in a record's line.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Skin => "skin",
+            Self::Bound => "bound",
+            Self::Image => "image",
+            Self::DeviceLost => "device-lost",
+        }
+    }
+}
+
+/// The time the render thread held a loading lifetime's first frame
+/// (dev-tools): from its first held wait to the end of its last.
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HoldStamp {
+    /// The loading lifetime.
+    pub lifetime: u64,
+    /// When the first held wait began.
+    pub from: TimeUs,
+    /// When the last held wait ended.
+    pub to: TimeUs,
+    /// Why the hold ended, once it has.
+    pub ended_by: Option<HoldEnd>,
+}
+
+/// The play state a frame at chart time `t` with view `v` drew: READY
+/// before the attempt's start, Closing once it began, the tail once the
+/// evaluation completed or nothing plays, the play otherwise (dev-tools).
+#[cfg(feature = "dev-tools")]
+#[must_use]
+pub fn play_phase(t: TimeUs, v: &ViewStamp) -> State {
+    let before_play = v.ready.is_some_and(|(_, start)| t < start);
+    match (v.closing.is_some(), v.complete, v.playing, before_play) {
+        (true, ..) => State::Closing,
+        (false, _, true, false) => State::Play,
+        (false, true, ..) | (false, false, false, false) => State::Tail,
+        (false, false, _, true) => State::Ready,
     }
 }
 
@@ -1653,6 +1839,10 @@ mod frame_tests {
             presented_at: TimeUs(at),
             #[cfg(feature = "dev-tools")]
             skin_loading: None,
+            #[cfg(feature = "dev-tools")]
+            stage: super::Stage::plain(super::State::Play),
+            #[cfg(feature = "dev-tools")]
+            hold: None,
             #[cfg(feature = "dev-tools")]
             generation: Some(1),
             timing: FrameTiming {

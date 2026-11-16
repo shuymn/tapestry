@@ -551,6 +551,18 @@ impl crate::render_side::FrameSink for RigSink {
         }
         self.decided.decision_left(record);
     }
+
+    fn play_ended(&mut self, at: bms_model::TimeUs) {
+        if let Some(f) = &mut self.frames {
+            f.play_ended(at);
+        }
+    }
+
+    fn result_taken(&mut self, at: bms_model::TimeUs) {
+        if let Some(f) = &mut self.frames {
+            f.result_taken(at);
+        }
+    }
 }
 
 impl Decided {
@@ -623,6 +635,23 @@ impl Rig {
         };
         let answer = self.link.select(ScreenKind::Decision, Some(bundle)).wait();
         assert_eq!(answer.unwrap(), Preparation::Ready);
+    }
+
+    /// [`new`](Self::new), its frames recorded into `transitions` by a
+    /// scenario's frame sink with no capture.
+    fn recording(dir: &TempDir, transitions: &crate::dev::transitions::Transitions) -> Self {
+        let frames = crate::dev::scenario::ScenarioFrames::recording(
+            crate::dev::scenario::Captures::of(Vec::new()),
+            transitions.clone(),
+        );
+        let rig = Self::bare_with(
+            crate::warp_turn::take(),
+            TARGET,
+            input::QpcClock::start(),
+            Some(frames),
+        );
+        rig.install(dir, TARGET);
+        rig
     }
 
     /// [`on`](Self::on), its frames also given to `captures`' frame sink.
@@ -2611,3 +2640,94 @@ fn recover_refusal_stands_when_the_result_restore_fails() {
 mod flow;
 // The decision skin inside the whole run, with the full configured set.
 mod integrated;
+
+/// The real render loop's frames, recorded by a scenario's frame sink:
+/// the built-in selection page, the decision skin's frames, its refused
+/// frame's fallback to the built-in presentation, and the loading state.
+/// The selection, the decision screen and the loading state are each a
+/// transition; the skin giving way to the fallback is a presentation
+/// change inside the decision screen, not a span of its own.
+#[test]
+fn the_render_loop_records_selection_decision_and_its_fallback() {
+    use crate::dev::transitions::{Record, Transitions};
+    use crate::measure::{Drew, State};
+    let dir = skin_dir();
+    let book = Transitions::with_capacity(64);
+    let rig = Rig::recording(&dir, &book);
+    rig.prepared("a", "A");
+    let from = rig.seen.len();
+    assert!(wait_until(|| rig.seen.pages(from, "select") >= 2));
+    rig.choose("a", "A", 5);
+    rig.skin_frames(0, 2);
+    rig.seen.refuse_frame.store(true, Ordering::Release);
+    assert!(wait_until(|| {
+        rig.decided
+            .stamps_of(5)
+            .iter()
+            .filter(|s| **s == crate::measure::DecisionDrawnAs::Fallback)
+            .count()
+            >= 2
+    }));
+    let from = rig.seen.len();
+    rig.link.loading().show(one_line("loading"));
+    assert!(wait_until(|| rig.seen.pages(from, "loading") >= 2));
+    rig.link.exit();
+    let records = book.records();
+    let edges: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Edge(e) => Some((
+                e.presentation,
+                e.from.state,
+                e.from.drew,
+                e.to.state,
+                e.to.drew,
+                e.to.lifetime,
+            )),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        edges,
+        [
+            (
+                false,
+                State::Selection,
+                Drew::BuiltIn,
+                State::Decision,
+                Drew::Skin,
+                5
+            ),
+            (
+                true,
+                State::Decision,
+                Drew::Skin,
+                State::Decision,
+                Drew::Fallback,
+                5
+            ),
+            // No specialization is pending: the loading state's first
+            // frame is its skin's presentation, of the rig's lifetime 0.
+            (
+                false,
+                State::Decision,
+                Drew::Fallback,
+                State::Loading,
+                Drew::Skin,
+                0
+            ),
+        ],
+        "{records:?}"
+    );
+    // The interval into the loading state ends at its span's first present.
+    let into_loading = records.iter().find_map(|r| match r {
+        Record::Edge(e) if e.to.state == State::Loading => Some(e.gap.to),
+        _ => None,
+    });
+    let loading_first = records.iter().find_map(|r| match r {
+        Record::Span(s) if s.stage.state == State::Loading => Some(s.first),
+        _ => None,
+    });
+    assert_eq!(into_loading, loading_first, "{records:?}");
+    assert!(into_loading.is_some());
+}
