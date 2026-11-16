@@ -315,13 +315,19 @@ fn runtime_number(pass: &Pass, n: i32) -> i32 {
 }
 
 /// `main_state.option(n)` on a screen's runtime: the profile's bridge, a
-/// negative id negated; false for an id it omits, noted once.
+/// negative id negated; false for an id it omits, noted once. A read of
+/// the BGA setting by a callback the import could not resolve is noted
+/// ([`super::runtime::note_bga`]).
 fn runtime_option(pass: &Pass, n: i32) -> bool {
+    let id = n.unsigned_abs().try_into().unwrap_or(i32::MAX);
+    if crate::import::ops::bga_setting(id).is_some() {
+        super::runtime::note_bga(pass, id);
+    }
     let mut screen = pass.screen.borrow_mut();
     let Some(s) = screen.as_mut() else {
         return false;
     };
-    if let Some(v) = s.option(n.unsigned_abs().try_into().unwrap_or(i32::MAX)) {
+    if let Some(v) = s.option(id) {
         return v != (n < 0);
     }
     drop(screen);

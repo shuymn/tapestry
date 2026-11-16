@@ -75,6 +75,7 @@ impl Cx<'_> {
         // Its role, from its timer and conditions alone, before any exit.
         let role = Role::Decorative.or_failure(self.record_failure(rec)?);
         if !fits {
+            self.bga_note_unread(rec)?;
             self.drop_el(role, at, NoteKind::Track(TrackWhy::Limits))?;
             return Ok(None);
         }

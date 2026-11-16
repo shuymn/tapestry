@@ -1,13 +1,14 @@
 //! `cargo xtask check-fmt`: `cargo fmt -p <package> --check` for each
-//! workspace package, then `cargo fmt --check` on the fuzz crate, which is
-//! outside the workspace. Each run passes rustfmt only one package's root
-//! files; `cargo fmt --all` passes every target's at once, and under a long
-//! checkout path Windows refuses that command line (OS error 206).
+//! workspace package, then `cargo fmt --check` on each crate outside the
+//! workspace ([`OUTSIDE`]: the fuzz crate and the test device's firmware).
+//! Each run passes rustfmt only one package's root files; `cargo fmt --all`
+//! passes every target's at once, and under a long checkout path Windows
+//! refuses that command line (OS error 206).
 //!
 //! `--all` also checks local path dependencies outside the workspace. Every
 //! local path dependency is a workspace member today, so checking the
-//! members and the fuzz crate covers what `cargo fmt --all --check` and the
-//! fuzz crate's own check did.
+//! members and the crates outside covers what `cargo fmt --all --check` and
+//! their own checks did.
 
 use std::path::Path;
 use std::process::{Child, Command, ExitCode, Stdio};
@@ -15,8 +16,12 @@ use std::process::{Child, Command, ExitCode, Stdio};
 use anyhow::Context as _;
 use cargo_metadata::MetadataCommand;
 
-/// The fuzz crate's manifest, relative to the workspace root.
-const FUZZ_MANIFEST: &str = "fuzz/Cargo.toml";
+/// The crates outside the workspace, each with its own lockfile: its name
+/// and its manifest relative to the workspace root.
+const OUTSIDE: &[(&str, &str)] = &[
+    ("fuzz", "fuzz/Cargo.toml"),
+    ("test-device-firmware", "test-device/firmware/Cargo.toml"),
+];
 
 /// The command: [`run`] on the workspace of `manifest`, reported like the
 /// other checks, each report line given to `line`.
@@ -44,12 +49,14 @@ pub fn run(manifest: &Path) -> anyhow::Result<Vec<String>> {
             .args(["-p", name, "--check"]);
         checks.push((format!("`{name}`"), cmd));
     }
-    let mut cmd = Command::new(crate::cargo());
-    cmd.arg("fmt")
-        .arg("--manifest-path")
-        .arg(root.join(FUZZ_MANIFEST))
-        .arg("--check");
-    checks.push((format!("`fuzz` ({FUZZ_MANIFEST})"), cmd));
+    for (name, path) in OUTSIDE {
+        let mut cmd = Command::new(crate::cargo());
+        cmd.arg("fmt")
+            .arg("--manifest-path")
+            .arg(root.join(path))
+            .arg("--check");
+        checks.push((format!("`{name}` ({path})"), cmd));
+    }
 
     let mut diagnostics = Vec::new();
     for (package, child) in spawn_all(checks)? {
@@ -97,7 +104,7 @@ mod tests {
     use std::process::{Command, ExitCode};
     use std::time::Duration;
 
-    use super::{main, run, spawn_all};
+    use super::{OUTSIDE, main, run, spawn_all};
     use crate::fixture::{lib, write_workspace};
 
     const FORMATTED: &str = "fn f() {}\n";
@@ -106,30 +113,36 @@ mod tests {
     /// Names the file [`slow_child`] writes when it finishes.
     const MARKER: &str = "XTASK_FMT_TEST_MARKER";
 
-    /// A workspace of `one` and `two` with the fuzz crate beside them.
+    /// A workspace of `one` and `two` with the crates outside it beside
+    /// them.
     fn workspace(dir: &Path) {
         write_workspace(dir, &[lib("one", ""), lib("two", "")]);
         for name in ["one", "two"] {
             fs::write(dir.join("crates").join(name).join("src/lib.rs"), FORMATTED).unwrap();
         }
-        let fuzz = dir.join("fuzz");
-        fs::create_dir_all(fuzz.join("src")).unwrap();
-        fs::write(
-            fuzz.join("Cargo.toml"),
-            "[package]\nname = \"fuzz\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
-             publish = false\n[workspace]\n",
-        )
-        .unwrap();
-        fs::write(fuzz.join("src/lib.rs"), FORMATTED).unwrap();
+        for (name, path) in OUTSIDE {
+            let krate = dir.join(path).parent().unwrap().to_path_buf();
+            fs::create_dir_all(krate.join("src")).unwrap();
+            fs::write(
+                krate.join("Cargo.toml"),
+                format!(
+                    "[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2024\"\n\
+                     publish = false\n[workspace]\n"
+                ),
+            )
+            .unwrap();
+            fs::write(krate.join("src/lib.rs"), FORMATTED).unwrap();
+        }
     }
 
     fn misformat(dir: &Path) {
         fs::write(dir.join("crates/two/src/lib.rs"), MISFORMATTED).unwrap();
         fs::write(dir.join("fuzz/src/lib.rs"), MISFORMATTED).unwrap();
+        fs::write(dir.join("test-device/firmware/src/lib.rs"), MISFORMATTED).unwrap();
     }
 
     #[test]
-    fn names_each_unformatted_package_and_the_fuzz_crate() {
+    fn names_each_unformatted_package_and_each_crate_outside() {
         let dir = tempfile::tempdir().unwrap();
         workspace(dir.path());
         let manifest = dir.path().join("Cargo.toml");
@@ -140,7 +153,8 @@ mod tests {
             run(&manifest).unwrap(),
             [
                 "`two` is not formatted",
-                "`fuzz` (fuzz/Cargo.toml) is not formatted"
+                "`fuzz` (fuzz/Cargo.toml) is not formatted",
+                "`test-device-firmware` (test-device/firmware/Cargo.toml) is not formatted"
             ]
         );
     }
@@ -162,7 +176,8 @@ mod tests {
             [
                 "check-fmt: `two` is not formatted",
                 "check-fmt: `fuzz` (fuzz/Cargo.toml) is not formatted",
-                "check-fmt: 2 violation(s)"
+                "check-fmt: `test-device-firmware` (test-device/firmware/Cargo.toml) is not formatted",
+                "check-fmt: 3 violation(s)"
             ]
         );
     }

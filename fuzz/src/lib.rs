@@ -107,6 +107,45 @@ pub fn bms_load(data: &[u8]) -> Result<Loaded, LoadError> {
                 loaded.chart.identity.resolved_hash,
                 mapped.chart.identity.resolved_hash
             );
+            // The BGA structure is read from the same objects at every
+            // speed, only its times mapped (its own timing may still fail
+            // at one speed alone).
+            if let (Some(one), Some(at)) = (&loaded.chart.bga, &mapped.chart.bga) {
+                assert_eq!(one.images(), at.images());
+                let images =
+                    |e: &[bms_model::BgaEvent]| e.iter().map(|e| e.image).collect::<Vec<_>>();
+                assert_eq!(
+                    images(one.base()),
+                    images(at.base()),
+                    "a mapped base event changed"
+                );
+                assert_eq!(
+                    images(one.layer()),
+                    images(at.layer()),
+                    "a mapped layer event changed"
+                );
+                assert!(
+                    one.poor()
+                        .iter()
+                        .map(|p| &p.frames)
+                        .eq(at.poor().iter().map(|p| &p.frames)),
+                    "a mapped poor sequence changed"
+                );
+                // Its times move the speed's way, as the rows' do.
+                let times = |b: &bms_model::ChartBga| {
+                    let events = b.base().iter().chain(b.layer()).map(|e| e.time);
+                    events
+                        .chain(b.poor().iter().map(|p| p.time))
+                        .collect::<Vec<_>>()
+                };
+                for (a, b) in times(one).into_iter().zip(times(at)) {
+                    if speed.twentieths() <= 20 {
+                        assert!(b >= a, "a slower BGA time is earlier");
+                    } else {
+                        assert!(b <= a, "a faster BGA time is later");
+                    }
+                }
+            }
         }
         Err(LoadError::TooLongAtSpeed { .. }) => {}
         Err(e) => panic!("loads at 1x but not at {}/20: {e}", speed.twentieths()),

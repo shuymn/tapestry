@@ -81,6 +81,15 @@
 //! the max combo is critical, whether or not the rest lowers, and so is
 //! one with an id or callee the scan cannot resolve. A cap, cancellation
 //! or the time budget refuses the candidate whatever the role.
+//!
+//! On every screen a callback a destination or its object's value reads
+//! is also scanned for the BGA setting ([`Cx::option_scan`], the same walk
+//! resolving `option` ids instead, once per callable): one whose reach
+//! reads option 40 or 41 by an id the scan resolves notes D33 for its
+//! destination, whatever becomes of it; on a selection or result runtime,
+//! one that leaves an `option` id or a callee open has its reads of 40
+//! and 41 noted when they run
+//! ([`crate::lua::runtime::RuntimeNote::BgaSetting`]).
 
 use std::collections::{BTreeMap, HashMap};
 
@@ -149,6 +158,9 @@ pub(crate) struct Lowered {
     /// its guards aside: a visibility known false folds as a JSON
     /// condition does.
     pub(crate) known: Option<i32>,
+    /// Whether its reads map the BGA setting, 40 or 41 of either sign, by
+    /// the ids the evaluation folded (D33, [`Cx::lower`]).
+    pub(crate) bga: bool,
     /// Whether its residual folded to a known value, for the conversion
     /// report.
     #[cfg(feature = "dev-tools")]
@@ -322,6 +334,7 @@ impl<'a> Lower<'a> {
                 deviates: false,
                 sentinel: false,
                 known: None,
+                bga: false,
                 #[cfg(feature = "dev-tools")]
                 constant: false,
             },
@@ -549,6 +562,7 @@ impl Lower<'_> {
             }
             "option" => {
                 let id = id.ok_or_else(unmapped)?;
+                self.out.bga |= super::names_bga(id);
                 // The mapping builds its condition: its bound charged first.
                 charge(self.an, "option", units(ops::MAX_COND_BYTES))?;
                 #[cfg(test)]
@@ -804,21 +818,23 @@ impl Lower<'_> {
             &["(", x.src(), " ", symbol(op), " ", y.src(), ")"],
         )?))
     }
-    /// The role scan of instance `i` (design.md "beatoraja Lua Skins",
-    /// roles): every expression of its whole tree and of the helpers it
-    /// calls, each id a `number` read takes resolved to the critical part
-    /// it shows. An id resolves from a numeral, a local of the same
-    /// function never assigned again and initialized by a numeral, a
-    /// captured integer, or a helper's parameter, the join of the ids its
-    /// call sites pass; a callee, to a host API, a helper or a library
-    /// function by its captured binding. While the candidate is open no
-    /// captured binding or value holds, so none resolves. A worklist: a
-    /// helper is scanned again only when a parameter's join grows, which
-    /// it does at most twice a parameter.
-    fn scan(&self, i: u32) -> R<Scan> {
+    /// The scan of instance `i` for `reads`: every expression of its whole
+    /// tree and of the helpers it calls, each id a `number` read takes
+    /// resolved to the critical part it shows (the role scan, design.md
+    /// "beatoraja Lua Skins", roles), or each id an `option` read takes to
+    /// whether it names the BGA setting (the option scan, D33). An id
+    /// resolves from a numeral, a local of the same function never
+    /// assigned again and initialized by a numeral, a captured integer, or
+    /// a helper's parameter, the join of the ids its call sites pass; a
+    /// callee, to a host API, a helper or a library function by its
+    /// captured binding. While the candidate is open no captured binding
+    /// or value holds, so none resolves. A worklist: a helper is scanned
+    /// again only when a parameter's join grows, which it does at most
+    /// twice a parameter.
+    fn scan(&self, i: u32, reads: Reads) -> R<Scan> {
         // Only play has critical parts: elsewhere every read is decorative,
-        // so nothing is scanned.
-        if self.kind != ScreenKind::Play {
+        // so no role scan is done.
+        if reads == Reads::Number && self.kind != ScreenKind::Play {
             return Ok(Scan::default());
         }
         let open = self.an.open.get().is_some();
@@ -838,7 +854,9 @@ impl Lower<'_> {
                 continue;
             };
             #[cfg(test)]
-            SCANNED.with(|n| n.set(n.get() + 1));
+            if reads == Reads::Number {
+                SCANNED.with(|n| n.set(n.get() + 1));
+            }
             // Its parameters' joins copied, one unit each.
             self.an.charge(u64::from(f.params.1)).map_err(stop)?;
             let own = params.get(&i).cloned().unwrap_or_default();
@@ -904,6 +922,10 @@ impl Lower<'_> {
                 own: &own,
                 open,
                 file,
+                part: match reads {
+                    Reads::Number => number_part,
+                    Reads::Option => bga_part,
+                },
             };
             for &e in &calls {
                 let Expr::Call { callee, args } = ast.expr(e) else {
@@ -932,12 +954,16 @@ impl Lower<'_> {
                 match resolved {
                     Some(Some(Callee::Host(api))) => {
                         let name = HOST_APIS.get(usize::from(api)).map_or("", |&(_, n)| n);
+                        let one = match reads {
+                            Reads::Number => "number",
+                            Reads::Option => "option",
+                        };
                         let read = match name {
-                            "number" => args.get(..1).unwrap_or_default(),
-                            "numbers" => args,
+                            _ if name == one => args.get(..1).unwrap_or_default(),
+                            "numbers" if reads == Reads::Number => args,
                             _ => &[],
                         };
-                        if name == "number" && args.is_empty() {
+                        if name == one && args.is_empty() {
                             out.unresolved = out.unresolved.or(Some("id"));
                         }
                         for &a in read {
@@ -994,26 +1020,41 @@ impl Lower<'_> {
     }
 }
 
-/// What the role scan of a callback found: the critical part a read
-/// shows, and the first thing it could not resolve (an `id` or a
-/// `callee`), which makes the role unknown.
+/// The host reads a scan resolves the ids of.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reads {
+    /// `number` and `numbers`, each id to the critical part it shows: the
+    /// role scan, play's alone.
+    Number,
+    /// `option`, each id to whether it names the BGA setting: the option
+    /// scan, on every screen.
+    Option,
+}
+
+/// What a scan of a callback found: the critical part a read shows (the
+/// role scan), whether a read names the BGA setting, option 40 or 41 of
+/// either sign (the option scan), and the first thing it could not
+/// resolve (an `id` or a `callee`), which makes the role unknown, or, for
+/// the option scan, leaves a read of the BGA setting possible.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct Scan {
     pub(crate) part: Option<CriticalPart>,
+    pub(crate) bga: bool,
     pub(crate) unresolved: Option<&'static str>,
 }
 
 impl Scan {
     fn unresolved(what: &'static str) -> Self {
         Self {
-            part: None,
             unresolved: Some(what),
+            ..Self::default()
         }
     }
 
     fn join(self, o: Self) -> Self {
         Self {
             part: self.part.or(o.part),
+            bga: self.bga || o.bga,
             unresolved: self.unresolved.or(o.unresolved),
         }
     }
@@ -1032,13 +1073,15 @@ struct Ids<'a> {
     /// time resolves to the join of the cell's captured value and the
     /// integer numerals written to it.
     file: u16,
+    /// What one integer id resolves to: [`number_part`] or [`bga_part`].
+    part: fn(i64) -> Scan,
 }
 
 impl Ids<'_> {
-    /// What expression `e`, read as a `number` id, shows.
+    /// What expression `e`, read as an id, resolves to.
     fn id(&self, e: u32) -> R<Scan> {
         if let Some(n) = numeral(self.ast, e) {
-            return Ok(number_part(n));
+            return Ok((self.part)(n));
         }
         let mut e = e;
         // Parentheses, each one unit.
@@ -1063,7 +1106,7 @@ impl Ids<'_> {
                     .unwrap_or(Scan::unresolved("id")))
             }
             Some(x) if x.kind == DeclKind::Local && x.init != NONE && !x.assigned => {
-                Ok(numeral(self.ast, x.init).map_or(Scan::unresolved("id"), number_part))
+                Ok(numeral(self.ast, x.init).map_or(Scan::unresolved("id"), self.part))
             }
             Some(_) => Ok(Scan::unresolved("id")),
             None if self.open => Ok(Scan::unresolved("id")),
@@ -1075,12 +1118,12 @@ impl Ids<'_> {
                 };
                 self.an.charge(units(ints.len())).map_err(stop)?;
                 let captured = match self.an.captured_upvalue(self.inst, d) {
-                    Some(Captured::Int(n)) => number_part(n),
+                    Some(Captured::Int(n)) => (self.part)(n),
                     // A cell captured nil before its first write.
                     Some(Captured::Nil) if !ints.is_empty() => Scan::default(),
                     _ => Scan::unresolved("id"),
                 };
-                Ok(ints.iter().fold(captured, |s, &n| s.join(number_part(n))))
+                Ok(ints.iter().fold(captured, |s, &n| s.join((self.part)(n))))
             }),
         }
     }
@@ -1111,7 +1154,16 @@ fn number_part(n: i64) -> Scan {
         });
     Scan {
         part,
-        unresolved: None,
+        ..Scan::default()
+    }
+}
+
+/// Whether `option(n)` reads the BGA setting, 40 or 41 of either sign
+/// (D33).
+fn bga_part(n: i64) -> Scan {
+    Scan {
+        bga: i32::try_from(n).is_ok_and(super::names_bga),
+        ..Scan::default()
     }
 }
 
@@ -1555,10 +1607,21 @@ impl Cx<'_> {
             .and_then(|l| l.analysis.as_deref())
     }
 
-    /// Lowers the callable at node `id`, converted by `conv`, a phase of
-    /// the analysis's time budget located at it.
-    fn lower(&mut self, id: u32, conv: Conv) -> Result<Lowering, ImportError> {
-        self.lower_phase(id, |cx| cx.lower_in(id, conv))
+    /// Lowers the callable at node `id` of destination record `rec`,
+    /// converted by `conv`, a phase of the analysis's time budget located
+    /// at it. One that lowers or compiles and whose reads map the BGA
+    /// setting notes D33 for `rec` at the callable ([`Self::bga_note`]),
+    /// before its consumer takes it: the evaluation folds ids the option
+    /// scan leaves open, such as `39 + 1` ([`Self::bga_callback`]).
+    fn lower(&mut self, rec: Span, id: u32, conv: Conv) -> Result<Lowering, ImportError> {
+        let l = self.lower_phase(id, |cx| cx.lower_in(id, conv))?;
+        if let Lowering::Lowered(o) | Lowering::Compiled(o, _) = &l
+            && o.bga
+        {
+            let at = self.arena_span(id);
+            self.bga_note(rec, at);
+        }
+        Ok(l)
     }
 
     /// `work` on the callable at node `id`, a phase of the analysis's time
@@ -1616,7 +1679,7 @@ impl Cx<'_> {
         let an = adm.analysis();
         let cancelled = || def.cancelled(|| None).is_err();
         let mut l = Lower::new(an, &self.custom, self.kind);
-        let scan = |l: &Lower<'_>| match l.scan(inst) {
+        let scan = |l: &Lower<'_>| match l.scan(inst, Reads::Number) {
             Ok(s) => Ok(s),
             Err(Stop::Fatal(why)) => Err(fatal(why)),
             Err(Stop::Unsupported(w)) => Ok(Scan::unresolved(match w {
@@ -1757,16 +1820,18 @@ impl Cx<'_> {
         Ok(self.callback_note(field, why))
     }
 
-    /// A text's `value` callback at node `id`, for an element of `role`:
-    /// what it folded to, or the note to drop the element with. A result
-    /// with no shape a text takes is unconsumed; an evaluation that stopped
-    /// carries its own reason.
+    /// A text's `value` callback at node `id`, for the element at `at` of
+    /// `role`: what it folded to, or the note to drop the element with. A
+    /// result with no shape a text takes is unconsumed; an evaluation that
+    /// stopped carries its own reason.
     pub(super) fn text_callback(
         &mut self,
+        at: Span,
         role: Role,
         id: u32,
     ) -> Result<Result<TextFold, NoteKind>, ImportError> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
+        self.bga_callback(at, id)?;
         // Its reads decide its role before it folds.
         let role = self.callback_role(id, "value", role)?;
         match self.lower_phase(id, |cx| cx.fold_text(id))? {
@@ -1785,6 +1850,7 @@ impl Cx<'_> {
                             deviates: false,
                             sentinel: false,
                             known: None,
+                            bga: false,
                             #[cfg(feature = "dev-tools")]
                             constant: matches!(fold, TextFold::Literal(_)),
                         }),
@@ -1865,7 +1931,7 @@ impl Cx<'_> {
         an.clock
             .enter(crate::lua::callback::Phase::Scan, Some(id))
             .map_err(time)?;
-        let r = Lower::new(an, &self.custom, self.kind).scan(inst);
+        let r = Lower::new(an, &self.custom, self.kind).scan(inst, Reads::Number);
         let left = an.clock.leave().map_err(time);
         let scan = match r {
             Ok(s) => s,
@@ -1884,6 +1950,44 @@ impl Cx<'_> {
         Ok(role)
     }
 
+    /// The option scan of the callable at node `id` (D33,
+    /// [`Lower::scan`] resolving `option` ids): whether its reach reads the
+    /// BGA setting by an id the scan resolves, and whether it leaves an
+    /// `option` id or a callee open (an untagged closure leaves everything
+    /// open). Once per callable instance for the import, each a phase of
+    /// the analysis's time budget located at the callable (a cap or
+    /// cancellation fatal); a role scan of the same callable is its own.
+    pub(super) fn option_scan(&mut self, id: u32) -> Result<(bool, bool), ImportError> {
+        let (Some(an), Some((_, inst))) = (self.analysis(), self.callable_at(id)) else {
+            return Ok((false, true));
+        };
+        if inst == NONE {
+            return Ok((false, true));
+        }
+        if let Some(&s) = self.option_scans.get(&inst) {
+            return Ok(s);
+        }
+        let fatal = |why| ImportError::Lua {
+            at: Some(self.def.loc(id)),
+            why,
+        };
+        let time = |w| fatal(sentinel(w).unwrap_or(LuaWhy::Limit(LuaLimit::AnalysisTime)));
+        an.clock
+            .enter(crate::lua::callback::Phase::Scan, Some(id))
+            .map_err(time)?;
+        let r = Lower::new(an, &self.custom, self.kind).scan(inst, Reads::Option);
+        let left = an.clock.leave().map_err(time);
+        let scan = match r {
+            Ok(s) => s,
+            Err(Stop::Fatal(why)) => return Err(fatal(why)),
+            Err(Stop::Unsupported(_)) => Scan::unresolved("callee"),
+        };
+        left?;
+        let s = (scan.bga, scan.unresolved.is_some());
+        self.option_scans.insert(inst, s);
+        Ok(s)
+    }
+
     /// An element's `draw` callback, or one of its `op` items, at node
     /// `id` in `field`, for an element of `role` at `at`: its condition
     /// joined to `conds` (its guards first), or `Ok(false)` when it is
@@ -1898,7 +2002,7 @@ impl Cx<'_> {
     ) -> Result<bool, ImportError> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
         let critical = role != Role::Decorative;
-        let why = match self.lower(id, Conv::Truthy) {
+        let why = match self.lower(at, id, Conv::Truthy) {
             Ok(Lowering::Lowered(l)) => {
                 self.lowered_outcome((c, id), field, role, &l);
                 #[cfg(test)]
@@ -2012,6 +2116,9 @@ impl Cx<'_> {
         } else {
             Some(self.compile(&gate.join(" && "), Ty::Bool, at)?)
         };
+        // Its reads of the BGA setting are noted as they run when the import
+        // could not resolve them.
+        let (_, option_open) = self.option_scan(id)?;
         let k = self.outputs.len();
         self.outputs.push(ty);
         // Its constructor in its file's tree: the same in every import of
@@ -2034,6 +2141,7 @@ impl Cx<'_> {
                 at,
                 ty,
                 gate,
+                option_open,
             });
         }
         self.outcome((c, id), field, role, (Disposition::Runtime, None));
@@ -2081,7 +2189,8 @@ impl Cx<'_> {
         conv: Conv,
     ) -> Result<Option<NumberValue>, ImportError> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
-        let (why, scan) = match self.lower(id, conv) {
+        self.bga_callback(at, id)?;
+        let (why, scan) = match self.lower(at, id, conv) {
             Ok(Lowering::Lowered(l)) => {
                 let role = l
                     .part
@@ -2137,7 +2246,7 @@ impl Cx<'_> {
                         why,
                         Scan {
                             part: l.part,
-                            unresolved: None,
+                            ..Scan::default()
                         },
                     ),
                 }
@@ -2178,7 +2287,8 @@ impl Cx<'_> {
         base: Role,
     ) -> Result<Option<SliderValue>, ImportError> {
         let c = self.callable_at(id).map_or(NONE, |(c, _)| c);
-        let (why, scan) = match self.lower(id, Conv::Float) {
+        self.bga_callback(at, id)?;
+        let (why, scan) = match self.lower(at, id, Conv::Float) {
             Ok(Lowering::Compiled(l, prog)) => {
                 let role = l.part.map_or(base, Role::Critical);
                 return Ok(Some(SliderValue {
@@ -2193,7 +2303,7 @@ impl Cx<'_> {
                 Unsupported::Type,
                 Scan {
                     part: l.part,
-                    unresolved: None,
+                    ..Scan::default()
                 },
             ),
             Ok(Lowering::Unsupported(why, scan)) => (why, scan),
@@ -2465,7 +2575,7 @@ impl Cx<'_> {
         let (c, inst) = self.callable_at(id).unwrap_or((NONE, NONE));
         let capped = end.settles_by_cap(last.saturating_mul(1000));
         let why = if capped {
-            match self.lower(id, Conv::Timer) {
+            match self.lower(at, id, Conv::Timer) {
                 // An object the source removes never calls it: compiled to
                 // nothing, the element on the screen's timer, by which it
                 // is never drawn.

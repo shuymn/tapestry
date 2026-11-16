@@ -413,6 +413,58 @@ fn a_system_image_is_removed_too() {
     assert_eq!(invoked(&mut p, 1_000, &[]), 1);
 }
 
+/// An image under `bgaon`, answered as off (D33), after a program
+/// condition: the source removes it at installation, so the condition,
+/// consumed first, is recorded as removed and never compiled, scheduled
+/// or invoked; under `draw = 41` likewise. Without `bgaon` it runs.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn an_image_under_bga_on_is_removed() {
+    use skin_beatoraja::NoteKind;
+    let program = "function() return ms.time() >= 0 end";
+    for fields in [
+        format!("op = {{ {program}, \"bgaon\" }},"),
+        format!("op = {{ {program} }}, draw = 41,"),
+    ] {
+        let body = dst("i", &fields);
+        let i = import(&body).unwrap_or_else(|e| panic!("{e:?}"));
+        // Never compiled: the callable's own outcome stays classified.
+        assert_eq!(i.callbacks, [Disposition::ClassifiedOnly], "{fields}");
+        // This occurrence is recorded as removed at installation.
+        let d = folder(&skin(&body));
+        let facts = skin_beatoraja::ImportFacts::unavailable(skin_model::ScreenKind::Play);
+        let s = skin_beatoraja::lua::survey::survey(
+            d.path(),
+            "s.luaskin",
+            &facts,
+            &Cancel::new(),
+            false,
+        );
+        let ops: Vec<(String, Option<String>)> = s
+            .consumers
+            .iter()
+            .filter(|c| c.field == "op")
+            .map(|c| (c.disposition.clone(), c.reason.clone()))
+            .collect();
+        assert_eq!(ops.len(), 1, "{fields}: {ops:?}");
+        assert!(
+            ops[0]
+                .0
+                .contains("an object the source removes at installation"),
+            "{fields}: {ops:?}"
+        );
+        let kinds = common::kinds(&i.imported.report);
+        assert!(
+            !kinds.iter().any(|k| matches!(k, NoteKind::Schedule { .. })),
+            "{fields}: {kinds:?}"
+        );
+        let mut p = played(&body);
+        assert_eq!(invoked(&mut p, 1_000, &[]), 0, "{fields}");
+    }
+    let mut p = played(&dst("i", &format!("op = {{ {program} }},")));
+    assert_eq!(invoked(&mut p, 1_000, &[]), 1);
+}
+
 /// An image whose `src` names no source, its id held by a later number
 /// too: the image is the destination's object, and the source makes none
 /// of it, so the destination draws nothing and its `draw` is never

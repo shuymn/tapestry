@@ -6,7 +6,7 @@
 //! ([`super::callback_tests::outcome`]).
 
 use super::callback_tests::{gauge, image, outcome, reader_entry, skin, writer_chunk};
-use super::{Disposition, LuaWhy, Unsupported};
+use super::{Disposition, LuaLimit, LuaWhy, Unsupported};
 use crate::error::ImportError;
 use crate::import::callback::LOWERED;
 
@@ -622,5 +622,357 @@ fn a_number_for_a_string_parameter_stays_in_the_subset() {
         "",
         "function() return string.sub(\"abc\", \"2\") end",
         false,
+    );
+}
+
+/// Checks that `d` opens the candidate at line `line` of the skin, where
+/// the walk meets the construct outside the subset: the critical reader
+/// refuses there for [`Unsupported::Interference`].
+#[track_caller]
+fn opens_at(pre: &str, draw: &str, line: u32) {
+    match outcome(&beside(pre, draw), &[]).0 {
+        Err(ImportError::Lua {
+            why:
+                LuaWhy::Critical {
+                    field: "draw",
+                    why: Unsupported::Interference,
+                },
+            at: Some(at),
+        }) => assert_eq!(
+            (at.file.as_str(), at.line),
+            ("s.luaskin", line),
+            "{pre} / {draw}"
+        ),
+        other => panic!("{pre} / {draw}: {other:?}"),
+    }
+}
+
+#[test]
+fn a_local_assigned_numbers_only_is_a_number() {
+    // GenericTheme's TOTAL shape: a local assigned again, only ever a
+    // number, keeps arithmetic and `..` in the subset.
+    closed(
+        "",
+        "function()\n\
+           local p = 368 / 74 * 100\n\
+           p = math.ceil(p * 100) / 100\n\
+           return (p .. \"%\") ~= \"\"\n\
+         end",
+    );
+    // So does a loop's: each pass reads the kinds the last one found.
+    closed(
+        "",
+        "function()\n\
+           local s = 0\n\
+           for i = 1, 3 do s = s + i end\n\
+           return s > 2\n\
+         end",
+    );
+}
+
+#[test]
+fn a_local_s_kind_joins_every_value_it_is_given() {
+    let d = d_line("");
+    // A number in one branch and a table in another: the arithmetic opens,
+    // at its first site under the converged kind (line d + 2), before the
+    // site the assignment's own pass would meet first (line d + 4).
+    opens_at(
+        "",
+        "function(u)\n\
+           local a = 1\n\
+           local x = a + 1\n\
+           if u then a = {} end\n\
+           return a * 2 > x\n\
+         end",
+        d + 2,
+    );
+    // A callable in one branch and a table in another: the call opens.
+    opens_at(
+        "",
+        "function(u)\n\
+           local f = string.len\n\
+           if u then f = {} end\n\
+           return f(\"ab\") > 0\n\
+         end",
+        d + 3,
+    );
+}
+
+#[test]
+fn joined_closures_lose_their_refinement() {
+    let pre = "local function h1() return 1 end\nlocal function h2() return 2 end";
+    let d = d_line(pre);
+    // Two different helpers: the callee is no one closure, so the call
+    // opens.
+    opens_at(
+        pre,
+        "function(u)\n\
+           local f = h1\n\
+           if u then f = h2 end\n\
+           return f() > 0\n\
+         end",
+        d + 3,
+    );
+    // The same helper on both paths keeps it.
+    closed(
+        pre,
+        "function(u)\n\
+           local f = h1\n\
+           if u then f = h1 end\n\
+           return f() > 0\n\
+         end",
+    );
+}
+
+#[test]
+fn a_kind_found_in_a_later_pass_reaches_earlier_reads() {
+    // In the loop, `a + 1` reads `a` before `a` takes `b`'s kind, and `b`
+    // takes a table after that: only the second pass gives `a` the table,
+    // and the read then opens, at the loop's line. Neither one pass nor the
+    // reporting pass alone sees it there.
+    opens_at(
+        "",
+        "function()\n\
+           local a, b = 1, 1\n\
+           for i = 1, 2 do local x = a + 1 a = b b = {} end\n\
+           return true\n\
+         end",
+        d_line("") + 2,
+    );
+}
+
+#[test]
+fn a_local_another_function_assigns_is_unknown() {
+    // `g` assigns `a` as an upvalue, so `a` may be anything: comparing it
+    // with an unknown value opens at that comparison (line d + 2), before
+    // the walk meets `g`'s function (line d + 3).
+    opens_at(
+        "",
+        "function(u)\n\
+           local a = 1\n\
+           local x = a == u\n\
+           local g = function() a = {} end\n\
+           return x\n\
+         end",
+        d_line("") + 2,
+    );
+}
+
+/// `n` locals each assigned the next, the last a table, in one loop: the
+/// table reaches the first local one pass at a time.
+fn chain(n: usize) -> String {
+    let names = (0..n).map(|k| format!("a{k}")).collect::<Vec<_>>();
+    let steps = (0..n - 1)
+        .map(|k| format!("a{k} = a{}", k + 1))
+        .collect::<Vec<_>>()
+        .join(" ");
+    skin(
+        "",
+        &image(&format!(
+            "function()\n\
+               local {} = {}\n\
+               for i = 1, 2 do {steps} a{} = {{}} end\n\
+               return true\n\
+             end",
+            names.join(", "),
+            vec!["1"; n].join(", "),
+            n - 1
+        )),
+    )
+}
+
+/// The most kind-only passes one body took importing `entry`, and
+/// whether a body reached its bound.
+fn passes(entry: &str) -> (usize, bool) {
+    super::effects::PASSES.with(|c| c.set((0, false)));
+    work(entry);
+    super::effects::PASSES.with(std::cell::Cell::get)
+}
+
+#[test]
+fn the_kind_passes_converge_within_their_bound_and_are_charged() {
+    // 190 locals (Lua allows 200 a function, a numeric `for` takes some)
+    // and the table one local further each pass: it reaches `a0` in pass
+    // 190 and pass 191 changes nothing, far inside the bound of
+    // 8 * 190 + 1, which no body reaches.
+    assert_eq!(passes(&chain(2)), (3, false));
+    assert_eq!(passes(&chain(190)), (191, false));
+    // Each pass a walk of the body's 190 statements, all charged.
+    let (short, long) = (work(&chain(2)), work(&chain(190)));
+    assert!(long - short >= 190 * 190, "{short} {long}");
+}
+
+/// A helper that opens at its second line, line `d_line(HELPER) - 2`.
+const HELPER: &str = "local function h()\nreturn {} + 1\nend";
+
+#[test]
+fn a_helper_the_kind_passes_reach_is_reported_by_its_own_walk() {
+    let d = d_line(HELPER);
+    // `bad` opens at line d + 2. The kind passes, run for `a`, reach `h`
+    // first, and record nothing there: `h`'s own open place comes after.
+    opens_at(
+        HELPER,
+        "function()\n\
+           local a = 1\n\
+           local bad = {} + 1\n\
+           a = 2\n\
+           return h()\n\
+         end",
+        d + 2,
+    );
+    // Alone, `h` opens at its own line: the kind passes' walk of it does
+    // not stand for the diagnosing one.
+    opens_at(
+        HELPER,
+        "function()\n\
+           local a = 1\n\
+           a = 2\n\
+           return h()\n\
+         end",
+        d - 2,
+    );
+    // Reached first by the diagnosing pass (no local assigned again), the
+    // same.
+    opens_at(HELPER, "function()\n  return h()\nend", d - 2);
+    // A helper whose own kind passes reach a second one: the first's
+    // `bad` (line 3 of `pre`) comes before the second's open place.
+    let pre = "local function h2() return {} + 1 end\n\
+               local function h1()\n\
+               local a = 1\n\
+               local bad = {} + 1\n\
+               a = 2\n\
+               return h2()\n\
+               end";
+    opens_at(pre, "function() return h1() end", d_line(pre) - 4);
+    // A writing helper the kind passes reach first still makes its caller a
+    // writer.
+    let latch = "local max_timer = 0\n\
+                 local function latch() max_timer = ms.timer(1) return true end";
+    let (r, callbacks) = outcome(
+        &skin(
+            latch,
+            &image("function() local a = 1 a = 2 return latch() end"),
+        ),
+        &[],
+    );
+    r.unwrap();
+    assert_eq!(callbacks, [Disposition::Replaced(Unsupported::Writes)]);
+}
+
+#[test]
+fn a_helper_s_results_are_charged_before_they_are_copied() {
+    // `h` returns three values: their charge meets an exhausted allowance
+    // and refuses with the work cap, before any copy of them starts.
+    let pre = "local function h() return 1, 2, 3 end";
+    super::tests::fail_next(Some("walk results"));
+    let r = outcome(&beside(pre, "function() return h() == 1 end"), &[]).0;
+    let copied = super::tests::site("walk results").1;
+    super::tests::fail_next(None);
+    match r {
+        Err(ImportError::Lua {
+            why: LuaWhy::Limit(LuaLimit::AnalysisWork),
+            ..
+        }) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(copied, 0);
+    // Without the exhausted allowance, the copies start and it imports.
+    closed(pre, "function() return h() == 1 end");
+    assert!(super::tests::site("walk results").1 > 0);
+}
+
+#[test]
+fn assignments_of_every_shape_join_their_kinds() {
+    let d = d_line("");
+    // A swap: `a` takes `b`'s table.
+    opens_at(
+        "",
+        "function(u)\n\
+           local a, b = 1, {}\n\
+           if u then a, b = b, a end\n\
+           return a + 1 > 0\n\
+         end",
+        d + 3,
+    );
+    closed(
+        "",
+        "function(u)\n\
+           local a, b = 1, 2\n\
+           if u then a, b = b, a end\n\
+           return a + b > 0\n\
+         end",
+    );
+    // An expanded call: each target takes its own result.
+    let two = "local function two() return 1, {} end";
+    opens_at(
+        two,
+        "function()\n\
+           local a, b = 0, 0\n\
+           a, b = two()\n\
+           return b + 1 > 0\n\
+         end",
+        d_line(two) + 3,
+    );
+    closed(
+        two,
+        "function()\n\
+           local a, b = 0, 0\n\
+           a, b = two()\n\
+           return a + 1 > 0\n\
+         end",
+    );
+    // `until` sees the body's local, assigned a table in it.
+    opens_at(
+        "",
+        "function()\n\
+           local x = 1\n\
+           repeat local x = 2 x = {} until x + 1 > 0\n\
+           return true\n\
+         end",
+        d + 2,
+    );
+    closed(
+        "",
+        "function()\n\
+           local x = {}\n\
+           repeat local x = 2 x = 3 until x + 1 > 0\n\
+           return true\n\
+         end",
+    );
+    // A shadowed local of the same name keeps its own kind.
+    closed(
+        "",
+        "function()\n\
+           local a = 1\n\
+           do local a = {} a = {} end\n\
+           a = 2\n\
+           return a + 1 > 0\n\
+         end",
+    );
+    opens_at(
+        "",
+        "function()\n\
+           local a = {}\n\
+           do local a = 1 a = 2 end\n\
+           a = {}\n\
+           return a + 1 > 0\n\
+         end",
+        d + 4,
+    );
+    // A generic `for`'s variable assigned again.
+    opens_at(
+        "",
+        "function()\n\
+           for k in ipairs({ 1 }) do k = {} local y = k + 1 end\n\
+           return true\n\
+         end",
+        d + 1,
+    );
+    closed(
+        "",
+        "function()\n\
+           for k in ipairs({ 1 }) do k = k + 1 local y = k * 2 end\n\
+           return true\n\
+         end",
     );
 }
