@@ -1896,6 +1896,69 @@ fn on_failure_reads_closes_by_default_and_round_trips() {
     assert_eq!(Settings::load(&root).unwrap().player, s.player);
 }
 
+/// `[bga]` in `player.toml` (design.md "Settings Files"): a file without it
+/// reads `mode = "on"` and `expand = "keep-aspect"` and writes no `[bga]`
+/// back; each value of each key reads as itself and is written back as
+/// read; a value naming none, and an unknown key, refuse the file with an
+/// error naming the key and the value.
+#[test]
+fn bga_mode_parses_and_refuses_unknown() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    fs::write(root.player_settings(), "preset = \"wide\"\n").unwrap();
+    let read = Settings::load(&root).unwrap().player;
+    assert_eq!(
+        read.bga,
+        BgaSettings {
+            mode: BgaMode::On,
+            expand: BgaExpand::KeepAspect,
+        }
+    );
+    save_settings(&root.player_settings(), &read).unwrap();
+    let text = fs::read_to_string(root.player_settings()).unwrap();
+    assert!(!text.contains("[bga]"), "{text}");
+    let modes = [
+        ("on", BgaMode::On),
+        ("autoplay", BgaMode::Autoplay),
+        ("off", BgaMode::Off),
+    ];
+    let expands = [
+        ("full", BgaExpand::Full),
+        ("keep-aspect", BgaExpand::KeepAspect),
+        ("off", BgaExpand::Off),
+    ];
+    for (m, mode) in modes {
+        for (e, expand) in expands {
+            let text = format!("preset = \"wide\"\n[bga]\nmode = \"{m}\"\nexpand = \"{e}\"\n");
+            fs::write(root.player_settings(), &text).unwrap();
+            let read = Settings::load(&root).unwrap().player;
+            assert_eq!(read.bga, BgaSettings { mode, expand }, "{text}");
+            save_settings(&root.player_settings(), &read).unwrap();
+            assert_eq!(Settings::load(&root).unwrap().player, read, "{text}");
+        }
+    }
+    for (text, key, value) in [
+        ("[bga]\nmode = \"auto\"\n", "mode", "\"auto\""),
+        ("[bga]\nmode = \"ON\"\n", "mode", "\"ON\""),
+        (
+            "[bga]\nexpand = \"keep_aspect\"\n",
+            "expand",
+            "\"keep_aspect\"",
+        ),
+        ("[bga]\nmode = 1\n", "mode", "1"),
+        ("[bga]\nstretch = \"full\"\n", "stretch", "stretch"),
+    ] {
+        fs::write(root.player_settings(), text).unwrap();
+        let e = Settings::load(&root).unwrap_err();
+        assert!(matches!(e, SettingsError::Parse(_)), "{text}: {e:?}");
+        let message = Chain(&e).to_string();
+        assert!(
+            message.contains(key) && message.contains(value),
+            "{text}: {message}"
+        );
+    }
+}
+
 /// `language` in `player.toml`: a missing key gives `ja`, `ja` reads as
 /// itself, a value naming no language refuses the file with an error
 /// naming the key and the value, and a written file holds the language

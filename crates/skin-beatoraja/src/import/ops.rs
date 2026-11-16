@@ -871,7 +871,7 @@ mod tests {
                 }
             }
         }
-        assert_eq!(exprs.len(), 126);
+        assert_eq!(exprs.len(), 128);
         let joined: usize =
             exprs.iter().map(|e| e.len() + 2).sum::<usize>() + 4 * (exprs.len() - 1);
         assert!(joined > skin_model::MAX_SOURCE_BYTES, "{joined}");
@@ -879,7 +879,7 @@ mod tests {
 
     /// The chart's metadata conditions read the `chart.*` fields, each by
     /// name too, none of them D4, and the conditions an unknown value's 0
-    /// would hold are guarded by its validity. 171 stays unsupported.
+    /// would hold are guarded by its validity, 171 (`song_bga`) among them.
     #[test]
     fn chart_metadata_conditions_map() {
         let none = BTreeMap::new();
@@ -893,6 +893,11 @@ mod tests {
                 170,
                 "song_no_bga".to_owned(),
                 "chart.bga_valid && !chart.bga".to_owned(),
+            ),
+            (
+                171,
+                "song_bga".to_owned(),
+                "chart.bga_valid && chart.bga".to_owned(),
             ),
             (
                 180,
@@ -945,8 +950,6 @@ mod tests {
         }
         assert_eq!(numeric(192, &none), Cond::Unsupported(192));
         assert_eq!(numeric(-193, &none), Cond::Unsupported(-193));
-        assert_eq!(numeric(171, &none), Cond::Unsupported(171));
-        assert_eq!(numeric(-171, &none), Cond::Unsupported(-171));
     }
 
     /// The judgment class options on the result screen are play's
@@ -1059,6 +1062,53 @@ mod tests {
         assert_eq!(numeric(-900, &items), Cond::Fold(false));
         assert_eq!(numeric(901, &items), Cond::Undefined(901));
         assert_eq!(numeric(300, &items), Cond::Unsupported(300));
+    }
+
+    /// The BGA setting folds options 40 and 41 on every screen, by number,
+    /// sign and name, from the setting alone: shown with `on`, with
+    /// `autoplay` in an autoplay session; hidden with `off`, autoplay or
+    /// not, and with `autoplay` otherwise. It wins over items declared with
+    /// its numbers and the opposite values.
+    #[test]
+    fn the_bga_setting_folds_options_40_and_41() {
+        use super::super::BgaMode::{Autoplay, Off, On};
+        let items = BTreeMap::from([(40, true), (41, false)]);
+        for (mode, autoplay, shown) in [
+            (On, false, true),
+            (Off, true, false),
+            (Autoplay, true, true),
+            (Autoplay, false, false),
+        ] {
+            let bga = Bga { mode, autoplay };
+            let at = format!("{mode:?} {autoplay}");
+            for kind in [
+                ScreenKind::Play,
+                ScreenKind::Selection,
+                ScreenKind::Decision,
+                ScreenKind::Result,
+            ] {
+                for (op, holds) in [(40, !shown), (-40, shown), (41, shown), (-41, !shown)] {
+                    assert_eq!(
+                        super::numeric_in(kind, op, &items, bga),
+                        Cond::Fold(holds),
+                        "{at} {kind:?} {op}"
+                    );
+                }
+                for (name, holds) in [
+                    ("bgaoff", !shown),
+                    ("!bgaoff", shown),
+                    ("bgaon", shown),
+                    ("!bgaon", !shown),
+                    ("!!bgaon", shown),
+                ] {
+                    assert_eq!(
+                        super::named_in(kind, name, bga),
+                        Some(Cond::Fold(holds)),
+                        "{at} {kind:?} {name}"
+                    );
+                }
+            }
+        }
     }
 
     /// `table_song` is a scene constant, false, by number and by name, and

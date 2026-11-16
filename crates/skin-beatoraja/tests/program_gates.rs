@@ -65,6 +65,15 @@ fn import(body: &str) -> Result<LuaImported, ImportError> {
 /// [`import`], the skin's folder holding `files` too, each a name and its
 /// bytes.
 fn import_files(body: &str, files: &[(&str, &[u8])]) -> Result<LuaImported, ImportError> {
+    import_in(body, files, skin_beatoraja::Bga::default())
+}
+
+/// [`import_files`] under the BGA setting `bga`.
+fn import_in(
+    body: &str,
+    files: &[(&str, &[u8])],
+    bga: skin_beatoraja::Bga,
+) -> Result<LuaImported, ImportError> {
     let d = folder(&skin(body));
     for (name, bytes) in files {
         common::write(d.path(), name, bytes);
@@ -74,6 +83,7 @@ fn import_files(body: &str, files: &[(&str, &[u8])]) -> Result<LuaImported, Impo
     FOLDERS.with(|f| f.borrow_mut().push(d));
     let config = Config {
         options: vec![Some(905)],
+        bga,
         ..Config::default()
     };
     common::lua_play(&h, &config, &cancel)
@@ -411,6 +421,76 @@ fn a_system_image_is_removed_too() {
         "op = { function() return ms.time() >= 0 end },",
     ));
     assert_eq!(invoked(&mut p, 1_000, &[]), 1);
+}
+
+/// An image under `bgaon` or `bgaoff` (by name in `op`, or by number in
+/// `draw`) after a program condition, under each BGA setting: the source
+/// removes the one whose option is false at installation, so its
+/// condition, consumed first, is recorded as removed and never compiled,
+/// scheduled or invoked; the one whose option holds is kept, its
+/// condition invoked each frame.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn an_image_under_a_false_bga_option_is_removed() {
+    use skin_beatoraja::BgaMode::{Autoplay, Off, On};
+    use skin_beatoraja::lua::survey::{Choice, survey_with};
+    use skin_beatoraja::{Bga, NoteKind};
+    let program = "function() return ms.time() >= 0 end";
+    for (mode, autoplay, shown) in [
+        (On, false, true),
+        (Off, true, false),
+        (Autoplay, true, true),
+        (Autoplay, false, false),
+    ] {
+        let bga = Bga { mode, autoplay };
+        for (fields, holds) in [
+            (format!("op = {{ {program}, \"bgaon\" }},"), shown),
+            (format!("op = {{ {program} }}, draw = 41,"), shown),
+            (format!("op = {{ {program}, \"bgaoff\" }},"), !shown),
+            (format!("op = {{ {program} }}, draw = 40,"), !shown),
+        ] {
+            let at = format!("{mode:?} {autoplay}: {fields}");
+            let body = dst("i", &fields);
+            let i = import_in(&body, &[], bga).unwrap_or_else(|e| panic!("{at}: {e:?}"));
+            let d = folder(&skin(&body));
+            let facts = skin_beatoraja::ImportFacts::unavailable(skin_model::ScreenKind::Play);
+            let choice = Choice {
+                bga,
+                ..Choice::default()
+            };
+            let s = survey_with(
+                d.path(),
+                "s.luaskin",
+                &facts,
+                &Cancel::new(),
+                false,
+                &choice,
+            );
+            let ops: Vec<(String, Option<String>)> = s
+                .consumers
+                .iter()
+                .filter(|c| c.field == "op")
+                .map(|c| (c.disposition.clone(), c.reason.clone()))
+                .collect();
+            assert_eq!(ops.len(), 1, "{at}: {ops:?}");
+            let removed = ops[0]
+                .0
+                .contains("an object the source removes at installation");
+            assert_eq!(removed, !holds, "{at}: {ops:?}");
+            if !holds {
+                // Never compiled: the callable's own outcome stays
+                // classified.
+                assert_eq!(i.callbacks, [Disposition::ClassifiedOnly], "{at}");
+                let kinds = common::kinds(&i.imported.report);
+                assert!(
+                    !kinds.iter().any(|k| matches!(k, NoteKind::Schedule { .. })),
+                    "{at}: {kinds:?}"
+                );
+            }
+            let mut p = Drawn::new(i.imported.skin, 4);
+            assert_eq!(invoked(&mut p, 1_000, &[]), u64::from(holds), "{at}");
+        }
+    }
 }
 
 /// An image whose `src` names no source, its id held by a later number

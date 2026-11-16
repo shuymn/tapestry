@@ -1896,3 +1896,136 @@ fn the_kept_vm_reads_the_player_totals() {
         "{notes:?}"
     );
 }
+
+/// The BGA settings the runtime tests run under, each with whether it
+/// shows the BGA.
+#[cfg(feature = "dev-tools")]
+fn bga_settings() -> [(skin_beatoraja::Bga, bool); 4] {
+    use skin_beatoraja::Bga;
+    use skin_beatoraja::BgaMode::{Autoplay, Off, On};
+    [
+        (
+            Bga {
+                mode: On,
+                autoplay: false,
+            },
+            true,
+        ),
+        (
+            Bga {
+                mode: Off,
+                autoplay: true,
+            },
+            false,
+        ),
+        (
+            Bga {
+                mode: Autoplay,
+                autoplay: true,
+            },
+            true,
+        ),
+        (
+            Bga {
+                mode: Autoplay,
+                autoplay: false,
+            },
+            false,
+        ),
+    ]
+}
+
+/// A selection skin's runtime and its configured pass read options 40
+/// and 41 from the BGA setting, autoplay or not, and 171 and 170 from the
+/// cursor chart's BGA flag (`selected.bga`), neither off a chart row.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_selection_runtime_reads_the_bga_setting() {
+    untimed();
+    let text = entry(
+        "local shown = ms.option(41) and not ms.option(40)",
+        &[
+            "function() return (ms.option(41) and 2 or 0) / 1 end",
+            "function() return (ms.option(40) and 2 or 0) / 1 end",
+            "function() return (shown and 3 or 1) / 1 end",
+            "function() return (ms.option(171) and 2 or 0) / 1 end",
+            "function() return (ms.option(170) and 2 or 0) / 1 end",
+        ],
+        "nil",
+    );
+    for (bga, shown) in bga_settings() {
+        let at = format!("{:?} {}", bga.mode, bga.autoplay);
+        let d = common::selection::folder("");
+        common::write(d.path(), "s.luaskin", text.as_bytes());
+        let cancel = Cancel::new();
+        let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+        let facts = ImportFacts::unavailable(ScreenKind::Selection);
+        let config = Config {
+            bga,
+            ..Config::defaults(h.header())
+        };
+        let LuaOutcome::Imported(mut i) = h.import_runtime(&config, &facts, &cancel).unwrap()
+        else {
+            panic!("{at}")
+        };
+        let n = runtime(&mut i).outputs();
+        assert_eq!(n, 5, "{at}: {:?}", i.callbacks);
+        let setting = if shown { [2, 0, 3] } else { [0, 2, 1] };
+        for (chart, flag, chart_want) in [(1, 1, [2, 0]), (1, 0, [0, 2]), (0, 0, [0, 0])] {
+            let mut f = fields(n, &[("cursor.chart", chart), ("selected.bga", flag)]);
+            runtime(&mut i).frame(&mut f, &[]);
+            let want: Vec<i32> = setting.iter().chain(&chart_want).copied().collect();
+            assert_eq!(
+                outputs(&f),
+                want,
+                "{at}, chart {chart} BGA {flag}: {:?}",
+                runtime(&mut i).status()
+            );
+        }
+    }
+}
+
+/// A result skin's runtime reads options 40 and 41 from the BGA setting.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_result_runtime_reads_the_bga_setting() {
+    untimed();
+    let tables = "local ms = require(\"main_state\")\n\
+        skin.value[2] = { id = \"r\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, \
+            digit = 4, value = function() return (ms.option(41) and 2 or 0) / 1 end }\n\
+        skin.value[3] = { id = \"q\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, \
+            digit = 4, value = function() return (ms.option(40) and 2 or 0) / 1 end }";
+    let dsts = "{ id = \"r\", dst = { { x = 0, y = 120, w = 4, h = 8 } } },\n\
+        { id = \"q\", dst = { { x = 0, y = 140, w = 4, h = 8 } } },";
+    for (bga, shown) in bga_settings() {
+        let at = format!("{:?} {}", bga.mode, bga.autoplay);
+        let d = common::result::sheet();
+        common::write(
+            d.path(),
+            "s.luaskin",
+            common::result::graph_lua(tables, dsts).as_bytes(),
+        );
+        let cancel = Cancel::new();
+        let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+        let facts = common::result::facts(None);
+        let config = Config {
+            bga,
+            ..Config::defaults(h.header())
+        };
+        let LuaOutcome::Imported(mut i) = h.import_runtime(&config, &facts, &cancel).unwrap()
+        else {
+            panic!("{at}")
+        };
+        let n = runtime(&mut i).outputs();
+        assert_eq!(n, 2, "{at}");
+        let mut f = vec![0; RESULT.fields.len() + 2 * n];
+        runtime(&mut i).frame(&mut f, &[]);
+        let out: Vec<i32> = f[RESULT.fields.len()..]
+            .iter()
+            .step_by(2)
+            .copied()
+            .collect();
+        let want = if shown { [2, 0] } else { [0, 2] };
+        assert_eq!(out, want, "{at}: {:?}", runtime(&mut i).status());
+    }
+}

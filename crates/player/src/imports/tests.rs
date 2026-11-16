@@ -972,6 +972,35 @@ fn a_lua_skin_builds_on_the_base_facts() {
     }
 }
 
+/// The session's BGA setting reaches the import: a Lua play skin reading
+/// option 41 builds for the setting and the session's autoplay, the image
+/// moved where the BGA shows (`on`, or `autoplay` under autoplay) and in
+/// place where it does not (`off` under autoplay, `autoplay` without it).
+#[test]
+fn the_session_s_bga_setting_reaches_the_import() {
+    let _serial = serial();
+    let mut r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let dir = lua_skin("if ms.option(41) then x = 500 end");
+    let c = choice(dir.path(), "play.luaskin");
+    let at = |p: &[u8], x| crate::render_common::rgb_at(p, 1_920, (x, 1_048));
+    for (request, (bga, autoplay, x)) in [
+        (game::BgaMode::On, false, 532),
+        (game::BgaMode::Off, true, 32),
+        (game::BgaMode::Autoplay, true, 532),
+        (game::BgaMode::Autoplay, false, 32),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let session = crate::imports::SkinSession { autoplay, bga };
+        let (b, _) = bundled(build(ScreenKind::Play, &c, session, &t, &Cancel::new()));
+        let p = frame(&mut r, &b, u64::try_from(request).unwrap() + 1);
+        assert_eq!(at(&p, x), RED, "{bga:?}, autoplay {autoplay}");
+        assert_ne!(at(&p, 564 - x), RED, "{bga:?}, autoplay {autoplay}");
+    }
+}
+
 /// A Lua play skin whose protected `dofile` names a part the folder does
 /// not have builds without it and draws (the caught error moves its
 /// image), so play admits charts; the same load unprotected refuses the
