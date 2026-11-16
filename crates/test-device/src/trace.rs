@@ -138,6 +138,9 @@ pub enum Body {
     /// `A`: the controller did not acknowledge the abort of report `seq` at
     /// `at`; the report was not revoked and the device reboots.
     Unacknowledged { ep: Ep, seq: u32, at: u64 },
+    /// `E`: report `seq` was dropped at `at` when the host configured its
+    /// endpoint again, without the host's ACK: withdrawn, not taken.
+    Dropped { ep: Ep, seq: u32, at: u64 },
     /// `V`: a revocation trial's reports, at k1's handoff.
     Trial(TrialRun),
     /// `L`: `count` records were dropped because the ring was full.
@@ -185,6 +188,7 @@ impl fmt::Display for Record {
             Body::Unacknowledged { ep, seq, at } => {
                 write!(f, "A {n} {} {seq} {at}", ep.name())
             }
+            Body::Dropped { ep, seq, at } => write!(f, "E {n} {} {seq} {at}", ep.name()),
             Body::Trial(t) => write!(
                 f,
                 "V {n} {} {} {} {} {}",
@@ -240,6 +244,11 @@ impl Record {
                 at: w.next()?.parse().ok()?,
             },
             "A" => Body::Unacknowledged {
+                ep: Ep::parse(w.next()?)?,
+                seq: w.next()?.parse().ok()?,
+                at: w.next()?.parse().ok()?,
+            },
+            "E" => Body::Dropped {
                 ep: Ep::parse(w.next()?)?,
                 seq: w.next()?.parse().ok()?,
                 at: w.next()?.parse().ok()?,
@@ -361,6 +370,8 @@ mod check {
         pub completion: Option<u64>,
         /// The `X` record's AVAILABLE and LENGTH, when it was revoked.
         pub revoked: Option<(bool, u16)>,
+        /// Whether an `E` record dropped it.
+        pub dropped: bool,
     }
 
     /// Why a trace cannot be used: any of these fails the row.
@@ -374,9 +385,10 @@ mod check {
         Pending { ep: Ep, seq: u32 },
         /// The trace does not end with `F`.
         NoFlush,
-        /// A completion or revocation of a report never handed.
+        /// A completion, revocation or drop of a report never handed.
         Unhanded { ep: Ep, seq: u32 },
-        /// A report handed but neither taken nor revoked by the flush.
+        /// A report handed but neither taken, revoked nor dropped by the
+        /// flush.
         Unresolved { ep: Ep, seq: u32 },
         /// A report handed twice.
         Repeated { ep: Ep, seq: u32 },
@@ -394,7 +406,7 @@ mod check {
 
     /// Reads records in order and checks them (docs/test-device.md "Timing
     /// trace"): consecutive numbers, no `L`, a terminal `F` with no `P`,
-    /// and every handed report taken or revoked.
+    /// and every handed report taken, revoked or dropped.
     #[derive(Debug, Default)]
     pub struct Check {
         next_n: Option<u32>,
@@ -446,6 +458,10 @@ mod check {
                 Body::Unacknowledged { ep, seq, .. } => {
                     self.problems.push(Problem::Unacknowledged { ep, seq });
                 }
+                Body::Dropped { ep, seq, .. } => match reports.get_mut(&(ep, seq)) {
+                    Some(e) => e.dropped = true,
+                    None => self.problems.push(Problem::Unhanded { ep, seq }),
+                },
                 Body::Trial(t) => self.trace.trials.push(t),
                 Body::Lost { count } => self.problems.push(Problem::Lost { n: r.n, count }),
                 Body::Pending { ep, seq } => self.problems.push(Problem::Pending { ep, seq }),
@@ -464,7 +480,7 @@ mod check {
             }
             for (&(ep, seq), e) in &self.trace.reports {
                 let pending = self.problems.contains(&Problem::Pending { ep, seq });
-                if e.completion.is_none() && e.revoked.is_none() && !pending {
+                if e.completion.is_none() && e.revoked.is_none() && !e.dropped && !pending {
                     self.problems.push(Problem::Unresolved { ep, seq });
                 }
             }
@@ -508,8 +524,8 @@ mod check {
             let Some(before) = self.reports.get(&(Ep::Pad, seq.wrapping_sub(1))) else {
                 return Ok(());
             };
-            // A predecessor the host never took (revoked, or not resolved)
-            // has no completion to carry.
+            // A predecessor the host never took (revoked, dropped, or not
+            // resolved) has no completion to carry.
             let taken = Some(before).filter(|prev| prev.completion.is_some());
             match (report.previous, taken) {
                 (None, None) => Ok(()),
@@ -630,6 +646,11 @@ mod tests {
                 seq: 9,
                 at: 12,
             },
+            Body::Dropped {
+                ep: Ep::Pad,
+                seq: 4,
+                at: 13,
+            },
             Body::Trial(TrialRun {
                 ep: Ep::Pad,
                 trial: 20,
@@ -707,6 +728,18 @@ mod tests {
             .finish()
             .unwrap();
         assert_eq!(ok.reports.len(), 2);
+        let dropped = Body::Dropped {
+            ep: Ep::Keyboard,
+            seq: 0,
+            at: 2,
+        };
+        assert_eq!(
+            records(&[t(0, 1), dropped, Body::Flushed])
+                .finish()
+                .map(|trace| trace.reports.len()),
+            Ok(1),
+            "a dropped report is resolved"
+        );
         assert_eq!(
             records(&[t(0, 1), c(0, 2)]).finish().unwrap_err(),
             [Problem::NoFlush]

@@ -406,6 +406,9 @@ pub struct State {
     session: u32,
     /// A line coding of [`BOOTSEL_BAUD`] arrived.
     bootsel: bool,
+    /// The host configured the device and has not reset or unconfigured
+    /// it since.
+    configured: bool,
     #[cfg(feature = "debug-faults")]
     faults: Faults,
 }
@@ -442,6 +445,7 @@ impl State {
             recovery: None,
             session: 0,
             bootsel: false,
+            configured: false,
             #[cfg(feature = "debug-faults")]
             faults: Faults::new(),
         }
@@ -588,13 +592,63 @@ impl State {
         }
     }
 
-    /// The bus configured the device: one report on each endpoint, the
-    /// current (neutral) state, whose buffer LENGTH identifies it.
+    /// The host configured the device (`SET_CONFIGURATION`), which
+    /// reinitialises each endpoint ([`State::reinitialised`]); the report
+    /// that follows on each, the current state, identifies it by its
+    /// buffer LENGTH.
     pub fn configured(&mut self, hw: &impl Hardware) {
+        self.configured = true;
         for ep in [Ep::Keyboard, Ep::Pad] {
-            self.ep(ep).dirty = true;
-            hw.kick(ep);
+            self.reinitialised(hw, ep);
         }
+    }
+
+    /// The host unconfigured the device (`SET_CONFIGURATION 0`), which
+    /// disables and reinitialises each endpoint.
+    pub fn unconfigured(&mut self, hw: &impl Hardware) {
+        self.configured = false;
+        for ep in [Ep::Keyboard, Ep::Pad] {
+            self.reinitialised(hw, ep);
+        }
+    }
+
+    /// The host selected an alternate setting of `ep`'s interface
+    /// (`SET_INTERFACE`), which reinitialises the endpoint. embassy-usb
+    /// reports a bus reset's return to setting 0 the same way without
+    /// touching the endpoints, which the reset leaves unconfigured: then
+    /// nothing happens.
+    pub fn interface_set(&mut self, hw: &impl Hardware, ep: Ep) {
+        if self.configured {
+            self.reinitialised(hw, ep);
+        }
+    }
+
+    /// embassy-rp rewrote `ep`'s buffer control as it enabled or disabled
+    /// the endpoint: AVAILABLE clear and the register's PID DATA1, so the
+    /// next report goes as DATA0, where the host restarts too. The host
+    /// did not acknowledge anything: a pending report is dropped, never
+    /// taken (`E`), and the release of whatever the host may still hold
+    /// is owed ahead of any queued input, the current state after it.
+    /// The firmware calls this before any completion poll can see the
+    /// cleared AVAILABLE. Nothing while recovering.
+    fn reinitialised(&mut self, hw: &impl Hardware, ep: Ep) {
+        if self.recovering() {
+            return;
+        }
+        let e = self.ep(ep);
+        let pending_pressed = e.assoc.pending().is_some() && !e.pending_neutral;
+        if let Some(seq) = e.assoc.revoked() {
+            if e.neutral_seq == Some(seq) {
+                e.neutral_seq = None;
+            }
+            let at = self.out(hw.now());
+            self.trace(hw, Body::Dropped { ep, seq, at });
+        }
+        let e = self.ep(ep);
+        let owed = u8::from(!e.delivered_neutral || pending_pressed);
+        e.owed = e.owed.max(owed);
+        e.dirty = true;
+        hw.kick(ep);
     }
 
     /// What `ep` sends next, applying its change to the held state. The
@@ -990,7 +1044,11 @@ impl State {
     }
 
     /// The bus reset: the link's connection ends and the lease with it.
+    /// embassy-rp disables the endpoints but leaves their buffers, which
+    /// the disarm revokes; the configuration that follows reinitialises
+    /// them.
     pub fn bus_reset(&mut self, hw: &impl Hardware) {
+        self.configured = false;
         self.link_lost();
         self.disarm(hw, Reason::Reset);
     }

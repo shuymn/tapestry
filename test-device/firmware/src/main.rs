@@ -32,6 +32,7 @@ use embassy_usb::class::hid::{
     Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, State as HidState,
 };
 use embassy_usb::control::{OutResponse, Recipient, Request, RequestType};
+use embassy_usb::types::InterfaceNumber;
 use embassy_usb::{Builder, Config, Handler};
 use static_cell::ConstStaticCell;
 use test_device::boot::{self, Action, Cause};
@@ -61,8 +62,10 @@ const FEED_EVERY: Duration = Duration::from_millis(250);
 const LEASE_TICK: Duration = Duration::from_micros(500);
 /// The longest `detach`.
 const MAX_DETACH_MS: u32 = 10_000;
-/// The link's CDC communication interface, after the keyboard's (0) and
-/// the pad's (1).
+/// The interfaces: the keyboard's, the pad's, and the link's CDC
+/// communication interface (the module doc).
+const KEYBOARD_INTERFACE: u8 = 0;
+const PAD_INTERFACE: u8 = 1;
 const LINK_INTERFACE: u16 = 2;
 
 type Line = heapless::String<{ protocol::MAX_LINE }>;
@@ -226,10 +229,13 @@ async fn main(_spawner: Spawner) {
     .await;
 }
 
-/// The bus events that disarm, the configuration that identifies the
-/// endpoints, and the link's control requests, taken as they arrive
-/// whatever the link's reader waits on. Registered before the classes, it
-/// sees each request first and leaves it to the CDC class.
+/// The bus events that disarm, the configuration requests that
+/// reinitialise the endpoints, and the link's control requests. embassy-usb
+/// calls each hook in the same synchronous step as the change it reports,
+/// so the logic hears of a reinitialised endpoint before any completion
+/// poll and of a link request whatever the link's reader waits on.
+/// Registered before the classes, it sees each request first and leaves
+/// it to the CDC class.
 struct Bus {
     state: &'static RefCell<State>,
 }
@@ -257,9 +263,21 @@ impl Handler for Bus {
     }
 
     fn configured(&mut self, configured: bool) {
+        let mut s = self.state.borrow_mut();
         if configured {
-            self.state.borrow_mut().configured(&Pico);
+            s.configured(&Pico);
+        } else {
+            s.unconfigured(&Pico);
         }
+    }
+
+    fn set_alternate_setting(&mut self, iface: InterfaceNumber, _alternate_setting: u8) {
+        let ep = match iface.0 {
+            KEYBOARD_INTERFACE => Ep::Keyboard,
+            PAD_INTERFACE => Ep::Pad,
+            _ => return,
+        };
+        self.state.borrow_mut().interface_set(&Pico, ep);
     }
 }
 

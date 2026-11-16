@@ -7,9 +7,12 @@
 //! leaves a report the host accepted AVAILABLE. The writers follow the
 //! firmware's loops: wait for the next report, write it as embassy-rp does
 //! (the opposite PID of the register, then AVAILABLE), then wait for its
-//! completion. The link's bytes go through [`Link`] and its control
-//! requests through [`State::cdc_request`], at their times, as the
-//! firmware's USB handler takes them.
+//! completion. The link's bytes go through [`Link`]; the link's control
+//! requests and the bus's events (a reset, the host configuring the device
+//! or an interface again, which rewrites the endpoints' buffer controls as
+//! embassy-rp does) go to the logic at their times, as the firmware's USB
+//! handler passes them on, after the host's poll in the same step and
+//! before the writers look.
 
 use std::cell::{Cell, RefCell};
 
@@ -125,10 +128,17 @@ enum Event {
     Dtr(bool),
     /// `SET_LINE_CODING` at this rate, 8N1.
     Baud(u32),
-    /// A bus reset.
+    /// A bus reset: the endpoints disabled, their buffers left as they
+    /// are, and each interface back at alternate setting 0.
     Reset,
     /// The link's reader fails: a disconnect.
     Lost,
+    /// `SET_CONFIGURATION 1`: each endpoint enabled and reinitialised.
+    Configure,
+    /// `SET_CONFIGURATION 0`: each endpoint disabled and reinitialised.
+    Unconfigure,
+    /// `SET_INTERFACE` on the endpoint's interface: it is reinitialised.
+    SetInterface(Ep),
 }
 
 struct World {
@@ -137,6 +147,8 @@ struct World {
     link: Link,
     /// Bus events due at their times.
     events: Vec<(u64, Event)>,
+    /// Whether each endpoint is enabled: the host polls only those.
+    enabled: [bool; 2],
     /// Each endpoint's writer waits for a completion.
     writing: [bool; 2],
     /// The host's first poll and its interval.
@@ -169,6 +181,7 @@ impl World {
             state,
             link: Link::new(),
             events: Vec::new(),
+            enabled: [false; 2],
             writing: [false; 2],
             phase,
             interval: u64::from(rate.interval_us()),
@@ -178,7 +191,7 @@ impl World {
             lose_ack: [0; 2],
             records: Vec::new(),
         };
-        w.state.configured(&w.hw);
+        w.event(Event::Configure);
         w.run_for(2 * w.interval + phase);
         assert!(w.state.identified());
         w
@@ -190,7 +203,7 @@ impl World {
 
     fn poll(&mut self, ep: Ep) {
         let i = index(ep);
-        if self.hw.abort.get()[i] {
+        if !self.enabled[i] || self.hw.abort.get()[i] {
             return;
         }
         let mut buffers = self.hw.buffers.borrow_mut();
@@ -230,9 +243,44 @@ impl World {
                 self.state
                     .cdc_request(&self.hw, SET_LINE_CODING, 0, &coding);
             }
-            Event::Reset => self.state.bus_reset(&self.hw),
+            Event::Reset => {
+                self.enabled = [false; 2];
+                self.state.bus_reset(&self.hw);
+                for ep in [Ep::Keyboard, Ep::Pad] {
+                    self.state.interface_set(&self.hw, ep);
+                }
+            }
             Event::Lost => self.state.link_lost(),
+            Event::Configure => {
+                self.enabled = [true; 2];
+                self.reinitialise(Ep::Keyboard);
+                self.reinitialise(Ep::Pad);
+                self.state.configured(&self.hw);
+            }
+            Event::Unconfigure => {
+                self.enabled = [false; 2];
+                self.reinitialise(Ep::Keyboard);
+                self.reinitialise(Ep::Pad);
+                self.state.unconfigured(&self.hw);
+            }
+            Event::SetInterface(ep) => {
+                self.reinitialise(ep);
+                self.state.interface_set(&self.hw, ep);
+            }
         }
+    }
+
+    /// embassy-rp's `endpoint_set_enabled`: the buffer control rewritten
+    /// to AVAILABLE clear and PID DATA1, so the next write sends DATA0,
+    /// where the host restarts the endpoint's toggle.
+    fn reinitialise(&mut self, ep: Ep) {
+        let i = index(ep);
+        self.hw.buffers.borrow_mut()[i].control = Buffer {
+            available: false,
+            pid: true,
+            length: 0,
+        };
+        self.expect[i] = false;
     }
 
     fn write(&mut self, ep: Ep) {
@@ -273,13 +321,13 @@ impl World {
 
     fn step(&mut self) {
         let t = self.now();
-        while let Some(i) = self.events.iter().position(|&(at, _)| at <= t) {
-            let (_, event) = self.events.remove(i);
-            self.event(event);
-        }
         if t >= self.phase && (t - self.phase).is_multiple_of(self.interval) {
             self.poll(Ep::Keyboard);
             self.poll(Ep::Pad);
+        }
+        while let Some(i) = self.events.iter().position(|&(at, _)| at <= t) {
+            let (_, event) = self.events.remove(i);
+            self.event(event);
         }
         self.write(Ep::Keyboard);
         self.write(Ep::Pad);
@@ -469,6 +517,105 @@ fn a_release_reaches_the_host_after_a_lost_ack() {
     assert_eq!(
         w.seen_from(Ep::Keyboard, 0),
         [(F24, true), (F24, false), (Control::Key(4), true)]
+    );
+}
+
+/// A neutral report the USB stack drops when the host configures the
+/// device or the keyboard's interface again was never taken: after a
+/// release whose first neutral report the host discarded (its toggle was
+/// unknown after a lost ACK), the second, still queued, is dropped, and the
+/// release still reaches the host before the next press.
+#[test]
+fn a_reconfiguration_keeps_the_release_owed() {
+    for reinit in [
+        &[Event::Configure][..],
+        &[Event::SetInterface(Ep::Keyboard)],
+        &[Event::Unconfigure, Event::Configure],
+    ] {
+        let mut w = World::new(Rate::Hz125, 3_000);
+        let ep = Ep::Keyboard;
+        w.lease();
+        assert_eq!(w.send("key 115 1"), "ok");
+        w.lose_ack[index(ep)] = 1;
+        w.run_for(10_000);
+        assert_eq!(w.send("release"), "ok");
+        w.run_for(8_000);
+        assert_eq!(w.discarded, 1, "{reinit:?}");
+        assert!(w.hw.buffer(ep).available, "{reinit:?}");
+        for (k, &event) in (1..).zip(reinit) {
+            w.events.push((w.now() + 1_000 * k, event));
+        }
+        w.lease();
+        assert_eq!(w.send("key 115 1"), "ok");
+        w.run_for(20_000);
+        assert_eq!(
+            w.seen_from(ep, 0),
+            [(F24, true), (F24, false), (F24, true)],
+            "{reinit:?}"
+        );
+    }
+}
+
+/// A press the host took with its ACK lost, dropped by `SET_INTERFACE`
+/// before its retry, may still be held at the host: its release goes ahead
+/// of the next input.
+#[test]
+fn a_press_dropped_by_set_interface_is_released_first() {
+    let mut w = World::new(Rate::Hz125, 3_000);
+    let ep = Ep::Keyboard;
+    w.lease();
+    assert_eq!(w.send("key 115 1"), "ok");
+    w.lose_ack[index(ep)] = 1;
+    w.run_for(10_000);
+    assert!(w.hw.buffer(ep).available, "the ACK was lost");
+    w.event(Event::SetInterface(ep));
+    assert_eq!(w.send("key 4 1"), "ok");
+    w.run_for(30_000);
+    assert_eq!(
+        w.seen_from(ep, 0),
+        [
+            (F24, true),
+            (F24, false),
+            (Control::Key(4), true),
+            (F24, true)
+        ]
+    );
+}
+
+/// A bus reset leaves the buffers as they are (embassy-rp only disables
+/// the endpoints): a report the host acknowledged just before keeps its
+/// completion, and the release the disarm owes, handed while the endpoint
+/// is disabled, is dropped by the configuration that follows and sent
+/// again before the next press.
+#[test]
+fn a_bus_reset_keeps_the_release_owed() {
+    let mut w = World::new(Rate::Hz125, 3_000);
+    let ep = Ep::Keyboard;
+    assert_eq!(w.send("trace on"), "ok");
+    w.lease();
+    assert_eq!(w.send("key 115 1"), "ok");
+    // The host takes the press at its poll at 27 ms; the reset comes in
+    // the same step, before the writer sees the completion.
+    w.events.push((27_000, Event::Reset));
+    w.run_until(30_000);
+    assert!(
+        w.hw.buffer(ep).available,
+        "the release handed while disabled"
+    );
+    w.event(Event::Configure);
+    w.lease();
+    assert_eq!(w.send("key 115 1"), "ok");
+    w.run_for(20_000);
+    assert_eq!(w.seen_from(ep, 0), [(F24, true), (F24, false), (F24, true)]);
+    let trace = w.trace();
+    let press = trace
+        .reports
+        .iter()
+        .find(|((e, _), r)| *e == ep && r.revoked == Some((false, 17)))
+        .map(|(_, r)| r.completion);
+    assert!(
+        matches!(press, Some(Some(_))),
+        "the press taken before the reset keeps its completion: {press:?}"
     );
 }
 
