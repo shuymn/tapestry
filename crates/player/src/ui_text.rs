@@ -105,6 +105,9 @@ pub enum Message<'a> {
     SearchIdle { query: &'a str },
     /// The "all charts" row with its count.
     AllChartsRow { charts: u64 },
+    /// The list is cut at its bound: only its first `limit` rows are
+    /// listed (the strip over a selection skin).
+    ListCut { limit: usize },
     /// `player.toml` could not be written, for the reason.
     SaveFailed { why: &'a str },
     /// A non-play kind's skin refused or unconfigured: its built-in screen.
@@ -276,6 +279,12 @@ mod ja {
             Message::SearchIdle { query } => write!(out, "検索 (Tab): {query}"),
             Message::AllChartsRow { charts } => {
                 write!(out, "  ▶ {}  ({charts})", label(Label::AllCharts))
+            }
+            Message::ListCut { limit } => {
+                write!(
+                    out,
+                    "先頭の {limit} 行だけを表示しています（検索で絞り込めます）"
+                )
             }
             Message::SaveFailed { why } => write!(out, "player.toml を保存できません: {why}"),
             Message::SkinBuiltIn { screen, why } => {

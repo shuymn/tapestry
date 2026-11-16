@@ -54,6 +54,9 @@ const STR: u8 = 8;
 const TABLE: u8 = 16;
 const FN: u8 = 32;
 const UNKNOWN: u8 = 64;
+/// What a string parameter of the library takes: a string, or a number
+/// read as its text.
+const TEXT: u8 = STR | NUM;
 
 /// What a value of a kind is known to be beyond its set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1179,12 +1182,14 @@ fn pure(ast: &Ast, name: &str, args: &Tuple, ids: &[u32]) -> Option<Tuple> {
     let ok = match name {
         "math.floor" | "math.ceil" | "math.abs" => n == 1 && fixed && arg(0).only(NUM),
         "math.max" | "math.min" => n >= 1 && all(NUM),
-        "string.len" | "string.upper" | "string.lower" => n == 1 && fixed && arg(0).only(STR),
-        "string.sub" => (2..=3).contains(&n) && fixed && arg(0).only(STR) && rest(1, NUM),
-        "string.byte" => n >= 1 && arg(0).only(STR) && rest(1, NUM),
+        // A string parameter takes a number too, as its text (the
+        // library's `number_text`); a numeric one takes numbers only.
+        "string.len" | "string.upper" | "string.lower" => n == 1 && fixed && arg(0).only(TEXT),
+        "string.sub" => (2..=3).contains(&n) && fixed && arg(0).only(TEXT) && rest(1, NUM),
+        "string.byte" => n >= 1 && arg(0).only(TEXT) && rest(1, NUM),
         "string.char" => all(NUM),
         "string.find" | "string.match" => {
-            (2..=3).contains(&n) && fixed && arg(0).only(STR) && arg(1).only(STR) && rest(2, NUM)
+            (2..=3).contains(&n) && fixed && arg(0).only(TEXT) && arg(1).only(TEXT) && rest(2, NUM)
         }
         // A string replacement only: the source's matcher reads a table
         // replacement through its metamethods, the sandbox's raw, and a
@@ -1192,9 +1197,9 @@ fn pure(ast: &Ast, name: &str, args: &Tuple, ids: &[u32]) -> Option<Tuple> {
         "string.gsub" => {
             (3..=4).contains(&n)
                 && fixed
-                && arg(0).only(STR)
-                && arg(1).only(STR)
-                && arg(2).only(STR)
+                && arg(0).only(TEXT)
+                && arg(1).only(TEXT)
+                && arg(2).only(TEXT)
                 && rest(3, NUM)
         }
         "string.format" => literal(0).and_then(format_kinds).is_some_and(|kinds| {
