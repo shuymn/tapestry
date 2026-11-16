@@ -3470,6 +3470,155 @@ pub fn canary(data: &[u8]) {
 #[cfg(test)]
 mod smoke;
 
+/// What [`bga_images`] made of its input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum BgaOutcome {
+    /// The name led to no file.
+    Unresolved,
+    /// The name led to a video, which is not read here.
+    Video,
+    /// The picture is absent, and why.
+    Absent(skin_model::chart_image::Absent),
+    /// The picture's cell: its native size and its content's.
+    Cell { native: [u32; 2], content: [u32; 2] },
+}
+
+/// The names `bga_images` writes its file under, by the input's first
+/// byte: a picture name, a BMP name, a video name, or a PNG name beside a
+/// JPEG name of the same bytes, which the priority order picks.
+const BGA_NAMES: [(&str, Option<&str>); 4] = [
+    ("s.png", None),
+    ("s.bmp", None),
+    ("s.mp4", None),
+    ("s.png", Some("s.jpg")),
+];
+
+fn bga_dir() -> &'static Path {
+    static DIR: OnceLock<tempfile::TempDir> = OnceLock::new();
+    DIR.get_or_init(|| {
+        tempfile::Builder::new()
+            .prefix("tapestry-fuzz-bga-")
+            .tempdir()
+            .expect("create a chart folder")
+    })
+    .path()
+}
+
+/// The ladder step the input's second byte names.
+#[must_use]
+pub fn bga_step(b: u8) -> skin_model::bga::Step {
+    use skin_model::bga::{STEP_CAPS, Step};
+    match b % 6 {
+        0 => Step::Full,
+        5 => Step::Grid,
+        i => STEP_CAPS
+            .get(usize::from(i - 1))
+            .map_or(Step::Full, |&c| Step::Cap(c)),
+    }
+}
+
+/// A chart's BGA picture through its preparation: the rest of the input
+/// written in a chart folder under the name the first byte picks
+/// ([`BGA_NAMES`]), resolved by the format priority, probed, and read
+/// into a cell of the ladder step the second byte picks ([`bga_step`]),
+/// once without a limit and once limited to 1 MiB each allocation. A read
+/// cell must be its content and a gutter on each side, premultiplied, its
+/// gutter repeating its edge, and fit a page when packed alone; the limited
+/// read gives the same cell or refuses its memory.
+///
+/// # Panics
+///
+/// If a cell breaks its shape, its premultiplication or its gutter, the
+/// limited read disagrees, or a cell packed alone leaves its page.
+#[must_use]
+pub fn bga_images(data: &[u8]) -> BgaOutcome {
+    use skin_model::bga::{
+        BgaBinding, CELL_GUTTER, PAGE_BUDGET, PAGE_SIDE, pack, probe, read_cell, resolve,
+        stored_size,
+    };
+    use skin_model::chart_image::{Absent, ChartDir, FileIdentity};
+    let (name, step, bytes) = match data {
+        [n, s, rest @ ..] => (
+            BGA_NAMES[usize::from(*n) % BGA_NAMES.len()],
+            bga_step(*s),
+            rest,
+        ),
+        _ => (BGA_NAMES[0], bga_step(0), data),
+    };
+    let dir = bga_dir();
+    for f in ["s.png", "s.bmp", "s.mp4", "s.jpg"] {
+        let _ = std::fs::remove_file(dir.join(f));
+    }
+    let (written, beside) = name;
+    std::fs::write(dir.join(written), bytes).expect("write the picture");
+    if let Some(b) = beside {
+        std::fs::write(dir.join(b), bytes).expect("write the picture");
+    }
+    let identity = |_: &std::fs::File| Some(FileIdentity(1));
+    let never = || false;
+    let chart = ChartDir::new(dir).expect("the chart folder");
+    let (path, key) = match resolve(&chart, written, &identity) {
+        BgaBinding::Unresolved(_) => return BgaOutcome::Unresolved,
+        BgaBinding::Resolved { video: true, .. } => return BgaOutcome::Video,
+        BgaBinding::Resolved { path, key, .. } => (path, key),
+    };
+    if let Some(b) = beside {
+        assert!(path.ends_with(b), "the priority order picks {b}: {path:?}");
+    }
+    let native = match probe(&path, &key, &identity) {
+        Ok(n) => n,
+        Err(why) => return BgaOutcome::Absent(why),
+    };
+    let stored = stored_size(native);
+    let content = step.content(stored);
+    assert!(
+        content[0] <= stored[0] && content[1] <= stored[1],
+        "{content:?} {stored:?}"
+    );
+    let cell = match read_cell(&path, &key, native, content, &never, &identity, None) {
+        Ok(c) => c,
+        Err(why) => return BgaOutcome::Absent(why),
+    };
+    assert_eq!(cell.native, native);
+    let [w, h] = content.map(|c| c + 2 * CELL_GUTTER);
+    assert_eq!(cell.padded, [w, h]);
+    let (w, h) = (w as usize, h as usize);
+    assert_eq!(cell.texels.len(), w * h * 4);
+    for &[r, g, b, a] in cell.texels.as_chunks::<4>().0 {
+        assert!(r <= a && g <= a && b <= a, "{:?}", [r, g, b, a]);
+    }
+    let row = |y: usize| &cell.texels[y * w * 4..(y + 1) * w * 4];
+    assert_eq!(row(0), row(1), "the top gutter");
+    assert_eq!(row(h - 1), row(h - 2), "the bottom gutter");
+    for y in 0..h {
+        let r = row(y);
+        assert_eq!(r[..4], r[4..8], "the left gutter");
+        assert_eq!(
+            r[(w - 1) * 4..],
+            r[(w - 2) * 4..(w - 1) * 4],
+            "the right gutter"
+        );
+    }
+    let packed = pack(&[Some(stored)], PAGE_BUDGET);
+    for place in packed.cells.iter().flatten() {
+        let [pw, ph] = place.padded();
+        assert!(place.origin[0] + pw <= PAGE_SIDE && place.origin[1] + ph <= PAGE_SIDE);
+    }
+    match read_cell(
+        &path,
+        &key,
+        native,
+        content,
+        &never,
+        &identity,
+        Some(1 << 20),
+    ) {
+        Ok(limited) => assert_eq!(limited, cell, "the limited read"),
+        Err(why) => assert_eq!(why, Absent::Refused, "the limited read"),
+    }
+    BgaOutcome::Cell { native, content }
+}
+
 /// The reads a fuzzed program may name: an integer, a boolean, and an
 /// integer guarded; with `bad`, also an enumeration and an output, which
 /// the verifier refuses.

@@ -14,6 +14,48 @@ use crate::{
     replay_file, seeded_readouts, seeds, skin_fnt, skin_json, skin_lua, skin_png,
 };
 
+/// The BGA seeds reach a cell at each step, every BMP variant they build,
+/// the JPEG the priority order picks, a video, and the absence of a GIF and
+/// of bytes of no format.
+#[test]
+fn bga_images_seeds_read_or_fail_as_built() {
+    use crate::{BgaOutcome, bga_images};
+    use skin_model::chart_image::Absent;
+    let seeds = seeds::bga_images();
+    assert_names(
+        &seeds,
+        &[
+            "png_canvas",
+            "png_full",
+            "png_cap",
+            "png_grid",
+            "bmp24",
+            "bmp8",
+            "bmp_rle8",
+            "video",
+            "beside_jpeg",
+            "gif",
+            "unknown",
+        ],
+    );
+    let outcome = |name: &str| {
+        let (_, bytes) = seeds.iter().find(|(n, _)| *n == name).unwrap();
+        bga_images(bytes)
+    };
+    let cell = |native, content| BgaOutcome::Cell { native, content };
+    assert_eq!(outcome("png_canvas"), cell([64, 32], [256, 256]));
+    assert_eq!(outcome("png_full"), cell([300, 200], [300, 200]));
+    assert_eq!(outcome("png_cap"), cell([300, 200], [256, 170]));
+    assert_eq!(outcome("png_grid"), cell([300, 200], [128, 85]));
+    for bmp in ["bmp24", "bmp8", "bmp_rle8"] {
+        assert_eq!(outcome(bmp), cell([4, 2], [256, 256]), "{bmp}");
+    }
+    assert_eq!(outcome("video"), BgaOutcome::Video);
+    assert_eq!(outcome("beside_jpeg"), cell([16, 16], [256, 256]));
+    assert_eq!(outcome("gif"), BgaOutcome::Absent(Absent::Format));
+    assert_eq!(outcome("unknown"), BgaOutcome::Absent(Absent::Format));
+}
+
 /// Every seed in `expected` is generated, and no other: a deleted seed
 /// fails the test instead of going unchecked.
 fn assert_names(seeds: &[seeds::Seed], expected: &[&str]) {

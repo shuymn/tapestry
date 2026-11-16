@@ -32,6 +32,91 @@ pub fn all() -> Vec<(&'static str, Vec<Seed>)> {
         ("skin_fnt", skin_fnts()),
         ("skin_png", skin_pngs()),
         ("present", presents()),
+        ("bga_images", bga_images()),
+    ]
+}
+
+/// A `w`x`h` RGBA PNG of `rgba`.
+fn bga_png([w, h]: [u32; 2], rgba: [u8; 4]) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut e = png::Encoder::new(&mut out, w, h);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let texels: Vec<u8> = (0..w * h).flat_map(|_| rgba).collect();
+    e.write_header()
+        .expect("a seed's header")
+        .write_image_data(&texels)
+        .expect("a seed's image");
+    out
+}
+
+/// A 4x2 BMP of `bpp` bits, `compression` and `data`, with a palette.
+fn bga_bmp(bpp: u16, compression: u32, palette: &[[u8; 3]], data: &[u8]) -> Vec<u8> {
+    let offset = 14 + 40 + 4 * palette.len() as u32;
+    let mut b = Vec::new();
+    b.extend_from_slice(b"BM");
+    b.extend_from_slice(&(offset + data.len() as u32).to_le_bytes());
+    b.extend_from_slice(&0_u32.to_le_bytes());
+    b.extend_from_slice(&offset.to_le_bytes());
+    b.extend_from_slice(&40_u32.to_le_bytes());
+    b.extend_from_slice(&4_i32.to_le_bytes());
+    b.extend_from_slice(&2_i32.to_le_bytes());
+    b.extend_from_slice(&1_u16.to_le_bytes());
+    b.extend_from_slice(&bpp.to_le_bytes());
+    b.extend_from_slice(&compression.to_le_bytes());
+    b.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    b.extend_from_slice(&2835_i32.to_le_bytes());
+    b.extend_from_slice(&2835_i32.to_le_bytes());
+    b.extend_from_slice(&(palette.len() as u32).to_le_bytes());
+    b.extend_from_slice(&0_u32.to_le_bytes());
+    for [r, g, bl] in palette {
+        b.extend_from_slice(&[*bl, *g, *r, 0]);
+    }
+    b.extend_from_slice(data);
+    b
+}
+
+/// `bga_images` seeds ([`crate::bga_images`]): the name byte, the step
+/// byte, then the file. A small PNG on its canvas and a large one at each
+/// step; 24-bit, 8-bit and RLE8 BMPs; a PNG beside a JPEG name; a video
+/// name; a GIF signature and bytes of no format, absent.
+#[must_use]
+pub fn bga_images() -> Vec<Seed> {
+    let with = |name: u8, step: u8, file: Vec<u8>| {
+        let mut v = vec![name, step];
+        v.extend(file);
+        v
+    };
+    let palette = [[200, 0, 0], [0, 200, 0]];
+    // Rows bottom-up: 24-bit, three bytes a pixel, 12 a row.
+    let rgb24: Vec<u8> = (0..8).flat_map(|i| [i * 20, 100, 200 - i * 20]).collect();
+    let eight: Vec<u8> = vec![0, 1, 0, 1, 1, 0, 1, 0];
+    // RLE8: each row a run of 4, then end of line; end of bitmap.
+    let rle8: Vec<u8> = vec![4, 0, 0, 0, 4, 1, 0, 0, 0, 1];
+    vec![
+        (
+            "png_canvas",
+            with(0, 0, bga_png([64, 32], [10, 20, 30, 255])),
+        ),
+        (
+            "png_full",
+            with(0, 0, bga_png([300, 200], [40, 50, 60, 128])),
+        ),
+        (
+            "png_cap",
+            with(0, 4, bga_png([300, 200], [70, 80, 90, 255])),
+        ),
+        ("png_grid", with(0, 5, bga_png([300, 200], [1, 2, 3, 255]))),
+        ("bmp24", with(1, 0, bga_bmp(24, 0, &[], &rgb24))),
+        ("bmp8", with(1, 0, bga_bmp(8, 0, &palette, &eight))),
+        ("bmp_rle8", with(1, 0, bga_bmp(8, 1, &palette, &rle8))),
+        ("video", with(2, 0, vec![0; 16])),
+        ("beside_jpeg", with(3, 0, bga_png([16, 16], [5, 6, 7, 255]))),
+        (
+            "gif",
+            with(0, 0, b"GIF89a\x01\x00\x01\x00\x00\x00\x00;".to_vec()),
+        ),
+        ("unknown", with(1, 0, b"not a picture".to_vec())),
     ]
 }
 
