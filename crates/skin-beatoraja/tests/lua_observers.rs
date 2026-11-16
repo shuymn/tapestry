@@ -406,10 +406,12 @@ fn an_observer_at_a_destination_the_import_drops_is_no_refusal() {
 
 /// A predicate that reads the BGA setting and discards it folds to its
 /// constant and notes D33 at its destination record once, as a lowered
-/// callback does (docs/stage3.md D33): an id the option scan resolves
-/// (40) and one only the evaluation folds (`39 + 1`). The setting is a
-/// static condition of the lowering, no constant of the capture proof, so
-/// a predicate whose value it is does not fold.
+/// callback does (docs/stage3.md D33), by a literal id (40) and by one
+/// only the evaluation folds (`39 + 1`): the fold's own reads are the
+/// note's only source, as the option scan never reads an observer's
+/// predicate. The setting is a static condition of the lowering, no
+/// constant of the capture proof, so a predicate whose value it is does
+/// not fold.
 #[test]
 fn a_predicate_reading_the_bga_setting_notes_d33() {
     let mut body = String::new();
