@@ -368,10 +368,22 @@ mod tests {
             parsed(&["--dev-window", "1920"]).unwrap_err(),
             UsageError::Usage("--dev-window takes <W>x<H>".to_owned())
         );
-        assert!(matches!(
-            parsed(&["--dev-window", "0x1080"]),
-            Err(UsageError::Usage(_))
-        ));
+        // A missing value, a negative side, a zero side and a side past
+        // the largest a target takes are refused, naming the flag or the
+        // bound.
+        assert_eq!(
+            parsed(&["--dev-window"]).unwrap_err(),
+            UsageError::Usage("--dev-window needs a value".to_owned())
+        );
+        let side =
+            |v: &str| UsageError::Usage(format!("a size of {v}: each side must be 1 to 8192"));
+        for v in ["-1x1080", "1920x-1", "0x1080", "8193x1080", "1920x8193"] {
+            assert_eq!(parsed(&["--dev-window", v]).unwrap_err(), side(v), "{v}");
+        }
+        assert_eq!(
+            select(&["--dev-window", "8192x8192"]).dev.window,
+            Some((8192, 8192))
+        );
         assert_eq!(
             parsed(&[
                 "--auto",
