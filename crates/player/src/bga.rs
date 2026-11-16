@@ -674,9 +674,12 @@ impl BgaWorker {
         self.forget();
     }
 
-    /// Advances the worker without blocking: takes what ended, and begins
-    /// the job the current want needs once no job's thread is alive. `coord`
-    /// `None` (the direct launch) runs it now on this thread, asking
+    /// Advances the worker without waiting for a job: takes what ended, and
+    /// begins the job the current want needs once no job's thread is alive.
+    /// A want without pictures has nothing to read: no job begins and no
+    /// permit is taken, so the load beside it keeps them all, and its empty
+    /// table is published here, on the render thread's answer. `coord`
+    /// `None` (the direct launch) runs the job now on this thread, asking
     /// `cancel`.
     pub fn step(&self, coord: Option<(&Coordinator, Spawner)>, cancel: &dyn Fn() -> bool) {
         let mut c = self.core();
@@ -687,6 +690,10 @@ impl BgaWorker {
         let Some(want) = c.want.clone() else {
             return;
         };
+        if want.names.is_empty() {
+            c.publish_absent(0);
+            return;
+        }
         let generation = c.current();
         let prior = c.kept.clone();
         let link = c.link.clone();
