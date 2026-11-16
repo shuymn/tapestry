@@ -481,3 +481,40 @@ fn a_value_reading_the_bga_setting_notes_d33_once_per_destination() {
     };
     assert_eq!(at, [Some(callback), Some(blend[0])]);
 }
+
+/// T2b with a counter: an increment of a written cell opens the
+/// candidate, whose callees no longer resolve, so the import notes no D33
+/// for its reads. On play no part reading the setting then draws without
+/// a note: the writer is replaced with `Writes` and a reader beside it
+/// with `Interference`, each with its own `Callback` note.
+#[test]
+fn an_open_candidate_replaces_its_bga_reads_with_their_own_notes() {
+    let w = "function() n = n + 1 return ms.option(40) end";
+    let r = "function() return ms.option(40) end";
+    let text = lua_play_text(
+        "local n = 0",
+        "function() return 0 end",
+        &format!(
+            "{{ id = \"i\", draw = {w}, dst = {{ {{ w = 10, h = 10 }} }} }},
+             {{ id = \"i\", draw = {r}, dst = {{ {{ w = 12, h = 12 }} }} }},"
+        ),
+    );
+    let (_d, i) = lua_play(&text);
+    for why in [Unsupported::Writes, Unsupported::Interference] {
+        assert!(
+            i.callbacks.contains(&Disposition::Replaced(why)),
+            "{why:?}: {:?}",
+            i.callbacks
+        );
+        assert!(
+            common::has(
+                &i.imported.report,
+                NoteKind::Callback { field: "draw", why }
+            ),
+            "{:?}",
+            common::kinds(&i.imported.report)
+        );
+    }
+    let d33 = d33_at(&i.imported);
+    assert!(d33.is_empty(), "{d33:?}");
+}

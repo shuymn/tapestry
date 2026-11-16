@@ -1922,6 +1922,43 @@ fn bga_frame(screen: ScreenKind, i: &mut LuaImported) -> Vec<i32> {
         .collect()
 }
 
+/// T4b with a counter: a selection or result draw that increments a
+/// written cell opens the candidate, so the import resolves none of its
+/// reads and notes no D33; it runs on the runtime, draws over the answer
+/// (40 holds; its lowered value is no runtime output), and after three frames has one runtime note for 40 at its
+/// definition.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn an_open_candidate_s_bga_read_is_noted_when_it_runs() {
+    untimed();
+    let draw = "function() c = c + 1 return ms.option(40) end";
+    for screen in [ScreenKind::Selection, ScreenKind::Result] {
+        let text = bga_entry(screen, "local c = 0", "function() return 3 end", &[draw]);
+        let mut i = bga_import(screen, &text);
+        assert!(
+            i.callbacks.contains(&Disposition::Runtime),
+            "{screen:?}: {:?}",
+            i.callbacks
+        );
+        let r = &i.imported.report;
+        assert!(
+            !r.notes
+                .iter()
+                .any(|n| n.kind == NoteKind::Deviation(DeviationId::D33)),
+            "{screen:?}"
+        );
+        for _ in 0..3 {
+            assert_eq!(bga_frame(screen, &mut i), [1], "{screen:?}");
+        }
+        let (l, c) = place(&text, draw);
+        assert_eq!(
+            located(&runtime(&mut i).notes().list),
+            [("bga 40".to_owned(), Some(("s.luaskin".to_owned(), l, c)))],
+            "{screen:?}"
+        );
+    }
+}
+
 /// T4b, T4c and T7b: on a selection and a result runtime, callbacks that
 /// write (so the runtime runs them) and read the BGA setting by an id the
 /// import resolves draw over the answer (40 holds, its negation and 41
