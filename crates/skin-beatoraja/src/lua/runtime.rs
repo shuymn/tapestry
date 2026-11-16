@@ -34,7 +34,9 @@
 //!   each once: a callback's error and an import-only call by the
 //!   callback's site (its file, and the line and column of its
 //!   constructor, [`SiteAt`]), an id it does not answer by its API and id,
-//!   located at its first reader in call order. Occurrences past the cap
+//!   located at its first reader in call order, and a read of the BGA
+//!   setting (options 40 and 41, D33) by a callback whose option scan the
+//!   import could not close, by its site and id. Occurrences past the cap
 //!   are counted, the list then incomplete; the stops are kept apart,
 //!   never capped. They go to the runtime's [`NoteBook`], its own unless
 //!   a screen shares one between the runtimes of one screen lifetime
@@ -101,6 +103,10 @@ pub(crate) struct Site {
     /// The conditions before it in its element's `dstdraw`, which the
     /// source evaluates first, stopping at the first false.
     pub(crate) gate: Option<Program>,
+    /// Whether its option scan left an `option` id or a callee open: its
+    /// reads of the BGA setting are noted as they run
+    /// ([`RuntimeNote::BgaSetting`]).
+    pub(crate) option_open: bool,
 }
 
 /// What became of a callback this frame.
@@ -159,6 +165,12 @@ pub enum RuntimeNote {
     /// An import-only capability called at runtime by the callback
     /// defined `at`.
     ImportOnly { at: Option<SiteAt> },
+    /// Option `id` (40 or 41), the BGA setting answered as off (D33), read
+    /// by the callback defined `at`, whose reads the import's option scan
+    /// could not all resolve. Executed evidence: a callback that also
+    /// reads one by an id the scan resolves has the import's D33 too, and
+    /// the two may name the same read.
+    BgaSetting { id: i32, at: Option<SiteAt> },
 }
 
 /// What the runtime gave a skin in place of an id it does not answer, as
@@ -174,12 +186,13 @@ pub enum Gave {
 }
 
 /// What a note is kept once by: a callback's site, an id by its API, an
-/// import-only call's site.
+/// import-only call's site, a BGA setting read's site and id.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Key {
     Error(SiteAt),
     Absent(&'static str, i32),
     ImportOnly(Option<SiteAt>),
+    BgaSetting(Option<SiteAt>, i32),
 }
 
 impl RuntimeNote {
@@ -188,6 +201,7 @@ impl RuntimeNote {
             Self::CallbackError { at } => Key::Error(at.clone()),
             Self::Absent { api, id, .. } => Key::Absent(api, *id),
             Self::ImportOnly { at } => Key::ImportOnly(at.clone()),
+            Self::BgaSetting { id, at } => Key::BgaSetting(at.clone(), *id),
         }
     }
 }
@@ -329,6 +343,24 @@ pub(crate) fn note_absent(pass: &Pass, api: &'static str, id: i32, gave: Gave) {
     pass.runtime_notes
         .borrow()
         .add(RuntimeNote::Absent { api, id, gave, at });
+}
+
+/// Notes the read of the BGA setting's option `id` (40 or 41) by the
+/// callback the runtime is calling, when that callback's option scan left
+/// an id or a callee open (D33); a read the scan resolved has its note in
+/// the import.
+pub(crate) fn note_bga(pass: &Pass, id: i32) {
+    let Some(k) = pass.calling.get() else {
+        return;
+    };
+    let open = pass.runtime_open.borrow().get(k as usize).copied();
+    if open != Some(true) {
+        return;
+    }
+    let at = pass.runtime_sites.borrow().get(k as usize).cloned();
+    pass.runtime_notes
+        .borrow()
+        .add(RuntimeNote::BgaSetting { id, at });
 }
 
 /// A host read's bridge, compiled once per id: its guard and its value.
@@ -785,6 +817,7 @@ impl ScreenRuntime {
             })
             .collect();
         let status = vec![CallStatus::Skipped; sites.len()];
+        *pass.runtime_open.borrow_mut() = sites.iter().map(|(s, _)| s.option_open).collect();
         // Each site's definition, its notes' key: the analysis's, else
         // its chunk's name and line of definition.
         *pass.runtime_sites.borrow_mut() = sites

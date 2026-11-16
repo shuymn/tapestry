@@ -10,6 +10,8 @@ use skin_beatoraja::lua::Disposition;
 use skin_beatoraja::lua::runtime::{CallStatus, Gave, RuntimeNote, Stopped};
 use skin_beatoraja::lua::runtime::{Pool, ScreenRuntime};
 use skin_beatoraja::{Cancel, Config, ImportFacts, LuaImported, LuaOutcome, read_lua_header};
+#[cfg(feature = "dev-tools")]
+use skin_beatoraja::{DeviationId, NoteKind};
 use skin_model::ScreenKind;
 #[cfg(feature = "dev-tools")]
 use skin_model::{RESULT, SELECTION};
@@ -1561,6 +1563,7 @@ fn located(notes: &[RuntimeNote]) -> Vec<Located> {
         .map(|n| match n {
             RuntimeNote::CallbackError { at: a } => ("error".to_owned(), Some(at(a))),
             RuntimeNote::ImportOnly { at: a } => ("import-only".to_owned(), a.as_ref().map(at)),
+            RuntimeNote::BgaSetting { id, at: a } => (format!("bga {id}"), a.as_ref().map(at)),
             RuntimeNote::Absent {
                 api,
                 id,
@@ -1842,4 +1845,146 @@ fn the_kept_vm_reads_the_player_totals() {
             .any(|n| matches!(n, RuntimeNote::Absent { .. })),
         "{notes:?}"
     );
+}
+
+/// A skin of `screen` (selection or result) over its fixtures' sheet:
+/// `prelude` after `ms`, a number whose value is `value`, and one `dot`
+/// destination drawn by each of `draws`, each on its own line.
+#[cfg(feature = "dev-tools")]
+fn bga_entry(screen: ScreenKind, prelude: &str, value: &str, draws: &[&str]) -> String {
+    let dots: String = draws
+        .iter()
+        .map(|d| {
+            format!(
+                "{{ id = \"dot\", dst = {{ {{ x = 0, y = 0, w = 8, h = 8 }} }}, draw = {d} }},\n"
+            )
+        })
+        .collect();
+    if screen == ScreenKind::Result {
+        let tables = format!(
+            "local ms = require(\"main_state\")\n{prelude}\n\
+             skin.value[2] = {{ id = \"r\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, \
+             digit = 4,\n value = {value} }}"
+        );
+        let dsts =
+            format!("{{ id = \"r\", dst = {{ {{ x = 0, y = 120, w = 4, h = 8 }} }} }},\n{dots}");
+        return common::result::graph_lua(&tables, &dsts);
+    }
+    format!(
+        "local skin = {{ type = 5, name = \"t\", w = 1920, h = 1080 }}\n\
+         if not skin_config then return skin end\n\
+         local ms = require(\"main_state\")\n\
+         {prelude}\n\
+         skin.source = {{ {{ id = \"s\", path = \"s.png\" }} }}\n\
+         skin.font = {{ {{ id = \"f\", path = \"f.ttf\" }} }}\n\
+         skin.image = {{ {{ id = \"dot\", src = \"s\", x = 0, y = 0, w = 8, h = 8 }} }}\n\
+         skin.imageset = {{ {{ id = \"set\", images = {{ \"dot\", \"dot\" }} }} }}\n\
+         skin.text = {{ {{ id = \"t\", font = \"f\", size = 10, ref = 10 }} }}\n\
+         skin.songlist = {{ id = \"list\", center = 0,\n\
+           liston = {{ {{ id = \"set\", dst = {{ {{ x = 0, y = 900, w = 300, h = 40 }} }} }} }},\n\
+           listoff = {{ {{ id = \"set\", dst = {{ {{ x = 0, y = 900, w = 300, h = 40 }} }} }} }},\n\
+           text = {{ {{ id = \"t\", dst = {{ {{ x = 0, y = 0, w = 100, h = 10 }} }} }} }} }}\n\
+         skin.value = {{ {{ id = \"r\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, digit = 4,\n\
+           value = {value} }} }}\n\
+         skin.destination = {{ {{ id = \"list\", dst = {{ {{ x = 0, y = 0, w = 0, h = 0 }} }} }},\n\
+           {{ id = \"r\", dst = {{ {{ x = 0, y = 120, w = 4, h = 8 }} }} }},\n\
+           {dots} }}\n\
+         return skin\n"
+    )
+}
+
+/// `text` imported for `screen`, its VM kept for the runtime.
+#[cfg(feature = "dev-tools")]
+fn bga_import(screen: ScreenKind, text: &str) -> LuaImported {
+    if screen == ScreenKind::Result {
+        return import_result_runtime(text.as_bytes(), &[]);
+    }
+    import(text)
+}
+
+/// One frame of `i`'s runtime on `screen` over fields that are 0: each
+/// output's value.
+#[cfg(feature = "dev-tools")]
+fn bga_frame(screen: ScreenKind, i: &mut LuaImported) -> Vec<i32> {
+    let n = runtime(i).outputs();
+    let schema = if screen == ScreenKind::Result {
+        &RESULT
+    } else {
+        &SELECTION
+    };
+    let mut f = vec![0; schema.fields.len() + 2 * n];
+    let timers = vec![0; schema.timers.len()];
+    runtime(i).frame(&mut f, &timers);
+    f[schema.fields.len()..]
+        .iter()
+        .step_by(2)
+        .copied()
+        .collect()
+}
+
+/// T4b, T4c and T7b: on a selection and a result runtime, callbacks that
+/// write (so the runtime runs them) and read the BGA setting by an id the
+/// import resolves draw over the answer (40 holds, its negation and 41
+/// do not; a value shows 7, not 3) and each notes D33 at its definition
+/// at import, with no runtime note; one whose id is computed has no
+/// import note and, after three frames, one runtime note for 40 at its
+/// definition; one that reads both has both, which name the same read.
+/// Each writes a numeral, which keeps the candidate closed (an increment
+/// of a written cell would open it, and an open candidate resolves no
+/// callee, so every read would be left to the runtime).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn bga_setting_reads_are_noted_at_import_or_when_they_run() {
+    untimed();
+    let value = "function() c = 1 return ms.option(40) and 7 or 3 end";
+    let on = "function() c = 1 return ms.option(40) end";
+    let neg = "function() c = 1 return not ms.option(40) end";
+    let bga_on = "function() c = 1 return ms.option(41) end";
+    let open = "function() c = 1 return ms.option(base + 1) end";
+    let both = "function() c = 1 return ms.option(40) and ms.option(base + 1) end";
+    for screen in [ScreenKind::Selection, ScreenKind::Result] {
+        let text = bga_entry(
+            screen,
+            "local c, base = 0, 39",
+            value,
+            &[on, neg, bga_on, open, both],
+        );
+        let mut i = bga_import(screen, &text);
+        let routed = i
+            .callbacks
+            .iter()
+            .filter(|d| **d == Disposition::Runtime)
+            .count();
+        assert_eq!(routed, 6, "{screen:?}: {:?}", i.callbacks);
+        let at = |s: &str| ("s.luaskin".to_owned(), place(&text, s).0, 0);
+        let r = &i.imported.report;
+        let mut d33: Vec<(String, u32, u32)> = r
+            .notes
+            .iter()
+            .filter(|n| n.kind == NoteKind::Deviation(DeviationId::D33))
+            .map(|n| {
+                let at = n.at.expect("located");
+                (r.sources[usize::from(at.source)].clone(), at.line, at.col)
+            })
+            .collect();
+        d33.sort();
+        let mut want = vec![at(value), at(on), at(neg), at(bga_on), at(both)];
+        want.sort();
+        assert_eq!(d33, want, "{screen:?}");
+        for _ in 0..3 {
+            assert_eq!(bga_frame(screen, &mut i), [7, 1, 0, 0, 1, 1], "{screen:?}");
+        }
+        let place_of = |s: &str| {
+            let (l, c) = place(&text, s);
+            Some(("s.luaskin".to_owned(), l, c))
+        };
+        assert_eq!(
+            located(&runtime(&mut i).notes().list),
+            [
+                ("bga 40".to_owned(), place_of(open)),
+                ("bga 40".to_owned(), place_of(both)),
+            ],
+            "{screen:?}"
+        );
+    }
 }
