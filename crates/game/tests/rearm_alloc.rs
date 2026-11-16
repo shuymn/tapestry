@@ -12,7 +12,7 @@
 mod common;
 mod counting;
 
-use bms_model::{ChartBuilder, TimeUs};
+use bms_model::{ChartBuilder, ChartProfile, ChartSummary, TimeUs};
 use common::{MS, lane};
 use eval::ControlId;
 use game::{DeviceSettings, HistoryRecorder, Logic, LogicConfig, audio_link_at};
@@ -31,11 +31,13 @@ const Q: ControlId = ControlId(0x10);
 fn repeated_rearms_allocate_nothing_and_hold_memory_flat() {
     let keys = DeviceSettings::default().keyboard;
     let key1 = ControlId(keys.lanes.iter().find(|k| k.lane == 1).unwrap().control);
-    let chart = ChartBuilder::new(150_000)
+    let mut chart = ChartBuilder::new(150_000)
         .tap(lane(1), TimeUs(0))
         .tap(lane(1), TimeUs(5_000 * MS))
         .build()
         .unwrap();
+    chart.meta.length = ChartSummary::of(&chart).length;
+    let profile = ChartProfile::of(&chart, &[]);
     let rule = rules::tapestry();
     let mut set = SourceSet::new(SourceConfig {
         max_devices: 4,
@@ -82,6 +84,9 @@ fn repeated_rearms_allocate_nothing_and_hold_memory_flat() {
         Vec::new(),
     )
     .unwrap();
+    // The judgment bins mapped, so every judgment counts and every
+    // publication and rearm copies or clears them.
+    assert!(logic.bin_judgments(&chart, &profile));
     let (sink, mut sounds) = audio_link_at(logic.max_events(), TimeUs(origin));
     logic.add_sink(Box::new(sink));
     let held = set.snapshot_capacity();
@@ -106,6 +111,7 @@ fn repeated_rearms_allocate_nothing_and_hold_memory_flat() {
     let before = counting::calls();
     let mut effects = 0;
     let mut judged = 0;
+    let mut binned = 0;
     for round in 0..60 {
         // The candidate judges a press early in its READY; every other
         // candidate's effects are left queued for the screen when it is
@@ -121,6 +127,7 @@ fn repeated_rearms_allocate_nothing_and_hold_memory_flat() {
             let v = side.acquire(1_024, |_| effects += 1).unwrap();
             assert_eq!(v.generation, round);
             judged += usize::from(v.notes.is_done(lane(1), 0));
+            binned += v.judge_bins.bins[0].iter().sum::<u32>();
         }
         // START held: the input side cancels the candidate.
         at += MS;
@@ -158,6 +165,7 @@ fn repeated_rearms_allocate_nothing_and_hold_memory_flat() {
             .unwrap();
         assert_eq!(v.generation, round + 1);
         assert!(!v.notes.is_done(lane(1), 0));
+        assert_eq!(v.judge_bins.bins[0], [0; game::JUDGE_CHANNELS]);
         if history.len() == replay::MAX_CANCELLED_OPENINGS {
             history.clear();
         }
@@ -167,6 +175,7 @@ fn repeated_rearms_allocate_nothing_and_hold_memory_flat() {
     assert_eq!(calls, 0);
     assert!(effects > 0, "each candidate judged");
     assert_eq!(judged, 30, "a view without its judged tap");
+    assert_eq!(binned, 30, "a view without its judged tap's count");
     assert_eq!(side.rearms(), 60);
     assert_eq!((history.reserved(), set.snapshot_capacity()), reserved);
 }

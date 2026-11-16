@@ -260,13 +260,32 @@ fn read_scanned_is_the_listing_and_the_summary() {
 }
 
 /// The scan's profile and MAIN tempo are the loader's: the profile a
-/// play's graphs draw and the MAIN of every note.
+/// play's graphs draw, less the rows' bins only a play's holds, and the
+/// MAIN of every note.
 #[test]
 fn read_scanned_carries_the_profile_and_main_tempo() {
     let limits = Limits::default();
     let scanned = read_scanned(CHART.as_bytes(), &limits).unwrap();
     let loaded = load(CHART, 0).unwrap();
-    assert_eq!(scanned.profile.as_ref(), Some(&loaded.profile));
+    let (p, play) = (scanned.profile.as_ref().unwrap(), &loaded.profile);
+    assert_eq!(
+        (
+            p.seconds(),
+            p.bins(),
+            p.bin_seconds(),
+            p.speeds(),
+            p.length_ms()
+        ),
+        (
+            play.seconds(),
+            play.bins(),
+            play.bin_seconds(),
+            play.speeds(),
+            play.length_ms()
+        )
+    );
+    assert!(p.row_bins().is_empty() && p.row_identity().is_none());
+    assert_eq!(play.row_bins().len(), loaded.chart.timeline.points().len());
     let main = bms_model::main_tempo(&loaded.chart, |_| true, bms_model::MAIN_HISTOGRAM_LIMIT).ok();
     assert!(main.is_some());
     assert_eq!(scanned.main, main);

@@ -2,7 +2,7 @@
 //! per id space over every id the surveyed result skins read, each
 //! classified. **N** ids are bridged from the result schema
 //! ([`skin_model::RESULT`]): the viewed result, its timing statistics, the
-//! best before this play and the chart's facts; **D** ids are a truthful
+//! best before this play, the play's target and the chart's facts; **D** ids are a truthful
 //! constant for a feature tapestry lacks (IR, replay slots, courses,
 //! difficulty tables, lane options) or an omission with a note. An id
 //! outside the survey follows the existing rules of its space, as on
@@ -143,10 +143,18 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
             part: Some(EssentialPart::ResultScore),
             ..count("ex_score")
         },
-        // The EX score less the target's, which is 0 with no target
-        // (`:186`, `:192`, `:198`, `:707-710`; `result/MusicResult.java:
-        // 343-344`, `ScoreDataProperty.java:129`).
-        108 | 128 | 153 => count("ex_score"),
+        // The EX score less the play's target T, one function in the
+        // source (`:186`, `:192`, `:198`, `:707-710`): its target paced
+        // over the score's notes, which are all the chart's
+        // (`ScoreDataProperty.java:129`, `play/JudgeManager.java:135`), is
+        // T itself (`result/MusicResult.java:343`). Only with a result.
+        108 | 128 | 153 => v("ex_score - target.ex", VALID, (-M, M)),
+        // T, the same in every view, under every status (`:196`).
+        151 => v("target.ex", "true", (0, M)),
+        // T's rate over the view's judged notes, whole percent and
+        // hundredths (`:202-203`), exact as play's 122 and 123.
+        157 => v("target.rate_bp / 100", "chart.notes_valid", (0, M / 100)),
+        158 => v("target.rate_bp % 100", "chart.notes_valid", (0, 99)),
         // The chart's, shown without a result too
         // (`IntegerPropertyFactory.java:562-576`).
         74 | 106 => v("chart.notes", "chart.notes_valid", (0, M)),
@@ -241,8 +249,8 @@ pub(crate) fn number(id: i32) -> Option<Class<ResValue>> {
         // The player's totals, as on selection
         // (`IntegerPropertyFactory.java:94-120`).
         17..=19 | 30..=37 | 333 => player(id)?,
-        // No score target; no IR.
-        151 | 157 | 158 | 179 | 180 | 182 | 380..=399 => {
+        // No IR.
+        179 | 180 | 182 | 380..=399 => {
             return Some(Omit);
         }
         _ => return None,
@@ -336,6 +344,11 @@ pub(crate) fn option(id: i32) -> Option<Class<ResOption>> {
         330 => Expr("best.ex_updated"),
         332 => Expr("best.bp_updated"),
         335 => Expr("best.rate_updated"),
+        // The EX score above, below or equal to the play's target
+        // (`BooleanPropertyFactory.java:658-663`).
+        352 => Expr("ex_score > target.ex"),
+        353 => Expr("ex_score < target.ex"),
+        354 => Expr("ex_score == target.ex"),
         2244 => Expr("count.bad > 0"),
         2245 => Expr("count.poor > 0"),
         // Offline: no IR.
@@ -421,7 +434,7 @@ pub(crate) fn read_number(value: &ResValue, fields: &ResultFields) -> Read {
 /// a number's does.
 pub(crate) fn option_guard(id: i32) -> &'static str {
     match id {
-        90 | 91 | 2244 | 2245 => VALID,
+        90 | 91 | 352..=354 | 2244 | 2245 => VALID,
         300..=307 => "result.rate_valid",
         320..=327 | 335 => "best.rate_valid",
         330 | 332 => BEST,
