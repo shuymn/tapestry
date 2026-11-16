@@ -2859,6 +2859,33 @@ mod tests {
         assert_eq!(step(&mut s, MenuKey::PageUp), (Acted::Changed, 0, 1));
     }
 
+    /// Inside a list longer than a page, a page step moves exactly
+    /// `PAGE_STEP` rows: on 40 rows Page Down goes 0, 18, 36, then stops
+    /// at 39 and wraps to 0; Page Up goes 0, 39, 21, 3, then stops at 0;
+    /// one `scratch` each.
+    #[test]
+    fn a_page_inside_a_long_list_moves_a_page_of_rows() {
+        use super::PAGE_STEP;
+        assert_eq!(PAGE_STEP, 18);
+        let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+        s.set_entries(folder("a", 40));
+        assert_eq!(s.cursor(), 0);
+        for to in [18, 36, 39, 0] {
+            assert_eq!(
+                step(&mut s, MenuKey::PageDown),
+                (Acted::Changed, to, 1),
+                "down to {to}"
+            );
+        }
+        for to in [39, 21, 3, 0] {
+            assert_eq!(
+                step(&mut s, MenuKey::PageUp),
+                (Acted::Changed, to, 1),
+                "up to {to}"
+            );
+        }
+    }
+
     /// A query whose results become empty lists nothing: no key steps or
     /// sounds, and a skin's window has no row and no cursor.
     // Source: SF-016
