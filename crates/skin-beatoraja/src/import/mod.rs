@@ -469,8 +469,8 @@ pub(crate) struct Cx<'d> {
     slot_roots: HashMap<u32, callback::SlotRoot>,
     /// Per callable instance, the play destinations whose `timer` it is.
     timer_sites: HashMap<u32, u32>,
-    /// The observer callables met at a play destination's `timer`, folded
-    /// or with their destination removed or inert ([`Self::close_observers`]).
+    /// The observer callables read as a play destination's `timer`,
+    /// whatever became of the destination ([`Self::close_observers`]).
     observers: std::collections::HashSet<u32>,
     /// Per callable instance, the `timer`s of play destinations whose
     /// object the source removes, or whose timer is inert: no site, and
@@ -954,6 +954,13 @@ impl<'d> Cx<'d> {
         let blend = self.int_or(blend, "blend", 0)?;
         let filter = self.int_or(filter, "filter", 0)?;
         let timer = self.callback_prop(timer, "timer")?;
+        // An observer here is met at a play destination's `timer`, whatever
+        // becomes of the destination.
+        if self.kind == ScreenKind::Play
+            && let Prop::Callable(id) = timer
+        {
+            self.observer_met(id);
+        }
         let looped = self.int_or(looped, "loop", 0)?;
         let center = self.int_or(center, "center", 0)?;
         let stretch = self.int_or(stretch, "stretch", -1)?;

@@ -283,6 +283,19 @@ fn an_observer_read_anywhere_but_a_timer_is_refused() {
 }
 
 #[test]
+fn an_observer_at_a_destination_the_import_drops_is_no_refusal() {
+    // A destination of an image no source defines is skipped, its
+    // observer never read.
+    let body = format!(
+        "{TWINS}
+         table.insert(skin.destination, {{ id = \"nope\", timer = on, dst = {{ {{ x = 0, y = 0, w = 8, h = 8 }} }} }})
+{}",
+        moving(100, "")
+    );
+    import_body(&body).unwrap();
+}
+
+#[test]
 fn the_observe_call_s_arguments_are_checked_at_the_call() {
     let observe = u16::try_from(
         HOST_APIS
