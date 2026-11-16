@@ -1583,9 +1583,13 @@ fn shelf_shown(
 /// it ends; `back`, `retry` and `close` until they are sent, which waits
 /// for the result's holding captures and, but `close`, for its drawn page
 /// (a result never drawn still gets its command at the deadline); `stay`
-/// until its page is drawn, then for good, the result leaving by its
-/// scene time, which must be in force. A scenario's captures before the
-/// result's steps are armed from `captures`.
+/// until its page is drawn, then until the result leaves by its scene
+/// time, which must be in force and within the bound. A command the
+/// result's gate would drop, a view command, `back` or `retry`, is held
+/// until the result takes input (its skin's input time), as a player's
+/// press must be; `back` or `retry` sent and not accepted within the bound
+/// fails its step. A scenario's captures before the result's steps are
+/// armed from `captures`.
 #[cfg(feature = "dev-tools")]
 pub fn script_result(
     script: &mut crate::dev::SelectScript,
@@ -1595,7 +1599,21 @@ pub fn script_result(
     at: ResultAt,
 ) {
     // A step left this result: the steps after it are the next screen's.
+    // Its command must be accepted within the bound, or the result would
+    // never be left.
     if script.left_result {
+        if let Some((sent, origin)) = script.leave_sent
+            && !at.leaving
+            && sent.elapsed() >= script.hold_bound()
+        {
+            script.leave_sent = None;
+            let why = "the result did not accept the command within the render bound";
+            match origin {
+                Some(o) => script.fail_at(o, why),
+                None => script.fail(why.to_owned()),
+            }
+            controls.close();
+        }
         return;
     }
     script.announce();
@@ -1640,7 +1658,9 @@ pub fn script_result(
             }
             Some(step @ (SelectStep::Next | SelectStep::Prev)) => match script.sent_views {
                 None => {
-                    if !may_act(script, captures, at, controls, true) {
+                    if !may_act(script, captures, at, controls, true)
+                        || !takes_input(script, at, controls)
+                    {
                         return;
                     }
                     script.sent_views = Some(at.views);
@@ -1666,15 +1686,22 @@ pub fn script_result(
                 }
             },
             Some(step @ (SelectStep::Back | SelectStep::Retry | SelectStep::Close)) => {
-                if !may_act(script, captures, at, controls, step != SelectStep::Close) {
+                let leaves = step != SelectStep::Close;
+                if !may_act(script, captures, at, controls, leaves)
+                    // Closing the window ends the run from any scene, its
+                    // input time or not.
+                    || (leaves && !takes_input(script, at, controls))
+                {
                     return;
+                }
+                if leaves {
+                    script.leave_sent = Some((Instant::now(), script.origin()));
                 }
                 script.done();
                 script.left_result = true;
                 match step {
                     SelectStep::Back => controls.command(game::Command::Quit),
                     SelectStep::Retry => controls.command(game::Command::Retry),
-                    // Closing the window ends the run from any scene.
                     _ => controls.close(),
                 }
                 return;
@@ -1682,11 +1709,13 @@ pub fn script_result(
             // The result is left on its own, by its scene time; the select
             // screen takes it. Its page drawn with no scene time in force
             // and no leaving accepted (a built-in result, or its skin
-            // fallen back before its scene time), or no page drawn within
-            // the bound, it would never leave.
+            // fallen back before its scene time), a scene time longer than
+            // the bound, no page drawn within the bound, or no leaving
+            // within it, it would not leave in time.
             Some(SelectStep::Stay) => {
-                if let Some(why) = stay_failure(at, script.hold_expired()) {
-                    script.fail(why.to_owned());
+                let bound = script.hold_bound();
+                if let Some(why) = stay_failure(at, bound, script.hold_expired()) {
+                    script.fail(why);
                     controls.close();
                 }
                 return;
@@ -1703,17 +1732,48 @@ pub fn script_result(
     }
 }
 
-/// Why `stay` fails at `at`, if it does: no page drawn by the step's
-/// deadline (`expired`), or a page drawn with no scene time in force and
-/// no leaving accepted, which a skin falling back during the outro its
-/// scene time began does not undo (dev-tools).
+/// Why `stay` fails at `at`, if it does (dev-tools): no page drawn by the
+/// step's deadline (`expired`); a page drawn with no scene time in force
+/// and no leaving accepted, which a skin falling back during the outro its
+/// scene time began does not undo; a scene time longer than the render
+/// bound `bound`, which the step cannot wait for; or no leaving accepted
+/// by the deadline.
 #[cfg(feature = "dev-tools")]
-const fn stay_failure(at: ResultAt, expired: bool) -> Option<&'static str> {
-    match (at.drawn, at.scene || at.leaving, expired) {
-        (false, _, true) => Some("the result was not drawn within the render bound"),
-        (true, false, _) => Some("stay needs a result skin's scene time; none is in force"),
+fn stay_failure(at: ResultAt, bound: Duration, expired: bool) -> Option<String> {
+    match (at.drawn, at.scene, expired) {
+        (false, _, true) => Some("the result was not drawn within the render bound".to_owned()),
+        (false, _, false) => None,
+        _ if at.leaving => None,
+        (true, None, _) => {
+            Some("stay needs a result skin's scene time; none is in force".to_owned())
+        }
+        (true, Some(_), true) => {
+            Some("the result did not leave by its scene time within the render bound".to_owned())
+        }
+        (true, Some(scene), false) if Duration::from_micros(scene.0.unsigned_abs()) > bound => {
+            Some(format!(
+                "stay waits for the result skin's scene time, {} ms, longer than the render bound of {} ms",
+                scene.0 / 1_000,
+                bound.as_millis()
+            ))
+        }
         _ => None,
     }
+}
+
+/// Whether the front step, a command the result's gate would drop, may be
+/// sent now (dev-tools): once the result takes input ([`ResultAt::accepts`]).
+/// Held past the step's deadline, it fails, closing the run.
+#[cfg(feature = "dev-tools")]
+fn takes_input(script: &mut crate::dev::SelectScript, at: ResultAt, controls: &Controls) -> bool {
+    if at.accepts {
+        return true;
+    }
+    if script.hold_expired() {
+        script.fail("the result did not take input within the render bound".to_owned());
+        controls.close();
+    }
+    false
 }
 
 /// Whether a command may act on the result now (dev-tools): no holding
@@ -1758,8 +1818,28 @@ pub struct ResultAt {
     /// Whether a leaving was accepted (its outro began) or served: the
     /// result leaves whatever its timing is now.
     pub leaving: bool,
-    /// Whether a result skin's scene time is in force.
-    pub scene: bool,
+    /// The result skin's scene time in force, from the result's start.
+    pub scene: Option<TimeUs>,
+    /// Whether the result takes a pressed command now: no skin timing in
+    /// force, or its input time has passed from the result's start, as the
+    /// result's own gate judges ([`accepts_input`]).
+    pub accepts: bool,
+}
+
+/// Whether a result with skin timing `timing` and start `origin` takes a
+/// pressed command at `now` (dev-tools): the gate the result applies to a
+/// press ([`game::gated`]); with a timing and no start yet, not yet.
+#[cfg(feature = "dev-tools")]
+pub(crate) fn accepts_input(
+    timing: Option<game::ResultTiming>,
+    origin: Option<TimeUs>,
+    now: TimeUs,
+) -> bool {
+    match (timing, origin) {
+        (None, _) => true,
+        (Some(_), None) => false,
+        (timing, start) => game::gated(timing, now, start) != game::Outro::Gated,
+    }
 }
 
 /// The holding captures a step waited on passed the render bound
@@ -2807,6 +2887,7 @@ impl PlayerRig<'_> {
     /// in flight never holds the game thread.
     #[cfg(feature = "dev-tools")]
     pub(crate) fn poll_result_script(&mut self) {
+        let timing = self.presenter.timing(&self.render);
         let at = ResultAt {
             id: self.scenario.as_ref().and_then(|s| s.result_id),
             page: self.render.end_pages_shown(),
@@ -2814,10 +2895,12 @@ impl PlayerRig<'_> {
             drawn: self.render.end_page_drawn(),
             views: self.views_shown,
             leaving: self.result_outro.is_some() || self.result_leaving,
-            scene: self
-                .presenter
-                .timing(&self.render)
-                .is_some_and(|t| t.scene.is_some()),
+            scene: timing.and_then(|t| t.scene),
+            accepts: accepts_input(
+                timing.map(crate::play::flow_timing),
+                self.presenter.origin(&self.render),
+                self.clock.now(),
+            ),
         };
         let Some(sel) = &mut self.selection else {
             if let Some(script) = &mut self.result_script {
@@ -9267,9 +9350,10 @@ pub(crate) mod tests {
             page,
             view: Some(view),
             drawn,
-            scene,
+            scene: scene.then_some(TimeUs(1_500_000)),
             views,
             leaving,
+            accepts: true,
         }
     }
 
@@ -9413,5 +9497,146 @@ pub(crate) mod tests {
         // Its scene time accepted back, then the skin fell back during the
         // outro: it is leaving, not failing.
         assert_eq!(stay(long, result_leaving(1, 1, true, false, 1, true)), None);
+        // A scene time longer than the bound cannot be waited for: it fails
+        // at once, naming both.
+        let hour = super::ResultAt {
+            scene: Some(TimeUs(3_600_000_000)),
+            ..result_at(1, 1, true, true)
+        };
+        assert_eq!(
+            stay(Duration::from_secs(60), hour).as_deref(),
+            Some(
+                "step 1 (capture): stay waits for the result skin's scene time, 3600000 ms, \
+                 longer than the render bound of 60000 ms"
+            )
+        );
+        // One within the bound that has not left the result by the step's
+        // deadline fails then; leaving by then, it does not.
+        assert_eq!(
+            stay(Duration::ZERO, result_at(1, 1, true, true)).as_deref(),
+            Some(
+                "step 1 (capture): the result did not leave by its scene time within the render bound"
+            )
+        );
+        assert_eq!(
+            stay(Duration::ZERO, result_leaving(1, 1, true, true, 1, true)),
+            None
+        );
+    }
+
+    /// Result 4 of play 2, drawn, whose skin does not take input yet.
+    #[cfg(feature = "dev-tools")]
+    fn before_input() -> super::ResultAt {
+        super::ResultAt {
+            accepts: false,
+            ..result_at(3, 7, true, false)
+        }
+    }
+
+    /// A command the result's gate would drop is held while the result's
+    /// skin takes no input, and sent at the first look once it does: back,
+    /// retry and a view command alike, none failing while held.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_command_before_the_input_time_waits_for_it() {
+        use crate::dev::SelectStep;
+        for (step, sent) in [
+            (SelectStep::Back, Some(game::Command::Quit)),
+            (SelectStep::Retry, Some(game::Command::Retry)),
+            (SelectStep::Next, None),
+        ] {
+            let (mut script, menu) = result_steps(vec![step.clone()]);
+            crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+                let controls = rig.controls;
+                let mut run = |at| super::script_result(&mut script, controls, &menu, None, at);
+                run(before_input());
+                run(before_input());
+                assert_eq!(controls.take(), None, "{step:?} sent before the input time");
+                assert!(menu.pop().is_none(), "{step:?} sent before the input time");
+                run(result_at(3, 7, true, false));
+                assert_eq!(controls.take(), sent, "{step:?}");
+                if sent.is_none() {
+                    assert_eq!(menu.pop(), Some(MenuInput::Key(MenuKey::Right)));
+                }
+            });
+            assert_eq!(script.failure(), None, "{step:?}");
+        }
+    }
+
+    /// Close ends the run from any scene: the input time does not hold it.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn close_does_not_wait_for_the_input_time() {
+        let (mut script, menu) = result_steps(vec![crate::dev::SelectStep::Close]);
+        crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            super::script_result(&mut script, rig.controls, &menu, None, before_input());
+            assert!(rig.controls.quitting());
+        });
+    }
+
+    /// A command held for an input time that never comes fails its step at
+    /// the step's deadline, closing the run, rather than waiting for good.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_command_held_past_the_bound_fails() {
+        let (mut script, menu) = result_steps(vec![crate::dev::SelectStep::Back]);
+        script.set_hold_bound(Duration::ZERO);
+        crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+            super::script_result(&mut script, rig.controls, &menu, None, before_input());
+            assert_eq!(rig.controls.take(), None);
+            assert!(rig.controls.quitting());
+        });
+        assert_eq!(
+            script.failure(),
+            Some("step 1 (capture): the result did not take input within the render bound")
+        );
+    }
+
+    /// Back sent to the result must be accepted within the bound: a result
+    /// still not leaving past it fails the step that sent it, closing the
+    /// run; one that is leaving, accepted, does not.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_leaving_command_not_accepted_fails_its_step() {
+        for (leaving, failed) in [
+            (
+                false,
+                Some(
+                    "step 1 (capture): the result did not accept the command within the render bound",
+                ),
+            ),
+            (true, None),
+        ] {
+            let (mut script, menu) = result_steps(vec![crate::dev::SelectStep::Back]);
+            script.set_hold_bound(Duration::ZERO);
+            crate::tests::on_rig(game::DeviceSettings::default(), |rig, _| {
+                let controls = rig.controls;
+                let mut run = |at| super::script_result(&mut script, controls, &menu, None, at);
+                run(result_at(3, 7, true, false));
+                assert_eq!(controls.take(), Some(game::Command::Quit));
+                assert!(!controls.quitting());
+                run(result_leaving(3, 7, true, false, 7, leaving));
+                assert_eq!(controls.quitting(), failed.is_some(), "leaving {leaving}");
+            });
+            assert_eq!(script.failure(), failed, "leaving {leaving}");
+        }
+    }
+
+    /// The result takes a pressed command once its skin's input time has
+    /// passed from its start, at once with no skin timing, and not before
+    /// it has a start.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_scripted_gate_is_the_results() {
+        let timing = Some(game::ResultTiming {
+            outro: TimeUs(200_000),
+            input: TimeUs(1_000_000),
+            scene: None,
+        });
+        let start = Some(TimeUs(5_000_000));
+        assert!(super::accepts_input(None, None, TimeUs(0)));
+        assert!(!super::accepts_input(timing, None, TimeUs(9_000_000)));
+        assert!(!super::accepts_input(timing, start, TimeUs(5_999_999)));
+        assert!(super::accepts_input(timing, start, TimeUs(6_000_000)));
     }
 }

@@ -71,9 +71,12 @@
 //!
 //! [[step]]
 //! result = "next-preset"         # "prev-preset" | "retry" | "back" | "stay"
-//! # "stay": nothing pressed once the result is drawn; it leaves on its
-//! # own (a result skin's scene time), and selection takes the next step;
-//! # with no scene time in force the run fails
+//! # each but "stay" waits until the result takes input (its skin's input
+//! # time), then is sent; "back" and "retry" must then be accepted within
+//! # the render bound. "stay": nothing pressed once the result is drawn;
+//! # it leaves on its own (a result skin's scene time), and selection
+//! # takes the next step; with no scene time in force, or one longer than
+//! # the render bound, the run fails
 //!
 //! [[step]]
 //! practice = { path = "library/a/a.bms", from = 1, to = 2, speed = 75, lead_in_ms = 2000, gauge = 20, repeat = true, input = "logs/a.tprl", rounds = 1 }

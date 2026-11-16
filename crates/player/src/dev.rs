@@ -1118,6 +1118,10 @@ pub struct SelectScript {
     /// The result shown was left by a step: its steps are over until the
     /// next result begins.
     pub left_result: bool,
+    /// When the leaving command that left the result was sent, and its
+    /// scenario step: the result must accept it within the render bound,
+    /// else the step fails.
+    pub leave_sent: Option<(std::time::Instant, Option<scenario::Origin>)>,
     /// The scenario step whose choice must pin the decision skin's
     /// labels, until that choice.
     pub skin_decision: Option<scenario::Origin>,
@@ -1265,10 +1269,15 @@ impl SelectScript {
         self.hold_bound = Some(bound);
     }
 
+    /// How long a step waits on the result: the render bound.
+    pub fn hold_bound(&self) -> Duration {
+        self.hold_bound.unwrap_or(HOLD_BOUND)
+    }
+
     /// Whether the front step's wait on a holding capture has passed its
     /// one deadline, set when the wait began.
     pub fn hold_expired(&mut self) -> bool {
-        let bound = self.hold_bound.unwrap_or(HOLD_BOUND);
+        let bound = self.hold_bound();
         let until = *self
             .held_until
             .get_or_insert_with(|| std::time::Instant::now() + bound);
