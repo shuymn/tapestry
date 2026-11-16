@@ -13,6 +13,7 @@ use rules::GaugeValue;
 use crate::AppReadouts;
 use crate::atlas::uv::{Cycle, UvTable};
 use crate::atlas::{Atlas, AtlasError, AtlasLimits, KeptLayers, Variant};
+use crate::bga::BgaStretch;
 use crate::canvas::{Canvas, Fit, MAX_CANVAS, f32_of};
 use crate::chart_image::{ChartImage, ChartStretch, ChartTable};
 use crate::decision::schema::timer as decision_timer;
@@ -170,6 +171,13 @@ pub enum Source {
         filter: Filter,
         stretch: ChartStretch,
     },
+    /// The chart's BGA (S15), a play skin's only: the base and the layer
+    /// in effect at the frame's chart time, or the poor pictures in the
+    /// miss window, each at its installed cell
+    /// ([`BgaTable`](crate::bga::BgaTable)) met by `stretch` against its
+    /// drawn size; the black placeholder before chart time 0, for a
+    /// chart with no BGA and for a base with no picture.
+    Bga { stretch: BgaStretch },
 }
 
 /// What only a result skin has: the widgets it draws and the timing it
@@ -503,6 +511,8 @@ enum Kind {
     HitError(usize, usize),
     /// The chart's own image, its filter and stretch.
     ChartImage(ChartImage, Filter, ChartStretch),
+    /// The chart's BGA and its stretch.
+    Bga(BgaStretch),
 }
 
 /// What a press on an element other than a slider gives, recorded in its
@@ -930,6 +940,7 @@ fn check_follows(def: &SkinDef, reach: i64) -> Result<(), LoadError> {
                     | Source::Number(_)
                     | Source::Text(_)
                     | Source::ChartImage { .. }
+                    | Source::Bga { .. }
             )
         {
             return Err(LoadError::UnsupportedFollow { element });
@@ -1081,7 +1092,8 @@ fn check_widget_images(
         | Source::BpmGraph(_)
         | Source::TimingVisualizer(_)
         | Source::HitErrorVisualizer(_)
-        | Source::ChartImage { .. } => {}
+        | Source::ChartImage { .. }
+        | Source::Bga { .. } => {}
     }
     Ok(())
 }
@@ -1140,7 +1152,8 @@ fn check_widget_params(element: usize, source: Source, w: &WidgetDefs) -> Result
         | Source::BpmGraph(_)
         | Source::TimingVisualizer(_)
         | Source::HitErrorVisualizer(_)
-        | Source::ChartImage { .. } => {}
+        | Source::ChartImage { .. }
+        | Source::Bga { .. } => {}
     }
     Ok(())
 }
@@ -1178,6 +1191,8 @@ fn worst(
         | Source::CoverPaint(_)
         | Source::RatioBar(_)
         | Source::ChartImage { .. } => 0,
+        // The base, or the placeholder, and the layer.
+        Source::Bga { .. } => 2,
         Source::SongList => sel.song_list.as_ref().map_or(0, SongListDef::quads),
         Source::Text(i) => w.texts.get(index(i)).map_or(0, TextDef::quads),
         Source::Number(i) => w
@@ -1322,7 +1337,8 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>, sel: &SelectionDefs) -> Regions
             | Source::BpmGraph(_)
             | Source::TimingVisualizer(_)
             | Source::HitErrorVisualizer(_)
-            | Source::ChartImage { .. } => {
+            | Source::ChartImage { .. }
+            | Source::Bga { .. } => {
                 let b = match e.source {
                     Source::SongList => sel.song_list.as_ref().and_then(|l| {
                         l.placements
@@ -1359,7 +1375,8 @@ fn regions(def: &SkinDef, lanes: Option<&Lanes>, sel: &SelectionDefs) -> Regions
                     | Source::BpmGraph(_)
                     | Source::TimingVisualizer(_)
                     | Source::HitErrorVisualizer(_)
-                    | Source::ChartImage { .. } => e.track.bounds(),
+                    | Source::ChartImage { .. }
+                    | Source::Bga { .. } => e.track.bounds(),
                 };
                 if let Some(b) = b {
                     let slot = match e.place.bind {
@@ -1617,7 +1634,8 @@ fn check_kind(
                 | Source::BpmGraph(_)
                 | Source::TimingVisualizer(_)
                 | Source::HitErrorVisualizer(_)
-                | Source::ChartImage { .. } => false,
+                | Source::ChartImage { .. }
+                | Source::Bga { .. } => false,
             },
             ScreenKind::Selection => match e.source {
                 Source::RatioBar(i) => score(i) != Some(true),
@@ -1634,6 +1652,7 @@ fn check_kind(
                         | Source::TimingGraph(_)
                         | Source::TimingVisualizer(_)
                         | Source::HitErrorVisualizer(_)
+                        | Source::Bga { .. }
                 ),
             },
             ScreenKind::Result => match e.source {
@@ -1652,6 +1671,7 @@ fn check_kind(
                                 | Source::BpmGraph(_)
                                 | Source::TimingVisualizer(_)
                                 | Source::HitErrorVisualizer(_)
+                                | Source::Bga { .. }
                         )
                 }
             },
@@ -2244,7 +2264,8 @@ impl Skin {
                 | Source::BpmGraph(_)
                 | Source::TimingVisualizer(_)
                 | Source::HitErrorVisualizer(_)
-                | Source::ChartImage { .. } => {}
+                | Source::ChartImage { .. }
+                | Source::Bga { .. } => {}
             }
         }
         let mut slots = Vec::with_capacity(elements.len());
@@ -2268,7 +2289,9 @@ impl Skin {
         let exists = |i: u32| usize::try_from(i).is_ok_and(|i| i < images.len());
         let frames = |i: u32| images.get(index(i)).map(|m| m.frames);
         if let Some(element) = elements.iter().position(|e| match e.source {
-            Source::Image(_) | Source::Lanes | Source::ChartImage { .. } => false,
+            Source::Image(_) | Source::Lanes | Source::ChartImage { .. } | Source::Bga { .. } => {
+                false
+            }
             Source::CoverPaint(p) => w.cover_paints.get(index(p)).is_none(),
             Source::Number(i) => w.numbers.get(index(i)).is_none(),
             Source::Gauge(i) => w.gauges.get(index(i)).is_none(),
@@ -2303,7 +2326,8 @@ impl Skin {
             | Source::BpmGraph(_)
             | Source::TimingVisualizer(_)
             | Source::HitErrorVisualizer(_)
-            | Source::ChartImage { .. } => false,
+            | Source::ChartImage { .. }
+            | Source::Bga { .. } => false,
         }) {
             return Err(LoadError::UnknownImage { element });
         }
@@ -2767,6 +2791,7 @@ impl Skin {
                         filter,
                         stretch,
                     } => Kind::ChartImage(which, filter, stretch),
+                    Source::Bga { stretch } => Kind::Bga(stretch),
                     Source::Text(i) => {
                         let def = texts.get(index(i));
                         let text = Text {
@@ -5032,6 +5057,24 @@ impl Skin {
                     if let Some((uv, _)) = chart {
                         brush.push_clipped(out, rect, uv, filter, trim);
                     }
+                }
+                Kind::Bga(stretch) => {
+                    let (show, table, media) = match scene.phase {
+                        Phase::Play { play, .. } => play.bga_frame(),
+                        _ => (
+                            crate::play::bga::Show::Placeholder,
+                            &crate::bga::NO_TABLE,
+                            crate::bga::NullMedia,
+                        ),
+                    };
+                    let parts = crate::play::bga::Parts {
+                        show,
+                        table,
+                        media,
+                        stretch,
+                        scale: canvas.scale(),
+                    };
+                    parts.draw(out, &brush, rect, trim);
                 }
                 Kind::Number(i) => {
                     if let Some(n) = self.numbers.get(i) {

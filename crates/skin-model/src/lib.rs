@@ -96,6 +96,7 @@
 )]
 
 mod atlas;
+pub mod bga;
 mod canvas;
 pub mod chart_image;
 mod decision;

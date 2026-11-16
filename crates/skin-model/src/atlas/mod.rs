@@ -20,7 +20,7 @@
 mod mip;
 pub use mip::downsample_rgba;
 pub(crate) use mip::premultiply;
-mod pack;
+pub(crate) mod pack;
 pub(crate) mod uv;
 
 use std::path::PathBuf;
