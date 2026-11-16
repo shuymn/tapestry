@@ -506,6 +506,46 @@ fn a_stopped_text_value_keeps_its_reason() {
     }
 }
 
+/// A decorative text of GenericTheme's TOTAL shape: a local assigned again
+/// with `string`'s value when it is given, else a number.
+fn total_text(string: Option<&str>) -> String {
+    format!(
+        "function()\n\
+           local total = ms.number(368)\n\
+           local totalnotes = ms.number(74)\n\
+           local base_total = math.max(260.0, 7.605 * totalnotes / (0.01 * totalnotes + 6.5))\n\
+           local total_percentage = total / base_total * 100\n\
+           total_percentage = math.ceil(total_percentage * 100) / 100\n\
+           {}\n\
+           return total .. \" (\" .. total_percentage .. \"%)\" end",
+        string.map_or(String::new(), |s| format!(
+            "if total > 1000 then total_percentage = {s} end"
+        ))
+    )
+}
+
+/// A local assigned again keeps the join of its values' kinds: only
+/// numbers, so the candidate stays closed, the reads resolve and the
+/// composed string is replaced for its own construct; one string among its
+/// values opens the candidate at the arithmetic, and the import refuses
+/// at the value, whose reads no scan resolves, as GenericTheme's TOTAL text
+/// did before the kinds were joined.
+#[test]
+fn a_composed_text_over_a_reassigned_number_is_replaced_for_its_concat() {
+    text_follows_its_role(&total_text(None), Unsupported::Construct(".."));
+    match import(&text_folder(&total_text(Some("\"x\"")), ""), 905) {
+        Err(ImportError::Lua {
+            why:
+                LuaWhy::Critical {
+                    field: "value",
+                    why: Unsupported::Unresolved("callee"),
+                },
+            ..
+        }) => {}
+        other => panic!("{other:?}"),
+    }
+}
+
 /// Reading a text in another consumer keeps its result: the comparison
 /// and the scene's constants are the text's alone.
 #[test]

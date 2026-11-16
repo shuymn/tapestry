@@ -11,7 +11,10 @@
 //! against the subset by every kind a value may have:
 //!
 //! - statements: `local` without attributes, assignment to a local of the
-//!   same function, `return`, call statements, `if`, `while`, `repeat`, a
+//!   same function (its kind the join of its initializer's and of every
+//!   value the function gives it, found by kind-only passes until none
+//!   changes, before the pass that checks; a local another function
+//!   assigns is unknown), `return`, call statements, `if`, `while`, `repeat`, a
 //!   numeric `for` over numbers, a generic `for` over `pairs(t)`,
 //!   `ipairs(t)` or `next, t` with `t` a table without a metatable, `do`,
 //!   `break`, `goto` and labels;
@@ -307,8 +310,17 @@ struct Body<'a> {
     proto: u32,
     /// The kinds of its locals declared so far.
     locals: HashMap<u32, K>,
-    /// Its locals assigned after their declaration.
+    /// Its locals assigned after their declaration in the function itself,
+    /// and in no other function.
     reassigned: HashSet<u32>,
+    /// The kind of each of them: the join of its initializer and every
+    /// value an assignment gives it, as far as the kind passes have found.
+    kinds: HashMap<u32, K>,
+    /// Whether a kind changed in this pass.
+    changed: bool,
+    /// Whether this is a kind-only pass, which records no open place, no
+    /// write and no call edge.
+    quiet: bool,
     /// The join of its `return` lists.
     ret: Option<Tuple>,
 }
@@ -352,12 +364,17 @@ impl<'a> Walk<'a> {
     /// Opens at expression or statement line `line` of `b`: the construct
     /// `why` is outside the subset; its value is unknown.
     fn outside(&self, b: &Body<'_>, line: u32, why: Unsupported) -> K {
-        self.open(Site::Code { file: b.file, line }, why);
+        if !b.quiet {
+            self.open(Site::Code { file: b.file, line }, why);
+        }
         K::UNKNOWN
     }
 
     /// [`Self::outside`] for a write: `b`'s prototype writes.
     fn write(&mut self, b: &Body<'_>, line: u32, why: Unsupported) {
+        if b.quiet {
+            return;
+        }
         if let Some(w) = self.writes.get_mut(b.proto as usize) {
             *w = true;
         }
@@ -368,6 +385,9 @@ impl<'a> Walk<'a> {
     /// numeral `int` when it is one: `b`'s prototype writes, and the cell
     /// is recorded with what it gets, the candidate left as it is.
     fn write_cell(&mut self, b: &Body<'_>, d: u32, line: u32, int: Option<i64>) {
+        if b.quiet {
+            return;
+        }
         if let Some(w) = self.writes.get_mut(b.proto as usize) {
             *w = true;
         }
@@ -578,16 +598,58 @@ impl<'a> Walk<'a> {
             proto: p,
             locals: HashMap::new(),
             reassigned: HashSet::new(),
+            kinds: HashMap::new(),
+            changed: false,
+            quiet: false,
             ret: None,
         };
         if inst.values.is_none() && f.upvalues.1 > 0 {
             self.outside(&b, f.line, Unsupported::Capture("no reader"));
         }
         self.charge_at(&b, f.line, u64::from(f.params.1))?;
-        for &d in ast.list(f.params) {
+        self.reassigned(&mut b, f.body)?;
+        let params = ast.list(f.params);
+        for &d in params {
+            if b.reassigned.contains(&d) {
+                b.kinds.insert(d, K::UNKNOWN);
+            }
+        }
+        // Kind-only passes until no assigned local's kind changes: a kind
+        // only grows and a refinement is only lost, so each local changes
+        // at most 8 times (7 bits and one refinement). Each pass is charged
+        // as any walk of the body; past the bound every assigned local is
+        // unknown.
+        if !b.reassigned.is_empty() {
+            let bound = b.reassigned.len().saturating_mul(8).saturating_add(1);
+            b.quiet = true;
+            let mut passes = 0_usize;
+            loop {
+                passes += 1;
+                b.changed = false;
+                b.locals.clear();
+                b.ret = None;
+                for &d in params {
+                    b.locals.insert(d, K::UNKNOWN);
+                }
+                self.block(&mut b, f.body)?;
+                if !b.changed {
+                    break;
+                }
+                if passes >= bound {
+                    for &d in &b.reassigned {
+                        b.kinds.insert(d, K::UNKNOWN);
+                    }
+                    break;
+                }
+            }
+            b.quiet = false;
+            b.locals.clear();
+            b.ret = None;
+        }
+        // The diagnosing pass, over the converged kinds.
+        for &d in params {
             b.locals.insert(d, K::UNKNOWN);
         }
-        self.reassigned(&mut b, f.body)?;
         self.block(&mut b, f.body)?;
         let ret = b.ret.take().unwrap_or_default();
         let always = returns(an, ast, f.body).map_err(|w| self.fatal(&b, f.line, w))?;
@@ -619,13 +681,13 @@ impl<'a> Walk<'a> {
                 self.charge_at(b, line, u64::from(targets.1))?;
                 for &t in ast.list(targets) {
                     if let Expr::Local(d) = ast.expr(t) {
-                        b.reassigned.insert(d);
+                        Self::reassigned_local(b, d);
                     }
                 }
             }
             Stmt::Function { target, .. } => {
                 if let Expr::Local(d) = ast.expr(target) {
-                    b.reassigned.insert(d);
+                    Self::reassigned_local(b, d);
                 }
             }
             Stmt::If(arms) => {
@@ -645,6 +707,14 @@ impl<'a> Walk<'a> {
         Ok(())
     }
 
+    /// Records `d` as assigned again by `b`'s function, unless another
+    /// function assigns it too, which leaves it unknown.
+    fn reassigned_local(b: &mut Body<'_>, d: u32) {
+        if !b.ast.decl(d).is_some_and(|x| x.assigned_inner) {
+            b.reassigned.insert(d);
+        }
+    }
+
     fn block(&mut self, b: &mut Body<'_>, l: List) -> R<()> {
         let ast = b.ast;
         for &s in ast.list(l) {
@@ -659,14 +729,29 @@ impl<'a> Walk<'a> {
         d != CHUNK_ENV && b.ast.decl(d).is_some_and(|x| x.func == b.func)
     }
 
-    /// Declares local `d` with kind `k`: unknown when it is assigned again.
+    /// Declares local `d` with kind `k`: unknown when another function
+    /// assigns it, and when this one does, the join of `k` and every value
+    /// it is given.
     fn declare(b: &mut Body<'_>, d: u32, k: K) {
-        let k = if b.reassigned.contains(&d) {
+        let k = if b.ast.decl(d).is_some_and(|x| x.assigned_inner) {
             K::UNKNOWN
+        } else if b.reassigned.contains(&d) {
+            Self::assign(b, d, k)
         } else {
             k
         };
         b.locals.insert(d, k);
+    }
+
+    /// Joins `k` into the kind of `d`, a local `b`'s function assigns:
+    /// the joined kind, which `d` then reads.
+    fn assign(b: &mut Body<'_>, d: u32, k: K) -> K {
+        let joined = b.kinds.get(&d).map_or(k, |&p| p.join(k));
+        if b.kinds.get(&d) != Some(&joined) {
+            b.kinds.insert(d, joined);
+            b.changed = true;
+        }
+        joined
     }
 
     fn stmt(&mut self, b: &mut Body<'_>, s: u32, line: u32) -> R<()> {
@@ -702,6 +787,7 @@ impl<'a> Walk<'a> {
                 // Each target one unit.
                 self.charge_at(b, line, u64::from(targets.1))?;
                 let values = ast.list(exprs);
+                let mut own = Vec::new();
                 for (k, &t) in ast.list(targets).iter().enumerate() {
                     // The value an upvalue gets: an integer numeral, when
                     // it is one and the list does not expand past it.
@@ -710,7 +796,7 @@ impl<'a> Walk<'a> {
                         _ => None,
                     };
                     match ast.expr(t) {
-                        Expr::Local(d) if Self::own(b, d) => {}
+                        Expr::Local(d) if Self::own(b, d) => own.push((k, d)),
                         Expr::Index { obj, key } => {
                             self.one(b, obj)?;
                             self.one(b, key)?;
@@ -721,7 +807,14 @@ impl<'a> Walk<'a> {
                         _ => self.write(b, line, Unsupported::Construct("assignment")),
                     }
                 }
-                self.list(b, exprs)?;
+                let given = self.list(b, exprs)?;
+                // Each local of this function takes its value's kind, joined.
+                for (k, d) in own {
+                    if b.reassigned.contains(&d) {
+                        let k = Self::assign(b, d, given.at(k));
+                        b.locals.insert(d, k);
+                    }
+                }
             }
             Stmt::Call(e) => {
                 self.multi(b, e)?;
@@ -781,7 +874,11 @@ impl<'a> Walk<'a> {
             }
             Stmt::Function { target, .. } => match ast.expr(target) {
                 Expr::Local(d) if Self::own(b, d) => {
-                    self.outside(b, line, Unsupported::Construct("function"));
+                    let k = self.outside(b, line, Unsupported::Construct("function"));
+                    if b.reassigned.contains(&d) {
+                        let k = Self::assign(b, d, k);
+                        b.locals.insert(d, k);
+                    }
                 }
                 _ => self.write(b, line, Unsupported::Construct("function")),
             },
@@ -1033,7 +1130,9 @@ impl<'a> Walk<'a> {
                 };
                 self.depth -= 1;
                 let (t, p) = r?;
-                if let Some(p) = p {
+                if let Some(p) = p
+                    && !b.quiet
+                {
                     self.edges.push((b.proto, p));
                 }
                 Ok(t)

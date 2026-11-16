@@ -624,3 +624,168 @@ fn a_number_for_a_string_parameter_stays_in_the_subset() {
         false,
     );
 }
+
+/// Checks that `d` opens the candidate at line `line` of the skin, where
+/// the walk meets the construct outside the subset: the critical reader
+/// refuses there for [`Unsupported::Interference`].
+#[track_caller]
+fn opens_at(pre: &str, draw: &str, line: u32) {
+    match outcome(&beside(pre, draw), &[]).0 {
+        Err(ImportError::Lua {
+            why:
+                LuaWhy::Critical {
+                    field: "draw",
+                    why: Unsupported::Interference,
+                },
+            at: Some(at),
+        }) => assert_eq!(
+            (at.file.as_str(), at.line),
+            ("s.luaskin", line),
+            "{pre} / {draw}"
+        ),
+        other => panic!("{pre} / {draw}: {other:?}"),
+    }
+}
+
+#[test]
+fn a_local_assigned_numbers_only_is_a_number() {
+    // GenericTheme's TOTAL shape: a local assigned again, only ever a
+    // number, keeps arithmetic and `..` in the subset.
+    closed(
+        "",
+        "function()\n\
+           local p = 368 / 74 * 100\n\
+           p = math.ceil(p * 100) / 100\n\
+           return (p .. \"%\") ~= \"\"\n\
+         end",
+    );
+    // So does a loop's: each pass reads the kinds the last one found.
+    closed(
+        "",
+        "function()\n\
+           local s = 0\n\
+           for i = 1, 3 do s = s + i end\n\
+           return s > 2\n\
+         end",
+    );
+}
+
+#[test]
+fn a_local_s_kind_joins_every_value_it_is_given() {
+    let d = d_line("");
+    // A number in one branch and a table in another: the arithmetic opens,
+    // at its first site under the converged kind (line d + 2), before the
+    // site the assignment's own pass would meet first (line d + 4).
+    opens_at(
+        "",
+        "function(u)\n\
+           local a = 1\n\
+           local x = a + 1\n\
+           if u then a = {} end\n\
+           return a * 2 > x\n\
+         end",
+        d + 2,
+    );
+    // A callable in one branch and a table in another: the call opens.
+    opens_at(
+        "",
+        "function(u)\n\
+           local f = string.len\n\
+           if u then f = {} end\n\
+           return f(\"ab\") > 0\n\
+         end",
+        d + 3,
+    );
+}
+
+#[test]
+fn joined_closures_lose_their_refinement() {
+    let pre = "local function h1() return 1 end\nlocal function h2() return 2 end";
+    let d = d_line(pre);
+    // Two different helpers: the callee is no one closure, so the call
+    // opens.
+    opens_at(
+        pre,
+        "function(u)\n\
+           local f = h1\n\
+           if u then f = h2 end\n\
+           return f() > 0\n\
+         end",
+        d + 3,
+    );
+    // The same helper on both paths keeps it.
+    closed(
+        pre,
+        "function(u)\n\
+           local f = h1\n\
+           if u then f = h1 end\n\
+           return f() > 0\n\
+         end",
+    );
+}
+
+#[test]
+fn a_kind_found_in_a_later_pass_reaches_earlier_reads() {
+    // In the loop, `a + 1` reads `a` before `a` takes `b`'s kind, and `b`
+    // takes a table after that: only the second pass gives `a` the table,
+    // and the read then opens, at the loop's line. Neither one pass nor the
+    // reporting pass alone sees it there.
+    opens_at(
+        "",
+        "function()\n\
+           local a, b = 1, 1\n\
+           for i = 1, 2 do local x = a + 1 a = b b = {} end\n\
+           return true\n\
+         end",
+        d_line("") + 2,
+    );
+}
+
+#[test]
+fn a_local_another_function_assigns_is_unknown() {
+    // `g` assigns `a` as an upvalue, so `a` may be anything: comparing it
+    // with an unknown value opens at that comparison (line d + 2), before
+    // the walk meets `g`'s function (line d + 3).
+    opens_at(
+        "",
+        "function(u)\n\
+           local a = 1\n\
+           local x = a == u\n\
+           local g = function() a = {} end\n\
+           return x\n\
+         end",
+        d_line("") + 2,
+    );
+}
+
+/// `n` locals each assigned the next, the last a table, in one loop: the
+/// table reaches the first local one pass at a time.
+fn chain(n: usize) -> String {
+    let names = (0..n).map(|k| format!("a{k}")).collect::<Vec<_>>();
+    let steps = (0..n - 1)
+        .map(|k| format!("a{k} = a{}", k + 1))
+        .collect::<Vec<_>>()
+        .join(" ");
+    skin(
+        "",
+        &image(&format!(
+            "function()\n\
+               local {} = {}\n\
+               for i = 1, 2 do {steps} a{} = {{}} end\n\
+               return true\n\
+             end",
+            names.join(", "),
+            vec!["1"; n].join(", "),
+            n - 1
+        )),
+    )
+}
+
+#[test]
+fn the_kind_passes_converge_within_their_bound_and_are_charged() {
+    // 190 locals (Lua allows 200 a function, a numeric `for` takes some)
+    // and the table one local further each pass: about 190 passes, each a
+    // walk of the body's 190 statements, all charged.
+    let (short, long) = (work(&chain(2)), work(&chain(190)));
+    assert!(long - short >= 190 * 190, "{short} {long}");
+}

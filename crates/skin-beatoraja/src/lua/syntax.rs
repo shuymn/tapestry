@@ -271,6 +271,9 @@ pub(crate) struct Decl {
     /// Whether an assignment after its declaration targets it, in any
     /// function.
     pub(crate) assigned: bool,
+    /// Whether an assignment in a function other than its own targets it
+    /// (an upvalue write).
+    pub(crate) assigned_inner: bool,
 }
 
 /// How a function constructor is written.
@@ -1429,6 +1432,7 @@ impl<'a> Parser<'a, '_> {
             init: NONE,
             env,
             assigned: false,
+            assigned_inner: false,
         });
         Ok(u32::try_from(self.ast.decls.len() - 1).unwrap_or(NONE))
     }
@@ -1952,8 +1956,10 @@ impl<'a> Parser<'a, '_> {
     fn target(&mut self, e: u32) -> Result<(), Fail> {
         match self.ast.expr(e) {
             Expr::Local(d) => {
+                let func = self.current_func();
                 if let Some(x) = self.ast.decls.get_mut(d as usize) {
                     x.assigned = true;
+                    x.assigned_inner |= x.func != func;
                 }
                 Ok(())
             }
