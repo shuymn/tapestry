@@ -11,7 +11,8 @@
 //!   as written; a missing name is searched for with the video extensions,
 //!   then the picture ones. Every candidate passes the chart images' name
 //!   rules and containment (T08, [`chart_image`](crate::chart_image)).
-//! - **Pictures** ([`probe`], [`read_cell`]): PNG, JPEG and BMP within the
+//! - **Pictures** ([`probe`], [`read_cell`]: [`read_picture`] then
+//!   [`ReadPicture::cell`]): PNG, JPEG and BMP within the
 //!   chart images' caps; the decoded texels are premultiplied, a picture
 //!   whose longer side is at most [`CANVAS_SIDE`] is drawn at the top
 //!   centre of a canvas of that side, opaque black for a picture with no
@@ -428,14 +429,7 @@ fn alloc(bytes: u64, limit: Option<u64>) -> Result<Vec<u8>, Absent> {
 
 /// Reads the picture in the file at `canonical`, observed as `key` with
 /// `native` texels ([`probe`]), into a cell whose content is `content`
-/// (see the module). Every allocation of its own, the file's bytes and the
-/// cell included, is at most `limit` bytes when one is given, and an
-/// allocation past it or refused leaves the picture
-/// [`Absent::Refused`]. `cancel` is asked before the read, before each
-/// piece of it and after the decode.
-///
-/// Memory: the chart images' whole-decode bound, then the premultiplied
-/// native texels (or the canvas) beside their downscale and the cell.
+/// (see the module): [`read_picture`], then [`ReadPicture::cell`].
 ///
 /// # Errors
 ///
@@ -449,6 +443,42 @@ pub fn read_cell(
     identity: Identity<'_>,
     limit: Option<u64>,
 ) -> Result<CellPixels, Absent> {
+    read_picture(canonical, key, native, cancel, identity, limit)?.cell(content, cancel, limit)
+}
+
+/// A picture's file read whole, not yet decoded.
+pub struct ReadPicture {
+    bytes: Vec<u8>,
+    dims: [u32; 2],
+    header: Option<decode::PngHeader>,
+}
+
+impl std::fmt::Debug for ReadPicture {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReadPicture")
+            .field("bytes", &self.bytes.len())
+            .field("dims", &self.dims)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Reads the whole file at `canonical`, observed as `key` with `native`
+/// texels ([`probe`]), checking it is still that file. Its bytes are at
+/// most `limit` when one is given, checked before they are read: past it,
+/// or refused, the picture is [`Absent::Refused`]. `cancel` is asked
+/// before the read and before each piece of it.
+///
+/// # Errors
+///
+/// Why the picture is absent.
+pub fn read_picture(
+    canonical: &Path,
+    key: &FileKey,
+    native: [u32; 2],
+    cancel: &dyn Fn() -> bool,
+    identity: Identity<'_>,
+    limit: Option<u64>,
+) -> Result<ReadPicture, Absent> {
     chart_image::checkpoint(cancel, Site::Read)?;
     let (mut file, len) = open_unchanged(canonical, key, identity)?;
     if limit.is_some_and(|l| len > l) {
@@ -463,15 +493,49 @@ pub fn read_cell(
     if dims != native {
         return Err(Absent::Changed);
     }
-    decode::check_whole(&bytes, dims, header).map_err(|e| absent(chart_image::absent_of(e)))?;
-    let (image, alpha) =
-        decode::decode_alpha(bytes, dims).map_err(|e| absent(chart_image::absent_of(e)))?;
-    chart_image::checkpoint(cancel, Site::Decoded)?;
-    cell_of(image.into_raw(), dims, alpha, content, limit).map(|(padded, texels)| CellPixels {
-        native: dims,
-        padded,
-        texels,
+    Ok(ReadPicture {
+        bytes,
+        dims,
+        header,
     })
+}
+
+impl ReadPicture {
+    /// Decodes the picture into a cell whose content is `content` (see the
+    /// module). Every allocation of its own, the decoded picture, its
+    /// RGBA8 copy and the cell included, is at most `limit` bytes when one
+    /// is given, each checked before it is made, and an allocation past it
+    /// or refused leaves the picture [`Absent::Refused`]. `cancel` is
+    /// asked after the decode.
+    ///
+    /// Memory: the chart images' whole-decode bound, then the
+    /// premultiplied native texels (or the canvas) beside their downscale
+    /// and the cell.
+    ///
+    /// # Errors
+    ///
+    /// Why the picture is absent.
+    pub fn cell(
+        self,
+        content: [u32; 2],
+        cancel: &dyn Fn() -> bool,
+        limit: Option<u64>,
+    ) -> Result<CellPixels, Absent> {
+        let Self {
+            bytes,
+            dims,
+            header,
+        } = self;
+        decode::check_whole(&bytes, dims, header).map_err(|e| absent(chart_image::absent_of(e)))?;
+        let (image, alpha) = decode::decode_alpha(bytes, dims, limit)
+            .map_err(|e| absent(chart_image::absent_of(e)))?;
+        chart_image::checkpoint(cancel, Site::Decoded)?;
+        cell_of(image.into_raw(), dims, alpha, content, limit).map(|(padded, texels)| CellPixels {
+            native: dims,
+            padded,
+            texels,
+        })
+    }
 }
 
 /// The cell of a decoded picture of `dims` texels (straight RGBA8 rows in
@@ -581,19 +645,37 @@ pub struct BgaKey {
 pub struct BgaTable {
     entries: Vec<BgaEntry>,
     key: Option<BgaKey>,
+    published: bool,
 }
 
 impl BgaTable {
-    /// No entry, of no array: every definition absent.
+    /// Nothing published: no entry, of no array. A frame shows the
+    /// placeholder for it ([`published`](Self::published)).
     pub const ABSENT: Self = Self {
         entries: Vec::new(),
         key: None,
+        published: false,
     };
 
-    /// `entries` by definition, of no array until [`keyed`](Self::keyed).
+    /// `entries` by definition, published, of no array until
+    /// [`keyed`](Self::keyed): with none, every picture is absent.
     #[must_use]
     pub fn new(entries: Vec<BgaEntry>) -> Self {
-        Self { entries, key: None }
+        Self {
+            entries,
+            key: None,
+            published: true,
+        }
+    }
+
+    /// Whether it is a published table ([`new`](Self::new)) rather than
+    /// [`ABSENT`](Self::ABSENT), which stands in until one is: a frame
+    /// draws a published table of no array as every picture absent,
+    /// channel by channel, and shows the placeholder for anything else it
+    /// cannot draw.
+    #[must_use]
+    pub const fn published(&self) -> bool {
+        self.published
     }
 
     /// The same table, describing the array `key` names.

@@ -164,6 +164,39 @@ fn a_table_not_drawable_or_a_chart_without_bga_shows_the_placeholder() {
     assert_eq!(drawn(none.batch.quads()), [PLACEHOLDER]);
 }
 
+/// Inside a poor window: a table of an array no longer in use, or none
+/// published yet, shows the placeholder, where a table published with no
+/// array draws every picture absent, so the miss window draws nothing.
+#[test]
+fn an_unpublished_or_stale_table_shows_the_placeholder_in_a_poor_window() {
+    let miss = |h: &mut Harness| {
+        h.frame(
+            3_200,
+            &[ev(3_200, judged(1, 0, Judgment::Bad, Some(90), None, 0))],
+        );
+        drawn(h.batch.quads())
+    };
+    let mut drawable = harness(0, table());
+    assert_eq!(miss(&mut drawable), [base(3)]);
+    let mut stale = harness(0, table());
+    stale.play.set_bga_live(Some(BgaKey {
+        renderer: 1,
+        array: 8,
+    }));
+    assert_eq!(miss(&mut stale), [PLACEHOLDER], "stale");
+    // A lost device: no live array, the published table keyed to one.
+    let mut lost = harness(0, table());
+    lost.play.set_bga_live(None);
+    assert_eq!(miss(&mut lost), [PLACEHOLDER], "no live array");
+    let mut unpublished = harness(0, BgaTable::ABSENT);
+    assert_eq!(miss(&mut unpublished), [PLACEHOLDER], "unpublished");
+    let mut none = harness(0, BgaTable::new(vec![BgaEntry::Absent; 5]));
+    none.play.set_bga_live(None);
+    none.frame(600, &[]);
+    assert_eq!(drawn(none.batch.quads()), [PLACEHOLDER], "base absent");
+    assert_eq!(miss(&mut none), [], "published with no array");
+}
+
 #[test]
 fn poor_replaces_base_and_layer_for_500ms_after_a_combo_break() {
     let mut h = harness(0, table());
