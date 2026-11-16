@@ -2670,6 +2670,7 @@ pub fn run(args: ScenarioArgs, clock: QpcClock) -> anyhow::Result<()> {
                 render_timeout: args.render_timeout,
                 stop_timeout: None,
                 size: None,
+                window: None,
                 scenario: Some(session),
             },
         },
