@@ -98,6 +98,10 @@ pub const FAIL_SPAWN: u8 = 1;
 #[cfg(test)]
 pub const FAIL_PANIC: u8 = 2;
 
+/// Each whole file read takes at least this many ms more (tests).
+#[cfg(test)]
+pub static READ_DELAY_MS: AtomicU64 = AtomicU64::new(0);
+
 /// Whether the job's spawn is refused (tests: [`FAIL`]).
 fn spawn_refused() -> bool {
     #[cfg(test)]
@@ -426,6 +430,8 @@ fn read_and_publish(
     let identity: Identity<'_> = &crate::chart_images::file_identity;
     #[cfg(feature = "dev-tools")]
     crate::dev::stage("bga_reads_start");
+    #[cfg(feature = "dev-tools")]
+    let probing = Instant::now();
     let bindings: Vec<BgaBinding> = want
         .names
         .iter()
@@ -466,8 +472,12 @@ fn read_and_publish(
             BgaBinding::Unresolved(_) => {}
         }
     }
+    // The headers read: each whole file read below ends the reads again.
     #[cfg(feature = "dev-tools")]
-    crate::dev::stage("bga_reads_end");
+    {
+        crate::dev::stage("bga_reads_end");
+        crate::dev::stage_busy("bga_reads_busy", probing.elapsed());
+    }
     #[cfg(feature = "dev-tools")]
     crate::dev::stage("bga_packing_start");
     let stored: Vec<Option<[u32; 2]>> = natives.iter().map(|s| s.map(bga::stored_size)).collect();
@@ -534,11 +544,32 @@ fn read_and_publish(
             out.end = end;
             return out;
         }
+        // The reads' stage ends at the last file read whole and the
+        // decodes' begins at the first decode; each read's and decode's
+        // own time adds to its kind's busy time.
         #[cfg(feature = "dev-tools")]
-        crate::dev::stage("bga_decodes_start");
-        let decoded = bga::read_cell(path, file, native, place.content, cancel, identity, limit());
+        let reading = Instant::now();
+        #[cfg(test)]
+        std::thread::sleep(Duration::from_millis(READ_DELAY_MS.load(Ordering::SeqCst)));
+        let read = bga::read_picture(path, file, native, cancel, identity, limit());
         #[cfg(feature = "dev-tools")]
-        crate::dev::stage("bga_decodes_end");
+        {
+            crate::dev::stage("bga_reads_end");
+            crate::dev::stage_busy("bga_reads_busy", reading.elapsed());
+        }
+        let decoded = read.and_then(|read| {
+            #[cfg(feature = "dev-tools")]
+            crate::dev::stage("bga_decodes_start");
+            #[cfg(feature = "dev-tools")]
+            let decoding = Instant::now();
+            let cell = read.cell(place.content, cancel, limit());
+            #[cfg(feature = "dev-tools")]
+            {
+                crate::dev::stage("bga_decodes_end");
+                crate::dev::stage_busy("bga_decodes_busy", decoding.elapsed());
+            }
+            cell
+        });
         let pixels = match decoded {
             Ok(p) => p,
             Err(Absent::Refused) => {

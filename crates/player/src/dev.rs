@@ -3018,7 +3018,10 @@ static RESTORE_REFUSED: AtomicBool = AtomicBool::new(false);
 
 /// The stages of the load from a choice to READY (`[load_stages]`), each
 /// in µs from the choice on the game's clock: the first start and the
-/// last end of each, and the points, until READY ends the record.
+/// last end of each, and the points, until READY ends the record; and the
+/// BGA job's time busy reading and decoding in all (`*_busy`, durations
+/// in µs), which its spans cannot tell apart where the pictures' reads
+/// and decodes alternate.
 #[derive(Debug, Default)]
 struct LoadStages {
     /// The game's clock and the choice's time on it, from the choice on.
@@ -3035,7 +3038,7 @@ static LOAD_STAGES: Mutex<LoadStages> = Mutex::new(LoadStages {
 });
 
 /// The order `[load_stages]` lists its keys in.
-pub const LOAD_STAGE_KEYS: [&str; 19] = [
+pub const LOAD_STAGE_KEYS: [&str; 21] = [
     "chart_start",
     "chart_end",
     "sounds_start",
@@ -3050,6 +3053,8 @@ pub const LOAD_STAGE_KEYS: [&str; 19] = [
     "bga_packing_end",
     "bga_decodes_start",
     "bga_decodes_end",
+    "bga_reads_busy",
+    "bga_decodes_busy",
     "bga_upload_start",
     "bga_upload_end",
     "decision_end",
@@ -3092,6 +3097,19 @@ pub fn stage_at(name: &'static str, at: Option<TimeUs>) {
     }
     if name == "ready" {
         s.done = true;
+    }
+}
+
+/// Adds `took` to the duration `name` (a `*_busy` key).
+pub fn stage_busy(name: &'static str, took: Duration) {
+    let mut s = load_stages();
+    if s.since.is_none() || s.done {
+        return;
+    }
+    let us = i64::try_from(took.as_micros()).unwrap_or(i64::MAX);
+    match s.stamps.iter_mut().find(|(n, _)| *n == name) {
+        Some((_, v)) => *v = v.saturating_add(us),
+        None => s.stamps.push((name, us)),
     }
 }
 

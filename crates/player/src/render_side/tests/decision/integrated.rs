@@ -1759,9 +1759,20 @@ fn a_later_decision_build_made_to_allocate_is_counted() {
 /// (`[load_stages]`): each in µs from the choice, so below 600 s; each
 /// job's start no later than its end; the decision screen's end no earlier
 /// than the built-in presentation's 1.5 s, the loading minimum's end at
-/// least 1 s after it; READY last.
+/// least 1 s after it; the one picture's file, read 30 ms slower, read
+/// whole after the packing and before its decode, its time in the reads'
+/// busy time; READY last.
 #[test]
 fn load_stages_are_recorded_in_order() {
+    /// Reads at full speed again when dropped, a failing test's included.
+    struct Quick;
+    impl Drop for Quick {
+        fn drop(&mut self) {
+            crate::bga::READ_DELAY_MS.store(0, Ordering::SeqCst);
+        }
+    }
+    let _quick = Quick;
+    crate::bga::READ_DELAY_MS.store(30, Ordering::SeqCst);
     let set = Set::new("s.luaskin");
     let opts = Opts {
         saved: true,
@@ -1799,6 +1810,13 @@ fn load_stages_are_recorded_in_order() {
         let (start, end) = (at(&format!("{stage}_start")), at(&format!("{stage}_end")));
         assert!(start <= end, "{stage}: {start} {end}");
     }
+    // The one picture's file is read whole after the packing, and decoded
+    // after it is read: the reads end there, the decodes span the decode,
+    // and the read's 30 ms count as reading.
+    assert!(at("bga_reads_end") > at("bga_packing_end"), "{stages:?}");
+    assert!(at("bga_reads_end") <= at("bga_decodes_start"), "{stages:?}");
+    assert!(at("bga_reads_busy") >= 30_000, "{stages:?}");
+    assert!(at("bga_decodes_busy") >= 0, "{stages:?}");
     let decided = at("decision_end");
     assert!(decided >= 1_500_000, "{stages:?}");
     assert!(at("minimum_end") >= decided + 1_000_000, "{stages:?}");
