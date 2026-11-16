@@ -1,8 +1,9 @@
 //! The BGA setting, options 40 (`bgaoff`) and 41 (`bgaon`), answered as off
 //! on every screen (docs/stage3.md D33): 40 holds, 41 does not, option 170
 //! still reads the chart's BGA flag, and each destination record that
-//! names 40 or 41 in its `op` or `draw` carries one located D33 note,
-//! whatever else becomes of it.
+//! names 40 or 41 in its `op` or `draw`, or reads one through a callback
+//! (its `op`, `draw` or `timer`, or its object's value), carries one
+//! located D33 note, whatever else becomes of it.
 
 mod common;
 
@@ -10,6 +11,7 @@ use bms_model::ChartBuilder;
 use common::lanes::{NOTES, body, note};
 use common::play::Drawn;
 use common::{import_dir, skin_with};
+use skin_beatoraja::lua::{Disposition, Unsupported};
 use skin_beatoraja::{
     Cancel, Config, DeviationId, Imported, NoteKind, NoteLoc, Severity, TrackWhy, read_lua_header,
 };
@@ -293,4 +295,314 @@ fn the_result_screen_reads_bga_off() {
     let mut want = vec![LAMP, B0];
     want.sort_unstable();
     assert_eq!(drawn, want);
+}
+
+/// A Lua play skin with source `a`, image `i` and number `n`, whose value
+/// is `value`, `prelude` after `ms`, and `dsts` as its destinations.
+fn lua_play_text(prelude: &str, value: &str, dsts: &str) -> String {
+    format!(
+        "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
+         if not skin_config then return skin end\n\
+         local ms = require(\"main_state\")\n\
+         {prelude}\n\
+         skin.source = {{ {{ id = \"a\", path = \"a.png\" }} }}\n\
+         skin.image = {{ {{ id = \"i\", src = \"a\", x = 0, y = 0, w = 8, h = 8 }} }}\n\
+         skin.value = {{ {{ id = \"n\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2,\n\
+           value = {value} }} }}\n\
+         skin.destination = {{\n\
+         {dsts}\n\
+         }}\n\
+         return skin\n"
+    )
+}
+
+/// `text` imported as a Lua play skin with its defaults, with its folder.
+fn lua_play(text: &str) -> (tempfile::TempDir, skin_beatoraja::LuaImported) {
+    let d = common::skin(&[("s.luaskin", text)]);
+    common::png(d.path(), "a.png", 64, 64);
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+    let i = common::lua_play(&h, &Config::default(), &cancel).unwrap_or_else(|e| panic!("{e:?}"));
+    (d, i)
+}
+
+/// The D33 notes of `imported`, each a deviation: its source's name, line
+/// and column.
+fn d33_at(imported: &Imported) -> Vec<(String, u32, u32)> {
+    imported
+        .report
+        .notes
+        .iter()
+        .filter(|n| n.kind == D33)
+        .map(|n| {
+            assert_eq!(n.severity, Severity::Deviation);
+            let NoteLoc { source, line, col } = n.at.expect("located");
+            (
+                imported.report.sources[usize::from(source)].clone(),
+                line,
+                col,
+            )
+        })
+        .collect()
+}
+
+/// Where a Lua callback starting with `needle` in `text` is noted: its
+/// module, the line of its `function` and column 0.
+fn at_fn(text: &str, needle: &str) -> (String, u32, u32) {
+    ("s.luaskin".to_owned(), place(text, needle).0, 0)
+}
+
+/// T2: a play `draw` callback reading the BGA setting lowers over the
+/// answer (40 holds, so on a chart with a BGA, where 170 does not, it
+/// draws from the play timer; 41 never draws) and notes D33 at its
+/// definition, the id given by a numeral, a helper's parameter or a local
+/// of the callback.
+#[test]
+fn a_draw_callback_reading_the_bga_setting_lowers_with_d33() {
+    let a = "function() return ms.option(40) or ms.option(170) end";
+    let b = "function() return ms.option(41) end";
+    let c = "function() return on(40) end";
+    let e = "function() local k = 40 return ms.option(k) end";
+    let dsts: String = [(a, 10), (b, 11), (c, 12), (e, 13)]
+        .iter()
+        .map(|(d, w)| {
+            format!(
+                "{{ id = \"i\", timer = 41, draw = {d},\n\
+                   dst = {{ {{ time = 0, w = {w}, h = 10 }} }} }},\n"
+            )
+        })
+        .collect();
+    let text = lua_play_text(
+        "local function on(k) return ms.option(k) end",
+        "function() return 0 end",
+        &dsts,
+    );
+    let (_d, i) = lua_play(&text);
+    assert!(
+        !i.callbacks.iter().any(|d| matches!(
+            d,
+            Disposition::Replaced(Unsupported::Unmapped { id: 40 | 41, .. })
+        )),
+        "{:?}",
+        i.callbacks
+    );
+    assert_eq!(
+        d33_at(&i.imported),
+        [
+            at_fn(&text, a),
+            at_fn(&text, b),
+            at_fn(&text, c),
+            at_fn(&text, e)
+        ]
+    );
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    let meta = ChartMetadata {
+        bga: Some(true),
+        ..ChartMetadata::UNKNOWN
+    };
+    let mut p = Drawn::over_meta(i.imported.skin, &chart, meta);
+    for ms in [0, 400] {
+        let mut w: Vec<i32> = p.rects(ms).iter().map(|r| r[2]).collect();
+        w.sort_unstable();
+        assert_eq!(w, [10, 12, 13], "{ms} ms");
+    }
+}
+
+/// T2b: a play callback that writes, replaced on play, still notes D33 at
+/// its definition beside its own `Callback` note. It writes a numeral, so
+/// the candidate stays closed and its callees resolve.
+#[test]
+fn a_replaced_callback_reading_the_bga_setting_notes_d33() {
+    let a = "function() n = 1 return ms.option(40) end";
+    let text = lua_play_text(
+        "local n = 0",
+        "function() return 0 end",
+        &format!("{{ id = \"i\", draw = {a}, dst = {{ {{ w = 10, h = 10 }} }} }},"),
+    );
+    let (_d, i) = lua_play(&text);
+    assert!(
+        i.callbacks
+            .contains(&Disposition::Replaced(Unsupported::Writes)),
+        "{:?}",
+        i.callbacks
+    );
+    assert!(
+        common::has(
+            &i.imported.report,
+            NoteKind::Callback {
+                field: "draw",
+                why: Unsupported::Writes
+            }
+        ),
+        "{:?}",
+        common::kinds(&i.imported.report)
+    );
+    assert_eq!(d33_at(&i.imported), [at_fn(&text, a)]);
+}
+
+/// T2c: an id the option scan leaves open but the lowering folds (`39 +
+/// 1`, `39 + 2`) notes D33 at its callback once the callback lowers or
+/// compiles: a `draw` lowered, a `timer` compiled into the program and a
+/// number's value. They behave as the answer: on a chart with BGA the
+/// draw and the timer of 40 show and those of 41 do not, and the number
+/// shows 17, two digits, not 3.
+#[test]
+fn a_folded_id_reading_the_bga_setting_notes_d33() {
+    let v = "function() return ms.option(39 + 1) and 17 or 3 end";
+    let d40 = "function() return ms.option(39 + 1) end";
+    let d41 = "function() return ms.option(39 + 2) end";
+    let t40 = "function() if ms.option(39 + 1) then return 0 end return ms.timer_off_value end";
+    let t41 = "function() if ms.option(39 + 2) then return 0 end return ms.timer_off_value end";
+    let text = lua_play_text(
+        "",
+        v,
+        &format!(
+            "{{ id = \"i\", draw = {d40}, dst = {{ {{ w = 10, h = 10 }} }} }},
+             {{ id = \"i\", draw = {d41}, dst = {{ {{ w = 11, h = 10 }} }} }},
+             {{ id = \"i\", timer = {t40}, dst = {{ {{ time = 0, w = 12, h = 10 }} }} }},
+             {{ id = \"i\", timer = {t41}, dst = {{ {{ time = 0, w = 13, h = 10 }} }} }},
+             {{ id = \"n\", dst = {{ {{ w = 6, h = 6 }} }} }},"
+        ),
+    );
+    let (_d, i) = lua_play(&text);
+    assert!(
+        i.callbacks
+            .iter()
+            .all(|d| matches!(d, Disposition::Lowered | Disposition::Compiled)),
+        "{:?}",
+        i.callbacks
+    );
+    let mut at = d33_at(&i.imported);
+    at.sort();
+    let mut want: Vec<_> = [d40, d41, t40, t41, v]
+        .iter()
+        .map(|f| at_fn(&text, f))
+        .collect();
+    want.sort();
+    assert_eq!(at, want);
+    let chart = ChartBuilder::new(150_000).build().unwrap();
+    let meta = ChartMetadata {
+        bga: Some(true),
+        ..ChartMetadata::UNKNOWN
+    };
+    let mut p = Drawn::over_meta(i.imported.skin, &chart, meta);
+    for ms in [0, 400] {
+        let r = p.rects(ms);
+        // The images are 10 high, the number's digits 6.
+        let mut w: Vec<i32> = r.iter().filter(|r| r[3] == 10).map(|r| r[2]).collect();
+        w.sort_unstable();
+        assert_eq!(w, [10, 12], "{ms} ms");
+        assert_eq!(r.iter().filter(|r| r[3] == 6).count(), 2, "{ms} ms");
+    }
+}
+
+/// T7: a number's value reading the BGA setting notes D33 at its
+/// definition for a destination that names neither 40 nor 41, and one
+/// D33 alone, at the record (where its subtract blend is noted), for a
+/// destination that also names 40.
+#[test]
+fn a_value_reading_the_bga_setting_notes_d33_once_per_destination() {
+    let v = "function() return ms.option(40) and 1 or 0 end";
+    let text = lua_play_text(
+        "",
+        v,
+        "{ id = \"n\", dst = { { x = 0, y = 0, w = 6, h = 6 } } },\n\
+         { id = \"n\", op = { 40 }, blend = 3, dst = { { x = 0, y = 20, w = 6, h = 6 } } },",
+    );
+    let (_d, i) = lua_play(&text);
+    assert!(
+        i.callbacks.contains(&Disposition::Lowered),
+        "{:?}",
+        i.callbacks
+    );
+    let r = &i.imported.report;
+    let blend: Vec<NoteLoc> = r
+        .notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::SubtractBlend)
+        .filter_map(|n| n.at)
+        .collect();
+    assert_eq!(blend.len(), 1, "{:?}", common::kinds(r));
+    let at: Vec<Option<NoteLoc>> = r
+        .notes
+        .iter()
+        .filter(|n| n.kind == D33)
+        .map(|n| n.at)
+        .collect();
+    let (source, line, _) = at_fn(&text, v);
+    let callback = NoteLoc {
+        source: u16::try_from(r.sources.iter().position(|s| *s == source).unwrap()).unwrap(),
+        line,
+        col: 0,
+    };
+    assert_eq!(at, [Some(callback), Some(blend[0])]);
+}
+
+/// T7c: a number's value that writes, replaced on play and so never
+/// lowered, still notes D33 at its definition, from its option scan,
+/// beside its own `Callback` note.
+#[test]
+fn a_replaced_value_reading_the_bga_setting_notes_d33() {
+    let v = "function() n = 1 return ms.option(40) and 1 or 0 end";
+    let text = lua_play_text(
+        "local n = 0",
+        v,
+        "{ id = \"n\", dst = { { x = 0, y = 0, w = 6, h = 6 } } },",
+    );
+    let (_d, i) = lua_play(&text);
+    assert!(
+        i.callbacks
+            .contains(&Disposition::Replaced(Unsupported::Writes)),
+        "{:?}",
+        i.callbacks
+    );
+    assert!(
+        common::has(
+            &i.imported.report,
+            NoteKind::Callback {
+                field: "value",
+                why: Unsupported::Writes
+            }
+        ),
+        "{:?}",
+        common::kinds(&i.imported.report)
+    );
+    assert_eq!(d33_at(&i.imported), [at_fn(&text, v)]);
+}
+
+/// T2b with a counter: an increment of a written cell opens the
+/// candidate, whose callees no longer resolve, so the import notes no D33
+/// for its reads. On play no part reading the setting then draws without
+/// a note: the writer is replaced with `Writes` and a reader beside it
+/// with `Interference`, each with its own `Callback` note.
+#[test]
+fn an_open_candidate_replaces_its_bga_reads_with_their_own_notes() {
+    let w = "function() n = n + 1 return ms.option(40) end";
+    let r = "function() return ms.option(40) end";
+    let text = lua_play_text(
+        "local n = 0",
+        "function() return 0 end",
+        &format!(
+            "{{ id = \"i\", draw = {w}, dst = {{ {{ w = 10, h = 10 }} }} }},
+             {{ id = \"i\", draw = {r}, dst = {{ {{ w = 12, h = 12 }} }} }},"
+        ),
+    );
+    let (_d, i) = lua_play(&text);
+    for why in [Unsupported::Writes, Unsupported::Interference] {
+        assert!(
+            i.callbacks.contains(&Disposition::Replaced(why)),
+            "{why:?}: {:?}",
+            i.callbacks
+        );
+        assert!(
+            common::has(
+                &i.imported.report,
+                NoteKind::Callback { field: "draw", why }
+            ),
+            "{:?}",
+            common::kinds(&i.imported.report)
+        );
+    }
+    let d33 = d33_at(&i.imported);
+    assert!(d33.is_empty(), "{d33:?}");
 }
