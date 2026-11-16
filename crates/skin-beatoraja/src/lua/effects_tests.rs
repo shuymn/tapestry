@@ -601,3 +601,26 @@ fn a_counting_timer_is_no_slot() {
         ))]
     );
 }
+
+#[test]
+fn a_number_for_a_string_parameter_stays_in_the_subset() {
+    // The library reads a number passed for a string parameter as its
+    // text (design.md "beatoraja Lua Skins", number text), so a frame-time
+    // call passing one stays in the walk's subset.
+    for draw in [
+        "function() return string.match(-102, \"notesgraph\") == nil end",
+        "function() return string.len(1.5) == 3 end",
+        "function() return string.sub(12345, 2, 3) == \"23\" end",
+        "function() return string.find(1234, 23) == 2 end",
+        "function() return string.gsub(\"abc\", \"b\", 50) == \"a50c\" end",
+    ] {
+        closed("", draw);
+    }
+    // A table there, or a string for a numeric parameter, opens it.
+    opens("", "function() return string.match({}, \"x\") end", false);
+    opens(
+        "",
+        "function() return string.sub(\"abc\", \"2\") end",
+        false,
+    );
+}
