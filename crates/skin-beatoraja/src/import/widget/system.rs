@@ -144,6 +144,47 @@ impl Cx<'_> {
         )
     }
 
+    /// A play skin's `bga` destination (design.md "Rendering and Skins",
+    /// BGA): an element of [`Source::Bga`], its keys' rects unbaked, as
+    /// each picture's size is known only at the frame, and its stretch
+    /// kept for placement, the cropping ones included; none, or an
+    /// unknown mode, takes the player's BGA expansion
+    /// (`play/SkinBGA.java:24-31`, `skin/SkinObject.java:318-326`). Its
+    /// filter is the BGA's own, the skin's not read. An offset-4 one that
+    /// may reach the lanes is dropped: the BGA is never SUDDEN+'s paint.
+    /// Charges no image.
+    pub(in super::super) fn bga(&mut self, dst: Dst) -> Result<(), ImportError> {
+        let at = dst.span;
+        let (charged, lowered) = self.lowered(&dst)?;
+        let role = super::super::policy::Role::Decorative;
+        if lowered == Lowered::Paint {
+            return self.drop_el(
+                role,
+                at,
+                NoteKind::Unsupported {
+                    object: Object::Bga,
+                },
+            );
+        }
+        let stretch = skin_model::bga::BgaStretch::of(dst.stretch);
+        let Some(c) = self.turning_image_common(&dst, charged, (Lowered::Image, role))? else {
+            return Ok(());
+        };
+        if self.untimed_refused(&c) {
+            return self.drop_el(c.role, at, NoteKind::Timer(TimerWhy::Untimed));
+        }
+        let mut rects = Vec::with_capacity(c.track.keys.len());
+        for k in &c.track.keys {
+            let r = self.key_rect(&c, k)?;
+            rects.push(
+                r.model_from(self.flip)
+                    .ok_or_else(|| self.range(at, "dst"))?,
+            );
+        }
+        let t = self.model_track(&c, &rects)?;
+        self.push_native(c, Source::Bga { stretch }, t, None)
+    }
+
     /// The system image of `color` for `c` and `c`'s keys baked against
     /// its 1x1 cell, as [`Self::src_image_rects`] gives an image record's.
     /// `None` once `c` is dropped.
