@@ -68,6 +68,7 @@ jobs:
           nix flake update rust-overlay
           nix eval .#devShells.x86_64-linux.default.drvPath
           nix eval .#devShells.x86_64-linux.fuzz.drvPath
+          nix eval .#devShells.x86_64-linux.test-device.drvPath
 
       - name: Check changed files
         if: steps.lock.outputs.changed == 'true'

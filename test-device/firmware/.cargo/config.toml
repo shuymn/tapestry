@@ -1,0 +1,6 @@
+# The firmware builds for the Pico 2's RP2350 (Cortex-M33, hard float) only.
+[build]
+target = "thumbv8m.main-none-eabihf"
+
+[target.thumbv8m.main-none-eabihf]
+rustflags = ["-C", "link-arg=--nmagic", "-C", "link-arg=-Tlink.x", "-C", "target-cpu=cortex-m33"]

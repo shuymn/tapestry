@@ -45,9 +45,11 @@ jobs:
         run: |
           scripts/dep-check.sh deny check advisories --deny index-failure
           scripts/dep-check.sh deny --manifest-path fuzz/Cargo.toml --config deny.toml check advisories --deny index-failure
+          scripts/dep-check.sh deny --manifest-path test-device/firmware/Cargo.toml --config deny.toml check advisories --deny index-failure
       # cargo-audit only logs index failures (on stderr, which dep-check.sh
       # scans).
       - name: cargo-audit
         run: |
           scripts/dep-check.sh audit --file Cargo.lock --deny warnings
           scripts/dep-check.sh audit --file fuzz/Cargo.lock --deny warnings
+          scripts/dep-check.sh audit --file test-device/firmware/Cargo.lock --deny warnings
