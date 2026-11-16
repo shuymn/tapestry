@@ -6314,12 +6314,11 @@ impl Run {
             let mut screen_stamp = None;
             // The frame's one instant: a play frame's chart time and the
             // turntable's state time and tick are all of it. A play frame
-            // reads it again once it has acquired its view (below).
+            // reads it again once it has acquired its view (below). Each
+            // frame that shows them takes the application's readouts at
+            // its instant: the presents of the last second, the local time
+            // and the uptime, the clock reading 0 at launch.
             let mut frame_at = self.clock.now();
-            // The application's readouts at that instant: the presents of
-            // the last second, the local time and the uptime, the clock
-            // reading 0 at launch.
-            let mut app = self.app.readouts(frame_at);
             // Whether a result frame was built with its skin (dev-tools:
             // G3's and G5's ends).
             #[cfg(feature = "dev-tools")]
@@ -6435,12 +6434,14 @@ impl Run {
                         continue;
                     };
                     *skipped = 0;
-                    // The frame's instant, read after its acquisition: the
-                    // view was published before it, so the chart time it
-                    // finalized was too (design.md "Rendering and Skins",
-                    // the note snapshot).
+                    // The frame's instant, read after its acquisition, and
+                    // its readouts at it: the view was published before it,
+                    // so with no negative input offset the chart time it
+                    // finalized is before the frame's; a negative offset
+                    // may put it up to that offset past (design.md
+                    // "Rendering and Skins", the note snapshot).
                     frame_at = self.clock.now();
-                    app = self.app.readouts(frame_at);
+                    let app = self.app.readouts(frame_at);
                     #[cfg(feature = "dev-tools")]
                     {
                         view_stamp = Some(crate::measure::ViewStamp {
@@ -6575,7 +6576,7 @@ impl Run {
                             update.as_deref(),
                             snapshot.as_ref(),
                             self.turntable.angle(),
-                            app,
+                            self.app.readouts(frame_at),
                         );
                         let drawn = match presented {
                             Some(Presented::Staged { token, .. }) => screen.loading_staged(
@@ -6709,7 +6710,7 @@ impl Run {
                         shown.logic.as_mut(),
                         changed,
                         frame_at,
-                        app,
+                        self.app.readouts(frame_at),
                     );
                     #[cfg(feature = "dev-tools")]
                     {
@@ -6801,6 +6802,7 @@ impl Run {
                     // selection frame's: its timers age on the same clock
                     // reading as its clock and uptime numbers.
                     let now = frame_at;
+                    let app = self.app.readouts(now);
                     if let Some(side) = &mut self.result {
                         side.drain();
                     }

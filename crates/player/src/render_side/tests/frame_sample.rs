@@ -1,7 +1,10 @@
 //! A play frame's one sample and its view's acquisition (#626): the frame
 //! reads the clock for its chart time after it acquires the newest view,
 //! so whatever that view finalized, through an input publication made
-//! before the publication of the view, is before the frame's chart time.
+//! before the publication of the view, is before the frame's chart time
+//! when no source has a negative input offset (a negative one counts an
+//! input up to that offset after it was received). The test's view is
+//! finalized as a source with offset 0 gives it.
 //! A scenario's capture writes both beside the frame (`chart_us` from
 //! `Drawn::play`, `finalized_us` from `Drawn::view`).
 
@@ -58,8 +61,9 @@ impl Screen for Frames {
 
 /// A view published while a play frame has begun and not yet acquired its
 /// view, finalized through the clock read there less 1 µs (as the input
-/// thread's publication gives it, the logic step finalizing there before
-/// it publishes the view), is the view that frame draws, and the frame's
+/// thread's publication gives it for a source with input offset 0, the
+/// logic step finalizing there before it publishes the view), is the view
+/// that frame draws, and the frame's
 /// chart time is after the view's finalized watermark: the frame reads
 /// the clock after the acquisition, not at its beginning, 2 ms before.
 #[test]
