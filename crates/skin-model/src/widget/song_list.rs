@@ -3,7 +3,8 @@
 //! slot, the cursor's row in the selected placement at the center slot.
 //!
 //! Slot `i` shows row `cursor + i − center` of the window. A slot whose
-//! row lies outside the list draws nothing; the list never wraps. A slot
+//! row the window lacks draws nothing; the player's window carries the
+//! list's ring, so a short list fills every slot by repeating. A slot
 //! whose placement does not draw draws none of its parts. The parts draw
 //! in passes over every slot: the bars, then the row texts, the lamps, the
 //! levels and the labels.

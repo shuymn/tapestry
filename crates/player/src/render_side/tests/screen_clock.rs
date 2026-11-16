@@ -23,6 +23,9 @@ struct Rig {
     clock: QpcClock,
     rule: rules::RulePreset,
     device: DeviceProfile,
+    /// The best's pace each attempt carries, ending at its best; none by
+    /// default.
+    pace: Option<Arc<[u32]>>,
 }
 
 impl Rig {
@@ -51,6 +54,7 @@ impl Rig {
             clock,
             rule: rules::tapestry(),
             device: DeviceProfile::default(),
+            pace: None,
         }
     }
 
@@ -87,9 +91,11 @@ impl Rig {
     /// [`play`](Self::play) with chart time 0 at `zero` on the clock: the
     /// logic step, for a rearm.
     fn play_from(&self, ready_state_at: TimeUs, zero: TimeUs) -> Logic<'_, SourceReader> {
-        let ready = self
-            .link
-            .prepare_attempt(attempt(&self.chart, None), || false);
+        let attempt = match &self.pace {
+            None => attempt(&self.chart, None),
+            Some(pace) => paced_attempt(&self.chart, Arc::clone(pace)),
+        };
+        let ready = self.link.prepare_attempt(attempt, || false);
         assert_eq!(ready.unwrap(), Preparation::Ready);
         self.link.commit_attempt().unwrap();
         let (logic, side) = Logic::<SourceReader>::new(
@@ -497,14 +503,17 @@ fn a_practice_start_refused_after_its_pause_keeps_the_session_origin() {
 
 /// C8: the play frames that carry the screen clock allocate nothing in
 /// the app region, a lifetime's origin and an anchored one, the first
-/// frames included; the positive control proves the region counts a
-/// build's allocation.
+/// frames included, each attempt carrying the best's pace; the positive
+/// control proves the region counts a build's allocation.
 #[cfg(feature = "dev-tools")]
 #[test]
 fn play_frames_screen_alloc() {
     let (control, _) = app_region_count(true, false);
     assert!(control.is_some_and(|n| n > 0), "{control:?}");
-    let rig = Rig::new(Some(LOADEND));
+    // Each attempt carries the best's pace: its chart's one target, a
+    // best of 2.
+    let mut rig = Rig::new(Some(LOADEND));
+    rig.pace = Some(Arc::from([0, 2]));
     rig.play_state(1);
     let t = rig.begin();
     rig.link.pause_loading().unwrap();
@@ -526,6 +535,31 @@ fn play_frames_screen_alloc() {
         .expect("the play's figures");
     assert_eq!(fig.render_app_allocations, Some(0));
     rig.link.exit();
+}
+
+/// The attempt of `chart` the game would make under the default preset,
+/// with a known best of `pace`'s last entry paced by it.
+fn paced_attempt(chart: &Chart, pace: Arc<[u32]>) -> AttemptContext {
+    let best = pace.last().copied().unwrap_or(0);
+    let attempt = game::Attempt {
+        score: game::ScoreBasis {
+            best,
+            best_known: true,
+            target: best,
+        },
+        pace: Some(pace),
+        ..game::Attempt::new(
+            1,
+            &rules::tapestry(),
+            TimeUs(1_000_000),
+            None,
+            game::NoteEnd::Play.of(chart),
+            game::finish_point(game::finish_anchor(chart, false)),
+            &game::ChartLabels::default(),
+            chart,
+        )
+    };
+    AttemptContext::new(attempt, crate::attempt_context::SIMPLE_SCRATCH, 1, false)
 }
 
 /// The decision screen of lifetime `lifetime`, drawn with its built-in

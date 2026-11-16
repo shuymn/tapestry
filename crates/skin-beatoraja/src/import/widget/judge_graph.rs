@@ -3,9 +3,10 @@
 //! `skin/SkinNoteDistributionGraph.java` at `0.8.9`), drawn on a generated
 //! chip grid and a white image: on a result skin, types 1 (by judgment)
 //! and 2 (early and late) become the model's judge graph; on a play skin,
-//! type 0 becomes its notes graph, the chart's notes by second. Any other
-//! type is dropped with a note: type 0 on a result and types 1 and 2 on
-//! play are not drawn yet.
+//! type 0 becomes its notes graph, the chart's notes by second, and types
+//! 1 and 2 the same judge graphs drawn from the play's judgments so far
+//! over the notes graph's bins. Any other type is dropped with a note:
+//! type 0 on a result and types 1 and 2 on selection are not drawn.
 //!
 //! Its destination keeps its track, timer, visibility, blend, colour,
 //! alpha and angle; its stretch fits the whole graph as the source fits
@@ -79,8 +80,8 @@ impl Cx<'_> {
         );
         let kind = match (self.kind, self.int_or(ty, "type", 0)?) {
             (ScreenKind::Play | ScreenKind::Selection, 0) => JudgeGraphKind::Notes,
-            (ScreenKind::Result, 1) => JudgeGraphKind::Judgment,
-            (ScreenKind::Result, 2) => JudgeGraphKind::EarlyLate,
+            (ScreenKind::Play | ScreenKind::Result, 1) => JudgeGraphKind::Judgment,
+            (ScreenKind::Play | ScreenKind::Result, 2) => JudgeGraphKind::EarlyLate,
             _ => return self.drop_el(role, at, NoteKind::UnsupportedField { field: "type" }),
         };
         let back = self.int_or(back_off, "backTexOff", 0)? != 1;
@@ -101,10 +102,15 @@ impl Cx<'_> {
             solid: 0,
             fit,
         };
-        // Its quads at worst, before its images are added; spent if it is
-        // later refused.
+        // Its quads at worst, the play's cursors included, before its images
+        // are added; spent if it is later refused.
+        let quads = if self.kind == ScreenKind::Play {
+            def.play_quads()
+        } else {
+            def.quads()
+        };
         self.budget
-            .widget_quads(def.quads())
+            .widget_quads(quads)
             .map_err(|l| self.limit(at, l))?;
         if dst.filter != 0 {
             self.ignored(at, NoteKind::Ignored { field: "filter" });

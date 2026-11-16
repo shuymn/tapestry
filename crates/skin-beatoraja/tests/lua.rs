@@ -502,10 +502,11 @@ fn the_library_runs_its_loops_as_metered_lua() {
 }
 
 #[test]
-fn the_library_never_coerces_a_string_to_a_number_or_back() {
+fn the_library_never_reads_a_string_as_a_number() {
     // Each is an ordinary error the skin can catch: a string where a
-    // number belongs, a number where a string belongs, a fraction where
-    // an integer belongs, a value out of range, string arithmetic.
+    // number belongs, a fraction where an integer belongs, a value out of
+    // range, string arithmetic. A number where a string belongs is its
+    // text (`a_number_passed_for_a_string_is_read_as_its_text`).
     for call in [
         "string.char(\"65\")",
         "string.char(65.5)",
@@ -514,16 +515,11 @@ fn the_library_never_coerces_a_string_to_a_number_or_back() {
         "string.sub(\"abc\", \"1\")",
         "string.sub(\"abc\", 1.5)",
         "string.byte(\"abc\", \"1\")",
-        "string.upper(1)",
-        "string.len(1)",
-        "string.find(1, \"1\")",
         "string.find(\"abc\", \"b\", \"1\")",
         "string.gsub(\"abc\", \"b\", \"x\", \"1\")",
-        "string.gsub(\"abc\", \"b\", 7)",
         "string.format(\"%d\", \"1\")",
         "string.format(\"%d\", 1.5)",
         "string.format(\"%f\", \"1\")",
-        "string.format(1)",
         "math.floor(\"1\")",
         "math.ceil(\"1\")",
         "math.abs(\"1\")",
@@ -532,7 +528,7 @@ fn the_library_never_coerces_a_string_to_a_number_or_back() {
         "math.max()",
         "table.insert({}, \"1\", 2)",
         "table.remove({ 1 }, \"1\")",
-        "table.concat({ 1 }, 1)",
+        "table.concat({ 1 }, \"\", \"1\")",
         "select(\"1\", 1)",
         "error(\"x\", \"1\")",
         "(\"1\") + 1",
@@ -557,6 +553,9 @@ fn the_library_never_coerces_a_string_to_a_number_or_back() {
          assert(math.max(2, 7.5, 7) == 7.5 and math.min(3, -1) == -1 and math.abs(-2) == 2)\n\
          assert(math.floor(-1.5) == -2 and math.ceil(1.2) == 2 and math.floor(3) == 3)\n\
          assert(not pcall(function() return (\"1\") + 1 end))\n\
+         assert(string.upper(1) == \"1\" and string.len(10) == 2 and string.find(1, \"1\") == 1)\n\
+         assert(string.gsub(\"abc\", \"b\", 7) == \"a7c\" and string.format(1) == \"1\")\n\
+         assert(table.concat({ 1, 2 }, 0) == \"102\" and tonumber(12, 10) == 12)\n\
          assert(skin_config.get_path(\"none.png\") == \"none.png\")",
     );
     import(&d).unwrap();
@@ -2560,4 +2559,158 @@ fn offset_tables_are_fresh() {
     )]);
     let h = header(&d).unwrap();
     common::lua_play(&h, &offsets_configured(&h), &Cancel::new()).unwrap();
+}
+
+/// A play skin whose configured pass computes the string `expr` gives at
+/// construction and draws it as quads, `i` at 1×1 pixels: the first at
+/// x = its length, then one per byte at x = that byte. `expr` names a
+/// value of any type; it is shown as `tostring` gives it unless it is a
+/// string, so a wrong type shows too.
+fn shown(pre: &str, expr: &str) -> TempDir {
+    folder(&[(
+        "s.luaskin",
+        &skin(
+            "",
+            &format!(
+                "{pre}\n\
+                 local v = ({expr})\n\
+                 if type(v) ~= \"string\" then v = type(v) .. \":\" .. tostring(v) end\n\
+                 local d = {{ {{ id = \"i\", dst = {{ {{ x = #v, y = 0, w = 1, h = 1 }} }} }} }}\n\
+                 for k = 1, #v do\n\
+                   d[#d + 1] = {{ id = \"i\", dst = {{ {{ x = string.byte(v, k), y = 2 * k, w = 1, h = 1 }} }} }}\n\
+                 end\n\
+                 skin.destination = d"
+            ),
+        ),
+    )])
+}
+
+/// The string the skin [`shown`] makes for `expr` draws: its quads read
+/// back, length first.
+fn read_shown(expr: &str) -> String {
+    // The folder stays until the skin is drawn: its atlas reads the image.
+    let d = shown("", expr);
+    let i = import(&d).unwrap_or_else(|e| panic!("{expr}: {e:?}"));
+    let xs: Vec<i32> = common::play::Drawn::new(i.imported.skin, 0)
+        .rects(1_000)
+        .iter()
+        .map(|r| r[0])
+        .collect();
+    let (len, bytes) = xs.split_first().expect("the length quad");
+    assert_eq!(
+        usize::try_from(*len).unwrap(),
+        bytes.len(),
+        "{expr}: {xs:?}"
+    );
+    String::from_utf8(bytes.iter().map(|&b| u8::try_from(b).unwrap()).collect()).unwrap()
+}
+
+#[test]
+fn a_number_passed_for_a_string_is_read_as_its_text() {
+    // Lua's coercion of a number where a string is expected, as the
+    // source's interpreter reads it (design.md "beatoraja Lua Skins",
+    // number text): every string parameter, the converted string used
+    // for its length, index and native.
+    for (expr, want) in [
+        // Banner's shape: a number id matched against a name, and a
+        // number pattern.
+        ("string.match(-102, \"notesgraph\")", "nil:nil"),
+        ("string.match(-102, \"%d+\")", "102"),
+        ("string.match(1234, 23)", "23"),
+        ("string.find(-102, \"0\")", "number:3"),
+        ("string.len(-102)", "number:4"),
+        ("string.sub(12345, 2, 3)", "23"),
+        ("string.byte(-102, 1)", "number:45"),
+        // The native gets the text, so a whole float is `50`, not Lua
+        // 5.4's `50.0`.
+        ("string.upper(50.0)", "50"),
+        ("string.lower(100 / 2)", "50"),
+        // A number format string, and `%s` of numbers.
+        ("string.format(5, 1)", "5"),
+        (
+            "string.format(\"%s|%s|%s\", 50.0, 0.5, -102)",
+            "50|0.5|-102",
+        ),
+        // Replacements: a number, a function's number, a table's number,
+        // and a subject that is a number.
+        ("(string.gsub(\"abc\", \"b\", 50))", "a50c"),
+        ("(string.gsub(\"abc\", \"b\", 2.5))", "a2.5c"),
+        (
+            "(string.gsub(\"abc\", \"b\", function() return 50.0 end))",
+            "a50c",
+        ),
+        ("(string.gsub(\"abc\", \"(b)\", { b = 7.0 }))", "a7c"),
+        ("(string.gsub(-102, \"1\", \"x\"))", "-x02"),
+        ("string.match(1 / 3, \".*\")", "0.33333333333333"),
+        // The table library's string parameters and entries, and
+        // `tonumber`'s subject in base 10.
+        ("table.concat({ 50.0, 0.5, -102 }, 0)", "5000.50-102"),
+        ("tonumber(12.0, 10)", "number:12"),
+    ] {
+        assert_eq!(read_shown(expr), want, "{expr}");
+    }
+}
+
+#[test]
+fn number_text_follows_one_rule() {
+    // Every row of the shared table, through two string functions: the
+    // text `string.sub` returns, and the length `string.len` measures.
+    for row in include_str!("number_text.txt")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+    {
+        let [lua, _, want] = row.split('\t').collect::<Vec<_>>()[..] else {
+            panic!("{row}");
+        };
+        assert_eq!(
+            read_shown(&format!("string.sub({lua}, 1, -1)")),
+            want,
+            "{lua}"
+        );
+        assert_eq!(
+            read_shown(&format!("string.len({lua})")),
+            format!("number:{}", want.len()),
+            "{lua}"
+        );
+    }
+}
+
+#[test]
+fn a_string_is_never_read_as_a_number() {
+    // The reverse coercion stays refused, as does a value that is
+    // neither, and a numeric parameter takes a number only: each an
+    // ordinary error at its line.
+    for expr in [
+        "string.len({})",
+        "string.sub(\"abc\", \"2\")",
+        "string.byte(\"abc\", \"1\")",
+        "(string.gsub(\"abc\", \"b\", \"x\", \"1\"))",
+        "math.floor(\"3\")",
+        "\"1\" + 1",
+    ] {
+        let d = shown("", expr);
+        assert_eq!(
+            located(import(&d)),
+            (LuaWhy::Error, "s.luaskin".into(), 6),
+            "{expr}"
+        );
+    }
+}
+
+#[test]
+fn a_number_s_text_is_charged_before_it_is_made() {
+    // Two charges of native work: the conversion's, a fixed 24 bytes taken
+    // before the text is made, and the `upper` result's, the converted
+    // text's length.
+    let work = |expr: &str| import(&shown("", expr)).unwrap().usage.native_work;
+    let two = work("string.upper(\"50\")");
+    let four = work("string.upper(\"50.0\")");
+    let number = work("string.upper(50.0)");
+    // Positive control: the result's charge tells a 2-byte result from a
+    // 4-byte one.
+    assert_eq!(four - two, 2);
+    // The number costs the conversion's 24 bytes and then the result's
+    // charge for `"50"`, 2 bytes, not Lua 5.4's `"50.0"`, 4 (that would be
+    // 26).
+    assert_eq!(number - two, 24);
 }

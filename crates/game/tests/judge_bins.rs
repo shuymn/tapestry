@@ -644,9 +644,9 @@ fn result_totals(
 }
 
 /// T11: the play's last bins and the result's timelines agree in their
-/// per-channel totals, each over its own axis: T2's play, the same at
-/// ×1.5, a practice round of seconds 2 to 3 and a play ended at 3 500 ms
-/// with the LN held.
+/// per-channel totals, each over its own axis: T2's play, a practice round
+/// of seconds 2 to 3 and a play ended at 3 500 ms with the LN held (×1.5
+/// below).
 #[test]
 fn the_plays_last_bins_and_the_results_timelines_agree_in_totals() {
     let rule = rules::tapestry();
@@ -680,23 +680,6 @@ fn the_plays_last_bins_and_the_results_timelines_agree_in_totals() {
         )
     );
 
-    // At ×1.5, loaded as the loader loads it.
-    let mut taps: Vec<(u8, i64)> = vec![(1, 1_200), (2, 1_500), (3, 1_800)];
-    for i in 0..23_i64 {
-        taps.push((u8::try_from(i % 7).unwrap() + 1, 2_000 + 40 * i));
-    }
-    taps.push((5, 3_500));
-    let fast = load(&bms(&taps, ""), Speed::from_twentieths(30).unwrap());
-    let mut p = Play::new(&fast.chart, &rule, &dev, None, 1_024, t2_inputs(3, 2));
-    assert!(p.logic.bin_judgments(&fast.chart, &fast.profile));
-    p.step(6_000 * MS);
-    let play = totals(&p.logic.view().judge_bins.bins);
-    assert_eq!(sum(&play), 27);
-    assert_eq!(
-        play,
-        result_totals(&p.stream, &fast.chart, None, Coverage::Recorded)
-    );
-
     // A practice round of seconds 2 to 3.
     let section = eval::Section {
         start: TimeUs(2_000 * MS),
@@ -720,4 +703,52 @@ fn the_plays_last_bins_and_the_results_timelines_agree_in_totals() {
     );
     // The notes outside the section are never judged.
     assert_eq!(p.logic.view().judge_bins.bins[1], [0; JUDGE_CHANNELS]);
+}
+
+/// T11 at ×1.5: T2's play, its long note included, loaded as the loader
+/// loads it at ×1.5, agrees with the result's timelines in its per-channel
+/// totals, and the long note counts on its release's side: released 120 ms
+/// early at play time, farther than its head's 26.7 ms late, its GREAT is
+/// early.
+#[test]
+fn at_1_5x_the_plays_last_bins_and_the_results_timelines_agree_in_totals() {
+    let rule = rules::tapestry();
+    let dev = device(&[0]);
+    let mut taps: Vec<(u8, i64)> = vec![(1, 1_200), (2, 1_500), (3, 1_800)];
+    for i in 0..23_i64 {
+        taps.push((u8::try_from(i % 7).unwrap() + 1, 2_000 + 40 * i));
+    }
+    taps.push((5, 3_500));
+    // The long note on lane 4 from 3.2 to 3.8 s: measure 1, slots 60 and
+    // 90 of 100.
+    let mut ln = vec!["00"; 100];
+    (ln[60], ln[90]) = ("01", "01");
+    let extra = format!("#LNTYPE 1\n#00154:{}\n", ln.concat());
+    let fast = load(&bms(&taps, &extra), Speed::from_twentieths(30).unwrap());
+    let longs = fast.chart.lanes.iter().flatten();
+    let longs = longs.filter(|n| matches!(n.kind, NoteKind::Long { .. }));
+    assert_eq!(longs.count(), 1);
+    // T2's inputs at ×1.5, but the long note's head pressed 40 ms late and
+    // released 180 ms early at 1× (26.7 and 120 ms at play time): a GREAT
+    // whose release lies farther.
+    let at = |ms: i64| ms * MS * 2 / 3;
+    let mut inputs: Vec<PhysicalInputEvent> = t2_inputs(3, 2)
+        .into_iter()
+        .filter(|e| e.received != TimeUs(at(3_225)) && e.received != TimeUs(at(3_680)))
+        .collect();
+    inputs.push(press(at(3_240), 0, lane(4)));
+    inputs.push(release(at(3_620), 0, lane(4)));
+    assert_eq!(inputs.len(), 16);
+    inputs.sort_by_key(|e| e.received);
+    let mut p = Play::new(&fast.chart, &rule, &dev, None, 1_024, inputs);
+    assert!(p.logic.bin_judgments(&fast.chart, &fast.profile));
+    p.step(6_000 * MS);
+    let play = totals(&p.logic.view().judge_bins.bins);
+    assert_eq!(sum(&play), 28);
+    assert_eq!(
+        play,
+        result_totals(&p.stream, &fast.chart, None, Coverage::Recorded)
+    );
+    assert_eq!(play[GR_E], 1, "the long note's GREAT is early");
+    assert_eq!(play[GR_L], 0);
 }

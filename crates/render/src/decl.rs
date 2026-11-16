@@ -712,6 +712,10 @@ impl Installation {
 pub fn skin_frame<'a>(f: &FrameInput<'a>) -> SkinFrame<'a> {
     let view = f.view;
     SkinFrame {
+        judgments: view
+            .judge_bins
+            .available
+            .then_some(view.judge_bins.bins.as_slice()),
         now: f.now,
         display_offset: f.display_offset,
         state_us: f.state_us,

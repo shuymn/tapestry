@@ -43,7 +43,7 @@ use winit::raw_window_handle::{
     DisplayHandle, HandleError, HasDisplayHandle, HasWindowHandle, RawWindowHandle,
     Win32WindowHandle, WindowHandle,
 };
-use winit::window::{Fullscreen, Window, WindowId};
+use winit::window::{Fullscreen, Window, WindowAttributes, WindowId};
 
 use crate::controls::Controls;
 use crate::menu_screen::WindowSink;
@@ -306,11 +306,7 @@ impl ApplicationHandler<Ask> for App {
                 m.refresh_rate_millihertz().unwrap_or(0)
             );
         }
-        let attrs = Window::default_attributes()
-            .with_title("tapestry")
-            .with_visible(false)
-            .with_fullscreen(Some(Fullscreen::Borderless(monitor)));
-        match event_loop.create_window(attrs) {
+        match event_loop.create_window(attributes(monitor)) {
             Ok(w) => {
                 self.focus(w.has_focus());
                 let surface = surface(&w);
@@ -638,6 +634,52 @@ impl WindowShown {
             .wait_timeout_while(shown, timeout, |shown| !*shown)
             .unwrap_or_else(PoisonError::into_inner);
         *shown
+    }
+}
+
+/// The client size `--dev-window` asks for (dev-tools), set once before
+/// the window opens ([`set_dev_window`]).
+#[cfg(feature = "dev-tools")]
+static DEV_WINDOW: std::sync::OnceLock<(u32, u32)> = std::sync::OnceLock::new();
+
+/// Makes the window that opens a window of client size `size`, in
+/// physical pixels, in place of the borderless fullscreen one
+/// (`--dev-window`, dev-tools); the first size set stays.
+#[cfg(feature = "dev-tools")]
+pub fn set_dev_window(size: (u32, u32)) {
+    let _ = DEV_WINDOW.set(size);
+}
+
+/// The window's attributes: hidden until shown, borderless fullscreen on
+/// `monitor`; with `--dev-window` (dev-tools), [`dev_window`]'s.
+fn attributes(monitor: Option<MonitorHandle>) -> WindowAttributes {
+    #[cfg(feature = "dev-tools")]
+    if let Some(&size) = DEV_WINDOW.get() {
+        let at = monitor.as_ref().map(MonitorHandle::position);
+        println!("window: a {}x{} window (--dev-window)", size.0, size.1);
+        return dev_window(size, at);
+    }
+    Window::default_attributes()
+        .with_title("tapestry")
+        .with_visible(false)
+        .with_fullscreen(Some(Fullscreen::Borderless(monitor)))
+}
+
+/// A window of client size `size` in physical pixels at `at` (the chosen
+/// monitor's top-left corner), hidden until shown, undecorated so its
+/// client area is the whole window, and fixed in size, so the render
+/// target is `size` (dev-tools).
+#[cfg(feature = "dev-tools")]
+fn dev_window(size: (u32, u32), at: Option<PhysicalPosition<i32>>) -> WindowAttributes {
+    let attrs = Window::default_attributes()
+        .with_title("tapestry")
+        .with_visible(false)
+        .with_decorations(false)
+        .with_resizable(false)
+        .with_inner_size(PhysicalSize::new(size.0, size.1));
+    match at {
+        Some(at) => attrs.with_position(at),
+        None => attrs,
     }
 }
 
@@ -1094,6 +1136,40 @@ fn menu_key(key: PhysicalKey, repeat: bool) -> Option<MenuKey> {
 
 #[cfg(test)]
 mod tests {
+    /// The window is borderless fullscreen on its monitor and sized by
+    /// nothing else.
+    #[test]
+    fn the_window_is_borderless_fullscreen() {
+        let a = super::attributes(None);
+        assert_eq!(
+            a.fullscreen,
+            Some(winit::window::Fullscreen::Borderless(None))
+        );
+        assert_eq!(a.inner_size, None);
+        assert!(!a.visible);
+    }
+
+    /// `--dev-window`'s window: the asked client size in physical pixels
+    /// at the monitor's corner, not fullscreen, undecorated and fixed in
+    /// size, hidden until shown.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_dev_window_has_the_asked_client_size_at_the_monitors_corner() {
+        use winit::dpi::{PhysicalPosition, PhysicalSize, Position, Size};
+        let at = PhysicalPosition::new(-13, 1080);
+        let a = super::dev_window((1920, 1080), Some(at));
+        assert_eq!(
+            a.inner_size,
+            Some(Size::Physical(PhysicalSize::new(1920, 1080)))
+        );
+        assert_eq!(a.position, Some(Position::Physical(at)));
+        assert_eq!(a.fullscreen, None);
+        assert!(!a.decorations);
+        assert!(!a.resizable);
+        assert!(!a.visible);
+        assert_eq!(super::dev_window((1280, 720), None).position, None);
+    }
+
     /// The window as the IME handler sees it: its size, and what it was
     /// asked.
     struct FakeWindow {

@@ -90,8 +90,10 @@ pub enum ScoreRate {
     /// `ex / 2p` once the attempt has a judgment (1 while `p` is 0), 0
     /// before.
     Judged,
-    /// The best paced linearly to the judged targets, `⌊B · p / n⌋ / 2n`;
-    /// none for a chart that declares `#RANDOM`.
+    /// The best paced to the judged targets over `2n`: `ghost[p] / 2n` by
+    /// the best play's series ([`PlayScore::pace`](crate::PlayScore::pace))
+    /// while the attempt has one, else `⌊B · p / n⌋ / 2n`; none for a chart
+    /// that declares `#RANDOM`.
     PacedBest,
     /// `B / 2n`; none for a chart that declares `#RANDOM`.
     Best,

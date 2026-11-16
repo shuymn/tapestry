@@ -274,3 +274,92 @@ fn image_conditions_wait_for_the_images_while_loading() {
         "present: −194, not 194, the image"
     );
 }
+
+/// A skin whose title card, a text in a two-page bitmap font, draws while
+/// the chart has no back image (194), beside fifteen 4096×3072 files and a
+/// file choice `Close` over a 64×64 default and a 4096×3072 `big.bmp`,
+/// each drawn, with `close` configured.
+fn title_card_skin(close: Option<&str>) -> common::Loaded {
+    let base = 15;
+    let sources = common::join((0..base).map(|i| format!(r#"{{"id": "{i}", "path": "{i}.bmp"}}"#)));
+    let images = common::join(
+        (0..base).map(|i| format!(r#"{{"id": "{i}", "src": "{i}", "w": 1, "h": 1}}"#)),
+    );
+    let dsts =
+        common::join((0..base).map(|i| format!(r#"{{"id": "{i}", "dst": [{{"w": 1, "h": 1}}]}}"#)));
+    let json = common::hd(&format!(
+        r#""filepath": [{{"name": "Close", "path": "close/*.bmp", "def": "small"}}],
+           "source": [{sources}, {{"id": "c", "path": "close/*.bmp"}}],
+           "image": [{images}, {{"id": "c", "src": "c", "w": 1, "h": 1}}],
+           "font": [{{"id": "f", "path": "t.fnt"}}],
+           "text": [{{"id": "title", "font": "f", "size": 24, "constantText": "AB"}}],
+           "destination": [{dsts}, {{"id": "c", "dst": [{{"w": 1, "h": 1}}]}},
+             {{"id": "title", "op": [194], "dst": [{{"x": 700, "y": 500, "w": 300, "h": 30}}]}}]"#
+    ));
+    let dir = common::skin(&[("s.json", &json)]);
+    for i in 0..base {
+        common::write(
+            dir.path(),
+            &format!("{i}.bmp"),
+            &common::bmp_header(4_096, 3_072),
+        );
+    }
+    common::write(dir.path(), "close/small.bmp", &common::bmp_header(64, 64));
+    common::write(
+        dir.path(),
+        "close/big.bmp",
+        &common::bmp_header(4_096, 3_072),
+    );
+    let fnt = "info face=\"t\" size=24 padding=0,0,0,0\n\
+               common lineHeight=24 base=20 scaleW=1024 scaleH=1024 pages=2\n\
+               page id=0 file=\"t0.png\"\npage id=1 file=\"t1.png\"\n\
+               char id=65 x=0 y=0 width=10 height=20 xoffset=0 yoffset=0 xadvance=12 page=0\n\
+               char id=66 x=0 y=0 width=10 height=20 xoffset=0 yoffset=0 xadvance=12 page=1\n";
+    common::write(dir.path(), "t.fnt", fnt.as_bytes());
+    common::png(dir.path(), "t0.png", 1_024, 1_024);
+    common::png(dir.path(), "t1.png", 1_024, 1_024);
+    let result = common::import_with(dir.path(), |c| {
+        if let Some(v) = close {
+            c.files.insert("Close".into(), v.into());
+        }
+    });
+    common::Loaded { dir, result }
+}
+
+/// The title card's bitmap font is charged once its condition (194, no
+/// back image) is a chart fact, as every drawable element's files are:
+/// with the large closing sheet chosen, the variant reads fifteen and one
+/// 4096×3072 files and two 1024×1024 pages, 194 Mi, past the former
+/// 192 Mi and within the limit, and imports. The default sheet fits
+/// either way. (The files are headers only, so nothing is drawn: 194's
+/// reading is `the_image_conditions_read_the_published_table`.)
+#[test]
+fn a_title_card_font_beside_a_large_chosen_sheet_fits_the_texel_total() {
+    const FILE: u64 = 4_096 * 3_072;
+    const PAGE: u64 = 1_024 * 1_024;
+    const CHOSEN: u64 = 16 * FILE + 2 * PAGE;
+    const { assert!(CHOSEN > 192 << 20) };
+    let l = title_card_skin(Some("big.bmp"));
+    let i = match &l.result {
+        Ok(i) => i,
+        Err(e) => panic!("the chosen sheet beside the title card is refused: {e:?}"),
+    };
+    assert_eq!(
+        i.report.files,
+        [skin_beatoraja::FileChoice {
+            choice: 0,
+            candidate: Some(0),
+            rule: skin_beatoraja::Rule::Configured,
+            ambiguous: false,
+        }],
+    );
+    // The fifteen files, the chosen sheet and the font's two pages.
+    assert_eq!(
+        (i.report.usage.fonts, i.report.usage.files),
+        (1, 18),
+        "the title card's font is charged: {:?}",
+        kinds(&i.report)
+    );
+    let d = title_card_skin(None);
+    assert_eq!(d.report().usage.files, 18, "the default sheet fits");
+}

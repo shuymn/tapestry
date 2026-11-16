@@ -415,6 +415,9 @@ pub struct Harness {
     pub turntable: i32,
     /// The state clock each frame gives: by default 0.
     pub state_us: i64,
+    /// The frames' judgment bins ([`SkinFrame::judgments`]): `None`, unavailable,
+    /// by default.
+    pub judgments: Option<Vec<[u32; 9]>>,
     /// The chart time in µs the screen clock starts at: each frame's
     /// `screen_us` is its `now` less this (`SkinFrame::screen_us`). By
     /// default READY's start, so an untimed element runs from READY.
@@ -459,6 +462,7 @@ impl Harness {
             readouts: None,
             turntable: 0,
             state_us: 0,
+            judgments: None,
             screen_from,
             chart: chart.clone(),
             notes: NoteFacts::new(chart),
@@ -501,6 +505,7 @@ impl Harness {
             follow(&mut self.notes, &self.chart, ev);
         }
         let frame = SkinFrame {
+            judgments: self.judgments.as_deref(),
             app: self.app,
             state_us: self.state_us,
             screen_us: now_us.saturating_sub(self.screen_from),

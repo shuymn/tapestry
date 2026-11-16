@@ -1160,3 +1160,490 @@ fn extreme_weights_stay_finite() {
         assert_eq!(shown_ema(&fx, 0), want, "{alpha}");
     }
 }
+
+// ---------------------------------------------------------------------
+// The judgment graphs (S10-10j).
+
+/// The play's judgment fixture at 1×: taps at 1.2, 1.5 and 1.8 s; 23
+/// taps from 2.0 to 2.88 s; an LN from 3.2 to 3.8 s, a tap at 3.5 s and
+/// a mine at 3.4 s. Length 3.8 s: 5 bins of 1 s; the judgeable notes per
+/// bin are 0, 3, 23, 2 and 0, so the scale is 30.
+fn judged_chart() -> Chart {
+    let mut b = ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(1_200 * MS))
+        .tap(lane(2), TimeUs(1_500 * MS))
+        .tap(lane(3), TimeUs(1_800 * MS));
+    for i in 0..23_i64 {
+        b = b.tap(
+            lane(1 + u8::try_from(i % 7).unwrap()),
+            TimeUs((2_000 + 40 * i) * MS),
+        );
+    }
+    let mut chart = b
+        .long(lane(4), TimeUs(3_200 * MS), TimeUs(3_800 * MS))
+        .tap(lane(5), TimeUs(3_500 * MS))
+        .mine(lane(6), TimeUs(3_400 * MS), 3)
+        .build()
+        .unwrap();
+    chart.meta.length = ChartSummary::of(&chart).length;
+    chart
+}
+
+fn judgment_graph(kind: JudgeGraphKind, reverse: bool, delay_ms: i64) -> JudgeGraphDef {
+    JudgeGraphDef {
+        kind,
+        delay: TimeUs(delay_ms * MS),
+        reverse,
+        back: false,
+        chips: SOLID,
+        solid: SOLID,
+        fit: skin_model::GraphFit::Stretch,
+    }
+}
+
+/// Bins of the 9 channels `[PG, GR e, GD e, BD e, PR e, GR l, GD l, BD l,
+/// PR l]`, the given ones set, 512 in all as the play view holds them.
+fn bins(set: &[(usize, [u32; 9])]) -> Vec<[u32; 9]> {
+    let mut v = vec![[0; 9]; 512];
+    for &(i, b) in set {
+        v[i] = b;
+    }
+    v
+}
+
+/// The view at 2.3 s of the fixture's play: bin 1 PERFECT, GREAT early
+/// and POOR late; bin 2 BAD early, GOOD late and two POORs late.
+fn at_2300() -> Vec<[u32; 9]> {
+    bins(&[
+        (1, [1, 1, 0, 0, 0, 0, 0, 0, 1]),
+        (2, [0, 0, 0, 1, 0, 0, 1, 0, 2]),
+    ])
+}
+
+/// The view at the end: bin 2's 21 POORs late, bin 3's GREAT early and
+/// POOR late.
+fn at_end() -> Vec<[u32; 9]> {
+    bins(&[
+        (1, [1, 1, 0, 0, 0, 0, 0, 0, 1]),
+        (2, [0, 0, 0, 1, 0, 0, 1, 0, 21]),
+        (3, [0, 1, 0, 0, 0, 0, 0, 0, 1]),
+    ])
+}
+
+/// A 300 × 100 graph of `def` over the fixture (60 px a bin, a cell
+/// 100/30 px), its frames at 1×.
+fn judged_fx(chart: &Chart, profile: &ChartProfile, def: JudgeGraphDef) -> Fx {
+    let s = skin(
+        vec![el(Source::JudgeGraph(0), [0, 0, 300, 100])],
+        PlayDefs {
+            judge_graphs: vec![def],
+            ..PlayDefs::default()
+        },
+    );
+    let score = PlayScore {
+        profile: Some(profile),
+        ..PlayScore::NONE
+    };
+    Fx::new(s, chart, &ready(score))
+}
+
+/// Cell `k`'s centre of a 100 px graph scaled to 30 cells.
+fn cell30(k: f32) -> f32 {
+    100.0 - (k + 0.5) * 100.0 / 30.0
+}
+
+/// C37: a play's judgment graph stacks each bin's notes less its
+/// judgments in grey, then its judgments by channel in the source's
+/// colours and order (reversed under `orderReverse`), scaled by the
+/// largest bin's notes: at 2.3 s bin 2 holds 19 grey, then GOOD, BAD and
+/// two POORs over 30 cells (a scale from the judged counts would be 20);
+/// at the end bin 2 has no grey and bin 1 its three judgments.
+#[test]
+fn a_judgment_graph_stacks_the_views_judgments_over_its_notes() {
+    let chart = judged_chart();
+    let profile = ChartProfile::of(&chart, &[]);
+    let grey = rgb(0x55_5555);
+    let (pg, gr, gd, bd, pr) = (
+        rgb(0x00_88ff),
+        rgb(0x00_ff88),
+        rgb(0xff_ff00),
+        rgb(0xff_8800),
+        rgb(0xff_0000),
+    );
+    let judgment = |reverse| judgment_graph(JudgeGraphKind::Judgment, reverse, 0);
+    let mut fx = judged_fx(&chart, &profile, judgment(false));
+    fx.h.judgments = Some(at_2300());
+    fx.frame(2_300);
+    // Bin 2 spans x 120 to 180; the play cursor covers 138 to 174.
+    let x = 128.0;
+    fx.is(x, cell30(0.0), grey);
+    fx.is(x, cell30(18.0), grey);
+    fx.is(x, cell30(19.0), gd);
+    fx.is(x, cell30(20.0), bd);
+    fx.is(x, cell30(21.0), pr);
+    fx.is(x, cell30(22.0), pr);
+    // Bin 1: three notes, all judged.
+    fx.is(90.0, cell30(0.0), pg);
+    fx.is(90.0, cell30(1.0), gr);
+    fx.is(90.0, cell30(2.0), pr);
+    // Bin 3's two notes, none judged yet.
+    fx.is(210.0, cell30(1.0), grey);
+    fx.empty(210.0, cell30(2.0));
+
+    fx.h.judgments = Some(at_end());
+    fx.frame(4_000);
+    fx.is(x, cell30(0.0), gd);
+    fx.is(x, cell30(1.0), bd);
+    fx.is(x, cell30(2.0), pr);
+    fx.is(x, cell30(22.0), pr);
+    fx.empty(x, cell30(23.0));
+    fx.is(210.0, cell30(0.0), gr);
+    fx.is(210.0, cell30(1.0), pr);
+
+    // Reversed: from the last channel.
+    let mut fx = judged_fx(&chart, &profile, judgment(true));
+    fx.h.judgments = Some(at_2300());
+    fx.frame(2_300);
+    fx.is(x, cell30(0.0), pr);
+    fx.is(x, cell30(1.0), pr);
+    fx.is(x, cell30(2.0), bd);
+    fx.is(x, cell30(3.0), gd);
+    fx.is(x, cell30(4.0), grey);
+    fx.is(x, cell30(22.0), grey);
+
+    // Type 2 at the end: BAD early, GOOD late, then the POORs late.
+    let early_late = judgment_graph(JudgeGraphKind::EarlyLate, false, 0);
+    let mut fx = judged_fx(&chart, &profile, early_late);
+    fx.h.judgments = Some(at_end());
+    fx.frame(4_000);
+    fx.is(x, cell30(0.0), rgb(0x00_4488));
+    fx.is(x, cell30(1.0), rgb(0xcc_6600));
+    fx.is(x, cell30(2.0), rgb(0x44_2200));
+    fx.is(x, cell30(22.0), rgb(0x44_2200));
+    // GREAT early is its own colour on type 2.
+    fx.is(210.0, cell30(0.0), rgb(0x00_88ff));
+}
+
+/// C36, C37: unavailable bins draw nothing, not even the background;
+/// available empty bins (READY) draw every note grey; the reveal runs over
+/// `delay` on the screen timer: at 100 ms of 250 only the first 40 % of
+/// the width.
+#[test]
+fn unavailable_bins_draw_nothing_and_empty_ones_every_note_grey() {
+    let chart = judged_chart();
+    let profile = ChartProfile::of(&chart, &[]);
+    let def = JudgeGraphDef {
+        back: true,
+        ..judgment_graph(JudgeGraphKind::Judgment, false, 250)
+    };
+    let mut fx = judged_fx(&chart, &profile, def);
+    fx.h.screen_from = -1_000 * MS;
+    fx.h.judgments = None;
+    fx.frame(-700);
+    for x in [30.0, 90.0, 150.0, 270.0] {
+        fx.empty(x, cell30(0.0));
+        fx.empty(x, 5.0);
+    }
+    fx.h.judgments = Some(bins(&[]));
+    // 100 ms of the 250 ms reveal: chips to x = 120 only.
+    fx.frame(-900);
+    fx.is(90.0, cell30(2.0), rgb(0x55_5555));
+    assert_ne!(fx.px(150.0, cell30(0.0)).0, rgb(0x55_5555));
+    // 300 ms: all of it, every note grey.
+    fx.frame(-700);
+    fx.is(150.0, cell30(22.0), rgb(0x55_5555));
+    fx.is(210.0, cell30(1.0), rgb(0x55_5555));
+    // The background is drawn where no chip is.
+    assert!(fx.px(270.0, cell30(0.0)).1 > 0);
+}
+
+/// C37: the judgment graphs draw the play cursor at `t·W/(len·1000)`,
+/// 3/5 of a second wide (2.3 s of 5 over 300 px: x 138 to 174), and a
+/// section attempt's lines, as the notes graph does; at READY no cursor.
+#[test]
+fn the_judgment_graphs_draw_the_cursors() {
+    let chart = judged_chart();
+    let profile = ChartProfile::of(&chart, &[]);
+    let white = rgb(0xff_ffff);
+    for kind in [JudgeGraphKind::Judgment, JudgeGraphKind::EarlyLate] {
+        let mut fx = judged_fx(&chart, &profile, judgment_graph(kind, false, 0));
+        fx.h.judgments = Some(at_2300());
+        fx.frame(-500);
+        fx.empty(150.0, 5.0);
+        fx.frame(2_300);
+        fx.is(140.0, 5.0, white);
+        fx.is(172.0, 5.0, white);
+        fx.empty(136.0, 5.0);
+        fx.empty(176.0, 5.0);
+    }
+    // C38: a section attempt over seconds 2 to 3 draws the whole chart,
+    // its notes outside the section grey, with the section's start
+    // (green, x 120 to 156) and end (red, 180 to 216) lines; its READY
+    // frame draws every bin grey.
+    let section = Section {
+        start: TimeUs(2_000 * MS),
+        end: TimeUs(3_000 * MS),
+        lead_in: TimeUs(1_000 * MS),
+        initial_gauges: GAUGES.iter().map(|g| g.start).collect(),
+    };
+    let s = skin(
+        vec![el(Source::JudgeGraph(0), [0, 0, 300, 100])],
+        PlayDefs {
+            judge_graphs: vec![judgment_graph(JudgeGraphKind::Judgment, false, 0)],
+            ..PlayDefs::default()
+        },
+    );
+    let practice = PlayContext {
+        attempt: Attempt::Section(&section),
+        score: PlayScore {
+            profile: Some(&profile),
+            ..PlayScore::NONE
+        },
+        ..full(1_000)
+    };
+    let mut fx = Fx::new(s, &chart, &practice);
+    fx.h.judgments = Some(bins(&[]));
+    fx.frame(1_500);
+    // The play cursor at 1.5 s covers x 90 to 126.
+    fx.is(130.0, 5.0, rgb(0x80_ff80));
+    fx.is(200.0, 5.0, rgb(0xff_8080));
+    fx.is(70.0, cell30(2.0), rgb(0x55_5555));
+    fx.is(170.0, cell30(22.0), rgb(0x55_5555));
+    // Its own judgments, the section's only.
+    fx.h.judgments = Some(bins(&[(2, [0, 0, 0, 0, 0, 0, 0, 0, 23])]));
+    fx.frame(3_100);
+    fx.is(170.0, cell30(0.0), rgb(0xff_0000));
+    fx.is(70.0, cell30(0.0), rgb(0x55_5555));
+}
+
+/// C38, G25, G26: practice at ×1.5 over the 1× section 2.1 to 3.0 s
+/// (play time 1.4 to 2.0 s). Each round prepares its own play, as every
+/// attempt does, and draws its own view. Round 1 at play time 1.8 s (1×
+/// 2.7 s): bin 2 holds 10 grey, 10 PERFECT and 3 GREAT, bin 1's three
+/// notes outside the section stay grey, and the play cursor covers x 162 to
+/// 198 at 1× (not 108 to 144 at play time). Round 2's READY draws bin 2
+/// all grey, round 1's judgments gone, and then its own: 18 grey and 5
+/// POOR. The section's lines are at 1×: green x 126 to 162, red 180 to
+/// 216.
+#[test]
+fn each_practice_round_draws_its_own_judgments_at_its_speed() {
+    let chart = judged_chart();
+    let profile = ChartProfile::of(&chart, &[]);
+    let section = Section {
+        start: TimeUs(1_400 * MS),
+        end: TimeUs(2_000 * MS),
+        lead_in: TimeUs(1_000 * MS),
+        initial_gauges: GAUGES.iter().map(|g| g.start).collect(),
+    };
+    let practice = PlayContext {
+        attempt: Attempt::Section(&section),
+        score: PlayScore {
+            profile: Some(&profile),
+            speed: Speed::from_twentieths(30).unwrap(),
+            ..PlayScore::NONE
+        },
+        ..full(1_000)
+    };
+    let round = || {
+        let s = skin(
+            vec![el(Source::JudgeGraph(0), [0, 0, 300, 100])],
+            PlayDefs {
+                judge_graphs: vec![judgment_graph(JudgeGraphKind::Judgment, false, 0)],
+                ..PlayDefs::default()
+            },
+        );
+        Fx::new(s, &chart, &practice)
+    };
+    let (grey, pg, gr, pr) = (
+        rgb(0x55_5555),
+        rgb(0x00_88ff),
+        rgb(0x00_ff88),
+        rgb(0xff_0000),
+    );
+    let white = rgb(0xff_ffff);
+    // Bin 2 (x 120 to 180) left of the green line; bin 1 (60 to 120).
+    let x = 123.0;
+    let mut one = round();
+    one.h.judgments = Some(bins(&[(2, [10, 3, 0, 0, 0, 0, 0, 0, 0])]));
+    one.frame(1_800);
+    one.is(x, cell30(9.0), grey);
+    one.is(x, cell30(10.0), pg);
+    one.is(x, cell30(19.0), pg);
+    one.is(x, cell30(20.0), gr);
+    one.is(x, cell30(22.0), gr);
+    one.is(90.0, cell30(2.0), grey);
+    one.is(190.0, 5.0, white);
+    // Not at play time (x 108 to 144).
+    one.empty(110.0, 5.0);
+    one.is(130.0, 5.0, rgb(0x80_ff80));
+    one.is(214.0, 5.0, rgb(0xff_8080));
+
+    let mut two = round();
+    two.h.judgments = Some(bins(&[]));
+    two.frame(-500);
+    for k in [0.0, 10.0, 20.0, 22.0] {
+        two.is(x, cell30(k), grey);
+    }
+    two.empty(x, cell30(23.0));
+    two.h.judgments = Some(bins(&[(2, [0, 0, 0, 0, 0, 0, 0, 0, 5])]));
+    two.frame(1_600);
+    two.is(x, cell30(10.0), grey);
+    two.is(x, cell30(17.0), grey);
+    two.is(x, cell30(18.0), pr);
+    two.is(x, cell30(22.0), pr);
+    two.is(90.0, cell30(2.0), grey);
+}
+
+/// C36: a widened bin sums its seconds' notes: from 511 s the bins are
+/// 2 s wide, and the notes at 510 and 511 s are bin 255's two (the fullest
+/// second would give one): with one judged, grey then PERFECT.
+#[test]
+fn a_widened_bin_holds_its_seconds_notes() {
+    let mut chart = ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(510_000 * MS))
+        .tap(lane(2), TimeUs(511_000 * MS))
+        .build()
+        .unwrap();
+    chart.meta.length = ChartSummary::of(&chart).length;
+    let profile = ChartProfile::of(&chart, &[]);
+    assert_eq!(profile.bins().len(), 257);
+    let s = skin(
+        vec![el(Source::JudgeGraph(0), [0, 0, 1_285, 100])],
+        PlayDefs {
+            judge_graphs: vec![judgment_graph(JudgeGraphKind::Judgment, false, 0)],
+            ..PlayDefs::default()
+        },
+    );
+    let score = PlayScore {
+        profile: Some(&profile),
+        ..PlayScore::NONE
+    };
+    let mut fx = Fx::new(s, &chart, &ready(score));
+    fx.h.judgments = Some(bins(&[(255, [1, 0, 0, 0, 0, 0, 0, 0, 0])]));
+    fx.frame(-500);
+    // 5 px a bin, scale 20: 5 px a cell.
+    let x = 255.0 * 5.0 + 2.5;
+    fx.is(x, 97.5, rgb(0x55_5555));
+    fx.is(x, 92.5, rgb(0x00_88ff));
+    fx.empty(x, 87.5);
+}
+
+/// C21, C37: with widened bins every column is `bin_seconds` wide, the
+/// last one padded past the chart, so the cursors are placed on the axis
+/// the columns represent, their count times their width (as the source
+/// places a time at its second's column, `skin/SkinNoteDistributionGraph.java`
+/// at `0.8.9`, lines 203-230 and 302). A tap at 513.5 s gives 515 seconds,
+/// 2 s bins and 258 columns of 5 px: 516 s over 1 290 px, 2.5 px a second.
+/// At 513.5 s the play cursor covers x 1 283.75 to 1 285.25, inside the
+/// tap's column 256 (1 280 to 1 285), not 1 286.25 in the padding column
+/// 257 as over the 515 seconds; the section's start at 506 s (green, 1 265
+/// to 1 266.5) and end at 510 s (red, 1 275 to 1 276.5) likewise; on the
+/// notes graph and both judgment graphs.
+#[test]
+fn widened_columns_place_the_cursors_in_their_own_column() {
+    let mut chart = ChartBuilder::new(150_000)
+        .tap(lane(1), TimeUs(1_000 * MS))
+        .tap(lane(1), TimeUs(513_500 * MS))
+        .build()
+        .unwrap();
+    chart.meta.length = ChartSummary::of(&chart).length;
+    let profile = ChartProfile::of(&chart, &[]);
+    assert_eq!(
+        (
+            profile.seconds().len(),
+            profile.bin_seconds(),
+            profile.bins().len()
+        ),
+        (515, 2, 258)
+    );
+    let section = Section {
+        start: TimeUs(506_000 * MS),
+        end: TimeUs(510_000 * MS),
+        lead_in: TimeUs(1_000 * MS),
+        initial_gauges: GAUGES.iter().map(|g| g.start).collect(),
+    };
+    let practice = PlayContext {
+        attempt: Attempt::Section(&section),
+        score: PlayScore {
+            profile: Some(&profile),
+            ..PlayScore::NONE
+        },
+        ..full(1_000)
+    };
+    let (white, green, red) = (rgb(0xff_ffff), rgb(0x80_ff80), rgb(0xff_8080));
+    for kind in [
+        JudgeGraphKind::Notes,
+        JudgeGraphKind::Judgment,
+        JudgeGraphKind::EarlyLate,
+    ] {
+        let s = skin(
+            vec![el(Source::JudgeGraph(0), [0, 0, 1_290, 100])],
+            PlayDefs {
+                judge_graphs: vec![judgment_graph(kind, false, 0)],
+                ..PlayDefs::default()
+            },
+        );
+        let mut fx = Fx::new(s, &chart, &practice);
+        fx.h.judgments = Some(bins(&[]));
+        fx.frame(513_500);
+        // The graph's top cells hold no chip.
+        let y = 5.0;
+        fx.is(1_284.5, y, white);
+        fx.empty(1_286.75, y);
+        fx.is(1_265.75, y, green);
+        fx.empty(1_268.0, y);
+        fx.is(1_275.75, y, red);
+        fx.empty(1_278.0, y);
+        // The tap's chip in column 256, left of the cursor.
+        assert!(fx.px(1_281.0, 97.5).1 > 0, "{kind:?}");
+        fx.empty(1_287.5, 97.5);
+    }
+}
+
+/// C39: on play a judgment graph is charged its cursors with the
+/// result's quads (type 2 with its background: 5 702 + 6), and three of
+/// them pass the budget, refusing the skin.
+#[test]
+fn a_play_judgment_graph_is_charged_its_cursors() {
+    let base = skin(Vec::new(), PlayDefs::default()).quad_capacity();
+    let def = JudgeGraphDef {
+        back: true,
+        ..judgment_graph(JudgeGraphKind::EarlyLate, false, 0)
+    };
+    let defs = || PlayDefs {
+        judge_graphs: vec![def],
+        ..PlayDefs::default()
+    };
+    let one = skin(vec![el(Source::JudgeGraph(0), [0, 0, 300, 100])], defs());
+    assert_eq!(one.quad_capacity() - base, 5_708);
+    assert_eq!(def.play_quads(), 5_708);
+    assert_eq!(def.quads(), 5_702);
+    let three = Skin::new_play(
+        SkinDef {
+            fit: Fit::Fixed,
+            regions: [RegionDef {
+                anchor: Anchor::TopLeft,
+                optional: false,
+            }; Region::COUNT],
+            whens: Vec::new(),
+            sheet: sheet(),
+            lanes: None,
+            elements: (0..3)
+                .map(|_| el(Source::JudgeGraph(0), [0, 0, 300, 100]))
+                .collect(),
+            widgets: skin_model::WidgetDefs::default(),
+            bomb_up_to: None,
+            close: None,
+            loadend: None,
+            present: None,
+        },
+        defs(),
+    );
+    assert!(
+        matches!(
+            three,
+            Err(skin_model::LoadError::TooManyWidgetQuads { n: 17_124 })
+        ),
+        "{three:?}"
+    );
+}
