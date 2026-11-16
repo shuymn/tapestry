@@ -49,12 +49,14 @@ fn image(id: u16, name: &str) -> BgaImage {
 /// 120 BPM; a STOP of two beats (1 s) at measure 1's start; 7 BPM from
 /// measure 1's half (4 s) on, a beat 60/7 s. A key note at 0 and at two
 /// thirds of measure 2 (with a base event there), a base event at a third
-/// of measure 0 and a layer event at three quarters of measure 1.
+/// of measure 0, a layer event at three quarters of measure 1 and a poor
+/// line on measure 2.
 ///
 /// Exact times: base 0 at 2/3 s = 666 666.6 µs; layer at 4 s + 60/7 s =
-/// 12 571 428.571 µs; measure 2 starts at 4 s + 120/7 s and the base event
-/// at two thirds of it at 4 s + 280/7 s = 44 000 000 µs exactly, where
-/// flooring the measure's start and the offset apart gives 43 999 999.
+/// 12 571 428.571 µs; measure 2 starts at 4 s + 120/7 s = 148/7 s, the
+/// poor sequence's time, 21 142 857.142 µs, and the base event at two
+/// thirds of it at 4 s + 280/7 s = 44 000 000 µs exactly, where flooring
+/// the measure's start and the offset apart gives 43 999 999.
 const TIMED: &str = "\
 #BPM 120
 #BPM01 7
@@ -67,6 +69,7 @@ const TIMED: &str = "\
 #00108:0001
 #00107:00000001
 #00204:000002
+#00206:0102
 #00211:000001
 ";
 
@@ -83,7 +86,14 @@ fn base_and_layer_events_time_through_bpm_and_stop() {
         "base events at their exact times floored once"
     );
     assert_eq!(bga.layer(), [event(12_571_428, Some(0))].as_slice());
-    assert!(bga.poor().is_empty());
+    assert_eq!(
+        bga.poor(),
+        [PoorSequence {
+            time: TimeUs(21_142_857),
+            frames: vec![Some(BgaImageId(0)), Some(BgaImageId(1))].into(),
+        }]
+        .as_slice()
+    );
 }
 
 #[test]
@@ -92,7 +102,7 @@ fn practice_speed_maps_bga_like_notes() {
         let speed = Speed::from_twentieths(k).unwrap();
         let loaded = load_at(TIMED, speed);
         let bga = loaded.chart.bga.unwrap();
-        // floor(T × 20 / k) from the exact T: 2/3 s, 88/7 s, 44 s.
+        // floor(T × 20 / k) from the exact T: 2/3 s, 88/7 s, 44 s, 148/7 s.
         let at = |numer: i128, denom: i128| {
             i64::try_from((numer * 20).div_euclid(denom * i128::from(k))).unwrap()
         };
@@ -103,6 +113,8 @@ fn practice_speed_maps_bga_like_notes() {
             "base at {k}/20"
         );
         assert_eq!(times(bga.layer()), [at(88_000_000, 7)], "layer at {k}/20");
+        let poor: Vec<_> = bga.poor().iter().map(|p| p.time.0).collect();
+        assert_eq!(poor, [at(148_000_000, 7)], "poor at {k}/20");
         // The note at the second base event's position has its time.
         assert_eq!(loaded.chart.lanes[1][1].time, bga.base()[1].time);
     }
@@ -124,6 +136,30 @@ fn undefined_bmp_id_clears_the_layer() {
         "an id no #BMPxx defines is a clearing event"
     );
     assert_eq!(bga.base(), [event(4_000_000, None)].as_slice());
+}
+
+/// Measure 1 is 0.000001 of a measure long, 2 µs at 120 BPM, so its
+/// first quarter (0.5 µs) floors to the µs of its start.
+#[test]
+fn at_one_position_the_later_object_wins_and_close_positions_stay_apart() {
+    let bga = bga("#BPM 120
+#BMP01 a.bmp
+#BMP02 b.bmp
+#BMP03 c.bmp
+#00011:01
+#00102:0.000001
+#00104:01000000
+#00104:02
+#00104:00030000
+#00207:01
+#00207:0300
+");
+    assert_eq!(
+        bga.base(),
+        [event(2_000_000, Some(1)), event(2_000_000, Some(2))].as_slice(),
+        "the later line at one position wins; a distinct position on the same µs stays, in position order"
+    );
+    assert_eq!(bga.layer(), [event(2_000_002, Some(2))].as_slice());
 }
 
 #[test]
