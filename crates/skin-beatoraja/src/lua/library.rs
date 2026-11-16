@@ -33,7 +33,9 @@
 //! base. An ordinary error stays a Lua value raised in Lua; the host's
 //! primitives fail only with the ledger's fault. `get_path` takes its
 //! argument checked here, the loaders check their names in Rust before
-//! copying them, and no host function raises an error.
+//! copying them, and no host function raises an error but `dofile` of a
+//! name that leads to no file inside the skin folder
+//! ([`super::loader::dofile`]).
 //!
 //! # The bound of every native
 //!

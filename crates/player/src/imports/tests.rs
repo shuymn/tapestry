@@ -951,6 +951,37 @@ fn a_lua_skin_builds_on_the_base_facts() {
     }
 }
 
+/// A Lua play skin whose protected `dofile` names a part the folder does
+/// not have builds without it and draws (the caught error moves its
+/// image), so play admits charts; the same load unprotected refuses the
+/// skin with a notice naming the file and the call's place.
+#[test]
+fn a_play_skin_goes_on_past_a_protected_absent_part() {
+    let _serial = serial();
+    let mut r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let dir = lua_skin(
+        "local ok, e = pcall(dofile, \"none.lua\")\n\
+         if not ok and type(e) == \"string\" then x = 500 end",
+    );
+    let c = choice(dir.path(), "play.luaskin");
+    let (b, _) = bundled(build(ScreenKind::Play, &c, false, &t, &Cancel::new()));
+    let p = frame(&mut r, &b, 1);
+    let at = |p: &[u8], x| crate::render_common::rgb_at(p, 1_920, (x, 1_048));
+    assert_eq!(at(&p, 532), RED);
+    assert_ne!(at(&p, 32), RED);
+    let dir = lua_skin("dofile(\"none.lua\")");
+    let why = refused(build(
+        ScreenKind::Play,
+        &choice(dir.path(), "play.luaskin"),
+        false,
+        &t,
+        &Cancel::new(),
+    ));
+    assert!(why.contains("play.luaskin:7"), "{why}");
+    assert!(why.contains("cannot read none.lua"), "{why}");
+}
+
 /// Where [`class_skin`] draws its image while a frame reads the chart as
 /// easy.
 const FRAME_CLASS: [i32; 4] = [300, 100, 100, 100];

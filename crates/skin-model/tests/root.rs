@@ -248,3 +248,276 @@ fn a_fifo_is_refused_without_opening_it() {
         Err(mpsc::RecvTimeoutError::Disconnected) => panic!("the reading thread panicked"),
     }
 }
+
+/// What reading `name` gave: the bytes, or the refusal's variant.
+fn outcome(root: &Root, name: &str) -> Result<Vec<u8>, String> {
+    root.read(name, 64)
+        .map(|(bytes, _)| bytes)
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// A name is walked from the folder one component at a time, each link
+/// judged by its own target before anything below it is looked at
+/// (design.md "Threat Model" T08). An outward link refuses its name
+/// whatever lies beyond it: a way back inside, an absent entry, a
+/// dangling child outside, or nothing, also below nested folders; an
+/// inward link is followed; an unresolved one (missing target, a target
+/// asking for a child under a file, a chain over the hop cap, a loop)
+/// is `Dangling`; a name is `Missing` only when its own components run
+/// into an absent entry or a file.
+// Covers: T08
+#[test]
+fn a_name_is_walked_from_the_folder_and_stops_at_an_outward_link() {
+    let outer = dir();
+    let skin = outer.path().join("skin");
+    let ext = outer.path().join("ext");
+    write(&skin, "real/x.lua", b"inside");
+    fs::create_dir_all(skin.join("a/b")).unwrap();
+    write(&ext, "x.lua", b"outside");
+    // O and N: outward links, at the top and below two real folders; the
+    // outside holds a way back in and a dangling child (D).
+    link_dir(&skin.join("out"), &ext);
+    link_dir(&skin.join("a").join("b").join("out"), &ext);
+    link_dir(&ext.join("back"), &skin.join("real"));
+    link_dir(&ext.join("gone"), &ext.join("nothing"));
+    // I, ID, R, F.
+    link_dir(&skin.join("in"), &skin.join("real"));
+    link_dir(&skin.join("gone"), &skin.join("nothing"));
+    link_dir(&skin.join("return"), &skin.join("out").join("back"));
+    link_dir(
+        &skin.join("badtarget"),
+        &skin.join("real").join("x.lua").join("child"),
+    );
+    link_dir(&skin.join("tofile"), &skin.join("real").join("x.lua"));
+    // L: 32 links in a chain, 33, a self-loop and a two-link loop.
+    for (prefix, n) in [("c", 32), ("d", 33)] {
+        for i in 0..n {
+            let target = if i + 1 == n {
+                skin.join("real")
+            } else {
+                skin.join(format!("{prefix}{}", i + 1))
+            };
+            link_dir(&skin.join(format!("{prefix}{i}")), &target);
+        }
+    }
+    link_dir(&skin.join("self"), &skin.join("self"));
+    link_dir(&skin.join("p"), &skin.join("q"));
+    link_dir(&skin.join("q"), &skin.join("p"));
+    let root = Root::new(&skin).unwrap();
+    let err = |e: &str| Err::<Vec<u8>, String>(e.to_owned());
+
+    for top in ["", "a/b/"] {
+        for rest in [
+            "out/back/x.lua",
+            "out/back/none.lua",
+            "out/absent/none.lua",
+            "out/gone/none.lua",
+            "out/x.lua",
+            "out/none.lua",
+        ] {
+            let name = format!("{top}{rest}");
+            assert_eq!(outcome(&root, &name), err("Escapes"), "{name}");
+        }
+    }
+    assert_eq!(outcome(&root, "return/x.lua"), err("Escapes"));
+    assert_eq!(outcome(&root, "in/x.lua"), Ok(b"inside".to_vec()));
+    assert_eq!(
+        root.read("in/x.lua", 64).unwrap().1,
+        root.read("real/x.lua", 64).unwrap().1
+    );
+    assert_eq!(outcome(&root, "in/none.lua"), err("Missing"));
+    assert_eq!(outcome(&root, "gone/x.lua"), err("Dangling"));
+    assert_eq!(outcome(&root, "badtarget/x.lua"), err("Dangling"));
+    assert_eq!(outcome(&root, "tofile/child"), err("Missing"));
+    assert_eq!(outcome(&root, "tofile"), Ok(b"inside".to_vec()));
+    assert_eq!(outcome(&root, "real/x.lua/child"), err("Missing"));
+    assert_eq!(outcome(&root, "a/none/x.lua"), err("Missing"));
+    assert_eq!(outcome(&root, "c0/x.lua"), Ok(b"inside".to_vec()));
+    assert_eq!(outcome(&root, "d0/x.lua"), err("Dangling"));
+    assert_eq!(outcome(&root, "self/x.lua"), err("Dangling"));
+    assert_eq!(outcome(&root, "p/x.lua"), err("Dangling"));
+    #[cfg(windows)]
+    assert_eq!(outcome(&root, "OUT/none.lua"), err("Escapes"));
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("../real", skin.join("a/rel")).unwrap();
+        assert_eq!(outcome(&root, "a/rel/x.lua"), Ok(b"inside".to_vec()));
+    }
+
+    let names: Vec<String> = root
+        .list("", 1_000)
+        .unwrap()
+        .entries
+        .into_iter()
+        .map(|e| e.name)
+        .collect();
+    let has = |n: &str| names.iter().any(|e| e == n);
+    assert!(!has("return"), "{names:?}");
+    for skipped in ["out", "gone", "badtarget", "d0", "self", "p", "q"] {
+        assert!(!has(skipped), "{skipped}: {names:?}");
+    }
+    for kept in ["in", "c0", "real", "a"] {
+        assert!(has(kept), "{kept}: {names:?}");
+    }
+    assert!(matches!(root.list("out/back", 16), Err(RootError::Escapes)));
+    assert!(matches!(root.list("a/b/out", 16), Err(RootError::Escapes)));
+}
+
+/// A file link `link` to the target spelled `target` (`/` separators,
+/// written with `\` on Windows), relative or absolute as spelled.
+fn file_link(link: &Path, target: &str) {
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_file(target.replace('/', "\\"), link).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+/// A folder link `link` to the relative target `target`, as
+/// [`file_link`] spells it.
+fn folder_link(link: &Path, target: &str) {
+    #[cfg(windows)]
+    std::os::windows::fs::symlink_dir(target.replace('/', "\\"), link).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(target, link).unwrap();
+}
+
+/// A skin folder `skin` beside `ext`, whose link targets put a `..` after
+/// a component the walk must judge first:
+/// - `probe` -> `out/../x.lua`, `out` an outward link to `ext/sub`: on
+///   Unix the system reads `ext/x.lua` through it;
+/// - `miss` -> `missing/../x.lua`, `missing` absent;
+/// - `up` -> `../ext/x.lua`, above the folder;
+/// - `deep` -> `sub/../../ext/x.lua`, `sub` an inward link to `a/b`:
+///   the walk reaches the folder's own `ext/x.lua`, and so does Unix;
+///   Windows resolves the spelling, which leads to the outside `ext/x.lua`;
+/// - `a/rel` -> `../real`, an ordinary inward target;
+/// - on Unix, `bs` -> the literal `real\x.lua`, beside an entry named
+///   `real\x.lua` that links to the outside `ext/x.lua`: a name's `\` is a
+///   separator, so the walk reaches the inside `real/x.lua`, while the
+///   system follows the backslash-named entry out of the folder.
+///
+/// `outside` says whether the outside `ext/x.lua` exists.
+fn dot_dot_links(outside: bool) -> (TempDir, std::path::PathBuf) {
+    let outer = dir();
+    let skin = outer.path().join("skin");
+    let ext = outer.path().join("ext");
+    write(&skin, "x.lua", b"inside");
+    write(&skin, "real/x.lua", b"real");
+    write(&skin, "ext/x.lua", b"inside-ext");
+    fs::create_dir_all(skin.join("a/b")).unwrap();
+    fs::create_dir_all(ext.join("sub")).unwrap();
+    if outside {
+        write(&ext, "x.lua", b"outside");
+    }
+    link_dir(&skin.join("out"), &ext.join("sub"));
+    link_dir(&skin.join("sub"), &skin.join("a").join("b"));
+    file_link(&skin.join("probe"), "out/../x.lua");
+    file_link(&skin.join("miss"), "missing/../x.lua");
+    file_link(&skin.join("up"), "../ext/x.lua");
+    file_link(&skin.join("deep"), "sub/../../ext/x.lua");
+    folder_link(&skin.join("a").join("rel"), "../real");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(ext.join("x.lua"), skin.join("real\\x.lua")).unwrap();
+        std::os::unix::fs::symlink("real\\x.lua", skin.join("bs")).unwrap();
+    }
+    (outer, skin)
+}
+
+/// A link target's `..` steps up only once the components before it are
+/// walked, so an outward link before it refuses the name whatever lies
+/// outside, and a `..` above the folder leads out of it; an ordinary
+/// inward `../real` and a `..` after an inward link stay admitted
+/// (design.md "Threat Model" T08).
+// Covers: T08
+#[test]
+fn a_target_steps_up_only_after_the_link_before_it_is_judged() {
+    for outside in [true, false] {
+        let (_outer, skin) = dot_dot_links(outside);
+        let root = Root::new(&skin).unwrap();
+        let err = |e: &str| Err::<Vec<u8>, String>(e.to_owned());
+        assert_eq!(outcome(&root, "probe"), err("Escapes"), "outside {outside}");
+        assert_eq!(outcome(&root, "up"), err("Escapes"), "outside {outside}");
+        assert_eq!(
+            outcome(&root, "deep"),
+            Ok(b"inside-ext".to_vec()),
+            "outside {outside}"
+        );
+        assert_eq!(outcome(&root, "a/rel/x.lua"), Ok(b"real".to_vec()));
+        // What the system itself reads through `probe`: Unix follows `out`
+        // first, out of the folder; Windows resolves the spelling.
+        #[cfg(unix)]
+        assert_eq!(
+            fs::read(skin.join("probe")).ok(),
+            outside.then(|| b"outside".to_vec())
+        );
+        #[cfg(windows)]
+        assert_eq!(fs::read(skin.join("probe")).unwrap(), b"inside");
+        // A target's `\` is a separator for the walk, a name character for
+        // Unix, which reads the outside file through `bs`.
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                outcome(&root, "bs"),
+                Ok(b"real".to_vec()),
+                "outside {outside}"
+            );
+            assert_eq!(
+                fs::read(skin.join("bs")).ok(),
+                outside.then(|| b"outside".to_vec())
+            );
+        }
+    }
+}
+
+/// An unresolved component before a target's `..` leaves the link
+/// unresolved, though the spelling would cancel it (design.md "Threat
+/// Model" T08).
+// Covers: T08
+#[test]
+fn an_unresolved_component_before_a_dot_dot_is_dangling() {
+    let (_outer, skin) = dot_dot_links(true);
+    let root = Root::new(&skin).unwrap();
+    assert_eq!(outcome(&root, "miss"), Err("Dangling".to_owned()));
+}
+
+/// A listing keeps a link by its walk and describes it by the path the
+/// walk reached, so it is the same whether the outside file exists or
+/// not: the outward and unresolved `..` links are left out, the inward
+/// ones kept (design.md "Threat Model" T08).
+// Covers: T08
+#[test]
+fn a_listing_of_links_does_not_depend_on_what_lies_outside() {
+    let listings: Vec<(Vec<Entry>, Vec<Entry>)> = [true, false]
+        .into_iter()
+        .map(|outside| {
+            let (_outer, skin) = dot_dot_links(outside);
+            let root = Root::new(&skin).unwrap();
+            (
+                root.list("", 64).unwrap().entries,
+                root.list("a", 64).unwrap().entries,
+            )
+        })
+        .collect();
+    for (top, a) in &listings {
+        let names: Vec<&str> = top.iter().map(|e| e.name.as_str()).collect();
+        for skipped in ["probe", "miss", "up", "out"] {
+            assert!(!names.contains(&skipped), "{skipped}: {names:?}");
+        }
+        let entry = |name: &str, folder| Entry {
+            name: name.to_owned(),
+            folder,
+        };
+        assert!(top.contains(&entry("deep", false)), "{top:?}");
+        assert!(top.contains(&entry("sub", true)), "{top:?}");
+        assert!(a.contains(&entry("rel", true)), "{a:?}");
+        // Kept by its walk, described by the inside file it reached; the
+        // backslash-named entry it shadows leads out and is left out.
+        #[cfg(unix)]
+        {
+            assert!(top.contains(&entry("bs", false)), "{top:?}");
+            assert!(!names.contains(&"real\\x.lua"), "{names:?}");
+        }
+    }
+    assert_eq!(listings.first(), listings.last());
+}

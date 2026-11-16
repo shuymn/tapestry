@@ -24,7 +24,10 @@
 //!   raise a fault of the ledger again, never running the skin's handler
 //!   once one is recorded, and refuse an error no handler saw (an
 //!   allocation failure);
-//! - the confined loaders `require` and `dofile` ([`super::loader`]).
+//! - the confined loaders `require` and `dofile` ([`super::loader`]);
+//!   `dofile` of a name that leads to no file inside the skin folder is
+//!   the one host function that raises an ordinary error, from its own
+//!   face ([`DOFILE`]).
 //!
 //! There is no `io`, `os`, `debug`, `package`, `load`, `loadfile`,
 //! `collectgarbage`, `print`, `warn`, `coroutine` or `utf8`. Every
@@ -274,6 +277,59 @@ where
     })
 }
 
+/// The registry name of the marker `dofile`'s host returns before the
+/// message of a name that leads to no file: a table only the face
+/// compares with, never returned to skin code.
+const ABSENT: &str = "tapestry.absent";
+/// The registry name of the function that makes `dofile`'s face.
+const DOFILE_FACE: &str = "tapestry.dofile_face";
+
+/// `dofile`'s face, compiled before any skin code: [`SHIMS`]' with one
+/// more case, the only ordinary error a host function gives. A result
+/// starting with the private marker raises its message as an ordinary
+/// error, at level 0 as Lua's `dofile` adds no position; any other
+/// result is returned whole, its count and positions kept.
+const DOFILE: &str = r##"
+local error, fault, absent, select, rawequal = ...
+local function settle(ok, ...)
+  if not ok then
+    error(fault, 0)
+  end
+  if select("#", ...) > 0 and rawequal((...), absent) then
+    error((select(2, ...)), 0)
+  end
+  return ...
+end
+return function(raw)
+  return function(a)
+    return settle(raw(a))
+  end
+end
+"##;
+
+/// The confined `dofile`'s Lua face over `f`: as [`host`]'s with one
+/// argument, and a [`loader::Loaded::Absent`] raised in Lua as the
+/// ordinary error it carries.
+pub(super) fn dofile_face<F>(lua: &Lua, pass: &Arc<Pass>, f: F) -> mlua::Result<Function>
+where
+    F: Fn(&Lua, &Pass, MultiValue) -> mlua::Result<loader::Loaded> + Send + 'static,
+{
+    let raw = host_raw(lua, pass, move |lua, pass, args| {
+        match f(lua, pass, args)? {
+            loader::Loaded::Found(v) => Ok(v),
+            loader::Loaded::Absent(message) => {
+                let marker: Table = lua.named_registry_value(ABSENT)?;
+                Ok(MultiValue::from_iter([
+                    Value::Table(marker),
+                    Value::String(message),
+                ]))
+            }
+        }
+    })?;
+    let face: Function = lua.named_registry_value(DOFILE_FACE)?;
+    face.call(raw)
+}
+
 /// A host function as a skin calls it: [`host_raw`]'s, given exactly
 /// `arity` (0 or 1) of the skin's arguments, its results returned and a
 /// fault raised in Lua.
@@ -337,6 +393,20 @@ pub(super) fn vm(pass: &Arc<Pass>) -> mlua::Result<Lua> {
         .set_mode(ChunkMode::Text)
         .call((error.clone(), FAULT))?;
     lua.set_named_registry_value(SHIM, shim)?;
+    let absent = lua.create_table()?;
+    lua.set_named_registry_value(ABSENT, absent.clone())?;
+    let dofile_face: Function = lua
+        .load(DOFILE)
+        .set_name("=sandbox")
+        .set_mode(ChunkMode::Text)
+        .call((
+            error.clone(),
+            FAULT,
+            absent,
+            base.raw_get::<Function>("select")?,
+            base.raw_get::<Function>("rawequal")?,
+        ))?;
+    lua.set_named_registry_value(DOFILE_FACE, dofile_face)?;
     let env = lua.create_table()?;
     for name in BASE {
         env.raw_set(name, base.raw_get::<Value>(name)?)?;
