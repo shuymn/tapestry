@@ -48,6 +48,12 @@ pub enum Filter {
     /// its gaps stay whole texels instead of blending into translucent
     /// rows.
     NearestBase,
+    /// A BGA picture: bilinear at level 0 of the BGA array, its layer
+    /// the array's page.
+    Bga,
+    /// A BGA layer picture: the nearest texel at level 0 of the BGA
+    /// array, a pure black texel keyed transparent.
+    BgaLayer,
 }
 
 /// How a quad is blended over what is under it.

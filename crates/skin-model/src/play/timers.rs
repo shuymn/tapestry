@@ -831,6 +831,7 @@ impl Play {
         for ev in frame.effects {
             self.reducer.apply(ev);
         }
+        self.bga_show = self.bga.show(frame.now, self.reducer.miss);
         self.read_offsets(frame.offsets);
         self.take_holds(frame.notes, frame.now);
         // The frame's one sample of the playhead, which the beat and the
