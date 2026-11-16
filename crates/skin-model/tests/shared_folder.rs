@@ -5,12 +5,12 @@
 
 mod shared_folder_support;
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Barrier, OnceLock};
+use std::process::{Child, Command};
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use image::{Rgba, RgbaImage};
@@ -39,6 +39,9 @@ const SHEET_READERS: usize = 2;
 const ATLAS_READERS: usize = 1;
 /// Past this the writers are killed and the test fails.
 const LIMIT: Duration = Duration::from_secs(60);
+/// How long a failing race may take to end: well under [`LIMIT`], which a
+/// writer left waiting for its start file takes to end by itself.
+const ENDING: Duration = Duration::from_secs(20);
 const FILES: u32 = 16;
 const LIMITS: AtlasLimits = AtlasLimits {
     max_side: 256,
@@ -201,8 +204,9 @@ fn unix_us() -> u64 {
 
 /// The writer process: waits for the start file it is given, then places
 /// the files under the base folder it is given, again and again until the
-/// stop file it is given exists. It prints when it entered, when it began
-/// and ended placing, and how many times it placed them.
+/// stop file it is given exists. It prints, once it stopped, when it
+/// entered, how many times it placed the files, and when each placement
+/// began and ended.
 #[test]
 #[ignore = "a writer process of a_reader_never_meets_a_file_being_placed"]
 fn writer() {
@@ -220,30 +224,37 @@ fn writer() {
         std::thread::sleep(Duration::from_millis(1));
     }
     let files = files();
-    let began = unix_us();
-    let mut passes = 0u32;
+    let mut placed = Vec::new();
     while !stop.exists() {
         assert!(waiting.elapsed() < LIMIT, "no stop file within {LIMIT:?}");
+        let began = unix_us();
         folder_in(&base, "shared", &files);
-        passes += 1;
+        placed.push((began, unix_us()));
     }
-    println!("writer entered {entered}");
-    println!("writer placed {began} {}", unix_us());
-    println!("writer passes {passes}");
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "writer entered {entered}").unwrap();
+    writeln!(out, "writer passes {}", placed.len()).unwrap();
+    for (began, ended) in placed {
+        writeln!(out, "writer placed {began} {ended}").unwrap();
+    }
 }
 
-fn spawn_writer(base: &Path, start: &Path, stop: &Path, fails: bool) -> Child {
+/// Spawns a writer process that writes its output, a line for each
+/// placement, into the file `out`: a pipe nobody reads until the writer
+/// ends would hold it up once full.
+fn spawn_writer(base: &Path, start: &Path, stop: &Path, fails: bool, out: &Path) -> Child {
     let mut command = Command::new(std::env::current_exe().unwrap());
     if fails {
         command.env(WRITER_FAILS, "1");
     }
+    let out = std::fs::File::create(out).unwrap();
     command
         .args(["writer", "--exact", "--ignored", "--nocapture"])
         .env(WRITER_BASE, base)
         .env(WRITER_START, start)
         .env(WRITER_STOP, stop)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stdout(out.try_clone().unwrap())
+        .stderr(out)
         .spawn()
         .unwrap()
 }
@@ -251,9 +262,8 @@ fn spawn_writer(base: &Path, start: &Path, stop: &Path, fails: bool) -> Child {
 /// What one writer process reported, its times in [`unix_us`].
 struct Wrote {
     entered: u64,
-    began: u64,
-    ended: u64,
-    passes: u32,
+    /// When each placement began and when it ended.
+    placed: Vec<(u64, u64)>,
 }
 
 impl Wrote {
@@ -263,15 +273,25 @@ impl Wrote {
                 .find_map(|l| l.strip_prefix(key))
                 .unwrap_or_else(|| panic!("a writer did not report `{key}`: {out}"))
                 .trim()
-                .to_owned()
+                .parse::<u64>()
+                .unwrap()
         };
-        let placed = field("writer placed ");
-        let (began, ended) = placed.split_once(' ').unwrap();
+        let placed: Vec<(u64, u64)> = out
+            .lines()
+            .filter_map(|l| l.strip_prefix("writer placed "))
+            .map(|times| {
+                let (began, ended) = times.trim().split_once(' ').unwrap();
+                (began.parse().unwrap(), ended.parse().unwrap())
+            })
+            .collect();
+        assert_eq!(
+            u64::try_from(placed.len()).unwrap(),
+            field("writer passes "),
+            "a writer did not report each placement"
+        );
         Self {
-            entered: field("writer entered ").parse().unwrap(),
-            began: began.parse().unwrap(),
-            ended: ended.parse().unwrap(),
-            passes: field("writer passes ").parse().unwrap(),
+            entered: field("writer entered "),
+            placed,
         }
     }
 }
@@ -285,8 +305,7 @@ struct Seen {
     longest: Duration,
     /// When each round that loaded began and when it ended.
     loaded: Vec<(u64, u64)>,
-    /// When the reader reached the start barrier, and when it saw it was
-    /// let go.
+    /// When the reader was ready, and when it saw it was let go.
     ready: u64,
     went: u64,
 }
@@ -322,8 +341,8 @@ fn chain(e: &dyn std::error::Error) -> String {
 
 /// The race's signals to its readers.
 struct Signals {
-    /// Every reader and the race meet here before the writers start.
-    ready: Barrier,
+    /// How many readers are ready; the writers start once all are.
+    ready: AtomicUsize,
     /// The folder, set once the race placed it; then the readers go.
     dir: OnceLock<PathBuf>,
     go: AtomicBool,
@@ -331,14 +350,14 @@ struct Signals {
     done: AtomicBool,
 }
 
-/// Meets the race at the start barrier, waits to be let go, then reads the
-/// folder round after round until the writers end, and at least once.
+/// Counts itself ready, waits to be let go, then reads the folder round
+/// after round until the writers end, and at least once.
 fn read_until(reading: Reading, signals: &Signals) -> Seen {
     let mut seen = Seen {
         ready: unix_us(),
         ..Seen::default()
     };
-    signals.ready.wait();
+    signals.ready.fetch_add(1, Ordering::Release);
     while !signals.go.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -374,10 +393,11 @@ fn read_until(reading: Reading, signals: &Signals) -> Seen {
     seen
 }
 
-/// Waits for every writer, writing the stop file `stop` at `stop_at` and
-/// killing them past [`LIMIT`]; returns each one's output.
+/// Waits for every writer, each with the file it writes its output into,
+/// writing the stop file `stop` at `stop_at`, and fails past [`LIMIT`];
+/// takes each writer that ended from `writers` and returns its output.
 fn wait_writers(
-    mut writers: Vec<Child>,
+    writers: &mut Vec<(Child, PathBuf)>,
     start: Instant,
     stop: &Path,
     stop_at: Instant,
@@ -387,30 +407,15 @@ fn wait_writers(
         if Instant::now() >= stop_at && !stop.exists() {
             std::fs::write(stop, b"").unwrap();
         }
-        if start.elapsed() > LIMIT {
-            for child in &mut writers {
-                let _ = child.kill();
-            }
-            panic!("the writers did not end within {LIMIT:?}");
-        }
+        assert!(
+            start.elapsed() <= LIMIT,
+            "the writers did not end within {LIMIT:?}"
+        );
         let mut i = 0;
         while i < writers.len() {
-            if writers[i].try_wait().unwrap().is_some() {
-                let mut child = writers.swap_remove(i);
-                let status = child.wait().unwrap();
-                let mut out = String::new();
-                child
-                    .stdout
-                    .take()
-                    .unwrap()
-                    .read_to_string(&mut out)
-                    .unwrap();
-                child
-                    .stderr
-                    .take()
-                    .unwrap()
-                    .read_to_string(&mut out)
-                    .unwrap();
+            if let Some(status) = writers[i].0.try_wait().unwrap() {
+                let (_, out) = writers.swap_remove(i);
+                let out = std::fs::read_to_string(out).unwrap();
                 assert!(status.success(), "a writer failed: {out}");
                 outputs.push(out);
             } else {
@@ -433,45 +438,69 @@ struct Raced {
     let_go: u64,
 }
 
-/// Runs [`WRITERS`] writer processes (failing ones with `fails`) against
-/// the reader threads until the writers end. The readers are ready before
-/// any writer places: the writers wait for a start file, written once every
-/// reader has reached the start barrier. The race then places the folder
-/// itself, its first placements racing the writers' to create the files,
-/// lets the readers go, and [`WRITING`] later writes the stop file that
-/// ends the writers' placing.
-fn race(base: &Path, fails: bool) -> Raced {
+/// What a race is made to fail by.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Fault {
+    None,
+    /// Every writer fails at once.
+    Writers,
+    /// The reader of this index, counted from 0, does not spawn.
+    Reader(usize),
+}
+
+/// Runs [`WRITERS`] writer processes against the reader threads until the
+/// writers end, made to fail by `fault`. The readers are ready before any
+/// writer places: the writers wait for a start file, written once every
+/// reader counted itself ready. The race then places the folder itself, its
+/// first placements racing the writers' to create the files, lets the
+/// readers go, and [`WRITING`] later writes the stop file that ends the
+/// writers' placing.
+fn race(base: &Path, fault: Fault) -> Raced {
     let start = Instant::now();
     let (start_file, stop_file) = (base.join("start"), base.join("stop"));
-    let spawned = unix_us();
-    let writers = (0..WRITERS)
-        .map(|_| spawn_writer(base, &start_file, &stop_file, fails))
-        .collect();
-    let readings = [
+    let readings: Vec<Reading> = [
         (Reading::Files, FILE_READERS),
         (Reading::Sheet, SHEET_READERS),
         (Reading::Atlas, ATLAS_READERS),
-    ];
+    ]
+    .into_iter()
+    .flat_map(|(reading, n)| std::iter::repeat_n(reading, n))
+    .collect();
     let signals = Signals {
-        ready: Barrier::new(FILE_READERS + SHEET_READERS + ATLAS_READERS + 1),
+        ready: AtomicUsize::new(0),
         dir: OnceLock::new(),
         go: AtomicBool::new(false),
         done: AtomicBool::new(false),
     };
-    let (mut started, mut let_go) = (0, 0);
+    let mut writers = Vec::new();
+    let (spawned, mut started, mut let_go) = (unix_us(), 0, 0);
     let (outputs, seen) = std::thread::scope(|s| {
-        let readers: Vec<_> = readings
-            .into_iter()
-            .flat_map(|(reading, n)| std::iter::repeat_n(reading, n))
-            .map(|reading| {
-                let signals = &signals;
-                s.spawn(move || read_until(reading, signals))
-            })
-            .collect();
-        signals.ready.wait();
-        // The readers stop even when a writer failed, or the scope would
-        // wait for them for good.
+        let mut readers = Vec::new();
+        // Whatever fails, from the first spawn on, the cleanup below runs.
         let outputs = std::panic::catch_unwind(AssertUnwindSafe(|| {
+            for i in 0..WRITERS {
+                let out = base.join(format!("writer-{i}.out"));
+                let fails = fault == Fault::Writers;
+                let writer = spawn_writer(base, &start_file, &stop_file, fails, &out);
+                writers.push((writer, out));
+            }
+            for (i, reading) in readings.into_iter().enumerate() {
+                let signals = &signals;
+                let reader = if fault == Fault::Reader(i) {
+                    Err(std::io::Error::other("this reader fails as it was asked"))
+                } else {
+                    std::thread::Builder::new()
+                        .spawn_scoped(s, move || read_until(reading, signals))
+                };
+                readers.push(reader.unwrap_or_else(|e| panic!("a reader did not spawn: {e}")));
+            }
+            while signals.ready.load(Ordering::Acquire) < readers.len() {
+                assert!(
+                    start.elapsed() <= LIMIT,
+                    "the readers were not ready within {LIMIT:?}"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
             std::fs::write(&start_file, b"").unwrap();
             started = unix_us();
             let dir = folder_in(base, "shared", &files());
@@ -479,10 +508,15 @@ fn race(base: &Path, fails: bool) -> Raced {
             let_go = unix_us();
             signals.go.store(true, Ordering::Release);
             let stop_at = Instant::now() + WRITING;
-            wait_writers(writers, start, &stop_file, stop_at)
+            wait_writers(&mut writers, start, &stop_file, stop_at)
         }));
-        // Writers left placing when the race failed end too.
+        // The cleanup: the writers left end, and the readers stop, or the
+        // scope would wait for them for good.
         let _ = std::fs::write(&stop_file, b"");
+        for (writer, _) in &mut writers {
+            let _ = writer.kill();
+            let _ = writer.wait();
+        }
         signals.go.store(true, Ordering::Release);
         signals.done.store(true, Ordering::Relaxed);
         let seen: Vec<Seen> = readers.into_iter().map(|r| r.join().unwrap()).collect();
@@ -498,26 +532,46 @@ fn race(base: &Path, fails: bool) -> Raced {
     }
 }
 
-/// A writer that fails fails the race, and the readers stop: the race does
-/// not wait for them for good.
-#[test]
-fn a_failed_writer_ends_the_race() {
+/// Runs a race made to fail by `fault` on a thread of its own and returns
+/// the message it failed with, which must come within [`ENDING`]: the
+/// cleanup ends and waits for the writers and stops the readers.
+fn failed_race(fault: Fault) -> String {
     let base = base();
     let (sent, ended) = std::sync::mpsc::channel();
     let path = base.path().to_owned();
     std::thread::spawn(move || {
-        let raced = std::panic::catch_unwind(|| race(&path, true));
+        let raced = std::panic::catch_unwind(|| race(&path, fault));
         let payload = raced
             .err()
             .map(|p| p.downcast_ref::<String>().cloned().unwrap_or_default());
         sent.send(payload).unwrap();
     });
     let payload = ended
-        .recv_timeout(LIMIT)
-        .expect("the race did not end after its writers failed");
-    let message = payload.expect("the race passed with failing writers");
+        .recv_timeout(ENDING)
+        .unwrap_or_else(|_| panic!("the race did not end within {ENDING:?} of {fault:?}"));
+    payload.unwrap_or_else(|| panic!("the race passed with {fault:?}"))
+}
+
+/// A writer that fails fails the race, and the readers stop: the race does
+/// not wait for them for good.
+#[test]
+fn a_failed_writer_ends_the_race() {
+    let message = failed_race(Fault::Writers);
     assert!(
         message.contains("a writer failed") && message.contains("this writer fails"),
+        "{message}"
+    );
+}
+
+/// A reader that does not spawn fails the race, and what was spawned before
+/// it ends: the writers, still waiting for their start file, and the
+/// readers, waiting to be let go.
+#[test]
+fn a_reader_not_spawned_ends_the_race() {
+    let last = FILE_READERS + SHEET_READERS + ATLAS_READERS - 1;
+    let message = failed_race(Fault::Reader(last));
+    assert!(
+        message.contains("a reader did not spawn") && message.contains("this reader fails"),
         "{message}"
     );
 }
@@ -526,49 +580,74 @@ fn a_failed_writer_ends_the_race() {
 /// a short window of the replacement, so a placement that replaced files
 /// fails this in some runs, not every: [`placing_again_keeps_each_file`]
 /// checks in every run that a placement replaces nothing. Only reads while
-/// the writers place count: each reader must load the folder in a round
-/// wholly between the first writer's start of placing and the last one's
-/// end, begun at or after the one and ended at or before the other.
+/// a writer places count: each reader must load the folder in a round that
+/// lies wholly within the writers' placements, some writer placing the
+/// files at every moment from its start to its end.
 #[test]
 fn a_reader_never_meets_a_file_being_placed() {
     let base = base();
     let begun = Instant::now();
-    let raced = race(base.path(), false);
+    let raced = race(base.path(), Fault::None);
     let wrote: Vec<Wrote> = raced.outputs.iter().map(|o| Wrote::parse(o)).collect();
-    let first = wrote.iter().map(|w| w.began).min().unwrap();
-    let last = wrote.iter().map(|w| w.ended).max().unwrap();
+    // The placings: every writer's placements, those that meet merged.
+    let mut placings: Vec<(u64, u64)> = wrote.iter().flat_map(|w| w.placed.clone()).collect();
+    placings.sort_unstable();
+    placings.dedup_by(|next, merged| {
+        let meets = next.0 <= merged.1;
+        if meets {
+            merged.1 = merged.1.max(next.1);
+        }
+        meets
+    });
+    let first = placings.first().map_or(u64::MAX, |p| p.0);
+    let last = placings.last().map_or(0, |p| p.1);
+    let within = |b: u64, e: u64| {
+        let i = placings.partition_point(|p| p.0 <= b);
+        i > 0 && e <= placings[i - 1].1
+    };
     let seen = &raced.seen;
     // Milliseconds from `from` to `to`, both in unix_us.
     let ms = |from: u64, to: u64| (i128::from(to) - i128::from(from)) / 1_000;
-    // A loading round's place: begun before the writers placed, wholly
-    // while they placed, or begun while or after they placed and ended
-    // after.
     let count = |keep: &dyn Fn(u64, u64) -> bool| {
         seen.iter()
             .map(|s| s.loaded.iter().filter(|&&(b, e)| keep(b, e)).count())
             .collect::<Vec<_>>()
     };
 
-    let passes: Vec<u32> = wrote.iter().map(|w| w.passes).collect();
+    // A loading round's place: begun before the first placement, wholly
+    // within the placings, across a moment no writer placed between the
+    // first placement and the last, or ended after the last.
+    let passes: Vec<usize> = wrote.iter().map(|w| w.placed.len()).collect();
     let before = count(&|b, _| b < first);
-    let during = count(&|b, e| b >= first && e <= last);
+    let during = count(&|b, e| within(b, e));
+    let across = count(&|b, e| b >= first && e <= last && !within(b, e));
     let after = count(&|b, e| b >= first && e > last);
+    let gaps = placings.windows(2).map(|p| p[1].0 - p[0].1);
+    let longest_gap = gaps.max().unwrap_or(0);
     let longest: Vec<u128> = seen.iter().map(|s| s.longest.as_millis()).collect();
     let missing: u32 = seen.iter().map(|s| s.missing).sum();
     let others: Vec<&String> = seen.iter().flat_map(|s| &s.others).collect();
     let from_spawn = |times: &mut dyn Iterator<Item = u64>| {
         times.map(|t| ms(raced.spawned, t)).collect::<Vec<_>>()
     };
+    let ends = |w: &Wrote| {
+        w.placed
+            .first()
+            .map(|f| f.0)
+            .zip(w.placed.last().map(|l| l.1))
+    };
     println!(
-        "passes {passes:?}, loads before {before:?} during {during:?} after {after:?} the \
-         writers placed, missing {missing}, other errors {}, longest rounds {longest:?} ms; \
-         ms after the spawn: writers entered {:?}, start file {}, writers began {:?} and \
-         ended {:?}, readers ready {:?}, let go {} and saw it {:?}; in {} ms",
+        "passes {passes:?}, loads before {before:?} during {during:?} across {across:?} \
+         after {after:?} the placings, missing {missing}, other errors {}, longest rounds \
+         {longest:?} ms; {} placings, the longest gap between them {longest_gap} us; ms after \
+         the spawn: writers entered {:?}, start file {}, writers began {:?} and ended {:?}, \
+         readers ready {:?}, let go {} and saw it {:?}; in {} ms",
         others.len(),
+        placings.len(),
         from_spawn(&mut wrote.iter().map(|w| w.entered)),
         ms(raced.spawned, raced.started),
-        from_spawn(&mut wrote.iter().map(|w| w.began)),
-        from_spawn(&mut wrote.iter().map(|w| w.ended)),
+        from_spawn(&mut wrote.iter().filter_map(ends).map(|(began, _)| began)),
+        from_spawn(&mut wrote.iter().filter_map(ends).map(|(_, ended)| ended)),
         from_spawn(&mut seen.iter().map(|s| s.ready)),
         ms(raced.spawned, raced.let_go),
         from_spawn(&mut seen.iter().map(|s| s.went)),
@@ -581,12 +660,11 @@ fn a_reader_never_meets_a_file_being_placed() {
         &others[..others.len().min(3)]
     );
     // The controls: each writer placed the files, and each reader loaded
-    // them in a round wholly while the writers placed them, so the race
-    // ran.
+    // them in a round wholly within the placings, so the race ran.
     assert!(passes.iter().all(|&p| p > 0), "passes {passes:?}");
     assert!(
         during.iter().all(|&d| d > 0),
-        "a reader loaded nothing while the writers placed: loads before {before:?} during \
-         {during:?} after {after:?}"
+        "a reader loaded nothing within the placings: loads before {before:?} during \
+         {during:?} across {across:?} after {after:?}"
     );
 }
