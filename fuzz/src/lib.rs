@@ -806,6 +806,7 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         let mut notes = eval::NoteFacts::new(&chart);
         notes.set_done(lane, 0);
         let frame = SkinFrame {
+            judgments: None,
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             screen_us: screen_us_at(TimeUs(ms * 1_000)),
@@ -863,6 +864,7 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         }
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            judgments: None,
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             screen_us: screen_us_at(TimeUs(ms * 1_000)),
@@ -965,6 +967,7 @@ fn lane_order_probes(
         batch.clear();
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            judgments: None,
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             screen_us: screen_us_at(TimeUs(800_000 + i64::try_from(k).unwrap_or(0) * 400_000)),
@@ -1061,6 +1064,7 @@ fn gauge_probes(
             batch.clear();
             let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
+                judgments: None,
                 app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
                 screen_us: screen_us_at(TimeUs(i64::try_from(k).unwrap_or(0) * 16_000)),
@@ -1189,6 +1193,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
         batch.clear();
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            judgments: None,
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             screen_us: screen_us_at(TimeUs(ms * 1_000)),
@@ -1312,6 +1317,7 @@ fn grade_anchor_probes(
             batch.clear();
             let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
+                judgments: None,
                 app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
                 screen_us: screen_us_at(TimeUs(now)),
@@ -1508,6 +1514,7 @@ fn digit_probes(
         batch.clear();
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            judgments: None,
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             screen_us: screen_us_at(now),
@@ -1600,6 +1607,7 @@ fn long_note_probes(
                 notes.set_hold(lane, Some(hold));
             }
             let frame = SkinFrame {
+                judgments: None,
                 app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
                 screen_us: screen_us_at(TimeUs(ms * 1_000)),
@@ -1673,6 +1681,7 @@ fn bar_probes(
         };
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            judgments: None,
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             screen_us: screen_us_at(TimeUs(ms * 1_000)),
@@ -1791,6 +1800,7 @@ fn choice_probes(
         batch.clear();
         let notes = eval::NoteFacts::default();
         let frame = SkinFrame {
+            judgments: None,
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             screen_us: screen_us_at(TimeUs(now)),
@@ -1896,6 +1906,7 @@ fn rate_and_kind_probes(
             batch.clear();
             let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
+                judgments: None,
                 app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
                 screen_us: screen_us_at(TimeUs(2_000_000)),
@@ -2198,6 +2209,7 @@ fn readout_probes(
             batch.clear();
             let notes = eval::NoteFacts::default();
             let frame = SkinFrame {
+                judgments: None,
                 app: skin_model::AppReadouts::LAUNCH,
                 state_us: 0,
                 screen_us: screen_us_at(TimeUs(now_ms * 1_000)),
@@ -3715,6 +3727,7 @@ pub fn present(data: &[u8]) -> Option<usize> {
             ..Default::default()
         };
         let frame = SkinFrame {
+            judgments: None,
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             screen_us: screen_us_at(TimeUs(i64::from(combo) * 16_000)),

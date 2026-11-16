@@ -15,6 +15,11 @@
 //!   135 ≥ 126) is AA, `rank.current.1`; the whole ranks over 5/14 (`135`
 //!   against `14 · i`) reach i = 9 (126) but not 12 (168): `rank.whole.5`
 //!   to `.7`.
+//!
+//! With the best play's series `[0, 2, 4, 6, 8, 9, 11, 11]` (PERFECTs, then
+//! a GREAT, a PERFECT and a miss: its misses in the second half), the best
+//! paces by `ghost[p]` instead: at p = 3, `best.diff` = 5 − 6 = −1 and bar
+//! 112 is 6/14, while `target.diff` stays 0 and bar 114 5/14.
 
 mod graph_support;
 mod play_support;
@@ -117,6 +122,22 @@ fn ctx(basis: ScoreBasis) -> PlayContext<'static> {
         ..full(0)
     }
 }
+
+/// The whole chart played with `basis` and the best play's series `pace`.
+fn paced_ctx(basis: ScoreBasis, pace: &'static [u32]) -> PlayContext<'static> {
+    PlayContext {
+        score: PlayScore {
+            basis,
+            pace: Some(pace),
+            ..PlayScore::NONE
+        },
+        ..full(0)
+    }
+}
+
+/// The best play's EX after each of its 7 judged targets: PERFECT four
+/// times, GREAT, PERFECT, then a miss; it ends at B = 11.
+const PACE: [u32; 8] = [0, 2, 4, 6, 8, 9, 11, 11];
 
 /// B = 11 and T = 13, the best known.
 const KNOWN: ScoreBasis = ScoreBasis {
@@ -347,6 +368,14 @@ fn random_hides_the_comparisons_with_the_best() {
     fx.bar(0, Some((5, 14)));
     fx.bar(4, Some((5, 14)));
     fx.bar(5, Some((13, 14)));
+    // With the best play's series too: still hidden.
+    let mut fx = Fx::new(&chart(7, true), &paced_ctx(KNOWN, &PACE));
+    fx.frame(1_300, tally(2, 1, 0, 0));
+    assert!(!fx.figures().valid);
+    assert!(!fx.lit(705.0, 105.0));
+    fx.bar(2, None);
+    fx.bar(3, None);
+    fx.bar(4, Some((5, 14)));
     // The same chart without the draw shows them.
     let mut fx = Fx::new(&chart(7, false), &ctx(KNOWN));
     fx.frame(1_300, tally(2, 1, 0, 0));
@@ -354,6 +383,61 @@ fn random_hides_the_comparisons_with_the_best() {
     assert!(fx.lit(705.0, 105.0));
     fx.bar(2, Some((4, 14)));
     fx.bar(3, Some((11, 14)));
+}
+
+/// 152 and bar 112 pace the best by its play's series, `ex − ghost[p]`
+/// and `ghost[p] / 2n`; 153 and bar 114 keep the line. At p = 3, ex = 5:
+/// −1 and 6/14 where the line gives 1 and 4/14; at p = 5, ex = 8: −1
+/// where the line gives 1; at p = 7 the series ends at B. A rearm keeps
+/// the series.
+#[test]
+fn the_best_paces_by_its_play() {
+    let mut fx = Fx::new(&chart(7, false), &paced_ctx(KNOWN, &PACE));
+    fx.frame(0, tally(0, 0, 0, 0));
+    assert_eq!(fx.figures(), before());
+    fx.bar(2, Some((0, 14)));
+    // p = 3, ex = 5.
+    fx.frame(1_300, tally(2, 1, 0, 0));
+    assert_eq!(
+        fx.figures(),
+        Figures {
+            best_diff: -1,
+            target_diff: 0,
+            current: vec![1],
+            whole: vec![5, 6, 7],
+            ..before()
+        }
+    );
+    fx.bar(2, Some((6, 14)));
+    fx.bar(4, Some((5, 14)));
+    // p = 5, ex = 8: ghost 9 where the line gives ⌊55/7⌋ = 7.
+    fx.frame(1_500, tally(3, 2, 0, 0));
+    assert_eq!(fx.figures().best_diff, -1);
+    fx.bar(2, Some((9, 14)));
+    // p = 7, ex = 12: the series' end is B.
+    fx.frame(1_700, tally(5, 2, 0, 0));
+    assert_eq!(fx.figures().best_diff, 1);
+    fx.bar(2, Some((11, 14)));
+    // A rearm keeps it.
+    fx.h.play.rearm();
+    fx.frame(1_300, tally(2, 1, 0, 0));
+    assert_eq!(fx.figures().best_diff, -1);
+    fx.bar(2, Some((6, 14)));
+}
+
+/// A series that is not this attempt's paces the best by the line: one
+/// entry short of `n + 1`, and one of the right length that does not end
+/// at B. Both read 1 and 4/14 at p = 3, ex = 5.
+#[test]
+fn a_series_not_of_this_attempt_paces_linearly() {
+    const SHORT: [u32; 7] = [0, 2, 4, 6, 8, 9, 11];
+    const OTHER_END: [u32; 8] = [0, 2, 4, 6, 8, 9, 10, 10];
+    for pace in [&SHORT[..], &OTHER_END[..]] {
+        let mut fx = Fx::new(&chart(7, false), &paced_ctx(KNOWN, pace));
+        fx.frame(1_300, tally(2, 1, 0, 0));
+        assert_eq!(fx.figures().best_diff, 1, "{pace:?}");
+        fx.bar(2, Some((4, 14)));
+    }
 }
 
 /// An unavailable best (no library, a failed read) is the empty score,

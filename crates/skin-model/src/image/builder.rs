@@ -1096,15 +1096,15 @@ mod tests {
     fn generated_texels_meet_each_variants_total() {
         let dir = tempfile::tempdir().unwrap();
         let mut b = builder(dir.path());
-        // 24 images of 8 Mi texels fill 192 Mi exactly.
-        for i in 0..24 {
+        // 27 images of 8 Mi texels fill 216 Mi exactly.
+        for i in 0..27 {
             b.add_solid_image(solid([4_096, 2_048])).unwrap();
             assert_eq!(b.lo_texels.sum, (i + 1) * (8 << 20));
         }
         let full = solid_state(&b);
         let e = b.add_solid_image(solid([1, 1])).unwrap_err();
         assert!(
-            matches!(e, ImageError::SolidTotalTooLarge { image: 24 }),
+            matches!(e, ImageError::SolidTotalTooLarge { image: 27 }),
             "{e:?}"
         );
         assert_eq!(solid_state(&b), full);
