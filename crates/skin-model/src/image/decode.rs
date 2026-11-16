@@ -363,6 +363,16 @@ fn png_mode(bytes: &[u8]) -> Result<Result<Mode, Unbanded>, DecodeError> {
 /// [`MAX_IMAGE_TEXELS`](super::MAX_IMAGE_TEXELS) (12 Mi), that is at most
 /// 160 MiB.
 pub(crate) fn decode(bytes: Vec<u8>, dims: [u32; 2]) -> Result<RgbaImage, DecodeError> {
+    decode_alpha(bytes, dims).map(|(image, _)| image)
+}
+
+/// [`decode`], and whether the decoded picture has an alpha channel (its
+/// decoder's colour type: a PNG's alpha or transparency chunk, a BMP's
+/// alpha mask).
+pub(crate) fn decode_alpha(
+    bytes: Vec<u8>,
+    dims: [u32; 2],
+) -> Result<(RgbaImage, bool), DecodeError> {
     let [w, h] = dims;
     let native = u64::from(w) * u64::from(h) * NATIVE_TEXEL_BYTES;
     let mut limits = Limits::no_limits();
@@ -376,7 +386,8 @@ pub(crate) fn decode(bytes: Vec<u8>, dims: [u32; 2]) -> Result<RgbaImage, Decode
     if decoder.total_bytes() > native {
         return Err(DecodeError::Unsupported);
     }
-    Ok(DynamicImage::from_decoder(decoder)?.into_rgba8())
+    let alpha = decoder.color_type().has_alpha();
+    Ok((DynamicImage::from_decoder(decoder)?.into_rgba8(), alpha))
 }
 
 /// Where the bands of a file decoded in bands go.
