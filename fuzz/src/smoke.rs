@@ -1068,13 +1068,12 @@ fn skin_import_seeds_import_and_draw_as_built() {
                 assert_eq!(drawn, [2 + 4 + 3 + 1 + 2 + 2; 4], "{name}");
             }
             "play graphs" => {
-                // The type-1 judge graph and the timing visualizer past 1 000
-                // ms drop; the BPM graph's four-digit colour keeps its
-                // default.
+                // The timing visualizer past 1 000 ms drops; the BPM graph's
+                // four-digit colour keeps its default; the type-1 judge graph
+                // is kept.
                 assert_eq!(
                     kinds(&i),
                     [
-                        NoteKind::UnsupportedField { field: "type" },
                         NoteKind::InvalidColour {
                             field: "otherBPMColor"
                         },
@@ -1085,12 +1084,12 @@ fn skin_import_seeds_import_and_draw_as_built() {
                     "{name}"
                 );
                 assert_eq!(u.elements, 6, "{name}");
-                // With no chart profile, no windows and an empty ring, the
-                // notes and BPM graphs draw nothing; the timing band is its
-                // 31 grid texels (every 10th of 301, the centre among them)
-                // and the hit-error pixmap its centre line, four columns
-                // wide (`lineWidth` 6 clamped), under the average's line at
-                // 0 on the same columns, one run each.
+                // With no chart profile, no judgment bins, no windows and an
+                // empty ring, the judge and BPM graphs draw nothing; the
+                // timing band is its 31 grid texels (every 10th of 301, the
+                // centre among them) and the hit-error pixmap its centre
+                // line, four columns wide (`lineWidth` 6 clamped), under the
+                // average's line at 0 on the same columns, one run each.
                 assert_eq!(drawn, [31 + 4; 4], "{name}");
             }
             "readouts" => {

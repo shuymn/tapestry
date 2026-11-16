@@ -76,6 +76,10 @@ pub struct LuaUsage {
     pub requires: u32,
     /// The `dofile` invocations among `loads`.
     pub dofiles: u32,
+    /// The `dofile` invocations among `dofiles` whose name led to no
+    /// regular file inside the skin folder: an ordinary error, caught or
+    /// not.
+    pub missing_loads: u32,
     /// Protected calls (`pcall` and `xpcall`).
     pub protected_calls: u32,
     /// `setmetatable` calls.

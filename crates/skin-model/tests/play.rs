@@ -1149,6 +1149,7 @@ fn an_inconsistent_snapshot_poisons_the_play() {
         let tally = h.tally;
         let layout = h.layout;
         let f = skin_model::SkinFrame {
+            judgments: None,
             app: skin_model::AppReadouts::LAUNCH,
             state_us: 0,
             screen_us: 0,

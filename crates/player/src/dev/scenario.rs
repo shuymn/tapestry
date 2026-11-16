@@ -2722,32 +2722,42 @@ pub struct State {
 ///
 /// The file's refusal, or the run's first failure.
 pub fn run(args: ScenarioArgs, clock: QpcClock) -> anyhow::Result<()> {
-    let Scenario {
-        rescan_ms,
-        mut script,
-        session,
-    } = load(&args.file)?;
+    let mut scenario = load(&args.file)?;
     // A holding capture waits at most the render bound.
-    script.set_hold_bound(args.render_timeout.unwrap_or(super::HOLD_BOUND));
+    scenario
+        .script
+        .set_hold_bound(args.render_timeout.unwrap_or(super::HOLD_BOUND));
     if let Some((stage, mode)) = args.specializing {
         super::specializing(stage, mode);
     }
-    crate::select(
-        crate::args::Select {
-            input: crate::PlayInput::Autoplay,
-            dev: super::SelectOptions {
-                headless: true,
-                script: Some(script),
-                rescan_ms,
-                frames: None,
-                render_timeout: args.render_timeout,
-                stop_timeout: None,
-                size: None,
-                scenario: Some(session),
-            },
+    crate::select(select_args(scenario, args.render_timeout), clock)
+}
+
+/// The song selection `scenario` runs: autoplay, headless, its steps as
+/// the script and its session; no window, so no `--dev-window` size.
+fn select_args(
+    scenario: Scenario,
+    render_timeout: Option<std::time::Duration>,
+) -> crate::args::Select {
+    let Scenario {
+        rescan_ms,
+        script,
+        session,
+    } = scenario;
+    crate::args::Select {
+        input: crate::PlayInput::Autoplay,
+        dev: super::SelectOptions {
+            headless: true,
+            script: Some(script),
+            rescan_ms,
+            frames: None,
+            render_timeout,
+            stop_timeout: None,
+            size: None,
+            window: None,
+            scenario: Some(session),
         },
-        clock,
-    )
+    }
 }
 
 /// The outcome of a scenario run, from the first failure on: the script's
@@ -2825,6 +2835,26 @@ pub(crate) mod tests {
         CaptureState, Captures, InputRef, Origin, PlayStep, SelectStep, StepKind, UntilCommand,
         find, parse, write_new,
     };
+
+    /// A scenario's song selection is headless with its session, and has
+    /// no `--dev-window` size: a headless run has no window.
+    #[test]
+    fn a_scenario_selects_headless_without_a_dev_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let scenario = parse(
+            "version = 8\n[library]\nroots = [\".\"]\n[[step]]\nquit = {}\n",
+            dir.path(),
+        )
+        .unwrap();
+        let select = super::select_args(scenario, Some(std::time::Duration::from_secs(9)));
+        assert_eq!(select.dev.window, None);
+        assert!(select.dev.headless);
+        assert!(select.dev.script.is_some() && select.dev.scenario.is_some());
+        assert_eq!(
+            select.dev.render_timeout,
+            Some(std::time::Duration::from_secs(9))
+        );
+    }
 
     /// A play report ending as `end`, its record finalized at
     /// `finalized` (none for `None`), with `closing`.

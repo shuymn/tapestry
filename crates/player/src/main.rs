@@ -1538,6 +1538,12 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     );
     #[cfg(not(feature = "dev-tools"))]
     let rescan = shelf::RESCAN_AFTER;
+    // A window of a set client size in place of the fullscreen one
+    // (`--dev-window`).
+    #[cfg(feature = "dev-tools")]
+    if let Some(size) = s.dev.window {
+        window::set_dev_window(size);
+    }
     let (caps, note) = priority::run_caps(&settings.device, &priority::System);
     if let Some(note) = note {
         eprintln!("{note}");

@@ -47,8 +47,8 @@ fn list_skin(def: skin_model::SongListDef) -> Fx {
 }
 
 /// Slot `i` shows row `cursor + i − center`, the selected placement at the
-/// center slot and the unselected elsewhere; a slot past the list's ends
-/// draws nothing: the list never wraps (O1).
+/// center slot and the unselected elsewhere; a slot whose row the window
+/// lacks draws nothing (the player's window carries the list's ring).
 #[test]
 fn slots_show_the_rows_around_the_cursor_without_wrapping() {
     let mut fx = list_skin(list(7, 3));
