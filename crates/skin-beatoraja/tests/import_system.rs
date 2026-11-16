@@ -282,20 +282,20 @@ fn system_images_charge_the_frame_limit() {
     }
 }
 
-/// Fifteen 4096×3072 files and a 4096×`last` one, each drawn, then
+/// Seventeen 4096×3072 files and a 4096×`last` one, each drawn, then
 /// `extra` destinations.
 fn texels_skin(last: i32, extra: &str) -> Result<skin_beatoraja::Imported, ImportError> {
-    let sources = common::join((0..16).map(|i| format!(r#"{{"id": "{i}", "path": "{i}.bmp"}}"#)));
+    let sources = common::join((0..18).map(|i| format!(r#"{{"id": "{i}", "path": "{i}.bmp"}}"#)));
     let images =
-        common::join((0..16).map(|i| format!(r#"{{"id": "{i}", "src": "{i}", "w": 1, "h": 1}}"#)));
+        common::join((0..18).map(|i| format!(r#"{{"id": "{i}", "src": "{i}", "w": 1, "h": 1}}"#)));
     let dsts =
-        common::join((0..16).map(|i| format!(r#"{{"id": "{i}", "dst": [{{"w": 1, "h": 1}}]}}"#)));
+        common::join((0..18).map(|i| format!(r#"{{"id": "{i}", "dst": [{{"w": 1, "h": 1}}]}}"#)));
     let json = common::hd(&format!(
         r#""source": [{sources}], "image": [{images}], "destination": [{dsts} {extra}]"#
     ));
     let d = common::skin(&[("s.json", &json)]);
-    for i in 0..16 {
-        let h = if i == 15 { last } else { 3_072 };
+    for i in 0..18 {
+        let h = if i == 17 { last } else { 3_072 };
         common::write(d.path(), &format!("{i}.bmp"), &common::bmp_header(4_096, h));
     }
     common::import_dir(d.path())
@@ -303,14 +303,14 @@ fn texels_skin(last: i32, extra: &str) -> Result<skin_beatoraja::Imported, Impor
 
 #[test]
 fn system_images_charge_the_texel_totals() {
-    // 15 × 12 Mi + 4096 × 3071 texels leaves 4,096 of the 192 Mi a
+    // 17 × 12 Mi + 4096 × 3071 texels leaves 4,096 of the 216 Mi a
     // variant holds: a system image fits.
     let one = ",\n{\"id\": \"-110\", \"dst\": [{\"w\": 1, \"h\": 1}]}";
     let r = texels_skin(3_071, one).unwrap().report;
-    assert_eq!((r.usage.images, r.usage.files), (17, 16), "{:?}", r.notes);
-    // The files alone fill exactly 192 Mi and are accepted.
+    assert_eq!((r.usage.images, r.usage.files), (19, 18), "{:?}", r.notes);
+    // The files alone fill exactly 216 Mi and are accepted.
     let r = texels_skin(3_072, "").unwrap().report;
-    assert_eq!((r.usage.images, r.usage.files), (16, 16), "{:?}", r.notes);
+    assert_eq!((r.usage.images, r.usage.files), (18, 18), "{:?}", r.notes);
     // A system image after them does not fit: the limit is located at
     // its destination, on the definition's second line.
     match texels_skin(3_072, one) {
@@ -323,7 +323,7 @@ fn system_images_charge_the_texel_totals() {
         }
         other => panic!("{:?}", other.map(|i| i.report)),
     }
-    assert_eq!(MAX_TOTAL_TEXELS, 16 * (4_096 * 3_072));
+    assert_eq!(MAX_TOTAL_TEXELS, 18 * (4_096 * 3_072));
 }
 
 /// The banner and any other negative id stay dropped; the chart's stage

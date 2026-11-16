@@ -2,9 +2,10 @@
 //! allocating (stage 3, S10-10; design.md "Scope of No Allocation"), each
 //! widget at its cap and drawing its asserted output: skin A, the six
 //! score bars in both orientations, every score number at the most cells
-//! a strip takes, the sixteen rank flags and both pass timers, over the
-//! frames before the first judgment, after an empty POOR, mid-play, at
-//! the end, after a rearm and in a second practice round. Then skins B to
+//! a strip takes, the sixteen rank flags and both pass timers, with the
+//! best paced by its play's series, over the frames before the first
+//! judgment, after an empty POOR, mid-play, at the end, after a rearm and
+//! in a second practice round. Then skins B to
 //! D and a one-hour chart's notes graph over the same frames: a BPM graph
 //! at 2 048 columns, every column at its four runs; a timing visualizer at
 //! jw 1 000 beside a hit-error visualizer 4 096 texels wide over a wrapped
@@ -299,9 +300,13 @@ fn score_frames_do_not_allocate() {
         best_known: true,
         target: 13,
     };
+    // The best play's EX after each judged target, not the line: at p = 3
+    // it is 6 where the line gives 4.
+    let pace = [0, 2, 4, 6, 8, 9, 11, 11];
     let ctx = PlayContext {
         score: PlayScore {
             basis,
+            pace: Some(&pace),
             ..PlayScore::NONE
         },
         ..full(0)
@@ -343,10 +348,10 @@ fn score_frames_do_not_allocate() {
         },
         "empty POOR",
     );
-    // Mid-play: p = 3, ex = 5.
+    // Mid-play: p = 3, ex = 5, the best paced to 6 by its series.
     assert_eq!(frame(&mut h, 1_300, tally(2, 1, 0)), 0);
     let mut numbers = READY_NUMBERS;
-    numbers[2] = Some(1_000_001);
+    numbers[2] = Some(999_999);
     check(
         &h,
         &atlas,
@@ -354,7 +359,7 @@ fn score_frames_do_not_allocate() {
             bars: [
                 Some((5, 14)),
                 Some((5, 6)),
-                Some((4, 14)),
+                Some((6, 14)),
                 Some((11, 14)),
                 Some((5, 14)),
                 Some((13, 14)),

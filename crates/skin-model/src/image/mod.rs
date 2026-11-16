@@ -64,8 +64,12 @@ pub const MAX_IMAGE_TEXELS: u64 = 12 << 20;
 /// atlas's pages and tables
 /// ([`ATLAS_TABLE_BYTES`](crate::ATLAS_TABLE_BYTES)).
 pub const MAX_STREAMED_TEXELS: u64 = 64 << 20;
-/// The most texels across one variant's files.
-pub const MAX_TOTAL_TEXELS: u64 = 192 << 20;
+/// The most texels across one variant's files: 216 Mi, eighteen files at
+/// [`MAX_IMAGE_TEXELS`]. A provisional limit, raised when a real skin
+/// hits it: a surveyed play skin whose large closing sheet (6400×7941)
+/// sits beside the bitmap fonts of its title card, drawn while the chart
+/// has no back image, reads 202 706 072 texels, past the former 192 Mi.
+pub const MAX_TOTAL_TEXELS: u64 = 216 << 20;
 
 /// A file of the skin: a name relative to the skin folder, and an optional
 /// file at exactly twice its size for high-resolution targets.
