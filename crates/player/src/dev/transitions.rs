@@ -476,8 +476,9 @@ impl Recorder {
     }
 
     /// A presented frame of `stage` at `at`, with its loading lifetime's
-    /// hold if the render thread held it.
-    pub fn frame(&mut self, stage: Stage, at: TimeUs, hold: Option<HoldStamp>) {
+    /// hold if the render thread held it. Returns the change it recorded:
+    /// a transition, or a presentation change.
+    pub fn frame(&mut self, stage: Stage, at: TimeUs, hold: Option<HoldStamp>) -> Option<Edge> {
         if let Some(h) = hold {
             self.hold(h);
         }
@@ -487,6 +488,7 @@ impl Recorder {
             self.preparing = None;
         }
         let unpresented = std::mem::take(&mut self.unpresented);
+        let mut change = None;
         match (self.last, self.open) {
             (Some((last, last_at)), Some(mut s)) => {
                 let gap = Gap {
@@ -497,21 +499,25 @@ impl Recorder {
                 };
                 if last.state != stage.state || last.lifetime != stage.lifetime {
                     self.book.push(Record::Span(s));
-                    self.book.push(Record::Edge(Edge {
+                    let edge = Edge {
                         presentation: false,
                         from: last,
                         to: stage,
                         gap,
-                    }));
+                    };
+                    self.book.push(Record::Edge(edge));
+                    change = Some(edge);
                     self.open = Some(Self::opened(stage, at));
                 } else {
                     if last.drew != stage.drew {
-                        self.book.push(Record::Edge(Edge {
+                        let edge = Edge {
                             presentation: true,
                             from: last,
                             to: stage,
                             gap,
-                        }));
+                        };
+                        self.book.push(Record::Edge(edge));
+                        change = Some(edge);
                     }
                     s.frames = s.frames.saturating_add(1);
                     s.unpresented = s.unpresented.saturating_add(unpresented);
@@ -537,6 +543,7 @@ impl Recorder {
                 *slot = None;
             }
         }
+        change
     }
 
     const fn opened(stage: Stage, at: TimeUs) -> Span {

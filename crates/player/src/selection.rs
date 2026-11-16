@@ -6357,6 +6357,7 @@ pub(crate) mod tests {
             logs: Vec::new(),
             captures: crate::dev::scenario::Captures::of(Vec::new()),
             transitions: crate::dev::transitions::Transitions::default(),
+            shots: None,
             recorded: crate::input_side::Recorded {
                 keyboard: Vec::new(),
                 controller: Vec::new(),
@@ -8881,6 +8882,7 @@ pub(crate) mod tests {
             logs: Vec::new(),
             captures,
             transitions: crate::dev::transitions::Transitions::default(),
+            shots: None,
             recorded: crate::input_side::Recorded {
                 keyboard: Vec::new(),
                 controller: Vec::new(),

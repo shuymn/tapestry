@@ -4131,14 +4131,14 @@ fn a_scenario_records_each_change_with_its_first_frame() {
     )
     .unwrap();
     let (out, stdout, stderr) = fx.run_drained(
-        &mut fx.command(&scenario(&[
+        &mut fx.command(&capturing(&scenario(&[
             "select = { path = \"library/a/a.bms\" }",
             "play = { input = \"auto\", until = \"end\" }",
             "result = \"back\"",
             "practice = { path = \"library/a/a.bms\", from = 1, to = 2, speed = 100, \
          lead_in_ms = 2500, gauge = 20, repeat = true, input = \"logs/k7.tprl\", rounds = 1 }",
             "quit = {}",
-        ])),
+        ]))),
         RUN_LIMIT,
     );
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
@@ -4164,9 +4164,10 @@ fn a_scenario_records_each_change_with_its_first_frame() {
         Some(record.len().to_string().as_str()),
         "the summary counts the records printed: {summary}"
     );
+    // Each change's first frame was read back: every line is
+    // instrumented.
     for l in record.iter().chain([&summary]) {
-        assert!(!l.ends_with(", instrumented"), "{l}");
-        assert!(!l.starts_with("dev: mark read-back"), "{l}");
+        assert!(l.ends_with(", instrumented"), "{l}");
     }
     // `dev: transition <from> -> <to>: <n> us, last <a> us, first <b> us…`.
     let number = |l: &str, key: &str| -> i64 {
@@ -4195,6 +4196,54 @@ fn a_scenario_records_each_change_with_its_first_frame() {
         }
     }
     assert!(span.is_some(), "the last state's span: {stdout}");
+    // Each transition and presentation line has its first frame's
+    // capture, numbered in the record's order: that frame's present is
+    // the line's first, and its JSON names the same change.
+    let shots = fx.base.join("out").join("transitions");
+    let mut taken = 0;
+    for l in &record {
+        let (kind, from, to, name) = if let Some(rest) = l.strip_prefix("dev: transition ") {
+            let (from, rest) = rest.split_once(" -> ").unwrap();
+            let to = rest.split(':').next().unwrap();
+            ("transition", from, to, format!("{from}-{to}"))
+        } else if let Some(rest) = l.strip_prefix("dev: presentation ") {
+            // `<state> <lifetime>: <from> -> <to>: …`.
+            let (head, rest) = rest.split_once(": ").unwrap();
+            let state = head.split(' ').next().unwrap();
+            let (from, rest) = rest.split_once(" -> ").unwrap();
+            let to = rest.split(':').next().unwrap();
+            ("presentation", from, to, format!("{state}-{from}-{to}"))
+        } else {
+            continue;
+        };
+        taken += 1;
+        let png = shots.join(format!("{taken:02}-{name}.png"));
+        assert!(png.is_file(), "{} for {l}", png.display());
+        let side = fs::read_to_string(png.with_extension("json")).unwrap();
+        let first = number(l, "first");
+        for field in [
+            format!("\"presented_us\":{first},"),
+            format!("\"first_us\":{first},"),
+            format!("\"last_us\":{},", number(l, "last")),
+            format!("\"transition\":\"{kind}\""),
+            format!("\"from\":\"{from}\""),
+            format!("\"to\":\"{to}\""),
+            "\"instrumented\":true".to_owned(),
+        ] {
+            assert!(side.contains(&field), "{field} for {l}: {side}");
+        }
+    }
+    let pngs = fs::read_dir(&shots)
+        .unwrap()
+        .filter(|e| {
+            e.as_ref()
+                .unwrap()
+                .path()
+                .extension()
+                .is_some_and(|x| x == "png")
+        })
+        .count();
+    assert_eq!(pngs, taken, "one capture per change: {stdout}");
     // The final state's span is pushed at the render thread's end: printed
     // after it, it is the last record.
     assert!(
@@ -4242,6 +4291,169 @@ fn a_scenario_records_each_change_with_its_first_frame() {
             assert_eq!(spans, [drawn], "{decision}\n{stdout}");
         }
     }
+}
+
+/// `text` with each change's first frame captured (`[transitions] capture
+/// = true`).
+fn capturing(text: &str) -> String {
+    text.replace("[library]", "[transitions]\ncapture = true\n[library]")
+}
+
+/// The record's lines of `stdout`: transitions, presentation changes,
+/// spans and marks.
+fn record_lines(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter(|l| {
+            [
+                "dev: transition ",
+                "dev: presentation ",
+                "dev: span ",
+                "dev: mark ",
+            ]
+            .iter()
+            .any(|p| l.starts_with(p))
+        })
+        .collect()
+}
+
+/// The frames of each READY span in `record`.
+fn ready_frames(record: &[&str]) -> Vec<i64> {
+    record
+        .iter()
+        .filter(|l| l.starts_with("dev: span ready "))
+        .map(|l| figure(l, "frames"))
+        .collect()
+}
+
+/// The read-backs in `record` of `at_least` µs or more.
+fn long_read_backs(record: &[&str], at_least: i64) -> usize {
+    record
+        .iter()
+        .filter(|l| {
+            l.starts_with("dev: mark read-back ")
+                && figure(l, "to") - figure(l, "read-back") >= at_least
+        })
+        .count()
+}
+
+/// The practice round run with each change captured, the test stall of
+/// 4 s on the captures of frames of `state` only.
+fn stalled_at(state: &str) -> (Output, String, String) {
+    let fx = practice_fixture();
+    fx.run_drained(
+        fx.command(&capturing(&practice_scenario()))
+            .env("TAPESTRY_DEV_CAPTURE_STALL_MS", "4000")
+            .env("TAPESTRY_DEV_CAPTURE_STALL_STATE", state),
+        RUN_LIMIT,
+    )
+}
+
+/// A capture's read-back stalls the render thread it times, so a short
+/// state can lose its frames to it. One practice round with a 2.5 s
+/// lead-in, run twice: recorded only, READY shows over several frames, no
+/// frame is read back and no line is instrumented; with each change
+/// captured and only READY's capture stalled 4 s, READY keeps only its
+/// captured first frame, the interval from it into the play is covered by
+/// that read-back of 4 s or more, and every line is instrumented.
+#[test]
+fn a_capture_s_read_back_can_erase_a_short_ready() {
+    // Recorded only.
+    let fx = practice_fixture();
+    let (out, stdout, stderr) = fx.run_drained(&mut fx.command(&practice_scenario()), RUN_LIMIT);
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let record = record_lines(&stdout);
+    let summary = lines(&stdout, "dev: transitions: ");
+    assert_eq!(summary.len(), 1, "{stdout}");
+    for l in record.iter().chain(&summary) {
+        assert!(!l.ends_with(", instrumented"), "{l}");
+        assert!(!l.starts_with("dev: mark read-back"), "{l}");
+    }
+    assert!(
+        record
+            .iter()
+            .any(|l| l.starts_with("dev: transition loading -> ready:")),
+        "{stdout}"
+    );
+    let ready = ready_frames(&record);
+    assert!(
+        ready.first().is_some_and(|&n| n >= 2),
+        "READY over several frames: {ready:?}\n{stdout}"
+    );
+
+    // Each change captured, READY's capture stalled 4 s.
+    let (out, stdout, stderr) = stalled_at("ready");
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let record = record_lines(&stdout);
+    let summary = lines(&stdout, "dev: transitions: ");
+    assert_eq!(summary.len(), 1, "{stdout}");
+    for l in record.iter().chain(&summary) {
+        assert!(l.ends_with(", instrumented"), "{l}");
+    }
+    let ready = ready_frames(&record);
+    assert_eq!(
+        ready.first(),
+        Some(&1),
+        "READY keeps only its captured first frame: {ready:?}\n{stdout}"
+    );
+    let into_play = record
+        .iter()
+        .find(|l| l.starts_with("dev: transition ready -> play:"))
+        .unwrap_or_else(|| panic!("no ready -> play: {stdout}"));
+    assert!(
+        figure(into_play, "covered") >= 4_000_000,
+        "the read-back covers the interval into the play: {into_play}"
+    );
+    assert!(
+        long_read_backs(&record, 4_000_000) >= 1,
+        "a read-back of 4 s or more: {stdout}"
+    );
+}
+
+/// A stall at the loading state's captured first frame cannot erase READY:
+/// the end of loading waits for the render thread's acknowledgement, so
+/// READY begins after the stall. The loading state's read-back of 4 s or
+/// more is the run's only long one, and READY is presented after it.
+#[test]
+fn a_stalled_loading_capture_delays_ready() {
+    let (out, stdout, stderr) = stalled_at("loading");
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let record = record_lines(&stdout);
+    assert!(
+        record
+            .iter()
+            .any(|l| l.starts_with("dev: transition loading -> ready:")),
+        "READY is not erased: {stdout}"
+    );
+    let ready = ready_frames(&record);
+    assert!(
+        ready.first().is_some_and(|&n| n >= 1),
+        "READY presented: {ready:?}\n{stdout}"
+    );
+    assert_eq!(
+        long_read_backs(&record, 4_000_000),
+        1,
+        "only the loading state's capture stalls: {stdout}"
+    );
+    // Covered time of the interval into READY, or of a loading span's
+    // longest gap (`longest gap <g> us (<a> to <b>, uncovered <u> us)`).
+    let into_ready = record
+        .iter()
+        .filter(|l| l.starts_with("dev: transition loading -> ready:"))
+        .map(|l| figure(l, "covered"));
+    let in_span = record
+        .iter()
+        .filter(|l| l.starts_with("dev: span loading "))
+        .filter_map(|l| l.split("longest gap ").nth(1))
+        .filter(|rest| !rest.starts_with("none"))
+        .map(|rest| figure(&format!("gap {rest}"), "gap") - figure(rest, "uncovered"));
+    let loading_stalled = into_ready
+        .chain(in_span)
+        .any(|covered| covered >= 4_000_000);
+    assert!(
+        loading_stalled,
+        "the loading state's stall lies in its span or its interval into READY: {stdout}"
+    );
 }
 
 /// The record's cap reaches the run's exit: with the cap lowered to 3
