@@ -91,7 +91,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use mlua::{Lua, MultiValue, RegistryKey, Value};
-use skin_model::{FileId, Root, ScreenKind};
+use skin_model::{FileId, Root, RootError, ScreenKind};
 
 pub use self::callback::Disposition;
 use self::config::Bridge;
@@ -363,6 +363,9 @@ pub(crate) struct Pass {
     hosts: SyncRefCell<HashMap<usize, u16>>,
     handled: SyncCell<u64>,
     last_error: SyncRefCell<Option<Loc>>,
+    /// The last `dofile` read that led to no file: its error's message,
+    /// the name read and why ([`loader::dofile`]).
+    absent: SyncRefCell<Option<(Vec<u8>, String, bool)>>,
     bridge: Option<Bridge>,
     /// The configured pass's import facts, and the facts it read once
     /// each, in first-read order.
@@ -448,6 +451,7 @@ impl Pass {
             hosts: SyncRefCell::new(HashMap::new()),
             handled: SyncCell::new(0),
             last_error: SyncRefCell::new(None),
+            absent: SyncRefCell::new(None),
             bridge,
             facts,
             reads: SyncRefCell::new(Vec::new()),
@@ -514,6 +518,29 @@ impl Pass {
     fn handled(&self, at: Option<Loc>) {
         self.handled.set(self.handled.get() + 1);
         *self.last_error.borrow_mut() = at;
+    }
+
+    /// Records the `dofile` read of `key` that led to no file, `why`
+    /// [`RootError::Missing`] or [`RootError::NotAFile`], raised as
+    /// `message`.
+    fn absent(&self, message: &[u8], key: String, why: &RootError) {
+        let missing = matches!(why, RootError::Missing);
+        *self.absent.borrow_mut() = Some((message.to_vec(), key, missing));
+    }
+
+    /// The read the escaped error `e` reports, when it is the last absent
+    /// `dofile`'s own message.
+    fn escaped_absent(&self, e: &[u8]) -> Option<(String, RootError)> {
+        let absent = self.absent.borrow();
+        let (message, key, missing) = absent.as_ref()?;
+        (message.as_slice() == e).then(|| {
+            let why = if *missing {
+                RootError::Missing
+            } else {
+                RootError::NotAFile
+            };
+            (key.clone(), why)
+        })
     }
 
     fn handled_count(&self) -> u64 {

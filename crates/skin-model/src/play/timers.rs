@@ -163,6 +163,14 @@ fn exact_rate(x: u64, n: u64, scale: u32) -> i32 {
     i32::try_from(q).unwrap_or(i32::MAX)
 }
 
+/// The best paced to `p` of `n` targets: entry `p` of the best play's
+/// `pace` when there is one, else the line, [`paced`]. Read with `get`, so
+/// an entry past the series also gives the line.
+fn paced_best(best: u32, pace: Option<&[u32]>, p: u64, n: u64) -> u64 {
+    pace.and_then(|s| s.get(usize::try_from(p).ok()?))
+        .map_or_else(|| paced(best, p, n), |&g| u64::from(g))
+}
+
 /// `ex − paced` as a field value, clamped to ±[`MAX_COUNT`].
 fn difference(ex: u32, paced: u64) -> i32 {
     let d = i128::from(ex) - i128::from(paced);
@@ -183,27 +191,29 @@ fn at_least(ex: u32, i: u32, d: u64) -> bool {
 
 /// What one frame's score figures read: the EX score, the judged targets
 /// `p`, the attempt's targets `n`, whether the attempt has been updated
-/// (its first judgment, the empty POOR included), the play's best and
-/// target, and whether its chart declares `#RANDOM`.
+/// (its first judgment, the empty POOR included), the play's best, its
+/// pace and target, and whether its chart declares `#RANDOM`.
 #[derive(Clone, Copy)]
-pub(crate) struct ScoreInputs {
+pub(crate) struct ScoreInputs<'a> {
     pub(crate) ex: u32,
     pub(crate) judged: u64,
     pub(crate) targets: u64,
     pub(crate) updated: bool,
     pub(crate) best: u32,
+    pub(crate) pace: Option<&'a [u32]>,
     pub(crate) target: u32,
     pub(crate) random: bool,
 }
 
 /// The score fields from `field::BEST_EX`, in slot order.
-pub(crate) fn score_figures(s: ScoreInputs) -> [i32; SCORE_FIELDS] {
+pub(crate) fn score_figures(s: ScoreInputs<'_>) -> [i32; SCORE_FIELDS] {
     let ScoreInputs {
         ex,
         judged: p,
         targets: n,
         updated,
         best,
+        pace,
         target,
         random,
     } = s;
@@ -223,7 +233,7 @@ pub(crate) fn score_figures(s: ScoreInputs) -> [i32; SCORE_FIELDS] {
     let head = [
         count(best),
         count(target),
-        difference(ex, paced(best, p, n)),
+        difference(ex, paced_best(best, pace, p, n)),
         difference(ex, paced(target, p, n)),
         exact_rate(u64::from(best), n, bp),
         exact_rate(u64::from(target), n, bp),
@@ -249,13 +259,14 @@ pub(crate) fn score_figures(s: ScoreInputs) -> [i32; SCORE_FIELDS] {
 /// The six score ratios the play's ratio bars draw, in
 /// [`ScoreRate::ALL`](crate::ScoreRate::ALL)'s order: each exact, 0 for an empty denominator,
 /// and none for the best's two on a `#RANDOM` chart.
-pub(crate) fn score_ratios(s: ScoreInputs) -> [Option<Ratio>; 6] {
+pub(crate) fn score_ratios(s: ScoreInputs<'_>) -> [Option<Ratio>; 6] {
     let ScoreInputs {
         ex,
         judged: p,
         targets: n,
         updated,
         best,
+        pace,
         target,
         random,
     } = s;
@@ -268,7 +279,7 @@ pub(crate) fn score_ratios(s: ScoreInputs) -> [Option<Ratio>; 6] {
     [
         Some(over_chart(u64::from(ex), n)),
         Some(judged),
-        compared(over_chart(paced(best, p, n), n)),
+        compared(over_chart(paced_best(best, pace, p, n), n)),
         compared(over_chart(u64::from(best), n)),
         Some(over_chart(paced(target, p, n), n)),
         Some(over_chart(u64::from(target), n)),
@@ -890,6 +901,7 @@ impl Play {
             targets: u64::from(self.reducer.targets()),
             updated: self.judged,
             best: self.score.best,
+            pace: self.pace.as_deref(),
             target: self.score.target,
             random: self.random,
         };

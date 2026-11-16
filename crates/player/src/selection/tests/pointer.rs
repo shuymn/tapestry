@@ -386,8 +386,9 @@ fn last_rects(screens: &Installers) -> Vec<[f32; 4]> {
     screens.built.lock().unwrap().last().unwrap().2.clone()
 }
 
-/// The fixture as built: each slot holding a row draws its bar at its
-/// rect, and every target is where the points above take it.
+/// The fixture as built: each slot draws its bar at its rect, the list's
+/// ring filling all seven, and every target is where the points above
+/// take it.
 #[test]
 fn the_pointer_fixture_draws_where_its_points_are() {
     let dir = tempfile::tempdir().unwrap();
@@ -395,14 +396,14 @@ fn the_pointer_fixture_draws_where_its_points_are() {
     on_pointer(sel, true, None, |_, _, screens| {
         let rects = last_rects(screens);
         let has = |r: [f32; 4]| rects.contains(&r);
-        // The cursor on row 0: slots 3 to 6 hold rows 0 to 3.
-        for i in 3..7 {
+        // The cursor on row 0: slots 3 to 6 hold rows 0 to 3, and slots
+        // 0 to 2 rows 1 to 3 around the ring.
+        for i in 0..7 {
             assert!(
                 has([1_000.0, 100.0 + 100.0 * i as f32, 800.0, 80.0]),
                 "{rects:?}"
             );
         }
-        assert!(!has([1_000.0, 200.0, 800.0, 80.0]));
         for r in [
             [100.0, 200.0, 100.0, 50.0],
             [100.0, 300.0, 100.0, 50.0],
@@ -423,8 +424,8 @@ fn the_pointer_fixture_draws_where_its_points_are() {
 }
 
 /// P2: a left press on a row moves the cursor to it by its identity, on
-/// the drawn cursor's row acts as Enter, and a slot with no row is no
-/// target. With the render thread a frame behind (the cursor moved down
+/// the drawn cursor's row acts as Enter, and the slot above the first
+/// row's shows the last row on the list's ring. With the render thread a frame behind (the cursor moved down
 /// after the frame it holds), the old cursor row moves the cursor back
 /// and plays nothing; an off-centre chart or folder is moved to, not
 /// played or opened; once drawn at the centre, the chart plays.
@@ -474,12 +475,9 @@ fn a_left_press_moves_to_its_row_and_enters_the_drawn_cursors() {
         act(rig, screens);
         assert_eq!(log(rig), [(Press(MoveTo(1)), 1)]);
         assert_eq!(place(rig), SelectionPlace::Top);
-        // A slot that drew no row is no target.
+        // The slot above the first row's shows the last on the list's
+        // ring: chart c, moved to, then once drawn at the centre, played.
         w.click(c, slot(1), Button::Left);
-        act(rig, screens);
-        assert_eq!(log(rig), [(Press(Nothing), 1)]);
-        // Chart c, then once drawn at the centre, played.
-        w.click(c, row(1, 4), Button::Left);
         act(rig, screens);
         assert_eq!(log(rig), [(Press(MoveTo(4)), 4)]);
         w.click(c, row(4, 4), Button::Left);
@@ -2136,9 +2134,100 @@ fn a_slot_or_row_without_its_bar_takes_no_click() {
     });
 }
 
+/// A press on a slot acts on the row the slot shows, wherever the ring
+/// repeats it (design.md "Input", Pointer input): on Top's three rows
+/// (all charts, c1, c2) with the cursor on c1, slot `i` shows row
+/// `(i − 2) mod 3`, so slots 1 and 2 move to c2 and to all charts, and
+/// slots 0 and 6, copies of the cursor's row, choose c1. Each case runs on
+/// a fresh rig.
+// Source: SF-016
+#[test]
+fn a_press_on_a_repeated_row_acts_on_the_row_it_shows() {
+    for (at, want) in [
+        (1, MoveTo(2)),
+        (2, MoveTo(0)),
+        (0, Key(MenuKey::Enter)),
+        (6, Key(MenuKey::Enter)),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let (sel, roots) = charts(dir.path(), 2);
+        on_pointer(sel, true, None, |rig, w, screens| {
+            let c = rig.controls;
+            w.key(MenuKey::Down);
+            act(rig, screens);
+            assert_eq!(cursor(rig), 1);
+            log(rig);
+            w.click(c, slot(at), Button::Left);
+            let pick = take_all(rig);
+            let cursor = match want {
+                MoveTo(to) => {
+                    assert_eq!(pick, None, "slot {at}");
+                    to
+                }
+                _ => {
+                    assert_eq!(
+                        pick,
+                        Some(game::Pick::Play(roots[0].join("c1.bms"))),
+                        "slot {at}"
+                    );
+                    1
+                }
+            };
+            assert_eq!(log(rig), [(Press(want), cursor)], "slot {at}");
+        });
+    }
+}
+
+/// The wheel steps around the list's ring and sounds `scratch` once a
+/// notch, whole laps that bring the cursor back included; on a one-row
+/// list it sounds and stays.
+// Source: SF-012
+// Source: SF-016
+#[test]
+fn the_wheel_steps_around_the_ring() {
+    use audio::SystemKind;
+    let starts = |rig: &mut PlayerRig<'_>| {
+        rig.audio
+            .control
+            .failure_probe()
+            .system_starts(SystemKind::Scratch)
+    };
+    // Top: all charts and three charts.
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 3);
+    let skin = crate::selection_skin::pointer_fixture(true);
+    on_pointer_from(&skin, sel, None, true, |rig, w, screens| {
+        let c = rig.controls;
+        let mut last = starts(rig);
+        for (notches, at, sounds) in [(1, 1, 1), (-3, 2, 3), (4, 2, 4), (-4, 2, 4)] {
+            w.wheel(c, notches);
+            act(rig, screens);
+            assert_eq!(log(rig), [(Notch(Rows(notches)), at)], "{notches}");
+            let now = starts(rig);
+            assert_eq!(now - last, sounds, "{notches} notches");
+            last = now;
+        }
+    });
+    // All charts entered with one chart: a one-row list.
+    let dir = tempfile::tempdir().unwrap();
+    let (sel, _) = charts(dir.path(), 1);
+    on_pointer_from(&skin, sel, None, true, |rig, w, screens| {
+        let c = rig.controls;
+        w.key(MenuKey::Enter);
+        act(rig, screens);
+        assert_eq!(sel_of(rig).screen.selectable(), 1);
+        log(rig);
+        let last = starts(rig);
+        w.wheel(c, 1);
+        act(rig, screens);
+        assert_eq!(log(rig), [(Notch(Rows(1)), 0)]);
+        assert_eq!(starts(rig) - last, 1, "a notch on one row");
+    });
+}
+
 /// C24-5, C24-8 through the pointer's own path (design.md "State Model",
 /// system sounds, Selection): each look's requests to the audio thread.
-/// The wheel sounds `scratch` once for each row it moves; a click on a
+/// The wheel sounds `scratch` once a notch; a click on a
 /// row, the list slider and a volume slider move or set without a sound;
 /// the order button and a cover switch sound `o-change`.
 // Source: SF-012

@@ -2,9 +2,10 @@
 //! allocating (stage 3, S10-10; design.md "Scope of No Allocation"), each
 //! widget at its cap and drawing its asserted output: skin A, the six
 //! score bars in both orientations, every score number at the most cells
-//! a strip takes, the sixteen rank flags and both pass timers, over the
-//! frames before the first judgment, after an empty POOR, mid-play, at
-//! the end, after a rearm and in a second practice round. Then skins B to
+//! a strip takes, the sixteen rank flags and both pass timers, with the
+//! best paced by its play's series, over the frames before the first
+//! judgment, after an empty POOR, mid-play, at the end, after a rearm and
+//! in a second practice round. Then skins B to
 //! D and a one-hour chart's notes graph over the same frames: a BPM graph
 //! at 2 048 columns, every column at its four runs; a timing visualizer at
 //! jw 1 000 beside a hit-error visualizer 4 096 texels wide over a wrapped
@@ -299,9 +300,13 @@ fn score_frames_do_not_allocate() {
         best_known: true,
         target: 13,
     };
+    // The best play's EX after each judged target, not the line: at p = 3
+    // it is 6 where the line gives 4.
+    let pace = [0, 2, 4, 6, 8, 9, 11, 11];
     let ctx = PlayContext {
         score: PlayScore {
             basis,
+            pace: Some(&pace),
             ..PlayScore::NONE
         },
         ..full(0)
@@ -343,10 +348,10 @@ fn score_frames_do_not_allocate() {
         },
         "empty POOR",
     );
-    // Mid-play: p = 3, ex = 5.
+    // Mid-play: p = 3, ex = 5, the best paced to 6 by its series.
     assert_eq!(frame(&mut h, 1_300, tally(2, 1, 0)), 0);
     let mut numbers = READY_NUMBERS;
-    numbers[2] = Some(1_000_001);
+    numbers[2] = Some(999_999);
     check(
         &h,
         &atlas,
@@ -354,7 +359,7 @@ fn score_frames_do_not_allocate() {
             bars: [
                 Some((5, 14)),
                 Some((5, 6)),
-                Some((4, 14)),
+                Some((6, 14)),
                 Some((11, 14)),
                 Some((5, 14)),
                 Some((13, 14)),
@@ -465,6 +470,7 @@ fn score_frames_do_not_allocate() {
     );
     skin_b();
     skin_notes();
+    skin_live();
     skin_c();
     skin_d();
     one_hour();
@@ -1058,4 +1064,70 @@ fn one_hour() {
         assert_eq!(at_x(h, 900.0), 1, "{at}");
     };
     graph_frames("one hour", skin, &chart, score, &check);
+}
+
+/// A play's early/late graph at its cap: 512 bins of 2 s, ten notes in
+/// each, every bin holding one judgment of each of the nine channels and
+/// one note not judged; with the background and the cursors, each frame
+/// at zero allocations draws 512 × 10 chips.
+fn skin_live() {
+    let mut b = ChartBuilder::new(150_000);
+    for bin in 0..512_i64 {
+        for k in 0..10_i64 {
+            b = b.tap(
+                lane(1 + u8::try_from(k % 7).unwrap()),
+                TimeUs((2_000 * bin + 50 * k) * MS),
+            );
+        }
+    }
+    let mut chart = b.build().unwrap();
+    chart.meta.length = bms_model::ChartSummary::of(&chart).length;
+    let profile = bms_model::ChartProfile::of(&chart, &[]);
+    assert_eq!((profile.bins().len(), profile.bin_seconds()), (512, 2));
+    let score = PlayScore {
+        profile: Some(&profile),
+        ..PlayScore::NONE
+    };
+    let def = skin_model::JudgeGraphDef {
+        kind: skin_model::JudgeGraphKind::EarlyLate,
+        delay: TimeUs(0),
+        reverse: false,
+        back: true,
+        chips: 0,
+        solid: 0,
+        fit: skin_model::GraphFit::Stretch,
+    };
+    let skin = graph_skin(
+        vec![screen_el(Source::JudgeGraph(0), [0, 0, 1_024, 500])],
+        PlayDefs {
+            judge_graphs: vec![def],
+            ..PlayDefs::default()
+        },
+    );
+    let ctx = PlayContext {
+        score,
+        ..full(1_000)
+    };
+    let mut h = Harness::new(skin, &chart, &ctx);
+    h.judgments = Some(vec![[1; 9]; 512]);
+    let colors: [u32; 10] = [
+        0x55_5555, 0x44_ff44, 0x00_88ff, 0x00_66cc, 0x00_4488, 0x00_2244, 0xff_8800, 0xcc_6600,
+        0x88_4400, 0x44_2200,
+    ];
+    let chip = |c: [f32; 4]| {
+        colors.iter().any(|&w| {
+            let w = [(w >> 16) & 0xff, (w >> 8) & 0xff, w & 0xff].map(|v| v as f32 / 255.0);
+            w.iter().zip(c).all(|(a, b)| (a - b).abs() < 1e-3)
+        })
+    };
+    let chips = |h: &Harness| h.batch.quads().iter().filter(|q| chip(q.color)).count();
+    assert_eq!(frame(&mut h, -500, tally(0, 0, 0)), 0, "live: ready");
+    assert_eq!(chips(&h), 512 * 10, "live: ready");
+    assert_eq!(frame(&mut h, 1_300, tally(2, 1, 0)), 0, "live: mid-play");
+    assert_eq!(chips(&h), 512 * 10, "live: mid-play");
+    h.play.rearm();
+    h.judgments = Some(vec![[0; 9]; 512]);
+    assert_eq!(frame(&mut h, -500, tally(0, 0, 0)), 0, "live: rearm");
+    // Every note grey: one run a bin.
+    assert_eq!(chips(&h), 512, "live: rearm");
 }

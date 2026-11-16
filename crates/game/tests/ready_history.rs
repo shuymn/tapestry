@@ -231,6 +231,8 @@ fn the_reservation_charges_the_arenas_actual_capacity() {
     let base = Reservation {
         fixed: 1_000,
         per_input: 10,
+        judge_bins: 0,
+        note_bins: 0,
     };
     let charged = base.with_history(40);
     assert_eq!(charged.fixed, 1_000 + HistoryRecorder::bytes(40));

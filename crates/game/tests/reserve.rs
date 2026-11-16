@@ -15,12 +15,12 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-use bms_model::{ChartBuilder, TimeUs};
+use bms_model::{ChartBuilder, ChartProfile, ChartSummary, TimeUs};
 use common::{MS, device, lane};
 use eval::{InputStart, JudgeEvent};
 use game::{
-    Logic, LogicConfig, Reservation, SMALL_PARTS_BYTES, TABLE_BYTES_PER_OBJECT, VIEW_NOTE_COPIES,
-    audio_link_at,
+    JUDGE_BIN_COPIES, JudgeBins, Logic, LogicConfig, Reservation, SMALL_PARTS_BYTES,
+    TABLE_BYTES_PER_OBJECT, VIEW_NOTE_COPIES, audio_link_at,
 };
 use input::source_queue;
 
@@ -77,12 +77,36 @@ fn reservation_matches_what_a_play_allocates() {
     for i in 0..25 {
         b = b.mine(lane(7), TimeUs(1_017 * MS + i * 401 * MS), 3);
     }
-    let chart = b.build().unwrap();
+    let mut chart = b.build().unwrap();
+    chart.meta.length = ChartSummary::of(&chart).length;
+    let profile = ChartProfile::of(&chart, &[]);
     let objects: usize = chart.lanes.iter().map(Vec::len).sum();
     let rule = rules::tapestry();
     let dev = device(&[0, 0, 0]);
     let effects = 1_000;
     let r = Reservation::of(&chart, &rule, &dev, effects).unwrap();
+    // The judgment bins' terms, from the actual sizes and counts: the six
+    // copies of the bins and 2 bytes for each of the 365 objects, mines
+    // included, each of them in the fixed part.
+    assert_eq!(size_of::<JudgeBins>(), 18_448);
+    assert_eq!(r.judge_bins, JUDGE_BIN_COPIES * size_of::<JudgeBins>());
+    assert_eq!(JUDGE_BIN_COPIES, 1 + VIEW_NOTE_COPIES);
+    assert_eq!(r.note_bins, 2 * objects);
+    assert_eq!(objects, 365);
+    let tens = {
+        let mut b = ChartBuilder::new(150_000);
+        for i in 0..10_000 {
+            b = b.tap(
+                lane(u8::try_from(i % 7).unwrap() + 1),
+                TimeUs(1_000 * MS + i * 7 * MS),
+            );
+        }
+        b.build().unwrap()
+    };
+    let r10 = Reservation::of(&tens, &rule, &dev, effects).unwrap();
+    assert_eq!(r10.note_bins, 20_000);
+    assert_eq!(r10.judge_bins, r.judge_bins);
+    assert!(r10.fixed >= r10.judge_bins + r10.note_bins + SMALL_PARTS_BYTES);
     // A play's reservations, as `live` makes them: the logic step, the
     // audio command queue and the copy of the events.
     let measure = |inputs: usize| {
@@ -100,6 +124,8 @@ fn reservation_matches_what_a_play_allocates() {
             Vec::new(),
         )
         .unwrap();
+        let mut logic = logic;
+        assert!(logic.bin_judgments(&chart, &profile));
         let audio = audio_link_at(logic.max_events(), TimeUs(0));
         let live: Vec<JudgeEvent> = Vec::with_capacity(logic.max_events());
         // The view the play's end takes.

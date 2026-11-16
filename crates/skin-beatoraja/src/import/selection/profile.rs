@@ -247,8 +247,13 @@ pub(crate) fn number(id: i32) -> Option<Class<SelValue>> {
         // at `0.8.9`: `:155-159`, `:175`, `:183`, `:187-188`, `:200-201`,
         // `:231`, `:237`).
         71 | 101 | 150 | 171 => Bridge(SelValue::Ex),
-        // EX less the rival's, the target's or the best's, which are 0
-        // here (`:186`, `:192`, `:197-198`, `:232`, `:702-710`).
+        // EX less the paced best (152, 172) or the paced rival (108, 128,
+        // 153) (`:186`, `:192`, `:197-198`, `:232`, `:702-710`): both are
+        // 0 on selection, whatever best or target the player has. Only
+        // play and result set the best and the rival's score
+        // (`ScoreDataProperty.setTargetScore`,
+        // `play/BMSPlayer.java:443-454`, `result/MusicResult.java:343`),
+        // and tapestry has no rival (docs/stage3.md §1, Out).
         108 | 128 | 152 | 153 | 172 => Bridge(SelValue::ExDifference),
         72 => Bridge(SelValue::MaxEx),
         74 | 106 => Bridge(SelValue::Notes),
@@ -545,7 +550,10 @@ pub(crate) fn image_index(id: i32) -> Option<Class<&'static str>> {
         // No image-index property on selection: the source's image draws
         // its entry 0.
         15 | 16 | 19 | 77 | 315..=318 => Bridge("0"),
-        // The target's clear type.
+        // The selected row's rival's clear type: the source's selection
+        // reads the rival's score here, not the target's
+        // (`IntegerPropertyFactory.java:1339-1342`); tapestry has no
+        // rival (docs/stage3.md §1, Out).
         371 => Omit,
         _ => return None,
     })

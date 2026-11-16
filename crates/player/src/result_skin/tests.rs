@@ -100,6 +100,7 @@ fn chart() -> ResultChart {
         notes: None,
         judge_class: None,
         images: skin_model::ImageFacts::default(),
+        target: 0,
     }
 }
 
@@ -425,6 +426,101 @@ fn the_length_is_the_charts_content_end_at_1x() {
         }))
         .unwrap();
     assert_eq!(length(&loaded), Some(bms_model::TimeUs(20_000_000)));
+}
+
+/// A record sink that saves nothing and answers every best read with its
+/// best.
+struct Answers(game::BestLookup);
+
+impl game::RecordSink for Answers {
+    fn save(&mut self, _: &replay::PlayRecord) -> Result<game::RecordRef, game::SaveError> {
+        Err(std::io::Error::other("not saved").into())
+    }
+
+    fn best_before(&mut self, _: &game::BestKey, _: &rules::RulePreset) -> game::BestLookup {
+        self.0.clone()
+    }
+}
+
+/// A 27-note chart (largest EX score 54) loaded under the player's target
+/// `target`, its best read answered with `answer`, no library for `None`.
+fn at_target(
+    target: game::ScoreTarget,
+    answer: Option<game::BestLookup>,
+) -> (tempfile::TempDir, game::Loaded) {
+    let settings = game::Settings {
+        device: game::DeviceSettings::default(),
+        player: game::PlayerSettings {
+            target,
+            ..game::PlayerSettings::default()
+        },
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("a.bms");
+    fs::write(&path, format!("#BPM 120\n#00111:{}\n", "01".repeat(27))).unwrap();
+    let config = game::SessionConfig {
+        lead_in: bms_model::TimeUs(1_000_000),
+        step: bms_model::TimeUs(1_000),
+        start: bms_model::TimeUs(0),
+        effects: 64,
+        seed: 1,
+        speed: bms_model::Speed::NORMAL,
+        app_version: "0.0.0-test".to_owned(),
+        provenance: replay::BuildProvenance::Development,
+        receive: replay::ReceiveMethod::Scripted,
+        autoplay: None,
+    };
+    let parts = game::Parts {
+        records: answer.map(|a| Box::new(Answers(a)) as Box<dyn game::RecordSink>),
+        ..game::Parts::unsaved(&settings.player)
+    };
+    let root = game::DataRoot::new(dir.path().join("root"));
+    let loaded = game::Loaded::load(root, settings, &path, config, parts).unwrap();
+    (dir, loaded)
+}
+
+/// The result's chart carries the play's target (design.md "Personal
+/// Bests", Target), the attempt's own, which its play skin takes: `"next"`
+/// over a known best of 40 is rank 21's 42, not the best; `"aa-"` with no
+/// library is `⌈54 · 20 / 27⌉` = 40; a practice round under `"max"` has
+/// none, 0, where a full play's is 54.
+#[test]
+fn the_result_carries_the_plays_target() {
+    let known = game::BestLookup::Known(game::BestScore {
+        plays: 1,
+        ex: Some(40),
+        bp: Some(0),
+        max_combo: None,
+        clear: None,
+    });
+    let target = |l: &game::Loaded| {
+        super::attempt_chart(l)
+            .resolved(skin_model::ImageFacts::default())
+            .target
+    };
+    for (setting, answer, want) in [
+        (game::ScoreTarget::Next, Some(known), 42),
+        (game::ScoreTarget::AaMinus, None, 40),
+        (game::ScoreTarget::Max, None, 54),
+    ] {
+        let (_dir, mut loaded) = at_target(setting, answer);
+        drop(loaded.begin_play());
+        assert_eq!(target(&loaded), want, "{setting:?}");
+        assert_eq!(loaded.attempt().score.target, want, "{setting:?}");
+    }
+    let (_dir, mut loaded) = at_target(game::ScoreTarget::Max, None);
+    let gauges = loaded.attempt().gauges.len();
+    loaded
+        .set_practice(Some(game::Practice {
+            start: bms_model::TimeUs(0),
+            end: bms_model::TimeUs(3_000_000),
+            lead_in: bms_model::TimeUs(1_000_000),
+            initial_gauges: vec![rules::GaugeValue(20 * rules::GaugeValue::PERCENT); gauges],
+            repeat: true,
+        }))
+        .unwrap();
+    drop(loaded.begin_play());
+    assert_eq!(target(&loaded), 0, "a practice round");
 }
 
 /// A renderer that lags: it holds the bundles it took and reports their
@@ -760,6 +856,51 @@ fn chart_reads_are_decided_before_ready() {
     assert_eq!(builds(), b0);
     assert_eq!(p.source_counts(), read);
     assert!(Arc::ptr_eq(&shown(&rs), &every));
+}
+
+/// A skin that reads the play's target (number 151) while it loads is
+/// decided by the image stage as a chart read is: T is the attempt's, the
+/// same in every view, so one bundle serves every view, published with
+/// no layout job. The read reaches T: the same skin under another target
+/// takes its error branch and is not drawn.
+#[test]
+fn a_target_read_is_decided_before_ready() {
+    let _s = serial();
+    let d = skin_reading(
+        "local t = ms.number(151)",
+        "if t ~= 1234 then error(\"target\") end",
+        "{ { id = \"a\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+    );
+    let at = |target| ResultChart { target, ..chart() };
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+    assert_eq!(
+        rs.image_stage(at(1_234), Some(JudgeClass::Normal), || false, || false),
+        Staged::Ready
+    );
+    assert!(
+        rs.staged_line().starts_with("every view"),
+        "{}",
+        rs.staged_line()
+    );
+    let jobs = jobs_started();
+    let mut v = probe_view(at(1_234));
+    v.score.next_rank = 5;
+    rs.request(ViewFacts(Some(ResultFields::of(&v))));
+    assert!(!rs.has_job());
+    assert_eq!(jobs_started(), jobs);
+    assert!(matches!(rs.published().0, Some(Published::Skin(..))));
+    // The control: under T 7 the probe takes the error branch.
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(p)));
+    assert_eq!(
+        rs.image_stage(at(7), Some(JudgeClass::Normal), || false, || false),
+        Staged::Ready
+    );
+    assert!(
+        !rs.staged_line().starts_with("every view"),
+        "{}",
+        rs.staged_line()
+    );
 }
 
 /// The image stage at `level` with judgment class `class`.

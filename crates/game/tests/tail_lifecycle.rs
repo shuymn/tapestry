@@ -200,6 +200,9 @@ struct Seen {
     tally: Tally,
     finalized: Option<TimeUs>,
     events: u64,
+    /// The judgment bins' bin 1 (the chart's second 1, all its notes)
+    /// and whether they are available.
+    bins: ([u32; game::JUDGE_CHANNELS], bool),
 }
 
 /// The game's threads on a virtual clock: each wait moves it 1 ms, feeds
@@ -499,6 +502,7 @@ impl Rig for Tail {
                 tally: v.tally,
                 finalized: v.finalized,
                 events: v.events,
+                bins: (v.judge_bins.bins[1], v.judge_bins.available),
             });
         }
     }
@@ -707,7 +711,22 @@ fn tail_presses_sound_and_light_without_changing_the_play() {
             (s.tally, s.finalized, s.events),
             (frozen.tally, frozen.finalized, frozen.events)
         );
+        // The judgment bins likewise (design.md "Rendering and Skins"):
+        // the three hits counted on the production route, the tail's
+        // presses and its idle steps counting nothing.
+        assert_eq!(s.bins, frozen.bins);
     }
+    let counted: u32 = frozen.bins.0.iter().sum();
+    assert!(frozen.bins.1, "the play mapped its notes");
+    assert_eq!(counted, 3);
+    assert_eq!(
+        counted,
+        frozen.tally.counts.perfect
+            + frozen.tally.counts.great
+            + frozen.tally.counts.good
+            + frozen.tally.counts.bad
+            + frozen.tally.counts.poor
+    );
     let last = &rig.tail().last().unwrap().input;
     assert_eq!(last.lane(lane(1)), input(false, Some(2_500), Some(2_520)));
     assert_eq!(last.lane(lane(2)), input(false, Some(2_600), Some(2_620)));
@@ -1061,6 +1080,9 @@ fn a_quit_after_the_last_judgment_before_the_final_deadline_closes() {
     let kept = rig.side.as_mut().unwrap().view();
     assert_eq!(kept.closing, Some(closing.started_at));
     assert_eq!(kept.fading, None);
+    // Closing keeps the judgment bins the play counted: its three hits.
+    assert!(kept.judge_bins.available);
+    assert_eq!(kept.judge_bins.bins[1].iter().sum::<u32>(), 3);
     assert!(rig.seen.iter().all(|s| s.fading.is_none()));
     // Every note was judged before the quit, and the play completes at
     // 1.28 s: its record ends midway, before that.

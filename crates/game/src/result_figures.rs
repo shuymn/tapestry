@@ -11,6 +11,7 @@ use replay::verify::Coverage;
 use rules::{GaugeValue, Judgment, RulePreset};
 
 use crate::bests::BestLamp;
+use crate::judge_bins::channel;
 
 /// The width of a timeline bin up to [`MAX_TIMELINE_BINS`] bins: 1 s.
 pub const TIMELINE_BIN_US: i64 = 1_000_000;
@@ -523,25 +524,6 @@ impl Timelines {
         self.bins
             .get(..usize::from(self.axis.count))
             .unwrap_or(&self.bins)
-    }
-}
-
-/// The channel of a judgment: PERFECT 0; GREAT to POOR 1 to 4 early and 5
-/// to 8 late. The side is [`eval::Tally`]'s: a long note's by whichever of
-/// its head's press and its release lies farther from its time, the
-/// release on a tie; early at a deviation of 0 or less; a miss late.
-fn channel(judgment: Judgment, deviation: Option<TimeUs>, release: Option<TimeUs>) -> usize {
-    let grade = match judgment {
-        Judgment::Perfect => return 0,
-        Judgment::Great => 0,
-        Judgment::Good => 1,
-        Judgment::Bad => 2,
-        Judgment::Poor => 3,
-    };
-    if side_deviation(deviation, release).is_some_and(|d| d.0 <= 0) {
-        1 + grade
-    } else {
-        5 + grade
     }
 }
 

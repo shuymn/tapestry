@@ -502,10 +502,11 @@ fn the_library_runs_its_loops_as_metered_lua() {
 }
 
 #[test]
-fn the_library_never_coerces_a_string_to_a_number_or_back() {
+fn the_library_never_reads_a_string_as_a_number() {
     // Each is an ordinary error the skin can catch: a string where a
-    // number belongs, a number where a string belongs, a fraction where
-    // an integer belongs, a value out of range, string arithmetic.
+    // number belongs, a fraction where an integer belongs, a value out of
+    // range, string arithmetic. A number where a string belongs is its
+    // text (`a_number_passed_for_a_string_is_read_as_its_text`).
     for call in [
         "string.char(\"65\")",
         "string.char(65.5)",
@@ -514,16 +515,11 @@ fn the_library_never_coerces_a_string_to_a_number_or_back() {
         "string.sub(\"abc\", \"1\")",
         "string.sub(\"abc\", 1.5)",
         "string.byte(\"abc\", \"1\")",
-        "string.upper(1)",
-        "string.len(1)",
-        "string.find(1, \"1\")",
         "string.find(\"abc\", \"b\", \"1\")",
         "string.gsub(\"abc\", \"b\", \"x\", \"1\")",
-        "string.gsub(\"abc\", \"b\", 7)",
         "string.format(\"%d\", \"1\")",
         "string.format(\"%d\", 1.5)",
         "string.format(\"%f\", \"1\")",
-        "string.format(1)",
         "math.floor(\"1\")",
         "math.ceil(\"1\")",
         "math.abs(\"1\")",
@@ -532,7 +528,7 @@ fn the_library_never_coerces_a_string_to_a_number_or_back() {
         "math.max()",
         "table.insert({}, \"1\", 2)",
         "table.remove({ 1 }, \"1\")",
-        "table.concat({ 1 }, 1)",
+        "table.concat({ 1 }, \"\", \"1\")",
         "select(\"1\", 1)",
         "error(\"x\", \"1\")",
         "(\"1\") + 1",
@@ -557,6 +553,9 @@ fn the_library_never_coerces_a_string_to_a_number_or_back() {
          assert(math.max(2, 7.5, 7) == 7.5 and math.min(3, -1) == -1 and math.abs(-2) == 2)\n\
          assert(math.floor(-1.5) == -2 and math.ceil(1.2) == 2 and math.floor(3) == 3)\n\
          assert(not pcall(function() return (\"1\") + 1 end))\n\
+         assert(string.upper(1) == \"1\" and string.len(10) == 2 and string.find(1, \"1\") == 1)\n\
+         assert(string.gsub(\"abc\", \"b\", 7) == \"a7c\" and string.format(1) == \"1\")\n\
+         assert(table.concat({ 1, 2 }, 0) == \"102\" and tonumber(12, 10) == 12)\n\
          assert(skin_config.get_path(\"none.png\") == \"none.png\")",
     );
     import(&d).unwrap();
@@ -1115,7 +1114,7 @@ fn loaders_refuse_names_outside_the_skin_folder() {
         ("dofile(\"m.lua:stream\")", RootError::Rejected),
         ("dofile(\"parts/*.lua\")", RootError::Rejected),
         ("pcall(dofile, \"../x.lua\")", RootError::Underflow),
-        ("pcall(dofile, \"missing.lua\")", RootError::Missing),
+        ("dofile(\"missing.lua\")", RootError::Missing),
         ("require(\"..x\")", RootError::Rejected),
         ("require(\"a/b\")", RootError::Rejected),
         ("pcall(require, \"c:x\")", RootError::Rejected),
@@ -2560,4 +2559,412 @@ fn offset_tables_are_fresh() {
     )]);
     let h = header(&d).unwrap();
     common::lua_play(&h, &offsets_configured(&h), &Cancel::new()).unwrap();
+}
+
+/// The x of each drawn quad of `r`'s skin at 0 ms, sorted.
+#[track_caller]
+fn drawn_xs(r: LuaImported) -> Vec<i32> {
+    let mut xs: Vec<i32> = common::play::Drawn::new(r.imported.skin, 10)
+        .rects(0)
+        .iter()
+        .map(|q| q[0])
+        .collect();
+    xs.sort_unstable();
+    xs
+}
+
+/// A `dofile` whose name leads to no file inside the skin folder raises
+/// an ordinary Lua error, `cannot open <name>`, which a protected call
+/// catches, and the skin goes on without that part: a judge sidecar the
+/// chosen image does not have, a part under a folder choice whose
+/// chosen candidate is a file (the path runs through it), and a folder.
+/// The control configuration finds both parts; each import has its own
+/// counts.
+#[test]
+fn a_protected_probe_of_an_absent_part_goes_on_without_it() {
+    let d = folder(&[
+        (
+            "s.luaskin",
+            &skin(
+                "filepath = {\n\
+                   { name = \"Judge\", path = \"custom/judge/*.png\", def = \"a\" },\n\
+                   { name = \"FC\", path = \"custom/fc/*\", def = \"d\" },\n\
+                 },",
+                "local cannot = function(e) return type(e) == \"string\" and string.sub(e, 1, 12) == \"cannot open \" end\n\
+                 local judge = string.match(skin_config.get_path(\"custom/judge/\" .. skin_config.file_path.Judge), \"(.+)%.png$\") .. \".lua\"\n\
+                 local ok, s = pcall(dofile, judge)\n\
+                 local x = 23\n\
+                 if ok then x = s.offset_x else assert(cannot(s), \"judge message\") end\n\
+                 local ok2, fc = pcall(function() return dofile(skin_config.get_path(\"custom/fc/*\") .. \"/fc.lua\").load() end)\n\
+                 if not ok2 then assert(cannot(fc), \"fc message\") end\n\
+                 local ok3, e3 = pcall(dofile, \"custom\")\n\
+                 assert(not ok3 and cannot(e3), \"folder\")\n\
+                 skin.destination = { { id = \"i\", dst = { { x = x, y = 0, w = 64, h = 64 } } } }\n\
+                 if ok2 then table.insert(skin.destination, { id = \"i\", dst = { { x = fc.x, y = 100, w = 64, h = 64 } } }) end",
+            ),
+        ),
+        ("custom/judge/a.png", ""),
+        ("custom/judge/a.lua", "return { offset_x = 7 }"),
+        ("custom/judge/b.png", ""),
+        (
+            "custom/fc/d/fc.lua",
+            "return { load = function() return { x = 300 } end }",
+        ),
+        (
+            "custom/fc/fc.lua",
+            "return { load = function() return { x = 300 } end }",
+        ),
+    ]);
+    let h = header(&d).unwrap();
+    let configured = |judge: &str, fc: &str| {
+        let mut config = Config::defaults(h.header());
+        config.files.insert("Judge".into(), judge.into());
+        config.files.insert("FC".into(), fc.into());
+        common::lua_play(&h, &config, &Cancel::new())
+    };
+    let r = configured("b.png", "fc.lua");
+    assert!(r.is_ok(), "{r:?}");
+    let r = r.unwrap();
+    assert_eq!((r.usage.missing_loads, r.usage.dofiles), (3, 3));
+    assert_eq!(drawn_xs(r), [23]);
+    let control = configured("a.png", "d").unwrap();
+    assert_eq!((control.usage.missing_loads, control.usage.dofiles), (1, 3));
+    assert_eq!(drawn_xs(control), [7, 300]);
+}
+
+/// An absent part's ordinary error reaches a protected call by any
+/// route: `xpcall`'s handler sees `cannot open <name>` and the call gives
+/// what the handler returns, a `pcall` of `pcall` gives the inner call's
+/// answer, and so does a protected function returning one. Each answer
+/// moves a drawn image, and each import counts its own absent loads.
+#[test]
+fn an_absent_part_is_caught_through_xpcall_and_a_nested_pcall() {
+    let d = folder(&[(
+        "s.luaskin",
+        &skin(
+            "",
+            "local ok1, e1 = xpcall(dofile, function(e) return \"handled:\" .. e end, \"parts/none.lua\")\n\
+             assert(ok1 == false and e1 == \"handled:cannot open parts/none.lua\", \"xpcall\")\n\
+             local ok2, in2, e2 = pcall(pcall, dofile, \"gone.lua\")\n\
+             assert(ok2 == true and in2 == false and e2 == \"cannot open gone.lua\", \"pcall of pcall\")\n\
+             local ok3, in3, e3 = pcall(function() return pcall(dofile, \"p/q.lua\") end)\n\
+             assert(ok3 == true and in3 == false and e3 == \"cannot open p/q.lua\", \"nested\")\n\
+             skin.destination = {\n\
+               { id = \"i\", dst = { { x = #e1, y = 0, w = 64, h = 64 } } },\n\
+               { id = \"i\", dst = { { x = 100 + #e2, y = 0, w = 64, h = 64 } } },\n\
+               { id = \"i\", dst = { { x = 200 + #e3, y = 0, w = 64, h = 64 } } },\n\
+             }",
+        ),
+    )]);
+    let r = import(&d);
+    assert!(r.is_ok(), "{r:?}");
+    let r = r.unwrap();
+    assert_eq!((r.usage.missing_loads, r.usage.dofiles), (3, 3));
+    assert_eq!(drawn_xs(r), [34, 120, 219]);
+}
+
+/// An absent `dofile` that no protected call catches refuses the skin
+/// as the read it is, named and located at its call; inside a part, at
+/// the part's call, which the entry's protected call does not catch. A
+/// part that is found and then fails refuses too, its changes to the
+/// globals never left behind a protected call; an absent load's error
+/// raised again as another value is the skin's own error.
+// Covers: T09
+#[test]
+fn an_unprotected_absent_part_refuses_at_its_call() {
+    let read_at = |r: Result<LuaImported, ImportError>| match r {
+        Err(ImportError::Read {
+            at: Some(at),
+            name,
+            source,
+        }) => (at.file, at.line, name, format!("{source:?}")),
+        other => panic!("{other:?}"),
+    };
+    let entry = |body: &str, files: &[(&str, &str)]| {
+        let mut all = vec![("s.luaskin", skin("", &format!("{body}\n{DRAW_I}")))];
+        all.extend(files.iter().map(|&(n, t)| (n, t.to_owned())));
+        let all: Vec<(&str, &str)> = all.iter().map(|(n, t)| (*n, t.as_str())).collect();
+        import(&folder(&all))
+    };
+    assert_eq!(
+        read_at(entry("dofile(\"parts/none.lua\")", &[])),
+        (
+            "s.luaskin".to_owned(),
+            5,
+            "parts/none.lua".to_owned(),
+            "Missing".to_owned()
+        )
+    );
+    assert_eq!(
+        read_at(entry(
+            "local ok = pcall(dofile, \"a.lua\")",
+            &[(
+                "a.lua",
+                "local x = 1\nlocal y = 2\ndofile(\"none.lua\")\nreturn {}"
+            )]
+        )),
+        (
+            "a.lua".to_owned(),
+            3,
+            "none.lua".to_owned(),
+            "Missing".to_owned()
+        )
+    );
+    let r = entry(
+        "local ok = pcall(dofile, \"bad.lua\")\nassert(false, \"resumed\")",
+        &[("bad.lua", "leaked = 1\nerror(\"x\")")],
+    );
+    assert_eq!(located(r), (LuaWhy::Error, "bad.lua".to_owned(), 2));
+    let r = entry(
+        "local ok, e = pcall(dofile, \"none.lua\")\nerror(e .. \"!\", 0)",
+        &[],
+    );
+    assert_eq!(located(r), (LuaWhy::Error, "s.luaskin".to_owned(), 6));
+}
+
+/// A protected probe learns nothing outside the skin folder: under a
+/// link leading out, at the top or below two folders, every name refuses
+/// with the same located `Escapes` whatever lies outside (a way back
+/// in, an absent entry, a dangling child, a file); a link spelled inward
+/// whose own resolution crosses the outward one refuses too; an
+/// unresolved inward link and a target asking for a child under a file
+/// are `Dangling`; only names inside the folder are caught as absent.
+// Covers: T09
+#[test]
+fn a_protected_probe_learns_nothing_outside_the_folder() {
+    let ext = tempfile::tempdir().unwrap();
+    std::fs::write(ext.path().join("x.lua"), "return {}").unwrap();
+    let make = || {
+        let d = folder(&[("real/x.lua", "return { v = 1 }"), ("a/b/keep", "")]);
+        let p = d.path();
+        common::link_dir(&p.join("out"), ext.path());
+        common::link_dir(&p.join("a").join("b").join("out"), ext.path());
+        common::link_dir(&p.join("gone"), &p.join("nothing"));
+        common::link_dir(&p.join("return"), &p.join("out").join("back"));
+        common::link_dir(
+            &p.join("badtarget"),
+            &p.join("real").join("x.lua").join("child"),
+        );
+        d
+    };
+    let probe = |d: &TempDir, name: &str| {
+        common::write(
+            d.path(),
+            "s.luaskin",
+            format!(
+                "{REP}{}",
+                skin(
+                    "",
+                    &format!("local ok = pcall(dofile, \"{name}\")\n{DRAW_I}")
+                )
+            )
+            .as_bytes(),
+        );
+        import(d)
+    };
+    let refusal = |r: Result<LuaImported, ImportError>| match r {
+        Err(ImportError::Read {
+            at: Some(at),
+            source,
+            ..
+        }) => (at.file, at.line, format!("{source:?}")),
+        other => panic!("{other:?}"),
+    };
+    let escapes = ("s.luaskin".to_owned(), 5, "Escapes".to_owned());
+    for back in [false, true] {
+        let d = make();
+        if back {
+            common::link_dir(&ext.path().join("back"), &d.path().join("real"));
+            common::link_dir(&ext.path().join("gone"), &ext.path().join("nothing"));
+        }
+        for top in ["", "a/b/"] {
+            for rest in [
+                "out/back/x.lua",
+                "out/back/none.lua",
+                "out/absent/none.lua",
+                "out/gone/none.lua",
+                "out/x.lua",
+                "out/none.lua",
+            ] {
+                let name = format!("{top}{rest}");
+                assert_eq!(refusal(probe(&d, &name)), escapes, "{name} back {back}");
+            }
+        }
+        assert_eq!(refusal(probe(&d, "return/x.lua")), escapes, "back {back}");
+        for name in ["gone/x.lua", "badtarget/x.lua"] {
+            assert_eq!(
+                refusal(probe(&d, name)),
+                ("s.luaskin".to_owned(), 5, "Dangling".to_owned()),
+                "{name}"
+            );
+        }
+        for name in ["none.lua", "real/x.lua/child", "real/none.lua"] {
+            let r = probe(&d, name);
+            assert!(r.is_ok(), "{name}: {r:?}");
+            assert_eq!(r.unwrap().usage.missing_loads, 1, "{name}");
+        }
+        if back {
+            // A junction is removed as a folder, a Unix link as a file.
+            for link in ["back", "gone"] {
+                #[cfg(windows)]
+                std::fs::remove_dir(ext.path().join(link)).unwrap();
+                #[cfg(unix)]
+                std::fs::remove_file(ext.path().join(link)).unwrap();
+            }
+        }
+    }
+}
+
+/// A play skin whose configured pass computes the string `expr` gives at
+/// construction and draws it as quads, `i` at 1×1 pixels: the first at
+/// x = its length, then one per byte at x = that byte. `expr` names a
+/// value of any type; it is shown as `tostring` gives it unless it is a
+/// string, so a wrong type shows too.
+fn shown(pre: &str, expr: &str) -> TempDir {
+    folder(&[(
+        "s.luaskin",
+        &skin(
+            "",
+            &format!(
+                "{pre}\n\
+                 local v = ({expr})\n\
+                 if type(v) ~= \"string\" then v = type(v) .. \":\" .. tostring(v) end\n\
+                 local d = {{ {{ id = \"i\", dst = {{ {{ x = #v, y = 0, w = 1, h = 1 }} }} }} }}\n\
+                 for k = 1, #v do\n\
+                   d[#d + 1] = {{ id = \"i\", dst = {{ {{ x = string.byte(v, k), y = 2 * k, w = 1, h = 1 }} }} }}\n\
+                 end\n\
+                 skin.destination = d"
+            ),
+        ),
+    )])
+}
+
+/// The string the skin [`shown`] makes for `expr` draws: its quads read
+/// back, length first.
+fn read_shown(expr: &str) -> String {
+    // The folder stays until the skin is drawn: its atlas reads the image.
+    let d = shown("", expr);
+    let i = import(&d).unwrap_or_else(|e| panic!("{expr}: {e:?}"));
+    let xs: Vec<i32> = common::play::Drawn::new(i.imported.skin, 0)
+        .rects(1_000)
+        .iter()
+        .map(|r| r[0])
+        .collect();
+    let (len, bytes) = xs.split_first().expect("the length quad");
+    assert_eq!(
+        usize::try_from(*len).unwrap(),
+        bytes.len(),
+        "{expr}: {xs:?}"
+    );
+    String::from_utf8(bytes.iter().map(|&b| u8::try_from(b).unwrap()).collect()).unwrap()
+}
+
+#[test]
+fn a_number_passed_for_a_string_is_read_as_its_text() {
+    // Lua's coercion of a number where a string is expected, as the
+    // source's interpreter reads it (design.md "beatoraja Lua Skins",
+    // number text): every string parameter, the converted string used
+    // for its length, index and native.
+    for (expr, want) in [
+        // Banner's shape: a number id matched against a name, and a
+        // number pattern.
+        ("string.match(-102, \"notesgraph\")", "nil:nil"),
+        ("string.match(-102, \"%d+\")", "102"),
+        ("string.match(1234, 23)", "23"),
+        ("string.find(-102, \"0\")", "number:3"),
+        ("string.len(-102)", "number:4"),
+        ("string.sub(12345, 2, 3)", "23"),
+        ("string.byte(-102, 1)", "number:45"),
+        // The native gets the text, so a whole float is `50`, not Lua
+        // 5.4's `50.0`.
+        ("string.upper(50.0)", "50"),
+        ("string.lower(100 / 2)", "50"),
+        // A number format string, and `%s` of numbers.
+        ("string.format(5, 1)", "5"),
+        (
+            "string.format(\"%s|%s|%s\", 50.0, 0.5, -102)",
+            "50|0.5|-102",
+        ),
+        // Replacements: a number, a function's number, a table's number,
+        // and a subject that is a number.
+        ("(string.gsub(\"abc\", \"b\", 50))", "a50c"),
+        ("(string.gsub(\"abc\", \"b\", 2.5))", "a2.5c"),
+        (
+            "(string.gsub(\"abc\", \"b\", function() return 50.0 end))",
+            "a50c",
+        ),
+        ("(string.gsub(\"abc\", \"(b)\", { b = 7.0 }))", "a7c"),
+        ("(string.gsub(-102, \"1\", \"x\"))", "-x02"),
+        ("string.match(1 / 3, \".*\")", "0.33333333333333"),
+        // The table library's string parameters and entries, and
+        // `tonumber`'s subject in base 10.
+        ("table.concat({ 50.0, 0.5, -102 }, 0)", "5000.50-102"),
+        ("tonumber(12.0, 10)", "number:12"),
+    ] {
+        assert_eq!(read_shown(expr), want, "{expr}");
+    }
+}
+
+#[test]
+fn number_text_follows_one_rule() {
+    // Every row of the shared table, through two string functions: the
+    // text `string.sub` returns, and the length `string.len` measures.
+    for row in include_str!("number_text.txt")
+        .lines()
+        .filter(|l| !l.starts_with('#'))
+    {
+        let [lua, _, want] = row.split('\t').collect::<Vec<_>>()[..] else {
+            panic!("{row}");
+        };
+        assert_eq!(
+            read_shown(&format!("string.sub({lua}, 1, -1)")),
+            want,
+            "{lua}"
+        );
+        assert_eq!(
+            read_shown(&format!("string.len({lua})")),
+            format!("number:{}", want.len()),
+            "{lua}"
+        );
+    }
+}
+
+#[test]
+fn a_string_is_never_read_as_a_number() {
+    // The reverse coercion stays refused, as does a value that is
+    // neither, and a numeric parameter takes a number only: each an
+    // ordinary error at its line.
+    for expr in [
+        "string.len({})",
+        "string.sub(\"abc\", \"2\")",
+        "string.byte(\"abc\", \"1\")",
+        "(string.gsub(\"abc\", \"b\", \"x\", \"1\"))",
+        "math.floor(\"3\")",
+        "\"1\" + 1",
+    ] {
+        let d = shown("", expr);
+        assert_eq!(
+            located(import(&d)),
+            (LuaWhy::Error, "s.luaskin".into(), 6),
+            "{expr}"
+        );
+    }
+}
+
+#[test]
+fn a_number_s_text_is_charged_before_it_is_made() {
+    // Two charges of native work: the conversion's, a fixed 24 bytes taken
+    // before the text is made, and the `upper` result's, the converted
+    // text's length.
+    let work = |expr: &str| import(&shown("", expr)).unwrap().usage.native_work;
+    let two = work("string.upper(\"50\")");
+    let four = work("string.upper(\"50.0\")");
+    let number = work("string.upper(50.0)");
+    // Positive control: the result's charge tells a 2-byte result from a
+    // 4-byte one.
+    assert_eq!(four - two, 2);
+    // The number costs the conversion's 24 bytes and then the result's
+    // charge for `"50"`, 2 bytes, not Lua 5.4's `"50.0"`, 4 (that would be
+    // 26).
+    assert_eq!(number - two, 24);
 }
