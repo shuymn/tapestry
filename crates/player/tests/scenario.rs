@@ -1200,6 +1200,127 @@ fn a_captured_play_frame_of_a_skin_has_its_display_list() {
     assert!(quad.contains("\"blend\":\"alpha\""), "{quad}");
 }
 
+/// A chart with a BGA, `g/g.bms`: four notes in measure 1 (2.0 to 3.5 s)
+/// and an invisible key-6 note that makes it a 7-key chart; its base
+/// 640x480 from 0 s, switched at 3 s, its layer from 0 s and a poor
+/// picture at 0 s, each written beside it.
+fn write_bga_chart(library: &Path) -> bms_model::Chart {
+    let dir = library.join("g");
+    fs::create_dir_all(&dir).unwrap();
+    write_wav(&dir.join("key.wav"));
+    for (name, [w, h], rgba) in [
+        ("base.png", [640, 480], [200, 0, 0, 255]),
+        ("next.png", [300, 200], [0, 200, 0, 255]),
+        ("layer.png", [256, 256], [0, 0, 0, 255]),
+        ("poor.png", [128, 128], [0, 0, 200, 255]),
+    ] {
+        let file = fs::File::create(dir.join(name)).unwrap();
+        let mut e = png::Encoder::new(std::io::BufWriter::new(file), w, h);
+        e.set_color(png::ColorType::Rgba);
+        e.set_depth(png::BitDepth::Eight);
+        let texels: Vec<u8> = (0..w * h).flat_map(|_| rgba).collect();
+        e.write_header().unwrap().write_image_data(&texels).unwrap();
+    }
+    let text = "#PLAYER 1\n#TITLE bga\n#BPM 120\n#WAV01 key.wav\n\
+                #BMP01 base.png\n#BMP02 next.png\n#BMP03 layer.png\n#BMP04 poor.png\n\
+                #00138:01\n#00004:01\n#00007:03\n#00006:04\n#00104:0002\n#00111:01010101\n";
+    fs::write(dir.join("g.bms"), text).unwrap();
+    bms_parser::load_bms(text.as_bytes(), &dir, &Default::default())
+        .unwrap()
+        .chart
+}
+
+/// A play skin whose only element is the chart's BGA filling the canvas,
+/// cropping its pictures (stretch 3).
+fn install_bga_skin(fx: &Fixture) {
+    let skin = fx.base.join("skin");
+    fs::create_dir_all(&skin).unwrap();
+    fs::write(
+        skin.join("s.json"),
+        r#"{"type": 0, "w": 1920, "h": 1080,
+            "bga": {"id": "g"},
+            "destination": [{"id": "g", "stretch": 3,
+                "dst": [{"x": 0, "y": 0, "w": 1920, "h": 1080}]}]}"#,
+    )
+    .unwrap();
+    fs::create_dir_all(fx.data()).unwrap();
+    fs::write(
+        fx.data().join("player.toml"),
+        format!(
+            "[skins.play]\nroot = '{}'\nentry = 's.json'\n",
+            skin.display()
+        ),
+    )
+    .unwrap();
+}
+
+/// The render thread's app region allocates nothing in any frame of a play
+/// drawing the chart's BGA (design.md "Scope of No Allocation"): its
+/// base, a switch and its layer under perfect input, and the poor picture
+/// with every note missed, through a cropping stretch. Its positive
+/// control: the BGA's draw made to allocate (dev-tools) is counted.
+#[test]
+fn render_app_zero_with_bga_events() {
+    let fx = Fixture::new();
+    let chart = write_bga_chart(&fx.library());
+    install_bga_skin(&fx);
+    write_log(
+        &fx.base.join("logs").join("g.tprl"),
+        &hits(&chart, |_| true),
+        1,
+    );
+    // Each run its own output; a capture where the BGA draws: the switched
+    // base under the layer, or the miss window after the first miss.
+    let plays = |input: &str, at: u32, output: &str| {
+        scenario(&[
+            &format!("capture = {{ at = {at}, file = \"bga.png\" }}"),
+            "select = { path = \"library/g/g.bms\" }",
+            &format!("play = {{ input = {input}, until = \"end\" }}"),
+            "result = \"back\"",
+            "quit = {}",
+        ])
+        .replacen("output = \"out\"", &format!("output = \"{output}\""), 1)
+    };
+    let measured = |fx: &Fixture| -> toml::Table {
+        let (records, _) = fx.played_records();
+        let last = records.last().expect("a played record");
+        fs::read_to_string(last.with_extension("measure.toml"))
+            .unwrap()
+            .parse()
+            .unwrap()
+    };
+    for (input, at, output) in [
+        ("\"logs/g.tprl\"", 3_200, "perfect"),
+        ("{ miss = \"all\" }", 2_400, "miss"),
+    ] {
+        let (out, stdout, stderr) = fx.run(&plays(input, at, output));
+        assert_eq!(out.status.code(), Some(0), "{input}: {stdout}\n{stderr}");
+        let m = measured(&fx);
+        assert!(int(&m, "render_cpu_us", "count").unwrap() > 0, "{m:?}");
+        assert_eq!(
+            int(&m, "allocations", "render_app"),
+            Some(0),
+            "{input}: {m:?}"
+        );
+        // The BGA drew: its element's quad, of the BGA's own filter.
+        let list = fs::read_to_string(fx.base.join(output).join("bga.jsonl")).unwrap();
+        assert!(
+            list.lines().any(|l| l.contains("\"filter\":\"Bga\"")),
+            "{input}: {list}"
+        );
+    }
+    let (out, stdout, stderr) = fx.output(
+        fx.command(&plays("\"logs/g.tprl\"", 3_200, "control"))
+            .env("TAPESTRY_DEV_BGA_ALLOCATE", "1"),
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let m = measured(&fx);
+    assert!(
+        int(&m, "allocations", "render_app").unwrap() > 0,
+        "the positive control is counted: {m:?}"
+    );
+}
+
 /// A READY capture past READY's end fails the run rather than show play.
 #[test]
 fn a_ready_capture_past_ready_fails_the_run() {

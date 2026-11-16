@@ -14868,6 +14868,63 @@ pub(crate) mod tests {
             self.staged_token = None;
             *self.shared.staging.lock().unwrap() = None;
         }
+        fn begin_bga(&mut self, pages: u32) -> Result<skin_model::bga::BgaKey, render::BgaFault> {
+            let mut b = self.shared.bga.lock().unwrap();
+            b.arrays += 1;
+            b.live = Some(b.arrays);
+            b.begins.push(pages);
+            Ok(skin_model::bga::BgaKey {
+                renderer: self.device,
+                array: b.arrays,
+            })
+        }
+        fn write_bga_cell(
+            &mut self,
+            key: skin_model::bga::BgaKey,
+            place: &skin_model::bga::CellPlace,
+            texels: &[u8],
+        ) -> Result<(), render::BgaFault> {
+            let mut b = self.shared.bga.lock().unwrap();
+            if b.live != Some(key.array) {
+                return Err(render::BgaFault::Stale);
+            }
+            let [w, h] = place.padded();
+            if texels.len() != usize::try_from(u64::from(w) * u64::from(h) * 4).unwrap() {
+                return Err(render::BgaFault::Cell);
+            }
+            b.cells += 1;
+            Ok(())
+        }
+        fn publish_bga(
+            &mut self,
+            key: Option<skin_model::bga::BgaKey>,
+            entries: Vec<skin_model::bga::BgaEntry>,
+        ) -> Result<Arc<skin_model::bga::BgaTable>, render::BgaFault> {
+            let mut b = self.shared.bga.lock().unwrap();
+            let table = skin_model::bga::BgaTable::new(entries);
+            let table = match key {
+                Some(k) if b.live == Some(k.array) => table.keyed(k),
+                Some(_) => return Err(render::BgaFault::Stale),
+                None => {
+                    b.live = None;
+                    table
+                }
+            };
+            let table = Arc::new(table);
+            b.published.push(Arc::clone(&table));
+            Ok(table)
+        }
+        fn published_bga(
+            &self,
+            key: skin_model::bga::BgaKey,
+        ) -> Option<Arc<skin_model::bga::BgaTable>> {
+            let b = self.shared.bga.lock().unwrap();
+            b.current().filter(|t| t.key() == Some(key)).cloned()
+        }
+        fn drop_bga(&mut self) {
+            let mut b = self.shared.bga.lock().unwrap();
+            b.live = None;
+        }
         fn install(
             &mut self,
             kind: ScreenKind,
@@ -15130,6 +15187,31 @@ pub(crate) mod tests {
         }
     }
 
+    /// The BGA steps an [`Installer`] took, as a renderer would answer
+    /// them: one array at a time, numbered from 1.
+    #[derive(Debug, Default)]
+    pub(crate) struct BgaSeen {
+        /// Each array begun, by its page count.
+        pub(crate) begins: Vec<u32>,
+        /// The cells written.
+        pub(crate) cells: u32,
+        /// Each table published, in order.
+        pub(crate) published: Vec<Arc<skin_model::bga::BgaTable>>,
+        /// The array in use, by its number.
+        live: Option<u64>,
+        arrays: u64,
+    }
+
+    impl BgaSeen {
+        /// The table in use: the last published while its array is live,
+        /// or one of no array.
+        pub(crate) fn current(&self) -> Option<&Arc<skin_model::bga::BgaTable>> {
+            self.published
+                .last()
+                .filter(|t| t.key().is_none_or(|k| Some(k.array) == self.live))
+        }
+    }
+
     /// The shared state of the [`Installer`]s a render thread builds,
     /// their devices numbered from 1.
     #[derive(Clone, Default)]
@@ -15239,6 +15321,8 @@ pub(crate) mod tests {
         pub(crate) committed_scores: Arc<std::sync::Mutex<Vec<skin_model::ScoreBasis>>>,
         /// The best's pace of each attempt committed, in order.
         pub(crate) committed_paces: Arc<std::sync::Mutex<Vec<Option<Vec<u32>>>>>,
+        /// The BGA steps the screens took.
+        pub(crate) bga: Arc<std::sync::Mutex<BgaSeen>>,
         /// Each play frame built: its own sample on the clock, its screen
         /// clock and its chart time; noted only while the vector has room
         /// (a test reserves it), so noting never allocates.

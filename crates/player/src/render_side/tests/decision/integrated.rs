@@ -382,6 +382,33 @@ impl Screen for Noted {
     fn chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
         self.menu.chart_key()
     }
+    fn begin_bga(&mut self, pages: u32) -> Result<skin_model::bga::BgaKey, render::BgaFault> {
+        self.menu.begin_bga(pages)
+    }
+    fn write_bga_cell(
+        &mut self,
+        key: skin_model::bga::BgaKey,
+        place: &skin_model::bga::CellPlace,
+        texels: &[u8],
+    ) -> Result<(), render::BgaFault> {
+        self.menu.write_bga_cell(key, place, texels)
+    }
+    fn publish_bga(
+        &mut self,
+        key: Option<skin_model::bga::BgaKey>,
+        entries: Vec<skin_model::bga::BgaEntry>,
+    ) -> Result<Arc<skin_model::bga::BgaTable>, render::BgaFault> {
+        self.menu.publish_bga(key, entries)
+    }
+    fn published_bga(
+        &self,
+        key: skin_model::bga::BgaKey,
+    ) -> Option<Arc<skin_model::bga::BgaTable>> {
+        self.menu.published_bga(key)
+    }
+    fn drop_bga(&mut self) {
+        self.menu.drop_bga();
+    }
     fn install(
         &mut self,
         kind: ScreenKind,
@@ -1016,6 +1043,8 @@ struct Opts {
     user_preset: Option<rules::RulePreset>,
     /// The chart's text in place of the one-note chart.
     chart: Option<&'static str>,
+    /// A 640x480 `a.png` beside the chart.
+    picture: bool,
 }
 
 /// The sound set a run's system sounds pick: `clear` (1.25 s) and `fail`
@@ -1135,7 +1164,11 @@ fn run_with(
             .unwrap_or("#TITLE a\n#BPM 120\n#00111:01\n#00138:01\n"),
     )
     .unwrap();
-    let (mut sel, roots) = crate::selection::tests::over(charts.path(), vec![root]);
+    let (mut sel, roots) = crate::selection::tests::over(charts.path(), vec![root.clone()]);
+    // Written once the folder is listed, which counts its files.
+    if opts.picture {
+        crate::bga::tests::png(&root, "a.png", [640, 480], [200, 0, 0]);
+    }
     assert!(sel.screen.select_path(&roots[0].join("a.bms")));
     let chart = sel.screen.selected().unwrap().path.clone();
     let menu = Arc::clone(&sel.menu);
@@ -1720,6 +1753,80 @@ fn a_later_decision_build_made_to_allocate_is_counted() {
     for line in ["decision_app = 1", "render_app = 0"] {
         assert!(text.lines().any(|l| l == line), "{line}: {text}");
     }
+}
+
+/// A choice of a chart with a BGA, made with the clock held 600 s from its
+/// origin, writes the load's stages beside the play it led to
+/// (`[load_stages]`): each in µs from the choice, so below 600 s; each
+/// job's start no later than its end; the decision screen's end no earlier
+/// than the built-in presentation's 1.5 s, the loading minimum's end at
+/// least 1 s after it; READY last.
+#[test]
+fn load_stages_are_recorded_in_order() {
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        saved: true,
+        picture: true,
+        chart: Some("#TITLE a\n#BPM 120\n#BMP01 a.png\n#00004:01\n#00111:01\n#00138:01\n"),
+        ..Opts::default()
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        side.prepared();
+        side.hold_clock();
+        side.clock.set(TimeUs(600_000_000));
+        let (chosen, ..) = side.choose(MenuKey::Enter);
+        assert_eq!(chosen, TimeUs(600_000_000));
+        side.to_loading();
+        side.seen.until("the result skin", |d| {
+            d.iter()
+                .any(|d| matches!(d.frame, Frame::Result { quads, .. } if quads > 0))
+        });
+    });
+    assert!(ran.ran.is_ok(), "{:?}", ran.ran);
+    let [(_, text)] = &ran.measured[..] else {
+        panic!("one saved play: {:?}", ran.measured);
+    };
+    let section = text
+        .split("[load_stages]\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no load stages: {text}"));
+    let stages: Vec<(&str, i64)> = section
+        .lines()
+        .take_while(|l| !l.is_empty() && !l.starts_with('['))
+        .map(|l| {
+            let (k, v) = l.split_once(" = ").unwrap();
+            (k, v.parse().unwrap())
+        })
+        .collect();
+    let at = |k: &str| {
+        stages
+            .iter()
+            .find(|(n, _)| *n == k)
+            .map(|&(_, v)| v)
+            .unwrap_or_else(|| panic!("{k}: {stages:?}"))
+    };
+    for &(k, v) in &stages {
+        assert!((0..600_000_000).contains(&v), "{k} = {v}: from the choice");
+    }
+    for stage in [
+        "chart",
+        "sounds",
+        "loudness",
+        "bga",
+        "bga_reads",
+        "bga_packing",
+        "bga_decodes",
+        "bga_upload",
+    ] {
+        let (start, end) = (at(&format!("{stage}_start")), at(&format!("{stage}_end")));
+        assert!(start <= end, "{stage}: {start} {end}");
+    }
+    let decided = at("decision_end");
+    assert!(decided >= 1_500_000, "{stages:?}");
+    assert!(at("minimum_end") >= decided + 1_000_000, "{stages:?}");
+    let ready = at("ready");
+    assert_eq!(stages.last().map(|s| s.0), Some("ready"), "{stages:?}");
+    assert!(stages.iter().all(|&(_, v)| v <= ready), "{stages:?}");
 }
 
 /// The second build made to allocate inside the skin's build, then

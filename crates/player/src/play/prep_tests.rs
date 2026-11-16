@@ -25,6 +25,7 @@ use crate::result_skin::tests as result;
 use crate::result_skin::{ResultSkin, ResultStart};
 
 mod adapter;
+mod bga;
 mod images;
 mod result_flow;
 mod result_images;
@@ -155,6 +156,7 @@ fn stage(rig: &PlayerRig<'_>) -> &'static str {
         Some(PrepStage::Image(..)) => "image",
         Some(PrepStage::Screen(_)) => "screen",
         Some(PrepStage::Images(..)) => "images",
+        Some(PrepStage::Bga(_)) => "bga",
         Some(PrepStage::Ended(_)) => "ended",
         Some(PrepStage::Answered(_)) => "answered",
     }
