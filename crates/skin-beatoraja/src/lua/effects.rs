@@ -12,8 +12,11 @@
 //!
 //! - statements: `local` without attributes, assignment to a local of the
 //!   same function (its kind the join of its initializer's and of every
-//!   value the function gives it, found by kind-only passes until none
-//!   changes, before the pass that checks; a local another function
+//!   value the function gives it, found by kind-only passes until a whole
+//!   pass changes none, before the pass that checks: each assignment joins
+//!   its value's kind, read under the kinds found so far, this pass's
+//!   included; the kind-only passes record no effect, and a closure they
+//!   call is walked for its results alone; a local another function
 //!   assigns is unknown), `return`, call statements, `if`, `while`, `repeat`, a
 //!   numeric `for` over numbers, a generic `for` over `pairs(t)`,
 //!   `ipairs(t)` or `next, t` with `t` a table without a metatable, `do`,
@@ -177,11 +180,19 @@ impl Tuple {
     }
 }
 
-/// A prototype's walk.
-#[derive(Clone, Debug)]
-enum State {
-    InProgress,
-    Done(Tuple),
+/// What the walk has of a prototype. Its results are fixed by its first
+/// walk, kind-only or diagnosing, so a caller's kind passes and its
+/// diagnosing pass get the same; its effects (open places, writes, call
+/// edges) only by its diagnosing walk.
+#[derive(Debug, Default)]
+struct State {
+    /// Its results, once a walk of its body has found them.
+    results: Option<Tuple>,
+    /// Whether a walk of its body is running: a call meanwhile is a
+    /// recursion, of unknown results.
+    busy: bool,
+    /// Whether its diagnosing walk has run or is running.
+    diagnosed: bool,
 }
 
 /// The kind of captured value `c`, a table with a metatable `None`.
@@ -319,10 +330,18 @@ struct Body<'a> {
     /// Whether a kind changed in this pass.
     changed: bool,
     /// Whether this is a kind-only pass, which records no open place, no
-    /// write and no call edge.
+    /// write and no call edge, and walks a closure it calls kind-only.
     quiet: bool,
     /// The join of its `return` lists.
     ret: Option<Tuple>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The most kind-only passes one body of this thread took, and whether
+    /// any body reached its bound.
+    pub(crate) static PASSES: std::cell::Cell<(usize, bool)> =
+        const { std::cell::Cell::new((0, false)) };
 }
 
 /// The walk over every root of an analysis.
@@ -467,7 +486,7 @@ impl<'a> Walk<'a> {
                 continue;
             }
             self.depth = 0;
-            self.instance(callable.instance)
+            self.instance(callable.instance, false)
                 .map_err(|f| (Some(id), f))?;
             roots.push(callable.instance);
         }
@@ -529,9 +548,15 @@ impl<'a> Walk<'a> {
         Ok(())
     }
 
-    /// Instance `i` walked, once a prototype: its results, unknown while
-    /// it is being walked (a recursion), and its prototype.
-    fn instance(&mut self, i: u32) -> R<(Tuple, Option<u32>)> {
+    /// Instance `i`'s results, unknown while a walk of its body runs (a
+    /// recursion), and its prototype.
+    ///
+    /// Called from a kind-only pass (`quiet`), it walks the body kind-only
+    /// when no walk has found its results yet, and records nothing.
+    /// Otherwise it runs the diagnosing walk once a prototype, which
+    /// records its effects, and still gives the results the first walk
+    /// fixed.
+    fn instance(&mut self, i: u32, quiet: bool) -> R<(Tuple, Option<u32>)> {
         let untagged = Found {
             why: Unsupported::Capture("an untagged closure"),
             file: 0,
@@ -551,35 +576,47 @@ impl<'a> Walk<'a> {
                 let next = u32::try_from(self.states.len()).unwrap_or(u32::MAX);
                 let p = *self.protos.entry(key).or_insert(next);
                 if p == next {
-                    self.states.push(State::InProgress);
+                    self.states.push(State::default());
                     self.writes.push(false);
-                    self.proto_of.insert(i, p);
-                    let r = self.body(i, p)?;
-                    // Its results kept, one unit each.
-                    let n = u64::try_from(r.fixed.len()).unwrap_or(u64::MAX);
-                    self.an.charge(n).map_err(|why| Found { why, ..untagged })?;
-                    if let Some(s) = self.states.get_mut(p as usize) {
-                        *s = State::Done(r.clone());
-                    }
-                    return Ok((r, Some(p)));
                 }
                 self.proto_of.insert(i, p);
                 p
             }
         };
-        match self.states.get(p as usize) {
-            Some(State::Done(t)) => {
-                // Its results copied, one unit each.
-                let n = u64::try_from(t.fixed.len()).unwrap_or(u64::MAX);
-                self.an.charge(n).map_err(|why| Found { why, ..untagged })?;
-                Ok((t.clone(), Some(p)))
+        let Some(s) = self.states.get_mut(p as usize) else {
+            return Ok((Tuple::unknown(), Some(p)));
+        };
+        let walk = if quiet {
+            s.results.is_none() && !s.busy
+        } else {
+            !s.diagnosed
+        };
+        let t = if walk {
+            s.busy = true;
+            s.diagnosed |= !quiet;
+            let r = self.body(i, p, quiet)?;
+            match self.states.get_mut(p as usize) {
+                Some(s) => {
+                    s.busy = false;
+                    s.results.get_or_insert(r).clone()
+                }
+                None => r,
             }
-            _ => Ok((Tuple::unknown(), Some(p))),
-        }
+        } else {
+            match &s.results {
+                Some(t) => t.clone(),
+                None => return Ok((Tuple::unknown(), Some(p))),
+            }
+        };
+        // Its results kept or copied, one unit each.
+        let n = u64::try_from(t.fixed.len()).unwrap_or(u64::MAX);
+        self.an.charge(n).map_err(|why| Found { why, ..untagged })?;
+        Ok((t, Some(p)))
     }
 
-    /// The results of instance `i`'s body, prototype `p`.
-    fn body(&mut self, i: u32, p: u32) -> R<Tuple> {
+    /// The results of instance `i`'s body, prototype `p`: its kind passes,
+    /// then its diagnosing pass, or one more kind-only pass when `quiet`.
+    fn body(&mut self, i: u32, p: u32, quiet: bool) -> R<Tuple> {
         let an = self.an;
         let Some(inst) = an.instance(i).copied() else {
             return Ok(Tuple::unknown());
@@ -600,7 +637,7 @@ impl<'a> Walk<'a> {
             reassigned: HashSet::new(),
             kinds: HashMap::new(),
             changed: false,
-            quiet: false,
+            quiet,
             ret: None,
         };
         if inst.values.is_none() && f.upvalues.1 > 0 {
@@ -632,6 +669,8 @@ impl<'a> Walk<'a> {
                     b.locals.insert(d, K::UNKNOWN);
                 }
                 self.block(&mut b, f.body)?;
+                #[cfg(test)]
+                PASSES.with(|c| c.set((c.get().0.max(passes), c.get().1)));
                 if !b.changed {
                     break;
                 }
@@ -639,14 +678,17 @@ impl<'a> Walk<'a> {
                     for &d in &b.reassigned {
                         b.kinds.insert(d, K::UNKNOWN);
                     }
+                    #[cfg(test)]
+                    PASSES.with(|c| c.set((c.get().0, true)));
                     break;
                 }
             }
-            b.quiet = false;
+            b.quiet = quiet;
             b.locals.clear();
             b.ret = None;
         }
-        // The diagnosing pass, over the converged kinds.
+        // The diagnosing pass, over the converged kinds, or the results'
+        // kind-only pass.
         for &d in params {
             b.locals.insert(d, K::UNKNOWN);
         }
@@ -1126,7 +1168,7 @@ impl<'a> Walk<'a> {
                 let r = if self.depth > MAX_AST_DEPTH {
                     Err(self.fatal(b, line, TOO_DEEP))
                 } else {
-                    self.instance(j)
+                    self.instance(j, b.quiet)
                 };
                 self.depth -= 1;
                 let (t, p) = r?;
