@@ -6389,7 +6389,14 @@ pub(crate) mod tests {
         };
         let script =
             crate::dev::SelectScript::compiled(steps.into_iter().map(|s| (s, o)).collect());
-        let state = crate::dev::scenario::State {
+        (script, scenario_state(Some(screen)))
+    }
+
+    /// A scenario's state with nothing played yet, on `practice`'s page if
+    /// one shows.
+    #[cfg(feature = "dev-tools")]
+    fn scenario_state(practice: Option<game::PracticeScreen>) -> crate::dev::scenario::State {
+        crate::dev::scenario::State {
             logs: Vec::new(),
             captures: crate::dev::scenario::Captures::of(Vec::new()),
             transitions: crate::dev::transitions::Transitions::default(),
@@ -6404,14 +6411,87 @@ pub(crate) mod tests {
             pending: None,
             until: None,
             sent: None,
-            practice: Some(screen),
+            practice,
             shown: true,
             rounds: 0,
             nearest: None,
             result_id: None,
             result_seq: 0,
+        }
+    }
+
+    /// A scenario is an autoplay session: under `[bga] mode = "autoplay"`
+    /// its chart played from an input log turns the rig's autoplay off,
+    /// but the BGA answer stays the one fixed at startup, shown, where a
+    /// play from the devices (a session without autoplay) does not show
+    /// it. A chart played by autoplay turns the rig's autoplay back on,
+    /// the answer unchanged.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_scenario_s_logged_play_keeps_the_startup_bga_answer() {
+        use crate::dev::SelectStep;
+        use crate::dev::scenario::{InputRef, Origin, PlayStep, StepKind};
+        let dir = tempfile::tempdir().unwrap();
+        let mut sel = unlisted(dir.path(), |library, charts| {
+            Shelf::new(
+                library,
+                charts,
+                Duration::from_secs(60),
+                None,
+                &crate::shelf::tests::coordinator(),
+            )
+        });
+        let o = Origin {
+            index: 1,
+            kind: StepKind::Play,
         };
-        (script, state)
+        let play = |input| SelectStep::Play(PlayStep { input, until: None });
+        sel.script = Some(crate::dev::SelectScript::compiled(vec![
+            (play(InputRef::Log(0)), o),
+            (play(InputRef::Auto), o),
+        ]));
+        let bga = game::BgaSettings {
+            mode: game::BgaMode::Autoplay,
+            expand: game::BgaExpand::Off,
+        };
+        let settings = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings {
+                bga,
+                ..game::PlayerSettings::default()
+            },
+        };
+        let render = crate::render_side::tests::Installers::default().spawn_bare();
+        let (got, _) = crate::tests::on_rig_with(settings, render, |rig, settings| {
+            // As a scenario's run starts: an autoplay session.
+            rig.autoplay = true;
+            rig.bga_session = crate::bga_session(settings, true);
+            rig.scenario = Some(scenario_state(None));
+            rig.selection = Some(sel);
+            let mut parts = game::Parts::unsaved(&settings.player);
+            let mut config = crate::session_config(
+                replay::ReceiveMethod::Scripted,
+                Some(game::AutoKeySounds::Scheduled),
+            );
+            game::AppRig::configure(rig, &mut config, &mut parts);
+            let logged = (rig.autoplay, config.autoplay, rig.bga_session);
+            let script = rig.selection.as_mut().and_then(|s| s.script.as_mut());
+            script.unwrap().done();
+            game::AppRig::configure(rig, &mut config, &mut parts);
+            (logged, (rig.autoplay, rig.bga_session))
+        });
+        let startup = game::BgaSession {
+            settings: bga,
+            autoplay: true,
+        };
+        assert_eq!(got.0, (false, None, startup), "the logged play");
+        assert!(got.0.2.shown(), "the logged play shows the BGA");
+        assert_eq!(got.1, (true, startup), "the autoplay");
+        let device = game::BgaSession {
+            settings: bga,
+            autoplay: false,
+        };
+        assert!(!device.shown(), "a play from the devices");
     }
 
     /// Runs the page's script as the page does: each key it presses acts on
