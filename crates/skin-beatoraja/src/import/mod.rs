@@ -469,8 +469,9 @@ pub(crate) struct Cx<'d> {
     slot_roots: HashMap<u32, callback::SlotRoot>,
     /// Per callable instance, the play destinations whose `timer` it is.
     timer_sites: HashMap<u32, u32>,
-    /// The observer callables read as a play destination's `timer`,
-    /// whatever became of the destination ([`Self::close_observers`]).
+    /// The nodes holding an observer read as a play destination's
+    /// `timer`, whatever became of the destination
+    /// ([`Self::close_observers`]).
     observers: std::collections::HashSet<u32>,
     /// Per callable instance, the `timer`s of play destinations whose
     /// object the source removes, or whose timer is inert: no site, and
@@ -1488,13 +1489,15 @@ impl<'d> Cx<'d> {
             // leaves before the timer is read at a sentinel value
             // (`SkinNumber.java:138-150`), an image choice at a negative
             // index (`SkinImage.java:127-132`), a judge before its first
-            // judgment (`play/SkinJudge.java:97-103`).
+            // judgment (`play/SkinJudge.java:97-103`). Every number is
+            // refused, a constant one included: the import does not prove
+            // a value is never a sentinel.
             Prop::Callable(id) if observer.is_some() => {
                 let held = self.number_value.is_some()
                     || self.sentinel_read
                     || !matches!(self.prepare.before(), Ok(None));
                 let why = if held {
-                    Some("object holds its timer back")
+                    Some("object may hold its timer back")
                 } else if conds
                     .get(own..)
                     .unwrap_or_default()

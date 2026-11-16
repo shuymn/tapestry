@@ -275,7 +275,7 @@ fn a_true_observer_whose_object_may_skip_its_timer_is_refused() {
     // A number, at a sentinel value, and an image set whose selector may
     // be negative (ref 40, the gauge kind) leave their preparation before
     // the timer is read, so the source's observer may start late.
-    let held = Unsupported::Observer("object holds its timer back");
+    let held = Unsupported::Observer("object may hold its timer back");
     let number = "skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, \
                   digit = 3, value = function() return 1 end } }\n\
                   table.insert(skin.destination, { id = \"v\", timer = on, dst = { { w = 6, h = 6 } } })";
@@ -311,6 +311,81 @@ fn an_observer_read_anywhere_but_a_timer_is_refused() {
             Unsupported::Observer("timer is no play destination's"),
             HEAD + 1
         )
+    );
+}
+
+/// Each use of one observer is its own: a timer use elsewhere, at a
+/// destination the import keeps or drops, does not admit its use as a
+/// `draw` or an `op` entry, which the source reads as a number (truthy).
+#[test]
+fn every_use_of_an_observer_is_checked() {
+    let dropped = "table.insert(skin.destination, { id = \"nope\", timer = on, dst = { { x = 0, y = 0, w = 8, h = 8 } } })";
+    let mut imported = Vec::new();
+    for (timer, other) in [
+        ("timer", moving(0, "timer = on,")),
+        ("dropped timer", dropped.to_owned()),
+    ] {
+        for (use_, field) in [("draw", "draw = on,"), ("op", "op = { on },")] {
+            let body = format!("{TWINS}\n{other}\n{}", moving(100, field));
+            match import_body(&body) {
+                Ok(i) => imported.push(format!("{timer} + {use_}: {:?}", i.callbacks)),
+                r => assert_eq!(
+                    observer_refused(r),
+                    (
+                        Unsupported::Observer("timer is no play destination's"),
+                        HEAD + 1
+                    ),
+                    "{body}"
+                ),
+            }
+        }
+    }
+    assert!(imported.is_empty(), "imported: {imported:#?}");
+}
+
+/// A predicate's every reached read is mapped and its operations checked
+/// as any lowering's, its value constant or not, a read whose value is
+/// discarded included (design.md "beatoraja Lua Skins", the expression
+/// acceptance proof): an image index the play has none of (-1) is
+/// refused where it is the value and where it is discarded, and so is a
+/// read whose availability the constant cannot keep (the maximum BPM,
+/// guarded while the range is unknown). A read always available folds.
+#[test]
+fn a_predicate_s_reads_are_checked_though_its_value_is_constant() {
+    let api = u16::try_from(
+        HOST_APIS
+            .iter()
+            .position(|&a| a == ("main_state", "event_index"))
+            .unwrap(),
+    )
+    .unwrap();
+    let unmapped = Unsupported::Unmapped { api, id: -1 };
+    let mut folded = Vec::new();
+    for (predicate, want) in [
+        ("return ms.event_index(-1)", unmapped),
+        ("local _ = ms.event_index(-1) return true", unmapped),
+        (
+            "local _ = ms.number(90) return true",
+            Unsupported::Observer("predicate reads an availability"),
+        ),
+    ] {
+        let body = format!(
+            "local on = tu.timer_observe_boolean(function() {predicate} end)\n{}",
+            moving(0, "timer = on,")
+        );
+        match import_body(&body) {
+            Ok(i) => folded.push(format!("{predicate}: {:?}", i.callbacks)),
+            r => assert_eq!(observer_refused(r), (want, HEAD + 1), "{predicate}"),
+        }
+    }
+    assert!(folded.is_empty(), "folded: {folded:#?}");
+    let body = format!(
+        "local on = tu.timer_observe_boolean(function() local _ = ms.number(161) return true end)\n{}",
+        moving(0, "timer = on,")
+    );
+    assert_eq!(
+        import_body(&body).unwrap().callbacks,
+        [Disposition::Lowered]
     );
 }
 
