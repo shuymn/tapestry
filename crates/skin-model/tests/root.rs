@@ -390,7 +390,11 @@ fn folder_link(link: &Path, target: &str) {
 /// - `deep` -> `sub/../../ext/x.lua`, `sub` an inward link to `a/b`:
 ///   the walk reaches the folder's own `ext/x.lua`, and so does Unix;
 ///   Windows resolves the spelling, which leads to the outside `ext/x.lua`;
-/// - `a/rel` -> `../real`, an ordinary inward target.
+/// - `a/rel` -> `../real`, an ordinary inward target;
+/// - on Unix, `bs` -> the literal `real\x.lua`, beside an entry named
+///   `real\x.lua` that links to the outside `ext/x.lua`: a name's `\` is a
+///   separator, so the walk reaches the inside `real/x.lua`, while the
+///   system follows the backslash-named entry out of the folder.
 ///
 /// `outside` says whether the outside `ext/x.lua` exists.
 fn dot_dot_links(outside: bool) -> (TempDir, std::path::PathBuf) {
@@ -412,6 +416,11 @@ fn dot_dot_links(outside: bool) -> (TempDir, std::path::PathBuf) {
     file_link(&skin.join("up"), "../ext/x.lua");
     file_link(&skin.join("deep"), "sub/../../ext/x.lua");
     folder_link(&skin.join("a").join("rel"), "../real");
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(ext.join("x.lua"), skin.join("real\\x.lua")).unwrap();
+        std::os::unix::fs::symlink("real\\x.lua", skin.join("bs")).unwrap();
+    }
     (outer, skin)
 }
 
@@ -444,6 +453,20 @@ fn a_target_steps_up_only_after_the_link_before_it_is_judged() {
         );
         #[cfg(windows)]
         assert_eq!(fs::read(skin.join("probe")).unwrap(), b"inside");
+        // A target's `\` is a separator for the walk, a name character for
+        // Unix, which reads the outside file through `bs`.
+        #[cfg(unix)]
+        {
+            assert_eq!(
+                outcome(&root, "bs"),
+                Ok(b"real".to_vec()),
+                "outside {outside}"
+            );
+            assert_eq!(
+                fs::read(skin.join("bs")).ok(),
+                outside.then(|| b"outside".to_vec())
+            );
+        }
     }
 }
 
@@ -488,6 +511,13 @@ fn a_listing_of_links_does_not_depend_on_what_lies_outside() {
         assert!(top.contains(&entry("deep", false)), "{top:?}");
         assert!(top.contains(&entry("sub", true)), "{top:?}");
         assert!(a.contains(&entry("rel", true)), "{a:?}");
+        // Kept by its walk, described by the inside file it reached; the
+        // backslash-named entry it shadows leads out and is left out.
+        #[cfg(unix)]
+        {
+            assert!(top.contains(&entry("bs", false)), "{top:?}");
+            assert!(!names.contains(&"real\\x.lua"), "{names:?}");
+        }
     }
     assert_eq!(listings.first(), listings.last());
 }
