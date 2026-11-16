@@ -21,11 +21,14 @@ use skin_model::{AtlasError, AtlasLimits, FileDef, Filter, ImageDef, ImageError,
 const WRITER_BASE: &str = "SKIN_MODEL_SHARED_FOLDER_WRITER_BASE";
 /// Names the file whose creation lets a writer process begin placing.
 const WRITER_START: &str = "SKIN_MODEL_SHARED_FOLDER_WRITER_START";
+/// Names the file whose creation ends a writer process's placing.
+const WRITER_STOP: &str = "SKIN_MODEL_SHARED_FOLDER_WRITER_STOP";
 /// Set, a writer process fails at once.
 const WRITER_FAILS: &str = "SKIN_MODEL_SHARED_FOLDER_WRITER_FAILS";
 /// How many writer processes run at once.
 const WRITERS: usize = 4;
-/// How long each writer keeps placing the files.
+/// How long the writers keep placing the files once the race lets the
+/// readers go: a first placement slowed by the machine shortens none of it.
 const WRITING: Duration = Duration::from_millis(3_000);
 /// Reader threads that open each file as the loader does (its canonical
 /// path, then the file, read whole), that load the sheet (each file's path
@@ -197,9 +200,9 @@ fn unix_us() -> u64 {
 }
 
 /// The writer process: waits for the start file it is given, then places
-/// the files under the base folder it is given, again and again for
-/// [`WRITING`]. It prints when it entered, when it began and ended placing,
-/// and how many times it placed them.
+/// the files under the base folder it is given, again and again until the
+/// stop file it is given exists. It prints when it entered, when it began
+/// and ended placing, and how many times it placed them.
 #[test]
 #[ignore = "a writer process of a_reader_never_meets_a_file_being_placed"]
 fn writer() {
@@ -210,6 +213,7 @@ fn writer() {
     );
     let base = PathBuf::from(std::env::var_os(WRITER_BASE).unwrap());
     let start = PathBuf::from(std::env::var_os(WRITER_START).unwrap());
+    let stop = PathBuf::from(std::env::var_os(WRITER_STOP).unwrap());
     let waiting = Instant::now();
     while !start.exists() {
         assert!(waiting.elapsed() < LIMIT, "no start file within {LIMIT:?}");
@@ -217,9 +221,9 @@ fn writer() {
     }
     let files = files();
     let began = unix_us();
-    let until = Instant::now() + WRITING;
     let mut passes = 0u32;
-    while Instant::now() < until {
+    while !stop.exists() {
+        assert!(waiting.elapsed() < LIMIT, "no stop file within {LIMIT:?}");
         folder_in(&base, "shared", &files);
         passes += 1;
     }
@@ -228,7 +232,7 @@ fn writer() {
     println!("writer passes {passes}");
 }
 
-fn spawn_writer(base: &Path, start: &Path, fails: bool) -> Child {
+fn spawn_writer(base: &Path, start: &Path, stop: &Path, fails: bool) -> Child {
     let mut command = Command::new(std::env::current_exe().unwrap());
     if fails {
         command.env(WRITER_FAILS, "1");
@@ -237,6 +241,7 @@ fn spawn_writer(base: &Path, start: &Path, fails: bool) -> Child {
         .args(["writer", "--exact", "--ignored", "--nocapture"])
         .env(WRITER_BASE, base)
         .env(WRITER_START, start)
+        .env(WRITER_STOP, stop)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -369,11 +374,19 @@ fn read_until(reading: Reading, signals: &Signals) -> Seen {
     seen
 }
 
-/// Waits for every writer, killing them past [`LIMIT`]; returns each
-/// one's output.
-fn wait_writers(mut writers: Vec<Child>, start: Instant) -> Vec<String> {
+/// Waits for every writer, writing the stop file `stop` at `stop_at` and
+/// killing them past [`LIMIT`]; returns each one's output.
+fn wait_writers(
+    mut writers: Vec<Child>,
+    start: Instant,
+    stop: &Path,
+    stop_at: Instant,
+) -> Vec<String> {
     let mut outputs = Vec::new();
     while !writers.is_empty() {
+        if Instant::now() >= stop_at && !stop.exists() {
+            std::fs::write(stop, b"").unwrap();
+        }
         if start.elapsed() > LIMIT {
             for child in &mut writers {
                 let _ = child.kill();
@@ -425,13 +438,14 @@ struct Raced {
 /// any writer places: the writers wait for a start file, written once every
 /// reader has reached the start barrier. The race then places the folder
 /// itself, its first placements racing the writers' to create the files,
-/// and lets the readers go.
+/// lets the readers go, and [`WRITING`] later writes the stop file that
+/// ends the writers' placing.
 fn race(base: &Path, fails: bool) -> Raced {
     let start = Instant::now();
-    let start_file = base.join("start");
+    let (start_file, stop_file) = (base.join("start"), base.join("stop"));
     let spawned = unix_us();
     let writers = (0..WRITERS)
-        .map(|_| spawn_writer(base, &start_file, fails))
+        .map(|_| spawn_writer(base, &start_file, &stop_file, fails))
         .collect();
     let readings = [
         (Reading::Files, FILE_READERS),
@@ -464,8 +478,11 @@ fn race(base: &Path, fails: bool) -> Raced {
             signals.dir.set(dir).unwrap();
             let_go = unix_us();
             signals.go.store(true, Ordering::Release);
-            wait_writers(writers, start)
+            let stop_at = Instant::now() + WRITING;
+            wait_writers(writers, start, &stop_file, stop_at)
         }));
+        // Writers left placing when the race failed end too.
+        let _ = std::fs::write(&stop_file, b"");
         signals.go.store(true, Ordering::Release);
         signals.done.store(true, Ordering::Relaxed);
         let seen: Vec<Seen> = readers.into_iter().map(|r| r.join().unwrap()).collect();
