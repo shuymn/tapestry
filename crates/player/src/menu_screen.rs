@@ -266,8 +266,9 @@ struct SelectionKey {
 }
 
 /// The strip's sprites over a selection skin, in layout pixels: a dark
-/// band under each line shown (the search line and the notice) and the
-/// composition's underline; none without a line. At most
+/// band under each line shown (the search line, the notice and the
+/// list-cut line) and the composition's underline; none without a line.
+/// At most
 /// [`render::STRIP_SPRITES`]; allocates nothing.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn strip_sprites(
@@ -282,7 +283,8 @@ fn strip_sprites(
         ..Sprite::default()
     };
     let mut n = 0;
-    for (i, slot) in out.iter_mut().take(lines.min(2)).enumerate() {
+    let bands = lines.min(render::STRIP_SPRITES - 1);
+    for (i, slot) in out.iter_mut().take(bands).enumerate() {
         *slot = band(i);
         n += 1;
     }
@@ -783,9 +785,10 @@ impl MenuScreen {
         self.prepare_strip(&u.strip, Some(stop.notice()))
     }
 
-    /// Lays out the strip `strip` over a selection skin: its search line
-    /// and notice from the top; the caret's area goes to the window. `script`, the runtime's stop notice, is
-    /// the notice line while `strip` has none.
+    /// Lays out the strip `strip` over a selection skin: its search line,
+    /// notice and list-cut line from the top; the caret's area goes to the
+    /// window. `script`, the runtime's stop notice, is the notice line
+    /// while `strip` has none, above the list-cut line.
     fn prepare_strip(
         &mut self,
         strip: &StripText,
@@ -799,10 +802,17 @@ impl MenuScreen {
         if let Some(text) = script
             && strip.notice.is_none()
         {
-            page.lines.push(MenuLine {
-                text: text.to_owned(),
-                style: LineStyle::Notice,
-            });
+            let at = page
+                .lines
+                .len()
+                .saturating_sub(usize::from(strip.cut.is_some()));
+            page.lines.insert(
+                at,
+                MenuLine {
+                    text: text.to_owned(),
+                    style: LineStyle::Notice,
+                },
+            );
         }
         #[cfg(all(test, feature = "dev-tools"))]
         {
