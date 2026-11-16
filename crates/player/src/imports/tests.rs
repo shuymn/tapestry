@@ -972,6 +972,31 @@ fn a_lua_skin_builds_on_the_base_facts() {
     }
 }
 
+/// The import shows the BGA exactly when the session does: for each mode,
+/// autoplay or not, the import's setting from the session agrees with the
+/// session's answer, and carries its autoplay.
+#[test]
+fn the_import_reads_the_session_s_bga_answer() {
+    for mode in [
+        game::BgaMode::On,
+        game::BgaMode::Autoplay,
+        game::BgaMode::Off,
+    ] {
+        for autoplay in [false, true] {
+            let s = game::BgaSession {
+                settings: game::BgaSettings {
+                    mode,
+                    expand: game::BgaExpand::Full,
+                },
+                autoplay,
+            };
+            let session = crate::imports::SkinSession::of(s);
+            assert_eq!(session.autoplay, autoplay, "{s:?}");
+            assert_eq!(session.bga().shown(), s.shown(), "{s:?}");
+        }
+    }
+}
+
 /// The session's BGA setting reaches the import: a Lua play skin reading
 /// option 41 builds for the setting and the session's autoplay, the image
 /// moved where the BGA shows (`on`, or `autoplay` under autoplay) and in

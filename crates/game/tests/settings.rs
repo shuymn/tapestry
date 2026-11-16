@@ -7,9 +7,9 @@ use bms_model::{Lane, TimeUs};
 use eval::{AxisBinding, AxisMode, Binding, ControlId, ScratchSettings, SourceProfile};
 use game::sound_sets::SetRole;
 use game::{
-    Adjust, BgaExpand, BgaMode, BgaSettings, Chain, Channel, ControllerDevice, CoverSettings,
-    DataRoot, DeviceSettings, FailureAction, HiSpeedReference, HiSpeedSettings, KeyConfig,
-    KeyError, LaneKey, Language, LibrarySettings, LocalRecords, PlayerSettings,
+    Adjust, BgaExpand, BgaMode, BgaSession, BgaSettings, Chain, Channel, ControllerDevice,
+    CoverSettings, DataRoot, DeviceSettings, FailureAction, HiSpeedReference, HiSpeedSettings,
+    KeyConfig, KeyError, LaneKey, Language, LibrarySettings, LocalRecords, PlayerSettings,
     PlayerSettingsError, RecordSink, Role, ScoreTarget, ScratchConfig, Settings, SettingsError,
     SkinChoice, SkinChoices, SoundSettings, SpeedMode, Tuning, Volume, load_settings,
     save_settings, write_atomic,
@@ -1894,6 +1894,31 @@ fn on_failure_reads_closes_by_default_and_round_trips() {
     let table = text.lines().position(|l| l.starts_with('['));
     assert!(line.is_some() && line < table, "{text}");
     assert_eq!(Settings::load(&root).unwrap().player, s.player);
+}
+
+/// The session's BGA answer (design.md "Differences from the source", BGA
+/// setting): `on` shows the BGA, autoplay or not; `off` hides it, autoplay
+/// or not; `autoplay` shows it only in an autoplay session. `expand` is
+/// the setting's, whatever the mode.
+#[test]
+fn bga_session_shows_by_mode_and_autoplay() {
+    for (mode, autoplay, shown) in [
+        (BgaMode::On, false, true),
+        (BgaMode::On, true, true),
+        (BgaMode::Off, false, false),
+        (BgaMode::Off, true, false),
+        (BgaMode::Autoplay, false, false),
+        (BgaMode::Autoplay, true, true),
+    ] {
+        for expand in [BgaExpand::Full, BgaExpand::KeepAspect, BgaExpand::Off] {
+            let s = BgaSession {
+                settings: BgaSettings { mode, expand },
+                autoplay,
+            };
+            assert_eq!(s.shown(), shown, "{s:?}");
+            assert_eq!(s.expand(), expand, "{s:?}");
+        }
+    }
 }
 
 /// `[bga]` in `player.toml` (design.md "Settings Files"): a file without it

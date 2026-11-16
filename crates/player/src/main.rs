@@ -2404,6 +2404,58 @@ mod tests {
     /// when the output has written enough frames after it, and the first
     /// after the frame its sounds start on, so no phase depends on how long
     /// a thread sleeps; the wall clock only bounds a stalled audio thread.
+    /// A session's BGA setting is `player.toml`'s `[bga]` as read, with the
+    /// session's autoplay.
+    #[test]
+    fn a_session_s_bga_setting_is_the_file_s_with_its_autoplay() {
+        let bga = game::BgaSettings {
+            mode: game::BgaMode::Autoplay,
+            expand: game::BgaExpand::Off,
+        };
+        let settings = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings {
+                bga,
+                ..game::PlayerSettings::default()
+            },
+        };
+        for autoplay in [false, true] {
+            assert_eq!(
+                super::bga_session(&settings, autoplay),
+                game::BgaSession {
+                    settings: bga,
+                    autoplay,
+                }
+            );
+        }
+    }
+
+    /// The rig fixes the BGA setting for the session, which the skin
+    /// imports and a play's BGA read: `player.toml`'s `[bga]` with the
+    /// session's autoplay.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn the_rig_fixes_the_bga_setting_for_the_session() {
+        let bga = game::BgaSettings {
+            mode: game::BgaMode::Off,
+            expand: game::BgaExpand::Full,
+        };
+        let settings = game::Settings {
+            device: game::DeviceSettings::default(),
+            player: game::PlayerSettings {
+                bga,
+                ..game::PlayerSettings::default()
+            },
+        };
+        let render = crate::render_side::tests::Installers::default().spawn_bare();
+        let (fixed, _) = on_rig_with(settings, render, |rig, _| (rig.bga_session, rig.autoplay));
+        let want = game::BgaSession {
+            settings: bga,
+            autoplay: false,
+        };
+        assert_eq!(fixed, (want, false));
+    }
+
     #[cfg(feature = "dev-tools")]
     #[test]
     fn sync_sends_each_volume_to_the_audio_thread() {
