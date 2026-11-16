@@ -131,6 +131,20 @@ pub fn bms_load(data: &[u8]) -> Result<Loaded, LoadError> {
                         .eq(at.poor().iter().map(|p| &p.frames)),
                     "a mapped poor sequence changed"
                 );
+                // Its times move the speed's way, as the rows' do.
+                let times = |b: &bms_model::ChartBga| {
+                    let events = b.base().iter().chain(b.layer()).map(|e| e.time);
+                    events
+                        .chain(b.poor().iter().map(|p| p.time))
+                        .collect::<Vec<_>>()
+                };
+                for (a, b) in times(one).into_iter().zip(times(at)) {
+                    if speed.twentieths() <= 20 {
+                        assert!(b >= a, "a slower BGA time is earlier");
+                    } else {
+                        assert!(b <= a, "a faster BGA time is later");
+                    }
+                }
             }
         }
         Err(LoadError::TooLongAtSpeed { .. }) => {}
