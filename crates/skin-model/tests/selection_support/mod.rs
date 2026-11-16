@@ -20,6 +20,9 @@ use skin_model::{
     selection_timer,
 };
 
+#[path = "../shared_folder_support/mod.rs"]
+mod shared_folder;
+
 /// The images, by index: [`PLAIN`] images of one frame each, then a strip
 /// of ten glyphs.
 pub const PLAIN: u32 = 24;
@@ -42,40 +45,20 @@ pub fn frames_of(i: u32) -> u16 {
     if i == DIGITS { 10 } else { 1 }
 }
 
+/// A folder of the images and a font under the target's test folder,
+/// shared by every test process ([`shared_folder`]).
 fn root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("skin-model-selection");
-        std::fs::create_dir_all(&dir).unwrap();
-        for i in 0..IMAGES {
-            let tmp = tempfile::Builder::new()
-                .suffix(".png")
-                .tempfile_in(&dir)
-                .unwrap();
-            RgbaImage::from_pixel(2 * u32::from(frames_of(i)), 2, Rgba([255; 4]))
-                .save_with_format(tmp.path(), ImageFormat::Png)
-                .unwrap();
-            let path = dir.join(format!("{i}.png"));
-            if let Err(e) = tmp.persist(&path)
-                && !path.is_file()
-            {
-                panic!("{path:?}: {e}");
-            }
-        }
-        // A font file the sheet admits by its header alone, replaced whole like
-        // the images: another test process may be reading it.
-        let tmp = tempfile::Builder::new()
-            .suffix(".ttf")
-            .tempfile_in(&dir)
-            .unwrap();
-        std::fs::write(tmp.path(), [0, 1, 0, 0]).unwrap();
-        let path = dir.join("o.ttf");
-        if let Err(e) = tmp.persist(&path)
-            && !path.is_file()
-        {
-            panic!("{path:?}: {e}");
-        }
-        dir
+        let mut files: Vec<_> = (0..IMAGES)
+            .map(|i| {
+                let image = RgbaImage::from_pixel(2 * u32::from(frames_of(i)), 2, Rgba([255; 4]));
+                (format!("{i}.png"), shared_folder::png(&image))
+            })
+            .collect();
+        // A font file the sheet admits by its header alone.
+        files.push(("o.ttf".to_owned(), vec![0, 1, 0, 0]));
+        shared_folder::folder("skin-model-selection", &files)
     })
 }
 

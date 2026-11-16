@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 use bms_model::{Chart, Lane, NoteKind, TimeUs};
 use eval::{GaugeState, JudgeEvent, JudgeEventKind, NoteFacts, NoteHold, Tally};
-use image::{ImageFormat, Rgba, RgbaImage};
+use image::{Rgba, RgbaImage};
 use rules::{GaugeValue, Judgment, PerJudgment};
 use skin_model::{
     Anchor, AtlasLimits, Attempt, Blend, BuildError, CoverSettings, Ease, ElementDef, End, FileDef,
@@ -16,6 +16,9 @@ use skin_model::{
     LoadError, PLAY, Place, Play, PlayContext, Program, QuadBatch, Region, RegionDef, Scope, Sheet,
     Side, Skin, SkinDef, SkinFrame, Source, TimerRef, Ty, UvTable, Variant, compile,
 };
+
+#[path = "../shared_folder_support/mod.rs"]
+pub mod shared_folder;
 
 pub const MS: i64 = 1_000;
 
@@ -269,30 +272,15 @@ pub const LIMITS: AtlasLimits = AtlasLimits {
 };
 
 /// A folder holding `white.png`, one opaque white texel, under the
-/// target's test folder; written once, atomically.
+/// target's test folder, shared by every test process ([`shared_folder`]).
 pub fn white_root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("skin-model-play");
-        std::fs::create_dir_all(&dir).unwrap();
-        let tmp = tempfile::Builder::new()
-            .suffix(".png")
-            .tempfile_in(&dir)
-            .unwrap();
-        RgbaImage::from_pixel(1, 1, Rgba([255; 4]))
-            .save_with_format(tmp.path(), ImageFormat::Png)
-            .unwrap();
-        // Under nextest each test is a process of its own, so another
-        // may write the same file at once. On Windows the rename over a
-        // file another process has open fails; the file there has the
-        // same bytes, so it is used.
-        let path = dir.join("white.png");
-        if let Err(e) = tmp.persist(&path)
-            && !path.is_file()
-        {
-            panic!("{path:?}: {e}");
-        }
-        dir
+        let white = RgbaImage::from_pixel(1, 1, Rgba([255; 4]));
+        shared_folder::folder(
+            "skin-model-play",
+            &[("white.png".to_owned(), shared_folder::png(&white))],
+        )
     })
 }
 
