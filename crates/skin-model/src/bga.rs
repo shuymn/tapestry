@@ -428,8 +428,9 @@ fn alloc(bytes: u64, limit: Option<u64>) -> Result<Vec<u8>, Absent> {
 
 /// Reads the picture in the file at `canonical`, observed as `key` with
 /// `native` texels ([`probe`]), into a cell whose content is `content`
-/// (see the module). Every allocation of its own, the file's bytes and the
-/// cell included, is at most `limit` bytes when one is given, and an
+/// (see the module). Every allocation of its own, the file's bytes, the
+/// decoded picture, its RGBA8 copy and the cell included, is at most
+/// `limit` bytes when one is given, each checked before it is made, and an
 /// allocation past it or refused leaves the picture
 /// [`Absent::Refused`]. `cancel` is asked before the read, before each
 /// piece of it and after the decode.
@@ -465,7 +466,7 @@ pub fn read_cell(
     }
     decode::check_whole(&bytes, dims, header).map_err(|e| absent(chart_image::absent_of(e)))?;
     let (image, alpha) =
-        decode::decode_alpha(bytes, dims).map_err(|e| absent(chart_image::absent_of(e)))?;
+        decode::decode_alpha(bytes, dims, limit).map_err(|e| absent(chart_image::absent_of(e)))?;
     chart_image::checkpoint(cancel, Site::Decoded)?;
     cell_of(image.into_raw(), dims, alpha, content, limit).map(|(padded, texels)| CellPixels {
         native: dims,

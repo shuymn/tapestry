@@ -215,8 +215,8 @@ pub enum Absent {
     #[error("the read was cancelled")]
     Cancelled,
     /// Its memory was refused: a reservation for its reader, or one of
-    /// the reader's own allocations (the file's bytes, a BGA picture's
-    /// canvas, downscale or cell).
+    /// the reader's own allocations (the file's bytes, the decoded image
+    /// and its RGBA8 copy, a BGA picture's canvas, downscale or cell).
     #[error("the image's memory was refused")]
     Refused,
     /// The worker reading it panicked or could not start (the player's):
@@ -561,6 +561,7 @@ pub(crate) fn absent_of(e: DecodeError) -> Stop {
     match e {
         DecodeError::Unsupported => Stop::Absent(Absent::Format),
         DecodeError::Changed | DecodeError::HeaderChanged => Stop::Changed,
+        DecodeError::Refused => Stop::Absent(Absent::Refused),
         _ => Stop::Absent(Absent::Decode),
     }
 }

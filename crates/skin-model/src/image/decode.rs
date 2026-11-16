@@ -12,8 +12,8 @@ use std::fs::File;
 use std::io::{self, BufRead, Cursor, Read, Seek, SeekFrom};
 
 use image::{
-    DynamicImage, ImageBuffer, ImageDecoder, ImageError, ImageFormat, ImageReader, Limits,
-    RgbaImage,
+    ColorType, DynamicImage, ImageBuffer, ImageDecoder, ImageError, ImageFormat, ImageReader,
+    Limits, RgbaImage,
 };
 
 use super::{HEADER_BYTES, MAX_IMAGE_TEXELS, MAX_SIDE, MAX_STREAMED_TEXELS, Unbanded};
@@ -73,6 +73,9 @@ pub(crate) enum DecodeError {
     HeaderChanged,
     /// `png` met its own allocation limit ([`PNG_WORK_BYTES`]).
     DecoderLimit,
+    /// The native image or its RGBA8 copy was past the limit given, or
+    /// refused by the allocator.
+    Refused,
     Image(ImageError),
     Png(png::DecodingError),
     Io(io::Error),
@@ -357,21 +360,27 @@ fn png_mode(bytes: &[u8]) -> Result<Result<Mode, Unbanded>, DecodeError> {
 /// over; a JPEG decoder copies them while it is built and drops the
 /// original (2E); decoding holds the encoded bytes and the native image
 /// (E + 8T at most); the encoded bytes go with the decoder, then the
-/// conversion holds the native image and the RGBA8 copy (12T at most, none
-/// when the native image is already RGBA8). With `E` at most
+/// conversion holds the native image, the RGBA8 copy and one band of
+/// [`BAND_ROWS`] rows of each (12T and 3 MiB at most, none when the native
+/// image is already RGBA8). With `E` at most
 /// [`MAX_FILE_BYTES`](super::MAX_FILE_BYTES) (64 MiB) and `T` at most
 /// [`MAX_IMAGE_TEXELS`](super::MAX_IMAGE_TEXELS) (12 Mi), that is at most
-/// 160 MiB.
+/// 160 MiB. The native image and the RGBA8 copy are allocated here, so a
+/// refusal is an error rather than an abort.
 pub(crate) fn decode(bytes: Vec<u8>, dims: [u32; 2]) -> Result<RgbaImage, DecodeError> {
-    decode_alpha(bytes, dims).map(|(image, _)| image)
+    decode_alpha(bytes, dims, None).map(|(image, _)| image)
 }
 
 /// [`decode`], and whether the decoded picture has an alpha channel (its
 /// decoder's colour type: a PNG's alpha or transparency chunk, a BMP's
-/// alpha mask).
+/// alpha mask). With `limit`, the native image and the RGBA8 copy are each
+/// at most `limit` bytes, their sizes taken from the header before either
+/// is allocated: past it, or refused by the allocator, the picture is
+/// [`DecodeError::Refused`].
 pub(crate) fn decode_alpha(
     bytes: Vec<u8>,
     dims: [u32; 2],
+    limit: Option<u64>,
 ) -> Result<(RgbaImage, bool), DecodeError> {
     let [w, h] = dims;
     let native = u64::from(w) * u64::from(h) * NATIVE_TEXEL_BYTES;
@@ -383,11 +392,104 @@ pub(crate) fn decode_alpha(
     if decoder.dimensions() != (w, h) {
         return Err(DecodeError::Changed);
     }
-    if decoder.total_bytes() > native {
+    let samples = decoder.total_bytes();
+    if samples > native {
         return Err(DecodeError::Unsupported);
     }
-    let alpha = decoder.color_type().has_alpha();
-    Ok((DynamicImage::from_decoder(decoder)?.into_rgba8(), alpha))
+    let rgba = u64::from(w) * u64::from(h) * 4;
+    if limit.is_some_and(|l| samples > l || rgba > l) {
+        return Err(DecodeError::Refused);
+    }
+    let color = decoder.color_type();
+    let mut buf = zeroed(samples)?;
+    decoder.read_image(&mut buf)?;
+    Ok((rgba8(buf, color, w, h)?, color.has_alpha()))
+}
+
+/// `n` zero bytes, [`DecodeError::Refused`] when the allocator refuses
+/// them.
+fn zeroed(n: u64) -> Result<Vec<u8>, DecodeError> {
+    let n = usize::try_from(n).map_err(|_| DecodeError::Refused)?;
+    let mut v = Vec::new();
+    v.try_reserve_exact(n).map_err(|_| DecodeError::Refused)?;
+    v.resize(n, 0);
+    Ok(v)
+}
+
+/// The native samples `buf` of a `w`×`h` image of `color` in RGBA8 by
+/// `image`'s conversion: `buf` itself when it already is, else converted
+/// a band of [`BAND_ROWS`] rows at a time into one allocation made here.
+fn rgba8(buf: Vec<u8>, color: ColorType, w: u32, h: u32) -> Result<RgbaImage, DecodeError> {
+    let bad = || DecodeError::Unsupported;
+    if color == ColorType::Rgba8 {
+        return RgbaImage::from_raw(w, h, buf).ok_or_else(bad);
+    }
+    let width = usize::try_from(w).map_err(|_| bad())?;
+    let band = usize::try_from(BAND_ROWS).map_err(|_| bad())?;
+    let in_row = width * usize::from(color.bytes_per_pixel());
+    let mut out = zeroed(u64::from(w) * u64::from(h) * 4)?;
+    if in_row > 0 {
+        for (src, dst) in buf
+            .chunks(in_row * band)
+            .zip(out.chunks_mut(width * 4 * band))
+        {
+            let rows = u32::try_from(src.len() / in_row).map_err(|_| bad())?;
+            let converted = band_image(src, color, w, rows)?.into_rgba8();
+            if converted.len() != dst.len() {
+                return Err(bad());
+            }
+            dst.copy_from_slice(&converted);
+        }
+    }
+    RgbaImage::from_raw(w, h, out).ok_or_else(bad)
+}
+
+/// A band of `w`×`rows` native samples of `color`, copied into an image
+/// of its own (the samples in native byte order, as decoders write them).
+fn band_image(
+    src: &[u8],
+    color: ColorType,
+    w: u32,
+    rows: u32,
+) -> Result<DynamicImage, DecodeError> {
+    fn copied<T, const N: usize>(src: &[u8], f: fn([u8; N]) -> T) -> Result<Vec<T>, DecodeError> {
+        let (samples, rest) = src.as_chunks::<N>();
+        if !rest.is_empty() {
+            return Err(DecodeError::Unsupported);
+        }
+        let mut v = Vec::new();
+        v.try_reserve_exact(samples.len())
+            .map_err(|_| DecodeError::Refused)?;
+        v.extend(samples.iter().map(|s| f(*s)));
+        Ok(v)
+    }
+    let eight = || copied::<u8, 1>(src, |[b]| b);
+    let sixteen = || copied(src, u16::from_ne_bytes);
+    let float = || copied(src, f32::from_ne_bytes);
+    let image = match color {
+        ColorType::L8 => ImageBuffer::from_raw(w, rows, eight()?).map(DynamicImage::ImageLuma8),
+        ColorType::La8 => ImageBuffer::from_raw(w, rows, eight()?).map(DynamicImage::ImageLumaA8),
+        ColorType::Rgb8 => ImageBuffer::from_raw(w, rows, eight()?).map(DynamicImage::ImageRgb8),
+        ColorType::Rgba8 => ImageBuffer::from_raw(w, rows, eight()?).map(DynamicImage::ImageRgba8),
+        ColorType::L16 => ImageBuffer::from_raw(w, rows, sixteen()?).map(DynamicImage::ImageLuma16),
+        ColorType::La16 => {
+            ImageBuffer::from_raw(w, rows, sixteen()?).map(DynamicImage::ImageLumaA16)
+        }
+        ColorType::Rgb16 => {
+            ImageBuffer::from_raw(w, rows, sixteen()?).map(DynamicImage::ImageRgb16)
+        }
+        ColorType::Rgba16 => {
+            ImageBuffer::from_raw(w, rows, sixteen()?).map(DynamicImage::ImageRgba16)
+        }
+        ColorType::Rgb32F => {
+            ImageBuffer::from_raw(w, rows, float()?).map(DynamicImage::ImageRgb32F)
+        }
+        ColorType::Rgba32F => {
+            ImageBuffer::from_raw(w, rows, float()?).map(DynamicImage::ImageRgba32F)
+        }
+        _ => None,
+    };
+    image.ok_or(DecodeError::Unsupported)
 }
 
 /// Where the bands of a file decoded in bands go.
@@ -605,4 +707,93 @@ fn to_rgba8(band: Samples, color: png::ColorType, w: u32, rows: u32) -> Result<R
         (_, C::Indexed) => return Err(bad()),
     };
     Ok(image.into_rgba8())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use image::{DynamicImage, ImageBuffer, ImageFormat, Luma, LumaA, Rgb, Rgba};
+
+    use super::{DecodeError, decode_alpha};
+
+    /// `image` encoded as `format`.
+    fn encoded(image: &DynamicImage, format: ImageFormat) -> Vec<u8> {
+        let mut out = Cursor::new(Vec::new());
+        image.write_to(&mut out, format).unwrap();
+        out.into_inner()
+    }
+
+    /// A sample that differs across the picture, of 16 bits.
+    fn wide(x: u32, y: u32, k: u32) -> u16 {
+        u16::try_from((x * 1031 + y * 977 + k * 4099) % 65_536).unwrap()
+    }
+
+    fn narrow(x: u32, y: u32, k: u32) -> u8 {
+        u8::try_from((x * 7 + y * 13 + k * 61) % 256).unwrap()
+    }
+
+    /// The conversion done here, a band at a time into its own
+    /// allocation, gives `image`'s own result for every colour type an
+    /// enabled format decodes to, a last band shorter than the others
+    /// included (41 rows).
+    #[test]
+    fn the_bounded_conversion_matches_image_s() {
+        let [w, h] = [37, 41];
+        let images = [
+            DynamicImage::ImageLuma8(ImageBuffer::from_fn(w, h, |x, y| Luma([narrow(x, y, 0)]))),
+            DynamicImage::ImageLumaA8(ImageBuffer::from_fn(w, h, |x, y| {
+                LumaA([narrow(x, y, 0), narrow(x, y, 1)])
+            })),
+            DynamicImage::ImageRgb8(ImageBuffer::from_fn(w, h, |x, y| {
+                Rgb([0, 1, 2].map(|k| narrow(x, y, k)))
+            })),
+            DynamicImage::ImageRgba8(ImageBuffer::from_fn(w, h, |x, y| {
+                Rgba([0, 1, 2, 3].map(|k| narrow(x, y, k)))
+            })),
+            DynamicImage::ImageLuma16(ImageBuffer::from_fn(w, h, |x, y| Luma([wide(x, y, 0)]))),
+            DynamicImage::ImageLumaA16(ImageBuffer::from_fn(w, h, |x, y| {
+                LumaA([wide(x, y, 0), wide(x, y, 1)])
+            })),
+            DynamicImage::ImageRgb16(ImageBuffer::from_fn(w, h, |x, y| {
+                Rgb([0, 1, 2].map(|k| wide(x, y, k)))
+            })),
+            DynamicImage::ImageRgba16(ImageBuffer::from_fn(w, h, |x, y| {
+                Rgba([0, 1, 2, 3].map(|k| wide(x, y, k)))
+            })),
+        ];
+        let mut files: Vec<_> = images
+            .iter()
+            .map(|i| (format!("{:?} png", i.color()), encoded(i, ImageFormat::Png)))
+            .collect();
+        files.push(("rgb bmp".into(), encoded(&images[2], ImageFormat::Bmp)));
+        files.push(("rgb jpeg".into(), encoded(&images[2], ImageFormat::Jpeg)));
+        files.push(("luma jpeg".into(), encoded(&images[0], ImageFormat::Jpeg)));
+        for (what, bytes) in files {
+            let theirs = image::load_from_memory(&bytes).unwrap();
+            let alpha = theirs.color().has_alpha();
+            let theirs = theirs.into_rgba8();
+            let (ours, has) = decode_alpha(bytes, [w, h], None).unwrap();
+            assert!(ours == theirs, "{what}");
+            assert_eq!(has, alpha, "{what}");
+        }
+    }
+
+    /// With a limit, a native image or an RGBA8 copy past it is refused
+    /// from the header, before it is allocated.
+    #[test]
+    fn a_limit_refuses_the_native_image_and_its_copy() {
+        let rgb = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(640, 480, Rgb([9, 8, 7])));
+        let bytes = encoded(&rgb, ImageFormat::Png);
+        let rgba = 640 * 480 * 4;
+        let decode = |limit| decode_alpha(bytes.clone(), [640, 480], Some(limit));
+        assert!(matches!(decode(rgba - 1), Err(DecodeError::Refused)));
+        assert!(decode(rgba).is_ok());
+        let deep = DynamicImage::ImageRgba16(ImageBuffer::from_pixel(64, 64, Rgba([1; 4])));
+        let bytes = encoded(&deep, ImageFormat::Png);
+        let native = 64 * 64 * 8;
+        let decode = |limit| decode_alpha(bytes.clone(), [64, 64], Some(limit));
+        assert!(matches!(decode(native - 1), Err(DecodeError::Refused)));
+        assert!(decode(native).is_ok());
+    }
 }

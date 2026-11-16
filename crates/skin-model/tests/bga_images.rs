@@ -375,6 +375,30 @@ fn a_refused_allocation_leaves_the_picture_absent() {
     assert!(read(302 * 302 * 4).is_ok());
 }
 
+/// A large picture fitted to a small cell, its file under the limit: the
+/// decoded picture is held to the limit too, refused from the header's
+/// size before it is allocated, so the picture is absent rather than the
+/// allocation past it made.
+#[test]
+fn a_large_picture_in_a_small_cell_is_refused_before_it_is_decoded() {
+    let d = dir();
+    let rgb = image::RgbImage::from_pixel(640, 480, image::Rgb([10, 20, 30]));
+    rgb.save_with_format(d.path().join("big.png"), ImageFormat::Png)
+        .unwrap();
+    let limit = 64 << 10;
+    assert!(fs::metadata(d.path().join("big.png")).unwrap().len() < limit);
+    let dir = ChartDir::new(d.path()).unwrap();
+    let BgaBinding::Resolved { path, key, .. } = resolve(&dir, "big.png", &fixed) else {
+        panic!();
+    };
+    let native = probe(&path, &key, &fixed).unwrap();
+    let read = |limit| read_cell(&path, &key, native, [64, 48], &never, &fixed, limit);
+    assert_eq!(read(Some(limit)), Err(Absent::Refused));
+    let cell = read(None).unwrap();
+    assert_eq!(cell.native, [640, 480]);
+    assert_eq!(cell.padded, [64 + 2 * CELL_GUTTER, 48 + 2 * CELL_GUTTER]);
+}
+
 fn sizes(n: usize, size: [u32; 2]) -> Vec<Option<[u32; 2]>> {
     vec![Some(stored_size(size)); n]
 }
