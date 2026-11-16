@@ -214,7 +214,8 @@ enum Static {
     Dynamic,
     /// Static, and its value is known at import: tapestry has no
     /// difficulty table or course (`table_song`, `:351-352`; `mode_course`,
-    /// `:526-527`; the course stages, `:521-525`), so all are false.
+    /// `:526-527`; the course stages, `:521-525`), so all are false, and
+    /// plays no BGA (`bgaoff` true, `bgaon` false, `:392-393`; D33).
     Known(bool),
     /// Static, read from the chart (`SongDataBooleanProperty`, `:251-265`,
     /// `:435-452`), which the play maps.
@@ -228,6 +229,9 @@ enum Static {
 fn static_class(id: i32) -> Static {
     match id {
         ops::TABLE_SONG | ops::COURSE_MODE | 280..=283 | 289 => Static::Known(false),
+        // The BGA setting, answered as off (D33).
+        ops::BGA_OFF => Static::Known(true),
+        ops::BGA_ON => Static::Known(false),
         150..=155 | 170 | 176 | 177 | 180..=184 | 190 | 191 | 194 | 195 => Static::Chart,
         171..=175
         | 178
@@ -236,8 +240,6 @@ fn static_class(id: i32) -> Static {
         | 160..=164
         | 1160
         | 1161
-        | 40
-        | 41
         | 192
         | 193
         | 50
