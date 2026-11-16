@@ -76,11 +76,6 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
-    # Line tables keep backtraces' file and line and make the debug
-    # artifacts, and so the cache, much smaller than full debug info.
-    env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
     defaults:
       run:
         shell: bash
@@ -98,11 +93,6 @@ jobs:
           mise exec -- rustc -Vv
       - name: Show runner image
         run: echo "runner image $ImageOS $ImageVersion"
-      # Dependencies built with optimizations: the CPU-bound tests ran 15-20 %
-      # faster here (not on Linux), and rust-cache keeps them. Before
-      # rust-cache, which hashes .cargo/config.toml into its key.
-      - name: Optimize dependencies in debug builds
-        run: printf '\n[profile.dev.package."*"]\nopt-level = 2\n' >> .cargo/config.toml
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           cmd-format: mise exec -- {0}
@@ -212,12 +202,8 @@ jobs:
     timeout-minutes: 45
     permissions:
       contents: read
-    # Line tables keep backtraces' file and line and make the debug
-    # artifacts, and so the cache, much smaller than full debug info.
     # DEV_TOOLS names the packages and features every part tests.
     env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
       DEV_TOOLS: -p player -p game -p audio -p input -p skin-beatoraja -p skin-model --features player/dev-tools,game/dev-tools,audio/dev-tools,input/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked
       PART: 1
       PARTS: 3
@@ -238,11 +224,6 @@ jobs:
           mise exec -- rustc -Vv
       - name: Show runner image
         run: echo "runner image $ImageOS $ImageVersion"
-      # Dependencies built with optimizations: the CPU-bound tests ran 15-20 %
-      # faster here (not on Linux), and rust-cache keeps them. Before
-      # rust-cache, which hashes .cargo/config.toml into its key.
-      - name: Optimize dependencies in debug builds
-        run: printf '\n[profile.dev.package."*"]\nopt-level = 2\n' >> .cargo/config.toml
       # One cache for the parts, under the key the single job used; the
       # first part builds everything the others build (and clippy's), so
       # only it saves.
@@ -293,8 +274,6 @@ jobs:
     permissions:
       contents: read
     env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
       DEV_TOOLS: -p player -p game -p audio -p input -p skin-beatoraja -p skin-model --features player/dev-tools,game/dev-tools,audio/dev-tools,input/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked
       PART: 2
       PARTS: 3
@@ -311,8 +290,6 @@ jobs:
     permissions:
       contents: read
     env:
-      CARGO_PROFILE_DEV_DEBUG: line-tables-only
-      CARGO_PROFILE_TEST_DEBUG: line-tables-only
       DEV_TOOLS: -p player -p game -p audio -p input -p skin-beatoraja -p skin-model --features player/dev-tools,game/dev-tools,audio/dev-tools,input/dev-tools,skin-beatoraja/dev-tools,skin-model/dev-tools --locked
       PART: 3
       PARTS: 3
