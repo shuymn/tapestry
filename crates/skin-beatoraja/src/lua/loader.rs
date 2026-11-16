@@ -21,8 +21,11 @@
 //! [`MAX_INCLUDE_PARSES`], at most [`MAX_INCLUDE_DEPTH`] active), and
 //! each read of a source, a snapshot reused included, is charged its
 //! bytes. A loader that fails, its source or the chunk it runs, is a
-//! fault: a required part that does not load never leaves a partial
-//! definition behind a protected call.
+//! fault: a part that does not load never leaves a partial definition
+//! behind a protected call. The one exception is a `dofile` whose name
+//! leads to no regular file inside the skin folder: Lua's own `dofile`
+//! error, which a protected call catches, the skin going on without
+//! that part ([`dofile`]).
 //!
 //! In the configured pass each chunk is parsed by the analysis's parser
 //! first ([`super::syntax`], once a pass per file) and compiled
@@ -169,16 +172,27 @@ pub(super) fn compile(lua: &Lua, pass: &Pass, key: &str) -> mlua::Result<(Functi
     let (id, bytes) = pass
         .source(key, || running(lua))
         .map_err(|e| pass.ledger.fail(e))?;
+    compile_read(lua, pass, id, &bytes)
+}
+
+/// Compiles the source `id` already read as `bytes`: its chunk, or a
+/// fault when it does not compile.
+fn compile_read(
+    lua: &Lua,
+    pass: &Pass,
+    id: FileId,
+    bytes: &[u8],
+) -> mlua::Result<(Function, FileId)> {
     pass.ledger.check(lua)?;
     let name = id.name().to_owned();
     pass.module(&name);
     let code = if pass.bridge.is_some() {
-        instrumented(lua, pass, &id, &bytes)?
+        instrumented(lua, pass, &id, bytes)?
     } else {
         None
     };
     let f = lua
-        .load(code.as_deref().unwrap_or(&bytes))
+        .load(code.as_deref().unwrap_or(bytes))
         .set_name(format!("@{name}"))
         .set_mode(ChunkMode::Text)
         .into_function();
@@ -362,6 +376,13 @@ pub(super) fn run(
         return Err(pass.ledger.fail_lua(lua, LuaWhy::Limit(LuaLimit::Memory)));
     }
     let at = pass.last_error();
+    // An absent `dofile` read that no protected call caught refuses as
+    // the read it is, named and located at its call.
+    if let Some(Value::String(e)) = r.pop_front()
+        && let Some((name, source)) = pass.escaped_absent(&e.as_bytes())
+    {
+        return Err(pass.ledger.fail(ImportError::Read { at, name, source }));
+    }
     Err(pass.ledger.fail(ImportError::Lua {
         at,
         why: LuaWhy::Error,
@@ -457,9 +478,17 @@ pub(super) fn require(lua: &Lua, pass: &Arc<Pass>) -> mlua::Result<Function> {
     })
 }
 
-/// The confined `dofile`.
+/// The confined `dofile`. A name that passes every name and confinement
+/// rule and leads to no regular file inside the skin folder (no entry, a
+/// path through a file, a folder: [`RootError::Missing`] and
+/// [`RootError::NotAFile`]) is no fault: its face raises the ordinary
+/// error `cannot open <name>`, which a protected call catches, and which
+/// refuses the import as that read when it escapes ([`run`]). Every other
+/// failure, once a source is found its compilation and its chunk's
+/// errors included, is a fault.
 pub(super) fn dofile(lua: &Lua, pass: &Arc<Pass>) -> mlua::Result<Function> {
-    host(lua, pass, 1, |lua, pass, args| {
+    sandbox::dofile_face(lua, pass, |lua, pass, args| {
+        // The runtime's phase raises first, before any read is classed.
         pass.import_only(lua)?;
         invocation(lua, pass)?;
         pass.ledger.update(|c| c.dofiles += 1);
@@ -479,9 +508,30 @@ pub(super) fn dofile(lua: &Lua, pass: &Arc<Pass>) -> mlua::Result<Function> {
             }));
         }
         let key = join(&pass.entry_dir, &name);
-        let (f, _) = compile(lua, pass, &key)?;
-        deeper(lua, pass, f, MultiValue::new())
+        pass.ledger.check(lua)?;
+        let (id, bytes) = match pass.source(&key, || running(lua)) {
+            Ok(read) => read,
+            Err(ImportError::Read {
+                source: source @ (RootError::Missing | RootError::NotAFile),
+                ..
+            }) => {
+                pass.ledger.update(|c| c.missing_loads += 1);
+                let message = format!("cannot open {name}");
+                pass.absent(message.as_bytes(), key, &source);
+                return Ok(Loaded::Absent(lua.create_string(message)?));
+            }
+            Err(e) => return Err(pass.ledger.fail(e)),
+        };
+        let (f, _) = compile_read(lua, pass, id, &bytes)?;
+        deeper(lua, pass, f, MultiValue::new()).map(Loaded::Found)
     })
+}
+
+/// What a `dofile` gives its face: the chunk's results, or the message
+/// of a name that leads to no file.
+pub(super) enum Loaded {
+    Found(MultiValue),
+    Absent(mlua::LuaString),
 }
 
 #[cfg(test)]

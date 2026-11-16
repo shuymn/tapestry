@@ -389,9 +389,12 @@ pub(crate) enum Value {
     TargetEx,
     /// The current EX score's differences from the best and the target
     /// paced to the judged targets (`diff_highscore`, 152, and
-    /// `diff_targetscore`, 153; `:197-198`, `:702-710`): the best paced
-    /// linearly where the source follows a stored best play's ghost (G9),
-    /// drawn only while `best.valid` (not for a `#RANDOM` chart, G15).
+    /// `diff_targetscore`, 153; `:197-198`, `:702-710`): the best paced by
+    /// its play's cumulative EX after each judged target, as the source
+    /// follows a stored best play's ghost, under the play preset's EX
+    /// weights where the source's are fixed, and linearly when the best
+    /// keeps no progress; drawn only while `best.valid` (not for a
+    /// `#RANDOM` chart, G15).
     BestDiff,
     TargetDiff,
     /// The target's and the best's rates over the attempt's targets,

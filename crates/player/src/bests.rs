@@ -7,12 +7,12 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Instant;
 
 use game::{
-    BestKey, BestLamp, BestLookup, BestScore, BestView, Chain, LocalRecords, PlayerTotals,
-    RecordRef, RecordSink, SaveError, SavedPlay,
+    BestKey, BestLamp, BestLookup, BestScore, BestView, Chain, LocalRecords, PlayBest,
+    PlayerTotals, ProgressLookup, ProgressQuery, RecordRef, RecordSink, SaveError, SavedPlay,
 };
 use library::{
-    Best, BestWriter, Contribution, Ineligible, Ingested, Key, LN_MODE, PlayId, Score, Totals,
-    Verified,
+    Best, BestWriter, Contribution, Ineligible, Ingested, Key, LN_MODE, PlayId, Progress, Score,
+    Totals, Verified,
 };
 use replay::PlayRecord;
 use rules::RulePreset;
@@ -82,6 +82,61 @@ impl RecordSink for BestsRecords {
                 eprintln!("{line}");
                 log::warn!("{line}");
                 BestLookup::Unavailable
+            }
+        }
+    }
+
+    /// The key's score and, when `progress` asks, its best's progress,
+    /// from one statement through the live writer's connection. A failed
+    /// read leaves both unavailable; a refused progress is logged and
+    /// leaves the best as read, paced by the line.
+    fn play_best(
+        &mut self,
+        key: &BestKey,
+        preset: &RulePreset,
+        progress: Option<ProgressQuery>,
+    ) -> PlayBest {
+        let read = self
+            .bests
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .play_best(
+                &Key {
+                    preset_sha256: key.preset_sha256,
+                    ln_mode: LN_MODE,
+                    chart_sha256: key.chart_sha256,
+                },
+                progress.map(|q| library::ProgressQuery {
+                    targets: q.targets,
+                    empty_poor_counted: q.empty_poor_counted,
+                }),
+            );
+        match read {
+            Ok(read) => PlayBest {
+                best: lookup(read.score.as_ref(), preset),
+                progress: match read.progress {
+                    None => ProgressLookup::Unavailable,
+                    Some(Progress::Known(judgments)) => ProgressLookup::Known(judgments),
+                    Some(Progress::Missing) => ProgressLookup::Missing,
+                    Some(Progress::Refused(why)) => {
+                        let line = format!(
+                            "bests: the best's progress is refused ({why}); \
+                             the best is paced linearly"
+                        );
+                        eprintln!("{line}");
+                        log::warn!("{line}");
+                        ProgressLookup::Refused(why.to_owned())
+                    }
+                },
+            },
+            Err(e) => {
+                let line = format!("bests: the best cannot be read: {}", Chain(&e));
+                eprintln!("{line}");
+                log::warn!("{line}");
+                PlayBest {
+                    best: BestLookup::Unavailable,
+                    progress: ProgressLookup::Unavailable,
+                }
             }
         }
     }
@@ -781,6 +836,105 @@ mod tests {
         // A read the database refuses leaves the best unavailable.
         common::sql(&fx.db(), "DROP TABLE scores;");
         assert_eq!(sink.best_before(&key, &preset), BestLookup::Unavailable);
+    }
+
+    /// A play's best and its progress, read in one statement through the
+    /// live writer, from plays counted as their results show: the common
+    /// chart's three notes, A (GREAT, PERFECT, PERFECT; EX 5) then D (every
+    /// note PERFECT; EX 6), whose progresses differ at p = 1. A refused
+    /// progress keeps the best and is answered refused with the library's
+    /// reason; the best play's record deleted keeps its progress; a read
+    /// the database refuses leaves both unavailable.
+    #[test]
+    fn the_play_best_is_read_with_its_progress_through_the_writer() {
+        use game::{BestKey, BestLookup, ProgressLookup, ProgressQuery};
+        use rules::Judgment::{Great, Perfect};
+        let fx = common::Fixture::new();
+        let lib = fx.open();
+        fx.pass(&lib);
+        let mut sink = sink(&fx, &lib);
+        // The first tap 30 ms late (GREAT), judged before the long note,
+        // which its end judges.
+        let ms = common::MS;
+        let a = common::record_of(
+            common::CHART,
+            0,
+            vec![
+                common::key(2, 2_000 * ms, 1),
+                common::key(1, 2_030 * ms, 1),
+                common::key(1, 2_080 * ms, 0),
+                common::key(2, 3_010 * ms, 0),
+                common::key(1, 4_000 * ms, 1),
+                common::key(1, 4_050 * ms, 0),
+            ],
+        );
+        let preset = rules::tapestry();
+        let key = BestKey {
+            chart_sha256: a.chart.identity.sha256,
+            preset_sha256: a.preset.sha256,
+        };
+        let query = Some(ProgressQuery {
+            targets: 3,
+            empty_poor_counted: false,
+        });
+        let ex = |read: &game::PlayBest| match &read.best {
+            BestLookup::Known(s) => s.ex,
+            other => panic!("{other:?}"),
+        };
+        // Nothing counted yet.
+        let read = sink.play_best(&key, &preset, query);
+        assert_eq!(
+            (read.best, read.progress),
+            (BestLookup::KnownEmpty, ProgressLookup::Missing)
+        );
+        finish(&mut sink, &a);
+        let read = sink.play_best(&key, &preset, query);
+        assert_eq!(ex(&read), Some(5));
+        assert_eq!(
+            read.progress,
+            ProgressLookup::Known(vec![Great, Perfect, Perfect].into())
+        );
+        // Not asked: the best alone.
+        let read = sink.play_best(&key, &preset, None);
+        assert_eq!(
+            (ex(&read), read.progress),
+            (Some(5), ProgressLookup::Unavailable)
+        );
+        let d = common::played(0);
+        finish(&mut sink, &d);
+        let read = sink.play_best(&key, &preset, query);
+        assert_eq!(ex(&read), Some(6));
+        assert_eq!(
+            read.progress,
+            ProgressLookup::Known(vec![Perfect, Perfect, Perfect].into())
+        );
+        // The records deleted: the bests keep the play's progress.
+        std::fs::remove_dir_all(&fx.records).unwrap();
+        assert_eq!(sink.play_best(&key, &preset, query), read);
+        // A progress naming another play: the best stays, the progress is
+        // refused for that reason.
+        common::sql(
+            &fx.db(),
+            &format!(
+                "UPDATE progress SET play_sha256 = x'{}'",
+                common::hex(&[9; 32])
+            ),
+        );
+        let refused = sink.play_best(&key, &preset, query);
+        assert_eq!(ex(&refused), Some(6));
+        assert_eq!(
+            refused.progress,
+            ProgressLookup::Refused("it is another play's than the breakdown's".to_owned())
+        );
+        // A read the database refuses leaves both unavailable.
+        common::sql(&fx.db(), "DROP TABLE progress;");
+        assert_eq!(
+            sink.play_best(&key, &preset, query),
+            game::PlayBest {
+                best: BestLookup::Unavailable,
+                progress: ProgressLookup::Unavailable,
+            }
+        );
     }
 
     /// A stored score converts by its best: none or one without a best is
