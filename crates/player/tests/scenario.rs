@@ -4436,7 +4436,7 @@ fn a_stalled_loading_capture_delays_ready() {
         "only the loading state's capture stalls: {stdout}"
     );
     // Covered time of the interval into READY, or of a loading span's
-    // longest gap (`longest gap <g> us (<a> to <b>, uncovered <u> us)`).
+    // longest gap (`longest gap <g> us (<a> to <b>, uncovered <u> us[, <c> to <d>])`).
     let into_ready = record
         .iter()
         .filter(|l| l.starts_with("dev: transition loading -> ready:"))

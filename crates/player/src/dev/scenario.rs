@@ -109,7 +109,7 @@
 //! `, instrumented`: the read-back stalled the render thread it times.
 //!
 //! ```text
-//! dev: span loading 1: frames 31, not presented 0, first 2618626 us, last 3848330 us, longest gap 60000 us (2618626 to 2678626, uncovered 60000 us), largest uncovered gap 60000 us of 60000 us (2618626 to 2678626, 2618626 to 2678626)
+//! dev: span loading 1: frames 31, not presented 0, first 2618626 us, last 3848330 us, longest gap 60000 us (2618626 to 2678626, uncovered 60000 us, 2618626 to 2678626), largest uncovered gap 60000 us of 60000 us (2618626 to 2678626, 2618626 to 2678626)
 //! dev: transition loading -> ready: 39972 us, last 3848330 us, first 3888302 us, covered 0 us, uncovered 39972 us (3848330 to 3888302)
 //! dev: mark preparing 8574600 to 13400100 us
 //! dev: transitions: 27 records, lost 0, marks dropped 0, largest uncovered 62548 us (35479870 to 35542418) in transition tail -> practice
