@@ -756,6 +756,9 @@ pub struct DeclSkin {
     /// The live key the renderer set for the next frames
     /// ([`PlaySkin::set_chart_live`]).
     chart_live: Option<skin_model::chart_image::ChartKey>,
+    /// The live key of the BGA array, set before each build
+    /// ([`PlaySkin::set_bga_live`]).
+    bga_live: Option<skin_model::bga::BgaKey>,
     /// The attempt's labels, for a captured list's text (dev-tools).
     #[cfg(feature = "dev-tools")]
     labels: [String; 5],
@@ -778,6 +781,7 @@ impl DeclSkin {
             loading: installation.loading.clone(),
             play: None,
             chart_live: None,
+            bga_live: None,
             #[cfg(feature = "dev-tools")]
             labels: Default::default(),
         }
@@ -888,6 +892,18 @@ impl PlaySkin for DeclSkin {
         }
     }
 
+    /// The prepared attempt's BGA pictures; nothing without one.
+    fn set_bga_images(&mut self, table: std::sync::Arc<skin_model::bga::BgaTable>) {
+        if let Some(play) = &mut self.play {
+            play.set_bga_images(table);
+        }
+    }
+
+    /// Kept for the next builds, which check the BGA table against it.
+    fn set_bga_live(&mut self, live: Option<skin_model::bga::BgaKey>) {
+        self.bga_live = live;
+    }
+
     /// The prepared attempt's images; nothing without one.
     fn set_chart_images(&mut self, table: ChartTable) {
         if let Some(play) = &mut self.play {
@@ -902,6 +918,7 @@ impl PlaySkin for DeclSkin {
             return Ok(());
         };
         play.set_chart_live(self.chart_live);
+        play.set_bga_live(self.bga_live);
         let bundle = &*self.bundle;
         bundle
             .skin
