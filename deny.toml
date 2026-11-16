@@ -15,8 +15,10 @@ all-features = true
 unmaintained = "all"
 unsound = "all"
 yanked = "deny"
-# Reviewed exceptions from the menu text stack (glyphon 0.12, cosmic-text
-# 0.19, render), each with why it does not apply and when it goes.
+# Reviewed exceptions, each with why it does not apply and when it goes: from
+# the menu text stack (glyphon 0.12, cosmic-text 0.19, render), and from the
+# test device's firmware, whose own lockfile CI checks with this file
+# (test-device/firmware/Cargo.lock; docs/setup.md "Dependency Checks").
 ignore = [
     # `lru` 0.16: `LruCache::pop` is not panic-safe when a key's `Drop`
     # panics. lru's only user is glyphon's glyph cache (text_atlas.rs), keyed
@@ -30,6 +32,21 @@ ignore = [
     # runtime font file chosen in the Windows fonts folder reaches it. Remove
     # it when a cosmic-text release (through glyphon) drops ttf-parser 0.25.
     { id = "RUSTSEC-2026-0192", reason = "unmaintained only, parses the Windows font file; remove when a cosmic-text release under glyphon drops ttf-parser 0.25" },
+    # `bare-metal` 0.2 is deprecated and archived, with no advisory against
+    # its code. Only the firmware has it, through cortex-m 0.7 (under
+    # embassy-rp and embassy-executor). Remove it when the firmware's
+    # cortex-m drops bare-metal.
+    { id = "RUSTSEC-2026-0110", reason = "deprecated only, through cortex-m 0.7 in the test device firmware; remove when the firmware's cortex-m drops bare-metal" },
+    # `paste` is unmaintained, with no advisory against its code. A proc
+    # macro, so it runs only at build time: only the firmware has it, through
+    # pio-core under embassy-rp's pio 0.3. Remove it when the firmware's pio
+    # crates drop paste.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained only, a build-time proc macro under embassy-rp's pio 0.3 in the test device firmware; remove when the firmware's pio crates drop paste" },
+    # `proc-macro-error2` is unmaintained, with no advisory against its
+    # code. It runs only at build time: only the firmware has it, through the
+    # pio-proc macro under embassy-rp's pio 0.3. Remove it when the
+    # firmware's pio-proc drops proc-macro-error2.
+    { id = "RUSTSEC-2026-0173", reason = "unmaintained only, build time under pio-proc (embassy-rp's pio 0.3) in the test device firmware; remove when the firmware's pio-proc drops proc-macro-error2" },
 ]
 
 [licenses]

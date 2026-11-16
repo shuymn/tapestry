@@ -34,6 +34,11 @@ const TARGET: [u32; 2] = [1_920, 1_080];
 /// The title's box, y down: 18 pixels tall.
 const TITLE: [i32; 4] = [100, 100, 1_200, 18];
 
+/// The band the animated fixture's moving text crosses, `[x, y, w, h]` in
+/// canvas pixels, y down: at x 100 at the screen's start, at x 1 500
+/// 4 000 ms later.
+const ANIMATED: [i32; 4] = [100, 600, 300, 18];
+
 /// A decision skin with the title (ref 10) and the artist (ref 16) in a
 /// generated Latin face, at em 18.
 fn skin_dir() -> TempDir {
@@ -48,6 +53,35 @@ fn skin_dir() -> TempDir {
             text("f", 18, Value::Ref(16), [100, 600, 1_200, 18]),
         ],
     )
+}
+
+/// [`skin_dir`] whose artist line moves: its destination runs from x 100
+/// to x 1 500 over the screen timer's first 4 000 ms, in [`ANIMATED`]'s
+/// band, so each frame draws it elsewhere while the screen stays one.
+fn animated_skin_dir() -> TempDir {
+    let dir = decision_folder(
+        &[(
+            "ttf.ttf",
+            crate::font_support::build(&crate::font_support::latin("Skin")),
+        )],
+        &[ttf()],
+        &[
+            text("f", 18, Value::Ref(10), TITLE),
+            text("f", 18, Value::Ref(16), ANIMATED),
+        ],
+    );
+    let path = dir.path().join("s.json");
+    let json = std::fs::read_to_string(&path).unwrap();
+    let [x, y, w, h] = ANIMATED;
+    let y = 1_080 - y - h;
+    let fixed = format!(r#"{{"id": "t1", "dst": [{{"x": {x}, "y": {y}, "w": {w}, "h": {h}}}]}}"#);
+    let moving = format!(
+        r#"{{"id": "t1", "dst": [{{"time": 0, "x": {x}, "y": {y}, "w": {w}, "h": {h}}},
+            {{"time": 4000, "x": 1500, "y": {y}, "w": {w}, "h": {h}}}]}}"#
+    );
+    assert_eq!(json.matches(&fixed).count(), 1, "{json}");
+    std::fs::write(&path, json.replace(&fixed, &moving)).unwrap();
+    dir
 }
 
 /// The labels of a chart titled `title`, its artist `AB`.
@@ -151,6 +185,10 @@ enum RowsGate {
     Held,
 }
 
+/// One tracked skin frame: its time, its `screen` timer's start, and the
+/// leftmost lit column in [`ANIMATED`]'s band.
+type Tracked = (TimeUs, Option<TimeUs>, Option<u32>);
+
 /// What the test sets and reads of the [`Recorder`]s a render thread
 /// builds, their devices numbered from 1.
 #[derive(Default)]
@@ -178,6 +216,11 @@ struct Seen {
     removed: AtomicU32,
     /// The next skin frame's lit pixels in the title's box are noted.
     probe: AtomicBool,
+    /// While set, each submitted skin frame is read back and its moving
+    /// text's place noted in `tracked`.
+    track: AtomicBool,
+    /// Each tracked skin frame.
+    tracked: Mutex<Vec<Tracked>>,
     /// A filling slot whose writes were all submitted is not settled
     /// while set, as if their completion had not come.
     hold_settle: AtomicBool,
@@ -439,6 +482,19 @@ impl Screen for Recorder {
                 .filter(|&p| crate::render_common::rgb_at(&pixels, w, p)[0] > 128)
                 .count();
             self.seen.lit.lock().unwrap().push((self.device, lit));
+        }
+        if self.seen.track.load(Ordering::Acquire)
+            && let Some((w, _, pixels)) = self.menu.read_back()
+        {
+            let [_, y, _, bh] = ANIMATED.map(|v| u32::try_from(v).unwrap());
+            let left = (0..w).find(|&px| {
+                (y..y + bh).any(|py| crate::render_common::rgb_at(&pixels, w, (px, py))[0] > 128)
+            });
+            let (now, screen) = match self.seen.drew.lock().unwrap().last() {
+                Some(Drew::Skin { now, screen, .. }) => (*now, *screen),
+                _ => (TimeUs(-1), None),
+            };
+            self.seen.tracked.lock().unwrap().push((now, screen, left));
         }
         Ok(timing)
     }
@@ -2646,12 +2702,16 @@ mod integrated;
 /// frame's fallback to the built-in presentation, and the loading state.
 /// The selection, the decision screen and the loading state are each a
 /// transition; the skin giving way to the fallback is a presentation
-/// change inside the decision screen, not a span of its own.
+/// change inside the decision screen, not a span of its own. The skin's
+/// artist line moves with its timer: frame by frame it is drawn further
+/// right, its frame time advancing and its `screen` timer's start
+/// constant, and the decision screen stays one span whose frames are the
+/// frames presented under its lifetime.
 #[test]
 fn the_render_loop_records_selection_decision_and_its_fallback() {
     use crate::dev::transitions::{Record, Transitions};
     use crate::measure::{Drew, State};
-    let dir = skin_dir();
+    let dir = animated_skin_dir();
     let book = Transitions::with_capacity(64);
     let rig = Rig::recording(&dir, &book);
     rig.prepared("a", "A");
@@ -2659,6 +2719,36 @@ fn the_render_loop_records_selection_decision_and_its_fallback() {
     assert!(wait_until(|| rig.seen.pages(from, "select") >= 2));
     rig.choose("a", "A", 5);
     rig.skin_frames(0, 2);
+    rig.seen.track.store(true, Ordering::Release);
+    assert!(wait_until(|| {
+        rig.seen
+            .tracked
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, _, left)| left.is_some())
+            .count()
+            >= 4
+    }));
+    rig.seen.track.store(false, Ordering::Release);
+    let tracked: Vec<_> = rig
+        .seen
+        .tracked
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|&(now, screen, left)| left.map(|x| (now, screen, x)))
+        .collect();
+    let (first, last) = (tracked[0], tracked[tracked.len() - 1]);
+    assert!(
+        tracked.iter().all(|t| t.1.is_some() && t.1 == first.1),
+        "one screen: {tracked:?}"
+    );
+    assert!(
+        tracked.windows(2).all(|w| w[0].0 < w[1].0),
+        "its time advances: {tracked:?}"
+    );
+    assert!(last.2 > first.2, "the artist line moved right: {tracked:?}");
     rig.seen.refuse_frame.store(true, Ordering::Release);
     assert!(wait_until(|| {
         rig.decided
@@ -2730,4 +2820,22 @@ fn the_render_loop_records_selection_decision_and_its_fallback() {
     });
     assert_eq!(into_loading, loading_first, "{records:?}");
     assert!(into_loading.is_some());
+    // The moving skin and its fallback are one span: every frame presented
+    // under the decision screen's lifetime, no more.
+    let spans: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Span(s) if s.stage.state == State::Decision => Some(s),
+            _ => None,
+        })
+        .collect();
+    let [span] = spans[..] else {
+        panic!("one decision span: {records:?}");
+    };
+    assert_eq!(span.stage.lifetime, 5);
+    assert_eq!(
+        span.frames,
+        u32::try_from(rig.decided.stamps_of(5).len()).unwrap(),
+        "{records:?}"
+    );
 }

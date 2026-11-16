@@ -31,6 +31,20 @@
           "clippy"
         ];
       };
+      # The test device's firmware target (docs/test-device.md "Building"),
+      # which mise.lock's Rust entry must also install.
+      firmwareTarget = "thumbv8m.main-none-eabihf";
+      firmwareToolchain =
+        assert pkgs.lib.assertMsg (builtins.elem firmwareTarget (
+          pkgs.lib.splitString "," (rust.options.targets or "")
+        )) "mise.lock's Rust targets must include ${firmwareTarget}";
+        pkgs.rust-bin.stable.${rust.version}.minimal.override {
+          extensions = [
+            "rustfmt"
+            "clippy"
+          ];
+          targets = [ firmwareTarget ];
+        };
       # The nightly of the `fuzz` shell (cargo-fuzz needs nightly for the
       # sanitizers). Bumped by hand, for example when stable passes it; the
       # date must exist in the locked rust-overlay.
@@ -66,6 +80,18 @@
           shellHook = rootHash + ''
             export CARGO_TARGET_DIR=${cacheDir "fuzz-target"}
             export TAPESTRY_FUZZ_CORPUS=${cacheDir "fuzz-corpus"}
+          '';
+        };
+        # The test device's firmware (docs/test-device.md "Building"): the
+        # toolchain with the RP2350 target, and picotool to check its UF2.
+        test-device = pkgs.mkShell {
+          packages = [
+            firmwareToolchain
+            pkgs.picotool
+            pkgs.git
+          ];
+          shellHook = rootHash + ''
+            export CARGO_TARGET_DIR=${cacheDir "test-device-target"}
           '';
         };
       };

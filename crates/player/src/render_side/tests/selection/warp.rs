@@ -1025,3 +1025,138 @@ fn a_selections_updates_keep_its_whole_frames() {
     assert!(wait_until(|| link.frames_probe().select.0.is_none()));
     link.exit();
 }
+
+/// What a recording sink saw of each frame: its stage, whether it was
+/// presented, and the moving image's left edge (`MOVING`'s size).
+type Moving = Arc<Mutex<Vec<(crate::measure::Stage, bool, Option<f32>)>>>;
+
+/// The moving image's width and height in the selection fixture.
+const MOVING: [f32; 2] = [37.0, 23.0];
+
+/// A scenario's recording sink with the frames it saw noted beside it.
+struct Recording {
+    sink: crate::dev::scenario::ScenarioFrames,
+    seen: Moving,
+}
+
+impl FrameSink for Recording {
+    fn frame(&mut self, screen: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
+        self.sink.frame(screen, drawn);
+        let left = screen.selection_quads().and_then(|qs| {
+            qs.iter()
+                .find(|q| {
+                    (q.rect[2] - MOVING[0]).abs() < 0.5 && (q.rect[3] - MOVING[1]).abs() < 0.5
+                })
+                .map(|q| q.rect[0])
+        });
+        self.seen
+            .lock()
+            .unwrap()
+            .push((drawn.stage, drawn.timing.presented, left));
+    }
+}
+
+/// A selection skin's timers advancing and a new revision of its update
+/// keep its span (design.md "Shortening Launch-Based Checks", transition
+/// record): the fixture's image moves with the screen's timer, frame by
+/// frame further right, and a second update of the same lifetime comes
+/// in between; the record holds one span of that lifetime whose frames
+/// are the frames presented under it, and no record between them.
+#[test]
+fn a_selection_skin_s_timers_and_updates_keep_its_span() {
+    use crate::dev::transitions::{Record, Transitions};
+    use crate::measure::State;
+    let dir = crate::selection_skin::lua_fixture();
+    let lua = std::fs::read_to_string(dir.path().join("s.luaskin")).unwrap();
+    let moving = format!(
+        "skin.destination = {{\n  {{ id = \"b\", dst = {{ {{ time = 0, x = 100, y = 500, w = {w}, h = {h} }}, \
+         {{ time = 4000, x = 1500, y = 500, w = {w}, h = {h} }} }} }},",
+        w = MOVING[0],
+        h = MOVING[1]
+    );
+    assert_eq!(lua.matches("skin.destination = {").count(), 1);
+    std::fs::write(
+        dir.path().join("moving.luaskin"),
+        lua.replace("skin.destination = {", &moving),
+    )
+    .unwrap();
+    let limits = crate::render_common::offscreen(1_920, 1_080);
+    let skin = crate::selection_skin::fixture_bundle(&limits, dir.path(), "moving.luaskin");
+    let book = Transitions::with_capacity(64);
+    let seen: Moving = Arc::default();
+    let sink = Recording {
+        sink: crate::dev::scenario::ScenarioFrames::recording(
+            crate::dev::scenario::Captures::of(Vec::new()),
+            book.clone(),
+        ),
+        seen: Arc::clone(&seen),
+    };
+    let bad_month = Arc::new(AtomicBool::new(false));
+    let (link, _, _) = lossy_spawn(None, &bad_month, Box::new(sink));
+    assert_eq!(
+        link.select(ScreenKind::Selection, Some(skin))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    // The screen's timer from the clock's start, so the image moves at once.
+    let entered = |revision| {
+        let mut u = update_of(1, revision, listed(SelectionPlace::All, ""));
+        u.events.entered = bms_model::TimeUs(0);
+        u.events.changed = bms_model::TimeUs(0);
+        u
+    };
+    let moved = |n: usize| {
+        wait_until(|| {
+            seen.lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, presented, left)| *presented && left.is_some())
+                .count()
+                >= n
+        })
+    };
+    link.enter_selection(1);
+    link.show_selection(entered(1));
+    assert!(moved(3));
+    link.show_selection(entered(2));
+    assert!(moved(6));
+    link.exit();
+    let seen = seen.lock().unwrap().clone();
+    let lefts: Vec<f32> = seen
+        .iter()
+        .filter_map(|(_, p, l)| l.filter(|_| *p))
+        .collect();
+    assert!(
+        lefts.windows(2).all(|w| w[0] <= w[1]) && lefts.last() > lefts.first(),
+        "the image moves right: {lefts:?}"
+    );
+    let presented = seen
+        .iter()
+        .filter(|(s, p, _)| *p && s.state == State::Selection && s.lifetime == 1)
+        .count();
+    let records = book.records();
+    let spans: Vec<_> = records
+        .iter()
+        .filter_map(|r| match r {
+            Record::Span(s) if s.stage.state == State::Selection && s.stage.lifetime == 1 => {
+                Some(s)
+            }
+            _ => None,
+        })
+        .collect();
+    let [span] = spans[..] else {
+        panic!("one span of selection 1: {records:?}");
+    };
+    assert_eq!(
+        span.frames,
+        u32::try_from(presented).unwrap(),
+        "{records:?}"
+    );
+    assert!(
+        !records.iter().any(|r| matches!(r, Record::Edge(e)
+            if e.from.state == State::Selection && e.from.lifetime == 1
+                && e.to.state == State::Selection && e.to.lifetime == 1)),
+        "no record between its frames: {records:?}"
+    );
+}
