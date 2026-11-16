@@ -140,6 +140,9 @@ pub struct Look {
     /// and over [`NO_BACK_MARK`] while `!chart.backbmp`. Its atlas keeps
     /// a chart layer.
     pub chart: bool,
+    /// The chart's BGA filling [`BGA_RECT`] (stretch 0) on the untimed
+    /// `screen` timer, over the image.
+    pub bga: bool,
 }
 
 /// The images of the full lane fixture's categories, each its own texel
@@ -294,6 +297,8 @@ pub const CHART_BACK: [i32; 4] = [1_300, 800, 100, 100];
 pub const BACK_MARK: [i32; 4] = [1_500, 800, 100, 100];
 /// Where its mark draws while it is not, through a negation (194).
 pub const NO_BACK_MARK: [i32; 4] = [1_700, 800, 100, 100];
+/// Where [`Look::bga`]'s BGA draws: within the image's left half.
+pub const BGA_RECT: [i32; 4] = [100, 100, 400, 400];
 
 impl Look {
     /// `rgba` over the left half, under a clip of the left half.
@@ -315,6 +320,7 @@ impl Look {
             progress: false,
             full_lanes: false,
             chart: false,
+            bga: false,
         }
     }
 }
@@ -470,6 +476,15 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
                 ..image(rect, false)
             }));
         }
+    }
+    if look.bga {
+        elements.push(ElementDef {
+            source: Source::Bga {
+                stretch: skin_model::bga::BgaStretch::of(0),
+            },
+            timer: TimerRef::Builtin(skin_model::timer::SCREEN),
+            ..image(BGA_RECT, false)
+        });
     }
     if look.finish {
         elements.push(ElementDef {
