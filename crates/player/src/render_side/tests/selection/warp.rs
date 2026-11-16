@@ -1150,7 +1150,7 @@ fn a_selection_skin_s_timers_and_updates_keep_its_span() {
     };
     assert_eq!(
         span.frames,
-        u64::try_from(presented).unwrap(),
+        u32::try_from(presented).unwrap(),
         "{records:?}"
     );
     assert!(

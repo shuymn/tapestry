@@ -2832,7 +2832,7 @@ fn the_render_loop_records_selection_decision_and_its_fallback() {
     assert_eq!(span.stage.lifetime, 5);
     assert_eq!(
         span.frames,
-        u64::try_from(rig.decided.stamps_of(5).len()).unwrap(),
+        u32::try_from(rig.decided.stamps_of(5).len()).unwrap(),
         "{records:?}"
     );
 }
