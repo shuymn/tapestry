@@ -582,19 +582,37 @@ pub struct BgaKey {
 pub struct BgaTable {
     entries: Vec<BgaEntry>,
     key: Option<BgaKey>,
+    published: bool,
 }
 
 impl BgaTable {
-    /// No entry, of no array: every definition absent.
+    /// Nothing published: no entry, of no array. A frame shows the
+    /// placeholder for it ([`published`](Self::published)).
     pub const ABSENT: Self = Self {
         entries: Vec::new(),
         key: None,
+        published: false,
     };
 
-    /// `entries` by definition, of no array until [`keyed`](Self::keyed).
+    /// `entries` by definition, published, of no array until
+    /// [`keyed`](Self::keyed): with none, every picture is absent.
     #[must_use]
     pub fn new(entries: Vec<BgaEntry>) -> Self {
-        Self { entries, key: None }
+        Self {
+            entries,
+            key: None,
+            published: true,
+        }
+    }
+
+    /// Whether it is a published table ([`new`](Self::new)) rather than
+    /// [`ABSENT`](Self::ABSENT), which stands in until one is: a frame
+    /// draws a published table of no array as every picture absent,
+    /// channel by channel, and shows the placeholder for anything else it
+    /// cannot draw.
+    #[must_use]
+    pub const fn published(&self) -> bool {
+        self.published
     }
 
     /// The same table, describing the array `key` names.

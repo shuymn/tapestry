@@ -1250,16 +1250,23 @@ impl Play {
         self.bga_live = live;
     }
 
-    /// What the last build's BGA destinations show, and the table they
-    /// draw from when it describes the live array, else none.
+    /// What the last build's BGA destinations show and the table they draw
+    /// from: the table when it describes the live array; a table published
+    /// with no array as every picture absent, channel by channel (the
+    /// placeholder on the base, nothing on the layer or in the miss
+    /// window); and the placeholder alone while no table for the live
+    /// array is published (none yet, or one whose array is no longer in
+    /// use), the miss window's included.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub(crate) fn bga_frame(&self) -> (bga::Show, &crate::bga::BgaTable, crate::bga::NullMedia) {
-        let table = if self.bga_table.drawable(self.bga_live) {
-            &*self.bga_table
+        let table = &*self.bga_table;
+        if table.drawable(self.bga_live) {
+            (self.bga_show, table, self.media)
+        } else if table.published() && table.key().is_none() {
+            (self.bga_show, &crate::bga::NO_TABLE, self.media)
         } else {
-            &crate::bga::NO_TABLE
-        };
-        (self.bga_show, table, self.media)
+            (bga::Show::Placeholder, &crate::bga::NO_TABLE, self.media)
+        }
     }
 
     /// The chart images its frames draw: the table set for it when it

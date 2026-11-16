@@ -19,8 +19,8 @@ pub const MISS_US: i64 = 500_000;
 /// What a frame's BGA destinations show.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Show {
-    /// The black placeholder: before chart time 0, or for a chart with no
-    /// BGA.
+    /// The black placeholder: before chart time 0, for a chart with no
+    /// BGA, or while no table for the live array is published.
     Placeholder,
     /// The miss window: the poor sequence's frame, `None` for one that
     /// names no picture (nothing drawn).
