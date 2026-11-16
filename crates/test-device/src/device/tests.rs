@@ -7,7 +7,9 @@
 //! leaves a report the host accepted AVAILABLE. The writers follow the
 //! firmware's loops: wait for the next report, write it as embassy-rp does
 //! (the opposite PID of the register, then AVAILABLE), then wait for its
-//! completion.
+//! completion. The link's bytes go through [`Link`] and its control
+//! requests through [`State::cdc_request`], at their times, as the
+//! firmware's USB handler takes them.
 
 use std::cell::{Cell, RefCell};
 
@@ -116,10 +118,25 @@ struct Accepted {
     data: Vec<u8>,
 }
 
+/// What the bus brings besides the link's bytes.
+#[derive(Clone, Copy, Debug)]
+enum Event {
+    /// `SET_CONTROL_LINE_STATE` with DTR set or clear (RTS set).
+    Dtr(bool),
+    /// `SET_LINE_CODING` at this rate, 8N1.
+    Baud(u32),
+    /// A bus reset.
+    Reset,
+    /// The link's reader fails: a disconnect.
+    Lost,
+}
+
 struct World {
     hw: Sim,
     state: Box<State>,
-    framer: Framer,
+    link: Link,
+    /// Bus events due at their times.
+    events: Vec<(u64, Event)>,
     /// Each endpoint's writer waits for a completion.
     writing: [bool; 2],
     /// The host's first poll and its interval.
@@ -150,7 +167,8 @@ impl World {
         let mut w = Self {
             hw: Sim::new(),
             state,
-            framer: Framer::new(),
+            link: Link::new(),
+            events: Vec::new(),
             writing: [false; 2],
             phase,
             interval: u64::from(rate.interval_us()),
@@ -198,6 +216,25 @@ impl World {
         }
     }
 
+    /// A bus event now, as the firmware's USB handler and reader take it.
+    fn event(&mut self, event: Event) {
+        match event {
+            Event::Dtr(on) => {
+                let value = u16::from(on) | 2;
+                self.state
+                    .cdc_request(&self.hw, SET_CONTROL_LINE_STATE, value, &[]);
+            }
+            Event::Baud(rate) => {
+                let mut coding = [0, 0, 0, 0, 0, 0, 8];
+                coding[..4].copy_from_slice(&rate.to_le_bytes());
+                self.state
+                    .cdc_request(&self.hw, SET_LINE_CODING, 0, &coding);
+            }
+            Event::Reset => self.state.bus_reset(&self.hw),
+            Event::Lost => self.state.link_lost(),
+        }
+    }
+
     fn write(&mut self, ep: Ep) {
         let i = index(ep);
         if self.writing[i] {
@@ -236,6 +273,10 @@ impl World {
 
     fn step(&mut self) {
         let t = self.now();
+        while let Some(i) = self.events.iter().position(|&(at, _)| at <= t) {
+            let (_, event) = self.events.remove(i);
+            self.event(event);
+        }
         if t >= self.phase && (t - self.phase).is_multiple_of(self.interval) {
             self.poll(Ep::Keyboard);
             self.poll(Ep::Pad);
@@ -262,21 +303,19 @@ impl World {
         }
     }
 
-    /// Bytes from the link, in one packet, with no step between the
-    /// commands they hold: the answers.
-    fn receive(&mut self, bytes: &[u8]) -> Vec<String> {
+    /// Bytes from the link, in one packet, through the receive loop: no
+    /// step between the commands they hold, except while `flush` waits.
+    /// The answers.
+    fn receive(&mut self, packet: &[u8]) -> Vec<String> {
         let mut answers = Vec::new();
-        for &b in bytes {
-            let outcome = match self.framer.push(b) {
-                Some(frame) => self.state.frame(&self.hw, frame),
-                None => continue,
-            };
+        let mut at = 0;
+        while let Some(outcome) = self.link.next(&mut self.state, &self.hw, packet, &mut at) {
             match outcome {
-                Some(Outcome::Answer(a)) => answers.push(a.to_string()),
-                Some(Outcome::Hello) => {
+                Outcome::Answer(a) => answers.push(a.to_string()),
+                Outcome::Hello => {
                     answers.push(Answer::Hello(self.state.hello("sim")).to_string());
                 }
-                Some(Outcome::Flush) => {
+                Outcome::Flush => {
                     let deadline = self.now() + 2 * self.interval + 10_000;
                     while !self.state.flush_poll(&self.hw) && self.now() < deadline {
                         self.step();
@@ -284,8 +323,7 @@ impl World {
                     self.state.flush_end(&self.hw);
                     self.drain();
                 }
-                Some(other) => answers.push(format!("{other:?}")),
-                None => answers.push("(dropped)".into()),
+                other => answers.push(format!("{other:?}")),
             }
         }
         answers
@@ -493,24 +531,61 @@ fn a_malformed_line_releases_held_input() {
     }
 }
 
-/// A partial line does not survive the session that sent it: its rest,
-/// arriving in the next session, is not a command.
+/// A partial line does not survive the link connection that sent it: its
+/// rest, arriving in the next connection, is not a command, whether the
+/// connection ended with DTR dropped, a bus reset or a failed read.
 #[test]
-fn a_partial_line_does_not_survive_its_session() {
-    for closed in [false, true] {
+fn a_partial_line_does_not_survive_its_connection() {
+    for end in [Event::Dtr(false), Event::Reset, Event::Lost] {
         let mut w = World::new(Rate::Hz1000, 300);
         assert_eq!(w.receive(b"detach "), Vec::<String>::new());
-        let mut framer = std::mem::take(&mut w.framer);
-        w.state.session_end(&w.hw, &mut framer, closed);
-        w.framer = framer;
-        assert_eq!(w.receive(b"500\n"), ["err syntax"], "closed {closed}");
+        w.event(end);
+        w.event(Event::Dtr(true));
+        assert_eq!(w.receive(b"500\n"), ["err syntax"], "{end:?}");
     }
-    // Within one session a line spans packets.
+    // Within one connection a line spans packets.
     let mut w = World::new(Rate::Hz1000, 300);
     assert_eq!(w.receive(b"lea"), Vec::<String>::new());
     assert_eq!(w.receive(b"se 10"), Vec::<String>::new());
     let answers = w.receive(b"00\n");
     assert!(answers[0].starts_with("lease 1 "), "{answers:?}");
+}
+
+/// A connection that ends while a command's outcome is awaited takes the
+/// rest of its packet with it: the port closed and opened again while
+/// `flush` waits on a pending report leaves no `detach` to complete.
+#[test]
+fn a_connection_that_ends_during_a_command_drops_the_rest_of_its_packet() {
+    let mut w = World::new(Rate::Hz125, 3_000);
+    w.lease();
+    assert_eq!(w.send("key 115 1"), "ok");
+    w.run_for(1_000);
+    assert!(w.hw.buffer(Ep::Keyboard).available, "flush waits");
+    let t = w.now();
+    w.events.push((t + 1_000, Event::Dtr(false)));
+    w.events.push((t + 2_000, Event::Dtr(true)));
+    assert_eq!(w.receive(b"flush\ndetach "), Vec::<String>::new());
+    assert!(w.events.is_empty() && w.now() > t + 2_000);
+    assert_eq!(w.receive(b"500\n"), ["err syntax"]);
+}
+
+/// A line coding of 1200 baud asks for BOOTSEL as it arrives, whatever the
+/// parser holds; another rate does not, nor 1200 under `baud-off`.
+#[test]
+fn a_1200_baud_line_coding_asks_for_bootsel() {
+    let mut w = World::new(Rate::Hz1000, 300);
+    w.event(Event::Baud(115_200));
+    assert!(!w.state.bootsel_due());
+    assert_eq!(w.receive(b"boot"), Vec::<String>::new());
+    w.event(Event::Baud(1200));
+    assert!(w.state.bootsel_due());
+    #[cfg(feature = "debug-faults")]
+    {
+        let mut w = World::new(Rate::Hz1000, 300);
+        w.state.set_fault(&w.hw, Fault::BaudOff, 0);
+        w.event(Event::Baud(1200));
+        assert!(!w.state.bootsel_due());
+    }
 }
 
 /// An abort the controller never acknowledges touches nothing and claims

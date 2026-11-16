@@ -32,6 +32,11 @@ pub const RECOVERY_US: u64 = 20_000;
 /// may have reached the host with only its ACK lost, so the host expects
 /// either DATA PID; one of two reports in a row carries the one it expects.
 pub const OWED_AFTER_REVOCATION: u8 = 2;
+/// The CDC requests the link's control interface takes ([`State::cdc_request`]).
+pub const SET_LINE_CODING: u8 = 0x20;
+pub const SET_CONTROL_LINE_STATE: u8 = 0x22;
+/// The line coding that asks for BOOTSEL.
+pub const BOOTSEL_BAUD: u32 = 1200;
 
 /// An IN endpoint's buffer control in the controller's DPRAM.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -253,19 +258,12 @@ pub enum Outcome {
     Fault { fault: Fault, arg: i64 },
 }
 
-/// The control link's line framing: bytes in, lines out. Its state belongs
-/// to one session of the link and is cleared when the session ends.
+/// The control link's line framing: bytes in, lines out.
 #[derive(Debug)]
-pub struct Framer {
+struct Framer {
     buf: [u8; MAX_LINE],
     len: usize,
     overlong: bool,
-}
-
-impl Default for Framer {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 /// One frame of the link.
@@ -279,8 +277,7 @@ pub enum Frame<'a> {
 }
 
 impl Framer {
-    #[must_use]
-    pub const fn new() -> Self {
+    const fn new() -> Self {
         Self {
             buf: [0; MAX_LINE],
             len: 0,
@@ -290,7 +287,7 @@ impl Framer {
 
     /// Takes one byte: a frame at its line's end (empty lines give none),
     /// or [`Frame::Overlong`] once per line past [`MAX_LINE`].
-    pub fn push(&mut self, b: u8) -> Option<Frame<'_>> {
+    fn push(&mut self, b: u8) -> Option<Frame<'_>> {
         if b == b'\n' || b == b'\r' {
             let was_overlong = core::mem::take(&mut self.overlong);
             let n = core::mem::take(&mut self.len);
@@ -316,11 +313,69 @@ impl Framer {
         }
     }
 
-    /// Forgets a partial line: the session that sent it ended (DTR
-    /// dropped, the port closed, a read error or a disconnect).
-    pub fn reset(&mut self) {
+    /// Forgets a partial line.
+    const fn reset(&mut self) {
         self.len = 0;
         self.overlong = false;
+    }
+}
+
+/// The control link's receive side. A command acts only within the link
+/// connection that sent it: when the connection ends ([`State::session`]
+/// changes), the partial line goes, and so does the rest of a packet the
+/// device was still running when it ended. A packet counts as the
+/// connection in which the device reads it.
+#[derive(Debug)]
+pub struct Link {
+    framer: Framer,
+    session: u32,
+}
+
+impl Default for Link {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Link {
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            framer: Framer::new(),
+            session: 0,
+        }
+    }
+
+    /// The next outcome of `packet` from `*at` on, advancing `*at` past
+    /// the bytes taken; `None` when the packet is done. Call it with `*at`
+    /// 0 for each packet read, and again after finishing each outcome.
+    pub fn next(
+        &mut self,
+        state: &mut State,
+        hw: &impl Hardware,
+        packet: &[u8],
+        at: &mut usize,
+    ) -> Option<Outcome> {
+        let session = state.session();
+        if session != self.session {
+            self.framer.reset();
+            self.session = session;
+            if *at > 0 {
+                // Read in the connection that ended.
+                *at = packet.len();
+                return None;
+            }
+        }
+        while let Some(&b) = packet.get(*at) {
+            *at += 1;
+            let Some(frame) = self.framer.push(b) else {
+                continue;
+            };
+            if let Some(outcome) = state.frame(hw, frame) {
+                return Some(outcome);
+            }
+        }
+        None
     }
 }
 
@@ -347,6 +402,10 @@ pub struct State {
     /// When an abort went unacknowledged (µs since boot): nothing is sent
     /// any more and the device reboots [`RECOVERY_US`] later.
     recovery: Option<u64>,
+    /// The link's connection, counted up at each end of one.
+    session: u32,
+    /// A line coding of [`BOOTSEL_BAUD`] arrived.
+    bootsel: bool,
     #[cfg(feature = "debug-faults")]
     faults: Faults,
 }
@@ -381,6 +440,8 @@ impl State {
             counter_cleared: false,
             trial: None,
             recovery: None,
+            session: 0,
+            bootsel: false,
             #[cfg(feature = "debug-faults")]
             faults: Faults::new(),
         }
@@ -916,15 +977,49 @@ impl State {
         })
     }
 
-    /// The link's session ended: its partial line is dropped, so no command
-    /// spans two sessions. `closed`: the host dropped DTR or closed the
-    /// port, which ends the lease; a read error or a disconnect leaves that
-    /// to the bus events.
-    pub fn session_end(&mut self, hw: &impl Hardware, framer: &mut Framer, closed: bool) {
-        framer.reset();
-        if closed {
-            self.disarm(hw, Reason::Closed);
+    /// The link's connection, which [`Link`] keeps its lines within.
+    #[must_use]
+    pub const fn session(&self) -> u32 {
+        self.session
+    }
+
+    /// The link's connection ended without a request saying so: a read
+    /// error or a disconnect. The bus events disarm.
+    pub const fn link_lost(&mut self) {
+        self.session = self.session.wrapping_add(1);
+    }
+
+    /// The bus reset: the link's connection ends and the lease with it.
+    pub fn bus_reset(&mut self, hw: &impl Hardware) {
+        self.link_lost();
+        self.disarm(hw, Reason::Reset);
+    }
+
+    /// A class request to the link's control interface, taken as the
+    /// request arrives, whatever the link's reader is waiting on: DTR
+    /// dropped ends the connection and the lease, and a line coding of
+    /// [`BOOTSEL_BAUD`] asks for BOOTSEL ([`State::bootsel_due`]),
+    /// independent of the command parser.
+    pub fn cdc_request(&mut self, hw: &impl Hardware, request: u8, value: u16, data: &[u8]) {
+        match request {
+            SET_CONTROL_LINE_STATE if value & 1 == 0 => {
+                self.link_lost();
+                self.disarm(hw, Reason::Closed);
+            }
+            SET_LINE_CODING => {
+                let rate = data.first_chunk::<4>().map(|b| u32::from_le_bytes(*b));
+                if rate == Some(BOOTSEL_BAUD) && self.fault(hw, Fault::BaudOff).is_none() {
+                    self.bootsel = true;
+                }
+            }
+            _ => {}
         }
+    }
+
+    /// Whether to reboot into BOOTSEL now: a line coding asked for it.
+    #[must_use]
+    pub const fn bootsel_due(&self) -> bool {
+        self.bootsel
     }
 
     /// Whether held input and patterns wait: a pattern or a trial plays.

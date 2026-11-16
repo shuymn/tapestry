@@ -27,16 +27,15 @@ use embassy_rp::watchdog::{ResetReason, Watchdog};
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
-use embassy_usb::class::cdc_acm::{
-    CdcAcmClass, ControlChanged, Receiver, Sender, State as CdcState,
-};
+use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State as CdcState};
 use embassy_usb::class::hid::{
     Config as HidConfig, HidBootProtocol, HidSubclass, HidWriter, State as HidState,
 };
+use embassy_usb::control::{OutResponse, Recipient, Request, RequestType};
 use embassy_usb::{Builder, Config, Handler};
 use static_cell::ConstStaticCell;
 use test_device::boot::{self, Action, Cause};
-use test_device::device::{Framer, Hardware as _, Kind, Next, Outcome, State};
+use test_device::device::{Hardware as _, Kind, Link, Next, Outcome, State};
 use test_device::faults::Fault;
 use test_device::lease::Reason;
 use test_device::mode::Mode;
@@ -62,6 +61,9 @@ const FEED_EVERY: Duration = Duration::from_millis(250);
 const LEASE_TICK: Duration = Duration::from_micros(500);
 /// The longest `detach`.
 const MAX_DETACH_MS: u32 = 10_000;
+/// The link's CDC communication interface, after the keyboard's (0) and
+/// the pad's (1).
+const LINK_INTERFACE: u16 = 2;
 
 type Line = heapless::String<{ protocol::MAX_LINE }>;
 type Answers = Channel<NoopRawMutex, Line, 8>;
@@ -155,7 +157,7 @@ async fn main(_spawner: Spawner) {
     let mut pad =
         HidWriter::<_, PAD_REPORT>::new(&mut builder, &mut pad_state, hid_config(PAD_DESCRIPTOR));
     let cdc = CdcAcmClass::new(&mut builder, &mut cdc_state, 64);
-    let (mut tx, mut rx, control) = cdc.split_with_control();
+    let (mut tx, mut rx) = cdc.split();
     let mut usb = builder.build();
     let answers = Answers::new();
 
@@ -186,7 +188,7 @@ async fn main(_spawner: Spawner) {
             }
         }
     };
-    let link_in = receive(&mut rx, &control, state, &answers, &watchdog);
+    let link_in = receive(&mut rx, state, &answers, &watchdog);
     let link_out = send(&mut tx, state, &answers);
     let lease_timer = async {
         loop {
@@ -201,6 +203,9 @@ async fn main(_spawner: Spawner) {
                 // An abort went unacknowledged: leaving the bus by a reboot
                 // ends every input the host holds from this device.
                 watchdog.borrow_mut().trigger_reset();
+            }
+            if s.bootsel_due() {
+                enter_bootsel(&mut watchdog.borrow_mut());
             }
         }
     };
@@ -221,15 +226,28 @@ async fn main(_spawner: Spawner) {
     .await;
 }
 
-/// The bus events that disarm, and the configuration that identifies the
-/// endpoints.
+/// The bus events that disarm, the configuration that identifies the
+/// endpoints, and the link's control requests, taken as they arrive
+/// whatever the link's reader waits on. Registered before the classes, it
+/// sees each request first and leaves it to the CDC class.
 struct Bus {
     state: &'static RefCell<State>,
 }
 
 impl Handler for Bus {
     fn reset(&mut self) {
-        self.state.borrow_mut().disarm(&Pico, Reason::Reset);
+        self.state.borrow_mut().bus_reset(&Pico);
+    }
+
+    fn control_out(&mut self, req: Request, data: &[u8]) -> Option<OutResponse> {
+        if (req.request_type, req.recipient, req.index)
+            == (RequestType::Class, Recipient::Interface, LINK_INTERFACE)
+        {
+            self.state
+                .borrow_mut()
+                .cdc_request(&Pico, req.request, req.value, data);
+        }
+        None
     }
 
     fn suspended(&mut self, suspended: bool) {
@@ -275,44 +293,32 @@ fn answer(answers: &Answers, a: &Answer<'_>) {
     }
 }
 
-/// Reads command lines; also watches the link's control lines: a line
-/// coding of 1200 baud reboots into BOOTSEL (whatever the parser does), and
-/// DTR dropped disarms. Each session's end (DTR dropped, a read error or a
-/// disconnect) drops its partial line.
+/// Reads command lines in packets through [`Link`], which keeps them
+/// within one connection of the link; [`Bus`] takes the control requests
+/// that end one. A failed read (a disconnect) ends one too.
 async fn receive<'d, D: embassy_usb::driver::Driver<'d>>(
     rx: &mut Receiver<'d, D>,
-    control: &ControlChanged<'d>,
     state: &RefCell<State>,
     answers: &Answers,
     watchdog: &RefCell<Watchdog>,
 ) {
     let mut packet = [0_u8; 64];
-    let mut framer = Framer::new();
+    let mut link = Link::new();
     loop {
-        match select(rx.read_packet(&mut packet), control.control_changed()).await {
-            Either::First(Ok(n)) => {
-                for &b in packet.get(..n).unwrap_or(&[]) {
-                    let outcome = match framer.push(b) {
-                        Some(frame) => state.borrow_mut().frame(&Pico, frame),
-                        None => continue,
-                    };
-                    if let Some(outcome) = outcome {
-                        run(outcome, state, answers, watchdog).await;
-                    }
+        match rx.read_packet(&mut packet).await {
+            Ok(n) => {
+                let bytes = packet.get(..n).unwrap_or(&[]);
+                let mut at = 0;
+                loop {
+                    // Not borrowed across the outcome's await.
+                    let outcome = link.next(&mut state.borrow_mut(), &Pico, bytes, &mut at);
+                    let Some(outcome) = outcome else { break };
+                    run(outcome, state, answers, watchdog).await;
                 }
             }
-            Either::First(Err(_)) => {
-                state.borrow_mut().session_end(&Pico, &mut framer, false);
+            Err(_) => {
+                state.borrow_mut().link_lost();
                 rx.wait_connection().await;
-            }
-            Either::Second(()) => {
-                let baud_off = state.borrow().fault(&Pico, Fault::BaudOff).is_some();
-                if rx.line_coding().data_rate() == 1200 && !baud_off {
-                    enter_bootsel(&mut watchdog.borrow_mut());
-                }
-                if !control.dtr() {
-                    state.borrow_mut().session_end(&Pico, &mut framer, true);
-                }
             }
         }
     }

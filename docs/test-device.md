@@ -73,7 +73,7 @@ Sequence numbers are 32-bit per endpoint; times are 64-bit µs. Records go throu
 
 ## Commands
 
-One command per line; one answer per line (`ok`, `err <reason>`, or the answers below). A line that is not a command, or not UTF-8, is answered `err syntax`, and one longer than 160 bytes `err overlong` (once, at its first byte past the limit; the rest of the line is dropped): either ends the lease (Lease and Disarm). A partial line belongs to its session of the link and is dropped when the session ends (DTR dropped, the port closed, a read error or a disconnect), so no command spans two sessions. A `hello` of another protocol version is refused by the host.
+One command per line; one answer per line (`ok`, `err <reason>`, or the answers below). A line that is not a command, or not UTF-8, is answered `err syntax`, and one longer than 160 bytes `err overlong` (once, at its first byte past the limit; the rest of the line is dropped): either ends the lease (Lease and Disarm). A command acts only within the link connection that sent it. The connection ends with DTR dropped (the port closed), a bus reset or a failed read; the device takes DTR and the line coding from the control requests as they arrive, whatever the link's reader is waiting on. At the end the partial line is dropped, and so is the rest of a packet whose earlier command the device was still running (a `flush` waiting, say), so no command completes in the next connection. A packet counts as the connection in which the device reads it. A `hello` of another protocol version is refused by the host.
 
 | Command | Effect |
 |---|---|
@@ -112,7 +112,7 @@ Every held input and every pattern belongs to a lease. A timer of its own checks
 Each path works without the button, and each is tested on its own (F5):
 
 - `bootsel` calls the boot ROM's `reboot` into BOOTSEL.
-- A line coding of 1200 baud does the same, handled where the link's control lines are watched, independent of the command parser.
+- A line coding of 1200 baud does the same: the USB handler takes it as the request arrives, independent of the command parser and of what the link's reader waits on, and the lease's timer starts the reboot at its next tick.
 - A watchdog of 2 s, fed by a future of its own in the one executor task, resets a firmware whose futures stop yielding (or that panicked).
 - A scratch register counts consecutive watchdog boots; at 3 the firmware reboots into BOOTSEL. The counter clears at any boot the watchdog timer did not cause (power-on, a forced reboot), and after 10 s of running with a `hello` answered. `hello` reports the boot's cause and count.
 
