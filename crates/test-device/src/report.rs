@@ -186,8 +186,9 @@ pub const KEYBOARD_FIELDS: &[Field] = &[
     },
 ];
 
-/// Bit 7 of the mode byte: the report carries H and C of the report
-/// before it (none before the first report).
+/// Bit 7 of the mode byte: the report carries H and C of report k-1, which
+/// the host took. Clear for the first report and after a revocation of
+/// report k-1, which has no completion (docs/test-device.md "Reports").
 pub const PREVIOUS_VALID: u8 = 0x80;
 
 /// A game pad report.
@@ -202,7 +203,7 @@ pub struct PadReport {
     pub seq: u16,
     /// R(k), the low 32 bits of the device µs.
     pub ready: u32,
-    /// H(k-1) and C(k-1), when report k-1 exists.
+    /// H(k-1) and C(k-1), when report k-1 was taken by the host.
     pub previous: Option<(u32, u32)>,
 }
 

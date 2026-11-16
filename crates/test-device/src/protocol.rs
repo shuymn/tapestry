@@ -174,6 +174,10 @@ pub enum Command {
     Detach { ms: u32 },
     /// `fault <name> [arg]`: a debug fault (`debug-faults` builds only).
     Fault { fault: Fault, arg: i64 },
+    /// `revoke-test <k|p> <trial>`: one phase-controlled revocation trial
+    /// on the endpoint, numbered `trial` in its `V` record
+    /// ([`crate::revoke`]).
+    RevokeTest { ep: Ep, trial: u32 },
 }
 
 impl Command {
@@ -257,6 +261,10 @@ impl Command {
                 };
                 Self::Fault { fault, arg }
             }
+            "revoke-test" => Self::RevokeTest {
+                ep: Ep::parse(w.next()?)?,
+                trial: w.next()?.parse().ok()?,
+            },
             _ => return None,
         };
         w.next().is_none().then_some(cmd)
@@ -300,6 +308,7 @@ impl fmt::Display for Command {
                 write!(f, "fault {} {arg}", fault.name())
             }
             Self::Fault { fault, .. } => write!(f, "fault {}", fault.name()),
+            Self::RevokeTest { ep, trial } => write!(f, "revoke-test {} {trial}", ep.name()),
         }
     }
 }
@@ -307,8 +316,10 @@ impl fmt::Display for Command {
 /// Why a command was refused.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
-    /// The line is not a command.
+    /// The line is not a command (or not UTF-8). Ends the lease.
     Syntax,
+    /// The line is longer than [`MAX_LINE`]. Ends the lease.
+    Overlong,
     Lease(Refusal),
     /// The pattern is full, or an item is earlier than the one before it
     /// on its endpoint.
@@ -320,6 +331,8 @@ pub enum Error {
     Unidentified,
     /// This build has no debug faults.
     NoFaults,
+    /// The revocation trial needs 125 Hz reporting on change.
+    Mode,
 }
 
 impl Error {
@@ -327,6 +340,7 @@ impl Error {
     pub const fn name(self) -> &'static str {
         match self {
             Self::Syntax => "syntax",
+            Self::Overlong => "overlong",
             Self::Lease(Refusal::BadLength) => "bad-length",
             Self::Lease(Refusal::Held) => "held",
             Self::Lease(Refusal::NoLease) => "no-lease",
@@ -336,6 +350,7 @@ impl Error {
             Self::Playing => "playing",
             Self::Unidentified => "unidentified",
             Self::NoFaults => "no-faults",
+            Self::Mode => "mode",
         }
     }
 
@@ -343,6 +358,7 @@ impl Error {
     pub fn parse(s: &str) -> Option<Self> {
         [
             Self::Syntax,
+            Self::Overlong,
             Self::Lease(Refusal::BadLength),
             Self::Lease(Refusal::Held),
             Self::Lease(Refusal::NoLease),
@@ -352,6 +368,7 @@ impl Error {
             Self::Playing,
             Self::Unidentified,
             Self::NoFaults,
+            Self::Mode,
         ]
         .into_iter()
         .find(|e| e.name() == s)
@@ -428,7 +445,9 @@ impl fmt::Display for Answer<'_> {
 }
 
 impl<'a> Answer<'a> {
-    /// The answer a line holds; `None` for a trace record or anything else.
+    /// The answer a line holds; `None` for a trace record or anything else,
+    /// and for a `hello` of a protocol version other than [`VERSION`]: the
+    /// host refuses a device it cannot read.
     #[must_use]
     pub fn parse(line: &'a str) -> Option<Self> {
         let flag = |s: &str| match s {
@@ -450,6 +469,9 @@ impl<'a> Answer<'a> {
             },
             "hello" => {
                 let version = v.next()?.parse().ok()?;
+                if version != VERSION {
+                    return None;
+                }
                 let mut field = |name: &str| {
                     (v.next()? == name).then_some(())?;
                     v.next()
@@ -537,6 +559,14 @@ mod tests {
                 fault: Fault::PongOffset,
                 arg: -50_000,
             },
+            Command::RevokeTest {
+                ep: Ep::Pad,
+                trial: 20,
+            },
+            Command::RevokeTest {
+                ep: Ep::Keyboard,
+                trial: 1,
+            },
         ];
         for c in commands {
             let line = c.to_string();
@@ -561,6 +591,9 @@ mod tests {
             "item 5 b1+ b2+ b3+ b4+ b5+ b6+ b7+ b8+ b9+",
             "fault drop-item",
             "trace maybe",
+            "revoke-test x 1",
+            "revoke-test p",
+            "revoke-test k 1 2",
         ] {
             assert_eq!(Command::parse(line), None, "{line:?}");
         }
@@ -587,6 +620,8 @@ mod tests {
             Answer::Ok,
             Answer::Err(Error::Lease(Refusal::WrongId)),
             Answer::Err(Error::Unidentified),
+            Answer::Err(Error::Overlong),
+            Answer::Err(Error::Mode),
             Answer::Hello(hello),
             Answer::Hello(Hello {
                 lease: None,
@@ -605,5 +640,34 @@ mod tests {
         }
         assert_eq!(Answer::parse("T 1 p 2 R 3 H 4"), None, "a trace record");
         assert_eq!(Answer::parse("ok then"), None);
+    }
+
+    /// A `hello` of another protocol version is refused, so the host never
+    /// reads a device whose lines mean something else.
+    #[test]
+    fn a_hello_of_another_version_is_refused() {
+        let hello = Answer::Hello(Hello {
+            version: VERSION,
+            build: "b",
+            mode: Mode {
+                rate: Rate::Hz1000,
+                reporting: Reporting::OnChange,
+            },
+            lease: None,
+            armed: false,
+            reason: Reason::None,
+            boot: Cause::PowerOn,
+            count: 0,
+            identified: false,
+        })
+        .to_string();
+        assert!(Answer::parse(&hello).is_some());
+        let other = hello.replacen(
+            &format!("hello {VERSION} "),
+            &format!("hello {} ", VERSION + 1),
+            1,
+        );
+        assert_ne!(other, hello);
+        assert_eq!(Answer::parse(&other), None);
     }
 }

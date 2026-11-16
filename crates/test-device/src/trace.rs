@@ -102,6 +102,18 @@ impl Association {
     }
 }
 
+/// One revocation trial's reports ([`crate::revoke`]): `k0` held the
+/// sentinel alone, `k1` the sentinel and the revoked control, and the
+/// probe item was due at `probe` (device µs).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TrialRun {
+    pub ep: Ep,
+    pub trial: u32,
+    pub k0: u32,
+    pub k1: u32,
+    pub probe: u64,
+}
+
 /// A trace record's content.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Body {
@@ -123,6 +135,11 @@ pub enum Body {
         len: u16,
         at: u64,
     },
+    /// `A`: the controller did not acknowledge the abort of report `seq` at
+    /// `at`; the report was not revoked and the device reboots.
+    Unacknowledged { ep: Ep, seq: u32, at: u64 },
+    /// `V`: a revocation trial's reports, at k1's handoff.
+    Trial(TrialRun),
     /// `L`: `count` records were dropped because the ring was full.
     Lost { count: u32 },
     /// `P`: report `seq` was still pending when `flush` gave up.
@@ -165,6 +182,18 @@ impl fmt::Display for Record {
                     u8::from(available)
                 )
             }
+            Body::Unacknowledged { ep, seq, at } => {
+                write!(f, "A {n} {} {seq} {at}", ep.name())
+            }
+            Body::Trial(t) => write!(
+                f,
+                "V {n} {} {} {} {} {}",
+                t.ep.name(),
+                t.trial,
+                t.k0,
+                t.k1,
+                t.probe
+            ),
             Body::Lost { count } => write!(f, "L {n} lost {count}"),
             Body::Pending { ep, seq } => write!(f, "P {n} {} {seq}", ep.name()),
             Body::Flushed => write!(f, "F {n}"),
@@ -210,6 +239,18 @@ impl Record {
                 len: w.next()?.parse().ok()?,
                 at: w.next()?.parse().ok()?,
             },
+            "A" => Body::Unacknowledged {
+                ep: Ep::parse(w.next()?)?,
+                seq: w.next()?.parse().ok()?,
+                at: w.next()?.parse().ok()?,
+            },
+            "V" => Body::Trial(TrialRun {
+                ep: Ep::parse(w.next()?)?,
+                trial: w.next()?.parse().ok()?,
+                k0: w.next()?.parse().ok()?,
+                k1: w.next()?.parse().ok()?,
+                probe: w.next()?.parse().ok()?,
+            }),
             "L" => {
                 (w.next()? == "lost").then_some(())?;
                 Body::Lost {
@@ -309,7 +350,7 @@ pub use check::{Check, Entry, Problem, Trace};
 mod check {
     use std::collections::BTreeMap;
 
-    use super::{Body, Ep, Record};
+    use super::{Body, Ep, Record, TrialRun};
     use crate::report::PadReport;
 
     /// One report as the trace shows it.
@@ -339,12 +380,16 @@ mod check {
         Unresolved { ep: Ep, seq: u32 },
         /// A report handed twice.
         Repeated { ep: Ep, seq: u32 },
+        /// The controller did not acknowledge an abort: the device rebooted.
+        Unacknowledged { ep: Ep, seq: u32 },
     }
 
     /// A complete trace: every report of each endpoint by number.
     #[derive(Clone, Debug, Default, PartialEq, Eq)]
     pub struct Trace {
         pub reports: BTreeMap<(Ep, u32), Entry>,
+        /// The revocation trials, in order.
+        pub trials: Vec<TrialRun>,
     }
 
     /// Reads records in order and checks them (docs/test-device.md "Timing
@@ -398,6 +443,10 @@ mod check {
                     Some(e) => e.revoked = Some((available, len)),
                     None => self.problems.push(Problem::Unhanded { ep, seq }),
                 },
+                Body::Unacknowledged { ep, seq, .. } => {
+                    self.problems.push(Problem::Unacknowledged { ep, seq });
+                }
+                Body::Trial(t) => self.trace.trials.push(t),
                 Body::Lost { count } => self.problems.push(Problem::Lost { n: r.n, count }),
                 Body::Pending { ep, seq } => self.problems.push(Problem::Pending { ep, seq }),
                 Body::Flushed => self.flushed = true,
@@ -429,8 +478,10 @@ mod check {
 
     impl Trace {
         /// Checks a received pad report's own fields against the trace:
-        /// its sequence number and R(k), and H(k−1) and C(k−1) when it
-        /// carries them.
+        /// its sequence number and R(k), and H(k−1) and C(k−1), which the
+        /// report carries exactly when report k−1 was taken by the host (not
+        /// after its revocation). k−1 of report 0 is the last before the u32
+        /// wrap; a k−1 handed before the trace began is not checked.
         ///
         /// # Errors
         ///
@@ -454,10 +505,13 @@ mod check {
                     report.ready, this.ready
                 ));
             }
-            let before = seq
-                .checked_sub(1)
-                .and_then(|s| self.reports.get(&(Ep::Pad, s)));
-            match (report.previous, before) {
+            let Some(before) = self.reports.get(&(Ep::Pad, seq.wrapping_sub(1))) else {
+                return Ok(());
+            };
+            // A predecessor the host never took (revoked, or not resolved)
+            // has no completion to carry.
+            let taken = Some(before).filter(|prev| prev.completion.is_some());
+            match (report.previous, taken) {
                 (None, None) => Ok(()),
                 (Some((h, c)), Some(prev)) => {
                     let ok = u64::from(h) == low32(prev.handoff)
@@ -476,9 +530,9 @@ mod check {
                         "absent"
                     },
                     if traced.is_some() {
-                        "present"
+                        "taken"
                     } else {
-                        "absent"
+                        "not taken"
                     },
                 )),
             }
@@ -571,6 +625,18 @@ mod tests {
                 len: 18,
                 at: 5,
             },
+            Body::Unacknowledged {
+                ep: Ep::Keyboard,
+                seq: 9,
+                at: 12,
+            },
+            Body::Trial(TrialRun {
+                ep: Ep::Pad,
+                trial: 20,
+                k0: u32::MAX,
+                k1: 0,
+                probe: u64::MAX,
+            }),
             Body::Lost { count: 4 },
             Body::Pending {
                 ep: Ep::Keyboard,
@@ -709,5 +775,107 @@ mod tests {
             ..second
         };
         assert!(trace.check_pad_report(1, &missing).is_err());
+    }
+
+    /// Report 0 after the u32 wrap is checked against report u32::MAX.
+    #[test]
+    fn a_pad_report_after_the_wrap_is_checked_against_the_last_before_it() {
+        let last = u32::MAX;
+        let trace = records(&[
+            Body::Handoff {
+                ep: Ep::Pad,
+                seq: last,
+                ready: 5,
+                handoff: 10,
+            },
+            Body::Completion {
+                ep: Ep::Pad,
+                seq: last,
+                at: 20,
+            },
+            Body::Handoff {
+                ep: Ep::Pad,
+                seq: 0,
+                ready: 25,
+                handoff: 30,
+            },
+            Body::Completion {
+                ep: Ep::Pad,
+                seq: 0,
+                at: 40,
+            },
+            Body::Flushed,
+        ])
+        .finish()
+        .unwrap();
+        let first = crate::report::PadReport {
+            seq: 0,
+            ready: 25,
+            previous: Some((10, 20)),
+            ..Default::default()
+        };
+        assert_eq!(trace.check_pad_report(0, &first), Ok(()));
+        let without = crate::report::PadReport {
+            previous: None,
+            ..first
+        };
+        assert!(trace.check_pad_report(0, &without).is_err());
+    }
+
+    /// After report k−1 was revoked, report k carries no predecessor: it
+    /// has no completion.
+    #[test]
+    fn a_pad_report_after_a_revocation_carries_no_predecessor() {
+        let trace = records(&[
+            Body::Handoff {
+                ep: Ep::Pad,
+                seq: 0,
+                ready: 1,
+                handoff: 2,
+            },
+            Body::Completion {
+                ep: Ep::Pad,
+                seq: 0,
+                at: 3,
+            },
+            Body::Handoff {
+                ep: Ep::Pad,
+                seq: 1,
+                ready: 4,
+                handoff: 5,
+            },
+            Body::Revoked {
+                ep: Ep::Pad,
+                seq: 1,
+                available: true,
+                len: 18,
+                at: 6,
+            },
+            Body::Handoff {
+                ep: Ep::Pad,
+                seq: 2,
+                ready: 7,
+                handoff: 8,
+            },
+            Body::Completion {
+                ep: Ep::Pad,
+                seq: 2,
+                at: 9,
+            },
+            Body::Flushed,
+        ])
+        .finish()
+        .unwrap();
+        let neutral = crate::report::PadReport {
+            seq: 2,
+            ready: 7,
+            ..Default::default()
+        };
+        assert_eq!(trace.check_pad_report(2, &neutral), Ok(()));
+        let stale = crate::report::PadReport {
+            previous: Some((2, 3)),
+            ..neutral
+        };
+        assert!(trace.check_pad_report(2, &stale).is_err());
     }
 }

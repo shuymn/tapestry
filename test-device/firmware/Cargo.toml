@@ -31,7 +31,7 @@ undocumented_unsafe_blocks = "deny"
 [features]
 # The debug faults the negative rows use (docs/test-device.md "Debug
 # faults"); never in the build the device normally runs.
-debug-faults = []
+debug-faults = ["test-device/debug-faults"]
 
 [dependencies]
 test-device = { path = "../../crates/test-device", default-features = false }

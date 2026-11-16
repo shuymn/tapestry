@@ -1,6 +1,6 @@
 # Test Input Device
 
-A Raspberry Pi Pico 2 that the agent drives as a real USB HID device, for the checks injected input cannot reach. Its role is in [design.md](design.md) "Test Input Device"; this document is its design. The firmware is `test-device/firmware` (outside the workspace); what the firmware and the host share (the protocol, the report layouts, the trace, the pattern format, the UF2 writer, the clock bounds and the matching behind the timing checks) is the `test-device` crate. Both are `MIT OR Apache-2.0` (design.md "Licenses").
+A Raspberry Pi Pico 2 that the agent drives as a real USB HID device, for the checks injected input cannot reach. Its role is in [design.md](design.md) "Test Input Device"; this document is its design. The firmware is `test-device/firmware` (outside the workspace); what the firmware and the host share (the protocol, the report layouts, the trace, the pattern format, the UF2 writer, the clock bounds and the matching behind the timing checks) is the `test-device` crate, and so is the device's logic (`device`: held input, patterns, the lease and its disarm, revocation, the link's framing, the revocation trial), which the firmware runs on the USB controller and the crate's tests run against a simulated controller and host. Both are `MIT OR Apache-2.0` (design.md "Licenses").
 
 ## Hardware
 
@@ -32,7 +32,7 @@ The pad report, little-endian, no report id:
 | 10-13 | H(k−1): when report k−1 was handed to the controller | Vendor 0xFF00, 0x03 |
 | 14-17 | C(k−1): when the host took report k−1 | Vendor 0xFF00, 0x05 |
 
-Times are the low 32 bits of the device's µs timer. The player never sees the vendor fields: it reads controller collections of Generic Desktop usages 0x04 and 0x05 and skips value caps off the Desktop page. The crate checks each layout against its own descriptor by parsing it (F0).
+Bytes 10-17 are valid (bit 7 of byte 3) exactly when the host took report k−1: not in the first report, and not after report k−1 was revoked, which has no completion. Times are the low 32 bits of the device's µs timer. The player never sees the vendor fields: it reads controller collections of Generic Desktop usages 0x04 and 0x05 and skips value caps off the Desktop page. The crate checks each layout against its own descriptor by parsing it (F0).
 
 **Report rate.** The interrupt endpoints' `bInterval`: 1 for 1000 Hz, 8 for 125 Hz. The mode byte holds the interval in ms in its low nibble and continuous reporting in bit 4. `mode` stores the mode in a watchdog scratch register and reboots; the host then rediscovers the device.
 
@@ -61,17 +61,19 @@ embassy-rp's `EndpointIn::write` waits until the previous buffer's AVAILABLE bit
 | `T <n> <ep> <seq> R <µs> H <µs>` | Report `seq` on endpoint `k` or `p`, fixed at R, handed at H |
 | `C <n> <ep> <seq> <µs>` | Its completion |
 | `X <n> <ep> <seq> <available> <length> <µs>` | A revocation, with the buffer control read at `EP_ABORT`; `available 0` means the host took the report first |
+| `A <n> <ep> <seq> <µs>` | The controller did not acknowledge the abort of report `seq`: it was not revoked, and the device reboots (Lease and Disarm) |
+| `V <n> <ep> <trial> <k0> <k1> <probe µs>` | A revocation trial's reports, at k1's handoff (Revocation Trial) |
 | `L <n> lost <count>` | Records dropped because the ring was full |
 | `P <n> <ep> <seq>` | Still pending when `flush` gave up |
 | `F <n>` | The end of a `flush` |
 
-Sequence numbers are 32-bit per endpoint; times are 64-bit µs. Records go through a 1024-record ring, and the numbers n are consecutive, so a gap is a loss; any loss fails the row. `flush` waits until every endpoint's pending report completes, bounded by two intervals plus 10 ms, then emits `P` for each still pending, the buffered records and `F`. A row needs `F` and no `P`. The pad's in-report fields must agree with the trace.
+Sequence numbers are 32-bit per endpoint; times are 64-bit µs. Records go through a 1024-record ring, and the numbers n are consecutive, so a gap is a loss; any loss fails the row. `flush` waits until every endpoint's pending report completes, bounded by two intervals plus 10 ms, then emits `P` for each still pending, the buffered records and `F`. A row needs `F`, no `P` and no `A`. The pad's in-report fields must agree with the trace: R(k) with report k's `T`, and bytes 10-17 with report k−1's `T` and `C` when the trace shows k−1 taken, absent when it shows k−1 revoked (k−1 of report 0 is the last before the 32-bit wrap; a k−1 handed before the trace began is not checked).
 
-**Keyboard edges.** Each keyboard record is one pattern item, a known set of usages going down or up. The listener's edges from the device's handle are matched to records in order across records and as a set within one (the order Windows emits them is unspecified). A make of a key already down is a typematic repeat: it has no record and is classed apart. Missing or extra edges fail. Pad timing never stands in for keyboard timing.
+**Keyboard edges.** Each keyboard record is one pattern item, a known set of usages going down or up. The crate's pinned usage-to-scan-code table (`keys`: letters, digits, Enter, Escape, Backspace, Tab, Space, F1-F24, the arrows and six modifiers) maps them to make and break codes; F1 reads each pattern usage alone on hardware once against it. The listener's edges from the device's handle are matched to records in order across records and as a set within one (the order Windows emits them is unspecified). A make of a key already down is a typematic repeat: it has no record and is classed apart. Missing or extra edges fail. Pad timing never stands in for keyboard timing.
 
 ## Commands
 
-One command per line; one answer per line (`ok`, `err <reason>`, or the answers below).
+One command per line; one answer per line (`ok`, `err <reason>`, or the answers below). A line that is not a command, or not UTF-8, is answered `err syntax`, and one longer than 160 bytes `err overlong` (once, at its first byte past the limit; the rest of the line is dropped): either ends the lease (Lease and Disarm). A partial line belongs to its session of the link and is dropped when the session ends (DTR dropped, the port closed, a read error or a disconnect), so no command spans two sessions. A `hello` of another protocol version is refused by the host.
 
 | Command | Effect |
 |---|---|
@@ -87,6 +89,7 @@ One command per line; one answer per line (`ok`, `err <reason>`, or the answers 
 | `release` | Ends the lease, releasing everything |
 | `bootsel` | Reboots into the boot ROM's drive |
 | `detach <ms>` | Takes the device off the bus (the pull-up off) for up to 10 s |
+| `revoke-test <k\|p> <trial>` | One revocation trial on the endpoint under the held lease, which it ends (Revocation Trial); `err mode` unless 125 Hz on change, `err playing` while anything is armed, held or owed |
 | `fault <name> [arg]` | A debug fault; `err no-faults` in a normal build |
 
 **Patterns.** Each item is sent as one report, and the writer waits for the previous report's completion before fixing the next, so a change is never overwritten before its report is sent (design.md "Test Input Device"). An item of several changes makes one report with all of them.
@@ -95,11 +98,11 @@ One command per line; one answer per line (`ok`, `err <reason>`, or the answers 
 
 Every held input and every pattern belongs to a lease. A timer of its own checks the deadline every 0.5 ms; it does not depend on the link's reads or on the HID writers.
 
-- **Disarm triggers:** expiry, DTR dropped or the port closed, a bus suspend, a bus reset, `detach`, `release`.
+- **Disarm triggers:** expiry, DTR dropped or the port closed, a line that is not a command (malformed, not UTF-8 or too long), a bus suspend, a bus reset, `detach`, `release`.
 - **On disarm, in this order:**
   1. Drop every queued pattern item and held change, and the held state.
-  2. Revoke a report handed but not yet taken on each HID endpoint: set `EP_ABORT`, wait for `EP_ABORT_DONE` (bounded), clear AVAILABLE and set the buffer's DATA PID back to the last delivered report's, then clear `EP_ABORT`. The next write sends the opposite PID of what the register holds, which is then the toggle the host expects. Each revocation is traced as `X`.
-  3. Hand a neutral report (everything released, the axis unchanged) on each endpoint whose last delivered report was not neutral, whose taken report was not neutral, or whose report was just revoked. A delivered report after a revocation is what shows the toggle was restored.
+  2. Revoke a report handed but not yet taken on each HID endpoint: set `EP_ABORT`, wait for `EP_ABORT_DONE` (at most 100 000 reads), clear AVAILABLE and set the buffer's DATA PID back to the last delivered report's, then clear `EP_ABORT`. The next write sends the opposite PID of what the register holds, which is then the toggle the host expects. Each revocation is traced as `X`. Without the acknowledgement nothing is touched or claimed: the buffer and `EP_ABORT` stay as they are, the report stays pending, the trace records `A`, the device sends nothing more and reboots 20 ms later, which takes it off the bus and ends every input the host holds from it.
+  3. Owe a neutral report (everything released, the axis unchanged) on each endpoint whose last delivered report was not neutral, whose taken report was not neutral, or whose report was just revoked. The owed report goes before anything else on its endpoint, and no held change, pattern item or trial report goes until the host has taken it; revoked in its turn by another disarm, it is owed again. A delivered report after a revocation is what shows the toggle was restored.
   4. Stay disarmed: nothing plays until a new `lease` and `arm`. A pattern never resumes after expiry, suspend or reset; an ended lease's id arms nothing.
 - **On resume** the first report the host takes is the neutral one.
 - The host keeps DTR asserted while it holds the port.
@@ -113,7 +116,7 @@ Each path works without the button, and each is tested on its own (F5):
 - A watchdog of 2 s, fed by a future of its own in the one executor task, resets a firmware whose futures stop yielding (or that panicked).
 - A scratch register counts consecutive watchdog boots; at 3 the firmware reboots into BOOTSEL. The counter clears at any boot the watchdog timer did not cause (power-on, a forced reboot), and after 10 s of running with a `hello` answered. `hello` reports the boot's cause and count.
 
-Scratch registers 0-2 hold the mode, the counter and the boot-hang fault; every path into BOOTSEL clears the last two. If every path fails on hardware, the owner is asked once to replug the board with BOOTSEL held.
+Scratch registers 0-2 hold the mode, the counter and the boot-hang fault; every path into BOOTSEL clears the last two. An abort the controller does not acknowledge reboots the device through the watchdog (a forced reset, which clears the counter; Lease and Disarm). If every path fails on hardware, the owner is asked once to replug the board with BOOTSEL held.
 
 ## Debug Faults
 
@@ -136,6 +139,17 @@ The firmware's `debug-faults` feature adds `fault <name> [arg]`, the negative ro
 | `keep-armed` | Bus disarms (detach, suspend, reset) do nothing | L4 |
 | `drop-item <n>` | Never sends pattern item n | U1 |
 | `split` | Sends each change of an item as its own report | U2 |
+
+## Revocation Trial
+
+`revoke-test <k|p> <trial>` shows on hardware (R1) what step 2 of a disarm does, with its phase against the host's polling controlled. The trial needs 125 Hz on change, so a poll comes every 8 ms, and a held lease with nothing armed, held or owed. Its controls are F23 (the sentinel), F24 (revoked) and F22 (the probe) on the keyboard, which type nothing, and buttons 15, 16 and 14 on the pad.
+
+1. Report k0 holds the sentinel alone; its completion C(k0) gives the host's poll phase.
+2. At C(k0) + 2 ms report k1 holds the sentinel and the revoked control. At its handoff the device arms a pattern whose only item presses the probe, due 16 ms after H(k1), and records `V` with k0, k1 and the probe's due time.
+3. The lease expires at C(k0) + 4 ms, 4 ms before the next poll, so the disarm goes through the expiry path while k1 is still queued: k1 is revoked (`X` with AVAILABLE set and k1's LENGTH), the pattern dropped, and the neutral report owed releases the sentinel.
+4. The host withholds `lease` and `arm` until 20 ms after the probe's due time, then arms a pattern of its own.
+
+The verdict (`revoke::judge`) needs k1 still queued at the abort, or the trial is "not exercised". Then each failure has its own message: the revoked control seen at the listener is "revoked report arrived"; a next change after the sentinel's press other than its release, or no taken neutral report, is "sentinel break missing after revocation"; a handoff on the endpoint after the neutral report, or the probe seen, before the withheld window ends is "item before rearm". The crate's tests run trials on both endpoints against the simulated controller and host, whose DATA toggle handling discards a repeated PID as a duplicate, and show each message under its mutation: no withdrawal, no toggle restore, a pattern that survives the disarm.
 
 ## Clock Bounds
 

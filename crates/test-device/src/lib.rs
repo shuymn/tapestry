@@ -1,6 +1,8 @@
 //! The test input device (docs/test-device.md; design.md "Test Input
 //! Device"): what its firmware and the host share, so the bytes one side
-//! writes are the bytes the other side reads.
+//! writes are the bytes the other side reads, and the device's logic
+//! ([`device`]), which the firmware runs against the USB controller and
+//! the tests run against a simulated controller and host.
 //!
 //! Without the default `std` feature the crate is `no_std` and allocates
 //! nothing: the firmware (`test-device/firmware`, outside the workspace)
@@ -20,15 +22,18 @@
 pub mod boot;
 #[cfg(feature = "std")]
 pub mod clock;
+pub mod device;
 pub mod faults;
 #[cfg(feature = "std")]
 pub mod hid;
+pub mod keys;
 pub mod lease;
 #[cfg(feature = "std")]
 pub mod matcher;
 pub mod mode;
 pub mod protocol;
 pub mod report;
+pub mod revoke;
 pub mod schedule;
 pub mod trace;
 pub mod uf2;

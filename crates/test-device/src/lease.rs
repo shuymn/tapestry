@@ -20,9 +20,12 @@ pub enum Reason {
     Detached,
     /// The `release` command.
     Released,
+    /// A line on the control link that is not a command: malformed, not
+    /// UTF-8, or longer than the longest line.
+    Protocol,
 }
 
-const REASONS: [Reason; 7] = [
+const REASONS: [Reason; 8] = [
     Reason::None,
     Reason::Expired,
     Reason::Closed,
@@ -30,6 +33,7 @@ const REASONS: [Reason; 7] = [
     Reason::Reset,
     Reason::Detached,
     Reason::Released,
+    Reason::Protocol,
 ];
 
 impl Reason {
@@ -43,6 +47,7 @@ impl Reason {
             Self::Reset => "reset",
             Self::Detached => "detached",
             Self::Released => "released",
+            Self::Protocol => "protocol",
         }
     }
 
@@ -164,6 +169,14 @@ impl Lease {
     #[must_use]
     pub const fn armed(&self) -> bool {
         matches!(self.held, Some(Held { armed: true, .. }))
+    }
+
+    /// Brings the held lease's deadline forward to `deadline`, never later:
+    /// the revocation trial ends its lease through the expiry path.
+    pub fn cut(&mut self, deadline: u64) {
+        if let Some(h) = &mut self.held {
+            h.deadline = h.deadline.min(deadline);
+        }
     }
 
     /// Whether the held lease's deadline has passed at `now`.

@@ -1,7 +1,9 @@
 //! The test input device's firmware (docs/test-device.md): one composite
 //! USB device on the Pico 2 with a keyboard (interface 0), a game pad
 //! (interface 1) and a control link (CDC ACM, interfaces 2-3). Every input
-//! is synthesized from commands and patterns received over the link.
+//! is synthesized from commands and patterns received over the link. The
+//! logic is the `test-device` crate's ([`test_device::device`]); this
+//! crate runs it on the USB controller, the timer and the watchdog.
 //!
 //! All work runs as futures joined in one executor task, so a future that
 //! stops yielding stops the watchdog's feeder too.
@@ -34,15 +36,17 @@ use embassy_usb::class::hid::{
 use embassy_usb::{Builder, Config, Handler};
 use static_cell::ConstStaticCell;
 use test_device::boot::{self, Action, Cause};
+use test_device::device::{Framer, Hardware as _, Kind, Next, Outcome, State};
 use test_device::faults::Fault;
 use test_device::lease::Reason;
 use test_device::mode::Mode;
-use test_device::protocol::{self, Answer, Command, Error, Hello};
+#[cfg(not(feature = "debug-faults"))]
+use test_device::protocol::Error;
+use test_device::protocol::{self, Answer};
 use test_device::report::{KEYBOARD_DESCRIPTOR, KEYBOARD_REPORT, PAD_DESCRIPTOR, PAD_REPORT};
-use test_device::schedule::Refused;
-use test_device::trace::{Body, Ep};
+use test_device::trace::Ep;
 
-use crate::device::{KEYBOARD_EP, Next, PAD_EP, State, now};
+use crate::device::Pico;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
@@ -61,6 +65,11 @@ const MAX_DETACH_MS: u32 = 10_000;
 
 type Line = heapless::String<{ protocol::MAX_LINE }>;
 type Answers = Channel<NoopRawMutex, Line, 8>;
+
+/// The µs since boot.
+fn now() -> u64 {
+    Pico.now()
+}
 
 /// Reboots into the boot ROM's drive, clearing the boot counter and the
 /// boot-hang fault first so the next firmware starts clean.
@@ -95,12 +104,7 @@ async fn main(_spawner: Spawner) {
     let mode = Mode::from_scratch(watchdog.get_scratch(0));
 
     let state: &'static RefCell<State> = STATE.take();
-    {
-        let mut s = state.borrow_mut();
-        s.mode = mode;
-        s.boot = cause;
-        s.count = count;
-    }
+    state.borrow_mut().set_boot(mode, cause, count);
     let watchdog = RefCell::new(watchdog);
 
     let driver = Driver::new(p.USB, Irqs);
@@ -158,32 +162,26 @@ async fn main(_spawner: Spawner) {
     let keyboard_loop = async {
         loop {
             keyboard.ready().await;
-            wait_for_send(state, Ep::Keyboard).await;
-            let report = state.borrow_mut().keyboard_report();
+            let kind = wait_for_send(state, Ep::Keyboard).await;
+            let report = state.borrow_mut().keyboard_report(&Pico, kind);
             if keyboard.write(&report).await.is_ok() {
-                let neutral = report.iter().all(|&b| b == 0);
-                state
-                    .borrow_mut()
-                    .handed(Ep::Keyboard, KEYBOARD_EP, neutral, KEYBOARD_REPORT);
+                state.borrow_mut().handed(&Pico, Ep::Keyboard);
             }
-            complete(state, Ep::Keyboard, KEYBOARD_EP).await;
+            complete(state, Ep::Keyboard).await;
         }
     };
     let pad_loop = async {
         loop {
             pad.ready().await;
-            wait_for_send(state, Ep::Pad).await;
-            let report = state.borrow_mut().pad_report();
+            let kind = wait_for_send(state, Ep::Pad).await;
+            let report = state.borrow_mut().pad_report(&Pico, kind);
             if pad.write(&report).await.is_ok() {
-                let neutral = report.get(..2) == Some(&[0, 0]);
-                state
-                    .borrow_mut()
-                    .handed(Ep::Pad, PAD_EP, neutral, PAD_REPORT);
+                state.borrow_mut().handed(&Pico, Ep::Pad);
             }
-            complete(state, Ep::Pad, PAD_EP).await;
-            let skip = state.borrow().fault(Fault::EveryOtherPoll).is_some();
+            complete(state, Ep::Pad).await;
+            let skip = state.borrow().fault(&Pico, Fault::EveryOtherPoll).is_some();
             if skip {
-                let interval = state.borrow().mode.rate.interval_us();
+                let interval = state.borrow().mode().rate.interval_us();
                 Timer::after_micros(u64::from(interval)).await;
             }
         }
@@ -194,19 +192,21 @@ async fn main(_spawner: Spawner) {
         loop {
             Timer::after(LEASE_TICK).await;
             let mut s = state.borrow_mut();
+            s.expire(&Pico);
             let t = now();
-            if s.lease.expired(t) {
-                s.disarm(Reason::Expired);
-            }
-            if !s.counter_cleared && boot::healthy(t, s.hello_answered) {
+            if s.clear_counter_due(t) {
                 watchdog.borrow_mut().set_scratch(1, boot::word(0));
-                s.counter_cleared = true;
+            }
+            if s.recovery_due(t) {
+                // An abort went unacknowledged: leaving the bus by a reboot
+                // ends every input the host holds from this device.
+                watchdog.borrow_mut().trigger_reset();
             }
         }
     };
     let feeder = async {
         loop {
-            let slow = state.borrow().fault(Fault::SlowWatchdog).is_some();
+            let slow = state.borrow().fault(&Pico, Fault::SlowWatchdog).is_some();
             watchdog
                 .borrow_mut()
                 .feed(if slow { SLOW_WATCHDOG } else { WATCHDOG });
@@ -229,34 +229,29 @@ struct Bus {
 
 impl Handler for Bus {
     fn reset(&mut self) {
-        self.state.borrow_mut().disarm(Reason::Reset);
+        self.state.borrow_mut().disarm(&Pico, Reason::Reset);
     }
 
     fn suspended(&mut self, suspended: bool) {
         if suspended {
-            self.state.borrow_mut().disarm(Reason::Suspended);
+            self.state.borrow_mut().disarm(&Pico, Reason::Suspended);
         }
     }
 
     fn configured(&mut self, configured: bool) {
         if configured {
-            // One report on each endpoint, the current (neutral) state:
-            // its buffer's LENGTH identifies the endpoint.
-            let mut s = self.state.borrow_mut();
-            for ep in [Ep::Keyboard, Ep::Pad] {
-                s.ep(ep).dirty = true;
-                device::kick(ep).signal(());
-            }
+            self.state.borrow_mut().configured(&Pico);
         }
     }
 }
 
-/// Waits until `ep` has a report to send, and applies its change.
-async fn wait_for_send(state: &RefCell<State>, ep: Ep) {
+/// Waits until `ep` has a report to send, and applies its change: what
+/// the report carries.
+async fn wait_for_send(state: &RefCell<State>, ep: Ep) -> Kind {
     loop {
-        let next = state.borrow_mut().next_report(ep, now());
+        let next = state.borrow_mut().next_report(&Pico, ep);
         match next {
-            Next::Now => return,
+            Next::Now(kind) => return kind,
             Next::At(at) => {
                 select(device::kick(ep).wait(), Timer::at(Instant::from_micros(at))).await;
             }
@@ -267,8 +262,8 @@ async fn wait_for_send(state: &RefCell<State>, ep: Ep) {
 
 /// Waits until the host takes `ep`'s pending report (or it is revoked),
 /// polling the buffer's AVAILABLE bit and yielding between polls.
-async fn complete(state: &RefCell<State>, ep: Ep, index: usize) {
-    while !state.borrow_mut().poll_completion(ep, index) {
+async fn complete(state: &RefCell<State>, ep: Ep) {
+    while !state.borrow_mut().poll_completion(&Pico, ep) {
         yield_now().await;
     }
 }
@@ -282,7 +277,8 @@ fn answer(answers: &Answers, a: &Answer<'_>) {
 
 /// Reads command lines; also watches the link's control lines: a line
 /// coding of 1200 baud reboots into BOOTSEL (whatever the parser does), and
-/// DTR dropped disarms.
+/// DTR dropped disarms. Each session's end (DTR dropped, a read error or a
+/// disconnect) drops its partial line.
 async fn receive<'d, D: embassy_usb::driver::Driver<'d>>(
     rx: &mut Receiver<'d, D>,
     control: &ControlChanged<'d>,
@@ -291,31 +287,31 @@ async fn receive<'d, D: embassy_usb::driver::Driver<'d>>(
     watchdog: &RefCell<Watchdog>,
 ) {
     let mut packet = [0_u8; 64];
-    let mut line: heapless::Vec<u8, { protocol::MAX_LINE }> = heapless::Vec::new();
-    let mut overlong = false;
+    let mut framer = Framer::new();
     loop {
         match select(rx.read_packet(&mut packet), control.control_changed()).await {
             Either::First(Ok(n)) => {
                 for &b in packet.get(..n).unwrap_or(&[]) {
-                    if b == b'\n' || b == b'\r' {
-                        if !line.is_empty() && !overlong {
-                            run(&line, state, answers, watchdog).await;
-                        }
-                        line.clear();
-                        overlong = false;
-                    } else if line.push(b).is_err() {
-                        overlong = true;
+                    let outcome = match framer.push(b) {
+                        Some(frame) => state.borrow_mut().frame(&Pico, frame),
+                        None => continue,
+                    };
+                    if let Some(outcome) = outcome {
+                        run(outcome, state, answers, watchdog).await;
                     }
                 }
             }
-            Either::First(Err(_)) => rx.wait_connection().await,
+            Either::First(Err(_)) => {
+                state.borrow_mut().session_end(&Pico, &mut framer, false);
+                rx.wait_connection().await;
+            }
             Either::Second(()) => {
-                let baud_off = state.borrow().fault(Fault::BaudOff).is_some();
+                let baud_off = state.borrow().fault(&Pico, Fault::BaudOff).is_some();
                 if rx.line_coding().data_rate() == 1200 && !baud_off {
                     enter_bootsel(&mut watchdog.borrow_mut());
                 }
                 if !control.dtr() {
-                    state.borrow_mut().disarm(Reason::Closed);
+                    state.borrow_mut().session_end(&Pico, &mut framer, true);
                 }
             }
         }
@@ -356,7 +352,7 @@ async fn send<'d, D: embassy_usb::driver::Driver<'d>>(
             write_line(tx, line.as_bytes()).await;
         }
         loop {
-            let record = state.borrow_mut().ring.pop();
+            let record = state.borrow_mut().next_record();
             let Some(r) = record else { break };
             let mut line = Line::new();
             if writeln!(line, "{r}").is_ok() {
@@ -366,139 +362,32 @@ async fn send<'d, D: embassy_usb::driver::Driver<'d>>(
     }
 }
 
-/// Runs one command line.
-async fn run(line: &[u8], state: &RefCell<State>, answers: &Answers, watchdog: &RefCell<Watchdog>) {
-    if state.borrow().fault(Fault::ParserOff).is_some() {
-        return;
-    }
-    let Some(cmd) = core::str::from_utf8(line).ok().and_then(Command::parse) else {
-        answer(answers, &Answer::Err(Error::Syntax));
-        return;
-    };
-    let reply = match cmd {
-        Command::Hello => {
-            let mut s = state.borrow_mut();
-            s.hello_answered = true;
-            let hello = Hello {
-                version: protocol::VERSION,
-                build: env!("TEST_DEVICE_BUILD"),
-                mode: s.mode,
-                lease: s.lease.held(),
-                armed: s.lease.armed(),
-                reason: s.lease.reason(),
-                boot: s.boot,
-                count: s.count,
-                identified: s.identified(),
-            };
+/// Finishes what the device logic hands back for one command.
+async fn run(
+    outcome: Outcome,
+    state: &RefCell<State>,
+    answers: &Answers,
+    watchdog: &RefCell<Watchdog>,
+) {
+    match outcome {
+        Outcome::Answer(a) => answer(answers, &a),
+        Outcome::Hello => {
+            let hello = state.borrow_mut().hello(env!("TEST_DEVICE_BUILD"));
             answer(answers, &Answer::Hello(hello));
-            return;
         }
-        Command::Mode(mode) => {
+        Outcome::Mode(mode) => {
             watchdog.borrow_mut().set_scratch(0, mode.scratch());
             answer(answers, &Answer::Ok);
             Timer::after_millis(50).await;
             watchdog.borrow_mut().trigger_reset();
-            return;
         }
-        Command::Lease { ms } => {
-            let mut s = state.borrow_mut();
-            let granted = s.lease.grant(now(), ms);
-            device::kick(Ep::Pad).signal(());
-            match granted {
-                Ok((id, deadline)) => Answer::Leased {
-                    id,
-                    deadline: s.out(deadline),
-                },
-                Err(r) => Answer::Err(Error::Lease(r)),
-            }
-        }
-        Command::Renew { id } => {
-            let mut s = state.borrow_mut();
-            match s.lease.renew(id, now()) {
-                Ok(deadline) => Answer::Leased {
-                    id,
-                    deadline: s.out(deadline),
-                },
-                Err(r) => Answer::Err(Error::Lease(r)),
-            }
-        }
-        Command::Set(change) => {
-            let mut s = state.borrow_mut();
-            if s.lease.held().is_none() {
-                Answer::Err(Error::Lease(test_device::lease::Refusal::NoLease))
-            } else if s.schedule.armed() {
-                Answer::Err(Error::Playing)
-            } else {
-                let ep = change.control.ep();
-                if s.ep(ep).changes.push_back(change).is_ok() {
-                    device::kick(ep).signal(());
-                    Answer::Ok
-                } else {
-                    Answer::Err(Error::Pattern)
-                }
-            }
-        }
-        Command::Load => {
-            let mut s = state.borrow_mut();
-            if s.schedule.armed() {
-                Answer::Err(Error::Playing)
-            } else {
-                s.schedule.clear();
-                Answer::Ok
-            }
-        }
-        Command::Item(item) => match state.borrow_mut().schedule.push(item) {
-            Ok(()) => Answer::Ok,
-            Err(Refused::Armed) => Answer::Err(Error::Playing),
-            Err(Refused::Full | Refused::Order) => Answer::Err(Error::Pattern),
-        },
-        Command::Arm { id, at } => {
-            let mut s = state.borrow_mut();
-            if s.identified() {
-                match s.lease.arm(id) {
-                    Ok(()) => {
-                        let start = s.inward(at);
-                        s.schedule.arm(start);
-                        device::kick(Ep::Keyboard).signal(());
-                        device::kick(Ep::Pad).signal(());
-                        Answer::Ok
-                    }
-                    Err(r) => Answer::Err(Error::Lease(r)),
-                }
-            } else {
-                Answer::Err(Error::Unidentified)
-            }
-        }
-        Command::Ping(n) => {
-            let s = state.borrow();
-            let shift = s.fault(Fault::PongOffset).unwrap_or(0);
-            let at = s.out(now()).wrapping_add_signed(shift);
-            Answer::Pong { n, at }
-        }
-        Command::Trace(on) => {
-            let mut s = state.borrow_mut();
-            if on && !s.identified() {
-                Answer::Err(Error::Unidentified)
-            } else {
-                s.tracing = on;
-                Answer::Ok
-            }
-        }
-        Command::Flush => {
-            flush(state).await;
-            return;
-        }
-        Command::Release => {
-            state.borrow_mut().disarm(Reason::Released);
-            Answer::Ok
-        }
-        Command::Bootsel => {
+        Outcome::Flush => flush(state).await,
+        Outcome::Bootsel => {
             answer(answers, &Answer::Ok);
             Timer::after_millis(20).await;
             enter_bootsel(&mut watchdog.borrow_mut());
         }
-        Command::Detach { ms } => {
-            state.borrow_mut().disarm(Reason::Detached);
+        Outcome::Detach(ms) => {
             answer(answers, &Answer::Ok);
             Timer::after_millis(20).await;
             embassy_rp::pac::USB
@@ -508,37 +397,28 @@ async fn run(line: &[u8], state: &RefCell<State>, answers: &Answers, watchdog: &
             embassy_rp::pac::USB
                 .sie_ctrl()
                 .modify(|w| w.set_pullup_en(true));
-            return;
         }
-        Command::Fault { fault, arg } => fault_command(state, watchdog, fault, arg),
-    };
-    answer(answers, &reply);
+        Outcome::Fault { fault, arg } => {
+            let a = fault_command(state, watchdog, fault, arg);
+            answer(answers, &a);
+        }
+    }
 }
 
 /// Waits until every endpoint's pending report completes, bounded by two
 /// intervals plus 10 ms; then records each still pending as `P` and ends
 /// with `F`, after every buffered record.
 async fn flush(state: &RefCell<State>) {
-    let interval = u64::from(state.borrow().mode.rate.interval_us());
+    let interval = u64::from(state.borrow().mode().rate.interval_us());
     let deadline = now() + 2 * interval + 10_000;
     loop {
-        let clear = {
-            let mut s = state.borrow_mut();
-            s.poll_completion(Ep::Keyboard, KEYBOARD_EP) && s.poll_completion(Ep::Pad, PAD_EP)
-        };
+        let clear = state.borrow_mut().flush_poll(&Pico);
         if clear || now() >= deadline {
             break;
         }
         yield_now().await;
     }
-    let mut s = state.borrow_mut();
-    for ep in [Ep::Keyboard, Ep::Pad] {
-        if let Some(seq) = s.ep(ep).assoc.pending() {
-            s.ring.push(Body::Pending { ep, seq });
-        }
-    }
-    s.ring.push(Body::Flushed);
-    device::KICK_TRACE.signal(());
+    state.borrow_mut().flush_end(&Pico);
 }
 
 #[cfg(feature = "debug-faults")]
@@ -548,8 +428,6 @@ fn fault_command(
     fault: Fault,
     arg: i64,
 ) -> Answer<'static> {
-    let mut s = state.borrow_mut();
-    let t = now();
     match fault {
         Fault::Hang => device::hang(),
         Fault::BootHang => {
@@ -557,16 +435,7 @@ fn fault_command(
             device::set_boot_hang(&mut watchdog.borrow_mut(), boots);
             device::hang();
         }
-        Fault::Suspend => {
-            s.faults.set(fault, arg, t);
-            s.disarm(Reason::Suspended);
-        }
-        Fault::ClockOffset => {
-            // The reported µs start 10 s before 2^32.
-            s.offset = ((1_u64 << 32) - 10_000_000).saturating_sub(t);
-            s.faults.set(fault, arg, t);
-        }
-        _ => s.faults.set(fault, arg, t),
+        _ => state.borrow_mut().set_fault(&Pico, fault, arg),
     }
     Answer::Ok
 }
