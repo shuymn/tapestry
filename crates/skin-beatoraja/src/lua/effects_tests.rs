@@ -6,7 +6,7 @@
 //! ([`super::callback_tests::outcome`]).
 
 use super::callback_tests::{gauge, image, outcome, reader_entry, skin, writer_chunk};
-use super::{Disposition, LuaWhy, Unsupported};
+use super::{Disposition, LuaLimit, LuaWhy, Unsupported};
 use crate::error::ImportError;
 use crate::import::callback::LOWERED;
 
@@ -857,6 +857,28 @@ fn a_helper_the_kind_passes_reach_is_reported_by_its_own_walk() {
     );
     r.unwrap();
     assert_eq!(callbacks, [Disposition::Replaced(Unsupported::Writes)]);
+}
+
+#[test]
+fn a_helper_s_results_are_charged_before_they_are_copied() {
+    // `h` returns three values: their charge meets an exhausted allowance
+    // and refuses with the work cap, before any copy of them starts.
+    let pre = "local function h() return 1, 2, 3 end";
+    super::tests::fail_next(Some("walk results"));
+    let r = outcome(&beside(pre, "function() return h() == 1 end"), &[]).0;
+    let copied = super::tests::site("walk results").1;
+    super::tests::fail_next(None);
+    match r {
+        Err(ImportError::Lua {
+            why: LuaWhy::Limit(LuaLimit::AnalysisWork),
+            ..
+        }) => {}
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(copied, 0);
+    // Without the exhausted allowance, the copies start and it imports.
+    closed(pre, "function() return h() == 1 end");
+    assert!(super::tests::site("walk results").1 > 0);
 }
 
 #[test]
