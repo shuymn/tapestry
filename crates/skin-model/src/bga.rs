@@ -14,7 +14,9 @@
 //! - **Pictures** ([`probe`], [`read_cell`]): PNG, JPEG and BMP within the
 //!   chart images' caps; the decoded texels are premultiplied, a picture
 //!   whose longer side is at most [`CANVAS_SIDE`] is drawn at the top
-//!   centre of a transparent canvas of that side, and the result is
+//!   centre of a canvas of that side, opaque black for a picture with no
+//!   alpha channel and transparent for one with it (a picture whose alpha
+//!   is 0 everywhere has none: it is drawn opaque), and the result is
 //!   downscaled by an area filter to its cell and given a
 //!   [`CELL_GUTTER`]-texel border repeating its edge. Every transient
 //!   allocation is fallible, and refused at a caller's limit, so a refused
@@ -462,9 +464,10 @@ pub fn read_cell(
         return Err(Absent::Changed);
     }
     decode::check_whole(&bytes, dims, header).map_err(|e| absent(chart_image::absent_of(e)))?;
-    let image = decode::decode(bytes, dims).map_err(|e| absent(chart_image::absent_of(e)))?;
+    let (image, alpha) =
+        decode::decode_alpha(bytes, dims).map_err(|e| absent(chart_image::absent_of(e)))?;
     chart_image::checkpoint(cancel, Site::Decoded)?;
-    cell_of(image.into_raw(), dims, content, limit).map(|(padded, texels)| CellPixels {
+    cell_of(image.into_raw(), dims, alpha, content, limit).map(|(padded, texels)| CellPixels {
         native: dims,
         padded,
         texels,
@@ -472,16 +475,22 @@ pub fn read_cell(
 }
 
 /// The cell of a decoded picture of `dims` texels (straight RGBA8 rows in
-/// `texels`) at `content`: premultiplied, on the canvas when small,
-/// downscaled and given its gutter. Each allocation is at most `limit`.
+/// `texels`, `alpha` when it had an alpha channel) at `content`:
+/// premultiplied, on the canvas when small, downscaled and given its
+/// gutter. An alpha 0 everywhere is no alpha channel: the picture is drawn
+/// opaque. Each allocation is at most `limit`.
 fn cell_of(
     mut texels: Vec<u8>,
     dims: [u32; 2],
+    alpha: bool,
     content: [u32; 2],
     limit: Option<u64>,
 ) -> Result<([u32; 2], Vec<u8>), Absent> {
+    // One pass, ending at the first texel that is not fully transparent.
+    let alpha = alpha && texels.as_chunks::<4>().0.iter().any(|t| t[3] != 0);
     for t in texels.as_chunks_mut::<4>().0 {
         let [r, g, b, a] = *t;
+        let a = if alpha { a } else { 255 };
         *t = [premultiply(r, a), premultiply(g, a), premultiply(b, a), a];
     }
     let drawn = drawn_size(dims);
@@ -489,6 +498,13 @@ fn cell_of(
         texels
     } else {
         let mut canvas = alloc(u64::from(drawn[0]) * u64::from(drawn[1]) * 4, limit)?;
+        // An opaque picture stays opaque, its margin included: black.
+        // Source: SF-017
+        if !alpha {
+            for t in canvas.as_chunks_mut::<4>().0 {
+                *t = [0, 0, 0, 255];
+            }
+        }
         place_on_canvas(&texels, dims, &mut canvas);
         drop(texels);
         canvas
@@ -515,8 +531,8 @@ fn cell_of(
 }
 
 /// Draws `src`, `dims` texels, at the top centre of `canvas`
-/// ([`CANVAS_SIDE`] square, transparent): its left edge at
-/// `⌊(256 − w) / 2⌋`, as the source draws it.
+/// ([`CANVAS_SIDE`] square): its left edge at `⌊(256 − w) / 2⌋`, as the
+/// source draws it.
 fn place_on_canvas(src: &[u8], dims: [u32; 2], canvas: &mut [u8]) {
     let [w, h] = dims.map(|v| usize::try_from(v).unwrap_or(0));
     let side = usize::try_from(CANVAS_SIDE).unwrap_or(0);

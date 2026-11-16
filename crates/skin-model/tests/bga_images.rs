@@ -105,8 +105,12 @@ fn at(c: &CellPixels, x: u32, y: u32) -> [u8; 4] {
     c.texels[i..i + 4].try_into().unwrap()
 }
 
+/// A small picture with an alpha channel sits at the top centre of a
+/// transparent canvas, a PNG's transparency chunk and a BMP's alpha mask
+/// included; a larger one keeps its own size.
+// Source: SF-017
 #[test]
-fn small_image_centres_on_a_256_canvas() {
+fn small_picture_with_alpha_centres_on_a_transparent_canvas() {
     let d = dir();
     save(d.path(), "s.png", &solid(100, 50, [255, 0, 0, 255]));
     let c = cell(d.path(), "s.png").unwrap();
@@ -125,6 +129,80 @@ fn small_image_centres_on_a_256_canvas() {
     assert_eq!(at(&c, 0, 0), [0, 255, 0, 255]);
     // The gutter repeats the edge.
     assert_eq!(&c.texels[..4], &[0, 255, 0, 255]);
+    // An RGB PNG with a transparency chunk, and a BMP with an alpha mask.
+    let mut png = Vec::new();
+    {
+        let mut e = ::png::Encoder::new(&mut png, 4, 2);
+        e.set_color(::png::ColorType::Rgb);
+        e.set_depth(::png::BitDepth::Eight);
+        e.set_trns(vec![0, 0, 255, 0, 0, 255]);
+        let mut w = e.write_header().unwrap();
+        w.write_image_data(&[255_u8, 0, 0].repeat(8)).unwrap();
+    }
+    fs::write(d.path().join("trns.png"), &png).unwrap();
+    fs::write(d.path().join("mask.bmp"), bmp(32, 3, 108, &[], &argb(255))).unwrap();
+    for name in ["trns.png", "mask.bmp"] {
+        let c = cell(d.path(), name).unwrap();
+        assert_eq!(at(&c, 126, 0)[3], 255, "{name}: the picture");
+        assert_eq!(at(&c, 0, 255), [0; 4], "{name}: the margin is transparent");
+    }
+}
+
+/// 32-bit BMP rows of `PIXELS` with `a` in every texel's fourth byte.
+fn argb(a: u8) -> Vec<u8> {
+    rows(|r| {
+        r.iter()
+            .flat_map(|&i| {
+                let [cr, cg, cb] = rgb(i);
+                [cb, cg, cr, a]
+            })
+            .collect()
+    })
+}
+
+/// A small picture with no alpha channel stays opaque, its margin included:
+/// its canvas is black (`play/bga/BGImageProcessor.java:50` at `0.8.9`
+/// shows it). An RGB PNG, a JPEG, a paletted BMP, a 32-bit BMP without an
+/// alpha mask (its fourth byte reserved, not read), and one with an alpha
+/// mask but alpha 0 everywhere, which has no alpha: drawn opaque.
+// Source: SF-017
+#[test]
+fn small_opaque_picture_centres_on_a_black_canvas() {
+    let d = dir();
+    image::RgbImage::from_pixel(100, 50, image::Rgb([255, 0, 0]))
+        .save_with_format(d.path().join("rgb.png"), ImageFormat::Png)
+        .unwrap();
+    image::RgbImage::from_pixel(100, 50, image::Rgb([255, 0, 0]))
+        .save_with_format(d.path().join("rgb.jpg"), ImageFormat::Jpeg)
+        .unwrap();
+    fs::write(
+        d.path().join("pal.bmp"),
+        bmp(8, 0, 40, &PALETTE, &rows(|r| r.to_vec())),
+    )
+    .unwrap();
+    fs::write(d.path().join("rgb32.bmp"), bmp(32, 0, 40, &[], &argb(7))).unwrap();
+    fs::write(d.path().join("zero.bmp"), bmp(32, 3, 108, &[], &argb(0))).unwrap();
+    for (name, w, h) in [
+        ("rgb.png", 100, 50),
+        ("rgb.jpg", 100, 50),
+        ("pal.bmp", 4, 2),
+        ("rgb32.bmp", 4, 2),
+        ("zero.bmp", 4, 2),
+    ] {
+        let c = cell(d.path(), name).unwrap();
+        assert_eq!(c.padded, [258, 258], "{name}");
+        let left = (256 - w) / 2;
+        assert_eq!(at(&c, left, 0)[3], 255, "{name}: the picture");
+        for (x, y) in [
+            (left - 1, 0),
+            (left + w, 0),
+            (left, h),
+            (0, 255),
+            (255, 255),
+        ] {
+            assert_eq!(at(&c, x, y), [0, 0, 0, 255], "{name}: ({x}, {y}) is black");
+        }
+    }
 }
 
 /// The test picture's colours: red, green, blue and white.
