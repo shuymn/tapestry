@@ -278,9 +278,10 @@ struct Seen {
     others: Vec<String>,
     /// The longest round, whatever its outcome.
     longest: Duration,
-    /// When each round that loaded began.
-    loaded: Vec<u64>,
-    /// When the reader reached the start barrier, and when it was let go.
+    /// When each round that loaded began and when it ended.
+    loaded: Vec<(u64, u64)>,
+    /// When the reader reached the start barrier, and when it saw it was
+    /// let go.
     ready: u64,
     went: u64,
 }
@@ -357,9 +358,10 @@ fn read_until(reading: Reading, signals: &Signals) -> Seen {
                 })
             }
         };
+        let ended = unix_us();
         seen.longest = seen.longest.max(round.elapsed());
         match failed {
-            None => seen.loaded.push(at),
+            None => seen.loaded.push((at, ended)),
             Some((true, _)) => seen.missing += 1,
             Some((false, e)) => seen.others.push(e),
         }
@@ -408,12 +410,14 @@ fn wait_writers(mut writers: Vec<Child>, start: Instant) -> Vec<String> {
 }
 
 /// One race: each writer's output, what each reader saw, and when the race
-/// spawned the writers and wrote their start file, in [`unix_us`].
+/// spawned the writers, wrote their start file and let the readers go, in
+/// [`unix_us`].
 struct Raced {
     outputs: Vec<String>,
     seen: Vec<Seen>,
     spawned: u64,
     started: u64,
+    let_go: u64,
 }
 
 /// Runs [`WRITERS`] writer processes (failing ones with `fails`) against
@@ -440,7 +444,7 @@ fn race(base: &Path, fails: bool) -> Raced {
         go: AtomicBool::new(false),
         done: AtomicBool::new(false),
     };
-    let mut started = 0;
+    let (mut started, mut let_go) = (0, 0);
     let (outputs, seen) = std::thread::scope(|s| {
         let readers: Vec<_> = readings
             .into_iter()
@@ -458,6 +462,7 @@ fn race(base: &Path, fails: bool) -> Raced {
             started = unix_us();
             let dir = folder_in(base, "shared", &files());
             signals.dir.set(dir).unwrap();
+            let_go = unix_us();
             signals.go.store(true, Ordering::Release);
             wait_writers(writers, start)
         }));
@@ -472,6 +477,7 @@ fn race(base: &Path, fails: bool) -> Raced {
         seen,
         spawned,
         started,
+        let_go,
     }
 }
 
@@ -504,8 +510,8 @@ fn a_failed_writer_ends_the_race() {
 /// fails this in some runs, not every: [`placing_again_keeps_each_file`]
 /// checks in every run that a placement replaces nothing. Only reads while
 /// the writers place count: each reader must load the folder in a round
-/// begun between the first writer's start of placing and the last one's
-/// end.
+/// wholly between the first writer's start of placing and the last one's
+/// end, begun at or after the one and ended at or before the other.
 #[test]
 fn a_reader_never_meets_a_file_being_placed() {
     let base = base();
@@ -517,16 +523,19 @@ fn a_reader_never_meets_a_file_being_placed() {
     let seen = &raced.seen;
     // Milliseconds from `from` to `to`, both in unix_us.
     let ms = |from: u64, to: u64| (i128::from(to) - i128::from(from)) / 1_000;
-    let count =
-        |s: &Seen, keep: &dyn Fn(u64) -> bool| s.loaded.iter().filter(|&&t| keep(t)).count();
+    // A loading round's place: begun before the writers placed, wholly
+    // while they placed, or begun while or after they placed and ended
+    // after.
+    let count = |keep: &dyn Fn(u64, u64) -> bool| {
+        seen.iter()
+            .map(|s| s.loaded.iter().filter(|&&(b, e)| keep(b, e)).count())
+            .collect::<Vec<_>>()
+    };
 
     let passes: Vec<u32> = wrote.iter().map(|w| w.passes).collect();
-    let before: Vec<usize> = seen.iter().map(|s| count(s, &|t| t < first)).collect();
-    let during: Vec<usize> = seen
-        .iter()
-        .map(|s| count(s, &|t| (first..last).contains(&t)))
-        .collect();
-    let after: Vec<usize> = seen.iter().map(|s| count(s, &|t| t >= last)).collect();
+    let before = count(&|b, _| b < first);
+    let during = count(&|b, e| b >= first && e <= last);
+    let after = count(&|b, e| b >= first && e > last);
     let longest: Vec<u128> = seen.iter().map(|s| s.longest.as_millis()).collect();
     let missing: u32 = seen.iter().map(|s| s.missing).sum();
     let others: Vec<&String> = seen.iter().flat_map(|s| &s.others).collect();
@@ -537,13 +546,14 @@ fn a_reader_never_meets_a_file_being_placed() {
         "passes {passes:?}, loads before {before:?} during {during:?} after {after:?} the \
          writers placed, missing {missing}, other errors {}, longest rounds {longest:?} ms; \
          ms after the spawn: writers entered {:?}, start file {}, writers began {:?} and \
-         ended {:?}, readers ready {:?} and let go {:?}; in {} ms",
+         ended {:?}, readers ready {:?}, let go {} and saw it {:?}; in {} ms",
         others.len(),
         from_spawn(&mut wrote.iter().map(|w| w.entered)),
         ms(raced.spawned, raced.started),
         from_spawn(&mut wrote.iter().map(|w| w.began)),
         from_spawn(&mut wrote.iter().map(|w| w.ended)),
         from_spawn(&mut seen.iter().map(|s| s.ready)),
+        ms(raced.spawned, raced.let_go),
         from_spawn(&mut seen.iter().map(|s| s.went)),
         begun.elapsed().as_millis()
     );
@@ -554,7 +564,8 @@ fn a_reader_never_meets_a_file_being_placed() {
         &others[..others.len().min(3)]
     );
     // The controls: each writer placed the files, and each reader loaded
-    // them while the writers placed them, so the race ran.
+    // them in a round wholly while the writers placed them, so the race
+    // ran.
     assert!(passes.iter().all(|&p| p > 0), "passes {passes:?}");
     assert!(
         during.iter().all(|&d| d > 0),
