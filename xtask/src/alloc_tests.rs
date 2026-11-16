@@ -88,6 +88,12 @@ pub struct UnitTest {
     pub file: String,
     /// Whether its body reads the counting allocator ([`COUNTER`]).
     pub counts: bool,
+    /// Whether it has `#[ignore]`.
+    pub ignored: bool,
+    /// The `cfg` predicates (whitespace removed) and `cfg_attr` attributes
+    /// on it and on every module and file above it, outermost first
+    /// ([`cfgs`]).
+    pub cfgs: Vec<String>,
 }
 
 /// An allocation guard: a package and its integration test.
@@ -194,11 +200,11 @@ pub fn run(manifest: &Path) -> anyhow::Result<Vec<String>> {
         }
         None => None,
     };
-    let path = root.join(WORKFLOW);
-    let workflow = std::fs::read_to_string(&path)
-        .with_context(|| format!("cannot read {}", path.display()))?;
+    let ci = root.join(WORKFLOW);
+    let workflow =
+        std::fs::read_to_string(&ci).with_context(|| format!("cannot read {}", ci.display()))?;
     let mut diagnostics = check(&guards, unit.as_deref(), &workflow)?;
-    let tests_of = |package: &str, target: &Target| -> anyhow::Result<Option<Vec<String>>> {
+    let tests_of = |package: &str, target: &Target| -> anyhow::Result<Option<Vec<UnitTest>>> {
         let Some(found) = metadata
             .workspace_packages()
             .into_iter()
@@ -227,16 +233,44 @@ pub fn run(manifest: &Path) -> anyhow::Result<Vec<String>> {
                 Err(e) => Err(e).with_context(|| format!("cannot read {path}")),
             }
         };
-        Ok(Some(
-            unit_tests(&root_file, &read)?
-                .into_iter()
-                .map(|t| t.path)
-                .collect(),
-        ))
+        Ok(Some(unit_tests(&root_file, &read)?))
     };
-    diagnostics.extend(check_selections(&selections(&workflow)?, &tests_of)?);
+    let features_of = |package: &str| -> Option<Features> {
+        metadata
+            .workspace_packages()
+            .into_iter()
+            .find(|p| p.name.as_str() == package)
+            .map(|p| {
+                p.features
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect()
+            })
+    };
+    let dir = root.join(WORKFLOWS);
+    let mut files: Vec<_> = std::fs::read_dir(&dir)
+        .with_context(|| format!("cannot read {}", dir.display()))?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<Result<_, _>>()
+        .with_context(|| format!("cannot read {}", dir.display()))?;
+    files.retain(|f| f.extension().is_some_and(|e| e == "yml" || e == "yaml"));
+    files.sort();
+    let mut selected = Vec::new();
+    for file in files {
+        let text = std::fs::read_to_string(&file)
+            .with_context(|| format!("cannot read {}", file.display()))?;
+        let name = format!(
+            "{WORKFLOWS}/{}",
+            file.file_name().unwrap_or_default().to_string_lossy()
+        );
+        selected.extend(selections(&text, &name)?);
+    }
+    diagnostics.extend(check_selections(&selected, &tests_of, &features_of)?);
     Ok(diagnostics)
 }
+
+/// The directory of the workflows whose by-name selections are checked.
+pub const WORKFLOWS: &str = ".github/workflows";
 
 /// A target of a package a command selects tests from.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -256,19 +290,43 @@ impl std::fmt::Display for Target {
     }
 }
 
-/// A workflow command that selects tests by name.
+/// Which `#[ignore]`d tests a command runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Ignored {
+    /// Only the tests without `#[ignore]` (libtest's and nextest's default).
+    #[default]
+    Not,
+    /// Only the ignored ones (`--ignored`, `--run-ignored only`).
+    Only,
+    /// Both (`--include-ignored`, `--run-ignored all`).
+    All,
+}
+
+/// A workflow command that selects tests: by name filters, `--skip`
+/// patterns, or by `#[ignore]`.
 #[derive(Debug, PartialEq, Eq)]
 pub struct ByName {
+    workflow: String,
     step: String,
     command: String,
     package: String,
     targets: Vec<Target>,
     selection: Selection,
+    ignored: Ignored,
+    /// The features asked for, for the package (`f` or `package/f`).
+    features: Vec<String>,
+    all_features: bool,
+    no_default_features: bool,
 }
 
-/// The tests of a package's target as libtest names them, `None` when the
-/// package or the target does not exist.
-type TestsOf<'a> = &'a dyn Fn(&str, &Target) -> anyhow::Result<Option<Vec<String>>>;
+/// A package's features and what each enables, as in its manifest.
+pub type Features = std::collections::BTreeMap<String, Vec<String>>;
+
+/// The tests of a package's target with what decides whether they run,
+/// `None` when the package or the target does not exist.
+type TestsOf<'a> = &'a dyn Fn(&str, &Target) -> anyhow::Result<Option<Vec<UnitTest>>>;
+/// A package's features, `None` when it does not exist.
+type FeaturesOf<'a> = &'a dyn Fn(&str) -> Option<Features>;
 
 /// Flags before `--` that take a value, of `cargo test` and `cargo nextest
 /// run`, so the value is not read as a filter.
@@ -300,18 +358,18 @@ const VALUE_FLAGS: &[&str] = &[
     "-Z",
 ];
 
-/// The commands of `workflow` that select tests by name: a `cargo test` or
-/// `cargo nextest run` with test filters, before or after `--`. Such a
-/// command must name one package and its targets and hold no shell syntax
+/// The commands of workflow `name` (its text `workflow`) that select tests:
+/// a `cargo test` or `cargo nextest run` with test filters (before or after
+/// `--`), `--skip` patterns, or a selection of ignored tests. Such a command
+/// must name one package and its targets and hold no shell syntax
 /// ([`NOT_PLAIN`], `$`); one that only builds or lists is skipped, and a
-/// nextest filterset (`-E`) or a libtest flag this check does not know is
-/// refused.
-pub fn selections(workflow: &str) -> anyhow::Result<Vec<ByName>> {
+/// nextest filterset (`-E`) or a flag this check does not know is refused.
+pub fn selections(workflow: &str, name: &str) -> anyhow::Result<Vec<ByName>> {
     let mut out = Vec::new();
-    for step in steps(workflow)? {
+    for step in steps_in(workflow, name)? {
         for line in step.run.replace("\\\n", " ").lines() {
             for command in commands(line) {
-                if let Some(by_name) = by_name(&step.name, command.trim())? {
+                if let Some(by_name) = by_name(name, &step.name, command.trim())? {
                     out.push(by_name);
                 }
             }
@@ -320,8 +378,8 @@ pub fn selections(workflow: &str) -> anyhow::Result<Vec<ByName>> {
     Ok(out)
 }
 
-/// `command`'s by-name selection, if it has one.
-fn by_name(step: &str, command: &str) -> anyhow::Result<Option<ByName>> {
+/// `command`'s selection, if it has one.
+fn by_name(workflow: &str, step: &str, command: &str) -> anyhow::Result<Option<ByName>> {
     let tokens: Vec<&str> = command.split_whitespace().collect();
     let start = if let Some(i) = tokens.windows(2).position(|w| w == ["cargo", "test"]) {
         i + 2
@@ -334,9 +392,7 @@ fn by_name(step: &str, command: &str) -> anyhow::Result<Option<ByName>> {
         return Ok(None);
     };
     let refuse = |why: &str| {
-        anyhow::anyhow!(
-            "{WORKFLOW}: step `{step}` runs `{command}`, which selects tests by name; {why}"
-        )
+        anyhow::anyhow!("{workflow}: step `{step}` runs `{command}`, which selects tests; {why}")
     };
     let args = tokens.get(start..).unwrap_or_default();
     let (head, tail) = match args.iter().position(|&a| a == "--") {
@@ -345,18 +401,31 @@ fn by_name(step: &str, command: &str) -> anyhow::Result<Option<ByName>> {
     };
     let mut packages = Vec::new();
     let mut targets = Vec::new();
+    let mut features = Vec::new();
+    let mut all_features = false;
+    let mut no_default_features = false;
+    let mut ignored = Ignored::Not;
     let mut selection = Selection::default();
     let mut head = head.iter().copied();
     while let Some(arg) = head.next() {
-        if arg == "--no-run" {
-            return Ok(None);
+        match arg {
+            "--no-run" => return Ok(None),
+            "--lib" => {
+                targets.push(Target::Lib);
+                continue;
+            }
+            "--all-features" => {
+                all_features = true;
+                continue;
+            }
+            "--no-default-features" => {
+                no_default_features = true;
+                continue;
+            }
+            _ => {}
         }
         if ["-E", "--filterset", "--filter-expr"].contains(&arg) || arg.starts_with("-E") {
             return Err(refuse("write its filters after `--`, not as a filterset"));
-        }
-        if arg == "--lib" {
-            targets.push(Target::Lib);
-            continue;
         }
         let (flag, inline) = match arg.split_once('=') {
             Some((flag, value)) if flag.starts_with("--") => (flag, Some(value)),
@@ -371,10 +440,23 @@ fn by_name(step: &str, command: &str) -> anyhow::Result<Option<ByName>> {
                 ("-p" | "--package", Some(p)) => packages.push(p),
                 ("--test", Some(t)) => targets.push(Target::Test(t)),
                 ("--bin", Some(b)) => targets.push(Target::Bin(b)),
+                ("-F" | "--features", Some(f)) => {
+                    features.extend(f.split(',').filter(|f| !f.is_empty()).map(str::to_owned))
+                }
+                ("--run-ignored", Some(r)) => {
+                    ignored = match r.as_str() {
+                        "default" => Ignored::Not,
+                        "only" | "ignored-only" => Ignored::Only,
+                        "all" => Ignored::All,
+                        _ => return Err(refuse(&format!("this check does not read `{arg}`"))),
+                    }
+                }
                 _ => {}
             }
         } else if let Some(p) = arg.strip_prefix("-p").filter(|p| !p.is_empty()) {
             packages.push(p.to_owned());
+        } else if let Some(f) = arg.strip_prefix("-F").filter(|f| !f.is_empty()) {
+            features.extend(f.split(',').filter(|f| !f.is_empty()).map(str::to_owned));
         } else if !arg.starts_with('-') && !arg.starts_with('$') {
             selection.filters.push(arg.to_owned());
         }
@@ -389,8 +471,9 @@ fn by_name(step: &str, command: &str) -> anyhow::Result<Option<ByName>> {
                     .ok_or_else(|| refuse("its `--skip` has no pattern"))?
                     .to_owned(),
             ),
-            "--ignored" | "--include-ignored" | "--nocapture" | "--no-capture"
-            | "--show-output" | "--test" => {}
+            "--ignored" => ignored = Ignored::Only,
+            "--include-ignored" => ignored = Ignored::All,
+            "--nocapture" | "--no-capture" | "--show-output" | "--test" => {}
             _ if arg.starts_with("--test-threads=") => {}
             "--test-threads" => {
                 tail.next();
@@ -401,7 +484,7 @@ fn by_name(step: &str, command: &str) -> anyhow::Result<Option<ByName>> {
             _ => selection.filters.push(arg.to_owned()),
         }
     }
-    if selection.filters.is_empty() {
+    if selection.filters.is_empty() && selection.skips.is_empty() && ignored == Ignored::Not {
         return Ok(None);
     }
     if NOT_PLAIN.iter().any(|m| command.contains(m)) || command.contains('$') {
@@ -415,49 +498,199 @@ fn by_name(step: &str, command: &str) -> anyhow::Result<Option<ByName>> {
     if targets.is_empty() {
         return Err(refuse("name its targets (`--test`, `--bin` or `--lib`)"));
     }
+    let features = features
+        .into_iter()
+        .filter_map(|f| match f.split_once('/') {
+            Some((p, f)) => (p == package).then(|| f.to_owned()),
+            None => Some(f),
+        })
+        .collect();
     Ok(Some(ByName {
+        workflow: workflow.to_owned(),
         step: step.to_owned(),
         command: command.to_owned(),
         package: package.clone(),
         targets,
         selection,
+        ignored,
+        features,
+        all_features,
+        no_default_features,
     }))
 }
 
-/// The diagnostics for by-name selections: one per filter that selects no
-/// test of its command's targets, and one per target that does not exist.
-pub fn check_selections(selected: &[ByName], tests_of: TestsOf) -> anyhow::Result<Vec<String>> {
+/// The features of a package that `s` enables, through `default` and what
+/// each enables; `None` for every feature with `--all-features`.
+fn enabled(s: &ByName, manifest: &Features) -> Option<Vec<String>> {
+    if s.all_features {
+        return None;
+    }
+    let mut on: Vec<String> = s.features.clone();
+    if !s.no_default_features {
+        on.push("default".to_owned());
+    }
+    let mut i = 0;
+    while let Some(f) = on.get(i).cloned() {
+        for next in manifest.get(&f).into_iter().flatten() {
+            if !next.contains(':') && !next.contains('/') && !on.contains(next) {
+                on.push(next.clone());
+            }
+        }
+        i += 1;
+    }
+    Some(on)
+}
+
+/// Whether `s` runs test `t`, if it can be told: its `#[ignore]` against the
+/// command's choice, then every `cfg` above it. `cfg(test)` always holds and
+/// `cfg(feature = "f")` holds when the command enables `f`; any other `cfg`
+/// or a `cfg_attr` cannot be told (`Err` names it).
+fn runs(s: &ByName, t: &UnitTest, on: Option<&[String]>) -> Result<(), Reason> {
+    let ignored_ok = match s.ignored {
+        Ignored::Not => !t.ignored,
+        Ignored::Only => t.ignored,
+        Ignored::All => true,
+    };
+    if !ignored_ok {
+        return Err(Reason::Not(if t.ignored {
+            "ignored".to_owned()
+        } else {
+            "not ignored".to_owned()
+        }));
+    }
+    let mut unknown = None;
+    for c in &t.cfgs {
+        if c == "test" {
+            continue;
+        }
+        match c
+            .strip_prefix("feature=\"")
+            .and_then(|f| f.strip_suffix('"'))
+        {
+            Some(f) => {
+                if on.is_some_and(|on| !on.iter().any(|o| o == f)) {
+                    return Err(Reason::Not(format!("needs feature `{f}`")));
+                }
+                if on.is_none() && !s.all_features {
+                    unknown.get_or_insert_with(|| c.clone());
+                }
+            }
+            None => {
+                unknown.get_or_insert_with(|| c.clone());
+            }
+        }
+    }
+    unknown.map_or(Ok(()), |c| Err(Reason::Unknown(c)))
+}
+
+/// Why a command does not run a test, or cannot be told to.
+enum Reason {
+    Not(String),
+    Unknown(String),
+}
+
+/// The diagnostics for selections: one per target that does not exist, and
+/// one per filter (or, with none, per command) whose selection leaves no test
+/// the command runs. A selection whose only candidates sit under a `cfg`
+/// this check cannot evaluate fails too: it is rejected, not assumed to run.
+pub fn check_selections(
+    selected: &[ByName],
+    tests_of: TestsOf,
+    features_of: FeaturesOf,
+) -> anyhow::Result<Vec<String>> {
     let mut diagnostics = Vec::new();
     for s in selected {
+        let where_ = format!("step `{}` of {}", s.step, s.workflow);
         let mut tests = Vec::new();
         for target in &s.targets {
             match tests_of(&s.package, target)? {
                 Some(found) => tests.extend(found),
                 None => diagnostics.push(format!(
-                    "step `{}` of {WORKFLOW} selects tests of `-p {} {target}`, which does not \
-                     exist",
-                    s.step, s.package
+                    "{where_} selects tests of `-p {} {target}`, which does not exist",
+                    s.package
                 )),
             }
         }
-        for filter in &s.selection.filters {
-            let one = Selection {
-                filters: vec![filter.clone()],
-                skips: s.selection.skips.clone(),
-                exact: s.selection.exact,
-            };
-            if !tests.iter().any(|t| one.runs(t)) {
-                let targets: Vec<String> = s.targets.iter().map(ToString::to_string).collect();
+        let manifest = features_of(&s.package);
+        // `None`: every feature (`--all-features`) or, with no manifest, unknown.
+        let on = manifest.as_ref().and_then(|m| enabled(s, m));
+        let targets: Vec<String> = s.targets.iter().map(ToString::to_string).collect();
+        let scope = format!("`-p {} {}`", s.package, targets.join(" "));
+        let groups: Vec<(String, Selection)> = if s.selection.filters.is_empty() {
+            vec![(
+                if s.selection.skips.is_empty() {
+                    "every test".to_owned()
+                } else {
+                    "every test outside its `--skip` patterns".to_owned()
+                },
+                Selection {
+                    filters: vec![],
+                    skips: s.selection.skips.clone(),
+                    exact: s.selection.exact,
+                },
+            )]
+        } else {
+            s.selection
+                .filters
+                .iter()
+                .map(|f| {
+                    (
+                        format!("`{f}`{}", if s.selection.exact { " (--exact)" } else { "" }),
+                        Selection {
+                            filters: vec![f.clone()],
+                            skips: s.selection.skips.clone(),
+                            exact: s.selection.exact,
+                        },
+                    )
+                })
+                .collect()
+        };
+        for (label, one) in groups {
+            let candidates: Vec<&UnitTest> = tests.iter().filter(|t| one.runs(&t.path)).collect();
+            let verdicts: Vec<(&UnitTest, Result<(), Reason>)> = candidates
+                .iter()
+                .map(|t| (*t, runs(s, t, on.as_deref())))
+                .collect();
+            if verdicts.iter().any(|(_, v)| v.is_ok()) {
+                continue;
+            }
+            if candidates.is_empty() {
                 diagnostics.push(format!(
-                    "step `{}` of {WORKFLOW} selects `{filter}`{} in `-p {} {}`, which matches no \
-                     test there, so the step would run nothing: `{}`",
-                    s.step,
-                    if s.selection.exact { " (--exact)" } else { "" },
-                    s.package,
-                    targets.join(" "),
+                    "{where_} selects {label} in {scope}, which matches no test there, so the \
+                     step would run nothing: `{}`",
                     s.command
                 ));
+                continue;
             }
+            let unknown: Vec<String> = verdicts
+                .iter()
+                .filter_map(|(t, v)| match v {
+                    Err(Reason::Unknown(c)) => Some(format!("`{}` (under `{c}`)", t.path)),
+                    _ => None,
+                })
+                .collect();
+            if !unknown.is_empty() {
+                diagnostics.push(format!(
+                    "{where_} selects {label} in {scope}, and this check cannot tell whether the \
+                     command runs {}: rejected rather than assumed to run: `{}`",
+                    unknown.join(", "),
+                    s.command
+                ));
+                continue;
+            }
+            let not: Vec<String> = verdicts
+                .iter()
+                .filter_map(|(t, v)| match v {
+                    Err(Reason::Not(why)) => Some(format!("`{}` ({why})", t.path)),
+                    _ => None,
+                })
+                .collect();
+            diagnostics.push(format!(
+                "{where_} selects {label} in {scope}, but the command runs none of the tests it \
+                 matches, so the step would run nothing: {}: `{}`",
+                not.join(", "),
+                s.command
+            ));
         }
     }
     Ok(diagnostics)
@@ -486,6 +719,7 @@ fn unit_tests(root_file: &str, read: Read) -> anyhow::Result<Vec<UnitTest>> {
     let mut walk = Walk {
         read,
         out: Vec::new(),
+        chain: Vec::new(),
     };
     walk.file(root_file, &text, "", &parent(root_file), false, None)?;
     Ok(walk.out)
@@ -494,6 +728,9 @@ fn unit_tests(root_file: &str, read: Read) -> anyhow::Result<Vec<UnitTest>> {
 struct Walk<'a> {
     read: Read<'a>,
     out: Vec<UnitTest>,
+    /// The `cfg` and `cfg_attr` attributes of the modules and files being
+    /// walked ([`cfgs`]).
+    chain: Vec<String>,
 }
 
 impl Walk<'_> {
@@ -520,7 +757,9 @@ impl Walk<'_> {
         }
         let syntax = syn::parse_file(text).with_context(|| format!("parsing {file}"))?;
         let restricted = restricted.or_else(|| gate(&syntax.attrs));
-        self.items(
+        let depth = self.chain.len();
+        self.chain.extend(cfgs(&syntax.attrs));
+        let walked = self.items(
             &syntax.items,
             file,
             module,
@@ -528,7 +767,9 @@ impl Walk<'_> {
             true,
             followed,
             restricted.as_deref(),
-        )
+        );
+        self.chain.truncate(depth);
+        walked
     }
 
     /// The items of module `module` in `file` (`top` when they are the
@@ -567,10 +808,14 @@ impl Walk<'_> {
                             );
                         }
                     }
+                    let mut chain = self.chain.clone();
+                    chain.extend(cfgs(&f.attrs));
                     self.out.push(UnitTest {
                         path,
                         file: file.to_owned(),
                         counts,
+                        ignored: f.attrs.iter().any(|a| a.path().is_ident("ignore")),
+                        cfgs: chain,
                     });
                 }
                 syn::Item::Mod(m) => {
@@ -585,6 +830,8 @@ impl Walk<'_> {
                              not follow"
                         )
                     };
+                    let depth = self.chain.len();
+                    self.chain.extend(cfgs(&m.attrs));
                     if let Some((_, inner)) = &m.content {
                         if path.is_some() {
                             return Err(not_followed());
@@ -598,6 +845,7 @@ impl Walk<'_> {
                             followed,
                             gated.as_deref(),
                         )?;
+                        self.chain.truncate(depth);
                         continue;
                     }
                     if m.attrs.iter().any(|a| a.path().is_ident("cfg_attr")) {
@@ -643,6 +891,7 @@ impl Walk<'_> {
                     if let Some((target, text, by_path)) = target {
                         self.file(&target, &text, &child, &child_dir, by_path, gated)?;
                     }
+                    self.chain.truncate(depth);
                 }
                 _ => {}
             }
@@ -711,6 +960,32 @@ fn gate(attrs: &[syn::Attribute]) -> Option<String> {
             .collect();
         (!UNIT_CFGS.contains(&predicate.as_str())).then(|| format!("cfg({})", list.tokens))
     })
+}
+
+/// Every `cfg` predicate of `attrs` (outer or inner), whitespace removed, and
+/// every `cfg_attr` as written (`cfg_attr(...)`), in order.
+fn cfgs(attrs: &[syn::Attribute]) -> Vec<String> {
+    attrs
+        .iter()
+        .filter_map(|a| {
+            let syn::Meta::List(list) = &a.meta else {
+                return None;
+            };
+            if a.path().is_ident("cfg_attr") {
+                Some(format!("cfg_attr({})", list.tokens))
+            } else if a.path().is_ident("cfg") {
+                Some(
+                    list.tokens
+                        .to_string()
+                        .chars()
+                        .filter(|c| !c.is_whitespace())
+                        .collect(),
+                )
+            } else {
+                None
+            }
+        })
+        .collect()
 }
 
 /// Whether `tokens` hold the identifier `name`, at any depth.
@@ -821,6 +1096,11 @@ pub fn check(
 
 /// The steps of a workflow that have a `run:` command, in order.
 pub fn steps(workflow: &str) -> anyhow::Result<Vec<Step>> {
+    steps_in(workflow, WORKFLOW)
+}
+
+/// The steps of workflow `name`, whose text is `workflow`, as [`steps`].
+fn steps_in(workflow: &str, name: &str) -> anyhow::Result<Vec<Step>> {
     struct Item {
         key_indent: usize,
         name: Option<String>,
@@ -889,7 +1169,7 @@ pub fn steps(workflow: &str) -> anyhow::Result<Vec<Step>> {
             // Folding would join the command's lines; refused rather than
             // read differently from the shell.
             ("run", Some(i)) if value.starts_with('>') => bail!(
-                "{WORKFLOW}: step `{}` has a folded `run: >`, which this check does not \
+                "{name}: step `{}` has a folded `run: >`, which this check does not \
                  read; use `run: |`",
                 i.name.as_deref().unwrap_or("(unnamed)")
             ),
@@ -1624,6 +1904,8 @@ mod tests {
                 path: path.to_owned(),
                 file: "crates/player/src/input_side.rs".to_owned(),
                 counts,
+                ignored: false,
+                cfgs: vec![],
             })
             .collect()
     }
@@ -1713,17 +1995,55 @@ mod tests {
     const PEAKS_RUN: &str = "cargo nextest run --release --locked -p bms-parser --test memory \
                              --run-ignored only -- --exact measure_load_peaks";
 
-    /// `bms-parser`'s `memory` test target holds `measure_load_peaks` and a
-    /// module's test; `player`'s binary the unit guard; nothing else exists.
-    fn tests_of(package: &str, target: &Target) -> anyhow::Result<Option<Vec<String>>> {
+    fn found_test(path: &str, ignored: bool, cfgs: &[&str]) -> UnitTest {
+        UnitTest {
+            path: path.to_owned(),
+            file: "crates/bms-parser/tests/memory.rs".to_owned(),
+            counts: false,
+            ignored,
+            cfgs: cfgs.iter().map(|&c| c.to_owned()).collect(),
+        }
+    }
+
+    /// `bms-parser`'s `memory` test target: the ignored measurement, two
+    /// ordinary tests, one behind its `dev-tools` feature and one behind a
+    /// `cfg` this check cannot evaluate; `player`'s binary the unit guard;
+    /// nothing else exists.
+    fn tests_of(package: &str, target: &Target) -> anyhow::Result<Option<Vec<UnitTest>>> {
         Ok(match (package, target) {
             ("bms-parser", Target::Test(t)) if t == "memory" => Some(vec![
-                "measure_load_peaks".into(),
-                "rows::a_row_is_counted".into(),
+                found_test("measure_load_peaks", true, &[]),
+                found_test("rows::a_row_is_counted", false, &["test"]),
+                found_test("the_timeline_is_held_at_its_counted_size", false, &[]),
+                found_test("dev::a_dev_only_case", false, &["feature=\"dev-tools\""]),
+                found_test("unix::a_unix_case", false, &["unix"]),
             ]),
-            ("player", Target::Bin(b)) if b == "tapestry" => Some(vec![GUARD.into()]),
+            ("player", Target::Bin(b)) if b == "tapestry" => Some(vec![found_test(
+                GUARD,
+                false,
+                &["test", "feature=\"dev-tools\""],
+            )]),
             _ => None,
         })
+    }
+
+    /// `bms-parser` has `dev-tools`, enabled by `extra`; `player` has
+    /// `dev-tools`.
+    fn features_of(package: &str) -> Option<Features> {
+        match package {
+            "bms-parser" => Some(
+                [
+                    ("default", vec![]),
+                    ("dev-tools", vec![]),
+                    ("extra", vec!["dev-tools".to_owned(), "dep:x".to_owned()]),
+                ]
+                .into_iter()
+                .map(|(k, v)| (k.to_owned(), v))
+                .collect(),
+            ),
+            "player" => Some([("dev-tools".to_owned(), vec![])].into_iter().collect()),
+            _ => None,
+        }
     }
 
     /// A workflow of one step, `Extra`, whose block command is `lines`.
@@ -1738,37 +2058,80 @@ mod tests {
         text
     }
 
+    fn selections_of(lines: &[&str]) -> anyhow::Result<Vec<ByName>> {
+        selections(&only_step(lines), WORKFLOW)
+    }
+
     fn selection_diagnostics(lines: &[&str]) -> anyhow::Result<Vec<String>> {
-        check_selections(&selections(&only_step(lines))?, &tests_of)
+        check_selections(&selections_of(lines)?, &tests_of, &features_of)
     }
 
     #[test]
     fn a_by_name_command_is_read_with_its_package_targets_and_filters() {
-        let selected = selections(&only_step(&[PEAKS_RUN])).unwrap();
+        let selected = selections_of(&[
+            PEAKS_RUN,
+            "cargo test -p bms-parser --test memory --features player/dev-tools,bms-parser/extra \
+             -F dev-tools --no-default-features -- --include-ignored --skip rows::",
+        ])
+        .unwrap();
         assert_eq!(
             selected,
-            [ByName {
-                step: "Extra".into(),
-                command: PEAKS_RUN.into(),
-                package: "bms-parser".into(),
-                targets: vec![Target::Test("memory".into())],
-                selection: Selection {
-                    filters: vec!["measure_load_peaks".into()],
-                    skips: vec![],
-                    exact: true,
+            [
+                ByName {
+                    workflow: WORKFLOW.into(),
+                    step: "Extra".into(),
+                    command: PEAKS_RUN.into(),
+                    package: "bms-parser".into(),
+                    targets: vec![Target::Test("memory".into())],
+                    selection: Selection {
+                        filters: vec!["measure_load_peaks".into()],
+                        skips: vec![],
+                        exact: true,
+                    },
+                    ignored: Ignored::Only,
+                    features: vec![],
+                    all_features: false,
+                    no_default_features: false,
                 },
-            }]
+                ByName {
+                    workflow: WORKFLOW.into(),
+                    step: "Extra".into(),
+                    command: "cargo test -p bms-parser --test memory --features \
+                              player/dev-tools,bms-parser/extra -F dev-tools \
+                              --no-default-features -- --include-ignored --skip rows::"
+                        .into(),
+                    package: "bms-parser".into(),
+                    targets: vec![Target::Test("memory".into())],
+                    selection: Selection {
+                        filters: vec![],
+                        skips: vec!["rows::".into()],
+                        exact: false,
+                    },
+                    ignored: Ignored::All,
+                    features: vec!["extra".into(), "dev-tools".into()],
+                    all_features: false,
+                    no_default_features: true,
+                },
+            ]
         );
     }
 
     #[test]
-    fn a_filter_that_selects_a_test_passes() {
+    fn a_selection_of_a_test_the_command_runs_passes() {
         for command in [
             PEAKS_RUN,
             "cargo test --release --locked -p bms-parser --test memory -- --ignored --exact \
              measure_load_peaks",
+            "cargo test -p bms-parser --test memory -- --include-ignored measure_load",
+            // Ignored tests only, by no name.
+            "cargo test -p bms-parser --test memory -- --ignored",
             "cargo test -p bms-parser --test=memory -- row --skip other",
             "cargo nextest run -p bms-parser --test memory a_row_is",
+            "cargo test -p bms-parser --test memory --features dev-tools -- a_dev_only",
+            "cargo test -p bms-parser --test memory --features extra -- a_dev_only",
+            "cargo test -p bms-parser --test memory --all-features -- a_dev_only",
+            // Exclusions that leave one test the command runs.
+            "cargo test -p bms-parser --test memory -- --skip the_ --skip dev:: --skip unix::",
             &format!("{UNIT_RUN} -- _alloc"),
         ] {
             assert_eq!(
@@ -1795,19 +2158,85 @@ mod tests {
                 "cargo nextest run -p bms-parser --test memory measure_peaks",
                 "`measure_peaks`",
             ),
+            // Exclusions only, which leave no test.
+            (
+                "cargo test -p bms-parser --test memory -- --skip the_ --skip a_ --skip measure_",
+                "every test outside its `--skip` patterns",
+            ),
         ];
-        for (command, filter) in rows {
+        for (command, label) in rows {
             let diags = selection_diagnostics(&[command]).unwrap();
             assert_eq!(
                 diags,
                 [format!(
-                    "step `Extra` of {WORKFLOW} selects {filter} in `-p bms-parser --test \
+                    "step `Extra` of {WORKFLOW} selects {label} in `-p bms-parser --test \
                      memory`, which matches no test there, so the step would run nothing: \
                      `{command}`"
                 )],
                 "{command}"
             );
         }
+    }
+
+    /// A name that exists but that the command does not run: ignored or
+    /// not against the command's choice, or behind a feature it leaves off.
+    #[test]
+    fn a_selection_of_a_test_the_command_does_not_run_fails() {
+        let rows = [
+            (
+                "cargo test -p bms-parser --test memory -- --ignored --exact \
+                 the_timeline_is_held_at_its_counted_size",
+                "`the_timeline_is_held_at_its_counted_size` (--exact)",
+                "`the_timeline_is_held_at_its_counted_size` (not ignored)",
+            ),
+            (
+                "cargo nextest run -p bms-parser --test memory -- --exact measure_load_peaks",
+                "`measure_load_peaks` (--exact)",
+                "`measure_load_peaks` (ignored)",
+            ),
+            (
+                "cargo test -p bms-parser --test memory -- a_dev_only",
+                "`a_dev_only`",
+                "`dev::a_dev_only_case` (needs feature `dev-tools`)",
+            ),
+            (
+                "cargo test -p bms-parser --test memory --no-default-features --features \
+                 player/dev-tools -- a_dev_only",
+                "`a_dev_only`",
+                "`dev::a_dev_only_case` (needs feature `dev-tools`)",
+            ),
+            (
+                "cargo test -p bms-parser --test memory -- --skip the_ --skip a_",
+                "every test outside its `--skip` patterns",
+                "`measure_load_peaks` (ignored)",
+            ),
+        ];
+        for (command, label, why) in rows {
+            let diags = selection_diagnostics(&[command]).unwrap();
+            assert_eq!(
+                diags,
+                [format!(
+                    "step `Extra` of {WORKFLOW} selects {label} in `-p bms-parser --test \
+                     memory`, but the command runs none of the tests it matches, so the step \
+                     would run nothing: {why}: `{command}`"
+                )],
+                "{command}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_selection_under_a_cfg_this_check_cannot_read_is_rejected() {
+        let command = "cargo test -p bms-parser --test memory -- a_unix_case";
+        assert_eq!(
+            selection_diagnostics(&[command]).unwrap(),
+            [format!(
+                "step `Extra` of {WORKFLOW} selects `a_unix_case` in `-p bms-parser --test \
+                 memory`, and this check cannot tell whether the command runs \
+                 `unix::a_unix_case` (under `unix`): rejected rather than assumed to run: \
+                 `{command}`"
+            )]
+        );
     }
 
     #[test]
@@ -1828,7 +2257,7 @@ mod tests {
 
     #[test]
     fn commands_that_select_nothing_by_name_are_not_read() {
-        let selected = selections(&only_step(&[
+        let selected = selections_of(&[
             "cargo nextest run $DEV_TOOLS --partition \"slice:$PART/$PARTS\" --no-fail-fast",
             "cargo nextest run --locked -p skin-beatoraja --features dev-tools --test lua_runtime \
              --bin lua_replay",
@@ -1836,7 +2265,8 @@ mod tests {
             "cargo test -p bms-parser --test memory -- measure_load_peaks --list",
             "cargo nextest list -p bms-parser --test memory measure_load_peaks",
             "cargo bench -p eval --bench evaluate -- --test",
-        ]))
+            "cargo nextest run -p bms-parser --test memory --run-ignored default",
+        ])
         .unwrap();
         assert_eq!(selected, []);
     }
@@ -1869,6 +2299,10 @@ mod tests {
                 "write its filters after `--`, not as a filterset",
             ),
             (
+                "cargo nextest run -p bms-parser --test memory --run-ignored some",
+                "this check does not read `--run-ignored`",
+            ),
+            (
                 "cargo test -p bms-parser --test memory -- --format=json measure_load_peaks",
                 "this check does not read `--format=json`",
             ),
@@ -1878,15 +2312,27 @@ mod tests {
             ),
         ];
         for (command, why) in rows {
-            let e = selections(&only_step(&[command])).unwrap_err();
+            let e = selections_of(&[command]).unwrap_err();
             assert_eq!(
                 e.to_string(),
-                format!(
-                    "{WORKFLOW}: step `Extra` runs `{command}`, which selects tests by name; {why}"
-                ),
+                format!("{WORKFLOW}: step `Extra` runs `{command}`, which selects tests; {why}"),
                 "{command}"
             );
         }
+    }
+
+    /// Every workflow file is read under its own name.
+    #[test]
+    fn a_selection_names_its_workflow() {
+        let text = only_step(&["cargo test -p bms-parser --test memory -- measure_peaks"]);
+        let selected = selections(&text, ".github/workflows/bench.yml").unwrap();
+        let diags = check_selections(&selected, &tests_of, &features_of).unwrap();
+        assert!(
+            diags.first().is_some_and(|d| d.starts_with(
+                "step `Extra` of .github/workflows/bench.yml selects `measure_peaks`"
+            )),
+            "{diags:?}"
+        );
     }
 
     #[test]
