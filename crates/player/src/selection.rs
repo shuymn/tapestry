@@ -3228,7 +3228,12 @@ impl PlayerRig<'_> {
             .watch_decision(crate::controls::DecisionWatch {
                 decision,
                 origin,
+                // The deadline step taken inside the rig's wait (a load
+                // still running at the deadline), as `deadline_step` takes
+                // it outside one.
                 reveal: Box::new(move || {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::stage("decision_end");
                     println!("load: the play screen loads {name}");
                     reveal();
                 }),
