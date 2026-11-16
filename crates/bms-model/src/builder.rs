@@ -211,6 +211,7 @@ impl ChartBuilder {
             timeline,
             meta: ChartMeta::default(),
             identity: ChartIdentity::default(),
+            bga: None,
         };
         // The links hold whenever this passes: each endpoint names the row
         // of its own time, and rows follow time.
