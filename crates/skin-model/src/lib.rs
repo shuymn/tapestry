@@ -155,7 +155,7 @@ pub use image::fnt::{
 pub use image::font::{
     FontDef, FontError, FontReader, MAX_FONT_BYTES, MAX_FONTS, MAX_TOTAL_FONT_BYTES,
 };
-pub use image::path::{Entry, FileId, Listing, Root, RootError};
+pub use image::path::{Entry, FileId, Listing, MAX_LINK_HOPS, Root, RootError};
 #[cfg(feature = "dev-tools")]
 pub use image::source::SourceCounts;
 pub use image::source::{CacheBounds, CacheUsage, FileSource, ResourceCache};

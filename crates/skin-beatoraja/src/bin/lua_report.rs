@@ -330,7 +330,7 @@ fn report(index: usize, survey: &Survey) -> String {
     }
     let u = survey.usage;
     line(&format!(
-        "  usage: instructions {} host calls {} native work {} loads {} (require {}, dofile {}) \
+        "  usage: instructions {} host calls {} native work {} loads {} (require {}, dofile {} (absent {})) \
          input bytes {} protected calls {} metatables {} peak memory {} \
          ast nodes {} captures {} expanded {}",
         u.instructions,
@@ -339,6 +339,7 @@ fn report(index: usize, survey: &Survey) -> String {
         u.loads,
         u.requires,
         u.dofiles,
+        u.missing_loads,
         u.input_bytes,
         u.protected_calls,
         u.metatables,
@@ -1024,7 +1025,7 @@ skin.destination = {
         assert_eq!(
             report(0, &s),
             "skin 0: imported\n  kind: none\n  modules: 0\n  \
-             usage: instructions 0 host calls 0 native work 0 loads 0 (require 0, dofile 0) \
+             usage: instructions 0 host calls 0 native work 0 loads 0 (require 0, dofile 0 (absent 0)) \
              input bytes 0 protected calls 0 metatables 0 peak memory 0 \
              ast nodes 0 captures 0 expanded 0\n  \
              root script: 0\n  root unread: 0\n  \

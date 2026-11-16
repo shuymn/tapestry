@@ -3,10 +3,11 @@
 -- loop whose length a skin chooses runs here, as Lua, so the instruction
 -- hook meters it and sees cancellation. A native function this chunk
 -- keeps is its private upvalue and is called only with arguments of the
--- exact Lua type it takes, checked first, never coerced (a string where
--- a number belongs, or the reverse, is an error), and only for a result
--- whose size is known and charged first (bytes). An unsupported form is
--- refused (refuse), never approximated.
+-- exact Lua type it takes, checked first: a string parameter reads a
+-- number as its text (number_text, Lua's own coercion), and a string
+-- where a number belongs is an error, never read as a number. It is
+-- called only for a result whose size is known and charged first
+-- (bytes). An unsupported form is refused (refuse), never approximated.
 local native, raw_charge, raw_refuse, bridge, cap, max_path, fault = ...
 
 local byte, sub = native.byte, native.sub
@@ -70,8 +71,16 @@ local function got(v)
   return v == nil and "no value" or type(v)
 end
 
--- Argument n, which must be a string.
+-- A number as text, defined after `bytes` below.
+local number_text
+
+-- Argument n, which must be a string, or a number read as its text
+-- (Lua's coercion of a number where a string is expected). Callers use
+-- the string it returns, never the argument.
 local function str(v, n, fname)
+  if type(v) == "number" then
+    return number_text(v)
+  end
   if type(v) ~= "string" then
     arg_error(n, fname, "string expected, got " .. got(v))
   end
@@ -124,6 +133,37 @@ local function bytes(n)
   end
 end
 
+-- The longest number text: an integer's 20 characters, or `%.14g`'s 21
+-- (sign, 14 digits, point, `e`, sign and 3 exponent digits).
+local NUMBER_TEXT = 24
+local INF = 1 / 0
+
+-- Number v as text (design.md "beatoraja Lua Skins", number text): an
+-- integer's digits; a float holding an integer x, -2^63 <= x < 2^63, as
+-- that integer's digits (negative zero as 0); `nan` whatever its sign,
+-- `inf` and `-inf`; any other float by Lua 5.2's `%.14g`. Charged
+-- before it is made.
+number_text = function(v)
+  bytes(NUMBER_TEXT)
+  if mathtype(v) == "integer" then
+    return native_tostring(v)
+  end
+  if v ~= v then
+    return "nan"
+  elseif v == INF then
+    return "inf"
+  elseif v == -INF then
+    return "-inf"
+  end
+  -- Lua 5.4's tointeger takes exactly the floats holding an integer in
+  -- that range.
+  local i = tointeger(v)
+  if i ~= nil then
+    return native_tostring(i)
+  end
+  return native_format("%.14g", v)
+end
+
 -- Lua's posrelatI: a start position, 1 for anything below the string.
 local function start_of(pos, l)
   if pos > 0 then
@@ -158,7 +198,7 @@ function string_lib.len(s)
 end
 
 function string_lib.sub(s, i, j)
-  str(s, 1, "sub")
+  s = str(s, 1, "sub")
   local l = #s
   i = start_of(int(i, 2, "sub", 1), l)
   j = end_of(int(j, 3, "sub", -1), l)
@@ -169,17 +209,19 @@ function string_lib.sub(s, i, j)
 end
 
 function string_lib.upper(s)
-  bytes(#str(s, 1, "upper"))
+  s = str(s, 1, "upper")
+  bytes(#s)
   return native_upper(s)
 end
 
 function string_lib.lower(s)
-  bytes(#str(s, 1, "lower"))
+  s = str(s, 1, "lower")
+  bytes(#s)
   return native_lower(s)
 end
 
 function string_lib.byte(s, i, j)
-  str(s, 1, "byte")
+  s = str(s, 1, "byte")
   local l = #s
   local pi = int(i, 2, "byte", 1)
   i = start_of(pi, l)
@@ -217,7 +259,7 @@ end
 -- and `0`, a width and a precision of at most two digits each, and
 -- `%%`. Any other is refused.
 function string_lib.format(fmt, ...)
-  str(fmt, 1, "format")
+  fmt = str(fmt, 1, "format")
   local args = { ... }
   local nargs = native_select("#", ...)
   local l = #fmt
@@ -274,7 +316,10 @@ function string_lib.format(fmt, ...)
         num(v, argi + 1, "format")
         total = total + width + (precision or 6) + 320
       elseif letter == 115 then -- s
-        if type(v) ~= "string" then
+        if type(v) == "number" then
+          v = number_text(v)
+          args[argi] = v
+        elseif type(v) ~= "string" then
           v = native_tostring(v)
           args[argi] = v
         end
@@ -690,7 +735,7 @@ local function replacement(repl, kind, si, e, out)
             v = capture(d - 48, si, e)
           end
           if type(v) == "number" then
-            v = native_tostring(v)
+            v = number_text(v)
           end
           out[#out + 1] = v
         else
@@ -722,7 +767,7 @@ local function replacement(repl, kind, si, e, out)
     bytes(e - si)
     out[#out + 1] = sub(M.s, si, e - 1)
   elseif type(v) == "string" or type(v) == "number" then
-    out[#out + 1] = type(v) == "number" and native_tostring(v) or v
+    out[#out + 1] = type(v) == "number" and number_text(v) or v
   else
     error("invalid replacement value (a " .. type(v) .. ")", 0)
   end
@@ -742,6 +787,11 @@ end
 function string_lib.gsub(s, p, repl, max_n)
   s = str(s, 1, "gsub")
   p = str(p, 2, "gsub")
+  -- A number replacement is its text, a string replacement (Lua's
+  -- coercion; its `%` escapes then read as any string's).
+  if type(repl) == "number" then
+    repl = number_text(repl)
+  end
   local kind = type(repl)
   if kind == "table" then
     plain(repl, 3, "gsub")
@@ -837,7 +887,7 @@ function table_lib.concat(t, sep, i, j)
     local v = rawget(t, k)
     local tv = type(v)
     if tv == "number" then
-      v = native_tostring(v)
+      v = number_text(v)
     elseif tv ~= "string" then
       error("invalid value (at index " .. k .. ") in table for 'concat'", 2)
     end
@@ -977,7 +1027,7 @@ function base.tonumber(v, b)
   if mathtype(b) ~= "integer" or b ~= 10 then
     refuse(TONUMBER)
   end
-  str(v, 1, "tonumber")
+  v = str(v, 1, "tonumber")
   local i, l = 1, #v
   while i <= l and is_space(byte(v, i)) do
     i = i + 1

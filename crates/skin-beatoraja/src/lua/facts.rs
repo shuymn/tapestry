@@ -326,7 +326,7 @@ impl FactId {
 }
 
 /// Whether the result schema expression `src` reads only the chart's
-/// fields other than its judged notes.
+/// fields other than its judged notes, and the play's target.
 fn chart_only(src: &str) -> bool {
     src.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '.'))
         .filter(|t| !t.is_empty() && !t.starts_with(|c: char| c.is_ascii_digit()))
@@ -335,6 +335,9 @@ fn chart_only(src: &str) -> bool {
                 t,
                 "if" | "then" | "else" | "true" | "false" | "abs" | "clamp"
             ) || (t.starts_with("chart.") && !t.starts_with("chart.notes"))
+                // The play's target: a fact of the attempt, the same in
+                // every view.
+                || t == "target.ex"
         })
 }
 

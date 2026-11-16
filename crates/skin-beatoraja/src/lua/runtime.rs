@@ -459,6 +459,9 @@ impl Screen {
 /// it reads is absent here, where the pinned source defines one (owner
 /// decision O8; docs/stage3.md S7-07). `None`: no such value, the typed
 /// constant 0 applies. `IntegerPropertyFactory.java` is cited as `IPF`.
+/// The runtime asks this only for an id its screen's profile does not
+/// bridge (`host::runtime_number`), so no entry names an id that profile
+/// bridges.
 ///
 /// Both screens:
 /// - 14, 314-316 (lane cover, lift, hidden) and 160, 163, 164 (current BPM,
@@ -474,36 +477,25 @@ impl Screen {
 ///   an empty ranking: `Integer.MIN_VALUE` (`IPF:876-907`, through
 ///   `:985-986`; `RankingData.java:188-193`, `getScore`, and `:201-206`,
 ///   `getScoreRanking`).
-/// - 92, 350-353, 360-365 (main BPM, note counts per class, density), song
-///   information, which no bridge supplies yet: `Integer.MIN_VALUE`, as
-///   with no song information (`IPF:167-173`, `:319-388`).
 ///
 /// Selection:
-/// - 75, 105, 174 (the best's max combo), 78-89 (its clear and fail
-///   counts, judgment counts and rates), none kept here:
-///   `Integer.MIN_VALUE`, as with no score (`IPF:131`, `:140-153`, `:182`,
-///   `:234`, `:500-511`, `:627-632`).
 /// - 107, 407 (the gauge), 173, 175, 176, 178 (the best's combo and BP and
 ///   their differences) and 370-377 (clear type, timing statistics),
 ///   play or result only: `Integer.MIN_VALUE` (`IPF:184-185`, `:233-238`,
 ///   `:396-440`, `:658-688`, `:712-753`).
-/// - 243-249 (the last play's date), 320-330 (a folder's lamps) and 368
-///   (gauge TOTAL), which no bridge supplies yet: `Integer.MIN_VALUE`, as
-///   with no score, no folder row or no song information (`IPF:281-287`,
-///   `:770-810`, `:389-395`, `:996-999`).
+/// - 243-249 (the last play's date) and 320-330 (a folder's lamps), which
+///   no bridge supplies yet: `Integer.MIN_VALUE`, as with no score or no
+///   folder row (`IPF:281-287`, `:770-810`, `:996-999`).
 /// - 122, 135, 157, the rival's rate, with no rival: 100, the rate being
 ///   1.0 (`IPF:190`, `:193`, `:202`; `ScoreDataProperty.java:56-60`); 123,
 ///   136, 158 give 0.
 /// - 271, the rival's EX score, with no rival: 0 (`IPF:288`;
 ///   `ScoreDataProperty.java:55-58`).
-/// - 410-427, the early and late counts and their sums, with no score: 0
-///   (`IPF:444-467`, `:516-520`, over `MainState.getJudgeCount`,
-///   `MainState.java:141-144`).
 ///
 /// Result:
-/// - 173, 175 (the best's max combo and its difference), which no bridge
-///   supplies yet: `Integer.MIN_VALUE`, as with no best (`IPF:233`,
-///   `:235`, `:734-753`).
+/// - 92, 350-353, 360-365 (main BPM, note counts per class, density), song
+///   information, which no bridge supplies yet: `Integer.MIN_VALUE`, as
+///   with no song information (`IPF:167-173`, `:319-388`).
 /// - 77-79 (play, clear and fail counts), 300 (a folder's songs) and
 ///   320-330 (a folder's lamps), selection only: `Integer.MIN_VALUE`
 ///   (`IPF:133-153`, `:289`, `:800-810`, `:996-999`).
@@ -525,31 +517,12 @@ pub fn absent(kind: ScreenKind, id: i32) -> Option<i32> {
             | 202..=220
             | 222..=242
             | 280..=289
-            | 380..=399
-            | 92
-            | 350..=353
-            | 360..=365,
+            | 380..=399,
         )
-        | (
-            Selection,
-            75
-            | 105
-            | 174
-            | 78..=89
-            | 107
-            | 407
-            | 173
-            | 175
-            | 176
-            | 178
-            | 370..=377
-            | 243..=249
-            | 320..=330
-            | 368,
-        )
-        | (Result, 77..=79 | 300 | 320..=330 | 173 | 175) => Some(HIDDEN),
+        | (Selection, 107 | 407 | 173 | 175 | 176 | 178 | 370..=377 | 243..=249 | 320..=330)
+        | (Result, 92 | 350..=353 | 360..=365 | 77..=79 | 300 | 320..=330) => Some(HIDDEN),
         (Selection, 122 | 135 | 157) => Some(100),
-        (Selection, 271 | 410..=427) => Some(0),
+        (Selection, 271) => Some(0),
         _ => None,
     }
 }
@@ -1276,8 +1249,8 @@ mod tests {
         for (kind, id, want) in [
             (Selection, 14, Some(HIDDEN)),
             (Result, 316, Some(HIDDEN)),
-            (Selection, 75, Some(HIDDEN)),
-            (Selection, 89, Some(HIDDEN)),
+            (Selection, 75, None),
+            (Selection, 89, None),
             (Result, 89, None),
             (Selection, 122, Some(100)),
             (Selection, 123, None),
@@ -1293,28 +1266,47 @@ mod tests {
             (Selection, 377, Some(HIDDEN)),
             (Result, 377, None),
             (Result, 399, Some(HIDDEN)),
-            (Selection, 427, Some(0)),
+            (Selection, 427, None),
             (Result, 426, None),
             (Selection, 428, None),
             (Selection, 65_536, None),
-            (Selection, 92, Some(HIDDEN)),
+            (Selection, 92, None),
             (Result, 92, Some(HIDDEN)),
             (Result, 353, Some(HIDDEN)),
             (Selection, 354, None),
-            (Selection, 360, Some(HIDDEN)),
+            (Selection, 360, None),
             (Result, 365, Some(HIDDEN)),
             (Selection, 243, Some(HIDDEN)),
             (Selection, 249, Some(HIDDEN)),
             (Result, 243, None),
             (Selection, 330, Some(HIDDEN)),
-            (Selection, 368, Some(HIDDEN)),
+            (Selection, 368, None),
             (Result, 368, None),
-            (Result, 173, Some(HIDDEN)),
-            (Result, 175, Some(HIDDEN)),
+            (Result, 173, None),
+            (Result, 175, None),
             (Result, 174, None),
         ] {
             assert_eq!(absent(kind, id), want, "{kind:?} {id}");
         }
+    }
+
+    /// No absent value names an id its screen's profile bridges: the
+    /// runtime asks for one only when the profile has no bridge, so such
+    /// an entry would never be reached.
+    #[test]
+    fn absent_values_are_for_unbridged_ids() {
+        use crate::import::result::profile as res;
+        use crate::import::selection::profile as sel;
+        let bridged = |kind, id| match kind {
+            Selection => matches!(sel::number(id), Some(sel::Class::Bridge(_))),
+            _ => matches!(res::number(id), Some(sel::Class::Bridge(_))),
+        };
+        let dead: Vec<_> = [Selection, Result]
+            .into_iter()
+            .flat_map(|kind| (0..=2_000).map(move |id| (kind, id)))
+            .filter(|&(kind, id)| absent(kind, id).is_some() && bridged(kind, id))
+            .collect();
+        assert!(dead.is_empty(), "{dead:?}");
     }
 
     /// A permit returns exactly once, by its drop, on any thread; a return

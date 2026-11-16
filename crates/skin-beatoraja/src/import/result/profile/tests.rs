@@ -50,10 +50,7 @@ const NUMERIC: &[(i32, i32, C)] = &[
     (105, 108, C::N),
     (110, 116, C::N),
     (128, 128, C::N),
-    (150, 150, C::N),
-    (151, 151, C::D),
-    (152, 156, C::N),
-    (157, 158, C::D),
+    (150, 158, C::N),
     (170, 172, C::N),
     (173, 173, C::N),
     (174, 174, C::N),
@@ -86,9 +83,10 @@ const TEXT: &[(i32, i32, C)] = &[
 /// §A's image indices: 2 N, 9 constants.
 const IMAGE_INDEX: &[(i32, i32, C)] = &[(42, 42, C::K(0)), (370, 371, C::N), (450, 457, C::K(0))];
 
-/// §A's built-in options: 44 N (180 to 184 the chart's judgment class,
-/// 190, 191, 194 and 195 its stage file and back image), then the 21 D
-/// constants with their values.
+/// §A's built-in options: 47 N (180 to 184 the chart's judgment class,
+/// 190, 191, 194 and 195 its stage file and back image, 352 to 354 the
+/// EX score against the play's target), then the 21 D constants with
+/// their values.
 const OPTION_N: &[(i32, i32)] = &[
     (90, 91),
     (150, 155),
@@ -102,6 +100,7 @@ const OPTION_N: &[(i32, i32)] = &[
     (330, 330),
     (332, 332),
     (335, 335),
+    (352, 354),
     (2244, 2245),
 ];
 const OPTION_D: &[(i32, i32, bool)] = &[
@@ -147,11 +146,11 @@ fn every_profile_id_has_its_class() {
             .filter(|&id| of(number(id)) == Some(c))
             .count()
     };
-    assert_eq!((count(C::N), count(C::D)), (107, 26));
+    assert_eq!((count(C::N), count(C::D)), (110, 23));
     let n = OPTION_N.iter().flat_map(|&(a, b)| a..=b);
     let d = OPTION_D.iter().flat_map(|&(a, b, _)| a..=b);
     // 160 to 164 are N (constant per kind) with constant values.
-    assert_eq!((n.clone().count(), d.clone().count()), (44, 23));
+    assert_eq!((n.clone().count(), d.clone().count()), (47, 23));
     for id in 0..=3_000 {
         let class = option(id);
         if n.clone().any(|i| i == id) {

@@ -41,10 +41,12 @@ use crate::{
 };
 
 /// The most sprites the selection screen's strip draws over its skin (a
-/// band under its search line, one under its notice, and the
-/// composition's underline), from the reserve the skin cannot fill
-/// ([`Renderer::build_selection`]).
-pub const STRIP_SPRITES: usize = 3;
+/// band under its search line, one under its notice, one under its
+/// list-cut line, and the composition's underline), from the reserve the
+/// skin cannot fill ([`Renderer::build_selection`]).
+pub const STRIP_SPRITES: usize = 4;
+
+const _: () = assert!(STRIP_SPRITES <= OVERLAY_SPRITES as usize);
 
 /// The most sprites the result screen's strip draws over its skin, one
 /// band per fact that applies, from the same reserve
@@ -96,13 +98,13 @@ static RENDERERS: AtomicU64 = AtomicU64::new(0);
 pub const MAX_SPRITES: usize = 8_192;
 
 /// The level-0 texels every screen kind's committed installation shares
-/// with a candidate ([`Renderer::admit`]): 832 Mi, sized so that the
+/// with a candidate ([`Renderer::admit`]): 896 Mi, sized so that the
 /// largest skins of each kind fit together with their VM charges, a play
 /// skin's chart layer included, and at least twice one atlas array's cap
 /// ([`skin_model::MAX_ATLAS_TEXELS`]), so any skin that fits alone is
 /// admitted on its own and two at that cap fit together. A provisional
 /// limit, raised when a real case hits it.
-pub const SHARED_TEXELS: u64 = 832 << 20;
+pub const SHARED_TEXELS: u64 = 896 << 20;
 
 // Two kinds' installations at the per-atlas cap must fit in the shared
 // budget at once: a candidate at the cap beside another kind committed at

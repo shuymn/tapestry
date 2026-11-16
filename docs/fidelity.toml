@@ -209,8 +209,9 @@ id = "SF-012"
 summary = "Selection's cue sounds for the cursor, places, panels and options"
 class = "rule"
 reason = """
-A player hears selection answer each input: `scratch` for each row a \
-one-row step moves the cursor, `f-open` for a place entered, `f-close` for \
+A player hears selection answer each input: `scratch` for each one-row \
+step a movement asks for, whether or not it comes back to the row it left \
+on the list's ring, `f-open` for a place entered, `f-close` for \
 a place left for its parent, `o-open` and `o-close` as an option panel \
 shows and goes, and `o-change` for an order step, a preset step or a cover \
 switch turned."""
@@ -229,6 +230,7 @@ tests = [
     "crates/player/src/selection.rs::each_input_path_asks_for_its_cues",
     "crates/player/src/selection.rs::the_panel_cues_follow_the_panel_shown",
     "crates/player/src/selection/tests/pointer.rs::the_wheel_sounds_a_row_a_notch",
+    "crates/player/src/selection/tests/pointer.rs::the_wheel_steps_around_the_ring",
     "crates/player/src/selection/tests/pointer.rs::a_choice_after_a_cue_burst_sounds_decide",
     "crates/player/src/system_sounds/rig_tests.rs::a_look_requests_its_cues",
 ]
@@ -299,4 +301,34 @@ tests = [
     "crates/player/src/system_sounds/rig_tests.rs::a_view_switch_keeps_the_result_sounds",
     "crates/player/src/render_side/tests/decision/integrated.rs::result_sounds_through_a_run",
     "crates/player/src/system_sounds/rig_tests.rs::loop_result_is_read_at_startup",
+]
+
+[[entry]]
+id = "SF-016"
+summary = "The selection list is a ring: the cursor wraps at both ends and a skin's rows fill around it"
+class = "rule"
+reason = """
+A player sees and hears the list as a ring: Up on the first row lands on \
+the last and Down on the last on the first, each step sounding; a skin's \
+song list shows, in each slot, the row at its offset from the cursor \
+around the list, so the row above the first is the last and a list \
+shorter than the slots repeats to fill them."""
+source = [
+    "src/bms/player/beatoraja/select/BarManager.java:538-547 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/select/BarRenderer.java:145-147 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/select/BarRenderer.java:471-480 @beatoraja-0.8.9",
+]
+sites = ["crates/player/src/select.rs", "crates/player/src/selection.rs"]
+tests = [
+    "crates/player/src/select.rs::the_arrow_and_page_keys_step_around_the_ring",
+    "crates/player/src/select.rs::a_step_back_onto_the_same_row_still_sounds",
+    "crates/player/src/select.rs::an_empty_list_takes_no_step",
+    "crates/player/src/select.rs::the_skin_window_runs_around_the_ring",
+    "crates/player/src/select.rs::the_feed_carries_the_ring_its_change_and_the_cut",
+    "crates/player/src/select.rs::the_built_in_page_wraps_its_cursor_without_repeating_lines",
+    "crates/player/src/selection.rs::the_skin_window_wraps_across_folder_and_chart_rows",
+    "crates/player/src/selection.rs::the_wheel_over_an_empty_list_takes_no_step",
+    "crates/player/src/selection/tests/pointer.rs::a_press_on_a_repeated_row_acts_on_the_row_it_shows",
+    "crates/player/src/selection/tests/pointer.rs::the_wheel_steps_around_the_ring",
+    "crates/player/src/menu_screen/tests/skinned.rs::a_short_list_fills_every_slot_around_the_cursor",
 ]
