@@ -1111,6 +1111,10 @@ pub struct SelectScript {
     held_until: Option<std::time::Instant>,
     /// How long a step waits on a holding capture: the render bound.
     hold_bound: Option<Duration>,
+    /// When the front step, a command on a result, first found the
+    /// result's gate closed: it is sent within the render bound after, or
+    /// fails.
+    pub input_since: Option<std::time::Instant>,
     /// The views the result had changed to when the front step, a view
     /// command on a result, was sent: it is over once a later view is
     /// published and drawn.
@@ -1260,6 +1264,7 @@ impl SelectScript {
         self.drawn_from = None;
         self.identities.clear();
         self.held_until = None;
+        self.input_since = None;
         self.sent_views = None;
     }
 
@@ -1282,6 +1287,14 @@ impl SelectScript {
             .held_until
             .get_or_insert_with(|| std::time::Instant::now() + bound);
         std::time::Instant::now() >= until
+    }
+
+    /// How long the front step has waited since its deadline was set
+    /// ([`hold_expired`](Self::hold_expired)); zero before.
+    pub fn held_for(&self) -> Duration {
+        self.held_until
+            .and_then(|until| until.checked_sub(self.hold_bound()))
+            .map_or(Duration::ZERO, |since| since.elapsed())
     }
 
     /// The front step waits on; `false` once it has waited

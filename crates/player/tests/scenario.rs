@@ -3701,6 +3701,48 @@ fn stay_on_a_scene_time_past_the_bound_fails() {
     );
 }
 
+/// `stay` keeps its deadline through the outro its scene time begins: an
+/// outro still playing at the render bound fails the step then, the result
+/// not left, rather than leaving after the outro. The scene time, 2 s, is
+/// within the bound, 9 s; the outro, 10 s (the longest a skin's may be),
+/// ends past it.
+#[test]
+fn stay_through_an_outro_past_the_bound_fails() {
+    let fx = Fixture::new();
+    write_chart(&fx.library(), "a", "譜面A");
+    result_skin_with(&fx, Reads::Nothing, ", fadeout = 10000, scene = 2000");
+    let file = fx.base.join("scenario.toml");
+    fs::write(
+        &file,
+        small(&[
+            "select = { path = \"library/a/a.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"stay\"",
+            "quit = {}",
+        ]),
+    )
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_tapestry"));
+    command
+        .arg("--dev-scenario")
+        .arg(&file)
+        .args(["--dev-render-timeout", "9"])
+        .env("LOCALAPPDATA", &fx.appdata);
+    let (out, stdout, stderr) = fx.run_drained(&mut command, std::time::Duration::from_secs(300));
+    assert_eq!(out.status.code(), Some(1), "{stdout}\n{stderr}");
+    assert!(
+        stdout.contains("dev: result outro began"),
+        "the scene time began no outro: {stdout}"
+    );
+    assert!(
+        stderr.contains(
+            "step 3 (result): the result did not leave by its scene time within the render \
+             bound: its scene time 2000 ms, its outro begun, waited "
+        ) && stderr.contains(" of 9000 ms"),
+        "{stderr}"
+    );
+}
+
 /// A capture whose frame is being written when its result is left is not
 /// failed by the leaving.
 #[test]
