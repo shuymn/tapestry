@@ -104,6 +104,8 @@ const OPTION_N: &[(i32, i32)] = &[
     (2244, 2245),
 ];
 const OPTION_D: &[(i32, i32, bool)] = &[
+    (40, 40, true),
+    (41, 41, false),
     (50, 50, true),
     (51, 51, false),
     (196, 196, true),
@@ -148,7 +150,7 @@ fn every_profile_id_has_its_class() {
     let n = OPTION_N.iter().flat_map(|&(a, b)| a..=b);
     let d = OPTION_D.iter().flat_map(|&(a, b, _)| a..=b);
     // 160 to 164 are N (constant per kind) with constant values.
-    assert_eq!((n.clone().count(), d.clone().count()), (47, 21));
+    assert_eq!((n.clone().count(), d.clone().count()), (47, 23));
     for id in 0..=3_000 {
         let class = option(id);
         if n.clone().any(|i| i == id) {

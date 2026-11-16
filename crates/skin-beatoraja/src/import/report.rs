@@ -194,6 +194,9 @@ pub enum DeviationId {
     D12,
     /// A distance-field bitmap font drawn with the default font.
     D13,
+    /// The BGA setting (options 40 and 41) answered as off, where the
+    /// source answers from its loaded resource.
+    D33,
 }
 
 /// How the lanes and their covers are drawn differently from the source:
