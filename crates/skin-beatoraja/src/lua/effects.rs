@@ -596,27 +596,45 @@ impl<'a> Walk<'a> {
         } else {
             !s.diagnosed
         };
-        let t = if walk {
+        if walk {
             s.busy = true;
             s.diagnosed |= !quiet;
             let r = self.body(i, p, quiet)?;
-            match self.states.get_mut(p as usize) {
-                Some(s) => {
-                    s.busy = false;
-                    s.results.get_or_insert(r).clone()
-                }
-                None => r,
-            }
-        } else {
-            match &s.results {
-                Some(t) => t.clone(),
-                None => return Ok((Tuple::unknown(), Some(p))),
-            }
+            let Some(s) = self.states.get_mut(p as usize) else {
+                self.charge_results(r.fixed.len())
+                    .map_err(|why| Found { why, ..untagged })?;
+                return Ok((r, Some(p)));
+            };
+            s.busy = false;
+            s.results.get_or_insert(r);
+        }
+        // Its kept results, one unit each, charged before they are copied.
+        let n = match self.states.get(p as usize).and_then(|s| s.results.as_ref()) {
+            Some(t) => t.fixed.len(),
+            None => return Ok((Tuple::unknown(), Some(p))),
         };
-        // Its results kept or copied, one unit each.
-        let n = u64::try_from(t.fixed.len()).unwrap_or(u64::MAX);
-        self.an.charge(n).map_err(|why| Found { why, ..untagged })?;
+        self.charge_results(n)
+            .map_err(|why| Found { why, ..untagged })?;
+        super::residual::did("walk results");
+        let t = self
+            .states
+            .get(p as usize)
+            .and_then(|s| s.results.clone())
+            .unwrap_or_else(Tuple::unknown);
         Ok((t, Some(p)))
+    }
+
+    /// `n` results' units charged before they are copied. For a test, the
+    /// charge can be made to meet an exhausted allowance
+    /// ([`super::tests::fail_next`], site `walk results`), so the real
+    /// check refuses it.
+    fn charge_results(&self, n: usize) -> Result<(), Unsupported> {
+        let n = u64::try_from(n).unwrap_or(u64::MAX);
+        #[cfg(test)]
+        if n > 0 && super::tests::fail_at("walk results") {
+            self.an.work.set(super::limits::MAX_ANALYSIS_WORK);
+        }
+        self.an.charge(n)
     }
 
     /// The results of instance `i`'s body, prototype `p`: its kind passes,
