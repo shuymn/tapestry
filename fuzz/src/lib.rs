@@ -107,6 +107,31 @@ pub fn bms_load(data: &[u8]) -> Result<Loaded, LoadError> {
                 loaded.chart.identity.resolved_hash,
                 mapped.chart.identity.resolved_hash
             );
+            // The BGA structure is read from the same objects at every
+            // speed, only its times mapped (its own timing may still fail
+            // at one speed alone).
+            if let (Some(one), Some(at)) = (&loaded.chart.bga, &mapped.chart.bga) {
+                assert_eq!(one.images(), at.images());
+                let images =
+                    |e: &[bms_model::BgaEvent]| e.iter().map(|e| e.image).collect::<Vec<_>>();
+                assert_eq!(
+                    images(one.base()),
+                    images(at.base()),
+                    "a mapped base event changed"
+                );
+                assert_eq!(
+                    images(one.layer()),
+                    images(at.layer()),
+                    "a mapped layer event changed"
+                );
+                assert!(
+                    one.poor()
+                        .iter()
+                        .map(|p| &p.frames)
+                        .eq(at.poor().iter().map(|p| &p.frames)),
+                    "a mapped poor sequence changed"
+                );
+            }
         }
         Err(LoadError::TooLongAtSpeed { .. }) => {}
         Err(e) => panic!("loads at 1x but not at {}/20: {e}", speed.twentieths()),

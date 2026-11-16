@@ -108,6 +108,12 @@ pub fn read(source: &Source, limits: &Limits, speed: Speed) -> Option<ChartBga> 
     }
     let strip = |events: Vec<(BgaEvent, TimelineId)>| events.into_iter().map(|e| e.0).collect();
     // Sorted by construction: a failure is a loader bug, which leaves the
-    // chart without BGA rather than failing a load for what is only shown.
-    ChartBga::new(images, strip(base), strip(layer), sequences).ok()
+    // chart without BGA rather than failing a load for what is only shown;
+    // debug builds, the fuzzer's included, stop on it.
+    let bga = ChartBga::new(images, strip(base), strip(layer), sequences);
+    debug_assert!(
+        bga.is_ok(),
+        "the loader built an invalid BGA structure: {bga:?}"
+    );
+    bga.ok()
 }
