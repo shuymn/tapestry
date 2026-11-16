@@ -2652,6 +2652,8 @@ impl PlayerRig<'_> {
             }
             sel.shelf.choose(path);
             sel.chosen_at = self.clock.now();
+            #[cfg(feature = "dev-tools")]
+            crate::dev::stages_begin(self.clock, sel.chosen_at);
             let name = file_name(path);
             let after = since(sel.entered_at, sel.chosen_at).as_millis();
             println!("select: chose {name}{what} {after} ms after entering selection");
@@ -3608,12 +3610,15 @@ impl AppRig for PlayerRig<'_> {
     /// stage: a loading lifetime begins, with the shown gauge's descriptor
     /// from the validated preset selection has chosen.
     fn entered_loading(&mut self, chart: &std::path::Path) {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::stage("decision_end");
         // Selection is left, its images before the play generation's
         // renewal (SC5): nothing of selection's begins after it.
         self.left_selection();
         // A new generation of the chart's images before the loading
         // lifetime begins: none of the last one's draws in it.
         self.chart_images.renew();
+        self.bga.renew();
         // The coming attempt's entry: its loading-time adjustments are its
         // own, and solve nothing until its chart is read. A failed fence is
         // the input thread's failure, which ends the run.
@@ -3723,6 +3728,7 @@ impl AppRig for PlayerRig<'_> {
         // lifetime begins: none of the last choice's draws when the
         // deadline reveals it.
         self.chart_images.renew();
+        self.bga.renew();
         self.controls.close_epoch();
         if let Some(ime) = self.selection.as_ref().and_then(|s| s.ime.as_ref()) {
             ime.set(false);
@@ -3823,6 +3829,8 @@ impl AppRig for PlayerRig<'_> {
     /// epoch's end, the held lifetime shown, and a new scene. Waits for
     /// nothing.
     fn deadline_step(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::stage("decision_end");
         self.end_decision();
         if let Some((_, name)) = self.selection.as_ref().and_then(|s| s.decision.as_ref()) {
             println!("load: the play screen loads {name}");
@@ -3961,6 +3969,7 @@ impl AppRig for PlayerRig<'_> {
         // Its images' job was cancelled with the choice's scope below; its
         // set is never taken, nor drawn.
         self.chart_images.forget();
+        self.bga.forget();
         let looks = looks!(self);
         let Some(sel) = &mut self.selection else {
             return Ok(());
@@ -3984,6 +3993,7 @@ impl AppRig for PlayerRig<'_> {
         // The last chart's images go: nothing of them stays beside
         // selection.
         self.chart_images.drop_images();
+        self.bga.drop_images();
         self.result_skin.drop_images();
         // Another scene: held adjustment controls act no more until
         // pressed afresh.

@@ -3016,6 +3016,148 @@ static LOST_PINNED_FAULT: AtomicU64 = AtomicU64::new(0);
 static LOST_PINNED_SEEN: AtomicU64 = AtomicU64::new(0);
 static RESTORE_REFUSED: AtomicBool = AtomicBool::new(false);
 
+/// The stages of the load from a choice to READY (`[load_stages]`), each
+/// in µs from the choice on the game's clock: the first start and the
+/// last end of each, and the points, until READY ends the record.
+#[derive(Debug, Default)]
+struct LoadStages {
+    /// The game's clock and the choice's time on it, from the choice on.
+    since: Option<(QpcClock, TimeUs)>,
+    stamps: Vec<(&'static str, i64)>,
+    /// READY was stamped: nothing more until the next choice.
+    done: bool,
+}
+
+static LOAD_STAGES: Mutex<LoadStages> = Mutex::new(LoadStages {
+    since: None,
+    stamps: Vec::new(),
+    done: false,
+});
+
+/// The order `[load_stages]` lists its keys in.
+pub const LOAD_STAGE_KEYS: [&str; 19] = [
+    "chart_start",
+    "chart_end",
+    "sounds_start",
+    "sounds_end",
+    "loudness_start",
+    "loudness_end",
+    "bga_start",
+    "bga_end",
+    "bga_reads_start",
+    "bga_reads_end",
+    "bga_packing_start",
+    "bga_packing_end",
+    "bga_decodes_start",
+    "bga_decodes_end",
+    "bga_upload_start",
+    "bga_upload_end",
+    "decision_end",
+    "minimum_end",
+    "ready",
+];
+
+fn load_stages() -> std::sync::MutexGuard<'static, LoadStages> {
+    LOAD_STAGES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// A chart was chosen at `chosen` on `clock`: the stages start again.
+pub fn stages_begin(clock: QpcClock, chosen: TimeUs) {
+    let mut s = load_stages();
+    s.since = Some((clock, chosen));
+    s.stamps.clear();
+    s.done = false;
+}
+
+/// Stamps stage `name` now.
+pub fn stage(name: &'static str) {
+    stage_at(name, None);
+}
+
+/// Stamps stage `name` at `at` (now when `None`): a start keeps its first
+/// stamp, anything else its last.
+pub fn stage_at(name: &'static str, at: Option<TimeUs>) {
+    let mut s = load_stages();
+    let Some((clock, chosen)) = s.since else {
+        return;
+    };
+    if s.done {
+        return;
+    }
+    let t = at.unwrap_or_else(|| clock.now()).0 - chosen.0;
+    match s.stamps.iter_mut().find(|(n, _)| *n == name) {
+        Some(_) if name.ends_with("_start") => {}
+        Some((_, v)) => *v = t,
+        None => s.stamps.push((name, t)),
+    }
+    if name == "ready" {
+        s.done = true;
+    }
+}
+
+/// The coordinator's jobs' stages ([`game::coord::observe_jobs`]).
+pub fn job_stage(kind: game::coord::JobKind, start: bool) {
+    use game::coord::JobKind;
+    let name = match (kind, start) {
+        (JobKind::Ingest, true) => "chart_start",
+        (JobKind::Ingest, false) => "chart_end",
+        (JobKind::Bank, true) => "sounds_start",
+        (JobKind::Bank, false) => "sounds_end",
+        (JobKind::Loudness | JobKind::Measure, true) => "loudness_start",
+        (JobKind::Loudness | JobKind::Measure, false) => "loudness_end",
+        // The BGA job stamps its own, on either path.
+        (JobKind::ChartImages | JobKind::BgaImages, _) => return,
+    };
+    stage(name);
+}
+
+/// The stages recorded since the last choice once READY was stamped, in
+/// [`LOAD_STAGE_KEYS`]' order; taken, so only the first play after a
+/// choice carries them.
+pub fn take_load_stages() -> Option<Vec<(&'static str, i64)>> {
+    let mut s = load_stages();
+    if !s.done {
+        return None;
+    }
+    s.done = false;
+    s.since = None;
+    let stamps = std::mem::take(&mut s.stamps);
+    Some(
+        LOAD_STAGE_KEYS
+            .iter()
+            .filter_map(|k| stamps.iter().find(|(n, _)| n == k).copied())
+            .collect(),
+    )
+}
+
+/// `text`, a play's measure file, with the load stages that led to it
+/// (`[load_stages]`) when it is the first play after a choice.
+#[must_use]
+pub fn with_load_stages(mut text: String) -> String {
+    use std::fmt::Write as _;
+    if let Some(stages) = take_load_stages() {
+        text.push_str("\n[load_stages]\n");
+        for (name, us) in stages {
+            let _ = writeln!(text, "{name} = {us}");
+        }
+    }
+    text
+}
+
+/// The environment variable that makes each BGA element's draw allocate
+/// once (any value): the positive control of the play's `render_app`
+/// count.
+pub const BGA_ALLOCATE_ENV: &str = "TAPESTRY_DEV_BGA_ALLOCATE";
+
+/// Reads [`BGA_ALLOCATE_ENV`] before any frame, so a frame reads only an
+/// atomic.
+pub fn read_bga_faults() {
+    skin_model::bga::ALLOCATE_IN_DRAW.store(
+        std::env::var_os(BGA_ALLOCATE_ENV).is_some(),
+        Ordering::SeqCst,
+    );
+}
+
 /// Reads [`RESULT_FAULTS_ENV`]'s `pinned<N>` and `lostpinned<N>` before
 /// any frame, so a frame reads only atomics.
 pub fn read_result_faults() {

@@ -217,6 +217,8 @@ pub struct PlayerRig<'a> {
     pub pending: Option<crate::imports::PendingSkin>,
     /// The chart's own images' worker (S10-12): the run's one owner.
     pub chart_images: crate::chart_images::ChartImageWorker,
+    /// The chart's BGA pictures' worker: the run's one owner.
+    pub bga: crate::bga::BgaWorker,
     /// The page side of the committed play skin's chart layer, if it keeps
     /// one ([`crate::imports::Started::play_chart`]).
     pub play_chart: Option<u32>,
@@ -537,6 +539,10 @@ enum PrepStage {
     /// the request answered, and the publication's request, `Some` for a
     /// staging with an array of its own.
     Images(u64, Option<u64>),
+    /// The chart's images published: the BGA pictures are published before
+    /// the final readiness (design.md "Rendering and Skins", BGA), for the
+    /// request answered.
+    Bga(u64),
     /// It ended before the render thread answered ready.
     Ended(Preparation),
     /// Answered: with the render request answered ready, which the final
@@ -821,12 +827,56 @@ impl PlayerRig<'_> {
             play: self.play_chart.filter(|_| self.pending.is_none()),
             result: None,
         });
+        self.bga
+            .attempt(crate::bga::Want::of(loaded.path(), loaded.chart()));
         let coord = self.selection.as_ref().map(|s| (&s.coord, s.spawner));
         // No coordinator (no song selection): the preparation reads them.
         if coord.is_some() {
             let publisher = self.render.chart_publisher();
             self.chart_images.step(coord, &|| false, Some(&publisher));
+            self.bga.step(coord, &|| false);
         }
+    }
+
+    /// The chart's BGA pictures for the attempt, until `until`: the worker
+    /// stepped until the current generation's table is published (or the
+    /// last array reused), the adjustments served meanwhile.
+    /// [`ImagesPoll::Stopped`] when the wait stops ([`preparation_stops`]);
+    /// [`ImagesPoll::Expired`] when the render thread did not answer
+    /// within the link's bound; `None` at `until`.
+    fn poll_bga(&mut self, until: Instant) -> Option<ImagesPoll> {
+        let worker = self.bga.clone();
+        let mut adjust = self.adjust.take();
+        let out = loop {
+            let stops = || {
+                preparation_stops(
+                    self.quitting(),
+                    self.controls.leaving(),
+                    self.input_failure(),
+                    self.audio_failure(),
+                )
+            };
+            let coord = self.selection.as_ref().map(|s| (&s.coord, s.spawner));
+            worker.step(coord, &stops);
+            if stops() {
+                break Some(ImagesPoll::Stopped);
+            }
+            match worker.poll() {
+                crate::bga::Poll::Ready(_) => break Some(ImagesPoll::Ready),
+                crate::bga::Poll::Expired => break Some(ImagesPoll::Expired),
+                crate::bga::Poll::Waiting => {}
+            }
+            #[cfg(feature = "dev-tools")]
+            crate::dev::press_due(self.controls, crate::dev::LoadPhase::Preparing);
+            serve_adjustments(adjust.as_mut(), &self.input, self.controls.tuning());
+            let now = Instant::now();
+            if now >= until {
+                break None;
+            }
+            std::thread::park_timeout(IMAGE_SLICE.min(until - now));
+        };
+        self.adjust = adjust;
+        out
     }
 
     /// The chart's images for the attempt, until `until`: the worker
@@ -923,6 +973,7 @@ impl PlayerRig<'_> {
             PrepStage::Facts(_)
             | PrepStage::Screen(_)
             | PrepStage::Images(..)
+            | PrepStage::Bga(_)
             | PrepStage::Ended(_)
             | PrepStage::Answered(_) => crate::imports::Settled::Ended,
         };
@@ -949,6 +1000,7 @@ impl PlayerRig<'_> {
             PrepStage::Facts(_)
             | PrepStage::Screen(_)
             | PrepStage::Images(..)
+            | PrepStage::Bga(_)
             | PrepStage::Ended(_)
             | PrepStage::Answered(_) => {}
         }
@@ -1565,6 +1617,7 @@ impl PlayerRig<'_> {
         // The images' worker, stopped within its bound; its panic is never
         // the run's.
         self.chart_images.end();
+        self.bga.end();
         // The system sounds' worker, ended within its bound, and what the
         // game thread holds of theirs dropped, before the audio thread
         // ends: what it holds drops with it, after its last step.
@@ -1684,6 +1737,8 @@ impl PlayerRig<'_> {
         let path = measure_path(&saved.path);
         let ms = |d: Option<Duration>| d.map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX));
         let text = to_toml(&fig, (ms(self.times.first), ms(self.times.retry)));
+        #[cfg(feature = "dev-tools")]
+        let text = crate::dev::with_load_stages(text);
         match game::write_atomic(&path, text.as_bytes()) {
             Ok(()) => println!("measure: {}", path.display()),
             Err(e) => eprintln!("measure: {}: {e}", path.display()),
@@ -2160,6 +2215,7 @@ impl Rig for PlayerRig<'_> {
         let loading = self.loading_active();
         commit_ready(&self.render, loading, &mut self.declared)?;
         self.chart_images.committed();
+        self.bga.committed();
         // The attempt's sources and result half move to the result,
         // replacing the last attempt's: only once its commit passed.
         self.result_skin
@@ -2284,6 +2340,13 @@ impl Rig for PlayerRig<'_> {
             staging: Instant::now(),
             stage: PrepStage::Answered(None),
         };
+        // The attempt's BGA: a retry's is a new generation, its array
+        // reused when nothing changed; begun now, beside the rest.
+        self.bga
+            .attempt(crate::bga::Want::of(loaded.path(), loaded.chart()));
+        if let Some(s) = &self.selection {
+            self.bga.step(Some((&s.coord, s.spawner)), &|| false);
+        }
         prep.stage = match self.begin_skin(loaded) {
             Ok(SkinStep::Ready(skin)) => self.enter_facts(&mut prep, skin),
             Ok(SkinStep::Running(job)) => PrepStage::Skin(job),
@@ -2382,10 +2445,7 @@ impl Rig for PlayerRig<'_> {
                         prep.stage = PrepStage::Images(request, target);
                         break Ok(game::PrepPoll::Pending);
                     }
-                    Some(ImagesPoll::Ready) => {
-                        prep.stage = PrepStage::Answered(Some(request));
-                        break Ok(game::PrepPoll::Done(Preparation::Ready));
-                    }
+                    Some(ImagesPoll::Ready) => prep.stage = PrepStage::Bga(request),
                     Some(ImagesPoll::Stopped) => {
                         // Stopped: what the request staged is dropped, as a
                         // stopped Screen stage's is.
@@ -2401,6 +2461,32 @@ impl Rig for PlayerRig<'_> {
                         let refused = Preparation::Refused(game::PreparationRefusal {
                             location: None,
                             reason: "the chart's images were not published in time".to_owned(),
+                        });
+                        prep.stage = PrepStage::Ended(refused.clone());
+                        break Ok(game::PrepPoll::Done(refused));
+                    }
+                },
+                PrepStage::Bga(request) => match self.poll_bga(deadline) {
+                    None => {
+                        prep.stage = PrepStage::Bga(request);
+                        break Ok(game::PrepPoll::Pending);
+                    }
+                    Some(ImagesPoll::Ready) => {
+                        prep.stage = PrepStage::Answered(Some(request));
+                        break Ok(game::PrepPoll::Done(Preparation::Ready));
+                    }
+                    Some(ImagesPoll::Stopped) => {
+                        self.render.discard_attempt();
+                        prep.stage = PrepStage::Ended(Preparation::Cancelled);
+                        break Ok(game::PrepPoll::Done(Preparation::Cancelled));
+                    }
+                    Some(ImagesPoll::Expired) => {
+                        // The render thread holds a step: refused, never
+                        // readied without the pictures settled.
+                        self.render.discard_attempt();
+                        let refused = Preparation::Refused(game::PreparationRefusal {
+                            location: None,
+                            reason: "the chart's BGA was not published in time".to_owned(),
                         });
                         prep.stage = PrepStage::Ended(refused.clone());
                         break Ok(game::PrepPoll::Done(refused));
@@ -2695,6 +2781,13 @@ impl Rig for PlayerRig<'_> {
         let page_faults = process_page_faults();
         let ready_state_at = TimeUs(origin.0 - self.lead_in.0);
         self.ready_state_at = Some(ready_state_at);
+        #[cfg(feature = "dev-tools")]
+        if let Some((_, ack)) = self.render.loading_ack() {
+            let end = game::minimum_ends(ack, self.render.loading_loadend());
+            crate::dev::stage_at("minimum_end", Some(end));
+        }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::stage_at("ready", Some(ready_state_at));
         self.origin = Some(origin);
         println!("play started");
         #[cfg(feature = "dev-tools")]

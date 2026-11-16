@@ -194,6 +194,58 @@ pub trait Screen: Send {
     /// # Errors
     ///
     /// As the renderer's; [`RenderError::NoChartLayer`] by default.
+    /// Begins the BGA array ([`render::Renderer::begin_bga`]); a screen
+    /// with no renderer refuses one, so the pictures are published absent.
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's; [`render::BgaFault::Refused`] by default.
+    fn begin_bga(&mut self, pages: u32) -> Result<skin_model::bga::BgaKey, render::BgaFault> {
+        let _ = pages;
+        Err(render::BgaFault::Refused)
+    }
+    /// Writes a BGA cell ([`render::Renderer::write_bga_cell`]).
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's; [`render::BgaFault::Refused`] by default.
+    fn write_bga_cell(
+        &mut self,
+        key: skin_model::bga::BgaKey,
+        place: &skin_model::bga::CellPlace,
+        texels: &[u8],
+    ) -> Result<(), render::BgaFault> {
+        let _ = (key, place, texels);
+        Err(render::BgaFault::Refused)
+    }
+    /// Publishes the BGA table ([`render::Renderer::publish_bga`]): by
+    /// default only one of no array.
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's; [`render::BgaFault::Stale`] by default for an
+    /// array.
+    fn publish_bga(
+        &mut self,
+        key: Option<skin_model::bga::BgaKey>,
+        entries: Vec<skin_model::bga::BgaEntry>,
+    ) -> Result<Arc<skin_model::bga::BgaTable>, render::BgaFault> {
+        match key {
+            None => Ok(Arc::new(skin_model::bga::BgaTable::new(entries))),
+            Some(_) => Err(render::BgaFault::Stale),
+        }
+    }
+    /// The table published for the array `key` names while it is still in
+    /// use ([`render::Renderer::published_bga`]); none by default.
+    fn published_bga(
+        &self,
+        key: skin_model::bga::BgaKey,
+    ) -> Option<Arc<skin_model::bga::BgaTable>> {
+        let _ = key;
+        None
+    }
+    /// Drops the BGA array and its table ([`render::Renderer::drop_bga`]).
+    fn drop_bga(&mut self) {}
     fn publish_chart_absent(
         &mut self,
         target: render::ChartTarget,
@@ -1066,6 +1118,13 @@ pub enum RenderMsg {
         /// Where the answer goes.
         reply: mpsc::SyncSender<crate::chart_images::Ack>,
     },
+    /// A step of the BGA pictures' publication (design.md "Rendering and
+    /// Skins", BGA), answered on its own channel; refused, nothing done,
+    /// once the game thread set another generation.
+    Bga {
+        generation: u64,
+        msg: crate::bga::BgaMsg,
+    },
     /// Publish the cursor's chart images into the committed selection
     /// installation (S10-12); `set` `None` publishes them absent. Answer
     /// what it left.
@@ -1366,6 +1425,11 @@ struct Shared {
     /// writes ([`crate::chart_images::ChartImageWorker::renew`]) and the
     /// render thread reads before each frame and publication.
     chart_generation: Arc<AtomicU64>,
+    /// The BGA pictures' generation, which the game thread's worker
+    /// writes ([`crate::bga::BgaWorker::renew`]) and the render thread
+    /// reads at each of their messages: one of another generation changes
+    /// nothing.
+    bga_generation: Arc<AtomicU64>,
     /// The cursor generation of the selection's chart images, which the
     /// game thread's worker writes and the render thread reads before
     /// each frame and selection publication.
@@ -1591,6 +1655,7 @@ impl Shared {
             failed: AtomicBool::new(false),
             recovery: Mutex::new(Recovery::Idle),
             chart_generation: Arc::default(),
+            bga_generation: Arc::default(),
             cursor_generation: Arc::default(),
             chart_targets: Mutex::new(ChartTargets::default()),
             #[cfg(test)]
@@ -2274,6 +2339,27 @@ fn hook_bound() -> Duration {
     )
 }
 
+/// Sends the BGA pictures' steps to the render thread from any thread
+/// ([`RenderLink::bga_publisher`]).
+#[derive(Clone)]
+pub struct BgaPublisher {
+    tx: Sender<RenderMsg>,
+    bound: Duration,
+}
+
+impl BgaPublisher {
+    /// Sends `msg` of `generation`; false when the render thread is gone.
+    pub fn send(&self, generation: u64, msg: crate::bga::BgaMsg) -> bool {
+        self.tx.send(RenderMsg::Bga { generation, msg }).is_ok()
+    }
+
+    /// How long an answer is waited for.
+    #[must_use]
+    pub const fn bound(&self) -> Duration {
+        self.bound
+    }
+}
+
 /// The game thread's end of the render thread.
 /// Sends chart publications to the render thread from any thread
 /// ([`RenderLink::chart_publisher`]).
@@ -2820,6 +2906,22 @@ impl RenderLink {
         self.chart_publisher()
             .publish_selection(cursor_generation, set, reply);
         rx
+    }
+
+    /// What hands the BGA pictures to the render thread from another
+    /// thread: the job that reads them.
+    #[must_use]
+    pub fn bga_publisher(&self) -> BgaPublisher {
+        BgaPublisher {
+            tx: self.tx.clone(),
+            bound: self.answer_timeout,
+        }
+    }
+
+    /// Where the BGA pictures' generation is written, for their worker.
+    #[must_use]
+    pub fn bga_generation(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.shared.bga_generation)
     }
 
     /// What publishes the chart's images from another thread: the job
@@ -4024,6 +4126,8 @@ pub fn spawn(
             crate::alloc_count::tag(crate::alloc_count::Tag::Render);
             #[cfg(feature = "dev-tools")]
             crate::dev::read_result_faults();
+            #[cfg(feature = "dev-tools")]
+            crate::dev::read_bga_faults();
             #[cfg(feature = "dev-tools")]
             crate::dev::read_script_switches();
             let screen = match build(
@@ -5534,6 +5638,7 @@ impl Run {
                         | RenderMsg::Ready { .. }
                         | RenderMsg::Discard(_)
                         | RenderMsg::ChartImages { .. }
+                        | RenderMsg::Bga { .. }
                         | RenderMsg::SelectionChart { .. }
                         | RenderMsg::ParkScripts(_))
                 )
@@ -5874,6 +5979,10 @@ impl Run {
                 }) => {
                     let ack = self.publish_chart(generation, request, set.as_deref());
                     let _ = reply.send(ack);
+                    continue;
+                }
+                Ok(RenderMsg::Bga { generation, msg }) => {
+                    self.bga(generation, msg);
                     continue;
                 }
                 Ok(RenderMsg::SelectionChart {
@@ -7738,6 +7847,47 @@ impl Run {
         Ack {
             key,
             answer: answer.map_err(|e| e.chart_outcome()),
+        }
+    }
+
+    /// Takes a step of the BGA pictures' publication of `generation`:
+    /// refused ([`render::BgaFault::Stale`], nothing published, no array
+    /// read as published) unless it is the game thread's current one, and
+    /// answered at once. A cell's bytes are dropped once written.
+    fn bga(&mut self, generation: u64, msg: crate::bga::BgaMsg) {
+        use crate::bga::BgaMsg;
+        let current = self.shared.bga_generation.load(Ordering::SeqCst) == generation;
+        let screen = self.screen.as_mut().filter(|_| current);
+        let stale = render::BgaFault::Stale;
+        match msg {
+            BgaMsg::Begin { pages, reply } => {
+                let _ = reply.send(screen.map_or(Err(stale), |s| s.begin_bga(pages)));
+            }
+            BgaMsg::Cell {
+                key,
+                place,
+                texels,
+                reply,
+            } => {
+                let written = screen.map_or(Err(stale), |s| s.write_bga_cell(key, &place, &texels));
+                drop(texels);
+                let _ = reply.send(written);
+            }
+            BgaMsg::Publish {
+                key,
+                entries,
+                reply,
+            } => {
+                let _ = reply.send(screen.map_or(Err(stale), |s| s.publish_bga(key, entries)));
+            }
+            BgaMsg::Reuse { key, reply } => {
+                let _ = reply.send(screen.and_then(|s| s.published_bga(key)));
+            }
+            BgaMsg::Drop => {
+                if let Some(s) = screen {
+                    s.drop_bga();
+                }
+            }
         }
     }
 
