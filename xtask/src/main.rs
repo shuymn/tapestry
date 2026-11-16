@@ -19,6 +19,7 @@ mod lint_fixtures;
 mod lints;
 mod portable;
 mod privacy;
+mod test_device;
 
 use std::ffi::OsString;
 use std::path::PathBuf;
@@ -46,13 +47,18 @@ commands:
                                           --update lowers the baseline, --init
                                           writes an absent one
   check-fmt                               run `cargo fmt --check` on each workspace
-                                          package and on the fuzz crate
+                                          package and on the crates outside it
+                                          (fuzz, the test device firmware)
   banned-words (--staged|--all) [--list <path>]
                                           check paths and contents in the index for
                                           terms in banned-words.txt
   portable <cargo-command> [args...]      run cargo on every non-Windows-only package
   demo-chart <dir>                        write a self-made two-minute chart and its
                                           generated sounds into <dir>
+  test-device build [--features <list>] [--picotool]
+                                          build the test device's firmware and write
+                                          its UF2 under <target dir>/test-device;
+                                          --picotool checks it with picotool
   check-binary (--absent|--present) <text> <file>
                                           check whether a file contains <text>";
 
@@ -100,6 +106,13 @@ fn main() -> ExitCode {
         Some("banned-words") => banned_words::run(&rest),
         Some("portable") => portable::run(&workspace_manifest(), &rest),
         Some("check-binary") => binary::run(&rest),
+        Some("test-device") => {
+            let manifest = workspace_manifest();
+            let Some(root) = manifest.parent() else {
+                return usage_error("the manifest has no folder");
+            };
+            test_device::run(root, &rest)
+        }
         Some("demo-chart") => demo_chart(&rest),
         Some("-h" | "--help") => {
             println!("{USAGE}");

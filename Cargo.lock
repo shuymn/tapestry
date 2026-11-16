@@ -3511,6 +3511,7 @@ dependencies = [
  "quote",
  "syn 2.0.119",
  "tempfile",
+ "test-device",
  "toml",
  "unicode-normalization",
 ]
