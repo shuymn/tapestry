@@ -1781,31 +1781,10 @@ fn load_stages_are_recorded_in_order() {
                 .any(|d| matches!(d.frame, Frame::Result { quads, .. } if quads > 0))
         });
     });
-    assert!(ran.ran.is_ok(), "{:?}", ran.ran);
-    let [(_, text)] = &ran.measured[..] else {
-        panic!("one saved play: {:?}", ran.measured);
-    };
-    let section = text
-        .split("[load_stages]\n")
-        .nth(1)
-        .unwrap_or_else(|| panic!("no load stages: {text}"));
-    let stages: Vec<(&str, i64)> = section
-        .lines()
-        .take_while(|l| !l.is_empty() && !l.starts_with('['))
-        .map(|l| {
-            let (k, v) = l.split_once(" = ").unwrap();
-            (k, v.parse().unwrap())
-        })
-        .collect();
-    let at = |k: &str| {
-        stages
-            .iter()
-            .find(|(n, _)| *n == k)
-            .map(|&(_, v)| v)
-            .unwrap_or_else(|| panic!("{k}: {stages:?}"))
-    };
-    for &(k, v) in &stages {
-        assert!((0..600_000_000).contains(&v), "{k} = {v}: from the choice");
+    let stages = load_stages(&ran);
+    let at = |k: &str| stage_at(&stages, k);
+    for (k, v) in &stages {
+        assert!((0..600_000_000).contains(v), "{k} = {v}: from the choice");
     }
     for stage in [
         "chart",
@@ -1824,8 +1803,92 @@ fn load_stages_are_recorded_in_order() {
     assert!(decided >= 1_500_000, "{stages:?}");
     assert!(at("minimum_end") >= decided + 1_000_000, "{stages:?}");
     let ready = at("ready");
-    assert_eq!(stages.last().map(|s| s.0), Some("ready"), "{stages:?}");
+    assert_eq!(
+        stages.last().map(|s| s.0.as_str()),
+        Some("ready"),
+        "{stages:?}"
+    );
     assert!(stages.iter().all(|&(_, v)| v <= ready), "{stages:?}");
+}
+
+/// The `[load_stages]` of the one play `ran` saved, in their order.
+#[track_caller]
+fn load_stages(ran: &Ran) -> Vec<(String, i64)> {
+    assert!(ran.ran.is_ok(), "{:?}", ran.ran);
+    let [(_, text)] = &ran.measured[..] else {
+        panic!("one saved play: {:?}", ran.measured);
+    };
+    let section = text
+        .split("[load_stages]\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no load stages: {text}"));
+    section
+        .lines()
+        .take_while(|l| !l.is_empty() && !l.starts_with('['))
+        .map(|l| {
+            let (k, v) = l.split_once(" = ").unwrap();
+            (k.to_owned(), v.parse().unwrap())
+        })
+        .collect()
+}
+
+/// Stage `k` of `stages`, which must be there.
+#[track_caller]
+fn stage_at(stages: &[(String, i64)], k: &str) -> i64 {
+    stages
+        .iter()
+        .find(|(n, _)| n == k)
+        .map(|&(_, v)| v)
+        .unwrap_or_else(|| panic!("{k}: {stages:?}"))
+}
+
+/// A decision screen whose deadline passes while the chart's load still
+/// runs (held at its start) takes its step inside the load's wait, and
+/// its end is recorded there: at least the built-in presentation's 1.5 s,
+/// before the sounds' load began.
+#[test]
+fn a_decision_ended_inside_the_load_s_wait_is_recorded() {
+    /// Lets the load go when dropped, a failing test's included.
+    struct LetGo;
+    impl Drop for LetGo {
+        fn drop(&mut self) {
+            crate::selection::LOAD_HOLD.store(false, Ordering::Release);
+        }
+    }
+    let _let_go = LetGo;
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        saved: true,
+        ..Opts::default()
+    };
+    crate::selection::LOAD_HOLD.store(true, Ordering::Release);
+    let ran = run_with(&set, None, opts, |side| {
+        side.prepared();
+        side.hold_clock();
+        side.clock.set(TimeUs(600_000_000));
+        side.choose(MenuKey::Enter);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !crate::selection::LOAD_HELD.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < end, "the load never held");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // The deadline passes while the load is held: its step is taken
+        // by the held wait's look.
+        side.to_loading();
+        assert!(
+            crate::selection::LOAD_HELD.load(Ordering::Acquire),
+            "still held"
+        );
+        crate::selection::LOAD_HOLD.store(false, Ordering::Release);
+        side.seen.until("the result skin", |d| {
+            d.iter()
+                .any(|d| matches!(d.frame, Frame::Result { quads, .. } if quads > 0))
+        });
+    });
+    let stages = load_stages(&ran);
+    let decided = stage_at(&stages, "decision_end");
+    assert!(decided >= 1_500_000, "{stages:?}");
+    assert!(decided < stage_at(&stages, "sounds_start"), "{stages:?}");
 }
 
 /// The second build made to allocate inside the skin's build, then
