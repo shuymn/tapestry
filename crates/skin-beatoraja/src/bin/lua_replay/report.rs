@@ -63,6 +63,12 @@ pub struct Report {
     /// Compared invocations where tapestry's rule differs from the
     /// source's on purpose, by difference: counted, never a finding.
     pub intended: BTreeMap<&'static str, usize>,
+    /// Observer occurrences compared and agreed, by frame kind and fold.
+    pub observers: BTreeMap<(&'static str, bool), usize>,
+    /// Observer occurrences whose elements' ages were compared, by the
+    /// intended difference from the reference's age (the play state's
+    /// first frame less the frame's `screen` origin).
+    pub observer_offsets: BTreeMap<i64, usize>,
 }
 
 impl Report {
@@ -117,6 +123,15 @@ impl Report {
         }
         for (what, n) in &self.intended {
             let _ = writeln!(o, "intended difference {what}: {n}");
+        }
+        for ((kind, b), n) in &self.observers {
+            let _ = writeln!(o, "observer {b} agreed on {kind} frames: {n}");
+        }
+        for (d, n) in &self.observer_offsets {
+            let _ = writeln!(
+                o,
+                "observer ages from the screen origin, difference {d} µs: {n}"
+            );
         }
         let listed = |o: &mut String, label: &str, l: &[Listed]| {
             let mut by: BTreeMap<&str, (usize, usize)> = BTreeMap::new();

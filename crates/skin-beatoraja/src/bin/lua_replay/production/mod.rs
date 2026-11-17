@@ -181,6 +181,11 @@ pub(in crate::production) struct FrameTrace {
     /// read (empty off play).
     pub(in crate::production) fields: Vec<i32>,
     pub(in crate::production) timers: Vec<i32>,
+    /// Each element's observation of the frame's draw: its index and its
+    /// timer's age when the draw reached its track, whether or not the
+    /// track gave a sample, `None` while the timer is off or when the draw
+    /// stopped before the track (none on a page).
+    pub(in crate::production) element_timer_ages: Vec<(u32, Option<i64>)>,
 }
 
 /// One round as production played it.
@@ -203,6 +208,8 @@ pub struct ProductionRun {
     /// Per callback, whether it loads or stores a slot.
     pub(in crate::production) slotted: Vec<bool>,
     pub(in crate::production) rounds: Vec<RoundTrace>,
+    /// The skin's loading minimum, µs ([`game::loading_minimum`]).
+    pub(in crate::production) loading_min_us: i64,
 }
 
 const LIMITS: AtlasLimits = AtlasLimits {
@@ -346,6 +353,8 @@ pub fn record(
                         batch.clear();
                         skin.build_loading(&mut loading, &frame, &uvs, &mut batch)
                             .map_err(|e| format!("loading build at {state_us}: {e:?}"))?;
+                        let element_timer_ages = element_timer_ages(&batch)
+                            .map_err(|e| format!("loading build at {state_us}: {e}"))?;
                         let st = loading.state();
                         let mut fields =
                             st.fields.get(..field::COUNT).unwrap_or(st.fields).to_vec();
@@ -366,6 +375,7 @@ pub fn record(
                             kind: FrameKind::Loading,
                             fields: Vec::new(),
                             timers: Vec::new(),
+                            element_timer_ages,
                         });
                         t += STEP;
                     }
@@ -390,6 +400,7 @@ pub fn record(
                             kind: FrameKind::Page,
                             fields: Vec::new(),
                             timers: Vec::new(),
+                            element_timer_ages: Vec::new(),
                         });
                         t += STEP;
                     }
@@ -503,6 +514,8 @@ pub fn record(
                             batch.clear();
                             skin.build(&mut play, &frame, &uvs, &mut batch)
                                 .map_err(|e| format!("build at {}: {e:?}", now.0))?;
+                            let element_timer_ages = element_timer_ages(&batch)
+                                .map_err(|e| format!("build at {}: {e}", now.0))?;
                             let s = play.state();
                             let fields = s.fields.get(..field::COUNT).unwrap_or(s.fields);
                             let outs = s.fields.get(field::COUNT..).unwrap_or_default().to_vec();
@@ -548,6 +561,7 @@ pub fn record(
                                 kind: FrameKind::Play { round, stage },
                                 fields: fields.to_vec(),
                                 timers: s.timers.to_vec(),
+                                element_timer_ages,
                             });
                             Ok(())
                         },
@@ -585,9 +599,27 @@ pub fn record(
             structure: skin.program_structure(),
             slotted: skin.program_slotted(),
             rounds,
+            loading_min_us: game::loading_minimum(skin.loadend()).0,
         },
         inputs,
     ))
+}
+
+/// Each element's timer age in `batch`'s frame
+/// ([`FrameTrace::element_timer_ages`]); an error when the batch had no room for
+/// one.
+fn element_timer_ages(batch: &QuadBatch) -> Result<Vec<(u32, Option<i64>)>, String> {
+    if batch.observations_dropped() > 0 {
+        return Err(format!(
+            "{} element observations dropped",
+            batch.observations_dropped()
+        ));
+    }
+    Ok(batch
+        .observations()
+        .iter()
+        .map(|o| (o.element, o.age.map(|t| t.0)))
+        .collect())
 }
 
 /// An occurrence's identity: its destination, consumer, `op` index and

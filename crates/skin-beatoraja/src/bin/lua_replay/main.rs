@@ -27,6 +27,8 @@ mod isolation;
 #[cfg(test)]
 mod lowered_tests;
 mod observed;
+#[cfg(test)]
+mod observer_tests;
 mod production;
 mod reference;
 mod report;

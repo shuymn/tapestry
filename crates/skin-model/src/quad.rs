@@ -227,6 +227,7 @@ impl QuadBatch {
             value: None,
             choice: None,
             t: None,
+            age: None,
         });
     }
 
@@ -253,6 +254,15 @@ impl QuadBatch {
     pub(crate) fn observed_time(&mut self, t: i64) {
         if let Some(o) = self.observing() {
             o.t = Some(bms_model::TimeUs(t));
+        }
+    }
+
+    /// The open observation's element's timer is `age` µs old, `None` while
+    /// it is off, before its track is sampled.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) fn observed_age(&mut self, age: Option<i64>) {
+        if let Some(o) = self.observing() {
+            o.age = age.map(bms_model::TimeUs);
         }
     }
 

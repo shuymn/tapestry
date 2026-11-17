@@ -13,7 +13,7 @@ use crate::tests::{LATCH, dst, folder, options, run_with};
 
 /// Both imports, the production frames and the reference over `script`:
 /// the report, what the reference observed, and the frames' inputs.
-fn pieces(body: &str, script: Script) -> (Report, Observed, Vec<FrameInputs>) {
+pub(crate) fn pieces(body: &str, script: Script) -> (Report, Observed, Vec<FrameInputs>) {
     pieces_with(body, &options(script))
 }
 
@@ -49,7 +49,7 @@ fn pieces_with(body: &str, o: &Options) -> (Report, Observed, Vec<FrameInputs>) 
 }
 
 /// Each round's frame indices, in order: the runs of play frames.
-fn rounds_of(inputs: &[FrameInputs]) -> Vec<Vec<usize>> {
+pub(crate) fn rounds_of(inputs: &[FrameInputs]) -> Vec<Vec<usize>> {
     let mut out: Vec<Vec<usize>> = Vec::new();
     let mut open = false;
     for (i, f) in inputs.iter().enumerate() {

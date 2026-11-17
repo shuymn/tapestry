@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use bms_model::{Chart, ChartBuilder, TimeUs};
-use image::{ImageFormat, Rgba, RgbaImage};
+use image::{Rgba, RgbaImage};
 use rules::{GaugeValue, Judgment};
 use skin_model::{
     Align, Anchor, Attach, Blend, ComboPart, CycleDef, DigitsDef, ElementDef, FileDef, Filter, Fit,
@@ -20,7 +20,7 @@ use skin_model::{
 };
 
 use crate::lanes_support::rect;
-use crate::play_support::{Harness, MS, REGIONS, ev, full, judged};
+use crate::play_support::{Harness, MS, REGIONS, ev, full, judged, shared_folder};
 
 /// The images, by index; image 0 is a plain one.
 pub const TEN: u32 = 1;
@@ -49,33 +49,20 @@ pub fn frames_of(i: u32) -> u16 {
     }
 }
 
-/// A folder of the images under the target's test folder, written once,
-/// each atomically; each frame 2×2, each image its own height.
+/// A folder of the images under the target's test folder, shared by every
+/// test process ([`shared_folder`]); each frame 2×2, each image its own
+/// height.
 fn root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("skin-model-widgets");
-        std::fs::create_dir_all(&dir).unwrap();
-        for i in 0..IMAGES {
-            let tmp = tempfile::Builder::new()
-                .suffix(".png")
-                .tempfile_in(&dir)
-                .unwrap();
-            RgbaImage::from_pixel(2 * u32::from(frames_of(i)), 2 + i % 3, Rgba([255; 4]))
-                .save_with_format(tmp.path(), ImageFormat::Png)
-                .unwrap();
-            // Under nextest each test is a process of its own, so another
-            // may write the same file at once. On Windows the rename over a
-            // file another process has open fails; the file there has the
-            // same bytes, so it is used.
-            let path = dir.join(format!("{i}.png"));
-            if let Err(e) = tmp.persist(&path)
-                && !path.is_file()
-            {
-                panic!("{path:?}: {e}");
-            }
-        }
-        dir
+        let files: Vec<_> = (0..IMAGES)
+            .map(|i| {
+                let image =
+                    RgbaImage::from_pixel(2 * u32::from(frames_of(i)), 2 + i % 3, Rgba([255; 4]));
+                (format!("{i}.png"), shared_folder::png(&image))
+            })
+            .collect();
+        shared_folder::folder("skin-model-widgets", &files)
     })
 }
 
