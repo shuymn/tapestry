@@ -499,11 +499,14 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/widget/timing_graph.rs"),
     Site::File("crates/skin-model/src/widget/timing_vis.rs"),
     // A chart image's table and stretch, read by every frame that draws
-    // one (S10-12); the read path in the same file is preparation work.
+    // one (S10-12), and the table each selection frame builds from its
+    // pool slot; the read path in the same file is preparation work.
     Site::Fns(
         "crates/skin-model/src/chart_image.rs",
         &[
             "ChartImage::index",
+            "ChartTable::new",
+            "ChartTable::keyed",
             "ChartTable::get",
             "ChartTable::present",
             "ChartTable::drawable",
