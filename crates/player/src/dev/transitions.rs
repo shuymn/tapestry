@@ -36,6 +36,11 @@ pub const MAX_RECORDS: usize = 4096;
 /// dropped and covers nothing.
 pub const MAX_MARKS: usize = 8;
 
+/// The spans and changes recorded while a result is prepared, kept to be
+/// rewritten with the preparation's coverage once the result is taken; one
+/// past them keeps its gaps uncovered and counts as a dropped mark.
+pub const MAX_PREPARED: usize = 8;
+
 /// What a mark annotates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MarkKind {
@@ -146,11 +151,14 @@ pub struct Book {
 }
 
 impl Book {
-    fn push(&mut self, r: Record) {
+    /// Keeps `r`, returning its place, or counts it lost past the cap.
+    fn push(&mut self, r: Record) -> Option<usize> {
         if self.records.len() < self.cap {
             self.records.push(r);
+            Some(self.records.len() - 1)
         } else {
             self.lost = self.lost.saturating_add(1);
+            None
         }
     }
 }
@@ -183,7 +191,7 @@ impl Transitions {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn push(&self, r: Record) {
+    fn push(&self, r: Record) -> Option<usize> {
         let mut b = self.lock();
         if let Record::Mark(Mark {
             kind: MarkKind::ReadBack,
@@ -192,7 +200,15 @@ impl Transitions {
         {
             b.readbacks = b.readbacks.saturating_add(1);
         }
-        b.push(r);
+        b.push(r)
+    }
+
+    /// Replaces the record kept at `at` (a span or a change whose gaps a
+    /// result's preparation turned out to cover).
+    fn replace(&self, at: usize, r: Record) {
+        if let Some(slot) = self.lock().records.get_mut(at) {
+            *slot = r;
+        }
     }
 
     fn dropped_mark(&self) {
@@ -463,6 +479,11 @@ pub struct Recorder {
     /// only once the result is taken (design.md "State Model",
     /// ResultPreparing). A preparation withdrawn drops them.
     prepared: Option<(Option<Gap>, Option<Gap>)>,
+    /// The records already written while the result is prepared (a span
+    /// closed by a change of phase within the attempt, the change itself, a
+    /// presentation change), each with its form covered by the preparation,
+    /// written over it once the result is taken.
+    rewrites: [Option<(usize, Record)>; MAX_PREPARED],
     /// The loading lifetime whose hold is marked.
     held: Option<u64>,
 }
@@ -479,6 +500,7 @@ impl Recorder {
             unpresented: 0,
             preparing: None,
             prepared: None,
+            rewrites: [None; MAX_PREPARED],
             held: None,
         }
     }
@@ -496,17 +518,18 @@ impl Recorder {
             self.hold(h);
         }
         // A play that ended without a result: its preparation is no
-        // result's, and marks nothing. So does one a change to another
-        // state than the result's leaves (a retry withdrawing it).
-        let changed = self
-            .last
-            .is_some_and(|(l, _)| l.state != stage.state || l.lifetime != stage.lifetime);
+        // result's, and marks nothing. So does one another attempt's frame
+        // follows (a retry withdrawing it). A change of phase within the
+        // attempt (its stopped view, the tail or Closing, presented after
+        // its end) keeps it.
+        let other_attempt = self.last.is_some_and(|(l, _)| l.lifetime != stage.lifetime);
         if self.preparing.is_some()
             && stage.state != State::Result
-            && (changed || !is_play(stage.state))
+            && (!is_play(stage.state) || other_attempt)
         {
             self.preparing = None;
             self.prepared = None;
+            self.rewrites = [None; MAX_PREPARED];
         }
         let unpresented = std::mem::take(&mut self.unpresented);
         let mut change = None;
@@ -518,15 +541,32 @@ impl Recorder {
                     cover: coverage(last_at, at, &self.marks),
                     unpresented,
                 };
+                // The gap as the preparation covers it, while one runs.
+                let with = self.preparing.map(|from| Gap {
+                    cover: coverage(last_at, at, &self.with_preparation(from, at)),
+                    ..gap
+                });
                 if last.state != stage.state || last.lifetime != stage.lifetime {
-                    self.book.push(Record::Span(s));
+                    let at_span = self.book.push(Record::Span(s));
+                    if let Some((longest, uncovered)) = self.prepared {
+                        let covered = Span {
+                            longest,
+                            uncovered,
+                            ..s
+                        };
+                        self.rewrite(at_span, Record::Span(covered));
+                        self.prepared = Some((None, None));
+                    }
                     let edge = Edge {
                         presentation: false,
                         from: last,
                         to: stage,
                         gap,
                     };
-                    self.book.push(Record::Edge(edge));
+                    let at_edge = self.book.push(Record::Edge(edge));
+                    if let Some(gap) = with {
+                        self.rewrite(at_edge, Record::Edge(Edge { gap, ..edge }));
+                    }
                     change = Some(edge);
                     self.open = Some(Self::opened(stage, at));
                 } else {
@@ -537,20 +577,17 @@ impl Recorder {
                             to: stage,
                             gap,
                         };
-                        self.book.push(Record::Edge(edge));
+                        let at_edge = self.book.push(Record::Edge(edge));
+                        if let Some(gap) = with {
+                            self.rewrite(at_edge, Record::Edge(Edge { gap, ..edge }));
+                        }
                         change = Some(edge);
                     }
                     s.frames = s.frames.saturating_add(1);
                     s.unpresented = s.unpresented.saturating_add(unpresented);
                     s.last = at;
-                    if let Some(from) = self.preparing {
-                        let with = Gap {
-                            cover: coverage(last_at, at, &self.with_preparation(from, at)),
-                            ..gap
-                        };
-                        if let Some((longest, uncovered)) = &mut self.prepared {
-                            Self::widen(longest, uncovered, with);
-                        }
+                    if let (Some(with), Some((longest, uncovered))) = (with, &mut self.prepared) {
+                        Self::widen(longest, uncovered, with);
                     }
                     Self::widen(&mut s.longest, &mut s.uncovered, gap);
                     self.open = Some(s);
@@ -566,6 +603,18 @@ impl Recorder {
             }
         }
         change
+    }
+
+    /// Keeps `r` to be written at `at` once the result is taken; past
+    /// [`MAX_PREPARED`] the record keeps its gaps uncovered, counted as a
+    /// dropped mark.
+    fn rewrite(&mut self, at: Option<usize>, r: Record) {
+        let Some(at) = at else { return };
+        if let Some(slot) = self.rewrites.iter_mut().find(|s| s.is_none()) {
+            *slot = Some((at, r));
+        } else {
+            self.book.dropped_mark();
+        }
     }
 
     /// `gap` into a span's longest and largest uncovered gaps.
@@ -641,6 +690,10 @@ impl Recorder {
             if let (Some((longest, uncovered)), Some(s)) = (self.prepared.take(), &mut self.open) {
                 s.longest = longest;
                 s.uncovered = uncovered;
+            }
+            let rewrites = std::mem::replace(&mut self.rewrites, [None; MAX_PREPARED]);
+            for (at, r) in rewrites.into_iter().flatten() {
+                self.book.replace(at, r);
             }
             self.mark(Mark {
                 kind: MarkKind::Preparing,

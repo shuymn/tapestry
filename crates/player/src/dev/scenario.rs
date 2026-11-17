@@ -6081,6 +6081,61 @@ pub(crate) mod tests {
         assert_eq!(edges[0].gap.cover.uncovered, 16_700);
     }
 
+    /// The play's end can come before its stopped view is presented: the
+    /// play's last frame, the end, then the tail's first frame of the same
+    /// attempt. That change of phase keeps the preparation, and once the
+    /// result is taken every record written since the end is covered from
+    /// it: the play span's gap but its 10 ms before the end, the change to
+    /// the tail and the tail's gap.
+    #[test]
+    fn a_change_of_phase_after_the_end_keeps_the_preparation() {
+        use super::FrameSink as _;
+        use crate::dev::transitions::MarkKind;
+        use crate::measure::{Drew, Stage, State};
+        let book = super::Transitions::with_capacity(32);
+        let mut sink = super::ScenarioFrames::recording(Captures::of(Vec::new()), book.clone());
+        let (play, tail) = (play_stage(State::Play), play_stage(State::Tail));
+        present(&mut sink, &[(play, 1_000_000)]);
+        sink.play_ended(TimeUs(1_010_000));
+        present(
+            &mut sink,
+            &[(play, 1_300_000), (tail, 1_500_000), (tail, 1_800_000)],
+        );
+        sink.result_taken(TimeUs(1_900_000));
+        let result = Stage {
+            state: State::Result,
+            lifetime: 3,
+            drew: Drew::Skin,
+        };
+        present(&mut sink, &[(result, 1_916_700)]);
+        drop_bounded(sink);
+        let (spans, edges, marks) = records_of(&book);
+        let preparing: Vec<_> = marks
+            .iter()
+            .filter(|m| m.kind == MarkKind::Preparing)
+            .map(|m| (m.from, m.to))
+            .collect();
+        assert_eq!(preparing, [(TimeUs(1_010_000), TimeUs(1_900_000))]);
+        let played = spans[0].uncovered.unwrap();
+        assert_eq!(
+            (played.from, played.cover.uncovered, played.cover.piece),
+            (
+                TimeUs(1_000_000),
+                10_000,
+                Some((TimeUs(1_000_000), TimeUs(1_010_000)))
+            )
+        );
+        assert_eq!(
+            (edges[0].to.state, edges[0].gap.cover.uncovered),
+            (State::Tail, 0)
+        );
+        let longest = spans[1].longest.unwrap();
+        assert_eq!(
+            (longest.from, longest.cover.uncovered, spans[1].uncovered),
+            (TimeUs(1_500_000), 0, None)
+        );
+    }
+
     /// A retry that withdraws the preparation (the next attempt's READY
     /// follows the tail) leaves it covering nothing: the tail's gap after
     /// the play's end stays uncovered, the READY span's gaps too, and a
