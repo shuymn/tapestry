@@ -521,18 +521,16 @@ enum Draw {
 }
 
 /// Where chart images are published ([`Renderer::publish_chart_images`]):
-/// the committed play installation's array, a staged one's own array,
+/// the committed play installation's array, or a staged one's own array,
 /// named by its token (S10-12 design §5.3, a pending play skin's
-/// specialization), or the committed selection installation's array.
+/// specialization). The selection's images go into its chart-image pool
+/// ([`Renderer::write_pool`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChartTarget {
     /// The committed play installation.
     Committed,
     /// The staged play installation `token` names, with its own array.
     Staged(PreparedToken),
-    /// The committed selection installation, its tables keyed by
-    /// [`Renderer::selection_chart_key`].
-    Selection,
 }
 
 /// Where a result view's chart images are written
@@ -1243,10 +1241,6 @@ pub struct Renderer {
     result_chart_writes: u64,
     #[cfg(any(test, feature = "dev-tools"))]
     result_chart_refuse: bool,
-    /// Tests and development builds: the selection chart writes that wrote
-    /// pixels, a skipped one not counted.
-    #[cfg(any(test, feature = "dev-tools"))]
-    selection_chart_writes: u64,
     /// Tests and development builds: the last atlas array upload's timing
     /// (the S10-09i design's §8.1 G1), until
     /// [`take_upload_timing`](Self::take_upload_timing) takes it.
@@ -1477,8 +1471,6 @@ impl Renderer {
             result_chart_writes: 0,
             #[cfg(any(test, feature = "dev-tools"))]
             result_chart_refuse: false,
-            #[cfg(any(test, feature = "dev-tools"))]
-            selection_chart_writes: 0,
             #[cfg(any(test, feature = "dev-tools"))]
             upload_timing: None,
             started: None,
@@ -3197,9 +3189,6 @@ impl Renderer {
     /// installation's own ([`ChartTarget::Staged`]), whose table is held
     /// with the staging under the staging's own key and drawn by its
     /// loading presentation from then on; its commit keeps the key.
-    /// [`ChartTarget::Selection`] writes as
-    /// [`write_selection_chart`](Self::write_selection_chart) does, with
-    /// no set recorded, so the next write is never skipped.
     ///
     /// # Errors
     ///
@@ -3226,7 +3215,6 @@ impl Renderer {
     ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
         match target {
             ChartTarget::Committed => self.publish_committed_chart(images),
-            ChartTarget::Selection => self.write_selection_chart_in(images, None),
             ChartTarget::Staged(token) => {
                 let Some(mut pending) = self.pending.take() else {
                     return Err(RenderError::ChartChanged);
@@ -3455,8 +3443,7 @@ impl Renderer {
     ///
     /// # Errors
     ///
-    /// [`RenderError::NoChartLayer`] with no committed play (or, for
-    /// [`ChartTarget::Selection`], selection) installation,
+    /// [`RenderError::NoChartLayer`] with no committed play installation,
     /// [`RenderError::DeviceLost`] once the device is lost, and
     /// [`RenderError::ChartChanged`] for a token that is not the
     /// staging's: nothing changes.
@@ -3477,18 +3464,6 @@ impl Renderer {
                 self.chart = Some(PublishedChart { key, table });
                 self.sync_chart();
                 Ok(table)
-            }
-            ChartTarget::Selection => {
-                let i = Self::screen(ScreenKind::Selection);
-                if i.and_then(|i| self.screens.get(i))
-                    .is_none_or(Option::is_none)
-                {
-                    return Err(RenderError::NoChartLayer);
-                }
-                let Some(key) = self.selection_chart_key() else {
-                    return Err(RenderError::DeviceLost);
-                };
-                Ok(ChartTable::ABSENT.keyed(key))
             }
             ChartTarget::Staged(token) => match self.pending.as_mut() {
                 // A lost device's staging never commits a drawable table:
@@ -3611,71 +3586,12 @@ impl Renderer {
             &installation,
             atlas,
             images,
-            Some(set),
-            seams,
-        )?;
-        #[cfg(any(test, feature = "dev-tools"))]
-        {
-            self.result_chart_writes += u64::from(wrote);
-        }
-        #[cfg(not(any(test, feature = "dev-tools")))]
-        let _ = wrote;
-        Ok(table)
-    }
-
-    /// Writes chart set `set`'s `images` (each fitted for the selection
-    /// layout's chart slots) into the committed selection installation's
-    /// array, and returns the table of where they lie, keyed to
-    /// [`selection_chart_key`](Self::selection_chart_key). The write is
-    /// skipped when the array's chart layer already holds `set`.
-    ///
-    /// # Errors
-    ///
-    /// - [`RenderError::NoChartLayer`]: no selection installation, or one
-    ///   keeping no chart layer (nothing changes).
-    /// - [`RenderError::ChartImage`] (a misfit or a level mismatch) and
-    ///   [`RenderError::Atlas`] (a write refused): refusals, after which
-    ///   the array's record is cleared.
-    /// - [`RenderError::DeviceLost`] and a failing wait's error: the
-    ///   device's failure.
-    pub fn write_selection_chart(
-        &mut self,
-        images: [Option<&skin_model::chart_image::Fitted>; 3],
-        set: u64,
-    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
-        self.write_selection_chart_in(images, Some(set))
-    }
-
-    /// [`write_selection_chart`](Self::write_selection_chart), recording
-    /// `set` when there is one; with none, the write is never skipped and
-    /// the record stays cleared.
-    fn write_selection_chart_in(
-        &mut self,
-        images: [Option<&skin_model::chart_image::Fitted>; 3],
-        set: Option<u64>,
-    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
-        if self.gpu.lost() {
-            return Err(RenderError::DeviceLost);
-        }
-        let renderer = self.id;
-        let seams = self.chart_seams(false);
-        let Some(Some(slot)) =
-            Self::screen(ScreenKind::Selection).and_then(|i| self.screens.get_mut(i))
-        else {
-            return Err(RenderError::NoChartLayer);
-        };
-        let (table, wrote) = write_chart_set(
-            &self.gpu,
-            renderer,
-            &slot.installation,
-            &mut slot.resources.atlas,
-            images,
             set,
             seams,
         )?;
         #[cfg(any(test, feature = "dev-tools"))]
         {
-            self.selection_chart_writes += u64::from(wrote);
+            self.result_chart_writes += u64::from(wrote);
         }
         #[cfg(not(any(test, feature = "dev-tools")))]
         let _ = wrote;
@@ -3694,15 +3610,6 @@ impl Renderer {
         }
     }
 
-    /// The live key of the selection kind's committed array, as
-    /// [`write_selection_chart`](Self::write_selection_chart) keys its
-    /// tables; `None` without one or once the device is lost. Selection
-    /// frames draw a table only while it equals this.
-    #[must_use]
-    pub fn selection_chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
-        self.slot_chart_key(ScreenKind::Selection)
-    }
-
     /// The live key of `kind`'s committed array; `None` without one or
     /// once the device is lost.
     fn slot_chart_key(&self, kind: ScreenKind) -> Option<skin_model::chart_image::ChartKey> {
@@ -3714,14 +3621,6 @@ impl Renderer {
             atlas: s.installation.bundle().atlas_id().0,
             generation: s.resources.atlas.serial(),
         })
-    }
-
-    /// Tests and development builds: the selection chart writes that
-    /// wrote pixels.
-    #[cfg(any(test, feature = "dev-tools"))]
-    #[must_use]
-    pub const fn selection_chart_writes(&self) -> u64 {
-        self.selection_chart_writes
     }
 
     /// The live key of the result kind's committed array, as
@@ -6064,7 +5963,7 @@ fn write_chart_set(
     installation: &Installation,
     atlas: &mut AtlasTexture,
     images: [Option<&skin_model::chart_image::Fitted>; 3],
-    set: Option<u64>,
+    set: u64,
     seams: ChartSeams,
 ) -> Result<(skin_model::chart_image::ChartTable, bool), RenderError> {
     use skin_model::chart_image::{ChartImage, ChartKey, ChartTable, ChartUv};
@@ -6101,7 +6000,7 @@ fn write_chart_set(
     }
     let [stage, back, banner] = uvs;
     let table = ChartTable::new(stage, back, banner).keyed(key);
-    if set.is_some() && atlas.chart_set() == set {
+    if atlas.chart_set() == Some(set) {
         return Ok((table, false));
     }
     atlas.set_chart_set(None);
@@ -6143,7 +6042,7 @@ fn write_chart_set(
             return Err(RenderError::Atlas(UploadError::Device(e)));
         }
     }
-    atlas.set_chart_set(set);
+    atlas.set_chart_set(Some(set));
     Ok((table, true))
 }
 
