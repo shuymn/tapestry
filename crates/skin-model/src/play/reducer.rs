@@ -124,6 +124,9 @@ pub(crate) struct Reducer {
     pub(crate) recent: Recent,
     pub(crate) lanes: [LaneJudge; LANE_COUNT],
     pub(crate) combo_up: Option<TimeUs>,
+    /// The latest judgment that left the combo at 0, an empty POOR
+    /// included: the BGA's miss window starts there.
+    pub(crate) miss: Option<TimeUs>,
     targets: u32,
     /// The whole chart's taps and long notes, whatever the section: the
     /// count the full combo is judged against.
@@ -227,6 +230,7 @@ impl Reducer {
             recent: Recent::default(),
             lanes: [LaneJudge::default(); LANE_COUNT],
             combo_up: None,
+            miss: None,
             targets,
             whole,
             full_combo: None,
@@ -250,6 +254,7 @@ impl Reducer {
         self.recent = Recent::default();
         self.lanes = [LaneJudge::default(); LANE_COUNT];
         self.combo_up = None;
+        self.miss = None;
         self.full_combo = None;
         self.gauge_max.copy_from_slice(&self.gauge_start);
     }
@@ -286,6 +291,9 @@ impl Reducer {
                     self.set_lane(l, LaneJudge::code(Grade::of(judgment), us), t, presses);
                 }
                 self.combo_up = (combo > 0).then_some(t);
+                if combo == 0 {
+                    self.miss = Some(t);
+                }
                 // Source: SF-019
                 if self.whole > 0 && combo == self.whole && self.full_combo.is_none() {
                     self.full_combo = Some(t);
@@ -349,6 +357,9 @@ impl Reducer {
                 );
                 if self.empty_poor_breaks_combo {
                     self.combo_up = None;
+                }
+                if self.combo_up.is_none() {
+                    self.miss = Some(t);
                 }
                 self.feedback(lane.index(), Grade::EmptyPoor, t);
             }

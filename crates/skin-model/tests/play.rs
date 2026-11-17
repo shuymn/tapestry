@@ -54,6 +54,7 @@ fn in_section(s: &Section) -> PlayContext<'_> {
         bpm_whole_change: None,
         play_level: None,
         score: skin_model::PlayScore::NONE,
+        bga_shown: true,
     }
 }
 
@@ -663,6 +664,7 @@ fn targets_match_the_evaluators() {
         bpm_whole_change: None,
         play_level: None,
         score: skin_model::PlayScore::NONE,
+        bga_shown: true,
     };
     let section_ctx = PlayContext {
         attempt: Attempt::Section(&edge),

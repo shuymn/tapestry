@@ -93,11 +93,18 @@ unicode-script = "0.5.8"
 
 # render and skin-model (dev only): the expected images of the WARP tests,
 # palette PNG fixtures
+# skin-model `image::decode`'s bound of its own buffers (`png_scratch`)
+# follows 0.18.1 (and fdeflate 0.3.7): a test there fails when the lock file
+# moves them, until the bound is read again.
 png = "0.18.1"
 
 # skin-model and render: skin images (decoding, capped) and their atlas
 # pages; the text layer's allocator
 etagere = { version = "0.3.0", default-features = false }
+# The bounds of its JPEG (`zune-jpeg` 0.5.15) and BMP decoders' own buffers in
+# skin-model `image::decode` (`jpeg_scratch`, `bmp_scratch`) follow these
+# versions: a test there fails when the lock file moves them, until the bounds
+# are read again.
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "bmp"] }
 
 # skin-beatoraja: the Lua skins' VM (design.md "beatoraja Lua Skins"),

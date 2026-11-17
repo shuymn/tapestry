@@ -1994,6 +1994,7 @@ fn build_does_not_allocate() {
         bpm_whole_change: None,
         play_level: None,
         score: skin_model::PlayScore::NONE,
+        bga_shown: true,
     };
     let round = Section {
         start: TimeUs(30_000 * MS),
@@ -4064,6 +4065,7 @@ fn readouts_do_not_allocate(loaded: &Loaded, descs: &[GaugeDesc]) {
         bpm_whole_change: None,
         play_level: None,
         score: skin_model::PlayScore::NONE,
+        bga_shown: true,
     };
     let round = PlayContext {
         attempt: Attempt::Section(&section),
@@ -4236,6 +4238,7 @@ fn rhythm_does_not_allocate(descs: &[GaugeDesc]) {
         bpm_whole_change: None,
         play_level: None,
         score: skin_model::PlayScore::NONE,
+        bga_shown: true,
     };
     let t = tally(0);
     let gauges = [descs[0].start, descs[1].start].map(state);
@@ -4365,6 +4368,7 @@ fn main_bpm_does_not_allocate(descs: &[GaugeDesc]) {
         bpm_whole_change: None,
         play_level: None,
         score,
+        bga_shown: true,
     };
     let full = ctx(Attempt::Full {
         lead_in: TimeUs(500 * MS),
@@ -4534,6 +4538,7 @@ fn progress_and_length_do_not_allocate(descs: &[GaugeDesc]) {
             speed,
             ..skin_model::PlayScore::NONE
         },
+        bga_shown: true,
     };
     // The tap at 2 s plus 5 s.
     let full = ctx(

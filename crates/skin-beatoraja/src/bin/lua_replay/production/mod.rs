@@ -438,6 +438,7 @@ pub fn record(
                         bpm_whole_change: None,
                         play_level,
                         score: play_score(tempo.main),
+                        bga_shown: true,
                     };
                     let mut play = skin
                         .prepare(&chart, &ctx)

@@ -508,6 +508,27 @@ pub const IN_PLAY: &[Site] = &[
             "to_f32",
         ],
     ),
+    // The chart's BGA a play frame shows: its clock and drawing, the
+    // chart's events, the published table and the stretch; the resolver,
+    // reader and packing in the same file are preparation work.
+    Site::File("crates/skin-model/src/play/bga.rs"),
+    Site::Fns(
+        "crates/skin-model/src/bga.rs",
+        &[
+            "BgaTable::drawable",
+            "BgaTable::published",
+            "BgaTable::key",
+            "BgaTable::get",
+            "NullMedia::frame",
+            "BgaStretch::place",
+        ],
+    ),
+    Site::Fns(
+        "crates/bms-model/src/bga.rs",
+        &["ChartBga::base", "ChartBga::layer", "ChartBga::poor"],
+    ),
+    // Each play frame's live BGA key.
+    Site::Fns("crates/render/src/bga.rs", &["BgaArray::key"]),
     Site::Fns(
         "crates/render/src/atlas.rs",
         &["glyph_uv", "solid_uv", "texels", "cell_of"],
