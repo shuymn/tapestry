@@ -62,8 +62,13 @@ fn write(
     })
 }
 
+/// A time slice of none: one step at a boundary, so the tests see each
+/// step (the slice's own test is a unit test on a test clock).
+const ONE_STEP: std::time::Duration = std::time::Duration::ZERO;
+
 /// Hands `cells` to `r` for the array `key` names and steps its frame
-/// boundaries until the batch ends; the boundaries it took.
+/// boundaries, a step at each, until the batch ends; the boundaries it
+/// took.
 fn upload(
     r: &mut render::Renderer,
     key: skin_model::bga::BgaKey,
@@ -72,7 +77,7 @@ fn upload(
     r.stage_bga_cells(key, cells)?;
     let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
     for steps in 1.. {
-        match r.bga_boundary() {
+        match r.bga_boundary_within(ONE_STEP) {
             render::BgaStep::Done(done) => return done.map(|()| steps),
             render::BgaStep::Pending => {
                 assert!(std::time::Instant::now() < end, "the batch never ended");
@@ -243,7 +248,11 @@ fn a_batch_is_written_a_budget_at_a_boundary() {
     let mut r = renderer(dir.path(), &c);
     let key = r.begin_bga(1).unwrap();
     let (place, texels) = large_cell();
-    assert_eq!(r.bga_boundary(), render::BgaStep::Idle, "nothing in hand");
+    assert_eq!(
+        r.bga_boundary_within(ONE_STEP),
+        render::BgaStep::Idle,
+        "nothing in hand"
+    );
     let steps = upload(&mut r, key, vec![(place, texels)]).unwrap();
     assert!(steps >= 4, "{steps} boundaries");
     assert_eq!(r.bga_upload_bytes(), 0);
@@ -275,7 +284,7 @@ fn a_batch_is_written_a_budget_at_a_boundary() {
     r.stage_bga_cells(key, cells).unwrap();
     let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let mut left = 4 * quarter;
-    while r.bga_boundary() == render::BgaStep::Pending {
+    while r.bga_boundary_within(ONE_STEP) == render::BgaStep::Pending {
         let now = r.bga_upload_bytes();
         assert!(
             now == left || now + quarter == left,
@@ -310,16 +319,16 @@ fn a_batch_whose_array_is_replaced_ends_stale() {
     r.stage_bga_cells(key, vec![(place, texels)]).unwrap();
     assert_eq!(r.bga_upload_bytes(), bytes);
     assert_eq!(
-        r.bga_boundary(),
+        r.bga_boundary_within(ONE_STEP),
         render::BgaStep::Pending,
         "a budget written"
     );
     let again = r.begin_bga(1).unwrap();
     assert_eq!(
-        r.bga_boundary(),
+        r.bga_boundary_within(ONE_STEP),
         render::BgaStep::Done(Err(render::BgaFault::Stale))
     );
-    assert_eq!(r.bga_boundary(), render::BgaStep::Idle);
+    assert_eq!(r.bga_boundary_within(ONE_STEP), render::BgaStep::Idle);
     assert_eq!(r.bga_upload_bytes(), 0);
     let off = CellPlace { page: 1, ..place };
     let (_, texels) = large_cell();
@@ -327,5 +336,5 @@ fn a_batch_whose_array_is_replaced_ends_stale() {
         r.stage_bga_cells(again, vec![(off, texels)]),
         Err(render::BgaFault::Cell)
     );
-    assert_eq!(r.bga_boundary(), render::BgaStep::Idle);
+    assert_eq!(r.bga_boundary_within(ONE_STEP), render::BgaStep::Idle);
 }

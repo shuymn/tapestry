@@ -7,14 +7,16 @@
 //! **A batch's upload** ([`BgaUpload`]): the render thread takes a batch of
 //! cells in hand and writes it at its frame boundaries, outside every
 //! frame, one step at a time: at most [`BGA_WRITE_BUDGET`] bytes (rows
-//! padded as the queue pads them, a cell split between boundaries by its
+//! padded as the queue pads them, a cell split between steps by its
 //! rows), written and submitted inside one pair of error scopes, each
 //! cell's bytes dropped once written, and a flag-only completion
 //! registered for the step ([`completion`]). No step is written while the
 //! last one's completion is unseen, whichever batch it belonged to, so at
-//! most one step's staging is in flight; the batch is done at the boundary
-//! that sees its last step's completion. Nothing waits for the GPU
-//! (design.md "Memory Budget").
+//! most one step's staging is in flight. Within a boundary the steps go on
+//! while each completion is seen at once, until the boundary's steps have
+//! taken [`UPLOAD_TIME_SLICE`]; the batch is done at the round that sees its
+//! last step's completion. Nothing waits for the GPU (design.md "Memory
+//! Budget").
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -23,11 +25,19 @@ use skin_model::bga::{BgaKey, CellPlace, PAGE_BUDGET, PAGE_SIDE};
 
 use crate::gpu::Gpu;
 
-/// The most bytes the queue stages for the BGA array's writes at one frame
-/// boundary, rows padded as the queue pads them (design.md "Memory
-/// Budget"; a provisional limit: a 1 024² cell, so the six pages' 384 MiB
-/// go over in about 96 boundaries).
+/// The most bytes a step of the BGA array's upload writes, which the queue
+/// stages until the GPU completes it, rows padded as the queue pads them
+/// (design.md "Memory Budget"; a provisional limit: a 1 024² cell, so the
+/// six pages' 384 MiB go over in about 96 steps).
 pub const BGA_WRITE_BUDGET: u64 = 4 << 20;
+
+/// The render thread's time for upload steps at one frame boundary,
+/// outside every frame: a step after the boundary's first begins only
+/// while the boundary's steps so far took less (design.md "Memory
+/// Budget"; a provisional limit, a quarter of a 60 Hz frame). It is the
+/// frame boundary's upload time slice, for any upload made at frame
+/// boundaries; the BGA array's is the first.
+pub const UPLOAD_TIME_SLICE: std::time::Duration = std::time::Duration::from_millis(4);
 
 /// What a frame boundary's step of a batch's upload came to
 /// ([`Renderer::bga_boundary`](crate::Renderer::bga_boundary)).
@@ -315,7 +325,7 @@ mod tests {
     use skin_model::bga::{BgaKey, CellPlace};
 
     use crate::gpu::Gpu;
-    use crate::{AdapterChoice, BgaFault, BgaStep, Renderer, Target};
+    use crate::{AdapterChoice, BgaFault, BgaStep, Renderer, Target, UPLOAD_TIME_SLICE};
 
     /// One budget's cell: a 1 022² picture, padded to 1 024 rows of 4 KiB.
     const QUARTER: usize = 1_024 * 1_024 * 4;
@@ -330,16 +340,24 @@ mod tests {
         )
         .unwrap();
         let key = r.begin_bga(1).unwrap();
+        // Each step takes the whole slice on the boundary's clock: one
+        // step a boundary, unless a test says otherwise.
+        r.bga_step_cost.set(Some(UPLOAD_TIME_SLICE));
         (r, key)
     }
 
     /// Four cells of one budget each, at a page's four quarters.
     fn cells() -> Vec<(CellPlace, Vec<u8>)> {
-        (0..4_u32)
+        quarters(4)
+    }
+
+    /// `n` (at most 16) cells of one budget each, along page 0's rows.
+    fn quarters(n: u32) -> Vec<(CellPlace, Vec<u8>)> {
+        (0..n)
             .map(|i| {
                 let place = CellPlace {
                     page: 0,
-                    origin: [i % 2 * 1_024, i / 2 * 1_024],
+                    origin: [i % 4 * 1_024, i / 4 * 1_024],
                     content: [1_022, 1_022],
                 };
                 (place, vec![255; QUARTER])
@@ -407,14 +425,14 @@ mod tests {
         let (mut r, key) = renderer();
         r.stage_bga_cells(key, cells()).unwrap();
         until_submitted(&mut r, 1);
-        r.bga_withheld.set(true);
+        r.bga_seen.set(Some(false));
         for _ in 0..5 {
             assert_eq!(r.bga_boundary(), BgaStep::Pending);
             std::thread::sleep(Duration::from_millis(5));
         }
         assert_eq!(r.bga_submits.get(), 1, "nothing written while in flight");
         assert_eq!(r.bga_upload_bytes(), u64::try_from(3 * QUARTER).unwrap());
-        r.bga_withheld.set(false);
+        r.bga_seen.set(None);
         until_submitted(&mut r, 2);
         assert_eq!(r.bga_upload_bytes(), u64::try_from(2 * QUARTER).unwrap());
     }
@@ -427,7 +445,7 @@ mod tests {
         let (mut r, key) = renderer();
         r.stage_bga_cells(key, cells()).unwrap();
         until_submitted(&mut r, 1);
-        r.bga_withheld.set(true);
+        r.bga_seen.set(Some(false));
         r.stage_bga_cells(key, cells()).unwrap();
         assert_eq!(r.bga_boundary(), BgaStep::Pending);
         r.cancel_bga_upload();
@@ -436,7 +454,7 @@ mod tests {
             assert_eq!(r.bga_boundary(), BgaStep::Pending);
         }
         assert_eq!(r.bga_submits.get(), 1, "the new batch waited");
-        r.bga_withheld.set(false);
+        r.bga_seen.set(None);
         until_submitted(&mut r, 2);
     }
 
@@ -467,5 +485,25 @@ mod tests {
         r.bga_write_fault = None;
         r.stage_bga_cells(key, cells()).unwrap();
         assert_eq!(until_done(&mut r), Ok(()));
+    }
+
+    /// Within a boundary the steps go on while each completion is seen at
+    /// once, until the boundary's steps have taken the time slice
+    /// (design.md "Memory Budget"): at a millisecond a step on the
+    /// boundary's clock, a 4 ms slice takes four of eight steps, the next
+    /// boundary the other four, and that boundary answers the batch once
+    /// the last completion is seen, with no boundary of its own.
+    #[test]
+    fn steps_go_on_within_a_boundary_until_its_time_slice() {
+        assert_eq!(UPLOAD_TIME_SLICE, Duration::from_millis(4));
+        let (mut r, key) = renderer();
+        r.bga_step_cost.set(Some(Duration::from_millis(1)));
+        r.bga_seen.set(Some(true));
+        r.stage_bga_cells(key, quarters(8)).unwrap();
+        assert_eq!(r.bga_boundary(), BgaStep::Pending);
+        assert_eq!(r.bga_submits.get(), 4, "four steps in the slice");
+        assert_eq!(r.bga_upload_bytes(), u64::try_from(4 * QUARTER).unwrap());
+        assert_eq!(r.bga_boundary(), BgaStep::Done(Ok(())));
+        assert_eq!(r.bga_submits.get(), 8);
     }
 }

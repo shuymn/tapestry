@@ -1287,10 +1287,15 @@ pub struct Renderer {
     /// Unit tests: the submissions of BGA steps made at frame boundaries.
     #[cfg(test)]
     pub(crate) bga_submits: std::cell::Cell<usize>,
-    /// Unit tests: while set, a BGA step in flight is taken as not yet
-    /// complete (its completion withheld).
+    /// Unit tests: a BGA step in flight taken as complete (`Some(true)`)
+    /// or not yet (`Some(false)`, its completion withheld) instead of
+    /// read from its flag.
     #[cfg(test)]
-    pub(crate) bga_withheld: std::cell::Cell<bool>,
+    pub(crate) bga_seen: std::cell::Cell<Option<bool>>,
+    /// Unit tests: the time each BGA step takes on the boundary's clock,
+    /// read instead of the real clock.
+    #[cfg(test)]
+    pub(crate) bga_step_cost: std::cell::Cell<Option<Duration>>,
     /// Unit tests: run inside a BGA step's scopes before its writes, and
     /// just before its submission, to make the device refuse there.
     #[cfg(test)]
@@ -1468,7 +1473,9 @@ impl Renderer {
             #[cfg(test)]
             bga_submits: std::cell::Cell::new(0),
             #[cfg(test)]
-            bga_withheld: std::cell::Cell::new(false),
+            bga_seen: std::cell::Cell::new(None),
+            #[cfg(test)]
+            bga_step_cost: std::cell::Cell::new(None),
             #[cfg(test)]
             bga_write_fault: None,
             #[cfg(test)]
@@ -3400,84 +3407,112 @@ impl Renderer {
         Ok(())
     }
 
-    /// One frame boundary's step of the batch in hand, outside every
-    /// frame, never waiting for the GPU. A poll that does not block comes
-    /// first, then the device's loss is read. While the last step's
-    /// completion is unseen nothing is written; once it is seen, the batch
-    /// is done if every cell was written, and otherwise its next step goes:
-    /// at most [`BGA_WRITE_BUDGET`](crate::BGA_WRITE_BUDGET) bytes of its
-    /// rows written and submitted inside one pair of error scopes, then a
-    /// flag-only completion registered for that submission, with no other.
-    /// The batch ends at once, dropped, when its array is no longer the one
-    /// in use or the device is lost ([`crate::BgaFault::Stale`]), or when
-    /// the device refused a step or the poll failed
-    /// ([`crate::BgaFault::Refused`]); a step it submitted stays in flight.
+    /// One frame boundary's steps of the batch in hand, outside every
+    /// frame, within [`UPLOAD_TIME_SLICE`](crate::UPLOAD_TIME_SLICE)
+    /// ([`bga_boundary_within`](Self::bga_boundary_within)).
     pub fn bga_boundary(&mut self) -> crate::BgaStep {
-        let Some(up) = self.bga_upload.as_ref() else {
-            return crate::BgaStep::Idle;
-        };
+        self.bga_boundary_within(crate::UPLOAD_TIME_SLICE)
+    }
+
+    /// One frame boundary's steps of the batch in hand, outside every
+    /// frame, never waiting for the GPU. Each round polls without blocking,
+    /// then reads the device's loss. While the last step's completion is
+    /// unseen nothing is written; once it is seen, the batch is done if
+    /// every cell was written, and otherwise its next step goes, the
+    /// boundary's first always and a later one only while the boundary's
+    /// steps so far took less than `slice`: at most
+    /// [`BGA_WRITE_BUDGET`](crate::BGA_WRITE_BUDGET) bytes of its rows
+    /// written and submitted inside one pair of error scopes, then a
+    /// flag-only completion registered for that submission, with no other,
+    /// and the next round. So one step is in flight at a time, and a GPU
+    /// that completes a step at once takes several in a boundary. The
+    /// batch ends at once, dropped, when its array is no longer the one in
+    /// use or the device is lost ([`crate::BgaFault::Stale`]), or when the
+    /// device refused a step or the poll failed
+    /// ([`crate::BgaFault::Refused`]); a step it submitted stays in flight.
+    pub fn bga_boundary_within(&mut self, slice: Duration) -> crate::BgaStep {
         let end = |r: &mut Self, result| {
             r.bga_upload = None;
             crate::BgaStep::Done(result)
         };
-        if self.bga.key(self.id) != Some(up.key) || self.gpu.lost() {
-            return end(self, Err(crate::BgaFault::Stale));
-        }
-        if self.gpu.device().poll(wgpu::PollType::Poll).is_err() {
-            return end(self, Err(crate::BgaFault::Refused));
-        }
-        if self.gpu.lost() {
-            return end(self, Err(crate::BgaFault::Stale));
-        }
-        if !self.bga_step_completed() {
-            return crate::BgaStep::Pending;
-        }
-        self.bga_in_flight = None;
-        let Some(up) = self.bga_upload.as_mut() else {
-            return crate::BgaStep::Idle;
-        };
-        if up.written() {
-            return end(self, Ok(()));
-        }
-        let (array, gpu) = (&self.bga, &self.gpu);
-        #[cfg(test)]
-        let (write_fault, submit_fault, submits) = (
-            self.bga_write_fault,
-            self.bga_submit_fault,
-            &self.bga_submits,
-        );
-        let ((), refused) = skin_atlas::scoped(gpu.device(), || {
-            #[cfg(test)]
-            if let Some(f) = write_fault {
-                f(gpu);
+        let started = Instant::now();
+        let mut steps = 0_u32;
+        loop {
+            let Some(up) = self.bga_upload.as_ref() else {
+                return crate::BgaStep::Idle;
+            };
+            if self.bga.key(self.id) != Some(up.key) || self.gpu.lost() {
+                return end(self, Err(crate::BgaFault::Stale));
             }
-            array.write_some(gpu, up, crate::BGA_WRITE_BUDGET);
-            // The step's submission, in the same scopes as its writes: what
-            // the device refuses there is this step's refusal.
+            if self.gpu.device().poll(wgpu::PollType::Poll).is_err() {
+                return end(self, Err(crate::BgaFault::Refused));
+            }
+            if self.gpu.lost() {
+                return end(self, Err(crate::BgaFault::Stale));
+            }
+            if !self.bga_step_completed() {
+                return crate::BgaStep::Pending;
+            }
+            self.bga_in_flight = None;
+            if up.written() {
+                return end(self, Ok(()));
+            }
+            if steps > 0 && self.bga_elapsed(started, steps) >= slice {
+                return crate::BgaStep::Pending;
+            }
+            let Some(up) = self.bga_upload.as_mut() else {
+                return crate::BgaStep::Idle;
+            };
+            let (array, gpu) = (&self.bga, &self.gpu);
             #[cfg(test)]
-            {
-                if let Some(f) = submit_fault {
+            let (write_fault, submit_fault, submits) = (
+                self.bga_write_fault,
+                self.bga_submit_fault,
+                &self.bga_submits,
+            );
+            let ((), refused) = skin_atlas::scoped(gpu.device(), || {
+                #[cfg(test)]
+                if let Some(f) = write_fault {
                     f(gpu);
                 }
-                submits.set(submits.get() + 1);
+                array.write_some(gpu, up, crate::BGA_WRITE_BUDGET);
+                // The step's submission, in the same scopes as its writes:
+                // what the device refuses there is this step's refusal.
+                #[cfg(test)]
+                {
+                    if let Some(f) = submit_fault {
+                        f(gpu);
+                    }
+                    submits.set(submits.get() + 1);
+                }
+                gpu.queue().submit([]);
+            });
+            // In flight until a later round sees it, whatever becomes of
+            // the batch: the next step waits for it.
+            self.bga_in_flight = Some(crate::bga::completion(&self.gpu));
+            if refused.is_some() {
+                return end(self, Err(crate::BgaFault::Refused));
             }
-            gpu.queue().submit([]);
-        });
-        // In flight until a later boundary sees it, whatever becomes of
-        // the batch: the next step waits for it.
-        self.bga_in_flight = Some(crate::bga::completion(&self.gpu));
-        if refused.is_some() {
-            return end(self, Err(crate::BgaFault::Refused));
+            steps += 1;
         }
-        crate::BgaStep::Pending
+    }
+
+    /// The time the boundary's `steps` BGA steps took since `started`.
+    fn bga_elapsed(&self, started: Instant, steps: u32) -> Duration {
+        #[cfg(test)]
+        if let Some(each) = self.bga_step_cost.get() {
+            return each.saturating_mul(steps);
+        }
+        let _ = steps;
+        started.elapsed()
     }
 
     /// Whether the last BGA step's completion was seen (or none is in
     /// flight).
     fn bga_step_completed(&self) -> bool {
         #[cfg(test)]
-        if self.bga_withheld.get() {
-            return self.bga_in_flight.is_none();
+        if let Some(seen) = self.bga_seen.get() {
+            return seen || self.bga_in_flight.is_none();
         }
         self.bga_in_flight
             .as_ref()
