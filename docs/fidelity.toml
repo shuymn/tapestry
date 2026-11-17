@@ -425,3 +425,25 @@ tests = [
     "crates/skin-beatoraja/tests/lua_runtime.rs::a_lowered_selection_read_agrees_with_the_runtime_in_every_record_state",
     "crates/skin-beatoraja/tests/lua_runtime.rs::absent_scores_read_zero_where_the_source_does",
 ]
+
+[[entry]]
+id = "SF-021"
+summary = "A chart without a difficulty gets one inferred at scan: subtitle keyword, then title keyword, then note count"
+class = "rule"
+reason = """
+A player sees the level colour and the difficulty conditions of every chart \
+that declares no `#DIFFICULTY` (or 0): the scan gives it the difficulty of \
+the first keyword step its subtitle, then its title, meets, else of its note \
+count (below 250, 600, 1 000 and 2 000 notes), so such a chart is coloured \
+and filtered as one of the five difficulties rather than as none. A declared \
+difficulty always wins (design.md "Loading and Song Selection", \
+Difficulty)."""
+source = [
+    "src/bms/player/beatoraja/song/SQLiteSongDatabaseAccessor.java:933-953 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/song/SongData.java:211 @beatoraja-0.8.9",
+]
+sites = ["crates/library/src/difficulty.rs"]
+tests = [
+    "crates/library/tests/scan.rs::an_undeclared_difficulty_follows_the_subtitle_then_the_title",
+    "crates/library/tests/scan.rs::an_undeclared_difficulty_follows_the_note_count",
+]

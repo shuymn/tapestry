@@ -2326,9 +2326,7 @@ fn chosen_chart(e: &library::ChartEntry) -> ChosenChart {
         play_level: Some(crate::imports::facts::level_of(
             h.playlevel.as_deref().unwrap_or_default(),
         )),
-        difficulty: Some(crate::imports::facts::difficulty_of(
-            h.difficulty.as_deref().unwrap_or_default(),
-        )),
+        difficulty: Some(e.difficulty),
         bga: Some(e.bga),
         length_us: e.summary.as_ref().map(|s| s.length),
     }
@@ -4461,6 +4459,7 @@ pub(crate) mod tests {
             rank: None,
             images: None,
             info: None,
+            difficulty: 0,
         }
     }
 
@@ -4577,31 +4576,25 @@ pub(crate) mod tests {
         assert_eq!(level(None), Some(0));
     }
 
-    /// A chosen chart's difficulty is its entry's `#DIFFICULTY` as an
-    /// attempt reads it, 1 to 5 and 0 for any other or none, and its BGA
-    /// flag the entry's: both known once the entry is.
+    /// A chosen chart's difficulty is the one its entry stores, declared
+    /// or inferred, 0 for none, whatever `#DIFFICULTY` text the entry
+    /// holds, and its BGA flag the entry's: both known once the entry is.
     #[test]
     fn the_chosen_charts_difficulty_and_bga_come_from_its_entry() {
-        let chosen = |text: Option<&str>, bga| {
+        let chosen = |stored, bga| {
             let header = library::Header {
-                difficulty: text.map(str::to_owned),
+                difficulty: Some("2".to_owned()),
                 ..library::Header::default()
             };
-            let c = chosen_chart(&entry(header, bga));
+            let c = chosen_chart(&library::ChartEntry {
+                difficulty: stored,
+                ..entry(header, bga)
+            });
             (c.difficulty, c.bga)
         };
-        assert_eq!(chosen(Some("4"), true), (Some(4), Some(true)));
-        assert_eq!(chosen(Some("+5"), false), (Some(5), Some(false)));
-        for text in [
-            Some("6"),
-            Some("0"),
-            Some("-1"),
-            Some("2a"),
-            Some("４"),
-            None,
-        ] {
-            assert_eq!(chosen(text, false), (Some(0), Some(false)), "{text:?}");
-        }
+        assert_eq!(chosen(4, true), (Some(4), Some(true)));
+        assert_eq!(chosen(5, false), (Some(5), Some(false)));
+        assert_eq!(chosen(0, false), (Some(0), Some(false)));
     }
 
     /// A chosen chart's length is its entry's summary's, the loader's 1×

@@ -1201,3 +1201,151 @@ fn the_scan_stores_the_preview_profile() {
     assert_eq!(rows[1].scroll, bms_model::SCROLL_ONE / 2);
     assert_eq!(rows.last().unwrap().ms, 4_200);
 }
+
+/// A chart of `notes` taps on key 1, sixteen a measure from measure 1, after
+/// `head`'s header lines, with `extra` channel lines in measure 0; an
+/// invisible key 6 object there lists it as 7-key.
+fn notes_chart(head: &str, notes: usize, extra: &str) -> String {
+    let mut text = format!("#BPM 150\n{head}#00038:01\n{extra}");
+    for (measure, start) in (0..notes).step_by(16).enumerate() {
+        let taps = (notes - start).min(16);
+        text.push_str(&format!("#{:03}11:{}\n", measure + 1, "01".repeat(taps)));
+    }
+    text
+}
+
+/// Scans `charts` (file stem, text) and returns each one's stored
+/// difficulty with its stem, in path order.
+fn difficulties(charts: &[(&str, String)]) -> Vec<(String, u8)> {
+    let fx = Fixture::new();
+    for (stem, text) in charts {
+        fx.write(&format!("{stem}.bms"), text.as_bytes());
+    }
+    let (lib, _) = fx.open();
+    scan(&lib, std::slice::from_ref(&fx.root));
+    lib.charts()
+        .unwrap()
+        .into_iter()
+        .map(|c| {
+            let stem = c.path.file_stem().unwrap().to_str().unwrap().to_owned();
+            (stem, c.difficulty)
+        })
+        .collect()
+}
+
+/// Asserts that scanning `cases` (file stem, text, difficulty) stores each
+/// difficulty.
+fn assert_difficulties(cases: &[(&str, String, u8)]) {
+    let charts: Vec<_> = cases.iter().map(|(s, t, _)| (*s, t.clone())).collect();
+    let mut want: Vec<_> = cases
+        .iter()
+        .map(|(s, _, d)| ((*s).to_owned(), *d))
+        .collect();
+    want.sort();
+    assert_eq!(difficulties(&charts), want);
+}
+
+/// A `#DIFFICULTY` that reads as an integer other than 0 is kept whatever
+/// the subtitle, title or note count say: 1 to 5 as it is, any other as
+/// none (0). One that reads 0, and one that does not read, is inferred,
+/// here from the subtitle or the note count.
+#[test]
+fn a_declared_difficulty_is_kept() {
+    let chart = |head: &str| notes_chart(head, 10, "");
+    assert_difficulties(&[
+        ("three", chart("#DIFFICULTY 3\n#SUBTITLE another\n"), 3),
+        ("plus", chart("#DIFFICULTY +5\n#TITLE beginner\n"), 5),
+        ("lead", chart("#DIFFICULTY 05\n"), 5),
+        ("two", notes_chart("#DIFFICULTY 2\n", 2_000, ""), 2),
+        ("six", chart("#DIFFICULTY 6\n#SUBTITLE beginner\n"), 0),
+        ("minus", chart("#DIFFICULTY -1\n#SUBTITLE hyper\n"), 0),
+        ("zero", chart("#DIFFICULTY 0\n#SUBTITLE another\n"), 4),
+        ("word", chart("#DIFFICULTY x\n#SUBTITLE hyper\n"), 3),
+        ("wide", chart("#DIFFICULTY \u{FF14}\n"), 1),
+    ]);
+}
+
+/// Without `#DIFFICULTY`, the subtitle's first keyword step gives the
+/// difficulty, in any case; without one there, the title's; the steps go
+/// in their order whatever the text's, and a subtitle's keyword wins over
+/// a title's earlier one. The note count (2 000, else 10) would give
+/// another difficulty in each case.
+// Source: SF-021
+#[test]
+fn an_undeclared_difficulty_follows_the_subtitle_then_the_title() {
+    let many = |head: &str| notes_chart(head, 2_000, "");
+    let few = |head: &str| notes_chart(head, 10, "");
+    assert_difficulties(&[
+        ("s1", many("#TITLE Song\n#SUBTITLE Beginner\n"), 1),
+        ("s2", many("#TITLE Song\n#SUBTITLE [NORMAL]\n"), 2),
+        ("s3", many("#TITLE Song\n#SUBTITLE hyper\n"), 3),
+        ("s4", few("#TITLE Song\n#SUBTITLE ANOTHER\n"), 4),
+        ("s5", few("#TITLE Song\n#SUBTITLE Insane\n"), 5),
+        ("s5b", few("#TITLE Song\n#SUBTITLE LEGGENDARIA\n"), 5),
+        ("order", few("#SUBTITLE another / normal\n"), 2),
+        ("t1", many("#TITLE Song (beginner)\n#SUBTITLE -\n"), 1),
+        ("t3", many("#TITLE Song HYPER\n"), 3),
+        ("t4", few("#TITLE Song [Another]\n#SUBTITLE remix\n"), 4),
+        ("t5", few("#TITLE insane song\n"), 5),
+        (
+            "both",
+            few("#TITLE Song [BEGINNER]\n#SUBTITLE another\n"),
+            4,
+        ),
+    ]);
+}
+
+/// Without `#DIFFICULTY` or a keyword, the note count of the seed-0
+/// summary gives the difficulty: below 250 1, below 600 2, below 1 000 3,
+/// below 2 000 4, else 5. A long note counts once and a mine not at all.
+/// A chart whose seed-0 branch the loader refuses has no count: its
+/// keyword still gives a difficulty, and without one it has none.
+// Source: SF-021
+#[test]
+fn an_undeclared_difficulty_follows_the_note_count() {
+    let plain = |notes| notes_chart("#TITLE Song\n", notes, "");
+    // A long note on key 2 and a mine on key 3.
+    let held = |notes| notes_chart("#TITLE Song\n", notes, "#00052:0101\n#000D3:01\n");
+    let refused = "#BPM 120\n#00111:01\n#00138:01\n#RANDOM 2\n#IF 2\n#LNTYPE 2\n#ENDIF\n";
+    assert_difficulties(&[
+        ("n0249", plain(249), 1),
+        ("n0250", plain(250), 2),
+        ("n0599", plain(599), 2),
+        ("n0600", plain(600), 3),
+        ("n0999", plain(999), 3),
+        ("n1000", plain(1_000), 4),
+        ("n1999", plain(1_999), 4),
+        ("n2000", plain(2_000), 5),
+        ("held249", held(248), 1),
+        ("held250", held(249), 2),
+        ("refused", refused.to_owned(), 0),
+        ("refused3", format!("#SUBTITLE hyper\n{refused}"), 3),
+    ]);
+}
+
+/// A library of schema 13 stored no difficulty: opening it under this
+/// version rebuilds it, so the next scan infers every undeclared one.
+#[test]
+fn schema_13_infers_difficulties_again() {
+    let fx = Fixture::new();
+    fx.write("a.bms", notes_chart("#SUBTITLE hyper\n", 10, "").as_bytes());
+    let stored = |lib: &Library| lib.charts().unwrap()[0].difficulty;
+    {
+        let (lib, _) = fx.open();
+        scan(&lib, std::slice::from_ref(&fx.root));
+        assert_eq!(stored(&lib), 3);
+    }
+    {
+        let old = rusqlite::Connection::open(fx.db()).unwrap();
+        old.execute_batch(
+            "ALTER TABLE charts DROP COLUMN difficulty_level; PRAGMA user_version = 13;",
+        )
+        .unwrap();
+    }
+    let (lib, opened) = fx.open();
+    assert_eq!(opened, Opened::Rebuilt { old_version: 13 });
+    assert_eq!(lib.charts().unwrap(), Vec::new());
+    let report = scan(&lib, std::slice::from_ref(&fx.root));
+    assert_eq!((report.found, report.read), (1, 1), "a full scan");
+    assert_eq!(stored(&lib), 3);
+}

@@ -6,7 +6,7 @@
 //! the bests phase of a scan pass; and the cached loudness measurements of
 //! the charts played (design.md "Algorithms").
 //!
-//! # Schema version 13
+//! # Schema version 14
 //!
 //! [`SCHEMA_VERSION`] is kept in `PRAGMA user_version`.
 //!
@@ -18,7 +18,7 @@
 //!   rank_kind, rank_value, stagefile, banner, image_names, key_taps,
 //!   key_longs, scratch_taps, scratch_longs, density_peak, density_end,
 //!   density_end_x100, density_average, density_average_x100, gauge_total,
-//!   main_bpm)`: the
+//!   main_bpm, difficulty_level)`: the
 //!   header values as [`bms_parser::read_scanned`] reads them, `NULL` when
 //!   undeclared; the integer `playlevel` reads as `level`
 //!   ([`bms_parser::header_integer`]), `NULL` when it reads none or is
@@ -41,7 +41,8 @@
 //!   file, 2 the banner), never shortened; and the values a song list
 //!   previews of that branch ([`ChartInfoView`]), all `NULL` when the
 //!   branch is refused, `main_bpm` also when the MAIN tempo was
-//!   unavailable, and 0 when no note weighs one.
+//!   unavailable, and 0 when no note weighs one; and the difficulty
+//!   ([`ChartEntry::difficulty`]), declared or inferred.
 //!   Indexed by `root`; by `(mode, title_key IS NULL, title_key, path)`, the
 //!   [`Sort::Title`] order, so an unfiltered list reads only the rows it
 //!   returns; and by `(mode, folder)`, by which [`Library::level`] finds a
@@ -127,6 +128,7 @@ mod test_common;
 
 mod bests;
 mod db;
+mod difficulty;
 mod loudness;
 mod preview;
 mod scan;
@@ -162,7 +164,7 @@ pub use search::{FolderKey, FolderRow, Level, SEPARATOR, Search, Sort};
 pub use stored_profile::{MAX_PROFILE_BYTES, MAX_ROWS, StoredProfile};
 
 /// The schema version this build reads and writes.
-pub const SCHEMA_VERSION: i64 = 13;
+pub const SCHEMA_VERSION: i64 = 14;
 
 /// Why the library database cannot be opened, read or scanned.
 #[derive(Debug, thiserror::Error)]
@@ -285,6 +287,12 @@ pub struct ChartEntry {
     /// gauge total and MAIN tempo; `None` when the loader refuses that
     /// branch.
     pub info: Option<ChartInfoView>,
+    /// Its difficulty, 1 to 5, or 0 for none (design.md "Loading and Song
+    /// Selection", Difficulty): its `#DIFFICULTY` when that reads as an
+    /// integer other than 0, 1 to 5 as it is and any other 0; else the one
+    /// the scan infers from its subtitle, its title and its seed-0
+    /// branch's note count, 0 when no step gives one.
+    pub difficulty: u8,
 }
 
 /// The longest image name the library keeps, in bytes: the chart-image
