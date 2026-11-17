@@ -1081,7 +1081,8 @@ impl ChartImageWorker {
 
     /// The chart is left: a new generation with nothing asked for. Its
     /// job, if running, was cancelled through the choice's scope and is
-    /// kept until its thread ends.
+    /// kept until its thread ends. A cursor read's slot is freed now: its
+    /// output is never taken, so nothing of it is written.
     pub fn forget(&self) {
         let mut c = self.core();
         c.renew();
@@ -1089,6 +1090,15 @@ impl ChartImageWorker {
         c.starter = None;
         c.starter_cursor = false;
         if let Some(job) = c.job.take() {
+            if let Target::Cursor {
+                generation,
+                slot,
+                version,
+                ..
+            } = job.target
+            {
+                c.free_slot(generation, slot, version);
+            }
             c.retire(job.job);
         }
     }

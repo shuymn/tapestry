@@ -675,6 +675,37 @@ fn a_check_counts_only_for_its_version() {
     );
 }
 
+/// A chart left while a cursor read still runs (a choice refused before
+/// its departure): its slot is freed at once and nothing of the read is
+/// written, so with one slot the next rest's row is read into it.
+#[test]
+fn a_chart_left_during_a_cursor_read_frees_its_slot() {
+    let _serial = crate::imports::tests::serial();
+    let _let_go = LetGo;
+    let c = cursor_of(1);
+    let (a, b) = (chart([100, 100], [10, 10]), chart([200, 100], [20, 10]));
+    HOLD_HARD.store(true, Ordering::Release);
+    c.rest_on(a.path(), named());
+    c.step();
+    // In its read, which ignores its cancel.
+    assert!(wait_until(|| HELD_HARD.load(Ordering::Acquire)));
+    assert_eq!(c.w.slot_states(), vec![SlotState::Writing { version: 1 }]);
+    // The choice, refused before its departure: the chart is left.
+    c.w.leave_selection(&c.coord);
+    c.w.forget();
+    assert_eq!(c.w.slot_states(), vec![SlotState::Free], "the slot kept");
+    HOLD_HARD.store(false, Ordering::Release);
+    // Back on selection: B's rest is read into the slot.
+    c.w.entered();
+    c.rest_on(b.path(), named());
+    assert!(matches!(
+        c.shown(b.path(), named()),
+        EntryState::Resident { slot: 0, .. }
+    ));
+    assert!(c.w.entry(&row(a.path(), named())).is_none(), "A adopted");
+    assert_eq!(c.written().len(), 1);
+}
+
 /// A check never waits behind a held read or an unanswered write: A's use
 /// is checked while B's read is held (r2 MEDIUM 5).
 #[test]
