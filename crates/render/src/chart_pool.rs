@@ -40,7 +40,7 @@ pub const POOL_MAX_SLOTS: u16 = 48;
 
 /// The most level-0 texels a pool's layers hold, grid waste counted
 /// (provisional): a pool whose one layer passes it keeps that layer, its
-/// firm slot, as the chart layer it replaces would.
+/// firm layer, as the chart layer it replaces would.
 pub const POOL_MAX_TEXELS: u64 = 16 << 20;
 
 /// The next pool generation; 0 names none.
@@ -125,7 +125,7 @@ impl Grid {
         })
     }
 
-    /// One layer's level-0 texels: what the firm slot is charged.
+    /// One layer's level-0 texels: what the firm layer is charged.
     pub(crate) fn layer_texels(&self) -> u64 {
         u64::from(self.side) * u64::from(self.side)
     }

@@ -1490,7 +1490,7 @@ pub fn startup(
                 let chart = (kind == ScreenKind::Play)
                     .then(|| bundle.chart_layer().map(|_| side))
                     .flatten();
-                // The selection's pool: its firm slot is charged with the
+                // The selection's pool: its firm layer is charged with the
                 // installation, one layer of the page side raised to the
                 // text layer's least.
                 let pooled = kind == ScreenKind::Selection
