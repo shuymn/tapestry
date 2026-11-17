@@ -105,7 +105,7 @@ use crate::lua::residual::{
 };
 use crate::lua::syntax::{Ast, Bin, DeclKind, Expr, List, Stmt};
 use crate::lua::{HOST_APIS, LuaLimit, LuaWhy, Unsupported};
-use crate::tree::{Kind, LuaScalar, NONE};
+use crate::tree::{CallableKind, Kind, LuaScalar, NONE};
 
 /// A slot root: the slots its cells are, in its upvalues' order, and the
 /// timer callbacks compiled for it, each with its element's role, its
@@ -1398,19 +1398,216 @@ impl Cx<'_> {
         {
             #[cfg(feature = "dev-tools")]
             self.unused(f, crate::lua::callback::Unused::Dropped);
+            self.read_callables.insert(f);
             return Ok(Prop::Callable(f));
         }
         self.prop(field, name)
     }
 
-    /// The callable at node `id`: its index and its instance.
+    /// The callable at node `id`: its index and its instance. An
+    /// observer's predicate is no callback of its own: only
+    /// [`Self::observer_timer`] reads it, so its instance is `NONE` here.
     pub(super) fn callable_at(&self, id: u32) -> Option<(u32, u32)> {
+        let (c, k) = self.callable_kind_at(id)?;
+        let observer = matches!(k.kind, CallableKind::Observer { .. });
+        Some((c, if observer { NONE } else { k.instance }))
+    }
+
+    /// The callable at node `id`: its index and what it is.
+    fn callable_kind_at(&self, id: u32) -> Option<(u32, crate::tree::Callable)> {
         let lua = self.def.arena.lua.as_deref()?;
         let n = self.def.arena.nodes.get(id as usize)?;
         let LuaScalar::Callable(c) = *lua.values.get(n.end as usize)? else {
             return None;
         };
-        Some((c, lua.callables.get(c as usize)?.instance))
+        Some((c, *lua.callables.get(c as usize)?))
+    }
+
+    /// Records the observer at node `id`, if it is one, as met at a play
+    /// destination's `timer` ([`Self::close_observers`]).
+    pub(super) fn observer_met(&mut self, id: u32) {
+        if let Some((_, k)) = self.callable_kind_at(id)
+            && matches!(k.kind, CallableKind::Observer { .. })
+        {
+            self.observers.insert(id);
+        }
+    }
+
+    /// The observer at node `id`, read as a destination's `timer`, for an
+    /// element of `role`: `None` for no observer; what its predicate folds
+    /// to, and its callable, for one that folds; a refusal at its call for
+    /// any other (design.md "beatoraja Lua Skins", observers).
+    pub(super) fn observer_timer(
+        &mut self,
+        role: Role,
+        id: u32,
+    ) -> Result<Option<(bool, u32)>, ImportError> {
+        let Some((c, k)) = self.callable_kind_at(id) else {
+            return Ok(None);
+        };
+        if !matches!(k.kind, CallableKind::Observer { .. }) {
+            return Ok(None);
+        }
+        let fold = if self.kind == ScreenKind::Play {
+            self.observers.insert(id);
+            self.lower_phase(id, |cx| cx.fold_observer(id, k.instance))?
+        } else {
+            Err(Unsupported::Observer("timer is no play destination's"))
+        };
+        match fold {
+            Ok(b) => {
+                self.record(
+                    (c, id),
+                    "timer",
+                    role,
+                    (Disposition::Lowered, None),
+                    (
+                        Some(&Lowered {
+                            src: b.to_string(),
+                            guards: Vec::new(),
+                            part: None,
+                            essential: None,
+                            deviates: false,
+                            sentinel: false,
+                            known: Some(i32::from(b)),
+                            #[cfg(feature = "dev-tools")]
+                            constant: true,
+                        }),
+                        None,
+                    ),
+                );
+                Ok(Some((b, c)))
+            }
+            Err(why) => Err(self.observer_refused(role, (c, id), why)),
+        }
+    }
+
+    /// What observer predicate instance `inst`, at node `id`, folds to,
+    /// or why it does not: one whose reach writes never folds, checked
+    /// before it is evaluated; one evaluated to anything but a known
+    /// boolean is not constant. Its constant holds only as any lowering's
+    /// would: every read it reaches mapped and every operation checked,
+    /// discarded ones included, and no read with an availability guard,
+    /// which the constant cannot keep (design.md "beatoraja Lua Skins",
+    /// the expression acceptance proof).
+    fn fold_observer(&self, id: u32, inst: u32) -> Result<Result<bool, Unsupported>, ImportError> {
+        let def: &crate::resolve::Definition = self.def;
+        let Some(an) = def.arena.lua.as_deref().and_then(|l| l.analysis.as_deref()) else {
+            return Ok(Err(Unsupported::Observer("predicate is not captured")));
+        };
+        if inst == NONE {
+            return Ok(Err(Unsupported::Observer("predicate is not captured")));
+        }
+        let Some(adm) = an.admitted() else {
+            return Ok(Err(Unsupported::Capture("an unadmitted callback")));
+        };
+        let an = adm.analysis();
+        if an.writes(inst) {
+            return Ok(Err(Unsupported::Observer("predicate writes")));
+        }
+        let cancelled = || def.cancelled(|| None).is_err();
+        let fatal = |why| ImportError::Lua {
+            at: Some(self.def.loc(id)),
+            why,
+        };
+        self.interference.set(None);
+        let res = match residual::evaluate(
+            adm,
+            inst,
+            Conv::Truthy,
+            &[],
+            &cancelled,
+            &self.interference,
+        ) {
+            Ok(res) => res,
+            Err(Stop::Unsupported(Unsupported::Interference)) => {
+                return Ok(Err(Unsupported::Interference));
+            }
+            Err(Stop::Unsupported(_)) => {
+                return Ok(Err(Unsupported::Observer("predicate is not constant")));
+            }
+            Err(Stop::Fatal(why)) => return Err(fatal(why)),
+        };
+        let mut l = Lower::new(an, &self.custom, self.kind, self.config.bga);
+        match l
+            .attach(&res)
+            .and_then(|()| compile::intervals(an, &l, &res))
+        {
+            Ok(_) => {}
+            Err(Stop::Unsupported(why)) => return Ok(Err(why)),
+            Err(Stop::Fatal(why)) => return Err(fatal(why)),
+        }
+        if l.read_guards.values().any(|g| !g.is_empty()) {
+            return Ok(Err(Unsupported::Observer(
+                "predicate reads an availability",
+            )));
+        }
+        Ok(match res.val(res.root) {
+            Some(Val::Bool(b)) => Ok(b),
+            _ => Err(Unsupported::Observer("predicate is not constant")),
+        })
+    }
+
+    /// The refusal of observer callable `c` at node `id`, for an element of
+    /// `role`, for `why`: recorded, and located at the observer's call.
+    pub(super) fn observer_refused(
+        &self,
+        role: Role,
+        (c, id): (u32, u32),
+        why: Unsupported,
+    ) -> ImportError {
+        self.outcome((c, id), "timer", role, (Disposition::Refused, Some(why)));
+        ImportError::Lua {
+            at: Some(self.observer_loc(c, id)),
+            why: LuaWhy::Critical {
+                field: "timer",
+                why,
+            },
+        }
+    }
+
+    /// Where observer callable `c`, at node `id`, was called: its module and
+    /// line, or the node.
+    fn observer_loc(&self, c: u32, id: u32) -> crate::error::Loc {
+        let lua = self.def.arena.lua.as_deref();
+        let at = lua.and_then(|l| {
+            let k = l.callables.get(c as usize)?;
+            let file = l.modules.get(usize::from(k.module?))?;
+            Some(crate::error::Loc {
+                file: file.clone(),
+                line: k.line,
+                col: 0,
+            })
+        });
+        at.unwrap_or_else(|| self.def.loc(id))
+    }
+
+    /// Refuses the first observer the source reads anywhere but a play
+    /// destination's `timer`: at a property field of its own, as another
+    /// field's callback, or on another screen. Each use is its own node:
+    /// one observer held at a timer and elsewhere is refused for the
+    /// other use. The uses are the nodes where the source reads a callback
+    /// and those a consumer read as one, a field of a record an `if`/
+    /// `value` wrapper chose among them; one held anywhere else is inert.
+    pub(super) fn close_observers(&mut self) -> Result<(), ImportError> {
+        let Some(lua) = self.def.arena.lua.as_deref() else {
+            return Ok(());
+        };
+        let first = crate::lua::callback::callable_nodes(&self.def.arena).find(|&(id, c)| {
+            (lua.callback_nodes.binary_search(&id).is_ok() || self.read_callables.contains(&id))
+                && lua
+                    .callables
+                    .get(c as usize)
+                    .is_some_and(|k| matches!(k.kind, CallableKind::Observer { .. }))
+                && !self.observers.contains(&id)
+        });
+        match first {
+            Some((id, c)) => {
+                let why = Unsupported::Observer("timer is no play destination's");
+                Err(self.observer_refused(Role::Decorative, (c, id), why))
+            }
+            None => Ok(()),
+        }
     }
 
     /// Records what became of callable `c` at node `id`, consumed in
@@ -2537,9 +2734,9 @@ impl Cx<'_> {
             return 0;
         };
         let held = |c: u32| {
-            lua.callables
-                .get(c as usize)
-                .is_some_and(|k| k.instance == inst)
+            lua.callables.get(c as usize).is_some_and(|k| {
+                k.instance == inst && !matches!(k.kind, CallableKind::Observer { .. })
+            })
         };
         let nodes = crate::lua::callback::callable_nodes(&self.def.arena)
             .filter(|&(_, c)| held(c))

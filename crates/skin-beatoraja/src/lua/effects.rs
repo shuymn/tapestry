@@ -481,7 +481,12 @@ impl<'a> Walk<'a> {
             }
             // The time budget, checked at each root.
             self.an.clock.root(id).map_err(|w| (Some(id), unit(w)))?;
-            if callable.kind != CallableKind::Lua || callable.instance == NONE {
+            // An observer's predicate is walked as a frame root.
+            let walked = matches!(
+                callable.kind,
+                CallableKind::Lua | CallableKind::Observer { .. }
+            );
+            if !walked || callable.instance == NONE {
                 self.open(Site::Node(id), Unsupported::Capture("not a skin closure"));
                 continue;
             }

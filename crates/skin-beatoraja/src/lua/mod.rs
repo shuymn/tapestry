@@ -90,7 +90,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use mlua::{Lua, MultiValue, RegistryKey, Value};
+use mlua::{Function, Lua, MultiValue, RegistryKey, Value};
 use skin_model::{FileId, Root, RootError, ScreenKind};
 
 pub use self::callback::Disposition;
@@ -224,6 +224,9 @@ pub enum LuaWhy {
         field: &'static str,
         why: Unsupported,
     },
+    /// A `timer_util.timer_observe_boolean` call whose argument is no skin
+    /// closure, for the reason named.
+    Observer(&'static str),
 }
 
 /// Why a callback does not convert.
@@ -261,6 +264,9 @@ pub enum Unsupported {
     /// A read whose id, or a call whose callee, the role scan cannot
     /// resolve, so whose role is unknown: critical.
     Unresolved(&'static str),
+    /// An observer ([`crate::tree::CallableKind::Observer`]) that does not
+    /// fold, for the reason named: refused at its call.
+    Observer(&'static str),
 }
 
 impl fmt::Display for Unsupported {
@@ -285,6 +291,7 @@ impl fmt::Display for Unsupported {
             }
             Self::Writes => f.write_str("a write at frame time"),
             Self::Unresolved(w) => write!(f, "an unresolved {w}"),
+            Self::Observer(w) => write!(f, "an observer whose {w}"),
         }
     }
 }
@@ -331,6 +338,7 @@ impl fmt::Display for LuaWhy {
             Self::Critical { field, why } => {
                 write!(f, "a play-critical callback in `{field}`: {why}")
             }
+            Self::Observer(why) => write!(f, "timer_util.timer_observe_boolean: {why}"),
         }
     }
 }
@@ -345,6 +353,16 @@ pub(crate) enum Module {
 /// A parsed file's chunk as the configured pass compiles it: instrumented,
 /// or `None` to run as written (it has no constructor).
 type Chunk = Option<Arc<[u8]>>;
+
+/// A construction-time observer: the function
+/// `timer_util.timer_observe_boolean` returned and its predicate, both
+/// kept until the pass's VM goes (so no address is read as another's and
+/// the predicate's tag holds), and where it was called.
+struct Observer {
+    _face: RegistryKey,
+    predicate: RegistryKey,
+    at: Option<Loc>,
+}
 
 /// One pass's state, shared by the VM's host functions.
 pub(crate) struct Pass {
@@ -361,6 +379,10 @@ pub(crate) struct Pass {
     depth: SyncCell<u32>,
     /// The host API functions, by address.
     hosts: SyncRefCell<HashMap<usize, u16>>,
+    /// The construction-time observers in call order, and each one's
+    /// returned function by address ([`host`]'s `observe`).
+    observers: SyncRefCell<Vec<Observer>>,
+    observer_of: SyncRefCell<HashMap<usize, u32>>,
     handled: SyncCell<u64>,
     last_error: SyncRefCell<Option<Loc>>,
     /// The last `dofile` read that led to no file: its error's message,
@@ -446,6 +468,8 @@ impl Pass {
             cache: SyncRefCell::new(HashMap::new()),
             depth: SyncCell::new(0),
             hosts: SyncRefCell::new(HashMap::new()),
+            observers: SyncRefCell::new(Vec::new()),
+            observer_of: SyncRefCell::new(HashMap::new()),
             handled: SyncCell::new(0),
             last_error: SyncRefCell::new(None),
             absent: SyncRefCell::new(None),
@@ -578,6 +602,46 @@ impl Pass {
 
     fn host_api_of(&self, addr: usize) -> Option<u16> {
         self.hosts.borrow().get(&addr).copied()
+    }
+
+    /// Records the observer `timer_util.timer_observe_boolean` returned as
+    /// `face` for `predicate`, called at `at`.
+    fn observe(
+        &self,
+        lua: &Lua,
+        face: &Function,
+        predicate: &Function,
+        at: Option<Loc>,
+    ) -> mlua::Result<()> {
+        let mut observers = self.observers.borrow_mut();
+        let n = u32::try_from(observers.len()).map_err(|_| {
+            self.ledger
+                .fail_lua(lua, LuaWhy::Limit(LuaLimit::HostCalls))
+        })?;
+        observers.push(Observer {
+            _face: lua.create_registry_value(face.clone())?,
+            predicate: lua.create_registry_value(predicate.clone())?,
+            at,
+        });
+        self.observer_of
+            .borrow_mut()
+            .insert(face.to_pointer().addr(), n);
+        Ok(())
+    }
+
+    /// The ordinal of the observer whose returned function is at `addr`.
+    fn observer_of(&self, addr: usize) -> Option<u32> {
+        self.observer_of.borrow().get(&addr).copied()
+    }
+
+    /// Each observer's predicate, from `lua`'s registry, and where it was
+    /// called, in call order.
+    fn observers(&self, lua: &Lua) -> mlua::Result<Vec<(Function, Option<Loc>)>> {
+        self.observers
+            .borrow()
+            .iter()
+            .map(|o| Ok((lua.registry_value(&o.predicate)?, o.at.clone())))
+            .collect()
     }
 
     /// The cached value of the module `key` named before, or a fault for

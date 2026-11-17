@@ -532,6 +532,15 @@ pub(crate) struct Cx<'d> {
     slot_roots: HashMap<u32, callback::SlotRoot>,
     /// Per callable instance, the play destinations whose `timer` it is.
     timer_sites: HashMap<u32, u32>,
+    /// The nodes holding an observer read as a play destination's
+    /// `timer`, whatever became of the destination
+    /// ([`Self::close_observers`]).
+    observers: std::collections::HashSet<u32>,
+    /// The nodes holding a function a consumer read as a callback
+    /// ([`Self::callback_prop`]): uses beside the source's schema sites,
+    /// such as the fields of a record a wrapper chose
+    /// ([`Self::close_observers`]).
+    read_callables: std::collections::HashSet<u32>,
     /// Per callable instance, the `timer`s of play destinations whose
     /// object the source removes, or whose timer is inert: no site, and
     /// no reference ([`Cx::close_slots`]).
@@ -694,6 +703,8 @@ impl<'d> Cx<'d> {
             present: skin_model::present::PresentDef::default(),
             slot_roots: HashMap::new(),
             timer_sites: HashMap::new(),
+            observers: std::collections::HashSet::new(),
+            read_callables: std::collections::HashSet::new(),
             removed_refs: HashMap::new(),
             install: prepare::Install::default(),
             prepare: prepare::Prepare::Open,
@@ -1013,6 +1024,13 @@ impl<'d> Cx<'d> {
         let blend = self.int_or(blend, "blend", 0)?;
         let filter = self.int_or(filter, "filter", 0)?;
         let timer = self.callback_prop(timer, "timer")?;
+        // An observer here is met at a play destination's `timer`, whatever
+        // becomes of the destination.
+        if self.kind == ScreenKind::Play
+            && let Prop::Callable(id) = timer
+        {
+            self.observer_met(id);
+        }
         let looped = self.int_or(looped, "loop", 0)?;
         let center = self.int_or(center, "center", 0)?;
         let stretch = self.int_or(stretch, "stretch", -1)?;
@@ -1412,8 +1430,37 @@ impl<'d> Cx<'d> {
             }
         };
 
+        // An observer at `timer` folds before the conditions: a false one
+        // never draws, whatever they are, as the source's never starts
+        // (`TimerUtility.java:89-108`).
+        let observer = match dst.timer {
+            Prop::Callable(id) => self.observer_timer(role, id)?,
+            _ => None,
+        };
+        if let Some((false, _)) = observer {
+            #[cfg(feature = "dev-tools")]
+            {
+                self.folded = true;
+                let callables = dst.ops.iter().filter_map(|op| match op {
+                    Op::Callable(id) => Some(*id),
+                    _ => None,
+                });
+                let draw = match dst.draw {
+                    Prop::Callable(id) => Some(id),
+                    _ => None,
+                };
+                for id in callables.chain(draw) {
+                    self.unused(id, crate::lua::callback::Unused::FoldedFalse);
+                }
+            }
+            self.ignored(at, NoteKind::Ignored { field: "timer" });
+            return Ok(None);
+        }
+
         // Conditions, after the value's availability.
         let mut conds: Vec<String> = o.guard.into_iter().map(str::to_owned).collect();
+        // The destination's own conditions start here.
+        let own = conds.len();
         let mut deviates = false;
         let mut seen = BTreeSet::new();
         // The source's order: the numeric ids first, then the names and
@@ -1505,6 +1552,38 @@ impl<'d> Cx<'d> {
 
         // Timer.
         let (timer, untimed) = match dst.timer {
+            // A true observer: untimed, as the source's starts at the first
+            // frame its destination is prepared, unless its object's own
+            // preparation or a condition may hold that frame back: a number
+            // leaves before the timer is read at a sentinel value
+            // (`SkinNumber.java:138-150`), an image choice at a negative
+            // index (`SkinImage.java:127-132`), a judge before its first
+            // judgment (`play/SkinJudge.java:97-103`). Every number is
+            // refused, a constant one included: the import does not prove
+            // a value is never a sentinel.
+            Prop::Callable(id) if observer.is_some() => {
+                let held = self.number_value.is_some()
+                    || self.sentinel_read
+                    || !matches!(self.prepare.before(), Ok(None));
+                let why = if held {
+                    Some("object may hold its timer back")
+                } else if conds
+                    .get(own..)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|c| c != "true")
+                {
+                    Some("destination is conditioned")
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    let c = observer.map_or(crate::tree::NONE, |(_, c)| c);
+                    let why = crate::lua::Unsupported::Observer(why);
+                    return Err(self.observer_refused(role, (c, id), why));
+                }
+                (self.screen(), true)
+            }
             Prop::Null => (self.screen(), true),
             Prop::Id(n) if n < 0 => (self.screen(), true),
             Prop::Name(_) => {
@@ -2327,6 +2406,7 @@ impl<'d> Cx<'d> {
             loadend,
             present: {
                 self.close_slots()?;
+                self.close_observers()?;
                 (!self.present.callbacks.is_empty()).then(|| std::mem::take(&mut self.present))
             },
         };

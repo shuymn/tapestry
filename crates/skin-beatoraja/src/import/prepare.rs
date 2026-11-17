@@ -139,7 +139,7 @@ pub(super) enum Prepare {
 impl Prepare {
     /// The gate before an element's conditions, or why the program cannot
     /// write it.
-    fn before(&self) -> Result<Option<String>, Unsupported> {
+    pub(super) fn before(&self) -> Result<Option<String>, Unsupported> {
         Ok(match self {
             Self::Open | Self::Selector(None) => None,
             Self::Selector(Some(src)) => Some(format!("({src}) >= 0")),
