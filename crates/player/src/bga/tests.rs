@@ -405,7 +405,9 @@ const PROGRESSIVE_444: &[u8] = &[
 
 /// Production's job holds each picture to one whole-decode bound
 /// (`TERMS`) as its allocation limit: a 640×480 baseline JPEG and a
-/// progressive 4:4:4 one (drawn on its 256² canvas) are read into cells;
+/// progressive 4:4:4 one (drawn on its 256² canvas) are read into cells,
+/// and so is one whose file runs on to 15 MiB, whose envelope passes the
+/// cell term;
 /// beside a JPEG whose decoder's
 /// envelope passes the bound by its file's length (a small picture whose
 /// file runs on to 21 MiB), the pictures are absent.
@@ -423,20 +425,25 @@ fn the_job_holds_each_picture_to_the_whole_decode_term() {
     jpeg("base.jpg", [640, 480]);
     assert!(PROGRESSIVE_444.windows(2).any(|m| m == [0xff, 0xc2]));
     std::fs::write(d.path().join("prog.jpg"), PROGRESSIVE_444).unwrap();
-    jpeg("long.jpg", [64, 48]);
-    let mut long = std::fs::read(d.path().join("long.jpg")).unwrap();
-    long.resize(21 << 20, 0);
-    std::fs::write(d.path().join("long.jpg"), long).unwrap();
+    // Two small JPEGs whose files run on: one to 15 MiB, whose envelope
+    // (about 120 MiB) passes the cell term but not the whole decode, and
+    // one to 21 MiB, whose envelope passes the whole decode.
+    for (name, len) in [("mid.jpg", 15_usize << 20), ("long.jpg", 21 << 20)] {
+        jpeg(name, [64, 48]);
+        let mut bytes = std::fs::read(d.path().join(name)).unwrap();
+        bytes.resize(len, 0);
+        std::fs::write(d.path().join(name), bytes).unwrap();
+    }
     let screens = Installers::default();
     let link = render(&screens);
     let coord = Coordinator::new(CAPS);
     let w = worker(&link);
     let entries = |t: &BgaTable| t.entries().iter().map(|e| native(*e)).collect::<Vec<_>>();
     w.renew();
-    w.attempt(want(d.path(), &["base.jpg", "prog.jpg"]));
+    w.attempt(want(d.path(), &["base.jpg", "prog.jpg", "mid.jpg"]));
     assert_eq!(
         entries(&ready(&w, &coord)),
-        [Some([640, 480]), Some([256, 256])]
+        [Some([640, 480]), Some([256, 256]), Some([256, 256])]
     );
     w.committed();
     w.renew();
