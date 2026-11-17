@@ -116,7 +116,7 @@
 //! dev: span loading 1: frames 31, not presented 0, first 2618626 us, last 3848330 us, longest gap 60000 us (2618626 to 2678626, uncovered 60000 us, 2618626 to 2678626), largest uncovered gap 60000 us of 60000 us (2618626 to 2678626, 2618626 to 2678626)
 //! dev: transition loading -> ready: 39972 us, last 3848330 us, first 3888302 us, covered 0 us, uncovered 39972 us (3848330 to 3888302)
 //! dev: mark preparing 8574600 to 13400100 us
-//! dev: transitions: 27 records, lost 0, marks dropped 0, largest uncovered 62548 us (35479870 to 35542418) in transition tail -> practice
+//! dev: transitions: 27 records, lost 0, largest uncovered 62548 us (35479870 to 35542418) in transition tail -> practice
 //! ```
 
 use std::collections::HashMap;
@@ -136,7 +136,7 @@ use input::{QpcClock, ScriptedInput};
 use rules::GaugeValue;
 use serde::Deserialize;
 
-use super::transitions::{Edge, MAX_RECORDS, Mark, MarkKind, Recorder, Transitions};
+use super::transitions::{Change, MAX_RECORDS, Mark, MarkKind, Recorder, Transitions};
 use super::{SelectScript, SelectStep};
 use crate::args::UsageError;
 use crate::input_side::Recorded;
@@ -2317,8 +2317,6 @@ impl Drop for ScenarioFrames {
     /// the file system holds it, and with it this thread: the render
     /// link's bounds leave both to the process's exit.
     fn drop(&mut self) {
-        // The render thread's end: the open span is recorded.
-        self.recorder.close();
         if let Some(Writer { jobs, thread }) = self.writer.take() {
             drop(jobs);
             let _ = thread.join();
@@ -2532,12 +2530,12 @@ enum Stamp {
     /// Its decision screen's choice.
     Decision { origin: TimeUs },
     /// The change whose first presented frame it is.
-    Transition(Edge),
+    Transition(Change),
 }
 
 /// A change's name in its capture's file: a transition's states, or a
 /// presentation change's state and what drew it before and after.
-fn change_name(e: &Edge) -> String {
+fn change_name(e: &Change) -> String {
     if e.presentation {
         format!(
             "{}-{}-{}",
@@ -2735,8 +2733,8 @@ fn sidecar(
                 e.to.state.name(),
                 num(Some(e.to.lifetime)),
                 e.to.drew.name(),
-                e.gap.from.0,
-                e.gap.to.0,
+                e.last.0,
+                e.first.0,
             )
         }
         _ => String::new(),
@@ -6256,7 +6254,7 @@ pub(crate) mod tests {
         };
         let filled = |cap: usize| {
             let book = super::Transitions::with_capacity(cap);
-            let mut r = Recorder::new(book.clone());
+            let r = Recorder::new(book.clone());
             for k in 0..6 {
                 r.mark(Mark {
                     kind: MarkKind::ReadBack,
