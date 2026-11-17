@@ -12,7 +12,7 @@ use std::cell::Cell;
 use std::fs::File;
 use std::path::Path;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
 
 use image::{ImageFormat, RgbImage};
 use image_support::dir;
@@ -31,6 +31,10 @@ static LARGEST: AtomicUsize = AtomicUsize::new(0);
 static LOG: [AtomicUsize; 32] = [const { AtomicUsize::new(0) }; 32];
 static LOG_LEN: AtomicUsize = AtomicUsize::new(0);
 const LOGGED: usize = 4 << 10;
+/// The bytes a watching thread has live (its allocations less its frees
+/// while watched), and their high-water mark since the last reset.
+static LIVE: AtomicIsize = AtomicIsize::new(0);
+static PEAK: AtomicIsize = AtomicIsize::new(0);
 
 thread_local! {
     /// Whether this thread's allocations are watched: the test's own.
@@ -66,6 +70,19 @@ impl Refusing {
         REFUSED.store(true, Ordering::SeqCst);
         true
     }
+
+    /// `by` bytes made live (or freed, negative) on this thread, if watched.
+    fn live(by: isize) {
+        if WATCHED.with(Cell::get) {
+            let now = LIVE.fetch_add(by, Ordering::SeqCst) + by;
+            PEAK.fetch_max(now, Ordering::SeqCst);
+        }
+    }
+}
+
+/// `n` bytes as a change of the live count.
+fn signed(n: usize) -> isize {
+    isize::try_from(n).unwrap_or(isize::MAX)
 }
 
 // SAFETY: every call the allocator does not refuse is forwarded to the
@@ -76,6 +93,7 @@ unsafe impl GlobalAlloc for Refusing {
         if Self::refuses(layout.size()) {
             return std::ptr::null_mut();
         }
+        Self::live(signed(layout.size()));
         // SAFETY: as the caller's contract for `alloc`.
         unsafe { System.alloc(layout) }
     }
@@ -84,6 +102,7 @@ unsafe impl GlobalAlloc for Refusing {
         if Self::refuses(layout.size()) {
             return std::ptr::null_mut();
         }
+        Self::live(signed(layout.size()));
         // SAFETY: as the caller's contract for `alloc_zeroed`.
         unsafe { System.alloc_zeroed(layout) }
     }
@@ -92,11 +111,15 @@ unsafe impl GlobalAlloc for Refusing {
         if Self::refuses(new_size) {
             return std::ptr::null_mut();
         }
+        // The old and the new block both live while the bytes move.
+        Self::live(signed(new_size));
+        Self::live(-signed(layout.size()));
         // SAFETY: as the caller's contract for `realloc`.
         unsafe { System.realloc(ptr, layout, new_size) }
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        Self::live(-signed(layout.size()));
         // SAFETY: as the caller's contract for `dealloc`.
         unsafe { System.dealloc(ptr, layout) };
     }
@@ -122,19 +145,26 @@ fn byte(v: u32) -> u8 {
 /// whole-decode bound.
 const LIMIT: u64 = 161 << 20;
 
+/// What reading a picture into a cell did.
+struct Made {
+    /// The cell's padded size, or why the picture is absent.
+    out: Result<[u32; 2], Absent>,
+    /// Whether the allocation asked to be refused was.
+    refused: bool,
+    /// The largest allocation made while the cell was made (after the
+    /// file's read).
+    largest: usize,
+    /// The allocations of at least [`LOGGED`] bytes, in order, from the
+    /// file's read on.
+    log: Vec<usize>,
+    /// The most bytes live at once from the file's read on.
+    peak: usize,
+}
+
 /// `name` in `root` read into a cell of `content` through the production
 /// reader, with the allocation of `size` bytes after `skip` of that size
-/// refused (none for 0), on this thread only. Returns the outcome, whether
-/// the refusal happened, and the largest allocation and those of at least
-/// [`LOGGED`] bytes, in order, made while the cell was made.
-fn cell(
-    root: &Path,
-    name: &str,
-    content: [u32; 2],
-    limit: u64,
-    size: usize,
-    skip: usize,
-) -> (Result<[u32; 2], Absent>, bool, usize, Vec<usize>) {
+/// refused (none for 0), on this thread only.
+fn cell(root: &Path, name: &str, content: [u32; 2], limit: u64, size: usize, skip: usize) -> Made {
     let dir = ChartDir::new(root).unwrap();
     let BgaBinding::Resolved { path, key, .. } = resolve(&dir, name, &fixed) else {
         panic!("{name} resolves");
@@ -143,10 +173,12 @@ fn cell(
     SKIP.store(skip, Ordering::SeqCst);
     REFUSED.store(false, Ordering::SeqCst);
     SIZE.store(size, Ordering::SeqCst);
+    LOG_LEN.store(0, Ordering::SeqCst);
+    LIVE.store(0, Ordering::SeqCst);
+    PEAK.store(0, Ordering::SeqCst);
     WATCHED.with(|w| w.set(true));
     let read = read_picture(&path, &key, native, &never, &fixed, Some(limit));
     LARGEST.store(0, Ordering::SeqCst);
-    LOG_LEN.store(0, Ordering::SeqCst);
     let out = read.and_then(|r| r.cell(content, &never, Some(limit)));
     WATCHED.with(|w| w.set(false));
     SIZE.store(0, Ordering::SeqCst);
@@ -157,12 +189,13 @@ fn cell(
         .take(logged)
         .map(|s| s.load(Ordering::SeqCst))
         .collect();
-    (
-        out.map(|c| c.padded),
-        REFUSED.load(Ordering::SeqCst),
+    Made {
+        out: out.map(|c| c.padded),
+        refused: REFUSED.load(Ordering::SeqCst),
         largest,
         log,
-    )
+        peak: usize::try_from(PEAK.load(Ordering::SeqCst)).unwrap_or(0),
+    }
 }
 
 /// Each buffer the read and the cell allocate, refused on its own, leaves
@@ -171,8 +204,9 @@ fn cell(
 /// the downscale's output and row sums, and the cell with its gutter. Each
 /// refusal is checked to have happened. A 24-bit BMP, whose decoder
 /// allocates nothing of its own, so no other allocation has these sizes;
-/// and while its cell is made, these are its only buffers of 4 KiB or more,
-/// so no other copy of the picture is made where a refusal would abort.
+/// and from the file's read to its cell, these are its only buffers of
+/// 4 KiB or more, so no other copy of the file or the picture is made where
+/// a refusal would abort.
 // Covers: T08
 #[test]
 fn each_buffer_of_a_bga_picture_refused_leaves_it_absent() {
@@ -206,8 +240,10 @@ fn each_buffer_of_a_bga_picture_refused_leaves_it_absent() {
         ("big.bmp", [64, 48], padded([64, 48]), 0, "the cell"),
         ("small.bmp", [64, 64], 256 * 256 * 4, 0, "the canvas"),
     ];
-    let (_, _, _, log) = cell(d.path(), "big.bmp", [64, 48], LIMIT, 0, 0);
+    let log = cell(d.path(), "big.bmp", [64, 48], LIMIT, 0, 0).log;
     let buffers = [
+        file,
+        file,
         640 * 480 * 3,
         640 * 480 * 4,
         64 * 48 * 4,
@@ -216,11 +252,17 @@ fn each_buffer_of_a_bga_picture_refused_leaves_it_absent() {
     ];
     assert_eq!(log, buffers, "the cell's buffers of 4 KiB or more");
     for (name, content, size, skip, what) in cases {
-        let (control, refused, _, _) = cell(d.path(), name, content, LIMIT, 0, 0);
-        assert!(control.is_ok() && !refused, "{what}: the control reads");
-        let (out, refused, _, _) = cell(d.path(), name, content, LIMIT, size, skip);
-        assert!(refused, "{what}: an allocation of {size} bytes was made");
-        assert_eq!(out, Err(Absent::Refused), "{what}");
+        let control = cell(d.path(), name, content, LIMIT, 0, 0);
+        assert!(
+            control.out.is_ok() && !control.refused,
+            "{what}: the control reads"
+        );
+        let made = cell(d.path(), name, content, LIMIT, size, skip);
+        assert!(
+            made.refused,
+            "{what}: an allocation of {size} bytes was made"
+        );
+        assert_eq!(made.out, Err(Absent::Refused), "{what}");
     }
 }
 
@@ -241,21 +283,23 @@ fn a_picture_whose_decoder_could_pass_the_limit_is_refused_before_it_decodes() {
     let native = 640 * 480 * 3;
     // The native image and its RGBA8 copy fit (2 150 400 bytes); the
     // envelope beside the native image does not (over 5 MB).
-    let (out, _, largest, _) = cell(d.path(), "big.jpg", [64, 48], 3_000_000, 0, 0);
-    assert_eq!(out, Err(Absent::Refused));
+    let refused = cell(d.path(), "big.jpg", [64, 48], 3_000_000, 0, 0);
+    assert_eq!(refused.out, Err(Absent::Refused));
     assert!(
-        largest < native,
-        "{largest} bytes at once before the refusal"
+        refused.largest < native,
+        "{} bytes at once before the refusal",
+        refused.largest
     );
-    let (out, _, largest, _) = cell(d.path(), "big.jpg", [64, 48], LIMIT, 0, 0);
-    assert!(out.is_ok());
-    assert!(largest >= native, "the decode made its native image");
+    let read = cell(d.path(), "big.jpg", [64, 48], LIMIT, 0, 0);
+    assert!(read.out.is_ok());
+    assert!(read.largest >= native, "the decode made its native image");
 }
 
 /// Under a limit, each phase of a picture's cell holds at most the limit at
 /// once, checked before its first buffer: at the edge of the phase that
-/// holds the most the picture is read, one byte below it the picture is
-/// refused with no buffer near its size allocated. Decoding (a JPEG: its
+/// holds the most the picture is read, holding no more than that edge live
+/// at once, and one byte below it the picture is refused with no buffer
+/// near its size allocated. Decoding (a JPEG: its
 /// envelope beside the native image), converting (a BMP's native image at
 /// its largest beside the RGBA8 copy), placing a small picture on its
 /// canvas (the picture beside the canvas, for a picture larger than the
@@ -323,13 +367,26 @@ fn each_phase_of_a_bga_picture_is_held_to_the_limit_at_its_edge() {
         ),
     ];
     for (what, name, content, edge, native) in cases {
-        let (out, _, _, _) = cell(d.path(), name, content, edge, 0, 0);
-        assert!(out.is_ok(), "{what}: read at {edge}: {out:?}");
-        let (out, _, largest, _) = cell(d.path(), name, content, edge - 1, 0, 0);
-        assert_eq!(out, Err(Absent::Refused), "{what}: refused below {edge}");
+        let read = cell(d.path(), name, content, edge, 0, 0);
+        assert!(read.out.is_ok(), "{what}: read at {edge}: {:?}", read.out);
+        // What the phase was checked against is what it held: no buffer
+        // the check left out was live beside the others.
+        let edge_bytes = usize::try_from(edge).unwrap();
         assert!(
-            largest < usize::try_from(native).unwrap(),
-            "{what}: {largest} bytes at once before the refusal"
+            read.peak <= edge_bytes,
+            "{what}: {} bytes live at once over the checked {edge}",
+            read.peak
+        );
+        let refused = cell(d.path(), name, content, edge - 1, 0, 0);
+        assert_eq!(
+            refused.out,
+            Err(Absent::Refused),
+            "{what}: refused below {edge}"
+        );
+        assert!(
+            refused.largest < usize::try_from(native).unwrap(),
+            "{what}: {} bytes at once before the refusal",
+            refused.largest
         );
     }
 }
