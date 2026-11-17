@@ -44,10 +44,12 @@ use crate::render_side::BgaPublisher;
 pub(crate) mod tests;
 
 /// The transient the job states before it reads ("Memory Budget"): one
-/// picture's whole-decode bound, as the chart images', and the cells in
-/// hand, at most a whole page's bytes together ([`BATCH`]).
+/// picture's whole-decode bound, as the chart images'
+/// ([`chart_image::DECODE_LIMIT`](skin_model::chart_image::DECODE_LIMIT)),
+/// and the cells in hand, at most a whole page's bytes together
+/// ([`BATCH`]).
 pub const TERMS: Terms = Terms {
-    decode: 161 << 20,
+    decode: skin_model::chart_image::DECODE_LIMIT,
     cell: bga::PAGE_SIDE as u64 * bga::PAGE_SIDE as u64 * 4,
 };
 
