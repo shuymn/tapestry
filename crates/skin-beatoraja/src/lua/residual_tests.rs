@@ -1126,6 +1126,19 @@ fn every_new_charge_is_made_before_its_work() {
         work,
         u32::try_from(line + 1).unwrap(),
     );
+    // W19: a joined number's longest text, charged before it is written.
+    let entry = skin(
+        "skin.font = { { id = \"f\", path = \"f.ttf\" } }\n\
+         skin.text = { { id = \"t\", font = \"f\", size = 10, value = function() return \"x\" .. 50.5 end } }",
+        "{ id = \"t\", dst = { { x = 0, y = 0, w = 64, h = 10 } } },",
+    );
+    witness(
+        "number text",
+        &entry,
+        24,
+        work,
+        u32::try_from(line + 1).unwrap(),
+    );
     let past = Unsupported::Construct("a folded string past its cap");
     let entry = skin(
         &format!(

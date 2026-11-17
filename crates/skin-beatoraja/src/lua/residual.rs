@@ -87,9 +87,9 @@
 //! with [`Analysis::pending`] set; an unavailable one stays a read. In a
 //! play text's value, `..` of two known strings or numbers folds to the
 //! joined string ([`S::Built`]), a number written by the number text rule
-//! ([`super::number_text`]): one past [`MAX_FOLDED_TEXT_BYTES`] is
-//! refused by the text's role, and the bytes of one within it are charged
-//! before it is built.
+//! ([`super::number_text`]), its longest text charged before it is
+//! written: one past [`MAX_FOLDED_TEXT_BYTES`] is refused by the text's
+//! role, and the bytes of one within it are charged before it is built.
 //!
 //! The residual is a DAG in one arena a lowering, dropped with it. Every
 //! node is charged against [`MAX_EXPANDED_NODES`] before it is pushed
@@ -1786,8 +1786,9 @@ impl<'a> Eval<'a> {
     }
 
     /// Known string or number `v` as the bytes `..` joins, a number by the
-    /// number text rule.
+    /// number text rule, its longest text charged before it is written.
     fn piece(&self, v: Val) -> R<std::borrow::Cow<'_, [u8]>> {
+        use super::number_text::{NUMBER_TEXT_MAX, number_text};
         use std::borrow::Cow;
         if let Val::Str(s) = v {
             return match self.str_bytes(s)? {
@@ -1795,7 +1796,12 @@ impl<'a> Eval<'a> {
                 None => refuse(Unsupported::Type),
             };
         }
-        match num_val(v).and_then(super::number_text::number_text) {
+        if !matches!(v, Val::Int(_) | Val::Float(_)) {
+            return construct("a Lua error");
+        }
+        charge(self.an, "number text", units(NUMBER_TEXT_MAX))?;
+        did("number text");
+        match num_val(v).and_then(number_text) {
             Some(t) => Ok(Cow::Owned(t.into_bytes())),
             None => construct("a Lua error"),
         }
