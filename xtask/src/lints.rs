@@ -418,6 +418,10 @@ pub const IN_PLAY: &[Site] = &[
     ),
     Site::File("crates/player/src/audio_side.rs"),
     // The render thread's frame.
+    // The selection's chart-image pool: a frame builds the cursor's table
+    // from a slot's record, and the boundary's write runs beside the
+    // frames.
+    Site::File("crates/render/src/chart_pool.rs"),
     // The decision label slots: a frame borrows a slot's content, and the
     // boundary's writes and settling run beside the frames.
     Site::File("crates/render/src/decision_labels.rs"),

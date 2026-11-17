@@ -23,6 +23,7 @@ use bms_model::ChartBuilder;
 use render::{RenderError, Renderer, SHARED_TEXELS, SkinBundle, VM_TEXELS};
 use skin_model::{AtlasLimits, MAX_ATLAS_TEXELS, ScreenKind};
 
+use crate::renderer::pool_tests::{LAYER, pool_bundle};
 use crate::test_common::{GAUGES, attempt, context, offscreen};
 use crate::test_decl::{Look, atlas_cap_bundle, solid_bundle};
 
@@ -158,18 +159,28 @@ fn the_largest_skin_of_each_kind_fits_together() {
     r.admit(ScreenKind::Result, &result).unwrap();
 }
 
+/// The largest selection skin's charge as measured (201 719 808 texels,
+/// 38 layers of 2 304 with its chart layer): its atlas without the chart
+/// layer and its chart-image pool's firm layer, one layer of the same side
+/// (design.md "Memory Budget"). Its optional layers are a reclaimable term
+/// outside the set.
+const SELECTION_ATLAS: u64 = 37 * 2_304 * 2_304;
+const SELECTION_FIRM: u64 = 2_304 * 2_304;
+
 /// The owner's largest set with a play skin's chart layer (S10-12), as
 /// measured over the imported skins at the device's limits: the play skin
 /// with its chart layer and its title card's fonts (178 421 760 texels), the
-/// largest selection skin (201 719 808) and decision skin (142 737 408),
-/// each keeping a VM, and the largest result skin (234 881 024) keeping
-/// one: 808 091 648 texels, past the former 768 Mi and within the limit.
-/// Committed at those charges, a result candidate at an atlas's cap,
-/// more than the measured result skin, is admitted beside them.
+/// largest selection skin (its atlas and its pool's firm layer, 201 719 808)
+/// and decision skin (142 737 408), each keeping a VM, and the largest
+/// result skin (234 881 024) keeping one: 808 091 648 texels, past the
+/// former 768 Mi and within the limit. Committed at those charges, a result
+/// candidate at an atlas's cap, more than the measured result skin, is
+/// admitted beside them.
 #[test]
 fn the_measured_set_with_a_chart_layer_fits() {
     const PLAY: u64 = 178_421_760;
-    const SELECTION: u64 = 201_719_808;
+    const SELECTION: u64 = SELECTION_ATLAS + SELECTION_FIRM;
+    assert_eq!(SELECTION, 201_719_808);
     const DECISION: u64 = 142_737_408;
     const RESULT: u64 = 234_881_024;
     const SET: u64 = PLAY + SELECTION + DECISION + RESULT + 3 * VM_TEXELS;
@@ -198,16 +209,17 @@ fn the_measured_set_with_a_chart_layer_fits() {
 /// The measured set once the play skin's title card is charged beside its
 /// large closing sheet: the play skin with its chart layer, its title
 /// card's fonts and a 6400×7941 sheet chosen (249 790 464 texels), the
-/// largest selection (201 719 808) and decision (142 737 408) skins, each
-/// keeping a VM, and the largest result skin (234 881 024) keeping one:
-/// 879 460 352 texels, past the former 832 Mi and within the limit.
-/// Committed at those charges, a result candidate at an atlas's cap, more
-/// than the measured result skin, is admitted beside them, as the result
-/// skin's installation is again after play's commit.
+/// largest selection (its atlas and its pool's firm layer, 201 719 808) and
+/// decision (142 737 408) skins, each keeping a VM, and the largest result
+/// skin (234 881 024) keeping one: 879 460 352 texels, past the former
+/// 832 Mi and within the limit. Committed at those charges, a result
+/// candidate at an atlas's cap, more than the measured result skin, is
+/// admitted beside them, as the result skin's installation is again after
+/// play's commit.
 #[test]
 fn the_measured_set_with_a_large_closing_sheet_fits() {
     const PLAY: u64 = 249_790_464;
-    const SELECTION: u64 = 201_719_808;
+    const SELECTION: u64 = SELECTION_ATLAS + SELECTION_FIRM;
     const DECISION: u64 = 142_737_408;
     const RESULT: u64 = 234_881_024;
     const SET: u64 = PLAY + SELECTION + DECISION + RESULT + 3 * VM_TEXELS;
@@ -361,4 +373,147 @@ fn a_candidate_s_text_layer_is_charged() {
     assert!(r.staged().is_none());
     assert_eq!(candidate.atlas_texels(), CAP);
     assert_eq!(CAP, 4 * PAGE);
+}
+
+/// The chart-image pool's optional layers yield to later candidates in
+/// startup's order (play, selection, decision, result; AC-S9): with the
+/// selection installed and its pool whole, a decision candidate that fits
+/// only with the pool reduced is admitted, the pool made again with the
+/// layers left as a new generation, then a result candidate likewise, the
+/// pool down to its firm layer. No candidate is refused and no result
+/// released for the pool, and the shared total holds.
+#[test]
+fn the_pool_yields_to_later_candidates_in_startup_order() {
+    let mut r = offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let p = tiny(&r, RED);
+    play(&mut r, &p, 1);
+    let s = pool_bundle(&r, dir.path());
+    commit(&mut r, ScreenKind::Selection, &s, 2);
+    let whole = r.pool().unwrap();
+    assert_eq!(whole.layers, 4);
+    let a = r.admission();
+    assert_eq!((a.firm, a.pool), (LAYER, 3 * LAYER));
+    let sel = a.charge(ScreenKind::Selection);
+    assert_eq!(sel, s.atlas_texels() + LAYER);
+    // Play's skin charged what leaves one optional layer beside a tiny
+    // decision skin.
+    r.state_charge(&p, SHARED_TEXELS - sel - TINY - LAYER);
+    let _ = r.take_pool_change();
+
+    let b = tiny(&r, BLUE);
+
+    commit(&mut r, ScreenKind::Decision, &b, 3);
+    let reduced = r.pool().unwrap();
+    assert_eq!(reduced.layers, 2);
+    assert!(reduced.generation > whole.generation);
+    assert_eq!(r.take_pool_change(), Some(Some(reduced)));
+    assert_eq!(r.admission().total(), SHARED_TEXELS);
+
+    let b = tiny(&r, GREEN);
+
+    commit(&mut r, ScreenKind::Result, &b, 4);
+    let firm = r.pool().unwrap();
+    assert_eq!(firm.layers, 1);
+    assert!(firm.generation > reduced.generation);
+    let a = r.admission();
+    assert_eq!((a.firm, a.pool), (LAYER, 0));
+    assert_eq!(a.total(), SHARED_TEXELS - LAYER + TINY);
+    assert!(!r.take_result_release());
+    assert!(r.installed(ScreenKind::Result).is_some());
+    // The firm layer is the selection's own: a candidate past what the
+    // optional layers gave is refused, counting it.
+    let big = big(&r);
+    let e = r.admit(ScreenKind::Decision, &big).unwrap_err();
+    refused(&e, ScreenKind::Decision, a.committed_total() - TINY + CAP);
+}
+
+/// A larger play specialization staged in Preparing reduces the pool
+/// first, as a new generation, and keeps the result installed (AC-S9);
+/// only one that does not fit with the pool at its firm layer releases
+/// the result, the pool reduced before.
+#[test]
+fn a_larger_play_specialization_reduces_the_pool_before_the_result() {
+    let mut r = offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let p = tiny(&r, RED);
+    play(&mut r, &p, 1);
+    let s = pool_bundle(&r, dir.path());
+    commit(&mut r, ScreenKind::Selection, &s, 2);
+    let whole = r.pool().unwrap();
+    let result = tiny(&r, GREEN);
+    commit(&mut r, ScreenKind::Result, &result, 3);
+    // The selection charged what leaves one optional layer beside a tiny
+    // play candidate and the result.
+    r.state_charge(&s, SHARED_TEXELS - LAYER - 2 * TINY - LAYER);
+    let b = tiny(&r, BLUE);
+    play(&mut r, &b, 4);
+    let reduced = r.pool().unwrap();
+    assert_eq!(reduced.layers, 2);
+    assert!(reduced.generation > whole.generation);
+    assert!(!r.take_result_release());
+    assert!(r.installed(ScreenKind::Result).is_some());
+    assert_eq!(r.admission().total(), SHARED_TEXELS);
+
+    // One past even the firm layer alone: the pool goes to its firm layer,
+    // then the result is released.
+    r.state_charge(&s, SHARED_TEXELS - LAYER - TINY);
+    let b = tiny(&r, RED);
+    play(&mut r, &b, 5);
+    let firm = r.pool().unwrap();
+    assert_eq!(firm.layers, 1);
+    assert!(firm.generation > reduced.generation);
+    assert!(r.take_result_release());
+    assert!(r.installed(ScreenKind::Result).is_none());
+    assert_eq!(r.admission().total(), SHARED_TEXELS);
+}
+
+/// A renderer built again restores the kinds in their order and the pool
+/// last (AC-S9): the selection's restore makes the pool's firm layer, a
+/// new generation, the later kinds are restored beside it, and the
+/// regrowth after them sizes the pool to what they leave.
+#[test]
+fn a_recovery_restores_the_kinds_first_and_the_pool_last() {
+    let mut r = offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let p = tiny(&r, RED);
+    play(&mut r, &p, 1);
+    let s = pool_bundle(&r, dir.path());
+    commit(&mut r, ScreenKind::Selection, &s, 2);
+    let b = tiny(&r, BLUE);
+    commit(&mut r, ScreenKind::Decision, &b, 3);
+    let b = tiny(&r, GREEN);
+    commit(&mut r, ScreenKind::Result, &b, 4);
+    let old = r.pool().unwrap();
+    assert_eq!(old.layers, 4);
+    let installations: Vec<_> = [
+        ScreenKind::Play,
+        ScreenKind::Selection,
+        ScreenKind::Decision,
+        ScreenKind::Result,
+    ]
+    .map(|k| (k, r.installation(k).unwrap()))
+    .into();
+
+    let mut again = offscreen(1_920, 1_080);
+    for (kind, installation) in &installations {
+        again.restore(*kind, installation).unwrap();
+        if *kind == ScreenKind::Play {
+            // Play's skin charged what leaves one optional layer beside
+            // the other kinds.
+            let others = s.atlas_texels() + LAYER + 2 * TINY;
+            again.state_charge(installation.bundle(), SHARED_TEXELS - others - LAYER);
+        }
+        if *kind == ScreenKind::Selection {
+            let firm = again.pool().unwrap();
+            assert_eq!(firm.layers, 1);
+            assert!(firm.generation > old.generation);
+        }
+    }
+    let firm = again.pool().unwrap();
+    assert_eq!(firm.layers, 1, "the kinds restored beside the firm layer");
+    let grown = again.regrow_pool().unwrap();
+    assert_eq!(grown.layers, 2);
+    assert!(grown.generation > firm.generation);
+    assert_eq!(again.admission().total(), SHARED_TEXELS);
 }

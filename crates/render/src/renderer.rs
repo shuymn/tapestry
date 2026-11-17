@@ -20,6 +20,7 @@ use windows::Win32::Foundation::{HANDLE, WAIT_OBJECT_0};
 use windows::Win32::Graphics::Dxgi::{DXGI_FRAME_STATISTICS, IDXGISwapChain3};
 use windows::Win32::System::Threading::WaitForSingleObject;
 
+use crate::chart_pool::{ChartPool, Grid, PoolLayout, PoolWriteError};
 use crate::decision_labels::{
     self, DecisionMemory, FillStep, LabelRegion, LabelStore, LabelTarget, RowPlan, Settled,
 };
@@ -139,7 +140,8 @@ const _: () = assert!(crate::atlas::ATLAS_SIZE == 128);
 
 const SPRITE_WGSL: &str = r"
 // An `Instance`: its pivot and angle share location 3, and its flags hold
-// the atlas layer (low 16 bits) and the nearest and base filter bits.
+// the layer (low 15 bits), the pool bit (bit 15) and the nearest and base
+// filter bits.
 struct Inst {
     @location(0) rect: vec4f,
     @location(1) uv: vec4f,
@@ -162,6 +164,7 @@ struct Proj {
 @group(0) @binding(1) var smooth_samp: sampler;
 @group(0) @binding(2) var nearest_samp: sampler;
 @group(0) @binding(3) var<uniform> proj: Proj;
+@group(0) @binding(4) var pool: texture_2d_array<f32>;
 
 // Canvas pixels (origin top left, y down) to clip space; the viewport places
 // the canvas on the target. Each corner turns clockwise on screen by the
@@ -193,8 +196,17 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
 // samples are always taken, so they stay in uniform control flow; the
 // base read has an explicit level, which needs no derivatives, so only a
 // sprite with the base bit takes it. One result is chosen.
+//
+// A quad with the pool bit samples the chart-image pool instead, by the
+// same filters, never the built-in read (its layer 0 holds ordinary
+// images). Its gradients are taken first, in uniform control flow, and
+// its samples take them explicitly inside the branch, so the atlas's
+// samples and their results stay as they are.
 fn tinted(v: VOut) -> vec4f {
-    let layer = i32(v.flags & 0xFFFFu);
+    let gx = dpdx(v.uv);
+    let gy = dpdy(v.uv);
+    let layer = i32(v.flags & 0x7FFFu);
+    let pooled = (v.flags & 0x8000u) != 0u;
     let smoothed = textureSample(atlas, smooth_samp, v.uv, layer);
     let nearest = textureSample(atlas, nearest_samp, v.uv, layer);
     let texel = clamp(vec2i(floor(v.uv * 128.0)), vec2i(0), vec2i(127));
@@ -203,7 +215,17 @@ fn tinted(v: VOut) -> vec4f {
     if (v.flags & 0x20000u) != 0u {
         page = textureSampleLevel(atlas, nearest_samp, v.uv, layer, 0.0);
     }
-    return select(page, builtin, layer == 0) * v.color;
+    var out = select(page, builtin, layer == 0 && !pooled);
+    if pooled {
+        if (v.flags & 0x20000u) != 0u {
+            out = textureSampleLevel(pool, nearest_samp, v.uv, layer, 0.0);
+        } else if (v.flags & 0x10000u) != 0u {
+            out = textureSampleGrad(pool, nearest_samp, v.uv, layer, gx, gy);
+        } else {
+            out = textureSampleGrad(pool, smooth_samp, v.uv, layer, gx, gy);
+        }
+    }
+    return out * v.color;
 }
 
 @fragment
@@ -667,6 +689,9 @@ enum Retired {
         staging: Staging,
         /// Held only so that it is dropped outside the commit.
         _instances: wgpu::Buffer,
+        /// The array's bind group the layout's own replaced (a selection
+        /// layout binding its own pool), held likewise.
+        _bind: Option<wgpu::BindGroup>,
     },
     Slot(Slot),
     Pages(PagesRes),
@@ -689,10 +714,13 @@ enum PendingRes {
     /// resources it keeps.
     Installed,
     /// A fresh layout on its kind's committed atlas array, whose pages it
-    /// shares: its staging and instance buffer, with nothing uploaded.
+    /// shares: its staging and instance buffer, with nothing uploaded, and
+    /// for the selection the array's bind group with the staged pool, made
+    /// now so that the commit allocates nothing.
     Layout {
         staging: Box<Staging>,
         instances: wgpu::Buffer,
+        bind: Option<wgpu::BindGroup>,
     },
     /// Its own atlas array and layout.
     Own(Box<Resources>),
@@ -740,6 +768,35 @@ struct Pending {
     /// loading frames draw them before the commit and the installed ones
     /// after it, and a discard drops them with it.
     chart: Option<skin_model::chart_image::ChartTable>,
+    /// A selection staging's chart-image pool, which its commit installs;
+    /// `None` for one that keeps the committed pool (the same bundle) and
+    /// for another kind.
+    pool: Option<StagedPool>,
+}
+
+/// The chart-image pool a selection staging installs: its grid (`None`
+/// for a skin that draws no chart image, or whose atlas keeps a chart
+/// layer) and its array (`None` when the device refused even the firm
+/// layer).
+struct StagedPool {
+    grid: Option<Grid>,
+    pool: Option<ChartPool>,
+}
+
+/// What admitting a candidate takes once the pool's optional layers yield
+/// ([`Renderer::reclaim`]), computed before anything changes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reclaim {
+    /// It fits as things are.
+    Fits,
+    /// It fits once the pool is made again with this many layers.
+    Reduce(u32),
+    /// Play's: it fits once the pool keeps its firm layer alone and the
+    /// result's installation is released.
+    ReleaseResult,
+    /// It does not fit: the level-0 texels it needs with the pool at its
+    /// firm layer.
+    Refused(u64),
 }
 
 /// The level-0 texels charged against [`SHARED_TEXELS`] now
@@ -748,10 +805,16 @@ struct Pending {
 pub struct Admission {
     /// Each kind's committed installation, in [`ScreenKind`] order (play,
     /// selection, decision, result); 0 for none, and for play's built-in
-    /// skin.
+    /// skin. The selection's includes its chart-image pool's firm layer.
     pub committed: [u64; 4],
     /// The staged installation's kind and charge, if any.
     pub candidate: Option<(ScreenKind, u64)>,
+    /// The chart-image pool's firm layer, inside the selection's
+    /// committed charge.
+    pub firm: u64,
+    /// The chart-image pool's optional layers: a reclaimable term, which
+    /// yields before any candidate is refused or the result released.
+    pub pool: u64,
 }
 
 impl Admission {
@@ -774,6 +837,13 @@ impl Admission {
         play.saturating_add(selection)
             .saturating_add(decision)
             .saturating_add(result)
+    }
+
+    /// Everything charged now: every kind's committed charge and the
+    /// pool's optional layers.
+    #[must_use]
+    pub const fn total(&self) -> u64 {
+        self.committed_total().saturating_add(self.pool)
     }
 }
 
@@ -1026,11 +1096,20 @@ struct Bindings {
     /// The half last written to [`projection`](Self::projection), `None`
     /// until the first write: a frame writes it only when it changes.
     uploaded: Option<[f32; 2]>,
+    /// A 1×1 array of one zeroed layer, bound as the chart-image pool of
+    /// every bind group without one.
+    placeholder: wgpu::TextureView,
 }
 
 impl Bindings {
-    /// The bind group of `atlas`.
-    fn bind(&self, device: &wgpu::Device, atlas: &AtlasTexture) -> wgpu::BindGroup {
+    /// The bind group of `atlas` and `pool`, the chart-image pool's view
+    /// (the selection's), or the placeholder without one.
+    fn bind(
+        &self,
+        device: &wgpu::Device,
+        atlas: &AtlasTexture,
+        pool: Option<&wgpu::TextureView>,
+    ) -> wgpu::BindGroup {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("atlas"),
             layout: &self.layout,
@@ -1050,6 +1129,10 @@ impl Bindings {
                 wgpu::BindGroupEntry {
                     binding: 3,
                     resource: self.projection.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::TextureView(pool.unwrap_or(&self.placeholder)),
                 },
             ],
         })
@@ -1122,6 +1205,26 @@ pub struct Renderer {
     result_pages: Option<PagesRes>,
     /// What the last commit replaced, until the next staging or a drain.
     retired: Option<Retired>,
+    /// The committed selection installation's chart-image pool grid, its
+    /// cells fixed at the installation; `None` without one, or for a skin
+    /// that draws no chart image or whose atlas keeps a chart layer.
+    pool_grid: Option<Grid>,
+    /// The committed selection installation's chart-image pool, bound
+    /// beside its atlas; `None` without a grid, or when the device refused
+    /// even its firm layer.
+    pool: Option<ChartPool>,
+    /// The pool a commit replaced, kept as [`retired`](Self::retired) is.
+    retired_pool: Option<ChartPool>,
+    /// The pool's layout after its last change, until
+    /// [`take_pool_change`](Self::take_pool_change) takes it.
+    pool_change: Option<Option<PoolLayout>>,
+    /// Unit tests: pool arrays the device refuses next, one each.
+    #[cfg(test)]
+    pool_faults: std::cell::Cell<u32>,
+    /// Run by the next pool write inside its error scopes: a unit test
+    /// makes the device refuse something there.
+    #[cfg(test)]
+    pool_write_fault: Option<fn(&Gpu)>,
     /// Play's admission released the result's installation
     /// ([`take_result_release`](Self::take_result_release)).
     result_released: bool,
@@ -1318,7 +1421,7 @@ impl Renderer {
         };
         let (alpha, additive, multiply, bindings) = pipelines(&gpu, format);
         let atlas = AtlasTexture::builtin(&gpu);
-        let atlas_bind = bindings.bind(device, &atlas);
+        let atlas_bind = bindings.bind(device, &atlas, None);
         let skin: Box<dyn PlaySkin> = Box::new(SimpleSkin::new());
         // The simple skin's runs are as many as its sprites, the staging's
         // default.
@@ -1357,6 +1460,14 @@ impl Renderer {
             pending: None,
             result_pages: None,
             retired: None,
+            pool_grid: None,
+            pool: None,
+            retired_pool: None,
+            pool_change: None,
+            #[cfg(test)]
+            pool_faults: std::cell::Cell::new(0),
+            #[cfg(test)]
+            pool_write_fault: None,
             result_released: false,
             result_disabled: false,
             staged_result_text: None,
@@ -1612,7 +1723,7 @@ impl Renderer {
         // changes until all of it was accepted.
         let ((atlas, bind), refused) = skin_atlas::scoped(device, || {
             let atlas = AtlasTexture::upload(&self.gpu, pages, layers);
-            let bind = self.bindings.bind(device, &atlas);
+            let bind = self.bindings.bind(device, &atlas, None);
             #[cfg(test)]
             if let Some(fault) = fault {
                 fault(&self.gpu);
@@ -1792,19 +1903,24 @@ impl Renderer {
 
     /// Whether `bundle` as `kind`'s installation fits the texels the
     /// screens share: every other kind's committed charge and `bundle`'s
-    /// ([`Admission`]), at most [`SHARED_TEXELS`]. The candidate replaces
-    /// its kind's charge, so the state after its commit is what is
-    /// admitted. `kind`'s committed bundle itself allocates nothing again
-    /// and is admitted as it is. Allocates nothing.
+    /// ([`Admission`]), at most [`SHARED_TEXELS`], once the selection's
+    /// chart-image pool has given up as many optional layers as that
+    /// takes (design.md "Memory Budget"). The candidate replaces its
+    /// kind's charge, so the state after its commit is what is admitted; a
+    /// selection candidate is charged its pool's firm layer too, and
+    /// replaces the pool. `kind`'s committed bundle itself allocates
+    /// nothing again and is admitted as it is. Allocates nothing.
     ///
     /// A read-only budget query: `Ok` means the hypothetical replacement
     /// fits the charges committed now. It reserves nothing, changes no
-    /// staging, validates no device resource, and does not promise that a
-    /// later installation succeeds; every staging checks admission itself.
+    /// staging or pool, validates no device resource, and does not promise
+    /// that a later installation succeeds; every staging checks admission
+    /// itself.
     ///
     /// # Errors
     ///
-    /// [`RenderError::Admission`] with the sum, past the limit.
+    /// [`RenderError::Admission`] with the sum, the pool at its firm layer,
+    /// past the limit.
     pub fn admit(&self, kind: ScreenKind, bundle: &SkinBundle) -> Result<(), RenderError> {
         if self
             .committed_installation(kind)
@@ -1812,68 +1928,124 @@ impl Renderer {
         {
             return Ok(());
         }
-        self.admit_charge(kind, charge_of(bundle), None)
+        let charge = self.candidate_charge(kind, bundle);
+        match self.reclaim(kind, charge) {
+            Reclaim::Fits | Reclaim::Reduce(_) => Ok(()),
+            Reclaim::ReleaseResult | Reclaim::Refused(_) => Err(RenderError::Admission {
+                kind,
+                needed: self.needed(kind, charge),
+                limit: SHARED_TEXELS,
+            }),
+        }
     }
 
-    /// Whether `charge` as `kind`'s fits beside every other kind's
-    /// committed charge but `without`'s.
-    fn admit_charge(
-        &self,
-        kind: ScreenKind,
-        charge: u64,
-        without: Option<ScreenKind>,
-    ) -> Result<(), RenderError> {
-        let others = KINDS
+    /// What admitting `charge` as `kind`'s takes, read only and before
+    /// anything is created (design.md "Memory Budget"): it fits beside
+    /// every other kind's committed charge and the pool's optional layers;
+    /// or it fits once the pool keeps the most optional layers that leave
+    /// it room, down to none; or, for play, once the pool keeps its firm
+    /// layer alone and the result's installation is released; or it is
+    /// refused. A selection candidate replaces the pool, so its optional
+    /// layers go with the kind.
+    fn reclaim(&self, kind: ScreenKind, charge: u64) -> Reclaim {
+        let base = self.needed(kind, charge);
+        let (layer, optional) = match &self.pool {
+            Some(p) if kind != ScreenKind::Selection => {
+                (p.grid().layer_texels(), p.layers().saturating_sub(1))
+            }
+            _ => (0, 0),
+        };
+        let fits =
+            |kept: u32| base.saturating_add(layer.saturating_mul(u64::from(kept))) <= SHARED_TEXELS;
+        if fits(optional) {
+            return Reclaim::Fits;
+        }
+        if let Some(kept) = (0..optional).rev().find(|&k| fits(k)) {
+            return Reclaim::Reduce(kept + 1);
+        }
+        let result = self.charge(ScreenKind::Result);
+        if kind == ScreenKind::Play && result > 0 && base.saturating_sub(result) <= SHARED_TEXELS {
+            return Reclaim::ReleaseResult;
+        }
+        Reclaim::Refused(base)
+    }
+
+    /// The level-0 texels `charge` as `kind`'s needs beside every other
+    /// kind's committed charge, the pool's optional layers left out.
+    fn needed(&self, kind: ScreenKind, charge: u64) -> u64 {
+        KINDS
             .iter()
-            .filter(|&&k| k != kind && Some(k) != without)
-            .fold(0u64, |sum, &k| sum.saturating_add(self.charge(k)));
-        let needed = others.saturating_add(charge);
-        if needed > SHARED_TEXELS {
-            return Err(RenderError::Admission {
+            .filter(|&&k| k != kind)
+            .fold(charge, |sum, &k| sum.saturating_add(self.charge(k)))
+    }
+
+    /// Admits `charge` as `kind`'s ([`reclaim`](Self::reclaim)), applying
+    /// what that takes: the pool made again smaller, as a new generation,
+    /// then, for play, the result's installation released (no result is
+    /// drawn from Preparing until the result, and its owner installs it
+    /// again after play's commit, if it is admitted then).
+    fn admit_reclaiming(&mut self, kind: ScreenKind, charge: u64) -> Result<(), RenderError> {
+        match self.reclaim(kind, charge) {
+            Reclaim::Fits => Ok(()),
+            Reclaim::Reduce(layers) => {
+                self.reduce_pool(layers);
+                Ok(())
+            }
+            Reclaim::ReleaseResult => {
+                self.reduce_pool(1);
+                self.remove(ScreenKind::Result);
+                self.result_released = true;
+                Ok(())
+            }
+            Reclaim::Refused(needed) => Err(RenderError::Admission {
                 kind,
                 needed,
                 limit: SHARED_TEXELS,
-            });
+            }),
         }
-        Ok(())
     }
 
-    /// `kind`'s committed charge: its installation's, or the result's
-    /// pages-only installation's array.
+    /// Admits `bundle` as `kind`'s staging ([`admit_reclaiming`](Self::admit_reclaiming));
+    /// `kind`'s committed bundle is admitted as it is.
+    fn admit_bundle(
+        &mut self,
+        kind: ScreenKind,
+        bundle: &Arc<SkinBundle>,
+    ) -> Result<(), RenderError> {
+        if self
+            .committed_installation(kind)
+            .is_some_and(|i| Arc::ptr_eq(i.bundle(), bundle))
+        {
+            return Ok(());
+        }
+        self.admit_reclaiming(kind, self.candidate_charge(kind, bundle))
+    }
+
+    /// What `bundle` is charged as `kind`'s candidate: its own charge, and
+    /// for the selection its pool's firm layer at the current target.
+    fn candidate_charge(&self, kind: ScreenKind, bundle: &SkinBundle) -> u64 {
+        let firm = if kind == ScreenKind::Selection {
+            self.pool_grid_for(bundle).map_or(0, |g| g.layer_texels())
+        } else {
+            0
+        };
+        charge_of(bundle).saturating_add(firm)
+    }
+
+    /// `kind`'s committed charge: its installation's, the selection's with
+    /// its pool's firm layer, or the result's pages-only installation's
+    /// array.
     fn charge(&self, kind: ScreenKind) -> u64 {
         match self.committed_installation(kind) {
+            Some(i) if kind == ScreenKind::Selection => self
+                .committed_charge(i.bundle())
+                .saturating_add(self.pool.as_ref().map_or(0, ChartPool::firm_texels)),
             Some(i) => self.committed_charge(i.bundle()),
             None if kind == ScreenKind::Result => self
                 .result_pages
                 .as_ref()
                 .map_or(0, |p| pages_texels(&p.pages)),
             None => 0,
-        }
-    }
-
-    /// Admits `bundle` as `kind`'s ([`admit`](Self::admit)); for play, when
-    /// only the result's committed installation keeps it out, that
-    /// installation is released first (design.md "Memory Budget"): no
-    /// result is drawn from Preparing until the result, and its owner
-    /// installs it again after play's commit, if it is admitted then.
-    fn admit_or_release(
-        &mut self,
-        kind: ScreenKind,
-        bundle: &Arc<SkinBundle>,
-    ) -> Result<(), RenderError> {
-        match self.admit(kind, bundle) {
-            Err(_)
-                if kind == ScreenKind::Play
-                    && self.charge(ScreenKind::Result) > 0
-                    && self
-                        .admit_charge(kind, charge_of(bundle), Some(ScreenKind::Result))
-                        .is_ok() =>
-            {
-                self.remove(ScreenKind::Result);
-                self.result_released = true;
-                Ok(())
-            }
-            other => other,
         }
     }
 
@@ -1900,8 +2072,9 @@ impl Renderer {
     }
 
     /// Tests and development builds: charges `bundle` `texels` whenever it
-    /// is a kind's committed installation, in place of its own charge, so
-    /// the shared limit is tested through [`admit`](Self::admit) without
+    /// is a kind's committed installation, in place of its own charge (the
+    /// selection's pool's firm layer is still charged beside it), so the
+    /// shared limit is tested through [`admit`](Self::admit) without
     /// committing arrays that large. A candidate is charged its own.
     #[cfg(any(test, feature = "dev-tools"))]
     pub fn state_charge(&mut self, bundle: &Arc<SkinBundle>, texels: u64) {
@@ -1909,21 +2082,274 @@ impl Renderer {
         self.stated.push((Arc::clone(bundle), texels));
     }
 
-    /// The charges [`admit`](Self::admit) sums now, and the staged
-    /// installation's.
+    /// The charges [`admit`](Self::admit) sums now, the staged
+    /// installation's and the chart-image pool's firm and optional layers.
     #[must_use]
     pub fn admission(&self) -> Admission {
         Admission {
             committed: KINDS.map(|k| self.charge(k)),
             candidate: self.pending.as_ref().map(|p| {
                 let charge = match (&p.skin, &p.pages) {
-                    (Some(s), _) => charge_of(s.bundle()),
+                    (Some(s), _) => self.candidate_charge(p.token.kind, s.bundle()),
                     (None, Some(pages)) => pages_texels(pages),
                     (None, None) => 0,
                 };
                 (p.token.kind, charge)
             }),
+            firm: self.pool.as_ref().map_or(0, ChartPool::firm_texels),
+            pool: self.pool.as_ref().map_or(0, ChartPool::optional_texels),
         }
+    }
+
+    /// The chart-image pool grid of `bundle` as the selection's at the
+    /// current target: its cells ([`skin_model::Skin::chart_cells`]) in
+    /// layers of its page side raised to [`skin_model::MIN_TEXT_SIDE`].
+    /// `None` for a skin that draws no chart image, or whose atlas keeps a
+    /// chart layer for them.
+    fn pool_grid_for(&self, bundle: &SkinBundle) -> Option<Grid> {
+        if bundle.chart_layer().is_some() || !bundle.skin().has_chart_images() {
+            return None;
+        }
+        let side = bundle.side().max(skin_model::MIN_TEXT_SIDE);
+        let cells = bundle.skin().chart_cells(self.target(), side);
+        Grid::of(cells, side, &self.gpu.device().limits())
+    }
+
+    /// The most layers of `grid` that fit beside `used` level-0 texels,
+    /// the firm layer counted in `used`: at least the firm layer.
+    fn fitting_layers(grid: &Grid, used: u64) -> u32 {
+        let room = SHARED_TEXELS.saturating_sub(used) / grid.layer_texels().max(1);
+        u32::try_from(room)
+            .unwrap_or(u32::MAX)
+            .saturating_add(1)
+            .min(grid.max_layers())
+    }
+
+    /// A pool of `layers` layers of `grid` (or of its firm layer alone when
+    /// the device refuses that) with `atlas`'s bind group binding it, made
+    /// inside error scopes; `None` when the device refuses even the firm
+    /// layer. Queued, not submitted; waits for no GPU work.
+    fn make_pool(
+        &self,
+        grid: Grid,
+        layers: u32,
+        atlas: &AtlasTexture,
+    ) -> Option<(ChartPool, wgpu::BindGroup)> {
+        let tries = [Some(layers), (layers > 1).then_some(1)];
+        tries.into_iter().flatten().find_map(|layers| {
+            #[cfg(test)]
+            let fault = self.pool_faults.get() > 0;
+            #[cfg(test)]
+            self.pool_faults
+                .set(self.pool_faults.get().saturating_sub(1));
+            let device = self.gpu.device();
+            let ((pool, bind), refused) = skin_atlas::scoped(device, || {
+                let pool = ChartPool::create(&self.gpu, grid, layers);
+                let bind = self.bindings.bind(device, atlas, Some(pool.view()));
+                #[cfg(test)]
+                if fault {
+                    pool_fault(&self.gpu);
+                }
+                (pool, bind)
+            });
+            refused.is_none().then_some((pool, bind))
+        })
+    }
+
+    /// The committed selection installation's slot.
+    fn selection_slot(&self) -> Option<&Slot> {
+        let i = Self::screen(ScreenKind::Selection)?;
+        self.screens.get(i)?.as_ref()
+    }
+
+    /// The committed selection installation's slot, to change.
+    fn selection_slot_mut(&mut self) -> Option<&mut Slot> {
+        let i = Self::screen(ScreenKind::Selection)?;
+        self.screens.get_mut(i)?.as_mut()
+    }
+
+    /// Makes the committed selection's pool again with `layers` layers, a
+    /// new generation, when it has more: or with its firm layer alone when
+    /// the device refuses that, and none when it refuses even that, the
+    /// selection then bound to the placeholder. Rebinds the selection and
+    /// publishes the change. Not a frame's work: it allocates.
+    fn reduce_pool(&mut self, layers: u32) {
+        let Some(grid) = self
+            .pool
+            .as_ref()
+            .filter(|p| p.layers() > layers)
+            .map(ChartPool::grid)
+        else {
+            return;
+        };
+        // The old array goes first, so its layers are given back before
+        // the smaller one is made.
+        self.pool = None;
+        let Some(slot) = self.selection_slot() else {
+            self.pool_changed();
+            return;
+        };
+        let atlas = &slot.resources.atlas;
+        let (pool, bind) = match self.make_pool(grid, layers, atlas) {
+            Some((pool, bind)) => (Some(pool), bind),
+            None => (None, self.bindings.bind(self.gpu.device(), atlas, None)),
+        };
+        if let Some(slot) = self.selection_slot_mut() {
+            slot.resources.atlas_bind = bind;
+        }
+        self.pool = pool;
+        self.pool_changed();
+    }
+
+    /// Regrows the committed selection's chart-image pool to the most
+    /// layers that fit beside every committed charge and the staged
+    /// candidate's (design.md "Memory Budget"), as a new generation, when
+    /// that is more than it has; a refusal by the device keeps the pool it
+    /// has. The owner calls it at each selection entry and after a
+    /// renderer built again has restored every kind, so the pool is made
+    /// last, sized to what the kinds leave. Not a frame's work: it
+    /// allocates. Returns the live pool.
+    pub fn regrow_pool(&mut self) -> Option<PoolLayout> {
+        if self.gpu.lost() {
+            return None;
+        }
+        let Some(grid) = self.pool_grid else {
+            return self.pool();
+        };
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|p| p.token.kind == ScreenKind::Selection)
+        {
+            return self.pool();
+        }
+        let current = self.pool.as_ref().map_or(0, ChartPool::layers);
+        let firm = if current == 0 { grid.layer_texels() } else { 0 };
+        let staged = self.admission().candidate;
+        let used = KINDS.iter().fold(firm, |sum, &k| {
+            let charge = match staged {
+                Some((kind, c)) if kind == k => self.charge(k).max(c),
+                _ => self.charge(k),
+            };
+            sum.saturating_add(charge)
+        });
+        if used > SHARED_TEXELS {
+            return self.pool();
+        }
+        let layers = Self::fitting_layers(&grid, used);
+        if layers <= current {
+            return self.pool();
+        }
+        // The pool it has stays until the larger one is made; the firm
+        // layer alone is taken only when there is no pool.
+        let made = self.selection_slot().and_then(|slot| {
+            self.make_pool(grid, layers, &slot.resources.atlas)
+                .filter(|(p, _)| current == 0 || p.layers() == layers)
+        });
+        if let Some((pool, bind)) = made {
+            if let Some(slot) = self.selection_slot_mut() {
+                slot.resources.atlas_bind = bind;
+            }
+            self.pool = Some(pool);
+            self.pool_changed();
+        }
+        self.pool()
+    }
+
+    /// Records the pool's layout after a change, for
+    /// [`take_pool_change`](Self::take_pool_change).
+    fn pool_changed(&mut self) {
+        self.pool_change = Some(self.pool());
+    }
+
+    /// The live chart-image pool's layout: `None` without a pool, or once
+    /// the device is lost.
+    #[must_use]
+    pub fn pool(&self) -> Option<PoolLayout> {
+        if self.gpu.lost() {
+            return None;
+        }
+        self.pool.as_ref().map(ChartPool::layout)
+    }
+
+    /// The pool's layout after its last change (`Some(None)` once there is
+    /// no pool), if it changed since the last call, which clears it: a new
+    /// generation at each array made, none after the array is released.
+    pub fn take_pool_change(&mut self) -> Option<Option<PoolLayout>> {
+        self.pool_change.take()
+    }
+
+    /// The live key of the chart-image pool: this renderer, the selection
+    /// installation (its presentation's number), its atlas and the pool's
+    /// generation; `None` without a pool or once the device is lost.
+    /// Allocates nothing.
+    #[must_use]
+    pub fn pool_chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
+        let pool = self.pool.as_ref()?;
+        let i = Self::screen(ScreenKind::Selection)?;
+        let s = self.screens.get(i)?.as_ref()?;
+        (!self.gpu.lost()).then(|| skin_model::chart_image::ChartKey {
+            renderer: self.id,
+            installation: s.installation.loading().id(),
+            atlas: s.installation.bundle().atlas_id().0,
+            generation: pool.generation(),
+        })
+    }
+
+    /// The table of slot `slot` of pool generation `generation`, keyed to
+    /// the pool ([`pool_chart_key`](Self::pool_chart_key)): its stage
+    /// file and banner, when `generation` is live and the slot's write was
+    /// applied; `None` otherwise, which a frame draws as pending. A
+    /// frame's work: allocates nothing.
+    #[must_use]
+    pub fn pool_table(
+        &self,
+        generation: u64,
+        slot: u16,
+    ) -> Option<skin_model::chart_image::ChartTable> {
+        let pool = self
+            .pool
+            .as_ref()
+            .filter(|p| p.generation() == generation)?;
+        pool.table(slot, self.pool_chart_key()?)
+    }
+
+    /// Writes `stage` and `banner` (each fitted into its pool cell, `None`
+    /// for one absent) into slot `slot` of pool generation `generation`,
+    /// between frames: every level at its cell's origin `>> k` inside
+    /// error scopes, queued and not submitted, waiting for no GPU work, so
+    /// the next frame's submission flushes it after every frame already
+    /// submitted. The slot's record is cleared first and set by a whole
+    /// write. The caller writes only a slot no frame it may still draw
+    /// shows.
+    ///
+    /// # Errors
+    ///
+    /// [`PoolWriteError::DeviceLost`] once the device is lost;
+    /// [`PoolWriteError::Stale`] for a generation that is not live or a
+    /// slot it does not have; [`PoolWriteError::Refused`] for a fit that
+    /// does not lie in its cell or a write the device refused, the slot's
+    /// record cleared.
+    pub fn write_pool(
+        &mut self,
+        generation: u64,
+        slot: u16,
+        stage: Option<&skin_model::chart_image::Fitted>,
+        banner: Option<&skin_model::chart_image::Fitted>,
+    ) -> Result<(), PoolWriteError> {
+        if self.gpu.lost() {
+            return Err(PoolWriteError::DeviceLost);
+        }
+        #[cfg(test)]
+        let fault = self.pool_write_fault.take();
+        #[cfg(not(test))]
+        let fault = None;
+        let pool = self
+            .pool
+            .as_mut()
+            .filter(|p| p.generation() == generation)
+            .ok_or(PoolWriteError::Stale)?;
+        pool.write(&self.gpu, slot, stage, banner, fault)
     }
 
     /// [`stage`](Self::stage) with attempt `a`, or
@@ -1951,7 +2377,7 @@ impl Renderer {
         if a.is_some() {
             self.text_report = TextReport::default();
         }
-        self.admit_or_release(kind, bundle)?;
+        self.admit_bundle(kind, bundle)?;
         let installed = self
             .committed_installation(kind)
             .filter(|i| Arc::ptr_eq(i.bundle(), bundle))
@@ -1967,6 +2393,7 @@ impl Renderer {
                     PendingRes::Layout {
                         staging: Box::new(staging),
                         instances,
+                        bind: None,
                     },
                 )
             }
@@ -1975,6 +2402,8 @@ impl Renderer {
                 PendingRes::Own(Box::new(self.resources_for(kind, bundle)?)),
             ),
         };
+        let pool = (kind == ScreenKind::Selection && !matches!(res, PendingRes::Installed))
+            .then(|| self.stage_pool(bundle, &mut res));
         let mut skin = DeclSkin::of(&installation);
         let mut text = Holder::default();
         if let Some(a) = a {
@@ -2043,10 +2472,51 @@ impl Renderer {
             text,
             loading: Holder::default(),
             chart: None,
+            pool,
         });
         #[cfg(test)]
         self.text_hooks.steps.push(text_upload::Step::StageReturned);
         Ok(token)
+    }
+
+    /// The chart-image pool a selection staging of `bundle` on `res` (its
+    /// own array or a layout on the committed one) installs: its grid at
+    /// the current target, and an array of as many layers as fit beside
+    /// every other kind's committed charge and the staging's own, down to
+    /// its firm layer, or none when the device refuses even that
+    /// (design.md "Rendering and Skins", chart images). The array's bind
+    /// group, with the pool or the placeholder, is made into `res` now, so
+    /// the commit allocates nothing.
+    fn stage_pool(&self, bundle: &SkinBundle, res: &mut PendingRes) -> StagedPool {
+        let grid = self.pool_grid_for(bundle);
+        // Own resources are bound to the placeholder already, and so is a
+        // committed array without a pool.
+        if grid.is_none() && (matches!(res, PendingRes::Own(_)) || self.pool.is_none()) {
+            return StagedPool { grid, pool: None };
+        }
+        let used = self.needed(
+            ScreenKind::Selection,
+            self.candidate_charge(ScreenKind::Selection, bundle),
+        );
+        let atlas = match &*res {
+            PendingRes::Own(r) => Some(&r.atlas),
+            PendingRes::Layout { .. } => self.selection_slot().map(|s| &s.resources.atlas),
+            PendingRes::Installed | PendingRes::Pages(_) => None,
+        };
+        let Some(atlas) = atlas else {
+            return StagedPool { grid, pool: None };
+        };
+        let made = grid.and_then(|g| self.make_pool(g, Self::fitting_layers(&g, used), atlas));
+        let (pool, bind) = match made {
+            Some((pool, bind)) => (Some(pool), bind),
+            None => (None, self.bindings.bind(self.gpu.device(), atlas, None)),
+        };
+        match res {
+            PendingRes::Own(r) => r.atlas_bind = bind,
+            PendingRes::Layout { bind: b, .. } => *b = Some(bind),
+            PendingRes::Installed | PendingRes::Pages(_) => {}
+        }
+        StagedPool { grid, pool }
     }
 
     /// What the last preparation of rasterized text did, an attempt's
@@ -2137,7 +2607,7 @@ impl Renderer {
             skin_atlas::check_pages(&upload, &device.limits()).map_err(RenderError::Atlas)?;
         let ((atlas, atlas_bind, buffer), refused) = skin_atlas::scoped(device, || {
             let atlas = AtlasTexture::upload(&self.gpu, &upload, layers);
-            let bind = self.bindings.bind(device, &atlas);
+            let bind = self.bindings.bind(device, &atlas, None);
             #[cfg(test)]
             if let Some(fault) = self.atlas_fault {
                 fault(&self.gpu);
@@ -2240,6 +2710,7 @@ impl Renderer {
         self.requested = request;
         self.drop_pending();
         self.retired = None;
+        self.retired_pool = None;
         Ok(())
     }
 
@@ -2274,7 +2745,7 @@ impl Renderer {
             PendingRes::Pages(None)
         } else {
             self.release(kind);
-            self.admit_charge(kind, pages_texels(pages), None)?;
+            self.admit_reclaiming(kind, pages_texels(pages))?;
             PendingRes::Pages(Some(Box::new(self.pages_for(pages)?)))
         };
         let token = PreparedToken {
@@ -2290,15 +2761,23 @@ impl Renderer {
             text: Holder::default(),
             loading: Holder::default(),
             chart: None,
+            pool: None,
         });
         Ok(token)
     }
 
     /// Drops `kind`'s committed installation, the result's pages-only one
-    /// and its staged lines included, leaving a staging in place.
+    /// and its staged lines included, and the selection's chart-image pool,
+    /// whose generation ends, leaving a staging in place.
     fn release(&mut self, kind: ScreenKind) {
         if let Some(slot) = Self::screen(kind).and_then(|i| self.screens.get_mut(i)) {
             *slot = None;
+        }
+        if kind == ScreenKind::Selection {
+            self.pool_grid = None;
+            if self.pool.take().is_some() {
+                self.pool_changed();
+            }
         }
         if kind == ScreenKind::Result {
             self.result_pages = None;
@@ -2399,6 +2878,16 @@ impl Renderer {
             Some(i) => {
                 let installation = pending.skin.as_ref().map(DeclSkin::installation);
                 let result = token.kind == ScreenKind::Result;
+                // A selection staging's own pool replaces the committed
+                // one, which is kept as what the commit replaced.
+                if let Some(staged) = pending.pool {
+                    self.retired_pool = self.pool.take();
+                    self.pool_grid = staged.grid;
+                    self.pool = staged.pool;
+                    if self.retired_pool.is_some() || self.pool.is_some() {
+                        self.pool_changed();
+                    }
+                }
                 // What it replaces keeps its device resources until the
                 // next staging or a drain: a commit drops none of them.
                 let old = self.screens.get_mut(i).and_then(Option::take);
@@ -2428,20 +2917,27 @@ impl Renderer {
                         PendingRes::Layout {
                             mut staging,
                             instances,
+                            bind,
                         },
                         Some(installation),
                     ) => {
                         // The installed array, with the lines it holds
-                        // until the new layout's own are installed.
+                        // until the new layout's own are installed, bound
+                        // with the staged pool when the staging made one.
                         let held = match (old, pages) {
                             (Some(s), _) => {
+                                let (atlas_bind, replaced) = match bind {
+                                    Some(b) => (b, Some(s.resources.atlas_bind)),
+                                    None => (s.resources.atlas_bind, None),
+                                };
                                 self.retired = Some(Retired::Layout {
                                     staging: s.resources.staging,
                                     _instances: s.resources.instances,
+                                    _bind: replaced,
                                 });
                                 Some((
                                     s.resources.atlas,
-                                    s.resources.atlas_bind,
+                                    atlas_bind,
                                     s.resources.text_cache,
                                     s.resources.labels,
                                     s.text,
@@ -2584,8 +3080,20 @@ impl Renderer {
         if kind == ScreenKind::Result && self.result_disabled {
             return Err(RenderError::ResultDisabled);
         }
-        self.admit(kind, installation.bundle())?;
-        let r = self.resources_for(kind, installation.bundle())?;
+        self.admit_bundle(kind, installation.bundle())?;
+        let mut r = self.resources_for(kind, installation.bundle())?;
+        // The selection's pool is made again with its firm layer alone, a
+        // new generation; it regrows once every kind is restored
+        // ([`regrow_pool`](Self::regrow_pool)).
+        let pool = (kind == ScreenKind::Selection).then(|| {
+            let grid = self.pool_grid_for(installation.bundle());
+            let made = grid.and_then(|g| self.make_pool(g, 1, &r.atlas));
+            let pool = made.map(|(pool, bind)| {
+                r.atlas_bind = bind;
+                pool
+            });
+            (grid, pool)
+        });
         match Self::screen(kind) {
             None => {
                 self.replace_resources(r);
@@ -2600,6 +3108,14 @@ impl Renderer {
                         text: Holder::default(),
                     });
                 }
+            }
+        }
+        if let Some((grid, pool)) = pool {
+            let had = self.pool.is_some();
+            self.pool_grid = grid;
+            self.pool = pool;
+            if had || self.pool.is_some() {
+                self.pool_changed();
             }
         }
         Ok(())
@@ -2640,7 +3156,7 @@ impl Renderer {
             return Err(RenderError::ResultDisabled);
         }
         self.release(kind);
-        self.admit_charge(kind, pages_texels(pages), None)?;
+        self.admit_reclaiming(kind, pages_texels(pages))?;
         self.result_pages = Some(self.pages_for(pages)?);
         Ok(())
     }
@@ -3329,6 +3845,7 @@ impl Renderer {
     /// design's §2.1 Q3) before another atlas build is considered. The next
     /// staging drains it too.
     pub fn drain_retired(&mut self) -> Option<AtlasId> {
+        self.retired_pool = None;
         self.retired.take().and_then(|r| r.atlas_id())
     }
 
@@ -5504,6 +6021,19 @@ fn finish_uploads(gpu: &Gpu) -> Result<(), RenderError> {
     wait_for_gpu(gpu)
 }
 
+/// Unit tests: what a refused pool array runs inside its error scopes, a
+/// buffer whose usage mixes both map modes, which every device's
+/// validation refuses.
+#[cfg(test)]
+fn pool_fault(gpu: &Gpu) {
+    let _ = gpu.device().create_buffer(&wgpu::BufferDescriptor {
+        label: Some("refused"),
+        size: 4,
+        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::MAP_WRITE,
+        mapped_at_creation: false,
+    });
+}
+
 /// Test and development seams of [`write_chart_set`]: a refusal of the
 /// write as a misfit, and a fault run inside the write's error scope.
 /// Neither exists in a production build.
@@ -5754,15 +6284,67 @@ fn pipelines(
                 },
                 count: None,
             },
+            wgpu::BindGroupLayoutEntry {
+                binding: 4,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2Array,
+                    multisampled: false,
+                },
+                count: None,
+            },
         ],
+    });
+    // The pool binding of every bind group without a pool: one zeroed
+    // texel, written so that it is not cleared at its first draw.
+    let placeholder = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("no chart pool"),
+        size: extent(1, 1),
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+        view_formats: &[],
+    });
+    skin_atlas::write_region(gpu.queue(), &placeholder, (0, 0), [0, 0], [1, 1], &[0; 4]);
+    let placeholder = placeholder.create_view(&wgpu::TextureViewDescriptor {
+        label: Some("no chart pool"),
+        dimension: Some(wgpu::TextureViewDimension::D2Array),
+        ..wgpu::TextureViewDescriptor::default()
     });
     let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("sprites"),
         source: wgpu::ShaderSource::Wgsl(SPRITE_WGSL.into()),
     });
+    let (alpha, additive, multiply) = sprite_pipelines(device, &layout, &module, format);
+    let bindings = Bindings {
+        layout,
+        smooth,
+        nearest,
+        projection,
+        uploaded: None,
+        placeholder,
+    };
+    (alpha, additive, multiply, bindings)
+}
+
+/// The alpha, additive and multiply pipelines of the sprite shader
+/// `module` over bind group `layout` ([`pipelines`]).
+fn sprite_pipelines(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    module: &wgpu::ShaderModule,
+    format: wgpu::TextureFormat,
+) -> (
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+) {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("sprites"),
-        bind_group_layouts: &[Some(&layout)],
+        bind_group_layouts: &[Some(layout)],
         immediate_size: 0,
     });
     let pipeline = |blend, fragment| {
@@ -5779,7 +6361,7 @@ fn pipelines(
             label: Some("sprites"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
-                module: &module,
+                module,
                 entry_point: Some("vs"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[Some(wgpu::VertexBufferLayout {
@@ -5789,7 +6371,7 @@ fn pipelines(
                 })],
             },
             fragment: Some(wgpu::FragmentState {
-                module: &module,
+                module,
                 entry_point: Some(fragment),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 targets: &[Some(wgpu::ColorTargetState {
@@ -5836,18 +6418,19 @@ fn pipelines(
         },
         "fs_multiply",
     );
-    let bindings = Bindings {
-        layout,
-        smooth,
-        nearest,
-        projection,
-        uploaded: None,
-    };
-    (alpha, additive, multiply, bindings)
+    (alpha, additive, multiply)
 }
 
 /// The projection's uniform: half the canvas's size, padded to 16 bytes.
 const PROJECTION_BYTES: u64 = 16;
+
+#[cfg(test)]
+#[path = "pool_shader_tests.rs"]
+mod pool_shader_tests;
+
+#[cfg(test)]
+#[path = "pool_tests.rs"]
+pub(crate) mod pool_tests;
 
 #[cfg(test)]
 #[path = "decision_label_tests.rs"]

@@ -26,14 +26,20 @@ use skin_model::{ClipId, Filter, Quad, QuadBatch, RunKey};
 /// texel, so the bitmap font stays sharp, whatever its filter.
 pub type Sprite = Quad;
 
-/// The atlas layer and filter bits of [`Instance::flags`]: the layer in
-/// the low 16 bits, and this bit set when the atlas is sampled at its
-/// nearest texel.
+/// The pool bit of [`Instance::flags`], the top bit of a quad's 16-bit
+/// layer: the quad samples the selection's chart-image pool at the layer
+/// in the 15 bits below it, not the atlas
+/// ([`skin_model::chart_image::POOL_LAYER`]). No atlas layer reaches it.
+pub const FLAG_POOL: u32 = 1 << 15;
+/// The filter bit of [`Instance::flags`] set when the texture is sampled
+/// at its nearest texel; the layer and the pool bit are the low 16 bits.
 pub const FLAG_NEAREST: u32 = 1 << 16;
-/// The filter bit of [`Instance::flags`] set when the atlas is sampled at
-/// its nearest level-0 texel, however far the sprite shrinks
+/// The filter bit of [`Instance::flags`] set when the texture is sampled
+/// at its nearest level-0 texel, however far the sprite shrinks
 /// ([`Filter::NearestBase`]).
 pub const FLAG_BASE: u32 = 1 << 17;
+
+const _: () = assert!(FLAG_POOL == skin_model::chart_image::POOL_LAYER as u32);
 
 /// One sprite as the GPU reads it: 64 bytes, its fields converted one by
 /// one from a [`Sprite`] ([`Instance::of`]).
@@ -50,8 +56,8 @@ pub struct Instance {
     pub pivot: [f32; 2],
     /// The clockwise rotation about `pivot`, in radians.
     pub angle: f32,
-    /// The atlas layer (low 16 bits), and [`FLAG_NEAREST`] or
-    /// [`FLAG_BASE`].
+    /// The layer (low 15 bits) with [`FLAG_POOL`] for a pool quad, and
+    /// [`FLAG_NEAREST`] or [`FLAG_BASE`].
     pub flags: u32,
 }
 
@@ -405,6 +411,14 @@ mod tests {
         };
         assert_eq!(Instance::of(&grid).flags, 0x2_1234);
         assert_eq!(FLAG_BASE, 0x2_0000);
+        // A pool quad's layer carries the pool bit through.
+        let pooled = Sprite {
+            layer: skin_model::chart_image::POOL_LAYER | 3,
+            filter: Filter::Nearest,
+            ..Sprite::default()
+        };
+        assert_eq!(Instance::of(&pooled).flags, FLAG_NEAREST | FLAG_POOL | 3);
+        assert_eq!(FLAG_POOL, 0x8000);
     }
 
     /// The instance layout the vertex buffer describes.
