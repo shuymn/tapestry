@@ -116,7 +116,7 @@
 //! dev: span loading 1: frames 31, not presented 0, first 2618626 us, last 3848330 us, longest gap 60000 us (2618626 to 2678626, uncovered 60000 us, 2618626 to 2678626), largest uncovered gap 60000 us of 60000 us (2618626 to 2678626, 2618626 to 2678626)
 //! dev: transition loading -> ready: 39972 us, last 3848330 us, first 3888302 us, covered 0 us, uncovered 39972 us (3848330 to 3888302)
 //! dev: mark preparing 8574600 to 13400100 us
-//! dev: transitions: 27 records, lost 0, marks dropped 0, largest uncovered 62548 us (35479870 to 35542418) in transition tail -> practice
+//! dev: transitions: 27 records, lost 0, largest uncovered 62548 us (35479870 to 35542418) in transition tail -> practice
 //! ```
 
 use std::collections::HashMap;
@@ -136,7 +136,7 @@ use input::{QpcClock, ScriptedInput};
 use rules::GaugeValue;
 use serde::Deserialize;
 
-use super::transitions::{Edge, MAX_RECORDS, Mark, MarkKind, Recorder, Transitions};
+use super::transitions::{Change, MAX_RECORDS, Mark, MarkKind, Recorder, Transitions};
 use super::{SelectScript, SelectStep};
 use crate::args::UsageError;
 use crate::input_side::Recorded;
@@ -2317,8 +2317,6 @@ impl Drop for ScenarioFrames {
     /// the file system holds it, and with it this thread: the render
     /// link's bounds leave both to the process's exit.
     fn drop(&mut self) {
-        // The render thread's end: the open span is recorded.
-        self.recorder.close();
         if let Some(Writer { jobs, thread }) = self.writer.take() {
             drop(jobs);
             let _ = thread.join();
@@ -2532,12 +2530,12 @@ enum Stamp {
     /// Its decision screen's choice.
     Decision { origin: TimeUs },
     /// The change whose first presented frame it is.
-    Transition(Edge),
+    Transition(Change),
 }
 
 /// A change's name in its capture's file: a transition's states, or a
 /// presentation change's state and what drew it before and after.
-fn change_name(e: &Edge) -> String {
+fn change_name(e: &Change) -> String {
     if e.presentation {
         format!(
             "{}-{}-{}",
@@ -2735,8 +2733,8 @@ fn sidecar(
                 e.to.state.name(),
                 num(Some(e.to.lifetime)),
                 e.to.drew.name(),
-                e.gap.from.0,
-                e.gap.to.0,
+                e.last.0,
+                e.first.0,
             )
         }
         _ => String::new(),
@@ -6029,6 +6027,146 @@ pub(crate) mod tests {
         }
     }
 
+    /// The result's preparation covers the gaps that close while it runs,
+    /// from the play's end, though its mark is recorded only when the
+    /// result is taken: the tail span's 300 ms gap inside it is covered,
+    /// and only the 10 ms before the play's end stays uncovered, so the
+    /// span agrees with its own record's marks.
+    #[test]
+    fn the_preparation_covers_gaps_closed_before_the_result_is_taken() {
+        use super::FrameSink as _;
+        use crate::dev::transitions::MarkKind;
+        use crate::measure::{Drew, Stage, State};
+        let book = super::Transitions::with_capacity(32);
+        let mut sink = super::ScenarioFrames::recording(Captures::of(Vec::new()), book.clone());
+        let tail = play_stage(State::Tail);
+        present(&mut sink, &[(tail, 1_000_000)]);
+        sink.play_ended(TimeUs(1_010_000));
+        present(&mut sink, &[(tail, 1_100_000), (tail, 1_400_000)]);
+        sink.result_taken(TimeUs(1_500_000));
+        let result = Stage {
+            state: State::Result,
+            lifetime: 3,
+            drew: Drew::Skin,
+        };
+        present(&mut sink, &[(result, 1_516_700)]);
+        drop_bounded(sink);
+        let (spans, edges, marks) = records_of(&book);
+        let preparing: Vec<_> = marks
+            .iter()
+            .filter(|m| m.kind == MarkKind::Preparing)
+            .map(|m| (m.from, m.to))
+            .collect();
+        assert_eq!(preparing, [(TimeUs(1_010_000), TimeUs(1_500_000))]);
+        let longest = spans[0].longest.unwrap();
+        assert_eq!(
+            (longest.from, longest.to, longest.cover.uncovered),
+            (TimeUs(1_100_000), TimeUs(1_400_000), 0)
+        );
+        let uncovered = spans[0].uncovered.unwrap();
+        assert_eq!(
+            (
+                uncovered.from,
+                uncovered.cover.uncovered,
+                uncovered.cover.piece
+            ),
+            (
+                TimeUs(1_000_000),
+                10_000,
+                Some((TimeUs(1_000_000), TimeUs(1_010_000)))
+            )
+        );
+        assert_eq!(edges[0].gap.cover.uncovered, 16_700);
+    }
+
+    /// The play's end can come before its stopped view is presented: the
+    /// play's last frame, the end, then the tail's first frame of the same
+    /// attempt. That change of phase keeps the preparation, and once the
+    /// result is taken every record written since the end is covered from
+    /// it: the play span's gap but its 10 ms before the end, the change to
+    /// the tail and the tail's gap.
+    #[test]
+    fn a_change_of_phase_after_the_end_keeps_the_preparation() {
+        use super::FrameSink as _;
+        use crate::dev::transitions::MarkKind;
+        use crate::measure::{Drew, Stage, State};
+        let book = super::Transitions::with_capacity(32);
+        let mut sink = super::ScenarioFrames::recording(Captures::of(Vec::new()), book.clone());
+        let (play, tail) = (play_stage(State::Play), play_stage(State::Tail));
+        present(&mut sink, &[(play, 1_000_000)]);
+        sink.play_ended(TimeUs(1_010_000));
+        present(
+            &mut sink,
+            &[(play, 1_300_000), (tail, 1_500_000), (tail, 1_800_000)],
+        );
+        sink.result_taken(TimeUs(1_900_000));
+        let result = Stage {
+            state: State::Result,
+            lifetime: 3,
+            drew: Drew::Skin,
+        };
+        present(&mut sink, &[(result, 1_916_700)]);
+        drop_bounded(sink);
+        let (spans, edges, marks) = records_of(&book);
+        let preparing: Vec<_> = marks
+            .iter()
+            .filter(|m| m.kind == MarkKind::Preparing)
+            .map(|m| (m.from, m.to))
+            .collect();
+        assert_eq!(preparing, [(TimeUs(1_010_000), TimeUs(1_900_000))]);
+        let played = spans[0].uncovered.unwrap();
+        assert_eq!(
+            (played.from, played.cover.uncovered, played.cover.piece),
+            (
+                TimeUs(1_000_000),
+                10_000,
+                Some((TimeUs(1_000_000), TimeUs(1_010_000)))
+            )
+        );
+        assert_eq!(
+            (edges[0].to.state, edges[0].gap.cover.uncovered),
+            (State::Tail, 0)
+        );
+        let longest = spans[1].longest.unwrap();
+        assert_eq!(
+            (longest.from, longest.cover.uncovered, spans[1].uncovered),
+            (TimeUs(1_500_000), 0, None)
+        );
+    }
+
+    /// A retry that withdraws the preparation (the next attempt's READY
+    /// follows the tail) leaves it covering nothing: the tail's gap after
+    /// the play's end stays uncovered, the READY span's gaps too, and a
+    /// result taken later marks nothing.
+    #[test]
+    fn a_withdrawn_preparation_covers_nothing() {
+        use super::FrameSink as _;
+        use crate::dev::transitions::MarkKind;
+        use crate::measure::{Stage, State};
+        let book = super::Transitions::with_capacity(32);
+        let mut sink = super::ScenarioFrames::recording(Captures::of(Vec::new()), book.clone());
+        let tail = play_stage(State::Tail);
+        let ready = Stage {
+            lifetime: 42,
+            ..play_stage(State::Ready)
+        };
+        present(&mut sink, &[(tail, 1_000_000)]);
+        sink.play_ended(TimeUs(1_010_000));
+        present(
+            &mut sink,
+            &[(tail, 1_100_000), (ready, 1_200_000), (ready, 1_500_000)],
+        );
+        sink.result_taken(TimeUs(1_600_000));
+        drop_bounded(sink);
+        let (spans, _, marks) = records_of(&book);
+        assert!(
+            marks.iter().all(|m| m.kind != MarkKind::Preparing),
+            "{marks:?}"
+        );
+        assert_eq!(spans[0].uncovered.unwrap().cover.uncovered, 100_000);
+        assert_eq!(spans[1].uncovered.unwrap().cover.uncovered, 300_000);
+    }
+
     /// Through the sink, one tail span whose longest raw gap, largest
     /// uncovered gap and largest uncovered piece are three gaps: A, 3 s
     /// mostly marked (100 ms uncovered); B, 1 s with two overlapping marks
@@ -6116,7 +6254,7 @@ pub(crate) mod tests {
         };
         let filled = |cap: usize| {
             let book = super::Transitions::with_capacity(cap);
-            let mut r = Recorder::new(book.clone());
+            let r = Recorder::new(book.clone());
             for k in 0..6 {
                 r.mark(Mark {
                     kind: MarkKind::ReadBack,
