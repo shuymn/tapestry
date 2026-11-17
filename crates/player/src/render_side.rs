@@ -7930,11 +7930,8 @@ impl Run {
                         std::thread::sleep(Duration::from_millis(1));
                     }
                 }
-                let table = screen.map_or(Err(stale), |s| s.publish_bga(key, entries));
-                let _ = reply.send(crate::bga::Publication {
-                    table,
-                    at: Instant::now(),
-                });
+                // Published only while in time, under the answer's lock.
+                reply.give(|| screen.map_or(Err(stale), |s| s.publish_bga(key, entries)));
             }
             BgaMsg::Reuse { key, reply } => {
                 let _ = reply.send(screen.and_then(|s| s.published_bga(key)));

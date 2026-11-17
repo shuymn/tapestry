@@ -28,7 +28,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, PoisonError, mpsc};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError, mpsc};
 use std::time::{Duration, Instant};
 
 use game::coord::{
@@ -207,11 +207,12 @@ pub enum BgaMsg {
         cells: Vec<(CellPlace, Vec<u8>)>,
         reply: mpsc::SyncSender<Result<(), BgaFault>>,
     },
-    /// Publish the table ([`render::Renderer::publish_bga`]).
+    /// Publish the table ([`render::Renderer::publish_bga`]), answering
+    /// through `reply` only while it is in time.
     Publish {
         key: Option<BgaKey>,
         entries: Vec<BgaEntry>,
-        reply: mpsc::SyncSender<Publication>,
+        reply: Arc<Answer>,
     },
     /// The table published for `key`'s array, if it is still the one in
     /// use ([`render::Renderer::published_bga`]).
@@ -223,13 +224,102 @@ pub enum BgaMsg {
     Drop,
 }
 
-/// The render thread's answer to [`BgaMsg::Publish`], and when it gave it:
-/// an answer taken after its bound passed is one given before it only when
-/// `at` says so.
+/// The render thread's answer to [`BgaMsg::Publish`] and its bound, in one
+/// state that the render thread and the thread asking change only under
+/// its lock. The render thread publishes and answers only while no answer
+/// was given and the bound has not passed; whoever looks after the bound
+/// with no answer given ends it unanswered. So an answer given in time is
+/// taken however late it is looked at, and one the bound has passed
+/// publishes nothing: there is no moment where an answer is given but not
+/// yet seen.
 #[derive(Debug)]
-pub struct Publication {
-    pub table: Result<Arc<BgaTable>, BgaFault>,
-    pub at: Instant,
+pub struct Answer {
+    by: Instant,
+    state: Mutex<Answering>,
+    given: Condvar,
+}
+
+#[derive(Debug)]
+enum Answering {
+    Pending,
+    Given(Result<Arc<BgaTable>, BgaFault>),
+    /// Unanswered (the bound passed with none given), or the answer taken.
+    Over,
+}
+
+/// What a look at an [`Answer`] found.
+#[derive(Debug)]
+enum Looked {
+    Given(Result<Arc<BgaTable>, BgaFault>),
+    /// Not given, the bound not passed.
+    Pending,
+    Unanswered,
+}
+
+impl Answer {
+    /// An answer due within `bound` from now.
+    #[must_use]
+    pub fn new(bound: Duration) -> Arc<Self> {
+        Arc::new(Self {
+            by: Instant::now() + bound,
+            state: Mutex::new(Answering::Pending),
+            given: Condvar::new(),
+        })
+    }
+
+    fn state(&self) -> MutexGuard<'_, Answering> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The render thread's answer: publishes with `publish` and answers
+    /// with its table while no answer was given and the bound has not
+    /// passed; otherwise publishes nothing and ends the answer unanswered.
+    pub fn give(&self, publish: impl FnOnce() -> Result<Arc<BgaTable>, BgaFault>) {
+        let mut s = self.state();
+        if matches!(*s, Answering::Pending) && Instant::now() < self.by {
+            *s = Answering::Given(publish());
+            self.given.notify_all();
+        } else {
+            *s = Answering::Over;
+        }
+    }
+
+    /// Looks without waiting: the answer once given, taken once.
+    fn look(&self) -> Looked {
+        let mut s = self.state();
+        match std::mem::replace(&mut *s, Answering::Over) {
+            Answering::Given(t) => Looked::Given(t),
+            Answering::Pending if Instant::now() < self.by => {
+                *s = Answering::Pending;
+                Looked::Pending
+            }
+            Answering::Pending | Answering::Over => Looked::Unanswered,
+        }
+    }
+
+    /// Waits for the answer until the bound: `None` once it passed with
+    /// none given.
+    fn wait(&self) -> Option<Result<Arc<BgaTable>, BgaFault>> {
+        let mut s = self.state();
+        loop {
+            match std::mem::replace(&mut *s, Answering::Over) {
+                Answering::Given(t) => return Some(t),
+                Answering::Over => return None,
+                Answering::Pending => {
+                    let now = Instant::now();
+                    if now >= self.by {
+                        return None;
+                    }
+                    *s = Answering::Pending;
+                    s = self
+                        .given
+                        .wait_timeout(s, self.by - now)
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .0;
+                }
+            }
+        }
+    }
 }
 
 /// How a step's answer came.
@@ -414,18 +504,25 @@ fn read_and_publish(
         decoded: 0,
     };
     let n = want.names.len();
-    let publish =
-        |key: Option<BgaKey>, entries: Vec<BgaEntry>| match ask(link, generation, |reply| {
+    let publish = |key: Option<BgaKey>, entries: Vec<BgaEntry>| {
+        let answer = Answer::new(link.bound());
+        let reply = Arc::clone(&answer);
+        if !link.send(
+            generation,
             BgaMsg::Publish {
                 key,
                 entries,
                 reply,
-            }
-        }) {
-            Asked::Answer(Publication { table: Ok(t), .. }) => End::Published(t),
-            Asked::Answer(Publication { table: Err(_), .. }) => End::Stopped,
-            Asked::Unanswered => End::Unanswered,
-        };
+            },
+        ) {
+            return End::Unanswered;
+        }
+        match answer.wait() {
+            Some(Ok(t)) => End::Published(t),
+            Some(Err(_)) => End::Stopped,
+            None => End::Unanswered,
+        }
+    };
     let absent = || vec![BgaEntry::Absent; n];
     if n == 0 {
         out.end = publish(None, Vec::new());
@@ -661,12 +758,10 @@ struct Core {
 
 /// The render thread's answer to an absent table, taken by a later step
 /// or poll, never waited for: the game thread sends it while the render
-/// thread may be held (a loading frame awaiting its acknowledgement).
+/// thread may be held (a loading frame awaiting its acknowledgement). Due
+/// within the link's bound from the send ([`Answer`]).
 struct AbsentAnswer {
-    rx: mpsc::Receiver<Publication>,
-    /// The link's bound from the send: unanswered past it, an answer given
-    /// after it included, however early it is taken.
-    by: Instant,
+    answer: Arc<Answer>,
 }
 
 /// The BGA pictures' worker: what the game thread asks, the one job, and
@@ -935,17 +1030,14 @@ impl Core {
     /// [`take_finished`](Self::take_finished), unanswered past the link's
     /// bound.
     fn publish_absent(&mut self, n: usize) {
-        let (reply, rx) = mpsc::sync_channel(1);
+        let answer = Answer::new(self.link.bound());
         let message = BgaMsg::Publish {
             key: None,
             entries: vec![BgaEntry::Absent; n],
-            reply,
+            reply: Arc::clone(&answer),
         };
         if self.link.send(self.current(), message) {
-            self.absent = Some(AbsentAnswer {
-                rx,
-                by: Instant::now() + self.link.bound(),
-            });
+            self.absent = Some(AbsentAnswer { answer });
         } else {
             self.done = Some(End::Unanswered);
         }
@@ -955,21 +1047,16 @@ impl Core {
     /// Takes the absent table's answer once it came, or once the link's
     /// bound passed without it. An answer given within the bound counts
     /// however late it is taken (other loading work may delay the step);
-    /// one given after it is unanswered.
+    /// past the bound the render thread gives none ([`Answer`]).
     fn take_absent(&mut self) {
         let Some(absent) = &self.absent else {
             return;
         };
-        // The time read first: an answer in the channel by then counts by
-        // its own stamp, and an empty channel only once the bound has
-        // passed before it was looked at.
-        let now = Instant::now();
-        let answer = match absent.rx.try_recv() {
-            Ok(a) if a.at >= absent.by => End::Unanswered,
-            Ok(Publication { table: Ok(t), .. }) => End::Published(t),
-            Ok(Publication { table: Err(_), .. }) => End::Stopped,
-            Err(mpsc::TryRecvError::Empty) if now < absent.by => return,
-            Err(_) => End::Unanswered,
+        let answer = match absent.answer.look() {
+            Looked::Pending => return,
+            Looked::Given(Ok(t)) => End::Published(t),
+            Looked::Given(Err(_)) => End::Stopped,
+            Looked::Unanswered => End::Unanswered,
         };
         self.done = Some(answer);
         self.absent = None;

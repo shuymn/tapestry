@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use game::coord::{Caps, Class, Coordinator, JobKey, JobKind, Owner, Scope, Spawner};
 use skin_model::bga::{BgaEntry, BgaTable};
 
-use super::{BATCH, BATCH_LIMIT, BgaMsg, BgaWorker, HELD, HOLD, Poll, Publication, Want};
+use super::{Answer, BATCH, BATCH_LIMIT, BgaMsg, BgaWorker, HELD, HOLD, Poll, Want};
 use crate::render_side::tests::Installers;
 use crate::render_side::{BgaPublisher, RenderLink, RenderMsg};
 
@@ -177,18 +177,18 @@ fn bga_images_are_one_owned_job_published_before_ready() {
     assert_eq!(seen.published.len(), 1, "nothing of the job left");
     assert!(seen.current().is_none(), "the array dropped");
     drop(seen);
-    let (reply, rx) = std::sync::mpsc::sync_channel(1);
+    let answer = Answer::new(Duration::from_secs(10));
     assert!(link.bga_publisher().send(
         left,
         BgaMsg::Publish {
             key: None,
             entries: vec![BgaEntry::Absent],
-            reply,
+            reply: Arc::clone(&answer),
         },
     ));
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(10)).unwrap().table,
-        Err(render::BgaFault::Stale)
+        answer.wait().map(|t| t.err()),
+        Some(Some(render::BgaFault::Stale))
     );
     assert_eq!(screens.bga.lock().unwrap().published.len(), 1);
 }
@@ -311,54 +311,94 @@ fn bga_cells_go_in_batches_within_the_cell_term() {
     }
 }
 
+/// The absent table's answer as the render thread gives it: its message
+/// taken from the link, a worker of `bound` having sent it at the step.
+fn absent_answer(bound: Duration) -> (BgaWorker, Arc<Answer>) {
+    let (link, rx) = BgaPublisher::channel(bound);
+    let w = BgaWorker::new(Arc::new(AtomicU64::new(0)), link);
+    w.renew();
+    w.attempt(want(Path::new("."), &[]));
+    w.step(None, &|| false);
+    let Ok(RenderMsg::Bga {
+        msg: BgaMsg::Publish { reply, .. },
+        ..
+    }) = rx.try_recv()
+    else {
+        panic!("the empty table is sent at the step");
+    };
+    (w, reply)
+}
+
+/// An empty table, as the render thread publishes one.
+fn empty() -> Result<Arc<BgaTable>, render::BgaFault> {
+    Ok(Arc::new(BgaTable::new(Vec::new())))
+}
+
 /// The absent table's answer counts when the render thread gave it within
 /// the link's bound, however late a step takes it (other loading work may
-/// delay the step); given after the bound, or not at all, it is unanswered
-/// and the attempt refused.
+/// delay the step); past the bound the render thread publishes nothing and
+/// gives no answer, and with none given the attempt is refused.
 #[test]
 fn an_absent_table_answered_after_the_bound_is_unanswered() {
     const BOUND: Duration = Duration::from_millis(200);
     // `Some(late)`: answered before or after the bound; `None`: never.
-    let poll_after_the_bound = |late: Option<bool>| -> Poll {
-        let (link, rx) = BgaPublisher::channel(BOUND);
-        let w = BgaWorker::new(Arc::new(AtomicU64::new(0)), link);
-        w.renew();
-        w.attempt(want(Path::new("."), &[]));
-        w.step(None, &|| false);
-        let Ok(RenderMsg::Bga {
-            msg: BgaMsg::Publish { reply, .. },
-            ..
-        }) = rx.try_recv()
-        else {
-            panic!("the empty table is sent at the step");
-        };
-        let answer = || {
-            reply
-                .send(Publication {
-                    table: Ok(Arc::new(BgaTable::new(Vec::new()))),
-                    at: Instant::now(),
-                })
-                .unwrap();
-        };
+    // Returns the poll after the bound and whether the table was published.
+    let poll_after_the_bound = |late: Option<bool>| -> (Poll, bool) {
+        let (w, reply) = absent_answer(BOUND);
+        let mut published = false;
         if late == Some(false) {
-            answer();
+            reply.give(|| {
+                published = true;
+                empty()
+            });
         }
         std::thread::sleep(2 * BOUND);
         if late == Some(true) {
-            answer();
+            reply.give(|| {
+                published = true;
+                empty()
+            });
         }
-        w.poll()
+        (w.poll(), published)
     };
+    let (poll, published) = poll_after_the_bound(Some(false));
     assert!(
-        matches!(poll_after_the_bound(Some(false)), Poll::Ready(_)),
-        "an answer given in time, taken after the bound"
+        matches!(poll, Poll::Ready(_)) && published,
+        "an answer given in time, taken after the bound: {poll:?}"
     );
-    assert_eq!(poll_after_the_bound(None), Poll::Expired);
+    assert_eq!(poll_after_the_bound(None), (Poll::Expired, false));
     assert_eq!(
         poll_after_the_bound(Some(true)),
-        Poll::Expired,
-        "an answer given after the bound"
+        (Poll::Expired, false),
+        "an answer given after the bound publishes nothing"
     );
+}
+
+/// An answer the render thread began to give within the bound counts
+/// however long its publication takes: a step looking after the bound,
+/// while the render thread is still between deciding it is in time and
+/// handing its table over, takes the table, never "not published in
+/// time". The render thread is paused there, past the bound, here.
+#[test]
+fn an_answer_begun_in_time_is_taken_after_the_bound() {
+    const BOUND: Duration = Duration::from_millis(200);
+    let (w, reply) = absent_answer(BOUND);
+    let inside = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let giving = {
+        let inside = Arc::clone(&inside);
+        std::thread::spawn(move || {
+            reply.give(|| {
+                inside.store(true, Ordering::SeqCst);
+                std::thread::sleep(3 * BOUND);
+                empty()
+            });
+        })
+    };
+    until(|| inside.load(Ordering::SeqCst));
+    std::thread::sleep(2 * BOUND);
+    let poll = w.poll();
+    giving.join().unwrap();
+    assert!(matches!(poll, Poll::Ready(_)), "{poll:?}");
 }
 
 /// A 64×48 JPEG of one colour, progressive, its three components at full
