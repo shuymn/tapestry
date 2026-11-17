@@ -2033,3 +2033,171 @@ fn a_result_runtime_reads_the_bga_setting() {
         assert_eq!(out, want, "{at}: {:?}", runtime(&mut i).status());
     }
 }
+
+/// A Lua selection skin over the selection fixtures' sheet and font whose
+/// `dot` image is drawn once per entry of `draws`, the `k`th at
+/// `x = 1000 + 10k`, by that `draw` callback.
+fn draws_skin(prelude: &str, draws: &[String]) -> String {
+    let dsts: String = draws
+        .iter()
+        .enumerate()
+        .map(|(k, d)| {
+            format!(
+                "{{ id = \"dot\", draw = {d}, dst = {{ {{ x = {}, y = 0, w = 8, h = 8 }} }} }},\n",
+                1000 + 10 * k
+            )
+        })
+        .collect();
+    entry(prelude, &[], "nil").replace(
+        "return skin\n",
+        &format!(
+            "for _, d in ipairs({{ {dsts} }}) do skin.destination[#skin.destination + 1] = d end\n\
+             return skin\n"
+        ),
+    )
+}
+
+/// Which of `n` draws of [`draws_skin`] the frame at 0 drew.
+fn drawn_of(s: &mut common::selection::Sel, n: usize) -> Vec<bool> {
+    let xs: Vec<f32> = s.drawn(0).into_iter().map(|(_, r)| r[0]).collect();
+    (0..n)
+        .map(|k| {
+            let x = f32::from(u16::try_from(1000 + 10 * k).unwrap());
+            xs.iter().any(|&v| (v - x).abs() < 0.5)
+        })
+        .collect()
+}
+
+/// The selected chart's record and the cursor's row in each state a
+/// selection read can see: no record, played with no best, a best of no
+/// plays and 0 EX, a best played, a folder row and no row.
+fn record_states() -> Vec<(&'static str, skin_model::SelectionView)> {
+    use common::selection::{best, chart, folder_row, summary, view};
+    let chart_with = |score| {
+        view(
+            vec![skin_model::RowView {
+                score,
+                ..chart("a")
+            }],
+            Some(0),
+            Some(200),
+            Some(summary(90, 10, 125, 150, 180)),
+        )
+    };
+    vec![
+        ("no record", chart_with(skin_model::RowScore::Unplayed)),
+        (
+            "played, no best",
+            chart_with(skin_model::RowScore::NoBest { plays: 3 }),
+        ),
+        ("a best of no plays", chart_with(best(0, 0, 0))),
+        ("a best played", chart_with(best(150, 4, 7))),
+        (
+            "a folder row",
+            view(vec![folder_row("f", 2)], Some(0), None, None),
+        ),
+        ("no row", view(Vec::new(), None, None, None)),
+    ]
+}
+
+/// Every selection number a `main_state.number` read bridges under an
+/// availability that can be false (the selected chart's record first,
+/// then its other facts, the row and the settings), each lowered and run
+/// on the runtime alike in every record state: a lowered draw reads the
+/// source's `Integer.MIN_VALUE` where the value is absent, as the runtime
+/// does (`IntegerPropertyFactory.java:133-153` at `0.8.9`), never hiding
+/// its element for the read's availability. The runtime twin of each draw
+/// writes a captured local, which no expression represents.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_lowered_selection_read_agrees_with_the_runtime_in_every_record_state() {
+    untimed();
+    const IDS: [i32; 25] = [
+        71, 150, 76, 77, 75, 78, 79, 80, 84, 85, 89, 102, 103, 154, 72, 74, 90, 91, 96, 1163, 1164,
+        300, 350, 92, 312,
+    ];
+    let cmps = ["< 0", ">= 0"];
+    let mut draws = Vec::new();
+    for id in IDS {
+        for c in cmps {
+            draws.push(format!("function() return ms.number({id}) {c} end"));
+            draws.push(format!("function() w = 0 return ms.number({id}) {c} end"));
+        }
+    }
+    let (_d, mut i) = import_in(&draws_skin("local w = 0", &draws));
+    let count = |want: Disposition| i.callbacks.iter().filter(|d| **d == want).count();
+    assert_eq!(
+        count(Disposition::Lowered),
+        draws.len() / 2,
+        "{:?}",
+        i.callbacks
+    );
+    assert_eq!(
+        count(Disposition::Runtime),
+        draws.len() / 2,
+        "{:?}",
+        i.callbacks
+    );
+    let mut rt = i.runtime.take().expect("a runtime");
+    let mut s = common::selection::Sel::new(i.imported.skin);
+    for (state, v) in record_states() {
+        s.view(&v);
+        s.skin
+            .prepare_selection_frame(&mut s.sel, bms_model::TimeUs(0), &s.timers, &s.app)
+            .unwrap();
+        let (fields, timers) = s.sel.runtime_parts();
+        rt.frame(fields, timers);
+        let drawn = drawn_of(&mut s, draws.len());
+        for (k, pair) in drawn.chunks(2).enumerate() {
+            let (id, c) = (IDS[k / 2], cmps[k % 2]);
+            assert_eq!(
+                pair[0], pair[1],
+                "{state}: number({id}) {c}, lowered against runtime"
+            );
+            // Exactly one of the two comparisons holds for any value.
+            if k % 2 == 1 {
+                assert_ne!(drawn[2 * k - 2], pair[0], "{state}: number({id})");
+            }
+        }
+    }
+}
+
+/// A selection skin shaped like the placeholders a skin draws for a chart
+/// with no record: one image drawn while the plays (77) or the best EX
+/// (150) is below 0, the source's `Integer.MIN_VALUE` with no record, and
+/// one while either is above 0. Both lower; with no record only the
+/// placeholder draws, with a best of no plays and 0 EX neither does, and
+/// with a played best only the other.
+#[test]
+fn a_no_record_placeholder_draws_for_a_chart_with_no_record() {
+    let read = "local plays = main_state.number(77) local score = main_state.number(150)";
+    let draws = [
+        format!("function() {read} return plays < 0 or score < 0 end"),
+        format!("function() {read} return plays > 0 or score > 0 end"),
+    ];
+    let (_d, i) = import_in(&draws_skin(
+        "local main_state = require(\"main_state\")",
+        &draws,
+    ));
+    assert_eq!(
+        i.callbacks
+            .iter()
+            .filter(|d| **d == Disposition::Lowered)
+            .count(),
+        2,
+        "{:?}",
+        i.callbacks
+    );
+    assert!(i.runtime.is_none());
+    let mut s = common::selection::Sel::new(i.imported.skin);
+    let states = record_states();
+    for (state, want) in [
+        ("no record", [true, false]),
+        ("a best of no plays", [false, false]),
+        ("a best played", [false, true]),
+    ] {
+        let (_, v) = states.iter().find(|(s, _)| *s == state).unwrap();
+        s.view(v);
+        assert_eq!(drawn_of(&mut s, 2), want, "{state}");
+    }
+}

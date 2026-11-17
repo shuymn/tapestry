@@ -21,7 +21,9 @@
 //! attached, before anything is emitted, whether or not the result still
 //! uses it: its JSON
 //! mapping, that mapping's availability guard (joined into the element's
-//! visibility, so a value that can be unknown draws nothing while it is),
+//! visibility, so a value that can be unknown draws nothing while it is;
+//! on selection a number's instead selects its value, the source's
+//! `Integer.MIN_VALUE` while it is false, as the runtime reads it),
 //! its D4 deviation and its critical part (`number(101)` the EX score, as
 //! 101 in JSON); one with no mapping refuses the callback:
 //!
@@ -127,6 +129,9 @@ pub(super) struct SlotConsumer {
     /// may be an object the source removed ([`Cx::installed`]).
     pub(super) kept: bool,
 }
+
+/// The source's `Integer.MIN_VALUE`, as an expression reads it.
+const HIDDEN: &str = "(-2147483648)";
 
 /// The gauge looks `gauge_type()` selects, by index.
 const LOOKS: [&str; 6] = ["assist_easy", "easy", "normal", "hard", "ex_hard", "hazard"];
@@ -519,16 +524,36 @@ impl Lower<'_> {
                 else {
                     return Err(unmapped());
                 };
-                if let Some(g) = v.availability() {
-                    self.guard(g);
-                }
                 self.out.deviates |= v.deviates();
                 self.out.sentinel |= v.pre_judgment();
                 self.out.part = self.out.part.or(v.part());
                 self.out.essential = self.out.essential.or(v.essential());
                 let (lo, hi) = v.range();
-                let src = Self::text(self.an, &["(", v.expr(), ")"])?;
-                Ok(Mapped::Int { src, lo, hi })
+                match v.availability() {
+                    // On selection an absent value is the source's
+                    // `Integer.MIN_VALUE`, which the callback reads as the
+                    // runtime's `main_state.number` gives it
+                    // ([`crate::lua::runtime::Screen::number`]): the guard
+                    // selects the value, never the element's visibility.
+                    Some(g) if self.kind == ScreenKind::Selection && g != "true" => {
+                        let src = Self::text(
+                            self.an,
+                            &["(if (", g, ") then (", v.expr(), ") else ", HIDDEN, ")"],
+                        )?;
+                        Ok(Mapped::Int {
+                            src,
+                            lo: i64::from(i32::MIN),
+                            hi,
+                        })
+                    }
+                    g => {
+                        if let Some(g) = g {
+                            self.guard(g);
+                        }
+                        let src = Self::text(self.an, &["(", v.expr(), ")"])?;
+                        Ok(Mapped::Int { src, lo, hi })
+                    }
+                }
             }
             // The best's rate over the attempt's targets
             // (`FloatPropertyFactory.java:297-302` at `0.8.9`, `B / 2n` in
