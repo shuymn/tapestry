@@ -2009,8 +2009,9 @@ fn build_does_not_allocate() {
     };
     // (name, context, effects, first frame): the whole chart with breaks,
     // a practice round with breaks after a retry with the scratch on the
-    // right, a round played to a full combo on the left again, its
-    // empty POORs counted, and the whole chart again by autoplay.
+    // right, a round over part of the chart without a break on the left
+    // again, its empty POORs counted, which starts no full combo, and the
+    // whole chart again by autoplay, which does.
     let attempts = [
         ("play", full, effects(&chart, None, false), -lead_in),
         (
@@ -2145,7 +2146,7 @@ fn build_does_not_allocate() {
                 w.lane_states
             );
         }
-        if matches!(*name, "clean round" | "autoplay") {
+        if *name == "autoplay" {
             assert!(w.on[fc], "{name}: `full_combo` never started");
             assert!(w.drawn[fc], "{name}: its elements were never drawn");
         } else {

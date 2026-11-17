@@ -694,7 +694,7 @@ fn a_lowering_s_memo_holds_only_what_it_emits() {
 /// The model fields read by the counts the oracle sets, by property id:
 /// written from the play schema's names, apart from the importer.
 const FIELDS: [(i64, &str); 9] = [
-    (106, "notes"),
+    (106, "chart.notes"),
     (110, "count.perfect"),
     (111, "count.great"),
     (112, "count.good"),

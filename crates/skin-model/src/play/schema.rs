@@ -319,6 +319,7 @@ pub static PLAY: Schema = Schema {
         int("chart.main_bpm", READOUT_MAX, T),
         flag("chart.main_bpm_valid", T),
         int("chart.length_ms", i32::MAX, T),
+        count("chart.notes", T),
     ],
     timers: &[
         timer("ready", E),
@@ -661,8 +662,11 @@ pub mod field {
     /// the chosen chart's library length
     /// ([`LoadingFrame::length`](crate::LoadingFrame::length)).
     pub const CHART_LENGTH_MS: u16 = 153;
+    /// The whole chart's taps and long notes, in every attempt, a practice
+    /// round's too, where `notes` is the attempt's targets.
+    pub const CHART_NOTES: u16 = 154;
     /// The number of fields.
-    pub const COUNT: usize = 154;
+    pub const COUNT: usize = 155;
 
     /// The `rank.current.K` slot, `k` below 8.
     #[must_use]
@@ -708,7 +712,9 @@ pub mod timer {
     /// The notes' end, from the first playing frame at or past it
     /// ([`PlayContext::last_note_end`](crate::PlayContext::last_note_end)).
     pub const LAST_NOTE: u16 = 3;
-    /// The judgment that made the combo equal the target count.
+    /// The judgment that made the combo equal the whole chart's note
+    /// count (`chart.notes`); a practice round over fewer notes never
+    /// starts it.
     pub const FULL_COMBO: u16 = 4;
     /// The shown gauge at its maximum.
     pub const GAUGE_MAX: u16 = 5;
@@ -1157,7 +1163,19 @@ mod tests {
                 T
             ))
         );
-        assert_eq!(field::COUNT, 154);
+        assert_eq!(slot("chart.notes"), Some(field::CHART_NOTES));
+        assert_eq!(field::CHART_NOTES, 154);
+        assert_eq!(
+            PLAY.field("chart.notes").map(|(_, f)| (f.ty, f.export)),
+            Some((
+                FieldTy::Int {
+                    lo: 0,
+                    hi: MAX_COUNT
+                },
+                T
+            ))
+        );
+        assert_eq!(field::COUNT, 155);
     }
 
     #[test]
