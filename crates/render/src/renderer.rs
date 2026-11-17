@@ -5086,9 +5086,10 @@ impl Renderer {
         if std::mem::take(&mut self.selection_faults.0) {
             return Err(BuildError::Kind);
         }
-        // The array this frame draws from: a table keyed to another draws
+        // The chart-image pool this frame draws from: a table keyed to
+        // another (an earlier generation, renderer or installation) draws
         // nothing.
-        sel.set_chart_live(self.selection_chart_key());
+        sel.set_chart_live(self.pool_chart_key());
         let Some(Some(slot)) =
             Self::screen(ScreenKind::Selection).and_then(|i| self.screens.get_mut(i))
         else {

@@ -30,6 +30,15 @@
 //!   The result half is handed to the result at the attempt's commit.
 //! - **Direct launch:** with no coordinator, the images are read
 //!   synchronously on the game thread in the attempt's preparation.
+//! - **The selection** (design.md "Rendering and Skins", chart images):
+//!   the cursor's row, once it rested, is read into a slot of the
+//!   selection's chart-image pool no pin holds, and written there by the
+//!   render thread at a frame boundary, one write in flight. Every row
+//!   read is an entry ([`pool`]), resident in its slot or absent, which
+//!   each update names for its cursor row, so a row visited before shows
+//!   at once while its entry stays; each use of an entry is checked after
+//!   it by a job of its own (design.md "Load Pipeline", Freshness). A new
+//!   pool generation drops the resident entries.
 
 use std::fs::File;
 use std::path::{Path, PathBuf};
@@ -44,6 +53,11 @@ use skin_model::ImageFacts;
 use skin_model::chart_image::{
     self, Absent, ChartDir, ChartImage, ChartTable, FileIdentity, Fitted, Read,
 };
+
+mod pool;
+
+#[cfg(test)]
+pub(crate) use pool::{EntryState, SlotState};
 
 /// Holds every read of the images until let go, or until its cancel
 /// answers (tests).
@@ -67,6 +81,15 @@ pub static HELD_HARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicB
 /// Makes the next read of the images panic (tests: a job's panic).
 #[cfg(test)]
 pub static PANIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Holds every check of a selection entry after its last observation
+/// until let go (tests: a check's result held).
+#[cfg(test)]
+pub static CHECK_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set while a check is held by [`CHECK_HOLD`] (tests).
+#[cfg(test)]
+pub static CHECK_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
 #[cfg(test)]
 thread_local! {
@@ -497,16 +520,13 @@ pub enum Publish {
 const GONE: Published = Err(render::ChartOutcome::Unavailable);
 
 /// What the cursor's request names (design.md "Rendering and Skins",
-/// Chart images): the chart's folder, its stage file and banner names as
-/// the library keeps them, and the page side of the selection
-/// installation's chart layer. A rest compares it with the last selection
-/// set's.
+/// Chart images): the chart's folder and its stage file and banner names
+/// as the library keeps them. The selection's entries are keyed by it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CursorId {
     pub dir: PathBuf,
     /// The stage file's, then the banner's.
     pub names: [library::Name; 2],
-    pub side: u32,
 }
 
 /// The cursor's one image request (S10-12 plan D2, I5): made once the
@@ -523,86 +543,144 @@ pub struct CursorRequest {
     subscriber: game::coord::Subscriber,
 }
 
-/// The last selection set (I7): what it was read for, for which cursor
-/// generation it is current, and the set. Also the only candidates a
-/// later request's read keeps reads from (D3).
-#[derive(Debug)]
-struct SelectionSet {
-    id: CursorId,
-    cursor_generation: u64,
-    set: Arc<ChartImages>,
+/// The binding of `which`'s name in `id` as observed now: its name
+/// resolved again under T08's rules in `dir` (an overlong name to
+/// nothing), or the folder's own failure.
+fn binding_now(
+    dir: &Result<ChartDir, std::io::Error>,
+    name: &library::Name,
+    identity: chart_image::Identity<'_>,
+) -> chart_image::Binding {
+    match (dir, name) {
+        (_, library::Name::None) => chart_image::Binding::NoHeader,
+        (_, library::Name::Overlong) => chart_image::Binding::Unresolved {
+            name: String::new(),
+            why: chart_image::Unresolved::Overlong,
+        },
+        (Err(e), library::Name::Named(_)) => chart_image::Binding::Unresolved {
+            name: String::new(),
+            why: chart_image::Unresolved::Io(e.kind()),
+        },
+        (Ok(dir), library::Name::Named(name)) => chart_image::resolve(dir, name, &[], identity),
+    }
 }
 
-/// Reads `id`'s images for the selection installation's chart slots: the
-/// stage file and the banner, each decoded and derived for its slot of
-/// `id.side`, the sources dropped; the back image is never read there.
-/// Each name is resolved again, and `prior`'s read of an unchanged file is
-/// kept (D3). An overlong name resolves to nothing, never to a shortened
-/// one. Asks `cancel` throughout.
-fn read_selection(
+/// `source` derived into `cell`: absent when there is no cell or no image.
+fn derive_into(source: &Read, cell: Option<chart_image::Slot>, cancel: &dyn Fn() -> bool) -> Read {
+    let image = match (&source.image, cell) {
+        (Ok(image), Some(cell)) => {
+            #[cfg(test)]
+            count([0, 1]);
+            chart_image::derive(image, cell, cancel)
+        }
+        (Ok(_), None) => Err(Absent::NoHeader),
+        (Err(why), _) => Err(why.clone()),
+    };
+    Read {
+        binding: source.binding.clone(),
+        image,
+    }
+}
+
+/// `sources`' stage file and banner each derived into its pool cell of
+/// `cells`, the back image absent, as the cursor's job derives them
+/// ([`read_row`]; dev-tools tests): `None` when a derivation failed, so no
+/// failed fit is ever kept ([`fit_reusable`]).
+#[cfg(all(test, feature = "dev-tools"))]
+#[must_use]
+pub fn derive_cells(
+    sources: &Sources,
+    cells: chart_image::ChartCells,
+    cancel: &dyn Fn() -> bool,
+) -> Option<ChartImages> {
+    let reads = ChartImage::ALL.map(|which| {
+        let cell = match which {
+            ChartImage::Stage => cells.stage,
+            ChartImage::Banner => cells.banner,
+            ChartImage::Back => return absent_read(chart_image::Binding::NoHeader),
+        };
+        Arc::new(derive_into(sources.read(which), cell, cancel))
+    });
+    Some(ChartImages::of(reads)).filter(|d| {
+        [ChartImage::Stage, ChartImage::Banner]
+            .into_iter()
+            .all(|w| {
+                fit_reusable(d.read(w), sources.read(w))
+                    || matches!(d.read(w).image, Err(Absent::NoHeader))
+            })
+    })
+}
+
+/// Reads row `id`'s images into the pool's `cells`: the stage file and the
+/// banner, each name resolved again, decoded, then derived into its cell
+/// ([`derive_into`]), one at a time, the source dropped; the back image is
+/// never read there. A name with no cell is resolved but not decoded. An
+/// overlong name resolves to nothing, never to a shortened one. Asks
+/// `cancel` throughout, between the decode and the derivation included.
+fn read_row(
     id: &CursorId,
-    prior: Option<&ChartImages>,
+    cells: chart_image::ChartCells,
     cancel: &dyn Fn() -> bool,
 ) -> ChartImages {
-    let dir = match ChartDir::new(&id.dir) {
-        Ok(dir) => dir,
-        Err(e) => {
-            return ChartImages::absent(&Absent::Unresolved(chart_image::Unresolved::Io(e.kind())));
-        }
-    };
+    let dir = ChartDir::new(&id.dir);
     #[cfg(test)]
     hold(cancel);
     let identity: chart_image::Identity<'_> = &file_identity;
     let [stage, banner] = &id.names;
     let reads = ChartImage::ALL.map(|which| {
-        let name = match which {
-            ChartImage::Stage => stage,
-            ChartImage::Banner => banner,
+        let (name, cell) = match which {
+            ChartImage::Stage => (stage, cells.stage),
+            ChartImage::Banner => (banner, cells.banner),
             ChartImage::Back => return absent_read(chart_image::Binding::NoHeader),
         };
-        let (binding, name) = match name {
-            library::Name::None => (chart_image::Binding::NoHeader, ""),
-            library::Name::Overlong => (
-                chart_image::Binding::Unresolved {
-                    name: String::new(),
-                    why: chart_image::Unresolved::Overlong,
-                },
-                "",
-            ),
-            library::Name::Named(name) => (
-                chart_image::resolve(&dir, name, &[], identity),
-                name.as_str(),
-            ),
-        };
-        if let Some(prior) = prior {
-            let kept = prior.read(which);
-            if binding.same_as(&kept.binding) && reusable(kept) {
-                return Arc::clone(&prior.reads[which.index()]);
-            }
-        }
-        let chart_image::Binding::Resolved { .. } = binding else {
+        let binding = binding_now(&dir, name, identity);
+        let (Ok(dir), chart_image::Binding::Resolved { .. }, Some(_)) = (&dir, &binding, cell)
+        else {
             return absent_read(binding);
         };
-        let Some((_, slot)) = which.slot(id.side) else {
-            return absent_read(chart_image::Binding::NoHeader);
+        let library::Name::Named(name) = name else {
+            return absent_read(binding);
         };
         #[cfg(test)]
         count([1, 0]);
-        let source = chart_image::read_source(&dir, name, &[], cancel, identity);
-        let image = match &source.image {
-            Ok(image) => {
-                #[cfg(test)]
-                count([0, 1]);
-                chart_image::derive(image, slot, cancel)
-            }
-            Err(why) => Err(why.clone()),
-        };
-        Arc::new(Read {
-            binding: source.binding,
-            image,
-        })
+        let source = chart_image::read_source(dir, name, &[], cancel, identity);
+        if cancel() {
+            return Arc::new(Read {
+                binding: source.binding,
+                image: Err(Absent::Cancelled),
+            });
+        }
+        Arc::new(derive_into(&source, cell, cancel))
     });
     ChartImages::of(reads)
+}
+
+/// Whether row `id`'s names still resolve as `bindings` observed them
+/// (design.md "Load Pipeline", Freshness): each resolved again under T08's
+/// rules and compared ([`chart_image::Binding::same_as`]), reading no
+/// bytes.
+fn unchanged(id: &CursorId, bindings: &[chart_image::Binding; 2]) -> bool {
+    let dir = ChartDir::new(&id.dir);
+    let identity: chart_image::Identity<'_> = &file_identity;
+    let same = id
+        .names
+        .iter()
+        .zip(bindings)
+        .all(|(name, kept)| binding_now(&dir, name, identity).same_as(kept));
+    #[cfg(test)]
+    hold_check();
+    same
+}
+
+/// Holds a check after its last observation while [`CHECK_HOLD`] is set
+/// (tests).
+#[cfg(test)]
+fn hold_check() {
+    while CHECK_HOLD.load(std::sync::atomic::Ordering::Acquire) {
+        CHECK_HELD.store(true, std::sync::atomic::Ordering::Release);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    CHECK_HELD.store(false, std::sync::atomic::Ordering::Release);
 }
 
 /// Holds a read while [`HOLD`] is set and `cancel` does not answer, and
@@ -620,12 +698,12 @@ fn hold(cancel: &dyn Fn() -> bool) {
 }
 
 /// What a job gives: an attempt's job its [`JobOut`], the cursor's job
-/// its selection set.
+/// its row's images fitted into their pool cells.
 #[derive(Debug)]
 enum Output {
     Attempt(JobOut),
     Cursor {
-        set: Arc<ChartImages>,
+        fits: Arc<ChartImages>,
         /// Tests: the files it decoded and the fits it derived.
         #[cfg(test)]
         counts: (u64, u64),
@@ -665,11 +743,49 @@ enum Target {
         fresh: bool,
         derive: [bool; 2],
     },
-    /// The cursor's request, for its cursor generation (I6).
+    /// The cursor's request, for its cursor generation (I6), read into
+    /// slot `slot` of pool generation `generation` as read `version`.
     Cursor {
         id: CursorId,
         cursor_generation: u64,
+        generation: u64,
+        slot: u16,
+        version: u64,
     },
+}
+
+/// A row's pool write, from its read's end to its answer: what it is for,
+/// and the fits, kept until answered (the render thread may hold them).
+#[derive(Debug)]
+struct PendingWrite {
+    generation: u64,
+    slot: u16,
+    row: CursorId,
+    version: u64,
+    fits: Arc<ChartImages>,
+    /// The answer, once sent; `None` until the select screen's step sends
+    /// it.
+    rx: Option<mpsc::Receiver<Result<(), render::PoolWriteError>>>,
+}
+
+/// A check of an entry (design.md "Load Pipeline", Freshness): its row,
+/// the read and pool generation it checks (none for an absent entry), the
+/// last use it validates, and its job.
+struct Check {
+    row: CursorId,
+    version: u64,
+    generation: Option<u64>,
+    covers: u64,
+    job: OwnedJob<bool>,
+}
+
+/// The update sent last: its cursor row, the version of that row's entry
+/// and the value it carried.
+#[derive(Debug)]
+struct Sent {
+    row: Option<CursorId>,
+    version: Option<u64>,
+    chart: crate::chart_currency::CursorChart,
 }
 
 /// What a job that failed (panicked, or could not start) leaves: the
@@ -711,17 +827,42 @@ struct Core {
     job: Option<Job>,
     /// A job of an earlier want or generation, its thread not yet joined.
     obsolete: Option<OwnedJob<Arc<Output>>>,
-    /// The selection's cursor generation, which the render thread reads
-    /// ([`crate::render_side::RenderLink::cursor_generation`]): a new one
-    /// at each change of the cursor's request.
-    cursor_generation: Arc<AtomicU64>,
+    /// The selection's cursor generation: a new one at each change of the
+    /// cursor's request.
+    cursor_generation: u64,
     /// The cursor's request, deferred until nothing holds the worker (I5).
     cursor: Option<CursorRequest>,
-    /// The last selection set (I7).
-    selection: Option<SelectionSet>,
-    /// The selection's publication (I8); [`Core::retiring`] is shared
-    /// with play's.
-    sel_publication: Option<Publication>,
+    /// The cursor's row, as the next update names it: `None` for a row
+    /// that is no chart.
+    cursor_row: Option<CursorId>,
+    /// The cursor's row whose request was taken in this rest, if any: a
+    /// pool generation that drops what it read reads it again.
+    asked: Option<CursorId>,
+    /// The rows read (design.md "Rendering and Skins", chart images).
+    entries: pool::Entries,
+    /// The live pool generation (0 for none) and its slots.
+    pool_generation: u64,
+    slots: Option<pool::Slots>,
+    /// Reads numbered: each read's version.
+    versions: u64,
+    /// The one pool write from a read's end to its answer.
+    pending_write: Option<PendingWrite>,
+    /// The check running, and the one waiting: a row and its entry's
+    /// version.
+    check: Option<Check>,
+    check_queued: Option<(CursorId, u64)>,
+    /// Uses stamped so far.
+    use_clock: u64,
+    /// The update sent last (one of its slot is pinned).
+    sent: Option<Sent>,
+    /// The next update is a selection entry's: a use of its row's entry.
+    entered: bool,
+    /// The cursor's read is to be requested again with no new rest: its
+    /// entry was withdrawn, or a new pool generation dropped what it read.
+    rearm: bool,
+    /// The cursor row's value changed: its entry adopted, withdrawn, or
+    /// dropped by a new pool generation; the next look sends an update.
+    changed: bool,
     /// The starter is the selection's ([`ChartImageWorker::cursor_step`]),
     /// which leaving selection drops.
     starter_cursor: bool,
@@ -757,10 +898,11 @@ struct Core {
     ended: bool,
     /// Jobs begun (tests count jobs by it).
     begun: u64,
-    /// Tests: the selection publications sent, by the game thread or a
-    /// job.
+    /// Tests: the pool writes sent, and the checks begun.
     #[cfg(test)]
-    sel_sent: u64,
+    writes_sent: u64,
+    #[cfg(test)]
+    checks_begun: u64,
     /// Tests: the files its jobs decoded and the fits they derived.
     #[cfg(test)]
     counts: (u64, u64),
@@ -780,7 +922,7 @@ pub struct ChartImageWorker {
 
 impl Default for ChartImageWorker {
     fn default() -> Self {
-        Self::new(Arc::default(), Arc::default())
+        Self::new(Arc::default())
     }
 }
 
@@ -793,10 +935,15 @@ impl std::fmt::Debug for ChartImageWorker {
             .field("job", &c.job.as_ref().map(|j| &j.target))
             .field("obsolete", &c.obsolete.is_some())
             .field("cursor", &c.cursor)
+            .field("cursor_row", &c.cursor_row)
+            .field("entries", &c.entries.len())
+            .field("pool_generation", &c.pool_generation)
+            .field("pending_write", &c.pending_write)
             .field(
-                "selection",
-                &c.selection.as_ref().map(|s| (&s.id, s.cursor_generation)),
+                "check",
+                &c.check.as_ref().map(|k| (&k.row, k.version, k.covers)),
             )
+            .field("check_queued", &c.check_queued)
             .field("sources", &c.sources.as_ref().map(|(w, g, _)| (w, g)))
             .field("retiring", &c.retiring.is_some())
             .finish_non_exhaustive()
@@ -815,22 +962,32 @@ pub struct ResultImages {
 }
 
 impl ChartImageWorker {
-    /// A worker writing its generation to `generation` and the cursor
-    /// generation to `cursor_generation`, which the render thread reads
-    /// ([`crate::render_side::RenderLink::chart_generation`],
-    /// [`crate::render_side::RenderLink::cursor_generation`]).
+    /// A worker writing its generation to `generation`, which the render
+    /// thread reads ([`crate::render_side::RenderLink::chart_generation`]).
     #[must_use]
-    pub fn new(generation: Arc<AtomicU64>, cursor_generation: Arc<AtomicU64>) -> Self {
+    pub fn new(generation: Arc<AtomicU64>) -> Self {
         Self {
             core: Arc::new(Mutex::new(Core {
                 want: None,
                 generation,
                 job: None,
                 obsolete: None,
-                cursor_generation,
+                cursor_generation: 0,
                 cursor: None,
-                selection: None,
-                sel_publication: None,
+                cursor_row: None,
+                asked: None,
+                entries: pool::Entries::default(),
+                pool_generation: 0,
+                slots: None,
+                versions: 0,
+                pending_write: None,
+                check: None,
+                check_queued: None,
+                use_clock: 0,
+                sent: None,
+                entered: false,
+                rearm: false,
+                changed: false,
                 starter_cursor: false,
                 sources: None,
                 play: None,
@@ -844,7 +1001,9 @@ impl ChartImageWorker {
                 ended: false,
                 begun: 0,
                 #[cfg(test)]
-                sel_sent: 0,
+                writes_sent: 0,
+                #[cfg(test)]
+                checks_begun: 0,
                 #[cfg(test)]
                 counts: (0, 0),
                 #[cfg(test)]
@@ -935,46 +1094,48 @@ impl ChartImageWorker {
     }
 
     /// Selection is entered: the sources and halves go, so nothing of the
-    /// last chart's images stays beside selection's, and so does the last
-    /// selection set, so a request after the entry reads its files again
-    /// (ST16); its publication, if unanswered, retires.
+    /// last chart's images stays beside selection's. The selection's
+    /// entries stay, checked on their next use, and so do the pool's slots
+    /// while their generation lives (design.md "Rendering and Skins",
+    /// chart images).
     pub fn drop_images(&self) {
         let mut c = self.core();
         c.sources = None;
         c.play = None;
         c.result = None;
-        c.selection = None;
-        c.supersede_selection();
     }
 
     /// The cursor's request for `dir`'s images `names` (the stage file's,
-    /// then the banner's) on a selection chart layer of side `side`: for
-    /// the current cursor generation, its subscriber to `coord`'s cursor
-    /// scope taken now (D2).
+    /// then the banner's): for the current cursor generation, its
+    /// subscriber to `coord`'s cursor scope taken now (D2).
     pub fn cursor_request(
         &self,
         dir: PathBuf,
         names: [library::Name; 2],
-        side: u32,
         coord: &Coordinator,
     ) -> CursorRequest {
         let c = self.core();
         CursorRequest {
-            id: CursorId { dir, names, side },
-            cursor_generation: c.cursor_generation(),
+            id: CursorId { dir, names },
+            cursor_generation: c.cursor_generation,
             subscriber: coord.subscriber(Scope::Cursor),
         }
     }
 
-    /// The cursor's request identity changed (SC4, D2): the one function
-    /// every change goes through. A new cursor generation, written where
-    /// the render thread reads it, so no selection table of the last one
-    /// draws from the next frame; the deferred request goes; the cursor's
-    /// scope advances, cancelling a running cursor job, whose output is
-    /// never adopted (it stays the worker's until its thread ends); the
-    /// selection publication is superseded (unanswered, it retires).
-    pub fn cursor_changed(&self, coord: &Coordinator) {
-        self.core().cursor_changed(coord);
+    /// The cursor's row changed to `row` (`None` for a row that is no
+    /// chart; SC4, D2): the one function every change goes through. A new
+    /// cursor generation; the deferred request goes; the cursor's scope
+    /// advances, cancelling a running cursor job, whose output is never
+    /// adopted (it stays the worker's until its thread ends); the next
+    /// update names `row`.
+    pub fn cursor_changed(&self, coord: &Coordinator, row: Option<CursorId>) {
+        self.core().cursor_changed(coord, row);
+    }
+
+    /// The next update is a selection entry's: a use of its row's entry
+    /// (design.md "Load Pipeline", Freshness).
+    pub fn entered(&self) {
+        self.core().entered = true;
     }
 
     /// The cursor rested (SC1): `request` is the one deferred, replacing
@@ -989,25 +1150,34 @@ impl ChartImageWorker {
 
     /// Selection is left (D2, SC5), before the play generation renews:
     /// what [`cursor_changed`](Self::cursor_changed) does, and the
-    /// selection's starter and set go, so nothing of selection begins or
-    /// is published after it. An unanswered selection publication retires,
-    /// and no job begins until it is answered.
+    /// selection's starter goes, so nothing of selection begins after it;
+    /// a read's write not yet sent goes, its slot freed. A write sent is
+    /// answered by the render thread, which keeps none past selection, and
+    /// no job begins until it is. The entries and slots stay (design.md
+    /// "Rendering and Skins", chart images).
     pub fn leave_selection(&self, coord: &Coordinator) {
         let mut c = self.core();
-        c.cursor_changed(coord);
+        c.cursor_changed(coord, None);
         if c.starter_cursor {
             c.starter = None;
             c.starter_cursor = false;
         }
-        c.selection = None;
+        c.sent = None;
+        c.entered = false;
+        c.changed = false;
+        if c.pending_write.as_ref().is_some_and(|p| p.rx.is_none())
+            && let Some(p) = c.pending_write.take()
+        {
+            c.free_slot(p.generation, p.slot, p.version);
+        }
     }
 
     /// Advances the selection's images without blocking (D2): takes what
-    /// ended, begins the deferred request once nothing holds the worker
-    /// (or publishes without a job what needs none), and publishes the
-    /// current selection set again when its last answer is not current
-    /// (a screen built again, SC6). Never begins anything after
-    /// [`end`](Self::end).
+    /// ended (the cursor's read, the pool write's answer, the check), reads
+    /// the live pool (a new generation drops the resident entries, P-h),
+    /// sends a finished read's pool write, begins the deferred request once
+    /// nothing holds the worker, and begins the check waiting. Never begins
+    /// anything after [`end`](Self::end).
     pub fn cursor_step(
         &self,
         coord: &Coordinator,
@@ -1019,19 +1189,98 @@ impl ChartImageWorker {
         if c.ended {
             return;
         }
+        c.sync_pool(publisher);
+        c.send_write(publisher);
         c.starter = Some((coord.clone(), spawner, Some(publisher.clone())));
         c.starter_cursor = true;
         c.begin_if_free();
-        c.republish_selection(publisher);
+        c.begin_check(coord, spawner);
     }
 
-    /// Whether a deferred cursor request waits for a job's thread to end
-    /// or a publication to be answered: the select screen then looks
-    /// again within a slice ([`crate::play::IMAGE_SLICE`]).
+    /// The value the update about to be sent carries for the cursor's row
+    /// (design.md "Rendering and Skins", chart images): resident in its
+    /// slot, absent, or pending without an entry. Called only for an
+    /// update sent: it pins the slot it names and makes it, and the
+    /// entry, the most recently used. A use of the entry (another row or
+    /// read than the last update's, a selection entry, or a list
+    /// `refreshed` with the cursor kept) is stamped, and a check queued
+    /// for it when one is due (design.md "Load Pipeline", Freshness).
+    pub fn update_chart(&self, refreshed: bool) -> crate::chart_currency::CursorChart {
+        use crate::chart_currency::CursorChart;
+        let mut c = self.core();
+        let row = c.cursor_row.clone();
+        let entered = std::mem::take(&mut c.entered);
+        let entry = row
+            .as_ref()
+            .and_then(|r| c.entries.get(r))
+            .map(|e| (e.version, e.state));
+        let chart = match (&row, entry) {
+            (None, _) => CursorChart::Absent,
+            (Some(_), None) => CursorChart::Pending,
+            (Some(_), Some((_, pool::EntryState::Absent))) => CursorChart::Absent,
+            (Some(_), Some((_, pool::EntryState::Resident { generation, slot }))) => {
+                CursorChart::Resident { generation, slot }
+            }
+        };
+        let version = entry.map(|(v, _)| v);
+        if let (Some(r), Some(v)) = (&row, version) {
+            let same = c
+                .sent
+                .as_ref()
+                .is_some_and(|s| s.row.as_ref() == Some(r) && s.version == Some(v));
+            c.entries.touch(r);
+            if let CursorChart::Resident { generation, slot } = chart
+                && generation == c.pool_generation
+                && let Some(slots) = c.slots.as_mut()
+            {
+                slots.touch(slot);
+            }
+            if !same || entered || refreshed {
+                c.use_clock += 1;
+                let stamp = c.use_clock;
+                if let Some(e) = c.entries.get_mut(r) {
+                    e.last_use = stamp;
+                }
+                c.queue_check(r);
+            }
+        }
+        c.sent = Some(Sent {
+            row,
+            version,
+            chart,
+        });
+        chart
+    }
+
+    /// Whether the cursor's read is to be requested again with no new
+    /// rest, once: its entry was withdrawn by a check, or a new pool
+    /// generation dropped what it read.
+    pub fn take_rearm(&self) -> bool {
+        std::mem::take(&mut self.core().rearm)
+    }
+
+    /// Whether the cursor row's value changed since the last update, once:
+    /// its entry adopted, withdrawn, or dropped by a new pool generation.
+    pub fn take_changed(&self) -> bool {
+        std::mem::take(&mut self.core().changed)
+    }
+
+    /// Whether the select screen is to look again within a slice
+    /// ([`crate::play::IMAGE_SLICE`]): a deferred request waits, a read or
+    /// a check runs or waits, a pool write is unanswered, or the cursor's
+    /// value changed or its read is to be requested again.
     #[must_use]
     pub fn cursor_waiting(&self) -> bool {
         let c = self.core();
-        c.cursor.is_some() && c.held_back()
+        c.cursor.is_some()
+            || c.job
+                .as_ref()
+                .is_some_and(|j| matches!(j.target, Target::Cursor { .. }))
+            || c.pending_write.is_some()
+            || c.check.is_some()
+            || c.check_queued.is_some()
+            || c.rearm
+            || c.changed
     }
 
     /// Whether the job's thread has ended, its outcome not yet taken
@@ -1042,44 +1291,93 @@ impl ChartImageWorker {
         self.core().job.as_ref().is_some_and(|j| j.job.finished())
     }
 
-    /// Whether a selection set is kept, current or not (tests).
+    /// The entry of `id`: where its images are, its version, its last use
+    /// and the last use validated (tests).
     #[cfg(test)]
     #[must_use]
-    pub fn selection_kept(&self) -> bool {
-        self.core().selection.is_some()
+    pub fn entry(&self, id: &CursorId) -> Option<(pool::EntryState, u64, u64, u64)> {
+        self.core()
+            .entries
+            .get(id)
+            .map(|e| (e.state, e.version, e.last_use, e.validated))
     }
 
-    /// The selection set, while current for the cursor generation (tests).
+    /// The entry of the cursor's row, as [`entry`](Self::entry) (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    #[must_use]
+    pub fn cursor_entry(&self) -> Option<(pool::EntryState, u64, u64, u64)> {
+        let c = self.core();
+        let row = c.cursor_row.as_ref()?;
+        c.entries
+            .get(row)
+            .map(|e| (e.state, e.version, e.last_use, e.validated))
+    }
+
+    /// The entries kept (tests).
     #[cfg(test)]
     #[must_use]
-    pub fn current_selection(&self) -> Option<Arc<ChartImages>> {
-        let c = self.core();
-        let now = c.cursor_generation();
-        c.selection
+    pub fn entries(&self) -> usize {
+        self.core().entries.len()
+    }
+
+    /// The live pool's slots as the worker keeps them (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn slot_states(&self) -> Vec<pool::SlotState> {
+        self.core()
+            .slots
             .as_ref()
-            .filter(|s| s.cursor_generation == now)
-            .map(|s| Arc::clone(&s.set))
+            .map_or_else(Vec::new, pool::Slots::states)
+    }
+
+    /// The live pool generation the worker read last, 0 for none (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn pool_generation(&self) -> u64 {
+        self.core().pool_generation
+    }
+
+    /// The value the last update sent carried (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    #[must_use]
+    pub fn sent_chart(&self) -> Option<crate::chart_currency::CursorChart> {
+        self.core().sent.as_ref().map(|s| s.chart)
+    }
+
+    /// The pool writes sent (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn writes_sent(&self) -> u64 {
+        self.core().writes_sent
+    }
+
+    /// The checks begun (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn checks_begun(&self) -> u64 {
+        self.core().checks_begun
+    }
+
+    /// Whether a check runs, and whether one waits (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn checks_pending(&self) -> (bool, bool) {
+        let c = self.core();
+        (c.check.is_some(), c.check_queued.is_some())
+    }
+
+    /// Whether a pool write is unanswered or not yet sent (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn write_pending(&self) -> bool {
+        self.core().pending_write.is_some()
     }
 
     /// The cursor generation (tests).
     #[cfg(all(test, feature = "dev-tools"))]
     #[must_use]
     pub fn cursor_generation(&self) -> u64 {
-        self.core().cursor_generation()
-    }
-
-    /// Whether a publication retires (tests).
-    #[cfg(test)]
-    #[must_use]
-    pub fn retiring(&self) -> bool {
-        self.core().retiring.is_some()
-    }
-
-    /// Whether the selection publication is unanswered (tests).
-    #[cfg(test)]
-    #[must_use]
-    pub fn selection_pending(&self) -> bool {
-        self.core().sel_pending()
+        self.core().cursor_generation
     }
 
     /// Whether a cursor request is deferred (tests).
@@ -1087,13 +1385,6 @@ impl ChartImageWorker {
     #[must_use]
     pub fn cursor_deferred(&self) -> bool {
         self.core().cursor.is_some()
-    }
-
-    /// The selection publications sent (tests).
-    #[cfg(test)]
-    #[must_use]
-    pub fn selection_publications(&self) -> u64 {
-        self.core().sel_sent
     }
 
     /// The result begins: the play half goes (the play installation is not
@@ -1304,7 +1595,7 @@ impl ChartImageWorker {
         };
         if !asked {
             c.supersede();
-            if c.retiring.is_none() && !c.sel_pending() {
+            if c.retiring.is_none() && c.pending_write.is_none() {
                 let rx = render.publish_chart_images(generation, request, set.clone());
                 c.publication = Some(Publication::sent(
                     generation,
@@ -1364,32 +1655,51 @@ impl ChartImageWorker {
         c.result = None;
         c.blocked = None;
         c.cursor = None;
-        c.selection = None;
-        c.sel_publication = None;
+        c.cursor_row = None;
+        c.asked = None;
+        c.entries.clear();
+        c.slots = None;
+        c.pool_generation = 0;
+        c.pending_write = None;
+        c.check_queued = None;
+        c.sent = None;
+        c.rearm = false;
+        c.changed = false;
         let deadline = Instant::now() + STOP_WAIT;
-        for job in [c.job.take().map(|j| j.job), c.obsolete.take()]
+        let jobs = [c.job.take().map(|j| j.job), c.obsolete.take()];
+        let check = c.check.take().map(|k| k.job);
+        let ended = jobs
             .into_iter()
             .flatten()
-        {
-            let bound = deadline.saturating_duration_since(Instant::now());
-            match job.settle(bound, &Instant::now, &mut || Some(())) {
-                Settled::Joined {
-                    after_panic: Some(p),
-                    ..
-                } => log::warn!("chart images: the worker stopped unexpectedly: {}", p.0),
-                Settled::Joined { .. } => {}
-                Settled::Abandoned { .. } => {
-                    log::warn!("chart images: the worker was left to end with the process");
-                    #[cfg(test)]
-                    {
-                        c.abandoned += 1;
-                    }
-                }
-            }
-            #[cfg(test)]
-            {
-                c.settled += 1;
-            }
+            .map(|job| end_job(job, deadline))
+            .chain(check.map(|job| end_job(job, deadline)));
+        #[cfg(test)]
+        for abandoned in ended {
+            c.settled += 1;
+            c.abandoned += u64::from(abandoned);
+        }
+        #[cfg(not(test))]
+        ended.for_each(drop);
+    }
+}
+
+/// Settles `job` at the run's end within what is left of `deadline`, or
+/// leaves it to the process's exit: whether it was left. A panic is
+/// logged, never the run's.
+fn end_job<T: Clone>(job: OwnedJob<T>, deadline: Instant) -> bool {
+    let bound = deadline.saturating_duration_since(Instant::now());
+    match job.settle(bound, &Instant::now, &mut || Some(())) {
+        Settled::Joined {
+            after_panic: Some(p),
+            ..
+        } => {
+            log::warn!("chart images: the worker stopped unexpectedly: {}", p.0);
+            false
+        }
+        Settled::Joined { .. } => false,
+        Settled::Abandoned { .. } => {
+            log::warn!("chart images: the worker was left to end with the process");
+            true
         }
     }
 }
@@ -1450,9 +1760,13 @@ fn run_job(
     }
 }
 
-/// The cursor job's work: `id`'s selection set ([`read_selection`]),
-/// keeping `prior`'s unchanged reads. Asks `cancel` throughout.
-fn run_cursor_job(id: &CursorId, prior: Option<&ChartImages>, cancel: &dyn Fn() -> bool) -> Output {
+/// The cursor job's work: `id`'s images read into the pool's `cells`
+/// ([`read_row`]). Asks `cancel` throughout.
+fn run_cursor_job(
+    id: &CursorId,
+    cells: chart_image::ChartCells,
+    cancel: &dyn Fn() -> bool,
+) -> Output {
     #[cfg(test)]
     let before = COUNTS.with(std::cell::Cell::get);
     #[cfg(test)]
@@ -1460,9 +1774,9 @@ fn run_cursor_job(id: &CursorId, prior: Option<&ChartImages>, cancel: &dyn Fn() 
         !PANIC.swap(false, std::sync::atomic::Ordering::AcqRel),
         "an injected panic of the images' job"
     );
-    let set = Arc::new(read_selection(id, prior, cancel));
+    let fits = Arc::new(read_row(id, cells, cancel));
     Output::Cursor {
-        set,
+        fits,
         #[cfg(test)]
         counts: COUNTS.with(|c| {
             let (d, f) = c.get();
@@ -1476,23 +1790,14 @@ impl Core {
         self.generation.load(Ordering::SeqCst)
     }
 
-    fn cursor_generation(&self) -> u64 {
-        self.cursor_generation.load(Ordering::SeqCst)
-    }
-
     /// [`ChartImageWorker::cursor_changed`] under the held worker.
-    fn cursor_changed(&mut self, coord: &Coordinator) {
-        self.cursor_generation.fetch_add(1, Ordering::SeqCst);
+    fn cursor_changed(&mut self, coord: &Coordinator, row: Option<CursorId>) {
+        self.cursor_generation += 1;
         self.cursor = None;
         coord.advance(Scope::Cursor);
-        self.supersede_selection();
-    }
-
-    /// The selection publication is no longer the one asked for, by the
-    /// rule of [`supersede`](Self::supersede).
-    fn supersede_selection(&mut self) {
-        let p = self.sel_publication.take();
-        self.retire_publication(p);
+        self.cursor_row = row;
+        self.asked = None;
+        self.rearm = false;
     }
 
     /// Whether play's publication is unanswered.
@@ -1500,21 +1805,15 @@ impl Core {
         self.publication.as_ref().is_some_and(Publication::pending)
     }
 
-    /// Whether the selection publication is unanswered.
-    fn sel_pending(&self) -> bool {
-        self.sel_publication
-            .as_ref()
-            .is_some_and(Publication::pending)
-    }
-
     /// Whether a job may not begin now: a job's thread alive, a
-    /// publication retiring, or any target's unanswered (SX20).
+    /// publication retiring, play's unanswered, or a pool write not yet
+    /// answered (SX20). Never a check.
     fn held_back(&self) -> bool {
         self.job.is_some()
             || self.obsolete.is_some()
             || self.retiring.is_some()
             || self.play_pending()
-            || self.sel_pending()
+            || self.pending_write.is_some()
     }
 
     fn renew(&mut self) {
@@ -1543,7 +1842,8 @@ impl Core {
         }
     }
 
-    /// Takes the answers that came, the retiring one's and the last one's.
+    /// Takes the answers that came: the retiring publication's, the last
+    /// one's and the pool write's.
     fn poll_answers(&mut self) {
         if let Some(r) = &mut self.retiring {
             r.poll();
@@ -1554,8 +1854,277 @@ impl Core {
         if let Some(p) = &mut self.publication {
             p.poll();
         }
-        if let Some(p) = &mut self.sel_publication {
-            p.poll();
+        self.poll_write();
+    }
+
+    /// Frees slot `slot` of pool generation `generation` from read
+    /// `version`, while that generation is live.
+    fn free_slot(&mut self, generation: u64, slot: u16, version: u64) {
+        if generation == self.pool_generation
+            && let Some(slots) = self.slots.as_mut()
+        {
+            slots.free(slot, version);
+        }
+    }
+
+    /// Inserts `entry` for `row`, freeing the slots of the entries it
+    /// evicts and its own if it is not kept; the cursor row's value
+    /// changes when it is the cursor's.
+    fn adopt_entry(&mut self, row: CursorId, entry: pool::Entry) {
+        let (version, state) = (entry.version, entry.state);
+        let cursor = self.cursor_row.as_ref() == Some(&row);
+        let (kept, gone) = self.entries.insert(row, entry);
+        for e in gone {
+            if let pool::EntryState::Resident { generation, slot } = e.state {
+                self.free_slot(generation, slot, e.version);
+            }
+        }
+        if !kept && let pool::EntryState::Resident { generation, slot } = state {
+            self.free_slot(generation, slot, version);
+        }
+        if cursor {
+            self.changed = true;
+        }
+        log::debug!(
+            "chart images: {} entries, {} bytes",
+            self.entries.len(),
+            self.entries.bytes()
+        );
+    }
+
+    /// Takes the pool write's answer, if it came: written, the row is
+    /// resident in its slot; otherwise (stale, refused, the device lost,
+    /// or the render thread gone) its slot is freed and the row has no
+    /// entry, so it is read again at a later rest.
+    fn poll_write(&mut self) {
+        let Some(rx) = self.pending_write.as_ref().and_then(|p| p.rx.as_ref()) else {
+            return;
+        };
+        let answer = match rx.try_recv() {
+            Ok(answer) => answer,
+            Err(mpsc::TryRecvError::Empty) => return,
+            Err(mpsc::TryRecvError::Disconnected) => Err(render::PoolWriteError::Stale),
+        };
+        let Some(p) = self.pending_write.take() else {
+            return;
+        };
+        match answer {
+            Ok(()) if p.generation == self.pool_generation => {
+                if let Some(slots) = self.slots.as_mut() {
+                    slots.set(p.slot, pool::SlotState::Resident { version: p.version });
+                }
+                let bindings = [
+                    p.fits.read(ChartImage::Stage).binding.clone(),
+                    p.fits.read(ChartImage::Banner).binding.clone(),
+                ];
+                let state = pool::EntryState::Resident {
+                    generation: p.generation,
+                    slot: p.slot,
+                };
+                self.adopt_entry(p.row, pool::Entry::new(p.version, bindings, state));
+            }
+            Ok(()) => {}
+            Err(e) => {
+                log::info!("chart images: the pool write was not applied: {e}");
+                self.free_slot(p.generation, p.slot, p.version);
+            }
+        }
+    }
+
+    /// Sends the pool write a finished read left, if any
+    /// ([`crate::render_side::ChartPublisher::write_pool`]).
+    fn send_write(&mut self, publisher: &crate::render_side::ChartPublisher) {
+        let Some(p) = self.pending_write.as_mut().filter(|p| p.rx.is_none()) else {
+            return;
+        };
+        let (reply, rx) = mpsc::sync_channel(1);
+        publisher.write_pool(Box::new(crate::render_side::PoolWrite {
+            generation: p.generation,
+            slot: p.slot,
+            fits: Arc::clone(&p.fits),
+            reply,
+        }));
+        p.rx = Some(rx);
+        #[cfg(test)]
+        {
+            self.writes_sent += 1;
+        }
+    }
+
+    /// Reads the live pool (P-h): when its generation changed or ended,
+    /// the resident entries and the slots go, the absent entries stay, a
+    /// read's write not yet sent goes, and the cursor's row, its read
+    /// asked in this rest and now without an entry, is read again as on a
+    /// cold start. Logs the pool's change once.
+    fn sync_pool(&mut self, publisher: &crate::render_side::ChartPublisher) {
+        let (layout, _) = publisher.pool_now();
+        let generation = layout.map_or(0, |l| l.generation);
+        if generation == self.pool_generation {
+            return;
+        }
+        match layout {
+            Some(l) => log::info!(
+                "chart images: pool generation {}, {} slots, cells {:?} and {:?} in {} layers of {}",
+                l.generation,
+                l.slots,
+                l.cells.stage.map(chart_image::Slot::size),
+                l.cells.banner.map(chart_image::Slot::size),
+                l.layers,
+                l.side
+            ),
+            None => log::info!("chart images: no pool"),
+        }
+        let resident = self
+            .cursor_row
+            .as_ref()
+            .and_then(|r| self.entries.get(r))
+            .is_some_and(|e| matches!(e.state, pool::EntryState::Resident { .. }));
+        self.pool_generation = generation;
+        self.slots = layout.map(pool::Slots::new);
+        self.entries.drop_resident();
+        if self.pending_write.as_ref().is_some_and(|p| p.rx.is_none()) {
+            self.pending_write = None;
+        }
+        if resident {
+            self.changed = true;
+        }
+        if generation != 0
+            && let Some(row) = &self.cursor_row
+            && self.asked.as_ref() == Some(row)
+            && self.entries.get(row).is_none()
+        {
+            self.rearm = true;
+        }
+    }
+
+    /// Queues a check of `row`'s entry when it is due (a use not yet
+    /// validated) and no check running or waiting covers that use.
+    fn queue_check(&mut self, row: &CursorId) {
+        let Some(e) = self.entries.get(row) else {
+            return;
+        };
+        if e.last_use <= e.validated {
+            return;
+        }
+        let (version, last_use) = (e.version, e.last_use);
+        if self
+            .check
+            .as_ref()
+            .is_some_and(|k| &k.row == row && k.version == version && k.covers >= last_use)
+        {
+            return;
+        }
+        if self
+            .check_queued
+            .as_ref()
+            .is_some_and(|(r, v)| r == row && *v == version)
+        {
+            return;
+        }
+        self.check_queued = Some((row.clone(), version));
+    }
+
+    /// Begins the check waiting when none runs: it validates every use of
+    /// its entry up to now (`covers`), resolving the names again and
+    /// comparing the bindings (design.md "Load Pipeline", Freshness). A
+    /// check is never held back by a read or a write.
+    fn begin_check(&mut self, coord: &Coordinator, spawner: Spawner) {
+        if self.check.is_some() || self.ended {
+            return;
+        }
+        let Some((row, version)) = self.check_queued.take() else {
+            return;
+        };
+        let Some(e) = self.entries.get(&row).filter(|e| e.version == version) else {
+            return;
+        };
+        let covers = e.last_use;
+        let generation = match e.state {
+            pool::EntryState::Resident { generation, .. } => Some(generation),
+            pool::EntryState::Absent => None,
+        };
+        let (id, bindings) = (row.clone(), e.bindings.clone());
+        let key = JobKey {
+            kind: JobKind::ChartCheck,
+            path: row.dir.clone(),
+            speed: bms_model::Speed::NORMAL,
+        };
+        let spawned = coord.spawn_owned(
+            spawner,
+            key,
+            (Class::Foreground, false, Owner::Foreground),
+            coord.subscriber(Scope::Folder),
+            |_| {},
+            move |_| unchanged(&id, &bindings),
+        );
+        match spawned {
+            Ok(job) => {
+                #[cfg(test)]
+                {
+                    self.checks_begun += 1;
+                }
+                self.check = Some(Check {
+                    row,
+                    version,
+                    generation,
+                    covers,
+                    job,
+                });
+            }
+            Err(e) => log::warn!("chart images: {e}"),
+        }
+    }
+
+    /// Takes the check's outcome once it ended: a result counts only for
+    /// the entry's version and, for a resident entry, its pool generation.
+    /// Unchanged, the uses up to the one it covered are validated, and a
+    /// later use is checked next; a mismatch drops the entry, its slot
+    /// freed, and when it is the cursor's row its value changes and its
+    /// read is requested again with no move.
+    fn check_finished(&mut self) {
+        if !self.check.as_ref().is_some_and(|k| k.job.finished()) {
+            return;
+        }
+        let Some(k) = self.check.take() else {
+            return;
+        };
+        let outcome = k.job.poll().map(|o| o.outcome);
+        end_job(k.job, Instant::now() + STOP_WAIT);
+        let same = match outcome {
+            Some(Outcome::Done(same)) => same,
+            Some(Outcome::Panicked(p)) => {
+                log::warn!("chart images: a check stopped unexpectedly: {}", p.0);
+                return;
+            }
+            Some(Outcome::Cancelled) | None => return,
+        };
+        let Some(e) = self.entries.get_mut(&k.row) else {
+            return;
+        };
+        let generation = match e.state {
+            pool::EntryState::Resident { generation, .. } => Some(generation),
+            pool::EntryState::Absent => None,
+        };
+        if e.version != k.version || generation != k.generation {
+            return;
+        }
+        if same {
+            e.validated = e.validated.max(k.covers);
+            self.queue_check(&k.row);
+            return;
+        }
+        log::info!(
+            "chart images: {} changed since it was read",
+            k.row.dir.display()
+        );
+        if let Some(e) = self.entries.remove(&k.row)
+            && let pool::EntryState::Resident { generation, slot } = e.state
+        {
+            self.free_slot(generation, slot, e.version);
+        }
+        if self.cursor_row.as_ref() == Some(&k.row) {
+            self.changed = true;
+            self.rearm = true;
         }
     }
 
@@ -1710,6 +2279,7 @@ impl Core {
     /// Never blocks, never begins a job.
     fn take_finished(&mut self) {
         self.poll_answers();
+        self.check_finished();
         if self.obsolete.as_ref().is_some_and(OwnedJob::finished)
             && let Some(old) = self.obsolete.take()
         {
@@ -1734,7 +2304,10 @@ impl Core {
             Target::Cursor {
                 id,
                 cursor_generation,
-            } => self.cursor_finished(id, cursor_generation, outcome),
+                generation,
+                slot,
+                version,
+            } => self.cursor_finished(id, cursor_generation, (generation, slot, version), outcome),
         }
     }
 
@@ -1787,20 +2360,24 @@ impl Core {
     }
 
     /// The cursor's job for `id` in `cursor_generation` ended with
-    /// `outcome` (SX5-SX8): its set, or a panicked job's failed one, is
-    /// the selection set while that cursor generation is current, else
-    /// dropped (stale); a cancelled job leaves nothing. A failed set,
-    /// which the job never sent, is published by the next step.
+    /// `outcome` (SX5-SX8), its read admitted to slot `slot` of pool
+    /// generation `generation` as read `version`: while that cursor and
+    /// pool generation are current, a read with both images absent is an
+    /// absent entry, its slot freed, and any other leaves its pool write to
+    /// be sent ([`Core::send_write`]); a read stale, cancelled, panicked or
+    /// failed part way frees its slot and leaves no entry, so the row is
+    /// read again at a later rest.
     fn cursor_finished(
         &mut self,
         id: CursorId,
         cursor_generation: u64,
+        (generation, slot, version): (u64, u16, u64),
         outcome: Option<Outcome<Arc<Output>>>,
     ) {
-        let (set, sent) = match outcome {
+        let fits = match outcome {
             Some(Outcome::Done(out)) => match &*out {
                 Output::Cursor {
-                    set,
+                    fits,
                     #[cfg(test)]
                     counts,
                 } => {
@@ -1809,40 +2386,47 @@ impl Core {
                         self.counts.0 += counts.0;
                         self.counts.1 += counts.1;
                     }
-                    (Arc::clone(set), true)
+                    Some(Arc::clone(fits))
                 }
-                Output::Attempt(_) => return,
+                Output::Attempt(_) => None,
             },
             Some(Outcome::Panicked(p)) => {
                 log::warn!("chart images: the worker stopped unexpectedly: {}", p.0);
-                (Arc::new(ChartImages::absent(&Absent::Failed)), false)
+                None
             }
-            Some(Outcome::Cancelled) | None => return,
+            Some(Outcome::Cancelled) | None => None,
         };
-        if cursor_generation != self.cursor_generation() {
+        let current =
+            cursor_generation == self.cursor_generation && generation == self.pool_generation;
+        let read =
+            [ChartImage::Stage, ChartImage::Banner].map(|w| fits.as_ref().map(|f| f.read(w)));
+        let whole = read.iter().all(|r| r.is_some_and(reusable));
+        let Some(fits) = fits.filter(|_| current && whole) else {
+            self.free_slot(generation, slot, version);
+            return;
+        };
+        log_absent(&fits);
+        let [stage, _, banner] = fits.fitted();
+        if stage.is_none() && banner.is_none() {
+            self.free_slot(generation, slot, version);
+            let bindings = [
+                fits.read(ChartImage::Stage).binding.clone(),
+                fits.read(ChartImage::Banner).binding.clone(),
+            ];
+            self.adopt_entry(
+                id,
+                pool::Entry::new(version, bindings, pool::EntryState::Absent),
+            );
             return;
         }
-        if let Some(p) = self
-            .sel_publication
-            .as_mut()
-            .filter(|p| p.awaits_job(cursor_generation))
-        {
-            p.job_ended(sent.then_some(&set));
-        }
-        self.adopt_selection(id, cursor_generation, set);
-    }
-
-    /// `set` is the selection set for `id` in `cursor_generation` (I7).
-    fn adopt_selection(&mut self, id: CursorId, cursor_generation: u64, set: Arc<ChartImages>) {
-        self.selection = Some(SelectionSet {
-            id,
-            cursor_generation,
-            set,
+        self.pending_write = Some(PendingWrite {
+            generation,
+            slot,
+            row: id,
+            version,
+            fits,
+            rx: None,
         });
-        log::debug!(
-            "chart images: read for the cursor; {} bytes retained",
-            self.retained_bytes()
-        );
     }
 
     /// Begins the job the last step left, once no job's thread is alive and
@@ -1967,13 +2551,15 @@ impl Core {
     }
 
     /// Begins the cursor's deferred request once nothing holds the worker
-    /// (SX1, SX20): a request of an older cursor generation is dropped; the
-    /// last selection set's own request is that set again, published
-    /// without a job (D3); one naming no image is published absent at once
-    /// (SX2); otherwise its job reads it on its own subscriber, keeping
-    /// the last selection set's unchanged reads, and publishes what it
-    /// read unless cancelled. A job that cannot start leaves the images
-    /// absent (SX9).
+    /// (SX1, SX20; design.md "Rendering and Skins", chart images): a
+    /// request of an older cursor generation is dropped, and so is one
+    /// whose row has an entry; a chart naming no image is an absent entry
+    /// at once, with no job (SX2). With no live pool the request goes, and
+    /// the pool's next generation asks for it again. Otherwise the row is
+    /// admitted a slot no pin holds (a free one, else the least recently
+    /// used, whose entry goes), and its job reads it into the slot's cells
+    /// on its own subscriber; with every slot pinned the request waits. A
+    /// job that cannot start frees its slot and leaves no entry (SX9).
     fn begin_cursor(
         &mut self,
         coord: &Coordinator,
@@ -1986,50 +2572,63 @@ impl Core {
         let Some(request) = self.cursor.take() else {
             return;
         };
-        let cursor_generation = self.cursor_generation();
-        if request.cursor_generation != cursor_generation {
+        if request.cursor_generation != self.cursor_generation {
             return;
+        }
+        self.asked = Some(request.id.clone());
+        if self.entries.get(&request.id).is_some() {
+            return;
+        }
+        if request.id.names.iter().all(|n| *n == library::Name::None) {
+            self.versions += 1;
+            let entry = pool::Entry::new(
+                self.versions,
+                [
+                    chart_image::Binding::NoHeader,
+                    chart_image::Binding::NoHeader,
+                ],
+                pool::EntryState::Absent,
+            );
+            self.adopt_entry(request.id, entry);
+            return;
+        }
+        let Some((slots, publish)) = self.slots.as_mut().zip(publish) else {
+            return;
+        };
+        let generation = slots.layout().generation;
+        // The pins: the slot the newest update sent names, and the one the
+        // render thread displayed last, read now.
+        let in_pool =
+            |chart: Option<(u64, u16)>| chart.filter(|&(g, _)| g == generation).map(|(_, s)| s);
+        let sent = self.sent.as_ref().and_then(|s| match s.chart {
+            crate::chart_currency::CursorChart::Resident { generation, slot } => {
+                Some((generation, slot))
+            }
+            _ => None,
+        });
+        let (_, displayed) = publish.pool_now();
+        let pins = [
+            in_pool(sent),
+            in_pool(crate::chart_currency::CursorChart::unpack(displayed)),
+        ];
+        let Some((slot, evicted)) = slots.admit(pins) else {
+            // Every slot pinned or written: the request waits for a frame.
+            self.cursor = Some(request);
+            return;
+        };
+        let cells = slots.layout().cells;
+        self.versions += 1;
+        let version = self.versions;
+        slots.set(slot, pool::SlotState::Writing { version });
+        if let Some(row) = evicted.and_then(|v| self.entries.by_version(v)).cloned() {
+            self.entries.remove(&row);
         }
         let CursorRequest { id, subscriber, .. } = request;
-        let publish_now = |c: &mut Self, set: Arc<ChartImages>| {
-            if let Some(p) = publish {
-                c.publish_selection_now(p, cursor_generation, set);
-            }
-        };
-        if let Some(last) = self
-            .selection
-            .as_mut()
-            .filter(|s| s.id == id && ChartImage::ALL.into_iter().all(|w| reusable(s.set.read(w))))
-        {
-            last.cursor_generation = cursor_generation;
-            let set = Arc::clone(&last.set);
-            publish_now(self, set);
-            return;
-        }
-        if id.names.iter().all(|n| *n == library::Name::None) {
-            let set = Arc::new(ChartImages::absent(&Absent::NoHeader));
-            self.adopt_selection(id, cursor_generation, Arc::clone(&set));
-            publish_now(self, set);
-            return;
-        }
-        // The last selection set is the only candidate (D3).
-        let prior = self
-            .selection
-            .as_ref()
-            .filter(|s| s.id.side == id.side)
-            .map(|s| Arc::clone(&s.set));
         self.begun += 1;
         let key = JobKey {
             kind: JobKind::ChartImages,
             path: id.dir.clone(),
             speed: bms_model::Speed::NORMAL,
-        };
-        let (sender, rx) = match publish {
-            Some(p) => {
-                let (reply, rx) = mpsc::sync_channel(1);
-                (Some((p.clone(), reply)), Some(rx))
-            }
-            None => (None, None),
         };
         let read = id.clone();
         let spawned = coord.spawn_owned(
@@ -2038,108 +2637,27 @@ impl Core {
             (Class::Foreground, false, Owner::Foreground),
             subscriber,
             |_| {},
-            move |ctx| {
-                let out = run_cursor_job(&read, prior.as_deref(), &|| ctx.cancelled());
-                if let Some((p, reply)) = sender
-                    && !ctx.cancelled()
-                    && let Output::Cursor { set, .. } = &out
-                {
-                    p.publish_selection(cursor_generation, Some(Arc::clone(set)), reply);
-                }
-                Arc::new(out)
-            },
+            move |ctx| Arc::new(run_cursor_job(&read, cells, &|| ctx.cancelled())),
         );
         match spawned {
             Ok(job) => {
-                if let Some(rx) = rx {
-                    #[cfg(test)]
-                    {
-                        self.sel_sent += 1;
-                    }
-                    self.supersede_selection();
-                    self.sel_publication =
-                        Some(Publication::sent(cursor_generation, None, None, rx, true));
-                }
                 self.job = Some(Job {
                     target: Target::Cursor {
                         id,
-                        cursor_generation,
+                        cursor_generation: self.cursor_generation,
+                        generation,
+                        slot,
+                        version,
                     },
                     job,
                 });
             }
             Err(e) => {
-                // A thread that cannot start: the images absent, the run
-                // goes on.
+                // A thread that cannot start: no entry, the run goes on.
                 log::warn!("chart images: {e}");
-                let set = Arc::new(ChartImages::absent(&Absent::Failed));
-                self.adopt_selection(id, cursor_generation, Arc::clone(&set));
-                publish_now(self, set);
+                self.free_slot(generation, slot, version);
             }
         }
-    }
-
-    /// Publishes the selection set again when it is current for the
-    /// cursor generation and its last publication's answer is not (a
-    /// screen built again, SC6, SX11, SX19), or none was sent: no decode,
-    /// no move.
-    fn republish_selection(&mut self, publisher: &crate::render_side::ChartPublisher) {
-        let cursor_generation = self.cursor_generation();
-        let Some(set) = self
-            .selection
-            .as_ref()
-            .filter(|s| s.cursor_generation == cursor_generation)
-            .map(|s| Arc::clone(&s.set))
-        else {
-            return;
-        };
-        self.publish_selection_now(publisher, cursor_generation, set);
-    }
-
-    /// Publishes `set` for `cursor_generation` into the selection
-    /// installation, unless that very publication is asked for and its
-    /// answer, if any, is still current ([`PublicationKey::current`]: the
-    /// cursor generation and the live selection key). Nothing is sent
-    /// without a selection installation to publish into (SX18: the last
-    /// answer stays not current until a new installation's key, which is
-    /// then asked for again), or while another publication is unanswered.
-    fn publish_selection_now(
-        &mut self,
-        publisher: &crate::render_side::ChartPublisher,
-        cursor_generation: u64,
-        set: Arc<ChartImages>,
-    ) {
-        self.poll_answers();
-        // Read after the answers: the render thread mirrors its targets
-        // before it answers.
-        let now = publisher.now(self.generation());
-        let asked = self.sel_publication.as_ref().is_some_and(|p| {
-            p.gone
-                || (p.generation == cursor_generation
-                    && same(p.set.as_ref(), Some(&set))
-                    && !p.unsent
-                    && p.ack.as_ref().is_none_or(|a| a.key.current(&now, None)))
-        });
-        if asked || now.selection.is_none() {
-            return;
-        }
-        self.supersede_selection();
-        if self.retiring.is_some() || self.play_pending() {
-            return;
-        }
-        #[cfg(test)]
-        {
-            self.sel_sent += 1;
-        }
-        let (reply, rx) = mpsc::sync_channel(1);
-        publisher.publish_selection(cursor_generation, Some(Arc::clone(&set)), reply);
-        self.sel_publication = Some(Publication::sent(
-            cursor_generation,
-            None,
-            Some(set),
-            rx,
-            false,
-        ));
     }
 
     /// Publishes `set` (absent when `None`) for the skin in use, unless
@@ -2163,7 +2681,7 @@ impl Core {
             return true;
         }
         self.supersede();
-        if self.retiring.is_some() || self.sel_pending() {
+        if self.retiring.is_some() || self.pending_write.is_some() {
             return false;
         }
         let (reply, rx) = mpsc::sync_channel(1);
@@ -2173,8 +2691,9 @@ impl Core {
     }
 
     /// The bytes it keeps: the sources, both halves and, while the render
-    /// thread may still hold them, the published and the retiring set,
-    /// each counted once.
+    /// thread may still hold them, the published and the retiring set and
+    /// the pool write's fits, each counted once. The selection's entries
+    /// are bounded apart, by their accounted bytes.
     fn retained_bytes(&self) -> u64 {
         let mut seen: Vec<&Arc<ChartImages>> = Vec::new();
         let mut total = 0_u64;
@@ -2184,9 +2703,9 @@ impl Core {
             .map(|(_, _, s)| s)
             .chain(self.play.iter().map(|h| &h.fits))
             .chain(self.result.iter().map(|h| &h.fits))
-            .chain(self.selection.iter().map(|s| &s.set))
+            .chain(self.pending_write.iter().map(|p| &p.fits))
             .chain(
-                [&self.publication, &self.sel_publication, &self.retiring]
+                [&self.publication, &self.retiring]
                     .into_iter()
                     .flatten()
                     .filter_map(|p| p.set.as_ref()),

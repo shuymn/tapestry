@@ -746,7 +746,8 @@ fn pack(
 /// takes them from ([`skin_model::Skin::fit_chart_layer`]). A chart layer
 /// that the limits refuse while the atlas without it fits is given up, so
 /// the skin keeps its main presentation and its chart images draw absent;
-/// the note says why.
+/// the note says why. A selection skin keeps none: its images live in its
+/// chart-image pool, made with its installation.
 pub(crate) fn plan_layers(
     skin: &mut skin_model::Skin,
     variant: skin_model::Variant,
@@ -1349,9 +1350,10 @@ pub struct Started {
     /// The page side of the committed play skin's chart layer, when it
     /// keeps one: the chart's images are fitted for it (S10-12).
     pub play_chart: Option<u32>,
-    /// The page side of the installed selection skin's chart layer, when
-    /// it keeps one: the cursor's images are read for it (S10-12).
-    pub selection_chart: Option<u32>,
+    /// Whether the installed selection skin draws the chart's images: the
+    /// cursor's are then read into its chart-image pool (design.md
+    /// "Rendering and Skins", chart images).
+    pub selection_chart: bool,
 }
 
 impl PartialEq for Started {
@@ -1485,9 +1487,17 @@ pub fn startup(
                 let skin = bundle.skin();
                 let window = (kind == ScreenKind::Selection)
                     .then(|| (skin.song_list_center(), skin.song_list_slots()));
-                let chart = matches!(kind, ScreenKind::Play | ScreenKind::Selection)
+                let chart = (kind == ScreenKind::Play)
                     .then(|| bundle.chart_layer().map(|_| side))
                     .flatten();
+                // The selection's pool: its firm slot is charged with the
+                // installation, one layer of the page side raised to the
+                // text layer's least.
+                let pooled = kind == ScreenKind::Selection
+                    && bundle.chart_layer().is_none()
+                    && bundle.skin().has_chart_images();
+                let pool_side = u64::from(side.max(skin_model::MIN_TEXT_SIDE));
+                let firm = if pooled { pool_side * pool_side } else { 0 };
                 let pending = render.select_with(kind, Some(bundle), script);
                 match answered(kind, pending, &mut stop)? {
                     None => {
@@ -1498,9 +1508,9 @@ pub fn startup(
                             started.play_chart = chart;
                         }
                         if kind == ScreenKind::Selection {
-                            started.selection_chart = chart;
+                            started.selection_chart = pooled;
                         }
-                        committed = committed.saturating_add(texels);
+                        committed = committed.saturating_add(texels).saturating_add(firm);
                         let atlas = Atlas { texels, side };
                         log_installed(kind, &summary, atlas, committed, log::logger());
                         Shown::Installed

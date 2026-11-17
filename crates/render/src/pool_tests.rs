@@ -184,16 +184,22 @@ fn read_pool(r: &Renderer, z: u32, k: u32, [x, y]: [u32; 2], [w, h]: [u32; 2]) -
     out
 }
 
-/// A selection whose atlas keeps a chart layer, as every selection skin's
-/// does until the player moves its images into the pool, has no pool and
-/// is charged its atlas alone.
+/// A selection whose atlas keeps a chart layer, which no selection skin's
+/// does (its images live in the pool), has no pool and is charged its
+/// atlas alone.
 #[test]
 fn a_selection_keeping_a_chart_layer_has_no_pool() {
     let mut r = crate::test_common::offscreen(1_920, 1_080);
     let dir = tempfile::tempdir().unwrap();
     let skin = chart_skin(dir.path());
+    assert!(!skin.kept_layers().chart);
+    let keeping = KeptLayers {
+        chart: true,
+        ..KeptLayers::NONE
+    };
     let atlas = skin
-        .atlas(Variant::Lo, r.atlas_limits(), &|| false)
+        .sheet()
+        .atlas_keeping(Variant::Lo, r.atlas_limits(), keeping, &|| false)
         .unwrap();
     let b = bundle_of(skin, atlas);
     assert!(b.chart_layer().is_some());

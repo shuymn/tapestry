@@ -65,6 +65,10 @@ pub struct SelectionUpdate {
     /// them; each frame takes the volume and the display offset as they
     /// are then ([`live_settings`]). `None` until the flow gives them.
     pub settings: Option<SelectionSettings>,
+    /// The cursor row's chart images (design.md "Rendering and Skins",
+    /// chart images): the frame that displays this update draws them from
+    /// the pool slot it names while that slot's generation is live.
+    pub cursor_chart: crate::chart_currency::CursorChart,
 }
 
 impl SelectionUpdate {
@@ -491,6 +495,9 @@ impl SkinFeed {
                 order: screen.order_view(),
                 ..s
             }),
+            // The select screen sets the cursor row's value as it sends the
+            // update ([`crate::selection::Selection::show`]).
+            cursor_chart: crate::chart_currency::CursorChart::Pending,
         }
     }
 }
@@ -944,12 +951,12 @@ d[#d + 1] = { id = -102, dst = { { x = 1500, y = 200, w = 300, h = 80 } } }
 }
 
 /// A chart's selection images, a 64×48 stage file of `stage` and, when
-/// `banner` is given, a 60×16 banner of it, read and fitted for a chart
-/// layer of side `side` (dev-tools tests).
+/// `banner` is given, a 60×16 banner of it, read and fitted into the pool
+/// cells `cells` ([`crate::chart_images::derive_cells`]; dev-tools tests).
 #[cfg(test)]
 #[cfg(feature = "dev-tools")]
 pub(crate) fn selection_images(
-    side: u32,
+    cells: skin_model::chart_image::ChartCells,
     stage: [u8; 3],
     banner: Option<[u8; 3]>,
 ) -> (tempfile::TempDir, Arc<crate::chart_images::ChartImages>) {
@@ -977,7 +984,7 @@ pub(crate) fn selection_images(
         result: None,
     };
     let sources = crate::chart_images::read_sources(&want, None, &|| false);
-    let set = crate::chart_images::derive_set(&sources, side, &|| false).unwrap();
+    let set = crate::chart_images::derive_cells(&sources, cells, &|| false).unwrap();
     let [s, _, n] = set.fitted();
     assert!(s.is_some() && n.is_some() == banner.is_some(), "{set:?}");
     (d, Arc::new(set))
@@ -1205,6 +1212,7 @@ mod tests {
             strip: StripText::default(),
             events: SelectionEvents::default(),
             settings: None,
+            cursor_chart: crate::chart_currency::CursorChart::Pending,
         };
         let mut slot = SelectionSlot::default();
         assert!(!slot.offer(update(1, 1)));

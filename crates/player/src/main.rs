@@ -912,10 +912,7 @@ fn rig<'a>(
         #[cfg(test)]
         std::sync::Arc::clone(&audio_lost),
     );
-    let chart_images = crate::chart_images::ChartImageWorker::new(
-        render.chart_generation(),
-        render.cursor_generation(),
-    );
+    let chart_images = crate::chart_images::ChartImageWorker::new(render.chart_generation());
     // The loading waits serve the images' work a step left.
     let served = chart_images.clone();
     controls.serve_images(crate::controls::ImageService(Box::new(move || {
@@ -930,7 +927,7 @@ fn rig<'a>(
         pending: None,
         chart_images,
         play_chart: None,
-        selection_chart: None,
+        selection_chart: false,
         controls,
         clock,
         recorded: input_side::Recorded {

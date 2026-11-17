@@ -2936,20 +2936,24 @@ impl Skin {
 
     /// The layers its atlas keeps after its pages: a text layer when it has
     /// rasterized text ([`has_outline_text`](Self::has_outline_text)), and
-    /// a chart layer when it draws a chart's own images
-    /// ([`has_chart_images`](Self::has_chart_images)).
+    /// a chart layer when a play or result skin draws a chart's own images
+    /// ([`has_chart_images`](Self::has_chart_images)). A selection skin's
+    /// images live in its chart-image pool, an array of its own (design.md
+    /// "Rendering and Skins", chart images), so its atlas keeps no chart
+    /// layer.
     #[must_use]
     pub fn kept_layers(&self) -> KeptLayers {
         KeptLayers {
             text: self.has_outline_text(),
-            chart: self.has_chart_images(),
+            chart: self.has_chart_images() && self.kind != ScreenKind::Selection,
         }
     }
 
     /// Whether some element draws one of the chart's own images
     /// ([`Source::ChartImage`]) and its chart layer was not given up
-    /// ([`without_chart_layer`](Self::without_chart_layer)): its
-    /// installation then keeps a chart layer.
+    /// ([`without_chart_layer`](Self::without_chart_layer)): a play or
+    /// result installation then keeps a chart layer, and a selection one
+    /// a chart-image pool.
     #[must_use]
     pub fn has_chart_images(&self) -> bool {
         !self.chart_layer_dropped

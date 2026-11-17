@@ -441,71 +441,83 @@ pub struct Selection {
 pub(crate) const REST: TimeUs = TimeUs(150_000);
 
 /// The cursor's chart as its image request names it: the chart row's
-/// path, the names the library keeps for it, and the side of the selection
-/// skin's chart layer. A row that is no chart, a chart whose names the
-/// loader refused, or a selection skin with no chart layer has none, and
-/// asks for nothing.
+/// path and the names the library keeps for it. A row that is no chart, a
+/// chart whose names the loader refused, or a selection skin drawing no
+/// chart image has none, and asks for nothing.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CursorChart {
+pub struct RestedChart {
     path: std::path::PathBuf,
     names: library::ChartNames,
-    side: u32,
 }
 
-/// The cursor's rest (D2): its chart, since when it is there, and whether
-/// its images were asked for.
+/// The cursor's rest (D2): its chart, since when it is there, whether its
+/// images were asked for, and the list revision the last update sent was
+/// of (a refreshed list keeping the cursor is a use of its entry).
 #[derive(Debug, Default)]
 pub struct CursorRest {
-    chart: Option<CursorChart>,
+    chart: Option<RestedChart>,
     since: TimeUs,
     asked: bool,
+    list_revision: u64,
 }
 
-/// What the select screen gives the cursor's images: the worker, and the
-/// side of the selection skin's chart layer, if it keeps one.
+impl CursorRest {
+    /// The cursor's read is requested again at `now` with no move: the
+    /// rest counts as served (design.md "Load Pipeline", Freshness; P-h).
+    fn rearm(&mut self, now: TimeUs) {
+        self.asked = false;
+        self.since = TimeUs(now.0.saturating_sub(REST.0));
+    }
+}
+
+/// What the select screen gives the cursor's images: the worker, and
+/// whether the selection skin draws them.
 #[derive(Clone, Copy)]
 pub(crate) struct CursorImages<'a> {
     pub worker: &'a crate::chart_images::ChartImageWorker,
-    pub side: Option<u32>,
+    pub drawn: bool,
 }
 
 impl Selection {
-    /// The cursor's chart for a selection chart layer of side `side`, as
-    /// borrowed from the list: its path and names.
-    fn cursor_chart(
-        &self,
-        side: Option<u32>,
-    ) -> Option<(&std::path::Path, &library::ChartNames, u32)> {
-        let side = side?;
+    /// The cursor's chart when the skin draws its images, as borrowed from
+    /// the list: its path and names.
+    fn cursor_chart(&self, drawn: bool) -> Option<(&std::path::Path, &library::ChartNames)> {
+        if !drawn {
+            return None;
+        }
         let entry = self.screen.selected()?;
-        Some((&entry.path, entry.images.as_ref()?, side))
+        Some((&entry.path, entry.images.as_ref()?))
     }
 
     /// Before an update is sent (SC4): when the cursor's chart changed
     /// (a move, a list read again with other names or another row under
     /// the cursor, a refused chart selected, an entry), the worker's
-    /// cursor generation changes and the rest counts from `now`. Compared
-    /// by the chart itself, never by what the update's key holds, and
-    /// copied only when it changed.
+    /// cursor generation and row change and the rest counts from `now`.
+    /// Compared by the chart itself, never by what the update's key holds,
+    /// and copied only when it changed.
     fn track_cursor(&mut self, images: CursorImages<'_>, now: TimeUs) {
-        let chart = self.cursor_chart(images.side);
+        let chart = self.cursor_chart(images.drawn);
         let same = self
             .rest
             .chart
             .as_ref()
-            .map(|c| (c.path.as_path(), &c.names, c.side))
+            .map(|c| (c.path.as_path(), &c.names))
             == chart;
         if !same {
-            let chart = chart.map(|(path, names, side)| CursorChart {
+            let chart = chart.map(|(path, names)| RestedChart {
                 path: path.to_owned(),
                 names: names.clone(),
-                side,
             });
-            images.worker.cursor_changed(&self.coord);
+            let row = chart.as_ref().map(|c| crate::chart_images::CursorId {
+                dir: crate::chart_images::folder(&c.path),
+                names: [c.names.stagefile.clone(), c.names.banner.clone()],
+            });
+            images.worker.cursor_changed(&self.coord, row);
             self.rest = CursorRest {
                 chart,
                 since: now,
                 asked: false,
+                list_revision: self.rest.list_revision,
             };
         }
     }
@@ -528,7 +540,6 @@ impl Selection {
         Some(images.worker.cursor_request(
             crate::chart_images::folder(&chart.path),
             [chart.names.stagefile.clone(), chart.names.banner.clone()],
-            chart.side,
             &self.coord,
         ))
     }
@@ -539,19 +550,22 @@ impl Selection {
             .then(|| TimeUs(self.rest.since.0.saturating_add(REST.0)))
     }
 
-    /// Selection is entered at `now`: a new cursor generation, so a table
-    /// of the last visit is never current at the entry, whatever row the
-    /// cursor is on; the rest counted from here (SX17), the cursor's chart
-    /// set by the first update's [`track_cursor`](Self::track_cursor). The
-    /// departure ([`left_selection`](PlayerRig::left_selection)) is not on
-    /// every way back: a chart refused before it (a practice the session
-    /// refuses) enters selection again without one.
+    /// Selection is entered at `now`: a new cursor generation whatever row
+    /// the cursor is on, the rest counted from here (SX17), the cursor's
+    /// chart set by the first update's [`track_cursor`](Self::track_cursor),
+    /// and that update a use of its row's entry (design.md "Load
+    /// Pipeline", Freshness). The departure
+    /// ([`left_selection`](PlayerRig::left_selection)) is not on every way
+    /// back: a chart refused before it (a practice the session refuses)
+    /// enters selection again without one.
     fn rest_entered(&mut self, images: CursorImages<'_>, now: TimeUs) {
-        images.worker.cursor_changed(&self.coord);
+        images.worker.cursor_changed(&self.coord, None);
+        images.worker.entered();
         self.rest = CursorRest {
             chart: None,
             since: now,
             asked: false,
+            list_revision: self.rest.list_revision,
         };
     }
 }
@@ -1167,7 +1181,15 @@ impl Selection {
                     }
                 }
             }
-            render.show_selection(self.update_of(page, now));
+            let mut update = self.update_of(page, now);
+            // The cursor row's chart images, as sent: a refreshed list
+            // keeping the cursor on its row is a use of its entry.
+            if images.drawn {
+                let refreshed = self.feed.list_revision != self.rest.list_revision;
+                update.cursor_chart = images.worker.update_chart(refreshed);
+            }
+            self.rest.list_revision = self.feed.list_revision;
+            render.show_selection(update);
         }
     }
 
@@ -2459,8 +2481,8 @@ impl PlayerRig<'_> {
     /// Selection is left (the decision screen, loading or the practice
     /// page), the one departure (D2, SC5): the worker's selection side first
     /// ([`crate::chart_images::ChartImageWorker::leave_selection`]: its
-    /// request, starter and set go, its job is cancelled, its publication
-    /// retires), then the render thread's, so nothing of it is drawn again;
+    /// request and starter go, its job is cancelled, a pool write not yet
+    /// sent goes), then the render thread's, so nothing of it is drawn again;
     /// the window queues no pointer input until the next entry, nothing in
     /// flight dispatched. Selection's BGM stops at once, a loop still
     /// waiting for its generation included (design.md "State Model",
@@ -2777,7 +2799,7 @@ impl PlayerRig<'_> {
         let now = self.clock.now();
         let images = CursorImages {
             worker: &self.chart_images,
-            side: self.selection_chart,
+            drawn: self.selection_chart,
         };
         let chosen = sel.admit(chosen, &mut self.skin, &self.render, images, now);
         if let Some(pick) = &chosen {
@@ -2832,7 +2854,14 @@ impl PlayerRig<'_> {
             // The cursor's images, only with no choice in this pass, so no
             // selection job begins in the pass that chose (D2): the
             // request once the cursor rested, then the worker's step.
-            if self.selection_chart.is_some() {
+            // A read requested again (its entry withdrawn, or dropped by a
+            // new pool generation) counts the rest as served. A value that
+            // changed in the step (a read adopted, an entry withdrawn) is
+            // sent in this look.
+            if self.selection_chart {
+                if self.chart_images.take_rearm() {
+                    sel.rest.rearm(now);
+                }
                 if let Some(request) = sel.rest_request(images, now) {
                     self.chart_images.rest(request);
                 }
@@ -2841,6 +2870,10 @@ impl PlayerRig<'_> {
                     sel.spawner,
                     &self.render.chart_publisher(),
                 );
+                if self.chart_images.take_changed() {
+                    sel.dirty = true;
+                    sel.show(&self.render, images, None, now);
+                }
             }
             // A selection capture due is armed with the update just
             // published, which follows every step before it (dev-tools).
@@ -4045,7 +4078,7 @@ impl AppRig for PlayerRig<'_> {
             sel.refused(&refusal.chart, format!("{name}: {shown}"), preset);
             let images = CursorImages {
                 worker: &self.chart_images,
-                side: self.selection_chart,
+                drawn: self.selection_chart,
             };
             sel.show(&self.render, images, None, self.clock.now());
         }
@@ -4097,7 +4130,7 @@ impl AppRig for PlayerRig<'_> {
         if let Some(sel) = &mut self.selection {
             let images = CursorImages {
                 worker: &self.chart_images,
-                side: self.selection_chart,
+                drawn: self.selection_chart,
             };
             sel.show(&self.render, images, None, self.clock.now());
         }
@@ -4131,7 +4164,7 @@ impl AppRig for PlayerRig<'_> {
         #[cfg(feature = "dev-tools")]
         self.finish_result(crate::dev::scenario::Leaving::Left);
         // The last chart's images go: nothing of them stays beside
-        // selection.
+        // selection; the selection's own entries stay.
         self.chart_images.drop_images();
         self.result_skin.drop_images();
         // Another scene: held adjustment controls act no more until
@@ -4160,11 +4193,11 @@ impl AppRig for PlayerRig<'_> {
             let now = self.clock.now();
             let images = CursorImages {
                 worker: &self.chart_images,
-                side: self.selection_chart,
+                drawn: self.selection_chart,
             };
-            // A new cursor generation before the list is read again: a
-            // table of the last visit draws nothing, and the rest counts
-            // from now, whatever the cursor is on (SX17).
+            // A new cursor generation before the list is read again, the
+            // rest counted from now whatever the cursor is on (SX17), and
+            // the first update a use of its row's entry.
             sel.rest_entered(images, now);
             sel.entered(now);
             // A panel held at the entry opens with it.
@@ -4214,7 +4247,7 @@ impl AppRig for PlayerRig<'_> {
         sel.dirty = true;
         let images = CursorImages {
             worker: &self.chart_images,
-            side: self.selection_chart,
+            drawn: self.selection_chart,
         };
         sel.show(&self.render, images, None, self.clock.now());
     }
@@ -4344,19 +4377,23 @@ impl AppRig for PlayerRig<'_> {
     }
 
     /// The cursor's rest coming due, while it has not asked; else, while
-    /// its request waits for a job's thread to end or a publication to be
-    /// answered, a slice from now, so it begins within a slice of that
-    /// (D2, ST15).
+    /// the worker waits on something (a deferred request, a read, a pool
+    /// write's answer, a check, or a value to send), a slice from now, so
+    /// it moves on within a slice of that (D2, ST15).
     fn selection_wake(&self) -> Option<TimeUs> {
         let sel = self.selection.as_ref()?;
-        self.selection_chart?;
-        if let Some(at) = sel.rest_due() {
-            return Some(at);
+        if !self.selection_chart {
+            return None;
         }
         let slice = i64::try_from(crate::play::IMAGE_SLICE.as_micros()).unwrap_or(i64::MAX);
-        self.chart_images
+        let waiting = self
+            .chart_images
             .cursor_waiting()
-            .then(|| TimeUs(self.clock.now().0.saturating_add(slice)))
+            .then(|| TimeUs(self.clock.now().0.saturating_add(slice)));
+        match (sel.rest_due(), waiting) {
+            (Some(due), Some(slice)) => Some(TimeUs(due.0.min(slice.0))),
+            (due, slice) => due.or(slice),
+        }
     }
 
     fn take_practice(&mut self) -> Option<PracticeInput> {
@@ -4698,7 +4735,7 @@ pub(crate) mod tests {
             let worker = crate::chart_images::ChartImageWorker::default();
             let images = CursorImages {
                 worker: &worker,
-                side: None,
+                drawn: false,
             };
             let admitted = sel.admit(chosen, skin, &render, images, TimeUs(0));
             assert!(began.elapsed() < Duration::from_secs(1), "a look waited");
@@ -8162,7 +8199,7 @@ pub(crate) mod tests {
                 sel.dirty = true;
                 let images = CursorImages {
                     worker: &rig.chart_images,
-                    side: rig.selection_chart,
+                    drawn: rig.selection_chart,
                 };
                 sel.show(&rig.render, images, None, rig.clock.now());
                 assert!(rig.render.fence(Duration::from_secs(5)));

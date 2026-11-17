@@ -317,8 +317,9 @@ fn a_chart_image_draws_its_stretched_rect() {
 
 /// A chart image is the stage file and back image on play and result, and
 /// the stage file and banner on selection: each other image, and any on
-/// decision, is refused; a skin drawing one keeps a chart layer, a play
-/// skin's counted after the text layer.
+/// decision, is refused; a play or result skin drawing one keeps a chart
+/// layer, a play skin's counted after the text layer, and a selection
+/// skin keeps none, its images living in its chart-image pool.
 #[test]
 fn a_chart_image_is_play_and_results_and_keeps_a_chart_layer() {
     let element = || chart_image(ChartImage::Stage, ChartStretch::Fill, STAGE);
@@ -338,7 +339,7 @@ fn a_chart_image_is_play_and_results_and_keeps_a_chart_layer() {
     for which in [ChartImage::Stage, ChartImage::Banner] {
         let selection = selection_of(which).unwrap();
         assert!(selection.has_chart_images(), "{which:?}");
-        assert!(selection.kept_layers().chart, "{which:?}");
+        assert!(!selection.kept_layers().chart, "{which:?}");
     }
     assert!(matches!(
         selection_of(ChartImage::Back),

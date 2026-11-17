@@ -220,10 +220,10 @@ pub struct PlayerRig<'a> {
     /// The page side of the committed play skin's chart layer, if it keeps
     /// one ([`crate::imports::Started::play_chart`]).
     pub play_chart: Option<u32>,
-    /// The page side of the selection skin's chart layer, if it keeps one
-    /// ([`crate::imports::Started::selection_chart`]): without one the
+    /// Whether the selection skin draws the chart's images
+    /// ([`crate::imports::Started::selection_chart`]): without them the
     /// cursor asks for no image.
-    pub selection_chart: Option<u32>,
+    pub selection_chart: bool,
     /// The window's controls.
     pub controls: &'a Controls,
     /// Whether the window was shown: recording opens once it is. `None`

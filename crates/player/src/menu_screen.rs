@@ -949,17 +949,31 @@ impl Screen for MenuScreen {
         self.renderer.chart_key()
     }
 
-    fn write_selection_chart(
-        &mut self,
-        images: [Option<&skin_model::chart_image::Fitted>; 3],
-        set: u64,
-    ) -> Result<skin_model::chart_image::ChartTable, RenderError> {
-        self.renderer.write_selection_chart(images, set)
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn pool(&self) -> Option<render::PoolLayout> {
+        self.renderer.pool()
     }
 
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn selection_chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
-        self.renderer.selection_chart_key()
+    fn pool_table(
+        &self,
+        generation: u64,
+        slot: u16,
+    ) -> Option<skin_model::chart_image::ChartTable> {
+        self.renderer.pool_table(generation, slot)
+    }
+
+    fn write_pool_slot(
+        &mut self,
+        generation: u64,
+        slot: u16,
+        [stage, banner]: [Option<&skin_model::chart_image::Fitted>; 2],
+    ) -> Result<(), render::PoolWriteError> {
+        self.renderer.write_pool(generation, slot, stage, banner)
+    }
+
+    fn regrow_pool(&mut self) {
+        let _ = self.renderer.regrow_pool();
     }
 
     /// Stages `skin`'s chart-independent installation of `kind`,

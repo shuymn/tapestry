@@ -33,9 +33,15 @@ struct Charts {
     /// Each loading frame's lifetime, and whether a table was published
     /// as it was drawn.
     frames: Vec<(u64, bool)>,
-    /// Each selection write: its set's id, and whether each of the stage
-    /// file, back image and banner was an image.
-    selection: Vec<(u64, [bool; 3])>,
+    /// Each pool write applied: its generation and slot, and whether its
+    /// stage file and banner were images.
+    pool_writes: Vec<(u64, u16, [bool; 2])>,
+    /// Pool writes are refused while set.
+    refuse_writes: bool,
+    /// Selection frames drawn.
+    selection_frames: u32,
+    /// The selection frames drawn before each pool write applied.
+    write_frames: Vec<u32>,
 }
 
 /// A screen with a chart layer: its committed layer's key names
@@ -44,9 +50,8 @@ struct ChartScreen {
     charts: Arc<Mutex<Charts>>,
     installation: Arc<AtomicU64>,
     hold: Arc<AtomicBool>,
-    /// The selection installation's chart layer, by its key's
-    /// installation; none while 0.
-    selection: Arc<AtomicU64>,
+    /// The selection's chart-image pool, if any.
+    pool: Arc<Mutex<Option<render::PoolLayout>>>,
 }
 
 impl ChartScreen {
@@ -123,6 +128,30 @@ impl Screen for ChartScreen {
     fn invalidate_chart_images(&mut self) {
         self.charts.lock().unwrap().table = false;
     }
+    fn selection(
+        &mut self,
+        _update: &crate::selection_skin::SelectionUpdate,
+        _logic: Option<&mut crate::selection_skin::SelectionLogic>,
+        _changed: bool,
+        _now: TimeUs,
+        _app: skin_model::AppReadouts,
+    ) -> Result<crate::selection_skin::SelectionDrawn, RenderError> {
+        // A selection frame stalls while `hold` is set, before any write
+        // held for its next boundary is taken.
+        while self.hold.load(Ordering::Acquire) {
+            self.charts.lock().unwrap().stalled = true;
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let mut c = self.charts.lock().unwrap();
+        c.stalled = false;
+        c.selection_frames += 1;
+        drop(c);
+        Ok(crate::selection_skin::SelectionDrawn {
+            timing: timing(true),
+            refused: None,
+            skinned: false,
+        })
+    }
     fn chart_key(&self) -> Option<ChartKey> {
         Some(ChartKey {
             renderer: 1,
@@ -131,31 +160,35 @@ impl Screen for ChartScreen {
             generation: 1,
         })
     }
-    fn write_selection_chart(
+    fn pool(&self) -> Option<render::PoolLayout> {
+        *self.pool.lock().unwrap()
+    }
+    fn write_pool_slot(
         &mut self,
-        images: [Option<&skin_model::chart_image::Fitted>; 3],
-        set: u64,
-    ) -> Result<ChartTable, RenderError> {
-        let Some(key) = self.selection_chart_key() else {
-            return Err(RenderError::NoChartLayer);
-        };
+        generation: u64,
+        slot: u16,
+        [stage, banner]: [Option<&skin_model::chart_image::Fitted>; 2],
+    ) -> Result<(), render::PoolWriteError> {
+        if self
+            .pool()
+            .is_none_or(|p| p.generation != generation || slot >= p.slots)
+        {
+            return Err(render::PoolWriteError::Stale);
+        }
         while self.hold.load(Ordering::Acquire) {
             self.charts.lock().unwrap().stalled = true;
             std::thread::sleep(Duration::from_millis(1));
         }
         let mut c = self.charts.lock().unwrap();
         c.stalled = false;
-        c.selection.push((set, images.map(|i| i.is_some())));
-        Ok(ChartTable::ABSENT.keyed(key))
-    }
-    fn selection_chart_key(&self) -> Option<ChartKey> {
-        let installation = self.selection.load(Ordering::SeqCst);
-        (installation != 0).then_some(ChartKey {
-            renderer: 1,
-            installation,
-            atlas: 2,
-            generation: 1,
-        })
+        if c.refuse_writes {
+            return Err(render::PoolWriteError::Refused);
+        }
+        c.pool_writes
+            .push((generation, slot, [stage.is_some(), banner.is_some()]));
+        let frames = c.selection_frames;
+        c.write_frames.push(frames);
+        Ok(())
     }
     #[cfg(feature = "dev-tools")]
     fn read_back(&self) -> Option<(u32, u32, Vec<u8>)> {
@@ -168,20 +201,26 @@ struct Rig {
     charts: Arc<Mutex<Charts>>,
     installation: Arc<AtomicU64>,
     hold: Arc<AtomicBool>,
-    selection: Arc<AtomicU64>,
+    pool: Arc<Mutex<Option<render::PoolLayout>>>,
 }
 
 fn rig() -> Rig {
     rig_with(0)
 }
 
-/// [`rig`], its selection installation's chart layer `selection` (none
-/// for 0).
-fn rig_with(selection: u64) -> Rig {
+/// A pool layout of `slots` slots and a new generation
+/// ([`super::pool_layout`]).
+fn pool_of(slots: u16) -> render::PoolLayout {
+    super::pool_layout(slots)
+}
+
+/// [`rig`], with a selection chart-image pool of `slots` slots (none for
+/// 0).
+fn rig_with(slots: u16) -> Rig {
     let charts = Arc::new(Mutex::new(Charts::default()));
     let installation = Arc::new(AtomicU64::new(1));
     let hold = Arc::new(AtomicBool::new(false));
-    let selection = Arc::new(AtomicU64::new(selection));
+    let selection = Arc::new(Mutex::new((slots > 0).then(|| pool_of(slots))));
     let (c, i, h, s) = (
         Arc::clone(&charts),
         Arc::clone(&installation),
@@ -193,7 +232,7 @@ fn rig_with(selection: u64) -> Rig {
             charts: Arc::clone(&c),
             installation: Arc::clone(&i),
             hold: Arc::clone(&h),
-            selection: Arc::clone(&s),
+            pool: Arc::clone(&s),
         }) as Box<dyn Screen>)
     });
     let link = spawn_empty(make);
@@ -205,14 +244,14 @@ fn rig_with(selection: u64) -> Rig {
         charts,
         installation,
         hold,
-        selection,
+        pool: selection,
     }
 }
 
 /// The worker of `link`'s generation, its current set read for a target
 /// with a chart layer: both absent (no folder), not a job.
 fn worker_with_a_set(link: &super::super::RenderLink) -> ChartImageWorker {
-    let w = ChartImageWorker::new(link.chart_generation(), link.cursor_generation());
+    let w = ChartImageWorker::new(link.chart_generation());
     w.attempt(Want {
         dir: std::path::PathBuf::from("no such folder"),
         names: [String::new(), String::new(), String::new()],
@@ -349,7 +388,7 @@ fn the_job_publishes_its_set_for_the_loading_frames() {
         foreground: 4,
         speculative: 1,
     });
-    let w = ChartImageWorker::new(r.link.chart_generation(), r.link.cursor_generation());
+    let w = ChartImageWorker::new(r.link.chart_generation());
     w.renew();
     w.attempt(Want {
         dir: std::path::PathBuf::from("no such folder"),
@@ -417,7 +456,7 @@ fn a_panicked_job_publishes_its_failed_set_before_the_answer() {
     let r = rig();
     let d = folder_with_stage();
     let coord = coordinator();
-    let w = ChartImageWorker::new(r.link.chart_generation(), r.link.cursor_generation());
+    let w = ChartImageWorker::new(r.link.chart_generation());
     w.renew();
     w.attempt(want_in(d.path(), Some(2_048)));
     let publisher = r.link.chart_publisher();
@@ -468,7 +507,7 @@ fn a_stalled_render_thread_holds_back_the_next_reads() {
         folder_with_stage(),
     );
     let coord = coordinator();
-    let w = ChartImageWorker::new(r.link.chart_generation(), r.link.cursor_generation());
+    let w = ChartImageWorker::new(r.link.chart_generation());
     let publisher = r.link.chart_publisher();
     let step = |w: &ChartImageWorker| {
         w.step(
@@ -516,7 +555,7 @@ fn a_stalled_render_thread_holds_back_the_next_reads() {
 fn a_target_with_no_layer_reads_absent_while_the_chart_loads() {
     let r = rig();
     let coord = coordinator();
-    let w = ChartImageWorker::new(r.link.chart_generation(), r.link.cursor_generation());
+    let w = ChartImageWorker::new(r.link.chart_generation());
     w.renew();
     w.attempt(want_in(std::path::Path::new("no such folder"), None));
     let publisher = r.link.chart_publisher();
@@ -539,7 +578,7 @@ fn a_job_held_back_begins_from_the_waits() {
     let r = rig();
     let (a, b) = (folder_with_stage(), folder_with_stage());
     let coord = coordinator();
-    let w = ChartImageWorker::new(r.link.chart_generation(), r.link.cursor_generation());
+    let w = ChartImageWorker::new(r.link.chart_generation());
     let publisher = r.link.chart_publisher();
     crate::chart_images::HOLD.store(true, Ordering::Release);
     w.renew();
