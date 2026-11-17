@@ -375,6 +375,13 @@ pub struct Selection {
     /// The load's lines on the play screen, from a chart's choice or a
     /// practice Start to its READY state or the way back.
     pub loading: Option<LoadingText>,
+    /// The chart chosen last, with the difficulty its library entry
+    /// stores, declared or inferred ([`library::ChartEntry::difficulty`]):
+    /// what its play and result show for `chart.difficulty` (design.md
+    /// "Play Lifecycle", the chart's labels). Kept from its choice through
+    /// every attempt at it, retries and rounds included; none when the
+    /// chart was not listed.
+    pub chosen_difficulty: Option<(std::path::PathBuf, u8)>,
     /// Whether the chart chosen last was chosen to practice.
     pub practicing: bool,
     /// The decision screen's presentation while it shows, sent again when
@@ -2322,6 +2329,15 @@ fn loading_text(sel: &Selection, chart: &std::path::Path, autoplay: bool) -> Loa
     }
 }
 
+/// The chart chosen, `chart`, with the difficulty its library entry
+/// stores, when it is the listed one ([`Selection::chosen_difficulty`]).
+fn chosen_difficulty(sel: &Selection, chart: &std::path::Path) -> Option<(std::path::PathBuf, u8)> {
+    sel.screen
+        .selected()
+        .filter(|e| e.path == chart)
+        .map(|e| (e.path.clone(), e.difficulty))
+}
+
 /// The strings a decision skin shows of a chart, from its library
 /// header as the select screen's view gives them
 /// ([`crate::select::SelectScreen`]), so their revision
@@ -2351,9 +2367,7 @@ fn chosen_chart(e: &library::ChartEntry) -> ChosenChart {
         play_level: Some(crate::imports::facts::level_of(
             h.playlevel.as_deref().unwrap_or_default(),
         )),
-        difficulty: Some(crate::imports::facts::difficulty_of(
-            h.difficulty.as_deref().unwrap_or_default(),
-        )),
+        difficulty: Some(e.difficulty),
         bga: Some(e.bga),
         length_us: e.summary.as_ref().map(|s| s.length),
     }
@@ -3808,6 +3822,7 @@ impl AppRig for PlayerRig<'_> {
         let Some(sel) = &mut self.selection else {
             return;
         };
+        sel.chosen_difficulty = chosen_difficulty(sel, chart);
         let page = loading_text(sel, chart, self.autoplay);
         println!("load: the play screen loads {}", file_name(chart));
         let gauge = sel
@@ -3916,6 +3931,7 @@ impl AppRig for PlayerRig<'_> {
         let Some(sel) = &mut self.selection else {
             return d;
         };
+        sel.chosen_difficulty = chosen_difficulty(sel, chart);
         let page = loading_text(sel, chart, self.autoplay);
         println!("decision: {} chosen", file_name(chart));
         let shown = page.decision();
@@ -4505,6 +4521,7 @@ pub(crate) mod tests {
             rank: None,
             images: None,
             info: None,
+            difficulty: 0,
         }
     }
 
@@ -4621,31 +4638,25 @@ pub(crate) mod tests {
         assert_eq!(level(None), Some(0));
     }
 
-    /// A chosen chart's difficulty is its entry's `#DIFFICULTY` as an
-    /// attempt reads it, 1 to 5 and 0 for any other or none, and its BGA
-    /// flag the entry's: both known once the entry is.
+    /// A chosen chart's difficulty is the one its entry stores, declared
+    /// or inferred, 0 for none, whatever `#DIFFICULTY` text the entry
+    /// holds, and its BGA flag the entry's: both known once the entry is.
     #[test]
     fn the_chosen_charts_difficulty_and_bga_come_from_its_entry() {
-        let chosen = |text: Option<&str>, bga| {
+        let chosen = |stored, bga| {
             let header = library::Header {
-                difficulty: text.map(str::to_owned),
+                difficulty: Some("2".to_owned()),
                 ..library::Header::default()
             };
-            let c = chosen_chart(&entry(header, bga));
+            let c = chosen_chart(&library::ChartEntry {
+                difficulty: stored,
+                ..entry(header, bga)
+            });
             (c.difficulty, c.bga)
         };
-        assert_eq!(chosen(Some("4"), true), (Some(4), Some(true)));
-        assert_eq!(chosen(Some("+5"), false), (Some(5), Some(false)));
-        for text in [
-            Some("6"),
-            Some("0"),
-            Some("-1"),
-            Some("2a"),
-            Some("４"),
-            None,
-        ] {
-            assert_eq!(chosen(text, false), (Some(0), Some(false)), "{text:?}");
-        }
+        assert_eq!(chosen(4, true), (Some(4), Some(true)));
+        assert_eq!(chosen(5, false), (Some(5), Some(false)));
+        assert_eq!(chosen(0, false), (Some(0), Some(false)));
     }
 
     /// A chosen chart's length is its entry's summary's, the loader's 1×
@@ -4848,6 +4859,7 @@ pub(crate) mod tests {
             rate: 48_000,
             chosen_at: TimeUs(0),
             loading: None,
+            chosen_difficulty: None,
             decision: None,
             practicing: false,
             entered_at: TimeUs(0),
@@ -7821,6 +7833,7 @@ pub(crate) mod tests {
             rate: 48_000,
             chosen_at: TimeUs(0),
             loading: None,
+            chosen_difficulty: None,
             decision: None,
             practicing: false,
             entered_at: TimeUs(0),

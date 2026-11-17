@@ -154,6 +154,7 @@ fn bench_on(coord: Coordinator, dir: &Path, decodes: Decodes, spawner: Spawner) 
         rate: RATE,
         chosen_at: TimeUs(0),
         loading: None,
+        chosen_difficulty: None,
         practicing: false,
         decision: None,
         entered_at: TimeUs(0),
