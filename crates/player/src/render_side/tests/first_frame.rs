@@ -686,13 +686,48 @@ fn the_hold_alloc() {
     link.exit();
 }
 
+/// A hold mark spans its waits (dev-tools): from the first wait's start to
+/// the last one's end, however many there are, and it keeps the first
+/// reason it ended for; a lifetime never held has no mark to end.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_hold_mark_spans_its_waits() {
+    use crate::measure::{HoldEnd, HoldStamp};
+    let frame = |lifetime| super::super::FirstFrame {
+        lifetime,
+        shown_at: TimeUs(1_000),
+        ended: false,
+        hold: None,
+    };
+    let mut held = frame(7);
+    for (from, to) in [(2_000, 6_000), (6_100, 10_100), (10_150, 12_000)] {
+        held.held(TimeUs(from), TimeUs(to));
+    }
+    held.hold_ended(HoldEnd::Bound);
+    held.hold_ended(HoldEnd::Image);
+    assert_eq!(
+        held.hold,
+        Some(HoldStamp {
+            lifetime: 7,
+            from: TimeUs(2_000),
+            to: TimeUs(12_000),
+            ended_by: Some(HoldEnd::Bound),
+        })
+    );
+    let mut unheld = frame(8);
+    unheld.hold_ended(HoldEnd::Skin);
+    assert_eq!(unheld.hold, None);
+}
+
 /// The transition record's hold marks (dev-tools): a held lifetime's hold,
-/// on the render thread's clock, ended by its bound, a real 180 ms from the
-/// showing; and a successor held until its skin, ended by the skin. Each
-/// lifetime gives one mark however many of its frames are drawn, and the
-/// interval into each loading state is covered only by its own hold: the
-/// rest of it is uncovered. The successor's hold runs on the test's time,
-/// so only its skin ends it.
+/// on the render thread's clock, ended by its bound from the showing; and a
+/// successor held until its skin, ended by the skin. Each lifetime gives one
+/// mark however many of its frames are drawn, and the interval into each
+/// loading state is covered only by its own hold: the rest of it is
+/// uncovered. The first hold's end is checked against the test's readings
+/// of the clock, never against a scheduling allowance: its render thread
+/// is stopped before the look that finds the bound passed. The successor's
+/// hold runs on the test's time, so only its skin ends it.
 #[cfg(feature = "dev-tools")]
 #[test]
 fn the_record_marks_each_hold_once() {
@@ -710,14 +745,32 @@ fn the_record_marks_each_hold_once() {
     extent.publish(1_920, 1_080);
     link.follow(&extent);
     show_page(&link);
-    show_held_to_the_bound(&link);
+    // Held on the test's time until the hold is seen, so a render thread
+    // that takes the showing late still finds it running.
+    hold_at(&link, 0);
+    show_held(&link);
     let first = link.loading_lifetime();
+    let (lifetime, shown) = first_shown(&link).unwrap();
+    assert_eq!(lifetime, first);
+    // Two more waits after `looked`: the second begins once the first not
+    // yet counted at the read has ended, so it lies wholly after `looked`.
+    let looked = link.clock.now();
+    let counted = waits(&link);
+    assert!(wait_until(|| waits(&link) >= counted + 2));
+    // The render thread stopped between a held wait and its next look
+    // while the bound from the showing passes on the clock: that look finds
+    // the bound reached, after the mark's last wait.
+    let before_look = &link.shared.frame_gates[0];
+    before_look.hold(true);
+    assert!(wait_until(|| before_look.waiting()));
+    let stopped = link.clock.now();
+    hold_on_the_clock(&link);
+    assert!(wait_until(|| link.clock.now().0 >= shown.0 + BOUND));
+    before_look.hold(false);
     assert!(wait_until(|| link
         .loading_ack()
         .is_some_and(|(l, _)| l == first)));
     let (_, acked) = link.loading_ack().unwrap();
-    let (lifetime, shown) = first_shown(&link).unwrap();
-    assert_eq!(lifetime, first);
     let drawn = stamps(&link).0;
     assert!(wait_until(|| stamps(&link).0 >= drawn + 3));
     link.end_loading().unwrap();
@@ -751,19 +804,18 @@ fn the_record_marks_each_hold_once() {
     };
     assert_eq!(bound.kind, MarkKind::Hold(Some(HoldEnd::Bound)));
     assert_eq!(skin.kind, MarkKind::Hold(Some(HoldEnd::Skin)));
-    // The mark is the render thread's held time: from its first held
-    // iteration, after the showing however late the thread took it, to the
-    // end of its last wait, after which the next look found the bound from
-    // the showing reached and the pending presentation was drawn and
-    // acknowledged. Only that look's start lies between the mark's end and
-    // the bound.
+    // The mark is the render thread's held time, from its first wait, after
+    // the showing, to the end of its last: past the waits after `looked`,
+    // and no later than the stop before the look that ended the hold. Where
+    // the bound lies is `the_hold_is_bounded`'s, on the test's time, and
+    // how waits add up to a mark `a_hold_mark_spans_its_waits`'.
     assert!(
-        shown <= bound.from && bound.from < bound.to && bound.to <= acked,
-        "held between the showing and the acknowledgement: {shown:?} {bound:?} {acked:?}"
+        shown <= bound.from && bound.from < looked,
+        "held from the showing: {shown:?} {bound:?} {looked:?}"
     );
     assert!(
-        bound.to.0 >= shown.0 + BOUND - 30 * MS,
-        "held to the bound from the showing: {shown:?} {bound:?}"
+        looked < bound.to && bound.to <= stopped && stopped <= acked,
+        "held to the last wait: {looked:?} {bound:?} {stopped:?} {acked:?}"
     );
     let into_loading: Vec<_> = records
         .iter()
