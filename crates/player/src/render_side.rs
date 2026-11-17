@@ -1602,6 +1602,10 @@ struct Shared {
     /// whether one holds (tests).
     #[cfg(test)]
     result_frame_hold: [AtomicBool; 2],
+    /// Play frames hold right before they acquire the view while set, and
+    /// whether one holds (tests).
+    #[cfg(test)]
+    play_frame_hold: [AtomicBool; 2],
     /// Each result frame's time and the `screen` timer reading its running
     /// runtime's host read in it, after its visit (tests).
     #[cfg(all(test, feature = "dev-tools"))]
@@ -1742,6 +1746,8 @@ impl Shared {
             result_status: Mutex::new(ResultReport::default()),
             #[cfg(test)]
             result_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
+            #[cfg(test)]
+            play_frame_hold: [AtomicBool::new(false), AtomicBool::new(false)],
             #[cfg(all(test, feature = "dev-tools"))]
             result_runtime_timers: Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -1856,7 +1862,19 @@ impl Shared {
     /// Holds a result frame while a test says so.
     #[cfg(test)]
     fn hold_result_frame(&self) {
-        let [held, waiting] = &self.result_frame_hold;
+        Self::hold_frame(&self.result_frame_hold);
+    }
+
+    /// Holds a play frame before its acquisition while a test says so.
+    #[cfg(test)]
+    fn hold_play_frame(&self) {
+        Self::hold_frame(&self.play_frame_hold);
+    }
+
+    /// Waits while `hold`'s first flag is set, its second set meanwhile.
+    #[cfg(test)]
+    fn hold_frame(hold: &[AtomicBool; 2]) {
+        let [held, waiting] = hold;
         if !held.load(Ordering::SeqCst) {
             return;
         }
@@ -6424,12 +6442,12 @@ impl Run {
             #[cfg(feature = "dev-tools")]
             let mut screen_stamp = None;
             // The frame's one instant: a play frame's chart time and the
-            // turntable's state time and tick are all of it.
-            let frame_at = self.clock.now();
-            // The application's readouts at that instant: the presents of
-            // the last second, the local time and the uptime, the clock
-            // reading 0 at launch.
-            let app = self.app.readouts(frame_at);
+            // turntable's state time and tick are all of it. A play frame
+            // reads it again once it has acquired its view (below). Each
+            // frame that shows them takes the application's readouts at
+            // its instant: the presents of the last second, the local time
+            // and the uptime, the clock reading 0 at launch.
+            let mut frame_at = self.clock.now();
             // Whether a result frame was built with its skin (dev-tools:
             // G3's and G5's ends).
             #[cfg(feature = "dev-tools")]
@@ -6525,6 +6543,9 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     let region = crate::alloc_count::AppRegion::enter();
                     effects.clear();
+                    // A test holds a play frame here, before its acquisition.
+                    #[cfg(test)]
+                    self.shared.hold_play_frame();
                     // One coherent acquisition (design.md "Rendering and
                     // Skins", the note snapshot): the newest view, its
                     // candidate's generation and origin, and that
@@ -6542,6 +6563,14 @@ impl Run {
                         continue;
                     };
                     *skipped = 0;
+                    // The frame's instant, read after its acquisition, and
+                    // its readouts at it: the view was published before it,
+                    // so with no negative input offset the chart time it
+                    // finalized is before the frame's; a negative offset
+                    // may put it up to that offset past (design.md
+                    // "Rendering and Skins", the note snapshot).
+                    frame_at = self.clock.now();
+                    let app = self.app.readouts(frame_at);
                     #[cfg(feature = "dev-tools")]
                     {
                         view_stamp = Some(crate::measure::ViewStamp {
@@ -6676,7 +6705,7 @@ impl Run {
                             update.as_deref(),
                             snapshot.as_ref(),
                             self.turntable.angle(),
-                            app,
+                            self.app.readouts(frame_at),
                         );
                         let drawn = match presented {
                             Some(Presented::Staged { token, .. }) => screen.loading_staged(
@@ -6810,7 +6839,7 @@ impl Run {
                         shown.logic.as_mut(),
                         changed,
                         frame_at,
-                        app,
+                        self.app.readouts(frame_at),
                     );
                     #[cfg(feature = "dev-tools")]
                     {
@@ -6902,6 +6931,7 @@ impl Run {
                     // selection frame's: its timers age on the same clock
                     // reading as its clock and uptime numbers.
                     let now = frame_at;
+                    let app = self.app.readouts(now);
                     if let Some(side) = &mut self.result {
                         side.drain();
                     }
@@ -20022,6 +20052,9 @@ pub(crate) mod tests {
     mod bitmap;
     // Dropped effects and rearms through the acquisition into both skins.
     mod note_snapshot;
+    // A play frame's sample and its view's acquisition (#626).
+    #[cfg(feature = "dev-tools")]
+    mod frame_sample;
     // Lane input through the acquisition into both skins' key beams and
     // key timers.
     mod lane_input;

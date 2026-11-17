@@ -256,10 +256,11 @@ fn a_picture_whose_decoder_could_pass_the_limit_is_refused_before_it_decodes() {
 /// holds the most the picture is read, one byte below it the picture is
 /// refused with no buffer near its size allocated. Decoding (a JPEG: its
 /// envelope beside the native image), converting (a BMP's native image at
-/// its largest beside the RGBA8 copy), downscaling (a small picture's
-/// canvas beside the downscale and its row sums) and the cell (the content
-/// beside the cell). A small picture's canvas beside the picture never
-/// holds the most: the downscale or the cell holds the canvas and more.
+/// its largest beside the RGBA8 copy), placing a small picture on its
+/// canvas (the picture beside the canvas, for a picture larger than the
+/// downscale it is fitted to), downscaling (a small picture's canvas beside
+/// the downscale and its row sums) and the cell (the content beside the
+/// cell).
 // Covers: T08
 #[test]
 fn each_phase_of_a_bga_picture_is_held_to_the_limit_at_its_edge() {
@@ -276,6 +277,9 @@ fn each_phase_of_a_bga_picture_is_held_to_the_limit_at_its_edge() {
         .unwrap();
     rgb(100, 50)
         .save_with_format(d.path().join("small.bmp"), ImageFormat::Bmp)
+        .unwrap();
+    rgb(200, 200)
+        .save_with_format(d.path().join("square.bmp"), ImageFormat::Bmp)
         .unwrap();
     image::RgbaImage::from_pixel(300, 300, image::Rgba([1, 2, 3, 255]))
         .save_with_format(d.path().join("rgba.bmp"), ImageFormat::Bmp)
@@ -294,6 +298,13 @@ fn each_phase_of_a_bga_picture_is_held_to_the_limit_at_its_edge() {
             [64, 48],
             2 * 640 * 480 * 4,
             640 * 480 * 3,
+        ),
+        (
+            "placing on the canvas",
+            "square.bmp",
+            [64, 64],
+            200 * 200 * 4 + 256 * 256 * 4,
+            200 * 200 * 3,
         ),
         (
             "downscaling",
