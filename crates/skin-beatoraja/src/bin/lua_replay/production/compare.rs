@@ -266,6 +266,13 @@ impl<'a> Cx<'a> {
         self.by_key.get(&join(k)).copied()
     }
 
+    /// What an observer occurrence folded to, when production recorded
+    /// one: a `timer` lowered to a constant (design.md "beatoraja Lua
+    /// Skins", observers).
+    fn observer(&self, k: &Key) -> Option<bool> {
+        observer_fold(self.rec(k)?)
+    }
+
     /// Its program callback, when it is compiled.
     fn compiled(&self, k: &Key) -> Option<u16> {
         self.rec(k)
@@ -298,6 +305,146 @@ impl<'a> Cx<'a> {
                 _ => None,
             },
         }
+    }
+}
+
+/// What observer record `o` folded to: a `timer` lowered to `true` or
+/// `false`, which only an observer's record is.
+fn observer_fold(o: &Occurrence) -> Option<bool> {
+    if o.field != "timer" || o.disposition != "lowered" {
+        return None;
+    }
+    match o.lowered.as_ref().map(|l| l.src.as_str()) {
+        Some("true") => Some(true),
+        Some("false") => Some(false),
+        _ => None,
+    }
+}
+
+/// Each frame's `screen` origin on the state clock as docs/stage3.md D3
+/// gives it, worked out from the frames themselves: a loading frame's is
+/// the first frame of its loading lifetime (its run of loading frames); a
+/// play frame's is the first loading frame before the first play frame,
+/// else the first play frame less the skin's loading minimum; a page has
+/// none (production builds nothing there). Two loading phases with no
+/// frame between would read as one lifetime; no script has them.
+fn screen_origins(run: &ProductionRun) -> Vec<Option<i64>> {
+    let first_play = run
+        .frames
+        .iter()
+        .position(|f| matches!(f.kind, FrameKind::Play { .. }));
+    let loading_first = run
+        .frames
+        .iter()
+        .take(first_play.unwrap_or(run.frames.len()))
+        .find(|f| matches!(f.kind, FrameKind::Loading))
+        .map(|f| f.state_us);
+    let play = loading_first.or_else(|| {
+        first_play
+            .and_then(|i| run.frames.get(i))
+            .map(|f| f.state_us - run.loading_min_us)
+    });
+    let mut lifetime = None;
+    let mut out = Vec::with_capacity(run.frames.len());
+    for f in &run.frames {
+        out.push(match f.kind {
+            FrameKind::Loading => Some(*lifetime.get_or_insert(f.state_us)),
+            FrameKind::Page => {
+                lifetime = None;
+                None
+            }
+            FrameKind::Play { .. } => {
+                lifetime = None;
+                play
+            }
+        });
+    }
+    out
+}
+
+/// An observer occurrence's comparison on one frame.
+enum ObsCheck {
+    Agreed,
+    /// Its destination was left by the import before the fold (dropped
+    /// or ignored): attributed, not compared.
+    Left,
+    Found(String),
+}
+
+/// The bucket of an observer occurrence whose destination the import
+/// left.
+const LEFT: &str = "observer on a destination the import left";
+
+/// The first difference of an observer occurrence `occ` from production's
+/// fold `b` on a frame at `state_us`: `ages` its destination's own
+/// elements' sampled ages there, `origin` the frame's `screen` origin
+/// (`None` on a page, where production builds nothing and only the
+/// reference is checked), `first` the play state's first frame. The
+/// source's observer starts at the first frame its destination is
+/// prepared, which for a folded true one is the first; production draws
+/// it on `screen`, so each element's age must be the frame's time less
+/// the origin, `first − origin` more than the reference's age. `Ok` that
+/// difference when the ages were compared.
+fn observer_differs(
+    b: bool,
+    occ: &Occ,
+    ages: &[Option<i64>],
+    (state_us, origin, first): (i64, Option<i64>, i64),
+) -> Result<Option<i64>, String> {
+    let outcome = match occ.first {
+        Point::NotReached {
+            why: why @ (Cause::Inconclusive | Cause::Unavailable),
+            ..
+        } => return Err(format!("observer: reference could not decide ({why:?})")),
+        Point::NotReached { why, .. } if b => {
+            return Err(format!(
+                "observer: production true, the source does not reach it ({why:?})"
+            ));
+        }
+        Point::NotReached { .. } => return Ok(None),
+        Point::Ran { outcome, .. } => outcome,
+    };
+    match outcome {
+        Outcome::Value(_) => {}
+        Outcome::Unanswered(a) => {
+            return Err(format!("observer: reference could not complete ({a})"));
+        }
+        Outcome::Budget => return Err("observer: reference could not complete (budget)".into()),
+        Outcome::Error | Outcome::Unavailable => {
+            return Err(format!("observer: reference {outcome:?}"));
+        }
+    }
+    let Some(t) = occ.summary else {
+        return Err("observer: no summary".into());
+    };
+    if t.on != b {
+        return Err(format!("observer: production {b}, reference {}", t.on));
+    }
+    if !b {
+        return Ok(None);
+    }
+    if t.start != Some(first) {
+        return Err(format!(
+            "observer start: reference {:?}, expected {first} (the play state's first frame)",
+            t.start
+        ));
+    }
+    let Some(origin) = origin else {
+        return Ok(None);
+    };
+    let want = state_us - origin;
+    match t.shown {
+        None => Err("observer: the selected source's fact is unknown: sampling undecided".into()),
+        Some(false) if ages.iter().any(Option::is_some) => Err(format!(
+            "observer: sampled {ages:?} where the source draws nothing"
+        )),
+        Some(false) => Ok(None),
+        Some(true) if ages.is_empty() => Err("observer: its destination has no element".into()),
+        Some(true) if ages.iter().any(|&a| a != Some(want)) => Err(format!(
+            "observer age: production {ages:?}, expected {want} (reference {}, D3 origin {origin})",
+            state_us - first
+        )),
+        Some(true) => Ok(Some(first - origin)),
     }
 }
 
@@ -643,6 +790,7 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
     // located finding for the run, its frames not reported again; a
     // lowered one is counted until e-3.
     let mut listed_k: BTreeSet<u16> = BTreeSet::new();
+    let mut listed_observers: BTreeSet<Join> = BTreeSet::new();
     for (label, list) in [
         ("unmodelled", &obs.unmodelled),
         ("unresolved", &obs.unresolved),
@@ -660,6 +808,14 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                             format!("compiled on a {label} object ({})", l.what),
                         );
                     }
+                    Some("lowered") if cx.observer(key).is_some() => {
+                        listed_observers.insert(join(key));
+                        find(
+                            *key,
+                            0,
+                            format!("observer on a {label} object, not compared ({})", l.what),
+                        );
+                    }
                     Some("lowered") => {
                         *rep.buckets
                             .entry(format!("lowered on a {label} object (e-3)"))
@@ -672,6 +828,83 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
     }
     let mut stopped: BTreeMap<(&'static str, u32), (&'static str, usize, Key)> = BTreeMap::new();
     let mut lowered: BTreeMap<Join, Result<LoweredExpr, String>> = BTreeMap::new();
+    let origins = screen_origins(run);
+    let first_us = run.frames.first().map_or(0, |f| f.state_us);
+    // Each observer occurrence's points, to find one never compared.
+    let mut observer_points: BTreeMap<Join, usize> = BTreeMap::new();
+    let mut observers_agreed: BTreeMap<(&'static str, bool), usize> = BTreeMap::new();
+    let mut observer_offsets: BTreeMap<i64, usize> = BTreeMap::new();
+    // An observer occurrence on frame `i` of kind `label`: recognized on
+    // both sides, its destination what its fold makes it, then compared
+    // ([`observer_differs`]). `None` when it is no observer's.
+    let mut observer = |key: Key, occ: &Occ, i: usize, label: &'static str| -> Option<ObsCheck> {
+        let held = obs.observers.contains(&key.callable);
+        let Some(b) = cx.observer(&key) else {
+            return held.then(|| match cx.rec(&key) {
+                // No record: the bucket only for a destination the import
+                // left before the fold; any other is a record missing.
+                None => match run.recorded.destinations.get(key.dest).map(|e| e.became) {
+                    Some(Became::Dropped | Became::Ignored) => ObsCheck::Left,
+                    Some(became) => ObsCheck::Found(format!(
+                        "observer: no production record, its destination {became:?}"
+                    )),
+                    None => ObsCheck::Found(
+                        "observer: no production record, nor its destination's".into(),
+                    ),
+                },
+                Some(o) => ObsCheck::Found(format!(
+                    "observer: production record {}, the reference holds an observer",
+                    o.disposition
+                )),
+            });
+        };
+        if !held {
+            return Some(ObsCheck::Found(format!(
+                "observer: production folds {b}, the reference holds no observer"
+            )));
+        }
+        let entry = run.recorded.destinations.get(key.dest);
+        let elements = match (b, entry.map(|e| e.became)) {
+            (false, Some(Became::Folded)) | (true, Some(Became::Retained)) => {
+                entry.map(|e| e.elements.clone()).unwrap_or_default()
+            }
+            (true, Some(Became::Dropped | Became::Ignored)) => return Some(ObsCheck::Left),
+            (_, Some(became)) => {
+                return Some(ObsCheck::Found(format!(
+                    "observer: a {b} fold whose destination became {became:?}"
+                )));
+            }
+            (_, None) => {
+                return Some(ObsCheck::Found(format!(
+                    "observer: a {b} fold with no destination record"
+                )));
+            }
+        };
+        *observer_points.entry(join(&key)).or_default() += 1;
+        let pf = run.frames.get(i)?;
+        let ages: Vec<Option<i64>> = elements
+            .filter_map(|e| u32::try_from(e).ok())
+            .map(|e| {
+                pf.element_timer_ages
+                    .iter()
+                    .find(|(el, _)| *el == e)
+                    .and_then(|(_, t)| *t)
+            })
+            .collect();
+        let origin = origins.get(i).copied().flatten();
+        Some(
+            match observer_differs(b, occ, &ages, (pf.state_us, origin, first_us)) {
+                Ok(d) => {
+                    *observers_agreed.entry((label, b)).or_default() += 1;
+                    if let Some(d) = d {
+                        *observer_offsets.entry(d).or_default() += 1;
+                    }
+                    ObsCheck::Agreed
+                }
+                Err(what) => ObsCheck::Found(what),
+            },
+        )
+    };
     for (i, (pf, rf)) in run.frames.iter().zip(&obs.frames).enumerate() {
         let label = pf.kind.label();
         rep.kinds.entry(label).or_default().0 += 1;
@@ -713,6 +946,18 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 for occ in cat.iter().flatten() {
                     let key = occ.key;
                     rep.points += 1;
+                    match observer(key, occ, i, label) {
+                        None => {}
+                        Some(ObsCheck::Agreed) => continue,
+                        Some(ObsCheck::Left) => {
+                            *rep.buckets.entry(LEFT.into()).or_default() += 1;
+                            continue;
+                        }
+                        Some(ObsCheck::Found(what)) => {
+                            find(key, i, what);
+                            continue;
+                        }
+                    }
                     let Point::Ran { outcome, .. } = occ.first else {
                         continue;
                     };
@@ -780,6 +1025,22 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 };
                 // Points: the invocation, or the one not reached.
                 rep.points += 1;
+                match observer(key, occ, i, label) {
+                    None => {}
+                    Some(ObsCheck::Agreed) => {
+                        rep.matched += 1;
+                        rep.agreed += 1;
+                        continue;
+                    }
+                    Some(ObsCheck::Left) => {
+                        *rep.buckets.entry(LEFT.into()).or_default() += 1;
+                        continue;
+                    }
+                    Some(ObsCheck::Found(what)) => {
+                        find(key, i, what);
+                        continue;
+                    }
+                }
                 let lowered_rec = cx
                     .rec(&key)
                     .filter(|o| k.is_none() && o.disposition == "lowered");
@@ -1027,6 +1288,28 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
             rep.first_agreed.push(agreed);
         }
     }
+    // An observer production folded that no frame compared.
+    for (j, o) in &cx.by_key {
+        if observer_fold(o).is_some()
+            && !listed_observers.contains(j)
+            && !observer_points.contains_key(j)
+            && matches!(
+                run.recorded.destinations.get(j.0).map(|e| e.became),
+                Some(Became::Retained | Became::Folded)
+            )
+        {
+            let key = Key {
+                dest: j.0,
+                field: j.1,
+                index: j.2,
+                callable: j.3,
+                path: j.4,
+            };
+            find(key, 0, "observer: never compared".into());
+        }
+    }
+    rep.observers = observers_agreed;
+    rep.observer_offsets = observer_offsets;
     // Stopped roots and their isolation entries, by the kind of frame
     // they stopped on: an entry covering a root's outside stops leaves its
     // play stops to e-1's rule.
@@ -1778,6 +2061,278 @@ mod tests {
         found("frame kind", &|_, obs| {
             obs.frames[0].outside = false;
         });
+    }
+
+    /// The observer comparison's rules, each broken on one side, are found
+    /// by their own message (design.md "beatoraja Lua Skins", the
+    /// reference executor): over a practice session with a true observer
+    /// (destination 0), a false one (1) and an untimed image (2).
+    #[test]
+    #[expect(clippy::too_many_lines, reason = "one case per rule, each a few lines")]
+    fn observer_mutations_are_found() {
+        use super::LEFT;
+        use crate::observed::{Cause, Listed, Observed, Outcome};
+        use crate::production::{FrameKind, ProductionRun};
+        use crate::report::Finding;
+        use crate::script::Script;
+        use crate::tests::pieces_over;
+        use skin_beatoraja::lua::survey::Became;
+        const STEP: i64 = 4_167;
+        let body = crate::observer_tests::twins();
+        let (run, obs) = pieces_over(&body, Script::rounds());
+        let r = compare(&run, &obs, &[]);
+        assert!(r.passes(), "{}", r.text(0, true, true));
+        // The findings `f` gives whose text holds `what`.
+        let found = |what: &str, f: &dyn Fn(&mut ProductionRun, &mut Observed)| -> Vec<Finding> {
+            let (mut run, mut obs) = pieces_over(&body, Script::rounds());
+            f(&mut run, &mut obs);
+            let r = compare(&run, &obs, &[]);
+            let hits: Vec<Finding> = r
+                .findings
+                .iter()
+                .filter(|x| x.what.contains(what))
+                .cloned()
+                .collect();
+            assert!(!hits.is_empty(), "{what}: {}", r.text(0, true, true));
+            hits
+        };
+        // Destination `d`'s own elements.
+        let elements = |run: &ProductionRun, d: usize| -> Vec<u32> {
+            run.recorded.destinations[d]
+                .elements
+                .clone()
+                .map(|e| u32::try_from(e).unwrap())
+                .collect()
+        };
+        // Destination 0's timer ages shifted by STEP on the frames `on` picks.
+        let shift = |run: &mut ProductionRun, on: &dyn Fn(usize, &ProductionRun) -> bool| {
+            let els = elements(run, 0);
+            let pick: Vec<bool> = (0..run.frames.len()).map(|i| on(i, run)).collect();
+            for (f, p) in run.frames.iter_mut().zip(pick) {
+                if p {
+                    for (e, t) in &mut f.element_timer_ages {
+                        if els.contains(e) {
+                            *t = t.map(|v| v + STEP);
+                        }
+                    }
+                }
+            }
+        };
+        // `edit` on the observer timers of destination `d` from frame
+        // `from`, the first `n` of them.
+        let timers = |obs: &mut Observed,
+                      (d, from, n): (usize, usize, usize),
+                      edit: &dyn Fn(&mut crate::observed::TimerOut)| {
+            obs.frames
+                .iter_mut()
+                .skip(from)
+                .flat_map(|f| f.timers.iter_mut())
+                .filter(|t| t.key.dest == d)
+                .take(n)
+                .for_each(edit);
+        };
+        let round_end = |run: &ProductionRun, round: usize| {
+            run.frames
+                .iter()
+                .rposition(|f| matches!(f.kind, FrameKind::Play { round: r, .. } if r == round))
+                .unwrap()
+        };
+        // (a) production's ages a frame later from round 1's READY: the
+        // first finding is there.
+        let hits = found("observer age", &|run, _| {
+            let from = ready_of(run, 0);
+            shift(run, &|i, _| i >= from);
+        });
+        let (run0, _) = pieces_over(&body, Script::rounds());
+        assert_eq!(hits.iter().map(|h| h.frame).min(), Some(ready_of(&run0, 0)));
+        // (b) on round 2 only.
+        found("observer age", &|run, _| {
+            let (from, to) = (ready_of(run, 1), round_end(run, 1));
+            shift(run, &|i, _| (from..=to).contains(&i));
+        });
+        // (c) on every frame: a uniform shift of one side.
+        found("observer age", &|run, _| shift(run, &|_, _| true));
+        // (d) on loading frames only.
+        found("observer age", &|run, _| {
+            shift(run, &|i, run| {
+                matches!(run.frames[i].kind, FrameKind::Loading)
+            });
+        });
+        // (e) the reference's start later from round 2.
+        found("observer start", &|run, obs| {
+            timers(obs, (0, ready_of(run, 1), usize::MAX), &|t| {
+                t.start = t.start.map(|s| s + STEP);
+            });
+        });
+        // (f) the start restarted at round 2's first frame (no carry).
+        found("observer start", &|run, obs| {
+            let i = ready_of(run, 1);
+            let s = run.frames[i].state_us;
+            timers(obs, (0, i, usize::MAX), &|t| t.start = Some(s));
+        });
+        // (g) the false observer on in the reference.
+        found("observer: production false, reference true", &|_, obs| {
+            timers(obs, (1, 0, usize::MAX), &|t| t.on = true);
+        });
+        // (h) the start changed on one page frame.
+        found("observer start", &|run, obs| {
+            let i = run
+                .frames
+                .iter()
+                .position(|f| matches!(f.kind, FrameKind::Page))
+                .unwrap();
+            timers(obs, (0, i, 1), &|t| t.start = t.start.map(|s| s + STEP));
+        });
+        // (i) the reference unable to answer on a loading frame: a
+        // finding, not a stopped root.
+        {
+            let (run, mut obs) = pieces_over(&body, Script::rounds());
+            let p = obs.frames[0]
+                .points
+                .iter_mut()
+                .find(|p| matches!(p, Point::Ran { key, .. } if key.dest == 0))
+                .unwrap();
+            let Point::Ran { outcome, .. } = p else {
+                unreachable!()
+            };
+            *outcome = Outcome::Unanswered("x");
+            let r = compare(&run, &obs, &[]);
+            assert!(
+                r.findings
+                    .iter()
+                    .any(|f| f.frame == 0 && f.what == "observer: reference could not complete (x)"),
+                "{}",
+                r.text(0, true, true)
+            );
+            assert!(r.stopped.is_empty(), "{:?}", r.stopped);
+        }
+        // (i') the reference unable to decide whether the timer is read.
+        found(
+            "observer: reference could not decide (Inconclusive)",
+            &|_, obs| {
+                let p = obs.frames[0]
+                    .points
+                    .iter_mut()
+                    .find(|p| matches!(p, Point::Ran { key, .. } if key.dest == 0))
+                    .unwrap();
+                let Point::Ran { key, .. } = *p else {
+                    unreachable!()
+                };
+                *p = Point::NotReached {
+                    key,
+                    why: Cause::Inconclusive,
+                };
+            },
+        );
+        // (j) the false observer's destination kept.
+        found(
+            "observer: a false fold whose destination became Retained",
+            &|run, _| {
+                run.recorded.destinations[1].became = Became::Retained;
+            },
+        );
+        // (k) production's record of the false observer folded to true;
+        // alone, its folded destination is the finding; with the
+        // destination kept, the fold against the reference's off.
+        found(
+            "observer: a true fold whose destination became Folded",
+            &|run, _| {
+                for o in &mut run.recorded.occurrences {
+                    if o.destination == Some(1)
+                        && let Some(l) = o.lowered.as_mut()
+                    {
+                        l.src = "true".to_owned();
+                    }
+                }
+            },
+        );
+        found("observer: production true, reference false", &|run, _| {
+            run.recorded.destinations[1].became = Became::Retained;
+            for o in &mut run.recorded.occurrences {
+                if o.destination == Some(1)
+                    && let Some(l) = o.lowered.as_mut()
+                {
+                    l.src = "true".to_owned();
+                }
+            }
+        });
+        // (l) the reference holding no observer.
+        found("the reference holds no observer", &|_, obs| {
+            obs.observers.clear()
+        });
+        // (m) element-tied: the observer's own element's timer age not
+        // recorded while the untimed image's stays.
+        found("observer age", &|run, _| {
+            let els = elements(run, 0);
+            for f in &mut run.frames {
+                f.element_timer_ages.retain(|(e, _)| !els.contains(e));
+            }
+        });
+        // (n) an observer on an object the reference does not model: one
+        // located finding, not compared.
+        found(
+            "observer on a unmodelled object, not compared (x)",
+            &|_, obs| {
+                let key = obs.frames[0]
+                    .timers
+                    .iter()
+                    .find(|t| t.key.dest == 0)
+                    .unwrap()
+                    .key;
+                obs.unmodelled.push(Listed {
+                    dest: 0,
+                    what: "x".into(),
+                    callables: vec![key],
+                });
+            },
+        );
+        // (o) a true observer on a destination the import dropped: the
+        // bucket, no finding.
+        {
+            let (mut run, obs) = pieces_over(&body, Script::rounds());
+            run.recorded.destinations[0].became = Became::Dropped;
+            let r = compare(&run, &obs, &[]);
+            assert!(
+                r.buckets.get(LEFT).copied().unwrap_or(0) > 0,
+                "{}",
+                r.text(0, true, true)
+            );
+            assert!(
+                r.findings.iter().all(|f| !f.what.starts_with("observer")),
+                "{}",
+                r.text(0, true, true)
+            );
+        }
+        // (p) the true observer's record missing while its destination is
+        // kept: a finding, not the bucket; (q) missing with its destination
+        // dropped: the bucket, no finding.
+        let unrecorded = |run: &mut ProductionRun| {
+            run.recorded
+                .occurrences
+                .retain(|o| !(o.destination == Some(0) && o.field == "timer"));
+        };
+        found(
+            "observer: no production record, its destination Retained",
+            &|run, _| {
+                unrecorded(run);
+            },
+        );
+        {
+            let (mut run, obs) = pieces_over(&body, Script::rounds());
+            unrecorded(&mut run);
+            run.recorded.destinations[0].became = Became::Dropped;
+            let r = compare(&run, &obs, &[]);
+            assert!(
+                r.buckets.get(LEFT).copied().unwrap_or(0) > 0,
+                "{}",
+                r.text(0, true, true)
+            );
+            assert!(
+                r.findings.iter().all(|f| !f.what.starts_with("observer")),
+                "{}",
+                r.text(0, true, true)
+            );
+        }
     }
 
     /// The probe of the score tests: Rm's `getDummyNumber` shape, the EX
