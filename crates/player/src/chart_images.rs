@@ -1227,7 +1227,8 @@ impl ChartImageWorker {
 
     /// The value the update about to be sent carries for the cursor's row
     /// (design.md "Rendering and Skins", chart images): resident in its
-    /// slot, absent, or pending without an entry. Called only for an
+    /// slot, absent, or pending without an entry (a chart naming no image
+    /// is absent without one). Called only for an
     /// update sent: it pins the slot it names and makes it, and the
     /// entry, the most recently used. A use of the entry (another row or
     /// read than the last update's, a selection entry, or a list
@@ -1244,6 +1245,11 @@ impl ChartImageWorker {
             .map(|e| (e.version, e.state));
         let chart = match (&row, entry) {
             (None, _) => CursorChart::Absent,
+            // A chart naming no image is absent at once: its entry, made
+            // at its rest with no job, changes nothing drawn.
+            (Some(r), None) if r.names.iter().all(|n| *n == library::Name::None) => {
+                CursorChart::Absent
+            }
             (Some(_), None) => CursorChart::Pending,
             (Some(_), Some((_, pool::EntryState::Absent))) => CursorChart::Absent,
             (Some(_), Some((_, pool::EntryState::Resident { generation, slot }))) => {

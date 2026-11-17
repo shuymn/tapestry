@@ -220,7 +220,8 @@ fn a_move_before_the_rest_makes_no_request() {
 }
 
 /// A row that is no chart asks for nothing and is absent; a chart naming
-/// no image is an absent entry with no job.
+/// no image is absent at once and an absent entry at its rest, with no
+/// job.
 #[test]
 fn a_row_with_no_chart_asks_for_nothing() {
     let _serial = crate::imports::tests::serial();
@@ -234,7 +235,7 @@ fn a_row_with_no_chart_asks_for_nothing() {
     assert!(!s.rest(1_000));
     keys(&mut s.sel, &[MenuKey::Down]);
     s.show(1_000);
-    assert_eq!(s.w.sent_chart(), Some(CursorChart::Pending));
+    assert_eq!(s.w.sent_chart(), Some(CursorChart::Absent));
     assert!(s.rest(1_150));
     assert_eq!(s.read(), EntryState::Absent);
     assert_eq!(s.w.begun(), 0);

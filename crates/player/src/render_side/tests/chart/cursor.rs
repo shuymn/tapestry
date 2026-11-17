@@ -366,15 +366,20 @@ fn a_read_done_before_a_move_is_never_adopted_after_it() {
     assert!(c.w.slot_states().iter().all(|s| *s == SlotState::Free));
 }
 
-/// A chart naming no image is an absent entry at once, with no job and no
-/// slot; so is a row whose images are both missing, read but taking no
-/// slot, and an update names it absent.
+/// A chart naming no image is absent at once, before its rest, and an
+/// absent entry at its rest, with no job and no slot; so is a row whose
+/// images are both missing, read but taking no slot, and an update names
+/// it absent.
 #[test]
 fn an_absent_row_takes_no_slot() {
     let _serial = crate::imports::tests::serial();
     let c = cursor();
     let d = tempfile::tempdir().unwrap();
-    c.rest_on(d.path(), [Name::None, Name::None]);
+    assert_eq!(
+        c.on(d.path(), [Name::None, Name::None]),
+        CursorChart::Absent
+    );
+    c.rest(d.path(), [Name::None, Name::None]);
     c.step();
     assert_eq!(c.w.begun(), 0);
     assert_eq!(
