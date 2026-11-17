@@ -780,17 +780,16 @@ pub enum BgaStretch {
     Whole(ChartStretch),
     /// A stretch that crops it, at each frame.
     Crop(Crop),
-    /// None given: the player's BGA expansion.
-    Expand,
 }
 
 impl BgaStretch {
     /// The stretch of a destination's `stretch` mode
-    /// (`skin/StretchType.java` at `0.8.9`): a negative or unknown mode
-    /// is none.
+    /// (`skin/StretchType.java` at `0.8.9`); `None` for a negative or
+    /// unknown mode, which sets none (`skin/SkinObject.java:318-326`), so
+    /// the importer settles it from the BGA setting's expansion.
     #[must_use]
-    pub const fn of(mode: i32) -> Self {
-        match mode {
+    pub const fn of(mode: i32) -> Option<Self> {
+        Some(match mode {
             0 => Self::Whole(ChartStretch::Fill),
             1 => Self::Whole(ChartStretch::Inner),
             2 => Self::Whole(ChartStretch::Outer),
@@ -802,13 +801,9 @@ impl BgaStretch {
             8 => Self::Whole(ChartStretch::NoExpanding),
             9 => Self::Whole(ChartStretch::NoResize),
             10 => Self::Crop(Crop::NoResize),
-            _ => Self::Expand,
-        }
+            _ => return None,
+        })
     }
-
-    /// The player's BGA expansion: the picture's aspect inside the
-    /// destination, until the BGA setting gives another.
-    pub const EXPAND: ChartStretch = ChartStretch::Inner;
 
     /// The destination `rect` (canvas pixels) of a picture of `native`
     /// texels whose content is `uv`, at `scale` target pixels per canvas
@@ -827,10 +822,6 @@ impl BgaStretch {
         let crop = match self {
             Self::Whole(s) => {
                 let (r, n) = s.place(rect, native);
-                return (r, uv, n);
-            }
-            Self::Expand => {
-                let (r, n) = Self::EXPAND.place(rect, native);
                 return (r, uv, n);
             }
             Self::Crop(c) => c,
@@ -909,7 +900,8 @@ mod tests {
     fn stretch_3_crops_the_overflowing_axis_about_the_centre() {
         // A 200×100 picture in a 100×100 rect: height fits, width crops
         // to its middle half.
-        let (r, f, n) = BgaStretch::of(3).place([10.0, 20.0, 100.0, 100.0], [200, 100], uv(), 1.0);
+        let (r, f, n) =
+            BgaStretch::Crop(Crop::Outer).place([10.0, 20.0, 100.0, 100.0], [200, 100], uv(), 1.0);
         assert_eq!(r, [10.0, 20.0, 100.0, 100.0]);
         assert_eq!(f.uv, [0.25, 0.0, 0.75, 1.0]);
         assert_eq!(f.layer, 3);
@@ -918,24 +910,33 @@ mod tests {
 
     #[test]
     fn stretch_5_centres_a_short_picture_and_crops_a_tall_one() {
-        let (r, f, _) = BgaStretch::of(5).place([0.0, 0.0, 100.0, 100.0], [100, 50], uv(), 1.0);
+        let (r, f, _) =
+            BgaStretch::Crop(Crop::FitWidth).place([0.0, 0.0, 100.0, 100.0], [100, 50], uv(), 1.0);
         assert_eq!(r, [0.0, 25.0, 100.0, 50.0]);
         assert_eq!(f.uv, [0.0, 0.0, 1.0, 1.0]);
-        let (r, f, _) = BgaStretch::of(5).place([0.0, 0.0, 100.0, 100.0], [100, 400], uv(), 1.0);
+        let (r, f, _) =
+            BgaStretch::Crop(Crop::FitWidth).place([0.0, 0.0, 100.0, 100.0], [100, 400], uv(), 1.0);
         assert_eq!(r, [0.0, 0.0, 100.0, 100.0]);
         assert_eq!(f.uv, [0.0, 0.375, 1.0, 0.625]);
     }
 
     #[test]
     fn stretch_10_keeps_the_native_size_and_crops_past_the_rect() {
-        let (r, f, _) = BgaStretch::of(10).place([0.0, 0.0, 100.0, 100.0], [50, 400], uv(), 1.0);
+        let (r, f, _) =
+            BgaStretch::Crop(Crop::NoResize).place([0.0, 0.0, 100.0, 100.0], [50, 400], uv(), 1.0);
         assert_eq!(r, [25.0, 0.0, 50.0, 100.0]);
         assert_eq!(f.uv, [0.0, 0.375, 1.0, 0.625]);
     }
 
     #[test]
-    fn unset_and_unknown_modes_take_the_expansion() {
-        assert_eq!(BgaStretch::of(-1), BgaStretch::Expand);
-        assert_eq!(BgaStretch::of(11), BgaStretch::Expand);
+    fn unset_and_unknown_modes_are_none() {
+        assert_eq!(BgaStretch::of(-1), None);
+        assert_eq!(BgaStretch::of(11), None);
+        assert_eq!(
+            BgaStretch::of(0),
+            Some(BgaStretch::Whole(ChartStretch::Fill))
+        );
+        assert_eq!(BgaStretch::of(3), Some(BgaStretch::Crop(Crop::Outer)));
+        assert_eq!(BgaStretch::of(10), Some(BgaStretch::Crop(Crop::NoResize)));
     }
 }

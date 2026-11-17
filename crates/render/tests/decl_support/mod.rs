@@ -480,7 +480,9 @@ fn skin_of(sheet: Sheet, look: &Look) -> Skin {
     if look.bga {
         elements.push(ElementDef {
             source: Source::Bga {
-                stretch: skin_model::bga::BgaStretch::of(0),
+                stretch: skin_model::bga::BgaStretch::Whole(
+                    skin_model::chart_image::ChartStretch::Fill,
+                ),
             },
             timer: TimerRef::Builtin(skin_model::timer::SCREEN),
             ..image(BGA_RECT, false)

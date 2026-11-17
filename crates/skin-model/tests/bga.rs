@@ -15,9 +15,11 @@ use std::sync::Arc;
 
 use bms_model::{BgaEvent, BgaImage, BgaImageId, ChartBga, PoorSequence, TimeUs};
 use rules::Judgment;
-use skin_model::bga::{BgaCell, BgaEntry, BgaKey, BgaStretch, BgaTable, SOLID};
+use skin_model::bga::{BgaCell, BgaEntry, BgaKey, BgaStretch, BgaTable, Crop, SOLID};
+use skin_model::chart_image::ChartStretch;
 use skin_model::{
-    ElementDef, Filter, FrameUv, Place, Quad, ScreenKind, Skin, Source, TimerRef, timer,
+    ElementDef, Filter, FrameUv, Place, PlayContext, Quad, ScreenKind, Skin, Source, TimerRef,
+    timer,
 };
 
 use lanes_support::rect;
@@ -71,11 +73,11 @@ fn bga() -> ChartBga {
     .unwrap()
 }
 
-fn bga_element(stretch: i32) -> ElementDef {
+const FILL: BgaStretch = BgaStretch::Whole(ChartStretch::Fill);
+
+fn bga_element(stretch: BgaStretch) -> ElementDef {
     ElementDef {
-        source: Source::Bga {
-            stretch: BgaStretch::of(stretch),
-        },
+        source: Source::Bga { stretch },
         track: rect(DST),
         timer: TimerRef::Builtin(timer::SCREEN),
         visible: None,
@@ -85,7 +87,7 @@ fn bga_element(stretch: i32) -> ElementDef {
     }
 }
 
-fn skin(stretch: i32) -> Skin {
+fn skin(stretch: BgaStretch) -> Skin {
     load(Vec::new(), vec![bga_element(stretch)]).unwrap()
 }
 
@@ -94,7 +96,7 @@ fn table() -> BgaTable {
     BgaTable::new((0..5).map(|i| cell(i, [256, 256])).collect()).keyed(KEY)
 }
 
-fn harness(stretch: i32, table: BgaTable) -> Harness {
+fn harness(stretch: BgaStretch, table: BgaTable) -> Harness {
     let mut c = chart();
     c.bga = Some(bga());
     let mut h = Harness::new(skin(stretch), &c, &full(1_000));
@@ -129,7 +131,7 @@ const fn layer(i: u16) -> (Option<u16>, Filter) {
 
 #[test]
 fn base_image_follows_chart_time() {
-    let mut h = harness(0, table());
+    let mut h = harness(FILL, table());
     // A display offset far ahead: the BGA keeps to chart time.
     h.offset = TimeUs(1_500 * MS);
     let mut at = |ms: i64| {
@@ -150,14 +152,14 @@ fn base_image_follows_chart_time() {
 
 #[test]
 fn a_table_not_drawable_or_a_chart_without_bga_shows_the_placeholder() {
-    let mut h = harness(0, table());
+    let mut h = harness(FILL, table());
     h.play.set_bga_live(Some(BgaKey {
         renderer: 1,
         array: 8,
     }));
     h.frame(600, &[]);
     assert_eq!(drawn(h.batch.quads()), [PLACEHOLDER]);
-    let mut none = Harness::new(skin(0), &chart(), &full(1_000));
+    let mut none = Harness::new(skin(FILL), &chart(), &full(1_000));
     none.play.set_bga_images(Arc::new(table()));
     none.play.set_bga_live(Some(KEY));
     none.frame(600, &[]);
@@ -176,21 +178,21 @@ fn an_unpublished_or_stale_table_shows_the_placeholder_in_a_poor_window() {
         );
         drawn(h.batch.quads())
     };
-    let mut drawable = harness(0, table());
+    let mut drawable = harness(FILL, table());
     assert_eq!(miss(&mut drawable), [base(3)]);
-    let mut stale = harness(0, table());
+    let mut stale = harness(FILL, table());
     stale.play.set_bga_live(Some(BgaKey {
         renderer: 1,
         array: 8,
     }));
     assert_eq!(miss(&mut stale), [PLACEHOLDER], "stale");
     // A lost device: no live array, the published table keyed to one.
-    let mut lost = harness(0, table());
+    let mut lost = harness(FILL, table());
     lost.play.set_bga_live(None);
     assert_eq!(miss(&mut lost), [PLACEHOLDER], "no live array");
-    let mut unpublished = harness(0, BgaTable::ABSENT);
+    let mut unpublished = harness(FILL, BgaTable::ABSENT);
     assert_eq!(miss(&mut unpublished), [PLACEHOLDER], "unpublished");
-    let mut none = harness(0, BgaTable::new(vec![BgaEntry::Absent; 5]));
+    let mut none = harness(FILL, BgaTable::new(vec![BgaEntry::Absent; 5]));
     none.play.set_bga_live(None);
     none.frame(600, &[]);
     assert_eq!(drawn(none.batch.quads()), [PLACEHOLDER], "base absent");
@@ -199,7 +201,7 @@ fn an_unpublished_or_stale_table_shows_the_placeholder_in_a_poor_window() {
 
 #[test]
 fn poor_replaces_base_and_layer_for_500ms_after_a_combo_break() {
-    let mut h = harness(0, table());
+    let mut h = harness(FILL, table());
     // A miss before the first poor sequence: base and layer keep drawing.
     h.frame(
         2_500,
@@ -245,7 +247,7 @@ fn absent_pictures_draw_per_channel_in_the_model() {
     entries[0] = BgaEntry::Absent;
     entries[2] = BgaEntry::Absent;
     entries[3] = BgaEntry::Video;
-    let mut h = harness(0, BgaTable::new(entries).keyed(KEY));
+    let mut h = harness(FILL, BgaTable::new(entries).keyed(KEY));
     h.frame(600, &[]);
     assert_eq!(drawn(h.batch.quads()), [PLACEHOLDER]);
     h.frame(
@@ -261,7 +263,10 @@ fn trimmed_stretch_3_crops_at_frame_time() {
     // fills it, the width is cropped to its middle half.
     let mut entries: Vec<BgaEntry> = (0..5).map(|i| cell(i, [256, 256])).collect();
     entries[0] = cell(0, [512, 256]);
-    let mut h = harness(3, BgaTable::new(entries).keyed(KEY));
+    let mut h = harness(
+        BgaStretch::Crop(Crop::Outer),
+        BgaTable::new(entries).keyed(KEY),
+    );
     h.frame(100, &[]);
     let q = h.batch.quads()[0];
     assert_eq!(q.rect, [100.0, 100.0, 512.0, 512.0]);
@@ -273,13 +278,43 @@ fn trimmed_stretch_3_crops_at_frame_time() {
     assert_eq!(q.uv, [0.0625, 0.0, 0.125, 0.0625]);
 }
 
+/// A play whose session does not show the BGA draws the placeholder for
+/// every frame, the base's, the layer's and a poor window's, where the
+/// same play shown draws them.
 #[test]
-fn an_unset_stretch_keeps_the_aspect_inside() {
-    let mut entries: Vec<BgaEntry> = (0..5).map(|i| cell(i, [256, 256])).collect();
-    entries[0] = cell(0, [512, 256]);
-    let mut h = harness(-1, BgaTable::new(entries).keyed(KEY));
-    h.frame(100, &[]);
-    assert_eq!(h.batch.quads()[0].rect, [100.0, 228.0, 512.0, 256.0]);
+fn a_play_not_showing_the_bga_draws_the_placeholder_throughout() {
+    let run = |shown: bool| {
+        let mut c = chart();
+        c.bga = Some(bga());
+        let ctx = PlayContext {
+            bga_shown: shown,
+            ..full(1_000)
+        };
+        let mut h = Harness::new(skin(FILL), &c, &ctx);
+        h.play.set_bga_images(Arc::new(table()));
+        h.play.set_bga_live(Some(KEY));
+        let mut at = Vec::new();
+        for ms in [0, 600, 1_000] {
+            h.frame(ms, &[]);
+            at.push(drawn(h.batch.quads()));
+        }
+        h.frame(
+            3_200,
+            &[ev(3_200, judged(1, 0, Judgment::Bad, Some(90), None, 0))],
+        );
+        at.push(drawn(h.batch.quads()));
+        at
+    };
+    assert_eq!(
+        run(true),
+        [
+            vec![base(0)],
+            vec![base(0), layer(2)],
+            vec![base(1), layer(2)],
+            vec![base(3)],
+        ]
+    );
+    assert_eq!(run(false), [[PLACEHOLDER]; 4]);
 }
 
 #[test]
@@ -289,7 +324,7 @@ fn only_a_play_skin_draws_the_bga() {
     let on = |t| {
         vec![ElementDef {
             timer: TimerRef::Builtin(t),
-            ..bga_element(0)
+            ..bga_element(FILL)
         }]
     };
     let selection = Skin::new_selection(
@@ -309,7 +344,7 @@ fn only_a_play_skin_draws_the_bga() {
         ResultDefs::default(),
     );
     let decision = Skin::new_decision(
-        def(Vec::new(), white_sheet(), vec![bga_element(0)]),
+        def(Vec::new(), white_sheet(), vec![bga_element(FILL)]),
         DecisionDefs::default(),
     );
     for (kind, refused) in [
@@ -322,5 +357,5 @@ fn only_a_play_skin_draws_the_bga() {
             "{kind:?}: {refused:?}"
         );
     }
-    assert!(load(Vec::new(), vec![bga_element(0)]).is_ok());
+    assert!(load(Vec::new(), vec![bga_element(FILL)]).is_ok());
 }

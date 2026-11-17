@@ -129,6 +129,7 @@ fn result_entry_points_refuse_other_kinds() {
         bpm_whole_change: None,
         play_level: None,
         score: skin_model::PlayScore::NONE,
+        bga_shown: true,
     };
     assert!(matches!(
         fx.skin.prepare(&chart, &ctx),

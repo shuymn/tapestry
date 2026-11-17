@@ -5518,6 +5518,7 @@ mod tests {
             bpm_whole_change: None,
             play_level: None,
             score: crate::PlayScore::NONE,
+            bga_shown: true,
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         skin.attach_bitmap_text(&mut play, &ChartText::default());

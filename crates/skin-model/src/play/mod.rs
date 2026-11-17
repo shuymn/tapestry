@@ -231,6 +231,11 @@ pub struct PlayContext<'a> {
     pub play_level: Option<i32>,
     /// Whether the attempt is autoplay, which `autoplay` reads.
     pub autoplay: bool,
+    /// Whether the session shows the chart's BGA (design.md "Settings
+    /// Files", `[bga] mode`, with the session's autoplay): a play that
+    /// does not show it draws the black placeholder for a `bga` element
+    /// throughout, its poor window included.
+    pub bga_shown: bool,
     /// The chart's metadata the `chart.*` fields read.
     pub meta: ChartMetadata,
     /// The play's best and target, the chart's profile and its MAIN tempo.
@@ -1040,7 +1045,11 @@ impl Play {
             bitmap: Box::new([]),
             chart: ChartTable::ABSENT,
             chart_live: None,
-            bga: bga::BgaClock::new(chart.bga.clone()),
+            bga: bga::BgaClock::new(if ctx.bga_shown {
+                chart.bga.clone()
+            } else {
+                None
+            }),
             bga_show: bga::Show::Placeholder,
             bga_table: crate::bga::absent_table(),
             bga_live: None,
@@ -1467,6 +1476,7 @@ mod tests {
             bpm_whole_change: None,
             play_level: None,
             score: crate::PlayScore::NONE,
+            bga_shown: true,
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         let zero = PerJudgment {
@@ -1651,6 +1661,7 @@ mod tests {
                 basis,
                 ..crate::PlayScore::NONE
             },
+            bga_shown: true,
         };
         let mut play = super::Play::new(
             &chart,

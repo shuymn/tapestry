@@ -764,6 +764,7 @@ impl PlayerRig<'_> {
         let epoch = self.adjust.as_mut().and_then(game::AdjustDriver::prepared);
         let attempt =
             AttemptContext::new(attempt, SIMPLE_SCRATCH, epoch.unwrap_or(0), self.autoplay)
+                .with_bga_shown(self.bga_session.shown())
                 .with_scratch_notes(std::mem::take(&mut prep.scratch_notes));
         prep.staging = Instant::now();
         PrepStage::Screen(self.render.begin_attempt(attempt, skin))
