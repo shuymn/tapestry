@@ -585,7 +585,7 @@ fn an_entry_with_no_departure_draws_nothing_of_the_last_visit() {
     use game::AppRig as _;
 
     use crate::select::MenuKey;
-    use crate::selection::image_tests::{library, look_until, past_rest, press, resident};
+    use crate::selection::image_tests::{library, look_until, past_rest, press, quiet, resident};
     let _warp = crate::warp_turn::take();
     let _serial = crate::imports::tests::serial();
     let (_skin, skin, script) = chart_skin();
@@ -598,10 +598,11 @@ fn an_entry_with_no_departure_draws_nothing_of_the_last_visit() {
         Preparation::Ready
     );
     let dir = tempfile::tempdir().unwrap();
-    let (sel, _) = library(
+    let (mut sel, _) = library(
         dir.path(),
         &[("a.bms", Some("hidden-a.png"), Some("hidden-n.png"))],
     );
+    quiet(&mut sel);
     let settings = game::Settings {
         device: game::DeviceSettings::default(),
         player: game::PlayerSettings::default(),

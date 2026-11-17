@@ -70,6 +70,15 @@ pub(crate) fn library(
     (sel, root)
 }
 
+/// Starts no scan pass after the one running, for a test that looks on a
+/// rig: each pass's end refreshes the list, an update, and passes ending
+/// faster than the render thread's frames would leave no frame boundary
+/// free for the pool's write (one per boundary, none at a boundary that
+/// took a new update).
+pub(crate) fn quiet(sel: &mut Selection) {
+    sel.shelf.set_rescan_after(Duration::from_secs(3_600));
+}
+
 /// Screens with a selection chart-image pool of 8 slots.
 fn pooled() -> Installers {
     let screens = Installers::default();
@@ -346,13 +355,14 @@ pub(crate) fn resident(w: &ChartImageWorker) -> bool {
 /// skin draws them into a pool and whose clock a test may hold.
 fn on_charts<R>(f: impl FnOnce(&mut crate::play::PlayerRig<'_>) -> R) -> R {
     let dir = tempfile::tempdir().unwrap();
-    let (sel, _) = library(
+    let (mut sel, _) = library(
         dir.path(),
         &[
             ("a.bms", Some("hidden-a.png"), Some("hidden-n.png")),
             ("b.bms", Some("hidden-b.png"), None),
         ],
     );
+    quiet(&mut sel);
     let screens = pooled();
     let render = screens.spawn_bare();
     on_selection_at(sel, &screens, render, QpcClock::holdable(), |rig| {
@@ -430,10 +440,11 @@ fn a_deferred_request_wakes_the_select_screen_within_a_slice() {
 fn a_return_shows_the_row_at_once_and_reads_it_again_once_changed() {
     let _serial = crate::imports::tests::serial();
     let dir = tempfile::tempdir().unwrap();
-    let (sel, root) = library(
+    let (mut sel, root) = library(
         dir.path(),
         &[("a.bms", Some("hidden-a.png"), Some("hidden-n.png"))],
     );
+    quiet(&mut sel);
     let screens = pooled();
     let render = screens.spawn_bare();
     on_selection_at(sel, &screens, render, QpcClock::holdable(), |rig| {
