@@ -753,8 +753,12 @@ struct Graphs {
     /// A section attempt's start and end in 1× µs.
     section: Option<[i64; 2]>,
     /// Each bin's judgeable notes (taps and long-note heads), by the
-    /// profile's row bins; empty without a judgment graph or the rows.
+    /// profile's row bins, over the judgment graphs' span
+    /// ([`judgment_span`]); empty without a judgment graph or the rows.
     judge_notes: Box<[u32]>,
+    /// The 1× seconds the judgment graphs' bins represent, their count
+    /// times their width.
+    judge_seconds: u32,
     bpm: Box<[BpmRaster]>,
     bands: Box<[Box<[Run]>]>,
     hits: Box<[HitErrorState]>,
@@ -763,16 +767,39 @@ struct Graphs {
     areas: [[i16; 2]; 5],
 }
 
-/// Each of `profile`'s bins' judgeable notes of `chart` (taps and
-/// long-note heads, never mines), by each note's head row's bin
+/// The judgment graphs' span of `profile`: the chart's 1× length in whole
+/// seconds plus one, one second fewer than the profile's (the notes
+/// graph's), as the source sizes these graphs by the chart's last time;
+/// as the count of the profile's bins that cover those seconds and the
+/// seconds they represent, that count times their width.
+// Source: SF-022
+fn judgment_span(profile: &ChartProfile) -> (usize, u32) {
+    let width = profile.bin_seconds().max(1);
+    let bins = profile
+        .seconds()
+        .len()
+        .saturating_sub(1)
+        .max(1)
+        .div_ceil(usize::try_from(width).unwrap_or(usize::MAX))
+        .min(profile.bins().len());
+    (
+        bins,
+        u32::try_from(bins)
+            .unwrap_or(u32::MAX)
+            .saturating_mul(width),
+    )
+}
+
+/// The judgeable notes of `chart` (taps and long-note heads, never mines)
+/// in each of `profile`'s first `bins` bins, by each note's head row's bin
 /// ([`ChartProfile::row_bins`]): a widened bin sums its seconds' notes.
 /// Empty when the profile holds no rows (a preview's).
-fn judge_notes(chart: &Chart, profile: &ChartProfile) -> Box<[u32]> {
+fn judge_notes(chart: &Chart, profile: &ChartProfile, bins: usize) -> Box<[u32]> {
     let rows = profile.row_bins();
     if rows.is_empty() {
         return Box::default();
     }
-    let mut notes = vec![0_u32; profile.bins().len()];
+    let mut notes = vec![0_u32; bins];
     for n in chart
         .lanes
         .iter()
@@ -803,9 +830,12 @@ impl Graphs {
             ),
             None => (Box::default(), 0),
         };
-        let judge_notes = match profile.filter(|_| plan.judgments) {
-            Some(p) => judge_notes(chart, p),
-            None => Box::default(),
+        let (judge_notes, judge_seconds) = match profile.filter(|_| plan.judgments) {
+            Some(p) => {
+                let (n, seconds) = judgment_span(p);
+                (judge_notes(chart, p, n), seconds)
+            }
+            None => (Box::default(), 0),
         };
         let speed = score.speed.ratio();
         let to_1x = |t: TimeUs| {
@@ -845,6 +875,7 @@ impl Graphs {
             speed,
             section,
             judge_notes,
+            judge_seconds,
             bpm,
             bands: plan.timing.iter().map(|t| t.band(score.areas)).collect(),
             hits: plan.hit.iter().map(|&h| HitErrorState::new(h)).collect(),
@@ -1094,8 +1125,8 @@ impl Play {
         }
     }
 
-    /// The judgment graphs' notes per bin and their cursors at `now`
-    /// (those of [`notes_graph`](Self::notes_graph)); `None` without
+    /// The judgment graphs' notes per bin and their cursors at `now`,
+    /// placed on their own span ([`judgment_span`]); `None` without
     /// them.
     pub(crate) fn judgment_graph(
         &self,
@@ -1105,12 +1136,12 @@ impl Play {
         if g.judge_notes.is_empty() {
             return None;
         }
-        Some((&g.judge_notes, self.cursors(now)))
+        Some((&g.judge_notes, self.cursors(now, g.judge_seconds)))
     }
 
-    /// The cursors at `now`: the play cursor while the play runs, and a
-    /// section attempt's lines.
-    fn cursors(&self, now: TimeUs) -> crate::widget::judge_graph::Cursors {
+    /// The cursors at `now` over `seconds` 1× seconds: the play cursor
+    /// while the play runs, and a section attempt's lines.
+    fn cursors(&self, now: TimeUs, seconds: u32) -> crate::widget::judge_graph::Cursors {
         let g = &self.graphs;
         let (n, d) = g.speed;
         let play = (now >= self.play_at).then(|| {
@@ -1118,7 +1149,7 @@ impl Play {
             i64::try_from(v).unwrap_or(0)
         });
         crate::widget::judge_graph::Cursors {
-            seconds: g.seconds,
+            seconds,
             play,
             section: g.section,
         }
@@ -1137,7 +1168,7 @@ impl Play {
         if g.bins.is_empty() {
             return None;
         }
-        Some((&g.bins, self.cursors(now)))
+        Some((&g.bins, self.cursors(now, g.seconds)))
     }
 
     /// BPM graph element `slot`'s prepared pixmap.

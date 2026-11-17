@@ -451,3 +451,24 @@ tests = [
     "crates/library/tests/scan.rs::an_undeclared_difficulty_follows_the_note_count",
     "crates/player/src/render_side/tests/decision/integrated.rs::a_chosen_charts_stored_difficulty_reaches_play_and_result",
 ]
+
+[[entry]]
+id = "SF-022"
+summary = "A play's judgment and early/late graphs span `floor(length / 1 s) + 1` seconds, one fewer than the notes graph"
+class = "rule"
+reason = """
+A player sees each graph's time span as where its play cursor stands and how \
+wide its columns are: the judgment and early/late graphs spread the chart's \
+whole seconds plus one over their width, so their cursor reaches the right \
+edge a second sooner than over the notes graph's span (SF-008), which the \
+song information's distribution gives (design.md "Rendering and Skins", play \
+graphs and visualizers)."""
+source = [
+    "src/bms/player/beatoraja/skin/SkinNoteDistributionGraph.java:171-174 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/SkinNoteDistributionGraph.java:195-220 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/SkinNoteDistributionGraph.java:277 @beatoraja-0.8.9",
+]
+sites = ["crates/skin-model/src/play/mod.rs"]
+tests = [
+    "crates/skin-model/tests/play_graphs.rs::the_judgment_graphs_span_one_second_less_than_the_notes_graph",
+]

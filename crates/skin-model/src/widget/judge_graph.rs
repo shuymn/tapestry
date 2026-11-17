@@ -3,9 +3,9 @@
 //! without a counted judgment grey and the others by their judgment; on
 //! play, the notes graph, the chart's notes by kind over its 1× seconds
 //! (the source's type 0), and the judgment graphs, the play's judgments
-//! over the same bins, each with the play cursor and a practice round's
-//! section lines over it (design.md "Rendering and Skins", result widgets
-//! and play graphs).
+//! over the same bins up to the chart's whole seconds plus one, each with
+//! the play cursor and a practice round's section lines over its own span
+//! (design.md "Rendering and Skins", result widgets and play graphs).
 //!
 //! The source paints two textures and draws each once under the
 //! destination's colour: a background of stripes and lines, then the
@@ -234,9 +234,9 @@ pub(crate) enum GraphData<'a> {
         bins: &'a [[u16; NOTE_CHANNELS]],
         cursors: Cursors,
     },
-    /// A play's judgments over the notes graph's bins: each bin's
-    /// judgments by channel and its judgeable notes, a bin a column, and
-    /// the cursors.
+    /// A play's judgments over the judgment graphs' span of the notes
+    /// graph's bins: each bin's judgments by channel and its judgeable
+    /// notes, a bin a column, and the cursors.
     Live {
         bins: &'a [[u32; TIMELINE_CHANNELS]],
         notes: &'a [u32],
