@@ -2203,3 +2203,101 @@ fn a_fresh_round_reads_its_own_score() {
         assert_eq!(scores(&fresh), [0, 0, 10_000, whole], "over {notes}");
     }
 }
+
+/// The `n` rows' digits as drawn at `ms`, below the EX score's row, read
+/// through the EX score's glyph for each digit; a blank cell is not drawn.
+fn digit_rows(d: &mut Drawn, ms: i64, n: usize) -> Vec<String> {
+    let glyph = d.ex_glyphs(ms);
+    let q = d.frame(ms, &[]);
+    let mut cells: Vec<_> = q.iter().map(|q| (q.rect[1], q.rect[0], q.uv)).collect();
+    cells.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.total_cmp(&b.1)));
+    let mut ys: Vec<f32> = cells.iter().map(|c| c.0).collect();
+    ys.dedup();
+    let mut rows = vec![String::new(); n];
+    for (y, uv) in cells.iter().map(|c| (c.0, c.2)) {
+        let row = ys.iter().position(|&r| r == y).unwrap();
+        if row > 0 {
+            rows[row - 1].push(glyph[&uv.map(f32::to_bits)]);
+        }
+    }
+    rows
+}
+
+/// A play skin's numbers 74 and 106, by `ref`, by name and through
+/// `main_state.number` in a callback, show the whole chart's note count
+/// in a practice round too (3 of `chart(7)`'s notes), with no D4 note;
+/// the score rate (102) beside them keeps its D4 note.
+// Source: SF-018
+#[test]
+fn numbers_74_and_106_are_the_whole_charts_note_count() {
+    let rows = [
+        "ref = 74",
+        "ref = 106",
+        "value = \"totalnotes\"",
+        "value = \"totalnotes2\"",
+        "value = function() return ms.number(74) end",
+        "value = function() return ms.number(106) end",
+    ];
+    let mut values = vec![
+        "{ id = \"ex\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 1, ref = 71 }"
+            .to_owned(),
+    ];
+    let mut dsts = vec![
+        "table.insert(skin.destination, { id = \"ex\", dst = { { x = 0, y = 0, w = 6, h = 6 } } })"
+            .to_owned(),
+    ];
+    for (i, read) in rows.iter().chain(&["ref = 102"]).enumerate() {
+        let digit = if *read == "ref = 102" { 3 } else { 2 };
+        values.push(format!(
+            "{{ id = \"v{i}\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = {digit}, {read} }}"
+        ));
+        let y = 100 * (i + 1);
+        dsts.push(format!(
+            "table.insert(skin.destination, {{ id = \"v{i}\", dst = {{ {{ x = 0, y = {y}, w = 6, h = 6 }} }} }})"
+        ));
+    }
+    let d = folder(&skin(&format!(
+        "skin.value = {{ {} }}\n{}",
+        values.join(",\n"),
+        dsts.join("\n")
+    )));
+    let i = import(&d, 905).unwrap();
+    assert_eq!(i.callbacks, [Disposition::Lowered; 2]);
+    // One D4 note, the score rate's.
+    let d4 = i
+        .imported
+        .report
+        .notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::Deviation(skin_beatoraja::DeviationId::D4))
+        .count();
+    assert_eq!(d4, 1, "{:?}", i.imported.report.notes);
+    #[cfg(feature = "dev-tools")]
+    {
+        use skin_beatoraja::lua::survey::survey;
+        let facts = skin_beatoraja::ImportFacts::unavailable(skin_model::ScreenKind::Play);
+        let s = survey(d.path(), "s.luaskin", &facts, &Cancel::new(), true);
+        let lowered: Vec<_> = s
+            .consumers
+            .iter()
+            .filter_map(|c| c.local.as_ref()?.lowered.as_ref())
+            .map(|l| l.src.as_str())
+            .collect();
+        assert_eq!(lowered, ["(chart.notes)"; 2], "{:?}", s.consumers);
+    }
+    let section = eval::Section {
+        start: bms_model::TimeUs(1_020_000),
+        end: bms_model::TimeUs(1_050_000),
+        lead_in: bms_model::TimeUs(0),
+        initial_gauges: vec![common::play::GAUGES[0].start],
+    };
+    let mut p = Drawn::over_section(i.imported.skin, 7, &section);
+    let mut expected = vec!["7"; rows.len()];
+    expected.push("100");
+    assert_eq!(digit_rows(&mut p, 1_025, rows.len() + 1), expected);
+    // The round's own targets are 3.
+    assert_eq!(
+        p.play.state().fields[usize::from(skin_model::field::NOTES)],
+        3
+    );
+}

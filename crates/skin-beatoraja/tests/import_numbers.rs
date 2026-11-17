@@ -435,3 +435,59 @@ fn early_and_late_counts_show_the_tallys_counts() {
     let shown: Vec<_> = EARLY_LATE.iter().map(|(_, v)| v.to_string()).collect();
     assert_eq!(rows(&mut d, 16, n), shown);
 }
+
+/// A practice round's section of `chart(7)`'s taps at 1 020, 1 030 and
+/// 1 040 ms: 3 of its 7 notes.
+fn three_of_seven() -> eval::Section {
+    eval::Section {
+        start: bms_model::TimeUs(1_020_000),
+        end: bms_model::TimeUs(1_050_000),
+        lead_in: bms_model::TimeUs(0),
+        initial_gauges: vec![common::play::GAUGES[0].start],
+    }
+}
+
+/// A play skin's numbers 74 and 106 show the whole chart's note count in
+/// a practice round too, with no D4 note; the score rate (102) beside
+/// them keeps its D4 note.
+// Source: SF-018
+#[test]
+fn json_numbers_74_and_106_are_the_whole_charts_note_count() {
+    let ids = [("t74", 74, 2), ("t106", 106, 2), ("cp", 102, 3)];
+    let mut values = vec![
+        r#"{"id": "ex", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": 1, "ref": 71}"#
+            .to_owned(),
+    ];
+    let mut dsts = vec![r#"{"id": "ex", "dst": [{"x": 0, "y": 0, "w": 12, "h": 20}]}"#.to_owned()];
+    for (i, (id, prop, digit)) in ids.iter().enumerate() {
+        values.push(format!(
+            r#"{{"id": "{id}", "src": "n", "w": 120, "h": 20, "divx": 10, "digit": {digit},
+                 "ref": {prop}}}"#
+        ));
+        let y = 100 * (i + 1);
+        dsts.push(format!(
+            r#"{{"id": "{id}", "dst": [{{"x": 0, "y": {y}, "w": 12, "h": 20}}]}}"#
+        ));
+    }
+    let loaded = import_body(&format!(
+        r#""value": [{}], "destination": [{}]"#,
+        values.join(","),
+        dsts.join(",")
+    ));
+    // One D4 note, the score rate's.
+    let d4: Vec<_> = loaded
+        .report()
+        .notes
+        .iter()
+        .filter(|n| n.kind == NoteKind::Deviation(skin_beatoraja::DeviationId::D4))
+        .collect();
+    assert_eq!(d4.len(), 1, "{:?}", loaded.report().notes);
+    let skin = loaded.ok().skin.clone();
+    let mut d = common::play::Drawn::over_section(skin, 7, &three_of_seven());
+    assert_eq!(rows(&mut d, 1_025, ids.len()), ["7", "7", "100"]);
+    // The round's own targets are 3.
+    assert_eq!(
+        d.play.state().fields[usize::from(skin_model::field::NOTES)],
+        3
+    );
+}

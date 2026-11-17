@@ -539,6 +539,12 @@ pub(crate) fn length_ms(length: TimeUs) -> i32 {
     i32::try_from(length.0.max(0) / 1_000).unwrap_or(i32::MAX)
 }
 
+/// `field::CHART_NOTES` from the whole chart's note count, which the
+/// reducer's full combo is judged against.
+pub(crate) fn chart_notes(whole: u32) -> i32 {
+    count(whole)
+}
+
 /// The number of `chart.*` fields from `field::CHART_DIFFICULTY`.
 pub(crate) const CHART_FIELDS: usize = 8;
 
@@ -1014,7 +1020,7 @@ impl Play {
             .chain(r.settings)
             .chain(r.app)
             .chain(self.main_bpm)
-            .chain([self.length_ms]);
+            .chain([self.length_ms, self.chart_notes]);
         for (slot, v) in self.fields.iter_mut().zip(fields) {
             *slot = v;
         }
