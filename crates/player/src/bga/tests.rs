@@ -311,6 +311,65 @@ fn bga_cells_go_in_batches_within_the_cell_term() {
     }
 }
 
+/// A batch is taken in hand by the render thread and answered only once
+/// its writes end at a later frame boundary (design.md "Memory Budget"):
+/// with each batch kept three boundaries before it is written, every batch
+/// takes four, and the pictures are published once every batch is
+/// answered.
+#[test]
+fn a_batch_is_answered_at_the_render_thread_s_boundaries() {
+    let _serial = crate::imports::tests::serial();
+    let _back = BatchBack;
+    let d = tempfile::tempdir().unwrap();
+    let names = ["1.png", "2.png", "3.png"];
+    for (i, n) in (0_u8..).zip(names) {
+        png(d.path(), n, [300, 300], [i * 40, 100, 0]);
+    }
+    BATCH_LIMIT.store(2 * 302 * 302 * 4, Ordering::SeqCst);
+    let screens = Installers::default();
+    screens.bga.lock().unwrap().boundaries_per_batch = 3;
+    let link = render(&screens);
+    let coord = Coordinator::new(CAPS);
+    let w = worker(&link);
+    w.renew();
+    w.attempt(want(d.path(), &names));
+    let t = ready(&w, &coord);
+    assert!(t.entries().iter().all(|e| native(*e) == Some([300, 300])));
+    let seen = screens.bga.lock().unwrap();
+    assert_eq!(seen.batches.len(), 2);
+    assert_eq!(seen.boundaries, 8, "four boundaries a batch");
+    assert_eq!(seen.published.len(), 1);
+}
+
+/// A batch in hand whose generation is left is dropped at the next frame
+/// boundary, unwritten, and its job answered stale: nothing of it is
+/// published.
+#[test]
+fn a_batch_of_a_generation_left_is_dropped_at_the_boundary() {
+    let _serial = crate::imports::tests::serial();
+    let d = tempfile::tempdir().unwrap();
+    png(d.path(), "a.png", [300, 300], [200, 0, 0]);
+    let screens = Installers::default();
+    screens.bga.lock().unwrap().boundaries_per_batch = u32::MAX;
+    let link = render(&screens);
+    let coord = Coordinator::new(CAPS);
+    let w = worker(&link);
+    w.renew();
+    w.attempt(want(d.path(), &["a.png"]));
+    w.step(Some((&coord, Spawner::SYSTEM)), &|| false);
+    until(|| screens.bga.lock().unwrap().boundaries > 0);
+    coord.advance(Scope::Choice);
+    w.forget();
+    until(|| {
+        w.step(Some((&coord, Spawner::SYSTEM)), &|| false);
+        w.idle()
+    });
+    let seen = screens.bga.lock().unwrap();
+    assert_eq!(seen.cancelled, 1, "dropped unwritten");
+    assert!(seen.batches.is_empty());
+    assert!(seen.published.is_empty(), "nothing of it published");
+}
+
 /// The absent table's answer as the render thread gives it: its message
 /// taken from the link, a worker of `bound` having sent it at the step.
 fn absent_answer(bound: Duration) -> (BgaWorker, Arc<Answer>) {

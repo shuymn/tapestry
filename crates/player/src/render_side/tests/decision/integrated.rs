@@ -385,12 +385,18 @@ impl Screen for Noted {
     fn begin_bga(&mut self, pages: u32) -> Result<skin_model::bga::BgaKey, render::BgaFault> {
         self.menu.begin_bga(pages)
     }
-    fn write_bga_cells(
+    fn stage_bga_cells(
         &mut self,
         key: skin_model::bga::BgaKey,
-        cells: &[(skin_model::bga::CellPlace, Vec<u8>)],
+        cells: Vec<(skin_model::bga::CellPlace, Vec<u8>)>,
     ) -> Result<(), render::BgaFault> {
-        self.menu.write_bga_cells(key, cells)
+        self.menu.stage_bga_cells(key, cells)
+    }
+    fn bga_boundary(&mut self) -> render::BgaStep {
+        self.menu.bga_boundary()
+    }
+    fn cancel_bga_upload(&mut self) {
+        self.menu.cancel_bga_upload();
     }
     fn publish_bga(
         &mut self,

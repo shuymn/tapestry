@@ -55,11 +55,33 @@ fn write(
             })
         })
         .collect();
-    r.write_bga_cells(key, &[(place, texels)]).unwrap();
+    upload(r, key, vec![(place, texels)]).unwrap();
     BgaEntry::Picture(BgaCell {
         uv: place.uv(),
         native: [SIDE, SIDE],
     })
+}
+
+/// Hands `cells` to `r` for the array `key` names and steps its frame
+/// boundaries until the batch ends; the boundaries it took.
+fn upload(
+    r: &mut render::Renderer,
+    key: skin_model::bga::BgaKey,
+    cells: Vec<(CellPlace, Vec<u8>)>,
+) -> Result<u32, render::BgaFault> {
+    r.stage_bga_cells(key, cells)?;
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    for steps in 1.. {
+        match r.bga_boundary() {
+            render::BgaStep::Done(done) => return done.map(|()| steps),
+            render::BgaStep::Pending => {
+                assert!(std::time::Instant::now() < end, "the batch never ended");
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            render::BgaStep::Idle => panic!("no batch in hand"),
+        }
+    }
+    unreachable!()
 }
 
 fn image(id: u16) -> BgaImage {
@@ -180,4 +202,125 @@ fn absent_pictures_draw_per_channel() {
     r.publish_bga(None, vec![BgaEntry::Absent; 4]).unwrap();
     let p = frame(&mut r, 500, &[]);
     assert_eq!((at(&p, LEFT), at(&p, RIGHT)), (BLACK, BLACK));
+}
+
+/// A 2 046² picture's cell, its top half blue and its bottom half green,
+/// at page 0's top left.
+fn large_cell() -> (CellPlace, Vec<u8>) {
+    let place = CellPlace {
+        page: 0,
+        origin: [0, 0],
+        content: [2_046, 2_046],
+    };
+    let [w, h] = place.padded();
+    let texels = (0..h)
+        .flat_map(|y| {
+            let [cr, cg, cb] = if y < h / 2 { BLUE } else { GREEN };
+            (0..w).flat_map(move |_| [cr, cg, cb, 255])
+        })
+        .collect();
+    (place, texels)
+}
+
+/// A batch is written at frame boundaries, at most `BGA_WRITE_BUDGET`
+/// bytes at each (design.md "Memory Budget"): a 2 046² picture, whose
+/// cell's 16 MiB are four budgets, ends no sooner than its fourth boundary
+/// and draws whole, its last rows included; four cells of a budget each
+/// are written one a boundary, each dropped once written.
+#[test]
+fn a_batch_is_written_a_budget_at_a_boundary() {
+    assert_eq!(render::BGA_WRITE_BUDGET, 4 << 20);
+    let dir = tempfile::tempdir().unwrap();
+    let c = chart(
+        ChartBga::new(
+            vec![image(1)],
+            vec![event(0, Some(0))],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap(),
+    );
+    let mut r = renderer(dir.path(), &c);
+    let key = r.begin_bga(1).unwrap();
+    let (place, texels) = large_cell();
+    assert_eq!(r.bga_boundary(), render::BgaStep::Idle, "nothing in hand");
+    let steps = upload(&mut r, key, vec![(place, texels)]).unwrap();
+    assert!(steps >= 4, "{steps} boundaries");
+    assert_eq!(r.bga_upload_bytes(), 0);
+    r.publish_bga(
+        Some(key),
+        vec![BgaEntry::Picture(BgaCell {
+            uv: place.uv(),
+            native: [2_046, 2_046],
+        })],
+    )
+    .unwrap();
+    let p = frame(&mut r, 100, &[]);
+    assert_eq!(at(&p, (200, 10)), BLUE);
+    assert_eq!(at(&p, (200, 390)), GREEN, "the last rows written");
+    // Four 1 022² pictures, each cell a whole budget (1 024 rows of 4 KiB):
+    // one cell written at each boundary, its bytes dropped once written.
+    let quarter = 1_024 * 1_024 * 4;
+    let cells = (0..4)
+        .map(|i| {
+            let place = CellPlace {
+                page: 0,
+                origin: [i % 2 * 1_024, i / 2 * 1_024],
+                content: [1_022, 1_022],
+            };
+            (place, vec![255; quarter])
+        })
+        .collect();
+    r.stage_bga_cells(key, cells).unwrap();
+    for left in (1..4).rev() {
+        assert_eq!(r.bga_boundary(), render::BgaStep::Pending);
+        assert_eq!(
+            r.bga_upload_bytes(),
+            left * u64::try_from(quarter).unwrap(),
+            "one cell a boundary"
+        );
+    }
+    r.cancel_bga_upload();
+}
+
+/// A batch whose array is replaced while it is written ends stale at the
+/// next boundary, dropped; a cell off its page is refused before anything
+/// is taken in hand.
+#[test]
+fn a_batch_whose_array_is_replaced_ends_stale() {
+    let dir = tempfile::tempdir().unwrap();
+    let c = chart(
+        ChartBga::new(
+            vec![image(1)],
+            vec![event(0, Some(0))],
+            Vec::new(),
+            Vec::new(),
+        )
+        .unwrap(),
+    );
+    let mut r = renderer(dir.path(), &c);
+    let key = r.begin_bga(1).unwrap();
+    let (place, texels) = large_cell();
+    let bytes = u64::try_from(texels.len()).unwrap();
+    r.stage_bga_cells(key, vec![(place, texels)]).unwrap();
+    assert_eq!(r.bga_upload_bytes(), bytes);
+    assert_eq!(
+        r.bga_boundary(),
+        render::BgaStep::Pending,
+        "a budget written"
+    );
+    let again = r.begin_bga(1).unwrap();
+    assert_eq!(
+        r.bga_boundary(),
+        render::BgaStep::Done(Err(render::BgaFault::Stale))
+    );
+    assert_eq!(r.bga_boundary(), render::BgaStep::Idle);
+    assert_eq!(r.bga_upload_bytes(), 0);
+    let off = CellPlace { page: 1, ..place };
+    let (_, texels) = large_cell();
+    assert_eq!(
+        r.stage_bga_cells(again, vec![(off, texels)]),
+        Err(render::BgaFault::Cell)
+    );
+    assert_eq!(r.bga_boundary(), render::BgaStep::Idle);
 }

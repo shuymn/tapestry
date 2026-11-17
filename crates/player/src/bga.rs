@@ -202,8 +202,10 @@ pub enum BgaMsg {
         pages: u32,
         reply: mpsc::SyncSender<Result<BgaKey, BgaFault>>,
     },
-    /// Write a batch of cells, each its place and texels
-    /// ([`render::Renderer::write_bga_cells`]), then drop them.
+    /// Write a batch of cells, each its place and texels, at the render
+    /// thread's frame boundaries ([`render::Renderer::stage_bga_cells`]),
+    /// answering once the writes completed; each cell is dropped once
+    /// written.
     Cells {
         key: BgaKey,
         cells: Vec<(CellPlace, Vec<u8>)>,

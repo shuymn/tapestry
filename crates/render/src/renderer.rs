@@ -1101,6 +1101,9 @@ pub struct Renderer {
     /// The BGA table last published, keyed to the array its cells were
     /// written into ([`publish_bga`](Self::publish_bga)).
     bga_table: Arc<skin_model::bga::BgaTable>,
+    /// The batch of BGA cells in hand, written at frame boundaries
+    /// ([`bga_boundary`](Self::bga_boundary)).
+    bga_upload: Option<crate::bga::BgaUpload>,
     instances: wgpu::Buffer,
     /// The batch, its staging copied into `instances` each frame, and the
     /// play skin's projection and clip scissors.
@@ -1366,6 +1369,7 @@ impl Renderer {
             bga,
             bga_serial: 0,
             bga_table: Arc::new(skin_model::bga::BgaTable::ABSENT),
+            bga_upload: None,
             instances,
             staging,
             text_cache: TextCache::none(),
@@ -3345,36 +3349,96 @@ impl Renderer {
         Ok(key)
     }
 
-    /// Writes a batch of cells, each its `texels` (premultiplied RGBA8 rows
-    /// of its padded size) at its place, into the array `key` names, and
-    /// waits for the GPU once before it returns, so the queue's staging of
-    /// one batch is released before the next.
+    /// Takes a batch of cells in hand for the array `key` names, each its
+    /// `texels` (premultiplied RGBA8 rows of its padded size) at its
+    /// place, written at the frame boundaries that follow
+    /// ([`bga_boundary`](Self::bga_boundary)); a batch still in hand is
+    /// dropped first. Nothing is written here.
     ///
     /// # Errors
     ///
     /// [`crate::BgaFault::Stale`] when `key` is not the array in use (or the
-    /// device is lost), [`crate::BgaFault::Cell`] for a cell off its page,
-    /// [`crate::BgaFault::Refused`] when the device refuses the write.
-    pub fn write_bga_cells(
+    /// device is lost), [`crate::BgaFault::Cell`] for a cell off its page:
+    /// nothing is taken.
+    pub fn stage_bga_cells(
         &mut self,
         key: skin_model::bga::BgaKey,
-        cells: &[(skin_model::bga::CellPlace, Vec<u8>)],
+        cells: Vec<(skin_model::bga::CellPlace, Vec<u8>)>,
     ) -> Result<(), crate::BgaFault> {
+        self.bga_upload = None;
         if self.bga_key() != Some(key) {
             return Err(crate::BgaFault::Stale);
         }
-        let (written, refused) = skin_atlas::scoped(self.gpu.device(), || {
-            let w = cells
-                .iter()
-                .try_for_each(|(place, texels)| self.bga.write(&self.gpu, place, texels));
-            self.gpu.queue().submit([]);
-            w
-        });
-        written?;
-        if refused.is_some() || wait_for_gpu(&self.gpu).is_err() {
-            return Err(crate::BgaFault::Refused);
-        }
+        self.bga_upload = Some(self.bga.upload(key, cells)?);
         Ok(())
+    }
+
+    /// One frame boundary's step of the batch in hand, outside every
+    /// frame: at most [`BGA_WRITE_BUDGET`](crate::BGA_WRITE_BUDGET) bytes
+    /// of its rows written, inside one pair of error scopes, and submitted;
+    /// after its last write, one flag-only completion registered; then a
+    /// poll that does not block, which releases the staging of the writes
+    /// the GPU completed. The batch is done once that poll saw its
+    /// completion; it ends at once, dropped, when its array is no longer
+    /// the one in use or the device is lost ([`crate::BgaFault::Stale`]),
+    /// or when the device refused a write or the poll failed
+    /// ([`crate::BgaFault::Refused`]). Nothing waits for the GPU.
+    pub fn bga_boundary(&mut self) -> crate::BgaStep {
+        let Some(up) = self.bga_upload.as_mut() else {
+            return crate::BgaStep::Idle;
+        };
+        let end = |r: &mut Self, result| {
+            r.bga_upload = None;
+            crate::BgaStep::Done(result)
+        };
+        if self.bga.key(self.id) != Some(up.key) || self.gpu.lost() {
+            return end(self, Err(crate::BgaFault::Stale));
+        }
+        if up.done.is_none() {
+            let (array, gpu) = (&self.bga, &self.gpu);
+            let (all, refused) = skin_atlas::scoped(gpu.device(), || {
+                array.write_some(gpu, up, crate::BGA_WRITE_BUDGET)
+            });
+            if refused.is_some() {
+                return end(self, Err(crate::BgaFault::Refused));
+            }
+            // Each boundary's writes are submitted at once, so the queue's
+            // staging of them is released as the GPU completes them, not
+            // held until the batch's last write.
+            if all {
+                up.done = Some(crate::decision_labels::watch(gpu));
+            } else {
+                gpu.queue().submit([]);
+            }
+        }
+        if self.gpu.device().poll(wgpu::PollType::Poll).is_err() {
+            return end(self, Err(crate::BgaFault::Refused));
+        }
+        if self.gpu.lost() {
+            return end(self, Err(crate::BgaFault::Stale));
+        }
+        if self
+            .bga_upload
+            .as_ref()
+            .is_some_and(crate::bga::BgaUpload::completed)
+        {
+            return end(self, Ok(()));
+        }
+        crate::BgaStep::Pending
+    }
+
+    /// Drops the batch of BGA cells in hand, if any, unwritten rows and
+    /// all: its generation is over.
+    pub fn cancel_bga_upload(&mut self) {
+        self.bga_upload = None;
+    }
+
+    /// The bytes of the BGA cells in hand, not yet written.
+    #[must_use]
+    pub fn bga_upload_bytes(&self) -> u64 {
+        self.bga_upload
+            .as_ref()
+            .map_or(0, crate::bga::BgaUpload::bytes)
     }
 
     /// Publishes `entries` as the BGA table of the array `key` names

@@ -73,7 +73,7 @@ mod text_cache;
 mod text_upload;
 
 pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows, solid_uv};
-pub use bga::BgaFault;
+pub use bga::{BGA_WRITE_BUDGET, BgaFault, BgaStep};
 pub use decision_labels::{
     CoolFrom, DECISION_TEXT_WRITE_BUDGET, DecisionMemory, FillProgress, FillStep, Gen, LABEL_SLOTS,
     LabelBook, LabelContent, LabelJob, LabelKey, LabelOutput, LabelRow, LabelScratch, LabelState,

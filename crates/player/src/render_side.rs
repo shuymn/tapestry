@@ -204,19 +204,27 @@ pub trait Screen: Send {
         let _ = pages;
         Err(render::BgaFault::Refused)
     }
-    /// Writes a batch of BGA cells ([`render::Renderer::write_bga_cells`]).
+    /// Takes a batch of BGA cells in hand, written at the frame boundaries
+    /// that follow ([`render::Renderer::stage_bga_cells`]).
     ///
     /// # Errors
     ///
     /// As the renderer's; [`render::BgaFault::Refused`] by default.
-    fn write_bga_cells(
+    fn stage_bga_cells(
         &mut self,
         key: skin_model::bga::BgaKey,
-        cells: &[(skin_model::bga::CellPlace, Vec<u8>)],
+        cells: Vec<(skin_model::bga::CellPlace, Vec<u8>)>,
     ) -> Result<(), render::BgaFault> {
         let _ = (key, cells);
         Err(render::BgaFault::Refused)
     }
+    /// One frame boundary's step of the batch in hand
+    /// ([`render::Renderer::bga_boundary`]); none in hand by default.
+    fn bga_boundary(&mut self) -> render::BgaStep {
+        render::BgaStep::Idle
+    }
+    /// Drops the batch in hand ([`render::Renderer::cancel_bga_upload`]).
+    fn cancel_bga_upload(&mut self) {}
     /// Publishes the BGA table ([`render::Renderer::publish_bga`]): by
     /// default only one of no array.
     ///
@@ -4236,6 +4244,7 @@ pub fn spawn(
                 #[cfg(feature = "dev-tools")]
                 decision_faults: crate::dev::DecisionFaults::read(),
                 decision_want: None,
+                bga_reply: None,
                 decision_disabled: None,
                 decision_next: 1,
                 tuning: None,
@@ -5503,6 +5512,9 @@ struct Run {
     /// The chart the selection cursor rests on, its labels asked of the
     /// preparation; kept after selection is left.
     decision_want: Option<crate::decision_side::Want>,
+    /// The BGA batch in hand: its generation and the job's answer, given
+    /// once its writes end ([`Self::bga_boundary`]).
+    bga_reply: Option<(u64, mpsc::SyncSender<Result<(), render::BgaFault>>)>,
     /// Why the decision kind is disabled for the run: no request is posted
     /// and no slot is pinned from then on.
     decision_disabled: Option<String>,
@@ -5639,7 +5651,9 @@ impl Run {
         loop {
             self.sync_chart();
             let idle = matches!(mode, Mode::Idle) || self.screen.is_none();
-            let msg = if idle && (self.attempt.is_some() || self.decision_busy()) {
+            let msg = if idle
+                && (self.attempt.is_some() || self.decision_busy() || self.bga_reply.is_some())
+            {
                 // A preparation not yet answered is asked again between
                 // messages.
                 rx.recv_timeout(CANCEL_POLL).map_err(|e| match e {
@@ -6193,6 +6207,9 @@ impl Run {
                     continue;
                 }
             }
+            // The BGA batch in hand at this frame boundary, outside every
+            // frame: a step of its writes, never a wait for the GPU.
+            self.bga_boundary();
             let Some(screen) = &mut self.screen else {
                 continue;
             };
@@ -7903,7 +7920,10 @@ impl Run {
     /// Takes a step of the BGA pictures' publication of `generation`:
     /// refused ([`render::BgaFault::Stale`], nothing published, no array
     /// read as published) unless it is the game thread's current one, and
-    /// answered at once. A batch's bytes are dropped once written.
+    /// answered at once, but for a batch of cells: that one is taken in
+    /// hand, written at the frame boundaries that follow and answered once
+    /// its writes end ([`Self::bga_boundary`]); a batch still in hand is
+    /// answered stale first.
     fn bga(&mut self, generation: u64, msg: crate::bga::BgaMsg) {
         use crate::bga::BgaMsg;
         let current = self.shared.bga_generation.load(Ordering::SeqCst) == generation;
@@ -7914,9 +7934,15 @@ impl Run {
                 let _ = reply.send(screen.map_or(Err(stale), |s| s.begin_bga(pages)));
             }
             BgaMsg::Cells { key, cells, reply } => {
-                let written = screen.map_or(Err(stale), |s| s.write_bga_cells(key, &cells));
-                drop(cells);
-                let _ = reply.send(written);
+                if let Some((_, superseded)) = self.bga_reply.take() {
+                    let _ = superseded.send(Err(stale));
+                }
+                match screen.map_or(Err(stale), |s| s.stage_bga_cells(key, cells)) {
+                    Ok(()) => self.bga_reply = Some((generation, reply)),
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
             }
             BgaMsg::Publish {
                 key,
@@ -7941,6 +7967,37 @@ impl Run {
                     s.drop_bga();
                 }
             }
+        }
+    }
+
+    /// The BGA batch in hand at a frame boundary, outside every frame
+    /// (design.md "Memory Budget"): of a generation no longer the game
+    /// thread's, or with no screen, it is dropped and its job answered
+    /// stale; otherwise one step of its writes
+    /// ([`render::Renderer::bga_boundary`]), its job answered once they
+    /// end. A batch the screen no longer holds (a screen built again) is
+    /// answered stale.
+    fn bga_boundary(&mut self) {
+        let Some((generation, _)) = &self.bga_reply else {
+            return;
+        };
+        let current = self.shared.bga_generation.load(Ordering::SeqCst) == *generation;
+        let stale = render::BgaStep::Done(Err(render::BgaFault::Stale));
+        let step = match self.screen.as_mut() {
+            Some(s) if current => s.bga_boundary(),
+            Some(s) => {
+                s.cancel_bga_upload();
+                stale
+            }
+            None => stale,
+        };
+        let answer = match step {
+            render::BgaStep::Pending => return,
+            render::BgaStep::Idle => Err(render::BgaFault::Stale),
+            render::BgaStep::Done(r) => r,
+        };
+        if let Some((_, reply)) = self.bga_reply.take() {
+            let _ = reply.send(answer);
         }
     }
 
@@ -14936,26 +14993,52 @@ pub(crate) mod tests {
                 array: b.arrays,
             })
         }
-        fn write_bga_cells(
+        fn stage_bga_cells(
             &mut self,
             key: skin_model::bga::BgaKey,
-            cells: &[(skin_model::bga::CellPlace, Vec<u8>)],
+            cells: Vec<(skin_model::bga::CellPlace, Vec<u8>)>,
         ) -> Result<(), render::BgaFault> {
             let mut b = self.shared.bga.lock().unwrap();
+            b.pending = None;
             if b.live != Some(key.array) {
                 return Err(render::BgaFault::Stale);
             }
             let mut bytes = 0;
-            for (place, texels) in cells {
+            for (place, texels) in &cells {
                 let [w, h] = place.padded();
                 if texels.len() != usize::try_from(u64::from(w) * u64::from(h) * 4).unwrap() {
                     return Err(render::BgaFault::Cell);
                 }
                 bytes += texels.len();
             }
-            b.cells += u32::try_from(cells.len()).unwrap();
-            b.batches.push((cells.len(), bytes));
+            let boundaries = b.boundaries_per_batch;
+            b.pending = Some((key.array, cells.len(), bytes, boundaries));
             Ok(())
+        }
+        fn bga_boundary(&mut self) -> render::BgaStep {
+            let mut b = self.shared.bga.lock().unwrap();
+            let Some((array, cells, bytes, left)) = b.pending else {
+                return render::BgaStep::Idle;
+            };
+            b.boundaries += 1;
+            if b.live != Some(array) {
+                b.pending = None;
+                return render::BgaStep::Done(Err(render::BgaFault::Stale));
+            }
+            if left > 0 {
+                b.pending = Some((array, cells, bytes, left - 1));
+                return render::BgaStep::Pending;
+            }
+            b.pending = None;
+            b.cells += u32::try_from(cells).unwrap();
+            b.batches.push((cells, bytes));
+            render::BgaStep::Done(Ok(()))
+        }
+        fn cancel_bga_upload(&mut self) {
+            let mut b = self.shared.bga.lock().unwrap();
+            if b.pending.take().is_some() {
+                b.cancelled += 1;
+            }
         }
         fn publish_bga(
             &mut self,
@@ -15259,6 +15342,16 @@ pub(crate) mod tests {
         pub(crate) cells: u32,
         /// Each batch written: its cells and their bytes.
         pub(crate) batches: Vec<(usize, usize)>,
+        /// The batch in hand: its array, cells, bytes and the boundaries
+        /// left before it is written.
+        pending: Option<(u64, usize, usize, u32)>,
+        /// The boundaries a batch stays in hand before it is written (0:
+        /// written at the first boundary).
+        pub(crate) boundaries_per_batch: u32,
+        /// The boundaries that stepped a batch in hand.
+        pub(crate) boundaries: u32,
+        /// The batches in hand dropped unwritten.
+        pub(crate) cancelled: u32,
         /// Each table published, in order.
         pub(crate) published: Vec<Arc<skin_model::bga::BgaTable>>,
         /// The array in use, by its number.
