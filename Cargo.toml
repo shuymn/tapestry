@@ -134,6 +134,8 @@ quote = { version = "1.0.47", default-features = false }
 syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "printing", "visit"] }
 # `cargo xtask ffmpeg fetch` finds MSVC's lib.exe as cc finds MSVC's tools.
 cc = "1.10.0"
+# `cargo xtask media fixtures` compresses a clip's movie header with zlib.
+miniz_oxide = "0.9.1"
 
 # Debug builds as the Windows CI jobs build them (docs/setup.md "CI"): line
 # tables keep backtraces' files and lines at a fraction of full debug info's

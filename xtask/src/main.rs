@@ -18,6 +18,7 @@ mod fmt;
 #[path = "../lint-fixtures/mod.rs"]
 mod lint_fixtures;
 mod lints;
+mod media;
 mod portable;
 mod privacy;
 mod test_device;
@@ -68,7 +69,11 @@ commands:
                                           compare or record its hashes and pack the
                                           release assets under target/ffmpeg-build
   ffmpeg fetch                            unpack ffmpeg.toml's pinned release into
-                                          target/ffmpeg after checking its sha256";
+                                          target/ffmpeg after checking its sha256
+  media fixtures [--record]               remake the committed video clips in the
+                                          flake's `ffmpeg` shell and check them
+                                          against their hashes; --record commits
+                                          them and rewrites the hashes";
 
 fn main() -> ExitCode {
     let mut args = std::env::args_os().skip(1);
@@ -127,6 +132,13 @@ fn main() -> ExitCode {
                 return usage_error("the manifest has no folder");
             };
             ffmpeg::run(root, &rest)
+        }
+        Some("media") => {
+            let manifest = workspace_manifest();
+            let Some(root) = manifest.parent() else {
+                return usage_error("the manifest has no folder");
+            };
+            media::run(root, &rest)
         }
         Some("demo-chart") => demo_chart(&rest),
         Some("-h" | "--help") => {
