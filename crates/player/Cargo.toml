@@ -53,6 +53,7 @@ windows = { workspace = true, features = [
 winit.workspace = true
 
 [dev-dependencies]
+image.workspace = true
 png.workspace = true
 rusqlite.workspace = true
 # The render tests' shared helpers wait on the device.

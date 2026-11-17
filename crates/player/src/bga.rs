@@ -129,7 +129,9 @@ pub fn reserve(terms: Terms) -> bool {
     true
 }
 
-/// The limit of each of the job's allocations, if any.
+/// The allocation limit each picture is held to: one whole decode
+/// ([`TERMS`]), what its read, decode and cell hold at once (skin-model
+/// `ReadPicture::cell`).
 fn limit() -> Option<u64> {
     #[cfg(test)]
     {
@@ -138,7 +140,7 @@ fn limit() -> Option<u64> {
             return Some(l);
         }
     }
-    None
+    Some(TERMS.decode)
 }
 
 /// The bytes a batch may hold.
