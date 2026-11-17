@@ -779,6 +779,7 @@ fn draw_skin(imported: &Imported, seed: &[u8]) -> Vec<usize> {
         play_level: None,
         meta: skin_model::ChartMetadata::UNKNOWN,
         score: skin_model::PlayScore::NONE,
+        bga_shown: true,
     };
     let mut play = skin
         .prepare(&chart, &ctx)
@@ -1090,6 +1091,7 @@ fn gauge_probes(
             play_level: None,
             meta: skin_model::ChartMetadata::UNKNOWN,
             score: skin_model::PlayScore::NONE,
+            bga_shown: true,
         };
         let mut play = skin
             .prepare(chart, &ctx)
@@ -1178,6 +1180,7 @@ pub fn judged_rects(imported: &Imported, full: bool) -> Vec<[f32; 4]> {
         play_level: None,
         meta: skin_model::ChartMetadata::UNKNOWN,
         score: skin_model::PlayScore::NONE,
+        bga_shown: true,
     };
     let mut play = skin
         .prepare(&chart, &ctx)
@@ -1808,6 +1811,7 @@ fn choice_probes(
         play_level: None,
         meta: skin_model::ChartMetadata::UNKNOWN,
         score: skin_model::PlayScore::NONE,
+        bga_shown: true,
     };
     let mut play = skin
         .prepare(chart, &ctx)
@@ -1930,6 +1934,7 @@ fn rate_and_kind_probes(
             play_level: None,
             meta: skin_model::ChartMetadata::UNKNOWN,
             score: skin_model::PlayScore::NONE,
+            bga_shown: true,
         };
         let mut play = skin
             .prepare(chart, &ctx)
@@ -2233,6 +2238,7 @@ fn readout_probes(
             play_level: None,
             meta: skin_model::ChartMetadata::UNKNOWN,
             score: skin_model::PlayScore::NONE,
+            bga_shown: true,
         };
         let mut play = skin
             .prepare(chart, &ctx)
@@ -3752,6 +3758,7 @@ pub fn present(data: &[u8]) -> Option<usize> {
         play_level: None,
         meta: skin_model::ChartMetadata::UNKNOWN,
         score: skin_model::PlayScore::NONE,
+        bga_shown: true,
     };
     let mut play = skin.prepare(&chart, &ctx).expect("the skin prepares");
     let states = [GaugeState {

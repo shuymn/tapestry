@@ -305,6 +305,7 @@ fn the_recent_timing_reaches_the_skin_through_logic_and_the_frame() {
         bpm_whole_change: None,
         play_level: None,
         score: skin_model::PlayScore::NONE,
+        bga_shown: true,
     };
     let mut r = Rig::new(&chart, &rule, &dev, &skin, &ctx);
     assert_eq!(

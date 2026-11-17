@@ -187,12 +187,14 @@ impl ChartBga {
 
     /// The base (channel 04) events in time order.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn base(&self) -> &[BgaEvent] {
         &self.0.base
     }
 
     /// The layer (channel 07) events in time order.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn layer(&self) -> &[BgaEvent] {
         &self.0.layer
     }
@@ -200,6 +202,7 @@ impl ChartBga {
     /// The poor sequences (channel 06) in time order, one a measure at
     /// most.
     #[must_use]
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn poor(&self) -> &[PoorSequence] {
         &self.0.poor
     }

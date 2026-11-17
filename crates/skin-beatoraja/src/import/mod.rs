@@ -1301,6 +1301,7 @@ impl<'d> Cx<'d> {
             Object::BpmGraph => self.bpm_graph(dst, orec)?,
             Object::TimingVisualizer => self.timing_visualizer(dst, orec)?,
             Object::HitErrorVisualizer => self.hit_error(dst, orec)?,
+            Object::Bga if !dst.failure => self.bga(dst)?,
             _ => {
                 self.drop_el(role, at, NoteKind::Unsupported { object })?;
             }

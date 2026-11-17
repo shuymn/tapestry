@@ -4,6 +4,7 @@
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 #![deny(clippy::float_arithmetic, clippy::float_cmp)]
 
+pub(crate) mod bga;
 pub(crate) mod loading;
 pub(crate) mod playhead;
 pub(crate) mod reducer;
@@ -230,6 +231,11 @@ pub struct PlayContext<'a> {
     pub play_level: Option<i32>,
     /// Whether the attempt is autoplay, which `autoplay` reads.
     pub autoplay: bool,
+    /// Whether the session shows the chart's BGA (design.md "Settings
+    /// Files", `[bga] mode`, with the session's autoplay): a play that
+    /// does not show it draws the black placeholder for a `bga` element
+    /// throughout, its poor window included.
+    pub bga_shown: bool,
     /// The chart's metadata the `chart.*` fields read.
     pub meta: ChartMetadata,
     /// The play's best and target, the chart's profile and its MAIN tempo.
@@ -707,6 +713,18 @@ pub struct Play {
     /// The live key of the array its frames draw from, set by the frame's
     /// renderer before each build ([`set_chart_live`](Self::set_chart_live)).
     chart_live: Option<ChartKey>,
+    /// The chart's BGA on chart time; a rearm forgets its cursors.
+    bga: bga::BgaClock,
+    /// What the last build's BGA destinations show.
+    bga_show: bga::Show,
+    /// The BGA pictures its frames draw: absent until set
+    /// ([`set_bga_images`](Self::set_bga_images)).
+    bga_table: std::sync::Arc<crate::bga::BgaTable>,
+    /// The live key of the BGA array, set by the frame's renderer before
+    /// each build ([`set_bga_live`](Self::set_bga_live)).
+    bga_live: Option<crate::bga::BgaKey>,
+    /// Where a video's frames come from: none yet.
+    media: crate::bga::NullMedia,
     /// The bar groups' per-frame work, for a skin with lanes and groups;
     /// a build lends it to the lanes.
     bars: Option<BarScratch>,
@@ -1031,6 +1049,15 @@ impl Play {
             bitmap: Box::new([]),
             chart: ChartTable::ABSENT,
             chart_live: None,
+            bga: bga::BgaClock::new(if ctx.bga_shown {
+                chart.bga.clone()
+            } else {
+                None
+            }),
+            bga_show: bga::Show::Placeholder,
+            bga_table: crate::bga::absent_table(),
+            bga_live: None,
+            media: crate::bga::NullMedia,
             bars: (lanes && bar_groups > 0).then(|| BarScratch::new(bar_groups)),
             graphs: Graphs::new(plan, chart, ctx),
         })
@@ -1052,6 +1079,8 @@ impl Play {
         self.ms.fill(TIMER_OFF);
         self.beat = None;
         self.rhythm.clear();
+        self.bga.clear();
+        self.bga_show = bga::Show::Placeholder;
         self.graphs.hits.iter_mut().for_each(HitErrorState::reset);
     }
 
@@ -1213,6 +1242,44 @@ impl Play {
     /// Allocates nothing.
     pub fn set_chart_live(&mut self, live: Option<ChartKey>) {
         self.chart_live = live;
+    }
+
+    /// Sets the BGA pictures its frames draw, from the next frame on; kept
+    /// by [`rearm`](Self::rearm). Set before the attempt's READY and never
+    /// during it. Allocates nothing.
+    pub fn set_bga_images(&mut self, table: std::sync::Arc<crate::bga::BgaTable>) {
+        self.bga_table = table;
+    }
+
+    /// The BGA pictures set for it.
+    #[must_use]
+    pub fn bga_images(&self) -> &crate::bga::BgaTable {
+        &self.bga_table
+    }
+
+    /// Sets the live key of the BGA array its next frames draw from: the
+    /// frame's renderer sets it before each build. Allocates nothing.
+    pub fn set_bga_live(&mut self, live: Option<crate::bga::BgaKey>) {
+        self.bga_live = live;
+    }
+
+    /// What the last build's BGA destinations show and the table they draw
+    /// from: the table when it describes the live array; a table published
+    /// with no array as every picture absent, channel by channel (the
+    /// placeholder on the base, nothing on the layer or in the miss
+    /// window); and the placeholder alone while no table for the live
+    /// array is published (none yet, or one whose array is no longer in
+    /// use), the miss window's included.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub(crate) fn bga_frame(&self) -> (bga::Show, &crate::bga::BgaTable, crate::bga::NullMedia) {
+        let table = &*self.bga_table;
+        if table.drawable(self.bga_live) {
+            (self.bga_show, table, self.media)
+        } else if table.published() && table.key().is_none() {
+            (self.bga_show, &crate::bga::NO_TABLE, self.media)
+        } else {
+            (bga::Show::Placeholder, &crate::bga::NO_TABLE, self.media)
+        }
     }
 
     /// The chart images its frames draw: the table set for it when it
@@ -1413,6 +1480,7 @@ mod tests {
             bpm_whole_change: None,
             play_level: None,
             score: crate::PlayScore::NONE,
+            bga_shown: true,
         };
         let mut play = skin.prepare(&chart, &ctx).unwrap();
         let zero = PerJudgment {
@@ -1597,6 +1665,7 @@ mod tests {
                 basis,
                 ..crate::PlayScore::NONE
             },
+            bga_shown: true,
         };
         let mut play = super::Play::new(
             &chart,

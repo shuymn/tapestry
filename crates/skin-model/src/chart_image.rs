@@ -214,6 +214,11 @@ pub enum Absent {
     Changed,
     #[error("the read was cancelled")]
     Cancelled,
+    /// Its memory was refused: a reservation for its reader, or one of
+    /// the reader's own allocations (the file's bytes, the decoded image
+    /// and its RGBA8 copy, a BGA picture's canvas, downscale or cell).
+    #[error("the image's memory was refused")]
+    Refused,
     /// The worker reading it panicked or could not start (the player's):
     /// the images it had not finished are absent, and the run goes on.
     #[error("the image's worker failed")]
@@ -381,7 +386,10 @@ pub fn resolve(dir: &ChartDir, label: &str, fallbacks: &[&str], identity: Identi
 
 /// Opens `canonical`, checked again as a regular file within the byte cap
 /// on the handle, and observes it.
-fn observe(canonical: &Path, identity: Identity<'_>) -> Result<(File, FileKey), PathError> {
+pub(crate) fn observe(
+    canonical: &Path,
+    identity: Identity<'_>,
+) -> Result<(File, FileKey), PathError> {
     let (file, _) = path::open(canonical)?;
     let meta = file.metadata().map_err(PathError::Io)?;
     let key = FileKey::of(&meta, &file, identity);
@@ -389,7 +397,7 @@ fn observe(canonical: &Path, identity: Identity<'_>) -> Result<(File, FileKey), 
 }
 
 /// Why one attempt at reading a resolved file stopped.
-enum Stop {
+pub(crate) enum Stop {
     Absent(Absent),
     /// The file is not the one resolved: start again.
     Changed,
@@ -431,6 +439,13 @@ pub fn read(
 /// The side of the largest chart slot any installation can have: half of
 /// a page of [`MAX_PAGE_SIDE`].
 pub const SOURCE_SIDE: u32 = MAX_PAGE_SIDE / 2;
+
+/// One image's whole-decode bound (design.md "Memory Budget", 161 MiB):
+/// the allocation limit a chart image's decode is held to, and a BGA
+/// picture's read, decode and cell, what each holds at once checked
+/// before the decode begins. A decoder's own buffers count by their
+/// bound, as no limit given to `image` reaches every decoder.
+pub const DECODE_LIMIT: u64 = 161 << 20;
 
 /// The slot a source is fitted for ([`read_source`]): the largest chart
 /// slot any installation can have, [`SOURCE_SIDE`] square.
@@ -545,14 +560,15 @@ fn read_levels(
     }
 }
 
-fn checkpoint(cancel: &dyn Fn() -> bool, site: Site) -> Result<(), Absent> {
+pub(crate) fn checkpoint(cancel: &dyn Fn() -> bool, site: Site) -> Result<(), Absent> {
     decode::checkpoint(cancel, site).map_err(|_| Absent::Cancelled)
 }
 
-fn absent_of(e: DecodeError) -> Stop {
+pub(crate) fn absent_of(e: DecodeError) -> Stop {
     match e {
         DecodeError::Unsupported => Stop::Absent(Absent::Format),
         DecodeError::Changed | DecodeError::HeaderChanged => Stop::Changed,
+        DecodeError::Refused => Stop::Absent(Absent::Refused),
         _ => Stop::Absent(Absent::Decode),
     }
 }
@@ -591,18 +607,18 @@ fn read_resolved(
     drop(file);
     let (bytes, dims, header) = snapshot?;
     decode::check_whole(&bytes, dims, header).map_err(absent_of)?;
-    let image = decode::decode(bytes, dims).map_err(absent_of)?;
+    let (image, _) = decode::decode_alpha(bytes, dims, Some(DECODE_LIMIT)).map_err(absent_of)?;
     checkpoint(cancel, Site::Decoded)?;
     Ok(fit(image, slot, levels, cancel)?)
 }
 
 /// What a read decodes: the whole bytes, the dimensions and a PNG's
 /// header fields.
-type Snapshot = (Vec<u8>, [u32; 2], Option<decode::PngHeader>);
+pub(crate) type Snapshot = (Vec<u8>, [u32; 2], Option<decode::PngHeader>);
 
 /// The header within the side and texel caps, and the whole bytes, of the
 /// open `file` of `len` bytes.
-fn take(file: &mut File, len: u64, cancel: &dyn Fn() -> bool) -> Result<Snapshot, Stop> {
+pub(crate) fn take(file: &mut File, len: u64, cancel: &dyn Fn() -> bool) -> Result<Snapshot, Stop> {
     let probe = decode::header(file, len).map_err(absent_of)?;
     let [w, h] = probe.dims;
     if w > MAX_SIDE || h > MAX_SIDE {
@@ -618,6 +634,7 @@ fn take(file: &mut File, len: u64, cancel: &dyn Fn() -> bool) -> Result<Snapshot
     let (bytes, more) = match decode::read_capped(file, len, MAX_FILE_BYTES, cancel) {
         Ok(read) => read,
         Err(e) if decode::is_cancelled(&e) => return Err(Absent::Cancelled.into()),
+        Err(e) if e.kind() == io::ErrorKind::OutOfMemory => return Err(Absent::Refused.into()),
         Err(_) => return Err(Absent::Decode.into()),
     };
     if more || u64::try_from(bytes.len()).ok() != Some(len) {
@@ -628,7 +645,7 @@ fn take(file: &mut File, len: u64, cancel: &dyn Fn() -> bool) -> Result<Snapshot
 
 /// The largest size within `max` that keeps the aspect of `native`,
 /// rounded down, each side at least 1; `native` itself when it fits.
-fn fitted_size(native: [u32; 2], max: [u32; 2]) -> [u32; 2] {
+pub(crate) fn fitted_size(native: [u32; 2], max: [u32; 2]) -> [u32; 2] {
     let [w, h] = native;
     let [mw, mh] = max;
     if w <= mw && h <= mh {
@@ -643,7 +660,7 @@ fn fitted_size(native: [u32; 2], max: [u32; 2]) -> [u32; 2] {
     }
 }
 
-fn zeroed(len: u64) -> Result<Vec<u8>, Absent> {
+pub(crate) fn zeroed(len: u64) -> Result<Vec<u8>, Absent> {
     let n = usize::try_from(len).map_err(|_| Absent::Decode)?;
     let mut v = Vec::new();
     v.try_reserve_exact(n).map_err(|_| Absent::Decode)?;
@@ -687,7 +704,7 @@ fn finish(
 ) -> Result<Fitted, Absent> {
     let padded = content.map(|c| c.next_multiple_of(ALIGN) + 2 * GUTTER);
     let mut levels = Vec::with_capacity(count);
-    levels.push(extrude(&texels, content, padded)?.into_boxed_slice());
+    levels.push(extrude(&texels, content, padded, GUTTER)?.into_boxed_slice());
     drop(texels);
     for k in 1..count.min(MIP_LEVELS) {
         checkpoint(cancel, Site::Mip)?;
@@ -723,14 +740,17 @@ fn downscaled(texels: Vec<u8>, from: [u32; 2], to: [u32; 2]) -> Result<Vec<u8>, 
 /// side at most `from`'s) by an area filter: each output texel is the
 /// mean of the source area it covers, weighted by the exact overlap, in
 /// integers, rounded to nearest.
-fn area(src: &[u8], from: [u32; 2], to: [u32; 2]) -> Result<Vec<u8>, Absent> {
+pub(crate) fn area(src: &[u8], from: [u32; 2], to: [u32; 2]) -> Result<Vec<u8>, Absent> {
     let [w, h] = from.map(u64::from);
     let [cw, ch] = to.map(u64::from);
     let mut out = zeroed(cw * ch * 4)?;
     // One output row's column sums over the source rows it covers, per
     // source column and channel.
-    let mut acc = vec![0_u64; to_usize(from[0]) * 4];
     let row_bytes = to_usize(from[0]) * 4;
+    let mut acc = Vec::new();
+    acc.try_reserve_exact(row_bytes)
+        .map_err(|_| Absent::Decode)?;
+    acc.resize(row_bytes, 0_u64);
     let total = w * h;
     for (oy, out_row) in (0..ch).zip(out.chunks_exact_mut(to_usize(to[0]) * 4)) {
         acc.iter_mut().for_each(|a| *a = 0);
@@ -767,13 +787,18 @@ fn area(src: &[u8], from: [u32; 2], to: [u32; 2]) -> Result<Vec<u8>, Absent> {
 }
 
 /// The allocation of `padded` texels holding `content` texels of `src`
-/// [`GUTTER`] texels in, every other texel repeating the nearest content
+/// `gutter` texels in, every other texel repeating the nearest content
 /// texel.
-fn extrude(src: &[u8], content: [u32; 2], padded: [u32; 2]) -> Result<Vec<u8>, Absent> {
+pub(crate) fn extrude(
+    src: &[u8],
+    content: [u32; 2],
+    padded: [u32; 2],
+    gutter: u32,
+) -> Result<Vec<u8>, Absent> {
     let [cw, ch] = content;
     let [pw, ph] = padded;
     let mut out = zeroed(u64::from(pw) * u64::from(ph) * 4)?;
-    let nearest = |d: u32, n: u32| to_usize(d.saturating_sub(GUTTER).min(n - 1));
+    let nearest = |d: u32, n: u32| to_usize(d.saturating_sub(gutter).min(n - 1));
     for (dy, row) in (0..ph).zip(out.chunks_exact_mut(to_usize(pw) * 4)) {
         let sy = nearest(dy, ch);
         for (dx, texel) in (0..pw).zip(row.as_chunks_mut::<4>().0) {
