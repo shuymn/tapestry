@@ -1213,9 +1213,6 @@ pub struct Renderer {
     pool: Option<ChartPool>,
     /// The pool a commit replaced, kept as [`retired`](Self::retired) is.
     retired_pool: Option<ChartPool>,
-    /// The pool's layout after its last change, until
-    /// [`take_pool_change`](Self::take_pool_change) takes it.
-    pool_change: Option<Option<PoolLayout>>,
     /// Unit tests: pool arrays the device refuses next, one each.
     #[cfg(test)]
     pool_faults: std::cell::Cell<u32>,
@@ -1457,7 +1454,6 @@ impl Renderer {
             pool_grid: None,
             pool: None,
             retired_pool: None,
-            pool_change: None,
             #[cfg(test)]
             pool_faults: std::cell::Cell::new(0),
             #[cfg(test)]
@@ -2178,7 +2174,6 @@ impl Renderer {
         // the smaller one is made.
         self.pool = None;
         let Some(slot) = self.selection_slot() else {
-            self.pool_changed();
             return;
         };
         let atlas = &slot.resources.atlas;
@@ -2190,7 +2185,6 @@ impl Renderer {
             slot.resources.atlas_bind = bind;
         }
         self.pool = pool;
-        self.pool_changed();
     }
 
     /// Regrows the committed selection's chart-image pool to the most
@@ -2243,15 +2237,8 @@ impl Renderer {
                 slot.resources.atlas_bind = bind;
             }
             self.pool = Some(pool);
-            self.pool_changed();
         }
         self.pool()
-    }
-
-    /// Records the pool's layout after a change, for
-    /// [`take_pool_change`](Self::take_pool_change).
-    fn pool_changed(&mut self) {
-        self.pool_change = Some(self.pool());
     }
 
     /// The live chart-image pool's layout: `None` without a pool, or once
@@ -2262,13 +2249,6 @@ impl Renderer {
             return None;
         }
         self.pool.as_ref().map(ChartPool::layout)
-    }
-
-    /// The pool's layout after its last change (`Some(None)` once there is
-    /// no pool), if it changed since the last call, which clears it: a new
-    /// generation at each array made, none after the array is released.
-    pub fn take_pool_change(&mut self) -> Option<Option<PoolLayout>> {
-        self.pool_change.take()
     }
 
     /// The live key of the chart-image pool: this renderer, the selection
@@ -2767,9 +2747,7 @@ impl Renderer {
         }
         if kind == ScreenKind::Selection {
             self.pool_grid = None;
-            if self.pool.take().is_some() {
-                self.pool_changed();
-            }
+            self.pool = None;
         }
         if kind == ScreenKind::Result {
             self.result_pages = None;
@@ -2876,9 +2854,6 @@ impl Renderer {
                     self.retired_pool = self.pool.take();
                     self.pool_grid = staged.grid;
                     self.pool = staged.pool;
-                    if self.retired_pool.is_some() || self.pool.is_some() {
-                        self.pool_changed();
-                    }
                 }
                 // What it replaces keeps its device resources until the
                 // next staging or a drain: a commit drops none of them.
@@ -3103,12 +3078,8 @@ impl Renderer {
             }
         }
         if let Some((grid, pool)) = pool {
-            let had = self.pool.is_some();
             self.pool_grid = grid;
             self.pool = pool;
-            if had || self.pool.is_some() {
-                self.pool_changed();
-            }
         }
         Ok(())
     }

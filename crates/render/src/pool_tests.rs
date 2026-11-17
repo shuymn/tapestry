@@ -205,7 +205,6 @@ fn a_selection_keeping_a_chart_layer_has_no_pool() {
     assert!(b.chart_layer().is_some());
     commit(&mut r, ScreenKind::Selection, &b, 1);
     assert_eq!(r.pool(), None);
-    assert_eq!(r.take_pool_change(), None);
     let a = r.admission();
     assert_eq!((a.firm, a.pool), (0, 0));
     assert_eq!(a.charge(ScreenKind::Selection), b.atlas_texels());
@@ -229,7 +228,6 @@ fn a_pool_write_lands_in_its_cells_at_every_level() {
         ([448, 640], [448, 256])
     );
     assert_eq!((l.side, l.layers, l.slots), (2_048, 4, 32));
-    assert_eq!(r.take_pool_change(), Some(Some(l)));
     let a = r.admission();
     assert_eq!((a.firm, a.pool), (LAYER, 3 * LAYER));
     assert_eq!(a.charge(ScreenKind::Selection), b.atlas_texels() + LAYER);
@@ -329,7 +327,6 @@ fn a_reduced_pool_keeps_its_firm_layer_or_none() {
     // A decision candidate as large as play's skin fits with one optional
     // layer.
     r.state_charge(&p, SHARED_TEXELS - sel - tiny - LAYER);
-    let _ = r.take_pool_change();
     // The two-layer array is refused, then the firm layer alone: no pool.
     r.pool_faults.set(2);
     let d = crate::test_decl::solid_bundle(
@@ -339,14 +336,13 @@ fn a_reduced_pool_keeps_its_firm_layer_or_none() {
     );
     commit(&mut r, ScreenKind::Decision, &d, 3);
     assert_eq!(r.pool(), None);
-    assert_eq!(r.take_pool_change(), Some(None));
     let a = r.admission();
     assert_eq!((a.firm, a.pool), (0, 0));
     assert_eq!(a.charge(ScreenKind::Selection), sel - LAYER);
     // Regrown with what the kinds leave: the firm layer and one more.
     let l = r.regrow_pool().unwrap();
     assert_eq!(l.layers, 2);
-    assert_eq!(r.take_pool_change(), Some(Some(l)));
+    assert_eq!(r.pool(), Some(l));
     assert_eq!(r.admission().total(), SHARED_TEXELS);
 
     // Regrown whole, then a result candidate leaving one optional layer:
@@ -422,10 +418,8 @@ fn each_pool_array_takes_a_new_generation_and_removal_ends_it() {
         Err(PoolWriteError::Stale)
     );
 
-    let _ = r.take_pool_change();
     r.remove(ScreenKind::Selection);
     assert_eq!(r.pool(), None);
-    assert_eq!(r.take_pool_change(), Some(None));
     assert_eq!(r.pool_chart_key(), None);
     assert_eq!(
         r.write_pool(g4.generation, 0, Some(&stage), None),

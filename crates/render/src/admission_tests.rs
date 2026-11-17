@@ -399,7 +399,6 @@ fn the_pool_yields_to_later_candidates_in_startup_order() {
     // Play's skin charged what leaves one optional layer beside a tiny
     // decision skin.
     r.state_charge(&p, SHARED_TEXELS - sel - TINY - LAYER);
-    let _ = r.take_pool_change();
 
     let b = tiny(&r, BLUE);
 
@@ -407,7 +406,6 @@ fn the_pool_yields_to_later_candidates_in_startup_order() {
     let reduced = r.pool().unwrap();
     assert_eq!(reduced.layers, 2);
     assert!(reduced.generation > whole.generation);
-    assert_eq!(r.take_pool_change(), Some(Some(reduced)));
     assert_eq!(r.admission().total(), SHARED_TEXELS);
 
     let b = tiny(&r, GREEN);
