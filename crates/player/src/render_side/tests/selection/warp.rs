@@ -1068,9 +1068,13 @@ fn a_selection_skin_s_timers_and_updates_keep_its_span() {
     use crate::measure::State;
     let dir = crate::selection_skin::lua_fixture();
     let lua = std::fs::read_to_string(dir.path().join("s.luaskin")).unwrap();
+    // An hour's way across, longer than any run of the test: the image's
+    // animation loops at its end, and the screen's timer runs from the
+    // clock's start, so a shorter one could wrap between frames of a test
+    // starved for seconds.
     let moving = format!(
         "skin.destination = {{\n  {{ id = \"b\", dst = {{ {{ time = 0, x = 100, y = 500, w = {w}, h = {h} }}, \
-         {{ time = 4000, x = 1500, y = 500, w = {w}, h = {h} }} }} }},",
+         {{ time = 3600000, x = 1500, y = 500, w = {w}, h = {h} }} }} }},",
         w = MOVING[0],
         h = MOVING[1]
     );
