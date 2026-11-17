@@ -8,9 +8,9 @@ use std::sync::Arc;
 use render::SkinBundle;
 use skin_beatoraja::ImportFacts;
 
-use super::{choice, class_skin, pending, play, serial, target};
+use super::{choice, class_skin, pending, play, serial, target, text_skin};
 use crate::imports::facts::attempt_facts;
-use crate::imports::facts::tests::loaded;
+use crate::imports::facts::tests::{loaded, loaded_kept};
 use crate::imports::{ForAttempt, PendingSkin, Specialized};
 use crate::render_side::tests::{installed_is, pending_link, specialized};
 
@@ -323,4 +323,180 @@ fn a_settled_specialization_is_cancelled_and_joined() {
     let one = u64::from(cfg!(feature = "dev-tools"));
     assert_eq!((s2 - s, j2 - j), (one, one), "started and joined");
     assert_eq!(live2, live, "its VMs closed");
+}
+
+/// A play text's value over the gauge total.
+const OVER_TOTAL: &str = "function() return ms.number(368) >= 300 and \"high\" or \"low\" end";
+
+/// A play text's value over the gauge total, then the note count.
+const OVER_BOTH: &str =
+    "function() return ms.number(368) >= 300 and ms.number(74) > 1000 and \"high\" or \"low\" end";
+
+/// A chart file's text: `head`, then `notes - 1` taps on lane 1 from
+/// measure 2, 64 a measure, and a mine on lane 2; [`loaded`] adds its
+/// one note.
+fn chart_text(head: &str, notes: usize) -> String {
+    let mut text = String::from(head);
+    let mut left = notes - 1;
+    let mut measure = 2;
+    while left > 0 {
+        let n = left.min(64);
+        text.push_str(&format!("#{measure:03}11:{}\n", "01".repeat(n)));
+        left -= n;
+        measure += 1;
+    }
+    text.push_str("#001D2:01\n");
+    text
+}
+
+/// An attempt with `facts` and no signal: its skin and how it ran.
+fn attempt_with(skin: &mut PendingSkin, facts: ImportFacts) -> (ForAttempt, Specialized) {
+    skin.attempt(facts, || {}, || false, || false)
+}
+
+/// The lines the texts of `b`'s skin ask for.
+fn requested(b: &SkinBundle) -> Vec<String> {
+    let chart = skin_model::ChartText {
+        title: "",
+        subtitle: "",
+        artist: "",
+        subartist: "",
+        genre: "",
+    };
+    b.skin()
+        .text_requests(&chart, [1_920, 1_080], &skin_model::Layout::AUTHOR)
+        .into_iter()
+        .map(|r| r.text)
+        .collect()
+}
+
+/// The facts the kept specialization of `skin` read.
+fn kept_reads(skin: &PendingSkin) -> Vec<skin_beatoraja::FactRead> {
+    skin.cached
+        .as_ref()
+        .map(|c| c.facts.reads.clone())
+        .unwrap_or_default()
+}
+
+/// A text over the gauge total and the note count, in a skin pending at
+/// the play level too, is specialized per chart: chart A runs a job and
+/// asks for `high`; a practice section of A, a retry of A and A at another
+/// speed reuse it (the facts are the whole loaded chart's); chart B, of
+/// the same level but another total and count, runs a job, whose facts
+/// name both; chart C, whose total is past what the number widget shows,
+/// runs a job whose text is dropped; and A then runs a job again.
+#[test]
+fn a_texts_specialization_follows_the_charts_facts() {
+    use skin_beatoraja::{FactId, FactRead, FactValue};
+    let _serial = serial();
+    let r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let dir = text_skin("local l = ms.number(96)", OVER_BOTH, "");
+    let (p, note) = pending(play(&choice(dir.path(), "play.luaskin"), &t));
+    assert_eq!(note.fact, FactId::PlayLevel);
+    let mut skin = PendingSkin::new(p);
+    let read = |fact, v| FactRead {
+        fact,
+        value: FactValue::Int(v),
+    };
+    let level = FactRead {
+        fact: FactId::PlayLevel,
+        value: FactValue::Level(12),
+    };
+
+    let a = chart_text("#PLAYLEVEL 12\n#TOTAL 321\n", 1_234);
+    let (got, how, _, _) = attempt(&mut skin, &a);
+    assert!(matches!(how, Specialized::Ran));
+    let first = ready(got);
+    assert_eq!(requested(&first), ["high"]);
+    assert_eq!(
+        kept_reads(&skin),
+        [
+            level,
+            read(FactId::ChartTotal, 321),
+            read(FactId::ChartNotes, 1_234)
+        ]
+    );
+
+    // A practice section of A: 1 target of its 1 234 notes.
+    let (_section_dir, mut section) = loaded_kept(&a, "tapestry");
+    let gauges = section.attempt().gauges.len();
+    section
+        .set_practice(Some(game::Practice {
+            start: bms_model::TimeUs(0),
+            end: bms_model::TimeUs(3_000_000),
+            lead_in: bms_model::TimeUs(1_000_000),
+            initial_gauges: vec![rules::GaugeValue(20 * rules::GaugeValue::PERCENT); gauges],
+            repeat: true,
+        }))
+        .unwrap();
+    assert!(section.section().is_some());
+    let (got, how) = attempt_with(&mut skin, attempt_facts(&section, false));
+    assert!(matches!(how, Specialized::Reused), "the section");
+    assert!(Arc::ptr_eq(&ready(got), &first));
+    // A retry of A.
+    let (got, how, _, _) = attempt(&mut skin, &a);
+    assert!(matches!(how, Specialized::Reused), "the retry");
+    assert!(Arc::ptr_eq(&ready(got), &first));
+    // A at another speed.
+    let (_speed_dir, mut faster) = loaded_kept(&a, "tapestry");
+    faster
+        .set_speed(bms_model::Speed::from_twentieths(15).unwrap())
+        .unwrap();
+    let (got, how) = attempt_with(&mut skin, attempt_facts(&faster, false));
+    assert!(matches!(how, Specialized::Reused), "the speed change");
+    assert!(Arc::ptr_eq(&ready(got), &first));
+
+    // B: the same level, another total and count.
+    let b = chart_text("#PLAYLEVEL 12\n#TOTAL 450\n", 1_914);
+    let (got, how, _, _) = attempt(&mut skin, &b);
+    assert!(matches!(how, Specialized::Ran), "B");
+    assert_eq!(requested(&ready(got)), ["high"]);
+    assert_eq!(
+        kept_reads(&skin),
+        [
+            level,
+            read(FactId::ChartTotal, 450),
+            read(FactId::ChartNotes, 1_914)
+        ]
+    );
+
+    // C: a total past the range, recorded; the text dropped.
+    let c = chart_text("#PLAYLEVEL 12\n#TOTAL 2147483648\n", 1_234);
+    let (got, how, _, _) = attempt(&mut skin, &c);
+    assert!(matches!(how, Specialized::Ran), "C");
+    assert_eq!(requested(&ready(got)), [] as [&str; 0]);
+    assert_eq!(
+        kept_reads(&skin),
+        [level, read(FactId::ChartTotal, i32::MAX)]
+    );
+
+    // A again: C's recorded total does not hold for it.
+    let (got, how, _, _) = attempt(&mut skin, &a);
+    assert!(matches!(how, Specialized::Ran), "A again");
+    assert_eq!(requested(&ready(got)), ["high"]);
+}
+
+/// A failure-presentation text over a total past what the number widget
+/// shows refuses the attempt with its reason.
+#[test]
+fn a_failure_text_past_the_totals_range_refuses_the_attempt() {
+    let _serial = serial();
+    let r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let dir = text_skin("", OVER_TOTAL, "timer = 3,");
+    let (p, _) = pending(play(&choice(dir.path(), "play.luaskin"), &t));
+    let mut skin = PendingSkin::new(p);
+    let (got, _, _, _) = attempt(&mut skin, &chart_text("#TOTAL 2147483648\n", 10));
+    let ForAttempt::Refused(why) = got else {
+        panic!("{got:?}");
+    };
+    assert!(
+        why.starts_with("the play skin cannot be built for this chart: ")
+            && why.contains("a chart total past its range"),
+        "{why}"
+    );
+    // Within the range it folds.
+    let (got, _, _, _) = attempt(&mut skin, &chart_text("#TOTAL 2147483646\n", 10));
+    assert_eq!(requested(&ready(got)), ["high"]);
 }

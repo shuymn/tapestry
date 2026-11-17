@@ -931,6 +931,54 @@ pub(crate) fn lua_skin(body: &str) -> tempfile::TempDir {
     dir
 }
 
+/// A Lua play skin whose configured pass runs `pre` with `ms` the host
+/// module, and whose text, in a font file, has the value `value`, drawn
+/// with `timer` at (100, 100).
+pub(crate) fn text_skin(pre: &str, value: &str, timer: &str) -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    let entry = format!(
+        "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
+         if not skin_config then return skin end\n\
+         local ms = require(\"main_state\")\n\
+         {pre}\n\
+         skin.font = {{ {{ id = \"f\", path = \"f.ttf\" }} }}\n\
+         skin.text = {{ {{ id = \"t\", font = \"f\", size = 40, value = {value} }} }}\n\
+         skin.destination = {{ {{ id = \"t\", {timer} dst = {{ {{ x = 100, y = 100, w = 800, h = 40 }} }} }} }}\n\
+         return skin\n"
+    );
+    fs::write(dir.path().join("play.luaskin"), entry).unwrap();
+    fs::write(
+        dir.path().join("f.ttf"),
+        crate::font_support::build(&crate::font_support::latin("Skin")),
+    )
+    .unwrap();
+    dir
+}
+
+/// A play text's value reading the chart's gauge total or note count
+/// makes the skin pending at its base import, on that fact.
+#[test]
+fn a_base_import_reading_a_chart_fact_ends_pending() {
+    let _serial = serial();
+    let r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    for (value, fact) in [
+        (
+            "function() return ms.number(368) >= 300 and \"high\" or \"low\" end",
+            FactId::ChartTotal,
+        ),
+        ("function() return ms.number(74) end", FactId::ChartNotes),
+    ] {
+        let dir = text_skin("", value, "");
+        let (_, note) = pending(play(&choice(dir.path(), "play.luaskin"), &t));
+        assert_eq!(note.fact, fact, "{value}");
+        assert_eq!(note.dependencies, ["play.luaskin"], "{value}");
+    }
+    // Control: a text over no chart fact builds.
+    let dir = text_skin("", "function() return \"x\" end", "");
+    let _ = bundled(play(&choice(dir.path(), "play.luaskin"), &t));
+}
+
 /// A Lua play skin builds against the base facts: autoplay (option 33,
 /// on) is known, so a skin reading it builds for the session's value; a
 /// skin reading the chart's judgment class (option 180) or its play level
