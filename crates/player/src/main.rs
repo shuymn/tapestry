@@ -19,6 +19,8 @@ compile_error!("player is Windows-only");
 
 #[cfg(feature = "dev-tools")]
 mod alloc_count;
+#[cfg(all(test, feature = "dev-tools"))]
+mod alloc_refusal;
 mod app_clock;
 mod args;
 mod attempt_context;
@@ -27,6 +29,7 @@ mod background;
 #[cfg(feature = "dev-tools")]
 mod bank_witness;
 mod bests;
+mod bga;
 mod chart_currency;
 mod chart_images;
 mod controls;
@@ -916,6 +919,9 @@ fn rig<'a>(
         render.chart_generation(),
         render.cursor_generation(),
     );
+    let bga = crate::bga::BgaWorker::new(render.bga_generation(), render.bga_publisher());
+    #[cfg(feature = "dev-tools")]
+    game::coord::observe_jobs(crate::dev::job_stage);
     // The loading waits serve the images' work a step left.
     let served = chart_images.clone();
     controls.serve_images(crate::controls::ImageService(Box::new(move || {
@@ -929,6 +935,7 @@ fn rig<'a>(
         skin: render_side::SkinState::Ready,
         pending: None,
         chart_images,
+        bga,
         play_chart: None,
         selection_chart: None,
         controls,

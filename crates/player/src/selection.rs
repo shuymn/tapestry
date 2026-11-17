@@ -2240,6 +2240,31 @@ pub enum ChartLoadError {
     NoSelection,
 }
 
+/// Holds a chart's load at its start until let go, the decision screen
+/// served meanwhile as the load's waits serve it, so its deadline can pass
+/// while the load still runs (tests).
+#[cfg(test)]
+pub static LOAD_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set while a load is held by [`LOAD_HOLD`] (tests).
+#[cfg(test)]
+pub static LOAD_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`LOAD_HOLD`]'s wait: the decision screen looked at, as the load's
+/// cancellation check looks at it, until let go or left.
+#[cfg(test)]
+fn hold_load(controls: &crate::controls::Controls) {
+    use std::sync::atomic::Ordering;
+    while LOAD_HOLD.load(Ordering::Acquire) {
+        LOAD_HELD.store(true, Ordering::Release);
+        if cancelled(controls) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    LOAD_HELD.store(false, Ordering::Release);
+}
+
 /// Whether the quit key or a window close cancels the load, or the
 /// decision screen its waits serve ([`Controls::look`]) was left.
 ///
@@ -2793,6 +2818,8 @@ impl PlayerRig<'_> {
             }
             sel.shelf.choose(path);
             sel.chosen_at = self.clock.now();
+            #[cfg(feature = "dev-tools")]
+            crate::dev::stages_begin(self.clock, sel.chosen_at);
             let name = file_name(path);
             let after = since(sel.entered_at, sel.chosen_at).as_millis();
             println!("select: chose {name}{what} {after} ms after entering selection");
@@ -3375,7 +3402,12 @@ impl PlayerRig<'_> {
             .watch_decision(crate::controls::DecisionWatch {
                 decision,
                 origin,
+                // The deadline step taken inside the rig's wait (a load
+                // still running at the deadline), as `deadline_step` takes
+                // it outside one.
                 reveal: Box::new(move || {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::stage("decision_end");
                     println!("load: the play screen loads {name}");
                     reveal();
                 }),
@@ -3757,12 +3789,15 @@ impl AppRig for PlayerRig<'_> {
     /// stage: a loading lifetime begins, with the shown gauge's descriptor
     /// from the validated preset selection has chosen.
     fn entered_loading(&mut self, chart: &std::path::Path) {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::stage("decision_end");
         // Selection is left, its images before the play generation's
         // renewal (SC5): nothing of selection's begins after it.
         self.left_selection();
         // A new generation of the chart's images before the loading
         // lifetime begins: none of the last one's draws in it.
         self.chart_images.renew();
+        self.bga.renew();
         // The coming attempt's entry: its loading-time adjustments are its
         // own, and solve nothing until its chart is read. A failed fence is
         // the input thread's failure, which ends the run.
@@ -3872,6 +3907,7 @@ impl AppRig for PlayerRig<'_> {
         // lifetime begins: none of the last choice's draws when the
         // deadline reveals it.
         self.chart_images.renew();
+        self.bga.renew();
         self.controls.close_epoch();
         if let Some(ime) = self.selection.as_ref().and_then(|s| s.ime.as_ref()) {
             ime.set(false);
@@ -3972,6 +4008,8 @@ impl AppRig for PlayerRig<'_> {
     /// epoch's end, the held lifetime shown, and a new scene. Waits for
     /// nothing.
     fn deadline_step(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::stage("decision_end");
         self.end_decision();
         if let Some((_, name)) = self.selection.as_ref().and_then(|s| s.decision.as_ref()) {
             println!("load: the play screen loads {name}");
@@ -4015,7 +4053,11 @@ impl AppRig for PlayerRig<'_> {
         let stepped = decision.stepped();
         // Moved to the load's waits and back, one owner at a time.
         let lent = std::mem::replace(decision, game::Decision::off());
-        let (loading, served) = self.watching(loaded.path(), lent, |rig| rig.load_watched(loaded));
+        let (loading, served) = self.watching(loaded.path(), lent, |rig| {
+            #[cfg(test)]
+            hold_load(rig.controls);
+            rig.load_watched(loaded)
+        });
         *decision = served;
         if decision.stepped() && !stepped {
             // The deadline's step ran inside a wait: the opening's
@@ -4110,6 +4152,7 @@ impl AppRig for PlayerRig<'_> {
         // Its images' job was cancelled with the choice's scope below; its
         // set is never taken, nor drawn.
         self.chart_images.forget();
+        self.bga.forget();
         let looks = looks!(self);
         let Some(sel) = &mut self.selection else {
             return Ok(());
@@ -4133,6 +4176,7 @@ impl AppRig for PlayerRig<'_> {
         // The last chart's images go: nothing of them stays beside
         // selection.
         self.chart_images.drop_images();
+        self.bga.drop_images();
         self.result_skin.drop_images();
         // Another scene: held adjustment controls act no more until
         // pressed afresh.
