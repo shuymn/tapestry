@@ -375,12 +375,15 @@ fn png_mode(bytes: &[u8]) -> Result<Result<Mode, Unbanded>, DecodeError> {
 /// counts, [`jpeg_scratch`], [`bmp_scratch`]) and the native image (8T at
 /// most); then, while converting, the native image and its RGBA8 copy (12T
 /// at most, none when the native image is already RGBA8); [`peak`] is the
-/// larger. With `E` at most [`MAX_FILE_BYTES`](super::MAX_FILE_BYTES)
-/// (64 MiB) and `T` at most [`MAX_IMAGE_TEXELS`](super::MAX_IMAGE_TEXELS)
-/// (12 Mi), the buffers made here are at most 160 MiB. The native image and
-/// the RGBA8 copy are allocated here, so a refusal is an error rather than
-/// an abort; a decoder's own buffers are only bounded, and abort as any
-/// out-of-memory does.
+/// larger. Here no limit holds that sum: with `T` at most
+/// [`MAX_IMAGE_TEXELS`](super::MAX_IMAGE_TEXELS) (12 Mi) the native image
+/// and its RGBA8 copy are at most 144 MiB, but a decoder's own buffers grow
+/// with `E` (a JPEG's envelope is 8E and more), so a caller that states a
+/// bound passes it to [`decode_alpha`] (a chart image's and a BGA
+/// picture's, [`DECODE_LIMIT`](crate::chart_image::DECODE_LIMIT)). The
+/// native image and the RGBA8 copy are allocated here, so a refusal is an
+/// error rather than an abort; a decoder's own buffers are only bounded,
+/// and abort as any out-of-memory does.
 pub(crate) fn decode(bytes: Vec<u8>, dims: [u32; 2]) -> Result<RgbaImage, DecodeError> {
     decode_alpha(bytes, dims, None).map(|(image, _)| image)
 }

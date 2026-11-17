@@ -13,7 +13,8 @@ use std::path::Path;
 use image::{ImageFormat, Rgba, RgbaImage};
 use image_support::{dir, link_dir, save, solid};
 use skin_model::chart_image::{
-    Absent, Binding, Cap, ChartDir, FileIdentity, Fitted, Read, Slot, Unresolved, read, resolve,
+    Absent, Binding, Cap, ChartDir, DECODE_LIMIT, FileIdentity, Fitted, Read, Slot, Unresolved,
+    read, resolve,
 };
 use skin_model::{GUTTER, MAX_FILE_BYTES, MAX_PATH_BYTES, MIP_LEVELS};
 
@@ -707,4 +708,25 @@ fn a_source_derives_each_slots_fit() {
         derive(&source, slot(1_152), &|| true),
         Err(Absent::Cancelled)
     );
+}
+
+/// A chart image is held to one whole-decode bound ([`DECODE_LIMIT`]) as
+/// its allocation limit (design.md "Memory Budget"; T08): a JPEG whose file
+/// runs on to 21 MiB, so that its decoder's buffers by their bound pass the
+/// limit, is refused before it decodes; the same picture run on to 15 MiB,
+/// whose bound fits, is read.
+#[test]
+fn a_chart_image_past_the_whole_decode_bound_is_refused() {
+    assert_eq!(DECODE_LIMIT, 161 << 20);
+    let d = dir();
+    let img = RgbaImage::from_pixel(64, 48, Rgba([200, 40, 40, 255]));
+    let jpeg = encoded(&img, ImageFormat::Jpeg);
+    for (name, len) in [("fits.jpg", 15_usize << 20), ("past.jpg", 21 << 20)] {
+        let mut bytes = jpeg.clone();
+        bytes.resize(len, 0);
+        fs::write(d.path().join(name), bytes).unwrap();
+    }
+    let read = fitted(read_in(d.path(), "fits.jpg", 64));
+    assert_eq!(texel(&read, 0, 32, 24)[3], 255);
+    assert_eq!(absent(&read_in(d.path(), "past.jpg", 64)), Absent::Refused);
 }
