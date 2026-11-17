@@ -362,17 +362,22 @@ fn bmp_variants_decode_through_the_production_reader() {
 #[test]
 fn a_refused_allocation_leaves_the_picture_absent() {
     let d = dir();
-    save(d.path(), "s.png", &solid(300, 300, [1, 2, 3, 255]));
+    // A BMP, whose decoder's own bound (about 2 KiB) is far below the cell.
+    solid(300, 300, [1, 2, 3, 255])
+        .save_with_format(d.path().join("s.bmp"), ImageFormat::Bmp)
+        .unwrap();
     let dir = ChartDir::new(d.path()).unwrap();
-    let BgaBinding::Resolved { path, key, .. } = resolve(&dir, "s.png", &fixed) else {
+    let BgaBinding::Resolved { path, key, .. } = resolve(&dir, "s.bmp", &fixed) else {
         panic!();
     };
     let native = probe(&path, &key, &fixed).unwrap();
     let read = |limit| read_cell(&path, &key, native, [300, 300], &never, &fixed, Some(limit));
-    // The file's bytes, then the cell (302² × 4 bytes).
+    // The file's bytes, then the cell beside the picture it is made from
+    // (300² and 302² × 4 bytes), which holds the most of the read.
+    let cell = 300 * 300 * 4 + 302 * 302 * 4;
     assert_eq!(read(0), Err(Absent::Refused));
-    assert_eq!(read(302 * 302 * 4 - 1), Err(Absent::Refused));
-    assert!(read(302 * 302 * 4).is_ok());
+    assert_eq!(read(cell - 1), Err(Absent::Refused));
+    assert!(read(cell).is_ok());
 }
 
 /// A large picture fitted to a small cell, its file under the limit: the

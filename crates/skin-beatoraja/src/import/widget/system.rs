@@ -148,7 +148,9 @@ impl Cx<'_> {
     /// BGA): an element of [`Source::Bga`], its keys' rects unbaked, as
     /// each picture's size is known only at the frame, and its stretch
     /// kept for placement, the cropping ones included; none, or an
-    /// unknown mode, takes the player's BGA expansion
+    /// unknown mode, takes `[bga] expand` (design.md "Settings Files"):
+    /// `full` fills the destination, `keep-aspect` keeps the picture's
+    /// aspect inside it, `off` keeps its aspect without enlarging it
     /// (`play/SkinBGA.java:24-31`, `skin/SkinObject.java:318-326`). Its
     /// filter is the BGA's own, the skin's not read. An offset-4 one that
     /// may reach the lanes is dropped: the BGA is never SUDDEN+'s paint.
@@ -166,7 +168,13 @@ impl Cx<'_> {
                 },
             );
         }
-        let stretch = skin_model::bga::BgaStretch::of(dst.stretch);
+        let stretch = skin_model::bga::BgaStretch::of(dst.stretch).unwrap_or(
+            skin_model::bga::BgaStretch::Whole(match self.config.bga.expand {
+                super::super::BgaExpand::Full => skin_model::chart_image::ChartStretch::Fill,
+                super::super::BgaExpand::KeepAspect => skin_model::chart_image::ChartStretch::Inner,
+                super::super::BgaExpand::Off => skin_model::chart_image::ChartStretch::NoExpanding,
+            }),
+        );
         let Some(c) = self.turning_image_common(&dst, charged, (Lowered::Image, role))? else {
             return Ok(());
         };

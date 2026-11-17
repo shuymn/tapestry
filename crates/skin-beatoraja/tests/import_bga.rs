@@ -64,14 +64,13 @@ fn model([x, y, w, h]: [i32; 4]) -> [f32; 4] {
 #[test]
 fn bga_destination_imports_with_track_blend_colour_stretch() {
     // 300×300 at (100, 200): stretch 3 crops the 512×256 picture to its
-    // middle 256×256; stretch 1 and an unset stretch keep it inside,
-    // 300×150 centred; stretch 0 fills.
+    // middle 256×256; stretch 1 keeps it inside, 300×150 centred;
+    // stretch 0 fills.
     let rect = model([100, 200, 300, 300]);
     let [x, y, w, _] = rect;
     for (mode, want, uv) in [
         ("3", rect, [0.03125, 0.0, 0.09375, 0.0625]),
         ("1", [x, y + 75.0, w, 150.0], CELL.uv.uv),
-        ("-1", [x, y + 75.0, w, 150.0], CELL.uv.uv),
         ("0", rect, CELL.uv.uv),
     ] {
         let l = import_body(&format!(
@@ -106,6 +105,53 @@ fn bga_destination_imports_with_track_blend_colour_stretch() {
     let mut d = Drawn::new(skin, 0);
     d.frame(0, &[]);
     assert_eq!(d.batch.runs()[0].key.blend, Blend::Add);
+}
+
+/// A destination without a stretch of its own, or with one no mode has,
+/// takes `[bga] expand` (`play/SkinBGA.java:24-31`,
+/// `skin/SkinObject.java:318-326`): `full` fills it, `keep-aspect` keeps
+/// the 512×256 picture's aspect inside it, enlarged to 1 024×512, and
+/// `off` keeps the aspect without enlarging it. A stretch of its own is
+/// kept whatever the expansion.
+#[test]
+fn a_bga_destination_without_a_stretch_takes_the_bga_expansion() {
+    use skin_beatoraja::BgaExpand;
+    let rect = model([100, 0, 1_024, 1_024]);
+    let [x, y, ..] = rect;
+    let inner = [x, y + 256.0, 1_024.0, 512.0];
+    let off = [x + 256.0, y + 384.0, 512.0, 256.0];
+    for (mode, expand, want) in [
+        ("-1", BgaExpand::Full, rect),
+        ("-1", BgaExpand::KeepAspect, inner),
+        ("-1", BgaExpand::Off, off),
+        ("11", BgaExpand::Full, rect),
+        ("11", BgaExpand::KeepAspect, inner),
+        ("11", BgaExpand::Off, off),
+        ("0", BgaExpand::Off, rect),
+        ("1", BgaExpand::Full, inner),
+        ("8", BgaExpand::Full, off),
+    ] {
+        let l = common::import_config(
+            [1_920, 1_080],
+            &format!(
+                r#""bga": {{"id": "b"}},
+            "destination": [{{"id": "b", "stretch": {mode},
+                "dst": [{{"x": 100, "y": 0, "w": 1024, "h": 1024}}]}}]"#
+            ),
+            &[],
+            |c| c.bga.expand = expand,
+        );
+        assert!(
+            l.report().notes.is_empty(),
+            "{mode} {expand:?}: {:?}",
+            kinds(l.report())
+        );
+        let quads = drawn(l.ok().skin.clone());
+        let [q] = quads.as_slice() else {
+            panic!("{mode} {expand:?}: {quads:?}");
+        };
+        assert_eq!(round(q.rect), round(want), "{mode} {expand:?}");
+    }
 }
 
 /// The object is looked up on play only: elsewhere its id names nothing.

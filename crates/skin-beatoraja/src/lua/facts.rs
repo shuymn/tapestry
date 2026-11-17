@@ -400,8 +400,8 @@ pub(crate) enum OptionRead {
     LiveState,
 }
 
-/// Answers `option(n)` from `facts`.
-pub(crate) fn option(facts: &ImportFacts, n: i32) -> OptionRead {
+/// Answers `option(n)` from `facts`, the BGA setting from `bga`.
+pub(crate) fn option(facts: &ImportFacts, n: i32, bga: crate::import::Bga) -> OptionRead {
     // `i32::MIN`'s magnitude is not an `i32`: not built in.
     let Some(id) = n
         .checked_abs()
@@ -424,10 +424,8 @@ pub(crate) fn option(facts: &ImportFacts, n: i32) -> OptionRead {
         _ if facts.scene == ScreenKind::Play && crate::import::ops::play_constant_false(id) => {
             return constant(false);
         }
-        // The BGA setting, answered as off on every scene (D33).
-        crate::import::ops::BGA_OFF | crate::import::ops::BGA_ON => {
-            return constant(id == crate::import::ops::BGA_OFF);
-        }
+        // The BGA setting, a constant of the session on every scene.
+        _ if let Some(on) = crate::import::ops::bga_setting(id, bga) => return constant(on),
         AUTOPLAY_OFF | AUTOPLAY_ON => FactId::Autoplay,
         _ if JudgeClass::of_option(id).is_some() => FactId::JudgeClass,
         // The result profile's: a constant, or a result fact.
@@ -572,7 +570,7 @@ mod tests {
                 (-1_008, true),
             ] {
                 assert_eq!(
-                    option(&f, n),
+                    option(&f, n, crate::import::Bga::default()),
                     OptionRead::Constant { value, known: true },
                     "{scene:?} {n}"
                 );

@@ -76,6 +76,69 @@ pub struct Config {
     /// File choice name to the chosen candidate's name.
     pub files: BTreeMap<String, String>,
     pub offsets: BTreeMap<i32, OffsetValue>,
+    /// The player's BGA setting, which options 40 and 41 and selection's
+    /// image index 72 read on every screen: not the skin's, but fixed for
+    /// the session as the skin's configuration is.
+    pub bga: Bga,
+}
+
+/// The player's BGA setting as a skin reads it (design.md "Differences
+/// from the source", BGA setting): `[bga]` in `player.toml`, and whether
+/// the session plays automatically, which its `Autoplay` reads.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Bga {
+    pub mode: BgaMode,
+    pub autoplay: bool,
+    /// `[bga] expand`, settled when the skin loads as the source binds it
+    /// (`play/SkinBGA.java:24-31` at `0.8.9`).
+    pub expand: BgaExpand,
+}
+
+/// `[bga] expand`: how a BGA destination without a stretch of its own
+/// fits the chart's pictures.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BgaExpand {
+    /// Stretched to the destination.
+    Full,
+    /// Fitted inside it, its aspect kept, the default.
+    #[default]
+    KeepAspect,
+    /// At its own size, its aspect kept.
+    Off,
+}
+
+/// `[bga] mode`: whether a play shows the chart's BGA.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum BgaMode {
+    /// Always, the default (`Config.java:152` at `0.8.9`).
+    #[default]
+    On,
+    /// Only in an autoplay session.
+    Autoplay,
+    /// Never.
+    Off,
+}
+
+impl Bga {
+    /// Whether the BGA is shown: option 41 holds, and 40 does not.
+    #[must_use]
+    pub const fn shown(self) -> bool {
+        match self.mode {
+            BgaMode::On => true,
+            BgaMode::Autoplay => self.autoplay,
+            BgaMode::Off => false,
+        }
+    }
+
+    /// Selection's image index 72: the mode in the source's numbering,
+    /// 0 on, 1 autoplay, 2 off (`Config.java:153-155` at `0.8.9`).
+    pub(crate) const fn index(self) -> &'static str {
+        match self.mode {
+            BgaMode::On => "0",
+            BgaMode::Autoplay => "1",
+            BgaMode::Off => "2",
+        }
+    }
 }
 
 /// A user offset: reference pixels (the source at a 1920×1080 window),
@@ -469,6 +532,15 @@ pub(crate) struct Cx<'d> {
     slot_roots: HashMap<u32, callback::SlotRoot>,
     /// Per callable instance, the play destinations whose `timer` it is.
     timer_sites: HashMap<u32, u32>,
+    /// The nodes holding an observer read as a play destination's
+    /// `timer`, whatever became of the destination
+    /// ([`Self::close_observers`]).
+    observers: std::collections::HashSet<u32>,
+    /// The nodes holding a function a consumer read as a callback
+    /// ([`Self::callback_prop`]): uses beside the source's schema sites,
+    /// such as the fields of a record a wrapper chose
+    /// ([`Self::close_observers`]).
+    read_callables: std::collections::HashSet<u32>,
     /// Per callable instance, the `timer`s of play destinations whose
     /// object the source removes, or whose timer is inert: no site, and
     /// no reference ([`Cx::close_slots`]).
@@ -536,15 +608,6 @@ pub(crate) struct Cx<'d> {
     /// The Lua scalar `op` values already noted ignored: a destination
     /// read twice (the lanes read ahead, a selected row) notes once.
     ignored_ops: BTreeSet<Span>,
-    /// The destination records already given their D33 note: one per
-    /// record, whichever path reads it and however often (a selected row's
-    /// record is read by its slot and again by its placement, a callback
-    /// read in its `op` and its object's value).
-    bga_noted: BTreeSet<Span>,
-    /// Each callable instance's option scan ([`Self::option_scan`]): whether
-    /// it reads the BGA setting, and whether it leaves an id or a callee
-    /// open.
-    option_scans: HashMap<u32, (bool, bool)>,
     /// The destination being read, for the conversion report's records.
     #[cfg(feature = "dev-tools")]
     element: Option<crate::lua::survey::Element>,
@@ -640,6 +703,8 @@ impl<'d> Cx<'d> {
             present: skin_model::present::PresentDef::default(),
             slot_roots: HashMap::new(),
             timer_sites: HashMap::new(),
+            observers: std::collections::HashSet::new(),
+            read_callables: std::collections::HashSet::new(),
             removed_refs: HashMap::new(),
             install: prepare::Install::default(),
             prepare: prepare::Prepare::Open,
@@ -664,8 +729,6 @@ impl<'d> Cx<'d> {
             cycled: BTreeSet::new(),
             selectors: HashMap::new(),
             ignored_ops: BTreeSet::new(),
-            bga_noted: BTreeSet::new(),
-            option_scans: HashMap::new(),
             #[cfg(feature = "dev-tools")]
             element: None,
             #[cfg(feature = "dev-tools")]
@@ -961,40 +1024,20 @@ impl<'d> Cx<'d> {
         let blend = self.int_or(blend, "blend", 0)?;
         let filter = self.int_or(filter, "filter", 0)?;
         let timer = self.callback_prop(timer, "timer")?;
+        // An observer here is met at a play destination's `timer`, whatever
+        // becomes of the destination.
+        if self.kind == ScreenKind::Play
+            && let Prop::Callable(id) = timer
+        {
+            self.observer_met(id);
+        }
         let looped = self.int_or(looped, "loop", 0)?;
         let center = self.int_or(center, "center", 0)?;
         let stretch = self.int_or(stretch, "stretch", -1)?;
         let draw = self.callback_prop(draw, "draw")?;
         let failure = self.failure(&timer, &ops);
-        let span = self.arena_span(rec);
-        let bga = ops.iter().any(|op| match op {
-            Op::Id(n) => names_bga(*n),
-            Op::Name(s) => ops::resolve_name(s).is_some_and(|(id, _)| names_bga(id)),
-            Op::Callable(_) => false,
-        }) || match &draw {
-            Prop::Id(n) => names_bga(*n),
-            Prop::Name(s) => ops::resolve_name(s).is_some_and(|(id, _)| names_bga(id)),
-            Prop::Null | Prop::Callable(_) => false,
-        };
-        if bga {
-            self.bga_note(span, span);
-        }
-        let callables: Vec<u32> = ops
-            .iter()
-            .filter_map(|op| match op {
-                Op::Callable(id) => Some(*id),
-                Op::Id(_) | Op::Name(_) => None,
-            })
-            .chain([&draw, &timer].into_iter().filter_map(|p| match p {
-                Prop::Callable(id) => Some(*id),
-                Prop::Null | Prop::Id(_) | Prop::Name(_) => None,
-            }))
-            .collect();
-        for id in callables {
-            self.bga_callback(span, id)?;
-        }
         let dst = Dst {
-            span,
+            span: self.arena_span(rec),
             blend,
             filter,
             timer,
@@ -1050,83 +1093,6 @@ impl<'d> Cx<'d> {
         Ok(ops)
     }
 
-    /// Notes D33 for destination record `rec` once, however often the
-    /// record is read, at `at`: its `op` or `draw` names the BGA setting
-    /// (options 40 and 41), answered as off, noted at the record, or a
-    /// callback it reads does ([`Self::bga_callback`]), noted at the
-    /// callback. Noted before anything decides the destination, so a
-    /// destination dropped, ignored or never drawn for another reason
-    /// carries it beside that reason's note.
-    fn bga_note(&mut self, rec: Span, at: Span) {
-        if self.bga_noted.insert(rec) {
-            self.note(
-                Some(at),
-                Severity::Deviation,
-                NoteKind::Deviation(DeviationId::D33),
-            );
-        }
-    }
-
-    /// [`Self::bga_note`] for destination record `rec` at the callback at
-    /// node `id` (its `op`, `draw` or `timer`, or its object's value) when
-    /// the callback's option scan finds a read of the BGA setting by an id
-    /// it resolves ([`Self::option_scan`]), whatever becomes of the
-    /// callback. An id the scan leaves open is noted when the callback
-    /// lowers or compiles and its evaluation folded the id to 40 or 41
-    /// ([`Self::lower`]).
-    pub(super) fn bga_callback(&mut self, rec: Span, id: u32) -> Result<(), ImportError> {
-        if self.bga_noted.contains(&rec) {
-            return Ok(());
-        }
-        if self.option_scan(id)?.0 {
-            let at = self.arena_span(id);
-            self.bga_note(rec, at);
-        }
-        Ok(())
-    }
-
-    /// [`Self::bga_note`] for record `rec` whose keys are not read (a
-    /// nested destination past the key cap): its `op`, `draw` and `timer`
-    /// fields read from the definition as `record_failure` reads them,
-    /// never its `dst` keys, a callback scanned ([`Self::bga_callback`]),
-    /// any other item that is not a number or a string skipped and no error
-    /// raised, so the exit it precedes is unchanged but for the analysis's
-    /// own limits.
-    fn bga_note_unread(&mut self, rec: u32) -> Result<(), ImportError> {
-        let [op, draw, timer] = self.def.fields(rec, ["op", "draw", "timer"]);
-        let items: Vec<u32> = match op {
-            Some(op) if self.def.arena.is_array(op) => self.def.arena.children(op).collect(),
-            _ => Vec::new(),
-        };
-        let named = items
-            .iter()
-            .copied()
-            .chain(draw)
-            .any(|f| match self.def.arena.scalar(f) {
-                Scalar::Long(_) | Scalar::Double(_) | Scalar::Int(_) | Scalar::Float(_) => {
-                    self.def.int(f, "op").is_ok_and(names_bga)
-                }
-                Scalar::Str { .. } => self
-                    .def
-                    .string(f, "op")
-                    .ok()
-                    .flatten()
-                    .and_then(|s| ops::resolve_name(&s))
-                    .is_some_and(|(id, _)| names_bga(id)),
-                _ => false,
-            });
-        let at = self.arena_span(rec);
-        if named {
-            self.bga_note(at, at);
-        }
-        for f in items.into_iter().chain(draw).chain(timer) {
-            if self.callable_at(f).is_some() {
-                self.bga_callback(at, f)?;
-            }
-        }
-        Ok(())
-    }
-
     /// Whether destination record `rec` is failure presentation
     /// ([`Self::failure`]), read from its `timer`, `op` and `draw` alone,
     /// before anything else of it is read or charged.
@@ -1178,7 +1144,7 @@ impl<'d> Cx<'d> {
     /// Numeric op `n`'s condition: none for 0, else built-ins first, then
     /// the declared items folded ([`ops::numeric`]).
     fn op_cond(&self, n: i32) -> Option<Cond> {
-        (n != 0).then(|| ops::numeric_in(self.kind, n, &self.items))
+        (n != 0).then(|| ops::numeric_in(self.kind, n, &self.items, self.config.bga))
     }
 
     /// Refuses a play destination `dst` the configured options leave
@@ -1465,8 +1431,37 @@ impl<'d> Cx<'d> {
             }
         };
 
+        // An observer at `timer` folds before the conditions: a false one
+        // never draws, whatever they are, as the source's never starts
+        // (`TimerUtility.java:89-108`).
+        let observer = match dst.timer {
+            Prop::Callable(id) => self.observer_timer(role, id)?,
+            _ => None,
+        };
+        if let Some((false, _)) = observer {
+            #[cfg(feature = "dev-tools")]
+            {
+                self.folded = true;
+                let callables = dst.ops.iter().filter_map(|op| match op {
+                    Op::Callable(id) => Some(*id),
+                    _ => None,
+                });
+                let draw = match dst.draw {
+                    Prop::Callable(id) => Some(id),
+                    _ => None,
+                };
+                for id in callables.chain(draw) {
+                    self.unused(id, crate::lua::callback::Unused::FoldedFalse);
+                }
+            }
+            self.ignored(at, NoteKind::Ignored { field: "timer" });
+            return Ok(None);
+        }
+
         // Conditions, after the value's availability.
         let mut conds: Vec<String> = o.guard.into_iter().map(str::to_owned).collect();
+        // The destination's own conditions start here.
+        let own = conds.len();
         let mut deviates = false;
         let mut seen = BTreeSet::new();
         // The source's order: the numeric ids first, then the names and
@@ -1485,7 +1480,7 @@ impl<'d> Cx<'d> {
                     };
                     c
                 }
-                Op::Name(s) => match ops::named_in(self.kind, s) {
+                Op::Name(s) => match ops::named_in(self.kind, s, self.config.bga) {
                     Some(c) => c,
                     None => {
                         let why = NoteKind::UnsupportedProperty {
@@ -1528,7 +1523,7 @@ impl<'d> Cx<'d> {
         match &dst.draw {
             Prop::Null => {}
             Prop::Id(n) => {
-                if let Some(c) = draw_cond(self.kind, *n) {
+                if let Some(c) = draw_cond(self.kind, *n, self.config.bga) {
                     if !self.condition(role, at, c, &mut conds, &mut deviates)? {
                         return Ok(None);
                     }
@@ -1537,7 +1532,7 @@ impl<'d> Cx<'d> {
                 }
             }
             Prop::Name(s) => {
-                let Some(c) = ops::named_in(self.kind, s) else {
+                let Some(c) = ops::named_in(self.kind, s, self.config.bga) else {
                     let why = NoteKind::UnsupportedProperty {
                         kind: PropertyKind::Boolean,
                         id: None,
@@ -1558,6 +1553,38 @@ impl<'d> Cx<'d> {
 
         // Timer.
         let (timer, untimed) = match dst.timer {
+            // A true observer: untimed, as the source's starts at the first
+            // frame its destination is prepared, unless its object's own
+            // preparation or a condition may hold that frame back: a number
+            // leaves before the timer is read at a sentinel value
+            // (`SkinNumber.java:138-150`), an image choice at a negative
+            // index (`SkinImage.java:127-132`), a judge before its first
+            // judgment (`play/SkinJudge.java:97-103`). Every number is
+            // refused, a constant one included: the import does not prove
+            // a value is never a sentinel.
+            Prop::Callable(id) if observer.is_some() => {
+                let held = self.number_value.is_some()
+                    || self.sentinel_read
+                    || !matches!(self.prepare.before(), Ok(None));
+                let why = if held {
+                    Some("object may hold its timer back")
+                } else if conds
+                    .get(own..)
+                    .unwrap_or_default()
+                    .iter()
+                    .any(|c| c != "true")
+                {
+                    Some("destination is conditioned")
+                } else {
+                    None
+                };
+                if let Some(why) = why {
+                    let c = observer.map_or(crate::tree::NONE, |(_, c)| c);
+                    let why = crate::lua::Unsupported::Observer(why);
+                    return Err(self.observer_refused(role, (c, id), why));
+                }
+                (self.screen(), true)
+            }
             Prop::Null => (self.screen(), true),
             Prop::Id(n) if n < 0 => (self.screen(), true),
             Prop::Name(_) => {
@@ -2380,6 +2407,7 @@ impl<'d> Cx<'d> {
             loadend,
             present: {
                 self.close_slots()?;
+                self.close_observers()?;
                 (!self.present.callbacks.is_empty()).then(|| std::mem::take(&mut self.present))
             },
         };
@@ -2492,19 +2520,13 @@ impl Common {
     }
 }
 
-/// Whether numeric op or `draw` `n` names the BGA setting, 40 or 41 of
-/// either sign (D33).
-fn names_bga(n: i32) -> bool {
-    i32::try_from(n.unsigned_abs()).is_ok_and(|id| ops::bga_setting(id).is_some())
-}
-
 /// Numeric `draw` `n`'s condition: a boolean property joining the ops
 /// (`JsonSkinObjectLoader.java:734-737`), so a built-in only; anything
 /// else, an option item among them, has no effect (`None`) and never
 /// folds.
-fn draw_cond(kind: ScreenKind, n: i32) -> Option<Cond> {
+fn draw_cond(kind: ScreenKind, n: i32, bga: Bga) -> Option<Cond> {
     ops::is_builtin(i32::try_from(n.unsigned_abs()).unwrap_or(0))
-        .then(|| ops::numeric_in(kind, n, &BTreeMap::new()))
+        .then(|| ops::numeric_in(kind, n, &BTreeMap::new(), bga))
 }
 
 /// The pivot of `center`: 1..=9 as the table of `SkinObject.java:80-81,

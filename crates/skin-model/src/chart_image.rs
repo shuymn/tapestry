@@ -739,8 +739,11 @@ pub(crate) fn area(src: &[u8], from: [u32; 2], to: [u32; 2]) -> Result<Vec<u8>, 
     let mut out = zeroed(cw * ch * 4)?;
     // One output row's column sums over the source rows it covers, per
     // source column and channel.
-    let mut acc = vec![0_u64; to_usize(from[0]) * 4];
     let row_bytes = to_usize(from[0]) * 4;
+    let mut acc = Vec::new();
+    acc.try_reserve_exact(row_bytes)
+        .map_err(|_| Absent::Decode)?;
+    acc.resize(row_bytes, 0_u64);
     let total = w * h;
     for (oy, out_row) in (0..ch).zip(out.chunks_exact_mut(to_usize(to[0]) * 4)) {
         acc.iter_mut().for_each(|a| *a = 0);

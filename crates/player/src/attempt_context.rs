@@ -69,6 +69,8 @@ pub struct AttemptContext {
     /// The scratch lane's notes autoplay's turntable presses, built before
     /// READY; none for a play by hand.
     scratch_notes: Vec<game::ScratchNote>,
+    /// Whether the session shows the chart's BGA.
+    bga_shown: bool,
 }
 
 impl AttemptContext {
@@ -107,6 +109,7 @@ impl AttemptContext {
             areas: attempt.areas,
             speed: attempt.speed,
             scratch_notes: Vec::new(),
+            bga_shown: true,
         }
     }
 
@@ -141,6 +144,15 @@ impl AttemptContext {
         self.epoch
     }
 
+    /// The attempt with the chart's BGA shown when `shown` (the
+    /// session's answer, [`game::BgaSession::shown`]); shown until
+    /// told.
+    #[must_use]
+    pub const fn with_bga_shown(mut self, shown: bool) -> Self {
+        self.bga_shown = shown;
+        self
+    }
+
     /// The attempt with `notes` as autoplay's scratch notes.
     #[must_use]
     pub fn with_scratch_notes(mut self, notes: Vec<game::ScratchNote>) -> Self {
@@ -171,6 +183,7 @@ impl AttemptContext {
         PlayContext {
             meta: self.meta,
             autoplay: self.autoplay,
+            bga_shown: self.bga_shown,
             gauges: &self.gauges,
             attempt: match &self.kind {
                 AttemptKind::Full { lead_in } => skin_model::Attempt::Full {

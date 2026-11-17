@@ -392,6 +392,9 @@ pub struct SelectedChart {
     /// with another note count, and for one without a summary or preset.
     pub max_ex: Option<u64>,
     pub score: RowScore,
+    /// Its library entry's BGA flag: whether it defines a `#BMPxx` image
+    /// (design.md "Differences from the source", BGA flag).
+    pub bga: bool,
     /// Its judgment class from its library entry's rank, 0 the hardest to
     /// 4 the easiest; `None` without one, or for a rank in no class. A
     /// value above 4 is none.

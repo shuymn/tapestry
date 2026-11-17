@@ -70,7 +70,12 @@ fn value_deviates(v: Value) -> bool {
 /// Image set `value` and `ref`'s selector: an explicit value first, its
 /// null falling back to `ref` in the image-index namespace; a value the
 /// model cannot show does not fall back.
-pub(in super::super) fn set_selector(kind: ScreenKind, value: &Prop, r: i32) -> SetSelector {
+pub(in super::super) fn set_selector(
+    kind: ScreenKind,
+    value: &Prop,
+    r: i32,
+    bga: crate::import::Bga,
+) -> SetSelector {
     match property::value_prop(kind, value) {
         IntProp::Shown(v) => SetSelector::Expr {
             src: value_selector(v),
@@ -89,7 +94,7 @@ pub(in super::super) fn set_selector(kind: ScreenKind, value: &Prop, r: i32) -> 
                 id,
             },
         },
-        IntProp::Null => match property::index_in(kind, r) {
+        IntProp::Null => match property::index_in(kind, r, bga) {
             IndexProp::Null => SetSelector::Null,
             IndexProp::Unsupported(id) => SetSelector::Unsupported {
                 why: index_unsupported(id),

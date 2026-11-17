@@ -516,6 +516,8 @@ pub const IN_PLAY: &[Site] = &[
         "crates/skin-model/src/bga.rs",
         &[
             "BgaTable::drawable",
+            "BgaTable::published",
+            "BgaTable::key",
             "BgaTable::get",
             "NullMedia::frame",
             "BgaStretch::place",

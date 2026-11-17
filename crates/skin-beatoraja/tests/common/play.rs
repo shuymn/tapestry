@@ -264,6 +264,7 @@ pub fn context_with(
         bpm_whole_change,
         play_level: None,
         score: skin_model::PlayScore::NONE,
+        bga_shown: true,
     }
 }
 
