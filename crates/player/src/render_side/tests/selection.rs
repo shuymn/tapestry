@@ -211,7 +211,9 @@ fn the_skin_state_follows_the_lifetime_and_a_refusal_is_for_the_run() {
     assert!(wait_until(|| seen(&screens)
         .iter()
         .any(|s| s.revision == 1)));
-    let first = last(&screens);
+    // The update's first frame, not the latest: frames after it may
+    // already have been drawn, and they lay nothing out.
+    let first = *seen(&screens).iter().find(|s| s.revision == 1).unwrap();
     assert!(first.state.is_some() && first.changed);
     // Later frames of the same update lay nothing out again.
     assert!(wait_until(|| !last(&screens).changed));
