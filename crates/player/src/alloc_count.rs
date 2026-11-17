@@ -138,15 +138,25 @@ fn note() {
 /// The allocator.
 pub struct Counting;
 
-// SAFETY: delegates to `System`; only adds a counter, which never allocates.
+// SAFETY: delegates to `System`; only adds a counter, which never allocates
+// (tests: or returns null for the one allocation `alloc_refusal` chose, as
+// an allocator out of memory does).
 unsafe impl GlobalAlloc for Counting {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        #[cfg(test)]
+        if crate::alloc_refusal::refuses(layout.size()) {
+            return std::ptr::null_mut();
+        }
         note();
         // SAFETY: same contract as the caller's.
         unsafe { System.alloc(layout) }
     }
 
     unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        #[cfg(test)]
+        if crate::alloc_refusal::refuses(layout.size()) {
+            return std::ptr::null_mut();
+        }
         note();
         // SAFETY: same contract as the caller's.
         unsafe { System.alloc_zeroed(layout) }
@@ -167,6 +177,10 @@ unsafe impl GlobalAlloc for Counting {
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        #[cfg(test)]
+        if crate::alloc_refusal::refuses(new_size) {
+            return std::ptr::null_mut();
+        }
         note();
         // SAFETY: same contract as the caller's.
         unsafe { System.realloc(ptr, layout, new_size) }

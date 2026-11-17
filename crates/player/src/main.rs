@@ -19,6 +19,8 @@ compile_error!("player is Windows-only");
 
 #[cfg(feature = "dev-tools")]
 mod alloc_count;
+#[cfg(all(test, feature = "dev-tools"))]
+mod alloc_refusal;
 mod app_clock;
 mod args;
 mod attempt_context;

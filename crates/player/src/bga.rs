@@ -580,9 +580,19 @@ fn read_and_publish(
         }
         match b {
             BgaBinding::Resolved { video: true, .. } => *entry = BgaEntry::Video,
-            BgaBinding::Resolved { path, key, .. } => {
-                *native = bga::probe(path, key, identity).ok();
-            }
+            BgaBinding::Resolved { path, key, .. } => match bga::probe(path, key, identity) {
+                Ok(size) => *native = Some(size),
+                // A refused allocation leaves every picture absent, as a
+                // refused decode does below.
+                Err(Absent::Refused) => {
+                    log::warn!("bga: a picture's memory was refused; the pictures are absent");
+                    out.end = publish(None, absent());
+                    return out;
+                }
+                Err(Absent::Cancelled) => return out,
+                // A picture that cannot be read is absent alone.
+                Err(_) => {}
+            },
             BgaBinding::Unresolved(_) => {}
         }
     }

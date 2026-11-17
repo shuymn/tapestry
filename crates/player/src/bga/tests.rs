@@ -401,6 +401,58 @@ fn an_answer_begun_in_time_is_taken_after_the_bound() {
     assert!(matches!(poll, Poll::Ready(_)), "{poll:?}");
 }
 
+/// A picture whose header read the allocator refuses, before any picture
+/// is decoded, leaves every picture of the attempt absent, the one beside
+/// it that reads whole included, under the coordinator and on a direct
+/// launch alike: no array is begun. With nothing refused both are read.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_refused_header_read_leaves_every_picture_absent() {
+    let _serial = crate::imports::tests::serial();
+    let d = tempfile::tempdir().unwrap();
+    // The refused file runs on to a length no other allocation here is
+    // likely to have: its header read reserves the whole file (under the
+    // header's cap), the first allocation of that size.
+    png(d.path(), "odd.png", [64, 48], [200, 0, 0]);
+    let mut bytes = std::fs::read(d.path().join("odd.png")).unwrap();
+    bytes.resize(7_919, 0);
+    std::fs::write(d.path().join("odd.png"), &bytes).unwrap();
+    png(d.path(), "b.png", [640, 480], [0, 200, 0]);
+    for coordinated in [true, false] {
+        for refused in [false, true] {
+            let what = format!("coordinated {coordinated}, refused {refused}");
+            let screens = Installers::default();
+            let link = render(&screens);
+            let coord = Coordinator::new(CAPS);
+            let w = worker(&link);
+            w.renew();
+            w.attempt(want(d.path(), &["odd.png", "b.png"]));
+            if refused {
+                crate::alloc_refusal::arm(bytes.len());
+            }
+            let t = if coordinated {
+                ready(&w, &coord)
+            } else {
+                w.step(None, &|| false);
+                match w.poll() {
+                    Poll::Ready(t) => t,
+                    other => panic!("{what}: {other:?}"),
+                }
+            };
+            assert_eq!(crate::alloc_refusal::disarm(), refused, "{what}: refusal");
+            let drawn: Vec<_> = t.entries().iter().map(|&e| native(e)).collect();
+            let begun = screens.bga.lock().unwrap().begins.len();
+            if refused {
+                assert_eq!(drawn, [None, None], "{what}");
+                assert_eq!(begun, 0, "{what}: no array");
+            } else {
+                assert_eq!(drawn, [Some([256, 256]), Some([640, 480])], "{what}");
+                assert_eq!(begun, 1, "{what}");
+            }
+        }
+    }
+}
+
 /// A 64×48 JPEG of one colour, progressive, its three components at full
 /// resolution (4:4:4: `SOF2`, each sampled 1×1), made outside the
 /// repository by an encoder that writes progressive files (Pillow,
