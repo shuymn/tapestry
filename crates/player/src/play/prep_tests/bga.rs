@@ -101,8 +101,9 @@ fn bga_transient_the_ledger_refuses_leaves_bga_absent_and_play_starts() {
 /// A session that does not show the BGA (`[bga] mode` off, or `autoplay`
 /// in a session that is not autoplay) reads nothing for a chart with BGA:
 /// no job begun, nothing decoded, no array begun; and it is ready without
-/// waiting for its empty table, which the render thread holds here past
-/// the link's bound; a later step reads nothing either. The session's answer is read, never the rig's own
+/// waiting for its empty table, sent at once, which the render thread holds here past
+/// the link's bound; a later step reads nothing either, and the attempt is
+/// prepared to draw the placeholder. The session's answer is read, never the rig's own
 /// autoplay, which a scenario's chart changes: an autoplay session whose
 /// rig plays by hand still reads the pictures.
 #[test]
@@ -139,11 +140,27 @@ fn a_session_not_showing_the_bga_reads_nothing_and_is_ready_unwaited() {
             assert_eq!(ready, Preparation::Ready, "{what}");
             assert!(took < Duration::from_secs(1), "{what}: waited {took:?}");
             assert_eq!(stage(rig), "answered", "{what}");
+            // Its empty table was sent by READY: once released, the render
+            // thread takes it without another step.
+            let by = Instant::now() + Duration::from_secs(5);
+            while screens.bga.lock().unwrap().published.is_empty() && Instant::now() < by {
+                std::thread::park_timeout(Duration::from_millis(1));
+            }
+            {
+                let seen = screens.bga.lock().unwrap();
+                assert_eq!(seen.published.len(), 1, "{what}: the empty table sent");
+                assert!(seen.published[0].entries().is_empty(), "{what}");
+            }
             // A later step, as the play's take: with no coordinator the
             // job would run now, so what the attempt asked for is read
             // here if anything is.
             rig.bga.step(None, &|| false);
             assert_eq!(rig.bga.counts(), (0, 0), "{what}: nothing read");
+            assert_eq!(
+                *screens.bga_shown.lock().unwrap(),
+                [false],
+                "{what}: the attempt draws the placeholder"
+            );
             let seen = screens.bga.lock().unwrap();
             assert!(seen.begins.is_empty(), "{what}: no array");
             assert_eq!(seen.cells, 0, "{what}");
@@ -157,6 +174,7 @@ fn a_session_not_showing_the_bga_reads_nothing_and_is_ready_unwaited() {
         let mut h = begin(rig, &l);
         assert_eq!(polled(rig, &mut h).unwrap(), Preparation::Ready);
         assert_eq!(rig.bga.counts(), (1, 1), "an autoplay session reads them");
+        assert_eq!(*screens.bga_shown.lock().unwrap(), [true], "and draws them");
         let seen = screens.bga.lock().unwrap();
         let table = seen.current().expect("published before ready");
         assert!(matches!(table.entries(), [BgaEntry::Picture(c)] if c.native == [640, 480]));

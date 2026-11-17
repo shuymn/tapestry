@@ -14863,6 +14863,11 @@ pub(crate) mod tests {
                 "prepare {request} {:?} {}",
                 a.context.scratch, a.text.title
             ));
+            self.shared
+                .bga_shown
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(a.context.bga_shown);
             self.staged_score = Some(a.context.score.basis);
             self.staged_pace = a.context.score.pace.map(<[u32]>::to_vec);
             // The skin given is staged with the attempt, as the renderer
@@ -15336,6 +15341,8 @@ pub(crate) mod tests {
         log: Log,
         /// Selection frames refuse while set, as a skin refusing one.
         pub(crate) refuse_selection: Arc<AtomicBool>,
+        /// Whether each attempt prepared shows the chart's BGA, in order.
+        pub(crate) bga_shown: Arc<std::sync::Mutex<Vec<bool>>>,
         /// Frames are paced while set: each wait takes one of `permits`,
         /// holding until there is one.
         pub(crate) pace: Arc<AtomicBool>,

@@ -2460,9 +2460,12 @@ impl Rig for PlayerRig<'_> {
                         break Ok(game::PrepPoll::Pending);
                     }
                     // A play that does not show the BGA asked for nothing:
-                    // ready without waiting for its empty table, which a
-                    // later step takes.
+                    // its empty table is sent now (the step begins no job),
+                    // and it is ready without waiting for the answer, which
+                    // a later step takes.
                     Some(ImagesPoll::Ready) if !self.bga_session.shown() => {
+                        let coord = self.selection.as_ref().map(|s| (&s.coord, s.spawner));
+                        self.bga.step(coord, &|| false);
                         prep.stage = PrepStage::Answered(Some(request));
                         break Ok(game::PrepPoll::Done(Preparation::Ready));
                     }
