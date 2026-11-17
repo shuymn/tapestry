@@ -853,6 +853,8 @@ struct Core {
     /// The live pool generation (0 for none) and its slots.
     pool_generation: u64,
     slots: Option<pool::Slots>,
+    /// The live pool was read once: its layout or absence is logged.
+    pool_read: bool,
     /// Reads numbered: each read's version.
     versions: u64,
     /// The one pool write from a read's end to its answer.
@@ -993,6 +995,7 @@ impl ChartImageWorker {
                 entries: pool::Entries::default(),
                 pool_generation: 0,
                 slots: None,
+                pool_read: false,
                 versions: 0,
                 pending_write: None,
                 check: None,
@@ -1980,11 +1983,18 @@ impl Core {
     /// the resident entries and the slots go, the absent entries stay, a
     /// read's write not yet sent goes, and the cursor's row, its read
     /// asked in this rest and now without an entry, is read again as on a
-    /// cold start. Logs the pool's change once.
+    /// cold start. Logs the pool's change once, and its absence at the
+    /// first read.
     fn sync_pool(&mut self, publisher: &crate::render_side::ChartPublisher) {
         let (layout, _) = publisher.pool_now();
         let generation = layout.map_or(0, |l| l.generation);
+        let first = !std::mem::replace(&mut self.pool_read, true);
         if generation == self.pool_generation {
+            // No pool from the start (the device refused even the firm
+            // layer, or the skin keeps none): logged once all the same.
+            if first {
+                log::info!("chart images: no pool");
+            }
             return;
         }
         match layout {

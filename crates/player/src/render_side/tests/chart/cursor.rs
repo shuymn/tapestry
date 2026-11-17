@@ -523,6 +523,27 @@ fn a_new_pool_generation_reloads_the_cursor() {
     assert!(c.w.take_rearm(), "the row not asked again with a pool");
 }
 
+/// A pool absent from the start (the device refused even its firm layer,
+/// or the skin keeps none) is logged once, at the worker's first selection
+/// step, though its generation never changes (AC-S9).
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_pool_absent_from_the_start_is_logged_once() {
+    let _serial = crate::imports::tests::serial();
+    let r = rig_with(0);
+    r.link.enter_selection(1);
+    r.link
+        .show_selection(crate::render_side::tests::selection_update(1, 1));
+    let w = ChartImageWorker::new(r.link.chart_generation());
+    let coord = Coordinator::new(CAPS);
+    let lines = crate::result_skin::chart_tests::logged("chart images: no pool", || {
+        for _ in 0..3 {
+            w.cursor_step(&coord, Spawner::SYSTEM, &r.link.chart_publisher());
+        }
+    });
+    assert_eq!(lines.len(), 1, "{lines:?}");
+}
+
 /// A changed file withdraws its entry at the check of its next use: a
 /// stage file replaced, a stage file deleted, and a missing banner that
 /// appeared each drop the cursor row's entry, free its slot, make the
