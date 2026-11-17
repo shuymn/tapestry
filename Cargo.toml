@@ -35,7 +35,7 @@ num-integer = { version = "0.1.47", default-features = false }
 num-rational = { version = "0.4.2", default-features = false, features = ["num-bigint"] }
 num-traits = { version = "0.2.19", default-features = false }
 
-# bms-parser, library, replay and audio, and render (dev only)
+# bms-parser, library, replay, audio and xtask, and render (dev only)
 sha2 = { version = "0.11.1", default-features = false }
 
 # replay
@@ -132,6 +132,8 @@ pulldown-cmark = { version = "0.13.6", default-features = false }
 proc-macro2 = { version = "1.0.107", default-features = false, features = ["span-locations"] }
 quote = { version = "1.0.47", default-features = false }
 syn = { version = "2.0.119", default-features = false, features = ["full", "parsing", "printing", "visit"] }
+# `cargo xtask ffmpeg fetch` finds MSVC's lib.exe as cc finds MSVC's tools.
+cc = "1.10.0"
 
 # Debug builds as the Windows CI jobs build them (docs/setup.md "CI"): line
 # tables keep backtraces' files and lines at a fraction of full debug info's

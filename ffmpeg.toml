@@ -1,0 +1,82 @@
+# tapestry's FFmpeg build (design.md "Libraries", the FFmpeg row; docs/setup.md
+# "FFmpeg"): the source, how `cargo xtask ffmpeg build` builds it and, once the
+# owner has published it, the release `cargo xtask ffmpeg fetch` unpacks.
+# [release] is added in a PR after the release exists, from the hashes.toml the
+# build wrote, never edited by hand from another machine's build.
+version = 1
+
+[source]
+# release/9.0; `git describe` of the commit, which the build writes as VERSION.
+commit = "7adfbe40dcde598f93a6963d2f7b22cd75202ccc"
+describe = "n9.0.2-39-g7adfbe40dc"
+archive = "https://github.com/FFmpeg/FFmpeg/archive/7adfbe40dcde598f93a6963d2f7b22cd75202ccc.tar.gz"
+sha256 = "4babda050dcfccb1194dd2a9e75b5e5ec1aa33b3e99d4f6a7106b6337b6b4a0c"
+# `nix hash path` of the unpacked tree: still checks the source if the archive
+# is ever re-compressed and its sha256 changes.
+tree = "sha256-KO11MR50bFBPQxkBoc1tDuIQGhYPrBJe+50Y0Gqaf6A="
+# The commit's committer time (2026-10-30T00:33:43Z), the build's
+# SOURCE_DATE_EPOCH: ld writes it as each DLL's PE time stamp.
+date = 1793320423
+
+[build]
+# Counts changes of flags, libraries or toolchain (flake.lock's nixpkgs); the
+# release tag's last part and FFmpeg's --extra-version.
+revision = 1
+# The fixed path the build runs at: the DLLs embed it, so a rebuild matches
+# only at the same path.
+dir = "/tmp/tapestry-ffmpeg-build"
+dlls = ["avutil-61", "swresample-7", "swscale-10", "avcodec-63", "avformat-63"]
+# Shared LGPL libraries for 64-bit Windows with zlib as the one external
+# library, without programs, devices, filters or any hardware or Windows media
+# component (design.md "Threat Model" T02: nothing that imports USER32 or
+# GDI32), Windows threads and libgcc linked in. The build adds
+# --extra-version and the -I and -L of the shell's mcfgthread and zlib.
+configure = [
+  "--enable-cross-compile",
+  "--target-os=mingw32",
+  "--arch=x86_64",
+  "--cross-prefix=x86_64-w64-mingw32-",
+  "--pkg-config=pkg-config",
+  "--enable-shared",
+  "--disable-static",
+  "--disable-autodetect",
+  "--enable-zlib",
+  "--disable-programs",
+  "--disable-doc",
+  "--disable-avdevice",
+  "--disable-avfilter",
+  "--disable-hwaccels",
+  "--disable-amf",
+  "--disable-audiotoolbox",
+  "--disable-cuda",
+  "--disable-cuda-llvm",
+  "--disable-cuda-nvcc",
+  "--disable-cuda-sdk",
+  "--disable-cuvid",
+  "--disable-d3d11va",
+  "--disable-d3d12va",
+  "--disable-dxva2",
+  "--disable-ffnvcodec",
+  "--disable-libdrm",
+  "--disable-libmfx",
+  "--disable-libvpl",
+  "--disable-mmal",
+  "--disable-nvdec",
+  "--disable-nvenc",
+  "--disable-opencl",
+  "--disable-v4l2-m2m",
+  "--disable-vaapi",
+  "--disable-vdpau",
+  "--disable-videotoolbox",
+  "--disable-vulkan",
+  "--disable-mediafoundation",
+  "--enable-w32threads",
+  "--disable-pthreads",
+  "--extra-ldflags=-static-libgcc",
+]
+
+[zlib]
+# The flake's `ffmpeg` shell overrides the pinned nixpkgs' zlib with this
+# release (flake.nix); the build checks the shell's tarball against it.
+version = "1.4"
+sha256 = "02dd159783677a749c04adbdd02b55b8a2bcc7e054f51b76b549199a916ad584"
