@@ -247,6 +247,13 @@ pub struct PlayerRig<'a> {
     /// Whether the session plays generated input (design.md "Autoplay"):
     /// no recommended input offset, and "not saved" when nothing was.
     pub autoplay: bool,
+    /// The BGA setting with the session's autoplay, fixed for the session:
+    /// what the skin imports and a play's BGA read. A scenario (dev-tools)
+    /// is an autoplay session whose charts play their `play` step's input:
+    /// an input log's play turns `autoplay` off but leaves this as it was
+    /// at startup, so under `[bga] mode = "autoplay"` that play shows the
+    /// BGA, which a play from the devices would not.
+    pub bga_session: game::BgaSession,
     /// The run's play states, for the turntable (docs/stage3.md, offset
     /// 1).
     pub play_states: game::PlayStates,

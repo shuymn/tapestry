@@ -417,9 +417,6 @@ pub(crate) struct Pass {
     /// the index of the one being called: the reader a host read notes.
     pub(crate) runtime_sites: SyncRefCell<Vec<runtime::SiteAt>>,
     pub(crate) calling: SyncCell<Option<u32>>,
-    /// Whether each of the runtime's callbacks, by its index, has its
-    /// reads of the BGA setting noted ([`runtime::Site::option_open`]).
-    pub(crate) runtime_open: SyncRefCell<Vec<bool>>,
     /// A reference's frame inputs (dev-tools, [`replay`]).
     #[cfg(feature = "dev-tools")]
     pub(crate) replay: SyncRefCell<Option<replay::Frame>>,
@@ -491,17 +488,24 @@ impl Pass {
             runtime_notes: SyncRefCell::new(runtime::NoteBook::default()),
             runtime_sites: SyncRefCell::new(Vec::new()),
             calling: SyncCell::new(None),
-            runtime_open: SyncRefCell::new(Vec::new()),
             #[cfg(feature = "dev-tools")]
             replay: SyncRefCell::new(None),
         }
+    }
+
+    /// The BGA setting the configured pass's configuration carries; the
+    /// header pass, which has none, reads the default.
+    pub(crate) fn bga(&self) -> crate::import::Bga {
+        self.bridge
+            .as_ref()
+            .map_or_else(Default::default, |b| b.bga)
     }
 
     /// Enters the runtime phase for a `kind` screen, irreversibly: no
     /// setter clears it.
     pub(crate) fn enter_runtime(&self, kind: ScreenKind) {
         self.runtime.set(true);
-        *self.screen.borrow_mut() = Some(runtime::Screen::new(kind));
+        *self.screen.borrow_mut() = Some(runtime::Screen::new(kind, self.bga()));
     }
 
     /// Whether the VM runs as a screen's runtime.

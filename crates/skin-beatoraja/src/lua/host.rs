@@ -160,7 +160,7 @@ fn option(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<bool> {
         return Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: OPTION }));
     };
     let id = n.unsigned_abs();
-    match facts::option(snapshot, n) {
+    match facts::option(snapshot, n, pass.bga()) {
         OptionRead::Constant { value, known } => {
             pass.count_fact(|| {
                 if known {
@@ -317,19 +317,13 @@ fn runtime_number(pass: &Pass, n: i32) -> i32 {
 }
 
 /// `main_state.option(n)` on a screen's runtime: the profile's bridge, a
-/// negative id negated; false for an id it omits, noted once. A read of
-/// the BGA setting by a callback the import could not resolve is noted
-/// ([`super::runtime::note_bga`]).
+/// negative id negated; false for an id it omits, noted once.
 fn runtime_option(pass: &Pass, n: i32) -> bool {
-    let id = n.unsigned_abs().try_into().unwrap_or(i32::MAX);
-    if crate::import::ops::bga_setting(id).is_some() {
-        super::runtime::note_bga(pass, id);
-    }
     let mut screen = pass.screen.borrow_mut();
     let Some(s) = screen.as_mut() else {
         return false;
     };
-    if let Some(v) = s.option(id) {
+    if let Some(v) = s.option(n.unsigned_abs().try_into().unwrap_or(i32::MAX)) {
         return v != (n < 0);
     }
     drop(screen);

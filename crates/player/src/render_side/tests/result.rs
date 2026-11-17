@@ -683,7 +683,7 @@ pub(super) fn lua_skin_scripted(
     let built = crate::imports::build(
         ScreenKind::Result,
         &choice,
-        false,
+        crate::imports::SkinSession::default(),
         &target,
         &skin_beatoraja::Cancel::new(),
     );

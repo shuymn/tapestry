@@ -907,7 +907,8 @@ fn the_settings_draw_the_players_values_through_the_production_path() {
             .map(|(&id, &k)| (id, k))
             .collect()
     };
-    // The truthful constants: 7-key and no BGA (2), every other 0.
+    // The truthful constants: 7-key (2), every other 0, the BGA setting
+    // (72) among them as `on`, the default.
     let mut want_constants: BTreeMap<i32, u8> = [
         11, 15, 16, 19, 42, 43, 54, 72, 75, 77, 301, 302, 303, 304, 305, 306, 307, 308, 315, 316,
         317, 318, 341,
@@ -916,7 +917,6 @@ fn the_settings_draw_the_players_values_through_the_production_path() {
     .map(|id| (id, 0))
     .collect();
     want_constants.insert(11, 2);
-    want_constants.insert(72, 2);
 
     let a = settings(
         7,
@@ -1719,5 +1719,96 @@ fn the_player_totals_draw() {
         };
         s.view(&v);
         assert_eq!(numbers(&mut s, &PLAYER_NUMBERS), want, "{what}");
+    }
+}
+
+/// The options of the BGA test, each a `dot` at x `10 · i`.
+const BGA_OPS: [i32; 8] = [40, -40, 41, -41, 170, -170, 171, -171];
+
+/// The BGA fixture: a `dot` under each of [`BGA_OPS`] and image index 72
+/// (an image of eleven entries) at x 1000.
+fn bga_skin() -> String {
+    let mut dsts: Vec<String> = BGA_OPS
+        .iter()
+        .enumerate()
+        .map(|(i, op)| {
+            format!(
+                r#"{{"id": "dot", "op": [{op}], "dst": [{}]}}"#,
+                at(10 * i as i32, 1000, 8, 8)
+            )
+        })
+        .collect();
+    dsts.push(format!(
+        r#"{{"id": "i72", "dst": [{}]}}"#,
+        at(1000, 900, 8, 8)
+    ));
+    let list = song_list(&[&at(0, 900, 300, 40)], &[&at(0, 900, 300, 40)], 0, TITLE);
+    format!(
+        r#""imageset": [{SET}], "text": [{TEXT_T}], {list},
+           "image": [{}, {{"id": "i72", "src": "s", "x": 0, "y": 64, "w": 88, "h": 8, "divx": 11, "len": 11, "ref": 72}}],
+           "destination": [{{"id": "list", "dst": [{{"x": 0, "y": 0, "w": 0, "h": 0}}]}}, {}]"#,
+        common::selection::IMAGES,
+        dsts.join(",")
+    )
+}
+
+/// Through the production path, image index 72 shows the BGA setting (0
+/// `on`, 1 `autoplay`, 2 `off`) and options 40 and 41 follow it, autoplay
+/// or not, on every row; 171 holds on a chart row whose chart has a BGA
+/// and 170 on one without, and neither on a folder row, whatever the
+/// setting.
+#[test]
+fn selection_72_170_171_follow_setting_and_chart() {
+    use skin_beatoraja::{Bga, BgaMode};
+    let d = folder(&bga_skin());
+    for (mode, autoplay, index, shown) in [
+        (BgaMode::On, false, 0, true),
+        (BgaMode::Autoplay, true, 1, true),
+        (BgaMode::Autoplay, false, 1, false),
+        (BgaMode::Off, true, 2, false),
+    ] {
+        let at = format!("{mode:?} {autoplay}");
+        let i = common::selection::import_selection_with(d.path(), |c| {
+            c.bga = Bga {
+                mode,
+                autoplay,
+                ..Bga::default()
+            };
+        })
+        .unwrap();
+        let mut s = Sel::new(i.skin);
+        for (row, flag) in [
+            ("chart with BGA", Some(true)),
+            ("chart without", Some(false)),
+            ("folder", None),
+        ] {
+            let mut v = match flag {
+                Some(_) => view(vec![chart("a")], Some(0), None, None),
+                None => view(vec![folder_row("f", 2)], Some(0), None, None),
+            };
+            if let Some(selected) = v.selected.as_mut() {
+                selected.bga = flag == Some(true);
+            }
+            s.view(&v);
+            let mut options = Vec::new();
+            let mut drawn72 = None;
+            for (t, r) in s.drawn(0) {
+                if t == DOT {
+                    options.push(BGA_OPS[(r[0] / 10.0) as usize]);
+                } else if t[1] == 68 {
+                    drawn72 = Some((t[0] - 4) / 8);
+                }
+            }
+            options.sort_unstable();
+            let mut want = if shown { vec![-40, 41] } else { vec![40, -41] };
+            want.extend(match flag {
+                Some(true) => [-170, 171],
+                Some(false) => [170, -171],
+                None => [-170, -171],
+            });
+            want.sort_unstable();
+            assert_eq!(options, want, "{at}, {row}");
+            assert_eq!(drawn72, Some(index), "{at}, {row}");
+        }
     }
 }

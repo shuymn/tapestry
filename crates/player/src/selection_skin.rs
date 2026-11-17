@@ -1005,7 +1005,7 @@ pub(crate) fn fixture_scripted(
     match crate::imports::build(
         skin_model::ScreenKind::Selection,
         &choice,
-        false,
+        crate::imports::SkinSession::default(),
         &target,
         &cancel,
     ) {
@@ -1061,7 +1061,7 @@ pub(crate) fn fixture_bundle(
     match crate::imports::build(
         skin_model::ScreenKind::Selection,
         &choice,
-        false,
+        crate::imports::SkinSession::default(),
         &target,
         &cancel,
     ) {

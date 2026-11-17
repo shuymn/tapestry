@@ -1766,6 +1766,7 @@ impl SelectScreen {
             random: e.random,
             max_ex: max_ex(e, self.bests_preset.as_ref()),
             score: self.score_of(e),
+            bga: e.bga,
             // The stored rank (the seed-0 parse's) classed by the rule
             // play and result class their parse's rank with (design.md
             // "Rendering and Skins", chart metadata).

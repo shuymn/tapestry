@@ -175,7 +175,6 @@ fn note_record(
         ),
         RuntimeNote::CallbackError { at } => ("callback error", None, None, Some(at)),
         RuntimeNote::ImportOnly { at } => ("import-only call", None, None, at.as_ref()),
-        RuntimeNote::BgaSetting { id, at } => ("bga setting", Some(*id), None, at.as_ref()),
     };
     RuntimeNoteRecord {
         what,
@@ -202,6 +201,8 @@ pub struct Resolved {
 pub struct Choice {
     pub options: Vec<(String, String)>,
     pub files: Vec<(String, String)>,
+    /// The BGA setting the configuration carries.
+    pub bga: crate::import::Bga,
     /// A result view a result import is drawn over once imported
     /// ([`Survey::frames`]).
     pub result: Option<skin_model::ResultView>,
@@ -685,7 +686,10 @@ pub fn survey_with(
         choice.options.iter().map(|(o, i)| (o.as_str(), i.as_str())),
         choice.files.iter().map(|(f, c)| (f.as_str(), c.as_str())),
     ) {
-        Ok(config) => config,
+        Ok(config) => Config {
+            bga: choice.bga,
+            ..config
+        },
         Err(e) => {
             return Survey {
                 // The names are those the command line gave.
@@ -964,7 +968,10 @@ pub fn survey_json(root: &Path, entry: &str, choice: &Choice) -> Survey {
         choice.options.iter().map(|(o, i)| (o.as_str(), i.as_str())),
         choice.files.iter().map(|(f, c)| (f.as_str(), c.as_str())),
     ) {
-        Ok(config) => config,
+        Ok(config) => Config {
+            bga: choice.bga,
+            ..config
+        },
         Err(_) => {
             s.outcome = "config".to_owned();
             return s;
@@ -1356,6 +1363,7 @@ mod tests {
             options: vec![("fc".to_owned(), "on".to_owned())],
             files: Vec::new(),
             result: None,
+            bga: Default::default(),
         };
         let s = ledger_survey(&d, true, &choice);
         assert_eq!(s.outcome, "imported");
@@ -1368,6 +1376,7 @@ mod tests {
             options: vec![("fc".to_owned(), "never".to_owned())],
             files: Vec::new(),
             result: None,
+            bga: Default::default(),
         };
         let s = ledger_survey(&d, true, &bad);
         assert_eq!(s.outcome, "config: option \"fc\" has no item \"never\"");
@@ -1478,6 +1487,7 @@ mod tests {
             options: Vec::new(),
             files: vec![("named".to_owned(), "b.png".to_owned())],
             result: None,
+            bga: Default::default(),
         };
         let s = ledger_survey(&d, true, &choice);
         assert_eq!(s.outcome, "imported");
