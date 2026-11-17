@@ -104,7 +104,7 @@ fn images(draws: &[&str]) -> String {
 /// with theirs.
 const NUMBERS: [(i64, &str); 4] = [
     (101, "ex_score"),
-    (106, "notes"),
+    (106, "chart.notes"),
     (110, "count.perfect"),
     (111, "count.great"),
 ];
@@ -373,7 +373,7 @@ fn r4_conditionals_need_all_four_proofs() {
     assert!(closed(&entry));
     assert_eq!(run(&entry).callbacks, [Disposition::Compiled]);
     // range: an arm whose interval leaves `i32`.
-    let (_, notes) = PLAY.field("notes").unwrap();
+    let (_, notes) = PLAY.field("chart.notes").unwrap();
     assert!(
         matches!(notes.ty, skin_model::FieldTy::Int { hi, .. } if i64::from(hi) * i64::from(hi) > i64::from(i32::MAX))
     );

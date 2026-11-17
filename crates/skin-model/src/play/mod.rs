@@ -679,6 +679,8 @@ pub struct Play {
     main_bpm: [i32; 2],
     /// `chart.length_ms` from the chart's 1× length.
     length_ms: i32,
+    /// `chart.notes` from the reducer's whole-chart note count.
+    chart_notes: i32,
     /// The context's [`PlayContext::autoplay`].
     pub(crate) autoplay: bool,
     /// The context's play best and target ([`PlayScore::basis`]), which a
@@ -975,6 +977,7 @@ impl Play {
             ctx.empty_poor_breaks_combo,
             bomb_up_to,
         );
+        let chart_notes = timers::chart_notes(reducer.whole());
         // The best's pace, only when it is this attempt's: one entry per
         // judged target and one for none, ending at the best.
         let entries = usize::try_from(reducer.targets())
@@ -1027,6 +1030,7 @@ impl Play {
             chart_fields: timers::chart_fields(ctx.meta),
             main_bpm: timers::main_bpm_fields(ctx.score.main),
             length_ms: timers::length_ms(chart.meta.length),
+            chart_notes,
             autoplay: ctx.autoplay,
             score: ctx.score.basis,
             pace,

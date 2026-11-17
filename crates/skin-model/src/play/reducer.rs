@@ -128,6 +128,9 @@ pub(crate) struct Reducer {
     /// included: the BGA's miss window starts there.
     pub(crate) miss: Option<TimeUs>,
     targets: u32,
+    /// The whole chart's taps and long notes, whatever the section: the
+    /// count the full combo is judged against.
+    whole: u32,
     pub(crate) full_combo: Option<TimeUs>,
     /// Per gauge: when it reached its maximum, if it is there by the
     /// effects delivered so far.
@@ -156,8 +159,9 @@ pub(crate) fn is_target(section: Option<(TimeUs, TimeUs)>, time: TimeUs, end: Ti
 }
 
 /// The targets of `chart` within `section` (every tap and long note of
-/// the whole chart without one): the attempt's target count, which its
-/// point is over.
+/// the whole chart without one): with the attempt's section, its target
+/// count, which its point is over; without one, the whole chart's note
+/// count, which its full combo is judged against.
 pub(crate) fn count_targets(chart: &Chart, section: Option<(TimeUs, TimeUs)>) -> u32 {
     let mut targets: u32 = 0;
     for note in chart.lanes.iter().flatten() {
@@ -194,6 +198,12 @@ impl Reducer {
         bomb_up_to: Option<Grade>,
     ) -> Self {
         let targets = count_targets(chart, section.map(|s| (s.start, s.end)));
+        // Source: SF-018
+        let whole = if section.is_some() {
+            count_targets(chart, None)
+        } else {
+            targets
+        };
         let notes = std::array::from_fn(|l| {
             chart.lanes.get(l).map_or_else(Box::default, |notes| {
                 notes
@@ -222,6 +232,7 @@ impl Reducer {
             combo_up: None,
             miss: None,
             targets,
+            whole,
             full_combo: None,
             gauge_start: gauge_max.clone().into_boxed_slice(),
             gauge_max: gauge_max.into_boxed_slice(),
@@ -253,6 +264,11 @@ impl Reducer {
         self.targets
     }
 
+    /// The whole chart's note count, whatever the attempt's section.
+    pub(crate) fn whole(&self) -> u32 {
+        self.whole
+    }
+
     /// Applies one effect. Lanes come from [`bms_model::Lane`], so every
     /// lane index is below [`LANE_COUNT`]; notes and gauges out of range
     /// are ignored.
@@ -278,7 +294,8 @@ impl Reducer {
                 if combo == 0 {
                     self.miss = Some(t);
                 }
-                if self.targets > 0 && combo == self.targets && self.full_combo.is_none() {
+                // Source: SF-019
+                if self.whole > 0 && combo == self.whole && self.full_combo.is_none() {
                     self.full_combo = Some(t);
                 }
                 let long = self.long(l, note);
