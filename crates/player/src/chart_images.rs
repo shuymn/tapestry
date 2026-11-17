@@ -96,6 +96,11 @@ pub static CHECK_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 #[cfg(test)]
 pub static CHECK_PANIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Makes the next derivation into a pool cell fail as a refused
+/// allocation does (tests).
+#[cfg(test)]
+pub static DERIVE_FAIL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(test)]
 thread_local! {
     /// Files decoded into sources, and fits derived from them, on this
@@ -572,7 +577,9 @@ fn binding_now(
 
 /// `source` derived into `cell`, filling it on each axis when its flag is
 /// set ([`chart_image::ChartCells::of`]): absent when there is no cell or
-/// no image.
+/// no image. A derivation of an image that fails other than by its
+/// cancel (its allocation refused) is [`Absent::Failed`], never the
+/// file's own absence, so its read leaves no entry ([`reusable`]).
 fn derive_into(
     source: &Read,
     cell: Option<(chart_image::Slot, bool)>,
@@ -582,11 +589,21 @@ fn derive_into(
         (Ok(image), Some((cell, fills))) => {
             #[cfg(test)]
             count([0, 1]);
-            if fills {
+            #[cfg(test)]
+            let refused = DERIVE_FAIL.swap(false, std::sync::atomic::Ordering::AcqRel);
+            #[cfg(not(test))]
+            let refused = false;
+            let fit = if refused {
+                Err(Absent::Decode)
+            } else if fills {
                 chart_image::derive_filling(image, cell, cancel)
             } else {
                 chart_image::derive(image, cell, cancel)
-            }
+            };
+            fit.map_err(|why| match why {
+                Absent::Cancelled => Absent::Cancelled,
+                _ => Absent::Failed,
+            })
         }
         (Ok(_), None) => Err(Absent::NoHeader),
         (Err(why), _) => Err(why.clone()),

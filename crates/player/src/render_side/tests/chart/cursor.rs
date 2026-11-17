@@ -19,8 +19,8 @@ use library::Name;
 use super::{Rig, pool_of, rig_with};
 use crate::chart_currency::CursorChart;
 use crate::chart_images::{
-    CHECK_HELD, CHECK_HOLD, CHECK_PANIC, ChartImageWorker, CursorId, EntryState, HELD_HARD, HOLD,
-    HOLD_HARD, PANIC, SlotState, Want,
+    CHECK_HELD, CHECK_HOLD, CHECK_PANIC, ChartImageWorker, CursorId, DERIVE_FAIL, EntryState,
+    HELD_HARD, HOLD, HOLD_HARD, PANIC, SlotState, Want,
 };
 use crate::render_side::tests::wait_until;
 
@@ -170,8 +170,9 @@ impl Cursor {
 }
 
 /// Lets go of [`HOLD`], [`HOLD_HARD`] and [`CHECK_HOLD`], and clears
-/// [`CHECK_PANIC`], when dropped, so a failing test leaves no read or
-/// check held, and no check's panic, for the next.
+/// [`CHECK_PANIC`] and [`DERIVE_FAIL`], when dropped, so a failing test
+/// leaves no read or check held, and no check's panic or derivation's
+/// failure, for the next.
 struct LetGo;
 
 impl Drop for LetGo {
@@ -180,6 +181,7 @@ impl Drop for LetGo {
         HOLD_HARD.store(false, Ordering::Release);
         CHECK_HOLD.store(false, Ordering::Release);
         CHECK_PANIC.store(false, Ordering::Release);
+        DERIVE_FAIL.store(false, Ordering::Release);
     }
 }
 
@@ -480,6 +482,34 @@ fn a_failed_cursor_job_leaves_no_entry() {
             EntryState::Resident { .. }
         ));
     }
+}
+
+/// A read whose stage file decoded but whose fit into its cell failed
+/// (its allocation refused) leaves no entry and frees its slot, as a
+/// failed job does, never an entry missing that image: the next rest
+/// reads the row again and shows both.
+#[test]
+fn a_failed_derivation_leaves_no_entry() {
+    let _serial = crate::imports::tests::serial();
+    let _let_go = LetGo;
+    let c = cursor();
+    let d = chart([640, 480], [300, 80]);
+    DERIVE_FAIL.store(true, Ordering::Release);
+    c.rest_on(d.path(), named());
+    c.until(|c| c.w.begun() == 1 && c.w.idle() && !c.w.write_pending());
+    assert!(
+        !DERIVE_FAIL.load(Ordering::Acquire),
+        "the derivation failed"
+    );
+    assert_eq!(c.w.entries(), 0);
+    assert!(c.w.slot_states().iter().all(|s| *s == SlotState::Free));
+    assert!(c.written().is_empty());
+    c.rest(d.path(), named());
+    assert!(matches!(
+        c.shown(d.path(), named()),
+        EntryState::Resident { .. }
+    ));
+    assert_eq!(c.written(), vec![(c.generation(), 0, [true, true])]);
 }
 
 /// A refused write frees its slot and leaves no entry: the row is read
