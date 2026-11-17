@@ -40,6 +40,9 @@ struct Charts {
     refuse_writes: bool,
     /// Selection frames drawn.
     selection_frames: u32,
+    /// Selection frames are drawn but not presented while set, as when the
+    /// present timed out or the window is occluded.
+    unpresented: bool,
     /// The selection frames drawn before each pool write applied.
     write_frames: Vec<u32>,
 }
@@ -145,9 +148,10 @@ impl Screen for ChartScreen {
         let mut c = self.charts.lock().unwrap();
         c.stalled = false;
         c.selection_frames += 1;
+        let presented = !c.unpresented;
         drop(c);
         Ok(crate::selection_skin::SelectionDrawn {
-            timing: timing(true),
+            timing: timing(presented),
             refused: None,
             skinned: false,
         })

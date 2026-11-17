@@ -285,6 +285,50 @@ fn one_slot_a_to_b_to_a_reads_a_again() {
     assert!(c.w.entry(&row(b.path(), named())).is_none());
 }
 
+/// The displayed slot's atomic pins a slot drawn by frames that were not
+/// presented (the present timed out or the window is occluded), as a
+/// presented one does (AC-S7): with one slot, while only such frames
+/// display A's slot, B's read waits; once B's update is drawn, B takes it.
+#[test]
+fn a_slot_drawn_by_an_unpresented_frame_stays_pinned() {
+    let _serial = crate::imports::tests::serial();
+    let c = cursor_of(1);
+    let (a, b) = (chart([100, 100], [10, 10]), chart([200, 100], [20, 10]));
+    c.rest_on(a.path(), named());
+    let at_a = c.shown(a.path(), named());
+    let EntryState::Resident { generation, slot } = at_a else {
+        panic!("{at_a:?}");
+    };
+    let frames = {
+        let mut charts = c.r.charts.lock().unwrap();
+        charts.unpresented = true;
+        charts.selection_frames
+    };
+    let mut update = crate::render_side::tests::selection_update(1, 2);
+    update.cursor_chart = CursorChart::Resident { generation, slot };
+    c.r.link.show_selection(update);
+    assert!(wait_until(
+        || c.r.link.pool_now().1 == CursorChart::pack(generation, slot)
+    ));
+    assert!(c.r.charts.lock().unwrap().selection_frames > frames);
+    assert_eq!(c.on(b.path(), named()), CursorChart::Pending);
+    c.rest(b.path(), named());
+    for _ in 0..20 {
+        c.step();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        c.w.begun(),
+        1,
+        "a read into a slot an unpresented frame drew"
+    );
+    assert!(c.w.cursor_deferred());
+    c.r.link
+        .show_selection(crate::render_side::tests::selection_update(1, 3));
+    assert!(wait_until(|| c.r.link.pool_now().1 == 0));
+    assert_eq!(c.shown(b.path(), named()), at_a);
+}
+
 /// A request deferred behind a running read is dropped by a move: once
 /// that read ended, nothing begins until the next rest, whose row is the
 /// one read.
