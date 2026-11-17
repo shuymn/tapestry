@@ -960,11 +960,15 @@ impl Core {
         let Some(absent) = &self.absent else {
             return;
         };
+        // The time read first: an answer in the channel by then counts by
+        // its own stamp, and an empty channel only once the bound has
+        // passed before it was looked at.
+        let now = Instant::now();
         let answer = match absent.rx.try_recv() {
             Ok(a) if a.at >= absent.by => End::Unanswered,
             Ok(Publication { table: Ok(t), .. }) => End::Published(t),
             Ok(Publication { table: Err(_), .. }) => End::Stopped,
-            Err(mpsc::TryRecvError::Empty) if Instant::now() < absent.by => return,
+            Err(mpsc::TryRecvError::Empty) if now < absent.by => return,
             Err(_) => End::Unanswered,
         };
         self.done = Some(answer);
