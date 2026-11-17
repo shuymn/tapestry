@@ -1333,8 +1333,9 @@ impl Leaves for Lower<'_> {
     }
 }
 
-/// The string `v` when it is one: valid UTF-8, its bytes charged.
-fn known_string(an: &Analysis, v: Val) -> R<Option<String>> {
+/// The string `v` when it is one: valid UTF-8, its bytes charged; a string
+/// a play text's `..` built is read from `res`.
+fn known_string(an: &Analysis, res: &Residual, v: Val) -> R<Option<String>> {
     let Val::Str(s) = v else {
         return Ok(None);
     };
@@ -1346,6 +1347,7 @@ fn known_string(an: &Analysis, v: Val) -> R<Option<String>> {
             did("str");
             an.names.iter().find_map(|(b, &i)| (i == n).then_some(&**b))
         }
+        residual::S::Built(k) => res.built(k),
     };
     let Some(bytes) = bytes else {
         return Ok(None);
@@ -1390,7 +1392,7 @@ fn text_fold(an: &Analysis, res: &Residual, kind: ScreenKind) -> R<Option<TextFo
         return Ok(Some(TextFold::Field(id)));
     }
     Ok(match res.node(res.root) {
-        Node::Known(v) => known_string(an, v)?.map(TextFold::Literal),
+        Node::Known(v) => known_string(an, res, v)?.map(TextFold::Literal),
         Node::Select { cond, then, other } => {
             let Node::Cmp(op, read, _) = res.node(cond) else {
                 return Ok(None);
@@ -1406,7 +1408,7 @@ fn text_fold(an: &Analysis, res: &Residual, kind: ScreenKind) -> R<Option<TextFo
             if field(read_arm) != Some(id) {
                 return Ok(None);
             }
-            known_string(an, v)?.map(|s| TextFold::FieldOr(id, s))
+            known_string(an, res, v)?.map(|s| TextFold::FieldOr(id, s))
         }
         _ => None,
     })

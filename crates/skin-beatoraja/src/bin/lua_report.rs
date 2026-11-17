@@ -2,8 +2,8 @@
 //! for the developer's PC:
 //! `lua_report [--autoplay on|off] [--bga on|autoplay|off]
 //! [--class veryhard|hard|normal|easy|veryeasy|none] [--level <n>|pending]
-//! [--result dense] [--option <name> <item>]... [--file <name> <candidate>]...
-//! [--local] <root> <entry> [<root> <entry>]...`
+//! [--total <n>] [--notes <n>] [--result dense] [--option <name> <item>]...
+//! [--file <name> <candidate>]... [--local] <root> <entry> [<root> <entry>]...`
 //! imports each Lua skin (or JSON skin, an `entry` ending in `.json`,
 //! which reports its outcome, kind, notes and frames alone), `entry`
 //! relative to its skin folder `root`,
@@ -13,7 +13,9 @@
 //! with autoplay, the chart's judgment class and its play level as given
 //! (`none` for a chart in no class, `pending` for a level the base
 //! snapshot has pending; each
-//! unavailable when not given) and, with `--result dense`, a result
+//! unavailable when not given), the chart's gauge total and its note
+//! count as `--total` and `--notes` give them (read by a play text's
+//! value only; unavailable when not given, so the text keeps its read) and, with `--result dense`, a result
 //! scene's view known: a ready result with a known best, its chart of
 //! the judgment class given, dense timelines (512 bins of 2 s, every
 //! channel 9 and 19 notes unjudged), a gauge
@@ -68,7 +70,8 @@ use skin_model::{
 
 const USAGE: &str = "usage: lua_report [--autoplay on|off] [--bga on|autoplay|off] \
                      [--class veryhard|hard|normal|easy|veryeasy|none] \
-                     [--level <n>|pending] [--result dense] [--option <name> <item>]... \
+                     [--level <n>|pending] [--total <n>] [--notes <n>] [--result dense] \
+                     [--option <name> <item>]... \
                      [--file <name> <candidate>]... [--local] <root> <entry> [<root> <entry>]...\n\
                      \x20      lua_report --catalogue <root> <entry> [<root> <entry>]...";
 
@@ -132,6 +135,14 @@ fn facts(mut args: &[String]) -> Option<(ImportFacts, Choice, bool, &[String])> 
                     "pending" => Fact::Pending,
                     n => Fact::Known(n.parse().ok()?),
                 };
+                args = rest;
+            }
+            [flag, v, rest @ ..] if flag == "--total" => {
+                facts.total = Fact::Known(v.parse().ok()?);
+                args = rest;
+            }
+            [flag, v, rest @ ..] if flag == "--notes" => {
+                facts.chart_notes = Fact::Known(v.parse().ok()?);
                 args = rest;
             }
             [flag, c, rest @ ..] if flag == "--class" => {
@@ -573,7 +584,18 @@ mod tests {
         let a = args("--class none root s");
         assert_eq!(facts(&a).unwrap().0.judge_class, Fact::Known(None));
         let a = args("root s.luaskin");
-        assert_eq!(facts(&a).unwrap().0.play_level, Fact::Unavailable);
+        let f = facts(&a).unwrap().0;
+        assert_eq!(f.play_level, Fact::Unavailable);
+        assert_eq!(
+            (f.total, f.chart_notes),
+            (Fact::Unavailable, Fact::Unavailable)
+        );
+        let a = args("--total 2147483647 --notes 1000 root s");
+        let f = facts(&a).unwrap().0;
+        assert_eq!(
+            (f.total, f.chart_notes),
+            (Fact::Known(i32::MAX), Fact::Known(1_000))
+        );
     }
 
     /// A result skin's callback no expression represents is reported as
@@ -989,6 +1011,10 @@ skin.destination = {
             "--level x root s",
             "--level 2147483648 root s",
             "--level",
+            "--total x root s",
+            "--total 2147483648 root s",
+            "--notes -x root s",
+            "--notes",
             "--autoplay maybe root s",
             "--class 2 root s",
             "--result ready root s",

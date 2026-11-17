@@ -2301,3 +2301,654 @@ fn numbers_74_and_106_are_the_whole_charts_note_count() {
         3
     );
 }
+
+/// An attempt's facts on play, as the player makes them: autoplay off, a
+/// normal chart of level 12, its gauge total `total` and its whole note
+/// count `notes`.
+fn chart_facts(
+    total: skin_beatoraja::Fact<i32>,
+    notes: skin_beatoraja::Fact<i32>,
+) -> skin_beatoraja::ImportFacts {
+    use skin_beatoraja::{Fact, ImportFacts, JudgeClass};
+    ImportFacts {
+        autoplay: Fact::Known(false),
+        judge_class: Fact::Known(Some(JudgeClass::Normal)),
+        play_level: Fact::Known(12),
+        total,
+        chart_notes: notes,
+        ..ImportFacts::unavailable(skin_model::ScreenKind::Play)
+    }
+}
+
+/// [`chart_facts`] with both chart facts known.
+fn known_chart(total: i32, notes: i32) -> skin_beatoraja::ImportFacts {
+    use skin_beatoraja::Fact;
+    chart_facts(Fact::Known(total), Fact::Known(notes))
+}
+
+/// A play skin running `pre`, with a text in a font file for each value
+/// of `values`, each drawn with `timer`, from y 0 down by 20.
+fn facts_folder(pre: &str, values: &[&str], timer: &str) -> TempDir {
+    let texts: Vec<String> = values
+        .iter()
+        .enumerate()
+        .map(|(k, v)| format!("{{ id = \"t{k}\", font = \"f\", size = 10, value = {v} }}"))
+        .collect();
+    let dsts: String = (0..values.len())
+        .map(|k| {
+            format!(
+                "table.insert(skin.destination, {{ id = \"t{k}\", {timer} dst = {{ {{ y = {}, w = 64, h = 10 }} }} }})\n",
+                k * 20
+            )
+        })
+        .collect();
+    let d = folder(&skin(&format!(
+        "{pre}\n\
+         skin.font = {{ {{ id = \"f\", path = \"f.ttf\" }} }}\n\
+         skin.text = {{ {} }}\n\
+         {dsts}",
+        texts.join(", ")
+    )));
+    common::font(d.path(), "f.ttf");
+    d
+}
+
+/// Both passes of `d`'s skin, its defaults, against `facts`.
+fn import_facts(
+    d: &TempDir,
+    facts: &skin_beatoraja::ImportFacts,
+) -> Result<skin_beatoraja::LuaOutcome, ImportError> {
+    let cancel = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &cancel)?;
+    h.import(&Config::defaults(h.header()), facts, &cancel)
+}
+
+/// [`import_facts`], imported.
+#[track_caller]
+fn imported_with(d: &TempDir, facts: &skin_beatoraja::ImportFacts) -> LuaImported {
+    match import_facts(d, facts) {
+        Ok(skin_beatoraja::LuaOutcome::Imported(i)) => i,
+        other => panic!("{other:?}"),
+    }
+}
+
+/// The lines `i`'s texts ask for.
+fn requested(i: &LuaImported) -> Vec<String> {
+    i.imported
+        .skin
+        .text_requests(&NO_TEXT, [1_920, 1_080], &Layout::AUTHOR)
+        .into_iter()
+        .map(|r| r.text)
+        .collect()
+}
+
+/// A chart fact read with its value.
+fn chart_read(fact: skin_beatoraja::FactId, v: i32) -> skin_beatoraja::FactRead {
+    skin_beatoraja::FactRead {
+        fact,
+        value: skin_beatoraja::FactValue::Int(v),
+    }
+}
+
+/// A play text's value over the gauge total.
+const OVER_TOTAL: &str = "function() return ms.number(368) >= 300 and \"high\" or \"low\" end";
+
+/// In a play text's value, numbers 368, 74 and 106 are the attempt's
+/// gauge total and whole note count: the selects over them fold to
+/// literals, and each fact is recorded once, after the configured pass's
+/// reads.
+#[test]
+fn a_play_texts_chart_reads_fold_to_the_facts() {
+    use skin_beatoraja::FactId::{ChartNotes, ChartTotal};
+    for (total, want) in [(321, "high"), (260, "low"), (300, "high"), (299, "low")] {
+        let i = imported_with(
+            &facts_folder("", &[OVER_TOTAL], ""),
+            &known_chart(total, 1_234),
+        );
+        assert_eq!(i.callbacks, [Disposition::Lowered], "{total}");
+        assert_eq!(requested(&i), [want], "{total}");
+        assert_eq!(i.facts.reads, [chart_read(ChartTotal, total)], "{total}");
+    }
+    for id in [74, 106] {
+        let value = format!("function() return ms.number({id}) > 1000 and \"many\" or \"few\" end");
+        for (notes, want) in [(1_234, "many"), (1_000, "few")] {
+            let i = imported_with(&facts_folder("", &[&value], ""), &known_chart(321, notes));
+            assert_eq!(requested(&i), [want], "{id} {notes}");
+            assert_eq!(i.facts.reads, [chart_read(ChartNotes, notes)], "{id}");
+        }
+    }
+    // Every reader in one skin: each fact once, after the configured
+    // pass's autoplay read.
+    let i = imported_with(
+        &facts_folder(
+            "local auto = ms.option(33)",
+            &[
+                OVER_TOTAL,
+                "function() return ms.number(74) > 1000 and \"many\" or \"few\" end",
+                "function() return ms.number(106) > 1233 and \"all\" or \"some\" end",
+                OVER_TOTAL,
+            ],
+            "",
+        ),
+        &known_chart(321, 1_234),
+    );
+    assert_eq!(requested(&i), ["high", "many", "all", "high"]);
+    assert_eq!(
+        i.facts.reads,
+        [
+            skin_beatoraja::FactRead {
+                fact: skin_beatoraja::FactId::Autoplay,
+                value: skin_beatoraja::FactValue::Bool(false),
+            },
+            chart_read(ChartTotal, 321),
+            chart_read(ChartNotes, 1_234),
+        ]
+    );
+    assert!(i.facts.holds(&known_chart(321, 1_234)));
+    assert!(!i.facts.holds(&known_chart(450, 1_234)));
+    assert!(!i.facts.holds(&known_chart(321, 1_233)));
+}
+
+/// Outside a play text's value the chart's numbers keep their lowering
+/// to `chart.notes` and `chart.total`, whatever the facts, and record no
+/// fact.
+#[test]
+fn chart_reads_elsewhere_keep_their_lowering() {
+    let body = "skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+           value = function() return ms.number(74) end },\n\
+           { id = \"w\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+           value = function() return ms.number(368) end } }\n\
+         table.insert(skin.destination, { id = \"v\", dst = { { x = 0, y = 100, w = 6, h = 6 } } })\n\
+         table.insert(skin.destination, { id = \"w\", dst = { { x = 0, y = 200, w = 6, h = 6 } } })\n\
+         table.insert(skin.destination, { id = \"i\", draw = function() return ms.number(106) > 0 end,\n\
+           dst = { { x = 0, y = 0, w = 64, h = 64 } } })";
+    let d = folder(&skin(body));
+    for facts in [known_chart(321, 1_234), known_chart(2_147_483_647, 1_000)] {
+        let i = imported_with(&d, &facts);
+        assert_eq!(i.callbacks, [Disposition::Lowered; 3], "{facts:?}");
+        assert_eq!(i.facts.reads, [], "{facts:?}");
+    }
+    let base = skin_beatoraja::ImportFacts::base(
+        skin_model::ScreenKind::Play,
+        skin_beatoraja::Fact::Known(false),
+    );
+    let i = imported_with(&d, &base);
+    assert_eq!(i.callbacks, [Disposition::Lowered; 3]);
+    #[cfg(feature = "dev-tools")]
+    {
+        use skin_beatoraja::lua::survey::survey;
+        let s = survey(
+            d.path(),
+            "s.luaskin",
+            &known_chart(321, 1_234),
+            &Cancel::new(),
+            true,
+        );
+        let lowered: Vec<_> = s
+            .consumers
+            .iter()
+            .filter_map(|c| c.local.as_ref()?.lowered.as_ref())
+            .map(|l| l.src.as_str())
+            .collect();
+        assert_eq!(
+            lowered,
+            ["(chart.notes)", "(chart.total)", "((chart.notes) > 0)"],
+            "{:?}",
+            s.consumers
+        );
+    }
+}
+
+/// A base import whose play text reads a chart fact ends pending on it,
+/// not as an error, through the import and the timed import alike, with
+/// the facts read before it; a text that cannot fold once the fact is
+/// known ends pending too, and is then dropped as unconsumed.
+#[test]
+fn a_base_import_reading_a_chart_fact_ends_pending() {
+    use skin_beatoraja::{Fact, FactId, ImportFacts, LuaOutcome};
+    let base = ImportFacts::base(skin_model::ScreenKind::Play, Fact::Known(false));
+    let d = facts_folder("", &[OVER_TOTAL], "");
+    let imported = match import_facts(&d, &base) {
+        Ok(LuaOutcome::Pending(p)) => {
+            assert_eq!(p.pending, FactId::ChartTotal);
+            assert_eq!(p.facts.reads, []);
+            assert_eq!(p.dependencies, ["s.luaskin"]);
+            p
+        }
+        other => panic!("{other:?}"),
+    };
+    assert_ne!(imported.usage.expanded, 0);
+    #[cfg(feature = "dev-tools")]
+    {
+        let cancel = Cancel::new();
+        let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+        let config = Config::defaults(h.header());
+        match h.timed(&config, &base, &cancel) {
+            Ok(skin_beatoraja::lua::LuaTimed::Pending(p)) => {
+                assert_eq!(p.pending, FactId::ChartTotal);
+                assert_eq!(p.facts.reads, []);
+                // The common import's dependencies and counts, as the
+                // import reports them.
+                assert_eq!(p.dependencies, ["s.luaskin"]);
+                assert_eq!(p.usage.input_bytes, imported.usage.input_bytes);
+                assert_eq!(p.usage.loads, imported.usage.loads);
+                assert_eq!(p.usage.expanded, imported.usage.expanded);
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            h.timed(&config, &known_chart(321, 1_234), &cancel),
+            Ok(skin_beatoraja::lua::LuaTimed::Imported(_))
+        ));
+    }
+    // The facts read before it are kept: autoplay, then the pending one.
+    let d = facts_folder(
+        "local auto = ms.option(33)",
+        &[
+            "function() return ms.number(106) > 0 and \"a\" or \"b\" end",
+            OVER_TOTAL,
+        ],
+        "",
+    );
+    match import_facts(&d, &base) {
+        Ok(LuaOutcome::Pending(p)) => {
+            assert_eq!(p.pending, FactId::ChartNotes);
+            assert_eq!(
+                p.facts.reads,
+                [skin_beatoraja::FactRead {
+                    fact: FactId::Autoplay,
+                    value: skin_beatoraja::FactValue::Bool(false),
+                }]
+            );
+        }
+        other => panic!("{other:?}"),
+    }
+    // Control: the skin without the read imports on the base facts.
+    let i = imported_with(
+        &facts_folder("", &["function() return \"x\" end"], ""),
+        &base,
+    );
+    assert_eq!(requested(&i), ["x"]);
+    // A known number is no text's string: pending first, then dropped.
+    let d = facts_folder("", &["function() return ms.number(74) end"], "");
+    match import_facts(&d, &base) {
+        Ok(LuaOutcome::Pending(p)) => assert_eq!(p.pending, FactId::ChartNotes),
+        other => panic!("{other:?}"),
+    }
+    let i = imported_with(&d, &known_chart(321, 1_234));
+    assert_eq!(
+        i.callbacks,
+        [Disposition::Replaced(Unsupported::Consumer("text value"))]
+    );
+    assert_eq!(requested(&i), [] as [&str; 0]);
+    assert_eq!(i.facts.reads, [chart_read(FactId::ChartNotes, 1_234)]);
+}
+
+/// With the chart's facts unavailable (the report's default) a play
+/// text's read stays the read it is: the text keeps the record it has
+/// with no snapshot, and no fact is recorded.
+#[test]
+fn unavailable_chart_facts_keep_todays_record() {
+    use skin_beatoraja::Fact;
+    let d = facts_folder("", &[OVER_TOTAL], "");
+    for facts in [
+        chart_facts(Fact::Unavailable, Fact::Unavailable),
+        skin_beatoraja::ImportFacts::unavailable(skin_model::ScreenKind::Play),
+    ] {
+        let i = imported_with(&d, &facts);
+        assert_eq!(
+            i.callbacks,
+            [Disposition::Replaced(Unsupported::Consumer("text value"))]
+        );
+        assert_eq!(i.facts.reads, []);
+    }
+}
+
+/// A known gauge total past what the number widget shows is recorded,
+/// then refused: a decorative text is dropped with its note, failure
+/// presentation refuses at the value, and a total within the range folds
+/// at both ends.
+#[test]
+fn a_total_past_its_range_follows_the_texts_role() {
+    use skin_beatoraja::FactId;
+    let why = Unsupported::Construct("a chart total past its range");
+    for total in [2_147_483_647, -1, i32::MIN] {
+        let i = imported_with(
+            &facts_folder("", &[OVER_TOTAL], ""),
+            &known_chart(total, 1_000),
+        );
+        assert_eq!(i.callbacks, [Disposition::Replaced(why)], "{total}");
+        assert!(
+            i.imported.report.notes.iter().any(|n| n.kind
+                == NoteKind::Callback {
+                    field: "value",
+                    why
+                }),
+            "{total}"
+        );
+        assert_eq!(requested(&i), [] as [&str; 0], "{total}");
+        assert_eq!(i.imported.report.usage.texts, 0, "{total}");
+        assert_eq!(i.facts.reads, [chart_read(FactId::ChartTotal, total)]);
+        // The refusal keeps the read it was made from.
+        let d = facts_folder("", &[OVER_TOTAL], "timer = 3,");
+        let cancel = Cancel::new();
+        let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+        let refused = match h.import_reading(
+            &Config::defaults(h.header()),
+            &known_chart(total, 1_000),
+            &cancel,
+        ) {
+            Err(refused) => refused,
+            Ok(other) => panic!("{total}: {other:?}"),
+        };
+        match &refused.0 {
+            ImportError::Lua {
+                at: Some(_),
+                why:
+                    LuaWhy::Critical {
+                        field: "value",
+                        why: w,
+                    },
+            } => assert_eq!(*w, why, "{total}"),
+            other => panic!("{total}: {other:?}"),
+        }
+        assert_eq!(
+            refused.1.reads,
+            [chart_read(FactId::ChartTotal, total)],
+            "{total}"
+        );
+    }
+    for (total, want) in [(2_147_483_646, "high"), (0, "low")] {
+        for timer in ["", "timer = 3,"] {
+            let i = imported_with(
+                &facts_folder("", &[OVER_TOTAL], timer),
+                &known_chart(total, 1_000),
+            );
+            assert_eq!(requested(&i), [want], "{total} {timer}");
+        }
+    }
+}
+
+/// GenericTheme's TOTAL readout, written fresh: the gauge total over the
+/// default total for the whole chart's note count, its percentage rounded
+/// up to hundredths, joined with `..`.
+const READOUT: &str = "function() local t = ms.number(368) local n = ms.number(74) \
+     local b = math.max(260.0, 7.605 * n / (0.01 * n + 6.5)) \
+     local p = t / b * 100 p = math.ceil(p * 100) / 100 \
+     return t .. \" (\" .. p .. \"%)\" end";
+
+/// [`READOUT`] joined left-nested.
+const READOUT_LEFT: &str = "function() local t = ms.number(368) local n = ms.number(74) \
+     local b = math.max(260.0, 7.605 * n / (0.01 * n + 6.5)) \
+     local p = t / b * 100 p = math.ceil(p * 100) / 100 \
+     return ((t .. \" (\") .. p) .. \"%)\" end";
+
+/// Text value `value` on play under `facts`: lowered to the literal
+/// `want`, the text asked for with no callback note.
+#[track_caller]
+fn folds_to(value: &str, facts: &skin_beatoraja::ImportFacts, want: &str) {
+    let i = imported_with(&facts_folder("", &[value], ""), facts);
+    assert_eq!(i.callbacks, [Disposition::Lowered], "{value}");
+    assert_eq!(requested(&i), [want], "{value}");
+    assert!(
+        !i.imported
+            .report
+            .notes
+            .iter()
+            .any(|n| matches!(n.kind, NoteKind::Callback { .. })),
+        "{value}: {:?}",
+        i.imported.report.notes
+    );
+}
+
+/// Text value `value` on play under `facts` refused for `why`: a
+/// decorative text dropped with its note, and the same value as failure
+/// presentation (timer 3) refusing the import at the value.
+#[track_caller]
+fn follows_role(value: &str, facts: &skin_beatoraja::ImportFacts, why: Unsupported) {
+    let i = imported_with(&facts_folder("", &[value], ""), facts);
+    assert_eq!(i.callbacks, [Disposition::Replaced(why)], "{value}");
+    assert!(
+        i.imported.report.notes.iter().any(|n| n.kind
+            == NoteKind::Callback {
+                field: "value",
+                why
+            }),
+        "{value}"
+    );
+    assert_eq!(requested(&i), [] as [&str; 0], "{value}");
+    assert_eq!(i.imported.report.usage.texts, 0, "{value}");
+    match import_facts(&facts_folder("", &[value], "timer = 3,"), facts) {
+        Err(ImportError::Lua {
+            at: Some(_),
+            why:
+                LuaWhy::Critical {
+                    field: "value",
+                    why: w,
+                },
+        }) => assert_eq!(w, why, "{value}"),
+        other => panic!("{value}: {other:?}"),
+    }
+}
+
+/// GenericTheme's TOTAL readout folds over the attempt's facts to the
+/// string the source writes, numbers by the number text rule, whichever
+/// way its `..` nests; a total past what the number widget shows is
+/// recorded and dropped with its note.
+#[test]
+fn a_total_readout_folds_to_its_string() {
+    for (total, notes, want) in [
+        (321, 1_234, "321 (64.45%)"),
+        (321, 57, "321 (123.47%)"),
+        (321, 2_000, "321 (55.93%)"),
+        (300, 1_000, "300 (65.09%)"),
+        (260, 100, "260 (100%)"),
+        (0, 1_000, "0 (0%)"),
+        (2_147_483_646, 1_000, "2147483646 (465923473.5%)"),
+    ] {
+        for value in [READOUT, READOUT_LEFT] {
+            folds_to(value, &known_chart(total, notes), want);
+        }
+    }
+    let i = imported_with(
+        &facts_folder("", &[READOUT], ""),
+        &known_chart(2_147_483_647, 1_000),
+    );
+    assert_eq!(
+        i.facts.reads,
+        [chart_read(
+            skin_beatoraja::FactId::ChartTotal,
+            2_147_483_647
+        )]
+    );
+    follows_role(
+        READOUT,
+        &known_chart(2_147_483_647, 1_000),
+        Unsupported::Construct("a chart total past its range"),
+    );
+}
+
+/// Known strings and numbers join in a play text's value: a skin's own
+/// literal kept as it is written, a whole float written without `.0`,
+/// and the chart's facts as integers.
+#[test]
+fn known_operands_join() {
+    let facts = known_chart(321, 1_234);
+    folds_to(
+        "function() return \"a\" .. \"b\" .. ms.number(368) end",
+        &facts,
+        "ab321",
+    );
+    folds_to("function() return \"x\" .. 50.5 end", &facts, "x50.5");
+    folds_to("function() return \"v1.0/\" .. 50.0 end", &facts, "v1.0/50");
+    // A practice section's facts are the whole chart's.
+    folds_to(
+        "function() return ms.number(106) .. \"/\" .. ms.number(74) end",
+        &facts,
+        "1234/1234",
+    );
+    // A captured string, by its bytes.
+    let i = imported_with(
+        &facts_folder(
+            "local unit = \"pt\"",
+            &["function() return 7 .. unit end"],
+            "",
+        ),
+        &facts,
+    );
+    assert_eq!(requested(&i), ["7pt"]);
+}
+
+/// `..` over an operand not known at import keeps the refusal, and over
+/// a known nil or boolean it is a Lua error: each follows the text's
+/// role.
+#[test]
+fn an_unknown_operand_keeps_the_refusal() {
+    let facts = known_chart(321, 1_234);
+    let dots = Unsupported::Construct("..");
+    for value in [
+        "function() return ms.number(110) .. \"\" end",
+        "function() return ms.text(12) .. \"x\" end",
+        "function() return ms.time() .. \"\" end",
+        // A select of numbers, its kinds closed: an `and`/`or` over a
+        // comparison would join a boolean and open the candidate.
+        "function() local v = 1 if ms.number(110) > 0 then v = 2 end return v .. \"\" end",
+    ] {
+        follows_role(value, &facts, dots);
+    }
+    for value in [
+        "function() return nil .. \"x\" end",
+        "function() return \"x\" .. true end",
+    ] {
+        follows_role(value, &facts, Unsupported::Construct("a Lua error"));
+    }
+    // With the chart's facts unavailable the readout's reads stay reads.
+    follows_role(
+        READOUT,
+        &skin_beatoraja::ImportFacts::unavailable(skin_model::ScreenKind::Play),
+        dots,
+    );
+}
+
+/// Outside a text's value `..` is refused before its operands, as it
+/// was: a `draw` and a number's `value` over known operands stay
+/// `Construct ..`.
+#[test]
+fn concatenation_outside_a_text_keeps_its_refusal() {
+    let body = "skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 8,\n\
+           value = function() return (1 .. \"\") == \"1\" and 1 or 0 end } }\n\
+         table.insert(skin.destination, { id = \"v\", dst = { { x = 0, y = 100, w = 6, h = 6 } } })\n\
+         table.insert(skin.destination, { id = \"i\", draw = function() return (1 .. \"\") == \"1\" end,\n\
+           dst = { { x = 0, y = 0, w = 64, h = 64 } } })";
+    let d = folder(&skin(body));
+    let dots = Disposition::Replaced(Unsupported::Construct(".."));
+    for facts in [
+        known_chart(321, 1_234),
+        skin_beatoraja::ImportFacts::unavailable(skin_model::ScreenKind::Play),
+    ] {
+        let i = imported_with(&d, &facts);
+        assert_eq!(i.callbacks, [dots, dots], "{facts:?}");
+    }
+}
+
+/// A play text's concatenation folds; this value's off-play twins keep
+/// their refusal (`selection_lua.rs`, `decision_import.rs`,
+/// `result_import.rs`).
+#[test]
+fn a_concatenation_off_play_keeps_its_outcome() {
+    folds_to(
+        "function() return \"x\" .. 50.5 end",
+        &skin_beatoraja::ImportFacts::unavailable(skin_model::ScreenKind::Play),
+        "x50.5",
+    );
+}
+
+/// A folded string past 1 024 bytes is refused by the text's role before
+/// it is built; one of 1 024 folds, and the widget then cuts it to the
+/// text's cap with its deviation note.
+#[test]
+fn a_folded_string_is_capped() {
+    let facts = known_chart(321, 1_234);
+    let past = Unsupported::Construct("a folded string past its cap");
+    let doubled = |n: usize, tail: &str| {
+        format!(
+            "function() local s = \"abcdefgh\" {}return s{tail} end",
+            "s = s .. s ".repeat(n)
+        )
+    };
+    follows_role(&doubled(8, ""), &facts, past);
+    follows_role(&doubled(7, " .. \"x\""), &facts, past);
+    let i = imported_with(&facts_folder("", &[&doubled(7, "")], ""), &facts);
+    assert_eq!(i.callbacks, [Disposition::Lowered]);
+    assert_eq!(requested(&i), ["abcdefgh".repeat(MAX_TEXT_BYTES / 8)]);
+    assert!(
+        i.imported
+            .report
+            .notes
+            .iter()
+            .any(|n| n.kind == NoteKind::Deviation(skin_beatoraja::DeviationId::D6))
+    );
+}
+
+/// A folded string compares and tests empty by its bytes wherever a known
+/// string does, two built strings included; as a table key it is
+/// refused.
+#[test]
+fn a_folded_string_reads_as_its_bytes() {
+    let facts = known_chart(321, 1_234);
+    for (value, want) in [
+        (
+            "function() return (\"a\" .. \"b\") == \"ab\" and \"y\" or \"n\" end",
+            "y",
+        ),
+        (
+            "function() return (\"a\" .. \"b\") == (\"ab\" .. \"\") and \"y\" or \"n\" end",
+            "y",
+        ),
+        (
+            "function() return (\"a\" .. \"b\") == (\"a\" .. \"c\") and \"y\" or \"n\" end",
+            "n",
+        ),
+        (
+            "function() return (\"\" .. \"\") == \"\" and \"e\" or \"f\" end",
+            "e",
+        ),
+        (
+            "function() return (\"a\" .. 1) ~= \"a1\" and \"y\" or \"n\" end",
+            "n",
+        ),
+    ] {
+        folds_to(value, &facts, want);
+    }
+    // A field tested against an empty folded string, and a folded string
+    // as its fallback; a nonempty one is no empty test.
+    for value in [
+        "function() local tx = ms.text(12)\n\
+           if tx == (\"\" .. \"\") then return \"none\" else return tx end end",
+        "function() local tx = ms.text(12)\n\
+           if tx == \"\" then return \"no\" .. \"ne\" else return tx end end",
+    ] {
+        assert_eq!(text_lines(value, &FULL), ["T S"], "{value}");
+        assert_eq!(text_lines(value, &NO_TEXT), ["none"], "{value}");
+    }
+    follows_role(
+        "function() local tx = ms.text(12)\n\
+           if tx == (\"no\" .. \"ne\") then return \"none\" else return tx end end",
+        &facts,
+        Unsupported::Type,
+    );
+    let i = imported_with(
+        &facts_folder(
+            "local t = { ab = \"hit\" }",
+            &["function() return t[\"a\" .. \"b\"] end"],
+            "",
+        ),
+        &facts,
+    );
+    assert_eq!(
+        i.callbacks,
+        [Disposition::Replaced(Unsupported::Construct(
+            "a built string key"
+        ))]
+    );
+}

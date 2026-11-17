@@ -227,7 +227,7 @@ pub(super) fn convert(
             .zip(&modules)
             .map(|(i, m)| (m.as_str(), i))
             .collect(),
-        analysis: Analysis::with_cancel(pass.ledger.cancel()),
+        analysis: Analysis::with_cancel(pass.ledger.cancel(), pass.facts),
         entry: entry.name(),
         nodes: Vec::new(),
         bytes: Vec::new(),

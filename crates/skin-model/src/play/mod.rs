@@ -82,6 +82,14 @@ pub fn attempt_targets(chart: &Chart, attempt: &Attempt<'_>) -> u32 {
     reducer::count_targets(chart, section)
 }
 
+/// The whole chart's note count as the play's `chart.notes` gives it:
+/// every tap and long note of `chart`, whatever the attempt's section,
+/// clamped as the field is.
+#[must_use]
+pub fn chart_notes(chart: &Chart) -> i32 {
+    timers::chart_notes(reducer::count_targets(chart, None))
+}
+
 /// A play's best and target EX scores, read once when the play began and
 /// kept by each READY rearm of its attempt (stage 3, S10-10).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
