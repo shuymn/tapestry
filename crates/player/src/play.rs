@@ -511,6 +511,10 @@ pub struct AttemptPrep {
     chart: crate::result_skin::PendingChart,
     /// The attempt's judgment class.
     class: Option<skin_beatoraja::JudgeClass>,
+    /// The difficulty the library stores for the attempt's chart when it
+    /// was chosen on selection ([`PlayerRig::chosen_difficulty`]), which
+    /// its play shows.
+    difficulty: Option<u8>,
     /// The chart's strings the attempt's result shows, until the result
     /// skin's stage takes them.
     labels: Option<skin_model::ResultLabels>,
@@ -736,6 +740,22 @@ impl PlayerRig<'_> {
         }
     }
 
+    /// The difficulty the library stores for `loaded`'s chart, declared
+    /// or inferred, when it was chosen on selection
+    /// ([`Selection::chosen_difficulty`](crate::selection::Selection::chosen_difficulty)):
+    /// what its play and result show (design.md "Play Lifecycle", the
+    /// chart's labels). None for a chart given on the command line, which
+    /// shows its own `#DIFFICULTY`.
+    // Source: SF-021
+    fn chosen_difficulty(&self, loaded: &Loaded) -> Option<u8> {
+        self.selection
+            .as_ref()?
+            .chosen_difficulty
+            .as_ref()
+            .filter(|(path, _)| path == loaded.path())
+            .map(|&(_, difficulty)| difficulty)
+    }
+
     /// Asks the render thread to prepare the attempt from its owned
     /// context with play skin `skin`, and returns at once. The loading
     /// lifetime's gauge descriptor is replaced from the preset the play
@@ -764,6 +784,7 @@ impl PlayerRig<'_> {
         let epoch = self.adjust.as_mut().and_then(game::AdjustDriver::prepared);
         let attempt =
             AttemptContext::new(attempt, SIMPLE_SCRATCH, epoch.unwrap_or(0), self.autoplay)
+                .with_difficulty(prep.difficulty)
                 .with_bga_shown(self.bga_session.shown())
                 .with_scratch_notes(std::mem::take(&mut prep.scratch_notes));
         prep.staging = Instant::now();
@@ -2252,6 +2273,7 @@ impl Rig for PlayerRig<'_> {
                 displayed: loaded.displayed().0,
                 chart: crate::result_skin::attempt_chart(loaded),
                 class: crate::result_skin::attempt_class(loaded),
+                difficulty: None,
                 labels: None,
                 images: (std::path::PathBuf::new(), [String::new(), String::new()]),
                 scratch_notes: Vec::new(),
@@ -2273,13 +2295,15 @@ impl Rig for PlayerRig<'_> {
                 attempt.labels.backbmp.clone(),
             ],
         );
+        let difficulty = self.chosen_difficulty(loaded);
         let mut prep = AttemptPrep {
             ticket: self.preps,
             attempt: Some(attempt),
             loading_gauge: shown_gauge(loaded.preset(), loaded.displayed().0),
             displayed: loaded.displayed().0,
-            chart: crate::result_skin::attempt_chart(loaded),
+            chart: crate::result_skin::attempt_chart(loaded).with_difficulty(difficulty),
             class: crate::result_skin::attempt_class(loaded),
+            difficulty,
             labels: Some(labels),
             images,
             // Autoplay's turntable presses its scratch notes.

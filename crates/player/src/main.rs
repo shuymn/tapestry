@@ -1808,6 +1808,7 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
         rate: opened.rate,
         chosen_at: TimeUs(0),
         loading: None,
+        chosen_difficulty: None,
         practicing: false,
         decision: None,
         entered_at: TimeUs(0),
