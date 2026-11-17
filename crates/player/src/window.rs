@@ -50,6 +50,7 @@ use crate::menu_screen::WindowSink;
 use crate::pointer::{Capture, PointerShared};
 use crate::render_side::Extent;
 use crate::select::{MenuInput, MenuKey, MenuQueue};
+use crate::topmost::{LevelWindow, Topmost};
 use crate::tuning::KeyEvent;
 
 /// What the game and render threads ask of the window thread.
@@ -290,6 +291,8 @@ struct App {
     pointer: Arc<PointerShared>,
     /// The mouse's held button, position and wheel fraction.
     capture: Capture,
+    /// Whether the window was made topmost.
+    topmost: Topmost,
 }
 
 impl ApplicationHandler<Ask> for App {
@@ -445,28 +448,55 @@ impl ApplicationHandler<Ask> for App {
 }
 
 impl App {
-    /// Shows the hidden window once its first frame was presented, or at
-    /// its deadline; until then the loop wakes to look again.
-    /// The window's focus is `focused`, as every focus change the window
-    /// reports goes: the pointer cancelled first on a loss, then the
-    /// controls told, which wake the game thread
-    /// ([`Capture::focus_changed`]).
+    /// The window's focus is `focused` ([`focus_changed`]).
     fn focus(&mut self, focused: bool) {
-        let controls = &self.controls;
-        self.capture
-            .focus_changed(&self.pointer, focused, |f| controls.focus(f));
+        let window = self.window.as_ref();
+        focus_changed(
+            &mut self.capture,
+            &self.pointer,
+            &self.controls,
+            &mut self.topmost,
+            window,
+            focused,
+        );
     }
 
+    /// Shows the hidden window once its first frame was presented, or at
+    /// its deadline; until then the loop wakes to look again.
     fn poll_showing(&mut self, event_loop: &ActiveEventLoop) {
         if let (Some(w), Some(showing)) = (&self.window, &mut self.showing) {
-            let (capture, pointer, controls) = (&mut self.capture, &self.pointer, &self.controls);
-            let focus = |f| capture.focus_changed(pointer, f, |f| controls.focus(f));
+            let (capture, pointer, controls, topmost) = (
+                &mut self.capture,
+                &self.pointer,
+                &self.controls,
+                &mut self.topmost,
+            );
+            let focus = |f| focus_changed(capture, pointer, controls, topmost, Some(w), f);
             let flow = match showing.poll(w, focus, &self.shared, Instant::now()) {
                 Some(next) => ControlFlow::WaitUntil(next),
                 None => ControlFlow::Wait,
             };
             event_loop.set_control_flow(flow);
         }
+    }
+}
+
+/// The window's focus is `focused`, as every focus change the window
+/// reports goes: the pointer cancelled first on a loss, then the controls
+/// told, which wake the game thread ([`Capture::focus_changed`]), then
+/// `window` made topmost or not ([`Topmost::focus`]), after the controls so
+/// a play's abort waits for nothing.
+fn focus_changed(
+    capture: &mut Capture,
+    pointer: &PointerShared,
+    controls: &Controls,
+    topmost: &mut Topmost,
+    window: Option<&impl LevelWindow>,
+    focused: bool,
+) {
+    capture.focus_changed(pointer, focused, |f| controls.focus(f));
+    if let Some(w) = window {
+        topmost.focus(w, focused);
     }
 }
 
@@ -759,6 +789,7 @@ pub fn open(
                 shared: thread_shared,
                 pointer,
                 capture: Capture::default(),
+                topmost: Topmost::default(),
             };
             if let Err(e) = event_loop.run_app(&mut app) {
                 eprintln!("the event loop failed: {e}");
@@ -2257,5 +2288,60 @@ mod tests {
         // Observed after T, before any look of the screen.
         key_press(&mut w, code(KeyCode::Escape), false, false, None);
         assert!(w.2.take_escape(deadline), "an Escape after T did not leave");
+    }
+
+    /// The fullscreen window as the topmost state sees it, and whether
+    /// the controls had focus when each was done to it.
+    struct LevelSeen<'a> {
+        controls: &'a Controls,
+        done: std::cell::RefCell<Vec<(&'static str, bool)>>,
+    }
+
+    impl crate::topmost::LevelWindow for LevelSeen<'_> {
+        fn fullscreen(&self) -> bool {
+            true
+        }
+
+        fn raise(&self) {
+            let focused = self.controls.focused();
+            self.done.borrow_mut().push(("raise", focused));
+        }
+
+        fn lower(&self) {
+            let focused = self.controls.focused();
+            self.done.borrow_mut().push(("lower", focused));
+        }
+    }
+
+    /// Every focus change the window reports reaches the controls, then
+    /// the window's topmost state: gained, the window is made topmost
+    /// with the controls focused; lost, it stops being topmost once the
+    /// controls, and so a play's focus latch, have seen the loss; regained,
+    /// it is topmost again. Before the window exists the controls are told
+    /// all the same.
+    #[test]
+    fn a_focus_change_reaches_the_controls_then_the_topmost_state() {
+        let c = Controls::new(QpcClock::start());
+        let w = LevelSeen {
+            controls: &c,
+            done: std::cell::RefCell::default(),
+        };
+        let mut capture = crate::pointer::Capture::default();
+        let pointer = crate::pointer::PointerShared::default();
+        let mut topmost = crate::topmost::Topmost::default();
+        let mut focus = |window: Option<&LevelSeen<'_>>, focused| {
+            super::focus_changed(&mut capture, &pointer, &c, &mut topmost, window, focused);
+        };
+        focus(None, false);
+        assert!(!c.focused());
+        focus(Some(&w), true);
+        focus(Some(&w), false);
+        focus(Some(&w), true);
+        assert_eq!(
+            *w.done.borrow(),
+            [("raise", true), ("lower", false), ("raise", true)]
+        );
+        focus(None, false);
+        assert!(!c.focused());
     }
 }
