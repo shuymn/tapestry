@@ -2974,9 +2974,13 @@ impl Skin {
     /// reach depends on a native size unknown here. Each is made a cell
     /// ([`Slot::cell`]) capped at the image's slot for a side of `side`
     /// raised to [`MIN_TEXT_SIDE`] ([`ChartImage::slot`]), then the
-    /// widest per axis over the image's elements is kept. An image no
-    /// element draws has no cell, and the back image never has one.
-    /// Load-stage work; allocates nothing.
+    /// widest per axis over the image's elements is kept. An image some
+    /// element draws with [`ChartStretch::Fill`] has its fit fill its cell
+    /// on each axis ([`ChartCells::of`]): that draw stretches it to its
+    /// destination whatever its aspect, which a fit keeping the aspect
+    /// would cover on one axis only. An image no element draws has no
+    /// cell, and the back image never has one. Load-stage work; allocates
+    /// nothing.
     #[must_use]
     pub fn chart_cells(&self, target: [u32; 2], side: u32) -> ChartCells {
         let scale = self.fit(target).0.min(MAX_CELL_SCALE);
@@ -3003,7 +3007,7 @@ impl Skin {
             } else {
                 cap.size()
             };
-            cells.holding(which, Slot::cell(reach, cap))
+            cells.holding(which, Slot::cell(reach, cap), stretch == ChartStretch::Fill)
         })
     }
 

@@ -212,13 +212,15 @@ fn the_image_options_read_the_selection_fields_in_lua() {
     );
     assert!(lua.imported.skin.has_chart_images());
     // The pool cells come from the lowered destinations: 640 × 400 and
-    // 600 × 160 at scale 1, padded and aligned to 64.
+    // 600 × 160 at scale 1, padded and aligned to 64; `Inner` keeps each
+    // fit's aspect.
     let cell = |w, h| Some(Slot::new([w, h]).unwrap());
     assert_eq!(
         lua.imported.skin.chart_cells([1_920, 1_080], 2_048),
         ChartCells {
             stage: cell(704, 448),
             banner: cell(640, 192),
+            ..ChartCells::NONE
         }
     );
     let json = format!(

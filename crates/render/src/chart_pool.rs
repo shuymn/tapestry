@@ -369,6 +369,7 @@ mod tests {
         ChartCells {
             stage: stage.map(|s| Slot::new(s).unwrap()),
             banner: banner.map(|b| Slot::new(b).unwrap()),
+            ..ChartCells::NONE
         }
     }
 

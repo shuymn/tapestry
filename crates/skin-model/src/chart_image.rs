@@ -310,11 +310,19 @@ pub const POOL_LAYER: u16 = 1 << 15;
 /// The pool cells a selection skin's chart images need
 /// ([`Skin::chart_cells`](crate::Skin::chart_cells)): one for the stage
 /// file and one for the banner, each `None` when no element draws that
-/// image. A pool slot is the stage cell above the banner cell.
+/// image, and whether some element stretches each to its destination
+/// ([`ChartStretch::Fill`]), whose fit then fills its cell on each axis
+/// ([`derive_filling`]). A pool slot is the stage cell above the banner
+/// cell.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChartCells {
     pub stage: Option<Slot>,
     pub banner: Option<Slot>,
+    /// Whether some element draws the stage file with
+    /// [`ChartStretch::Fill`].
+    pub stage_fills: bool,
+    /// Whether some element draws the banner with [`ChartStretch::Fill`].
+    pub banner_fills: bool,
 }
 
 impl ChartCells {
@@ -322,11 +330,25 @@ impl ChartCells {
     pub const NONE: Self = Self {
         stage: None,
         banner: None,
+        stage_fills: false,
+        banner_fills: false,
     };
 
-    /// These cells, `which`'s grown on each axis to hold `cell` too; the
-    /// back image has none.
-    pub(crate) fn holding(self, which: ChartImage, cell: Slot) -> Self {
+    /// `which`'s cell, and whether its fit fills it on each axis
+    /// ([`derive_filling`]); `None` for an image with no cell, the back
+    /// image included.
+    #[must_use]
+    pub fn of(self, which: ChartImage) -> Option<(Slot, bool)> {
+        match which {
+            ChartImage::Stage => self.stage.map(|c| (c, self.stage_fills)),
+            ChartImage::Banner => self.banner.map(|c| (c, self.banner_fills)),
+            ChartImage::Back => None,
+        }
+    }
+
+    /// These cells, `which`'s grown on each axis to hold `cell` too, and
+    /// filled when `fills` is; the back image has none.
+    pub(crate) fn holding(self, which: ChartImage, cell: Slot, fills: bool) -> Self {
         let grown = |kept: Option<Slot>| {
             Some(kept.map_or(cell, |k| {
                 let [kw, kh] = k.size;
@@ -338,10 +360,12 @@ impl ChartCells {
         match which {
             ChartImage::Stage => Self {
                 stage: grown(self.stage),
+                stage_fills: self.stage_fills || fills,
                 ..self
             },
             ChartImage::Banner => Self {
                 banner: grown(self.banner),
+                banner_fills: self.banner_fills || fills,
                 ..self
             },
             ChartImage::Back => self,
@@ -550,8 +574,41 @@ pub fn read_source(
 /// [`Absent::Cancelled`] once `cancel` answers; [`Absent::Decode`] for a
 /// source with no level 0 or one that cannot be allocated.
 pub fn derive(source: &Fitted, slot: Slot, cancel: &dyn Fn() -> bool) -> Result<Fitted, Absent> {
+    derive_to(
+        source,
+        fitted_size(source.native, slot.max_content()),
+        cancel,
+    )
+}
+
+/// The fit of `source` (a [`read_source`]'s image) filling `slot`'s
+/// content on each axis, its aspect not kept: on each axis the slot's
+/// largest content, at most the source's, an area downscale. For a pool
+/// cell of an image some element stretches to its destination
+/// ([`ChartStretch::Fill`]; design.md "Rendering and Skins", chart
+/// images): that draw stretches the whole content to the destination
+/// whatever its aspect, so a fit keeping the aspect of a picture whose
+/// aspect differs from its cell's would keep less than the cell on one
+/// axis and draw upscaled there. The native size is kept for placement,
+/// as [`derive`] keeps it, so only the resolution kept differs. Errors and
+/// checkpoints as [`derive`]'s.
+///
+/// # Errors
+///
+/// As [`derive`].
+pub fn derive_filling(
+    source: &Fitted,
+    slot: Slot,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Fitted, Absent> {
+    derive_to(source, slot.max_content(), cancel)
+}
+
+/// The fit of `source` whose content is `want` on each axis, at most the
+/// source's ([`derive`], [`derive_filling`]).
+fn derive_to(source: &Fitted, want: [u32; 2], cancel: &dyn Fn() -> bool) -> Result<Fitted, Absent> {
     checkpoint(cancel, Site::Fitted)?;
-    let [cw, ch] = fitted_size(source.native, slot.max_content());
+    let [cw, ch] = want;
     let [mw, mh] = source.content;
     let content = [cw.min(mw), ch.min(mh)];
     // The source's content texels, [`GUTTER`] in on each axis.

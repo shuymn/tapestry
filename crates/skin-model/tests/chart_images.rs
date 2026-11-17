@@ -794,9 +794,10 @@ fn keys(rects: &[[i32; 4]]) -> skin_model::Track {
 /// size; one that can draw past it (`Outer`, `FitWidth`, `FitHeight`,
 /// `NoResize`) takes the image's slot, as does an element its rect cannot
 /// bound (a fill); each is padded, aligned to 64 and capped at the slot of
-/// the atlas side raised to 2 048, and the widest per axis is kept. The
-/// scale is the canvas's, at most 2. A skin without -102 has no banner
-/// cell, and one without chart images none.
+/// the atlas side raised to 2 048, and the widest per axis is kept. An
+/// image some `Fill` element draws has its cell filled. The scale is the
+/// canvas's, at most 2. A skin without -102 has no banner cell, and one
+/// without chart images none.
 #[test]
 fn chart_cells_follow_each_stretchs_reach() {
     use skin_model::chart_image::{ChartCells, Slot};
@@ -815,7 +816,8 @@ fn chart_cells_follow_each_stretchs_reach() {
             s.chart_cells(hd, 2_048),
             ChartCells {
                 stage: cell(448, 320),
-                banner: None
+                stage_fills: stretch == ChartStretch::Fill,
+                ..ChartCells::NONE
             },
             "{stretch:?}"
         );
@@ -885,6 +887,9 @@ fn chart_cells_follow_each_stretchs_reach() {
             stage: cell(576, 448),
             // 300 → 320, 900 → 512 (capped).
             banner: cell(320, 512),
+            // A `Fill` element draws each.
+            stage_fills: true,
+            banner_fills: true,
         }
     );
     // An exact 64 step and one texel past it.

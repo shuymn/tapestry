@@ -570,13 +570,23 @@ fn binding_now(
     }
 }
 
-/// `source` derived into `cell`: absent when there is no cell or no image.
-fn derive_into(source: &Read, cell: Option<chart_image::Slot>, cancel: &dyn Fn() -> bool) -> Read {
+/// `source` derived into `cell`, filling it on each axis when its flag is
+/// set ([`chart_image::ChartCells::of`]): absent when there is no cell or
+/// no image.
+fn derive_into(
+    source: &Read,
+    cell: Option<(chart_image::Slot, bool)>,
+    cancel: &dyn Fn() -> bool,
+) -> Read {
     let image = match (&source.image, cell) {
-        (Ok(image), Some(cell)) => {
+        (Ok(image), Some((cell, fills))) => {
             #[cfg(test)]
             count([0, 1]);
-            chart_image::derive(image, cell, cancel)
+            if fills {
+                chart_image::derive_filling(image, cell, cancel)
+            } else {
+                chart_image::derive(image, cell, cancel)
+            }
         }
         (Ok(_), None) => Err(Absent::NoHeader),
         (Err(why), _) => Err(why.clone()),
@@ -599,12 +609,10 @@ pub fn derive_cells(
     cancel: &dyn Fn() -> bool,
 ) -> Option<ChartImages> {
     let reads = ChartImage::ALL.map(|which| {
-        let cell = match which {
-            ChartImage::Stage => cells.stage,
-            ChartImage::Banner => cells.banner,
-            ChartImage::Back => return absent_read(chart_image::Binding::NoHeader),
-        };
-        Arc::new(derive_into(sources.read(which), cell, cancel))
+        if which == ChartImage::Back {
+            return absent_read(chart_image::Binding::NoHeader);
+        }
+        Arc::new(derive_into(sources.read(which), cells.of(which), cancel))
     });
     Some(ChartImages::of(reads)).filter(|d| {
         [ChartImage::Stage, ChartImage::Banner]
@@ -634,8 +642,8 @@ fn read_row(
     let [stage, banner] = &id.names;
     let reads = ChartImage::ALL.map(|which| {
         let (name, cell) = match which {
-            ChartImage::Stage => (stage, cells.stage),
-            ChartImage::Banner => (banner, cells.banner),
+            ChartImage::Stage => (stage, cells.of(which)),
+            ChartImage::Banner => (banner, cells.of(which)),
             ChartImage::Back => return absent_read(chart_image::Binding::NoHeader),
         };
         let binding = binding_now(&dir, name, identity);
@@ -3476,5 +3484,38 @@ mod tests {
         w.step(None, &|| false, None);
         assert_eq!(w.begun(), jobs, "a job began after the end");
         assert_eq!(w.facts(), None);
+    }
+
+    /// A cursor read fits an image some element stretches to its
+    /// destination (`Fill`) to its whole cell on each axis, and keeps the
+    /// aspect of one no element does: a 16:9 1 920×1 080 stage file in the
+    /// 448×320 cell of a 384×288 `Fill` destination keeps 432×304, above
+    /// the destination on both axes, where an aspect-kept fit keeps 432×243
+    /// and would draw upscaled on its height. Both keep the native size.
+    #[test]
+    fn a_fill_cell_is_filled_on_each_axis() {
+        use skin_model::chart_image::{ChartCells, Slot};
+        let d = tempfile::tempdir().unwrap();
+        png(d.path(), "s.png", [1_920, 1_080], [10, 20, 30]);
+        let id = super::CursorId {
+            dir: d.path().to_path_buf(),
+            names: [
+                library::Name::Named("s.png".to_owned()),
+                library::Name::None,
+            ],
+        };
+        let content = |fills| {
+            let cells = ChartCells {
+                stage: Slot::new([448, 320]),
+                stage_fills: fills,
+                ..ChartCells::NONE
+            };
+            let set = super::read_row(&id, cells, &|| false);
+            let fit = set.read(ChartImage::Stage).image.as_ref().unwrap();
+            assert_eq!(fit.native(), [1_920, 1_080]);
+            fit.content()
+        };
+        assert_eq!(content(true), [432, 304]);
+        assert_eq!(content(false), [432, 243]);
     }
 }

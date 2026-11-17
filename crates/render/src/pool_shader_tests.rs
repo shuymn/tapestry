@@ -334,7 +334,7 @@ fn the_pool_samples_as_the_atlas_does_and_the_atlas_is_unchanged() {
     let pool_images = [image(POOL_SIDE, 1), image(POOL_SIDE, 2)];
     let cells = ChartCells {
         stage: Slot::new([256, 256]),
-        banner: None,
+        ..ChartCells::NONE
     };
     let grid = Grid::of(cells, POOL_SIDE, &device.limits()).unwrap();
     let pool = ChartPool::create(gpu, grid, 2);

@@ -10248,6 +10248,7 @@ pub(crate) mod tests {
             cells: skin_model::chart_image::ChartCells {
                 stage: cell([448, 320]),
                 banner: cell([320, 128]),
+                ..skin_model::chart_image::ChartCells::NONE
             },
             side: 2_048,
             layers: 1,

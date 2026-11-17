@@ -749,3 +749,40 @@ fn a_source_derives_each_slots_fit() {
         Err(Absent::Cancelled)
     );
 }
+
+/// A fit filling its cell (a pool cell of an image a `Fill` element
+/// draws) downscales the source to the cell's content on each axis, its
+/// aspect not kept, never past the source's: a 16:9 1 920×1 080 picture
+/// in a 448×320 cell keeps 432×304 where an aspect-kept fit keeps
+/// 432×243, its halves still split at the middle; a 320×180 one keeps
+/// its own size. Both keep the native size, and every level.
+#[test]
+fn a_filling_fit_covers_its_cell_on_each_axis() {
+    use skin_model::chart_image::{derive, derive_filling, read_source};
+    let (red, blue) = ([200, 0, 0, 255], [0, 0, 200, 255]);
+    let halves =
+        |w: u32, h: u32| RgbaImage::from_fn(w, h, |x, _| Rgba(if x < w / 2 { red } else { blue }));
+    let d = dir();
+    save(d.path(), "s.png", &halves(1_920, 1_080));
+    save(d.path(), "t.png", &halves(320, 180));
+    let root = ChartDir::new(d.path()).unwrap();
+    let cell = Slot::new([448, 320]).unwrap();
+    let source = fitted(read_source(&root, "s.png", &[], &never, &fixed));
+    let filled = derive_filling(&source, cell, &never).unwrap();
+    assert_eq!(filled.content(), [432, 304]);
+    assert_eq!(filled.native(), [1_920, 1_080]);
+    assert_eq!(filled.levels().len(), MIP_LEVELS);
+    assert!(cell.holds(&filled));
+    assert_eq!(texel(&filled, 0, GUTTER, GUTTER + 303), red);
+    assert_eq!(texel(&filled, 0, GUTTER + 215, GUTTER), red);
+    assert_eq!(texel(&filled, 0, GUTTER + 216, GUTTER), blue);
+    assert_eq!(texel(&filled, 0, GUTTER + 431, GUTTER + 303), blue);
+    assert_eq!(derive(&source, cell, &never).unwrap().content(), [432, 243]);
+    let small = fitted(read_source(&root, "t.png", &[], &never, &fixed));
+    let kept = derive_filling(&small, cell, &never).unwrap();
+    assert_eq!(kept.content(), [320, 180], "never upscaled");
+    assert_eq!(
+        derive_filling(&source, cell, &|| true),
+        Err(Absent::Cancelled)
+    );
+}
