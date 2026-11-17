@@ -166,7 +166,8 @@ fn hold(cancel: &dyn Fn() -> bool) {
 }
 
 /// What an attempt's BGA reads: the chart's folder and each `#BMPxx`
-/// name by its id's index (none for a chart without BGA).
+/// name by its id's index (none for a chart without BGA, or for a play
+/// that does not show it).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Want {
     pub dir: PathBuf,
@@ -174,14 +175,19 @@ pub struct Want {
 }
 
 impl Want {
-    /// The BGA of `chart`, read from `path`'s folder.
+    /// The BGA of `chart`, read from `path`'s folder when `shown` (the
+    /// session's answer, [`game::BgaSession::shown`]); nothing when not.
     #[must_use]
-    pub fn of(path: &Path, chart: &bms_model::Chart) -> Self {
+    pub fn of(path: &Path, chart: &bms_model::Chart, shown: bool) -> Self {
         Self {
             dir: crate::chart_images::folder(path),
-            names: chart.bga.as_ref().map_or_else(Vec::new, |b| {
-                b.images().iter().map(|i| i.name.clone()).collect()
-            }),
+            names: chart
+                .bga
+                .as_ref()
+                .filter(|_| shown)
+                .map_or_else(Vec::new, |b| {
+                    b.images().iter().map(|i| i.name.clone()).collect()
+                }),
         }
     }
 }

@@ -1440,6 +1440,10 @@ struct Shared {
     /// [`hook_bound`] (tests).
     #[cfg(test)]
     chart_hold: AtomicBool,
+    /// While set, a BGA table's publication waits before it publishes, at
+    /// most [`hook_bound`] (tests).
+    #[cfg(test)]
+    bga_hold: AtomicBool,
     /// When the current play's first frame was drawn, on the clock.
     first_frame: AtomicI64,
     /// The end screen's slot: its newest page, and the pages left with the
@@ -1659,6 +1663,8 @@ impl Shared {
             chart_targets: Mutex::new(ChartTargets::default()),
             #[cfg(test)]
             chart_hold: AtomicBool::new(false),
+            #[cfg(test)]
+            bga_hold: AtomicBool::new(false),
             first_frame: AtomicI64::new(i64::MIN),
             end_page: Mutex::new(EndSlot::default()),
             #[cfg(feature = "dev-tools")]
@@ -2976,6 +2982,13 @@ impl RenderLink {
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn hold_chart_publications(&self, on: bool) {
         self.shared.chart_hold.store(on, Ordering::SeqCst);
+    }
+
+    /// Holds every BGA table's publication before it publishes while
+    /// `on`, at most [`hook_bound`] each (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn hold_bga_publications(&self, on: bool) {
+        self.shared.bga_hold.store(on, Ordering::SeqCst);
     }
 
     pub fn ready_attempt(&self, request: u64, epoch: u64) -> Result<ReadyAnswer, ScreenError> {
@@ -7880,6 +7893,13 @@ impl Run {
                 entries,
                 reply,
             } => {
+                #[cfg(test)]
+                {
+                    let end = Instant::now() + hook_bound();
+                    while self.shared.bga_hold.load(Ordering::SeqCst) && Instant::now() < end {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
                 let table = screen.map_or(Err(stale), |s| s.publish_bga(key, entries));
                 let _ = reply.send(crate::bga::Publication {
                     table,

@@ -1233,6 +1233,11 @@ fn write_bga_chart(library: &Path) -> bms_model::Chart {
 /// A play skin whose only element is the chart's BGA filling the canvas,
 /// cropping its pictures (stretch 3).
 fn install_bga_skin(fx: &Fixture) {
+    install_bga_skin_with(fx, "");
+}
+
+/// [`install_bga_skin`] with `settings` added to `player.toml`.
+fn install_bga_skin_with(fx: &Fixture, settings: &str) {
     let skin = fx.base.join("skin");
     fs::create_dir_all(&skin).unwrap();
     fs::write(
@@ -1247,11 +1252,54 @@ fn install_bga_skin(fx: &Fixture) {
     fs::write(
         fx.data().join("player.toml"),
         format!(
-            "[skins.play]\nroot = '{}'\nentry = 's.json'\n",
+            "{settings}[skins.play]\nroot = '{}'\nentry = 's.json'\n",
             skin.display()
         ),
     )
     .unwrap();
+}
+
+/// With `[bga] mode` off, a play of a chart with BGA draws the black
+/// placeholder and no picture, the switched base under the layer and the
+/// miss window after the first miss alike, and its render thread's app
+/// region allocates nothing (design.md "Rendering and Skins", BGA;
+/// "Settings Files").
+#[test]
+fn a_play_with_the_bga_off_draws_the_placeholder() {
+    let fx = Fixture::new();
+    write_bga_chart(&fx.library());
+    install_bga_skin_with(&fx, "[bga]\nmode = 'off'\n");
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "capture = { at = 3200, file = \"on.png\" }",
+        "capture = { at = 2400, file = \"miss.png\" }",
+        "select = { path = \"library/g/g.bms\" }",
+        "play = { input = { miss = \"all\" }, until = \"end\" }",
+        "result = \"back\"",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let (records, _) = fx.played_records();
+    let m: toml::Table = fs::read_to_string(
+        records
+            .last()
+            .expect("a played record")
+            .with_extension("measure.toml"),
+    )
+    .unwrap()
+    .parse()
+    .unwrap();
+    assert_eq!(int(&m, "allocations", "render_app"), Some(0), "{m:?}");
+    for list in ["on", "miss"] {
+        let list = fs::read_to_string(fx.base.join("out").join(format!("{list}.jsonl"))).unwrap();
+        let quads: Vec<&str> = list.lines().filter(|l| l.contains("\"seq\":")).collect();
+        let [q] = quads.as_slice() else {
+            panic!("the placeholder alone: {list}");
+        };
+        assert!(
+            q.contains("\"color\":[0,0,0,1]") && q.contains("\"filter\":\"Linear\""),
+            "a black opaque placeholder, no picture: {list}"
+        );
+    }
 }
 
 /// The render thread's app region allocates nothing in any frame of a play

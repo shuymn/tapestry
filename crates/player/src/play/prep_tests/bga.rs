@@ -97,3 +97,64 @@ fn bga_transient_the_ledger_refuses_leaves_bga_absent_and_play_starts() {
         });
     }
 }
+
+/// A session that does not show the BGA (`[bga] mode` off, or `autoplay`
+/// in a session that is not autoplay) reads nothing for a chart with BGA:
+/// no job begun, nothing decoded, no array begun; and it is ready without
+/// waiting for its empty table, which the render thread holds here past
+/// the link's bound. The session's answer is read, never the rig's own
+/// autoplay, which a scenario's chart changes: an autoplay session whose
+/// rig plays by hand still reads the pictures.
+#[test]
+fn a_session_not_showing_the_bga_reads_nothing_and_is_ready_unwaited() {
+    let _serial = imports::serial();
+    let session = |mode, autoplay| game::BgaSession {
+        settings: game::BgaSettings {
+            mode,
+            ..game::BgaSettings::default()
+        },
+        autoplay,
+    };
+    for (what, s, rig_autoplay) in [
+        ("off", session(game::BgaMode::Off, false), false),
+        (
+            "autoplay, the session by hand",
+            session(game::BgaMode::Autoplay, false),
+            true,
+        ),
+    ] {
+        let (_dir, l) = chart_with_bga();
+        let screens = Installers::default();
+        on_rig(l.chart(), &screens, false, |rig| {
+            rig.bga_session = s;
+            rig.autoplay = rig_autoplay;
+            rig.render
+                .set_timeouts(Duration::from_secs(1), Duration::from_secs(5));
+            rig.render.hold_bga_publications(true);
+            let began = Instant::now();
+            let mut h = begin(rig, &l);
+            let ready = polled(rig, &mut h).unwrap();
+            let took = began.elapsed();
+            rig.render.hold_bga_publications(false);
+            assert_eq!(ready, Preparation::Ready, "{what}");
+            assert!(took < Duration::from_secs(1), "{what}: waited {took:?}");
+            assert_eq!(stage(rig), "answered", "{what}");
+            assert_eq!(rig.bga.counts(), (0, 0), "{what}: nothing read");
+            let seen = screens.bga.lock().unwrap();
+            assert!(seen.begins.is_empty(), "{what}: no array");
+            assert_eq!(seen.cells, 0, "{what}");
+        });
+    }
+    let (_dir, l) = chart_with_bga();
+    let screens = Installers::default();
+    on_rig(l.chart(), &screens, false, |rig| {
+        rig.bga_session = session(game::BgaMode::Autoplay, true);
+        rig.autoplay = false;
+        let mut h = begin(rig, &l);
+        assert_eq!(polled(rig, &mut h).unwrap(), Preparation::Ready);
+        assert_eq!(rig.bga.counts(), (1, 1), "an autoplay session reads them");
+        let seen = screens.bga.lock().unwrap();
+        let table = seen.current().expect("published before ready");
+        assert!(matches!(table.entries(), [BgaEntry::Picture(c)] if c.native == [640, 480]));
+    });
+}

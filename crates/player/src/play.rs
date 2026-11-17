@@ -835,8 +835,11 @@ impl PlayerRig<'_> {
             play: self.play_chart.filter(|_| self.pending.is_none()),
             result: None,
         });
-        self.bga
-            .attempt(crate::bga::Want::of(loaded.path(), loaded.chart()));
+        self.bga.attempt(crate::bga::Want::of(
+            loaded.path(),
+            loaded.chart(),
+            self.bga_session.shown(),
+        ));
         let coord = self.selection.as_ref().map(|s| (&s.coord, s.spawner));
         // No coordinator (no song selection): the preparation reads them.
         if coord.is_some() {
@@ -2350,8 +2353,11 @@ impl Rig for PlayerRig<'_> {
         };
         // The attempt's BGA: a retry's is a new generation, its array
         // reused when nothing changed; begun now, beside the rest.
-        self.bga
-            .attempt(crate::bga::Want::of(loaded.path(), loaded.chart()));
+        self.bga.attempt(crate::bga::Want::of(
+            loaded.path(),
+            loaded.chart(),
+            self.bga_session.shown(),
+        ));
         if let Some(s) = &self.selection {
             self.bga.step(Some((&s.coord, s.spawner)), &|| false);
         }
@@ -2452,6 +2458,13 @@ impl Rig for PlayerRig<'_> {
                     None => {
                         prep.stage = PrepStage::Images(request, target);
                         break Ok(game::PrepPoll::Pending);
+                    }
+                    // A play that does not show the BGA asked for nothing:
+                    // ready without waiting for its empty table, which a
+                    // later step takes.
+                    Some(ImagesPoll::Ready) if !self.bga_session.shown() => {
+                        prep.stage = PrepStage::Answered(Some(request));
+                        break Ok(game::PrepPoll::Done(Preparation::Ready));
                     }
                     Some(ImagesPoll::Ready) => prep.stage = PrepStage::Bga(request),
                     Some(ImagesPoll::Stopped) => {
