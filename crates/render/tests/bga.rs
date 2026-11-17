@@ -226,7 +226,7 @@ fn large_cell() -> (CellPlace, Vec<u8>) {
 /// bytes at each (design.md "Memory Budget"): a 2 046² picture, whose
 /// cell's 16 MiB are four budgets, ends no sooner than its fourth boundary
 /// and draws whole, its last rows included; four cells of a budget each
-/// are written one a boundary, each dropped once written.
+/// are written at most one a boundary, each dropped once written.
 #[test]
 fn a_batch_is_written_a_budget_at_a_boundary() {
     assert_eq!(render::BGA_WRITE_BUDGET, 4 << 20);
@@ -259,8 +259,9 @@ fn a_batch_is_written_a_budget_at_a_boundary() {
     assert_eq!(at(&p, (200, 10)), BLUE);
     assert_eq!(at(&p, (200, 390)), GREEN, "the last rows written");
     // Four 1 022² pictures, each cell a whole budget (1 024 rows of 4 KiB):
-    // one cell written at each boundary, its bytes dropped once written.
-    let quarter = 1_024 * 1_024 * 4;
+    // a boundary writes one cell or, while the last step is in flight,
+    // nothing, and each cell's bytes are dropped once written.
+    let quarter = u64::try_from(1_024 * 1_024 * 4).unwrap();
     let cells = (0..4)
         .map(|i| {
             let place = CellPlace {
@@ -268,19 +269,23 @@ fn a_batch_is_written_a_budget_at_a_boundary() {
                 origin: [i % 2 * 1_024, i / 2 * 1_024],
                 content: [1_022, 1_022],
             };
-            (place, vec![255; quarter])
+            (place, vec![255; 1_024 * 1_024 * 4])
         })
         .collect();
     r.stage_bga_cells(key, cells).unwrap();
-    for left in (1..4).rev() {
-        assert_eq!(r.bga_boundary(), render::BgaStep::Pending);
-        assert_eq!(
-            r.bga_upload_bytes(),
-            left * u64::try_from(quarter).unwrap(),
-            "one cell a boundary"
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let mut left = 4 * quarter;
+    while r.bga_boundary() == render::BgaStep::Pending {
+        let now = r.bga_upload_bytes();
+        assert!(
+            now == left || now + quarter == left,
+            "{left} to {now}: one cell a boundary at most"
         );
+        left = now;
+        assert!(std::time::Instant::now() < end, "the batch never ended");
+        std::thread::sleep(std::time::Duration::from_millis(1));
     }
-    r.cancel_bga_upload();
+    assert_eq!(left, 0, "every cell written");
 }
 
 /// A batch whose array is replaced while it is written ends stale at the
