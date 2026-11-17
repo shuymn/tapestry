@@ -84,6 +84,8 @@ struct Tags {
     /// The host module proxies: address, module, unchanged.
     proxies: Vec<(usize, u8, bool)>,
     config: Option<Table>,
+    /// Each observer's predicate and where it was called, by ordinal.
+    observers: Vec<(Function, Option<Loc>)>,
 }
 
 /// How many values are converted between two looks at the cancellation
@@ -160,6 +162,13 @@ pub(crate) fn field(arena: &Arena, id: u32) -> &'static str {
         .unwrap_or("other")
 }
 
+/// Whether `f` is no skin closure: a native function, or the sandbox's own
+/// Lua (its chunks are named `=`), host functions among them.
+pub(super) fn native(f: &Function) -> bool {
+    let info = f.info();
+    info.what == "C" || info.source.as_deref().is_some_and(|s| s.starts_with('='))
+}
+
 /// Converts `value`, what the entry of `entry` returned, with `modules`
 /// the files the pass loaded (the entry first), in `lua`, the pass's VM.
 pub(super) fn convert(
@@ -194,6 +203,7 @@ pub(super) fn convert(
                 marks: lua.named_registry_value(super::sandbox::TAG_MARKS)?,
                 proxies: super::host::proxies(lua)?,
                 config,
+                observers: pass.observers(lua)?,
             })
         })();
         Some(r.map_err(|e| ImportError::Lua {
@@ -223,6 +233,7 @@ pub(super) fn convert(
         bytes: Vec::new(),
         values: Vec::new(),
         callables: Vec::new(),
+        callback_nodes: Vec::new(),
         functions: Vec::new(),
         seen: HashMap::new(),
         path: Vec::new(),
@@ -249,6 +260,7 @@ pub(super) fn convert(
         bytes,
         values,
         callables,
+        callback_nodes,
         functions,
         mut analysis,
         ..
@@ -272,6 +284,7 @@ pub(super) fn convert(
         values,
         modules,
         callables,
+        callback_nodes,
         analysis,
         kept: None,
     }));
@@ -325,6 +338,9 @@ struct Conv<'a> {
     bytes: Vec<u8>,
     values: Vec<LuaScalar>,
     callables: Vec<Callable>,
+    /// The nodes holding a function at a property field or an `op` entry
+    /// ([`LuaText::callback_nodes`]).
+    callback_nodes: Vec<u32>,
     /// Each callable's function, by its index: what a screen's runtime
     /// calls when the import keeps the VM.
     functions: Vec<Function>,
@@ -461,10 +477,12 @@ impl Conv<'_> {
                         i
                     }
                 };
+                let id = self.scalar(LuaScalar::Callable(index), span)?;
                 if matches!(pos, Pos::Prop(_)) {
                     self.root(index, f)?;
+                    self.callback_nodes.push(id);
                 }
-                self.scalar(LuaScalar::Callable(index), span)
+                Ok(id)
             }
             _ => Err(self.lua(LuaWhy::Value)),
         }
@@ -481,10 +499,16 @@ impl Conv<'_> {
         if c.root {
             return Ok(());
         }
-        let instance = if c.kind == CallableKind::Lua {
-            self.tagged(f)?.unwrap_or(NONE)
-        } else {
-            NONE
+        let instance = match c.kind {
+            CallableKind::Lua => self.tagged(f)?.unwrap_or(NONE),
+            // An observer's predicate, captured as a root closure is.
+            CallableKind::Observer { observer, .. } => {
+                match self.observer(observer).map(|(p, _)| p.clone()) {
+                    Some(p) => self.tagged(&p)?.unwrap_or(NONE),
+                    None => NONE,
+                }
+            }
+            CallableKind::Host(_) | CallableKind::Library => NONE,
         };
         if let Some(c) = self.callables.get_mut(i as usize) {
             c.root = true;
@@ -533,8 +557,22 @@ impl Conv<'_> {
         }
     }
 
-    /// What function `f`, at `addr`, is and where it was defined.
+    /// What function `f`, at `addr`, is and where it was defined: an
+    /// observer where it was called.
     fn callable(&mut self, f: &mlua::Function, addr: usize) -> Result<Callable, ImportError> {
+        if let Some(observer) = self.pass.observer_of(addr) {
+            let at = self.observer(observer).and_then(|(_, at)| at.as_ref());
+            return Ok(Callable {
+                module: at.and_then(|l| self.module_index.get(l.file.as_str()).copied()),
+                line: at.map_or(0, |l| l.line),
+                kind: CallableKind::Observer {
+                    api: super::host::OBSERVE,
+                    observer,
+                },
+                instance: NONE,
+                root: false,
+            });
+        }
         if let Some(api) = self.pass.host_api_of(addr) {
             return Ok(Callable {
                 module: None,
@@ -544,10 +582,7 @@ impl Conv<'_> {
                 root: false,
             });
         }
-        let info = f.info();
-        // The sandbox's own Lua (its chunks are named `=`) is library.
-        let ours = info.source.as_deref().is_some_and(|s| s.starts_with('='));
-        if info.what == "C" || ours {
+        if native(f) {
             return Ok(Callable {
                 module: None,
                 line: 0,
@@ -556,6 +591,7 @@ impl Conv<'_> {
                 root: false,
             });
         }
+        let info = f.info();
         let source = info.source.as_deref().and_then(|s| s.strip_prefix('@'));
         // One hash of the source's name, its bytes charged first.
         if let Some(s) = source {
@@ -573,6 +609,11 @@ impl Conv<'_> {
             instance: NONE,
             root: false,
         })
+    }
+
+    /// Observer `n`'s predicate and where it was called.
+    fn observer(&self, n: u32) -> Option<&(Function, Option<Loc>)> {
+        self.tags.as_ref()?.observers.get(n as usize)
     }
 
     /// The cancellation request, seen every [`CHECK_EVERY`] entries a

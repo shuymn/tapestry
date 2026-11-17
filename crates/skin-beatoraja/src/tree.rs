@@ -86,6 +86,10 @@ pub(crate) struct LuaText {
     pub(crate) modules: Vec<String>,
     /// The functions the table held, each instance once.
     pub(crate) callables: Vec<Callable>,
+    /// The nodes holding a function where the source reads a callback (a
+    /// property field or an `op` entry), ascending: a function held
+    /// anywhere else is inert.
+    pub(crate) callback_nodes: Vec<u32>,
     /// The configured pass's trees and captures; `None` for the header
     /// pass's table.
     pub(crate) analysis: Option<Box<crate::lua::callback::Analysis>>,
@@ -116,13 +120,16 @@ pub(crate) enum LuaScalar {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Callable {
     /// The module that defined it, an index of [`LuaText::modules`];
-    /// `None` for a host or library function.
+    /// `None` for a host or library function. An observer's is the module
+    /// it was called in.
     pub(crate) module: Option<u16>,
-    /// The line its definition starts on, 0 for a host function.
+    /// The line its definition starts on, 0 for a host function; an
+    /// observer's call line.
     pub(crate) line: u32,
     /// What it is.
     pub(crate) kind: CallableKind,
-    /// Its closure instance in [`LuaText::analysis`], `NONE` without one.
+    /// Its closure instance in [`LuaText::analysis`], `NONE` without one;
+    /// an observer's is its predicate's.
     pub(crate) instance: u32,
     /// Whether the source reads it: it is met at a property field or an
     /// `op` entry ([`crate::lua::convert`]'s schema). Any other is inert.
@@ -139,6 +146,10 @@ pub enum CallableKind {
     Host(u16),
     /// A library function (`string`, `table`, `math` or a base function).
     Library,
+    /// The function a construction-time `timer_util.timer_observe_boolean`
+    /// returned: host API `api`, the pass's observer `observer`, in call
+    /// order.
+    Observer { api: u16, observer: u32 },
 }
 
 /// A value as a field reads it, following the pinned reader's typing:
