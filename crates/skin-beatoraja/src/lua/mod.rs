@@ -600,20 +600,26 @@ impl Pass {
         self.hosts.borrow().get(&addr).copied()
     }
 
-    /// Records the observer `timer_util.timer_observe_boolean` returned as
-    /// `face` for `predicate`, called at `at`.
+    /// The ordinal the next observer gets ([`Self::observe`]).
+    fn next_observer(&self, lua: &Lua) -> mlua::Result<u32> {
+        u32::try_from(self.observers.borrow().len()).map_err(|_| {
+            self.ledger
+                .fail_lua(lua, LuaWhy::Limit(LuaLimit::HostCalls))
+        })
+    }
+
+    /// Records observer `n` ([`Self::next_observer`]), the function
+    /// `timer_util.timer_observe_boolean` returned as `face` for
+    /// `predicate`, called at `at`.
     fn observe(
         &self,
         lua: &Lua,
-        face: &Function,
+        (n, face): (u32, &Function),
         predicate: &Function,
         at: Option<Loc>,
     ) -> mlua::Result<()> {
         let mut observers = self.observers.borrow_mut();
-        let n = u32::try_from(observers.len()).map_err(|_| {
-            self.ledger
-                .fail_lua(lua, LuaWhy::Limit(LuaLimit::HostCalls))
-        })?;
+        debug_assert_eq!(usize::try_from(n).ok(), Some(observers.len()));
         observers.push(Observer {
             _face: lua.create_registry_value(face.clone())?,
             predicate: lua.create_registry_value(predicate.clone())?,
@@ -628,6 +634,26 @@ impl Pass {
     /// The ordinal of the observer whose returned function is at `addr`.
     fn observer_of(&self, addr: usize) -> Option<u32> {
         self.observer_of.borrow().get(&addr).copied()
+    }
+
+    /// Observer `n`'s predicate, from `lua`'s registry.
+    #[cfg(feature = "dev-tools")]
+    fn observer_predicate(&self, lua: &Lua, n: u32) -> mlua::Result<Option<Function>> {
+        let observers = self.observers.borrow();
+        match usize::try_from(n).ok().and_then(|i| observers.get(i)) {
+            Some(o) => lua.registry_value(&o.predicate).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Where each observer was called, in call order.
+    #[cfg(feature = "dev-tools")]
+    fn observer_sites(&self) -> Vec<Option<Loc>> {
+        self.observers
+            .borrow()
+            .iter()
+            .map(|o| o.at.clone())
+            .collect()
     }
 
     /// Each observer's predicate, from `lua`'s registry, and where it was
