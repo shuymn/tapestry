@@ -203,7 +203,7 @@ pub enum BgaMsg {
     Publish {
         key: Option<BgaKey>,
         entries: Vec<BgaEntry>,
-        reply: mpsc::SyncSender<Result<Arc<BgaTable>, BgaFault>>,
+        reply: mpsc::SyncSender<Publication>,
     },
     /// The table published for `key`'s array, if it is still the one in
     /// use ([`render::Renderer::published_bga`]).
@@ -213,6 +213,15 @@ pub enum BgaMsg {
     },
     /// Drop the array and its table ([`render::Renderer::drop_bga`]).
     Drop,
+}
+
+/// The render thread's answer to [`BgaMsg::Publish`], and when it gave it:
+/// an answer taken after its bound passed is one given before it only when
+/// `at` says so.
+#[derive(Debug)]
+pub struct Publication {
+    pub table: Result<Arc<BgaTable>, BgaFault>,
+    pub at: Instant,
 }
 
 /// How a step's answer came.
@@ -405,8 +414,8 @@ fn read_and_publish(
                 reply,
             }
         }) {
-            Asked::Answer(Ok(t)) => End::Published(t),
-            Asked::Answer(Err(_)) => End::Stopped,
+            Asked::Answer(Publication { table: Ok(t), .. }) => End::Published(t),
+            Asked::Answer(Publication { table: Err(_), .. }) => End::Stopped,
             Asked::Unanswered => End::Unanswered,
         };
     let absent = || vec![BgaEntry::Absent; n];
@@ -646,8 +655,9 @@ struct Core {
 /// or poll, never waited for: the game thread sends it while the render
 /// thread may be held (a loading frame awaiting its acknowledgement).
 struct AbsentAnswer {
-    rx: mpsc::Receiver<Result<Arc<BgaTable>, BgaFault>>,
-    /// The link's bound from the send: unanswered past it.
+    rx: mpsc::Receiver<Publication>,
+    /// The link's bound from the send: unanswered past it, an answer given
+    /// after it included, however early it is taken.
     by: Instant,
 }
 
@@ -935,14 +945,17 @@ impl Core {
     }
 
     /// Takes the absent table's answer once it came, or once the link's
-    /// bound passed without it.
+    /// bound passed without it. An answer given within the bound counts
+    /// however late it is taken (other loading work may delay the step);
+    /// one given after it is unanswered.
     fn take_absent(&mut self) {
         let Some(absent) = &self.absent else {
             return;
         };
         let answer = match absent.rx.try_recv() {
-            Ok(Ok(t)) => End::Published(t),
-            Ok(Err(_)) => End::Stopped,
+            Ok(a) if a.at >= absent.by => End::Unanswered,
+            Ok(Publication { table: Ok(t), .. }) => End::Published(t),
+            Ok(Publication { table: Err(_), .. }) => End::Stopped,
             Err(mpsc::TryRecvError::Empty) if Instant::now() < absent.by => return,
             Err(_) => End::Unanswered,
         };

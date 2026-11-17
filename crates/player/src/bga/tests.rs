@@ -7,15 +7,15 @@
 
 use std::path::Path;
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use game::coord::{Caps, Class, Coordinator, JobKey, JobKind, Owner, Scope, Spawner};
 use skin_model::bga::{BgaEntry, BgaTable};
 
-use super::{BATCH, BATCH_LIMIT, BgaMsg, BgaWorker, HELD, HOLD, Poll, Want};
-use crate::render_side::RenderLink;
+use super::{BATCH, BATCH_LIMIT, BgaMsg, BgaWorker, HELD, HOLD, Poll, Publication, Want};
 use crate::render_side::tests::Installers;
+use crate::render_side::{BgaPublisher, RenderLink, RenderMsg};
 
 const CAPS: Caps = Caps {
     foreground: 4,
@@ -187,7 +187,7 @@ fn bga_images_are_one_owned_job_published_before_ready() {
         },
     ));
     assert_eq!(
-        rx.recv_timeout(Duration::from_secs(10)).unwrap(),
+        rx.recv_timeout(Duration::from_secs(10)).unwrap().table,
         Err(render::BgaFault::Stale)
     );
     assert_eq!(screens.bga.lock().unwrap().published.len(), 1);
@@ -309,4 +309,54 @@ fn bga_cells_go_in_batches_within_the_cell_term() {
         );
         assert_eq!(seen.cells, 5);
     }
+}
+
+/// The absent table's answer counts when the render thread gave it within
+/// the link's bound, however late a step takes it (other loading work may
+/// delay the step); given after the bound, or not at all, it is unanswered
+/// and the attempt refused.
+#[test]
+fn an_absent_table_answered_after_the_bound_is_unanswered() {
+    const BOUND: Duration = Duration::from_millis(200);
+    // `Some(late)`: answered before or after the bound; `None`: never.
+    let poll_after_the_bound = |late: Option<bool>| -> Poll {
+        let (link, rx) = BgaPublisher::channel(BOUND);
+        let w = BgaWorker::new(Arc::new(AtomicU64::new(0)), link);
+        w.renew();
+        w.attempt(want(Path::new("."), &[]));
+        w.step(None, &|| false);
+        let Ok(RenderMsg::Bga {
+            msg: BgaMsg::Publish { reply, .. },
+            ..
+        }) = rx.try_recv()
+        else {
+            panic!("the empty table is sent at the step");
+        };
+        let answer = || {
+            reply
+                .send(Publication {
+                    table: Ok(Arc::new(BgaTable::new(Vec::new()))),
+                    at: Instant::now(),
+                })
+                .unwrap();
+        };
+        if late == Some(false) {
+            answer();
+        }
+        std::thread::sleep(2 * BOUND);
+        if late == Some(true) {
+            answer();
+        }
+        w.poll()
+    };
+    assert!(
+        matches!(poll_after_the_bound(Some(false)), Poll::Ready(_)),
+        "an answer given in time, taken after the bound"
+    );
+    assert_eq!(poll_after_the_bound(None), Poll::Expired);
+    assert_eq!(
+        poll_after_the_bound(Some(true)),
+        Poll::Expired,
+        "an answer given after the bound"
+    );
 }

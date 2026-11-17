@@ -2357,6 +2357,14 @@ impl BgaPublisher {
     pub const fn bound(&self) -> Duration {
         self.bound
     }
+
+    /// A publisher whose messages go to the returned receiver, answered
+    /// by the test (a render thread double).
+    #[cfg(test)]
+    pub(crate) fn channel(bound: Duration) -> (Self, Receiver<RenderMsg>) {
+        let (tx, rx) = mpsc::channel();
+        (Self { tx, bound }, rx)
+    }
 }
 
 /// The game thread's end of the render thread.
@@ -7872,7 +7880,11 @@ impl Run {
                 entries,
                 reply,
             } => {
-                let _ = reply.send(screen.map_or(Err(stale), |s| s.publish_bga(key, entries)));
+                let table = screen.map_or(Err(stale), |s| s.publish_bga(key, entries));
+                let _ = reply.send(crate::bga::Publication {
+                    table,
+                    at: Instant::now(),
+                });
             }
             BgaMsg::Reuse { key, reply } => {
                 let _ = reply.send(screen.and_then(|s| s.published_bga(key)));
