@@ -4,7 +4,8 @@
 //! process, and the input thread owns it). It is made hidden and shown once
 //! the render thread presented its first frame, or after [`SHOW_TIMEOUT`]
 //! at the latest ([`Showing`]), so the empty window Windows would paint
-//! first is never seen; a play's recording waits for the show
+//! first is never seen, and brought forward with no input sent
+//! ([`bring_forward`]); a play's recording waits for the show
 //! ([`WindowShown`]). Focus, the retry and quit keys, the settings keys F1
 //! to F8 and closing go to [`Controls`], which wakes the game
 //! thread for each, and the input thread on a focus change once the focus
@@ -100,23 +101,82 @@ pub const SHOW_TIMEOUT: Duration = Duration::from_secs(5);
 const SHOW_POLL: Duration = Duration::from_millis(10);
 
 /// What showing the window needs of it: [`Window`], or a fake in tests.
+/// None of it sends input (design.md "Rendering and Skins", Showing the
+/// window): winit's `focus_window` taps Alt with `SendInput` to get around
+/// Windows' foreground lock, and that Alt reaches the window in front.
 trait ShowWindow {
-    /// Shows the window and brings it to the foreground.
-    fn show(&self);
+    /// Shows the window active: Windows brings it to the foreground when
+    /// the player may take it.
+    fn show_active(&self);
     fn has_focus(&self) -> bool;
+    /// Asks Windows for the foreground (`SetForegroundWindow`): whether it
+    /// was granted.
+    fn ask_foreground(&self) -> bool;
+    /// Flashes the taskbar button until the window comes to the
+    /// foreground.
+    fn flash(&self);
 }
 
 impl ShowWindow for Window {
-    fn show(&self) {
+    fn show_active(&self) {
+        // Made with winit's default `active`, so shown with `SW_SHOW`.
         self.set_visible(true);
-        // Made hidden, the window was not brought to the foreground when
-        // it was made fullscreen.
-        self.focus_window();
     }
 
     fn has_focus(&self) -> bool {
         Window::has_focus(self)
     }
+
+    fn ask_foreground(&self) -> bool {
+        let Some(h) = hwnd(self) else {
+            return false;
+        };
+        // SAFETY: the window is open: it is `self`.
+        unsafe { windows::Win32::UI::WindowsAndMessaging::SetForegroundWindow(h) }.as_bool()
+    }
+
+    fn flash(&self) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            FLASHW_TIMERNOFG, FLASHW_TRAY, FLASHWINFO, FlashWindowEx,
+        };
+        let Some(h) = hwnd(self) else {
+            return;
+        };
+        let info = FLASHWINFO {
+            cbSize: u32::try_from(size_of::<FLASHWINFO>()).unwrap_or(u32::MAX),
+            hwnd: h,
+            dwFlags: FLASHW_TRAY | FLASHW_TIMERNOFG,
+            uCount: 0,
+            dwTimeout: 0,
+        };
+        // SAFETY: the window is open (it is `self`) and `info` outlives
+        // the call.
+        let _ = unsafe { FlashWindowEx(&raw const info) };
+    }
+}
+
+/// The window's Win32 handle.
+fn hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
+    match window.window_handle().ok()?.as_raw() {
+        RawWindowHandle::Win32(h) => Some(windows::Win32::Foundation::HWND(
+            h.hwnd.get() as *mut std::ffi::c_void
+        )),
+        _ => None,
+    }
+}
+
+/// Shows `window` and brings it forward without input of its own: shown
+/// active; when Windows kept another window in front, the foreground
+/// asked for once; refused again, its taskbar button flashed. Whether it
+/// has focus.
+fn bring_forward(window: &impl ShowWindow) -> bool {
+    window.show_active();
+    if window.has_focus() || (window.ask_foreground() && window.has_focus()) {
+        return true;
+    }
+    window.flash();
+    println!("window: shown behind the window in front; its taskbar button flashes");
+    false
 }
 
 /// Whether the hidden window was shown: on the first frame presented, or
@@ -166,8 +226,7 @@ impl Showing {
     /// the show; then wakes whoever waits for the show.
     fn show(&mut self, window: &impl ShowWindow, focus: impl FnOnce(bool), shared: &Shared) {
         self.shown = true;
-        window.show();
-        focus(window.has_focus());
+        focus(bring_forward(window));
         shared.mark_shown();
     }
 }
@@ -306,8 +365,14 @@ impl ApplicationHandler<Ask> for App {
                 m.refresh_rate_millihertz().unwrap_or(0)
             );
         }
-        match event_loop.create_window(attributes(monitor)) {
+        let (attributes, fullscreen) = attributes(monitor);
+        match event_loop.create_window(attributes) {
             Ok(w) => {
+                // Before the size is read: winit makes a window fullscreen
+                // the same way just after making it.
+                if fullscreen.is_some() {
+                    w.set_fullscreen(fullscreen);
+                }
                 self.focus(w.has_focus());
                 let surface = surface(&w);
                 let _ = ready.send(surface);
@@ -650,19 +715,22 @@ pub fn set_dev_window(size: (u32, u32)) {
     let _ = DEV_WINDOW.set(size);
 }
 
-/// The window's attributes: hidden until shown, borderless fullscreen on
-/// `monitor`; with `--dev-window` (dev-tools), [`dev_window`]'s.
-fn attributes(monitor: Option<MonitorHandle>) -> WindowAttributes {
+/// The window's attributes, hidden until shown, and the fullscreen it
+/// takes once made: borderless fullscreen on `monitor`; with
+/// `--dev-window` (dev-tools), [`dev_window`]'s and none. The fullscreen
+/// is not an attribute: winit brings a window made fullscreen to the
+/// foreground by tapping Alt, as `focus_window` does ([`ShowWindow`]).
+fn attributes(monitor: Option<MonitorHandle>) -> (WindowAttributes, Option<Fullscreen>) {
     #[cfg(feature = "dev-tools")]
     if let Some(&size) = DEV_WINDOW.get() {
         let at = monitor.as_ref().map(MonitorHandle::position);
         println!("window: a {}x{} window (--dev-window)", size.0, size.1);
-        return dev_window(size, at);
+        return (dev_window(size, at), None);
     }
-    Window::default_attributes()
+    let attributes = Window::default_attributes()
         .with_title("tapestry")
-        .with_visible(false)
-        .with_fullscreen(Some(Fullscreen::Borderless(monitor)))
+        .with_visible(false);
+    (attributes, Some(Fullscreen::Borderless(monitor)))
 }
 
 /// A window of client size `size` in physical pixels at `at` (the chosen
@@ -1137,16 +1205,19 @@ fn menu_key(key: PhysicalKey, repeat: bool) -> Option<MenuKey> {
 #[cfg(test)]
 mod tests {
     /// The window is borderless fullscreen on its monitor and sized by
-    /// nothing else.
+    /// nothing else, made fullscreen once it exists: winit taps Alt for a
+    /// window made fullscreen.
     #[test]
-    fn the_window_is_borderless_fullscreen() {
-        let a = super::attributes(None);
+    fn the_window_is_made_borderless_fullscreen_after_it_exists() {
+        let (a, fullscreen) = super::attributes(None);
         assert_eq!(
-            a.fullscreen,
+            fullscreen,
             Some(winit::window::Fullscreen::Borderless(None))
         );
+        assert_eq!(a.fullscreen, None);
         assert_eq!(a.inner_size, None);
         assert!(!a.visible);
+        assert!(a.active, "shown with SW_SHOW, not SW_SHOWNOACTIVATE");
     }
 
     /// `--dev-window`'s window: the asked client size in physical pixels
@@ -1261,20 +1332,64 @@ mod tests {
         assert_eq!(*seen.lock().unwrap(), [true]);
     }
 
-    /// The hidden window as showing sees it.
+    /// The hidden window as showing sees it: whether Windows brings it to
+    /// the foreground when it is shown and when it asks, and what was done
+    /// to it.
     #[derive(Default)]
     struct FakeShow {
-        shows: std::cell::Cell<u32>,
-        focused: bool,
+        front_when_shown: bool,
+        granted: bool,
+        front: std::cell::Cell<bool>,
+        done: std::cell::RefCell<Vec<&'static str>>,
+    }
+
+    impl FakeShow {
+        fn shows(&self) -> usize {
+            self.done.borrow().iter().filter(|&&d| d == "show").count()
+        }
     }
 
     impl super::ShowWindow for FakeShow {
-        fn show(&self) {
-            self.shows.set(self.shows.get() + 1);
+        fn show_active(&self) {
+            self.done.borrow_mut().push("show");
+            self.front.set(self.front_when_shown);
         }
 
         fn has_focus(&self) -> bool {
-            self.focused && self.shows.get() > 0
+            self.front.get()
+        }
+
+        fn ask_foreground(&self) -> bool {
+            self.done.borrow_mut().push("ask");
+            self.front.set(self.granted);
+            self.granted
+        }
+
+        fn flash(&self) {
+            self.done.borrow_mut().push("flash");
+        }
+    }
+
+    /// Showing sends no input: the window is shown active, asks for the
+    /// foreground once only when Windows kept another window in front,
+    /// and flashes its taskbar button only when that is refused too, and
+    /// the focus reported is the window's. Nothing else is done to it
+    /// (`ShowWindow` has no input to send, where winit's `focus_window`
+    /// taps Alt).
+    #[test]
+    fn showing_brings_the_window_forward_without_input() {
+        for (front_when_shown, granted, done, focused) in [
+            (true, false, &["show"][..], true),
+            (false, true, &["show", "ask"][..], true),
+            (false, false, &["show", "ask", "flash"][..], false),
+        ] {
+            let w = FakeShow {
+                front_when_shown,
+                granted,
+                ..FakeShow::default()
+            };
+            assert_eq!(super::bring_forward(&w), focused, "{done:?}");
+            assert_eq!(*w.done.borrow(), done);
         }
     }
 
@@ -1287,7 +1402,7 @@ mod tests {
         use std::time::{Duration, Instant};
         let c = Controls::new(QpcClock::start());
         let w = FakeShow {
-            focused: true,
+            front_when_shown: true,
             ..FakeShow::default()
         };
         let shared = std::sync::Arc::new(super::Shared::default());
@@ -1301,15 +1416,15 @@ mod tests {
             showing.poll(&w, |f| c.focus(f), &shared, start),
             Some(start + super::SHOW_POLL)
         );
-        assert_eq!(w.shows.get(), 0);
+        assert_eq!(w.shows(), 0);
         assert!(!shown.wait(Duration::ZERO));
         shared.presented.store(true, Ordering::Release);
         assert_eq!(showing.poll(&w, |f| c.focus(f), &shared, start), None);
-        assert_eq!(w.shows.get(), 1);
+        assert_eq!(w.shows(), 1);
         assert!(c.focused());
         assert!(shown.wait(Duration::ZERO));
         assert_eq!(showing.poll(&w, |f| c.focus(f), &shared, start), None);
-        assert_eq!(w.shows.get(), 1);
+        assert_eq!(w.shows(), 1);
     }
 
     /// A play that asks to open before the window shows waits for it: the
@@ -1357,12 +1472,12 @@ mod tests {
             showing.poll(&w, |f| c.focus(f), &shared, late),
             Some(start + super::SHOW_TIMEOUT)
         );
-        assert_eq!(w.shows.get(), 0);
+        assert_eq!(w.shows(), 0);
         assert_eq!(
             showing.poll(&w, |f| c.focus(f), &shared, start + super::SHOW_TIMEOUT),
             None
         );
-        assert_eq!(w.shows.get(), 1);
+        assert_eq!(w.shows(), 1);
         assert!(!c.focused());
         // A window thread that never shows: the wait ends at its bound.
         let never = super::WindowShown(std::sync::Arc::new(super::Shared::default()));
