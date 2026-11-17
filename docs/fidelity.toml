@@ -369,7 +369,7 @@ note of the chart: a practice round over fewer notes, a mid-chart start \
 after the first note included, never shows it, and a round over every \
 note shows it as a full attempt does. The source's timer staying lit into \
 the next round is a byproduct not copied (design.md "beatoraja Lua Skins", \
-practice rounds and the whole chart)."""
+"Differences from the source", state across practice rounds)."""
 source = [
     "src/bms/player/beatoraja/play/BMSPlayer.java:1035-1036 @beatoraja-0.8.9",
     "src/bms/player/beatoraja/song/SongData.java:211 @beatoraja-0.8.9",
