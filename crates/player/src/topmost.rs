@@ -2,22 +2,23 @@
 //! topmost while focused): the borderless fullscreen window is topmost
 //! while it has focus, so no other topmost window (an auto-hidden taskbar's
 //! strip) covers it and keeps it from independent flip. It stops being
-//! topmost when Windows names another window in the foreground
-//! (`EVENT_SYSTEM_FOREGROUND`, watched only while the window is topmost),
-//! directly behind that window: when the window hears it has lost focus,
-//! Windows may not have set the new foreground window yet. A hidden window
-//! is never made topmost: made topmost before its first frame, the window
-//! failed to start (the render thread's first swap chain was refused as an
-//! invalid surface).
+//! topmost once another window is in the foreground, directly behind that
+//! window. Its own focus loss and Windows' focus and foreground events from
+//! other programs (watched only while the window is topmost) only make it
+//! look at the foreground window then: at the focus loss Windows may not
+//! have set the new foreground window yet, and its events do not match
+//! activations one to one. A hidden window is never made topmost: made
+//! topmost before its first frame, the window failed to start (the render
+//! thread's first swap chain was refused as an invalid surface).
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::Accessibility::{HWINEVENTHOOK, SetWinEventHook, UnhookWinEvent};
 use windows::Win32::UI::WindowsAndMessaging::{
-    EVENT_SYSTEM_FOREGROUND, GetForegroundWindow, GetWindowInfo, HWND_NOTOPMOST, HWND_TOPMOST,
-    SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, WINDOWINFO, WINEVENT_OUTOFCONTEXT,
-    WINEVENT_SKIPOWNPROCESS, WS_EX_TOPMOST,
+    EVENT_OBJECT_FOCUS, EVENT_SYSTEM_FOREGROUND, GetForegroundWindow, GetWindowInfo,
+    HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, WINDOWINFO,
+    WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WS_EX_TOPMOST,
 };
 use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
@@ -30,20 +31,21 @@ pub trait LevelWindow {
     /// Whether the window is shown: made hidden, it gains focus before its
     /// first frame (winit activates a window made fullscreen).
     fn shown(&self) -> bool;
-    /// Whether the window is the foreground window now.
-    fn in_front(&self) -> bool;
+    /// The foreground window now; null when there is none.
+    fn foreground(&self) -> HWND;
     /// Whether `front` is this window.
     fn is(&self, front: HWND) -> bool;
     /// Whether `front` is a topmost window.
     fn is_topmost(&self, front: HWND) -> bool;
-    /// Starts watching the foreground ([`Watch`]); `None` when Windows
-    /// refuses.
+    /// Starts watching other programs' focus and foreground ([`Watch`]);
+    /// `None` when Windows refuses.
     fn watch(&self) -> Option<Watch>;
     /// Makes the window topmost, in front of every topmost window.
     fn raise(&self);
-    /// Places the window directly after `after` in the order of windows:
-    /// a window, or `HWND_NOTOPMOST` ([`behind`]).
-    fn place_after(&self, after: HWND);
+    /// Places the window directly after `after` in the order of windows (a
+    /// window, or `HWND_NOTOPMOST`: [`behind`]); whether it is no longer
+    /// topmost then.
+    fn lower(&self, after: HWND) -> bool;
 }
 
 impl LevelWindow for Window {
@@ -55,10 +57,9 @@ impl LevelWindow for Window {
         self.is_visible() == Some(true)
     }
 
-    fn in_front(&self) -> bool {
+    fn foreground(&self) -> HWND {
         // SAFETY: a plain query.
-        let front = unsafe { GetForegroundWindow() };
-        hwnd(self) == Some(front)
+        unsafe { GetForegroundWindow() }
     }
 
     fn is(&self, front: HWND) -> bool {
@@ -70,31 +71,37 @@ impl LevelWindow for Window {
     }
 
     fn watch(&self) -> Option<Watch> {
-        let watch = watch_foreground();
+        let watch = hwnd(self).and_then(Watch::start);
         if watch.is_none() {
-            eprintln!("window: the foreground cannot be watched; the window is not made topmost");
+            eprintln!("window: other programs' focus cannot be watched; not made topmost");
         }
         watch
     }
 
     fn raise(&self) {
-        if let Some(h) = hwnd(self)
-            && let Err(e) = raise(h)
-        {
-            eprintln!("window: not made topmost: {e}");
+        let Some(h) = hwnd(self) else { return };
+        match raise(h) {
+            Err(e) => eprintln!("window: not made topmost: {e}"),
+            Ok(()) if !is_topmost(h) => eprintln!("window: not made topmost (ignored)"),
+            Ok(()) => {}
         }
     }
 
-    fn place_after(&self, after: HWND) {
-        if let Some(h) = hwnd(self)
-            && let Err(e) = place_after(h, after)
-        {
+    fn lower(&self, after: HWND) -> bool {
+        let Some(h) = hwnd(self) else { return true };
+        if let Err(e) = place_after(h, after) {
             eprintln!("window: still topmost: {e}");
+            return false;
         }
+        let lowered = !is_topmost(h);
+        if !lowered {
+            eprintln!("window: still topmost (placement ignored)");
+        }
+        lowered
     }
 }
 
-/// Whether the window was made topmost: the watch of the foreground it
+/// Whether the window was made topmost: the watch of other programs it
 /// keeps while it is.
 #[derive(Debug, Default)]
 pub struct Topmost {
@@ -103,16 +110,19 @@ pub struct Topmost {
 
 impl Topmost {
     /// The window's focus is `focused`. Gained while the window is
-    /// fullscreen and shown, the window starts watching the foreground and
-    /// is made topmost, again when it already is, so it comes in front of
-    /// any topmost window brought forward since; a window whose foreground
-    /// cannot be watched is never made topmost, since nothing would end it.
-    /// A focus lost changes nothing here: the foreground Windows names next
-    /// ends it ([`Topmost::foreground`]). The show reports the focus again
-    /// ([`crate::window`]), so a focus gained while hidden makes the window
-    /// topmost once it shows.
+    /// fullscreen and shown, the window starts watching and is made
+    /// topmost, again when it already is, so it comes in front of any
+    /// topmost window brought forward since; a window that cannot watch is
+    /// never made topmost, since nothing would end it. Lost, the window
+    /// looks at the foreground window ([`Topmost::look`]). The show reports
+    /// the focus again ([`crate::window`]), so a focus gained while hidden
+    /// makes the window topmost once it shows.
     pub fn focus(&mut self, window: &impl LevelWindow, focused: bool) {
-        if !(focused && window.fullscreen() && window.shown()) {
+        if !focused {
+            self.look(window);
+            return;
+        }
+        if !(window.fullscreen() && window.shown()) {
             return;
         }
         if self.watch.is_none() {
@@ -123,100 +133,147 @@ impl Topmost {
         }
     }
 
-    /// Windows named `front` the foreground window. While the window is
-    /// topmost and not itself in front (the event can come after the
-    /// window took the foreground back), it stops being topmost directly
-    /// behind `front` ([`behind`]) and stops watching.
-    pub fn foreground(&mut self, window: &impl LevelWindow, front: HWND) {
-        if self.watch.is_none() || window.is(front) || window.in_front() {
+    /// Looks at the foreground window now: the window's focus loss, or a
+    /// focus or foreground event from another program ([`Watch`]). While
+    /// the window is topmost and another window is in front, it goes
+    /// directly behind that window ([`behind`]) and stops watching; when the
+    /// window is itself in front, or none is (Windows has not set the new
+    /// one yet), it waits for the next look. A placement Windows ignored
+    /// leaves it topmost and watching, for the next look to try again.
+    pub fn look(&mut self, window: &impl LevelWindow) {
+        LOOK_POSTED.set(false);
+        if self.watch.is_none() {
             return;
         }
-        window.place_after(behind(front, window.is_topmost(front)));
-        self.watch = None;
+        let front = window.foreground();
+        if front.is_invalid() || window.is(front) {
+            return;
+        }
+        if window.lower(behind(front, window.is_topmost(front))) {
+            self.watch = None;
+        }
     }
 
-    /// Whether the window watches the foreground (tests).
+    /// Whether the window watches other programs (tests).
     #[cfg(test)]
     pub fn watching(&self) -> bool {
         self.watch.is_some()
     }
 }
 
-/// Windows' report of each new foreground window (`EVENT_SYSTEM_FOREGROUND`)
-/// to this thread, out of context, while the window is topmost; unhooked
-/// when dropped, so the window thread's end unhooks it too.
+/// Windows' reports of other programs' focus changes (`EVENT_OBJECT_FOCUS`:
+/// a window activated sets its focus after it is) and foreground changes
+/// (`EVENT_SYSTEM_FOREGROUND`) to this thread, out of context, while the
+/// window is topmost. Each only asks for a look ([`signal`]). Unhooked when
+/// dropped, so the window thread's end unhooks them too.
 #[derive(Debug)]
-pub struct Watch(HWINEVENTHOOK);
+pub struct Watch {
+    focus: HWINEVENTHOOK,
+    foreground: HWINEVENTHOOK,
+}
 
 impl Watch {
+    /// Hooks both events for this thread, other processes only, for the
+    /// window `own`; `None` when Windows refuses either.
+    fn start(own: HWND) -> Option<Self> {
+        let watch = Self {
+            focus: hook(EVENT_OBJECT_FOCUS),
+            foreground: hook(EVENT_SYSTEM_FOREGROUND),
+        };
+        if watch.focus.is_invalid() || watch.foreground.is_invalid() {
+            return None;
+        }
+        OWN.set(own.0.addr());
+        LOOK_POSTED.set(false);
+        Some(watch)
+    }
+
     /// A watch that hooks nothing (tests).
     #[cfg(test)]
     pub fn fake() -> Self {
-        Self(HWINEVENTHOOK::default())
+        Self {
+            focus: HWINEVENTHOOK::default(),
+            foreground: HWINEVENTHOOK::default(),
+        }
     }
 }
 
 impl Drop for Watch {
     fn drop(&mut self) {
-        if !self.0.is_invalid() {
-            // SAFETY: the hook was set on this thread and is unhooked once.
-            let _ = unsafe { UnhookWinEvent(self.0) };
+        for hook in [self.focus, self.foreground] {
+            if !hook.is_invalid() {
+                // SAFETY: the hook was set on this thread and is unhooked
+                // once.
+                let _ = unsafe { UnhookWinEvent(hook) };
+            }
         }
     }
 }
 
-/// Where foreground reports go: the handle of each window Windows names.
-type Sink = Box<dyn Fn(usize)>;
-
-thread_local! {
-    /// Where the watch sends each foreground window Windows names on this
-    /// thread ([`on_foreground`]).
-    static SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
-}
-
-/// Sends each foreground window Windows names to this thread's watch to
-/// `sink`, as the window's handle: the window thread's event loop, which
-/// hands it to [`Topmost::foreground`].
-pub fn on_foreground(sink: impl Fn(usize) + 'static) {
-    SINK.with(|s| *s.borrow_mut() = Some(Box::new(sink)));
-}
-
-/// The handle a foreground report carries.
-pub fn front(handle: usize) -> HWND {
-    HWND(std::ptr::without_provenance_mut(handle))
-}
-
-/// Hooks `EVENT_SYSTEM_FOREGROUND` for this thread, other processes only.
-fn watch_foreground() -> Option<Watch> {
+/// Hooks `event` for this thread, out of context, other processes only;
+/// invalid when Windows refuses.
+fn hook(event: u32) -> HWINEVENTHOOK {
     // SAFETY: an out-of-context hook needs no module: Windows calls
-    // `foreground_changed` on this thread while it waits for messages.
-    let hook = unsafe {
+    // `signalled` on this thread while it waits for messages.
+    unsafe {
         SetWinEventHook(
-            EVENT_SYSTEM_FOREGROUND,
-            EVENT_SYSTEM_FOREGROUND,
+            event,
+            event,
             None,
-            Some(foreground_changed),
+            Some(signalled),
             0,
             0,
             WINEVENT_OUTOFCONTEXT | WINEVENT_SKIPOWNPROCESS,
         )
-    };
-    (!hook.is_invalid()).then_some(Watch(hook))
+    }
 }
 
-/// The watch's callback: hands the new foreground window to the sink.
-unsafe extern "system" fn foreground_changed(
+/// Where a look is asked for: the window thread's event loop, which hands
+/// it to [`Topmost::look`].
+type Sink = Box<dyn Fn()>;
+
+thread_local! {
+    /// Where [`signal`] asks for a look on this thread ([`on_look`]).
+    static SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
+    /// The watching window's handle.
+    static OWN: Cell<usize> = const { Cell::new(0) };
+    /// Whether a look was asked for and not yet taken.
+    static LOOK_POSTED: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Sends each look the watch asks for on this thread to `sink`: the window
+/// thread's event loop.
+pub fn on_look(sink: impl Fn() + 'static) {
+    SINK.with(|s| *s.borrow_mut() = Some(Box::new(sink)));
+}
+
+/// The watch's callback, for either event: whatever window the event
+/// names, the decision is made from the foreground window at the look.
+unsafe extern "system" fn signalled(
     _hook: HWINEVENTHOOK,
     _event: u32,
-    window: HWND,
+    _window: HWND,
     _object: i32,
     _child: i32,
     _thread: u32,
     _time: u32,
 ) {
+    // SAFETY: a plain query.
+    signal(unsafe { GetForegroundWindow() });
+}
+
+/// Asks the sink for one look when `front`, the foreground window now, is
+/// another window than the watching one, unless a look is already asked
+/// for: while the window is in front (the play), the events of other
+/// programs ask for nothing.
+fn signal(front: HWND) {
+    if front.is_invalid() || front.0.addr() == OWN.get() || LOOK_POSTED.get() {
+        return;
+    }
+    LOOK_POSTED.set(true);
     SINK.with(|s| {
         if let Some(sink) = &*s.borrow() {
-            sink(window.0.addr());
+            sink();
         }
     });
 }
@@ -275,19 +332,15 @@ fn place_after(hwnd: HWND, after: HWND) -> windows::core::Result<()> {
 }
 
 /// Where the window goes when it stops being topmost, `front` being the
-/// new foreground window: directly behind `front` when that is an ordinary
+/// foreground window: directly behind `front` when that is an ordinary
 /// window, since a topmost window placed after an ordinary one stops being
-/// topmost; otherwise (`front_topmost`, such as the task switcher, or no
-/// window) `HWND_NOTOPMOST`, the top of the ordinary windows, behind every
-/// topmost one. `HWND_NOTOPMOST` with an ordinary window in front would put
-/// the window in front of every ordinary window, the one in front
-/// included.
+/// topmost; behind a topmost one (`front_topmost`, such as the task
+/// switcher) `HWND_NOTOPMOST`, the top of the ordinary windows, behind
+/// every topmost one. `HWND_NOTOPMOST` with an ordinary window in front
+/// would put the window in front of every ordinary window, the one in
+/// front included.
 fn behind(front: HWND, front_topmost: bool) -> HWND {
-    if front.is_invalid() || front_topmost {
-        HWND_NOTOPMOST
-    } else {
-        front
-    }
+    if front_topmost { HWND_NOTOPMOST } else { front }
 }
 
 /// Whether `hwnd` is a topmost window; a window that cannot be read counts
@@ -304,6 +357,7 @@ fn is_topmost(hwnd: HWND) -> bool {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::rc::Rc;
 
     use windows::Win32::Foundation::HWND;
     use windows::Win32::UI::WindowsAndMessaging::{
@@ -313,24 +367,26 @@ mod tests {
 
     use super::{LevelWindow, Topmost, Watch};
 
-    /// The window's own handle, an ordinary window's and a topmost
-    /// window's, as the fake knows them.
+    /// No window, the window's own handle, an ordinary window's and a
+    /// topmost window's, as the fake knows them.
+    const NONE: usize = 0;
     const OWN: usize = 1;
     const ORDINARY: usize = 2;
     const TOPMOST: usize = 3;
 
     fn handle(h: usize) -> HWND {
-        super::front(h)
+        HWND(std::ptr::without_provenance_mut(h))
     }
 
     /// The window as the topmost state sees it: whether it is fullscreen,
-    /// hidden, refused a watch or in front, and what was done to it.
-    #[derive(Default)]
+    /// hidden or refused a watch, the foreground window, whether Windows
+    /// ignores its placement, and what was done to it.
     struct FakeLevel {
         fullscreen: bool,
         hidden: Cell<bool>,
         unwatchable: bool,
-        in_front: Cell<bool>,
+        front: Cell<usize>,
+        stuck: Cell<bool>,
         done: RefCell<Vec<String>>,
     }
 
@@ -338,7 +394,18 @@ mod tests {
         fn fullscreen() -> Self {
             Self {
                 fullscreen: true,
-                ..Self::default()
+                ..Self::windowed()
+            }
+        }
+
+        fn windowed() -> Self {
+            Self {
+                fullscreen: false,
+                hidden: Cell::new(false),
+                unwatchable: false,
+                front: Cell::new(OWN),
+                stuck: Cell::new(false),
+                done: RefCell::default(),
             }
         }
 
@@ -356,8 +423,8 @@ mod tests {
             !self.hidden.get()
         }
 
-        fn in_front(&self) -> bool {
-            self.in_front.get()
+        fn foreground(&self) -> HWND {
+            handle(self.front.get())
         }
 
         fn is(&self, front: HWND) -> bool {
@@ -377,62 +444,101 @@ mod tests {
             self.done.borrow_mut().push("raise".into());
         }
 
-        fn place_after(&self, after: HWND) {
+        fn lower(&self, after: HWND) -> bool {
             let after = if after == super::HWND_NOTOPMOST {
                 "HWND_NOTOPMOST".to_owned()
             } else {
                 format!("{}", after.0.addr())
             };
             self.done.borrow_mut().push(format!("after {after}"));
+            !self.stuck.get()
         }
     }
 
-    /// The fullscreen window starts watching the foreground and is made
-    /// topmost when it gains focus; losing focus changes nothing until
-    /// Windows names the window in front, an ordinary one here, and the
-    /// window then goes directly behind it and stops watching.
+    /// The fullscreen window starts watching and is made topmost when it
+    /// gains focus. Lost while Windows names no foreground window yet, it
+    /// waits; at the next look, an ordinary window in front, it goes
+    /// directly behind that window and stops watching.
     #[test]
     fn a_fullscreen_window_is_topmost_until_another_window_is_in_front() {
         let w = FakeLevel::fullscreen();
         let mut t = Topmost::default();
         t.focus(&w, true);
         assert_eq!(w.take(), ["watch", "raise"]);
-        assert!(t.watching());
+        w.front.set(NONE);
         t.focus(&w, false);
         assert_eq!(w.take(), Vec::<String>::new());
-        t.foreground(&w, handle(ORDINARY));
+        assert!(t.watching());
+        w.front.set(ORDINARY);
+        t.look(&w);
         assert_eq!(w.take(), [format!("after {ORDINARY}")]);
         assert!(!t.watching());
     }
 
-    /// A topmost window named in front (the task switcher) leaves the
-    /// window at the top of the ordinary windows, behind every topmost one.
+    /// Lost while another window is already in front, the window goes
+    /// behind it at the focus loss itself.
+    #[test]
+    fn a_focus_loss_with_another_window_in_front_lowers_the_window_at_once() {
+        let w = FakeLevel::fullscreen();
+        let mut t = Topmost::default();
+        t.focus(&w, true);
+        w.take();
+        w.front.set(ORDINARY);
+        t.focus(&w, false);
+        assert_eq!(w.take(), [format!("after {ORDINARY}")]);
+        assert!(!t.watching());
+    }
+
+    /// A topmost window in front (the task switcher, a topmost program
+    /// clicked) leaves the window at the top of the ordinary windows,
+    /// behind every topmost one.
     #[test]
     fn a_topmost_window_in_front_leaves_the_window_on_top_of_the_ordinary_ones() {
         let w = FakeLevel::fullscreen();
         let mut t = Topmost::default();
         t.focus(&w, true);
         w.take();
-        t.foreground(&w, handle(TOPMOST));
+        w.front.set(TOPMOST);
+        t.look(&w);
         assert_eq!(w.take(), ["after HWND_NOTOPMOST"]);
         assert!(!t.watching());
     }
 
-    /// The window itself named in front, or any window named while the
-    /// window is in front again (a report that comes after the window took
-    /// the foreground back), changes nothing: the window stays topmost and
-    /// watching.
+    /// A look while the window is itself in front (an event for a window
+    /// that was refused the foreground) or while no window is changes
+    /// nothing: the window stays topmost and watching.
     #[test]
-    fn a_report_while_the_window_is_in_front_changes_nothing() {
+    fn a_look_while_no_other_window_is_in_front_changes_nothing() {
         let w = FakeLevel::fullscreen();
         let mut t = Topmost::default();
         t.focus(&w, true);
         w.take();
-        t.foreground(&w, handle(OWN));
-        w.in_front.set(true);
-        t.foreground(&w, handle(ORDINARY));
+        t.look(&w);
+        w.front.set(NONE);
+        t.look(&w);
         assert_eq!(w.take(), Vec::<String>::new());
         assert!(t.watching());
+    }
+
+    /// A placement Windows ignored leaves the window topmost and watching,
+    /// and the next look places it again.
+    #[test]
+    fn a_placement_left_topmost_is_tried_again_at_the_next_look() {
+        let w = FakeLevel::fullscreen();
+        let mut t = Topmost::default();
+        t.focus(&w, true);
+        w.take();
+        w.front.set(ORDINARY);
+        w.stuck.set(true);
+        t.look(&w);
+        assert!(t.watching());
+        w.stuck.set(false);
+        t.look(&w);
+        assert_eq!(
+            w.take(),
+            [format!("after {ORDINARY}"), format!("after {ORDINARY}")]
+        );
+        assert!(!t.watching());
     }
 
     /// Focus regained makes the window topmost again, watching again, and
@@ -443,34 +549,41 @@ mod tests {
         let w = FakeLevel::fullscreen();
         let mut t = Topmost::default();
         t.focus(&w, true);
-        t.foreground(&w, handle(ORDINARY));
+        w.front.set(ORDINARY);
+        t.focus(&w, false);
         w.take();
+        w.front.set(OWN);
         t.focus(&w, true);
         assert_eq!(w.take(), ["watch", "raise"]);
         t.focus(&w, true);
         assert_eq!(w.take(), ["raise"]);
     }
 
-    /// A window that is not topmost is left where it is when a window is
-    /// named in front: before it was ever raised, and after it went behind
-    /// one window, at the next.
+    /// A window that is not topmost is left where it is: before it was ever
+    /// raised, and after it went behind one window, at the next look.
     #[test]
     fn a_window_not_topmost_is_left_where_it_is() {
         let w = FakeLevel::fullscreen();
         let mut t = Topmost::default();
-        t.foreground(&w, handle(ORDINARY));
+        w.front.set(ORDINARY);
+        t.look(&w);
+        t.focus(&w, false);
         assert_eq!(w.take(), Vec::<String>::new());
+        w.front.set(OWN);
         t.focus(&w, true);
-        t.foreground(&w, handle(ORDINARY));
+        w.front.set(ORDINARY);
+        t.look(&w);
         w.take();
-        t.foreground(&w, handle(TOPMOST));
+        w.front.set(TOPMOST);
+        t.look(&w);
+        t.focus(&w, false);
         assert_eq!(w.take(), Vec::<String>::new());
     }
 
-    /// A window whose foreground cannot be watched is never made topmost:
-    /// nothing would end it.
+    /// A window that cannot watch is never made topmost: nothing would end
+    /// it.
     #[test]
-    fn a_window_that_cannot_watch_the_foreground_is_not_made_topmost() {
+    fn a_window_that_cannot_watch_is_not_made_topmost() {
         let w = FakeLevel {
             unwatchable: true,
             ..FakeLevel::fullscreen()
@@ -500,51 +613,42 @@ mod tests {
     /// focused or not.
     #[test]
     fn a_window_that_is_not_fullscreen_is_never_topmost() {
-        let w = FakeLevel::default();
+        let w = FakeLevel::windowed();
         let mut t = Topmost::default();
-        for focused in [true, false, true] {
-            t.focus(&w, focused);
-        }
-        t.foreground(&w, handle(ORDINARY));
+        t.focus(&w, true);
+        w.front.set(ORDINARY);
+        t.focus(&w, false);
+        t.look(&w);
         assert_eq!(w.take(), Vec::<String>::new());
     }
 
-    /// The watch's callback hands the window Windows names to this
-    /// thread's sink, as the handle the window thread turns back into it.
+    /// An event asks for one look only while another window is in front:
+    /// none while the window itself or no window is, and no second one
+    /// until the first was taken.
     #[test]
-    fn a_named_foreground_reaches_the_sink() {
-        let seen = std::rc::Rc::new(Cell::new(0));
-        let sink = std::rc::Rc::clone(&seen);
-        super::on_foreground(move |h| sink.set(h));
-        // SAFETY: the callback reads its window argument only.
-        unsafe {
-            super::foreground_changed(
-                windows::Win32::UI::Accessibility::HWINEVENTHOOK::default(),
-                super::EVENT_SYSTEM_FOREGROUND,
-                handle(ORDINARY),
-                0,
-                0,
-                0,
-                0,
-            );
-        }
-        assert_eq!(seen.get(), ORDINARY);
-        assert_eq!(super::front(seen.get()), handle(ORDINARY));
+    fn an_event_asks_for_one_look_while_another_window_is_in_front() {
+        let looks = Rc::new(Cell::new(0));
+        let sink = Rc::clone(&looks);
+        super::on_look(move || sink.set(sink.get() + 1));
+        super::OWN.set(OWN);
+        super::signal(handle(OWN));
+        super::signal(handle(NONE));
+        assert_eq!(looks.get(), 0);
+        super::signal(handle(ORDINARY));
+        super::signal(handle(TOPMOST));
+        assert_eq!(looks.get(), 1);
+        Topmost::default().look(&FakeLevel::fullscreen());
+        super::signal(handle(ORDINARY));
+        assert_eq!(looks.get(), 2);
     }
 
     /// The window goes directly behind an ordinary window in front, and to
-    /// the top of the ordinary windows when a topmost window or none is.
+    /// the top of the ordinary windows when a topmost window is.
     #[test]
     fn the_window_goes_behind_an_ordinary_window_in_front() {
         let front = handle(ORDINARY);
         assert_eq!(super::behind(front, false), front);
-        for (front, front_topmost) in [(front, true), (HWND::default(), false)] {
-            assert_eq!(
-                super::behind(front, front_topmost),
-                super::HWND_NOTOPMOST,
-                "{front:?} {front_topmost}"
-            );
-        }
+        assert_eq!(super::behind(front, true), super::HWND_NOTOPMOST);
     }
 
     /// A hidden popup window of this thread, destroyed on drop.
@@ -615,15 +719,18 @@ mod tests {
         assert!(!super::is_topmost(window.0));
     }
 
-    /// On this thread Windows grants the watch, and dropping it unhooks
-    /// it.
+    /// On this thread Windows grants the watch's two hooks, and dropping
+    /// it unhooks both.
     #[test]
-    fn the_foreground_can_be_watched() {
-        let watch = super::watch_foreground().expect("a foreground hook");
-        let hook = watch.0;
+    fn other_programs_can_be_watched() {
+        let window = Popup::new();
+        let watch = Watch::start(window.0).expect("both hooks");
+        let hooks = [watch.focus, watch.foreground];
         drop(watch);
-        // SAFETY: the hook was set on this thread; already unhooked, the
-        // call fails.
-        assert!(!unsafe { super::UnhookWinEvent(hook) }.as_bool());
+        for hook in hooks {
+            // SAFETY: the hook was set on this thread; already unhooked,
+            // the call fails.
+            assert!(!unsafe { super::UnhookWinEvent(hook) }.as_bool());
+        }
     }
 }

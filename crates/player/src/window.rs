@@ -64,9 +64,9 @@ enum Ask {
     Caret,
     /// Show the cursor, or hide it (a play runs).
     Cursor(bool),
-    /// Windows named this window (its handle) the foreground window, while
-    /// the topmost window watches it ([`crate::topmost`]).
-    Foreground(usize),
+    /// Look at the foreground window: another program's focus or
+    /// foreground changed while the window is topmost ([`crate::topmost`]).
+    Look,
 }
 
 /// What the window thread shares with the threads that draw into the
@@ -440,7 +440,7 @@ impl ApplicationHandler<Ask> for App {
                 self.ime.caret(w, caret);
             }
             (Ask::Cursor(shown), Some(w)) => show_cursor(w, shown),
-            (Ask::Foreground(front), w) => foreground_named(&mut self.topmost, w.as_ref(), front),
+            (Ask::Look, w) => look(&mut self.topmost, w.as_ref()),
             (Ask::Ime(_) | Ask::Caret | Ask::Cursor(_), None) => {}
             (Ask::Exit, _) => {
                 // The window goes before the loop ends, on its own thread,
@@ -506,12 +506,11 @@ fn focus_changed(
     }
 }
 
-/// Windows named the window with handle `front` the foreground window
-/// ([`Ask::Foreground`]): `window`'s topmost state hears of it
-/// ([`Topmost::foreground`]).
-fn foreground_named(topmost: &mut Topmost, window: Option<&impl LevelWindow>, front: usize) {
+/// The topmost window's watch asked for a look ([`Ask::Look`]): `window`'s
+/// topmost state looks at the foreground window ([`Topmost::look`]).
+fn look(topmost: &mut Topmost, window: Option<&impl LevelWindow>) {
     if let Some(w) = window {
-        topmost.foreground(w, crate::topmost::front(front));
+        topmost.look(w);
     }
 }
 
@@ -791,9 +790,9 @@ pub fn open(
             };
             event_loop.listen_device_events(DeviceEvents::Never);
             let _ = proxy_tx.send(event_loop.create_proxy());
-            let foreground = event_loop.create_proxy();
-            crate::topmost::on_foreground(move |front| {
-                let _ = foreground.send_event(Ask::Foreground(front));
+            let looks = event_loop.create_proxy();
+            crate::topmost::on_look(move || {
+                let _ = looks.send_event(Ask::Look);
             });
             let mut app = App {
                 controls: Arc::clone(&controls),
@@ -2309,17 +2308,42 @@ mod tests {
         assert!(w.2.take_escape(deadline), "an Escape after T did not leave");
     }
 
-    /// The fullscreen window as the topmost state sees it: what was done
-    /// to it, with whether the controls had focus then.
+    /// No window, the handles of the window itself, an ordinary window
+    /// and a topmost window, as the fakes know them.
+    const NONE: usize = 0;
+    const OWN: usize = 1;
+    const ORDINARY: usize = 2;
+    const TOPMOST: usize = 3;
+
+    fn handle(h: usize) -> windows::Win32::Foundation::HWND {
+        windows::Win32::Foundation::HWND(std::ptr::without_provenance_mut(h))
+    }
+
+    /// The fullscreen window as the topmost state sees it: the foreground
+    /// window, and what was done to it, with whether the controls had
+    /// focus then.
     struct LevelSeen<'a> {
         controls: &'a Controls,
+        front: std::cell::Cell<usize>,
         done: std::cell::RefCell<Vec<(&'static str, bool)>>,
     }
 
-    impl LevelSeen<'_> {
+    impl<'a> LevelSeen<'a> {
+        fn new(controls: &'a Controls) -> Self {
+            Self {
+                controls,
+                front: std::cell::Cell::new(OWN),
+                done: std::cell::RefCell::default(),
+            }
+        }
+
         fn push(&self, what: &'static str) {
             let focused = self.controls.focused();
             self.done.borrow_mut().push((what, focused));
+        }
+
+        fn what(&self) -> Vec<&'static str> {
+            self.done.take().into_iter().map(|(what, _)| what).collect()
         }
     }
 
@@ -2332,16 +2356,16 @@ mod tests {
             true
         }
 
-        fn in_front(&self) -> bool {
-            false
+        fn foreground(&self) -> windows::Win32::Foundation::HWND {
+            handle(self.front.get())
         }
 
         fn is(&self, front: windows::Win32::Foundation::HWND) -> bool {
-            front == crate::topmost::front(OWN)
+            front == handle(OWN)
         }
 
         fn is_topmost(&self, front: windows::Win32::Foundation::HWND) -> bool {
-            front == crate::topmost::front(TOPMOST)
+            front == handle(TOPMOST)
         }
 
         fn watch(&self) -> Option<crate::topmost::Watch> {
@@ -2353,49 +2377,44 @@ mod tests {
             self.push("raise");
         }
 
-        fn place_after(&self, after: windows::Win32::Foundation::HWND) {
-            self.push(if after == crate::topmost::front(ORDINARY) {
+        fn lower(&self, after: windows::Win32::Foundation::HWND) -> bool {
+            self.push(if after == handle(ORDINARY) {
                 "behind the ordinary window"
             } else if after == windows::Win32::UI::WindowsAndMessaging::HWND_NOTOPMOST {
                 "on top of the ordinary windows"
             } else {
                 "elsewhere"
             });
+            true
         }
     }
 
-    /// The handles of the window itself, an ordinary window and a topmost
-    /// window, as the fakes know them.
-    const OWN: usize = 1;
-    const ORDINARY: usize = 2;
-    const TOPMOST: usize = 3;
-
-    /// The window thread hands each foreground window Windows names to the
-    /// topmost state: the window itself named changes nothing; an ordinary
-    /// window named puts the topmost window directly behind it; after focus
-    /// came back, a topmost window named (the task switcher) puts it on top
+    /// A look the watch asks for reaches the topmost state, which decides
+    /// from the foreground window then: the window itself in front changes
+    /// nothing; a focus loss while no window is in front waits; an ordinary
+    /// window in front puts the window directly behind it; after focus came
+    /// back, a topmost window in front (the task switcher) puts it on top
     /// of the ordinary windows; with no window yet, nothing happens.
     #[test]
-    fn a_named_foreground_ends_the_topmost_state_behind_it() {
+    fn a_look_places_the_window_behind_the_window_in_front() {
         let c = Controls::new(QpcClock::start());
-        let w = LevelSeen {
-            controls: &c,
-            done: std::cell::RefCell::default(),
-        };
+        let w = LevelSeen::new(&c);
         let mut capture = crate::pointer::Capture::default();
         let pointer = crate::pointer::PointerShared::default();
         let mut topmost = crate::topmost::Topmost::default();
-        super::foreground_named(&mut topmost, None::<&LevelSeen<'_>>, ORDINARY);
+        super::look(&mut topmost, None::<&LevelSeen<'_>>);
         super::focus_changed(&mut capture, &pointer, &c, &mut topmost, Some(&w), true);
-        super::foreground_named(&mut topmost, Some(&w), OWN);
+        super::look(&mut topmost, Some(&w));
+        w.front.set(NONE);
         super::focus_changed(&mut capture, &pointer, &c, &mut topmost, Some(&w), false);
-        super::foreground_named(&mut topmost, Some(&w), ORDINARY);
+        w.front.set(ORDINARY);
+        super::look(&mut topmost, Some(&w));
+        w.front.set(OWN);
         super::focus_changed(&mut capture, &pointer, &c, &mut topmost, Some(&w), true);
-        super::focus_changed(&mut capture, &pointer, &c, &mut topmost, Some(&w), false);
-        super::foreground_named(&mut topmost, Some(&w), TOPMOST);
-        let done: Vec<_> = w.done.take().into_iter().map(|(what, _)| what).collect();
+        w.front.set(TOPMOST);
+        super::look(&mut topmost, Some(&w));
         assert_eq!(
-            done,
+            w.what(),
             [
                 "watch",
                 "raise",
@@ -2408,19 +2427,15 @@ mod tests {
     }
 
     /// Every focus change the window reports reaches the controls, then
-    /// the window's topmost state: gained, the window watches the
-    /// foreground and is made topmost with the controls focused; lost, the
-    /// controls, and so a play's focus latch, see the loss, and the window
-    /// stays as it is until Windows names the window in front; regained, it
-    /// is raised again. Before the window exists the controls are told all
-    /// the same.
+    /// the window's topmost state: gained, the window watches and is made
+    /// topmost with the controls focused; lost with another window in
+    /// front, it goes behind that window once the controls, and so a play's
+    /// focus latch, have seen the loss; regained, it is topmost again.
+    /// Before the window exists the controls are told all the same.
     #[test]
     fn a_focus_change_reaches_the_controls_then_the_topmost_state() {
         let c = Controls::new(QpcClock::start());
-        let w = LevelSeen {
-            controls: &c,
-            done: std::cell::RefCell::default(),
-        };
+        let w = LevelSeen::new(&c);
         let mut capture = crate::pointer::Capture::default();
         let pointer = crate::pointer::PointerShared::default();
         let mut topmost = crate::topmost::Topmost::default();
@@ -2430,12 +2445,20 @@ mod tests {
         focus(None, false);
         assert!(!c.focused());
         focus(Some(&w), true);
+        w.front.set(ORDINARY);
         focus(Some(&w), false);
         assert!(!c.focused());
+        w.front.set(OWN);
         focus(Some(&w), true);
         assert_eq!(
             *w.done.borrow(),
-            [("watch", true), ("raise", true), ("raise", true)]
+            [
+                ("watch", true),
+                ("raise", true),
+                ("behind the ordinary window", false),
+                ("watch", true),
+                ("raise", true)
+            ]
         );
         focus(None, false);
         assert!(!c.focused());
@@ -2470,12 +2493,12 @@ mod tests {
             self.visible.get()
         }
 
-        fn in_front(&self) -> bool {
-            true
+        fn foreground(&self) -> windows::Win32::Foundation::HWND {
+            handle(OWN)
         }
 
-        fn is(&self, _: windows::Win32::Foundation::HWND) -> bool {
-            false
+        fn is(&self, front: windows::Win32::Foundation::HWND) -> bool {
+            front == handle(OWN)
         }
 
         fn is_topmost(&self, _: windows::Win32::Foundation::HWND) -> bool {
@@ -2491,8 +2514,9 @@ mod tests {
             self.done.borrow_mut().push("raise");
         }
 
-        fn place_after(&self, _: windows::Win32::Foundation::HWND) {
-            self.done.borrow_mut().push("place");
+        fn lower(&self, _: windows::Win32::Foundation::HWND) -> bool {
+            self.done.borrow_mut().push("lower");
+            true
         }
     }
 
