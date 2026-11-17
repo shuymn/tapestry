@@ -10,9 +10,7 @@ mod common;
 
 use common::play::{Drawn, Loader};
 use skin_beatoraja::lua::{Disposition, HOST_APIS, Unsupported};
-use skin_beatoraja::{
-    Cancel, Config, DeviationId, ImportError, LuaImported, LuaWhy, NoteKind, read_lua_header,
-};
+use skin_beatoraja::{Cancel, Config, ImportError, LuaImported, LuaWhy, NoteKind, read_lua_header};
 use skin_model::timer;
 use tempfile::TempDir;
 
@@ -416,37 +414,38 @@ fn an_observer_at_a_destination_the_import_drops_is_no_refusal() {
 }
 
 /// A predicate that reads the BGA setting and discards it folds to its
-/// constant and notes D33 at its destination record once, as a lowered
-/// callback does (docs/stage3.md D33), by a literal id (40) and by one
-/// only the evaluation folds (`39 + 1`): the fold's own reads are the
-/// note's only source, as the option scan never reads an observer's
-/// predicate. The setting is a static condition of the lowering, no
-/// constant of the capture proof, so a predicate whose value it is does
-/// not fold.
+/// constant with no note, by a literal id (40) and by one only the
+/// evaluation folds (`39 + 1`), and draws: the setting is fixed for the
+/// session, so its options are constants of the lowering (design.md
+/// "Differences from the source", BGA setting). A predicate whose value
+/// is the setting is still refused: the observer fold checks the
+/// residual expression, where the setting is a static condition of the
+/// lowering rather than a constant of the capture proof, a limit of this
+/// fold rather than of the setting.
 #[test]
-fn a_predicate_reading_the_bga_setting_notes_d33() {
+fn a_predicate_reading_the_bga_setting_folds() {
     let mut body = String::new();
     for (x, predicate) in [
         (0, "local _ = ms.option(40) return true"),
         (100, "local _ = ms.option(39 + 1) return true"),
     ] {
         body.push_str(&format!(
-            "local o{x} = tu.timer_observe_boolean(function() {predicate} end)\n{}\n",
+            "local o{x} = tu.timer_observe_boolean(function() {predicate} end)
+{}
+",
             moving(x, &format!("timer = o{x},"))
         ));
     }
     let i = import_body(&body).unwrap();
     assert_eq!(i.callbacks, [Disposition::Lowered, Disposition::Lowered]);
-    let d33: Vec<u32> = i
+    let deviations: Vec<_> = i
         .imported
         .report
         .notes
         .iter()
-        .filter(|n| n.kind == NoteKind::Deviation(DeviationId::D33))
-        .map(|n| n.at.expect("located").line)
+        .filter(|n| matches!(n.kind, NoteKind::Deviation(_)))
         .collect();
-    // Each at its observer's call.
-    assert_eq!(d33, [HEAD + 1, HEAD + 4]);
+    assert!(deviations.is_empty(), "{deviations:?}");
     let (_d, skin) = drawable(&body);
     let rects = at_ready(Drawn::new(skin, 4));
     assert!(

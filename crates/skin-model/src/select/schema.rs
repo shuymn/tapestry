@@ -137,6 +137,7 @@ pub static SELECTION: Schema = Schema {
         value("selected.total"),
         value("selected.main_bpm"),
         flag("selected.main_bpm_valid"),
+        flag("selected.bga"),
         int("settings.display_offset", -VALUE_MAX, VALUE_MAX),
         int("settings.volume_system", 0, 100),
         flag("settings.floating"),
@@ -310,11 +311,14 @@ pub mod field {
     /// notes weigh nothing; not valid while it is unknown.
     pub const SELECTED_MAIN_BPM: u16 = SELECTED_INFO_VALID + 11;
     pub const SELECTED_MAIN_BPM_VALID: u16 = SELECTED_INFO_VALID + 12;
+    /// Whether its library entry has the BGA flag: a `#BMPxx` definition
+    /// naming a file.
+    pub const SELECTED_BGA: u16 = SELECTED_MAIN_BPM_VALID + 1;
     /// The settings' fields, then the application's readouts, from here
     /// on, which a view leaves as they are
     /// ([`SelectionSettings`](crate::SelectionSettings),
     /// [`SelectionFrame::app`](crate::SelectionFrame::app)).
-    pub const SETTINGS: u16 = SELECTED_MAIN_BPM_VALID + 1;
+    pub const SETTINGS: u16 = SELECTED_BGA + 1;
     /// The display offset in whole ms.
     pub const SETTINGS_DISPLAY_OFFSET: u16 = SETTINGS;
     /// The system volume's number, its whole percent rounded half up.
@@ -456,6 +460,7 @@ mod tests {
             (field::SELECTED_TOTAL, "selected.total"),
             (field::SELECTED_MAIN_BPM, "selected.main_bpm"),
             (field::SELECTED_MAIN_BPM_VALID, "selected.main_bpm_valid"),
+            (field::SELECTED_BGA, "selected.bga"),
             (field::SETTINGS, "settings.display_offset"),
             (field::SETTINGS_DISPLAY_OFFSET, "settings.display_offset"),
             (field::SETTINGS_VOLUME_SYSTEM, "settings.volume_system"),
@@ -477,8 +482,8 @@ mod tests {
         ] {
             assert_eq!(names[usize::from(slot)], name);
         }
-        // The image fields, then the preview fields, the last before the
-        // settings, which a view leaves as they are.
+        // The image fields, then the preview fields and the BGA flag, the
+        // last before the settings, which a view leaves as they are.
         assert_eq!(
             names[usize::from(field::SELECTED_STAGEFILE)..=usize::from(field::SELECTED_INFO_VALID)],
             [
@@ -487,7 +492,7 @@ mod tests {
                 "selected.info_valid"
             ]
         );
-        assert_eq!(field::SETTINGS, field::SELECTED_MAIN_BPM_VALID + 1);
+        assert_eq!(field::SETTINGS, field::SELECTED_BGA + 1);
         assert_eq!(
             SELECTION.timers[usize::from(timer::CHANGE)].name,
             "select.change"

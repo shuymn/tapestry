@@ -312,9 +312,6 @@ pub(crate) fn note_lines(owner: &str, book: &NoteBook) -> Vec<String> {
             }
             RuntimeNote::CallbackError { at } => ("callback error".to_owned(), Some(at)),
             RuntimeNote::ImportOnly { at } => ("import-only call".to_owned(), at.as_ref()),
-            RuntimeNote::BgaSetting { id, at } => {
-                (format!("option {id} read as BGA off"), at.as_ref())
-            }
         };
         let at = at.map_or_else(
             || "?".to_owned(),

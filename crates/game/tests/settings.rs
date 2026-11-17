@@ -7,11 +7,12 @@ use bms_model::{Lane, TimeUs};
 use eval::{AxisBinding, AxisMode, Binding, ControlId, ScratchSettings, SourceProfile};
 use game::sound_sets::SetRole;
 use game::{
-    Adjust, Chain, Channel, ControllerDevice, CoverSettings, DataRoot, DeviceSettings,
-    FailureAction, HiSpeedReference, HiSpeedSettings, KeyConfig, KeyError, LaneKey, Language,
-    LibrarySettings, LocalRecords, PlayerSettings, PlayerSettingsError, RecordSink, Role,
-    ScoreTarget, ScratchConfig, Settings, SettingsError, SkinChoice, SkinChoices, SoundSettings,
-    SpeedMode, Tuning, Volume, load_settings, save_settings, write_atomic,
+    Adjust, BgaExpand, BgaMode, BgaSession, BgaSettings, Chain, Channel, ControllerDevice,
+    CoverSettings, DataRoot, DeviceSettings, FailureAction, HiSpeedReference, HiSpeedSettings,
+    KeyConfig, KeyError, LaneKey, Language, LibrarySettings, LocalRecords, PlayerSettings,
+    PlayerSettingsError, RecordSink, Role, ScoreTarget, ScratchConfig, Settings, SettingsError,
+    SkinChoice, SkinChoices, SoundSettings, SpeedMode, Tuning, Volume, load_settings,
+    save_settings, write_atomic,
 };
 use input::DeviceKind;
 use input::hid::AxisCap;
@@ -130,6 +131,10 @@ fn changed() -> Settings {
                 sound_root: Some(absolute("sets/sound")),
                 bgm_root: Some(PathBuf::new()),
                 loop_result: true,
+            },
+            bga: BgaSettings {
+                mode: BgaMode::Autoplay,
+                expand: BgaExpand::Full,
             },
         },
     }
@@ -443,6 +448,7 @@ fn device_and_player_settings_round_trip() {
          hidden = 40\nhidden_on = true\n\
          [skins.play]\nroot = 'D:\\skins\\Mine'\nentry = 'play/play7.luaskin'\n\
          options = { \"Lane cover\" = \"On\" }\nfiles = { \"Background\" = \"bg2.png\" }\n\
+         [bga]\nmode = \"autoplay\"\nexpand = \"full\"\n\
          [sounds]\nbgm_root = ''\nloop_result = true\n"
             .to_owned()
             + &format!("sound_root = '{}'\n", absolute("sets/sound").display()),
@@ -1888,6 +1894,94 @@ fn on_failure_reads_closes_by_default_and_round_trips() {
     let table = text.lines().position(|l| l.starts_with('['));
     assert!(line.is_some() && line < table, "{text}");
     assert_eq!(Settings::load(&root).unwrap().player, s.player);
+}
+
+/// The session's BGA answer (design.md "Differences from the source", BGA
+/// setting): `on` shows the BGA, autoplay or not; `off` hides it, autoplay
+/// or not; `autoplay` shows it only in an autoplay session. `expand` is
+/// the setting's, whatever the mode.
+#[test]
+fn bga_session_shows_by_mode_and_autoplay() {
+    for (mode, autoplay, shown) in [
+        (BgaMode::On, false, true),
+        (BgaMode::On, true, true),
+        (BgaMode::Off, false, false),
+        (BgaMode::Off, true, false),
+        (BgaMode::Autoplay, false, false),
+        (BgaMode::Autoplay, true, true),
+    ] {
+        for expand in [BgaExpand::Full, BgaExpand::KeepAspect, BgaExpand::Off] {
+            let s = BgaSession {
+                settings: BgaSettings { mode, expand },
+                autoplay,
+            };
+            assert_eq!(s.shown(), shown, "{s:?}");
+            assert_eq!(s.expand(), expand, "{s:?}");
+        }
+    }
+}
+
+/// `[bga]` in `player.toml` (design.md "Settings Files"): a file without it
+/// reads `mode = "on"` and `expand = "keep-aspect"` and writes no `[bga]`
+/// back; each value of each key reads as itself and is written back as
+/// read; a value naming none, and an unknown key, refuse the file with an
+/// error naming the key and the value.
+#[test]
+fn bga_mode_parses_and_refuses_unknown() {
+    let (_dir, root) = temp_root();
+    fs::create_dir_all(root.path()).unwrap();
+    fs::write(root.player_settings(), "preset = \"wide\"\n").unwrap();
+    let read = Settings::load(&root).unwrap().player;
+    assert_eq!(
+        read.bga,
+        BgaSettings {
+            mode: BgaMode::On,
+            expand: BgaExpand::KeepAspect,
+        }
+    );
+    save_settings(&root.player_settings(), &read).unwrap();
+    let text = fs::read_to_string(root.player_settings()).unwrap();
+    assert!(!text.contains("[bga]"), "{text}");
+    let modes = [
+        ("on", BgaMode::On),
+        ("autoplay", BgaMode::Autoplay),
+        ("off", BgaMode::Off),
+    ];
+    let expands = [
+        ("full", BgaExpand::Full),
+        ("keep-aspect", BgaExpand::KeepAspect),
+        ("off", BgaExpand::Off),
+    ];
+    for (m, mode) in modes {
+        for (e, expand) in expands {
+            let text = format!("preset = \"wide\"\n[bga]\nmode = \"{m}\"\nexpand = \"{e}\"\n");
+            fs::write(root.player_settings(), &text).unwrap();
+            let read = Settings::load(&root).unwrap().player;
+            assert_eq!(read.bga, BgaSettings { mode, expand }, "{text}");
+            save_settings(&root.player_settings(), &read).unwrap();
+            assert_eq!(Settings::load(&root).unwrap().player, read, "{text}");
+        }
+    }
+    for (text, key, value) in [
+        ("[bga]\nmode = \"auto\"\n", "mode", "\"auto\""),
+        ("[bga]\nmode = \"ON\"\n", "mode", "\"ON\""),
+        (
+            "[bga]\nexpand = \"keep_aspect\"\n",
+            "expand",
+            "\"keep_aspect\"",
+        ),
+        ("[bga]\nmode = 1\n", "mode", "1"),
+        ("[bga]\nstretch = \"full\"\n", "stretch", "stretch"),
+    ] {
+        fs::write(root.player_settings(), text).unwrap();
+        let e = Settings::load(&root).unwrap_err();
+        assert!(matches!(e, SettingsError::Parse(_)), "{text}: {e:?}");
+        let message = Chain(&e).to_string();
+        assert!(
+            message.contains(key) && message.contains(value),
+            "{text}: {message}"
+        );
+    }
 }
 
 /// `language` in `player.toml`: a missing key gives `ja`, `ja` reads as

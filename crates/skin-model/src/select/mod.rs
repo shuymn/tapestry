@@ -911,6 +911,7 @@ fn fields(view: &SelectionView, cursor: Option<&RowView>) -> [i32; field::COUNT]
         field::SELECTED_LEVEL,
         c.labels.level_value.clamp(-VALUE_MAX, VALUE_MAX),
     );
+    set(field::SELECTED_BGA, i32::from(c.bga));
     if let Some(i) = c.info {
         set(field::SELECTED_INFO_VALID, 1);
         for (slot, (v, max)) in (field::SELECTED_KEY_TAPS..).zip([

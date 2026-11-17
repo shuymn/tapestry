@@ -134,10 +134,11 @@ const OPTIONS: &[(i32, bool)] = &[
     (-32, true),
     (33, false),
     (-33, true),
-    (40, true),
-    (-40, false),
-    (41, false),
-    (-41, true),
+    // The BGA setting, `on` by default: BGA shown.
+    (40, false),
+    (-40, true),
+    (41, true),
+    (-41, false),
     (50, true),
     (-50, false),
     (51, false),
@@ -173,8 +174,8 @@ const LUA_PROPERTY: &str =
     "property = { { name = \"mode\", item = { { name = \"on\", op = 901 } }, def = \"on\" } },";
 
 /// C3: options 32, 33, 51, 161-164, 280-283, 289, 290 and 1008 are false
-/// and 50 and 160 true on the decision screen, their negations the
-/// reverse, JSON by `op` and Lua by a `draw` callback's
+/// and 50 and 160 true on the decision screen, 40 false and 41 true under
+/// the default BGA setting, their negations the reverse, JSON by `op` and Lua by a `draw` callback's
 /// `main_state.option` read alike; a configured option keeps its value.
 #[test]
 fn decision_options_are_the_screen_s_constants() {

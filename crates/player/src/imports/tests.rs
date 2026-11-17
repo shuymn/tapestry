@@ -486,7 +486,13 @@ pub(crate) fn target(r: &Renderer) -> ImportTarget {
 
 /// Builds `choice` as a play skin for `t`.
 pub(crate) fn play(choice: &SkinChoice, t: &ImportTarget) -> KindOutcome {
-    build(ScreenKind::Play, choice, false, t, &Cancel::new())
+    build(
+        ScreenKind::Play,
+        choice,
+        crate::imports::SkinSession::default(),
+        t,
+        &Cancel::new(),
+    )
 }
 
 #[track_caller]
@@ -581,7 +587,7 @@ fn a_skin_builds_only_for_its_own_kind_and_importer() {
     let as_result = build(
         ScreenKind::Result,
         &choice(dir.path(), "s.json"),
-        false,
+        crate::imports::SkinSession::default(),
         &t,
         &c,
     );
@@ -594,7 +600,7 @@ fn a_skin_builds_only_for_its_own_kind_and_importer() {
     let r = refused(build(
         ScreenKind::Result,
         &choice(dir.path(), "r.json"),
-        false,
+        crate::imports::SkinSession::default(),
         &t,
         &c,
     ));
@@ -624,7 +630,13 @@ fn a_skin_builds_only_for_its_own_kind_and_importer() {
     ] {
         #[cfg(feature = "dev-tools")]
         let passes = skin_beatoraja::vm_hooks::thread_passes();
-        let why = refused(build(ScreenKind::Result, &c2, false, &t, &c));
+        let why = refused(build(
+            ScreenKind::Result,
+            &c2,
+            crate::imports::SkinSession::default(),
+            &t,
+            &c,
+        ));
         assert!(!why.is_empty(), "{entry}");
         #[cfg(feature = "dev-tools")]
         assert_eq!(
@@ -935,7 +947,16 @@ fn a_lua_skin_builds_on_the_base_facts() {
     // Source y 0 is the canvas's bottom: the image lies on rows 1016 to 1079.
     let at = |p: &[u8], x| crate::render_common::rgb_at(p, 1_920, (x, 1_048));
     for (autoplay, x, request) in [(false, 32, 1), (true, 532, 2)] {
-        let (b, _) = bundled(build(ScreenKind::Play, &c, autoplay, &t, &Cancel::new()));
+        let (b, _) = bundled(build(
+            ScreenKind::Play,
+            &c,
+            crate::imports::SkinSession {
+                autoplay,
+                ..Default::default()
+            },
+            &t,
+            &Cancel::new(),
+        ));
         let p = frame(&mut r, &b, request);
         assert_eq!(at(&p, x), RED, "autoplay {autoplay}");
     }
@@ -948,6 +969,85 @@ fn a_lua_skin_builds_on_the_base_facts() {
         assert_eq!(note.fact, fact, "{body}");
         assert_eq!(note.dependencies, ["play.luaskin"], "{body}");
         assert!(note.usage.instructions > 0, "{body}: {:?}", note.usage);
+    }
+}
+
+/// The import shows the BGA exactly when the session does: for each mode,
+/// autoplay or not, the import's setting from the session agrees with the
+/// session's answer, and carries its autoplay and its expansion.
+#[test]
+fn the_import_reads_the_session_s_bga_answer() {
+    for mode in [
+        game::BgaMode::On,
+        game::BgaMode::Autoplay,
+        game::BgaMode::Off,
+    ] {
+        for autoplay in [false, true] {
+            let s = game::BgaSession {
+                settings: game::BgaSettings {
+                    mode,
+                    expand: game::BgaExpand::Full,
+                },
+                autoplay,
+            };
+            let session = crate::imports::SkinSession::of(s);
+            assert_eq!(session.autoplay, autoplay, "{s:?}");
+            assert_eq!(session.bga().shown(), s.shown(), "{s:?}");
+        }
+    }
+    for (expand, import) in [
+        (game::BgaExpand::Full, skin_beatoraja::BgaExpand::Full),
+        (
+            game::BgaExpand::KeepAspect,
+            skin_beatoraja::BgaExpand::KeepAspect,
+        ),
+        (game::BgaExpand::Off, skin_beatoraja::BgaExpand::Off),
+    ] {
+        let s = game::BgaSession {
+            settings: game::BgaSettings {
+                mode: game::BgaMode::Off,
+                expand,
+            },
+            autoplay: true,
+        };
+        assert_eq!(
+            crate::imports::SkinSession::of(s).bga().expand,
+            import,
+            "{expand:?}"
+        );
+    }
+}
+
+/// The session's BGA setting reaches the import: a Lua play skin reading
+/// option 41 builds for the setting and the session's autoplay, the image
+/// moved where the BGA shows (`on`, or `autoplay` under autoplay) and in
+/// place where it does not (`off` under autoplay, `autoplay` without it).
+#[test]
+fn the_session_s_bga_setting_reaches_the_import() {
+    let _serial = serial();
+    let mut r = crate::render_common::offscreen(1_920, 1_080);
+    let t = target(&r);
+    let dir = lua_skin("if ms.option(41) then x = 500 end");
+    let c = choice(dir.path(), "play.luaskin");
+    let at = |p: &[u8], x| crate::render_common::rgb_at(p, 1_920, (x, 1_048));
+    for (request, (bga, autoplay, x)) in [
+        (game::BgaMode::On, false, 532),
+        (game::BgaMode::Off, true, 32),
+        (game::BgaMode::Autoplay, true, 532),
+        (game::BgaMode::Autoplay, false, 32),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let session = crate::imports::SkinSession {
+            autoplay,
+            bga,
+            ..Default::default()
+        };
+        let (b, _) = bundled(build(ScreenKind::Play, &c, session, &t, &Cancel::new()));
+        let p = frame(&mut r, &b, u64::try_from(request).unwrap() + 1);
+        assert_eq!(at(&p, x), RED, "{bga:?}, autoplay {autoplay}");
+        assert_ne!(at(&p, 564 - x), RED, "{bga:?}, autoplay {autoplay}");
     }
 }
 
@@ -965,7 +1065,13 @@ fn a_play_skin_goes_on_past_a_protected_absent_part() {
          if not ok and type(e) == \"string\" then x = 500 end",
     );
     let c = choice(dir.path(), "play.luaskin");
-    let (b, _) = bundled(build(ScreenKind::Play, &c, false, &t, &Cancel::new()));
+    let (b, _) = bundled(build(
+        ScreenKind::Play,
+        &c,
+        crate::imports::SkinSession::default(),
+        &t,
+        &Cancel::new(),
+    ));
     let p = frame(&mut r, &b, 1);
     let at = |p: &[u8], x| crate::render_common::rgb_at(p, 1_920, (x, 1_048));
     assert_eq!(at(&p, 532), RED);
@@ -974,7 +1080,7 @@ fn a_play_skin_goes_on_past_a_protected_absent_part() {
     let why = refused(build(
         ScreenKind::Play,
         &choice(dir.path(), "play.luaskin"),
-        false,
+        crate::imports::SkinSession::default(),
         &t,
         &Cancel::new(),
     ));
@@ -1264,7 +1370,13 @@ fn looping_job(
             default_font: render::DefaultFont::runtime,
         };
         Witness(
-            Some(build(ScreenKind::Play, &c, false, &t, cancel)),
+            Some(build(
+                ScreenKind::Play,
+                &c,
+                crate::imports::SkinSession::default(),
+                &t,
+                cancel,
+            )),
             dropped,
         )
     }

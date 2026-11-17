@@ -1,6 +1,6 @@
 //! The Lua conversion report (docs/stage3.md §3, the conversion report),
 //! for the developer's PC:
-//! `lua_report [--autoplay on|off]
+//! `lua_report [--autoplay on|off] [--bga on|autoplay|off]
 //! [--class veryhard|hard|normal|easy|veryeasy|none] [--level <n>|pending]
 //! [--result dense] [--option <name> <item>]... [--file <name> <candidate>]...
 //! [--local] <root> <entry> [<root> <entry>]...`
@@ -8,7 +8,8 @@
 //! which reports its outcome, kind, notes and frames alone), `entry`
 //! relative to its skin folder `root`,
 //! with its default configuration, but for what `--option` and `--file`
-//! name, on the scene of the kind its header names, against import facts
+//! name and the BGA setting `--bga` gives (`on` by default; `autoplay`
+//! reads `--autoplay`, off when not given), on the scene of the kind its header names, against import facts
 //! with autoplay, the chart's judgment class and its play level as given
 //! (`none` for a chart in no class, `pending` for a level the base
 //! snapshot has pending; each
@@ -54,18 +55,18 @@ use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use bms_model::TimeUs;
-use skin_beatoraja::Cancel;
 use skin_beatoraja::lua::facts::{Fact, ImportFacts, JudgeClass};
 use skin_beatoraja::lua::survey::{
     Choice, DestinationEntry, Local, RuntimeNoteRecord, Survey, survey_json, survey_with,
 };
+use skin_beatoraja::{BgaMode, Cancel};
 use skin_model::{
     BestFigures, BestRate, BestView, DEVIATION_SLOTS, GRAPH_COLUMNS, GaugeColumn, GaugeHistory,
     GaugeLook, LampKey, ResultChart, ResultFields, ResultNumber, ResultScore, ResultStatus,
     ResultView, ScreenKind, Timelines, TimingStats,
 };
 
-const USAGE: &str = "usage: lua_report [--autoplay on|off] \
+const USAGE: &str = "usage: lua_report [--autoplay on|off] [--bga on|autoplay|off] \
                      [--class veryhard|hard|normal|easy|veryeasy|none] \
                      [--level <n>|pending] [--result dense] [--option <name> <item>]... \
                      [--file <name> <candidate>]... [--local] <root> <entry> [<root> <entry>]...\n\
@@ -108,11 +109,22 @@ fn facts(mut args: &[String]) -> Option<(ImportFacts, Choice, bool, &[String])> 
                 args = rest;
             }
             [flag, v, rest @ ..] if flag == "--autoplay" => {
-                facts.autoplay = Fact::Known(match v.as_str() {
+                let on = match v.as_str() {
                     "on" => true,
                     "off" => false,
                     _ => return None,
-                });
+                };
+                facts.autoplay = Fact::Known(on);
+                choice.bga.autoplay = on;
+                args = rest;
+            }
+            [flag, v, rest @ ..] if flag == "--bga" => {
+                choice.bga.mode = match v.as_str() {
+                    "on" => BgaMode::On,
+                    "autoplay" => BgaMode::Autoplay,
+                    "off" => BgaMode::Off,
+                    _ => return None,
+                };
                 args = rest;
             }
             [flag, v, rest @ ..] if flag == "--level" => {

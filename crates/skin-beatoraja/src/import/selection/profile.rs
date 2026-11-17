@@ -444,6 +444,11 @@ pub(crate) fn option(id: i32) -> Option<Class<SelOption>> {
         1100 | 1103 | 1104 => Constant(false),
         // Other modes are not listed.
         161..=164 | 1160 | 1161 => Constant(false),
+        // The cursor's chart's BGA flag, from its library entry; neither
+        // holds on another row, as the source's with no song data
+        // (`BooleanPropertyFactory.java:255-265`, `:435-436` at `0.8.9`).
+        170 => Expr("cursor.chart && !selected.bga"),
+        171 => Expr("selected.bga"),
         176 => Expr("selected.summary && !selected.bpm_change"),
         177 => Expr("selected.bpm_change"),
         // The selected chart's judgment class, from its library entry.
@@ -458,19 +463,14 @@ pub(crate) fn option(id: i32) -> Option<Class<SelOption>> {
         193 => Expr("selected.banner"),
         200..=207 => rank(id - 200),
         300..=307 => rank(id - 300),
-        // The BGA setting, answered as off: no BGA is drawn (D33), as index 72 reads `BGA_OFF`.
-        crate::import::ops::BGA_OFF => Constant(true),
-        crate::import::ops::BGA_ON => Constant(false),
         // Offline: no IR, no rivals.
         50 | 624 => Constant(true),
         // No grade rows, courses, IR, replays, option-specific clear
-        // history, BGA, `#TEXT` or STOP facts on selection.
+        // history, `#TEXT` or STOP facts on selection.
         3
         | 51
         | 60
         | 126..=131
-        | 170
-        | 171
         | 174
         | 175
         | 197
@@ -542,10 +542,11 @@ pub(crate) fn image_index(id: i32) -> Option<Class<&'static str>> {
         // (`IntegerPropertyFactory.java:1112`; `PlayerConfig.java:175`).
         341 => Bridge("0"),
         // Truthful constants, at the source's value for what tapestry has
-        // or lacks: only 7-key charts are listed (`BEAT_7K`), no BGA is
-        // drawn (`BGA_OFF`), no lane option, display-timing auto
-        // adjustment or assist option exists, and long notes are LN.
-        11 | 72 => Bridge("2"),
+        // or lacks: only 7-key charts are listed (`BEAT_7K`), no lane
+        // option, display-timing auto adjustment or assist option exists,
+        // and long notes are LN. Index 72, the BGA setting, is the
+        // session's ([`crate::import::property::index_in`]).
+        11 => Bridge("2"),
         42 | 43 | 54 | 75 | 301..=308 => Bridge("0"),
         // No image-index property on selection: the source's image draws
         // its entry 0.
@@ -719,7 +720,6 @@ mod tests {
         (42, 43, C::K(0)),
         (54, 54, C::K(0)),
         (55, 55, C::N),
-        (72, 72, C::K(2)),
         (75, 75, C::K(0)),
         (77, 77, C::K(0)),
         (78, 78, C::N),
@@ -755,6 +755,7 @@ mod tests {
         (21, 23),
         (100, 105),
         (160, 164),
+        (170, 171),
         (176, 177),
         (180, 184),
         (190, 193),
@@ -765,13 +766,10 @@ mod tests {
     ];
     const OPTION_D: &[(i32, i32, bool)] = &[
         (3, 3, false),
-        (40, 40, true),
-        (41, 41, false),
         (50, 50, true),
         (51, 51, false),
         (60, 60, false),
         (126, 131, false),
-        (170, 171, false),
         (174, 175, false),
         (197, 197, false),
         (352, 354, false),
@@ -855,7 +853,7 @@ mod tests {
         }
         let n = OPTION_N.iter().flat_map(|&(a, b)| a..=b);
         let d = OPTION_D.iter().flat_map(|&(a, b, _)| a..=b);
-        assert_eq!(n.clone().count() + d.clone().count(), 100);
+        assert_eq!(n.clone().count() + d.clone().count(), 98);
         for id in 0..=3_000 {
             let class = option(id);
             if n.clone().any(|i| i == id) {

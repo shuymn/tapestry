@@ -512,7 +512,7 @@ impl Cx<'_> {
         let len = self.int_or(len, "len", 0)?;
         let group = len > 1;
         let r = self.int_or(r, "ref", 0)?;
-        let index = property::index_in(self.kind, r);
+        let index = property::index_in(self.kind, r, self.config.bga);
         let (charged, lowered) = self.lowered(&dst)?;
         let mut role = lowered.role(dst.failure);
         if group && self.kind == skin_model::ScreenKind::Result {
@@ -715,7 +715,7 @@ impl Cx<'_> {
             .fields(rec, ["ref", "value", "images", "act", "click"]);
         let r = self.int_or(r, "ref", 0)?;
         let value = self.callback_prop(value, "value")?;
-        let selector = image_choice::set_selector(self.kind, &value, r);
+        let selector = image_choice::set_selector(self.kind, &value, r, self.config.bga);
         let (charged, lowered) = self.lowered(&dst)?;
         let mut role = lowered.role(dst.failure);
         // On a result skin a set choosing by the clear type is the clear
@@ -741,7 +741,7 @@ impl Cx<'_> {
             }
             property::IntProp::Null => {
                 !matches!(value, Prop::Callable(_))
-                    && property::index_in(self.kind, r).non_negative()
+                    && property::index_in(self.kind, r, self.config.bga).non_negative()
             }
             _ => false,
         };

@@ -1095,7 +1095,7 @@ fn run_with(
         &link,
         &set.choices(),
         Launch::Selection,
-        false,
+        crate::imports::SkinSession::default(),
         &build,
         || false,
     )

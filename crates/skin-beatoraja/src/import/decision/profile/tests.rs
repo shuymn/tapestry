@@ -6,8 +6,6 @@ use super::*;
 /// (docs/stage3.md §3, Decision).
 const CONSTANTS: &[(i32, i32, bool)] = &[
     (32, 33, false),
-    (40, 40, true),
-    (41, 41, false),
     (50, 50, true),
     (51, 51, false),
     (160, 160, true),

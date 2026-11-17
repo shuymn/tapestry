@@ -585,7 +585,7 @@ impl ReferenceVm {
     /// null `ref` does (`SkinImage.java:123-125`).
     #[must_use]
     pub fn index_property(&self, id: i32) -> Option<i32> {
-        let p = index_in(ScreenKind::Play, id);
+        let p = index_in(ScreenKind::Play, id, self.pass.bga());
         let src = p.selector()?;
         let mut g = self.pass.replay.borrow_mut();
         g.as_mut()?.eval(src, Ty::Int)
@@ -596,7 +596,7 @@ impl ReferenceVm {
     /// model has no value for it. `items` are the declared option items.
     #[must_use]
     pub fn condition(&self, op: i32, items: &BTreeMap<i32, bool>) -> Option<bool> {
-        match ops::numeric_in(ScreenKind::Play, op, items) {
+        match ops::numeric_in(ScreenKind::Play, op, items, self.pass.bga()) {
             Cond::Fold(b) => Some(b),
             Cond::Expr { src, .. } => {
                 let mut g = self.pass.replay.borrow_mut();
@@ -611,7 +611,7 @@ impl ReferenceVm {
     /// when the model has no value for it.
     #[must_use]
     pub fn named_condition(&self, name: &str) -> Option<bool> {
-        match ops::named_in(ScreenKind::Play, name)? {
+        match ops::named_in(ScreenKind::Play, name, self.pass.bga())? {
             Cond::Fold(b) => Some(b),
             Cond::Expr { src, .. } => {
                 let mut g = self.pass.replay.borrow_mut();
@@ -764,7 +764,7 @@ pub(super) fn answer(
         }
         // The image index the play's callbacks bridge: the hi-speed fix.
         "event_index" => match arg(args).and_then(|n| i32::try_from(n).ok()) {
-            Some(id) if index_in(ScreenKind::Play, id) == IndexProp::FixHispeed => {
+            Some(id) if index_in(ScreenKind::Play, id, pass.bga()) == IndexProp::FixHispeed => {
                 match IndexProp::FixHispeed.selector() {
                     Some(src) => int(f, None, src, i64::from(id), 0),
                     None => Err(unanswered()),
@@ -780,7 +780,7 @@ pub(super) fn answer(
             let Some(id) = arg(args).and_then(|n| i32::try_from(n).ok()) else {
                 return Some(Err(unanswered()));
             };
-            match ops::numeric_in(ScreenKind::Play, id, &BTreeMap::new()) {
+            match ops::numeric_in(ScreenKind::Play, id, &BTreeMap::new(), pass.bga()) {
                 Cond::Fold(b) => Ok(Value::Boolean(b)),
                 Cond::Undefined(_) => Ok(Value::Boolean(false)),
                 Cond::Expr { src, .. } => match f.eval(&src, Ty::Bool) {

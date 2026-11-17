@@ -100,7 +100,7 @@ fn result_bundle() -> (tempfile::TempDir, Arc<render::SkinBundle>) {
     let built = crate::imports::build(
         ScreenKind::Result,
         &choice,
-        false,
+        crate::imports::SkinSession::default(),
         &target,
         &skin_beatoraja::Cancel::new(),
     );

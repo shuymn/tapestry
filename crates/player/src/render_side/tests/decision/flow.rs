@@ -668,7 +668,7 @@ fn configured(rig: &Rig, choice: &game::SkinChoice) -> crate::imports::Started {
         &rig.link,
         &choices,
         Launch::Selection,
-        false,
+        crate::imports::SkinSession::default(),
         &built,
         || false,
     )
