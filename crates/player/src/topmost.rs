@@ -20,8 +20,9 @@ use windows::Win32::UI::WindowsAndMessaging::{
     HWND_NOTOPMOST, HWND_TOPMOST, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, WINDOWINFO,
     WINEVENT_OUTOFCONTEXT, WINEVENT_SKIPOWNPROCESS, WS_EX_TOPMOST,
 };
-use winit::raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use winit::window::Window;
+
+use crate::window::hwnd;
 
 /// What the topmost state needs of the window: [`Window`], or a fake in
 /// tests.
@@ -301,14 +302,6 @@ fn ask_look() {
             sink();
         }
     });
-}
-
-/// The window's Win32 handle.
-fn hwnd(window: &Window) -> Option<HWND> {
-    match window.window_handle().ok()?.as_raw() {
-        RawWindowHandle::Win32(h) => Some(HWND(h.hwnd.get() as *mut std::ffi::c_void)),
-        _ => None,
-    }
 }
 
 /// Makes `hwnd` topmost, in front of every topmost window, neither moved,

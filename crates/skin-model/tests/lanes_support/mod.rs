@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use bms_model::{Lane, TimeUs};
-use image::{ImageFormat, Rgba, RgbaImage};
+use image::{Rgba, RgbaImage};
 use skin_model::{
     Anchor, BarGroupDef, Bind, Blend, CoverImage, CoverMotion, CoverPaintDef, CoverTrim, Ease,
     ElementDef, End, FileDef, Filter, Fit, Follow, ImageDef, KeyDef, LaneParts, LaneStyle,
@@ -16,7 +16,7 @@ use skin_model::{
     Source, SourceLanes, TimerRef, Track, WidgetDefs, timer,
 };
 
-use crate::play_support::{Harness, REGIONS};
+use crate::play_support::{Harness, REGIONS, shared_folder};
 
 /// The images, by index: a white texel for plain elements, then one per
 /// lane part and the covers' paints, each its own size so none shares a
@@ -48,33 +48,20 @@ const SIZES: [(u32, u32); 12] = [
     (14, 32),
 ];
 
-/// A folder of the part images under the target's test folder, written
-/// once, each atomically.
+/// A folder of the part images under the target's test folder, shared by
+/// every test process ([`shared_folder`]).
 fn root() -> &'static Path {
     static ROOT: OnceLock<PathBuf> = OnceLock::new();
     ROOT.get_or_init(|| {
-        let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("skin-model-lanes");
-        std::fs::create_dir_all(&dir).unwrap();
-        for (i, &(w, h)) in SIZES.iter().enumerate() {
-            let tmp = tempfile::Builder::new()
-                .suffix(".png")
-                .tempfile_in(&dir)
-                .unwrap();
-            RgbaImage::from_pixel(w, h, Rgba([255; 4]))
-                .save_with_format(tmp.path(), ImageFormat::Png)
-                .unwrap();
-            // Under nextest each test is a process of its own, so another
-            // may write the same file at once. On Windows the rename over a
-            // file another process has open fails; the file there has the
-            // same bytes, so it is used.
-            let path = dir.join(format!("{i}.png"));
-            if let Err(e) = tmp.persist(&path)
-                && !path.is_file()
-            {
-                panic!("{path:?}: {e}");
-            }
-        }
-        dir
+        let files: Vec<_> = SIZES
+            .iter()
+            .enumerate()
+            .map(|(i, &(w, h))| {
+                let image = RgbaImage::from_pixel(w, h, Rgba([255; 4]));
+                (format!("{i}.png"), shared_folder::png(&image))
+            })
+            .collect();
+        shared_folder::folder("skin-model-lanes", &files)
     })
 }
 
