@@ -639,11 +639,59 @@ fn a_use_during_a_held_unchanged_check_is_checked_again() {
     }
 }
 
-/// A check's result counts only for the version it checked: an entry read
-/// again while its old version's check was held keeps the new read, and
-/// the old mismatch drops nothing (AC-S15).
+/// A check's result counts only for the version it checked (AC-S15): A's
+/// stage file changes, and the check of A's next use observes the
+/// mismatch and is held; meanwhile a new pool generation reads A again as
+/// a new version, of the changed file. Released, the old version's
+/// mismatch drops nothing: the new read stays, and its own check finds it
+/// unchanged.
 #[test]
 fn a_check_counts_only_for_its_version() {
+    let _serial = crate::imports::tests::serial();
+    let _let_go = LetGo;
+    let c = cursor();
+    let a = chart([640, 480], [300, 80]);
+    c.rest_on(a.path(), named());
+    c.shown(a.path(), named());
+    let old = c.w.entry(&row(a.path(), named())).unwrap().1;
+    // Changed before the check observes it: its result is a mismatch.
+    std::thread::sleep(Duration::from_millis(20));
+    png(a.path(), "s.png", [160, 120]);
+    CHECK_HOLD.store(true, Ordering::Release);
+    c.w.update_chart(true);
+    c.until(|_| CHECK_HELD.load(Ordering::Acquire));
+    // A new pool generation: A is read again as a new version while the
+    // old version's check is held.
+    let next = pool_of(4);
+    *c.r.pool.lock().unwrap() = Some(next);
+    assert!(wait_until(|| c.r.link.pool_now().0 == Some(next)));
+    c.step();
+    c.rest(a.path(), named());
+    c.until(|c| c.w.entry(&row(a.path(), named())).is_some() && !c.w.write_pending());
+    let new = c.w.entry(&row(a.path(), named())).unwrap().1;
+    assert_ne!(new, old);
+    // The new read's update: a use of the new version, checked after the
+    // held check.
+    let _ = c.w.take_rearm();
+    c.w.update_chart(false);
+    let checks = c.w.checks_begun();
+    CHECK_HOLD.store(false, Ordering::Release);
+    c.until(|c| c.w.checks_pending() == (false, false) && c.w.checks_begun() > checks);
+    assert_eq!(
+        c.w.entry(&row(a.path(), named())).map(|e| e.1),
+        Some(new),
+        "the old version's mismatch dropped the new read"
+    );
+    assert!(!c.w.take_rearm(), "the new read asked again");
+}
+
+/// The reverse of [`a_check_counts_only_for_its_version`]: the check of
+/// A's use observes A unchanged and is held; A is read again as a new
+/// version, and its file then changes. Released, the old version's
+/// unchanged result validates no use of the new version: the new
+/// version's own check finds the change and withdraws it.
+#[test]
+fn an_old_unchanged_result_validates_no_use_of_a_new_version() {
     let _serial = crate::imports::tests::serial();
     let _let_go = LetGo;
     let c = cursor();
@@ -654,25 +702,28 @@ fn a_check_counts_only_for_its_version() {
     CHECK_HOLD.store(true, Ordering::Release);
     c.w.update_chart(true);
     c.until(|_| CHECK_HELD.load(Ordering::Acquire));
-    // Changed, then a new pool generation: the row is read again as a new
-    // version while the old check is held.
-    std::thread::sleep(Duration::from_millis(20));
-    png(a.path(), "s.png", [160, 120]);
     let next = pool_of(4);
     *c.r.pool.lock().unwrap() = Some(next);
     assert!(wait_until(|| c.r.link.pool_now().0 == Some(next)));
     c.step();
     c.rest(a.path(), named());
     c.until(|c| c.w.entry(&row(a.path(), named())).is_some() && !c.w.write_pending());
-    let new = c.w.entry(&row(a.path(), named())).unwrap().1;
-    assert_ne!(new, old);
+    assert_ne!(c.w.entry(&row(a.path(), named())).unwrap().1, old);
+    let _ = c.w.take_rearm();
+    // The new read's update, a use of the new version, checked after the
+    // held check; the file changes meanwhile.
+    c.w.update_chart(false);
+    std::thread::sleep(Duration::from_millis(20));
+    png(a.path(), "s.png", [160, 120]);
+    let checks = c.w.checks_begun();
     CHECK_HOLD.store(false, Ordering::Release);
-    c.until(|c| !c.w.checks_pending().0);
-    assert_eq!(
-        c.w.entry(&row(a.path(), named())).map(|e| e.1),
-        Some(new),
-        "the old version's check dropped the new read"
+    c.until(|c| c.w.checks_pending() == (false, false) && c.w.checks_begun() > checks);
+    assert!(
+        c.w.entry(&row(a.path(), named())).is_none(),
+        "the old version's unchanged result validated the new read"
     );
+    assert!(c.w.take_rearm());
+    assert_eq!(c.w.update_chart(false), CursorChart::Pending);
 }
 
 /// A chart left while a cursor read still runs (a choice refused before
