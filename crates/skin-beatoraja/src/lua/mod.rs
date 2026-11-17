@@ -1330,6 +1330,14 @@ impl LuaHeader {
         // carries it as a cancellation.
         let (hook_reads, pending) = analysis_pending(&def);
         if let (Err(_), Some(pending)) = (&imported, pending) {
+            // The store and usage as [`Self::finish`] reports them: the
+            // configured pass moved the store into `def`.
+            let mut counts = counts;
+            let store = common_reads(&mut def, &mut counts);
+            if let Some(an) = def.arena.lua.as_deref().and_then(|l| l.analysis.as_deref()) {
+                counts.expanded = an.expanded.get();
+                counts.analysis_work = an.work.get();
+            }
             let mut reads = reads;
             add_reads(&mut reads, hook_reads);
             return Ok(LuaTimed::Pending(LuaPending {

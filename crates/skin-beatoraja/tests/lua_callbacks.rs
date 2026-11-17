@@ -2508,14 +2508,16 @@ fn a_base_import_reading_a_chart_fact_ends_pending() {
     use skin_beatoraja::{Fact, FactId, ImportFacts, LuaOutcome};
     let base = ImportFacts::base(skin_model::ScreenKind::Play, Fact::Known(false));
     let d = facts_folder("", &[OVER_TOTAL], "");
-    match import_facts(&d, &base) {
+    let imported = match import_facts(&d, &base) {
         Ok(LuaOutcome::Pending(p)) => {
             assert_eq!(p.pending, FactId::ChartTotal);
             assert_eq!(p.facts.reads, []);
             assert_eq!(p.dependencies, ["s.luaskin"]);
+            p
         }
         other => panic!("{other:?}"),
-    }
+    };
+    assert_ne!(imported.usage.expanded, 0);
     #[cfg(feature = "dev-tools")]
     {
         let cancel = Cancel::new();
@@ -2525,6 +2527,12 @@ fn a_base_import_reading_a_chart_fact_ends_pending() {
             Ok(skin_beatoraja::lua::LuaTimed::Pending(p)) => {
                 assert_eq!(p.pending, FactId::ChartTotal);
                 assert_eq!(p.facts.reads, []);
+                // The common import's dependencies and counts, as the
+                // import reports them.
+                assert_eq!(p.dependencies, ["s.luaskin"]);
+                assert_eq!(p.usage.input_bytes, imported.usage.input_bytes);
+                assert_eq!(p.usage.loads, imported.usage.loads);
+                assert_eq!(p.usage.expanded, imported.usage.expanded);
             }
             other => panic!("{other:?}"),
         }
