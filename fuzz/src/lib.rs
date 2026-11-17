@@ -688,6 +688,7 @@ fn draw_selection(skin: &skin_model::Skin) -> Vec<usize> {
             max_ex: Some(300),
             score: RowScore::NoBest { plays: 1 },
             judge_class: Some(3),
+            bga: true,
             clears: 0,
             best: None,
             info: None,

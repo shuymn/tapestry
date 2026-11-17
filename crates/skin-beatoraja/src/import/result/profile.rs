@@ -351,9 +351,6 @@ pub(crate) fn option(id: i32) -> Option<Class<ResOption>> {
         354 => Expr("ex_score == target.ex"),
         2244 => Expr("count.bad > 0"),
         2245 => Expr("count.poor > 0"),
-        // The BGA setting, answered as off: no BGA is drawn (D33).
-        crate::import::ops::BGA_OFF => Constant(true),
-        crate::import::ops::BGA_ON => Constant(false),
         // Offline: no IR.
         50 => Constant(true),
         51 => Constant(false),

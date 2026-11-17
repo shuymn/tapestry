@@ -55,6 +55,11 @@ pub struct ElementObservation {
     pub choice: Option<u32>,
     /// The time its track was sampled at.
     pub t: Option<TimeUs>,
+    /// Its timer's age when the draw reached its track, recorded before
+    /// the track is sampled, so a track that gives no sample then (not
+    /// started, ended, between loop keys) still has it; `None` while the
+    /// timer is off or when the draw stopped before its track.
+    pub age: Option<TimeUs>,
 }
 
 /// An element in a [`DisplayList`].

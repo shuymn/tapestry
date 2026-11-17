@@ -1027,8 +1027,12 @@ impl IndexProp {
 /// selection or result profile's ([`selection::profile::image_index`],
 /// [`super::result::profile::image_index`]), an id
 /// outside it unsupported where the factory knows it and selecting entry
-/// 0 where it does not.
-pub(crate) fn index_in(kind: ScreenKind, id: i32) -> IndexProp {
+/// 0 where it does not. Selection's 72 is the BGA setting `bga`'s index
+/// ([`super::Bga`]), fixed for the session.
+pub(crate) fn index_in(kind: ScreenKind, id: i32, bga: super::Bga) -> IndexProp {
+    if kind == ScreenKind::Selection && id == BGA_SETTING {
+        return IndexProp::Selection(bga.index());
+    }
     let class = match kind {
         ScreenKind::Selection => selection::profile::image_index(id),
         ScreenKind::Result => result::profile::image_index(id),
@@ -1046,6 +1050,10 @@ pub(crate) fn index_in(kind: ScreenKind, id: i32) -> IndexProp {
         },
     }
 }
+
+/// Image index 72, `bga` (`IntegerPropertyFactory.java:1113` at `0.8.9`):
+/// the BGA setting.
+const BGA_SETTING: i32 = 72;
 
 /// The image-index ids the factory knows besides the supported ones
 /// (`IntegerPropertyFactory.java:920-961, 1088-1383`): the `IndexType`

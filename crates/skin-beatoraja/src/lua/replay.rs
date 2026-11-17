@@ -282,6 +282,9 @@ pub(crate) struct Frame {
     allowed: Option<Vec<bool>>,
     /// Compiled reads by source text: `None` when it does not compile.
     cache: HashMap<String, Option<Program>>,
+    /// Each observer's start on the state clock, by ordinal; an observer
+    /// without one is off ([`observed`]).
+    observers: BTreeMap<u32, i64>,
 }
 
 impl Frame {
@@ -392,6 +395,53 @@ impl ReferenceVm {
     #[must_use]
     pub fn callable(&self, f: &Function) -> Option<u32> {
         self.by_ptr.get(&f.to_pointer().addr()).copied()
+    }
+
+    /// The observer whose function is `f`: its ordinal and call site,
+    /// named as the other callables' sites are (the chunk name and line).
+    #[must_use]
+    pub fn observer(&self, f: &Function) -> Option<(u32, Option<(String, u32)>)> {
+        let n = self.pass.observer_of(f.to_pointer().addr())?;
+        let sites = self.observers().sites;
+        let at = usize::try_from(n)
+            .ok()
+            .and_then(|i| sites.get(i))
+            .cloned()
+            .flatten();
+        Some((n, at))
+    }
+
+    /// Its observers now ([`Self::carry`]).
+    #[must_use]
+    pub fn observers(&self) -> Observers {
+        Observers {
+            sites: self
+                .pass
+                .observer_sites()
+                .into_iter()
+                .map(|at| at.map(|l| (format!("@{}", l.file), l.line)))
+                .collect(),
+            starts: self
+                .pass
+                .replay
+                .borrow()
+                .as_ref()
+                .map(|f| f.observers.clone())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Carries `o`, the previous round's reference's observers, into this
+    /// one: their starts run on, as the state clock does; an error when
+    /// this import's observers are not the same calls.
+    pub fn carry(&self, o: &Observers) -> Result<(), String> {
+        if self.observers().sites != o.sites {
+            return Err("its observers differ from the previous reference's".to_owned());
+        }
+        if let Some(f) = self.pass.replay.borrow_mut().as_mut() {
+            f.observers.clone_from(&o.starts);
+        }
+        Ok(())
     }
 
     /// Adds `delta` to every later answer of `number(id)`: the mutation
@@ -535,7 +585,7 @@ impl ReferenceVm {
     /// null `ref` does (`SkinImage.java:123-125`).
     #[must_use]
     pub fn index_property(&self, id: i32) -> Option<i32> {
-        let p = index_in(ScreenKind::Play, id);
+        let p = index_in(ScreenKind::Play, id, self.pass.bga());
         let src = p.selector()?;
         let mut g = self.pass.replay.borrow_mut();
         g.as_mut()?.eval(src, Ty::Int)
@@ -546,7 +596,7 @@ impl ReferenceVm {
     /// model has no value for it. `items` are the declared option items.
     #[must_use]
     pub fn condition(&self, op: i32, items: &BTreeMap<i32, bool>) -> Option<bool> {
-        match ops::numeric_in(ScreenKind::Play, op, items) {
+        match ops::numeric_in(ScreenKind::Play, op, items, self.pass.bga()) {
             Cond::Fold(b) => Some(b),
             Cond::Expr { src, .. } => {
                 let mut g = self.pass.replay.borrow_mut();
@@ -561,7 +611,7 @@ impl ReferenceVm {
     /// when the model has no value for it.
     #[must_use]
     pub fn named_condition(&self, name: &str) -> Option<bool> {
-        match ops::named_in(ScreenKind::Play, name)? {
+        match ops::named_in(ScreenKind::Play, name, self.pass.bga())? {
             Cond::Fold(b) => Some(b),
             Cond::Expr { src, .. } => {
                 let mut g = self.pass.replay.borrow_mut();
@@ -714,7 +764,7 @@ pub(super) fn answer(
         }
         // The image index the play's callbacks bridge: the hi-speed fix.
         "event_index" => match arg(args).and_then(|n| i32::try_from(n).ok()) {
-            Some(id) if index_in(ScreenKind::Play, id) == IndexProp::FixHispeed => {
+            Some(id) if index_in(ScreenKind::Play, id, pass.bga()) == IndexProp::FixHispeed => {
                 match IndexProp::FixHispeed.selector() {
                     Some(src) => int(f, None, src, i64::from(id), 0),
                     None => Err(unanswered()),
@@ -730,7 +780,7 @@ pub(super) fn answer(
             let Some(id) = arg(args).and_then(|n| i32::try_from(n).ok()) else {
                 return Some(Err(unanswered()));
             };
-            match ops::numeric_in(ScreenKind::Play, id, &BTreeMap::new()) {
+            match ops::numeric_in(ScreenKind::Play, id, &BTreeMap::new(), pass.bga()) {
                 Cond::Fold(b) => Ok(Value::Boolean(b)),
                 Cond::Undefined(_) => Ok(Value::Boolean(false)),
                 Cond::Expr { src, .. } => match f.eval(&src, Ty::Bool) {
@@ -773,6 +823,51 @@ pub(super) fn answer(
         }
         _ => Err(unanswered()),
     })
+}
+
+/// Observer `n`'s function called on a reference: `None` when the pass
+/// is not one. Its predicate runs with no frame borrowed (the predicate's
+/// own reads borrow it, and a guard held across a call into Lua would
+/// deadlock), under the call's budget; a true result starts the observer
+/// at the frame's state time if it is off, a false one turns it off, and
+/// the start or the off value is returned as the source's timer function
+/// returns it (`TimerUtility.java:89-108` at `0.8.9`). A predicate that
+/// cannot complete leaves the state as it was.
+pub(super) fn observed(lua: &Lua, pass: &Pass, n: u32) -> Option<mlua::Result<Value>> {
+    let now = pass.replay.borrow().as_ref()?.state_us;
+    let predicate = match pass.observer_predicate(lua, n) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            let why = LuaWhy::LiveState {
+                api: super::host::OBSERVE,
+            };
+            return Some(Err(pass.ledger.fail_lua(lua, why)));
+        }
+        Err(e) => return Some(Err(e)),
+    };
+    let on = match predicate.call::<MultiValue>(()) {
+        Ok(v) => !matches!(v.front(), None | Some(Value::Nil | Value::Boolean(false))),
+        Err(e) => return Some(Err(e)),
+    };
+    let mut g = pass.replay.borrow_mut();
+    let f = g.as_mut()?;
+    let start = if on {
+        Some(*f.observers.entry(n).or_insert(now))
+    } else {
+        f.observers.remove(&n);
+        None
+    };
+    #[expect(clippy::cast_precision_loss, reason = "the source's double")]
+    let v = start.unwrap_or(i64::MIN) as f64;
+    Some(Ok(Value::Number(v)))
+}
+
+/// What a reference's observers are: each one's call site, in call order,
+/// and the starts of those that are on, by ordinal.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Observers {
+    sites: Vec<Option<(String, u32)>>,
+    starts: BTreeMap<u32, i64>,
 }
 
 /// The play fields the source's score data gives: the EX score and the

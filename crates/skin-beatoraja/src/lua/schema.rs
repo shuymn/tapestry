@@ -48,7 +48,7 @@ impl Serializer {
     pub(crate) fn resolves(self, name: &str) -> bool {
         match self {
             // `BooleanPropertyFactory.getBooleanProperty(String)`.
-            Self::Boolean | Self::Op => ops::named(name).is_some(),
+            Self::Boolean | Self::Op => ops::named(name, crate::import::Bga::default()).is_some(),
             // `IntegerPropertyFactory.getIntegerProperty(String)`.
             Self::Integer => int_by_name(name).is_some(),
             // `StringPropertyFactory.getStringProperty(String)`.
