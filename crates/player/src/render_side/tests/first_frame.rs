@@ -215,6 +215,24 @@ fn hold_at(link: &super::super::RenderLink, elapsed: i64) {
     link.shared.hold_elapsed.store(elapsed, SeqCst);
 }
 
+/// The hold reads the clock again, from now on.
+#[cfg(feature = "dev-tools")]
+fn hold_on_the_clock(link: &super::super::RenderLink) {
+    hold_at(link, i64::MIN);
+}
+
+/// Shows a loading lifetime held on the test's time, then hands the hold
+/// back to the clock: it ends at its bound from the showing. A render
+/// thread that takes the showing late (the parallel tests can starve it
+/// past any bound) still finds the hold running, so the hold is there to
+/// end.
+#[cfg(feature = "dev-tools")]
+fn show_held_to_the_bound(link: &super::super::RenderLink) {
+    hold_at(link, 0);
+    show_held(link);
+    hold_on_the_clock(link);
+}
+
 /// TB4: with no staging the hold ends at its bound from the showing, not
 /// a microsecond before: held at the bound less 1 µs, the pending
 /// presentation drawn and acknowledged once the bound is reached. The
@@ -669,11 +687,12 @@ fn the_hold_alloc() {
 }
 
 /// The transition record's hold marks (dev-tools): a held lifetime's hold,
-/// on the render thread's clock, ended by its bound, a real 180 ms; and a
-/// successor held until its skin, ended by the skin. Each lifetime gives
-/// one mark however many of its frames are drawn, and the interval into
-/// each loading state is covered only by its own hold: the rest of it is
-/// uncovered.
+/// on the render thread's clock, ended by its bound, a real 180 ms from the
+/// showing; and a successor held until its skin, ended by the skin. Each
+/// lifetime gives one mark however many of its frames are drawn, and the
+/// interval into each loading state is covered only by its own hold: the
+/// rest of it is uncovered. The successor's hold runs on the test's time,
+/// so only its skin ends it.
 #[cfg(feature = "dev-tools")]
 #[test]
 fn the_record_marks_each_hold_once() {
@@ -691,16 +710,20 @@ fn the_record_marks_each_hold_once() {
     extent.publish(1_920, 1_080);
     link.follow(&extent);
     show_page(&link);
-    show_held(&link);
+    show_held_to_the_bound(&link);
     let first = link.loading_lifetime();
     assert!(wait_until(|| link
         .loading_ack()
         .is_some_and(|(l, _)| l == first)));
+    let (_, acked) = link.loading_ack().unwrap();
+    let (lifetime, shown) = first_shown(&link).unwrap();
+    assert_eq!(lifetime, first);
     let drawn = stamps(&link).0;
     assert!(wait_until(|| stamps(&link).0 >= drawn + 3));
     link.end_loading().unwrap();
 
     show_page(&link);
+    hold_at(&link, 0);
     show_held(&link);
     let second = link.loading_lifetime();
     assert_eq!(
@@ -728,9 +751,19 @@ fn the_record_marks_each_hold_once() {
     };
     assert_eq!(bound.kind, MarkKind::Hold(Some(HoldEnd::Bound)));
     assert_eq!(skin.kind, MarkKind::Hold(Some(HoldEnd::Skin)));
+    // The mark is the render thread's held time: from its first held
+    // iteration, after the showing however late the thread took it, to the
+    // end of its last wait, after which the next look found the bound from
+    // the showing reached and the pending presentation was drawn and
+    // acknowledged. Only that look's start lies between the mark's end and
+    // the bound.
     assert!(
-        bound.to.0 - bound.from.0 >= BOUND - 30 * MS,
-        "held near the bound: {bound:?}"
+        shown <= bound.from && bound.from < bound.to && bound.to <= acked,
+        "held between the showing and the acknowledgement: {shown:?} {bound:?} {acked:?}"
+    );
+    assert!(
+        bound.to.0 >= shown.0 + BOUND - 30 * MS,
+        "held to the bound from the showing: {shown:?} {bound:?}"
     );
     let into_loading: Vec<_> = records
         .iter()
@@ -798,7 +831,7 @@ fn the_draw_facts_record_the_pending_presentation_giving_way() {
     use crate::measure::{Drew, State};
     let book = Transitions::with_capacity(256);
     let (chart, _screens, link, _extent) = recorded(180 * MS, &book);
-    show_held(&link);
+    show_held_to_the_bound(&link);
     let lifetime = link.loading_lifetime();
     assert!(wait_until(|| link
         .loading_ack()
