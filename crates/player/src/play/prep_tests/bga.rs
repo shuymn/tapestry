@@ -102,7 +102,7 @@ fn bga_transient_the_ledger_refuses_leaves_bga_absent_and_play_starts() {
 /// in a session that is not autoplay) reads nothing for a chart with BGA:
 /// no job begun, nothing decoded, no array begun; and it is ready without
 /// waiting for its empty table, which the render thread holds here past
-/// the link's bound. The session's answer is read, never the rig's own
+/// the link's bound; a later step reads nothing either. The session's answer is read, never the rig's own
 /// autoplay, which a scenario's chart changes: an autoplay session whose
 /// rig plays by hand still reads the pictures.
 #[test]
@@ -139,6 +139,10 @@ fn a_session_not_showing_the_bga_reads_nothing_and_is_ready_unwaited() {
             assert_eq!(ready, Preparation::Ready, "{what}");
             assert!(took < Duration::from_secs(1), "{what}: waited {took:?}");
             assert_eq!(stage(rig), "answered", "{what}");
+            // A later step, as the play's take: with no coordinator the
+            // job would run now, so what the attempt asked for is read
+            // here if anything is.
+            rig.bga.step(None, &|| false);
             assert_eq!(rig.bga.counts(), (0, 0), "{what}: nothing read");
             let seen = screens.bga.lock().unwrap();
             assert!(seen.begins.is_empty(), "{what}: no array");
