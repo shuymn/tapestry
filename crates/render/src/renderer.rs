@@ -2170,21 +2170,31 @@ impl Renderer {
         else {
             return;
         };
-        // The old array goes first, so its layers are given back before
-        // the smaller one is made.
+        // The old array goes first: the pool's handle, and the selection's
+        // bind group, which holds its view, rebound to the placeholder, so
+        // the old layers are given back before the smaller array is made,
+        // once the frames already submitted have read them.
         self.pool = None;
         let Some(slot) = self.selection_slot() else {
             return;
         };
+        let placeholder = self
+            .bindings
+            .bind(self.gpu.device(), &slot.resources.atlas, None);
+        if let Some(slot) = self.selection_slot_mut() {
+            slot.resources.atlas_bind = placeholder;
+        }
+        let Some(slot) = self.selection_slot() else {
+            return;
+        };
         let atlas = &slot.resources.atlas;
-        let (pool, bind) = match self.make_pool(grid, layers, atlas) {
-            Some((pool, bind)) => (Some(pool), bind),
-            None => (None, self.bindings.bind(self.gpu.device(), atlas, None)),
+        let Some((pool, bind)) = self.make_pool(grid, layers, atlas) else {
+            return;
         };
         if let Some(slot) = self.selection_slot_mut() {
             slot.resources.atlas_bind = bind;
         }
-        self.pool = pool;
+        self.pool = Some(pool);
     }
 
     /// Regrows the committed selection's chart-image pool to the most
