@@ -19,9 +19,12 @@
 //!   alpha channel and transparent for one with it (a picture whose alpha
 //!   is 0 everywhere has none: it is drawn opaque), and the result is
 //!   downscaled by an area filter to its cell and given a
-//!   [`CELL_GUTTER`]-texel border repeating its edge. Every transient
-//!   allocation is fallible, and refused at a caller's limit, so a refused
-//!   allocation leaves the picture absent ([`Absent::Refused`]).
+//!   [`CELL_GUTTER`]-texel border repeating its edge. The buffers the read
+//!   and the cell make are allocated fallibly, and under a caller's limit
+//!   what each phase holds at once is checked against it before its first
+//!   buffer is made, so a refusal leaves the picture absent
+//!   ([`Absent::Refused`]); a decoder's own buffers are only bounded
+//!   (`image::decode`), and abort as any out-of-memory does.
 //! - **Packing** ([`pack`]): pages of [`PAGE_SIDE`], no mips; a set that
 //!   does not fit [`PAGE_BUDGET`] pages caps the longer side at each of
 //!   [`STEP_CAPS`] in turn, then fits every picture to [`GRID_SIDE`] in a
@@ -414,12 +417,9 @@ impl std::fmt::Debug for CellPixels {
     }
 }
 
-/// An allocation of `bytes` within `limit`, `None` past it or when the
-/// allocator refuses it.
-fn alloc(bytes: u64, limit: Option<u64>) -> Result<Vec<u8>, Absent> {
-    if limit.is_some_and(|l| bytes > l) {
-        return Err(Absent::Refused);
-    }
+/// An allocation of `bytes`, [`Absent::Refused`] when the allocator
+/// refuses it.
+fn alloc(bytes: u64) -> Result<Vec<u8>, Absent> {
     let n = usize::try_from(bytes).map_err(|_| Absent::Refused)?;
     let mut v = Vec::new();
     v.try_reserve_exact(n).map_err(|_| Absent::Refused)?;
@@ -502,15 +502,15 @@ pub fn read_picture(
 
 impl ReadPicture {
     /// Decodes the picture into a cell whose content is `content` (see the
-    /// module). Every allocation of its own, the decoded picture, its
-    /// RGBA8 copy and the cell included, is at most `limit` bytes when one
-    /// is given, each checked before it is made, and an allocation past it
-    /// or refused leaves the picture [`Absent::Refused`]. `cancel` is
-    /// asked after the decode.
+    /// module). With `limit`, what the decode and the cell each hold at
+    /// once is at most `limit` bytes, both checked before the decode
+    /// begins (`decode_alpha`'s peak, [`cell_peak`]); its own buffers are
+    /// allocated fallibly, and one past the limit or refused leaves the
+    /// picture [`Absent::Refused`]. `cancel` is asked after the decode.
     ///
-    /// Memory: the chart images' whole-decode bound, then the
-    /// premultiplied native texels (or the canvas) beside their downscale
-    /// and the cell.
+    /// Memory: the decode's (the chart images' whole-decode bound), then
+    /// the premultiplied native texels (or the canvas) beside their
+    /// downscale, then the downscale beside the cell.
     ///
     /// # Errors
     ///
@@ -526,11 +526,15 @@ impl ReadPicture {
             dims,
             header,
         } = self;
+        let padded = content.map(|c| c + 2 * CELL_GUTTER);
+        if limit.is_some_and(|l| cell_peak(dims, drawn_size(dims), content, padded) > l) {
+            return Err(Absent::Refused);
+        }
         decode::check_whole(&bytes, dims, header).map_err(|e| absent(chart_image::absent_of(e)))?;
         let (image, alpha) = decode::decode_alpha(bytes, dims, limit)
             .map_err(|e| absent(chart_image::absent_of(e)))?;
         chart_image::checkpoint(cancel, Site::Decoded)?;
-        cell_of(image.into_raw(), dims, alpha, content, limit).map(|(padded, texels)| CellPixels {
+        cell_of(image.into_raw(), dims, alpha, content).map(|(padded, texels)| CellPixels {
             native: dims,
             padded,
             texels,
@@ -542,14 +546,15 @@ impl ReadPicture {
 /// `texels`, `alpha` when it had an alpha channel) at `content`:
 /// premultiplied, on the canvas when small, downscaled and given its
 /// gutter. An alpha 0 everywhere is no alpha channel: the picture is drawn
-/// opaque. Each allocation is at most `limit`.
+/// opaque. Each allocation is fallible.
 fn cell_of(
     mut texels: Vec<u8>,
     dims: [u32; 2],
     alpha: bool,
     content: [u32; 2],
-    limit: Option<u64>,
 ) -> Result<([u32; 2], Vec<u8>), Absent> {
+    let drawn = drawn_size(dims);
+    let padded = content.map(|c| c + 2 * CELL_GUTTER);
     // One pass, ending at the first texel that is not fully transparent.
     let alpha = alpha && texels.as_chunks::<4>().0.iter().any(|t| t[3] != 0);
     for t in texels.as_chunks_mut::<4>().0 {
@@ -557,11 +562,10 @@ fn cell_of(
         let a = if alpha { a } else { 255 };
         *t = [premultiply(r, a), premultiply(g, a), premultiply(b, a), a];
     }
-    let drawn = drawn_size(dims);
     let texels = if drawn == dims {
         texels
     } else {
-        let mut canvas = alloc(u64::from(drawn[0]) * u64::from(drawn[1]) * 4, limit)?;
+        let mut canvas = alloc(u64::from(drawn[0]) * u64::from(drawn[1]) * 4)?;
         // An opaque picture stays opaque, its margin included: black.
         // Source: SF-017
         if !alpha {
@@ -576,22 +580,34 @@ fn cell_of(
     let texels = if content == drawn {
         texels
     } else {
-        let bytes = u64::from(content[0]) * u64::from(content[1]) * 4;
-        if limit.is_some_and(|l| bytes > l) {
-            return Err(Absent::Refused);
-        }
         let out = chart_image::area(&texels, drawn, content).map_err(|_| Absent::Refused)?;
         drop(texels);
         out
     };
-    let padded = content.map(|c| c + 2 * CELL_GUTTER);
-    let bytes = u64::from(padded[0]) * u64::from(padded[1]) * 4;
-    if limit.is_some_and(|l| bytes > l) {
-        return Err(Absent::Refused);
-    }
     let cell =
         chart_image::extrude(&texels, content, padded, CELL_GUTTER).map_err(|_| Absent::Refused)?;
     Ok((padded, cell))
+}
+
+/// The most the cell of a picture of `dims` texels, drawn at `drawn` and
+/// fitted to `content` with its gutter (`padded`), holds at once, in RGBA8:
+/// a small picture beside its canvas; the drawn picture beside its
+/// downscale and that one's row sums (8 bytes a channel of a drawn row);
+/// and the content beside the cell.
+fn cell_peak(dims: [u32; 2], drawn: [u32; 2], content: [u32; 2], padded: [u32; 2]) -> u64 {
+    let bytes = |[w, h]: [u32; 2]| u64::from(w) * u64::from(h) * 4;
+    let canvas = if drawn == dims {
+        0
+    } else {
+        bytes(dims) + bytes(drawn)
+    };
+    let downscale = if content == drawn {
+        0
+    } else {
+        bytes(drawn) + bytes(content) + u64::from(drawn[0]) * 4 * 8
+    };
+    let cell = bytes(content) + bytes(padded);
+    canvas.max(downscale).max(cell)
 }
 
 /// Draws `src`, `dims` texels, at the top centre of `canvas`

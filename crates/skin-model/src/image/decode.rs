@@ -1,5 +1,6 @@
-//! Capped reads, image headers and decoding: a whole file through
-//! `image`, or an oversized PNG in bands of rows through `png`.
+//! Capped reads, image headers and decoding: a whole PNG through `png`, a
+//! whole JPEG or BMP through `image`, or an oversized PNG in bands of rows
+//! through `png`.
 //!
 //! No decoder is handed a file: bytes are read here, with every read
 //! bounded, into an owned buffer the decoder then takes over.
@@ -23,14 +24,16 @@ use super::{HEADER_BYTES, MAX_IMAGE_TEXELS, MAX_SIDE, MAX_STREAMED_TEXELS, Unban
 const HEADER_ALLOC: u64 = 4 << 20;
 /// The widest native texel of an enabled format: 16-bit RGBA PNG.
 pub(crate) const NATIVE_TEXEL_BYTES: u64 = 8;
-/// Room above the native image for a decoder's own buffers.
+/// Room above the native image for a decoder's own buffers, when no
+/// limit is given.
 const DECODE_MARGIN: u64 = 1 << 20;
 /// A read buffer grows by at most this much at a time.
 const READ_STEP: u64 = 1 << 20;
 /// The rows of one band of a file decoded in bands.
 pub(crate) const BAND_ROWS: u32 = 16;
 /// What `png` may allocate by its own count while it decodes a file in
-/// bands: the metadata it keeps and its output row.
+/// bands, or whole under a limit: the metadata it keeps and its output
+/// row.
 pub(crate) const PNG_WORK_BYTES: usize = 1 << 20;
 
 /// How a file is decoded, decided from its header at admission.
@@ -73,8 +76,9 @@ pub(crate) enum DecodeError {
     HeaderChanged,
     /// `png` met its own allocation limit ([`PNG_WORK_BYTES`]).
     DecoderLimit,
-    /// The native image or its RGBA8 copy was past the limit given, or
-    /// refused by the allocator.
+    /// A buffer of the read or decode, or the decoder's own buffers by
+    /// their bound, was past the limit given, or a buffer was refused by
+    /// the allocator.
     Refused,
     Image(ImageError),
     Png(png::DecodingError),
@@ -166,6 +170,16 @@ fn to_usize(n: u64) -> io::Result<usize> {
     usize::try_from(n).map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))
 }
 
+/// An I/O error of a read, [`DecodeError::Refused`] for a buffer the
+/// allocator refused.
+fn io_error(e: io::Error) -> DecodeError {
+    if e.kind() == io::ErrorKind::OutOfMemory {
+        DecodeError::Refused
+    } else {
+        DecodeError::Io(e)
+    }
+}
+
 fn reserve(buf: &mut Vec<u8>, n: u64) -> io::Result<()> {
     buf.try_reserve_exact(to_usize(n)?)
         .map_err(|e| io::Error::new(io::ErrorKind::OutOfMemory, e))
@@ -236,7 +250,7 @@ fn oversized([w, h]: [u32; 2]) -> bool {
 /// PNG, by the banded decoder's own settings through the start of its
 /// image data, for the fields of its banded decoding or why it has none.
 pub(crate) fn header(file: &mut File, len: u64) -> Result<Probe, DecodeError> {
-    let (bytes, more) = read_capped(file, len, HEADER_BYTES, &|| false).map_err(DecodeError::Io)?;
+    let (bytes, more) = read_capped(file, len, HEADER_BYTES, &|| false).map_err(io_error)?;
     let mut reader = reader(Cursor::new(bytes.as_slice()))?;
     let format = reader.format();
     let mut limits = Limits::no_limits();
@@ -356,36 +370,205 @@ fn png_mode(bytes: &[u8]) -> Result<Result<Mode, Unbanded>, DecodeError> {
 /// Decodes `bytes`, which must hold an image of `dims`, into RGBA8 with
 /// straight alpha.
 ///
-/// Memory, for `E` encoded bytes and `T` texels: the decoder takes `bytes`
-/// over; a JPEG decoder copies them while it is built and drops the
-/// original (2E); decoding holds the encoded bytes and the native image
-/// (E + 8T at most); the encoded bytes go with the decoder, then the
-/// conversion holds the native image, the RGBA8 copy and one band of
-/// [`BAND_ROWS`] rows of each (12T and 3 MiB at most, none when the native
-/// image is already RGBA8). With `E` at most
-/// [`MAX_FILE_BYTES`](super::MAX_FILE_BYTES) (64 MiB) and `T` at most
-/// [`MAX_IMAGE_TEXELS`](super::MAX_IMAGE_TEXELS) (12 Mi), that is at most
-/// 160 MiB. The native image and the RGBA8 copy are allocated here, so a
-/// refusal is an error rather than an abort.
+/// Memory, for `E` encoded bytes and `T` texels: while decoding, the
+/// encoded bytes, the decoder's own buffers ([`png_scratch`] and what `png`
+/// counts, [`jpeg_scratch`], [`bmp_scratch`]) and the native image (8T at
+/// most); then, while converting, the native image and its RGBA8 copy (12T
+/// at most, none when the native image is already RGBA8); [`peak`] is the
+/// larger. With `E` at most [`MAX_FILE_BYTES`](super::MAX_FILE_BYTES)
+/// (64 MiB) and `T` at most [`MAX_IMAGE_TEXELS`](super::MAX_IMAGE_TEXELS)
+/// (12 Mi), the buffers made here are at most 160 MiB. The native image and
+/// the RGBA8 copy are allocated here, so a refusal is an error rather than
+/// an abort; a decoder's own buffers are only bounded, and abort as any
+/// out-of-memory does.
 pub(crate) fn decode(bytes: Vec<u8>, dims: [u32; 2]) -> Result<RgbaImage, DecodeError> {
     decode_alpha(bytes, dims, None).map(|(image, _)| image)
 }
 
 /// [`decode`], and whether the decoded picture has an alpha channel (its
 /// decoder's colour type: a PNG's alpha or transparency chunk, a BMP's
-/// alpha mask). With `limit`, the native image and the RGBA8 copy are each
-/// at most `limit` bytes, their sizes taken from the header before either
-/// is allocated: past it, or refused by the allocator, the picture is
-/// [`DecodeError::Refused`].
+/// alpha mask).
+///
+/// With `limit`, the decode holds at most `limit` bytes at once: its
+/// [`peak`], from the header and the file's length, is checked against it
+/// before the decoder is built, `png` counts its own buffers within
+/// [`PNG_WORK_BYTES`], and the native image and the RGBA8 copy are
+/// allocated fallibly. Past it, or a buffer refused by the allocator, the
+/// picture is [`DecodeError::Refused`].
 pub(crate) fn decode_alpha(
     bytes: Vec<u8>,
     dims: [u32; 2],
     limit: Option<u64>,
 ) -> Result<(RgbaImage, bool), DecodeError> {
     let [w, h] = dims;
+    let format = reader(Cursor::new(bytes.as_slice()))?.format();
+    let header = if format == Some(ImageFormat::Png) {
+        Some(png_ihdr(&bytes)?.1)
+    } else {
+        None
+    };
+    let len = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
+    let (most, peak) = peak(format, header, len, dims)?;
+    if limit.is_some_and(|l| peak > l) {
+        return Err(DecodeError::Refused);
+    }
+    let (samples, layout) = if header.is_some() {
+        png_whole(bytes, dims, most, limit.is_some())?
+    } else {
+        image_whole(bytes, dims, most, limit)?
+    };
+    Ok((rgba8(samples, layout, w, h)?, layout.alpha()))
+}
+
+/// The most the native image of a picture of `dims` in `format` (a PNG's
+/// `header`) can take, and the most its decode from a file of `len` bytes
+/// holds at once: while decoding, the file, the decoder's own buffers by
+/// their bound and the native image; while converting, the native image and
+/// its RGBA8 copy. The native image is taken at its largest for the format:
+/// 3 bytes a texel for a JPEG, 4 for a BMP, and for a PNG its colour type
+/// and depth expanded, with the alpha a transparency chunk may add.
+fn peak(
+    format: Option<ImageFormat>,
+    header: Option<PngHeader>,
+    len: u64,
+    dims: [u32; 2],
+) -> Result<(u64, u64), DecodeError> {
+    let [w, h] = dims;
+    let texels = u64::from(w) * u64::from(h);
+    let (texel, decoder) = match (format, header) {
+        // The file, kept by the decoder, and an `eXIf` chunk's copy of it.
+        (Some(ImageFormat::Png), Some(header)) => (
+            png_texel(header),
+            png_scratch(header, w)
+                .saturating_add(u64::try_from(PNG_WORK_BYTES).unwrap_or(u64::MAX))
+                .saturating_add(len.saturating_mul(2)),
+        ),
+        // The file's copies are the envelope's.
+        (Some(ImageFormat::Jpeg), None) => (3, jpeg_scratch(len, dims)),
+        (Some(ImageFormat::Bmp), None) => (4, bmp_scratch(w).saturating_add(len)),
+        _ => return Err(DecodeError::Unsupported),
+    };
+    let native = texels * texel;
+    let decoding = decoder.saturating_add(native);
+    let converting = native + texels * 4;
+    Ok((native, decoding.max(converting)))
+}
+
+/// The bytes of a PNG texel of `header`'s colour type and depth as `png`
+/// expands it, with the alpha a transparency chunk may add.
+fn png_texel(header: PngHeader) -> u64 {
+    let channels = match header.color {
+        png::ColorType::Grayscale | png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb | png::ColorType::Rgba | png::ColorType::Indexed => 4,
+    };
+    if header.depth == png::BitDepth::Sixteen {
+        channels * 2
+    } else {
+        channels
+    }
+}
+
+/// The most `image`'s JPEG decoder allocates beside the native image for a
+/// file of `len` bytes and `w`×`h` texels, by an envelope that reads
+/// neither the file's sampling nor its scans: the copies of the input and
+/// of its metadata segments (8 `len` and 64 KiB), the coefficient planes a
+/// progressive or multi-scan file keeps (8 (w + 31)(h + 31)), and the rows
+/// and upsampling buffers of the widest sampling (3 410 (w + 31)).
+/// `zune-jpeg` takes no byte limit and allocates infallibly, so this is
+/// their only bound; its constants follow `zune-jpeg` 0.5.15 under `image`
+/// 0.25.10 (`the_decoder_bounds_follow_the_locked_versions`).
+fn jpeg_scratch(len: u64, [w, h]: [u32; 2]) -> u64 {
+    let [w, h] = [u64::from(w) + 31, u64::from(h) + 31];
+    len.saturating_mul(8)
+        .saturating_add(64 << 10)
+        .saturating_add(8 * w * h)
+        .saturating_add(3_410 * w)
+}
+
+/// The most `image`'s BMP decoder allocates beside the native image for a
+/// picture `w` wide: its palette (768 bytes kept, 1 024 read) and one row
+/// of 8-bit palette indices (4 ⌈w / 4⌉), or at most 256 bytes of a run in
+/// a run-length file. It takes no byte limit (`image` 0.25.10).
+fn bmp_scratch(w: u32) -> u64 {
+    1_792 + 4 * u64::from(w.div_ceil(4))
+}
+
+/// The most `png` 0.18 allocates outside its own count while it decodes a
+/// PNG `w` wide of `header`'s colour type and depth: the window of inflated
+/// rows, twice the most it grows to (max(4R, 128 KiB) + 2R + 40 KiB for a
+/// filtered row of R bytes), two rows of a stream cut short, a
+/// deinterlaced row (8w), and the inflater's tables (32 KiB). Its own
+/// count covers its chunk buffers and its output row.
+fn png_scratch(header: PngHeader, w: u32) -> u64 {
+    let samples: u64 = match header.color {
+        png::ColorType::Grayscale | png::ColorType::Indexed => 1,
+        png::ColorType::GrayscaleAlpha => 2,
+        png::ColorType::Rgb => 3,
+        png::ColorType::Rgba => 4,
+    };
+    let bits = header.depth as u64;
+    let row = 1 + (u64::from(w) * samples * bits).div_ceil(8);
+    let window = (4 * row + 64).max(128 << 10) + 2 * row + (40 << 10);
+    2 * window + 2 * row + 8 * u64::from(w) + (32 << 10)
+}
+
+/// A PNG decoded whole by `png` as `image` reads it, each row expanded to
+/// 8 or 16 bits a sample, its text chunks and colour profile skipped, its
+/// native image at most `most`. `png` counts its own buffers (its chunk
+/// buffers, an `eXIf` chunk's among them, and its output row) within
+/// [`PNG_WORK_BYTES`] when `limited`, past it [`DecodeError::Refused`];
+/// otherwise within the native image's largest and 1 MiB.
+fn png_whole(
+    bytes: Vec<u8>,
+    [w, h]: [u32; 2],
+    most: u64,
+    limited: bool,
+) -> Result<(Vec<u8>, Layout), DecodeError> {
+    let counted = if limited {
+        PNG_WORK_BYTES
+    } else {
+        let native = u64::from(w) * u64::from(h) * NATIVE_TEXEL_BYTES;
+        usize::try_from(native + DECODE_MARGIN).unwrap_or(usize::MAX)
+    };
+    let refused = |e: png::DecodingError| match e {
+        png::DecodingError::LimitsExceeded if limited => DecodeError::Refused,
+        e => e.into(),
+    };
+    let mut decoder =
+        png::Decoder::new_with_limits(Cursor::new(bytes), png::Limits { bytes: counted });
+    decoder.set_ignore_text_chunk(true);
+    decoder.set_ignore_iccp_chunk(true);
+    decoder.set_transformations(png::Transformations::EXPAND);
+    let mut reader = decoder.read_info().map_err(refused)?;
+    if reader.info().size() != (w, h) {
+        return Err(DecodeError::Changed);
+    }
+    let (color, depth) = reader.output_color_type();
+    let layout = Layout::of_png(color, depth)?;
+    let samples = reader
+        .output_buffer_size()
+        .and_then(|n| u64::try_from(n).ok())
+        .ok_or(DecodeError::Unsupported)?;
+    if samples > most {
+        return Err(DecodeError::Unsupported);
+    }
+    let mut buf = zeroed(samples)?;
+    reader.next_frame(&mut buf).map_err(refused)?;
+    Ok((buf, layout))
+}
+
+/// A JPEG or BMP decoded whole by `image`, its native image at most `most`,
+/// its decoder's limit `limit` (or the native image and 1 MiB), which
+/// these decoders apply to the dimensions alone.
+fn image_whole(
+    bytes: Vec<u8>,
+    [w, h]: [u32; 2],
+    most: u64,
+    limit: Option<u64>,
+) -> Result<(Vec<u8>, Layout), DecodeError> {
     let native = u64::from(w) * u64::from(h) * NATIVE_TEXEL_BYTES;
     let mut limits = Limits::no_limits();
-    limits.max_alloc = Some(native + DECODE_MARGIN);
+    limits.max_alloc = Some(limit.unwrap_or(native + DECODE_MARGIN));
     let mut reader = reader(Cursor::new(bytes))?;
     reader.limits(limits);
     let decoder = reader.into_decoder()?;
@@ -393,17 +576,13 @@ pub(crate) fn decode_alpha(
         return Err(DecodeError::Changed);
     }
     let samples = decoder.total_bytes();
-    if samples > native {
+    if samples > most {
         return Err(DecodeError::Unsupported);
     }
-    let rgba = u64::from(w) * u64::from(h) * 4;
-    if limit.is_some_and(|l| samples > l || rgba > l) {
-        return Err(DecodeError::Refused);
-    }
-    let color = decoder.color_type();
+    let layout = Layout::of_image(decoder.color_type())?;
     let mut buf = zeroed(samples)?;
     decoder.read_image(&mut buf)?;
-    Ok((rgba8(buf, color, w, h)?, color.has_alpha()))
+    Ok((buf, layout))
 }
 
 /// `n` zero bytes, [`DecodeError::Refused`] when the allocator refuses
@@ -416,80 +595,113 @@ fn zeroed(n: u64) -> Result<Vec<u8>, DecodeError> {
     Ok(v)
 }
 
-/// The native samples `buf` of a `w`×`h` image of `color` in RGBA8 by
-/// `image`'s conversion: `buf` itself when it already is, else converted
-/// a band of [`BAND_ROWS`] rows at a time into one allocation made here.
-fn rgba8(buf: Vec<u8>, color: ColorType, w: u32, h: u32) -> Result<RgbaImage, DecodeError> {
+/// How a decoded image's texels are laid out: grey, grey and alpha, RGB or
+/// RGBA (`channels`), of 8-bit samples or of 16-bit ones in the byte order
+/// `wide` reads.
+#[derive(Clone, Copy)]
+struct Layout {
+    channels: usize,
+    wide: Option<fn([u8; 2]) -> u16>,
+}
+
+impl Layout {
+    /// The layout of `image`'s decoded `color` (16-bit samples in native
+    /// byte order).
+    fn of_image(color: ColorType) -> Result<Self, DecodeError> {
+        let ne: fn([u8; 2]) -> u16 = u16::from_ne_bytes;
+        let (channels, wide) = match color {
+            ColorType::L8 => (1, None),
+            ColorType::La8 => (2, None),
+            ColorType::Rgb8 => (3, None),
+            ColorType::Rgba8 => (4, None),
+            ColorType::L16 => (1, Some(ne)),
+            ColorType::La16 => (2, Some(ne)),
+            ColorType::Rgb16 => (3, Some(ne)),
+            ColorType::Rgba16 => (4, Some(ne)),
+            _ => return Err(DecodeError::Unsupported),
+        };
+        Ok(Self { channels, wide })
+    }
+
+    /// The layout of `png`'s expanded output (16-bit samples big-endian).
+    fn of_png(color: png::ColorType, depth: png::BitDepth) -> Result<Self, DecodeError> {
+        let be: fn([u8; 2]) -> u16 = u16::from_be_bytes;
+        let wide = match depth {
+            png::BitDepth::Eight => None,
+            png::BitDepth::Sixteen => Some(be),
+            _ => return Err(DecodeError::Unsupported),
+        };
+        let channels = match color {
+            png::ColorType::Grayscale => 1,
+            png::ColorType::GrayscaleAlpha => 2,
+            png::ColorType::Rgb => 3,
+            png::ColorType::Rgba => 4,
+            // `EXPAND` leaves no indexed output.
+            png::ColorType::Indexed => return Err(DecodeError::Unsupported),
+        };
+        Ok(Self { channels, wide })
+    }
+
+    /// Whether the texels carry alpha.
+    const fn alpha(self) -> bool {
+        self.channels.is_multiple_of(2)
+    }
+
+    /// The bytes of one texel.
+    const fn bytes(self) -> usize {
+        self.channels * if self.wide.is_some() { 2 } else { 1 }
+    }
+}
+
+/// The native samples `buf` of a `w`×`h` image of `layout` in RGBA8:
+/// `buf` itself when it already is, else converted texel by texel
+/// ([`texel`]) into one allocation made here.
+fn rgba8(buf: Vec<u8>, layout: Layout, w: u32, h: u32) -> Result<RgbaImage, DecodeError> {
     let bad = || DecodeError::Unsupported;
-    if color == ColorType::Rgba8 {
+    if layout.channels == 4 && layout.wide.is_none() {
         return RgbaImage::from_raw(w, h, buf).ok_or_else(bad);
     }
-    let width = usize::try_from(w).map_err(|_| bad())?;
-    let band = usize::try_from(BAND_ROWS).map_err(|_| bad())?;
-    let in_row = width * usize::from(color.bytes_per_pixel());
-    let mut out = zeroed(u64::from(w) * u64::from(h) * 4)?;
-    if in_row > 0 {
-        for (src, dst) in buf
-            .chunks(in_row * band)
-            .zip(out.chunks_mut(width * 4 * band))
-        {
-            let rows = u32::try_from(src.len() / in_row).map_err(|_| bad())?;
-            let converted = band_image(src, color, w, rows)?.into_rgba8();
-            if converted.len() != dst.len() {
-                return Err(bad());
-            }
-            dst.copy_from_slice(&converted);
-        }
+    let texels = u64::from(w) * u64::from(h);
+    let step = u64::try_from(layout.bytes()).map_err(|_| bad())?;
+    if u64::try_from(buf.len()).ok() != texels.checked_mul(step) {
+        return Err(bad());
     }
+    let mut out = zeroed(texels * 4)?;
+    for (src, dst) in buf
+        .chunks_exact(layout.bytes())
+        .zip(out.as_chunks_mut::<4>().0)
+    {
+        *dst = texel(src, layout);
+    }
+    drop(buf);
     RgbaImage::from_raw(w, h, out).ok_or_else(bad)
 }
 
-/// A band of `w`×`rows` native samples of `color`, copied into an image
-/// of its own (the samples in native byte order, as decoders write them).
-fn band_image(
-    src: &[u8],
-    color: ColorType,
-    w: u32,
-    rows: u32,
-) -> Result<DynamicImage, DecodeError> {
-    fn copied<T, const N: usize>(src: &[u8], f: fn([u8; N]) -> T) -> Result<Vec<T>, DecodeError> {
-        let (samples, rest) = src.as_chunks::<N>();
-        if !rest.is_empty() {
-            return Err(DecodeError::Unsupported);
+/// One texel `src` of `layout` in RGBA8, as `image` converts it: an 8-bit
+/// sample as it is, a 16-bit one `x` to the nearest of `x / 257`
+/// (`(x + 128) / 257`); grey goes to red, green and blue, and a missing
+/// alpha is opaque.
+fn texel(src: &[u8], layout: Layout) -> [u8; 4] {
+    let mut s = [0_u8; 4];
+    match layout.wide {
+        None => {
+            for (o, &v) in s.iter_mut().zip(src) {
+                *o = v;
+            }
         }
-        let mut v = Vec::new();
-        v.try_reserve_exact(samples.len())
-            .map_err(|_| DecodeError::Refused)?;
-        v.extend(samples.iter().map(|s| f(*s)));
-        Ok(v)
+        Some(read) => {
+            for (o, &pair) in s.iter_mut().zip(src.as_chunks::<2>().0) {
+                *o = u8::try_from((u32::from(read(pair)) + 128) / 257).unwrap_or(u8::MAX);
+            }
+        }
     }
-    let eight = || copied::<u8, 1>(src, |[b]| b);
-    let sixteen = || copied(src, u16::from_ne_bytes);
-    let float = || copied(src, f32::from_ne_bytes);
-    let image = match color {
-        ColorType::L8 => ImageBuffer::from_raw(w, rows, eight()?).map(DynamicImage::ImageLuma8),
-        ColorType::La8 => ImageBuffer::from_raw(w, rows, eight()?).map(DynamicImage::ImageLumaA8),
-        ColorType::Rgb8 => ImageBuffer::from_raw(w, rows, eight()?).map(DynamicImage::ImageRgb8),
-        ColorType::Rgba8 => ImageBuffer::from_raw(w, rows, eight()?).map(DynamicImage::ImageRgba8),
-        ColorType::L16 => ImageBuffer::from_raw(w, rows, sixteen()?).map(DynamicImage::ImageLuma16),
-        ColorType::La16 => {
-            ImageBuffer::from_raw(w, rows, sixteen()?).map(DynamicImage::ImageLumaA16)
-        }
-        ColorType::Rgb16 => {
-            ImageBuffer::from_raw(w, rows, sixteen()?).map(DynamicImage::ImageRgb16)
-        }
-        ColorType::Rgba16 => {
-            ImageBuffer::from_raw(w, rows, sixteen()?).map(DynamicImage::ImageRgba16)
-        }
-        ColorType::Rgb32F => {
-            ImageBuffer::from_raw(w, rows, float()?).map(DynamicImage::ImageRgb32F)
-        }
-        ColorType::Rgba32F => {
-            ImageBuffer::from_raw(w, rows, float()?).map(DynamicImage::ImageRgba32F)
-        }
-        _ => None,
-    };
-    image.ok_or(DecodeError::Unsupported)
+    let [a, b, c, d] = s;
+    match layout.channels {
+        1 => [a, a, a, u8::MAX],
+        2 => [a, a, a, b],
+        3 => [a, b, c, u8::MAX],
+        _ => [a, b, c, d],
+    }
 }
 
 /// Where the bands of a file decoded in bands go.
@@ -673,8 +885,8 @@ fn samples(depth: png::BitDepth, line: usize, rows: u32) -> Result<Samples, Halt
     })
 }
 
-/// A band of `w`×`rows` native samples of `color` in RGBA8, by the
-/// conversion [`decode`] uses.
+/// A band of `w`×`rows` native samples of `color` in RGBA8, by `image`'s
+/// conversion, which gives what [`decode`]'s own gives.
 fn to_rgba8(band: Samples, color: png::ColorType, w: u32, rows: u32) -> Result<RgbaImage, Halt> {
     use png::ColorType as C;
     let bad = || Halt::Failed(DecodeError::Unsupported);
@@ -715,7 +927,10 @@ mod tests {
 
     use image::{DynamicImage, ImageBuffer, ImageFormat, Luma, LumaA, Rgb, Rgba};
 
-    use super::{DecodeError, decode_alpha};
+    use super::{
+        DecodeError, PNG_WORK_BYTES, PngHeader, bmp_scratch, decode_alpha, jpeg_scratch,
+        png_scratch,
+    };
 
     /// `image` encoded as `format`.
     fn encoded(image: &DynamicImage, format: ImageFormat) -> Vec<u8> {
@@ -733,10 +948,9 @@ mod tests {
         u8::try_from((x * 7 + y * 13 + k * 61) % 256).unwrap()
     }
 
-    /// The conversion done here, a band at a time into its own
-    /// allocation, gives `image`'s own result for every colour type an
-    /// enabled format decodes to, a last band shorter than the others
-    /// included (41 rows).
+    /// The conversion done here, texel by texel into its own allocation,
+    /// gives `image`'s own result for every colour type an enabled format
+    /// decodes to, and for every 8-bit and 16-bit sample value.
     #[test]
     fn the_bounded_conversion_matches_image_s() {
         let [w, h] = [37, 41];
@@ -769,31 +983,156 @@ mod tests {
         files.push(("rgb bmp".into(), encoded(&images[2], ImageFormat::Bmp)));
         files.push(("rgb jpeg".into(), encoded(&images[2], ImageFormat::Jpeg)));
         files.push(("luma jpeg".into(), encoded(&images[0], ImageFormat::Jpeg)));
-        for (what, bytes) in files {
+        // Every sample value: 8 bits in grey and alpha, 16 bits in grey.
+        let every8 = DynamicImage::ImageLumaA8(ImageBuffer::from_fn(256, 1, |x, _| {
+            let v = u8::try_from(x).unwrap();
+            LumaA([v, u8::MAX - v])
+        }));
+        let every16 = DynamicImage::ImageLuma16(ImageBuffer::from_fn(256, 256, |x, y| {
+            Luma([u16::try_from(y * 256 + x).unwrap()])
+        }));
+        let every = [
+            ("every 8-bit value", every8, [256, 1]),
+            ("every 16-bit value", every16, [256, 256]),
+        ];
+        let files = files
+            .into_iter()
+            .map(|(what, bytes)| (what, bytes, [w, h]))
+            .chain(
+                every
+                    .into_iter()
+                    .map(|(what, i, dims)| (what.into(), encoded(&i, ImageFormat::Png), dims)),
+            );
+        for (what, bytes, dims) in files {
             let theirs = image::load_from_memory(&bytes).unwrap();
             let alpha = theirs.color().has_alpha();
             let theirs = theirs.into_rgba8();
-            let (ours, has) = decode_alpha(bytes, [w, h], None).unwrap();
+            let (ours, has) = decode_alpha(bytes, dims, None).unwrap();
             assert!(ours == theirs, "{what}");
             assert_eq!(has, alpha, "{what}");
         }
     }
 
-    /// With a limit, a native image or an RGBA8 copy past it is refused
-    /// from the header, before it is allocated.
+    /// A picture's name, file and dimensions, and the edge of its decode
+    /// from the file's length.
+    type Case<'a> = (&'a str, Vec<u8>, [u32; 2], &'a dyn Fn(u64) -> u64);
+
+    /// With a limit, a decode is refused before its decoder is built when
+    /// the most it holds at once passes the limit by one byte, and decoded
+    /// at it, whichever phase holds the most: while decoding, the file, the
+    /// decoder's own buffers by their bound (a JPEG's envelope, a BMP's
+    /// palette and row, a PNG's window of rows and its own count) and the
+    /// native image at its largest for the format; while converting, the
+    /// native image and its RGBA8 copy.
     #[test]
-    fn a_limit_refuses_the_native_image_and_its_copy() {
-        let rgb = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(640, 480, Rgb([9, 8, 7])));
-        let bytes = encoded(&rgb, ImageFormat::Png);
-        let rgba = 640 * 480 * 4;
-        let decode = |limit| decode_alpha(bytes.clone(), [640, 480], Some(limit));
-        assert!(matches!(decode(rgba - 1), Err(DecodeError::Refused)));
-        assert!(decode(rgba).is_ok());
-        let deep = DynamicImage::ImageRgba16(ImageBuffer::from_pixel(64, 64, Rgba([1; 4])));
-        let bytes = encoded(&deep, ImageFormat::Png);
-        let native = 64 * 64 * 8;
-        let decode = |limit| decode_alpha(bytes.clone(), [64, 64], Some(limit));
-        assert!(matches!(decode(native - 1), Err(DecodeError::Refused)));
-        assert!(decode(native).is_ok());
+    fn a_limit_holds_each_phase_of_a_decode_at_its_edge() {
+        let small = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(16, 2, Rgb([9, 8, 7])));
+        let large = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(640, 480, Rgb([9, 8, 7])));
+        let rgb8 = PngHeader {
+            color: png::ColorType::Rgb,
+            depth: png::BitDepth::Eight,
+            interlaced: false,
+        };
+        let work = u64::try_from(PNG_WORK_BYTES).unwrap();
+        let png_decoding = move |len: u64| 2 * len + png_scratch(rgb8, 16) + work + 16 * 2 * 4;
+        let cases: [Case<'_>; 4] = [
+            // Decoding holds the most: the decoder's own buffers outweigh
+            // the picture.
+            (
+                "JPEG",
+                encoded(&small, ImageFormat::Jpeg),
+                [16, 2],
+                &|len| jpeg_scratch(len, [16, 2]) + 16 * 2 * 3,
+            ),
+            ("BMP", encoded(&small, ImageFormat::Bmp), [16, 2], &|len| {
+                len + bmp_scratch(16) + 16 * 2 * 4
+            }),
+            (
+                "PNG",
+                encoded(&small, ImageFormat::Png),
+                [16, 2],
+                &png_decoding,
+            ),
+            // Converting holds the most: the native image, at a BMP's
+            // largest, beside its RGBA8 copy.
+            (
+                "large BMP",
+                encoded(&large, ImageFormat::Bmp),
+                [640, 480],
+                &|_| 2 * 640 * 480 * 4,
+            ),
+        ];
+        for (what, bytes, dims, edge) in cases {
+            let edge = edge(u64::try_from(bytes.len()).unwrap());
+            let decode = |limit| decode_alpha(bytes.clone(), dims, Some(limit));
+            assert!(decode(edge).is_ok(), "{what} at {edge}");
+            assert!(
+                matches!(decode(edge - 1), Err(DecodeError::Refused)),
+                "{what} below {edge}"
+            );
+        }
+    }
+
+    /// The PNG CRC of `bytes`.
+    fn crc32(bytes: &[u8]) -> u32 {
+        let mut c = !0_u32;
+        for &b in bytes {
+            c ^= u32::from(b);
+            for _ in 0..8 {
+                c = if c & 1 == 0 {
+                    c >> 1
+                } else {
+                    0xEDB8_8320 ^ (c >> 1)
+                };
+            }
+        }
+        !c
+    }
+
+    /// With a limit, `png` counts its own buffers within
+    /// [`PNG_WORK_BYTES`]: a PNG whose `eXIf` chunk is past it is refused,
+    /// though the most its decode holds is within the limit; without a
+    /// limit `png` counts the native image and 1 MiB, and it decodes.
+    #[test]
+    fn a_limit_holds_png_s_own_count() {
+        let picture = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(640, 480, Rgb([9, 8, 7])));
+        let mut bytes = encoded(&picture, ImageFormat::Png);
+        let data = vec![0_u8; 2 << 20];
+        let mut chunk = Vec::new();
+        chunk.extend_from_slice(&u32::try_from(data.len()).unwrap().to_be_bytes());
+        let mut body = b"eXIf".to_vec();
+        body.extend_from_slice(&data);
+        chunk.extend_from_slice(&body);
+        chunk.extend_from_slice(&crc32(&body).to_be_bytes());
+        // After the signature (8 bytes) and `IHDR` (25).
+        bytes.splice(33..33, chunk);
+        assert!(matches!(
+            decode_alpha(bytes.clone(), [640, 480], Some(161 << 20)),
+            Err(DecodeError::Refused)
+        ));
+        assert!(decode_alpha(bytes, [640, 480], None).is_ok());
+    }
+
+    /// The bounds of the decoders' own buffers ([`jpeg_scratch`],
+    /// [`bmp_scratch`], [`png_scratch`]) were read from these versions'
+    /// sources: a lock file that moves any of them fails here until they
+    /// are read again.
+    #[test]
+    fn the_decoder_bounds_follow_the_locked_versions() {
+        let lock = include_str!("../../../../Cargo.lock").replace("\r\n", "\n");
+        for (name, version) in [
+            ("image", "0.25.10"),
+            ("png", "0.18.1"),
+            ("fdeflate", "0.3.7"),
+            ("zune-jpeg", "0.5.15"),
+            ("zune-core", "0.5.3"),
+        ] {
+            let named = format!("name = \"{name}\"\n");
+            assert_eq!(lock.matches(&named).count(), 1, "one {name}");
+            assert!(
+                lock.contains(&format!("{named}version = \"{version}\"\n")),
+                "{name} {version}"
+            );
+        }
     }
 }
