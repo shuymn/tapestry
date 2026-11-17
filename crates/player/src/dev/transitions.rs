@@ -457,6 +457,12 @@ pub struct Recorder {
     unpresented: u32,
     /// The play's end, while its result is prepared.
     preparing: Option<TimeUs>,
+    /// The open span's longest and largest uncovered gaps as they stand
+    /// if the preparation ends in a result: each gap since the play's end
+    /// covered by the preparation's mark from its start, which is recorded
+    /// only once the result is taken (design.md "State Model",
+    /// ResultPreparing). A preparation withdrawn drops them.
+    prepared: Option<(Option<Gap>, Option<Gap>)>,
     /// The loading lifetime whose hold is marked.
     held: Option<u64>,
 }
@@ -472,6 +478,7 @@ impl Recorder {
             marks: [None; MAX_MARKS],
             unpresented: 0,
             preparing: None,
+            prepared: None,
             held: None,
         }
     }
@@ -489,9 +496,17 @@ impl Recorder {
             self.hold(h);
         }
         // A play that ended without a result: its preparation is no
-        // result's, and marks nothing.
-        if self.preparing.is_some() && !is_play(stage.state) && stage.state != State::Result {
+        // result's, and marks nothing. So does one a change to another
+        // state than the result's leaves (a retry withdrawing it).
+        let changed = self
+            .last
+            .is_some_and(|(l, _)| l.state != stage.state || l.lifetime != stage.lifetime);
+        if self.preparing.is_some()
+            && stage.state != State::Result
+            && (changed || !is_play(stage.state))
+        {
             self.preparing = None;
+            self.prepared = None;
         }
         let unpresented = std::mem::take(&mut self.unpresented);
         let mut change = None;
@@ -528,15 +543,16 @@ impl Recorder {
                     s.frames = s.frames.saturating_add(1);
                     s.unpresented = s.unpresented.saturating_add(unpresented);
                     s.last = at;
-                    if s.longest.is_none_or(|l| gap.len() > l.len()) {
-                        s.longest = Some(gap);
+                    if let Some(from) = self.preparing {
+                        let with = Gap {
+                            cover: coverage(last_at, at, &self.with_preparation(from, at)),
+                            ..gap
+                        };
+                        if let Some((longest, uncovered)) = &mut self.prepared {
+                            Self::widen(longest, uncovered, with);
+                        }
                     }
-                    if gap.cover.uncovered > 0
-                        && s.uncovered
-                            .is_none_or(|u| gap.cover.uncovered > u.cover.uncovered)
-                    {
-                        s.uncovered = Some(gap);
-                    }
+                    Self::widen(&mut s.longest, &mut s.uncovered, gap);
                     self.open = Some(s);
                 }
             }
@@ -550,6 +566,32 @@ impl Recorder {
             }
         }
         change
+    }
+
+    /// `gap` into a span's longest and largest uncovered gaps.
+    fn widen(longest: &mut Option<Gap>, uncovered: &mut Option<Gap>, gap: Gap) {
+        if longest.is_none_or(|l| gap.len() > l.len()) {
+            *longest = Some(gap);
+        }
+        if gap.cover.uncovered > 0
+            && uncovered.is_none_or(|u| gap.cover.uncovered > u.cover.uncovered)
+        {
+            *uncovered = Some(gap);
+        }
+    }
+
+    /// The kept marks with the preparation's from `from` to `at`, in a free
+    /// slot; with none free, its mark would be dropped and covers nothing.
+    fn with_preparation(&self, from: TimeUs, at: TimeUs) -> [Option<Mark>; MAX_MARKS] {
+        let mut marks = self.marks;
+        if let Some(slot) = marks.iter_mut().find(|s| s.is_none()) {
+            *slot = Some(Mark {
+                kind: MarkKind::Preparing,
+                from,
+                to: at,
+            });
+        }
+        marks
     }
 
     const fn opened(stage: Stage, at: TimeUs) -> Span {
@@ -587,14 +629,19 @@ impl Recorder {
     }
 
     /// The play's in-play interval ended at `at`.
-    pub const fn play_ended(&mut self, at: TimeUs) {
+    pub fn play_ended(&mut self, at: TimeUs) {
         self.preparing = Some(at);
+        self.prepared = Some(self.open.map_or((None, None), |s| (s.longest, s.uncovered)));
     }
 
     /// The render thread took a result's presentation or the built-in
     /// result's page at `at`: the result was prepared since the play ended.
     pub fn result_taken(&mut self, at: TimeUs) {
         if let Some(from) = self.preparing.take() {
+            if let (Some((longest, uncovered)), Some(s)) = (self.prepared.take(), &mut self.open) {
+                s.longest = longest;
+                s.uncovered = uncovered;
+            }
             self.mark(Mark {
                 kind: MarkKind::Preparing,
                 from,
