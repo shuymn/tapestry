@@ -2,7 +2,10 @@
 //! topmost while focused): the borderless fullscreen window is topmost
 //! while it has focus, so no other topmost window (an auto-hidden taskbar's
 //! strip) covers it and keeps it from independent flip, and stops being
-//! topmost when it loses focus, behind the window that took it.
+//! topmost when it loses focus, behind the window that took it. A hidden
+//! window is never made topmost: made topmost before its first frame, the
+//! window failed to start (the render thread's first swap chain was refused
+//! as an invalid surface).
 
 use windows::Win32::Foundation::HWND;
 use windows::Win32::UI::WindowsAndMessaging::{
@@ -17,6 +20,9 @@ use winit::window::Window;
 pub trait LevelWindow {
     /// Whether the window is fullscreen now.
     fn fullscreen(&self) -> bool;
+    /// Whether the window is shown: made hidden, it gains focus before its
+    /// first frame (winit activates a window made fullscreen).
+    fn shown(&self) -> bool;
     /// Makes the window topmost, in front of every topmost window.
     fn raise(&self);
     /// Ends the window's topmost state, behind the window in front
@@ -27,6 +33,10 @@ pub trait LevelWindow {
 impl LevelWindow for Window {
     fn fullscreen(&self) -> bool {
         Window::fullscreen(self).is_some()
+    }
+
+    fn shown(&self) -> bool {
+        self.is_visible() == Some(true)
     }
 
     fn raise(&self) {
@@ -57,12 +67,14 @@ pub struct Topmost {
 
 impl Topmost {
     /// The window's focus is `focused`. Gained while the window is
-    /// fullscreen, the window is made topmost, again when it already is,
-    /// so it comes in front of any topmost window brought forward since;
-    /// lost, or gained while not fullscreen, the window stops being
-    /// topmost if it was, and is left where it is if it was not.
+    /// fullscreen and shown, the window is made topmost, again when it
+    /// already is, so it comes in front of any topmost window brought
+    /// forward since; lost, or gained while not fullscreen or hidden, the
+    /// window stops being topmost if it was, and is left where it is if it
+    /// was not. The show reports the focus again ([`crate::window`]), so a
+    /// focus gained while hidden makes the window topmost once it shows.
     pub fn focus(&mut self, window: &impl LevelWindow, focused: bool) {
-        if focused && window.fullscreen() {
+        if focused && window.fullscreen() && window.shown() {
             window.raise();
             self.raised = true;
         } else if self.raised {
@@ -165,11 +177,12 @@ mod tests {
 
     use super::{LevelWindow, Topmost};
 
-    /// The window as the topmost state sees it: whether it is fullscreen,
-    /// and what was done to it.
+    /// The window as the topmost state sees it: whether it is fullscreen
+    /// and hidden, and what was done to it.
     #[derive(Default)]
     struct FakeLevel {
         fullscreen: bool,
+        hidden: std::cell::Cell<bool>,
         done: RefCell<Vec<&'static str>>,
     }
 
@@ -189,6 +202,10 @@ mod tests {
     impl LevelWindow for FakeLevel {
         fn fullscreen(&self) -> bool {
             self.fullscreen
+        }
+
+        fn shown(&self) -> bool {
+            !self.hidden.get()
         }
 
         fn raise(&self) {
@@ -242,6 +259,22 @@ mod tests {
         w.take();
         t.focus(&w, false);
         assert_eq!(w.take(), Vec::<&str>::new());
+    }
+
+    /// A hidden window that gains focus (winit activates a window made
+    /// fullscreen before its first frame) is not made topmost; shown, a
+    /// focus gain makes it topmost.
+    #[test]
+    fn a_hidden_window_is_not_made_topmost() {
+        let w = FakeLevel::fullscreen();
+        w.hidden.set(true);
+        let mut t = Topmost::default();
+        t.focus(&w, true);
+        t.focus(&w, false);
+        assert_eq!(w.take(), Vec::<&str>::new());
+        w.hidden.set(false);
+        t.focus(&w, true);
+        assert_eq!(w.take(), ["raise"]);
     }
 
     /// A window that is not fullscreen (`--dev-window`) is never topmost,

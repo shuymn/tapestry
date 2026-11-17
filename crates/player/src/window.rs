@@ -2302,6 +2302,10 @@ mod tests {
             true
         }
 
+        fn shown(&self) -> bool {
+            true
+        }
+
         fn raise(&self) {
             let focused = self.controls.focused();
             self.done.borrow_mut().push(("raise", focused));
@@ -2343,5 +2347,71 @@ mod tests {
         );
         focus(None, false);
         assert!(!c.focused());
+    }
+
+    /// The hidden fullscreen window as showing and the topmost state see
+    /// it: active before it shows, as winit makes a window made
+    /// fullscreen, and what was done to it, in order.
+    #[derive(Default)]
+    struct HiddenActive {
+        visible: std::cell::Cell<bool>,
+        done: std::cell::RefCell<Vec<&'static str>>,
+    }
+
+    impl super::ShowWindow for HiddenActive {
+        fn show(&self) {
+            self.visible.set(true);
+            self.done.borrow_mut().push("show");
+        }
+
+        fn has_focus(&self) -> bool {
+            true
+        }
+    }
+
+    impl crate::topmost::LevelWindow for HiddenActive {
+        fn fullscreen(&self) -> bool {
+            true
+        }
+
+        fn shown(&self) -> bool {
+            self.visible.get()
+        }
+
+        fn raise(&self) {
+            self.done.borrow_mut().push("raise");
+        }
+
+        fn lower(&self) {
+            self.done.borrow_mut().push("lower");
+        }
+    }
+
+    /// The window is never made topmost before it shows: a focus gained
+    /// while it is hidden, before its first frame (when the render thread
+    /// sets up its swap chain), raises nothing, and the show, once a frame
+    /// was presented, makes it topmost after it is shown.
+    #[test]
+    fn the_window_is_made_topmost_only_once_shown() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+        let c = Controls::new(QpcClock::start());
+        let w = HiddenActive::default();
+        let mut capture = crate::pointer::Capture::default();
+        let pointer = crate::pointer::PointerShared::default();
+        let mut topmost = crate::topmost::Topmost::default();
+        let shared = super::Shared::default();
+        let start = Instant::now();
+        let mut showing = super::Showing::new(start);
+        let mut focus = |focused| {
+            super::focus_changed(&mut capture, &pointer, &c, &mut topmost, Some(&w), focused);
+        };
+        // winit activates the hidden window as it makes it fullscreen.
+        focus(true);
+        assert!(showing.poll(&w, &mut focus, &shared, start).is_some());
+        assert_eq!(*w.done.borrow(), Vec::<&str>::new());
+        shared.presented.store(true, Ordering::Release);
+        assert_eq!(showing.poll(&w, &mut focus, &shared, start), None);
+        assert_eq!(*w.done.borrow(), ["show", "raise"]);
     }
 }
