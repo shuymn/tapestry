@@ -22,8 +22,9 @@
 //! uses it: its JSON
 //! mapping, that mapping's availability guard (joined into the element's
 //! visibility, so a value that can be unknown draws nothing while it is;
-//! on selection a number's instead selects its value, the source's
-//! `Integer.MIN_VALUE` while it is false, as the runtime reads it),
+//! on selection a number's instead selects its value, the property's
+//! absent value while it is false
+//! ([`super::selection::profile::absent_number`], as the runtime reads it)),
 //! its D4 deviation and its critical part (`number(101)` the EX score, as
 //! 101 in JSON); one with no mapping refuses the callback:
 //!
@@ -129,9 +130,6 @@ pub(super) struct SlotConsumer {
     /// may be an object the source removed ([`Cx::installed`]).
     pub(super) kept: bool,
 }
-
-/// The source's `Integer.MIN_VALUE`, as an expression reads it.
-const HIDDEN: &str = "(-2147483648)";
 
 /// The gauge looks `gauge_type()` selects, by index.
 const LOOKS: [&str; 6] = ["assist_easy", "easy", "normal", "hard", "ex_hard", "hazard"];
@@ -520,8 +518,8 @@ impl Lower<'_> {
                 Ok(Mapped::Gauge)
             }
             "number" => {
-                let IntProp::Shown(v) = property::int_in(self.kind, id.ok_or_else(unmapped)?)
-                else {
+                let n = id.ok_or_else(unmapped)?;
+                let IntProp::Shown(v) = property::int_in(self.kind, n) else {
                     return Err(unmapped());
                 };
                 self.out.deviates |= v.deviates();
@@ -530,20 +528,26 @@ impl Lower<'_> {
                 self.out.essential = self.out.essential.or(v.essential());
                 let (lo, hi) = v.range();
                 match v.availability() {
-                    // On selection an absent value is the source's
-                    // `Integer.MIN_VALUE`, which the callback reads as the
-                    // runtime's `main_state.number` gives it
-                    // ([`crate::lua::runtime::Screen::number`]): the guard
-                    // selects the value, never the element's visibility.
+                    // On selection a read while its bridge is unavailable
+                    // gives the property's absent value, the source's, as
+                    // the runtime's `main_state.number` gives it
+                    // ([`super::selection::profile::absent_number`]): the
+                    // guard selects the value, never the element's
+                    // visibility.
                     Some(g) if self.kind == ScreenKind::Selection && g != "true" => {
+                        // Source: SF-020
+                        let absent = i64::from(
+                            super::selection::profile::absent_number(n).unwrap_or(i32::MIN),
+                        );
+                        let a = Self::int_text(self.an, absent)?;
                         let src = Self::text(
                             self.an,
-                            &["(if (", g, ") then (", v.expr(), ") else ", HIDDEN, ")"],
+                            &["(if (", g, ") then (", v.expr(), ") else ", &a, ")"],
                         )?;
                         Ok(Mapped::Int {
                             src,
-                            lo: i64::from(i32::MIN),
-                            hi,
+                            lo: lo.min(absent),
+                            hi: hi.max(absent),
                         })
                     }
                     g => {
