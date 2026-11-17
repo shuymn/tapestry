@@ -935,16 +935,36 @@ pub(crate) fn lua_skin(body: &str) -> tempfile::TempDir {
 /// module, and whose text, in a font file, has the value `value`, drawn
 /// with `timer` at (100, 100).
 pub(crate) fn text_skin(pre: &str, value: &str, timer: &str) -> tempfile::TempDir {
+    texts_skin(pre, &[value], timer)
+}
+
+/// [`text_skin`] with a text for each of `values`, from y 100 down by 50.
+pub(crate) fn texts_skin(pre: &str, values: &[&str], timer: &str) -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
+    let texts: Vec<String> = values
+        .iter()
+        .enumerate()
+        .map(|(k, v)| format!("{{ id = \"t{k}\", font = \"f\", size = 40, value = {v} }}"))
+        .collect();
+    let dsts: Vec<String> = (0..values.len())
+        .map(|k| {
+            format!(
+                "{{ id = \"t{k}\", {timer} dst = {{ {{ x = 100, y = {}, w = 800, h = 40 }} }} }}",
+                100 + 50 * k
+            )
+        })
+        .collect();
     let entry = format!(
         "local skin = {{ type = 0, name = \"t\", w = 1920, h = 1080 }}\n\
          if not skin_config then return skin end\n\
          local ms = require(\"main_state\")\n\
          {pre}\n\
          skin.font = {{ {{ id = \"f\", path = \"f.ttf\" }} }}\n\
-         skin.text = {{ {{ id = \"t\", font = \"f\", size = 40, value = {value} }} }}\n\
-         skin.destination = {{ {{ id = \"t\", {timer} dst = {{ {{ x = 100, y = 100, w = 800, h = 40 }} }} }} }}\n\
-         return skin\n"
+         skin.text = {{ {} }}\n\
+         skin.destination = {{ {} }}\n\
+         return skin\n",
+        texts.join(", "),
+        dsts.join(", ")
     );
     fs::write(dir.path().join("play.luaskin"), entry).unwrap();
     fs::write(

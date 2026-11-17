@@ -8,7 +8,7 @@ use std::sync::Arc;
 use render::SkinBundle;
 use skin_beatoraja::ImportFacts;
 
-use super::{choice, class_skin, pending, play, serial, target, text_skin};
+use super::{choice, class_skin, pending, play, serial, target, text_skin, texts_skin};
 use crate::imports::facts::attempt_facts;
 use crate::imports::facts::tests::{loaded, loaded_kept};
 use crate::imports::{ForAttempt, PendingSkin, Specialized};
@@ -332,6 +332,14 @@ const OVER_TOTAL: &str = "function() return ms.number(368) >= 300 and \"high\" o
 const OVER_BOTH: &str =
     "function() return ms.number(368) >= 300 and ms.number(74) > 1000 and \"high\" or \"low\" end";
 
+/// A play text's TOTAL readout: the gauge total over the default total
+/// for the whole chart's note count, its percentage rounded up to
+/// hundredths, joined with `..`.
+const READOUT: &str = "function() local t = ms.number(368) local n = ms.number(74) \
+     local b = math.max(260.0, 7.605 * n / (0.01 * n + 6.5)) \
+     local p = t / b * 100 p = math.ceil(p * 100) / 100 \
+     return t .. \" (\" .. p .. \"%)\" end";
+
 /// A chart file's text: `head`, then `notes - 1` taps on lane 1 from
 /// measure 2, 64 a measure, and a mine on lane 2; [`loaded`] adds its
 /// one note.
@@ -384,14 +392,16 @@ fn kept_reads(skin: &PendingSkin) -> Vec<skin_beatoraja::FactRead> {
 /// speed reuse it (the facts are the whole loaded chart's); chart B, of
 /// the same level but another total and count, runs a job, whose facts
 /// name both; chart C, whose total is past what the number widget shows,
-/// runs a job whose text is dropped; and A then runs a job again.
+/// runs a job whose texts are dropped; and A then runs a job again. A
+/// second text, the TOTAL readout, folds to the whole chart's string in
+/// each, the section's and the speed change's too.
 #[test]
 fn a_texts_specialization_follows_the_charts_facts() {
     use skin_beatoraja::{FactId, FactRead, FactValue};
     let _serial = serial();
     let r = crate::render_common::offscreen(1_920, 1_080);
     let t = target(&r);
-    let dir = text_skin("local l = ms.number(96)", OVER_BOTH, "");
+    let dir = texts_skin("local l = ms.number(96)", &[OVER_BOTH, READOUT], "");
     let (p, note) = pending(play(&choice(dir.path(), "play.luaskin"), &t));
     assert_eq!(note.fact, FactId::PlayLevel);
     let mut skin = PendingSkin::new(p);
@@ -408,7 +418,8 @@ fn a_texts_specialization_follows_the_charts_facts() {
     let (got, how, _, _) = attempt(&mut skin, &a);
     assert!(matches!(how, Specialized::Ran));
     let first = ready(got);
-    assert_eq!(requested(&first), ["high"]);
+    let a_lines = ["high", "321 (64.45%)"];
+    assert_eq!(requested(&first), a_lines);
     assert_eq!(
         kept_reads(&skin),
         [
@@ -433,7 +444,9 @@ fn a_texts_specialization_follows_the_charts_facts() {
     assert!(section.section().is_some());
     let (got, how) = attempt_with(&mut skin, attempt_facts(&section, false));
     assert!(matches!(how, Specialized::Reused), "the section");
-    assert!(Arc::ptr_eq(&ready(got), &first));
+    let got = ready(got);
+    assert!(Arc::ptr_eq(&got, &first));
+    assert_eq!(requested(&got), a_lines, "the section: the whole chart's");
     // A retry of A.
     let (got, how, _, _) = attempt(&mut skin, &a);
     assert!(matches!(how, Specialized::Reused), "the retry");
@@ -445,13 +458,15 @@ fn a_texts_specialization_follows_the_charts_facts() {
         .unwrap();
     let (got, how) = attempt_with(&mut skin, attempt_facts(&faster, false));
     assert!(matches!(how, Specialized::Reused), "the speed change");
-    assert!(Arc::ptr_eq(&ready(got), &first));
+    let got = ready(got);
+    assert!(Arc::ptr_eq(&got, &first));
+    assert_eq!(requested(&got), a_lines, "the speed change");
 
     // B: the same level, another total and count.
     let b = chart_text("#PLAYLEVEL 12\n#TOTAL 450\n", 1_914);
     let (got, how, _, _) = attempt(&mut skin, &b);
     assert!(matches!(how, Specialized::Ran), "B");
-    assert_eq!(requested(&ready(got)), ["high"]);
+    assert_eq!(requested(&ready(got)), ["high", "450 (79.27%)"]);
     assert_eq!(
         kept_reads(&skin),
         [
@@ -474,7 +489,7 @@ fn a_texts_specialization_follows_the_charts_facts() {
     // A again: C's recorded total does not hold for it.
     let (got, how, _, _) = attempt(&mut skin, &a);
     assert!(matches!(how, Specialized::Ran), "A again");
-    assert_eq!(requested(&ready(got)), ["high"]);
+    assert_eq!(requested(&ready(got)), a_lines);
 }
 
 /// A failure-presentation text over a total past what the number widget
