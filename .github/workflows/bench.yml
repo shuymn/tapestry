@@ -37,8 +37,8 @@ concurrency:
 jobs:
   compare:
     runs-on: ubuntu-24.04
-    # The two suites take about 15 minutes; confirming up to 8 regressions
-    # adds up to about 10 more.
+    # The two suites take up to about 19 minutes and the confirmation stops
+    # at 15, which leaves the summary time.
     timeout-minutes: 40
     # A failed step is reported, but does not fail the run.
     continue-on-error: true
@@ -133,15 +133,21 @@ jobs:
           fi
       # Measures the flagged benchmarks once more, merge base and then head,
       # with the binaries both builds left.
+      # Its own deadline (8 of the slowest benchmarks take about 6 minutes)
+      # leaves the summary time within the job's; a confirmation that runs out
+      # of it leaves its regressions unconfirmed.
       - name: Confirm the regressions
         if: steps.head.outputs.measured == 'true'
+        timeout-minutes: 15
+        continue-on-error: true
         env:
           BENCHES: ${{ steps.base.outputs.benches }}
         run: scripts/bench-confirm.sh "$RUNNER_TEMP/bench.log" "$NOISE_THRESHOLD" "$RUNNER_TEMP/base" "$RUNNER_TEMP/base-target" "$RUNNER_TEMP/confirmed.md"
-      # A step of its own, so a confirmation that fails or runs out of time
-      # still leaves the first comparison in the summary.
+      # A step of its own, run even after a failure or a cancellation, so a
+      # confirmation that fails or runs out of time still leaves the first
+      # comparison in the summary.
       - name: Summary
-        if: ${{ !cancelled() && steps.head.outputs.measured == 'true' }}
+        if: ${{ always() && steps.head.outputs.measured == 'true' }}
         run: |
           {
             echo '### Benchmarks: head against merge base'
@@ -213,11 +219,13 @@ jobs:
           fi
       - name: Confirm the regression
         if: steps.head.outputs.measured == 'true'
+        timeout-minutes: 10
+        continue-on-error: true
         env:
           BENCHES: -p render --bench skin
         run: scripts/bench-confirm.sh "$RUNNER_TEMP/bench.log" "$NOISE_THRESHOLD" "$RUNNER_TEMP/base" "$RUNNER_TEMP/base-target" "$RUNNER_TEMP/confirmed.md"
       - name: Summary
-        if: ${{ !cancelled() && steps.head.outputs.measured == 'true' }}
+        if: ${{ always() && steps.head.outputs.measured == 'true' }}
         run: |
           {
             echo '### Render benchmark: head against merge base'

@@ -34,26 +34,38 @@ percent=$(awk -v t="$threshold" 'BEGIN { printf "%g", t * 100 }')
 # shellcheck disable=SC2206 # split into arguments on purpose
 benches=($BENCHES)
 
-# Prints "<id><TAB><change>" for each benchmark a criterion log reports as
-# regressed. The id is criterion's stdout line before `time:` (on its own
-# line, or in front of `time:` when it is short); the stderr "Benchmarking
-# <id>: ..." lines are skipped, since they interleave out of order.
-regressed() {
-  awk '
+# Prints "<id><TAB><change>" for each benchmark of a criterion log: those it
+# reports as regressed (`parse <log> 0`) or every compared one (`parse <log>
+# 1`). The id is criterion's stdout line before `time:` (on its own line, or
+# in front of `time:` when it is short); the stderr "Benchmarking <id>: ..."
+# lines are skipped, since they interleave out of order. Ids with spaces are
+# not read (none of the repository's have one).
+parse() {
+  awk -v all="$2" '
     { sub(/\r$/, "") }
     /^Benchmarking / { next }
     /^[A-Za-z0-9_][A-Za-z0-9_.\/-]*$/ { id = $0; next }
     /^[A-Za-z0-9_][A-Za-z0-9_.\/-]* +time:/ { id = $1; next }
-    /^ +change:/ { change = $0; sub(/^ +change: +/, "", change); next }
-    /^ +Performance has regressed\.$/ && id != "" { print id "\t" change }
+    /^ +change:/ {
+      change = $0; sub(/^ +change: +/, "", change)
+      if (all && id != "") print id "\t" change
+      next
+    }
+    !all && /^ +Performance has regressed\.$/ && id != "" { print id "\t" change }
     # A verdict ends a benchmark: its id is not carried to the next one.
     /^ +(Performance has (regressed|improved)|No change in performance detected|Change within noise threshold)\.$/ { id = "" }
   ' "$1"
 }
+regressed() { parse "$1" 0; }
 
 # Prints "<id><TAB><change>" lines as a Markdown list.
 list() {
   printf '%s\n' "$1" | awk -F'\t' 'NF { print "- `" $1 "`: " $2 }'
+}
+
+# Prints "<id><TAB><first change><TAB><second change>" lines as a Markdown list.
+list_both() {
+  printf '%s\n' "$1" | awk -F'\t' 'NF { print "- `" $1 "`: first " $2 "; second " $3 }'
 }
 
 : > "$out"
@@ -94,8 +106,15 @@ if [ "$status" -eq 0 ]; then
   mise exec -- cargo bench --no-fail-fast "${benches[@]}" -- "$filter" --baseline-lenient confirm --noise-threshold "$threshold" 2>&1 | tee "$confirm_log" || status=$?
   set +o pipefail
 fi
-again=$(regressed "$confirm_log" | sort -u)
+again=$(regressed "$confirm_log" | cut -f1)
+second=$(parse "$confirm_log" 1)
 rm -f "$confirm_log"
+# Each measured benchmark with both changes. Every one is listed, confirmed or
+# not, so the summaries of pull requests that leave a benchmark's code
+# unchanged show how often the two passes in one job agree.
+paired=$(awk -F'\t' 'NR == FNR { s[$1] = $2; next } NF { print $1 "\t" $2 "\t" (($1 in s) ? s[$1] : "not measured") }' <(printf '%s\n' "$second") <(printf '%s\n' "$flagged"))
+confirmed=$(awk -F'\t' 'NR == FNR { c[$1] = 1; next } $1 in c' <(printf '%s\n' "$again") <(printf '%s\n' "$paired"))
+unconfirmed=$(awk -F'\t' 'NR == FNR { c[$1] = 1; next } NF && !($1 in c)' <(printf '%s\n' "$again") <(printf '%s\n' "$paired"))
 
 {
   if [ "$status" -ne 0 ]; then
@@ -103,21 +122,18 @@ rm -f "$confirm_log"
     echo
     list "$flagged"
   else
-    # The filter limited the second comparison to the flagged ids.
-    confirmed=$again
     if [ -n "$confirmed" ]; then
-      echo "**Confirmed regressions** (beyond the ${percent} % noise threshold in both measurements; change of the second):"
+      echo "**Confirmed regressions** (beyond the ${percent} % noise threshold in both measurements):"
       echo
-      list "$confirmed"
+      list_both "$confirmed"
     else
       echo "No confirmed regression."
     fi
-    unconfirmed=$(printf '%s\n' "$flagged" | awk -F'\t' 'NR == FNR { seen[$1] = 1; next } !($1 in seen)' <(printf '%s\n' "$confirmed" | cut -f1) -)
     if [ -n "$unconfirmed" ]; then
       echo
-      echo "Not repeated in the second measurement (change of the first):"
+      echo "Not repeated in the second measurement:"
       echo
-      list "$unconfirmed"
+      list_both "$unconfirmed"
     fi
   fi
   if [ -n "$rest" ]; then
@@ -131,6 +147,6 @@ rm -f "$confirm_log"
 if [ "$status" -ne 0 ]; then
   echo "::warning::The confirmation run failed (exit $status); the flagged regressions are unconfirmed."
 else
-  printf '%s\n' "$confirmed" | awk -F'\t' 'NF { print "::warning::Confirmed regression: " $1 " " $2 }'
+  printf '%s\n' "$confirmed" | awk -F'\t' 'NF { print "::warning::Confirmed regression: " $1 ": first " $2 "; second " $3 }'
 fi
 finish
