@@ -5,9 +5,9 @@
 //! recorded frame inputs (design.md "beatoraja Lua Skins", the reference
 //! executor; s7-06e-design.md §3.2-§3.3; s7-06e-1-r1-tables.md, B).
 //!
-//! Modelled kinds: system images, plain and grouped images, image sets
-//! and numbers. Every other kind is listed with every callable it holds,
-//! its nested parts' included.
+//! Modelled kinds: system images, plain and grouped images, image sets,
+//! numbers, and texts whose value is a function. Every other kind is
+//! listed with every callable it holds, its nested parts' included.
 
 use std::collections::BTreeMap;
 
@@ -44,6 +44,8 @@ enum PropRef {
 enum Kind {
     Image,
     Number,
+    /// A text whose value is a function: only that string is compared.
+    Text,
 }
 
 enum Cond {
@@ -72,6 +74,8 @@ struct Obj {
     entries: Vec<Validity>,
     conds: Vec<Cond>,
     timer: Option<(Function, Key)>,
+    /// A text's value, run after everything else.
+    text: Option<(Function, Key)>,
     options: Vec<i32>,
     validity: Validity,
 }
@@ -434,6 +438,7 @@ impl<'a> Reference<'a> {
         // (`JsonSkinObjectLoader.java:42-124`).
         let system = id.parse::<i32>().is_ok_and(|n| n < 0);
         let mut entries = Vec::new();
+        let mut text = None;
         let (kind, sel, validity) = if system {
             (Kind::Image, Sel::Zero, Validity::Valid)
         } else if let Some(img) = find(skin, "image", &id) {
@@ -480,6 +485,25 @@ impl<'a> Reference<'a> {
             let by_ref = Sel::Int(PropRef::Id(toint(&raw(&num, "ref")).unwrap_or(0)));
             let sel = self.value_sel(&raw(&num, "value"), index, by_ref);
             (Kind::Number, sel, Validity::Valid)
+        } else if let Some((def, f)) =
+            find(skin, "text", &id).and_then(|t| match raw(&t, "value") {
+                Value::Function(f) => Some((t, f)),
+                _ => None,
+            })
+        {
+            // A text is built only with a declared font
+            // (`JsonSkinObjectLoader.java:627-629`); its value is a string
+            // property over the function (`SkinLuaAccessor.java:689-700`).
+            let font = id_string(&raw(&def, "font")).and_then(|f| find(skin, "font", &f));
+            let k = self.key_at(&f, index, ("value", 0), "def");
+            self.observed.texts.insert(k);
+            text = Some((f, k));
+            let validity = if font.is_some() {
+                Validity::Valid
+            } else {
+                Validity::Invalid
+            };
+            (Kind::Text, Sel::Zero, validity)
         } else {
             let other = other_kind(skin, &id);
             let callables = self.all_callables(index, dest, other.as_ref().map(|(_, t)| t));
@@ -563,6 +587,7 @@ impl<'a> Reference<'a> {
             entries,
             conds,
             timer,
+            text,
             options,
             validity,
         };
@@ -774,6 +799,9 @@ fn obj_keys(o: &Obj) -> Vec<Key> {
     if let Some((_, k)) = &o.timer {
         out.push(*k);
     }
+    if let Some((_, k)) = &o.text {
+        out.push(*k);
+    }
     out
 }
 
@@ -837,14 +865,36 @@ fn prop(vm: &ReferenceVm, p: &PropRef, kind: &Kind) -> Result<i32, Cause> {
     match (v, kind) {
         (PropValue::Value(n), _) => Ok(n),
         (PropValue::Null, Kind::Number) => Ok(i32::MIN),
-        (PropValue::Null, Kind::Image) => Ok(0),
+        (PropValue::Null, Kind::Image | Kind::Text) => Ok(0),
         (PropValue::Unavailable, _) => Err(Cause::Unavailable),
         (PropValue::Unsupported, _) => Err(Cause::Inconclusive),
     }
 }
 
-/// `o`'s prepare path on the frame the VM holds.
+/// A text's string, interned; any other outcome as [`outcome`] gives it.
+fn text_outcome(c: &Called) -> Outcome {
+    match c {
+        Called::Value(Value::String(s)) => Outcome::Value(Raw::Text(intern(&s.to_string_lossy()))),
+        c => outcome(c),
+    }
+}
+
+/// `o`'s prepare path on the frame the VM holds, then a text's value:
+/// the source's text runs its value after its object's prepare, whatever
+/// that gave (`SkinText.java:100-109`).
 fn prepare(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut RefFrame) {
+    prepare_object(vm, items, o, out);
+    if let Some((f, k)) = &o.text {
+        let c = vm.call(f);
+        out.points.push(Point::Ran {
+            key: *k,
+            outcome: text_outcome(&c),
+        });
+    }
+}
+
+/// `o`'s object prepare path on the frame the VM holds.
+fn prepare_object(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut RefFrame) {
     // 1. The selector or value.
     let sel: Result<i32, Cause> = match &o.sel {
         Sel::Zero => Ok(0),

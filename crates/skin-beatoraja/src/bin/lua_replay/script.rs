@@ -6,7 +6,9 @@
 //! A script is a play state: its phases (loading, the practice page and
 //! rounds) share one chart and one state clock (s7-06e-2-design.md §3).
 
-use bms_model::{Chart, ChartBuilder, Lane, TimeUs};
+use bms_model::{
+    Chart, ChartBuilder, HeaderValue, JudgmentHeader, JudgmentHeaderName, Lane, TimeUs,
+};
 use eval::{
     Binding, ControlId, DeviceProfile, Evaluator, InputKind, InputStart, JudgeEvent,
     PhysicalInputEvent, Section, SourceId, SourceProfile, Tally,
@@ -27,6 +29,8 @@ pub struct Script {
     /// The chart's tempo changes after its initial [`BPM`]: each at a
     /// chart time (µs), in thousandths of a BPM.
     pub tempo: Vec<(i64, i64)>,
+    /// The chart's `#TOTAL`, when it declares one.
+    pub total: Option<i64>,
 }
 
 /// One phase of a play state.
@@ -144,6 +148,7 @@ impl Script {
             phases: vec![Phase::Round(round)],
             fix_hispeed: 0,
             tempo: Vec::new(),
+            total: None,
         }
     }
 
@@ -194,6 +199,7 @@ impl Script {
             phases,
             fix_hispeed: 0,
             tempo: Vec::new(),
+            total: None,
         }
     }
 
@@ -247,7 +253,7 @@ impl Script {
     }
 
     /// The chart: `notes` notes on key 1, at [`BPM`] and its tempo
-    /// changes.
+    /// changes, with its `#TOTAL`.
     pub fn chart(&self) -> Chart {
         let b = self
             .tempo
@@ -255,10 +261,19 @@ impl Script {
             .fold(ChartBuilder::new(BPM), |b, &(at, milli)| {
                 b.bpm(TimeUs(at), milli)
             });
-        (0..self.notes)
+        let mut chart = (0..self.notes)
             .fold(b, |b, i| b.tap(lane(), TimeUs(Self::note_time(i))))
             .build()
-            .expect("a self-made chart builds")
+            .expect("a self-made chart builds");
+        chart.meta.judgment_headers = self
+            .total
+            .map(|t| JudgmentHeader {
+                name: JudgmentHeaderName::Total,
+                value: HeaderValue::integer(t),
+            })
+            .into_iter()
+            .collect();
+        chart
     }
 
     /// The last note's time.

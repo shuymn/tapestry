@@ -16,6 +16,9 @@ pub struct Finding {
     /// The frame's round and stage, or its outside kind.
     pub place: String,
     pub what: String,
+    /// What the skin wrote that the finding names, printed only under
+    /// `--local`.
+    pub detail: Option<String>,
 }
 
 /// A root whose reference invocation could not complete.
@@ -60,6 +63,8 @@ pub struct Report {
     pub first_agreed: Vec<usize>,
     /// Lowered invocations compared and agreed, by frame kind and consumer.
     pub lowered: BTreeMap<(&'static str, &'static str), usize>,
+    /// Text strings compared and agreed, by frame kind.
+    pub texts: BTreeMap<&'static str, usize>,
     /// Compared invocations where tapestry's rule differs from the
     /// source's on purpose, by difference: counted, never a finding.
     pub intended: BTreeMap<&'static str, usize>,
@@ -121,6 +126,9 @@ impl Report {
         for ((kind, field), n) in &self.lowered {
             let _ = writeln!(o, "lowered {field} agreed on {kind} frames: {n}");
         }
+        for (kind, n) in &self.texts {
+            let _ = writeln!(o, "text agreed on {kind} frames: {n}");
+        }
         for (what, n) in &self.intended {
             let _ = writeln!(o, "intended difference {what}: {n}");
         }
@@ -171,9 +179,13 @@ impl Report {
         let _ = writeln!(o, "findings {}", self.findings.len());
         let shown = if all { usize::MAX } else { SHOWN };
         for f in self.findings.iter().take(shown) {
+            let detail = match &f.detail {
+                Some(d) if local => format!(": {d}"),
+                _ => String::new(),
+            };
             let _ = writeln!(
                 o,
-                "finding destination {} {} {} frame {} ({}): {}",
+                "finding destination {} {} {} frame {} ({}): {}{detail}",
                 f.key.dest,
                 consumer(&f.key, local),
                 site(&f.site),

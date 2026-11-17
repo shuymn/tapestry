@@ -156,6 +156,10 @@ pub(crate) struct Lowered {
     /// report.
     #[cfg(feature = "dev-tools")]
     pub(crate) constant: bool,
+    /// A text value's folded string before the widget cleans it, for the
+    /// replay's comparison.
+    #[cfg(feature = "dev-tools")]
+    pub(crate) literal: Option<String>,
 }
 
 /// A text's value as a callback folded it.
@@ -331,6 +335,8 @@ impl<'a> Lower<'a> {
                 known: None,
                 #[cfg(feature = "dev-tools")]
                 constant: false,
+                #[cfg(feature = "dev-tools")]
+                literal: None,
             },
             mapped: HashMap::new(),
             memo: HashMap::new(),
@@ -1503,6 +1509,8 @@ impl Cx<'_> {
                             known: Some(i32::from(b)),
                             #[cfg(feature = "dev-tools")]
                             constant: true,
+                            #[cfg(feature = "dev-tools")]
+                            literal: None,
                         }),
                         None,
                     ),
@@ -1734,6 +1742,7 @@ impl Cx<'_> {
                         src: l.src.clone(),
                         guards: l.guards.clone(),
                         constant: l.constant,
+                        literal: l.literal.clone(),
                     }),
                     program,
                 });
@@ -2022,6 +2031,11 @@ impl Cx<'_> {
                             known: None,
                             #[cfg(feature = "dev-tools")]
                             constant: matches!(fold, TextFold::Literal(_)),
+                            #[cfg(feature = "dev-tools")]
+                            literal: match &fold {
+                                TextFold::Literal(s) => Some(s.clone()),
+                                _ => None,
+                            },
                         }),
                         None,
                     ),

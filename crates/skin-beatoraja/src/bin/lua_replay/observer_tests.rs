@@ -189,6 +189,7 @@ fn a_later_loading_lifetime_s_observer_follows_its_own_origin() {
         ],
         fix_hispeed: 0,
         tempo: Vec::new(),
+        total: None,
     };
     let (r, _, inputs) = pieces(&twins(), script);
     assert!(r.passes(), "{}", r.text(0, true, true));

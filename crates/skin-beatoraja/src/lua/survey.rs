@@ -381,6 +381,8 @@ pub struct Lowered {
     pub guards: Vec<&'static str>,
     /// Whether it folded to a known value, which `src` writes.
     pub constant: bool,
+    /// A text value's folded string before the widget cleans it.
+    pub literal: Option<String>,
 }
 
 /// What an import's analysis recorded for the report.
@@ -1148,6 +1150,7 @@ mod tests {
                 src: src.to_owned(),
                 guards: guards.to_vec(),
                 constant,
+                literal: None,
             })
         };
         let got: Vec<_> = s

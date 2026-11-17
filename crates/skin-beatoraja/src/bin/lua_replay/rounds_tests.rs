@@ -23,7 +23,8 @@ fn pieces_with(body: &str, o: &Options) -> (Report, Observed, Vec<FrameInputs>) 
     let cancel = skin_beatoraja::Cancel::new();
     let h = skin_beatoraja::read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
     let config = skin_beatoraja::Config::named(h.header(), [], []).unwrap();
-    let (out, rec) = h.import_recorded(&config, &o.facts, &cancel);
+    let facts = o.import_facts();
+    let (out, rec) = h.import_recorded(&config, &facts, &cancel);
     let skin_beatoraja::LuaOutcome::Imported(i) = out.unwrap() else {
         panic!("pending");
     };
@@ -32,7 +33,7 @@ fn pieces_with(body: &str, o: &Options) -> (Report, Observed, Vec<FrameInputs>) 
     let mut obs = crate::reference::run_rounds(
         &inputs,
         || {
-            let (_, rec, vm) = h.import_reference(&config, &o.facts, &cancel);
+            let (_, rec, vm) = h.import_reference(&config, &facts, &cancel);
             let vm = vm.unwrap();
             Ok(crate::reference::Fresh {
                 vm,
@@ -230,6 +231,7 @@ fn a_page_write_does_not_leak_into_the_next_round() {
         ],
         fix_hispeed: 0,
         tempo: Vec::new(),
+        total: None,
     };
     let body = format!("{LATCH}{}", dst("-111", 0, "timer = latch, loop = -1,"));
     let mut o = options(script);
@@ -461,6 +463,7 @@ fn a_practice_script_s_rounds_run_on_the_loading_origin() {
         ],
         fix_hispeed: 0,
         tempo: Vec::new(),
+        total: None,
     };
     let body = dst("\"i\"", 0, "");
     let (r, _, inputs) = pieces(&body, script);

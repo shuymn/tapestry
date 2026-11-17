@@ -2,8 +2,12 @@
 //! reference executor; docs/stage3.md S7-06e), for the developer's PC:
 //! `lua_replay [--autoplay on|off] [--class veryhard|hard|normal|easy|veryeasy|none]
 //! [--level <n>] [--option <name> <item>]... [--file <name> <candidate>]...
-//! [--script full|mixed|rounds|closing] [--perturb <id>=<delta>]... [--isolation <file>] [--local]
-//! <root> <entry> [<root> <entry>]...`
+//! [--script full|mixed|rounds|closing] [--total <n>|unavailable] [--notes <n>|unavailable]
+//! [--perturb <id>=<delta>]... [--isolation <file>] [--local] <root> <entry> [<root> <entry>]...`
+//!
+//! The import's chart facts are the script chart's gauge total and note
+//! count, as an attempt's are; `--total` and `--notes` replace them, and
+//! `unavailable` leaves a play text's read of them unfolded.
 //!
 //! Each play skin is imported twice. The production import's frames are
 //! built over a self-made chart that the evaluator plays by the script,
@@ -37,6 +41,8 @@ mod rounds_tests;
 mod script;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod text_tests;
 
 use std::path::Path;
 
@@ -50,12 +56,17 @@ use crate::script::Script;
 const USAGE: &str = "usage: lua_replay [--autoplay on|off] \
      [--class veryhard|hard|normal|easy|veryeasy|none] [--level <n>] \
      [--option <name> <item>]... [--file <name> <candidate>]... [--script full|mixed|rounds|closing] \
-     [--perturb <id>=<delta>]... [--isolation <file>] [--local] [--all] <root> <entry> [<root> <entry>]...";
+     [--total <n>|unavailable] [--notes <n>|unavailable] [--perturb <id>=<delta>]... [--isolation <file>] [--local] [--all] <root> <entry> [<root> <entry>]...";
 
 /// What the flags ask for.
 #[derive(Debug)]
 pub struct Options {
+    /// The facts the flags give; the chart's are [`Self::import_facts`]'s.
     pub facts: ImportFacts,
+    /// `--total`'s gauge total, else the script chart's.
+    pub total: Option<Fact<i32>>,
+    /// `--notes`'s note count, else the script chart's.
+    pub notes: Option<Fact<i32>>,
     pub options: Vec<(String, String)>,
     pub files: Vec<(String, String)>,
     pub script: Script,
@@ -78,6 +89,8 @@ pub struct Options {
 fn parse(mut args: &[String]) -> Option<(Options, &[String])> {
     let mut o = Options {
         facts: ImportFacts::unavailable(ScreenKind::Play),
+        total: None,
+        notes: None,
         options: Vec::new(),
         files: Vec::new(),
         script: Script::full(),
@@ -110,6 +123,14 @@ fn parse(mut args: &[String]) -> Option<(Options, &[String])> {
             }
             [flag, v, rest @ ..] if flag == "--script" => {
                 o.script = Script::named(v)?;
+                args = rest;
+            }
+            [flag, v, rest @ ..] if flag == "--total" => {
+                o.total = Some(chart_fact(v)?);
+                args = rest;
+            }
+            [flag, v, rest @ ..] if flag == "--notes" => {
+                o.notes = Some(chart_fact(v)?);
                 args = rest;
             }
             [flag, v, rest @ ..] if flag == "--perturb" => {
@@ -152,6 +173,34 @@ fn parse(mut args: &[String]) -> Option<(Options, &[String])> {
     }
 }
 
+/// A chart fact's flag value: a number, or `unavailable`.
+fn chart_fact(v: &str) -> Option<Fact<i32>> {
+    if v == "unavailable" {
+        Some(Fact::Unavailable)
+    } else {
+        v.parse().ok().map(Fact::Known)
+    }
+}
+
+impl Options {
+    /// The import's facts: the flags', with the chart's gauge total and
+    /// note count the script chart's as the player's attempt makes them
+    /// (`game::song_total`, [`skin_model::chart_notes`]), unless a flag
+    /// gives them.
+    pub fn import_facts(&self) -> ImportFacts {
+        let chart = self.script.chart();
+        ImportFacts {
+            total: self
+                .total
+                .unwrap_or_else(|| Fact::Known(game::song_total(&chart))),
+            chart_notes: self
+                .notes
+                .unwrap_or_else(|| Fact::Known(skin_model::chart_notes(&chart))),
+            ..self.facts
+        }
+    }
+}
+
 /// Why a replay did not compare.
 #[derive(Debug)]
 pub enum Stop {
@@ -176,7 +225,8 @@ pub fn replay(root: &Path, entry: &str, o: &Options) -> Result<Report, Stop> {
         o.files.iter().map(|(a, b)| (a.as_str(), b.as_str())),
     )
     .map_err(|e| fail(format!("configuration: {e:?}")))?;
-    let (out, recorded) = h.import_recorded(&config, &o.facts, &cancel);
+    let facts = o.import_facts();
+    let (out, recorded) = h.import_recorded(&config, &facts, &cancel);
     let skin = match out.map_err(|e| fail(format!("import: {e}")))? {
         LuaOutcome::Imported(i) => i.imported.skin,
         LuaOutcome::Pending(p) => return Err(fail(format!("pending {:?}", p.pending))),
@@ -191,7 +241,7 @@ pub fn replay(root: &Path, entry: &str, o: &Options) -> Result<Report, Stop> {
     // Each round's reference: a fresh import, checked against production's
     // once.
     let fresh = || -> Result<reference::Fresh, String> {
-        let (out, rec, vm) = h.import_reference(&config, &o.facts, &cancel);
+        let (out, rec, vm) = h.import_reference(&config, &facts, &cancel);
         let structure = match out.map_err(|e| format!("reference import: {e}"))? {
             LuaOutcome::Imported(i) => i.imported.skin.program_structure(),
             LuaOutcome::Pending(p) => return Err(format!("pending {:?}", p.pending)),

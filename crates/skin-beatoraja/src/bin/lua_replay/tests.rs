@@ -55,6 +55,8 @@ pub(crate) fn options(script: Script) -> Options {
     facts.play_level = Fact::Known(12);
     Options {
         facts,
+        total: None,
+        notes: None,
         options: Vec::new(),
         files: Vec::new(),
         script,
@@ -1012,7 +1014,8 @@ pub fn pieces_over(
     let cancel = skin_beatoraja::Cancel::new();
     let h = skin_beatoraja::read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
     let config = skin_beatoraja::Config::named(h.header(), [], []).unwrap();
-    let (out, rec) = h.import_recorded(&config, &o.facts, &cancel);
+    let facts = o.import_facts();
+    let (out, rec) = h.import_recorded(&config, &facts, &cancel);
     let skin_beatoraja::LuaOutcome::Imported(i) = out.unwrap() else {
         panic!("pending");
     };
@@ -1021,7 +1024,7 @@ pub fn pieces_over(
     let mut obs = crate::reference::run_rounds(
         &inputs,
         || {
-            let (_, rec, vm) = h.import_reference(&config, &o.facts, &cancel);
+            let (_, rec, vm) = h.import_reference(&config, &facts, &cancel);
             let vm = vm.unwrap();
             Ok(crate::reference::Fresh {
                 vm,

@@ -418,7 +418,12 @@ pub fn record(
                     let section = script.section(starts);
                     let shown = if r.survival { survival } else { 0 };
                     let ctx = PlayContext {
-                        meta: ChartMetadata::UNKNOWN,
+                        // The chart's gauge total, which a play text's
+                        // fold and the reference's number 368 read.
+                        meta: ChartMetadata {
+                            total: Some(game::song_total(&chart)),
+                            ..ChartMetadata::UNKNOWN
+                        },
                         autoplay: false,
                         gauges: &gauges,
                         attempt: if r.section {
