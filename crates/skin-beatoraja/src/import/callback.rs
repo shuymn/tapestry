@@ -21,7 +21,10 @@
 //! attached, before anything is emitted, whether or not the result still
 //! uses it: its JSON
 //! mapping, that mapping's availability guard (joined into the element's
-//! visibility, so a value that can be unknown draws nothing while it is),
+//! visibility, so a value that can be unknown draws nothing while it is;
+//! on selection a number's instead selects its value, the property's
+//! absent value while it is false
+//! ([`super::selection::profile::absent_number`], as the runtime reads it)),
 //! its D4 deviation and its critical part (`number(101)` the EX score, as
 //! 101 in JSON); one with no mapping refuses the callback:
 //!
@@ -515,20 +518,46 @@ impl Lower<'_> {
                 Ok(Mapped::Gauge)
             }
             "number" => {
-                let IntProp::Shown(v) = property::int_in(self.kind, id.ok_or_else(unmapped)?)
-                else {
+                let n = id.ok_or_else(unmapped)?;
+                let IntProp::Shown(v) = property::int_in(self.kind, n) else {
                     return Err(unmapped());
                 };
-                if let Some(g) = v.availability() {
-                    self.guard(g);
-                }
                 self.out.deviates |= v.deviates();
                 self.out.sentinel |= v.pre_judgment();
                 self.out.part = self.out.part.or(v.part());
                 self.out.essential = self.out.essential.or(v.essential());
                 let (lo, hi) = v.range();
-                let src = Self::text(self.an, &["(", v.expr(), ")"])?;
-                Ok(Mapped::Int { src, lo, hi })
+                match v.availability() {
+                    // On selection a read while its bridge is unavailable
+                    // gives the property's absent value, the source's, as
+                    // the runtime's `main_state.number` gives it
+                    // ([`super::selection::profile::absent_number`]): the
+                    // guard selects the value, never the element's
+                    // visibility.
+                    Some(g) if self.kind == ScreenKind::Selection && g != "true" => {
+                        // Source: SF-020
+                        let absent = i64::from(
+                            super::selection::profile::absent_number(n).unwrap_or(i32::MIN),
+                        );
+                        let a = Self::int_text(self.an, absent)?;
+                        let src = Self::text(
+                            self.an,
+                            &["(if (", g, ") then (", v.expr(), ") else ", &a, ")"],
+                        )?;
+                        Ok(Mapped::Int {
+                            src,
+                            lo: lo.min(absent),
+                            hi: hi.max(absent),
+                        })
+                    }
+                    g => {
+                        if let Some(g) = g {
+                            self.guard(g);
+                        }
+                        let src = Self::text(self.an, &["(", v.expr(), ")"])?;
+                        Ok(Mapped::Int { src, lo, hi })
+                    }
+                }
             }
             // The best's rate over the attempt's targets
             // (`FloatPropertyFactory.java:297-302` at `0.8.9`, `B / 2n` in
