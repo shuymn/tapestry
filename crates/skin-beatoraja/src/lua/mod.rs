@@ -64,6 +64,7 @@ mod ledger;
 mod library;
 pub mod limits;
 mod loader;
+mod number_text;
 #[cfg(feature = "dev-tools")]
 pub mod replay;
 pub(crate) mod residual;

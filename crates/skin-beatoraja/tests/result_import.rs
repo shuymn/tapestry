@@ -1734,3 +1734,50 @@ fn a_result_text_keeps_its_chart_reads() {
     );
     assert_eq!(with.imported.report.notes, without.imported.report.notes);
 }
+
+/// Off play a text's `..` keeps its refusal before its operands, the
+/// chart's facts known or not: no literal is folded (the play twin
+/// folds, `lua_callbacks.rs`).
+#[test]
+fn a_result_concatenation_keeps_its_outcome() {
+    let pre = "skin.text = { { id = \"c\", font = \"f\", size = 10,\n\
+                 value = function() return \"x\" .. 50.5 end } }";
+    // The score and the clear the result needs, then the text.
+    let ex = lua_value("ex", 4, "value = function() return ms.number(71) end");
+    let dsts = lua_dst("ex", 100, 4, "")
+        + ", "
+        + &lua_dst("dot", 300, 8, "draw = function() return ms.option(91) end,")
+        + ", "
+        + &lua_dst("c", 400, 64, "");
+    let d = sheet();
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin(pre, &ex, "", &dsts).as_bytes(),
+    );
+    let view = ready(1_000, true, best(ResultNumber::Shown(-3)));
+    for facts in [
+        facts(Some(&view)),
+        ImportFacts {
+            total: Fact::Known(321),
+            chart_notes: Fact::Known(1_234),
+            ..facts(Some(&view))
+        },
+    ] {
+        let i = lua_result(d.path(), &facts).unwrap();
+        use skin_beatoraja::lua::{Disposition, Unsupported};
+        // The score's and the clear's callbacks lower; the text's alone
+        // does not.
+        let not_lowered: Vec<_> = i
+            .callbacks
+            .iter()
+            .filter(|d| **d != Disposition::Lowered)
+            .collect();
+        assert_eq!(
+            not_lowered,
+            [&Disposition::Replaced(Unsupported::Construct(".."))],
+            "{:?}",
+            i.callbacks
+        );
+    }
+}

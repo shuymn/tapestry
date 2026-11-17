@@ -480,3 +480,19 @@ fn a_lua_missing_bar_image_takes_the_json_rule() {
         other => panic!("{:?}", other.map(|i| i.imported.report)),
     }
 }
+
+/// Off play a text's `..` keeps its refusal before its operands: no
+/// literal is folded (the play twin folds, `lua_callbacks.rs`).
+#[test]
+fn a_selection_concatenation_keeps_its_outcome() {
+    let more = "table.insert(skin.text, { id = \"c\", font = \"f\", size = 10,\n\
+                  value = function() return \"x\" .. 50.5 end })\n\
+                table.insert(skin.destination, { id = \"c\", dst = { { x = 0, y = 40, w = 100, h = 10 } } })";
+    let i = import_lua(&lua_skin("", more)).unwrap();
+    assert_eq!(
+        i.callbacks,
+        [Disposition::Replaced(
+            skin_beatoraja::lua::Unsupported::Construct("..")
+        )]
+    );
+}

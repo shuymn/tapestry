@@ -109,6 +109,13 @@ pub const MAX_REWRITTEN_BYTES: u64 = 1 << 26;
 /// callbacks makes in all ([`super::residual`]), each charged before it
 /// is pushed; past it, fatal.
 pub const MAX_EXPANDED_NODES: u64 = 1 << 20;
+/// The most bytes of a string a play text's `..` builds at import
+/// ([`super::residual`], provisional): 4 × the text cap
+/// ([`MAX_TEXT_BYTES`](skin_model::MAX_TEXT_BYTES)), so a fold may pass
+/// the cut the widget makes at 256 bytes; a longer one is refused by the
+/// text's role, and the bytes of one within it are charged to
+/// [`MAX_ANALYSIS_WORK`] before they are built.
+pub const MAX_FOLDED_TEXT_BYTES: usize = 1_024;
 
 /// A kept VM's memory cap on a screen's runtime (docs/stage3.md S7-07,
 /// provisional): lowered from [`MAX_LUA_MEMORY`] when the import keeps

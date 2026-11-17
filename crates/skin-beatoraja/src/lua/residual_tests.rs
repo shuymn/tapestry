@@ -1104,6 +1104,42 @@ fn every_new_charge_is_made_before_its_work() {
     let src = "(cover.enabled)";
     witness("text", &entry, 2 * units(src), work, at(&entry));
     witness("compile", &entry, units(src), work, at(&entry));
+    // W18: a play text's 900-byte join, charged before it is built; the
+    // byte cap is the text's role, never this fatal charge.
+    let entry = skin(
+        &format!(
+            "skin.font = {{ {{ id = \"f\", path = \"f.ttf\" }} }}\n\
+             skin.text = {{ {{ id = \"t\", font = \"f\", size = 10, value = function() return \"{}\" .. \"{}\" end }} }}",
+            "a".repeat(600),
+            "b".repeat(300)
+        ),
+        "{ id = \"t\", dst = { { x = 0, y = 0, w = 64, h = 10 } } },",
+    );
+    let line = entry
+        .lines()
+        .position(|l| l.starts_with("skin.text"))
+        .unwrap();
+    witness(
+        "concat",
+        &entry,
+        900,
+        work,
+        u32::try_from(line + 1).unwrap(),
+    );
+    let past = Unsupported::Construct("a folded string past its cap");
+    let entry = skin(
+        &format!(
+            "skin.font = {{ {{ id = \"f\", path = \"f.ttf\" }} }}\n\
+             skin.text = {{ {{ id = \"t\", font = \"f\", size = 10, value = function() return \"{}\" .. \"b\" end }} }}",
+            "a".repeat(1_024)
+        ),
+        "{ id = \"t\", dst = { { x = 0, y = 0, w = 64, h = 10 } } },",
+    );
+    fail_next(None);
+    let r = run(&entry);
+    r.r.unwrap();
+    assert_eq!(r.callbacks, [Disposition::Replaced(past)]);
+    assert_eq!(site("concat"), (0, 0));
 }
 
 fn units(s: &str) -> u64 {
