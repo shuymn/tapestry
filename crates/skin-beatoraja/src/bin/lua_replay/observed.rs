@@ -120,6 +120,9 @@ pub struct Observed {
     pub sites: std::collections::BTreeMap<u32, (String, u32)>,
     /// Each callable's last line, where the VM knows it.
     pub ends: std::collections::BTreeMap<u32, u32>,
+    /// The callables the reference holds as observer functions
+    /// (`timer_util.timer_observe_boolean`'s), known by the function.
+    pub observers: std::collections::BTreeSet<u32>,
     /// Custom timers and events holding a function.
     pub custom: usize,
     /// The skin folder, which chunk names are relative to.

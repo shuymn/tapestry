@@ -5,8 +5,12 @@ name: Bench
 # (docs/setup.md "Benchmarks"). `compare` runs `eval`, `bms-parser`, `library`,
 # `skin-model` and `audio` on Linux, `compare-render` runs `render` on
 # Windows.
-# Neither is a required check and neither fails the run: shared runners are
-# noisy, so a reviewer reads the numbers.
+# Shared runners move a benchmark by more than criterion's confidence interval
+# shows (about 2 % on Linux, 5 % for `render`, on unchanged code), so a
+# regression counts only beyond a 3 % noise threshold and when
+# scripts/bench-confirm.sh measures it again and it repeats.
+# Neither is a required check and neither fails the run: a reviewer reads the
+# confirmed regressions.
 
 on:
   pull_request:
@@ -16,9 +20,15 @@ on:
       - Cargo.toml
       - Cargo.lock
       - .github/workflows/bench.yml
+      - scripts/bench-confirm.sh
   workflow_dispatch:
 
 permissions: {}
+
+env:
+  # A regression must exceed this fraction in both measurements
+  # (docs/setup.md "Benchmarks").
+  NOISE_THRESHOLD: "0.03"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -27,7 +37,9 @@ concurrency:
 jobs:
   compare:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # The two suites take up to about 19 minutes and the confirmation stops
+    # at 15, which leaves the summary time.
+    timeout-minutes: 40
     # A failed step is reported, but does not fail the run.
     continue-on-error: true
     permissions:
@@ -98,6 +110,7 @@ jobs:
           if [ -f "$RUNNER_TEMP/base/crates/audio/benches/loudness.rs" ]; then
             benches+=(-p audio --bench loudness)
           fi
+          echo "benches=${benches[*]}" >> "$GITHUB_OUTPUT"
           if CARGO_TARGET_DIR="$RUNNER_TEMP/base-target" mise exec -- cargo bench --manifest-path "$RUNNER_TEMP/base/Cargo.toml" "${benches[@]}" -- --save-baseline base; then
             echo "saved=true" >> "$GITHUB_OUTPUT"
           else
@@ -108,21 +121,43 @@ jobs:
       # executable from hiding the others; whatever was captured is printed
       # even after a failure.
       - name: Benchmark the head against it
+        id: head
         if: steps.base.outputs.saved == 'true'
         run: |
           set -o pipefail
           status=0
-          mise exec -- cargo bench --no-fail-fast -p eval -p bms-parser -p library -p skin-model -p audio --bench evaluate --bench load --bench scan --bench build --bench loudness -- --baseline-lenient base 2>&1 | tee "$RUNNER_TEMP/bench.log" || status=$?
+          mise exec -- cargo bench --no-fail-fast -p eval -p bms-parser -p library -p skin-model -p audio --bench evaluate --bench load --bench scan --bench build --bench loudness -- --baseline-lenient base --noise-threshold "$NOISE_THRESHOLD" 2>&1 | tee "$RUNNER_TEMP/bench.log" || status=$?
+          echo "measured=true" >> "$GITHUB_OUTPUT"
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::The benchmarks of the head failed (exit $status); the results are partial."
+          fi
+      # Measures the flagged benchmarks once more, merge base and then head,
+      # with the binaries both builds left.
+      # Its own deadline (8 of the slowest benchmarks take about 6 minutes)
+      # leaves the summary time within the job's; a confirmation that runs out
+      # of it leaves its regressions unconfirmed.
+      - name: Confirm the regressions
+        if: steps.head.outputs.measured == 'true'
+        timeout-minutes: 15
+        continue-on-error: true
+        env:
+          BENCHES: ${{ steps.base.outputs.benches }}
+        run: scripts/bench-confirm.sh "$RUNNER_TEMP/bench.log" "$NOISE_THRESHOLD" "$RUNNER_TEMP/base" "$RUNNER_TEMP/base-target" "$RUNNER_TEMP/confirmed.md"
+      # A step of its own, run even after a failure or a cancellation, so a
+      # confirmation that fails or runs out of time still leaves the first
+      # comparison in the summary.
+      - name: Summary
+        if: ${{ always() && steps.head.outputs.measured == 'true' }}
+        run: |
           {
             echo '### Benchmarks: head against merge base'
-            echo 'Shared runners fluctuate; read a change as real only when it is large and repeats.'
+            cat "$RUNNER_TEMP/confirmed.md" 2>/dev/null || echo '**The confirmation did not finish; the regressions below are unconfirmed.**'
+            echo
+            echo "First measurement, every change (\"regressed\" there is beyond the noise threshold of $NOISE_THRESHOLD but unconfirmed):"
             echo '```'
             grep -v '^Benchmarking ' "$RUNNER_TEMP/bench.log"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$status" -ne 0 ]; then
-            echo "::warning::The benchmarks of the head failed (exit $status); the results above are partial."
-          fi
 
   compare-render:
     runs-on: windows-2025
@@ -172,18 +207,32 @@ jobs:
             echo "::warning::The render benchmark of the merge base failed."
           fi
       - name: Benchmark the head against it
+        id: head
         if: steps.base.outputs.saved == 'true'
         run: |
           set -o pipefail
           status=0
-          mise exec -- cargo bench --no-fail-fast -p render --bench skin -- --baseline-lenient base 2>&1 | tee "$RUNNER_TEMP/bench.log" || status=$?
+          mise exec -- cargo bench --no-fail-fast -p render --bench skin -- --baseline-lenient base --noise-threshold "$NOISE_THRESHOLD" 2>&1 | tee "$RUNNER_TEMP/bench.log" || status=$?
+          echo "measured=true" >> "$GITHUB_OUTPUT"
+          if [ "$status" -ne 0 ]; then
+            echo "::warning::The render benchmark of the head failed (exit $status); the results are partial."
+          fi
+      - name: Confirm the regression
+        if: steps.head.outputs.measured == 'true'
+        timeout-minutes: 10
+        continue-on-error: true
+        env:
+          BENCHES: -p render --bench skin
+        run: scripts/bench-confirm.sh "$RUNNER_TEMP/bench.log" "$NOISE_THRESHOLD" "$RUNNER_TEMP/base" "$RUNNER_TEMP/base-target" "$RUNNER_TEMP/confirmed.md"
+      - name: Summary
+        if: ${{ always() && steps.head.outputs.measured == 'true' }}
+        run: |
           {
             echo '### Render benchmark: head against merge base'
-            echo 'Shared runners fluctuate; read a change as real only when it is large and repeats.'
+            cat "$RUNNER_TEMP/confirmed.md" 2>/dev/null || echo '**The confirmation did not finish; a regression below is unconfirmed.**'
+            echo
+            echo "First measurement (\"regressed\" there is beyond the noise threshold of $NOISE_THRESHOLD but unconfirmed):"
             echo '```'
             grep -v '^Benchmarking ' "$RUNNER_TEMP/bench.log"
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
-          if [ "$status" -ne 0 ]; then
-            echo "::warning::The render benchmark of the head failed (exit $status); the results above are partial."
-          fi
