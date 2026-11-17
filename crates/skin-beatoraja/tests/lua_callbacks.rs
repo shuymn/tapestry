@@ -2629,20 +2629,34 @@ fn a_total_past_its_range_follows_the_texts_role() {
         assert_eq!(requested(&i), [] as [&str; 0], "{total}");
         assert_eq!(i.imported.report.usage.texts, 0, "{total}");
         assert_eq!(i.facts.reads, [chart_read(FactId::ChartTotal, total)]);
-        match import_facts(
-            &facts_folder("", &[OVER_TOTAL], "timer = 3,"),
+        // The refusal keeps the read it was made from.
+        let d = facts_folder("", &[OVER_TOTAL], "timer = 3,");
+        let cancel = Cancel::new();
+        let h = read_lua_header(d.path(), "s.luaskin", &cancel).unwrap();
+        let refused = match h.import_reading(
+            &Config::defaults(h.header()),
             &known_chart(total, 1_000),
+            &cancel,
         ) {
-            Err(ImportError::Lua {
+            Err(refused) => refused,
+            Ok(other) => panic!("{total}: {other:?}"),
+        };
+        match &refused.0 {
+            ImportError::Lua {
                 at: Some(_),
                 why:
                     LuaWhy::Critical {
                         field: "value",
                         why: w,
                     },
-            }) => assert_eq!(w, why, "{total}"),
+            } => assert_eq!(*w, why, "{total}"),
             other => panic!("{total}: {other:?}"),
         }
+        assert_eq!(
+            refused.1.reads,
+            [chart_read(FactId::ChartTotal, total)],
+            "{total}"
+        );
     }
     for (total, want) in [(2_147_483_646, "high"), (0, "low")] {
         for timer in ["", "timer = 3,"] {
