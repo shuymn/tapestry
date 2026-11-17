@@ -301,3 +301,64 @@ impl BgaArray {
         true
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use skin_model::bga::CellPlace;
+
+    use crate::{AdapterChoice, BgaStep, Renderer, Target};
+
+    /// Each boundary's writes are submitted at that boundary (design.md
+    /// "Memory Budget": the queue's staging is released as the GPU
+    /// completes it, not held until the batch's last write): four cells of
+    /// one budget each are written one a boundary, and every one of those
+    /// boundaries submits once, the last included.
+    #[test]
+    fn each_boundary_s_writes_are_submitted_at_that_boundary() {
+        let mut r = Renderer::new(
+            Target::Offscreen {
+                width: 64,
+                height: 64,
+            },
+            AdapterChoice::Warp,
+        )
+        .unwrap();
+        let key = r.begin_bga(1).unwrap();
+        let cells = (0..4_u32)
+            .map(|i| {
+                let place = CellPlace {
+                    page: 0,
+                    origin: [i % 2 * 1_024, i / 2 * 1_024],
+                    content: [1_022, 1_022],
+                };
+                (place, vec![255; 1_024 * 1_024 * 4])
+            })
+            .collect();
+        r.stage_bga_cells(key, cells).unwrap();
+        for boundary in 1..=3 {
+            assert_eq!(r.bga_boundary(), BgaStep::Pending);
+            assert_eq!(
+                r.bga_submits.get(),
+                boundary,
+                "submitted at boundary {boundary}"
+            );
+        }
+        let mut step = r.bga_boundary();
+        assert_eq!(
+            r.bga_submits.get(),
+            4,
+            "the last write submitted at its boundary"
+        );
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while step == BgaStep::Pending && std::time::Instant::now() < end {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            step = r.bga_boundary();
+        }
+        assert_eq!(step, BgaStep::Done(Ok(())));
+        assert_eq!(
+            r.bga_submits.get(),
+            4,
+            "a boundary with nothing written submits nothing"
+        );
+    }
+}

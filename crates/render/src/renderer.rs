@@ -1280,6 +1280,10 @@ pub struct Renderer {
     /// opened.
     #[cfg(test)]
     pub(crate) decision_scope_pairs: std::cell::Cell<usize>,
+    /// Unit tests: the submissions of BGA writes made at frame boundaries
+    /// ([`submit_bga_step`](Self::submit_bga_step)).
+    #[cfg(test)]
+    pub(crate) bga_submits: std::cell::Cell<usize>,
     /// Tests and development builds: the charges stated for bundles
     /// ([`state_charge`](Self::state_charge)).
     #[cfg(any(test, feature = "dev-tools"))]
@@ -1447,6 +1451,8 @@ impl Renderer {
             decision_in_scope: None,
             #[cfg(test)]
             decision_scope_pairs: std::cell::Cell::new(0),
+            #[cfg(test)]
+            bga_submits: std::cell::Cell::new(0),
             #[cfg(any(test, feature = "dev-tools"))]
             stated: Vec::new(),
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
@@ -3402,14 +3408,7 @@ impl Renderer {
             if refused.is_some() {
                 return end(self, Err(crate::BgaFault::Refused));
             }
-            // Each boundary's writes are submitted at once, so the queue's
-            // staging of them is released as the GPU completes them, not
-            // held until the batch's last write.
-            if all {
-                up.done = Some(crate::decision_labels::watch(gpu));
-            } else {
-                gpu.queue().submit([]);
-            }
+            self.submit_bga_step(all);
         }
         if self.gpu.device().poll(wgpu::PollType::Poll).is_err() {
             return end(self, Err(crate::BgaFault::Refused));
@@ -3425,6 +3424,19 @@ impl Renderer {
             return end(self, Ok(()));
         }
         crate::BgaStep::Pending
+    }
+
+    /// Submits a boundary's writes of the BGA batch at that boundary, so
+    /// the queue's staging of them is released as the GPU completes them,
+    /// not held until the batch's last write; after its `last` write,
+    /// registers the batch's one flag-only completion.
+    fn submit_bga_step(&mut self, last: bool) {
+        #[cfg(test)]
+        self.bga_submits.set(self.bga_submits.get() + 1);
+        self.gpu.queue().submit([]);
+        if last && let Some(up) = self.bga_upload.as_mut() {
+            up.done = Some(crate::decision_labels::watch(&self.gpu));
+        }
     }
 
     /// Drops the batch of BGA cells in hand, if any, unwritten rows and
