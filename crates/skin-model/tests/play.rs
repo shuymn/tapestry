@@ -516,6 +516,8 @@ fn a_practice_round() {
         assert_eq!(h.start(timer::READY), None, "round {round}");
         h.frame(8_000, &[]);
         assert_eq!(h.field(field::NOTES), 3);
+        // The whole chart's five taps and two long notes, not the mine.
+        assert_eq!(h.field(field::CHART_NOTES), 7);
         assert_eq!(h.start(timer::READY), Some(8_000 * MS));
         assert_eq!(h.start(timer::PLAY), None);
         h.frame(
@@ -540,8 +542,94 @@ fn a_practice_round() {
                 ev(19_000, judged(2, 0, Judgment::Perfect, Some(0), None, 3)),
             ],
         );
-        assert_eq!(h.start(timer::FULL_COMBO), Some(19_000 * MS));
+        // The round's combo reached its 3 targets, not the chart's 7.
+        assert_eq!(h.start(timer::FULL_COMBO), None);
     }
+}
+
+/// Judges `practice_chart`'s notes in time order from its `from`th (the
+/// taps at 5, 10, 15, 20 and 25 s and the long notes ending at 19 and
+/// 21 s), giving the combos of `combos` (a 0 is a POOR), one frame per
+/// moment, each long note held from its head unless it is a POOR; 48 is
+/// checked off before each frame.
+fn judge_in_order(h: &mut Harness, from: usize, combos: &[u32]) {
+    // (end ms, lane, note in its lane, head ms of a long note)
+    let notes: [(i64, u8, usize, Option<i64>); 7] = [
+        (5_000, 1, 0, None),
+        (10_000, 1, 1, None),
+        (15_000, 1, 2, None),
+        (19_000, 2, 0, Some(16_000)),
+        (20_000, 1, 3, None),
+        (21_000, 3, 0, Some(18_000)),
+        (25_000, 1, 4, None),
+    ];
+    let mut events = Vec::new();
+    for (&(ms, l, note, head), &combo) in notes.iter().skip(from).zip(combos) {
+        let (judgment, deviation) = if combo == 0 {
+            (Judgment::Poor, None)
+        } else {
+            (Judgment::Perfect, Some(0))
+        };
+        if let Some(head) = head.filter(|_| combo > 0) {
+            events.push(ev(head, play_support::ln_held(l, note, judgment)));
+            events.push(ev(ms, play_support::hold_ended(l, note)));
+        }
+        events.push(ev(ms, judged(l, note, judgment, deviation, None, combo)));
+    }
+    events.sort_by_key(|e| e.time);
+    for moment in events.chunk_by(|a, b| a.time == b.time) {
+        let us = moment[0].time.0;
+        h.frame_us(us - MS, &[]);
+        assert_eq!(h.start(timer::FULL_COMBO), None, "before {us} us");
+        h.frame_us(us, moment);
+    }
+}
+
+/// The full-combo timer (48) starts when the combo reaches the whole
+/// chart's note count: a practice round over fewer notes, a mid-chart
+/// start after the first note included, never starts it, and a round
+/// over every note starts it as a full attempt does.
+// Source: SF-019
+#[test]
+fn the_full_combo_needs_the_whole_charts_count() {
+    let chart = practice_chart();
+    // A partial round: its 3 targets judged without a break.
+    let s = section(10_000, 20_000, 2_000);
+    let mut h = Harness::empty(&chart, &in_section(&s));
+    h.frame(8_000, &[]);
+    assert_eq!(h.field(field::NOTES), 3);
+    judge_in_order(&mut h, 1, &[1, 2, 3]);
+    for ms in [19_500, 20_000, 21_000] {
+        h.frame(ms, &[]);
+        assert_eq!(h.start(timer::FULL_COMBO), None, "partial at {ms} ms");
+    }
+    // A round over every note, without a break: lit at the 7th judgment.
+    let s = section(4_000, 30_000, 2_000);
+    let mut h = Harness::empty(&chart, &in_section(&s));
+    h.frame(2_000, &[]);
+    assert_eq!(h.field(field::NOTES), 7);
+    judge_in_order(&mut h, 0, &[1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(h.start(timer::FULL_COMBO), Some(25_000 * MS));
+    // The same round with a POOR at the 4th note: off to the end.
+    let mut h = Harness::empty(&chart, &in_section(&s));
+    h.frame(2_000, &[]);
+    judge_in_order(&mut h, 0, &[1, 2, 3, 0, 1, 2, 3]);
+    h.frame(30_000, &[]);
+    assert_eq!(h.start(timer::FULL_COMBO), None);
+    // A mid-chart start after the first note, to past the chart's end:
+    // its 6 targets judged without a break.
+    let s = section(7_000, 30_000, 2_000);
+    let mut h = Harness::empty(&chart, &in_section(&s));
+    h.frame(5_000, &[]);
+    assert_eq!(h.field(field::NOTES), 6);
+    judge_in_order(&mut h, 1, &[1, 2, 3, 4, 5, 6]);
+    h.frame(30_000, &[]);
+    assert_eq!(h.start(timer::FULL_COMBO), None);
+    // Control: a full attempt without a break lights it at the 7th.
+    let mut h = Harness::empty(&chart, &full(0));
+    h.frame(0, &[]);
+    judge_in_order(&mut h, 0, &[1, 2, 3, 4, 5, 6, 7]);
+    assert_eq!(h.start(timer::FULL_COMBO), Some(25_000 * MS));
 }
 
 #[test]
@@ -1000,6 +1088,7 @@ fn a_sections_point_is_over_its_targets() {
     let mut h = Harness::empty(&chart, &in_section(&s));
     assert_eq!(point_after(&mut h, [2, 0, 0], 2), 200_000);
     assert_eq!(h.field(field::NOTES), 2);
+    assert_eq!(h.field(field::CHART_NOTES), 4);
 }
 
 #[test]
@@ -1103,6 +1192,7 @@ fn the_attempt_targets_are_prepared_per_attempt() {
     h.frame(0, &[]);
     // Five taps and two long notes; the mine is no target.
     assert_eq!(rates(&h), (10_000, 1_428));
+    assert_eq!(h.field(field::CHART_NOTES), 7);
     // A round from 10 s to 20 s: the taps at 10 s and 15 s and the long
     // note from 16 s; the tap at its end and the long note spanning its
     // start are not targets.
@@ -1110,6 +1200,7 @@ fn the_attempt_targets_are_prepared_per_attempt() {
     h.play = h.skin.prepare(&chart, &in_section(&s)).unwrap();
     h.frame(0, &[]);
     assert_eq!(h.field(field::NOTES), 3);
+    assert_eq!(h.field(field::CHART_NOTES), 7);
     assert_eq!(rates(&h), (10_000, 3_333));
 }
 

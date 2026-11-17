@@ -254,6 +254,9 @@ const FIELDS: [LoadingField; field::COUNT] = {
         // The chart's 1× length, 153: the chosen chart's library length,
         // from the frame.
         Chosen, // chart.length_ms
+        // The whole chart's note count, 154: the parsed chart's, as
+        // `notes`.
+        Unavailable, // chart.notes
     ]
 };
 
@@ -826,6 +829,7 @@ mod tests {
             "best.rate_ppm",
             "best.reached",
             "target.reached",
+            "chart.notes",
         ] {
             assert_eq!(class(name), Some(LoadingField::Unavailable), "{name}");
         }
