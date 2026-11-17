@@ -392,3 +392,36 @@ source = [
 ]
 sites = ["crates/skin-model/src/play/reducer.rs"]
 tests = ["crates/skin-model/tests/play.rs::the_full_combo_needs_the_whole_charts_count"]
+
+[[entry]]
+id = "SF-020"
+summary = "A selection number read while its value is absent gives the property's own absent value"
+class = "compatibility"
+reason = """
+Lua selection skins are written against what `main_state.number` gives for \
+a chart with no record, no song or no folder under the cursor: a \
+placeholder drawn while the plays read below 0 (`Integer.MIN_VALUE`), or a \
+figure that reads 0 there (the largest EX score, the best score, the EX \
+score to the next rank). Each guarded selection number reads its \
+property's value from one table, in the runtime and in a lowered \
+expression alike (design.md "beatoraja Lua Skins", the expression \
+acceptance proof)."""
+source = [
+    "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:126-201 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:289-395 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:473-511 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:562-700 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:1486-1507 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/ScoreDataProperty.java:64-109 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/ScoreDataProperty.java:155-156 @beatoraja-0.8.9",
+]
+sites = [
+    "crates/skin-beatoraja/src/import/callback.rs",
+    "crates/skin-beatoraja/src/import/selection/profile.rs",
+    "crates/skin-beatoraja/src/lua/runtime.rs",
+]
+tests = [
+    "crates/skin-beatoraja/src/import/selection/profile.rs::every_unavailable_number_has_its_absent_value",
+    "crates/skin-beatoraja/tests/lua_runtime.rs::a_lowered_selection_read_agrees_with_the_runtime_in_every_record_state",
+    "crates/skin-beatoraja/tests/lua_runtime.rs::absent_scores_read_zero_where_the_source_does",
+]

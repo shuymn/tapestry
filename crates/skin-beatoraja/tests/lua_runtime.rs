@@ -2033,3 +2033,424 @@ fn a_result_runtime_reads_the_bga_setting() {
         assert_eq!(out, want, "{at}: {:?}", runtime(&mut i).status());
     }
 }
+
+/// A Lua selection skin over the selection fixtures' sheet and font whose
+/// `dot` image is drawn once per entry of `draws`, by that `draw` callback,
+/// the `k`th at [`draw_at`]`(k)`.
+fn draws_skin(prelude: &str, draws: &[String]) -> String {
+    let dsts: String = draws
+        .iter()
+        .enumerate()
+        .map(|(k, d)| {
+            let (x, y) = draw_at(k);
+            format!("{{ id = \"dot\", draw = {d}, dst = {{ {{ x = {x}, y = {y}, w = 8, h = 8 }} }} }},\n")
+        })
+        .collect();
+    entry(prelude, &[], "nil").replace(
+        "return skin\n",
+        &format!(
+            "for _, d in ipairs({{ {dsts} }}) do skin.destination[#skin.destination + 1] = d end\n\
+             return skin\n"
+        ),
+    )
+}
+
+/// Where [`draws_skin`] places its `k`th draw: rows of 80 from
+/// `(1000, 0)`, 10 apart across and 20 down, clear of the song list and
+/// of each other however the build orients `y`.
+fn draw_at(k: usize) -> (u16, u16) {
+    let (row, col) = (
+        u16::try_from(k / 80).unwrap(),
+        u16::try_from(k % 80).unwrap(),
+    );
+    (1000 + 10 * col, 20 * row)
+}
+
+/// Which of `n` draws of [`draws_skin`] the frame at 0 drew.
+fn drawn_of(s: &mut common::selection::Sel, n: usize) -> Vec<bool> {
+    let rects: Vec<[f32; 4]> = s.drawn(0).into_iter().map(|(_, r)| r).collect();
+    (0..n)
+        .map(|k| {
+            let (x, y) = draw_at(k);
+            let (x, y) = (f32::from(x), f32::from(y));
+            rects.iter().any(|r| {
+                (r[0] - x).abs() < 0.5
+                    && ((r[1] - y).abs() < 0.5 || (r[1] - (1072.0 - y)).abs() < 0.5)
+            })
+        })
+        .collect()
+}
+
+/// The selection settings in Classic, or in Floating with green 300.
+#[cfg(feature = "dev-tools")]
+fn speed_settings(floating: bool) -> skin_model::SelectionSettings {
+    skin_model::SelectionSettings {
+        display_offset_ms: 0,
+        system_volume: skin_model::VolumeReading::of_gain(1.0),
+        key_volume: skin_model::VolumeReading::of_gain(1.0),
+        background_volume: skin_model::VolumeReading::of_gain(1.0),
+        speed: if floating {
+            skin_model::SpeedView::Floating {
+                reference: skin_model::SpeedReference::Start,
+                green: 300,
+            }
+        } else {
+            skin_model::SpeedView::Classic
+        },
+        order: skin_model::SelectionOrder::Title,
+        gauge: None,
+        covers_on: [false; 3],
+        play_to_end: false,
+        assignment: None,
+    }
+}
+
+/// The selected chart's record and facts, the cursor's row and the speed
+/// setting in each state a selection read can see, by name: no record,
+/// played with no best, a best of no plays and 0 EX, a best played, then
+/// "everything", a played best with its play's counts, the chart's
+/// summary and song information and Floating, where every unavailable
+/// number but a folder's charts (300) is available; a folder row, where
+/// only that one is; and no row, where none is.
+fn record_states() -> Vec<(&'static str, skin_model::SelectionView, bool)> {
+    use common::selection::{best, chart, folder_row, summary, view};
+    let chart_with = |score| {
+        view(
+            vec![skin_model::RowView {
+                score,
+                ..chart("a")
+            }],
+            Some(0),
+            Some(200),
+            Some(summary(90, 10, 125, 150, 180)),
+        )
+    };
+    let mut everything = chart_with(best(150, 4, 7));
+    let c = everything.selected.as_mut().unwrap();
+    c.labels.level_value = 12;
+    c.clears = 3;
+    let per = |perfect, great, good| rules::PerJudgment {
+        perfect,
+        great,
+        good,
+        bad: 2,
+        poor: 2,
+    };
+    c.best = Some(skin_model::SelectedBest {
+        max_combo: 40,
+        play: skin_model::BestPlay {
+            tally: eval::Tally {
+                counts: per(60, 30, 6),
+                ex_score: 150,
+                bp: 4,
+                max_combo: 40,
+                early: per(30, 15, 3),
+                late: per(30, 15, 3),
+                ..eval::Tally::default()
+            },
+            notes: 100,
+        },
+    });
+    c.info = Some(skin_model::SelectedInfo {
+        key_taps: 80,
+        key_longs: 5,
+        scratch_taps: 10,
+        scratch_longs: 5,
+        density_peak: 12,
+        density_end: 7,
+        density_end_hundredths: 25,
+        density_average: 6,
+        density_average_hundredths: 50,
+        total: 300,
+        main_bpm: Some(150),
+    });
+    vec![
+        (
+            "no record",
+            chart_with(skin_model::RowScore::Unplayed),
+            false,
+        ),
+        (
+            "played, no best",
+            chart_with(skin_model::RowScore::NoBest { plays: 3 }),
+            false,
+        ),
+        ("a best of no plays", chart_with(best(0, 0, 0)), false),
+        ("a best played", chart_with(best(150, 4, 7)), false),
+        ("everything", everything, true),
+        (
+            "a folder row",
+            view(vec![folder_row("f", 2)], Some(0), None, None),
+            false,
+        ),
+        ("no row", view(Vec::new(), None, None, None), false),
+    ]
+}
+
+/// The source's value of each selection number that can be unavailable,
+/// with no score data, no song data or no folder under the cursor
+/// (`IntegerPropertyFactory.java` at `0.8.9`, `IPF`; `ScoreDataProperty.java`,
+/// `SDP`): the oracle the absent reads are held to, apart from the
+/// profile's table.
+#[cfg(feature = "dev-tools")]
+const SOURCE_ABSENT: [(i32, i32); 57] = {
+    const MIN: i32 = i32::MIN;
+    [
+        // The current EX score (`IPF:606-616`); the best score, never set
+        // on selection (`IPF:618-625`, `SDP:15`, `:155-156`).
+        (71, MIN),
+        (101, MIN),
+        (171, MIN),
+        (150, 0),
+        // The best's BP (`IPF:644-657`).
+        (76, MIN),
+        (177, MIN),
+        // Plays, clears, fails (`IPF:133-153`); the best max combo
+        // (`IPF:627-642`).
+        (77, MIN),
+        (78, MIN),
+        (79, MIN),
+        (75, MIN),
+        (105, MIN),
+        (174, MIN),
+        // The score's counts and their percent (`IPF:500-511`).
+        (80, MIN),
+        (81, MIN),
+        (82, MIN),
+        (83, MIN),
+        (84, MIN),
+        (85, MIN),
+        (86, MIN),
+        (87, MIN),
+        (88, MIN),
+        (89, MIN),
+        // The largest EX score (`IPF:127-129`).
+        (72, 0),
+        // The chart's notes, BPMs, length and level (`IPF:154-166`,
+        // `:473-478`, `:562-584`).
+        (74, MIN),
+        (106, MIN),
+        (90, MIN),
+        (91, MIN),
+        (1163, MIN),
+        (1164, MIN),
+        (45, MIN),
+        (46, MIN),
+        (47, MIN),
+        (48, MIN),
+        (49, MIN),
+        (96, MIN),
+        // The score rates (`IPF:176-181`, `:187-188`, `:200-201`); the EX
+        // score to the next rank of no score (`SDP:64-67`, `:94`,
+        // `:100-109`).
+        (102, MIN),
+        (115, MIN),
+        (155, MIN),
+        (103, MIN),
+        (116, MIN),
+        (156, MIN),
+        (154, 0),
+        // A folder's charts (`IPF:1486-1507`).
+        (300, MIN),
+        // The song information (`IPF:167-173`, `:319-395`).
+        (350, MIN),
+        (351, MIN),
+        (352, MIN),
+        (353, MIN),
+        (360, MIN),
+        (361, MIN),
+        (362, MIN),
+        (363, MIN),
+        (364, MIN),
+        (365, MIN),
+        (368, MIN),
+        (92, MIN),
+        // The duration and its green number (`IPF:292-318`).
+        (312, MIN),
+        (313, MIN),
+    ]
+};
+
+/// Every selection number that can be unavailable, each read three ways,
+/// `< 0`, `>= 0` and against its source absent value, lowered and on the
+/// runtime alike (the runtime twin of each draw writes a captured local,
+/// which no expression represents), through the production path in every
+/// state of [`record_states`]: the two agree, exactly one of the signs
+/// holds, and the absent read is exact: with no row every one reads its
+/// source value; on a folder row all but the folder's charts do; with
+/// everything only the folder's charts do.
+// Source: SF-020
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_lowered_selection_read_agrees_with_the_runtime_in_every_record_state() {
+    untimed();
+    let is_absent = |a: i32| {
+        if a == i32::MIN {
+            "< -2147483647".to_owned()
+        } else {
+            format!("== {a}")
+        }
+    };
+    let cmps = |a: i32| ["< 0".to_owned(), ">= 0".to_owned(), is_absent(a)];
+    let mut draws = Vec::new();
+    for (id, a) in SOURCE_ABSENT {
+        for c in cmps(a) {
+            draws.push(format!("function() return ms.number({id}) {c} end"));
+            draws.push(format!("function() w = 0 return ms.number({id}) {c} end"));
+        }
+    }
+    let (_d, mut i) = import_in(&draws_skin("local w = 0", &draws));
+    let count = |want: Disposition| i.callbacks.iter().filter(|d| **d == want).count();
+    assert_eq!(
+        count(Disposition::Lowered),
+        draws.len() / 2,
+        "{:?}",
+        i.callbacks
+    );
+    assert_eq!(
+        count(Disposition::Runtime),
+        draws.len() / 2,
+        "{:?}",
+        i.callbacks
+    );
+    let mut rt = i.runtime.take().expect("a runtime");
+    let mut s = common::selection::Sel::new(i.imported.skin);
+    for (state, v, floating) in record_states() {
+        s.view(&v);
+        s.skin
+            .update_selection_settings(&mut s.sel, &speed_settings(floating))
+            .unwrap();
+        s.skin
+            .prepare_selection_frame(&mut s.sel, bms_model::TimeUs(0), &s.timers, &s.app)
+            .unwrap();
+        let (fields, timers) = s.sel.runtime_parts();
+        rt.frame(fields, timers);
+        let drawn = drawn_of(&mut s, draws.len());
+        for (k, (id, a)) in SOURCE_ABSENT.into_iter().enumerate() {
+            let read = |c: usize| {
+                let (lowered, runtime) = (drawn[6 * k + 2 * c], drawn[6 * k + 2 * c + 1]);
+                assert_eq!(
+                    lowered,
+                    runtime,
+                    "{state}: number({id}) {}, lowered against runtime",
+                    cmps(a)[c]
+                );
+                lowered
+            };
+            let (below, not_below, absent) = (read(0), read(1), read(2));
+            assert_ne!(below, not_below, "{state}: number({id})");
+            let want = match state {
+                "no row" => Some(true),
+                "a folder row" => Some(id != 300),
+                "everything" => Some(id == 300),
+                _ => None,
+            };
+            if let Some(want) = want {
+                assert_eq!(absent, want, "{state}: number({id}) {}", is_absent(a));
+            }
+        }
+    }
+}
+
+/// A selection skin shaped like the placeholders a skin draws for a chart
+/// with no record: one image drawn while the plays (77) or the best EX
+/// (150) is below 0, and one while either is above 0. Both lower; with no
+/// record the plays read the source's `Integer.MIN_VALUE` and only the
+/// placeholder draws; once played (with or without a best) only the
+/// other; with a best of no plays and 0 EX neither.
+#[test]
+fn a_no_record_placeholder_draws_for_a_chart_with_no_record() {
+    let read = "local plays = main_state.number(77) local score = main_state.number(150)";
+    let draws = [
+        format!("function() {read} return plays < 0 or score < 0 end"),
+        format!("function() {read} return plays > 0 or score > 0 end"),
+    ];
+    let (_d, i) = import_in(&draws_skin(
+        "local main_state = require(\"main_state\")",
+        &draws,
+    ));
+    assert_eq!(
+        i.callbacks
+            .iter()
+            .filter(|d| **d == Disposition::Lowered)
+            .count(),
+        2,
+        "{:?}",
+        i.callbacks
+    );
+    assert!(i.runtime.is_none());
+    let mut s = common::selection::Sel::new(i.imported.skin);
+    let states = record_states();
+    for (state, want) in [
+        ("no record", [true, false]),
+        ("played, no best", [false, true]),
+        ("a best of no plays", [false, false]),
+        ("a best played", [false, true]),
+    ] {
+        let (_, v, _) = states.iter().find(|(s, _, _)| *s == state).unwrap();
+        s.view(v);
+        assert_eq!(drawn_of(&mut s, 2), want, "{state}");
+    }
+}
+
+/// The largest EX score (72) and the EX score to the next rank (154) read
+/// the source's 0 where they are unavailable (`IntegerPropertyFactory.java:
+/// 127-129`, `ScoreDataProperty.java:94-109` at `0.8.9`), where the plays
+/// (77) read `Integer.MIN_VALUE`: lowered, on a folder row and with no
+/// row 72's and 154's `== 0` draw and their `< 0` do not, and their values
+/// draw a 0 each where 77's draws no digit.
+// Source: SF-020
+#[test]
+fn absent_scores_read_zero_where_the_source_does() {
+    let draws: Vec<String> = [72, 154]
+        .iter()
+        .flat_map(|id| {
+            [
+                format!("function() return ms.number({id}) == 0 end"),
+                format!("function() return ms.number({id}) < 0 end"),
+            ]
+        })
+        .collect();
+    let values = [
+        "function() return ms.number(72) end",
+        "function() return ms.number(154) end",
+        "function() return ms.number(77) end",
+    ];
+    let text = draws_skin("", &draws).replace(
+        "skin.value = {  }",
+        &format!(
+            "skin.value = {{ {} }}",
+            values
+                .iter()
+                .enumerate()
+                .map(|(k, v)| format!(
+                    "{{ id = \"v{k}\", src = \"s\", x = 0, y = 32, w = 40, h = 8, divx = 10, digit = 4, value = {v} }},"
+                ))
+                .collect::<String>()
+        ),
+    );
+    let text = text.replace(
+        "for _, d in ipairs(",
+        "for k = 0, 2 do skin.destination[#skin.destination + 1] = { id = \"v\" .. k, \
+         dst = { { x = 40 * k, y = 100, w = 4, h = 8 } } } end\nfor _, d in ipairs(",
+    );
+    let (_d, i) = import_in(&text);
+    assert!(i.runtime.is_none(), "{:?}", i.callbacks);
+    assert_eq!(
+        i.callbacks
+            .iter()
+            .filter(|d| **d == Disposition::Lowered)
+            .count(),
+        7,
+        "{:?}",
+        i.callbacks
+    );
+    let mut s = common::selection::Sel::new(i.imported.skin);
+    let states = record_states();
+    for state in ["a folder row", "no row"] {
+        let (_, v, _) = states.iter().find(|(s, _, _)| *s == state).unwrap();
+        s.view(v);
+        assert_eq!(drawn_of(&mut s, 4), [true, false, true, false], "{state}");
+        assert_eq!(s.digits(0), "00", "{state}");
+    }
+}
