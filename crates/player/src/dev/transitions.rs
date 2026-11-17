@@ -177,6 +177,9 @@ pub struct Book {
     raw: Vec<Raw>,
     cap: usize,
     lost: u64,
+    /// Whether the sink read a frame back, kept even when that mark is
+    /// lost past the cap: the run is instrumented either way.
+    read_back: bool,
 }
 
 impl Book {
@@ -209,6 +212,7 @@ impl Transitions {
             raw: Vec::with_capacity(cap),
             cap,
             lost: 0,
+            read_back: false,
         })))
     }
 
@@ -217,7 +221,15 @@ impl Transitions {
     }
 
     fn push(&self, r: Raw) {
-        self.lock().push(r);
+        let mut b = self.lock();
+        if let Raw::Mark(Mark {
+            kind: MarkKind::ReadBack,
+            ..
+        }) = r
+        {
+            b.read_back = true;
+        }
+        b.push(r);
     }
 
     /// The record derived from the raw records kept so far (tests).
@@ -254,16 +266,7 @@ impl Transitions {
                 return Err("the transition record is held by the render thread".to_owned());
             }
         };
-        let instrumented = b.raw.iter().any(|r| {
-            matches!(
-                r,
-                Raw::Mark(Mark {
-                    kind: MarkKind::ReadBack,
-                    ..
-                })
-            )
-        });
-        let lines = format_records(&derive(&b.raw), instrumented, b.lost);
+        let lines = format_records(&derive(&b.raw), b.read_back, b.lost);
         let failure = (b.lost > 0).then(|| {
             format!(
                 "{} transition records were lost past the cap of {}",
@@ -881,6 +884,25 @@ mod tests {
         let within = Transitions::with_capacity(4);
         Recorder::new(within.clone()).mark(read_back(0, 1));
         assert_eq!(within.lines().unwrap().1, None);
+    }
+
+    /// A read-back whose mark is lost past the cap still makes the run
+    /// instrumented: a book of one record keeps the present and loses the
+    /// read-back, and every line, the summary included, is tagged.
+    #[test]
+    fn a_read_back_lost_past_the_cap_still_tags_the_run() {
+        let book = Transitions::with_capacity(1);
+        let mut r = Recorder::new(book.clone());
+        r.frame(stage(State::Ready, 90, Drew::Plain), TimeUs(1_000), None);
+        r.mark(read_back(1_100, 1_200));
+        assert_eq!(book.lost(), 1);
+        let (lines, failure) = book.lines().unwrap();
+        assert!(failure.is_some());
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines.iter().all(|l| l.ends_with(", instrumented")),
+            "{lines:?}"
+        );
     }
 
     /// The book's lines, formatted after the run: each record kind in
