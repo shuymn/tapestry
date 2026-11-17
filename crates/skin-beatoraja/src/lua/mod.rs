@@ -1070,6 +1070,27 @@ fn admit(def: &mut Definition, slot: ScreenKind) -> Result<(), ImportError> {
     callback::admit(&def.arena)
 }
 
+/// The chart facts the residual's hook read during `def`'s import, and the
+/// one it met pending, if any ([`callback::Analysis::pending`]).
+fn analysis_pending(def: &Definition) -> (Vec<FactRead>, Option<FactId>) {
+    def.arena
+        .lua
+        .as_deref()
+        .and_then(|l| l.analysis.as_deref())
+        .map_or((Vec::new(), None), |an| {
+            (an.fact_reads.borrow().clone(), an.pending.get())
+        })
+}
+
+/// `more` appended to `reads`, each fact once.
+fn add_reads(reads: &mut Vec<FactRead>, more: Vec<FactRead>) {
+    for read in more {
+        if !reads.iter().any(|r| r.fact == read.fact) {
+            reads.push(read);
+        }
+    }
+}
+
 /// Carries what the common reader did with `def`'s includes into the
 /// candidate: the bytes and loads it charged, which the next pass starts
 /// from, and the snapshots it read and added, its files among the
@@ -1304,7 +1325,24 @@ impl LuaHeader {
         admit(&mut def, facts.scene)?;
         let mut t = LAST_TIMINGS.with(std::cell::Cell::get);
         let start = std::time::Instant::now();
-        std::hint::black_box(import(&mut def, &self.header, config, facts.scene)?);
+        let imported = import(&mut def, &self.header, config, facts.scene);
+        // A pending chart fact is read before the error is: the residual
+        // carries it as a cancellation.
+        let (hook_reads, pending) = analysis_pending(&def);
+        if let (Err(_), Some(pending)) = (&imported, pending) {
+            let mut reads = reads;
+            add_reads(&mut reads, hook_reads);
+            return Ok(LuaTimed::Pending(LuaPending {
+                facts: FactDeps {
+                    scene: facts.scene,
+                    reads,
+                },
+                pending,
+                dependencies: store.dependencies,
+                usage: counts,
+            }));
+        }
+        std::hint::black_box(imported?);
         t.import = start.elapsed();
         Ok(LuaTimed::Imported(t))
     }
@@ -1342,7 +1380,7 @@ impl LuaHeader {
         def: Result<Definition, Stop>,
         mut counts: Counts,
         mut store: Store,
-        reads: Vec<FactRead>,
+        mut reads: Vec<FactRead>,
         config: &Config,
     ) -> Outcome<Imported, Stop> {
         let slot = self.header.kind;
@@ -1354,6 +1392,10 @@ impl LuaHeader {
             let mut r =
                 admit(&mut def, slot).and_then(|()| import(&mut def, &self.header, config, slot));
             store = common_reads(&mut def, &mut counts);
+            // A pending chart fact is read before the result is mapped: the
+            // residual carries it as a cancellation.
+            let (hook_reads, pending) = analysis_pending(&def);
+            add_reads(&mut reads, hook_reads);
             if let Some(an) = def.arena.lua.as_deref().and_then(|l| l.analysis.as_deref()) {
                 counts.expanded = an.expanded.get();
                 counts.analysis_work = an.work.get();
@@ -1393,7 +1435,10 @@ impl LuaHeader {
                     None => {}
                 }
             }
-            r.map_err(Stop::Fault)
+            match pending {
+                Some(fact) => Err(Stop::Pending(fact)),
+                None => r.map_err(Stop::Fault),
+            }
         });
         Outcome {
             result,

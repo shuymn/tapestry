@@ -273,6 +273,17 @@ pub(crate) struct Analysis {
     pub(crate) runtime: RefCell<Vec<super::runtime::Site>>,
     /// The runtime sites' file names, one each, by file.
     site_files: RefCell<HashMap<u16, std::sync::Arc<str>>>,
+    /// The configured pass's import facts: a play text's value reads the
+    /// chart's facts from them ([`super::residual`]'s hook).
+    pub(crate) facts: Option<super::facts::ImportFacts>,
+    /// The chart facts the hook read, each once, in first-read order.
+    pub(crate) fact_reads: RefCell<Vec<super::facts::FactRead>>,
+    /// The first chart fact the hook met pending. Invariant: it is set only
+    /// together with the residual's `Stop::Fatal(LuaWhy::Cancelled)`, which
+    /// carries the pending stop out of the import, so a `Cancelled` while
+    /// it is unset is a real cancellation; the import's callers read it
+    /// before they map the result.
+    pub(crate) pending: Cell<Option<super::facts::FactId>>,
 }
 
 /// The witness that [`admit`] walked every root of an [`Analysis`]:
@@ -344,11 +355,23 @@ impl Analysis {
     }
 
     /// An empty analysis that sees `cancel`, set before any capture so
-    /// that every charge polls it.
-    pub(crate) fn with_cancel(cancel: super::Cancel) -> Self {
+    /// that every charge polls it, over the pass's import facts `facts`.
+    pub(crate) fn with_cancel(
+        cancel: super::Cancel,
+        facts: Option<super::facts::ImportFacts>,
+    ) -> Self {
         Self {
             cancel: Some(cancel),
+            facts,
             ..Self::default()
+        }
+    }
+
+    /// Records the chart fact read `read` unless its fact was read before.
+    pub(crate) fn read_fact(&self, read: super::facts::FactRead) {
+        let mut reads = self.fact_reads.borrow_mut();
+        if !reads.iter().any(|r| r.fact == read.fact) {
+            reads.push(read);
         }
     }
 

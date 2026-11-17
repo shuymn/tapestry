@@ -2701,7 +2701,11 @@ pub fn skin_lua(data: &[u8]) -> Result<(Header, Result<LuaOutcome, ImportError>)
 /// showing [`result_view`] for 255; the play level unavailable, pending,
 /// or `a / 16` (twice) by `a / 4` modulo 4; the chart's judgment class
 /// unavailable, pending, or known by `r`'s low two bits, the rest choosing
-/// one of the five classes or none.
+/// one of the five classes or none; the chart's gauge total and note
+/// count, which a play text's value reads, by `r`'s top three bits: both
+/// unavailable for 0 and 1, both pending for 2 and 3, known for 4 to 6
+/// (the total `a / 16` times 37, the count `r`'s low five bits times 41)
+/// and for 7 with the total `i32::MAX`, past what the number widget shows.
 #[must_use]
 pub fn lua_facts(a: u8, r: u8) -> ImportFacts {
     let scene = if a == u8::MAX {
@@ -2739,12 +2743,21 @@ pub fn lua_facts(a: u8, r: u8) -> ImportFacts {
     } else {
         Fact::Unavailable
     };
+    let notes = i32::from(r & 0x1f) * 41;
+    let (total, chart_notes) = match r >> 5 {
+        0 | 1 => (Fact::Unavailable, Fact::Unavailable),
+        2 | 3 => (Fact::Pending, Fact::Pending),
+        4..=6 => (Fact::Known(i32::from(a >> 4) * 37), Fact::Known(notes)),
+        _ => (Fact::Known(i32::MAX), Fact::Known(notes)),
+    };
     ImportFacts {
         scene,
         autoplay,
         judge_class,
         play_level,
         result,
+        total,
+        chart_notes,
     }
 }
 

@@ -1691,3 +1691,46 @@ fn the_target_reads_while_a_lua_skin_loads() {
         "an unavailable view refuses the comparison"
     );
 }
+
+/// A result skin's text reading the chart's gauge total and note count
+/// keeps the record it has with those facts unavailable: the chart facts
+/// are a play text's alone, and none is recorded.
+#[test]
+fn a_result_text_keeps_its_chart_reads() {
+    let ex = lua_value("ex", 4, "value = function() return ms.number(71) end");
+    let pre = "skin.text = { { id = \"t\", font = \"f\", size = 10, value = function()\n\
+                 return ms.number(368) >= 300 and ms.number(74) > 1000 and \"high\" or \"low\" end } }";
+    let dsts = lua_dst("ex", 100, 4, "")
+        + ", "
+        + &lua_dst("dot", 300, 8, "draw = function() return ms.option(91) end,")
+        + ", "
+        + &lua_dst("t", 400, 64, "");
+    let d = sheet();
+    common::write(
+        d.path(),
+        "s.luaskin",
+        lua_skin(pre, &ex, "", &dsts).as_bytes(),
+    );
+    let view = ready(1_000, true, best(ResultNumber::Shown(-3)));
+    let without = lua_result(d.path(), &facts(Some(&view))).unwrap();
+    let with = lua_result(
+        d.path(),
+        &ImportFacts {
+            total: Fact::Known(321),
+            chart_notes: Fact::Known(1_234),
+            ..facts(Some(&view))
+        },
+    )
+    .unwrap();
+    assert_eq!(with.callbacks, without.callbacks);
+    assert_eq!(with.facts, without.facts);
+    assert!(
+        with.facts
+            .reads
+            .iter()
+            .all(|r| !matches!(r.fact, FactId::ChartTotal | FactId::ChartNotes)),
+        "{:?}",
+        with.facts
+    );
+    assert_eq!(with.imported.report.notes, without.imported.report.notes);
+}

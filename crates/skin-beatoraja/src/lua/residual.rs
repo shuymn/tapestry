@@ -76,7 +76,14 @@
 //! [`Node::Select`]'s arms; a text's `value` as it is, for the lowering to
 //! read its shape. For a text alone, the scene's constants fold (texts 1001
 //! to 1003, options 290 and 1008, recording no read) and a string read
-//! compares with `""`.
+//! compares with `""`. For a play text alone, the chart's facts fold
+//! through the analysis's import facts: number 368, the gauge total, and
+//! 74 and 106, the whole chart's note count, each read recorded once
+//! ([`Analysis::fact_reads`]). A total past
+//! [`READOUT_MAX`](skin_model::READOUT_MAX), what the number widget
+//! shows, is recorded and then refused, so the text follows its role; a
+//! pending fact stops the import, carried by the cancellation's fatal stop
+//! with [`Analysis::pending`] set; an unavailable one stays a read.
 //!
 //! The residual is a DAG in one arena a lowering, dropped with it. Every
 //! node is charged against [`MAX_EXPANDED_NODES`] before it is pushed
@@ -468,6 +475,8 @@ struct Eval<'a> {
     stack: Vec<u32>,
     /// The consumer is a text's value ([`Conv::Text`]).
     text: bool,
+    /// The consumer is a play text's value: the chart's facts fold.
+    play_text: bool,
     /// The call being evaluated is an operand of `==` or `~=` whose other
     /// operand is a literal 0: the one place a `float_number` read may be
     /// ([`Self::call`]). Taken by the next call.
@@ -499,6 +508,11 @@ pub(crate) fn evaluate(
         depth: 0,
         stack: Vec::new(),
         text: conv == Conv::Text,
+        play_text: conv == Conv::Text
+            && adm
+                .analysis()
+                .facts
+                .is_some_and(|f| f.scene == skin_model::ScreenKind::Play),
         zero_operand: false,
         cells,
         ret: None,
@@ -1280,6 +1294,11 @@ impl<'a> Eval<'a> {
                 {
                     return self.known(known);
                 }
+                if self.play_text
+                    && let Some(v) = self.chart_fact(api, arg)?
+                {
+                    return self.known(Val::Int(v.into()));
+                }
                 let r = self.push(Node::Read { api, arg })?;
                 charge(self.an, "read", 1)?;
                 did("read");
@@ -1288,6 +1307,48 @@ impl<'a> Eval<'a> {
             }
             Some(Val::Lib(l)) => self.library(f, l, args),
             _ => refuse(Unsupported::Callee),
+        }
+    }
+
+    /// A play text's read of a chart fact, `api` called with `arg`: the
+    /// known value, recorded first; a total past what the number widget
+    /// shows refused once recorded; a pending one stops the import with
+    /// [`Analysis::pending`] set; `None` for an unavailable one or any
+    /// other read.
+    fn chart_fact(&self, api: u16, arg: Option<i64>) -> R<Option<i32>> {
+        use super::facts::{Fact, FactId, FactRead, FactValue};
+        if HOST_APIS.get(usize::from(api)) != Some(&("main_state", "number")) {
+            return Ok(None);
+        }
+        let Some(fact) = arg
+            .and_then(|n| i32::try_from(n).ok())
+            .and_then(super::facts::chart_fact)
+        else {
+            return Ok(None);
+        };
+        let Some(facts) = self.an.facts else {
+            return Ok(None);
+        };
+        match facts.chart(fact) {
+            Fact::Known(v) => {
+                self.an.read_fact(FactRead {
+                    fact,
+                    value: FactValue::Int(v),
+                });
+                // Every total past the range stops here, so the recorded
+                // value, saturated past `i32`, is exact for reuse.
+                if fact == FactId::ChartTotal && !(0..=skin_model::READOUT_MAX).contains(&v) {
+                    return construct("a chart total past its range");
+                }
+                Ok(Some(v))
+            }
+            Fact::Pending => {
+                if self.an.pending.get().is_none() {
+                    self.an.pending.set(Some(fact));
+                }
+                Err(Stop::Fatal(LuaWhy::Cancelled))
+            }
+            Fact::Unavailable => Ok(None),
         }
     }
 

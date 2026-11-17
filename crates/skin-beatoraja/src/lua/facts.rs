@@ -32,7 +32,12 @@
 //! - texts 1001 to 1003, the difficulty table's name, level and both
 //!   (`StringPropertyFactory.java:259-261`): the constant `""`, unrecorded,
 //!   as there are no difficulty tables and outside a table the source's
-//!   strings are empty (`PlayerResource.java:128-129`, `:531-535`).
+//!   strings are empty (`PlayerResource.java:128-129`, `:531-535`);
+//! - on [`ScreenKind::Play`], read only by a text's value (the residual's
+//!   hook, [`chart_fact`]; the configured pass and every other consumer
+//!   read the live property): number 368, the chart's gauge total, the
+//!   snapshot's [`ImportFacts::total`]; and numbers 74 and 106, the whole
+//!   chart's note count, the snapshot's [`ImportFacts::chart_notes`].
 //!
 //! An import records each fact it read once, with the derived value it
 //! read, in first-read order ([`FactDeps`]);
@@ -43,7 +48,9 @@
 //! snapshot; its result names its scene and the facts it read; a base
 //! import that reaches a [`Fact::Pending`] fact ends with a pending
 //! result naming it ([`super::LuaPending`]); a [`Fact::Unavailable`] one
-//! refuses. Building the snapshots from a session, the base import and
+//! refuses, but a chart fact read by a play text's value, which stays the
+//! read it is without a snapshot (the report's and the replay's default).
+//! Building the snapshots from a session, the base import and
 //! the attempt's specialization, the pending installation, generations,
 //! invalidation and refusing a stale completion belong to the caller
 //! (docs/stage3.md S10-07).
@@ -202,6 +209,14 @@ pub struct ImportFacts {
     /// ([`ResultFields::of`] the view); read on [`ScreenKind::Result`]
     /// only, through the result profile.
     pub result: Fact<ResultFields>,
+    /// The chart's gauge total, as the song information gives it
+    /// (`game::song_total`, past `i32` saturated); read by a play text's
+    /// value only.
+    pub total: Fact<i32>,
+    /// The whole chart's note count (its taps and long notes, whatever the
+    /// attempt's section), as the play's `chart.notes` gives it; read by a
+    /// play text's value only.
+    pub chart_notes: Fact<i32>,
 }
 
 impl ImportFacts {
@@ -214,6 +229,8 @@ impl ImportFacts {
             judge_class: Fact::Unavailable,
             play_level: Fact::Unavailable,
             result: Fact::Unavailable,
+            total: Fact::Unavailable,
+            chart_notes: Fact::Unavailable,
         }
     }
 
@@ -222,10 +239,10 @@ impl ImportFacts {
     /// the result's pending on [`ScreenKind::Result`].
     #[must_use]
     pub fn base(scene: ScreenKind, autoplay: Fact<bool>) -> Self {
-        let (judge_class, play_level) = if scene == ScreenKind::Selection {
-            (Fact::Unavailable, Fact::Unavailable)
+        let (judge_class, play_level, chart) = if scene == ScreenKind::Selection {
+            (Fact::Unavailable, Fact::Unavailable, Fact::Unavailable)
         } else {
-            (Fact::Pending, Fact::Pending)
+            (Fact::Pending, Fact::Pending, Fact::Pending)
         };
         let result = if scene == ScreenKind::Result {
             Fact::Pending
@@ -238,6 +255,8 @@ impl ImportFacts {
             judge_class,
             play_level,
             result,
+            total: chart,
+            chart_notes: chart,
         }
     }
 
@@ -259,6 +278,8 @@ impl ImportFacts {
                 Fact::Pending => Fact::Pending,
                 Fact::Unavailable => Fact::Unavailable,
             },
+            FactId::ChartTotal => Self::int(self.total),
+            FactId::ChartNotes => Self::int(self.chart_notes),
             FactId::ResultNumber(n) => self.read_result(|fields| {
                 let Some(Class::Bridge(v)) = profile::number(n) else {
                     return Read::Unavailable;
@@ -266,6 +287,25 @@ impl ImportFacts {
                 profile::read_number(&v, fields)
             }),
             FactId::ResultOption(n) => self.read_result(|fields| profile::read_option(n, fields)),
+        }
+    }
+
+    /// A chart fact as an int.
+    fn int(fact: Fact<i32>) -> Fact<FactValue> {
+        match fact {
+            Fact::Known(v) => Fact::Known(FactValue::Int(v)),
+            Fact::Pending => Fact::Pending,
+            Fact::Unavailable => Fact::Unavailable,
+        }
+    }
+
+    /// The chart fact `fact` as this snapshot gives it, for the residual's
+    /// hook.
+    pub(crate) fn chart(&self, fact: FactId) -> Fact<i32> {
+        match fact {
+            FactId::ChartTotal => self.total,
+            FactId::ChartNotes => self.chart_notes,
+            _ => Fact::Unavailable,
         }
     }
 
@@ -292,6 +332,10 @@ pub enum FactId {
     JudgeClass,
     /// Number 96.
     PlayLevel,
+    /// Number 368, read by a play text's value.
+    ChartTotal,
+    /// Numbers 74 and 106, read by a play text's value.
+    ChartNotes,
     /// A result number by its id, read through the result profile on
     /// [`ScreenKind::Result`].
     ResultNumber(i32),
@@ -309,7 +353,11 @@ impl FactId {
     #[must_use]
     pub fn reads_view(self) -> bool {
         match self {
-            Self::Autoplay | Self::JudgeClass | Self::PlayLevel => false,
+            Self::Autoplay
+            | Self::JudgeClass
+            | Self::PlayLevel
+            | Self::ChartTotal
+            | Self::ChartNotes => false,
             Self::ResultNumber(n) => match profile::number(n) {
                 Some(Class::Bridge(v)) => !(chart_only(v.expr) && chart_only(v.guard)),
                 _ => true,
@@ -351,7 +399,9 @@ pub enum FactValue {
     /// [`FactId::PlayLevel`]: the level.
     Level(i32),
     /// [`FactId::ResultNumber`]: the value, `i32::MIN` when hidden;
-    /// [`FactId::ResultOption`]: 1 when it holds, else 0.
+    /// [`FactId::ResultOption`]: 1 when it holds, else 0;
+    /// [`FactId::ChartTotal`]: the gauge total; [`FactId::ChartNotes`]: the
+    /// note count.
     Int(i32),
 }
 
@@ -526,6 +576,23 @@ pub(crate) fn scene_option(n: i32) -> Option<bool> {
     .then_some(n < 0)
 }
 
+/// The number ids of the chart's gauge total and its whole note count.
+const CHART_TOTAL: i32 = 368;
+const CHART_NOTES: [i32; 2] = [74, 106];
+
+/// The chart fact number `n` reads in a play text's value: 368 the gauge
+/// total, 74 and 106 the whole chart's note count. Only the residual's
+/// hook asks: the configured pass's `number` reads them as live state.
+pub(crate) fn chart_fact(n: i32) -> Option<FactId> {
+    if n == CHART_TOTAL {
+        Some(FactId::ChartTotal)
+    } else if CHART_NOTES.contains(&n) {
+        Some(FactId::ChartNotes)
+    } else {
+        None
+    }
+}
+
 /// Whether text `n` is the empty string on every scene: the table texts.
 pub(crate) fn scene_text(n: i32) -> bool {
     TABLE_TEXTS.contains(&n)
@@ -545,7 +612,9 @@ pub(crate) fn text(_facts: &ImportFacts, n: i32) -> TextRead {
 mod tests {
     use skin_model::ScreenKind;
 
-    use super::{Fact, ImportFacts, OptionRead, option};
+    use super::{
+        Fact, FactDeps, FactId, FactRead, FactValue, ImportFacts, OptionRead, chart_fact, option,
+    };
 
     #[test]
     fn the_scene_s_constants_hold_off_play() {
@@ -575,6 +644,80 @@ mod tests {
                     "{scene:?} {n}"
                 );
             }
+        }
+    }
+
+    /// The chart's gauge total and note count: pending in a play snapshot's
+    /// base, unavailable on selection's and in an unavailable snapshot; read
+    /// by numbers 368, 74 and 106 only.
+    #[test]
+    fn the_chart_facts_are_pending_only_in_a_charted_base() {
+        for scene in [ScreenKind::Play, ScreenKind::Decision, ScreenKind::Result] {
+            let base = ImportFacts::base(scene, Fact::Known(false));
+            assert_eq!(
+                (base.total, base.chart_notes),
+                (Fact::Pending, Fact::Pending)
+            );
+        }
+        let base = ImportFacts::base(ScreenKind::Selection, Fact::Known(false));
+        assert_eq!(
+            (base.total, base.chart_notes),
+            (Fact::Unavailable, Fact::Unavailable)
+        );
+        for scene in [ScreenKind::Play, ScreenKind::Selection] {
+            let f = ImportFacts::unavailable(scene);
+            assert_eq!(
+                (f.total, f.chart_notes),
+                (Fact::Unavailable, Fact::Unavailable)
+            );
+        }
+        assert_eq!(chart_fact(368), Some(FactId::ChartTotal));
+        assert_eq!(chart_fact(74), Some(FactId::ChartNotes));
+        assert_eq!(chart_fact(106), Some(FactId::ChartNotes));
+        for n in [96, 75, 105, 107, 367, 369, 0, -368, -74] {
+            assert_eq!(chart_fact(n), None, "{n}");
+        }
+    }
+
+    /// A specialization that read the gauge total and the note count holds
+    /// only for a snapshot with both at their values, one past the total's
+    /// range included; one that read neither holds whatever they are.
+    #[test]
+    fn a_specialization_over_the_total_holds_only_for_it() {
+        let at = |total, notes| ImportFacts {
+            total: Fact::Known(total),
+            chart_notes: Fact::Known(notes),
+            play_level: Fact::Known(12),
+            ..ImportFacts::unavailable(ScreenKind::Play)
+        };
+        let read = |fact, v| FactRead {
+            fact,
+            value: FactValue::Int(v),
+        };
+        let deps = |reads: Vec<FactRead>| FactDeps {
+            scene: ScreenKind::Play,
+            reads,
+        };
+        let both = deps(vec![
+            read(FactId::ChartTotal, 321),
+            read(FactId::ChartNotes, 1_234),
+        ]);
+        assert!(both.holds(&at(321, 1_234)));
+        assert!(!both.holds(&at(450, 1_234)));
+        assert!(!both.holds(&at(321, 1_233)));
+        assert!(!both.holds(&at(i32::MAX, 1_234)));
+        let mut pending = at(321, 1_234);
+        pending.total = Fact::Pending;
+        assert!(!both.holds(&pending));
+        let past = deps(vec![read(FactId::ChartTotal, i32::MAX)]);
+        assert!(past.holds(&at(i32::MAX, 7)));
+        assert!(!past.holds(&at(321, 1_234)));
+        let level = deps(vec![FactRead {
+            fact: FactId::PlayLevel,
+            value: FactValue::Level(12),
+        }]);
+        for (total, notes) in [(321, 1_234), (450, 1_914), (i32::MAX, 0)] {
+            assert!(level.holds(&at(total, notes)), "{total} {notes}");
         }
     }
 }
