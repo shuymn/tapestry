@@ -3,7 +3,8 @@
 //! placement; 101 is dropped as an unsupported system object, and the
 //! trimmed stretches are dropped as on play. Options 190 to 193 read the
 //! selection's image fields (`selected.stagefile`, `selected.banner`) with
-//! no guard, in a JSON `op` and a Lua `main_state.option` alike.
+//! no guard, in a JSON `op` and a Lua `main_state.option` alike. The
+//! lowered destinations size the chart-image pool cells.
 
 mod common;
 
@@ -13,7 +14,7 @@ use skin_beatoraja::lua::Disposition;
 use skin_beatoraja::{Cancel, Config, ImportFacts, LuaOutcome, NoteKind, Object, read_lua_header};
 use skin_model::FrameUv;
 use skin_model::ScreenKind;
-use skin_model::chart_image::{ChartKey, ChartStretch, ChartTable, ChartUv};
+use skin_model::chart_image::{ChartCells, ChartKey, ChartStretch, ChartTable, ChartUv, Slot};
 
 const KEY: ChartKey = ChartKey {
     renderer: 1,
@@ -118,6 +119,12 @@ fn selection_chart_images_lower_and_read_the_table() {
         ]
     );
     assert!(i.skin.has_chart_images());
+    // The stage file's stretch 4 can draw past its destination, so its
+    // cell is the slot; the banner's is its destination, padded and
+    // aligned to 64.
+    let cells = i.skin.chart_cells([1_920, 1_080], 2_048);
+    assert_eq!(cells.stage.map(Slot::size), Some([1_024, 1_024]));
+    assert_eq!(cells.banner.map(Slot::size), Some([640, 192]));
     let mut s = Sel::new(i.skin);
 
     let (marks, stage, banner) = frame(&mut s, Some(table(true, true)));
@@ -204,6 +211,16 @@ fn the_image_options_read_the_selection_fields_in_lua() {
         lua.callbacks
     );
     assert!(lua.imported.skin.has_chart_images());
+    // The pool cells come from the lowered destinations: 640 × 400 and
+    // 600 × 160 at scale 1, padded and aligned to 64.
+    let cell = |w, h| Some(Slot::new([w, h]).unwrap());
+    assert_eq!(
+        lua.imported.skin.chart_cells([1_920, 1_080], 2_048),
+        ChartCells {
+            stage: cell(704, 448),
+            banner: cell(640, 192),
+        }
+    );
     let json = format!(
         r#""imageset": [{SET}], "text": [{TEXT_T}],
            "songlist": {{"id": "list", "center": 0,

@@ -348,6 +348,47 @@ fn slots_take_gutters_aligned_sides_only() {
     assert_eq!(slot(1_024).max_content(), [1_008, 1_008]);
 }
 
+/// A pool cell is a reach padded as a fit is (aligned to 8, a gutter on
+/// each side), aligned up to 64 and capped at its slot (AC-S12): content
+/// of `64k - 16` texels fits a `64k` side, one more texel takes the next
+/// step; a reach of 0 gets one step; a capped side is the slot's, which
+/// may be a multiple of 8 only; every cell is a slot holding its reach
+/// unless capped.
+#[test]
+fn a_cell_holds_its_reach_aligned_and_capped() {
+    use skin_model::chart_image::CELL_ALIGN;
+    let cap = Slot::new([1_024, 544]).unwrap();
+    assert_eq!(CELL_ALIGN, 64);
+    assert_eq!(Slot::cell([0, 0], cap).size(), [64, 64]);
+    assert_eq!(2 * GUTTER, 16);
+    for k in 1..=8 {
+        let fits = 64 * k - 2 * GUTTER;
+        assert_eq!(Slot::cell([fits, 1], cap).size(), [64 * k, 64], "{k}");
+        assert_eq!(
+            Slot::cell([fits + 1, 1], cap).size(),
+            [64 * (k + 1), 64],
+            "{k}"
+        );
+    }
+    // The 8 alignment comes first: 41 pads to 48, then 64.
+    assert_eq!(Slot::cell([41, 49], cap).size(), [64, 128]);
+    // Capped: the slot's side, past a 64 step or not.
+    assert_eq!(Slot::cell([1_009, 529], cap).size(), [1_024, 544]);
+    assert_eq!(Slot::cell([u32::MAX, u32::MAX], cap).size(), [1_024, 544]);
+    for r in (0..1_100).step_by(7) {
+        let c = Slot::cell([r, r], cap);
+        assert_eq!(Slot::new(c.size()), Some(c), "{r}");
+        for (i, (side, max)) in c.size().into_iter().zip(cap.size()).enumerate() {
+            assert!(side == max || side % 64 == 0, "{r} {i}");
+            assert!(side == max || c.max_content()[i] >= r, "{r} {i}");
+            assert!(
+                side == max || side - 64 < r.next_multiple_of(8) + 2 * GUTTER,
+                "the least step: {r} {i}"
+            );
+        }
+    }
+}
+
 /// A picture that fills its slot less the gutters is written at its own
 /// size, and its allocation, gutters included, is the whole slot: level 0
 /// is uploaded at the slot's origin, its content `GUTTER` texels in.

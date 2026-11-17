@@ -703,6 +703,201 @@ fn slots_and_uvs_cover_the_content_only() {
     assert!(ChartUv::of(&wide, ChartImage::Stage, 2_048, 7).is_none());
 }
 
+/// A pool cell's uv: the content `GUTTER` texels into the cell at its
+/// origin on a layer of any side, the layer kept as given (the pool bit
+/// too); a slot's uv is the same at the slot's origin. A cell past the
+/// layer's edge, or one that does not hold the fit, has none.
+#[test]
+fn a_cells_uv_covers_its_content_at_its_origin() {
+    use skin_model::chart_image::{POOL_LAYER, Slot};
+    let d = tempfile::tempdir().unwrap();
+    image::RgbaImage::from_pixel(50, 30, image::Rgba([9, 9, 9, 255]))
+        .save(d.path().join("s.png"))
+        .unwrap();
+    let dir = skin_model::chart_image::ChartDir::new(d.path()).unwrap();
+    let cell = Slot::new([128, 64]).unwrap();
+    let fitted = skin_model::chart_image::read(&dir, "s.png", &[], cell, &|| false, &|_| None)
+        .image
+        .unwrap();
+    let side = 1_536;
+    let layer = 3 | POOL_LAYER;
+    let uv = ChartUv::at(&fitted, [256, 704], cell, side, layer).unwrap();
+    let at = |v: u32| v as f32 / side as f32;
+    assert_eq!(
+        uv.uv.uv,
+        [
+            at(256 + GUTTER),
+            at(704 + GUTTER),
+            at(256 + GUTTER + 50),
+            at(704 + GUTTER + 30)
+        ]
+    );
+    assert_eq!((uv.uv.layer, uv.native), (layer, [50, 30]));
+    // At the layer's far corner it fits; one texel further it does not.
+    assert!(ChartUv::at(&fitted, [side - 128, side - 64], cell, side, 0).is_some());
+    assert!(ChartUv::at(&fitted, [side - 127, 0], cell, side, 0).is_none());
+    assert!(ChartUv::at(&fitted, [0, side - 63], cell, side, 0).is_none());
+    assert!(ChartUv::at(&fitted, [u32::MAX, 0], cell, side, 0).is_none());
+    // A cell smaller than the fit does not hold it.
+    let small = Slot::new([64, 64]).unwrap();
+    assert!(ChartUv::at(&fitted, [0, 0], small, side, 0).is_none());
+    // A slot's uv is the uv at its origin.
+    for which in ChartImage::ALL {
+        let (origin, slot) = which.slot(2_048).unwrap();
+        assert_eq!(
+            ChartUv::of(&fitted, which, 2_048, 7),
+            ChartUv::at(&fitted, origin, slot, 2_048, 7),
+            "{which:?}"
+        );
+    }
+}
+
+/// A selection skin of `elements`, each on its screen timer.
+fn selection_of(elements: Vec<ElementDef>) -> Skin {
+    let elements = elements
+        .into_iter()
+        .map(|e| ElementDef {
+            timer: TimerRef::Builtin(skin_model::selection_timer::SCREEN),
+            ..e
+        })
+        .collect();
+    Skin::new_selection(
+        def(Vec::new(), white_sheet(), elements),
+        SelectionDefs::default(),
+    )
+    .unwrap()
+}
+
+/// A track of one key per rect, 100 ms apart.
+fn keys(rects: &[[i32; 4]]) -> skin_model::Track {
+    let keys: Vec<_> = (0_i64..)
+        .zip(rects)
+        .map(|(i, &[x, y, w, h])| {
+            let mut props = [None; 9];
+            props[0] = Some(x);
+            props[1] = Some(y);
+            props[2] = Some(w);
+            props[3] = Some(h);
+            skin_model::KeyDef {
+                at: TimeUs(i * 100_000),
+                props,
+            }
+        })
+        .collect();
+    skin_model::Track::new(&keys, skin_model::Ease::Linear, skin_model::End::Hold).unwrap()
+}
+
+/// The cells a selection skin's chart images need (AC-S12): a stretch that
+/// stays inside its destination (`Fill`, `Inner`, `NoExpanding`) takes the
+/// largest key rect at the output scale, rounded up, a flipped key by its
+/// size; one that can draw past it (`Outer`, `FitWidth`, `FitHeight`,
+/// `NoResize`) takes the image's slot, as does an element its rect cannot
+/// bound (a fill); each is padded, aligned to 64 and capped at the slot of
+/// the atlas side raised to 2 048, and the widest per axis is kept. The
+/// scale is the canvas's, at most 2. A skin without -102 has no banner
+/// cell, and one without chart images none.
+#[test]
+fn chart_cells_follow_each_stretchs_reach() {
+    use skin_model::chart_image::{ChartCells, Slot};
+    let hd = [1_920, 1_080];
+    let cell = |w, h| Some(Slot::new([w, h]).unwrap());
+    let stage_at = |stretch, r| chart_image(ChartImage::Stage, stretch, r);
+    let stage = |stretch| stage_at(stretch, [100, 100, 400, 300]);
+    for stretch in [
+        ChartStretch::Fill,
+        ChartStretch::Inner,
+        ChartStretch::NoExpanding,
+    ] {
+        let s = selection_of(vec![stage(stretch)]);
+        // 400 + 16 = 416 → 448; 300 → 304 + 16 = 320.
+        assert_eq!(
+            s.chart_cells(hd, 2_048),
+            ChartCells {
+                stage: cell(448, 320),
+                banner: None
+            },
+            "{stretch:?}"
+        );
+        // Twice the target: 816 → 832, 616 → 640; the scale stops at 2.
+        for target in [[3_840, 2_160], [5_120, 2_880]] {
+            assert_eq!(
+                s.chart_cells(target, 2_048).stage,
+                cell(832, 640),
+                "{stretch:?}"
+            );
+        }
+        // Two thirds, rounded up: 267 → 272 + 16 = 288 → 320, 200 → 216 → 256.
+        assert_eq!(
+            s.chart_cells([1_280, 720], 2_048).stage,
+            cell(320, 256),
+            "{stretch:?}"
+        );
+    }
+    for stretch in [
+        ChartStretch::Outer,
+        ChartStretch::FitWidth,
+        ChartStretch::FitHeight,
+        ChartStretch::NoResize,
+    ] {
+        let s = selection_of(vec![stage(stretch)]);
+        assert_eq!(
+            s.chart_cells(hd, 2_048).stage,
+            cell(1_024, 1_024),
+            "{stretch:?}"
+        );
+        // The side is raised to 2 048, never lowered.
+        assert_eq!(
+            s.chart_cells(hd, 1_024).stage,
+            cell(1_024, 1_024),
+            "{stretch:?}"
+        );
+        assert_eq!(
+            s.chart_cells(hd, 4_096).stage,
+            cell(2_048, 2_048),
+            "{stretch:?}"
+        );
+    }
+    // A fill reaches past its rect: the slot.
+    let filled = selection_of(vec![ElementDef {
+        place: Place {
+            fill: skin_model::Fill::Cover,
+            ..Place::SCREEN
+        },
+        ..stage(ChartStretch::Fill)
+    }]);
+    assert_eq!(filled.chart_cells(hd, 2_048).stage, cell(1_024, 1_024));
+    // The largest key, a flipped one by its size; the widest per axis over
+    // the elements; a banner capped at its slot (1 024 × 512).
+    let s = selection_of(vec![
+        ElementDef {
+            track: keys(&[[0, 0, 200, 100], [0, 0, -500, 40]]),
+            ..stage(ChartStretch::Inner)
+        },
+        stage_at(ChartStretch::Fill, [0, 0, 100, 400]),
+        chart_image(ChartImage::Banner, ChartStretch::Fill, [0, 0, 300, 80]),
+        chart_image(ChartImage::Banner, ChartStretch::Inner, [0, 0, 60, 900]),
+    ]);
+    assert_eq!(
+        s.chart_cells(hd, 2_048),
+        ChartCells {
+            // 500 → 576, 400 → 448.
+            stage: cell(576, 448),
+            // 300 → 320, 900 → 512 (capped).
+            banner: cell(320, 512),
+        }
+    );
+    // An exact 64 step and one texel past it.
+    let edge = |w| {
+        selection_of(vec![stage_at(ChartStretch::Fill, [0, 0, w, 48])])
+            .chart_cells(hd, 2_048)
+            .stage
+    };
+    assert_eq!(edge(112), cell(128, 64));
+    assert_eq!(edge(113), cell(192, 64));
+    let plain = selection_of(Vec::new());
+    assert_eq!(plain.chart_cells(hd, 2_048), ChartCells::NONE);
+}
+
 /// A table draws only in a frame whose live key is its own: another
 /// renderer's, installation's, atlas's or generation's table, an unkeyed
 /// one, or any while the live key is unknown (a lost device) reads as
