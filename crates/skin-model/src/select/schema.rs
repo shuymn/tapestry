@@ -283,10 +283,12 @@ pub mod field {
     pub const PLAYER_COUNT_PERFECT: u16 = PLAYER_TIME_H + 6;
     pub const PLAYER_COUNT_POOR: u16 = PLAYER_TIME_H + 10;
     pub const PLAYER_NOTES: u16 = PLAYER_TIME_H + 11;
-    /// Whether the cursor's chart's stage file and banner are drawable:
-    /// true only while the selection's chart table is current for the
-    /// cursor generation and holds that image (options 190 to 193). The
-    /// player writes them after the view's fields, which reset them.
+    /// Whether the cursor's chart's stage file and banner are drawable
+    /// (options 190 to 193): they read the table the frame builds from
+    /// the displayed update's cursor chart, true when it names a resident
+    /// slot of the live pool generation holding that image, false while
+    /// that chart is pending or absent. The player writes them after the
+    /// view's fields, which reset them.
     pub const SELECTED_STAGEFILE: u16 = PLAYER_NOTES + 1;
     pub const SELECTED_BANNER: u16 = SELECTED_STAGEFILE + 1;
     /// Whether the chart has the scan's preview numbers: its draw with
