@@ -1297,7 +1297,8 @@ pub struct Renderer {
     #[cfg(test)]
     pub(crate) bga_step_cost: std::cell::Cell<Option<Duration>>,
     /// Unit tests: run inside a BGA step's scopes before its writes, and
-    /// just before its submission, to make the device refuse there.
+    /// just before its submission, to make the device refuse there (or
+    /// the step take time).
     #[cfg(test)]
     pub(crate) bga_write_fault: Option<fn(&Gpu)>,
     #[cfg(test)]

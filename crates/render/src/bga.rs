@@ -506,4 +506,65 @@ mod tests {
         assert_eq!(r.bga_boundary(), BgaStep::Done(Ok(())));
         assert_eq!(r.bga_submits.get(), 8);
     }
+
+    /// Takes twice the time slice, inside a step's scopes before its
+    /// submission.
+    fn slow(_: &Gpu) {
+        std::thread::sleep(UPLOAD_TIME_SLICE * 2);
+    }
+
+    /// On the real clock, a boundary's first step that takes longer than
+    /// the slice ends the boundary's steps, every completion seen at once
+    /// (design.md "Memory Budget"): the slice is measured from the
+    /// boundary's start, the step's own time included.
+    #[test]
+    fn a_step_past_the_slice_ends_the_boundary_on_the_real_clock() {
+        let (mut r, key) = renderer();
+        r.bga_step_cost.set(None);
+        r.bga_seen.set(Some(true));
+        r.bga_submit_fault = Some(slow);
+        r.stage_bga_cells(key, quarters(4)).unwrap();
+        assert_eq!(r.bga_boundary(), BgaStep::Pending);
+        assert_eq!(r.bga_submits.get(), 1, "no second step past the slice");
+        assert_eq!(r.bga_upload_bytes(), u64::try_from(3 * QUARTER).unwrap());
+    }
+
+    /// A step in flight when the device is lost: the batch ends stale at
+    /// the next boundary with nothing more written, its key names nothing
+    /// to publish or write to, and a renderer built again, as the render
+    /// thread builds one after a loss, has a key of its own, refuses the
+    /// old one and uploads a batch whole (design.md "Rendering and Skins",
+    /// BGA).
+    #[test]
+    fn a_step_in_flight_through_a_device_loss_ends_stale() {
+        let (mut r, key) = renderer();
+        r.bga_seen.set(Some(false));
+        r.stage_bga_cells(key, cells()).unwrap();
+        assert_eq!(r.bga_boundary(), BgaStep::Pending);
+        assert!(r.bga_in_flight.is_some(), "a step outstanding");
+        r.gpu().device().destroy();
+        // The device reports its loss at its next poll.
+        let _ = r.gpu().device().poll(wgpu::PollType::wait_indefinitely());
+        assert!(r.gpu().lost());
+        assert_eq!(r.bga_boundary(), BgaStep::Done(Err(BgaFault::Stale)));
+        assert_eq!(r.bga_submits.get(), 1, "nothing written after the loss");
+        assert_eq!(r.bga_key(), None);
+        assert!(matches!(
+            r.publish_bga(Some(key), Vec::new()),
+            Err(BgaFault::Stale)
+        ));
+        assert_eq!(r.stage_bga_cells(key, cells()), Err(BgaFault::Stale));
+        drop(r);
+        let (mut again, fresh) = renderer();
+        assert_ne!(fresh, key);
+        assert_eq!(
+            again.stage_bga_cells(key, cells()),
+            Err(BgaFault::Stale),
+            "the old key names nothing on the new renderer"
+        );
+        again.stage_bga_cells(fresh, cells()).unwrap();
+        assert_eq!(until_done(&mut again), Ok(()));
+        let table = again.publish_bga(Some(fresh), Vec::new()).unwrap();
+        assert_eq!(table.key(), Some(fresh));
+    }
 }
