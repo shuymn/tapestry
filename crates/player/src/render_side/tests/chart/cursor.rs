@@ -870,6 +870,122 @@ fn a_write_held_when_selection_is_left_is_answered() {
     assert!(c.w.slot_states().iter().all(|s| *s == SlotState::Free));
 }
 
+/// A pool write held across the end of its generation (the screen built
+/// again, its skin replaced): the render thread, stalled in a selection
+/// frame when the write was sent, takes it after the new generation is
+/// live and answers it stale; nothing of it is written, its slot is
+/// freed, and the cursor's row is read again into the new generation.
+#[test]
+fn a_write_held_across_a_new_generation_is_answered_stale() {
+    let _serial = crate::imports::tests::serial();
+    let c = cursor();
+    let d = chart([640, 480], [300, 80]);
+    let old = c.generation();
+    c.r.hold.store(true, Ordering::Release);
+    assert!(wait_until(|| c.r.charts.lock().unwrap().stalled));
+    c.rest_on(d.path(), named());
+    c.until(|c| c.w.writes_sent() == 1);
+    // The generation ends while the write waits for the render thread.
+    let next = pool_of(4);
+    *c.r.pool.lock().unwrap() = Some(next);
+    c.r.hold.store(false, Ordering::Release);
+    c.until(|c| !c.w.write_pending());
+    assert!(c.written().is_empty(), "written into an ended generation");
+    assert!(c.w.entry(&row(d.path(), named())).is_none());
+    assert!(wait_until(|| c.r.link.pool_now().0 == Some(next)));
+    c.step();
+    assert_ne!(c.w.pool_generation(), old);
+    assert!(c.w.take_rearm());
+    c.rest(d.path(), named());
+    assert_eq!(
+        c.shown(d.path(), named()),
+        EntryState::Resident {
+            generation: next.generation,
+            slot: 0
+        }
+    );
+    assert_eq!(c.written(), vec![(next.generation, 0, [true, true])]);
+}
+
+/// A play between two visits whose pool is made again meanwhile (P-h):
+/// no read and no pool write runs during the play; on the return the
+/// resident entry of the ended generation is dropped and the cursor's row
+/// read again into the new one, as on a cold start.
+#[test]
+fn a_pool_made_again_during_a_play_reloads_on_the_return() {
+    let _serial = crate::imports::tests::serial();
+    let c = cursor();
+    let d = chart([640, 480], [300, 80]);
+    c.rest_on(d.path(), named());
+    c.shown(d.path(), named());
+    let (begun, writes) = (c.w.begun(), c.w.writes_sent());
+    // The choice; the play's own steps.
+    c.w.leave_selection(&c.coord);
+    c.r.link.leave_selection();
+    c.w.renew();
+    let next = pool_of(4);
+    *c.r.pool.lock().unwrap() = Some(next);
+    let publisher = c.r.link.chart_publisher();
+    for _ in 0..20 {
+        c.w.step(
+            Some((&c.coord, Spawner::SYSTEM)),
+            &|| false,
+            Some(&publisher),
+        );
+        c.w.service();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(c.w.begun(), begun, "a read during the play");
+    assert_eq!(c.w.writes_sent(), writes, "a write during the play");
+    // Back on selection, the cursor on the same row.
+    c.r.link.enter_selection(2);
+    c.r.link
+        .show_selection(crate::render_side::tests::selection_update(2, 1));
+    assert!(wait_until(|| c.r.link.pool_now().0 == Some(next)));
+    c.w.entered();
+    c.on(d.path(), named());
+    c.step();
+    assert!(c.w.entry(&row(d.path(), named())).is_none(), "kept");
+    assert!(c.w.take_changed(), "the cursor's resident value kept");
+    assert_eq!(c.w.update_chart(false), CursorChart::Pending);
+    // Read again at its rest, as on a cold start.
+    c.rest(d.path(), named());
+    assert_eq!(
+        c.shown(d.path(), named()),
+        EntryState::Resident {
+            generation: next.generation,
+            slot: 0
+        }
+    );
+    assert_eq!(c.w.begun(), begun + 1);
+}
+
+/// A check never waits behind an unanswered write (r2 MEDIUM 5): with
+/// B's write sent and the render thread stalled, A's use is checked, the
+/// write still unanswered.
+#[test]
+fn a_check_does_not_wait_behind_an_unanswered_write() {
+    let _serial = crate::imports::tests::serial();
+    let c = cursor();
+    let (a, b) = (chart([640, 480], [300, 80]), chart([200, 100], [20, 10]));
+    c.rest_on(a.path(), named());
+    c.shown(a.path(), named());
+    c.settled();
+    let checks = c.w.checks_begun();
+    c.r.hold.store(true, Ordering::Release);
+    assert!(wait_until(|| c.r.charts.lock().unwrap().stalled));
+    c.rest_on(b.path(), named());
+    c.until(|c| c.w.writes_sent() == 2);
+    // A use of A, as an entry onto it would make, while B's write waits.
+    c.w.cursor_changed(&c.coord, Some(row(a.path(), named())));
+    c.w.entered();
+    c.w.update_chart(false);
+    c.until(|c| c.w.checks_begun() > checks && !c.w.checks_pending().0);
+    assert!(c.w.write_pending(), "the write answered");
+    c.r.hold.store(false, Ordering::Release);
+    c.settled();
+}
+
 /// A write queued before a move (AC-S5): the boundary that takes the
 /// move's update applies no write, so the write lands after a frame of
 /// that update, into a slot the update does not name; its row's entry is
