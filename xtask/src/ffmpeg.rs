@@ -517,37 +517,47 @@ fn run_plain(cmd: &mut Command, what: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Empties `dir` of everything but `keep`, creating it with its marker the
-/// first time; a directory without the marker is not this build's and is
-/// left alone.
-fn fresh_work_dir(dir: &Path, keep: &str) -> anyhow::Result<()> {
-    let marker = dir.join(".tapestry-ffmpeg-build");
+/// The marker file that makes a directory the build's own.
+const MARKER: &str = ".tapestry-ffmpeg-build";
+
+/// Claims the build directory `dir` for one build: takes an exclusive lock on
+/// `<dir>.lock` beside it, refusing while another build holds it, then
+/// removes `dir`, which must hold [`MARKER`] if it exists (a directory
+/// without it is not the build's and is left alone), and creates it empty
+/// with the marker. The lock holds while the returned file is open, so two
+/// builds never share the directory and none inherits another's files.
+fn claim_build_dir(dir: &Path) -> anyhow::Result<fs::File> {
+    let mut lock_path = dir.as_os_str().to_owned();
+    lock_path.push(".lock");
+    let lock_path = PathBuf::from(lock_path);
+    let lock = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&lock_path)
+        .with_context(|| format!("cannot open {}", lock_path.display()))?;
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(fs::TryLockError::WouldBlock) => bail!(
+            "another build holds {}: one build at a time works at {}",
+            lock_path.display(),
+            dir.display()
+        ),
+        Err(fs::TryLockError::Error(e)) => {
+            return Err(e).with_context(|| format!("cannot lock {}", lock_path.display()));
+        }
+    }
     if dir.exists() {
         ensure!(
-            marker.exists(),
-            "{} exists without {}: not this build's, left alone",
-            dir.display(),
-            marker.display()
+            dir.join(MARKER).is_file(),
+            "{} exists without {MARKER}: not the build's, left alone",
+            dir.display()
         );
-        for entry in fs::read_dir(dir)? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if name == keep || name == ".tapestry-ffmpeg-build" {
-                continue;
-            }
-            let path = entry.path();
-            if entry.file_type()?.is_dir() {
-                fs::remove_dir_all(&path)
-            } else {
-                fs::remove_file(&path)
-            }
-            .with_context(|| format!("cannot clear {}", path.display()))?;
-        }
-    } else {
-        fs::create_dir_all(dir)?;
-        fs::write(&marker, "")?;
+        fs::remove_dir_all(dir).with_context(|| format!("cannot remove {}", dir.display()))?;
     }
-    Ok(())
+    fs::create_dir_all(dir)?;
+    fs::write(dir.join(MARKER), "")?;
+    Ok(lock)
 }
 
 /// `program` on `path` (a `PATH` value).
@@ -599,7 +609,7 @@ fn build(root: &Path, m: &Manifest, expect: Expect<'_>) -> anyhow::Result<()> {
     let out = root.join("target").join("ffmpeg-build");
     fs::create_dir_all(&out)?;
     let work = PathBuf::from(&m.build.dir);
-    fresh_work_dir(&work, "dl")?;
+    let _lock = claim_build_dir(&work)?;
     for d in [
         "src",
         "build",
@@ -610,16 +620,17 @@ fn build(root: &Path, m: &Manifest, expect: Expect<'_>) -> anyhow::Result<()> {
         "deps/mcf",
         "deps/zlib/include",
         "deps/zlib/lib",
-        "dl",
     ] {
         fs::create_dir_all(work.join(d))?;
     }
 
     // The source, checked by the archive's sha256 and the unpacked tree's
-    // nix hash (which still holds if the archive is ever re-compressed).
-    let tarball = work
-        .join("dl")
-        .join(format!("ffmpeg-{}.tar.gz", m.source.commit));
+    // nix hash (which still holds if the archive is ever re-compressed). The
+    // download is kept in the workspace's target directory, outside the
+    // build directory, and checked again on each run.
+    let dl = root.join("target").join("ffmpeg-dl");
+    fs::create_dir_all(&dl)?;
+    let tarball = dl.join(format!("ffmpeg-{}.tar.gz", m.source.commit));
     if !tarball.exists() {
         let part = tarball.with_extension("part");
         run_plain(
@@ -884,7 +895,8 @@ fn pack(
     // (the VERSION file version.sh reads), zlib's tarball and the build
     // inputs of this commit.
     fs::copy(
-        work.join("dl")
+        root.join("target")
+            .join("ffmpeg-dl")
             .join(format!("ffmpeg-{}.tar.gz", m.source.commit)),
         src_dir.join(format!("ffmpeg-{}.tar.gz", m.source.commit)),
     )?;
@@ -1207,6 +1219,38 @@ sha256 = "z"
         let delayed = pe(&["KERNEL32.dll"], &["GDI32.dll"]);
         let imports = pe_imports(&delayed).unwrap();
         assert_eq!(disallowed_imports(&dlls, &imports), ["GDI32.dll"]);
+    }
+
+    /// The build's fixed directory: a claim starts it empty with its marker,
+    /// a second claim while the first is held is refused and leaves it alone,
+    /// a claim after the first is released empties it again, and a directory
+    /// without the marker is never removed.
+    #[test]
+    fn the_build_dir_is_claimed_by_one_build_and_starts_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("build");
+        let first = claim_build_dir(&dir).unwrap();
+        assert!(dir.join(MARKER).is_file());
+        fs::write(dir.join("left.o"), "x").unwrap();
+        let e = claim_build_dir(&dir).unwrap_err();
+        assert!(e.to_string().contains("another build holds"), "{e}");
+        assert!(
+            dir.join("left.o").exists(),
+            "a refused claim touches nothing"
+        );
+        drop(first);
+        let _second = claim_build_dir(&dir).unwrap();
+        let names: Vec<_> = fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names, [MARKER], "the next build starts empty");
+
+        let foreign = tmp.path().join("foreign");
+        fs::create_dir(&foreign).unwrap();
+        fs::write(foreign.join("keep"), "x").unwrap();
+        assert!(claim_build_dir(&foreign).is_err());
+        assert!(foreign.join("keep").exists());
     }
 
     /// `cargo xtask ffmpeg fetch` checks the asset's sha256 before unpacking
