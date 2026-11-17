@@ -306,9 +306,9 @@ fn an_unsupported_part_refuses_at_its_destination() {
         (r#""offset": 2"#, NoteKind::RuntimeOffset(2)),
         (r#""op": ["a_script()"]"#, prop(PropertyKind::Boolean, None)),
         (r#""draw": "nothing""#, prop(PropertyKind::Boolean, None)),
-        (r#""op": [171]"#, prop(PropertyKind::Boolean, Some(171))),
-        (r#""op": [-171]"#, prop(PropertyKind::Boolean, Some(-171))),
-        (r#""draw": 171"#, prop(PropertyKind::Boolean, Some(171))),
+        (r#""op": [192]"#, prop(PropertyKind::Boolean, Some(192))),
+        (r#""op": [-192]"#, prop(PropertyKind::Boolean, Some(-192))),
+        (r#""draw": 192"#, prop(PropertyKind::Boolean, Some(192))),
     ] {
         let r = images("", &[&fail("i", fields)]);
         refused_as_failure(r, &at("i"), why);

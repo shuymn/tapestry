@@ -124,7 +124,7 @@ impl Cx<'_> {
                     property::str_by_name_in(self.kind, &s).unwrap_or(StrProp::Unsupported(None))
                 }
                 Prop::Callable(id) => {
-                    let fold = match self.text_callback(at, role, id)? {
+                    let fold = match self.text_callback(role, id)? {
                         Ok(fold) => fold,
                         Err(why) => {
                             self.drop_el(role, at, why)?;

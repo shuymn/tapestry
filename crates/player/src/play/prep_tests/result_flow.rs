@@ -223,7 +223,7 @@ fn fixed_skin() -> (tempfile::TempDir, Arc<render::SkinBundle>) {
     match crate::imports::build(
         ScreenKind::Result,
         &choice,
-        false,
+        crate::imports::SkinSession::default(),
         &target,
         &skin_beatoraja::Cancel::new(),
     ) {

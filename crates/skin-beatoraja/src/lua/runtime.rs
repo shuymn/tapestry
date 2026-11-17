@@ -34,9 +34,7 @@
 //!   each once: a callback's error and an import-only call by the
 //!   callback's site (its file, and the line and column of its
 //!   constructor, [`SiteAt`]), an id it does not answer by its API and id,
-//!   located at its first reader in call order, and a read of the BGA
-//!   setting (options 40 and 41, D33) by a callback whose option scan the
-//!   import could not close, by its site and id. Occurrences past the cap
+//!   located at its first reader in call order. Occurrences past the cap
 //!   are counted, the list then incomplete; the stops are kept apart,
 //!   never capped. They go to the runtime's [`NoteBook`], its own unless
 //!   a screen shares one between the runtimes of one screen lifetime
@@ -103,10 +101,6 @@ pub(crate) struct Site {
     /// The conditions before it in its element's `dstdraw`, which the
     /// source evaluates first, stopping at the first false.
     pub(crate) gate: Option<Program>,
-    /// Whether its option scan left an `option` id or a callee open: its
-    /// reads of the BGA setting are noted as they run
-    /// ([`RuntimeNote::BgaSetting`]).
-    pub(crate) option_open: bool,
 }
 
 /// What became of a callback this frame.
@@ -165,12 +159,6 @@ pub enum RuntimeNote {
     /// An import-only capability called at runtime by the callback
     /// defined `at`.
     ImportOnly { at: Option<SiteAt> },
-    /// Option `id` (40 or 41), the BGA setting answered as off (D33), read
-    /// by the callback defined `at`, whose reads the import's option scan
-    /// could not all resolve. Executed evidence: a callback that also
-    /// reads one by an id the scan resolves has the import's D33 too, and
-    /// the two may name the same read.
-    BgaSetting { id: i32, at: Option<SiteAt> },
 }
 
 /// What the runtime gave a skin in place of an id it does not answer, as
@@ -186,13 +174,12 @@ pub enum Gave {
 }
 
 /// What a note is kept once by: a callback's site, an id by its API, an
-/// import-only call's site, a BGA setting read's site and id.
+/// import-only call's site.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Key {
     Error(SiteAt),
     Absent(&'static str, i32),
     ImportOnly(Option<SiteAt>),
-    BgaSetting(Option<SiteAt>, i32),
 }
 
 impl RuntimeNote {
@@ -201,7 +188,6 @@ impl RuntimeNote {
             Self::CallbackError { at } => Key::Error(at.clone()),
             Self::Absent { api, id, .. } => Key::Absent(api, *id),
             Self::ImportOnly { at } => Key::ImportOnly(at.clone()),
-            Self::BgaSetting { id, at } => Key::BgaSetting(at.clone(), *id),
         }
     }
 }
@@ -345,34 +331,17 @@ pub(crate) fn note_absent(pass: &Pass, api: &'static str, id: i32, gave: Gave) {
         .add(RuntimeNote::Absent { api, id, gave, at });
 }
 
-/// Notes the read of the BGA setting's option `id` (40 or 41) by the
-/// callback the runtime is calling, when that callback's option scan left
-/// an id or a callee open (D33); a read the scan resolved has its note in
-/// the import.
-pub(crate) fn note_bga(pass: &Pass, id: i32) {
-    let Some(k) = pass.calling.get() else {
-        return;
-    };
-    let open = pass.runtime_open.borrow().get(k as usize).copied();
-    if open != Some(true) {
-        return;
-    }
-    let at = pass.runtime_sites.borrow().get(k as usize).cloned();
-    pass.runtime_notes
-        .borrow()
-        .add(RuntimeNote::BgaSetting { id, at });
-}
-
 /// A host read's bridge, compiled once per id: its guard and its value.
 struct Bridged {
     guard: Option<Program>,
     value: Program,
 }
 
-/// The screen a runtime frame reads: its kind, a copy of its fields and
-/// timer readings, and the compiled bridges by id.
+/// The screen a runtime frame reads: its kind, the BGA setting, a copy of
+/// its fields and timer readings, and the compiled bridges by id.
 pub(crate) struct Screen {
     kind: ScreenKind,
+    bga: crate::import::Bga,
     fields: Vec<i32>,
     timers: Vec<i32>,
     numbers: HashMap<i32, Option<Bridged>>,
@@ -380,9 +349,10 @@ pub(crate) struct Screen {
 }
 
 impl Screen {
-    pub(crate) fn new(kind: ScreenKind) -> Self {
+    pub(crate) fn new(kind: ScreenKind, bga: crate::import::Bga) -> Self {
         Self {
             kind,
+            bga,
             fields: Vec::new(),
             timers: Vec::new(),
             numbers: HashMap::new(),
@@ -448,10 +418,14 @@ impl Screen {
         })
     }
 
-    /// `main_state.option(id)` for a positive `id`: the bridge's value,
-    /// false while its guard is false; `None` for an id the profile does
-    /// not bridge, never cached.
+    /// `main_state.option(id)` for a positive `id`: the BGA setting's
+    /// constant for 40 and 41, else the bridge's value, false while its
+    /// guard is false; `None` for an id the profile does not bridge, never
+    /// cached.
     pub(crate) fn option(&mut self, id: i32) -> Option<bool> {
+        if let Some(on) = crate::import::ops::bga_setting(id, self.bga) {
+            return Some(on);
+        }
         if !self.options.contains_key(&id) {
             let constant = |s: &Self, b: bool| {
                 s.compile(if b { "true" } else { "false" }, Ty::Bool)
@@ -790,7 +764,6 @@ impl ScreenRuntime {
             })
             .collect();
         let status = vec![CallStatus::Skipped; sites.len()];
-        *pass.runtime_open.borrow_mut() = sites.iter().map(|(s, _)| s.option_open).collect();
         // Each site's definition, its notes' key: the analysis's, else
         // its chunk's name and line of definition.
         *pass.runtime_sites.borrow_mut() = sites
@@ -1204,7 +1177,7 @@ mod tests {
     #[test]
     fn equal_selection_ids_read_as_their_bridged_id() {
         use skin_model::selection_field as f;
-        let mut s = Screen::new(Selection);
+        let mut s = Screen::new(Selection, crate::import::Bga::default());
         s.fields = vec![0; f::COUNT];
         for id in [71, 101, 171] {
             assert_eq!(s.number(id), Some(HIDDEN), "{id}");
@@ -1225,7 +1198,7 @@ mod tests {
     #[test]
     fn equal_result_ids_read_as_their_bridged_id() {
         use skin_model::result_field as f;
-        let mut s = Screen::new(Result);
+        let mut s = Screen::new(Result, crate::import::Bga::default());
         s.fields = vec![0; skin_model::RESULT.fields.len()];
         let ids = [
             45, 80, 84, 101, 105, 106, 108, 115, 116, 128, 153, 155, 156, 174, 177, 426, 427,

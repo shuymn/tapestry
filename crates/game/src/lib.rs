@@ -173,11 +173,11 @@ pub use session::{
     wake_policy,
 };
 pub use settings::{
-    ControllerDevice, CoverSettings, DEVICE_SETTINGS_VERSION, DataRoot, DeviceSettings,
-    DeviceSettingsError, KeyConfig, KeyError, LaneKey, Language, LibrarySettings, NEXT_PRESET_KEY,
-    OVERLAY_KEY, PREV_PRESET_KEY, PlayerSettings, PlayerSettingsError, Role, ScratchConfig,
-    SettingsError, SettingsFile, SkinChoice, SkinChoices, load_settings, reserved_key,
-    save_settings, volume_key,
+    BgaExpand, BgaMode, BgaSession, BgaSettings, ControllerDevice, CoverSettings,
+    DEVICE_SETTINGS_VERSION, DataRoot, DeviceSettings, DeviceSettingsError, KeyConfig, KeyError,
+    LaneKey, Language, LibrarySettings, NEXT_PRESET_KEY, OVERLAY_KEY, PREV_PRESET_KEY,
+    PlayerSettings, PlayerSettingsError, Role, ScratchConfig, SettingsError, SettingsFile,
+    SkinChoice, SkinChoices, load_settings, reserved_key, save_settings, volume_key,
 };
 pub use sound::{AudioQueue, AudioSink, RunnerAudio, Wakes, audio_link, audio_link_at};
 pub use sound_sets::SoundSettings;

@@ -1587,9 +1587,11 @@ fn host_modules_hold_the_pinned_names_and_refuse_calls() {
     let h = header(&d).unwrap();
     // Each pinned name is a function in its module, and calling it is
     // refused as reading play state; `offset` answers from the
-    // configuration (`offset_answers_the_configuration`).
+    // configuration (`offset_answers_the_configuration`), and
+    // `timer_observe_boolean` checks its argument first
+    // (`lua_observers.rs`).
     for (index, &(module, api)) in HOST_APIS.iter().enumerate() {
-        if api == "offset" {
+        if api == "offset" || api == "timer_observe_boolean" {
             continue;
         }
         let d = folder(&[(

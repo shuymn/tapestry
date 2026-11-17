@@ -117,6 +117,8 @@ const NUMBER: u16 = 1;
 const TEXT: u16 = 3;
 /// `main_state.offset`'s index in [`HOST_APIS`].
 const OFFSET: u16 = 4;
+/// `timer_util.timer_observe_boolean`'s index in [`HOST_APIS`].
+pub(crate) const OBSERVE: u16 = 58;
 
 /// The source's last offset id (`MainController.java:124-125` at `0.8.9`,
 /// `OFFSET_MAX`): its array holds ids 0 to this.
@@ -158,7 +160,7 @@ fn option(lua: &Lua, pass: &Pass, args: MultiValue) -> mlua::Result<bool> {
         return Err(pass.ledger.fail_lua(lua, LuaWhy::LiveState { api: OPTION }));
     };
     let id = n.unsigned_abs();
-    match facts::option(snapshot, n) {
+    match facts::option(snapshot, n, pass.bga()) {
         OptionRead::Constant { value, known } => {
             pass.count_fact(|| {
                 if known {
@@ -315,19 +317,13 @@ fn runtime_number(pass: &Pass, n: i32) -> i32 {
 }
 
 /// `main_state.option(n)` on a screen's runtime: the profile's bridge, a
-/// negative id negated; false for an id it omits, noted once. A read of
-/// the BGA setting by a callback the import could not resolve is noted
-/// ([`super::runtime::note_bga`]).
+/// negative id negated; false for an id it omits, noted once.
 fn runtime_option(pass: &Pass, n: i32) -> bool {
-    let id = n.unsigned_abs().try_into().unwrap_or(i32::MAX);
-    if crate::import::ops::bga_setting(id).is_some() {
-        super::runtime::note_bga(pass, id);
-    }
     let mut screen = pass.screen.borrow_mut();
     let Some(s) = screen.as_mut() else {
         return false;
     };
-    if let Some(v) = s.option(id) {
+    if let Some(v) = s.option(n.unsigned_abs().try_into().unwrap_or(i32::MAX)) {
         return v != (n < 0);
     }
     drop(screen);
@@ -341,6 +337,42 @@ pub(super) const MODULES: [&str; 3] = ["main_state", "timer_util", "event_util"]
 /// The registry name of host module `name`'s table in this VM.
 fn registry_name(name: &str) -> String {
     format!("tapestry.host.{name}")
+}
+
+/// `timer_util.timer_observe_boolean(f)` during the configured pass: a new
+/// function, recorded with its predicate `f` and where it was called
+/// ([`Pass::observe`]), which the import folds or refuses where a
+/// destination's `timer` holds it. An `f` that is not a function, or not
+/// a skin closure (a host, library or sandbox function), refuses at the
+/// call, fatal and located. At runtime it reads play state, as the
+/// function it returns does whenever it is called.
+fn observe(lua: &Lua, arc: &Arc<Pass>, pass: &Pass, args: &MultiValue) -> mlua::Result<Value> {
+    if pass.in_runtime() {
+        #[cfg(feature = "dev-tools")]
+        if let Some(r) = super::replay::answer(lua, pass, OBSERVE, args) {
+            return r;
+        }
+        return Err(pass
+            .ledger
+            .fail_lua(lua, LuaWhy::LiveState { api: OBSERVE }));
+    }
+    let Some(Value::Function(f)) = args.front() else {
+        return Err(pass
+            .ledger
+            .fail_lua(lua, LuaWhy::Observer("predicate not a function")));
+    };
+    if super::convert::native(f) {
+        return Err(pass
+            .ledger
+            .fail_lua(lua, LuaWhy::Observer("predicate not a skin closure")));
+    }
+    let face = host(lua, arc, 0, |lua, pass, _| -> mlua::Result<Value> {
+        Err(pass
+            .ledger
+            .fail_lua(lua, LuaWhy::LiveState { api: OBSERVE }))
+    })?;
+    pass.observe(lua, &face, f, super::ledger::running(lua))?;
+    Ok(Value::Function(face))
 }
 
 /// The registry name of host module `name`'s proxy metatable.
@@ -374,6 +406,11 @@ pub(super) fn install(lua: &Lua, pass: &Arc<Pass>) -> mlua::Result<()> {
                 host(lua, pass, 1, text)?
             } else if index == OFFSET {
                 host(lua, pass, 1, offset)?
+            } else if index == OBSERVE {
+                let arc = Arc::clone(pass);
+                host(lua, pass, 1, move |lua, pass, args| {
+                    observe(lua, &arc, pass, &args)
+                })?
             } else {
                 // A reference's play host answers what it can (dev-tools),
                 // its one argument passed.
