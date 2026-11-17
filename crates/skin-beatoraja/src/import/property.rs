@@ -258,8 +258,9 @@ const STRING_PATTERNS: &[(i32, i32, &str, &str, i32)] = &[
 pub(crate) enum Value {
     ExScore,
     MaxCombo,
-    /// The target count (D4 during section practice).
-    Notes,
+    /// The whole chart's note count (74, 106), in every attempt, a
+    /// practice round's too.
+    ChartNotes,
     /// The source's 7-key point (`point`, 100; `ScoreDataProperty.java:
     /// 76-79`), over the attempt's targets: a section's during section
     /// practice, as the source's practice counts only its section's notes
@@ -520,7 +521,7 @@ impl Value {
             Self::TargetRateFraction => "target.rate_bp % 100",
             Self::BestRatePercent => "best.rate_bp / 100",
             Self::BestRateFraction => "best.rate_bp % 100",
-            Self::Notes => "notes",
+            Self::ChartNotes => "chart.notes",
             Self::Point => "point",
             Self::GaugePercent => "gauge / 10",
             Self::GaugeTenths => "gauge % 10",
@@ -630,6 +631,7 @@ impl Value {
             self,
             Self::ExScore
                 | Self::MaxCombo
+                | Self::ChartNotes
                 | Self::Point
                 | Self::BestEx
                 | Self::TargetEx
@@ -794,7 +796,8 @@ fn shown(id: i32) -> Option<Value> {
     Some(match id {
         71 | 101 => Value::ExScore,
         75 | 105 => Value::MaxCombo,
-        74 | 106 => Value::Notes,
+        // Source: SF-018
+        74 | 106 => Value::ChartNotes,
         100 => Value::Point,
         150 => Value::BestEx,
         151 | 121 => Value::TargetEx,
@@ -1212,6 +1215,25 @@ mod tests {
         assert!(STRING_TYPES.contains(&(12, "fulltitle")));
     }
 
+    /// A play skin's numbers 74 and 106, by id and by name, read the
+    /// whole chart's note count, which keeps the source's rule.
+    #[test]
+    fn numbers_74_and_106_read_the_chart_note_count() {
+        let scope = skin_model::Scope::new(&skin_model::PLAY);
+        for (id, name) in [(74, "totalnotes"), (106, "totalnotes2")] {
+            assert_eq!(
+                int_in(ScreenKind::Play, id),
+                IntProp::Shown(Value::ChartNotes)
+            );
+            assert_eq!(int_by_name(name), Some(IntProp::Shown(Value::ChartNotes)));
+        }
+        let value = Value::ChartNotes;
+        assert_eq!((value.expr(), value.availability()), ("chart.notes", None));
+        assert_eq!(value.range(), (0, i64::from(skin_model::MAX_COUNT)));
+        assert!(!value.deviates());
+        assert!(skin_model::compile("chart.notes", &scope, skin_model::Ty::Int).is_ok());
+    }
+
     /// Numbers 20 to 29 read the application's readouts on play, on
     /// selection and on result, by id and by name, each the field of the
     /// same name and range in every schema, always available; 19 and 30
@@ -1486,7 +1508,7 @@ mod tests {
         // The earlier values are never guarded.
         for v in [
             Value::ExScore,
-            Value::Notes,
+            Value::ChartNotes,
             Value::GaugePercent,
             Value::Count(0),
         ] {

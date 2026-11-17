@@ -332,3 +332,47 @@ tests = [
     "crates/player/src/selection/tests/pointer.rs::the_wheel_steps_around_the_ring",
     "crates/player/src/menu_screen/tests/skinned.rs::a_short_list_fills_every_slot_around_the_cursor",
 ]
+
+[[entry]]
+id = "SF-018"
+summary = "A play skin's numbers 74 and 106 are the whole chart's note count, a practice round's too"
+class = "rule"
+reason = """
+A player sees the chart's note count and what remains of it: in a practice \
+round, a mid-chart start included, numbers 74 and 106 count the whole \
+chart's taps and long notes, as in a full attempt, so a remaining count \
+stops at the notes outside the round. The round's own targets stay the \
+point's, the rates' and the rank's."""
+source = [
+    "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:130 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:183 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:562-578 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/song/SongData.java:211 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/play/BMSPlayer.java:527-529 @beatoraja-0.8.9",
+]
+sites = [
+    "crates/skin-beatoraja/src/import/property.rs",
+    "crates/skin-model/src/play/reducer.rs",
+]
+tests = [
+    "crates/skin-beatoraja/tests/lua_callbacks.rs::numbers_74_and_106_are_the_whole_charts_note_count",
+    "crates/skin-beatoraja/tests/import_numbers.rs::json_numbers_74_and_106_are_the_whole_charts_note_count",
+]
+
+[[entry]]
+id = "SF-019"
+summary = "The full-combo timer (48) starts when the combo reaches the whole chart's note count"
+class = "rule"
+reason = """
+A player sees the full-combo effect only for an unbroken run over every \
+note of the chart: a practice round over fewer notes, a mid-chart start \
+after the first note included, never shows it, and a round over every \
+note shows it as a full attempt does. The source's timer staying lit into \
+the next round is a byproduct not copied (design.md "beatoraja Lua Skins", \
+practice rounds and the whole chart)."""
+source = [
+    "src/bms/player/beatoraja/play/BMSPlayer.java:1035-1036 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/song/SongData.java:211 @beatoraja-0.8.9",
+]
+sites = ["crates/skin-model/src/play/reducer.rs"]
+tests = ["crates/skin-model/tests/play.rs::the_full_combo_needs_the_whole_charts_count"]
