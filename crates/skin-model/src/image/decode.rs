@@ -927,10 +927,7 @@ mod tests {
 
     use image::{DynamicImage, ImageBuffer, ImageFormat, Luma, LumaA, Rgb, Rgba};
 
-    use super::{
-        DecodeError, PNG_WORK_BYTES, PngHeader, bmp_scratch, decode_alpha, jpeg_scratch,
-        png_scratch,
-    };
+    use super::{DecodeError, decode_alpha};
 
     /// `image` encoded as `format`.
     fn encoded(image: &DynamicImage, format: ImageFormat) -> Vec<u8> {
@@ -1028,31 +1025,33 @@ mod tests {
     fn a_limit_holds_each_phase_of_a_decode_at_its_edge() {
         let small = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(16, 2, Rgb([9, 8, 7])));
         let large = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(640, 480, Rgb([9, 8, 7])));
-        let rgb8 = PngHeader {
-            color: png::ColorType::Rgb,
-            depth: png::BitDepth::Eight,
-            interlaced: false,
-        };
-        let work = u64::try_from(PNG_WORK_BYTES).unwrap();
-        let png_decoding = move |len: u64| 2 * len + png_scratch(rgb8, 16) + work + 16 * 2 * 4;
+        // Each edge worked out from the bounds' documented terms, not by
+        // calling them, so a term left out of a bound moves the bound and
+        // not the edge.
         let cases: [Case<'_>; 4] = [
             // Decoding holds the most: the decoder's own buffers outweigh
-            // the picture.
+            // the picture. A JPEG's envelope: 8 times the file, 64 KiB,
+            // 8 (16 + 31)(2 + 31) and 3 410 (16 + 31); its native image
+            // 3 bytes a texel.
             (
                 "JPEG",
                 encoded(&small, ImageFormat::Jpeg),
                 [16, 2],
-                &|len| jpeg_scratch(len, [16, 2]) + 16 * 2 * 3,
+                &|len| 8 * len + 65_536 + 8 * 47 * 33 + 3_410 * 47 + 16 * 2 * 3,
             ),
+            // A BMP's file, palette (1 792) and row of 4 ⌈16 / 4⌉; its
+            // native image at its largest, 4 bytes a texel.
             ("BMP", encoded(&small, ImageFormat::Bmp), [16, 2], &|len| {
-                len + bmp_scratch(16) + 16 * 2 * 4
+                len + 1_792 + 16 + 16 * 2 * 4
             }),
-            (
-                "PNG",
-                encoded(&small, ImageFormat::Png),
-                [16, 2],
-                &png_decoding,
-            ),
+            // A PNG's file twice, its window twice (a filtered row R of
+            // 1 + 16 × 3 = 49 bytes: max(4R + 64, 128 KiB) + 2R + 40 KiB =
+            // 172 130), two rows, a deinterlaced row (8 × 16) and the
+            // inflater's tables (32 KiB), `png`'s own 1 MiB, and its native
+            // image at its largest for RGB, 4 bytes a texel.
+            ("PNG", encoded(&small, ImageFormat::Png), [16, 2], &|len| {
+                2 * len + 2 * 172_130 + 2 * 49 + 8 * 16 + 32_768 + 1_048_576 + 16 * 2 * 4
+            }),
             // Converting holds the most: the native image, at a BMP's
             // largest, beside its RGBA8 copy.
             (

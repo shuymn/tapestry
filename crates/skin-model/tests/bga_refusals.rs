@@ -239,8 +239,9 @@ fn a_picture_whose_decoder_could_pass_the_limit_is_refused_before_it_decodes() {
     rgb.save_with_format(d.path().join("big.jpg"), ImageFormat::Jpeg)
         .unwrap();
     let native = 640 * 480 * 3;
-    // The native image and its RGBA8 copy fit; the envelope does not.
-    let (out, _, largest, _) = cell(d.path(), "big.jpg", [64, 48], 1_300_000, 0, 0);
+    // The native image and its RGBA8 copy fit (2 150 400 bytes); the
+    // envelope beside the native image does not (over 5 MB).
+    let (out, _, largest, _) = cell(d.path(), "big.jpg", [64, 48], 3_000_000, 0, 0);
     assert_eq!(out, Err(Absent::Refused));
     assert!(
         largest < native,
