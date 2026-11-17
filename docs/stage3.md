@@ -275,6 +275,7 @@ Before play, never per frame, so per-frame cost is unchanged apart from trilinea
       | Autoplay, options 32 and 33 | Known in the base snapshot, from the session | false | false | false |
       | Judgment class, options 180–184 | Pending in the base snapshot, known per attempt from the drawn chart | Unavailable | Pending in the base snapshot, known at the choice, or unavailable when the draw decides it | Pending in the base snapshot, known per attempt |
       | Course mode, option 290 | false | false | false | false |
+      | Gauge total and note count, numbers 368, 74 and 106, read only by a play text's value | Pending in the base snapshot, known per attempt from the drawn chart | Unavailable | Pending in the base snapshot, never read | Pending in the base snapshot, never read; unavailable when the result skin is specialized |
       | The result profile's numbers and options | Unavailable | Unavailable | Unavailable | Pending in the base snapshot, known per view (shown, hidden as `i32::MIN`, or unavailable) |
 
       Building the decision snapshot as unavailable when the draw decides the class is S10-07's.
