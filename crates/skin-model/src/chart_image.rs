@@ -440,6 +440,13 @@ pub fn read(
 /// a page of [`MAX_PAGE_SIDE`].
 pub const SOURCE_SIDE: u32 = MAX_PAGE_SIDE / 2;
 
+/// One image's whole-decode bound (design.md "Memory Budget", 161 MiB):
+/// the allocation limit a chart image's decode is held to, and a BGA
+/// picture's read, decode and cell, what each holds at once checked
+/// before the decode begins. A decoder's own buffers count by their
+/// bound, as no limit given to `image` reaches every decoder.
+pub const DECODE_LIMIT: u64 = 161 << 20;
+
 /// The slot a source is fitted for ([`read_source`]): the largest chart
 /// slot any installation can have, [`SOURCE_SIDE`] square.
 #[must_use]
@@ -600,7 +607,7 @@ fn read_resolved(
     drop(file);
     let (bytes, dims, header) = snapshot?;
     decode::check_whole(&bytes, dims, header).map_err(absent_of)?;
-    let image = decode::decode(bytes, dims).map_err(absent_of)?;
+    let (image, _) = decode::decode_alpha(bytes, dims, Some(DECODE_LIMIT)).map_err(absent_of)?;
     checkpoint(cancel, Site::Decoded)?;
     Ok(fit(image, slot, levels, cancel)?)
 }
