@@ -238,7 +238,17 @@ impl<'a> Reference<'a> {
         path: &'static str,
     ) -> Key {
         let callable = self.vm.callable(f).unwrap_or(u32::MAX);
-        if let std::collections::btree_map::Entry::Vacant(e) = self.observed.sites.entry(callable) {
+        // An observer's function is the host's: it is named by the call
+        // that returned it.
+        if let Some((_, site)) = self.vm.observer(f) {
+            self.observed.observers.insert(callable);
+            self.observed
+                .sites
+                .entry(callable)
+                .or_insert_with(|| site.unwrap_or_default());
+        } else if let std::collections::btree_map::Entry::Vacant(e) =
+            self.observed.sites.entry(callable)
+        {
             let info = f.info();
             e.insert((
                 info.source.unwrap_or_default().to_string(),
@@ -694,13 +704,17 @@ pub struct Fresh {
 /// fresh (design.md "beatoraja Lua Skins", the reference executor): the
 /// frames before the first round run on a reference of their own, and an
 /// outside frame on the reference of the round before it, so a write it
-/// makes reaches no later round. Every reference installs on the run's
-/// first play frame; one that installs other objects than the first fails
-/// the run. `page_point` is a test's override of one page's point.
+/// makes reaches no later round. Each observer's start is carried into
+/// the next round's reference, as the state clock runs on (and with it
+/// production's `screen`); a reference whose observers are other calls
+/// fails the run. Every reference installs on the run's first play frame;
+/// one that installs other objects than the first fails the run.
+/// `page_point` is a test's override of one page's point.
 ///
 /// # Errors
 ///
-/// `fresh` failing, or a reference installing other objects.
+/// `fresh` failing, or a reference installing other objects or holding
+/// other observers.
 pub fn run_rounds(
     frames: &[FrameInputs],
     mut fresh: impl FnMut() -> Result<Fresh, String>,
@@ -716,18 +730,27 @@ pub fn run_rounds(
     starts.insert(0, 0);
     starts.push(frames.len());
     let mut observed: Option<Observed> = None;
+    let mut carried: Option<skin_beatoraja::lua::replay::Observers> = None;
     for w in starts.windows(2) {
         let &[from, to] = w else { continue };
         let Some(segment) = frames.get(from..to) else {
             continue;
         };
         let f = fresh()?;
+        if let Some(c) = &carried {
+            f.vm.carry(c)
+                .map_err(|e| format!("the reference at frame {from}: {e}"))?;
+        }
         let mut reference = Reference::new(&f.vm, &f.items, &f.sources);
         reference.page_point = page_point;
         let part = reference.run_from(install, segment);
+        carried = Some(f.vm.observers());
         match &mut observed {
             None => observed = Some(part),
-            Some(o) if o.installed == part.installed => o.frames.extend(part.frames),
+            Some(o) if o.installed == part.installed => {
+                o.frames.extend(part.frames);
+                o.observers.extend(part.observers);
+            }
             Some(_) => {
                 return Err(format!(
                     "the reference at frame {from} installs other objects than the first"

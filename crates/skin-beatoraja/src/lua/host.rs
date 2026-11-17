@@ -345,7 +345,8 @@ fn registry_name(name: &str) -> String {
 /// destination's `timer` holds it. An `f` that is not a function, or not
 /// a skin closure (a host, library or sandbox function), refuses at the
 /// call, fatal and located. At runtime it reads play state, as the
-/// function it returns does whenever it is called.
+/// function it returns does whenever it is called; a development build's
+/// reference host answers that function ([`super::replay::observed`]).
 fn observe(lua: &Lua, arc: &Arc<Pass>, pass: &Pass, args: &MultiValue) -> mlua::Result<Value> {
     if pass.in_runtime() {
         #[cfg(feature = "dev-tools")]
@@ -366,12 +367,19 @@ fn observe(lua: &Lua, arc: &Arc<Pass>, pass: &Pass, args: &MultiValue) -> mlua::
             .ledger
             .fail_lua(lua, LuaWhy::Observer("predicate not a skin closure")));
     }
-    let face = host(lua, arc, 0, |lua, pass, _| -> mlua::Result<Value> {
+    let n = pass.next_observer(lua)?;
+    let face = host(lua, arc, 0, move |lua, pass, _| -> mlua::Result<Value> {
+        #[cfg(feature = "dev-tools")]
+        if pass.in_runtime()
+            && let Some(r) = super::replay::observed(lua, pass, n)
+        {
+            return r;
+        }
         Err(pass
             .ledger
             .fail_lua(lua, LuaWhy::LiveState { api: OBSERVE }))
     })?;
-    pass.observe(lua, &face, f, super::ledger::running(lua))?;
+    pass.observe(lua, (n, &face), f, super::ledger::running(lua))?;
     Ok(Value::Function(face))
 }
 
