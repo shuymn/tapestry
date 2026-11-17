@@ -153,6 +153,18 @@ impl AttemptContext {
         self
     }
 
+    /// The attempt with `stored`, when given, as its chart's difficulty
+    /// (`chart.difficulty`): the one the library stores for a chart chosen
+    /// on selection, declared or inferred, in place of the attempt's own
+    /// `#DIFFICULTY` (design.md "Play Lifecycle", the chart's labels).
+    #[must_use]
+    pub const fn with_difficulty(mut self, stored: Option<u8>) -> Self {
+        if let Some(d) = stored {
+            self.meta.difficulty = Some(d);
+        }
+        self
+    }
+
     /// The attempt with `notes` as autoplay's scratch notes.
     #[must_use]
     pub fn with_scratch_notes(mut self, notes: Vec<game::ScratchNote>) -> Self {

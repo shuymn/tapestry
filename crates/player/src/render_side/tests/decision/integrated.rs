@@ -257,6 +257,11 @@ struct Seen {
     /// as in Closing.
     playing: AtomicU64,
     closing: AtomicU64,
+    /// Each attempt's `chart.difficulty` as its preparation reached the
+    /// screen.
+    play_difficulties: Mutex<Vec<Option<u8>>>,
+    /// Each result view's chart difficulty as its layout was prepared.
+    result_difficulties: Mutex<Vec<Option<u8>>>,
 }
 
 impl Seen {
@@ -350,6 +355,11 @@ impl Screen for Noted {
         skin: Option<&Arc<SkinBundle>>,
         request: u64,
     ) -> Option<Result<Preparation, RenderError>> {
+        self.seen
+            .play_difficulties
+            .lock()
+            .unwrap()
+            .push(a.context.meta.difficulty);
         self.menu.prepare_attempt(a, skin, request)
     }
     fn device(&self) -> u64 {
@@ -469,6 +479,11 @@ impl Screen for Noted {
         view: &skin_model::ResultView,
         labels: &skin_model::ResultLabels,
     ) -> Result<Result<(), String>, RenderError> {
+        self.seen
+            .result_difficulties
+            .lock()
+            .unwrap()
+            .push(view.chart.difficulty);
         self.menu.prepare_result(skin, state, view, labels)
     }
     fn install_result_text(&mut self) -> bool {
@@ -3020,6 +3035,50 @@ fn result_sounds_through_a_run() {
             i += 1;
         }
     }
+}
+
+/// A chart that declares no `#DIFFICULTY`, its subtitle naming the third
+/// keyword step and its one note giving 1 by count, chosen on selection:
+/// the library's inferred difficulty (3) is what its play's
+/// `chart.difficulty` and its result's chart show, never the attempt's
+/// own header (none: 0 on play, none on the result).
+// Source: SF-021
+#[test]
+fn a_chosen_charts_stored_difficulty_reaches_play_and_result() {
+    let set = Set::with_result("s.luaskin", Some(result_skin(0)));
+    let opts = Opts {
+        user_preset: Some(user_preset(true)),
+        chart: Some("#TITLE a\n#SUBTITLE [HYPER]\n#BPM 120\n#00111:01\n#00138:01\n"),
+        ..Opts::default()
+    };
+    let seen = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+    let out = Arc::clone(&seen);
+    let ran = run_with(&set, None, opts, move |side| {
+        side.prepared();
+        let (chosen, ..) = side.choose(MenuKey::Enter);
+        // The decision screen's scene and fade-out over at once.
+        side.clock.set(TimeUs(chosen.0 + 3_000 * MS));
+        side.to_loading();
+        side.seen
+            .until("a play frame", |d| d.iter().any(|d| d.frame == Frame::Play));
+        side.clock.run();
+        side.seen.until("the result's first frame", |d| {
+            d.iter()
+                .any(|d| matches!(d.frame, Frame::Result { quads, .. } if quads > 0))
+        });
+        *out.lock().unwrap() = (
+            side.seen.play_difficulties.lock().unwrap().clone(),
+            side.seen.result_difficulties.lock().unwrap().clone(),
+        );
+    });
+    assert!(ran.ran.is_ok(), "{:?}", ran.ran);
+    let (play, result) = seen.lock().unwrap().clone();
+    assert!(
+        !play.is_empty() && !result.is_empty(),
+        "{play:?} {result:?}"
+    );
+    assert!(play.iter().all(|d| *d == Some(3)), "play: {play:?}");
+    assert!(result.iter().all(|d| *d == Some(3)), "result: {result:?}");
 }
 
 /// C26-1, C26-2, C26-3 through the whole run, the system sounds armed with

@@ -119,7 +119,9 @@ pub struct ResultChart {
     /// Its gauge total, whole.
     pub total: Option<u32>,
     pub bpm: Option<ResultBpm>,
-    /// Its `#DIFFICULTY` when it is 1 to 5.
+    /// Its difficulty when it is 1 to 5: for a chart chosen on selection
+    /// the one its library entry stores, declared or inferred, else its
+    /// `#DIFFICULTY`.
     pub difficulty: Option<u8>,
     /// Its length at 1×: its last note's end or BGM event, whichever is
     /// later, the source's `SongData.getLastTime()`

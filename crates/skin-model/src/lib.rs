@@ -196,7 +196,7 @@ pub use play::{
     AppReadouts, Attempt, BpmRange, BuildError, ChartMetadata, CoverSettings, DurationRatio,
     FrameReadouts, GaugeDesc, LoadState, LocalTime, NativeReadouts, NativeValues, OFFSET_SLOTS,
     Offsets, Play, PlayContext, PlayScore, PrepareError, RoundedDuration, ScoreBasis, SkinFrame,
-    attempt_targets,
+    attempt_targets, chart_notes,
 };
 pub use pointer::{
     ActionDef, Button, ClickType, HoverRect, MAX_SEARCH_BOXES, PointerDef, PointerError,

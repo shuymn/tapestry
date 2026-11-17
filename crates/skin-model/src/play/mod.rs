@@ -82,6 +82,14 @@ pub fn attempt_targets(chart: &Chart, attempt: &Attempt<'_>) -> u32 {
     reducer::count_targets(chart, section)
 }
 
+/// The whole chart's note count as the play's `chart.notes` gives it:
+/// every tap and long note of `chart`, whatever the attempt's section,
+/// clamped as the field is.
+#[must_use]
+pub fn chart_notes(chart: &Chart) -> i32 {
+    timers::chart_notes(reducer::count_targets(chart, None))
+}
+
 /// A play's best and target EX scores, read once when the play began and
 /// kept by each READY rearm of its attempt (stage 3, S10-10).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -246,8 +254,10 @@ pub struct PlayContext<'a> {
 /// the caller does not know it, which clears its validity.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ChartMetadata {
-    /// Its difficulty, `chart.difficulty`: `#DIFFICULTY` from 1 to 5, 0
-    /// for any other or none. A value above 5 is unknown.
+    /// Its difficulty, `chart.difficulty`, from 1 to 5, 0 for any other or
+    /// none: for a chart chosen on selection the one its library entry
+    /// stores, declared or inferred, else its `#DIFFICULTY`. A value above
+    /// 5 is unknown.
     pub difficulty: Option<u8>,
     /// Its judgment class, `chart.judge_class`: 0 the hardest to 4 the
     /// easiest, from its own rank as the reference computes it; `None`

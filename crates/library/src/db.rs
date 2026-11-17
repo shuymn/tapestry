@@ -204,7 +204,8 @@ pub fn create(conn: &Connection) -> rusqlite::Result<()> {
              density_average INTEGER,
              density_average_x100 INTEGER,
              gauge_total INTEGER,
-             main_bpm INTEGER
+             main_bpm INTEGER,
+             difficulty_level INTEGER NOT NULL
          );
          CREATE TABLE profiles (
              chart_id INTEGER PRIMARY KEY REFERENCES charts(id) ON DELETE CASCADE,
@@ -571,10 +572,10 @@ pub fn commit(
                  length_us, tempo_start, tempo_min, tempo_max, rank_kind, rank_value,
                  stagefile, banner, image_names, key_taps, key_longs, scratch_taps,
                  scratch_longs, density_peak, density_end, density_end_x100, density_average,
-                 density_average_x100, gauge_total, main_bpm, level)
+                 density_average_x100, gauge_total, main_bpm, level, difficulty_level)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17,
                  ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32,
-                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46)
+                 ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47)
              ON CONFLICT (path) DO UPDATE SET root = excluded.root, size = excluded.size,
                  mtime_ns = excluded.mtime_ns, sha256 = excluded.sha256, md5 = excluded.md5,
                  title = excluded.title, subtitle = excluded.subtitle,
@@ -598,7 +599,7 @@ pub fn commit(
                  density_average = excluded.density_average,
                  density_average_x100 = excluded.density_average_x100,
                  gauge_total = excluded.gauge_total, main_bpm = excluded.main_bpm,
-                 level = excluded.level
+                 level = excluded.level, difficulty_level = excluded.difficulty_level
              RETURNING id",
         )?;
         let mut put_profile = tx.prepare(
@@ -665,6 +666,7 @@ pub fn commit(
                     info.map(|i| i.total),
                     info.and_then(|i| i.main_bpm),
                     h.playlevel.as_deref().and_then(bms_parser::header_integer),
+                    crate::difficulty::of(h, summary),
                 ],
                 |r| r.get(0),
             )?;
@@ -697,7 +699,7 @@ pub const ENTRY_COLUMNS: &str = "c.path, c.size, c.mtime_ns, c.sha256, c.md5, c.
      c.bga, c.taps, c.longs, c.mines, c.length_us, c.tempo_start, c.tempo_min, c.tempo_max, \
      c.rank_kind, c.rank_value, c.stagefile, c.banner, c.image_names, c.key_taps, c.key_longs, \
      c.scratch_taps, c.scratch_longs, c.density_peak, c.density_end, c.density_end_x100, \
-     c.density_average, c.density_average_x100, c.gauge_total, c.main_bpm";
+     c.density_average, c.density_average_x100, c.gauge_total, c.main_bpm, c.difficulty_level";
 
 /// A tempo as a summary column stores it: `u128` does not fit an integer.
 const fn tempo_bytes(tempo: Tempo) -> [u8; 16] {
@@ -797,6 +799,7 @@ pub fn entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<ChartEntry> {
         rank: rank_of(r.get(22)?, r.get(23)?),
         images: images_of(r.get(24)?, r.get(25)?, r.get(26)?),
         info: info(r, 27)?,
+        difficulty: r.get(38)?,
     })
 }
 

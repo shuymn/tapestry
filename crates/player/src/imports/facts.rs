@@ -11,8 +11,12 @@ use skin_model::ScreenKind;
 /// The facts of an attempt at `loaded`'s chart with autoplay as
 /// `autoplay`: the play scene, autoplay known, the chart's judgment class
 /// from its own rank, by the rule every screen uses
-/// ([`JudgeClass::of_headers`], whatever the play preset judges with), and
-/// the chart's play level parsed by [`level_of`].
+/// ([`JudgeClass::of_headers`], whatever the play preset judges with),
+/// the chart's play level parsed by [`level_of`], its gauge total as the
+/// attempt takes it ([`game::song_total`], unfiltered: a total past what
+/// the number widget shows is a known fact the importer refuses when a
+/// text reads it), and its note count over the whole chart, whatever the
+/// attempt's section or speed ([`skin_model::chart_notes`]).
 pub fn attempt_facts(loaded: &Loaded, autoplay: bool) -> ImportFacts {
     ImportFacts {
         scene: ScreenKind::Play,
@@ -22,6 +26,8 @@ pub fn attempt_facts(loaded: &Loaded, autoplay: bool) -> ImportFacts {
         )),
         play_level: Fact::Known(level_of(&loaded.labels().playlevel)),
         result: Fact::Unavailable,
+        total: Fact::Known(game::song_total(loaded.chart())),
+        chart_notes: Fact::Known(skin_model::chart_notes(loaded.chart())),
     }
 }
 

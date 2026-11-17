@@ -242,10 +242,47 @@ fn an_attempt_reads_the_references_class_whatever_the_preset() {
                         judge_class: Fact::Known(class),
                         play_level: Fact::Known(0),
                         result: Fact::Unavailable,
+                        total: Fact::Known(260),
+                        chart_notes: Fact::Known(1),
                     },
                     "{text:?} {preset}"
                 );
             }
+        }
+    }
+}
+
+/// An attempt's facts hold the loaded chart's gauge total as the attempt
+/// takes it, unfiltered past what the number widget shows, and its note
+/// count over the whole chart, its taps and long notes and no mine, under
+/// either preset.
+#[test]
+fn an_attempts_facts_hold_the_charts_total_and_note_count() {
+    // `head`, then `notes - 1` taps on lane 1 from measure 2 and two mines;
+    // `loaded` adds one note.
+    let chart = |head: &str, notes: usize| {
+        let mut text = String::from(head);
+        let mut left = notes - 1;
+        let mut measure = 2;
+        while left > 0 {
+            let n = left.min(64);
+            text.push_str(&format!("#{measure:03}11:{}\n", "01".repeat(n)));
+            left -= n;
+            measure += 1;
+        }
+        text.push_str("#001D2:0101\n");
+        text
+    };
+    for preset in ["tapestry", "beatoraja-style"] {
+        for (text, total, notes) in [
+            (chart("#TOTAL 321\n", 1_234), 321, 1_234),
+            (chart("", 1_000), 460, 1_000),
+            (chart("#TOTAL 2147483648\n", 3), i32::MAX, 3),
+            (chart("#TOTAL 300.9\n", 2), 300, 2),
+        ] {
+            let facts = attempt_facts(&loaded(&text, preset), false);
+            assert_eq!(facts.total, Fact::Known(total), "{preset} {total}");
+            assert_eq!(facts.chart_notes, Fact::Known(notes), "{preset} {total}");
         }
     }
 }

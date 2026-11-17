@@ -54,8 +54,9 @@
 //!   have happened travels as a condition and a value, so paths are never
 //!   split.
 //! - **Refused**, each [`Unsupported`] following the callback's role:
-//!   loops, `goto`, function constructors, `^`, bitwise operators, `..`,
-//!   `#`, library calls but the five `math` functions, method calls, table
+//!   loops, `goto`, function constructors, `^`, bitwise operators, `..`
+//!   outside a play text's value or over an unknown operand, `#`, library
+//!   calls but the five `math` functions, method calls, table
 //!   constructors, varargs, `return` lists, recursion, a host argument that
 //!   is not a known integer, a definite Lua error on a reached path, and
 //!   string arithmetic or ordering.
@@ -76,7 +77,19 @@
 //! [`Node::Select`]'s arms; a text's `value` as it is, for the lowering to
 //! read its shape. For a text alone, the scene's constants fold (texts 1001
 //! to 1003, options 290 and 1008, recording no read) and a string read
-//! compares with `""`.
+//! compares with `""`. For a play text alone, the chart's facts fold
+//! through the analysis's import facts: number 368, the gauge total, and
+//! 74 and 106, the whole chart's note count, each read recorded once
+//! ([`Analysis::fact_reads`]). A total past
+//! [`READOUT_MAX`](skin_model::READOUT_MAX), what the number widget
+//! shows, is recorded and then refused, so the text follows its role; a
+//! pending fact stops the import, carried by the cancellation's fatal stop
+//! with [`Analysis::pending`] set; an unavailable one stays a read. In a
+//! play text's value, `..` of two known strings or numbers folds to the
+//! joined string ([`S::Built`]), a number written by the number text rule
+//! ([`super::number_text`]), its longest text charged before it is
+//! written: one past [`MAX_FOLDED_TEXT_BYTES`] is refused by the text's
+//! role, and the bytes of one within it are charged before it is built.
 //!
 //! The residual is a DAG in one arena a lowering, dropped with it. Every
 //! node is charged against [`MAX_EXPANDED_NODES`] before it is pushed
@@ -87,7 +100,7 @@
 //! depth bounded by [`MAX_AST_DEPTH`].
 
 use super::callback::{Admitted, Analysis, Captured, MAIN_STATE, fatal};
-use super::limits::{MAX_AST_DEPTH, MAX_EXPANDED_NODES};
+use super::limits::{MAX_AST_DEPTH, MAX_EXPANDED_NODES, MAX_FOLDED_TEXT_BYTES};
 use super::syntax::{Ast, Attrib, Bin, CHUNK_ENV, EXACT, Expr, List, NONE, Stmt, Un};
 use super::{HOST_APIS, LuaLimit, LuaWhy, Unsupported};
 use skin_model::present::{self, num};
@@ -124,6 +137,9 @@ pub(crate) enum S {
     Lit { file: u16, id: u32 },
     /// The empty string of a scene constant.
     Empty,
+    /// One a play text's `..` built, by its index among
+    /// [`Residual::built`]; compared by its bytes.
+    Built(u32),
 }
 
 /// A value known at import.
@@ -328,9 +344,17 @@ pub(crate) struct Residual {
     pub(crate) root: u32,
     /// Each slot's value as the invocation ends, by slot: what it stores.
     pub(crate) stores: Vec<(u16, u32)>,
+    /// The strings a play text's `..` built ([`S::Built`]), each at most
+    /// [`MAX_FOLDED_TEXT_BYTES`].
+    built: Vec<Box<[u8]>>,
 }
 
 impl Residual {
+    /// The bytes of built string `k`.
+    pub(crate) fn built(&self, k: u32) -> Option<&[u8]> {
+        self.built.get(k as usize).map(|b| &**b)
+    }
+
     pub(crate) fn node(&self, r: u32) -> Node {
         self.nodes
             .get(r as usize)
@@ -372,6 +396,7 @@ impl Residual {
             reads: Vec::new(),
             root: u32::try_from(nodes.len()).unwrap_or(1).saturating_sub(1),
             stores: Vec::new(),
+            built: Vec::new(),
         }
     }
 }
@@ -468,6 +493,8 @@ struct Eval<'a> {
     stack: Vec<u32>,
     /// The consumer is a text's value ([`Conv::Text`]).
     text: bool,
+    /// The consumer is a play text's value: the chart's facts fold.
+    play_text: bool,
     /// The call being evaluated is an operand of `==` or `~=` whose other
     /// operand is a literal 0: the one place a `float_number` read may be
     /// ([`Self::call`]). Taken by the next call.
@@ -499,6 +526,11 @@ pub(crate) fn evaluate(
         depth: 0,
         stack: Vec::new(),
         text: conv == Conv::Text,
+        play_text: conv == Conv::Text
+            && adm
+                .analysis()
+                .facts
+                .is_some_and(|f| f.scene == skin_model::ScreenKind::Play),
         zero_operand: false,
         cells,
         ret: None,
@@ -1207,6 +1239,7 @@ impl<'a> Eval<'a> {
                             .copied()
                     }
                     S::Empty => self.an.entry(t, b"").map_err(stop)?,
+                    S::Built(_) => return construct("a built string key"),
                 };
                 match c {
                     Some(c) => self.captured(c, None),
@@ -1280,6 +1313,11 @@ impl<'a> Eval<'a> {
                 {
                     return self.known(known);
                 }
+                if self.play_text
+                    && let Some(v) = self.chart_fact(api, arg)?
+                {
+                    return self.known(Val::Int(v.into()));
+                }
                 let r = self.push(Node::Read { api, arg })?;
                 charge(self.an, "read", 1)?;
                 did("read");
@@ -1288,6 +1326,48 @@ impl<'a> Eval<'a> {
             }
             Some(Val::Lib(l)) => self.library(f, l, args),
             _ => refuse(Unsupported::Callee),
+        }
+    }
+
+    /// A play text's read of a chart fact, `api` called with `arg`: the
+    /// known value, recorded first; a total past what the number widget
+    /// shows refused once recorded; a pending one stops the import with
+    /// [`Analysis::pending`] set; `None` for an unavailable one or any
+    /// other read.
+    fn chart_fact(&self, api: u16, arg: Option<i64>) -> R<Option<i32>> {
+        use super::facts::{Fact, FactId, FactRead, FactValue};
+        if HOST_APIS.get(usize::from(api)) != Some(&("main_state", "number")) {
+            return Ok(None);
+        }
+        let Some(fact) = arg
+            .and_then(|n| i32::try_from(n).ok())
+            .and_then(super::facts::chart_fact)
+        else {
+            return Ok(None);
+        };
+        let Some(facts) = self.an.facts else {
+            return Ok(None);
+        };
+        match facts.chart(fact) {
+            Fact::Known(v) => {
+                self.an.read_fact(FactRead {
+                    fact,
+                    value: FactValue::Int(v),
+                });
+                // Every total past the range stops here, so the recorded
+                // value, saturated past `i32`, is exact for reuse.
+                if fact == FactId::ChartTotal && !(0..=skin_model::READOUT_MAX).contains(&v) {
+                    return construct("a chart total past its range");
+                }
+                Ok(Some(v))
+            }
+            Fact::Pending => {
+                if self.an.pending.get().is_none() {
+                    self.an.pending.set(Some(fact));
+                }
+                Err(Stop::Fatal(LuaWhy::Cancelled))
+            }
+            Fact::Unavailable => Ok(None),
         }
     }
 
@@ -1393,6 +1473,8 @@ impl<'a> Eval<'a> {
                     charge(self.an, "str", units(b.len()))?;
                     crate::numeral::number(b).unwrap_or(0.0)
                 }
+                // Only a play text's value builds one.
+                S::Built(_) => return refuse(Unsupported::Type),
             };
             return self.known(Val::Float(d.to_bits()));
         }
@@ -1440,7 +1522,8 @@ impl<'a> Eval<'a> {
     fn binary(&mut self, f: &mut Frame<'a>, op: Bin, a: u32, b: u32) -> R<u32> {
         match op {
             Bin::Pow => return construct("^"),
-            Bin::Concat => return construct(".."),
+            // A play text's value alone joins its operands.
+            Bin::Concat if !self.play_text => return construct(".."),
             Bin::BAnd | Bin::BOr | Bin::BXor | Bin::Shl | Bin::Shr => return construct("bitwise"),
             _ => {}
         }
@@ -1460,6 +1543,11 @@ impl<'a> Eval<'a> {
                         }
                     }
                 }
+            }
+            Bin::Concat => {
+                let x = self.expr(f, a)?;
+                let y = self.expr(f, b)?;
+                self.concat(x, y)
             }
             _ => {
                 let zero = matches!(op, Bin::Eq | Bin::Ne);
@@ -1648,12 +1736,103 @@ impl<'a> Eval<'a> {
         Ok(acc)
     }
 
+    /// `..` of `x` and `y` in a play text's value: two known strings or
+    /// numbers joined into a built string, a number by the number text
+    /// rule; the result refused past [`MAX_FOLDED_TEXT_BYTES`] and its
+    /// bytes charged before it is built. A known operand Lua's `..` raises
+    /// on is a Lua error, the off value out of range, any other operand
+    /// refused.
+    fn concat(&mut self, x: u32, y: u32) -> R<u32> {
+        let (p, q) = (self.val(x), self.val(y));
+        let raises = |v: Option<Val>| {
+            matches!(
+                v,
+                Some(
+                    Val::Nil
+                        | Val::Bool(_)
+                        | Val::Table(_)
+                        | Val::Closure(_)
+                        | Val::Module(_)
+                        | Val::Host(_)
+                        | Val::Lib(_)
+                )
+            )
+        };
+        if raises(p) || raises(q) {
+            return construct("a Lua error");
+        }
+        if p == Some(Val::OffValue) || q == Some(Val::OffValue) {
+            return refuse(Unsupported::Range);
+        }
+        let (Some(p), Some(q)) = (p, q) else {
+            return construct("..");
+        };
+        let joined = {
+            let (a, b) = (self.piece(p)?, self.piece(q)?);
+            let len = a.len().saturating_add(b.len());
+            if len > MAX_FOLDED_TEXT_BYTES {
+                return construct("a folded string past its cap");
+            }
+            charge(self.an, "concat", units(len))?;
+            did("concat");
+            let mut joined = Vec::with_capacity(len);
+            joined.extend_from_slice(&a);
+            joined.extend_from_slice(&b);
+            joined.into_boxed_slice()
+        };
+        let k = u32::try_from(self.res.built.len()).map_err(|_| Stop::Unsupported(LIMITS))?;
+        self.res.built.push(joined);
+        self.known(Val::Str(S::Built(k)))
+    }
+
+    /// Known string or number `v` as the bytes `..` joins, a number by the
+    /// number text rule, its longest text charged before it is written.
+    fn piece(&self, v: Val) -> R<std::borrow::Cow<'_, [u8]>> {
+        use super::number_text::{NUMBER_TEXT_MAX, number_text};
+        use std::borrow::Cow;
+        if let Val::Str(s) = v {
+            return match self.str_bytes(s)? {
+                Some(b) => Ok(Cow::Borrowed(b)),
+                None => refuse(Unsupported::Type),
+            };
+        }
+        if !matches!(v, Val::Int(_) | Val::Float(_)) {
+            return construct("a Lua error");
+        }
+        charge(self.an, "number text", units(NUMBER_TEXT_MAX))?;
+        did("number text");
+        match num_val(v).and_then(number_text) {
+            Some(t) => Ok(Cow::Owned(t.into_bytes())),
+            None => construct("a Lua error"),
+        }
+    }
+
+    /// The bytes of known string `s`, a captured one's found by its id
+    /// (charged); `None` for an id no name holds.
+    fn str_bytes(&self, s: S) -> R<Option<&[u8]>> {
+        Ok(match s {
+            S::Empty => Some(b""),
+            S::Lit { file, id } => Some(self.bytes(file, id)),
+            S::Name(n) => {
+                charge(self.an, "str", units(self.an.names.len()))?;
+                did("str");
+                self.an
+                    .names
+                    .iter()
+                    .find(|&(_, &m)| m == n)
+                    .map(|(b, _)| &**b)
+            }
+            S::Built(k) => self.res.built(k),
+        })
+    }
+
     /// Whether known string `s` is empty.
     fn is_empty(&self, s: S) -> bool {
         match s {
             S::Empty => true,
             S::Lit { file, id } => self.bytes(file, id).is_empty(),
             S::Name(n) => self.an.names.get(&b""[..]) == Some(&n),
+            S::Built(k) => self.res.built(k).is_some_and(<[u8]>::is_empty),
         }
     }
 
@@ -1668,6 +1847,15 @@ impl<'a> Eval<'a> {
         };
         match (p, q) {
             (S::Empty, s) | (s, S::Empty) => Ok(self.is_empty(s)),
+            // Only names are unique by id: a built string by its bytes.
+            (S::Built(_), _) | (_, S::Built(_)) => {
+                let (Some(s), Some(t)) = (self.str_bytes(p)?, self.str_bytes(q)?) else {
+                    return refuse(Unsupported::Type);
+                };
+                charge(self.an, "str", units(s.len().max(t.len())))?;
+                did("str");
+                Ok(s == t)
+            }
             (S::Name(m), S::Name(n)) => Ok(m == n),
             (S::Lit { file, id }, S::Name(n)) | (S::Name(n), S::Lit { file, id }) => {
                 let s = self.bytes(file, id);

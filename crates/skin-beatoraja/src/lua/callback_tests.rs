@@ -900,6 +900,8 @@ fn known() -> super::facts::ImportFacts {
         judge_class: Fact::Known(Some(JudgeClass::Normal)),
         play_level: Fact::Known(12),
         result: Fact::Unavailable,
+        total: Fact::Unavailable,
+        chart_notes: Fact::Unavailable,
     }
 }
 
@@ -949,4 +951,77 @@ fn a_callback_s_fact_read_is_not_folded() {
         assert_eq!(callbacks, [lowered], "{facts:?}");
         assert_eq!(sources, ["(autoplay)"], "{facts:?}");
     }
+}
+
+/// A play skin whose text's value reads the gauge total through a local
+/// helper, so its lowering expands an instance, in a font file.
+fn total_text_skin() -> tempfile::TempDir {
+    let d = folder(&skin(
+        "local function high() return ms.number(368) >= 300 and \"high\" or \"low\" end\n\
+         skin.font = { { id = \"f\", path = \"f.ttf\" } }\n\
+         skin.text = { { id = \"t\", font = \"f\", size = 10, value = function() return high() end } }",
+        "{ id = \"t\", dst = { { x = 0, y = 0, w = 64, h = 10 } } },",
+    ));
+    std::fs::write(d.path().join("f.ttf"), [0_u8, 1, 0, 0, 0]).unwrap();
+    d
+}
+
+/// A cancellation requested after the configured pass, at the residual's
+/// first expansion, where a pending chart fact and a real cancellation
+/// share their carrier, stays a cancellation through the common import and
+/// the timed import: no chart fact was met pending. The same skin on the
+/// base facts ends pending on the gauge total through the same path.
+#[test]
+fn a_cancellation_after_the_configured_pass_stays_a_cancellation() {
+    use super::facts::{Fact, FactId, ImportFacts};
+    use super::ledger::Stop;
+    use skin_model::ScreenKind;
+    let d = total_text_skin();
+    let probe = Cancel::new();
+    let h = read_lua_header(d.path(), "s.luaskin", &probe).unwrap();
+    let config = Config::defaults(h.header());
+    let facts = ImportFacts {
+        total: Fact::Known(321),
+        chart_notes: Fact::Known(1_234),
+        ..known()
+    };
+    // Control: without the request, the text folds.
+    let (def, counts, store, reads) = h.configured(&config, &facts, &probe);
+    let o = h.finish(def, counts, store, reads, &config);
+    assert!(o.result.is_ok());
+    // The request made at the first expansion, after the configured pass.
+    let cancel = Cancel::new();
+    let (def, counts, store, reads) = h.configured(&config, &facts, &cancel);
+    let def = def.unwrap_or_else(|_| panic!("the configured pass completes"));
+    let remote = cancel.clone();
+    super::tests::at_expansion(move || remote.cancel());
+    let o = h.finish(Ok(def), counts, store, reads, &config);
+    assert!(
+        matches!(
+            o.result,
+            Err(Stop::Fault(ImportError::Lua {
+                why: LuaWhy::Cancelled,
+                ..
+            }))
+        ),
+        "a cancellation became pending"
+    );
+    #[cfg(feature = "dev-tools")]
+    {
+        let cancel = Cancel::new();
+        let remote = cancel.clone();
+        super::tests::at_expansion(move || remote.cancel());
+        assert!(matches!(
+            h.timed(&config, &facts, &cancel),
+            Err(ImportError::Lua {
+                why: LuaWhy::Cancelled,
+                ..
+            })
+        ));
+    }
+    // The base facts: the same carrier, with the pending fact set.
+    let base = ImportFacts::base(ScreenKind::Play, Fact::Known(true));
+    let (def, counts, store, reads) = h.configured(&config, &base, &probe);
+    let o = h.finish(def, counts, store, reads, &config);
+    assert!(matches!(o.result, Err(Stop::Pending(FactId::ChartTotal))));
 }
