@@ -19,8 +19,8 @@ use library::Name;
 use super::{Rig, pool_of, rig_with};
 use crate::chart_currency::CursorChart;
 use crate::chart_images::{
-    CHECK_HELD, CHECK_HOLD, ChartImageWorker, CursorId, EntryState, HELD_HARD, HOLD, HOLD_HARD,
-    PANIC, SlotState, Want,
+    CHECK_HELD, CHECK_HOLD, CHECK_PANIC, ChartImageWorker, CursorId, EntryState, HELD_HARD, HOLD,
+    HOLD_HARD, PANIC, SlotState, Want,
 };
 use crate::render_side::tests::wait_until;
 
@@ -169,8 +169,9 @@ impl Cursor {
     }
 }
 
-/// Lets go of [`HOLD`], [`HOLD_HARD`] and [`CHECK_HOLD`] when dropped, so a
-/// failing test leaves no read or check held for the next.
+/// Lets go of [`HOLD`], [`HOLD_HARD`] and [`CHECK_HOLD`], and clears
+/// [`CHECK_PANIC`], when dropped, so a failing test leaves no read or
+/// check held, and no check's panic, for the next.
 struct LetGo;
 
 impl Drop for LetGo {
@@ -178,6 +179,7 @@ impl Drop for LetGo {
         HOLD.store(false, Ordering::Release);
         HOLD_HARD.store(false, Ordering::Release);
         CHECK_HOLD.store(false, Ordering::Release);
+        CHECK_PANIC.store(false, Ordering::Release);
     }
 }
 
@@ -637,6 +639,97 @@ fn a_use_during_a_held_unchanged_check_is_checked_again() {
         assert_eq!(c.w.update_chart(false), CursorChart::Pending, "{case}");
         assert_eq!(c.w.checks_begun(), checks + 2, "{case}");
     }
+}
+
+/// An older use's follow-up never pushes out a newer due check: A's check
+/// is held, A is used again, and the cursor moves to B, which has an entry
+/// whose file changed. Released, A's unchanged result leaves B's check
+/// waiting, which withdraws B while the cursor stays on it.
+#[test]
+fn a_follow_up_check_keeps_the_cursor_rows_check() {
+    let _serial = crate::imports::tests::serial();
+    let _let_go = LetGo;
+    let c = cursor();
+    let (a, b) = (chart([640, 480], [300, 80]), chart([200, 100], [20, 10]));
+    c.rest_on(a.path(), named());
+    c.shown(a.path(), named());
+    c.rest_on(b.path(), named());
+    c.shown(b.path(), named());
+    // Back on A, a use: its check held after its observation.
+    CHECK_HOLD.store(true, Ordering::Release);
+    c.on(a.path(), named());
+    c.until(|_| CHECK_HELD.load(Ordering::Acquire));
+    // Another use of A, past what the held check covers.
+    c.w.update_chart(true);
+    std::thread::sleep(Duration::from_millis(20));
+    png(b.path(), "s.png", [100, 50]);
+    // On B: its use's check waits.
+    assert!(matches!(
+        c.on(b.path(), named()),
+        CursorChart::Resident { .. }
+    ));
+    CHECK_HOLD.store(false, Ordering::Release);
+    c.until(|c| c.w.checks_pending() == (false, false));
+    assert!(
+        c.w.entry(&row(b.path(), named())).is_none(),
+        "B's check pushed out"
+    );
+    assert!(c.w.take_changed() && c.w.take_rearm());
+    assert_eq!(c.w.update_chart(false), CursorChart::Pending);
+}
+
+/// A check that cannot start, and one that panics, leave their use due:
+/// each is tried again once and validates it. A second failure in a row
+/// leaves the use to the row's next use rather than retrying at every
+/// step.
+#[test]
+fn a_failed_check_is_tried_again_once() {
+    let _serial = crate::imports::tests::serial();
+    let _let_go = LetGo;
+    let c = cursor();
+    let d = chart([640, 480], [300, 80]);
+    let id = row(d.path(), named());
+    c.rest_on(d.path(), named());
+    c.shown(d.path(), named());
+    let due = |c: &Cursor| {
+        let (_, _, last_use, validated) = c.w.entry(&id).unwrap();
+        last_use > validated
+    };
+    // Refused to start.
+    let checks = c.w.checks_begun();
+    c.w.update_chart(true);
+    c.step_on(Spawner::refusing_owned(&[JobKind::ChartCheck]));
+    assert_eq!(c.w.checks_begun(), checks);
+    assert_eq!(c.w.checks_pending(), (false, true), "the use dropped");
+    c.settled();
+    assert_eq!(c.w.checks_begun(), checks + 1);
+    assert!(!due(&c));
+    // Panicked.
+    CHECK_PANIC.store(true, Ordering::Release);
+    c.w.update_chart(true);
+    c.settled();
+    assert_eq!(c.w.checks_begun(), checks + 3);
+    assert!(!due(&c));
+    // Panicked twice in a row: the use waits for the next one.
+    CHECK_PANIC.store(true, Ordering::Release);
+    c.w.update_chart(true);
+    c.step();
+    assert_eq!(c.w.checks_begun(), checks + 4);
+    // That check took the panic; its retry, begun at a later step, takes
+    // this one.
+    assert!(wait_until(|| !CHECK_PANIC.load(Ordering::Acquire)));
+    CHECK_PANIC.store(true, Ordering::Release);
+    c.settled();
+    assert_eq!(c.w.checks_begun(), checks + 5);
+    assert!(due(&c));
+    assert!(!CHECK_PANIC.load(Ordering::Acquire));
+    for _ in 0..20 {
+        c.step();
+    }
+    assert_eq!(c.w.checks_begun(), checks + 5, "retried at every step");
+    c.w.update_chart(true);
+    c.settled();
+    assert!(!due(&c));
 }
 
 /// A check's result counts only for the version it checked (AC-S15): A's

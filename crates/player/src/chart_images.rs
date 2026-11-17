@@ -91,6 +91,11 @@ pub static CHECK_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 #[cfg(test)]
 pub static CHECK_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Makes the next check of a selection entry panic (tests: a check's
+/// panic).
+#[cfg(test)]
+pub static CHECK_PANIC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[cfg(test)]
 thread_local! {
     /// Files decoded into sources, and fits derived from them, on this
@@ -669,6 +674,11 @@ fn unchanged(id: &CursorId, bindings: &[chart_image::Binding; 2]) -> bool {
         .all(|(name, kept)| binding_now(&dir, name, identity).same_as(kept));
     #[cfg(test)]
     hold_check();
+    #[cfg(test)]
+    assert!(
+        !CHECK_PANIC.swap(false, std::sync::atomic::Ordering::AcqRel),
+        "a check's panic (tests)"
+    );
     same
 }
 
@@ -851,6 +861,10 @@ struct Core {
     /// version.
     check: Option<Check>,
     check_queued: Option<(CursorId, u64)>,
+    /// A check that could not start or panicked was queued again; until a
+    /// check ends with a result, a further failure leaves its use to the
+    /// row's next use, so a failing check is not retried at every step.
+    check_retried: bool,
     /// Uses stamped so far.
     use_clock: u64,
     /// The update sent last (one of its slot is pinned).
@@ -983,6 +997,7 @@ impl ChartImageWorker {
                 pending_write: None,
                 check: None,
                 check_queued: None,
+                check_retried: false,
                 use_clock: 0,
                 sent: None,
                 entered: false,
@@ -2008,7 +2023,10 @@ impl Core {
     }
 
     /// Queues a check of `row`'s entry when it is due (a use not yet
-    /// validated) and no check running or waiting covers that use.
+    /// validated) and no check running or waiting covers that use. One
+    /// check waits: another row's waiting check is replaced only by a newer
+    /// use, so a follow-up for an older use never pushes out the due check
+    /// of a row used since.
     fn queue_check(&mut self, row: &CursorId) {
         let Some(e) = self.entries.get(row) else {
             return;
@@ -2024,12 +2042,18 @@ impl Core {
         {
             return;
         }
-        if self
-            .check_queued
-            .as_ref()
-            .is_some_and(|(r, v)| r == row && *v == version)
-        {
-            return;
+        if let Some((r, v)) = &self.check_queued {
+            if r == row && *v == version {
+                return;
+            }
+            let newer = self
+                .entries
+                .get(r)
+                .filter(|e| e.version == *v && e.last_use > e.validated)
+                .is_some_and(|e| e.last_use > last_use);
+            if r != row && newer {
+                return;
+            }
         }
         self.check_queued = Some((row.clone(), version));
     }
@@ -2081,7 +2105,13 @@ impl Core {
                     job,
                 });
             }
-            Err(e) => log::warn!("chart images: {e}"),
+            Err(e) => {
+                log::warn!("chart images: {e}");
+                // The use stays due: tried again at the next step, once.
+                if !std::mem::replace(&mut self.check_retried, true) {
+                    self.check_queued = Some((row, version));
+                }
+            }
         }
     }
 
@@ -2090,7 +2120,8 @@ impl Core {
     /// Unchanged, the uses up to the one it covered are validated, and a
     /// later use is checked next; a mismatch drops the entry, its slot
     /// freed, and when it is the cursor's row its value changes and its
-    /// read is requested again with no move.
+    /// read is requested again with no move. A panicked check leaves its
+    /// use due: it is checked again, once.
     fn check_finished(&mut self) {
         if !self.check.as_ref().is_some_and(|k| k.job.finished()) {
             return;
@@ -2101,10 +2132,13 @@ impl Core {
         let outcome = k.job.poll().map(|o| o.outcome);
         end_job(k.job, Instant::now() + STOP_WAIT);
         let same = match outcome {
-            Some(Outcome::Done(same)) => same,
+            Some(Outcome::Done(same)) => {
+                self.check_retried = false;
+                Some(same)
+            }
             Some(Outcome::Panicked(p)) => {
                 log::warn!("chart images: a check stopped unexpectedly: {}", p.0);
-                return;
+                None
             }
             Some(Outcome::Cancelled) | None => return,
         };
@@ -2118,6 +2152,12 @@ impl Core {
         if e.version != k.version || generation != k.generation {
             return;
         }
+        let Some(same) = same else {
+            if !std::mem::replace(&mut self.check_retried, true) {
+                self.queue_check(&k.row);
+            }
+            return;
+        };
         if same {
             e.validated = e.validated.max(k.covers);
             self.queue_check(&k.row);
