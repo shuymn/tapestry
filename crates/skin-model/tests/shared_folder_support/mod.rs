@@ -33,13 +33,38 @@ pub fn folder(prefix: &str, files: &[(String, Vec<u8>)]) -> PathBuf {
 /// The folder holding `files` under `base`: `<prefix>-<hash of files>`,
 /// with each file created unless it is there already.
 pub fn folder_in(base: &Path, prefix: &str, files: &[(String, Vec<u8>)]) -> PathBuf {
+    folder_in_marked(base, prefix, files, &mut |_| {})
+}
+
+/// Where [`folder_in_marked`] is when it calls its mark.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mark {
+    /// Its first step, creating the folder, is done.
+    AfterFirst,
+    /// Its last step, placing the last file, comes next.
+    BeforeLast,
+}
+
+/// [`folder_in`], calling `mark` between its steps: a time taken at
+/// [`Mark::AfterFirst`] and one taken at [`Mark::BeforeLast`] lie strictly
+/// between the placement's first file system step and its last.
+pub fn folder_in_marked(
+    base: &Path,
+    prefix: &str,
+    files: &[(String, Vec<u8>)],
+    mark: &mut dyn FnMut(Mark),
+) -> PathBuf {
     // `DefaultHasher::new` has fixed keys: every process of a build names
     // the same contents alike.
     let mut hasher = DefaultHasher::new();
     files.hash(&mut hasher);
     let dir = base.join(format!("{prefix}-{:016x}", hasher.finish()));
     std::fs::create_dir_all(&dir).unwrap();
-    for (name, bytes) in files {
+    mark(Mark::AfterFirst);
+    for (i, (name, bytes)) in files.iter().enumerate() {
+        if i + 1 == files.len() {
+            mark(Mark::BeforeLast);
+        }
         place(&dir, name, bytes);
     }
     dir

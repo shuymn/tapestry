@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
 use image::{Rgba, RgbaImage};
-use shared_folder_support::{create, folder_in, png};
+use shared_folder_support::{Mark, create, folder_in, folder_in_marked, png};
 use skin_model::{AtlasError, AtlasLimits, FileDef, Filter, ImageDef, ImageError, Sheet, Variant};
 
 /// Names the base folder a writer process places the files under.
@@ -195,6 +195,16 @@ fn a_file_with_other_bytes_is_refused() {
 
 /// Microseconds since the Unix epoch: a time the writer processes and the
 /// race read alike.
+///
+/// The system clock can step, and a step back during the race reorders
+/// the times, within a process and across processes. That cannot pass a
+/// race that met a file being replaced: a file found absent or unreadable
+/// fails the test whatever the times say. The times decide only the control
+/// that the race ran (each reader loaded within the placings), so a step
+/// can at worst pass a race whose reads met no placement, as a race that
+/// missed the replacements' short windows already passes.
+/// Std has no monotonic clock that compares across processes, and ordering
+/// the reads by files the writers write would add I/O to every round.
 fn unix_us() -> u64 {
     let since = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -205,8 +215,10 @@ fn unix_us() -> u64 {
 /// The writer process: waits for the start file it is given, then places
 /// the files under the base folder it is given, again and again until the
 /// stop file it is given exists. It prints, once it stopped, when it
-/// entered, how many times it placed the files, and when each placement
-/// began and ended.
+/// entered, how many times it placed the files, and for each placement when
+/// its first file system step was done and when its last one came next: a
+/// read between the two lies within the placement's I/O, wherever the
+/// writer is held up before or after it.
 #[test]
 #[ignore = "a writer process of a_reader_never_meets_a_file_being_placed"]
 fn writer() {
@@ -227,9 +239,12 @@ fn writer() {
     let mut placed = Vec::new();
     while !stop.exists() {
         assert!(waiting.elapsed() < LIMIT, "no stop file within {LIMIT:?}");
-        let began = unix_us();
-        folder_in(&base, "shared", &files);
-        placed.push((began, unix_us()));
+        let (mut began, mut ended) = (0, 0);
+        folder_in_marked(&base, "shared", &files, &mut |mark| match mark {
+            Mark::AfterFirst => began = unix_us(),
+            Mark::BeforeLast => ended = unix_us(),
+        });
+        placed.push((began, ended));
     }
     let mut out = std::io::stdout().lock();
     writeln!(out, "writer entered {entered}").unwrap();
@@ -262,7 +277,8 @@ fn spawn_writer(base: &Path, start: &Path, stop: &Path, fails: bool, out: &Path)
 /// What one writer process reported, its times in [`unix_us`].
 struct Wrote {
     entered: u64,
-    /// When each placement began and when it ended.
+    /// For each placement, when its first step was done and when its last
+    /// came next.
     placed: Vec<(u64, u64)>,
 }
 
@@ -474,7 +490,7 @@ fn race(base: &Path, fault: Fault) -> Raced {
     };
     let mut writers = Vec::new();
     let (spawned, mut started, mut let_go) = (unix_us(), 0, 0);
-    let (outputs, seen) = std::thread::scope(|s| {
+    let (outputs, seen, running) = std::thread::scope(|s| {
         let mut readers = Vec::new();
         // Whatever fails, from the first spawn on, the cleanup below runs.
         let outputs = std::panic::catch_unwind(AssertUnwindSafe(|| {
@@ -511,7 +527,8 @@ fn race(base: &Path, fault: Fault) -> Raced {
             wait_writers(&mut writers, start, &stop_file, stop_at)
         }));
         // The cleanup: the writers left end, and the readers stop, or the
-        // scope would wait for them for good.
+        // scope would wait for them for good. Checked below: no writer is
+        // left running.
         let _ = std::fs::write(&stop_file, b"");
         for (writer, _) in &mut writers {
             let _ = writer.kill();
@@ -520,8 +537,14 @@ fn race(base: &Path, fault: Fault) -> Raced {
         signals.go.store(true, Ordering::Release);
         signals.done.store(true, Ordering::Relaxed);
         let seen: Vec<Seen> = readers.into_iter().map(|r| r.join().unwrap()).collect();
-        (outputs, seen)
+        let running = writers
+            .iter_mut()
+            .map(|(writer, _)| writer.try_wait())
+            .filter(|status| !matches!(status, Ok(Some(_))))
+            .count();
+        (outputs, seen, running)
     });
+    assert_eq!(running, 0, "writers still running after the cleanup");
     let outputs = outputs.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
     Raced {
         outputs,
@@ -581,8 +604,9 @@ fn a_reader_not_spawned_ends_the_race() {
 /// fails this in some runs, not every: [`placing_again_keeps_each_file`]
 /// checks in every run that a placement replaces nothing. Only reads while
 /// a writer places count: each reader must load the folder in a round that
-/// lies wholly within the writers' placements, some writer placing the
-/// files at every moment from its start to its end.
+/// lies wholly within the writers' placements, some writer between the
+/// first and the last file system step of a placement at every moment from
+/// its start to its end.
 #[test]
 fn a_reader_never_meets_a_file_being_placed() {
     let base = base();
