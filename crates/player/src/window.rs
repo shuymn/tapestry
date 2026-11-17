@@ -51,6 +51,7 @@ use crate::menu_screen::WindowSink;
 use crate::pointer::{Capture, PointerShared};
 use crate::render_side::Extent;
 use crate::select::{MenuInput, MenuKey, MenuQueue};
+use crate::topmost::{LevelWindow, Topmost};
 use crate::tuning::KeyEvent;
 
 /// What the game and render threads ask of the window thread.
@@ -64,6 +65,9 @@ enum Ask {
     Caret,
     /// Show the cursor, or hide it (a play runs).
     Cursor(bool),
+    /// Look at the foreground window: another program's focus or
+    /// foreground changed while the window is topmost ([`crate::topmost`]).
+    Look,
 }
 
 /// What the window thread shares with the threads that draw into the
@@ -156,7 +160,7 @@ impl ShowWindow for Window {
 }
 
 /// The window's Win32 handle.
-fn hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
+pub(crate) fn hwnd(window: &Window) -> Option<windows::Win32::Foundation::HWND> {
     match window.window_handle().ok()?.as_raw() {
         RawWindowHandle::Win32(h) => Some(windows::Win32::Foundation::HWND(
             h.hwnd.get() as *mut std::ffi::c_void
@@ -349,6 +353,8 @@ struct App {
     pointer: Arc<PointerShared>,
     /// The mouse's held button, position and wheel fraction.
     capture: Capture,
+    /// Whether the window was made topmost.
+    topmost: Topmost,
 }
 
 impl ApplicationHandler<Ask> for App {
@@ -493,9 +499,12 @@ impl ApplicationHandler<Ask> for App {
                 self.ime.caret(w, caret);
             }
             (Ask::Cursor(shown), Some(w)) => show_cursor(w, shown),
+            (Ask::Look, w) => self.topmost.asked(w.as_ref()),
             (Ask::Ime(_) | Ask::Caret | Ask::Cursor(_), None) => {}
             (Ask::Exit, _) => {
-                // The window goes before the loop ends, on its own thread.
+                // The window goes before the loop ends, on its own thread,
+                // and its watch of the foreground with it.
+                self.topmost = Topmost::default();
                 self.window = None;
                 event_loop.exit();
             }
@@ -504,28 +513,55 @@ impl ApplicationHandler<Ask> for App {
 }
 
 impl App {
-    /// Shows the hidden window once its first frame was presented, or at
-    /// its deadline; until then the loop wakes to look again.
-    /// The window's focus is `focused`, as every focus change the window
-    /// reports goes: the pointer cancelled first on a loss, then the
-    /// controls told, which wake the game thread
-    /// ([`Capture::focus_changed`]).
+    /// The window's focus is `focused` ([`focus_changed`]).
     fn focus(&mut self, focused: bool) {
-        let controls = &self.controls;
-        self.capture
-            .focus_changed(&self.pointer, focused, |f| controls.focus(f));
+        let window = self.window.as_ref();
+        focus_changed(
+            &mut self.capture,
+            &self.pointer,
+            &self.controls,
+            &mut self.topmost,
+            window,
+            focused,
+        );
     }
 
+    /// Shows the hidden window once its first frame was presented, or at
+    /// its deadline; until then the loop wakes to look again.
     fn poll_showing(&mut self, event_loop: &ActiveEventLoop) {
         if let (Some(w), Some(showing)) = (&self.window, &mut self.showing) {
-            let (capture, pointer, controls) = (&mut self.capture, &self.pointer, &self.controls);
-            let focus = |f| capture.focus_changed(pointer, f, |f| controls.focus(f));
+            let (capture, pointer, controls, topmost) = (
+                &mut self.capture,
+                &self.pointer,
+                &self.controls,
+                &mut self.topmost,
+            );
+            let focus = |f| focus_changed(capture, pointer, controls, topmost, Some(w), f);
             let flow = match showing.poll(w, focus, &self.shared, Instant::now()) {
                 Some(next) => ControlFlow::WaitUntil(next),
                 None => ControlFlow::Wait,
             };
             event_loop.set_control_flow(flow);
         }
+    }
+}
+
+/// The window's focus is `focused`, as every focus change the window
+/// reports goes: the pointer cancelled first on a loss, then the controls
+/// told, which wake the game thread ([`Capture::focus_changed`]), then
+/// `window`'s topmost state ([`Topmost::focus`]), after the controls so a
+/// play's abort waits for nothing.
+fn focus_changed(
+    capture: &mut Capture,
+    pointer: &PointerShared,
+    controls: &Controls,
+    topmost: &mut Topmost,
+    window: Option<&impl LevelWindow>,
+    focused: bool,
+) {
+    capture.focus_changed(pointer, focused, |f| controls.focus(f));
+    if let Some(w) = window {
+        topmost.focus(w, focused);
     }
 }
 
@@ -823,6 +859,10 @@ pub fn open(
             };
             event_loop.listen_device_events(DeviceEvents::Never);
             let _ = proxy_tx.send(event_loop.create_proxy());
+            let looks = event_loop.create_proxy();
+            crate::topmost::on_look(move || {
+                let _ = looks.send_event(Ask::Look);
+            });
             let mut app = App {
                 controls: Arc::clone(&controls),
                 keys: Keys::new(retry, quit),
@@ -836,6 +876,7 @@ pub fn open(
                 shared: thread_shared,
                 pointer,
                 capture: Capture::default(),
+                topmost: Topmost::default(),
             };
             if let Err(e) = event_loop.run_app(&mut app) {
                 eprintln!("the event loop failed: {e}");
@@ -2601,5 +2642,286 @@ mod tests {
         // Observed after T, before any look of the screen.
         key_press(&mut w, code(KeyCode::Escape), false, false, None);
         assert!(w.2.take_escape(deadline), "an Escape after T did not leave");
+    }
+
+    /// No window, the handles of the window itself, an ordinary window
+    /// and a topmost window, as the fakes know them.
+    const NONE: usize = 0;
+    const OWN: usize = 1;
+    const ORDINARY: usize = 2;
+    const TOPMOST: usize = 3;
+
+    fn handle(h: usize) -> windows::Win32::Foundation::HWND {
+        windows::Win32::Foundation::HWND(std::ptr::without_provenance_mut(h))
+    }
+
+    /// The fullscreen window as the topmost state sees it: the foreground
+    /// window, and what was done to it, with whether the controls had
+    /// focus then.
+    struct LevelSeen<'a> {
+        controls: &'a Controls,
+        front: std::cell::Cell<usize>,
+        done: std::cell::RefCell<Vec<(&'static str, bool)>>,
+    }
+
+    impl<'a> LevelSeen<'a> {
+        fn new(controls: &'a Controls) -> Self {
+            Self {
+                controls,
+                front: std::cell::Cell::new(OWN),
+                done: std::cell::RefCell::default(),
+            }
+        }
+
+        fn push(&self, what: &'static str) {
+            let focused = self.controls.focused();
+            self.done.borrow_mut().push((what, focused));
+        }
+
+        fn what(&self) -> Vec<&'static str> {
+            self.done.take().into_iter().map(|(what, _)| what).collect()
+        }
+    }
+
+    impl crate::topmost::LevelWindow for LevelSeen<'_> {
+        fn fullscreen(&self) -> bool {
+            true
+        }
+
+        fn shown(&self) -> bool {
+            true
+        }
+
+        fn foreground(&self) -> windows::Win32::Foundation::HWND {
+            handle(self.front.get())
+        }
+
+        fn is(&self, front: windows::Win32::Foundation::HWND) -> bool {
+            front == handle(OWN)
+        }
+
+        fn is_topmost(&self, front: windows::Win32::Foundation::HWND) -> bool {
+            front == handle(TOPMOST)
+        }
+
+        fn watch(&self) -> Option<crate::topmost::Watch> {
+            self.push("watch");
+            Some(crate::topmost::Watch::fake())
+        }
+
+        fn raise(&self) {
+            self.push("raise");
+        }
+
+        fn lower(&self, after: windows::Win32::Foundation::HWND) -> bool {
+            self.push(if after == handle(ORDINARY) {
+                "behind the ordinary window"
+            } else if after == windows::Win32::UI::WindowsAndMessaging::HWND_NOTOPMOST {
+                "on top of the ordinary windows"
+            } else {
+                "elsewhere"
+            });
+            true
+        }
+    }
+
+    /// A look the watch asks for reaches the topmost state, which decides
+    /// from the foreground window then: the window itself in front changes
+    /// nothing; a focus loss while no window is in front waits; an ordinary
+    /// window in front puts the window directly behind it; after focus came
+    /// back, a topmost window in front (the task switcher) puts it on top
+    /// of the ordinary windows; with no window yet, nothing happens.
+    #[test]
+    fn a_look_places_the_window_behind_the_window_in_front() {
+        let c = Controls::new(QpcClock::start());
+        let w = LevelSeen::new(&c);
+        let mut capture = crate::pointer::Capture::default();
+        let pointer = crate::pointer::PointerShared::default();
+        let mut topmost = crate::topmost::Topmost::default();
+        topmost.asked(None::<&LevelSeen<'_>>);
+        super::focus_changed(&mut capture, &pointer, &c, &mut topmost, Some(&w), true);
+        topmost.asked(Some(&w));
+        w.front.set(NONE);
+        super::focus_changed(&mut capture, &pointer, &c, &mut topmost, Some(&w), false);
+        w.front.set(ORDINARY);
+        topmost.asked(Some(&w));
+        w.front.set(OWN);
+        super::focus_changed(&mut capture, &pointer, &c, &mut topmost, Some(&w), true);
+        w.front.set(TOPMOST);
+        topmost.asked(Some(&w));
+        assert_eq!(
+            w.what(),
+            [
+                "watch",
+                "raise",
+                "behind the ordinary window",
+                "watch",
+                "raise",
+                "on top of the ordinary windows"
+            ]
+        );
+    }
+
+    /// Every focus change the window reports reaches the controls, then
+    /// the window's topmost state: gained, the window watches and is made
+    /// topmost with the controls focused; lost with another window in
+    /// front, it goes behind that window once the controls, and so a play's
+    /// focus latch, have seen the loss; regained, it is topmost again.
+    /// Before the window exists the controls are told all the same.
+    #[test]
+    fn a_focus_change_reaches_the_controls_then_the_topmost_state() {
+        let c = Controls::new(QpcClock::start());
+        let w = LevelSeen::new(&c);
+        let mut capture = crate::pointer::Capture::default();
+        let pointer = crate::pointer::PointerShared::default();
+        let mut topmost = crate::topmost::Topmost::default();
+        let mut focus = |window: Option<&LevelSeen<'_>>, focused| {
+            super::focus_changed(&mut capture, &pointer, &c, &mut topmost, window, focused);
+        };
+        focus(None, false);
+        assert!(!c.focused());
+        focus(Some(&w), true);
+        w.front.set(ORDINARY);
+        focus(Some(&w), false);
+        assert!(!c.focused());
+        w.front.set(OWN);
+        focus(Some(&w), true);
+        assert_eq!(
+            *w.done.borrow(),
+            [
+                ("watch", true),
+                ("raise", true),
+                ("behind the ordinary window", false),
+                ("watch", true),
+                ("raise", true)
+            ]
+        );
+        focus(None, false);
+        assert!(!c.focused());
+    }
+
+    /// The hidden fullscreen window as showing and the topmost state see
+    /// it: whether Windows refuses it the foreground when it is shown and
+    /// when it asks, whether it is shown and in front, and what was done to
+    /// it, in order.
+    #[derive(Default)]
+    struct HiddenActive {
+        refused: bool,
+        visible: std::cell::Cell<bool>,
+        front: std::cell::Cell<bool>,
+        done: std::cell::RefCell<Vec<&'static str>>,
+    }
+
+    impl super::ShowWindow for HiddenActive {
+        fn show_active(&self) {
+            self.visible.set(true);
+            self.front.set(!self.refused);
+            self.done.borrow_mut().push("show");
+        }
+
+        fn has_focus(&self) -> bool {
+            self.front.get()
+        }
+
+        fn ask_foreground(&self) -> bool {
+            self.done.borrow_mut().push("ask");
+            self.front.set(!self.refused);
+            !self.refused
+        }
+
+        fn flash(&self) {
+            self.done.borrow_mut().push("flash");
+        }
+    }
+
+    impl crate::topmost::LevelWindow for HiddenActive {
+        fn fullscreen(&self) -> bool {
+            true
+        }
+
+        fn shown(&self) -> bool {
+            self.visible.get()
+        }
+
+        fn foreground(&self) -> windows::Win32::Foundation::HWND {
+            handle(OWN)
+        }
+
+        fn is(&self, front: windows::Win32::Foundation::HWND) -> bool {
+            front == handle(OWN)
+        }
+
+        fn is_topmost(&self, _: windows::Win32::Foundation::HWND) -> bool {
+            false
+        }
+
+        fn watch(&self) -> Option<crate::topmost::Watch> {
+            self.done.borrow_mut().push("watch");
+            Some(crate::topmost::Watch::fake())
+        }
+
+        fn raise(&self) {
+            self.done.borrow_mut().push("raise");
+        }
+
+        fn lower(&self, _: windows::Win32::Foundation::HWND) -> bool {
+            self.done.borrow_mut().push("lower");
+            true
+        }
+    }
+
+    /// The window is never made topmost before it shows: a focus reported
+    /// while it is hidden, before its first frame (when the render thread
+    /// sets up its swap chain), raises nothing, and the show, once a frame
+    /// was presented and Windows let the window take the foreground, makes
+    /// it topmost after it is shown.
+    #[test]
+    fn the_window_is_made_topmost_only_once_shown() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+        let c = Controls::new(QpcClock::start());
+        let w = HiddenActive::default();
+        let mut capture = crate::pointer::Capture::default();
+        let pointer = crate::pointer::PointerShared::default();
+        let mut topmost = crate::topmost::Topmost::default();
+        let shared = super::Shared::default();
+        let start = Instant::now();
+        let mut showing = super::Showing::new(start);
+        let mut focus = |focused| {
+            super::focus_changed(&mut capture, &pointer, &c, &mut topmost, Some(&w), focused);
+        };
+        focus(true);
+        assert!(showing.poll(&w, &mut focus, &shared, start).is_some());
+        assert_eq!(*w.done.borrow(), Vec::<&str>::new());
+        shared.presented.store(true, Ordering::Release);
+        assert_eq!(showing.poll(&w, &mut focus, &shared, start), None);
+        assert_eq!(*w.done.borrow(), ["show", "watch", "raise"]);
+    }
+
+    /// A window shown behind the window in front (Windows refused it the
+    /// foreground, and again when it asked) is not made topmost: the show
+    /// reports no focus, and it waits for the player to bring it forward.
+    #[test]
+    fn a_window_shown_behind_the_window_in_front_is_not_made_topmost() {
+        use std::sync::atomic::Ordering;
+        use std::time::Instant;
+        let c = Controls::new(QpcClock::start());
+        let w = HiddenActive {
+            refused: true,
+            ..HiddenActive::default()
+        };
+        let mut capture = crate::pointer::Capture::default();
+        let pointer = crate::pointer::PointerShared::default();
+        let mut topmost = crate::topmost::Topmost::default();
+        let shared = super::Shared::default();
+        let start = Instant::now();
+        let mut showing = super::Showing::new(start);
+        let mut focus = |focused| {
+            super::focus_changed(&mut capture, &pointer, &c, &mut topmost, Some(&w), focused);
+        };
+        shared.presented.store(true, Ordering::Release);
+        assert_eq!(showing.poll(&w, &mut focus, &shared, start), None);
+        assert_eq!(*w.done.borrow(), ["show", "ask", "flash"]);
+        assert!(!c.focused());
     }
 }
