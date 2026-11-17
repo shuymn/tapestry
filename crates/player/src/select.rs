@@ -3302,6 +3302,16 @@ mod tests {
             s.view(0, 0, true).selected.unwrap().max_ex
         };
         assert_eq!(max(&e, Some(rules::tapestry())), Some(30));
+        // A chart with no record keeps its largest EX score, a fact of the
+        // chart (docs/stage3.md D32).
+        let mut unplayed = SelectScreen::new(Vec::new());
+        unplayed.set_entries(vec![e.clone()]);
+        unplayed.set_bests_preset(Some(rules::tapestry()));
+        let selected = unplayed.view(0, 0, true).selected.unwrap();
+        assert_eq!(
+            (selected.max_ex, selected.score),
+            (Some(30), skin_model::RowScore::Unplayed)
+        );
         let mut heavier = rules::tapestry();
         heavier.score.ex.great = 4;
         assert_eq!(max(&e, Some(heavier)), Some(60));
