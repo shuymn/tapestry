@@ -126,9 +126,14 @@ fn an_observation_says_where_each_element_stopped() {
     assert_eq!(observed(&h, 0).outcome, Outcome::Sampled);
     // On `ready`, from the play's lead-in.
     assert!(observed(&h, 0).t.is_some_and(|t| t > TimeUs(0)));
+    assert_eq!(observed(&h, 0).age, observed(&h, 0).t);
     assert_eq!(observed(&h, 1).outcome, Outcome::NotSampled);
     assert_eq!(observed(&h, 1).t, None);
+    // Its timer's age, recorded before its track gave no sample.
+    assert_eq!(observed(&h, 1).age, observed(&h, 0).t);
     assert_eq!(observed(&h, 2).outcome, Outcome::NotSampled);
+    assert_eq!(observed(&h, 2).age, None, "its timer is off");
+    assert_eq!(observed(&h, 7).age, None, "stopped before its track");
     let number = observed(&h, 3);
     assert_eq!((number.outcome, number.value), (Outcome::Sampled, Some(42)));
     let selected = observed(&h, 4);

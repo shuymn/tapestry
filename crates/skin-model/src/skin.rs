@@ -4798,6 +4798,8 @@ impl Skin {
                     out.observed(crate::observation::Outcome::RegionHidden);
                     continue;
                 }
+                #[cfg(feature = "dev-tools")]
+                out.observed_age(rt.starts.at(e.slot).map(|s| elapsed_us(now, s)));
                 let Some((_t, s)) =
                     sample(rt.starts, now, state, e.slot, e.visible.as_ref(), &e.track)
                 else {
@@ -4866,6 +4868,8 @@ impl Skin {
                 None => None,
             };
             let track = choice.and_then(|p| p.track.as_ref()).unwrap_or(&e.track);
+            #[cfg(feature = "dev-tools")]
+            out.observed_age(rt.starts.at(e.slot).map(|s| elapsed_us(now, s)));
             let Some((t, s)) = sample(rt.starts, now, state, e.slot, e.visible.as_ref(), track)
             else {
                 #[cfg(feature = "dev-tools")]
