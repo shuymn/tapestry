@@ -2920,6 +2920,23 @@ fn a_folded_string_reads_as_its_bytes() {
     ] {
         folds_to(value, &facts, want);
     }
+    // A field tested against an empty folded string, and a folded string
+    // as its fallback; a nonempty one is no empty test.
+    for value in [
+        "function() local tx = ms.text(12)\n\
+           if tx == (\"\" .. \"\") then return \"none\" else return tx end end",
+        "function() local tx = ms.text(12)\n\
+           if tx == \"\" then return \"no\" .. \"ne\" else return tx end end",
+    ] {
+        assert_eq!(text_lines(value, &FULL), ["T S"], "{value}");
+        assert_eq!(text_lines(value, &NO_TEXT), ["none"], "{value}");
+    }
+    follows_role(
+        "function() local tx = ms.text(12)\n\
+           if tx == (\"no\" .. \"ne\") then return \"none\" else return tx end end",
+        &facts,
+        Unsupported::Type,
+    );
     let i = imported_with(
         &facts_folder(
             "local t = { ab = \"hit\" }",
