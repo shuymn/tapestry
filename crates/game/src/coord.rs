@@ -193,6 +193,10 @@ pub enum JobKind {
     /// The chosen chart's stage file and back image read and fitted (its
     /// owned image worker, S10-12).
     ChartImages,
+    /// A selection row's kept chart images checked against their files'
+    /// metadata after a use, reading no image (design.md "Load Pipeline",
+    /// Freshness).
+    ChartCheck,
 }
 
 /// What tells jobs apart: two of one key are one job. The speed is
@@ -276,7 +280,8 @@ impl Owner {
 /// rule: a panic is fatal when the owner was [`Owner::Foreground`] or the
 /// job `responsible`, otherwise recoverable; a cancellation is no failure.
 /// One exception: a [`JobKind::ChartImages`] job's panic is that job's own
-/// terminal absence (its images not yet finished are absent) and never the
+/// terminal absence (its images not yet finished are absent), and a
+/// [`JobKind::ChartCheck`] job's validates nothing; neither is ever the
 /// run's, whatever its owner, as the chart's images are decorative and the
 /// source catches their failures (S10-12, design C13).
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -57,6 +57,7 @@ const fn kind_name(kind: JobKind) -> &'static str {
         JobKind::Ingest => "read",
         JobKind::Bank => "sound decode",
         JobKind::ChartImages => "images",
+        JobKind::ChartCheck => "image check",
     }
 }
 
