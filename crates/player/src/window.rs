@@ -440,7 +440,7 @@ impl ApplicationHandler<Ask> for App {
                 self.ime.caret(w, caret);
             }
             (Ask::Cursor(shown), Some(w)) => show_cursor(w, shown),
-            (Ask::Look, w) => look(&mut self.topmost, w.as_ref()),
+            (Ask::Look, w) => self.topmost.asked(w.as_ref()),
             (Ask::Ime(_) | Ask::Caret | Ask::Cursor(_), None) => {}
             (Ask::Exit, _) => {
                 // The window goes before the loop ends, on its own thread,
@@ -503,14 +503,6 @@ fn focus_changed(
     capture.focus_changed(pointer, focused, |f| controls.focus(f));
     if let Some(w) = window {
         topmost.focus(w, focused);
-    }
-}
-
-/// The topmost window's watch asked for a look ([`Ask::Look`]): `window`'s
-/// topmost state looks at the foreground window ([`Topmost::look`]).
-fn look(topmost: &mut Topmost, window: Option<&impl LevelWindow>) {
-    if let Some(w) = window {
-        topmost.look(w);
     }
 }
 
@@ -2402,17 +2394,17 @@ mod tests {
         let mut capture = crate::pointer::Capture::default();
         let pointer = crate::pointer::PointerShared::default();
         let mut topmost = crate::topmost::Topmost::default();
-        super::look(&mut topmost, None::<&LevelSeen<'_>>);
+        topmost.asked(None::<&LevelSeen<'_>>);
         super::focus_changed(&mut capture, &pointer, &c, &mut topmost, Some(&w), true);
-        super::look(&mut topmost, Some(&w));
+        topmost.asked(Some(&w));
         w.front.set(NONE);
         super::focus_changed(&mut capture, &pointer, &c, &mut topmost, Some(&w), false);
         w.front.set(ORDINARY);
-        super::look(&mut topmost, Some(&w));
+        topmost.asked(Some(&w));
         w.front.set(OWN);
         super::focus_changed(&mut capture, &pointer, &c, &mut topmost, Some(&w), true);
         w.front.set(TOPMOST);
-        super::look(&mut topmost, Some(&w));
+        topmost.asked(Some(&w));
         assert_eq!(
             w.what(),
             [

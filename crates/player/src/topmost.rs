@@ -133,15 +133,29 @@ impl Topmost {
         }
     }
 
-    /// Looks at the foreground window now: the window's focus loss, or a
-    /// focus or foreground event from another program ([`Watch`]). While
-    /// the window is topmost and another window is in front, it goes
-    /// directly behind that window ([`behind`]) and stops watching; when the
-    /// window is itself in front, or none is (Windows has not set the new
-    /// one yet), it waits for the next look. A placement Windows ignored
-    /// leaves it topmost and watching, for the next look to try again.
-    pub fn look(&mut self, window: &impl LevelWindow) {
+    /// A look the watch asked for ([`signal`]) was taken from the window
+    /// thread's event loop: events may ask for another from now on, and
+    /// `window`, once it exists, looks ([`Topmost::look`]).
+    pub fn asked(&mut self, window: Option<&impl LevelWindow>) {
         LOOK_POSTED.set(false);
+        if let Some(w) = window {
+            self.look(w);
+        }
+    }
+
+    /// Looks at the foreground window now: at the window's focus loss, or
+    /// asked for by a focus or foreground event from another program
+    /// ([`Watch`]). While the window is topmost and another window is in
+    /// front, it goes directly behind that window ([`behind`]) and stops
+    /// watching; when the window is itself in front, or none is (Windows
+    /// has not set the new one yet), it waits for the next look. A
+    /// placement Windows ignored leaves it topmost and watching, for the
+    /// next look to try again. A foreground window that changed while the
+    /// window was placed (the task switcher's choice taking the foreground)
+    /// leaves it watching and asks for another look, which places it behind
+    /// the window in front then: placed after the task switcher, the window
+    /// would otherwise stay in front of the window chosen.
+    fn look(&mut self, window: &impl LevelWindow) {
         if self.watch.is_none() {
             return;
         }
@@ -149,7 +163,10 @@ impl Topmost {
         if front.is_invalid() || window.is(front) {
             return;
         }
-        if window.lower(behind(front, window.is_topmost(front))) {
+        let lowered = window.lower(behind(front, window.is_topmost(front)));
+        if window.foreground() != front {
+            ask_look();
+        } else if lowered {
             self.watch = None;
         }
     }
@@ -184,7 +201,6 @@ impl Watch {
             return None;
         }
         OWN.set(own.0.addr());
-        LOOK_POSTED.set(false);
         Some(watch)
     }
 
@@ -229,15 +245,16 @@ fn hook(event: u32) -> HWINEVENTHOOK {
 }
 
 /// Where a look is asked for: the window thread's event loop, which hands
-/// it to [`Topmost::look`].
+/// it to [`Topmost::asked`].
 type Sink = Box<dyn Fn()>;
 
 thread_local! {
-    /// Where [`signal`] asks for a look on this thread ([`on_look`]).
+    /// Where a look is asked for on this thread ([`on_look`]).
     static SINK: RefCell<Option<Sink>> = const { RefCell::new(None) };
     /// The watching window's handle.
     static OWN: Cell<usize> = const { Cell::new(0) };
-    /// Whether a look was asked for and not yet taken.
+    /// Whether a look was asked for and not yet taken from the event loop
+    /// ([`Topmost::asked`]).
     static LOOK_POSTED: Cell<bool> = const { Cell::new(false) };
 }
 
@@ -262,17 +279,25 @@ unsafe extern "system" fn signalled(
     signal(unsafe { GetForegroundWindow() });
 }
 
-/// Asks the sink for one look when `front`, the foreground window now, is
-/// another window than the watching one, unless a look is already asked
-/// for: while the window is in front (the play), the events of other
-/// programs ask for nothing.
+/// Asks for a look when `front`, the foreground window now, is another
+/// window than the watching one ([`ask_look`]): while the window is in
+/// front (the play), the events of other programs ask for nothing.
 fn signal(front: HWND) {
-    if front.is_invalid() || front.0.addr() == OWN.get() || LOOK_POSTED.get() {
+    if front.is_invalid() || front.0.addr() == OWN.get() {
         return;
     }
-    LOOK_POSTED.set(true);
+    ask_look();
+}
+
+/// Asks the sink for one look, unless one is asked for and not yet taken
+/// from the event loop: one waits at a time.
+fn ask_look() {
+    if LOOK_POSTED.get() {
+        return;
+    }
     SINK.with(|s| {
         if let Some(sink) = &*s.borrow() {
+            LOOK_POSTED.set(true);
             sink();
         }
     });
@@ -379,13 +404,15 @@ mod tests {
     }
 
     /// The window as the topmost state sees it: whether it is fullscreen,
-    /// hidden or refused a watch, the foreground window, whether Windows
+    /// hidden or refused a watch, the foreground window, the one that
+    /// takes the foreground while the window is placed, whether Windows
     /// ignores its placement, and what was done to it.
     struct FakeLevel {
         fullscreen: bool,
         hidden: Cell<bool>,
         unwatchable: bool,
         front: Cell<usize>,
+        front_after_lower: Cell<Option<usize>>,
         stuck: Cell<bool>,
         done: RefCell<Vec<String>>,
     }
@@ -404,6 +431,7 @@ mod tests {
                 hidden: Cell::new(false),
                 unwatchable: false,
                 front: Cell::new(OWN),
+                front_after_lower: Cell::new(None),
                 stuck: Cell::new(false),
                 done: RefCell::default(),
             }
@@ -451,6 +479,9 @@ mod tests {
                 format!("{}", after.0.addr())
             };
             self.done.borrow_mut().push(format!("after {after}"));
+            if let Some(front) = self.front_after_lower.take() {
+                self.front.set(front);
+            }
             !self.stuck.get()
         }
     }
@@ -637,9 +668,60 @@ mod tests {
         super::signal(handle(ORDINARY));
         super::signal(handle(TOPMOST));
         assert_eq!(looks.get(), 1);
-        Topmost::default().look(&FakeLevel::fullscreen());
+        Topmost::default().asked(None::<&FakeLevel>);
         super::signal(handle(ORDINARY));
         assert_eq!(looks.get(), 2);
+    }
+
+    /// A look asked for stays the only one until the event loop takes it:
+    /// the focus loss's own look and a new watch do not let events ask for
+    /// a second one; taken, the next event asks again.
+    #[test]
+    fn a_look_asked_for_stays_the_only_one_until_the_event_loop_takes_it() {
+        let looks = Rc::new(Cell::new(0));
+        let sink = Rc::clone(&looks);
+        super::on_look(move || sink.set(sink.get() + 1));
+        let w = FakeLevel::fullscreen();
+        let mut t = Topmost::default();
+        t.focus(&w, true);
+        super::OWN.set(OWN);
+        super::signal(handle(ORDINARY));
+        assert_eq!(looks.get(), 1);
+        w.front.set(NONE);
+        t.focus(&w, false);
+        let window = Popup::new();
+        drop(Watch::start(window.0).expect("both hooks"));
+        super::signal(handle(ORDINARY));
+        assert_eq!(looks.get(), 1);
+        t.asked(Some(&w));
+        super::signal(handle(ORDINARY));
+        assert_eq!(looks.get(), 2);
+    }
+
+    /// A foreground window that changes while the window is placed (the
+    /// task switcher's choice taking the foreground just after the look saw
+    /// the switcher) leaves the window watching and asks for another look,
+    /// which puts it directly behind the window in front then and ends the
+    /// watch.
+    #[test]
+    fn a_foreground_changed_during_the_placement_is_looked_at_again() {
+        let looks = Rc::new(Cell::new(0));
+        let sink = Rc::clone(&looks);
+        super::on_look(move || sink.set(sink.get() + 1));
+        let w = FakeLevel::fullscreen();
+        let mut t = Topmost::default();
+        t.focus(&w, true);
+        w.take();
+        w.front.set(TOPMOST);
+        w.front_after_lower.set(Some(ORDINARY));
+        t.focus(&w, false);
+        assert_eq!(w.take(), ["after HWND_NOTOPMOST"]);
+        assert!(t.watching());
+        assert_eq!(looks.get(), 1);
+        t.asked(Some(&w));
+        assert_eq!(w.take(), [format!("after {ORDINARY}")]);
+        assert!(!t.watching());
+        assert_eq!(looks.get(), 1);
     }
 
     /// The window goes directly behind an ordinary window in front, and to
