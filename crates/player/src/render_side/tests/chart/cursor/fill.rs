@@ -8,15 +8,16 @@
 use std::path::Path;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use game::coord::{Caps, Class, Coordinator};
+use game::coord::{Caps, Class, Coordinator, Spawner};
 use library::Name;
 use windows::Win32::System::Threading::{THREAD_MODE_BACKGROUND_BEGIN, THREAD_PRIORITY};
 
 use super::{Cursor, LetGo, chart, cursor_of, named, row};
 use crate::chart_currency::CursorChart;
-use crate::chart_images::{EntryState, HOLD, SlotState};
+use crate::chart_images::FS_READS;
+use crate::chart_images::{EntryState, HELD_HARD, HOLD, HOLD_HARD, SlotState, Want};
 use crate::render_side::tests::wait_until;
 
 impl Cursor {
@@ -166,8 +167,15 @@ fn a_refused_background_mode_ends_the_fill_for_the_run() {
     );
     let run = || {
         c.on(at.path(), named());
+        let reads = FS_READS.load(Ordering::Relaxed);
         c.rest_with(at.path(), named(), &[&near[0]]);
         c.filled();
+        assert_eq!(
+            FS_READS.load(Ordering::Relaxed) - reads,
+            3,
+            "the refused read touched the filesystem (the cursor's: its \
+             folder and its two images)"
+        );
         assert!(c.fill_off());
         assert!(c.w.entry(&row(near[0].path(), named())).is_none());
         assert_eq!(c.w.begun(), 2, "the cursor's read and the refused one");
@@ -461,6 +469,215 @@ fn a_refill_before_the_request_begins_replaces_its_neighbours() {
     assert_eq!(c.w.begun(), 2);
     assert!(c.slot_of(&near[1]).is_some());
     assert!(c.w.entry(&row(near[0].path(), named())).is_none());
+}
+
+/// A neighbour's entry never evicts one its rest filled or kept: with the
+/// entries at their bound, a later rest that keeps B and reads D evicts an
+/// older entry of no slot of its own, never B's.
+#[test]
+fn a_neighbour_never_evicts_an_entry_its_rest_keeps() {
+    let _serial = crate::imports::tests::serial();
+    let c = cursor_of(8);
+    let near = charts(4);
+    let [a, b, cur, d] = [&near[0], &near[1], &near[2], &near[3]];
+    c.on(a.path(), named());
+    c.rest_with(a.path(), named(), &[b]);
+    c.filled();
+    assert!(c.slot_of(b).is_some());
+    c.w.pad_entries(None, None);
+    c.on(cur.path(), named());
+    c.rest_with(cur.path(), named(), &[b, d]);
+    c.filled();
+    assert!(c.slot_of(b).is_some(), "the kept row's entry was evicted");
+    assert!(c.slot_of(d).is_some() && c.slot_of(cur).is_some());
+    assert!(c.slot_of(a).is_none(), "the cursor's row evicts the oldest");
+}
+
+/// A check that withdraws the cursor's entry while a neighbour is read
+/// stops that read; no neighbour begins until the cursor's read is asked
+/// again, and the stopped row is read after the cursor's (AC-S8).
+#[test]
+fn a_withdrawn_cursor_row_is_read_again_before_its_neighbours() {
+    let _serial = crate::imports::tests::serial();
+    let _let_go = LetGo;
+    let c = cursor_of(8);
+    let (at, near) = (chart([640, 480], [300, 80]), charts(2));
+    let near_refs: Vec<&tempfile::TempDir> = near.iter().collect();
+    c.rest_on(at.path(), named());
+    c.shown(at.path(), named());
+    c.w.update_chart(false);
+    c.settled();
+    let checks = c.w.checks_begun();
+    HOLD.store(true, Ordering::Release);
+    c.rest_with(at.path(), named(), &near_refs);
+    c.until(|c| c.w.begun() == 2 && !c.w.idle());
+    std::thread::sleep(Duration::from_millis(20));
+    super::png(at.path(), "s.png", [320, 240]);
+    // A use: a list refreshed with the cursor kept.
+    let _ = c.w.update_chart(true);
+    c.until(|c| {
+        c.w.checks_pending() == (false, false) && c.w.checks_begun() > checks && c.w.idle()
+    });
+    assert!(c.w.entry(&row(at.path(), named())).is_none());
+    for _ in 0..20 {
+        c.step();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(c.w.begun(), 2, "a neighbour began before the cursor's read");
+    assert!(c.w.take_rearm());
+    HOLD.store(false, Ordering::Release);
+    c.rest_with(at.path(), named(), &near_refs);
+    c.until(|c| c.w.entry(&row(at.path(), named())).is_some());
+    assert!(c.w.entry(&row(near[0].path(), named())).is_none());
+    c.filled();
+    assert!(c.slot_of(&near[0]).is_some() && c.slot_of(&near[1]).is_some());
+    assert_eq!(c.w.begun(), 5);
+}
+
+/// A list read again that no longer has the neighbour being read stops
+/// that read; the new list's rows are read instead.
+#[test]
+fn a_refresh_stops_a_neighbour_it_no_longer_lists() {
+    let _serial = crate::imports::tests::serial();
+    let _let_go = LetGo;
+    let c = cursor_of(8);
+    let (at, near) = (chart([64, 48], [30, 8]), charts(2));
+    c.rest_on(at.path(), named());
+    c.shown(at.path(), named());
+    HOLD.store(true, Ordering::Release);
+    c.rest_with(at.path(), named(), &[&near[0]]);
+    c.until(|c| c.w.begun() == 2 && !c.w.idle());
+    c.w.refill(vec![row(near[1].path(), named())]);
+    c.until(|c| c.w.begun() == 3);
+    HOLD.store(false, Ordering::Release);
+    c.filled();
+    assert!(c.w.entry(&row(near[0].path(), named())).is_none());
+    assert!(c.slot_of(&near[1]).is_some());
+}
+
+/// A neighbour never takes a slot a pin holds, though an earlier rest
+/// filled it: with two slots, the row a frame still displays keeps its
+/// slot, and the fill stops.
+#[test]
+fn a_neighbour_never_takes_a_pinned_slot_of_an_earlier_rest() {
+    let _serial = crate::imports::tests::serial();
+    let c = cursor_of(2);
+    let (a, b, near) = (
+        chart([64, 48], [30, 8]),
+        chart([64, 48], [30, 8]),
+        charts(1),
+    );
+    c.rest_on(a.path(), named());
+    let at_a = c.shown(a.path(), named());
+    let EntryState::Resident { generation, slot } = at_a else {
+        panic!("{at_a:?}");
+    };
+    c.r.charts.lock().unwrap().unpresented = true;
+    let mut update = crate::render_side::tests::selection_update(1, 2);
+    update.cursor_chart = CursorChart::Resident { generation, slot };
+    c.r.link.show_selection(update);
+    assert!(wait_until(
+        || c.r.link.pool_now().1 == CursorChart::pack(generation, slot)
+    ));
+    c.on(b.path(), named());
+    c.rest_with(b.path(), named(), &[&near[0]]);
+    c.filled();
+    assert!(c.slot_of(&b).is_some());
+    assert_eq!(c.w.entry(&row(a.path(), named())).map(|e| e.0), Some(at_a));
+    assert!(c.w.entry(&row(near[0].path(), named())).is_none());
+}
+
+/// When no entry may make room for a neighbour's, the fill stops: before
+/// its read once the count bound is reached with nothing evictable, and
+/// at its adoption when the byte bound leaves it no room, its slot freed
+/// and the rows after it not read.
+#[test]
+fn the_fill_stops_when_no_entry_may_make_room() {
+    let _serial = crate::imports::tests::serial();
+    let (at, near) = (chart([64, 48], [30, 8]), charts(2));
+    let near_refs: Vec<&tempfile::TempDir> = near.iter().collect();
+    for leave in [None, Some(16)] {
+        let c = cursor_of(8);
+        c.rest_on(at.path(), named());
+        c.shown(at.path(), named());
+        c.w.pad_entries(Some(&row(at.path(), named())), leave);
+        c.rest_with(at.path(), named(), &near_refs);
+        c.filled();
+        let read = u64::from(leave.is_some());
+        assert_eq!(c.w.begun(), 1 + read, "{leave:?}");
+        assert!(
+            near.iter()
+                .all(|d| c.w.entry(&row(d.path(), named())).is_none())
+        );
+        assert_eq!(c.w.fill_state(), (false, false), "{leave:?}");
+        assert_eq!(
+            c.w.slot_states()
+                .iter()
+                .filter(|s| **s != SlotState::Free)
+                .count(),
+            1,
+            "{leave:?}: the unkept read's slot not freed"
+        );
+    }
+}
+
+/// A choice while a neighbour is read waits for that read alone: play's
+/// image job begins right after the neighbour's read returns, though the
+/// read ignores its cancel, and no other neighbour begins before it (the
+/// bound on a choice behind the fill, design.md "Rendering and Skins",
+/// chart images).
+#[test]
+fn a_choice_during_a_neighbour_read_begins_play_right_after_it() {
+    let _serial = crate::imports::tests::serial();
+    let _let_go = LetGo;
+    let c = cursor_of(8);
+    let (at, near) = (chart([64, 48], [30, 8]), charts(2));
+    let near_refs: Vec<&tempfile::TempDir> = near.iter().collect();
+    c.rest_on(at.path(), named());
+    c.shown(at.path(), named());
+    HELD_HARD.store(false, Ordering::Release);
+    HOLD_HARD.store(true, Ordering::Release);
+    c.rest_with(at.path(), named(), &near_refs);
+    c.until(|c| c.w.begun() == 2 && !c.w.idle());
+    assert!(wait_until(|| HELD_HARD.load(Ordering::Acquire)));
+    // The choice.
+    c.w.leave_selection(&c.coord);
+    c.r.link.leave_selection();
+    c.w.renew();
+    c.w.attempt(Want {
+        dir: at.path().to_path_buf(),
+        names: ["s.png".to_owned(), "n.png".to_owned(), String::new()],
+        play: Some(2_048),
+        result: None,
+    });
+    let publisher = c.r.link.chart_publisher();
+    let play_step = || {
+        c.w.step(
+            Some((&c.coord, Spawner::SYSTEM)),
+            &|| false,
+            Some(&publisher),
+        );
+        c.w.service();
+    };
+    for _ in 0..20 {
+        play_step();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(c.w.begun(), 2, "play's job began beside the neighbour's");
+    HOLD_HARD.store(false, Ordering::Release);
+    let end = Instant::now() + Duration::from_secs(10);
+    while c.w.begun() == 2 {
+        assert!(Instant::now() < end, "play's job never began: {:?}", c.w);
+        play_step();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    while c.w.current().is_none() || !c.w.idle() {
+        assert!(Instant::now() < end, "{:?}", c.w);
+        play_step();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(c.w.begun(), 3, "another neighbour began before play's job");
+    assert!(c.w.entry(&row(near[1].path(), named())).is_none());
 }
 
 impl Cursor {

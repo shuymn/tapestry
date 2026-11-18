@@ -120,11 +120,17 @@ impl Entries {
     }
 
     /// Inserts `entry` for `id`, replacing its own, the least recently
-    /// used going first while either bound would be passed; one larger
-    /// than the whole byte bound is not kept. Returns whether it was kept
-    /// and the entries that went, its own replaced one included, whose
-    /// slots the caller frees.
-    pub(super) fn insert(&mut self, id: CursorId, mut entry: Entry) -> (bool, Vec<Entry>) {
+    /// used of those `evictable` allows going first while either bound
+    /// would be passed; one larger than the whole byte bound, or one the
+    /// bounds leave no room for once nothing evictable is left, is not
+    /// kept. Returns whether it was kept and the entries that went, its
+    /// own replaced one included, whose slots the caller frees.
+    pub(super) fn insert(
+        &mut self,
+        id: CursorId,
+        mut entry: Entry,
+        evictable: &dyn Fn(&Entry) -> bool,
+    ) -> (bool, Vec<Entry>) {
         let mut gone: Vec<Entry> = self.remove(&id).into_iter().collect();
         entry.bytes = accounted(&id, &entry.bindings);
         if entry.bytes > MAX_ENTRY_BYTES {
@@ -135,10 +141,11 @@ impl Entries {
                 .list
                 .iter()
                 .enumerate()
+                .filter(|(_, (_, e))| evictable(e))
                 .min_by_key(|(_, (_, e))| e.recency)
                 .map(|(i, _)| i)
             else {
-                break;
+                return (false, gone);
             };
             let (_, e) = self.list.swap_remove(oldest);
             self.bytes -= e.bytes;
@@ -148,6 +155,38 @@ impl Entries {
         self.bytes += entry.bytes;
         self.list.push((id, entry));
         (true, gone)
+    }
+
+    /// Adds entries of rows no list has, in `state`, newer than every
+    /// entry here: up to the count bound, or with `leave`, one entry that
+    /// leaves `leave` bytes below the byte bound (tests).
+    #[cfg(test)]
+    pub(super) fn pad(&mut self, state: EntryState, leave: Option<usize>) {
+        let add = |e: &mut Self, i: u64, dir: std::path::PathBuf| {
+            let id = CursorId {
+                dir,
+                names: [library::Name::None, library::Name::None],
+            };
+            let entry = Entry::new((1 << 40) + i, [Binding::NoHeader, Binding::NoHeader], state);
+            let _ = e.insert(id, entry, &|_| true);
+        };
+        if let Some(leave) = leave {
+            let base = std::mem::size_of::<(CursorId, Entry)>();
+            let n = MAX_ENTRY_BYTES - self.bytes - base - leave;
+            add(self, 0, std::path::PathBuf::from("y".repeat(n)));
+            return;
+        }
+        let mut i = 0;
+        while self.list.len() < MAX_ENTRIES {
+            add(self, i, std::path::PathBuf::from(format!("pad/{i}")));
+            i += 1;
+        }
+    }
+
+    /// Whether one more entry could be counted: below the count bound, or
+    /// an entry `evictable` allows could make room.
+    pub(super) fn has_room(&self, evictable: &dyn Fn(&Entry) -> bool) -> bool {
+        self.list.len() < MAX_ENTRIES || self.list.iter().any(|(_, e)| evictable(e))
     }
 
     /// Removes `id`'s entry.
@@ -298,6 +337,11 @@ impl Slots {
 
     /// Slot `slot` was carried by an update sent, or kept by the fill, in
     /// rest `rest`: the most recently used, and that rest's.
+    /// The rest that last filled, showed or kept `slot`.
+    pub(super) fn rest_of(&self, slot: u16) -> Option<u64> {
+        self.slots.get(usize::from(slot)).map(|s| s.rest)
+    }
+
     pub(super) fn touch(&mut self, slot: u16, rest: u64) {
         self.clock += 1;
         let now = self.clock;
@@ -348,6 +392,42 @@ mod tests {
         Entry::new(version, [Binding::NoHeader, Binding::NoHeader], state)
     }
 
+    /// Inserts with every entry evictable.
+    fn put(e: &mut Entries, id: CursorId, entry: Entry) -> (bool, Vec<Entry>) {
+        e.insert(id, entry, &|_| true)
+    }
+
+    /// An insert evicts only the entries `evictable` allows, least recent
+    /// first; with none left at the bound, the new entry is not kept and
+    /// nothing goes.
+    #[test]
+    fn an_insert_never_evicts_a_protected_entry() {
+        let mut e = Entries::default();
+        for i in 0..MAX_ENTRIES {
+            put(
+                &mut e,
+                row(format!("one/{i}")),
+                entry(u64::try_from(i).unwrap(), EntryState::Absent),
+            );
+        }
+        let protect_first = |x: &Entry| x.version != 0;
+        assert!(e.has_room(&protect_first));
+        let (kept, gone) = e.insert(
+            row("two/a"),
+            entry(1_000, EntryState::Absent),
+            &protect_first,
+        );
+        assert!(kept);
+        assert_eq!(gone.iter().map(|g| g.version).collect::<Vec<_>>(), [1]);
+        assert!(e.get(&row("one/0")).is_some());
+        let none = |_: &Entry| false;
+        assert!(!e.has_room(&none));
+        let (kept, gone) = e.insert(row("two/b"), entry(1_001, EntryState::Absent), &none);
+        assert!(!kept && gone.is_empty());
+        assert_eq!(e.len(), MAX_ENTRIES);
+        assert!(e.get(&row("two/b")).is_none());
+    }
+
     const RESIDENT: EntryState = EntryState::Resident {
         generation: 1,
         slot: 0,
@@ -366,7 +446,8 @@ mod tests {
             } else {
                 RESIDENT
             };
-            let (kept, gone) = e.insert(
+            let (kept, gone) = put(
+                &mut e,
                 row(format!("{folder}/{i}")),
                 entry(u64::try_from(i).unwrap(), state),
             );
@@ -375,7 +456,7 @@ mod tests {
         assert_eq!(e.len(), MAX_ENTRIES);
         // The first, an absence, used again: the second goes instead.
         e.touch(&row("one/0"));
-        let (kept, gone) = e.insert(row("two/new"), entry(1_000, EntryState::Absent));
+        let (kept, gone) = put(&mut e, row("two/new"), entry(1_000, EntryState::Absent));
         assert!(kept);
         assert_eq!(gone.len(), 1);
         assert_eq!(gone[0].version, 1);
@@ -383,9 +464,9 @@ mod tests {
         assert!(e.get(&row("one/0")).is_some());
         assert!(e.get(&row("two/1")).is_none());
         // The next goes the third, an absence (0 used, 1 gone).
-        let (_, gone) = e.insert(row("one/new"), entry(1_001, RESIDENT));
+        let (_, gone) = put(&mut e, row("one/new"), entry(1_001, RESIDENT));
         assert_eq!(gone[0].version, 2);
-        let (_, gone) = e.insert(row("two/newer"), entry(1_002, RESIDENT));
+        let (_, gone) = put(&mut e, row("two/newer"), entry(1_002, RESIDENT));
         assert_eq!(gone[0].version, 3);
         assert_eq!(gone[0].state, EntryState::Absent);
     }
@@ -410,7 +491,7 @@ mod tests {
             } else {
                 RESIDENT
             };
-            let (kept, gone) = e.insert(long(n), entry(u64::try_from(n).unwrap(), state));
+            let (kept, gone) = put(&mut e, long(n), entry(u64::try_from(n).unwrap(), state));
             assert!(kept);
             if !gone.is_empty() {
                 assert_eq!(gone.len(), 1);
@@ -425,7 +506,7 @@ mod tests {
         assert!(e.bytes() > MAX_ENTRY_BYTES - (66 << 10));
         assert!(e.get(&long(0)).is_none());
         let huge = row("y".repeat(MAX_ENTRY_BYTES + 1));
-        let (kept, gone) = e.insert(huge.clone(), entry(9_999, EntryState::Absent));
+        let (kept, gone) = put(&mut e, huge.clone(), entry(9_999, EntryState::Absent));
         assert!(!kept && gone.is_empty());
         assert!(e.get(&huge).is_none());
     }
@@ -435,8 +516,8 @@ mod tests {
     #[test]
     fn a_generations_end_keeps_only_absences() {
         let mut e = Entries::default();
-        e.insert(row("a"), entry(1, RESIDENT));
-        e.insert(row("b"), entry(2, EntryState::Absent));
+        put(&mut e, row("a"), entry(1, RESIDENT));
+        put(&mut e, row("b"), entry(2, EntryState::Absent));
         e.drop_resident();
         assert!(e.get(&row("a")).is_none());
         assert!(e.get(&row("b")).is_some());

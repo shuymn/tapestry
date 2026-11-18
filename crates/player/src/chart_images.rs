@@ -74,6 +74,11 @@ pub(crate) use pool::{EntryState, SlotState};
 #[cfg(test)]
 pub static HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// A row read's filesystem steps: its folder, and each image it resolves
+/// (tests).
+#[cfg(test)]
+pub static FS_READS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 pub use crate::chart_currency::{ChartNow, PublicationKey, PublishedTo};
 
 // A name the library keeps is one the chart-image reader accepts.
@@ -676,6 +681,17 @@ fn read_row(
     cells: chart_image::ChartCells,
     cancel: &dyn Fn() -> bool,
 ) -> ChartImages {
+    let cancelled = || {
+        Arc::new(Read {
+            binding: chart_image::Binding::NoHeader,
+            image: Err(Absent::Cancelled),
+        })
+    };
+    if cancel() {
+        return ChartImages::of(ChartImage::ALL.map(|_| cancelled()));
+    }
+    #[cfg(test)]
+    FS_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = ChartDir::new(&id.dir);
     #[cfg(test)]
     hold(cancel);
@@ -687,6 +703,11 @@ fn read_row(
             ChartImage::Banner => (banner, cells.of(which)),
             ChartImage::Back => return absent_read(chart_image::Binding::NoHeader),
         };
+        if cancel() {
+            return cancelled();
+        }
+        #[cfg(test)]
+        FS_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let binding = binding_now(&dir, name, identity);
         let (Ok(dir), chart_image::Binding::Resolved { .. }, Some(_)) = (&dir, &binding, cell)
         else {
@@ -1267,6 +1288,7 @@ impl ChartImageWorker {
             return;
         }
         if c.asked.is_some() && c.asked == c.cursor_row {
+            c.stop_fill_read(&|r| neighbours.contains(r), false);
             c.fill = Some(Fill {
                 cursor_generation: c.cursor_generation,
                 rows: neighbours.into(),
@@ -1512,6 +1534,19 @@ impl ChartImageWorker {
     #[must_use]
     pub fn cursor_generation(&self) -> u64 {
         self.core().cursor_generation
+    }
+
+    /// Pads the entries with rows no list has, newer than every entry
+    /// there: absent ones, or ones in `like`'s slot (which its rest and
+    /// pins protect); up to the count bound, or with `leave`, one that
+    /// leaves `leave` bytes below the byte bound (tests).
+    #[cfg(test)]
+    pub fn pad_entries(&self, like: Option<&CursorId>, leave: Option<usize>) {
+        let mut c = self.core();
+        let state = like
+            .and_then(|r| c.entries.get(r))
+            .map_or(pool::EntryState::Absent, |e| e.state);
+        c.entries.pad(state, leave);
     }
 
     /// Whether the fill has rows left, and whether a refused background
@@ -2018,7 +2053,17 @@ impl Core {
     fn adopt_entry(&mut self, row: CursorId, entry: pool::Entry) {
         let (version, state) = (entry.version, entry.state);
         let cursor = self.cursor_row.as_ref() == Some(&row);
-        let (kept, gone) = self.entries.insert(row, entry);
+        let pins = self.fill_pins();
+        let (generation, rest, slots) = (
+            self.pool_generation,
+            self.cursor_generation,
+            self.slots.as_ref(),
+        );
+        // The cursor's row may evict any entry; a neighbour's evicts none
+        // whose slot this rest filled, showed or kept, or a pin holds, as
+        // its slot admission takes none of them.
+        let evictable = |e: &pool::Entry| cursor || !protected(e, generation, rest, slots, pins);
+        let (kept, gone) = self.entries.insert(row, entry, &evictable);
         for e in gone {
             if let pool::EntryState::Resident { generation, slot } = e.state {
                 self.free_slot(generation, slot, e.version);
@@ -2026,6 +2071,11 @@ impl Core {
         }
         if !kept && let pool::EntryState::Resident { generation, slot } = state {
             self.free_slot(generation, slot, version);
+        }
+        // No room left for this rest's rows: the fill stops, never
+        // evicting what it filled.
+        if !kept && !cursor {
+            self.fill = None;
         }
         if cursor {
             self.changed = true;
@@ -2316,7 +2366,42 @@ impl Core {
         if self.cursor_row.as_ref() == Some(&k.row) {
             self.changed = true;
             self.rearm = true;
+            // The cursor's row goes first: a neighbour in flight is
+            // stopped and read again after it.
+            self.stop_fill_read(&|_| false, true);
         }
+    }
+
+    /// Stops the fill's read in flight unless `keep` keeps its row; with
+    /// `requeue`, a stopped row goes back to the front of the fill.
+    fn stop_fill_read(&mut self, keep: &dyn Fn(&CursorId) -> bool, requeue: bool) {
+        let Some(Job {
+            target: Target::Cursor {
+                id, fill: Some(_), ..
+            },
+            job,
+        }) = &self.job
+        else {
+            return;
+        };
+        if keep(id) {
+            return;
+        }
+        job.stop();
+        if requeue && let Some(f) = self.fill.as_mut() {
+            f.rows.push_front(id.clone());
+        }
+    }
+
+    /// The slots a pin holds now: the newest update sent, and the one the
+    /// render thread displayed when the worker last had its publisher.
+    fn fill_pins(&self) -> [Option<u16>; 2] {
+        self.starter
+            .as_ref()
+            .and_then(|(_, _, p)| p.as_ref())
+            .map_or([None, None], |p| {
+                pins(self.sent.as_ref(), self.pool_generation, p)
+            })
     }
 
     fn retire(&mut self, job: OwnedJob<Arc<Output>>) {
@@ -2874,7 +2959,7 @@ impl Core {
         spawner: Spawner,
         publish: Option<&crate::render_side::ChartPublisher>,
     ) {
-        if self.held_back() || self.cursor.is_some() || self.ended {
+        if self.held_back() || self.cursor.is_some() || self.ended || self.rearm {
             return;
         }
         let rest = self.cursor_generation;
@@ -2895,6 +2980,14 @@ impl Core {
             return;
         };
         let pins = pins(self.sent.as_ref(), generation, publish);
+        let slots = self.slots.as_ref();
+        if !self
+            .entries
+            .has_room(&|e| !protected(e, generation, rest, slots, pins))
+        {
+            self.fill = None;
+            return;
+        }
         let (row, slot, evicted, cells) = loop {
             let (Some(fill), Some(slots)) = (self.fill.as_mut(), self.slots.as_mut()) else {
                 return;
@@ -3059,6 +3152,27 @@ fn pins(
         in_pool(sent),
         in_pool(crate::chart_currency::CursorChart::unpack(displayed)),
     ]
+}
+
+/// Whether entry `e` holds a slot of live generation `generation` that
+/// rest `rest` filled, showed or kept, or that `pins` hold: a neighbour's
+/// entry never evicts it.
+fn protected(
+    e: &pool::Entry,
+    generation: u64,
+    rest: u64,
+    slots: Option<&pool::Slots>,
+    pins: [Option<u16>; 2],
+) -> bool {
+    match e.state {
+        pool::EntryState::Resident {
+            generation: g,
+            slot,
+        } if g == generation => {
+            pins.contains(&Some(slot)) || slots.and_then(|s| s.rest_of(slot)) == Some(rest)
+        }
+        _ => false,
+    }
 }
 
 /// Settles an ended job, logging a panic after its publication.
@@ -3784,5 +3898,47 @@ mod tests {
         };
         assert_eq!(content(true), [432, 304]);
         assert_eq!(content(false), [432, 243]);
+    }
+
+    /// A row read asks its cancel before each image: one cancelled once
+    /// the stage image is resolved never resolves the banner, and both
+    /// come back cancelled.
+    #[test]
+    fn a_row_read_cancelled_between_its_images_reads_no_more() {
+        use std::sync::atomic::Ordering;
+
+        use skin_model::chart_image::{ChartCells, Slot};
+        let _serial = crate::imports::tests::serial();
+        let d = tempfile::tempdir().unwrap();
+        png(d.path(), "s.png", [64, 48], [10, 20, 30]);
+        png(d.path(), "n.png", [30, 8], [10, 20, 30]);
+        let id = super::CursorId {
+            dir: d.path().to_path_buf(),
+            names: [
+                library::Name::Named("s.png".to_owned()),
+                library::Name::Named("n.png".to_owned()),
+            ],
+        };
+        let cells = ChartCells {
+            stage: Slot::new([64, 48]),
+            banner: Slot::new([30, 8]),
+            ..ChartCells::NONE
+        };
+        let start = super::FS_READS.load(Ordering::Relaxed);
+        // The folder and the stage image's resolution, then cancelled.
+        let set = super::read_row(&id, cells, &|| {
+            super::FS_READS.load(Ordering::Relaxed) >= start + 2
+        });
+        assert_eq!(
+            super::FS_READS.load(Ordering::Relaxed) - start,
+            2,
+            "the banner was resolved after the cancel"
+        );
+        for which in [ChartImage::Stage, ChartImage::Banner] {
+            assert!(matches!(
+                set.read(which).image,
+                Err(super::Absent::Cancelled)
+            ));
+        }
     }
 }
