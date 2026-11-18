@@ -3021,6 +3021,7 @@ fn select_args(
             frames: None,
             render_timeout,
             stop_timeout: None,
+            speculative_permits: None,
             size: None,
             window: None,
             scenario: Some(session),
