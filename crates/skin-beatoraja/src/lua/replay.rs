@@ -329,6 +329,29 @@ impl Frame {
         Some(read.map(|n| n.saturating_add(delta)))
     }
 
+    /// Timer `id`'s start on the state clock in µs, `i64::MIN` when it is
+    /// off, as the host's `timer` answers it: `None` on a frame production
+    /// builds no play frame for, or for a timer the model has no slot for
+    /// (timer 0 is off).
+    fn timer_us(&self, id: i32) -> Option<i64> {
+        if self.allowed.is_some() {
+            return None;
+        }
+        match builtin_timer(id) {
+            Some(slot) => {
+                let ms = self.timers.get(slot).copied().unwrap_or(TIMER_OFF);
+                Some(if ms == TIMER_OFF {
+                    i64::MIN
+                } else {
+                    self.state_us
+                        .saturating_sub(i64::from(ms).saturating_mul(1_000))
+                })
+            }
+            None if id == 0 => Some(i64::MIN),
+            None => None,
+        }
+    }
+
     /// A guarded integer: `Err(())` when the guard is false.
     fn guarded(&mut self, guard: Option<&str>, src: &str) -> Option<Result<i32, ()>> {
         if let Some(g) = guard
@@ -583,6 +606,19 @@ impl ReferenceVm {
         }
     }
 
+    /// Timer `id`'s start on the state clock in µs, `i64::MIN` when it is
+    /// off, as the host's `timer` answers it; `None` when unanswered.
+    #[must_use]
+    pub fn timer(&self, id: i32) -> Option<i64> {
+        self.pass.replay.borrow().as_ref()?.timer_us(id)
+    }
+
+    /// The frame's state clock in µs.
+    #[must_use]
+    pub fn state_us(&self) -> Option<i64> {
+        Some(self.pass.replay.borrow().as_ref()?.state_us)
+    }
+
     /// Image-index property `id` (an image group's or an image set's
     /// `ref`) on the frame: `None` when the mapping has no value for it;
     /// a property the factory does not know selects 0, as the source's
@@ -799,28 +835,13 @@ pub(super) fn answer(
             let t = f.state_us as f64;
             Ok(Value::Number(t))
         }
-        "timer" if f.allowed.is_some() => Err(unanswered()),
         "timer" => {
-            let Some(id) = arg(args).and_then(|n| i32::try_from(n).ok()) else {
-                return Some(Err(unanswered()));
-            };
-            match builtin_timer(id) {
-                Some(slot) => {
-                    let ms = f.timers.get(slot).copied().unwrap_or(TIMER_OFF);
+            let id = arg(args).and_then(|n| i32::try_from(n).ok());
+            match id.and_then(|id| f.timer_us(id)) {
+                Some(v) => {
                     #[expect(clippy::cast_precision_loss, reason = "the source's double")]
-                    let v = if ms == TIMER_OFF {
-                        i64::MIN as f64
-                    } else {
-                        f.state_us
-                            .saturating_sub(i64::from(ms).saturating_mul(1_000))
-                            as f64
-                    };
+                    let v = v as f64;
                     Ok(Value::Number(v))
-                }
-                None if id == 0 => {
-                    #[expect(clippy::cast_precision_loss, reason = "the source's double")]
-                    let off = i64::MIN as f64;
-                    Ok(Value::Number(off))
                 }
                 None => Err(unanswered()),
             }
