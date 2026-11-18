@@ -2210,6 +2210,7 @@ fn build_does_not_allocate() {
     large_gauges_do_not_allocate(&full, &views, &descs);
     programs_do_not_allocate(&chart, &full);
     promoted_numerics_do_not_allocate(&chart, &full);
+    instructions_do_not_allocate(&chart, &full);
     slots_do_not_allocate(&chart, &full);
     app_readouts_do_not_allocate(&chart, &full, &views, &descs);
     // The next attempt, prepared untracked after the stretches, builds.
@@ -5193,6 +5194,285 @@ fn promoted_numerics_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
     // µs reads as 2^53, plus 3 rounding to 2^53 + 4, less 2^53 4.
     assert_eq!(outs[n - 2], [2, 1]);
     assert_eq!(outs[2 * n + n - 1], [4, 1]);
+    // The positive control: an allocation on this thread is counted.
+    TRACK.with(|t| t.set(true));
+    std::hint::black_box(Vec::<u8>::with_capacity(16));
+    TRACK.with(|t| t.set(false));
+    assert!(ALLOCS.load(Ordering::Relaxed) > 0, "the counter counts");
+    ALLOCS.store(0, Ordering::Relaxed);
+}
+
+/// The program's instructions no other guard runs (design.md "Scope of No
+/// Allocation", the program's executor): `Move`, `Not`, `Extreme` both
+/// ways, `Jump` (to the span's end too, which returns nil), `IDiv` and
+/// `Mod` with negative and zero divisors (a zero integer divisor a caught
+/// error), `Ceil`, the `Le` and `Ne` comparisons, and a float output's
+/// conversion, over the state clock at 0, negative and positive. Every
+/// frame's outputs are the numeric API's own results as the executor
+/// converts them, so each path ran; with a positive control.
+fn instructions_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
+    use present_support::{Builder, Cb, slot};
+    use skin_model::present::num::{arith, clock, compare, extreme, math, to_float, to_int};
+    use skin_model::present::{Arith, Cmp, Conv, Fail, Insn, MathFn, Val};
+    // The executor's conversion of a value output, restated.
+    let int_out = |r: Result<Val, Fail>| match r {
+        Err(Fail::Unavailable) => [0, 0],
+        Err(Fail::Error) => [0, 1],
+        Ok(v) => {
+            let n = to_int(v);
+            [n, i32::from(n != i32::MIN && n != i32::MAX)]
+        }
+    };
+    // The clock `op` constant 0.
+    let by = |op| {
+        Cb::code(
+            vec![
+                Insn::StateUs { dst: 0 },
+                Insn::Const { dst: 1, k: 0 },
+                Insn::Arith {
+                    op,
+                    dst: 0,
+                    a: 0,
+                    b: 1,
+                },
+                Insn::Ret { src: 0 },
+            ],
+            vec![],
+            vec![],
+            Conv::Int,
+        )
+    };
+    let mut b = Builder::default();
+    let mut want: Vec<Box<dyn Fn(i64) -> [i32; 2]>> = Vec::new();
+    // clock // k and clock % k, k each of 3, -4, 0 and 2.5.
+    for k in [Val::Int(3), Val::Int(-4), Val::Int(0), Val::Float(2.5)] {
+        for op in [Arith::IDiv, Arith::Mod] {
+            let mut cb = by(op);
+            cb.consts = vec![k];
+            b.push(cb);
+            want.push(Box::new(move |us| int_out(arith(op, clock(us), k))));
+        }
+    }
+    // math.ceil(clock / 4), through a moved register.
+    b.push(Cb::code(
+        vec![
+            Insn::StateUs { dst: 0 },
+            Insn::Const { dst: 1, k: 0 },
+            Insn::Arith {
+                op: Arith::Div,
+                dst: 0,
+                a: 0,
+                b: 1,
+            },
+            Insn::Move { dst: 2, src: 0 },
+            Insn::Math {
+                f: MathFn::Ceil,
+                dst: 2,
+                a: 2,
+            },
+            Insn::Ret { src: 2 },
+        ],
+        vec![Val::Int(4)],
+        vec![],
+        Conv::Int,
+    ));
+    want.push(Box::new(move |us| {
+        int_out(arith(Arith::Div, clock(us), Val::Int(4)).and_then(|v| math(MathFn::Ceil, v)))
+    }));
+    // math.max(clock, 2) and math.min(clock, -1.5).
+    for (max, k) in [(true, Val::Int(2)), (false, Val::Float(-1.5))] {
+        b.push(Cb::code(
+            vec![
+                Insn::StateUs { dst: 0 },
+                Insn::Const { dst: 1, k: 0 },
+                Insn::Extreme {
+                    max,
+                    dst: 0,
+                    a: 0,
+                    b: 1,
+                },
+                Insn::Ret { src: 0 },
+            ],
+            vec![k],
+            vec![],
+            Conv::Int,
+        ));
+        want.push(Box::new(move |us| int_out(extreme(max, clock(us), k))));
+    }
+    // if not (clock <= 0) then 1 elseif clock ~= -3 then 2 else 3.
+    b.push(Cb::code(
+        vec![
+            Insn::StateUs { dst: 0 },
+            Insn::Const { dst: 1, k: 0 },
+            Insn::Cmp {
+                op: Cmp::Le,
+                dst: 2,
+                a: 0,
+                b: 1,
+            },
+            Insn::Not { dst: 2, a: 2 },
+            Insn::Test {
+                cond: 2,
+                when: false,
+                to: 7,
+            },
+            Insn::Const { dst: 3, k: 1 },
+            Insn::Jump { to: 13 },
+            Insn::Const { dst: 1, k: 2 },
+            Insn::Cmp {
+                op: Cmp::Ne,
+                dst: 2,
+                a: 0,
+                b: 1,
+            },
+            Insn::Test {
+                cond: 2,
+                when: false,
+                to: 12,
+            },
+            Insn::Const { dst: 3, k: 3 },
+            Insn::Jump { to: 13 },
+            Insn::Const { dst: 3, k: 4 },
+            Insn::Ret { src: 3 },
+        ],
+        vec![
+            Val::Int(0),
+            Val::Int(1),
+            Val::Int(-3),
+            Val::Int(2),
+            Val::Int(3),
+        ],
+        vec![],
+        Conv::Int,
+    ));
+    want.push(Box::new(|us| {
+        let x = clock(us);
+        let v = if !compare(Cmp::Le, x, Val::Int(0)).unwrap() {
+            1
+        } else if compare(Cmp::Ne, x, Val::Int(-3)).unwrap() {
+            2
+        } else {
+            3
+        };
+        [v, 1]
+    }));
+    // A jump to the span's end: nil, false.
+    b.push(Cb::code(
+        vec![Insn::Jump { to: 2 }, Insn::Ret { src: 0 }],
+        vec![],
+        vec![],
+        Conv::Truthy,
+    ));
+    want.push(Box::new(|_| [0, 1]));
+    // clock / 3 as a float output: its bits.
+    b.push(Cb::code(
+        vec![
+            Insn::StateUs { dst: 0 },
+            Insn::Const { dst: 1, k: 0 },
+            Insn::Arith {
+                op: Arith::Div,
+                dst: 0,
+                a: 0,
+                b: 1,
+            },
+            Insn::Ret { src: 0 },
+        ],
+        vec![Val::Int(3)],
+        vec![],
+        Conv::Float,
+    ));
+    want.push(Box::new(|us| {
+        let v = arith(Arith::Div, clock(us), Val::Int(3)).unwrap();
+        [to_float(v).to_bits().cast_signed(), 1]
+    }));
+    let sig = b.signature();
+    let n = sig.len();
+    let elements = (0..n)
+        .map(|k| {
+            let mut e = widget(
+                Source::Image(0),
+                track(0, Ease::Linear, End::Hold),
+                TimerRef::Builtin(timer::READY),
+                Place::SCREEN,
+            );
+            e.visible = Some(present_support::expr(
+                &format!("lua.{k}.ok"),
+                &sig,
+                skin_model::Ty::Bool,
+            ));
+            e
+        })
+        .collect();
+    let skin = present_support::load(
+        Some(b.0),
+        Vec::new(),
+        elements,
+        skin_model::WidgetDefs::default(),
+    )
+    .unwrap();
+    let uvs = play_support::uvs(&skin);
+    let mut batch = QuadBatch::with_capacity(skin.quad_capacity(), skin.run_capacity());
+    let gauges = [state(GaugeValue::FULL), state(GaugeValue::FULL)];
+    let notes = NoteFacts::default();
+    let layout = SkinLayout::AUTHOR;
+    let t = tally(3);
+    let frame = |now: i64, state_us: i64| SkinFrame {
+        judgments: None,
+        app: skin_model::AppReadouts::LAUNCH,
+        state_us,
+        screen_us: 0,
+        now: TimeUs(now),
+        display_offset: TimeUs(0),
+        tally: &t,
+        gauges: &gauges,
+        gauge: 0,
+        effects: &[],
+        notes: &notes,
+        offsets: skin_model::Offsets::NONE,
+        input: &eval::InputFacts::NONE,
+        complete: false,
+        target: TARGETS[0],
+        layout: &layout,
+        turntable: 0,
+        lanes: play_support::VIEW,
+        readouts: readouts_for(play_support::VIEW),
+        playing: true,
+        closing: None,
+        fading: None,
+    };
+    let clocks = [0, 5, -7, 12, -3];
+    let mut play = skin.prepare(chart, ctx).unwrap();
+    let mut outs = vec![[0; 2]; n * clocks.len()];
+    TRACK.with(|t| t.set(true));
+    for (i, &us) in clocks.iter().enumerate() {
+        batch.clear();
+        let now = i64::try_from(i).unwrap() * 16 * MS;
+        skin.build(&mut play, &frame(now, us), &uvs, &mut batch)
+            .expect("the frame builds");
+        let f = play.state().fields;
+        for k in 0..n {
+            outs[i * n + k] = [f[slot(k)], f[slot(k) + 1]];
+        }
+    }
+    TRACK.with(|t| t.set(false));
+    assert_eq!(
+        ALLOCS.load(Ordering::Relaxed),
+        0,
+        "instructions: allocations"
+    );
+    for (i, &us) in clocks.iter().enumerate() {
+        for (k, w) in want.iter().enumerate() {
+            assert_eq!(outs[i * n + k], w(us), "callback {k} at {us} µs");
+        }
+    }
+    // The paths ran: -7 // 3 is -3 and -7 % -4 is -3; an integer zero
+    // divisor is a caught error; the branches give 2, 1, 2, 1, 3.
+    assert_eq!(outs[2 * n], [-3, 1]);
+    assert_eq!(outs[2 * n + 3], [-3, 1]);
+    assert_eq!(outs[2 * n + 4], [0, 1]);
+    let branch = n - 3;
+    let taken: Vec<i32> = (0..clocks.len()).map(|i| outs[i * n + branch][0]).collect();
+    assert_eq!(taken, [2, 1, 2, 1, 3]);
     // The positive control: an allocation on this thread is counted.
     TRACK.with(|t| t.set(true));
     std::hint::black_box(Vec::<u8>::with_capacity(16));
