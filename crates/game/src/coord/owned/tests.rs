@@ -394,6 +394,49 @@ fn a_queued_owned_job_promoted_takes_a_foreground_permit() {
     drop(busy);
 }
 
+/// The owner's stop ends a job waiting for its permit without running
+/// it, and a running job at its next checkpoint, both cancelled.
+#[test]
+fn a_stopped_owned_job_ends_cancelled_queued_or_running() {
+    let _w = Watchdog::arm("a_stopped_owned_job_ends_cancelled_queued_or_running");
+    let coord = Coordinator::new(CAPS);
+    let busy = coord.try_lease(Class::Speculative).unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&ran);
+    let queued = spawn(
+        &coord,
+        "a",
+        Class::Speculative,
+        false,
+        Owner::Speculative,
+        move |_| {
+            seen.store(true, Ordering::SeqCst);
+        },
+    );
+    queued.stop();
+    assert_eq!(outcome(&queued).outcome, Outcome::Cancelled);
+    assert!(!ran.load(Ordering::SeqCst));
+    drop(busy);
+    let started = Arc::new(AtomicBool::new(false));
+    let running = Arc::clone(&started);
+    let job = spawn(
+        &coord,
+        "b",
+        Class::Speculative,
+        false,
+        Owner::Speculative,
+        move |ctx| {
+            running.store(true, Ordering::SeqCst);
+            until_cancelled(ctx);
+        },
+    );
+    while !started.load(Ordering::SeqCst) {
+        thread::yield_now();
+    }
+    job.stop();
+    assert_eq!(outcome(&job).outcome, Outcome::Cancelled);
+}
+
 /// Y5.
 #[test]
 fn a_demoted_queued_job_with_no_speculative_permit_ends_cancelled() {
