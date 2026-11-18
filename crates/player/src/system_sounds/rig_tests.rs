@@ -63,6 +63,21 @@ fn on_rig_with<R>(
     gate: Option<Arc<AudioGate>>,
     f: impl FnOnce(&mut PlayerRig<'_>) -> R,
 ) -> R {
+    on_rig_drawn(
+        &crate::render_side::tests::Installers::default(),
+        sounds,
+        gate,
+        f,
+    )
+}
+
+/// [`on_rig_with`] whose render thread draws on `screens`.
+fn on_rig_drawn<R>(
+    screens: &crate::render_side::tests::Installers,
+    sounds: game::SoundSettings,
+    gate: Option<Arc<AudioGate>>,
+    f: impl FnOnce(&mut PlayerRig<'_>) -> R,
+) -> R {
     let settings = game::Settings {
         device: game::DeviceSettings::default(),
         player: game::PlayerSettings {
@@ -70,7 +85,7 @@ fn on_rig_with<R>(
             ..game::PlayerSettings::default()
         },
     };
-    let render = crate::render_side::tests::Installers::default().spawn_bare();
+    let render = screens.spawn_bare();
     crate::tests::on_rig_gated(
         settings,
         render,
@@ -1377,6 +1392,7 @@ fn the_first_result_sound_follows_the_own_view() {
                 .unwrap();
             assert_eq!(probe.system_starts(SystemKind::Scratch), 1);
             rig.show_end(&report, &screen);
+            first_picture(rig);
             let starts = [SystemKind::Clear, SystemKind::Fail].map(|k| probe.system_starts(k));
             let want = if own { [1, 0] } else { [0, 1] };
             assert_eq!(starts, want, "own cleared {own}: clear, fail");
@@ -1410,16 +1426,19 @@ fn a_view_switch_keeps_the_result_sounds() {
         };
         // Positive control: the first show starts `clear`.
         rig.show_end(&report, &screen);
+        first_picture(rig);
         let first = counts(&probe);
         assert_eq!(first, ([1, 0, 0], [0, 0, 0]), "the first show");
         // A view switch.
         screen.step(1, &report, &one);
         rig.show_end(&report, &screen);
+        first_picture(rig);
         assert_eq!(counts(&probe), first, "a view switch");
         // The built-in result's screen built again, then shown again.
         assert!(!rig.presenter.current(), "the built-in result");
         rig.before_rebuild();
         rig.show_end(&report, &screen);
+        first_picture(rig);
         assert_eq!(counts(&probe), first, "a rebuild");
         wait("the result's sound", || {
             probe.reserved(SystemKind::Clear).is_some()
@@ -1431,6 +1450,195 @@ fn a_view_switch_keeps_the_result_sounds() {
         rig.leave_result();
         assert_eq!(counts(&probe).1, [1, 1, 1], "left once");
     });
+}
+
+/// The rig's look once the render thread acknowledged the current Result
+/// entry's first picture (design.md "State Model", system sounds,
+/// Result).
+fn first_picture(rig: &mut PlayerRig<'_>) {
+    let entry = rig.result_entry.expect("the result handed over").number;
+    wait("the first picture's acknowledgement", || {
+        rig.render.result_acknowledged() == entry
+    });
+    let now = rig.now();
+    rig.idle_wait(now);
+}
+
+/// Counts of `clear`, `fail` and `resultclose`: started, then stopped.
+fn result_counts(p: &game::OutputProbe) -> ([u64; 3], [u64; 3]) {
+    let kinds = [SystemKind::Clear, SystemKind::Fail, SystemKind::ResultClose];
+    (
+        kinds.map(|k| p.system_starts(k)),
+        kinds.map(|k| p.system_stops(k)),
+    )
+}
+
+/// V5 (design.md "State Model", system sounds, Result): the result's
+/// sound starts at its first picture, not at the hand-over: with the
+/// built-in result page held, the hand-over starts nothing; two frames that
+/// count for nothing (one to be tried again, one not built) then leave the
+/// game thread waiting, and the frame shown after them wakes it from an
+/// idle wait far longer than the test's bound, and its look starts `clear`
+/// once; a later look starts nothing more.
+// Source: SF-015
+#[test]
+fn the_result_sound_starts_at_its_first_picture() {
+    let _fx = arm_result();
+    let screens = crate::render_side::tests::Installers::default();
+    on_rig_drawn(&screens, game::SoundSettings::default(), None, |rig| {
+        let dir = tempfile::tempdir().unwrap();
+        let probe = rig.audio.control.failure_probe();
+        let _ = installed_past(rig, None);
+        let (report, screen) = switched_result(true, dir.path());
+        screens.pace.store(true, Ordering::Release);
+        screens
+            .end_outcomes
+            .lock()
+            .unwrap()
+            .extend([render::FrameOutcome::Retry, render::FrameOutcome::NotBuilt]);
+        rig.show_end(&report, &screen);
+        assert_eq!(result_counts(&probe).0, [0, 0, 0], "the hand-over");
+        let entry = rig.result_entry.unwrap().number;
+        // The frames go once this thread waits: only the acknowledgement's
+        // wake ends the wait before its deadline.
+        rig.park_probe.store(false, Ordering::SeqCst);
+        let release = {
+            let parked = Arc::clone(&rig.park_probe);
+            let screens = screens.clone();
+            std::thread::spawn(move || {
+                wait("the idle wait", || parked.load(Ordering::SeqCst));
+                screens.permits.store(3, Ordering::Release);
+            })
+        };
+        let began = Instant::now();
+        while result_counts(&probe).0 == [0, 0, 0] && began.elapsed() < Duration::from_secs(5) {
+            let now = rig.now();
+            rig.idle_wait(bms_model::TimeUs(now.0 + 20_000_000));
+        }
+        release.join().unwrap();
+        assert!(
+            began.elapsed() < Duration::from_secs(5),
+            "woken: {:?}",
+            began.elapsed()
+        );
+        assert_eq!(rig.render.result_acknowledged(), entry);
+        assert!(
+            screens.ends.load(Ordering::Acquire) >= 3,
+            "two frames counted for nothing"
+        );
+        assert_eq!(
+            result_counts(&probe),
+            ([1, 0, 0], [0, 0, 0]),
+            "the first picture"
+        );
+        screens.pace.store(false, Ordering::Release);
+        let now = rig.now();
+        rig.idle_wait(now);
+        assert_eq!(result_counts(&probe).0, [1, 0, 0], "once");
+    });
+}
+
+/// V5 (design.md "State Model", system sounds, Result): an acknowledgement
+/// starts nothing when the entry's fade-out began, before it or after it,
+/// nor when Result was left before the look that reads it, whether the
+/// acknowledgement came before leaving or after it (the first frame held
+/// through the leave); leaving after the hand-over stops `clear`, `fail`
+/// and `resultclose` whether or not the sound started. A later entry (a retry's) starts its own sound only at
+/// its own acknowledgement, never at the earlier entry's.
+// Source: SF-015
+#[test]
+fn a_late_acknowledgement_starts_nothing() {
+    #[derive(Clone, Copy, Debug)]
+    enum Late {
+        FadeOutFirst,
+        FadeOutAfter,
+        LeftAfter,
+        LeftFirst,
+    }
+    for late in [
+        Late::FadeOutFirst,
+        Late::FadeOutAfter,
+        Late::LeftAfter,
+        Late::LeftFirst,
+    ] {
+        let _fx = arm_result();
+        let screens = crate::render_side::tests::Installers::default();
+        on_rig_drawn(&screens, game::SoundSettings::default(), None, |rig| {
+            let dir = tempfile::tempdir().unwrap();
+            let probe = rig.audio.control.failure_probe();
+            let _ = installed_past(rig, None);
+            let (report, screen) = switched_result(true, dir.path());
+            screens.pace.store(true, Ordering::Release);
+            let waits = screens.waits.load(Ordering::Acquire);
+            rig.show_end(&report, &screen);
+            let entry = rig.result_entry.unwrap().number;
+            match late {
+                Late::FadeOutFirst => {
+                    let now = rig.now();
+                    let _ = rig.begin_outro(now, None);
+                }
+                Late::LeftFirst => {
+                    // A frame held, Result is left; then the frame goes,
+                    // and the entry's acknowledgement is published after
+                    // the leave (by the frame, or here if it drew none).
+                    wait("a frame held", || {
+                        screens.waits.load(Ordering::Acquire) > waits
+                    });
+                    rig.leave_result();
+                    screens.permits.store(1, Ordering::Release);
+                    wait("the held frame", || {
+                        screens.permits.load(Ordering::Acquire) == 0
+                    });
+                    rig.render.result_acknowledger()(entry);
+                }
+                Late::FadeOutAfter | Late::LeftAfter => {}
+            }
+            // The first frame goes; LeftFirst's went already, so it gives
+            // no permit and the next entry's frames stay held below.
+            if !matches!(late, Late::LeftFirst) {
+                screens.permits.store(1, Ordering::Release);
+            }
+            wait("the acknowledgement", || {
+                rig.render.result_acknowledged() == entry
+            });
+            match late {
+                Late::FadeOutAfter => {
+                    let now = rig.now();
+                    let _ = rig.begin_outro(now, None);
+                }
+                Late::LeftAfter => rig.leave_result(),
+                Late::FadeOutFirst | Late::LeftFirst => {}
+            }
+            let now = rig.now();
+            rig.idle_wait(now);
+            assert_eq!(result_counts(&probe).0, [0, 0, 0], "{late:?}: started");
+            if !matches!(late, Late::LeftAfter | Late::LeftFirst) {
+                rig.leave_result();
+            }
+            assert_eq!(result_counts(&probe).1, [1, 1, 1], "{late:?}: Result left");
+            // The next entry: the earlier acknowledgement starts nothing.
+            rig.show_end(&report, &screen);
+            let next = rig.result_entry.unwrap().number;
+            assert!(next > entry, "{late:?}");
+            let now = rig.now();
+            rig.idle_wait(now);
+            // Its frames are still held: nothing of it acknowledged yet.
+            assert_ne!(
+                rig.render.result_acknowledged(),
+                next,
+                "{late:?}: the next entry's frames held"
+            );
+            assert_eq!(
+                result_counts(&probe).0,
+                [0, 0, 0],
+                "{late:?}: an earlier entry's"
+            );
+            screens.pace.store(false, Ordering::Release);
+            first_picture(rig);
+            assert_eq!(result_counts(&probe).0, [1, 0, 0], "{late:?}: its own");
+            rig.leave_result();
+        });
+    }
 }
 
 /// C27-5 (design.md "Settings Files"): `[sounds] loop_result` as read at
@@ -1460,6 +1668,7 @@ fn loop_result_is_read_at_startup() {
             rig.files = crate::tuning::SettingsFiles::new(DataRoot::new(dir.path().into()), later);
             let (report, screen) = switched_result(true, dir.path());
             rig.show_end(&report, &screen);
+            first_picture(rig);
             wait("the result's sound", || {
                 probe.reserved(SystemKind::Clear).is_some()
             });

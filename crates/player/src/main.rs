@@ -1022,7 +1022,7 @@ fn rig<'a>(
         result_facts: None,
         result_offset: None,
         result_leaving: false,
-        result_sounding: false,
+        result_entry: None,
         #[cfg(feature = "dev-tools")]
         views_shown: 0,
         result_outro: None,
@@ -1031,6 +1031,8 @@ fn rig<'a>(
         probe_ready: None,
         #[cfg(test)]
         relooked: std::sync::Arc::default(),
+        #[cfg(test)]
+        result_started: std::sync::Arc::default(),
         #[cfg(test)]
         park_probe: std::sync::Arc::default(),
         #[cfg(all(test, feature = "dev-tools"))]
@@ -2739,7 +2741,7 @@ mod tests {
                 cpu: std::time::Duration::from_micros(50),
                 sprites: 0,
                 dropped: 0,
-                presented: true,
+                outcome: render::FrameOutcome::Shown,
                 present_count: None,
             })
         }
@@ -2796,7 +2798,7 @@ mod tests {
                 cpu: std::time::Duration::from_micros(50),
                 sprites: 0,
                 dropped: 0,
-                presented: true,
+                outcome: render::FrameOutcome::Shown,
                 present_count: None,
             })
         }

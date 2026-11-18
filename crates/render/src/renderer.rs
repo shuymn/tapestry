@@ -1048,14 +1048,98 @@ pub struct FrameTiming {
     /// Pushes the full batch refused: an overflow indicator, a lower bound
     /// on what the frame left out (see [`SpriteBatch::dropped`]).
     pub dropped: u32,
-    /// Whether the frame reached the target; `false` when the swap chain
-    /// image could not be acquired.
-    pub presented: bool,
+    /// What became of the frame: whether it reached the target, and if not,
+    /// why ([`presented`](Self::presented) is whether it did).
+    pub outcome: FrameOutcome,
     /// The swap chain's present count of this frame, read right after its
     /// present; `None` offscreen, for a frame not presented, or when the call
     /// failed. It pairs the frame with its frame statistics (design.md "Latency
     /// Figures").
     pub present_count: Option<u32>,
+}
+
+impl FrameTiming {
+    /// Whether the frame reached the target ([`FrameOutcome::Shown`]).
+    #[must_use]
+    pub const fn presented(&self) -> bool {
+        matches!(self.outcome, FrameOutcome::Shown)
+    }
+}
+
+/// What became of a frame (design.md "State Model", system sounds,
+/// Result: a result frame counts once it is shown or deliberately not).
+/// A frame that fails returns an error instead.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FrameOutcome {
+    /// Submitted and handed to the present (a window's), or submitted
+    /// (offscreen).
+    Shown,
+    /// Built and deliberately not shown: the window is minimized or
+    /// occluded.
+    Invisible,
+    /// Not shown, to be tried again by a later frame: the swap chain image
+    /// timed out or was outdated, or the offscreen pacer skipped it.
+    Retry,
+    /// No frame was built since the last submit, or its screen's slot is
+    /// missing: nothing was acquired or submitted.
+    NotBuilt,
+}
+
+impl FrameOutcome {
+    /// Whether the frame was shown or deliberately not shown: what a
+    /// result's first picture is acknowledged at.
+    #[must_use]
+    pub const fn counts(self) -> bool {
+        matches!(self, Self::Shown | Self::Invisible)
+    }
+}
+
+/// What a window's frame does with its swap chain acquisition.
+enum Acquisition {
+    /// An image to draw into.
+    Image(wgpu::SurfaceTexture),
+    /// No image: the frame ends with `outcome`, the surface configured
+    /// again first when `reconfigure`.
+    Skip {
+        outcome: FrameOutcome,
+        reconfigure: bool,
+    },
+    /// The surface is lost; the device is rebuilt.
+    Lost,
+}
+
+/// Classifies a swap chain acquisition: a timed-out image leaves the frame
+/// to be tried again, an occluded window's frame is deliberately not shown,
+/// and an outdated swap chain is configured again and the frame tried
+/// again (design.md "State Model", system sounds, Result).
+fn acquisition(current: wgpu::CurrentSurfaceTexture) -> Acquisition {
+    match current {
+        wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+            Acquisition::Image(t)
+        }
+        wgpu::CurrentSurfaceTexture::Timeout => Acquisition::Skip {
+            outcome: FrameOutcome::Retry,
+            reconfigure: false,
+        },
+        wgpu::CurrentSurfaceTexture::Occluded => Acquisition::Skip {
+            outcome: FrameOutcome::Invisible,
+            reconfigure: false,
+        },
+        wgpu::CurrentSurfaceTexture::Outdated => Acquisition::Skip {
+            outcome: FrameOutcome::Retry,
+            reconfigure: true,
+        },
+        wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
+            Acquisition::Lost
+        }
+    }
+}
+
+/// The outcome of an offscreen frame the pacer skips, `wait` being the
+/// bounded wait for the frame before it: to be tried again by a later
+/// frame. `None` when the pacer admits the frame.
+fn offscreen_skip<I>(pacer: &mut Pacer<I>, wait: impl FnOnce(&I) -> bool) -> Option<FrameOutcome> {
+    (!pacer.admit(wait)).then_some(FrameOutcome::Retry)
 }
 
 struct Window {
@@ -4421,11 +4505,13 @@ impl Renderer {
     /// Submits and presents the frame [`build`](Self::build) staged, once.
     /// Without a frame built since the last submit, a refused one
     /// included, nothing is acquired or submitted, and the frame is not
-    /// presented (`presented` is `false`, no sprite drawn).
+    /// presented ([`FrameOutcome::NotBuilt`], no sprite drawn).
     ///
-    /// A frame whose swap chain image times out or is occluded is skipped
-    /// (`presented` is `false`); an outdated swap chain is configured again
-    /// and the frame skipped.
+    /// A frame whose swap chain image times out is skipped
+    /// ([`FrameOutcome::Retry`]), and one whose window is occluded or
+    /// minimized is not shown ([`FrameOutcome::Invisible`]); an outdated
+    /// swap chain is configured again and the frame skipped
+    /// ([`FrameOutcome::Retry`]).
     ///
     /// # Errors
     ///
@@ -4437,7 +4523,7 @@ impl Renderer {
                 cpu: Duration::ZERO,
                 sprites: 0,
                 dropped: 0,
-                presented: false,
+                outcome: FrameOutcome::NotBuilt,
                 present_count: None,
             });
         };
@@ -5330,7 +5416,7 @@ impl Renderer {
             cpu: Duration::ZERO,
             sprites: 0,
             dropped: 0,
-            presented: false,
+            outcome: FrameOutcome::NotBuilt,
             present_count: None,
         };
         let Some(start) = self.started.take() else {
@@ -5912,38 +5998,36 @@ impl Renderer {
         };
         let sprites = staging.instances().len();
         let staged = u32::try_from(sprites).unwrap_or(u32::MAX);
-        let timing = |cpu, presented| FrameTiming {
+        let timing = |cpu, outcome| FrameTiming {
             cpu,
             sprites,
             dropped: staging.batch().dropped(),
-            presented,
+            outcome,
             present_count: None,
         };
         if self.minimized {
-            return Ok(timing(start.elapsed(), false));
+            return Ok(timing(start.elapsed(), FrameOutcome::Invisible));
         }
         let acquire = Instant::now();
         let (frame, view) = match &mut self.output {
-            Output::Window(w) => match w.surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(t)
-                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+            Output::Window(w) => match acquisition(w.surface.get_current_texture()) {
+                Acquisition::Image(t) => {
                     let view = t
                         .texture
                         .create_view(&wgpu::TextureViewDescriptor::default());
                     (Some(t), view)
                 }
-                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                Acquisition::Skip {
+                    outcome,
+                    reconfigure,
+                } => {
+                    if reconfigure {
+                        w.configure(self.gpu.device());
+                    }
                     let cpu = start.elapsed().saturating_sub(acquire.elapsed());
-                    return Ok(timing(cpu, false));
+                    return Ok(timing(cpu, outcome));
                 }
-                wgpu::CurrentSurfaceTexture::Outdated => {
-                    w.configure(self.gpu.device());
-                    let cpu = start.elapsed().saturating_sub(acquire.elapsed());
-                    return Ok(timing(cpu, false));
-                }
-                wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
-                    return Err(RenderError::SurfaceLost);
-                }
+                Acquisition::Lost => return Err(RenderError::SurfaceLost),
             },
             Output::Offscreen { view, .. } => {
                 // Nothing paces offscreen frames: the frame before must be
@@ -5955,7 +6039,7 @@ impl Renderer {
                 let wait = self.offscreen_wait;
                 #[cfg(not(feature = "dev-tools"))]
                 let wait = Some(OFFSCREEN_FRAME_WAIT);
-                let admitted = self.pacer.admit(|previous| {
+                let skipped = offscreen_skip(&mut self.pacer, |previous| {
                     !matches!(
                         device.poll(wgpu::PollType::Wait {
                             submission_index: Some(previous.clone()),
@@ -5964,9 +6048,9 @@ impl Renderer {
                         Err(wgpu::PollError::Timeout)
                     )
                 });
-                if !admitted {
+                if let Some(outcome) = skipped {
                     let cpu = start.elapsed().saturating_sub(acquire.elapsed());
-                    return Ok(timing(cpu, false));
+                    return Ok(timing(cpu, outcome));
                 }
                 (None, view.clone())
             }
@@ -6064,7 +6148,7 @@ impl Renderer {
         }
         let submitted = queue.submit([encoder.finish()]);
         let cpu = start.elapsed() - acquired;
-        let mut out = timing(cpu, true);
+        let mut out = timing(cpu, FrameOutcome::Shown);
         match frame {
             Some(t) => {
                 queue.present(t);
@@ -6641,8 +6725,10 @@ mod tests {
     use wgpu::wgc::instance as core;
 
     use super::{
-        AtlasPages, ChartOutcome, ChartTarget, ClipTable, RenderError, Renderer, Target, letterbox,
+        Acquisition, AtlasPages, ChartOutcome, ChartTarget, ClipTable, FrameOutcome, RenderError,
+        Renderer, Target, acquisition, letterbox, offscreen_skip,
     };
+    use crate::pace::Pacer;
     use crate::text::MenuText;
     use crate::{AdapterChoice, Blend, SkinError, Sprite, UploadError, solid_uv};
 
@@ -6657,6 +6743,64 @@ mod tests {
         source
             .downcast_ref::<T>()
             .expect("the source keeps its type")
+    }
+
+    /// A timed-out swap chain image and an outdated swap chain (configured
+    /// again) leave the frame to be tried again, an occluded window's frame
+    /// is deliberately not shown, and a lost or invalid surface is lost.
+    #[test]
+    fn an_acquisition_without_an_image_classifies_its_frame() {
+        let skip = |current| match acquisition(current) {
+            Acquisition::Skip {
+                outcome,
+                reconfigure,
+            } => Some((outcome, reconfigure)),
+            Acquisition::Image(_) | Acquisition::Lost => None,
+        };
+        assert_eq!(
+            skip(wgpu::CurrentSurfaceTexture::Timeout),
+            Some((FrameOutcome::Retry, false)),
+            "a timed-out image"
+        );
+        assert_eq!(
+            skip(wgpu::CurrentSurfaceTexture::Occluded),
+            Some((FrameOutcome::Invisible, false)),
+            "an occluded window"
+        );
+        assert_eq!(
+            skip(wgpu::CurrentSurfaceTexture::Outdated),
+            Some((FrameOutcome::Retry, true)),
+            "an outdated swap chain"
+        );
+        for lost in [
+            wgpu::CurrentSurfaceTexture::Lost,
+            wgpu::CurrentSurfaceTexture::Validation,
+        ] {
+            assert!(matches!(acquisition(lost), Acquisition::Lost));
+        }
+    }
+
+    /// An offscreen frame the pacer skips, the frame before it not done
+    /// within the wait, is tried again; one it admits goes on.
+    #[test]
+    fn an_offscreen_frame_skipped_is_tried_again() {
+        let mut pacer = Pacer::default();
+        assert_eq!(
+            offscreen_skip(&mut pacer, |_: &u32| false),
+            None,
+            "none pending"
+        );
+        pacer.submitted(1);
+        assert_eq!(
+            offscreen_skip(&mut pacer, |_| false),
+            Some(FrameOutcome::Retry),
+            "the frame before not done"
+        );
+        assert_eq!(
+            offscreen_skip(&mut pacer, |_| true),
+            None,
+            "the frame before done"
+        );
     }
 
     /// Each wrapped failure is the source, printed once in the chain. The
@@ -6778,7 +6922,7 @@ mod tests {
                 &text,
             )
             .unwrap();
-        assert!(timing.presented);
+        assert!(timing.presented());
         let pixels = r.read_back();
         // Layout (100, 200) and (300, 200): target pixels (50, 100) and
         // (150, 100) at half scale.
@@ -6863,7 +7007,7 @@ mod tests {
                 &text,
             )
             .unwrap();
-        assert!(timing.presented);
+        assert!(timing.presented());
         let pixels = r.read_back();
         let at = |x: usize| -> [u8; 4] {
             let i = (100 * 960 + x) * 4;
@@ -7017,7 +7161,7 @@ mod tests {
                 &text,
             )
             .unwrap();
-        assert!(timing.presented);
+        assert!(timing.presented());
         let pixels = r.read_back();
         let i = (50 * 960 + 50) * 4;
         assert_eq!(&pixels[i..i + 3], &[255, 255, 255]);
@@ -7060,7 +7204,7 @@ mod tests {
                     &text,
                 )
                 .unwrap();
-            assert!(timing.presented);
+            assert!(timing.presented());
             r.read_back()
         };
         let atlas = crate::atlas::build_atlas();

@@ -486,7 +486,7 @@ fn staged_chart_images_draw_before_the_commit_and_move_with_it() {
     let ctx = context(&GAUGES, false);
     let staged = |r: &mut render::Renderer, on: LoadingOn| {
         let t = r.loading_frame_on(on, &frame(1), &text).unwrap().unwrap();
-        assert!(t.presented);
+        assert!(t.presented());
         read_back(r)
     };
 

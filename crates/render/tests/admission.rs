@@ -52,7 +52,7 @@ fn play(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64) {
 fn frame(r: &mut Renderer) -> (usize, [u8; 3]) {
     let v = view(0, 0);
     let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
-    assert!(timing.presented);
+    assert!(timing.presented());
     let pixels = common::read_back(r);
     (timing.sprites, common::rgb_at(&pixels, 1_920, LEFT))
 }
