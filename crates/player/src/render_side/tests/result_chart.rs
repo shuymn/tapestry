@@ -408,12 +408,23 @@ fn the_probe_marks_a_replaced_layouts_drop_inside_its_readings() {
             .map(|m| (m.1, m.2))
             .collect()
     };
+    // Read once a layout was dropped and no drop is under way: each drop's
+    // last reading marked.
+    let settled = || {
+        let d = drops();
+        let count = |tag: &str| d.iter().filter(|m| m.0 == tag).count();
+        (d.contains(&("dr:kind", 3)) && count("dr:site") == count("dr:l1")).then_some(d)
+    };
+    let read = std::cell::RefCell::new(None);
     assert!(
-        wait_until(|| drops().contains(&("dr:kind", 3))),
+        wait_until(|| {
+            *read.borrow_mut() = settled();
+            read.borrow().is_some()
+        }),
         "no layout dropped: {:?}",
         drops()
     );
-    let d = drops();
+    let d = read.into_inner().unwrap_or_default();
     for (at, _) in d.iter().enumerate().filter(|(_, m)| **m == ("dr:kind", 3)) {
         let opened = d[..at].iter().rposition(|m| m.0 == "dr:l0");
         let closed = d[at..].iter().position(|m| m.0 == "dr:l1").map(|k| at + k);
