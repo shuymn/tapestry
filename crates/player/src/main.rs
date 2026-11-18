@@ -915,10 +915,7 @@ fn rig<'a>(
         #[cfg(test)]
         std::sync::Arc::clone(&audio_lost),
     );
-    let chart_images = crate::chart_images::ChartImageWorker::new(
-        render.chart_generation(),
-        render.cursor_generation(),
-    );
+    let chart_images = crate::chart_images::ChartImageWorker::new(render.chart_generation());
     let bga = crate::bga::BgaWorker::new(render.bga_generation(), render.bga_publisher());
     #[cfg(feature = "dev-tools")]
     game::coord::observe_jobs(crate::dev::job_stage);
@@ -937,7 +934,7 @@ fn rig<'a>(
         chart_images,
         bga,
         play_chart: None,
-        selection_chart: None,
+        selection_chart: false,
         controls,
         clock,
         recorded: input_side::Recorded {

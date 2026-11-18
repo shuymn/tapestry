@@ -11,3 +11,7 @@ xtask = "run --quiet --locked --profile xtask --package xtask --"
 # schedules by its own -j.
 [env]
 RUST_TEST_THREADS = "8"
+# tapestry's FFmpeg build, which `cargo xtask ffmpeg fetch` unpacks there
+# (docs/setup.md "FFmpeg"); forced, so a caller's own FFMPEG_DIR cannot point
+# the build at another FFmpeg.
+FFMPEG_DIR = { value = "target/ffmpeg", relative = true, force = true }

@@ -98,6 +98,27 @@ jobs:
           cmd-format: mise exec -- {0}
           cache-bin: false
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # tapestry's FFmpeg release (docs/setup.md "FFmpeg"): fetched here and
+      # refused unless its sha256 is ffmpeg.toml's, kept in a cache keyed by
+      # that sha256. With no release pinned, fetch says so and does nothing.
+      - name: Read the pinned FFmpeg release
+        id: ffmpeg
+        run: |
+          sha=$(python -c 'import tomllib; r = tomllib.load(open("ffmpeg.toml", "rb")).get("release"); print(r["binary"]["sha256"] if r else "")')
+          echo "sha256=$sha" | tee -a "$GITHUB_OUTPUT"
+      - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        id: ffmpeg-cache
+        if: steps.ffmpeg.outputs.sha256 != ''
+        with:
+          path: target/ffmpeg
+          key: ffmpeg-${{ steps.ffmpeg.outputs.sha256 }}
+      - name: Fetch FFmpeg
+        run: mise exec -- cargo xtask ffmpeg fetch
+      - if: github.ref == 'refs/heads/main' && steps.ffmpeg.outputs.sha256 != '' && steps.ffmpeg-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: target/ffmpeg
+          key: ffmpeg-${{ steps.ffmpeg.outputs.sha256 }}
       - name: Format
         run: mise exec -- cargo fmt --all --check
       - name: Clippy
@@ -393,7 +414,7 @@ jobs:
       # The allocation contracts also hold with optimizations (design.md
       # "Scope of No Allocation").
       - name: Allocation tests (release)
-        run: mise exec -- cargo test --release --locked -p eval -p input -p game -p audio -p skin-model --test alloc --test audio_alloc --test audio_burst_alloc --test ring_out_alloc --test system_alloc --test autoplay_iter_alloc --test loudness_alloc --test tempo_alloc --test adjustment_alloc --test rearm_alloc --test history_alloc --test restore_alloc --test reopen_alloc --test tail_alloc --test closing_alloc --test ending_alloc --test turntable_alloc --test readouts_alloc --test driver_alloc --test selection_alloc --test result_alloc --test chart_images_alloc --test score_graphs_alloc
+        run: mise exec -- cargo test --release --locked -p eval -p input -p game -p audio -p skin-model --test alloc --test reset_alloc --test audio_alloc --test audio_burst_alloc --test ring_out_alloc --test system_alloc --test autoplay_iter_alloc --test loudness_alloc --test tempo_alloc --test adjustment_alloc --test rearm_alloc --test history_alloc --test restore_alloc --test reopen_alloc --test tail_alloc --test closing_alloc --test ending_alloc --test turntable_alloc --test readouts_alloc --test driver_alloc --test selection_alloc --test result_alloc --test chart_images_alloc --test score_graphs_alloc
       # The element observations a capture reads run in every play frame of a
       # dev-tools build, so the skin's guard holds with them on too.
       - name: Skin allocation test with observations (release)

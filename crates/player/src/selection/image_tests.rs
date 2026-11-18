@@ -1,9 +1,12 @@
 //! The cursor's chart images on the select screen (S10-12 plan D2, SC1,
-//! SC4): the request waits for the cursor's rest, a change of the cursor's
-//! chart (a move, a list read again with other names or another row under
-//! the cursor, an entry) is a new cursor generation, the worker is stepped
-//! only in a look that chose nothing, and a request waiting behind a job
-//! wakes the screen within a slice.
+//! SC4; design.md "Rendering and Skins", chart images): the request waits
+//! for the cursor's rest, a change of the cursor's chart (a move, a list
+//! read again with other names or another row under the cursor, an entry)
+//! is a new cursor generation, a refreshed list keeping the cursor is a
+//! use of its entry, the worker is stepped only in a look that chose
+//! nothing, a request waiting behind a job wakes the screen within a
+//! slice, and a return shows a resident row at once and reads it again,
+//! with no move or rest, once its check finds it changed.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -12,17 +15,14 @@ use std::time::{Duration, Instant};
 use bms_model::{TimeSource as _, TimeUs};
 use game::AppRig as _;
 use input::QpcClock;
-use skin_model::chart_image::ChartImage;
 
 use super::tests::{keys, on_selection_at, over, settle};
 use super::{CursorImages, REST, Selection};
-use crate::chart_images::{ChartImageWorker, ChartImages, HELD_HARD, HOLD_HARD};
+use crate::chart_currency::CursorChart;
+use crate::chart_images::{ChartImageWorker, EntryState, HELD_HARD, HOLD_HARD};
 use crate::render_side::RenderLink;
-use crate::render_side::tests::{Installers, wait_until};
+use crate::render_side::tests::{Installers, pool_layout, selection_update, wait_until};
 use crate::select::{MenuInput, MenuKey};
-
-/// The selection chart layer's side.
-const SIDE: u32 = 2_048;
 
 /// A `w`×`h` PNG at `path`.
 fn png(path: &Path, [w, h]: [u32; 2]) {
@@ -70,13 +70,24 @@ pub(crate) fn library(
     (sel, root)
 }
 
-/// The native size of `which` in `set`, if it is an image.
-fn native(set: &ChartImages, which: ChartImage) -> Option<[u32; 2]> {
-    set.read(which).image.as_ref().ok().map(|f| f.native())
+/// Starts no scan pass after the one running, for a test that looks on a
+/// rig: each pass's end refreshes the list, an update, and passes ending
+/// faster than the render thread's frames would leave no frame boundary
+/// free for the pool's write (one per boundary, none at a boundary that
+/// took a new update).
+pub(crate) fn quiet(sel: &mut Selection) {
+    sel.shelf.set_rescan_after(Duration::from_secs(3_600));
 }
 
-/// A select screen's selection, a render link to show it on, and the
-/// worker its cursor asks.
+/// Screens with a selection chart-image pool of 8 slots.
+fn pooled() -> Installers {
+    let screens = Installers::default();
+    *screens.pool.lock().unwrap() = Some(pool_layout(8));
+    screens
+}
+
+/// A select screen's selection, a render link drawing a selection, whose
+/// screen has a pool, and the worker its cursor asks.
 struct Screen {
     sel: Selection,
     render: RenderLink,
@@ -86,14 +97,25 @@ struct Screen {
 
 impl Screen {
     fn new(sel: Selection) -> Self {
-        let screens = Installers::default();
+        let screens = pooled();
         let render = screens.spawn_bare();
-        let w = ChartImageWorker::new(render.chart_generation(), render.cursor_generation());
+        // The render thread on selection: it applies pool writes.
+        render.enter_selection(1);
+        render.show_selection(selection_update(1, 1));
+        assert!(wait_until(|| render.pool_now().0.is_some()));
+        let w = ChartImageWorker::new(render.chart_generation());
         Self {
             sel,
             render,
             w,
             _screens: screens,
+        }
+    }
+
+    fn images(&self) -> CursorImages<'_> {
+        CursorImages {
+            worker: &self.w,
+            drawn: true,
         }
     }
 
@@ -103,7 +125,7 @@ impl Screen {
         sel.dirty = true;
         let images = CursorImages {
             worker: w,
-            side: Some(SIDE),
+            drawn: true,
         };
         sel.show(render, images, None, TimeUs(ms * 1_000));
     }
@@ -113,7 +135,7 @@ impl Screen {
     fn rest(&mut self, ms: i64) -> bool {
         let images = CursorImages {
             worker: &self.w,
-            side: Some(SIDE),
+            drawn: true,
         };
         let request = self.sel.rest_request(images, TimeUs(ms * 1_000));
         let made = request.is_some();
@@ -123,11 +145,15 @@ impl Screen {
         made
     }
 
-    /// Steps the worker until the selection set is current and its job
-    /// ended; the set.
-    fn read(&self) -> std::sync::Arc<ChartImages> {
+    /// Steps the worker until the cursor's row has an entry and nothing
+    /// runs or waits; the entry's state.
+    fn read(&self) -> EntryState {
         let end = Instant::now() + Duration::from_secs(10);
-        while self.w.current_selection().is_none() || !self.w.idle() {
+        while self.w.cursor_entry().is_none()
+            || !self.w.idle()
+            || self.w.write_pending()
+            || self.w.checks_pending() != (false, false)
+        {
             assert!(Instant::now() < end, "{:?}", self.w);
             self.w.cursor_step(
                 &self.sel.coord,
@@ -136,13 +162,14 @@ impl Screen {
             );
             std::thread::sleep(Duration::from_millis(1));
         }
-        self.w.current_selection().unwrap()
+        let _ = self.images();
+        self.w.cursor_entry().unwrap().0
     }
 }
 
 /// The cursor's request is made once it rested 150 ms on a chart, not
-/// before, and once per rest; the 640×480 stage file and 300×80 banner are
-/// read for it.
+/// before, and once per rest; the stage file and banner are both read for
+/// it, into a slot of the pool.
 #[test]
 fn the_cursors_request_waits_for_its_rest() {
     let _serial = crate::imports::tests::serial();
@@ -159,9 +186,8 @@ fn the_cursors_request_waits_for_its_rest() {
     assert!(!s.rest(159));
     assert!(s.rest(160));
     assert!(!s.rest(400), "requested twice in one rest");
-    let set = s.read();
-    assert_eq!(native(&set, ChartImage::Stage), Some([640, 480]));
-    assert_eq!(native(&set, ChartImage::Banner), Some([300, 80]));
+    assert!(matches!(s.read(), EntryState::Resident { .. }));
+    assert_eq!(s.w.counts().0, 2);
     assert_eq!(s.w.begun(), 1);
 }
 
@@ -188,13 +214,14 @@ fn a_move_before_the_rest_makes_no_request() {
     assert!(!s.rest(150), "requested for the chart left");
     assert!(!s.rest(289));
     assert!(s.rest(290));
-    let set = s.read();
-    assert_eq!(native(&set, ChartImage::Stage), Some([320, 240]));
+    assert!(matches!(s.read(), EntryState::Resident { .. }));
     assert_eq!(s.w.begun(), 1);
+    assert_eq!(s.w.counts().0, 1);
 }
 
-/// A row that is no chart asks for nothing; a chart naming no image is
-/// published absent with no job.
+/// A row that is no chart asks for nothing and is absent; a chart naming
+/// no image is absent at once and an absent entry at its rest, with no
+/// job.
 #[test]
 fn a_row_with_no_chart_asks_for_nothing() {
     let _serial = crate::imports::tests::serial();
@@ -204,19 +231,21 @@ fn a_row_with_no_chart_asks_for_nothing() {
     // The all-charts row.
     s.show(0);
     assert!(s.sel.screen.selected().is_none());
+    assert_eq!(s.w.sent_chart(), Some(CursorChart::Absent));
     assert!(!s.rest(1_000));
     keys(&mut s.sel, &[MenuKey::Down]);
     s.show(1_000);
+    assert_eq!(s.w.sent_chart(), Some(CursorChart::Absent));
     assert!(s.rest(1_150));
-    let set = s.read();
-    assert!(set.fitted().iter().all(Option::is_none));
+    assert_eq!(s.read(), EntryState::Absent);
     assert_eq!(s.w.begun(), 0);
 }
 
 /// The list read again: with the cursor's chart and its names unchanged
-/// nothing changes; with its banner renamed on the same path the cursor
-/// generation changes and the new banner is read; with the cursor's chart
-/// gone, the row under the cursor changes as a move does.
+/// the cursor generation stays and the refresh is a use, checked once;
+/// with its banner renamed on the same path the cursor generation changes,
+/// the update is pending, and the new banner is read; with the cursor's
+/// chart gone, the row under the cursor changes as a move does.
 #[test]
 fn a_rescan_changes_the_request_only_with_its_chart() {
     let _serial = crate::imports::tests::serial();
@@ -232,30 +261,48 @@ fn a_rescan_changes_the_request_only_with_its_chart() {
     keys(&mut s.sel, &[MenuKey::Down]);
     s.show(0);
     assert!(s.rest(150));
-    assert_eq!(native(&s.read(), ChartImage::Banner), Some([300, 80]));
-    let generation = s.w.cursor_generation();
-    // Scanned again, unchanged.
+    assert!(matches!(s.read(), EntryState::Resident { .. }));
+    // Its adoption's update: a use, checked.
+    s.show(160);
+    s.read();
+    let (generation, checks) = (s.w.cursor_generation(), s.w.checks_begun());
+    // An ordinary update is no use.
+    s.show(170);
+    s.read();
+    assert_eq!(s.w.checks_begun(), checks, "an ordinary update checked");
+    // Scanned again, unchanged: the same request, a use.
     settle(&mut s.sel);
     s.show(200);
     assert_eq!(s.w.cursor_generation(), generation);
     assert!(!s.rest(400));
-    assert!(s.w.current_selection().is_some());
+    assert!(matches!(
+        s.w.sent_chart(),
+        Some(CursorChart::Resident { .. })
+    ));
+    s.read();
+    assert_eq!(s.w.checks_begun(), checks + 1, "the refresh not checked");
     // The banner renamed.
     std::thread::sleep(Duration::from_millis(20));
     write(&root, "a.bms", Some("hidden-a.png"), Some("hidden-m.png"));
     settle(&mut s.sel);
     s.show(500);
     assert!(s.w.cursor_generation() > generation, "the old banner kept");
-    assert!(s.w.current_selection().is_none());
+    assert_eq!(s.w.sent_chart(), Some(CursorChart::Pending));
     assert!(s.rest(650));
-    assert_eq!(native(&s.read(), ChartImage::Banner), Some([200, 40]));
+    let decodes = s.w.counts().0;
+    assert!(matches!(s.read(), EntryState::Resident { .. }));
+    assert_eq!(s.w.counts().0, decodes + 2);
     // The chart gone: the cursor is on another row.
     let generation = s.w.cursor_generation();
     std::fs::remove_file(root.join("a.bms")).unwrap();
     settle(&mut s.sel);
     s.show(700);
     assert!(s.w.cursor_generation() > generation);
-    assert!(s.w.current_selection().is_none());
+    assert_ne!(
+        s.w.sent_chart()
+            .map(|c| matches!(c, CursorChart::Resident { .. })),
+        Some(true)
+    );
 }
 
 /// Lets go of [`HOLD_HARD`] when dropped.
@@ -296,21 +343,31 @@ pub(crate) fn look_until(
     }
 }
 
+/// Whether the worker has settled with the cursor's row resident: no
+/// read, write or check runs or waits.
+pub(crate) fn resident(w: &ChartImageWorker) -> bool {
+    matches!(w.cursor_entry(), Some((EntryState::Resident { .. }, ..)))
+        && w.idle()
+        && !w.write_pending()
+        && w.checks_pending() == (false, false)
+}
+
 /// The select screen of two charts with images, on a rig whose selection
-/// skin keeps a chart layer and whose clock a test may hold.
+/// skin draws them into a pool and whose clock a test may hold.
 fn on_charts<R>(f: impl FnOnce(&mut crate::play::PlayerRig<'_>) -> R) -> R {
     let dir = tempfile::tempdir().unwrap();
-    let (sel, _) = library(
+    let (mut sel, _) = library(
         dir.path(),
         &[
             ("a.bms", Some("hidden-a.png"), Some("hidden-n.png")),
             ("b.bms", Some("hidden-b.png"), None),
         ],
     );
-    let screens = Installers::default();
+    quiet(&mut sel);
+    let screens = pooled();
     let render = screens.spawn_bare();
     on_selection_at(sel, &screens, render, QpcClock::holdable(), |rig| {
-        rig.selection_chart = Some(SIDE);
+        rig.selection_chart = true;
         f(rig)
     })
 }
@@ -369,64 +426,103 @@ fn a_deferred_request_wakes_the_select_screen_within_a_slice() {
         HOLD_HARD.store(false, Ordering::Release);
         rig.clock.run();
         look_until(rig, |w| w.begun() == 2);
-        look_until(rig, |w| w.current_selection().is_some());
-        let set = rig.chart_images.current_selection().unwrap();
-        assert_eq!(native(&set, ChartImage::Stage), Some([320, 240]));
+        look_until(rig, resident);
+        // B's stage file alone.
+        assert_eq!(rig.chart_images.counts().0, 1);
     });
 }
 
-/// Back on selection with the cursor on the same chart: the cursor
-/// generation is new, so the last visit's table is not current; the
-/// request comes only after the rest counted from the entry; and the stage
-/// file replaced meanwhile and the unchanged banner are both read again.
+/// Back on selection with the cursor on the same chart, its stage file
+/// replaced meanwhile (P-i, AC-S4, AC-S17): the entry's first update names
+/// its slot at once, with no read; the check of that use finds the file
+/// changed, withdraws the row (the next update pending), and its read is
+/// asked again with no move and no new rest, the clock held.
 #[test]
-fn a_return_reads_the_chart_again_after_its_rest() {
+fn a_return_shows_the_row_at_once_and_reads_it_again_once_changed() {
     let _serial = crate::imports::tests::serial();
     let dir = tempfile::tempdir().unwrap();
-    let (sel, root) = library(
+    let (mut sel, root) = library(
         dir.path(),
         &[("a.bms", Some("hidden-a.png"), Some("hidden-n.png"))],
     );
-    let screens = Installers::default();
+    quiet(&mut sel);
+    let screens = pooled();
     let render = screens.spawn_bare();
     on_selection_at(sel, &screens, render, QpcClock::holdable(), |rig| {
-        rig.selection_chart = Some(SIDE);
+        rig.selection_chart = true;
         // Held: the rest is reached by moving the clock, and the entry and
         // the looks after it read the times set, however long they took.
         let moved = rig.clock.hold();
         press(rig, MenuKey::Down);
         assert!(rig.choose().is_none());
         rig.clock.set(TimeUs(moved.0 + REST.0));
-        look_until(rig, |w| w.current_selection().is_some() && w.idle());
+        look_until(rig, resident);
         let (decodes, begun) = (rig.chart_images.counts().0, rig.chart_images.begun());
         assert_eq!(decodes, 2);
-        let generation = rig.chart_images.cursor_generation();
-        // Away (the entry alone is checked here, so the departure's own
-        // new cursor generation is left out); the stage file replaced
-        // meanwhile.
+        let Some((EntryState::Resident { generation, slot }, ..)) = rig.chart_images.cursor_entry()
+        else {
+            panic!("{:?}", rig.chart_images);
+        };
+        // Away (the departure); the stage file replaced meanwhile.
+        rig.left_selection();
         std::thread::sleep(Duration::from_millis(20));
         png(&root.join("hidden-a.png"), [160, 120]);
-        let entered = rig.clock.now();
+        let checks = rig.chart_images.checks_begun();
         rig.entered_selection();
-        assert!(rig.chart_images.cursor_generation() > generation);
-        assert!(rig.chart_images.current_selection().is_none());
-        assert!(rig.choose().is_none());
-        assert_eq!(rig.chart_images.begun(), begun, "requested at the entry");
-        let wake = rig.selection_wake().unwrap();
-        assert_eq!(wake.0, entered.0 + REST.0, "{wake:?} {entered:?}");
-        // The request is made at the rest, not before (its job may begin
-        // in a later look).
-        let due = |rig: &crate::play::PlayerRig<'_>| rig.selection.as_ref().unwrap().rest_due();
-        rig.clock.set(TimeUs(wake.0 - 1));
-        assert!(rig.choose().is_none());
-        assert_eq!(due(rig), Some(wake), "requested before the rest");
-        rig.clock.set(wake);
-        assert!(rig.choose().is_none());
-        assert_eq!(due(rig), None, "no request at the rest");
-        rig.clock.run();
-        look_until(rig, |w| w.current_selection().is_some() && w.idle());
+        // The entry's update names the slot at once, with no read.
+        assert_eq!(
+            rig.chart_images.sent_chart(),
+            Some(CursorChart::Resident { generation, slot })
+        );
+        assert_eq!(rig.chart_images.begun(), begun, "read at the entry");
+        // The check of the entry's use withdraws it.
+        look_until(rig, |w| w.cursor_entry().is_none());
+        assert!(rig.chart_images.checks_begun() > checks);
+        assert_eq!(rig.chart_images.sent_chart(), Some(CursorChart::Pending));
+        // Read again, the clock still held: no new rest.
+        look_until(rig, resident);
+        assert_eq!(rig.chart_images.begun(), begun + 1);
         assert_eq!(rig.chart_images.counts().0, decodes + 2);
-        let set = rig.chart_images.current_selection().unwrap();
-        assert_eq!(native(&set, ChartImage::Stage), Some([160, 120]));
+    });
+}
+
+/// A still cursor whose entry a check withdraws is read again at the next
+/// look, the clock held at its first rest's end: the withdrawal counts
+/// the rest as served, with no move, no entry and no new rest (AC-S17).
+/// The use is a list read again with the cursor kept.
+#[test]
+fn a_withdrawn_entry_under_a_still_cursor_is_read_again_at_once() {
+    let _serial = crate::imports::tests::serial();
+    let dir = tempfile::tempdir().unwrap();
+    let (mut sel, root) = library(
+        dir.path(),
+        &[("a.bms", Some("hidden-a.png"), Some("hidden-n.png"))],
+    );
+    quiet(&mut sel);
+    let screens = pooled();
+    let render = screens.spawn_bare();
+    on_selection_at(sel, &screens, render, QpcClock::holdable(), |rig| {
+        rig.selection_chart = true;
+        let moved = rig.clock.hold();
+        press(rig, MenuKey::Down);
+        assert!(rig.choose().is_none());
+        rig.clock.set(TimeUs(moved.0 + REST.0));
+        look_until(rig, resident);
+        let (decodes, begun) = (rig.chart_images.counts().0, rig.chart_images.begun());
+        let checks = rig.chart_images.checks_begun();
+        // The stage file replaced, then the list read again with the
+        // cursor kept: a use of its entry.
+        std::thread::sleep(Duration::from_millis(20));
+        png(&root.join("hidden-a.png"), [160, 120]);
+        let sel = rig.selection.as_mut().unwrap();
+        sel.shelf.set_rescan_after(Duration::ZERO);
+        settle(sel);
+        quiet(sel);
+        look_until(rig, |w| w.cursor_entry().is_none());
+        assert!(rig.chart_images.checks_begun() > checks);
+        // Read again with the clock still held: no new rest.
+        look_until(rig, resident);
+        assert_eq!(rig.chart_images.begun(), begun + 1);
+        assert_eq!(rig.chart_images.counts().0, decodes + 2);
     });
 }

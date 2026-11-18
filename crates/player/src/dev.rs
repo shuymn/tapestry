@@ -3146,7 +3146,7 @@ pub fn job_stage(kind: game::coord::JobKind, start: bool) {
         (JobKind::Loudness | JobKind::Measure, true) => "loudness_start",
         (JobKind::Loudness | JobKind::Measure, false) => "loudness_end",
         // The BGA job stamps its own, on either path.
-        (JobKind::ChartImages | JobKind::BgaImages, _) => return,
+        (JobKind::ChartImages | JobKind::ChartCheck | JobKind::BgaImages, _) => return,
     };
     stage(name);
 }
