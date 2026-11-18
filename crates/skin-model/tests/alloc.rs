@@ -5356,10 +5356,14 @@ fn instructions_do_not_allocate(chart: &Chart, ctx: &PlayContext<'_>) {
         };
         [v, 1]
     }));
-    // A jump to the span's end: nil, false.
+    // A jump to the span's end past a return of true: nil, false.
     b.push(Cb::code(
-        vec![Insn::Jump { to: 2 }, Insn::Ret { src: 0 }],
-        vec![],
+        vec![
+            Insn::Const { dst: 0, k: 0 },
+            Insn::Jump { to: 3 },
+            Insn::Ret { src: 0 },
+        ],
+        vec![Val::Bool(true)],
         vec![],
         Conv::Truthy,
     ));
