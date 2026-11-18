@@ -196,68 +196,82 @@ fn a_folded_text_agrees_with_its_closure() {
     assert_eq!(lit, [Some("260 (100%)".to_owned())]);
 }
 
+/// Whether `r` passes with exactly one text agreed on each play frame.
+fn agreed_on_every_play_frame(r: &Report) -> bool {
+    r.passes() && texts_agreed(r) == play_frames(r)
+}
+
 /// Each cleaning twin: the record keeps the fold before cleaning, the
 /// player is asked for it cleaned, and the comparison agrees with the
-/// closure's string respelled before it is cleaned.
+/// closure's string respelled before it is cleaned. Every case runs, and
+/// the ones whose replay disagrees are named together.
 #[test]
 fn a_folded_text_is_compared_as_the_player_receives_it() {
     let a = |n: usize| "a".repeat(n);
-    let cases: Vec<(String, String, Vec<String>)> = vec![
-        // 257 bytes: the request is cut to 256; the reference's 261 bytes
-        // respell to 257 before the same cut.
+    // Name, value, the fold, the request (none when it cleans away).
+    let cases: Vec<(&str, String, String, Option<String>)> = vec![
+        // The request is cut to 256; the reference's 261 bytes respell to
+        // 257 before the same cut.
         (
+            "257 bytes",
             format!(
                 "function() local t = ms.number(368) return \"{}\" .. t .. \"/\" .. t end",
                 a(250)
             ),
             format!("{}260/260", a(250)),
-            vec![format!("{}260/26", a(250))],
+            Some(format!("{}260/26", a(250))),
         ),
-        // Control characters dropped.
         (
+            "control characters",
             "function() local t = ms.number(368) return \"a\\tb\\127\" .. t end".to_owned(),
             "a\tb\u{7f}260".to_owned(),
-            vec!["ab260".to_owned()],
+            Some("ab260".to_owned()),
         ),
-        // A multibyte character past the cut is dropped whole.
+        // A two-byte character past the cut is dropped whole.
         (
+            "two-byte character dropped",
             format!(
                 "function() local t = ms.number(368) return t .. \"/\" .. t .. \"{}\" .. \"é\" end",
                 a(248)
             ),
             format!("260/260{}é", a(248)),
-            vec![format!("260/260{}", a(248))],
+            Some(format!("260/260{}", a(248))),
         ),
-        // One byte shorter, it stays.
+        // One byte shorter, it stays; cleaning the reference's string
+        // before respelling it would cut it.
         (
+            "two-byte character kept",
             format!(
                 "function() local t = ms.number(368) return t .. \"/\" .. t .. \"{}\" .. \"é\" end",
                 a(247)
             ),
             format!("260/260{}é", a(247)),
-            vec![format!("260/260{}é", a(247))],
+            Some(format!("260/260{}é", a(247))),
+        ),
+        // A fold the widget cleans away: no request, and the closure's
+        // string cleans away too.
+        (
+            "cleaned to empty",
+            "function() return \"\\t\" .. \"\\n\" end".to_owned(),
+            "\t\n".to_owned(),
+            None,
         ),
     ];
-    for (value, literal, requests) in cases {
+    let mut disagree = Vec::new();
+    for (name, value, literal, request) in cases {
         let o = options(Script::full());
-        let r = replayed(&[&value], &o);
-        agrees_on_every_play_frame(&r);
         let (lit, req) = imported(&[&value], &o);
         // The comparator's cleaning is the text the player is asked for.
-        assert_eq!(req, [clean(&literal)]);
-        assert_eq!(lit, [Some(literal)]);
-        assert_eq!(req, requests);
+        let cleaned = clean(&literal);
+        assert_eq!(req, request.iter().cloned().collect::<Vec<_>>(), "{name}");
+        assert_eq!(req.first().cloned().unwrap_or_default(), cleaned, "{name}");
+        assert_eq!(lit, [Some(literal)], "{name}");
+        let r = replayed(&[&value], &o);
+        if !agreed_on_every_play_frame(&r) {
+            disagree.push(name);
+        }
     }
-    // A fold the widget cleans away: no request, and the closure's string
-    // cleans away too.
-    let value = "function() return \"\\t\" .. \"\\n\" end";
-    let o = options(Script::full());
-    let r = replayed(&[value], &o);
-    assert!(r.passes(), "{}", r.text(0, true, true));
-    assert_eq!(texts_agreed(&r), play_frames(&r));
-    let (lit, req) = imported(&[value], &o);
-    assert_eq!(lit, [Some("\t\n".to_owned())]);
-    assert!(req.is_empty(), "{req:?}");
+    assert!(disagree.is_empty(), "cases that disagree: {disagree:?}");
 }
 
 /// The text findings of `r`, each with its detail.
