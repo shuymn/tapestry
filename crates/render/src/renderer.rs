@@ -1325,8 +1325,9 @@ pub struct Renderer {
     pool: Option<ChartPool>,
     /// The pool a commit replaced, kept as [`retired`](Self::retired) is.
     retired_pool: Option<ChartPool>,
-    /// Unit tests: pool arrays the device refuses next, one each.
-    #[cfg(test)]
+    /// Tests and development builds: pool arrays the device refuses
+    /// next, one each.
+    #[cfg(any(test, feature = "dev-tools"))]
     pool_faults: std::cell::Cell<u32>,
     /// Run by the next pool write inside its error scopes: a unit test
     /// makes the device refuse something there.
@@ -1591,7 +1592,7 @@ impl Renderer {
             pool_grid: None,
             pool: None,
             retired_pool: None,
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dev-tools"))]
             pool_faults: std::cell::Cell::new(0),
             #[cfg(test)]
             pool_write_fault: None,
@@ -2219,6 +2220,32 @@ impl Renderer {
         self.stated.push((Arc::clone(bundle), texels));
     }
 
+    /// Tests and development builds: the next `n` chart-image pool arrays
+    /// are refused as the device refuses one, so a selection can be
+    /// committed with no pool, its firm layer included.
+    #[cfg(any(test, feature = "dev-tools"))]
+    pub fn refuse_next_pools(&self, n: u32) {
+        self.pool_faults.set(n);
+    }
+
+    /// The selection's and decision's committed charges, the selection's
+    /// with its chart-image pool's firm layer whether the pool has it now
+    /// or not (refused, or not yet made again): a selection entry's
+    /// regrowth ([`regrow_pool`](Self::regrow_pool)) or a recovery's
+    /// [`restore`](Self::restore) makes that layer again without a
+    /// staging, so this bounds those kinds' charges until an installation
+    /// changes.
+    #[must_use]
+    pub fn menu_charges(&self) -> u64 {
+        let firm = self.pool_grid.map_or(0, |g| g.layer_texels());
+        let selection = self
+            .committed_installation(ScreenKind::Selection)
+            .map_or(0, |i| {
+                self.committed_charge(i.bundle()).saturating_add(firm)
+            });
+        selection.saturating_add(self.charge(ScreenKind::Decision))
+    }
+
     /// The charges [`admit`](Self::admit) sums now, the staged
     /// installation's and the chart-image pool's firm and optional layers.
     #[must_use]
@@ -2274,16 +2301,16 @@ impl Renderer {
     ) -> Option<(ChartPool, wgpu::BindGroup)> {
         let tries = [Some(layers), (layers > 1).then_some(1)];
         tries.into_iter().flatten().find_map(|layers| {
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dev-tools"))]
             let fault = self.pool_faults.get() > 0;
-            #[cfg(test)]
+            #[cfg(any(test, feature = "dev-tools"))]
             self.pool_faults
                 .set(self.pool_faults.get().saturating_sub(1));
             let device = self.gpu.device();
             let ((pool, bind), refused) = skin_atlas::scoped(device, || {
                 let pool = ChartPool::create(&self.gpu, grid, layers);
                 let bind = self.bindings.bind(device, atlas, Some(pool.view()));
-                #[cfg(test)]
+                #[cfg(any(test, feature = "dev-tools"))]
                 if fault {
                     pool_fault(&self.gpu);
                 }
@@ -6299,10 +6326,10 @@ fn finish_uploads(gpu: &Gpu) -> Result<(), RenderError> {
     wait_for_gpu(gpu)
 }
 
-/// Unit tests: what a refused pool array runs inside its error scopes, a
-/// buffer whose usage mixes both map modes, which every device's
-/// validation refuses.
-#[cfg(test)]
+/// Tests and development builds: what a refused pool array runs inside its
+/// error scopes, a buffer whose usage mixes both map modes, which every
+/// device's validation refuses.
+#[cfg(any(test, feature = "dev-tools"))]
 fn pool_fault(gpu: &Gpu) {
     let _ = gpu.device().create_buffer(&wgpu::BufferDescriptor {
         label: Some("refused"),

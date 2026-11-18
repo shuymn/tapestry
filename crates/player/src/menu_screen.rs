@@ -1086,6 +1086,10 @@ impl Screen for MenuScreen {
         self.renderer.retained_atlases(kind)
     }
 
+    fn menus(&self) -> u64 {
+        self.renderer.menu_charges()
+    }
+
     fn prepare_result(
         &mut self,
         skin: &Arc<SkinBundle>,

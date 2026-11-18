@@ -304,6 +304,10 @@ pub struct ResultSkin {
     /// The committed attempt's images: replaced at the next commit,
     /// dropped at selection's and practice's entry.
     images: Option<HeldImages>,
+    /// Whether the probe of a skin reading a result fact is packed from
+    /// its kept import ([`kept_probe_fits`]), else from a plain one; `None`
+    /// until first decided, a plain one meanwhile.
+    kept: Option<bool>,
 }
 
 impl std::fmt::Debug for ResultSkin {
@@ -313,6 +317,20 @@ impl std::fmt::Debug for ResultSkin {
             .field("published", &self.published)
             .finish_non_exhaustive()
     }
+}
+
+/// Whether the shared texel limit leaves room for any result atlas
+/// beside the selection's and decision's committed charges `menus` (the
+/// selection's with its pool's firm layer, whether the pool has it now
+/// or not, [`render::Renderer::menu_charges`]): the largest play and result
+/// charges, each the per-atlas cap and one VM charge, fit beside them
+/// (design.md "beatoraja Lua Skins", the result skin; "Memory
+/// Budget"). Only then is a probe packed from its kept import, which
+/// can be larger than a plain one.
+#[must_use]
+pub fn kept_probe_fits(menus: u64) -> bool {
+    let most = skin_model::MAX_ATLAS_TEXELS.saturating_add(render::VM_TEXELS);
+    menus.saturating_add(most.saturating_mul(2)) <= render::SHARED_TEXELS
 }
 
 /// Whether `deps` read a fact of the viewed result beyond the chart's
@@ -554,7 +572,7 @@ fn layout(
     };
     let facts = result_facts(fields, class);
     // A layout that is shown keeps its runtime, under the permit taken
-    // for it; the probe's, never shown, keeps none.
+    // for it; the plain probe's, never shown, keeps none.
     let outcome = if permit.is_some() {
         pending
             .header
@@ -784,6 +802,28 @@ impl ResultSkin {
         self.forget_unpresented();
         if self.others().len() < 2 {
             self.retry_deferred();
+        }
+    }
+
+    /// Whether the kept probe fits, decided from the charges the
+    /// renderer last reported ([`kept_probe_fits`]), before each image
+    /// stage, when no job runs. A change of a decision made drops what was
+    /// packed or bound the other way: the probe's record, the prepared
+    /// atlas, the kept cells, and the cached layouts and the publication
+    /// bound to a prepared atlas (the publication's would be the next
+    /// probe's union base), so no later probe or view packs or binds cells
+    /// only the other mode keeps. A bundle for every view of a skin that
+    /// reads no fact of the viewed result has its own atlas, the same in
+    /// either mode, and stays. The first decision drops nothing.
+    pub fn set_kept_probe(&mut self, kept: bool) {
+        if self.kept.replace(kept).is_some_and(|was| was != kept) {
+            self.probe = None;
+            self.image = None;
+            self.cells = None;
+            self.layout.take_if(|l| l.entry.is_some());
+            self.presented.take_if(|l| l.entry.is_some());
+            self.published
+                .take_if(|p| matches!(p, Published::Skin(_, Some(_), _)));
         }
     }
 
@@ -1053,6 +1093,7 @@ impl ResultSkin {
         let theirs = Arc::clone(&slot);
         let base = self.shown_entry();
         let others = self.others();
+        let kept = self.kept == Some(true);
         let spawned = imports::spawn_job(move |cancel: &Cancel| -> ImageOut {
             let slot = theirs;
             let o = if permit.is_some() {
@@ -1110,23 +1151,38 @@ impl ResultSkin {
                     };
                     (Some(r.map(Some)), deps, Some(images), None, script)
                 }
-                Ok(LuaOutcome::Imported(_)) => {
-                    let view = ViewFacts(Some(match facts.result {
-                        Fact::Known(f) => f,
-                        _ => return (None, deps, None, None, ScriptSlot::default()),
-                    }));
-                    let (laid, _) = layout(
-                        &pending,
-                        view,
-                        Some(class),
-                        &slot,
-                        base,
-                        others,
-                        cancel,
-                        None,
-                        None,
-                    );
-                    // The probe's layout is never shown: its atlas is.
+                Ok(LuaOutcome::Imported(mut i)) => {
+                    // A skin that reads the viewed result: the probe's
+                    // layout is never shown, its atlas is. While the kept
+                    // probe fits ([`kept_probe_fits`]) it is laid out from
+                    // this import, made in the shown layouts' mode when
+                    // the permit came, so its atlas holds the cells a
+                    // runtime's callback draws; the runtime goes and the
+                    // permit is released here, before the pack. Else from
+                    // a second, plain import, which keeps no such cells.
+                    drop(i.runtime.take());
+                    drop(permit);
+                    let laid = if kept {
+                        lay_out(&pending, i, &slot, base, others, cancel)
+                    } else {
+                        drop(i);
+                        let view = ViewFacts(Some(match facts.result {
+                            Fact::Known(f) => f,
+                            _ => return (None, deps, None, None, ScriptSlot::default()),
+                        }));
+                        layout(
+                            &pending,
+                            view,
+                            Some(class),
+                            &slot,
+                            base,
+                            others,
+                            cancel,
+                            None,
+                            None,
+                        )
+                        .0
+                    };
                     (
                         Some(laid.result.map(|_| None).map_err(|e| match e {
                             Unbuilt::Refused(why) => why,
