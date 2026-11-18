@@ -10,6 +10,46 @@
 //! whose slot was taken but not filled when the marks are read, is counted,
 //! not kept (the count is printed with the marks). Off, a mark is one
 //! atomic load.
+//!
+//! Two classes of mark. The deciding marks are exact at their events:
+//! `prep:begin` and `g:open`, and the end-to-end spans built from them
+//! with the transition record's choice and READY, the figures a
+//! transition is judged by. Every other mark is diagnostic: it names its
+//! event truly (the array, view or upload it is of), and its interval is
+//! what is measured, with what it cannot leave out:
+//!
+//! - `fu:*`, an array's first use: the first frame that encoded a sprite
+//!   draw sampling the array uploaded last. `fu:submit_us` is the frame's
+//!   submit call; `fu:cpu_us` the frame's CPU time as its timing counts it,
+//!   the image's acquisition or admission left out; `fu:gpu_done_us` runs
+//!   from the submit's return to wgpu's report of the work done, which
+//!   comes at the device's next submit or poll, so it includes the wait
+//!   for that call (an upper bound on the GPU's work). The report can come
+//!   inside another submit, an upload's included, so its mark can fall
+//!   among that upload's marks; marks are the probe's own work, left out
+//!   of the upload's figures.
+//! - `tx:*`, a text preparation: each step as timed; `tx:gpu_wait_us`
+//!   from just before the wait to its return, zero when every line was
+//!   cached and nothing was submitted. Each includes the thread's
+//!   descheduling inside it.
+//! - `att:*`, an attempt's staging: `att:stage_us` is the whole stage or
+//!   preparation call, any upload and wait inside it included.
+//! - `rf:*`, the result's first frames: the three frames after its first
+//!   view committed, a skin's staging or the built-in view, counted on the
+//!   render thread; `rf:wait_us` includes the acquisition's or the
+//!   admission's wait, which a frame still pending lengthens.
+//! - `dr:*`, a drop: the drop of the handle it names; the memory read after
+//!   it can still be held, freed at the device's next maintenance
+//!   (`render::probe`).
+//! - An upload's summary (`up:*`) is marked once its wait returned, or at
+//!   once when it was refused: no wait is added to the refusal, so a
+//!   refused upload's queued writes can still be in flight when its
+//!   summary is marked.
+//!
+//! Off, the probe reads no clock and no thread-local of its own: its spans
+//! and its own time are zero, and the renderer's after-submit readings are
+//! skipped. Its atomics (the frames armed, the first use awaited) are
+//! still loaded.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -94,6 +134,9 @@ impl Recorder {
     /// Takes the next slot, or counts a mark past the room as dropped.
     pub fn take(&self) -> Option<&Slot> {
         let slots = self.slots.get()?;
+        // The count goes on past the room, unsaturated: it wraps only after
+        // 2^64 marks, out of any run's reach, where a saturating
+        // compare-exchange loop would make the marking threads contend.
         let slot = slots.get(self.taken.fetch_add(1, Ordering::Relaxed));
         if slot.is_none() {
             self.dropped.fetch_add(1, Ordering::Relaxed);

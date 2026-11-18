@@ -741,13 +741,22 @@ impl Renderer {
     }
 
     /// After a frame's submit (the probe on): the first draw of the array
-    /// uploaded last (`fu:*`: its submit, its CPU time from the frame's
-    /// start, and the report of its GPU completion, wall time to when wgpu
-    /// reports the work done at the device's next submit or poll; or
-    /// `fu:in_play` in play, where no completion callback is armed;
-    /// the probe takes no poll to hurry the report), then the submit and memory of the
-    /// frames marked after a drop or a first use (`pd:*`).
-    fn probe_after_submit(&self, first: Option<(u64, u8)>, submit: Duration, cpu: Duration) {
+    /// uploaded last, in a frame that encoded a sprite draw sampling it
+    /// (`fu:*`: its submit; the frame's CPU time as [`FrameTiming::cpu`]
+    /// counts it, without the image's acquisition or admission; and the
+    /// report of its GPU completion, wall time from `submitted`, the
+    /// submit's return, to when wgpu reports the work done, which is at the
+    /// device's next submit or poll, so the figure includes the wait for
+    /// that call (the probe takes no poll to hurry it); or `fu:in_play` in
+    /// play, where no completion callback is armed), then the submit and
+    /// memory of the frames marked after a drop or a first use (`pd:*`).
+    fn probe_after_submit(
+        &self,
+        first: Option<(u64, u8)>,
+        submit: Duration,
+        cpu: Duration,
+        submitted: Instant,
+    ) {
         use crate::probe::{POST, mark, mem, us};
         if let Some((key, caller)) = first {
             crate::probe::end_first_use(key);
@@ -758,12 +767,11 @@ impl Renderer {
             if crate::probe::in_play() {
                 mark("fu:in_play", 1);
             } else {
-                // Wall time: the readings below run while the GPU works on
-                // this frame, so they are not left out of its completion.
-                let t = Instant::now();
+                // Wall time: the GPU works on this frame from the submit,
+                // so the probe's readings since are not left out of it.
                 crate::probe::own(|| {
                     self.gpu.queue().on_submitted_work_done(move || {
-                        mark("fu:gpu_done_us", us(t.elapsed()));
+                        mark("fu:gpu_done_us", us(submitted.elapsed()));
                     });
                 });
             }
@@ -1973,6 +1981,10 @@ impl Renderer {
     /// by the device, and [`RenderError::Poll`] when the device fails
     /// waiting for the upload; the atlas and clips in use stay, and frames
     /// go on drawing with them.
+    ///
+    /// The transition probe (dev-tools) marks no upload or first use of
+    /// this array: only this crate's tests install an atlas so; the
+    /// player's skins are uploaded by their staging.
     pub fn install_atlas(
         &mut self,
         pages: &AtlasPages<'_>,
@@ -2965,9 +2977,12 @@ impl Renderer {
         });
         #[cfg(feature = "dev-tools")]
         let p_scoped = p_scope0.elapsed();
-        // The upload's figures, marked once it is waited for or refused: no
-        // probe work overlaps the GPU's copy that the wait and the total
-        // time (dev-tools).
+        // The upload's figures, marked once it is waited for, so no probe
+        // work overlaps the GPU's copy that the wait and the total time; or
+        // at once when it is refused, where no wait is added, so a refused
+        // upload's queued writes can still be in flight (dev-tools). A
+        // first use's completion report armed earlier can run inside this
+        // upload's submit; its mark is the probe's own work, left out here.
         #[cfg(feature = "dev-tools")]
         let p_summary = |refused: bool| {
             if !crate::probe::on() {
@@ -6363,6 +6378,9 @@ impl Renderer {
                 crate::probe::first_use(key).map(|caller| (key, caller))
             })
             .flatten();
+        // Whether a sprite draw, which samples the array, is encoded.
+        #[cfg(feature = "dev-tools")]
+        let mut p_drew = false;
         let sprites = staging.instances().len();
         let staged = u32::try_from(sprites).unwrap_or(u32::MAX);
         let timing = |cpu, outcome| FrameTiming {
@@ -6544,6 +6562,10 @@ impl Renderer {
                     Blend::Multiply => &self.multiply,
                 });
                 pass.draw(0..4, run.start..end);
+                #[cfg(feature = "dev-tools")]
+                {
+                    p_drew = true;
+                }
             }
         }
         for text in texts {
@@ -6569,6 +6591,8 @@ impl Renderer {
         let p_s = crate::probe::Span::start();
         let submitted = queue.submit([encoder.finish()]);
         #[cfg(feature = "dev-tools")]
+        let p_submitted = crate::probe::on().then(Instant::now);
+        #[cfg(feature = "dev-tools")]
         let p_submit = p_s.elapsed();
         let cpu = start.elapsed() - acquired;
         // The probe's own work in the frame is not its CPU time.
@@ -6576,9 +6600,13 @@ impl Renderer {
         let cpu = cpu.saturating_sub(crate::probe::own_time().saturating_sub(p_own));
         // After the frame's time is taken: the probe's readings (the
         // allocator's report and the completion callback allocate inside
-        // wgpu) are not counted in it.
+        // wgpu) are not counted in it. A frame that encoded no sprite draw
+        // (no run, or every run clipped away) leaves the array's first use
+        // awaited.
         #[cfg(feature = "dev-tools")]
-        self.probe_after_submit(p_first, p_submit, cpu + acquired);
+        if let Some(submitted) = p_submitted {
+            self.probe_after_submit(p_first.filter(|_| p_drew), p_submit, cpu, submitted);
+        }
         let mut out = timing(cpu, FrameOutcome::Shown);
         match frame {
             Some(t) => {

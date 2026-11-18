@@ -9995,9 +9995,6 @@ impl Run {
                 }
             } else {
                 let mut committed = None;
-                // Whether the view committed is a staging's (dev-tools).
-                #[cfg(feature = "dev-tools")]
-                let mut p_staged = false;
                 if let Some(v) = side.prepared.take() {
                     let lifetime = side.lifetime;
                     let commit =
@@ -10016,10 +10013,6 @@ impl Run {
                             if v.token.is_some() {
                                 side.drain = true;
                                 side.reconcile = true;
-                            }
-                            #[cfg(feature = "dev-tools")]
-                            {
-                                p_staged = v.token.is_some();
                             }
                             committed = Some(v.held);
                         }
@@ -10048,10 +10041,11 @@ impl Run {
                         // runtime.
                         h.script.transfer_from(&mut old.script);
                     }
-                    // The result's first view committed with its staging:
-                    // its first frames are probed (`rf:*`, dev-tools).
+                    // The result's first view committed, a skin's staging or
+                    // the built-in view: its first frames are probed
+                    // (`rf:*`, dev-tools).
                     #[cfg(feature = "dev-tools")]
-                    if p_staged && side.presented.is_none() && crate::dev::loop_probe::on() {
+                    if side.presented.is_none() && crate::dev::loop_probe::on() {
                         crate::dev::loop_probe::RESULT_FRAMES
                             .store(3, std::sync::atomic::Ordering::Relaxed);
                     }

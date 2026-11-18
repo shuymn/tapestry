@@ -270,8 +270,6 @@ pub(crate) fn prepare(
     });
     #[cfg(feature = "dev-tools")]
     let p_scoped = p_began.elapsed();
-    #[cfg(feature = "dev-tools")]
-    let p_wait = crate::probe::Span::start();
     report.upload_bytes = bytes;
     report.submission = submission.clone();
     // A device lost while its writes are queued is not detected here: on
@@ -280,6 +278,8 @@ pub(crate) fn prepare(
     // callback is registered (`Gpu::lost`), but this path does not read
     // it after its wait, a gap left open here. Only a failing wait is
     // treated as the device's failure below.
+    #[cfg(feature = "dev-tools")]
+    let p_wait = crate::probe::Span::start();
     let waited = if submission.is_some() {
         // A unit test, or a development build, may make the wait fail in
         // place of waiting.
@@ -301,6 +301,13 @@ pub(crate) fn prepare(
         w
     } else {
         Ok(())
+    };
+    // The wait's end, before any mark: none when every line was cached.
+    #[cfg(feature = "dev-tools")]
+    let p_waited = if submission.is_some() {
+        p_wait.elapsed()
+    } else {
+        std::time::Duration::ZERO
     };
     #[cfg(feature = "dev-tools")]
     if crate::probe::caller() != crate::probe::OTHER {
@@ -327,7 +334,7 @@ pub(crate) fn prepare(
             crate::probe::POP_US.load(std::sync::atomic::Ordering::Relaxed)
         );
         cmark!("tx", "to_scoped_us", us(p_scoped));
-        cmark!("tx", "gpu_wait_us", us(p_wait.elapsed()));
+        cmark!("tx", "gpu_wait_us", us(p_waited));
         cmark!(
             "tx",
             "max_rect_w",

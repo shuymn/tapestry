@@ -655,6 +655,78 @@ fn the_probe_marks_the_first_use_through_a_layout_on_the_same_array() {
     link.exit();
 }
 
+/// With the transition probe on, a frame that draws no sprite does not
+/// use the array it would sample: a selection skin whose song list and
+/// image wait for the image callback's thirteenth call draws frames with
+/// no quad first, and
+/// its first use (`fu:*`) is the first frame that draws the image, after
+/// every one of them was presented.
+#[test]
+fn the_probe_marks_the_first_use_at_the_first_frame_that_draws() {
+    use crate::dev::loop_probe::tests::{marks, turn_on};
+    let _warp = crate::warp_turn::take();
+    let _serial = crate::imports::tests::serial();
+    turn_on();
+    let dir = crate::selection_skin::lua_fixture();
+    let lua = std::fs::read_to_string(dir.path().join("s.luaskin")).unwrap();
+    let at = lua.find("skin.destination = {").unwrap();
+    std::fs::write(
+        dir.path().join("late.luaskin"),
+        format!(
+            "{}local calls = 0\n\
+             skin.destination = {{\n\
+               {{ id = \"list\", draw = function() return calls > 12 end, \
+                 dst = {{ {{ x = 0, y = 0, w = 0, h = 0 }} }} }},\n\
+               {{ id = \"b\", draw = function() calls = calls + 1; return calls > 12 end, \
+                 dst = {{ {{ x = 100, y = 100, w = 8, h = 8 }} }} }} }}\n\
+             return skin\n",
+            &lua[..at]
+        ),
+    )
+    .unwrap();
+    let limits = crate::render_common::offscreen(1_920, 1_080).atlas_limits();
+    let (skin, script) =
+        crate::selection_skin::fixture_scripted(limits, dir.path(), "late.luaskin");
+    let frames = Frames::default();
+    let (link, _, _) = lossy_spawn(None, &Arc::default(), Box::new(frames.clone()));
+    assert_eq!(
+        link.select_with(ScreenKind::Selection, Some(skin), script.untimed())
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    let count = |tag: &str| marks().iter().filter(|m| m.1 == tag).count();
+    assert_eq!(count("fu:submit_us"), 0, "drawn before the selection");
+    let before = marks().last().map_or(0, |m| m.0);
+    link.enter_selection(1);
+    link.show_selection(update(1, 1, "", CursorChart::Pending));
+    frames.until(|s| !s.quads.is_empty());
+    assert!(
+        wait_until(|| count("fu:submit_us") == 1),
+        "no first use of the array: {:?}",
+        marks()
+    );
+    let empty = frames
+        .seen
+        .lock()
+        .unwrap()
+        .iter()
+        .take_while(|s| s.quads.is_empty())
+        .count();
+    assert!(empty > 0, "no frame without a quad");
+    let all = marks();
+    let fu = all.iter().find(|m| m.1 == "fu:submit_us").unwrap().0;
+    let presented = all
+        .iter()
+        .filter(|m| m.1 == "present" && m.0 > before && m.0 < fu)
+        .count();
+    assert!(
+        presented >= empty,
+        "the first use before the frames without a quad: {presented} presented, {empty} empty"
+    );
+    link.exit();
+}
+
 /// With the transition probe on, an array dropped before any frame drew
 /// it ends its wait, whatever drops it: a selection skin replaced by the
 /// built-in selection before any frame is marked `fu:discarded`, with the

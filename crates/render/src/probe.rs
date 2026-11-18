@@ -5,6 +5,10 @@
 //! read. Nothing here waits for or reorders work, and a mark allocates
 //! nothing (the sink's buffer is reserved before it is registered).
 //!
+//! These marks are diagnostic: each names its event, and its interval is
+//! what is measured, as the player's probe documents for each family
+//! (`dev::loop_probe`).
+//!
 //! A duration is a [`Span`]: the probe's own work on its thread inside it
 //! (marks, memory readings, keys, callbacks armed: [`own`]) is left out, so
 //! a figure is what the work it names took, nested spans included.
@@ -92,9 +96,14 @@ pub fn own<R>(f: impl FnOnce() -> R) -> R {
     r
 }
 
-/// The probe's own time on this thread so far.
+/// The probe's own time on this thread so far; zero, read from no
+/// thread-local, with the probe off.
 pub fn own_time() -> Duration {
-    OWN.with(Cell::get)
+    if on() {
+        OWN.with(Cell::get)
+    } else {
+        Duration::ZERO
+    }
 }
 
 /// A probe figure's start: a time on this thread and the probe's own time

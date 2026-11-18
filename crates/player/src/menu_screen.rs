@@ -905,8 +905,9 @@ impl Screen for MenuScreen {
         };
         #[cfg(feature = "dev-tools")]
         {
+            let took = crate::dev::loop_probe::us(p_t.elapsed());
             crate::dev::loop_probe::mark("att:staged", i64::from(skin.is_some()));
-            crate::dev::loop_probe::mark("att:stage_us", crate::dev::loop_probe::us(p_t.elapsed()));
+            crate::dev::loop_probe::mark("att:stage_us", took);
             drop(p_caller);
         }
         Some(match done {
