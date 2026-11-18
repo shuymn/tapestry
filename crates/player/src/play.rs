@@ -434,10 +434,11 @@ pub struct PlayerRig<'a> {
     /// preparation leaves its lifetime. Until then a screen built again
     /// keeps it, an outro playing included.
     pub result_leaving: bool,
-    /// The result's `clear` or `fail` was asked for at its first show,
-    /// and Result has not been left since: a later show (a view switch, a
-    /// screen built again) starts none, and leaving stops them.
-    pub result_sounding: bool,
+    /// The Result entry handed over and not left since: set at the
+    /// result's first show, it arms the stop of its sounds on leaving; a
+    /// later show (a view switch, a screen built again) numbers no other
+    /// entry (design.md "State Model", system sounds, Result).
+    pub(crate) result_entry: Option<ResultEntry>,
     /// The views the result has changed to so far, each printed once
     /// (dev-tools: a scripted view command is over once its view shows).
     #[cfg(feature = "dev-tools")]
@@ -1207,16 +1208,38 @@ impl PlayerRig<'_> {
         self.end_result();
     }
 
-    /// Result is left: its `clear`, `fail` and `resultclose` stop, once a
-    /// result sound was asked for (design.md "State Model", system sounds,
-    /// Result).
+    /// Result is left: its `clear`, `fail` and `resultclose` stop, once
+    /// the result was handed over, whether or not its sound started
+    /// (design.md "State Model", system sounds, Result).
     fn end_result_sounds(&mut self) {
-        if !std::mem::take(&mut self.result_sounding) {
+        if self.result_entry.take().is_none() {
             return;
         }
         if let Some(sounds) = self.system_sounds.as_mut() {
             // Source: SF-015
             sounds.result_left(&mut self.audio.control);
+        }
+    }
+
+    /// The result's `clear` or `fail`, by the play's own view's lamp, at
+    /// the first look that reads its entry's first result picture
+    /// acknowledged, once per entry; never once the entry's fade-out began,
+    /// so it does not sound over `resultclose` (design.md "State Model",
+    /// system sounds, Result).
+    fn start_result_sound(&mut self) {
+        let Some(entry) = self.result_entry.as_mut().filter(|e| e.due) else {
+            return;
+        };
+        if self.render.result_acknowledged() != entry.number {
+            return;
+        }
+        entry.due = false;
+        if self.result_outro.is_some() {
+            return;
+        }
+        if let Some(sounds) = self.system_sounds.as_mut() {
+            // Source: SF-015
+            sounds.result_shown(&mut self.audio.control, entry.cleared);
         }
     }
 
@@ -2027,6 +2050,9 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn idle_wait(&mut self, deadline: TimeUs) {
+        // Read before the wait, as the render thread acknowledges before it
+        // wakes this thread: a wake another wait took is not missed.
+        self.start_result_sound();
         let left = deadline.0 - self.clock.now().0;
         if left > 0 {
             #[cfg(test)]
@@ -2053,6 +2079,7 @@ impl Rig for PlayerRig<'_> {
         if self.controls.quitting() && self.result_skin.has_job() {
             self.result_skin.settle(|| true);
         }
+        self.start_result_sound();
         self.serve_adjustments();
         self.sync();
         // The result's own path, after the adjustments: an offset changed
@@ -3234,19 +3261,23 @@ impl Rig for PlayerRig<'_> {
             #[cfg(feature = "dev-tools")]
             id: self.scenario.as_ref().and_then(|s| s.result_id),
         });
+        // The result is handed over: at its first show its entry is
+        // numbered before anything of it is sent, its sound due by the
+        // play's own view's lamp whichever view shows (with no lamp of its
+        // own the play did not clear), started once the entry's first
+        // picture is acknowledged (design.md "State Model", system sounds,
+        // Result).
+        if self.result_entry.is_none() {
+            self.result_entry = Some(ResultEntry {
+                number: self.render.enter_result_entry(self.controls.game_thread()),
+                cleared: screen.own_cleared() == Some(true),
+                due: true,
+            });
+        }
         // The skin's presentation goes first, so the built-in page does not
         // draw before it.
         self.present_view(report, screen);
         self.send_end(tuning.get());
-        // The result's sound, at its first show only, by the play's own
-        // view's lamp whichever view shows; with no lamp of its own the play
-        // did not clear (design.md "State Model", system sounds, Result).
-        if !std::mem::replace(&mut self.result_sounding, true)
-            && let Some(sounds) = self.system_sounds.as_mut()
-        {
-            // Source: SF-015
-            sounds.result_shown(&mut self.audio.control, screen.own_cleared() == Some(true));
-        }
         // Its requests made: the rebuild it follows is over.
         #[cfg(test)]
         self.rebuilds.shown.store(
@@ -3269,6 +3300,21 @@ impl Rig for PlayerRig<'_> {
             self.end_shown = Some(std::time::Instant::now());
         }
     }
+}
+
+/// A Result entry handed over (design.md "State Model", system sounds,
+/// Result).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResultEntry {
+    /// Its number, which the render thread acknowledges at the entry's
+    /// first result picture.
+    pub number: u64,
+    /// Whether the play's own view cleared: `clear` plays, else `fail`.
+    pub cleared: bool,
+    /// Whether its sound is still to start: until the first look that
+    /// reads the acknowledgement, which starts it or, once the entry's
+    /// fade-out began, forgoes it.
+    pub due: bool,
 }
 
 /// The retries a result's flow took (`take_menu`), by receipt, since the

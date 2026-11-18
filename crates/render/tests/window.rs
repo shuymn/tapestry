@@ -103,7 +103,10 @@ fn window_target_presents_and_reads_back_nothing() {
     for frame in 0..10 {
         assert!(r.wait_for_frame(1_000), "frame {frame} waited too long");
         let now = TimeUs(500 * MS + frame * 16_667);
-        if r.frame(&input(&v, now, TimeUs(0), &[])).unwrap().presented {
+        if r.frame(&input(&v, now, TimeUs(0), &[]))
+            .unwrap()
+            .presented()
+        {
             presented += 1;
         }
     }

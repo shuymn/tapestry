@@ -189,7 +189,7 @@ fn draw(r: &mut Renderer, sprites: Vec<Sprite>) -> Vec<u8> {
     r.set_skin(Box::new(Fixed(sprites))).unwrap();
     let v = view(0, 0);
     let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
-    assert!(timing.presented);
+    assert!(timing.presented());
     r.read_back()
 }
 

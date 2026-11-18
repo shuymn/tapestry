@@ -2678,7 +2678,7 @@ impl FrameDump {
 
 impl FrameSink for FrameDump {
     fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>) {
-        if !drawn.timing.presented {
+        if !drawn.timing.presented() {
             return;
         }
         let names = self.names(drawn);
