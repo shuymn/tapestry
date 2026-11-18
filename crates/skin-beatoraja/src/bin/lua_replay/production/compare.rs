@@ -74,6 +74,23 @@ fn luaj_long(r: Raw) -> i64 {
     }
 }
 
+/// LuaJ's `tofloat()` of a slider's value (`SkinLuaAccessor.java:665-677`):
+/// the number narrowed to `float`; nil and booleans 0. Restated here, not
+/// called, so the comparator checks production's conversion against the
+/// rule.
+fn luaj_float(r: Raw) -> f32 {
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "LuaJ's double, then Java's d2f"
+    )]
+    match r {
+        Raw::Int(n) => (n as f64) as f32,
+        Raw::Float(f) => f as f32,
+        _ => 0.0,
+    }
+}
+
 /// Whether two numbers are the same real number (NaN with NaN; −0.0 and
 /// 0.0 are equal as IEEE compares them).
 fn same_number(a: Raw, b: Raw) -> bool {
@@ -119,6 +136,10 @@ fn converted(field: &str, o: Outcome) -> Option<Converted> {
         ("timer", Outcome::Value(r)) => Converted::Long(Some(luaj_long(r))),
         ("timer", Outcome::Error) => Converted::Long(Some(i64::MIN)),
         ("timer", Outcome::Unavailable) => Converted::Long(None),
+        // A slider's value: its `tofloat()`, a caught error `0f`.
+        ("slider", Outcome::Value(r)) => Converted::Float(luaj_float(r).to_bits(), true),
+        ("slider", Outcome::Error) => Converted::Float(0.0_f32.to_bits(), true),
+        ("slider", Outcome::Unavailable) => Converted::Float(0, false),
         ("value", Outcome::Value(r)) => {
             let n = toint(r);
             Converted::Int(n, n != i32::MIN && n != i32::MAX)
@@ -766,6 +787,7 @@ fn expected_out(field: &str, o: Outcome) -> (i32, i32) {
     match converted(field, o) {
         Some(Converted::Bool(b)) => (i32::from(b), i32::from(o != Outcome::Unavailable)),
         Some(Converted::Int(n, ok)) => (n, i32::from(ok)),
+        Some(Converted::Float(bits, ok)) => (bits.cast_signed(), i32::from(ok)),
         _ => (0, 0),
     }
 }
@@ -775,7 +797,7 @@ fn expected_out(field: &str, o: Outcome) -> (i32, i32) {
 /// an `op` true.
 fn allows(field: &str, o: Outcome) -> bool {
     match converted(field, o) {
-        Some(Converted::Int(_, ok)) => ok,
+        Some(Converted::Int(_, ok) | Converted::Float(_, ok)) => ok,
         Some(Converted::Bool(b)) => b && o != Outcome::Unavailable,
         _ => false,
     }
@@ -1227,6 +1249,12 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 };
                 seen.insert(k);
                 rep.matched += 1;
+                // A slider's value is converted as a float.
+                let field = if obs.sliders.contains(&key) {
+                    "slider"
+                } else {
+                    key.field
+                };
                 if let Point::NotReached { why, .. } = occ.first {
                     let was_blocked = blocked;
                     if key.field != "timer" {
@@ -1260,8 +1288,8 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 if let Some(outcome) = call {
                     order.push(k);
                     if key.field != "timer" {
-                        blocked = !allows(key.field, outcome);
-                        outs.insert(k, expected_out(key.field, outcome));
+                        blocked = !allows(field, outcome);
+                        outs.insert(k, expected_out(field, outcome));
                     }
                     match (outcome, p.first.get(&k)) {
                         (Outcome::Unanswered(api), _) => {
@@ -1282,10 +1310,10 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                         }
                         (_, Some(First::Ran(prod))) => {
                             used.insert(k);
-                            if toint_differs(key.field, outcome) {
+                            if toint_differs(field, outcome) {
                                 *rep.intended.entry(TOINT_PAST_I32).or_default() += 1;
                             }
-                            match differ(key.field, *prod, outcome) {
+                            match differ(field, *prod, outcome) {
                                 None => rep.agreed += 1,
                                 Some(d) => {
                                     let hint = luaj_hint(obs, key.callable);
