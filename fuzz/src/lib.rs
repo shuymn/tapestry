@@ -3970,3 +3970,123 @@ pub fn present(data: &[u8]) -> Option<usize> {
     }
     Some(n)
 }
+
+/// What [`ring_bytes`] read from a frame ring.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RingOutcome {
+    /// No frame was due.
+    Nothing,
+    /// The last frame a poll staged.
+    Staged(skin_model::media::Frame),
+    /// What failed the player.
+    Fault(skin_model::media::Fault),
+}
+
+/// The frame sizes [`ring_bytes`] picks from by its input's first byte.
+pub const RING_SIZES: [[u32; 2]; 4] = [[1, 1], [2, 2], [3, 5], [16, 9]];
+
+/// The window of the run [`ring_bytes`] reads.
+pub const RING_WINDOW: skin_model::media::Window = skin_model::media::Window {
+    first: 0,
+    last: 1 << 20,
+};
+
+/// A frame ring's memory whose requests are logged.
+struct LoggedRing<'a> {
+    ring: &'a [std::sync::atomic::AtomicU64],
+    log: std::cell::RefCell<Vec<(usize, usize)>>,
+}
+
+impl skin_model::media::Words for LoggedRing<'_> {
+    fn words(&self, start: usize, len: usize) -> Option<&[std::sync::atomic::AtomicU64]> {
+        self.log.borrow_mut().push((start, len));
+        self.ring.words(start, len)
+    }
+}
+
+/// Target `ring_bytes`: a video's frame ring as an arbitrary worker left
+/// it. The first byte picks a frame size ([`RING_SIZES`]), the next eight
+/// the due stamp, little-endian, and the rest are the ring's words after
+/// the game set it up ([`skin_model::media::Reader::new`]), little-endian
+/// from its first word, the words past the input left as set up. A worker
+/// attaches to it, and the game polls it twice, at the due stamp and a
+/// second later.
+///
+/// # Panics
+///
+/// If a worker accepts a header whose ring is larger than the section; if a
+/// poll asks for a word outside the slots, or a run of words other than one
+/// slot's frame; if a staged frame is not due, lies outside the window, or
+/// does not follow the frame staged before it; or if a fault is not kept:
+/// the next poll must return it without reading the ring and show nothing.
+#[must_use]
+pub fn ring_bytes(data: &[u8]) -> RingOutcome {
+    use skin_model::media::{Geometry, HEADER_WORDS, Poll, Reader, SLOTS, Writer};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let (size, rest) = data.split_first().unwrap_or((&0, &[]));
+    let (due, words) = rest.split_at_checked(8).unwrap_or((&[0; 8], rest));
+    let due = i64::from_le_bytes(due.try_into().expect("eight bytes"));
+    let [w, h] = RING_SIZES[usize::from(*size) % RING_SIZES.len()];
+    let g = Geometry::new(w, h).expect("a ring's size");
+    let mem: Vec<AtomicU64> = (0..g.words()).map(|_| AtomicU64::new(0)).collect();
+    let mut reader = Reader::new(&*mem, g, RING_WINDOW).expect("a ring");
+    for (word, bytes) in mem.iter().zip(words.chunks(8)) {
+        let mut le = [0; 8];
+        le[..bytes.len()].copy_from_slice(bytes);
+        word.store(u64::from_le_bytes(le), Ordering::Relaxed);
+    }
+    if let Ok(writer) = Writer::attach(&*mem) {
+        assert!(
+            writer.geometry().words() <= mem.len(),
+            "a ring past its section"
+        );
+    }
+    let logged = LoggedRing {
+        ring: &mem,
+        log: std::cell::RefCell::new(Vec::new()),
+    };
+    let mut outcome = RingOutcome::Nothing;
+    for due in [due, due.saturating_add(1_000_000)] {
+        let polled = reader.poll(&logged, due);
+        for (start, len) in logged.log.take() {
+            assert!(
+                start >= HEADER_WORDS && start + len <= g.words(),
+                "a request outside the slots: {start}+{len}"
+            );
+            assert!(
+                len == 1 || (0..SLOTS).any(|k| (start, len) == (g.frame_start(k), g.frame_words())),
+                "a run of words other than a slot's frame: {start}+{len}"
+            );
+        }
+        match polled {
+            Ok(Poll {
+                staged: Some(f), ..
+            }) => {
+                assert!(f.stamp <= due, "a frame not due: {f:?} at {due}");
+                assert!(
+                    RING_WINDOW.first <= f.stamp && f.stamp <= RING_WINDOW.last,
+                    "a frame outside the window: {f:?}"
+                );
+                if let RingOutcome::Staged(before) = outcome {
+                    assert!(
+                        f.seq > before.seq && f.stamp > before.stamp,
+                        "{f:?} after {before:?}"
+                    );
+                }
+                assert_eq!(
+                    reader.staged().map(|(s, w)| (s, w.len())),
+                    Some((f, g.frame_words()))
+                );
+                outcome = RingOutcome::Staged(f);
+            }
+            Ok(_) => {}
+            Err(fault) => {
+                assert_eq!(reader.poll(&logged, due), Err(fault), "a kept fault");
+                assert_eq!(logged.log.take(), [], "a failed player reads nothing more");
+                assert!(reader.staged().is_none(), "a failed player shows nothing");
+                return RingOutcome::Fault(fault);
+            }
+        }
+    }
+    outcome
+}

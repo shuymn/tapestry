@@ -33,6 +33,93 @@ pub fn all() -> Vec<(&'static str, Vec<Seed>)> {
         ("skin_png", skin_pngs()),
         ("present", presents()),
         ("bga_images", bga_images()),
+        ("ring_bytes", rings()),
+    ]
+}
+
+/// A slot header's words, as the frame ring orders them.
+const RING_STATE: usize = 0;
+const RING_SEQ: usize = 1;
+const RING_RUN: usize = 2;
+const RING_STAMP: usize = 3;
+const RING_INDEX: usize = 4;
+const RING_BYTES: usize = 5;
+
+/// A frame ring of `size` ([`crate::RING_SIZES`]) as the game sets it up,
+/// with `frames` published, each (sequence, run, stamp), then each of
+/// `words` (slot, slot header word, value) written over it: the input
+/// [`crate::ring_bytes`] reads at `due`.
+fn ring_seed(
+    size: u8,
+    due: i64,
+    frames: &[(u64, u64, i64)],
+    words: &[(usize, usize, u64)],
+) -> Vec<u8> {
+    use skin_model::media::{Geometry, Reader, SLOT_HEADER_WORDS, Writer};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let [w, h] = crate::RING_SIZES[usize::from(size)];
+    let g = Geometry::new(w, h).expect("a ring's size");
+    let mem: Vec<AtomicU64> = (0..g.words()).map(|_| AtomicU64::new(0)).collect();
+    Reader::new(&*mem, g, crate::RING_WINDOW).expect("a ring");
+    let writer = Writer::attach(&*mem).expect("the game's ring");
+    for &(seq, run, stamp) in frames {
+        let frame: Vec<u8> = (0..g.frame_bytes())
+            .map(|i| (seq as usize * 31 + i) as u8)
+            .collect();
+        let slot = writer.claim(&*mem).expect("a free slot");
+        writer
+            .publish(&*mem, slot, &frame, seq, run, stamp)
+            .expect("a frame of the ring's size");
+    }
+    for &(slot, i, v) in words {
+        mem[g.frame_start(slot) - SLOT_HEADER_WORDS + i].store(v, Ordering::Relaxed);
+    }
+    let mut out = vec![size];
+    out.extend(due.to_le_bytes());
+    for w in &mem {
+        out.extend(w.load(Ordering::Relaxed).to_le_bytes());
+    }
+    out
+}
+
+/// `ring_bytes` seeds ([`crate::ring_bytes`]): rings of each size whose
+/// frames are due, not due yet, filling every slot, or of an earlier run;
+/// and one for each check a slot can fail.
+#[must_use]
+pub fn rings() -> Vec<Seed> {
+    let two = [(1, 1, 1_000), (2, 1, 1_000_000)];
+    vec![
+        ("empty", ring_seed(0, 0, &[], &[])),
+        ("due", ring_seed(1, 1_000, &two, &[])),
+        ("not_due", ring_seed(2, 999, &[(1, 1, 1_000)], &[])),
+        (
+            "full",
+            ring_seed(
+                3,
+                30_000,
+                &[
+                    (1, 1, 10_000),
+                    (2, 1, 20_000),
+                    (3, 1, 30_000),
+                    (4, 1, 40_000),
+                ],
+                &[],
+            ),
+        ),
+        ("earlier_run", ring_seed(3, 5_000, &[(1, 0, 1_000)], &[])),
+        ("state", ring_seed(3, 1_000, &two, &[(2, RING_STATE, 3)])),
+        ("index", ring_seed(3, 1_000, &two, &[(1, RING_INDEX, 0)])),
+        ("size", ring_seed(3, 1_000, &two, &[(0, RING_BYTES, 8)])),
+        ("run", ring_seed(3, 1_000, &two, &[(1, RING_RUN, 2)])),
+        ("shared_seq", ring_seed(3, 1_000, &two, &[(1, RING_SEQ, 1)])),
+        (
+            "stamp_order",
+            ring_seed(3, 1_000, &two, &[(1, RING_STAMP, 1_000)]),
+        ),
+        (
+            "stamp_outside",
+            ring_seed(3, 1_000, &two, &[(1, RING_STAMP, 1 << 21)]),
+        ),
     ]
 }
 
