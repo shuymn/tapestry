@@ -20,6 +20,7 @@ use crate::inputs::{FrameInputs, Host};
 use crate::observed::{
     Cause, Key, Listed, Observed, Outcome, Point, Raw, RefFrame, TimerOut, intern,
 };
+use crate::production::compare::numeral;
 
 /// How an image or a number chooses what it shows.
 enum Sel {
@@ -1029,15 +1030,23 @@ pub(crate) fn reaches(t: &Timing, mut time: i64) -> bool {
 /// before it (0 for the first), and the keyframes sort by time
 /// (`SkinObject.java:240-247`). The timer by its serializer
 /// (`LuaSkinLoader.java:155-167`): a function is [`Obj::timer`], a number
-/// or a numeric string an id, another string a script, anything else
-/// (a boolean, a table) no timer.
+/// an id, a string read as a number an id (as a plain numeral, so `"0x29"`
+/// is timer 41; design.md "beatoraja Lua Skins", numeric strings), another
+/// string a script, anything else (a boolean, a table) no timer.
 pub(crate) fn timing(dest: &Table) -> Timing {
+    let id = |n: i32| {
+        if n >= 0 {
+            TimerRef::Id(n)
+        } else {
+            TimerRef::None
+        }
+    };
     let timer = match raw(dest, "timer") {
-        v if lua_number(&v).is_some() => match toint(&v) {
-            Some(n) if n >= 0 => TimerRef::Id(n),
-            _ => TimerRef::None,
+        v @ Value::String(_) => match string(&v).as_deref().and_then(numeral) {
+            Some(d) => id(d2i(d)),
+            None => TimerRef::Undecided,
         },
-        Value::String(_) => TimerRef::Undecided,
+        v if lua_number(&v).is_some() => toint(&v).map_or(TimerRef::None, id),
         _ => TimerRef::None,
     };
     let mut prev = 0;
@@ -1064,12 +1073,16 @@ pub(crate) fn timing(dest: &Table) -> Timing {
 /// depth: any other (a source timer, an event, one in a nested table)
 /// may run where the model does not, so such a slider is listed.
 pub(crate) fn only_value(s: &Table) -> bool {
-    /// Whether `t` holds a function, other than `value` at the top, to a
-    /// few levels, each table once on the way down.
+    /// Whether `t` holds a function, other than `value` at the top, each
+    /// table once on the way down; a table past a few levels counts as one,
+    /// since the scan cannot tell.
     fn other(t: &Table, top: bool, stack: &mut Vec<usize>) -> bool {
         let at = t.to_pointer().addr();
-        if stack.len() > 6 || stack.contains(&at) {
+        if stack.contains(&at) {
             return false;
+        }
+        if stack.len() > 6 {
+            return true;
         }
         stack.push(at);
         let mut found = false;

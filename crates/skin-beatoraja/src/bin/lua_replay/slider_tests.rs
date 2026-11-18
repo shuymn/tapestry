@@ -221,3 +221,57 @@ fn only_a_lone_value_function_is_modelled() {
         "return { id = \"s\", value = function() end, extra = { value = function() end } }"
     )));
 }
+
+/// A NaN agrees with any NaN: a slider dividing zero by zero, where the
+/// reference VM's native division may give another NaN than the
+/// program's, agrees on every play frame in its converted value and its
+/// output cells.
+#[test]
+fn a_nan_value_agrees_whatever_its_bits() {
+    let r = run(&[slider(
+        "s",
+        "function() return (ms.number(100) - ms.number(100)) / (ms.number(100) - ms.number(100)) end",
+        "",
+    )]);
+    agrees(&r, 1);
+    assert_eq!(r.matched, r.production_runs, "{}", r.text(0, true, true));
+}
+
+/// A slider whose definition nests deeper than the scan reads is listed:
+/// the scan cannot tell whether a function lies past it.
+#[test]
+fn a_definition_past_the_scan_is_listed() {
+    let lua = mlua::Lua::new();
+    let def: mlua::Table = lua
+        .load(
+            "return { id = \"s\", value = function() end, a = { { { { { { { { 1 } } } } } } } } }",
+        )
+        .eval()
+        .unwrap();
+    assert!(!only_value(&def));
+    let def: mlua::Table = lua
+        .load("return { id = \"s\", value = function() end, a = { { 1 } } }")
+        .eval()
+        .unwrap();
+    assert!(only_value(&def));
+}
+
+/// A timer string read as a number is that timer, `"0x29"` timer 41; a
+/// negative one is no timer, and any other string a script.
+#[test]
+fn a_numeric_timer_string_is_an_id() {
+    let lua = mlua::Lua::new();
+    let timer = |t: &str| {
+        timing(
+            &lua.load(format!("return {{ timer = {t}, dst = {{ {{}} }} }}"))
+                .eval()
+                .unwrap(),
+        )
+        .timer
+    };
+    assert!(matches!(timer("\"0x29\""), TimerRef::Id(41)));
+    assert!(matches!(timer("\" 41 \""), TimerRef::Id(41)));
+    assert!(matches!(timer("\"-1\""), TimerRef::None));
+    assert!(matches!(timer("\"timer41\""), TimerRef::Undecided));
+    assert!(matches!(timer("false"), TimerRef::None));
+}

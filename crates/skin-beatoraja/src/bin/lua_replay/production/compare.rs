@@ -102,7 +102,7 @@ fn luaj_float(r: Raw) -> f32 {
 /// optional fraction, or a fraction alone, then an optional exponent) or
 /// `0x` and hexadecimal digits worth less than 2^64, rounded once; `None`
 /// for anything else.
-fn numeral(s: &str) -> Option<f64> {
+pub(crate) fn numeral(s: &str) -> Option<f64> {
     let t = s.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'));
     let (neg, t) = match t.strip_prefix('-') {
         Some(rest) => (true, rest),
@@ -230,9 +230,25 @@ fn differ(field: &str, prod: (Result<Val, Fail>, Converted), refo: Outcome) -> O
         return Some(format!("raw: production {v:?}, reference {r:?}"));
     }
     match converted(field, refo) {
-        Some(c) if c == conv => None,
+        Some(c) if same_converted(c, conv) => None,
         c => Some(format!("converted: production {conv:?}, reference {c:?}")),
     }
+}
+
+/// Whether two conversions agree: exactly, but a float's NaN agrees with
+/// any NaN, whatever its bits (the reference VM's native division may give
+/// another NaN than the program's canonical one); whether it gave a value
+/// is compared exactly.
+fn same_converted(a: Converted, b: Converted) -> bool {
+    match (a, b) {
+        (Converted::Float(x, xok), Converted::Float(y, yok)) => xok == yok && same_bits(x, y),
+        _ => a == b,
+    }
+}
+
+/// Whether two `float`s' bits are the same, any NaN with any NaN.
+fn same_bits(x: u32, y: u32) -> bool {
+    x == y || (f32::from_bits(x).is_nan() && f32::from_bits(y).is_nan())
 }
 
 /// What an intended difference from the source is counted under: a
@@ -1173,6 +1189,8 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
         let mut seen: BTreeSet<u16> = BTreeSet::new();
         let mut order: Vec<u16> = Vec::new();
         let mut outs: BTreeMap<u16, (i32, i32)> = BTreeMap::new();
+        // The callbacks whose output cell holds a float's bits.
+        let mut floats: BTreeSet<u16> = BTreeSet::new();
         // Each installed object's occurrences, once, in schedule order;
         // `blocked`: the last compiled consumer before did not allow what
         // follows.
@@ -1339,6 +1357,9 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                     if key.field != "timer" {
                         blocked = !allows(field, outcome);
                         outs.insert(k, expected_out(field, outcome));
+                        if field == "slider" {
+                            floats.insert(k);
+                        }
                     }
                     match (outcome, p.first.get(&k)) {
                         (Outcome::Unanswered(api), _) => {
@@ -1474,7 +1495,12 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 pf.outs.get(at).copied().unwrap_or(i32::MIN),
                 pf.outs.get(at + 1).copied().unwrap_or(i32::MIN),
             );
-            if got != (v, ok) {
+            let same = if floats.contains(&k) {
+                got.1 == ok && same_bits(got.0.cast_unsigned(), v.cast_unsigned())
+            } else {
+                got == (v, ok)
+            };
+            if !same {
                 find(
                     key_k(k),
                     i,
