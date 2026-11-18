@@ -72,10 +72,13 @@ fn worker_starts_confined_before_it_runs() {
     let worker = launch(&stage, recipe());
     let process = worker.process();
     // The launch checked these before the worker ran (else it fails);
-    // they hold, read here from the running worker.
+    // they hold, read here from the running worker. It is in the job the
+    // launch made, not only in one (the test runner's own holds it too).
+    let job = worker.job();
+    assert!(job.is_some(), "the launch made no job");
     let mut inside = windows::core::BOOL(0);
     // SAFETY: the worker's process and its job.
-    unsafe { IsProcessInJob(process, worker.job(), &raw mut inside) }.unwrap();
+    unsafe { IsProcessInJob(process, job, &raw mut inside) }.unwrap();
     assert!(inside.as_bool(), "the worker is in its job");
     // An AppContainer with no capability at low integrity (0x1000).
     assert_eq!(token_facts(process), (true, 0, 0x1000));
@@ -724,7 +727,7 @@ fn worker_denials_hold_with_their_codes() {
         "the recipe",
         &[
             ("file", false, Some(5)),
-            // A name it opens resolves in its AppContainer's own namespace.
+            // By the name this test gave it, and by its NT path.
             ("event", false, Some(5)),
             ("nt-event", false, Some(0xc000_0022)),
             ("process-query", false, Some(5)),
