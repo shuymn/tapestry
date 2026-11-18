@@ -1593,7 +1593,11 @@ fn a_late_acknowledgement_starts_nothing() {
                 }
                 Late::FadeOutAfter | Late::LeftAfter => {}
             }
-            screens.permits.store(1, Ordering::Release);
+            // The first frame goes; LeftFirst's went already, so it gives
+            // no permit and the next entry's frames stay held below.
+            if !matches!(late, Late::LeftFirst) {
+                screens.permits.store(1, Ordering::Release);
+            }
             wait("the acknowledgement", || {
                 rig.render.result_acknowledged() == entry
             });
@@ -1618,6 +1622,12 @@ fn a_late_acknowledgement_starts_nothing() {
             assert!(next > entry, "{late:?}");
             let now = rig.now();
             rig.idle_wait(now);
+            // Its frames are still held: nothing of it acknowledged yet.
+            assert_ne!(
+                rig.render.result_acknowledged(),
+                next,
+                "{late:?}: the next entry's frames held"
+            );
             assert_eq!(
                 result_counts(&probe).0,
                 [0, 0, 0],

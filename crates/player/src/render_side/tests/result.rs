@@ -3700,8 +3700,11 @@ fn an_end_page_acknowledges_only_an_entry_without_a_lifetime() {
 /// V5's render half (design.md "State Model", system sounds, Result): a
 /// frame acknowledges the entry it draws a picture of, not one entered
 /// while it draws, the skin's view and a built-in one alike, frames
-/// stepped one at a time; and it writes the acknowledgement once per
-/// entry, a later counted frame of the same entry writing nothing.
+/// stepped one at a time. As a retry does, the first entry's lifetime ends
+/// before the next entry's view comes, so the first entry's view never
+/// acknowledges the next entry; the next entry's own view, a different
+/// one, does. The acknowledgement is written once per entry, a later
+/// counted frame of the same entry writing nothing.
 #[test]
 fn a_frame_acknowledges_the_entry_it_draws() {
     let (_dir, skin) = fixed_skin();
@@ -3710,7 +3713,11 @@ fn a_frame_acknowledges_the_entry_it_draws() {
         let shared = Arc::clone(&rig.link.shared);
         let entered = Arc::new(AtomicU64::new(0));
         let next = Arc::clone(&entered);
+        // Inside the first frame's draw: the first entry's lifetime ends
+        // (the slot empties, as the retry's leaving does) and the next
+        // entry enters.
         *rig.faults.during_submit.lock().unwrap() = Some(Box::new(move || {
+            shared.result_slot().enter(0);
             next.store(shared.result_entries.enter(None), Ordering::Release);
         }));
         let lifetime = installed(&rig, &skin);
@@ -3718,8 +3725,9 @@ fn a_frame_acknowledges_the_entry_it_draws() {
         let entries = &rig.link.shared.result_entries;
         // Frames go one at a time: each step draws one.
         paced(&rig);
-        let view = payload(1, skinned.then_some(&skin), 1_111, &[]);
-        show(&rig.link, lifetime, 1, &view, &Overlay::default());
+        let skin_of = skinned.then_some(&skin);
+        let a = payload(1, skin_of, 1_111, &["first entry"]);
+        show(&rig.link, lifetime, 1, &a, &Overlay::default());
         let case = format!("skinned {skinned}");
         assert!(
             wait_until(|| rig.gate.held.load(Ordering::Acquire)),
@@ -3734,18 +3742,32 @@ fn a_frame_acknowledges_the_entry_it_draws() {
             first,
             "{case}: the entry drawn"
         );
-        // The next frame draws a picture of the next entry's number, and
-        // later ones write nothing more.
+        // The next entry's own lifetime and view: the frame held meanwhile
+        // draws it, not the first entry's ended one, and acknowledges the
+        // next entry.
+        let next_lifetime = rig.link.begin_result();
+        let b = payload(2, skin_of, 2_222, &["next entry"]);
+        show(&rig.link, next_lifetime, 1, &b, &Overlay::default());
         rig.gate.step();
+        let drawn = rig.drawn();
+        assert_eq!(drawn.len(), 2, "{case}: {drawn:?}");
+        assert_ne!(drawn[0], drawn[1], "{case}: the next entry's own view");
         assert_eq!(
             rig.link.result_acknowledged(),
             second,
-            "{case}: the next frame"
+            "{case}: the next entry's view"
         );
         for _ in 0..3 {
             rig.gate.step();
         }
-        assert_eq!(rig.drawn().len(), 5, "{case}: {:?}", rig.drawn());
+        let drawn = rig.drawn();
+        assert_eq!(drawn.len(), 5, "{case}: {drawn:?}");
+        // No frame after the first draws the first entry's view, so none of
+        // it acknowledged the next entry.
+        assert!(
+            drawn[1..].iter().all(|d| *d == drawn[1]),
+            "{case}: only the next entry's view after the first frame: {drawn:?}"
+        );
         assert_eq!(
             entries.publications.load(Ordering::Relaxed),
             2,
