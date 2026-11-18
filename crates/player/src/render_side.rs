@@ -2740,7 +2740,7 @@ impl RenderLink {
 
     /// Acknowledges a Result entry's first picture as the render thread
     /// does, from any thread (tests).
-    #[cfg(test)]
+    #[cfg(all(test, feature = "dev-tools"))]
     pub(crate) fn result_acknowledger(&self) -> impl Fn(u64) + Send + Sync + use<> {
         let shared = Arc::clone(&self.shared);
         move |entry| shared.result_entries.acknowledge(entry)
