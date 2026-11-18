@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use skin_model::media::{
     CHUNK_WORDS, Fault, Frame, Geometry, HEADER_WORDS, Poll, Reader, Refused, SLOT_HEADER_WORDS,
-    SLOTS, Window, Words, Writer,
+    SLOTS, WATERMARK_WORD, Window, Words, Writer,
 };
 
 /// Run 1's window: the first minute.
@@ -245,14 +245,20 @@ fn copy_chunks(g: Geometry, slot: usize) -> [(usize, usize); 2] {
     ]
 }
 
-/// Asserts every request in `log` lies inside `g`'s ring, below its
-/// header, and every run of more than one word inside slot `slot`'s frame.
+/// Whether a request is the watermark's word or lies inside `g`'s slots,
+/// the only words a reader asks for.
+fn in_ring(g: Geometry, (start, len): (usize, usize)) -> bool {
+    (start, len) == (WATERMARK_WORD, 1) || (start >= HEADER_WORDS && start + len <= g.words())
+}
+
+/// Asserts every request in `log` is the watermark or lies inside `g`'s
+/// slots, and every run of more than one word inside slot `slot`'s frame.
 #[track_caller]
 fn assert_bounded(log: &[(usize, usize)], g: Geometry, slot: usize) {
     let frame = g.frame_start(slot)..g.frame_start(slot) + g.frame_words();
     for &(start, len) in log {
         assert!(
-            start >= HEADER_WORDS && start + len <= g.words(),
+            in_ring(g, (start, len)),
             "a request outside the slots: {start}+{len}"
         );
         if len > 1 {
@@ -269,11 +275,18 @@ fn assert_bounded(log: &[(usize, usize)], g: Geometry, slot: usize) {
 fn ring_round_trip_writer_to_reader() {
     let g = Geometry::new(37, 21).unwrap();
     assert_eq!(g.frame_bytes(), 37 * 21 + 2 * 19 * 11);
+    let largest = Geometry::new(2048, 2048).unwrap();
     assert_eq!(
-        Geometry::new(2048, 2048).unwrap().frame_bytes(),
+        largest.frame_bytes(),
         6 << 20,
         "4 Mi pixels at even sides fill 6 MiB"
     );
+    assert_eq!(
+        largest.bytes(),
+        (24 << 20) + 8 * (HEADER_WORDS + SLOTS * SLOT_HEADER_WORDS),
+        "the section: four frames and the headers, about 24 MiB"
+    );
+    assert_eq!(largest.bytes(), 8 * largest.words());
     assert!(Geometry::new(8192, 512).is_some(), "4 Mi pixels");
     assert_eq!(Geometry::new(2049, 2048), None, "over 4 Mi pixels");
     assert_eq!(Geometry::new(8193, 1), None, "over the longest side");
@@ -380,7 +393,7 @@ fn taken_one(g: Geometry) -> (Vec<AtomicU64>, Reader) {
 fn ring_rejects_bad_index_sequence_stamp_state() {
     let g = Geometry::new(16, 9).unwrap();
     type Corrupt = fn(&[AtomicU64], Geometry);
-    let cases: [(&str, Corrupt, Fault); 10] = [
+    let cases: [(&str, Corrupt, Fault); 11] = [
         (
             "another slot's index",
             |r, g| slot_word(r, g, 1, INDEX).store(3, Ordering::Relaxed),
@@ -403,6 +416,11 @@ fn ring_rejects_bad_index_sequence_stamp_state() {
             "a run not started",
             |r, g| slot_word(r, g, 1, RUN).store(2, Ordering::Relaxed),
             Fault::Run { slot: 1, value: 2 },
+        ),
+        (
+            "run 0, which no ring starts",
+            |r, g| slot_word(r, g, 1, RUN).store(0, Ordering::Relaxed),
+            Fault::Run { slot: 1, value: 0 },
         ),
         (
             "a sequence already taken",
@@ -627,6 +645,86 @@ fn ring_cooperating_writer_never_tears() {
     assert_whole(&reader, last);
 }
 
+// Covers: T02
+#[test]
+fn ring_frames_published_during_a_scan_wait_for_the_next_poll() {
+    let g = Geometry::new(16, 9).unwrap();
+    // The reader stops as it turns to slot 1, slot 0 found free; meanwhile
+    // the worker publishes two frames, the first into slot 0, which the
+    // reader has passed, the second into slot 1, which it reads next.
+    let scan = |ring: &[AtomicU64], reader: &mut Reader, run: u64| {
+        let meeting = Meeting::default();
+        let watched =
+            Watched::stopping_at(ring, (g.frame_start(1) - SLOT_HEADER_WORDS, 1), &meeting);
+        thread::scope(|s| {
+            let read = s.spawn(|| {
+                let _done = Done(&meeting);
+                reader.poll(&watched, 5_000)
+            });
+            let release = meeting.meet();
+            assert_eq!(publish(ring, 1, run, 1_000), 0);
+            assert_eq!(publish(ring, 2, run, 2_000), 1);
+            drop(release);
+            read.join().unwrap()
+        })
+    };
+
+    // Both frames due in the current run: the second waits for the next
+    // poll, which takes it and frees the first with it, so the first is
+    // never left behind a taken frame, which would fail the player.
+    let mem = section(g);
+    let ring = &*mem;
+    let mut reader = Reader::new(ring, g, WINDOW).unwrap();
+    assert_eq!(
+        scan(ring, &mut reader, 1),
+        Ok(Poll::default()),
+        "a frame published during the scan waits"
+    );
+    assert_eq!(
+        reader.poll(ring, 5_000),
+        Ok(Poll {
+            staged: Some(Frame {
+                seq: 2,
+                stamp: 2_000
+            }),
+            freed: true
+        }),
+        "the next poll takes the newest and frees the one before it"
+    );
+    assert_whole(&reader, 2);
+    assert_eq!(reader.poll(ring, 5_000), Ok(Poll::default()));
+    let writer = Writer::attach(ring).unwrap();
+    let claimed: Vec<_> = (0..SLOTS).map_while(|_| writer.claim(ring)).collect();
+    assert_eq!(claimed.len(), SLOTS, "both frames' slots are free again");
+
+    // Frames of an earlier run, from a worker that has not seen the new
+    // one yet: the second is not freed during the scan either, so the
+    // next poll frees both unread, and the run's own frame then shows.
+    let mem = section(g);
+    let ring = &*mem;
+    let mut reader = Reader::new(ring, g, WINDOW).unwrap();
+    let run = reader.start_run(ring, WINDOW);
+    assert_eq!(
+        scan(ring, &mut reader, 1),
+        Ok(Poll::default()),
+        "an earlier run's frame published during the scan waits too"
+    );
+    assert_eq!(
+        reader.poll(ring, 5_000),
+        Ok(Poll {
+            staged: None,
+            freed: true
+        }),
+        "the next poll frees both unread"
+    );
+    publish(ring, 3, run, 3_000);
+    assert_eq!(
+        reader.poll(ring, 5_000).unwrap().staged.map(|f| f.seq),
+        Some(3)
+    );
+    assert_eq!(reader.fault(), None);
+}
+
 /// A small generator of words, the same for every run.
 struct Xorshift(u64);
 
@@ -686,6 +784,8 @@ fn ring_arbitrary_writer_stays_safe_and_bounded() {
         ("its state", STATE, 0),
         ("its run", RUN, 0),
         ("its stamp", STAMP, 999),
+        ("its index", INDEX, 3),
+        ("its frame size", BYTES, 8),
     ] {
         let mem = section(g);
         let ring = &*mem;
@@ -724,7 +824,14 @@ fn ring_arbitrary_writer_stays_safe_and_bounded() {
         for w in &mem[HEADER_WORDS..] {
             w.store(rng.next(), Ordering::Relaxed);
         }
-        // Each slot word near a valid frame's, and one in eight arbitrary.
+        // The watermark at or above every near-valid sequence, and each
+        // slot word near a valid frame's; one in eight of them arbitrary.
+        let watermark = if rng.next().is_multiple_of(8) {
+            rng.next()
+        } else {
+            8
+        };
+        mem[WATERMARK_WORD].store(watermark, Ordering::Relaxed);
         for slot in 0..SLOTS {
             let r = rng.next();
             let fields = [
@@ -749,7 +856,7 @@ fn ring_arbitrary_writer_stays_safe_and_bounded() {
         let polled = reader.poll(&watched, due);
         let log = watched.take_log();
         for &(start, len) in &log {
-            assert!(start >= HEADER_WORDS && start + len <= g.words());
+            assert!(in_ring(g, (start, len)));
             if len > 1 {
                 assert!((0..SLOTS).any(|k| {
                     let f = g.frame_start(k);

@@ -1657,7 +1657,7 @@ Which tests check part of each row's mitigation. `Tagged tests` is generated fro
 | ID | Tagged tests | Note |
 | --- | --- | --- |
 | T01 | `crates/bms-parser/tests/bga.rs`: `a_sidecar_event_past_the_playable_end_leaves_bga_absent`, `too_many_raw_objects_refuses_the_chart`; `crates/bms-parser/tests/load.rs`: `text_limits_name_the_line`, `time_past_the_duration_cap_by_less_than_a_microsecond_is_refused`, `tiny_bpm_exceeding_duration_cap_is_rejected`; `crates/bms-parser/tests/time.rs`: `a_stop_that_overflows_the_time_cap_is_refused`, `time_size_cap_is_reached_at_the_computed_measure` | |
-| T02 | `crates/skin-model/tests/media.rs`: `ring_arbitrary_writer_stays_safe_and_bounded`, `ring_cooperating_writer_never_tears`, `ring_reader_copies_only_parent_sized_bytes`, `ring_rejects_bad_index_sequence_stamp_state`, `ring_round_trip_writer_to_reader` | |
+| T02 | `crates/skin-model/tests/media.rs`: `ring_arbitrary_writer_stays_safe_and_bounded`, `ring_cooperating_writer_never_tears`, `ring_frames_published_during_a_scan_wait_for_the_next_poll`, `ring_reader_copies_only_parent_sized_bytes`, `ring_rejects_bad_index_sequence_stamp_state`, `ring_round_trip_writer_to_reader` | |
 | T03 | Unverified | |
 | T04 | Unverified | CI steps "cargo-deny", "cargo-machete" and "cargo-audit", and the daily "Audit" workflow's "cargo-deny" and "cargo-audit" |
 | T05 | Unverified | |

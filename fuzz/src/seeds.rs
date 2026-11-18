@@ -45,7 +45,8 @@ const RING_STAMP: usize = 3;
 const RING_INDEX: usize = 4;
 const RING_BYTES: usize = 5;
 
-/// A frame ring of `size` ([`crate::RING_SIZES`]) as the game sets it up,
+/// A frame ring of `size` ([`crate::RING_SIZES`], with
+/// [`crate::RING_SECOND_RUN`] in its run started) as the game sets it up,
 /// with `frames` published, each (sequence, run, stamp), then each of
 /// `words` (slot, slot header word, value) written over it: the input
 /// [`crate::ring_bytes`] reads at `due`.
@@ -57,10 +58,13 @@ fn ring_seed(
 ) -> Vec<u8> {
     use skin_model::media::{Geometry, Reader, SLOT_HEADER_WORDS, Writer};
     use std::sync::atomic::{AtomicU64, Ordering};
-    let [w, h] = crate::RING_SIZES[usize::from(size)];
+    let [w, h] = crate::RING_SIZES[usize::from(size % 4)];
     let g = Geometry::new(w, h).expect("a ring's size");
     let mem: Vec<AtomicU64> = (0..g.words()).map(|_| AtomicU64::new(0)).collect();
-    Reader::new(&*mem, g, crate::RING_WINDOW).expect("a ring");
+    let mut reader = Reader::new(&*mem, g, crate::RING_WINDOW).expect("a ring");
+    if size & crate::RING_SECOND_RUN != 0 {
+        reader.start_run(&*mem, crate::RING_WINDOW);
+    }
     let writer = Writer::attach(&*mem).expect("the game's ring");
     for &(seq, run, stamp) in frames {
         let frame: Vec<u8> = (0..g.frame_bytes())
@@ -83,8 +87,8 @@ fn ring_seed(
 }
 
 /// `ring_bytes` seeds ([`crate::ring_bytes`]): rings of each size whose
-/// frames are due, not due yet, filling every slot, or of an earlier run;
-/// and one for each check a slot can fail.
+/// frames are due, not due yet, filling every slot, of an earlier run, or
+/// above the watermark; and one for each check a slot can fail.
 #[must_use]
 pub fn rings() -> Vec<Seed> {
     let two = [(1, 1, 1_000), (2, 1, 1_000_000)];
@@ -106,7 +110,20 @@ pub fn rings() -> Vec<Seed> {
                 &[],
             ),
         ),
-        ("earlier_run", ring_seed(3, 5_000, &[(1, 0, 1_000)], &[])),
+        (
+            "earlier_run",
+            ring_seed(
+                3 | crate::RING_SECOND_RUN,
+                5_000,
+                &[(1, 1, 1_000), (2, 2, 2_000)],
+                &[],
+            ),
+        ),
+        (
+            "above_watermark",
+            ring_seed(3, 1_000, &two, &[(1, RING_SEQ, 3)]),
+        ),
+        ("run_zero", ring_seed(3, 1_000, &two, &[(1, RING_RUN, 0)])),
         ("state", ring_seed(3, 1_000, &two, &[(2, RING_STATE, 3)])),
         ("index", ring_seed(3, 1_000, &two, &[(1, RING_INDEX, 0)])),
         ("size", ring_seed(3, 1_000, &two, &[(0, RING_BYTES, 8)])),

@@ -10,28 +10,37 @@
 //! may write.
 //!
 //! The reader trusts nothing it reads back. It keeps the geometry and the
-//! run it started itself and never reads the header again. A slot it takes
-//! must hold a known state, its own index, the game's frame size, a run
-//! already started, a sequence above every frame taken before it, and in
-//! the current run a stamp inside the run's window that rises with the
-//! sequence, and it must not change while its frame is copied. Anything
-//! else is a [`Fault`], which fails the video's player: the reader keeps it
-//! and reads nothing more. A copy reads exactly the slot's frame, at the
-//! size the game gave it.
+//! run it started itself and never reads back the header words it wrote. A
+//! slot it takes must hold a known state, its own index, the game's frame
+//! size, a run already started, a sequence above every frame taken before
+//! it, and in the current run a stamp inside the run's window that rises
+//! with the sequence, and none of those words may change while its frame
+//! is copied. Anything else is a [`Fault`], which fails the video's player:
+//! the reader keeps it and reads nothing more. A copy reads exactly the
+//! slot's frame, at the size the game gave it.
 //!
-//! A worker that keeps the protocol (a frame written only into a slot it
-//! claimed free, published once whole) always yields whole frames. One that
-//! does not cannot make the game read outside the ring or write outside its
-//! staging buffer, and what it can show stays inside its own panel until a
-//! check fails its player.
+//! The worker publishes frames in sequence order and, after each, raises
+//! the ring's watermark, the highest sequence it has published. The reader
+//! reads the watermark before it looks at any slot and leaves a frame above
+//! it for the next poll, so a frame published while it looks, perhaps into
+//! a slot it has already passed, waits instead of overtaking an earlier one.
+//! The watermark only defers: whatever value it holds, the slots' checks
+//! still apply.
+//!
+//! A worker that keeps the protocol (frames written only into slots it
+//! claimed free, published once whole, in sequence order) always yields
+//! whole frames and never fails its player. One that does not cannot make
+//! the game read outside the ring or write outside its staging buffer, and
+//! what it shows stays inside its own panel: frames with plausible words
+//! are shown, and the first slot that breaks a check fails its player.
 //!
 //! The layout, in words: a header of [`HEADER_WORDS`] (a magic word, the
-//! version, the slot count, the width, the height, a frame's bytes and the
-//! current run), then the slots, each [`SLOT_HEADER_WORDS`] (its state,
-//! sequence, run, stamp, its own index and its frame's bytes) followed by
-//! its frame: the luma plane, then the two chroma planes, each half the
-//! width and height rounded up (I420), packed little-endian into words, the
-//! last word's spare bytes zero.
+//! version, the slot count, the width, the height, a frame's bytes, the
+//! current run and, at [`WATERMARK_WORD`], the watermark), then the slots,
+//! each [`SLOT_HEADER_WORDS`] (its state, sequence, run, stamp, its own
+//! index and its frame's bytes) followed by its frame: the luma plane, then
+//! the two chroma planes, each half the width and height rounded up (I420),
+//! packed little-endian into words, the last word's spare bytes zero.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
@@ -74,6 +83,11 @@ const H_BYTES: usize = 5;
 /// The run the game started last, for the worker; the game never reads it
 /// back.
 const H_RUN: usize = 6;
+
+/// The header word holding the watermark: the highest sequence the worker
+/// has published, which it raises after each publication and the game reads
+/// before each scan of the slots.
+pub const WATERMARK_WORD: usize = 7;
 
 /// A slot's words before its frame.
 const S_STATE: usize = 0;
@@ -147,8 +161,9 @@ impl Geometry {
     }
 
     /// A frame's bytes: the luma plane, then the two chroma planes, each
-    /// half the width and height rounded up (I420). 6 MiB at 4 Mi pixels of
-    /// even sides, a little more at odd ones.
+    /// half the width and height rounded up (I420): 6 MiB at 4 Mi pixels of
+    /// even sides, a little more at odd ones. The section holds four of them
+    /// and the headers, [`Geometry::bytes`] in all.
     #[must_use]
     pub const fn frame_bytes(self) -> usize {
         let (w, h) = (self.width as usize, self.height as usize);
@@ -291,8 +306,8 @@ pub struct Reader {
 
 impl Reader {
     /// Sets up a ring of `geometry` in `ring`: writes its header, every
-    /// slot free and run 1, whose frames are stamped inside `window`, and
-    /// allocates the staging buffer. The game does this at preparation,
+    /// slot free, run 1, whose frames are stamped inside `window`, and a
+    /// watermark of 0, and allocates the staging buffer. The game does this at preparation,
     /// before it passes the section to the worker.
     ///
     /// # Errors
@@ -319,6 +334,7 @@ impl Reader {
             (H_HEIGHT, u64::from(geometry.height)),
             (H_BYTES, wide(geometry.frame_bytes())),
             (H_RUN, 1),
+            (WATERMARK_WORD, 0),
         ];
         for (i, v) in header {
             if let Some(w) = word(ring, i) {
@@ -386,7 +402,9 @@ impl Reader {
     /// Reads the ring at `due`, the media time the screen shows: frees the
     /// frames of earlier runs unread, copies the newest frame of the run
     /// stamped at or before `due` into the staging buffer, and frees it with
-    /// the frames before it. A frame not due yet stays in its slot.
+    /// the frames before it. A frame not due yet stays in its slot, and so
+    /// does one above the watermark read before the scan, until a later
+    /// poll.
     ///
     /// # Errors
     ///
@@ -405,6 +423,12 @@ impl Reader {
     }
 
     fn read<W: Words + ?Sized>(&mut self, ring: &W, due: i64) -> Result<Poll, Fault> {
+        // Every frame at or below it was published before this load, so the
+        // scan finds each one still in its slot: none is passed over while a
+        // later one is taken.
+        let committed = word(ring, WATERMARK_WORD)
+            .ok_or(Fault::Section)?
+            .load(Ordering::Acquire);
         let mut found = [None; SLOTS];
         for (slot, f) in found.iter_mut().enumerate() {
             *f = self.look(ring, slot)?;
@@ -438,12 +462,16 @@ impl Reader {
             }
         }
         let mut freed = false;
-        for a in found.iter().flatten().filter(|a| a.run < run) {
+        for a in found
+            .iter()
+            .flatten()
+            .filter(|a| a.run < run && a.seq <= committed)
+        {
             self.free(ring, a)?;
             freed = true;
         }
         let chosen = current()
-            .filter(|a| a.stamp <= due)
+            .filter(|a| a.seq <= committed && a.stamp <= due)
             .max_by_key(|a| a.seq)
             .copied();
         let Some(c) = chosen else {
@@ -495,7 +523,7 @@ impl Reader {
             return Err(Fault::Size { slot: index, value });
         }
         let run = load(S_RUN)?;
-        if run > self.run {
+        if run == 0 || run > self.run {
             return Err(Fault::Run {
                 slot: index,
                 value: run,
@@ -510,7 +538,8 @@ impl Reader {
     }
 
     /// Copies `c`'s frame into the staging buffer, then checks that its
-    /// slot still holds that frame.
+    /// slot still holds that frame: the same state, sequence, run, stamp,
+    /// index and frame size.
     fn copy<W: Words + ?Sized>(&mut self, ring: &W, c: &Found) -> Result<(), Fault> {
         let mut at = self.geometry.frame_start(c.slot);
         for dst in self.staging.chunks_mut(CHUNK_WORDS) {
@@ -529,7 +558,9 @@ impl Reader {
         let same = load(S_STATE) == Some(READY)
             && load(S_SEQ) == Some(c.seq)
             && load(S_RUN) == Some(c.run)
-            && load(S_STAMP) == Some(c.stamp.cast_unsigned());
+            && load(S_STAMP) == Some(c.stamp.cast_unsigned())
+            && load(S_INDEX) == Some(wide(c.slot))
+            && load(S_BYTES) == Some(wide(self.geometry.frame_bytes()));
         if same {
             Ok(())
         } else {
@@ -635,8 +666,10 @@ impl Writer {
     }
 
     /// Publishes `frame` in `slot` as sequence `seq` of run `run`, stamped
-    /// `stamp`: writes its bytes and then the slot's words, and marks it
-    /// ready once all are written.
+    /// `stamp`: writes its bytes and then the slot's words, marks it ready
+    /// once all are written, and then raises the watermark to `seq`. Frames
+    /// are published in sequence order; a publication never moves the
+    /// watermark back.
     ///
     /// # Errors
     ///
@@ -690,6 +723,9 @@ impl Writer {
         word(ring, base + S_STATE)
             .ok_or(Refused::Section)?
             .store(READY, Ordering::Release);
+        word(ring, WATERMARK_WORD)
+            .ok_or(Refused::Section)?
+            .fetch_max(seq, Ordering::Release);
         Ok(())
     }
 }

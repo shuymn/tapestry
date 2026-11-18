@@ -3985,7 +3985,11 @@ pub enum RingOutcome {
 /// The frame sizes [`ring_bytes`] picks from by its input's first byte.
 pub const RING_SIZES: [[u32; 2]; 4] = [[1, 1], [2, 2], [3, 5], [16, 9]];
 
-/// The window of the run [`ring_bytes`] reads.
+/// The bit of [`ring_bytes`]'s first byte that starts a second run before
+/// the ring's words are written.
+pub const RING_SECOND_RUN: u8 = 4;
+
+/// The window of the runs [`ring_bytes`] reads.
 pub const RING_WINDOW: skin_model::media::Window = skin_model::media::Window {
     first: 0,
     last: 1 << 20,
@@ -4005,23 +4009,25 @@ impl skin_model::media::Words for LoggedRing<'_> {
 }
 
 /// Target `ring_bytes`: a video's frame ring as an arbitrary worker left
-/// it. The first byte picks a frame size ([`RING_SIZES`]), the next eight
-/// the due stamp, little-endian, and the rest are the ring's words after
-/// the game set it up ([`skin_model::media::Reader::new`]), little-endian
-/// from its first word, the words past the input left as set up. A worker
-/// attaches to it, and the game polls it twice, at the due stamp and a
-/// second later.
+/// it. The first byte picks a frame size ([`RING_SIZES`]) by its two low
+/// bits, and its [`RING_SECOND_RUN`] bit has the game start a second run;
+/// the next eight bytes are the due stamp, little-endian, and the rest are
+/// the ring's words after the game set it up
+/// ([`skin_model::media::Reader::new`]), little-endian from its first word,
+/// the words past the input left as set up. A worker attaches to it, and
+/// the game polls it twice, at the due stamp and a second later.
 ///
 /// # Panics
 ///
 /// If a worker accepts a header whose ring is larger than the section; if a
-/// poll asks for a word outside the slots, or a run of words other than one
-/// slot's frame; if a staged frame is not due, lies outside the window, or
-/// does not follow the frame staged before it; or if a fault is not kept:
-/// the next poll must return it without reading the ring and show nothing.
+/// poll asks for a word outside the slots other than the watermark, or a
+/// run of words other than one slot's frame; if a staged frame is not due,
+/// lies outside the window, or does not follow the frame staged before it;
+/// or if a fault is not kept: the next poll must return it without reading
+/// the ring and show nothing.
 #[must_use]
 pub fn ring_bytes(data: &[u8]) -> RingOutcome {
-    use skin_model::media::{Geometry, HEADER_WORDS, Poll, Reader, SLOTS, Writer};
+    use skin_model::media::{Geometry, HEADER_WORDS, Poll, Reader, SLOTS, WATERMARK_WORD, Writer};
     use std::sync::atomic::{AtomicU64, Ordering};
     let (size, rest) = data.split_first().unwrap_or((&0, &[]));
     let (due, words) = rest.split_at_checked(8).unwrap_or((&[0; 8], rest));
@@ -4030,6 +4036,9 @@ pub fn ring_bytes(data: &[u8]) -> RingOutcome {
     let g = Geometry::new(w, h).expect("a ring's size");
     let mem: Vec<AtomicU64> = (0..g.words()).map(|_| AtomicU64::new(0)).collect();
     let mut reader = Reader::new(&*mem, g, RING_WINDOW).expect("a ring");
+    if size & RING_SECOND_RUN != 0 {
+        reader.start_run(&*mem, RING_WINDOW);
+    }
     for (word, bytes) in mem.iter().zip(words.chunks(8)) {
         let mut le = [0; 8];
         le[..bytes.len()].copy_from_slice(bytes);
@@ -4050,7 +4059,8 @@ pub fn ring_bytes(data: &[u8]) -> RingOutcome {
         let polled = reader.poll(&logged, due);
         for (start, len) in logged.log.take() {
             assert!(
-                start >= HEADER_WORDS && start + len <= g.words(),
+                (start, len) == (WATERMARK_WORD, 1)
+                    || (start >= HEADER_WORDS && start + len <= g.words()),
                 "a request outside the slots: {start}+{len}"
             );
             assert!(

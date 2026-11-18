@@ -73,6 +73,8 @@ fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
             "not_due",
             "full",
             "earlier_run",
+            "above_watermark",
+            "run_zero",
             "state",
             "index",
             "size",
@@ -91,8 +93,18 @@ fn ring_bytes_seeds_stage_wait_or_fail_as_built() {
     assert_eq!(outcome("due"), staged(2, 1_000_000));
     assert_eq!(outcome("not_due"), staged(1, 1_000), "due a second later");
     assert_eq!(outcome("full"), staged(4, 40_000));
-    assert_eq!(outcome("earlier_run"), RingOutcome::Nothing);
+    assert_eq!(
+        outcome("earlier_run"),
+        staged(2, 2_000),
+        "run 1's frame freed unread, run 2's shown"
+    );
+    assert_eq!(
+        outcome("above_watermark"),
+        staged(1, 1_000),
+        "the frame above the watermark waits"
+    );
     let fault = RingOutcome::Fault;
+    assert_eq!(outcome("run_zero"), fault(Fault::Run { slot: 1, value: 0 }));
     assert_eq!(outcome("state"), fault(Fault::State { slot: 2, value: 3 }));
     assert_eq!(outcome("index"), fault(Fault::Index { slot: 1, value: 0 }));
     assert_eq!(outcome("size"), fault(Fault::Size { slot: 0, value: 8 }));
