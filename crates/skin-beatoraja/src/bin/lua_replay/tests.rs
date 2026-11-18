@@ -779,15 +779,17 @@ fn an_unknown_entry_is_inconclusive() {
     );
 }
 
-/// A4: a listed object's callables keep their consumer: an unmodelled
-/// slider's lowered `value` is attributed to production's record of it,
-/// and a compiled one is one located finding for the run.
+/// A4: a listed object's callables keep their consumer: the `value` of a
+/// slider holding another function (an `event`), which the reference
+/// does not model, is attributed to production's record of it when
+/// lowered, and is one located finding for the run when compiled; the
+/// listed object holds exactly its two consumers.
 #[test]
 fn listed_consumers_join_their_records() {
     let slider = |value: &str| {
         format!(
             "skin.slider = {{ {{ id = \"sl\", src = \"a\", x = 0, y = 0, w = 8, h = 8, angle = 0, range = 100,\n\
-               value = function() {value} end }} }}\n{}",
+               event = function() end, value = function() {value} end }} }}\n{}",
             dst("\"sl\"", 0, "")
         )
     };
@@ -796,10 +798,11 @@ fn listed_consumers_join_their_records() {
     for r in [&lowered, &compiled] {
         let listed = r.unmodelled.iter().find(|l| l.what == "slider");
         assert!(
-            listed.is_some_and(|l| l
-                .callables
-                .iter()
-                .all(|k| k.field == "value" && k.path == "def")),
+            listed.is_some_and(|l| {
+                let mut c: Vec<_> = l.callables.iter().map(|k| (k.field, k.path)).collect();
+                c.sort_unstable();
+                c == [("other", "def"), ("value", "def")]
+            }),
             "{}",
             r.text(0, true, true)
         );
@@ -825,14 +828,15 @@ fn listed_consumers_join_their_records() {
 }
 
 /// A4: an isolation reader on a listed object is found by its consumer:
-/// a slider's `value` reading what a stopped value writes.
+/// the `value` of a slider holding an `event` reading what a stopped value
+/// writes.
 #[test]
 fn a_listed_reader_carries_its_evidence() {
     let body = "local n\n\
          skin.value = { { id = \"v\", src = \"a\", x = 0, y = 0, w = 60, h = 6, divx = 10, digit = 2,\n\
            value = function() if ms.float_number(114) ~= 0 then n = 1 else n = 2 end return n end } }\n\
          skin.slider = { { id = \"sl\", src = \"a\", x = 0, y = 0, w = 8, h = 8, angle = 0, range = 100,\n\
-           value = function() return n or 0 end } }\n\
+           event = function() end, value = function() return n or 0 end } }\n\
          table.insert(skin.destination, { id = \"sl\", dst = { { x = 0, y = 0, w = 8, h = 8 } } })\n\
          table.insert(skin.destination, { id = \"v\", dst = { { x = 0, y = 0, w = 64, h = 64 } } })\n";
     let bare = run(body);

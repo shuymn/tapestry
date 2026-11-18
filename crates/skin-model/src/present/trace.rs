@@ -33,6 +33,9 @@ pub enum Converted {
     /// A value's `toint()` and whether it gave one (not unavailable and
     /// no sentinel).
     Int(i32, bool),
+    /// A slider value's `tofloat()` as its bits, and whether it gave one
+    /// (not unavailable).
+    Float(u32, bool),
     /// A timer invocation's `tolong()`, an error the off value; `None`
     /// for no value.
     Long(Option<i64>),

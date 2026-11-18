@@ -50,6 +50,9 @@ pub enum Cause {
     Sentinel,
     /// An earlier condition was false.
     Condition,
+    /// The object's timer was off, or its keyframes did not reach the
+    /// frame's time (`SkinObject.java:348-375`).
+    Hidden,
     /// An earlier read was unavailable.
     Unavailable,
     /// An earlier invocation could not complete.
@@ -135,6 +138,9 @@ pub struct Observed {
     /// The value occurrences of texts, whose string is compared with the
     /// literal the import folded.
     pub texts: std::collections::BTreeSet<Key>,
+    /// The value occurrences of sliders, whose `tofloat()` is compared
+    /// with production's float.
+    pub sliders: std::collections::BTreeSet<Key>,
 }
 
 /// `s` with a static lifetime, each distinct one leaked once (an object

@@ -122,7 +122,8 @@ pub fn bga_images() -> Vec<Seed> {
 
 /// `present` seeds ([`crate::present_def`]): a value reading the combo
 /// and a draw gated on it after that value, accepted; a backward jump; a
-/// read of an enumeration.
+/// read of an enumeration; the constant pool's ±2^53 edge; and a latch, a
+/// timer reading a slot beside a value storing into another, accepted.
 #[must_use]
 pub fn presents() -> Vec<Seed> {
     let accepted = [
@@ -146,12 +147,23 @@ pub fn presents() -> Vec<Seed> {
     edge[15..19].copy_from_slice(&[0, 0, 6, 0]);
     let mut wide = accepted.to_vec();
     wide[15..19].copy_from_slice(&[0, 0, 8, 0]);
+    let latch = vec![
+        2, // two callbacks
+        0, 2, 2, 0x80, 1, 255, 255, // a timer: start 0, length 2
+        2, 3, 2, 1, 1, 255, 255, // a value: start 2, length 3, `Int`
+        241, 0, 0, 0, // r0 <- slot 0, the latch (off at first)
+        11, 0, 0, 0, // Ret r0
+        0, 0, 4, 0, // Const r0 <- 3
+        242, 0, 1, 1, // slot 1 <- r0, in its domain 0..=3
+        11, 0, 0, 0, // Ret r0
+    ];
     vec![
         ("accepted", accepted.to_vec()),
         ("jump_back", jump),
         ("enum_read", kind),
         ("const_edge", edge),
         ("const_wide", wide),
+        ("latch", latch),
     ]
 }
 
@@ -1075,6 +1087,11 @@ pub const LUA_CLASS_NORMAL: u8 = (2 << 2) | 2;
 pub const LUA_AUTOPLAY_OFF_LEVEL_9: u8 = (9 << 4) | (2 << 2) | LUA_AUTOPLAY_OFF;
 /// [`crate::lua_facts`]'s first byte for a result scene.
 pub const LUA_RESULT_SCENE: u8 = u8::MAX;
+/// [`crate::lua_facts`]'s second byte for the normal judgment class with
+/// the chart's gauge total and note count known: top bits 4, the low two
+/// bits 2 (known) and `(r >> 2) % 6` = 32 % 6 = 2 (normal), the count
+/// 2 × 41 = 82; with [`LUA_AUTOPLAY_OFF_LEVEL_9`] the total is 9 × 37 = 333.
+pub const LUA_CLASS_NORMAL_CHART_KNOWN: u8 = (4 << 5) | 2;
 
 /// The header of the `skin_lua` seeds: an option, a file choice over the
 /// folder's PNGs and an offset. The configured pass adds `body`.
@@ -1098,7 +1115,9 @@ return skin
 /// selected parts, configuration and a pass-local write to it, pass
 /// isolation, callbacks converted, one of them into the presentation
 /// program, one kept in the program after its element is dropped, and a
-/// decorative one replaced, import facts read), then
+/// decorative one replaced, import facts read, numbers passed to the
+/// string functions, constant observers, and a play text folded over the
+/// chart's known gauge total and note count), then
 /// one refusal per boundary: a callback with an unknown effect, a write
 /// to a host module, the instruction and memory caps (also inside a
 /// protected call), a path out of the folder, a coroutine, malformed
@@ -1181,6 +1200,33 @@ assert(pcall(function() return string.find(ms.text(1002), "x") end))"#,
     );
     let host_write =
         lua_skin(r#"local ms = require("main_state") pcall(function() ms.number = nil end)"#);
+    // A number passed to the string functions, read as its text.
+    let coercion = lua_skin(
+        r#"assert(string.match(-102, "%d+") == "102" and string.len(-102) == 4)
+assert(string.find(-102, "0") == 3 and string.sub(12345, 2, 3) == "23")
+assert(string.match(-102, "notesgraph") == nil)"#,
+    );
+    // Constant observers: a true one on an unconditioned destination, and
+    // one false under the configuration.
+    let observers = lua_skin(
+        r#"local tu = require("timer_util")
+local on = tu.timer_observe_boolean(function() return true end)
+local off = tu.timer_observe_boolean(function() return skin_config.option.mode == 902 end)
+skin.destination[2] = { id = "i", timer = on, dst = { { x = 20, y = 0, w = 10, h = 10 } } }
+skin.destination[3] = { id = "i", timer = off, dst = { { x = 40, y = 0, w = 10, h = 10 } } }"#,
+    );
+    // A play text joining the chart's gauge total and note count, folded
+    // over the known facts ([`LUA_CLASS_NORMAL_CHART_KNOWN`]).
+    let composition = lua_skin(
+        r#"local ms = require("main_state")
+skin.text = { { id = "t", font = "f", size = 10, value = function()
+  local t = ms.number(368) local n = ms.number(74)
+  local b = math.max(260.0, 7.605 * n / (0.01 * n + 6.5))
+  local p = math.ceil(t / b * 100 * 100) / 100
+  return t .. " (" .. p .. "%)"
+end } }
+skin.destination[2] = { id = "t", dst = { { x = 0, y = 20, w = 100, h = 10 } } }"#,
+    );
     // A result skin reading [`crate::result_view`]'s values while it loads:
     // the offline constants, 17 to the next grade and no previous BP
     // (`i32::MIN`); its EX score and a status image under option 90.
@@ -1213,6 +1259,14 @@ skin.destination[3] = { id = "i", op = { 90 }, dst = { { x = x, y = 0, w = 10, h
         ("result_facts", {
             let mut input = lua_input(&[&result]);
             input[0] = LUA_RESULT_SCENE;
+            input
+        }),
+        ("coercion", lua_input(&[&coercion])),
+        ("observers", lua_input(&[&observers])),
+        ("composition", {
+            let mut input = lua_input(&[&composition]);
+            input[0] = LUA_AUTOPLAY_OFF_LEVEL_9;
+            input[1] = LUA_CLASS_NORMAL_CHART_KNOWN;
             input
         }),
         ("callback_replaced", lua_input(&[&replaced])),
