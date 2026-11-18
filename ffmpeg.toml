@@ -21,7 +21,7 @@ date = 1793320423
 [build]
 # Counts changes of flags, libraries or toolchain (flake.lock's nixpkgs); the
 # release tag's last part and FFmpeg's --extra-version.
-revision = 1
+revision = 2
 # The fixed path the build runs at: the DLLs embed it, so a rebuild matches
 # only at the same path.
 dir = "/tmp/tapestry-ffmpeg-build"
@@ -29,8 +29,10 @@ dlls = ["avutil-61", "swresample-7", "swscale-10", "avcodec-63", "avformat-63"]
 # Shared LGPL libraries for 64-bit Windows with zlib as the one external
 # library, without programs, devices, filters or any hardware or Windows media
 # component (design.md "Threat Model" T02: nothing that imports USER32 or
-# GDI32), Windows threads and libgcc linked in. The build adds
-# --extra-version and the -I and -L of the shell's mcfgthread and zlib.
+# GDI32), Windows threads and libgcc linked in, and with only the worker's
+# codec and container allow-list (design.md "Libraries", the FFmpeg row). The
+# build adds --extra-version and the -I and -L of the shell's mcfgthread and
+# zlib.
 configure = [
   "--enable-cross-compile",
   "--target-os=mingw32",
@@ -45,6 +47,21 @@ configure = [
   "--disable-doc",
   "--disable-avdevice",
   "--disable-avfilter",
+  # The allow-list by FFmpeg's names: MPEG-1/2, H.264, HEVC, VC-1, WMV 1/2/3,
+  # MS-MPEG4 v2/v3, MPEG-4, Cinepak, MS Video 1, VP8 and MJPEG; MPEG-PS,
+  # MPEG-ES, ASF, MP4, AVI and Matroska; the parsers FFmpeg has for those
+  # codecs. The encoders stay, and the muxers of those containers, for the
+  # tests' clips. No protocol: the worker reads through a custom I/O context.
+  "--disable-decoders",
+  "--enable-decoder=mpeg1video,mpeg2video,h264,hevc,vc1,wmv1,wmv2,wmv3,msmpeg4v2,msmpeg4v3,mpeg4,cinepak,msvideo1,vp8,mjpeg",
+  "--disable-demuxers",
+  "--enable-demuxer=mpegps,mpegvideo,asf,mov,avi,matroska",
+  "--disable-parsers",
+  "--enable-parser=mpegvideo,h264,hevc,vc1,mpeg4video,vp8,mjpeg",
+  "--disable-muxers",
+  "--enable-muxer=mpeg1system,mpeg1video,mpeg2video,asf,avi,mov,mp4,matroska",
+  "--disable-bsfs",
+  "--disable-protocols",
   "--disable-hwaccels",
   "--disable-amf",
   "--disable-audiotoolbox",
@@ -74,6 +91,37 @@ configure = [
   "--disable-pthreads",
   "--extra-ldflags=-static-libgcc",
 ]
+
+# What configure must register, by kind: the build reads its generated lists
+# of decoders, parsers, bitstream filters, demuxers and protocols before
+# compiling and fails unless each holds exactly these (docs/setup.md
+# "FFmpeg"). They are the flags' names and what configure builds for them:
+# h263 for mpeg4, whose decoder is built on H.263's; the ac3 parser and the
+# aac_adtstoasc, pgs_frame_merge and vp9_superframe bitstream filters for the
+# mov and matroska muxers.
+[build.components]
+decoders = [
+  "cinepak",
+  "h263",
+  "h264",
+  "hevc",
+  "mjpeg",
+  "mpeg1video",
+  "mpeg2video",
+  "mpeg4",
+  "msmpeg4v2",
+  "msmpeg4v3",
+  "msvideo1",
+  "vc1",
+  "vp8",
+  "wmv1",
+  "wmv2",
+  "wmv3",
+]
+parsers = ["ac3", "h264", "hevc", "mjpeg", "mpeg4video", "mpegvideo", "vc1", "vp8"]
+bsfs = ["aac_adtstoasc", "pgs_frame_merge", "vp9_superframe"]
+demuxers = ["asf", "avi", "matroska", "mov", "mpegps", "mpegvideo"]
+protocols = []
 
 [zlib]
 # The flake's `ffmpeg` shell overrides the pinned nixpkgs' zlib with this

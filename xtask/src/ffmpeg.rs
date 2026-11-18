@@ -6,7 +6,9 @@
 //!   in the flake's `ffmpeg` shell on Linux: fetches the pinned FFmpeg source
 //!   and checks its hashes, configures it with the recorded flags at the
 //!   manifest's fixed path with a cleared environment (only the shell's
-//!   build tools on `PATH`), builds it, checks each DLL's imports against
+//!   build tools on `PATH`), checks that configure registered exactly the
+//!   manifest's components ([`registered`], [`compare_components`]), builds
+//!   it, checks each DLL's imports against
 //!   [`ALLOWED_IMPORTS`], hashes every DLL and `.def` file and compares them
 //!   with the pinned ones ([`expectation`]) or records them, and packs the
 //!   two release assets under `target/ffmpeg-build/`.
@@ -18,7 +20,7 @@
 //! xtask links nothing of FFmpeg: it runs the build's tools and reads the
 //! DLLs' import tables as bytes ([`pe_imports`]).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::fs;
@@ -37,6 +39,20 @@ const MANIFEST_VERSION: i64 = 1;
 /// prefix.
 pub const ALLOWED_IMPORTS: [&str; 3] = ["kernel32.dll", "bcrypt.dll", "ws2_32.dll"];
 const CRT_API_SET: &str = "api-ms-win-crt-";
+
+/// The kinds of component the build checks, each with the list configure
+/// generates for it (in the build directory) and the suffix its entries
+/// carry there (`&ff_<name><suffix>,`).
+pub const COMPONENT_LISTS: [(&str, &str, &str); 5] = [
+    ("decoders", "libavcodec/codec_list.c", "_decoder"),
+    ("parsers", "libavcodec/parser_list.c", "_parser"),
+    ("bsfs", "libavcodec/bsf_list.c", "_bsf"),
+    ("demuxers", "libavformat/demuxer_list.c", "_demuxer"),
+    ("protocols", "libavformat/protocol_list.c", "_protocol"),
+];
+
+/// Component names by kind (a key of [`COMPONENT_LISTS`]).
+pub type Components = BTreeMap<String, BTreeSet<String>>;
 
 /// The manifest: the source, how it is built and, once the owner has
 /// published one, the release it was built as.
@@ -70,6 +86,8 @@ pub struct Build {
     pub dir: String,
     pub dlls: Vec<String>,
     pub configure: Vec<String>,
+    /// What configure must register, every kind of [`COMPONENT_LISTS`].
+    pub components: Components,
 }
 
 #[derive(Debug)]
@@ -143,6 +161,7 @@ impl Manifest {
                 dir: string(build, "dir")?,
                 dlls: strings(build, "dlls")?,
                 configure: strings(build, "configure")?,
+                components: components(table(build, "components")?)?,
             },
             zlib: Zlib {
                 version: string(zlib, "version")?,
@@ -201,6 +220,21 @@ fn strings(t: &toml::Table, key: &str) -> anyhow::Result<Vec<String>> {
         .collect()
 }
 
+/// `[build.components]`: a list for every kind of [`COMPONENT_LISTS`] and
+/// no other key.
+fn components(t: &toml::Table) -> anyhow::Result<Components> {
+    for key in t.keys() {
+        ensure!(
+            COMPONENT_LISTS.iter().any(|&(kind, _, _)| kind == key),
+            "ffmpeg.toml: [build.components] has `{key}`, which is no kind the build checks"
+        );
+    }
+    COMPONENT_LISTS
+        .iter()
+        .map(|&(kind, _, _)| Ok((kind.to_owned(), strings(t, kind)?.into_iter().collect())))
+        .collect()
+}
+
 fn asset(t: &toml::Table) -> anyhow::Result<Asset> {
     Ok(Asset {
         name: string(t, "name")?,
@@ -252,6 +286,64 @@ pub fn compare_hashes(
         if !pinned.contains_key(file) {
             out.push(format!("{file}: built {got}, not pinned"));
         }
+    }
+    out
+}
+
+/// The names one of configure's generated lists registers for a kind: the
+/// `<name>` of each `&ff_<name><suffix>,` entry. `codec_list.c` also lists
+/// the encoders, whose entries end in `_encoder` and are skipped. Any other
+/// line than the array's opening, an entry and its closing `NULL };`, or a
+/// list without that closing, is refused, so a list in another form cannot
+/// read as empty.
+pub fn registered(list: &str, suffix: &str) -> Result<BTreeSet<String>, String> {
+    let mut names = BTreeSet::new();
+    let mut closed = false;
+    for line in list.lines().map(str::trim).filter(|l| !l.is_empty()) {
+        if closed {
+            return Err(format!("`{line}` after the closing `NULL }};`"));
+        }
+        if line == "NULL };" {
+            closed = true;
+            continue;
+        }
+        if line.ends_with("[] = {") {
+            continue;
+        }
+        let entry = line
+            .strip_prefix("&ff_")
+            .and_then(|l| l.strip_suffix(','))
+            .ok_or_else(|| format!("unexpected line `{line}`"))?;
+        if let Some(name) = entry.strip_suffix(suffix) {
+            names.insert(name.to_owned());
+        } else if !entry.ends_with("_encoder") {
+            return Err(format!("`{line}` is no {suffix} entry"));
+        }
+    }
+    if closed {
+        Ok(names)
+    } else {
+        Err("the list has no closing `NULL };`".to_owned())
+    }
+}
+
+/// Compares what configure registered with what the manifest lists, both
+/// ways: one line for each listed component not registered and each
+/// registered one not listed, naming its kind.
+pub fn compare_components(listed: &Components, built: &Components) -> Vec<String> {
+    let none = BTreeSet::new();
+    let mut out = Vec::new();
+    for (kind, _, _) in COMPONENT_LISTS {
+        let want = listed.get(kind).unwrap_or(&none);
+        let got = built.get(kind).unwrap_or(&none);
+        out.extend(
+            want.difference(got)
+                .map(|name| format!("{kind}: {name} is listed and not registered")),
+        );
+        out.extend(
+            got.difference(want)
+                .map(|name| format!("{kind}: {name} is registered and not listed")),
+        );
     }
     out
 }
@@ -736,6 +828,33 @@ fn build(root: &Path, m: &Manifest, expect: Expect<'_>) -> anyhow::Result<()> {
         config_h.lines().any(|l| l == "#define CONFIG_ZLIB 1"),
         "configure left zlib off (config.h)"
     );
+    // What configure registered, read from the lists it generated, which the
+    // libraries' lookups walk: exactly ffmpeg.toml's components, checked
+    // before anything is compiled.
+    let mut built = Components::new();
+    let mut components_txt = String::new();
+    for (kind, list, suffix) in COMPONENT_LISTS {
+        let path = work.join("build").join(list);
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        let names =
+            registered(&text, suffix).map_err(|e| anyhow::anyhow!("{}: {e}", path.display()))?;
+        let _ = write!(components_txt, "{kind}:");
+        for name in &names {
+            let _ = write!(components_txt, " {name}");
+        }
+        components_txt.push('\n');
+        built.insert(kind.to_owned(), names);
+    }
+    fs::write(out.join("components.txt"), &components_txt)?;
+    let diff = compare_components(&m.build.components, &built);
+    ensure!(
+        diff.is_empty(),
+        "configure registered other components than ffmpeg.toml's [build.components] \
+         (registered: {}):\n  {}",
+        out.join("components.txt").display(),
+        diff.join("\n  ")
+    );
     let jobs = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
     let make_log = out.join("make.log");
     let mut make = Command::new(&bash);
@@ -1104,6 +1223,12 @@ revision = 2
 dir = "/tmp/x"
 dlls = ["avutil-61", "avcodec-63"]
 configure = ["--enable-shared"]
+[build.components]
+decoders = ["h264", "vp8"]
+parsers = ["h264"]
+bsfs = []
+demuxers = ["mov"]
+protocols = []
 [zlib]
 version = "1.4"
 sha256 = "z"
@@ -1180,8 +1305,71 @@ sha256 = "z"
             )
         );
         assert!(m.release.is_none());
+        assert_eq!(m.build.components.len(), COMPONENT_LISTS.len());
+        assert_eq!(
+            m.build.components["decoders"],
+            BTreeSet::from(["h264".to_owned(), "vp8".to_owned()])
+        );
         let other = MANIFEST.replace("version = 1", "version = 2");
         assert!(Manifest::parse(&other).is_err());
+        let missing = MANIFEST.replace("protocols = []\n", "");
+        assert!(Manifest::parse(&missing).is_err(), "every kind is listed");
+        let unknown = MANIFEST.replace("protocols = []", "protocols = []\nencoders = []");
+        assert!(Manifest::parse(&unknown).is_err(), "no other kind");
+    }
+
+    /// One of configure's generated lists, holding `entries`.
+    fn list(entries: &[&str]) -> String {
+        let mut s = String::from("static const FFCodec * const codec_list[] = {\n");
+        for e in entries {
+            let _ = writeln!(s, "    &ff_{e},");
+        }
+        s.push_str("    NULL };\n");
+        s
+    }
+
+    /// The build's component check (design.md "Libraries", the FFmpeg row):
+    /// what configure registered passes only when every kind holds exactly
+    /// the manifest's names; an off-list decoder built again (flashsv) or a
+    /// listed one left out (vp8) fails, naming it. Encoders in the codec
+    /// list are not decoders; a line of another form, or a list cut short,
+    /// is refused rather than read as fewer components.
+    #[test]
+    fn ffmpeg_build_registers_exactly_the_listed_components() {
+        let listed = Manifest::parse(MANIFEST).unwrap().build.components;
+        let built = |decoders: &[&str]| -> Components {
+            let lists = [
+                ("decoders", list(decoders), "_decoder"),
+                ("parsers", list(&["h264_parser"]), "_parser"),
+                ("bsfs", list(&[]), "_bsf"),
+                ("demuxers", list(&["mov_demuxer"]), "_demuxer"),
+                ("protocols", list(&[]), "_protocol"),
+            ];
+            lists
+                .iter()
+                .map(|(kind, text, suffix)| ((*kind).to_owned(), registered(text, suffix).unwrap()))
+                .collect()
+        };
+        let same = built(&["h264_decoder", "mpeg4_encoder", "vp8_decoder"]);
+        assert!(compare_components(&listed, &same).is_empty());
+
+        let extra = built(&["flashsv_decoder", "h264_decoder", "vp8_decoder"]);
+        assert_eq!(
+            compare_components(&listed, &extra),
+            ["decoders: flashsv is registered and not listed"]
+        );
+        let short = built(&["h264_decoder"]);
+        assert_eq!(
+            compare_components(&listed, &short),
+            ["decoders: vp8 is listed and not registered"]
+        );
+
+        assert!(registered(&list(&["file_protocol"]), "_bsf").is_err());
+        let open = "static const URLProtocol * const url_protocols[] = {\n";
+        assert!(registered(open, "_protocol").is_err(), "no closing");
+        let after = list(&[]) + "    &ff_file_protocol,\n";
+        assert!(registered(&after, "_protocol").is_err(), "past the closing");
+        assert!(registered("#define X 1\n    NULL };\n", "_bsf").is_err());
     }
 
     #[test]
