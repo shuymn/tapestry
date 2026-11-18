@@ -128,3 +128,31 @@ protocols = []
 # release (flake.nix); the build checks the shell's tarball against it.
 version = "1.4"
 sha256 = "02dd159783677a749c04adbdd02b55b8a2bcc7e054f51b76b549199a916ad584"
+
+# The published release: setup's and CI's `cargo xtask ffmpeg fetch` installs
+# it. The assets' sha256 are `sha256sum` of each file as uploaded; [files] is
+# the hashes.toml inside the binary asset.
+[release]
+revision = 2
+repository = "shuymn/tapestry"
+tag = "ffmpeg-n9.0.2-39-g7adfbe40dc-2"
+
+[release.binary]
+name = "tapestry-ffmpeg-n9.0.2-39-g7adfbe40dc-2-win64-lgpl-shared.zip"
+sha256 = "0311ab37b077f20ec22972cef383e98c57e17f715b9c62d92aaf0a7ee2470f42"
+
+[release.source]
+name = "tapestry-ffmpeg-n9.0.2-39-g7adfbe40dc-2-source.tar.xz"
+sha256 = "c7d95d149b69f82a5db2f5288e0d516a7ab6ac3d789454545b289780ab6bc21e"
+
+[release.files]
+"bin/avcodec-63.dll" = "5631b9b0c4b6fc9138b55dd9f753bd223a5825e5cb07f048c0021c92bec3e70f"
+"bin/avformat-63.dll" = "7a308b53ab4a2354e4c452218c0b5716a23478eda9af62a701a2da01af59fc15"
+"bin/avutil-61.dll" = "997b00b13ae6338551f6422672d796f321002235545ec12a8cc0c665464effa2"
+"bin/swresample-7.dll" = "b104eb7d9baa6dc23bac1a7003e6e3555cfb5fca66a56fe984c34d0d5fa28210"
+"bin/swscale-10.dll" = "e937497a855f1b45ea4fb431e6f307624a13af07f20afed893b4293a046cb65a"
+"lib/avcodec-63.def" = "7b217499370e8f540e0dd06286066679c6057a132d7339799c2bd3990801fa42"
+"lib/avformat-63.def" = "3d515a1a579cad7ecd8a56e515af8ebfa93c6949cb121de845f6a7073c327a8d"
+"lib/avutil-61.def" = "831f10dbc9fb4bbcca87a2e62f42fb0b8943652672712886d8275afe60c5187f"
+"lib/swresample-7.def" = "f9218bbdf6a09284adae3ef14e4b481a7a405d5a57de39907a6e803950114677"
+"lib/swscale-10.def" = "f99d273291bd67ecf4959e28cacad0b2d1ce67a4f6d318954cb389a1959bd8a1"
