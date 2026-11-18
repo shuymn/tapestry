@@ -364,6 +364,48 @@ fn gen_clip(dir: &Path, name: &str, spec: &str) -> PathBuf {
 
 // Covers: T02
 #[test]
+fn worker_operations_succeed_under_the_recipe() {
+    let mut worker = Worker::start(&[]);
+    // It runs confined: in its job, an AppContainer's token with no
+    // capability at low integrity, win32k system calls disabled.
+    let process = worker.launched.process();
+    assert_eq!(media_support::token_facts(process), (true, 0, 0x1000));
+    assert_eq!(
+        media_support::policy(
+            process,
+            windows::Win32::System::Threading::ProcessSystemCallDisablePolicy
+        ) & 1,
+        1
+    );
+    // Its hello came, so it loaded the shipped DLLs; it reads its pipe,
+    // reads the handed file through its I/O context, maps its section,
+    // decodes into it, waits on its event as slots are freed, seeks and
+    // answers each command.
+    let fixture = root().join("crates/player/tests/media/zlib/plain.mkv");
+    let probe = worker.open(1, &fixture);
+    let Reply::Probed { width, height, .. } = probe else {
+        panic!("{probe:?}; the worker's log:\n{}", worker.log());
+    };
+    let mut ring = Ring::new(width, height);
+    assert_eq!(worker.play(1, &ring), Reply::Playing { player: 1 });
+    let frames = take_all(&worker, &mut ring, 1, 0, 33_333);
+    assert_eq!(frames.len(), 120);
+    let run = ring.start_run(2_000_000);
+    worker.send(&Order::Seek {
+        player: 1,
+        run,
+        at: 2_000_000,
+    });
+    let landed = match worker.reply() {
+        Reply::Sought { landed, .. } => landed,
+        other => panic!("{other:?}; the worker's log:\n{}", worker.log()),
+    };
+    assert!(take_one(&worker, &mut ring, landed).stamp >= 2_000_000);
+    worker.close(1);
+}
+
+// Covers: T02
+#[test]
 fn worker_loads_the_pinned_build() {
     let worker = Worker::start(&[]);
     let text = std::fs::read_to_string(root().join("ffmpeg.toml")).unwrap();
