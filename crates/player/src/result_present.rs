@@ -186,9 +186,10 @@ pub struct ResultReport {
     /// kept to restore.
     pub installed: Option<AtlasId>,
     /// The level-0 texels the selection's and decision's committed
-    /// installations are charged (`render::Admission`, the selection's
-    /// with its pool's firm layer), as of the last event that can change
-    /// them: what the kept probe's room is decided from
+    /// installations are charged (`render::Renderer::menu_charges`, the
+    /// selection's with its pool's firm layer, made now or not), as of the
+    /// last event that can change them: what the kept probe's room is
+    /// decided from
     /// ([`crate::result_skin::kept_probe_fits`]).
     pub menus: u64,
 }

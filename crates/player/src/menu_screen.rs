@@ -1086,8 +1086,8 @@ impl Screen for MenuScreen {
         self.renderer.retained_atlases(kind)
     }
 
-    fn charge(&self, kind: ScreenKind) -> u64 {
-        self.renderer.admission().charge(kind)
+    fn menus(&self) -> u64 {
+        self.renderer.menu_charges()
     }
 
     fn prepare_result(

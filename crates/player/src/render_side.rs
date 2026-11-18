@@ -428,10 +428,11 @@ pub trait Screen: Send {
         let _ = kind;
         [None; 3]
     }
-    /// `kind`'s committed charge against the shared texel limit
-    /// (`render::Admission::charge`). The default charges nothing.
-    fn charge(&self, kind: ScreenKind) -> u64 {
-        let _ = kind;
+    /// The selection's and decision's committed charges against the
+    /// shared texel limit, the selection's with its pool's firm layer
+    /// whether the pool has it now or not (`render::Renderer::menu_charges`).
+    /// The default charges nothing.
+    fn menus(&self) -> u64 {
         0
     }
     /// Prepares a result view on `state`, a state of `skin`'s: the view
@@ -9983,10 +9984,7 @@ impl Run {
         let installed = self.committed.atlas(ScreenKind::Result);
         let mut status = self.shared.result_status();
         // With no screen, the charges it had.
-        let menus = self.screen.as_ref().map_or(status.menus, |s| {
-            s.charge(ScreenKind::Selection)
-                .saturating_add(s.charge(ScreenKind::Decision))
-        });
+        let menus = self.screen.as_ref().map_or(status.menus, |s| s.menus());
         let same = status.installed == installed
             && status.menus == menus
             && status.disabled == self.result_disabled

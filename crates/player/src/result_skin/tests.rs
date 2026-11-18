@@ -862,6 +862,42 @@ fn chart_reads_are_decided_before_ready() {
     assert!(Arc::ptr_eq(&shown(&rs), &every));
 }
 
+/// A reversal of the kept-probe decision keeps a bundle for every view
+/// (design.md "beatoraja Lua Skins", the result skin): a skin that reads
+/// only a chart fact builds the same bundle, with its own atlas, in either
+/// mode, so the next attempt reuses it with no job, no build and no file
+/// read.
+#[test]
+fn a_reversal_keeps_a_chart_only_bundle() {
+    let _s = serial();
+    let d = skin_reading(
+        "local lv = ms.number(96)",
+        "if lv ~= 12 then error(\"level\") end",
+        "{ { id = \"a\", src = \"s\", x = 0, y = 0, w = 8, h = 8 } }",
+    );
+    let p = pending(d.path(), LIMITS);
+    let mut rs = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+    rs.set_kept_probe(true);
+    staged(&mut rs);
+    assert!(
+        rs.staged_line().starts_with("every view"),
+        "{}",
+        rs.staged_line()
+    );
+    rs.request(view(5));
+    let every = shown(&rs);
+    let (jobs, b0, read) = (jobs_started(), builds(), p.source_counts());
+    rs.set_kept_probe(false);
+    rs.next_attempt();
+    staged(&mut rs);
+    assert!(rs.staged_line().starts_with("every view"));
+    rs.request(view(7));
+    assert_eq!(jobs_started(), jobs, "no job");
+    assert_eq!(builds(), b0, "no build");
+    assert_eq!(p.source_counts(), read, "no file read");
+    assert!(Arc::ptr_eq(&shown(&rs), &every), "the same bundle");
+}
+
 /// A skin that reads the play's target (number 151) while it loads is
 /// decided by the image stage as a chart read is: T is the attempt's, the
 /// same in every view, so one bundle serves every view, published with

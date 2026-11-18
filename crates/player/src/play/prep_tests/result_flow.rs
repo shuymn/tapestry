@@ -103,17 +103,20 @@ fn on_warp<R>(
     coord: bool,
     f: impl FnOnce(&mut PlayerRig<'_>, &Seen) -> R,
 ) -> R {
-    on_warp_charged(chart, coord, bundle(), Vec::new(), f)
+    on_warp_charged(chart, coord, bundle(), Vec::new(), 0, f)
 }
 
 /// [`on_warp`] with `play` chosen, each bundle of `stated` charged its
 /// level-0 texels once committed (`Renderer::state_charge`), so the shared
-/// limit leaves the other kinds only what is past it.
+/// limit leaves the other kinds only what is past it, and the first
+/// `pools_refused` chart-image pool arrays refused
+/// (`Renderer::refuse_next_pools`).
 fn on_warp_charged<R>(
     chart: &bms_model::Chart,
     coord: bool,
     play: Arc<render::SkinBundle>,
     stated: Vec<(Arc<render::SkinBundle>, u64)>,
+    pools_refused: u32,
     f: impl FnOnce(&mut PlayerRig<'_>, &Seen) -> R,
 ) -> R {
     let seen = Seen::default();
@@ -128,6 +131,7 @@ fn on_warp_charged<R>(
         for (b, texels) in &stated {
             r.state_charge(b, *texels);
         }
+        r.refuse_next_pools(pools_refused);
         Ok(Box::new(MenuScreen::new(r, Some(render::text::Fonts::runtime()?))) as Box<dyn Screen>)
     });
     let clock = QpcClock::start();
@@ -559,6 +563,7 @@ fn a_kept_probe_past_the_room_leaves_the_plain_one() {
         false,
         Arc::clone(&play),
         vec![(play, charge), (Arc::clone(&sel), MENUS)],
+        0,
         |rig, seen| {
             assert_eq!(
                 rig.render
@@ -567,6 +572,82 @@ fn a_kept_probe_past_the_room_leaves_the_plain_one() {
                     .unwrap(),
                 Preparation::Ready
             );
+            rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+            let mut h = begin(rig, &l);
+            readied(rig, &mut h);
+            assert_eq!(uploaded(rig).1, plain, "the plain probe's pages");
+            rig.commit_attempt().unwrap();
+            assert!(
+                rig.presenter.attempt_fallen().is_none(),
+                "the probe's pages refused"
+            );
+            let drawn = shown(rig, seen, dir.path(), |_, m| near(m, MARK));
+            assert!(
+                drawn.is_some_and(|[_, m]| near(m, MARK)),
+                "the view drawn with its skin: {drawn:?}"
+            );
+        },
+    );
+}
+
+/// The gate counts the selection's pool firm layer whether the pool has
+/// it at the report or not (design.md "beatoraja Lua Skins", the result
+/// skin): a chart-image selection committed with its pool refused, charged
+/// so the gate opens without the firm layer and closes with it, then a
+/// selection entry that makes the pool again with no new report. With the
+/// play skin charged so the room left fits the plain probe but is one
+/// texel short of the kept one, the probe is plain and the view draws
+/// with its skin; a gate that left the layer out would pack the kept
+/// probe, which the commit refuses.
+#[test]
+fn a_pool_made_again_after_the_report_leaves_the_plain_probe() {
+    use crate::result_skin::kept_probe_fits;
+    let _serial = imports::serial();
+    let (dir, l) = chart(Some(RED));
+    let (_skin, p, kept, plain) = kept_only_skin();
+    let fixture = crate::selection_skin::chart_fixture();
+    let limits = crate::render_common::offscreen(1_920, 1_080).atlas_limits();
+    let (sel, script) =
+        crate::selection_skin::fixture_scripted(limits, fixture.path(), "chart.luaskin");
+    let side = u64::from(sel.side().max(skin_model::MIN_TEXT_SIDE));
+    let firm = side * side;
+    let room = render::SHARED_TEXELS - 2 * (skin_model::MAX_ATLAS_TEXELS + render::VM_TEXELS);
+    let menus = room - firm / 2;
+    assert!(kept_probe_fits(menus) && !kept_probe_fits(menus + firm));
+    let play = bundle();
+    let charge = render::SHARED_TEXELS - menus - firm - (kept - 1);
+    on_warp_charged(
+        l.chart(),
+        false,
+        Arc::clone(&play),
+        vec![(play, charge), (Arc::clone(&sel), menus)],
+        2,
+        |rig, seen| {
+            assert_eq!(
+                rig.render
+                    .select_with(ScreenKind::Selection, Some(sel), script)
+                    .wait()
+                    .unwrap(),
+                Preparation::Ready
+            );
+            assert!(rig.render.pool_now().0.is_none(), "the pool refused");
+            assert_eq!(
+                rig.render.result_status().menus,
+                menus + firm,
+                "the firm layer counted without the pool"
+            );
+            rig.render.enter_selection(1);
+            rig.render
+                .show_selection(crate::render_side::tests::selection_update(1, 1));
+            assert!(
+                crate::render_side::tests::wait_until(|| rig
+                    .render
+                    .pool_now()
+                    .0
+                    .is_some_and(|pool| u64::from(pool.side) == side)),
+                "the pool made again at the entry"
+            );
+            rig.render.leave_selection();
             rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
             let mut h = begin(rig, &l);
             readied(rig, &mut h);
@@ -601,6 +682,7 @@ fn a_selection_past_the_room_closes_the_gate() {
         false,
         bundle(),
         vec![(Arc::clone(&sel), MENUS)],
+        0,
         |rig, seen| {
             rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
             prepared(rig, &l);

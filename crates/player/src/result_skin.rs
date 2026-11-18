@@ -319,12 +319,10 @@ impl std::fmt::Debug for ResultSkin {
     }
 }
 
-/// Whether `deps` read a fact of the viewed result beyond the chart's
-/// ([`skin_beatoraja::FactId::reads_view`]): the chart's facts are known
-/// before READY and decided there.
 /// Whether the shared texel limit leaves room for any result atlas
 /// beside the selection's and decision's committed charges `menus` (the
-/// selection's with its pool's firm layer): the largest play and result
+/// selection's with its pool's firm layer, whether the pool has it now
+/// or not, [`render::Renderer::menu_charges`]): the largest play and result
 /// charges, each the per-atlas cap and one VM charge, fit beside them
 /// (design.md "beatoraja Lua Skins", the result skin; "Memory
 /// Budget"). Only then is a probe packed from its kept import, which
@@ -335,6 +333,9 @@ pub fn kept_probe_fits(menus: u64) -> bool {
     menus.saturating_add(most.saturating_mul(2)) <= render::SHARED_TEXELS
 }
 
+/// Whether `deps` read a fact of the viewed result beyond the chart's
+/// ([`skin_beatoraja::FactId::reads_view`]): the chart's facts are known
+/// before READY and decided there.
 fn reads_result(deps: &FactDeps) -> bool {
     deps.reads.iter().any(|r| r.fact.reads_view())
 }
@@ -808,18 +809,21 @@ impl ResultSkin {
     /// renderer last reported ([`kept_probe_fits`]), before each image
     /// stage, when no job runs. A change of a decision made drops what was
     /// packed or bound the other way: the probe's record, the prepared
-    /// atlas, the kept cells, the cached layouts and the publication, whose
-    /// entry would be the next probe's union base, so no later probe or
-    /// view packs or binds cells only the other mode keeps. The first
-    /// decision drops nothing.
+    /// atlas, the kept cells, and the cached layouts and the publication
+    /// bound to a prepared atlas (the publication's would be the next
+    /// probe's union base), so no later probe or view packs or binds cells
+    /// only the other mode keeps. A bundle for every view of a skin that
+    /// reads no fact of the viewed result has its own atlas, the same in
+    /// either mode, and stays. The first decision drops nothing.
     pub fn set_kept_probe(&mut self, kept: bool) {
         if self.kept.replace(kept).is_some_and(|was| was != kept) {
             self.probe = None;
             self.image = None;
             self.cells = None;
-            self.layout = None;
-            self.presented = None;
-            self.published = None;
+            self.layout.take_if(|l| l.entry.is_some());
+            self.presented.take_if(|l| l.entry.is_some());
+            self.published
+                .take_if(|p| matches!(p, Published::Skin(_, Some(_), _)));
         }
     }
 
