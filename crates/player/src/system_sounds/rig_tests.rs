@@ -1540,9 +1540,10 @@ fn the_result_sound_starts_at_its_first_picture() {
 
 /// V5 (design.md "State Model", system sounds, Result): an acknowledgement
 /// starts nothing when the entry's fade-out began, before it or after it,
-/// nor when Result was left before the look that reads it; leaving after
-/// the hand-over stops `clear`, `fail` and `resultclose` whether or not the
-/// sound started. A later entry (a retry's) starts its own sound only at
+/// nor when Result was left before the look that reads it, whether the
+/// acknowledgement came before leaving or after it (the first frame held
+/// through the leave); leaving after the hand-over stops `clear`, `fail`
+/// and `resultclose` whether or not the sound started. A later entry (a retry's) starts its own sound only at
 /// its own acknowledgement, never at the earlier entry's.
 // Source: SF-015
 #[test]
@@ -1552,8 +1553,14 @@ fn a_late_acknowledgement_starts_nothing() {
         FadeOutFirst,
         FadeOutAfter,
         LeftAfter,
+        LeftFirst,
     }
-    for late in [Late::FadeOutFirst, Late::FadeOutAfter, Late::LeftAfter] {
+    for late in [
+        Late::FadeOutFirst,
+        Late::FadeOutAfter,
+        Late::LeftAfter,
+        Late::LeftFirst,
+    ] {
         let _fx = arm_result();
         let screens = crate::render_side::tests::Installers::default();
         on_rig_drawn(&screens, game::SoundSettings::default(), None, |rig| {
@@ -1562,11 +1569,29 @@ fn a_late_acknowledgement_starts_nothing() {
             let _ = installed_past(rig, None);
             let (report, screen) = switched_result(true, dir.path());
             screens.pace.store(true, Ordering::Release);
+            let waits = screens.waits.load(Ordering::Acquire);
             rig.show_end(&report, &screen);
             let entry = rig.result_entry.unwrap().number;
-            if matches!(late, Late::FadeOutFirst) {
-                let now = rig.now();
-                let _ = rig.begin_outro(now, None);
+            match late {
+                Late::FadeOutFirst => {
+                    let now = rig.now();
+                    let _ = rig.begin_outro(now, None);
+                }
+                Late::LeftFirst => {
+                    // A frame held, Result is left; then the frame goes,
+                    // and the entry's acknowledgement is published after
+                    // the leave (by the frame, or here if it drew none).
+                    wait("a frame held", || {
+                        screens.waits.load(Ordering::Acquire) > waits
+                    });
+                    rig.leave_result();
+                    screens.permits.store(1, Ordering::Release);
+                    wait("the held frame", || {
+                        screens.permits.load(Ordering::Acquire) == 0
+                    });
+                    rig.render.result_acknowledger()(entry);
+                }
+                Late::FadeOutAfter | Late::LeftAfter => {}
             }
             screens.permits.store(1, Ordering::Release);
             wait("the acknowledgement", || {
@@ -1578,12 +1603,12 @@ fn a_late_acknowledgement_starts_nothing() {
                     let _ = rig.begin_outro(now, None);
                 }
                 Late::LeftAfter => rig.leave_result(),
-                Late::FadeOutFirst => {}
+                Late::FadeOutFirst | Late::LeftFirst => {}
             }
             let now = rig.now();
             rig.idle_wait(now);
             assert_eq!(result_counts(&probe).0, [0, 0, 0], "{late:?}: started");
-            if !matches!(late, Late::LeftAfter) {
+            if !matches!(late, Late::LeftAfter | Late::LeftFirst) {
                 rig.leave_result();
             }
             assert_eq!(result_counts(&probe).1, [1, 1, 1], "{late:?}: Result left");

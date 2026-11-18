@@ -5,7 +5,7 @@
 //! disables the kind for the run, and a screen built again draws on from
 //! the revision presented.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -73,6 +73,8 @@ pub(super) struct Faults {
     /// What becomes of each result frame, the skin's or a page, in order,
     /// in place of what the screen gave (a window's outcomes offscreen).
     pub(super) outcomes: Mutex<std::collections::VecDeque<render::FrameOutcome>>,
+    /// Run inside the next result frame's submit, the skin's or a page's.
+    pub(super) during_submit: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The next result frame is refused by the skin.
     pub(super) refuse: AtomicBool,
     /// A screen built again refuses to restore the result's installation.
@@ -422,6 +424,9 @@ impl Screen for Recorded {
             return Err(render::RenderError::SurfaceLost);
         }
         let mut t = self.menu.submit_result()?;
+        if let Some(f) = self.faults.during_submit.lock().unwrap().take() {
+            f();
+        }
         if let Some(o) = self.faults.outcomes.lock().unwrap().pop_front() {
             t.outcome = o;
         }
@@ -455,6 +460,9 @@ impl Screen for Recorded {
             "the render thread panics (a test's fault)"
         );
         let mut p = self.menu.end(page)?;
+        if let Some(f) = self.faults.during_submit.lock().unwrap().take() {
+            f();
+        }
         if let Some(o) = self.faults.outcomes.lock().unwrap().pop_front() {
             p = o;
         }
@@ -3687,6 +3695,66 @@ fn an_end_page_acknowledges_only_an_entry_without_a_lifetime() {
     assert!(rig.until(|d| skin_frame(d).is_some()));
     assert!(wait_until(|| rig.link.result_acknowledged() == second));
     rig.link.exit();
+}
+
+/// V5's render half (design.md "State Model", system sounds, Result): a
+/// frame acknowledges the entry it draws a picture of, not one entered
+/// while it draws, the skin's view's and a page's alike; and it writes the
+/// acknowledgement once per entry, a later counted frame of the same entry
+/// writing nothing.
+#[test]
+fn a_frame_acknowledges_the_entry_it_draws() {
+    let (_dir, skin) = fixed_skin();
+    for skinned in [true, false] {
+        let rig = Rig::new();
+        let shared = Arc::clone(&rig.link.shared);
+        let entered = Arc::new(AtomicU64::new(0));
+        let next = Arc::clone(&entered);
+        *rig.faults.during_submit.lock().unwrap() = Some(Box::new(move || {
+            next.store(shared.result_entries.enter(None), Ordering::Release);
+        }));
+        let first = rig.link.enter_result_entry(None);
+        let entries = &rig.link.shared.result_entries;
+        if skinned {
+            let lifetime = installed(&rig, &skin);
+            show(
+                &rig.link,
+                lifetime,
+                1,
+                &payload(1, Some(&skin), 1_111, &[]),
+                &Overlay::default(),
+            );
+        } else {
+            rig.link.show_end(EndPage {
+                lines: vec!["page".to_owned()],
+                graphs: None,
+                #[cfg(feature = "dev-tools")]
+                id: None,
+            });
+        }
+        assert!(wait_until(|| rig.link.result_acknowledged() != 0));
+        let second = entered.load(Ordering::Acquire);
+        assert_eq!(
+            second,
+            first + 1,
+            "skinned {skinned}: entered while drawing"
+        );
+        assert_eq!(
+            rig.link.result_acknowledged(),
+            first,
+            "skinned {skinned}: the entry drawn"
+        );
+        // Later counted frames of the next entry's number: one write.
+        assert!(wait_until(|| rig.link.result_acknowledged() == second));
+        let drawn = rig.drawn().len();
+        assert!(wait_until(|| rig.drawn().len() >= drawn + 3));
+        assert_eq!(
+            entries.publications.load(Ordering::Relaxed),
+            2,
+            "skinned {skinned}: one write per entry"
+        );
+        rig.link.exit();
+    }
 }
 
 /// V5's render half (design.md "State Model", system sounds, Result): the

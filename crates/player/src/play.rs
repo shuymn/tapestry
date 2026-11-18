@@ -462,6 +462,9 @@ pub struct PlayerRig<'a> {
     /// looks again.
     #[cfg(test)]
     pub relooked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Tests: set when a look starts the result's sound.
+    #[cfg(test)]
+    pub result_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Tests: set by the idle wait right before it parks.
     #[cfg(test)]
     pub park_probe: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1237,6 +1240,9 @@ impl PlayerRig<'_> {
         if self.result_outro.is_some() {
             return;
         }
+        #[cfg(test)]
+        self.result_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         if let Some(sounds) = self.system_sounds.as_mut() {
             // Source: SF-015
             sounds.result_shown(&mut self.audio.control, entry.cleared);
@@ -2064,8 +2070,11 @@ impl Rig for PlayerRig<'_> {
         // thread once its outcome is in, and while its thread still ends
         // the look is repeated every LAYOUT_RELOOK, within the deadline. A
         // close leaves the looks at once, and the wait within the stop
-        // bound.
+        // bound. Each park is followed by a read of the acknowledgement,
+        // as the first's is here, so a wake the render thread gave during
+        // the looks starts the sound at once.
         while !self.land_result() && self.result_skin.landing() && !self.controls.quitting() {
+            self.start_result_sound();
             // Tests: a look found the outcome received, not yet taken.
             #[cfg(test)]
             self.relooked
@@ -2192,6 +2201,12 @@ impl Rig for PlayerRig<'_> {
     /// once.
     fn result_timing(&self) -> Option<game::ResultTiming> {
         self.presenter.timing(&self.render).map(flow_timing)
+    }
+
+    /// The entry's sound not yet started at its first picture's look.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn result_sound_due(&self) -> bool {
+        self.result_entry.as_ref().is_some_and(|e| e.due)
     }
 
     /// The result's origin: the render thread's first commit of a view.
@@ -3597,7 +3612,7 @@ mod tests {
 
         use crate::imports::facts::tests::loaded;
         use crate::imports::tests as imports;
-        use crate::play::PrepStage;
+        use crate::play::{PrepStage, ResultEntry};
         use crate::render_side::ScreenError;
         use crate::render_side::tests::{Installers, bundle};
         use crate::result_skin::tests as result;
@@ -3778,6 +3793,57 @@ mod tests {
                 "landed after its thread's release, woken by the job"
             );
             assert!(kept, "given up at the deadline, the job kept");
+        }
+
+        /// V5's layout overlap (design.md "State Model", system sounds,
+        /// Result): an acknowledgement given while the idle wait looks
+        /// again for a received layout (its thread held after its send)
+        /// starts the result's sound at once, not once the layout lands or
+        /// the wait's deadline passes.
+        #[test]
+        fn an_acknowledgement_during_the_relooks_starts_at_once() {
+            use std::sync::atomic::Ordering;
+            let _serial = imports::serial();
+            let (_d, rs, loaded) = staged_skin();
+            let (started, _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    let _let_go = LetGo;
+                    rig.result_skin = rs;
+                    rig.result_skin.set_wake(rig.controls.game_thread());
+                    let number = rig.render.enter_result_entry(rig.controls.game_thread());
+                    rig.result_entry = Some(ResultEntry {
+                        number,
+                        cleared: true,
+                        due: true,
+                    });
+                    let relooked = Arc::clone(&rig.relooked);
+                    let started = Arc::clone(&rig.result_started);
+                    let acknowledge = rig.render.result_acknowledger();
+                    imports::hold_exit(true);
+                    rig.result_skin.request(result::view(5));
+                    let far = bms_model::TimeUs(rig.now().0 + 60_000_000);
+                    std::thread::scope(|s| {
+                        let render = s.spawn(|| {
+                            let _let_go = LetGo;
+                            until(|| relooked.load(Ordering::SeqCst));
+                            acknowledge(number);
+                            // Within 5 s, the layout's thread still held.
+                            let end = Instant::now() + Duration::from_secs(5);
+                            while !started.load(Ordering::SeqCst) && Instant::now() < end {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            let at_once = started.load(Ordering::SeqCst);
+                            imports::hold_exit(false);
+                            at_once
+                        });
+                        while rig.result_skin.has_job() {
+                            assert!(rig.now().0 < far.0, "the layout never landed");
+                            rig.idle_wait(far);
+                        }
+                        render.join().unwrap()
+                    })
+                });
+            assert!(started, "started while the layout's thread was held");
         }
 
         /// A close while the idle wait looks again for a received layout

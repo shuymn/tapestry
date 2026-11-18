@@ -2738,6 +2738,14 @@ impl RenderLink {
         self.shared.result_entries.enter(wake)
     }
 
+    /// Acknowledges a Result entry's first picture as the render thread
+    /// does, from any thread (tests).
+    #[cfg(test)]
+    pub(crate) fn result_acknowledger(&self) -> impl Fn(u64) + Send + Sync + use<> {
+        let shared = Arc::clone(&self.shared);
+        move |entry| shared.result_entries.acknowledge(entry)
+    }
+
     /// The last Result entry whose first result picture a frame
     /// acknowledged, 0 before any.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -6672,10 +6680,11 @@ impl Run {
             // scenario's transition record).
             #[cfg(feature = "dev-tools")]
             let mut selection_skinned: Option<bool> = None;
-            // Whether the frame draws a result picture of the current
-            // Result entry: its commit point holds a view, or it is the
-            // built-in page of an entry without a result lifetime.
-            let mut result_picture = false;
+            // The Result entry the frame draws a result picture of, read
+            // before the frame fixes what it draws: its commit point holds
+            // a view, or it is the built-in page of an entry without a
+            // result lifetime.
+            let mut result_picture: Option<u64> = None;
             let drawn = match &mut mode {
                 Mode::Idle => continue,
                 Mode::Splash { pending } => {
@@ -7140,6 +7149,7 @@ impl Run {
                     if let Some(side) = &mut self.result {
                         side.drain();
                     }
+                    let entry = self.shared.result_entries.drawing();
                     let fadeout = Self::result_commit(
                         screen.as_mut(),
                         self.result.as_mut(),
@@ -7147,7 +7157,11 @@ impl Run {
                         &self.scripts,
                         now,
                     );
-                    result_picture = self.result.as_ref().is_some_and(|s| s.presented.is_some());
+                    result_picture = self
+                        .result
+                        .as_ref()
+                        .is_some_and(|s| s.presented.is_some())
+                        .then_some(entry);
                     Self::result_visit(self.result.as_mut(), now, fadeout, &app);
                     #[cfg(all(test, feature = "dev-tools"))]
                     if let Some(h) = self.result.as_ref().and_then(|s| s.presented.as_ref()) {
@@ -7368,7 +7382,8 @@ impl Run {
                 Mode::End => {
                     // An entry whose result lifetime began shows first at
                     // its first committed view, not on this page.
-                    result_picture = !self.shared.result_slot().open();
+                    result_picture = (!self.shared.result_slot().open())
+                        .then(|| self.shared.result_entries.drawing());
                     #[cfg(feature = "dev-tools")]
                     {
                         result_stamp = Some(crate::measure::ResultStamp {
@@ -7411,8 +7426,10 @@ impl Run {
             // The entry's first result picture, once shown or deliberately
             // not shown: the game thread starts the result's sound at its
             // next look (design.md "State Model", system sounds, Result).
-            if result_picture && drawn.as_ref().is_ok_and(|(t, _)| t.outcome.counts()) {
-                self.shared.result_entries.acknowledge();
+            if let Some(entry) = result_picture
+                && drawn.as_ref().is_ok_and(|(t, _)| t.outcome.counts())
+            {
+                self.shared.result_entries.acknowledge(entry);
             }
             // What the frame drew, fixed before a refused decision frame
             // hands the screen to its page (dev-tools: a scenario's
@@ -10163,10 +10180,14 @@ struct ResultEntries {
     /// The entry the game is in, 0 before the first; only the game thread
     /// writes it.
     current: AtomicU64,
-    /// The last entry a frame acknowledged, 0 before any.
+    /// The last entry a frame acknowledged, 0 before any; only the render
+    /// thread writes it.
     acknowledged: AtomicU64,
     /// The game thread, unparked at an entry's acknowledgement.
     wake: Mutex<Option<std::thread::Thread>>,
+    /// Writes of `acknowledged` (tests).
+    #[cfg(test)]
+    publications: std::sync::atomic::AtomicU32,
 }
 
 impl ResultEntries {
@@ -10177,15 +10198,25 @@ impl ResultEntries {
         self.current.fetch_add(1, Ordering::AcqRel) + 1
     }
 
-    /// A frame of the current entry's first result picture ended shown or
-    /// deliberately not shown: the entry is acknowledged, and the game
-    /// thread woken the first time, so its look comes at once.
+    /// The entry a frame draws a picture of: the one entered before the
+    /// frame fixed what it draws, so an entry entered while the frame draws
+    /// is not taken for it.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
-    fn acknowledge(&self) {
-        let entry = self.current.load(Ordering::Acquire);
-        if entry == 0 || self.acknowledged.swap(entry, Ordering::AcqRel) == entry {
+    fn drawing(&self) -> u64 {
+        self.current.load(Ordering::Acquire)
+    }
+
+    /// A frame of `entry`'s first result picture ended shown or
+    /// deliberately not shown: the entry is acknowledged and the game
+    /// thread woken, once per entry, so its look comes at once.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn acknowledge(&self, entry: u64) {
+        if entry == 0 || self.acknowledged.load(Ordering::Acquire) == entry {
             return;
         }
+        self.acknowledged.store(entry, Ordering::Release);
+        #[cfg(test)]
+        self.publications.fetch_add(1, Ordering::Relaxed);
         if let Some(game) = &*self.wake.lock().unwrap_or_else(PoisonError::into_inner) {
             game.unpark();
         }
@@ -12569,8 +12600,8 @@ pub(crate) mod tests {
         for _ in 0..3 {
             let entry = link.enter_result_entry(Some(std::thread::current()));
             let before = counts();
-            link.shared.result_entries.acknowledge();
-            link.shared.result_entries.acknowledge();
+            link.shared.result_entries.acknowledge(entry);
+            link.shared.result_entries.acknowledge(entry);
             std::thread::park_timeout(Duration::ZERO);
             let read = link.result_acknowledged();
             let after = counts();

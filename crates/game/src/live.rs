@@ -159,6 +159,14 @@ pub trait Rig {
         let _ = deadline;
         self.wait();
     }
+    /// Whether the result's sound waits for its first picture (design.md
+    /// "State Model", system sounds, Result): the result's loop then does
+    /// no blocking work of its own between its waits, so the look that
+    /// starts it comes at the picture. By default, never.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn result_sound_due(&self) -> bool {
+        false
+    }
     /// After a step's decisions (`aborted`: the step ended the play).
     /// A virtual rig steps its audio through the step's own time here;
     /// threads need nothing.
@@ -1163,10 +1171,14 @@ fn run_from<R: Rig>(
         loop {
             // The wait ends at the shelf's poll deadline at the latest, so
             // a wake just before it does not put the check off; with a
-            // skin, at the outro's end or the scene time too.
+            // skin, at the outro's end or the scene time too. While the
+            // result's sound waits for its first picture the files are not
+            // polled, so their deadline does not end the wait.
             let now = rig.now();
-            let deadline = loaded.shelf().deadline().next(now);
-            let mut until = now.0.saturating_add(IDLE_WAIT.0).min(deadline.0);
+            let mut until = now.0.saturating_add(IDLE_WAIT.0);
+            if !rig.result_sound_due() {
+                until = until.min(loaded.shelf().deadline().next(now).0);
+            }
             let due = match outro {
                 Some((_, end)) => Some(end.0),
                 None => rig
@@ -1181,9 +1193,13 @@ fn run_from<R: Rig>(
                 return leave(rig);
             }
             // The user preset files are polled while the result shows, never
-            // during a play; a reload is used by plays from the next one on,
+            // during a play, nor while its sound waits for its first
+            // picture, so a reload's file reads never hold the look that
+            // starts it; a reload is used by plays from the next one on,
             // and the view sees every change through the shelf's revision.
-            let _ = loaded.poll_presets(rig.now());
+            if !rig.result_sound_due() {
+                let _ = loaded.poll_presets(rig.now());
+            }
             let mut dirty = screen.sync(&report, loaded.shelf(), loaded.chart());
             // Retry and back are taken before the screen is rebuilt, so a
             // known input failure ends the run without another handshake

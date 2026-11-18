@@ -1094,6 +1094,54 @@ impl FrameOutcome {
     }
 }
 
+/// What a window's frame does with its swap chain acquisition.
+enum Acquisition {
+    /// An image to draw into.
+    Image(wgpu::SurfaceTexture),
+    /// No image: the frame ends with `outcome`, the surface configured
+    /// again first when `reconfigure`.
+    Skip {
+        outcome: FrameOutcome,
+        reconfigure: bool,
+    },
+    /// The surface is lost; the device is rebuilt.
+    Lost,
+}
+
+/// Classifies a swap chain acquisition: a timed-out image leaves the frame
+/// to be tried again, an occluded window's frame is deliberately not shown,
+/// and an outdated swap chain is configured again and the frame tried
+/// again (design.md "State Model", system sounds, Result).
+fn acquisition(current: wgpu::CurrentSurfaceTexture) -> Acquisition {
+    match current {
+        wgpu::CurrentSurfaceTexture::Success(t) | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+            Acquisition::Image(t)
+        }
+        wgpu::CurrentSurfaceTexture::Timeout => Acquisition::Skip {
+            outcome: FrameOutcome::Retry,
+            reconfigure: false,
+        },
+        wgpu::CurrentSurfaceTexture::Occluded => Acquisition::Skip {
+            outcome: FrameOutcome::Invisible,
+            reconfigure: false,
+        },
+        wgpu::CurrentSurfaceTexture::Outdated => Acquisition::Skip {
+            outcome: FrameOutcome::Retry,
+            reconfigure: true,
+        },
+        wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
+            Acquisition::Lost
+        }
+    }
+}
+
+/// The outcome of an offscreen frame the pacer skips, `wait` being the
+/// bounded wait for the frame before it: to be tried again by a later
+/// frame. `None` when the pacer admits the frame.
+fn offscreen_skip<I>(pacer: &mut Pacer<I>, wait: impl FnOnce(&I) -> bool) -> Option<FrameOutcome> {
+    (!pacer.admit(wait)).then_some(FrameOutcome::Retry)
+}
+
 struct Window {
     surface: wgpu::Surface<'static>,
     config: wgpu::SurfaceConfiguration,
@@ -5962,30 +6010,24 @@ impl Renderer {
         }
         let acquire = Instant::now();
         let (frame, view) = match &mut self.output {
-            Output::Window(w) => match w.surface.get_current_texture() {
-                wgpu::CurrentSurfaceTexture::Success(t)
-                | wgpu::CurrentSurfaceTexture::Suboptimal(t) => {
+            Output::Window(w) => match acquisition(w.surface.get_current_texture()) {
+                Acquisition::Image(t) => {
                     let view = t
                         .texture
                         .create_view(&wgpu::TextureViewDescriptor::default());
                     (Some(t), view)
                 }
-                wgpu::CurrentSurfaceTexture::Timeout => {
+                Acquisition::Skip {
+                    outcome,
+                    reconfigure,
+                } => {
+                    if reconfigure {
+                        w.configure(self.gpu.device());
+                    }
                     let cpu = start.elapsed().saturating_sub(acquire.elapsed());
-                    return Ok(timing(cpu, FrameOutcome::Retry));
+                    return Ok(timing(cpu, outcome));
                 }
-                wgpu::CurrentSurfaceTexture::Occluded => {
-                    let cpu = start.elapsed().saturating_sub(acquire.elapsed());
-                    return Ok(timing(cpu, FrameOutcome::Invisible));
-                }
-                wgpu::CurrentSurfaceTexture::Outdated => {
-                    w.configure(self.gpu.device());
-                    let cpu = start.elapsed().saturating_sub(acquire.elapsed());
-                    return Ok(timing(cpu, FrameOutcome::Retry));
-                }
-                wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
-                    return Err(RenderError::SurfaceLost);
-                }
+                Acquisition::Lost => return Err(RenderError::SurfaceLost),
             },
             Output::Offscreen { view, .. } => {
                 // Nothing paces offscreen frames: the frame before must be
@@ -5997,7 +6039,7 @@ impl Renderer {
                 let wait = self.offscreen_wait;
                 #[cfg(not(feature = "dev-tools"))]
                 let wait = Some(OFFSCREEN_FRAME_WAIT);
-                let admitted = self.pacer.admit(|previous| {
+                let skipped = offscreen_skip(&mut self.pacer, |previous| {
                     !matches!(
                         device.poll(wgpu::PollType::Wait {
                             submission_index: Some(previous.clone()),
@@ -6006,9 +6048,9 @@ impl Renderer {
                         Err(wgpu::PollError::Timeout)
                     )
                 });
-                if !admitted {
+                if let Some(outcome) = skipped {
                     let cpu = start.elapsed().saturating_sub(acquire.elapsed());
-                    return Ok(timing(cpu, FrameOutcome::Retry));
+                    return Ok(timing(cpu, outcome));
                 }
                 (None, view.clone())
             }
@@ -6683,8 +6725,10 @@ mod tests {
     use wgpu::wgc::instance as core;
 
     use super::{
-        AtlasPages, ChartOutcome, ChartTarget, ClipTable, RenderError, Renderer, Target, letterbox,
+        Acquisition, AtlasPages, ChartOutcome, ChartTarget, ClipTable, FrameOutcome, RenderError,
+        Renderer, Target, acquisition, letterbox, offscreen_skip,
     };
+    use crate::pace::Pacer;
     use crate::text::MenuText;
     use crate::{AdapterChoice, Blend, SkinError, Sprite, UploadError, solid_uv};
 
@@ -6699,6 +6743,64 @@ mod tests {
         source
             .downcast_ref::<T>()
             .expect("the source keeps its type")
+    }
+
+    /// A timed-out swap chain image and an outdated swap chain (configured
+    /// again) leave the frame to be tried again, an occluded window's frame
+    /// is deliberately not shown, and a lost or invalid surface is lost.
+    #[test]
+    fn an_acquisition_without_an_image_classifies_its_frame() {
+        let skip = |current| match acquisition(current) {
+            Acquisition::Skip {
+                outcome,
+                reconfigure,
+            } => Some((outcome, reconfigure)),
+            Acquisition::Image(_) | Acquisition::Lost => None,
+        };
+        assert_eq!(
+            skip(wgpu::CurrentSurfaceTexture::Timeout),
+            Some((FrameOutcome::Retry, false)),
+            "a timed-out image"
+        );
+        assert_eq!(
+            skip(wgpu::CurrentSurfaceTexture::Occluded),
+            Some((FrameOutcome::Invisible, false)),
+            "an occluded window"
+        );
+        assert_eq!(
+            skip(wgpu::CurrentSurfaceTexture::Outdated),
+            Some((FrameOutcome::Retry, true)),
+            "an outdated swap chain"
+        );
+        for lost in [
+            wgpu::CurrentSurfaceTexture::Lost,
+            wgpu::CurrentSurfaceTexture::Validation,
+        ] {
+            assert!(matches!(acquisition(lost), Acquisition::Lost));
+        }
+    }
+
+    /// An offscreen frame the pacer skips, the frame before it not done
+    /// within the wait, is tried again; one it admits goes on.
+    #[test]
+    fn an_offscreen_frame_skipped_is_tried_again() {
+        let mut pacer = Pacer::default();
+        assert_eq!(
+            offscreen_skip(&mut pacer, |_: &u32| false),
+            None,
+            "none pending"
+        );
+        pacer.submitted(1);
+        assert_eq!(
+            offscreen_skip(&mut pacer, |_| false),
+            Some(FrameOutcome::Retry),
+            "the frame before not done"
+        );
+        assert_eq!(
+            offscreen_skip(&mut pacer, |_| true),
+            None,
+            "the frame before done"
+        );
     }
 
     /// Each wrapped failure is the source, printed once in the chain. The
