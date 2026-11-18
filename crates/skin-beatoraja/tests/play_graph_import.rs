@@ -660,8 +660,9 @@ fn a_notes_graph_is_type_0_revealed_over_500_ms() {
 /// early and 6 late; 69 not judged.
 const BIN_1: [u32; 9] = [10, 5, 0, 0, 2, 3, 4, 1, 6];
 
-/// `skin` over 100 taps on lane 1 from 1 s (bin 1 of the profile's 3), the
-/// view's 512 judgment bins holding [`BIN_1`] at bin 1: its quads at `ms`.
+/// `skin` over 100 taps on lane 1 from 1 s (bin 1 of the judgment graph's
+/// 3), the view's 512 judgment bins holding [`BIN_1`] at bin 1: its quads
+/// at `ms`.
 fn judged(skin: Skin, ms: i64) -> Vec<Quad> {
     // The 100 taps of [`taps`] from 1 s, then a background sound at 2.5 s:
     // a length of 2.5 s gives the judgment graphs 3 bins of 1 s (the
