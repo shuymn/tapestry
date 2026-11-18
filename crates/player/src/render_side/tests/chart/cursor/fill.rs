@@ -389,6 +389,42 @@ fn a_new_pool_generation_fills_again() {
     assert!(near.iter().all(fresh));
 }
 
+/// A new pool generation stops a fill read in flight, whose output it
+/// would drop, so the cursor's read asked again begins without waiting
+/// for it; the neighbours follow it (AC-S14).
+#[test]
+fn a_new_pool_generation_stops_the_fill_read_in_flight() {
+    let _serial = crate::imports::tests::serial();
+    let _let_go = LetGo;
+    let c = cursor_of(8);
+    let (at, near) = (chart([64, 48], [30, 8]), charts(2));
+    let near_refs: Vec<&tempfile::TempDir> = near.iter().collect();
+    c.rest_on(at.path(), named());
+    c.shown(at.path(), named());
+    HOLD.store(true, Ordering::Release);
+    c.rest_with(at.path(), named(), &near_refs);
+    c.until(|c| c.w.begun() == 2 && !c.w.idle());
+    let next = super::super::pool_of(4);
+    *c.r.pool.lock().unwrap() = Some(next);
+    assert!(wait_until(|| c.r.link.pool_now().0 == Some(next)));
+    // The held read ends although the hold stays set: it saw the stop.
+    c.until(|c| c.w.idle());
+    assert!(c.w.take_rearm(), "the cursor's read not asked again");
+    assert_eq!(c.w.begun(), 2);
+    assert!(c.w.entry(&row(near[0].path(), named())).is_none());
+    HOLD.store(false, Ordering::Release);
+    c.rest_with(at.path(), named(), &near_refs);
+    c.filled();
+    assert_eq!(c.w.begun(), 5);
+    let fresh = |d: &tempfile::TempDir| {
+        matches!(
+            c.w.entry(&row(d.path(), named())).map(|e| e.0),
+            Some(EntryState::Resident { generation, .. }) if generation == next.generation
+        )
+    };
+    assert!(fresh(&at) && near.iter().all(fresh));
+}
+
 impl Cursor {
     /// Whether a refused background mode ended the fill for the run.
     fn fill_off(&self) -> bool {

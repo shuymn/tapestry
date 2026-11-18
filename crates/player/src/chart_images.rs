@@ -2142,6 +2142,16 @@ impl Core {
             self.pending_write = None;
         }
         self.fill = None;
+        // A fill read in flight is of the old generation, its output to
+        // be dropped: stopped, so the cursor's read asked again below does
+        // not wait for it to get a permit or finish its file.
+        if let Some(Job {
+            target: Target::Cursor { fill: Some(_), .. },
+            job,
+        }) = &self.job
+        {
+            job.stop();
+        }
         if resident {
             self.changed = true;
         }
