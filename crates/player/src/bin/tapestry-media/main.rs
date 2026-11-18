@@ -26,7 +26,6 @@ compile_error!("tapestry-media is Windows-only");
 #[cfg(feature = "dev-tools")]
 mod dev;
 mod ffmpeg;
-#[path = "../../media_host/handles.rs"]
 mod handles;
 mod os;
 mod player;

@@ -9,6 +9,11 @@
 //! one the system's process snapshots make (`PssCaptureSnapshot` with
 //! `PSS_CAPTURE_HANDLES`); the snapshot API would also query each handle's
 //! names, which can block on a pipe, where this reads only the table.
+//!
+//! The game's host (`src/media_host/handles.rs`) and the worker
+//! (`src/bin/tapestry-media/handles.rs`) each compile a copy of this file,
+//! which a test keeps identical: the two binaries share no library, and
+//! `check-arch`'s R6 refuses a `#[path]` module.
 
 use windows::Wdk::System::Threading::{NtQueryInformationProcess, ProcessHandleInformation};
 use windows::Win32::Foundation::{HANDLE, NTSTATUS, STATUS_INFO_LENGTH_MISMATCH};

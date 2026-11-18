@@ -555,6 +555,17 @@ fn worker_launch_fails_closed_without_a_hello_in_time() {
     assert_eq!(e.step, Step::Handshake, "{e}");
 }
 
+/// The game's host and the worker each compile a copy of the handle
+/// table's reader (the two binaries share no library, and `check-arch`'s
+/// R6 refuses a `#[path]` module): the copies are one file.
+#[test]
+fn host_and_worker_read_handle_tables_alike() {
+    let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let host = std::fs::read(src.join("media_host/handles.rs")).unwrap();
+    let worker = std::fs::read(src.join("bin/tapestry-media/handles.rs")).unwrap();
+    assert!(host == worker, "the two copies of handles.rs differ");
+}
+
 // Covers: T02
 #[test]
 fn job_close_kills_the_worker() {
