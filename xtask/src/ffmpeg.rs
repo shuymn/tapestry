@@ -1290,7 +1290,10 @@ fn unzip_asset(zip: &Path, into: &Path) -> anyhow::Result<()> {
 
 /// An import library for the DLL `def` describes: MSVC's `lib.exe` on
 /// Windows (found as the `cc` crate finds MSVC's tools), `llvm-dlltool` on
-/// Linux.
+/// Linux. The release's `.def` files hold only `EXPORTS`, no `LIBRARY`
+/// line, so the DLL's name is the `.def` file's own (`avutil-61.def` names
+/// `avutil-61.dll`): `lib.exe` takes it from the file name, `llvm-dlltool`
+/// only from `-D`, refusing the `.def` without it.
 fn import_library(def: &Path, lib: &Path) -> anyhow::Result<()> {
     if cfg!(windows) {
         let mut cmd = cc::windows_registry::find("x86_64-pc-windows-msvc", "lib.exe")
@@ -1306,10 +1309,17 @@ fn import_library(def: &Path, lib: &Path) -> anyhow::Result<()> {
             "lib.exe",
         )
     } else {
+        let mut dll = def
+            .file_stem()
+            .with_context(|| format!("{} has no file name", def.display()))?
+            .to_owned();
+        dll.push(".dll");
         run_plain(
             Command::new("llvm-dlltool")
                 .args(["-m", "i386:x86-64", "-d"])
                 .arg(def)
+                .arg("-D")
+                .arg(&dll)
                 .arg("-l")
                 .arg(lib),
             "llvm-dlltool",
@@ -1740,6 +1750,37 @@ sha256 = "z"
             "{e}"
         );
         assert_eq!(fs::read(&dll).unwrap(), b"changed", "nothing installed");
+    }
+
+    /// The fetch's real import-library step, not a fake, on a `.def` file
+    /// like the release's (`EXPORTS` alone, no `LIBRARY` line): the library
+    /// it makes imports from the versioned DLL the `.def` file is named for.
+    /// Windows always has `lib.exe` here; Linux runs it where `llvm-dlltool`
+    /// is on `PATH` (the `llvm` package of the cargo-xwin check).
+    #[test]
+    fn import_library_imports_from_the_dll_its_def_is_named_for() {
+        if !cfg!(windows)
+            && Command::new("llvm-dlltool")
+                .arg("--version")
+                .output()
+                .is_err()
+        {
+            eprintln!("llvm-dlltool is not on PATH: the import library is not made");
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let def = tmp.path().join("avutil-61.def");
+        fs::write(&def, "EXPORTS\n    av_malloc\n    av_free\n").unwrap();
+        let lib = tmp.path().join("avutil.lib");
+        import_library(&def, &lib).unwrap();
+        let bytes = fs::read(&lib).unwrap();
+        for name in ["avutil-61.dll", "av_malloc", "av_free"] {
+            assert!(
+                bytes.windows(name.len()).any(|w| w == name.as_bytes()),
+                "{} does not name {name}",
+                lib.display()
+            );
+        }
     }
 
     /// The build step's comparison: the manifest's own hashes pass; one DLL's
