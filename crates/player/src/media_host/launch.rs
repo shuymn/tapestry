@@ -44,16 +44,16 @@ use std::time::Duration;
 
 use skin_model::media::control::{self, Reply};
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, ERROR_TIMEOUT, GENERIC_ALL, GetLastError, HANDLE, HANDLE_FLAG_INHERIT,
-    HANDLE_FLAGS, HLOCAL, LocalFree, SetHandleInformation,
+    ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_TIMEOUT, GENERIC_ALL, GetLastError, HANDLE,
+    HANDLE_FLAG_INHERIT, HANDLE_FLAGS, HLOCAL, LocalFree, SetHandleInformation,
 };
 use windows::Win32::Security::Authorization::{
-    EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW, GetSecurityInfo, SE_FILE_OBJECT,
-    SE_OBJECT_TYPE, SE_WINDOW_OBJECT, SetEntriesInAclW, SetNamedSecurityInfoW, SetSecurityInfo,
-    TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
+    ConvertSidToStringSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
+    GetSecurityInfo, SE_FILE_OBJECT, SE_OBJECT_TYPE, SE_WINDOW_OBJECT, SetEntriesInAclW,
+    SetNamedSecurityInfoW, SetSecurityInfo, TRUSTEE_IS_SID, TRUSTEE_IS_UNKNOWN, TRUSTEE_W,
 };
 use windows::Win32::Security::Isolation::{
-    CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName,
+    CreateAppContainerProfile, DeriveAppContainerSidFromAppContainerName, GetAppContainerFolderPath,
 };
 use windows::Win32::Security::{
     ACCESS_ALLOWED_ACE, ACE_FLAGS, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
@@ -64,6 +64,7 @@ use windows::Win32::Security::{
     TOKEN_QUERY, TokenAppContainerSid, TokenCapabilities, TokenIntegrityLevel, TokenIsAppContainer,
 };
 use windows::Win32::Storage::FileSystem::{FILE_GENERIC_EXECUTE, FILE_GENERIC_READ};
+use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT,
     JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
@@ -587,31 +588,47 @@ impl Drop for Sid {
 /// How many times the profile is asked for while another process makes it.
 const PROFILE_ATTEMPTS: u32 = 20;
 
-/// Whether this process has made or found the profile. Asking for it again
-/// at every launch is not harmless: a call that finds the profile, made
-/// while another launch creates its process in the AppContainer, can fail
-/// that creation with `ERROR_FILE_NOT_FOUND` (2 of 120 launches from four
-/// threads at once; none of 720 once the profile was asked for once).
-static PROFILE_FOUND: Mutex<bool> = Mutex::new(false);
-
-/// Step 2: the AppContainer profile's SID, the profile made or found by
-/// this process's first launch.
+/// Step 2: the AppContainer profile's SID. The first launch on the machine
+/// makes the profile, which Windows keeps; a later one finds its folder and
+/// leaves it alone. Asking `CreateAppContainerProfile` for a profile that
+/// exists is not harmless: the call, made while another launch creates its
+/// process in the AppContainer, can fail that creation with
+/// `ERROR_FILE_NOT_FOUND` (2 of 120 launches from four threads at once).
 fn profile() -> Result<Sid, Failure> {
-    let mut found = PROFILE_FOUND.lock().unwrap_or_else(PoisonError::into_inner);
-    if !*found {
-        find_profile()?;
-        *found = true;
-    }
     // SAFETY: a nul-terminated name; the SID returned is freed by `Sid`.
-    unsafe { DeriveAppContainerSidFromAppContainerName(PROFILE) }
+    let sid = unsafe { DeriveAppContainerSidFromAppContainerName(PROFILE) }
         .map(Sid)
-        .map_err(failed("the profile's SID"))
+        .map_err(failed("the profile's SID"))?;
+    if !made(&sid)? {
+        make_profile()?;
+    }
+    Ok(sid)
+}
+
+/// Whether the profile of `sid` exists: whether Windows gives its folder.
+fn made(sid: &Sid) -> Result<bool, Failure> {
+    let mut text = PWSTR::null();
+    // SAFETY: a SID the profile's calls allocated; the string returned is
+    // freed by `Local`.
+    unsafe { ConvertSidToStringSidW(sid.0, &raw mut text) }
+        .map_err(failed("the profile's SID as text"))?;
+    let _text = Local(text.0.cast());
+    // SAFETY: a nul-terminated SID string; the path returned is freed here.
+    match unsafe { GetAppContainerFolderPath(PCWSTR(text.0)) } {
+        Ok(path) => {
+            // SAFETY: the path the call allocated, unused after this.
+            unsafe { CoTaskMemFree(Some(path.0.cast())) };
+            Ok(true)
+        }
+        Err(e) if e.code() == ERROR_FILE_NOT_FOUND.to_hresult() => Ok(false),
+        Err(e) => Err(failed("the profile's folder")(e)),
+    }
 }
 
 /// Makes the AppContainer profile, or finds it made. Another process making
 /// it at the same moment fails the call, so it is asked for again, a little
 /// later, a bounded number of times.
-fn find_profile() -> Result<(), Failure> {
+fn make_profile() -> Result<(), Failure> {
     let mut attempt = 1;
     loop {
         // SAFETY: nul-terminated names and no capability; the SID returned
