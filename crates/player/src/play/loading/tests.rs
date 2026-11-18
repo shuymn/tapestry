@@ -550,3 +550,28 @@ fn the_offset_keys_are_revoked_on_leaving_the_result() {
         });
     }
 }
+
+/// The transition probe on (`TAPESTRY_LOOP_PROBE`): the rig's opening is
+/// marked once at each call, `g:open` 0 at a full opening and 1 at a
+/// round's candidate, within the call. It turns the process's probe on, so
+/// it runs in a process of its own (nextest).
+#[test]
+fn the_probe_marks_each_opening_at_its_call() {
+    crate::dev::loop_probe::tests::turn_on();
+    let opens = |from: u64, to: u64| -> Vec<i64> {
+        crate::dev::loop_probe::tests::marks()
+            .iter()
+            .filter(|m| m.1 == "g:open" && m.0 >= from && m.0 <= to)
+            .map(|m| m.2)
+            .collect()
+    };
+    on_input_rig(|rig, _| {
+        let t0 = crate::dev::loop_probe::tests::now();
+        let _ = rig.open(TimeUs(1_000_000));
+        let t1 = crate::dev::loop_probe::tests::now();
+        assert_eq!(opens(t0, t1), [0], "the full opening");
+        let _ = rig.open_candidate(TimeUs(1_000_000), 1);
+        let t2 = crate::dev::loop_probe::tests::now();
+        assert_eq!(opens(t1 + 1, t2), [1], "the round's candidate");
+    });
+}

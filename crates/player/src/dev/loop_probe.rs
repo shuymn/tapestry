@@ -181,6 +181,13 @@ pub(crate) mod tests {
             .unwrap_or_default()
     }
 
+    /// The probe's clock now, in the marks' µs.
+    pub(crate) fn now() -> u64 {
+        super::REC.base.get().map_or(0, |b| {
+            u64::try_from(b.elapsed().as_micros()).unwrap_or(u64::MAX)
+        })
+    }
+
     /// The marks not kept for want of room.
     pub(crate) fn dropped() -> u64 {
         super::REC.dropped()

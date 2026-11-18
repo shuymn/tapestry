@@ -572,6 +572,9 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
             );
         }
     }
+    // The preparations' numbers, and both image stages ended Ready.
+    assert_eq!(values("prep:begin"), [0, 1]);
+    assert_eq!(values("img:stage_end"), [1, 1]);
     // Each attempt's result upload: inside its select (the play skin's own
     // select, at the rig's start, is upload 0), its levels' writes summing
     // to its pages' bytes with the built-in layer's 128² texels, its pages
