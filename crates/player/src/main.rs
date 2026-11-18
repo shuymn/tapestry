@@ -142,6 +142,9 @@ fn main() -> ExitCode {
     // The clock reads 0 at the start of the process: load times count from
     // here unless the command sets something up first.
     let clock = QpcClock::start();
+    // The transition probe (`TAPESTRY_LOOP_PROBE`), on from here if set.
+    #[cfg(feature = "dev-tools")]
+    crate::dev::loop_probe::init();
     // A usage error is found before anything is opened, and exits 2.
     let command = match args::parse(std::env::args_os().skip(1)) {
         Ok(command) => command,
@@ -1954,6 +1957,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     if let Some((sc, script)) = scenario {
         // The transition record, printed off the render thread now that
         // it has ended (design.md "Shortening Launch-Based Checks").
+        // The transition probe's marks first (`TAPESTRY_LOOP_PROBE`).
+        crate::dev::loop_probe::dump();
         let record = sc.transitions.lines();
         if let Ok((lines, _)) = &record {
             for l in lines {

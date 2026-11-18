@@ -61,6 +61,8 @@ mod outline;
 mod overlay;
 mod pace;
 pub mod presentation;
+#[cfg(feature = "dev-tools")]
+pub mod probe;
 mod projection;
 mod renderer;
 mod simple;

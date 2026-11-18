@@ -669,10 +669,19 @@ impl MenuScreen {
             subartist: field(&c.subartist),
             genre: field(&c.genre),
         };
-        match self
-            .renderer
-            .prepare_loading_text_on(on, lifetime, update.revision, which, &chart)
+        #[cfg(feature = "dev-tools")]
+        let p_c = crate::dev::loop_probe::Caller::set(render::probe::LOADING);
+        #[cfg(feature = "dev-tools")]
+        let p_t = std::time::Instant::now();
+        let p_prepared =
+            self.renderer
+                .prepare_loading_text_on(on, lifetime, update.revision, which, &chart);
+        #[cfg(feature = "dev-tools")]
         {
+            crate::dev::loop_probe::mark("ld:text_us", crate::dev::loop_probe::us(p_t.elapsed()));
+            drop(p_c);
+        }
+        match p_prepared {
             Ok(()) => self.chosen.staged = Some(asked),
             Err(e) if e.is_refusal() => {
                 eprintln!(
@@ -886,10 +895,20 @@ impl Screen for MenuScreen {
         skin: Option<&Arc<SkinBundle>>,
         request: u64,
     ) -> Option<Result<Preparation, RenderError>> {
+        #[cfg(feature = "dev-tools")]
+        let p_caller = crate::dev::loop_probe::Caller::set(render::probe::ATTEMPT);
+        #[cfg(feature = "dev-tools")]
+        let p_t = std::time::Instant::now();
         let done = match skin {
             Some(bundle) => self.renderer.stage(bundle, a, request).map(|_| ()),
             None => self.renderer.prepare_attempt(a),
         };
+        #[cfg(feature = "dev-tools")]
+        {
+            crate::dev::loop_probe::mark("att:staged", i64::from(skin.is_some()));
+            crate::dev::loop_probe::mark("att:stage_us", crate::dev::loop_probe::us(p_t.elapsed()));
+            drop(p_caller);
+        }
         Some(match done {
             Ok(()) => Ok(Preparation::Ready),
             // The whole chain: the skin's or the device's own reason too.

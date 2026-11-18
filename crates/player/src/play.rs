@@ -740,6 +740,11 @@ impl PlayerRig<'_> {
             "dev: result image stage: {}",
             self.result_skin.staged_line()
         );
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark(
+            "img:stage_end",
+            i64::from(staged == crate::result_skin::Staged::Ready),
+        );
         match staged {
             crate::result_skin::Staged::Cancelled => PrepStage::Ended(Preparation::Cancelled),
             crate::result_skin::Staged::Ready => self.send_screen(prep, skin),
@@ -793,6 +798,8 @@ impl PlayerRig<'_> {
                 .with_difficulty(prep.difficulty)
                 .with_bga_shown(self.bga_session.shown())
                 .with_scratch_notes(std::mem::take(&mut prep.scratch_notes));
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("att:send", 0);
         prep.staging = Instant::now();
         PrepStage::Screen(self.render.begin_attempt(attempt, skin))
     }
@@ -1263,6 +1270,11 @@ impl PlayerRig<'_> {
         // disabled), `reused` (installed) or `uploaded` (asked for).
         #[cfg(feature = "dev-tools")]
         let installed = status.installed == Some(upload.atlas()) && !crate::dev::result_cold();
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark(
+            "res:installed",
+            i64::from(installed) | (i64::from(status.installed.is_some()) << 1),
+        );
         #[cfg(not(feature = "dev-tools"))]
         let installed = status.installed == Some(upload.atlas());
         #[cfg(feature = "dev-tools")]
@@ -1272,6 +1284,8 @@ impl PlayerRig<'_> {
         if installed {
             return;
         }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("res:select_sent", 0);
         let mut pending = self.render.upload_result(upload);
         loop {
             if preparation_stops(
@@ -1290,7 +1304,11 @@ impl PlayerRig<'_> {
             }
             let why = match pending.poll(crate::render_side::SELECT_SLICE) {
                 None => continue,
-                Some(Ok(Preparation::Ready)) => return,
+                Some(Ok(Preparation::Ready)) => {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::loop_probe::mark("res:select_ready", 0);
+                    return;
+                }
                 Some(Ok(Preparation::Refused(why))) => why.to_string(),
                 Some(Ok(Preparation::Cancelled)) => "the upload was withdrawn".to_owned(),
                 Some(Err(e)) => Chain(&e).to_string(),
@@ -2256,6 +2274,8 @@ impl Rig for PlayerRig<'_> {
         {
             self.probe_ready = Some((std::time::Instant::now(), "none"));
         }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("att:committed", 0);
         self.upload_result();
         #[cfg(feature = "dev-tools")]
         crate::dev::print_result_work("commit");
@@ -2271,6 +2291,8 @@ impl Rig for PlayerRig<'_> {
     /// the opening returns to the same loading state ([`defer`](Rig::defer));
     /// the opening ends it.
     fn end_loading(&mut self) -> Result<(), ScreenError> {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("g:end_loading", 0);
         #[cfg(test)]
         self.opening_gates.ending();
         let loading = self
@@ -2342,6 +2364,8 @@ impl Rig for PlayerRig<'_> {
             });
             return game::PrepHandle::new(key, self.preps);
         }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("prep:begin", i64::try_from(self.preps).unwrap_or(-1));
         self.result_skin.next_attempt();
         self.presenter.next_attempt();
         self.preps += 1;
@@ -2600,6 +2624,8 @@ impl Rig for PlayerRig<'_> {
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
         // G2's sample (dev-tools): `commit_ready`'s return to here.
         #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("g:open", 0);
+        #[cfg(feature = "dev-tools")]
         crate::dev::print_ready_to_open(self.probe_ready.take());
         // The window gains its focus when shown: an opening before it
         // would latch the play's focus loss at once.
@@ -2666,6 +2692,8 @@ impl Rig for PlayerRig<'_> {
         generation: u32,
     ) -> Result<Option<Opening<SourceReader>>, InputWaitError> {
         // G2's sample (dev-tools), as at [`open`](Rig::open).
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("g:open", 1);
         #[cfg(feature = "dev-tools")]
         crate::dev::print_ready_to_open(self.probe_ready.take());
         if let Some(window) = &self.window {
