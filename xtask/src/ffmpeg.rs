@@ -12,10 +12,13 @@
 //!   [`ALLOWED_IMPORTS`], hashes every DLL and `.def` file and compares them
 //!   with the pinned ones ([`expectation`]) or records them, and packs the
 //!   two release assets under `target/ffmpeg-build/`.
-//! - `cargo xtask ffmpeg fetch`: downloads the binary asset the manifest's
-//!   `[release]` names, refuses it unless its sha256 is the pinned one
-//!   ([`unpack_checked`]), unpacks it into `target/ffmpeg/` and makes the
-//!   import libraries there from the `.def` files.
+//! - `cargo xtask ffmpeg fetch` ([`install_release`]): keeps the release
+//!   the manifest's `[release]` pins in `target/ffmpeg/` while every file
+//!   there has its pinned sha256; otherwise downloads its binary asset,
+//!   refuses it unless its sha256 is the pinned one ([`unpack_checked`]),
+//!   unpacks it, refuses it unless every DLL and `.def` file in it has its
+//!   pinned sha256, and puts it in place; either way it makes the import
+//!   libraries there from the `.def` files.
 //!
 //! xtask links nothing of FFmpeg: it runs the build's tools and reads the
 //! DLLs' import tables as bytes ([`pe_imports`]).
@@ -1103,64 +1106,146 @@ fn pack(
     Ok(())
 }
 
-/// `cargo xtask ffmpeg fetch`: the binary asset of the manifest's release,
-/// checked and unpacked into `target/ffmpeg/`, with import libraries made
-/// from its `.def` files.
+/// The steps of a fetch that reach outside the workspace: downloading a URL
+/// to a path, unpacking a zip into a directory, and making an import library
+/// from a `.def` file. `fetch` passes the real ones ([`curl_download`],
+/// [`unzip_asset`], [`import_library`]); tests pass their own.
+pub struct FetchSteps<'a> {
+    pub download: &'a dyn Fn(&str, &Path) -> anyhow::Result<()>,
+    pub unpack: &'a dyn Fn(&Path, &Path) -> anyhow::Result<()>,
+    pub import_library: &'a dyn Fn(&Path, &Path) -> anyhow::Result<()>,
+}
+
+/// `cargo xtask ffmpeg fetch`: [`install_release`] into `target/` with the
+/// real steps.
 fn fetch(root: &Path) -> anyhow::Result<()> {
     let m = read_manifest(&root.join("ffmpeg.toml"))?;
+    install_release(
+        &root.join("target"),
+        &m,
+        &FetchSteps {
+            download: &curl_download,
+            unpack: &unzip_asset,
+            import_library: &import_library,
+        },
+    )
+}
+
+/// The directory the pinned release's binary asset unpacks to: the asset's
+/// name without `-win64-lgpl-shared.zip`, as the build packs it.
+fn release_top(release: &Release) -> anyhow::Result<&str> {
+    release
+        .binary
+        .name
+        .strip_suffix("-win64-lgpl-shared.zip")
+        .with_context(|| {
+            format!(
+                "[release]'s binary asset {} is no `<name>-win64-lgpl-shared.zip`",
+                release.binary.name
+            )
+        })
+}
+
+/// The `.def` files of `[release.files]` (`lib/<dll>.def`), each with the
+/// import library made from it (`lib/<name>.lib`, the DLL's name without its
+/// major version). A path that is neither `bin/<dll>.dll` nor
+/// `lib/<dll>.def` is refused.
+fn release_defs(release: &Release) -> anyhow::Result<Vec<(String, String)>> {
+    let mut defs = Vec::new();
+    for path in release.files.keys() {
+        let (dir, name) = path.split_once('/').unwrap_or(("", path));
+        let plain = !name.contains(['/', '\\']) && !name.starts_with('.');
+        match (dir, name.rsplit_once('.')) {
+            ("bin", Some((dll, "dll"))) if plain && !dll.is_empty() => {}
+            ("lib", Some((dll, "def"))) if plain && !dll.is_empty() => {
+                let base = dll.split('-').next().unwrap_or(dll);
+                defs.push((path.clone(), format!("lib/{base}.lib")));
+            }
+            _ => bail!("[release.files] has `{path}`, neither bin/<dll>.dll nor lib/<dll>.def"),
+        }
+    }
+    ensure!(!defs.is_empty(), "[release.files] lists no .def file");
+    Ok(defs)
+}
+
+/// The files of `[release.files]` that `dir` does not hold with their pinned
+/// sha256, one line each, naming the file.
+pub fn unpinned_files(dir: &Path, release: &Release) -> Vec<String> {
+    release
+        .files
+        .iter()
+        .filter_map(|(path, pinned)| match fs::read(dir.join(path)) {
+            Ok(bytes) => {
+                let got = sha256(&bytes);
+                (got != *pinned).then(|| format!("{path}: sha256 {got}, pinned {pinned}"))
+            }
+            Err(_) => Some(format!("{path}: missing")),
+        })
+        .collect()
+}
+
+/// Installs the release `m` pins into `<target>/ffmpeg`, all of it taken from
+/// `[release]` (the asset, the directory it unpacks to, its files), never
+/// from `[build]`, which may already build a newer revision.
+///
+/// An installation whose `TAG` is the release's is kept only when every file
+/// of `[release.files]` in it has its pinned sha256; its import libraries
+/// are then made again from those `.def` files. Otherwise the binary asset
+/// is downloaded, refused unless its sha256 is the pinned one before
+/// anything is unpacked, unpacked, and refused unless every pinned file in
+/// it has its pinned sha256; only then are its import libraries made and its
+/// `TAG` written, and it replaces the directory. With no release pinned,
+/// nothing is done.
+pub fn install_release(target: &Path, m: &Manifest, steps: &FetchSteps<'_>) -> anyhow::Result<()> {
     let Some(release) = &m.release else {
         println!("ffmpeg: ffmpeg.toml pins no release yet; nothing to fetch");
         return Ok(());
     };
-    let target = root.join("target");
+    let defs = release_defs(release)?;
+    let make_libraries = |dir: &Path| -> anyhow::Result<()> {
+        for (def, lib) in &defs {
+            (steps.import_library)(&dir.join(def), &dir.join(lib))?;
+        }
+        Ok(())
+    };
     let dir = target.join("ffmpeg");
     if fs::read_to_string(dir.join("TAG")).is_ok_and(|t| t.trim() == release.tag) {
-        println!("ffmpeg: {} already in {}", release.tag, dir.display());
-        return Ok(());
+        let unpinned = unpinned_files(&dir, release);
+        if unpinned.is_empty() {
+            make_libraries(&dir)?;
+            println!(
+                "ffmpeg: {} already in {}, every file as pinned",
+                release.tag,
+                dir.display()
+            );
+            return Ok(());
+        }
+        println!(
+            "ffmpeg: {} in {} differs from its pins; installing it again:\n  {}",
+            release.tag,
+            dir.display(),
+            unpinned.join("\n  ")
+        );
     }
-    fs::create_dir_all(&target)?;
+    fs::create_dir_all(target)?;
     let download = target.join(&release.binary.name);
     let url = format!(
         "https://github.com/{}/releases/download/{}/{}",
         release.repository, release.tag, release.binary.name
     );
-    run_plain(
-        Command::new("curl")
-            .args(["-fsSL", "--retry", "3", "-o"])
-            .arg(&download)
-            .arg(&url),
-        "curl",
-    )?;
+    (steps.download)(&url, &download)?;
     let staging = target.join("ffmpeg.new");
     let _ = fs::remove_dir_all(&staging);
-    unpack_checked(&download, &release.binary.sha256, &staging, |zip, into| {
-        fs::create_dir_all(into)?;
-        // Windows' own tar reads zip; Linux has unzip in the setup.
-        if cfg!(windows) {
-            run_plain(
-                Command::new("tar").arg("-xf").arg(zip).arg("-C").arg(into),
-                "tar",
-            )
-        } else {
-            run_plain(
-                Command::new("unzip").arg("-q").arg(zip).arg("-d").arg(into),
-                "unzip",
-            )
-        }
-    })?;
-    let (_, binary, _) = m.names();
-    let top = staging.join(
-        binary
-            .trim_end_matches(".zip")
-            .replace("-win64-lgpl-shared", ""),
+    unpack_checked(&download, &release.binary.sha256, &staging, steps.unpack)?;
+    let top = staging.join(release_top(release)?);
+    let unpinned = unpinned_files(&top, release);
+    ensure!(
+        unpinned.is_empty(),
+        "{}: its files differ from ffmpeg.toml's [release.files]: refused, nothing installed:\n  {}",
+        release.binary.name,
+        unpinned.join("\n  ")
     );
-    for dll in &m.build.dlls {
-        let def = top.join("lib").join(format!("{dll}.def"));
-        let lib = top
-            .join("lib")
-            .join(format!("{}.lib", dll.split('-').next().unwrap_or(dll)));
-        import_library(&def, &lib)?;
-    }
+    make_libraries(&top)?;
     fs::write(top.join("TAG"), format!("{}\n", release.tag))?;
     let _ = fs::remove_dir_all(&dir);
     fs::rename(&top, &dir)?;
@@ -1174,6 +1259,33 @@ fn fetch(root: &Path) -> anyhow::Result<()> {
         release.source.sha256
     );
     Ok(())
+}
+
+fn curl_download(url: &str, to: &Path) -> anyhow::Result<()> {
+    run_plain(
+        Command::new("curl")
+            .args(["-fsSL", "--retry", "3", "-o"])
+            .arg(to)
+            .arg(url),
+        "curl",
+    )
+}
+
+/// Unpacks the zip at `zip` into `into`: Windows' own tar reads zip; Linux
+/// has unzip in the setup.
+fn unzip_asset(zip: &Path, into: &Path) -> anyhow::Result<()> {
+    fs::create_dir_all(into)?;
+    if cfg!(windows) {
+        run_plain(
+            Command::new("tar").arg("-xf").arg(zip).arg("-C").arg(into),
+            "tar",
+        )
+    } else {
+        run_plain(
+            Command::new("unzip").arg("-q").arg(zip).arg("-d").arg(into),
+            "unzip",
+        )
+    }
 }
 
 /// An import library for the DLL `def` describes: MSVC's `lib.exe` on
@@ -1207,6 +1319,8 @@ fn import_library(def: &Path, lib: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+
     use super::*;
 
     const MANIFEST: &str = r#"
@@ -1472,6 +1586,160 @@ sha256 = "z"
         assert!(e.to_string().contains("refused"), "{e}");
         assert!(!called, "nothing unpacked");
         assert!(!into.exists());
+    }
+
+    const DLL: &[u8] = b"the pinned avutil-61.dll";
+    const DEF: &[u8] = b"EXPORTS\n av_malloc\n";
+
+    /// A manifest whose release (revision 2, tag `ffmpeg-n9-2`) pins `asset`
+    /// as its binary asset and [`DLL`] and [`DEF`] as `bin/avutil-61.dll` and
+    /// `lib/avutil-61.def`, while `[build]` builds `build_revision` with
+    /// `build_dlls`.
+    fn pinning(asset: &[u8], build_revision: i64, build_dlls: &str) -> Manifest {
+        let text = MANIFEST
+            .replace("revision = 2", &format!("revision = {build_revision}"))
+            .replace(
+                r#"dlls = ["avutil-61", "avcodec-63"]"#,
+                &format!("dlls = {build_dlls}"),
+            );
+        let release = format!(
+            "[release]\nrevision = 2\nrepository = \"o/r\"\ntag = \"ffmpeg-n9-2\"\n\
+             binary = {{ name = \"tapestry-ffmpeg-n9-2-win64-lgpl-shared.zip\", sha256 = \"{}\" }}\n\
+             source = {{ name = \"tapestry-ffmpeg-n9-2-source.tar.xz\", sha256 = \"s\" }}\n\
+             [release.files]\n\"bin/avutil-61.dll\" = \"{}\"\n\"lib/avutil-61.def\" = \"{}\"\n",
+            sha256(asset),
+            sha256(DLL),
+            sha256(DEF)
+        );
+        Manifest::parse(&format!("{text}{release}")).unwrap()
+    }
+
+    /// [`install_release`] with its outside steps faked: the download writes
+    /// `asset` and counts itself, the unpack writes the release's directory
+    /// with `dll` and [`DEF`], and an import library is `lib of ` and its
+    /// `.def`.
+    struct Fake {
+        asset: Vec<u8>,
+        dll: RefCell<Vec<u8>>,
+        downloads: Cell<u32>,
+    }
+
+    impl Fake {
+        fn new() -> Self {
+            Self {
+                asset: b"the binary asset".to_vec(),
+                dll: RefCell::new(DLL.to_vec()),
+                downloads: Cell::new(0),
+            }
+        }
+
+        fn install(&self, target: &Path, m: &Manifest) -> anyhow::Result<()> {
+            let download = |_: &str, to: &Path| -> anyhow::Result<()> {
+                self.downloads.set(self.downloads.get() + 1);
+                Ok(fs::write(to, &self.asset)?)
+            };
+            let unpack = |_: &Path, into: &Path| -> anyhow::Result<()> {
+                let top = into.join("tapestry-ffmpeg-n9-2");
+                fs::create_dir_all(top.join("bin"))?;
+                fs::create_dir_all(top.join("lib"))?;
+                fs::write(top.join("bin/avutil-61.dll"), &*self.dll.borrow())?;
+                Ok(fs::write(top.join("lib/avutil-61.def"), DEF)?)
+            };
+            let import_library = |def: &Path, lib: &Path| -> anyhow::Result<()> {
+                Ok(fs::write(
+                    lib,
+                    [b"lib of ".as_slice(), &fs::read(def)?].concat(),
+                )?)
+            };
+            install_release(
+                target,
+                m,
+                &FetchSteps {
+                    download: &download,
+                    unpack: &unpack,
+                    import_library: &import_library,
+                },
+            )
+        }
+    }
+
+    /// `cargo xtask ffmpeg fetch` installs the release `[release]` pins while
+    /// `[build]` already builds a newer revision with other DLLs: the
+    /// asset's directory and the files it checks and makes import libraries
+    /// for are the release's. A pinned path outside `bin/` and `lib/` is
+    /// refused.
+    #[test]
+    fn fetch_installs_the_pinned_release_while_a_newer_revision_builds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new();
+        let m = pinning(&fake.asset, 3, r#"["avutil-62", "avcodec-64"]"#);
+        fake.install(tmp.path(), &m).unwrap();
+        let dir = tmp.path().join("ffmpeg");
+        assert_eq!(
+            fs::read_to_string(dir.join("TAG")).unwrap(),
+            "ffmpeg-n9-2\n"
+        );
+        assert_eq!(fs::read(dir.join("bin/avutil-61.dll")).unwrap(), DLL);
+        assert_eq!(
+            fs::read(dir.join("lib/avutil.lib")).unwrap(),
+            [b"lib of ".as_slice(), DEF].concat()
+        );
+        assert_eq!(fake.downloads.get(), 1);
+
+        let mut outside = pinning(&fake.asset, 2, r#"["avutil-61"]"#);
+        let files = &mut outside.release.as_mut().unwrap().files;
+        files.insert("../avutil-61.dll".to_owned(), sha256(DLL));
+        let e = fake
+            .install(&tmp.path().join("other"), &outside)
+            .unwrap_err();
+        assert!(e.to_string().contains("`../avutil-61.dll`"), "{e}");
+    }
+
+    /// `cargo xtask ffmpeg fetch` keeps an installation only while every
+    /// pinned file in it has its pinned sha256: intact, nothing is downloaded
+    /// and its import library is made again; a changed DLL or a missing
+    /// `.def` under the release's `TAG` is installed again, its import
+    /// library made from the restored `.def` rather than left stale; an
+    /// asset whose files differ from `[release.files]` is refused and
+    /// nothing is installed.
+    #[test]
+    fn fetch_installs_again_a_release_that_differs_from_its_pins() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fake = Fake::new();
+        let m = pinning(&fake.asset, 2, r#"["avutil-61"]"#);
+        let dir = tmp.path().join("ffmpeg");
+        let (dll, def, lib) = (
+            dir.join("bin/avutil-61.dll"),
+            dir.join("lib/avutil-61.def"),
+            dir.join("lib/avutil.lib"),
+        );
+        let made = [b"lib of ".as_slice(), DEF].concat();
+        fake.install(tmp.path(), &m).unwrap();
+        fs::write(&lib, "stale").unwrap();
+        fake.install(tmp.path(), &m).unwrap();
+        assert_eq!(fake.downloads.get(), 1, "an intact installation is kept");
+        assert_eq!(fs::read(&lib).unwrap(), made);
+
+        fs::write(&dll, "changed").unwrap();
+        fake.install(tmp.path(), &m).unwrap();
+        assert_eq!(fake.downloads.get(), 2, "a changed DLL is installed again");
+        assert_eq!(fs::read(&dll).unwrap(), DLL);
+
+        fs::write(&lib, "stale").unwrap();
+        fs::remove_file(&def).unwrap();
+        fake.install(tmp.path(), &m).unwrap();
+        assert_eq!(fake.downloads.get(), 3, "a missing .def is installed again");
+        assert_eq!(fs::read(&def).unwrap(), DEF);
+        assert_eq!(fs::read(&lib).unwrap(), made);
+
+        *fake.dll.borrow_mut() = b"another build's DLL".to_vec();
+        fs::write(&dll, "changed").unwrap();
+        let e = fake.install(tmp.path(), &m).unwrap_err().to_string();
+        assert!(
+            e.contains("refused") && e.contains("bin/avutil-61.dll"),
+            "{e}"
+        );
+        assert_eq!(fs::read(&dll).unwrap(), b"changed", "nothing installed");
     }
 
     /// The build step's comparison: the manifest's own hashes pass; one DLL's
