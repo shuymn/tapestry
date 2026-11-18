@@ -3699,9 +3699,9 @@ fn an_end_page_acknowledges_only_an_entry_without_a_lifetime() {
 
 /// V5's render half (design.md "State Model", system sounds, Result): a
 /// frame acknowledges the entry it draws a picture of, not one entered
-/// while it draws, the skin's view's and a page's alike; and it writes the
-/// acknowledgement once per entry, a later counted frame of the same entry
-/// writing nothing.
+/// while it draws, the skin's view and a built-in one alike, frames
+/// stepped one at a time; and it writes the acknowledgement once per
+/// entry, a later counted frame of the same entry writing nothing.
 #[test]
 fn a_frame_acknowledges_the_entry_it_draws() {
     let (_dir, skin) = fixed_skin();
@@ -3713,48 +3713,74 @@ fn a_frame_acknowledges_the_entry_it_draws() {
         *rig.faults.during_submit.lock().unwrap() = Some(Box::new(move || {
             next.store(shared.result_entries.enter(None), Ordering::Release);
         }));
+        let lifetime = installed(&rig, &skin);
         let first = rig.link.enter_result_entry(None);
         let entries = &rig.link.shared.result_entries;
-        if skinned {
-            let lifetime = installed(&rig, &skin);
-            show(
-                &rig.link,
-                lifetime,
-                1,
-                &payload(1, Some(&skin), 1_111, &[]),
-                &Overlay::default(),
-            );
-        } else {
-            rig.link.show_end(EndPage {
-                lines: vec!["page".to_owned()],
-                graphs: None,
-                #[cfg(feature = "dev-tools")]
-                id: None,
-            });
-        }
-        assert!(wait_until(|| rig.link.result_acknowledged() != 0));
-        let second = entered.load(Ordering::Acquire);
-        assert_eq!(
-            second,
-            first + 1,
-            "skinned {skinned}: entered while drawing"
+        // Frames go one at a time: each step draws one.
+        paced(&rig);
+        let view = payload(1, skinned.then_some(&skin), 1_111, &[]);
+        show(&rig.link, lifetime, 1, &view, &Overlay::default());
+        let case = format!("skinned {skinned}");
+        assert!(
+            wait_until(|| rig.gate.held.load(Ordering::Acquire)),
+            "{case}"
         );
+        rig.gate.step();
+        assert_eq!(rig.drawn().len(), 1, "{case}: {:?}", rig.drawn());
+        let second = entered.load(Ordering::Acquire);
+        assert_eq!(second, first + 1, "{case}: entered while drawing");
         assert_eq!(
             rig.link.result_acknowledged(),
             first,
-            "skinned {skinned}: the entry drawn"
+            "{case}: the entry drawn"
         );
-        // Later counted frames of the next entry's number: one write.
-        assert!(wait_until(|| rig.link.result_acknowledged() == second));
-        let drawn = rig.drawn().len();
-        assert!(wait_until(|| rig.drawn().len() >= drawn + 3));
+        // The next frame draws a picture of the next entry's number, and
+        // later ones write nothing more.
+        rig.gate.step();
+        assert_eq!(
+            rig.link.result_acknowledged(),
+            second,
+            "{case}: the next frame"
+        );
+        for _ in 0..3 {
+            rig.gate.step();
+        }
+        assert_eq!(rig.drawn().len(), 5, "{case}: {:?}", rig.drawn());
         assert_eq!(
             entries.publications.load(Ordering::Relaxed),
             2,
-            "skinned {skinned}: one write per entry"
+            "{case}: one write per entry"
         );
+        rig.gate.release();
         rig.link.exit();
     }
+}
+
+/// V5's render half (design.md "State Model", system sounds, Result): the
+/// render thread prints what the result shows once it has let the result's
+/// status go, so a game thread reading the status is not held behind a
+/// stalled print.
+#[test]
+fn the_result_shown_print_lets_the_status_go() {
+    use crate::render_side::{SHOWN_PRINT_HELD, SHOWN_PRINT_HOLD};
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    SHOWN_PRINT_HELD.store(false, Ordering::Release);
+    SHOWN_PRINT_HOLD.store(true, Ordering::Release);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    let held = wait_until(|| SHOWN_PRINT_HELD.load(Ordering::Acquire));
+    let free = rig.link.shared.result_status.try_lock().is_ok();
+    SHOWN_PRINT_HOLD.store(false, Ordering::Release);
+    assert!(held, "the print was reached");
+    assert!(free, "the status was let go before the print");
+    rig.link.exit();
 }
 
 /// V5's render half (design.md "State Model", system sounds, Result): the

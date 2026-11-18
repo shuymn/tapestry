@@ -2066,15 +2066,17 @@ impl Rig for PlayerRig<'_> {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             thread::park_timeout(Duration::from_micros(left.unsigned_abs()));
         }
+        // Each park is followed first by a read of the acknowledgement,
+        // before anything that may wait on the render thread (the result's
+        // status, which a layout's landing reads), so the render thread's
+        // wake starts the sound at once.
+        self.start_result_sound();
         // A switch's layout lands when its job is done: the job wakes this
         // thread once its outcome is in, and while its thread still ends
         // the look is repeated every LAYOUT_RELOOK, within the deadline. A
         // close leaves the looks at once, and the wait within the stop
-        // bound. Each park is followed by a read of the acknowledgement,
-        // as the first's is here, so a wake the render thread gave during
-        // the looks starts the sound at once.
+        // bound.
         while !self.land_result() && self.result_skin.landing() && !self.controls.quitting() {
-            self.start_result_sound();
             // Tests: a look found the outcome received, not yet taken.
             #[cfg(test)]
             self.relooked
@@ -2084,6 +2086,7 @@ impl Rig for PlayerRig<'_> {
                 break;
             }
             thread::park_timeout(Duration::from_micros(left.unsigned_abs()).min(LAYOUT_RELOOK));
+            self.start_result_sound();
         }
         if self.controls.quitting() && self.result_skin.has_job() {
             self.result_skin.settle(|| true);
@@ -3844,6 +3847,52 @@ mod tests {
                     })
                 });
             assert!(started, "started while the layout's thread was held");
+        }
+
+        /// V5 (design.md "State Model", system sounds, Result): after its
+        /// park the idle wait reads the acknowledgement first, before the
+        /// result's status, which the render thread may hold: an
+        /// acknowledgement given while the status is held starts the
+        /// result's sound at once.
+        #[test]
+        fn an_acknowledgement_is_read_before_the_results_status() {
+            use std::sync::atomic::Ordering;
+            let _serial = imports::serial();
+            let loaded = loaded("#PLAYLEVEL 12\n", "tapestry");
+            let (started, _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    let number = rig.render.enter_result_entry(rig.controls.game_thread());
+                    rig.result_entry = Some(ResultEntry {
+                        number,
+                        cleared: true,
+                        due: true,
+                    });
+                    let parked = Arc::clone(&rig.park_probe);
+                    parked.store(false, Ordering::SeqCst);
+                    let started = Arc::clone(&rig.result_started);
+                    let acknowledge = rig.render.result_acknowledger();
+                    let hold = rig.render.result_status_hold();
+                    let far = bms_model::TimeUs(rig.now().0 + 20_000_000);
+                    std::thread::scope(|s| {
+                        let render = s.spawn(|| {
+                            until(|| parked.load(Ordering::SeqCst));
+                            let mut at_once = false;
+                            hold(&mut || {
+                                acknowledge(number);
+                                // Within 5 s, the status still held.
+                                let end = Instant::now() + Duration::from_secs(5);
+                                while !started.load(Ordering::SeqCst) && Instant::now() < end {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                at_once = started.load(Ordering::SeqCst);
+                            });
+                            at_once
+                        });
+                        rig.idle_wait(far);
+                        render.join().unwrap()
+                    })
+                });
+            assert!(started, "started while the result's status was held");
         }
 
         /// A close while the idle wait looks again for a received layout

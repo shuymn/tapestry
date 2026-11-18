@@ -2746,6 +2746,17 @@ impl RenderLink {
         move |entry| shared.result_entries.acknowledge(entry)
     }
 
+    /// Runs `f` holding the result's status, as the render thread holds it
+    /// while it publishes, from any thread (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn result_status_hold(&self) -> impl Fn(&mut dyn FnMut()) + Send + Sync + use<> {
+        let shared = Arc::clone(&self.shared);
+        move |f| {
+            let _held = shared.result_status();
+            f();
+        }
+    }
+
     /// The last Result entry whose first result picture a frame
     /// acknowledged, 0 before any.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
@@ -10040,9 +10051,11 @@ impl Run {
             return;
         }
         // What is shown, once it changes (dev-tools: tests of the real
-        // flow read it).
+        // flow read it), printed once the status is let go: the game
+        // thread's waits read it (design.md "State Model", system sounds,
+        // Result).
         #[cfg(feature = "dev-tools")]
-        if status.shown != shown
+        let announce = if status.shown != shown
             && let Some((_, skin)) = shown
         {
             let why = self.result_disabled.as_deref().or_else(|| {
@@ -10057,12 +10070,10 @@ impl Run {
                             .or_else(|| refused.map(|(_, w)| w.as_str()))
                     })
             });
-            match (skin, why) {
-                (true, _) => println!("dev: result shown: skin"),
-                (false, Some(why)) => println!("dev: result shown: built-in: {why}"),
-                (false, None) => println!("dev: result shown: built-in"),
-            }
-        }
+            Some((skin, why))
+        } else {
+            None
+        };
         status.installed = installed;
         status.disabled.clone_from(&self.result_disabled);
         status.lifetime = lifetime;
@@ -10071,6 +10082,18 @@ impl Run {
         status.pinned = pinned;
         status.refused = refused.cloned();
         status.retained = ids().into_iter().flatten().collect();
+        drop(status);
+        #[cfg(feature = "dev-tools")]
+        if let Some((skin, why)) = announce {
+            // A test holds the print here, the status let go (tests).
+            #[cfg(test)]
+            shown_print_gate();
+            match (skin, why) {
+                (true, _) => println!("dev: result shown: skin"),
+                (false, Some(why)) => println!("dev: result shown: built-in: {why}"),
+                (false, None) => println!("dev: result shown: built-in"),
+            }
+        }
     }
 
     /// Selects the result kind's pages-only installation of `pages` for
@@ -10220,6 +10243,21 @@ impl ResultEntries {
         if let Some(game) = &*self.wake.lock().unwrap_or_else(PoisonError::into_inner) {
             game.unpark();
         }
+    }
+}
+
+/// A test holds the render thread's "result shown" print while set, and
+/// the print says it reached the hold (tests).
+#[cfg(all(test, feature = "dev-tools"))]
+static SHOWN_PRINT_HOLD: AtomicBool = AtomicBool::new(false);
+#[cfg(all(test, feature = "dev-tools"))]
+static SHOWN_PRINT_HELD: AtomicBool = AtomicBool::new(false);
+
+#[cfg(all(test, feature = "dev-tools"))]
+fn shown_print_gate() {
+    while SHOWN_PRINT_HOLD.load(Ordering::Acquire) {
+        SHOWN_PRINT_HELD.store(true, Ordering::Release);
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
