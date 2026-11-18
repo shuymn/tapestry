@@ -140,8 +140,8 @@ const _: () = assert!(crate::atlas::ATLAS_SIZE == 128);
 
 const SPRITE_WGSL: &str = r"
 // An `Instance`: its pivot and angle share location 3, and its flags hold
-// the layer (low 15 bits), the pool bit (bit 15) and the nearest and base
-// filter bits.
+// the layer (low 15 bits), the pool bit (bit 15), the nearest and base
+// filter bits (16, 17), the BGA bit (18) and the key bit (19).
 struct Inst {
     @location(0) rect: vec4f,
     @location(1) uv: vec4f,

@@ -47,6 +47,8 @@ pub const FLAG_BGA: u32 = 1 << 18;
 pub const FLAG_KEY: u32 = 1 << 19;
 
 const _: () = assert!(FLAG_POOL == skin_model::chart_image::POOL_LAYER as u32);
+// A BGA quad's layer is its page, which never reaches the pool bit.
+const _: () = assert!(skin_model::bga::PAGE_BUDGET < FLAG_POOL);
 
 /// One sprite as the GPU reads it: 64 bytes, its fields converted one by
 /// one from a [`Sprite`] ([`Instance::of`]).
@@ -63,8 +65,9 @@ pub struct Instance {
     pub pivot: [f32; 2],
     /// The clockwise rotation about `pivot`, in radians.
     pub angle: f32,
-    /// The layer (low 15 bits) with [`FLAG_POOL`] for a pool quad, and
-    /// [`FLAG_NEAREST`] or [`FLAG_BASE`].
+    /// The layer (low 15 bits) with [`FLAG_POOL`] for a pool quad,
+    /// [`FLAG_NEAREST`] or [`FLAG_BASE`], and [`FLAG_BGA`] with
+    /// [`FLAG_KEY`] for a BGA quad.
     pub flags: u32,
 }
 
