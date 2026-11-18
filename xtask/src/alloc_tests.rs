@@ -2,12 +2,16 @@
 //! release step of CI (design.md "Scope of No Allocation").
 //!
 //! An allocation guard is a workspace package's integration test named
-//! `alloc` or `*_alloc` (`tests/alloc.rs`, `tests/rearm_alloc.rs`). Tests
-//! that bound allocation sizes or order rather than count take other names
-//! (`alloc_order`, `memory`, `reserve`). Each guard must appear in the
-//! release command of a step in [`WORKFLOW`]: a `cargo test --release`
-//! whose `-p` list names the guard's package and whose `--test` list names
-//! the guard. The portable guards go in [`ALLOC_STEP`]; a Windows-only
+//! `alloc` or `*_alloc` (`tests/alloc.rs`, `tests/rearm_alloc.rs`). The
+//! check finds guards by name alone: a test that bounds an in-play
+//! allocation count under another name is not seen, so such a test takes
+//! the name. Tests that bound allocation sizes or order rather than count
+//! take other names (`alloc_order`, `memory`, `reserve`), and so do a count
+//! that needs a device (audio's `wasapi`, ignored) and one a wider sweep
+//! repeats beside the guards that hold the bound (game's `app`). Each guard
+//! must appear in the release command of a step in [`WORKFLOW`]: a
+//! `cargo test --release` whose `-p` list names the guard's package and
+//! whose `--test` list names the guard. The portable guards go in [`ALLOC_STEP`]; a Windows-only
 //! crate's guard may have a step of its own on a Windows job (render's).
 //!
 //! The player's counting allocator exists only in its development builds,

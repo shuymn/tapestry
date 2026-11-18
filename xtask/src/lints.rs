@@ -421,6 +421,10 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/player/src/dev/loop_probe.rs"),
     Site::File("crates/render/src/probe.rs"),
     // The render thread's frame.
+    // The selection's chart-image pool: a frame builds the cursor's table
+    // from a slot's record, and the boundary's write runs beside the
+    // frames.
+    Site::File("crates/render/src/chart_pool.rs"),
     // The decision label slots: a frame borrows a slot's content, and the
     // boundary's writes and settling run beside the frames.
     Site::File("crates/render/src/decision_labels.rs"),
@@ -498,11 +502,14 @@ pub const IN_PLAY: &[Site] = &[
     Site::File("crates/skin-model/src/widget/timing_graph.rs"),
     Site::File("crates/skin-model/src/widget/timing_vis.rs"),
     // A chart image's table and stretch, read by every frame that draws
-    // one (S10-12); the read path in the same file is preparation work.
+    // one (S10-12), and the table each selection frame builds from its
+    // pool slot; the read path in the same file is preparation work.
     Site::Fns(
         "crates/skin-model/src/chart_image.rs",
         &[
             "ChartImage::index",
+            "ChartTable::new",
+            "ChartTable::keyed",
             "ChartTable::get",
             "ChartTable::present",
             "ChartTable::drawable",
@@ -576,7 +583,8 @@ pub const IN_PLAY: &[Site] = &[
             "MenuScreen::target",
             "MenuScreen::minimized",
             "MenuScreen::chart_key",
-            "MenuScreen::selection_chart_key",
+            "MenuScreen::pool",
+            "MenuScreen::pool_table",
             "MenuScreen::build_selection_frame",
             "MenuScreen::build_page_frame",
             "MenuScreen::build_decision",

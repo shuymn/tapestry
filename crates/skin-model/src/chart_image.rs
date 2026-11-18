@@ -1,7 +1,9 @@
 //! A chart's own images: the stage file, back image and banner a chart's
 //! header names (system images 100, 101 and 102 of beatoraja skins), read
 //! from the chart's folder and fitted into a slot of an atlas layer
-//! (docs/stage3.md S10-12). S15 reads BGA images through the same path, with its own
+//! (docs/stage3.md S10-12), or, on selection, into a cell of the
+//! chart-image pool ([`ChartCells`], [`POOL_LAYER`]; docs/stage3.md
+//! S10-35). S15 reads BGA images through the same path, with its own
 //! extension fallbacks and slots.
 //!
 //! - **Confinement** (design.md "Threat Model", T08: a chart's files are
@@ -225,9 +227,10 @@ pub enum Absent {
     Failed,
 }
 
-/// A slot of an atlas layer an image is fitted into, its gutters
-/// included: each side a multiple of [`ALIGN`], at least
-/// `2 × GUTTER + ALIGN` and at most [`MAX_PAGE_SIDE`].
+/// A slot of an atlas layer, or a cell of the chart-image pool
+/// ([`Slot::cell`]), an image is fitted into, its gutters included: each
+/// side a multiple of [`ALIGN`], at least `2 × GUTTER + ALIGN` and at most
+/// [`MAX_PAGE_SIDE`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Slot {
     size: [u32; 2],
@@ -256,8 +259,30 @@ impl Slot {
         self.size.map(|s| s - 2 * GUTTER)
     }
 
+    /// The pool cell of a draw reaching `reach` texels, capped at `cap`
+    /// (design.md "Rendering and Skins", chart images): on each axis the
+    /// reach padded as a fit is ([`ALIGN`], then a [`GUTTER`] each side),
+    /// aligned up to [`CELL_ALIGN`] so every mip level's origin in a pool
+    /// layer is whole, and at most `cap`'s side, which may be a multiple
+    /// of [`ALIGN`] only. A reach of 0 still gets a [`CELL_ALIGN`] cell.
+    /// A content of `reach` fits it unless `cap` cuts it.
+    #[must_use]
+    pub fn cell(reach: [u32; 2], cap: Self) -> Self {
+        let side = |r: u32, c: u32| {
+            r.checked_next_multiple_of(ALIGN)
+                .and_then(|r| r.checked_add(2 * GUTTER))
+                .and_then(|r| r.checked_next_multiple_of(CELL_ALIGN))
+                .map_or(c, |r| r.min(c))
+        };
+        let [rw, rh] = reach;
+        let [cw, ch] = cap.size;
+        // Each side is `cap`'s (valid) or a multiple of 64 below it, so
+        // valid too; the fallback is never taken.
+        Self::new([side(rw, cw), side(rh, ch)]).unwrap_or(cap)
+    }
+
     /// Whether `fitted`'s allocation, padding and gutters included, fits
-    /// it: what [`ChartUv::of`] places, and what a read kept for another
+    /// it: what [`ChartUv::at`] places, and what a read kept for another
     /// slot must pass to be reused for this one.
     #[must_use]
     pub fn holds(self, fitted: &Fitted) -> bool {
@@ -274,6 +299,82 @@ impl Slot {
         self.holds(fitted)
             && fitted.levels.len() == MIP_LEVELS
             && fitted_size(fitted.native, self.max_content()) == fitted.content
+    }
+}
+
+/// What a pool cell's sides are aligned up to ([`Slot::cell`]): with
+/// [`MIP_LEVELS`] levels, a cell's origin stays whole at every level.
+pub const CELL_ALIGN: u32 = 64;
+
+/// The bit a pool [`ChartUv`]'s layer carries, OR'd onto its layer in the
+/// pool's array: the renderer samples the selection's chart-image pool,
+/// not the atlas, for a quad whose layer has it. No atlas layer reaches
+/// it.
+pub const POOL_LAYER: u16 = 1 << 15;
+
+/// The pool cells a selection skin's chart images need
+/// ([`Skin::chart_cells`](crate::Skin::chart_cells)): one for the stage
+/// file and one for the banner, each `None` when no element draws that
+/// image, and whether some element stretches each to its destination
+/// ([`ChartStretch::Fill`]), whose fit then fills its cell on each axis
+/// ([`derive_filling`]). A pool slot is the stage cell above the banner
+/// cell.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ChartCells {
+    pub stage: Option<Slot>,
+    pub banner: Option<Slot>,
+    /// Whether some element draws the stage file with
+    /// [`ChartStretch::Fill`].
+    pub stage_fills: bool,
+    /// Whether some element draws the banner with [`ChartStretch::Fill`].
+    pub banner_fills: bool,
+}
+
+impl ChartCells {
+    /// No cell: a skin that draws no chart image.
+    pub const NONE: Self = Self {
+        stage: None,
+        banner: None,
+        stage_fills: false,
+        banner_fills: false,
+    };
+
+    /// `which`'s cell, and whether its fit fills it on each axis
+    /// ([`derive_filling`]); `None` for an image with no cell, the back
+    /// image included.
+    #[must_use]
+    pub fn of(self, which: ChartImage) -> Option<(Slot, bool)> {
+        match which {
+            ChartImage::Stage => self.stage.map(|c| (c, self.stage_fills)),
+            ChartImage::Banner => self.banner.map(|c| (c, self.banner_fills)),
+            ChartImage::Back => None,
+        }
+    }
+
+    /// These cells, `which`'s grown on each axis to hold `cell` too, and
+    /// filled when `fills` is; the back image has none.
+    pub(crate) fn holding(self, which: ChartImage, cell: Slot, fills: bool) -> Self {
+        let grown = |kept: Option<Slot>| {
+            Some(kept.map_or(cell, |k| {
+                let [kw, kh] = k.size;
+                let [cw, ch] = cell.size;
+                // Each side is one of two valid sides, so valid.
+                Slot::new([kw.max(cw), kh.max(ch)]).unwrap_or(cell)
+            }))
+        };
+        match which {
+            ChartImage::Stage => Self {
+                stage: grown(self.stage),
+                stage_fills: self.stage_fills || fills,
+                ..self
+            },
+            ChartImage::Banner => Self {
+                banner: grown(self.banner),
+                banner_fills: self.banner_fills || fills,
+                ..self
+            },
+            ChartImage::Back => self,
+        }
     }
 }
 
@@ -488,8 +589,41 @@ pub fn read_source(
 /// [`Absent::Cancelled`] once `cancel` answers; [`Absent::Decode`] for a
 /// source with no level 0 or one that cannot be allocated.
 pub fn derive(source: &Fitted, slot: Slot, cancel: &dyn Fn() -> bool) -> Result<Fitted, Absent> {
+    derive_to(
+        source,
+        fitted_size(source.native, slot.max_content()),
+        cancel,
+    )
+}
+
+/// The fit of `source` (a [`read_source`]'s image) filling `slot`'s
+/// content on each axis, its aspect not kept: on each axis the slot's
+/// largest content, at most the source's, an area downscale. For a pool
+/// cell of an image some element stretches to its destination
+/// ([`ChartStretch::Fill`]; design.md "Rendering and Skins", chart
+/// images): that draw stretches the whole content to the destination
+/// whatever its aspect, so a fit keeping the aspect of a picture whose
+/// aspect differs from its cell's would keep less than the cell on one
+/// axis and draw upscaled there. The native size is kept for placement,
+/// as [`derive`] keeps it, so only the resolution kept differs. Errors and
+/// checkpoints as [`derive`]'s.
+///
+/// # Errors
+///
+/// As [`derive`].
+pub fn derive_filling(
+    source: &Fitted,
+    slot: Slot,
+    cancel: &dyn Fn() -> bool,
+) -> Result<Fitted, Absent> {
+    derive_to(source, slot.max_content(), cancel)
+}
+
+/// The fit of `source` whose content is `want` on each axis, at most the
+/// source's ([`derive`], [`derive_filling`]).
+fn derive_to(source: &Fitted, want: [u32; 2], cancel: &dyn Fn() -> bool) -> Result<Fitted, Absent> {
     checkpoint(cancel, Site::Fitted)?;
-    let [cw, ch] = fitted_size(source.native, slot.max_content());
+    let [cw, ch] = want;
     let [mw, mh] = source.content;
     let content = [cw.min(mw), ch.min(mh)];
     // The source's content texels, [`GUTTER`] in on each axis.
@@ -897,13 +1031,31 @@ pub struct ChartUv {
 
 impl ChartUv {
     /// The uv of `fitted` written in `which`'s slot of layer `layer`, a
-    /// chart layer of side `side`: level 0 at the slot's origin, its
-    /// content [`GUTTER`] texels in. `None` for a side with no such slot,
-    /// or content that does not fit it.
+    /// chart layer of side `side`: [`at`](Self::at) the slot's origin.
+    /// `None` for a side with no such slot, or content that does not fit
+    /// it.
     #[must_use]
     pub fn of(fitted: &Fitted, which: ChartImage, side: u32, layer: u16) -> Option<Self> {
-        let ([ox, oy], slot) = which.slot(side)?;
-        if !slot.holds(fitted) {
+        let (origin, slot) = which.slot(side)?;
+        Self::at(fitted, origin, slot, side, layer)
+    }
+
+    /// The uv of `fitted` written in `cell` at `origin` of layer `layer`,
+    /// a layer of side `side` (a chart layer's slot, or a pool cell with
+    /// [`POOL_LAYER`] in `layer`): level 0 at the origin, its content
+    /// [`GUTTER`] texels in. `None` for a cell that does not lie inside
+    /// the layer, or content that does not fit it.
+    #[must_use]
+    pub fn at(
+        fitted: &Fitted,
+        [ox, oy]: [u32; 2],
+        cell: Slot,
+        side: u32,
+        layer: u16,
+    ) -> Option<Self> {
+        let [sw, sh] = cell.size;
+        let inside = |o: u32, s: u32| o.checked_add(s).is_some_and(|end| end <= side);
+        if !inside(ox, sw) || !inside(oy, sh) || !cell.holds(fitted) {
             return None;
         }
         let [cw, ch] = fitted.content;
@@ -1029,6 +1181,15 @@ pub enum ChartStretch {
 }
 
 impl ChartStretch {
+    /// Whether its draw stays inside the destination, whatever the
+    /// image's native size: [`Fill`](Self::Fill), [`Inner`](Self::Inner)
+    /// and [`NoExpanding`](Self::NoExpanding). The others can draw past
+    /// it, by how much depending on the native size.
+    #[must_use]
+    pub const fn bounded(self) -> bool {
+        matches!(self, Self::Fill | Self::Inner | Self::NoExpanding)
+    }
+
     /// The destination `[x, y, w, h]` (author pixels) of an image of
     /// `native` texels, and the native size the quad keeps at placement
     /// for [`NoExpanding`](Self::NoExpanding) and

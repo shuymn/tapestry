@@ -494,7 +494,7 @@ impl log::Log for Capture {
 }
 
 /// The lines naming `what` that `f` logs, on any thread.
-fn logged(what: &str, f: impl FnOnce()) -> Vec<String> {
+pub(crate) fn logged(what: &str, f: impl FnOnce()) -> Vec<String> {
     static INSTALLED: std::sync::Once = std::sync::Once::new();
     INSTALLED.call_once(|| {
         log::set_logger(&CAPTURE).expect("no other logger in the tests");

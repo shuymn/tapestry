@@ -43,8 +43,6 @@ mod outline_support;
 #[cfg(test)]
 mod result_tests;
 #[cfg(test)]
-mod selection_chart_tests;
-#[cfg(test)]
 #[path = "../tests/common/mod.rs"]
 mod test_common;
 #[cfg(test)]
@@ -53,6 +51,7 @@ mod test_decl;
 
 mod atlas;
 mod bga;
+mod chart_pool;
 mod decision_labels;
 mod decl;
 mod gpu;
@@ -76,6 +75,7 @@ mod text_upload;
 
 pub use atlas::{ATLAS_SIZE, GLYPH_H, GLYPH_W, glyph_rows, solid_uv};
 pub use bga::{BGA_WRITE_BUDGET, BgaFault, BgaStep, UPLOAD_TIME_SLICE};
+pub use chart_pool::{POOL_MAX_SLOTS, POOL_MAX_TEXELS, PoolLayout, PoolWriteError};
 pub use decision_labels::{
     CoolFrom, DECISION_TEXT_WRITE_BUDGET, DecisionMemory, FillProgress, FillStep, Gen, LABEL_SLOTS,
     LabelBook, LabelContent, LabelJob, LabelKey, LabelOutput, LabelRow, LabelScratch, LabelState,
@@ -109,7 +109,8 @@ pub use simple::{
 pub use skin::{AttemptInput, FrameInput, LoadingFrame, PlaySkin, SkinError, cover_settings};
 pub use skin_atlas::{AtlasPages, PageLevels, RESERVED_LAYERS, UploadError, atlas_limits};
 pub use sprite::{
-    Blend, FLAG_BASE, FLAG_BGA, FLAG_KEY, FLAG_NEAREST, Instance, Run, Sprite, SpriteBatch,
+    Blend, FLAG_BASE, FLAG_BGA, FLAG_KEY, FLAG_NEAREST, FLAG_POOL, Instance, Run, Sprite,
+    SpriteBatch,
 };
 pub use staging::{Scissor, Staging};
 pub use text_cache::{MAX_ALIASES, MAX_ROUNDS, MAX_TEXT_ENTRIES, TextCounts};

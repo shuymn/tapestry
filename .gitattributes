@@ -22,3 +22,6 @@ banned-words.txt text eol=lf -diff linguist-documentation
 *.wav binary
 *.ogg binary
 *.flac binary
+*.mov binary
+*.mkv binary
+*.mp4 binary

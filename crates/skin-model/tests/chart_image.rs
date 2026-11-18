@@ -349,6 +349,47 @@ fn slots_take_gutters_aligned_sides_only() {
     assert_eq!(slot(1_024).max_content(), [1_008, 1_008]);
 }
 
+/// A pool cell is a reach padded as a fit is (aligned to 8, a gutter on
+/// each side), aligned up to 64 and capped at its slot (AC-S12): content
+/// of `64k - 16` texels fits a `64k` side, one more texel takes the next
+/// step; a reach of 0 gets one step; a capped side is the slot's, which
+/// may be a multiple of 8 only; every cell is a slot holding its reach
+/// unless capped.
+#[test]
+fn a_cell_holds_its_reach_aligned_and_capped() {
+    use skin_model::chart_image::CELL_ALIGN;
+    let cap = Slot::new([1_024, 544]).unwrap();
+    assert_eq!(CELL_ALIGN, 64);
+    assert_eq!(Slot::cell([0, 0], cap).size(), [64, 64]);
+    assert_eq!(2 * GUTTER, 16);
+    for k in 1..=8 {
+        let fits = 64 * k - 2 * GUTTER;
+        assert_eq!(Slot::cell([fits, 1], cap).size(), [64 * k, 64], "{k}");
+        assert_eq!(
+            Slot::cell([fits + 1, 1], cap).size(),
+            [64 * (k + 1), 64],
+            "{k}"
+        );
+    }
+    // The 8 alignment comes first: 41 pads to 48, then 64.
+    assert_eq!(Slot::cell([41, 49], cap).size(), [64, 128]);
+    // Capped: the slot's side, past a 64 step or not.
+    assert_eq!(Slot::cell([1_009, 529], cap).size(), [1_024, 544]);
+    assert_eq!(Slot::cell([u32::MAX, u32::MAX], cap).size(), [1_024, 544]);
+    for r in (0..1_100).step_by(7) {
+        let c = Slot::cell([r, r], cap);
+        assert_eq!(Slot::new(c.size()), Some(c), "{r}");
+        for (i, (side, max)) in c.size().into_iter().zip(cap.size()).enumerate() {
+            assert!(side == max || side % 64 == 0, "{r} {i}");
+            assert!(side == max || c.max_content()[i] >= r, "{r} {i}");
+            assert!(
+                side == max || side - 64 < r.next_multiple_of(8) + 2 * GUTTER,
+                "the least step: {r} {i}"
+            );
+        }
+    }
+}
+
 /// A picture that fills its slot less the gutters is written at its own
 /// size, and its allocation, gutters included, is the whole slot: level 0
 /// is uploaded at the slot's origin, its content `GUTTER` texels in.
@@ -706,6 +747,43 @@ fn a_source_derives_each_slots_fit() {
     assert!(!slot(2_048).derives_as(&small), "a larger slot gets more");
     assert_eq!(
         derive(&source, slot(1_152), &|| true),
+        Err(Absent::Cancelled)
+    );
+}
+
+/// A fit filling its cell (a pool cell of an image a `Fill` element
+/// draws) downscales the source to the cell's content on each axis, its
+/// aspect not kept, never past the source's: a 16:9 1 920×1 080 picture
+/// in a 448×320 cell keeps 432×304 where an aspect-kept fit keeps
+/// 432×243, its halves still split at the middle; a 320×180 one keeps
+/// its own size. Both keep the native size, and every level.
+#[test]
+fn a_filling_fit_covers_its_cell_on_each_axis() {
+    use skin_model::chart_image::{derive, derive_filling, read_source};
+    let (red, blue) = ([200, 0, 0, 255], [0, 0, 200, 255]);
+    let halves =
+        |w: u32, h: u32| RgbaImage::from_fn(w, h, |x, _| Rgba(if x < w / 2 { red } else { blue }));
+    let d = dir();
+    save(d.path(), "s.png", &halves(1_920, 1_080));
+    save(d.path(), "t.png", &halves(320, 180));
+    let root = ChartDir::new(d.path()).unwrap();
+    let cell = Slot::new([448, 320]).unwrap();
+    let source = fitted(read_source(&root, "s.png", &[], &never, &fixed));
+    let filled = derive_filling(&source, cell, &never).unwrap();
+    assert_eq!(filled.content(), [432, 304]);
+    assert_eq!(filled.native(), [1_920, 1_080]);
+    assert_eq!(filled.levels().len(), MIP_LEVELS);
+    assert!(cell.holds(&filled));
+    assert_eq!(texel(&filled, 0, GUTTER, GUTTER + 303), red);
+    assert_eq!(texel(&filled, 0, GUTTER + 215, GUTTER), red);
+    assert_eq!(texel(&filled, 0, GUTTER + 216, GUTTER), blue);
+    assert_eq!(texel(&filled, 0, GUTTER + 431, GUTTER + 303), blue);
+    assert_eq!(derive(&source, cell, &never).unwrap().content(), [432, 243]);
+    let small = fitted(read_source(&root, "t.png", &[], &never, &fixed));
+    let kept = derive_filling(&small, cell, &never).unwrap();
+    assert_eq!(kept.content(), [320, 180], "never upscaled");
+    assert_eq!(
+        derive_filling(&source, cell, &|| true),
         Err(Absent::Cancelled)
     );
 }

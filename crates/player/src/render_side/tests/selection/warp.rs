@@ -158,15 +158,26 @@ impl Screen for Lossy {
     ) -> Result<skin_model::chart_image::ChartTable, render::RenderError> {
         self.menu.publish_chart_absent(target)
     }
-    fn write_selection_chart(
-        &mut self,
-        images: [Option<&skin_model::chart_image::Fitted>; 3],
-        set: u64,
-    ) -> Result<skin_model::chart_image::ChartTable, render::RenderError> {
-        self.menu.write_selection_chart(images, set)
+    fn pool(&self) -> Option<render::PoolLayout> {
+        self.menu.pool()
     }
-    fn selection_chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
-        self.menu.selection_chart_key()
+    fn pool_table(
+        &self,
+        generation: u64,
+        slot: u16,
+    ) -> Option<skin_model::chart_image::ChartTable> {
+        self.menu.pool_table(generation, slot)
+    }
+    fn write_pool_slot(
+        &mut self,
+        generation: u64,
+        slot: u16,
+        fits: [Option<&skin_model::chart_image::Fitted>; 2],
+    ) -> Result<(), render::PoolWriteError> {
+        self.menu.write_pool_slot(generation, slot, fits)
+    }
+    fn regrow_pool(&mut self) {
+        self.menu.regrow_pool();
     }
     fn wait(&self) -> bool {
         let gate = &self.gate;

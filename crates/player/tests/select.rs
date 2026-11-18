@@ -1271,19 +1271,22 @@ fn the_select_screen_is_drawn_after_a_results_quit_key() {
     }
 }
 
-/// An adjustment while a load's phase stalls is published before the load
-/// ends (design.md "Play Adjustments": the game thread serves the
-/// adjustments through every wait of a load): F2, on the window in this
-/// autoplay session, pressed while `phase` holds, steps hi-speed from 4.00
-/// to 4.50 (120 BPM, target 300), before that phase is over when the
-/// threads keep up, and READY starts after it.
+/// An adjustment pressed while a load's phase stalls is published, never
+/// before its press (design.md "Play Adjustments"): F2, on the window in
+/// this autoplay session, pressed while `phase` holds, steps hi-speed from
+/// 4.00 to 4.50 (120 BPM, target 300), and READY starts after the press.
 ///
 /// The stall is a fixed time on the real threads: a game thread starved
 /// through it presses nothing, and one that presses late in it may have
-/// the step published only after the phase, as the design permits. The
-/// run is checked against what it printed: no 4.50 before the press, and
-/// once pressed, 4.50 published after it, by the end of the play at the
-/// latest; unpressed, 4.00 throughout.
+/// the step published only after the phase. The run is checked against
+/// what it printed: no 4.50 before the press, and once pressed, 4.50
+/// published after it, by the end of the play at the latest; unpressed,
+/// 4.00 throughout. So these tests do not show that the phase's wait
+/// serves the adjustments, since the play publishes the step anyway. The
+/// chart load's wait is driven with a pending load in
+/// `an_adjustment_during_the_charts_load_is_published_before_it_ends`
+/// (crates/player/src/selection.rs); the decode's, the measurement's and
+/// the render preparation's waits have no such test.
 fn an_adjustment_during_a_stalled_phase_is_published(stall: &str, phase: &str, held: &str) {
     let fx = fixture();
     write_chart(&fx.library, "a", "a.bms", "譜面A", 4_000);
@@ -1312,7 +1315,7 @@ fn an_adjustment_during_a_stalled_phase_is_published(stall: &str, phase: &str, h
 }
 
 #[test]
-fn a_select_during_a_stalled_decode_is_published_before_loading_ends() {
+fn a_select_during_a_stalled_decode_is_published_by_the_plays_end() {
     an_adjustment_during_a_stalled_phase_is_published(
         "slow-decoding=1500",
         "decoding",
@@ -1321,7 +1324,7 @@ fn a_select_during_a_stalled_decode_is_published_before_loading_ends() {
 }
 
 #[test]
-fn a_select_during_a_stalled_measurement_is_published_before_loading_ends() {
+fn a_select_during_a_stalled_measurement_is_published_by_the_plays_end() {
     an_adjustment_during_a_stalled_phase_is_published(
         "slow-measuring=1500",
         "measuring",
@@ -1330,7 +1333,7 @@ fn a_select_during_a_stalled_measurement_is_published_before_loading_ends() {
 }
 
 #[test]
-fn an_adjustment_during_a_stalled_render_preparation_is_published_before_it_ends() {
+fn an_adjustment_during_a_stalled_render_preparation_is_published_by_the_plays_end() {
     an_adjustment_during_a_stalled_phase_is_published(
         "slow-preparing=1500",
         "preparing",
@@ -1339,7 +1342,7 @@ fn an_adjustment_during_a_stalled_render_preparation_is_published_before_it_ends
 }
 
 #[test]
-fn an_adjustment_during_a_stalled_chart_load_is_published_before_it_ends() {
+fn an_adjustment_during_a_stalled_chart_load_is_published_by_the_plays_end() {
     an_adjustment_during_a_stalled_phase_is_published(
         "slow-chart-load=1500",
         "chart-load",
