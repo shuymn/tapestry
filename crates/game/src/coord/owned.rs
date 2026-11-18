@@ -398,9 +398,10 @@ impl<T: Clone> OwnedJob<T> {
 }
 
 impl<T> OwnedJob<T> {
-    /// Stops it without waiting for its thread: its admission and its next
-    /// checkpoint see the owner's stop, and it ends cancelled. The owner
-    /// still settles it.
+    /// Stops it without waiting for its thread, cooperatively: its
+    /// admission and its next checkpoint see the owner's stop, and it ends
+    /// cancelled; a job past its last checkpoint can still publish what it
+    /// computed. The owner still settles it.
     pub fn stop(&self) {
         self.stop.store(true, Ordering::Release);
     }

@@ -414,7 +414,11 @@ fn a_stopped_owned_job_ends_cancelled_queued_or_running() {
         },
     );
     queued.stop();
-    assert_eq!(outcome(&queued).outcome, Outcome::Cancelled);
+    assert_eq!(
+        outcome_within(&queued, *LONG).map(|o| o.outcome),
+        Some(Outcome::Cancelled),
+        "the queued job not ended by its stop"
+    );
     assert!(!ran.load(Ordering::SeqCst));
     drop(busy);
     let started = Arc::new(AtomicBool::new(false));
@@ -430,11 +434,30 @@ fn a_stopped_owned_job_ends_cancelled_queued_or_running() {
             until_cancelled(ctx);
         },
     );
+    let end = Instant::now() + *LONG;
     while !started.load(Ordering::SeqCst) {
+        assert!(Instant::now() < end, "the job never ran");
         thread::yield_now();
     }
     job.stop();
-    assert_eq!(outcome(&job).outcome, Outcome::Cancelled);
+    let ended = outcome_within(&job, *LONG).map(|o| o.outcome);
+    for j in [queued, job] {
+        let _ = j.settle(Duration::ZERO, &Instant::now, &mut || None::<()>);
+    }
+    assert_eq!(
+        ended,
+        Some(Outcome::Cancelled),
+        "the running job not ended by its stop"
+    );
+}
+
+/// The job's outcome, if it ends within `bound`.
+fn outcome_within<T: Clone>(job: &OwnedJob<T>, bound: Duration) -> Option<Observed<T>> {
+    let end = Instant::now() + bound;
+    match job.wait(Duration::from_millis(1), || Instant::now() >= end) {
+        Waited::Done(o) => Some(o),
+        Waited::Stopped(_) => None,
+    }
 }
 
 /// Y5.
