@@ -519,6 +519,10 @@ pub const IN_PLAY: &[Site] = &[
     // chart's events, the published table and the stretch; the resolver,
     // reader and packing in the same file are preparation work.
     Site::File("crates/skin-model/src/play/bga.rs"),
+    // A video's frame ring, which the render thread reads each frame; the
+    // ring's setup and the worker's writer in the same file are not in
+    // play.
+    Site::File("crates/skin-model/src/media.rs"),
     Site::Fns(
         "crates/skin-model/src/bga.rs",
         &[
