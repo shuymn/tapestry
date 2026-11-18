@@ -40,6 +40,8 @@ mod report;
 mod rounds_tests;
 mod script;
 #[cfg(test)]
+mod slider_tests;
+#[cfg(test)]
 mod tests;
 #[cfg(test)]
 mod text_tests;
