@@ -334,6 +334,22 @@ tests = [
 ]
 
 [[entry]]
+id = "SF-017"
+summary = "A small BGA picture's canvas margin is black when the picture has no alpha channel"
+class = "rule"
+reason = """
+A player sees an opaque BGA picture stay opaque when it is smaller than its \
+256×256 canvas: the margin around a BMP, a JPEG or a PNG with no alpha is \
+black, as the chart's author saw it, and only a picture with an alpha \
+channel lets the skin show through its margin."""
+source = ["src/bms/player/beatoraja/play/bga/BGImageProcessor.java:46-56 @beatoraja-0.8.9"]
+sites = ["crates/skin-model/src/bga.rs"]
+tests = [
+    "crates/skin-model/tests/bga_images.rs::small_opaque_picture_centres_on_a_black_canvas",
+    "crates/skin-model/tests/bga_images.rs::small_picture_with_alpha_centres_on_a_transparent_canvas",
+]
+
+[[entry]]
 id = "SF-018"
 summary = "A play skin's numbers 74 and 106 are the whole chart's note count, a practice round's too"
 class = "rule"
@@ -376,3 +392,62 @@ source = [
 ]
 sites = ["crates/skin-model/src/play/reducer.rs"]
 tests = ["crates/skin-model/tests/play.rs::the_full_combo_needs_the_whole_charts_count"]
+
+[[entry]]
+id = "SF-020"
+summary = "A selection number read while its value is absent gives the property's own absent value"
+class = "compatibility"
+reason = """
+Lua selection skins are written against what `main_state.number` gives for \
+a chart with no record, no song or no folder under the cursor: a \
+placeholder drawn while the plays read below 0 (`Integer.MIN_VALUE`), or a \
+figure that reads 0 there (the largest EX score, the best score, the EX \
+score to the next rank). Each guarded selection number reads its \
+property's value from one table, in the runtime and in a lowered \
+expression alike (design.md "beatoraja Lua Skins", the expression \
+acceptance proof)."""
+source = [
+    "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:126-201 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:289-395 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:473-511 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:562-700 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:1486-1507 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/ScoreDataProperty.java:64-109 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/ScoreDataProperty.java:155-156 @beatoraja-0.8.9",
+]
+sites = [
+    "crates/skin-beatoraja/src/import/callback.rs",
+    "crates/skin-beatoraja/src/import/selection/profile.rs",
+    "crates/skin-beatoraja/src/lua/runtime.rs",
+]
+tests = [
+    "crates/skin-beatoraja/src/import/selection/profile.rs::every_unavailable_number_has_its_absent_value",
+    "crates/skin-beatoraja/tests/lua_runtime.rs::a_lowered_selection_read_agrees_with_the_runtime_in_every_record_state",
+    "crates/skin-beatoraja/tests/lua_runtime.rs::absent_scores_read_zero_where_the_source_does",
+]
+
+[[entry]]
+id = "SF-021"
+summary = "A chart without a difficulty gets one inferred at scan (subtitle keyword, then title keyword, then note count), shown from selection to its result"
+class = "rule"
+reason = """
+A player sees the level colour and the difficulty conditions of every chart \
+that declares no `#DIFFICULTY` (or 0): the scan gives it the difficulty of \
+the first keyword step its subtitle, then its title, meets, else of its note \
+count (below 250, 600, 1 000 and 2 000 notes), so such a chart is coloured \
+and filtered as one of the five difficulties rather than as none, and a chart \
+chosen on selection keeps that difficulty on its play and result. A declared \
+difficulty always wins (design.md "Loading and Song Selection", \
+Difficulty; "Play Lifecycle", the chart's labels)."""
+source = [
+    "src/bms/player/beatoraja/song/SQLiteSongDatabaseAccessor.java:933-953 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/song/SongData.java:211 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/song/SongData.java:172-174 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/PlayerResource.java:172-175 @beatoraja-0.8.9",
+]
+sites = ["crates/library/src/difficulty.rs", "crates/player/src/play.rs"]
+tests = [
+    "crates/library/tests/scan.rs::an_undeclared_difficulty_follows_the_subtitle_then_the_title",
+    "crates/library/tests/scan.rs::an_undeclared_difficulty_follows_the_note_count",
+    "crates/player/src/render_side/tests/decision/integrated.rs::a_chosen_charts_stored_difficulty_reaches_play_and_result",
+]

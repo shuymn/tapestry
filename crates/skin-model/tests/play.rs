@@ -54,6 +54,7 @@ fn in_section(s: &Section) -> PlayContext<'_> {
         bpm_whole_change: None,
         play_level: None,
         score: skin_model::PlayScore::NONE,
+        bga_shown: true,
     }
 }
 
@@ -663,6 +664,7 @@ fn targets_match_the_evaluators() {
         bpm_whole_change: None,
         play_level: None,
         score: skin_model::PlayScore::NONE,
+        bga_shown: true,
     };
     let section_ctx = PlayContext {
         attempt: Attempt::Section(&edge),
@@ -1202,6 +1204,23 @@ fn the_attempt_targets_are_prepared_per_attempt() {
     assert_eq!(h.field(field::NOTES), 3);
     assert_eq!(h.field(field::CHART_NOTES), 7);
     assert_eq!(rates(&h), (10_000, 3_333));
+}
+
+/// The note count an attempt's facts take is the play's `chart.notes`:
+/// the whole chart's taps and long notes, no mine, for a full attempt and
+/// for a section with 3 targets alike.
+#[test]
+fn the_note_count_fact_is_the_plays_field() {
+    let chart = practice_chart();
+    assert_eq!(skin_model::chart_notes(&chart), 7);
+    let mut h = Harness::empty(&chart, &full(0));
+    h.frame(0, &[]);
+    assert_eq!(h.field(field::CHART_NOTES), skin_model::chart_notes(&chart));
+    let s = section(10_000, 20_000, 2_000);
+    h.play = h.skin.prepare(&chart, &in_section(&s)).unwrap();
+    h.frame(0, &[]);
+    assert_eq!(h.field(field::NOTES), 3);
+    assert_eq!(h.field(field::CHART_NOTES), skin_model::chart_notes(&chart));
 }
 
 #[test]

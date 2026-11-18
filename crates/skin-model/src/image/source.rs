@@ -66,7 +66,10 @@ impl Failed {
             DecodeError::Changed => Some(Self::Changed),
             DecodeError::HeaderChanged => Some(Self::HeaderChanged),
             DecodeError::DecoderLimit => Some(Self::DecoderLimit),
-            DecodeError::Image(_) | DecodeError::Png(_) | DecodeError::Io(_) => None,
+            DecodeError::Image(_)
+            | DecodeError::Png(_)
+            | DecodeError::Io(_)
+            | DecodeError::Refused => None,
         }
     }
 

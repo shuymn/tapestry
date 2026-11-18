@@ -472,6 +472,7 @@ fn a_short_list_fills_every_slot_around_the_cursor() {
         rank: None,
         images: None,
         info: None,
+        difficulty: 0,
     };
     let (_dir, mut screen, mut logic, _sent) =
         skinned_with(warp(), crate::selection_skin::ring_fixture(), "s.json");

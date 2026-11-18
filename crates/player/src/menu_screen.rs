@@ -931,6 +931,45 @@ impl Screen for MenuScreen {
         self.renderer.publish_chart_absent(target)
     }
 
+    fn begin_bga(&mut self, pages: u32) -> Result<skin_model::bga::BgaKey, render::BgaFault> {
+        self.renderer.begin_bga(pages)
+    }
+
+    fn stage_bga_cells(
+        &mut self,
+        key: skin_model::bga::BgaKey,
+        cells: Vec<(skin_model::bga::CellPlace, Vec<u8>)>,
+    ) -> Result<(), render::BgaFault> {
+        self.renderer.stage_bga_cells(key, cells)
+    }
+
+    fn bga_boundary(&mut self) -> render::BgaStep {
+        self.renderer.bga_boundary()
+    }
+
+    fn cancel_bga_upload(&mut self) {
+        self.renderer.cancel_bga_upload();
+    }
+
+    fn publish_bga(
+        &mut self,
+        key: Option<skin_model::bga::BgaKey>,
+        entries: Vec<skin_model::bga::BgaEntry>,
+    ) -> Result<std::sync::Arc<skin_model::bga::BgaTable>, render::BgaFault> {
+        self.renderer.publish_bga(key, entries)
+    }
+
+    fn published_bga(
+        &self,
+        key: skin_model::bga::BgaKey,
+    ) -> Option<std::sync::Arc<skin_model::bga::BgaTable>> {
+        self.renderer.published_bga(key)
+    }
+
+    fn drop_bga(&mut self) {
+        self.renderer.drop_bga();
+    }
+
     fn write_result_chart(
         &mut self,
         target: render::ResultChartTarget,

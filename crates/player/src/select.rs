@@ -1729,7 +1729,7 @@ impl SelectScreen {
                         artist: text(&h.artist),
                         level: text(&h.playlevel),
                         level_value: level_value(h.playlevel.as_deref()),
-                        difficulty: difficulty(h.difficulty.as_deref()),
+                        difficulty: difficulty(e),
                         score: self.score_of(e),
                         features: e.summary.as_ref().map(RowFeatures::of),
                         random: e.random,
@@ -1760,7 +1760,7 @@ impl SelectScreen {
                 genre: text(&h.genre),
                 level: text(&h.playlevel),
                 level_value: level_value(h.playlevel.as_deref()),
-                difficulty: difficulty(h.difficulty.as_deref()),
+                difficulty: difficulty(e),
             },
             summary: e.summary,
             random: e.random,
@@ -1863,11 +1863,10 @@ const fn selected_info(i: library::ChartInfoView) -> SelectedInfo {
     }
 }
 
-/// `#DIFFICULTY` when it is 1 to 5, read as an attempt's is
-/// ([`crate::imports::facts::difficulty_of`]).
-fn difficulty(text: Option<&str>) -> Option<u8> {
-    text.map(crate::imports::facts::difficulty_of)
-        .filter(|d| (1..=5).contains(d))
+/// The chart's difficulty the library stores, declared or inferred
+/// ([`ChartEntry::difficulty`]), when it is 1 to 5.
+fn difficulty(e: &ChartEntry) -> Option<u8> {
+    Some(e.difficulty).filter(|d| (1..=5).contains(d))
 }
 
 /// The largest EX score a chart's summary allows under `preset`: its judged
@@ -1918,6 +1917,7 @@ mod tests {
             rank: None,
             images: None,
             info: None,
+            difficulty: 0,
         }
     }
 
@@ -3157,27 +3157,40 @@ mod tests {
         assert_eq!(s.view(1, 1, true).rows[1].score, RowScore::Unplayed);
     }
 
-    /// A row's difficulty is `#DIFFICULTY` when it reads as an integer
-    /// from 1 to 5.
+    /// A row's difficulty is the one the library stores when it is 1 to
+    /// 5, none for 0, whatever `#DIFFICULTY` text the entry holds.
     #[test]
-    fn a_difficulty_is_one_to_five() {
-        for (text, want) in [
-            ("1", Some(1)),
-            ("+5", Some(5)),
-            ("05", Some(5)),
-            ("0", None),
-            ("6", None),
-            ("x", None),
-            ("５", None),
-        ] {
+    fn a_difficulty_is_the_librarys_from_one_to_five() {
+        for (stored, want) in [(1, Some(1)), (5, Some(5)), (0, None)] {
             let mut e = entry(r"C:\charts\x\1.bms", "a");
-            e.header.difficulty = Some(text.to_owned());
+            e.header.difficulty = Some("4".to_owned());
+            e.difficulty = stored;
             let mut s = SelectScreen::new(Vec::new());
             s.set_entries(vec![e]);
             let v = s.view(1, 1, true);
-            assert_eq!(v.rows[1].difficulty, want, "{text:?}");
-            assert_eq!(v.selected.unwrap().labels.difficulty, want, "{text:?}");
+            assert_eq!(v.rows[1].difficulty, want, "{stored}");
+            assert_eq!(v.selected.unwrap().labels.difficulty, want, "{stored}");
         }
+    }
+
+    /// A chart that declares no `#DIFFICULTY` shows the difficulty the
+    /// library scan inferred for it: a subtitle naming the third step
+    /// gives 3 on its row and as the selected chart.
+    #[test]
+    fn an_undeclared_difficulty_shows_the_scans_inference() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a.bms"),
+            "#TITLE Song\n#SUBTITLE [HYPER]\n#BPM 120\n#00111:01\n#00118:01\n",
+        )
+        .unwrap();
+        let e = scanned(dir.path());
+        assert_eq!(e.header.difficulty, None);
+        let mut s = SelectScreen::new(Vec::new());
+        s.set_entries(vec![e]);
+        let v = s.view(1, 1, true);
+        assert_eq!(v.rows[1].difficulty, Some(3));
+        assert_eq!(v.selected.unwrap().labels.difficulty, Some(3));
     }
 
     /// A chart that does not draw has a largest EX score: its judged notes at

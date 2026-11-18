@@ -145,6 +145,18 @@ struct HeldImages {
 pub struct PendingChart(ResultChart);
 
 impl PendingChart {
+    /// The facts with `stored`, when given, as the chart's difficulty: the
+    /// one the library stores for a chart chosen on selection, declared or
+    /// inferred, when it is 1 to 5, in place of the attempt's own
+    /// `#DIFFICULTY` (design.md "Play Lifecycle", the chart's labels).
+    #[must_use]
+    pub fn with_difficulty(mut self, stored: Option<u8>) -> Self {
+        if let Some(d) = stored {
+            self.0.difficulty = Some(d).filter(|d| (1..=5).contains(d));
+        }
+        self
+    }
+
     /// The chart's facts with its images' resolved availability.
     #[must_use]
     pub const fn resolved(self, images: ImageFacts) -> ResultChart {

@@ -38,6 +38,13 @@ pub const FLAG_NEAREST: u32 = 1 << 16;
 /// at its nearest level-0 texel, however far the sprite shrinks
 /// ([`Filter::NearestBase`]).
 pub const FLAG_BASE: u32 = 1 << 17;
+/// The bit of [`Instance::flags`] set when the sprite reads the BGA array
+/// at level 0 ([`Filter::Bga`], [`Filter::BgaLayer`]), its layer the
+/// array's page.
+pub const FLAG_BGA: u32 = 1 << 18;
+/// The bit of [`Instance::flags`] set when a pure black texel is drawn
+/// transparent ([`Filter::BgaLayer`]).
+pub const FLAG_KEY: u32 = 1 << 19;
 
 const _: () = assert!(FLAG_POOL == skin_model::chart_image::POOL_LAYER as u32);
 
@@ -75,6 +82,8 @@ impl Instance {
             Filter::Nearest => FLAG_NEAREST,
             Filter::NearestBase => FLAG_BASE,
             Filter::Linear => 0,
+            Filter::Bga => FLAG_BGA,
+            Filter::BgaLayer => FLAG_BGA | FLAG_NEAREST | FLAG_KEY,
         };
         Self {
             rect: s.rect,

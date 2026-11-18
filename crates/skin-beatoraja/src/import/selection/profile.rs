@@ -328,6 +328,60 @@ pub(crate) fn number(id: i32) -> Option<Class<SelValue>> {
     })
 }
 
+/// What `main_state.number(id)` reads on selection while the bridge of
+/// [`number`]'s `id` is unavailable ([`SelValue::availability`] false):
+/// the source's value of the property with no score data, no song data
+/// or no folder under the cursor (`IntegerPropertyFactory.java` at
+/// `0.8.9`, `IPF` below; `ScoreDataProperty.java`, `SDP`), whatever it
+/// is, `Integer.MIN_VALUE` or 0. The runtime's bridge
+/// ([`crate::lua::runtime::Screen::number`]) and a lowered callback's read
+/// ([`crate::import::callback`]) both take it from here. `None` for an id
+/// whose bridge is always available or that is not bridged.
+// Source: SF-020
+pub(crate) fn absent_number(id: i32) -> Option<i32> {
+    const MIN: i32 = i32::MIN;
+    Some(match id {
+        // The current EX score with no score data (`IPF:126`, `:175`,
+        // `:231`, through `:606-616`).
+        71 | 101 | 171 => MIN,
+        // The best score, `SDP.bestscore`: 0 unless play or result set it
+        // (`IPF:195`, `:618-625`; `SDP:15`, `:155-156`), never on selection.
+        150 => 0,
+        // The largest EX score: 0 with no score data (`IPF:127-129`).
+        72 => 0,
+        // The best's BP with no score (`IPF:132`, `:237`, `:644-657`).
+        76 | 177 => MIN,
+        // Plays, clears and fails with no score (`IPF:133-153`).
+        77..=79 => MIN,
+        // The best max combo with no score (`IPF:131`, `:182`, `:234`,
+        // `:627-642`).
+        75 | 105 | 174 => MIN,
+        // The score's counts with no score (`IPF:500-504`).
+        80..=84 => MIN,
+        // Their whole percent with no score or no notes (`IPF:505-511`).
+        85..=89 => MIN,
+        // The score rates with no score data (`IPF:176-181`, `:187-188`,
+        // `:200-201`, `:690-700`).
+        102 | 103 | 115 | 116 | 155 | 156 => MIN,
+        // The EX score to the next rank of no score: its notes and EX 0,
+        // its rate 1, so the first rank not reached gives
+        // `⌈0 − 1 · 0⌉` (`IPF:199`; `SDP:64-67`, `:94`, `:100-109`).
+        154 => 0,
+        // The chart's notes, BPMs, level and length with no song data
+        // (`IPF:130`, `:154-166`, `:183`, `:473-478`, `:562-584`).
+        74 | 106 | 90 | 91 | 45..=49 | 96 | 1163 | 1164 => MIN,
+        // A folder's charts with no folder under the cursor
+        // (`IPF:289`, `:1486-1507`).
+        300 => MIN,
+        // The song information with none (`IPF:167-173`, `:319-395`).
+        92 | 350..=353 | 360..=365 | 368 => MIN,
+        // The duration and its green number with no selected play config
+        // (`IPF:292-318`).
+        312 | 313 => MIN,
+        _ => return None,
+    })
+}
+
 /// A selection text.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SelText {
@@ -894,6 +948,32 @@ mod tests {
             assert_eq!(graph(ty), Some(Class::Bridge(RatioSource::JudgeRate(k))));
         }
         assert_eq!(graph(145), Some(Class::Bridge(RatioSource::ComboRate)));
+    }
+
+    /// Every bridged number that can be unavailable, and only such a one,
+    /// has its source's absent value: the 57 ids, 0 for 72, 150 and 154,
+    /// `Integer.MIN_VALUE` for the rest.
+    // Source: SF-020
+    #[test]
+    fn every_unavailable_number_has_its_absent_value() {
+        let mut guarded = Vec::new();
+        for id in 0..=2_000 {
+            let unavailable =
+                matches!(number(id), Some(Class::Bridge(v)) if v.availability() != "true");
+            assert_eq!(absent_number(id).is_some(), unavailable, "{id}");
+            if unavailable {
+                guarded.push(id);
+            }
+        }
+        assert_eq!(guarded.len(), 57, "{guarded:?}");
+        for id in guarded {
+            let want = if matches!(id, 72 | 150 | 154) {
+                0
+            } else {
+                i32::MIN
+            };
+            assert_eq!(absent_number(id), Some(want), "{id}");
+        }
     }
 
     /// Every bridge compiles against the selection schema with its type.

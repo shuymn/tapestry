@@ -312,6 +312,10 @@ impl ImageError {
             DecodeError::Image(source) => Self::Decode { at, source },
             DecodeError::Png(source) => Self::Png { at, source },
             DecodeError::Io(source) => Self::Io { at, source },
+            DecodeError::Refused => Self::Io {
+                at,
+                source: io::ErrorKind::OutOfMemory.into(),
+            },
         }
     }
 }

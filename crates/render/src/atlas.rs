@@ -198,5 +198,8 @@ mod tests {
         }
         assert!(!lit(&atlas, 119, 124));
         assert_eq!(solid_uv(), [124.0 / 128.0; 4]);
+        // The BGA's placeholder draws this block too.
+        assert_eq!(skin_model::bga::SOLID.uv, solid_uv());
+        assert_eq!(skin_model::bga::SOLID.layer, 0);
     }
 }

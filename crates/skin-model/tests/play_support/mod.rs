@@ -230,6 +230,7 @@ pub fn full(lead_in_ms: i64) -> PlayContext<'static> {
         bpm_whole_change: None,
         play_level: None,
         score: skin_model::PlayScore::NONE,
+        bga_shown: true,
     }
 }
 

@@ -615,3 +615,22 @@ fn decision_timer_1_starts_at_input() {
         "lua",
     );
 }
+
+/// Off play a text's `..` keeps its refusal before its operands: no
+/// literal is folded (the play twin folds, `lua_callbacks.rs`).
+#[test]
+fn a_decision_concatenation_keeps_its_outcome() {
+    let l = lua_folder_with(
+        "",
+        "",
+        "skin.text = { { id = \"c\", font = \"f\", size = 8, value = function() return \"x\" .. 50.5 end } }\n\
+         skin.destination = { { id = \"c\", dst = { { x = 200, y = 100, w = 300, h = 8 } } } }",
+    );
+    let i = lua_decision(l.path()).unwrap();
+    assert_eq!(
+        i.callbacks,
+        [skin_beatoraja::lua::Disposition::Replaced(
+            skin_beatoraja::lua::Unsupported::Construct("..")
+        )]
+    );
+}

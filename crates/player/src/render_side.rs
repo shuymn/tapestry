@@ -194,6 +194,65 @@ pub trait Screen: Send {
     /// # Errors
     ///
     /// As the renderer's; [`RenderError::NoChartLayer`] by default.
+    /// Begins the BGA array ([`render::Renderer::begin_bga`]); a screen
+    /// with no renderer refuses one, so the pictures are published absent.
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's; [`render::BgaFault::Refused`] by default.
+    fn begin_bga(&mut self, pages: u32) -> Result<skin_model::bga::BgaKey, render::BgaFault> {
+        let _ = pages;
+        Err(render::BgaFault::Refused)
+    }
+    /// Takes a batch of BGA cells in hand, written at the frame boundaries
+    /// that follow ([`render::Renderer::stage_bga_cells`]).
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's; [`render::BgaFault::Refused`] by default.
+    fn stage_bga_cells(
+        &mut self,
+        key: skin_model::bga::BgaKey,
+        cells: Vec<(skin_model::bga::CellPlace, Vec<u8>)>,
+    ) -> Result<(), render::BgaFault> {
+        let _ = (key, cells);
+        Err(render::BgaFault::Refused)
+    }
+    /// One frame boundary's step of the batch in hand
+    /// ([`render::Renderer::bga_boundary`]); none in hand by default.
+    fn bga_boundary(&mut self) -> render::BgaStep {
+        render::BgaStep::Idle
+    }
+    /// Drops the batch in hand ([`render::Renderer::cancel_bga_upload`]).
+    fn cancel_bga_upload(&mut self) {}
+    /// Publishes the BGA table ([`render::Renderer::publish_bga`]): by
+    /// default only one of no array.
+    ///
+    /// # Errors
+    ///
+    /// As the renderer's; [`render::BgaFault::Stale`] by default for an
+    /// array.
+    fn publish_bga(
+        &mut self,
+        key: Option<skin_model::bga::BgaKey>,
+        entries: Vec<skin_model::bga::BgaEntry>,
+    ) -> Result<Arc<skin_model::bga::BgaTable>, render::BgaFault> {
+        match key {
+            None => Ok(Arc::new(skin_model::bga::BgaTable::new(entries))),
+            Some(_) => Err(render::BgaFault::Stale),
+        }
+    }
+    /// The table published for the array `key` names while it is still in
+    /// use ([`render::Renderer::published_bga`]); none by default.
+    fn published_bga(
+        &self,
+        key: skin_model::bga::BgaKey,
+    ) -> Option<Arc<skin_model::bga::BgaTable>> {
+        let _ = key;
+        None
+    }
+    /// Drops the BGA array and its table ([`render::Renderer::drop_bga`]).
+    fn drop_bga(&mut self) {}
     fn publish_chart_absent(
         &mut self,
         target: render::ChartTarget,
@@ -1084,6 +1143,13 @@ pub enum RenderMsg {
         /// Where the answer goes.
         reply: mpsc::SyncSender<crate::chart_images::Ack>,
     },
+    /// A step of the BGA pictures' publication (design.md "Rendering and
+    /// Skins", BGA), answered on its own channel; refused, nothing done,
+    /// once the game thread set another generation.
+    Bga {
+        generation: u64,
+        msg: crate::bga::BgaMsg,
+    },
     /// Write a row's chart images into a slot of the selection's pool
     /// (design.md "Rendering and Skins", chart images): held until a frame
     /// boundary of the select screen, and answered there.
@@ -1418,6 +1484,11 @@ struct Shared {
     /// writes ([`crate::chart_images::ChartImageWorker::renew`]) and the
     /// render thread reads before each frame and publication.
     chart_generation: Arc<AtomicU64>,
+    /// The BGA pictures' generation, which the game thread's worker
+    /// writes ([`crate::bga::BgaWorker::renew`]) and the render thread
+    /// reads at each of their messages: one of another generation changes
+    /// nothing.
+    bga_generation: Arc<AtomicU64>,
     /// The slot of the chart-image pool the selection frame built last
     /// displayed, packed with its generation
     /// ([`crate::chart_currency::CursorChart::pack`]; 0 for none): the
@@ -1432,6 +1503,10 @@ struct Shared {
     /// [`hook_bound`] (tests).
     #[cfg(test)]
     chart_hold: AtomicBool,
+    /// While set, a BGA table's publication waits before it publishes, at
+    /// most [`hook_bound`] (tests).
+    #[cfg(test)]
+    bga_hold: AtomicBool,
     /// When the current play's first frame was drawn, on the clock.
     first_frame: AtomicI64,
     /// The end screen's slot: its newest page, and the pages left with the
@@ -1650,10 +1725,13 @@ impl Shared {
             failed: AtomicBool::new(false),
             recovery: Mutex::new(Recovery::Idle),
             chart_generation: Arc::default(),
+            bga_generation: Arc::default(),
             selection_displayed: AtomicU64::new(0),
             chart_targets: Mutex::new(ChartTargets::default()),
             #[cfg(test)]
             chart_hold: AtomicBool::new(false),
+            #[cfg(test)]
+            bga_hold: AtomicBool::new(false),
             first_frame: AtomicI64::new(i64::MIN),
             end_page: Mutex::new(EndSlot::default()),
             #[cfg(feature = "dev-tools")]
@@ -2347,6 +2425,35 @@ fn hook_bound() -> Duration {
     )
 }
 
+/// Sends the BGA pictures' steps to the render thread from any thread
+/// ([`RenderLink::bga_publisher`]).
+#[derive(Clone)]
+pub struct BgaPublisher {
+    tx: Sender<RenderMsg>,
+    bound: Duration,
+}
+
+impl BgaPublisher {
+    /// Sends `msg` of `generation`; false when the render thread is gone.
+    pub fn send(&self, generation: u64, msg: crate::bga::BgaMsg) -> bool {
+        self.tx.send(RenderMsg::Bga { generation, msg }).is_ok()
+    }
+
+    /// How long an answer is waited for.
+    #[must_use]
+    pub const fn bound(&self) -> Duration {
+        self.bound
+    }
+
+    /// A publisher whose messages go to the returned receiver, answered
+    /// by the test (a render thread double).
+    #[cfg(test)]
+    pub(crate) fn channel(bound: Duration) -> (Self, Receiver<RenderMsg>) {
+        let (tx, rx) = mpsc::channel();
+        (Self { tx, bound }, rx)
+    }
+}
+
 /// The game thread's end of the render thread.
 /// Sends chart publications to the render thread from any thread
 /// ([`RenderLink::chart_publisher`]).
@@ -2891,6 +2998,22 @@ impl RenderLink {
         rx
     }
 
+    /// What hands the BGA pictures to the render thread from another
+    /// thread: the job that reads them.
+    #[must_use]
+    pub fn bga_publisher(&self) -> BgaPublisher {
+        BgaPublisher {
+            tx: self.tx.clone(),
+            bound: self.answer_timeout,
+        }
+    }
+
+    /// Where the BGA pictures' generation is written, for their worker.
+    #[must_use]
+    pub fn bga_generation(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.shared.bga_generation)
+    }
+
     /// The live chart-image pool as the render thread mirrored it last,
     /// and the slot it displayed last, packed (tests).
     #[cfg(test)]
@@ -2934,6 +3057,13 @@ impl RenderLink {
     #[cfg(all(test, feature = "dev-tools"))]
     pub fn hold_chart_publications(&self, on: bool) {
         self.shared.chart_hold.store(on, Ordering::SeqCst);
+    }
+
+    /// Holds every BGA table's publication before it publishes while
+    /// `on`, at most [`hook_bound`] each (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn hold_bga_publications(&self, on: bool) {
+        self.shared.bga_hold.store(on, Ordering::SeqCst);
     }
 
     pub fn ready_attempt(&self, request: u64, epoch: u64) -> Result<ReadyAnswer, ScreenError> {
@@ -4092,6 +4222,8 @@ pub fn spawn(
             #[cfg(feature = "dev-tools")]
             crate::dev::read_result_faults();
             #[cfg(feature = "dev-tools")]
+            crate::dev::read_bga_faults();
+            #[cfg(feature = "dev-tools")]
             crate::dev::read_script_switches();
             let screen = match build(
                 &mut make,
@@ -4165,6 +4297,7 @@ pub fn spawn(
                 #[cfg(feature = "dev-tools")]
                 decision_faults: crate::dev::DecisionFaults::read(),
                 decision_want: None,
+                bga_reply: None,
                 decision_disabled: None,
                 decision_next: 1,
                 tuning: None,
@@ -5485,6 +5618,9 @@ struct Run {
     /// The chart the selection cursor rests on, its labels asked of the
     /// preparation; kept after selection is left.
     decision_want: Option<crate::decision_side::Want>,
+    /// The BGA batch in hand: its generation and the job's answer, given
+    /// once its writes end ([`Self::bga_boundary`]).
+    bga_reply: Option<(u64, mpsc::SyncSender<Result<(), render::BgaFault>>)>,
     /// Why the decision kind is disabled for the run: no request is posted
     /// and no slot is pinned from then on.
     decision_disabled: Option<String>,
@@ -5628,7 +5764,9 @@ impl Run {
         loop {
             self.sync_chart();
             let idle = matches!(mode, Mode::Idle) || self.screen.is_none();
-            let msg = if idle && (self.attempt.is_some() || self.decision_busy()) {
+            let msg = if idle
+                && (self.attempt.is_some() || self.decision_busy() || self.bga_reply.is_some())
+            {
                 // A preparation not yet answered is asked again between
                 // messages.
                 rx.recv_timeout(CANCEL_POLL).map_err(|e| match e {
@@ -5665,6 +5803,7 @@ impl Run {
                         | RenderMsg::Ready { .. }
                         | RenderMsg::Discard(_)
                         | RenderMsg::ChartImages { .. }
+                        | RenderMsg::Bga { .. }
                         | RenderMsg::PoolWrite(_)
                         | RenderMsg::ParkScripts(_))
                 )
@@ -6007,6 +6146,10 @@ impl Run {
                     let _ = reply.send(ack);
                     continue;
                 }
+                Ok(RenderMsg::Bga { generation, msg }) => {
+                    self.bga(generation, msg);
+                    continue;
+                }
                 Ok(RenderMsg::PoolWrite(write)) => {
                     // Held for a frame boundary of the select screen, or of
                     // the launch screen handing over to it; in any other
@@ -6183,6 +6326,9 @@ impl Run {
                     continue;
                 }
             }
+            // The BGA batch in hand at this frame boundary, outside every
+            // frame: a step of its writes, never a wait for the GPU.
+            self.bga_boundary();
             let Some(screen) = &mut self.screen else {
                 continue;
             };
@@ -7940,6 +8086,90 @@ impl Run {
         Ack {
             key,
             answer: answer.map_err(|e| e.chart_outcome()),
+        }
+    }
+
+    /// Takes a step of the BGA pictures' publication of `generation`:
+    /// refused ([`render::BgaFault::Stale`], nothing published, no array
+    /// read as published) unless it is the game thread's current one, and
+    /// answered at once, but for a batch of cells: that one is taken in
+    /// hand, written at the frame boundaries that follow and answered once
+    /// its writes end ([`Self::bga_boundary`]); a batch still in hand is
+    /// answered stale first.
+    fn bga(&mut self, generation: u64, msg: crate::bga::BgaMsg) {
+        use crate::bga::BgaMsg;
+        let current = self.shared.bga_generation.load(Ordering::SeqCst) == generation;
+        let screen = self.screen.as_mut().filter(|_| current);
+        let stale = render::BgaFault::Stale;
+        match msg {
+            BgaMsg::Begin { pages, reply } => {
+                let _ = reply.send(screen.map_or(Err(stale), |s| s.begin_bga(pages)));
+            }
+            BgaMsg::Cells { key, cells, reply } => {
+                if let Some((_, superseded)) = self.bga_reply.take() {
+                    let _ = superseded.send(Err(stale));
+                }
+                match screen.map_or(Err(stale), |s| s.stage_bga_cells(key, cells)) {
+                    Ok(()) => self.bga_reply = Some((generation, reply)),
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            BgaMsg::Publish {
+                key,
+                entries,
+                reply,
+            } => {
+                #[cfg(test)]
+                {
+                    let end = Instant::now() + hook_bound();
+                    while self.shared.bga_hold.load(Ordering::SeqCst) && Instant::now() < end {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                }
+                // Published only while in time, under the answer's lock.
+                reply.give(|| screen.map_or(Err(stale), |s| s.publish_bga(key, entries)));
+            }
+            BgaMsg::Reuse { key, reply } => {
+                let _ = reply.send(screen.and_then(|s| s.published_bga(key)));
+            }
+            BgaMsg::Drop => {
+                if let Some(s) = screen {
+                    s.drop_bga();
+                }
+            }
+        }
+    }
+
+    /// The BGA batch in hand at a frame boundary, outside every frame
+    /// (design.md "Memory Budget"): of a generation no longer the game
+    /// thread's, or with no screen, it is dropped and its job answered
+    /// stale; otherwise one step of its writes
+    /// ([`render::Renderer::bga_boundary`]), its job answered once they
+    /// end. A batch the screen no longer holds (a screen built again) is
+    /// answered stale.
+    fn bga_boundary(&mut self) {
+        let Some((generation, _)) = &self.bga_reply else {
+            return;
+        };
+        let current = self.shared.bga_generation.load(Ordering::SeqCst) == *generation;
+        let stale = render::BgaStep::Done(Err(render::BgaFault::Stale));
+        let step = match self.screen.as_mut() {
+            Some(s) if current => s.bga_boundary(),
+            Some(s) => {
+                s.cancel_bga_upload();
+                stale
+            }
+            None => stale,
+        };
+        let answer = match step {
+            render::BgaStep::Pending => return,
+            render::BgaStep::Idle => Err(render::BgaFault::Stale),
+            render::BgaStep::Done(r) => r,
+        };
+        if let Some((_, reply)) = self.bga_reply.take() {
+            let _ = reply.send(answer);
         }
     }
 
@@ -14885,6 +15115,11 @@ pub(crate) mod tests {
                 "prepare {request} {:?} {}",
                 a.context.scratch, a.text.title
             ));
+            self.shared
+                .bga_shown
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(a.context.bga_shown);
             self.staged_score = Some(a.context.score.basis);
             self.staged_pace = a.context.score.pace.map(<[u32]>::to_vec);
             // The skin given is staged with the attempt, as the renderer
@@ -14945,6 +15180,93 @@ pub(crate) mod tests {
             self.staged_pace = None;
             self.staged_token = None;
             *self.shared.staging.lock().unwrap() = None;
+        }
+        fn begin_bga(&mut self, pages: u32) -> Result<skin_model::bga::BgaKey, render::BgaFault> {
+            let mut b = self.shared.bga.lock().unwrap();
+            b.arrays += 1;
+            b.live = Some(b.arrays);
+            b.begins.push(pages);
+            Ok(skin_model::bga::BgaKey {
+                renderer: self.device,
+                array: b.arrays,
+            })
+        }
+        fn stage_bga_cells(
+            &mut self,
+            key: skin_model::bga::BgaKey,
+            cells: Vec<(skin_model::bga::CellPlace, Vec<u8>)>,
+        ) -> Result<(), render::BgaFault> {
+            let mut b = self.shared.bga.lock().unwrap();
+            b.pending = None;
+            if b.live != Some(key.array) {
+                return Err(render::BgaFault::Stale);
+            }
+            let mut bytes = 0;
+            for (place, texels) in &cells {
+                let [w, h] = place.padded();
+                if texels.len() != usize::try_from(u64::from(w) * u64::from(h) * 4).unwrap() {
+                    return Err(render::BgaFault::Cell);
+                }
+                bytes += texels.len();
+            }
+            let boundaries = b.boundaries_per_batch;
+            b.pending = Some((key.array, cells.len(), bytes, boundaries));
+            Ok(())
+        }
+        fn bga_boundary(&mut self) -> render::BgaStep {
+            let mut b = self.shared.bga.lock().unwrap();
+            let Some((array, cells, bytes, left)) = b.pending else {
+                return render::BgaStep::Idle;
+            };
+            b.boundaries += 1;
+            if b.live != Some(array) {
+                b.pending = None;
+                return render::BgaStep::Done(Err(render::BgaFault::Stale));
+            }
+            if left > 0 {
+                b.pending = Some((array, cells, bytes, left - 1));
+                return render::BgaStep::Pending;
+            }
+            b.pending = None;
+            b.cells += u32::try_from(cells).unwrap();
+            b.batches.push((cells, bytes));
+            render::BgaStep::Done(Ok(()))
+        }
+        fn cancel_bga_upload(&mut self) {
+            let mut b = self.shared.bga.lock().unwrap();
+            if b.pending.take().is_some() {
+                b.cancelled += 1;
+            }
+        }
+        fn publish_bga(
+            &mut self,
+            key: Option<skin_model::bga::BgaKey>,
+            entries: Vec<skin_model::bga::BgaEntry>,
+        ) -> Result<Arc<skin_model::bga::BgaTable>, render::BgaFault> {
+            let mut b = self.shared.bga.lock().unwrap();
+            let table = skin_model::bga::BgaTable::new(entries);
+            let table = match key {
+                Some(k) if b.live == Some(k.array) => table.keyed(k),
+                Some(_) => return Err(render::BgaFault::Stale),
+                None => {
+                    b.live = None;
+                    table
+                }
+            };
+            let table = Arc::new(table);
+            b.published.push(Arc::clone(&table));
+            Ok(table)
+        }
+        fn published_bga(
+            &self,
+            key: skin_model::bga::BgaKey,
+        ) -> Option<Arc<skin_model::bga::BgaTable>> {
+            let b = self.shared.bga.lock().unwrap();
+            b.current().filter(|t| t.key() == Some(key)).cloned()
+        }
+        fn drop_bga(&mut self) {
+            let mut b = self.shared.bga.lock().unwrap();
+            b.live = None;
         }
         fn install(
             &mut self,
@@ -15208,6 +15530,43 @@ pub(crate) mod tests {
         }
     }
 
+    /// The BGA steps an [`Installer`] took, as a renderer would answer
+    /// them: one array at a time, numbered from 1.
+    #[derive(Debug, Default)]
+    pub(crate) struct BgaSeen {
+        /// Each array begun, by its page count.
+        pub(crate) begins: Vec<u32>,
+        /// The cells written.
+        pub(crate) cells: u32,
+        /// Each batch written: its cells and their bytes.
+        pub(crate) batches: Vec<(usize, usize)>,
+        /// The batch in hand: its array, cells, bytes and the boundaries
+        /// left before it is written.
+        pending: Option<(u64, usize, usize, u32)>,
+        /// The boundaries a batch stays in hand before it is written (0:
+        /// written at the first boundary).
+        pub(crate) boundaries_per_batch: u32,
+        /// The boundaries that stepped a batch in hand.
+        pub(crate) boundaries: u32,
+        /// The batches in hand dropped unwritten.
+        pub(crate) cancelled: u32,
+        /// Each table published, in order.
+        pub(crate) published: Vec<Arc<skin_model::bga::BgaTable>>,
+        /// The array in use, by its number.
+        live: Option<u64>,
+        arrays: u64,
+    }
+
+    impl BgaSeen {
+        /// The table in use: the last published while its array is live,
+        /// or one of no array.
+        pub(crate) fn current(&self) -> Option<&Arc<skin_model::bga::BgaTable>> {
+            self.published
+                .last()
+                .filter(|t| t.key().is_none_or(|k| Some(k.array) == self.live))
+        }
+    }
+
     /// The shared state of the [`Installer`]s a render thread builds,
     /// their devices numbered from 1.
     #[derive(Clone, Default)]
@@ -15270,6 +15629,8 @@ pub(crate) mod tests {
         log: Log,
         /// Selection frames refuse while set, as a skin refusing one.
         pub(crate) refuse_selection: Arc<AtomicBool>,
+        /// Whether each attempt prepared shows the chart's BGA, in order.
+        pub(crate) bga_shown: Arc<std::sync::Mutex<Vec<bool>>>,
         /// Frames are paced while set: each wait takes one of `permits`,
         /// holding until there is one.
         pub(crate) pace: Arc<AtomicBool>,
@@ -15321,6 +15682,8 @@ pub(crate) mod tests {
         pub(crate) committed_scores: Arc<std::sync::Mutex<Vec<skin_model::ScoreBasis>>>,
         /// The best's pace of each attempt committed, in order.
         pub(crate) committed_paces: Arc<std::sync::Mutex<Vec<Option<Vec<u32>>>>>,
+        /// The BGA steps the screens took.
+        pub(crate) bga: Arc<std::sync::Mutex<BgaSeen>>,
         /// Each play frame built: its own sample on the clock, its screen
         /// clock and its chart time; noted only while the vector has room
         /// (a test reserves it), so noting never allocates.

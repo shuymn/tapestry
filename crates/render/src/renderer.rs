@@ -165,6 +165,7 @@ struct Proj {
 @group(0) @binding(2) var nearest_samp: sampler;
 @group(0) @binding(3) var<uniform> proj: Proj;
 @group(0) @binding(4) var pool: texture_2d_array<f32>;
+@group(1) @binding(0) var bga: texture_2d_array<f32>;
 
 // Canvas pixels (origin top left, y down) to clip space; the viewport places
 // the canvas on the target. Each corner turns clockwise on screen by the
@@ -195,7 +196,10 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
 // times 128, exact whatever the array's side. The two implicit-derivative
 // samples are always taken, so they stay in uniform control flow; the
 // base read has an explicit level, which needs no derivatives, so only a
-// sprite with the base bit takes it. One result is chosen.
+// sprite with the base bit takes it. One result is chosen. A sprite with
+// the BGA bit reads the BGA array instead, at level 0 by explicit level:
+// bilinear, or at the nearest texel with the nearest bit, and with the key
+// bit a pure black texel is transparent.
 //
 // A quad with the pool bit samples the chart-image pool instead, by the
 // same filters, never the built-in read (its layer 0 holds ordinary
@@ -215,17 +219,25 @@ fn tinted(v: VOut) -> vec4f {
     if (v.flags & 0x20000u) != 0u {
         page = textureSampleLevel(atlas, nearest_samp, v.uv, layer, 0.0);
     }
-    var out = select(page, builtin, layer == 0 && !pooled);
+    var c = select(page, builtin, layer == 0 && !pooled);
     if pooled {
         if (v.flags & 0x20000u) != 0u {
-            out = textureSampleLevel(pool, nearest_samp, v.uv, layer, 0.0);
+            c = textureSampleLevel(pool, nearest_samp, v.uv, layer, 0.0);
         } else if (v.flags & 0x10000u) != 0u {
-            out = textureSampleGrad(pool, nearest_samp, v.uv, layer, gx, gy);
+            c = textureSampleGrad(pool, nearest_samp, v.uv, layer, gx, gy);
         } else {
-            out = textureSampleGrad(pool, smooth_samp, v.uv, layer, gx, gy);
+            c = textureSampleGrad(pool, smooth_samp, v.uv, layer, gx, gy);
         }
     }
-    return out * v.color;
+    if (v.flags & 0x40000u) != 0u {
+        let bs = textureSampleLevel(bga, smooth_samp, v.uv, layer, 0.0);
+        let bn = textureSampleLevel(bga, nearest_samp, v.uv, layer, 0.0);
+        c = select(bs, bn, (v.flags & 0x10000u) != 0u);
+        if (v.flags & 0x80000u) != 0u && all(c.rgb == vec3f(0.0)) {
+            c = vec4f(0.0);
+        }
+    }
+    return c * v.color;
 }
 
 @fragment
@@ -1089,6 +1101,8 @@ struct Bindings {
     /// The nearest texel of the nearest level, for pixel art and, at level
     /// 0, the built-in atlas.
     nearest: wgpu::Sampler,
+    /// The second group's layout: the BGA array.
+    bga: wgpu::BindGroupLayout,
     /// Half the canvas's size ([`Projection::half`]), padded to 16 bytes.
     projection: wgpu::Buffer,
     /// The half last written to [`projection`](Self::projection), `None`
@@ -1160,6 +1174,20 @@ pub struct Renderer {
     bindings: Bindings,
     atlas: AtlasTexture,
     atlas_bind: wgpu::BindGroup,
+    /// The BGA array in use, or its stand-in.
+    bga: crate::bga::BgaArray,
+    /// The last BGA array's serial.
+    bga_serial: u64,
+    /// The BGA table last published, keyed to the array its cells were
+    /// written into ([`publish_bga`](Self::publish_bga)).
+    bga_table: Arc<skin_model::bga::BgaTable>,
+    /// The batch of BGA cells in hand, written at frame boundaries
+    /// ([`bga_boundary`](Self::bga_boundary)).
+    bga_upload: Option<crate::bga::BgaUpload>,
+    /// The completion of the last BGA step submitted, until a boundary saw
+    /// it: no step is written while it is unset, whatever batch is in hand
+    /// (one step's staging in flight).
+    pub(crate) bga_in_flight: Option<Arc<std::sync::atomic::AtomicBool>>,
     instances: wgpu::Buffer,
     /// The batch, its staging copied into `instances` each frame, and the
     /// play skin's projection and clip scissors.
@@ -1349,6 +1377,25 @@ pub struct Renderer {
     /// opened.
     #[cfg(test)]
     pub(crate) decision_scope_pairs: std::cell::Cell<usize>,
+    /// Unit tests: the submissions of BGA steps made at frame boundaries.
+    #[cfg(test)]
+    pub(crate) bga_submits: std::cell::Cell<usize>,
+    /// Unit tests: a BGA step in flight taken as complete (`Some(true)`)
+    /// or not yet (`Some(false)`, its completion withheld) instead of
+    /// read from its flag.
+    #[cfg(test)]
+    pub(crate) bga_seen: std::cell::Cell<Option<bool>>,
+    /// Unit tests: the time each BGA step takes on the boundary's clock,
+    /// read instead of the real clock.
+    #[cfg(test)]
+    pub(crate) bga_step_cost: std::cell::Cell<Option<Duration>>,
+    /// Unit tests: run inside a BGA step's scopes before its writes, and
+    /// just before its submission, to make the device refuse there (or
+    /// the step take time).
+    #[cfg(test)]
+    pub(crate) bga_write_fault: Option<fn(&Gpu)>,
+    #[cfg(test)]
+    pub(crate) bga_submit_fault: Option<fn(&Gpu)>,
     /// Tests and development builds: the charges stated for bundles
     /// ([`state_charge`](Self::state_charge)).
     #[cfg(any(test, feature = "dev-tools"))]
@@ -1413,6 +1460,7 @@ impl Renderer {
         let (alpha, additive, multiply, bindings) = pipelines(&gpu, format);
         let atlas = AtlasTexture::builtin(&gpu);
         let atlas_bind = bindings.bind(device, &atlas, None);
+        let bga = crate::bga::BgaArray::stand_in(&gpu, &bindings.bga);
         let skin: Box<dyn PlaySkin> = Box::new(SimpleSkin::new());
         // The simple skin's runs are as many as its sprites, the staging's
         // default.
@@ -1434,6 +1482,11 @@ impl Renderer {
             bindings,
             atlas,
             atlas_bind,
+            bga,
+            bga_serial: 0,
+            bga_table: Arc::new(skin_model::bga::BgaTable::ABSENT),
+            bga_upload: None,
+            bga_in_flight: None,
             instances,
             staging,
             text_cache: TextCache::none(),
@@ -1516,6 +1569,16 @@ impl Renderer {
             decision_in_scope: None,
             #[cfg(test)]
             decision_scope_pairs: std::cell::Cell::new(0),
+            #[cfg(test)]
+            bga_submits: std::cell::Cell::new(0),
+            #[cfg(test)]
+            bga_seen: std::cell::Cell::new(None),
+            #[cfg(test)]
+            bga_step_cost: std::cell::Cell::new(None),
+            #[cfg(test)]
+            bga_write_fault: None,
+            #[cfg(test)]
+            bga_submit_fault: None,
             #[cfg(any(test, feature = "dev-tools"))]
             stated: Vec::new(),
             id: RENDERERS.fetch_add(1, Ordering::Relaxed),
@@ -1665,6 +1728,7 @@ impl Renderer {
             }
         }
         self.skin = skin;
+        self.skin.set_bga_images(Arc::clone(&self.bga_table));
         self.installed = None;
         self.chart = None;
         self.installed_text = Holder::default();
@@ -1791,6 +1855,7 @@ impl Renderer {
         self.skin
             .prepare(&self.gpu, &a)
             .map_err(RenderError::Skin)?;
+        self.skin.set_bga_images(Arc::clone(&self.bga_table));
         self.refused = None;
         self.project();
         finish_uploads(&self.gpu)
@@ -2394,6 +2459,7 @@ impl Renderer {
                 ..*a
             };
             skin.prepare(&self.gpu, &a).map_err(RenderError::Skin)?;
+            skin.set_bga_images(Arc::clone(&self.bga_table));
             if let Some(producer) = bundle.text_producer() {
                 let key = self.loading_text_key();
                 // The staging's own resources, or the installed ones,
@@ -2975,6 +3041,7 @@ impl Renderer {
     fn activate_decl_skin(&mut self, skin: DeclSkin) {
         self.installed = Some(skin.installation());
         self.skin = Box::new(skin);
+        self.skin.set_bga_images(Arc::clone(&self.bga_table));
         self.refused = None;
         self.loading_refused = None;
         self.started = None;
@@ -3680,6 +3747,250 @@ impl Renderer {
         })
     }
 
+    /// The live key of the BGA array: this renderer and the array's
+    /// serial; `None` with no array or once the device is lost. Frames are
+    /// built against it ([`PlaySkin::set_bga_live`]).
+    #[must_use]
+    pub fn bga_key(&self) -> Option<skin_model::bga::BgaKey> {
+        if self.gpu.lost() {
+            return None;
+        }
+        self.bga.key(self.id)
+    }
+
+    /// Begins a BGA array of `pages` pages (design.md "Rendering and
+    /// Skins", BGA): the array in use and the table published are dropped
+    /// first, so no frame draws a picture of either from now on. Returns
+    /// the new array's key, which its writes and publication name.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::BgaFault::Pages`] for a page count out of range or past the
+    /// device's limits, [`crate::BgaFault::Refused`] when the device
+    /// refuses the array: no array is left, and the pictures are absent.
+    pub fn begin_bga(&mut self, pages: u32) -> Result<skin_model::bga::BgaKey, crate::BgaFault> {
+        self.drop_bga();
+        self.bga_serial += 1;
+        let array =
+            crate::bga::BgaArray::new(&self.gpu, &self.bindings.bga, pages, self.bga_serial)?;
+        let key = array.key(self.id).ok_or(crate::BgaFault::Stale)?;
+        self.bga = array;
+        Ok(key)
+    }
+
+    /// Takes a batch of cells in hand for the array `key` names, each its
+    /// `texels` (premultiplied RGBA8 rows of its padded size) at its
+    /// place, written at the frame boundaries that follow
+    /// ([`bga_boundary`](Self::bga_boundary)); a batch still in hand is
+    /// dropped first, though a step of it in flight still holds the next
+    /// back until its completion is seen. Nothing is written here.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::BgaFault::Stale`] when `key` is not the array in use (or the
+    /// device is lost), [`crate::BgaFault::Cell`] for a cell off its page:
+    /// nothing is taken.
+    pub fn stage_bga_cells(
+        &mut self,
+        key: skin_model::bga::BgaKey,
+        cells: Vec<(skin_model::bga::CellPlace, Vec<u8>)>,
+    ) -> Result<(), crate::BgaFault> {
+        self.bga_upload = None;
+        if self.bga_key() != Some(key) {
+            return Err(crate::BgaFault::Stale);
+        }
+        self.bga_upload = Some(self.bga.upload(key, cells)?);
+        Ok(())
+    }
+
+    /// One frame boundary's steps of the batch in hand, outside every
+    /// frame, within [`UPLOAD_TIME_SLICE`](crate::UPLOAD_TIME_SLICE)
+    /// ([`bga_boundary_within`](Self::bga_boundary_within)).
+    pub fn bga_boundary(&mut self) -> crate::BgaStep {
+        self.bga_boundary_within(crate::UPLOAD_TIME_SLICE)
+    }
+
+    /// One frame boundary's steps of the batch in hand, outside every
+    /// frame, never waiting for the GPU. Each round polls without blocking,
+    /// then reads the device's loss. While the last step's completion is
+    /// unseen nothing is written; once it is seen, the batch is done if
+    /// every cell was written, and otherwise its next step goes, the
+    /// boundary's first always and a later one only while the boundary's
+    /// steps so far took less than `slice`: at most
+    /// [`BGA_WRITE_BUDGET`](crate::BGA_WRITE_BUDGET) bytes of its rows
+    /// written and submitted inside one pair of error scopes, then a
+    /// flag-only completion registered for that submission, with no other,
+    /// and the next round. So one step is in flight at a time, and a GPU
+    /// that completes a step at once takes several in a boundary. The
+    /// batch ends at once, dropped, when its array is no longer the one in
+    /// use or the device is lost ([`crate::BgaFault::Stale`]), or when the
+    /// device refused a step or the poll failed
+    /// ([`crate::BgaFault::Refused`]); a step it submitted stays in flight.
+    pub fn bga_boundary_within(&mut self, slice: Duration) -> crate::BgaStep {
+        let end = |r: &mut Self, result| {
+            r.bga_upload = None;
+            crate::BgaStep::Done(result)
+        };
+        let started = Instant::now();
+        let mut steps = 0_u32;
+        loop {
+            let Some(up) = self.bga_upload.as_ref() else {
+                return crate::BgaStep::Idle;
+            };
+            if self.bga.key(self.id) != Some(up.key) || self.gpu.lost() {
+                return end(self, Err(crate::BgaFault::Stale));
+            }
+            if self.gpu.device().poll(wgpu::PollType::Poll).is_err() {
+                return end(self, Err(crate::BgaFault::Refused));
+            }
+            if self.gpu.lost() {
+                return end(self, Err(crate::BgaFault::Stale));
+            }
+            if !self.bga_step_completed() {
+                return crate::BgaStep::Pending;
+            }
+            self.bga_in_flight = None;
+            if up.written() {
+                return end(self, Ok(()));
+            }
+            if steps > 0 && self.bga_elapsed(started, steps) >= slice {
+                return crate::BgaStep::Pending;
+            }
+            let Some(up) = self.bga_upload.as_mut() else {
+                return crate::BgaStep::Idle;
+            };
+            let (array, gpu) = (&self.bga, &self.gpu);
+            #[cfg(test)]
+            let (write_fault, submit_fault, submits) = (
+                self.bga_write_fault,
+                self.bga_submit_fault,
+                &self.bga_submits,
+            );
+            let ((), refused) = skin_atlas::scoped(gpu.device(), || {
+                #[cfg(test)]
+                if let Some(f) = write_fault {
+                    f(gpu);
+                }
+                array.write_some(gpu, up, crate::BGA_WRITE_BUDGET);
+                // The step's submission, in the same scopes as its writes:
+                // what the device refuses there is this step's refusal.
+                #[cfg(test)]
+                {
+                    if let Some(f) = submit_fault {
+                        f(gpu);
+                    }
+                    submits.set(submits.get() + 1);
+                }
+                gpu.queue().submit([]);
+            });
+            // In flight until a later round sees it, whatever becomes of
+            // the batch: the next step waits for it.
+            self.bga_in_flight = Some(crate::bga::completion(&self.gpu));
+            if refused.is_some() {
+                return end(self, Err(crate::BgaFault::Refused));
+            }
+            steps += 1;
+        }
+    }
+
+    /// The time the boundary's `steps` BGA steps took since `started`.
+    fn bga_elapsed(&self, started: Instant, steps: u32) -> Duration {
+        #[cfg(test)]
+        if let Some(each) = self.bga_step_cost.get() {
+            return each.saturating_mul(steps);
+        }
+        let _ = steps;
+        started.elapsed()
+    }
+
+    /// Whether the last BGA step's completion was seen (or none is in
+    /// flight).
+    fn bga_step_completed(&self) -> bool {
+        #[cfg(test)]
+        if let Some(seen) = self.bga_seen.get() {
+            return seen || self.bga_in_flight.is_none();
+        }
+        self.bga_in_flight
+            .as_ref()
+            .is_none_or(|f| f.load(std::sync::atomic::Ordering::Acquire))
+    }
+
+    /// Drops the batch of BGA cells in hand, if any, unwritten rows and
+    /// all: its generation is over.
+    pub fn cancel_bga_upload(&mut self) {
+        self.bga_upload = None;
+    }
+
+    /// The bytes of the BGA cells in hand, not yet written.
+    #[must_use]
+    pub fn bga_upload_bytes(&self) -> u64 {
+        self.bga_upload
+            .as_ref()
+            .map_or(0, crate::bga::BgaUpload::bytes)
+    }
+
+    /// Publishes `entries` as the BGA table of the array `key` names
+    /// (`None`: no array, every picture absent), which the play skin in
+    /// use, a staged one and every attempt prepared later draw from the
+    /// next frame on.
+    ///
+    /// # Errors
+    ///
+    /// [`crate::BgaFault::Stale`] when `key` is not the array in use: the
+    /// table is not published.
+    pub fn publish_bga(
+        &mut self,
+        key: Option<skin_model::bga::BgaKey>,
+        entries: Vec<skin_model::bga::BgaEntry>,
+    ) -> Result<Arc<skin_model::bga::BgaTable>, crate::BgaFault> {
+        let table = skin_model::bga::BgaTable::new(entries);
+        let table = match key {
+            Some(k) if self.bga_key() == Some(k) => table.keyed(k),
+            Some(_) => return Err(crate::BgaFault::Stale),
+            None => {
+                self.drop_bga();
+                table
+            }
+        };
+        self.set_bga_table(Arc::new(table));
+        Ok(Arc::clone(&self.bga_table))
+    }
+
+    /// The table published for the array `key` names, if it is still the
+    /// array in use with that table: what a later attempt of the same
+    /// pictures reuses without writing anything.
+    #[must_use]
+    pub fn published_bga(
+        &self,
+        key: skin_model::bga::BgaKey,
+    ) -> Option<Arc<skin_model::bga::BgaTable>> {
+        (self.bga_key() == Some(key) && self.bga_table.key() == Some(key))
+            .then(|| Arc::clone(&self.bga_table))
+    }
+
+    /// Drops the BGA array and its table: the stand-in is bound again.
+    pub fn drop_bga(&mut self) {
+        self.set_bga_table(Arc::new(skin_model::bga::BgaTable::ABSENT));
+        self.bga = crate::bga::BgaArray::stand_in(&self.gpu, &self.bindings.bga);
+    }
+
+    /// The BGA array's bytes on the GPU (0 for the stand-in).
+    #[must_use]
+    pub fn bga_bytes(&self) -> u64 {
+        self.bga.key(self.id).map_or(0, |_| self.bga.bytes())
+    }
+
+    fn set_bga_table(&mut self, table: Arc<skin_model::bga::BgaTable>) {
+        self.bga_table = table;
+        self.skin.set_bga_images(Arc::clone(&self.bga_table));
+        if let Some(Pending {
+            skin: Some(skin), ..
+        }) = &mut self.pending
+        {
+            skin.set_bga_images(Arc::clone(&self.bga_table));
+        }
+    }
+
     /// Copies the valid chart images ([`valid_chart`](Self::valid_chart))
     /// into the play installation's loading presentation, `None` without
     /// them, and into the committed attempt, absent without them.
@@ -4090,6 +4401,7 @@ impl Renderer {
         };
         let live = self.chart_key();
         self.skin.set_chart_live(live);
+        self.skin.set_bga_live(self.bga_key());
         if let Err(e) = self.staging.build(self.skin.as_mut(), &f) {
             self.refused = Some(e);
             return Err(e);
@@ -5699,6 +6011,7 @@ impl Renderer {
             });
             pass.set_viewport(x, y, w, h, 0.0, 1.0);
             pass.set_bind_group(0, atlas_bind, &[]);
+            pass.set_bind_group(1, &self.bga.bind, &[]);
             pass.set_vertex_buffer(0, instances.slice(..));
             // The runs in the batch's order, so each sprite is drawn over
             // every sprite pushed before it, whatever their blends. Each run
@@ -6177,6 +6490,7 @@ fn pipelines(
             },
         ],
     });
+    let bga = crate::bga::layout(device);
     // The pool binding of every bind group without a pool: one zeroed
     // texel, written so that it is not cleared at its first draw.
     let placeholder = device.create_texture(&wgpu::TextureDescriptor {
@@ -6199,11 +6513,12 @@ fn pipelines(
         label: Some("sprites"),
         source: wgpu::ShaderSource::Wgsl(SPRITE_WGSL.into()),
     });
-    let (alpha, additive, multiply) = sprite_pipelines(device, &layout, &module, format);
+    let (alpha, additive, multiply) = sprite_pipelines(device, &layout, &bga, &module, format);
     let bindings = Bindings {
         layout,
         smooth,
         nearest,
+        bga,
         projection,
         uploaded: None,
         placeholder,
@@ -6212,10 +6527,12 @@ fn pipelines(
 }
 
 /// The alpha, additive and multiply pipelines of the sprite shader
-/// `module` over bind group `layout` ([`pipelines`]).
+/// `module` over bind group `layout` and the BGA array's `bga`
+/// ([`pipelines`]).
 fn sprite_pipelines(
     device: &wgpu::Device,
     layout: &wgpu::BindGroupLayout,
+    bga: &wgpu::BindGroupLayout,
     module: &wgpu::ShaderModule,
     format: wgpu::TextureFormat,
 ) -> (
@@ -6225,7 +6542,7 @@ fn sprite_pipelines(
 ) {
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("sprites"),
-        bind_group_layouts: &[Some(layout)],
+        bind_group_layouts: &[Some(layout), Some(bga)],
         immediate_size: 0,
     });
     let pipeline = |blend, fragment| {

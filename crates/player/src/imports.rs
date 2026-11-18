@@ -117,6 +117,8 @@ const fn fact_name(fact: FactId) -> &'static str {
         FactId::Autoplay => "autoplay",
         FactId::JudgeClass => "the chart's judgment class",
         FactId::PlayLevel => "the chart's play level",
+        FactId::ChartTotal => "the chart's gauge total",
+        FactId::ChartNotes => "the chart's note count",
         FactId::ResultNumber(_) | FactId::ResultOption(_) => "the result's values",
     }
 }

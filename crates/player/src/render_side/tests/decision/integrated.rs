@@ -257,6 +257,11 @@ struct Seen {
     /// as in Closing.
     playing: AtomicU64,
     closing: AtomicU64,
+    /// Each attempt's `chart.difficulty` as its preparation reached the
+    /// screen.
+    play_difficulties: Mutex<Vec<Option<u8>>>,
+    /// Each result view's chart difficulty as its layout was prepared.
+    result_difficulties: Mutex<Vec<Option<u8>>>,
 }
 
 impl Seen {
@@ -350,6 +355,11 @@ impl Screen for Noted {
         skin: Option<&Arc<SkinBundle>>,
         request: u64,
     ) -> Option<Result<Preparation, RenderError>> {
+        self.seen
+            .play_difficulties
+            .lock()
+            .unwrap()
+            .push(a.context.meta.difficulty);
         self.menu.prepare_attempt(a, skin, request)
     }
     fn device(&self) -> u64 {
@@ -381,6 +391,38 @@ impl Screen for Noted {
     }
     fn chart_key(&self) -> Option<skin_model::chart_image::ChartKey> {
         self.menu.chart_key()
+    }
+    fn begin_bga(&mut self, pages: u32) -> Result<skin_model::bga::BgaKey, render::BgaFault> {
+        self.menu.begin_bga(pages)
+    }
+    fn stage_bga_cells(
+        &mut self,
+        key: skin_model::bga::BgaKey,
+        cells: Vec<(skin_model::bga::CellPlace, Vec<u8>)>,
+    ) -> Result<(), render::BgaFault> {
+        self.menu.stage_bga_cells(key, cells)
+    }
+    fn bga_boundary(&mut self) -> render::BgaStep {
+        self.menu.bga_boundary()
+    }
+    fn cancel_bga_upload(&mut self) {
+        self.menu.cancel_bga_upload();
+    }
+    fn publish_bga(
+        &mut self,
+        key: Option<skin_model::bga::BgaKey>,
+        entries: Vec<skin_model::bga::BgaEntry>,
+    ) -> Result<Arc<skin_model::bga::BgaTable>, render::BgaFault> {
+        self.menu.publish_bga(key, entries)
+    }
+    fn published_bga(
+        &self,
+        key: skin_model::bga::BgaKey,
+    ) -> Option<Arc<skin_model::bga::BgaTable>> {
+        self.menu.published_bga(key)
+    }
+    fn drop_bga(&mut self) {
+        self.menu.drop_bga();
     }
     fn install(
         &mut self,
@@ -437,6 +479,11 @@ impl Screen for Noted {
         view: &skin_model::ResultView,
         labels: &skin_model::ResultLabels,
     ) -> Result<Result<(), String>, RenderError> {
+        self.seen
+            .result_difficulties
+            .lock()
+            .unwrap()
+            .push(view.chart.difficulty);
         self.menu.prepare_result(skin, state, view, labels)
     }
     fn install_result_text(&mut self) -> bool {
@@ -1016,6 +1063,8 @@ struct Opts {
     user_preset: Option<rules::RulePreset>,
     /// The chart's text in place of the one-note chart.
     chart: Option<&'static str>,
+    /// A 640x480 `a.png` beside the chart.
+    picture: bool,
 }
 
 /// The sound set a run's system sounds pick: `clear` (1.25 s) and `fail`
@@ -1135,7 +1184,11 @@ fn run_with(
             .unwrap_or("#TITLE a\n#BPM 120\n#00111:01\n#00138:01\n"),
     )
     .unwrap();
-    let (mut sel, roots) = crate::selection::tests::over(charts.path(), vec![root]);
+    let (mut sel, roots) = crate::selection::tests::over(charts.path(), vec![root.clone()]);
+    // Written once the folder is listed, which counts its files.
+    if opts.picture {
+        crate::bga::tests::png(&root, "a.png", [640, 480], [200, 0, 0]);
+    }
     assert!(sel.screen.select_path(&roots[0].join("a.bms")));
     let chart = sel.screen.selected().unwrap().path.clone();
     let menu = Arc::clone(&sel.menu);
@@ -1720,6 +1773,161 @@ fn a_later_decision_build_made_to_allocate_is_counted() {
     for line in ["decision_app = 1", "render_app = 0"] {
         assert!(text.lines().any(|l| l == line), "{line}: {text}");
     }
+}
+
+/// A choice of a chart with a BGA, made with the clock held 600 s from its
+/// origin, writes the load's stages beside the play it led to
+/// (`[load_stages]`): each in µs from the choice, so below 600 s; each
+/// job's start no later than its end; the decision screen's end no earlier
+/// than the built-in presentation's 1.5 s, the loading minimum's end at
+/// least 1 s after it; the one picture's file, read 30 ms slower, read
+/// whole after the packing and before its decode, its time in the reads'
+/// busy time; READY last.
+#[test]
+fn load_stages_are_recorded_in_order() {
+    /// Reads at full speed again when dropped, a failing test's included.
+    struct Quick;
+    impl Drop for Quick {
+        fn drop(&mut self) {
+            crate::bga::READ_DELAY_MS.store(0, Ordering::SeqCst);
+        }
+    }
+    let _quick = Quick;
+    crate::bga::READ_DELAY_MS.store(30, Ordering::SeqCst);
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        saved: true,
+        picture: true,
+        chart: Some("#TITLE a\n#BPM 120\n#BMP01 a.png\n#00004:01\n#00111:01\n#00138:01\n"),
+        ..Opts::default()
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        side.prepared();
+        side.hold_clock();
+        side.clock.set(TimeUs(600_000_000));
+        let (chosen, ..) = side.choose(MenuKey::Enter);
+        assert_eq!(chosen, TimeUs(600_000_000));
+        side.to_loading();
+        side.seen.until("the result skin", |d| {
+            d.iter()
+                .any(|d| matches!(d.frame, Frame::Result { quads, .. } if quads > 0))
+        });
+    });
+    let stages = load_stages(&ran);
+    let at = |k: &str| stage_at(&stages, k);
+    for (k, v) in &stages {
+        assert!((0..600_000_000).contains(v), "{k} = {v}: from the choice");
+    }
+    for stage in [
+        "chart",
+        "sounds",
+        "loudness",
+        "bga",
+        "bga_reads",
+        "bga_packing",
+        "bga_decodes",
+        "bga_upload",
+    ] {
+        let (start, end) = (at(&format!("{stage}_start")), at(&format!("{stage}_end")));
+        assert!(start <= end, "{stage}: {start} {end}");
+    }
+    // The one picture's file is read whole after the packing, and decoded
+    // after it is read: the reads end there, the decodes span the decode,
+    // and the read's 30 ms count as reading.
+    assert!(at("bga_reads_end") > at("bga_packing_end"), "{stages:?}");
+    assert!(at("bga_reads_end") <= at("bga_decodes_start"), "{stages:?}");
+    assert!(at("bga_reads_busy") >= 30_000, "{stages:?}");
+    assert!(at("bga_decodes_busy") >= 0, "{stages:?}");
+    let decided = at("decision_end");
+    assert!(decided >= 1_500_000, "{stages:?}");
+    assert!(at("minimum_end") >= decided + 1_000_000, "{stages:?}");
+    let ready = at("ready");
+    assert_eq!(
+        stages.last().map(|s| s.0.as_str()),
+        Some("ready"),
+        "{stages:?}"
+    );
+    assert!(stages.iter().all(|&(_, v)| v <= ready), "{stages:?}");
+}
+
+/// The `[load_stages]` of the one play `ran` saved, in their order.
+#[track_caller]
+fn load_stages(ran: &Ran) -> Vec<(String, i64)> {
+    assert!(ran.ran.is_ok(), "{:?}", ran.ran);
+    let [(_, text)] = &ran.measured[..] else {
+        panic!("one saved play: {:?}", ran.measured);
+    };
+    let section = text
+        .split("[load_stages]\n")
+        .nth(1)
+        .unwrap_or_else(|| panic!("no load stages: {text}"));
+    section
+        .lines()
+        .take_while(|l| !l.is_empty() && !l.starts_with('['))
+        .map(|l| {
+            let (k, v) = l.split_once(" = ").unwrap();
+            (k.to_owned(), v.parse().unwrap())
+        })
+        .collect()
+}
+
+/// Stage `k` of `stages`, which must be there.
+#[track_caller]
+fn stage_at(stages: &[(String, i64)], k: &str) -> i64 {
+    stages
+        .iter()
+        .find(|(n, _)| n == k)
+        .map(|&(_, v)| v)
+        .unwrap_or_else(|| panic!("{k}: {stages:?}"))
+}
+
+/// A decision screen whose deadline passes while the chart's load still
+/// runs (held at its start) takes its step inside the load's wait, and
+/// its end is recorded there: at least the built-in presentation's 1.5 s,
+/// before the sounds' load began.
+#[test]
+fn a_decision_ended_inside_the_load_s_wait_is_recorded() {
+    /// Lets the load go when dropped, a failing test's included.
+    struct LetGo;
+    impl Drop for LetGo {
+        fn drop(&mut self) {
+            crate::selection::LOAD_HOLD.store(false, Ordering::Release);
+        }
+    }
+    let _let_go = LetGo;
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        saved: true,
+        ..Opts::default()
+    };
+    crate::selection::LOAD_HOLD.store(true, Ordering::Release);
+    let ran = run_with(&set, None, opts, |side| {
+        side.prepared();
+        side.hold_clock();
+        side.clock.set(TimeUs(600_000_000));
+        side.choose(MenuKey::Enter);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !crate::selection::LOAD_HELD.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < end, "the load never held");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // The deadline passes while the load is held: its step is taken
+        // by the held wait's look.
+        side.to_loading();
+        assert!(
+            crate::selection::LOAD_HELD.load(Ordering::Acquire),
+            "still held"
+        );
+        crate::selection::LOAD_HOLD.store(false, Ordering::Release);
+        side.seen.until("the result skin", |d| {
+            d.iter()
+                .any(|d| matches!(d.frame, Frame::Result { quads, .. } if quads > 0))
+        });
+    });
+    let stages = load_stages(&ran);
+    let decided = stage_at(&stages, "decision_end");
+    assert!(decided >= 1_500_000, "{stages:?}");
+    assert!(decided < stage_at(&stages, "sounds_start"), "{stages:?}");
 }
 
 /// The second build made to allocate inside the skin's build, then
@@ -2827,6 +3035,50 @@ fn result_sounds_through_a_run() {
             i += 1;
         }
     }
+}
+
+/// A chart that declares no `#DIFFICULTY`, its subtitle naming the third
+/// keyword step and its one note giving 1 by count, chosen on selection:
+/// the library's inferred difficulty (3) is what its play's
+/// `chart.difficulty` and its result's chart show, never the attempt's
+/// own header (none: 0 on play, none on the result).
+// Source: SF-021
+#[test]
+fn a_chosen_charts_stored_difficulty_reaches_play_and_result() {
+    let set = Set::with_result("s.luaskin", Some(result_skin(0)));
+    let opts = Opts {
+        user_preset: Some(user_preset(true)),
+        chart: Some("#TITLE a\n#SUBTITLE [HYPER]\n#BPM 120\n#00111:01\n#00138:01\n"),
+        ..Opts::default()
+    };
+    let seen = Arc::new(Mutex::new((Vec::new(), Vec::new())));
+    let out = Arc::clone(&seen);
+    let ran = run_with(&set, None, opts, move |side| {
+        side.prepared();
+        let (chosen, ..) = side.choose(MenuKey::Enter);
+        // The decision screen's scene and fade-out over at once.
+        side.clock.set(TimeUs(chosen.0 + 3_000 * MS));
+        side.to_loading();
+        side.seen
+            .until("a play frame", |d| d.iter().any(|d| d.frame == Frame::Play));
+        side.clock.run();
+        side.seen.until("the result's first frame", |d| {
+            d.iter()
+                .any(|d| matches!(d.frame, Frame::Result { quads, .. } if quads > 0))
+        });
+        *out.lock().unwrap() = (
+            side.seen.play_difficulties.lock().unwrap().clone(),
+            side.seen.result_difficulties.lock().unwrap().clone(),
+        );
+    });
+    assert!(ran.ran.is_ok(), "{:?}", ran.ran);
+    let (play, result) = seen.lock().unwrap().clone();
+    assert!(
+        !play.is_empty() && !result.is_empty(),
+        "{play:?} {result:?}"
+    );
+    assert!(play.iter().all(|d| *d == Some(3)), "play: {play:?}");
+    assert!(result.iter().all(|d| *d == Some(3)), "result: {result:?}");
 }
 
 /// C26-1, C26-2, C26-3 through the whole run, the system sounds armed with

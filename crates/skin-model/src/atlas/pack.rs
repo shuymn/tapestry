@@ -82,8 +82,8 @@ pub(crate) fn order(padded: &[[u32; 2]]) -> Vec<usize> {
     order
 }
 
-fn allocator(side: i32) -> AtlasAllocator {
-    let a = i32::try_from(ALIGN).unwrap_or(1);
+fn allocator(side: i32, align: u32) -> AtlasAllocator {
+    let a = i32::try_from(align).unwrap_or(1);
     AtlasAllocator::with_options(
         size2(side, side),
         &AllocatorOptions {
@@ -104,6 +104,19 @@ pub(crate) fn pack_side(
     max_pages: u32,
     per_page: usize,
 ) -> Result<Option<Packing>, PackError> {
+    pack_side_aligned(padded, order, side, max_pages, per_page, ALIGN)
+}
+
+/// [`pack_side`] with every place a multiple of `align` (at least 1).
+pub(crate) fn pack_side_aligned(
+    padded: &[[u32; 2]],
+    order: &[usize],
+    side: u32,
+    max_pages: u32,
+    per_page: usize,
+    align: u32,
+) -> Result<Option<Packing>, PackError> {
+    let align = align.max(1);
     let Ok(side_i) = i32::try_from(side) else {
         return Ok(None);
     };
@@ -140,7 +153,7 @@ pub(crate) fn pack_side(
             if page >= max_pages || per_page == 0 {
                 return Ok(None);
             }
-            let mut alloc = allocator(side_i);
+            let mut alloc = allocator(side_i, align);
             let Some(a) = alloc.allocate(size) else {
                 return Ok(None);
             };
@@ -151,7 +164,7 @@ pub(crate) fn pack_side(
         let [Some(x), Some(y), Some(rw), Some(rh)] = rect else {
             return Err(PackError::Misaligned);
         };
-        let aligned = [x, y, rw, rh].iter().all(|v| v % ALIGN == 0);
+        let aligned = [x, y, rw, rh].iter().all(|v| v % align == 0);
         let [pw, ph] = [w, h].map(|v| u32::try_from(v).unwrap_or(u32::MAX));
         if !aligned || rw < pw || rh < ph || x + rw > side || y + rh > side {
             return Err(PackError::Misaligned);

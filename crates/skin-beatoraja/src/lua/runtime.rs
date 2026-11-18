@@ -385,8 +385,10 @@ impl Screen {
         self.numbers.len() + self.options.len()
     }
 
-    /// `main_state.number(id)`: the bridge's value, `HIDDEN` while its
-    /// guard is false; `None` for an id the profile does not bridge, which
+    /// `main_state.number(id)`: the bridge's value; while its guard is
+    /// false, on selection the property's absent value
+    /// ([`sel::absent_number`], the one a lowered read takes), on the
+    /// result `HIDDEN`; `None` for an id the profile does not bridge, which
     /// is classified again at each read and never cached.
     pub(crate) fn number(&mut self, id: i32) -> Option<i32> {
         if !self.numbers.contains_key(&id) {
@@ -414,8 +416,17 @@ impl Screen {
         Some(if b.guard.as_ref().is_none_or(|g| g.eval_bool(&st)) {
             b.value.eval(&st)
         } else {
-            HIDDEN
+            self.absent_number(id)
         })
+    }
+
+    /// What number `id` reads while its bridge's guard is false.
+    // Source: SF-020
+    fn absent_number(&self, id: i32) -> i32 {
+        match self.kind {
+            ScreenKind::Selection => sel::absent_number(id).unwrap_or(HIDDEN),
+            ScreenKind::Result | ScreenKind::Play | ScreenKind::Decision => HIDDEN,
+        }
     }
 
     /// `main_state.option(id)` for a positive `id`: the BGA setting's

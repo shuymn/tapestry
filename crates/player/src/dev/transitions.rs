@@ -1,18 +1,21 @@
 //! A scenario run's transition record (dev-tools, design.md "Shortening
 //! Launch-Based Checks", transition record).
 //!
-//! The render thread's frame sink keeps fixed-size records of the presented
-//! frames in a book allocated before the run starts: a **transition** at
-//! each change of a frame's state or of that state's lifetime, a
-//! **presentation** change when only what drew it changes, a **span**
-//! summary closing each run of frames of one state and lifetime, and the
-//! **marks** that annotate time: the pending presentation's hold, the
-//! result's preparation and the sink's own capture read-backs. Nothing is
-//! printed during the run: once the render thread has ended, the main
-//! thread formats the book ([`Transitions::lines`]).
+//! The render thread's frame sink appends fixed-size raw records to a book
+//! allocated before the run starts: each present, with the stage it was
+//! drawn for and the frames not presented before it; each mark that
+//! annotates time (the pending presentation's hold, the sink's own capture
+//! read-backs); the play's end; and the result taken. Nothing is derived
+//! or printed during the run: once the render thread has ended, the main
+//! thread derives the record from them ([`Transitions::lines`]): a
+//! **transition** at each change of a frame's state or of that state's
+//! lifetime, a **presentation** change when only what drew it changes, a
+//! **span** summary closing each run of frames of one state and lifetime,
+//! and the marks, the result's preparation among them, paired from the
+//! play's end and the result taken.
 //!
 //! Every gap between two presents keeps its raw duration. Marks are
-//! annotations, not exemptions: [`coverage`] clips each mark to the gap,
+//! annotations, not exemptions: [`coverage`] clips every mark to the gap,
 //! merges overlapping marks so no time is counted twice, and keeps what no
 //! mark covers, its largest uncovered piece with its endpoints; a count of
 //! frames not presented covers no time.
@@ -27,14 +30,11 @@ use bms_model::TimeUs;
 
 use crate::measure::{HoldEnd, HoldStamp, Stage, State};
 
-/// The records a scenario run keeps (provisional: about 170 for the exit
-/// scenario, 20 to 50 for one gate chain). Past it each record is counted
-/// as lost and the run fails.
-pub const MAX_RECORDS: usize = 4096;
-
-/// The marks that may annotate one gap; a mark past them is counted as
-/// dropped and covers nothing.
-pub const MAX_MARKS: usize = 8;
+/// The raw records a scenario run keeps: its presents and marks
+/// (provisional, sized for the 600 s render timeout at about 60 presents a
+/// second, with room for the marks). Past it each record is counted as
+/// lost and the run fails.
+pub const MAX_RECORDS: usize = 65_536;
 
 /// What a mark annotates.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -92,7 +92,24 @@ impl Gap {
     }
 }
 
-/// A change between two presented frames.
+/// A change between two presented frames, as the render thread sees it
+/// when the later one is presented (for its capture).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Change {
+    /// Whether only what drew the frames changed, not their state or its
+    /// lifetime.
+    pub presentation: bool,
+    /// The last frame's stage before the change.
+    pub from: Stage,
+    /// The first frame's stage after it.
+    pub to: Stage,
+    /// The last present before the change.
+    pub last: TimeUs,
+    /// The first present after it.
+    pub first: TimeUs,
+}
+
+/// A change between two presented frames, with its interval's coverage.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Edge {
     /// Whether the state or its lifetime changed, or only what drew it.
@@ -124,7 +141,7 @@ pub struct Span {
     pub uncovered: Option<Gap>,
 }
 
-/// One record.
+/// One record of the derived transition record.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Record {
     /// A transition or a presentation change.
@@ -135,20 +152,41 @@ pub enum Record {
     Mark(Mark),
 }
 
-/// The records of a run, kept in place.
+/// What the render thread appends to the book.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Raw {
+    /// A presented frame of `stage` at `at`, after `unpresented` frames
+    /// not presented since the last present.
+    Present {
+        stage: Stage,
+        at: TimeUs,
+        unpresented: u32,
+    },
+    /// A hold or a read-back.
+    Mark(Mark),
+    /// The play's in-play interval ended.
+    PlayEnded(TimeUs),
+    /// The render thread took a result's presentation or the built-in
+    /// result's page.
+    ResultTaken(TimeUs),
+}
+
+/// The raw records of a run, kept in place.
 #[derive(Debug)]
 pub struct Book {
-    records: Vec<Record>,
+    raw: Vec<Raw>,
     cap: usize,
     lost: u64,
-    readbacks: u64,
-    dropped: u64,
+    /// Whether the sink read a frame back, kept even when that mark is
+    /// lost past the cap: the run is instrumented either way.
+    read_back: bool,
 }
 
 impl Book {
-    fn push(&mut self, r: Record) {
-        if self.records.len() < self.cap {
-            self.records.push(r);
+    /// Keeps `r`, or counts it lost past the cap.
+    fn push(&mut self, r: Raw) {
+        if self.raw.len() < self.cap {
+            self.raw.push(r);
         } else {
             self.lost = self.lost.saturating_add(1);
         }
@@ -167,15 +205,14 @@ impl Default for Transitions {
 }
 
 impl Transitions {
-    /// A book of `cap` records, allocated now.
+    /// A book of `cap` raw records, allocated now.
     #[must_use]
     pub fn with_capacity(cap: usize) -> Self {
         Self(Arc::new(Mutex::new(Book {
-            records: Vec::with_capacity(cap),
+            raw: Vec::with_capacity(cap),
             cap,
             lost: 0,
-            readbacks: 0,
-            dropped: 0,
+            read_back: false,
         })))
     }
 
@@ -183,30 +220,25 @@ impl Transitions {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    fn push(&self, r: Record) {
+    fn push(&self, r: Raw) {
         let mut b = self.lock();
-        if let Record::Mark(Mark {
+        if let Raw::Mark(Mark {
             kind: MarkKind::ReadBack,
             ..
         }) = r
         {
-            b.readbacks = b.readbacks.saturating_add(1);
+            b.read_back = true;
         }
         b.push(r);
     }
 
-    fn dropped_mark(&self) {
-        let mut b = self.lock();
-        b.dropped = b.dropped.saturating_add(1);
-    }
-
-    /// The records kept so far (tests).
+    /// The record derived from the raw records kept so far (tests).
     #[cfg(test)]
     pub fn records(&self) -> Vec<Record> {
-        self.lock().records.clone()
+        derive(&self.lock().raw)
     }
 
-    /// The records lost past the cap (tests).
+    /// The raw records lost past the cap (tests).
     #[cfg(test)]
     pub fn lost(&self) -> u64 {
         self.lock().lost
@@ -219,9 +251,9 @@ impl Transitions {
     }
 
     /// The book's lines (design.md "Shortening Launch-Based Checks"),
-    /// formatted off the render thread once it has ended, and the run's
-    /// failure if records were lost; an error when the book is still held
-    /// (a render thread that did not end).
+    /// derived and formatted off the render thread once it has ended, and
+    /// the run's failure if raw records were lost; an error when the book
+    /// is still held (a render thread that did not end).
     ///
     /// # Errors
     ///
@@ -234,18 +266,162 @@ impl Transitions {
                 return Err("the transition record is held by the render thread".to_owned());
             }
         };
-        Ok(format_book(&b))
+        let lines = format_records(&derive(&b.raw), b.read_back, b.lost);
+        let failure = (b.lost > 0).then(|| {
+            format!(
+                "{} transition records were lost past the cap of {}",
+                b.lost, b.cap
+            )
+        });
+        Ok((lines, failure))
     }
 }
 
-/// The book's lines, then its failure if records were lost.
-fn format_book(b: &Book) -> (Vec<String>, Option<String>) {
-    let tag = if b.readbacks > 0 {
-        ", instrumented"
+/// Whether the frame of `stage` after one of `last` is a change: `Some`
+/// with whether only what drew it changed, `None` within a span drawn
+/// alike.
+fn change(last: Stage, stage: Stage) -> Option<bool> {
+    if last.state != stage.state || last.lifetime != stage.lifetime {
+        Some(false)
+    } else if last.drew != stage.drew {
+        Some(true)
     } else {
-        ""
-    };
-    let mut lines = Vec::with_capacity(b.records.len() + 1);
+        None
+    }
+}
+
+/// Every mark of the run, each with the raw record its line follows: the
+/// recorded holds and read-backs, and each result's preparation, from the
+/// play's end to the result taken. A play that ended without a result
+/// marks nothing: a frame of another attempt (a retry withdrawing it), or
+/// of a state outside the play other than the result (its practice page,
+/// selection), withdraws its preparation; a change of phase within the
+/// attempt (its stopped view, the tail or Closing, presented after its
+/// end) keeps it.
+fn marks_of(raw: &[Raw]) -> Vec<(usize, Mark)> {
+    let mut marks = Vec::new();
+    let mut preparing: Option<TimeUs> = None;
+    let mut last: Option<Stage> = None;
+    for (i, r) in raw.iter().enumerate() {
+        match *r {
+            Raw::Mark(m) => marks.push((i, m)),
+            Raw::PlayEnded(at) => preparing = Some(at),
+            Raw::Present { stage, .. } => {
+                let other_attempt = last.is_some_and(|l| l.lifetime != stage.lifetime);
+                if stage.state != State::Result && (!is_play(stage.state) || other_attempt) {
+                    preparing = None;
+                }
+                last = Some(stage);
+            }
+            Raw::ResultTaken(at) => {
+                if let Some(from) = preparing.take() {
+                    marks.push((
+                        i,
+                        Mark {
+                            kind: MarkKind::Preparing,
+                            from,
+                            to: at,
+                        },
+                    ));
+                }
+            }
+        }
+    }
+    marks
+}
+
+/// The record derived from the raw records: spans, changes and marks in
+/// the order they happened, every gap covered by every mark of the run.
+fn derive(raw: &[Raw]) -> Vec<Record> {
+    let marks = marks_of(raw);
+    let all: Vec<Mark> = marks.iter().map(|&(_, m)| m).collect();
+    let mut placed = marks.iter().peekable();
+    let mut out = Vec::new();
+    let mut last: Option<(Stage, TimeUs)> = None;
+    let mut open: Option<Span> = None;
+    for (i, r) in raw.iter().enumerate() {
+        if let Raw::Present {
+            stage,
+            at,
+            unpresented,
+        } = *r
+        {
+            match (last, open) {
+                (Some((l, l_at)), Some(mut s)) => {
+                    let gap = Gap {
+                        from: l_at,
+                        to: at,
+                        cover: coverage(l_at, at, &all),
+                        unpresented,
+                    };
+                    match change(l, stage) {
+                        Some(false) => {
+                            out.push(Record::Span(s));
+                            out.push(Record::Edge(Edge {
+                                presentation: false,
+                                from: l,
+                                to: stage,
+                                gap,
+                            }));
+                            open = Some(opened(stage, at));
+                        }
+                        presentation => {
+                            if presentation.is_some() {
+                                out.push(Record::Edge(Edge {
+                                    presentation: true,
+                                    from: l,
+                                    to: stage,
+                                    gap,
+                                }));
+                            }
+                            s.frames = s.frames.saturating_add(1);
+                            s.unpresented = s.unpresented.saturating_add(unpresented);
+                            s.last = at;
+                            if s.longest.is_none_or(|g| gap.len() > g.len()) {
+                                s.longest = Some(gap);
+                            }
+                            if gap.cover.uncovered > 0
+                                && s.uncovered
+                                    .is_none_or(|u| gap.cover.uncovered > u.cover.uncovered)
+                            {
+                                s.uncovered = Some(gap);
+                            }
+                            open = Some(s);
+                        }
+                    }
+                }
+                _ => open = Some(opened(stage, at)),
+            }
+            last = Some((stage, at));
+        }
+        while let Some(&(_, m)) = placed.next_if(|&&(j, _)| j == i) {
+            out.push(Record::Mark(m));
+        }
+    }
+    // The run's end closes the open span.
+    if let Some(s) = open {
+        out.push(Record::Span(s));
+    }
+    out
+}
+
+/// A span opened by the frame of `stage` presented at `at`.
+const fn opened(stage: Stage, at: TimeUs) -> Span {
+    Span {
+        stage,
+        frames: 1,
+        unpresented: 0,
+        first: at,
+        last: at,
+        longest: None,
+        uncovered: None,
+    }
+}
+
+/// The record's lines, then its summary.
+fn format_records(records: &[Record], instrumented: bool, lost: u64) -> Vec<String> {
+    let tag = if instrumented { ", instrumented" } else { "" };
+    let mut lines = Vec::with_capacity(records.len() + 1);
     // The largest uncovered time of any gap or interval, and where.
     let mut worst: Option<(Gap, String)> = None;
     let mut consider = |gap: Gap, at: &dyn Fn() -> String| {
@@ -257,7 +433,7 @@ fn format_book(b: &Book) -> (Vec<String>, Option<String>) {
             worst = Some((gap, at()));
         }
     };
-    for r in &b.records {
+    for r in records {
         let line = match r {
             Record::Edge(e) if e.presentation => format!(
                 "dev: presentation {} {}: {} -> {}: {} us, last {} us, first {} us{}{tag}",
@@ -319,18 +495,10 @@ fn format_book(b: &Book) -> (Vec<String>, Option<String>) {
         },
     );
     lines.push(format!(
-        "dev: transitions: {} records, lost {}, marks dropped {}, largest uncovered {largest}{tag}",
-        b.records.len(),
-        b.lost,
-        b.dropped
+        "dev: transitions: {} records, lost {lost}, largest uncovered {largest}{tag}",
+        records.len(),
     ));
-    let failure = (b.lost > 0).then(|| {
-        format!(
-            "{} transition records were lost past the cap of {}",
-            b.lost, b.cap
-        )
-    });
-    (lines, failure)
+    lines
 }
 
 /// A gap's covered and uncovered time, and its frames not presented.
@@ -406,18 +574,15 @@ const fn mark_name(k: MarkKind) -> &'static str {
 
 /// How much of the gap from `from` to `to` the marks cover: each clipped to
 /// the gap, overlaps merged so no time counts twice, and the largest piece
-/// no mark covers. Allocates nothing.
+/// no mark covers.
 #[must_use]
-pub fn coverage(from: TimeUs, to: TimeUs, marks: &[Option<Mark>]) -> Coverage {
+pub fn coverage(from: TimeUs, to: TimeUs, marks: &[Mark]) -> Coverage {
     let (g0, g1) = (from.0, to.0);
-    // The clipped intervals; empty slots sort last.
-    let mut clipped = [(i64::MAX, i64::MAX); MAX_MARKS];
-    for (slot, m) in clipped.iter_mut().zip(marks.iter().flatten()) {
-        let (a, b) = (m.from.0.max(g0), m.to.0.min(g1));
-        if a < b {
-            *slot = (a, b);
-        }
-    }
+    let mut clipped: Vec<(i64, i64)> = marks
+        .iter()
+        .map(|m| (m.from.0.max(g0), m.to.0.min(g1)))
+        .filter(|&(a, b)| a < b)
+        .collect();
     clipped.sort_unstable();
     let mut cursor = g0;
     let mut uncovered = 0;
@@ -430,7 +595,7 @@ pub fn coverage(from: TimeUs, to: TimeUs, marks: &[Option<Mark>]) -> Coverage {
             }
         }
     };
-    for &(a, b) in clipped.iter().take_while(|&&(a, _)| a != i64::MAX) {
+    for (a, b) in clipped {
         open(cursor, a, &mut uncovered);
         cursor = cursor.max(b);
     }
@@ -443,20 +608,14 @@ pub fn coverage(from: TimeUs, to: TimeUs, marks: &[Option<Mark>]) -> Coverage {
 }
 
 /// The render thread's recorder: it sees each frame the sink sees and
-/// writes finished records into the book; it allocates nothing.
+/// appends raw records to the book; it allocates nothing.
 #[derive(Debug)]
 pub struct Recorder {
     book: Transitions,
     /// The last presented frame's stage and present.
     last: Option<(Stage, TimeUs)>,
-    /// The span the last presented frame belongs to.
-    open: Option<Span>,
-    /// The marks that may still lie in a gap to come.
-    marks: [Option<Mark>; MAX_MARKS],
     /// The frames not presented since the last present.
     unpresented: u32,
-    /// The play's end, while its result is prepared.
-    preparing: Option<TimeUs>,
     /// The loading lifetime whose hold is marked.
     held: Option<u64>,
 }
@@ -464,14 +623,11 @@ pub struct Recorder {
 impl Recorder {
     /// A recorder writing into `book`.
     #[must_use]
-    pub fn new(book: Transitions) -> Self {
+    pub const fn new(book: Transitions) -> Self {
         Self {
             book,
             last: None,
-            open: None,
-            marks: [None; MAX_MARKS],
             unpresented: 0,
-            preparing: None,
             held: None,
         }
     }
@@ -482,86 +638,29 @@ impl Recorder {
     }
 
     /// A presented frame of `stage` at `at`, with its loading lifetime's
-    /// hold if the render thread held it. Returns the change it recorded:
-    /// a transition, or a presentation change.
-    pub fn frame(&mut self, stage: Stage, at: TimeUs, hold: Option<HoldStamp>) -> Option<Edge> {
+    /// hold if the render thread held it. Returns the change it ends: a
+    /// transition, or a presentation change.
+    pub fn frame(&mut self, stage: Stage, at: TimeUs, hold: Option<HoldStamp>) -> Option<Change> {
         if let Some(h) = hold {
             self.hold(h);
         }
-        // A play that ended without a result: its preparation is no
-        // result's, and marks nothing.
-        if self.preparing.is_some() && !is_play(stage.state) && stage.state != State::Result {
-            self.preparing = None;
-        }
         let unpresented = std::mem::take(&mut self.unpresented);
-        let mut change = None;
-        match (self.last, self.open) {
-            (Some((last, last_at)), Some(mut s)) => {
-                let gap = Gap {
-                    from: last_at,
-                    to: at,
-                    cover: coverage(last_at, at, &self.marks),
-                    unpresented,
-                };
-                if last.state != stage.state || last.lifetime != stage.lifetime {
-                    self.book.push(Record::Span(s));
-                    let edge = Edge {
-                        presentation: false,
-                        from: last,
-                        to: stage,
-                        gap,
-                    };
-                    self.book.push(Record::Edge(edge));
-                    change = Some(edge);
-                    self.open = Some(Self::opened(stage, at));
-                } else {
-                    if last.drew != stage.drew {
-                        let edge = Edge {
-                            presentation: true,
-                            from: last,
-                            to: stage,
-                            gap,
-                        };
-                        self.book.push(Record::Edge(edge));
-                        change = Some(edge);
-                    }
-                    s.frames = s.frames.saturating_add(1);
-                    s.unpresented = s.unpresented.saturating_add(unpresented);
-                    s.last = at;
-                    if s.longest.is_none_or(|l| gap.len() > l.len()) {
-                        s.longest = Some(gap);
-                    }
-                    if gap.cover.uncovered > 0
-                        && s.uncovered
-                            .is_none_or(|u| gap.cover.uncovered > u.cover.uncovered)
-                    {
-                        s.uncovered = Some(gap);
-                    }
-                    self.open = Some(s);
-                }
-            }
-            _ => self.open = Some(Self::opened(stage, at)),
-        }
-        self.last = Some((stage, at));
-        // A mark that ended by this present lies in no later gap.
-        for slot in &mut self.marks {
-            if slot.is_some_and(|m| m.to.0 <= at.0) {
-                *slot = None;
-            }
-        }
-        change
-    }
-
-    const fn opened(stage: Stage, at: TimeUs) -> Span {
-        Span {
+        self.book.push(Raw::Present {
             stage,
-            frames: 1,
-            unpresented: 0,
-            first: at,
-            last: at,
-            longest: None,
-            uncovered: None,
-        }
+            at,
+            unpresented,
+        });
+        let ended = self.last.and_then(|(last, last_at)| {
+            change(last, stage).map(|presentation| Change {
+                presentation,
+                from: last,
+                to: stage,
+                last: last_at,
+                first: at,
+            })
+        });
+        self.last = Some((stage, at));
+        ended
     }
 
     /// The hold of loading lifetime `h.lifetime`, marked once per lifetime.
@@ -576,38 +675,20 @@ impl Recorder {
         }
     }
 
-    /// Records `m` and keeps it for the gaps it may lie in.
-    pub fn mark(&mut self, m: Mark) {
-        self.book.push(Record::Mark(m));
-        if let Some(slot) = self.marks.iter_mut().find(|s| s.is_none()) {
-            *slot = Some(m);
-        } else {
-            self.book.dropped_mark();
-        }
+    /// Records `m`.
+    pub fn mark(&self, m: Mark) {
+        self.book.push(Raw::Mark(m));
     }
 
     /// The play's in-play interval ended at `at`.
-    pub const fn play_ended(&mut self, at: TimeUs) {
-        self.preparing = Some(at);
+    pub fn play_ended(&self, at: TimeUs) {
+        self.book.push(Raw::PlayEnded(at));
     }
 
     /// The render thread took a result's presentation or the built-in
     /// result's page at `at`: the result was prepared since the play ended.
-    pub fn result_taken(&mut self, at: TimeUs) {
-        if let Some(from) = self.preparing.take() {
-            self.mark(Mark {
-                kind: MarkKind::Preparing,
-                from,
-                to: at,
-            });
-        }
-    }
-
-    /// The run ended: the open span is recorded.
-    pub fn close(&mut self) {
-        if let Some(open) = self.open.take() {
-            self.book.push(Record::Span(open));
-        }
+    pub fn result_taken(&self, at: TimeUs) {
+        self.book.push(Raw::ResultTaken(at));
     }
 }
 
@@ -680,8 +761,9 @@ mod tests {
             TimeUs(13_016_700),
             None,
         );
-        let [s] = spans(&book)[..] else {
-            panic!("one span: {:?}", book.records());
+        // The run's end closes the play's span too.
+        let [s, _] = spans(&book)[..] else {
+            panic!("two spans: {:?}", book.records());
         };
         assert_eq!((s.frames, s.unpresented), (3, 1));
         let g = s.longest.unwrap();
@@ -705,15 +787,14 @@ mod tests {
             from: TimeUs(20_000_000),
             to: TimeUs(20_600_000),
         };
-        let c = coverage(TimeUs(20_100_000), TimeUs(20_500_000), &[Some(hold)]);
+        let c = coverage(TimeUs(20_100_000), TimeUs(20_500_000), &[hold]);
         assert_eq!((c.covered, c.uncovered, c.piece), (400_000, 0, None));
     }
 
-    /// A ninth mark in one gap is counted as dropped and covers nothing:
-    /// eight 1 µs read-backs cover 8 µs of a 1 s gap, and the ninth's
-    /// 500 ms stay uncovered.
+    /// Every mark in a gap covers its part, however many: eight 1 µs
+    /// read-backs and a ninth of 500 ms cover 500 008 µs of a 1 s gap.
     #[test]
-    fn a_mark_past_the_slots_covers_nothing() {
+    fn every_mark_in_a_gap_covers_its_part() {
         let book = Transitions::with_capacity(32);
         let mut r = Recorder::new(book.clone());
         let play = stage(State::Play, 7, Drew::Plain);
@@ -723,16 +804,10 @@ mod tests {
         }
         r.mark(read_back(5_200_000, 5_700_000));
         r.frame(play, TimeUs(6_000_000), None);
-        r.close();
         let [s] = spans(&book)[..] else {
             panic!("one span: {:?}", book.records());
         };
-        assert_eq!(s.longest.unwrap().cover.uncovered, 1_000_000 - 8);
-        let (lines, _) = book.lines().unwrap();
-        assert!(
-            lines.last().unwrap().contains("marks dropped 1"),
-            "{lines:?}"
-        );
+        assert_eq!(s.longest.unwrap().cover.uncovered, 1_000_000 - 500_008);
     }
 
     /// A change of what draws a state is a presentation record, not a span
@@ -767,7 +842,6 @@ mod tests {
             TimeUs(1_566_000),
             None,
         );
-        r.close();
         let presentations: Vec<_> = book
             .records()
             .into_iter()
@@ -797,7 +871,7 @@ mod tests {
     #[test]
     fn overflow_counts_lost_records_and_fails_the_run() {
         let book = Transitions::with_capacity(4);
-        let mut r = Recorder::new(book.clone());
+        let r = Recorder::new(book.clone());
         for k in 0..6 {
             r.mark(read_back(k * 1_000, k * 1_000 + 500));
         }
@@ -810,6 +884,25 @@ mod tests {
         let within = Transitions::with_capacity(4);
         Recorder::new(within.clone()).mark(read_back(0, 1));
         assert_eq!(within.lines().unwrap().1, None);
+    }
+
+    /// A read-back whose mark is lost past the cap still makes the run
+    /// instrumented: a book of one record keeps the present and loses the
+    /// read-back, and every line, the summary included, is tagged.
+    #[test]
+    fn a_read_back_lost_past_the_cap_still_tags_the_run() {
+        let book = Transitions::with_capacity(1);
+        let mut r = Recorder::new(book.clone());
+        r.frame(stage(State::Ready, 90, Drew::Plain), TimeUs(1_000), None);
+        r.mark(read_back(1_100, 1_200));
+        assert_eq!(book.lost(), 1);
+        let (lines, failure) = book.lines().unwrap();
+        assert!(failure.is_some());
+        assert_eq!(lines.len(), 2, "{lines:?}");
+        assert!(
+            lines.iter().all(|l| l.ends_with(", instrumented")),
+            "{lines:?}"
+        );
     }
 
     /// The book's lines, formatted after the run: each record kind in
@@ -836,7 +929,6 @@ mod tests {
             TimeUs(2_400_100),
             None,
         );
-        r.close();
         let (lines, failure) = book.lines().unwrap();
         assert_eq!(failure, None);
         assert_eq!(
@@ -851,7 +943,7 @@ mod tests {
                  longest gap 150000 us (2250100 to 2400100, uncovered 100000 us, 2300200 to 2400100), \
                  largest uncovered gap 100000 us of 150000 us (2250100 to 2400100, 2300200 to 2400100), \
                  instrumented",
-                "dev: transitions: 4 records, lost 0, marks dropped 0, largest uncovered 249800 us \
+                "dev: transitions: 4 records, lost 0, largest uncovered 249800 us \
                  (2000300 to 2250100) in transition loading -> ready, instrumented",
             ]
         );
@@ -865,48 +957,49 @@ mod tests {
 
     /// Every line form, from records of fixed values: a fully covered
     /// transition (no piece), a presentation change with frames not
-    /// presented, each hold ending and an unended hold, a preparation, a
-    /// dropped mark, and a summary with no uncovered time.
+    /// presented, each hold ending and an unended hold, a preparation, and
+    /// a summary with no uncovered time.
     #[test]
     fn every_line_form_is_pinned() {
-        use super::{Coverage, Edge, Gap};
-        let book = Transitions::with_capacity(16);
+        use super::{Coverage, Edge, Gap, format_records};
         let gap = |from: i64, to: i64, cover: Coverage, unpresented: u32| Gap {
             from: TimeUs(from),
             to: TimeUs(to),
             cover,
             unpresented,
         };
-        book.push(Record::Edge(Edge {
-            presentation: false,
-            from: stage(State::Loading, 7, Drew::Skin),
-            to: stage(State::Ready, 90, Drew::Plain),
-            gap: gap(
-                1_000_000,
-                1_200_000,
-                Coverage {
-                    covered: 200_000,
-                    uncovered: 0,
-                    piece: None,
-                },
-                0,
-            ),
-        }));
-        book.push(Record::Edge(Edge {
-            presentation: true,
-            from: stage(State::Decision, 3, Drew::Skin),
-            to: stage(State::Decision, 3, Drew::Fallback),
-            gap: gap(
-                2_000_000,
-                2_016_700,
-                Coverage {
-                    covered: 0,
-                    uncovered: 16_700,
-                    piece: Some((TimeUs(2_000_000), TimeUs(2_016_700))),
-                },
-                2,
-            ),
-        }));
+        let mut records = vec![
+            Record::Edge(Edge {
+                presentation: false,
+                from: stage(State::Loading, 7, Drew::Skin),
+                to: stage(State::Ready, 90, Drew::Plain),
+                gap: gap(
+                    1_000_000,
+                    1_200_000,
+                    Coverage {
+                        covered: 200_000,
+                        uncovered: 0,
+                        piece: None,
+                    },
+                    0,
+                ),
+            }),
+            Record::Edge(Edge {
+                presentation: true,
+                from: stage(State::Decision, 3, Drew::Skin),
+                to: stage(State::Decision, 3, Drew::Fallback),
+                gap: gap(
+                    2_000_000,
+                    2_016_700,
+                    Coverage {
+                        covered: 0,
+                        uncovered: 16_700,
+                        piece: Some((TimeUs(2_000_000), TimeUs(2_016_700))),
+                    },
+                    2,
+                ),
+            }),
+        ];
         for kind in [
             MarkKind::Hold(Some(HoldEnd::Bound)),
             MarkKind::Hold(Some(HoldEnd::Skin)),
@@ -915,17 +1008,14 @@ mod tests {
             MarkKind::Hold(None),
             MarkKind::Preparing,
         ] {
-            book.push(Record::Mark(Mark {
+            records.push(Record::Mark(Mark {
                 kind,
                 from: TimeUs(10),
                 to: TimeUs(20),
             }));
         }
-        book.dropped_mark();
-        let (lines, failure) = book.lines().unwrap();
-        assert_eq!(failure, None);
         assert_eq!(
-            lines,
+            format_records(&records, false, 0),
             [
                 "dev: transition loading -> ready: 200000 us, last 1000000 us, first 1200000 us, \
                  covered 200000 us, uncovered 0 us",
@@ -938,7 +1028,7 @@ mod tests {
                 "dev: mark hold 10 to 20 us (ended by device-lost)",
                 "dev: mark hold 10 to 20 us",
                 "dev: mark preparing 10 to 20 us",
-                "dev: transitions: 8 records, lost 0, marks dropped 1, largest uncovered none",
+                "dev: transitions: 8 records, lost 0, largest uncovered none",
             ]
         );
     }

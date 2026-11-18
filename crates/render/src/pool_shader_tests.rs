@@ -13,8 +13,8 @@ use crate::chart_pool::{ChartPool, Grid};
 use crate::skin_atlas::PageLevels;
 use crate::sprite::{FLAG_BASE, FLAG_NEAREST, FLAG_POOL};
 
-/// The sprite shader as it was before the pool's binding: one texture
-/// array, the layer in the low 16 bits of the flags.
+/// The sprite shader as it was before the pool's binding: the atlas's
+/// array and the BGA array, the layer in the low 16 bits of the flags.
 const BEFORE_WGSL: &str = r"
 // An `Instance`: its pivot and angle share location 3, and its flags hold
 // the atlas layer (low 16 bits) and the nearest and base filter bits.
@@ -40,6 +40,7 @@ struct Proj {
 @group(0) @binding(1) var smooth_samp: sampler;
 @group(0) @binding(2) var nearest_samp: sampler;
 @group(0) @binding(3) var<uniform> proj: Proj;
+@group(1) @binding(0) var bga: texture_2d_array<f32>;
 
 // Canvas pixels (origin top left, y down) to clip space; the viewport places
 // the canvas on the target. Each corner turns clockwise on screen by the
@@ -70,7 +71,10 @@ fn vs(@builtin(vertex_index) vi: u32, i: Inst) -> VOut {
 // times 128, exact whatever the array's side. The two implicit-derivative
 // samples are always taken, so they stay in uniform control flow; the
 // base read has an explicit level, which needs no derivatives, so only a
-// sprite with the base bit takes it. One result is chosen.
+// sprite with the base bit takes it. One result is chosen. A sprite with
+// the BGA bit reads the BGA array instead, at level 0 by explicit level:
+// bilinear, or at the nearest texel with the nearest bit, and with the key
+// bit a pure black texel is transparent.
 fn tinted(v: VOut) -> vec4f {
     let layer = i32(v.flags & 0xFFFFu);
     let smoothed = textureSample(atlas, smooth_samp, v.uv, layer);
@@ -81,7 +85,16 @@ fn tinted(v: VOut) -> vec4f {
     if (v.flags & 0x20000u) != 0u {
         page = textureSampleLevel(atlas, nearest_samp, v.uv, layer, 0.0);
     }
-    return select(page, builtin, layer == 0) * v.color;
+    var c = select(page, builtin, layer == 0);
+    if (v.flags & 0x40000u) != 0u {
+        let bs = textureSampleLevel(bga, smooth_samp, v.uv, layer, 0.0);
+        let bn = textureSampleLevel(bga, nearest_samp, v.uv, layer, 0.0);
+        c = select(bs, bn, (v.flags & 0x10000u) != 0u);
+        if (v.flags & 0x80000u) != 0u && all(c.rgb == vec3f(0.0)) {
+            c = vec4f(0.0);
+        }
+    }
+    return c * v.color;
 }
 
 @fragment
@@ -193,12 +206,13 @@ fn quads(sources: &[([f32; 4], u32, u32)]) -> Vec<(usize, Instance)> {
     out
 }
 
-/// `quads` drawn with `pipes` (by blend) and `bind` over a cleared
-/// target, read back: RGBA8 rows tightly packed.
+/// `quads` drawn with `pipes` (by blend), `bind` and the BGA group `bga`
+/// over a cleared target, read back: RGBA8 rows tightly packed.
 fn draw(
     gpu: &crate::Gpu,
     pipes: [&wgpu::RenderPipeline; 3],
     bind: &wgpu::BindGroup,
+    bga: &wgpu::BindGroup,
     quads: &[(usize, Instance)],
 ) -> Vec<u8> {
     let device = gpu.device();
@@ -248,6 +262,7 @@ fn draw(
             ..wgpu::RenderPassDescriptor::default()
         });
         pass.set_bind_group(0, bind, &[]);
+        pass.set_bind_group(1, bga, &[]);
         pass.set_vertex_buffer(0, buffer.slice(..));
         for (i, &(blend, _)) in (0..).zip(quads) {
             pass.set_pipeline(pipes[blend]);
@@ -392,7 +407,7 @@ fn the_pool_samples_as_the_atlas_does_and_the_atlas_is_unchanged() {
         source: wgpu::ShaderSource::Wgsl(BEFORE_WGSL.into()),
     });
     let (old_alpha, old_additive, old_multiply) =
-        sprite_pipelines(device, &old_layout, &old_module, FORMAT);
+        sprite_pipelines(device, &old_layout, &bindings.bga, &old_module, FORMAT);
     let old_bind = |a: &AtlasTexture| {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("before"),
@@ -420,14 +435,16 @@ fn the_pool_samples_as_the_atlas_does_and_the_atlas_is_unchanged() {
     let now = [&alpha, &additive, &multiply];
     let before = [&old_alpha, &old_additive, &old_multiply];
     let bind = bindings.bind(device, &atlas, Some(pool.view()));
+    // No BGA quad is drawn: both shaders read the stand-in.
+    let bga = crate::bga::BgaArray::stand_in(gpu, &bindings.bga);
 
     // Atlas quads: the built-in read and the page, as before.
     let builtin = [0.0, 0.0, 0.3, 0.3];
     let page = [0.1, 0.1, 0.6, 0.6];
     let atlas_quads = quads(&[(builtin, 0, 0), (page, 1, 0)]);
-    let drawn = draw(gpu, now, &bind, &atlas_quads);
+    let drawn = draw(gpu, now, &bind, &bga.bind, &atlas_quads);
     assert!(
-        drawn == draw(gpu, before, &old_bind(&atlas), &atlas_quads),
+        drawn == draw(gpu, before, &old_bind(&atlas), &bga.bind, &atlas_quads),
         "atlas quads draw as before"
     );
 
@@ -437,12 +454,14 @@ fn the_pool_samples_as_the_atlas_does_and_the_atlas_is_unchanged() {
         gpu,
         now,
         &bind,
+        &bga.bind,
         &quads(&[(cell, 0, FLAG_POOL), (cell, 1, FLAG_POOL)]),
     );
     let expected = draw(
         gpu,
         before,
         &old_bind(&reference),
+        &bga.bind,
         &quads(&[(cell, 1, 0), (cell, 2, 0)]),
     );
     let difference = largest_difference(&pooled, &expected);
@@ -451,7 +470,13 @@ fn the_pool_samples_as_the_atlas_does_and_the_atlas_is_unchanged() {
 
     // Without the pool bit the same quads read the atlas: layer 0's
     // built-in read and the page.
-    let unflagged = draw(gpu, now, &bind, &quads(&[(cell, 0, 0), (cell, 1, 0)]));
+    let unflagged = draw(
+        gpu,
+        now,
+        &bind,
+        &bga.bind,
+        &quads(&[(cell, 0, 0), (cell, 1, 0)]),
+    );
     assert!(largest_difference(&pooled, &unflagged) > 32);
     for row in 0..3 {
         // Each filter and each layer its own pixels.
