@@ -2,7 +2,7 @@
 # Run a command in the Nix dev shell of this working copy, at its root.
 # On Windows (Git Bash) the command runs in a WSL distro; on Linux, directly.
 # TAPESTRY_NIX_SHELL names the flake's dev shell: `default` (the default),
-# `fuzz` or `test-device`.
+# `fuzz`, `test-device` or `ffmpeg`.
 # Usage: scripts/wsl.sh <command> [args...]
 set -euo pipefail
 

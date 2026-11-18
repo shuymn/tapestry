@@ -1,0 +1,99 @@
+name: FFmpeg
+
+# Rebuilds tapestry's FFmpeg build (docs/setup.md "FFmpeg") on a runner and
+# fails on any DLL or .def file whose sha256 differs from the pinned one:
+# - schedule: the release main's ffmpeg.toml pins, rebuilt at its tag against
+#   main's hashes (the tag's own ffmpeg.toml predates them); nothing pinned,
+#   nothing built.
+# - workflow_dispatch with a tag: that release, rebuilt at its tag against the
+#   hashes.toml in its own binary asset; the check one runner makes before
+#   ffmpeg.toml pins a new release.
+# - pull_request: the head's own ffmpeg.toml, compared when its [release] pins
+#   the revision it builds (the pin's PR), else built and its hashes printed.
+# The build's logs are printed in the job's log when it fails.
+
+on:
+  schedule:
+    - cron: "29 19 * * 1"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to rebuild (ffmpeg-<describe>-<revision>); empty for the one main pins
+        type: string
+        default: ""
+  pull_request:
+    branches: [main]
+    paths:
+      - .github/workflows/ffmpeg.yml
+      - ffmpeg.toml
+      - flake.nix
+      - flake.lock
+      - xtask/src/ffmpeg.rs
+
+permissions: {}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-24.04
+    # The cross toolchain is built once per run when the binary cache lacks it
+    # (about 15 min), then the build (about 5 min).
+    timeout-minutes: 90
+    permissions:
+      contents: read
+    env:
+      TAPESTRY_NIX_SHELL: ffmpeg
+      EVENT: ${{ github.event_name }}
+      TAG_INPUT: ${{ inputs.tag }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Choose the release and its hashes
+        id: pick
+        run: |
+          set -euo pipefail
+          expect="$RUNNER_TEMP/expect.toml"
+          tag=
+          if [ "$EVENT" = schedule ] || { [ "$EVENT" = workflow_dispatch ] && [ -z "$TAG_INPUT" ]; }; then
+            tag=$(python3 -c 'import tomllib; r = tomllib.load(open("ffmpeg.toml", "rb")).get("release"); print(r["tag"] if r else "")')
+            if [ -z "$tag" ]; then
+              echo "ffmpeg.toml pins no release yet: nothing to rebuild"
+              echo "skip=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            cp ffmpeg.toml "$expect"
+          elif [ "$EVENT" = workflow_dispatch ]; then
+            tag=$TAG_INPUT
+            case "$tag" in ffmpeg-*) ;; *) echo "not a release tag of the FFmpeg series: $tag" >&2; exit 1 ;; esac
+            zip="tapestry-$tag-win64-lgpl-shared.zip"
+            curl -fsSL --retry 3 -o "$RUNNER_TEMP/$zip" "https://github.com/$REPOSITORY/releases/download/$tag/$zip"
+            sha256sum "$RUNNER_TEMP/$zip"
+            unzip -p "$RUNNER_TEMP/$zip" "tapestry-$tag/hashes.toml" > "$expect"
+          fi
+          if [ -n "$tag" ]; then
+            git switch --detach "refs/tags/$tag"
+            echo "expect=$expect" >> "$GITHUB_OUTPUT"
+          fi
+          echo "rebuilding $(git rev-parse HEAD) ${tag:+(tag $tag)}"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+      - uses: DeterminateSystems/nix-installer-action@3138316df39ed29be04236d7ffc686fa525866aa # v23
+        if: steps.pick.outputs.skip == 'false'
+      - name: Build
+        if: steps.pick.outputs.skip == 'false'
+        env:
+          EXPECT: ${{ steps.pick.outputs.expect }}
+        run: scripts/wsl.sh cargo xtask ffmpeg build ${EXPECT:+--expect "$EXPECT"}
+      - name: Print the build's logs
+        if: failure() && steps.pick.outputs.skip == 'false'
+        run: |
+          for f in hashes.toml imports.txt configure.log; do
+            [ -f "target/ffmpeg-build/$f" ] && { echo "::group::$f"; cat "target/ffmpeg-build/$f"; echo "::endgroup::"; }
+          done
+          [ -f target/ffmpeg-build/make.log ] && { echo "::group::make.log (last 400 lines)"; tail -n 400 target/ffmpeg-build/make.log; echo "::endgroup::"; }
+          true
