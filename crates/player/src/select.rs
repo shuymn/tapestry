@@ -3302,8 +3302,8 @@ mod tests {
             s.view(0, 0, true).selected.unwrap().max_ex
         };
         assert_eq!(max(&e, Some(rules::tapestry())), Some(30));
-        // A chart with no record keeps its largest EX score, a fact of the
-        // chart (docs/stage3.md D32).
+        // The native selection data keeps an unplayed chart's largest EX
+        // score, which tapestry's own screens show.
         let mut unplayed = SelectScreen::new(Vec::new());
         unplayed.set_entries(vec![e.clone()]);
         unplayed.set_bests_preset(Some(rules::tapestry()));

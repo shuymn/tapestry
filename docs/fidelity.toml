@@ -404,8 +404,10 @@ placeholder drawn while the plays read below 0 (`Integer.MIN_VALUE`), or a \
 figure that reads 0 there (the largest EX score, the best score, the EX \
 score to the next rank). Each guarded selection number reads its \
 property's value from one table, in the runtime and in a lowered \
-expression alike (design.md "beatoraja Lua Skins", the expression \
-acceptance proof)."""
+expression alike. The largest EX score reads its 0 also while the chart \
+has no record, its chart maximum known or not, a direct number included, \
+so `number(72) == 0` holds for an unplayed chart (design.md "beatoraja Lua \
+Skins", the expression acceptance proof)."""
 source = [
     "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:126-201 @beatoraja-0.8.9",
     "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:289-395 @beatoraja-0.8.9",
@@ -424,6 +426,7 @@ tests = [
     "crates/skin-beatoraja/src/import/selection/profile.rs::every_unavailable_number_has_its_absent_value",
     "crates/skin-beatoraja/tests/lua_runtime.rs::a_lowered_selection_read_agrees_with_the_runtime_in_every_record_state",
     "crates/skin-beatoraja/tests/lua_runtime.rs::absent_scores_read_zero_where_the_source_does",
+    "crates/skin-beatoraja/tests/lua_runtime.rs::the_largest_ex_reads_zero_for_a_chart_with_no_record",
 ]
 
 [[entry]]
