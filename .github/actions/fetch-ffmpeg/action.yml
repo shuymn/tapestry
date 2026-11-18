@@ -1,0 +1,30 @@
+name: Fetch FFmpeg
+description: >-
+  tapestry's FFmpeg release (docs/setup.md "FFmpeg"), which the player's build
+  script requires in target/ffmpeg: fetched and refused unless its sha256 is
+  ffmpeg.toml's, kept in a cache keyed by that sha256 and saved only on main.
+  With no release pinned, fetch says so and does nothing.
+
+runs:
+  using: composite
+  steps:
+    - name: Read the pinned FFmpeg release
+      id: release
+      shell: bash
+      run: |
+        sha=$(python -c 'import tomllib; r = tomllib.load(open("ffmpeg.toml", "rb")).get("release"); print(r["binary"]["sha256"] if r else "")')
+        echo "sha256=$sha" | tee -a "$GITHUB_OUTPUT"
+    - uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      id: cache
+      if: steps.release.outputs.sha256 != ''
+      with:
+        path: target/ffmpeg
+        key: ffmpeg-${{ steps.release.outputs.sha256 }}
+    - name: Fetch FFmpeg
+      shell: bash
+      run: mise exec -- cargo xtask ffmpeg fetch
+    - if: github.ref == 'refs/heads/main' && steps.release.outputs.sha256 != '' && steps.cache.outputs.cache-hit != 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: target/ffmpeg
+        key: ffmpeg-${{ steps.release.outputs.sha256 }}

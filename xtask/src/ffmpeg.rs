@@ -19,6 +19,10 @@
 //!   unpacks it, refuses it unless every DLL and `.def` file in it has its
 //!   pinned sha256, and puts it in place; either way it makes the import
 //!   libraries there from the `.def` files.
+//! - `cargo xtask ffmpeg check-exes <dir>` ([`worker_disallowed_imports`],
+//!   [`game_ffmpeg_imports`]): in a profile directory, the media worker's
+//!   executable imports only the system's core API sets, its C runtime and
+//!   the build's DLLs, and the game's executable none of the build's DLLs.
 //!
 //! xtask links nothing of FFmpeg: it runs the build's tools and reads the
 //! DLLs' import tables as bytes ([`pe_imports`]).
@@ -455,6 +459,74 @@ pub fn disallowed_imports<'a>(dlls: &[String], imports: &'a [String]) -> Vec<&'a
         .collect()
 }
 
+/// The DLLs the media worker's executable may import besides the build's
+/// own and the system's API sets (design.md "Threat Model" T02: no Windows
+/// graphics component), by name without case.
+pub const WORKER_IMPORTS: [&str; 3] = ["kernel32.dll", "ntdll.dll", "vcruntime140.dll"];
+/// The prefix of the system's core API sets.
+const CORE_API_SET: &str = "api-ms-win-core-";
+
+/// Whether `name` is one of `dlls` (the build's own DLLs, without `.dll`).
+fn is_build_dll(dlls: &[String], name: &str) -> bool {
+    dlls.iter()
+        .any(|d| name.eq_ignore_ascii_case(&format!("{d}.dll")))
+}
+
+/// The worker executable's imported DLL names that are neither in
+/// [`WORKER_IMPORTS`], a core or C runtime API set nor one of `dlls`.
+pub fn worker_disallowed_imports<'a>(dlls: &[String], imports: &'a [String]) -> Vec<&'a str> {
+    imports
+        .iter()
+        .map(String::as_str)
+        .filter(|name| {
+            let lower = name.to_ascii_lowercase();
+            !(WORKER_IMPORTS.contains(&lower.as_str())
+                || lower.starts_with(CORE_API_SET)
+                || lower.starts_with(CRT_API_SET)
+                || is_build_dll(dlls, name))
+        })
+        .collect()
+}
+
+/// The game executable's imported DLL names that are one of `dlls`: the
+/// game process loads no FFmpeg library (design.md "Threat Model" T02).
+pub fn game_ffmpeg_imports<'a>(dlls: &[String], imports: &'a [String]) -> Vec<&'a str> {
+    imports
+        .iter()
+        .map(String::as_str)
+        .filter(|name| is_build_dll(dlls, name))
+        .collect()
+}
+
+/// `cargo xtask ffmpeg check-exes <dir>`: the worker's and the game's
+/// executables in `dir`, a profile directory, import what design.md "Threat
+/// Model" T02 allows them.
+fn check_exes(root: &Path, args: &[OsString]) -> anyhow::Result<()> {
+    let [dir] = args else {
+        bail!("check-exes takes the profile directory");
+    };
+    let m = read_manifest(&root.join("ffmpeg.toml"))?;
+    type Check = for<'a> fn(&[String], &'a [String]) -> Vec<&'a str>;
+    let checks: [(&str, Check); 2] = [
+        ("tapestry-media.exe", worker_disallowed_imports),
+        ("tapestry.exe", game_ffmpeg_imports),
+    ];
+    let mut bad = Vec::new();
+    for (exe, check) in checks {
+        let path = Path::new(dir).join(exe);
+        let bytes = fs::read(&path).with_context(|| format!("cannot read {}", path.display()))?;
+        let imports = pe_imports(&bytes).map_err(|e| anyhow::anyhow!("{exe}: {e}"))?;
+        println!("{exe}: {}", imports.join(" "));
+        bad.extend(
+            check(&m.build.dlls, &imports)
+                .into_iter()
+                .map(|name| format!("{exe} imports {name}")),
+        );
+    }
+    ensure!(bad.is_empty(), "{}", bad.join("; "));
+    Ok(())
+}
+
 /// The sha256 of `bytes`, in lowercase hex.
 pub fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
@@ -538,8 +610,9 @@ pub fn run(root: &Path, args: &[OsString]) -> ExitCode {
     let result = match args.first().and_then(|a| a.to_str()) {
         Some("build") => build_command(root, &args[1..]),
         Some("fetch") if args.len() == 1 => fetch(root),
+        Some("check-exes") => check_exes(root, &args[1..]),
         _ => Err(anyhow::anyhow!(
-            "usage: cargo xtask ffmpeg (build [--expect <file>] | fetch)"
+            "usage: cargo xtask ffmpeg (build [--expect <file>] | fetch | check-exes <dir>)"
         )),
     };
     match result {
@@ -1531,6 +1604,46 @@ sha256 = "z"
         let delayed = pe(&["KERNEL32.dll"], &["GDI32.dll"]);
         let imports = pe_imports(&delayed).unwrap();
         assert_eq!(disallowed_imports(&dlls, &imports), ["GDI32.dll"]);
+    }
+
+    /// The executables' import check (design.md "Threat Model" T02): the
+    /// worker imports the system's core, its C runtime and the build's DLLs,
+    /// and fails with a graphics DLL, imported or delay-loaded; the game
+    /// imports no DLL of the build.
+    #[test]
+    fn executables_import_what_the_worker_split_allows() {
+        let dlls = ["avutil-61".to_owned(), "avcodec-63".to_owned()];
+        let worker = pe(
+            &[
+                "KERNEL32.dll",
+                "ntdll.dll",
+                "VCRUNTIME140.dll",
+                "api-ms-win-core-synch-l1-2-0.dll",
+                "api-ms-win-crt-heap-l1-1-0.dll",
+                "AVCODEC-63.dll",
+            ],
+            &["avutil-61.dll"],
+        );
+        let imports = pe_imports(&worker).unwrap();
+        assert!(worker_disallowed_imports(&dlls, &imports).is_empty());
+        assert_eq!(
+            game_ffmpeg_imports(&dlls, &imports),
+            ["AVCODEC-63.dll", "avutil-61.dll"]
+        );
+        for bad in ["USER32.dll", "gdi32.dll", "bcrypt.dll"] {
+            let image = pe(&["KERNEL32.dll", bad], &[]);
+            let imports = pe_imports(&image).unwrap();
+            assert_eq!(worker_disallowed_imports(&dlls, &imports), [bad], "{bad}");
+        }
+        let delayed = pe(&["KERNEL32.dll"], &["GDI32.dll"]);
+        let imports = pe_imports(&delayed).unwrap();
+        assert_eq!(worker_disallowed_imports(&dlls, &imports), ["GDI32.dll"]);
+        let game = pe(&["USER32.dll", "GDI32.dll", "KERNEL32.dll"], &[]);
+        let imports = pe_imports(&game).unwrap();
+        assert!(game_ffmpeg_imports(&dlls, &imports).is_empty());
+        let game = pe(&["USER32.dll"], &["avutil-61.dll"]);
+        let imports = pe_imports(&game).unwrap();
+        assert_eq!(game_ffmpeg_imports(&dlls, &imports), ["avutil-61.dll"]);
     }
 
     /// The build's fixed directory: a claim starts it empty with its marker,
