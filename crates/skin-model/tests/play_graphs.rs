@@ -1422,7 +1422,7 @@ fn unavailable_bins_draw_nothing_and_empty_ones_every_note_grey() {
         fx.empty(x, 5.0);
     }
     fx.h.judgments = Some(bins(&[]));
-    // 100 ms of the 250 ms reveal: chips to x = 120 only.
+    // 100 ms of the 250 ms reveal: chips to x = 96 only.
     fx.frame(-900);
     fx.is(90.0, cell30(2.0), rgb(0x55_5555));
     assert_ne!(fx.px(150.0, cell30(0.0)).0, rgb(0x55_5555));
@@ -1435,7 +1435,7 @@ fn unavailable_bins_draw_nothing_and_empty_ones_every_note_grey() {
 }
 
 /// C37: the judgment graphs draw the play cursor at `t·W/(len·1000)`,
-/// 3/5 of a second wide (2.3 s of 5 over 300 px: x 138 to 174), and a
+/// 3/5 of a second wide (2.3 s of 4 over 240 px: x 138 to 174), and a
 /// section attempt's lines, as the notes graph does; at READY no cursor.
 #[test]
 fn the_judgment_graphs_draw_the_cursors() {

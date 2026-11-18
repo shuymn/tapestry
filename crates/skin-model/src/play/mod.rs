@@ -771,7 +771,9 @@ struct Graphs {
 /// seconds plus one, one second fewer than the profile's (the notes
 /// graph's), as the source sizes these graphs by the chart's last time;
 /// as the count of the profile's bins that cover those seconds and the
-/// seconds they represent, that count times their width.
+/// seconds they represent, that count times their width, which widened
+/// bins round up, so the two spans can then differ by a bin or not at
+/// all.
 // Source: SF-022
 fn judgment_span(profile: &ChartProfile) -> (usize, u32) {
     let width = profile.bin_seconds().max(1);

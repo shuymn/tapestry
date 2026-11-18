@@ -457,15 +457,16 @@ tests = [
 
 [[entry]]
 id = "SF-022"
-summary = "A play's judgment and early/late graphs span `floor(length / 1 s) + 1` seconds, one fewer than the notes graph"
+summary = "A play's judgment and early/late graphs span `floor(length / 1 s) + 1` seconds, one fewer than the notes graph before widened bins round it up"
 class = "rule"
 reason = """
 A player sees each graph's time span as where its play cursor stands and how \
 wide its columns are: the judgment and early/late graphs spread the chart's \
 whole seconds plus one over their width, so their cursor reaches the right \
 edge a second sooner than over the notes graph's span (SF-008), which the \
-song information's distribution gives (design.md "Rendering and Skins", play \
-graphs and visualizers)."""
+song information's distribution gives; widened bins, from 511 s, round each \
+span up to whole bins, so there the two differ by a bin or not at all \
+(design.md "Rendering and Skins", play graphs and visualizers)."""
 source = [
     "src/bms/player/beatoraja/skin/SkinNoteDistributionGraph.java:171-174 @beatoraja-0.8.9",
     "src/bms/player/beatoraja/skin/SkinNoteDistributionGraph.java:195-220 @beatoraja-0.8.9",
