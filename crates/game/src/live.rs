@@ -1168,6 +1168,12 @@ fn run_from<R: Rig>(
         // The leaving command accepted and its outro's end, from the pinned
         // view's timing.
         let mut outro: Option<(MenuCommand, TimeUs)> = None;
+        // Preset steps taken while the result's sound waits for its first
+        // picture, in order: a step evaluates, which may block, so each
+        // waits for the look that handles the start (design.md "State
+        // Model", system sounds, Result). A leaving command accepted drops
+        // them with the result.
+        let mut waiting_steps: Vec<isize> = Vec::new();
         loop {
             // The wait ends at the shelf's poll deadline at the latest, so
             // a wake just before it does not put the check off; with a
@@ -1224,6 +1230,12 @@ fn run_from<R: Rig>(
                 // a preset step pins nothing and takes the gate as sampled.
                 // The scene time is no press: the gate does not hold it.
                 let mut accepted = None;
+                let sound_due = rig.result_sound_due();
+                if !sound_due {
+                    for by in waiting_steps.drain(..) {
+                        dirty |= screen.step(by, &report, loaded.chart());
+                    }
+                }
                 while let Some(c) = rig.take_menu() {
                     match c {
                         MenuCommand::Retry | MenuCommand::Back => {
@@ -1235,15 +1247,15 @@ fn run_from<R: Rig>(
                         }
                         _ if !open => {}
                         // Each step stamps G5's start (dev-tools).
-                        MenuCommand::NextPreset => {
+                        MenuCommand::NextPreset | MenuCommand::PrevPreset => {
                             #[cfg(feature = "dev-tools")]
                             crate::probe::stamp(&crate::probe::STEP_ACCEPTED);
-                            dirty |= screen.step(1, &report, loaded.chart());
-                        }
-                        MenuCommand::PrevPreset => {
-                            #[cfg(feature = "dev-tools")]
-                            crate::probe::stamp(&crate::probe::STEP_ACCEPTED);
-                            dirty |= screen.step(-1, &report, loaded.chart());
+                            let by = if c == MenuCommand::NextPreset { 1 } else { -1 };
+                            if sound_due {
+                                waiting_steps.push(by);
+                            } else {
+                                dirty |= screen.step(by, &report, loaded.chart());
+                            }
                         }
                     }
                 }
@@ -1302,6 +1314,9 @@ fn run_from<R: Rig>(
             }
             if dirty {
                 // A view landed: its best is read once, before it shows.
+                // While the result's sound waits the view is the first one,
+                // whose best was read before the hand-over (steps wait and
+                // nothing polls the shelf), so this reads no library then.
                 screen.compare_best(&report, &mut |k, p| loaded.best_before(k, p));
                 rig.show_end(&report, &screen);
             }
