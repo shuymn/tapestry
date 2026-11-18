@@ -624,7 +624,10 @@ fn layout(
 /// refusal of the entry's rebind (its pages' variant, kept layers or skin
 /// folder; a file not held; a cell not held), the entry's variant, kept
 /// layers and folder against the layout's, whether the entry's import and
-/// the layout's had a permit, and the layout's cells the entry lacks.
+/// the layout's had a permit, and the layout's cells the entry lacks by
+/// name and rectangle: a file rewritten with the same cells is refused as
+/// `missing-file` with none of them missing, the refusal comparing the
+/// file's version as well.
 #[cfg(feature = "dev-tools")]
 fn probe_miss(e: &ImageEntry, sheet: &Sheet, variant: Variant, kept: skin_model::KeptLayers) {
     let pages = e.atlas.shared_pages();
@@ -645,7 +648,7 @@ fn probe_miss(e: &ImageEntry, sheet: &Sheet, variant: Variant, kept: skin_model:
     let cells = sheet.survey_cells(variant);
     let miss: Vec<_> = cells.iter().filter(|c| !have.contains(*c)).collect();
     println!(
-        "dev: probe-miss refusal {refusal}; layout variant {variant:?} kept {kept:?} import-permit {}; entry variant {:?} kept {:?} root {:?} import-permit {}; layout cells {} entry cells {} missing {} {miss:?}",
+        "dev: probe-miss refusal {refusal}; layout variant {variant:?} kept {kept:?} import-permit {}; entry variant {:?} kept {:?} root {:?} import-permit {}; layout cells {} entry cells {} missing by name and rectangle {} {miss:?}",
         IMPORT_PERMIT.get(),
         pages.variant(),
         pages.kept(),
@@ -783,7 +786,7 @@ fn lay_out(
             #[cfg(any(test, feature = "dev-tools"))]
             BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             #[cfg(feature = "dev-tools")]
-            let p_t = std::time::Instant::now();
+            let p_t = render::probe::Span::start();
             let built = match packed.atlas_keeping(variant, limits, kept, &|| cancel.is_cancelled())
             {
                 Ok(a) => {

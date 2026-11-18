@@ -672,7 +672,7 @@ impl MenuScreen {
         #[cfg(feature = "dev-tools")]
         let p_c = crate::dev::loop_probe::Caller::set(render::probe::LOADING);
         #[cfg(feature = "dev-tools")]
-        let p_t = std::time::Instant::now();
+        let p_t = render::probe::Span::start();
         let p_prepared =
             self.renderer
                 .prepare_loading_text_on(on, lifetime, update.revision, which, &chart);
@@ -898,7 +898,7 @@ impl Screen for MenuScreen {
         #[cfg(feature = "dev-tools")]
         let p_caller = crate::dev::loop_probe::Caller::set(render::probe::ATTEMPT);
         #[cfg(feature = "dev-tools")]
-        let p_t = std::time::Instant::now();
+        let p_t = render::probe::Span::start();
         let done = match skin {
             Some(bundle) => self.renderer.stage(bundle, a, request).map(|_| ()),
             None => self.renderer.prepare_attempt(a),

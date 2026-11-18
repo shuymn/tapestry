@@ -623,6 +623,26 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
         );
     }
     assert_eq!(times("fu:gpu_done_us").len(), 2);
+    // Each first use credited to the result's upload (the selection skin
+    // caller), and its frame the first probed: the result's frames are
+    // counted from the view's commit, not from its installation.
+    assert_eq!(
+        values("fu:caller"),
+        [i64::from(render::probe::SELECT_SKIN); 2]
+    );
+    for k in 0..2 {
+        let fu = one("fu:submit_us", k);
+        let (at, left) = marks
+            .iter()
+            .find(|m| m.1 == "rf:frame_left" && m.0 > one("res:install_us", k))
+            .map(|m| (m.0, m.2))
+            .unwrap();
+        assert_eq!(left, 2, "attempt {k}'s first probed frame");
+        assert!(
+            within("present", at, fu).is_empty(),
+            "attempt {k}: a frame presented between the first probed and the first use"
+        );
+    }
     // Frames were presented between B's upload and its result: none of
     // them was the first use.
     let between = within(

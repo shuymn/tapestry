@@ -361,6 +361,44 @@ fn render_app_region_does_not_allocate() {
     assert_eq!(int(&m, "allocations", "render_app"), Some(0));
 }
 
+/// The transition probe's tags printed in `stdout`, in their order.
+fn probe_tags(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("dev: probe "))
+        .filter_map(|l| l.split(' ').nth(1))
+        .collect()
+}
+
+/// With the transition probe on (`TAPESTRY_LOOP_PROBE`), a direct play
+/// prints its marks when the command ends, once: its preparation, its
+/// image stage's end and its opening among them, then the count of marks
+/// not kept.
+#[test]
+fn a_direct_play_prints_the_transition_probes_marks() {
+    let fx = fixture();
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
+        .env("TAPESTRY_LOOP_PROBE", "1")
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    let tags = probe_tags(&stdout);
+    for tag in ["prep:begin", "img:stage_end", "g:open"] {
+        assert!(tags.contains(&tag), "{tag}: {stdout}");
+    }
+    let dropped: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("dev: probe-dropped "))
+        .collect();
+    assert_eq!(
+        dropped,
+        ["dev: probe-dropped 0 (past the room 0, unfilled 0)"],
+        "{stdout}"
+    );
+}
+
 /// The play's setup, measured as the game thread hands the play to audio
 /// and the screen, reaches its `.measure.toml` and the console line printed
 /// when the play ends, with the first frame after it and the process's page

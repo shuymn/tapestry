@@ -720,25 +720,46 @@ impl Retired {
 
 #[cfg(feature = "dev-tools")]
 impl Renderer {
+    /// The array a frame drawn `on` samples, as [`draw_on`](Self::draw_on)
+    /// picks its resources.
+    fn drawn_atlas(&self, on: Draw) -> &AtlasTexture {
+        match on {
+            Draw::Play => &self.atlas,
+            Draw::Slot(i) => self
+                .screens
+                .get(i)
+                .and_then(Option::as_ref)
+                .map_or(&self.atlas, |s| &s.resources.atlas),
+            Draw::Pending => match &self.pending {
+                Some(Pending {
+                    res: PendingRes::Own(r),
+                    ..
+                }) => &r.atlas,
+                _ => &self.atlas,
+            },
+        }
+    }
+
     /// After a frame's submit (the probe on): the first draw of the array
     /// uploaded last (`fu:*`: its submit, its CPU time from the frame's
     /// start, its GPU completion, or `fu:in_play` in play, where no
     /// completion callback is armed), then the submit and memory of the
     /// frames marked after a drop or a first use (`pd:*`).
-    fn probe_after_submit(&self, first: bool, submit: Duration, start: Instant) {
-        use crate::probe::{FIRST_USE, POST, mark, mem, us};
-        use std::sync::atomic::Ordering::Relaxed;
-        if first {
-            FIRST_USE.store(0, Relaxed);
+    fn probe_after_submit(&self, first: Option<u8>, submit: Duration, cpu: Duration) {
+        use crate::probe::{POST, mark, mem, us};
+        if let Some(caller) = first {
+            mark("fu:caller", i64::from(caller));
             mark("fu:submit_us", us(submit));
-            mark("fu:cpu_us", us(start.elapsed()));
-            POST.store(3, Relaxed);
+            mark("fu:cpu_us", us(cpu));
+            crate::probe::arm_post(3);
             if crate::probe::in_play() {
                 mark("fu:in_play", 1);
             } else {
-                let t = Instant::now();
-                self.gpu.queue().on_submitted_work_done(move || {
-                    mark("fu:gpu_done_us", us(t.elapsed()));
+                let t = crate::probe::Span::start();
+                crate::probe::own(|| {
+                    self.gpu.queue().on_submitted_work_done(move || {
+                        mark("fu:gpu_done_us", us(t.elapsed()));
+                    });
                 });
             }
         }
@@ -751,7 +772,8 @@ impl Renderer {
 
 /// Drops what a drain or a staging retired (the probe on): the CPU pages,
 /// the array and its view, the bind group and the text cache, in the
-/// fields' order as a whole drop would, and the selection's retired
+/// fields' order as a whole drop would, or the slot, or the layout, and
+/// the selection's retired
 /// chart-image pool before them or after them as its site drops it
 /// (`pool_first`), each drop timed (`dr:*`), with memory before and after;
 /// then marks the next frames' submit and memory (`pd:*`).
@@ -766,7 +788,7 @@ fn probe_drop(
     use crate::probe::{mark, mem, us};
     let drop_pool = |pool: Option<ChartPool>| {
         if let Some(p) = pool {
-            let t = Instant::now();
+            let t = crate::probe::Span::start();
             drop(p);
             mark("dr:pool_us", us(t.elapsed()));
         }
@@ -792,28 +814,33 @@ fn probe_drop(
                 "dr:pages_strong",
                 i64::try_from(Arc::strong_count(&pages)).unwrap_or(-1),
             );
-            let t = Instant::now();
+            let t = crate::probe::Span::start();
             drop(pages);
             mark("dr:cpu_us", us(t.elapsed()));
-            let t = Instant::now();
+            let t = crate::probe::Span::start();
             drop(atlas);
             mark("dr:tex_view_us", us(t.elapsed()));
-            let t = Instant::now();
+            let t = crate::probe::Span::start();
             drop(atlas_bind);
             mark("dr:bind_us", us(t.elapsed()));
             drop(text_cache);
         }
         Some(Retired::Slot(s)) => {
             mark("dr:kind", 2);
-            let t = Instant::now();
+            let t = crate::probe::Span::start();
             drop(s);
             mark("dr:slot_us", us(t.elapsed()));
         }
-        Some(Retired::Layout { .. }) => mark("dr:kind", 3),
+        Some(layout @ Retired::Layout { .. }) => {
+            mark("dr:kind", 3);
+            let t = crate::probe::Span::start();
+            drop(layout);
+            mark("dr:layout_us", us(t.elapsed()));
+        }
     }
     drop_pool(pool);
     mem(d, "dr:l1", "dr:n1", "dr:r1");
-    crate::probe::arm_post();
+    crate::probe::arm_post(8);
 }
 
 /// What a staging holds besides its skin.
@@ -2157,7 +2184,7 @@ impl Renderer {
                 #[cfg(feature = "dev-tools")]
                 {
                     crate::probe::mark("adm:result_released", 1);
-                    crate::probe::arm_post();
+                    crate::probe::arm_post(8);
                 }
                 self.result_released = true;
                 Ok(())
@@ -2359,8 +2386,6 @@ impl Renderer {
             .bindings
             .bind(self.gpu.device(), &slot.resources.atlas, None);
         if let Some(slot) = self.selection_slot_mut() {
-            #[cfg(feature = "dev-tools")]
-            crate::probe::rebind(&slot.resources.atlas_bind, &placeholder);
             slot.resources.atlas_bind = placeholder;
         }
         let Some(slot) = self.selection_slot() else {
@@ -2371,8 +2396,6 @@ impl Renderer {
             return;
         };
         if let Some(slot) = self.selection_slot_mut() {
-            #[cfg(feature = "dev-tools")]
-            crate::probe::rebind(&slot.resources.atlas_bind, &bind);
             slot.resources.atlas_bind = bind;
         }
         self.pool = Some(pool);
@@ -2425,8 +2448,6 @@ impl Renderer {
         });
         if let Some((pool, bind)) = made {
             if let Some(slot) = self.selection_slot_mut() {
-                #[cfg(feature = "dev-tools")]
-                crate::probe::rebind(&slot.resources.atlas_bind, &bind);
                 slot.resources.atlas_bind = bind;
             }
             self.pool = Some(pool);
@@ -2544,7 +2565,7 @@ impl Renderer {
         }
         self.admit_bundle(kind, bundle)?;
         #[cfg(feature = "dev-tools")]
-        let p_res = Instant::now();
+        let p_res = crate::probe::Span::start();
         let installed = self
             .committed_installation(kind)
             .filter(|i| Arc::ptr_eq(i.bundle(), bundle))
@@ -2594,7 +2615,7 @@ impl Renderer {
                 ..*a
             };
             #[cfg(feature = "dev-tools")]
-            let p_prep = Instant::now();
+            let p_prep = crate::probe::Span::start();
             skin.prepare(&self.gpu, &a).map_err(RenderError::Skin)?;
             skin.set_bga_images(Arc::clone(&self.bga_table));
             #[cfg(feature = "dev-tools")]
@@ -2603,7 +2624,7 @@ impl Renderer {
                 cmark!("st", "skin_prepare_us", us(p_prep.elapsed()));
             }
             #[cfg(feature = "dev-tools")]
-            let p_text = Instant::now();
+            let p_text = crate::probe::Span::start();
             if let Some(producer) = bundle.text_producer() {
                 let key = self.loading_text_key();
                 // The staging's own resources, or the installed ones,
@@ -2710,8 +2731,6 @@ impl Renderer {
         };
         match res {
             PendingRes::Own(r) => {
-                #[cfg(feature = "dev-tools")]
-                crate::probe::rebind(&r.atlas_bind, &bind);
                 r.atlas_bind = bind;
             }
             PendingRes::Layout { bind: b, .. } => *b = Some(bind),
@@ -2793,11 +2812,15 @@ impl Renderer {
         #[cfg(any(test, feature = "dev-tools"))]
         let began = Instant::now();
         #[cfg(feature = "dev-tools")]
+        let p_began = crate::probe::Span::at(began);
+        #[cfg(feature = "dev-tools")]
         crate::probe::cmark!("up", "t0", 0);
         #[cfg(any(test, feature = "dev-tools"))]
         let done = Arc::new(std::sync::OnceLock::new());
         #[cfg(any(test, feature = "dev-tools"))]
         let mut submitted = began;
+        #[cfg(feature = "dev-tools")]
+        let mut p_submitted = p_began;
         let device = self.gpu.device();
         let levels = page_levels(pages);
         let upload = AtlasPages {
@@ -2813,30 +2836,24 @@ impl Renderer {
         #[cfg(feature = "dev-tools")]
         let mut p_submit = Duration::ZERO;
         #[cfg(feature = "dev-tools")]
-        let p_scope0 = Instant::now();
+        let p_scope0 = crate::probe::Span::start();
         let ((atlas, atlas_bind, buffer), refused) = skin_atlas::scoped(device, || {
             let atlas = AtlasTexture::upload(&self.gpu, &upload, layers);
             #[cfg(feature = "dev-tools")]
-            let p_b = Instant::now();
+            let p_b = crate::probe::Span::start();
             let bind = self.bindings.bind(device, &atlas, None);
             #[cfg(feature = "dev-tools")]
-            if crate::probe::on() {
-                crate::probe::cmark!("up", "bind_only_us", crate::probe::us(p_b.elapsed()));
-                crate::probe::FIRST_USE.store(
-                    crate::probe::bind_key(&bind),
-                    std::sync::atomic::Ordering::Relaxed,
-                );
-            }
+            crate::probe::cmark!("up", "bind_only_us", crate::probe::us(p_b.elapsed()));
             #[cfg(test)]
             if let Some(fault) = self.atlas_fault {
                 fault(&self.gpu);
             }
             let buffer = instances.map(|n| self.staged_buffer(n));
             #[cfg(feature = "dev-tools")]
-            let p_s = Instant::now();
+            let p_s = crate::probe::Span::start();
             #[cfg(feature = "dev-tools")]
             {
-                p_bind = p_s.saturating_duration_since(p_b);
+                p_bind = p_b.until(p_s);
             }
             self.gpu.queue().submit([]);
             #[cfg(feature = "dev-tools")]
@@ -2846,6 +2863,10 @@ impl Renderer {
             #[cfg(any(test, feature = "dev-tools"))]
             {
                 submitted = Instant::now();
+                #[cfg(feature = "dev-tools")]
+                {
+                    p_submitted = crate::probe::Span::at(submitted);
+                }
                 let done = Arc::clone(&done);
                 self.gpu.queue().on_submitted_work_done(move || {
                     let _ = done.set(Instant::now());
@@ -2896,20 +2917,32 @@ impl Renderer {
             return Err(RenderError::Atlas(UploadError::Device(e)));
         }
         #[cfg(feature = "dev-tools")]
-        let p_wait = Instant::now();
+        let p_wait = crate::probe::Span::start();
         let p_waited = wait_for_gpu(&self.gpu);
         #[cfg(feature = "dev-tools")]
         {
             use crate::probe::{cmark, us};
-            cmark!("up", "gpu_wait_us", us(p_wait.elapsed()));
-            cmark!("up", "total_us", us(began.elapsed()));
+            let (wait, total) = (p_wait.elapsed(), p_began.elapsed());
+            cmark!("up", "gpu_wait_us", us(wait));
+            cmark!("up", "total_us", us(total));
             crate::probe::mem(self.gpu.device(), "up:mem:l", "up:mem:n", "up:mem:r");
         }
         p_waited?;
+        // Its first use awaited once it is uploaded (a refused upload's
+        // array is never drawn).
+        #[cfg(feature = "dev-tools")]
+        if crate::probe::on() {
+            crate::probe::await_first_use(crate::probe::array_key(atlas.texture()));
+        }
         #[cfg(any(test, feature = "dev-tools"))]
         {
+            // With the probe's own work left out (dev-tools).
+            #[cfg(feature = "dev-tools")]
+            let written = p_began.until(p_submitted);
+            #[cfg(not(feature = "dev-tools"))]
+            let written = submitted.saturating_duration_since(began);
             self.upload_timing = Some(UploadTiming {
-                written: submitted.saturating_duration_since(began),
+                written,
                 done: done.get().map(|d| d.saturating_duration_since(submitted)),
             });
         }
@@ -3077,7 +3110,7 @@ impl Renderer {
             }
         }
         #[cfg(feature = "dev-tools")]
-        let p_t = Instant::now();
+        let p_t = crate::probe::Span::start();
         if let Some(slot) = Self::screen(kind).and_then(|i| self.screens.get_mut(i)) {
             *slot = None;
         }
@@ -3088,7 +3121,7 @@ impl Renderer {
             self.pool = None;
         }
         #[cfg(feature = "dev-tools")]
-        let p_pool = p_t.elapsed() - p_slot;
+        let p_pool = p_t.elapsed().saturating_sub(p_slot);
         if kind == ScreenKind::Result {
             self.result_pages = None;
             self.staged_result_text = None;
@@ -3096,13 +3129,16 @@ impl Renderer {
         #[cfg(feature = "dev-tools")]
         if p_some {
             use crate::probe::{mark, us};
+            let p_pages = p_t.elapsed().saturating_sub(p_slot + p_pool);
             mark("rel:slot_us", us(p_slot));
             if kind == ScreenKind::Selection {
                 mark("rel:pool_us", us(p_pool));
             }
-            mark("rel:pages_us", us(p_t.elapsed() - p_slot - p_pool));
+            if kind == ScreenKind::Result {
+                mark("rel:pages_us", us(p_pages));
+            }
             crate::probe::mem(self.gpu.device(), "rel:l1", "rel:n1", "rel:r1");
-            crate::probe::arm_post();
+            crate::probe::arm_post(8);
         }
     }
 
@@ -3354,6 +3390,20 @@ impl Renderer {
     /// resources, whose lines go with their cache: text staged for the
     /// installation in use stays.
     fn drop_pending(&mut self) {
+        // A staging's own array dropped before any frame drew it.
+        #[cfg(feature = "dev-tools")]
+        if crate::probe::on()
+            && let Some(Pending { res, .. }) = &self.pending
+        {
+            let atlas = match res {
+                PendingRes::Own(r) => Some(&r.atlas),
+                PendingRes::Pages(p) => p.as_deref().map(|p| &p.atlas),
+                PendingRes::Installed | PendingRes::Layout { .. } => None,
+            };
+            if let Some(a) = atlas {
+                crate::probe::discard_first_use(crate::probe::array_key(a.texture()));
+            }
+        }
         self.pending = None;
         let installed = self.loading_text_key();
         if self
@@ -3408,8 +3458,6 @@ impl Renderer {
             let grid = self.pool_grid_for(installation.bundle());
             let made = grid.and_then(|g| self.make_pool(g, 1, &r.atlas));
             let pool = made.map(|(pool, bind)| {
-                #[cfg(feature = "dev-tools")]
-                crate::probe::rebind(&r.atlas_bind, &bind);
                 r.atlas_bind = bind;
                 pool
             });
@@ -3609,7 +3657,7 @@ impl Renderer {
                 continue;
             };
             #[cfg(feature = "dev-tools")]
-            let p_w = Instant::now();
+            let p_w = crate::probe::Span::start();
             let ((), refused) = skin_atlas::scoped(self.gpu.device(), || {
                 for ((k, bytes), level) in (0_u32..).zip(f.levels()).zip(0..) {
                     let Some(size) = f.level_size(level) else {
@@ -3636,12 +3684,12 @@ impl Renderer {
             });
             // Submitted work is waited for, a refused write's included.
             #[cfg(feature = "dev-tools")]
-            let p_v = Instant::now();
+            let p_v = crate::probe::Span::start();
             let waited = self.wait_chart();
             #[cfg(feature = "dev-tools")]
             crate::probe::chart_image(
                 which.index(),
-                f.levels().iter().map(|l| l.len()).sum(),
+                || f.levels().iter().map(|l| l.len()).sum(),
                 p_w,
                 p_v,
             );
@@ -3734,7 +3782,7 @@ impl Renderer {
                 continue;
             };
             #[cfg(feature = "dev-tools")]
-            let p_w = Instant::now();
+            let p_w = crate::probe::Span::start();
             let ((), refused) = skin_atlas::scoped(self.gpu.device(), || {
                 for ((k, bytes), level) in (0_u32..).zip(f.levels()).zip(0..) {
                     let Some(size) = f.level_size(level) else {
@@ -3756,12 +3804,12 @@ impl Renderer {
                 self.gpu.queue().submit([]);
             });
             #[cfg(feature = "dev-tools")]
-            let p_v = Instant::now();
+            let p_v = crate::probe::Span::start();
             let waited = self.wait_chart();
             #[cfg(feature = "dev-tools")]
             crate::probe::chart_image(
                 which.index(),
-                f.levels().iter().map(|l| l.len()).sum(),
+                || f.levels().iter().map(|l| l.len()).sum(),
                 p_w,
                 p_v,
             );
@@ -6197,6 +6245,10 @@ impl Renderer {
         // Whatever is drawn now, a play frame built before it is not
         // submitted again.
         self.started = None;
+        // The probe's own time so far: the frame's work from here on is
+        // measured without it.
+        #[cfg(feature = "dev-tools")]
+        let p_own = crate::probe::own_time();
         let play = (&self.staging, &self.instances, &self.atlas_bind);
         let (staging, instances, atlas_bind) = match on {
             Draw::Play => play,
@@ -6217,10 +6269,11 @@ impl Renderer {
             },
         };
         #[cfg(feature = "dev-tools")]
-        let p_first = {
-            let k = crate::probe::FIRST_USE.load(std::sync::atomic::Ordering::Relaxed);
-            k != 0 && crate::probe::bind_key(atlas_bind) == k
-        };
+        let p_first = crate::probe::on()
+            .then(|| {
+                crate::probe::first_use(crate::probe::array_key(self.drawn_atlas(on).texture()))
+            })
+            .flatten();
         let sprites = staging.instances().len();
         let staged = u32::try_from(sprites).unwrap_or(u32::MAX);
         let timing = |cpu, presented| FrameTiming {
@@ -6234,6 +6287,8 @@ impl Renderer {
             return Ok(timing(start.elapsed(), false));
         }
         let acquire = Instant::now();
+        #[cfg(feature = "dev-tools")]
+        let p_acquire = crate::probe::Span::at(acquire);
         let (frame, view) = match &mut self.output {
             Output::Window(w) => match w.surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(t)
@@ -6248,7 +6303,7 @@ impl Renderer {
                     if crate::probe::frame_armed() {
                         crate::probe::arm_frame(false);
                         crate::probe::mark("rf:output", 0);
-                        crate::probe::mark("rf:wait_us", crate::probe::us(acquire.elapsed()));
+                        crate::probe::mark("rf:wait_us", crate::probe::us(p_acquire.elapsed()));
                         crate::probe::mark("rf:skipped", 1);
                     }
                     let cpu = start.elapsed().saturating_sub(acquire.elapsed());
@@ -6259,7 +6314,7 @@ impl Renderer {
                     if crate::probe::frame_armed() {
                         crate::probe::arm_frame(false);
                         crate::probe::mark("rf:output", 0);
-                        crate::probe::mark("rf:wait_us", crate::probe::us(acquire.elapsed()));
+                        crate::probe::mark("rf:wait_us", crate::probe::us(p_acquire.elapsed()));
                         crate::probe::mark("rf:skipped", 1);
                     }
                     w.configure(self.gpu.device());
@@ -6283,7 +6338,7 @@ impl Renderer {
                 #[cfg(feature = "dev-tools")]
                 let mut p_polled = false;
                 #[cfg(feature = "dev-tools")]
-                let p_adm = Instant::now();
+                let p_adm = crate::probe::Span::start();
                 let admitted = self.pacer.admit(|previous| {
                     #[cfg(feature = "dev-tools")]
                     {
@@ -6308,7 +6363,7 @@ impl Renderer {
                     crate::probe::mark("rf:bound_us", wait.map_or(-1, crate::probe::us));
                     if !admitted {
                         crate::probe::arm_frame(false);
-                        crate::probe::mark("rf:wait_us", crate::probe::us(acquire.elapsed()));
+                        crate::probe::mark("rf:wait_us", crate::probe::us(p_acquire.elapsed()));
                         crate::probe::mark("rf:skipped", 1);
                     }
                 }
@@ -6420,16 +6475,19 @@ impl Renderer {
             text.render(&mut pass).map_err(RenderError::Text)?;
         }
         #[cfg(feature = "dev-tools")]
-        let p_s = Instant::now();
+        let p_s = crate::probe::Span::start();
         let submitted = queue.submit([encoder.finish()]);
         #[cfg(feature = "dev-tools")]
         let p_submit = p_s.elapsed();
         let cpu = start.elapsed() - acquired;
+        // The probe's own work in the frame is not its CPU time.
+        #[cfg(feature = "dev-tools")]
+        let cpu = cpu.saturating_sub(crate::probe::own_time().saturating_sub(p_own));
         // After the frame's time is taken: the probe's readings (the
         // allocator's report and the completion callback allocate inside
         // wgpu) are not counted in it.
         #[cfg(feature = "dev-tools")]
-        self.probe_after_submit(p_first, p_submit, start);
+        self.probe_after_submit(p_first, p_submit, cpu + acquired);
         let mut out = timing(cpu, true);
         match frame {
             Some(t) => {
@@ -6677,7 +6735,7 @@ fn write_chart_set(
             continue;
         };
         #[cfg(feature = "dev-tools")]
-        let p_w = Instant::now();
+        let p_w = crate::probe::Span::start();
         let ((), refused) = skin_atlas::scoped(gpu.device(), || {
             for ((k, bytes), level) in (0_u32..).zip(f.levels()).zip(0..) {
                 let Some(size) = f.level_size(level) else {
@@ -6699,12 +6757,12 @@ fn write_chart_set(
             gpu.queue().submit([]);
         });
         #[cfg(feature = "dev-tools")]
-        let p_v = Instant::now();
+        let p_v = crate::probe::Span::start();
         let waited = wait_for_gpu(gpu);
         #[cfg(feature = "dev-tools")]
         crate::probe::chart_image(
             which.index(),
-            f.levels().iter().map(|l| l.len()).sum(),
+            || f.levels().iter().map(|l| l.len()).sum(),
             p_w,
             p_v,
         );

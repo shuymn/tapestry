@@ -574,6 +574,135 @@ fn a_refused_selection_skin_ends_its_pool() {
     r.link.exit();
 }
 
+/// Two bundles of `bundle`'s skin over one new atlas: the second staged
+/// while the first is committed is a layout on its array.
+fn same_array(bundle: &Arc<render::SkinBundle>) -> [Arc<render::SkinBundle>; 2] {
+    let skin = bundle.skin();
+    let variant = bundle.atlas_pages().variant();
+    let limits = crate::render_common::offscreen(1_920, 1_080).atlas_limits();
+    let atlas = skin.atlas(variant, limits, &|| false).unwrap();
+    let second = atlas
+        .rebind_keeping(skin.sheet(), variant, skin.kept_layers())
+        .unwrap();
+    let of = |a| {
+        Arc::new(
+            render::SkinBundle::new(
+                Arc::clone(skin),
+                a,
+                render::ClipTable::default(),
+                skin_model::Side::Left,
+            )
+            .unwrap(),
+        )
+    };
+    [of(atlas), of(second)]
+}
+
+/// With the transition probe on, a selection skin's first use (`fu:*`) is
+/// the first frame that samples its array, though another bundle laid out
+/// on that array, binding a pool of its own, was committed before any
+/// frame drew.
+#[test]
+fn the_probe_marks_the_first_use_through_a_layout_on_the_same_array() {
+    use crate::dev::loop_probe::tests::{marks, turn_on};
+    let _warp = crate::warp_turn::take();
+    let _serial = crate::imports::tests::serial();
+    turn_on();
+    let count = |tag: &str| marks().iter().filter(|m| m.1 == tag).count();
+    let (_dir, skin, script) = chart_skin();
+    let (_other_dir, _, other_script) = chart_skin();
+    let [first, second] = same_array(&skin);
+    let frames = Frames::default();
+    let (link, _, _) = lossy_spawn(None, &Arc::default(), Box::new(frames.clone()));
+    assert_eq!(
+        link.select_with(ScreenKind::Selection, Some(first), script)
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    assert_eq!(count("up:selskin:total_us"), 1, "{:?}", marks());
+    assert_eq!(
+        link.select_with(ScreenKind::Selection, Some(second), other_script)
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    // A layout on the array, with a pool bound of its own: nothing
+    // uploaded, nothing drawn yet.
+    let paths: Vec<i64> = marks()
+        .iter()
+        .filter(|m| m.1 == "st:selskin:path")
+        .map(|m| m.2)
+        .collect();
+    assert_eq!(paths, [2, 1], "own resources, then a layout");
+    assert_eq!(count("up:selskin:total_us"), 1, "{:?}", marks());
+    assert_eq!(count("fu:submit_us"), 0, "drawn before the selection");
+    link.enter_selection(1);
+    link.show_selection(update(1, 1, "", CursorChart::Pending));
+    frames.until(draws_none);
+    assert!(
+        wait_until(|| count("fu:submit_us") == 1),
+        "no first use of the array: {:?}",
+        marks()
+    );
+    // Credited to the selection skin's upload it awaited.
+    let caller: Vec<i64> = marks()
+        .iter()
+        .filter(|m| m.1 == "fu:caller")
+        .map(|m| m.2)
+        .collect();
+    assert_eq!(caller, [i64::from(render::probe::SELECT_SKIN)]);
+    link.exit();
+}
+
+/// With the transition probe on, each array awaited for its first use
+/// ends once: a selection skin replaced before any frame drew it has its
+/// array's wait ended by the replacement's upload (`fu:superseded`), so the
+/// first use the next frame marks is the replacement's (`fu:caller`), each
+/// with the caller it was uploaded for.
+#[test]
+fn the_probe_ends_each_awaited_first_use_once() {
+    use crate::dev::loop_probe::tests::{marks, turn_on};
+    let _warp = crate::warp_turn::take();
+    let _serial = crate::imports::tests::serial();
+    turn_on();
+    let (_dir, skin, script) = chart_skin();
+    let (_other_dir, other, other_script) = chart_skin();
+    let frames = Frames::default();
+    let (link, _, _) = lossy_spawn(None, &Arc::default(), Box::new(frames.clone()));
+    for (bundle, script) in [(skin, script), (other, other_script)] {
+        assert_eq!(
+            link.select_with(ScreenKind::Selection, Some(bundle), script)
+                .wait()
+                .unwrap(),
+            Preparation::Ready
+        );
+    }
+    let ends = || -> Vec<(&'static str, i64)> {
+        marks()
+            .iter()
+            .filter(|m| matches!(m.1, "fu:caller" | "fu:superseded" | "fu:discarded"))
+            .map(|m| (m.1, m.2))
+            .collect()
+    };
+    let uploads = marks()
+        .iter()
+        .filter(|m| m.1 == "up:selskin:total_us")
+        .count();
+    assert_eq!(uploads, 2, "{:?}", marks());
+    link.enter_selection(1);
+    link.show_selection(update(1, 1, "", CursorChart::Pending));
+    frames.until(draws_none);
+    assert!(
+        wait_until(|| ends().iter().any(|e| e.0 == "fu:caller")),
+        "no first use: {:?}",
+        marks()
+    );
+    let skin = i64::from(render::probe::SELECT_SKIN);
+    assert_eq!(ends(), [("fu:superseded", skin), ("fu:caller", skin)]);
+    link.exit();
+}
+
 /// With the transition probe on, the selection's chart-image pool leaves
 /// each mark at its event: the first frame that draws the selection skin
 /// uploaded last is its first use (`fu:*`), though its pool binds that
@@ -581,7 +710,7 @@ fn a_refused_selection_skin_ends_its_pool() {
 /// replacement; a replacement's commit retires the old pool, whose drop
 /// lies inside the memory readings of the drop that takes it
 /// (`dr:pool_us`); a refused skin's release times its pool beside its slot
-/// (`rel:pool_us`).
+/// (`rel:pool_us`), with no pages phase (`rel:pages_us` is a result's).
 #[test]
 fn the_probe_marks_the_selections_pool_at_its_events() {
     use crate::dev::loop_probe::tests::{marks, now, turn_on};
@@ -656,14 +785,20 @@ fn the_probe_marks_the_selections_pool_at_its_events() {
     bad.store(true, Ordering::Release);
     assert!(wait_until(|| r.link.pool_now().0.is_none()));
     assert!(
-        wait_until(|| !after("rel:pages_us", refused).is_empty()),
+        wait_until(|| !after("rel:pool_us", refused).is_empty()),
         "{:?}",
         marks()
     );
     let [slot, pool, pages] =
         ["rel:slot_us", "rel:pool_us", "rel:pages_us"].map(|t| after(t, refused));
     assert_eq!(pool.len(), 1, "the pool's release: {:?}", marks());
-    assert!(slot.first() <= pool.first() && pool.first() <= pages.first());
+    assert!(
+        slot.len() == 1 && slot.first() <= pool.first(),
+        "{:?}",
+        marks()
+    );
+    // A selection's release has no pages of the result's to time.
+    assert_eq!(pages, [], "{:?}", marks());
     r.link.exit();
 }
 

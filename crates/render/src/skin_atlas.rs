@@ -123,7 +123,7 @@ pub(crate) fn scoped<T>(
     let invalid = device.push_error_scope(wgpu::ErrorFilter::Validation);
     let out = work();
     #[cfg(feature = "dev-tools")]
-    let popping = std::time::Instant::now();
+    let popping = crate::probe::Span::start();
     // Popped in the reverse order of their pushes.
     let refused = pollster::block_on(invalid.pop());
     let refused = refused.or(pollster::block_on(out_of_memory.pop()));
@@ -227,7 +227,7 @@ impl AtlasTexture {
         let side = pages.side;
         let levels = u32::try_from(MIP_LEVELS).unwrap_or(1);
         #[cfg(feature = "dev-tools")]
-        let creating = std::time::Instant::now();
+        let creating = crate::probe::Span::start();
         let texture = create(device, side, layers, levels);
         #[cfg(feature = "dev-tools")]
         let writing = {
@@ -235,7 +235,7 @@ impl AtlasTexture {
                 crate::probe::us(creating.elapsed()),
                 std::sync::atomic::Ordering::Relaxed,
             );
-            std::time::Instant::now()
+            crate::probe::Span::start()
         };
         // The built-in atlas at the top left of layer 0's level 0; the
         // shader samples nothing else of layer 0.
@@ -243,7 +243,7 @@ impl AtlasTexture {
         for (layer, page) in (RESERVED_LAYERS..).zip(pages.pages) {
             for (level, bytes) in (0..).zip(page) {
                 #[cfg(feature = "dev-tools")]
-                let p_w = std::time::Instant::now();
+                let p_w = crate::probe::Span::start();
                 write(gpu.queue(), &texture, layer, level, side >> level, bytes);
                 #[cfg(feature = "dev-tools")]
                 {

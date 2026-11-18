@@ -311,6 +311,128 @@ fn a_result_released_by_plays_admission_draws_the_next_charts_images() {
     rig.exit();
 }
 
+/// With the transition probe on, play's admission that releases the
+/// result's installation marks the release once, after the result's
+/// charge it was admitted against (`adm:*`).
+#[test]
+fn the_probe_marks_the_result_released_by_plays_admission() {
+    use crate::dev::loop_probe::tests::{marks, turn_on};
+    turn_on();
+    let (_dir, skin, _) = chart_skin("");
+    let (_a, red) = images(skin.side(), RED, BLUE);
+    let big = {
+        let r = crate::render_common::offscreen(1_920, 1_080);
+        crate::render_decl::atlas_cap_bundle(&r, [0, 0, 255, 255])
+    };
+    let mut rig = Rig::new();
+    rig.link
+        .set_timeouts(Duration::from_secs(60), Duration::from_secs(10));
+    rig.faults.charge_result.store(
+        render::SHARED_TEXELS - skin_model::MAX_ATLAS_TEXELS + 256 * 256 * 2,
+        Ordering::Release,
+    );
+    let lifetime = rig.link.begin_result();
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &viewed(1, &skin, 1_111, &[], &red),
+        &Overlay::default(),
+    );
+    first_with(&rig, 0);
+    let adm = || -> Vec<(&'static str, i64)> {
+        marks()
+            .iter()
+            .filter(|m| m.1.starts_with("adm:"))
+            .map(|m| (m.1, m.2))
+            .collect()
+    };
+    assert_eq!(adm(), [], "no play admitted yet");
+    assert_eq!(
+        rig.link
+            .select(skin_model::ScreenKind::Play, Some(Arc::clone(&big)))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    assert!(wait_until(|| rig.link.result_status().installed.is_none()));
+    let marked = adm();
+    assert!(
+        matches!(marked[..], [("adm:result_charge", c), ("adm:result_released", 1)] if c > 0),
+        "{marked:?}"
+    );
+    rig.exit();
+}
+
+/// With the transition probe on, a layout replaced on its array is
+/// dropped inside the memory readings of the drop that takes it, timed
+/// as a layout (`dr:layout_us`).
+#[test]
+fn the_probe_marks_a_replaced_layouts_drop_inside_its_readings() {
+    use crate::dev::loop_probe::tests::{marks, turn_on};
+    turn_on();
+    let (_dir, skin, _) = chart_skin("");
+    let [a, b] = pair(&skin);
+    let (_images, set) = images(a.side(), RED, BLUE);
+    let rig = Rig::new();
+    assert_eq!(
+        rig.link
+            .upload_result(crate::result_skin::Upload::Pages(Arc::clone(
+                a.atlas_pages()
+            )))
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    let lifetime = rig.link.begin_result();
+    for (key, bundle, lines) in [
+        (1, &a, &[][..]),
+        (2, &b, &["B"][..]),
+        (3, &a, &["C", "C"][..]),
+    ] {
+        show(
+            &rig.link,
+            lifetime,
+            key,
+            &viewed(key, bundle, 2_222, lines, &set),
+            &Overlay::default(),
+        );
+        first_with(&rig, lines.len());
+    }
+    // The drops' marks in their order: each layout's between its drop's
+    // readings, the first before it and the last after it.
+    let drops = || -> Vec<(&'static str, i64)> {
+        marks()
+            .iter()
+            .filter(|m| m.1.starts_with("dr:"))
+            .map(|m| (m.1, m.2))
+            .collect()
+    };
+    assert!(
+        wait_until(|| drops().contains(&("dr:kind", 3))),
+        "no layout dropped: {:?}",
+        drops()
+    );
+    let d = drops();
+    for (at, _) in d.iter().enumerate().filter(|(_, m)| **m == ("dr:kind", 3)) {
+        let opened = d[..at].iter().rposition(|m| m.0 == "dr:l0");
+        let closed = d[at..].iter().position(|m| m.0 == "dr:l1").map(|k| at + k);
+        let timed = d[at..]
+            .iter()
+            .position(|m| m.0 == "dr:layout_us")
+            .map(|k| at + k);
+        assert!(
+            opened.is_some_and(|o| !d[o..at].iter().any(|m| m.0 == "dr:l1")),
+            "no reading before the layout's drop: {d:?}"
+        );
+        assert!(
+            matches!((timed, closed), (Some(t), Some(c)) if t < c),
+            "the layout not dropped before the last reading: {d:?}"
+        );
+    }
+    rig.exit();
+}
+
 /// Pages uploaded alone, then a view of a layout on them, then
 /// a view of another layout on the same array with the same set, then the
 /// same layout again (installed): the first view writes the set into the

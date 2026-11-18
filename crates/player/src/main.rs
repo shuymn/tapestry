@@ -160,7 +160,7 @@ fn main() -> ExitCode {
     {
         log_file::start(&root.path().join("logs"), name);
     }
-    match command {
+    let code = match command {
         Command::Version => {
             println!("tapestry {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -179,7 +179,12 @@ fn main() -> ExitCode {
         Command::MeasureSelect => report(measure_select(clock)),
         #[cfg(feature = "dev-tools")]
         Command::Scenario(s) => report(dev::scenario::run(s, clock)),
-    }
+    };
+    // The transition probe's marks, whatever the command, unless its run
+    // printed them already (a scenario, before its transition record).
+    #[cfg(feature = "dev-tools")]
+    crate::dev::loop_probe::dump();
+    code
 }
 
 /// The name the log gives `command`, or `None` for one that writes no log:

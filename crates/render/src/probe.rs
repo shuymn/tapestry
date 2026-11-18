@@ -4,11 +4,24 @@
 //! they share the player's time base. Without a sink nothing is marked or
 //! read. Nothing here waits for or reorders work, and a mark allocates
 //! nothing (the sink's buffer is reserved before it is registered).
+//!
+//! A duration is a [`Span`]: the probe's own work on its thread inside it
+//! (marks, memory readings, keys, callbacks armed: [`own`]) is left out, so
+//! a figure is what the work it names took, nested spans included.
+//!
+//! A timed drop (`dr:*_us`, `rel:*_us`) is the drop of the handle it
+//! names: wgpu frees an array when its last handle (often a bind group) is
+//! dropped and no submitted work uses it, at the device's next maintenance
+//! (a submit), which the probe does not force. The readings after a drop
+//! (`dr:l1`, `rel:l1`) can therefore show memory still held; the next
+//! frames' readings (`pd:*`) show it freed.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
+use std::cell::Cell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU8, AtomicU32, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use windows::Win32::Graphics::Dxgi::{
     DXGI_MEMORY_SEGMENT_GROUP, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
@@ -27,9 +40,11 @@ pub(crate) static WRITE_US: AtomicI64 = AtomicI64::new(-1);
 pub(crate) static POP_US: AtomicI64 = AtomicI64::new(-1);
 /// Frames left whose submit and memory are marked after a drop (`pd:*`).
 pub(crate) static POST: AtomicU32 = AtomicU32::new(0);
-/// The bind group of the array uploaded last, by [`bind_key`], until a
-/// frame draws it (`fu:*`); 0: none.
-pub(crate) static FIRST_USE: AtomicU64 = AtomicU64::new(0);
+/// The array uploaded last, by [`array_key`], until a frame samples it
+/// (`fu:*`), whatever bind group the frame binds it with; 0: none.
+static FIRST_USE: AtomicU64 = AtomicU64::new(0);
+/// The caller [`FIRST_USE`]'s array was uploaded for.
+static FIRST_USE_CALLER: AtomicU8 = AtomicU8::new(OTHER);
 
 /// The callers an upload's marks are tagged with (`<family>:<caller>:*`).
 pub const OTHER: u8 = 0;
@@ -51,7 +66,84 @@ pub fn on() -> bool {
 
 pub fn mark(tag: &'static str, v: i64) {
     if let Some(f) = SINK.get() {
-        f(tag, v);
+        own(|| f(tag, v));
+    }
+}
+
+thread_local! {
+    /// The probe's own time on this thread so far ([`own`]).
+    static OWN: Cell<Duration> = const { Cell::new(Duration::ZERO) };
+    /// Whether this thread is in the probe's own work: nested work is
+    /// counted once.
+    static IN_OWN: Cell<bool> = const { Cell::new(false) };
+}
+
+/// Runs `f` as the probe's own work: its time is left out of every
+/// [`Span`] on this thread that encloses it.
+pub fn own<R>(f: impl FnOnce() -> R) -> R {
+    if IN_OWN.with(|c| c.replace(true)) {
+        return f();
+    }
+    let t = Instant::now();
+    let r = f();
+    let took = t.elapsed();
+    OWN.with(|c| c.set(c.get().saturating_add(took)));
+    IN_OWN.with(|c| c.set(false));
+    r
+}
+
+/// The probe's own time on this thread so far.
+pub fn own_time() -> Duration {
+    OWN.with(Cell::get)
+}
+
+/// A probe figure's start: a time on this thread and the probe's own time
+/// then, so its [`elapsed`](Self::elapsed) leaves the probe's work out.
+/// With the probe off it reads no clock and every figure is zero.
+#[derive(Clone, Copy, Debug)]
+pub struct Span {
+    at: Option<Instant>,
+    own: Duration,
+}
+
+impl Span {
+    pub fn start() -> Self {
+        if on() {
+            Self::at(Instant::now())
+        } else {
+            Self {
+                at: None,
+                own: Duration::ZERO,
+            }
+        }
+    }
+
+    /// A span from `at`, a time this thread took with no probe work since.
+    pub fn at(at: Instant) -> Self {
+        Self {
+            at: Some(at),
+            own: own_time(),
+        }
+    }
+
+    /// The time since its start, less the probe's own work on this thread
+    /// since.
+    pub fn elapsed(&self) -> Duration {
+        self.at.map_or(Duration::ZERO, |at| {
+            at.elapsed()
+                .saturating_sub(own_time().saturating_sub(self.own))
+        })
+    }
+
+    /// The time from its start to `to`'s, less the probe's own work
+    /// between them.
+    pub fn until(&self, to: Self) -> Duration {
+        match (self.at, to.at) {
+            (Some(from), Some(at)) => at
+                .saturating_duration_since(from)
+                .saturating_sub(to.own.saturating_sub(self.own)),
+            _ => Duration::ZERO,
+        }
     }
 }
 
@@ -138,6 +230,10 @@ pub(crate) fn mem(d: &wgpu::Device, l: &'static str, n: &'static str, r: &'stati
     if !on() {
         return;
     }
+    own(|| read_mem(d, l, n, r));
+}
+
+fn read_mem(d: &wgpu::Device, l: &'static str, n: &'static str, r: &'static str) {
     if in_play() {
         mark(l, -2);
         mark(n, -2);
@@ -155,47 +251,87 @@ pub(crate) fn mem(d: &wgpu::Device, l: &'static str, n: &'static str, r: &'stati
 
 /// Marks one chart image's write (`ci:<caller>:*`): its index, its
 /// bytes, its writes from `written` to `waiting` and its wait for the GPU
-/// from `waiting` to now.
+/// from `waiting` to now, both taken before its bytes are counted or any
+/// of its marks made.
 pub(crate) fn chart_image(
     index: usize,
-    bytes: usize,
-    written: std::time::Instant,
-    waiting: std::time::Instant,
+    bytes: impl FnOnce() -> usize,
+    written: Span,
+    waiting: Span,
 ) {
+    if !on() {
+        return;
+    }
+    let wait = waiting.elapsed();
+    let write = written.until(waiting);
+    let bytes = own(bytes);
     cmark!("ci", "image", i64::try_from(index).unwrap_or(-1));
     cmark!("ci", "bytes", i64::try_from(bytes).unwrap_or(-1));
-    cmark!(
-        "ci",
-        "write_us",
-        us(waiting.saturating_duration_since(written))
-    );
-    cmark!("ci", "wait_us", us(waiting.elapsed()));
+    cmark!("ci", "write_us", us(write));
+    cmark!("ci", "wait_us", us(wait));
 }
 
-/// Marks the submit and memory of the next frames after a drop (`pd:*`).
-pub(crate) fn arm_post() {
+/// Marks the submit and memory of the next `frames` frames (`pd:*`):
+/// after a drop 8, after a first use 3; an armed count is never cut.
+pub fn arm_post(frames: u32) {
     if on() {
-        POST.store(8, Ordering::Relaxed);
+        POST.fetch_max(frames, Ordering::Relaxed);
     }
 }
 
-/// `new` made in place of `old` on the same array (the probe on): a
-/// chart-image pool bound, or the placeholder in its place. If `old` is
-/// the array uploaded last, not drawn yet, its first use is now the first
-/// frame that draws `new` (`fu:*`).
-pub(crate) fn rebind(old: &wgpu::BindGroup, new: &wgpu::BindGroup) {
-    if on() {
-        let key = bind_key(old);
-        // A failed exchange: `old` is not the array awaiting its first use.
-        let _ =
-            FIRST_USE.compare_exchange(key, bind_key(new), Ordering::Relaxed, Ordering::Relaxed);
-    }
+/// The frames left whose submit and memory are marked (`pd:*`).
+pub fn post_left() -> u32 {
+    POST.load(Ordering::Relaxed)
 }
 
-/// A bind group's identity for [`FIRST_USE`], never 0.
-pub(crate) fn bind_key(b: &wgpu::BindGroup) -> u64 {
+/// Awaits the first frame that samples the array `key`, uploaded now for
+/// the current caller: an array awaited before and not drawn is marked
+/// replaced (`fu:superseded`, its caller), so no first use is credited to
+/// the wrong upload.
+pub(crate) fn await_first_use(key: u64) {
+    own(|| {
+        let replaced = FIRST_USE.swap(key, Ordering::Relaxed);
+        let was = FIRST_USE_CALLER.swap(caller(), Ordering::Relaxed);
+        if replaced != 0 {
+            mark("fu:superseded", i64::from(was));
+        }
+    });
+}
+
+/// The array `key` dropped with its staging before any frame sampled it:
+/// its first use is no longer awaited (`fu:discarded`, its caller).
+pub(crate) fn discard_first_use(key: u64) {
+    own(|| {
+        if FIRST_USE
+            .compare_exchange(key, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+        {
+            mark(
+                "fu:discarded",
+                i64::from(FIRST_USE_CALLER.load(Ordering::Relaxed)),
+            );
+        }
+    });
+}
+
+/// Whether a frame sampling the array `key` is its first use: then it is
+/// no longer awaited, and the caller it was uploaded for is returned.
+pub(crate) fn first_use(key: u64) -> Option<u8> {
+    own(|| {
+        FIRST_USE
+            .compare_exchange(key, 0, Ordering::Relaxed, Ordering::Relaxed)
+            .ok()
+            .filter(|&k| k != 0)
+            .map(|_| FIRST_USE_CALLER.load(Ordering::Relaxed))
+    })
+}
+
+/// An array's identity for [`FIRST_USE`], never 0.
+pub(crate) fn array_key(b: &wgpu::Texture) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    b.hash(&mut h);
-    h.finish().max(1)
+    own(|| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        b.hash(&mut h);
+        h.finish().max(1)
+    })
 }

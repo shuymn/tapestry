@@ -630,6 +630,41 @@ fn a_skip_after_completion_lands_on_the_result() {
     assert!(!lines(&stdout, "result: viewing ").is_empty(), "{stdout}");
 }
 
+/// With the transition probe on (`TAPESTRY_LOOP_PROBE`), a scenario
+/// prints its marks once, before its transition record.
+#[test]
+fn a_scenario_prints_the_transition_probes_marks_once() {
+    let fx = Fixture::new();
+    write_tail_chart(&fx.library());
+    let (out, stdout, stderr) = fx.output(
+        fx.command(&scenario(&[
+            "select = { path = \"library/tail/tail.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ]))
+        .env("TAPESTRY_LOOP_PROBE", "1"),
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let at = |prefix: &str| -> Vec<usize> {
+        stdout
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with(prefix))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let dropped = at("dev: probe-dropped ");
+    assert_eq!(dropped.len(), 1, "{stdout}");
+    assert!(
+        at("dev: probe ").iter().any(|&i| i < dropped[0]),
+        "{stdout}"
+    );
+    let record = at("dev: transition");
+    assert!(!record.is_empty(), "{stdout}");
+    assert!(record.iter().all(|&i| i > dropped[0]), "{stdout}");
+}
+
 /// The quit key timed while the chart plays (`command = "quit"`) ends the
 /// play midway on its result, which the next step leaves for selection.
 #[test]

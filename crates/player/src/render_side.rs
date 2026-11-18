@@ -5762,6 +5762,13 @@ impl Run {
         let mut mode = Mode::Splash { pending: None };
         let mut effects: Vec<JudgeEvent> = Vec::with_capacity(self.view.effects);
         loop {
+            // The mode this pass's work runs in (the probe reads no memory
+            // in play): a message that changed it and went on to the next
+            // is followed here.
+            #[cfg(feature = "dev-tools")]
+            if crate::dev::loop_probe::on() {
+                render::probe::set_in_play(matches!(mode, Mode::Play { .. }));
+            }
             #[cfg(feature = "dev-tools")]
             crate::dev::loop_probe::mark(
                 "loop",
@@ -6362,13 +6369,16 @@ impl Run {
             // D1, "Prepared").
             if matches!(mode, Mode::Result) {
                 #[cfg(feature = "dev-tools")]
-                let prepared = Instant::now();
+                let (prepared, p_own) = (Instant::now(), render::probe::own_time());
                 self.prepare_result();
                 // Charged to the next frame only while the screen it was
-                // done on lives (dev-tools: the whole frames).
+                // done on lives (dev-tools: the whole frames), without the
+                // probe's own work.
                 #[cfg(feature = "dev-tools")]
                 if self.screen.is_some() {
-                    self.result_frames.before_wait(prepared);
+                    let p_own = render::probe::own_time().saturating_sub(p_own);
+                    self.result_frames
+                        .before_wait(prepared.checked_add(p_own).unwrap_or(prepared));
                 }
                 if self.screen.is_none() {
                     mode = Mode::Idle;
@@ -6717,21 +6727,10 @@ impl Run {
                 // reads no memory and arms no callback (they allocate).
                 render::probe::set_in_play(matches!(mode, Mode::Play { .. }));
             }
+            // Whether this frame is one of the result's first frames
+            // probed (`rf:*`), decided at its commit point.
             #[cfg(feature = "dev-tools")]
-            let p_rf = matches!(mode, Mode::Result)
-                && render::probe::count_down(&crate::dev::loop_probe::RESULT_FRAMES);
-            #[cfg(feature = "dev-tools")]
-            if p_rf {
-                crate::dev::loop_probe::mark(
-                    "rf:frame_left",
-                    i64::from(
-                        crate::dev::loop_probe::RESULT_FRAMES
-                            .load(std::sync::atomic::Ordering::Relaxed),
-                    ),
-                );
-                crate::dev::loop_probe::RF_ACTIVE.store(true, std::sync::atomic::Ordering::Relaxed);
-                render::probe::arm_frame(true);
-            }
+            let mut p_rf = false;
             let drawn = match &mut mode {
                 Mode::Idle => continue,
                 Mode::Splash { pending } => {
@@ -7209,6 +7208,23 @@ impl Run {
                         &self.scripts,
                         now,
                     );
+                    // The first frames after the first view committed.
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        p_rf = render::probe::count_down(&crate::dev::loop_probe::RESULT_FRAMES);
+                        if p_rf {
+                            crate::dev::loop_probe::mark(
+                                "rf:frame_left",
+                                i64::from(
+                                    crate::dev::loop_probe::RESULT_FRAMES
+                                        .load(std::sync::atomic::Ordering::Relaxed),
+                                ),
+                            );
+                            crate::dev::loop_probe::RF_ACTIVE
+                                .store(true, std::sync::atomic::Ordering::Relaxed);
+                            render::probe::arm_frame(true);
+                        }
+                    }
                     Self::result_visit(self.result.as_mut(), now, fadeout, &app);
                     #[cfg(all(test, feature = "dev-tools"))]
                     if let Some(h) = self.result.as_ref().and_then(|s| s.presented.as_ref()) {
@@ -7596,16 +7612,19 @@ impl Run {
                 );
             }
             #[cfg(feature = "dev-tools")]
-            let p_t = std::time::Instant::now();
-            if matches!(mode, Mode::Result) && drawn.is_ok() {
+            let p_t = render::probe::Span::start();
+            let p_after = matches!(mode, Mode::Result) && drawn.is_ok();
+            if p_after {
                 self.after_result_frame();
             }
             #[cfg(feature = "dev-tools")]
             if p_rf {
-                crate::dev::loop_probe::mark(
-                    "rf:after_result_frame_us",
-                    crate::dev::loop_probe::us(p_t.elapsed()),
-                );
+                if p_after {
+                    crate::dev::loop_probe::mark(
+                        "rf:after_result_frame_us",
+                        crate::dev::loop_probe::us(p_t.elapsed()),
+                    );
+                }
                 crate::dev::loop_probe::RF_ACTIVE
                     .store(false, std::sync::atomic::Ordering::Relaxed);
             }
@@ -8169,7 +8188,7 @@ impl Run {
         #[cfg(feature = "dev-tools")]
         let p_caller = crate::dev::loop_probe::Caller::set(render::probe::ATTEMPT);
         #[cfg(feature = "dev-tools")]
-        let p_t = std::time::Instant::now();
+        let p_t = render::probe::Span::start();
         let mut answer = publish(screen, target);
         // The admitted staging draws from the committed installation when
         // it has no array of its own: its table is published there.
@@ -9392,6 +9411,8 @@ impl Run {
     fn drop_result(&mut self) {
         #[cfg(feature = "dev-tools")]
         {
+            // No result frame left to probe past its result.
+            crate::dev::loop_probe::RESULT_FRAMES.store(0, std::sync::atomic::Ordering::Relaxed);
             self.result_frames
                 .report("result", self.clock.frequency().hz());
             self.frames_view = None;
@@ -9582,7 +9603,7 @@ impl Run {
                 // built again restored what the result kind keeps, which
                 // follows each view's commit (`reconcile_result`).
                 #[cfg(feature = "dev-tools")]
-                let p_t = std::time::Instant::now();
+                let p_t = render::probe::Span::start();
                 let p_prepared =
                     screen.prepare_result(bundle, state, &h.payload.view, &h.payload.labels);
                 #[cfg(feature = "dev-tools")]
@@ -9594,7 +9615,7 @@ impl Run {
                     Ok(Ok(())) => {
                         screen.install_result_text();
                         #[cfg(feature = "dev-tools")]
-                        let p_t = std::time::Instant::now();
+                        let p_t = render::probe::Span::start();
                         // The images again, into the restored array.
                         let p_chart = stage_result_chart(
                             screen.as_mut(),
@@ -9617,7 +9638,7 @@ impl Run {
             }
             let lines = strip_lines(&h.payload, &h.overlay, side.stop);
             #[cfg(feature = "dev-tools")]
-            let p_t = std::time::Instant::now();
+            let p_t = render::probe::Span::start();
             let p_strip = screen
                 .prepare_result_strip(STRIP_PRESENTED, &lines)
                 .map(|()| screen.use_result_strip(STRIP_PRESENTED));
@@ -9670,7 +9691,7 @@ impl Run {
                     #[cfg(feature = "dev-tools")]
                     let uploads = screen.atlas_uploads();
                     #[cfg(feature = "dev-tools")]
-                    let p_t = std::time::Instant::now();
+                    let p_t = render::probe::Span::start();
                     let installed = screen.install(ScreenKind::Result, bundle, request);
                     #[cfg(feature = "dev-tools")]
                     {
@@ -9691,13 +9712,6 @@ impl Run {
                             "res:bundle_level_bytes",
                             crate::dev::loop_probe::pages_level_bytes(pages),
                         );
-                        if crate::dev::loop_probe::on()
-                            && side.presented.is_none()
-                            && matches!(installed, Ok(Preparation::Ready))
-                        {
-                            crate::dev::loop_probe::RESULT_FRAMES
-                                .store(3, std::sync::atomic::Ordering::Relaxed);
-                        }
                     }
                     #[cfg(feature = "dev-tools")]
                     crate::dev::result_staged(screen.atlas_uploads() - uploads);
@@ -9725,7 +9739,7 @@ impl Run {
                             token = Some(staged);
                             let mut state = bundle.skin().prepare_result();
                             #[cfg(feature = "dev-tools")]
-                            let p_t = std::time::Instant::now();
+                            let p_t = render::probe::Span::start();
                             // The view's images, into the array its
                             // staging uses, keyed to its installation.
                             let p_chart = stage_result_chart(
@@ -9743,7 +9757,7 @@ impl Run {
                                 Err(e) => failed = Some(e),
                             }
                             #[cfg(feature = "dev-tools")]
-                            let p_t = std::time::Instant::now();
+                            let p_t = render::probe::Span::start();
                             let prepared = screen.prepare_result(
                                 bundle,
                                 &mut state,
@@ -9922,6 +9936,9 @@ impl Run {
                 }
             } else {
                 let mut committed = None;
+                // Whether the view committed is a staging's (dev-tools).
+                #[cfg(feature = "dev-tools")]
+                let mut p_staged = false;
                 if let Some(v) = side.prepared.take() {
                     let lifetime = side.lifetime;
                     let commit =
@@ -9940,6 +9957,10 @@ impl Run {
                             if v.token.is_some() {
                                 side.drain = true;
                                 side.reconcile = true;
+                            }
+                            #[cfg(feature = "dev-tools")]
+                            {
+                                p_staged = v.token.is_some();
                             }
                             committed = Some(v.held);
                         }
@@ -9967,6 +9988,13 @@ impl Run {
                         // A switch that keeps the layout keeps its running
                         // runtime.
                         h.script.transfer_from(&mut old.script);
+                    }
+                    // The result's first view committed with its staging:
+                    // its first frames are probed (`rf:*`, dev-tools).
+                    #[cfg(feature = "dev-tools")]
+                    if p_staged && side.presented.is_none() && crate::dev::loop_probe::on() {
+                        crate::dev::loop_probe::RESULT_FRAMES
+                            .store(3, std::sync::atomic::Ordering::Relaxed);
                     }
                     if let Some(old) = side.presented.replace(h) {
                         side.drop_later(old);
@@ -10107,7 +10135,7 @@ impl Run {
         };
         // What the commit point replaced: its slots park, outside it.
         #[cfg(feature = "dev-tools")]
-        let p_t = std::time::Instant::now();
+        let p_t = render::probe::Span::start();
         side.drain();
         #[cfg(feature = "dev-tools")]
         if crate::dev::loop_probe::RF_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -10132,7 +10160,7 @@ impl Run {
             }
             if std::mem::take(&mut side.drain) {
                 #[cfg(feature = "dev-tools")]
-                let p_t = std::time::Instant::now();
+                let p_t = render::probe::Span::start();
                 let _ = screen.drain_retired();
                 #[cfg(feature = "dev-tools")]
                 if crate::dev::loop_probe::RF_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
@@ -10282,7 +10310,7 @@ impl Run {
         #[cfg(feature = "dev-tools")]
         let p_caller = crate::dev::loop_probe::Caller::set(render::probe::SELECT);
         #[cfg(feature = "dev-tools")]
-        let p_t = std::time::Instant::now();
+        let p_t = render::probe::Span::start();
         let installed = screen.install_pages(kind, pages, request);
         #[cfg(feature = "dev-tools")]
         {

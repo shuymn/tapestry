@@ -177,7 +177,7 @@ pub(crate) fn prepare(
     slots: usize,
 ) -> Result<(TextTable, Holder, TextReport), RenderError> {
     #[cfg(feature = "dev-tools")]
-    let p_began = std::time::Instant::now();
+    let p_began = crate::probe::Span::start();
     #[cfg(feature = "dev-tools")]
     let mut p_raster = std::time::Duration::ZERO;
     #[cfg(feature = "dev-tools")]
@@ -219,17 +219,17 @@ pub(crate) fn prepare(
                 break;
             };
             #[cfg(feature = "dev-tools")]
-            let p_r = std::time::Instant::now();
+            let p_r = crate::probe::Span::start();
             if let Err(e) = rasterize(producer, &n.layout, scratch) {
                 raster = Err(RenderError::Skin(e));
                 break;
             }
             expand(scratch, n.rect, n.layout.size);
             #[cfg(feature = "dev-tools")]
-            let p_w = std::time::Instant::now();
+            let p_w = crate::probe::Span::start();
             #[cfg(feature = "dev-tools")]
             {
-                p_raster += p_w.saturating_duration_since(p_r);
+                p_raster += p_r.until(p_w);
             }
             for k in 0..MIP_LEVELS {
                 let [x, y, w, h] = n.rect.map(|v| v >> k);
@@ -256,7 +256,7 @@ pub(crate) fn prepare(
         // Inside the scopes: the queued writes reach the device only at a
         // submission.
         #[cfg(feature = "dev-tools")]
-        let p_s = std::time::Instant::now();
+        let p_s = crate::probe::Span::start();
         let submission = (written > 0).then(|| queue.submit([]));
         #[cfg(feature = "dev-tools")]
         {
@@ -271,7 +271,7 @@ pub(crate) fn prepare(
     #[cfg(feature = "dev-tools")]
     let p_scoped = p_began.elapsed();
     #[cfg(feature = "dev-tools")]
-    let p_wait = std::time::Instant::now();
+    let p_wait = crate::probe::Span::start();
     report.upload_bytes = bytes;
     report.submission = submission.clone();
     // A device lost while its writes are queued is not detected here: on

@@ -2624,9 +2624,9 @@ impl Rig for PlayerRig<'_> {
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
         // G2's sample (dev-tools): `commit_ready`'s return to here.
         #[cfg(feature = "dev-tools")]
-        crate::dev::loop_probe::mark("g:open", 0);
-        #[cfg(feature = "dev-tools")]
         crate::dev::print_ready_to_open(self.probe_ready.take());
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("g:open", 0);
         // The window gains its focus when shown: an opening before it
         // would latch the play's focus loss at once.
         if let Some(window) = &self.window {
@@ -2693,9 +2693,9 @@ impl Rig for PlayerRig<'_> {
     ) -> Result<Option<Opening<SourceReader>>, InputWaitError> {
         // G2's sample (dev-tools), as at [`open`](Rig::open).
         #[cfg(feature = "dev-tools")]
-        crate::dev::loop_probe::mark("g:open", 1);
-        #[cfg(feature = "dev-tools")]
         crate::dev::print_ready_to_open(self.probe_ready.take());
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("g:open", 1);
         if let Some(window) = &self.window {
             window.wait_to_open();
         }
