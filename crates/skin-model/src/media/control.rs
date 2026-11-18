@@ -11,14 +11,30 @@
 //! worker's replies as it reads the frame ring: it trusts nothing in them,
 //! and a reply it cannot decode fails the worker's players.
 //!
-//! A handle travels as its value in the worker: the worker holds every
-//! handle a command names and closes a player's when the player closes.
+//! A handle travels as its value in the worker, into which the game
+//! duplicated it with exactly the access [`FILE_ACCESS`], [`SECTION_ACCESS`]
+//! or [`EVENT_ACCESS`] names. The worker takes a value only when it holds a
+//! handle of that kind with exactly that access that no other player
+//! holds, and closes a player's handles when the player closes.
 
 /// The most bytes a frame holds after its length.
 pub const MAX_FRAME: usize = 8_192;
 
 /// The most bytes of a string field.
 pub const MAX_TEXT: usize = 4_096;
+
+/// The access of the file handle an [`Command::Open`] names: reading the
+/// file's bytes (`FILE_READ_DATA`), and nothing else.
+pub const FILE_ACCESS: u32 = 0x0001;
+
+/// The access of the section handle a [`Command::Play`] names: mapping the
+/// frame ring for reading and writing (`SECTION_MAP_READ` and
+/// `SECTION_MAP_WRITE`), and nothing else.
+pub const SECTION_ACCESS: u32 = 0x0006;
+
+/// The access of the event handle a [`Command::Play`] names: waiting on it
+/// (`SYNCHRONIZE`), and nothing else.
+pub const EVENT_ACCESS: u32 = 0x0010_0000;
 
 /// A command from the game.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -80,6 +96,8 @@ pub enum Reply {
     Failed { player: u8, why: Failure, code: i32 },
     /// `player` is closed, its handles with it.
     Closed { player: u8 },
+    /// A line of the worker's or FFmpeg's diagnostics.
+    Log { text: String },
 }
 
 /// Why a file is refused at its probe: an absent picture
@@ -155,6 +173,7 @@ const SOUGHT: u8 = 68;
 const ENDED: u8 = 69;
 const FAILED: u8 = 70;
 const CLOSED: u8 = 71;
+const LOG: u8 = 72;
 
 /// The refusals by their code on the wire, their index.
 const REFUSALS: [Refusal; 6] = [
@@ -283,6 +302,7 @@ impl Reply {
                 code: err,
             } => b.u8(FAILED).u8(*player).u8(code(&FAILURES, why)).i32(*err),
             Self::Closed { player } => b.u8(CLOSED).u8(*player),
+            Self::Log { text } => b.u8(LOG).text(text),
         };
         b.0
     }
@@ -329,6 +349,7 @@ impl Reply {
                 code: r.i32()?,
             },
             CLOSED => Self::Closed { player: r.u8()? },
+            LOG => Self::Log { text: r.text()? },
             tag => return Err(Malformed::Tag(tag)),
         };
         r.end()?;

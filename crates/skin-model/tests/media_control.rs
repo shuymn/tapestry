@@ -51,6 +51,9 @@ fn replies() -> Vec<Reply> {
         },
         Reply::Ended { player: 7, run: 12 },
         Reply::Closed { player: 8 },
+        Reply::Log {
+            text: "ffmpeg: [h263 @ 0000] Codec (h263) not on whitelist".to_owned(),
+        },
     ];
     for (i, why) in [
         Refusal::Read,
