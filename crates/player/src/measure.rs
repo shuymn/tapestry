@@ -1309,7 +1309,7 @@ impl Measure {
             drop(std::hint::black_box(vec![0u8; 8]));
         }
         self.drain();
-        if let Some(count) = d.timing.present_count.filter(|_| d.timing.presented)
+        if let Some(count) = d.timing.present_count.filter(|_| d.timing.presented())
             && self.last_present.is_some_and(|last| count <= last)
         {
             // A new swap chain counts again from the start: what the old
@@ -1327,7 +1327,7 @@ impl Measure {
         if d.timing.dropped > 0 {
             self.sprite_full_frames += 1;
         }
-        if !d.timing.presented {
+        if !d.timing.presented() {
             return;
         }
         if d.presentation.is_some() {
@@ -1849,7 +1849,7 @@ mod frame_tests {
                 cpu: Duration::from_micros(cpu_us),
                 sprites: 0,
                 dropped: 0,
-                presented: true,
+                outcome: render::FrameOutcome::Shown,
                 present_count: count,
             },
             statistics,

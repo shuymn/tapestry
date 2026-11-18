@@ -434,10 +434,11 @@ pub struct PlayerRig<'a> {
     /// preparation leaves its lifetime. Until then a screen built again
     /// keeps it, an outro playing included.
     pub result_leaving: bool,
-    /// The result's `clear` or `fail` was asked for at its first show,
-    /// and Result has not been left since: a later show (a view switch, a
-    /// screen built again) starts none, and leaving stops them.
-    pub result_sounding: bool,
+    /// The Result entry handed over and not left since: set at the
+    /// result's first show, it arms the stop of its sounds on leaving; a
+    /// later show (a view switch, a screen built again) numbers no other
+    /// entry (design.md "State Model", system sounds, Result).
+    pub(crate) result_entry: Option<ResultEntry>,
     /// The views the result has changed to so far, each printed once
     /// (dev-tools: a scripted view command is over once its view shows).
     #[cfg(feature = "dev-tools")]
@@ -461,6 +462,9 @@ pub struct PlayerRig<'a> {
     /// looks again.
     #[cfg(test)]
     pub relooked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Tests: set when a look starts the result's sound.
+    #[cfg(test)]
+    pub result_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Tests: set by the idle wait right before it parks.
     #[cfg(test)]
     pub park_probe: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -1214,16 +1218,41 @@ impl PlayerRig<'_> {
         self.end_result();
     }
 
-    /// Result is left: its `clear`, `fail` and `resultclose` stop, once a
-    /// result sound was asked for (design.md "State Model", system sounds,
-    /// Result).
+    /// Result is left: its `clear`, `fail` and `resultclose` stop, once
+    /// the result was handed over, whether or not its sound started
+    /// (design.md "State Model", system sounds, Result).
     fn end_result_sounds(&mut self) {
-        if !std::mem::take(&mut self.result_sounding) {
+        if self.result_entry.take().is_none() {
             return;
         }
         if let Some(sounds) = self.system_sounds.as_mut() {
             // Source: SF-015
             sounds.result_left(&mut self.audio.control);
+        }
+    }
+
+    /// The result's `clear` or `fail`, by the play's own view's lamp, at
+    /// the first look that reads its entry's first result picture
+    /// acknowledged, once per entry; never once the entry's fade-out began,
+    /// so it does not sound over `resultclose` (design.md "State Model",
+    /// system sounds, Result).
+    fn start_result_sound(&mut self) {
+        let Some(entry) = self.result_entry.as_mut().filter(|e| e.due) else {
+            return;
+        };
+        if self.render.result_acknowledged() != entry.number {
+            return;
+        }
+        entry.due = false;
+        if self.result_outro.is_some() {
+            return;
+        }
+        #[cfg(test)]
+        self.result_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(sounds) = self.system_sounds.as_mut() {
+            // Source: SF-015
+            sounds.result_shown(&mut self.audio.control, entry.cleared);
         }
     }
 
@@ -2045,6 +2074,9 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn idle_wait(&mut self, deadline: TimeUs) {
+        // Read before the wait, as the render thread acknowledges before it
+        // wakes this thread: a wake another wait took is not missed.
+        self.start_result_sound();
         let left = deadline.0 - self.clock.now().0;
         if left > 0 {
             #[cfg(test)]
@@ -2052,6 +2084,11 @@ impl Rig for PlayerRig<'_> {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             thread::park_timeout(Duration::from_micros(left.unsigned_abs()));
         }
+        // Each park is followed first by a read of the acknowledgement,
+        // before anything that may wait on the render thread (the result's
+        // status, which a layout's landing reads), so the render thread's
+        // wake starts the sound at once.
+        self.start_result_sound();
         // A switch's layout lands when its job is done: the job wakes this
         // thread once its outcome is in, and while its thread still ends
         // the look is repeated every LAYOUT_RELOOK, within the deadline. A
@@ -2067,10 +2104,12 @@ impl Rig for PlayerRig<'_> {
                 break;
             }
             thread::park_timeout(Duration::from_micros(left.unsigned_abs()).min(LAYOUT_RELOOK));
+            self.start_result_sound();
         }
         if self.controls.quitting() && self.result_skin.has_job() {
             self.result_skin.settle(|| true);
         }
+        self.start_result_sound();
         self.serve_adjustments();
         self.sync();
         // The result's own path, after the adjustments: an offset changed
@@ -2183,6 +2222,12 @@ impl Rig for PlayerRig<'_> {
     /// once.
     fn result_timing(&self) -> Option<game::ResultTiming> {
         self.presenter.timing(&self.render).map(flow_timing)
+    }
+
+    /// The entry's sound not yet started at its first picture's look.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn result_sound_due(&self) -> bool {
+        self.result_entry.as_ref().is_some_and(|e| e.due)
     }
 
     /// The result's origin: the render thread's first commit of a view.
@@ -3262,19 +3307,23 @@ impl Rig for PlayerRig<'_> {
             #[cfg(feature = "dev-tools")]
             id: self.scenario.as_ref().and_then(|s| s.result_id),
         });
+        // The result is handed over: at its first show its entry is
+        // numbered before anything of it is sent, its sound due by the
+        // play's own view's lamp whichever view shows (with no lamp of its
+        // own the play did not clear), started once the entry's first
+        // picture is acknowledged (design.md "State Model", system sounds,
+        // Result).
+        if self.result_entry.is_none() {
+            self.result_entry = Some(ResultEntry {
+                number: self.render.enter_result_entry(self.controls.game_thread()),
+                cleared: screen.own_cleared() == Some(true),
+                due: true,
+            });
+        }
         // The skin's presentation goes first, so the built-in page does not
         // draw before it.
         self.present_view(report, screen);
         self.send_end(tuning.get());
-        // The result's sound, at its first show only, by the play's own
-        // view's lamp whichever view shows; with no lamp of its own the play
-        // did not clear (design.md "State Model", system sounds, Result).
-        if !std::mem::replace(&mut self.result_sounding, true)
-            && let Some(sounds) = self.system_sounds.as_mut()
-        {
-            // Source: SF-015
-            sounds.result_shown(&mut self.audio.control, screen.own_cleared() == Some(true));
-        }
         // Its requests made: the rebuild it follows is over.
         #[cfg(test)]
         self.rebuilds.shown.store(
@@ -3297,6 +3346,21 @@ impl Rig for PlayerRig<'_> {
             self.end_shown = Some(std::time::Instant::now());
         }
     }
+}
+
+/// A Result entry handed over (design.md "State Model", system sounds,
+/// Result).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResultEntry {
+    /// Its number, which the render thread acknowledges at the entry's
+    /// first result picture.
+    pub number: u64,
+    /// Whether the play's own view cleared: `clear` plays, else `fail`.
+    pub cleared: bool,
+    /// Whether its sound is still to start: until the first look that
+    /// reads the acknowledgement, which starts it or, once the entry's
+    /// fade-out began, forgoes it.
+    pub due: bool,
 }
 
 /// The retries a result's flow took (`take_menu`), by receipt, since the
@@ -3579,7 +3643,7 @@ mod tests {
 
         use crate::imports::facts::tests::loaded;
         use crate::imports::tests as imports;
-        use crate::play::PrepStage;
+        use crate::play::{PrepStage, ResultEntry};
         use crate::render_side::ScreenError;
         use crate::render_side::tests::{Installers, bundle};
         use crate::result_skin::tests as result;
@@ -3760,6 +3824,103 @@ mod tests {
                 "landed after its thread's release, woken by the job"
             );
             assert!(kept, "given up at the deadline, the job kept");
+        }
+
+        /// V5's layout overlap (design.md "State Model", system sounds,
+        /// Result): an acknowledgement given while the idle wait looks
+        /// again for a received layout (its thread held after its send)
+        /// starts the result's sound at once, not once the layout lands or
+        /// the wait's deadline passes.
+        #[test]
+        fn an_acknowledgement_during_the_relooks_starts_at_once() {
+            use std::sync::atomic::Ordering;
+            let _serial = imports::serial();
+            let (_d, rs, loaded) = staged_skin();
+            let (started, _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    let _let_go = LetGo;
+                    rig.result_skin = rs;
+                    rig.result_skin.set_wake(rig.controls.game_thread());
+                    let number = rig.render.enter_result_entry(rig.controls.game_thread());
+                    rig.result_entry = Some(ResultEntry {
+                        number,
+                        cleared: true,
+                        due: true,
+                    });
+                    let relooked = Arc::clone(&rig.relooked);
+                    let started = Arc::clone(&rig.result_started);
+                    let acknowledge = rig.render.result_acknowledger();
+                    imports::hold_exit(true);
+                    rig.result_skin.request(result::view(5));
+                    let far = bms_model::TimeUs(rig.now().0 + 60_000_000);
+                    std::thread::scope(|s| {
+                        let render = s.spawn(|| {
+                            let _let_go = LetGo;
+                            until(|| relooked.load(Ordering::SeqCst));
+                            acknowledge(number);
+                            // Within 5 s, the layout's thread still held.
+                            let end = Instant::now() + Duration::from_secs(5);
+                            while !started.load(Ordering::SeqCst) && Instant::now() < end {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            let at_once = started.load(Ordering::SeqCst);
+                            imports::hold_exit(false);
+                            at_once
+                        });
+                        while rig.result_skin.has_job() {
+                            assert!(rig.now().0 < far.0, "the layout never landed");
+                            rig.idle_wait(far);
+                        }
+                        render.join().unwrap()
+                    })
+                });
+            assert!(started, "started while the layout's thread was held");
+        }
+
+        /// V5 (design.md "State Model", system sounds, Result): after its
+        /// park the idle wait reads the acknowledgement first, before the
+        /// result's status, which the render thread may hold: an
+        /// acknowledgement given while the status is held starts the
+        /// result's sound at once.
+        #[test]
+        fn an_acknowledgement_is_read_before_the_results_status() {
+            use std::sync::atomic::Ordering;
+            let _serial = imports::serial();
+            let loaded = loaded("#PLAYLEVEL 12\n", "tapestry");
+            let (started, _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    let number = rig.render.enter_result_entry(rig.controls.game_thread());
+                    rig.result_entry = Some(ResultEntry {
+                        number,
+                        cleared: true,
+                        due: true,
+                    });
+                    let parked = Arc::clone(&rig.park_probe);
+                    parked.store(false, Ordering::SeqCst);
+                    let started = Arc::clone(&rig.result_started);
+                    let acknowledge = rig.render.result_acknowledger();
+                    let hold = rig.render.result_status_hold();
+                    let far = bms_model::TimeUs(rig.now().0 + 20_000_000);
+                    std::thread::scope(|s| {
+                        let render = s.spawn(|| {
+                            until(|| parked.load(Ordering::SeqCst));
+                            let mut at_once = false;
+                            hold(&mut || {
+                                acknowledge(number);
+                                // Within 5 s, the status still held.
+                                let end = Instant::now() + Duration::from_secs(5);
+                                while !started.load(Ordering::SeqCst) && Instant::now() < end {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                at_once = started.load(Ordering::SeqCst);
+                            });
+                            at_once
+                        });
+                        rig.idle_wait(far);
+                        render.join().unwrap()
+                    })
+                });
+            assert!(started, "started while the result's status was held");
         }
 
         /// A close while the idle wait looks again for a received layout

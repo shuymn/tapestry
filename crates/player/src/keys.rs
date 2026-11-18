@@ -197,7 +197,7 @@ impl KeyScreen for Screen<'_> {
         let lines = lines(flow);
         let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
         match self.renderer.text_frame(&refs) {
-            Ok(t) if t.presented => self.presented.store(true, Ordering::Release),
+            Ok(t) if t.presented() => self.presented.store(true, Ordering::Release),
             Ok(_) => {}
             Err(e) => {
                 // The screen is lost: nothing more can be shown, so the

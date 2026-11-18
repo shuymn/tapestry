@@ -301,6 +301,8 @@ tests = [
     "crates/player/src/system_sounds/rig_tests.rs::a_view_switch_keeps_the_result_sounds",
     "crates/player/src/render_side/tests/decision/integrated.rs::result_sounds_through_a_run",
     "crates/player/src/system_sounds/rig_tests.rs::loop_result_is_read_at_startup",
+    "crates/player/src/system_sounds/rig_tests.rs::the_result_sound_starts_at_its_first_picture",
+    "crates/player/src/system_sounds/rig_tests.rs::a_late_acknowledgement_starts_nothing",
 ]
 
 [[entry]]

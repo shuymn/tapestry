@@ -540,7 +540,7 @@ fn frame(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64) -> Vec<u8> {
     r.commit(token).unwrap();
     let v = crate::render_common::view(0, 0);
     let input = crate::render_common::input(&v, TimeUs(0), TimeUs(0), &[]);
-    assert!(r.frame(&input).unwrap().presented);
+    assert!(r.frame(&input).unwrap().presented());
     crate::render_common::read_back(r)
 }
 
@@ -565,7 +565,7 @@ fn frame_of(r: &mut Renderer, b: &Arc<SkinBundle>, request: u64, loaded: &game::
     r.commit(token).unwrap();
     let v = crate::render_common::view(0, 0);
     let input = crate::render_common::input(&v, TimeUs(0), TimeUs(0), &[]);
-    assert!(r.frame(&input).unwrap().presented);
+    assert!(r.frame(&input).unwrap().presented());
     crate::render_common::read_back(r)
 }
 

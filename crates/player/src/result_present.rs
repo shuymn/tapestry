@@ -136,6 +136,11 @@ impl ResultSlot {
     pub const fn current(&self, lifetime: u64) -> bool {
         lifetime != 0 && self.lifetime == lifetime
     }
+
+    /// Whether a result lifetime is current.
+    pub const fn open(&self) -> bool {
+        self.lifetime != 0
+    }
 }
 
 /// The barrier the game thread sets when a leaving command is accepted
