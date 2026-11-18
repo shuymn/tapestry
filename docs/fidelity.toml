@@ -404,8 +404,11 @@ placeholder drawn while the plays read below 0 (`Integer.MIN_VALUE`), or a \
 figure that reads 0 there (the largest EX score, the best score, the EX \
 score to the next rank). Each guarded selection number reads its \
 property's value from one table, in the runtime and in a lowered \
-expression alike (design.md "beatoraja Lua Skins", the expression \
-acceptance proof)."""
+expression alike. The largest EX score reads its 0 also while the chart \
+has no record, its chart maximum known or not, and on a folder row or with \
+no row, a direct number included, so `number(72) == 0` holds for an \
+unplayed chart (design.md "beatoraja Lua Skins", the expression acceptance \
+proof)."""
 source = [
     "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:126-201 @beatoraja-0.8.9",
     "src/bms/player/beatoraja/skin/property/IntegerPropertyFactory.java:289-395 @beatoraja-0.8.9",
@@ -424,6 +427,7 @@ tests = [
     "crates/skin-beatoraja/src/import/selection/profile.rs::every_unavailable_number_has_its_absent_value",
     "crates/skin-beatoraja/tests/lua_runtime.rs::a_lowered_selection_read_agrees_with_the_runtime_in_every_record_state",
     "crates/skin-beatoraja/tests/lua_runtime.rs::absent_scores_read_zero_where_the_source_does",
+    "crates/skin-beatoraja/tests/lua_runtime.rs::the_largest_ex_reads_zero_for_a_chart_with_no_record",
 ]
 
 [[entry]]
@@ -450,4 +454,26 @@ tests = [
     "crates/library/tests/scan.rs::an_undeclared_difficulty_follows_the_subtitle_then_the_title",
     "crates/library/tests/scan.rs::an_undeclared_difficulty_follows_the_note_count",
     "crates/player/src/render_side/tests/decision/integrated.rs::a_chosen_charts_stored_difficulty_reaches_play_and_result",
+]
+
+[[entry]]
+id = "SF-022"
+summary = "A play's judgment and early/late graphs span `floor(length / 1 s) + 1` seconds, one fewer than the notes graph before widened bins round it up"
+class = "rule"
+reason = """
+A player sees each graph's time span as where its play cursor stands and how \
+wide its columns are: the judgment and early/late graphs spread the chart's \
+whole seconds plus one over their width, so their cursor reaches the right \
+edge a second sooner than over the notes graph's span (SF-008), which the \
+song information's distribution gives; widened bins, from 511 s, round each \
+span up to whole bins, so there the two differ by a bin or not at all \
+(design.md "Rendering and Skins", play graphs and visualizers)."""
+source = [
+    "src/bms/player/beatoraja/skin/SkinNoteDistributionGraph.java:171-174 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/SkinNoteDistributionGraph.java:195-220 @beatoraja-0.8.9",
+    "src/bms/player/beatoraja/skin/SkinNoteDistributionGraph.java:277 @beatoraja-0.8.9",
+]
+sites = ["crates/skin-model/src/play/mod.rs"]
+tests = [
+    "crates/skin-model/tests/play_graphs.rs::the_judgment_graphs_span_one_second_less_than_the_notes_graph",
 ]

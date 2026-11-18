@@ -160,7 +160,13 @@ impl SelValue {
     pub(crate) fn expr(self) -> &'static str {
         match self {
             Self::Ex | Self::ExDifference => "selected.ex",
-            Self::MaxEx => "selected.max_ex",
+            // The largest EX score reads its absent value, 0, while the
+            // chart has no record, its chart maximum known or not: the
+            // source reads it from the score data
+            // (`skin/property/IntegerPropertyFactory.java:126-128` at
+            // `0.8.9`), a direct number included.
+            // Source: SF-020
+            Self::MaxEx => "(if (selected.played) then (selected.max_ex) else 0)",
             Self::Notes => "selected.notes",
             Self::Bp => "selected.bp",
             Self::Plays => "selected.plays",
@@ -207,7 +213,11 @@ impl SelValue {
     pub(crate) fn availability(self) -> &'static str {
         match self {
             Self::Ex | Self::Bp => "selected.best",
-            Self::MaxEx => "selected.max_ex_valid",
+            // Without a record (a folder row and no row included) it is
+            // the source's 0, whatever the chart maximum; with one, the
+            // chart maximum when known.
+            // Source: SF-020
+            Self::MaxEx => "!selected.played || selected.max_ex_valid",
             Self::Plays | Self::MaxCombo | Self::Clears | Self::Fails | Self::ScoreCount(_) => {
                 "selected.played"
             }

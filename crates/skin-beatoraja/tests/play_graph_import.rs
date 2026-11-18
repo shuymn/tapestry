@@ -660,13 +660,23 @@ fn a_notes_graph_is_type_0_revealed_over_500_ms() {
 /// early and 6 late; 69 not judged.
 const BIN_1: [u32; 9] = [10, 5, 0, 0, 2, 3, 4, 1, 6];
 
-/// `skin` over 100 taps on lane 1 from 1 s (bin 1 of the profile's 3), the
-/// view's 512 judgment bins holding [`BIN_1`] at bin 1: its quads at `ms`.
+/// `skin` over 100 taps on lane 1 from 1 s (bin 1 of the judgment graph's
+/// 3), the view's 512 judgment bins holding [`BIN_1`] at bin 1: its quads
+/// at `ms`.
 fn judged(skin: Skin, ms: i64) -> Vec<Quad> {
-    let mut chart = taps();
+    // The 100 taps of [`taps`] from 1 s, then a background sound at 2.5 s:
+    // a length of 2.5 s gives the judgment graphs 3 bins of 1 s (the
+    // notes graph 4).
+    let mut chart = (0..100)
+        .fold(ChartBuilder::new(150_000).sound("bgm.wav"), |b, i| {
+            b.tap(Lane::new(1).unwrap(), TimeUs((1_000 + 10 * i) * MS))
+        })
+        .bgm(TimeUs(2_500 * MS), bms_model::SoundId(0))
+        .build()
+        .unwrap();
     chart.meta.length = ChartSummary::of(&chart).length;
     let profile = ChartProfile::of(&chart, &[]);
-    assert_eq!(profile.bins().len(), 3);
+    assert_eq!(profile.bins().len(), 4);
     let score = PlayScore {
         profile: Some(&profile),
         ..PlayScore::NONE

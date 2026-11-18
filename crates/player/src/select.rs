@@ -3302,6 +3302,16 @@ mod tests {
             s.view(0, 0, true).selected.unwrap().max_ex
         };
         assert_eq!(max(&e, Some(rules::tapestry())), Some(30));
+        // The native selection data keeps an unplayed chart's largest EX
+        // score, which tapestry's own screens show.
+        let mut unplayed = SelectScreen::new(Vec::new());
+        unplayed.set_entries(vec![e.clone()]);
+        unplayed.set_bests_preset(Some(rules::tapestry()));
+        let selected = unplayed.view(0, 0, true).selected.unwrap();
+        assert_eq!(
+            (selected.max_ex, selected.score),
+            (Some(30), skin_model::RowScore::Unplayed)
+        );
         let mut heavier = rules::tapestry();
         heavier.score.ex.great = 4;
         assert_eq!(max(&e, Some(heavier)), Some(60));
