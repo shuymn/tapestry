@@ -491,11 +491,37 @@ fn the_transition_probe_marks_each_event() {
         let first = shown(rig, seen, a_dir.path(), |_, m| near(m, MARK));
         assert!(first.is_some_and(|[_, m]| near(m, MARK)), "{first:?}");
         prepared(rig, &b);
+        // Frames of another picture between B's upload and its result's
+        // first frame: the first use is the result's, not theirs.
+        let at = probe_now();
+        rig.render
+            .loading()
+            .show(crate::render_side::tests::one_line("between"));
+        let end = Instant::now() + Duration::from_secs(10);
+        while presents_after(at) < 3 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(presents_after(at) >= 3, "no frame between");
         let second = shown(rig, seen, b_dir.path(), |c, _| near(c, GREEN));
         assert!(second.is_some_and(|[c, _]| near(c, GREEN)), "{second:?}");
     });
     let marks = crate::dev::loop_probe::tests::marks();
     assert_marks(&marks);
+}
+
+/// The probe's time of its last mark so far.
+fn probe_now() -> u64 {
+    crate::dev::loop_probe::tests::marks()
+        .last()
+        .map_or(0, |m| m.0)
+}
+
+/// The frames presented after the probe's time `at`.
+fn presents_after(at: u64) -> usize {
+    crate::dev::loop_probe::tests::marks()
+        .iter()
+        .filter(|m| m.1 == "present" && m.0 > at)
+        .count()
 }
 
 /// [`the_transition_probe_marks_each_event`]'s marks, each at its event.
@@ -594,6 +620,14 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
         );
     }
     assert_eq!(times("fu:gpu_done_us").len(), 2);
+    // Frames were presented between B's upload and its result: none of
+    // them was the first use.
+    let between = within(
+        "present",
+        one("res:select_ready", 1),
+        one("res:install_us", 1),
+    );
+    assert!(between.len() >= 3, "{between:?}");
     // The result frames probed are presented.
     assert!(values("rf:presented").iter().all(|&v| v == 1));
     // B's chart images, written for the result's view inside its staging.
