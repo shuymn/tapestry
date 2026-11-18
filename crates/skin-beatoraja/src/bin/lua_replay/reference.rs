@@ -52,9 +52,10 @@ enum Kind {
 }
 
 /// A slider's destination timer as its serializer reads it
-/// (`LuaSkinLoader.java:132-134`, `TimerPropertyFactory.java:6-8`):
-/// none (absent, or a negative id), an id, or a string the source runs
-/// as a script, which the model does not. A function is [`Obj::timer`].
+/// (`LuaSkinLoader.java:132-134`, `:155-167`,
+/// `TimerPropertyFactory.java:6-8`): none (absent, a negative id, or a
+/// value the serializer ignores), an id, or a string the source runs as
+/// a script, which the model does not. A function is [`Obj::timer`].
 #[derive(Clone, Copy)]
 pub(crate) enum TimerRef {
     None,
@@ -925,7 +926,9 @@ fn prop(vm: &ReferenceVm, p: &PropRef, kind: &Kind) -> Result<i32, Cause> {
     }
 }
 
-/// A text's string, interned; any other outcome as [`outcome`] gives it.
+/// A returned string, interned (a text's, or a slider's value, which the
+/// comparator reads as a number); any other outcome as [`outcome`] gives
+/// it.
 fn text_outcome(c: &Called) -> Outcome {
     match c {
         Called::Value(Value::String(s)) => Outcome::Value(Raw::Text(intern(&s.to_string_lossy()))),
@@ -951,7 +954,7 @@ fn prepare(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut Ref
         Ok(()) => {
             let c = vm.call(f);
             let outcome = match o.kind {
-                Kind::Text => text_outcome(&c),
+                Kind::Text | Kind::Slider => text_outcome(&c),
                 _ => outcome(&c),
             };
             out.points.push(Point::Ran { key: *k, outcome });
@@ -963,13 +966,11 @@ fn prepare(vm: &ReferenceVm, items: &BTreeMap<i32, bool>, o: &Obj, out: &mut Ref
 /// Whether a slider past its conditions on clock `clock` draws on the
 /// frame the VM holds (`SkinObject.java:591-607`, `:348-375`): its timer
 /// on, its keyframes reaching the time, which the timer's start makes
-/// relative (both in ms, as Java's `long` division gives them), and no
-/// mouse rectangle deciding it. A slider's image is never null once it
-/// installs: a loaded texture's grid has a cell.
+/// relative (both in ms, as Java's `long` division gives them), and then
+/// no mouse rectangle deciding it, which the model cannot. A slider's
+/// image is never null once it installs: a loaded texture's grid has a
+/// cell.
 fn draws(vm: &ReferenceVm, t: &Timing, clock: Clock) -> Result<(), Cause> {
-    if t.mouse {
-        return Err(Cause::Inconclusive);
-    }
     let start = match (clock, t.timer) {
         (Clock::Undecided, _) | (_, TimerRef::Undecided) => return Err(Cause::Inconclusive),
         (Clock::Off, _) => return Err(Cause::Hidden),
@@ -983,10 +984,20 @@ fn draws(vm: &ReferenceVm, t: &Timing, clock: Clock) -> Result<(), Cause> {
     };
     let now = vm.state_us().ok_or(Cause::Inconclusive)? / 1000;
     let time = start.map_or(now, |s| now.saturating_sub(s / 1000));
-    if reaches(t, time) {
-        Ok(())
-    } else {
+    shown(t, time)
+}
+
+/// Whether a slider whose timer is on draws at `time` (ms past its
+/// timer's start): hidden where its keyframes do not reach it, then
+/// undecided where a mouse rectangle decides it (`SkinObject.java:
+/// 591-607`).
+pub(crate) fn shown(t: &Timing, time: i64) -> Result<(), Cause> {
+    if !reaches(t, time) {
         Err(Cause::Hidden)
+    } else if t.mouse {
+        Err(Cause::Inconclusive)
+    } else {
+        Ok(())
     }
 }
 
@@ -1013,23 +1024,29 @@ pub(crate) fn reaches(t: &Timing, mut time: i64) -> bool {
 }
 
 /// A slider destination's [`Timing`] as the loader reads it
-/// (`JSONSkinLoader.java:425-462`): a keyframe's absent time is the one
+/// (`JSONSkinLoader.java:425-462`): a keyframe's absent time, and one of
+/// `Integer.MIN_VALUE`, which the loader takes for absent, is the one
 /// before it (0 for the first), and the keyframes sort by time
-/// (`SkinObject.java:240-247`).
-fn timing(dest: &Table) -> Timing {
+/// (`SkinObject.java:240-247`). The timer by its serializer
+/// (`LuaSkinLoader.java:155-167`): a function is [`Obj::timer`], a number
+/// or a numeric string an id, another string a script, anything else
+/// (a boolean, a table) no timer.
+pub(crate) fn timing(dest: &Table) -> Timing {
     let timer = match raw(dest, "timer") {
-        Value::Nil | Value::Function(_) => TimerRef::None,
         v if lua_number(&v).is_some() => match toint(&v) {
             Some(n) if n >= 0 => TimerRef::Id(n),
             _ => TimerRef::None,
         },
-        _ => TimerRef::Undecided,
+        Value::String(_) => TimerRef::Undecided,
+        _ => TimerRef::None,
     };
     let mut prev = 0;
     let (mut first, mut last) = (i64::MAX, i64::MIN);
     for k in list(&raw(dest, "dst")) {
         if let Value::Table(k) = k {
-            prev = toint(&raw(&k, "time")).unwrap_or(prev);
+            prev = toint(&raw(&k, "time"))
+                .filter(|&t| t != i32::MIN)
+                .unwrap_or(prev);
         }
         first = first.min(i64::from(prev));
         last = last.max(i64::from(prev));
@@ -1043,16 +1060,31 @@ fn timing(dest: &Table) -> Timing {
     }
 }
 
-/// Whether slider `s` holds no function but its `value`: any other (a
-/// source timer, an event) runs where the model does not, so such a
-/// slider is listed.
-fn only_value(s: &Table) -> bool {
-    let mut other = false;
-    let _ = s.for_each(|k: Value, v: Value| {
-        other |= matches!(v, Value::Function(_)) && id_string(&k).as_deref() != Some("value");
-        Ok(())
-    });
-    !other
+/// Whether slider `s` holds no function but its own `value`, at any
+/// depth: any other (a source timer, an event, one in a nested table)
+/// may run where the model does not, so such a slider is listed.
+pub(crate) fn only_value(s: &Table) -> bool {
+    /// Whether `t` holds a function, other than `value` at the top, to a
+    /// few levels, each table once on the way down.
+    fn other(t: &Table, top: bool, stack: &mut Vec<usize>) -> bool {
+        let at = t.to_pointer().addr();
+        if stack.len() > 6 || stack.contains(&at) {
+            return false;
+        }
+        stack.push(at);
+        let mut found = false;
+        let _ = t.for_each(|k: Value, v: Value| {
+            found |= match &v {
+                Value::Function(_) => !(top && id_string(&k).as_deref() == Some("value")),
+                Value::Table(t) => other(t, false, stack),
+                _ => false,
+            };
+            Ok(())
+        });
+        stack.pop();
+        found
+    }
+    !other(s, true, &mut Vec::new())
 }
 
 /// `o`'s object prepare path on the frame the VM holds: the clock it

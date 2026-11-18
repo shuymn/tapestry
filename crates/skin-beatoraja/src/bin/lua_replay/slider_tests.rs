@@ -3,7 +3,8 @@
 //! once the slider draws, after its conditions, its timer and its
 //! keyframes, as `tofloat()` gives it.
 
-use crate::reference::{TimerRef, Timing, reaches};
+use crate::observed::Cause;
+use crate::reference::{TimerRef, Timing, only_value, reaches, shown, timing};
 use crate::report::Report;
 use crate::script::Script;
 use crate::tests::{dst, options, run_with};
@@ -118,4 +119,105 @@ fn keyframes_reach_the_time() {
     // 1100 is 300 again.
     assert!(!reaches(&t(500, 1000, 200), 1100));
     assert!(reaches(&t(500, 1000, 200), 1400));
+}
+
+/// A return the slider coerces (design.md "beatoraja Lua Skins", numbers
+/// and numeric strings): a numeral string, a hexadecimal one with a sign
+/// and whitespace, a string that is no numeral, booleans, a numeric −0
+/// (the source's integer zero, +0) and a string's −0 (its sign kept),
+/// each as its own slider. Every one agrees on every play frame.
+#[test]
+fn slider_returns_coerce_as_the_slider_reads_them() {
+    let returns = [
+        "\"0.25\"",
+        "\" -0x1\t\"",
+        "\"abc\"",
+        "false",
+        "true",
+        "-0.0",
+        "ms.number(100) * -0.0",
+        "\"-0.0\"",
+    ];
+    let sliders: Vec<String> = returns
+        .iter()
+        .enumerate()
+        .map(|(i, v)| slider(&format!("s{i}"), &format!("function() return {v} end"), ""))
+        .collect();
+    let r = run(&sliders);
+    agrees(&r, returns.len());
+    assert_eq!(r.matched, r.production_runs, "{}", r.text(0, true, true));
+}
+
+/// A boolean `timer` is no timer, as the source's serializer reads it
+/// (`LuaSkinLoader.java:155-167`): the value runs on the frames the
+/// untimed control runs it, and agrees.
+#[test]
+fn a_boolean_timer_is_no_timer() {
+    let value = "function() return ms.number(100) / 3 + 0.5 end";
+    let untimed = run(&[slider("s", value, "")]);
+    let boolean = run(&[slider("s", value, "timer = false,")]);
+    agrees(&untimed, 1);
+    agrees(&boolean, 1);
+    assert_eq!(
+        boolean.production_runs,
+        untimed.production_runs,
+        "{}",
+        boolean.text(0, true, true)
+    );
+}
+
+/// A mouse rectangle decides only once the keyframes reach the time
+/// (`SkinObject.java:591-607`): hidden before them, undecided after.
+#[test]
+fn a_mouse_rectangle_decides_after_the_keyframes() {
+    let t = Timing {
+        timer: TimerRef::None,
+        first: 500,
+        last: 1000,
+        looping: 0,
+        mouse: true,
+    };
+    assert_eq!(shown(&t, 400), Err(Cause::Hidden));
+    assert_eq!(shown(&t, 600), Err(Cause::Inconclusive));
+    let t = Timing { mouse: false, ..t };
+    assert_eq!(shown(&t, 600), Ok(()));
+}
+
+/// A keyframe's `Integer.MIN_VALUE` time is absent to the loader
+/// (`JSONSkinLoader.java:428-441`): it takes the time before it.
+#[test]
+fn a_minimum_key_time_is_the_one_before() {
+    let lua = mlua::Lua::new();
+    let dest: mlua::Table = lua
+        .load("return { dst = { { time = 500 }, { time = -2147483648 }, { time = 900 } } }")
+        .eval()
+        .unwrap();
+    let t = timing(&dest);
+    assert_eq!((t.first, t.last), (500, 900));
+    let dest: mlua::Table = lua
+        .load("return { dst = { { time = -2147483648 }, { time = 300 } } }")
+        .eval()
+        .unwrap();
+    let t = timing(&dest);
+    assert_eq!((t.first, t.last), (0, 300));
+}
+
+/// A slider is modelled only when its own `value` is its one function: a
+/// function anywhere else in its definition, nested too, lists it.
+#[test]
+fn only_a_lone_value_function_is_modelled() {
+    let lua = mlua::Lua::new();
+    let def = |src: &str| -> mlua::Table { lua.load(src).eval().unwrap() };
+    assert!(only_value(&def(
+        "return { id = \"s\", value = function() end }"
+    )));
+    assert!(!only_value(&def(
+        "return { id = \"s\", value = function() end, event = function() end }"
+    )));
+    assert!(!only_value(&def(
+        "return { id = \"s\", value = function() end, extra = { function() end } }"
+    )));
+    assert!(!only_value(&def(
+        "return { id = \"s\", value = function() end, extra = { value = function() end } }"
+    )));
 }

@@ -782,7 +782,8 @@ fn an_unknown_entry_is_inconclusive() {
 /// A4: a listed object's callables keep their consumer: the `value` of a
 /// slider holding another function (an `event`), which the reference
 /// does not model, is attributed to production's record of it when
-/// lowered, and is one located finding for the run when compiled.
+/// lowered, and is one located finding for the run when compiled; the
+/// listed object holds exactly its two consumers.
 #[test]
 fn listed_consumers_join_their_records() {
     let slider = |value: &str| {
@@ -797,10 +798,11 @@ fn listed_consumers_join_their_records() {
     for r in [&lowered, &compiled] {
         let listed = r.unmodelled.iter().find(|l| l.what == "slider");
         assert!(
-            listed.is_some_and(|l| l
-                .callables
-                .iter()
-                .any(|k| k.field == "value" && k.path == "def")),
+            listed.is_some_and(|l| {
+                let mut c: Vec<_> = l.callables.iter().map(|k| (k.field, k.path)).collect();
+                c.sort_unstable();
+                c == [("other", "def"), ("value", "def")]
+            }),
             "{}",
             r.text(0, true, true)
         );

@@ -74,21 +74,65 @@ fn luaj_long(r: Raw) -> i64 {
     }
 }
 
-/// LuaJ's `tofloat()` of a slider's value (`SkinLuaAccessor.java:665-677`):
-/// the number narrowed to `float`; nil and booleans 0. Restated here, not
-/// called, so the comparator checks production's conversion against the
-/// rule.
+/// A slider's value as `tofloat()` reads it (`SkinLuaAccessor.java:
+/// 665-677`; design.md "beatoraja Lua Skins", numbers and numeric
+/// strings): a number as the source's interpreter holds it, with no
+/// negative zero, a string as a plain numeral ([`numeral`], a −0 keeping
+/// its sign, none 0), nil, booleans and anything else 0; then narrowed to
+/// `float`. Restated here, not called, so the comparator checks
+/// production's conversion against the rule.
 fn luaj_float(r: Raw) -> f32 {
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_precision_loss,
-        reason = "LuaJ's double, then Java's d2f"
-    )]
-    match r {
-        Raw::Int(n) => (n as f64) as f32,
-        Raw::Float(f) => f as f32,
+    #[expect(clippy::cast_precision_loss, reason = "LuaJ holds a double")]
+    let d = match r {
+        Raw::Int(n) => n as f64,
+        // Matches −0 too: the source holds an integer zero.
+        Raw::Float(0.0) => 0.0,
+        Raw::Float(f) => f,
+        Raw::Text(s) => numeral(s).unwrap_or(0.0),
         _ => 0.0,
-    }
+    };
+    #[expect(clippy::cast_possible_truncation, reason = "Java's d2f")]
+    let f = d as f32;
+    f
+}
+
+/// String `s` as a plain numeral (design.md "beatoraja Lua Skins",
+/// numeric strings): Lua's six ASCII whitespace characters ignored at
+/// both ends, an optional sign, then a decimal numeral (digits with an
+/// optional fraction, or a fraction alone, then an optional exponent) or
+/// `0x` and hexadecimal digits worth less than 2^64, rounded once; `None`
+/// for anything else.
+fn numeral(s: &str) -> Option<f64> {
+    let t = s.trim_matches(|c| matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'));
+    let (neg, t) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    let v = if let Some(h) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        if h.is_empty() || !h.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return None;
+        }
+        #[expect(clippy::cast_precision_loss, reason = "rounded once")]
+        let v = u64::from_str_radix(h, 16).ok()? as f64;
+        v
+    } else {
+        let (mantissa, exponent) = match t.find(['e', 'E']) {
+            Some(i) => (t.get(..i)?, Some(t.get(i + 1..)?)),
+            None => (t, None),
+        };
+        let (whole, fraction) = mantissa.split_once('.').unwrap_or((mantissa, ""));
+        let digits = |d: &str| d.bytes().all(|b| b.is_ascii_digit());
+        let exponent_ok = exponent.is_none_or(|e| {
+            let e = e.strip_prefix(['+', '-']).unwrap_or(e);
+            !e.is_empty() && digits(e)
+        });
+        if whole.len() + fraction.len() == 0 || !digits(whole) || !digits(fraction) || !exponent_ok
+        {
+            return None;
+        }
+        t.parse::<f64>().ok()?
+    };
+    Some(if neg { -v } else { v })
 }
 
 /// Whether two numbers are the same real number (NaN with NaN; −0.0 and
@@ -162,7 +206,9 @@ fn converted(field: &str, o: Outcome) -> Option<Converted> {
 /// (`toint()`, `toboolean()`). The pair agrees only when the converted
 /// output is equal, so a `value` agrees (0 drawn on both sides) and a
 /// `draw` does not (`nil` false, 0 true); `nil` against any other integer
-/// stays a raw difference.
+/// stays a raw difference. A slider's string or boolean has no raw
+/// counterpart: the import reads a known one into the number the program
+/// returns, so only its converted float is compared.
 fn differ(field: &str, prod: (Result<Val, Fail>, Converted), refo: Outcome) -> Option<String> {
     let (result, conv) = prod;
     let class = match (result, refo) {
@@ -174,7 +220,10 @@ fn differ(field: &str, prod: (Result<Val, Fail>, Converted), refo: Outcome) -> O
     if class.is_some() {
         return class;
     }
+    let read_at_import =
+        field == "slider" && matches!(refo, Outcome::Value(Raw::Text(_) | Raw::Bool(_)));
     if let (Ok(v), Outcome::Value(r)) = (result, refo)
+        && !read_at_import
         && !same_raw(val_raw(v), r)
         && !matches!((v, r), (Val::Int(0), Raw::Nil))
     {
