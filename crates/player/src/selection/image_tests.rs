@@ -485,3 +485,44 @@ fn a_return_shows_the_row_at_once_and_reads_it_again_once_changed() {
         assert_eq!(rig.chart_images.counts().0, decodes + 2);
     });
 }
+
+/// A still cursor whose entry a check withdraws is read again at the next
+/// look, the clock held at its first rest's end: the withdrawal counts
+/// the rest as served, with no move, no entry and no new rest (AC-S17).
+/// The use is a list read again with the cursor kept.
+#[test]
+fn a_withdrawn_entry_under_a_still_cursor_is_read_again_at_once() {
+    let _serial = crate::imports::tests::serial();
+    let dir = tempfile::tempdir().unwrap();
+    let (mut sel, root) = library(
+        dir.path(),
+        &[("a.bms", Some("hidden-a.png"), Some("hidden-n.png"))],
+    );
+    quiet(&mut sel);
+    let screens = pooled();
+    let render = screens.spawn_bare();
+    on_selection_at(sel, &screens, render, QpcClock::holdable(), |rig| {
+        rig.selection_chart = true;
+        let moved = rig.clock.hold();
+        press(rig, MenuKey::Down);
+        assert!(rig.choose().is_none());
+        rig.clock.set(TimeUs(moved.0 + REST.0));
+        look_until(rig, resident);
+        let (decodes, begun) = (rig.chart_images.counts().0, rig.chart_images.begun());
+        let checks = rig.chart_images.checks_begun();
+        // The stage file replaced, then the list read again with the
+        // cursor kept: a use of its entry.
+        std::thread::sleep(Duration::from_millis(20));
+        png(&root.join("hidden-a.png"), [160, 120]);
+        let sel = rig.selection.as_mut().unwrap();
+        sel.shelf.set_rescan_after(Duration::ZERO);
+        settle(sel);
+        quiet(sel);
+        look_until(rig, |w| w.cursor_entry().is_none());
+        assert!(rig.chart_images.checks_begun() > checks);
+        // Read again with the clock still held: no new rest.
+        look_until(rig, resident);
+        assert_eq!(rig.chart_images.begun(), begun + 1);
+        assert_eq!(rig.chart_images.counts().0, decodes + 2);
+    });
+}
