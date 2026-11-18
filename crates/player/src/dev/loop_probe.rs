@@ -355,6 +355,21 @@ pub(crate) mod tests {
         assert!(span.elapsed() >= work, "{:?}", span.elapsed());
     }
 
+    /// A frame that would be an array's first use but is skipped before
+    /// its submit (minimized, occluded, not admitted) leaves it awaited: the
+    /// next frame submitted is its first use, with its upload's caller.
+    #[test]
+    fn a_skipped_frame_leaves_the_first_use_awaited() {
+        turn_on();
+        let _caller = super::Caller::set(render::probe::RESULT);
+        render::probe::await_first_use(7);
+        let result = Some(render::probe::RESULT);
+        assert_eq!(render::probe::first_use(7), result, "the frame skipped");
+        assert_eq!(render::probe::first_use(7), result, "the frame submitted");
+        render::probe::end_first_use(7);
+        assert_eq!(render::probe::first_use(7), None, "used");
+    }
+
     /// A mark is the probe's own work, left out of the figures around it.
     #[test]
     fn a_mark_is_the_probes_own_work() {

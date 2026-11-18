@@ -655,6 +655,42 @@ fn the_probe_marks_the_first_use_through_a_layout_on_the_same_array() {
     link.exit();
 }
 
+/// With the transition probe on, an array dropped before any frame drew
+/// it ends its wait, whatever drops it: a selection skin replaced by the
+/// built-in selection before any frame is marked `fu:discarded`, with the
+/// selection skin's caller.
+#[test]
+fn the_probe_marks_an_array_dropped_before_its_first_use() {
+    use crate::dev::loop_probe::tests::{marks, turn_on};
+    let _warp = crate::warp_turn::take();
+    let _serial = crate::imports::tests::serial();
+    turn_on();
+    let (_dir, skin, script) = chart_skin();
+    let (link, _, _) = lossy_spawn(None, &Arc::default(), Box::new(Frames::default()));
+    assert_eq!(
+        link.select_with(ScreenKind::Selection, Some(skin), script)
+            .wait()
+            .unwrap(),
+        Preparation::Ready
+    );
+    assert!(link.select(ScreenKind::Selection, None).wait().is_ok());
+    let ends = || -> Vec<(&'static str, i64)> {
+        marks()
+            .iter()
+            .filter(|m| matches!(m.1, "fu:caller" | "fu:superseded" | "fu:discarded"))
+            .map(|m| (m.1, m.2))
+            .collect()
+    };
+    assert!(
+        wait_until(|| !ends().is_empty()),
+        "the dropped array's wait not ended: {:?}",
+        marks()
+    );
+    let skin = i64::from(render::probe::SELECT_SKIN);
+    assert_eq!(ends(), [("fu:discarded", skin)]);
+    link.exit();
+}
+
 /// With the transition probe on, each array awaited for its first use
 /// ends once: a selection skin replaced before any frame drew it has its
 /// array's wait ended by the replacement's upload (`fu:superseded`), so the

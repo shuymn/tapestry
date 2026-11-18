@@ -745,9 +745,10 @@ impl Renderer {
     /// start, its GPU completion, or `fu:in_play` in play, where no
     /// completion callback is armed), then the submit and memory of the
     /// frames marked after a drop or a first use (`pd:*`).
-    fn probe_after_submit(&self, first: Option<u8>, submit: Duration, cpu: Duration) {
+    fn probe_after_submit(&self, first: Option<(u64, u8)>, submit: Duration, cpu: Duration) {
         use crate::probe::{POST, mark, mem, us};
-        if let Some(caller) = first {
+        if let Some((key, caller)) = first {
+            crate::probe::end_first_use(key);
             mark("fu:caller", i64::from(caller));
             mark("fu:submit_us", us(submit));
             mark("fu:cpu_us", us(cpu));
@@ -755,7 +756,9 @@ impl Renderer {
             if crate::probe::in_play() {
                 mark("fu:in_play", 1);
             } else {
-                let t = crate::probe::Span::start();
+                // Wall time: the readings below run while the GPU works on
+                // this frame, so they are not left out of its completion.
+                let t = Instant::now();
                 crate::probe::own(|| {
                     self.gpu.queue().on_submitted_work_done(move || {
                         mark("fu:gpu_done_us", us(t.elapsed()));
@@ -2876,8 +2879,14 @@ impl Renderer {
         });
         #[cfg(feature = "dev-tools")]
         let p_scoped = p_scope0.elapsed();
+        // The upload's figures, marked once it is waited for or refused: no
+        // probe work overlaps the GPU's copy that the wait and the total
+        // time (dev-tools).
         #[cfg(feature = "dev-tools")]
-        if crate::probe::on() {
+        let p_summary = |refused: bool| {
+            if !crate::probe::on() {
+                return;
+            }
             use crate::probe::{CREATE_US, POP_US, WRITE_US, cmark, us};
             use std::sync::atomic::Ordering::Relaxed;
             let raw: usize = levels.iter().flatten().map(|l| l.len()).sum();
@@ -2911,9 +2920,11 @@ impl Renderer {
             cmark!("up", "submit_us", us(p_submit));
             cmark!("up", "scope_pop_us", POP_US.load(Relaxed));
             cmark!("up", "scoped_total_us", us(p_scoped));
-            cmark!("up", "refused", i64::from(refused.is_some()));
-        }
+            cmark!("up", "refused", i64::from(refused));
+        };
         if let Some(e) = refused {
+            #[cfg(feature = "dev-tools")]
+            p_summary(true);
             return Err(RenderError::Atlas(UploadError::Device(e)));
         }
         #[cfg(feature = "dev-tools")]
@@ -2923,6 +2934,7 @@ impl Renderer {
         {
             use crate::probe::{cmark, us};
             let (wait, total) = (p_wait.elapsed(), p_began.elapsed());
+            p_summary(false);
             cmark!("up", "gpu_wait_us", us(wait));
             cmark!("up", "total_us", us(total));
             crate::probe::mem(self.gpu.device(), "up:mem:l", "up:mem:n", "up:mem:r");
@@ -3390,20 +3402,6 @@ impl Renderer {
     /// resources, whose lines go with their cache: text staged for the
     /// installation in use stays.
     fn drop_pending(&mut self) {
-        // A staging's own array dropped before any frame drew it.
-        #[cfg(feature = "dev-tools")]
-        if crate::probe::on()
-            && let Some(Pending { res, .. }) = &self.pending
-        {
-            let atlas = match res {
-                PendingRes::Own(r) => Some(&r.atlas),
-                PendingRes::Pages(p) => p.as_deref().map(|p| &p.atlas),
-                PendingRes::Installed | PendingRes::Layout { .. } => None,
-            };
-            if let Some(a) = atlas {
-                crate::probe::discard_first_use(crate::probe::array_key(a.texture()));
-            }
-        }
         self.pending = None;
         let installed = self.loading_text_key();
         if self
@@ -6268,10 +6266,13 @@ impl Renderer {
                 _ => play,
             },
         };
+        // Whether this frame, if submitted, is the first use of the array
+        // it samples: its key and the caller it was uploaded for.
         #[cfg(feature = "dev-tools")]
         let p_first = crate::probe::on()
             .then(|| {
-                crate::probe::first_use(crate::probe::array_key(self.drawn_atlas(on).texture()))
+                let key = crate::probe::array_key(self.drawn_atlas(on).texture());
+                crate::probe::first_use(key).map(|caller| (key, caller))
             })
             .flatten();
         let sprites = staging.instances().len();
@@ -6284,7 +6285,10 @@ impl Renderer {
             present_count: None,
         };
         if self.minimized {
-            return Ok(timing(start.elapsed(), false));
+            let cpu = start.elapsed();
+            #[cfg(feature = "dev-tools")]
+            let cpu = cpu.saturating_sub(crate::probe::own_time().saturating_sub(p_own));
+            return Ok(timing(cpu, false));
         }
         let acquire = Instant::now();
         #[cfg(feature = "dev-tools")]
@@ -6307,6 +6311,8 @@ impl Renderer {
                         crate::probe::mark("rf:skipped", 1);
                     }
                     let cpu = start.elapsed().saturating_sub(acquire.elapsed());
+                    #[cfg(feature = "dev-tools")]
+                    let cpu = cpu.saturating_sub(p_acquire.own_before(p_own));
                     return Ok(timing(cpu, false));
                 }
                 wgpu::CurrentSurfaceTexture::Outdated => {
@@ -6319,6 +6325,8 @@ impl Renderer {
                     }
                     w.configure(self.gpu.device());
                     let cpu = start.elapsed().saturating_sub(acquire.elapsed());
+                    #[cfg(feature = "dev-tools")]
+                    let cpu = cpu.saturating_sub(p_acquire.own_before(p_own));
                     return Ok(timing(cpu, false));
                 }
                 wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Validation => {
@@ -6369,12 +6377,18 @@ impl Renderer {
                 }
                 if !admitted {
                     let cpu = start.elapsed().saturating_sub(acquire.elapsed());
+                    #[cfg(feature = "dev-tools")]
+                    let cpu = cpu.saturating_sub(p_acquire.own_before(p_own));
                     return Ok(timing(cpu, false));
                 }
                 (None, view.clone())
             }
         };
         let acquired = acquire.elapsed();
+        // The probe's marks inside the acquire are not its wait; the
+        // frame's CPU time leaves them out with the rest of its work.
+        #[cfg(feature = "dev-tools")]
+        let acquired = acquired.saturating_sub(p_acquire.own_since());
         #[cfg(feature = "dev-tools")]
         if crate::probe::frame_armed() {
             crate::probe::arm_frame(false);

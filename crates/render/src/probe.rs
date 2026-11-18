@@ -135,6 +135,17 @@ impl Span {
         })
     }
 
+    /// The probe's own work on this thread since its start.
+    pub fn own_since(&self) -> Duration {
+        own_time().saturating_sub(self.own)
+    }
+
+    /// The probe's own work on this thread from `base` (an [`own_time`])
+    /// to its start.
+    pub fn own_before(&self, base: Duration) -> Duration {
+        self.own.saturating_sub(base)
+    }
+
     /// The time from its start to `to`'s, less the probe's own work
     /// between them.
     pub fn until(&self, to: Self) -> Duration {
@@ -288,7 +299,7 @@ pub fn post_left() -> u32 {
 /// the current caller: an array awaited before and not drawn is marked
 /// replaced (`fu:superseded`, its caller), so no first use is credited to
 /// the wrong upload.
-pub(crate) fn await_first_use(key: u64) {
+pub fn await_first_use(key: u64) {
     own(|| {
         let replaced = FIRST_USE.swap(key, Ordering::Relaxed);
         let was = FIRST_USE_CALLER.swap(caller(), Ordering::Relaxed);
@@ -298,9 +309,9 @@ pub(crate) fn await_first_use(key: u64) {
     });
 }
 
-/// The array `key` dropped with its staging before any frame sampled it:
-/// its first use is no longer awaited (`fu:discarded`, its caller).
-pub(crate) fn discard_first_use(key: u64) {
+/// The array `key` dropped before any frame sampled it: its first use is
+/// no longer awaited (`fu:discarded`, its caller).
+pub fn discard_first_use(key: u64) {
     own(|| {
         if FIRST_USE
             .compare_exchange(key, 0, Ordering::Relaxed, Ordering::Relaxed)
@@ -314,16 +325,21 @@ pub(crate) fn discard_first_use(key: u64) {
     });
 }
 
-/// Whether a frame sampling the array `key` is its first use: then it is
-/// no longer awaited, and the caller it was uploaded for is returned.
-pub(crate) fn first_use(key: u64) -> Option<u8> {
+/// Whether a frame sampling the array `key` would be its first use: the
+/// caller it was uploaded for. It stays awaited until a frame sampling it
+/// is submitted ([`end_first_use`]): a frame skipped before its submit is
+/// not its first use.
+pub fn first_use(key: u64) -> Option<u8> {
     own(|| {
-        FIRST_USE
-            .compare_exchange(key, 0, Ordering::Relaxed, Ordering::Relaxed)
-            .ok()
-            .filter(|&k| k != 0)
-            .map(|_| FIRST_USE_CALLER.load(Ordering::Relaxed))
+        (key != 0 && FIRST_USE.load(Ordering::Relaxed) == key)
+            .then(|| FIRST_USE_CALLER.load(Ordering::Relaxed))
     })
+}
+
+/// A frame sampling the array `key` was submitted: its first use is no
+/// longer awaited.
+pub fn end_first_use(key: u64) {
+    let _ = FIRST_USE.compare_exchange(key, 0, Ordering::Relaxed, Ordering::Relaxed);
 }
 
 /// An array's identity for [`FIRST_USE`], never 0.

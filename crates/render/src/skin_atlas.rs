@@ -210,6 +210,19 @@ pub(crate) struct AtlasTexture {
 /// The next [`AtlasTexture::serial`].
 static SERIALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// An array dropped before any frame sampled it, whatever drops it (a
+/// staging replaced or refused after its upload, a release, a drain), ends
+/// its first use's wait (`fu:discarded`, dev-tools); one drawn or replaced
+/// by a newer upload is no longer awaited, and nothing is marked.
+#[cfg(feature = "dev-tools")]
+impl Drop for AtlasTexture {
+    fn drop(&mut self) {
+        if crate::probe::on() {
+            crate::probe::discard_first_use(crate::probe::array_key(&self.texture));
+        }
+    }
+}
+
 impl AtlasTexture {
     /// The built-in atlas alone: one 128-texel layer without mips.
     pub(crate) fn builtin(gpu: &Gpu) -> Self {
