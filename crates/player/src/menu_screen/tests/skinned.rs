@@ -473,15 +473,18 @@ fn selection_frame_during_fill_alloc() {
         crate::alloc_count::this_thread() - before
     };
     let build = |screen: &mut MenuScreen, logic: &mut SelectionLogic, slot: u16, k: i64| {
-        let table = screen.pool_table(pool.generation, slot);
-        assert!(table.is_some(), "slot {slot} not resident");
+        let mut resident = false;
+        // The table is built each frame, as the render thread builds it.
         let n = counted(&mut || {
+            let table = screen.pool_table(pool.generation, slot);
+            resident = table.is_some();
             logic.sel.set_chart_images(table);
             logic.sel.write_chart_fields();
             screen
                 .build_selection_frame(&u, logic, TimeUs(k * 16_667), app(k))
                 .unwrap();
         });
+        assert!(resident, "slot {slot} not resident");
         screen.renderer.submit_selection(&[]).unwrap();
         n
     };
