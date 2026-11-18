@@ -23,7 +23,7 @@ The environment for developing this repository, and how tool versions are pinned
 
 ## Version Pinning
 
-Use mise 2026.10.3 or newer. CI runs the minimum supported mise version.
+Use mise 2026.10.3 or newer (`min_version` in `mise.toml`). CI runs the mise pinned in `.github/actions/setup-mise/action.yml`, which Renovate keeps current, so the minimum version is not tested.
 
 Tool versions are pinned with mise. `mise.toml` specifies major-version ranges, and the exact versions are pinned in `mise.lock`. Configure `mise.toml` so that versions not in `mise.lock` are not used:
 
