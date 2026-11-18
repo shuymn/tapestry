@@ -111,8 +111,9 @@ fn control_messages_round_trip() {
     }
     // Each reason has a code of its own.
     assert_eq!(codes.len(), 12);
-    // A string longer than the cap is cut at a character boundary.
-    let long = "é".repeat(MAX_TEXT);
+    // A string longer than the cap is cut at the character boundary before
+    // the cap, which falls inside the two bytes of an "é".
+    let long = format!("a{}", "é".repeat(MAX_TEXT));
     let bytes = Reply::Hello {
         version: long.clone(),
         configuration: String::new(),
@@ -121,7 +122,7 @@ fn control_messages_round_trip() {
     let Ok(Reply::Hello { version, .. }) = Reply::decode(&bytes) else {
         panic!("a cut string decodes");
     };
-    assert!(version.len() <= MAX_TEXT && version.len() > MAX_TEXT - 2);
+    assert_eq!(version.len(), MAX_TEXT - 1);
     assert!(long.starts_with(&version));
 }
 
