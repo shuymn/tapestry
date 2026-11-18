@@ -333,23 +333,40 @@ pub(crate) mod tests {
 
     /// A probe figure leaves the probe's own work on its thread out:
     /// nested own work is counted once, and a span's time to another span
-    /// leaves out the work between them.
+    /// leaves out the work between them. Bounded by the wall time around
+    /// each figure, not by a guess at the host's speed, so a loaded host
+    /// cannot fail it.
     #[test]
     fn a_span_leaves_the_probes_own_work_out() {
         use render::probe::{Span, own, own_time};
+        use std::time::{Duration, Instant};
         turn_on();
-        use std::time::Duration;
-        let work = Duration::from_millis(40);
+        let work = Duration::from_millis(20);
+        let around = Instant::now();
         let (span, before) = (Span::start(), own_time());
+        let inner = Instant::now();
         own(|| own(|| busy(work)));
+        let inner = inner.elapsed();
         let counted = own_time() - before;
         let to = Span::start();
+        let wall = around.elapsed();
+        // Counted once: no more than the wall time of the outer call.
         assert!(
-            counted >= work && counted < work * 3 / 2,
-            "own work counted {counted:?} for {work:?}"
+            counted >= work && counted <= inner,
+            "own work counted {counted:?} for {work:?} in {inner:?}"
         );
-        assert!(span.elapsed() < work / 2, "{:?}", span.elapsed());
-        assert!(span.until(to) < work / 2, "{:?}", span.until(to));
+        // The figures leave it out: at most the wall time around them
+        // less the work.
+        assert!(
+            span.until(to) <= wall.saturating_sub(work),
+            "{:?}",
+            span.until(to)
+        );
+        let elapsed = span.elapsed();
+        assert!(
+            elapsed <= around.elapsed().saturating_sub(work),
+            "{elapsed:?}"
+        );
         // A positive control: work not the probe's is in the figure.
         busy(work);
         assert!(span.elapsed() >= work, "{:?}", span.elapsed());

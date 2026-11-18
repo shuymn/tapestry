@@ -742,8 +742,10 @@ impl Renderer {
 
     /// After a frame's submit (the probe on): the first draw of the array
     /// uploaded last (`fu:*`: its submit, its CPU time from the frame's
-    /// start, its GPU completion, or `fu:in_play` in play, where no
-    /// completion callback is armed), then the submit and memory of the
+    /// start, and the report of its GPU completion, wall time to when wgpu
+    /// reports the work done at the device's next submit or poll; or
+    /// `fu:in_play` in play, where no completion callback is armed;
+    /// the probe takes no poll to hurry the report), then the submit and memory of the
     /// frames marked after a drop or a first use (`pd:*`).
     fn probe_after_submit(&self, first: Option<(u64, u8)>, submit: Duration, cpu: Duration) {
         use crate::probe::{POST, mark, mem, us};
