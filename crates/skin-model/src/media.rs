@@ -44,6 +44,8 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
+pub mod control;
+
 use std::collections::TryReserveError;
 use std::sync::atomic::{AtomicU64, Ordering, fence};
 
