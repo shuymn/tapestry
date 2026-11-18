@@ -574,6 +574,99 @@ fn a_refused_selection_skin_ends_its_pool() {
     r.link.exit();
 }
 
+/// With the transition probe on, the selection's chart-image pool leaves
+/// each mark at its event: the first frame that draws the selection skin
+/// uploaded last is its first use (`fu:*`), though its pool binds that
+/// array again before the commit, for the first skin and for each
+/// replacement; a replacement's commit retires the old pool, whose drop
+/// lies inside the memory readings of the drop that takes it
+/// (`dr:pool_us`); a refused skin's release times its pool beside its slot
+/// (`rel:pool_us`).
+#[test]
+fn the_probe_marks_the_selections_pool_at_its_events() {
+    use crate::dev::loop_probe::tests::{marks, now, turn_on};
+    let _warp = crate::warp_turn::take();
+    let _serial = crate::imports::tests::serial();
+    turn_on();
+    let after = |tag: &str, at: u64| -> Vec<u64> {
+        marks()
+            .iter()
+            .filter(|m| m.1 == tag && m.0 >= at)
+            .map(|m| m.0)
+            .collect()
+    };
+    // The first use after the upload marked last, once a frame draws it.
+    let first_use = || {
+        let uploaded = marks()
+            .iter()
+            .filter(|m| m.1.starts_with("up:") && m.1.ends_with(":total_us"))
+            .map(|m| m.0)
+            .max()
+            .expect("the selection's upload is marked");
+        assert!(
+            wait_until(|| !after("fu:submit_us", uploaded).is_empty()),
+            "no first use after the upload: {:?}",
+            marks()
+        );
+    };
+    let bad = Arc::new(AtomicBool::new(false));
+    let r = rig_on(&bad);
+    assert!(r.pool().layers > 0, "no pool to bind");
+    first_use();
+    // A replacement retires the old pool, which the next staging drops
+    // (this rig's screen drains nothing).
+    let replaced = now();
+    let mut dirs = Vec::new();
+    for revision in [2, 3] {
+        let (dir, skin, script) = chart_skin();
+        dirs.push(dir);
+        assert_eq!(
+            r.link
+                .select_with(ScreenKind::Selection, Some(skin), script)
+                .wait()
+                .unwrap(),
+            Preparation::Ready
+        );
+        r.link
+            .show_selection(update(1, revision, "", CursorChart::Pending));
+        first_use();
+    }
+    assert!(
+        wait_until(|| !after("dr:pool_us", replaced).is_empty()
+            && !after("dr:l1", after("dr:pool_us", replaced)[0]).is_empty()),
+        "the retired pool's drop not marked: {:?}",
+        marks()
+    );
+    // Inside one drop's readings: its first before the pool's drop, none
+    // of its last between them.
+    let dropped = after("dr:pool_us", replaced)[0];
+    let opened = after("dr:l0", replaced)
+        .into_iter()
+        .filter(|&t| t <= dropped)
+        .max();
+    let opened =
+        opened.unwrap_or_else(|| panic!("no reading before the pool's drop: {:?}", marks()));
+    assert!(
+        after("dr:l1", opened).iter().all(|&t| t >= dropped),
+        "the pool dropped after its drop's last reading: {:?}",
+        marks()
+    );
+    // A refusal releases the slot and its pool.
+    let refused = now();
+    bad.store(true, Ordering::Release);
+    assert!(wait_until(|| r.link.pool_now().0.is_none()));
+    assert!(
+        wait_until(|| !after("rel:pages_us", refused).is_empty()),
+        "{:?}",
+        marks()
+    );
+    let [slot, pool, pages] =
+        ["rel:slot_us", "rel:pool_us", "rel:pages_us"].map(|t| after(t, refused));
+    assert_eq!(pool.len(), 1, "the pool's release: {:?}", marks());
+    assert!(slot.first() <= pool.first() && pool.first() <= pages.first());
+    r.link.exit();
+}
+
 /// A chart refused before selection's departure (a practice the session
 /// refuses) enters selection again with no departure: the entry is a new
 /// cursor generation whatever row the cursor is on, so with the cursor

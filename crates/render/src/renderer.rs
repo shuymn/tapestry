@@ -751,21 +751,42 @@ impl Renderer {
 
 /// Drops what a drain or a staging retired (the probe on): the CPU pages,
 /// the array and its view, the bind group and the text cache, in the
-/// fields' order as a whole drop would, each drop timed (`dr:*`), with
-/// memory before and after; then marks the next frames' submit and memory
-/// (`pd:*`).
+/// fields' order as a whole drop would, and the selection's retired
+/// chart-image pool before them or after them as its site drops it
+/// (`pool_first`), each drop timed (`dr:*`), with memory before and after;
+/// then marks the next frames' submit and memory (`pd:*`).
 #[cfg(feature = "dev-tools")]
-fn probe_drop(d: &wgpu::Device, r: Retired, site: i64) {
+fn probe_drop(
+    d: &wgpu::Device,
+    r: Option<Retired>,
+    pool: Option<ChartPool>,
+    pool_first: bool,
+    site: i64,
+) {
     use crate::probe::{mark, mem, us};
+    let drop_pool = |pool: Option<ChartPool>| {
+        if let Some(p) = pool {
+            let t = Instant::now();
+            drop(p);
+            mark("dr:pool_us", us(t.elapsed()));
+        }
+    };
     mark("dr:site", site);
     mem(d, "dr:l0", "dr:n0", "dr:r0");
+    let pool = if pool_first {
+        drop_pool(pool);
+        None
+    } else {
+        pool
+    };
     match r {
-        Retired::Pages(PagesRes {
+        None => mark("dr:kind", 0),
+        Some(Retired::Pages(PagesRes {
             pages,
             atlas,
             atlas_bind,
             text_cache,
-        }) => {
+        })) => {
             mark("dr:kind", 1);
             mark(
                 "dr:pages_strong",
@@ -782,14 +803,15 @@ fn probe_drop(d: &wgpu::Device, r: Retired, site: i64) {
             mark("dr:bind_us", us(t.elapsed()));
             drop(text_cache);
         }
-        Retired::Slot(s) => {
+        Some(Retired::Slot(s)) => {
             mark("dr:kind", 2);
             let t = Instant::now();
             drop(s);
             mark("dr:slot_us", us(t.elapsed()));
         }
-        Retired::Layout { .. } => mark("dr:kind", 3),
+        Some(Retired::Layout { .. }) => mark("dr:kind", 3),
     }
+    drop_pool(pool);
     mem(d, "dr:l1", "dr:n1", "dr:r1");
     crate::probe::arm_post();
 }
@@ -2129,12 +2151,12 @@ impl Renderer {
             }
             Reclaim::ReleaseResult => {
                 self.reduce_pool(1);
-                #[cfg(feature = "dev-tools")]
-                let p_t = Instant::now();
                 self.remove(ScreenKind::Result);
+                // The release's own marks (`rel:*`) time its drops, outside
+                // their memory readings.
                 #[cfg(feature = "dev-tools")]
                 {
-                    crate::probe::mark("adm:result_released_us", crate::probe::us(p_t.elapsed()));
+                    crate::probe::mark("adm:result_released", 1);
                     crate::probe::arm_post();
                 }
                 self.result_released = true;
@@ -2337,6 +2359,8 @@ impl Renderer {
             .bindings
             .bind(self.gpu.device(), &slot.resources.atlas, None);
         if let Some(slot) = self.selection_slot_mut() {
+            #[cfg(feature = "dev-tools")]
+            crate::probe::rebind(&slot.resources.atlas_bind, &placeholder);
             slot.resources.atlas_bind = placeholder;
         }
         let Some(slot) = self.selection_slot() else {
@@ -2347,6 +2371,8 @@ impl Renderer {
             return;
         };
         if let Some(slot) = self.selection_slot_mut() {
+            #[cfg(feature = "dev-tools")]
+            crate::probe::rebind(&slot.resources.atlas_bind, &bind);
             slot.resources.atlas_bind = bind;
         }
         self.pool = Some(pool);
@@ -2399,6 +2425,8 @@ impl Renderer {
         });
         if let Some((pool, bind)) = made {
             if let Some(slot) = self.selection_slot_mut() {
+                #[cfg(feature = "dev-tools")]
+                crate::probe::rebind(&slot.resources.atlas_bind, &bind);
                 slot.resources.atlas_bind = bind;
             }
             self.pool = Some(pool);
@@ -2681,7 +2709,11 @@ impl Renderer {
             None => (None, self.bindings.bind(self.gpu.device(), atlas, None)),
         };
         match res {
-            PendingRes::Own(r) => r.atlas_bind = bind,
+            PendingRes::Own(r) => {
+                #[cfg(feature = "dev-tools")]
+                crate::probe::rebind(&r.atlas_bind, &bind);
+                r.atlas_bind = bind;
+            }
             PendingRes::Layout { bind: b, .. } => *b = Some(bind),
             PendingRes::Installed | PendingRes::Pages(_) => {}
         }
@@ -2956,10 +2988,9 @@ impl Renderer {
         self.requested = request;
         self.drop_pending();
         #[cfg(feature = "dev-tools")]
-        if crate::probe::on()
-            && let Some(r) = self.retired.take()
-        {
-            probe_drop(self.gpu.device(), r, 2);
+        if crate::probe::on() && (self.retired.is_some() || self.retired_pool.is_some()) {
+            let (r, pool) = (self.retired.take(), self.retired_pool.take());
+            probe_drop(self.gpu.device(), r, pool, false, 2);
         }
         self.retired = None;
         self.retired_pool = None;
@@ -3050,20 +3081,26 @@ impl Renderer {
         if let Some(slot) = Self::screen(kind).and_then(|i| self.screens.get_mut(i)) {
             *slot = None;
         }
+        #[cfg(feature = "dev-tools")]
+        let p_slot = p_t.elapsed();
         if kind == ScreenKind::Selection {
             self.pool_grid = None;
             self.pool = None;
         }
         #[cfg(feature = "dev-tools")]
-        let p_slot = p_t.elapsed();
+        let p_pool = p_t.elapsed() - p_slot;
         if kind == ScreenKind::Result {
             self.result_pages = None;
             self.staged_result_text = None;
         }
         #[cfg(feature = "dev-tools")]
         if p_some {
-            crate::probe::mark("rel:slot_us", crate::probe::us(p_slot));
-            crate::probe::mark("rel:pages_us", crate::probe::us(p_t.elapsed() - p_slot));
+            use crate::probe::{mark, us};
+            mark("rel:slot_us", us(p_slot));
+            if kind == ScreenKind::Selection {
+                mark("rel:pool_us", us(p_pool));
+            }
+            mark("rel:pages_us", us(p_t.elapsed() - p_slot - p_pool));
             crate::probe::mem(self.gpu.device(), "rel:l1", "rel:n1", "rel:r1");
             crate::probe::arm_post();
         }
@@ -3371,6 +3408,8 @@ impl Renderer {
             let grid = self.pool_grid_for(installation.bundle());
             let made = grid.and_then(|g| self.make_pool(g, 1, &r.atlas));
             let pool = made.map(|(pool, bind)| {
+                #[cfg(feature = "dev-tools")]
+                crate::probe::rebind(&r.atlas_bind, &bind);
                 r.atlas_bind = bind;
                 pool
             });
@@ -4296,14 +4335,15 @@ impl Renderer {
     /// design's §2.1 Q3) before another atlas build is considered. The next
     /// staging drains it too.
     pub fn drain_retired(&mut self) -> Option<AtlasId> {
-        self.retired_pool = None;
-        let r = self.retired.take()?;
-        let id = r.atlas_id();
         #[cfg(feature = "dev-tools")]
-        if crate::probe::on() {
-            probe_drop(self.gpu.device(), r, 1);
+        if crate::probe::on() && (self.retired.is_some() || self.retired_pool.is_some()) {
+            let (pool, r) = (self.retired_pool.take(), self.retired.take());
+            let id = r.as_ref().and_then(Retired::atlas_id);
+            probe_drop(self.gpu.device(), r, pool, true, 1);
+            return id;
         }
-        id
+        self.retired_pool = None;
+        self.retired.take().and_then(|r| r.atlas_id())
     }
 
     /// Whether play's admission released the result's installation since

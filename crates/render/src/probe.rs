@@ -179,6 +179,19 @@ pub(crate) fn arm_post() {
     }
 }
 
+/// `new` made in place of `old` on the same array (the probe on): a
+/// chart-image pool bound, or the placeholder in its place. If `old` is
+/// the array uploaded last, not drawn yet, its first use is now the first
+/// frame that draws `new` (`fu:*`).
+pub(crate) fn rebind(old: &wgpu::BindGroup, new: &wgpu::BindGroup) {
+    if on() {
+        let key = bind_key(old);
+        // A failed exchange: `old` is not the array awaiting its first use.
+        let _ =
+            FIRST_USE.compare_exchange(key, bind_key(new), Ordering::Relaxed, Ordering::Relaxed);
+    }
+}
+
 /// A bind group's identity for [`FIRST_USE`], never 0.
 pub(crate) fn bind_key(b: &wgpu::BindGroup) -> u64 {
     use std::hash::{Hash as _, Hasher as _};
