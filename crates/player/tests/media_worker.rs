@@ -1,128 +1,74 @@
 //! The media worker `tapestry-media` (design.md "Threat Model" T02;
-//! "Libraries", the FFmpeg row), run as the real executable over its
-//! control pipe, with each frame ring and its free-slot event made here as
-//! the game makes them and handed to the worker by handle, each with only
-//! the access it needs. The game does not launch the worker yet, so these
-//! tests run it without its sandbox and check what FFmpeg's layer holds:
-//! the pinned build, the codec and container allow-list with FFmpeg's codec
-//! whitelist, the pixel cap, the refused secondary open, the decoded
-//! frames' stamps, the seek's back-off and the zlib-compressed containers.
+//! "Libraries", the FFmpeg row), the real executable launched by the
+//! game's host under the full recipe, its sandbox, and commanded over its
+//! control pipe, with each frame ring and its free-slot event made as the
+//! game makes them and handed to the worker by handle, each with only the
+//! access it needs. They check what the worker does under its sandbox and
+//! what FFmpeg's layer holds: the pinned build, the codec and container
+//! allow-list with FFmpeg's codec whitelist, the pixel cap, the refused
+//! secondary open, the decoded frames' stamps, the seek's back-off and the
+//! zlib-compressed containers (`media_sandbox.rs` checks the sandbox
+//! itself).
 //!
-//! The clips are made by the worker's own `--dev-gen-clip` (dev-tools), so
-//! those tests need dev-tools; the committed fixtures (`tests/media/`) and
-//! the handshake do not.
+//! The clips are made by the worker's own `--dev-gen-clip` (dev-tools), run
+//! as a command of its own, so those tests need dev-tools; the committed
+//! fixtures (`tests/media/`) and the handshake do not.
 
 #![cfg(windows)]
 
+mod media_support;
+
 use std::hash::{Hash as _, Hasher as _};
-use std::io::{BufRead as _, BufReader, Read as _, Write as _};
-use std::os::windows::io::AsRawHandle as _;
-use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::os::windows::io::{AsRawHandle as _, OwnedHandle};
+use std::path::Path;
+#[cfg(feature = "dev-tools")]
+use std::path::PathBuf;
+#[cfg(feature = "dev-tools")]
+use std::process::Command;
 use std::sync::atomic::AtomicU64;
-use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use skin_model::media::control::{self, Command as Order, Reply};
+#[cfg(feature = "dev-tools")]
+use media_support::WORKER;
+use media_support::{Kind, Launched, Stage, media_host, recipe, root};
+use skin_model::media::control::{Command as Order, Reply};
 use skin_model::media::{Frame, Geometry, Reader, Window};
-use windows::Win32::Foundation::{
-    CloseHandle, DUPLICATE_HANDLE_OPTIONS, DuplicateHandle, HANDLE, INVALID_HANDLE_VALUE,
-};
+use windows::Win32::Foundation::HANDLE;
 use windows::Win32::System::Memory::{
-    CreateFileMappingW, FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile,
-    PAGE_READWRITE, UnmapViewOfFile,
+    FILE_MAP_ALL_ACCESS, MEMORY_MAPPED_VIEW_ADDRESS, MapViewOfFile, UnmapViewOfFile,
 };
-use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcess, SetEvent};
-use windows::core::PCWSTR;
-
-const WORKER: &str = env!("CARGO_BIN_EXE_tapestry-media");
+use windows::Win32::System::Threading::SetEvent;
 
 /// How long a reply may take.
 const REPLY: Duration = Duration::from_secs(30);
 
-/// Read access to a file (`FILE_GENERIC_READ`).
-const FILE_READ: u32 = 0x0012_0089;
-/// Mapping a section for reading and writing (`SECTION_MAP_READ |
-/// SECTION_MAP_WRITE`).
-const SECTION_READ_WRITE: u32 = 0x0004 | 0x0002;
-/// Waiting on an event (`SYNCHRONIZE`).
-const WAIT: u32 = 0x0010_0000;
-
-/// The workspace root.
-fn root() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
-}
-
-/// A running worker and the replies on its control pipe.
+/// A worker the game's host launched under the recipe, staged in a
+/// directory of its own, and the replies on its control pipe.
 struct Worker {
-    child: Child,
-    stdin: ChildStdin,
-    replies: Receiver<Reply>,
-    log: Arc<Mutex<String>>,
-    hello: Reply,
+    launched: Launched,
+    _stage: Stage,
 }
 
 impl Worker {
-    /// Starts the worker with `args` and reads its hello.
+    /// Launches the worker with `args` and reads its hello.
     fn start(args: &[&str]) -> Self {
-        let mut child = Command::new(WORKER)
-            .args(args)
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .unwrap();
-        let stdin = child.stdin.take().unwrap();
-        let mut stdout = child.stdout.take().unwrap();
-        let stderr = child.stderr.take().unwrap();
-        let (tx, replies) = mpsc::channel();
-        std::thread::spawn(move || {
-            loop {
-                let mut prefix = [0; 2];
-                if stdout.read_exact(&mut prefix).is_err() {
-                    return;
-                }
-                let len = control::frame_len(prefix).expect("a frame of the protocol");
-                let mut message = vec![0; len];
-                if stdout.read_exact(&mut message).is_err() {
-                    return;
-                }
-                let reply = Reply::decode(&message).expect("a reply of the protocol");
-                if tx.send(reply).is_err() {
-                    return;
-                }
-            }
-        });
-        let log = Arc::new(Mutex::new(String::new()));
-        let sink = Arc::clone(&log);
-        std::thread::spawn(move || {
-            for line in BufReader::new(stderr).lines() {
-                let Ok(line) = line else { return };
-                let mut log = sink.lock().unwrap();
-                log.push_str(&line);
-                log.push('\n');
-            }
-        });
-        let hello = replies.recv_timeout(REPLY).expect("the worker's hello");
+        let stage = Stage::new();
+        let launched = stage
+            .launch(&recipe().args_of(args))
+            .unwrap_or_else(|e| panic!("{e}"));
         Self {
-            child,
-            stdin,
-            replies,
-            log,
-            hello,
+            launched,
+            _stage: stage,
         }
     }
 
     fn send(&mut self, order: &Order) {
-        let bytes = control::frame(&order.encode()).unwrap();
-        self.stdin.write_all(&bytes).unwrap();
-        self.stdin.flush().unwrap();
+        self.launched.send(order).unwrap();
     }
 
     /// The next reply.
     fn reply(&self) -> Reply {
-        match self.replies.recv_timeout(REPLY) {
+        match self.launched.recv(REPLY) {
             Ok(r) => r,
             Err(e) => panic!("no reply ({e}); the worker's log:\n{}", self.log()),
         }
@@ -130,33 +76,18 @@ impl Worker {
 
     /// A reply that has come, without waiting.
     fn try_reply(&self) -> Option<Reply> {
-        self.replies.try_recv().ok()
+        self.launched.try_recv()
     }
 
-    /// What the worker wrote to standard error so far.
+    /// The worker's log lines so far.
     fn log(&self) -> String {
-        self.log.lock().unwrap().clone()
+        self.launched.log()
     }
 
-    /// A duplicate of `handle` in the worker with `access`, as the game
-    /// hands it the handles a command names.
-    fn give(&self, handle: HANDLE, access: u32) -> u64 {
-        let mut theirs = HANDLE::default();
-        // SAFETY: `handle` is open in this process, and the child's process
-        // handle has every access.
-        unsafe {
-            DuplicateHandle(
-                GetCurrentProcess(),
-                handle,
-                HANDLE(self.child.as_raw_handle()),
-                &raw mut theirs,
-                access,
-                false,
-                DUPLICATE_HANDLE_OPTIONS(0),
-            )
-        }
-        .unwrap();
-        theirs.0 as u64
+    /// `handle` duplicated into the worker as the game hands it one of
+    /// `kind`.
+    fn give(&self, handle: HANDLE, kind: Kind) -> u64 {
+        self.launched.hand_in(handle, kind).unwrap()
     }
 
     /// The worker's peak commit so far, in bytes.
@@ -167,11 +98,11 @@ impl Worker {
         };
 
         let mut counters = PROCESS_MEMORY_COUNTERS::default();
-        // SAFETY: the child's process handle, which has every access, and a
-        // buffer of the size given.
+        // SAFETY: the worker's process handle, which has every access, and
+        // a buffer of the size given.
         unsafe {
             GetProcessMemoryInfo(
-                HANDLE(self.child.as_raw_handle()),
+                self.launched.process(),
                 &raw mut counters,
                 u32::try_from(size_of::<PROCESS_MEMORY_COUNTERS>()).unwrap(),
             )
@@ -183,7 +114,7 @@ impl Worker {
     /// Opens `path` as player `player`: the probe or the refusal.
     fn open(&mut self, player: u8, path: &Path) -> Reply {
         let file = std::fs::File::open(path).unwrap();
-        let handle = self.give(HANDLE(file.as_raw_handle()), FILE_READ);
+        let handle = self.give(HANDLE(file.as_raw_handle()), Kind::File);
         self.send(&Order::Open {
             player,
             file: handle,
@@ -193,8 +124,8 @@ impl Worker {
 
     /// Hands player `player` its ring.
     fn play(&mut self, player: u8, ring: &Ring) -> Reply {
-        let section = self.give(ring.section, SECTION_READ_WRITE);
-        let event = self.give(ring.event, WAIT);
+        let section = self.give(HANDLE(ring.section.as_raw_handle()), Kind::Section);
+        let event = self.give(HANDLE(ring.event.as_raw_handle()), Kind::Event);
         self.send(&Order::Play {
             player,
             section,
@@ -216,31 +147,14 @@ impl Worker {
     }
 }
 
-impl Drop for Worker {
-    fn drop(&mut self) {
-        if let Some(bytes) = control::frame(&Order::Quit.encode()) {
-            let _ = self.stdin.write_all(&bytes);
-            let _ = self.stdin.flush();
-        }
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while Instant::now() < deadline {
-            if let Ok(Some(_)) = self.child.try_wait() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
-/// A frame ring as the game makes it: a section of its own, mapped here,
-/// its header written, and its free-slot event.
+/// A frame ring as the game makes it ([`media_host::ring_objects`]): a
+/// section of its own, mapped here, its header written, and its free-slot
+/// event.
 struct Ring {
-    section: HANDLE,
+    section: OwnedHandle,
     view: MEMORY_MAPPED_VIEW_ADDRESS,
     len: usize,
-    event: HANDLE,
+    event: OwnedHandle,
     reader: Reader,
 }
 
@@ -249,25 +163,19 @@ impl Ring {
     /// at 0.
     fn new(width: u32, height: u32) -> Self {
         let geometry = Geometry::new(width, height).unwrap();
-        let bytes = u64::try_from(geometry.bytes()).unwrap();
-        // SAFETY: a new section backed by the paging file, of the ring's
-        // size.
-        let section = unsafe {
-            CreateFileMappingW(
-                INVALID_HANDLE_VALUE,
-                None,
-                PAGE_READWRITE,
-                u32::try_from(bytes >> 32).unwrap(),
-                u32::try_from(bytes & 0xffff_ffff).unwrap(),
-                PCWSTR::null(),
-            )
-        }
-        .unwrap();
+        let (section, event) =
+            media_host::ring_objects(u64::try_from(geometry.bytes()).unwrap()).unwrap();
         // SAFETY: the section just made, mapped whole.
-        let view = unsafe { MapViewOfFile(section, FILE_MAP_ALL_ACCESS, 0, 0, 0) };
+        let view = unsafe {
+            MapViewOfFile(
+                HANDLE(section.as_raw_handle()),
+                FILE_MAP_ALL_ACCESS,
+                0,
+                0,
+                0,
+            )
+        };
         assert!(!view.Value.is_null());
-        // SAFETY: an auto-reset event, unsignalled.
-        let event = unsafe { CreateEventW(None, false, false, PCWSTR::null()) }.unwrap();
         let len = geometry.words();
         // SAFETY: the view holds the ring's words and stays mapped while the
         // ring lives; every access goes through the atomics.
@@ -305,7 +213,7 @@ impl Ring {
             .unwrap_or_else(|f| panic!("the ring failed its player: {f}"));
         if poll.freed {
             // SAFETY: the ring's event.
-            unsafe { SetEvent(self.event) }.unwrap();
+            unsafe { SetEvent(HANDLE(self.event.as_raw_handle())) }.unwrap();
         }
         poll.staged
     }
@@ -345,12 +253,8 @@ impl Ring {
 
 impl Drop for Ring {
     fn drop(&mut self) {
-        // SAFETY: the view and handles this ring made, unused after this.
-        unsafe {
-            let _ = UnmapViewOfFile(self.view);
-            let _ = CloseHandle(self.section);
-            let _ = CloseHandle(self.event);
-        }
+        // SAFETY: the view this ring mapped, unused after this.
+        let _ = unsafe { UnmapViewOfFile(self.view) };
     }
 }
 
@@ -482,13 +386,10 @@ fn worker_loads_the_pinned_build() {
         format!("--extra-cflags=-I{dir}/deps/zlib/include"),
         format!("--extra-ldflags=-L{dir}/deps/zlib/lib"),
     ]);
-    let Reply::Hello {
+    let media_host::Hello {
         version,
         configuration,
-    } = &worker.hello
-    else {
-        panic!("{:?} for a hello", worker.hello);
-    };
+    } = worker.launched.hello();
     assert_eq!(version, &format!("{describe}-{revision}"));
     let configure: Vec<String> = configure.iter().map(|a| recorded(a)).collect();
     assert_eq!(
@@ -898,7 +799,7 @@ fn decoder_enomem_fails_one_player_and_the_worker_lives() {
         frames[1] += usize::from(two.poll(i64::MAX).is_some());
         assert_eq!(worker.try_reply(), None, "player 2 ended or failed early");
     }
-    assert!(worker.child.try_wait().unwrap().is_none());
+    assert!(!worker.launched.ended());
     let probe = worker.open(3, &steady);
     assert!(
         matches!(probe, Reply::Probed { player: 3, .. }),

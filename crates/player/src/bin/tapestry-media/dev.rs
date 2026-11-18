@@ -12,11 +12,18 @@
 //!   playlist or a reference would make it.
 //! - `--dev-max-alloc <bytes>`: serves the control pipe with FFmpeg's
 //!   largest allocation lowered to `bytes`.
+//! - `--dev-probe <probe>…`: answers the hello, then tries what the
+//!   sandbox denies the worker and what it leaves it ([`probe`]).
+//! - `--dev-silent <ms>`: waits `ms` milliseconds without answering the
+//!   game's launch, then exits.
+
+mod probe;
 
 use std::ffi::OsString;
 use std::process::ExitCode;
 
 use crate::ffmpeg::{self, Clip, Input, IoOpen};
+use crate::os::Source;
 
 /// The marker a dev-tools build prints and holds.
 const MARKER: &str = "tapestry dev-tools enabled";
@@ -45,6 +52,14 @@ pub fn run(args: &[OsString]) -> Option<ExitCode> {
                 _ => usage("--dev-max-alloc <bytes>"),
             });
         }
+        "--dev-probe" => return Some(probe::run(rest)),
+        "--dev-silent" => match rest {
+            [ms] => ms
+                .parse()
+                .map(|ms| std::thread::sleep(std::time::Duration::from_millis(ms)))
+                .map_err(|e| format!("--dev-silent {ms}: {e}")),
+            _ => Err("--dev-silent <ms>".to_owned()),
+        },
         _ => return None,
     };
     Some(match result {
@@ -124,8 +139,8 @@ fn secondary_open(args: &[String]) -> Result<(), String> {
         other => return Err(format!("{other}: not refuse or default")),
     };
     let file = std::fs::File::open(file).map_err(|e| format!("{file}: {e}"))?;
-    let (mut input, _) =
-        Input::open(file, io).map_err(|(why, code)| format!("refused: {why:?} {code}"))?;
+    let (mut input, _) = Input::open(Source::opened(file), io)
+        .map_err(|(why, code)| format!("refused: {why:?} {code}"))?;
     let code = input.secondary_open(c"segment-0.ts");
     println!("secondary open: {code}");
     Ok(())

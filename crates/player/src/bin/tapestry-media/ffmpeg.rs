@@ -16,12 +16,16 @@
 //! probed size, the size of the video's frame ring.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
+#[cfg(feature = "dev-tools")]
+use std::io::Write as _;
+use std::io::{Read as _, Seek, SeekFrom};
 use std::ptr;
 
 use ffmpeg_sys_next as ff;
 use skin_model::media::control::{Failure, Refusal};
 use skin_model::media::{MAX_PIXELS, MAX_SIDE};
+
+use crate::os::Source;
 
 /// The largest single allocation FFmpeg may make: below the 64 MiB margin
 /// between the game's termination line and the job's cap
@@ -140,7 +144,7 @@ unsafe extern "C" fn log(avcl: *mut c_void, level: c_int, fmt: *const c_char, ar
     let message = unsafe { CStr::from_ptr(line.as_ptr()) }.to_string_lossy();
     let message = message.trim_end();
     if !message.is_empty() {
-        let _ = writeln!(std::io::stderr().lock(), "ffmpeg: {message}");
+        crate::say(&format!("ffmpeg: {message}"));
     }
 }
 
@@ -178,10 +182,9 @@ unsafe extern "C" fn refuse_open(
     // SAFETY: FFmpeg passes the URL it would open, NUL-terminated, or null.
     let url = unsafe { text(url) };
     let url: String = url.chars().take(256).collect();
-    let _ = writeln!(
-        std::io::stderr().lock(),
+    crate::say(&format!(
         "tapestry-media: refused a secondary open of {url:?}"
-    );
+    ));
     averror(ff::EPERM)
 }
 
@@ -193,12 +196,12 @@ unsafe extern "C" fn read(opaque: *mut c_void, buf: *mut u8, size: c_int) -> c_i
     if opaque.is_null() || buf.is_null() {
         return averror(ff::EINVAL);
     }
-    // SAFETY: `opaque` is the file this module boxed for this context,
+    // SAFETY: `opaque` is the source this module boxed for this context,
     // alive until the context is freed, and FFmpeg hands a buffer of
     // `size` bytes.
     let (file, buf) = unsafe {
         (
-            &mut *opaque.cast::<std::fs::File>(),
+            &mut *opaque.cast::<Source>(),
             std::slice::from_raw_parts_mut(buf, len),
         )
     };
@@ -209,13 +212,15 @@ unsafe extern "C" fn read(opaque: *mut c_void, buf: *mut u8, size: c_int) -> c_i
     }
 }
 
-/// Moves in the file for FFmpeg, or gives its size.
-unsafe extern "C" fn seek(opaque: *mut c_void, offset: i64, whence: c_int) -> i64 {
+/// Moves in the file for FFmpeg, or gives its size: the file a context
+/// reads (a [`Source`]) or, for a dev-tools clip, writes (a `File`).
+unsafe extern "C" fn seek<T: Seek>(opaque: *mut c_void, offset: i64, whence: c_int) -> i64 {
     if opaque.is_null() {
         return i64::from(averror(ff::EINVAL));
     }
-    // SAFETY: as in `read`.
-    let file = unsafe { &mut *opaque.cast::<std::fs::File>() };
+    // SAFETY: `opaque` is the `T` this module boxed for this context, alive
+    // until the context is freed.
+    let file = unsafe { &mut *opaque.cast::<T>() };
     let at = if whence & ff::AVSEEK_SIZE != 0 {
         size(file)
     } else {
@@ -232,7 +237,7 @@ unsafe extern "C" fn seek(opaque: *mut c_void, offset: i64, whence: c_int) -> i6
 }
 
 /// The file's length, its position kept.
-fn size(file: &mut std::fs::File) -> Option<i64> {
+fn size(file: &mut impl Seek) -> Option<i64> {
     let here = file.stream_position().ok()?;
     let end = file.seek(SeekFrom::End(0)).ok()?;
     file.seek(SeekFrom::Start(here)).ok()?;
@@ -269,7 +274,7 @@ pub struct Input {
     scaled: *mut ff::AVFrame,
     sws: *mut ff::SwsContext,
     /// The file FFmpeg reads through `pb`: boxed so its address holds.
-    file: Box<std::fs::File>,
+    file: Box<Source>,
     stream: c_int,
     time_base: ff::AVRational,
     start: i64,
@@ -287,7 +292,7 @@ impl Input {
     ///
     /// Why the file is refused, with FFmpeg's error (0 when there is
     /// none).
-    pub fn open(file: std::fs::File, io: IoOpen) -> Result<(Self, Probe), (Refusal, c_int)> {
+    pub fn open(file: Source, io: IoOpen) -> Result<(Self, Probe), (Refusal, c_int)> {
         let mut input = Self {
             fc: ptr::null_mut(),
             pb: ptr::null_mut(),
@@ -329,9 +334,16 @@ impl Input {
             if buf.is_null() {
                 return Err(no_memory);
             }
-            let opaque = ptr::from_mut::<std::fs::File>(&mut self.file).cast::<c_void>();
-            self.pb =
-                ff::avio_alloc_context(buf, IO_BUFFER, 0, opaque, Some(read), None, Some(seek));
+            let opaque = ptr::from_mut::<Source>(&mut self.file).cast::<c_void>();
+            self.pb = ff::avio_alloc_context(
+                buf,
+                IO_BUFFER,
+                0,
+                opaque,
+                Some(read),
+                None,
+                Some(seek::<Source>),
+            );
             if self.pb.is_null() {
                 ff::av_free(buf.cast());
                 return Err(no_memory);
@@ -617,10 +629,9 @@ impl Input {
                     // the video as FFmpeg's own command line ends its input
                     // on one: the decoder gives the frames it still holds.
                     if r != ff::AVERROR_EOF {
-                        let _ = writeln!(
-                            std::io::stderr().lock(),
+                        crate::say(&format!(
                             "tapestry-media: demuxing ended on FFmpeg error {r}"
-                        );
+                        ));
                     }
                     self.drained = true;
                     let r = ff::avcodec_send_packet(self.dec, ptr::null());
@@ -919,8 +930,15 @@ impl Encoding {
                 return Err("out of memory".to_owned());
             }
             let opaque = ptr::from_mut::<std::fs::File>(&mut self.file).cast::<c_void>();
-            self.pb =
-                ff::avio_alloc_context(buf, IO_BUFFER, 1, opaque, None, Some(write), Some(seek));
+            self.pb = ff::avio_alloc_context(
+                buf,
+                IO_BUFFER,
+                1,
+                opaque,
+                None,
+                Some(write),
+                Some(seek::<std::fs::File>),
+            );
             if self.pb.is_null() {
                 ff::av_free(buf.cast());
                 return Err("out of memory".to_owned());

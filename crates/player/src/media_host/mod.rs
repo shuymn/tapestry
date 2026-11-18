@@ -1,0 +1,291 @@
+//! The media worker's host in the game (design.md "Threat Model" T02,
+//! docs/stage3.md S15): it launches `tapestry-media.exe` in its sandbox
+//! ([`launch`]), checks the suspended process before it runs, carries its
+//! control pipe (`skin_model::media::control`) and hands it the handles a
+//! video needs, each duplicated into it with the least access its use
+//! needs ([`Kind`]).
+//!
+//! The worker's replies are read on a thread of the host's own: its log
+//! lines go to the game's log, and every other reply, decoded and so
+//! bounded by the protocol, waits for [`Worker::recv`]. A reply that does
+//! not decode ends the reading, as a worker that dies does: the replies
+//! then stop for good.
+
+pub mod handles;
+pub mod launch;
+
+use std::io::Write as _;
+use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
+use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::time::Duration;
+
+use skin_model::media::control::{self, Command, EVENT_ACCESS, FILE_ACCESS, Reply, SECTION_ACCESS};
+use windows::Win32::Foundation::{
+    DUPLICATE_HANDLE_OPTIONS, DuplicateHandle, HANDLE, HLOCAL, INVALID_HANDLE_VALUE, LocalFree,
+};
+use windows::Win32::Security::Authorization::{
+    ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+};
+use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE};
+use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcess};
+use windows::core::{PCWSTR, w};
+
+use launch::{LaunchError, Setup};
+
+/// A kind of handle the game hands the worker.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A video's file, read-only.
+    File,
+    /// A frame ring's section, mapped for reading and writing.
+    Section,
+    /// A frame ring's free-slot event, waited on.
+    Event,
+}
+
+impl Kind {
+    /// The access the game hands a handle of this kind with, the one the
+    /// worker takes it with.
+    pub const fn access(self) -> u32 {
+        match self {
+            Self::File => FILE_ACCESS,
+            Self::Section => SECTION_ACCESS,
+            Self::Event => EVENT_ACCESS,
+        }
+    }
+}
+
+/// A frame ring's section of `bytes` bytes and its free-slot event, made
+/// for handing to the worker: each with a security descriptor whose DACL
+/// grants nothing. The game's own handles have every access by their
+/// creation, and the worker gets each with the least access its use needs
+/// ([`Kind`]); an object without a descriptor would let whoever holds a
+/// handle to it duplicate it with any access, a descriptor that grants
+/// nothing lets no one widen one.
+///
+/// # Errors
+///
+/// When the descriptor, the section or the event cannot be made.
+pub fn ring_objects(bytes: u64) -> windows::core::Result<(OwnedHandle, OwnedHandle)> {
+    let mut descriptor = PSECURITY_DESCRIPTOR::default();
+    // SAFETY: a nul-terminated SDDL string; the descriptor returned is
+    // freed with `LocalFree` below.
+    unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            w!("D:"),
+            SDDL_REVISION_1,
+            &raw mut descriptor,
+            None,
+        )
+    }?;
+    let attributes = SECURITY_ATTRIBUTES {
+        nLength: u32::try_from(size_of::<SECURITY_ATTRIBUTES>()).unwrap_or(0),
+        lpSecurityDescriptor: descriptor.0,
+        bInheritHandle: false.into(),
+    };
+    let high = u32::try_from(bytes >> 32).unwrap_or(u32::MAX);
+    let low = u32::try_from(bytes & 0xffff_ffff).unwrap_or(u32::MAX);
+    // SAFETY: an unnamed section backed by the paging file and an unnamed
+    // auto-reset event, each owned by the value returned; the descriptor
+    // lives through both calls.
+    let made = unsafe {
+        CreateFileMappingW(
+            INVALID_HANDLE_VALUE,
+            Some(&raw const attributes),
+            PAGE_READWRITE,
+            high,
+            low,
+            PCWSTR::null(),
+        )
+        .map(|h| OwnedHandle::from_raw_handle(h.0))
+        .and_then(|section| {
+            CreateEventW(Some(&raw const attributes), false, false, PCWSTR::null())
+                .map(|h| (section, OwnedHandle::from_raw_handle(h.0)))
+        })
+    };
+    // SAFETY: the descriptor `ConvertStringSecurityDescriptor…` allocated.
+    let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+    made
+}
+
+/// A handle the host made, closed when dropped.
+#[derive(Debug)]
+struct Owned(HANDLE);
+
+// SAFETY: a handle is a value any thread of the process may use; the one
+// `Owned` holds is used by its owner alone.
+unsafe impl Send for Owned {}
+// SAFETY: as above; shared, it is only read.
+unsafe impl Sync for Owned {}
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        if !self.0.is_invalid() {
+            // SAFETY: a handle this value made, unused after this.
+            let _ = unsafe { windows::Win32::Foundation::CloseHandle(self.0) };
+        }
+    }
+}
+
+/// The worker's answer to its launch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Hello {
+    /// Its FFmpeg's version string.
+    pub version: String,
+    /// Its FFmpeg's configure line.
+    pub configuration: String,
+}
+
+/// A running worker. Dropping it sends `Quit` and closes its job, which
+/// ends the worker.
+pub struct Worker {
+    /// Writes the commands, the control pipe's game end.
+    commands: std::fs::File,
+    replies: Receiver<Reply>,
+    hello: Hello,
+    process: Owned,
+    pid: u32,
+    /// The job, whose closing ends the worker (`None` only under a test's
+    /// setup without one).
+    job: Option<Owned>,
+    /// The window station and desktop the worker runs on, kept while it
+    /// runs.
+    _desktop: Option<launch::Desktop>,
+    #[cfg(test)]
+    log: std::sync::Arc<std::sync::Mutex<String>>,
+    #[cfg(test)]
+    suspended: Vec<handles::Entry>,
+    #[cfg(test)]
+    pipe_ends: [u64; 2],
+}
+
+impl Worker {
+    /// Launches the worker in `dir`, which holds `tapestry-media.exe` and
+    /// its FFmpeg DLLs, under `setup` (the recipe, [`Setup::recipe`]).
+    ///
+    /// # Errors
+    ///
+    /// The step that failed, or that the check found differing from the
+    /// setup, with the system's error; the process, if one was made, is
+    /// terminated before it runs (or, at the handshake, as it runs).
+    pub fn launch(dir: &std::path::Path, setup: &Setup) -> Result<Self, LaunchError> {
+        launch::launch(dir, setup)
+    }
+
+    /// The worker's hello.
+    pub const fn hello(&self) -> &Hello {
+        &self.hello
+    }
+
+    /// Sends `command`.
+    ///
+    /// # Errors
+    ///
+    /// When the pipe is closed: the worker has ended.
+    pub fn send(&mut self, command: &Command) -> std::io::Result<()> {
+        let bytes = control::frame(&command.encode())
+            .ok_or_else(|| std::io::Error::other("a command longer than a frame"))?;
+        self.commands.write_all(&bytes)?;
+        self.commands.flush()
+    }
+
+    /// The next reply other than a log line, waiting up to `timeout`.
+    ///
+    /// # Errors
+    ///
+    /// `Timeout` when none came in time; `Disconnected` once the replies
+    /// have ended (the worker ended or sent one that does not decode).
+    pub fn recv(&self, timeout: Duration) -> Result<Reply, RecvTimeoutError> {
+        self.replies.recv_timeout(timeout)
+    }
+
+    /// A reply other than a log line that has come, without waiting.
+    pub fn try_recv(&self) -> Option<Reply> {
+        self.replies.try_recv().ok()
+    }
+
+    /// Duplicates `handle`, the game's, into the worker with the access
+    /// its `kind` needs: the value a command names it by.
+    ///
+    /// # Errors
+    ///
+    /// When the duplication fails.
+    pub fn hand_in(&self, handle: HANDLE, kind: Kind) -> windows::core::Result<u64> {
+        self.duplicate_in(handle, kind.access())
+    }
+
+    /// Duplicates `handle` into the worker with `access`.
+    fn duplicate_in(&self, handle: HANDLE, access: u32) -> windows::core::Result<u64> {
+        let mut theirs = HANDLE::default();
+        // SAFETY: `handle` is open in the game, and the worker's process
+        // handle, made by its creation, has every access.
+        unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                handle,
+                self.process.0,
+                &raw mut theirs,
+                access,
+                false,
+                DUPLICATE_HANDLE_OPTIONS(0),
+            )
+        }?;
+        Ok(theirs.0.expose_provenance() as u64)
+    }
+
+    /// The worker's process id.
+    pub const fn pid(&self) -> u32 {
+        self.pid
+    }
+}
+
+#[cfg(test)]
+impl Worker {
+    /// Duplicates `handle` into the worker with `access`, which a test's
+    /// control widens.
+    pub fn hand_in_with(&self, handle: HANDLE, access: u32) -> windows::core::Result<u64> {
+        self.duplicate_in(handle, access)
+    }
+
+    /// The worker's process handle, with every access.
+    pub const fn process(&self) -> HANDLE {
+        self.process.0
+    }
+
+    /// The job's handle, if the setup made one.
+    pub fn job(&self) -> Option<HANDLE> {
+        self.job.as_ref().map(|j| j.0)
+    }
+
+    /// Closes the job, as the game's exit does, keeping the rest.
+    pub fn close_job(&mut self) {
+        self.job = None;
+    }
+
+    /// Every log line the worker sent so far.
+    pub fn log(&self) -> String {
+        self.log
+            .lock()
+            .map(|l| l.clone())
+            .unwrap_or_else(|e| e.into_inner().clone())
+    }
+
+    /// The handles the suspended worker held when it was checked.
+    pub fn suspended(&self) -> &[handles::Entry] {
+        &self.suspended
+    }
+
+    /// The values of the control pipe's ends it was created with.
+    pub const fn pipe_ends(&self) -> [u64; 2] {
+        self.pipe_ends
+    }
+}
+
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let _ = self.send(&Command::Quit);
+        // Closing the job ends the worker (`KILL_ON_JOB_CLOSE`).
+        self.job = None;
+    }
+}
