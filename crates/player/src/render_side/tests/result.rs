@@ -888,7 +888,7 @@ fn result_preparing_ends_at_the_first_taker() {
     for skin_first in [true, false] {
         let (_dir, skin) = fixed_skin();
         let book = Transitions::with_capacity(16);
-        let mut recorder = Recorder::new(book.clone());
+        let recorder = Recorder::new(book.clone());
         recorder.play_ended(TimeUs(1));
         let calls = Arc::new(Mutex::new(Vec::new()));
         let rig = Rig::with_sink(Box::new(Taking {

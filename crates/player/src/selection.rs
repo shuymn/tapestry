@@ -375,6 +375,13 @@ pub struct Selection {
     /// The load's lines on the play screen, from a chart's choice or a
     /// practice Start to its READY state or the way back.
     pub loading: Option<LoadingText>,
+    /// The chart chosen last, with the difficulty its library entry
+    /// stores, declared or inferred ([`library::ChartEntry::difficulty`]):
+    /// what its play and result show for `chart.difficulty` (design.md
+    /// "Play Lifecycle", the chart's labels). Kept from its choice through
+    /// every attempt at it, retries and rounds included; none when the
+    /// chart was not listed.
+    pub chosen_difficulty: Option<(std::path::PathBuf, u8)>,
     /// Whether the chart chosen last was chosen to practice.
     pub practicing: bool,
     /// The decision screen's presentation while it shows, sent again when
@@ -2240,6 +2247,31 @@ pub enum ChartLoadError {
     NoSelection,
 }
 
+/// Holds a chart's load at its start until let go, the decision screen
+/// served meanwhile as the load's waits serve it, so its deadline can pass
+/// while the load still runs (tests).
+#[cfg(test)]
+pub static LOAD_HOLD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set while a load is held by [`LOAD_HOLD`] (tests).
+#[cfg(test)]
+pub static LOAD_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// [`LOAD_HOLD`]'s wait: the decision screen looked at, as the load's
+/// cancellation check looks at it, until let go or left.
+#[cfg(test)]
+fn hold_load(controls: &crate::controls::Controls) {
+    use std::sync::atomic::Ordering;
+    while LOAD_HOLD.load(Ordering::Acquire) {
+        LOAD_HELD.store(true, Ordering::Release);
+        if cancelled(controls) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    LOAD_HELD.store(false, Ordering::Release);
+}
+
 /// Whether the quit key or a window close cancels the load, or the
 /// decision screen its waits serve ([`Controls::look`]) was left.
 ///
@@ -2297,6 +2329,15 @@ fn loading_text(sel: &Selection, chart: &std::path::Path, autoplay: bool) -> Loa
     }
 }
 
+/// The chart chosen, `chart`, with the difficulty its library entry
+/// stores, when it is the listed one ([`Selection::chosen_difficulty`]).
+fn chosen_difficulty(sel: &Selection, chart: &std::path::Path) -> Option<(std::path::PathBuf, u8)> {
+    sel.screen
+        .selected()
+        .filter(|e| e.path == chart)
+        .map(|e| (e.path.clone(), e.difficulty))
+}
+
 /// The strings a decision skin shows of a chart, from its library
 /// header as the select screen's view gives them
 /// ([`crate::select::SelectScreen`]), so their revision
@@ -2326,9 +2367,7 @@ fn chosen_chart(e: &library::ChartEntry) -> ChosenChart {
         play_level: Some(crate::imports::facts::level_of(
             h.playlevel.as_deref().unwrap_or_default(),
         )),
-        difficulty: Some(crate::imports::facts::difficulty_of(
-            h.difficulty.as_deref().unwrap_or_default(),
-        )),
+        difficulty: Some(e.difficulty),
         bga: Some(e.bga),
         length_us: e.summary.as_ref().map(|s| s.length),
     }
@@ -2793,6 +2832,8 @@ impl PlayerRig<'_> {
             }
             sel.shelf.choose(path);
             sel.chosen_at = self.clock.now();
+            #[cfg(feature = "dev-tools")]
+            crate::dev::stages_begin(self.clock, sel.chosen_at);
             let name = file_name(path);
             let after = since(sel.entered_at, sel.chosen_at).as_millis();
             println!("select: chose {name}{what} {after} ms after entering selection");
@@ -3375,7 +3416,12 @@ impl PlayerRig<'_> {
             .watch_decision(crate::controls::DecisionWatch {
                 decision,
                 origin,
+                // The deadline step taken inside the rig's wait (a load
+                // still running at the deadline), as `deadline_step` takes
+                // it outside one.
                 reveal: Box::new(move || {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::stage("decision_end");
                     println!("load: the play screen loads {name}");
                     reveal();
                 }),
@@ -3757,12 +3803,15 @@ impl AppRig for PlayerRig<'_> {
     /// stage: a loading lifetime begins, with the shown gauge's descriptor
     /// from the validated preset selection has chosen.
     fn entered_loading(&mut self, chart: &std::path::Path) {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::stage("decision_end");
         // Selection is left, its images before the play generation's
         // renewal (SC5): nothing of selection's begins after it.
         self.left_selection();
         // A new generation of the chart's images before the loading
         // lifetime begins: none of the last one's draws in it.
         self.chart_images.renew();
+        self.bga.renew();
         // The coming attempt's entry: its loading-time adjustments are its
         // own, and solve nothing until its chart is read. A failed fence is
         // the input thread's failure, which ends the run.
@@ -3773,6 +3822,7 @@ impl AppRig for PlayerRig<'_> {
         let Some(sel) = &mut self.selection else {
             return;
         };
+        sel.chosen_difficulty = chosen_difficulty(sel, chart);
         let page = loading_text(sel, chart, self.autoplay);
         println!("load: the play screen loads {}", file_name(chart));
         let gauge = sel
@@ -3872,6 +3922,7 @@ impl AppRig for PlayerRig<'_> {
         // lifetime begins: none of the last choice's draws when the
         // deadline reveals it.
         self.chart_images.renew();
+        self.bga.renew();
         self.controls.close_epoch();
         if let Some(ime) = self.selection.as_ref().and_then(|s| s.ime.as_ref()) {
             ime.set(false);
@@ -3880,6 +3931,7 @@ impl AppRig for PlayerRig<'_> {
         let Some(sel) = &mut self.selection else {
             return d;
         };
+        sel.chosen_difficulty = chosen_difficulty(sel, chart);
         let page = loading_text(sel, chart, self.autoplay);
         println!("decision: {} chosen", file_name(chart));
         let shown = page.decision();
@@ -3972,6 +4024,8 @@ impl AppRig for PlayerRig<'_> {
     /// epoch's end, the held lifetime shown, and a new scene. Waits for
     /// nothing.
     fn deadline_step(&mut self) {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::stage("decision_end");
         self.end_decision();
         if let Some((_, name)) = self.selection.as_ref().and_then(|s| s.decision.as_ref()) {
             println!("load: the play screen loads {name}");
@@ -4015,7 +4069,11 @@ impl AppRig for PlayerRig<'_> {
         let stepped = decision.stepped();
         // Moved to the load's waits and back, one owner at a time.
         let lent = std::mem::replace(decision, game::Decision::off());
-        let (loading, served) = self.watching(loaded.path(), lent, |rig| rig.load_watched(loaded));
+        let (loading, served) = self.watching(loaded.path(), lent, |rig| {
+            #[cfg(test)]
+            hold_load(rig.controls);
+            rig.load_watched(loaded)
+        });
         *decision = served;
         if decision.stepped() && !stepped {
             // The deadline's step ran inside a wait: the opening's
@@ -4110,6 +4168,7 @@ impl AppRig for PlayerRig<'_> {
         // Its images' job was cancelled with the choice's scope below; its
         // set is never taken, nor drawn.
         self.chart_images.forget();
+        self.bga.forget();
         let looks = looks!(self);
         let Some(sel) = &mut self.selection else {
             return Ok(());
@@ -4133,6 +4192,7 @@ impl AppRig for PlayerRig<'_> {
         // The last chart's images go: nothing of them stays beside
         // selection.
         self.chart_images.drop_images();
+        self.bga.drop_images();
         self.result_skin.drop_images();
         // Another scene: held adjustment controls act no more until
         // pressed afresh.
@@ -4461,6 +4521,7 @@ pub(crate) mod tests {
             rank: None,
             images: None,
             info: None,
+            difficulty: 0,
         }
     }
 
@@ -4577,31 +4638,25 @@ pub(crate) mod tests {
         assert_eq!(level(None), Some(0));
     }
 
-    /// A chosen chart's difficulty is its entry's `#DIFFICULTY` as an
-    /// attempt reads it, 1 to 5 and 0 for any other or none, and its BGA
-    /// flag the entry's: both known once the entry is.
+    /// A chosen chart's difficulty is the one its entry stores, declared
+    /// or inferred, 0 for none, whatever `#DIFFICULTY` text the entry
+    /// holds, and its BGA flag the entry's: both known once the entry is.
     #[test]
     fn the_chosen_charts_difficulty_and_bga_come_from_its_entry() {
-        let chosen = |text: Option<&str>, bga| {
+        let chosen = |stored, bga| {
             let header = library::Header {
-                difficulty: text.map(str::to_owned),
+                difficulty: Some("2".to_owned()),
                 ..library::Header::default()
             };
-            let c = chosen_chart(&entry(header, bga));
+            let c = chosen_chart(&library::ChartEntry {
+                difficulty: stored,
+                ..entry(header, bga)
+            });
             (c.difficulty, c.bga)
         };
-        assert_eq!(chosen(Some("4"), true), (Some(4), Some(true)));
-        assert_eq!(chosen(Some("+5"), false), (Some(5), Some(false)));
-        for text in [
-            Some("6"),
-            Some("0"),
-            Some("-1"),
-            Some("2a"),
-            Some("４"),
-            None,
-        ] {
-            assert_eq!(chosen(text, false), (Some(0), Some(false)), "{text:?}");
-        }
+        assert_eq!(chosen(4, true), (Some(4), Some(true)));
+        assert_eq!(chosen(5, false), (Some(5), Some(false)));
+        assert_eq!(chosen(0, false), (Some(0), Some(false)));
     }
 
     /// A chosen chart's length is its entry's summary's, the loader's 1×
@@ -4804,6 +4859,7 @@ pub(crate) mod tests {
             rate: 48_000,
             chosen_at: TimeUs(0),
             loading: None,
+            chosen_difficulty: None,
             decision: None,
             practicing: false,
             entered_at: TimeUs(0),
@@ -7777,6 +7833,7 @@ pub(crate) mod tests {
             rate: 48_000,
             chosen_at: TimeUs(0),
             loading: None,
+            chosen_difficulty: None,
             decision: None,
             practicing: false,
             entered_at: TimeUs(0),

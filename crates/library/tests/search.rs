@@ -463,9 +463,9 @@ fn a_query_reads_committed_rows_without_waiting_for_the_writer() {
         .execute_batch(
             "BEGIN IMMEDIATE;
              INSERT INTO charts (root, path, size, mtime_ns, sha256, md5, title, norm_text,
-                 folder, mode, random, bga, loader)
+                 folder, mode, random, bga, loader, difficulty_level)
                  SELECT id, 'pending.bms', 0, 0, zeroblob(32), zeroblob(16), 'Pending', 'pending',
-                     '', 0, 0, 0, 0
+                     '', 0, 0, 0, 0, 0
                  FROM roots;",
         )
         .unwrap();
@@ -700,8 +700,8 @@ fn insert_listed(db: &Path, root: &str, charts: &[(String, String, &str)]) {
         let mut insert = tx
             .prepare(
                 "INSERT INTO charts (root, path, size, mtime_ns, sha256, md5, title, norm_text,
-                     title_key, folder, mode, random, bga, loader)
-                 SELECT id, ?1, 0, 0, zeroblob(32), zeroblob(16), ?3, ?3, ?3, ?2, 0, 0, 0, 0
+                     title_key, folder, mode, random, bga, loader, difficulty_level)
+                 SELECT id, ?1, 0, 0, zeroblob(32), zeroblob(16), ?3, ?3, ?3, ?2, 0, 0, 0, 0, 0
                  FROM roots WHERE path = ?4",
             )
             .unwrap();
