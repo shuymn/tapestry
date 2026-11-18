@@ -160,9 +160,10 @@ pub trait Rig {
         self.wait();
     }
     /// Whether the result's sound waits for its first picture (design.md
-    /// "State Model", system sounds, Result): the result's loop then does
-    /// no blocking work of its own between its waits, so the look that
-    /// starts it comes at the picture. By default, never.
+    /// "State Model", system sounds, Result): the result's loop then
+    /// polls no preset file and lets their poll deadline end no wait, so
+    /// no file read holds the next look after the picture, which starts
+    /// the sound. By default, never.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     fn result_sound_due(&self) -> bool {
         false
