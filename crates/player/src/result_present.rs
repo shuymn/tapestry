@@ -185,6 +185,12 @@ pub struct ResultReport {
     /// The atlas of the result's installation committed (or pages-only),
     /// kept to restore.
     pub installed: Option<AtlasId>,
+    /// The level-0 texels the selection's and decision's committed
+    /// installations are charged (`render::Admission`, the selection's
+    /// with its pool's firm layer), as of the last event that can change
+    /// them: what the kept probe's room is decided from
+    /// ([`crate::result_skin::kept_probe_fits`]).
+    pub menus: u64,
 }
 
 /// `text` cut to the strip's width.

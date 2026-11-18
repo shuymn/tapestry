@@ -428,6 +428,12 @@ pub trait Screen: Send {
         let _ = kind;
         [None; 3]
     }
+    /// `kind`'s committed charge against the shared texel limit
+    /// (`render::Admission::charge`). The default charges nothing.
+    fn charge(&self, kind: ScreenKind) -> u64 {
+        let _ = kind;
+        0
+    }
     /// Prepares a result view on `state`, a state of `skin`'s: the view
     /// and labels taken ([`skin_model::Skin::update_result`]) and its
     /// lines staged for the result bundle staged or committed, not drawn
@@ -9976,7 +9982,13 @@ impl Run {
         };
         let installed = self.committed.atlas(ScreenKind::Result);
         let mut status = self.shared.result_status();
+        // With no screen, the charges it had.
+        let menus = self.screen.as_ref().map_or(status.menus, |s| {
+            s.charge(ScreenKind::Selection)
+                .saturating_add(s.charge(ScreenKind::Decision))
+        });
         let same = status.installed == installed
+            && status.menus == menus
             && status.disabled == self.result_disabled
             && status.lifetime == lifetime
             && status.revision == revision
@@ -10016,6 +10028,7 @@ impl Run {
             }
         }
         status.installed = installed;
+        status.menus = menus;
         status.disabled.clone_from(&self.result_disabled);
         status.lifetime = lifetime;
         status.revision = revision;

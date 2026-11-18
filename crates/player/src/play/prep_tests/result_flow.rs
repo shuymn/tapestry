@@ -103,15 +103,31 @@ fn on_warp<R>(
     coord: bool,
     f: impl FnOnce(&mut PlayerRig<'_>, &Seen) -> R,
 ) -> R {
+    on_warp_charged(chart, coord, bundle(), Vec::new(), f)
+}
+
+/// [`on_warp`] with `play` chosen, each bundle of `stated` charged its
+/// level-0 texels once committed (`Renderer::state_charge`), so the shared
+/// limit leaves the other kinds only what is past it.
+fn on_warp_charged<R>(
+    chart: &bms_model::Chart,
+    coord: bool,
+    play: Arc<render::SkinBundle>,
+    stated: Vec<(Arc<render::SkinBundle>, u64)>,
+    f: impl FnOnce(&mut PlayerRig<'_>, &Seen) -> R,
+) -> R {
     let seen = Seen::default();
-    let make: MakeScreen = Box::new(|| {
-        let r = render::Renderer::new(
+    let make: MakeScreen = Box::new(move || {
+        let mut r = render::Renderer::new(
             render::Target::Offscreen {
                 width: 1_920,
                 height: 1_080,
             },
             render::AdapterChoice::Warp,
         )?;
+        for (b, texels) in &stated {
+            r.state_charge(b, *texels);
+        }
         Ok(Box::new(MenuScreen::new(r, Some(render::text::Fonts::runtime()?))) as Box<dyn Screen>)
     });
     let clock = QpcClock::start();
@@ -127,10 +143,7 @@ fn on_warp<R>(
     .unwrap();
     render.load(Arc::new(chart.clone()), None).unwrap();
     assert_eq!(
-        render
-            .select(ScreenKind::Play, Some(bundle()))
-            .wait()
-            .unwrap(),
+        render.select(ScreenKind::Play, Some(play)).wait().unwrap(),
         Preparation::Ready
     );
     // A failing body's panic is taken and raised again once the rig shut
@@ -159,6 +172,17 @@ impl Drop for LetImagesGo {
 }
 
 /// `dir/name`, a 64×48 PNG of `rgb`.
+/// `dir/name`, a `side`×`side` PNG of `rgb`.
+fn png_sized(dir: &Path, name: &str, rgb: [u8; 3], side: u32) {
+    let file = std::fs::File::create(dir.join(name)).unwrap();
+    let mut e = png::Encoder::new(std::io::BufWriter::new(file), side, side);
+    e.set_color(png::ColorType::Rgba);
+    e.set_depth(png::BitDepth::Eight);
+    let [r, g, b] = rgb;
+    let texels = [r, g, b, 255].repeat(usize::try_from(side * side).unwrap());
+    e.write_header().unwrap().write_image_data(&texels).unwrap();
+}
+
 fn png(dir: &Path, name: &str, rgb: [u8; 3]) {
     let file = std::fs::File::create(dir.join(name)).unwrap();
     let mut e = png::Encoder::new(std::io::BufWriter::new(file), 64, 48);
@@ -422,6 +446,182 @@ fn a_skin_reading_191_lays_out_each_charts_availability() {
         );
         assert_eq!(payload_stage(rig, &on_b), Some(GREEN));
     });
+}
+
+/// V4 (#611 S2, design.md "beatoraja Lua Skins", the result skin): a
+/// pending result skin that reads a result fact (154) and draws an image
+/// of its own only through a `draw` function the runtime runs, at the
+/// mark's place. The attempt's image stage packs that image's cell, so the
+/// result shows it drawn with no atlas built and no texture array
+/// uploaded after the commit's.
+#[test]
+fn a_result_drawn_by_its_runtime_builds_and_uploads_nothing() {
+    let _serial = imports::serial();
+    let (dir, l) = chart(Some(RED));
+    let skin = lua_result(
+        "local nr = ms.number(154)\n\
+         local calls = 0\n\
+         local function rt() calls = calls + 1 return calls > 0 end\n\
+         skin.image[#skin.image + 1] = { id = \"jd\", src = \"m\", x = 8, y = 0, w = 8, h = 8 }",
+        "d[#d + 1] = { id = \"jd\", draw = rt, dst = { { x = 1200, y = 520, w = 40, h = 40 } } }",
+    );
+    let p = result::pending(skin.path(), result::LIMITS);
+    on_warp(l.chart(), false, |rig, seen| {
+        // The render thread's runtime cell, as the player gives it, so the
+        // layout's runtime draws.
+        rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))))
+            .with_scripts(rig.render.scripts().clone());
+        prepared(rig, &l);
+        assert!(
+            matches!(rig.result_skin.upload(), Some(Upload::Pages(_))),
+            "the probe's pages uploaded at the commit"
+        );
+        let (b0, u0) = (crate::result_skin::builds(), crate::dev::result_uploads());
+        let drawn = shown(rig, seen, dir.path(), |_, m| near(m, MARK));
+        assert!(
+            drawn.is_some_and(|[_, m]| near(m, MARK)),
+            "the runtime's image drawn: {drawn:?}"
+        );
+        assert_eq!(crate::result_skin::builds() - b0, 0, "no atlas built");
+        assert_eq!(
+            crate::dev::result_uploads() - u0,
+            0,
+            "no texture array uploaded"
+        );
+    });
+}
+
+/// A pending skin reading 154 that adds a 2048-texel image drawn only by a
+/// `draw` function the runtime runs while it reads 1, the probe's value:
+/// the kept probe holds that image, the plain one does not, and the view
+/// (154 is 0 in the view shown) draws the mark. With the level-0 texels of
+/// its kept and its plain probe.
+fn kept_only_skin() -> (
+    tempfile::TempDir,
+    Arc<crate::result_skin::PendingResult>,
+    u64,
+    u64,
+) {
+    let skin = lua_result(
+        "local nr = ms.number(154)\n\
+         if nr == 1 then\n\
+           local calls = 0\n\
+           local function rt() calls = calls + 1 return calls > 0 end\n\
+           skin.source[#skin.source + 1] = { id = \"b\", path = \"b.png\" }\n\
+           skin.image[#skin.image + 1] = { id = \"big\", src = \"b\", x = 0, y = 0, w = 2048, h = 2048 }\n\
+           d[#d + 1] = { id = \"big\", draw = rt, dst = { { x = 0, y = 600, w = 8, h = 8 } } }\n\
+         end",
+        &format!("d[#d + 1] = {MARK_DST}"),
+    );
+    png_sized(skin.path(), "b.png", BLUE, 2_048);
+    let p = result::pending(skin.path(), result::LIMITS);
+    let probe = |kept: bool| {
+        let mut rs = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+        rs.set_kept_probe(kept);
+        let _ = rs.image_stage(result::chart(), None, || false, || false);
+        render::pages_texels(rs.image().expect("prepared").pages())
+    };
+    let (kept, plain) = (probe(true), probe(false));
+    assert!(plain < kept, "the kept probe {kept}, the plain one {plain}");
+    (skin, p, kept, plain)
+}
+
+/// A selection installation charged so the kept probe's gate closes: past
+/// what leaves room beside it for the largest play and result charges.
+const MENUS: u64 = 400 << 20;
+
+/// The pages the attempt's result uploads, and their level-0 texels.
+fn uploaded(rig: &PlayerRig<'_>) -> (skin_model::AtlasId, u64) {
+    match rig.result_skin.upload() {
+        Some(Upload::Pages(pages)) => (pages.id(), render::pages_texels(&pages)),
+        other => panic!("not pages: {other:?}"),
+    }
+}
+
+/// The kept probe is used only where the shared limit cannot refuse it
+/// (#611 PR 3a; design.md "beatoraja Lua Skins", the result skin): a
+/// selection charged so the gate closes, and the play skin charged so the
+/// room left fits the plain probe but is one texel short of the kept one,
+/// whose cell only the runtime draws. The probe is plain, admitted at the
+/// commit, and the view draws with its skin; the kept probe would be
+/// refused and the attempt shown built-in.
+#[test]
+fn a_kept_probe_past_the_room_leaves_the_plain_one() {
+    let _serial = imports::serial();
+    assert!(!crate::result_skin::kept_probe_fits(MENUS));
+    let (dir, l) = chart(Some(RED));
+    let (_skin, p, kept, plain) = kept_only_skin();
+    let play = bundle();
+    let sel = bundle();
+    let charge = render::SHARED_TEXELS - MENUS - (kept - 1);
+    on_warp_charged(
+        l.chart(),
+        false,
+        Arc::clone(&play),
+        vec![(play, charge), (Arc::clone(&sel), MENUS)],
+        |rig, seen| {
+            assert_eq!(
+                rig.render
+                    .select(ScreenKind::Selection, Some(sel))
+                    .wait()
+                    .unwrap(),
+                Preparation::Ready
+            );
+            rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+            let mut h = begin(rig, &l);
+            readied(rig, &mut h);
+            assert_eq!(uploaded(rig).1, plain, "the plain probe's pages");
+            rig.commit_attempt().unwrap();
+            assert!(
+                rig.presenter.attempt_fallen().is_none(),
+                "the probe's pages refused"
+            );
+            let drawn = shown(rig, seen, dir.path(), |_, m| near(m, MARK));
+            assert!(
+                drawn.is_some_and(|[_, m]| near(m, MARK)),
+                "the view drawn with its skin: {drawn:?}"
+            );
+        },
+    );
+}
+
+/// The gate is decided again at an installation change (design.md
+/// "beatoraja Lua Skins", the result skin): attempt 1, with nothing charged
+/// beside play, packs the kept probe; a selection then committed past the
+/// gate's room closes it, and attempt 2 drops the kept probe and packs the
+/// plain one rather than reuse it.
+#[test]
+fn a_selection_past_the_room_closes_the_gate() {
+    let _serial = imports::serial();
+    let (dir, l) = chart(Some(RED));
+    let (_skin, p, kept, plain) = kept_only_skin();
+    let sel = bundle();
+    on_warp_charged(
+        l.chart(),
+        false,
+        bundle(),
+        vec![(Arc::clone(&sel), MENUS)],
+        |rig, seen| {
+            rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+            prepared(rig, &l);
+            let (first, texels) = uploaded(rig);
+            assert_eq!(texels, kept, "attempt 1's kept probe");
+            let drawn = shown(rig, seen, dir.path(), |_, m| near(m, MARK));
+            assert!(drawn.is_some_and(|[_, m]| near(m, MARK)), "{drawn:?}");
+            assert_eq!(
+                rig.render
+                    .select(ScreenKind::Selection, Some(sel))
+                    .wait()
+                    .unwrap(),
+                Preparation::Ready
+            );
+            assert_eq!(rig.render.result_status().menus, MENUS);
+            prepared(rig, &l);
+            let (second, texels) = uploaded(rig);
+            assert_eq!(texels, plain, "attempt 2's plain probe");
+            assert_ne!(second, first, "the kept probe not reused");
+        },
+    );
 }
 
 /// A pending skin reading 191 with the
