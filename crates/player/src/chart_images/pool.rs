@@ -2,16 +2,20 @@
 //! pool's slots (design.md "Rendering and Skins", chart images), on the
 //! game thread.
 //!
-//! - **Entries** ([`Entries`]): every cursor row read, resident in a slot
+//! - **Entries** ([`Entries`]): every row read (the cursor's, or a
+//!   neighbour the fill read), resident in a slot
 //!   or absent, with the version of its read, the bindings it was read
 //!   from and the uses its checks validated. Resident and absent entries
 //!   share one least-recently-used bound of [`MAX_ENTRIES`] entries and
 //!   [`MAX_ENTRY_BYTES`] of accounted heap bytes, each entry charged its
 //!   own when inserted.
 //! - **Slots** ([`Slots`]): one live pool generation's slots, each free,
-//!   being written or resident, with its recency. A slot is chosen for a
-//!   write only when no pin holds it: a free one first, else the least
-//!   recently used resident one, whose entry the caller drops.
+//!   being written or resident, with its recency and the last rest that
+//!   filled, showed or kept it. A slot is chosen for a write only when no
+//!   pin holds it: a free one first, else the least recently used resident
+//!   one, whose entry the caller drops; for the fill, never one of the
+//!   current rest's, so a rest's fill stops rather than evict what it
+//!   filled ([`Slots::admit_within`]).
 
 use skin_model::chart_image::Binding;
 
@@ -196,11 +200,20 @@ pub enum SlotState {
     Resident { version: u64 },
 }
 
+/// One slot: what it holds, when it was last used, and the last rest (a
+/// cursor generation) that filled, showed or kept it.
+#[derive(Clone, Copy, Debug)]
+struct Slot {
+    state: SlotState,
+    recency: u64,
+    rest: u64,
+}
+
 /// The live pool generation's slots.
 #[derive(Debug)]
 pub(super) struct Slots {
     layout: render::PoolLayout,
-    slots: Vec<(SlotState, u64)>,
+    slots: Vec<Slot>,
     clock: u64,
 }
 
@@ -209,7 +222,14 @@ impl Slots {
     pub(super) fn new(layout: render::PoolLayout) -> Self {
         Self {
             layout,
-            slots: vec![(SlotState::Free, 0); usize::from(layout.slots)],
+            slots: vec![
+                Slot {
+                    state: SlotState::Free,
+                    recency: 0,
+                    rest: 0,
+                };
+                usize::from(layout.slots)
+            ],
             clock: 0,
         }
     }
@@ -223,40 +243,67 @@ impl Slots {
     /// held, which the caller drops. `None` when every slot is pinned or
     /// being written.
     pub(super) fn admit(&self, pins: [Option<u16>; 2]) -> Option<(u16, Option<u64>)> {
-        let open = (0_u16..).zip(&self.slots).filter(|(i, (s, _))| {
-            !pins.contains(&Some(*i)) && !matches!(s, SlotState::Writing { .. })
+        self.admit_where(pins, |_| true)
+    }
+
+    /// A slot for a neighbour's write in rest `rest` (design.md
+    /// "Rendering and Skins", chart images): as [`admit`](Self::admit),
+    /// but never a slot filled, shown or kept during that rest, so the
+    /// fill stops once the pool holds nothing else.
+    pub(super) fn admit_within(
+        &self,
+        pins: [Option<u16>; 2],
+        rest: u64,
+    ) -> Option<(u16, Option<u64>)> {
+        self.admit_where(pins, |s| s.rest != rest)
+    }
+
+    fn admit_where(
+        &self,
+        pins: [Option<u16>; 2],
+        evictable: impl Fn(&Slot) -> bool,
+    ) -> Option<(u16, Option<u64>)> {
+        let open = (0_u16..).zip(&self.slots).filter(|(i, s)| {
+            !pins.contains(&Some(*i)) && !matches!(s.state, SlotState::Writing { .. })
         });
         let mut best: Option<(u16, Option<u64>, u64)> = None;
-        for (i, &(state, recency)) in open {
+        for (i, slot) in open {
+            let (state, recency) = (slot.state, slot.recency);
             match state {
                 SlotState::Free => return Some((i, None)),
-                SlotState::Resident { version } => {
+                SlotState::Resident { version } if evictable(slot) => {
                     if best.is_none_or(|(_, _, r)| recency < r) {
                         best = Some((i, Some(version), recency));
                     }
                 }
-                SlotState::Writing { .. } => {}
+                SlotState::Resident { .. } | SlotState::Writing { .. } => {}
             }
         }
         best.map(|(i, v, _)| (i, v))
     }
 
-    /// Sets slot `slot`'s state; a write or a residency makes it the most
-    /// recently used.
-    pub(super) fn set(&mut self, slot: u16, state: SlotState) {
+    /// Sets slot `slot`'s state in rest `rest`; a write or a residency
+    /// makes it the most recently used, and that rest's.
+    pub(super) fn set(&mut self, slot: u16, state: SlotState, rest: u64) {
         self.clock += 1;
         let now = self.clock;
         if let Some(s) = self.slots.get_mut(usize::from(slot)) {
-            *s = (state, if state == SlotState::Free { s.1 } else { now });
+            s.state = state;
+            if state != SlotState::Free {
+                s.recency = now;
+                s.rest = rest;
+            }
         }
     }
 
-    /// Slot `slot` was carried by an update sent: the most recently used.
-    pub(super) fn touch(&mut self, slot: u16) {
+    /// Slot `slot` was carried by an update sent, or kept by the fill, in
+    /// rest `rest`: the most recently used, and that rest's.
+    pub(super) fn touch(&mut self, slot: u16, rest: u64) {
         self.clock += 1;
         let now = self.clock;
         if let Some(s) = self.slots.get_mut(usize::from(slot)) {
-            s.1 = now;
+            s.recency = now;
+            s.rest = rest;
         }
     }
 
@@ -264,16 +311,16 @@ impl Slots {
     /// resident): no later write's slot is freed by an earlier read.
     pub(super) fn free(&mut self, slot: u16, version: u64) {
         if let Some(s) = self.slots.get_mut(usize::from(slot))
-            && matches!(s.0, SlotState::Writing { version: v } | SlotState::Resident { version: v } if v == version)
+            && matches!(s.state, SlotState::Writing { version: v } | SlotState::Resident { version: v } if v == version)
         {
-            s.0 = SlotState::Free;
+            s.state = SlotState::Free;
         }
     }
 
     /// Every slot's state (tests).
     #[cfg(test)]
     pub(super) fn states(&self) -> Vec<SlotState> {
-        self.slots.iter().map(|(s, _)| *s).collect()
+        self.slots.iter().map(|s| s.state).collect()
     }
 }
 
@@ -412,13 +459,13 @@ mod tests {
     fn a_slot_is_free_first_then_least_recent_and_never_pinned() {
         let mut s = Slots::new(layout(3));
         assert_eq!(s.admit([None, None]), Some((0, None)));
-        s.set(0, SlotState::Resident { version: 10 });
+        s.set(0, SlotState::Resident { version: 10 }, 1);
         assert_eq!(s.admit([Some(1), None]), Some((2, None)));
-        s.set(1, SlotState::Resident { version: 11 });
-        s.set(2, SlotState::Writing { version: 12 });
+        s.set(1, SlotState::Resident { version: 11 }, 1);
+        s.set(2, SlotState::Writing { version: 12 }, 1);
         // 0 is the least recent.
         assert_eq!(s.admit([None, None]), Some((0, Some(10))));
-        s.touch(0);
+        s.touch(0, 1);
         assert_eq!(s.admit([None, None]), Some((1, Some(11))));
         assert_eq!(s.admit([Some(1), Some(0)]), None);
         // An earlier read frees nothing of a later one.
@@ -426,5 +473,31 @@ mod tests {
         assert_eq!(s.states()[2], SlotState::Writing { version: 12 });
         s.free(2, 12);
         assert_eq!(s.admit([None, None]), Some((2, None)));
+    }
+
+    /// A neighbour takes a free slot, else the least recently used one not
+    /// filled, shown or kept during its rest; with every slot that rest's,
+    /// none, while the cursor's row is still admitted (AC-S8).
+    #[test]
+    fn a_neighbour_never_evicts_its_own_rests_slots() {
+        let mut s = Slots::new(layout(3));
+        // Rest 1 fills slots 0 and 1; slot 2 is free.
+        s.set(0, SlotState::Resident { version: 1 }, 1);
+        s.set(1, SlotState::Resident { version: 2 }, 1);
+        assert_eq!(s.admit_within([None, None], 1), Some((2, None)));
+        s.set(2, SlotState::Resident { version: 3 }, 1);
+        assert_eq!(s.admit_within([None, None], 1), None, "rest 1's own");
+        assert_eq!(s.admit([None, None]), Some((0, Some(1))), "the cursor");
+        // Rest 2 keeps slot 1 (a resident row of its window): a neighbour
+        // evicts the least recent of the others, never slot 1.
+        s.touch(1, 2);
+        assert_eq!(s.admit_within([None, None], 2), Some((0, Some(1))));
+        s.set(0, SlotState::Resident { version: 4 }, 2);
+        assert_eq!(s.admit_within([None, None], 2), Some((2, Some(3))));
+        s.set(2, SlotState::Resident { version: 5 }, 2);
+        assert_eq!(s.admit_within([None, None], 2), None);
+        // A pin holds even a slot of an earlier rest.
+        assert_eq!(s.admit_within([Some(0), Some(2)], 3), Some((1, Some(2))));
+        assert_eq!(s.admit_within([Some(0), Some(1)], 3), Some((2, Some(5))));
     }
 }

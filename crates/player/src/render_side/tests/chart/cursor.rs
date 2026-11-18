@@ -104,8 +104,10 @@ impl Cursor {
 
     /// The cursor rests on the row it is on, `dir` naming `names`.
     fn rest(&self, dir: &Path, names: [Name; 2]) {
-        self.w
-            .rest(self.w.cursor_request(dir.to_path_buf(), names, &self.coord));
+        self.w.rest(
+            self.w
+                .cursor_request(dir.to_path_buf(), names, Vec::new(), &self.coord),
+        );
     }
 
     /// [`on`](Self::on), then [`rest`](Self::rest).
@@ -1277,3 +1279,5 @@ fn the_end_drops_a_deferred_cursor_request() {
     assert_eq!(c.w.begun(), begun, "a job began after the end");
     assert_eq!(c.w.entries(), 0);
 }
+
+mod fill;

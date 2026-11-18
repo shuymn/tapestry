@@ -446,6 +446,88 @@ fn selection_frame_alloc() {
     );
 }
 
+/// A skinned selection frame while the fill writes the rows near the
+/// cursor into the pool (design.md "Rendering and Skins", chart images;
+/// AC-S11): between frames, each frame boundary writes one neighbour's
+/// cell pair into the next slot, as the render thread applies the fill's
+/// writes, and each frame draws a row resident in a slot just written,
+/// its table read from the pool. The frame's build (design.md "Scope of
+/// No Allocation") allocates nothing; the writes are outside the count.
+/// An allocation put into that work (the probe) is counted.
+#[test]
+fn selection_frame_during_fill_alloc() {
+    let _warp = crate::warp_turn::take();
+    let (_dir, mut screen, mut logic, _) = skinned_with(
+        warp(),
+        crate::selection_skin::chart_fixture(),
+        "chart.luaskin",
+    );
+    let pool = screen.pool().expect("the selection skin has a pool");
+    let mut feed = SkinFeed::default();
+    feed.enter(TimeUs(0));
+    let s = searching("abc", "かな");
+    let u = update(&mut feed, &s, 0);
+    let counted = |f: &mut dyn FnMut()| {
+        let before = crate::alloc_count::this_thread();
+        f();
+        crate::alloc_count::this_thread() - before
+    };
+    let build = |screen: &mut MenuScreen, logic: &mut SelectionLogic, slot: u16, k: i64| {
+        let table = screen.pool_table(pool.generation, slot);
+        assert!(table.is_some(), "slot {slot} not resident");
+        let n = counted(&mut || {
+            logic.sel.set_chart_images(table);
+            logic.sel.write_chart_fields();
+            screen
+                .build_selection_frame(&u, logic, TimeUs(k * 16_667), app(k))
+                .unwrap();
+        });
+        screen.renderer.submit_selection(&[]).unwrap();
+        n
+    };
+    screen
+        .prepare_selection(&u, &mut logic, true)
+        .unwrap()
+        .unwrap();
+    // The cursor's row in slot 0, then one neighbour per boundary.
+    let fill = |screen: &mut MenuScreen, slot: u16| {
+        let shade = u8::try_from(slot * 20 % 200).unwrap();
+        let (_images, set) = crate::selection_skin::selection_images(
+            pool.cells,
+            [shade, 10, 10],
+            Some([10, shade, 10]),
+        );
+        let [stage, _, banner] = set.fitted();
+        screen
+            .write_pool_slot(pool.generation, slot, [stage, banner])
+            .unwrap();
+    };
+    fill(&mut screen, 0);
+    assert_eq!(build(&mut screen, &mut logic, 0, 0), 0, "the cursor's row");
+    let slots = pool.slots.min(9);
+    assert!(slots > 1, "a pool of {} slots", pool.slots);
+    let mut k = 1;
+    for slot in 1..slots {
+        fill(&mut screen, slot);
+        for drawn in [slot, 0] {
+            assert_eq!(
+                build(&mut screen, &mut logic, drawn, k),
+                0,
+                "{slot}/{drawn}"
+            );
+            let q = screen.renderer.selection_quads().unwrap();
+            assert!(
+                has(&q, crate::selection_skin::STAGE_DST, Some(true)),
+                "{slot}/{drawn}"
+            );
+            k += 1;
+        }
+    }
+    // The positive control: the same work with an allocation in it.
+    screen.alloc_probe = true;
+    assert!(build(&mut screen, &mut logic, 0, k) > 0);
+}
+
 /// A list shorter than the song list's slots fills every slot around the
 /// cursor on the list's ring: the selected placement (x 1010) at the
 /// center slot only, the unselected one (x 1000) elsewhere, the copies of
