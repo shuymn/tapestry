@@ -73,6 +73,9 @@ pub struct Occurrence {
 pub struct LoweredRecord {
     pub src: String,
     pub guards: Vec<&'static str>,
+    /// A text value's folded string before the widget cleans it: what the
+    /// replay compares with the closure's string.
+    pub literal: Option<String>,
 }
 
 /// What a production import recorded besides its outcome.
@@ -174,6 +177,7 @@ pub(super) fn record(arena: &Arena, an: &Analysis) {
                 lowered: c.lowered.as_ref().map(|l| LoweredRecord {
                     src: l.src.clone(),
                     guards: l.guards.clone(),
+                    literal: l.literal.clone(),
                 }),
                 file: at.file,
                 line: at.line,

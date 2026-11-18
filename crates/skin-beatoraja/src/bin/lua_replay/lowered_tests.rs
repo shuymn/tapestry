@@ -135,7 +135,7 @@ fn a_lowered_record_carries_its_expression() {
 }
 
 /// L2: a lowered `draw`, an unguarded one and one whose guard is false on
-/// every frame (the chart's total, unknown to the harness), agrees.
+/// every frame (the difference from the best, which no replay has), agrees.
 #[test]
 fn a_lowered_draw_agrees() {
     let body = format!(
@@ -148,7 +148,7 @@ fn a_lowered_draw_agrees() {
         dst(
             "\"i\"",
             100,
-            "draw = function() return ms.number(368) > 0 end,"
+            "draw = function() return ms.number(152) > 0 end,"
         )
     );
     let r = run_with(&body, &options(Script::full()));
@@ -180,7 +180,7 @@ fn a_lowered_op_keeps_its_index() {
 fn a_guarded_value_is_unavailable() {
     let body = format!(
         "{VALUES}{}",
-        number("m", "function() return ms.number(368) end", 0)
+        number("m", "function() return ms.number(152) end", 0)
     );
     let r = run_with(&body, &options(Script::full()));
     assert!(r.passes(), "{}", r.text(0, true, true));
@@ -224,7 +224,7 @@ fn lowered_values_convert_as_the_source() {
 fn a_lowered_selector_agrees() {
     let body = "skin.imageset = {\n\
            { id = \"s\", images = { \"i\", \"j\" }, value = function() return ms.gauge_type() end },\n\
-           { id = \"t\", images = { \"i\", \"j\" }, value = function() return ms.number(368) end } }\n"
+           { id = \"t\", images = { \"i\", \"j\" }, value = function() return ms.number(152) end } }\n"
         .to_owned()
         + &dst("\"s\"", 0, "")
         + &dst("\"t\"", 100, "");

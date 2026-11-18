@@ -10,7 +10,7 @@ use skin_beatoraja::lua::replay::{LoweredRecord, Occurrence};
 use skin_beatoraja::lua::survey::Became;
 use skin_model::present::trace::{Converted, Event, Skip};
 use skin_model::present::{Fail, Val};
-use skin_model::{MAX_KEY_US, PLAY, Program, Scope, State, Ty, compile};
+use skin_model::{MAX_KEY_US, MAX_TEXT_BYTES, PLAY, Program, Scope, State, Ty, compile};
 
 use super::{FrameKind, ProductionRun, last_records};
 use crate::isolation::{Entry, same_file};
@@ -162,6 +162,87 @@ fn differ(field: &str, prod: (Result<Val, Fail>, Converted), refo: Outcome) -> O
     match converted(field, refo) {
         Some(c) if c == conv => None,
         c => Some(format!("converted: production {conv:?}, reference {c:?}")),
+    }
+}
+
+/// What an intended difference from the source is counted under: a
+/// text's string where the reference VM writes a whole float as `N.0`,
+/// which the source's VM writes `N` (design.md "beatoraja Lua Skins", the
+/// reference executor).
+pub const TEXT_SPELLED: &str = "text number spelled by the reference VM";
+
+/// The bucket of a text occurrence whose value the import did not fold
+/// to a literal: not compared.
+pub const NOT_FOLDED: &str = "text not folded to a literal";
+
+/// The widget's rule for a literal, restated so the comparator checks the
+/// text the player receives: control characters (C0, DEL, C1) dropped,
+/// cut at a character boundary to [`MAX_TEXT_BYTES`].
+pub(crate) fn clean(s: &str) -> String {
+    let mut out = String::with_capacity(s.len().min(MAX_TEXT_BYTES));
+    for c in s.chars().filter(|c| !c.is_control()) {
+        if out.len() + c.len_utf8() > MAX_TEXT_BYTES {
+            break;
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// `s` with each whole float the reference VM writes as `N.0` written
+/// `N`: a digit, `.0`, then no digit. It is textual, so a skin's own
+/// literal `N.0` loses its `.0` too.
+pub(crate) fn respell(s: &str) -> String {
+    let b = s.as_bytes();
+    let digit = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
+    let mut out = String::with_capacity(s.len());
+    let (mut from, mut i) = (0, 1);
+    while i + 1 < b.len() {
+        if b.get(i) == Some(&b'.') && b.get(i + 1) == Some(&b'0') && digit(i - 1) && !digit(i + 2) {
+            out.push_str(s.get(from..i).unwrap_or_default());
+            from = i + 2;
+            i += 2;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(s.get(from..).unwrap_or_default());
+    out
+}
+
+/// A text's folded literal `p` against the reference's outcome: both
+/// cleaned, the reference's string respelled before it is cleaned, so a
+/// cut falls where production's does. `Ok(true)` when they agree only
+/// through the respelling; `Err` with the finding and, for two strings,
+/// the strings (printed only under `--local`).
+fn text_differ(p: &str, refo: Outcome) -> Result<bool, (String, Option<String>)> {
+    let p = clean(p);
+    match refo {
+        Outcome::Value(Raw::Text(r)) => {
+            if p == clean(r) {
+                return Ok(false);
+            }
+            let r = clean(&respell(r));
+            if p == r {
+                Ok(true)
+            } else {
+                Err((
+                    "text: production and reference differ".into(),
+                    Some(format!("production `{p}`, reference `{r}`")),
+                ))
+            }
+        }
+        Outcome::Value(r) => Err((format!("text: the reference returned {r:?}"), None)),
+        Outcome::Error => Err((
+            "text: a Lua error where production has a literal".into(),
+            None,
+        )),
+        Outcome::Unavailable => Err((
+            "text: the reference unavailable where production has a literal".into(),
+            None,
+        )),
+        Outcome::Unanswered(api) => Err((format!("reference could not complete ({api})"), None)),
+        Outcome::Budget => Err(("reference could not complete (budget)".into(), None)),
     }
 }
 
@@ -762,8 +843,11 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
             frame,
             place: places.get(frame).cloned().unwrap_or_default(),
             what,
+            detail: None,
         });
     };
+    // Text findings with their strings, added after the frames.
+    let mut text_findings: Vec<(Key, usize, String, Option<String>)> = Vec::new();
     for (i, r) in run.rounds.iter().enumerate() {
         rep.rounds.push(format!(
             "round {}{}",
@@ -946,6 +1030,13 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                 for occ in cat.iter().flatten() {
                     let key = occ.key;
                     rep.points += 1;
+                    // A text's string is compared on play frames only.
+                    if obs.texts.contains(&key) {
+                        if matches!(occ.first, Point::Ran { .. }) {
+                            *rep.buckets.entry(bucket.clone()).or_default() += 1;
+                        }
+                        continue;
+                    }
                     match observer(key, occ, i, label) {
                         None => {}
                         Some(ObsCheck::Agreed) => continue,
@@ -1040,6 +1131,40 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                         find(key, i, what);
                         continue;
                     }
+                }
+                // A text's value: the literal the import folded against
+                // the closure's string. A recorded text not folded to a
+                // literal is counted, never compiled or compared; one with
+                // no record is explained by its destination's (dropped,
+                // folded, ignored) or is a finding.
+                if obs.texts.contains(&key) {
+                    let Some(outcome) = call else {
+                        continue;
+                    };
+                    let Some(rec) = cx.rec(&key) else {
+                        match cx.attribute(&key) {
+                            Some(b) => *rep.buckets.entry(b).or_default() += 1,
+                            None => find(key, i, "no production record of this occurrence".into()),
+                        }
+                        continue;
+                    };
+                    let literal = rec.lowered.as_ref().and_then(|l| l.literal.as_deref());
+                    let Some(p) = literal else {
+                        *rep.buckets.entry(NOT_FOLDED.into()).or_default() += 1;
+                        continue;
+                    };
+                    rep.matched += 1;
+                    match text_differ(p, outcome) {
+                        Ok(spelled) => {
+                            rep.agreed += 1;
+                            *rep.texts.entry(label).or_default() += 1;
+                            if spelled {
+                                *rep.intended.entry(TEXT_SPELLED).or_default() += 1;
+                            }
+                        }
+                        Err((what, detail)) => text_findings.push((key, i, what, detail)),
+                    }
+                    continue;
                 }
                 let lowered_rec = cx
                     .rec(&key)
@@ -1307,6 +1432,16 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
             };
             find(key, 0, "observer: never compared".into());
         }
+    }
+    for (key, frame, what, detail) in text_findings {
+        findings.push(Finding {
+            key,
+            site: site(&key),
+            frame,
+            place: places.get(frame).cloned().unwrap_or_default(),
+            what,
+            detail,
+        });
     }
     rep.observers = observers_agreed;
     rep.observer_offsets = observer_offsets;

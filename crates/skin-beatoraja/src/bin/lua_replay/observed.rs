@@ -26,6 +26,8 @@ pub enum Raw {
     Float(f64),
     /// A string, table, function or other value no program holds.
     Other(&'static str),
+    /// A text's string.
+    Text(&'static str),
 }
 
 /// What one invocation came to.
@@ -130,6 +132,9 @@ pub struct Observed {
     /// Each installed object's consumers, in schedule order: the
     /// occurrences each frame must give exactly one first point each.
     pub installed: Vec<Vec<Key>>,
+    /// The value occurrences of texts, whose string is compared with the
+    /// literal the import folded.
+    pub texts: std::collections::BTreeSet<Key>,
 }
 
 /// `s` with a static lifetime, each distinct one leaked once (an object

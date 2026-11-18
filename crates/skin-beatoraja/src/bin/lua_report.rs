@@ -1050,6 +1050,7 @@ skin.destination = {
             src: src.to_owned(),
             guards: guards.to_vec(),
             constant,
+            literal: None,
         })
     }
 
