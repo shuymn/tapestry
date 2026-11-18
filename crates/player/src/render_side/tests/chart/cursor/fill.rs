@@ -495,7 +495,8 @@ fn a_neighbour_never_evicts_an_entry_its_rest_keeps() {
 
 /// A check that withdraws the cursor's entry while a neighbour is read
 /// stops that read; no neighbour begins until the cursor's read is asked
-/// again, and the stopped row is read after the cursor's (AC-S8).
+/// again, and the request asked again reads the stopped row after the
+/// cursor's (AC-S8).
 #[test]
 fn a_withdrawn_cursor_row_is_read_again_before_its_neighbours() {
     let _serial = crate::imports::tests::serial();

@@ -1288,7 +1288,7 @@ impl ChartImageWorker {
             return;
         }
         if c.asked.is_some() && c.asked == c.cursor_row {
-            c.stop_fill_read(&|r| neighbours.contains(r), false);
+            c.stop_fill_read(&|r| neighbours.contains(r));
             c.fill = Some(Fill {
                 cursor_generation: c.cursor_generation,
                 rows: neighbours.into(),
@@ -2367,14 +2367,13 @@ impl Core {
             self.changed = true;
             self.rearm = true;
             // The cursor's row goes first: a neighbour in flight is
-            // stopped and read again after it.
-            self.stop_fill_read(&|_| false, true);
+            // stopped; the request asked again brings the fill's rows.
+            self.stop_fill_read(&|_| false);
         }
     }
 
-    /// Stops the fill's read in flight unless `keep` keeps its row; with
-    /// `requeue`, a stopped row goes back to the front of the fill.
-    fn stop_fill_read(&mut self, keep: &dyn Fn(&CursorId) -> bool, requeue: bool) {
+    /// Stops the fill's read in flight unless `keep` keeps its row.
+    fn stop_fill_read(&mut self, keep: &dyn Fn(&CursorId) -> bool) {
         let Some(Job {
             target: Target::Cursor {
                 id, fill: Some(_), ..
@@ -2388,9 +2387,6 @@ impl Core {
             return;
         }
         job.stop();
-        if requeue && let Some(f) = self.fill.as_mut() {
-            f.rows.push_front(id.clone());
-        }
     }
 
     /// The slots a pin holds now: the newest update sent, and the one the
