@@ -5,11 +5,15 @@
 //!
 //! The tests that interleave a reader and a writer hold the two threads at
 //! a meeting point: one of them asks the ring for a chosen run of words,
-//! and waits there while the other acts.
+//! and waits there while the other acts. Neither waits forever: the test
+//! fails at once when that thread finishes without asking for those words,
+//! and the stopped thread goes on when the test's thread lets it go or
+//! unwinds.
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Barrier, Mutex, PoisonError};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::thread;
+use std::time::Duration;
 
 use skin_model::media::{
     CHUNK_WORDS, Fault, Frame, Geometry, HEADER_WORDS, Poll, Reader, Refused, SLOT_HEADER_WORDS,
@@ -95,14 +99,102 @@ const STAMP: usize = 3;
 const INDEX: usize = 4;
 const BYTES: usize = 5;
 
+/// How long a thread waits at a meeting point before the test fails: far
+/// beyond any wait of a run that passes, so it ends only a thread that is
+/// stuck. `TAPESTRY_TEST_WATCHDOG` (seconds) overrides it, as in the
+/// game's tests.
+fn watchdog() -> Duration {
+    let secs = std::env::var("TAPESTRY_TEST_WATCHDOG").ok();
+    Duration::from_secs(secs.and_then(|s| s.parse().ok()).unwrap_or(600))
+}
+
+/// Where a thread that asks a [`Watched`] ring for its chosen words stops
+/// while the test's thread acts.
+#[derive(Default)]
+struct Meeting {
+    state: Mutex<Met>,
+    changed: Condvar,
+}
+
+#[derive(Default)]
+struct Met {
+    arrived: bool,
+    released: bool,
+    finished: bool,
+}
+
+impl Meeting {
+    fn lock(&self) -> MutexGuard<'_, Met> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn set(&self, f: impl FnOnce(&mut Met)) {
+        f(&mut self.lock());
+        self.changed.notify_all();
+    }
+
+    /// The stopped thread's side: waits there until the test's thread lets
+    /// it go.
+    fn stop(&self) {
+        self.set(|m| m.arrived = true);
+        let (met, waited) = self
+            .changed
+            .wait_timeout_while(self.lock(), watchdog(), |m| !m.released)
+            .unwrap_or_else(PoisonError::into_inner);
+        drop(met);
+        assert!(
+            !waited.timed_out(),
+            "the test's thread never let the stopped thread go"
+        );
+    }
+
+    /// The test's side: waits until the other thread stops there, failing
+    /// at once if it finished without stopping; the returned guard lets it
+    /// go when it drops, unwinding included.
+    #[track_caller]
+    fn meet(&self) -> Release<'_> {
+        let (met, _) = self
+            .changed
+            .wait_timeout_while(self.lock(), watchdog(), |m| !m.arrived && !m.finished)
+            .unwrap_or_else(PoisonError::into_inner);
+        let (arrived, finished) = (met.arrived, met.finished);
+        drop(met);
+        assert!(
+            arrived,
+            "the other thread {} without asking for the meeting point's words",
+            if finished { "finished" } else { "stalled" }
+        );
+        Release(self)
+    }
+}
+
+/// Marks a [`Meeting`]'s other thread finished when it drops, whether
+/// that thread's work returned or unwound.
+struct Done<'a>(&'a Meeting);
+
+impl Drop for Done<'_> {
+    fn drop(&mut self) {
+        self.0.set(|m| m.finished = true);
+    }
+}
+
+/// Lets a [`Meeting`]'s stopped thread go when it drops.
+struct Release<'a>(&'a Meeting);
+
+impl Drop for Release<'_> {
+    fn drop(&mut self) {
+        self.0.set(|m| m.released = true);
+    }
+}
+
 /// A ring's memory seen through the requests made of it: each one is
-/// logged, and the one for `stop`'s words (asked for once) waits at its
-/// barrier twice, on arriving and before going on, so the other thread can
-/// act in between.
+/// logged, and the one for `stop`'s words (asked for once) stops at its
+/// meeting point until the test's thread lets it go, so that thread can act
+/// in between.
 struct Watched<'a> {
     ring: &'a [AtomicU64],
     log: Mutex<Vec<(usize, usize)>>,
-    stop: Option<((usize, usize), &'a Barrier)>,
+    stop: Option<((usize, usize), &'a Meeting)>,
     stopped: AtomicBool,
 }
 
@@ -116,9 +208,9 @@ impl<'a> Watched<'a> {
         }
     }
 
-    fn stopping_at(ring: &'a [AtomicU64], at: (usize, usize), barrier: &'a Barrier) -> Self {
+    fn stopping_at(ring: &'a [AtomicU64], at: (usize, usize), meeting: &'a Meeting) -> Self {
         Self {
-            stop: Some((at, barrier)),
+            stop: Some((at, meeting)),
             ..Self::new(ring)
         }
     }
@@ -134,12 +226,11 @@ impl Words for Watched<'_> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push((start, len));
-        if let Some((at, barrier)) = self.stop
+        if let Some((at, meeting)) = self.stop
             && at == (start, len)
             && !self.stopped.swap(true, Ordering::SeqCst)
         {
-            barrier.wait();
-            barrier.wait();
+            meeting.stop();
         }
         self.ring.words(start, len)
     }
@@ -468,23 +559,24 @@ fn ring_cooperating_writer_never_tears() {
     let mut reader = Reader::new(ring, g, WINDOW).unwrap();
     assert_eq!(publish(ring, 1, 1, 1_000), 0);
     assert_eq!(reader.poll(ring, 1_000).unwrap().staged.unwrap().seq, 1);
-    let barrier = Barrier::new(2);
-    let watched = Watched::stopping_at(ring, copy_chunks(g, 0)[1], &barrier);
+    let meeting = Meeting::default();
+    let watched = Watched::stopping_at(ring, copy_chunks(g, 0)[1], &meeting);
     thread::scope(|s| {
         let writer = s.spawn(|| {
+            let _done = Done(&meeting);
             let w = Writer::attach(&watched).unwrap();
             let slot = w.claim(&watched).unwrap();
             assert_eq!(slot.index(), 0, "the slot frame 1 was taken from");
             w.publish(&watched, slot, &frame(g, 2), 2, 1, 2_000)
         });
-        barrier.wait();
+        let release = meeting.meet();
         assert_eq!(
             reader.poll(ring, 2_000),
             Ok(Poll::default()),
             "a poll while the writer is between its chunks takes nothing"
         );
         assert_whole(&reader, 1);
-        barrier.wait();
+        drop(release);
         writer.join().unwrap().unwrap();
     });
     assert_eq!(reader.poll(ring, 2_000).unwrap().staged.unwrap().seq, 2);
@@ -497,14 +589,15 @@ fn ring_cooperating_writer_never_tears() {
     let ring = &*mem;
     let mut reader = Reader::new(ring, g, WINDOW).unwrap();
     assert_eq!(publish(ring, 1, 1, 1_000), 0);
-    let barrier = Barrier::new(2);
-    let watched = Watched::stopping_at(ring, copy_chunks(g, 0)[1], &barrier);
+    let meeting = Meeting::default();
+    let watched = Watched::stopping_at(ring, copy_chunks(g, 0)[1], &meeting);
     thread::scope(|s| {
         let read = s.spawn(|| {
+            let _done = Done(&meeting);
             let polled = reader.poll(&watched, 1_000);
             (polled, staged_bytes(&reader))
         });
-        barrier.wait();
+        let release = meeting.meet();
         for seq in 2..=SLOTS as u64 {
             assert_ne!(publish(ring, seq, 1, 1_000 * seq as i64), 0);
         }
@@ -512,7 +605,7 @@ fn ring_cooperating_writer_never_tears() {
             Writer::attach(ring).unwrap().claim(ring).is_none(),
             "the slot being copied is not free"
         );
-        barrier.wait();
+        drop(release);
         let (polled, (staged, bytes)) = read.join().unwrap();
         assert_eq!(polled.unwrap().staged, Some(staged));
         assert_eq!(staged.seq, 1);
@@ -559,15 +652,18 @@ fn ring_arbitrary_writer_stays_safe_and_bounded() {
     let ring = &*mem;
     let mut reader = Reader::new(ring, g, WINDOW).unwrap();
     assert_eq!(publish(ring, 1, 1, 1_000), 0);
-    let barrier = Barrier::new(2);
-    let watched = Watched::stopping_at(ring, copy_chunks(g, 0)[1], &barrier);
+    let meeting = Meeting::default();
+    let watched = Watched::stopping_at(ring, copy_chunks(g, 0)[1], &meeting);
     thread::scope(|s| {
-        let read = s.spawn(|| reader.poll(&watched, 1_000));
-        barrier.wait();
+        let read = s.spawn(|| {
+            let _done = Done(&meeting);
+            reader.poll(&watched, 1_000)
+        });
+        let release = meeting.meet();
         for w in &mem[g.frame_start(0)..g.frame_start(0) + g.frame_words()] {
             w.store(scribble, Ordering::Relaxed);
         }
-        barrier.wait();
+        drop(release);
         assert_eq!(read.join().unwrap().unwrap().staged.unwrap().seq, 1);
     });
     assert_bounded(&watched.take_log(), g, 0);
@@ -595,13 +691,16 @@ fn ring_arbitrary_writer_stays_safe_and_bounded() {
         let ring = &*mem;
         let mut reader = Reader::new(ring, g, WINDOW).unwrap();
         assert_eq!(publish(ring, 1, 1, 1_000), 0);
-        let barrier = Barrier::new(2);
-        let watched = Watched::stopping_at(ring, copy_chunks(g, 0)[1], &barrier);
+        let meeting = Meeting::default();
+        let watched = Watched::stopping_at(ring, copy_chunks(g, 0)[1], &meeting);
         thread::scope(|s| {
-            let read = s.spawn(|| reader.poll(&watched, 1_000));
-            barrier.wait();
+            let read = s.spawn(|| {
+                let _done = Done(&meeting);
+                reader.poll(&watched, 1_000)
+            });
+            let release = meeting.meet();
             slot_word(ring, g, 0, i).store(value, Ordering::Relaxed);
-            barrier.wait();
+            drop(release);
             assert_eq!(
                 read.join().unwrap(),
                 Err(Fault::Changed { slot: 0 }),
