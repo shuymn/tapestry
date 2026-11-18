@@ -5,6 +5,7 @@
 
 use skin_beatoraja::lua::facts::Fact;
 use skin_beatoraja::lua::replay::Recorded;
+use skin_beatoraja::lua::survey::Became;
 use skin_model::{ChartText, Layout};
 use tempfile::TempDir;
 
@@ -272,6 +273,53 @@ fn a_folded_text_is_compared_as_the_player_receives_it() {
         }
     }
     assert!(disagree.is_empty(), "cases that disagree: {disagree:?}");
+}
+
+/// `rec` without any text value's occurrence: the import's record of
+/// the text lost, or joined under another key.
+fn unrecorded(rec: &mut Recorded) {
+    rec.occurrences.retain(|o| o.field != "value");
+}
+
+/// A retained text whose value production has no record of is a finding
+/// on every play frame, not a text left unfolded; with its destination
+/// dropped, the destination explains the absence and nothing is found.
+#[test]
+fn a_text_with_no_record_is_found() {
+    let o = options(Script::full());
+    let r = tampered(&[READOUT], &o, unrecorded, |_| {});
+    let text = r.text(0, true, true);
+    assert!(!r.passes(), "{text}");
+    let missing = r
+        .findings
+        .iter()
+        .filter(|f| f.what == "no production record of this occurrence")
+        .count();
+    assert_eq!(missing, play_frames(&r), "{text}");
+    assert_eq!(missing, r.findings.len(), "{text}");
+    assert!(r.texts.is_empty(), "{text}");
+    assert_eq!(r.buckets.get(NOT_FOLDED), None, "{text}");
+    // The destination dropped: its own bucket on every play frame.
+    let r = tampered(
+        &[READOUT],
+        &o,
+        |rec| {
+            unrecorded(rec);
+            for d in &mut rec.destinations {
+                d.became = Became::Dropped;
+            }
+        },
+        |_| {},
+    );
+    let text = r.text(0, true, true);
+    assert!(r.passes(), "{text}");
+    assert!(r.findings.is_empty(), "{text}");
+    assert_eq!(
+        r.buckets.get("dropped").copied(),
+        Some(play_frames(&r)),
+        "{text}"
+    );
+    assert_eq!(r.buckets.get(NOT_FOLDED), None, "{text}");
 }
 
 /// The text findings of `r`, each with its detail.

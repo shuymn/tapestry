@@ -1133,16 +1133,22 @@ pub fn compare(run: &ProductionRun, obs: &Observed, iso: &[Entry]) -> Report {
                     }
                 }
                 // A text's value: the literal the import folded against
-                // the closure's string; a text not folded to a literal is
-                // counted, never compiled or compared.
+                // the closure's string. A recorded text not folded to a
+                // literal is counted, never compiled or compared; one with
+                // no record is explained by its destination's (dropped,
+                // folded, ignored) or is a finding.
                 if obs.texts.contains(&key) {
                     let Some(outcome) = call else {
                         continue;
                     };
-                    let literal = cx
-                        .rec(&key)
-                        .and_then(|o| o.lowered.as_ref())
-                        .and_then(|l| l.literal.as_deref());
+                    let Some(rec) = cx.rec(&key) else {
+                        match cx.attribute(&key) {
+                            Some(b) => *rep.buckets.entry(b).or_default() += 1,
+                            None => find(key, i, "no production record of this occurrence".into()),
+                        }
+                        continue;
+                    };
+                    let literal = rec.lowered.as_ref().and_then(|l| l.literal.as_deref());
                     let Some(p) = literal else {
                         *rep.buckets.entry(NOT_FOLDED.into()).or_default() += 1;
                         continue;
