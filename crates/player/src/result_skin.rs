@@ -305,8 +305,9 @@ pub struct ResultSkin {
     /// dropped at selection's and practice's entry.
     images: Option<HeldImages>,
     /// Whether the probe of a skin reading a result fact is packed from
-    /// its kept import ([`kept_probe_fits`]); else from a plain one.
-    kept: bool,
+    /// its kept import ([`kept_probe_fits`]), else from a plain one; `None`
+    /// until first decided, a plain one meanwhile.
+    kept: Option<bool>,
 }
 
 impl std::fmt::Debug for ResultSkin {
@@ -805,14 +806,14 @@ impl ResultSkin {
 
     /// Whether the kept probe fits, decided from the charges the
     /// renderer last reported ([`kept_probe_fits`]), before each image
-    /// stage, when no job runs. A change drops what was packed or bound
-    /// the other way: the probe's record, the prepared atlas, the kept
-    /// cells, the cached layouts and the publication, whose entry would be
-    /// the next probe's union base, so no later probe or view packs or
-    /// binds cells only the other mode keeps.
+    /// stage, when no job runs. A change of a decision made drops what was
+    /// packed or bound the other way: the probe's record, the prepared
+    /// atlas, the kept cells, the cached layouts and the publication, whose
+    /// entry would be the next probe's union base, so no later probe or
+    /// view packs or binds cells only the other mode keeps. The first
+    /// decision drops nothing.
     pub fn set_kept_probe(&mut self, kept: bool) {
-        if self.kept != kept {
-            self.kept = kept;
+        if self.kept.replace(kept).is_some_and(|was| was != kept) {
             self.probe = None;
             self.image = None;
             self.cells = None;
@@ -1088,7 +1089,7 @@ impl ResultSkin {
         let theirs = Arc::clone(&slot);
         let base = self.shown_entry();
         let others = self.others();
-        let kept = self.kept;
+        let kept = self.kept == Some(true);
         let spawned = imports::spawn_job(move |cancel: &Cancel| -> ImageOut {
             let slot = theirs;
             let o = if permit.is_some() {
