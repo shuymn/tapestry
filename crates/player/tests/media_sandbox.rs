@@ -492,11 +492,25 @@ fn worker_launch_fails_closed() {
         );
         assert_eq!(e.exit, made.then_some(REFUSED), "{step:?}: {e}");
     }
-    // The check finds the lockdown missing, or the AppContainer.
-    for missing in [
-        Restrictions::NO_WIN32K,
-        Restrictions::APP_CONTAINER,
-        Restrictions::JOB,
+    // The check refuses each restriction it reads when it is missing, and
+    // names it: the job, each mitigation policy, the AppContainer, and the
+    // handle list, which left out lets the worker inherit this bait. An
+    // AppContainer turns strict handle checks on by itself, so they are
+    // left out with it.
+    let _bait = bait();
+    for (missing, named) in [
+        (Restrictions::JOB, "job"),
+        (Restrictions::NO_DYNAMIC_CODE, "dynamic code"),
+        (Restrictions::NO_WIN32K, "win32k system calls"),
+        (
+            Restrictions::STRICT_HANDLES.with(Restrictions::APP_CONTAINER),
+            "strict handle checks",
+        ),
+        (Restrictions::IMAGE_LOAD, "image loads"),
+        (Restrictions::NO_EXTENSION_POINTS, "extension points"),
+        (Restrictions::NO_CHILD, "child processes"),
+        (Restrictions::APP_CONTAINER, "AppContainer"),
+        (Restrictions::HANDLE_LIST, "not only the pipe's"),
     ] {
         let setup = recipe().applying(Restrictions::RECIPE.without(missing));
         let Err(e) = stage.launch(&setup) else {
@@ -507,6 +521,7 @@ fn worker_launch_fails_closed() {
             (Step::Check, Some(REFUSED)),
             "{missing:?}: {e}"
         );
+        assert!(e.what.contains(named), "{missing:?}: {e}");
     }
 }
 
