@@ -356,10 +356,14 @@ fn the_profile_draws_the_view_through_the_production_path() {
     );
     // The normal gauge's clear: the source's clear type 5.
     assert_eq!(clear, Some(5));
-    // A folder row: its charts, and no chart, score or lamp.
+    // A folder row: its charts, and no chart, score or lamp; the largest
+    // EX score draws the source's 0 with no score data.
     s.view(&view(vec![folder_row("f", 9)], Some(0), None, None));
     let (numbers, options, clear) = profile_frame(&mut s);
-    assert_eq!(numbers, BTreeMap::from([(300, "9".to_owned())]));
+    assert_eq!(
+        numbers,
+        BTreeMap::from([(72, "0".to_owned()), (300, "9".to_owned())])
+    );
     assert_eq!(options, [1, 50, 624, -2, -51, -625]);
     assert_eq!(clear, None);
     // An unplayed chart: no clear type; a no-play lamp.

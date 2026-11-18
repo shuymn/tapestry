@@ -2356,8 +2356,10 @@ fn a_lowered_selection_read_agrees_with_the_runtime_in_every_record_state() {
 /// has no record, though its chart maximum (200) is known
 /// (`IntegerPropertyFactory.java:126-128` at `0.8.9`): a number of `ref`
 /// 72 draws one 0, and `number(72) == 0` draws, lowered and on the
-/// runtime alike, where `number(72) == 200` does not; once played, with or
-/// without a best, each reads the chart's 200.
+/// runtime alike, where `number(72) == 200` does not; so with no chart
+/// maximum (a chart that draws, or no summary or preset), on a folder row
+/// and with no row, where the source has no score data either; once
+/// played, with or without a best, each reads the chart's 200.
 // Source: SF-020
 #[cfg(feature = "dev-tools")]
 #[test]
@@ -2391,9 +2393,19 @@ fn the_largest_ex_reads_zero_for_a_chart_with_no_record() {
     );
     let mut rt = i.runtime.take().expect("a runtime");
     let mut s = common::selection::Sel::new(i.imported.skin);
-    let states = record_states();
+    let mut states = record_states();
+    let (_, mut no_maximum, floating) = states
+        .iter()
+        .find(|(s, _, _)| *s == "no record")
+        .cloned()
+        .unwrap();
+    no_maximum.selected.as_mut().unwrap().max_ex = None;
+    states.push(("no record, no maximum", no_maximum, floating));
     for (state, want, digits) in [
         ("no record", [true, true, false, false], "0"),
+        ("no record, no maximum", [true, true, false, false], "0"),
+        ("a folder row", [true, true, false, false], "0"),
+        ("no row", [true, true, false, false], "0"),
         ("played, no best", [false, false, true, true], "200"),
         ("a best played", [false, false, true, true], "200"),
     ] {

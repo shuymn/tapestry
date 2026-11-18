@@ -213,7 +213,11 @@ impl SelValue {
     pub(crate) fn availability(self) -> &'static str {
         match self {
             Self::Ex | Self::Bp => "selected.best",
-            Self::MaxEx => "selected.max_ex_valid",
+            // Without a record (a folder row and no row included) it is
+            // the source's 0, whatever the chart maximum; with one, the
+            // chart maximum when known.
+            // Source: SF-020
+            Self::MaxEx => "!selected.played || selected.max_ex_valid",
             Self::Plays | Self::MaxCombo | Self::Clears | Self::Fails | Self::ScoreCount(_) => {
                 "selected.played"
             }
