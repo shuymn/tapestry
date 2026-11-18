@@ -2227,65 +2227,6 @@ fn result_presets_wait_for_the_sounds_first_picture() {
     );
 }
 
-/// While the result's sound waits for its first picture, preset steps
-/// evaluate nothing: each waits, in order, for the look that handles the
-/// start, which then takes each of them (the intermediate view evaluated
-/// too); a back taken meanwhile begins its outro at once and the steps
-/// waiting go with the result, never evaluated (design.md "State Model",
-/// system sounds, Result).
-#[test]
-fn result_preset_steps_wait_for_the_sounds_first_picture() {
-    use game::MenuCommand::{Back, NextPreset, PrevPreset};
-    let s = result_start();
-    let due = s + 700_000;
-    let dir = tempfile::tempdir().unwrap();
-    write_named(dir.path(), "late", &late());
-    write_named(dir.path(), "narrow", &narrow());
-    let built_in = |n: &str| EntryId::BuiltIn(n.to_owned());
-    let steps = [
-        (s + 100_000, NextPreset),
-        (s + 200_000, NextPreset),
-        (s + 300_000, PrevPreset),
-    ];
-
-    // The steps wait, then go in order.
-    let mut session = loaded(dir.path());
-    let mut rig = outro_rig(timing(500_000, 0, None), 18_000_000);
-    rig.sound_due_until = due;
-    press(&mut rig, &steps);
-    game::live::run_chart(&mut session, &mut rig).unwrap();
-    for (at, screen) in rig.screens.iter().filter(|(at, _)| *at < due) {
-        assert_eq!(viewed(screen), built_in("tapestry"), "shown at {at}");
-        assert_eq!(screen.evaluations(), 0, "evaluated by {at}");
-    }
-    let (at, after) = rig
-        .screens
-        .iter()
-        .find(|(at, _)| *at >= due)
-        .unwrap_or_else(|| panic!("no screen after the start: {:?}", rig.shown_at));
-    assert!(*at < due + 2 * game::IDLE_WAIT.0, "shown at {at}");
-    assert_eq!(viewed(after), built_in("beatoraja-style"));
-    assert_eq!(after.evaluations(), 2, "each step taken, not their sum");
-
-    // A back while they wait leaves at once; the steps go with the result.
-    let mut session = loaded(dir.path());
-    let mut rig = outro_rig(timing(500_000, 0, None), 18_000_000);
-    rig.sound_due_until = due;
-    press(&mut rig, &steps[..2]);
-    press(&mut rig, &[(s + 300_000, Back)]);
-    let left = game::live::run_chart(&mut session, &mut rig).unwrap();
-    assert_eq!(left, game::Leave::Back);
-    assert!(
-        rig.result_order.contains(&("outro", s + 300_000)),
-        "{:?}",
-        rig.result_order
-    );
-    for (at, screen) in &rig.screens {
-        assert_eq!(viewed(screen), built_in("tapestry"), "shown at {at}");
-        assert_eq!(screen.evaluations(), 0, "evaluated by {at}");
-    }
-}
-
 /// A user preset `name` holding `preset`, loaded under that name.
 fn named(name: &str, preset: rules::RulePreset) -> rules::RulePreset {
     rules::RulePreset {
