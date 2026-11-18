@@ -425,6 +425,44 @@ fn a_new_pool_generation_stops_the_fill_read_in_flight() {
     assert!(fresh(&at) && near.iter().all(fresh));
 }
 
+/// A neighbour read once and found without images keeps its absent entry:
+/// a later rest's fill passes it by, as it passes a resident row.
+#[test]
+fn an_absent_neighbour_is_not_read_again() {
+    let _serial = crate::imports::tests::serial();
+    let c = cursor_of(8);
+    let (at, other) = (chart([64, 48], [30, 8]), chart([64, 48], [30, 8]));
+    let gone = tempfile::tempdir().unwrap();
+    c.on(at.path(), named());
+    c.rest_with(at.path(), named(), &[&gone]);
+    c.filled();
+    assert_eq!(c.w.begun(), 2);
+    assert!(matches!(
+        c.w.entry(&row(gone.path(), named())).map(|e| e.0),
+        Some(EntryState::Absent)
+    ));
+    c.on(other.path(), named());
+    c.rest_with(other.path(), named(), &[&gone]);
+    c.filled();
+    assert_eq!(c.w.begun(), 3, "only the cursor's row read");
+}
+
+/// A list read again while the cursor's request is deferred replaces the
+/// request's neighbours: the fill reads the new list's rows, not the old.
+#[test]
+fn a_refill_before_the_request_begins_replaces_its_neighbours() {
+    let _serial = crate::imports::tests::serial();
+    let c = cursor_of(8);
+    let (at, near) = (chart([64, 48], [30, 8]), charts(2));
+    c.on(at.path(), named());
+    c.rest_with(at.path(), named(), &[&near[0]]);
+    c.w.refill(vec![row(near[1].path(), named())]);
+    c.filled();
+    assert_eq!(c.w.begun(), 2);
+    assert!(c.slot_of(&near[1]).is_some());
+    assert!(c.w.entry(&row(near[0].path(), named())).is_none());
+}
+
 impl Cursor {
     /// Whether a refused background mode ended the fill for the run.
     fn fill_off(&self) -> bool {
