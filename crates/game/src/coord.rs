@@ -193,6 +193,10 @@ pub enum JobKind {
     /// The chosen chart's stage file and back image read and fitted (its
     /// owned image worker, S10-12).
     ChartImages,
+    /// A selection row's kept chart images checked against their files'
+    /// metadata after a use, reading no image (design.md "Load Pipeline",
+    /// Freshness).
+    ChartCheck,
     /// The chosen chart's BGA pictures read, packed and handed to the
     /// render thread (their owned job, design.md "Rendering and Skins",
     /// BGA).
@@ -294,9 +298,10 @@ pub fn observe_jobs(f: fn(JobKind, bool)) {
 /// job `responsible`, otherwise recoverable; a cancellation is no failure.
 /// One exception: a [`JobKind::ChartImages`] or [`JobKind::BgaImages`]
 /// job's panic is that job's own terminal absence (its images not yet
-/// finished are absent) and never the run's, whatever its owner, as the
-/// chart's images are decorative and the source catches their failures
-/// (S10-12, design C13).
+/// finished are absent), and a [`JobKind::ChartCheck`] job's validates
+/// nothing; none is ever the run's, whatever its owner, as the chart's
+/// images are decorative and the source catches their failures (S10-12,
+/// design C13).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Observed<T> {
     /// How it ended.

@@ -12,10 +12,10 @@ use rules::GaugeValue;
 
 use crate::AppReadouts;
 use crate::atlas::uv::{Cycle, UvTable};
-use crate::atlas::{Atlas, AtlasError, AtlasLimits, KeptLayers, Variant};
+use crate::atlas::{Atlas, AtlasError, AtlasLimits, KeptLayers, MIN_TEXT_SIDE, Variant};
 use crate::bga::BgaStretch;
 use crate::canvas::{Canvas, Fit, MAX_CANVAS, f32_of};
-use crate::chart_image::{ChartImage, ChartStretch, ChartTable};
+use crate::chart_image::{ChartCells, ChartImage, ChartStretch, ChartTable, Slot};
 use crate::decision::schema::timer as decision_timer;
 use crate::decision::{
     DecisionError, DecisionFrame, DecisionLabels, DecisionScreen, DecisionStrings,
@@ -1946,7 +1946,20 @@ impl Ratio {
     fn min(self, o: Self) -> Self {
         if o.gt(self) { self } else { o }
     }
+
+    /// `v` times it, rounded up; `u32::MAX` past it.
+    fn ceil(self, v: u32) -> u32 {
+        let n = u128::from(v).saturating_mul(self.0);
+        match self.1 {
+            0 => u32::MAX,
+            d => u32::try_from(n.div_ceil(d)).unwrap_or(u32::MAX),
+        }
+    }
 }
+
+/// The largest output scale a chart image's pool cell is sized for
+/// ([`Skin::chart_cells`]): past it, images draw upscaled.
+const MAX_CELL_SCALE: Ratio = Ratio(2, 1);
 
 impl Skin {
     /// Loads a skin.
@@ -2948,20 +2961,24 @@ impl Skin {
 
     /// The layers its atlas keeps after its pages: a text layer when it has
     /// rasterized text ([`has_outline_text`](Self::has_outline_text)), and
-    /// a chart layer when it draws a chart's own images
-    /// ([`has_chart_images`](Self::has_chart_images)).
+    /// a chart layer when a play or result skin draws a chart's own images
+    /// ([`has_chart_images`](Self::has_chart_images)). A selection skin's
+    /// images live in its chart-image pool, an array of its own (design.md
+    /// "Rendering and Skins", chart images), so its atlas keeps no chart
+    /// layer.
     #[must_use]
     pub fn kept_layers(&self) -> KeptLayers {
         KeptLayers {
             text: self.has_outline_text(),
-            chart: self.has_chart_images(),
+            chart: self.has_chart_images() && self.kind != ScreenKind::Selection,
         }
     }
 
     /// Whether some element draws one of the chart's own images
     /// ([`Source::ChartImage`]) and its chart layer was not given up
-    /// ([`without_chart_layer`](Self::without_chart_layer)): its
-    /// installation then keeps a chart layer.
+    /// ([`without_chart_layer`](Self::without_chart_layer)): a play or
+    /// result installation then keeps a chart layer, and a selection one
+    /// a chart-image pool.
     #[must_use]
     pub fn has_chart_images(&self) -> bool {
         !self.chart_layer_dropped
@@ -2969,6 +2986,54 @@ impl Skin {
                 .elements
                 .iter()
                 .any(|e| matches!(e.kind, Kind::ChartImage(..)))
+    }
+
+    /// The chart-image pool cells its elements need on a `target`-pixel
+    /// target whose selection atlas has pages of side `side` (design.md
+    /// "Rendering and Skins", chart images). Each image's cell is the
+    /// largest draw its elements can reach at the output scale (the
+    /// canvas scale, at most 2): for an element whose stretch stays
+    /// inside its destination ([`ChartStretch::bounded`]), in `screen`,
+    /// with no fill, binding or native size, its largest key rect, each
+    /// side scaled and rounded up; for any other, the image's slot, whose
+    /// reach depends on a native size unknown here. Each is made a cell
+    /// ([`Slot::cell`]) capped at the image's slot for a side of `side`
+    /// raised to [`MIN_TEXT_SIDE`] ([`ChartImage::slot`]), then the
+    /// widest per axis over the image's elements is kept. An image some
+    /// element draws with [`ChartStretch::Fill`] has its fit fill its cell
+    /// on each axis ([`ChartCells::of`]): that draw stretches it to its
+    /// destination whatever its aspect, which a fit keeping the aspect
+    /// would cover on one axis only. An image no element draws has no
+    /// cell, and the back image never has one. Load-stage work; allocates
+    /// nothing.
+    #[must_use]
+    pub fn chart_cells(&self, target: [u32; 2], side: u32) -> ChartCells {
+        let scale = self.fit(target).0.min(MAX_CELL_SCALE);
+        let side = side.max(MIN_TEXT_SIDE);
+        self.elements.iter().fold(ChartCells::NONE, |cells, e| {
+            let Kind::ChartImage(which, _, stretch) = e.kind else {
+                return cells;
+            };
+            let Some((_, cap)) = which.slot(side) else {
+                return cells;
+            };
+            let rect_bound = stretch.bounded()
+                && e.region == Region::Screen
+                && e.fill == Fill::None
+                && e.bind == Bind::None
+                && e.native.is_none();
+            let reach = if rect_bound {
+                e.track.rects().fold([0, 0], |[rw, rh], [_, _, w, h]| {
+                    [
+                        rw.max(scale.ceil(w.unsigned_abs())),
+                        rh.max(scale.ceil(h.unsigned_abs())),
+                    ]
+                })
+            } else {
+                cap.size()
+            };
+            cells.holding(which, Slot::cell(reach, cap), stretch == ChartStretch::Fill)
+        })
     }
 
     /// Keeps its chart layer only if its atlas of `variant` can hold it

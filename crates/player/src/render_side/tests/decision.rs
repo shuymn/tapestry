@@ -796,6 +796,7 @@ impl Rig {
             strip: StripText::default(),
             events: SelectionEvents::default(),
             settings: None,
+            cursor_chart: crate::chart_currency::CursorChart::Pending,
         });
     }
 
@@ -1980,6 +1981,7 @@ fn selection_frame_during_decision_prep_alloc() {
         strip: StripText::default(),
         events: SelectionEvents::default(),
         settings: None,
+        cursor_chart: crate::chart_currency::CursorChart::Pending,
     };
     let mut k = 0_i64;
     let mut frame = |screen: &mut Direct, changed: bool| {

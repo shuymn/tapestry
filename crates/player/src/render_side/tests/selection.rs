@@ -34,6 +34,7 @@ fn update_of(lifetime: u64, revision: u64, view: SelectionView) -> SelectionUpda
             ..SelectionEvents::default()
         },
         settings: None,
+        cursor_chart: crate::chart_currency::CursorChart::Pending,
     }
 }
 

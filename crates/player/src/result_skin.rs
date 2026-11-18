@@ -1730,6 +1730,6 @@ pub fn view_facts(screen: &game::ResultScreen, chart: ResultChart) -> ViewFacts 
 }
 
 #[cfg(all(test, feature = "dev-tools"))]
-mod chart_tests;
+pub(crate) mod chart_tests;
 #[cfg(all(test, feature = "dev-tools"))]
 pub(crate) mod tests;

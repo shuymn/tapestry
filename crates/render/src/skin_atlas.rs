@@ -58,7 +58,8 @@ pub enum UploadError {
         max: u32,
     },
     /// The pages, the reserved layer and the text layer are more layers than the device's
-    /// arrays hold, or than a sprite's 16-bit layer names.
+    /// arrays hold, or than the 15 bits of a sprite's layer below its pool
+    /// bit name.
     #[error("{layers} layers, past the device's {max}")]
     Layers {
         /// The layers needed, the reserved one included.
@@ -103,6 +104,14 @@ pub fn atlas_limits(device: &wgpu::Device) -> AtlasLimits {
     }
 }
 
+/// The most layers an atlas array has: a sprite names its layer in the 15
+/// bits below the pool bit ([`FLAG_POOL`](crate::sprite::FLAG_POOL)).
+const MAX_ATLAS_LAYERS: u32 = 1 << 15;
+
+// No atlas layer carries the pool bit.
+const _: () = assert!((MAX_ATLAS_LAYERS - 1) & crate::sprite::FLAG_POOL == 0);
+const _: () = assert!(MAX_ATLAS_LAYERS <= crate::sprite::FLAG_POOL);
+
 /// Runs `work` inside out-of-memory and validation error scopes on
 /// `device`, and returns its result with the first error the device
 /// reported meanwhile: validation first, then out of memory.
@@ -141,8 +150,7 @@ pub(crate) fn check_pages(
         .saturating_add(u64::from(RESERVED_LAYERS))
         .saturating_add(u64::from(pages.text_layer))
         .saturating_add(u64::from(pages.chart_layer));
-    // A sprite names its layer in 16 bits.
-    let max_layers = limits.max_texture_array_layers.min(1 << 16);
+    let max_layers = limits.max_texture_array_layers.min(MAX_ATLAS_LAYERS);
     let Some(layer_count) = u32::try_from(layers).ok().filter(|&n| n <= max_layers) else {
         return Err(UploadError::Layers {
             layers,
@@ -505,6 +513,37 @@ mod tests {
                 len: 0,
                 expected: 262_144
             })
+        ));
+    }
+
+    /// However many layers a device's arrays hold, an atlas names at most
+    /// 2^15, below the pool bit of a sprite's layer.
+    #[test]
+    fn layers_stop_below_the_pool_bit() {
+        let empty: PageLevels<'_> = [&[]; MIP_LEVELS];
+        let all = vec![empty; 1 << 15];
+        let limits = wgpu::Limits {
+            max_texture_array_layers: 1 << 16,
+            ..limits()
+        };
+        let pages = |n: usize| AtlasPages {
+            side: 128,
+            pages: &all[..n],
+            text_layer: false,
+            chart_layer: false,
+        };
+        assert!(matches!(
+            check_pages(&pages(1 << 15), &limits),
+            Err(UploadError::Layers {
+                layers: 32_769,
+                max: 32_768
+            })
+        ));
+        // One layer fewer passes the layer check, failing next on the
+        // texels.
+        assert!(matches!(
+            check_pages(&pages((1 << 15) - 1), &limits),
+            Err(UploadError::Texels { .. })
         ));
     }
 
