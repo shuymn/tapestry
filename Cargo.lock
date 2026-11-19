@@ -2435,8 +2435,11 @@ dependencies = [
  "png",
  "proptest",
  "rules",
+ "serde",
+ "sha2",
  "skin-model",
  "tempfile",
+ "toml",
 ]
 
 [[package]]
