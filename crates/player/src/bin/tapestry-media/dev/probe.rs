@@ -39,8 +39,10 @@
 //!   `NtGdiCreateCompatibleDC` (`raw-gdi`) on a fresh thread each; a call
 //!   ran when the thread became a GUI thread and the value is no error
 //!   status.
-//! - `environment`: the worker's environment, every variable as
-//!   `name=value` joined by `;` (`code` their count).
+//! - `environment`: the worker's environment: `code` the count of its
+//!   variables, `allowed=1` when they are exactly the four the launch's
+//!   block leads to, and those four alone as `name=value` joined by `;`.
+//!   Any other variable's name and value stay out of the report.
 //! - `desktop=<hwnd>`: through USER32, the worker's desktop's name
 //!   (`desktop-name`); opens the input desktop (`input-desktop`) and
 //!   `WinSta0` (`winsta0`); counts the top-level windows it sees
@@ -132,12 +134,39 @@ pub fn run(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The worker's environment.
+/// The variables the worker's environment holds, by name (case aside): the
+/// launch's block and what Windows sets from it.
+const EXPECTED: [&str; 4] = ["LOCALAPPDATA", "SystemRoot", "TEMP", "TMP"];
+
+/// The worker's environment, as [`environment_report`] gives it.
 fn environment() {
-    let vars: Vec<String> = std::env::vars_os()
-        .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
-        .collect();
-    report("environment", true, vars.len(), &vars.join(";"));
+    let (count, allowed, detail) = environment_report(std::env::vars_os());
+    report(
+        "environment",
+        true,
+        count,
+        &format!("allowed={} {detail}", u8::from(allowed)),
+    );
+}
+
+/// How many variables `vars` holds, whether they are exactly the expected
+/// ones, and the expected ones alone as `name=value` joined by `;`. No other
+/// variable's name or value is reported: an environment leaked from the
+/// game would otherwise put its values, secrets among them, in the log.
+fn environment_report(
+    vars: impl Iterator<Item = (std::ffi::OsString, std::ffi::OsString)>,
+) -> (usize, bool, String) {
+    let mut count = 0;
+    let mut shown = Vec::new();
+    for (name, value) in vars {
+        count += 1;
+        let name = name.to_string_lossy();
+        if EXPECTED.iter().any(|e| e.eq_ignore_ascii_case(&name)) {
+            shown.push(format!("{name}={}", value.to_string_lossy()));
+        }
+    }
+    let allowed = count == EXPECTED.len() && shown.len() == EXPECTED.len();
+    (count, allowed, shown.join(";"))
 }
 
 /// Reports one probe's result.
@@ -813,4 +842,44 @@ fn event_handle(value: u64) {
     );
     wider("event-wider", value, EVENT_ALL_ACCESS.0);
     wider("event-dac", value, WRITE_DAC);
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+
+    use super::environment_report;
+
+    #[test]
+    fn environment_report_never_shows_an_unexpected_value() {
+        // A synthetic value standing for a secret the game's environment
+        // could hold, under a name the report does not expect.
+        let canary = "canary-6b0d1e";
+        let block = [
+            ("LOCALAPPDATA", r"C:\ac"),
+            ("SystemRoot", r"C:\Windows"),
+            ("TAPESTRY_CANARY", canary),
+            ("TEMP", r"C:\ac\Temp"),
+            ("TMP", r"C:\ac\Temp"),
+        ];
+        let vars = || {
+            block
+                .iter()
+                .map(|(n, v)| (OsString::from(n), OsString::from(v)))
+        };
+        let (count, allowed, detail) = environment_report(vars());
+        assert_eq!((count, allowed), (5, false));
+        assert!(
+            !detail.contains(canary) && !detail.contains("TAPESTRY_CANARY"),
+            "{detail}"
+        );
+        assert_eq!(
+            detail,
+            r"LOCALAPPDATA=C:\ac;SystemRoot=C:\Windows;TEMP=C:\ac\Temp;TMP=C:\ac\Temp"
+        );
+        // The expected four alone are allowed.
+        let (count, allowed, _) =
+            environment_report(vars().filter(|(n, _)| n.as_os_str() != "TAPESTRY_CANARY"));
+        assert_eq!((count, allowed), (4, true));
+    }
 }

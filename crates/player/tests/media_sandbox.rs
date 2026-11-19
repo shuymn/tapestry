@@ -1010,14 +1010,20 @@ fn worker_environment_is_only_the_block_the_launch_builds() {
     assert!(std::env::var_os("PATH").is_some());
     let windows = std::env::var("SystemRoot").unwrap().to_lowercase();
     let detail = environment.detail.to_lowercase();
-    let vars: Vec<(&str, &str)> = detail
+    let (allowed, listed) = detail.split_once(' ').unwrap_or((&detail, ""));
+    let vars: Vec<(&str, &str)> = listed
         .split(';')
         .map(|v| v.split_once('=').unwrap_or((v, "")))
         .collect();
     let names: Vec<&str> = vars.iter().map(|(name, _)| *name).collect();
     assert_eq!(
-        (environment.ok, environment.code, names),
-        (true, 4, vec!["localappdata", "systemroot", "temp", "tmp"]),
+        (environment.ok, environment.code, allowed, names),
+        (
+            true,
+            4,
+            "allowed=1",
+            vec!["localappdata", "systemroot", "temp", "tmp"]
+        ),
         "{log}"
     );
     let folder = vars[0].1;
