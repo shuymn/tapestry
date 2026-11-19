@@ -21,8 +21,8 @@ use std::time::Duration;
 use std::time::Instant;
 
 use media_support::{
-    Kind, Launched, REFUSED, Restrictions, Setup, Stage, Step, media_host, policy, recipe,
-    token_facts,
+    Kind, Launched, REFUSED, Restrictions, Setup, Stage, Step, change_shared, granted_all,
+    media_host, policy, recipe, revoked, token_facts,
 };
 #[cfg(feature = "dev-tools")]
 use media_support::{Probe, probe, probes};
@@ -1213,4 +1213,201 @@ fn worker_job_reads_back_exactly_its_limits() {
             | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
             | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
     );
+}
+
+/// An AppContainer's SID, derived from its name, freed when dropped.
+struct ContainerSid(windows::Win32::Security::PSID);
+
+impl ContainerSid {
+    /// The SID of the AppContainer `name`, which needs no profile.
+    fn named(name: &str) -> Self {
+        let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
+        // SAFETY: a nul-terminated name; the SID returned is freed on drop.
+        let sid = unsafe {
+            windows::Win32::Security::Isolation::DeriveAppContainerSidFromAppContainerName(PCWSTR(
+                name.as_ptr(),
+            ))
+        }
+        .unwrap();
+        Self(sid)
+    }
+
+    /// The SID the worker installed in `dir` runs as.
+    fn of(dir: &std::path::Path) -> Self {
+        Self::named(&media_host::launch::profile_name(dir))
+    }
+}
+
+impl Drop for ContainerSid {
+    fn drop(&mut self) {
+        // SAFETY: a SID the derivation allocated, unused after this.
+        let _ = unsafe { windows::Win32::Security::FreeSid(self.0) };
+    }
+}
+
+/// Whether the DACL of the window object `object` holds an allowed ACE for
+/// `sid`. A read that another process's change makes fail
+/// (`ERROR_INSUFFICIENT_BUFFER`: the DACL grew between the call's two
+/// reads) is made again.
+fn names(object: HANDLE, sid: windows::Win32::Security::PSID) -> bool {
+    use windows::Win32::Foundation::{ERROR_INSUFFICIENT_BUFFER, HLOCAL, LocalFree};
+    use windows::Win32::Security::Authorization::{GetSecurityInfo, SE_WINDOW_OBJECT};
+    use windows::Win32::Security::{
+        ACCESS_ALLOWED_ACE, ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, PSECURITY_DESCRIPTOR,
+    };
+    use windows::Win32::System::SystemServices::ACCESS_ALLOWED_ACE_TYPE;
+
+    for _ in 0..100 {
+        let mut dacl: *mut ACL = std::ptr::null_mut();
+        let mut descriptor = PSECURITY_DESCRIPTOR::default();
+        // SAFETY: a window object this process holds; the descriptor
+        // returned is freed below.
+        let read = unsafe {
+            GetSecurityInfo(
+                object,
+                SE_WINDOW_OBJECT,
+                DACL_SECURITY_INFORMATION,
+                None,
+                None,
+                Some(&raw mut dacl),
+                None,
+                Some(&raw mut descriptor),
+            )
+        };
+        if read == ERROR_INSUFFICIENT_BUFFER {
+            continue;
+        }
+        assert!(read.is_ok(), "the DACL's read: {read:?}");
+        let mut size = ACL_SIZE_INFORMATION::default();
+        // SAFETY: the DACL just read, and a struct of the size given.
+        unsafe {
+            GetAclInformation(
+                dacl,
+                (&raw mut size).cast(),
+                u32::try_from(size_of_val(&size)).unwrap(),
+                AclSizeInformation,
+            )
+        }
+        .unwrap();
+        let found = (0..size.AceCount).any(|i| {
+            let mut ace: *mut std::ffi::c_void = std::ptr::null_mut();
+            // SAFETY: ACE `i` of the DACL, which holds `AceCount` of them.
+            unsafe { GetAce(dacl, i, &raw mut ace) }.unwrap();
+            // SAFETY: each ACE starts with its header; an allowed ACE has
+            // its SID from `SidStart`.
+            unsafe {
+                let header = ace.cast::<ACE_HEADER>().read_unaligned();
+                u32::from(header.AceType) == ACCESS_ALLOWED_ACE_TYPE
+                    && EqualSid(
+                        windows::Win32::Security::PSID(
+                            (&raw mut (*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart).cast(),
+                        ),
+                        sid,
+                    )
+                    .is_ok()
+            }
+        });
+        // SAFETY: the descriptor the read allocated, unused after this.
+        let _ = unsafe { LocalFree(Some(HLOCAL(descriptor.0))) };
+        return found;
+    }
+    panic!("the DACL kept changing while it was read");
+}
+
+/// The name of the window station `station`.
+fn station_name(station: HANDLE) -> String {
+    use windows::Win32::System::StationsAndDesktops::{GetUserObjectInformationW, UOI_NAME};
+
+    let mut name = [0_u16; 256];
+    // SAFETY: a window station this process holds, and a buffer of the
+    // size given.
+    unsafe {
+        GetUserObjectInformationW(
+            station,
+            UOI_NAME,
+            Some(name.as_mut_ptr().cast()),
+            u32::try_from(size_of_val(&name)).unwrap(),
+            None,
+        )
+    }
+    .unwrap();
+    let end = name.iter().position(|&c| c == 0).unwrap();
+    String::from_utf16(&name[..end]).unwrap()
+}
+
+// Covers: T02
+#[test]
+fn launch_grants_its_desktop_and_leaves_the_shared_station_alone() {
+    let stage = Stage::new();
+    let sid = ContainerSid::of(stage.dir());
+    // Under the recipe the worker's AppContainer is granted its own desktop
+    // and nothing on the window station, the session's alternate one, which
+    // every launch and other programs' sandboxes share.
+    let worker = launch(&stage, recipe());
+    let objects = worker.desktop().expect("the recipe made no desktop");
+    assert!(
+        names(objects.desktop(), sid.0),
+        "the desktop is not granted"
+    );
+    assert!(
+        !names(objects.station(), sid.0),
+        "the recipe granted the shared window station"
+    );
+    // A test's setup without the lockdown, whose worker loads USER32 and so
+    // connects to the station, grants the station while its worker lives,
+    // and revokes the grant when the worker drops.
+    let unlocked = launch(&stage, recipe().without(Restrictions::NO_WIN32K));
+    let station = unlocked.desktop().unwrap().station();
+    assert_eq!(station_name(station), station_name(objects.station()));
+    assert!(
+        names(objects.station(), sid.0),
+        "the setup without the lockdown did not grant the window station"
+    );
+    drop(unlocked);
+    assert!(
+        !names(objects.station(), sid.0),
+        "the setup's grant of the window station outlived its worker"
+    );
+}
+
+// Covers: T02
+#[test]
+fn shared_dacl_changes_at_once_lose_none() {
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    const THREADS: usize = 8;
+    const ROUNDS: usize = 50;
+    // The tests' grants and revocations of the shared window station, many
+    // at once, here on a worker's own desktop, which nothing else changes:
+    // each read back holds, and none is undone by another.
+    let stage = Stage::new();
+    let worker = launch(&stage, recipe());
+    let desktop = value(worker.desktop().unwrap().desktop());
+    let lost = AtomicUsize::new(0);
+    let start = Barrier::new(THREADS);
+    std::thread::scope(|s| {
+        for t in 0..THREADS {
+            let (lost, start) = (&lost, &start);
+            s.spawn(move || {
+                let sid = ContainerSid::named(&format!("tapestry.media.dacl-test.{t}"));
+                let desktop = HANDLE(std::ptr::with_exposed_provenance_mut(
+                    usize::try_from(desktop).unwrap(),
+                ));
+                start.wait();
+                for _ in 0..ROUNDS {
+                    change_shared(desktop, granted_all(sid.0), "the desktop").unwrap();
+                    if !names(desktop, sid.0) {
+                        lost.fetch_add(1, Ordering::Relaxed);
+                    }
+                    change_shared(desktop, revoked(sid.0), "the desktop").unwrap();
+                    if names(desktop, sid.0) {
+                        lost.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            });
+        }
+    });
+    assert_eq!(lost.into_inner(), 0, "changes were lost");
 }

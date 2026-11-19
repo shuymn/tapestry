@@ -19,7 +19,9 @@ use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-pub use media_host::launch::{LaunchError, REFUSED, Restrictions, Setup, Step};
+pub use media_host::launch::{
+    LaunchError, REFUSED, Restrictions, Setup, Step, change_shared, granted_all, revoked,
+};
 pub use media_host::{Kind, Worker};
 use windows::Win32::Foundation::{
     CloseHandle, DUPLICATE_HANDLE_OPTIONS, DuplicateHandle, HANDLE, WAIT_OBJECT_0,

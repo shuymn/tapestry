@@ -374,6 +374,12 @@ impl Worker {
         self.job.as_ref().map(|j| j.0)
     }
 
+    /// The window station and desktop the worker runs on, if the setup made
+    /// them.
+    pub const fn desktop(&self) -> Option<&launch::Desktop> {
+        self._desktop.as_ref()
+    }
+
     /// Closes the job, as the game's exit does, keeping the rest: the
     /// watcher stops first, closing its own handle to the job.
     pub fn close_job(&mut self) {

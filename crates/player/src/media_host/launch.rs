@@ -8,8 +8,9 @@
 //!    installation directory ([`profile_name`]), and an ACE granting it
 //!    read and execute on that directory, inherited by the files directly
 //!    in it (the executable and its DLLs);
-//! 3. a window station of its own (`CreateWindowStationW` with no name) and
-//!    a desktop in it, each granted to the AppContainer;
+//! 3. a desktop of its own, granted to the AppContainer, in the session's
+//!    alternate window station (`CreateWindowStationW` with no name),
+//!    which other launches share and the launch leaves as it is;
 //! 4. the creation attributes: the control pipe's two ends as the only
 //!    handles it inherits, no child process, the mitigation policies (no
 //!    dynamic code, no win32k system calls, strict handle checks, images
@@ -27,14 +28,17 @@
 //!
 //! A step that fails, or a check that finds anything else, terminates the
 //! process, if one was made, and fails the launch: never a weaker sandbox.
-//! The window station and desktop are made as browsers' sandboxes make an
-//! alternate desktop for their sandboxed processes: the process's window
-//! station is switched to the new one while the desktop is created in it,
-//! under a lock, and switched back.
+//! The desktop is made as browsers' sandboxes make an alternate desktop for
+//! their sandboxed processes: the process's window station is switched to
+//! the alternate one while the desktop is created in it, under a lock, and
+//! switched back.
 //!
 //! A test's setup ([`Setup`], only under `cfg(test)`) removes restrictions,
 //! changes what the check expects, makes a step fail, or passes the worker
-//! arguments; a build of the game holds the recipe alone.
+//! arguments; a build of the game holds the recipe alone. A setup without
+//! the win32k lockdown, whose worker connects to the window station when it
+//! loads USER32, grants the AppContainer the station too, until the worker
+//! drops.
 
 use std::ffi::c_void;
 use std::fmt::Write as _;
@@ -162,7 +166,7 @@ impl Restrictions {
     pub const IMAGE_LOAD: Self = Self(1 << 7);
     /// No extension point.
     pub const NO_EXTENSION_POINTS: Self = Self(1 << 8);
-    /// A window station and desktop of its own.
+    /// A desktop of its own, off the interactive window station.
     pub const OWN_DESKTOP: Self = Self(1 << 9);
     /// Only the control pipe's ends inherited.
     pub const HANDLE_LIST: Self = Self(1 << 10);
@@ -468,7 +472,15 @@ pub fn launch(dir: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
         run(setup, Step::Grant, || grant(dir, sid)).map_err(early)?;
     }
     let desktop = if applied.has(Restrictions::OWN_DESKTOP) {
-        Some(run(setup, Step::Desktop, || Desktop::new(sid.as_ref())).map_err(early)?)
+        Some(
+            run(setup, Step::Desktop, || {
+                let desktop = Desktop::new(sid.as_ref())?;
+                #[cfg(test)]
+                let desktop = desktop.for_setup(sid.as_ref(), applied)?;
+                Ok(desktop)
+            })
+            .map_err(early)?,
+        )
     } else {
         None
     };
@@ -815,7 +827,7 @@ fn grant(dir: &Path, sid: &Sid) -> Result<(), Failure> {
     if granted(dacl, sid) {
         return Ok(());
     }
-    let entry = explicit(sid, DIRECTORY_ACCESS, DIRECTORY_INHERITANCE);
+    let entry = explicit(sid.0, DIRECTORY_ACCESS, DIRECTORY_INHERITANCE);
     let mut new: *mut ACL = std::ptr::null_mut();
     // SAFETY: one entry naming the SID, merged into the directory's DACL;
     // the ACL returned is freed by `Local`.
@@ -891,7 +903,7 @@ fn granted(dacl: *const ACL, sid: &Sid) -> bool {
 }
 
 /// An entry granting `sid` `access` with `inheritance`.
-fn explicit(sid: &Sid, access: u32, inheritance: ACE_FLAGS) -> EXPLICIT_ACCESS_W {
+fn explicit(sid: PSID, access: u32, inheritance: ACE_FLAGS) -> EXPLICIT_ACCESS_W {
     EXPLICIT_ACCESS_W {
         grfAccessPermissions: access,
         grfAccessMode: GRANT_ACCESS,
@@ -899,18 +911,24 @@ fn explicit(sid: &Sid, access: u32, inheritance: ACE_FLAGS) -> EXPLICIT_ACCESS_W
         Trustee: TRUSTEE_W {
             TrusteeForm: TRUSTEE_IS_SID,
             TrusteeType: TRUSTEE_IS_UNKNOWN,
-            ptstrName: PWSTR(sid.0.0.cast()),
+            ptstrName: PWSTR(sid.0.cast()),
             ..TRUSTEE_W::default()
         },
     }
 }
 
 /// Grants `sid` every access on the window object `object`.
-fn grant_object(object: HANDLE, sid: &Sid, what: &str) -> Result<(), Failure> {
+fn grant_object(object: HANDLE, sid: PSID, what: &str) -> Result<(), Failure> {
+    change_object(object, explicit(sid, GENERIC_ALL.0, NO_INHERITANCE), what)
+}
+
+/// Merges `entry` into the DACL of the window object `object`: the DACL is
+/// read, and written whole.
+fn change_object(object: HANDLE, entry: EXPLICIT_ACCESS_W, what: &str) -> Result<(), Failure> {
     let kind: SE_OBJECT_TYPE = SE_WINDOW_OBJECT;
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut descriptor = PSECURITY_DESCRIPTOR::default();
-    // SAFETY: a window station or desktop the launch made; the descriptor
+    // SAFETY: a window station or desktop the launch holds; the descriptor
     // returned is freed by `Local`.
     let read = unsafe {
         GetSecurityInfo(
@@ -928,7 +946,6 @@ fn grant_object(object: HANDLE, sid: &Sid, what: &str) -> Result<(), Failure> {
     if read.is_err() {
         return Err((read.0, format!("{what}'s DACL")));
     }
-    let entry = explicit(sid, GENERIC_ALL.0, NO_INHERITANCE);
     let mut new: *mut ACL = std::ptr::null_mut();
     // SAFETY: as in `grant`.
     let merged = unsafe { SetEntriesInAclW(Some(&[entry]), Some(dacl), &raw mut new) };
@@ -949,9 +966,57 @@ fn grant_object(object: HANDLE, sid: &Sid, what: &str) -> Result<(), Failure> {
         )
     };
     if set.is_err() {
-        return Err((set.0, format!("granting {what}")));
+        return Err((set.0, format!("setting {what}'s DACL")));
     }
     Ok(())
+}
+
+/// The mutex every test process takes to change a window object's DACL
+/// that other test processes change too.
+#[cfg(test)]
+const SHARED_DACL: PCWSTR = w!("Local\\tapestry-media-shared-dacl");
+
+/// How long a change waits for that mutex.
+#[cfg(test)]
+const SHARED_DACL_WAIT_MS: u32 = 10_000;
+
+/// Merges `entry` into the DACL of the window object `object` under the
+/// mutex every test process takes for it: each change reads the DACL and
+/// writes it whole, so two at once lose one of them, a grant or a
+/// revocation.
+#[cfg(test)]
+pub fn change_shared(object: HANDLE, entry: EXPLICIT_ACCESS_W, what: &str) -> Result<(), Failure> {
+    // SAFETY: a mutex named in the session's namespace, closed by `Owned`.
+    let mutex = Owned(
+        unsafe { windows::Win32::System::Threading::CreateMutexW(None, false, SHARED_DACL) }
+            .map_err(failed("the DACL's mutex"))?,
+    );
+    // SAFETY: the mutex just opened. One a process ended holding is taken
+    // all the same: its change was one call, made or not.
+    let waited = unsafe { WaitForSingleObject(mutex.0, SHARED_DACL_WAIT_MS) };
+    if waited != WAIT_OBJECT_0 && waited != windows::Win32::Foundation::WAIT_ABANDONED {
+        return Err((ERROR_TIMEOUT.0, format!("{what}'s DACL mutex")));
+    }
+    let changed = change_object(object, entry, what);
+    // SAFETY: the mutex this thread holds.
+    let _ = unsafe { windows::Win32::System::Threading::ReleaseMutex(mutex.0) };
+    changed
+}
+
+/// An entry revoking every access `sid` is granted.
+#[cfg(test)]
+pub fn revoked(sid: PSID) -> EXPLICIT_ACCESS_W {
+    EXPLICIT_ACCESS_W {
+        grfAccessPermissions: 0,
+        grfAccessMode: windows::Win32::Security::Authorization::REVOKE_ACCESS,
+        ..explicit(sid, 0, NO_INHERITANCE)
+    }
+}
+
+/// An entry granting `sid` every access on a window object.
+#[cfg(test)]
+pub fn granted_all(sid: PSID) -> EXPLICIT_ACCESS_W {
+    explicit(sid, GENERIC_ALL.0, NO_INHERITANCE)
 }
 
 /// The process's window station is switched while a desktop is made in
@@ -967,6 +1032,10 @@ pub struct Desktop {
     desktop: HDESK,
     /// `station\desktop`, nul-terminated, as the creation names it.
     path: Vec<u16>,
+    /// The SID a test's setup granted the window station, revoked when this
+    /// drops.
+    #[cfg(test)]
+    station_grant: Option<Vec<u32>>,
 }
 
 // SAFETY: window station and desktop handles are values any thread may
@@ -974,8 +1043,8 @@ pub struct Desktop {
 unsafe impl Send for Desktop {}
 
 impl Desktop {
-    /// Step 3: a window station of the worker's own, a desktop in it, each
-    /// granted to `sid`.
+    /// Step 3: a desktop of the worker's own, granted to `sid`, in the window
+    /// station `CreateWindowStationW` gives without a name.
     fn new(sid: Option<&Sid>) -> Result<Self, Failure> {
         // SAFETY: a window station named by the system (only administrators
         // may name one), closed by the value returned.
@@ -985,6 +1054,8 @@ impl Desktop {
             station,
             desktop: HDESK::default(),
             path: Vec::new(),
+            #[cfg(test)]
+            station_grant: None,
         };
         let mut name = [0u16; 256];
         let mut needed = 0;
@@ -1000,9 +1071,12 @@ impl Desktop {
             )
         }
         .map_err(failed("the window station's name"))?;
-        if let Some(sid) = sid {
-            grant_object(HANDLE(station.0), sid, "the window station")?;
-        }
+        // The window station is the session's one alternate station: every
+        // launch, and other programs' sandboxes, get the same. The launch
+        // writes nothing to it, since each write reads its DACL and writes it
+        // whole, racing the others, and would leave the AppContainer's ACE
+        // behind. Under the recipe the worker never connects to it: win32k
+        // is locked.
         let desk_name: Vec<u16> = format!(
             "tapestry-media-{}-{}",
             std::process::id(),
@@ -1037,7 +1111,7 @@ impl Desktop {
             back.map_err(failed("switching back the window station"))?;
         }
         if let Some(sid) = sid {
-            grant_object(HANDLE(desktop.desktop.0), sid, "the desktop")?;
+            grant_object(HANDLE(desktop.desktop.0), sid.0, "the desktop")?;
         }
         let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
         desktop.path = name
@@ -1052,8 +1126,54 @@ impl Desktop {
     }
 }
 
+#[cfg(test)]
+impl Desktop {
+    /// The window station's handle.
+    pub fn station(&self) -> HANDLE {
+        HANDLE(self.station.0)
+    }
+
+    /// The desktop's handle.
+    pub fn desktop(&self) -> HANDLE {
+        HANDLE(self.desktop.0)
+    }
+
+    /// Under a test's setup that removes the win32k lockdown, the worker
+    /// loads USER32, which connects it to the window station: `sid` is
+    /// granted the station too, and the grant revoked when this drops.
+    fn for_setup(mut self, sid: Option<&Sid>, applied: Restrictions) -> Result<Self, Failure> {
+        if let Some(sid) = sid
+            && !applied.has(Restrictions::NO_WIN32K)
+        {
+            // SAFETY: a SID the profile's calls allocated.
+            let bytes = unsafe { windows::Win32::Security::GetLengthSid(sid.0) };
+            let mut copy = vec![0u32; usize::try_from(bytes.div_ceil(4)).unwrap_or(0)];
+            // SAFETY: a buffer of at least `bytes` bytes, aligned as a SID.
+            unsafe {
+                windows::Win32::Security::CopySid(bytes, PSID(copy.as_mut_ptr().cast()), sid.0)
+            }
+            .map_err(failed("the SID's copy"))?;
+            change_shared(
+                self.station(),
+                granted_all(PSID(copy.as_mut_ptr().cast())),
+                "the window station",
+            )?;
+            self.station_grant = Some(copy);
+        }
+        Ok(self)
+    }
+}
+
 impl Drop for Desktop {
     fn drop(&mut self) {
+        #[cfg(test)]
+        if let Some(mut sid) = self.station_grant.take() {
+            let revoked = revoked(PSID(sid.as_mut_ptr().cast()));
+            if let Err((code, what)) = change_shared(self.station(), revoked, "the window station")
+            {
+                eprintln!("revoking a test's grant of {what} failed (error {code})");
+            }
+        }
         // SAFETY: the desktop and window station this value made, unused
         // after this.
         unsafe {
