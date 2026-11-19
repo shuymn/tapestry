@@ -27,7 +27,7 @@ use crate::wrap::SeqUnwrap;
 
 /// The simulation's time step, µs.
 const STEP: u64 = 50;
-/// The boot's TRNG draw in the simulated device.
+/// The boot's random 64 bits in the simulated device.
 const DRAW: u64 = 0x0123_4567_89ab_cdef;
 
 const fn index(ep: Ep) -> usize {
@@ -252,7 +252,7 @@ impl World {
         Self::with_draw(rate, phase, Some(DRAW))
     }
 
-    /// As [`World::new`], the boot's TRNG draw `draw`.
+    /// As [`World::new`], the boot's random 64 bits `draw`.
     fn with_draw(rate: Rate, phase: u64, draw: Option<u64>) -> Self {
         let mut state = Box::new(State::new());
         state.set_boot(
@@ -263,7 +263,7 @@ impl World {
             Cause::PowerOn,
             0,
         );
-        state.set_draw(draw, Draw::default());
+        state.set_draw(draw);
         let mut w = Self {
             hw: Sim::new(),
             state,
@@ -576,7 +576,6 @@ impl World {
                 faults: h.faults,
                 quiet: h.quiet,
                 session: h.session,
-                draw: h.draw,
             },
             _ => panic!("hello: {line}"),
         }
@@ -1209,7 +1208,7 @@ fn an_old_grant_and_its_hold_after_a_reboot_are_refused() {
     assert_eq!(w.seen_from(Ep::Pad, 0), []);
 }
 
-/// A boot whose TRNG draw failed has no token: `hello` reads `session -`
+/// A boot whose random read failed has no token: `hello` reads `session -`
 /// and every grant is refused `err session`.
 #[test]
 fn a_boot_without_a_draw_refuses_every_grant() {
