@@ -17,6 +17,8 @@ mod device;
 use core::cell::RefCell;
 use core::fmt::Write as _;
 use core::future::poll_fn;
+use core::pin::pin;
+use core::sync::atomic::{AtomicU8, Ordering};
 use core::task::Poll;
 
 use embassy_executor::Spawner;
@@ -49,7 +51,7 @@ use test_device::lease::Reason;
 use test_device::mode::Mode;
 #[cfg(not(feature = "debug-faults"))]
 use test_device::protocol::Error;
-use test_device::protocol::{self, Answer};
+use test_device::protocol::{self, Answer, Draw};
 use test_device::report::{KEYBOARD_DESCRIPTOR, KEYBOARD_REPORT, PAD_DESCRIPTOR, PAD_REPORT};
 use test_device::trace::Ep;
 
@@ -57,7 +59,9 @@ use crate::device::Pico;
 
 bind_interrupts!(struct Irqs {
     USBCTRL_IRQ => InterruptHandler<USB>;
-    TRNG_IRQ => trng::InterruptHandler<TRNG>;
+    // The draw's recorder reads the TRNG's status before the driver's
+    // handler clears it.
+    TRNG_IRQ => DrawChecks, trng::InterruptHandler<TRNG>;
 });
 
 static STATE: ConstStaticCell<RefCell<State>> = ConstStaticCell::new(RefCell::new(State::new()));
@@ -70,6 +74,9 @@ const FEED_EVERY: Duration = Duration::from_micros(FEED_EVERY_US);
 const LEASE_TICK: Duration = Duration::from_micros(500);
 /// How long the boot waits for the TRNG's draw before it counts as failed.
 const DRAW_TIMEOUT: Duration = Duration::from_millis(50);
+/// How often the draw is polled again, which restarts a run a failed
+/// entropy check stopped ([`draw`]).
+const DRAW_REPOLL: Duration = Duration::from_millis(1);
 /// The longest `detach`.
 const MAX_DETACH_MS: u32 = 10_000;
 /// The interfaces: the keyboard's, the pad's, and the link's CDC
@@ -102,26 +109,88 @@ fn enter_bootsel(watchdog: &mut Watchdog) -> ! {
 }
 
 /// The TRNG's setup: the driver's default with the ring oscillator's
-/// shortest inverter chain. Its default chain (`One`) fails the entropy
-/// checks on the board, and the driver's interrupt handler clears a CRNGT
-/// or von Neumann error without waking the draw, so that draw never ends;
-/// the shortest chain passes them. The checks stay on.
+/// shortest inverter chain. With its default chain (`One`) the entropy
+/// checks fail on the board's every run; the shortest chain passes them on
+/// most runs, and the draw starts another run after one that fails
+/// ([`draw`]). The checks stay on.
 fn trng_config() -> trng::Config {
     let mut config = trng::Config::default();
     config.inverter_chain_length = trng::InverterChainLength::None;
     config
 }
 
-/// The boot's 64 bits from the TRNG, the first half of every session
-/// token of this boot (docs/test-device.md "Lease and Disarm"); `None` when
-/// the draw does not complete in [`DRAW_TIMEOUT`] or reads a stuck value
-/// (all zeros or all ones), which leaves the boot without a token.
-async fn draw(mut rng: Trng<'_, TRNG>) -> Option<u64> {
-    let mut bytes = [0_u8; 8];
-    match select(rng.fill_bytes(&mut bytes), Timer::after(DRAW_TIMEOUT)).await {
-        Either::First(()) => Some(u64::from_le_bytes(bytes)).filter(|&d| d != 0 && d != u64::MAX),
-        Either::Second(()) => None,
+/// The runs of the boot's draw each entropy check failed ([`Draw`]), as
+/// [`DrawChecks`] counts them.
+static CRNGT: AtomicU8 = AtomicU8::new(0);
+static VN: AtomicU8 = AtomicU8::new(0);
+static AUTOCORR: AtomicU8 = AtomicU8::new(0);
+
+/// Counts the failed entropy check the TRNG reports, bound before the
+/// driver's handler, which clears it. It counts the one that handler takes
+/// this time, in its order (a result, then CRNGT, von Neumann,
+/// autocorrelation), so a status still set when the interrupt comes again
+/// is not counted twice.
+struct DrawChecks;
+
+impl embassy_rp::interrupt::typelevel::Handler<embassy_rp::interrupt::typelevel::TRNG_IRQ>
+    for DrawChecks
+{
+    unsafe fn on_interrupt() {
+        let isr = embassy_rp::pac::TRNG.rng_isr().read();
+        let failed = if isr.ehr_valid() {
+            None
+        } else if isr.crngt_err() {
+            Some(&CRNGT)
+        } else if isr.vn_err() {
+            Some(&VN)
+        } else if isr.autocorr_err() {
+            Some(&AUTOCORR)
+        } else {
+            None
+        };
+        // This handler is the counts' only writer.
+        if let Some(count) = failed {
+            count.store(
+                count.load(Ordering::Relaxed).saturating_add(1),
+                Ordering::Relaxed,
+            );
+        }
     }
+}
+
+/// The boot's 64 bits from the TRNG, the first half of every session
+/// token of this boot (docs/test-device.md "Commands"), and the runs each
+/// entropy check failed. A failed check stops the TRNG's run (RP2350
+/// datasheet 12.12.3: "The TRNG will run until: It has successfully
+/// completed the generation of a random number. One, or more, of the
+/// internal entropy checking mechanisms indicates a failed run."), and the
+/// driver's handler does not wake the draw for it, so the draw is polled
+/// again every [`DRAW_REPOLL`]: a poll that finds the run stopped without
+/// a result starts another (the driver's `fill_bytes`). `None` when no run
+/// completes in [`DRAW_TIMEOUT`] or the draw reads a stuck value (all
+/// zeros or all ones), which leaves the boot without a token.
+async fn draw(mut rng: Trng<'_, TRNG>) -> (Option<u64>, Draw) {
+    let mut bytes = [0_u8; 8];
+    let done = {
+        let mut fill = pin!(rng.fill_bytes(&mut bytes));
+        let until = Instant::now() + DRAW_TIMEOUT;
+        loop {
+            match select(fill.as_mut(), Timer::after(DRAW_REPOLL)).await {
+                Either::First(()) => break true,
+                Either::Second(()) if Instant::now() >= until => break false,
+                Either::Second(()) => {}
+            }
+        }
+    };
+    let value = done
+        .then(|| u64::from_le_bytes(bytes))
+        .filter(|&d| d != 0 && d != u64::MAX);
+    let checks = Draw {
+        crngt: CRNGT.load(Ordering::Relaxed),
+        vn: VN.load(Ordering::Relaxed),
+        autocorr: AUTOCORR.load(Ordering::Relaxed),
+    };
+    (value, checks)
 }
 
 #[embassy_executor::main]
@@ -143,11 +212,11 @@ async fn main(_spawner: Spawner) {
     device::boot_hang(&mut watchdog, cause);
     let mode = Mode::from_scratch(watchdog.get_scratch(0));
 
-    let draw = draw(Trng::new(p.TRNG, Irqs, trng_config())).await;
+    let (draw, checks) = draw(Trng::new(p.TRNG, Irqs, trng_config())).await;
 
     let state: &'static RefCell<State> = STATE.take();
     state.borrow_mut().set_boot(mode, cause, count);
-    state.borrow_mut().set_draw(draw);
+    state.borrow_mut().set_draw(draw, checks);
     let watchdog = RefCell::new(watchdog);
 
     let driver = Driver::new(p.USB, Irqs);

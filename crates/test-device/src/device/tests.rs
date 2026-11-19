@@ -263,7 +263,7 @@ impl World {
             Cause::PowerOn,
             0,
         );
-        state.set_draw(draw);
+        state.set_draw(draw, Draw::default());
         let mut w = Self {
             hw: Sim::new(),
             state,
@@ -576,6 +576,7 @@ impl World {
                 faults: h.faults,
                 quiet: h.quiet,
                 session: h.session,
+                draw: h.draw,
             },
             _ => panic!("hello: {line}"),
         }

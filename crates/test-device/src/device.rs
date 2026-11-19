@@ -11,7 +11,7 @@ use crate::faults::Faults;
 use crate::lease::{Lease, Reason, Refusal};
 use crate::mode::{Mode, Rate, Reporting};
 use crate::protocol::{
-    Answer, Change, Command, Control, Error, Hello, Item, LeaseId, MAX_LINE, Token, VERSION,
+    Answer, Change, Command, Control, Draw, Error, Hello, Item, LeaseId, MAX_LINE, Token, VERSION,
 };
 use crate::report::{KEYBOARD_REPORT, KeyboardReport, PAD_REPORT, PadReport};
 use crate::revoke::{self, DISARM_AFTER_C0, K1_AFTER_C0, PROBE_AFTER_K1};
@@ -512,6 +512,8 @@ pub struct State {
     /// The 64 bits drawn from the TRNG at boot, the first half of every
     /// token of this boot; `None` when the draw failed.
     draw: Option<u64>,
+    /// The entropy checks that failed during that draw.
+    draw_checks: Draw,
     /// A line coding of [`BOOTSEL_BAUD`] arrived.
     bootsel: bool,
     /// The host configured the device and has not reset or unconfigured
@@ -556,6 +558,11 @@ impl State {
             retire: false,
             timer_ran: false,
             draw: None,
+            draw_checks: Draw {
+                crngt: 0,
+                vn: 0,
+                autocorr: 0,
+            },
             bootsel: false,
             configured: false,
             #[cfg(feature = "debug-faults")]
@@ -571,9 +578,11 @@ impl State {
     }
 
     /// The boot's TRNG draw, the first half of its tokens; `None` when it
-    /// failed, which refuses every grant `err session`.
-    pub const fn set_draw(&mut self, draw: Option<u64>) {
+    /// failed, which refuses every grant `err session`. `checks`: the
+    /// entropy checks that failed during it, which `hello` reports.
+    pub const fn set_draw(&mut self, draw: Option<u64>, checks: Draw) {
         self.draw = draw;
+        self.draw_checks = checks;
     }
 
     /// The current connection's token; `None` when the boot has none: its
@@ -1540,6 +1549,7 @@ impl State {
             faults: cfg!(feature = "debug-faults"),
             quiet: self.quiet(),
             session: self.token(),
+            draw: self.draw_checks,
         }
     }
 

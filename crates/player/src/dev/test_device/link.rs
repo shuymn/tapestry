@@ -814,7 +814,7 @@ pub mod fake {
     pub fn hello(build: &str, faults: bool) -> String {
         format!(
             "hello {} build {build} mode 8 lease - armed 0 reason none boot power-on count 0 \
-             identified 1 faults {} quiet 1 session {TOKEN}",
+             identified 1 faults {} quiet 1 session {TOKEN} draw 0 0 0",
             test_device::protocol::VERSION,
             u8::from(faults)
         )

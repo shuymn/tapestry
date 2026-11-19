@@ -727,6 +727,23 @@ pub struct Hello<'a> {
     pub quiet: bool,
     /// The connection's token; `None` when the boot's TRNG draw failed.
     pub session: Option<Token>,
+    /// The entropy checks that failed during the boot's TRNG draw.
+    pub draw: Draw,
+}
+
+/// The runs of the boot's TRNG draw that each entropy check failed, each
+/// count saturating at 255. A failed check ends its run and the draw
+/// starts another (docs/test-device.md "Commands"), so a completed draw
+/// took one run more than their sum.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Draw {
+    /// Two consecutive blocks of 16 collected bits were equal.
+    pub crngt: u8,
+    /// 32 consecutive collected bits were identical (the von Neumann
+    /// balancer).
+    pub vn: u8,
+    /// The autocorrelation test failed four times in a row.
+    pub autocorr: u8,
 }
 
 /// An answer from the device.
@@ -777,9 +794,14 @@ impl fmt::Display for Answer<'_> {
                     u8::from(h.quiet),
                 )?;
                 match h.session {
-                    Some(token) => write!(f, "{token}"),
-                    None => f.write_str("-"),
+                    Some(token) => write!(f, "{token}")?,
+                    None => f.write_str("-")?,
                 }
+                write!(
+                    f,
+                    " draw {} {} {}",
+                    h.draw.crngt, h.draw.vn, h.draw.autocorr
+                )
             }
             Self::Pong { n, at } => write!(f, "pong {n} {at}"),
             Self::Leased { id, deadline } => write!(f, "lease {id} {deadline}"),
@@ -835,6 +857,12 @@ impl<'a> Answer<'a> {
                     "-" => None,
                     token => Some(Token::parse(token)?),
                 };
+                let crngt = field("draw")?.parse().ok()?;
+                let draw = Draw {
+                    crngt,
+                    vn: v.next()?.parse().ok()?,
+                    autocorr: v.next()?.parse().ok()?,
+                };
                 Self::Hello(Hello {
                     version,
                     build,
@@ -848,6 +876,7 @@ impl<'a> Answer<'a> {
                     faults,
                     quiet,
                     session,
+                    draw,
                 })
             }
             _ => return None,
@@ -1130,6 +1159,11 @@ mod tests {
             faults: true,
             quiet: false,
             session: Some(TOKEN),
+            draw: Draw {
+                crngt: 2,
+                vn: 0,
+                autocorr: 1,
+            },
         }
     }
 
@@ -1150,6 +1184,7 @@ mod tests {
                 faults: false,
                 quiet: true,
                 session: None,
+                draw: Draw::default(),
                 ..hello
             }),
             Answer::Pong { n: 7, at: u64::MAX },
@@ -1235,6 +1270,11 @@ mod tests {
             faults: true,
             quiet: true,
             session: Some(LARGEST_TOKEN),
+            draw: Draw {
+                crngt: u8::MAX,
+                vn: u8::MAX,
+                autocorr: u8::MAX,
+            },
         })
         .to_string();
         let mut lines = vec![
@@ -1310,6 +1350,7 @@ mod tests {
             faults: false,
             quiet: true,
             session: None,
+            draw: Draw::default(),
         })
         .to_string();
         assert!(Answer::parse_canonical(&hello).is_some());
