@@ -2860,10 +2860,10 @@ fn cutoff_asks(slices: i64) -> Vec<i64> {
     (0..=slices).map(|i| ENDED + i * PREP_SLICE_US).collect()
 }
 
-// Revert: the cutoff asked before the end of loading -> the steps put
-// `cutoff` before `end loading`, the order assertion fails. Revert: the
-// last look before the cutoff's wait -> the quit that comes with the
-// cutoff is not looked at and recording opens, fails.
+// Revert: the cutoff asked before the end of loading -> the end of
+// loading comes after the wait's slices, its time assertion fails.
+// Revert: the last look before the cutoff's wait -> the quit that comes
+// with the cutoff is not looked at and recording opens, fails.
 /// A loading opening waits after the end of loading for the render side's
 /// cutoff, in production slices, and opens once it is cut off, after the
 /// last look: a quit that came with the cutoff leaves there, the

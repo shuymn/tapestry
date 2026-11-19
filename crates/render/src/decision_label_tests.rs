@@ -1441,9 +1441,10 @@ fn decision_region_survives_play_text_pressure() {
 /// newest seen covering every submission so far, then the decision
 /// removed: its array is not destroyed before a completion covering the
 /// row's submission is seen.
-// Revert: a decision label row's write left unmarked on its array (no
-// queued use) -> the removed decision's entry is due at once, and
-// `destroy_due` destroys it before any poll, its row still queued.
+// Revert: a decision label row's write left unmarked on its array, the
+// write still queued -> the removed decision's entry is due at once, and
+// `destroy_due` destroys it before any poll, its row still queued:
+// "destroyed before its row's completion was seen".
 #[test]
 fn a_removed_decision_waits_for_its_queued_label_row() {
     let dir = decision_folder(

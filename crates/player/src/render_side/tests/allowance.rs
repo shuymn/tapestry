@@ -840,8 +840,9 @@ fn a_stale_begin_in_hand_runs_nothing_and_spends_nothing() {
     stale_in_hand(Held::Begin);
 }
 
-// Revert: as the begin's; the stale publication drops the live array:
-// "the live array's table" fails at the second `Reuse`.
+// Revert: the generation checked only at receipt, as the begin's -> the
+// stale publication runs at that boundary: "Destroy(2)" expected, a BGA
+// drop found.
 #[test]
 fn a_stale_absent_publication_in_hand_runs_nothing() {
     stale_in_hand(Held::Absent);

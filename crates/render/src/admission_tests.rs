@@ -566,8 +566,8 @@ fn stage_play(
 /// stays charged in its retirement entry, beside the newer candidate,
 /// until the entry's destruction, its completion seen or not; a staging
 /// of the committed bundle has nothing of its own and is counted once.
-// Revert: `Retirements::charged` leaving out the filled entries -> big is
-// admitted as play's beside the superseded candidate.
+// Revert: `Retirements::charged` leaving out the filled entries -> the
+// superseded candidate's entry is not counted: "the superseded candidate".
 #[test]
 fn a_superseded_staging_stays_charged_until_its_destruction() {
     let mut r = offscreen(1_920, 1_080);
@@ -672,8 +672,8 @@ fn play_fits_once_a_filled_entry_is_destroyed_in_its_call() {
 /// pool's optional layers, its array owed; and the result's release only
 /// for play, the pool down to its firm layer first.
 // Revert: `reclaim` reducing the pool before destroying filled entries
-// -> the decision candidate that fits once the removed result's entry is
-// destroyed leaves the pool owed.
+// -> the decision candidate's call reduces the pool instead, and an
+// entry stays filled: "the entry destroyed".
 #[test]
 fn filled_entries_go_before_the_pool_and_the_pool_before_the_result() {
     let mut r = offscreen(1_920, 1_080);
