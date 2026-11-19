@@ -182,6 +182,80 @@ pub struct PmFrame {
     pub sync_interval: Option<u32>,
     /// `AllowsTearing`, when the capture has the column.
     pub tearing: Option<bool>,
+    /// `PresentMode`, when the capture has the column.
+    pub mode: Option<PresentMode>,
+}
+
+/// PresentMon's `PresentMode`: how the system presented a present, by the
+/// values PresentMon 2.6 writes (design.md "Display Latency and Stutter",
+/// presentation mode per lifetime).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PresentMode {
+    /// `Hardware: Independent Flip`: the buffer scanned out directly.
+    IndependentFlip,
+    /// `Hardware Composed: Independent Flip`: scanned out on an overlay
+    /// plane.
+    OverlayIndependentFlip,
+    /// `Hardware: Legacy Flip`: exclusive fullscreen.
+    LegacyFlip,
+    /// `Hardware: Legacy Copy to front buffer`: exclusive fullscreen.
+    LegacyCopy,
+    /// `Composed: Flip`: copied into DWM's frame.
+    ComposedFlip,
+    /// `Composed: Copy with GPU GDI`.
+    ComposedCopyGpu,
+    /// `Composed: Copy with CPU GDI`.
+    ComposedCopyCpu,
+    /// Any other value.
+    Other,
+}
+
+impl PresentMode {
+    /// Every value, in the order a summary line names them.
+    pub const ALL: [Self; 8] = [
+        Self::IndependentFlip,
+        Self::OverlayIndependentFlip,
+        Self::LegacyFlip,
+        Self::LegacyCopy,
+        Self::ComposedFlip,
+        Self::ComposedCopyGpu,
+        Self::ComposedCopyCpu,
+        Self::Other,
+    ];
+
+    /// The value PresentMon writes for it; `other` for the rest.
+    #[must_use]
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::IndependentFlip => "Hardware: Independent Flip",
+            Self::OverlayIndependentFlip => "Hardware Composed: Independent Flip",
+            Self::LegacyFlip => "Hardware: Legacy Flip",
+            Self::LegacyCopy => "Hardware: Legacy Copy to front buffer",
+            Self::ComposedFlip => "Composed: Flip",
+            Self::ComposedCopyGpu => "Composed: Copy with GPU GDI",
+            Self::ComposedCopyCpu => "Composed: Copy with CPU GDI",
+            Self::Other => "other",
+        }
+    }
+
+    /// The mode a capture's value names.
+    #[must_use]
+    pub fn from_value(value: &str) -> Self {
+        let value = value.trim();
+        Self::ALL
+            .into_iter()
+            .find(|m| *m != Self::Other && m.name() == value)
+            .unwrap_or(Self::Other)
+    }
+
+    /// Whether DWM copied the frame into its own composed frame.
+    #[must_use]
+    pub const fn composed(self) -> bool {
+        matches!(
+            self,
+            Self::ComposedFlip | Self::ComposedCopyGpu | Self::ComposedCopyCpu
+        )
+    }
 }
 
 /// Why a capture could not be read. Its message is the variant as written
@@ -247,6 +321,7 @@ pub fn parse(text: &str, app: &str, to_us: impl Fn(i64) -> i64) -> (Vec<PmFrame>
         return (Vec::new(), Some(PmError::MissingColumn));
     };
     let (sync_col, tearing_col) = (col("SyncInterval"), col("AllowsTearing"));
+    let mode_col = col("PresentMode");
     let mut frames = Vec::new();
     let mut error = None;
     for (i, line) in lines.enumerate() {
@@ -265,9 +340,10 @@ pub fn parse(text: &str, app: &str, to_us: impl Fn(i64) -> i64) -> (Vec<PmFrame>
                     .transpose()
             };
             let present = (flag(sync_col)?, flag(tearing_col)?.map(|t| t != 0));
-            Ok((app_ok, start, busy, change, until, present))
+            let mode = mode_col.map(|c| PresentMode::from_value(fields[c]));
+            Ok((app_ok, start, busy, change, until, present, mode))
         })();
-        let Ok((app_ok, start, busy, change, until, (sync_interval, tearing))) = row else {
+        let Ok((app_ok, start, busy, change, until, (sync_interval, tearing), mode)) = row else {
             error = Some(PmError::BadRow(i + 2));
             break;
         };
@@ -281,6 +357,7 @@ pub fn parse(text: &str, app: &str, to_us: impl Fn(i64) -> i64) -> (Vec<PmFrame>
             display_us,
             sync_interval,
             tearing,
+            mode,
         });
     }
     frames.sort_by_key(|f| f.present_us);
@@ -416,6 +493,101 @@ pub fn count_capture(
     }
 }
 
+/// A lifetime's presents in the capture by [`PresentMode`]
+/// (design.md "Display Latency and Stutter", presentation mode per
+/// lifetime).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ModeSummary {
+    /// Displayed presents per value, in [`PresentMode::ALL`]'s order.
+    pub displayed: [u64; PresentMode::ALL.len()],
+    /// Displayed presents in a capture without the `PresentMode` column.
+    pub without_mode: u64,
+    /// Presents never displayed, whatever their mode.
+    pub not_displayed: u64,
+}
+
+impl ModeSummary {
+    /// The displayed presents with a value.
+    #[must_use]
+    pub fn with_mode(&self) -> u64 {
+        self.displayed.iter().sum()
+    }
+
+    /// The displayed presents DWM composed.
+    #[must_use]
+    pub fn composed(&self) -> u64 {
+        PresentMode::ALL
+            .iter()
+            .zip(self.displayed)
+            .filter(|(m, _)| m.composed())
+            .map(|(_, n)| n)
+            .sum()
+    }
+
+    /// Whether a lifetime of a `fullscreen` window was composed for most
+    /// of it: more than half of its displayed presents with a value.
+    #[must_use]
+    pub fn composed_fullscreen(&self, fullscreen: bool) -> bool {
+        fullscreen && self.composed() * 2 > self.with_mode()
+    }
+}
+
+/// The presents of `frames` in the span `[a, b)` (µs on the game's clock,
+/// by present time), by [`PresentMode`].
+#[must_use]
+pub fn summarize_modes(frames: &[PmFrame], (a, b): (i64, i64)) -> ModeSummary {
+    let mut s = ModeSummary::default();
+    for f in frames.iter().filter(|f| (a..b).contains(&f.present_us)) {
+        if f.display_us.is_none() {
+            s.not_displayed += 1;
+            continue;
+        }
+        let slot = f
+            .mode
+            .and_then(|m| PresentMode::ALL.iter().position(|&n| n == m));
+        match slot.and_then(|i| s.displayed.get_mut(i)) {
+            Some(n) => *n += 1,
+            None => s.without_mode += 1,
+        }
+    }
+    s
+}
+
+/// The lines a lifetime named `label` prints for `s`: its displayed
+/// presents per value (those without one, from a capture without the
+/// column, as `no PresentMode`) and its presents never displayed; then,
+/// for a `fullscreen` window composed for most of it, a line naming it.
+#[must_use]
+pub fn mode_lines(label: &str, s: &ModeSummary, fullscreen: bool) -> String {
+    let mut counts: Vec<String> = PresentMode::ALL
+        .iter()
+        .zip(s.displayed)
+        .filter(|(_, n)| *n > 0)
+        .map(|(m, n)| format!("{} {n}", m.name()))
+        .collect();
+    if s.without_mode > 0 {
+        counts.push(format!("no PresentMode {}", s.without_mode));
+    }
+    if counts.is_empty() {
+        counts.push("none".to_owned());
+    }
+    let mut out = format!(
+        "measure: {label}: displayed by present mode: {}; {} not displayed
+",
+        counts.join(", "),
+        s.not_displayed
+    );
+    if s.composed_fullscreen(fullscreen) {
+        let _ = writeln!(
+            out,
+            "measure: {label}: composed fullscreen lifetime: {} of {} displayed frames composed",
+            s.composed(),
+            s.with_mode()
+        );
+    }
+    out
+}
+
 /// The capture's figures as a TOML table, numbers only (N/A left out),
 /// with the game's own present count in the span and the period counted
 /// at.
@@ -448,7 +620,10 @@ mod tests {
 
     use render::measure::Presentation;
 
-    use super::{Capture, PlayCapture, PmError, PmFrame, count_play, locate, parse};
+    use super::{
+        Capture, ModeSummary, PlayCapture, PmError, PmFrame, PresentMode, count_play, locate,
+        mode_lines, parse, summarize_modes,
+    };
     use crate::measure::Figures;
 
     const HEADER: &str = "Application,ProcessID,SwapChainAddress,PresentRuntime,SyncInterval,PresentFlags,AllowsTearing,PresentMode,CPUStartQPC,MsBetweenSimulationStart,MsPCLatency,MsBetweenPresents,MsBetweenAppStart,MsCPUBusy,MsCPUWait,MsInPresentAPI,MsGPULatency,MsGPUTime,MsGPUBusy,MsGPUWait,MsVideoBusy,MsAnimationError,AnimationTime,MsFlipDelay,DisplayLatency,DisplayedTime,MsUntilDisplayed,MsBetweenDisplayChange";
@@ -529,12 +704,14 @@ mod tests {
                     display_us: Some(16_666 + 1_200 + 4_000),
                     sync_interval: Some(1),
                     tearing: Some(false),
+                    mode: Some(PresentMode::IndependentFlip),
                 },
                 PmFrame {
                     present_us: 33_333 + 1_200,
                     display_us: None,
                     sync_interval: Some(1),
                     tearing: Some(false),
+                    mode: Some(PresentMode::IndependentFlip),
                 },
             ]
         );
@@ -609,6 +786,7 @@ mod tests {
             display_us,
             sync_interval: Some(1),
             tearing: Some(false),
+            mode: Some(PresentMode::IndependentFlip),
         }
     }
 
@@ -771,6 +949,197 @@ mod tests {
             ..fig.clone()
         };
         assert_eq!(count_play(&frames, &unknown, T).count, None);
+    }
+
+    /// A row of `tapestry.exe` at `qpc` presented as `mode` (PresentMon's
+    /// value).
+    fn row_as(mode: &str, qpc: i64, displayed: bool) -> String {
+        row("tapestry.exe", qpc, displayed).replace("Hardware: Independent Flip", mode)
+    }
+
+    /// Each value PresentMon 2.6 writes is read as its mode, and only the
+    /// three `Composed:` ones count as composed; a summary line names each
+    /// by its value. Without the column, frames have no mode and no
+    /// lifetime is named.
+    #[test]
+    fn each_present_mode_value_is_read_and_classed() {
+        let modes = [
+            (
+                "Hardware: Independent Flip",
+                PresentMode::IndependentFlip,
+                false,
+            ),
+            (
+                "Hardware Composed: Independent Flip",
+                PresentMode::OverlayIndependentFlip,
+                false,
+            ),
+            ("Hardware: Legacy Flip", PresentMode::LegacyFlip, false),
+            (
+                "Hardware: Legacy Copy to front buffer",
+                PresentMode::LegacyCopy,
+                false,
+            ),
+            ("Composed: Flip", PresentMode::ComposedFlip, true),
+            (
+                "Composed: Copy with GPU GDI",
+                PresentMode::ComposedCopyGpu,
+                true,
+            ),
+            (
+                "Composed: Copy with CPU GDI",
+                PresentMode::ComposedCopyCpu,
+                true,
+            ),
+        ];
+        for (k, (value, mode, composed)) in (0_i64..).zip(modes) {
+            let csv = format!("{HEADER}\n{}\n", row_as(value, 1_000_000_000 + k, true));
+            let (frames, err) = parse(&csv, "tapestry.exe", to_us);
+            assert_eq!(err, None, "{value}");
+            assert_eq!(frames[0].mode, Some(mode), "{value}");
+            assert_eq!(mode.composed(), composed, "{value}");
+            let s = summarize_modes(&frames, (0, 1_000_000));
+            assert_eq!(
+                (s.composed(), s.with_mode()),
+                (u64::from(composed), 1),
+                "{value}"
+            );
+            assert_eq!(s.composed_fullscreen(true), composed, "{value}");
+            assert_eq!(
+                mode_lines("play", &s, false),
+                format!("measure: play: displayed by present mode: {value} 1; 0 not displayed\n")
+            );
+        }
+        let csv = format!(
+            "{}\n{}\n",
+            HEADER.replace(",PresentMode", ""),
+            row_as("Composed: Flip", 1_000_000_000, true).replace(",Composed: Flip", "")
+        );
+        let (frames, err) = parse(&csv, "tapestry.exe", to_us);
+        assert_eq!((frames[0].mode, err), (None, None));
+        let s = summarize_modes(&frames, (0, 1_000_000));
+        assert_eq!((s.without_mode, s.with_mode()), (1, 0));
+        assert_eq!(
+            mode_lines("play", &s, true),
+            "measure: play: displayed by present mode: no PresentMode 1; 0 not displayed\n"
+        );
+    }
+
+    /// A value PresentMon does not write is counted as `other`, never as
+    /// composed, and still counts toward the lifetime's frames.
+    #[test]
+    fn an_unknown_present_mode_is_other() {
+        let csv = format!(
+            "{HEADER}\n{}\n{}\n{}\n",
+            row_as("Composed: Composition Atlas", 1_000_000_000, true),
+            row_as("Unknown", 1_000_010_000, true),
+            row_as("Composed: Flip", 1_000_020_000, true),
+        );
+        let (frames, err) = parse(&csv, "tapestry.exe", to_us);
+        assert_eq!(err, None);
+        let modes: Vec<_> = frames.iter().map(|f| f.mode).collect();
+        let other = Some(PresentMode::Other);
+        assert_eq!(modes, [other, other, Some(PresentMode::ComposedFlip)]);
+        let s = summarize_modes(&frames, (0, 1_000_000));
+        // One composed of three: not most of the lifetime.
+        assert_eq!((s.composed(), s.with_mode()), (1, 3));
+        assert_eq!(
+            mode_lines("select lifetime 1", &s, true),
+            "measure: select lifetime 1: displayed by present mode: Composed: Flip 1, other 2; \
+             0 not displayed\n"
+        );
+    }
+
+    fn moded(present_us: i64, shown: bool, mode: PresentMode) -> PmFrame {
+        PmFrame {
+            mode: Some(mode),
+            ..frame(present_us, shown.then_some(present_us + 1_000))
+        }
+    }
+
+    /// Two lifetimes over one capture are each summarised from the
+    /// presents in their own span, never displayed ones counted apart: a
+    /// select lifetime composed throughout is named, the play after it,
+    /// independent flip after three composed frames, is not; the same
+    /// composed lifetime of a window that is not fullscreen is not named.
+    #[test]
+    fn mixed_lifetimes_are_summarised_apart() {
+        use PresentMode::{ComposedCopyGpu, ComposedFlip, IndependentFlip};
+        let mut frames: Vec<PmFrame> = (0..6)
+            .map(|k| moded(k * 16_000, true, ComposedFlip))
+            .collect();
+        frames.push(moded(96_000, true, ComposedCopyGpu));
+        frames.push(moded(100_000, false, ComposedFlip));
+        // The play from 112 ms: three composed, then independent flip.
+        frames.extend((0..3).map(|k| moded(112_000 + k * 16_000, true, ComposedFlip)));
+        frames.extend((0..5).map(|k| moded(160_000 + k * 4_000, true, IndependentFlip)));
+        frames.push(moded(164_500, false, IndependentFlip));
+        frames.sort_by_key(|f| f.present_us);
+        let select = summarize_modes(&frames, (0, 112_000));
+        assert_eq!((select.composed(), select.with_mode()), (7, 7));
+        assert_eq!(select.not_displayed, 1);
+        assert_eq!(
+            mode_lines("select lifetime 1", &select, true),
+            "measure: select lifetime 1: displayed by present mode: Composed: Flip 6, \
+             Composed: Copy with GPU GDI 1; 1 not displayed\n\
+             measure: select lifetime 1: composed fullscreen lifetime: 7 of 7 displayed frames \
+             composed\n"
+        );
+        assert_eq!(
+            mode_lines("select lifetime 1", &select, false)
+                .lines()
+                .count(),
+            1
+        );
+        let play = summarize_modes(&frames, (112_000, 200_000));
+        assert_eq!((play.composed(), play.with_mode()), (3, 8));
+        assert_eq!(play.not_displayed, 1);
+        assert_eq!(
+            mode_lines("1.tprl", &play, true),
+            "measure: 1.tprl: displayed by present mode: Hardware: Independent Flip 5, \
+             Composed: Flip 3; 1 not displayed\n"
+        );
+    }
+
+    /// Exactly half composed is not most of a lifetime; one more composed
+    /// frame is, and `other` is never composed.
+    #[test]
+    fn a_lifetime_is_named_only_past_half_composed() {
+        let half = ModeSummary {
+            displayed: [2, 0, 0, 0, 2, 0, 0, 0],
+            ..ModeSummary::default()
+        };
+        assert!(!half.composed_fullscreen(true));
+        let other = ModeSummary {
+            displayed: [2, 0, 0, 0, 2, 0, 0, 1],
+            ..half
+        };
+        assert!(!other.composed_fullscreen(true));
+        let most = ModeSummary {
+            displayed: [2, 0, 0, 0, 2, 1, 0, 0],
+            ..half
+        };
+        assert!(most.composed_fullscreen(true));
+    }
+
+    /// A lifetime with no displayed frame says so, counts the presents it
+    /// had and is never named; an empty span has nothing.
+    #[test]
+    fn a_lifetime_without_displayed_frames() {
+        let frames = [
+            moded(1_000, false, PresentMode::ComposedFlip),
+            moded(2_000, false, PresentMode::ComposedFlip),
+        ];
+        let s = summarize_modes(&frames, (0, 10_000));
+        assert_eq!((s.with_mode(), s.not_displayed), (0, 2));
+        assert_eq!(
+            mode_lines("result lifetime 2", &s, true),
+            "measure: result lifetime 2: displayed by present mode: none; 2 not displayed\n"
+        );
+        assert_eq!(
+            summarize_modes(&frames, (10_000, 20_000)),
+            ModeSummary::default()
+        );
     }
 
     #[test]

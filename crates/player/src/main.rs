@@ -308,8 +308,12 @@ fn measure_select(clock: QpcClock) -> anyhow::Result<()> {
         .map(|f| format!("{} {}\n", f.present_us, f.display_us.unwrap_or(-1)))
         .collect();
     write_fresh(&pm, &text)?;
+    let fullscreen = window::opens_fullscreen();
     for s in &measured.screens {
         let span = dev::screen_span(s.presents, &measured.presents);
+        let modes = presentmon::summarize_modes(&frames, span);
+        let label = format!("{} lifetime {}", s.screen, s.lifetime);
+        print!("{}", presentmon::mode_lines(&label, &modes, fullscreen));
         let counted = s.period_ns.map(|period| {
             presentmon::count_capture(&frames, span, presents, s.presentation, period)
         });
@@ -383,7 +387,11 @@ fn measure_play(chart: &Path, perfect: bool, clock: QpcClock) -> anyhow::Result<
     let plays = plays
         .lock()
         .map_err(|_| anyhow::anyhow!("the measured plays were lost"))?;
+    let fullscreen = window::opens_fullscreen();
     for (record, fig) in plays.iter() {
+        let modes = presentmon::summarize_modes(&frames, (fig.span.0.0, fig.span.1.0));
+        let label = record.display().to_string();
+        print!("{}", presentmon::mode_lines(&label, &modes, fullscreen));
         let Some(period) = fig.refresh_period_ns else {
             eprintln!("measure: no refresh rate for {}", record.display());
             continue;
