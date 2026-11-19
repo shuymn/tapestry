@@ -22,7 +22,8 @@
 //!   it makes to itself (`processes`).
 //! - `socket`: connects to 192.0.2.1:80 (TEST-NET-1); `ok=0` only when the
 //!   connect is refused before any packet leaves (10013).
-//! - `child`: starts `cmd.exe /c exit 7` (`exit=` its exit code).
+//! - `child`: starts `cmd.exe /c exit 7` (`exit=` its exit code, read
+//!   once a wait has seen it end, or that it had not ended in 30 s).
 //! - `dynamic-code`: allocates executable memory (`rwx`) and makes
 //!   writable memory executable (`rw-rx`).
 //! - `dll=<path>`: loads a DLL by its path.
@@ -375,6 +376,10 @@ fn socket() {
     report("socket", code != 10013, code, &detail);
 }
 
+/// How long `child` waits for the process it started to end: a started
+/// `cmd.exe` can take seconds to run while every core is busy.
+const CHILD_WAIT_MS: u32 = 30_000;
+
 fn child() {
     let app = wide(r"C:\Windows\System32\cmd.exe");
     let mut command = wide(r"C:\Windows\System32\cmd.exe /c exit 7");
@@ -401,16 +406,24 @@ fn child() {
     };
     match created {
         Ok(()) => {
-            let mut exit = 0;
+            // Its exit code is read only once the wait has seen it end: read
+            // before, it is `STILL_ACTIVE` (259).
             // SAFETY: the process just created, whose handles are closed
             // after.
-            unsafe {
-                let _ = WaitForSingleObject(info.hProcess, 5_000);
-                let _ = GetExitCodeProcess(info.hProcess, &raw mut exit);
-            }
+            let waited = unsafe { WaitForSingleObject(info.hProcess, CHILD_WAIT_MS) };
+            let detail = if waited == WAIT_OBJECT_0 {
+                let mut exit = 0;
+                // SAFETY: as above.
+                match unsafe { GetExitCodeProcess(info.hProcess, &raw mut exit) } {
+                    Ok(()) => format!("exit={exit}"),
+                    Err(e) => format!("exit unread (error {})", error_of(&e)),
+                }
+            } else {
+                format!("not ended after {CHILD_WAIT_MS} ms (wait {})", waited.0)
+            };
             close(info.hProcess);
             close(info.hThread);
-            report("child", true, 0, &format!("exit={exit}"));
+            report("child", true, 0, &detail);
         }
         Err(e) => report("child", false, error_of(&e), ""),
     }
