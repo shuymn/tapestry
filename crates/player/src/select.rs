@@ -1323,6 +1323,33 @@ impl SelectScreen {
         Acted::Changed
     }
 
+    /// The charts within `reach` selectable rows of the cursor around the
+    /// list's ring, as the cursor moves, nearest first (+1, −1, +2, −2,
+    /// …), each row once and never the cursor's own; the all-charts row
+    /// and folder rows are passed over (design.md "Rendering and Skins",
+    /// chart images: the fill).
+    pub fn charts_near(&self, reach: usize) -> Vec<&ChartEntry> {
+        let n = self.selectable();
+        let mut near = Vec::new();
+        if n == 0 {
+            return near;
+        }
+        let at = self.cursor % n;
+        let chart = |index: usize| {
+            index
+                .checked_sub(self.lead())
+                .and_then(|i| self.entries.get(i))
+        };
+        // Past half the ring a distance reaches rows a nearer one did.
+        for d in 1..=reach.min(n / 2) {
+            near.extend(chart((at + d) % n));
+            if 2 * d != n {
+                near.extend(chart((at + n - d) % n));
+            }
+        }
+        near
+    }
+
     /// The selectable row `steps` rows forward (or back) of the cursor
     /// around the list's ring; none while nothing is listed.
     // Source: SF-016
@@ -2033,6 +2060,48 @@ mod tests {
         }
         seen.sort_unstable();
         assert_eq!(seen, [Some(0), Some(4)]);
+    }
+
+    /// The charts near the cursor go nearest first around the ring, each
+    /// row once and never the cursor's own, within the reach; the
+    /// all-charts row is passed over, and a short ring stops at its half.
+    #[test]
+    fn the_charts_near_the_cursor_go_nearest_first_around_the_ring() {
+        let mut s = SelectScreen::new(vec![PathBuf::from(r"C:\charts")]);
+        let charts: Vec<ChartEntry> = (0..6)
+            .map(|i| entry(&format!(r"C:\charts\{i}.bms"), "t"))
+            .collect();
+        s.set_top(
+            library::Level {
+                charts,
+                ..library::Level::default()
+            },
+            6,
+        );
+        let near = |s: &SelectScreen, reach| -> Vec<String> {
+            s.charts_near(reach)
+                .iter()
+                .map(|c| c.path.file_stem().unwrap().to_string_lossy().into_owned())
+                .collect()
+        };
+        // The all-charts row, then charts 0 to 5: the cursor on chart 2.
+        assert!(s.move_to(3));
+        assert_eq!(near(&s, 16), ["3", "1", "4", "0", "5"]);
+        assert_eq!(near(&s, 2), ["3", "1", "4", "0"]);
+        assert_eq!(near(&s, 0), Vec::<String>::new());
+        // On chart 5, the ring wraps: the all-charts row is passed over.
+        assert!(s.move_to(6));
+        assert_eq!(near(&s, 16), ["4", "0", "3", "1", "2"]);
+        // Two rows: the other once; one row: none; none listed: none.
+        s.set_entries(vec![
+            entry(r"C:\charts\a.bms", "a"),
+            entry(r"C:\charts\b.bms", "b"),
+        ]);
+        assert_eq!(near(&s, 16), [if s.cursor() == 0 { "b" } else { "a" }]);
+        s.set_entries(vec![entry(r"C:\charts\a.bms", "a")]);
+        assert!(near(&s, 16).is_empty());
+        s.set_entries(Vec::new());
+        assert!(near(&s, 16).is_empty());
     }
 
     fn screen() -> SelectScreen {

@@ -537,6 +537,37 @@ fn play_frames_screen_alloc() {
     rig.link.exit();
 }
 
+/// The transition probe on (`TAPESTRY_LOOP_PROBE`), its marks taken in
+/// play frames: those frames allocate nothing in the app region either
+/// ([`play_frames_screen_alloc`] holds the region's positive control). It
+/// turns the process's probe on, so it runs in a process of its own
+/// (nextest), never in the release guards' shared one.
+#[cfg(feature = "dev-tools")]
+#[test]
+fn play_frames_with_the_transition_probe_on_count_no_app_allocation() {
+    crate::dev::loop_probe::tests::turn_on();
+    let rig = Rig::new(Some(LOADEND));
+    rig.play_state(1);
+    let t = rig.begin();
+    rig.link.pause_loading().unwrap();
+    rig.link.clear_loading();
+    rig.play(after(t, 1_234));
+    let fig = rig
+        .link
+        .finish(rig.clock.now())
+        .expect("the play's figures");
+    rig.link.exit();
+    assert_eq!(fig.render_app_allocations, Some(0));
+    // The probe marked the play's frames.
+    let marks = crate::dev::loop_probe::tests::marks();
+    assert!(
+        marks.iter().any(|m| m.1 == "loop" && m.2 == 2),
+        "no play frame marked"
+    );
+    assert!(marks.iter().any(|m| m.1 == "present"));
+    assert_eq!(crate::dev::loop_probe::tests::dropped(), 0);
+}
+
 /// The attempt of `chart` the game would make under the default preset,
 /// with a known best of `pace`'s last entry paced by it.
 fn paced_attempt(chart: &Chart, pace: Arc<[u32]>) -> AttemptContext {

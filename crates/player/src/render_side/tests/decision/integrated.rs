@@ -513,14 +513,14 @@ impl Screen for Noted {
             .result_quads()
             .map_or(0, |q| q.iter().filter(|q| q.layer != 0).count());
         // The first one to reach the target has its marker read back.
-        let mark = if t.presented && !self.result_read {
+        let mark = if t.presented() && !self.result_read {
             self.result_read = true;
             let (w, _, pixels) = self.menu.read_back().ok_or(RenderError::DeviceLost)?;
             Some(crate::render_common::rgb_at(&pixels, w, RESULT_MARK_AT))
         } else {
             None
         };
-        self.note(t.presented, Frame::Result { quads, mark });
+        self.note(t.presented(), Frame::Result { quads, mark });
         Ok(t)
     }
     fn decision_rows(&self) -> Option<Result<render::RowPlan, RenderError>> {
@@ -573,7 +573,7 @@ impl Screen for Noted {
     fn submit_decision(&mut self) -> Result<FrameTiming, RenderError> {
         let t = self.menu.submit_decision()?;
         let (at, screen) = self.decision.take().unwrap_or((self.clock.now(), None));
-        if !t.presented {
+        if !t.presented() {
             return Ok(t);
         }
         let mark = if self.seen.probe.swap(false, Ordering::AcqRel) {
@@ -623,15 +623,15 @@ impl Screen for Noted {
     }
     fn draw(&mut self) -> Result<FrameTiming, RenderError> {
         let t = self.menu.draw()?;
-        self.note(t.presented, Frame::Play);
+        self.note(t.presented(), Frame::Play);
         Ok(t)
     }
     fn text(&mut self, lines: &[&str]) -> Result<bool, RenderError> {
         self.menu.text(lines)
     }
-    fn end(&mut self, page: &EndPage) -> Result<bool, RenderError> {
+    fn end(&mut self, page: &EndPage) -> Result<render::FrameOutcome, RenderError> {
         let p = self.menu.end(page)?;
-        self.note(p, Frame::End);
+        self.note(p == render::FrameOutcome::Shown, Frame::End);
         Ok(p)
     }
     fn splash(&mut self, elapsed: Duration) -> Option<Result<bool, RenderError>> {
@@ -646,7 +646,7 @@ impl Screen for Noted {
     ) -> Result<Result<FrameTiming, BuildError>, RenderError> {
         let t = self.menu.loading(page, update, changed, frame)?;
         if let Ok(t) = &t {
-            self.note(t.presented, Frame::Loading);
+            self.note(t.presented(), Frame::Loading);
         }
         Ok(t)
     }
@@ -656,7 +656,7 @@ impl Screen for Noted {
         changed: bool,
     ) -> Result<FrameTiming, RenderError> {
         let t = self.menu.pending_loading(page, changed)?;
-        self.note(t.presented, Frame::Loading);
+        self.note(t.presented(), Frame::Loading);
         Ok(t)
     }
     fn menu(&mut self, page: &MenuPage, changed: bool) -> Result<FrameTiming, RenderError> {
@@ -665,7 +665,7 @@ impl Screen for Noted {
             .lines
             .first()
             .map_or_else(String::new, |l| l.text.clone());
-        self.note(t.presented, Frame::Page(line));
+        self.note(t.presented(), Frame::Page(line));
         Ok(t)
     }
     fn selection(
@@ -678,7 +678,7 @@ impl Screen for Noted {
     ) -> Result<crate::selection_skin::SelectionDrawn, RenderError> {
         let drawn = self.menu.selection(update, logic, changed, now, app)?;
         self.note(
-            drawn.timing.presented,
+            drawn.timing.presented(),
             Frame::Selection {
                 skinned: drawn.skinned,
             },
@@ -1848,6 +1848,51 @@ fn load_stages_are_recorded_in_order() {
         "{stages:?}"
     );
     assert!(stages.iter().all(|&(_, v)| v <= ready), "{stages:?}");
+}
+
+/// With the transition probe on, its deciding marks are on the game's
+/// clock, between the game's own times: the choice, made with the clock
+/// held 600 s from its origin, and READY, the choice plus the load's own
+/// `ready` stage; the preparation's mark (`prep:begin`) before the
+/// opening's (`g:open`), each once.
+#[test]
+fn the_probe_marks_the_deciding_events_on_the_games_clock() {
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        saved: true,
+        picture: true,
+        chart: Some("#TITLE a\n#BPM 120\n#BMP01 a.png\n#00004:01\n#00111:01\n#00138:01\n"),
+        ..Opts::default()
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        crate::dev::loop_probe::tests::turn_on_on(side.clock);
+        side.prepared();
+        side.hold_clock();
+        side.clock.set(TimeUs(600_000_000));
+        let (chosen, ..) = side.choose(MenuKey::Enter);
+        assert_eq!(chosen, TimeUs(600_000_000));
+        side.to_loading();
+        side.seen.until("the result skin", |d| {
+            d.iter()
+                .any(|d| matches!(d.frame, Frame::Result { quads, .. } if quads > 0))
+        });
+    });
+    let ready_stage = stage_at(&load_stages(&ran), "ready");
+    let marks = crate::dev::loop_probe::tests::marks();
+    let at = |tag: &str| -> Vec<(i64, i64)> {
+        marks
+            .iter()
+            .filter(|m| m.1 == tag)
+            .map(|m| (i64::try_from(m.0).unwrap(), m.2))
+            .collect()
+    };
+    let ready = 600_000_000 + ready_stage;
+    let (prep, open) = (at("prep:begin"), at("g:open"));
+    assert_eq!((prep.len(), open.len()), (1, 1), "{prep:?} {open:?}");
+    assert!(
+        600_000_000 <= prep[0].0 && prep[0].0 <= open[0].0 && open[0].0 <= ready,
+        "out of order: choice 600000000, prep {prep:?}, open {open:?}, READY {ready}"
+    );
 }
 
 /// The `[load_stages]` of the one play `ran` saved, in their order.

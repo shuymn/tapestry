@@ -185,6 +185,9 @@ struct Fake {
     idle_to_deadline: bool,
     /// The deadline of each idle wait, with the clock time it began.
     idle_waits: Vec<(i64, i64)>,
+    /// The result's sound waits for its first picture until this clock
+    /// time.
+    sound_due_until: i64,
     /// Menu commands, taken on the result at these clock times.
     menu: Vec<(i64, game::MenuCommand)>,
     /// Commands pressed by a record sink while the play is saved, taken
@@ -453,6 +456,7 @@ impl Fake {
             screens: Vec::new(),
             idle_to_deadline: false,
             idle_waits: Vec::new(),
+            sound_due_until: 0,
             menu: Vec::new(),
             pressed: std::sync::Arc::default(),
             steps: Vec::new(),
@@ -571,6 +575,10 @@ impl Rig for Fake {
         while let Some(i) = self.at.iter().position(|(at, _)| *at <= now) {
             (self.at.remove(i).1)();
         }
+    }
+
+    fn result_sound_due(&self) -> bool {
+        self.clock.now().0 < self.sound_due_until
     }
 
     fn take(&mut self) -> Option<Command> {
@@ -2172,6 +2180,51 @@ fn result_screen_shows_reload_and_error() {
     assert_eq!(ready(recovered), ready(reloaded));
     // Each state was drawn once, by the poll that found it.
     assert_eq!(rig.screens.len(), 4, "{:?}", rig.shown_at);
+}
+
+/// While the result's sound waits for its first picture, the user preset
+/// files are not polled, a rewrite included, and the idle wait is not
+/// ended by their poll deadline; the first poll after it reloads the
+/// rewrite (design.md "State Model", system sounds, Result).
+#[test]
+fn result_presets_wait_for_the_sounds_first_picture() {
+    const DUE_UNTIL: i64 = 16_700_000;
+    let dir = tempfile::tempdir().unwrap();
+    let path = write_user_preset(dir.path(), &rules::tapestry());
+    let mut loaded = loaded_with(dir.path(), "mine");
+    let items = vec![key(9_303_000, Z, 1), key(9_353_000, Z, 0)];
+    let mut rig = Fake::new(items, &[], 18_000_000);
+    rig.idle_to_deadline = true;
+    rig.sound_due_until = DUE_UNTIL;
+    let edit = path.clone();
+    rig.at.push((
+        16_000_000,
+        Box::new(move || rewrite_preset(&edit, &flat_normal())),
+    ));
+    game::live::run_chart(&mut loaded, &mut rig).unwrap();
+
+    let first = rig.shown_at[0];
+    assert!(first < 16_000_000, "{:?}", rig.shown_at);
+    let waits: Vec<_> = rig
+        .idle_waits
+        .iter()
+        .filter(|&&(at, _)| at >= first && at < DUE_UNTIL)
+        .copied()
+        .collect();
+    assert!(!waits.is_empty());
+    assert!(
+        waits.iter().all(|&(at, deadline)| deadline > at),
+        "a wait ended by the poll deadline: {waits:?}"
+    );
+    let (at, _) = rig
+        .screens
+        .iter()
+        .find(|(_, s)| s.notices().next().is_some())
+        .unwrap_or_else(|| panic!("never reloaded: {:?}", rig.shown_at));
+    assert!(
+        (DUE_UNTIL..DUE_UNTIL + 2 * game::IDLE_WAIT.0).contains(at),
+        "reloaded at {at}"
+    );
 }
 
 /// A user preset `name` holding `preset`, loaded under that name.

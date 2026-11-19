@@ -51,7 +51,7 @@ impl FrameSink for Frames {
             quads,
             lines,
             screen.device(),
-            drawn.timing.presented,
+            drawn.timing.presented(),
             lit,
             screen.selection_strip(),
         ));
@@ -231,7 +231,7 @@ impl Screen for Lossy {
         }
         let mut drawn = self.menu.selection(update, logic, changed, now, app)?;
         if self.skip.swap(false, Ordering::AcqRel) {
-            drawn.timing.presented = false;
+            drawn.timing.outcome = render::FrameOutcome::Retry;
         }
         Ok(drawn)
     }
@@ -1063,7 +1063,7 @@ impl FrameSink for Recording {
         self.seen
             .lock()
             .unwrap()
-            .push((drawn.stage, drawn.timing.presented, left));
+            .push((drawn.stage, drawn.timing.presented(), left));
     }
 }
 
