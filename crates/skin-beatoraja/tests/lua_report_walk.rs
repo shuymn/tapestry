@@ -66,11 +66,36 @@ fn the_walk_and_the_comparison_exit_by_what_they_found() {
     assert_eq!(code, 0, "{out}{err}");
     assert!(out.contains(" 0 new failures, "), "{out}");
     printed.push(out + &err);
-    // A dependency of configuration 2 damaged: a new failure.
+    // A dependency of configuration 2 damaged. Under one build the
+    // importer decided differently on the same input: not judged.
     std::fs::write(root.join("QZXpart.lua"), "not lua (").unwrap();
     let (code, _, err) = walk("c");
     assert_eq!(code, 0, "{err}");
     let (code, out, err) = run(&["--compare", path(&records("a")), path(&records("c"))]);
+    assert_eq!(code, 2, "{out}{err}");
+    assert!(
+        out.contains(
+            "skin 0 configuration 2 (option 0 1): outcome imported -> lua Syntax: unstable (one \
+             build), not judged\n"
+        ),
+        "{out}"
+    );
+    printed.push(out + &err);
+    // The kept run as another build's: a new failure.
+    let kept = std::fs::read_to_string(records("a")).unwrap();
+    let other: String = kept
+        .lines()
+        .map(|l| {
+            if l.starts_with("build = ") {
+                "build = \"another build\"\n".to_owned()
+            } else {
+                format!("{l}\n")
+            }
+        })
+        .collect();
+    assert_ne!(other, kept);
+    std::fs::write(records("other"), other).unwrap();
+    let (code, out, err) = run(&["--compare", path(&records("other")), path(&records("c"))]);
     assert_eq!(code, 1, "{out}{err}");
     assert!(
         out.contains(
@@ -130,5 +155,42 @@ fn the_walk_and_the_comparison_exit_by_what_they_found() {
     assert!(!records("e").exists());
     for p in printed {
         assert!(!p.contains("QZX"), "{p}");
+    }
+}
+
+/// An argument that is not valid Unicode: a fixed diagnostic and exit 2,
+/// before anything could print it.
+#[test]
+fn an_argument_that_is_not_unicode_exits_2() {
+    #[cfg(windows)]
+    let bad = {
+        use std::os::windows::ffi::OsStringExt;
+        // Not a source copy: a Windows argument with a lone surrogate.
+        let mut wide: Vec<u16> = "QZXbad".encode_utf16().collect();
+        wide.push(0xD800);
+        std::ffi::OsString::from_wide(&wide)
+    };
+    #[cfg(unix)]
+    let bad = {
+        use std::os::unix::ffi::OsStringExt;
+        std::ffi::OsString::from_vec(b"QZXbad\xff".to_vec())
+    };
+    for args in [
+        vec![std::ffi::OsString::from("--walk"), bad.clone()],
+        vec![
+            std::ffi::OsString::from("--compare"),
+            bad.clone(),
+            bad.clone(),
+        ],
+        vec![bad],
+    ] {
+        let out = Command::new(EXE).args(&args).output().unwrap();
+        let printed = String::from_utf8_lossy(&out.stdout) + String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(2), "{printed}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            "an argument is not valid Unicode\n"
+        );
+        assert!(!printed.contains("QZX"), "{printed}");
     }
 }

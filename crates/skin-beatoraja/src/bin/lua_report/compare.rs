@@ -3,11 +3,14 @@
 //! catalogue digest is equal; their configurations then pair by position.
 //! A new failure is a configuration that imported and no longer imports,
 //! or a refusal whose reason changed; a changed catalogue is re-baselined;
-//! an `inconclusive` or `unstable` configuration is not judged.
+//! an `inconclusive` or `unstable` configuration is not judged, nor is an
+//! outcome that differs between two runs of one build (the importer then
+//! decided differently on the same input: unstable).
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
+use super::label::Label;
 use super::record::{Record, Records};
 
 /// What a comparison found and its exit code.
@@ -37,9 +40,9 @@ impl Verdict {
 /// Whether `outcome` is a refusal: an import that did not complete for a
 /// reason of the importer's (not `unselectable`, `inconclusive` or
 /// `unstable`).
-fn refusal(outcome: &str) -> bool {
+fn refusal(outcome: &Label) -> bool {
     !matches!(
-        outcome,
+        outcome.as_str(),
         "imported" | "unselectable" | "inconclusive" | "unstable"
     )
 }
@@ -100,6 +103,7 @@ pub fn compare(kept: &Records, new: &Records) -> Result<Verdict, String> {
         m
     }
     let (kr, nr) = (by_skin(kept), by_skin(new));
+    let one_build = kept.build == new.build;
     let skins = kept.skin.len().max(new.skin.len());
     let mut total = 0;
     for i in 0..skins {
@@ -132,7 +136,7 @@ pub fn compare(kept: &Records, new: &Records) -> Result<Verdict, String> {
         }
         for (k, n) in kl.iter().zip(nl.iter()) {
             total += 1;
-            judge(&mut v, k, n);
+            judge(&mut v, k, n, one_build);
         }
     }
     let _ = writeln!(
@@ -144,19 +148,28 @@ pub fn compare(kept: &Records, new: &Records) -> Result<Verdict, String> {
     Ok(v)
 }
 
-/// One configuration's kept and new records.
-fn judge(v: &mut Verdict, k: &Record, n: &Record) {
+/// One configuration's kept and new records, of one build or two.
+fn judge(v: &mut Verdict, k: &Record, n: &Record, one_build: bool) {
     let head = format!(
         "skin {} configuration {} ({})",
         n.skin,
         n.configuration,
         n.toggle_label()
     );
-    let unjudged = |o: &str| matches!(o, "inconclusive" | "unstable");
+    let unjudged = |o: &Label| matches!(o.as_str(), "inconclusive" | "unstable");
     if unjudged(&k.outcome) || unjudged(&n.outcome) {
         let _ = writeln!(
             v.text,
             "{head}: outcome {} -> {}: not judged",
+            k.outcome, n.outcome
+        );
+        v.unjudged += 1;
+        return;
+    }
+    if one_build && k.outcome != n.outcome {
+        let _ = writeln!(
+            v.text,
+            "{head}: outcome {} -> {}: unstable (one build), not judged",
             k.outcome, n.outcome
         );
         v.unjudged += 1;

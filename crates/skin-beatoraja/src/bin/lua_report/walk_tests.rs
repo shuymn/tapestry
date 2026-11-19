@@ -10,8 +10,9 @@ use skin_beatoraja::{Cancel, FileSpec, Header, OffsetSpec, OptionItem, OptionSpe
 use skin_model::ScreenKind;
 
 use super::compare::{Verdict, compare};
-use super::record::{Record, Records, SkinEntry};
-use super::walk::{self, Disk, Source};
+use super::label::Label;
+use super::record::{Record, Records, SkinEntry, VERSION};
+use super::walk::{self, Disk, Skin, Source};
 
 /// A 64-pixel white PNG.
 fn png() -> Vec<u8> {
@@ -37,14 +38,25 @@ fn write(root: &Path, files: &[(&str, &[u8])]) {
     }
 }
 
+/// The build the tests' walks are marked as.
+const BUILD: &str = "test build";
+
+/// A skin named by its folder and entry.
+fn skin(folder: &str, entry: &str) -> Skin {
+    Skin {
+        folder: folder.to_owned(),
+        entry: entry.to_owned(),
+    }
+}
+
 /// The walk of `skins` (folder, entry) from disk.
 fn walk_of(skins: &[(&Path, &str)]) -> (Records, String) {
     let list: Vec<(String, String)> = skins
         .iter()
         .map(|(d, e)| (d.to_str().unwrap().to_owned(), (*e).to_owned()))
         .collect();
-    let entries: Vec<String> = list.iter().map(|(_, e)| e.clone()).collect();
-    let (r, summary) = walk::walk(&mut Disk(list), &entries);
+    let named: Vec<Skin> = list.iter().map(|(r, e)| Skin::at(r, e)).collect();
+    let (r, summary) = walk::walk(&mut Disk(list), &named, BUILD);
     // Every record a walk writes passes its own check.
     r.to_text().unwrap();
     (r, summary)
@@ -209,6 +221,23 @@ fn a_refused_header_is_one_record() {
 }
 
 #[test]
+fn a_library_refusal_is_written() {
+    // `string.format` with a conversion the library refuses.
+    let d = folder(&[(
+        "s.luaskin",
+        b"local skin = { type = 0, name = \"t\", w = 1920, h = 1080 }\n\
+          if not skin_config then return skin end\n\
+          local s = string.format(\"%x\", 255)\n\
+          skin.destination = { { id = -110, dst = { { w = 64, h = 64 } } } }\n\
+          return skin\n",
+    )]);
+    let (r, _) = walk_of(&[(d.path(), "s.luaskin")]);
+    assert_eq!(outcomes(&r), ["lua Library { op: \"format conversion\" }"]);
+    let text = r.to_text().unwrap();
+    assert_eq!(Records::read("new", &text).unwrap(), r);
+}
+
+#[test]
 fn the_walk_imports_under_the_decided_facts() {
     // Autoplay (option 32), the judge class (option 182) and the play
     // level (number 96) read while the skin loads: each unavailable
@@ -299,7 +328,7 @@ fn the_walk_record_is_not_the_clocks() {
     let (r, _) = walk_of(&[(d.path(), "s.luaskin")]);
     let rt = r.record[0].runtime.as_ref().unwrap();
     assert_eq!(rt.outputs, 2);
-    assert_eq!(rt.status, BTreeMap::from([("ok".to_owned(), 2)]));
+    assert_eq!(rt.status, BTreeMap::from([(Label::fixed("ok"), 2)]));
 }
 
 /// Options and file choices whose names repeat.
@@ -427,9 +456,15 @@ fn header() -> Header {
 
 #[test]
 fn the_digest_covers_the_whole_header_and_the_entry() {
-    let base = walk::digest(&header(), "s.luaskin");
-    assert_eq!(base, walk::digest(&header(), "s.luaskin"));
-    assert_ne!(base, walk::digest(&header(), "t.luaskin"));
+    let base = walk::digest(&header(), &skin("f", "s.luaskin"));
+    assert_eq!(base, walk::digest(&header(), &skin("f", "s.luaskin")));
+    assert_ne!(base, walk::digest(&header(), &skin("f", "t.luaskin")));
+    // The folder's name, and the boundary between it and the entry.
+    assert_ne!(base, walk::digest(&header(), &skin("g", "s.luaskin")));
+    assert_ne!(
+        walk::digest(&header(), &skin("fs", ".luaskin")),
+        walk::digest(&header(), &skin("f", "s.luaskin"))
+    );
     let changes: Vec<Change> = vec![
         ("kind", Box::new(|h| h.kind = ScreenKind::Result)),
         ("size", Box::new(|h| h.size = [1280, 720])),
@@ -495,7 +530,7 @@ fn the_digest_covers_the_whole_header_and_the_entry() {
     for (what, change) in changes {
         let mut h = header();
         change(&mut h);
-        assert_ne!(walk::digest(&h, "s.luaskin"), base, "{what}");
+        assert_ne!(walk::digest(&h, &skin("f", "s.luaskin")), base, "{what}");
     }
 }
 
@@ -579,7 +614,8 @@ fn plain() -> tempfile::TempDir {
 }
 
 fn scripted(s: &mut Script) -> Records {
-    walk::walk(s, &["s.luaskin".to_owned()]).0
+    let named = [Skin::at(&s.disk.0[0].0, "s.luaskin")];
+    walk::walk(s, &named, BUILD).0
 }
 
 #[test]
@@ -651,6 +687,24 @@ fn attempts_that_disagree_are_unstable() {
 }
 
 #[test]
+fn a_timeout_over_another_header_is_unstable() {
+    let d = plain();
+    let other = w1();
+    // A refusal over the skin's header, then a timeout over another one.
+    let mut s = Script::new(
+        d.path(),
+        vec![
+            Read::Disk,
+            Read::Other(other.path().to_str().unwrap().to_owned()),
+        ],
+        vec![refused("lua Error"), timeout()],
+    );
+    let r = scripted(&mut s);
+    assert_eq!(outcomes(&r), ["unstable"]);
+    assert_eq!(r.record[0].attempts, ["lua Error", "lua Limit(Time)"]);
+}
+
+#[test]
 fn a_probe_timeout_then_a_header_walks_the_skin() {
     let d = w1();
     let mut s = Script::new(d.path(), vec![Read::Refused(Box::new(timeout()))], vec![]);
@@ -675,50 +729,140 @@ fn two_probe_timeouts_are_an_inconclusive_skin() {
     assert_eq!(s.probes, 2);
 }
 
+/// Every label a record takes from its survey is one the default report
+/// prints for that survey: imported and refused configurations, a play
+/// skin with timers and a gauge, a result skin with a runtime frame, and
+/// a library refusal.
 #[test]
-fn the_walk_refuses_to_write_a_string_outside_the_vocabulary() {
-    let d = plain();
-    let records = d.path().join("records.toml");
-    let mut s = Script::new(
-        d.path(),
-        vec![],
-        vec![refused("QZX marker"), refused("QZX marker")],
-    );
-    let done = super::walk_mode(records.to_str().unwrap(), &mut s, &["s.luaskin".to_owned()]);
-    assert_eq!(done.code, 2);
-    assert!(!records.exists());
+fn record_labels_are_the_default_reports() {
+    let w = w1();
+    let runtime = folder(&[("s.luaskin", RUNTIME.as_bytes()), ("a.png", &png())]);
+    let json = json_skin();
+    let library = folder(&[(
+        "s.luaskin",
+        b"local skin = { type = 0, name = \"t\", w = 1920, h = 1080 }\n\
+          if not skin_config then return skin end\n\
+          local s = string.format(\"%x\", 255)\n\
+          return skin\n",
+    )]);
+    let png = png();
+    let gauge = folder(&[
+        (
+            "s.luaskin",
+            b"local skin = { type = 0, name = \"t\", w = 1920, h = 1080 }\n\
+              if not skin_config then return skin end\n\
+              skin.source = { { id = \"a\", path = \"a.png\" } }\n\
+              skin.image = { { id = \"n0\", src = \"a\", x = 0, y = 0, w = 8, h = 8 },\n\
+                { id = \"n1\", src = \"a\", x = 8, y = 0, w = 8, h = 8 },\n\
+                { id = \"n2\", src = \"a\", x = 16, y = 0, w = 8, h = 8 },\n\
+                { id = \"n3\", src = \"a\", x = 24, y = 0, w = 8, h = 8 } }\n\
+              skin.gauge = { id = \"g\", nodes = { \"n0\", \"n1\", \"n2\", \"n3\" }, parts = 10 }\n\
+              skin.destination = { { id = \"g\", dst = { { x = 100, y = 500, w = 100, h = 10 } } } }\n\
+              return skin\n",
+        ),
+        ("a.png", &png),
+    ]);
+    let play = ImportFacts::unavailable(ScreenKind::Play);
+    let result = ImportFacts::unavailable(ScreenKind::Result);
+    let bad = Choice {
+        files: vec![("part".to_owned(), "bad.lua".to_owned())],
+        ..Choice::default()
+    };
+    let surveys = [
+        survey_with(
+            w.path(),
+            "s.luaskin",
+            &play,
+            &Cancel::new(),
+            false,
+            &Choice::default(),
+        ),
+        survey_with(w.path(), "s.luaskin", &play, &Cancel::new(), false, &bad),
+        survey_with(
+            runtime.path(),
+            "s.luaskin",
+            &result,
+            &Cancel::new(),
+            false,
+            &Choice::default(),
+        ),
+        super::survey_entry(
+            json.path().to_str().unwrap(),
+            "s.json",
+            &result,
+            &Cancel::new(),
+            false,
+            &Choice::default(),
+        ),
+        survey_with(
+            library.path(),
+            "s.luaskin",
+            &play,
+            &Cancel::new(),
+            false,
+            &Choice::default(),
+        ),
+        survey_with(
+            gauge.path(),
+            "s.luaskin",
+            &play,
+            &Cancel::new(),
+            false,
+            &Choice::default(),
+        ),
+    ];
+    // The fixtures reach the channels a walk has seen most: timers, a
+    // gauge and a runtime frame's statuses.
+    let records: Vec<Record> = surveys
+        .iter()
+        .map(|s| Record::of(0, 0, ("default", None), s, Vec::new()))
+        .collect();
+    assert!(records.iter().any(|r| !r.gauges.is_empty()));
+    assert!(records.iter().any(|r| !r.play_timers.is_empty()));
     assert!(
-        done.err
-            .contains("skin 0 configuration 0: its outcome holds a string outside"),
-        "{}",
-        done.err
+        records
+            .iter()
+            .any(|r| r.runtime.as_ref().is_some_and(|rt| !rt.status.is_empty()))
     );
-    assert!(!done.err.contains("QZX") && !done.out.contains("QZX"));
+    let mut seen = 0;
+    for s in &surveys {
+        let report = super::report(0, s);
+        let record = Record::of(0, 0, ("default", None), s, Vec::new());
+        for l in record.survey_labels() {
+            assert!(report.contains(l.as_str()), "{l}: {report}");
+            seen += 1;
+        }
+    }
+    // The fixtures give more than their outcomes and kinds.
+    assert!(seen > 2 * surveys.len() + 4, "{seen}");
 }
 
-/// A record of skin `skin`, configuration `k`, with `outcome`.
+/// A record of skin `skin`, configuration `k`, with `outcome`: a play
+/// survey's, through the record's own path.
 fn rec(skin: usize, k: usize, outcome: &str) -> Record {
-    Record {
-        skin,
-        configuration: k,
-        toggle: if k == 0 { "default" } else { "option" }.to_owned(),
-        position: (k > 0).then(|| [0, k - 1]),
-        kind: "Play".to_owned(),
+    let s = Survey {
         outcome: outcome.to_owned(),
-        ..Record::default()
-    }
+        kind: Some(ScreenKind::Play),
+        ..Survey::default()
+    };
+    let toggle = if k == 0 {
+        ("default", None)
+    } else {
+        ("option", Some([0, k - 1]))
+    };
+    Record::of(skin, k, toggle, &s, Vec::new())
 }
 
 /// Records of skins, each a digest and its records' outcomes.
 fn run(skins: &[(&str, &[&str])]) -> Records {
-    let mut r = Records::new(walk::FACTS, walk::RESULT_FACTS);
+    let mut r = Records::new(walk::FACTS, walk::RESULT_FACTS, BUILD);
     for (i, (digest, list)) in skins.iter().enumerate() {
         let records: Vec<Record> = list.iter().enumerate().map(|(k, o)| rec(i, k, o)).collect();
         r.push_skin(
             SkinEntry {
                 index: i,
                 digest: (*digest).to_owned(),
-                kind: "Play".to_owned(),
+                kind: Label::fixed("Play"),
                 configurations: records.len(),
             },
             records,
@@ -727,8 +871,11 @@ fn run(skins: &[(&str, &[&str])]) -> Records {
     r
 }
 
+/// `kept` against `new` as a run of another build.
 fn verdict(kept: &Records, new: &Records) -> Verdict {
-    compare(kept, new).unwrap()
+    let mut new = new.clone();
+    new.build = "another build".to_owned();
+    compare(kept, &new).unwrap()
 }
 
 #[test]
@@ -742,8 +889,12 @@ fn records_round_trip() {
 #[test]
 fn another_record_version_is_refused() {
     let text = run(&[("d", &["imported"])]).to_text().unwrap();
-    for v in ["0", "2"] {
-        let other = text.replacen("version = 1", &format!("version = {v}"), 1);
+    for v in [VERSION - 1, VERSION + 1] {
+        let other = text.replacen(
+            &format!("version = {VERSION}"),
+            &format!("version = {v}"),
+            1,
+        );
         let e = Records::read("kept", &other).unwrap_err();
         assert!(e.starts_with("kept: records of another version"), "{e}");
     }
@@ -765,10 +916,7 @@ fn an_unknown_field_is_refused_by_its_table_and_line() {
     let unknown = text.replacen("[[record]]\n", "[[record]]\nextra = 1\n", 1);
     let e = Records::read("new", &unknown).unwrap_err();
     assert!(e.contains("in [[record]]"), "{e}");
-    assert!(
-        e.starts_with(&format!("new: line {line}")) || e.starts_with("new: line "),
-        "{e}"
-    );
+    assert!(e.starts_with(&format!("new: line {line}: ")), "{e}");
 }
 
 #[test]
@@ -869,11 +1017,11 @@ fn a_moved_refusal_with_its_label_is_reported_not_failed() {
 fn counts_and_stops_are_reported_not_failed() {
     let kept = run(&[("d", &["imported"])]);
     let mut new = kept.clone();
-    new.record[0].notes.insert("Ignored op".to_owned(), 1);
-    new.record[0].callbacks.insert("lowered".to_owned(), 1);
+    new.record[0].notes.insert(Label::fixed("Ignored op"), 1);
+    new.record[0].callbacks.insert(Label::fixed("lowered"), 1);
     new.record[0].runtime = Some(super::record::Runtime {
-        stops: vec!["budget".to_owned()],
-        stopped: Some("budget".to_owned()),
+        stops: vec![Label::fixed("budget")],
+        stopped: Some(Label::fixed("budget")),
         ..super::record::Runtime::default()
     });
     let v = verdict(&kept, &new);
@@ -935,6 +1083,67 @@ fn reordered_skins_are_rebaselined() {
     let new = run(&[("e", &["imported"]), ("d", &["imported"])]);
     let v = verdict(&kept, &new);
     assert_eq!((v.code(), v.rebaseline), (2, 2), "{}", v.text);
+}
+
+/// Two folders holding one skin, the second's module broken.
+fn twins() -> tempfile::TempDir {
+    let entry = b"local skin = { type = 0, name = \"t\", w = 1920, h = 1080 }\n\
+        if not skin_config then return skin end\n\
+        require(\"part\")\n\
+        skin.destination = { { id = -110, dst = { { w = 64, h = 64 } } } }\n\
+        return skin\n";
+    folder(&[
+        ("one/s.luaskin", entry),
+        ("one/part.lua", b"return 1"),
+        ("two/s.luaskin", entry),
+        ("two/part.lua", b"not lua ("),
+    ])
+}
+
+#[test]
+fn swapped_folders_with_one_catalogue_are_rebaselined() {
+    let d = twins();
+    let (one, two) = (d.path().join("one"), d.path().join("two"));
+    let (kept, _) = walk_of(&[(one.as_path(), "s.luaskin"), (two.as_path(), "s.luaskin")]);
+    let (new, _) = walk_of(&[(two.as_path(), "s.luaskin"), (one.as_path(), "s.luaskin")]);
+    assert_eq!(outcomes(&kept), ["imported", "lua Syntax"]);
+    let v = verdict(&kept, &new);
+    assert_eq!(
+        (v.code(), v.failures, v.rebaseline),
+        (2, 0, 2),
+        "{}",
+        v.text
+    );
+    assert!(
+        v.text.starts_with(
+            "skin 0: catalogue changed, re-baseline\nskin 1: catalogue changed, re-baseline\n"
+        ),
+        "{}",
+        v.text
+    );
+}
+
+#[test]
+fn two_walks_of_one_build_that_disagree_are_unstable() {
+    let d = twins();
+    let one = d.path().join("one");
+    let (kept, _) = walk_of(&[(one.as_path(), "s.luaskin")]);
+    // The module changed beneath one build: no verdict on the importer.
+    write(&one, &[("part.lua", b"not lua (")]);
+    let (new, _) = walk_of(&[(one.as_path(), "s.luaskin")]);
+    assert_eq!(kept.build, new.build);
+    let v = compare(&kept, &new).unwrap();
+    assert_eq!((v.code(), v.failures, v.unjudged), (2, 0, 1), "{}", v.text);
+    assert!(
+        v.text.contains(
+            "skin 0 configuration 0 (default): outcome imported -> lua Syntax: unstable (one build), \
+             not judged\n"
+        ),
+        "{}",
+        v.text
+    );
+    // The same runs as two builds' give the failure.
+    assert_eq!(verdict(&kept, &new).code(), 1);
 }
 
 #[test]
@@ -1108,14 +1317,14 @@ fn walk_and_compare_output_hold_nothing_from_the_skin() {
         (r.clone(), "QZXentry.luaskin".to_owned()),
         (r.clone(), "QZXrefused.luaskin".to_owned()),
     ];
-    let entries: Vec<String> = skins.iter().map(|(_, e)| e.clone()).collect();
+    let named: Vec<Skin> = skins.iter().map(|(r, e)| Skin::at(r, e)).collect();
     let hook = Shared::default();
     super::quiet_panics(hook.clone());
     let mut src = Panicking {
         disk: Disk(skins.clone()),
         panicked: false,
     };
-    let first = super::walk_mode(kept.to_str().unwrap(), &mut src, &entries);
+    let first = super::walk_mode(kept.to_str().unwrap(), &mut src, &named, "build a");
     let _ = std::panic::take_hook();
     assert_eq!(first.code, 0, "{}", first.err);
     let hooked = String::from_utf8(hook.0.lock().unwrap().clone()).unwrap();
@@ -1143,7 +1352,7 @@ fn walk_and_compare_output_hold_nothing_from_the_skin() {
     );
     // A dependency damaged: the default stops importing.
     write(&root, &[("QZXdir/QZXgood.lua", b"QZX is not lua (")]);
-    let second = super::walk_mode(new.to_str().unwrap(), &mut Disk(skins), &entries);
+    let second = super::walk_mode(new.to_str().unwrap(), &mut Disk(skins), &named, "build b");
     assert_eq!(second.code, 0, "{}", second.err);
     let compared = super::compare_mode(kept.to_str().unwrap(), new.to_str().unwrap());
     assert_eq!(compared.code, 1, "{}", compared.out);
@@ -1154,7 +1363,7 @@ fn walk_and_compare_output_hold_nothing_from_the_skin() {
     );
     assert_eq!(missing.code, 2);
     let malformed = runs.join("QZXmalformed.toml");
-    std::fs::write(&malformed, "version = 1\nQZXbad = = 1\n").unwrap();
+    std::fs::write(&malformed, format!("version = {VERSION}\nQZXbad = = 1\n")).unwrap();
     let bad = super::compare_mode(malformed.to_str().unwrap(), new.to_str().unwrap());
     assert_eq!(bad.code, 2);
     assert!(bad.err.starts_with("kept: line 2: "), "{}", bad.err);

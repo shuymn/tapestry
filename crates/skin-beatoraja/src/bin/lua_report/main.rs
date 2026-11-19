@@ -67,6 +67,7 @@
 //! prints a skin's names, paths or strings, nor its file arguments.
 
 mod compare;
+mod label;
 mod record;
 mod walk;
 #[cfg(test)]
@@ -318,9 +319,10 @@ fn completeness(dropped: u64) -> String {
 
 /// A runtime note's line: what it is and where, by module index.
 fn runtime_note(n: &RuntimeNoteRecord) -> String {
+    let what = label::runtime_what(n);
     let what = match (n.id, &n.gave) {
-        (Some(id), Some(gave)) => format!("{} {id} unanswered (gave {gave})", n.what),
-        _ => n.what.to_owned(),
+        (Some(id), Some(gave)) => format!("{what} {id} unanswered (gave {gave})"),
+        _ => what.to_string(),
     };
     let at = n.at.map_or_else(
         || "?".to_owned(),
@@ -339,11 +341,8 @@ fn report(index: usize, survey: &Survey) -> String {
         s.push_str(l);
         s.push('\n');
     };
-    line(&format!("skin {index}: {}", survey.outcome));
-    let kind = survey
-        .kind
-        .map_or_else(|| "none".to_owned(), |k| format!("{k:?}"));
-    line(&format!("  kind: {kind}"));
+    line(&format!("skin {index}: {}", label::outcome(survey)));
+    line(&format!("  kind: {}", label::kind(survey.kind)));
     if let Some((module, line_no, col)) = survey.at {
         line(&format!(
             "  at: module {module}, line {line_no}, column {col}"
@@ -351,7 +350,7 @@ fn report(index: usize, survey: &Survey) -> String {
     }
     line(&format!("  modules: {}", survey.modules));
     for a in &survey.atlas {
-        line(&format!("  atlas: {a}"));
+        line(&format!("  atlas: {}", label::atlas(a)));
     }
     if let Some((ops, callbacks)) = survey.frame_ops {
         line(&format!(
@@ -367,11 +366,14 @@ fn report(index: usize, survey: &Survey) -> String {
         ));
     }
     if let Some((n, by)) = &survey.play_elements {
-        let timers: Vec<String> = by.iter().map(|(t, c)| format!("{t} {c}")).collect();
+        let timers: Vec<String> = label::timers(by)
+            .iter()
+            .map(|(t, c)| format!("{t} {c}"))
+            .collect();
         line(&format!("  elements: {n} (timers: {})", timers.join(", ")));
     }
     for (segments, motion) in &survey.gauges {
-        line(&format!("  gauge segments {segments} motion {motion}"));
+        line(&format!("  gauge {}", label::gauge(*segments, motion)));
     }
     let u = survey.usage;
     line(&format!(
@@ -393,8 +395,8 @@ fn report(index: usize, survey: &Survey) -> String {
         u.captures,
         u.expanded
     ));
-    for ((field, kind), n) in &survey.callables {
-        line(&format!("  callable {field} {kind}: {n}"));
+    for (callable, n) in label::callables(survey) {
+        line(&format!("  callable {callable}: {n}"));
     }
     line(&format!("  root script: {}", survey.root_script));
     line(&format!("  root unread: {}", survey.root_unread));
@@ -404,13 +406,16 @@ fn report(index: usize, survey: &Survey) -> String {
             .map_or_else(String::new, |(module, line, col)| {
                 format!(" at module {module}, line {line}, column {col}")
             });
-        line(&format!("  effects: {}{at}", survey.effects));
+        line(&format!("  effects: {}{at}", label::effects(survey)));
     }
-    for (outcome, n) in &survey.outcomes {
+    for (outcome, n) in label::callbacks(survey) {
         line(&format!("  callback {outcome}: {n}"));
     }
     if let Some(rt) = &survey.runtime {
-        let status: Vec<String> = rt.status.iter().map(|(s, n)| format!("{s} {n}")).collect();
+        let status: Vec<String> = label::status(rt)
+            .iter()
+            .map(|(s, n)| format!("{s} {n}"))
+            .collect();
         line(&format!(
             "  runtime frame (fields 0): outputs {} status {} notes {} (+{}) \
              instructions {} host calls {} time {} us{}",
@@ -421,9 +426,7 @@ fn report(index: usize, survey: &Survey) -> String {
             rt.instructions,
             rt.host_calls,
             rt.micros,
-            rt.stopped
-                .as_deref()
-                .map_or_else(String::new, |s| format!(" stopped {s}"))
+            label::stopped(rt).map_or_else(String::new, |s| format!(" stopped {s}"))
         ));
         line(&format!(
             "  runtime notes: {}, stopped {}",
@@ -431,7 +434,11 @@ fn report(index: usize, survey: &Survey) -> String {
             if rt.stops.is_empty() {
                 "none".to_owned()
             } else {
-                rt.stops.join(", ")
+                label::stops(rt)
+                    .iter()
+                    .map(label::Label::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             }
         ));
         for n in &rt.notes {
@@ -458,7 +465,7 @@ fn report(index: usize, survey: &Survey) -> String {
             line(&local_line(l));
         }
     }
-    for (kind, n) in &survey.notes {
+    for (kind, n) in label::notes(survey) {
         line(&format!("  note {kind}: {n}"));
     }
     if let Some(r) = &survey.resolved {
@@ -480,11 +487,11 @@ fn report(index: usize, survey: &Survey) -> String {
             f.widget_quads, f.capacity, f.most, f.dropped, f.chips
         ));
     }
-    for (label, n) in &survey.facts {
-        line(&format!("  fact {label}: {n}"));
+    for (fact, n) in label::facts(survey) {
+        line(&format!("  fact {fact}: {n}"));
     }
     for r in &survey.reads {
-        line(&format!("  recorded {:?} = {:?}", r.fact, r.value));
+        line(&format!("  recorded {}", label::read(r)));
     }
     s
 }
@@ -587,11 +594,11 @@ impl Done {
 }
 
 /// `--walk <records> <root> <entry>...` over `src`.
-fn walk_mode(records: &str, src: &mut dyn walk::Source, entries: &[String]) -> Done {
-    let (walked, summary) = walk::walk(src, entries);
+fn walk_mode(records: &str, src: &mut dyn walk::Source, skins: &[walk::Skin], build: &str) -> Done {
+    let (walked, summary) = walk::walk(src, skins, build);
     let text = match walked.to_text() {
         Ok(t) => t,
-        // The summary prints the same labels: neither is given.
+        // The serializer failed: nothing is written, and no summary given.
         Err(e) => return Done::fail(e),
     };
     if let Err(e) = std::fs::write(records, text) {
@@ -647,8 +654,11 @@ fn new_mode(flag: &str, args: &[String]) -> Option<Done> {
                     _ => None,
                 })
                 .collect();
-            let entries: Vec<String> = skins.iter().map(|(_, e)| e.clone()).collect();
-            Some(walk_mode(records, &mut walk::Disk(skins), &entries))
+            let named: Vec<walk::Skin> = skins.iter().map(|(r, e)| walk::Skin::at(r, e)).collect();
+            Some(match build_identity() {
+                Ok(build) => walk_mode(records, &mut walk::Disk(skins), &named, &build),
+                Err(e) => Done::fail(e),
+            })
         }
         ("--compare", [kept, new]) if !kept.starts_with("--") && !new.starts_with("--") => {
             Some(compare_mode(kept, new))
@@ -657,8 +667,30 @@ fn new_mode(flag: &str, args: &[String]) -> Option<Done> {
     }
 }
 
+/// The running build's identity: the SHA-256 of its executable.
+fn build_identity() -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::env::current_exe()
+        .and_then(std::fs::read)
+        .map_err(|e| format!("the build's executable could not be read: {:?}", e.kind()))?;
+    Ok(walk::hex(&Sha256::digest(&bytes)))
+}
+
+/// The command line's arguments; `None` when one is not valid Unicode
+/// (never printed: it may name a skin).
+fn arguments() -> Option<Vec<String>> {
+    std::env::args_os()
+        .skip(1)
+        .map(std::ffi::OsString::into_string)
+        .collect::<Result<_, _>>()
+        .ok()
+}
+
 fn main() {
-    let all: Vec<String> = std::env::args().skip(1).collect();
+    let Some(all) = arguments() else {
+        eprintln!("an argument is not valid Unicode");
+        std::process::exit(2);
+    };
     if let Some((flag, args)) = all.split_first() {
         match flag.as_str() {
             "--catalogue" => {
@@ -686,16 +718,13 @@ fn main() {
     if args.is_empty() || !args.len().is_multiple_of(2) {
         usage();
     }
-    let mut kinds: BTreeMap<String, u32> = BTreeMap::new();
+    let mut kinds: BTreeMap<label::Label, u32> = BTreeMap::new();
     for (index, pair) in args.chunks(2).enumerate() {
         let [root, entry] = pair else { continue };
         let cancel = Cancel::new();
         let survey = survey_entry(root, entry, &facts, &cancel, local, &choice);
         print!("{}", report(index, &survey));
-        let kind = survey
-            .kind
-            .map_or_else(|| "none".to_owned(), |k| format!("{k:?}"));
-        *kinds.entry(kind).or_default() += 1;
+        *kinds.entry(label::kind(survey.kind)).or_default() += 1;
     }
     for (kind, n) in &kinds {
         println!("kind {kind}: {n}");

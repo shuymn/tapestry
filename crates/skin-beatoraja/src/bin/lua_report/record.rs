@@ -2,15 +2,19 @@
 //! TOML file per walk, one record per skin and configuration holding the
 //! default report's allowlisted values, without the values that differ
 //! between two runs of one build (the import's instruction count and peak
-//! memory, the runtime frame's wall time).
+//! memory, the runtime frame's wall time). Every string a record holds is
+//! a [`Label`]: one the default report prints, taken from the same
+//! function, or one of the walk's own words.
 
 use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
-use skin_beatoraja::lua::survey::{Survey, in_vocabulary};
+use skin_beatoraja::lua::survey::Survey;
+
+use super::label::{self, Label};
 
 /// The records' format version; another is refused, never converted.
-pub const VERSION: u32 = 1;
+pub const VERSION: u32 = 2;
 
 /// One walk.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -21,6 +25,10 @@ pub struct Records {
     pub facts: String,
     /// What a result skin adds to them.
     pub result_facts: String,
+    /// The walking build's identity: the SHA-256 of its executable (never
+    /// printed). Two runs of one build that disagree on an outcome are
+    /// not judged.
+    pub build: String,
     pub skins: usize,
     pub records: usize,
     #[serde(default)]
@@ -36,7 +44,7 @@ pub struct SkinEntry {
     pub index: usize,
     /// Its catalogue digest (never printed).
     pub digest: String,
-    pub kind: String,
+    pub kind: Label,
     pub configurations: usize,
 }
 
@@ -50,33 +58,33 @@ pub struct Record {
     pub skin: usize,
     pub configuration: usize,
     /// `default`, `option` or `file`.
-    pub toggle: String,
+    pub toggle: Label,
     /// The option and item, or file choice and candidate, by their
     /// indices in the header.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub position: Option<[usize; 2]>,
-    pub kind: String,
-    pub outcome: String,
+    pub kind: Label,
+    pub outcome: Label,
     /// The attempts' outcomes of an `inconclusive` or `unstable` record.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub attempts: Vec<String>,
+    pub attempts: Vec<Label>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub at: Option<At>,
     pub modules: usize,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub callbacks: BTreeMap<String, u32>,
+    pub callbacks: BTreeMap<Label, u32>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub callables: BTreeMap<String, u32>,
+    pub callables: BTreeMap<Label, u32>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub notes: BTreeMap<String, u32>,
+    pub notes: BTreeMap<Label, u32>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub facts: BTreeMap<String, u32>,
+    pub facts: BTreeMap<Label, u32>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub reads: Vec<String>,
+    pub reads: Vec<Label>,
     pub root_script: u32,
     pub root_unread: u32,
-    #[serde(default, skip_serializing_if = "String::is_empty")]
-    pub effects: String,
+    #[serde(default, skip_serializing_if = "Label::is_empty")]
+    pub effects: Label,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effects_at: Option<At>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -87,16 +95,16 @@ pub struct Record {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub play_elements: Option<usize>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub play_timers: BTreeMap<String, usize>,
+    pub play_timers: BTreeMap<Label, usize>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub gauges: Vec<String>,
+    pub gauges: Vec<Label>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub atlas: Vec<String>,
+    pub atlas: Vec<Label>,
     /// Widget charge, capacity, most quads, dropped, chips.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frames: Option<[u64; 5]>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub usage: BTreeMap<String, u64>,
+    pub usage: BTreeMap<Label, u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<Runtime>,
 }
@@ -107,17 +115,17 @@ pub struct Record {
 pub struct Runtime {
     pub outputs: usize,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub status: BTreeMap<String, u32>,
+    pub status: BTreeMap<Label, u32>,
     /// Its notes, by what they are.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub notes: BTreeMap<String, u32>,
+    pub notes: BTreeMap<Label, u32>,
     pub dropped: u64,
     pub instructions: u64,
     pub host_calls: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub stops: Vec<String>,
+    pub stops: Vec<Label>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub stopped: Option<String>,
+    pub stopped: Option<Label>,
 }
 
 fn at(a: Option<(usize, u32, u32)>) -> Option<At> {
@@ -129,55 +137,48 @@ impl Record {
     pub fn of(
         skin: usize,
         configuration: usize,
-        (toggle, position): (&str, Option<[usize; 2]>),
+        (toggle, position): (&'static str, Option<[usize; 2]>),
         s: &Survey,
-        attempts: Vec<String>,
+        attempts: Vec<Label>,
     ) -> Self {
         let u = s.usage;
         // Left out: the import's instruction count and peak memory, which
         // differ between two runs of one build.
-        let usage: BTreeMap<String, u64> = BTreeMap::from([
-            ("host_calls".to_owned(), u64::from(u.host_calls)),
-            ("native_work".to_owned(), u.native_work),
-            ("loads".to_owned(), u64::from(u.loads)),
-            ("requires".to_owned(), u64::from(u.requires)),
-            ("dofiles".to_owned(), u64::from(u.dofiles)),
-            ("missing_loads".to_owned(), u64::from(u.missing_loads)),
-            ("input_bytes".to_owned(), u.input_bytes),
-            ("protected_calls".to_owned(), u64::from(u.protected_calls)),
-            ("metatables".to_owned(), u64::from(u.metatables)),
-            ("ast_nodes".to_owned(), u.ast_nodes),
-            ("captures".to_owned(), u.captures),
-            ("expanded".to_owned(), u.expanded),
-        ]);
+        let usage: BTreeMap<Label, u64> = [
+            ("host_calls", u64::from(u.host_calls)),
+            ("native_work", u.native_work),
+            ("loads", u64::from(u.loads)),
+            ("requires", u64::from(u.requires)),
+            ("dofiles", u64::from(u.dofiles)),
+            ("missing_loads", u64::from(u.missing_loads)),
+            ("input_bytes", u.input_bytes),
+            ("protected_calls", u64::from(u.protected_calls)),
+            ("metatables", u64::from(u.metatables)),
+            ("ast_nodes", u.ast_nodes),
+            ("captures", u.captures),
+            ("expanded", u.expanded),
+        ]
+        .into_iter()
+        .map(|(k, v)| (Label::fixed(k), v))
+        .collect();
         Self {
             skin,
             configuration,
-            toggle: toggle.to_owned(),
+            toggle: Label::fixed(toggle),
             position,
-            kind: s
-                .kind
-                .map_or_else(|| "none".to_owned(), |k| format!("{k:?}")),
-            outcome: s.outcome.clone(),
+            kind: label::kind(s.kind),
+            outcome: label::outcome(s),
             attempts,
             at: at(s.at),
             modules: s.modules,
-            callbacks: s.outcomes.clone(),
-            callables: s
-                .callables
-                .iter()
-                .map(|((f, k), n)| (format!("{f} {k}"), *n))
-                .collect(),
-            notes: s.notes.clone(),
-            facts: s.facts.clone(),
-            reads: s
-                .reads
-                .iter()
-                .map(|r| format!("{:?} = {:?}", r.fact, r.value))
-                .collect(),
+            callbacks: label::callbacks(s),
+            callables: label::callables(s),
+            notes: label::notes(s),
+            facts: label::facts(s),
+            reads: s.reads.iter().map(label::read).collect(),
             root_script: s.root_script,
             root_unread: s.root_unread,
-            effects: s.effects.clone(),
+            effects: label::effects(s),
             effects_at: at(s.effects_at),
             frame_ops: s.frame_ops.map(|(a, b)| [a, b]),
             play_ending: s
@@ -187,14 +188,14 @@ impl Record {
             play_timers: s
                 .play_elements
                 .as_ref()
-                .map(|(_, by)| by.clone())
+                .map(|(_, by)| label::timers(by))
                 .unwrap_or_default(),
             gauges: s
                 .gauges
                 .iter()
-                .map(|(segments, motion)| format!("segments {segments} motion {motion}"))
+                .map(|(segments, motion)| label::gauge(*segments, motion))
                 .collect(),
-            atlas: s.atlas.clone(),
+            atlas: s.atlas.iter().map(|a| label::atlas(a)).collect(),
             frames: s.frames.map(|f| {
                 [
                     u64::from(f.widget_quads),
@@ -208,17 +209,17 @@ impl Record {
             runtime: s.runtime.as_ref().map(|rt| {
                 let mut notes = BTreeMap::new();
                 for n in &rt.notes {
-                    *notes.entry(n.what.to_owned()).or_default() += 1;
+                    *notes.entry(label::runtime_what(n)).or_default() += 1;
                 }
                 Runtime {
                     outputs: rt.outputs,
-                    status: rt.status.clone(),
+                    status: label::status(rt),
                     notes,
                     dropped: rt.dropped,
                     instructions: rt.instructions,
                     host_calls: rt.host_calls,
-                    stops: rt.stops.iter().map(|s| (*s).to_owned()).collect(),
-                    stopped: rt.stopped.clone(),
+                    stops: label::stops(rt),
+                    stopped: label::stopped(rt),
                 }
             }),
         }
@@ -228,56 +229,42 @@ impl Record {
     pub fn toggle_label(&self) -> String {
         match self.position {
             Some([a, b]) => format!("{} {a} {b}", self.toggle),
-            None => self.toggle.clone(),
+            None => self.toggle.to_string(),
         }
     }
 
-    /// Every string the record holds besides its field names, by the
-    /// field that holds it.
-    fn strings(&self) -> Vec<(&'static str, &str)> {
-        let mut v = vec![
-            ("toggle", self.toggle.as_str()),
-            ("kind", self.kind.as_str()),
-            ("outcome", self.outcome.as_str()),
-            ("effects", self.effects.as_str()),
-        ];
-        v.extend(self.attempts.iter().map(|s| ("attempts", s.as_str())));
-        for (field, m) in [
-            ("callbacks", &self.callbacks),
-            ("callables", &self.callables),
-            ("notes", &self.notes),
-            ("facts", &self.facts),
-        ] {
-            v.extend(m.keys().map(|k| (field, k.as_str())));
+    /// The labels it took from its survey (not its toggle, its usage keys
+    /// or its attempts), each one the default report prints.
+    #[cfg(test)]
+    pub fn survey_labels(&self) -> Vec<&Label> {
+        let mut v = vec![&self.kind, &self.outcome];
+        if !self.effects.is_empty() {
+            v.push(&self.effects);
         }
-        v.extend(self.reads.iter().map(|s| ("reads", s.as_str())));
-        v.extend(self.play_timers.keys().map(|s| ("play_timers", s.as_str())));
-        v.extend(self.gauges.iter().map(|s| ("gauges", s.as_str())));
-        v.extend(self.atlas.iter().map(|s| ("atlas", s.as_str())));
+        for m in [&self.callbacks, &self.callables, &self.notes, &self.facts] {
+            v.extend(m.keys());
+        }
+        v.extend(&self.reads);
+        v.extend(self.play_timers.keys());
+        v.extend(&self.gauges);
+        v.extend(&self.atlas);
         if let Some(rt) = &self.runtime {
-            v.extend(rt.status.keys().map(|s| ("runtime status", s.as_str())));
-            v.extend(rt.notes.keys().map(|s| ("runtime notes", s.as_str())));
-            v.extend(rt.stops.iter().map(|s| ("runtime stops", s.as_str())));
-            v.extend(rt.stopped.iter().map(|s| ("runtime stopped", s.as_str())));
+            v.extend(rt.status.keys());
+            v.extend(rt.notes.keys());
+            v.extend(&rt.stops);
+            v.extend(&rt.stopped);
         }
         v
-    }
-
-    /// The first string outside the report's vocabulary, by its field.
-    pub fn outside_vocabulary(&self) -> Option<&'static str> {
-        self.strings()
-            .into_iter()
-            .find(|(_, s)| !in_vocabulary(s))
-            .map(|(field, _)| field)
     }
 }
 
 impl Records {
-    pub fn new(facts: &str, result_facts: &str) -> Self {
+    pub fn new(facts: &str, result_facts: &str, build: &str) -> Self {
         Self {
             version: VERSION,
             facts: facts.to_owned(),
             result_facts: result_facts.to_owned(),
+            build: build.to_owned(),
             skins: 0,
             records: 0,
             skin: Vec::new(),
@@ -297,20 +284,8 @@ impl Records {
     ///
     /// # Errors
     ///
-    /// A record holding a string outside the report's vocabulary, named
-    /// by its skin, configuration and field (the string is not given).
+    /// The serializer's failure.
     pub fn to_text(&self) -> Result<String, String> {
-        if let Some((r, field)) = self
-            .record
-            .iter()
-            .find_map(|r| r.outside_vocabulary().map(|f| (r, f)))
-        {
-            return Err(format!(
-                "skin {} configuration {}: its {field} holds a string outside the report's \
-                 vocabulary; no records written",
-                r.skin, r.configuration
-            ));
-        }
         toml::to_string(self).map_err(|e| format!("the records could not be written: {e}"))
     }
 

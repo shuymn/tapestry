@@ -16,6 +16,7 @@ use skin_beatoraja::lua::survey::{Choice, Probe, Survey, probe, survey_probe};
 use skin_beatoraja::{Cancel, Header};
 use skin_model::ScreenKind;
 
+use super::label::{self, Label};
 use super::record::{Record, Records, SkinEntry};
 
 /// The import facts every configuration is walked under.
@@ -136,19 +137,52 @@ fn put_num(buf: &mut Vec<u8>, n: i64) {
     buf.extend_from_slice(&n.to_le_bytes());
 }
 
-fn hex(bytes: &[u8]) -> String {
+/// `bytes` in lower-case hexadecimal.
+pub fn hex(bytes: &[u8]) -> String {
     bytes.iter().fold(String::new(), |mut s, b| {
         let _ = write!(s, "{b:02x}");
         s
     })
 }
 
-/// The catalogue digest of `header` read from `entry`: SHA-256 over a
-/// length-prefixed encoding of every header field and the entry.
-pub fn digest(header: &Header, entry: &str) -> String {
+/// A skin as the walk names it: its folder's name and its entry. Both go
+/// into its digest (never printed), so that two folders with one header
+/// and entry stay two skins whatever their order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Skin {
+    pub folder: String,
+    pub entry: String,
+}
+
+impl Skin {
+    /// The skin at `root` with `entry`: the folder's own name, resolved
+    /// when `root` ends in `.` or `..`.
+    pub fn at(root: &str, entry: &str) -> Self {
+        let path = std::path::Path::new(root);
+        let folder = std::fs::canonicalize(path)
+            .ok()
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| root.to_owned());
+        Self {
+            folder,
+            entry: entry.to_owned(),
+        }
+    }
+
+    fn put(&self, b: &mut Vec<u8>) {
+        put(b, self.folder.as_bytes());
+        put(b, self.entry.replace('\\', "/").as_bytes());
+    }
+}
+
+/// The catalogue digest of `header` read as `skin`: SHA-256 over a
+/// length-prefixed encoding of the folder's name, the entry and every
+/// header field.
+pub fn digest(header: &Header, skin: &Skin) -> String {
     let mut b = Vec::new();
     put(&mut b, b"header");
-    put(&mut b, entry.replace('\\', "/").as_bytes());
+    skin.put(&mut b);
     put(&mut b, format!("{:?}", header.kind).as_bytes());
     put_num(&mut b, i64::from(header.size[0]));
     put_num(&mut b, i64::from(header.size[1]));
@@ -186,11 +220,11 @@ pub fn digest(header: &Header, entry: &str) -> String {
 }
 
 /// The digest standing for a header that was not read: its outcome and
-/// the entry, so that a stable refusal compares equal.
-fn refusal_digest(outcome: &str, entry: &str) -> String {
+/// the skin, so that a stable refusal compares equal.
+fn refusal_digest(outcome: &str, skin: &Skin) -> String {
     let mut b = Vec::new();
     put(&mut b, b"refused");
-    put(&mut b, entry.replace('\\', "/").as_bytes());
+    skin.put(&mut b);
     put(&mut b, outcome.as_bytes());
     hex(&Sha256::digest(&b))
 }
@@ -237,73 +271,63 @@ fn panicked() -> Survey {
 /// the digest the read gave (`None` when refused) and the survey.
 fn attempt(
     src: &mut dyn Source,
-    skin: usize,
-    entry: &str,
+    index: usize,
+    skin: &Skin,
     facts: &ImportFacts,
     choice: &Choice,
 ) -> (Option<String>, Survey) {
-    let mut p = match catch_unwind(AssertUnwindSafe(|| src.probe(skin))) {
+    let mut p = match catch_unwind(AssertUnwindSafe(|| src.probe(index))) {
         Ok(Ok(p)) => p,
         Ok(Err(refused)) => return (None, *refused),
         Err(_) => return (None, panicked()),
     };
-    let d = p.header().map(|h| digest(h, entry));
+    let d = p.header().map(|h| digest(h, skin));
     let s = catch_unwind(AssertUnwindSafe(|| src.survey(&mut p, facts, choice)))
         .unwrap_or_else(|_| panicked());
     (d, s)
 }
 
-/// Two attempts settled into one record's survey and outcome: a
-/// timed-out attempt is no outcome; two that timed out are
-/// `inconclusive`; two completed ones that disagree (outcome or digest)
-/// are `unstable`; otherwise the first completed one.
+/// Whether an attempt read another header than `digest`'s: another
+/// digest, or (unless the clock stopped the read) none.
+fn other_header(digest: &str, a: &(Option<String>, Survey)) -> bool {
+    match a.0.as_deref() {
+        Some(d) => d != digest,
+        None => !a.1.timed_out,
+    }
+}
+
+/// Two attempts settled into one record's survey and outcome: two that
+/// read different headers are `unstable`, whether or not the clock
+/// stopped either; otherwise a timed-out attempt is no outcome, two that
+/// timed out are `inconclusive`, two completed ones that disagree are
+/// `unstable`, and else the first completed one is the record.
 fn settle(
     digest: &str,
     a: (Option<String>, Survey),
     b: (Option<String>, Survey),
-) -> (Survey, Vec<String>) {
+) -> (Survey, Vec<Label>) {
+    if other_header(digest, &a) || other_header(digest, &b) {
+        return undecided("unstable", &a.1, &b.1);
+    }
     match (a.1.timed_out, b.1.timed_out) {
-        (true, true) => {
-            let attempts = vec![a.1.outcome.clone(), b.1.outcome];
-            (
-                Survey {
-                    outcome: "inconclusive".to_owned(),
-                    kind: a.1.kind,
-                    ..Survey::default()
-                },
-                attempts,
-            )
-        }
-        (true, false) => one(digest, b),
-        (false, true) => one(digest, a),
-        (false, false) => {
-            let same_digest = a.0.as_deref() == Some(digest) && b.0.as_deref() == Some(digest);
-            if a.1.outcome == b.1.outcome && same_digest {
-                (a.1, Vec::new())
-            } else {
-                unstable(&a.1, &b.1)
-            }
-        }
+        (true, true) => undecided("inconclusive", &a.1, &b.1),
+        (true, false) => (b.1, Vec::new()),
+        (false, true) => (a.1, Vec::new()),
+        (false, false) if a.1.outcome == b.1.outcome => (a.1, Vec::new()),
+        (false, false) => undecided("unstable", &a.1, &b.1),
     }
 }
 
-/// One completed attempt, `unstable` when its header was not `digest`'s.
-fn one(digest: &str, a: (Option<String>, Survey)) -> (Survey, Vec<String>) {
-    if a.0.as_deref() == Some(digest) {
-        (a.1, Vec::new())
-    } else {
-        unstable(&a.1, &a.1)
-    }
-}
-
-fn unstable(a: &Survey, b: &Survey) -> (Survey, Vec<String>) {
+/// A record that is neither attempt's: `outcome` (`unstable` or
+/// `inconclusive`), with both attempts' outcomes.
+fn undecided(outcome: &str, a: &Survey, b: &Survey) -> (Survey, Vec<Label>) {
     (
         Survey {
-            outcome: "unstable".to_owned(),
+            outcome: outcome.to_owned(),
             kind: a.kind,
             ..Survey::default()
         },
-        vec![a.outcome.clone(), b.outcome.clone()],
+        vec![label::outcome(a), label::outcome(b)],
     )
 }
 
@@ -325,7 +349,7 @@ fn facts_for(kind: ScreenKind) -> (ImportFacts, Choice) {
 /// A skin's header for the walk: its first read, read once more when a
 /// wall-clock limit refused it; the probe, or the survey a refusal gives
 /// (`inconclusive` when both reads timed out) and the attempts' outcomes.
-fn header_of(src: &mut dyn Source, skin: usize) -> Result<Probe, Box<(Survey, Vec<String>)>> {
+fn header_of(src: &mut dyn Source, skin: usize) -> Result<Probe, Box<(Survey, Vec<Label>)>> {
     let mut read = || match catch_unwind(AssertUnwindSafe(|| src.probe(skin))) {
         Ok(r) => r,
         Err(_) => Err(Box::new(panicked())),
@@ -342,21 +366,21 @@ fn header_of(src: &mut dyn Source, skin: usize) -> Result<Probe, Box<(Survey, Ve
                 outcome: "inconclusive".to_owned(),
                 ..Survey::default()
             },
-            vec![refused.outcome, again.outcome],
+            vec![label::outcome(&refused), label::outcome(&again)],
         ))),
         Err(again) => Err(Box::new((*again, Vec::new()))),
     }
 }
 
-/// Walks every skin of `src` (`entries`, their entries in argument
-/// order) and returns the records and the summary to print.
-pub fn walk(src: &mut dyn Source, entries: &[String]) -> (Records, String) {
+/// Walks every skin of `src` (`skins`, in argument order) and returns
+/// the records, marked as `build`'s, and the summary to print.
+pub fn walk(src: &mut dyn Source, skins: &[Skin], build: &str) -> (Records, String) {
     skin_beatoraja::vm_hooks::set_frame_time(Some(FRAME_TIME));
     let start = std::time::Instant::now();
-    let mut records = Records::new(FACTS, RESULT_FACTS);
+    let mut records = Records::new(FACTS, RESULT_FACTS, build);
     let mut summary = String::new();
     let (mut walked, mut imported_total) = (0, 0);
-    for (skin, entry) in entries.iter().enumerate() {
+    for (skin, named) in skins.iter().enumerate() {
         let mut list = Vec::new();
         // A source's read that gives no header is a refusal like any other
         // (a panic's), so the skin keeps its record.
@@ -367,12 +391,12 @@ pub fn walk(src: &mut dyn Source, entries: &[String]) -> (Records, String) {
         let (digest, kind) = match read {
             Err(refused) => {
                 let (s, attempts) = *refused;
-                let d = refusal_digest(&s.outcome, entry);
+                let d = refusal_digest(&s.outcome, named);
                 list.push(Record::of(skin, 0, coordinates(None), &s, attempts));
                 (d, None)
             }
             Ok((mut p, header)) => {
-                let d = digest(&header, entry);
+                let d = digest(&header, named);
                 let (facts, base) = facts_for(header.kind);
                 let all = rows(&header);
                 let configurations = std::iter::once(None)
@@ -406,7 +430,7 @@ pub fn walk(src: &mut dyn Source, entries: &[String]) -> (Records, String) {
                     let (s, attempts) = if first.1.outcome == "imported" && !first.1.timed_out {
                         (first.1, Vec::new())
                     } else {
-                        let second = attempt(src, skin, entry, &facts, &choice);
+                        let second = attempt(src, skin, named, &facts, &choice);
                         settle(&d, first, second)
                     };
                     list.push(Record::of(skin, k, coordinates(row), &s, attempts));
@@ -416,7 +440,7 @@ pub fn walk(src: &mut dyn Source, entries: &[String]) -> (Records, String) {
         };
         let count = |o: &str| list.iter().filter(|r| r.outcome == o).count();
         let imported = count("imported");
-        let kind_label = kind.map_or_else(|| "none".to_owned(), |k| format!("{k:?}"));
+        let kind_label = label::kind(kind);
         let _ = writeln!(
             summary,
             "skin {skin}: {kind_label}, configurations {}, imported {imported}, \
@@ -450,7 +474,7 @@ pub fn walk(src: &mut dyn Source, entries: &[String]) -> (Records, String) {
     let _ = writeln!(
         summary,
         "walked {walked} configurations over {} skins, {imported_total} imported, {:.0} s",
-        entries.len(),
+        skins.len(),
         start.elapsed().as_secs_f64()
     );
     (records, summary)
