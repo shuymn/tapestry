@@ -1267,6 +1267,42 @@ fn a_practice_start_times_its_load_from_its_acceptance() {
     );
 }
 
+/// A practice Start restarts the load's stages (`[load_stages]`) at its
+/// acceptance, as it does the choice's time: the 30 ms the page waited
+/// after the chart's choice are not in the first Start's `ready`, and a
+/// second Start, after the first's stages were taken, has its own, each
+/// READY counted from its own Start.
+#[test]
+fn a_practice_start_restarts_the_load_stages_at_its_acceptance() {
+    let dir = tempfile::tempdir().unwrap();
+    song(dir.path(), "");
+    let mut b = bench(dir.path(), Decodes::default(), Spawner::SYSTEM);
+    on_rig(
+        b.sel.take().unwrap(),
+        &Installers::default(),
+        false,
+        |rig| {
+            // The chart's choice, then the page's dwell.
+            crate::dev::stages_begin(rig.clock, rig.clock.now());
+            std::thread::sleep(Duration::from_millis(30));
+            for start in ["the first Start", "a second Start"] {
+                rig.start_ready().unwrap();
+                let accepted = sel(rig).chosen_at;
+                std::thread::sleep(Duration::from_millis(5));
+                let ready = rig.clock.now();
+                crate::dev::stage_at("ready", Some(ready));
+                let stages = crate::dev::take_load_stages()
+                    .unwrap_or_else(|| panic!("{start}: no stages of its own"));
+                assert_eq!(
+                    stages,
+                    [("ready", ready.0 - accepted.0)],
+                    "{start}: READY from its acceptance"
+                );
+            }
+        },
+    );
+}
+
 /// A hook that records, at each release barrier before its unload, the
 /// decodes in flight and the banks alive the witness sees.
 fn at_each_barrier(witness: &WitnessSlot) -> (Option<Hook>, Seen) {

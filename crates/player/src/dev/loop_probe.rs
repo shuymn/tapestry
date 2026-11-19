@@ -26,9 +26,15 @@
 //! `ready_state_at`, the decision screen's end, the loading minimum's end)
 //! count, and the scenario's transition record (each state's first
 //! presented frame, READY's included). So choice → READY is the game's
-//! own line, and preparation → READY, or → the opening, is a subtraction
-//! of `prep:begin` from the record's READY or `g:open`. Every other mark
-//! is diagnostic: it names its
+//! own line, both its ends the game's (`chosen_at`, `ready_state_at`), as
+//! the `ready` stage's are; preparation → READY's first presented frame is
+//! that frame minus `prep:begin`, and opening → that frame that frame
+//! minus the latest `g:open` at or before it, all within one preparation
+//! (from its `prep:begin` to the next). A retry, a practice's later
+//! round and a direct `tapestry play` have no choice: theirs are
+//! `prep:begin` → `g:open` and, in a scenario, preparation → READY's first
+//! presented frame (a direct play has no transition record). Every other
+//! mark is diagnostic: it names its
 //! event truly (the array, view or upload it is of), and its interval is
 //! what is measured, with what it cannot leave out:
 //!

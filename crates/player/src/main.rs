@@ -969,6 +969,7 @@ fn rig<'a>(
         #[cfg(feature = "dev-tools")]
         result_script: None,
         load_start: TimeUs(0),
+        ready_figure_due: false,
         pending_retry: None,
         window: None,
         cursor: None,

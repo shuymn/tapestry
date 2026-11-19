@@ -3784,6 +3784,42 @@ fn the_probe_marks_the_first_frames_of_each_built_in_entry() {
     rig.link.exit();
 }
 
+/// With the transition probe on, a built-in entry's first frame tried again
+/// (not presented, so the entry not yet acknowledged) does not arm its
+/// probed frames (`rf:*`) again: its frames are probed three times, from
+/// the frame tried again on.
+#[test]
+fn the_probe_arms_a_built_in_entry_once_across_a_frame_tried_again() {
+    use crate::dev::loop_probe::tests::{marks, turn_on};
+    turn_on();
+    let rig = Rig::new();
+    let left = || -> Vec<i64> {
+        marks()
+            .iter()
+            .filter(|m| m.1 == "rf:frame_left")
+            .map(|m| m.2)
+            .collect()
+    };
+    let entry = rig.link.enter_result_entry(None);
+    rig.faults
+        .outcomes
+        .lock()
+        .unwrap()
+        .push_back(render::FrameOutcome::Retry);
+    rig.link.show_end(EndPage {
+        lines: vec!["page".to_owned()],
+        graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
+    });
+    assert!(wait_until(|| rig.link.result_acknowledged() == entry));
+    assert!(wait_until(|| left().len() >= 3), "{:?}", left());
+    rig.clear();
+    assert!(wait_until(|| rig.drawn().len() >= 3), "{:?}", rig.drawn());
+    assert_eq!(left(), [2, 1, 0], "armed again at the frame tried again");
+    rig.link.exit();
+}
+
 /// V5's render half (design.md "State Model", system sounds, Result): a
 /// frame acknowledges the entry it draws a picture of, not one entered
 /// while it draws, the skin's view and a built-in one alike, frames

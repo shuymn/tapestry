@@ -2858,6 +2858,7 @@ impl PlayerRig<'_> {
             }
             sel.shelf.choose(path);
             sel.chosen_at = self.clock.now();
+            self.ready_figure_due = true;
             #[cfg(feature = "dev-tools")]
             crate::dev::stages_begin(self.clock, sel.chosen_at);
             #[cfg(feature = "dev-tools")]
@@ -4381,17 +4382,22 @@ impl AppRig for PlayerRig<'_> {
             .map_err(game::LiveError::Load)
     }
 
-    /// The one routine of every entry into the practice page: on opening
-    /// and after every return (a refused Start, a refused opening or
-    /// restore, the rounds left by the quit key or a result's back).
+    /// A Start taken on the practice page, before anything of it begins
+    /// (the chart's read at the chosen speed, the practice's fit): the
+    /// play skin's readiness, and, when it admits the Start, the Start's
+    /// time as the choice's.
     fn start_ready(&mut self) -> Result<(), String> {
-        // A Start taken chooses again: its load times run from here.
+        // A Start taken chooses again: its load times, and its load's
+        // stages (dev-tools), run from here.
         let now = self.clock.now();
         self.skin.ready().inspect_err(|notice| {
             println!("practice: not started: {notice}");
         })?;
         if let Some(sel) = self.selection.as_mut() {
             sel.chosen_at = now;
+            self.ready_figure_due = true;
+            #[cfg(feature = "dev-tools")]
+            crate::dev::stages_begin(self.clock, now);
         }
         Ok(())
     }

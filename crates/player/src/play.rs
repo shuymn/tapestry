@@ -304,6 +304,11 @@ pub struct PlayerRig<'a> {
     /// clock's 0), or the end of what the command set up first (a
     /// measurement's PresentMon capture).
     pub load_start: TimeUs,
+    /// A choice or a practice Start was taken and its READY has not
+    /// started: the console's choice → READY figure is due at the next
+    /// play's start, once, at the READY the load's `ready` stage
+    /// (dev-tools) is stamped at; a retry or a later round prints none.
+    pub ready_figure_due: bool,
     /// The latest retry taken, by its receipt time: the next play starts
     /// from it.
     pub pending_retry: Option<TimeUs>,
@@ -2920,12 +2925,19 @@ impl Rig for PlayerRig<'_> {
         println!("play started");
         #[cfg(feature = "dev-tools")]
         crate::dev::print_result_work("ready");
-        // A chart's first play: a retry runs from its own receipt.
+        // The first READY after a choice or a practice Start: a retry, a
+        // later round print none. From the choice's time to READY's, the
+        // two the load's `ready` stage (dev-tools) subtracts too: one
+        // figure, in ms and in µs.
         if let Some(sel) = &self.selection
-            && self.retry_from.is_none()
+            && std::mem::take(&mut self.ready_figure_due)
         {
-            let ms = since(sel.chosen_at, started).as_millis();
-            println!("load: READY started {ms} ms after the choice");
+            let after = since(sel.chosen_at, ready_state_at);
+            println!(
+                "load: READY started {} ms after the choice ({} us)",
+                after.as_millis(),
+                after.as_micros()
+            );
         }
         // Before the play is sent: the audio thread may mix its first wake
         // before this thread runs again.

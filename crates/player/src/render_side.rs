@@ -4299,6 +4299,8 @@ pub fn spawn(
                 frames,
                 shared: thread_shared,
                 end_page: (0, EndPage::default()),
+                #[cfg(feature = "dev-tools")]
+                rf_armed: 0,
                 granted: false,
                 image: Image::default(),
                 first_frame: None,
@@ -5557,6 +5559,11 @@ struct Run {
     shared: Arc<Shared>,
     /// The end screen's page last taken from the slot, and its number.
     end_page: (u64, EndPage),
+    /// The Result entry whose built-in page, with no result lifetime, last
+    /// armed the result's probed frames (`rf:*`, dev-tools): once per entry,
+    /// a frame tried again included.
+    #[cfg(feature = "dev-tools")]
+    rf_armed: u64,
     /// The screen's wait granted a frame that no draw has taken yet: the
     /// end screen was left or nothing was to be drawn. Only a presented
     /// frame gives the grant back (a swap chain's waitable object, one
@@ -7484,13 +7491,15 @@ impl Run {
                         .then(|| self.shared.result_entries.drawing());
                     // The first frames of an entry's built-in page with no
                     // result lifetime, as a lifetime's first view's are
-                    // (`rf:*`, dev-tools): armed while the entry's first
-                    // picture is not acknowledged, so a page after a
-                    // picture the entry already showed arms nothing.
+                    // (`rf:*`, dev-tools): armed once per entry, and only
+                    // while its first picture is not acknowledged, so a
+                    // frame tried again does not arm them again and a page
+                    // after a picture the entry already showed arms nothing.
                     #[cfg(feature = "dev-tools")]
                     {
                         if let Some(entry) = result_picture
                             && entry != 0
+                            && entry != self.rf_armed
                             && entry
                                 != self
                                     .shared
@@ -7499,6 +7508,7 @@ impl Run {
                                     .load(Ordering::Acquire)
                             && crate::dev::loop_probe::on()
                         {
+                            self.rf_armed = entry;
                             crate::dev::loop_probe::RESULT_FRAMES
                                 .store(3, std::sync::atomic::Ordering::Relaxed);
                         }
