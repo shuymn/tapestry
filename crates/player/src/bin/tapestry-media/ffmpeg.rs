@@ -27,7 +27,7 @@
 //! the video's frame ring.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
-use std::io::{Read as _, SeekFrom, Write as _};
+use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::ptr;
 
 use ffmpeg_sys_next as ff;
@@ -39,9 +39,10 @@ use skin_model::media::{MAX_PIXELS, MAX_SIDE};
 /// (design.md "Threat Model" T02).
 pub const MAX_ALLOC: usize = 63 << 20;
 
-/// The bytes a probe or a seek may read, and the seeks it may make: well
-/// over what FFmpeg reads and seeks to probe a healthy video or to seek in
-/// one, whatever a file's layout makes it scan.
+/// The bytes a probe or a seek may read, and the seeks it may ask for, a
+/// request for the file's size counted as one: well over what FFmpeg reads
+/// and seeks to probe a healthy video or to seek in one, whatever a file's
+/// layout makes it scan.
 const BUDGET: (u64, u32) = (64 << 20, 256);
 
 /// FFmpeg's error for a read or a seek past its budget.
@@ -601,10 +602,14 @@ unsafe extern "C" fn seek(opaque: *mut c_void, offset: i64, whence: c_int) -> i6
     seek_in(&mut source.file, offset, whence)
 }
 
-/// Moves in `file` as FFmpeg asks a seek callback to, or gives its size.
-fn seek_in(file: &mut impl std::io::Seek, offset: i64, whence: c_int) -> i64 {
+/// Moves in `file` as FFmpeg asks a seek callback to, or gives its size,
+/// read from its metadata without moving: one call moves in the file once
+/// at most.
+fn seek_in(file: &mut std::fs::File, offset: i64, whence: c_int) -> i64 {
     let at = if whence & ff::AVSEEK_SIZE != 0 {
-        size(file)
+        file.metadata()
+            .ok()
+            .and_then(|m| i64::try_from(m.len()).ok())
     } else {
         let to = match whence & !ff::AVSEEK_FORCE {
             0 => u64::try_from(offset).ok().map(SeekFrom::Start),
@@ -616,14 +621,6 @@ fn seek_in(file: &mut impl std::io::Seek, offset: i64, whence: c_int) -> i64 {
             .and_then(|at| i64::try_from(at).ok())
     };
     at.unwrap_or_else(|| i64::from(averror(ff::EIO)))
-}
-
-/// The file's length, its position kept.
-fn size(file: &mut impl std::io::Seek) -> Option<i64> {
-    let here = file.stream_position().ok()?;
-    let end = file.seek(SeekFrom::End(0)).ok()?;
-    file.seek(SeekFrom::Start(here)).ok()?;
-    i64::try_from(end).ok()
 }
 
 /// What a probe found.
