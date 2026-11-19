@@ -2721,6 +2721,12 @@ dependencies = [
 [[package]]
 name = "test-device"
 version = "0.0.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+]
 
 [[package]]
 name = "thiserror"
