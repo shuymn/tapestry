@@ -492,11 +492,19 @@ fn the_transition_probe_marks_each_event() {
         assert!(first.is_some_and(|[_, m]| near(m, MARK)), "{first:?}");
         prepared(rig, &b);
         // Frames of another picture between B's upload and its result's
-        // first frame: the first use is the result's, not theirs.
+        // first frame, each drawing a sprite (a built-in page's cursor bar)
+        // of another array: the first use is the result's, not theirs.
         let at = probe_now();
-        rig.render
-            .loading()
-            .show(crate::render_side::tests::one_line("between"));
+        rig.render.show_decision(
+            crate::menu_screen::MenuPage {
+                lines: vec![crate::menu_screen::MenuLine {
+                    text: "between".to_owned(),
+                    style: crate::menu_screen::LineStyle::Cursor,
+                }],
+                caret: None,
+            },
+            None,
+        );
         let end = Instant::now() + Duration::from_secs(10);
         while presents_after(at) < 3 && Instant::now() < end {
             std::thread::sleep(Duration::from_millis(5));
