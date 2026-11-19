@@ -561,7 +561,7 @@ pub(super) struct DecidedSink(pub(super) Arc<Decided>);
 
 impl crate::render_side::FrameSink for DecidedSink {
     fn frame(&mut self, _: &dyn Screen, drawn: &crate::measure::Drawn<'_>) {
-        if let Some(stamp) = drawn.decision.filter(|_| drawn.timing.presented) {
+        if let Some(stamp) = drawn.decision.filter(|_| drawn.timing.presented()) {
             self.0
                 .stamps
                 .lock()

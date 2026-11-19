@@ -544,6 +544,8 @@ impl Selection {
             return None;
         }
         self.rest.asked = true;
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("cur:rest", 0);
         Some(images.worker.cursor_request(
             crate::chart_images::folder(&chart.path),
             [chart.names.stagefile.clone(), chart.names.banner.clone()],
@@ -2213,6 +2215,8 @@ fn move_to(screen: &SelectScreen, menu: &MenuQueue, at: usize) -> bool {
     for _ in 0..at.abs_diff(cursor).min(PICK_BATCH) {
         menu.push(MenuInput::Key(key));
     }
+    #[cfg(feature = "dev-tools")]
+    crate::dev::loop_probe::mark("cur:move", i64::try_from(at).unwrap_or(-1));
     true
 }
 
@@ -2854,8 +2858,11 @@ impl PlayerRig<'_> {
             }
             sel.shelf.choose(path);
             sel.chosen_at = self.clock.now();
+            self.ready_figure_due = true;
             #[cfg(feature = "dev-tools")]
             crate::dev::stages_begin(self.clock, sel.chosen_at);
+            #[cfg(feature = "dev-tools")]
+            crate::dev::loop_probe::mark("cur:chose", 0);
             let name = file_name(path);
             let after = since(sel.entered_at, sel.chosen_at).as_millis();
             println!("select: chose {name}{what} {after} ms after entering selection");
@@ -3488,11 +3495,11 @@ impl PlayerRig<'_> {
             println!("load: cancelled");
             return Ok(Loading::Cancelled);
         }
-        // A practice's Start chooses again: its load times run from it.
-        let now = self.clock.now();
+        // A practice's Start chose again when it was taken
+        // ([`start_ready`](game::AppRig::start_ready)): its load times run
+        // from there, its read at the chosen speed and its fit included.
         let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
         if loaded.section().is_some() {
-            sel.chosen_at = now;
             // A Start decodes its own: a page bank still waiting for the
             // background is given up, and the Start waits for it itself.
             if let Some((_, pause)) = sel.page.take_pending() {
@@ -3950,7 +3957,11 @@ impl AppRig for PlayerRig<'_> {
     fn entered_decision(&mut self, pick: &Pick, d: game::Decision) -> game::Decision {
         // Selection is left, its images before the play generation's
         // renewal (SC5).
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("g:entered_decision", 0);
         self.left_selection();
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("g:left_selection_done", 0);
         // A new generation of the chart's images before the held loading
         // lifetime begins: none of the last choice's draws when the
         // deadline reveals it.
@@ -3983,6 +3994,8 @@ impl AppRig for PlayerRig<'_> {
         if let (Some(sc), Some(c)) = (&self.scenario, claimed) {
             sc.captures.bind_decision(c.lifetime, c.origin);
         }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("g:show_decision", 0);
         self.render.show_decision(shown.clone(), claimed);
         sel.decision = Some((shown, file_name(chart)));
         // The decision sound, once per decision screen whichever
@@ -4369,13 +4382,24 @@ impl AppRig for PlayerRig<'_> {
             .map_err(game::LiveError::Load)
     }
 
-    /// The one routine of every entry into the practice page: on opening
-    /// and after every return (a refused Start, a refused opening or
-    /// restore, the rounds left by the quit key or a result's back).
+    /// A Start taken on the practice page, before anything of it begins
+    /// (the chart's read at the chosen speed, the practice's fit): the
+    /// play skin's readiness, and, when it admits the Start, the Start's
+    /// time as the choice's.
     fn start_ready(&mut self) -> Result<(), String> {
+        // A Start taken chooses again: its load times, and its load's
+        // stages (dev-tools), run from here.
+        let now = self.clock.now();
         self.skin.ready().inspect_err(|notice| {
             println!("practice: not started: {notice}");
-        })
+        })?;
+        if let Some(sel) = self.selection.as_mut() {
+            sel.chosen_at = now;
+            self.ready_figure_due = true;
+            #[cfg(feature = "dev-tools")]
+            crate::dev::stages_begin(self.clock, now);
+        }
+        Ok(())
     }
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {

@@ -32,6 +32,22 @@ ignore = [
     # runtime font file chosen in the Windows fonts folder reaches it. Remove
     # it when a cosmic-text release (through glyphon) drops ttf-parser 0.25.
     { id = "RUSTSEC-2026-0192", reason = "unmaintained only, parses the Windows font file; remove when a cosmic-text release under glyphon drops ttf-parser 0.25" },
+    # `heapless` 0.8: nine soundness advisories fixed in 0.9.4. The firmware's
+    # own heapless is 0.9.4; 0.8 comes only through usb-device 0.3.2 (under
+    # usbd-hid under embassy-usb), which uses it for the string descriptor
+    # `Vec` of its own `UsbDevice` builder. The firmware runs embassy-usb's
+    # stack and takes only usbd-hid's descriptor types (embassy-usb
+    # class/hid.rs), so no usb-device or heapless 0.8 code runs. Remove these
+    # when usb-device (through usbd-hid) moves to heapless >= 0.9.4.
+    { id = "RUSTSEC-2026-0574", reason = "heapless 0.8 only through usb-device 0.3.2, whose code the firmware never runs; remove when usb-device moves to heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0575", reason = "heapless 0.8 only through usb-device 0.3.2, whose code the firmware never runs; remove when usb-device moves to heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0576", reason = "heapless 0.8 only through usb-device 0.3.2, whose code the firmware never runs; remove when usb-device moves to heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0577", reason = "heapless 0.8 only through usb-device 0.3.2, whose code the firmware never runs; remove when usb-device moves to heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0578", reason = "heapless 0.8 only through usb-device 0.3.2, whose code the firmware never runs; remove when usb-device moves to heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0579", reason = "heapless 0.8 only through usb-device 0.3.2, whose code the firmware never runs; remove when usb-device moves to heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0580", reason = "heapless 0.8 only through usb-device 0.3.2, whose code the firmware never runs; remove when usb-device moves to heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0581", reason = "heapless 0.8 only through usb-device 0.3.2, whose code the firmware never runs; remove when usb-device moves to heapless >= 0.9.4" },
+    { id = "RUSTSEC-2026-0582", reason = "heapless 0.8 only through usb-device 0.3.2, whose code the firmware never runs; remove when usb-device moves to heapless >= 0.9.4" },
     # `bare-metal` 0.2 is deprecated and archived, with no advisory against
     # its code. Only the firmware has it, through cortex-m 0.7 (under
     # embassy-rp and embassy-executor). Remove it when the firmware's

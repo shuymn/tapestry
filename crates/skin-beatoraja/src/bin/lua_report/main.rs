@@ -48,9 +48,30 @@
 //! `lua_report --catalogue <root> <entry> [<root> <entry>]...` prints, per
 //! skin, its header as the importer parses it, one tab-separated line per
 //! named option item (`option`, the option, the item) and per named file
-//! choice candidate (`file`, the choice, the candidate): the
-//! configurations a sweep reports each of. It names the skin's own
-//! options, so it too stays on the developer's PC.
+//! choice candidate (`file`, the choice, the candidate), its names'
+//! backslashes, tabs, CRs and LFs escaped: the rows the walk toggles, in
+//! its order (configuration n is a skin's n-th row). A JSON skin's header
+//! is read as the JSON import reads it. It names the skin's own options,
+//! so it too stays on the developer's PC.
+//!
+//! `lua_report --walk <records> <root> <entry> [<root> <entry>]...` walks
+//! each skin's default configuration and each catalogue row toggled alone
+//! under `--autoplay off --class normal --level 12` (and `--result dense`
+//! for a result skin), a refusal attempted once more, writes one
+//! record per skin and configuration to `<records>` and prints, per skin,
+//! the configurations walked and how many imported ([`walk`]).
+//!
+//! `lua_report --compare <kept> <new>` compares two walks' records and
+//! exits 1 on a new failure, 2 when a skin must be re-baselined or a
+//! configuration could not be judged, else 0 ([`compare`]). Neither mode
+//! prints a skin's names, paths or strings, nor its file arguments.
+
+mod compare;
+mod label;
+mod record;
+mod walk;
+#[cfg(test)]
+mod walk_tests;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -59,7 +80,7 @@ use std::path::PathBuf;
 use bms_model::TimeUs;
 use skin_beatoraja::lua::facts::{Fact, ImportFacts, JudgeClass};
 use skin_beatoraja::lua::survey::{
-    Choice, DestinationEntry, Local, RuntimeNoteRecord, Survey, survey_json, survey_with,
+    Choice, DestinationEntry, Local, RuntimeNoteRecord, Survey, probe, survey_json, survey_with,
 };
 use skin_beatoraja::{BgaMode, Cancel};
 use skin_model::{
@@ -73,7 +94,9 @@ const USAGE: &str = "usage: lua_report [--autoplay on|off] [--bga on|autoplay|of
                      [--level <n>|pending] [--total <n>] [--notes <n>] [--result dense] \
                      [--option <name> <item>]... \
                      [--file <name> <candidate>]... [--local] <root> <entry> [<root> <entry>]...\n\
-                     \x20      lua_report --catalogue <root> <entry> [<root> <entry>]...";
+                     \x20      lua_report --catalogue <root> <entry> [<root> <entry>]...\n\
+                     \x20      lua_report --walk <records> <root> <entry> [<root> <entry>]...\n\
+                     \x20      lua_report --compare <kept records> <new records>";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -296,9 +319,10 @@ fn completeness(dropped: u64) -> String {
 
 /// A runtime note's line: what it is and where, by module index.
 fn runtime_note(n: &RuntimeNoteRecord) -> String {
+    let what = label::runtime_what(n);
     let what = match (n.id, &n.gave) {
-        (Some(id), Some(gave)) => format!("{} {id} unanswered (gave {gave})", n.what),
-        _ => n.what.to_owned(),
+        (Some(id), Some(gave)) => format!("{what} {id} unanswered (gave {gave})"),
+        _ => what.to_string(),
     };
     let at = n.at.map_or_else(
         || "?".to_owned(),
@@ -317,11 +341,8 @@ fn report(index: usize, survey: &Survey) -> String {
         s.push_str(l);
         s.push('\n');
     };
-    line(&format!("skin {index}: {}", survey.outcome));
-    let kind = survey
-        .kind
-        .map_or_else(|| "none".to_owned(), |k| format!("{k:?}"));
-    line(&format!("  kind: {kind}"));
+    line(&format!("skin {index}: {}", label::outcome(survey)));
+    line(&format!("  kind: {}", label::kind(survey.kind)));
     if let Some((module, line_no, col)) = survey.at {
         line(&format!(
             "  at: module {module}, line {line_no}, column {col}"
@@ -329,7 +350,7 @@ fn report(index: usize, survey: &Survey) -> String {
     }
     line(&format!("  modules: {}", survey.modules));
     for a in &survey.atlas {
-        line(&format!("  atlas: {a}"));
+        line(&format!("  atlas: {}", label::atlas(a)));
     }
     if let Some((ops, callbacks)) = survey.frame_ops {
         line(&format!(
@@ -345,11 +366,14 @@ fn report(index: usize, survey: &Survey) -> String {
         ));
     }
     if let Some((n, by)) = &survey.play_elements {
-        let timers: Vec<String> = by.iter().map(|(t, c)| format!("{t} {c}")).collect();
+        let timers: Vec<String> = label::timers(by)
+            .iter()
+            .map(|(t, c)| format!("{t} {c}"))
+            .collect();
         line(&format!("  elements: {n} (timers: {})", timers.join(", ")));
     }
     for (segments, motion) in &survey.gauges {
-        line(&format!("  gauge segments {segments} motion {motion}"));
+        line(&format!("  gauge {}", label::gauge(*segments, motion)));
     }
     let u = survey.usage;
     line(&format!(
@@ -371,8 +395,8 @@ fn report(index: usize, survey: &Survey) -> String {
         u.captures,
         u.expanded
     ));
-    for ((field, kind), n) in &survey.callables {
-        line(&format!("  callable {field} {kind}: {n}"));
+    for (callable, n) in label::callables(survey) {
+        line(&format!("  callable {callable}: {n}"));
     }
     line(&format!("  root script: {}", survey.root_script));
     line(&format!("  root unread: {}", survey.root_unread));
@@ -382,13 +406,16 @@ fn report(index: usize, survey: &Survey) -> String {
             .map_or_else(String::new, |(module, line, col)| {
                 format!(" at module {module}, line {line}, column {col}")
             });
-        line(&format!("  effects: {}{at}", survey.effects));
+        line(&format!("  effects: {}{at}", label::effects(survey)));
     }
-    for (outcome, n) in &survey.outcomes {
+    for (outcome, n) in label::callbacks(survey) {
         line(&format!("  callback {outcome}: {n}"));
     }
     if let Some(rt) = &survey.runtime {
-        let status: Vec<String> = rt.status.iter().map(|(s, n)| format!("{s} {n}")).collect();
+        let status: Vec<String> = label::status(rt)
+            .iter()
+            .map(|(s, n)| format!("{s} {n}"))
+            .collect();
         line(&format!(
             "  runtime frame (fields 0): outputs {} status {} notes {} (+{}) \
              instructions {} host calls {} time {} us{}",
@@ -399,9 +426,7 @@ fn report(index: usize, survey: &Survey) -> String {
             rt.instructions,
             rt.host_calls,
             rt.micros,
-            rt.stopped
-                .as_deref()
-                .map_or_else(String::new, |s| format!(" stopped {s}"))
+            label::stopped(rt).map_or_else(String::new, |s| format!(" stopped {s}"))
         ));
         line(&format!(
             "  runtime notes: {}, stopped {}",
@@ -409,7 +434,11 @@ fn report(index: usize, survey: &Survey) -> String {
             if rt.stops.is_empty() {
                 "none".to_owned()
             } else {
-                rt.stops.join(", ")
+                label::stops(rt)
+                    .iter()
+                    .map(label::Label::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
             }
         ));
         for n in &rt.notes {
@@ -436,7 +465,7 @@ fn report(index: usize, survey: &Survey) -> String {
             line(&local_line(l));
         }
     }
-    for (kind, n) in &survey.notes {
+    for (kind, n) in label::notes(survey) {
         line(&format!("  note {kind}: {n}"));
     }
     if let Some(r) = &survey.resolved {
@@ -458,11 +487,11 @@ fn report(index: usize, survey: &Survey) -> String {
             f.widget_quads, f.capacity, f.most, f.dropped, f.chips
         ));
     }
-    for (label, n) in &survey.facts {
-        line(&format!("  fact {label}: {n}"));
+    for (fact, n) in label::facts(survey) {
+        line(&format!("  fact {fact}: {n}"));
     }
     for r in &survey.reads {
-        line(&format!("  recorded {:?} = {:?}", r.fact, r.value));
+        line(&format!("  recorded {}", label::read(r)));
     }
     s
 }
@@ -484,47 +513,204 @@ fn survey_entry(
     }
 }
 
+/// `s` with its backslashes, tabs, CRs and LFs escaped, so that it stays
+/// one field of a tab-separated row.
+fn escaped(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// The header catalogue of each `<root> <entry>` pair in `args`, as
-/// `--catalogue` prints it; a header refused prints its refusal's label.
+/// `--catalogue` prints it: the walk's rows ([`walk::rows`]) by name; a
+/// header refused prints its refusal's label.
 fn catalogue(args: &[String]) -> String {
     let mut s = String::new();
     for pair in args.chunks(2) {
         let [root, entry] = pair else { continue };
-        let _ = writeln!(s, "skin\t{root}\t{entry}");
-        let h = match skin_beatoraja::read_lua_header(&PathBuf::from(root), entry, &Cancel::new()) {
-            Ok(h) => h,
-            Err(e) => {
-                let _ = writeln!(s, "refused\t{e}");
-                continue;
-            }
+        let _ = writeln!(s, "skin\t{}\t{}", escaped(root), escaped(entry));
+        let p = probe(&PathBuf::from(root), entry, &Cancel::new());
+        let Some(header) = p.header() else {
+            let refused = p.refused().map(|r| r.outcome).unwrap_or_default();
+            let _ = writeln!(s, "refused\t{refused}");
+            continue;
         };
-        let header = h.header();
-        for o in &header.options {
-            let Some(name) = &o.name else { continue };
-            for item in o.items.iter().filter_map(|i| i.name.as_ref()) {
-                let _ = writeln!(s, "option\t{name}\t{item}");
-            }
-        }
-        for f in &header.files {
-            let Some(name) = &f.name else { continue };
-            for c in &f.candidates {
-                let _ = writeln!(s, "file\t{name}\t{c}");
-            }
+        for row in walk::rows(header) {
+            let (kind, name, value) = match row {
+                walk::Row::Option { option, item } => {
+                    let o = &header.options[option];
+                    ("option", &o.name, &o.items[item].name)
+                }
+                walk::Row::File { file, candidate } => {
+                    let f = &header.files[file];
+                    ("file", &f.name, &Some(f.candidates[candidate].clone()))
+                }
+            };
+            let (Some(name), Some(value)) = (name, value) else {
+                continue;
+            };
+            let _ = writeln!(s, "{kind}\t{}\t{}", escaped(name), escaped(value));
         }
     }
     s
 }
 
-fn main() {
-    let all: Vec<String> = std::env::args().skip(1).collect();
-    if let Some((flag, args)) = all.split_first()
-        && flag == "--catalogue"
-    {
-        if args.is_empty() || !args.len().is_multiple_of(2) {
-            usage();
+/// The panic hook of `--walk` and `--compare`: `panic` alone to `out`,
+/// neither the message nor the location (a skin's text may be in either).
+fn quiet_panics(out: impl std::io::Write + Send + Sync + 'static) {
+    let out = std::sync::Mutex::new(out);
+    std::panic::set_hook(Box::new(move |_| {
+        if let Ok(mut o) = out.lock() {
+            let _ = writeln!(o, "panic");
         }
-        print!("{}", catalogue(args));
-        return;
+    }));
+}
+
+/// What a mode printed and its exit code.
+struct Done {
+    code: i32,
+    out: String,
+    err: String,
+}
+
+impl Done {
+    fn fail(err: String) -> Self {
+        Self {
+            code: 2,
+            out: String::new(),
+            err: err
+                + "
+",
+        }
+    }
+}
+
+/// `--walk <records> <root> <entry>...` over `src`.
+fn walk_mode(records: &str, src: &mut dyn walk::Source, skins: &[walk::Skin], build: &str) -> Done {
+    let (walked, summary) = walk::walk(src, skins, build);
+    let text = match walked.to_text() {
+        Ok(t) => t,
+        // The serializer failed: nothing is written, and no summary given.
+        Err(e) => return Done::fail(e),
+    };
+    if let Err(e) = std::fs::write(records, text) {
+        return Done {
+            out: summary,
+            ..Done::fail(format!(
+                "the records file could not be written: {:?}",
+                e.kind()
+            ))
+        };
+    }
+    Done {
+        code: 0,
+        out: summary,
+        err: String::new(),
+    }
+}
+
+/// `--compare <kept> <new>`.
+fn compare_mode(kept: &str, new: &str) -> Done {
+    let read = |path: &str, name: &str| {
+        std::fs::read_to_string(path)
+            .map_err(|e| format!("{name}: could not be read: {:?}", e.kind()))
+            .and_then(|text| record::Records::read(name, &text))
+    };
+    let runs = read(kept, "kept").and_then(|k| read(new, "new").map(|n| (k, n)));
+    match runs.and_then(|(k, n)| compare::compare(&k, &n)) {
+        Ok(v) => Done {
+            code: v.code(),
+            out: v.text,
+            err: String::new(),
+        },
+        Err(e) => Done::fail(e),
+    }
+}
+
+/// The walk's and the comparison's command lines; `None` for a usage
+/// error.
+fn new_mode(flag: &str, args: &[String]) -> Option<Done> {
+    match (flag, args) {
+        ("--walk", [records, pairs @ ..]) => {
+            if records.starts_with("--")
+                || pairs.is_empty()
+                || !pairs.len().is_multiple_of(2)
+                || pairs.iter().any(|a| a.starts_with("--"))
+            {
+                return None;
+            }
+            let skins: Vec<(String, String)> = pairs
+                .chunks(2)
+                .filter_map(|p| match p {
+                    [r, e] => Some((r.clone(), e.clone())),
+                    _ => None,
+                })
+                .collect();
+            let named: Vec<walk::Skin> = skins.iter().map(|(r, e)| walk::Skin::at(r, e)).collect();
+            Some(match build_identity() {
+                Ok(build) => walk_mode(records, &mut walk::Disk(skins), &named, &build),
+                Err(e) => Done::fail(e),
+            })
+        }
+        ("--compare", [kept, new]) if !kept.starts_with("--") && !new.starts_with("--") => {
+            Some(compare_mode(kept, new))
+        }
+        _ => None,
+    }
+}
+
+/// The running build's identity: the SHA-256 of its executable.
+fn build_identity() -> Result<String, String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::env::current_exe()
+        .and_then(std::fs::read)
+        .map_err(|e| format!("the build's executable could not be read: {:?}", e.kind()))?;
+    Ok(walk::hex(&Sha256::digest(&bytes)))
+}
+
+/// The command line's arguments; `None` when one is not valid Unicode
+/// (never printed: it may name a skin).
+fn arguments() -> Option<Vec<String>> {
+    std::env::args_os()
+        .skip(1)
+        .map(std::ffi::OsString::into_string)
+        .collect::<Result<_, _>>()
+        .ok()
+}
+
+fn main() {
+    let Some(all) = arguments() else {
+        eprintln!("an argument is not valid Unicode");
+        std::process::exit(2);
+    };
+    if let Some((flag, args)) = all.split_first() {
+        match flag.as_str() {
+            "--catalogue" => {
+                if args.is_empty() || !args.len().is_multiple_of(2) {
+                    usage();
+                }
+                print!("{}", catalogue(args));
+                return;
+            }
+            "--walk" | "--compare" => {
+                quiet_panics(std::io::stderr());
+                let Some(done) = new_mode(flag, args) else {
+                    usage()
+                };
+                print!("{}", done.out);
+                eprint!("{}", done.err);
+                std::process::exit(done.code);
+            }
+            _ => {}
+        }
     }
     let Some((facts, choice, local, args)) = facts(&all) else {
         usage()
@@ -532,16 +718,13 @@ fn main() {
     if args.is_empty() || !args.len().is_multiple_of(2) {
         usage();
     }
-    let mut kinds: BTreeMap<String, u32> = BTreeMap::new();
+    let mut kinds: BTreeMap<label::Label, u32> = BTreeMap::new();
     for (index, pair) in args.chunks(2).enumerate() {
         let [root, entry] = pair else { continue };
         let cancel = Cancel::new();
         let survey = survey_entry(root, entry, &facts, &cancel, local, &choice);
         print!("{}", report(index, &survey));
-        let kind = survey
-            .kind
-            .map_or_else(|| "none".to_owned(), |k| format!("{k:?}"));
-        *kinds.entry(kind).or_default() += 1;
+        *kinds.entry(label::kind(survey.kind)).or_default() += 1;
     }
     for (kind, n) in &kinds {
         println!("kind {kind}: {n}");

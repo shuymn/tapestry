@@ -348,7 +348,7 @@ fn at_zero(layout: &Layout) -> ResultFrame<'_> {
 fn pixels(r: &mut Renderer, res: &mut ResultScreen, strip: &[Sprite]) -> Vec<u8> {
     let layout = Layout::AUTHOR;
     r.build_result(res, &at_zero(&layout), strip).unwrap();
-    assert!(r.submit_result(&[]).unwrap().presented);
+    assert!(r.submit_result(&[]).unwrap().presented());
     read_back(r)
 }
 

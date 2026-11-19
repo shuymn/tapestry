@@ -361,6 +361,105 @@ fn render_app_region_does_not_allocate() {
     assert_eq!(int(&m, "allocations", "render_app"), Some(0));
 }
 
+/// The transition probe's tags printed in `stdout`, in their order.
+fn probe_tags(stdout: &str) -> Vec<&str> {
+    stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("dev: probe "))
+        .filter_map(|l| l.split(' ').nth(1))
+        .collect()
+}
+
+/// With the transition probe on (`TAPESTRY_LOOP_PROBE`), a direct play
+/// prints its marks when the command ends, once: its preparation, its
+/// image stage's end and its opening among them, then the count of marks
+/// not kept.
+#[test]
+fn a_direct_play_prints_the_transition_probes_marks() {
+    let fx = fixture();
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
+        .env("TAPESTRY_LOOP_PROBE", "1")
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    let tags = probe_tags(&stdout);
+    for tag in ["prep:begin", "img:stage_end", "g:open"] {
+        assert!(tags.contains(&tag), "{tag}: {stdout}");
+    }
+    let dropped: Vec<&str> = stdout
+        .lines()
+        .filter(|l| l.starts_with("dev: probe-dropped "))
+        .collect();
+    assert_eq!(
+        dropped,
+        ["dev: probe-dropped 0 (past the room 0, unfilled 0)"],
+        "{stdout}"
+    );
+}
+
+/// With the transition probe on, a READY cancelled by a held START and
+/// rearmed at its release marks each opening once (`g:open`): the gated
+/// candidate's (1), then each rearmed one's (2), one per opening the
+/// record keeps as cancelled.
+#[test]
+fn the_probe_marks_each_rearmed_opening_once() {
+    let fx = fixture();
+    hold_through_ready(&fx.log);
+    let out = scripted_play(&fx.chart_path, &fx.log, &fx.appdata)
+        .env("TAPESTRY_LOOP_PROBE", "1")
+        .args(["--dev-rearm-delay", "30"])
+        .output()
+        .expect("run tapestry");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(0), "{stdout}{stderr}");
+    let saved = records(&fx.appdata);
+    assert_eq!(saved.len(), 1, "{saved:?}");
+    let rec = replay::decode(&fs::read(&saved[0]).unwrap(), &DecodeLimits::default()).unwrap();
+    let cancelled = rec.history.openings.len();
+    let opens: Vec<&str> = stdout
+        .lines()
+        .filter_map(|l| l.strip_prefix("dev: probe "))
+        .filter_map(|l| {
+            let mut f = l.split(' ');
+            let (_, tag, v) = (f.next()?, f.next()?, f.next()?);
+            (tag == "g:open").then_some(v)
+        })
+        .collect();
+    let want: Vec<&str> = std::iter::once("1")
+        .chain(std::iter::repeat_n("2", cancelled))
+        .collect();
+    assert_eq!(opens, want, "{cancelled} cancelled: {stdout}");
+}
+
+/// START's control on the scripted device.
+const START_CONTROL: u32 = 0x12;
+
+/// The scripted log at `log` with START held from 300 ms before chart
+/// time 0 to 200 ms after it, inside READY, and every other press 1.2 s
+/// later than the log has it.
+fn hold_through_ready(log: &Path) {
+    let mut rec = replay::decode(&fs::read(log).unwrap(), &DecodeLimits::default()).unwrap();
+    let q = |ms: i64, value: i32| eval::PhysicalInputEvent {
+        received: TimeUs(ms * 1_000),
+        source: eval::SourceId(0),
+        kind: eval::InputKind::Control {
+            control: eval::ControlId(START_CONTROL),
+            value,
+        },
+    };
+    let mut events = vec![q(-300, 1), q(200, 0)];
+    events.extend(rec.events.iter().map(|e| eval::PhysicalInputEvent {
+        received: TimeUs(e.received.0 + 1_200_000),
+        ..*e
+    }));
+    rec.events = events;
+    rec.status.finalized = TimeUs(rec.status.finalized.0 + 1_200_000);
+    fs::write(log, replay::encode(&rec)).unwrap();
+}
+
 /// The play's setup, measured as the game thread hands the play to audio
 /// and the screen, reaches its `.measure.toml` and the console line printed
 /// when the play ends, with the first frame after it and the process's page
@@ -511,7 +610,7 @@ fn an_invalid_key_config_exits_nonzero() {
 /// (game's tests/start_gate.rs).
 #[test]
 fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
-    const E: u32 = 0x12;
+    const E: u32 = START_CONTROL;
     let Fixture {
         dir,
         chart,
@@ -524,23 +623,7 @@ fn the_start_gate_cancels_and_rearms_ready_on_the_real_threads() {
         .output()
         .expect("run tapestry");
     let unheld = onsets(&String::from_utf8_lossy(&unheld.stdout));
-    let mut rec = replay::decode(&fs::read(&log).unwrap(), &DecodeLimits::default()).unwrap();
-    let q = |ms: i64, value: i32| eval::PhysicalInputEvent {
-        received: TimeUs(ms * 1_000),
-        source: eval::SourceId(0),
-        kind: eval::InputKind::Control {
-            control: eval::ControlId(E),
-            value,
-        },
-    };
-    let mut events = vec![q(-300, 1), q(200, 0)];
-    events.extend(rec.events.iter().map(|e| eval::PhysicalInputEvent {
-        received: TimeUs(e.received.0 + 1_200_000),
-        ..*e
-    }));
-    rec.events = events;
-    rec.status.finalized = TimeUs(rec.status.finalized.0 + 1_200_000);
-    fs::write(&log, replay::encode(&rec)).unwrap();
+    hold_through_ready(&log);
 
     let out = scripted_play(&chart_path, &log, &appdata)
         .args(["--dev-speed", "F2", "--dev-adjust-at", "1500"])

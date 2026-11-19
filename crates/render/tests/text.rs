@@ -260,7 +260,7 @@ fn japanese_title_renders_on_warp() {
     let timing = r
         .menu_frame(|b| text_screen(&["MENU MENU MENU"], b), &text)
         .unwrap();
-    assert!(timing.presented);
+    assert!(timing.presented());
     let rgb: Vec<u8> = r
         .read_back()
         .as_chunks::<4>()

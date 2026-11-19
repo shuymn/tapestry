@@ -301,7 +301,7 @@ pub fn read_back(r: &Renderer) -> Vec<u8> {
 #[track_caller]
 pub fn loading(r: &mut Renderer, text: &MenuText, f: &LoadingFrame<'_>) -> Vec<u8> {
     let timing = r.loading_frame(f, text).unwrap().unwrap();
-    assert!(timing.presented);
+    assert!(timing.presented());
     read_back(r)
 }
 
