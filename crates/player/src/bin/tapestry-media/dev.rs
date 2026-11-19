@@ -16,6 +16,10 @@
 //!   sandbox denies the worker and what it leaves it ([`probe`]).
 //! - `--dev-silent <ms>`: waits `ms` milliseconds without answering the
 //!   game's launch, then exits.
+//! - `--dev-deaf`: answers the hello, then never reads its commands.
+//! - `--dev-flood <n>`: answers the hello and, at the game's first
+//!   command, sends `n` replies the game never asked for, as fast as the
+//!   pipe takes them, then waits.
 
 mod probe;
 
@@ -53,6 +57,25 @@ pub fn run(args: &[OsString]) -> Option<ExitCode> {
             });
         }
         "--dev-probe" => return Some(probe::run(rest)),
+        "--dev-deaf" => {
+            let _ = crate::hello(ffmpeg::MAX_ALLOC);
+            wait_for_ever()
+        }
+        "--dev-flood" => match rest {
+            [n] => n
+                .parse::<u64>()
+                .map(|n| {
+                    let out = crate::hello(ffmpeg::MAX_ALLOC);
+                    // After the launch has taken the hello.
+                    let _ = crate::read_command(&mut std::io::stdin().lock());
+                    for _ in 0..n {
+                        out.send(&skin_model::media::control::Reply::Closed { player: 0 });
+                    }
+                    wait_for_ever()
+                })
+                .map_err(|e| format!("--dev-flood {n}: {e}")),
+            _ => Err("--dev-flood <n>".to_owned()),
+        },
         "--dev-silent" => match rest {
             [ms] => ms
                 .parse()
@@ -66,6 +89,13 @@ pub fn run(args: &[OsString]) -> Option<ExitCode> {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => usage(&e),
     })
+}
+
+/// Waits until the game ends the worker.
+fn wait_for_ever() -> ! {
+    loop {
+        std::thread::sleep(std::time::Duration::from_secs(3600));
+    }
 }
 
 /// Reports `message` and fails.

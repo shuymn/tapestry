@@ -1926,6 +1926,7 @@ dependencies = [
  "rules",
  "rusqlite",
  "serde",
+ "sha2",
  "skin-beatoraja",
  "skin-model",
  "tempfile",

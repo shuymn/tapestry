@@ -984,3 +984,233 @@ fn worker_win32k_is_locked_from_creation() {
         ],
     );
 }
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn worker_environment_is_only_the_block_the_launch_builds() {
+    let stage = Stage::new();
+    let worker = launch(&stage, recipe().args_of(&["--dev-probe", "environment"]));
+    let log = worker.probed(1);
+    let found = probes(&log);
+    let environment = probe(&found, "environment", &log);
+    // The game's own environment, which has more, does not reach it: the
+    // worker has the Windows directory, and the AppContainer's own folder
+    // as `LOCALAPPDATA` and its `Temp` as `TEMP` and `TMP`, which Windows
+    // sets from the block's `LOCALAPPDATA`.
+    assert!(std::env::var_os("PATH").is_some());
+    let windows = std::env::var("SystemRoot").unwrap().to_lowercase();
+    let detail = environment.detail.to_lowercase();
+    let vars: Vec<(&str, &str)> = detail
+        .split(';')
+        .map(|v| v.split_once('=').unwrap_or((v, "")))
+        .collect();
+    let names: Vec<&str> = vars.iter().map(|(name, _)| *name).collect();
+    assert_eq!(
+        (environment.ok, environment.code, names),
+        (true, 4, vec!["localappdata", "systemroot", "temp", "tmp"]),
+        "{log}"
+    );
+    let folder = vars[0].1;
+    let own = format!(
+        "\\packages\\{}\\ac",
+        media_host::launch::profile_name(stage.dir())
+    );
+    assert!(
+        folder.ends_with(&own) && !folder[..folder.len() - own.len()].contains("\\packages\\"),
+        "{log}"
+    );
+    let temp = format!("{folder}\\temp");
+    assert_eq!(
+        (vars[1].1, vars[2].1, vars[3].1),
+        (windows.as_str(), temp.as_str(), temp.as_str()),
+        "{log}"
+    );
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn each_installation_runs_as_an_appcontainer_of_its_own() {
+    let (ours, theirs) = (Stage::new(), Stage::new());
+    assert_ne!(
+        media_host::launch::profile_name(ours.dir()),
+        media_host::launch::profile_name(theirs.dir())
+    );
+    // The other installation's launch grants its directory to its worker.
+    drop(launch(&theirs, recipe()));
+    for (stage, readable) in [(&ours, true), (&theirs, false)] {
+        let exe = stage.dir().join("tapestry-media.exe");
+        let arg = format!("file={}", exe.display());
+        let worker = launch(&ours, recipe().args_of(&["--dev-probe", &arg]));
+        let log = worker.probed(1);
+        let found = probes(&log);
+        let file = probe(&found, "file", &log);
+        let want = if readable { (true, 0) } else { (false, 5) };
+        assert_eq!((file.ok, file.code), want, "{}: {log}", exe.display());
+    }
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn worker_replies_past_the_queue_fail_the_worker() {
+    let stage = Stage::new();
+    // More replies than the pipe holds, which the game does not read,
+    // from the worker's first command on.
+    let mut worker = launch(&stage, recipe().args_of(&["--dev-flood", "1000000"]));
+    worker.send(&Command::Close { player: 0 }).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while !worker.overflowed() {
+        assert!(
+            Instant::now() < deadline,
+            "the replies never overflowed; the worker's log:\n{}",
+            worker.log()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    // The queue held its capacity, and the replies have ended.
+    let mut queued = 0;
+    while worker.try_recv().is_some() {
+        queued += 1;
+    }
+    assert_eq!(queued, 64);
+    assert_eq!(
+        worker.recv(Duration::from_secs(5)),
+        Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+    );
+    // The pipe it replies on closed, its next reply ends the worker.
+    assert!(
+        worker.wait_exit(Duration::from_secs(10)).is_some(),
+        "the worker went on"
+    );
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn dropping_a_worker_never_waits_on_it() {
+    use std::io::Write as _;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let stage = Stage::new();
+    let mut launched = launch(&stage, recipe().args_of(&["--dev-deaf"]));
+    // The worker reads none of its commands: write until a write waits.
+    let mut pipe = launched.commands_again();
+    let written = Arc::new(AtomicUsize::new(0));
+    let filler = {
+        let written = Arc::clone(&written);
+        std::thread::spawn(move || {
+            let chunk = [0_u8; 4096];
+            while pipe.write_all(&chunk).is_ok() {
+                written.fetch_add(chunk.len(), Ordering::Relaxed);
+            }
+        })
+    };
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let mut last = (0, Instant::now());
+    loop {
+        let now = written.load(Ordering::Relaxed);
+        if now != last.0 {
+            last = (now, Instant::now());
+        } else if now > 0 && last.1.elapsed() > Duration::from_millis(300) {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the pipe never filled: {now} bytes"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // Dropping it returns at once, though the pipe is full.
+    let worker = launched.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let started = Instant::now();
+        drop(worker);
+        let _ = tx.send(started.elapsed());
+    });
+    let took = rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("dropping the worker waited on it");
+    assert!(
+        took < Duration::from_secs(1),
+        "dropping the worker took {took:?}"
+    );
+    // Its job closes after the grace, whatever the pipe does: the worker
+    // ends, and the waiting write fails.
+    assert!(
+        launched.wait_exit(Duration::from_secs(10)).is_some(),
+        "the worker went on"
+    );
+    filler.join().unwrap();
+}
+
+// Covers: T02
+#[test]
+fn worker_job_reads_back_exactly_its_limits() {
+    use windows::Win32::System::JobObjects::{
+        JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+        JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS,
+        JOB_OBJECT_UILIMIT_EXITWINDOWS, JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES,
+        JOB_OBJECT_UILIMIT_READCLIPBOARD, JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS,
+        JOB_OBJECT_UILIMIT_WRITECLIPBOARD, JOBOBJECT_BASIC_UI_RESTRICTIONS,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectBasicUIRestrictions,
+        JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    };
+
+    let stage = Stage::new();
+    let worker = launch(&stage, recipe());
+    let job = worker.job().expect("the recipe's job");
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // SAFETY: the worker's job, and a struct of the size given.
+    unsafe {
+        QueryInformationJobObject(
+            Some(job),
+            JobObjectExtendedLimitInformation,
+            (&raw mut limits).cast(),
+            u32::try_from(size_of_val(&limits)).unwrap(),
+            None,
+        )
+    }
+    .unwrap();
+    // The memory cap, the end on the job's closing and on an unhandled
+    // exception, one process, and no breakaway.
+    let basic = limits.BasicLimitInformation;
+    assert_eq!(
+        basic.LimitFlags,
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY
+            | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION
+            | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
+    );
+    assert_eq!(
+        (limits.ProcessMemoryLimit, basic.ActiveProcessLimit),
+        (512 << 20, 1)
+    );
+    let mut ui = JOBOBJECT_BASIC_UI_RESTRICTIONS::default();
+    // SAFETY: as above.
+    unsafe {
+        QueryInformationJobObject(
+            Some(job),
+            JobObjectBasicUIRestrictions,
+            (&raw mut ui).cast(),
+            u32::try_from(size_of_val(&ui)).unwrap(),
+            None,
+        )
+    }
+    .unwrap();
+    assert_eq!(
+        ui.UIRestrictionsClass,
+        JOB_OBJECT_UILIMIT_DESKTOP
+            | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
+            | JOB_OBJECT_UILIMIT_EXITWINDOWS
+            | JOB_OBJECT_UILIMIT_GLOBALATOMS
+            | JOB_OBJECT_UILIMIT_HANDLES
+            | JOB_OBJECT_UILIMIT_READCLIPBOARD
+            | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
+            | JOB_OBJECT_UILIMIT_WRITECLIPBOARD
+    );
+}

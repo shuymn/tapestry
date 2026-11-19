@@ -39,6 +39,8 @@
 //!   `NtGdiCreateCompatibleDC` (`raw-gdi`) on a fresh thread each; a call
 //!   ran when the thread became a GUI thread and the value is no error
 //!   status.
+//! - `environment`: the worker's environment, every variable as
+//!   `name=value` joined by `;` (`code` their count).
 //! - `desktop=<hwnd>`: through USER32, the worker's desktop's name
 //!   (`desktop-name`); opens the input desktop (`input-desktop`) and
 //!   `WinSta0` (`winsta0`); counts the top-level windows it sees
@@ -109,6 +111,7 @@ pub fn run(args: &[String]) -> ExitCode {
             "win32k" => win32k(),
             "win32k-raw" => win32k_raw(),
             "desktop" => desktop(value.parse().unwrap_or(0)),
+            "environment" => environment(),
             other => report(other, false, 0, "no such probe"),
         }
     }
@@ -127,6 +130,14 @@ pub fn run(args: &[String]) -> ExitCode {
         crate::say("probe done");
     }
     ExitCode::SUCCESS
+}
+
+/// The worker's environment.
+fn environment() {
+    let vars: Vec<String> = std::env::vars_os()
+        .map(|(k, v)| format!("{}={}", k.to_string_lossy(), v.to_string_lossy()))
+        .collect();
+    report("environment", true, vars.len(), &vars.join(";"));
 }
 
 /// Reports one probe's result.

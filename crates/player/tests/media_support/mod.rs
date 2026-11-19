@@ -96,6 +96,25 @@ impl Stage {
     }
 }
 
+impl Drop for Stage {
+    /// Deletes the AppContainer profile a launch made for the stage's
+    /// directory, which Windows would otherwise keep: each stage is an
+    /// installation of its own.
+    fn drop(&mut self) {
+        let name: Vec<u16> = media_host::launch::profile_name(self.dir())
+            .encode_utf16()
+            .chain([0])
+            .collect();
+        // SAFETY: a nul-terminated name; deleting a profile no launch made
+        // fails, and is ignored.
+        let _ = unsafe {
+            windows::Win32::Security::Isolation::DeleteAppContainerProfile(windows::core::PCWSTR(
+                name.as_ptr(),
+            ))
+        };
+    }
+}
+
 /// A launched worker: dropping it ends the worker, as the game does, and
 /// waits until it has ended.
 pub struct Launched {
@@ -125,6 +144,12 @@ impl Launched {
             worker: Some(worker),
             process,
         }
+    }
+
+    /// The worker itself, to drop apart from this value, which still
+    /// waits for it to end.
+    pub fn take(&mut self) -> Worker {
+        self.worker.take().unwrap()
     }
 
     /// Whether the worker has ended.

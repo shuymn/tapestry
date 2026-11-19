@@ -7,15 +7,22 @@
 //!
 //! The worker's replies are read on a thread of the host's own: its log
 //! lines go to the game's log, and every other reply, decoded and so
-//! bounded by the protocol, waits for [`Worker::recv`]. A reply that does
-//! not decode ends the reading, as a worker that dies does: the replies
-//! then stop for good.
+//! bounded by the protocol, waits for [`Worker::recv`] in a queue of a
+//! fixed capacity. A reply that does not decode, or one past the queue's
+//! capacity ([`Worker::overflowed`]), ends the reading, as a worker that
+//! dies does: the replies then stop for good.
+//!
+//! Dropping a worker never waits on it: its job closes, ending it, after a
+//! short grace on a thread of its own, whatever its pipe does, and a `Quit`
+//! is sent meanwhile on another, best effort.
 
 pub mod handles;
 pub mod launch;
 
 use std::io::Write as _;
 use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError};
 use std::time::Duration;
 
@@ -28,7 +35,7 @@ use windows::Win32::Security::Authorization::{
 };
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
 use windows::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE};
-use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcess};
+use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcess, WaitForSingleObject};
 use windows::core::{PCWSTR, w};
 
 use launch::{LaunchError, Setup};
@@ -137,12 +144,18 @@ pub struct Hello {
     pub configuration: String,
 }
 
-/// A running worker. Dropping it sends `Quit` and closes its job, which
-/// ends the worker.
+/// How long a dropped worker has to end on its own before its job closes.
+const QUIT_GRACE_MS: u32 = 500;
+
+/// A running worker. Dropping it ends the worker without waiting on it
+/// (the module's doc).
 pub struct Worker {
-    /// Writes the commands, the control pipe's game end.
-    commands: std::fs::File,
+    /// Writes the commands, the control pipe's game end (taken when the
+    /// worker drops).
+    commands: Option<std::fs::File>,
     replies: Receiver<Reply>,
+    /// The game left more replies unread than the queue holds.
+    overflowed: Arc<AtomicBool>,
     hello: Hello,
     process: Owned,
     pid: u32,
@@ -186,8 +199,18 @@ impl Worker {
     pub fn send(&mut self, command: &Command) -> std::io::Result<()> {
         let bytes = control::frame(&command.encode())
             .ok_or_else(|| std::io::Error::other("a command longer than a frame"))?;
-        self.commands.write_all(&bytes)?;
-        self.commands.flush()
+        let commands = self
+            .commands
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("the worker is dropping"))?;
+        commands.write_all(&bytes)?;
+        commands.flush()
+    }
+
+    /// Whether the worker sent more replies than the game holds unread: its
+    /// replies have ended, and it is to be treated as failed.
+    pub fn overflowed(&self) -> bool {
+        self.overflowed.load(Ordering::Acquire)
     }
 
     /// The next reply other than a log line, waiting up to `timeout`.
@@ -280,12 +303,65 @@ impl Worker {
     pub const fn pipe_ends(&self) -> [u64; 2] {
         self.pipe_ends
     }
+
+    /// A second handle to the game's end of the command pipe, to write
+    /// through from another thread.
+    pub fn commands_again(&self) -> std::fs::File {
+        use std::os::windows::io::AsRawHandle as _;
+        let Some(commands) = &self.commands else {
+            panic!("the worker is dropping");
+        };
+        let mut again = HANDLE::default();
+        // SAFETY: the game's end of the pipe, duplicated within the game;
+        // the file returned owns the duplicate.
+        unsafe {
+            DuplicateHandle(
+                GetCurrentProcess(),
+                HANDLE(commands.as_raw_handle()),
+                GetCurrentProcess(),
+                &raw mut again,
+                0,
+                false,
+                windows::Win32::Foundation::DUPLICATE_SAME_ACCESS,
+            )
+        }
+        .unwrap_or_else(|e| panic!("duplicating the command pipe: {e}"));
+        // SAFETY: the duplicate just made, owned by the file from here.
+        unsafe { std::fs::File::from_raw_handle(again.0) }
+    }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
-        let _ = self.send(&Command::Quit);
-        // Closing the job ends the worker (`KILL_ON_JOB_CLOSE`).
-        self.job = None;
+        // `Quit`, best effort, on a thread of its own: the write waits while
+        // the pipe is full, until the worker reads or ends. A thread that
+        // does not start drops the pipe, which ends the worker's reading as
+        // `Quit` would.
+        let commands = self.commands.take();
+        let _ = std::thread::Builder::new()
+            .name("media worker quit".to_owned())
+            .spawn(move || {
+                if let Some(mut commands) = commands
+                    && let Some(bytes) = control::frame(&Command::Quit.encode())
+                {
+                    let _ = commands.write_all(&bytes);
+                }
+            });
+        // The job closes after the grace, on another thread, whatever the
+        // write does; closing it ends the worker (`KILL_ON_JOB_CLOSE`). A
+        // thread that does not start closes it at once, as its closure
+        // drops.
+        let job = self.job.take();
+        let process = std::mem::replace(&mut self.process, Owned(HANDLE::default()));
+        let _ = std::thread::Builder::new()
+            .name("media worker end".to_owned())
+            .spawn(move || {
+                if job.is_some() {
+                    // SAFETY: the worker's process handle, which this
+                    // thread holds.
+                    let _ = unsafe { WaitForSingleObject(process.0, QUIT_GRACE_MS) };
+                }
+                drop((job, process));
+            });
     }
 }

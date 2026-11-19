@@ -4,9 +4,10 @@
 //! 1. a job: its committed memory capped, the worker ended when the job
 //!    closes and on an unhandled exception, one process, its UI
 //!    restricted;
-//! 2. the worker's AppContainer profile, with no capability, and an ACE
-//!    granting it read and execute on the worker's directory, inherited by
-//!    the files directly in it (the executable and its DLLs);
+//! 2. the worker's AppContainer profile, with no capability, one for each
+//!    installation directory ([`profile_name`]), and an ACE granting it
+//!    read and execute on that directory, inherited by the files directly
+//!    in it (the executable and its DLLs);
 //! 3. a window station of its own (`CreateWindowStationW` with no name) and
 //!    a desktop in it, each granted to the AppContainer;
 //! 4. the creation attributes: the control pipe's two ends as the only
@@ -15,8 +16,10 @@
 //!    only from local files without a low label and from System32 first,
 //!    no extension points) and the AppContainer;
 //! 5. the process created suspended, detached and below normal priority,
-//!    then put in the job;
+//!    with an environment the launch builds ([`environment`]), then put in
+//!    the job;
 //! 6. the check before it runs: it is still suspended and in the job, the
+//!    job's limits and UI restrictions read back exactly as set, the
 //!    queried mitigation policies hold, its token is the AppContainer's
 //!    with no capability at low integrity, and it holds exactly the pipe's
 //!    ends; then it resumes and must answer with its hello within the
@@ -34,18 +37,20 @@
 //! arguments; a build of the game holds the recipe alone.
 
 use std::ffi::c_void;
+use std::fmt::Write as _;
 use std::os::windows::ffi::OsStrExt as _;
 use std::os::windows::io::FromRawHandle as _;
 use std::path::Path;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError, Sender};
-use std::sync::{Mutex, PoisonError};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use sha2::{Digest as _, Sha256};
 use skin_model::media::control::{self, Reply};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, ERROR_FILE_NOT_FOUND, ERROR_TIMEOUT, GENERIC_ALL, GetLastError, HANDLE,
-    HANDLE_FLAG_INHERIT, HANDLE_FLAGS, HLOCAL, LocalFree, SetHandleInformation,
+    HANDLE_FLAG_INHERIT, HANDLE_FLAGS, HLOCAL, LocalFree, SetHandleInformation, WAIT_OBJECT_0,
 };
 use windows::Win32::Security::Authorization::{
     ConvertSidToStringSidW, EXPLICIT_ACCESS_W, GRANT_ACCESS, GetNamedSecurityInfoW,
@@ -68,12 +73,13 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, IsProcessInJob, JOB_OBJECT_LIMIT,
     JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_UILIMIT,
     JOB_OBJECT_UILIMIT_DESKTOP, JOB_OBJECT_UILIMIT_DISPLAYSETTINGS, JOB_OBJECT_UILIMIT_EXITWINDOWS,
     JOB_OBJECT_UILIMIT_GLOBALATOMS, JOB_OBJECT_UILIMIT_HANDLES, JOB_OBJECT_UILIMIT_READCLIPBOARD,
     JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS, JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
     JOBOBJECT_BASIC_UI_RESTRICTIONS, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-    JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, SetInformationJobObject,
+    JobObjectBasicUIRestrictions, JobObjectExtendedLimitInformation, QueryInformationJobObject,
+    SetInformationJobObject,
 };
 use windows::Win32::System::Pipes::CreatePipe;
 use windows::Win32::System::StationsAndDesktops::{
@@ -81,12 +87,13 @@ use windows::Win32::System::StationsAndDesktops::{
     GetProcessWindowStation, GetUserObjectInformationW, HDESK, HWINSTA, SetProcessWindowStation,
     UOI_NAME,
 };
+use windows::Win32::System::SystemInformation::GetSystemWindowsDirectoryW;
 use windows::Win32::System::SystemServices::SECURITY_MANDATORY_LOW_RID;
 use windows::Win32::System::Threading::{
-    BELOW_NORMAL_PRIORITY_CLASS, CREATE_SUSPENDED, CreateProcessW, DETACHED_PROCESS,
-    DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT, GetExitCodeProcess,
-    GetProcessMitigationPolicy, InitializeProcThreadAttributeList, LPPROC_THREAD_ATTRIBUTE_LIST,
-    OpenProcessToken, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
+    BELOW_NORMAL_PRIORITY_CLASS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT, CreateProcessW,
+    DETACHED_PROCESS, DeleteProcThreadAttributeList, EXTENDED_STARTUPINFO_PRESENT,
+    GetExitCodeProcess, GetProcessMitigationPolicy, InitializeProcThreadAttributeList,
+    LPPROC_THREAD_ATTRIBUTE_LIST, OpenProcessToken, PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY,
     PROC_THREAD_ATTRIBUTE_HANDLE_LIST, PROC_THREAD_ATTRIBUTE_MITIGATION_POLICY,
     PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, PROCESS_CREATION_FLAGS, PROCESS_INFORMATION,
     PROCESS_MITIGATION_POLICY, ProcessChildProcessPolicy, ProcessDynamicCodePolicy,
@@ -102,8 +109,10 @@ use super::{Hello, Owned, Worker, handles};
 /// The worker's executable, in the directory the game launches it from.
 pub const EXECUTABLE: &str = "tapestry-media.exe";
 
-/// The worker's AppContainer profile, which the user's account keeps.
-const PROFILE: PCWSTR = w!("tapestry.media");
+/// The most replies the game holds unread from one worker; one more fails
+/// the worker. Every reply answers a command, and the game reads them each
+/// frame: eight players' replies to a few commands each stay far below it.
+const REPLIES: usize = 64;
 
 /// The job's cap on the worker's committed memory.
 const MEMORY_CAP: usize = 512 << 20;
@@ -418,7 +427,7 @@ pub fn launch(dir: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
         None
     };
     let sid = if applied.has(Restrictions::APP_CONTAINER) {
-        Some(run(setup, Step::Profile, profile).map_err(early)?)
+        Some(run(setup, Step::Profile, || profile(&profile_name(dir))).map_err(early)?)
     } else {
         None
     };
@@ -467,16 +476,19 @@ pub fn launch(dir: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
     };
     #[cfg(test)]
     let log = std::sync::Arc::new(Mutex::new(String::new()));
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(REPLIES);
+    let overflowed = Arc::new(AtomicBool::new(false));
     let reading = {
         #[cfg(test)]
         let log = std::sync::Arc::clone(&log);
+        let overflowed = Arc::clone(&overflowed);
         std::thread::Builder::new()
             .name("media worker replies".to_owned())
             .spawn(move || {
                 read_replies(
                     replies,
                     &tx,
+                    &overflowed,
                     #[cfg(test)]
                     &log,
                 );
@@ -497,8 +509,9 @@ pub fn launch(dir: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
     #[cfg(not(test))]
     let _ = table;
     Ok(Worker {
-        commands,
+        commands: Some(commands),
         replies: rx,
+        overflowed,
         hello,
         process,
         pid,
@@ -527,18 +540,37 @@ impl Owned {
     }
 }
 
+/// The job's limits under `r`: the memory cap, the end on the job's
+/// closing and on an unhandled exception, one process under
+/// [`Restrictions::ONE_PROCESS`], and no breakaway.
+fn job_flags(r: Restrictions) -> JOB_OBJECT_LIMIT {
+    let mut flags = JOB_OBJECT_LIMIT_PROCESS_MEMORY
+        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
+    if r.has(Restrictions::ONE_PROCESS) {
+        flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
+    }
+    flags
+}
+
+/// The job's UI restrictions.
+const JOB_UI: JOB_OBJECT_UILIMIT = JOB_OBJECT_UILIMIT(
+    JOB_OBJECT_UILIMIT_DESKTOP.0
+        | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS.0
+        | JOB_OBJECT_UILIMIT_EXITWINDOWS.0
+        | JOB_OBJECT_UILIMIT_GLOBALATOMS.0
+        | JOB_OBJECT_UILIMIT_HANDLES.0
+        | JOB_OBJECT_UILIMIT_READCLIPBOARD.0
+        | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS.0
+        | JOB_OBJECT_UILIMIT_WRITECLIPBOARD.0,
+);
+
 /// Step 1: the job.
 fn job(applied: Restrictions) -> Result<Owned, Failure> {
     // SAFETY: an unnamed job, owned by the value returned.
     let job = Owned(unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(failed("a job"))?);
-    let mut flags: JOB_OBJECT_LIMIT = JOB_OBJECT_LIMIT_PROCESS_MEMORY
-        | JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-    if applied.has(Restrictions::ONE_PROCESS) {
-        flags |= JOB_OBJECT_LIMIT_ACTIVE_PROCESS;
-    }
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
-    limits.BasicLimitInformation.LimitFlags = flags;
+    limits.BasicLimitInformation.LimitFlags = job_flags(applied);
     limits.BasicLimitInformation.ActiveProcessLimit = 1;
     limits.ProcessMemoryLimit = MEMORY_CAP;
     // SAFETY: the job just made, and a struct of the size given.
@@ -552,14 +584,7 @@ fn job(applied: Restrictions) -> Result<Owned, Failure> {
     }
     .map_err(failed("the job's limits"))?;
     let ui = JOBOBJECT_BASIC_UI_RESTRICTIONS {
-        UIRestrictionsClass: JOB_OBJECT_UILIMIT_DESKTOP
-            | JOB_OBJECT_UILIMIT_DISPLAYSETTINGS
-            | JOB_OBJECT_UILIMIT_EXITWINDOWS
-            | JOB_OBJECT_UILIMIT_GLOBALATOMS
-            | JOB_OBJECT_UILIMIT_HANDLES
-            | JOB_OBJECT_UILIMIT_READCLIPBOARD
-            | JOB_OBJECT_UILIMIT_SYSTEMPARAMETERS
-            | JOB_OBJECT_UILIMIT_WRITECLIPBOARD,
+        UIRestrictionsClass: JOB_UI,
     };
     // SAFETY: as above.
     unsafe {
@@ -588,25 +613,66 @@ impl Drop for Sid {
 /// How many times the profile is asked for while another process makes it.
 const PROFILE_ATTEMPTS: u32 = 20;
 
-/// Step 2: the AppContainer profile's SID. The first launch on the machine
-/// makes the profile, which Windows keeps; a later one finds its folder and
-/// leaves it alone. Asking `CreateAppContainerProfile` for a profile that
-/// exists is not harmless: the call, made while another launch creates its
-/// process in the AppContainer, can fail that creation with
-/// `ERROR_FILE_NOT_FOUND` (2 of 120 launches from four threads at once).
-fn profile() -> Result<Sid, Failure> {
+/// The name of the worker's AppContainer profile for the installation in
+/// `dir`: `tapestry.media.` and the first 16 bytes of the SHA-256 of the
+/// directory's path (made absolute, its ASCII letters lowercased, as
+/// UTF-16), in hex. Each installation's worker runs as an AppContainer of
+/// its own, so the grant one installation's directory gets reaches no other
+/// installation's worker. Windows keeps a profile until it is deleted: an
+/// installation moved or removed leaves its profile, which grants nothing
+/// outside that installation's own directory, and the game deletes none,
+/// since it cannot tell whether that installation still runs.
+pub fn profile_name(dir: &Path) -> String {
+    let absolute = std::path::absolute(dir).unwrap_or_else(|_| dir.to_path_buf());
+    let mut digest = Sha256::new();
+    for unit in absolute.as_os_str().encode_wide() {
+        let unit = if (u16::from(b'A')..=u16::from(b'Z')).contains(&unit) {
+            unit + 32
+        } else {
+            unit
+        };
+        digest.update(unit.to_le_bytes());
+    }
+    let hash = digest.finalize();
+    let mut name = "tapestry.media.".to_owned();
+    for byte in hash.iter().take(16) {
+        let _ = write!(name, "{byte:02x}");
+    }
+    name
+}
+
+/// Launches in this process make a profile one at a time, each looking for
+/// it again once it holds the lock.
+static PROFILES: Mutex<()> = Mutex::new(());
+
+/// Step 2: the SID of the AppContainer profile `name`. The first launch
+/// from an installation makes its profile, which Windows keeps; a later one
+/// finds its folder and leaves it alone. Asking `CreateAppContainerProfile`
+/// for a profile that exists is not harmless: the call, made while another
+/// launch creates its process in the AppContainer, can fail that creation
+/// with `ERROR_FILE_NOT_FOUND` (2 of 120 launches from four threads at
+/// once).
+fn profile(name: &str) -> Result<Sid, Failure> {
+    let name: Vec<u16> = name.encode_utf16().chain([0]).collect();
     // SAFETY: a nul-terminated name; the SID returned is freed by `Sid`.
-    let sid = unsafe { DeriveAppContainerSidFromAppContainerName(PROFILE) }
+    let sid = unsafe { DeriveAppContainerSidFromAppContainerName(PCWSTR(name.as_ptr())) }
         .map(Sid)
         .map_err(failed("the profile's SID"))?;
+    let _making = PROFILES.lock().unwrap_or_else(PoisonError::into_inner);
     if !made(&sid)? {
-        make_profile()?;
+        make_profile(&name)?;
     }
     Ok(sid)
 }
 
 /// Whether the profile of `sid` exists: whether Windows gives its folder.
 fn made(sid: &Sid) -> Result<bool, Failure> {
+    folder(sid).map(|folder| folder.is_some())
+}
+
+/// The folder of the profile of `sid`, `None` when the profile does not
+/// exist.
+fn folder(sid: &Sid) -> Result<Option<Vec<u16>>, Failure> {
     let mut text = PWSTR::null();
     // SAFETY: a SID the profile's calls allocated; the string returned is
     // freed by `Local`.
@@ -616,26 +682,29 @@ fn made(sid: &Sid) -> Result<bool, Failure> {
     // SAFETY: a nul-terminated SID string; the path returned is freed here.
     match unsafe { GetAppContainerFolderPath(PCWSTR(text.0)) } {
         Ok(path) => {
+            // SAFETY: the nul-terminated path the call allocated, copied
+            // before it is freed.
+            let copy = unsafe { path.as_wide() }.to_vec();
             // SAFETY: the path the call allocated, unused after this.
             unsafe { CoTaskMemFree(Some(path.0.cast())) };
-            Ok(true)
+            Ok(Some(copy))
         }
-        Err(e) if e.code() == ERROR_FILE_NOT_FOUND.to_hresult() => Ok(false),
+        Err(e) if e.code() == ERROR_FILE_NOT_FOUND.to_hresult() => Ok(None),
         Err(e) => Err(failed("the profile's folder")(e)),
     }
 }
 
-/// Makes the AppContainer profile, or finds it made. Another process making
-/// it at the same moment fails the call, so it is asked for again, a little
-/// later, a bounded number of times.
-fn make_profile() -> Result<(), Failure> {
+/// Makes the AppContainer profile `name` (nul-terminated), or finds it
+/// made. Another process making it at the same moment fails the call, so it
+/// is asked for again, a little later, a bounded number of times.
+fn make_profile(name: &[u16]) -> Result<(), Failure> {
     let mut attempt = 1;
     loop {
         // SAFETY: nul-terminated names and no capability; the SID returned
         // is freed by `Sid`.
         let made = unsafe {
             CreateAppContainerProfile(
-                PROFILE,
+                PCWSTR(name.as_ptr()),
                 w!("tapestry media"),
                 w!("Decodes the videos tapestry plays"),
                 None,
@@ -1105,12 +1174,15 @@ impl Drop for Child {
     }
 }
 
-/// Terminates `process` and waits until it has ended: its exit code.
+/// Terminates `process` and waits up to 5 s until it has ended: its exit
+/// code, or `None` when it has not ended by then.
 fn terminate(process: HANDLE) -> Option<u32> {
     // SAFETY: a process this launch made.
     let _ = unsafe { TerminateProcess(process, REFUSED) };
     // SAFETY: as above.
-    let _ = unsafe { WaitForSingleObject(process, 5_000) };
+    if unsafe { WaitForSingleObject(process, 5_000) } != WAIT_OBJECT_0 {
+        return None;
+    }
     let mut exit = 0;
     // SAFETY: as above.
     unsafe { GetExitCodeProcess(process, &raw mut exit) }.ok()?;
@@ -1240,16 +1312,20 @@ fn create(
         if let Some(desktop) = desktop {
             startup.StartupInfo.lpDesktop = PWSTR(desktop.path.as_ptr().cast_mut());
         }
-        let mut flags: PROCESS_CREATION_FLAGS =
-            CREATE_SUSPENDED | DETACHED_PROCESS | BELOW_NORMAL_PRIORITY_CLASS;
+        let environment = environment(sid)?;
+        let mut flags: PROCESS_CREATION_FLAGS = CREATE_SUSPENDED
+            | DETACHED_PROCESS
+            | BELOW_NORMAL_PRIORITY_CLASS
+            | CREATE_UNICODE_ENVIRONMENT;
         if let Some(list) = &list {
             startup.lpAttributeList = list.list;
             flags |= EXTENDED_STARTUPINFO_PRESENT;
         }
         let mut info = PROCESS_INFORMATION::default();
-        // SAFETY: nul-terminated paths and a writable command line; the
-        // startup information and its attributes live through the call;
-        // the handles returned are owned by the `Child`.
+        // SAFETY: nul-terminated paths, a writable command line and an
+        // environment block ending in two nuls; the startup information and
+        // its attributes live through the call; the handles returned are
+        // owned by the `Child`.
         unsafe {
             CreateProcessW(
                 PCWSTR(app.as_ptr()),
@@ -1258,7 +1334,7 @@ fn create(
                 None,
                 true,
                 flags,
-                None,
+                Some(environment.as_ptr().cast()),
                 PCWSTR(cwd.as_ptr()),
                 &raw const startup.StartupInfo,
                 &raw mut info,
@@ -1272,6 +1348,59 @@ fn create(
             armed: true,
         })
     })
+}
+
+/// The worker's environment, a block the launch builds. Nothing of the
+/// game's environment reaches the worker: its variables name the user's
+/// folders and can hold credentials, and the worker needs none of them.
+/// The block holds, sorted by name as Windows keeps one:
+/// - in an AppContainer (`sid`), `LOCALAPPDATA` and the folder that holds
+///   the AppContainer's (`<it>\Packages\<name>\AC`): Windows refuses to
+///   create an AppContainer's process whose environment lacks the variable
+///   (`ERROR_ENVVAR_NOT_FOUND`), and from it sets the worker's
+///   `LOCALAPPDATA` to the AppContainer's folder and its `TEMP` and `TMP`
+///   to that folder's `Temp`;
+/// - `SystemRoot` and the Windows directory, which Windows expects of every
+///   process (system DLLs and the side-by-side loader expand it).
+fn environment(sid: Option<&Sid>) -> Result<Vec<u16>, Failure> {
+    use std::os::windows::ffi::OsStringExt as _;
+    let mut block = Vec::new();
+    if let Some(sid) = sid {
+        let Some(folder) = folder(sid)? else {
+            return Err((0, "the profile's folder is missing".to_owned()));
+        };
+        let folder = std::path::PathBuf::from(std::ffi::OsString::from_wide(&folder));
+        let named = |path: &Path, name: &str| {
+            path.file_name()
+                .is_some_and(|n| n.eq_ignore_ascii_case(name))
+        };
+        let packages = folder.parent().and_then(Path::parent);
+        let Some(root) = packages
+            .filter(|p| named(&folder, "AC") && named(p, "Packages"))
+            .and_then(Path::parent)
+        else {
+            return Err((
+                0,
+                format!(
+                    "the profile's folder is not under Packages: {}",
+                    folder.display()
+                ),
+            ));
+        };
+        block.extend("LOCALAPPDATA=".encode_utf16());
+        block.extend(root.as_os_str().encode_wide());
+        block.push(0);
+    }
+    let mut dir = [0u16; 261];
+    // SAFETY: a buffer of the size given.
+    let n = usize::try_from(unsafe { GetSystemWindowsDirectoryW(Some(&mut dir)) }).unwrap_or(0);
+    let Some(dir) = dir.get(..n).filter(|_| n > 0 && n < 261) else {
+        return Err((last_error(), "the Windows directory".to_owned()));
+    };
+    block.extend("SystemRoot=".encode_utf16());
+    block.extend_from_slice(dir);
+    block.extend([0, 0]);
+    Ok(block)
 }
 
 /// Step 6: checks the suspended process against `expected`: the handles
@@ -1290,13 +1419,14 @@ fn check(
     if previous == u32::MAX {
         return Err((last_error(), "suspending its thread".to_owned()));
     }
-    child.resume()?;
+    // Refused while still suspended: the launch terminates it as it is.
     if previous != 1 {
         return Err((
             0,
             format!("its thread was resumed ({previous} suspensions)"),
         ));
     }
+    child.resume()?;
     if expected.has(Restrictions::JOB) {
         let Some(job) = job else {
             return Err((0, "no job".to_owned()));
@@ -1308,6 +1438,7 @@ fn check(
         if !inside.as_bool() {
             return Err((0, "not in its job".to_owned()));
         }
+        job_holds(job, expected)?;
     }
     policies(child.process.0, expected)?;
     if expected.has(Restrictions::APP_CONTAINER) {
@@ -1331,6 +1462,60 @@ fn check(
         }
     }
     Ok(table)
+}
+
+/// Checks that `job`'s limits and UI restrictions read back exactly as
+/// `expected` sets them: the memory cap, the flags (no breakaway among
+/// them) and the process limit.
+fn job_holds(job: &Owned, expected: Restrictions) -> Result<(), Failure> {
+    let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+    // SAFETY: the job this launch made, and a struct of the size given.
+    unsafe {
+        QueryInformationJobObject(
+            Some(job.0),
+            JobObjectExtendedLimitInformation,
+            (&raw mut limits).cast(),
+            u32::try_from(size_of_val(&limits)).unwrap_or(0),
+            None,
+        )
+    }
+    .map_err(failed("the job's limits"))?;
+    let basic = limits.BasicLimitInformation;
+    let one = expected.has(Restrictions::ONE_PROCESS);
+    if basic.LimitFlags != job_flags(expected)
+        || limits.ProcessMemoryLimit != MEMORY_CAP
+        || (one && basic.ActiveProcessLimit != 1)
+    {
+        return Err((
+            0,
+            format!(
+                "its job's limits are {:#x}, {} bytes, {} processes",
+                basic.LimitFlags.0, limits.ProcessMemoryLimit, basic.ActiveProcessLimit
+            ),
+        ));
+    }
+    let mut ui = JOBOBJECT_BASIC_UI_RESTRICTIONS::default();
+    // SAFETY: as above.
+    unsafe {
+        QueryInformationJobObject(
+            Some(job.0),
+            JobObjectBasicUIRestrictions,
+            (&raw mut ui).cast(),
+            u32::try_from(size_of_val(&ui)).unwrap_or(0),
+            None,
+        )
+    }
+    .map_err(failed("the job's UI restrictions"))?;
+    if ui.UIRestrictionsClass != JOB_UI {
+        return Err((
+            0,
+            format!(
+                "its job's UI restrictions are {:#x}",
+                ui.UIRestrictionsClass.0
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// Checks the mitigation policies `expected` sets on `process`.
@@ -1469,11 +1654,16 @@ fn token(process: HANDLE, sid: &Sid) -> Result<(), Failure> {
     Ok(())
 }
 
-/// Reads the worker's replies from `replies` until the pipe ends or a reply
-/// does not decode: log lines to the game's log, the rest to `tx`.
+/// Reads the worker's replies from `replies` until the pipe ends, a reply
+/// does not decode or the game holds [`REPLIES`] unread: log lines to the
+/// game's log, the rest to `tx`. One reply past the queue's capacity marks
+/// the worker `overflowed` and ends the reading, which closes the pipe: the
+/// worker's next reply fails and ends it. The game's thread never waits on
+/// the queue, and takes each reply without allocating.
 fn read_replies(
     replies: Owned,
-    tx: &Sender<Reply>,
+    tx: &SyncSender<Reply>,
+    overflowed: &AtomicBool,
     #[cfg(test)] log: &std::sync::Arc<Mutex<String>>,
 ) {
     use std::io::Read as _;
@@ -1516,11 +1706,15 @@ fn read_replies(
                     log.push('\n');
                 }
             }
-            Ok(reply) => {
-                if tx.send(reply).is_err() {
+            Ok(reply) => match tx.try_send(reply) {
+                Ok(()) => {}
+                Err(TrySendError::Full(_)) => {
+                    overflowed.store(true, Ordering::Release);
+                    log::warn!("media worker: more than {REPLIES} replies unread; its replies end");
                     return;
                 }
-            }
+                Err(TrySendError::Disconnected(_)) => return,
+            },
             Err(e) => {
                 log::warn!("media worker: a reply that does not decode ({e})");
                 return;

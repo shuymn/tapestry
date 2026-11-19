@@ -45,6 +45,7 @@ rules.workspace = true
 skin-beatoraja.workspace = true
 skin-model.workspace = true
 serde = { workspace = true, optional = true }
+sha2.workspace = true
 thiserror.workspace = true
 toml = { workspace = true, optional = true }
 windows = { workspace = true, features = [
