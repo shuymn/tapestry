@@ -911,7 +911,7 @@ fn the_probe_marks_the_selections_pool_at_its_events() {
         marks()
     );
     // A selection's release has no pages of the result's to time.
-    assert_eq!(pages, [], "{:?}", marks());
+    assert_eq!(pages, Vec::<u64>::new(), "{:?}", marks());
     r.link.exit();
 }
 

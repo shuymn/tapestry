@@ -62,6 +62,8 @@ windows = "0.62.2"
 # game
 triple_buffer = "9.0.0"
 serde = { version = "1.0.229", features = ["derive"] }
+# player (dev-tools): `tapestry test-device`'s records
+serde_json = "1.0.154"
 toml = "1.1.8"
 
 # library: the library database (bundled SQLite, with FTS5 for search)

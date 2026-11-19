@@ -36,6 +36,7 @@ pub mod checkpoints;
 mod decision_faults;
 pub mod loop_probe;
 pub mod scenario;
+pub mod test_device;
 pub mod transitions;
 
 pub use decision_faults::DecisionFaults;
