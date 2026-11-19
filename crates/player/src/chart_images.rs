@@ -775,6 +775,84 @@ fn hold_check() {
     CHECK_HELD.store(false, std::sync::atomic::Ordering::Release);
 }
 
+/// Where a fill read stops while its worker's [`FillGates`] are shut
+/// (tests): as it begins, before its first checkpoint, and once read, its
+/// result made but not returned. A read held there ignores its stop, as
+/// one starved of a core or past its last checkpoint does.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FillGate {
+    Begun = 1,
+    Read = 2,
+}
+
+/// A worker's fill gates (tests): while `shut`, every fill read it begins
+/// stops at each [`FillGate`] until a pass is granted; open, it passes.
+#[cfg(test)]
+#[derive(Debug, Default)]
+pub struct FillGates {
+    pub shut: std::sync::atomic::AtomicBool,
+    /// The gate a fill read waits at, as a [`FillGate`]'s value; 0 for
+    /// none.
+    pub at: std::sync::atomic::AtomicU8,
+    /// Passes granted: each lets one waiting fill read through its gate.
+    pub pass: std::sync::atomic::AtomicU32,
+}
+
+#[cfg(test)]
+impl FillGates {
+    /// Stops a fill read at `at` while shut, until a pass is granted or
+    /// the gates open.
+    fn wait(&self, at: FillGate) {
+        use std::sync::atomic::Ordering::{AcqRel, Acquire, Release};
+        if !self.shut.load(Acquire) {
+            return;
+        }
+        self.at.store(at as u8, Release);
+        while self.shut.load(Acquire)
+            && self
+                .pass
+                .try_update(AcqRel, Acquire, |p| p.checked_sub(1))
+                .is_err()
+        {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.at.store(0, Release);
+    }
+}
+
+/// A read seen by [`ChartImageWorker::fill_probe`] (tests): its row, its
+/// version, its fill epoch if a neighbour's, and whether its thread ended
+/// (a pool write: whether it was sent).
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Probed {
+    pub row: CursorId,
+    pub version: u64,
+    pub epoch: Option<u64>,
+    pub done: bool,
+}
+
+/// What the fill's interleavings look at (tests).
+#[cfg(test)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FillProbe {
+    /// The read in flight.
+    pub job: Option<Probed>,
+    /// Whether a read is left behind, and whether its thread ended.
+    pub left_behind: Option<bool>,
+    /// The pool write from a read's end to its answer.
+    pub write: Option<Probed>,
+    pub fill_epoch: u64,
+    /// Whether a cursor request is deferred, the cursor's read is to be
+    /// asked again, the fill has rows, and it is off for the run.
+    pub flags: [bool; 4],
+    pub slots: Vec<SlotState>,
+    /// The row last asked for, and the fill's rows left.
+    pub asked: Option<CursorId>,
+    pub fill_rows: Vec<CursorId>,
+}
+
 /// Holds a row read while [`HOLD_ROW_HARD`] is set (tests).
 #[cfg(test)]
 fn hold_row_hard() {
@@ -855,8 +933,42 @@ enum Target {
         generation: u64,
         slot: u16,
         version: u64,
-        fill: Option<Arc<crate::page_jobs::JobMode>>,
+        fill: Option<FillRead>,
     },
+}
+
+/// A fill read's identity, fixed when it begins: the fill epoch it
+/// belongs to and its thread's mode (design.md "Rendering and Skins",
+/// chart images). Its role, a neighbour's, is that it has one.
+#[derive(Debug, Clone)]
+struct FillRead {
+    epoch: u64,
+    mode: Arc<crate::page_jobs::JobMode>,
+}
+
+/// What a read was begun as, which its pool write keeps to its answer:
+/// the cursor's row, or a neighbour of fill epoch `epoch`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Role {
+    Cursor,
+    Fill { epoch: u64 },
+}
+
+/// The bytes a fill read left behind at a choice is counted at until its
+/// thread ends ("Memory Budget"): a row read holds its completed fit, at
+/// most a fit's bound, beside the image it is decoding, at most one
+/// image's whole-decode bound.
+pub const LEFT_BEHIND_BYTES: u64 = FIT_BYTES + chart_image::DECODE_LIMIT;
+
+/// One fit's bound ("Memory Budget"): 12 Mi texels at their largest
+/// padded allocation, with its mips.
+pub const FIT_BYTES: u64 = 67_718_480;
+
+/// A fill read left behind at a choice: its job, stopped, and its mode,
+/// whose refusal is recorded when it settles.
+struct LeftBehind {
+    job: OwnedJob<Arc<Output>>,
+    mode: Arc<crate::page_jobs::JobMode>,
 }
 
 /// A row's pool write, from its read's end to its answer: what it is for,
@@ -869,6 +981,9 @@ struct PendingWrite {
     rest: u64,
     row: CursorId,
     version: u64,
+    /// What its read was begun as: its answer is adopted under that
+    /// role's eviction rule.
+    role: Role,
     fits: Arc<ChartImages>,
     /// The answer, once sent; `None` until the select screen's step sends
     /// it.
@@ -938,7 +1053,9 @@ struct Core {
     /// joined: no job waits for it, its output is never taken, and no
     /// fill read begins while it lives, so at most one is alive (design.md
     /// "Load Pipeline", speculation is never waited on).
-    left_behind: Option<OwnedJob<Arc<Output>>>,
+    left_behind: Option<LeftBehind>,
+    /// The fill epoch: a fill read of another is discarded.
+    fill_epoch: u64,
     /// The selection's cursor generation: a new one at each change of the
     /// cursor's request.
     cursor_generation: u64,
@@ -1035,6 +1152,16 @@ struct Core {
     settled: u64,
     #[cfg(test)]
     abandoned: u64,
+    /// Tests: each entry evicted, by the version it held, and whether a
+    /// neighbour's read or write evicted it.
+    #[cfg(test)]
+    evictions: Vec<(bool, u64)>,
+    /// Tests: the fill reads' gates, and whether a read of an ended fill
+    /// epoch counts as current (the interleaving test's control).
+    #[cfg(test)]
+    gates: Arc<FillGates>,
+    #[cfg(test)]
+    epoch_control: bool,
 }
 
 /// The run's one owner of the chart-image worker (module doc): a handle,
@@ -1100,6 +1227,7 @@ impl ChartImageWorker {
                 job: None,
                 obsolete: None,
                 left_behind: None,
+                fill_epoch: 0,
                 cursor_generation: 0,
                 cursor: None,
                 cursor_row: None,
@@ -1150,6 +1278,12 @@ impl ChartImageWorker {
                 settled: 0,
                 #[cfg(test)]
                 abandoned: 0,
+                #[cfg(test)]
+                evictions: Vec::new(),
+                #[cfg(test)]
+                gates: Arc::default(),
+                #[cfg(test)]
+                epoch_control: false,
             })),
         }
     }
@@ -1319,12 +1453,12 @@ impl ChartImageWorker {
         if c.ended {
             return;
         }
+        c.end_fill_epoch();
         if let Some(request) = c.cursor.as_mut() {
             request.neighbours = neighbours;
             return;
         }
         if c.asked.is_some() && c.asked == c.cursor_row {
-            c.stop_fill_read(&|r| neighbours.contains(r));
             c.fill = Some(Fill {
                 cursor_generation: c.cursor_generation,
                 rows: neighbours.into(),
@@ -1859,6 +1993,93 @@ impl ChartImageWorker {
         self.core().left_behind.is_some()
     }
 
+    /// The speculative bytes counted for a fill read left behind at a
+    /// choice (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn left_behind_bytes(&self) -> u64 {
+        self.core().left_behind_bytes()
+    }
+
+    /// The fill's state for its interleavings (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn fill_probe(&self) -> FillProbe {
+        let c = self.core();
+        let job = c.job.as_ref().and_then(|j| match &j.target {
+            Target::Cursor {
+                id, version, fill, ..
+            } => Some(Probed {
+                row: id.clone(),
+                version: *version,
+                epoch: fill.as_ref().map(|f| f.epoch),
+                done: j.job.finished(),
+            }),
+            Target::Attempt { .. } => None,
+        });
+        let write = c.pending_write.as_ref().map(|p| Probed {
+            row: p.row.clone(),
+            version: p.version,
+            epoch: match p.role {
+                Role::Cursor => None,
+                Role::Fill { epoch } => Some(epoch),
+            },
+            done: p.rx.is_some(),
+        });
+        FillProbe {
+            job,
+            left_behind: c.left_behind.as_ref().map(|l| l.job.finished()),
+            write,
+            fill_epoch: c.fill_epoch,
+            flags: [c.cursor.is_some(), c.rearm, c.fill.is_some(), c.fill_off],
+            slots: c
+                .slots
+                .as_ref()
+                .map(pool::Slots::states)
+                .unwrap_or_default(),
+            asked: c.asked.clone(),
+            fill_rows: c
+                .fill
+                .as_ref()
+                .map(|f| f.rows.iter().cloned().collect())
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The gates its fill reads stop at (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn fill_gates(&self) -> Arc<FillGates> {
+        Arc::clone(&self.core().gates)
+    }
+
+    /// Breaks the fill epoch's discard: a read of an ended epoch counts as
+    /// current (tests: the interleaving test's control).
+    #[cfg(test)]
+    pub fn break_epoch(&self) {
+        self.core().epoch_control = true;
+    }
+
+    /// The entries evicted since the last call, by version, and whether a
+    /// neighbour's read or write evicted each (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn take_evictions(&self) -> Vec<(bool, u64)> {
+        std::mem::take(&mut self.core().evictions)
+    }
+
+    /// Withdraws the cursor's row's entry, if it has one, as a check that
+    /// found it changed does (tests).
+    #[cfg(test)]
+    pub fn withdraw_cursor_entry(&self) {
+        let mut c = self.core();
+        if let Some(row) = c.cursor_row.clone()
+            && c.entries.get(&row).is_some()
+        {
+            c.withdraw(&row);
+        }
+    }
+
     /// At the run's end: nothing begins from here (no want, step, service
     /// or admission begins a job); what it keeps goes, and every job is
     /// stopped and joined within [`STOP_WAIT`], or left to the process's
@@ -1892,7 +2113,7 @@ impl ChartImageWorker {
         let jobs = [
             c.job.take().map(|j| j.job),
             c.obsolete.take(),
-            c.left_behind.take(),
+            c.left_behind.take().map(|l| l.job),
         ];
         let check = c.check.take().map(|k| k.job);
         let ended = jobs
@@ -2026,6 +2247,7 @@ impl Core {
         self.asked = None;
         self.fill = None;
         self.rearm = false;
+        self.end_fill_epoch();
     }
 
     /// Whether play's publication is unanswered.
@@ -2098,20 +2320,26 @@ impl Core {
     /// Inserts `entry` for `row`, freeing the slots of the entries it
     /// evicts and its own if it is not kept; the cursor row's value
     /// changes when it is the cursor's.
-    fn adopt_entry(&mut self, row: CursorId, entry: pool::Entry) {
+    fn adopt_entry(&mut self, (row, role): (CursorId, Role), entry: pool::Entry) {
         let (version, state) = (entry.version, entry.state);
         let cursor = self.cursor_row.as_ref() == Some(&row);
+        let fill = matches!(role, Role::Fill { .. });
         let pins = self.fill_pins();
         let (generation, rest, slots) = (
             self.pool_generation,
             self.cursor_generation,
             self.slots.as_ref(),
         );
-        // The cursor's row may evict any entry; a neighbour's evicts none
-        // whose slot this rest filled, showed or kept, or a pin holds, as
-        // its slot admission takes none of them.
-        let evictable = |e: &pool::Entry| cursor || !protected(e, generation, rest, slots, pins);
+        // The cursor's read of the cursor's row may evict any entry; a
+        // neighbour's evicts none whose slot this rest filled, showed or
+        // kept, or a pin holds, as its slot admission takes none of them,
+        // even when the cursor has since moved onto its row.
+        let free = cursor && !fill;
+        let evictable = |e: &pool::Entry| free || !protected(e, generation, rest, slots, pins);
         let (kept, gone) = self.entries.insert(row, entry, &evictable);
+        #[cfg(test)]
+        self.evictions
+            .extend(gone.iter().map(|e| (fill, e.version)));
         for e in gone {
             if let pool::EntryState::Resident { generation, slot } = e.state {
                 self.free_slot(generation, slot, e.version);
@@ -2122,7 +2350,7 @@ impl Core {
         }
         // No room left for this rest's rows: the fill stops, never
         // evicting what it filled.
-        if !kept && !cursor {
+        if !kept && fill {
             self.fill = None;
         }
         if cursor {
@@ -2168,7 +2396,10 @@ impl Core {
                     generation: p.generation,
                     slot: p.slot,
                 };
-                self.adopt_entry(p.row, pool::Entry::new(p.version, bindings, state));
+                self.adopt_entry(
+                    (p.row, p.role),
+                    pool::Entry::new(p.version, bindings, state),
+                );
             }
             Ok(()) => {}
             Err(e) => {
@@ -2241,15 +2472,9 @@ impl Core {
         }
         self.fill = None;
         // A fill read in flight is of the old generation, its output to
-        // be dropped: stopped, so the cursor's read asked again below does
-        // not wait for it to get a permit or finish its file.
-        if let Some(Job {
-            target: Target::Cursor { fill: Some(_), .. },
-            job,
-        }) = &self.job
-        {
-            job.stop();
-        }
+        // be dropped: its epoch ends, so the cursor's read asked again
+        // below does not wait for it to get a permit or finish its file.
+        self.end_fill_epoch();
         if resident {
             self.changed = true;
         }
@@ -2406,35 +2631,73 @@ impl Core {
             "chart images: {} changed since it was read",
             k.row.dir.display()
         );
-        if let Some(e) = self.entries.remove(&k.row)
+        self.withdraw(&k.row);
+    }
+
+    /// Withdraws `row`'s entry, its slot freed; when it is the cursor's
+    /// row, its value changes and its read is requested again with no
+    /// move, before the fill's rows: the fill epoch ends.
+    fn withdraw(&mut self, row: &CursorId) {
+        if let Some(e) = self.entries.remove(row)
             && let pool::EntryState::Resident { generation, slot } = e.state
         {
             self.free_slot(generation, slot, e.version);
         }
-        if self.cursor_row.as_ref() == Some(&k.row) {
+        if self.cursor_row.as_ref() == Some(row) {
             self.changed = true;
             self.rearm = true;
-            // The cursor's row goes first: a neighbour in flight is
-            // stopped; the request asked again brings the fill's rows.
-            self.stop_fill_read(&|_| false);
+            // The cursor's row goes first: the fill's epoch ends; the
+            // request asked again brings the fill's rows.
+            self.end_fill_epoch();
         }
     }
 
-    /// Stops the fill's read in flight unless `keep` keeps its row.
-    fn stop_fill_read(&mut self, keep: &dyn Fn(&CursorId) -> bool) {
-        let Some(Job {
-            target: Target::Cursor {
-                id, fill: Some(_), ..
-            },
+    /// Ends the fill epoch (design.md "Rendering and Skins", chart
+    /// images): the fill read in flight is stopped and its result, when it
+    /// ends, discarded ([`cursor_finished`](Self::cursor_finished)), and a
+    /// fill write not yet sent is dropped, its slot freed. A write already
+    /// sent is the render thread's: its answer is adopted under its role.
+    fn end_fill_epoch(&mut self) {
+        self.fill_epoch += 1;
+        if let Some(Job {
+            target: Target::Cursor { fill: Some(_), .. },
             job,
         }) = &self.job
-        else {
-            return;
-        };
-        if keep(id) {
-            return;
+        {
+            job.stop();
         }
-        job.stop();
+        if self
+            .pending_write
+            .as_ref()
+            .is_some_and(|p| p.rx.is_none() && matches!(p.role, Role::Fill { .. }))
+            && let Some(p) = self.pending_write.take()
+        {
+            self.free_slot(p.generation, p.slot, p.version);
+        }
+    }
+
+    /// Whether a read begun as `role` is still of the current fill epoch:
+    /// the cursor's always, a neighbour's while its epoch lives.
+    fn role_current(&self, role: Role) -> bool {
+        #[cfg(test)]
+        if self.epoch_control {
+            return true;
+        }
+        match role {
+            Role::Cursor => true,
+            Role::Fill { epoch } => epoch == self.fill_epoch,
+        }
+    }
+
+    /// The speculative bytes counted for a fill read left behind at a
+    /// choice, from its abandonment until its thread ends ("Memory
+    /// Budget"): [`LEFT_BEHIND_BYTES`] while it lives, else none.
+    fn left_behind_bytes(&self) -> u64 {
+        if self.left_behind.is_some() {
+            LEFT_BEHIND_BYTES
+        } else {
+            0
+        }
     }
 
     /// The slots a pin holds now: the newest update sent, and the one the
@@ -2470,6 +2733,7 @@ impl Core {
                     generation,
                     slot,
                     version,
+                    fill: Some(FillRead { mode, .. }),
                     ..
                 },
             job,
@@ -2479,7 +2743,10 @@ impl Core {
         };
         job.stop();
         self.free_slot(generation, slot, version);
-        self.left_behind = Some(job);
+        log::info!(
+            "chart images: a fill read left behind, {LEFT_BEHIND_BYTES} bytes counted until it ends"
+        );
+        self.left_behind = Some(LeftBehind { job, mode });
     }
 
     fn retire(&mut self, job: OwnedJob<Arc<Output>>) {
@@ -2622,8 +2889,9 @@ impl Core {
             self.result = Some(h);
         }
         log::info!(
-            "chart images: read; {} bytes retained",
-            self.retained_bytes()
+            "chart images: read; {} bytes retained, {} counted for a fill read left behind",
+            self.retained_bytes(),
+            self.left_behind_bytes()
         );
     }
 
@@ -2639,10 +2907,19 @@ impl Core {
         {
             settle_logged(old);
         }
-        if self.left_behind.as_ref().is_some_and(OwnedJob::finished)
+        if self.left_behind.as_ref().is_some_and(|l| l.job.finished())
             && let Some(old) = self.left_behind.take()
         {
-            settle_logged(old);
+            settle_logged(old.job);
+            log::info!(
+                "chart images: the fill read left behind ended, its {LEFT_BEHIND_BYTES} bytes no longer counted"
+            );
+            // A refused background mode ends the fill for the run, as for
+            // a read taken (below); its job logged it once.
+            if old.mode.refused() {
+                self.fill_off = true;
+                self.fill = None;
+            }
         }
         let Some(job) = self.job.take() else {
             return;
@@ -2670,11 +2947,17 @@ impl Core {
             } => {
                 // A refused background mode ends the fill for the run; its
                 // job logged it once.
-                if fill.is_some_and(|m| m.refused()) {
+                if fill.as_ref().is_some_and(|f| f.mode.refused()) {
                     self.fill_off = true;
                     self.fill = None;
                 }
-                self.cursor_finished(id, cursor_generation, (generation, slot, version), outcome);
+                let role = fill.map_or(Role::Cursor, |f| Role::Fill { epoch: f.epoch });
+                self.cursor_finished(
+                    (id, role),
+                    cursor_generation,
+                    (generation, slot, version),
+                    outcome,
+                );
             }
         }
     }
@@ -2737,7 +3020,7 @@ impl Core {
     /// read again at a later rest.
     fn cursor_finished(
         &mut self,
-        id: CursorId,
+        (id, role): (CursorId, Role),
         cursor_generation: u64,
         (generation, slot, version): (u64, u16, u64),
         outcome: Option<Outcome<Arc<Output>>>,
@@ -2764,8 +3047,9 @@ impl Core {
             }
             Some(Outcome::Cancelled) | None => None,
         };
-        let current =
-            cursor_generation == self.cursor_generation && generation == self.pool_generation;
+        let current = cursor_generation == self.cursor_generation
+            && generation == self.pool_generation
+            && self.role_current(role);
         let read =
             [ChartImage::Stage, ChartImage::Banner].map(|w| fits.as_ref().map(|f| f.read(w)));
         let whole = read.iter().all(|r| r.is_some_and(reusable));
@@ -2782,7 +3066,7 @@ impl Core {
                 fits.read(ChartImage::Banner).binding.clone(),
             ];
             self.adopt_entry(
-                id,
+                (id, role),
                 pool::Entry::new(version, bindings, pool::EntryState::Absent),
             );
             return;
@@ -2793,6 +3077,7 @@ impl Core {
             rest: cursor_generation,
             row: id,
             version,
+            role,
             fits,
             rx: None,
         });
@@ -2963,7 +3248,7 @@ impl Core {
                 ],
                 pool::EntryState::Absent,
             );
-            self.adopt_entry(request.id, entry);
+            self.adopt_entry((request.id, Role::Cursor), entry);
             return;
         }
         let Some((slots, publish)) = self.slots.as_mut().zip(publish) else {
@@ -2984,8 +3269,12 @@ impl Core {
             pool::SlotState::Writing { version },
             self.cursor_generation,
         );
-        if let Some(row) = evicted.and_then(|v| self.entries.by_version(v)).cloned() {
-            self.entries.remove(&row);
+        if let Some(row) = evicted.and_then(|v| self.entries.by_version(v)).cloned()
+            && let Some(gone) = self.entries.remove(&row)
+        {
+            #[cfg(test)]
+            self.evictions.push((false, gone.version));
+            let _ = gone;
         }
         let CursorRequest { id, subscriber, .. } = request;
         self.begun += 1;
@@ -3111,18 +3400,25 @@ impl Core {
         if let Some(slots) = self.slots.as_mut() {
             slots.set(slot, pool::SlotState::Writing { version }, rest);
         }
-        if let Some(gone) = evicted.and_then(|v| self.entries.by_version(v)).cloned() {
-            self.entries.remove(&gone);
+        if let Some(row) = evicted.and_then(|v| self.entries.by_version(v)).cloned()
+            && let Some(gone) = self.entries.remove(&row)
+        {
+            #[cfg(test)]
+            self.evictions.push((true, gone.version));
+            let _ = gone;
         }
         self.begun += 1;
         let key = JobKey {
-            kind: JobKind::ChartImages,
+            kind: JobKind::ChartImageFill,
             path: row.dir.clone(),
             speed: bms_model::Speed::NORMAL,
         };
         let mode =
             crate::page_jobs::JobMode::new(Arc::clone(&self.fill_mode), "chart images: fill");
+        let epoch = self.fill_epoch;
         let (hook, stop) = (Arc::clone(&mode), Arc::clone(&mode));
+        #[cfg(test)]
+        let gates = Arc::clone(&self.gates);
         let read = row.clone();
         let spawned = coord.spawn_owned(
             spawner,
@@ -3131,9 +3427,12 @@ impl Core {
             coord.subscriber(Scope::Cursor),
             move |class| hook.on_class(class),
             move |ctx| {
-                Arc::new(run_cursor_job(&read, cells, &|| {
-                    ctx.cancelled() || stop.refused()
-                }))
+                #[cfg(test)]
+                gates.wait(FillGate::Begun);
+                let out = run_cursor_job(&read, cells, &|| ctx.cancelled() || stop.refused());
+                #[cfg(test)]
+                gates.wait(FillGate::Read);
+                Arc::new(out)
             },
         );
         match spawned {
@@ -3145,7 +3444,7 @@ impl Core {
                         generation,
                         slot,
                         version,
-                        fill: Some(mode),
+                        fill: Some(FillRead { epoch, mode }),
                     },
                     job,
                 });
@@ -4028,5 +4327,62 @@ mod tests {
                 Err(super::Absent::Cancelled)
             ));
         }
+    }
+
+    /// A row read peaks within what a read left behind is counted at
+    /// (design.md "Memory Budget"): its stage file fitted to the largest
+    /// cell, 2 048² with its mips, is held while its banner, a 4 096×3 072
+    /// RGBA16 PNG (12 Mi texels, 96 MiB native), converts beside its RGBA8
+    /// copy (48 MiB). The test thread's heap reaches that combined peak and
+    /// stays within [`super::LEFT_BEHIND_BYTES`].
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn a_row_read_peaks_within_the_left_behind_bound_alloc() {
+        use skin_model::chart_image::{ChartCells, Slot};
+        let d = tempfile::tempdir().unwrap();
+        png(d.path(), "s.png", [2_048, 2_048], [10, 20, 30]);
+        {
+            let file = std::fs::File::create(d.path().join("n.png")).unwrap();
+            let mut e = png::Encoder::new(std::io::BufWriter::new(file), 4_096, 3_072);
+            e.set_color(png::ColorType::Rgba);
+            e.set_depth(png::BitDepth::Sixteen);
+            let texels = [1, 2, 3, 4, 5, 6, 255, 255].repeat(4_096 * 3_072);
+            e.write_header().unwrap().write_image_data(&texels).unwrap();
+        }
+        let id = super::CursorId {
+            dir: d.path().to_path_buf(),
+            names: [
+                library::Name::Named("s.png".to_owned()),
+                library::Name::Named("n.png".to_owned()),
+            ],
+        };
+        let cells = ChartCells {
+            stage: Slot::new([2_048, 2_048]),
+            banner: Slot::new([512, 128]),
+            ..ChartCells::NONE
+        };
+        crate::alloc_count::reset_peak();
+        let set = super::read_row(&id, cells, &|| false);
+        let peak = crate::alloc_count::peak_bytes();
+        let stage = set.read(ChartImage::Stage).image.as_ref().unwrap();
+        let banner = set.read(ChartImage::Banner).image.as_ref().unwrap();
+        assert_eq!(banner.native(), [4_096, 3_072]);
+        let fit: u64 = stage
+            .levels()
+            .iter()
+            .map(|l| u64::try_from(l.len()).unwrap())
+            .sum();
+        assert!(fit > 16 << 20, "{fit}");
+        // The native RGBA16 image beside its RGBA8 copy.
+        let converting = (8 + 4) * (12_u64 << 20);
+        assert!(
+            peak >= fit + converting,
+            "not the combined peak: {peak} < {fit} + {converting}"
+        );
+        assert!(
+            peak <= super::LEFT_BEHIND_BYTES,
+            "{peak} > {}",
+            super::LEFT_BEHIND_BYTES
+        );
     }
 }

@@ -12,12 +12,15 @@ use std::time::{Duration, Instant};
 
 use game::coord::{Caps, Class, Coordinator, Spawner};
 use library::Name;
+use skin_model::chart_image::ChartImage;
 use windows::Win32::System::Threading::{THREAD_MODE_BACKGROUND_BEGIN, THREAD_PRIORITY};
 
 use super::{Cursor, LetGo, chart, cursor_of, named, row};
 use crate::chart_currency::CursorChart;
 use crate::chart_images::FS_READS;
-use crate::chart_images::{EntryState, HELD_ROW_HARD, HOLD, HOLD_ROW_HARD, SlotState, Want};
+use crate::chart_images::{
+    EntryState, FillGate, HELD_ROW_HARD, HOLD, HOLD_ROW_HARD, LEFT_BEHIND_BYTES, SlotState, Want,
+};
 use crate::render_side::tests::wait_until;
 
 impl Cursor {
@@ -623,10 +626,13 @@ fn the_fill_stops_when_no_entry_may_make_room() {
 }
 
 /// A choice never waits on a fill read (design.md "Load Pipeline"): with
-/// a neighbour's read stalled for a core, ignoring its stop, play's image
-/// job begins and ends beside it, the read left behind with its slot
-/// freed. Back on selection while it lives, no fill read begins, so at
-/// most one is left behind; once it ends, the fill reads on.
+/// a neighbour's read stalled for a core, ignoring its stop, the choice of
+/// a chart in that very folder reads its images beside it under a key of
+/// its own, decoded, never refused as a job already running; the read is
+/// left behind with its slot freed and counted at its bound ("Memory
+/// Budget") until its thread ends. Back on selection while it lives, no
+/// fill read begins, so at most one is left behind; once it ends, the fill
+/// reads on.
 #[test]
 fn a_choice_never_waits_on_a_fill_read() {
     let _serial = crate::imports::tests::serial();
@@ -648,14 +654,15 @@ fn a_choice_never_waits_on_a_fill_read() {
             .count()
     };
     assert_eq!(held(&c), 2, "the cursor's slot and the neighbour's");
-    // The choice.
+    // The choice, of a chart in the folder the held read reads.
     c.w.leave_selection(&c.coord);
     c.r.link.leave_selection();
     assert!(c.w.left_behind_alive());
+    assert_eq!(c.w.left_behind_bytes(), LEFT_BEHIND_BYTES);
     assert_eq!(held(&c), 1, "the left read's slot not freed");
     c.w.renew();
     c.w.attempt(Want {
-        dir: at.path().to_path_buf(),
+        dir: near[0].path().to_path_buf(),
         names: ["s.png".to_owned(), "n.png".to_owned(), String::new()],
         play: Some(2_048),
         result: None,
@@ -681,6 +688,18 @@ fn a_choice_never_waits_on_a_fill_read() {
     }
     assert!(HELD_ROW_HARD.load(Ordering::Acquire), "the fill read ended");
     assert_eq!(c.w.begun(), 3, "the cursor's, the neighbour's and play's");
+    let images = c.w.current().unwrap();
+    let stage = images
+        .read(ChartImage::Stage)
+        .image
+        .as_ref()
+        .unwrap_or_else(|e| panic!("the chosen chart's stage file suppressed: {e:?}"));
+    assert_eq!(stage.native(), [64, 48]);
+    assert_eq!(
+        stage.levels()[0][..4],
+        [10, 20, 30, 255],
+        "the stage file's pixels"
+    );
     // Back on selection while the left read lives: the fill waits, no
     // read of it begins.
     c.w.forget();
@@ -710,8 +729,49 @@ fn a_choice_never_waits_on_a_fill_read() {
     HOLD_ROW_HARD.store(false, Ordering::Release);
     c.filled();
     assert!(!c.w.left_behind_alive());
+    assert_eq!(c.w.left_behind_bytes(), 0);
     assert!(c.slot_of(&near[0]).is_some() && c.slot_of(&near[1]).is_some());
     assert_eq!(c.w.begun(), begun + 2);
+}
+
+/// A read left behind at a choice keeps its thread's mode: a refusal of
+/// background mode it met is recorded when it settles, and ends the fill
+/// for the run as one met by a read taken does (AC-S10).
+#[test]
+fn a_refusal_met_by_a_read_left_behind_ends_the_fill() {
+    fn refuse(priority: THREAD_PRIORITY) -> windows::core::Result<()> {
+        if priority == THREAD_MODE_BACKGROUND_BEGIN {
+            return Err(windows::Win32::Foundation::E_ACCESSDENIED.into());
+        }
+        Ok(())
+    }
+    let _serial = crate::imports::tests::serial();
+    let _let_go = LetGo;
+    let mut c = cursor_of(8);
+    c.w =
+        c.w.clone()
+            .with_fill_mode(Arc::new(crate::priority::Checked::with(refuse)));
+    let (at, near) = (chart([64, 48], [30, 8]), charts(1));
+    c.rest_on(at.path(), named());
+    c.shown(at.path(), named());
+    let gates = c.w.fill_gates();
+    gates.shut.store(true, Ordering::Release);
+    c.rest_with(at.path(), named(), &[&near[0]]);
+    // The read meets the refusal as its thread takes its class, before it
+    // stands at its first gate.
+    c.until(|_| gates.at.load(Ordering::Acquire) == FillGate::Begun as u8);
+    c.w.leave_selection(&c.coord);
+    c.r.link.leave_selection();
+    assert!(c.w.left_behind_alive());
+    assert!(!c.fill_off());
+    gates.shut.store(false, Ordering::Release);
+    let end = Instant::now() + Duration::from_secs(10);
+    while c.w.left_behind_alive() {
+        assert!(Instant::now() < end, "the read left behind never ended");
+        c.w.service();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert!(c.fill_off(), "the refusal of the read left behind was lost");
 }
 
 impl Cursor {

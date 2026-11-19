@@ -1282,3 +1282,4 @@ fn the_end_drops_a_deferred_cursor_request() {
 }
 
 mod fill;
+mod interleavings;
