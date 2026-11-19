@@ -7,8 +7,9 @@
 //! what FFmpeg's layer holds: the pinned build, the codec and container
 //! allow-list, the worker's open of the decoders FFmpeg's probe opens, the
 //! pixel cap on the size FFmpeg allocates, the probe's read budget, the
-//! refused allocations a demuxer or a decoder goes on from, the refused
-//! secondary open, the decoded frames' stamps, the seek's back-off and the
+//! refused allocations a demuxer or a decoder goes on from, a refusal
+//! recorded while a decoder parks at a video's end, the refused secondary
+//! open, the decoded frames' stamps, the seek's back-off and the
 //! zlib-compressed containers (`media_sandbox.rs` checks the sandbox
 //! itself).
 //!
@@ -275,9 +276,27 @@ impl Taken {
 /// video ended: each poll is due half an interval past the last frame
 /// taken, so it stages the next frame and no later one.
 fn take_all(worker: &Worker, ring: &mut Ring, player: u8, first: i64, interval: i64) -> Vec<Taken> {
+    let (taken, last) = take_to_last(worker, ring, player, first, interval);
+    assert!(
+        matches!(last, Reply::Ended { player: p, .. } if p == player),
+        "{last:?} while player {player} plays; the worker's log:\n{}",
+        worker.log()
+    );
+    taken
+}
+
+/// As [`take_all`], until the worker answers that the video ended or that
+/// the player failed: the frames and that answer.
+fn take_to_last(
+    worker: &Worker,
+    ring: &mut Ring,
+    player: u8,
+    first: i64,
+    interval: i64,
+) -> (Vec<Taken>, Reply) {
     let mut taken = Vec::new();
     let mut due = first + interval / 2;
-    let mut ended = false;
+    let mut last = None;
     let deadline = Instant::now() + Duration::from_secs(120);
     loop {
         assert!(
@@ -295,11 +314,15 @@ fn take_all(worker: &Worker, ring: &mut Ring, player: u8, first: i64, interval: 
             due = frame.stamp + interval * 3 / 2;
             continue;
         }
-        if ended {
-            return taken;
+        if let Some(last) = last {
+            return (taken, last);
         }
         match worker.try_reply() {
-            Some(Reply::Ended { player: p, .. }) if p == player => ended = true,
+            Some(reply @ (Reply::Ended { player: p, .. } | Reply::Failed { player: p, .. }))
+                if p == player =>
+            {
+                last = Some(reply)
+            }
             Some(other) => panic!("{other:?} while player {player} plays"),
             None => std::thread::sleep(Duration::from_millis(1)),
         }
@@ -561,6 +584,81 @@ fn worker_seek_lands_on_target_after_back_off() {
         assert_eq!((taken.stamp, painted(&taken.bytes, 320)), (due, i));
     }
     worker.close(3);
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn worker_fails_a_player_refused_while_its_decoder_parks_at_the_end() {
+    use skin_model::media::control::Failure;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Two seconds at 24 fps, a key frame every half second, at a size whose
+    // last frame starts a packet of the file and so carries its own stamp:
+    // at a smaller size it shares its packet with the frames before it, has
+    // no stamp when the decoder gives it, and is skipped.
+    let path = gen_clip(dir.path(), "p.mpg", "mpeg1video mpeg 320x240 24 48 12");
+    let stamps: Vec<i64> = (0..48).map(|i| stamp_of(i, 24)).collect();
+    // Without a seam each player ends. With the park seam, which records a
+    // refusal for the player each time it parks its decoder at a video's
+    // end, after the decoder gave the end (as a frame thread still decoding
+    // when its other thread gave the end would), each fails there instead.
+    for seam in [false, true] {
+        let args: &[&str] = if seam { &["--dev-refuse-at-park"] } else { &[] };
+        let mut worker = Worker::start(args);
+        let refused = |player| Reply::Failed {
+            player,
+            why: Failure::Memory,
+            code: -12,
+        };
+
+        // Played to its end: every frame, then the answer.
+        let probe = worker.open(1, &path);
+        assert!(
+            matches!(probe, Reply::Probed { player: 1, .. }),
+            "{probe:?}"
+        );
+        let mut ring = Ring::new(320, 240);
+        assert_eq!(worker.play(1, &ring), Reply::Playing { player: 1 });
+        let (taken, last) = take_to_last(&worker, &mut ring, 1, 0, stamp_of(1, 24));
+        let taken: Vec<i64> = taken.iter().map(|t| t.stamp).collect();
+        assert_eq!(
+            taken,
+            stamps,
+            "seam {seam}: {last:?}; the worker's log:\n{}",
+            worker.log()
+        );
+        if seam {
+            assert_eq!(last, refused(1), "the worker's log:\n{}", worker.log());
+        } else {
+            assert!(matches!(last, Reply::Ended { player: 1, .. }), "{last:?}");
+        }
+
+        // Sought past its end: the answer, with the ring full and the
+        // player waiting for a slot short of the end.
+        let probe = worker.open(2, &path);
+        assert!(
+            matches!(probe, Reply::Probed { player: 2, .. }),
+            "{probe:?}"
+        );
+        let mut ring = Ring::new(320, 240);
+        assert_eq!(worker.play(2, &ring), Reply::Playing { player: 2 });
+        let run = ring.start_run(10_000_000);
+        worker.send(&Order::Seek {
+            player: 2,
+            run,
+            at: 10_000_000,
+        });
+        let want = if seam {
+            refused(2)
+        } else {
+            Reply::Ended { player: 2, run }
+        };
+        assert_eq!(worker.reply(), want, "the worker's log:\n{}", worker.log());
+        for player in [1, 2] {
+            worker.close(player);
+        }
+    }
 }
 
 /// `file` with every MPEG sequence header's size set to 4 095 × 4 095.
