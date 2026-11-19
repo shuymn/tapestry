@@ -4,7 +4,11 @@
 //! where ffmpeg-sys-next finds its headers and import libraries. This script
 //! fails the build, naming that command, unless the release there is the
 //! pinned one, and copies its DLLs beside the binaries it builds, where
-//! `tapestry-media.exe` loads them.
+//! `tapestry-media.exe` loads them. Cargo runs ffmpeg-sys-next's build script
+//! before this one (its `links` metadata reaches this one), so with no
+//! release there at all the build fails first in ffmpeg-sys-next's header
+//! check, which finds no headers in `target/ffmpeg/include`, and this
+//! script's message does not show (docs/setup.md "FFmpeg").
 
 use std::fs;
 use std::path::{Path, PathBuf};
