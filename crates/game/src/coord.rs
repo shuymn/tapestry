@@ -193,6 +193,11 @@ pub enum JobKind {
     /// The chosen chart's stage file and back image read and fitted (its
     /// owned image worker, S10-12).
     ChartImages,
+    /// A selection row's stage file and banner read speculatively by the
+    /// fill near the cursor (design.md "Rendering and Skins", chart
+    /// images): a kind of its own, so a fill read left running never holds
+    /// the key of the chosen chart's read of the same folder.
+    ChartImageFill,
     /// A selection row's kept chart images checked against their files'
     /// metadata after a use, reading no image (design.md "Load Pipeline",
     /// Freshness).
