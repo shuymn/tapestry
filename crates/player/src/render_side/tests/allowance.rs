@@ -1244,18 +1244,29 @@ fn a_cutoff_asked_before_a_pass_s_pacing_is_given_at_its_mark() {
     assert_eq!(r.fake.state().frames.len(), frames, "a frame between");
 }
 
-/// V18: asked in Idle after the end of loading: cut off in the `Cutoff`
-/// message's turn, the game woken.
+/// V18: asked while Idle waits for its message after the end of loading,
+/// with no filled entry: cut off at once by the game's swap, with no
+/// message's turn and no wake, as READY's opening asks it.
+// Revert: the idle wait left unmarked (no `mark_waiting` and
+// `mark_running` around it) -> "Idle's wait not marked waiting".
 #[test]
-fn a_cutoff_asked_in_idle_is_given_in_its_message_s_turn() {
+fn a_cutoff_asked_while_idle_waits_is_given_by_the_swap() {
     let r = Rig::new();
     let woken = woken(&r.link);
     r.link.loading().show(one_line("L"));
     r.until_frames(|f| !f.is_empty());
     r.link.end_loading().unwrap();
+    assert!(
+        wait_until(|| r.link.cutoff_phase() == CutoffPhase::Waiting),
+        "Idle's wait not marked waiting"
+    );
     r.link.ask_cutoff();
-    assert!(wait_until(|| r.link.cutoff_phase() == CutoffPhase::CutOff));
-    assert!(wait_until(|| woken.load(Ordering::Acquire) >= 1));
+    assert_eq!(
+        r.link.cutoff_phase(),
+        CutoffPhase::CutOff,
+        "not cut off by the swap"
+    );
+    assert_eq!(woken.load(Ordering::Acquire), 0, "woken for a swap");
 }
 
 /// V18: with a filled entry, READY waits; cut off in the pass that

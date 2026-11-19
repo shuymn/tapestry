@@ -4039,10 +4039,11 @@ impl RenderLink {
 
     /// Asks for READY's cutoff, once an attempt's end of loading returned
     /// (design.md "Memory Budget", READY's condition): while the render
-    /// thread waits for its frame with no filled retirement entry, cut off
-    /// at once by this swap, which it finds after its wait; otherwise the
-    /// request is marked and sent, and the render thread cuts off once no
-    /// entry is filled, waking the game thread. Allocates nothing.
+    /// thread waits, for its frame or in an idle pass for its next message,
+    /// with no filled retirement entry, cut off at once by this swap, which
+    /// it finds after its wait; otherwise the request is marked and sent,
+    /// and the render thread cuts off once no entry is filled, waking the
+    /// game thread. Allocates nothing.
     #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
     pub fn ask_cutoff(&self) {
         if self
@@ -6325,13 +6326,25 @@ impl Run {
                     // A heavy operation due and allowed: the boundary at
                     // once.
                     Some(wait) if wait.is_zero() => rx.try_recv(),
-                    // A preparation not yet answered, or work of the
-                    // boundary's, is looked at again between messages.
-                    Some(wait) => rx.recv_timeout(wait).map_err(|e| match e {
-                        mpsc::RecvTimeoutError::Timeout => TryRecvError::Empty,
-                        mpsc::RecvTimeoutError::Disconnected => TryRecvError::Disconnected,
-                    }),
-                    None => rx.recv().map_err(|_| TryRecvError::Disconnected),
+                    // READY's cutoff is marked waiting around the wait, as
+                    // around a frame's pacing, so the game's request taken
+                    // meanwhile with no entry filled is acknowledged at
+                    // once by its swap, with no message's turn.
+                    wait => {
+                        self.mark_waiting(self.screen.as_ref().map_or(0, |s| s.filled()));
+                        let msg = match wait {
+                            // A preparation not yet answered, or work of
+                            // the boundary's, is looked at again between
+                            // messages.
+                            Some(wait) => rx.recv_timeout(wait).map_err(|e| match e {
+                                mpsc::RecvTimeoutError::Timeout => TryRecvError::Empty,
+                                mpsc::RecvTimeoutError::Disconnected => TryRecvError::Disconnected,
+                            }),
+                            None => rx.recv().map_err(|_| TryRecvError::Disconnected),
+                        };
+                        self.mark_running();
+                        msg
+                    }
                 }
             } else if matches!(mode, Mode::Play { skipped, .. } if skipped >= ACQUIRE_RETRIES) {
                 // A play frame's acquisition keeps being skipped: wait a
@@ -8615,9 +8628,10 @@ impl Run {
         }
     }
 
-    /// Just before the frame's pacing, outside READY's cutoff: waiting,
-    /// with `filled` entries and the request kept; cut off instead when it
-    /// was asked with none filled. A lost cutoff stays lost until its end.
+    /// Just before the frame's pacing or an idle pass's wait for its
+    /// message, outside READY's cutoff: waiting, with `filled` entries and
+    /// the request kept; cut off instead when it was asked with none
+    /// filled. A lost cutoff stays lost until its end.
     fn mark_waiting(&mut self, filled: u32) {
         if self.cut_off {
             return;
@@ -8649,8 +8663,9 @@ impl Run {
         }
     }
 
-    /// Just after the frame's pacing, whichever way it returned: running
-    /// again, or cut off when the game's swap cut it off meanwhile.
+    /// Just after the frame's pacing or the idle wait, whichever way it
+    /// returned: running again, or cut off when the game's swap cut it off
+    /// meanwhile.
     fn mark_running(&mut self) {
         if self.cut_off {
             return;
