@@ -124,6 +124,39 @@ fn control_messages_round_trip() {
     };
     assert_eq!(version.len(), MAX_TEXT - 1);
     assert!(long.starts_with(&version));
+    // Two strings at the cap would overrun a frame: the second is cut to
+    // the room the first leaves, and the reply still frames.
+    let (first, second) = ("v".repeat(MAX_TEXT), "c".repeat(MAX_TEXT));
+    for reply in [
+        Reply::Hello {
+            version: first.clone(),
+            configuration: second.clone(),
+        },
+        Reply::Probed {
+            player: 1,
+            width: 2,
+            height: 3,
+            duration: 4,
+            codec: first.clone(),
+            container: second.clone(),
+        },
+    ] {
+        let bytes = reply.encode();
+        assert_eq!(bytes.len(), MAX_FRAME, "{reply:?}");
+        assert!(frame(&bytes).is_some(), "{reply:?}");
+        let (a, b) = match Reply::decode(&bytes) {
+            Ok(Reply::Hello {
+                version,
+                configuration,
+            }) => (version, configuration),
+            Ok(Reply::Probed {
+                codec, container, ..
+            }) => (codec, container),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(a, first);
+        assert!(b.len() < MAX_TEXT && second.starts_with(&b), "{}", b.len());
+    }
 }
 
 // Covers: T02

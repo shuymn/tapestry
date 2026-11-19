@@ -234,8 +234,9 @@ impl Command {
 }
 
 impl Reply {
-    /// The message's bytes, without the frame's length. A string longer
-    /// than [`MAX_TEXT`] is cut at a character boundary.
+    /// The message's bytes, without the frame's length, which fit a frame:
+    /// a string longer than [`MAX_TEXT`], or than the room the frame has
+    /// left for it, is cut at a character boundary.
     #[must_use]
     pub fn encode(&self) -> Vec<u8> {
         let mut b = Bytes::default();
@@ -243,7 +244,7 @@ impl Reply {
             Self::Hello {
                 version,
                 configuration,
-            } => b.u8(HELLO).text(version).text(configuration),
+            } => b.u8(HELLO).texts(&[version, configuration]),
             Self::Probed {
                 player,
                 width,
@@ -257,8 +258,7 @@ impl Reply {
                 .u32(*width)
                 .u32(*height)
                 .i64(*duration)
-                .text(codec)
-                .text(container),
+                .texts(&[codec, container]),
             Self::Refused {
                 player,
                 why,
@@ -393,8 +393,21 @@ impl Bytes {
         self
     }
 
-    fn text(&mut self, s: &str) -> &mut Self {
-        let mut end = s.len().min(MAX_TEXT);
+    /// Writes `strings`, the message's last fields, each cut to fit the
+    /// frame: to at most [`MAX_TEXT`] bytes, and to the room the frame has
+    /// left after its own length and those of the strings after it.
+    fn texts(&mut self, strings: &[&str]) -> &mut Self {
+        for (i, s) in strings.iter().enumerate() {
+            let lengths = 2 * (strings.len() - i);
+            let room = MAX_FRAME.saturating_sub(self.0.len() + lengths);
+            self.text(s, room.min(MAX_TEXT));
+        }
+        self
+    }
+
+    /// Writes `s` cut at a character boundary to at most `max` bytes.
+    fn text(&mut self, s: &str, max: usize) -> &mut Self {
+        let mut end = s.len().min(max);
         while !s.is_char_boundary(end) {
             end -= 1;
         }
