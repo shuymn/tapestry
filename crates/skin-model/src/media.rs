@@ -14,10 +14,11 @@
 //! slot it takes must hold a known state, its own index, the game's frame
 //! size, a run already started, a sequence above every frame taken before
 //! it, and in the current run a stamp inside the run's window that rises
-//! with the sequence, and none of those words may change while its frame
-//! is copied. Anything else is a [`Fault`], which fails the video's player:
-//! the reader keeps it and reads nothing more. A copy reads exactly the
-//! slot's frame, at the size the game gave it.
+//! with the sequence, and those words, read again once its frame is
+//! copied, must be what they were before the copy (a change undone before
+//! that second read goes unseen). Anything else is a [`Fault`], which fails
+//! the video's player: the reader keeps it and reads nothing more. A copy
+//! reads exactly the slot's frame, at the size the game gave it.
 //!
 //! The worker publishes frames in sequence order and, after each, raises
 //! the ring's watermark, the highest sequence it has published. The reader
@@ -27,16 +28,29 @@
 //! The watermark only defers: whatever value it holds, the slots' checks
 //! still apply.
 //!
+//! Runs pass from the game to the worker by command, never through the
+//! ring: the ring starts in run 1, which the worker plays from the video's
+//! start once the game hands it the ring, and each later run
+//! ([`Reader::start_run`]) begins at the seek that names it. The worker
+//! publishes a run's frames only after the command that starts the run,
+//! and once it has published a frame of a run it publishes none of an
+//! earlier run: a seek drops the frame it held for the run before. So
+//! every frame of an earlier run has a lower sequence than every frame of
+//! the current one, and freeing one, unread, never passes over a frame the
+//! game may still show.
+//!
 //! A worker that keeps the protocol (frames written only into slots it
-//! claimed free, published once whole, in sequence order) always yields
-//! whole frames and never fails its player. One that does not cannot make
-//! the game read outside the ring or write outside its staging buffer, and
-//! what it shows stays inside its own panel: frames with plausible words
-//! are shown, and the first slot that breaks a check fails its player.
+//! claimed free, published once whole, in sequence order, and runs handed
+//! over as above) always yields whole frames, in order, and never fails its
+//! player, however its writes interleave with the game's reads. One that
+//! does not cannot make the game read outside the ring or write outside its
+//! staging buffer, and what it shows stays inside its own panel: frames
+//! with plausible words are shown, and the first slot that breaks a check
+//! fails its player.
 //!
 //! The layout, in words: a header of [`HEADER_WORDS`] (a magic word, the
-//! version, the slot count, the width, the height, a frame's bytes, the
-//! current run and, at [`WATERMARK_WORD`], the watermark), then the slots,
+//! version, the slot count, the width, the height, a frame's bytes and, at
+//! [`WATERMARK_WORD`], the watermark), then the slots,
 //! each [`SLOT_HEADER_WORDS`] (its state, sequence, run, stamp, its own
 //! index and its frame's bytes) followed by its frame: the luma plane, then
 //! the two chroma planes, each half the width and height rounded up (I420),
@@ -80,14 +94,11 @@ const H_SLOTS: usize = 2;
 const H_WIDTH: usize = 3;
 const H_HEIGHT: usize = 4;
 const H_BYTES: usize = 5;
-/// The run the game started last, for the worker; the game never reads it
-/// back.
-const H_RUN: usize = 6;
 
 /// The header word holding the watermark: the highest sequence the worker
 /// has published, which it raises after each publication and the game reads
 /// before each scan of the slots.
-pub const WATERMARK_WORD: usize = 7;
+pub const WATERMARK_WORD: usize = 6;
 
 /// A slot's words before its frame.
 const S_STATE: usize = 0;
@@ -306,9 +317,10 @@ pub struct Reader {
 
 impl Reader {
     /// Sets up a ring of `geometry` in `ring`: writes its header, every
-    /// slot free, run 1, whose frames are stamped inside `window`, and a
-    /// watermark of 0, and allocates the staging buffer. The game does this at preparation,
-    /// before it passes the section to the worker.
+    /// slot free and a watermark of 0, starts run 1, whose frames are
+    /// stamped inside `window`, and allocates the staging buffer. The game
+    /// does this at preparation, before it hands the section to the worker,
+    /// whose frames are run 1's until a seek names another run.
     ///
     /// # Errors
     ///
@@ -333,7 +345,6 @@ impl Reader {
             (H_WIDTH, u64::from(geometry.width)),
             (H_HEIGHT, u64::from(geometry.height)),
             (H_BYTES, wide(geometry.frame_bytes())),
-            (H_RUN, 1),
             (WATERMARK_WORD, 0),
         ];
         for (i, v) in header {
@@ -378,17 +389,14 @@ impl Reader {
     }
 
     /// Starts the next run, whose frames are stamped inside `window`, and
-    /// returns its id for the worker's command. The staged frame and every
-    /// frame of an earlier run are no longer shown; the next poll frees
-    /// those still in the ring unread.
-    pub fn start_run<W: Words + ?Sized>(&mut self, ring: &W, window: Window) -> u64 {
+    /// returns its id for the seek that hands it to the worker. The staged
+    /// frame and every frame of an earlier run are no longer shown; the
+    /// next poll frees those still in the ring unread.
+    pub fn start_run(&mut self, window: Window) -> u64 {
         self.run = self.run.saturating_add(1);
         self.window = window;
         self.last_stamp = None;
         self.staged = None;
-        if let Some(w) = word(ring, H_RUN) {
-            w.store(self.run, Ordering::Release);
-        }
         self.run
     }
 
@@ -537,9 +545,10 @@ impl Reader {
         }))
     }
 
-    /// Copies `c`'s frame into the staging buffer, then checks that its
-    /// slot still holds that frame: the same state, sequence, run, stamp,
-    /// index and frame size.
+    /// Copies `c`'s frame into the staging buffer, then reads its slot's
+    /// words again and checks they still name that frame: the same state,
+    /// sequence, run, stamp, index and frame size. A change undone before
+    /// this second read goes unseen.
     fn copy<W: Words + ?Sized>(&mut self, ring: &W, c: &Found) -> Result<(), Fault> {
         let mut at = self.geometry.frame_start(c.slot);
         for dst in self.staging.chunks_mut(CHUNK_WORDS) {
@@ -646,12 +655,6 @@ impl Writer {
         self.geometry
     }
 
-    /// The run the game started last.
-    #[must_use]
-    pub fn run<W: Words + ?Sized>(self, ring: &W) -> u64 {
-        word(ring, H_RUN).map_or(0, |w| w.load(Ordering::Acquire))
-    }
-
     /// A free slot, claimed for the next frame, or `None` while every slot
     /// holds a frame: the worker then waits for the game to free one.
     #[must_use]
@@ -668,8 +671,9 @@ impl Writer {
     /// Publishes `frame` in `slot` as sequence `seq` of run `run`, stamped
     /// `stamp`: writes its bytes and then the slot's words, marks it ready
     /// once all are written, and then raises the watermark to `seq`. Frames
-    /// are published in sequence order; a publication never moves the
-    /// watermark back.
+    /// are published in sequence order, a run's after the command that
+    /// starts it and never one of an earlier run after it (the module's
+    /// handover of runs); a publication never moves the watermark back.
     ///
     /// # Errors
     ///

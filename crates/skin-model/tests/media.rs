@@ -296,7 +296,6 @@ fn ring_round_trip_writer_to_reader() {
     let mut reader = Reader::new(ring, g, WINDOW).unwrap();
     let writer = Writer::attach(ring).unwrap();
     assert_eq!(writer.geometry(), g, "the worker reads the game's geometry");
-    assert_eq!(writer.run(ring), 1);
 
     // Three frames; the first is not due yet.
     for seq in 1..=3 {
@@ -343,8 +342,7 @@ fn ring_round_trip_writer_to_reader() {
         first: 5_000_000,
         last: 9_000_000,
     };
-    assert_eq!(reader.start_run(ring, window), 2);
-    assert_eq!(writer.run(ring), 2, "the worker sees the new run");
+    assert_eq!(reader.start_run(window), 2);
     assert_eq!(reader.staged(), None);
     assert_eq!(
         reader.poll(ring, 9_000_000),
@@ -703,7 +701,7 @@ fn ring_frames_published_during_a_scan_wait_for_the_next_poll() {
     let mem = section(g);
     let ring = &*mem;
     let mut reader = Reader::new(ring, g, WINDOW).unwrap();
-    let run = reader.start_run(ring, WINDOW);
+    let run = reader.start_run(WINDOW);
     assert_eq!(
         scan(ring, &mut reader, 1),
         Ok(Poll::default()),

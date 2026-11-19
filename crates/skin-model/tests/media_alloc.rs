@@ -100,7 +100,7 @@ fn ring_reads_do_not_allocate() {
         (0, Some((1, g.frame_words()))),
         "the staged frame"
     );
-    let (n, run) = counted(|| reader.start_run(ring, window));
+    let (n, run) = counted(|| reader.start_run(window));
     assert_eq!((n, run), (0, 2), "a new run");
     let (n, polled) = counted(|| reader.poll(ring, 5_000));
     assert_eq!(n, 0, "frame 2 of run 1 freed unread");
