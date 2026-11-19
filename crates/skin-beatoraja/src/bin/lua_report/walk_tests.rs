@@ -1123,6 +1123,37 @@ fn swapped_folders_with_one_catalogue_are_rebaselined() {
     );
 }
 
+/// Two packs holding one skin under one folder name, the second's module
+/// broken.
+fn same_named_twins() -> tempfile::TempDir {
+    let d = twins();
+    for pack in ["a", "b"] {
+        std::fs::create_dir(d.path().join(pack)).unwrap();
+    }
+    std::fs::rename(d.path().join("one"), d.path().join("a").join("skin")).unwrap();
+    std::fs::rename(d.path().join("two"), d.path().join("b").join("skin")).unwrap();
+    d
+}
+
+#[test]
+fn swapped_folders_of_one_name_are_rebaselined() {
+    let d = same_named_twins();
+    let (a, b) = (
+        d.path().join("a").join("skin"),
+        d.path().join("b").join("skin"),
+    );
+    let (kept, _) = walk_of(&[(a.as_path(), "s.luaskin"), (b.as_path(), "s.luaskin")]);
+    let (new, _) = walk_of(&[(b.as_path(), "s.luaskin"), (a.as_path(), "s.luaskin")]);
+    assert_eq!(outcomes(&kept), ["imported", "lua Syntax"]);
+    let v = verdict(&kept, &new);
+    assert_eq!(
+        (v.code(), v.failures, v.rebaseline),
+        (2, 0, 2),
+        "{}",
+        v.text
+    );
+}
+
 #[test]
 fn two_walks_of_one_build_that_disagree_are_unstable() {
     let d = twins();

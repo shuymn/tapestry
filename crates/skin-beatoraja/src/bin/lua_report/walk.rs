@@ -145,9 +145,9 @@ pub fn hex(bytes: &[u8]) -> String {
     })
 }
 
-/// A skin as the walk names it: its folder's name and its entry. Both go
-/// into its digest (never printed), so that two folders with one header
-/// and entry stay two skins whatever their order.
+/// A skin as the walk names it: its folder's canonical path and its entry.
+/// Both go into its digest (never printed), so that two folders with one
+/// header and entry stay two skins whatever their order or their names.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Skin {
     pub folder: String,
@@ -155,15 +155,12 @@ pub struct Skin {
 }
 
 impl Skin {
-    /// The skin at `root` with `entry`: the folder's own name, resolved
-    /// when `root` ends in `.` or `..`.
+    /// The skin at `root` with `entry`: the folder's canonical path, or
+    /// `root` as given when it cannot be resolved.
     pub fn at(root: &str, entry: &str) -> Self {
-        let path = std::path::Path::new(root);
-        let folder = std::fs::canonicalize(path)
-            .ok()
-            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .or_else(|| path.file_name().map(|n| n.to_string_lossy().into_owned()))
-            .unwrap_or_else(|| root.to_owned());
+        let folder = std::fs::canonicalize(root)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| root.to_owned());
         Self {
             folder,
             entry: entry.to_owned(),
@@ -177,7 +174,7 @@ impl Skin {
 }
 
 /// The catalogue digest of `header` read as `skin`: SHA-256 over a
-/// length-prefixed encoding of the folder's name, the entry and every
+/// length-prefixed encoding of the folder's path, the entry and every
 /// header field.
 pub fn digest(header: &Header, skin: &Skin) -> String {
     let mut b = Vec::new();
