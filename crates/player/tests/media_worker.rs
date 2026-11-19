@@ -220,14 +220,10 @@ impl Ring {
 
     /// Starts the next run, its stamps from `first`: the run's id.
     fn start_run(&mut self, first: i64) -> u64 {
-        let words = Self::words(self.view, self.len);
-        self.reader.start_run(
-            words,
-            Window {
-                first,
-                last: i64::MAX,
-            },
-        )
+        self.reader.start_run(Window {
+            first,
+            last: i64::MAX,
+        })
     }
 
     /// Each slot's state, sequence, run and stamp, for a failure's message.

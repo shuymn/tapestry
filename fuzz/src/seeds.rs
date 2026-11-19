@@ -63,7 +63,7 @@ fn ring_seed(
     let mem: Vec<AtomicU64> = (0..g.words()).map(|_| AtomicU64::new(0)).collect();
     let mut reader = Reader::new(&*mem, g, crate::RING_WINDOW).expect("a ring");
     if size & crate::RING_SECOND_RUN != 0 {
-        reader.start_run(&*mem, crate::RING_WINDOW);
+        reader.start_run(crate::RING_WINDOW);
     }
     let writer = Writer::attach(&*mem).expect("the game's ring");
     for &(seq, run, stamp) in frames {

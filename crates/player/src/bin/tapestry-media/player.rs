@@ -3,12 +3,14 @@
 //!
 //! A player answers its open with the probe or a refusal. Once the game
 //! hands it the ring and the ring's free-slot event, it decodes from the
-//! video's start in the run the ring's header names, and from a seek's
-//! landing in the run the seek names, publishing each frame whose stamp is
-//! not below the run's start and rises above the last it published, and
-//! waits on the event while every slot is full. It answers the end of the
-//! video, a seek and a failure; a failed or refused player only waits to be
-//! closed. Closing unmaps its view of the ring before it answers.
+//! video's start in the ring's first run, 1, and from a seek's landing in
+//! the run the seek names (runs reach it by command alone, never through
+//! the ring; a seek drops the frame it held for the run before), publishing
+//! each frame whose stamp is not below the run's start and rises above the
+//! last it published, and waits on the event while every slot is full. It
+//! answers the end of the video, a seek and a failure; a failed or refused
+//! player only waits to be closed. Closing unmaps its view of the ring
+//! before it answers.
 
 use std::sync::mpsc::{Receiver, TryRecvError};
 
@@ -81,14 +83,13 @@ pub fn run(player: u8, file: Source, rx: &Receiver<ToPlayer>, out: &Out) {
         event,
         writer,
         frame: vec![0; writer.geometry().frame_bytes()],
-        run: 0,
+        run: 1,
         floor: 0,
         last: None,
         seq: 0,
         pending: None,
         ended: false,
     };
-    playing.run = playing.writer.run(playing.view.words());
     let failed = playing.play(rx, out);
     drop(playing);
     if failed {
