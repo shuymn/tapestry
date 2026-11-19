@@ -9,12 +9,21 @@ publish.workspace = true
 
 [features]
 default = ["std"]
-# The host's half: the clock bounds, the matching behind `compare` and the
-# report descriptor parser. The firmware builds without it.
-std = []
+# The host's half: the clock bounds, the matching behind `compare`, the
+# report descriptor parser, the evidence reader and the verdict contract.
+# The firmware builds without it.
+std = ["dep:serde", "dep:serde_json", "dep:sha2"]
 # The firmware's `debug-faults` build: the device logic consults the debug
 # faults (docs/test-device.md "Debug Faults"); without it it never does.
 debug-faults = []
+
+[dependencies]
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true
