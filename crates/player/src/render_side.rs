@@ -70,7 +70,7 @@
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::thread::JoinHandle;
@@ -320,9 +320,9 @@ pub trait Screen: Send {
         Err(render::PoolWriteError::Stale)
     }
     /// Regrows the selection's chart-image pool to what the other kinds
-    /// leave room for ([`render::Renderer::regrow_pool`]): at a selection
-    /// entry and after a screen built again restored every kind. Not a
-    /// frame's work. Nothing by default.
+    /// leave room for ([`render::Renderer::regrow_pool`]): at the boundary
+    /// of the pass that takes a selection entry, and after a screen built
+    /// again restored every kind. Not a frame's work. Nothing by default.
     fn regrow_pool(&mut self) {}
     /// Stages `skin`'s chart-independent installation of `kind` for
     /// request `request` (its atlas, clips, buffers and loading
@@ -411,22 +411,106 @@ pub trait Screen: Send {
     /// Disables the result kind for this screen's life
     /// ([`render::Renderer::disable_result`]). Nothing by default.
     fn disable_result(&mut self) {}
-    /// Drops what the last commit replaced, outside the commit point:
-    /// the array it released, if any. None by default.
-    fn drain_retired(&mut self) -> Option<AtlasId> {
-        None
-    }
     /// The result kind's pages-only installation's pages, if it has one
     /// ([`render::Renderer::installed_pages`]). None by default.
     fn installed_pages(&self, kind: ScreenKind) -> Option<Arc<PackedPages>> {
         let _ = kind;
         None
     }
-    /// The atlases the screen holds for `kind`: committed, staged and
-    /// retired. None by default.
-    fn retained_atlases(&self, kind: ScreenKind) -> [Option<AtlasId>; 3] {
+    /// The atlases the screen holds for `kind`
+    /// ([`render::Renderer::retained_atlases`]): committed, staged, the
+    /// pages upload in hand, then each retirement entry by its index.
+    /// None by default.
+    fn retained_atlases(&self, kind: ScreenKind) -> [Option<AtlasId>; render::RETAINED_ATLASES] {
         let _ = kind;
-        [None; 3]
+        [None; render::RETAINED_ATLASES]
+    }
+    /// For each retirement entry by its index, whether it still holds its
+    /// pages ([`render::Renderer::entries_holding_pages`]; development
+    /// builds: the result's holders). None by default.
+    #[cfg(feature = "dev-tools")]
+    fn entries_holding_pages(&self) -> [bool; render::RETIREMENT_ENTRIES] {
+        [false; render::RETIREMENT_ENTRIES]
+    }
+    /// One look at the completion watched, keeping one in flight
+    /// ([`render::Renderer::poll_completion`]), once a pass outside
+    /// READY's cutoff. Nothing by default.
+    ///
+    /// # Errors
+    ///
+    /// The device's failure: the screen must be built again.
+    fn poll_completion(&mut self) -> Result<(), RenderError> {
+        Ok(())
+    }
+    /// Whether a staging may destroy filled retirement entries in its own
+    /// call ([`render::Renderer::set_destroy_allowed`]), set each pass.
+    /// Nothing by default.
+    fn set_destroy_allowed(&mut self, allowed: bool) {
+        let _ = allowed;
+    }
+    /// How many retirement entries are filled
+    /// ([`render::Renderer::filled`]); none by default.
+    fn filled(&self) -> u32 {
+        0
+    }
+    /// Destroys every due light entry and, with `heavy`, at most one heavy
+    /// part ([`render::Renderer::destroy_due`]). Nothing by default.
+    fn destroy_due(&mut self, heavy: bool) -> render::Destroyed {
+        let _ = heavy;
+        render::Destroyed::default()
+    }
+    /// Whether a heavy part is due for destruction
+    /// ([`render::Renderer::due_heavy`]); never by default.
+    fn due_heavy(&self) -> bool {
+        false
+    }
+    /// Whether a filled entry waits for a completion not yet seen
+    /// ([`render::Renderer::pending_completion`]); never by default.
+    fn pending_completion(&self) -> bool {
+        false
+    }
+    /// Whether the selection's pool array is owed
+    /// ([`render::Renderer::pool_owed`]); never by default.
+    fn pool_owed(&self) -> bool {
+        false
+    }
+    /// Makes the selection's owed pool array
+    /// ([`render::Renderer::make_owed_pool`]): whether it ran. Never by
+    /// default.
+    fn make_owed_pool(&mut self) -> bool {
+        false
+    }
+    /// The oldest due entry's CPU part, to hand to the worker
+    /// ([`render::Renderer::take_handoff`]); none by default.
+    fn take_handoff(&mut self) -> Option<render::Handoff> {
+        None
+    }
+    /// Puts back a CPU part the worker could not take
+    /// ([`render::Renderer::return_handoff`]); dropped by default.
+    fn return_handoff(&mut self, entry: usize, cpu: render::CpuParts) -> bool {
+        let _ = (entry, cpu);
+        false
+    }
+    /// The counter of the result kind's entries' changes
+    /// ([`render::Renderer::result_changes`]); 0 by default.
+    fn result_changes(&self) -> u64 {
+        0
+    }
+    /// The heavy device operations run so far
+    /// ([`render::Renderer::heavy_ops`]); none by default.
+    fn heavy_ops(&self) -> render::HeavyOps {
+        render::HeavyOps::default()
+    }
+    /// Whether the swap chain grants a frame now, without waiting (a
+    /// stalled boundary's grant check, design.md "Load Pipeline"); never
+    /// by default.
+    fn grant_ready(&self) -> bool {
+        false
+    }
+    /// Whether a BGA array is in use ([`render::Renderer::bga_key`]);
+    /// never by default.
+    fn bga_in_use(&self) -> bool {
+        false
     }
     /// The selection's and decision's committed charges against the
     /// shared texel limit, the selection's with its pool's firm layer
@@ -824,13 +908,14 @@ pub trait Screen: Send {
         self.menu(page, changed)
     }
     /// Draws the launch screen `elapsed` after the render thread started,
-    /// as [`text`](Self::text), until the game sends what to draw; `None`
-    /// draws nothing instead (no launch screen).
+    /// as [`text`](Self::text), until the game sends what to draw, and
+    /// says what became of the frame; `None` draws nothing instead (no
+    /// launch screen).
     ///
     /// # Errors
     ///
     /// As [`menu`](Self::menu).
-    fn splash(&mut self, elapsed: Duration) -> Option<Result<bool, RenderError>> {
+    fn splash(&mut self, elapsed: Duration) -> Option<Result<FrameOutcome, RenderError>> {
         let _ = elapsed;
         None
     }
@@ -1153,7 +1238,10 @@ pub enum RenderMsg {
     },
     /// A step of the BGA pictures' publication (design.md "Rendering and
     /// Skins", BGA), answered on its own channel; refused, nothing done,
-    /// once the game thread set another generation.
+    /// once the game thread set another generation. A begin, and a drop
+    /// or an absent publication that finds an array in use, is held to a
+    /// frame boundary and answered there, as the one heavy operation of
+    /// its interval (design.md "Load Pipeline").
     Bga {
         generation: u64,
         msg: crate::bga::BgaMsg,
@@ -1305,6 +1393,10 @@ pub enum RenderMsg {
     /// signal already took this one's page or a newer one; nothing once
     /// the pages shown were cleared ([`RenderLink::clear_end`]).
     End,
+    /// The game asked for READY's cutoff while the render thread ran a
+    /// pass ([`RenderLink::ask_cutoff`]): cut off at once with no filled
+    /// retirement entry, else once the last one is destroyed.
+    Cutoff,
     /// The run ends.
     Exit,
 }
@@ -1469,10 +1561,64 @@ impl Shared {
     }
 }
 
-/// What wakes the game thread for a decision takeover
-/// ([`RenderLink::set_game_wake`]).
+/// What wakes the game thread ([`RenderLink::set_game_wake`]): for a
+/// decision takeover, READY's cutoff given or its screen lost, a result
+/// atlas leaving the report, and the render thread's end.
 #[derive(Default)]
 struct GameWake(Mutex<Option<Arc<dyn Fn() + Send + Sync>>>);
+
+impl GameWake {
+    /// Wakes the game thread, if a wake is set: the wake is cloned under
+    /// the lock and called outside it. Whether one was called.
+    fn wake(&self) -> bool {
+        let wake = self
+            .0
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        wake.map(|w| w()).is_some()
+    }
+}
+
+/// READY's cutoff ([`Shared::cutoff`]), packed in one word: the render
+/// thread's phase in its low two bits, the game's request in the next,
+/// and the filled retirement entries' count from bit 8 (design.md
+/// "Memory Budget", READY's condition).
+mod cutoff {
+    /// The render thread runs a pass.
+    pub const RUNNING: u32 = 0;
+    /// The render thread waits for its frame, with the count it stored.
+    pub const WAITING: u32 = 1;
+    /// Cut off: no entry is filled and none will be until its end.
+    pub const CUT_OFF: u32 = 2;
+    /// The screen was lost while it was asked and not cut off.
+    pub const LOST: u32 = 3;
+    /// The phase's bits.
+    pub const PHASE: u32 = 3;
+    /// The game asked for it.
+    pub const ASKED: u32 = 4;
+    /// Where the filled count begins.
+    pub const COUNT_SHIFT: u32 = 8;
+
+    /// `phase` with the request bit of `word` and `count` filled entries.
+    pub const fn with(word: u32, phase: u32, count: u32) -> u32 {
+        (word & ASKED) | phase | (count << COUNT_SHIFT)
+    }
+}
+
+/// Where READY's cutoff stands, as the game thread reads it
+/// ([`RenderLink::cutoff_phase`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CutoffPhase {
+    /// The render thread runs a pass.
+    Running,
+    /// The render thread waits for its frame.
+    Waiting,
+    /// Cut off: recording may open.
+    CutOff,
+    /// The screen was lost while it was asked.
+    Lost,
+}
 
 impl std::fmt::Debug for GameWake {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1612,11 +1758,56 @@ struct Shared {
     /// Why the decision skin was refused for the run, until the game
     /// thread takes it for its notice ([`RenderLink::take_decision_refusal`]).
     decision_refused: Mutex<Option<String>>,
-    /// What wakes the game thread for a takeover.
+    /// What wakes the game thread.
     game_wake: GameWake,
     /// The takeovers produced, each counted at its wake (tests).
     #[cfg(test)]
     takeovers_woken: AtomicU64,
+    /// READY's cutoff ([`cutoff`]): the render thread writes its phase and
+    /// the filled count while it runs, the game thread asks.
+    cutoff: AtomicU32,
+    /// The wakes READY's cutoff gave, cut off or lost (tests).
+    #[cfg(test)]
+    cutoffs_woken: AtomicU64,
+    /// The wakes a result atlas leaving the report gave (tests).
+    #[cfg(test)]
+    reports_woken: AtomicU64,
+    /// The result statuses published (tests).
+    #[cfg(test)]
+    reports_published: AtomicU64,
+    /// The BGA operations put in hand (tests).
+    #[cfg(test)]
+    bga_ops_held: AtomicU64,
+    /// The release flags read (tests).
+    #[cfg(test)]
+    releases_read: AtomicU64,
+    /// The retirement worker waits here before each drop (tests).
+    #[cfg(test)]
+    worker_gate: Arc<TestGate>,
+    /// Pages of a kind a test seeds into a handoff place, taken at the
+    /// render thread's next boundary (tests).
+    #[cfg(test)]
+    handoff_seed: Mutex<Option<(ScreenKind, Arc<PackedPages>)>>,
+    /// Each heavy operation a boundary ran, noted only while the vector
+    /// has room, so noting never allocates (tests).
+    #[cfg(test)]
+    heavy_record: Mutex<Vec<HeavyRec>>,
+    /// The frames that ended shown or invisible, refilling the allowance
+    /// (tests).
+    #[cfg(test)]
+    refilling_frames: AtomicU64,
+    /// The allocations the boundary's release reads, completion poll,
+    /// handoff sends and publication made on the render thread (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    boundary_allocations: AtomicU64,
+    /// While set, the next boundary allocates once inside its counted
+    /// span, and that span's count goes to `control_allocations` instead
+    /// (tests: a guard's positive control).
+    #[cfg(all(test, feature = "dev-tools"))]
+    boundary_control: AtomicBool,
+    /// The positive control's count ([`Self::boundary_control`]).
+    #[cfg(all(test, feature = "dev-tools"))]
+    control_allocations: AtomicU64,
     /// The decision presentation sent last (tests).
     #[cfg(test)]
     decision_sent: Mutex<Option<crate::decision_side::ShownDecision>>,
@@ -1791,6 +1982,31 @@ impl Shared {
             game_wake: GameWake::default(),
             #[cfg(test)]
             takeovers_woken: AtomicU64::new(0),
+            cutoff: AtomicU32::new(cutoff::RUNNING),
+            #[cfg(test)]
+            cutoffs_woken: AtomicU64::new(0),
+            #[cfg(test)]
+            reports_woken: AtomicU64::new(0),
+            #[cfg(test)]
+            reports_published: AtomicU64::new(0),
+            #[cfg(test)]
+            bga_ops_held: AtomicU64::new(0),
+            #[cfg(test)]
+            releases_read: AtomicU64::new(0),
+            #[cfg(test)]
+            worker_gate: Arc::default(),
+            #[cfg(test)]
+            handoff_seed: Mutex::new(None),
+            #[cfg(test)]
+            heavy_record: Mutex::new(Vec::new()),
+            #[cfg(test)]
+            refilling_frames: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            boundary_allocations: AtomicU64::new(0),
+            #[cfg(all(test, feature = "dev-tools"))]
+            boundary_control: AtomicBool::new(false),
+            #[cfg(all(test, feature = "dev-tools"))]
+            control_allocations: AtomicU64::new(0),
             #[cfg(test)]
             decision_sent: Mutex::new(None),
             #[cfg(test)]
@@ -3696,8 +3912,10 @@ impl RenderLink {
             .take()
     }
 
-    /// What wakes the game thread when the decision skin's takeover is
-    /// produced ([`crate::controls::Controls::wake_game`]).
+    /// What wakes the game thread ([`crate::controls::Controls::wake_game`]):
+    /// when the decision skin's takeover is produced, when READY's cutoff
+    /// is given or its screen lost, when a result atlas leaves the report,
+    /// and when the render thread ends.
     pub fn set_game_wake(&self, wake: Arc<dyn Fn() + Send + Sync>) {
         *self
             .shared
@@ -3817,6 +4035,116 @@ impl RenderLink {
         let (reply, rx) = mpsc::sync_channel(1);
         self.send(RenderMsg::Finish { end, reply });
         rx.recv_timeout(self.finish_timeout).ok().flatten()
+    }
+
+    /// Asks for READY's cutoff, once an attempt's end of loading returned
+    /// (design.md "Memory Budget", READY's condition): while the render
+    /// thread waits for its frame with no filled retirement entry, cut off
+    /// at once by this swap, which it finds after its wait; otherwise the
+    /// request is marked and sent, and the render thread cuts off once no
+    /// entry is filled, waking the game thread. Allocates nothing.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn ask_cutoff(&self) {
+        if self
+            .shared
+            .cutoff
+            .compare_exchange(
+                cutoff::WAITING,
+                cutoff::CUT_OFF | cutoff::ASKED,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            return;
+        }
+        self.shared.cutoff.fetch_or(cutoff::ASKED, Ordering::AcqRel);
+        self.send(RenderMsg::Cutoff);
+    }
+
+    /// Where READY's cutoff stands ([`ask_cutoff`](Self::ask_cutoff)).
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    pub fn cutoff_phase(&self) -> CutoffPhase {
+        match self.shared.cutoff.load(Ordering::Acquire) & cutoff::PHASE {
+            cutoff::WAITING => CutoffPhase::Waiting,
+            cutoff::CUT_OFF => CutoffPhase::CutOff,
+            cutoff::LOST => CutoffPhase::Lost,
+            _ => CutoffPhase::Running,
+        }
+    }
+
+    /// The wakes READY's cutoff gave, the result report's, the result
+    /// statuses published and the release flags read so far (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn retire_counts(&self) -> [u64; 4] {
+        [
+            self.shared.cutoffs_woken.load(Ordering::Acquire),
+            self.shared.reports_woken.load(Ordering::Acquire),
+            self.shared.reports_published.load(Ordering::Acquire),
+            self.shared.releases_read.load(Ordering::Acquire),
+        ]
+    }
+
+    /// Where the retirement worker waits before each drop (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn worker_gate(&self) -> Arc<TestGate> {
+        Arc::clone(&self.shared.worker_gate)
+    }
+
+    /// Seeds `pages` of `kind` into a handoff place at the render thread's
+    /// next boundary, with no retirement entry behind them (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub fn seed_handoff(&self, kind: ScreenKind, pages: Arc<PackedPages>) {
+        *self
+            .shared
+            .handoff_seed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((kind, pages));
+    }
+
+    /// The BGA operations put in hand so far (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn bga_ops_held(&self) -> u64 {
+        self.shared.bga_ops_held.load(Ordering::Acquire)
+    }
+
+    /// Notes each heavy operation a boundary runs from now, `room` at
+    /// most, the record kept so far dropped (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn record_heavy(&self, room: usize) {
+        *self
+            .shared
+            .heavy_record
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Vec::with_capacity(room);
+    }
+
+    /// The heavy operations the boundaries ran since
+    /// [`record_heavy`](Self::record_heavy) (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn heavy_record(&self) -> Vec<HeavyRec> {
+        self.shared
+            .heavy_record
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+    }
+
+    /// The allocations the boundaries' release reads, polls, sends and
+    /// publications made, and the positive control's (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn boundary_allocations(&self) -> [u64; 2] {
+        [
+            self.shared.boundary_allocations.load(Ordering::SeqCst),
+            self.shared.control_allocations.load(Ordering::SeqCst),
+        ]
+    }
+
+    /// The next boundary allocates once in its counted span, counted as
+    /// the positive control (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn arm_boundary_control(&self) {
+        self.shared.boundary_control.store(true, Ordering::SeqCst);
     }
 
     /// When the current play's first frame was drawn.
@@ -4293,6 +4621,12 @@ pub fn spawn(
                     return;
                 }
             };
+            // The startup build is no rebuild: the allowance starts free.
+            let heavy_seen = screen.heavy_ops().count;
+            let handoffs = crate::retire_worker::Handoffs::start(
+                #[cfg(test)]
+                Arc::clone(&thread_shared.worker_gate),
+            );
             let mut r = Run {
                 _unwinding: Unwinding(Arc::clone(&thread_shared)),
                 screen: Some(screen),
@@ -4349,6 +4683,19 @@ pub fn spawn(
                 decision_faults: crate::dev::DecisionFaults::read(),
                 decision_want: None,
                 bga_reply: None,
+                bga_op: None,
+                handoffs,
+                allowance: None,
+                heavy_seen,
+                stalled: false,
+                cut_off: false,
+                result_unacked: false,
+                regrow_due: false,
+                loading_presented: None,
+                loading_left: None,
+                publish_due: false,
+                result_changes: 0,
+                destroy_allowed: true,
                 decision_disabled: None,
                 decision_next: 1,
                 tuning: None,
@@ -5000,12 +5347,14 @@ fn ended(shared: &Shared) -> ScreenError {
 
 /// Marks the screen failed when the render thread unwinds from a panic,
 /// so [`RenderLink::failed`] reports it: its resources are gone with it.
+/// The game thread is woken, so a wait for READY's cutoff looks again.
 struct Unwinding(Arc<Shared>);
 
 impl Drop for Unwinding {
     fn drop(&mut self) {
         if std::thread::panicking() {
             self.0.failed.store(true, Ordering::Release);
+            self.0.game_wake.wake();
         }
     }
 }
@@ -5548,6 +5897,90 @@ const fn held_wait(now: TimeUs, shown_at: TimeUs, bound: TimeUs) -> Option<TimeU
     }
 }
 
+/// A BGA operation held for a frame boundary ([`Run::bga`]), the one heavy
+/// operation of its interval (design.md "Load Pipeline").
+enum BgaOp {
+    /// Begin an array of `pages` pages, the one in use dropped first.
+    Begin {
+        pages: u32,
+        reply: mpsc::SyncSender<Result<skin_model::bga::BgaKey, render::BgaFault>>,
+    },
+    /// Drop the array in use.
+    Drop,
+    /// Publish the absent table, the array in use dropped first, and
+    /// answer after the drop.
+    Absent {
+        entries: Vec<skin_model::bga::BgaEntry>,
+        reply: Arc<crate::bga::Answer>,
+    },
+}
+
+impl BgaOp {
+    /// Answers it stale, running nothing: a drop needs no answer.
+    fn stale(self) {
+        match self {
+            Self::Begin { reply, .. } => {
+                let _ = reply.send(Err(render::BgaFault::Stale));
+            }
+            Self::Drop => {}
+            Self::Absent { reply, .. } => {
+                let _ = reply.give(|| Err(render::BgaFault::Stale));
+            }
+        }
+    }
+}
+
+/// The clock's pace for the frames and boundaries the swap chain cannot
+/// pace (offscreen, minimized, no frame to draw): about 60 Hz, and the
+/// least time between two heavy operations where the loop is paced by
+/// the clock (design.md "Load Pipeline").
+const CLOCK_PACE: Duration = Duration::from_millis(16);
+
+/// How a boundary's heavy operation is admitted (design.md "Load
+/// Pipeline", the allowance).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Admit {
+    /// The allowance is free.
+    Free,
+    /// Only the stall's clock admits one: the allowance stays as it is
+    /// until one runs.
+    ByStall,
+    /// Spent.
+    No,
+}
+
+/// A boundary's heavy operation as the test record keeps it (tests).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct HeavyRec {
+    pub(crate) kind: HeavyKind,
+    pub(crate) start: Instant,
+    pub(crate) end: Instant,
+    pub(crate) regime: Regime,
+    /// The frames that ended shown or invisible before it began.
+    pub(crate) refills: u64,
+}
+
+/// Which of a boundary's heavy operations ran (tests).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum HeavyKind {
+    Regrowth,
+    Bga,
+    OwedPool,
+    Destruction,
+}
+
+/// The regime a boundary read (design.md "Load Pipeline", the
+/// allowance; tests).
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Regime {
+    Presenting,
+    Clock,
+    Stalled,
+}
+
 struct Run {
     /// The first field, so it drops first: an unwinding thread publishes
     /// its failure before the screen's resources are destroyed.
@@ -5677,6 +6110,48 @@ struct Run {
     /// The BGA batch in hand: its generation and the job's answer, given
     /// once its writes end ([`Self::bga_boundary`]).
     bga_reply: Option<(u64, mpsc::SyncSender<Result<(), render::BgaFault>>)>,
+    /// The BGA begin, drop or absent publication held for a frame
+    /// boundary, with its generation (design.md "Load Pipeline", one
+    /// heavy operation a frame interval): run, or answered stale, there.
+    bga_op: Option<(u64, BgaOp)>,
+    /// The retirement worker's handoff table (design.md "Memory Budget"):
+    /// the loop's, not the renderer's, so it outlives a screen dropped.
+    handoffs: crate::retire_worker::Handoffs,
+    /// When the frame interval's heavy operation ended (design.md "Load
+    /// Pipeline"); `None` while the allowance is free.
+    allowance: Option<Instant>,
+    /// The screen's heavy operations as last read: one more since spends
+    /// the allowance. A screen built again counts from its own.
+    heavy_seen: u64,
+    /// The frame pacing waited out its bound without a grant, or an
+    /// offscreen frame was skipped, and no frame presented since: the
+    /// loop is paced by the clock.
+    stalled: bool,
+    /// READY's cutoff holds (design.md "Memory Budget", READY's
+    /// condition): nothing is filled, read, sent or published.
+    cut_off: bool,
+    /// A play finished and its entry's first result picture not
+    /// acknowledged yet, nor another screen asked for: nothing is
+    /// destroyed.
+    result_unacked: bool,
+    /// A selection entry was taken: its regrowth is due at this pass's
+    /// boundary.
+    regrow_due: bool,
+    /// The loading lifetime whose loading frame presented last: before
+    /// its first, nothing is destroyed at a boundary.
+    loading_presented: Option<u64>,
+    /// The loading lifetime last ended or paused: lines of it taken late
+    /// leave READY's cutoff as it is.
+    loading_left: Option<u64>,
+    /// The result's status is published at the next boundary outside
+    /// READY's cutoff.
+    publish_due: bool,
+    /// The screen's result entries' changes as last published
+    /// ([`Screen::result_changes`]).
+    result_changes: u64,
+    /// Whether a staging may destroy filled entries in its own call, as
+    /// the pass set it: given to a screen built again.
+    destroy_allowed: bool,
     /// Why the decision kind is disabled for the run: no request is posted
     /// and no slot is pinned from then on.
     decision_disabled: Option<String>,
@@ -5780,10 +6255,9 @@ impl Run {
                 });
                 self.pool.took_update = true;
                 // A selection entry: the pool regrows to what the other
-                // kinds leave room for, as a new generation when it does.
-                if let Some(screen) = &mut self.screen {
-                    screen.regrow_pool();
-                }
+                // kinds leave room for, as a new generation when it does,
+                // at this pass's boundary (design.md "Memory Budget").
+                self.regrow_due = true;
             }
         }
         self.want_decision_labels();
@@ -5840,18 +6314,25 @@ impl Run {
                 },
             );
             self.sync_chart();
+            // Every pass's end comes back here, whichever way it ended:
+            // READY's cutoff asked with no entry filled is given here, and
+            // a heavy operation a handler ran spends the allowance.
+            self.check_cutoff();
+            self.note_heavy();
             let idle = matches!(mode, Mode::Idle) || self.screen.is_none();
-            let msg = if idle
-                && (self.attempt.is_some() || self.decision_busy() || self.bga_reply.is_some())
-            {
-                // A preparation not yet answered is asked again between
-                // messages.
-                rx.recv_timeout(CANCEL_POLL).map_err(|e| match e {
-                    mpsc::RecvTimeoutError::Timeout => TryRecvError::Empty,
-                    mpsc::RecvTimeoutError::Disconnected => TryRecvError::Disconnected,
-                })
-            } else if idle {
-                rx.recv().map_err(|_| TryRecvError::Disconnected)
+            let msg = if idle {
+                match self.idle_wait() {
+                    // A heavy operation due and allowed: the boundary at
+                    // once.
+                    Some(wait) if wait.is_zero() => rx.try_recv(),
+                    // A preparation not yet answered, or work of the
+                    // boundary's, is looked at again between messages.
+                    Some(wait) => rx.recv_timeout(wait).map_err(|e| match e {
+                        mpsc::RecvTimeoutError::Timeout => TryRecvError::Empty,
+                        mpsc::RecvTimeoutError::Disconnected => TryRecvError::Disconnected,
+                    }),
+                    None => rx.recv().map_err(|_| TryRecvError::Disconnected),
+                }
             } else if matches!(mode, Mode::Play { skipped, .. } if skipped >= ACQUIRE_RETRIES) {
                 // A play frame's acquisition keeps being skipped: wait a
                 // little, or for a message, before trying it again.
@@ -5876,6 +6357,14 @@ impl Run {
                     i64::from(idle),
                 );
             }
+            // The game's next screen or attempt ends READY's cutoff before
+            // its handler runs, and the result's wait for its first
+            // picture (design.md "Memory Budget", READY's condition).
+            if self.ends_cutoff(&msg) {
+                self.end_cutoff();
+                self.result_unacked = false;
+            }
+            self.allow_destruction(&mode);
             // The select screen is left: its frames are reported; and the
             // loading state's, once it is left.
             #[cfg(feature = "dev-tools")]
@@ -5896,7 +6385,8 @@ impl Run {
                         | RenderMsg::ChartImages { .. }
                         | RenderMsg::Bga { .. }
                         | RenderMsg::PoolWrite(_)
-                        | RenderMsg::ParkScripts(_))
+                        | RenderMsg::ParkScripts(_)
+                        | RenderMsg::Cutoff)
                 )
             {
                 self.loading_stats.report("loading");
@@ -6088,6 +6578,7 @@ impl Run {
                     reply,
                 }) => {
                     self.offer_screen_origin(origin);
+                    self.loading_left = Some(lifetime);
                     // Between frames, as an end: none of the loading
                     // state is drawn from here, but it is kept.
                     self.paused = None;
@@ -6132,6 +6623,7 @@ impl Run {
                     reply,
                 }) => {
                     self.offer_screen_origin(origin);
+                    self.loading_left = Some(lifetime);
                     // Between frames: none of the loading state follows.
                     if matches!(
                         mode,
@@ -6360,6 +6852,11 @@ impl Run {
                         self.frames.finish();
                     }
                     let _ = reply.send(self.measure.finish(end));
+                    // READY's cutoff ends here: this pass reads the
+                    // releases made since and publishes. Nothing is
+                    // destroyed until the result's first picture.
+                    self.end_cutoff();
+                    self.result_unacked = true;
                 }
                 Ok(RenderMsg::Follow(extent)) => {
                     // A wake sent since the sender was set is still in
@@ -6386,6 +6883,12 @@ impl Run {
                         result: (rl, rf),
                         charged,
                     });
+                }
+                Ok(RenderMsg::Cutoff) => {
+                    self.check_cutoff();
+                    if self.cut_off {
+                        continue;
+                    }
                 }
                 Ok(RenderMsg::Exit) | Err(TryRecvError::Disconnected) => {
                     // A decision screen still drawn is reported.
@@ -6419,6 +6922,7 @@ impl Run {
             if crate::dev::loop_probe::on() {
                 render::probe::set_in_play(matches!(mode, Mode::Play { .. }));
             }
+            self.allow_destruction(&mode);
             self.poll_attempt();
             // A result presentation is prepared apart from what draws, as
             // it comes and before the frame's wait (the S10-09i design's
@@ -6441,9 +6945,18 @@ impl Run {
                     continue;
                 }
             }
-            // The BGA batch in hand at this frame boundary, outside every
-            // frame: a step of its writes, never a wait for the GPU.
-            self.bga_boundary();
+            // The frame boundary, outside every frame and with or without a
+            // screen (design.md "Memory Budget", "Load Pipeline"): the
+            // worker's releases, the completion watched, the handoffs, at
+            // most one heavy operation, the BGA batch's step, the result's
+            // status and READY's cutoff. Its regime is read before it, a
+            // hold ending later in the pass included.
+            let held = self.held(&mode);
+            let regrow = std::mem::take(&mut self.regrow_due);
+            if self.boundary(&mode, held, regrow) {
+                mode = Mode::Idle;
+                continue;
+            }
             let Some(screen) = &mut self.screen else {
                 continue;
             };
@@ -6468,6 +6981,11 @@ impl Run {
             // drops the screen, which the game builds again.
             if self.decision_boundary() {
                 mode = Mode::Idle;
+                continue;
+            }
+            // An Idle pass ends here, before any frame's pacing (design.md
+            // "Load Pipeline", the Idle loop): its wait is the message's.
+            if matches!(mode, Mode::Idle) {
                 continue;
             }
             let Some(screen) = &mut self.screen else {
@@ -6588,28 +7106,46 @@ impl Run {
             };
             // Minimized, nothing is presented, so the swap chain's waitable
             // object would not be signaled: frames are paced by the clock
-            // instead, and a frame granted before stays granted.
+            // instead, and a frame granted before stays granted. READY's
+            // cutoff is marked waiting around the wait, with the filled
+            // count, so the game's request taken meanwhile is acknowledged
+            // at once, and found after it whichever way it returns.
             let minimized = screen.minimized();
-            if screen.paced() && !minimized {
+            let swap_paced = screen.paced();
+            let filled = screen.filled();
+            self.mark_waiting(filled);
+            let granted = if swap_paced && !minimized {
                 #[cfg(feature = "dev-tools")]
                 crate::dev::loop_probe::mark("wait0", i64::from(self.granted));
-                if !self.granted && !screen.wait() {
-                    #[cfg(feature = "dev-tools")]
-                    crate::dev::loop_probe::mark("wait-false", 0);
-                    continue;
-                }
-                #[cfg(feature = "dev-tools")]
-                crate::dev::loop_probe::mark("wait1", 0);
-                self.granted = true;
+                self.granted || self.screen.as_ref().is_some_and(|s| s.wait())
             } else {
                 #[cfg(test)]
                 self.shared.clock_paced.fetch_add(1, Ordering::SeqCst);
                 #[cfg(feature = "dev-tools")]
                 crate::dev::loop_probe::mark("sleep0", 0);
-                std::thread::sleep(Duration::from_millis(16));
+                std::thread::sleep(CLOCK_PACE);
                 #[cfg(feature = "dev-tools")]
                 crate::dev::loop_probe::mark("sleep1", 0);
+                true
+            };
+            self.mark_running();
+            if swap_paced && !minimized {
+                if !granted {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::loop_probe::mark("wait-false", 0);
+                    // The wait's bound passed without a grant: stalled
+                    // until a frame presents or a grant is taken.
+                    self.stalled = true;
+                    continue;
+                }
+                #[cfg(feature = "dev-tools")]
+                crate::dev::loop_probe::mark("wait1", 0);
+                self.granted = true;
+                self.stalled = false;
             }
+            let Some(screen) = &mut self.screen else {
+                continue;
+            };
             // The end screen was left (its pages cleared): the page drawn
             // last goes, and nothing is drawn until what comes next, which
             // takes the frame granted.
@@ -6811,10 +7347,7 @@ impl Run {
                         };
                         continue;
                     };
-                    drawn.map(|presented| {
-                        let timing = timing_of(shown_or_retry(presented));
-                        (timing, None)
-                    })
+                    drawn.map(|outcome| (timing_of(outcome), None))
                 }
                 Mode::Play {
                     origin,
@@ -7565,10 +8098,13 @@ impl Run {
             // The entry's first result picture, once shown or deliberately
             // not shown: the game thread starts the result's sound at its
             // next look (design.md "State Model", system sounds, Result).
+            // From it a boundary may destroy again (design.md "Memory
+            // Budget").
             if let Some(entry) = result_picture
                 && drawn.as_ref().is_ok_and(|(t, _)| t.outcome.counts())
             {
                 self.shared.result_entries.acknowledge(entry);
+                self.result_unacked = false;
             }
             // What the frame drew, fixed before a refused decision frame
             // hands the screen to its page (dev-tools: a scenario's
@@ -7656,6 +8192,24 @@ impl Run {
             }
             if !minimized {
                 self.granted = false;
+            }
+            // A frame that ended shown or invisible refills the frame
+            // interval's allowance and ends a stall (design.md "Load
+            // Pipeline"); an offscreen frame that ended `Retry` stalls the
+            // loop, a windowed one neither refills nor stalls.
+            if matches!(&drawn, Ok((t, _)) if t.outcome.counts()) {
+                #[cfg(test)]
+                self.shared.refilling_frames.fetch_add(1, Ordering::SeqCst);
+                self.allowance = None;
+                self.stalled = false;
+                if let Mode::Menu {
+                    loading: Some(l), ..
+                } = &mode
+                {
+                    self.loading_presented = Some(*l);
+                }
+            } else if drawn.is_ok() && !swap_paced {
+                self.stalled = true;
             }
             // Every screen's frame that reached the screen counts towards
             // the frames per second.
@@ -7949,6 +8503,557 @@ impl Run {
         self.shared.built(screen);
     }
 
+    /// A screen built again (a recovery, a chart load's retry): it takes
+    /// the pass's permission to destroy in a staging's call, its heavy
+    /// operations are counted from its own, and the rebuild, inline, spends
+    /// the frame interval's allowance at its end (design.md "Load
+    /// Pipeline", the device rebuild).
+    fn screen_built(&mut self) {
+        if let Some(s) = &mut self.screen {
+            s.set_destroy_allowed(self.destroy_allowed);
+            self.heavy_seen = s.heavy_ops().count;
+            self.result_changes = s.result_changes();
+        }
+        self.allowance = Some(Instant::now());
+    }
+
+    /// The screen was dropped: READY's cutoff asked and not given is lost,
+    /// the game thread woken, and the result's status published without
+    /// what only the dropped renderer held (design.md "Memory Budget",
+    /// the result's atlas report).
+    fn screen_dropped(&mut self) {
+        let word = self.shared.cutoff.load(Ordering::Acquire);
+        if !self.cut_off && word & cutoff::ASKED != 0 && word & cutoff::PHASE != cutoff::CUT_OFF {
+            self.shared
+                .cutoff
+                .store(cutoff::with(word, cutoff::LOST, 0), Ordering::Release);
+            self.wake_for_cutoff();
+        }
+        self.publish_result_status();
+    }
+
+    /// Wakes the game thread for READY's cutoff, given or lost.
+    fn wake_for_cutoff(&self) {
+        #[cfg(test)]
+        self.shared.cutoffs_woken.fetch_add(1, Ordering::AcqRel);
+        self.shared.game_wake.wake();
+    }
+
+    /// Whether the message taken is the game's next screen or attempt,
+    /// which ends READY's cutoff (design.md "Memory Budget", its end):
+    /// a loading lifetime's lines only for another lifetime than the one
+    /// ended or paused last, whose sinks may still report late.
+    fn ends_cutoff(&self, msg: &Result<RenderMsg, TryRecvError>) -> bool {
+        match msg {
+            Ok(
+                RenderMsg::Load { .. }
+                | RenderMsg::Prepare(_)
+                | RenderMsg::PrepareAttempt { .. }
+                | RenderMsg::Menu(_)
+                | RenderMsg::Decision { .. }
+                | RenderMsg::PracticePage(_)
+                | RenderMsg::SelectionChanged
+                | RenderMsg::Select { .. },
+            ) => true,
+            Ok(RenderMsg::Loading(l)) => {
+                self.loading_left != Some(*l)
+                    && !matches!(self.paused, Some(Mode::Menu { loading: Some(p), .. }) if p == *l)
+            }
+            _ => false,
+        }
+    }
+
+    /// READY's cutoff ends: running with the filled count, nothing asked;
+    /// the first boundary after it publishes the result's status.
+    fn end_cutoff(&mut self) {
+        let count = self.screen.as_ref().map_or(0, |s| s.filled());
+        self.shared
+            .cutoff
+            .store(cutoff::with(0, cutoff::RUNNING, count), Ordering::Release);
+        if std::mem::take(&mut self.cut_off) {
+            self.publish_due = true;
+        }
+    }
+
+    /// READY's cutoff asked with no retirement entry filled is given now:
+    /// at a pass's end, the loop's top and its message's turn.
+    fn check_cutoff(&mut self) {
+        if self.cut_off {
+            return;
+        }
+        let word = self.shared.cutoff.load(Ordering::Acquire);
+        match word & cutoff::PHASE {
+            cutoff::CUT_OFF => self.found_cut_off(),
+            cutoff::LOST => {}
+            _ if word & cutoff::ASKED != 0
+                && self.screen.as_ref().map_or(0, |s| s.filled()) == 0 =>
+            {
+                self.cut_off_now();
+            }
+            _ => {}
+        }
+    }
+
+    /// Cuts off: the phase stored, nothing destroyed in a staging's call
+    /// from here, and the game thread woken.
+    fn cut_off_now(&mut self) {
+        self.shared.cutoff.store(
+            cutoff::with(cutoff::ASKED, cutoff::CUT_OFF, 0),
+            Ordering::Release,
+        );
+        self.found_cut_off();
+        self.wake_for_cutoff();
+    }
+
+    /// The render thread is cut off from here: nothing destroyed in a
+    /// staging's call either.
+    fn found_cut_off(&mut self) {
+        self.cut_off = true;
+        self.destroy_allowed = false;
+        if let Some(s) = &mut self.screen {
+            s.set_destroy_allowed(false);
+        }
+    }
+
+    /// Just before the frame's pacing, outside READY's cutoff: waiting,
+    /// with `filled` entries and the request kept; cut off instead when it
+    /// was asked with none filled. A lost cutoff stays lost until its end.
+    fn mark_waiting(&mut self, filled: u32) {
+        if self.cut_off {
+            return;
+        }
+        let mut word = self.shared.cutoff.load(Ordering::Acquire);
+        loop {
+            match word & cutoff::PHASE {
+                cutoff::CUT_OFF => {
+                    self.found_cut_off();
+                    return;
+                }
+                cutoff::LOST => return,
+                _ => {}
+            }
+            if word & cutoff::ASKED != 0 && filled == 0 {
+                self.cut_off_now();
+                return;
+            }
+            let next = cutoff::with(word, cutoff::WAITING, filled);
+            match self.shared.cutoff.compare_exchange_weak(
+                word,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(now) => word = now,
+            }
+        }
+    }
+
+    /// Just after the frame's pacing, whichever way it returned: running
+    /// again, or cut off when the game's swap cut it off meanwhile.
+    fn mark_running(&mut self) {
+        if self.cut_off {
+            return;
+        }
+        let mut word = self.shared.cutoff.load(Ordering::Acquire);
+        loop {
+            match word & cutoff::PHASE {
+                cutoff::WAITING => {}
+                cutoff::CUT_OFF => {
+                    self.found_cut_off();
+                    return;
+                }
+                _ => return,
+            }
+            let next = (word & !cutoff::PHASE) | cutoff::RUNNING;
+            match self.shared.cutoff.compare_exchange_weak(
+                word,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(now) => word = now,
+            }
+        }
+    }
+
+    /// Whether a staging may destroy filled entries in its own call this
+    /// pass: not under READY's cutoff, not in play, not in the result
+    /// before its first picture (design.md "Memory Budget").
+    fn allow_destruction(&mut self, mode: &Mode) {
+        let allowed = !self.cut_off && !matches!(mode, Mode::Play { .. }) && !self.result_unacked;
+        self.destroy_allowed = allowed;
+        if let Some(s) = &mut self.screen {
+            s.set_destroy_allowed(allowed);
+        }
+    }
+
+    /// Whether a boundary may destroy, or make the pool owed: where a
+    /// staging may, and not before a loading lifetime's first presented
+    /// frame.
+    fn destroy_ok(&self, mode: &Mode) -> bool {
+        !self.cut_off
+            && !matches!(mode, Mode::Play { .. })
+            && !self.result_unacked
+            && !matches!(mode, Mode::Menu { loading: Some(l), .. } if self.loading_presented != Some(*l))
+    }
+
+    /// A heavy operation the screen ran since it was last read spends the
+    /// frame interval's allowance, from its end.
+    fn note_heavy(&mut self) {
+        let Some(s) = &self.screen else {
+            return;
+        };
+        let h = s.heavy_ops();
+        if h.count != self.heavy_seen {
+            self.heavy_seen = h.count;
+            self.allowance = Some(h.last_end.unwrap_or_else(Instant::now));
+        }
+    }
+
+    /// Whether a heavy operation is due at a boundary of `destroy_ok`:
+    /// the BGA operation held, a filled entry's heavy part, or the pool
+    /// owed once no filled entry stands in its way. None under READY's
+    /// cutoff.
+    fn heavy_due(&self, destroy_ok: bool) -> bool {
+        if self.cut_off {
+            return false;
+        }
+        if self.bga_op.is_some() {
+            return true;
+        }
+        self.screen.as_ref().is_some_and(|s| {
+            destroy_ok && (s.due_heavy() || (s.pool_owed() && s.filled() == 0 && !s.device_lost()))
+        })
+    }
+
+    /// How an Idle pass waits for its message (design.md "Load Pipeline",
+    /// the Idle loop): blocked (`None`) with nothing to look at again;
+    /// not at all with a heavy operation due and allowed; the rest of the
+    /// clock's pace with one due and the allowance spent; else
+    /// [`CANCEL_POLL`]. Outside READY's cutoff, a handoff place awaiting
+    /// its release keeps it looking, with no screen too, and so does a
+    /// filled entry whose completion is not seen yet or that a boundary
+    /// may destroy.
+    fn idle_wait(&self) -> Option<Duration> {
+        // Idle: no play, no loading frame; the allowance's clock is its
+        // regime's.
+        let destroy_ok = !self.cut_off && !self.result_unacked;
+        let work = self.attempt.is_some()
+            || self.decision_busy()
+            || self.bga_reply.is_some()
+            || self.bga_op.is_some()
+            || (!self.cut_off
+                && (self.handoffs.awaiting()
+                    || self.screen.as_ref().is_some_and(|s| {
+                        s.filled() > 0 && (destroy_ok || s.pending_completion())
+                    })));
+        if !work {
+            return None;
+        }
+        if self.heavy_due(destroy_ok) {
+            let rest = self.allowance.map_or(Duration::ZERO, |end| {
+                CLOCK_PACE.saturating_sub(end.elapsed())
+            });
+            return Some(rest.min(CANCEL_POLL));
+        }
+        Some(CANCEL_POLL)
+    }
+
+    /// The loading lifetime's first frame's hold as the boundary reads it
+    /// (design.md "Load Pipeline", read at each boundary): the frame `mode`
+    /// draws would be the pending presentation, its hold has not ended,
+    /// the image held is valid and the bound has not passed. Changes
+    /// nothing.
+    fn held(&self, mode: &Mode) -> bool {
+        let (
+            Mode::Menu {
+                loading: Some(lifetime),
+                update,
+                ..
+            },
+            Some(screen),
+        ) = (mode, &self.screen)
+        else {
+            return false;
+        };
+        if !self.shared.loading_current(*lifetime) {
+            return false;
+        }
+        let now = self.clock.now();
+        let shown_at = match self.first_frame {
+            Some(f) if f.lifetime == *lifetime && f.ended => return false,
+            Some(f) if f.lifetime == *lifetime => f.shown_at,
+            _ => update.as_deref().map_or(now, |u| u.origin),
+        };
+        let pending = presentation_of(
+            &self.committed,
+            self.specialized_in,
+            self.prepared.as_ref().map(Prepared::candidate),
+            self.requested,
+            (screen.staged_token(), screen.device()),
+            *lifetime,
+        ) == Presented::Placeholder;
+        #[cfg(test)]
+        let now = hold_now(&self.shared, now, shown_at);
+        pending
+            && held_wait(now, shown_at, first_frame_bound(&self.shared)).is_some()
+            && self.image.valid(notices_of(self.extent.as_ref()))
+    }
+
+    /// How the boundary of `mode` admits a heavy operation, `held` its
+    /// loading hold (design.md "Load Pipeline", the allowance): free, or
+    /// refilled where the loop is paced by the clock (no screen, Idle,
+    /// held) once [`CLOCK_PACE`] passed since the last one ended; a
+    /// stalled boundary that draws may run one by that clock but keeps the
+    /// field; a presenting one waits for a frame shown or invisible.
+    fn admit(&mut self, mode: &Mode, held: bool) -> Admit {
+        let Some(end) = self.allowance else {
+            return Admit::Free;
+        };
+        let passed = end.elapsed() >= CLOCK_PACE;
+        let clock = self.screen.is_none() || matches!(mode, Mode::Idle) || held;
+        match (clock, self.stalled, passed) {
+            (true, _, true) => {
+                self.allowance = None;
+                Admit::Free
+            }
+            (false, true, true) => Admit::ByStall,
+            _ => Admit::No,
+        }
+    }
+
+    /// A stalled boundary about to run an operation only the stall's clock
+    /// admits looks for a grant first, without waiting, where the pacing
+    /// waits for one: found, it is kept, the stall ends and the boundary
+    /// runs nothing, so the frame takes it.
+    fn grant_found(&mut self) -> bool {
+        let Some(s) = &self.screen else {
+            return false;
+        };
+        if !s.paced() || s.minimized() {
+            return false;
+        }
+        // A grant the pacing's wait took has ended the stall already.
+        if !self.granted && s.grant_ready() {
+            self.granted = true;
+            self.stalled = false;
+            return true;
+        }
+        false
+    }
+
+    /// The frame boundary (design.md "Memory Budget", the pass order;
+    /// "Load Pipeline", one place), with or without a screen: outside
+    /// READY's cutoff, the worker's releases read, the completion watched,
+    /// each completed entry's pages handed while a place is free; the
+    /// light destructions and at most one heavy operation where `mode`
+    /// allows them; the BGA batch's step; the result's status published
+    /// when it changed; READY's cutoff given with no entry filled.
+    /// `regrow` when the pass took a selection entry. Whether the screen
+    /// was dropped (the device failed its poll).
+    fn boundary(&mut self, mode: &Mode, held: bool, regrow: bool) -> bool {
+        #[cfg(test)]
+        self.take_handoff_seed();
+        let mut dropped = false;
+        debug_assert!(
+            !self.cut_off || self.screen.as_ref().is_none_or(|s| s.filled() == 0),
+            "a retirement entry was filled under READY's cutoff"
+        );
+        // The allocations of the release reads, the poll, the sends and
+        // the publication, counted (tests: V6's guard).
+        #[cfg(all(test, feature = "dev-tools"))]
+        let (control, counted_from) = (
+            self.shared.boundary_control.swap(false, Ordering::SeqCst),
+            crate::alloc_count::this_thread(),
+        );
+        #[cfg(all(test, feature = "dev-tools"))]
+        if control {
+            drop(std::hint::black_box(vec![1_u8; 8]));
+        }
+        if !self.cut_off {
+            let released = self.handoffs.read_releases();
+            #[cfg(test)]
+            self.shared.releases_read.fetch_add(1, Ordering::AcqRel);
+            self.publish_due |= released.result;
+            if let Some(s) = &mut self.screen
+                && let Err(e) = s.poll_completion()
+            {
+                eprintln!("render: {}", Chain(&e));
+                self.drop_screen();
+                self.granted = false;
+                self.shared.failed.store(true, Ordering::Release);
+                dropped = true;
+            }
+            while self.handoffs.has_free()
+                && let Some(s) = &mut self.screen
+                && let Some(h) = s.take_handoff()
+            {
+                if let Err((entry, cpu)) = self.handoffs.send(h) {
+                    s.return_handoff(entry, cpu);
+                    break;
+                }
+            }
+        }
+        #[cfg(all(test, feature = "dev-tools"))]
+        let counted = crate::alloc_count::this_thread() - counted_from;
+        if self.cut_off || dropped {
+            // Stale or light, answered whatever the cutoff.
+            self.bga_op_boundary(false);
+        } else {
+            let destroy_ok = self.destroy_ok(mode);
+            if destroy_ok && let Some(s) = &mut self.screen {
+                let _ = s.destroy_due(false);
+            }
+            self.heavy_op(mode, held, regrow, destroy_ok);
+        }
+        self.bga_boundary();
+        #[cfg(all(test, feature = "dev-tools"))]
+        let published_from = crate::alloc_count::this_thread();
+        if !self.cut_off {
+            let changes = self
+                .screen
+                .as_ref()
+                .map_or(self.result_changes, |s| s.result_changes());
+            if std::mem::take(&mut self.publish_due) || changes != self.result_changes {
+                self.result_changes = changes;
+                self.publish_result_status();
+            }
+        }
+        #[cfg(all(test, feature = "dev-tools"))]
+        {
+            let counted = counted + crate::alloc_count::this_thread() - published_from;
+            let to = if control {
+                &self.shared.control_allocations
+            } else {
+                &self.shared.boundary_allocations
+            };
+            to.fetch_add(counted, Ordering::SeqCst);
+        }
+        self.check_cutoff();
+        dropped
+    }
+
+    /// At most one heavy operation at the boundary, by priority, where its
+    /// allowance admits it (design.md "Load Pipeline"): the regrowth of
+    /// the pass that took a selection entry, the BGA operation held, the
+    /// pool owed, then a filled entry's heavy part; the last two only
+    /// where `destroy_ok`. The BGA operation held is answered stale, or
+    /// run when light, first, whatever the allowance.
+    fn heavy_op(&mut self, mode: &Mode, held: bool, regrow: bool, destroy_ok: bool) {
+        let bga = self.bga_op_boundary(false);
+        let Some(s) = &self.screen else {
+            return;
+        };
+        let owed = destroy_ok && s.pool_owed();
+        let destroy = destroy_ok && s.due_heavy();
+        if !(regrow || bga || owed || destroy) {
+            return;
+        }
+        match self.admit(mode, held) {
+            Admit::No => return,
+            Admit::ByStall if self.grant_found() => return,
+            Admit::ByStall | Admit::Free => {}
+        }
+        let Some(before) = self.screen.as_ref().map(|s| s.heavy_ops().count) else {
+            return;
+        };
+        #[cfg(test)]
+        let (start, refills, regime) = (
+            Instant::now(),
+            self.shared.refilling_frames.load(Ordering::SeqCst),
+            if self.screen.is_none() || matches!(mode, Mode::Idle) || held {
+                Regime::Clock
+            } else if self.stalled {
+                Regime::Stalled
+            } else {
+                Regime::Presenting
+            },
+        );
+        let ran = |r: &Self| {
+            r.screen
+                .as_ref()
+                .is_some_and(|s| s.heavy_ops().count != before)
+        };
+        #[cfg(test)]
+        let mut kind = None;
+        if regrow && let Some(s) = &mut self.screen {
+            s.regrow_pool();
+            #[cfg(test)]
+            {
+                kind = Some(HeavyKind::Regrowth);
+            }
+        }
+        if bga && !ran(self) {
+            self.bga_op_boundary(true);
+            #[cfg(test)]
+            {
+                kind = Some(HeavyKind::Bga);
+            }
+        }
+        if owed
+            && !ran(self)
+            && let Some(s) = &mut self.screen
+        {
+            s.make_owed_pool();
+            #[cfg(test)]
+            {
+                kind = Some(HeavyKind::OwedPool);
+            }
+        }
+        if destroy
+            && !ran(self)
+            && let Some(s) = &mut self.screen
+        {
+            let _ = s.destroy_due(true);
+            #[cfg(test)]
+            {
+                kind = Some(HeavyKind::Destruction);
+            }
+        }
+        #[cfg(test)]
+        if let Some(kind) = kind.filter(|_| ran(self)) {
+            self.note_heavy_record(HeavyRec {
+                kind,
+                start,
+                end: Instant::now(),
+                regime,
+                refills,
+            });
+        }
+        self.note_heavy();
+    }
+
+    /// Notes a boundary's heavy operation while the record has room
+    /// (tests).
+    #[cfg(test)]
+    fn note_heavy_record(&self, rec: HeavyRec) {
+        let mut r = self
+            .shared
+            .heavy_record
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        if r.len() < r.capacity() {
+            r.push(rec);
+        }
+    }
+
+    /// Takes the pages a test seeded for a handoff place, if any (tests).
+    #[cfg(test)]
+    fn take_handoff_seed(&mut self) {
+        let seed = self
+            .shared
+            .handoff_seed
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .take();
+        if let Some((kind, pages)) = seed {
+            let _ = self.handoffs.seed(kind, pages);
+            self.publish_due = true;
+        }
+    }
+
     /// Builds the screen again after a failure, without a chart: the
     /// device's recovery. A screen that can draw is kept as it is.
     fn recover(&mut self) -> Result<(), RenderError> {
@@ -7977,6 +9082,7 @@ impl Run {
             let screen = built?;
             self.built(screen.as_ref());
             self.screen = Some(screen);
+            self.screen_built();
             self.image.changed();
             self.result_rebuilt();
             // The new screen takes the window's size afresh.
@@ -8317,19 +9423,50 @@ impl Run {
 
     /// Takes a step of the BGA pictures' publication of `generation`:
     /// refused ([`render::BgaFault::Stale`], nothing published, no array
-    /// read as published) unless it is the game thread's current one, and
-    /// answered at once, but for a batch of cells: that one is taken in
-    /// hand, written at the frame boundaries that follow and answered once
-    /// its writes end ([`Self::bga_boundary`]); a batch still in hand is
-    /// answered stale first.
+    /// read as published) unless it is the game thread's current one,
+    /// leaving what is held in hand as it is. A current begin, and a
+    /// current drop or absent publication that finds an array in use, is
+    /// held for a frame boundary, where it runs as the interval's heavy
+    /// operation (design.md "Load Pipeline"), replacing one held before,
+    /// which is answered stale ([`Self::bga_op_boundary`]); a drop or an
+    /// absent publication with no array in use runs at once. A batch of
+    /// cells is taken in hand, written at the frame boundaries that follow
+    /// and answered once its writes end ([`Self::bga_boundary`]); a batch
+    /// still in hand is answered stale first. The rest is answered at once.
     fn bga(&mut self, generation: u64, msg: crate::bga::BgaMsg) {
         use crate::bga::BgaMsg;
         let current = self.shared.bga_generation.load(Ordering::SeqCst) == generation;
-        let screen = self.screen.as_mut().filter(|_| current);
+        let in_use = current && self.screen.as_ref().is_some_and(|s| s.bga_in_use());
         let stale = render::BgaFault::Stale;
+        let msg = match msg {
+            BgaMsg::Begin { pages, reply } if current && self.screen.is_some() => {
+                self.hold_bga(generation, BgaOp::Begin { pages, reply });
+                return;
+            }
+            BgaMsg::Drop if in_use => {
+                self.hold_bga(generation, BgaOp::Drop);
+                return;
+            }
+            BgaMsg::Publish {
+                key: None,
+                entries,
+                reply,
+            } if in_use => {
+                #[cfg(test)]
+                self.bga_held_publication();
+                self.hold_bga(generation, BgaOp::Absent { entries, reply });
+                return;
+            }
+            msg => msg,
+        };
+        #[cfg(test)]
+        if matches!(msg, BgaMsg::Publish { .. }) {
+            self.bga_held_publication();
+        }
+        let screen = self.screen.as_mut().filter(|_| current);
         match msg {
-            BgaMsg::Begin { pages, reply } => {
-                let _ = reply.send(screen.map_or(Err(stale), |s| s.begin_bga(pages)));
+            BgaMsg::Begin { reply, .. } => {
+                let _ = reply.send(Err(stale));
             }
             BgaMsg::Cells { key, cells, reply } => {
                 if let Some((_, superseded)) = self.bga_reply.take() {
@@ -8347,15 +9484,8 @@ impl Run {
                 entries,
                 reply,
             } => {
-                #[cfg(test)]
-                {
-                    let end = Instant::now() + hook_bound();
-                    while self.shared.bga_hold.load(Ordering::SeqCst) && Instant::now() < end {
-                        std::thread::sleep(Duration::from_millis(1));
-                    }
-                }
                 // Published only while in time, under the answer's lock.
-                reply.give(|| screen.map_or(Err(stale), |s| s.publish_bga(key, entries)));
+                let _ = reply.give(|| screen.map_or(Err(stale), |s| s.publish_bga(key, entries)));
             }
             BgaMsg::Reuse { key, reply } => {
                 let _ = reply.send(screen.and_then(|s| s.published_bga(key)));
@@ -8366,6 +9496,68 @@ impl Run {
                 }
             }
         }
+    }
+
+    /// Waits while BGA publications are held, at most [`hook_bound`]
+    /// (tests: `RenderLink::hold_bga_publications`).
+    #[cfg(test)]
+    fn bga_held_publication(&self) {
+        let end = Instant::now() + hook_bound();
+        while self.shared.bga_hold.load(Ordering::SeqCst) && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Holds `op` of `generation` for a frame boundary, in place of the
+    /// one held before, which is answered stale.
+    fn hold_bga(&mut self, generation: u64, op: BgaOp) {
+        #[cfg(test)]
+        self.shared.bga_ops_held.fetch_add(1, Ordering::AcqRel);
+        if let Some((_, replaced)) = self.bga_op.replace((generation, op)) {
+            replaced.stale();
+        }
+    }
+
+    /// The BGA operation held, at a frame boundary, looked at again: one
+    /// no longer the game thread's current, or with no screen, runs
+    /// nothing and is answered stale (a drop's array left to the newer
+    /// generation's first operation); a drop or an absent publication that
+    /// finds no array in use any more runs, light; with `heavy` (the
+    /// interval's allowance free, outside READY's cutoff) the one left
+    /// runs as the interval's heavy operation. Whether one is still held.
+    fn bga_op_boundary(&mut self, heavy: bool) -> bool {
+        let Some((generation, op)) = &self.bga_op else {
+            return false;
+        };
+        let current = self.shared.bga_generation.load(Ordering::SeqCst) == *generation;
+        let run = match (&self.screen, op) {
+            (Some(s), BgaOp::Drop | BgaOp::Absent { .. }) if current => heavy || !s.bga_in_use(),
+            (Some(_), BgaOp::Begin { .. }) if current => heavy,
+            _ => {
+                if let Some((_, op)) = self.bga_op.take() {
+                    op.stale();
+                }
+                return false;
+            }
+        };
+        if !run {
+            return true;
+        }
+        let (Some((_, op)), Some(s)) = (self.bga_op.take(), self.screen.as_mut()) else {
+            return false;
+        };
+        match op {
+            BgaOp::Begin { pages, reply } => {
+                let _ = reply.send(s.begin_bga(pages));
+            }
+            BgaOp::Drop => s.drop_bga(),
+            BgaOp::Absent { entries, reply } => {
+                // The answer follows the drop, under its lock; past its
+                // bound nothing is dropped or published.
+                let _ = reply.give(|| s.publish_bga(None, entries));
+            }
+        }
+        false
     }
 
     /// The BGA batch in hand at a frame boundary, outside every frame
@@ -8657,9 +9849,6 @@ impl Run {
                     self.selected = Some(bundle);
                     self.play_selection = request;
                 }
-                if kind == ScreenKind::Result {
-                    let _ = screen.drain_retired();
-                }
                 if kind == ScreenKind::Decision {
                     self.ensure_decision();
                 }
@@ -8818,6 +10007,7 @@ impl Run {
                 built.and_then(|s| {
                     self.built(s.as_ref());
                     self.screen = Some(s);
+                    self.screen_built();
                     self.image.changed();
                     // The new screen takes the window's size afresh.
                     self.applied = None;
@@ -8832,6 +10022,7 @@ impl Run {
             self.screen = None;
             self.image.changed();
             self.granted = false;
+            self.screen_dropped();
         }
         ready
     }
@@ -8948,7 +10139,8 @@ impl Run {
         // Refused while a lifetime was active: dropped once none is and
         // the render left the skinned screen, which draws from its store
         // until then.
-        if self.decision_side.as_ref().is_some_and(|s| s.retiring)
+        if !self.cut_off
+            && self.decision_side.as_ref().is_some_and(|s| s.retiring)
             && render::lock(&book).active().is_none()
             && !self.decision_skinned()
         {
@@ -9051,7 +10243,8 @@ impl Run {
                 None => side.stop(&mut || Arc::new(AtomicBool::new(true))),
             }
         }
-        if active.is_none() && !self.decision_skinned() {
+        // Under READY's cutoff the boundary drops it at its end.
+        if !self.cut_off && active.is_none() && !self.decision_skinned() {
             self.drop_decision_side();
         }
     }
@@ -9178,6 +10371,7 @@ impl Run {
                 self.screen = None;
                 self.image.changed();
                 self.granted = false;
+                self.screen_dropped();
                 Err(e)
             }
         }
@@ -9299,8 +10493,6 @@ struct ResultSide {
     /// A staging the commit point discarded, dropped after the frame: its
     /// token, so no other staging goes with it.
     discard: Option<PreparedToken>,
-    /// A commit happened: what it replaced is drained after the frame.
-    drain: bool,
     /// A commit happened: what the result kind keeps to restore is
     /// reconciled right after the commit point, before the frame is
     /// submitted ([`Run::reconcile_result`]).
@@ -9330,7 +10522,6 @@ impl ResultSide {
             stop: None,
             restrip: false,
             discard: None,
-            drain: false,
             reconcile: false,
             reapply: false,
             end_changed: false,
@@ -9588,6 +10779,7 @@ impl Run {
         self.reconcile_result();
         self.screen = None;
         self.image.changed();
+        self.screen_dropped();
         // The attempt is abandoned: its preparation before a wait is no
         // recovered frame's (dev-tools: the whole frames).
         #[cfg(feature = "dev-tools")]
@@ -10038,7 +11230,6 @@ impl Run {
                     match commit {
                         ViewCommit::Committed => {
                             if v.token.is_some() {
-                                side.drain = true;
                                 side.reconcile = true;
                             }
                             committed = Some(v.held);
@@ -10207,8 +11398,8 @@ impl Run {
     }
 
     /// After a result frame: what the commit point discarded or replaced
-    /// is dropped, the array a commit released drained (the S10-09i
-    /// design's §2.1 Q3), and the status published.
+    /// is dropped (an array a commit released waits in its retirement
+    /// entry, design.md "Memory Budget"), and the status published.
     fn after_result_frame(&mut self) {
         let Some(side) = &mut self.result else {
             return;
@@ -10234,41 +11425,46 @@ impl Run {
                 screen.use_result_strip(STRIP_PRESENTED);
             }
         }
-        if let Some(screen) = &mut self.screen {
-            if let Some(token) = side.discard.take() {
-                screen.discard_token(token);
-            }
-            if std::mem::take(&mut side.drain) {
-                #[cfg(feature = "dev-tools")]
-                let p_t = render::probe::Span::start();
-                let _ = screen.drain_retired();
-                #[cfg(feature = "dev-tools")]
-                if crate::dev::loop_probe::RF_ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
-                    crate::dev::loop_probe::mark(
-                        "rf:drain_retired_us",
-                        crate::dev::loop_probe::us(p_t.elapsed()),
-                    );
-                }
-            }
+        if let Some(screen) = &mut self.screen
+            && let Some(token) = side.discard.take()
+        {
+            screen.discard_token(token);
         }
         self.publish_result_status();
     }
 
     /// Publishes what the render thread shows of the result kind: its
     /// lifetime, the revision and view presented, the pinned view, every
-    /// atlas held for it (the screen's and the one kept to restore), the
-    /// run's register and a view refused. Allocates only when it changed.
+    /// atlas held for it (design.md "Memory Budget", the result's atlas
+    /// report: the screen's committed, staged and retired ones until their
+    /// arrays are destroyed, the handoff places' until their release is
+    /// read, and the one kept to restore), the run's register and a view
+    /// refused. Nothing under READY's cutoff, whose end publishes; an atlas
+    /// leaving wakes the game thread. Allocates only when it changed.
     fn publish_result_status(&mut self) {
-        let mut retained: [Option<AtlasId>; 4] = [None; 4];
-        if let Some(screen) = &self.screen {
-            let [a, b, c] = screen.retained_atlases(ScreenKind::Result);
-            retained = [a, b, c, None];
+        /// The report's places: the screen's, the handoff table's and the
+        /// record's.
+        const PLACES: usize = render::RETAINED_ATLASES + crate::retire_worker::PLACES + 1;
+        if self.cut_off {
+            return;
         }
-        if let Some(slot) = retained.get_mut(3) {
-            *slot = self.committed.atlas(ScreenKind::Result);
+        let screen_ids = self
+            .screen
+            .as_ref()
+            .map_or([None; render::RETAINED_ATLASES], |s| {
+                s.retained_atlases(ScreenKind::Result)
+            });
+        let mut retained: [Option<AtlasId>; PLACES] = [None; PLACES];
+        for (slot, id) in retained.iter_mut().zip(
+            screen_ids
+                .into_iter()
+                .chain(self.handoffs.result_ids())
+                .chain(std::iter::once(self.committed.atlas(ScreenKind::Result))),
+        ) {
+            *slot = id;
         }
         let ids = || {
-            let mut seen: [Option<AtlasId>; 4] = [None; 4];
+            let mut seen: [Option<AtlasId>; PLACES] = [None; PLACES];
             let mut n = 0;
             for id in retained.iter().flatten() {
                 if !seen.iter().flatten().any(|s| s == id)
@@ -10296,10 +11492,17 @@ impl Run {
             None => (0, 0, None, None),
         };
         let installed = self.committed.atlas(ScreenKind::Result);
+        #[cfg(feature = "dev-tools")]
+        let holders = self.result_holders(&screen_ids, &ids());
         let mut status = self.shared.result_status();
         // With no screen, the charges it had.
         let menus = self.screen.as_ref().map_or(status.menus, |s| s.menus());
-        let same = status.installed == installed
+        #[cfg(feature = "dev-tools")]
+        let same_holders = status.holders == holders;
+        #[cfg(not(feature = "dev-tools"))]
+        let same_holders = true;
+        let same = same_holders
+            && status.installed == installed
             && status.menus == menus
             && status.disabled == self.result_disabled
             && status.lifetime == lifetime
@@ -10347,8 +11550,25 @@ impl Run {
         status.shown = shown;
         status.pinned = pinned;
         status.refused = refused.cloned();
-        status.retained = ids().into_iter().flatten().collect();
+        let now = ids();
+        let left = status
+            .retained
+            .iter()
+            .any(|old| !now.iter().flatten().any(|id| id == old));
+        status.retained = now.into_iter().flatten().collect();
+        #[cfg(feature = "dev-tools")]
+        {
+            status.holders = holders;
+        }
         drop(status);
+        #[cfg(test)]
+        self.shared.reports_published.fetch_add(1, Ordering::AcqRel);
+        // An atlas left: a build deferred for room looks again at once.
+        if left {
+            #[cfg(test)]
+            self.shared.reports_woken.fetch_add(1, Ordering::AcqRel);
+            self.shared.game_wake.wake();
+        }
         #[cfg(feature = "dev-tools")]
         if let Some((skin, why)) = announce {
             // A test holds the print here, the status let go (tests).
@@ -10360,6 +11580,48 @@ impl Run {
                 (false, None) => println!("dev: result shown: built-in"),
             }
         }
+    }
+
+    /// Development builds: which render-side holders hold each of `ids`,
+    /// the result's report, from `screen` (the screen's places), the
+    /// handoff table and the record (design.md "Memory Budget", the
+    /// no-room line).
+    #[cfg(feature = "dev-tools")]
+    fn result_holders(
+        &self,
+        screen: &[Option<AtlasId>; render::RETAINED_ATLASES],
+        ids: &[Option<AtlasId>],
+    ) -> Vec<(AtlasId, crate::result_present::Holders)> {
+        use crate::result_present::Holders;
+        let holding = self
+            .screen
+            .as_ref()
+            .map_or([false; render::RETIREMENT_ENTRIES], |s| {
+                s.entries_holding_pages()
+            });
+        let places = self.handoffs.result_ids();
+        let record = self.committed.atlas(ScreenKind::Result);
+        ids.iter()
+            .flatten()
+            .map(|&id| {
+                let mut h = Holders::default();
+                let [committed, staged, upload, entries @ ..] = screen;
+                h.committed = *committed == Some(id);
+                h.staged = *staged == Some(id) || *upload == Some(id);
+                for (e, pages) in entries.iter().zip(holding) {
+                    if *e == Some(id) {
+                        if pages {
+                            h.entry_pages = true;
+                        } else {
+                            h.entry_array = true;
+                        }
+                    }
+                }
+                h.place = places.contains(&Some(id));
+                h.record = record == Some(id);
+                (id, h)
+            })
+            .collect()
     }
 
     /// Selects the result kind's pages-only installation of `pages` for
@@ -10389,13 +11651,14 @@ impl Run {
             }
         }
         // G1's cold precondition (dev-tools `cold`): the installation
-        // removed and nothing retained, so the pages upload again.
+        // removed and every retirement entry destroyed, its pages dropped
+        // here, so nothing is retained and the pages upload again.
         #[cfg(feature = "dev-tools")]
         let cold = crate::dev::result_cold();
         #[cfg(feature = "dev-tools")]
         if cold {
             screen.remove(kind);
-            let _ = screen.drain_retired();
+            settle_entries(screen.as_mut());
         }
         #[cfg(feature = "dev-tools")]
         let retained = screen.retained_atlases(kind).iter().flatten().count();
@@ -10455,7 +11718,6 @@ impl Run {
                     });
                     return Ok(refusal(e.to_string()));
                 }
-                let _ = screen.drain_retired();
                 commits.committed = commits.committed.max(request);
                 drop(commits);
                 Ok(Preparation::Ready)
@@ -10475,6 +11737,21 @@ impl Run {
                 Err(e)
             }
         }
+    }
+}
+
+/// Destroys every retirement entry of `screen` as its completion is seen,
+/// each part in turn, its pages dropped with it, for at most 10 s
+/// (development builds: G1's cold upload).
+#[cfg(feature = "dev-tools")]
+fn settle_entries(screen: &mut dyn Screen) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while screen.filled() > 0 && Instant::now() < deadline {
+        if screen.poll_completion().is_err() {
+            return;
+        }
+        let _ = screen.destroy_due(true);
+        std::thread::sleep(Duration::from_millis(1));
     }
 }
 
@@ -11938,9 +13215,12 @@ pub(crate) mod tests {
         fn text(&mut self, _lines: &[&str]) -> Result<bool, RenderError> {
             Ok(true)
         }
-        fn splash(&mut self, _elapsed: Duration) -> Option<Result<bool, RenderError>> {
+        fn splash(
+            &mut self,
+            _elapsed: Duration,
+        ) -> Option<Result<render::FrameOutcome, RenderError>> {
             self.splashes.fetch_add(1, Ordering::SeqCst);
-            Some(Ok(true))
+            Some(Ok(render::FrameOutcome::Shown))
         }
         fn menu(
             &mut self,
@@ -12458,6 +13738,10 @@ pub(crate) mod tests {
         let result = solid_bundle(&r, &Look::left([0, 255, 0, 255]), [16, 16]);
         let token = r.install(ScreenKind::Result, &result, 2).unwrap();
         r.commit(token).unwrap();
+        // Play's first commit retired its built-in resources: destroyed
+        // here, as a boundary would, so the refused admission below finds
+        // nothing of its own to destroy.
+        crate::render_common::settle(&mut r);
         let drawn = |r: &mut render::Renderer| {
             let v = view(0, 0);
             let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
@@ -15831,12 +17115,15 @@ pub(crate) mod tests {
         fn paced(&self) -> bool {
             self.shared.pace.load(Ordering::Acquire)
         }
-        fn splash(&mut self, _elapsed: Duration) -> Option<Result<bool, RenderError>> {
+        fn splash(
+            &mut self,
+            _elapsed: Duration,
+        ) -> Option<Result<render::FrameOutcome, RenderError>> {
             let shown = self.shared.splash.load(Ordering::Acquire);
             if shown {
                 self.shared.splashes.fetch_add(1, Ordering::AcqRel);
             }
-            shown.then_some(Ok(true))
+            shown.then_some(Ok(render::FrameOutcome::Shown))
         }
         fn selection(
             &mut self,
@@ -20866,6 +22153,19 @@ pub(crate) mod tests {
     // presentation, and the validity of the image it holds.
     #[cfg(feature = "dev-tools")]
     mod first_frame;
+    // The retirement worker's places in the result's report, and READY's
+    // cutoff.
+    #[cfg(feature = "dev-tools")]
+    mod retirement;
+    // The frame gate shared by the integrated decision tests and the
+    // frame interval's tests.
+    #[cfg(feature = "dev-tools")]
+    mod gate;
+    // The frame interval's heavy operation on a fake screen: the
+    // allowance's regimes, the stall and its grant check, the BGA
+    // operation held, the Idle loop's wait.
+    #[cfg(feature = "dev-tools")]
+    mod allowance;
 }
 
 /// Whether this result frame is one of the first frames probed (`rf:*`,

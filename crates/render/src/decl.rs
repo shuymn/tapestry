@@ -793,6 +793,12 @@ impl DeclSkin {
         &self.bundle
     }
 
+    /// Its loading presentation, its installation's.
+    #[must_use]
+    pub(crate) const fn loading(&self) -> &LoadingPresentation {
+        &self.loading
+    }
+
     /// Its installation: the bundle and the loading presentation, shared.
     #[must_use]
     pub fn installation(&self) -> Installation {

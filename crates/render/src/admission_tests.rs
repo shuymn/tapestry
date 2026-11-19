@@ -24,7 +24,7 @@ use render::{RenderError, Renderer, SHARED_TEXELS, SkinBundle, VM_TEXELS};
 use skin_model::{AtlasLimits, MAX_ATLAS_TEXELS, ScreenKind};
 
 use crate::renderer::pool_tests::{LAYER, pool_bundle};
-use crate::test_common::{GAUGES, attempt, context, offscreen};
+use crate::test_common::{GAUGES, attempt, context, offscreen, settle};
 use crate::test_decl::{Look, atlas_cap_bundle, solid_bundle};
 
 /// An atlas's cap: at most half the shared limit.
@@ -316,9 +316,11 @@ fn a_refused_admission_drops_the_staging_before() {
     assert!(r.installed(ScreenKind::Selection).is_none());
 }
 
-/// A removed installation gives its charge back: big, refused as play's
-/// beside a selection skin charged what the limit leaves beside big and
-/// tiny's atlas more, then fits.
+/// A removed installation gives its charge back once its retirement
+/// entry is destroyed: big, refused as play's beside a selection skin
+/// charged what the limit leaves beside big and tiny's atlas more, is
+/// still refused while the removed installation's entry stands (`admit`
+/// counts it as it stands), then fits.
 /// Play's installation is never removed this way.
 #[test]
 fn a_removed_installation_gives_its_charge_back() {
@@ -337,7 +339,13 @@ fn a_removed_installation_gives_its_charge_back() {
 
     r.remove(ScreenKind::Selection);
     assert!(r.installed(ScreenKind::Selection).is_none());
-    assert_eq!(r.admission().charge(ScreenKind::Selection), 0);
+    let a = r.admission();
+    assert_eq!(a.charge(ScreenKind::Selection), 0);
+    assert_eq!(a.filled, SHARED_TEXELS - CAP + TINY, "its entry charged");
+    let e = r.admit(ScreenKind::Play, &big).unwrap_err();
+    refused(&e, ScreenKind::Play, SHARED_TEXELS + TINY);
+    settle(&mut r);
+    assert_eq!(r.admission().filled, 0);
     r.admit(ScreenKind::Play, &big).unwrap();
 }
 
@@ -378,10 +386,11 @@ fn a_candidate_s_text_layer_is_charged() {
 /// The chart-image pool's optional layers yield to later candidates in
 /// startup's order (play, selection, decision, result; AC-S9): with the
 /// selection installed and its pool whole, a decision candidate that fits
-/// only with the pool reduced is admitted, the pool made again with the
-/// layers left as a new generation, then a result candidate likewise, the
-/// pool down to its firm layer. No candidate is refused and no result
-/// released for the pool, and the shared total holds.
+/// only with the pool reduced is admitted, the live array retired at once
+/// and the layers left owed, made as a new generation once the retired
+/// one is destroyed, then a result candidate likewise, the pool down to
+/// its firm layer. No candidate is refused and no result released for the
+/// pool, and the shared total holds.
 #[test]
 fn the_pool_yields_to_later_candidates_in_startup_order() {
     let mut r = offscreen(1_920, 1_080);
@@ -403,6 +412,11 @@ fn the_pool_yields_to_later_candidates_in_startup_order() {
     let b = tiny(&r, BLUE);
 
     commit(&mut r, ScreenKind::Decision, &b, 3);
+    assert_eq!(r.pool(), None, "retired at the reduction");
+    assert!(r.pool_owed());
+    assert_eq!(r.admission().total(), SHARED_TEXELS);
+    settle(&mut r);
+    assert!(r.make_owed_pool());
     let reduced = r.pool().unwrap();
     assert_eq!(reduced.layers, 2);
     assert!(reduced.generation > whole.generation);
@@ -411,6 +425,9 @@ fn the_pool_yields_to_later_candidates_in_startup_order() {
     let b = tiny(&r, GREEN);
 
     commit(&mut r, ScreenKind::Result, &b, 4);
+    assert_eq!(r.pool(), None);
+    settle(&mut r);
+    assert!(r.make_owed_pool());
     let firm = r.pool().unwrap();
     assert_eq!(firm.layers, 1);
     assert!(firm.generation > reduced.generation);
@@ -427,9 +444,11 @@ fn the_pool_yields_to_later_candidates_in_startup_order() {
 }
 
 /// A larger play specialization staged in Preparing reduces the pool
-/// first, as a new generation, and keeps the result installed (AC-S9);
-/// only one that does not fit with the pool at its firm layer releases
-/// the result, the pool reduced before.
+/// first, its smaller array owed and made as a new generation once the
+/// retired one is destroyed, and keeps the result installed (AC-S9); only
+/// one that does not fit with the pool at its firm layer releases the
+/// result, the pool reduced before. Each commit's replaced play skin is
+/// charged until its entry's destruction.
 #[test]
 fn a_larger_play_specialization_reduces_the_pool_before_the_result() {
     let mut r = offscreen(1_920, 1_080);
@@ -446,6 +465,12 @@ fn a_larger_play_specialization_reduces_the_pool_before_the_result() {
     r.state_charge(&s, SHARED_TEXELS - LAYER - 2 * TINY - LAYER);
     let b = tiny(&r, BLUE);
     play(&mut r, &b, 4);
+    assert_eq!(r.pool(), None);
+    assert!(!r.make_owed_pool(), "the retired pool not destroyed yet");
+    // Red's replaced skin, charged until its entry is destroyed.
+    assert_eq!(r.admission().total(), SHARED_TEXELS + TINY);
+    settle(&mut r);
+    assert!(r.make_owed_pool());
     let reduced = r.pool().unwrap();
     assert_eq!(reduced.layers, 2);
     assert!(reduced.generation > whole.generation);
@@ -458,6 +483,9 @@ fn a_larger_play_specialization_reduces_the_pool_before_the_result() {
     r.state_charge(&s, SHARED_TEXELS - LAYER - TINY);
     let b = tiny(&r, RED);
     play(&mut r, &b, 5);
+    assert_eq!(r.pool(), None);
+    settle(&mut r);
+    assert!(r.make_owed_pool());
     let firm = r.pool().unwrap();
     assert_eq!(firm.layers, 1);
     assert!(firm.generation > reduced.generation);
@@ -514,4 +542,264 @@ fn a_recovery_restores_the_kinds_first_and_the_pool_last() {
     assert_eq!(grown.layers, 2);
     assert!(grown.generation > firm.generation);
     assert_eq!(again.admission().total(), SHARED_TEXELS);
+}
+
+/// The destructions recorded since `from` of them were.
+fn recorded_since(r: &Renderer, from: usize) -> Vec<render::DestroyRecord> {
+    let all: Vec<_> = r.destructions().copied().collect();
+    let n = r.destructions_recorded() - from;
+    all[all.len() - n..].to_vec()
+}
+
+/// Stages `b` with an attempt as play's for `request`.
+fn stage_play(
+    r: &mut Renderer,
+    b: &Arc<SkinBundle>,
+    request: u64,
+) -> Result<render::PreparedToken, RenderError> {
+    let chart = ChartBuilder::new(120_000).build().unwrap();
+    let ctx = context(&GAUGES, false);
+    r.stage(b, &attempt(r, &chart, &ctx), request)
+}
+
+/// V7 at the renderer: a staging superseded after its upload's submission
+/// stays charged in its retirement entry, beside the newer candidate,
+/// until the entry's destruction, its completion seen or not; a staging
+/// of the committed bundle has nothing of its own and is counted once.
+// Revert: `Retirements::charged` leaving out the filled entries -> big is
+// admitted as play's beside the superseded candidate.
+#[test]
+fn a_superseded_staging_stays_charged_until_its_destruction() {
+    let mut r = offscreen(1_920, 1_080);
+    let big = big(&r);
+    let s = tiny(&r, GREEN);
+    commit(&mut r, ScreenKind::Selection, &s, 1);
+    r.state_charge(&s, SHARED_TEXELS - CAP);
+    r.admit(ScreenKind::Play, &big).unwrap();
+    let d1 = tiny(&r, RED);
+    let _ = r.install(ScreenKind::Decision, &d1, 2).unwrap();
+    let d2 = tiny(&r, BLUE);
+    let _ = r.install(ScreenKind::Decision, &d2, 3).unwrap();
+    let a = r.admission();
+    assert_eq!(a.candidate, Some((ScreenKind::Decision, TINY)));
+    assert_eq!(a.filled, TINY, "the superseded candidate");
+    let e = r.admit(ScreenKind::Play, &big).unwrap_err();
+    refused(&e, ScreenKind::Play, SHARED_TEXELS + TINY);
+    // Its completion seen: still charged until it is destroyed.
+    let began = std::time::Instant::now();
+    while r.pending_completion() {
+        assert!(began.elapsed().as_secs() < 10, "no completion seen");
+        r.poll_completion().unwrap();
+    }
+    assert_eq!(r.admission().filled, TINY);
+    let e = r.admit(ScreenKind::Play, &big).unwrap_err();
+    refused(&e, ScreenKind::Play, SHARED_TEXELS + TINY);
+    let d = r.destroy_due(true).heavy.unwrap();
+    assert_eq!(d.id, Some(d1.atlas_id()));
+    assert_eq!(r.admission().filled, 0);
+    r.admit(ScreenKind::Play, &big).unwrap();
+    // The committed bundle staged again: no entry of its own, nothing
+    // filled after its discard, its charge counted once.
+    r.discard();
+    settle(&mut r);
+    commit(&mut r, ScreenKind::Decision, &d1, 4);
+    let committed = r.admission();
+    let _ = r.install(ScreenKind::Decision, &d1, 5).unwrap();
+    let a = r.admission();
+    assert_eq!(a.committed, committed.committed);
+    assert_eq!((a.filled, a.total()), (0, committed.total()));
+    r.discard();
+    assert_eq!(r.filled(), 0);
+}
+
+/// V7 for play: a play staging that fits only once a filled entry is
+/// destroyed destroys it in its own call, where destruction is allowed,
+/// and keeps the result; where it is not, it is refused counting the
+/// entry, the result kept; one that does not fit even without the result
+/// is refused, the result kept.
+// Revert: `reclaim` without its `Destroy` step -> the play staging that
+// fits once the removed decision's entry is destroyed releases the result
+// instead.
+#[test]
+fn play_fits_once_a_filled_entry_is_destroyed_in_its_call() {
+    let mut r = offscreen(1_920, 1_080);
+    let p = tiny(&r, RED);
+    play(&mut r, &p, 1);
+    let res = tiny(&r, GREEN);
+    commit(&mut r, ScreenKind::Result, &res, 2);
+    let d = tiny(&r, BLUE);
+    commit(&mut r, ScreenKind::Decision, &d, 3);
+    settle(&mut r);
+    // The decision removed, its entry charged what puts a tiny play
+    // candidate one atlas past the limit.
+    r.state_charge(&d, SHARED_TEXELS - TINY);
+    r.remove(ScreenKind::Decision);
+    assert_eq!(r.admission().filled, SHARED_TEXELS - TINY);
+    let b = tiny(&r, BLUE);
+    r.set_destroy_allowed(false);
+    let e = stage_play(&mut r, &b, 4).unwrap_err();
+    refused(&e, ScreenKind::Play, SHARED_TEXELS + TINY);
+    assert_eq!(r.filled(), 1, "destroyed where it is not allowed");
+    assert!(r.installed(ScreenKind::Result).is_some());
+    r.set_destroy_allowed(true);
+    let from = r.destructions_recorded();
+    play(&mut r, &b, 5);
+    let got: Vec<_> = recorded_since(&r, from)
+        .iter()
+        .map(|x| (x.kind, x.id, x.in_call, x.last_use <= x.seen))
+        .collect();
+    assert_eq!(
+        got,
+        [(ScreenKind::Decision, Some(d.atlas_id()), true, true)]
+    );
+    assert!(!r.take_result_release());
+    assert!(r.installed(ScreenKind::Result).is_some());
+    // One past the limit even without the result: refused, the result
+    // kept.
+    settle(&mut r);
+    let s = tiny(&r, GREEN);
+    commit(&mut r, ScreenKind::Selection, &s, 6);
+    r.state_charge(&s, SHARED_TEXELS);
+    let c = tiny(&r, RED);
+    let e = stage_play(&mut r, &c, 7).unwrap_err();
+    refused(&e, ScreenKind::Play, SHARED_TEXELS + 2 * TINY);
+    assert!(!r.take_result_release());
+    assert!(r.installed(ScreenKind::Result).is_some());
+}
+
+/// V7b's order at the renderer: a candidate takes the filled entries'
+/// charges first, destroyed in its call, the pool kept whole; then the
+/// pool's optional layers, its array owed; and the result's release only
+/// for play, the pool down to its firm layer first.
+// Revert: `reclaim` reducing the pool before destroying filled entries
+// -> the decision candidate that fits once the removed result's entry is
+// destroyed leaves the pool owed.
+#[test]
+fn filled_entries_go_before_the_pool_and_the_pool_before_the_result() {
+    let mut r = offscreen(1_920, 1_080);
+    let dir = tempfile::tempdir().unwrap();
+    let p = tiny(&r, RED);
+    play(&mut r, &p, 1);
+    let s = pool_bundle(&r, dir.path());
+    commit(&mut r, ScreenKind::Selection, &s, 2);
+    let res = tiny(&r, GREEN);
+    commit(&mut r, ScreenKind::Result, &res, 3);
+    settle(&mut r);
+    let sel = r.admission().charge(ScreenKind::Selection);
+    // The result removed, its entry charged two layers; play charged so
+    // that a tiny decision candidate fits with the whole pool beside it,
+    // but not beside the entry.
+    r.state_charge(&res, 2 * LAYER);
+    r.remove(ScreenKind::Result);
+    r.state_charge(&p, SHARED_TEXELS - sel - TINY - 3 * LAYER);
+    let d = tiny(&r, BLUE);
+    commit(&mut r, ScreenKind::Decision, &d, 4);
+    assert_eq!(r.filled(), 0, "the entry destroyed");
+    assert_eq!(r.pool().unwrap().layers, 4, "the pool reduced");
+    assert!(!r.pool_owed());
+    // A result candidate beside them: the pool's optional layers yield.
+    let res2 = tiny(&r, GREEN);
+    commit(&mut r, ScreenKind::Result, &res2, 5);
+    assert_eq!(r.pool(), None);
+    assert!(r.pool_owed());
+    assert_eq!(r.admission().pool, 2 * LAYER, "three layers owed");
+    assert!(!r.take_result_release());
+    // Play past even the firm layer alone: the pool to its firm layer,
+    // then the result released.
+    r.state_charge(&s, SHARED_TEXELS - 2 * TINY - LAYER);
+    let b = tiny(&r, BLUE);
+    play(&mut r, &b, 6);
+    let a = r.admission();
+    assert_eq!((a.firm, a.pool), (LAYER, 0));
+    assert!(r.take_result_release());
+    assert!(r.installed(ScreenKind::Result).is_none());
+}
+
+/// A full list: twelve entries, play's standing one, ten candidates
+/// superseded and the newest staging's own. The next staging destroys the
+/// oldest filled entry in its own call where destruction is allowed, and
+/// is refused where it is not, its request still open and the newest
+/// staging kept.
+// Revert: `reserve_room` refusing whenever no entry is free -> the
+// twelfth staging is refused with destruction allowed.
+#[test]
+fn a_full_list_destroys_its_oldest_entry_in_the_staging_call() {
+    let mut r = offscreen(1_920, 1_080);
+    let mut newest = None;
+    for k in 1..=11_u8 {
+        let b = tiny(&r, [k * 20, 0, 0, 255]);
+        newest = Some(r.install(ScreenKind::Decision, &b, u64::from(k)).unwrap());
+    }
+    assert_eq!(r.filled(), 10);
+    let b = tiny(&r, GREEN);
+    r.set_destroy_allowed(false);
+    let e = r.install(ScreenKind::Decision, &b, 12).unwrap_err();
+    assert!(
+        matches!(
+            e,
+            RenderError::ListFull {
+                kind: ScreenKind::Decision
+            }
+        ),
+        "{e:?}"
+    );
+    assert!(e.is_refusal());
+    assert_eq!(r.staged(), newest, "the newest staging dropped");
+    assert_eq!(r.filled(), 10);
+    r.set_destroy_allowed(true);
+    let from = r.destructions_recorded();
+    let token = r.install(ScreenKind::Decision, &b, 12).unwrap();
+    let got: Vec<_> = recorded_since(&r, from)
+        .iter()
+        .map(|x| (x.in_call, x.last_use <= x.seen))
+        .collect();
+    assert_eq!(got, [(true, true)]);
+    assert_eq!(r.filled(), 10, "the oldest destroyed, the newest filled");
+    assert_eq!(r.staged(), Some(token));
+}
+
+/// V18: a removal always fills its installation's standing entry, with
+/// every other entry filled or reserved and no destruction allowed: the
+/// removed array is never dropped inline, and stays named and charged
+/// until a boundary destroys it.
+// Revert: `retire_standing` dropping inline (`retire_into(None, f)`) ->
+// "the removal dropped inline".
+#[test]
+fn a_removal_fills_its_standing_entry_with_the_list_full() {
+    let mut r = offscreen(1_920, 1_080);
+    let sel = tiny(&r, GREEN);
+    commit(&mut r, ScreenKind::Selection, &sel, 1);
+    r.set_destroy_allowed(false);
+    let mut request = 2_u64;
+    loop {
+        let b = tiny(&r, [u8::try_from(request * 9).unwrap(), 0, 0, 255]);
+        match r.install(ScreenKind::Decision, &b, request) {
+            Ok(_) => request += 1,
+            Err(e) => {
+                assert!(matches!(e, RenderError::ListFull { .. }), "{e:?}");
+                break;
+            }
+        }
+        assert!(request < 20, "the list never filled");
+    }
+    let filled = r.filled();
+    let from = r.destructions_recorded();
+    r.remove(ScreenKind::Selection);
+    assert_eq!(r.filled(), filled + 1, "the removal dropped inline");
+    assert_eq!(
+        r.destructions_recorded(),
+        from,
+        "the removal dropped inline"
+    );
+    assert!(
+        r.retained_atlases(ScreenKind::Selection)
+            .contains(&Some(sel.atlas_id())),
+        "the removed array not named"
+    );
+    r.set_destroy_allowed(true);
+    settle(&mut r);
+    assert!(
+        !r.retained_atlases(ScreenKind::Selection)
+            .contains(&Some(sel.atlas_id()))
+    );
 }

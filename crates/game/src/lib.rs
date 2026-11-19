@@ -100,7 +100,7 @@ pub use keys::{
     LearntRange, Press, ROLES, Refusal, SETTLE_TIME, capture_keys, capture_keys_within,
 };
 pub use live::{
-    AudioReadiness, CLOSE_FLOOR, Closing, ClosingEnd, FINISH_MARGIN, InputWaitError, Leave,
+    AudioReadiness, CLOSE_FLOOR, Closing, ClosingEnd, Cutoff, FINISH_MARGIN, InputWaitError, Leave,
     LiveError, Opening, Outro, PlayEnding, Polled, Rearm, ResultTiming, Rig, closing_deadline,
     closing_time, fade_deadline, finish_point, gated, hold_until,
 };

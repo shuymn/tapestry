@@ -47,6 +47,23 @@ pub fn offscreen(width: u32, height: u32) -> Renderer {
     r
 }
 
+/// Destroys every filled retirement entry the way the owner's boundaries
+/// do: the completion watched, then what is due, one heavy part a round,
+/// until the list holds nothing. Fails after 10 s of rounds.
+pub fn settle(r: &mut Renderer) {
+    let began = std::time::Instant::now();
+    while r.filled() > 0 {
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "{} entries still filled after 10 s",
+            r.filled()
+        );
+        r.poll_completion().expect("poll the completion");
+        let _ = r.destroy_due(true);
+        std::thread::yield_now();
+    }
+}
+
 /// A renderer on WARP ([`offscreen`], [`WIDTH`]×[`HEIGHT`]) with `chart`
 /// loaded and a whole-chart attempt prepared ([`prepare`]), as a play
 /// prepares one before its frames.

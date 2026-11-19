@@ -182,8 +182,12 @@ pub struct ResultReport {
     pub shown: Option<(ViewKey, bool)>,
     /// The view the barrier pinned.
     pub pinned: Option<ViewKey>,
-    /// Every atlas the renderer references for the result kind
-    /// (installed, staged, retired, kept for recovery), each once.
+    /// Every atlas the render side holds for the result kind, each once
+    /// (design.md "Memory Budget", the result's atlas report): the
+    /// committed installation's, the staging's with an array of its own,
+    /// each retirement entry's until its array is destroyed, each handoff
+    /// place's until the worker's release is read, and the one kept to
+    /// restore. An atlas leaves at the pass its last holder goes.
     pub retained: Vec<AtlasId>,
     /// A view whose staging was refused, with why.
     pub refused: Option<(ViewKey, String)>,
@@ -197,6 +201,59 @@ pub struct ResultReport {
     /// decided from
     /// ([`crate::result_skin::kept_probe_fits`]).
     pub menus: u64,
+    /// Development builds: which render-side holders hold each atlas of
+    /// [`retained`](Self::retained), for the no-room line.
+    #[cfg(feature = "dev-tools")]
+    pub holders: Vec<(AtlasId, Holders)>,
+}
+
+/// Which render-side holders hold a result atlas (development builds: the
+/// no-room line, design.md "Memory Budget").
+#[cfg(feature = "dev-tools")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Holders {
+    /// The committed installation.
+    pub committed: bool,
+    /// The staging, or the pages upload in hand.
+    pub staged: bool,
+    /// A retirement entry still holding its pages.
+    pub entry_pages: bool,
+    /// A retirement entry whose pages went to the worker: its array alone.
+    pub entry_array: bool,
+    /// A handoff place, until the worker's release is read.
+    pub place: bool,
+    /// The record kept to restore.
+    pub record: bool,
+}
+
+#[cfg(feature = "dev-tools")]
+impl Holders {
+    /// Whether only retirement entries whose pages left them hold it.
+    pub const fn array_only(&self) -> bool {
+        self.entry_array
+            && !self.committed
+            && !self.staged
+            && !self.entry_pages
+            && !self.place
+            && !self.record
+    }
+
+    /// The holders' names, joined by `+`.
+    pub fn names(&self) -> String {
+        [
+            (self.committed, "committed"),
+            (self.staged, "staged"),
+            (self.entry_pages, "entry"),
+            (self.entry_array, "entry-array"),
+            (self.place, "place"),
+            (self.record, "record"),
+        ]
+        .iter()
+        .filter(|(held, _)| *held)
+        .map(|(_, name)| *name)
+        .collect::<Vec<_>>()
+        .join("+")
+    }
 }
 
 /// `text` cut to the strip's width.

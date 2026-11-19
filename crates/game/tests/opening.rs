@@ -354,6 +354,41 @@ enum Happen {
     Gauge(usize),
 }
 
+/// How a scripted cutoff ends ([`CutoffScript`]).
+#[derive(Clone, Copy, Debug)]
+enum CutoffEnd {
+    /// The render thread acknowledges it.
+    CutOff,
+    /// A renderer dropped under it: the phase lost, with the screen's
+    /// failure latched as the drop latches it.
+    Lost,
+    /// Never acknowledged.
+    Waits,
+}
+
+/// The render side's cutoff, scripted ([`Rig::cutoff`]): every ask is
+/// logged as `cutoff` and answers `Waiting` until its `slices`-th park,
+/// where it ends as `end` and `with` happens; each park moves the clock a
+/// production slice (10 ms).
+#[derive(Clone, Copy, Debug)]
+struct CutoffScript {
+    slices: usize,
+    end: CutoffEnd,
+    with: Option<Happen>,
+    parked: usize,
+}
+
+impl CutoffScript {
+    fn new(slices: usize, end: CutoffEnd, with: Option<Happen>) -> Self {
+        Self {
+            slices,
+            end,
+            with,
+            parked: 0,
+        }
+    }
+}
+
 /// A rig on a virtual clock whose every wait (and every poll of the
 /// preparation) moves it 1 ms, but for the loading state's: those move it
 /// as production's do ([`LoadingRig::loading_wait`],
@@ -416,6 +451,9 @@ struct Loader {
     commit_fails: bool,
     end_loading_waits: usize,
     end_loading_fails: bool,
+    /// The render side's cutoff: unscripted, cut off at once, logging
+    /// nothing.
+    cutoff: Option<CutoffScript>,
     /// The generations asked to close acceptance, by step.
     closes: Vec<(&'static str, u32)>,
     applied: Vec<TuningSnapshot>,
@@ -499,6 +537,7 @@ impl Loader {
             commit_fails: false,
             end_loading_waits: 0,
             end_loading_fails: false,
+            cutoff: None,
             closes: Vec::new(),
             applied: Vec::new(),
             origins: Vec::new(),
@@ -796,6 +835,46 @@ impl Rig for Loader {
             return Err(SurfaceLost);
         }
         Ok(())
+    }
+
+    fn cutoff(&mut self) -> Result<game::Cutoff, SurfaceLost> {
+        let Some(script) = self.cutoff else {
+            return Ok(game::Cutoff::CutOff);
+        };
+        self.step("cutoff");
+        if script.parked < script.slices {
+            return Ok(game::Cutoff::Waiting);
+        }
+        match script.end {
+            CutoffEnd::CutOff => Ok(game::Cutoff::CutOff),
+            CutoffEnd::Lost => Err(SurfaceLost),
+            CutoffEnd::Waits => Ok(game::Cutoff::Waiting),
+        }
+    }
+
+    /// A production slice; the script ends at its last. The wait is
+    /// bounded: a second of slices without leaving fails.
+    fn cutoff_park(&mut self) {
+        let asked = self.times("cutoff").first().copied().unwrap_or(i64::MAX);
+        assert!(
+            self.clock.now().0 < asked.saturating_add(SECOND),
+            "the cutoff's wait did not leave: {:?}",
+            self.log
+        );
+        self.clock.advance(TimeUs(PREP_SLICE_US));
+        self.serve();
+        let script = self.cutoff.as_mut().expect("a park with no cutoff asked");
+        script.parked += 1;
+        if script.parked != script.slices {
+            return;
+        }
+        let (end, with) = (script.end, script.with);
+        if matches!(end, CutoffEnd::Lost) {
+            self.screen_failed = true;
+        }
+        if let Some(what) = with {
+            self.happen(what);
+        }
     }
 
     fn prepare_audio(&mut self) -> Result<game::AudioReadiness, AudioWaitError> {
@@ -2770,6 +2849,122 @@ fn after_end_loading(rig: &Loader) -> Vec<&'static str> {
     let steps = rig.steps();
     let from = steps.iter().position(|&s| s == "end loading").unwrap();
     steps[from..].to_vec()
+}
+
+/// The end of loading's time in these runs: the minimum's end.
+const ENDED: i64 = T0 + SECOND;
+
+/// The cutoff's asks of a wait of `slices` slices, from the end of
+/// loading: one before the first park, then one after each.
+fn cutoff_asks(slices: i64) -> Vec<i64> {
+    (0..=slices).map(|i| ENDED + i * PREP_SLICE_US).collect()
+}
+
+// Revert: the cutoff asked before the end of loading -> the steps put
+// `cutoff` before `end loading`, the order assertion fails. Revert: the
+// last look before the cutoff's wait -> the quit that comes with the
+// cutoff is not looked at and recording opens, fails.
+/// A loading opening waits after the end of loading for the render side's
+/// cutoff, in production slices, and opens once it is cut off, after the
+/// last look: a quit that came with the cutoff leaves there, the
+/// installation committed, tuning reopened.
+#[test]
+fn a_loading_opening_waits_for_the_cutoff_then_looks_last() {
+    for quit in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let mut rig = Loader::new(&loaded);
+        let with = quit.then_some(Happen::Quit);
+        rig.cutoff = Some(CutoffScript::new(3, CutoffEnd::CutOff, with));
+        assert_eq!(run(&mut loaded, &mut rig).unwrap(), Leave::Back, "{quit}");
+        assert_eq!(rig.times("end loading"), [ENDED], "{quit}");
+        assert_eq!(rig.times("cutoff"), cutoff_asks(3), "{quit}");
+        let waited = ["end loading", "cutoff", "cutoff", "cutoff", "cutoff"];
+        if quit {
+            assert_eq!(
+                after_end_loading(&rig),
+                [&waited[..], &["end presentation", "reopen"]].concat()
+            );
+            assert_eq!(rig.count("open"), 0);
+            assert_eq!(rig.count("discard"), 0);
+            assert_eq!(loaded.attempt().number, 0);
+            assert_tuning_open(&mut rig);
+        } else {
+            assert_eq!(
+                after_end_loading(&rig)[..6],
+                [&waited[..], &["open"]].concat()
+            );
+            assert_eq!(rig.opened_at(), ENDED + 3 * PREP_SLICE_US);
+        }
+    }
+}
+
+// Revert: the wait parked until a zero count's wake, with no slice looks
+// -> neither case leaves while the cutoff waits on, and the rig's second
+// of slices fails.
+/// A quit key or a close while the cutoff is waited for leaves the
+/// opening at the next slice's look, before recording opens: the
+/// installation committed, nothing discarded, as at the last look.
+#[test]
+fn a_quit_or_close_while_the_cutoff_waits_leaves_the_opening() {
+    for (case, what, left) in [
+        ("quit key", Happen::Quit, Leave::Back),
+        ("close", Happen::Close, Leave::Quit),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let mut rig = Loader::new(&loaded);
+        rig.cutoff = Some(CutoffScript::new(2, CutoffEnd::Waits, Some(what)));
+        assert_eq!(run(&mut loaded, &mut rig).unwrap(), left, "{case}");
+        assert_eq!(rig.times("cutoff"), cutoff_asks(2), "{case}");
+        assert_eq!(
+            rig.times("end presentation"),
+            [ENDED + 2 * PREP_SLICE_US],
+            "{case}"
+        );
+        assert_eq!(rig.count("open"), 0, "{case}");
+        assert_eq!(rig.count("discard"), 0, "{case}");
+        assert_eq!(loaded.attempt().number, 0, "{case}");
+    }
+}
+
+// Revert: the wait parked until a zero count's wake, with no slice looks
+// -> the failed screen never ends the wait, and the rig's second of
+// slices fails. Revert: the slice's looks before the cutoff's answer ->
+// the lost cutoff ends the run as `ScreenLost`, fails.
+/// A screen lost under the asked cutoff ends the run with the screen's
+/// error, though the drop also latched the screen's failure; a screen
+/// failed while the cutoff waits on ends it as lost at the next slice's
+/// look. Recording never opens, and nothing reopens.
+#[test]
+fn a_lost_or_failed_screen_while_the_cutoff_waits_ends_the_run() {
+    for (case, end, with) in [
+        ("lost", CutoffEnd::Lost, None),
+        ("failed", CutoffEnd::Waits, Some(Happen::ScreenFails)),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut loaded = loaded(dir.path());
+        let mut rig = Loader::new(&loaded);
+        rig.cutoff = Some(CutoffScript::new(2, end, with));
+        let ran = run(&mut loaded, &mut rig);
+        if case == "lost" {
+            assert!(
+                matches!(ran, Err(LiveError::Screen(SurfaceLost))),
+                "{case}: {ran:?}"
+            );
+        } else {
+            assert!(matches!(ran, Err(LiveError::ScreenLost)), "{case}: {ran:?}");
+        }
+        assert_eq!(rig.times("cutoff"), cutoff_asks(2), "{case}");
+        assert_eq!(
+            last_steps(&rig, 2),
+            ["cutoff", "end presentation"],
+            "{case}"
+        );
+        assert_eq!(rig.count("open"), 0, "{case}");
+        assert_eq!(rig.count("reopen"), 0, "{case}");
+        assert_eq!(rig.count("discard"), 0, "{case}");
+    }
 }
 
 /// A18, O-18: an opening deferred by a held START reopens tuning, resumes

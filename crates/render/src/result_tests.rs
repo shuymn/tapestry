@@ -23,15 +23,15 @@ use render::{
     pages_bytes, pages_texels, solid_uv,
 };
 use skin_model::{
-    Align, Anchor, BestView, ClipId, DigitsDef, Ease, ElementDef, End, FileDef, Filter, Fit,
-    FontRef, GlyphSet, ImageDef, KeyDef, LampKey, Layout, NumberDef, Overflow, Pad, Place, RESULT,
-    Region, RegionDef, ResultChart, ResultDefs, ResultFrame, ResultLabels, ResultScore,
+    Align, Anchor, AtlasId, BestView, ClipId, DigitsDef, Ease, ElementDef, End, FileDef, Filter,
+    Fit, FontRef, GlyphSet, ImageDef, KeyDef, LampKey, Layout, NumberDef, Overflow, Pad, Place,
+    RESULT, Region, RegionDef, ResultChart, ResultDefs, ResultFrame, ResultLabels, ResultScore,
     ResultScreen, ResultStatus, ResultTimers, ResultView, Root, Scope, ScreenKind, Side, Skin,
     SkinDef, SolidImageDef, Source, TextDef, TextField, TextValue, TimerRef, Track, Ty, Variant,
     WidgetDefs, compile, result_timer,
 };
 
-use crate::test_common::{GAUGES, attempt, context, offscreen, read_back, rgb_at};
+use crate::test_common::{GAUGES, attempt, context, offscreen, read_back, rgb_at, settle};
 use crate::test_decl::{Look, Text, solid_bundle};
 
 const W: u32 = 1_920;
@@ -47,6 +47,16 @@ const WHITE: [u8; 3] = [255, 255, 255];
 const YELLOW: [u8; 3] = [255, 255, 0];
 /// Where the image bands are read back.
 const A_AT: (u32, u32) = (200, 540);
+
+/// What [`Renderer::retained_atlases`] reports for `kind`: the committed
+/// array's identity, the staging's, and the retirement entries' in the
+/// list's order, empty places left out (the pages upload in hand is none
+/// yet).
+fn kept(r: &Renderer, kind: ScreenKind) -> (Option<AtlasId>, Option<AtlasId>, Vec<AtlasId>) {
+    let [committed, staged, upload, entries @ ..] = r.retained_atlases(kind);
+    assert_eq!(upload, None, "no upload in hand");
+    (committed, staged, entries.into_iter().flatten().collect())
+}
 const B_AT: (u32, u32) = (1_200, 540);
 
 /// What a test skin draws, on the screen timer.
@@ -399,27 +409,43 @@ fn a_layout_on_the_pages_installed_draws_its_own_quads() {
     let drawn = r.submit_result(&[]).unwrap();
     assert_eq!(drawn.sprites, 1 + MAX_SPRITES + 100);
     assert_eq!(drawn.dropped, 0);
+    // A's layout, retired, holds no pages of its own.
     assert_eq!(
-        r.retained_atlases(ScreenKind::Result),
-        [Some(x.a.atlas_id()), None, None]
+        kept(&r, ScreenKind::Result),
+        (Some(x.a.atlas_id()), None, vec![])
     );
     // A bundle on other pages uploads its own array; committed, the one it
-    // replaces is kept until the next staging.
+    // replaces is kept in its retirement entry until its destruction, a
+    // later staging's included.
     let token = r.install(ScreenKind::Result, &x.c, 3).unwrap();
     assert_eq!(r.atlas_uploads(), uploads + 1);
     assert_eq!(
-        r.retained_atlases(ScreenKind::Result),
-        [Some(x.a.atlas_id()), Some(x.c.atlas_id()), None]
+        kept(&r, ScreenKind::Result),
+        (Some(x.a.atlas_id()), Some(x.c.atlas_id()), vec![])
     );
     r.commit(token).unwrap();
     assert_eq!(
-        r.retained_atlases(ScreenKind::Result),
-        [Some(x.c.atlas_id()), None, Some(x.a.atlas_id())]
+        kept(&r, ScreenKind::Result),
+        (Some(x.c.atlas_id()), None, vec![x.a.atlas_id()])
     );
     let mut c = state(&x.c);
     assert_eq!(frame(&mut r, &mut c), (R3, BLACK));
     let _token = r.install(ScreenKind::Result, &x.a, 4).unwrap();
-    assert_eq!(r.retained_atlases(ScreenKind::Result)[2], None, "dropped");
+    assert_eq!(
+        kept(&r, ScreenKind::Result),
+        (
+            Some(x.c.atlas_id()),
+            Some(x.a.atlas_id()),
+            vec![x.a.atlas_id()]
+        ),
+        "kept past the next staging"
+    );
+    settle(&mut r);
+    assert_eq!(
+        kept(&r, ScreenKind::Result),
+        (Some(x.c.atlas_id()), Some(x.a.atlas_id()), vec![]),
+        "destroyed"
+    );
 }
 
 /// C2's renderer half: of several stagings on the same pages, only the
@@ -561,7 +587,8 @@ fn an_upload_times_itself_once() {
     assert!(r.take_upload_timing().is_none(), "installed: no upload");
     r.commit(token).unwrap();
     r.remove(ScreenKind::Result);
-    assert_eq!(r.retained_atlases(ScreenKind::Result), [None; 3]);
+    // Its array kept in its entry; nothing committed or staged.
+    assert_eq!(kept(&r, ScreenKind::Result), (None, None, vec![pages.id()]));
     let token = r.install_pages(ScreenKind::Result, pages, 3).unwrap();
     assert!(r.take_upload_timing().is_some(), "cold: uploaded again");
     r.commit(token).unwrap();
@@ -740,8 +767,8 @@ fn loading_bytes(b: &Arc<SkinBundle>) -> u64 {
 /// and committed: shared pages counted
 /// once wherever they are held, with `shared_bytes` keeping the array
 /// whatever holder comes first, each bundle's own bytes in one term, a
-/// committed layout counted, and what a commit replaced kept until the
-/// next staging.
+/// committed layout counted, and what a commit replaced kept in its
+/// retirement entry, counted in `retired`, until its destruction.
 #[test]
 fn the_witness_counts_every_result_term_once() {
     let mut r = offscreen(W, H);
@@ -794,8 +821,8 @@ fn the_witness_counts_every_result_term_once() {
     let token = r.install(ScreenKind::Result, &x.b, 3).unwrap();
     assert_eq!(r.memory(), committed);
     r.commit(token).unwrap();
-    // A on the same pages replacing B: B's layout is kept until the next
-    // staging, its installation gone.
+    // A on the same pages replacing B: B's layout is kept until its
+    // entry's destruction, its installation gone.
     let token = r.install(ScreenKind::Result, &x.a, 4).unwrap();
     r.commit(token).unwrap();
     let committed = MemoryWitness {
@@ -811,8 +838,9 @@ fn the_witness_counts_every_result_term_once() {
             ..committed
         }
     );
-    // C on its own pages: its array and pages too; committed, A's whole
-    // installation is kept until the next staging.
+    // C on its own pages: its array and pages too, B's layout still kept;
+    // committed, A's whole installation is kept beside it, its loading
+    // presentation with the result's.
     let token = r.install(ScreenKind::Result, &x.c, 5).unwrap();
     let m = r.memory();
     let c_array = r.shared_bytes(x.c.atlas_id()) - x.c.shared_bytes();
@@ -826,6 +854,7 @@ fn the_witness_counts_every_result_term_once() {
             upload: m.upload,
             staged_batch: layout_bytes(&x.c),
             staged_loading: loading_bytes(&x.c),
+            retired: layout_bytes(&x.b),
             ..committed
         }
     );
@@ -838,15 +867,18 @@ fn the_witness_counts_every_result_term_once() {
             result_batch: layout_bytes(&x.c),
             result_atlas: c_array,
             result_loading: loading_bytes(&x.c) + loading_bytes(&x.a),
-            retired: array + layout_bytes(&x.a) + x.a.resident_bytes(),
+            retired: array + layout_bytes(&x.a) + x.a.resident_bytes() + layout_bytes(&x.b),
             ..base
         }
     );
     let token = r.install(ScreenKind::Result, &x.c, 6).unwrap();
     r.commit(token).unwrap();
-    assert_eq!(r.memory().retired, 0, "kept past the next staging");
-    assert_eq!(r.memory().shared_cpu, x.c.shared_bytes());
-    assert_eq!(r.memory().result_loading, loading_bytes(&x.c));
+    assert!(r.memory().retired > 0, "kept past the next staging");
+    settle(&mut r);
+    let m = r.memory();
+    assert_eq!(m.retired, 0, "destroyed");
+    assert_eq!(m.shared_cpu, x.c.shared_bytes());
+    assert_eq!(m.result_loading, loading_bytes(&x.c));
 }
 
 /// A text producer holding the default font's bytes and nothing else.
@@ -875,14 +907,16 @@ impl AttemptText for WithFont {
     }
 }
 
-/// S10-09i Q3's handshake on the renderer's side: a commit on another
-/// array keeps the array it replaced, reported as retained, its default
-/// font still witnessed, until the owner drains it outside the commit
-/// point; the drain returns the released identity once, then the renderer
-/// retains only what draws, so another atlas build can be considered. A
-/// same-array replacement drains no array.
+/// S10-09i Q3's handshake on the renderer's side, through the retirement
+/// list: a commit on another array keeps the array it replaced in its
+/// entry, reported as retained, its default font still witnessed; its CPU
+/// part is handed on once its last use is seen, the entry keeping its
+/// identity, and the array is destroyed at a boundary, after which the
+/// renderer retains only what draws, so another atlas build can be
+/// considered. Each change moves the result's counter. A same-array
+/// replacement's layout is destroyed without the heavy operation.
 #[test]
-fn a_drain_releases_the_retired_array_outside_the_commit() {
+fn a_replaced_array_stays_in_its_entry_until_its_destruction() {
     let mut r = offscreen(W, H);
     let x = bundles(&r);
     let dir = tempfile::tempdir().unwrap();
@@ -911,29 +945,75 @@ fn a_drain_releases_the_retired_array_outside_the_commit() {
     r.commit(token).unwrap();
     assert_eq!(r.memory().default_font, 4_096);
     // Replaced by a producer-free bundle on another array.
+    let changes = r.result_changes();
     let token = r.install(ScreenKind::Result, &x.c, 2).unwrap();
     r.commit(token).unwrap();
+    assert_eq!(r.result_changes(), changes + 1, "the fill");
+    assert_eq!(r.filled(), 1);
     assert_eq!(
-        r.retained_atlases(ScreenKind::Result),
-        [Some(x.c.atlas_id()), None, Some(fonted.atlas_id())]
+        kept(&r, ScreenKind::Result),
+        (Some(x.c.atlas_id()), None, vec![fonted.atlas_id()])
     );
     assert_eq!(r.memory().default_font, 4_096, "the retired font left out");
-    // The owner drains it: released once, then only what draws is kept.
-    assert_eq!(r.drain_retired(), Some(fonted.atlas_id()));
-    assert_eq!(r.drain_retired(), None);
+    // Its CPU part handed on: the entry keeps its identity and its array.
+    r.poll_completion().unwrap();
+    let h = r.take_handoff().expect("a due CPU part");
+    assert_eq!(r.result_changes(), changes + 2, "the handoff");
     assert_eq!(
-        r.retained_atlases(ScreenKind::Result),
-        [Some(x.c.atlas_id()), None, None]
+        (h.id, h.kind),
+        (Some(fonted.atlas_id()), ScreenKind::Result)
+    );
+    assert_eq!(h.bytes, fonted.shared_bytes());
+    assert!(r.take_handoff().is_none(), "taken once");
+    assert_eq!(
+        kept(&r, ScreenKind::Result),
+        (Some(x.c.atlas_id()), None, vec![fonted.atlas_id()])
+    );
+    let handed = [(fonted.atlas_id(), h.bytes)];
+    assert_eq!(
+        r.memory_with(None, &handed).shared_cpu,
+        r.memory().shared_cpu + h.bytes,
+        "the handed pages counted once"
+    );
+    assert_eq!(
+        r.memory_with(None, &[handed[0], handed[0]]).shared_cpu,
+        r.memory_with(None, &handed).shared_cpu,
+        "the handed pages counted twice"
+    );
+    drop(h);
+    // Destroyed at a boundary: the heavy part, the CPU part already gone.
+    assert_eq!(r.destroy_due(false).heavy, None, "no heavy operation free");
+    let d = r.destroy_due(true).heavy.expect("the array destroyed");
+    assert_eq!(
+        (d.kind, d.id, d.part, d.cpu_dropped, d.freed),
+        (
+            ScreenKind::Result,
+            Some(fonted.atlas_id()),
+            render::Part::Array,
+            false,
+            true
+        )
+    );
+    assert_eq!(r.result_changes(), changes + 3, "the destruction");
+    assert_eq!(r.filled(), 0);
+    assert_eq!(
+        kept(&r, ScreenKind::Result),
+        (Some(x.c.atlas_id()), None, vec![])
     );
     let m = r.memory();
     assert_eq!((m.retired, m.default_font), (0, 0));
-    // A layout replaced on the same array releases no array.
+    // A layout replaced on the same array: a light entry, destroyed with
+    // no heavy operation.
     let token = r.install(ScreenKind::Result, &x.a, 3).unwrap();
     r.commit(token).unwrap();
+    settle(&mut r);
     let token = r.install(ScreenKind::Result, &x.b, 4).unwrap();
     r.commit(token).unwrap();
     assert!(r.memory().retired > 0);
-    assert_eq!(r.drain_retired(), None);
+    let heavy = r.heavy_ops().count;
+    let d = r.destroy_due(false);
+    assert_eq!((d.heavy, d.light), (None, 1));
+    assert_eq!(r.heavy_ops().count, heavy);
     assert_eq!(r.memory().retired, 0);
 }
 
@@ -1157,4 +1237,79 @@ fn result_chart_images_are_written_into_the_staged_array() {
         .unwrap();
     sb.set_chart_images(t4);
     assert_eq!(rgb_at(&pixels(&mut r, &mut sb, &[]), W, A_AT), GREEN_PX);
+}
+
+/// V18b, the renderer's places: every result atlas a render-side owner
+/// holds is named in `retained_atlases` until its last holder goes: a
+/// pages-only installation replaced by a view's union commit (its array in
+/// the standing entry), `disable_result` with a staging in hand (the
+/// installation and the staging each in an entry), and play's admission
+/// releasing the result (R5, the standing entry); each gone once
+/// destroyed.
+// Revert: a dropped staging's entry naming nothing (`bundle_id` read as
+// `None` in `retire_candidate`) -> "the staging's atlas not named".
+#[test]
+fn every_result_holder_is_named_until_its_destruction() {
+    let mut r = offscreen(W, H);
+    let x = bundles(&r);
+    let token = r
+        .install_pages(ScreenKind::Result, x.a.atlas_pages(), 1)
+        .unwrap();
+    r.commit(token).unwrap();
+    assert_eq!(
+        kept(&r, ScreenKind::Result),
+        (Some(x.a.atlas_id()), None, vec![])
+    );
+    // A view's union on other pages replaces the pages-only installation.
+    let token = r.install(ScreenKind::Result, &x.c, 2).unwrap();
+    assert_eq!(
+        kept(&r, ScreenKind::Result).1,
+        Some(x.c.atlas_id()),
+        "the staging not named"
+    );
+    r.commit(token).unwrap();
+    assert_eq!(
+        kept(&r, ScreenKind::Result),
+        (Some(x.c.atlas_id()), None, vec![x.a.atlas_id()])
+    );
+    settle(&mut r);
+    assert_eq!(
+        kept(&r, ScreenKind::Result),
+        (Some(x.c.atlas_id()), None, vec![])
+    );
+    // Disabled with a staging in hand: both in entries.
+    let _staged = r.install(ScreenKind::Result, &x.a, 3).unwrap();
+    r.disable_result();
+    let (committed, staged, mut entries) = kept(&r, ScreenKind::Result);
+    assert_eq!((committed, staged), (None, None));
+    entries.sort_unstable();
+    let mut want = vec![x.a.atlas_id(), x.c.atlas_id()];
+    want.sort_unstable();
+    assert_eq!(entries, want, "the staging's atlas not named");
+    settle(&mut r);
+    assert_eq!(kept(&r, ScreenKind::Result), (None, None, vec![]));
+    // R5: play's admission releases the result into its standing entry.
+    let mut r = offscreen(W, H);
+    let play = solid_bundle(&r, &Look::left(GREEN), [16, 16]);
+    let token = r.install(ScreenKind::Result, &x.c, 1).unwrap();
+    r.commit(token).unwrap();
+    r.state_charge(&x.c, SHARED_TEXELS - play.atlas_texels() + 1);
+    let chart = ChartBuilder::new(120_000).build().unwrap();
+    let ctx = context(&GAUGES, false);
+    let from = r.destructions_recorded();
+    let _token = r.stage(&play, &attempt(&r, &chart, &ctx), 2).unwrap();
+    assert!(r.take_result_release());
+    assert!(r.result_bundle().is_none(), "the result is released");
+    // Released into its entry, which the staging's admission destroyed in
+    // its call (2a): never dropped unrecorded.
+    let n = r.destructions_recorded() - from;
+    let all: Vec<_> = r.destructions().copied().collect();
+    assert!(
+        all[all.len() - n..]
+            .iter()
+            .any(|d| d.id == Some(x.c.atlas_id()) && d.kind == ScreenKind::Result),
+        "the released result not in an entry"
+    );
+    settle(&mut r);
+    assert_eq!(kept(&r, ScreenKind::Result), (None, None, vec![]));
 }

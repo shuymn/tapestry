@@ -1,8 +1,8 @@
 //! The transition probe's render-side marks (dev-tools only; #611): upload
-//! phases, inline drops, first use, chart-image and text figures, forwarded
-//! to the sink the player registers when `TAPESTRY_LOOP_PROBE` is set, so
-//! they share the player's time base. Without a sink nothing is marked or
-//! read. Nothing here waits for or reorders work, and a mark allocates
+//! phases, retired arrays' destruction, first use, chart-image and text
+//! figures, forwarded to the sink the player registers when
+//! `TAPESTRY_LOOP_PROBE` is set, so they share the player's time base.
+//! Without a sink nothing is marked or read. Nothing here waits for or reorders work, and a mark allocates
 //! nothing (the sink's buffer is reserved before it is registered).
 //!
 //! These marks are diagnostic: each names its event, and its interval is
@@ -13,12 +13,15 @@
 //! (marks, memory readings, keys, callbacks armed: [`own`]) is left out, so
 //! a figure is what the work it names took, nested spans included.
 //!
-//! A timed drop (`dr:*_us`, `rel:*_us`) is the drop of the handle it
-//! names: wgpu frees an array when its last handle (often a bind group) is
-//! dropped and no submitted work uses it, at the device's next maintenance
-//! (a submit), which the probe does not force. The readings after a drop
-//! (`dr:l1`, `rel:l1`) can therefore show memory still held; the next
-//! frames' readings (`pd:*`) show it freed.
+//! A timed drop (`dr:*_us`) is one retirement entry's part destroyed, at
+//! a frame boundary (`dr:site` 1) or in a staging's call (2): wgpu frees
+//! an array when its last handle (often a bind group) is dropped and no
+//! submitted work uses it, at the device's next maintenance (a submit),
+//! which the probe does not force. The readings after a drop (`dr:l1`)
+//! can therefore show memory still held; the next frames' readings
+//! (`pd:*`) show it freed. A release (`rel:*_us`) drops nothing: it times
+//! taking each handle and retiring it into its entry, whose destruction
+//! is marked later as a drop.
 
 #![deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 
