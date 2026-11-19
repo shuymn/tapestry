@@ -34,8 +34,8 @@
 //! stores, the standard publication pattern, and are not explored here.
 //!
 //! A control breaks the hand-over of runs: a worker that publishes a frame
-//! of an earlier run after one of a later run. The checker finds the fault
-//! that review r2 found by hand.
+//! of an earlier run after one of a later run. The checker must find the
+//! sequence fault that frame causes.
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
@@ -814,7 +814,7 @@ fn ring_cooperating_writer_plays_in_order_in_every_interleaving() {
         "the enumeration reaches every kind of interleaving: {reached:?}"
     );
 
-    // The control: the hand-over of runs broken, as review r2 found.
+    // The control: a worker that breaks the hand-over of runs.
     let (fault, choices) = explore(&BREACH).expect_err("a breach of the hand-over faults");
     assert!(
         matches!(fault, Fault::Sequence { .. }),

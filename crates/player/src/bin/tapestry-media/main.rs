@@ -80,10 +80,12 @@ pub fn say(line: &str) {
 }
 
 impl Out {
-    /// Writes `reply` as one frame. A pipe the game no longer reads ends
-    /// the worker: it has nobody to decode for.
+    /// Writes `reply` as one frame (every reply's encoding fits one). A
+    /// pipe the game no longer reads ends the worker: it has nobody to
+    /// decode for.
     pub fn send(&self, reply: &Reply) {
         let Some(bytes) = control::frame(&reply.encode()) else {
+            say("tapestry-media: a reply that does not fit a frame");
             return;
         };
         let written = match self.0.lock() {
@@ -110,9 +112,13 @@ pub enum ToPlayer {
 }
 
 /// Answers the game's launch with the hello on the control pipe, to which
-/// diagnostics go from then on: the pipe.
+/// diagnostics go from then on: the pipe. A worker whose hooks in FFmpeg
+/// cannot be set ends instead, before it answers.
 fn hello(max_alloc: usize) -> Out {
-    ffmpeg::init(max_alloc);
+    if let Err(e) = ffmpeg::init(max_alloc) {
+        say(&format!("tapestry-media: FFmpeg's hooks: {e}"));
+        std::process::exit(1);
+    }
     let out = OUT.get_or_init(|| Out(Arc::new(Mutex::new(std::io::stdout()))));
     let (version, configuration) = ffmpeg::version();
     out.send(&Reply::Hello {
@@ -156,6 +162,8 @@ fn serve(max_alloc: usize) -> ExitCode {
                 }
                 let (tx, rx) = mpsc::channel();
                 let thread_out = out.clone();
+                // The thread owns the handle: one that does not start closes
+                // it with its closure.
                 let source = os::Source::taken(file);
                 let spawned = std::thread::Builder::new()
                     .name(format!("player {player}"))

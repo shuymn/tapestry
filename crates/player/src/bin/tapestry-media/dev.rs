@@ -12,6 +12,9 @@
 //!   playlist or a reference would make it.
 //! - `--dev-max-alloc <bytes>`: serves the control pipe with FFmpeg's
 //!   largest allocation lowered to `bytes`.
+//! - `--dev-no-codec-list`: serves the control pipe with FFmpeg's codec
+//!   whitelist left unset at every open, as an allocation refused while it
+//!   is set would leave it.
 //! - `--dev-probe <probe>…`: answers the hello, then tries what the
 //!   sandbox denies the worker and what it leaves it ([`probe`]).
 //! - `--dev-silent <ms>`: waits `ms` milliseconds without answering the
@@ -47,6 +50,15 @@ pub fn run(args: &[OsString]) -> Option<ExitCode> {
         }
         "--dev-gen-clip" => gen_clip(rest),
         "--dev-secondary-open" => secondary_open(rest),
+        "--dev-no-codec-list" => {
+            return Some(match rest {
+                [] => {
+                    ffmpeg::leave_codec_list_unset();
+                    crate::serve(ffmpeg::MAX_ALLOC)
+                }
+                _ => usage("--dev-no-codec-list"),
+            });
+        }
         "--dev-max-alloc" => {
             return Some(match rest {
                 [bytes] => match bytes.parse() {
