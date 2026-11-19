@@ -2,9 +2,11 @@
 //! Commands"): the host side of the test input device, Windows-only and in
 //! `player` for its Win32 access. `devices` finds it and checks its shape,
 //! `flash` loads its firmware and `bootsel` puts it into its boot ROM's
-//! drive, both on the USB location they are given, and `trace` holds its
-//! link passively.
+//! drive, both on the USB location they are given, `trace` holds its
+//! link passively, and `check` applies the verdict contract to a run's
+//! files.
 
+mod check;
 mod devices;
 mod flash;
 mod link;
@@ -20,7 +22,7 @@ use crate::args::{Command, UsageError};
 const USAGE: &str = "usage: tapestry test-device devices [--out <json>] \
 | flash <uf2> --build <id> --port <location> \
 | bootsel --port <location> \
-| trace --out <jsonl> --build <id> [--port <location>] [--ping-ms <ms>] [--no-trace] [--framing-probe]";
+| trace --out <jsonl> --build <id> [--port <location>] [--ping-ms <ms>] [--no-trace] [--framing-probe] | check <row> <dir>";
 
 /// A `test-device` command.
 #[derive(Debug, PartialEq, Eq)]
@@ -38,6 +40,11 @@ pub enum TestDevice {
         port: String,
     },
     Trace(trace::Args),
+    /// The contract for the run, set or outer run in `dir`.
+    Check {
+        row: String,
+        dir: PathBuf,
+    },
 }
 
 fn usage() -> UsageError {
@@ -67,7 +74,7 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
     let mut framing_probe = false;
     while let Some(arg) = p.next()? {
         match (cmd.as_str(), arg) {
-            ("flash", Arg::Value(v)) => values.push(PathBuf::from(v)),
+            ("flash" | "check", Arg::Value(v)) => values.push(PathBuf::from(v)),
             ("devices" | "trace", Arg::Long("out")) => out = Some(PathBuf::from(p.value()?)),
             ("flash" | "trace", Arg::Long("build")) => build = Some(text(p)?),
             ("flash" | "bootsel" | "trace", Arg::Long("port")) => port = Some(text(p)?),
@@ -91,6 +98,14 @@ pub fn args(p: &mut lexopt::Parser) -> Result<Command, UsageError> {
         },
         "bootsel" => TestDevice::Bootsel {
             port: port.ok_or_else(usage)?,
+        },
+        "check" => TestDevice::Check {
+            row: values
+                .next()
+                .ok_or_else(usage)?
+                .to_string_lossy()
+                .into_owned(),
+            dir: values.next().ok_or_else(usage)?,
         },
         "trace" => TestDevice::Trace(trace::Args {
             out: out.ok_or_else(usage)?,
@@ -119,6 +134,7 @@ pub fn run(t: TestDevice) -> anyhow::Result<()> {
         TestDevice::Flash { uf2, build, port } => flash::flash(&uf2, &build, &port),
         TestDevice::Bootsel { port } => flash::bootsel(&port),
         TestDevice::Trace(a) => trace::trace(&a),
+        TestDevice::Check { row, dir } => check::check(&row, &dir),
     }
 }
 
@@ -194,6 +210,18 @@ mod tests {
         assert_eq!(
             parsed(&["flash", "a.uf2", "b.uf2", "--build", "b", "--port", "L"]).unwrap_err(),
             UsageError::Unknown("b.uf2".to_owned())
+        );
+        assert_eq!(
+            parsed(&["check", "sink", "runs/a"]).unwrap(),
+            TestDevice::Check {
+                row: "sink".to_owned(),
+                dir: PathBuf::from("runs/a"),
+            }
+        );
+        assert_eq!(parsed(&["check", "sink"]).unwrap_err(), usage());
+        assert_eq!(
+            parsed(&["check", "sink", "a", "b"]).unwrap_err(),
+            UsageError::Unknown("b".to_owned())
         );
         assert_eq!(parsed(&["jump"]).unwrap_err(), usage());
         assert_eq!(parsed(&[]).unwrap_err(), usage());
