@@ -79,6 +79,17 @@ impl PendingResult {
 pub struct ImageEntry {
     atlas: Atlas,
     packed: Sheet,
+    /// Whether the import it was laid out from had a permit, its runtime
+    /// kept (the transition probe's `dev: probe-miss`).
+    #[cfg(feature = "dev-tools")]
+    import_permit: bool,
+}
+
+#[cfg(feature = "dev-tools")]
+thread_local! {
+    /// Whether the import [`lay_out`] runs on, on this job's thread, had a
+    /// permit: set by [`layout`] (the transition probe's `dev: probe-miss`).
+    static IMPORT_PERMIT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 impl ImageEntry {
@@ -597,6 +608,8 @@ fn layout(
             );
         }
     };
+    #[cfg(feature = "dev-tools")]
+    IMPORT_PERMIT.set(permit.is_some());
     let script = ScriptSlot::staged_with(imported.runtime.take(), permit);
     let mut laid = lay_out(pending, imported, slot, base, others, cancel);
     // A chart slot the result half does not fit: the images derived from
@@ -624,6 +637,47 @@ fn layout(
     (laid, script)
 }
 
+/// The transition probe's `dev: probe-miss` line, for a layout of `sheet`
+/// under `variant` and `kept` that the image entry `e` does not hold: the
+/// refusal of the entry's rebind (its pages' variant, kept layers or skin
+/// folder; a file not held; a cell not held), the entry's variant, kept
+/// layers and folder against the layout's, whether the entry's import and
+/// the layout's had a permit, and the layout's cells the entry lacks by
+/// name and rectangle: a file rewritten with the same cells is refused as
+/// `missing-file` with none of them missing, the refusal comparing the
+/// file's version as well.
+#[cfg(feature = "dev-tools")]
+fn probe_miss(e: &ImageEntry, sheet: &Sheet, variant: Variant, kept: skin_model::KeptLayers) {
+    let pages = e.atlas.shared_pages();
+    let refusal = match pages.not_held_why(sheet, variant, kept) {
+        None => "none".to_owned(),
+        Some(skin_model::NotHeldWhy::Header {
+            variant,
+            kept,
+            root,
+        }) => format!("header (variant {variant}, kept {kept}, root {root})"),
+        Some(skin_model::NotHeldWhy::File(name)) => format!("missing-file {name:?}"),
+        Some(skin_model::NotHeldWhy::Cell(name, rect)) => {
+            format!("missing-cell {name:?} {rect:?}")
+        }
+        Some(skin_model::NotHeldWhy::Sheet) => "sheet".to_owned(),
+    };
+    let have: std::collections::BTreeSet<_> = e.packed.survey_cells(variant).into_iter().collect();
+    let cells = sheet.survey_cells(variant);
+    let miss: Vec<_> = cells.iter().filter(|c| !have.contains(*c)).collect();
+    println!(
+        "dev: probe-miss refusal {refusal}; layout variant {variant:?} kept {kept:?} import-permit {}; entry variant {:?} kept {:?} root {:?} import-permit {}; layout cells {} entry cells {} missing by name and rectangle {} {miss:?}",
+        IMPORT_PERMIT.get(),
+        pages.variant(),
+        pages.kept(),
+        pages.root(),
+        e.import_permit,
+        cells.len(),
+        have.len(),
+        miss.len()
+    );
+}
+
 /// [`layout`]'s atlas step and bundle, from its import `imported`.
 #[expect(clippy::needless_pass_by_value, reason = "the job owns its inputs")]
 fn lay_out(
@@ -643,8 +697,52 @@ fn lay_out(
     let held = entry
         .as_ref()
         .and_then(|e| e.atlas.rebind_keeping(skin.sheet(), variant, kept).ok());
+    #[cfg(feature = "dev-tools")]
+    {
+        crate::dev::loop_probe::mark("rl:had_entry", i64::from(entry.is_some()));
+        crate::dev::loop_probe::mark("rl:rebind_held", i64::from(held.is_some()));
+        if crate::dev::loop_probe::on()
+            && held.is_none()
+            && let Some(e) = &entry
+        {
+            probe_miss(e, skin.sheet(), variant, kept);
+        }
+        if crate::dev::loop_probe::on() {
+            // The layout's own cells, as one atlas (no file read).
+            match skin
+                .sheet()
+                .plan_shape(variant, pending.target.limits, kept)
+            {
+                Ok(sh) => {
+                    crate::dev::loop_probe::mark("rl:own_plan_pages", i64::from(sh.pages));
+                    crate::dev::loop_probe::mark("rl:own_plan_side", i64::from(sh.side));
+                    crate::dev::loop_probe::mark("rl:own_plan_layers", i64::from(sh.layers));
+                    crate::dev::loop_probe::mark(
+                        "rl:own_plan_texels",
+                        i64::try_from(sh.texels).unwrap_or(-1),
+                    );
+                }
+                Err(_) => crate::dev::loop_probe::mark("rl:own_plan_pages", -1),
+            }
+        }
+    }
     let (atlas, entry, taken) = match held {
-        Some(atlas) => (atlas, entry, None),
+        Some(atlas) => {
+            #[cfg(feature = "dev-tools")]
+            {
+                let pages = atlas.shared_pages();
+                crate::dev::loop_probe::mark(
+                    "rl:held_pages",
+                    i64::try_from(pages.pages().len()).unwrap_or(-1),
+                );
+                crate::dev::loop_probe::mark("rl:held_side", i64::from(pages.side()));
+                crate::dev::loop_probe::mark(
+                    "rl:held_level_bytes",
+                    crate::dev::loop_probe::pages_level_bytes(pages),
+                );
+            }
+            (atlas, entry, None)
+        }
         None => {
             drop(entry);
             let limits = pending.target.limits;
@@ -668,11 +766,19 @@ fn lay_out(
                     .filter(|_| earlier)
                     .filter(|u| u.plan_keeping(variant, limits, kept).is_ok())
                 {
-                    Some(u) => u,
+                    Some(u) => {
+                        #[cfg(feature = "dev-tools")]
+                        crate::dev::loop_probe::mark("rl:branch_union", 1);
+                        u
+                    }
                     None if skin.sheet().plan_keeping(variant, limits, kept).is_ok() => {
+                        #[cfg(feature = "dev-tools")]
+                        crate::dev::loop_probe::mark("rl:branch_own", i64::from(earlier));
                         skin.sheet().clone()
                     }
                     None => {
+                        #[cfg(feature = "dev-tools")]
+                        crate::dev::loop_probe::mark("rl:branch_refused", 1);
                         return Laid::refused(
                             "the layout's images do not fit one atlas".to_owned(),
                         );
@@ -697,9 +803,30 @@ fn lay_out(
             tests::build_gate(cancel);
             #[cfg(any(test, feature = "dev-tools"))]
             BUILDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            #[cfg(feature = "dev-tools")]
+            let p_t = render::probe::Span::start();
             let built = match packed.atlas_keeping(variant, limits, kept, &|| cancel.is_cancelled())
             {
-                Ok(a) => a,
+                Ok(a) => {
+                    #[cfg(feature = "dev-tools")]
+                    {
+                        crate::dev::loop_probe::mark(
+                            "rl:build_us",
+                            crate::dev::loop_probe::us(p_t.elapsed()),
+                        );
+                        let pages = a.shared_pages();
+                        crate::dev::loop_probe::mark(
+                            "rl:packed_pages",
+                            i64::try_from(pages.pages().len()).unwrap_or(-1),
+                        );
+                        crate::dev::loop_probe::mark("rl:packed_side", i64::from(pages.side()));
+                        crate::dev::loop_probe::mark(
+                            "rl:packed_level_bytes",
+                            crate::dev::loop_probe::pages_level_bytes(pages),
+                        );
+                    }
+                    a
+                }
                 Err(e) => {
                     return Laid {
                         result: Err(format!("the atlas cannot be built: {e}").into()),
@@ -714,6 +841,8 @@ fn lay_out(
             let new = Arc::new(ImageEntry {
                 atlas: built,
                 packed,
+                #[cfg(feature = "dev-tools")]
+                import_permit: IMPORT_PERMIT.get(),
             });
             let taken = Some(Images {
                 entry: Some(Arc::clone(&new)),
@@ -1072,6 +1201,16 @@ impl ResultSkin {
     ) -> ImageStage {
         self.chart = Some(chart);
         self.class = Some(class);
+        #[cfg(feature = "dev-tools")]
+        {
+            crate::dev::loop_probe::mark(
+                "img:begin",
+                i64::from(self.probe.is_some()) | (i64::from(self.image.is_some()) << 1),
+            );
+            if crate::dev::loop_probe::on() {
+                println!("dev: probe-chart {chart:?} class {class:?}");
+            }
+        }
         let pending = match &self.start {
             None => return ImageStage::Ready(Staged::Ready),
             Some(ResultStart::Fixed(b, script)) => {
@@ -1081,7 +1220,28 @@ impl ResultSkin {
             Some(ResultStart::Pending(p)) => Arc::clone(p),
         };
         let facts = result_facts(probe_fields(chart), self.class);
+        #[cfg(feature = "dev-tools")]
+        if crate::dev::loop_probe::on()
+            && let (Some((d, n)), Some(e)) = (&self.probe, &self.image)
+        {
+            crate::dev::loop_probe::mark("img:deps_hold", i64::from(d.holds(&facts)));
+            crate::dev::loop_probe::mark("img:cells_held", i64::from(n.held_by(e)));
+            for r in &d.reads {
+                let one = FactDeps {
+                    scene: d.scene,
+                    reads: vec![*r],
+                };
+                if !one.holds(&facts) {
+                    println!("dev: probe-facts differs {r:?}");
+                }
+            }
+        }
         if let Some(reused) = self.reuse_for_attempt(&facts) {
+            #[cfg(feature = "dev-tools")]
+            crate::dev::loop_probe::mark(
+                "img:reused",
+                i64::from(matches!(&reused, ForAttempt::Every(..))),
+            );
             self.attempt = Some(reused);
             return ImageStage::Ready(Staged::Ready);
         }
@@ -1111,6 +1271,16 @@ impl ResultSkin {
                 Err(refused) => refused.1.clone(),
             };
             let read = reads_result(&deps);
+            #[cfg(feature = "dev-tools")]
+            {
+                crate::dev::loop_probe::mark(
+                    "img:import_end",
+                    i64::try_from(deps.reads.len()).unwrap_or(-1),
+                );
+                if crate::dev::loop_probe::on() {
+                    println!("dev: probe-facts reads_view={read} {deps:?}");
+                }
+            }
             match o {
                 Ok(LuaOutcome::Imported(mut i)) if !read => {
                     let script = ScriptSlot::staged_with(i.runtime.take(), permit);
@@ -1312,6 +1482,16 @@ impl ResultSkin {
     /// or the request waits, replacing the one waiting (D11, "Requests").
     /// Returns the request.
     pub fn request(&mut self, view: ViewFacts) -> u64 {
+        #[cfg(feature = "dev-tools")]
+        if crate::dev::loop_probe::on() {
+            match &view.0 {
+                Some(f) => println!(
+                    "dev: probe-view {}",
+                    f.0.iter().map(i32::to_string).collect::<Vec<_>>().join(" ")
+                ),
+                None => println!("dev: probe-view unavailable"),
+            }
+        }
         self.next_request += 1;
         let request = self.next_request;
         self.latest = Some((request, view));

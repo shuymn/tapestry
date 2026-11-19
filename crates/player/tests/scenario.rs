@@ -630,6 +630,41 @@ fn a_skip_after_completion_lands_on_the_result() {
     assert!(!lines(&stdout, "result: viewing ").is_empty(), "{stdout}");
 }
 
+/// With the transition probe on (`TAPESTRY_LOOP_PROBE`), a scenario
+/// prints its marks once, before its transition record.
+#[test]
+fn a_scenario_prints_the_transition_probes_marks_once() {
+    let fx = Fixture::new();
+    write_tail_chart(&fx.library());
+    let (out, stdout, stderr) = fx.output(
+        fx.command(&scenario(&[
+            "select = { path = \"library/tail/tail.bms\" }",
+            "play = { input = \"auto\", until = \"end\" }",
+            "result = \"back\"",
+            "quit = {}",
+        ]))
+        .env("TAPESTRY_LOOP_PROBE", "1"),
+    );
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let at = |prefix: &str| -> Vec<usize> {
+        stdout
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.starts_with(prefix))
+            .map(|(i, _)| i)
+            .collect()
+    };
+    let dropped = at("dev: probe-dropped ");
+    assert_eq!(dropped.len(), 1, "{stdout}");
+    assert!(
+        at("dev: probe ").iter().any(|&i| i < dropped[0]),
+        "{stdout}"
+    );
+    let record = at("dev: transition");
+    assert!(!record.is_empty(), "{stdout}");
+    assert!(record.iter().all(|&i| i > dropped[0]), "{stdout}");
+}
+
 /// The quit key timed while the chart plays (`command = "quit"`) ends the
 /// play midway on its result, which the next step leaves for selection.
 #[test]
@@ -3930,6 +3965,61 @@ fn a_saving_capture_survives_departure() {
     );
     assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
     assert!(fx.base.join("out").join("r.png").exists());
+}
+
+/// The console's choice → READY figure (`load: READY started …`) is the
+/// load's `ready` stage in the play's `.measure.toml` (`[load_stages]`),
+/// to the µs, both from the choice's time and READY's: for a chart chosen
+/// and played, and for a practice's first round, whose choice is its
+/// Start, accepted on the page after the decision screen and the chart's
+/// read. The practice's second round, which no choice or Start leads, has
+/// neither.
+#[test]
+fn the_console_s_ready_figure_is_the_load_s_ready_stage() {
+    let fx = practice_fixture();
+    let (out, stdout, stderr) = fx.run(&scenario(&[
+        "select = { path = \"library/a/a.bms\" }",
+        "play = { input = \"logs/k7.tprl\", until = \"end\" }",
+        "result = \"back\"",
+        "practice = { path = \"library/a/a.bms\", from = 1, to = 2, speed = 100, \
+         lead_in_ms = 2500, gauge = 20, repeat = true, input = \"logs/k7.tprl\", rounds = 2 }",
+        "quit = {}",
+    ]));
+    assert_eq!(out.status.code(), Some(0), "{stdout}\n{stderr}");
+    let printed: Vec<(i64, i64)> = lines(&stdout, "load: READY started ")
+        .iter()
+        .map(|l| {
+            let ms = l
+                .strip_prefix("load: READY started ")
+                .and_then(|r| r.split(' ').next())
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("ms: {l}"));
+            let us = l
+                .rsplit_once('(')
+                .and_then(|(_, r)| r.strip_suffix(" us)"))
+                .and_then(|n| n.parse().ok())
+                .unwrap_or_else(|| panic!("us: {l}"));
+            (ms, us)
+        })
+        .collect();
+    let records = fx.records();
+    assert_eq!(records.len(), 3, "{records:?}");
+    let stages: Vec<Option<i64>> = records
+        .iter()
+        .map(|r| {
+            let m: toml::Table = fs::read_to_string(r.with_extension("measure.toml"))
+                .unwrap()
+                .parse()
+                .unwrap();
+            int(&m, "load_stages", "ready")
+        })
+        .collect();
+    let [Some(chosen), Some(started), None] = stages[..] else {
+        panic!("the choice's and the Start's plays staged, the round not: {stages:?}");
+    };
+    let stages = [chosen, started];
+    let want: Vec<(i64, i64)> = stages.iter().map(|&us| (us / 1_000, us)).collect();
+    assert_eq!(printed, want, "{stdout}");
 }
 
 /// The decision screen before a saved play reaches the play's

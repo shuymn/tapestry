@@ -304,6 +304,11 @@ pub struct PlayerRig<'a> {
     /// clock's 0), or the end of what the command set up first (a
     /// measurement's PresentMon capture).
     pub load_start: TimeUs,
+    /// A choice or a practice Start was taken and its READY has not
+    /// started: the console's choice → READY figure is due at the next
+    /// play's start, once, at the READY the load's `ready` stage
+    /// (dev-tools) is stamped at; a retry or a later round prints none.
+    pub ready_figure_due: bool,
     /// The latest retry taken, by its receipt time: the next play starts
     /// from it.
     pub pending_retry: Option<TimeUs>,
@@ -749,6 +754,11 @@ impl PlayerRig<'_> {
             "dev: result image stage: {}",
             self.result_skin.staged_line()
         );
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark(
+            "img:stage_end",
+            i64::from(staged == crate::result_skin::Staged::Ready),
+        );
         match staged {
             crate::result_skin::Staged::Cancelled => PrepStage::Ended(Preparation::Cancelled),
             crate::result_skin::Staged::Ready => self.send_screen(prep, skin),
@@ -802,6 +812,8 @@ impl PlayerRig<'_> {
                 .with_difficulty(prep.difficulty)
                 .with_bga_shown(self.bga_session.shown())
                 .with_scratch_notes(std::mem::take(&mut prep.scratch_notes));
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("att:send", 0);
         prep.staging = Instant::now();
         PrepStage::Screen(self.render.begin_attempt(attempt, skin))
     }
@@ -1297,6 +1309,11 @@ impl PlayerRig<'_> {
         // disabled), `reused` (installed) or `uploaded` (asked for).
         #[cfg(feature = "dev-tools")]
         let installed = status.installed == Some(upload.atlas()) && !crate::dev::result_cold();
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark(
+            "res:installed",
+            i64::from(installed) | (i64::from(status.installed.is_some()) << 1),
+        );
         #[cfg(not(feature = "dev-tools"))]
         let installed = status.installed == Some(upload.atlas());
         #[cfg(feature = "dev-tools")]
@@ -1306,6 +1323,8 @@ impl PlayerRig<'_> {
         if installed {
             return;
         }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("res:select_sent", 0);
         let mut pending = self.render.upload_result(upload);
         loop {
             if preparation_stops(
@@ -1324,7 +1343,11 @@ impl PlayerRig<'_> {
             }
             let why = match pending.poll(crate::render_side::SELECT_SLICE) {
                 None => continue,
-                Some(Ok(Preparation::Ready)) => return,
+                Some(Ok(Preparation::Ready)) => {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::loop_probe::mark("res:select_ready", 0);
+                    return;
+                }
                 Some(Ok(Preparation::Refused(why))) => why.to_string(),
                 Some(Ok(Preparation::Cancelled)) => "the upload was withdrawn".to_owned(),
                 Some(Err(e)) => Chain(&e).to_string(),
@@ -2306,6 +2329,8 @@ impl Rig for PlayerRig<'_> {
         {
             self.probe_ready = Some((std::time::Instant::now(), "none"));
         }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("att:committed", 0);
         self.upload_result();
         #[cfg(feature = "dev-tools")]
         crate::dev::print_result_work("commit");
@@ -2321,6 +2346,8 @@ impl Rig for PlayerRig<'_> {
     /// the opening returns to the same loading state ([`defer`](Rig::defer));
     /// the opening ends it.
     fn end_loading(&mut self) -> Result<(), ScreenError> {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("g:end_loading", 0);
         #[cfg(test)]
         self.opening_gates.ending();
         let loading = self
@@ -2392,6 +2419,8 @@ impl Rig for PlayerRig<'_> {
             });
             return game::PrepHandle::new(key, self.preps);
         }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("prep:begin", i64::try_from(self.preps).unwrap_or(-1));
         self.result_skin.next_attempt();
         self.presenter.next_attempt();
         self.preps += 1;
@@ -2648,9 +2677,11 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
-        // G2's sample (dev-tools): `commit_ready`'s return to here.
+        // The opening's time, then G2's sample (dev-tools):
+        // `commit_ready`'s return to here.
         #[cfg(feature = "dev-tools")]
-        crate::dev::print_ready_to_open(self.probe_ready.take());
+        let p_open =
+            crate::dev::loop_probe::opening(self.probe_ready.take(), &mut std::io::stderr());
         // The window gains its focus when shown: an opening before it
         // would latch the play's focus loss at once.
         if let Some(window) = &self.window {
@@ -2670,6 +2701,7 @@ impl Rig for PlayerRig<'_> {
         });
         #[cfg(feature = "dev-tools")]
         if opened.is_ok() {
+            crate::dev::loop_probe::opened(p_open, 0);
             Self::print_lua("open");
         }
         opened
@@ -2715,9 +2747,11 @@ impl Rig for PlayerRig<'_> {
         lead_in: TimeUs,
         generation: u32,
     ) -> Result<Option<Opening<SourceReader>>, InputWaitError> {
-        // G2's sample (dev-tools), as at [`open`](Rig::open).
+        // The opening's time, then G2's sample (dev-tools), as at
+        // [`open`](Rig::open): marked only if it opens.
         #[cfg(feature = "dev-tools")]
-        crate::dev::print_ready_to_open(self.probe_ready.take());
+        let p_open =
+            crate::dev::loop_probe::opening(self.probe_ready.take(), &mut std::io::stderr());
         if let Some(window) = &self.window {
             window.wait_to_open();
         }
@@ -2746,6 +2780,7 @@ impl Rig for PlayerRig<'_> {
         }
         #[cfg(feature = "dev-tools")]
         if opened.is_some() {
+            crate::dev::loop_probe::opened(p_open, 1);
             Self::print_lua("open");
         }
         if let (Some(opening), Some(gate)) = (&opened, &mut self.gate) {
@@ -2812,6 +2847,9 @@ impl Rig for PlayerRig<'_> {
         history: &mut game::HistoryRecorder,
         start: &mut eval::InputStart,
     ) -> Result<game::Rearm, InputWaitError> {
+        // The rearm's opening time (dev-tools): marked only if it opens.
+        #[cfg(feature = "dev-tools")]
+        let p_open = crate::dev::loop_probe::stamp();
         // The cancellation's and the previous opening's markers are taken
         // first: the tap owes one of each at most.
         let cancelled = self.gate.as_ref().map(|g| g.state().generation);
@@ -2833,6 +2871,8 @@ impl Rig for PlayerRig<'_> {
         if let game::Rearm::Opened { origin } = rearmed {
             self.origin = Some(origin);
             self.ready_state_at = Some(TimeUs(origin.0 - lead_in.0));
+            #[cfg(feature = "dev-tools")]
+            crate::dev::loop_probe::opened(p_open, 2);
         }
         if rearmed == game::Rearm::Held
             && let Some(driver) = &mut self.adjust
@@ -2890,12 +2930,19 @@ impl Rig for PlayerRig<'_> {
         println!("play started");
         #[cfg(feature = "dev-tools")]
         crate::dev::print_result_work("ready");
-        // A chart's first play: a retry runs from its own receipt.
+        // The first READY after a choice or a practice Start: a retry, a
+        // later round print none. From the choice's time to READY's, the
+        // two the load's `ready` stage (dev-tools) subtracts too: one
+        // figure, in ms and in µs.
         if let Some(sel) = &self.selection
-            && self.retry_from.is_none()
+            && std::mem::take(&mut self.ready_figure_due)
         {
-            let ms = since(sel.chosen_at, started).as_millis();
-            println!("load: READY started {ms} ms after the choice");
+            let after = since(sel.chosen_at, ready_state_at);
+            println!(
+                "load: READY started {} ms after the choice ({} us)",
+                after.as_millis(),
+                after.as_micros()
+            );
         }
         // Before the play is sent: the audio thread may mix its first wake
         // before this thread runs again.

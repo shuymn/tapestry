@@ -756,3 +756,223 @@ fn a_retry_resolves_the_stage_file_again_for_the_cached_layout() {
         );
     });
 }
+
+/// The transition probe (`TAPESTRY_LOOP_PROBE`) on, over two attempts
+/// whose result layouts differ (chart A's 190 branch, chart B's stage
+/// file): each of its marks at its event.
+#[test]
+fn the_transition_probe_marks_each_event() {
+    let _serial = imports::serial();
+    crate::dev::loop_probe::tests::turn_on();
+    let (a_dir, a) = chart(None);
+    let (b_dir, b) = chart(Some(GREEN));
+    let (_skin, p) = skin_on_191();
+    on_warp(a.chart(), true, |rig, seen| {
+        rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
+        prepared(rig, &a);
+        let first = shown(rig, seen, a_dir.path(), |_, m| near(m, MARK));
+        assert!(first.is_some_and(|[_, m]| near(m, MARK)), "{first:?}");
+        prepared(rig, &b);
+        // Frames of another picture between B's upload and its result's
+        // first frame, each drawing a sprite (a built-in page's cursor bar)
+        // of another array: the first use is the result's, not theirs.
+        let at = probe_now();
+        rig.render.show_decision(
+            crate::menu_screen::MenuPage {
+                lines: vec![crate::menu_screen::MenuLine {
+                    text: "between".to_owned(),
+                    style: crate::menu_screen::LineStyle::Cursor,
+                }],
+                caret: None,
+            },
+            None,
+        );
+        let end = Instant::now() + Duration::from_secs(10);
+        while presents_after(at) < 3 && Instant::now() < end {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(presents_after(at) >= 3, "no frame between");
+        let second = shown(rig, seen, b_dir.path(), |c, _| near(c, GREEN));
+        assert!(second.is_some_and(|[c, _]| near(c, GREEN)), "{second:?}");
+    });
+    let marks = crate::dev::loop_probe::tests::marks();
+    assert_marks(&marks);
+}
+
+/// The probe's time of its last mark so far.
+fn probe_now() -> u64 {
+    crate::dev::loop_probe::tests::marks()
+        .last()
+        .map_or(0, |m| m.0)
+}
+
+/// The frames presented after the probe's time `at`.
+fn presents_after(at: u64) -> usize {
+    crate::dev::loop_probe::tests::marks()
+        .iter()
+        .filter(|m| m.1 == "present" && m.0 > at)
+        .count()
+}
+
+/// [`the_transition_probe_marks_each_event`]'s marks, each at its event.
+fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
+    // Each mark's times and values, by tag.
+    let times =
+        |tag: &str| -> Vec<u64> { marks.iter().filter(|m| m.1 == tag).map(|m| m.0).collect() };
+    let values =
+        |tag: &str| -> Vec<i64> { marks.iter().filter(|m| m.1 == tag).map(|m| m.2).collect() };
+    let one = |tag: &str, k: usize| -> u64 {
+        *times(tag)
+            .get(k)
+            .unwrap_or_else(|| panic!("{tag} #{k}: {:?}", times(tag)))
+    };
+    // The values of `tag` marked in (from, to).
+    let within = |tag: &str, from: u64, to: u64| -> Vec<i64> {
+        marks
+            .iter()
+            .filter(|m| m.1 == tag && m.0 > from && m.0 < to)
+            .map(|m| m.2)
+            .collect()
+    };
+    // Two attempts: each one's steps in order, from its preparation to the
+    // first draw of its result's array.
+    let steps = [
+        "prep:begin",
+        "img:begin",
+        "img:import_end",
+        "img:stage_end",
+        "att:send",
+        "att:stage_us",
+        "att:committed",
+        "res:select_sent",
+        "res:select_ready",
+        "res:install_us",
+        "fu:submit_us",
+    ];
+    for tag in steps {
+        assert_eq!(times(tag).len(), 2, "{tag}: {:?}", times(tag));
+    }
+    for k in 0..2 {
+        for w in steps.windows(2) {
+            assert!(
+                one(w[0], k) <= one(w[1], k),
+                "attempt {k}: {} after {}",
+                w[0],
+                w[1]
+            );
+        }
+    }
+    // The preparations' numbers, and both image stages ended Ready.
+    assert_eq!(values("prep:begin"), [0, 1]);
+    assert_eq!(values("img:stage_end"), [1, 1]);
+    // Each attempt's result upload: inside its select (the play skin's own
+    // select, at the rig's start, is upload 0), its levels' writes summing
+    // to its pages' bytes with the built-in layer's 128² texels, its pages
+    // the bundle's; none refused.
+    let begins = times("up:selskin:begin");
+    assert_eq!(begins.len(), 3, "{begins:?}");
+    for k in 0..2 {
+        let (sent, ready) = (one("res:select_sent", k), one("res:select_ready", k));
+        let t0 = one("up:selskin:t0", k + 1);
+        let begin = one("up:selskin:begin", k + 1);
+        assert!(sent < t0 && begin < ready, "upload {k} outside its select");
+        let written: i64 = within("wt:selskin:bytes", t0, begin).iter().sum();
+        let raw = values("up:selskin:raw_bytes")[k + 1];
+        assert_eq!(written + 128 * 128 * 4, raw, "upload {k}'s writes");
+        assert_eq!(values("res:bundle_level_bytes")[k] + 128 * 128 * 4, raw);
+        assert_eq!(
+            values("up:selskin:pages")[k + 1],
+            values("res:bundle_pages")[k]
+        );
+        assert_eq!(values("up:selskin:refused")[k + 1], 0);
+        assert!(
+            within("up:selskin:create_us", t0, ready)
+                .iter()
+                .all(|&v| v >= 0)
+        );
+    }
+    // Each upload's figures are marked once it was waited for, so no probe
+    // work overlaps the GPU's copy its wait times: the first of them comes
+    // after the wait began (for the waits long enough to tell).
+    let waits: Vec<(u64, i64)> = marks
+        .iter()
+        .filter(|m| m.1 == "up:selskin:gpu_wait_us")
+        .map(|m| (m.0, m.2))
+        .collect();
+    assert_eq!(waits.len(), begins.len(), "{waits:?}");
+    let long: Vec<_> = begins
+        .iter()
+        .zip(&waits)
+        .filter(|(_, (_, w))| *w >= 1_000)
+        .collect();
+    assert!(!long.is_empty(), "no upload waited 1 ms: {waits:?}");
+    for (&begin, &(at, wait)) in long {
+        let began = at.saturating_sub(u64::try_from(wait).unwrap_or(0));
+        assert!(
+            begin >= began,
+            "an upload's figures marked before its wait: {begin} < {began}"
+        );
+    }
+    // The first result's installation: none before (0); the second's: one
+    // installed, another asked for (2).
+    assert_eq!(values("res:installed"), [0, 2]);
+    // B's layout replaces A's installation: dropped once, a slot, by the
+    // drain inside B's select, with the memory read around it.
+    assert_eq!(values("dr:site"), [1]);
+    assert_eq!(values("dr:kind"), [2]);
+    let drop = one("dr:site", 0);
+    assert!(one("up:selskin:begin", 2) < drop && drop < one("res:select_ready", 1));
+    assert!(values("dr:l0")[0] > 0 && values("dr:l1")[0] > 0);
+    // The first use: one per result upload, in its first result frame, with
+    // its frames' submits marked after it (the drop's included).
+    for k in 0..2 {
+        let fu = one("fu:submit_us", k);
+        let frame = within("rf:frame_left", one("res:install_us", k), fu);
+        assert_eq!(frame, [2], "attempt {k}'s first result frame");
+        assert_eq!(
+            within("pd:submit_us", fu - 1, fu + 1_000_000).first(),
+            values("fu:submit_us").get(k)
+        );
+    }
+    assert_eq!(times("fu:gpu_done_us").len(), 2);
+    // Each first use credited to the result's upload (the selection skin
+    // caller), and its frame the first probed: the result's frames are
+    // counted from the view's commit, not from its installation.
+    assert_eq!(
+        values("fu:caller"),
+        [i64::from(render::probe::SELECT_SKIN); 2]
+    );
+    for k in 0..2 {
+        let fu = one("fu:submit_us", k);
+        let (at, left) = marks
+            .iter()
+            .find(|m| m.1 == "rf:frame_left" && m.0 > one("res:install_us", k))
+            .map(|m| (m.0, m.2))
+            .unwrap();
+        assert_eq!(left, 2, "attempt {k}'s first probed frame");
+        assert!(
+            within("present", at, fu).is_empty(),
+            "attempt {k}: a frame presented between the first probed and the first use"
+        );
+    }
+    // Frames were presented between B's upload and its result: none of
+    // them was the first use.
+    let between = within(
+        "present",
+        one("res:select_ready", 1),
+        one("res:install_us", 1),
+    );
+    assert!(between.len() >= 3, "{between:?}");
+    // The result frames probed are presented.
+    assert!(values("rf:presented").iter().all(|&v| v == 1));
+    // B's chart images, written for the result's view inside its staging.
+    let (install, chart) = (one("res:install_us", 1), one("res:chart_us", 1));
+    assert_eq!(within("ci:result:image", install, chart), [0]);
+    assert!(
+        within("ci:result:bytes", install, chart)
+            .iter()
+            .all(|&b| b > 0)
+    );
+    // Nothing lost for want of room.
+    assert_eq!(crate::dev::loop_probe::tests::dropped(), 0);
+}

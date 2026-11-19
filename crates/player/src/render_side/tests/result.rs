@@ -1412,6 +1412,43 @@ fn a_refused_first_presentation_draws_its_own_page() {
     rig.link.exit();
 }
 
+/// With the transition probe on, a result whose first view is the
+/// built-in page, its skin's text refused, has its first frames probed
+/// (`rf:*`) as a skin's first view has: the first view committed, with a
+/// staging or without.
+#[test]
+fn the_probe_marks_the_first_frames_of_a_built_in_first_view() {
+    use crate::dev::loop_probe::tests::{marks, turn_on};
+    turn_on();
+    let (_dir, skin) = fixed_skin();
+    let rig = Rig::new();
+    let lifetime = installed(&rig, &skin);
+    rig.faults.refuse_text.store(true, Ordering::Release);
+    show(
+        &rig.link,
+        lifetime,
+        1,
+        &payload(1, Some(&skin), 1_111, &[]),
+        &Overlay::default(),
+    );
+    assert!(wait_until(|| !rig.drawn().is_empty()));
+    assert!(matches!(rig.drawn().first(), Some(Drawn::Page(_))));
+    let left = || -> Vec<i64> {
+        marks()
+            .iter()
+            .filter(|m| m.1 == "rf:frame_left")
+            .map(|m| m.2)
+            .collect()
+    };
+    assert!(
+        wait_until(|| left().len() == 3),
+        "the first view's frames not probed: {:?}",
+        marks()
+    );
+    assert_eq!(left(), [2, 1, 0]);
+    rig.link.exit();
+}
+
 /// A newer view's text refused on a healthy device, while a view is
 /// presented, draws the built-in page of the view presented, never the
 /// refused one's rows, and disables the kind (D1, C17c).
@@ -3694,6 +3731,92 @@ fn an_end_page_acknowledges_only_an_entry_without_a_lifetime() {
     );
     assert!(rig.until(|d| skin_frame(d).is_some()));
     assert!(wait_until(|| rig.link.result_acknowledged() == second));
+    rig.link.exit();
+}
+
+/// With the transition probe on, an entry whose built-in page shows with
+/// no result lifetime has its first three frames probed (`rf:*`), once:
+/// its later frames are not, nor a page shown again with no entry entered
+/// (the entry's first picture was shown), and the next such entry's
+/// first three are.
+#[test]
+fn the_probe_marks_the_first_frames_of_each_built_in_entry() {
+    use crate::dev::loop_probe::tests::{marks, turn_on};
+    turn_on();
+    let rig = Rig::new();
+    let page = || EndPage {
+        lines: vec!["page".to_owned()],
+        graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
+    };
+    let left = || -> Vec<i64> {
+        marks()
+            .iter()
+            .filter(|m| m.1 == "rf:frame_left")
+            .map(|m| m.2)
+            .collect()
+    };
+    rig.link.enter_result_entry(None);
+    rig.link.show_end(page());
+    assert!(
+        wait_until(|| left().len() == 3),
+        "the entry's frames not probed: {:?}",
+        left()
+    );
+    rig.clear();
+    assert!(wait_until(|| rig.drawn().len() >= 3), "{:?}", rig.drawn());
+    assert_eq!(left(), [2, 1, 0], "probed past its first frames");
+    rig.link.clear_end();
+    rig.clear();
+    rig.link.show_end(page());
+    assert!(wait_until(|| rig.drawn().len() >= 3), "{:?}", rig.drawn());
+    assert_eq!(left(), [2, 1, 0], "a page of an entry already shown probed");
+    rig.link.clear_end();
+    rig.link.enter_result_entry(None);
+    rig.link.show_end(page());
+    assert!(
+        wait_until(|| left().len() == 6),
+        "the next entry's frames not probed: {:?}",
+        left()
+    );
+    assert_eq!(left(), [2, 1, 0, 2, 1, 0]);
+    rig.link.exit();
+}
+
+/// With the transition probe on, a built-in entry's first frame tried again
+/// (not presented, so the entry not yet acknowledged) does not arm its
+/// probed frames (`rf:*`) again: its frames are probed three times, from
+/// the frame tried again on.
+#[test]
+fn the_probe_arms_a_built_in_entry_once_across_a_frame_tried_again() {
+    use crate::dev::loop_probe::tests::{marks, turn_on};
+    turn_on();
+    let rig = Rig::new();
+    let left = || -> Vec<i64> {
+        marks()
+            .iter()
+            .filter(|m| m.1 == "rf:frame_left")
+            .map(|m| m.2)
+            .collect()
+    };
+    let entry = rig.link.enter_result_entry(None);
+    rig.faults
+        .outcomes
+        .lock()
+        .unwrap()
+        .push_back(render::FrameOutcome::Retry);
+    rig.link.show_end(EndPage {
+        lines: vec!["page".to_owned()],
+        graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
+    });
+    assert!(wait_until(|| rig.link.result_acknowledged() == entry));
+    assert!(wait_until(|| left().len() >= 3), "{:?}", left());
+    rig.clear();
+    assert!(wait_until(|| rig.drawn().len() >= 3), "{:?}", rig.drawn());
+    assert_eq!(left(), [2, 1, 0], "armed again at the frame tried again");
     rig.link.exit();
 }
 

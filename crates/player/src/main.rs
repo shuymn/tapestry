@@ -142,6 +142,9 @@ fn main() -> ExitCode {
     // The clock reads 0 at the start of the process: load times count from
     // here unless the command sets something up first.
     let clock = QpcClock::start();
+    // The transition probe (`TAPESTRY_LOOP_PROBE`), on from here if set.
+    #[cfg(feature = "dev-tools")]
+    crate::dev::loop_probe::init(clock);
     // A usage error is found before anything is opened, and exits 2.
     let command = match args::parse(std::env::args_os().skip(1)) {
         Ok(command) => command,
@@ -157,7 +160,7 @@ fn main() -> ExitCode {
     {
         log_file::start(&root.path().join("logs"), name);
     }
-    match command {
+    let code = match command {
         Command::Version => {
             println!("tapestry {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -176,7 +179,12 @@ fn main() -> ExitCode {
         Command::MeasureSelect => report(measure_select(clock)),
         #[cfg(feature = "dev-tools")]
         Command::Scenario(s) => report(dev::scenario::run(s, clock)),
-    }
+    };
+    // The transition probe's marks, whatever the command, unless its run
+    // printed them already (a scenario, before its transition record).
+    #[cfg(feature = "dev-tools")]
+    crate::dev::loop_probe::dump();
+    code
 }
 
 /// The name the log gives `command`, or `None` for one that writes no log:
@@ -961,6 +969,7 @@ fn rig<'a>(
         #[cfg(feature = "dev-tools")]
         result_script: None,
         load_start: TimeUs(0),
+        ready_figure_due: false,
         pending_retry: None,
         window: None,
         cursor: None,
@@ -1953,6 +1962,8 @@ fn select(s: args::Select, clock: QpcClock) -> anyhow::Result<()> {
     if let Some((sc, script)) = scenario {
         // The transition record, printed off the render thread now that
         // it has ended (design.md "Shortening Launch-Based Checks").
+        // The transition probe's marks first (`TAPESTRY_LOOP_PROBE`).
+        crate::dev::loop_probe::dump();
         let record = sc.transitions.lines();
         if let Ok((lines, _)) = &record {
             for l in lines {
