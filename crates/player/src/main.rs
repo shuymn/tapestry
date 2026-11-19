@@ -144,7 +144,7 @@ fn main() -> ExitCode {
     let clock = QpcClock::start();
     // The transition probe (`TAPESTRY_LOOP_PROBE`), on from here if set.
     #[cfg(feature = "dev-tools")]
-    crate::dev::loop_probe::init();
+    crate::dev::loop_probe::init(clock);
     // A usage error is found before anything is opened, and exits 2.
     let command = match args::parse(std::env::args_os().skip(1)) {
         Ok(command) => command,

@@ -3734,6 +3734,49 @@ fn an_end_page_acknowledges_only_an_entry_without_a_lifetime() {
     rig.link.exit();
 }
 
+/// With the transition probe on, an entry whose built-in page shows with
+/// no result lifetime has its first three frames probed (`rf:*`), once:
+/// its later frames are not, and the next such entry's first three are.
+#[test]
+fn the_probe_marks_the_first_frames_of_each_built_in_entry() {
+    use crate::dev::loop_probe::tests::{marks, turn_on};
+    turn_on();
+    let rig = Rig::new();
+    let page = || EndPage {
+        lines: vec!["page".to_owned()],
+        graphs: None,
+        #[cfg(feature = "dev-tools")]
+        id: None,
+    };
+    let left = || -> Vec<i64> {
+        marks()
+            .iter()
+            .filter(|m| m.1 == "rf:frame_left")
+            .map(|m| m.2)
+            .collect()
+    };
+    rig.link.enter_result_entry(None);
+    rig.link.show_end(page());
+    assert!(
+        wait_until(|| left().len() == 3),
+        "the entry's frames not probed: {:?}",
+        left()
+    );
+    rig.clear();
+    assert!(wait_until(|| rig.drawn().len() >= 3), "{:?}", rig.drawn());
+    assert_eq!(left(), [2, 1, 0], "probed past its first frames");
+    rig.link.clear_end();
+    rig.link.enter_result_entry(None);
+    rig.link.show_end(page());
+    assert!(
+        wait_until(|| left().len() == 6),
+        "the next entry's frames not probed: {:?}",
+        left()
+    );
+    assert_eq!(left(), [2, 1, 0, 2, 1, 0]);
+    rig.link.exit();
+}
+
 /// V5's render half (design.md "State Model", system sounds, Result): a
 /// frame acknowledges the entry it draws a picture of, not one entered
 /// while it draws, the skin's view and a built-in one alike, frames

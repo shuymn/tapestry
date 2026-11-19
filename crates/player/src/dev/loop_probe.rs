@@ -1,43 +1,54 @@
 //! The transition probe (#611): marks of the render loop's steps, the
 //! game's transitions and the renderer's uploads, drops and first uses
-//! (`render::probe`), on one `Instant` base, buffered and printed when the
-//! command ends as `dev: probe <µs> <tag> <value>` lines ([`dump`]). Off
-//! unless `TAPESTRY_LOOP_PROBE` is set when the process starts ([`init`]).
+//! (`render::probe`), on the game's clock (the `QpcClock` the process
+//! started, the clock of the frames' presents and the scenario's
+//! transition record), buffered and printed when the command ends as
+//! `dev: probe <µs> <tag> <value>` lines ([`dump`]). Off unless
+//! `TAPESTRY_LOOP_PROBE` is set when the process starts ([`init`]).
 //!
 //! A mark allocates nothing and waits for nothing: its slot is reserved at
 //! [`init`], before any play, and taken by one atomic step, so a thread
-//! descheduled in a mark holds up no other. A mark past the room, or one
-//! whose slot was taken but not filled when the marks are read, is counted,
-//! not kept (the count is printed with the marks). Off, a mark is one
-//! atomic load.
+//! descheduled in a mark holds up no other (a test's held clock is read
+//! under its lock; the process's clock is never held). A mark past the
+//! room, or one whose slot was taken but not filled when the marks are
+//! read, is counted, not kept (the count is printed with the marks). Off,
+//! a mark is one atomic load.
 //!
-//! Two classes of mark. The deciding marks are exact at their events:
-//! `prep:begin` and `g:open`, and the end-to-end spans built from them
-//! with the transition record's choice and READY, the figures a
-//! transition is judged by. Every other mark is diagnostic: it names its
+//! Two classes of mark. The deciding marks are exact at their events, on
+//! the game's clock: `g:choice` at the game's own time of the accepted
+//! choice (0) or a practice's Start (1), `prep:begin` and `g:open` read
+//! as the preparation and the opening begin, before anything else they
+//! do, and `g:ready` at the game's own READY (`ready_state_at`: 0 a play's,
+//! 1 a round's), so every end-to-end span a transition is judged by is a
+//! subtraction of two of them. Every other mark is diagnostic: it names its
 //! event truly (the array, view or upload it is of), and its interval is
 //! what is measured, with what it cannot leave out:
 //!
 //! - `fu:*`, an array's first use: the first frame that encoded a sprite
 //!   draw sampling the array uploaded last. `fu:submit_us` is the frame's
-//!   submit call; `fu:cpu_us` the frame's CPU time as its timing counts it,
-//!   the image's acquisition or admission left out; `fu:gpu_done_us` runs
-//!   from the submit's return to wgpu's report of the work done, which
-//!   comes at the device's next submit or poll, so it includes the wait
-//!   for that call (an upper bound on the GPU's work). The report can come
-//!   inside another submit, an upload's included, so its mark can fall
-//!   among that upload's marks; marks are the probe's own work, left out
-//!   of the upload's figures.
+//!   submit: `encoder.finish()`, the submit call and the reading of the
+//!   submit's return time; `fu:cpu_us` the frame's CPU time as its timing
+//!   counts it, the image's acquisition or admission left out;
+//!   `fu:gpu_done_us` runs from the submit's return to wgpu's completion
+//!   callback, which wgpu runs at the device's next submit or poll, so it
+//!   is the latency of that callback, with no bound on the wait for that
+//!   call. The callback can run inside another submit or a timed poll, an
+//!   upload's included, so its mark can fall among that upload's marks;
+//!   marks are the probe's own work, left out of the upload's figures,
+//!   though they overlap the GPU's work its wait times.
 //! - `tx:*`, a text preparation: each step as timed; `tx:gpu_wait_us`
 //!   from just before the wait to its return, zero when every line was
-//!   cached and nothing was submitted. Each includes the thread's
-//!   descheduling inside it.
+//!   cached and nothing was submitted, and the time to the failure when a
+//!   test or a development fault makes the wait fail in its place. Each
+//!   includes the thread's descheduling inside it.
 //! - `att:*`, an attempt's staging: `att:stage_us` is the whole stage or
 //!   preparation call, any upload and wait inside it included.
 //! - `rf:*`, the result's first frames: the three frames after its first
-//!   view committed, a skin's staging or the built-in view, counted on the
-//!   render thread; `rf:wait_us` includes the acquisition's or the
-//!   admission's wait, which a frame still pending lengthens.
+//!   view committed, a skin's staging or the built-in view, or, for an
+//!   entry with no result lifetime, its built-in page's first three, once
+//!   per entry; counted on the render thread. `rf:wait_us` includes the
+//!   acquisition's or the admission's wait, which a frame still pending
+//!   lengthens.
 //! - `dr:*`, a drop: the drop of the handle it names; the memory read after
 //!   it can still be held, freed at the device's next maintenance
 //!   (`render::probe`).
@@ -55,12 +66,14 @@
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use std::time::Instant;
+
+use bms_model::{TimeSource, TimeUs};
+use input::QpcClock;
 
 /// The marks one run keeps.
 const ROOM: usize = 1 << 20;
 
-/// One mark: µs since the recorder's base, its tag and its value.
+/// One mark: µs on the recorder's clock, its tag and its value.
 pub type Mark = (u64, &'static str, i64);
 
 /// One mark's place: filled by the one mark that took it, its tag set
@@ -93,7 +106,7 @@ impl Slot {
 /// past the room are counted.
 pub struct Recorder {
     on: AtomicBool,
-    base: OnceLock<Instant>,
+    clock: OnceLock<QpcClock>,
     slots: OnceLock<Box<[Slot]>>,
     /// The slots taken so far, past the room included.
     taken: AtomicUsize,
@@ -104,20 +117,20 @@ impl Recorder {
     pub const fn new() -> Self {
         Self {
             on: AtomicBool::new(false),
-            base: OnceLock::new(),
+            clock: OnceLock::new(),
             slots: OnceLock::new(),
             taken: AtomicUsize::new(0),
             dropped: AtomicU64::new(0),
         }
     }
 
-    /// Reserves `room` slots, takes the time base and turns the recorder
-    /// on. Allocates.
-    pub fn turn_on(&self, room: usize) {
+    /// Reserves `room` slots, keeps `clock` and turns the recorder on: a
+    /// mark's time is `clock`'s. Allocates.
+    pub fn turn_on(&self, room: usize, clock: QpcClock) {
         let _ = self
             .slots
             .get_or_init(|| (0..room).map(|_| Slot::new()).collect());
-        let _ = self.base.set(Instant::now());
+        let _ = self.clock.set(clock);
         self.on.store(true, Ordering::Release);
     }
 
@@ -125,10 +138,10 @@ impl Recorder {
         self.on.load(Ordering::Acquire)
     }
 
-    /// The probe's clock now, in µs since its base.
+    /// The probe's clock now, in µs from its origin.
     fn now(&self) -> Option<u64> {
-        let base = self.base.get()?;
-        Some(u64::try_from(base.elapsed().as_micros()).unwrap_or(u64::MAX))
+        let now = self.clock.get()?.now();
+        Some(u64::try_from(now.0).unwrap_or(0))
     }
 
     /// Takes the next slot, or counts a mark past the room as dropped.
@@ -155,6 +168,17 @@ impl Recorder {
         };
         if let Some(slot) = self.take() {
             slot.fill(t, tag, v);
+        }
+    }
+
+    /// Keeps a mark at `at`, a time the game read on the recorder's
+    /// clock, as [`mark`](Self::mark) keeps one at its own reading.
+    pub fn mark_at(&self, tag: &'static str, at: TimeUs, v: i64) {
+        if !self.on() {
+            return;
+        }
+        if let Some(slot) = self.take() {
+            slot.fill(u64::try_from(at.0).unwrap_or(0), tag, v);
         }
     }
 
@@ -190,18 +214,18 @@ impl Recorder {
 static REC: Recorder = Recorder::new();
 
 /// Turns the probe on when `TAPESTRY_LOOP_PROBE` is set: its buffer
-/// reserved, its time base taken and the renderer's marks routed here.
-/// Called once, at the start of the process.
-pub fn init() {
+/// reserved, its marks timed on `clock`, the game's, and the renderer's
+/// marks routed here. Called once, at the start of the process.
+pub fn init(clock: QpcClock) {
     if std::env::var_os("TAPESTRY_LOOP_PROBE").is_none() {
         return;
     }
-    turn_on();
+    turn_on(clock);
 }
 
 /// [`init`]'s work, whatever the environment.
-fn turn_on() {
-    REC.turn_on(ROOM);
+fn turn_on(clock: QpcClock) {
+    REC.turn_on(ROOM, clock);
     render::probe::set_sink(mark);
 }
 
@@ -214,6 +238,33 @@ pub fn on() -> bool {
 pub fn mark(tag: &'static str, v: i64) {
     if REC.on() {
         render::probe::own(|| REC.mark(tag, v));
+    }
+}
+
+/// Keeps a deciding mark at `at`, the game's own time of its event on the
+/// game's clock (the probe's).
+pub fn mark_at(tag: &'static str, at: TimeUs, v: i64) {
+    if REC.on() {
+        render::probe::own(|| REC.mark_at(tag, at, v));
+    }
+}
+
+/// Marks an opening (`g:open`, `kind` 0 a full one, 1 a round's
+/// candidate) as it begins, then writes G2's sample (`commit_ready`'s
+/// return to here) to `out`: a stalled writer delays the opening, not its
+/// mark.
+pub fn mark_open(
+    kind: i64,
+    ready: Option<(std::time::Instant, &str)>,
+    out: &mut impl std::io::Write,
+) {
+    mark("g:open", kind);
+    if let Some((at, step)) = ready {
+        let _ = writeln!(
+            out,
+            "dev: probe G2 ready to open: {} us result {step}",
+            at.elapsed().as_micros()
+        );
     }
 }
 
@@ -285,9 +336,15 @@ pub(crate) mod tests {
     use crate::alloc_count::this_thread;
 
     /// Turns the process's probe on, as `TAPESTRY_LOOP_PROBE` would at
-    /// start: for a test run in a process of its own (nextest).
+    /// start, on a clock of its own: for a test run in a process of its
+    /// own (nextest).
     pub(crate) fn turn_on() {
-        super::turn_on();
+        super::turn_on(input::QpcClock::start());
+    }
+
+    /// [`turn_on`] on `clock`, a rig's game clock.
+    pub(crate) fn turn_on_on(clock: input::QpcClock) {
+        super::turn_on(clock);
     }
 
     /// The marks kept so far.
@@ -311,7 +368,7 @@ pub(crate) mod tests {
     #[test]
     fn transition_probe_marks_alloc() {
         let rec = Recorder::new();
-        rec.turn_on(4);
+        rec.turn_on(4, input::QpcClock::start());
         let frames = AtomicU32::new(2);
         let before = this_thread();
         for k in 0..6 {
@@ -342,7 +399,7 @@ pub(crate) mod tests {
     #[test]
     fn a_mark_under_way_holds_up_no_other_mark() {
         let rec = std::sync::Arc::new(Recorder::new());
-        rec.turn_on(8);
+        rec.turn_on(8, input::QpcClock::start());
         assert!(rec.take().is_some(), "a slot taken");
         let (done, finished) = std::sync::mpsc::channel();
         let other = std::sync::Arc::clone(&rec);
@@ -431,6 +488,38 @@ pub(crate) mod tests {
     }
 
     /// A mark is the probe's own work, left out of the figures around it.
+    /// An opening is marked as it begins, before G2's sample is written:
+    /// a writer that stalls 20 ms at each write delays the opening, not
+    /// its mark.
+    #[test]
+    fn the_probe_marks_an_opening_before_its_sample() {
+        struct Stalled(Vec<u64>);
+        impl std::io::Write for Stalled {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.push(now());
+                std::thread::sleep(std::time::Duration::from_millis(20));
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        turn_on();
+        let mut out = Stalled(Vec::new());
+        super::mark_open(0, Some((std::time::Instant::now(), "x")), &mut out);
+        let opened: Vec<u64> = marks()
+            .iter()
+            .filter(|m| m.1 == "g:open")
+            .map(|m| m.0)
+            .collect();
+        let written = out.0.first().copied().expect("the sample written");
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        assert!(
+            opened.iter().all(|&t| t <= written),
+            "the opening marked after its sample: {opened:?} > {written}"
+        );
+    }
+
     #[test]
     fn a_mark_is_the_probes_own_work() {
         turn_on();

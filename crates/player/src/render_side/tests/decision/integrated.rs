@@ -1850,6 +1850,56 @@ fn load_stages_are_recorded_in_order() {
     assert!(stages.iter().all(|&(_, v)| v <= ready), "{stages:?}");
 }
 
+/// With the transition probe on the game's clock, the deciding marks join
+/// on it: the choice, made with the clock held 600 s from its origin, is
+/// marked at 600 s (`g:choice`), READY (`g:ready`) at the choice plus the
+/// load's own `ready` stage, to the µs, and the preparation's and the
+/// opening's marks lie between them, in order.
+#[test]
+fn the_probe_marks_the_deciding_events_on_the_games_clock() {
+    let set = Set::new("s.luaskin");
+    let opts = Opts {
+        saved: true,
+        picture: true,
+        chart: Some("#TITLE a\n#BPM 120\n#BMP01 a.png\n#00004:01\n#00111:01\n#00138:01\n"),
+        ..Opts::default()
+    };
+    let ran = run_with(&set, None, opts, |side| {
+        crate::dev::loop_probe::tests::turn_on_on(side.clock);
+        side.prepared();
+        side.hold_clock();
+        side.clock.set(TimeUs(600_000_000));
+        let (chosen, ..) = side.choose(MenuKey::Enter);
+        assert_eq!(chosen, TimeUs(600_000_000));
+        side.to_loading();
+        side.seen.until("the result skin", |d| {
+            d.iter()
+                .any(|d| matches!(d.frame, Frame::Result { quads, .. } if quads > 0))
+        });
+    });
+    let ready_stage = stage_at(&load_stages(&ran), "ready");
+    let marks = crate::dev::loop_probe::tests::marks();
+    let at = |tag: &str| -> Vec<(i64, i64)> {
+        marks
+            .iter()
+            .filter(|m| m.1 == tag)
+            .map(|m| (i64::try_from(m.0).unwrap(), m.2))
+            .collect()
+    };
+    assert_eq!(at("g:choice"), [(600_000_000, 0)], "the choice");
+    let ready = at("g:ready");
+    assert_eq!(ready.len(), 1, "{ready:?}");
+    let (ready, kind) = ready[0];
+    assert_eq!(kind, 0, "a play's READY");
+    assert_eq!(ready - 600_000_000, ready_stage, "choice -> READY");
+    let (prep, open) = (at("prep:begin"), at("g:open"));
+    assert_eq!((prep.len(), open.len()), (1, 1), "{prep:?} {open:?}");
+    assert!(
+        600_000_000 <= prep[0].0 && prep[0].0 <= open[0].0 && open[0].0 <= ready,
+        "out of order: choice 600000000, prep {prep:?}, open {open:?}, READY {ready}"
+    );
+}
+
 /// The `[load_stages]` of the one play `ran` saved, in their order.
 #[track_caller]
 fn load_stages(ran: &Ran) -> Vec<(String, i64)> {

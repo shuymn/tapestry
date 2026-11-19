@@ -2861,6 +2861,8 @@ impl PlayerRig<'_> {
             #[cfg(feature = "dev-tools")]
             crate::dev::stages_begin(self.clock, sel.chosen_at);
             #[cfg(feature = "dev-tools")]
+            crate::dev::loop_probe::mark_at("g:choice", sel.chosen_at, 0);
+            #[cfg(feature = "dev-tools")]
             crate::dev::loop_probe::mark("cur:chose", 0);
             let name = file_name(path);
             let after = since(sel.entered_at, sel.chosen_at).as_millis();
@@ -3499,6 +3501,8 @@ impl PlayerRig<'_> {
         let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
         if loaded.section().is_some() {
             sel.chosen_at = now;
+            #[cfg(feature = "dev-tools")]
+            crate::dev::loop_probe::mark_at("g:choice", now, 1);
             // A Start decodes its own: a page bank still waiting for the
             // background is given up, and the Start waits for it itself.
             if let Some((_, pause)) = sel.page.take_pending() {

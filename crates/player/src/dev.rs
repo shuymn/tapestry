@@ -3008,17 +3008,6 @@ pub fn print_upload(cold: bool, retained: usize, t: render::UploadTiming) {
     }
 }
 
-/// Prints G2's sample, if `ready` holds one: from the attempt's
-/// `commit_ready` returning to the opening, and what the result step did.
-pub fn print_ready_to_open(ready: Option<(Instant, &str)>) {
-    if let Some((at, step)) = ready {
-        eprintln!(
-            "dev: probe G2 ready to open: {} us result {step}",
-            at.elapsed().as_micros()
-        );
-    }
-}
-
 /// Whether this selection or upload of the result kind is refused.
 pub fn refuse_result_select() -> bool {
     result_fault(

@@ -2667,11 +2667,10 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
-        // G2's sample (dev-tools): `commit_ready`'s return to here.
+        // The opening's mark, then G2's sample (dev-tools):
+        // `commit_ready`'s return to here.
         #[cfg(feature = "dev-tools")]
-        crate::dev::print_ready_to_open(self.probe_ready.take());
-        #[cfg(feature = "dev-tools")]
-        crate::dev::loop_probe::mark("g:open", 0);
+        crate::dev::loop_probe::mark_open(0, self.probe_ready.take(), &mut std::io::stderr());
         // The window gains its focus when shown: an opening before it
         // would latch the play's focus loss at once.
         if let Some(window) = &self.window {
@@ -2736,11 +2735,10 @@ impl Rig for PlayerRig<'_> {
         lead_in: TimeUs,
         generation: u32,
     ) -> Result<Option<Opening<SourceReader>>, InputWaitError> {
-        // G2's sample (dev-tools), as at [`open`](Rig::open).
+        // The opening's mark, then G2's sample (dev-tools), as at
+        // [`open`](Rig::open).
         #[cfg(feature = "dev-tools")]
-        crate::dev::print_ready_to_open(self.probe_ready.take());
-        #[cfg(feature = "dev-tools")]
-        crate::dev::loop_probe::mark("g:open", 1);
+        crate::dev::loop_probe::mark_open(1, self.probe_ready.take(), &mut std::io::stderr());
         if let Some(window) = &self.window {
             window.wait_to_open();
         }
@@ -2856,6 +2854,8 @@ impl Rig for PlayerRig<'_> {
         if let game::Rearm::Opened { origin } = rearmed {
             self.origin = Some(origin);
             self.ready_state_at = Some(TimeUs(origin.0 - lead_in.0));
+            #[cfg(feature = "dev-tools")]
+            crate::dev::loop_probe::mark_at("g:ready", TimeUs(origin.0 - lead_in.0), 1);
         }
         if rearmed == game::Rearm::Held
             && let Some(driver) = &mut self.adjust
@@ -2902,6 +2902,8 @@ impl Rig for PlayerRig<'_> {
         let page_faults = process_page_faults();
         let ready_state_at = TimeUs(origin.0 - self.lead_in.0);
         self.ready_state_at = Some(ready_state_at);
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark_at("g:ready", ready_state_at, 0);
         #[cfg(feature = "dev-tools")]
         if let Some((_, ack)) = self.render.loading_ack() {
             let end = game::minimum_ends(ack, self.render.loading_loadend());
