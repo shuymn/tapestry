@@ -15,6 +15,10 @@
 //! - `--dev-no-codec-list`: serves the control pipe with FFmpeg's codec
 //!   whitelist left unset at every open, as an allocation refused while it
 //!   is set would leave it.
+//! - `--dev-refuse-at-park`: serves the control pipe with an allocation
+//!   refused for the player each time it parks its decoder at a video's end
+//!   (the park seam), as a decoder's thread still at work when its other
+//!   thread gave the end would refuse one.
 
 use std::ffi::OsString;
 use std::process::ExitCode;
@@ -46,6 +50,15 @@ pub fn run(args: &[OsString]) -> Option<ExitCode> {
                     crate::serve(ffmpeg::MAX_ALLOC)
                 }
                 _ => usage("--dev-no-codec-list"),
+            });
+        }
+        "--dev-refuse-at-park" => {
+            return Some(match rest {
+                [] => {
+                    ffmpeg::refuse_while_parked();
+                    crate::serve(ffmpeg::MAX_ALLOC)
+                }
+                _ => usage("--dev-refuse-at-park"),
             });
         }
         "--dev-max-alloc" => {

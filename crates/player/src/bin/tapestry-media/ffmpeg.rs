@@ -84,6 +84,19 @@ pub fn leave_codec_list_unset() {
     NO_CODEC_LIST.store(true, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Each park of a decoder at a video's end records a refusal (dev-tools):
+/// the park seam.
+#[cfg(feature = "dev-tools")]
+static REFUSE_WHILE_PARKED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Has each park of a decoder at a video's end record a refusal for its
+/// player from now on (dev-tools).
+#[cfg(feature = "dev-tools")]
+pub fn refuse_while_parked() {
+    REFUSE_WHILE_PARKED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The codec whitelist, as the option an open sets.
 fn codec_list() -> &'static [(&'static CStr, &'static CStr)] {
     #[cfg(feature = "dev-tools")]
@@ -317,6 +330,18 @@ mod hooks {
         record(|r| {
             r.refused.fetch_max(size, Ordering::SeqCst);
         });
+    }
+
+    /// Refuses an allocation for the player this thread works for, through
+    /// the worker's own allocator (dev-tools): the park seam, standing in
+    /// for a decoder's thread whose allocation is refused while the player
+    /// parks the decoder at the end, after its other thread gave the end.
+    #[cfg(feature = "dev-tools")]
+    pub fn refuse_now() {
+        // SAFETY: the worker's allocator, asked for more than its cap: it
+        // records the refusal and allocates nothing.
+        let p = unsafe { malloc(CAP.load(Ordering::Relaxed).saturating_add(1)) };
+        debug_assert!(p.is_null());
     }
 
     unsafe extern "C" {
@@ -1188,6 +1213,9 @@ impl Input {
     /// error.
     pub fn next(&mut self, out: &mut [u8]) -> Result<Option<i64>, (Failure, c_int)> {
         let next = self.next_unchecked(out);
+        if matches!(next, Ok(None)) {
+            self.park();
+        }
         // A refusal made while the frame was decoded and converted, or while
         // the decoder drained, fails the player before the frame or the end
         // is taken.
@@ -1225,6 +1253,9 @@ impl Input {
     ) -> Result<Option<Landed>, (Failure, c_int)> {
         self.budget(Some(BUDGET));
         let landed = self.seek_within_budget(target, out);
+        if matches!(landed, Ok(None)) {
+            self.park();
+        }
         // As in `next`, before the landing or the end is taken; a seek past
         // its budget fails for its reading.
         let checked = self.check();
@@ -1279,6 +1310,20 @@ impl Input {
             }
         }
         Ok(None)
+    }
+
+    /// Waits at the video's end until the decoder's threads have finished
+    /// their work: FFmpeg's flush parks each frame thread once the packet it
+    /// was handed is decoded, so a refusal that work makes is recorded before
+    /// the end is checked, though another thread gave the end first. The
+    /// decoder keeps nothing; a seek flushes it again.
+    fn park(&mut self) {
+        // SAFETY: this input's decoder.
+        unsafe { ff::avcodec_flush_buffers(self.dec) };
+        #[cfg(feature = "dev-tools")]
+        if REFUSE_WHILE_PARKED.load(std::sync::atomic::Ordering::Relaxed) {
+            hooks::refuse_now();
+        }
     }
 
     /// Fails the player when an allocation made for it was refused since

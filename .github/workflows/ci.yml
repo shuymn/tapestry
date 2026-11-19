@@ -168,7 +168,8 @@ jobs:
           mise exec -- cargo xtask check-binary --absent "tapestry dev-tools enabled" target/release/tapestry.exe
           mise exec -- cargo xtask check-binary --absent "tapestry dev-tools enabled" target/release/tapestry-media.exe
           # The media worker's development arguments.
-          for arg in --dev-tools-probe --dev-gen-clip --dev-secondary-open --dev-max-alloc; do
+          for arg in --dev-tools-probe --dev-gen-clip --dev-secondary-open --dev-max-alloc \
+              --dev-no-codec-list --dev-refuse-at-park; do
             set +e
             target/release/tapestry-media.exe "$arg" x 2> probe.err
             code=$?
