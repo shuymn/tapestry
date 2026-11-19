@@ -304,6 +304,11 @@ pub struct PlayerRig<'a> {
     /// clock's 0), or the end of what the command set up first (a
     /// measurement's PresentMon capture).
     pub load_start: TimeUs,
+    /// A choice or a practice Start was taken and its READY has not
+    /// started: the console's choice → READY figure is due at the next
+    /// play's start, once, at the READY the load's `ready` stage
+    /// (dev-tools) is stamped at; a retry or a later round prints none.
+    pub ready_figure_due: bool,
     /// The latest retry taken, by its receipt time: the next play starts
     /// from it.
     pub pending_retry: Option<TimeUs>,
@@ -434,10 +439,11 @@ pub struct PlayerRig<'a> {
     /// preparation leaves its lifetime. Until then a screen built again
     /// keeps it, an outro playing included.
     pub result_leaving: bool,
-    /// The result's `clear` or `fail` was asked for at its first show,
-    /// and Result has not been left since: a later show (a view switch, a
-    /// screen built again) starts none, and leaving stops them.
-    pub result_sounding: bool,
+    /// The Result entry handed over and not left since: set at the
+    /// result's first show, it arms the stop of its sounds on leaving; a
+    /// later show (a view switch, a screen built again) numbers no other
+    /// entry (design.md "State Model", system sounds, Result).
+    pub(crate) result_entry: Option<ResultEntry>,
     /// The views the result has changed to so far, each printed once
     /// (dev-tools: a scripted view command is over once its view shows).
     #[cfg(feature = "dev-tools")]
@@ -461,6 +467,9 @@ pub struct PlayerRig<'a> {
     /// looks again.
     #[cfg(test)]
     pub relooked: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Tests: set when a look starts the result's sound.
+    #[cfg(test)]
+    pub result_started: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Tests: set by the idle wait right before it parks.
     #[cfg(test)]
     pub park_probe: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -698,6 +707,11 @@ impl PlayerRig<'_> {
         if self.result_run_disabled() {
             return self.send_screen(prep, skin);
         }
+        // The kept probe only while the selection's and decision's
+        // charges leave room for any result atlas, decided before play.
+        let menus = self.render.result_status().menus;
+        self.result_skin
+            .set_kept_probe(crate::result_skin::kept_probe_fits(menus));
         #[cfg(feature = "dev-tools")]
         crate::dev::stage_began(crate::dev::SpecializingStage::ResultImage);
         match self.result_skin.begin_image_stage(chart, prep.class) {
@@ -739,6 +753,11 @@ impl PlayerRig<'_> {
         println!(
             "dev: result image stage: {}",
             self.result_skin.staged_line()
+        );
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark(
+            "img:stage_end",
+            i64::from(staged == crate::result_skin::Staged::Ready),
         );
         match staged {
             crate::result_skin::Staged::Cancelled => PrepStage::Ended(Preparation::Cancelled),
@@ -793,6 +812,8 @@ impl PlayerRig<'_> {
                 .with_difficulty(prep.difficulty)
                 .with_bga_shown(self.bga_session.shown())
                 .with_scratch_notes(std::mem::take(&mut prep.scratch_notes));
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("att:send", 0);
         prep.staging = Instant::now();
         PrepStage::Screen(self.render.begin_attempt(attempt, skin))
     }
@@ -1207,16 +1228,41 @@ impl PlayerRig<'_> {
         self.end_result();
     }
 
-    /// Result is left: its `clear`, `fail` and `resultclose` stop, once a
-    /// result sound was asked for (design.md "State Model", system sounds,
-    /// Result).
+    /// Result is left: its `clear`, `fail` and `resultclose` stop, once
+    /// the result was handed over, whether or not its sound started
+    /// (design.md "State Model", system sounds, Result).
     fn end_result_sounds(&mut self) {
-        if !std::mem::take(&mut self.result_sounding) {
+        if self.result_entry.take().is_none() {
             return;
         }
         if let Some(sounds) = self.system_sounds.as_mut() {
             // Source: SF-015
             sounds.result_left(&mut self.audio.control);
+        }
+    }
+
+    /// The result's `clear` or `fail`, by the play's own view's lamp, at
+    /// the first look that reads its entry's first result picture
+    /// acknowledged, once per entry; never once the entry's fade-out began,
+    /// so it does not sound over `resultclose` (design.md "State Model",
+    /// system sounds, Result).
+    fn start_result_sound(&mut self) {
+        let Some(entry) = self.result_entry.as_mut().filter(|e| e.due) else {
+            return;
+        };
+        if self.render.result_acknowledged() != entry.number {
+            return;
+        }
+        entry.due = false;
+        if self.result_outro.is_some() {
+            return;
+        }
+        #[cfg(test)]
+        self.result_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(sounds) = self.system_sounds.as_mut() {
+            // Source: SF-015
+            sounds.result_shown(&mut self.audio.control, entry.cleared);
         }
     }
 
@@ -1263,6 +1309,11 @@ impl PlayerRig<'_> {
         // disabled), `reused` (installed) or `uploaded` (asked for).
         #[cfg(feature = "dev-tools")]
         let installed = status.installed == Some(upload.atlas()) && !crate::dev::result_cold();
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark(
+            "res:installed",
+            i64::from(installed) | (i64::from(status.installed.is_some()) << 1),
+        );
         #[cfg(not(feature = "dev-tools"))]
         let installed = status.installed == Some(upload.atlas());
         #[cfg(feature = "dev-tools")]
@@ -1272,6 +1323,8 @@ impl PlayerRig<'_> {
         if installed {
             return;
         }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("res:select_sent", 0);
         let mut pending = self.render.upload_result(upload);
         loop {
             if preparation_stops(
@@ -1290,7 +1343,11 @@ impl PlayerRig<'_> {
             }
             let why = match pending.poll(crate::render_side::SELECT_SLICE) {
                 None => continue,
-                Some(Ok(Preparation::Ready)) => return,
+                Some(Ok(Preparation::Ready)) => {
+                    #[cfg(feature = "dev-tools")]
+                    crate::dev::loop_probe::mark("res:select_ready", 0);
+                    return;
+                }
                 Some(Ok(Preparation::Refused(why))) => why.to_string(),
                 Some(Ok(Preparation::Cancelled)) => "the upload was withdrawn".to_owned(),
                 Some(Err(e)) => Chain(&e).to_string(),
@@ -2027,6 +2084,9 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn idle_wait(&mut self, deadline: TimeUs) {
+        // Read before the wait, as the render thread acknowledges before it
+        // wakes this thread: a wake another wait took is not missed.
+        self.start_result_sound();
         let left = deadline.0 - self.clock.now().0;
         if left > 0 {
             #[cfg(test)]
@@ -2034,6 +2094,11 @@ impl Rig for PlayerRig<'_> {
                 .store(true, std::sync::atomic::Ordering::SeqCst);
             thread::park_timeout(Duration::from_micros(left.unsigned_abs()));
         }
+        // Each park is followed first by a read of the acknowledgement,
+        // before anything that may wait on the render thread (the result's
+        // status, which a layout's landing reads), so the render thread's
+        // wake starts the sound at once.
+        self.start_result_sound();
         // A switch's layout lands when its job is done: the job wakes this
         // thread once its outcome is in, and while its thread still ends
         // the look is repeated every LAYOUT_RELOOK, within the deadline. A
@@ -2049,10 +2114,12 @@ impl Rig for PlayerRig<'_> {
                 break;
             }
             thread::park_timeout(Duration::from_micros(left.unsigned_abs()).min(LAYOUT_RELOOK));
+            self.start_result_sound();
         }
         if self.controls.quitting() && self.result_skin.has_job() {
             self.result_skin.settle(|| true);
         }
+        self.start_result_sound();
         self.serve_adjustments();
         self.sync();
         // The result's own path, after the adjustments: an offset changed
@@ -2167,6 +2234,12 @@ impl Rig for PlayerRig<'_> {
         self.presenter.timing(&self.render).map(flow_timing)
     }
 
+    /// The entry's sound not yet started at its first picture's look.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn result_sound_due(&self) -> bool {
+        self.result_entry.as_ref().is_some_and(|e| e.due)
+    }
+
     /// The result's origin: the render thread's first commit of a view.
     fn result_origin(&self) -> Option<TimeUs> {
         self.presenter.origin(&self.render)
@@ -2256,6 +2329,8 @@ impl Rig for PlayerRig<'_> {
         {
             self.probe_ready = Some((std::time::Instant::now(), "none"));
         }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("att:committed", 0);
         self.upload_result();
         #[cfg(feature = "dev-tools")]
         crate::dev::print_result_work("commit");
@@ -2271,6 +2346,8 @@ impl Rig for PlayerRig<'_> {
     /// the opening returns to the same loading state ([`defer`](Rig::defer));
     /// the opening ends it.
     fn end_loading(&mut self) -> Result<(), ScreenError> {
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("g:end_loading", 0);
         #[cfg(test)]
         self.opening_gates.ending();
         let loading = self
@@ -2342,6 +2419,8 @@ impl Rig for PlayerRig<'_> {
             });
             return game::PrepHandle::new(key, self.preps);
         }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("prep:begin", i64::try_from(self.preps).unwrap_or(-1));
         self.result_skin.next_attempt();
         self.presenter.next_attempt();
         self.preps += 1;
@@ -2598,9 +2677,11 @@ impl Rig for PlayerRig<'_> {
     }
 
     fn open(&mut self, lead_in: TimeUs) -> Result<Opening<SourceReader>, InputWaitError> {
-        // G2's sample (dev-tools): `commit_ready`'s return to here.
+        // The opening's time, then G2's sample (dev-tools):
+        // `commit_ready`'s return to here.
         #[cfg(feature = "dev-tools")]
-        crate::dev::print_ready_to_open(self.probe_ready.take());
+        let p_open =
+            crate::dev::loop_probe::opening(self.probe_ready.take(), &mut std::io::stderr());
         // The window gains its focus when shown: an opening before it
         // would latch the play's focus loss at once.
         if let Some(window) = &self.window {
@@ -2620,6 +2701,7 @@ impl Rig for PlayerRig<'_> {
         });
         #[cfg(feature = "dev-tools")]
         if opened.is_ok() {
+            crate::dev::loop_probe::opened(p_open, 0);
             Self::print_lua("open");
         }
         opened
@@ -2665,9 +2747,11 @@ impl Rig for PlayerRig<'_> {
         lead_in: TimeUs,
         generation: u32,
     ) -> Result<Option<Opening<SourceReader>>, InputWaitError> {
-        // G2's sample (dev-tools), as at [`open`](Rig::open).
+        // The opening's time, then G2's sample (dev-tools), as at
+        // [`open`](Rig::open): marked only if it opens.
         #[cfg(feature = "dev-tools")]
-        crate::dev::print_ready_to_open(self.probe_ready.take());
+        let p_open =
+            crate::dev::loop_probe::opening(self.probe_ready.take(), &mut std::io::stderr());
         if let Some(window) = &self.window {
             window.wait_to_open();
         }
@@ -2696,6 +2780,7 @@ impl Rig for PlayerRig<'_> {
         }
         #[cfg(feature = "dev-tools")]
         if opened.is_some() {
+            crate::dev::loop_probe::opened(p_open, 1);
             Self::print_lua("open");
         }
         if let (Some(opening), Some(gate)) = (&opened, &mut self.gate) {
@@ -2762,6 +2847,9 @@ impl Rig for PlayerRig<'_> {
         history: &mut game::HistoryRecorder,
         start: &mut eval::InputStart,
     ) -> Result<game::Rearm, InputWaitError> {
+        // The rearm's opening time (dev-tools): marked only if it opens.
+        #[cfg(feature = "dev-tools")]
+        let p_open = crate::dev::loop_probe::stamp();
         // The cancellation's and the previous opening's markers are taken
         // first: the tap owes one of each at most.
         let cancelled = self.gate.as_ref().map(|g| g.state().generation);
@@ -2783,6 +2871,8 @@ impl Rig for PlayerRig<'_> {
         if let game::Rearm::Opened { origin } = rearmed {
             self.origin = Some(origin);
             self.ready_state_at = Some(TimeUs(origin.0 - lead_in.0));
+            #[cfg(feature = "dev-tools")]
+            crate::dev::loop_probe::opened(p_open, 2);
         }
         if rearmed == game::Rearm::Held
             && let Some(driver) = &mut self.adjust
@@ -2840,12 +2930,19 @@ impl Rig for PlayerRig<'_> {
         println!("play started");
         #[cfg(feature = "dev-tools")]
         crate::dev::print_result_work("ready");
-        // A chart's first play: a retry runs from its own receipt.
+        // The first READY after a choice or a practice Start: a retry, a
+        // later round print none. From the choice's time to READY's, the
+        // two the load's `ready` stage (dev-tools) subtracts too: one
+        // figure, in ms and in µs.
         if let Some(sel) = &self.selection
-            && self.retry_from.is_none()
+            && std::mem::take(&mut self.ready_figure_due)
         {
-            let ms = since(sel.chosen_at, started).as_millis();
-            println!("load: READY started {ms} ms after the choice");
+            let after = since(sel.chosen_at, ready_state_at);
+            println!(
+                "load: READY started {} ms after the choice ({} us)",
+                after.as_millis(),
+                after.as_micros()
+            );
         }
         // Before the play is sent: the audio thread may mix its first wake
         // before this thread runs again.
@@ -3234,19 +3331,23 @@ impl Rig for PlayerRig<'_> {
             #[cfg(feature = "dev-tools")]
             id: self.scenario.as_ref().and_then(|s| s.result_id),
         });
+        // The result is handed over: at its first show its entry is
+        // numbered before anything of it is sent, its sound due by the
+        // play's own view's lamp whichever view shows (with no lamp of its
+        // own the play did not clear), started once the entry's first
+        // picture is acknowledged (design.md "State Model", system sounds,
+        // Result).
+        if self.result_entry.is_none() {
+            self.result_entry = Some(ResultEntry {
+                number: self.render.enter_result_entry(self.controls.game_thread()),
+                cleared: screen.own_cleared() == Some(true),
+                due: true,
+            });
+        }
         // The skin's presentation goes first, so the built-in page does not
         // draw before it.
         self.present_view(report, screen);
         self.send_end(tuning.get());
-        // The result's sound, at its first show only, by the play's own
-        // view's lamp whichever view shows; with no lamp of its own the play
-        // did not clear (design.md "State Model", system sounds, Result).
-        if !std::mem::replace(&mut self.result_sounding, true)
-            && let Some(sounds) = self.system_sounds.as_mut()
-        {
-            // Source: SF-015
-            sounds.result_shown(&mut self.audio.control, screen.own_cleared() == Some(true));
-        }
         // Its requests made: the rebuild it follows is over.
         #[cfg(test)]
         self.rebuilds.shown.store(
@@ -3269,6 +3370,21 @@ impl Rig for PlayerRig<'_> {
             self.end_shown = Some(std::time::Instant::now());
         }
     }
+}
+
+/// A Result entry handed over (design.md "State Model", system sounds,
+/// Result).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ResultEntry {
+    /// Its number, which the render thread acknowledges at the entry's
+    /// first result picture.
+    pub number: u64,
+    /// Whether the play's own view cleared: `clear` plays, else `fail`.
+    pub cleared: bool,
+    /// Whether its sound is still to start: until the first look that
+    /// reads the acknowledgement, which starts it or, once the entry's
+    /// fade-out began, forgoes it.
+    pub due: bool,
 }
 
 /// The retries a result's flow took (`take_menu`), by receipt, since the
@@ -3551,7 +3667,7 @@ mod tests {
 
         use crate::imports::facts::tests::loaded;
         use crate::imports::tests as imports;
-        use crate::play::PrepStage;
+        use crate::play::{PrepStage, ResultEntry};
         use crate::render_side::ScreenError;
         use crate::render_side::tests::{Installers, bundle};
         use crate::result_skin::tests as result;
@@ -3732,6 +3848,103 @@ mod tests {
                 "landed after its thread's release, woken by the job"
             );
             assert!(kept, "given up at the deadline, the job kept");
+        }
+
+        /// V5's layout overlap (design.md "State Model", system sounds,
+        /// Result): an acknowledgement given while the idle wait looks
+        /// again for a received layout (its thread held after its send)
+        /// starts the result's sound at once, not once the layout lands or
+        /// the wait's deadline passes.
+        #[test]
+        fn an_acknowledgement_during_the_relooks_starts_at_once() {
+            use std::sync::atomic::Ordering;
+            let _serial = imports::serial();
+            let (_d, rs, loaded) = staged_skin();
+            let (started, _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    let _let_go = LetGo;
+                    rig.result_skin = rs;
+                    rig.result_skin.set_wake(rig.controls.game_thread());
+                    let number = rig.render.enter_result_entry(rig.controls.game_thread());
+                    rig.result_entry = Some(ResultEntry {
+                        number,
+                        cleared: true,
+                        due: true,
+                    });
+                    let relooked = Arc::clone(&rig.relooked);
+                    let started = Arc::clone(&rig.result_started);
+                    let acknowledge = rig.render.result_acknowledger();
+                    imports::hold_exit(true);
+                    rig.result_skin.request(result::view(5));
+                    let far = bms_model::TimeUs(rig.now().0 + 60_000_000);
+                    std::thread::scope(|s| {
+                        let render = s.spawn(|| {
+                            let _let_go = LetGo;
+                            until(|| relooked.load(Ordering::SeqCst));
+                            acknowledge(number);
+                            // Within 5 s, the layout's thread still held.
+                            let end = Instant::now() + Duration::from_secs(5);
+                            while !started.load(Ordering::SeqCst) && Instant::now() < end {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            let at_once = started.load(Ordering::SeqCst);
+                            imports::hold_exit(false);
+                            at_once
+                        });
+                        while rig.result_skin.has_job() {
+                            assert!(rig.now().0 < far.0, "the layout never landed");
+                            rig.idle_wait(far);
+                        }
+                        render.join().unwrap()
+                    })
+                });
+            assert!(started, "started while the layout's thread was held");
+        }
+
+        /// V5 (design.md "State Model", system sounds, Result): after its
+        /// park the idle wait reads the acknowledgement first, before the
+        /// result's status, which the render thread may hold: an
+        /// acknowledgement given while the status is held starts the
+        /// result's sound at once.
+        #[test]
+        fn an_acknowledgement_is_read_before_the_results_status() {
+            use std::sync::atomic::Ordering;
+            let _serial = imports::serial();
+            let loaded = loaded("#PLAYLEVEL 12\n", "tapestry");
+            let (started, _) =
+                super::super::super::tests::on_rig_with(settings(), render(&loaded), |rig, _| {
+                    let number = rig.render.enter_result_entry(rig.controls.game_thread());
+                    rig.result_entry = Some(ResultEntry {
+                        number,
+                        cleared: true,
+                        due: true,
+                    });
+                    let parked = Arc::clone(&rig.park_probe);
+                    parked.store(false, Ordering::SeqCst);
+                    let started = Arc::clone(&rig.result_started);
+                    let acknowledge = rig.render.result_acknowledger();
+                    let hold = rig.render.result_status_hold();
+                    let far = bms_model::TimeUs(rig.now().0 + 20_000_000);
+                    std::thread::scope(|s| {
+                        let render = s.spawn(|| {
+                            until(|| parked.load(Ordering::SeqCst));
+                            let mut at_once = false;
+                            hold(&mut || {
+                                acknowledge(number);
+                                // Within 5 s, the status still held.
+                                let end = Instant::now() + Duration::from_secs(5);
+                                while !started.load(Ordering::SeqCst) && Instant::now() < end {
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                                at_once = started.load(Ordering::SeqCst);
+                            });
+                            at_once
+                        });
+                        rig.idle_wait(far);
+                        render.join().unwrap()
+                    })
+                });
+            assert!(started, "started while the result's status was held");
         }
 
         /// A close while the idle wait looks again for a received layout

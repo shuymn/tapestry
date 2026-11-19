@@ -63,7 +63,7 @@ fn attempt_frame(
     r.commit(token).unwrap();
     let v = view(0, 0);
     let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
-    assert!(timing.presented);
+    assert!(timing.presented());
     read_back(r)
 }
 
@@ -357,7 +357,7 @@ fn latch_frame(r: &mut Renderer, view: &game::PlayView, state_us: i64) -> Vec<u8
     let mut f = input(view, TimeUs(500 * MS), TimeUs(0), &[]);
     f.state_us = state_us;
     let timing = r.frame(&f).unwrap();
-    assert!(timing.presented);
+    assert!(timing.presented());
     read_back(r)
 }
 

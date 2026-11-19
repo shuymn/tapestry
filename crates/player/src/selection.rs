@@ -530,7 +530,8 @@ impl Selection {
     }
 
     /// The cursor's request, once it rested [`REST`] on a chart at `now`
-    /// and none was made for this rest (SC1).
+    /// and none was made for this rest (SC1), with the rows its fill reads
+    /// after it ([`neighbours`](Self::neighbours)).
     fn rest_request(
         &mut self,
         images: CursorImages<'_>,
@@ -543,12 +544,46 @@ impl Selection {
         if now.0.saturating_sub(self.rest.since.0) < REST.0 {
             return None;
         }
+        let dir = crate::chart_images::folder(&chart.path);
+        let names = [chart.names.stagefile.clone(), chart.names.banner.clone()];
+        let neighbours = self.neighbours(&dir, &names);
         self.rest.asked = true;
-        Some(images.worker.cursor_request(
-            crate::chart_images::folder(&chart.path),
-            [chart.names.stagefile.clone(), chart.names.banner.clone()],
-            &self.coord,
-        ))
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("cur:rest", 0);
+        Some(
+            images
+                .worker
+                .cursor_request(dir, names, neighbours, &self.coord),
+        )
+    }
+
+    /// The rows the fill reads after the cursor's own (design.md
+    /// "Rendering and Skins", chart images): the charts within
+    /// [`FILL_REACH`](crate::chart_images::FILL_REACH) rows of it, nearest
+    /// first, each folder's names once and never the cursor's (`dir`,
+    /// `names`); a chart whose names the library refused, or that names no
+    /// image, is passed over.
+    fn neighbours(
+        &self,
+        dir: &std::path::Path,
+        names: &[library::Name; 2],
+    ) -> Vec<crate::chart_images::CursorId> {
+        let mut ids: Vec<crate::chart_images::CursorId> = Vec::new();
+        for entry in self.screen.charts_near(crate::chart_images::FILL_REACH) {
+            let Some(n) = entry.images.as_ref() else {
+                continue;
+            };
+            let id = crate::chart_images::CursorId {
+                dir: crate::chart_images::folder(&entry.path),
+                names: [n.stagefile.clone(), n.banner.clone()],
+            };
+            let own = id.dir == dir && id.names == *names;
+            let none = id.names.iter().all(|n| *n == library::Name::None);
+            if !own && !none && !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        ids
     }
 
     /// When the rest comes due, while it has not asked yet.
@@ -1194,6 +1229,16 @@ impl Selection {
             if images.drawn {
                 let refreshed = self.feed.list_revision != self.rest.list_revision;
                 update.cursor_chart = images.worker.update_chart(refreshed);
+                // The list changed around a cursor whose read was asked:
+                // the fill reads the rows near it now.
+                if refreshed
+                    && self.rest.asked
+                    && let Some(chart) = &self.rest.chart
+                {
+                    let dir = crate::chart_images::folder(&chart.path);
+                    let names = [chart.names.stagefile.clone(), chart.names.banner.clone()];
+                    images.worker.refill(self.neighbours(&dir, &names));
+                }
             }
             self.rest.list_revision = self.feed.list_revision;
             render.show_selection(update);
@@ -2213,6 +2258,8 @@ fn move_to(screen: &SelectScreen, menu: &MenuQueue, at: usize) -> bool {
     for _ in 0..at.abs_diff(cursor).min(PICK_BATCH) {
         menu.push(MenuInput::Key(key));
     }
+    #[cfg(feature = "dev-tools")]
+    crate::dev::loop_probe::mark("cur:move", i64::try_from(at).unwrap_or(-1));
     true
 }
 
@@ -2854,8 +2901,11 @@ impl PlayerRig<'_> {
             }
             sel.shelf.choose(path);
             sel.chosen_at = self.clock.now();
+            self.ready_figure_due = true;
             #[cfg(feature = "dev-tools")]
             crate::dev::stages_begin(self.clock, sel.chosen_at);
+            #[cfg(feature = "dev-tools")]
+            crate::dev::loop_probe::mark("cur:chose", 0);
             let name = file_name(path);
             let after = since(sel.entered_at, sel.chosen_at).as_millis();
             println!("select: chose {name}{what} {after} ms after entering selection");
@@ -3488,11 +3538,11 @@ impl PlayerRig<'_> {
             println!("load: cancelled");
             return Ok(Loading::Cancelled);
         }
-        // A practice's Start chooses again: its load times run from it.
-        let now = self.clock.now();
+        // A practice's Start chose again when it was taken
+        // ([`start_ready`](game::AppRig::start_ready)): its load times run
+        // from there, its read at the chosen speed and its fit included.
         let sel = self.selection.as_mut().ok_or(ChartLoadError::NoSelection)?;
         if loaded.section().is_some() {
-            sel.chosen_at = now;
             // A Start decodes its own: a page bank still waiting for the
             // background is given up, and the Start waits for it itself.
             if let Some((_, pause)) = sel.page.take_pending() {
@@ -3950,7 +4000,11 @@ impl AppRig for PlayerRig<'_> {
     fn entered_decision(&mut self, pick: &Pick, d: game::Decision) -> game::Decision {
         // Selection is left, its images before the play generation's
         // renewal (SC5).
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("g:entered_decision", 0);
         self.left_selection();
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("g:left_selection_done", 0);
         // A new generation of the chart's images before the held loading
         // lifetime begins: none of the last choice's draws when the
         // deadline reveals it.
@@ -3983,6 +4037,8 @@ impl AppRig for PlayerRig<'_> {
         if let (Some(sc), Some(c)) = (&self.scenario, claimed) {
             sc.captures.bind_decision(c.lifetime, c.origin);
         }
+        #[cfg(feature = "dev-tools")]
+        crate::dev::loop_probe::mark("g:show_decision", 0);
         self.render.show_decision(shown.clone(), claimed);
         sel.decision = Some((shown, file_name(chart)));
         // The decision sound, once per decision screen whichever
@@ -4369,13 +4425,24 @@ impl AppRig for PlayerRig<'_> {
             .map_err(game::LiveError::Load)
     }
 
-    /// The one routine of every entry into the practice page: on opening
-    /// and after every return (a refused Start, a refused opening or
-    /// restore, the rounds left by the quit key or a result's back).
+    /// A Start taken on the practice page, before anything of it begins
+    /// (the chart's read at the chosen speed, the practice's fit): the
+    /// play skin's readiness, and, when it admits the Start, the Start's
+    /// time as the choice's.
     fn start_ready(&mut self) -> Result<(), String> {
+        // A Start taken chooses again: its load times, and its load's
+        // stages (dev-tools), run from here.
+        let now = self.clock.now();
         self.skin.ready().inspect_err(|notice| {
             println!("practice: not started: {notice}");
-        })
+        })?;
+        if let Some(sel) = self.selection.as_mut() {
+            sel.chosen_at = now;
+            self.ready_figure_due = true;
+            #[cfg(feature = "dev-tools")]
+            crate::dev::stages_begin(self.clock, now);
+        }
+        Ok(())
     }
 
     fn entered_practice(&mut self, screen: &PracticeScreen) {

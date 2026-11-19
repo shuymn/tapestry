@@ -64,7 +64,7 @@ fn read_back(r: &Renderer) -> Vec<u8> {
 fn frame(r: &mut Renderer) -> (usize, Vec<u8>) {
     let v = view(0, 0);
     let timing = r.frame(&input(&v, TimeUs(0), TimeUs(0), &[])).unwrap();
-    assert!(timing.presented);
+    assert!(timing.presented());
     assert_eq!(timing.dropped, 0);
     (timing.sprites, read_back(r))
 }
@@ -426,7 +426,7 @@ fn a_retry_reuses_the_resources_with_a_fresh_attempt() {
     // Its poisoned `Play` is never built again: every frame answers the
     // refusal and presents nothing.
     assert_eq!(r.build(&f), Err(BuildError::InconsistentTally));
-    assert!(!r.submit().unwrap().presented);
+    assert_eq!(r.submit().unwrap().outcome, render::FrameOutcome::NotBuilt);
 
     let retry = context(&TWO, false);
     let token = r.stage(&a, &attempt(&r, &chart, &retry), 2).unwrap();

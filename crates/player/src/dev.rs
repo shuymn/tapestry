@@ -34,6 +34,7 @@ use crate::render_side::{FrameSink, Screen};
 
 pub mod checkpoints;
 mod decision_faults;
+pub mod loop_probe;
 pub mod scenario;
 pub mod transitions;
 
@@ -822,6 +823,11 @@ pub struct SelectOptions {
     /// (`--dev-stop-timeout <seconds>`): a loaded machine can starve their
     /// background-mode threads for seconds.
     pub stop_timeout: Option<std::time::Duration>,
+    /// The speculative permits asked for in place of the setting's one
+    /// (`--dev-speculative-permits <n>`), within the machine's bounds and
+    /// only while speculation is on: the select screen measured at caps 1
+    /// and 2 (design.md "Load Pipeline", System friendliness).
+    pub speculative_permits: Option<usize>,
     /// The scenario the run plays (`--dev-scenario`), which no option of
     /// selection sets: its roots, captures and inputs.
     pub scenario: Option<scenario::Session>,
@@ -855,6 +861,12 @@ impl SelectOptions {
                     UsageError::Usage("--dev-stop-timeout takes seconds".to_owned())
                 })?;
                 self.stop_timeout = Some(std::time::Duration::from_secs(secs));
+            }
+            "dev-speculative-permits" => {
+                let n = p.value()?.to_string_lossy().parse().map_err(|_| {
+                    UsageError::Usage("--dev-speculative-permits takes a count".to_owned())
+                })?;
+                self.speculative_permits = Some(n);
             }
             _ => return Err(UsageError::Unknown(format!("--{name}"))),
         }
@@ -2678,7 +2690,7 @@ impl FrameDump {
 
 impl FrameSink for FrameDump {
     fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>) {
-        if !drawn.timing.presented {
+        if !drawn.timing.presented() {
             return;
         }
         let names = self.names(drawn);
@@ -2849,6 +2861,12 @@ pub fn result_staged(uploads: u64) {
     RESULT_UPLOADS.fetch_add(uploads, Ordering::SeqCst);
 }
 
+/// The texture arrays the result's stagings uploaded so far (tests).
+#[cfg(test)]
+pub fn result_uploads() -> u64 {
+    RESULT_UPLOADS.load(Ordering::SeqCst)
+}
+
 /// Prints the result's stagings and uploads so far, at `at` in the flow.
 pub fn print_result_work(at: &str) {
     println!(
@@ -3007,17 +3025,6 @@ pub fn print_upload(cold: bool, retained: usize, t: render::UploadTiming) {
     }
 }
 
-/// Prints G2's sample, if `ready` holds one: from the attempt's
-/// `commit_ready` returning to the opening, and what the result step did.
-pub fn print_ready_to_open(ready: Option<(Instant, &str)>) {
-    if let Some((at, step)) = ready {
-        eprintln!(
-            "dev: probe G2 ready to open: {} us result {step}",
-            at.elapsed().as_micros()
-        );
-    }
-}
-
 /// Whether this selection or upload of the result kind is refused.
 pub fn refuse_result_select() -> bool {
     result_fault(
@@ -3146,7 +3153,13 @@ pub fn job_stage(kind: game::coord::JobKind, start: bool) {
         (JobKind::Loudness | JobKind::Measure, true) => "loudness_start",
         (JobKind::Loudness | JobKind::Measure, false) => "loudness_end",
         // The BGA job stamps its own, on either path.
-        (JobKind::ChartImages | JobKind::ChartCheck | JobKind::BgaImages, _) => return,
+        (
+            JobKind::ChartImages
+            | JobKind::ChartImageFill
+            | JobKind::ChartCheck
+            | JobKind::BgaImages,
+            _,
+        ) => return,
     };
     stage(name);
 }

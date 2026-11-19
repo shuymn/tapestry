@@ -394,6 +394,78 @@ fn a_queued_owned_job_promoted_takes_a_foreground_permit() {
     drop(busy);
 }
 
+/// The owner's stop ends a job waiting for its permit without running
+/// it, and a running job at its next checkpoint, both cancelled.
+#[test]
+fn a_stopped_owned_job_ends_cancelled_queued_or_running() {
+    let _w = Watchdog::arm("a_stopped_owned_job_ends_cancelled_queued_or_running");
+    let coord = Coordinator::new(CAPS);
+    let busy = coord.try_lease(Class::Speculative).unwrap();
+    let ran = Arc::new(AtomicBool::new(false));
+    let seen = Arc::clone(&ran);
+    let queued = spawn(
+        &coord,
+        "a",
+        Class::Speculative,
+        false,
+        Owner::Speculative,
+        move |_| {
+            seen.store(true, Ordering::SeqCst);
+        },
+    );
+    queued.stop();
+    assert_eq!(
+        outcome_within(&queued, *LONG).map(|o| o.outcome),
+        Some(Outcome::Cancelled),
+        "the queued job not ended by its stop"
+    );
+    assert!(!ran.load(Ordering::SeqCst));
+    drop(busy);
+    let started = Arc::new(AtomicBool::new(false));
+    let running = Arc::clone(&started);
+    let job = spawn(
+        &coord,
+        "b",
+        Class::Speculative,
+        false,
+        Owner::Speculative,
+        move |ctx| {
+            running.store(true, Ordering::SeqCst);
+            until_cancelled(ctx);
+        },
+    );
+    let end = Instant::now() + *LONG;
+    while !started.load(Ordering::SeqCst) {
+        assert!(Instant::now() < end, "the job never ran");
+        thread::yield_now();
+    }
+    job.stop();
+    let ended = outcome_within(&job, *LONG).map(|o| o.outcome);
+    // The cleanup's own deadline, inside the watchdog's after the wait
+    // above: a job its stop did not end is detached then, so the assertion
+    // below fails by name, not the watchdog.
+    let cleanup = Instant::now() + *LONG / 2;
+    for j in [queued, job] {
+        let _ = j.settle(Duration::ZERO, &Instant::now, &mut || {
+            (Instant::now() >= cleanup).then_some(())
+        });
+    }
+    assert_eq!(
+        ended,
+        Some(Outcome::Cancelled),
+        "the running job not ended by its stop"
+    );
+}
+
+/// The job's outcome, if it ends within `bound`.
+fn outcome_within<T: Clone>(job: &OwnedJob<T>, bound: Duration) -> Option<Observed<T>> {
+    let end = Instant::now() + bound;
+    match job.wait(Duration::from_millis(1), || Instant::now() >= end) {
+        Waited::Done(o) => Some(o),
+        Waited::Stopped(_) => None,
+    }
+}
+
 /// Y5.
 #[test]
 fn a_demoted_queued_job_with_no_speculative_permit_ends_cancelled() {

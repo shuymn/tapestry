@@ -2381,7 +2381,7 @@ impl FrameSink for ScenarioFrames {
     }
 
     fn frame(&mut self, screen: &dyn Screen, drawn: &Drawn<'_>) {
-        if !drawn.timing.presented {
+        if !drawn.timing.presented() {
             self.recorder.unpresented();
             return;
         }
@@ -3021,6 +3021,7 @@ fn select_args(
             frames: None,
             render_timeout,
             stop_timeout: None,
+            speculative_permits: None,
             size: None,
             window: None,
             scenario: Some(session),
@@ -4932,7 +4933,7 @@ pub(crate) mod tests {
                 cpu: std::time::Duration::ZERO,
                 sprites: 0,
                 dropped: 0,
-                presented: true,
+                outcome: render::FrameOutcome::Shown,
                 present_count: None,
             },
             statistics: None,
@@ -5155,7 +5156,7 @@ pub(crate) mod tests {
         c.bind_decision(1, TimeUs(0));
         let (mut sink, screen) = released(&c);
         let mut d = decision_frame(1, crate::measure::DecisionDrawnAs::Skin, 10);
-        d.timing.presented = false;
+        d.timing.outcome = render::FrameOutcome::Retry;
         crate::render_side::FrameSink::frame(&mut sink, &screen, &d);
         assert!(matches!(
             c.status(0).unwrap().state,
@@ -5683,7 +5684,11 @@ pub(crate) mod tests {
         ];
         for (i, &(stage, us, presented)) in frames.iter().enumerate() {
             let mut d = staged(stage, us, i64::try_from(i).unwrap());
-            d.timing.presented = presented;
+            d.timing.outcome = if presented {
+                render::FrameOutcome::Shown
+            } else {
+                render::FrameOutcome::Retry
+            };
             sink.frame(&screen, &d);
         }
         drop_bounded(sink);
@@ -5844,7 +5849,7 @@ pub(crate) mod tests {
         for (i, &state) in states.iter().enumerate() {
             let i = i64::try_from(i).unwrap();
             let mut d = staged(play_stage(state), 1_000_000 + 16_700 * i, i);
-            d.timing.presented = true;
+            d.timing.outcome = render::FrameOutcome::Shown;
             sink.frame(&screen, &d);
         }
         drop_bounded(sink);
@@ -5945,7 +5950,7 @@ pub(crate) mod tests {
         let (_, screen) = released(&Captures::of(Vec::new()));
         for (i, &(stage, us)) in frames.iter().enumerate() {
             let mut d = staged(stage, us, i64::try_from(i).unwrap());
-            d.timing.presented = true;
+            d.timing.outcome = render::FrameOutcome::Shown;
             sink.frame(&screen, &d);
         }
     }
@@ -6307,7 +6312,11 @@ pub(crate) mod tests {
                 drew,
             };
             d.presented_at = TimeUs(us);
-            d.timing.presented = presented;
+            d.timing.outcome = if presented {
+                render::FrameOutcome::Shown
+            } else {
+                render::FrameOutcome::Retry
+            };
             d
         };
         let before = this_thread();
