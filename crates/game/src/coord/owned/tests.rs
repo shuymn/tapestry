@@ -441,8 +441,14 @@ fn a_stopped_owned_job_ends_cancelled_queued_or_running() {
     }
     job.stop();
     let ended = outcome_within(&job, *LONG).map(|o| o.outcome);
+    // The cleanup's own deadline, inside the watchdog's after the wait
+    // above: a job its stop did not end is detached then, so the assertion
+    // below fails by name, not the watchdog.
+    let cleanup = Instant::now() + *LONG / 2;
     for j in [queued, job] {
-        let _ = j.settle(Duration::ZERO, &Instant::now, &mut || None::<()>);
+        let _ = j.settle(Duration::ZERO, &Instant::now, &mut || {
+            (Instant::now() >= cleanup).then_some(())
+        });
     }
     assert_eq!(
         ended,
