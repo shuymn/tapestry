@@ -1105,7 +1105,14 @@ impl ChartImageWorker {
                 cursor_row: None,
                 asked: None,
                 fill: None,
+                #[cfg(not(test))]
                 fill_mode: Arc::new(crate::priority::Checked::SYSTEM),
+                // Tests keep a fill read at its thread's priority: in
+                // background mode it can wait seconds for a core while a
+                // whole test run keeps every core busy. The mode's own
+                // tests set theirs (`with_fill_mode`).
+                #[cfg(test)]
+                fill_mode: Arc::new(crate::priority::Checked::with(|_| Ok(()))),
                 fill_off: false,
                 entries: pool::Entries::default(),
                 pool_generation: 0,
