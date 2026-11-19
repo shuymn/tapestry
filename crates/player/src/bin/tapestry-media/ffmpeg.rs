@@ -13,18 +13,23 @@
 //! Before anything else runs, the worker points FFmpeg's DLLs at hooks of
 //! its own. Every allocation they ask their C runtime for passes the
 //! worker's allocator, which refuses one above 63 MiB and records each
-//! refusal, its own or the runtime's, on the thread that asked. Every
+//! refusal, its own or the runtime's, for the player the asking thread
+//! works for. Every thread they start passes the worker's start, which has
+//! the new thread work for the player of the thread that started it, and
+//! DLLs that import any other way to start a thread are refused. Every
 //! decoder the format library opens while it probes passes the worker's
 //! open, which refuses a codec off the list and gives the decoder the pixel
 //! cap and the worker's frame allocation, as the worker gives its own
 //! decoder. That allocation refuses a frame whose coded size, the size
 //! FFmpeg allocates, is over 4 Mi pixels or 8 192 on a side, before
-//! anything is allocated. A probe that met such a frame refuses the file,
-//! and a player whose thread recorded a refused allocation fails, even
-//! where FFmpeg goes on as if the file had ended. Each decoder runs on at
-//! most two threads, so a healthy worker stays below the line at which the
-//! game ends it. Frames come out as I420 at the probed size, the size of
-//! the video's frame ring.
+//! anything is allocated, and records that too. So every refusal made for
+//! a player, on its own thread or on one FFmpeg started for it, is recorded
+//! for that player: a probe that met one refuses the file, and a player
+//! fails on one before it takes another frame or the video's end, even
+//! where FFmpeg went on as if the frame were damaged or the file had ended.
+//! Each decoder runs on at most two threads, so a healthy worker stays
+//! below the line at which the game ends it. Frames come out as I420 at
+//! the probed size, the size of the video's frame ring.
 
 use std::ffi::{CStr, c_char, c_int, c_void};
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
@@ -48,7 +53,9 @@ const BUDGET: (u64, u32) = (64 << 20, 256);
 /// FFmpeg's error for a read or a seek past its budget.
 pub const SPENT: c_int = averror(ff::EFBIG);
 
-/// The threads a decoder runs on, at most.
+/// The threads a decoder runs on, at most, so a healthy worker stays below
+/// the line at which the game ends it. FFmpeg starts them through the
+/// worker's start, so each records its refusals for the decoder's player.
 const THREADS: c_int = 2;
 
 /// The bytes the I/O context reads at a time.
@@ -142,11 +149,13 @@ pub fn init(max_alloc: usize) -> Result<(), String> {
 
 /// The worker's hooks in FFmpeg's DLLs, and what they record.
 mod hooks {
+    use std::alloc::Layout;
     use std::cell::Cell;
     use std::ffi::{CStr, c_int, c_void};
     use std::io::Write as _;
     use std::ptr;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     use super::{CODEC_IDS, MAX_PIXELS, averror, ff, text, within_cap};
 
@@ -155,6 +164,10 @@ mod hooks {
     type Realloc = unsafe extern "C" fn(*mut c_void, usize) -> *mut c_void;
     type AlignedMalloc = unsafe extern "C" fn(usize, usize) -> *mut c_void;
     type AlignedRealloc = unsafe extern "C" fn(*mut c_void, usize, usize) -> *mut c_void;
+    /// A thread's start routine, as `_beginthreadex` takes it.
+    type Start = unsafe extern "system" fn(*mut c_void) -> u32;
+    type BeginThread =
+        unsafe extern "C" fn(*mut c_void, u32, Option<Start>, *mut c_void, u32, *mut u32) -> usize;
     type Open = unsafe extern "C" fn(
         *mut ff::AVCodecContext,
         *const ff::AVCodec,
@@ -165,39 +178,136 @@ mod hooks {
     static CAP: AtomicUsize = AtomicUsize::new(super::MAX_ALLOC);
 
     // The functions the DLLs' imports held before the worker pointed them
-    // at its hooks, 0 until then: the C runtime's allocators, and the codec
-    // library's `avcodec_open2` as the format library imports it.
+    // at its hooks, 0 until then: the C runtime's allocators and thread
+    // start, and the codec library's `avcodec_open2` as the format library
+    // imports it.
     static MALLOC: AtomicUsize = AtomicUsize::new(0);
     static CALLOC: AtomicUsize = AtomicUsize::new(0);
     static REALLOC: AtomicUsize = AtomicUsize::new(0);
     static ALIGNED_MALLOC: AtomicUsize = AtomicUsize::new(0);
     static ALIGNED_REALLOC: AtomicUsize = AtomicUsize::new(0);
+    static BEGIN_THREAD: AtomicUsize = AtomicUsize::new(0);
     static OPEN: AtomicUsize = AtomicUsize::new(0);
 
+    /// The functions besides `_beginthreadex` that start a thread, or run
+    /// code on a thread of the system's: one FFmpeg started so would work
+    /// for no player, so FFmpeg's DLLs may import none of them.
+    const OTHER_STARTS: [&CStr; 14] = [
+        c"CreateThread",
+        c"CreateRemoteThread",
+        c"CreateRemoteThreadEx",
+        c"_beginthread",
+        c"thrd_create",
+        c"QueueUserWorkItem",
+        c"TrySubmitThreadpoolCallback",
+        c"CreateThreadpoolWork",
+        c"CreateThreadpoolTimer",
+        c"CreateThreadpoolWait",
+        c"CreateThreadpoolIo",
+        c"CreateTimerQueueTimer",
+        c"RegisterWaitForSingleObject",
+        c"BindIoCompletionCallback",
+    ];
+
+    /// What the threads working for a player record for it until it looks.
+    #[derive(Default)]
+    pub struct Record {
+        /// The largest allocation refused, 0 when none was.
+        refused: AtomicUsize,
+        /// A frame over the cap was refused.
+        oversize: AtomicBool,
+    }
+
+    impl Record {
+        /// The largest allocation refused since the last look, forgotten
+        /// now.
+        pub fn refused(&self) -> Option<usize> {
+            Some(self.refused.swap(0, Ordering::SeqCst)).filter(|&size| size > 0)
+        }
+
+        /// Whether a frame over the cap was refused since the last look,
+        /// forgotten now.
+        pub fn oversize(&self) -> bool {
+            self.oversize.swap(false, Ordering::SeqCst)
+        }
+    }
+
+    /// What a thread working for no player records, which nobody reads:
+    /// the worker's own setup's, and its dev-tools encoder's.
+    static NOBODY: Record = Record {
+        refused: AtomicUsize::new(0),
+        oversize: AtomicBool::new(false),
+    };
+
     thread_local! {
-        /// The largest allocation refused on this thread since its player
-        /// last looked, 0 when none was.
-        static REFUSED: Cell<usize> = const { Cell::new(0) };
-        /// A frame over the cap was refused on this thread since its player
-        /// last looked.
-        static OVERSIZE: Cell<bool> = const { Cell::new(false) };
+        /// The record of the player this thread works for, null when it
+        /// works for none: a player's input sets its own ([`Owner`]), and a
+        /// thread FFmpeg starts gets the one of the thread that started it.
+        /// A record here holds one count of its `Arc` (`Arc::into_raw`).
+        static CURRENT: Cell<*const Record> = const { Cell::new(ptr::null()) };
     }
 
-    /// The largest allocation refused on this thread since the last look,
-    /// forgotten now.
-    pub fn refused() -> Option<usize> {
-        Some(REFUSED.replace(0)).filter(|&size| size > 0)
+    /// Runs `f` on the record of the player this thread works for.
+    fn record(f: impl FnOnce(&Record)) {
+        let current = CURRENT.with(Cell::get);
+        if current.is_null() {
+            f(&NOBODY);
+        } else {
+            // SAFETY: the count this thread's `CURRENT` holds keeps it
+            // alive while it is there.
+            f(unsafe { &*current });
+        }
     }
 
-    /// Whether a frame over the cap was refused on this thread since the
-    /// last look, forgotten now.
-    pub fn oversize() -> bool {
-        OVERSIZE.replace(false)
+    /// A player's record, which its thread and every thread FFmpeg starts
+    /// from it, or from those, record for until it drops.
+    pub struct Owner {
+        /// The record, whose count this thread's `CURRENT` holds.
+        record: *const Record,
+        /// What `CURRENT` held before.
+        previous: *const Record,
     }
 
-    /// Records an allocation of `size` bytes refused on this thread.
+    impl Owner {
+        /// Has this thread record for a fresh record of its own.
+        pub fn adopt() -> Self {
+            let record = Arc::into_raw(Arc::new(Record::default()));
+            let previous = CURRENT.with(|c| c.replace(record));
+            Self { record, previous }
+        }
+
+        pub fn record(&self) -> &Record {
+            // SAFETY: the count `CURRENT` holds, given back only when this
+            // owner drops.
+            unsafe { &*self.record }
+        }
+    }
+
+    impl Drop for Owner {
+        fn drop(&mut self) {
+            // The record is given back only while this thread still records
+            // for it: an owner dropped before one adopted after it stays
+            // what the later one gives `CURRENT` back to, so it is kept.
+            let restored = CURRENT.with(|c| {
+                let ours = c.get() == self.record;
+                if ours {
+                    c.set(self.previous);
+                }
+                ours
+            });
+            if restored {
+                // SAFETY: the count `CURRENT` held, which it no longer does.
+                unsafe { drop(Arc::from_raw(self.record)) };
+            }
+        }
+    }
+
+    /// Records an allocation of `size` bytes refused for the player this
+    /// thread works for.
     fn refuse(size: usize) {
-        REFUSED.set(REFUSED.get().max(size));
+        record(|r| {
+            r.refused.fetch_max(size, Ordering::SeqCst);
+        });
     }
 
     /// Whether `size` bytes may be allocated at once; a larger allocation is
@@ -305,7 +415,7 @@ mod hooks {
             if (*ctx).codec_type == ff::AVMediaType::AVMEDIA_TYPE_VIDEO {
                 let (width, height) = ((*frame).width, (*frame).height);
                 if !within_cap(width, height) {
-                    OVERSIZE.set(true);
+                    record(|r| r.oversize.store(true, Ordering::SeqCst));
                     let _ = writeln!(
                         std::io::stderr().lock(),
                         "tapestry-media: refused a frame of {width} x {height}"
@@ -315,6 +425,93 @@ mod hooks {
             }
             ff::avcodec_default_get_buffer2(ctx, frame, flags)
         }
+    }
+
+    /// What a thread [`begin_thread`] starts gets: FFmpeg's start routine
+    /// and its argument, and the record of the thread that started it, with
+    /// a count of its `Arc` for the new thread (null when that thread works
+    /// for no player).
+    struct Started {
+        start: Start,
+        arg: *mut c_void,
+        record: *const Record,
+    }
+
+    /// Starts a thread for FFmpeg through the runtime's `_beginthreadex`,
+    /// working for the player the starting thread works for: a decoder's
+    /// frame and slice threads record for the player whose thread opened
+    /// it.
+    unsafe extern "C" fn begin_thread(
+        security: *mut c_void,
+        stack: u32,
+        start: Option<Start>,
+        arg: *mut c_void,
+        flags: u32,
+        id: *mut u32,
+    ) -> usize {
+        let (Some(f), Some(start)) = (held(&BEGIN_THREAD), start) else {
+            return 0;
+        };
+        let layout = Layout::new::<Started>();
+        // SAFETY: a layout of non-zero size. The memory comes from Rust's
+        // allocator, not the runtime's the hooks stand in front of.
+        let started = unsafe { std::alloc::alloc(layout) }.cast::<Started>();
+        if started.is_null() {
+            return 0;
+        }
+        let record = CURRENT.with(Cell::get);
+        if !record.is_null() {
+            // SAFETY: a record `CURRENT` holds a count of: one more, for the
+            // new thread.
+            unsafe { Arc::increment_strong_count(record) };
+        }
+        // SAFETY: memory of `Started`'s layout, allocated above; then the
+        // runtime's `_beginthreadex`, which the import held, given FFmpeg's
+        // arguments but the start routine and its argument.
+        let thread = unsafe {
+            started.write(Started { start, arg, record });
+            std::mem::transmute::<usize, BeginThread>(f)(
+                security,
+                stack,
+                Some(run_started),
+                started.cast(),
+                flags,
+                id,
+            )
+        };
+        if thread == 0 {
+            // SAFETY: the `Started` written above, which no thread got.
+            unsafe {
+                let Started { record, .. } = started.read();
+                std::alloc::dealloc(started.cast(), layout);
+                if !record.is_null() {
+                    drop(Arc::from_raw(record));
+                }
+            }
+        }
+        thread
+    }
+
+    /// The start routine of each thread [`begin_thread`] starts: FFmpeg's,
+    /// run working for the player of the thread that started it.
+    unsafe extern "system" fn run_started(started: *mut c_void) -> u32 {
+        // SAFETY: the `Started` `begin_thread` wrote for this thread alone,
+        // read once and freed.
+        let Started { start, arg, record } = unsafe {
+            let s = started.cast::<Started>().read();
+            std::alloc::dealloc(started.cast(), Layout::new::<Started>());
+            s
+        };
+        let previous = CURRENT.with(|c| c.replace(record));
+        // SAFETY: the start routine and argument FFmpeg gave
+        // `_beginthreadex`.
+        let code = unsafe { start(arg) };
+        CURRENT.with(|c| c.set(previous));
+        if !record.is_null() {
+            // SAFETY: the count `begin_thread` took for this thread.
+            unsafe { drop(Arc::from_raw(record)) };
+        }
+        code
     }
 
     /// Gives a decoder the pixel cap and the worker's frame allocation.
@@ -367,9 +564,10 @@ mod hooks {
     }
 
     /// Points FFmpeg's DLLs at the hooks: their C runtime's allocators at
-    /// the worker's, which refuse an allocation above `max_alloc`, and the
-    /// format library's decoder opens at the worker's. FFmpeg's own cap is
-    /// lifted, so a request it would refuse reaches the worker's allocator.
+    /// the worker's, which refuse an allocation above `max_alloc`, its
+    /// thread start at the worker's, and the format library's decoder opens
+    /// at the worker's. FFmpeg's own cap is lifted, so a request it would
+    /// refuse reaches the worker's allocator.
     pub fn install(max_alloc: usize) -> Result<(), String> {
         CAP.store(max_alloc, Ordering::Relaxed);
         // SAFETY: each returns a static string inside its own library.
@@ -381,7 +579,7 @@ mod hooks {
                 ff::swscale_configuration().cast::<c_void>(),
             )
         };
-        let allocators: [(&CStr, &AtomicUsize, *const c_void); 5] = [
+        let runtime: [(&CStr, &AtomicUsize, *const c_void); 6] = [
             (c"malloc", &MALLOC, malloc as Malloc as *const c_void),
             (c"calloc", &CALLOC, calloc as Calloc as *const c_void),
             (c"realloc", &REALLOC, realloc as Realloc as *const c_void),
@@ -395,9 +593,24 @@ mod hooks {
                 &ALIGNED_REALLOC,
                 aligned_realloc as AlignedRealloc as *const c_void,
             ),
+            (
+                c"_beginthreadex",
+                &BEGIN_THREAD,
+                begin_thread as BeginThread as *const c_void,
+            ),
         ];
         for library in [util, codec, format, scale] {
-            for (name, original, hook) in allocators {
+            for name in OTHER_STARTS {
+                let imported = crate::os::imports(library, name)
+                    .map_err(|e| format!("{}: {e}", name.to_string_lossy()))?;
+                if imported {
+                    return Err(format!(
+                        "FFmpeg's DLLs start threads through {}, which the worker does not hook",
+                        name.to_string_lossy()
+                    ));
+                }
+            }
+            for (name, original, hook) in runtime {
                 point(library, name, original, hook)?;
             }
         }
@@ -407,11 +620,14 @@ mod hooks {
             &OPEN,
             open as Open as *const c_void,
         )?;
-        // `av_malloc` and `av_realloc` allocate through these two: without
-        // them the cap would not hold.
+        // `av_malloc` and `av_realloc` allocate through the two aligned
+        // allocators, without which the cap would not hold, and FFmpeg's
+        // threads start through `_beginthreadex`, without which their
+        // refusals would be recorded for no player.
         for (name, original) in [
             ("_aligned_malloc", &ALIGNED_MALLOC),
             ("_aligned_realloc", &ALIGNED_REALLOC),
+            ("_beginthreadex", &BEGIN_THREAD),
             ("avcodec_open2", &OPEN),
         ] {
             if held(original).is_none() {
@@ -701,6 +917,10 @@ pub struct Input {
     height: c_int,
     /// The demuxer has given its last packet and the decoder is draining.
     drained: bool,
+    /// What this input's player records, on its thread and on FFmpeg's:
+    /// the last field, given back after the drop has freed the contexts and
+    /// stopped FFmpeg's threads.
+    owner: hooks::Owner,
 }
 
 impl Input {
@@ -716,6 +936,9 @@ impl Input {
     /// probed for its decoder (with `ENOMEM`), and a probe past its budget
     /// for its reading (with [`SPENT`]).
     pub fn open(file: std::fs::File, io: IoOpen) -> Result<(Self, Probe), (Refusal, c_int)> {
+        // Before any call into FFmpeg: this thread, and each thread FFmpeg
+        // starts for this input, records for this input's record alone.
+        let owner = hooks::Owner::adopt();
         let source = Box::new(Budgeted {
             file,
             scratch: vec![0; IO_BUFFER.unsigned_abs() as usize].into_boxed_slice(),
@@ -737,20 +960,19 @@ impl Input {
             width: 0,
             height: 0,
             drained: false,
+            owner,
         };
-        // What an earlier open on this thread left recorded is not this
-        // file's.
-        let _ = (hooks::refused(), hooks::oversize());
         // SAFETY: each call gets the contexts this function allocated (or
         // FFmpeg's documented null), checked before use; `input` frees
         // whatever exists when it drops, on every return.
         let probe = unsafe { input.probe(io) };
         let spent = input.source().spent;
         input.budget(None);
-        if hooks::oversize() {
+        let record = input.owner.record();
+        if record.oversize() {
             return Err((Refusal::Size, 0));
         }
-        if let Some(size) = hooks::refused() {
+        if let Some(size) = record.refused() {
             refused_allocation(size);
             return Err((Refusal::Decoder, averror(ff::ENOMEM)));
         }
@@ -925,10 +1147,21 @@ impl Input {
     ///
     /// # Errors
     ///
-    /// When the file cannot be read, an allocation is refused on the
-    /// player's thread (one FFmpeg went on from as well) or the decoder
-    /// fails; a damaged packet FFmpeg skips is not an error.
+    /// When the file cannot be read, an allocation made for the player is
+    /// refused, a frame over the cap among them (one FFmpeg went on from as
+    /// well), or the decoder fails; a damaged packet FFmpeg skips is not an
+    /// error.
     pub fn next(&mut self, out: &mut [u8]) -> Result<Option<i64>, (Failure, c_int)> {
+        let next = self.next_unchecked(out);
+        // A refusal made while the frame was decoded and converted, or while
+        // the decoder drained, fails the player before the frame or the end
+        // is taken.
+        self.check()?;
+        next
+    }
+
+    /// [`Input::next`] before its last look for a refusal.
+    fn next_unchecked(&mut self, out: &mut [u8]) -> Result<Option<i64>, (Failure, c_int)> {
         loop {
             if !self.decode()? {
                 return Ok(None);
@@ -957,11 +1190,11 @@ impl Input {
     ) -> Result<Option<Landed>, (Failure, c_int)> {
         self.budget(Some(BUDGET));
         let landed = self.seek_within_budget(target, out);
-        let spent = self.source().spent;
+        // As in `next`, before the landing or the end is taken; a seek past
+        // its budget fails for its reading.
+        let checked = self.check();
         self.budget(None);
-        if spent {
-            return Err((Failure::Read, SPENT));
-        }
+        checked?;
         landed
     }
 
@@ -1013,13 +1246,20 @@ impl Input {
         Ok(None)
     }
 
-    /// Fails the player when an allocation was refused on its thread since
-    /// the last look, FFmpeg's error or not, or when the seek under way has
-    /// spent its budget.
+    /// Fails the player when an allocation made for it was refused since
+    /// the last look, on its thread or on one FFmpeg started for it, or a
+    /// frame over the cap, FFmpeg's error or not, or when the seek under way
+    /// has spent its budget.
     fn check(&mut self) -> Result<(), (Failure, c_int)> {
-        if let Some(size) = hooks::refused() {
+        let record = self.owner.record();
+        if let Some(size) = record.refused() {
             refused_allocation(size);
             return Err((Failure::Memory, averror(ff::ENOMEM)));
+        }
+        if record.oversize() {
+            // The error the frame allocation gave, whether the decoder
+            // passed it on or went on from it.
+            return Err((Failure::Decode, averror(ff::EINVAL)));
         }
         if self.source().spent {
             return Err((Failure::Read, SPENT));

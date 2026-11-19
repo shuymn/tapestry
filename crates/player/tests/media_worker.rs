@@ -7,8 +7,8 @@
 //! the pinned build, the codec and container allow-list, the worker's open
 //! of the decoders FFmpeg's probe opens, the pixel cap on the size FFmpeg
 //! allocates, the probe's read budget, the refused allocations a demuxer
-//! goes on from, the refused secondary open, the decoded frames' stamps,
-//! the seek's back-off and the zlib-compressed containers.
+//! or a decoder goes on from, the refused secondary open, the decoded
+//! frames' stamps, the seek's back-off and the zlib-compressed containers.
 //!
 //! The clips are made by the worker's own `--dev-gen-clip` (dev-tools), so
 //! those tests need dev-tools; the committed fixtures (`tests/media/`), the
@@ -1204,6 +1204,54 @@ fn h264_cropped(coded: (u32, u32), shown: (u32, u32), frames: u64) -> Vec<Vec<u8
         .collect()
 }
 
+/// The payload of IDR slice `i` of a grey picture of `coded` pixels, which
+/// decodes: an I slice of the whole picture, deblocking off, each
+/// macroblock predicted from its neighbours' mean (I_16x16, DC) with no
+/// residual.
+fn h264_grey(i: u64, coded: (u32, u32)) -> Vec<u8> {
+    let mut bits = Bits::default();
+    bits.ue(0)
+        .ue(7)
+        .ue(0)
+        .u(4, 0)
+        .ue(i)
+        .bit(false)
+        .bit(false)
+        .se(0)
+        .ue(1);
+    for _ in 0..(coded.0 / 16) * (coded.1 / 16) {
+        // The macroblock's type, its chroma's DC prediction, no change of
+        // quantizer, and no coefficient in its luma's DC block.
+        bits.ue(3).ue(0).se(0).bit(true);
+    }
+    bits.rbsp()
+}
+
+/// One part of an H.264 stream: the pixels its sequence codes, the pixels
+/// it crops them to, and how many grey IDR pictures it holds.
+type Part = ((u32, u32), (u32, u32), u64);
+
+/// The access units of an H.264 stream (Annex B) in parts, each a
+/// sequence that codes `coded` pixels, crops them to `shown` and holds
+/// `frames` grey IDR pictures, its parameter sets before its first.
+fn h264_parts(parts: &[Part]) -> Vec<Vec<u8>> {
+    let mut units = Vec::new();
+    for &(coded, shown, frames) in parts {
+        let (sps, pps) = h264_sets(coded, shown);
+        for f in 0..frames {
+            let mut unit = Vec::new();
+            if f == 0 {
+                unit.extend(nal(0x67, &sps));
+                unit.extend(nal(0x68, &pps));
+            }
+            let i = u64::try_from(units.len()).unwrap();
+            unit.extend(nal(0x65, &h264_grey(i, coded)));
+            units.push(unit);
+        }
+    }
+    units
+}
+
 /// An AVI file of one video stream of `fourcc` at `size` and `rate`
 /// frames a second, its frames `frames`, without an index.
 fn avi(size: (u32, u32), rate: u32, fourcc: &[u8; 4], frames: &[Vec<u8>]) -> Vec<u8> {
@@ -1525,6 +1573,170 @@ fn worker_caps_a_decoder_ffmpeg_opens_again_for_a_new_sample_description() {
         worker.log()
     );
     worker.close(1);
+}
+
+// Covers: T02
+#[test]
+fn worker_caps_the_coded_size_of_h264_frames_after_the_probe() {
+    use skin_model::media::control::Failure;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Ten seconds of H.264 at 64 × 48, then a sequence the probe never
+    // reads, coded at 8 192 × 4 096 (48 MiB a frame) and cropped to
+    // 1 920 × 1 080: FFmpeg's own cap reads the shown size, the worker's
+    // allocation refuses the coded one on the frame thread FFmpeg started
+    // for the player, and the decoder goes on from each such frame as from
+    // a damaged one.
+    let path = dir.path().join("grows.avi");
+    let units = h264_parts(&[((64, 48), (64, 48), 240), ((8192, 4096), (1920, 1080), 4)]);
+    std::fs::write(&path, avi((64, 48), 24, b"H264", &units)).unwrap();
+
+    let mut worker = Worker::start(&[]);
+    let probe = worker.open(1, &path);
+    assert!(
+        matches!(
+            probe,
+            Reply::Probed {
+                player: 1,
+                width: 64,
+                height: 48,
+                ..
+            }
+        ),
+        "{probe:?}; the worker's log:\n{}",
+        worker.log()
+    );
+    let mut ring = Ring::new(64, 48);
+    let before = worker.peak_commit();
+    assert_eq!(worker.play(1, &ring), Reply::Playing { player: 1 });
+    let deadline = Instant::now() + REPLY;
+    let mut taken = Vec::new();
+    let end = loop {
+        assert!(
+            Instant::now() < deadline,
+            "{} frames; the worker's log:\n{}",
+            taken.len(),
+            worker.log()
+        );
+        if let Some(frame) = ring.poll(i64::MAX) {
+            taken.push(frame.stamp);
+            continue;
+        }
+        if let Some(reply) = worker.try_reply() {
+            break reply;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    };
+    while let Some(frame) = ring.poll(i64::MAX) {
+        taken.push(frame.stamp);
+    }
+    // The first frame past the cap fails the player, with the error the
+    // worker's allocation gave; every frame before it came.
+    assert_eq!(
+        end,
+        Reply::Failed {
+            player: 1,
+            why: Failure::Decode,
+            code: -22,
+        },
+        "the worker's log:\n{}",
+        worker.log()
+    );
+    assert!(worker.log().contains("refused a frame of 8192 x 4096"));
+    assert_eq!(
+        taken.last(),
+        Some(&((239 * 1_000_000 + 12) / 24)),
+        "{taken:?}"
+    );
+    // Nothing of a frame of the coded size was allocated.
+    let peak = worker.peak_commit();
+    assert!(
+        peak < before + (32 << 20),
+        "the worker's peak commit rose from {before} to {peak}"
+    );
+    worker.close(1);
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn h264_decoder_enomem_fails_one_player_and_the_worker_lives() {
+    use skin_model::media::control::Failure;
+
+    let dir = tempfile::tempdir().unwrap();
+    // Player 1 plays ten seconds of H.264 at 64 × 48 and then 1 920 × 1 080
+    // frames, whose planes are larger than the lowered cap on one
+    // allocation. FFmpeg's decoder, on the frame threads it started for
+    // the player, goes on from a picture it could not allocate as from a
+    // damaged one; the refusal, recorded for the player, fails it. Player
+    // 2 plays 64 × 48 frames throughout.
+    let grows = dir.path().join("grows.avi");
+    let units = h264_parts(&[((64, 48), (64, 48), 240), ((1920, 1088), (1920, 1080), 4)]);
+    std::fs::write(&grows, avi((64, 48), 24, b"H264", &units)).unwrap();
+    let steady = gen_clip(dir.path(), "steady.mpg", "mpeg1video mpeg 64x48 24 1440 12");
+
+    let mut worker = Worker::start(&["--dev-max-alloc", "1048576"]);
+    let mut rings = Vec::new();
+    for (player, path) in [(1, &grows), (2, &steady)] {
+        let probe = worker.open(player, path);
+        assert!(
+            matches!(
+                probe,
+                Reply::Probed {
+                    width: 64,
+                    height: 48,
+                    ..
+                }
+            ),
+            "{probe:?}; the worker's log:\n{}",
+            worker.log()
+        );
+        let ring = Ring::new(64, 48);
+        assert_eq!(worker.play(player, &ring), Reply::Playing { player });
+        rings.push(ring);
+    }
+    let [one, two] = &mut rings[..] else {
+        unreachable!()
+    };
+    let deadline = Instant::now() + REPLY;
+    let mut frames = [0, 0];
+    let failed = loop {
+        assert!(
+            Instant::now() < deadline,
+            "the worker's log:\n{}",
+            worker.log()
+        );
+        frames[0] += usize::from(one.poll(i64::MAX).is_some());
+        frames[1] += usize::from(two.poll(HOLD).is_some());
+        if let Some(reply) = worker.try_reply() {
+            break reply;
+        }
+    };
+    assert_eq!(
+        failed,
+        Reply::Failed {
+            player: 1,
+            why: Failure::Memory,
+            code: -12,
+        },
+        "the worker's log:\n{}",
+        worker.log()
+    );
+    assert!(frames[0] > 0, "player 1 showed no frame before it failed");
+    // Player 2's frames keep coming.
+    let before = frames[1];
+    while frames[1] < before + 24 {
+        assert!(
+            Instant::now() < deadline,
+            "the worker's log:\n{}",
+            worker.log()
+        );
+        frames[1] += usize::from(two.poll(i64::MAX).is_some());
+        assert_eq!(worker.try_reply(), None, "player 2 ended or failed early");
+    }
+    for player in [1, 2] {
+        worker.close(player);
+    }
 }
 
 /// `clip`, an MPEG-PS file, with a run of padding packets `bytes` long

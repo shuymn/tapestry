@@ -257,6 +257,17 @@ impl Image {
     }
 }
 
+/// Whether the module holding `inside` imports a function named `name`.
+///
+/// # Errors
+///
+/// When the module's headers or imports do not read as a loaded 64-bit
+/// image's, or its imports of `name` hold different addresses.
+pub fn imports(inside: *const c_void, name: &CStr) -> Result<bool, &'static str> {
+    let image = Image::holding(inside).ok_or(UNREADABLE)?;
+    Ok(!image.slots(name)?.0.is_empty())
+}
+
 /// Points every import of the function `name` by the module holding
 /// `inside` at `to`, and gives the address those imports held, the same in
 /// each: `None` when the module imports no function of that name.
