@@ -1274,6 +1274,7 @@ version = "0.0.0"
 dependencies = [
  "cortex-m",
  "cortex-m-rt",
+ "critical-section",
  "embassy-executor",
  "embassy-futures",
  "embassy-rp",

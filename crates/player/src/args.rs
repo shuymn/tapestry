@@ -36,6 +36,9 @@ pub enum Command {
     /// `--dev-scenario <file.toml> [--dev-render-timeout <s>]`.
     #[cfg(feature = "dev-tools")]
     Scenario(crate::dev::scenario::ScenarioArgs),
+    /// `test-device <command>`: the test input device's host side.
+    #[cfg(feature = "dev-tools")]
+    TestDevice(crate::dev::test_device::TestDevice),
 }
 
 /// `play`'s arguments.
@@ -128,6 +131,8 @@ pub fn parse(args: impl IntoIterator<Item = OsString>) -> Result<Command, UsageE
         Some(Arg::Value(v)) if v == "keys" => Command::Keys(keys(&mut p)?),
         #[cfg(feature = "dev-tools")]
         Some(Arg::Value(v)) if v == "measure" => crate::dev::measure_args(&mut p)?,
+        #[cfg(feature = "dev-tools")]
+        Some(Arg::Value(v)) if v == "test-device" => crate::dev::test_device::args(&mut p)?,
         Some(other) => return Err(other.unexpected().into()),
     };
     Ok(command)
@@ -568,6 +573,69 @@ mod tests {
             parsed(&["play", "a.bms", "--auto", "--dev-headless"]).unwrap_err(),
             unknown("--dev-headless")
         );
+    }
+
+    /// A production build does not know the `test-device` command.
+    #[cfg(not(feature = "dev-tools"))]
+    #[test]
+    fn a_production_build_refuses_test_device() {
+        for args in [
+            &["test-device", "devices"][..],
+            &[
+                "test-device",
+                "flash",
+                "a.uf2",
+                "--build",
+                "b",
+                "--port",
+                "L",
+            ],
+            &["test-device"],
+        ] {
+            assert_eq!(
+                parsed(args).unwrap_err(),
+                unknown("test-device"),
+                "{args:?}"
+            );
+        }
+    }
+
+    /// `flash` and `bootsel` take the device's location; without it they
+    /// are a usage error.
+    #[cfg(feature = "dev-tools")]
+    #[test]
+    fn flash_and_bootsel_need_a_location() {
+        use crate::dev::test_device::TestDevice;
+        let location = "PCIROOT(0)#PCI(1400)#USBROOT(0)#USB(3)";
+        let usage = |args: &[&str]| match parsed(args) {
+            Err(UsageError::Usage(u)) => u,
+            other => panic!("{args:?}: {other:?}"),
+        };
+        assert!(
+            usage(&["test-device", "flash", "a.uf2", "--build", "b"]).contains("--port <location>")
+        );
+        assert!(usage(&["test-device", "bootsel"]).contains("--port <location>"));
+        let Ok(Command::TestDevice(TestDevice::Flash { uf2, build, port })) = parsed(&[
+            "test-device",
+            "flash",
+            "a.uf2",
+            "--build",
+            "b",
+            "--port",
+            location,
+        ]) else {
+            panic!("no flash");
+        };
+        assert_eq!(
+            (uf2, build.as_str(), port.as_str()),
+            (Path::new("a.uf2").to_owned(), "b", location)
+        );
+        let Ok(Command::TestDevice(TestDevice::Bootsel { port })) =
+            parsed(&["test-device", "bootsel", "--port", location])
+        else {
+            panic!("no bootsel");
+        };
+        assert_eq!(port, location);
     }
 
     /// A production build does not know `--dev-scenario`.

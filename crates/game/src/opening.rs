@@ -42,9 +42,9 @@
 //!    specialization declares its loading time from its first loading
 //!    frame, or at the commit when no frame drew it before) is
 //!    waited out with acceptance reopened, then closed again on a fresh,
-//!    quiet snapshot applied to the starting settings; the end of loading
-//!    and the last look; then recording opens through the common play
-//!    loop, once.
+//!    quiet snapshot applied to the starting settings; the end of
+//!    loading, the wait for the render side's cutoff and the last look;
+//!    then recording opens through the common play loop, once.
 //!
 //! A deferred opening reopens tuning acceptance. One deferred by a held
 //! START or SELECT is asked again at the release; one deferred for focus
@@ -62,7 +62,7 @@ use input::GateState;
 use crate::attempt::{Preparation, PreparationRefusal};
 use crate::live::{
     FirstOpening, InputWaitError, Leave, LiveError, LoadingGate, OpenPolicy, Opening, PREP_SLICE,
-    Played, Rig, open_and_play, preflight, refused, threads_over,
+    Played, Rig, open_and_play, preflight, refused, threads_over, wait_cutoff,
 };
 use crate::prep::{PrepHandle, PrepKey, PrepPoll, Readiness};
 use crate::session::{Command, Loaded, PlayStart, Settings};
@@ -537,8 +537,9 @@ fn dispose<R: Rig>(loaded: &mut Loaded, rig: &mut R, start: Option<PlayStart>) {
     }
 }
 
-/// The commit, the end of loading and the last look: `false` when the
-/// player quit or closed before the end of loading or at the last look.
+/// The commit, the end of loading, the wait for the render side's cutoff
+/// and the last look: `false` when the player quit or closed before the
+/// end of loading, while the cutoff was waited for, or at the last look.
 ///
 /// A pending play skin's specialization declares its loading time from
 /// its first loading frame, or at the commit when no frame drew it before
@@ -547,8 +548,8 @@ fn dispose<R: Rig>(loaded: &mut Loaded, rig: &mut R, start: Option<PlayStart>) {
 /// state waits as before the opening; then acceptance closes again on a
 /// fresh copy, which must be quiet and past the minimum at one time
 /// (else it reopens and waits on) and becomes the starting settings. The
-/// commit is not taken again, and the closed gap is the end of loading
-/// and the last look.
+/// commit is not taken again, and the closed gap is the end of loading,
+/// the cutoff's wait and the last look.
 #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
 fn commit<R: LoadingRig>(
     loaded: &mut Loaded,
@@ -576,6 +577,9 @@ fn commit<R: LoadingRig>(
         rig.apply_snapshot(&snapshot, loaded.settings_mut());
     }
     rig.end_loading().map_err(LiveError::Screen)?;
+    if !wait_cutoff(rig, quit_look)? {
+        return Ok(false);
+    }
     preflight(rig)?;
     Ok(!quit_look(rig))
 }

@@ -175,6 +175,40 @@ pub(crate) struct ChartPool {
     texture: wgpu::Texture,
     view: wgpu::TextureView,
     records: [Option<Record>; POOL_MAX_SLOTS as usize],
+    /// The number of the last submission that uses the array: the one
+    /// carrying its creation's or a row's queued writes, or a frame that
+    /// drew it ([`Gpu::submit`], [`Gpu::queued_use`]).
+    last_use: AtomicU64,
+}
+
+/// A retired pool's device resources alone: its texture, without its
+/// records or its view (a bind group still binding the view keeps its own
+/// reference, and retires with it) (design.md "Memory Budget").
+#[derive(Debug)]
+pub(crate) struct RetiredPool {
+    pub(crate) texture: wgpu::Texture,
+    /// The layers it had, for the witness.
+    pub(crate) layers: u32,
+    /// Its grid's texels per layer, for the witness.
+    pub(crate) layer_texels: u64,
+    /// Its last use when it was retired.
+    pub(crate) last_use: u64,
+}
+
+impl RetiredPool {
+    /// Its level-0 texels, every layer: what it was charged.
+    pub(crate) const fn texels(&self) -> u64 {
+        self.layer_texels.saturating_mul(self.layers as u64)
+    }
+
+    /// Its bytes on the GPU: every layer at its levels, RGBA8.
+    pub(crate) fn bytes(&self) -> u64 {
+        let side = u64::from(self.texture.width());
+        (0..self.texture.mip_level_count())
+            .map(|k| (side >> k) * (side >> k) * 4)
+            .sum::<u64>()
+            .saturating_mul(u64::from(self.layers))
+    }
 }
 
 impl ChartPool {
@@ -225,6 +259,29 @@ impl ChartPool {
             texture,
             view,
             records: [None; POOL_MAX_SLOTS as usize],
+            last_use: AtomicU64::new(gpu.queued_use()),
+        }
+    }
+
+    /// Records `number` as the array's last use, when later than the one
+    /// recorded.
+    pub(crate) fn mark(&self, number: u64) {
+        self.last_use.fetch_max(number, Ordering::AcqRel);
+    }
+
+    /// The number of the last submission that uses the array.
+    pub(crate) fn last_use(&self) -> u64 {
+        self.last_use.load(Ordering::Acquire)
+    }
+
+    /// Its device resources, to retire it.
+    pub(crate) fn retire(self) -> RetiredPool {
+        let layer_texels = self.grid.layer_texels();
+        RetiredPool {
+            last_use: self.last_use(),
+            layers: self.layers,
+            layer_texels,
+            texture: self.texture,
         }
     }
 
@@ -249,11 +306,6 @@ impl ChartPool {
         self.layers
     }
 
-    /// Its grid.
-    pub(crate) const fn grid(&self) -> Grid {
-        self.grid
-    }
-
     /// The array's view, for the selection's bind group.
     pub(crate) const fn view(&self) -> &wgpu::TextureView {
         &self.view
@@ -263,17 +315,6 @@ impl ChartPool {
     #[cfg(test)]
     pub(crate) const fn texture(&self) -> &wgpu::Texture {
         &self.texture
-    }
-
-    /// The firm layer's level-0 texels, charged with the selection
-    /// installation.
-    pub(crate) fn firm_texels(&self) -> u64 {
-        self.grid.layer_texels()
-    }
-
-    /// The optional layers' level-0 texels: the reclaimable term.
-    pub(crate) fn optional_texels(&self) -> u64 {
-        u64::from(self.layers.saturating_sub(1)).saturating_mul(self.grid.layer_texels())
     }
 
     /// Slot `slot`'s table, keyed `key`, when its write was applied:
@@ -348,6 +389,9 @@ impl ChartPool {
                 fault(gpu);
             }
         });
+        // Queued, whatever the scopes report: the next submission carries
+        // the writes.
+        self.last_use.fetch_max(gpu.queued_use(), Ordering::AcqRel);
         if refused.is_some() {
             return Err(PoolWriteError::Refused);
         }

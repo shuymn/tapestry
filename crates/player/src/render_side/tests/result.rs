@@ -331,18 +331,64 @@ impl Screen for Recorded {
     fn disable_result(&mut self) {
         self.menu.disable_result();
     }
-    fn drain_retired(&mut self) -> Option<skin_model::AtlasId> {
-        self.menu.drain_retired()
-    }
     fn installed_pages(&self, kind: ScreenKind) -> Option<Arc<skin_model::PackedPages>> {
         self.menu.installed_pages(kind)
     }
-    fn retained_atlases(&self, kind: ScreenKind) -> [Option<skin_model::AtlasId>; 3] {
+    fn retained_atlases(
+        &self,
+        kind: ScreenKind,
+    ) -> [Option<skin_model::AtlasId>; render::RETAINED_ATLASES] {
+        // The report reads the screen's atlases once a publication.
         self.faults.cleanups.lock().unwrap().push((
             self.faults.submits.load(Ordering::Acquire),
             crate::dev::presents_marked(),
         ));
         self.menu.retained_atlases(kind)
+    }
+    fn poll_completion(&mut self) -> Result<(), render::RenderError> {
+        self.menu.poll_completion()
+    }
+    fn set_destroy_allowed(&mut self, allowed: bool) {
+        self.menu.set_destroy_allowed(allowed);
+    }
+    fn filled(&self) -> u32 {
+        self.menu.filled()
+    }
+    fn destroy_due(&mut self, heavy: bool) -> render::Destroyed {
+        self.menu.destroy_due(heavy)
+    }
+    fn due_heavy(&self) -> bool {
+        self.menu.due_heavy()
+    }
+    fn pending_completion(&self) -> bool {
+        self.menu.pending_completion()
+    }
+    fn pool_owed(&self) -> bool {
+        self.menu.pool_owed()
+    }
+    fn make_owed_pool(&mut self) -> bool {
+        self.menu.make_owed_pool()
+    }
+    fn take_handoff(&mut self) -> Option<render::Handoff> {
+        self.menu.take_handoff()
+    }
+    fn return_handoff(&mut self, entry: usize, cpu: render::CpuParts) -> bool {
+        self.menu.return_handoff(entry, cpu)
+    }
+    fn result_changes(&self) -> u64 {
+        self.menu.result_changes()
+    }
+    fn heavy_ops(&self) -> render::HeavyOps {
+        self.menu.heavy_ops()
+    }
+    fn grant_ready(&self) -> bool {
+        self.menu.grant_ready()
+    }
+    fn bga_in_use(&self) -> bool {
+        self.menu.bga_in_use()
+    }
+    fn entries_holding_pages(&self) -> [bool; render::RETIREMENT_ENTRIES] {
+        self.menu.entries_holding_pages()
     }
     fn prepare_result(
         &mut self,
@@ -1101,9 +1147,14 @@ fn a_withdrawn_upload_installs_nothing_when_released() {
     );
     crate::dev::hold_result_uploads(false);
     assert!(rig.link.fence(Duration::from_secs(10)));
-    let status = rig.link.result_status();
-    assert_eq!(status.installed, None);
-    assert!(!status.retained.contains(&skin.atlas_id()), "{status:?}");
+    assert_eq!(rig.link.result_status().installed, None);
+    // The withdrawn staging's array waits in its own retirement entry
+    // until a boundary destroys it (design.md "Memory Budget"): it goes.
+    assert!(
+        wait_until(|| !rig.link.result_status().retained.contains(&skin.atlas_id())),
+        "{:?}",
+        rig.link.result_status()
+    );
     // The positive control: the same upload answered installs its pages.
     let pending = rig
         .link
@@ -1612,8 +1663,17 @@ fn a_withdrawn_pages_replacement_leaves_nothing_installed() {
     assert!(rig.link.fence(Duration::from_secs(10)));
     let status = rig.link.result_status();
     assert_eq!(status.installed, None, "{status:?}");
-    assert!(!status.retained.contains(&a.atlas_id()), "{status:?}");
-    assert!(!status.retained.contains(&b.atlas_id()), "{status:?}");
+    // `a` waits in the entry the begin's release filled, `b` in the
+    // withdrawn staging's, each until a boundary destroys it (design.md
+    // "Memory Budget"): both go.
+    assert!(
+        wait_until(|| {
+            let s = rig.link.result_status();
+            !s.retained.contains(&a.atlas_id()) && !s.retained.contains(&b.atlas_id())
+        }),
+        "{:?}",
+        rig.link.result_status()
+    );
     rig.link.exit();
 }
 
@@ -2088,7 +2148,9 @@ fn result_frame_alloc() {
         );
         screen.submit_result().unwrap();
         side.dropped = [None, None];
-        let _ = screen.drain_retired();
+        // What the commit retired goes before the next cycle, outside
+        // the spans counted.
+        crate::render_side::settle_entries(&mut screen);
     }
     // A frame the skin refuses allocates nothing either.
     screen.refuse_next_result(false);
@@ -2175,11 +2237,13 @@ fn a_held_upload_is_withdrawn_by_the_flow() {
             );
             crate::dev::hold_result_uploads(false);
             assert!(p.render.fence(Duration::from_secs(10)));
-            let status = p.render.result_status();
-            assert_eq!(status.installed, None, "{stop}");
+            assert_eq!(p.render.result_status().installed, None, "{stop}");
+            // The withdrawn staging's array waits in its retirement entry
+            // until a boundary destroys it (design.md "Memory Budget").
             assert!(
-                !status.retained.contains(&skin.atlas_id()),
-                "{stop}: {status:?}"
+                wait_until(|| !p.render.result_status().retained.contains(&skin.atlas_id())),
+                "{stop}: {:?}",
+                p.render.result_status()
             );
         });
     }
@@ -3186,7 +3250,9 @@ fn the_build_mark_precedes_the_result_build() {
         let start = render::take_build_start().expect("the build began");
         assert!(mark <= start, "frame {k}: the build began before its mark");
         side.dropped = [None, None];
-        let _ = screen.drain_retired();
+        // What the commit retired goes before the next cycle, outside
+        // the spans counted.
+        crate::render_side::settle_entries(&mut screen);
     }
 }
 

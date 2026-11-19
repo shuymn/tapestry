@@ -197,7 +197,9 @@ impl Want {
 /// A step of the publication, which the render thread answers on `reply`
 /// ([`crate::render_side::RenderMsg::Bga`]).
 pub enum BgaMsg {
-    /// Begin an array of `pages` pages ([`render::Renderer::begin_bga`]).
+    /// Begin an array of `pages` pages ([`render::Renderer::begin_bga`]),
+    /// at the render thread's next frame boundary that runs a heavy
+    /// operation.
     Begin {
         pages: u32,
         reply: mpsc::SyncSender<Result<BgaKey, BgaFault>>,
@@ -212,7 +214,9 @@ pub enum BgaMsg {
         reply: mpsc::SyncSender<Result<(), BgaFault>>,
     },
     /// Publish the table ([`render::Renderer::publish_bga`]), answering
-    /// through `reply` only while it is in time.
+    /// through `reply` only while it is in time. The absent table, with an
+    /// array in use, is published at the render thread's next frame
+    /// boundary that runs a heavy operation, after that array's drop.
     Publish {
         key: Option<BgaKey>,
         entries: Vec<BgaEntry>,
@@ -224,7 +228,9 @@ pub enum BgaMsg {
         key: BgaKey,
         reply: mpsc::SyncSender<Option<Arc<BgaTable>>>,
     },
-    /// Drop the array and its table ([`render::Renderer::drop_bga`]).
+    /// Drop the array and its table ([`render::Renderer::drop_bga`]): at
+    /// the render thread's next frame boundary that runs a heavy
+    /// operation, with an array in use.
     Drop,
 }
 
@@ -278,13 +284,26 @@ impl Answer {
     /// The render thread's answer: publishes with `publish` and answers
     /// with its table while no answer was given and the bound has not
     /// passed; otherwise publishes nothing and ends the answer unanswered.
-    pub fn give(&self, publish: impl FnOnce() -> Result<Arc<BgaTable>, BgaFault>) {
+    /// Returns whether `publish` ran (an absent publication's drop of the
+    /// array in use with it, a heavy operation at a frame boundary).
+    pub fn give(&self, publish: impl FnOnce() -> Result<Arc<BgaTable>, BgaFault>) -> bool {
         let mut s = self.state();
         if matches!(*s, Answering::Pending) && Instant::now() < self.by {
             *s = Answering::Given(publish());
             self.given.notify_all();
+            true
         } else {
             *s = Answering::Over;
+            false
+        }
+    }
+
+    /// The answer given, if one was, left in place (tests).
+    #[cfg(all(test, feature = "dev-tools"))]
+    pub(crate) fn given(&self) -> Option<Result<Arc<BgaTable>, BgaFault>> {
+        match &*self.state() {
+            Answering::Given(t) => Some(t.clone()),
+            Answering::Pending | Answering::Over => None,
         }
     }
 

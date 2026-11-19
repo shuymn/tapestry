@@ -289,6 +289,14 @@ pub struct ResultSkin {
     /// The atlases the renderer still references, as it last reported
     /// them ([`Self::set_retained`]).
     retained: Vec<AtlasId>,
+    /// Development builds: the render side's holders of each, as last
+    /// reported ([`Self::set_holders`]).
+    #[cfg(feature = "dev-tools")]
+    holders: Vec<(AtlasId, crate::result_present::Holders)>,
+    /// Development builds: the stage a view's build is asked for, as the
+    /// no-room line names it ([`Self::set_stage`]).
+    #[cfg(feature = "dev-tools")]
+    stage: &'static str,
     /// The latest request, and the view it asked for.
     latest: Option<(u64, ViewFacts)>,
     next_request: u64,
@@ -444,12 +452,76 @@ struct Images {
     layout: Option<Specialized>,
 }
 
+/// The atlases a build counts besides its image entry
+/// ([`ResultSkin::others`]), and in development builds what the no-room
+/// line names of them.
+struct Others {
+    ids: Vec<AtlasId>,
+    #[cfg(feature = "dev-tools")]
+    line: RoomLine,
+}
+
+/// Development builds: what a build that finds no room says (design.md
+/// "Memory Budget", the no-room line): the stage, each atlas counted with
+/// its holders, and whether the count is conservative, that is whether
+/// leaving out the atlases only retirement entries whose pages left them
+/// hold would leave room.
+#[cfg(feature = "dev-tools")]
+struct RoomLine {
+    stage: &'static str,
+    /// The render side's holders, as the report last named them.
+    holders: Vec<(AtlasId, crate::result_present::Holders)>,
+    /// The game's own holdings among the atlases counted.
+    game: Vec<AtlasId>,
+}
+
+#[cfg(feature = "dev-tools")]
+impl RoomLine {
+    /// The line for `live`, the atlases counted, `entry` the image entry
+    /// kept.
+    fn line(&self, live: &[AtlasId], entry: Option<AtlasId>) -> String {
+        let held = |id: &AtlasId| {
+            self.holders
+                .iter()
+                .find(|(h, _)| h == id)
+                .map(|(_, h)| *h)
+                .unwrap_or_default()
+        };
+        let game = |id: &AtlasId| self.game.contains(id) || entry == Some(*id);
+        let named: Vec<String> = live
+            .iter()
+            .map(|id| {
+                let mut by = held(id).names();
+                if game(id) {
+                    if !by.is_empty() {
+                        by.push('+');
+                    }
+                    by.push_str("game");
+                }
+                format!("{}:{by}", id.0)
+            })
+            .collect();
+        let conservative = live
+            .iter()
+            .filter(|id| !(held(id).array_only() && !game(id)))
+            .count()
+            < 2;
+        format!(
+            "dev: result build: no room at {}: {}{}",
+            self.stage,
+            named.join(" "),
+            if conservative { " conservative" } else { "" }
+        )
+    }
+}
+
 /// The one release decision, once a replacement plan fits (D13): an
 /// image entry that is not `base` (the shown one) is dropped, its cells
 /// kept; the unshown cached specialization goes too. Returns what is left
 /// and whether the atlases live besides it (`others`, with the entry when
-/// kept) leave room for one more (the S10-09i design's Q3).
-fn release(images: Images, base: Option<&Arc<ImageEntry>>, others: Vec<AtlasId>) -> (Images, bool) {
+/// kept) leave room for one more (the S10-09i design's Q3); in
+/// development builds, a build with no room says so.
+fn release(images: Images, base: Option<&Arc<ImageEntry>>, others: Others) -> (Images, bool) {
     let Images {
         entry,
         cells,
@@ -465,11 +537,20 @@ fn release(images: Images, base: Option<&Arc<ImageEntry>>, others: Vec<AtlasId>)
         (None, Some(d)) => Some(d.packed.clone()),
         (Some(c), Some(d)) => c.union(&d.packed).or(Some(c)),
     };
-    let mut live = others;
+    let mut live = others.ids;
     live.extend(entry.as_ref().map(|e| e.pages().id()));
     live.sort_unstable();
     live.dedup();
     let room = live.len() < 2;
+    #[cfg(feature = "dev-tools")]
+    if !room {
+        let line = others
+            .line
+            .line(&live, entry.as_ref().map(|e| e.pages().id()));
+        #[cfg(test)]
+        tests::room_line(&line);
+        println!("{line}");
+    }
     (
         Images {
             entry,
@@ -568,7 +649,7 @@ fn layout(
     class: Option<Option<JudgeClass>>,
     slot: &Slot,
     base: Option<Arc<ImageEntry>>,
-    others: Vec<AtlasId>,
+    others: Others,
     cancel: &Cancel,
     permit: Option<ScriptPermit>,
     chart: Option<&ChartFrom>,
@@ -685,7 +766,7 @@ fn lay_out(
     imported: skin_beatoraja::LuaImported,
     slot: &Slot,
     base: Option<Arc<ImageEntry>>,
-    others: Vec<AtlasId>,
+    others: Others,
     cancel: &Cancel,
 ) -> Laid {
     let deps = imported.facts;
@@ -905,6 +986,52 @@ impl ResultSkin {
         }
     }
 
+    /// The atlases a build at `stage` counts: [`others`](Self::others),
+    /// with what the no-room line names in development builds.
+    fn counted(&self, stage: &'static str) -> Others {
+        #[cfg(not(feature = "dev-tools"))]
+        let _ = stage;
+        Others {
+            ids: self.others(),
+            #[cfg(feature = "dev-tools")]
+            line: RoomLine {
+                stage,
+                holders: self.holders.clone(),
+                game: self.game_holdings(),
+            },
+        }
+    }
+
+    /// Development builds: the game's own holdings among the atlases a
+    /// build counts: the latest publication's binding and the layout
+    /// entries'.
+    #[cfg(feature = "dev-tools")]
+    fn game_holdings(&self) -> Vec<AtlasId> {
+        let mut v = Vec::new();
+        if let Some(Published::Skin(b, _, _)) = &self.published {
+            v.push(b.atlas_pages().id());
+        }
+        for l in self.layout.iter().chain(&self.presented) {
+            v.push(l.bundle.atlas_pages().id());
+        }
+        v
+    }
+
+    /// Development builds: the render side's holders of the atlases the
+    /// report names ([`crate::result_present::ResultReport::holders`]).
+    #[cfg(feature = "dev-tools")]
+    pub fn set_holders(&mut self, holders: &[(AtlasId, crate::result_present::Holders)]) {
+        self.holders.clear();
+        self.holders.extend_from_slice(holders);
+    }
+
+    /// Development builds: the stage the next view's build is asked for,
+    /// as the no-room line names it.
+    #[cfg(feature = "dev-tools")]
+    pub const fn set_stage(&mut self, stage: &'static str) {
+        self.stage = stage;
+    }
+
     /// The atlases live besides the image entry: the renderer's retained
     /// set, the latest publication's binding and the layout entry's.
     fn others(&self) -> Vec<AtlasId> {
@@ -927,7 +1054,7 @@ impl ResultSkin {
     /// again once fewer than two atlases are live (the S10-09i design's
     /// Q3).
     pub fn set_retained(&mut self, ids: &[AtlasId]) {
-        self.retained = ids.to_vec();
+        self.note_retained(ids);
         self.forget_unpresented();
         if self.others().len() < 2 {
             self.retry_deferred();
@@ -954,6 +1081,16 @@ impl ResultSkin {
             self.published
                 .take_if(|p| matches!(p, Published::Skin(_, Some(_), _)));
         }
+    }
+
+    /// A fresh report of the atlases the renderer references, read before
+    /// a build is decided (a view's request, the image stage's begin;
+    /// design.md "Memory Budget", the result's atlas report): no deferred
+    /// build is tried again here, since a request that follows supersedes
+    /// it.
+    pub fn note_retained(&mut self, ids: &[AtlasId]) {
+        self.retained.clear();
+        self.retained.extend_from_slice(ids);
     }
 
     /// The deferred request, asked for again unless a job runs.
@@ -1252,7 +1389,7 @@ impl ResultSkin {
         let slot = self.slot_for_job();
         let theirs = Arc::clone(&slot);
         let base = self.shown_entry();
-        let others = self.others();
+        let others = self.counted("the image stage");
         let kept = self.kept == Some(true);
         let spawned = imports::spawn_job(move |cancel: &Cancel| -> ImageOut {
             let slot = theirs;
@@ -1554,7 +1691,15 @@ impl ResultSkin {
         let slot = self.slot_for_job();
         let theirs = Arc::clone(&slot);
         let base = self.shown_entry();
-        let others = self.others();
+        #[cfg(feature = "dev-tools")]
+        let stage = if self.stage.is_empty() {
+            "a view's build"
+        } else {
+            self.stage
+        };
+        #[cfg(not(feature = "dev-tools"))]
+        let stage = "";
+        let others = self.counted(stage);
         let class = self.class;
         let chart = self.chart_from();
         // The game thread, woken once the outcome is in.

@@ -49,6 +49,11 @@ const PARK: Duration = Duration::from_millis(2);
 /// screen's failure, a timed quit).
 const IDLE_PARK: Duration = Duration::from_micros(game::IDLE_WAIT.0.unsigned_abs());
 
+/// How long a slice of READY's cutoff's wait parks at most
+/// ([`Rig::cutoff_park`]): the game's preparation slice; the render
+/// thread's cutoff wakes it earlier.
+const CUTOFF_PARK: Duration = Duration::from_millis(10);
+
 /// How long a wait for the input thread's marker parks at most
 /// ([`game::InputPump::park`]).
 pub(crate) const MARKER_PARK: Duration = Duration::from_millis(1);
@@ -429,6 +434,10 @@ pub struct PlayerRig<'a> {
     /// thread's failure: the end of loading does not wait on the render
     /// thread, which may still be in it.
     pub result_withdrawn: bool,
+    /// The current attempt asked for READY's cutoff already
+    /// ([`Rig::cutoff`]): cleared at each attempt's preparation, so a
+    /// deferred opening of the same attempt asks no second one.
+    pub cutoff_asked: bool,
     /// The facts behind the result strip's lines that do not depend on the
     /// view, while a result lifetime is current.
     pub result_facts: Option<crate::result_present::OverlayFacts>,
@@ -714,6 +723,7 @@ impl PlayerRig<'_> {
             .set_kept_probe(crate::result_skin::kept_probe_fits(menus));
         #[cfg(feature = "dev-tools")]
         crate::dev::stage_began(crate::dev::SpecializingStage::ResultImage);
+        self.fresh_result_report();
         match self.result_skin.begin_image_stage(chart, prep.class) {
             crate::result_skin::ImageStage::Ready(staged) => self.after_image(prep, skin, staged),
             crate::result_skin::ImageStage::Running(job) => PrepStage::Image(skin, job),
@@ -980,6 +990,17 @@ impl PlayerRig<'_> {
         out
     }
 
+    /// The render side's result atlases read afresh for the result skin
+    /// before a build is decided (design.md "Memory Budget", a fresh
+    /// report before each build): a view's request or the image stage's
+    /// begin counts what the renderer and its worker hold now.
+    fn fresh_result_report(&mut self) {
+        let status = self.render.result_status();
+        #[cfg(feature = "dev-tools")]
+        self.result_skin.set_holders(&status.holders);
+        self.result_skin.note_retained(&status.retained);
+    }
+
     /// Whether the render thread disabled the result skin for the run (the
     /// S10-09i design's D7), as the presenter now knows too.
     fn result_run_disabled(&mut self) -> bool {
@@ -1138,6 +1159,8 @@ impl PlayerRig<'_> {
     /// request is published.
     fn land_result(&mut self) -> bool {
         let status = self.render.result_status();
+        #[cfg(feature = "dev-tools")]
+        self.result_skin.set_holders(&status.holders);
         self.result_skin.set_retained(&status.retained);
         let ready = self.result_skin.poll();
         if self.presenter.current() {
@@ -2368,6 +2391,36 @@ impl Rig for PlayerRig<'_> {
         }
     }
 
+    /// READY's cutoff (design.md "Memory Budget", READY's condition): the
+    /// attempt's first call asks the render thread, unless the player is
+    /// leaving already, whose look then ends the wait; every call reports
+    /// the phase. A screen lost under it ends the run. Allocates nothing.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn cutoff(&mut self) -> Result<game::Cutoff, ScreenError> {
+        if !self.cutoff_asked {
+            if self.quitting() || self.controls.leaving() {
+                return Ok(game::Cutoff::Waiting);
+            }
+            self.cutoff_asked = true;
+            self.render.ask_cutoff();
+        }
+        match self.render.cutoff_phase() {
+            crate::render_side::CutoffPhase::CutOff => Ok(game::Cutoff::CutOff),
+            crate::render_side::CutoffPhase::Lost => Err(ScreenError::Lost),
+            crate::render_side::CutoffPhase::Running | crate::render_side::CutoffPhase::Waiting => {
+                Ok(game::Cutoff::Waiting)
+            }
+        }
+    }
+
+    /// One slice of READY's cutoff's wait: parked [`CUTOFF_PARK`] at most,
+    /// woken early when the render thread cuts off, serving the
+    /// adjustments as every wait does.
+    #[deny(clippy::expect_used, clippy::indexing_slicing, clippy::unwrap_used)]
+    fn cutoff_park(&mut self) {
+        self.wait_parked(CUTOFF_PARK);
+    }
+
     fn prepare_screen(&mut self) -> Result<(), ScreenError> {
         self.before_rebuild();
         #[cfg(test)]
@@ -2423,6 +2476,7 @@ impl Rig for PlayerRig<'_> {
         crate::dev::loop_probe::mark("prep:begin", i64::try_from(self.preps).unwrap_or(-1));
         self.result_skin.next_attempt();
         self.presenter.next_attempt();
+        self.cutoff_asked = false;
         self.preps += 1;
         let attempt = loaded.attempt();
         let labels = crate::result_present::labels_of(&attempt.labels);
@@ -3264,6 +3318,9 @@ impl Rig for PlayerRig<'_> {
                 };
                 println!("dev: result layout requested: best {best}");
             }
+            self.fresh_result_report();
+            #[cfg(feature = "dev-tools")]
+            self.result_skin.set_stage("the first view's build");
             self.result_skin
                 .request(crate::result_skin::view_facts(screen, chart));
             #[cfg(feature = "dev-tools")]
@@ -3306,6 +3363,9 @@ impl Rig for PlayerRig<'_> {
             && self.result_outro.is_none()
             && !self.result_skin_suppressed()
         {
+            self.fresh_result_report();
+            #[cfg(feature = "dev-tools")]
+            self.result_skin.set_stage("a switch's build");
             self.result_skin
                 .request(crate::result_skin::view_facts(screen, chart));
         }

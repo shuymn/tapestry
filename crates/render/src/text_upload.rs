@@ -257,7 +257,12 @@ pub(crate) fn prepare(
         // submission.
         #[cfg(feature = "dev-tools")]
         let p_s = crate::probe::Span::start();
-        let submission = (written > 0).then(|| queue.submit([]));
+        // The array's last use is this submission's, for its retirement.
+        let submission = (written > 0).then(|| {
+            let (n, index) = p.gpu.submit([]);
+            p.atlas.mark(n);
+            index
+        });
         #[cfg(feature = "dev-tools")]
         {
             p_submit = p_s.elapsed();
