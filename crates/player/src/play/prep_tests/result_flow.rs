@@ -530,6 +530,10 @@ fn kept_only_skin() -> (
     (skin, p, kept, plain)
 }
 
+/// The selection entries a test makes until one finds the frame
+/// interval's allowance free for the pool's regrowth.
+const ENTRIES: u64 = 4;
+
 /// A selection installation charged so the kept probe's gate closes: past
 /// what leaves room beside it for the largest play and result charges.
 const MENUS: u64 = 400 << 20;
@@ -636,18 +640,31 @@ fn a_pool_made_again_after_the_report_leaves_the_plain_probe() {
                 menus + firm,
                 "the firm layer counted without the pool"
             );
-            rig.render.enter_selection(1);
-            rig.render
-                .show_selection(crate::render_side::tests::selection_update(1, 1));
-            assert!(
-                crate::render_side::tests::wait_until(|| rig
-                    .render
+            // A selection entry's regrowth runs only while the frame
+            // interval's allowance is free, else it waits for the next
+            // entry (design.md "Memory Budget"): the commit's pool tries
+            // and the replaced play's destruction spend it, so entries are
+            // made until one finds it free, each with no new report.
+            let made = |rig: &PlayerRig<'_>| {
+                rig.render
                     .pool_now()
                     .0
-                    .is_some_and(|pool| u64::from(pool.side) == side)),
-                "the pool made again at the entry"
-            );
-            rig.render.leave_selection();
+                    .is_some_and(|pool| u64::from(pool.side) == side)
+            };
+            let entered = (1..=ENTRIES).any(|lifetime| {
+                rig.render.enter_selection(lifetime);
+                rig.render
+                    .show_selection(crate::render_side::tests::selection_update(lifetime, 1));
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while !made(rig) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                let now = made(rig);
+                rig.render.leave_selection();
+                assert!(rig.render.fence(std::time::Duration::from_secs(60)));
+                now
+            });
+            assert!(entered, "the pool made again at an entry");
             rig.result_skin = ResultSkin::new(Some(ResultStart::Pending(Arc::clone(&p))));
             let mut h = begin(rig, &l);
             readied(rig, &mut h);
@@ -916,13 +933,22 @@ fn assert_marks(marks: &[crate::dev::loop_probe::Mark]) {
     // The first result's installation: none before (0); the second's: one
     // installed, another asked for (2).
     assert_eq!(values("res:installed"), [0, 2]);
-    // B's layout replaces A's installation: dropped once, a slot, by the
-    // drain inside B's select, with the memory read around it.
-    assert_eq!(values("dr:site"), [1]);
-    assert_eq!(values("dr:kind"), [2]);
-    let drop = one("dr:site", 0);
-    assert!(one("up:selskin:begin", 2) < drop && drop < one("res:select_ready", 1));
-    assert!(values("dr:l0")[0] > 0 && values("dr:l1")[0] > 0);
+    // Two installations' resources destroyed, each at a frame boundary
+    // with the memory read around it: play's built-in ones, which the play
+    // skin's commit replaced, before the first result (READY waits for
+    // them); and A's, which B's layout replaces, once B's upload is done
+    // (not inside its select).
+    assert_eq!(values("dr:site"), [1, 1]);
+    assert_eq!(values("dr:kind"), [2, 2]);
+    let (play, replaced) = (one("dr:site", 0), one("dr:site", 1));
+    assert!(one("up:selskin:begin", 0) < play && play < one("res:select_sent", 0));
+    assert!(one("up:selskin:begin", 2) < replaced);
+    assert!(
+        values("dr:l0")
+            .iter()
+            .chain(&values("dr:l1"))
+            .all(|&v| v > 0)
+    );
     // The first use: one per result upload, in its first result frame, with
     // its frames' submits marked after it (the drop's included).
     for k in 0..2 {

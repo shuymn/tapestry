@@ -68,6 +68,7 @@ mod result_input;
 mod result_present;
 mod result_skin;
 mod result_view;
+mod retire_worker;
 mod screens;
 mod select;
 mod selection;
@@ -184,6 +185,8 @@ fn main() -> ExitCode {
         Command::MeasureSelect => report(measure_select(clock)),
         #[cfg(feature = "dev-tools")]
         Command::Scenario(s) => report(dev::scenario::run(s, clock)),
+        #[cfg(feature = "dev-tools")]
+        Command::TestDevice(t) => report(dev::test_device::run(t)),
     };
     // The transition probe's marks, whatever the command, unless its run
     // printed them already (a scenario, before its transition record).
@@ -198,7 +201,7 @@ fn logged(command: &Command) -> Option<&'static str> {
     match command {
         Command::Version => None,
         #[cfg(feature = "dev-tools")]
-        Command::DevToolsProbe => None,
+        Command::DevToolsProbe | Command::TestDevice(_) => None,
         Command::Keys(_) => Some("keys"),
         Command::Play(_) => Some("play"),
         Command::Select(_) => Some("select"),
@@ -1057,6 +1060,7 @@ fn rig<'a>(
         presenter: crate::result_present::Presenter::default(),
         result_labels: None,
         result_withdrawn: false,
+        cutoff_asked: false,
         result_facts: None,
         result_offset: None,
         result_leaving: false,

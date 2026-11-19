@@ -1,19 +1,30 @@
 //! The UF2 writer for the RP2350's boot ROM drive (docs/test-device.md
 //! "Building"): 512-byte blocks of 256 payload bytes, family
 //! `rp2350-arm-s`, written only for an image whose image definition lies
-//! where the boot ROM looks for it.
+//! where the boot ROM looks for it; and the check ([`check`]) the host runs
+//! on a UF2 before it reboots the device to copy one.
 
 /// UF2's first and second magic words and its final magic word.
 const MAGIC: [u32; 3] = [0x0A32_4655, 0x9E5D_5157, 0x0AB1_6F30];
+/// The byte offsets of the three magic words in a block.
+#[cfg(feature = "std")]
+const MAGIC_AT: [usize; 3] = [0, 4, 508];
+/// Bytes per UF2 block.
+pub const BLOCK: usize = 512;
 /// The block carries a family id.
 const FLAG_FAMILY: u32 = 0x0000_2000;
+/// The block's content is not for the device (`UF2_FLAG_NOT_MAIN_FLASH`,
+/// the UF2 specification, github.com/microsoft/uf2, README "Flags").
+#[cfg(feature = "std")]
+const FLAG_NOT_MAIN_FLASH: u32 = 0x0000_0001;
 /// The `rp2350-arm-s` family id.
 pub const FAMILY_RP2350_ARM_S: u32 = 0xE48B_FF59;
 /// The flash's address.
 pub const FLASH_BASE: u32 = 0x1000_0000;
 /// The Pico 2's flash size.
 pub const FLASH_SIZE: u32 = 4 << 20;
-/// Payload bytes per block.
+/// Payload bytes per block, and the alignment of a block's flash address:
+/// the only payload size the boot ROM takes (RP2350 datasheet, 5.5.2).
 pub const PAGE: usize = 256;
 /// The span the boot ROM searches for an image definition.
 pub const SEARCH: usize = 4096;
@@ -46,8 +57,8 @@ pub fn image_def_offset(image: &[u8]) -> Option<usize> {
 /// UF2 block `index` of `total`, carrying `payload` (at most [`PAGE`]
 /// bytes, zero-padded) for flash address `addr`.
 #[must_use]
-pub fn block(index: u32, total: u32, addr: u32, payload: &[u8]) -> [u8; 512] {
-    let mut out = [0_u8; 512];
+pub fn block(index: u32, total: u32, addr: u32, payload: &[u8]) -> [u8; BLOCK] {
+    let mut out = [0_u8; BLOCK];
     let head = [
         MAGIC[0],
         MAGIC[1],
@@ -71,14 +82,227 @@ pub fn block(index: u32, total: u32, addr: u32, payload: &[u8]) -> [u8; 512] {
     out
 }
 
+/// A UF2 rule a file breaks; `block` is the block's position in the file.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Uf2Error {
+    /// The file has no bytes.
+    Empty,
+    /// The file's length is not a whole number of blocks.
+    Length(usize),
+    /// The magic word at byte `at` of the block (0, 4 or 508) is `found`.
+    Magic { block: usize, at: usize, found: u32 },
+    /// The block lacks the family-id flag.
+    NoFamily { block: usize },
+    /// The block names family `found`, not `rp2350-arm-s`.
+    Family { block: usize, found: u32 },
+    /// The block is marked not for the device (`UF2_FLAG_NOT_MAIN_FLASH`).
+    NotMainFlash { block: usize },
+    /// The block's payload is `size` bytes, not [`PAGE`].
+    PayloadSize { block: usize, size: u32 },
+    /// The block's flash address `addr` is not a multiple of [`PAGE`].
+    Unaligned { block: usize, addr: u32 },
+    /// The block writes `addr` onwards for `size` bytes, outside the flash.
+    Address { block: usize, addr: u32, size: u32 },
+    /// The block says the file has `says` blocks; it has `has`.
+    NumBlocks { block: usize, says: u32, has: usize },
+    /// The block repeats the block number of block `first`.
+    Duplicate {
+        block: usize,
+        number: u32,
+        first: usize,
+    },
+    /// No block carries block number `number`.
+    Missing { number: u32 },
+    /// The block writes addresses block `other` writes as well.
+    Overlap { block: usize, other: usize },
+}
+
+impl core::fmt::Display for Uf2Error {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match *self {
+            Self::Empty => write!(f, "the file is empty"),
+            Self::Length(len) => write!(
+                f,
+                "{len} bytes is not a whole number of {BLOCK}-byte blocks"
+            ),
+            Self::Magic { block, at, found } => {
+                write!(f, "block {block}: magic word at byte {at} is {found:#010x}")
+            }
+            Self::NoFamily { block } => write!(f, "block {block}: no family-id flag"),
+            Self::Family { block, found } => write!(
+                f,
+                "block {block}: family {found:#010x}, not rp2350-arm-s ({FAMILY_RP2350_ARM_S:#010x})"
+            ),
+            Self::NotMainFlash { block } => write!(
+                f,
+                "block {block}: marked not main flash, which the boot ROM ignores"
+            ),
+            Self::PayloadSize { block, size } => write!(
+                f,
+                "block {block}: a payload of {size} bytes; the boot ROM takes only {PAGE}"
+            ),
+            Self::Unaligned { block, addr } => write!(
+                f,
+                "block {block}: address {addr:#010x} is not a multiple of {PAGE}, which the boot ROM needs"
+            ),
+            Self::Address { block, addr, size } => write!(
+                f,
+                "block {block}: {size} bytes at {addr:#010x} lie outside the flash \
+                 ({FLASH_BASE:#010x}, {FLASH_SIZE} bytes)"
+            ),
+            Self::NumBlocks { block, says, has } => {
+                write!(f, "block {block}: says {says} blocks; the file has {has}")
+            }
+            Self::Duplicate {
+                block,
+                number,
+                first,
+            } => write!(
+                f,
+                "block {block}: block number {number} again (block {first})"
+            ),
+            Self::Missing { number } => write!(f, "no block has block number {number}"),
+            Self::Overlap { block, other } => {
+                write!(f, "block {block}: writes addresses block {other} writes")
+            }
+        }
+    }
+}
+
 #[cfg(feature = "std")]
-pub use host::{Image, from_elf};
+impl std::error::Error for Uf2Error {}
+
+#[cfg(feature = "std")]
+pub use host::{Image, Summary, check, from_elf};
 
 #[cfg(feature = "std")]
 mod host {
     use std::collections::BTreeMap;
 
-    use super::{FLASH_BASE, FLASH_SIZE, PAGE, block, image_def_offset};
+    use super::{
+        BLOCK, FAMILY_RP2350_ARM_S, FLAG_FAMILY, FLAG_NOT_MAIN_FLASH, FLASH_BASE, FLASH_SIZE,
+        MAGIC, MAGIC_AT, PAGE, Uf2Error, block, image_def_offset, word,
+    };
+
+    /// What a UF2 that passes [`check`] writes.
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct Summary {
+        pub blocks: usize,
+        /// The lowest address a block writes.
+        pub start: u32,
+        /// The end of the highest block's payload.
+        pub end: u32,
+    }
+
+    /// Checks every block of a UF2 against the rules the crate's writer
+    /// follows and the boot ROM's drive needs: the three magic words, the
+    /// family-id flag with family `rp2350-arm-s`, no not-main-flash flag, a
+    /// payload of [`PAGE`] bytes at an address inside the flash and aligned
+    /// to [`PAGE`], a block count every block states and the file has,
+    /// block numbers 0..n each once, and no two blocks writing the same
+    /// address.
+    ///
+    /// The boot ROM's block rules are the RP2350 datasheet's, section 5.5.2
+    /// "UF2 format details": "All data destined for the device must be in
+    /// UF2 blocks with: [...] A payload_size of 256"; for a regular flash
+    /// image, "All blocks must be targeted at 256 byte alignments"; and "All
+    /// device destined data must be in blocks without the
+    /// UF2_FLAG_NOT_MAIN_FLASH marking". The drive takes a file whose
+    /// blocks break them, but the boot ROM does not write those blocks, so
+    /// the check refuses the file before any copy.
+    ///
+    /// # Errors
+    ///
+    /// The first rule broken, naming the block.
+    pub fn check(image: &[u8]) -> Result<Summary, Uf2Error> {
+        if image.is_empty() {
+            return Err(Uf2Error::Empty);
+        }
+        if !image.len().is_multiple_of(BLOCK) {
+            return Err(Uf2Error::Length(image.len()));
+        }
+        let has = image.len() / BLOCK;
+        let mut seen: Vec<Option<usize>> = vec![None; has];
+        let mut spans = Vec::with_capacity(has);
+        for (i, b) in image.as_chunks::<BLOCK>().0.iter().enumerate() {
+            let w = |at: usize| word(b, at).unwrap_or_default();
+            for (at, magic) in MAGIC_AT.into_iter().zip(MAGIC) {
+                if w(at) != magic {
+                    return Err(Uf2Error::Magic {
+                        block: i,
+                        at,
+                        found: w(at),
+                    });
+                }
+            }
+            if w(8) & FLAG_FAMILY == 0 {
+                return Err(Uf2Error::NoFamily { block: i });
+            }
+            if w(28) != FAMILY_RP2350_ARM_S {
+                return Err(Uf2Error::Family {
+                    block: i,
+                    found: w(28),
+                });
+            }
+            if w(8) & FLAG_NOT_MAIN_FLASH != 0 {
+                return Err(Uf2Error::NotMainFlash { block: i });
+            }
+            let (addr, size) = (w(12), w(16));
+            if usize::try_from(size).ok() != Some(PAGE) {
+                return Err(Uf2Error::PayloadSize { block: i, size });
+            }
+            let end = addr
+                .checked_add(size)
+                .filter(|&e| addr >= FLASH_BASE && e <= FLASH_BASE + FLASH_SIZE)
+                .ok_or(Uf2Error::Address {
+                    block: i,
+                    addr,
+                    size,
+                })?;
+            if usize::try_from(addr).is_ok_and(|a| !a.is_multiple_of(PAGE)) {
+                return Err(Uf2Error::Unaligned { block: i, addr });
+            }
+            let says = w(24);
+            if usize::try_from(says).ok() != Some(has) {
+                return Err(Uf2Error::NumBlocks {
+                    block: i,
+                    says,
+                    has,
+                });
+            }
+            let number = w(20);
+            // A number outside 0..n leaves one inside it missing.
+            if let Some(slot) = usize::try_from(number).ok().and_then(|n| seen.get_mut(n)) {
+                if let Some(first) = *slot {
+                    return Err(Uf2Error::Duplicate {
+                        block: i,
+                        number,
+                        first,
+                    });
+                }
+                *slot = Some(i);
+            }
+            spans.push((addr, end, i));
+        }
+        if let Some(number) = seen.iter().position(Option::is_none) {
+            return Err(Uf2Error::Missing {
+                number: u32::try_from(number).unwrap_or(u32::MAX),
+            });
+        }
+        spans.sort_unstable();
+        for pair in spans.windows(2) {
+            if let [(_, end, other), (addr, _, block)] = *pair
+                && end > addr
+            {
+                return Err(Uf2Error::Overlap { block, other });
+            }
+        }
+        Ok(Summary {
+            blocks: has,
+            start: spans.first().map_or(0, |s| s.0),
+            end: spans.iter().map(|s| s.1).max().unwrap_or(0),
+        })
+    }
 
     /// A flash image: 256-byte pages by address, only pages some loadable
     /// segment touches, as the boot ROM's drive takes them.
@@ -284,6 +508,160 @@ mod tests {
         let uf2 = image.uf2().unwrap();
         assert_eq!(uf2.len(), 2 * 512);
         assert_eq!(&uf2[512 + 12..512 + 16], &(FLASH_BASE + 256).to_le_bytes());
+    }
+
+    /// A three-block UF2 from the crate's writer.
+    fn written() -> Vec<u8> {
+        let bytes = image_with_def_at(0x114, 700);
+        from_elf(&elf(FLASH_BASE, &bytes)).unwrap().uf2().unwrap()
+    }
+
+    /// `uf2` with the word at byte `at` of block `block` set to `v`.
+    fn set(mut uf2: Vec<u8>, block: usize, at: usize, v: u32) -> Vec<u8> {
+        let at = block * BLOCK + at;
+        uf2[at..at + 4].copy_from_slice(&v.to_le_bytes());
+        uf2
+    }
+
+    #[test]
+    fn the_writers_uf2_passes_the_check() {
+        assert_eq!(
+            check(&written()),
+            Ok(Summary {
+                blocks: 3,
+                start: FLASH_BASE,
+                end: FLASH_BASE + 768,
+            })
+        );
+    }
+
+    #[test]
+    fn a_uf2_of_no_whole_blocks_is_refused() {
+        assert_eq!(check(&[]), Err(Uf2Error::Empty));
+        let mut short = written();
+        short.pop();
+        assert_eq!(check(&short), Err(Uf2Error::Length(3 * BLOCK - 1)));
+    }
+
+    #[test]
+    fn each_magic_word_is_checked() {
+        for at in MAGIC_AT {
+            assert_eq!(
+                check(&set(written(), 1, at, 0)),
+                Err(Uf2Error::Magic {
+                    block: 1,
+                    at,
+                    found: 0
+                }),
+                "magic at {at}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_block_must_name_the_rp2350_arm_secure_family() {
+        assert_eq!(
+            check(&set(written(), 2, 8, 0)),
+            Err(Uf2Error::NoFamily { block: 2 })
+        );
+        // The rp2350-arm-ns family.
+        assert_eq!(
+            check(&set(written(), 2, 28, 0xE48B_FF5B)),
+            Err(Uf2Error::Family {
+                block: 2,
+                found: 0xE48B_FF5B
+            })
+        );
+    }
+
+    /// The boot ROM writes only blocks of a 256-byte payload.
+    #[test]
+    fn a_payload_must_be_256_bytes() {
+        for size in [0, 1, 255, 257, 476] {
+            assert_eq!(
+                check(&set(written(), 2, 16, size)),
+                Err(Uf2Error::PayloadSize { block: 2, size }),
+                "{size}"
+            );
+        }
+    }
+
+    /// The boot ROM writes a flash block only at a 256-byte boundary.
+    #[test]
+    fn a_block_must_target_a_256_byte_boundary() {
+        for addr in [FLASH_BASE + 2 * 256 + 1, FLASH_BASE + 2 * 256 + 128] {
+            assert_eq!(
+                check(&set(written(), 2, 12, addr)),
+                Err(Uf2Error::Unaligned { block: 2, addr }),
+                "{addr:#x}"
+            );
+        }
+    }
+
+    /// The boot ROM ignores a block marked not main flash.
+    #[test]
+    fn a_block_marked_not_main_flash_is_refused() {
+        assert_eq!(
+            check(&set(written(), 1, 8, FLAG_FAMILY | FLAG_NOT_MAIN_FLASH)),
+            Err(Uf2Error::NotMainFlash { block: 1 })
+        );
+    }
+
+    #[test]
+    fn a_block_must_write_inside_the_flash() {
+        let last = FLASH_BASE + FLASH_SIZE - 256;
+        assert!(check(&set(written(), 2, 12, last)).is_ok());
+        for addr in [FLASH_BASE - 256, last + 1, 0x2000_0000, u32::MAX - 16] {
+            assert_eq!(
+                check(&set(written(), 2, 12, addr)),
+                Err(Uf2Error::Address {
+                    block: 2,
+                    addr,
+                    size: 256
+                }),
+                "{addr:#x}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_block_states_the_files_block_count() {
+        assert_eq!(
+            check(&set(written(), 1, 24, 4)),
+            Err(Uf2Error::NumBlocks {
+                block: 1,
+                says: 4,
+                has: 3
+            })
+        );
+    }
+
+    #[test]
+    fn block_numbers_run_from_0_each_once() {
+        assert_eq!(
+            check(&set(written(), 2, 20, 0)),
+            Err(Uf2Error::Duplicate {
+                block: 2,
+                number: 0,
+                first: 0
+            })
+        );
+        assert_eq!(
+            check(&set(written(), 1, 20, 3)),
+            Err(Uf2Error::Missing { number: 1 })
+        );
+    }
+
+    #[test]
+    fn no_two_blocks_write_the_same_address() {
+        // With 256-byte payloads at 256-byte boundaries, two blocks overlap
+        // only at the same address.
+        assert_eq!(
+            check(&set(written(), 2, 12, FLASH_BASE)),
+            Err(Uf2Error::Overlap { block: 2, other: 0 })
+        );
+        // Adjacent blocks touch without overlapping.
+        assert!(check(&set(written(), 2, 12, FLASH_BASE + 0x1000)).is_ok());
     }
 
     #[test]

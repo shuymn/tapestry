@@ -990,7 +990,9 @@ fn result_chart_frame_alloc() {
         );
         screen.submit_result().unwrap();
         side.dropped = [None, None];
-        let _ = screen.drain_retired();
+        // What the commit retired goes before the next cycle, outside
+        // the spans counted.
+        crate::render_side::settle_entries(&mut screen);
     }
     // The control: the count sees an allocation in the same window.
     let before = crate::alloc_count::this_thread();

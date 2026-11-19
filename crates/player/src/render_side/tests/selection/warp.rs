@@ -179,6 +179,57 @@ impl Screen for Lossy {
     fn regrow_pool(&mut self) {
         self.menu.regrow_pool();
     }
+    fn retained_atlases(
+        &self,
+        kind: skin_model::ScreenKind,
+    ) -> [Option<skin_model::AtlasId>; render::RETAINED_ATLASES] {
+        self.menu.retained_atlases(kind)
+    }
+    fn poll_completion(&mut self) -> Result<(), render::RenderError> {
+        self.menu.poll_completion()
+    }
+    fn set_destroy_allowed(&mut self, allowed: bool) {
+        self.menu.set_destroy_allowed(allowed);
+    }
+    fn filled(&self) -> u32 {
+        self.menu.filled()
+    }
+    fn destroy_due(&mut self, heavy: bool) -> render::Destroyed {
+        self.menu.destroy_due(heavy)
+    }
+    fn due_heavy(&self) -> bool {
+        self.menu.due_heavy()
+    }
+    fn pending_completion(&self) -> bool {
+        self.menu.pending_completion()
+    }
+    fn pool_owed(&self) -> bool {
+        self.menu.pool_owed()
+    }
+    fn make_owed_pool(&mut self) -> bool {
+        self.menu.make_owed_pool()
+    }
+    fn take_handoff(&mut self) -> Option<render::Handoff> {
+        self.menu.take_handoff()
+    }
+    fn return_handoff(&mut self, entry: usize, cpu: render::CpuParts) -> bool {
+        self.menu.return_handoff(entry, cpu)
+    }
+    fn result_changes(&self) -> u64 {
+        self.menu.result_changes()
+    }
+    fn heavy_ops(&self) -> render::HeavyOps {
+        self.menu.heavy_ops()
+    }
+    fn grant_ready(&self) -> bool {
+        self.menu.grant_ready()
+    }
+    fn bga_in_use(&self) -> bool {
+        self.menu.bga_in_use()
+    }
+    fn entries_holding_pages(&self) -> [bool; render::RETIREMENT_ENTRIES] {
+        self.menu.entries_holding_pages()
+    }
     fn wait(&self) -> bool {
         let gate = &self.gate;
         gate.waits.fetch_add(1, Ordering::AcqRel);
