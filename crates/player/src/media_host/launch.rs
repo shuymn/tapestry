@@ -8,8 +8,9 @@
 //!    installation directory ([`profile_name`]), and an ACE granting it
 //!    read and execute on that directory, inherited by the files directly
 //!    in it (the executable and its DLLs);
-//! 3. a window station of its own (`CreateWindowStationW` with no name) and
-//!    a desktop in it, each granted to the AppContainer;
+//! 3. a desktop of its own, granted to the AppContainer, in the session's
+//!    alternate window station (`CreateWindowStationW` with no name),
+//!    which other launches share and the launch leaves as it is;
 //! 4. the creation attributes: the control pipe's two ends as the only
 //!    handles it inherits, no child process, the mitigation policies (no
 //!    dynamic code, no win32k system calls, strict handle checks, images
@@ -27,14 +28,17 @@
 //!
 //! A step that fails, or a check that finds anything else, terminates the
 //! process, if one was made, and fails the launch: never a weaker sandbox.
-//! The window station and desktop are made as browsers' sandboxes make an
-//! alternate desktop for their sandboxed processes: the process's window
-//! station is switched to the new one while the desktop is created in it,
-//! under a lock, and switched back.
+//! The desktop is made as browsers' sandboxes make an alternate desktop for
+//! their sandboxed processes: the process's window station is switched to
+//! the alternate one while the desktop is created in it, under a lock, and
+//! switched back.
 //!
 //! A test's setup ([`Setup`], only under `cfg(test)`) removes restrictions,
 //! changes what the check expects, makes a step fail, or passes the worker
-//! arguments; a build of the game holds the recipe alone.
+//! arguments; a build of the game holds the recipe alone. A setup without
+//! the win32k lockdown, whose worker connects to the window station when it
+//! loads USER32, grants the AppContainer the station too, until the worker
+//! drops.
 
 use std::ffi::c_void;
 use std::fmt::Write as _;
@@ -161,7 +165,7 @@ impl Restrictions {
     pub const IMAGE_LOAD: Self = Self(1 << 7);
     /// No extension point.
     pub const NO_EXTENSION_POINTS: Self = Self(1 << 8);
-    /// A window station and desktop of its own.
+    /// A desktop of its own, off the interactive window station.
     pub const OWN_DESKTOP: Self = Self(1 << 9);
     /// Only the control pipe's ends inherited.
     pub const HANDLE_LIST: Self = Self(1 << 10);
