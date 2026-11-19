@@ -89,6 +89,16 @@ const _: () = assert!(library::IMAGE_NAME_BYTES == skin_model::MAX_PATH_BYTES);
 #[cfg(test)]
 pub static HOLD_HARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Holds every row read (the cursor's or a neighbour's) until let go,
+/// whatever its cancel says, and no attempt's read (tests: a fill read
+/// stalled for a core).
+#[cfg(test)]
+pub static HOLD_ROW_HARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Set while a row read is held by [`HOLD_ROW_HARD`] (tests).
+#[cfg(test)]
+pub static HELD_ROW_HARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 /// Set while a read is held by [`HOLD_HARD`] (tests).
 #[cfg(test)]
 pub static HELD_HARD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -695,6 +705,8 @@ fn read_row(
     let dir = ChartDir::new(&id.dir);
     #[cfg(test)]
     hold(cancel);
+    #[cfg(test)]
+    hold_row_hard();
     let identity: chart_image::Identity<'_> = &file_identity;
     let [stage, banner] = &id.names;
     let reads = ChartImage::ALL.map(|which| {
@@ -761,6 +773,16 @@ fn hold_check() {
         std::thread::sleep(Duration::from_millis(1));
     }
     CHECK_HELD.store(false, std::sync::atomic::Ordering::Release);
+}
+
+/// Holds a row read while [`HOLD_ROW_HARD`] is set (tests).
+#[cfg(test)]
+fn hold_row_hard() {
+    while HOLD_ROW_HARD.load(std::sync::atomic::Ordering::Acquire) {
+        HELD_ROW_HARD.store(true, std::sync::atomic::Ordering::Release);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    HELD_ROW_HARD.store(false, std::sync::atomic::Ordering::Release);
 }
 
 /// Holds a read while [`HOLD`] is set and `cancel` does not answer, and
@@ -912,6 +934,11 @@ struct Core {
     job: Option<Job>,
     /// A job of an earlier want or generation, its thread not yet joined.
     obsolete: Option<OwnedJob<Arc<Output>>>,
+    /// A fill read left behind at a choice, stopped, its thread not yet
+    /// joined: no job waits for it, its output is never taken, and no
+    /// fill read begins while it lives, so at most one is alive (design.md
+    /// "Load Pipeline", speculation is never waited on).
+    left_behind: Option<OwnedJob<Arc<Output>>>,
     /// The selection's cursor generation: a new one at each change of the
     /// cursor's request.
     cursor_generation: u64,
@@ -1031,6 +1058,7 @@ impl std::fmt::Debug for ChartImageWorker {
             .field("generation", &c.generation())
             .field("job", &c.job.as_ref().map(|j| &j.target))
             .field("obsolete", &c.obsolete.is_some())
+            .field("left_behind", &c.left_behind.is_some())
             .field("cursor", &c.cursor)
             .field("cursor_row", &c.cursor_row)
             .field("fill", &c.fill)
@@ -1071,6 +1099,7 @@ impl ChartImageWorker {
                 generation,
                 job: None,
                 obsolete: None,
+                left_behind: None,
                 cursor_generation: 0,
                 cursor: None,
                 cursor_row: None,
@@ -1306,6 +1335,7 @@ impl ChartImageWorker {
     pub fn leave_selection(&self, coord: &Coordinator) {
         let mut c = self.core();
         c.cursor_changed(coord, None);
+        c.abandon_fill_read();
         if c.starter_cursor {
             c.starter = None;
             c.starter_cursor = false;
@@ -1812,7 +1842,14 @@ impl ChartImageWorker {
     #[must_use]
     pub fn idle(&self) -> bool {
         let c = self.core();
-        c.job.is_none() && c.obsolete.is_none()
+        c.job.is_none() && c.obsolete.is_none() && c.left_behind.is_none()
+    }
+
+    /// Whether a fill read left behind at a choice is still alive (tests).
+    #[cfg(test)]
+    #[must_use]
+    pub fn left_behind_alive(&self) -> bool {
+        self.core().left_behind.is_some()
     }
 
     /// At the run's end: nothing begins from here (no want, step, service
@@ -1845,7 +1882,11 @@ impl ChartImageWorker {
         c.rearm = false;
         c.changed = false;
         let deadline = Instant::now() + STOP_WAIT;
-        let jobs = [c.job.take().map(|j| j.job), c.obsolete.take()];
+        let jobs = [
+            c.job.take().map(|j| j.job),
+            c.obsolete.take(),
+            c.left_behind.take(),
+        ];
         let check = c.check.take().map(|k| k.job);
         let ended = jobs
             .into_iter()
@@ -2400,6 +2441,40 @@ impl Core {
             })
     }
 
+    /// At a choice, a fill read in flight is stopped and left behind, so
+    /// the chosen chart's job never waits for it: its slot is freed now,
+    /// as its output is never taken, and it is settled once its thread
+    /// ends. A read in background mode can wait seconds for a core while
+    /// the chart's load or other software keeps every core busy (design.md
+    /// "Load Pipeline"). With one already left behind no fill read began,
+    /// so there is none to leave.
+    fn abandon_fill_read(&mut self) {
+        if !self
+            .job
+            .as_ref()
+            .is_some_and(|j| matches!(j.target, Target::Cursor { fill: Some(_), .. }))
+            || self.left_behind.is_some()
+        {
+            return;
+        }
+        let Some(Job {
+            target:
+                Target::Cursor {
+                    generation,
+                    slot,
+                    version,
+                    ..
+                },
+            job,
+        }) = self.job.take()
+        else {
+            return;
+        };
+        job.stop();
+        self.free_slot(generation, slot, version);
+        self.left_behind = Some(job);
+    }
+
     fn retire(&mut self, job: OwnedJob<Arc<Output>>) {
         if let Some(old) = self.obsolete.take() {
             // Two ended jobs at once: the older is settled now; its
@@ -2554,6 +2629,11 @@ impl Core {
         self.check_finished();
         if self.obsolete.as_ref().is_some_and(OwnedJob::finished)
             && let Some(old) = self.obsolete.take()
+        {
+            settle_logged(old);
+        }
+        if self.left_behind.as_ref().is_some_and(OwnedJob::finished)
+            && let Some(old) = self.left_behind.take()
         {
             settle_logged(old);
         }
@@ -2955,7 +3035,12 @@ impl Core {
         spawner: Spawner,
         publish: Option<&crate::render_side::ChartPublisher>,
     ) {
-        if self.held_back() || self.cursor.is_some() || self.ended || self.rearm {
+        if self.held_back()
+            || self.cursor.is_some()
+            || self.ended
+            || self.rearm
+            || self.left_behind.is_some()
+        {
             return;
         }
         let rest = self.cursor_generation;

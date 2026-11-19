@@ -181,6 +181,7 @@ impl Drop for LetGo {
     fn drop(&mut self) {
         HOLD.store(false, Ordering::Release);
         HOLD_HARD.store(false, Ordering::Release);
+        crate::chart_images::HOLD_ROW_HARD.store(false, Ordering::Release);
         CHECK_HOLD.store(false, Ordering::Release);
         CHECK_PANIC.store(false, Ordering::Release);
         DERIVE_FAIL.store(false, Ordering::Release);

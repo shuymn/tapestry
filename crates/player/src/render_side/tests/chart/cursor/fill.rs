@@ -17,7 +17,7 @@ use windows::Win32::System::Threading::{THREAD_MODE_BACKGROUND_BEGIN, THREAD_PRI
 use super::{Cursor, LetGo, chart, cursor_of, named, row};
 use crate::chart_currency::CursorChart;
 use crate::chart_images::FS_READS;
-use crate::chart_images::{EntryState, HELD_HARD, HOLD, HOLD_HARD, SlotState, Want};
+use crate::chart_images::{EntryState, HELD_ROW_HARD, HOLD, HOLD_ROW_HARD, SlotState, Want};
 use crate::render_side::tests::wait_until;
 
 impl Cursor {
@@ -622,13 +622,13 @@ fn the_fill_stops_when_no_entry_may_make_room() {
     }
 }
 
-/// A choice while a neighbour is read waits for that read alone: play's
-/// image job begins right after the neighbour's read returns, though the
-/// read ignores its cancel, and no other neighbour begins before it (the
-/// bound on a choice behind the fill, design.md "Rendering and Skins",
-/// chart images).
+/// A choice never waits on a fill read (design.md "Load Pipeline"): with
+/// a neighbour's read stalled for a core, ignoring its stop, play's image
+/// job begins and ends beside it, the read left behind with its slot
+/// freed. Back on selection while it lives, no fill read begins, so at
+/// most one is left behind; once it ends, the fill reads on.
 #[test]
-fn a_choice_during_a_neighbour_read_begins_play_right_after_it() {
+fn a_choice_never_waits_on_a_fill_read() {
     let _serial = crate::imports::tests::serial();
     let _let_go = LetGo;
     let c = cursor_of(8);
@@ -636,14 +636,23 @@ fn a_choice_during_a_neighbour_read_begins_play_right_after_it() {
     let near_refs: Vec<&tempfile::TempDir> = near.iter().collect();
     c.rest_on(at.path(), named());
     c.shown(at.path(), named());
-    HELD_HARD.store(false, Ordering::Release);
-    HOLD_HARD.store(true, Ordering::Release);
+    HELD_ROW_HARD.store(false, Ordering::Release);
+    HOLD_ROW_HARD.store(true, Ordering::Release);
     c.rest_with(at.path(), named(), &near_refs);
     c.until(|c| c.w.begun() == 2 && !c.w.idle());
-    assert!(wait_until(|| HELD_HARD.load(Ordering::Acquire)));
+    assert!(wait_until(|| HELD_ROW_HARD.load(Ordering::Acquire)));
+    let held = |c: &Cursor| {
+        c.w.slot_states()
+            .iter()
+            .filter(|s| **s != SlotState::Free)
+            .count()
+    };
+    assert_eq!(held(&c), 2, "the cursor's slot and the neighbour's");
     // The choice.
     c.w.leave_selection(&c.coord);
     c.r.link.leave_selection();
+    assert!(c.w.left_behind_alive());
+    assert_eq!(held(&c), 1, "the left read's slot not freed");
     c.w.renew();
     c.w.attempt(Want {
         dir: at.path().to_path_buf(),
@@ -660,25 +669,49 @@ fn a_choice_during_a_neighbour_read_begins_play_right_after_it() {
         );
         c.w.service();
     };
-    for _ in 0..20 {
-        play_step();
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert_eq!(c.w.begun(), 2, "play's job began beside the neighbour's");
-    HOLD_HARD.store(false, Ordering::Release);
     let end = Instant::now() + Duration::from_secs(10);
-    while c.w.begun() == 2 {
-        assert!(Instant::now() < end, "play's job never began: {:?}", c.w);
+    while c.w.current().is_none() {
+        assert!(
+            Instant::now() < end,
+            "play waited on the fill read: {:?}",
+            c.w
+        );
         play_step();
         std::thread::sleep(Duration::from_millis(1));
     }
-    while c.w.current().is_none() || !c.w.idle() {
-        assert!(Instant::now() < end, "{:?}", c.w);
-        play_step();
+    assert!(HELD_ROW_HARD.load(Ordering::Acquire), "the fill read ended");
+    assert_eq!(c.w.begun(), 3, "the cursor's, the neighbour's and play's");
+    // Back on selection while the left read lives: the fill waits, no
+    // read of it begins.
+    c.w.forget();
+    c.w.drop_images();
+    c.r.link.enter_selection(2);
+    c.r.link
+        .show_selection(crate::render_side::tests::selection_update(2, 1));
+    c.w.entered();
+    c.on(at.path(), named());
+    c.rest_with(at.path(), named(), &near_refs);
+    for _ in 0..20 {
+        c.step();
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(c.w.begun(), 3, "another neighbour began before play's job");
-    assert!(c.w.entry(&row(near[1].path(), named())).is_none());
+    assert!(c.w.left_behind_alive());
+    assert!(!c.w.cursor_deferred() && c.w.fill_state().0, "{:?}", c.w);
+    let begun = c.w.begun();
+    for _ in 0..20 {
+        c.step();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(
+        c.w.begun(),
+        begun,
+        "a second fill read began beside the left one"
+    );
+    HOLD_ROW_HARD.store(false, Ordering::Release);
+    c.filled();
+    assert!(!c.w.left_behind_alive());
+    assert!(c.slot_of(&near[0]).is_some() && c.slot_of(&near[1]).is_some());
+    assert_eq!(c.w.begun(), begun + 2);
 }
 
 impl Cursor {
