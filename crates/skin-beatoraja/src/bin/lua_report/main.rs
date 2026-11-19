@@ -48,9 +48,29 @@
 //! `lua_report --catalogue <root> <entry> [<root> <entry>]...` prints, per
 //! skin, its header as the importer parses it, one tab-separated line per
 //! named option item (`option`, the option, the item) and per named file
-//! choice candidate (`file`, the choice, the candidate): the
-//! configurations a sweep reports each of. It names the skin's own
-//! options, so it too stays on the developer's PC.
+//! choice candidate (`file`, the choice, the candidate), its names'
+//! backslashes, tabs, CRs and LFs escaped: the rows the walk toggles, in
+//! its order (configuration n is a skin's n-th row). A JSON skin's header
+//! is read as the JSON import reads it. It names the skin's own options,
+//! so it too stays on the developer's PC.
+//!
+//! `lua_report --walk <records> <root> <entry> [<root> <entry>]...` walks
+//! each skin's default configuration and each catalogue row toggled alone
+//! under `--autoplay off --class normal --level 12` (and `--result dense`
+//! for a result skin), a refusal attempted once more, writes one
+//! record per skin and configuration to `<records>` and prints, per skin,
+//! the configurations walked and how many imported ([`walk`]).
+//!
+//! `lua_report --compare <kept> <new>` compares two walks' records and
+//! exits 1 on a new failure, 2 when a skin must be re-baselined or a
+//! configuration could not be judged, else 0 ([`compare`]). Neither mode
+//! prints a skin's names, paths or strings, nor its file arguments.
+
+mod compare;
+mod record;
+mod walk;
+#[cfg(test)]
+mod walk_tests;
 
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
@@ -59,7 +79,7 @@ use std::path::PathBuf;
 use bms_model::TimeUs;
 use skin_beatoraja::lua::facts::{Fact, ImportFacts, JudgeClass};
 use skin_beatoraja::lua::survey::{
-    Choice, DestinationEntry, Local, RuntimeNoteRecord, Survey, survey_json, survey_with,
+    Choice, DestinationEntry, Local, RuntimeNoteRecord, Survey, probe, survey_json, survey_with,
 };
 use skin_beatoraja::{BgaMode, Cancel};
 use skin_model::{
@@ -73,7 +93,9 @@ const USAGE: &str = "usage: lua_report [--autoplay on|off] [--bga on|autoplay|of
                      [--level <n>|pending] [--total <n>] [--notes <n>] [--result dense] \
                      [--option <name> <item>]... \
                      [--file <name> <candidate>]... [--local] <root> <entry> [<root> <entry>]...\n\
-                     \x20      lua_report --catalogue <root> <entry> [<root> <entry>]...";
+                     \x20      lua_report --catalogue <root> <entry> [<root> <entry>]...\n\
+                     \x20      lua_report --walk <records> <root> <entry> [<root> <entry>]...\n\
+                     \x20      lua_report --compare <kept records> <new records>";
 
 fn usage() -> ! {
     eprintln!("{USAGE}");
@@ -484,47 +506,179 @@ fn survey_entry(
     }
 }
 
+/// `s` with its backslashes, tabs, CRs and LFs escaped, so that it stays
+/// one field of a tab-separated row.
+fn escaped(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\\' => out.push_str("\\\\"),
+            '\t' => out.push_str("\\t"),
+            '\r' => out.push_str("\\r"),
+            '\n' => out.push_str("\\n"),
+            c => out.push(c),
+        }
+    }
+    out
+}
+
 /// The header catalogue of each `<root> <entry>` pair in `args`, as
-/// `--catalogue` prints it; a header refused prints its refusal's label.
+/// `--catalogue` prints it: the walk's rows ([`walk::rows`]) by name; a
+/// header refused prints its refusal's label.
 fn catalogue(args: &[String]) -> String {
     let mut s = String::new();
     for pair in args.chunks(2) {
         let [root, entry] = pair else { continue };
-        let _ = writeln!(s, "skin\t{root}\t{entry}");
-        let h = match skin_beatoraja::read_lua_header(&PathBuf::from(root), entry, &Cancel::new()) {
-            Ok(h) => h,
-            Err(e) => {
-                let _ = writeln!(s, "refused\t{e}");
-                continue;
-            }
+        let _ = writeln!(s, "skin\t{}\t{}", escaped(root), escaped(entry));
+        let p = probe(&PathBuf::from(root), entry, &Cancel::new());
+        let Some(header) = p.header() else {
+            let refused = p.refused().map(|r| r.outcome).unwrap_or_default();
+            let _ = writeln!(s, "refused\t{refused}");
+            continue;
         };
-        let header = h.header();
-        for o in &header.options {
-            let Some(name) = &o.name else { continue };
-            for item in o.items.iter().filter_map(|i| i.name.as_ref()) {
-                let _ = writeln!(s, "option\t{name}\t{item}");
-            }
-        }
-        for f in &header.files {
-            let Some(name) = &f.name else { continue };
-            for c in &f.candidates {
-                let _ = writeln!(s, "file\t{name}\t{c}");
-            }
+        for row in walk::rows(header) {
+            let (kind, name, value) = match row {
+                walk::Row::Option { option, item } => {
+                    let o = &header.options[option];
+                    ("option", &o.name, &o.items[item].name)
+                }
+                walk::Row::File { file, candidate } => {
+                    let f = &header.files[file];
+                    ("file", &f.name, &Some(f.candidates[candidate].clone()))
+                }
+            };
+            let (Some(name), Some(value)) = (name, value) else {
+                continue;
+            };
+            let _ = writeln!(s, "{kind}\t{}\t{}", escaped(name), escaped(value));
         }
     }
     s
 }
 
+/// The panic hook of `--walk` and `--compare`: `panic` alone to `out`,
+/// neither the message nor the location (a skin's text may be in either).
+fn quiet_panics(out: impl std::io::Write + Send + Sync + 'static) {
+    let out = std::sync::Mutex::new(out);
+    std::panic::set_hook(Box::new(move |_| {
+        if let Ok(mut o) = out.lock() {
+            let _ = writeln!(o, "panic");
+        }
+    }));
+}
+
+/// What a mode printed and its exit code.
+struct Done {
+    code: i32,
+    out: String,
+    err: String,
+}
+
+impl Done {
+    fn fail(err: String) -> Self {
+        Self {
+            code: 2,
+            out: String::new(),
+            err: err
+                + "
+",
+        }
+    }
+}
+
+/// `--walk <records> <root> <entry>...` over `src`.
+fn walk_mode(records: &str, src: &mut dyn walk::Source, entries: &[String]) -> Done {
+    let (walked, summary) = walk::walk(src, entries);
+    let text = match walked.to_text() {
+        Ok(t) => t,
+        // The summary prints the same labels: neither is given.
+        Err(e) => return Done::fail(e),
+    };
+    if let Err(e) = std::fs::write(records, text) {
+        return Done {
+            out: summary,
+            ..Done::fail(format!(
+                "the records file could not be written: {:?}",
+                e.kind()
+            ))
+        };
+    }
+    Done {
+        code: 0,
+        out: summary,
+        err: String::new(),
+    }
+}
+
+/// `--compare <kept> <new>`.
+fn compare_mode(kept: &str, new: &str) -> Done {
+    let read = |path: &str, name: &str| {
+        std::fs::read_to_string(path)
+            .map_err(|e| format!("{name}: could not be read: {:?}", e.kind()))
+            .and_then(|text| record::Records::read(name, &text))
+    };
+    let runs = read(kept, "kept").and_then(|k| read(new, "new").map(|n| (k, n)));
+    match runs.and_then(|(k, n)| compare::compare(&k, &n)) {
+        Ok(v) => Done {
+            code: v.code(),
+            out: v.text,
+            err: String::new(),
+        },
+        Err(e) => Done::fail(e),
+    }
+}
+
+/// The walk's and the comparison's command lines; `None` for a usage
+/// error.
+fn new_mode(flag: &str, args: &[String]) -> Option<Done> {
+    match (flag, args) {
+        ("--walk", [records, pairs @ ..]) => {
+            if records.starts_with("--")
+                || pairs.is_empty()
+                || !pairs.len().is_multiple_of(2)
+                || pairs.iter().any(|a| a.starts_with("--"))
+            {
+                return None;
+            }
+            let skins: Vec<(String, String)> = pairs
+                .chunks(2)
+                .filter_map(|p| match p {
+                    [r, e] => Some((r.clone(), e.clone())),
+                    _ => None,
+                })
+                .collect();
+            let entries: Vec<String> = skins.iter().map(|(_, e)| e.clone()).collect();
+            Some(walk_mode(records, &mut walk::Disk(skins), &entries))
+        }
+        ("--compare", [kept, new]) if !kept.starts_with("--") && !new.starts_with("--") => {
+            Some(compare_mode(kept, new))
+        }
+        _ => None,
+    }
+}
+
 fn main() {
     let all: Vec<String> = std::env::args().skip(1).collect();
-    if let Some((flag, args)) = all.split_first()
-        && flag == "--catalogue"
-    {
-        if args.is_empty() || !args.len().is_multiple_of(2) {
-            usage();
+    if let Some((flag, args)) = all.split_first() {
+        match flag.as_str() {
+            "--catalogue" => {
+                if args.is_empty() || !args.len().is_multiple_of(2) {
+                    usage();
+                }
+                print!("{}", catalogue(args));
+                return;
+            }
+            "--walk" | "--compare" => {
+                quiet_panics(std::io::stderr());
+                let Some(done) = new_mode(flag, args) else {
+                    usage()
+                };
+                print!("{}", done.out);
+                eprint!("{}", done.err);
+                std::process::exit(done.code);
+            }
+            _ => {}
         }
-        print!("{}", catalogue(args));
-        return;
     }
     let Some((facts, choice, local, args)) = facts(&all) else {
         usage()
