@@ -465,7 +465,14 @@ fn the_digest_covers_the_whole_header_and_the_entry() {
         ("offset id", Box::new(|h| h.offsets[0].id = 2)),
         ("offset flag", Box::new(|h| h.offsets[0].a = true)),
         // Encoding boundaries: a string moved across two fields, an
-        // empty name against none, an item moved to the next list.
+        // empty name against none, an item moved to the next list, and
+        // two candidates whose concatenation is the same.
+        (
+            "candidate boundary",
+            Box::new(|h| {
+                h.files[0].candidates = vec!["a.p".to_owned(), "ngb.png".to_owned()];
+            }),
+        ),
         (
             "boundary",
             Box::new(|h| {
