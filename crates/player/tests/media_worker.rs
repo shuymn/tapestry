@@ -2276,12 +2276,15 @@ fn a_file_with_two_strikes_is_not_reopened_that_run() {
     let other_id = FileId::of(&open(&other_fixture)).unwrap();
     let mut strikes = Strikes::default();
     let stage = Stage::new();
-    // The file is open in two workers that crash: a strike each. Another,
-    // which each closed before it crashed, gets none.
+    // The file is open in two workers that crash, in each as two players
+    // through handles of their own: a strike for each worker, and both
+    // players fail. Another, which each closed before it crashed, gets
+    // none.
     for strike in 1..=2 {
         let mut worker = stage.launch(&recipe()).unwrap();
         worker.open(1, &open(&fixture), &strikes).unwrap();
         worker.open(2, &open(&other_fixture), &strikes).unwrap();
+        worker.open(3, &open(&fixture), &strikes).unwrap();
         worker.close(2).unwrap();
         loop {
             match worker.recv(REPLY).unwrap() {
@@ -2290,7 +2293,6 @@ fn a_file_with_two_strikes_is_not_reopened_that_run() {
                 reply => panic!("{reply:?}"),
             }
         }
-        worker.closed(2);
         // SAFETY: the worker's process handle, which has every access.
         unsafe { TerminateProcess(worker.process(), CRASH) }.unwrap();
         let deadline = Instant::now() + REPLY;
@@ -2303,7 +2305,7 @@ fn a_file_with_two_strikes_is_not_reopened_that_run() {
             std::thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(end, End::Exited(CRASH));
-        assert_eq!(failed, [1]);
+        assert_eq!(failed, [1, 3]);
         assert_eq!(strikes.of(id), strike);
         assert_eq!(strikes.of(other_id), 0);
     }
@@ -2320,4 +2322,76 @@ fn a_file_with_two_strikes_is_not_reopened_that_run() {
         matches!(probe, Reply::Probed { player: 2, .. }),
         "{probe:?}"
     );
+}
+
+/// Ends `worker` as a crash does and reaps it: the players that failed.
+fn crash_and_reap(worker: &mut Launched, strikes: &mut Strikes) -> Vec<u8> {
+    use windows::Win32::System::Threading::TerminateProcess;
+
+    // SAFETY: the worker's process handle, which has every access.
+    unsafe { TerminateProcess(worker.process(), CRASH) }.unwrap();
+    let deadline = Instant::now() + REPLY;
+    let mut failed = Vec::new();
+    loop {
+        if let Some(end) = worker.reap(strikes, |p| failed.push(p)) {
+            assert_eq!(end, End::Exited(CRASH));
+            return failed;
+        }
+        assert!(Instant::now() < deadline, "{:?}", worker.watch_events());
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+// Covers: T02
+#[test]
+fn a_refused_open_strikes_only_the_file_open() {
+    use media_host::OpenError;
+
+    let a_path = root().join("crates/player/tests/media/zlib/plain.mkv");
+    let b_path = root().join("crates/player/tests/media/zlib/plain.mov");
+    let open = |path: &Path| std::fs::File::open(path).unwrap();
+    let a = FileId::of(&open(&a_path)).unwrap();
+    let b = FileId::of(&open(&b_path)).unwrap();
+    let mut strikes = Strikes::default();
+    let stage = Stage::new();
+    // An open under a player's id while that player is open is refused by
+    // the host, and the player keeps its file: a crash strikes it, and not
+    // the file refused.
+    let mut worker = stage.launch(&recipe()).unwrap();
+    worker.open(1, &open(&a_path), &strikes).unwrap();
+    let probe = worker.recv(REPLY).unwrap();
+    assert!(
+        matches!(probe, Reply::Probed { player: 1, .. }),
+        "{probe:?}"
+    );
+    assert!(matches!(
+        worker.open(1, &open(&b_path), &strikes),
+        Err(OpenError::Occupied)
+    ));
+    assert_eq!(crash_and_reap(&mut worker, &mut strikes), [1]);
+    assert_eq!((strikes.of(a), strikes.of(b)), (1, 0));
+    // An open the worker refuses before its probe, past the eight players
+    // it holds, frees its id once the game takes the refusal: a crash
+    // strikes the file the eight have open, once, and not the one refused.
+    let mut worker = stage.launch(&recipe()).unwrap();
+    for player in 1..=8 {
+        worker.open(player, &open(&a_path), &strikes).unwrap();
+    }
+    worker.open(9, &open(&b_path), &strikes).unwrap();
+    let mut probed = std::collections::BTreeSet::new();
+    let mut refused = false;
+    while probed.len() < 8 || !refused {
+        match worker.recv(REPLY).unwrap() {
+            Reply::Probed { player, .. } => {
+                probed.insert(player);
+            }
+            Reply::Failed { player: 9, .. } => refused = true,
+            reply => panic!("{reply:?}"),
+        }
+    }
+    assert_eq!(
+        crash_and_reap(&mut worker, &mut strikes),
+        [1, 2, 3, 4, 5, 6, 7, 8]
+    );
+    assert_eq!((strikes.of(a), strikes.of(b)), (2, 0));
 }

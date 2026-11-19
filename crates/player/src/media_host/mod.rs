@@ -20,14 +20,18 @@
 //! and records how each worker ended; the game reads that end
 //! ([`Worker::end`]), and each file open in a worker that ended without
 //! the game asking gets a strike, two of which keep the file from being
-//! opened again in the run ([`strikes`], [`Worker::reap`]).
+//! opened again in the run ([`strikes`], [`Worker::reap`]). The host knows
+//! which file each player has open from the replies the game takes: an
+//! open stays the player's until the worker answers that it closed, or
+//! refuses the open before it answers its probe.
 
 pub mod handles;
 pub mod launch;
 pub mod strikes;
 pub mod watch;
 
-use std::collections::BTreeMap;
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::os::windows::io::{AsRawHandle as _, FromRawHandle as _, OwnedHandle};
 use std::sync::Arc;
@@ -156,6 +160,17 @@ pub struct Hello {
     pub configuration: String,
 }
 
+/// A player the game opened: its file, and whether the worker has yet to
+/// answer its open.
+#[derive(Clone, Copy, Debug)]
+struct Opened {
+    file: FileId,
+    /// The worker has not answered the open with its probe or a refusal:
+    /// a failure now is the open's refusal, and the player's id is free
+    /// again.
+    pending: bool,
+}
+
 /// How long a dropped worker has to end on its own before its job closes.
 const QUIT_GRACE_MS: u32 = 500;
 
@@ -176,8 +191,9 @@ pub struct Worker {
     job: Option<Owned>,
     /// The job's watcher (with the job).
     watch: Option<Watch>,
-    /// The file each player the game opened is reading, until it closes.
-    open_files: BTreeMap<u8, FileId>,
+    /// The file each player the game opened is reading, until the worker
+    /// answers that it closed or refuses its open ([`Opened`]).
+    open_files: RefCell<BTreeMap<u8, Opened>>,
     /// The window station and desktop the worker runs on, kept while it
     /// runs.
     _desktop: Option<launch::Desktop>,
@@ -236,12 +252,38 @@ impl Worker {
     /// `Timeout` when none came in time; `Disconnected` once the replies
     /// have ended (the worker ended or sent one that does not decode).
     pub fn recv(&self, timeout: Duration) -> Result<Reply, RecvTimeoutError> {
-        self.replies.recv_timeout(timeout)
+        let reply = self.replies.recv_timeout(timeout)?;
+        self.track(&reply);
+        Ok(reply)
     }
 
     /// A reply other than a log line that has come, without waiting.
     pub fn try_recv(&self) -> Option<Reply> {
-        self.replies.try_recv().ok()
+        let reply = self.replies.try_recv().ok()?;
+        self.track(&reply);
+        Some(reply)
+    }
+
+    /// Follows the players' files through `reply`: a player that closed no
+    /// longer has its file open, nor does one whose open the worker refused
+    /// before answering it; one whose open the worker answered (its probe
+    /// or the file's refusal) is no longer pending.
+    fn track(&self, reply: &Reply) {
+        let (player, gone) = match *reply {
+            Reply::Closed { player } => (player, true),
+            Reply::Failed { player, .. } => (player, false),
+            Reply::Probed { player, .. } | Reply::Refused { player, .. } => {
+                if let Some(opened) = self.open_files.borrow_mut().get_mut(&player) {
+                    opened.pending = false;
+                }
+                return;
+            }
+            _ => return,
+        };
+        let mut open = self.open_files.borrow_mut();
+        if gone || open.get(&player).is_some_and(|o| o.pending) {
+            open.remove(&player);
+        }
     }
 
     /// Duplicates `handle`, the game's, into the worker with the access
@@ -284,21 +326,27 @@ impl Worker {
         self.watch.as_ref().and_then(Watch::end)
     }
 
-    /// Opens `file` as player `player`, unless it has the strikes that keep
-    /// it from being opened: hands the worker its handle and sends `Open`,
-    /// whose reply comes as any other. The file is open in the worker until
-    /// the worker answers that the player closed ([`Self::closed`]).
+    /// Opens `file` as player `player`, unless that player is open or the
+    /// file has the strikes that keep it from being opened: hands the
+    /// worker its handle and sends `Open`, whose reply comes as any other.
+    /// The file is the player's until the game takes the worker's answer
+    /// that the player closed, or its refusal of the open
+    /// ([`Self::recv`]).
     ///
     /// # Errors
     ///
-    /// [`OpenError::Struck`], or the system's error that kept the file
-    /// from being handed or the command from being sent.
+    /// [`OpenError::Occupied`], [`OpenError::Struck`], or the system's
+    /// error that kept the file from being handed or the command from
+    /// being sent.
     pub fn open(
         &mut self,
         player: u8,
         file: &std::fs::File,
         strikes: &Strikes,
     ) -> Result<(), OpenError> {
+        if self.open_files.get_mut().contains_key(&player) {
+            return Err(OpenError::Occupied);
+        }
         let id = FileId::of(file).map_err(OpenError::System)?;
         if strikes.out(id) {
             return Err(OpenError::Struck);
@@ -311,13 +359,19 @@ impl Worker {
             file: value,
         })
         .map_err(OpenError::Pipe)?;
-        self.open_files.insert(player, id);
+        self.open_files.get_mut().insert(
+            player,
+            Opened {
+                file: id,
+                pending: true,
+            },
+        );
         Ok(())
     }
 
     /// Asks the worker to close player `player`. Its file stays open in the
-    /// worker until the worker answers, so a worker that ends while closing
-    /// it gives it a strike.
+    /// worker until the game takes the worker's answer, so a worker that
+    /// ends while closing it gives it a strike.
     ///
     /// # Errors
     ///
@@ -326,21 +380,17 @@ impl Worker {
         self.send(&Command::Close { player })
     }
 
-    /// Takes the worker's answer that player `player` closed: its file is
-    /// no longer open in the worker.
-    pub fn closed(&mut self, player: u8) {
-        self.open_files.remove(&player);
-    }
-
     /// How the worker ended, once its watcher has seen it end: each player
-    /// open in it then fails, passed to `failed`, and its file gets a
-    /// strike, once.
-    pub fn reap(&mut self, strikes: &mut Strikes, mut failed: impl FnMut(u8)) -> Option<End> {
+    /// open in it then fails, passed to `failed`, and each file open in it
+    /// gets one strike, however many of its players had it open.
+    pub fn reap(&mut self, strikes: &mut Strikes, failed: impl FnMut(u8)) -> Option<End> {
         let end = self.end()?;
-        while let Some((player, file)) = self.open_files.pop_first() {
+        let open = std::mem::take(self.open_files.get_mut());
+        let files: BTreeSet<FileId> = open.values().map(|o| o.file).collect();
+        for file in files {
             strikes.strike(file);
-            failed(player);
         }
+        open.into_keys().for_each(failed);
         Some(end)
     }
 }
@@ -348,6 +398,9 @@ impl Worker {
 /// Why a file was not opened.
 #[derive(Debug)]
 pub enum OpenError {
+    /// The player is open: the game has not taken the worker's answer that
+    /// it closed.
+    Occupied,
     /// It has the strikes that keep it from being opened again in the run.
     Struck,
     /// The system's error reading its identity or handing it in.
