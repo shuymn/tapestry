@@ -40,9 +40,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "dev-tools")]
 use media_support::WORKER;
 use media_support::media_host::strikes::{FileId, Strikes};
-#[cfg(feature = "dev-tools")]
-use media_support::media_host::watch::{self, Event};
-use media_support::media_host::watch::{End, LINE};
+use media_support::media_host::watch::{self, End, Event, LINE};
 use media_support::{Kind, Launched, Setup, Stage, media_host, recipe, root};
 use skin_model::media::control::{Command as Order, Reply};
 use skin_model::media::{Frame, Geometry, Reader, Window};
@@ -56,7 +54,6 @@ use windows::Win32::System::Threading::SetEvent;
 const REPLY: Duration = Duration::from_secs(30);
 
 /// Three and a half of the job watcher's periods: three of its reads.
-#[cfg(feature = "dev-tools")]
 const WATCHED: Duration = Duration::from_millis(350);
 
 /// A worker the game's host launched under the recipe, staged in a
@@ -1937,7 +1934,6 @@ fn logged(worker: &Launched, text: &str) -> String {
 }
 
 /// Waits until `worker`'s watcher has seen it end: how it ended.
-#[cfg(feature = "dev-tools")]
 fn ended(worker: &Launched) -> End {
     let deadline = Instant::now() + REPLY;
     loop {
@@ -1966,6 +1962,25 @@ fn reads(events: &[Event]) -> Vec<usize> {
         .collect()
 }
 
+/// Checks that the watcher's reads keep to its schedule of one every
+/// 100 ms from its start: none before the first 100 ms, and none in the
+/// same 100 ms as another, a packet's wake included. How late a read comes
+/// is the scheduler's and is not checked: a loaded machine delays it.
+#[cfg(feature = "dev-tools")]
+fn on_schedule(events: &[Event]) {
+    let periods: Vec<u128> = events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Read { at, .. } => Some(at.as_millis() / 100),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        periods.first().is_none_or(|&p| p >= 1) && periods.windows(2).all(|w| w[0] < w[1]),
+        "{events:?}"
+    );
+}
+
 // Covers: T02
 #[cfg(feature = "dev-tools")]
 #[test]
@@ -1977,7 +1992,7 @@ fn job_memory_cap_refuses_and_the_parent_terminates() {
     let off = watch::Variation {
         no_message: true,
         no_accounting: true,
-        discard_message: false,
+        ..watch::Variation::default()
     };
     let worker = balloon(&stage, "32 640", off);
     let log = logged(&worker, "refused with");
@@ -2028,6 +2043,18 @@ fn job_memory_message_alone_terminates_below_the_line() {
     assert!(log.contains("balloon: committed 384 MiB"), "{log}");
     let peak = worker.job_peak().unwrap();
     assert!(peak < LINE, "{peak}");
+    // The same message about another process wakes the watcher and ends
+    // nothing, nor moves its reads.
+    worker
+        .post_job_message_about(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT, worker.pid() ^ 4)
+        .unwrap();
+    std::thread::sleep(WATCHED);
+    let events = worker.watch_events();
+    assert!(!worker.ended() && worker.end().is_none(), "{events:?}");
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Message { .. })),
+        "{events:?}"
+    );
     worker
         .post_job_message(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT)
         .unwrap();
@@ -2035,6 +2062,7 @@ fn job_memory_message_alone_terminates_below_the_line() {
     assert_eq!(worker.wait_exit(REPLY), Some(watch::ENDED_BY_MESSAGE));
     let events = worker.watch_events();
     assert!(reads(&events).iter().all(|&p| p < LINE), "{events:?}");
+    on_schedule(&events);
     drop(worker);
     // The system's own message, observed rather than required: 128 MiB at
     // once past the cap is refused, and the peak stays below the line,
@@ -2076,9 +2104,8 @@ fn job_memory_cap_terminates_when_the_message_is_lost() {
     // The job's message discarded before the watcher sees it: the first
     // scheduled read at or past the line ends the worker.
     let lost = watch::Variation {
-        no_message: false,
-        no_accounting: false,
         discard_message: true,
+        ..watch::Variation::default()
     };
     let mut worker = balloon(&stage, "32 640", lost);
     worker.open(1, &file, &strikes).unwrap();
@@ -2111,6 +2138,7 @@ fn job_memory_cap_terminates_when_the_message_is_lost() {
         !watched.iter().any(|e| matches!(e, Event::Message { .. })),
         "{events:?}"
     );
+    on_schedule(&events);
     eprintln!("the watcher saw {events:?}");
     // The game records what it records on the message: the player failed,
     // and its file has a strike.
@@ -2142,6 +2170,7 @@ fn each_launch_gets_a_job_of_its_own() {
         peaks.len() >= 3 && peaks.iter().all(|&p| p < LINE),
         "{events:?}"
     );
+    on_schedule(&events);
     let fixture = root().join("crates/player/tests/media/zlib/plain.mkv");
     let probe = worker.open(1, &fixture);
     let Reply::Probed { width, height, .. } = probe else {
@@ -2152,6 +2181,192 @@ fn each_launch_gets_a_job_of_its_own() {
     assert_eq!(take_all(&worker, &mut ring, 1, 0, 33_333).len(), 120);
     worker.close(1);
     assert_eq!(worker.launched.end(), None);
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn job_memory_cap_terminates_on_a_crossing_released_between_reads() {
+    let stage = Stage::new();
+    // 416 MiB, below the line, then 64 MiB at once, past it, released at
+    // once: the next read finds the peak at the line, though the worker's
+    // commit is back below it, and ends the worker.
+    let worker = balloon(&stage, "32 416 64 free", watch::Variation::default());
+    assert_eq!(ended(&worker), End::Line);
+    assert_eq!(worker.wait_exit(REPLY), Some(watch::ENDED_AT_LINE));
+    // What the worker logged before it ended is still being read.
+    let deadline = Instant::now() + REPLY;
+    let mut log = worker.log();
+    while !log.contains("released") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+        log = worker.log();
+    }
+    assert!(
+        log.contains("balloon: committed 480 MiB and released 64 MiB (Ok(()))"),
+        "{log}"
+    );
+    let events = worker.watch_events();
+    let peaks = reads(&events);
+    let (last, before) = peaks.split_last().unwrap();
+    assert!(
+        *last >= 480 << 20 && before.iter().all(|&p| p < LINE),
+        "{events:?}"
+    );
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Message { .. })),
+        "{events:?}"
+    );
+    on_schedule(&events);
+}
+
+/// Ends the worker whose process `process` is, as a crash does, and waits
+/// until it has ended: the hook a test runs just before the watcher ends
+/// the worker's job.
+#[cfg(feature = "dev-tools")]
+fn crash_now(process: HANDLE) {
+    use windows::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+
+    // SAFETY: the watcher's handle to the worker's process, which has
+    // every access.
+    unsafe {
+        let _ = TerminateProcess(process, CRASH);
+        let _ = WaitForSingleObject(process, 30_000);
+    }
+}
+
+// Covers: T02
+#[test]
+fn a_memory_message_after_a_crash_records_the_crash() {
+    use windows::Win32::System::SystemServices::JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT;
+    use windows::Win32::System::Threading::TerminateProcess;
+
+    // The watcher's reads an hour apart, so none comes while the test acts:
+    // the job's memory message, queued after the worker crashed, is the
+    // first thing the watcher takes. Its termination finds the worker
+    // ended, and the end recorded is the crash.
+    let stage = Stage::new();
+    let slow = watch::Variation {
+        period: Some(Duration::from_secs(3600)),
+        ..watch::Variation::default()
+    };
+    let worker = stage.launch(&recipe().watching_as(slow)).unwrap();
+    // SAFETY: the worker's process handle, which has every access.
+    unsafe { TerminateProcess(worker.process(), CRASH) }.unwrap();
+    assert_eq!(worker.wait_exit(REPLY), Some(CRASH));
+    worker
+        .post_job_message(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT)
+        .unwrap();
+    assert_eq!(ended(&worker), End::Exited(CRASH));
+    let events = worker.watch_events();
+    assert!(
+        matches!(
+            events.as_slice(),
+            [
+                Event::Message {
+                    discarded: false,
+                    ..
+                },
+                Event::Ended {
+                    end: End::Exited(CRASH),
+                    ..
+                }
+            ]
+        ),
+        "{events:?}"
+    );
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn a_crash_before_the_line_termination_records_the_crash() {
+    // The job's message discarded, a read finds the peak at the line, and
+    // the worker crashes after the watcher last looked at it and before the
+    // watcher ends its job (a hook the watcher runs there): the end
+    // recorded is the crash.
+    let stage = Stage::new();
+    let racing = watch::Variation {
+        discard_message: true,
+        before_terminate: Some(crash_now),
+        ..watch::Variation::default()
+    };
+    let worker = balloon(&stage, "32 640", racing);
+    assert_eq!(ended(&worker), End::Exited(CRASH));
+    assert_eq!(worker.wait_exit(REPLY), Some(CRASH));
+    let events = worker.watch_events();
+    assert!(
+        reads(&events).last().is_some_and(|&p| p >= LINE),
+        "{events:?}"
+    );
+}
+
+// Covers: T02
+#[test]
+fn a_failed_termination_keeps_the_worker_watched() {
+    use windows::Win32::System::SystemServices::JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT;
+    use windows::Win32::System::Threading::TerminateProcess;
+
+    let stage = Stage::new();
+    // The watcher's first termination fails: the worker lives, and the
+    // watcher's next read asks again, which ends it with the message's exit
+    // code, the end recorded.
+    let once = watch::Variation {
+        failed_terminations: 1,
+        ..watch::Variation::default()
+    };
+    let worker = stage.launch(&recipe().watching_as(once)).unwrap();
+    worker
+        .post_job_message(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT)
+        .unwrap();
+    assert_eq!(ended(&worker), End::Message);
+    assert_eq!(worker.wait_exit(REPLY), Some(watch::ENDED_BY_MESSAGE));
+    drop(worker);
+    // Every termination fails: nothing is recorded while the worker lives,
+    // and the end it comes to by itself is recorded as its own.
+    let never = watch::Variation {
+        failed_terminations: u8::MAX,
+        ..watch::Variation::default()
+    };
+    let worker = stage.launch(&recipe().watching_as(never)).unwrap();
+    worker
+        .post_job_message(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT)
+        .unwrap();
+    std::thread::sleep(WATCHED);
+    let events = worker.watch_events();
+    assert!(!worker.ended() && worker.end().is_none(), "{events:?}");
+    // SAFETY: the worker's process handle, which has every access.
+    unsafe { TerminateProcess(worker.process(), CRASH) }.unwrap();
+    assert_eq!(ended(&worker), End::Exited(CRASH));
+}
+
+// Covers: T02
+#[test]
+fn a_watch_whose_stop_packet_is_lost_still_stops() {
+    // Neither stop packet is posted, to the watcher's port or to the port
+    // the job's messages are discarded from: both threads stop at their
+    // next timed wake, close their handles, and closing the job ends the
+    // worker.
+    let stage = Stage::new();
+    let lost = watch::Variation {
+        discard_message: true,
+        failed_stop_post: true,
+        ..watch::Variation::default()
+    };
+    let mut launched = stage.launch(&recipe().watching_as(lost)).unwrap();
+    let mut worker = launched.take();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        worker.close_job();
+        let _ = tx.send(worker);
+    });
+    let worker = rx
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap_or_else(|e| panic!("the watcher did not stop ({e})"));
+    assert!(
+        launched.wait_exit(REPLY).is_some(),
+        "the job kept the worker"
+    );
+    drop(worker);
 }
 
 /// How many views of a section `bytes` long `process` has mapped.

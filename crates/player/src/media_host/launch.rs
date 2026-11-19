@@ -319,6 +319,10 @@ impl Setup {
                 no_message: false,
                 no_accounting: false,
                 discard_message: false,
+                period: None,
+                failed_terminations: 0,
+                before_terminate: None,
+                failed_stop_post: false,
             },
         }
     }

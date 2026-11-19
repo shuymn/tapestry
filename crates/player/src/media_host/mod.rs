@@ -449,12 +449,22 @@ impl Worker {
     ///
     /// When the worker has no watcher, or the post fails.
     pub fn post_job_message(&self, message: u32) -> windows::core::Result<()> {
+        self.post_job_message_about(message, self.pid)
+    }
+
+    /// Posts the job's `message` about process `pid` to the job's watcher,
+    /// as the job posts it.
+    ///
+    /// # Errors
+    ///
+    /// When the worker has no watcher, or the post fails.
+    pub fn post_job_message_about(&self, message: u32, pid: u32) -> windows::core::Result<()> {
         self.watch
             .as_ref()
             .ok_or_else(|| {
                 windows::core::Error::from_hresult(windows::Win32::Foundation::E_UNEXPECTED)
             })?
-            .post(message, self.pid)
+            .post(message, pid)
     }
 
     /// The peak commit of the worker's job, as its watcher reads it.

@@ -14,11 +14,17 @@
 //! in it ([`port`]). Each launch makes its own job, so the peak read is that
 //! worker's alone. Each read also looks at the worker's process: an end the
 //! watcher did not cause is the worker's own, a crash or an exit the game
-//! did not ask for. The game never waits on the watcher: it reads the end
-//! the watcher recorded ([`Watch::end`]), and dropping the watch stops it.
+//! did not ask for. An end the watcher asked for is recorded only once the
+//! worker's process has ended, by the exit code it ended with: a worker
+//! that ended by itself first, or whose job could not be ended, is never
+//! recorded as ended for its memory, and the watcher asks again at each
+//! read while the worker lives. The game never waits on the watcher: it
+//! reads the end the watcher recorded ([`Watch::end`]), and dropping the
+//! watch stops it, by a flag the watcher reads at every timed wake and a
+//! packet that wakes it at once.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use windows::Win32::Foundation::{
@@ -70,7 +76,42 @@ pub enum End {
     Exited(u32),
 }
 
+/// A memory end the watcher asked for, pending until the worker's process
+/// ends.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Cause {
+    Message,
+    Line,
+}
+
+impl Cause {
+    /// The exit code the watcher ends the worker's job with.
+    const fn code(self) -> u32 {
+        match self {
+            Self::Message => ENDED_BY_MESSAGE,
+            Self::Line => ENDED_AT_LINE,
+        }
+    }
+
+    const fn end(self) -> End {
+        match self {
+            Self::Message => End::Message,
+            Self::Line => End::Line,
+        }
+    }
+}
+
 impl End {
+    /// How a worker that ended with exit `code` ended, the watcher having
+    /// asked for `requested`: the memory end it asked for only when the
+    /// worker ended with that end's code, else an end of its own.
+    fn of(requested: Option<Cause>, code: u32) -> Self {
+        match requested {
+            Some(cause) if code == cause.code() => cause.end(),
+            _ => Self::Exited(code),
+        }
+    }
+
     const fn encode(self) -> u64 {
         match self {
             Self::Message => 1 << 32,
@@ -103,6 +144,23 @@ pub struct Variation {
     /// it: the watcher neither wakes nor reads on it.
     #[cfg(test)]
     pub discard_message: bool,
+    /// The reads' period, when not [`PERIOD`]: a test lengthens it so that
+    /// no read comes while it acts.
+    #[cfg(test)]
+    pub period: Option<Duration>,
+    /// The first this many of the watcher's `TerminateJobObject` calls are
+    /// not made and fail, as a refused one does.
+    #[cfg(test)]
+    pub failed_terminations: u8,
+    /// Runs with the worker's process handle just before each of the
+    /// watcher's `TerminateJobObject` calls: a test ends the worker there,
+    /// between the watcher's look at it and its termination.
+    #[cfg(test)]
+    pub before_terminate: Option<fn(HANDLE)>,
+    /// The packets that stop the watcher are not posted, as if posting
+    /// failed.
+    #[cfg(test)]
+    pub failed_stop_post: bool,
 }
 
 #[cfg(test)]
@@ -113,6 +171,10 @@ impl Variation {
 
     const fn accounting(self) -> bool {
         !self.no_accounting
+    }
+
+    fn period(self) -> Duration {
+        self.period.unwrap_or(PERIOD)
     }
 }
 
@@ -128,6 +190,10 @@ impl Variation {
 
     const fn accounting(self) -> bool {
         true
+    }
+
+    const fn period(self) -> Duration {
+        PERIOD
     }
 }
 
@@ -218,6 +284,9 @@ pub struct Watch {
     /// The watcher's port.
     port: Arc<Owned>,
     end: Arc<AtomicU64>,
+    /// Set when the watch stops: the watcher reads it at every timed wake,
+    /// so it stops even when the packet that wakes it cannot be posted.
+    stopped: Arc<AtomicBool>,
     #[cfg(test)]
     test: Test,
 }
@@ -229,6 +298,7 @@ struct Test {
     threads: Vec<std::thread::JoinHandle<()>>,
     events: Arc<std::sync::Mutex<Vec<Event>>>,
     sink: Option<Arc<Owned>>,
+    failed_stop_post: bool,
 }
 
 impl Watch {
@@ -260,9 +330,11 @@ impl Watch {
         };
         let port = Arc::new(port);
         let end = Arc::new(AtomicU64::new(0));
+        let stopped = Arc::new(AtomicBool::new(false));
         let thread = {
             let port = Arc::clone(&port);
             let end = Arc::clone(&end);
+            let stopped = Arc::clone(&stopped);
             #[cfg(test)]
             let events = Arc::clone(&events);
             std::thread::Builder::new()
@@ -276,8 +348,11 @@ impl Watch {
                             pid,
                             variation,
                             end: &end,
+                            stopped: &stopped,
                             #[cfg(test)]
                             events: &events,
+                            #[cfg(test)]
+                            terminations: std::cell::Cell::new(0),
                         },
                         start,
                     );
@@ -292,9 +367,10 @@ impl Watch {
         if let Some(sink) = &sink {
             let sink = Arc::clone(sink);
             let events = Arc::clone(&events);
+            let stopped = Arc::clone(&stopped);
             let discarding = std::thread::Builder::new()
                 .name("media worker discard".to_owned())
-                .spawn(move || discard(&sink, pid, &events, start));
+                .spawn(move || discard(&sink, pid, &events, &stopped, start));
             match discarding {
                 Ok(t) => threads.push(t),
                 Err(e) => return Err(e.raw_os_error().map_or(0, i32::cast_unsigned)),
@@ -303,11 +379,13 @@ impl Watch {
         Ok(Self {
             port,
             end,
+            stopped,
             #[cfg(test)]
             test: Test {
                 threads,
                 events,
                 sink,
+                failed_stop_post: variation.failed_stop_post,
             },
         })
     }
@@ -317,11 +395,16 @@ impl Watch {
         End::decode(self.end.load(Ordering::Acquire))
     }
 
-    /// Asks the watcher to stop, without waiting for it.
+    /// Asks the watcher to stop, without waiting for it: the flag first,
+    /// which it reads at its next timed wake, a period at most away, then
+    /// the packet that wakes it at once, which may fail to post.
     fn stop(&self) {
-        // SAFETY: the watcher's port, which this value keeps open. A packet
-        // that cannot be posted leaves the watcher to stop at its next read
-        // after the worker has ended.
+        self.stopped.store(true, Ordering::Release);
+        #[cfg(test)]
+        if self.test.failed_stop_post {
+            return;
+        }
+        // SAFETY: the watcher's port, which this value keeps open.
         let _ = unsafe { PostQueuedCompletionStatus(self.port.0, 0, STOP_KEY, None) };
         #[cfg(test)]
         if let Some(sink) = &self.test.sink {
@@ -369,10 +452,18 @@ impl Drop for Watch {
 }
 
 /// Logs and discards the job's memory messages about process `pid` as they
-/// come to `sink`, until the watch stops.
+/// come to `sink`, until the watch stops: on its packet, or at the first
+/// timed wake after `stopped` is set.
 #[cfg(test)]
-fn discard(sink: &Owned, pid: u32, events: &std::sync::Mutex<Vec<Event>>, start: Instant) {
-    loop {
+fn discard(
+    sink: &Owned,
+    pid: u32,
+    events: &std::sync::Mutex<Vec<Event>>,
+    stopped: &AtomicBool,
+    start: Instant,
+) {
+    let wait = u32::try_from(PERIOD.as_millis()).unwrap_or(u32::MAX);
+    while !stopped.load(Ordering::Acquire) {
         let (mut message, mut key) = (0, 0);
         let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
         // SAFETY: the sink port, and locals for what a packet carries.
@@ -382,7 +473,7 @@ fn discard(sink: &Owned, pid: u32, events: &std::sync::Mutex<Vec<Event>>, start:
                 &raw mut message,
                 &raw mut key,
                 &raw mut overlapped,
-                u32::MAX,
+                wait,
             )
         };
         match got {
@@ -401,6 +492,7 @@ fn discard(sink: &Owned, pid: u32, events: &std::sync::Mutex<Vec<Event>>, start:
                 }
             }
             Ok(()) => {}
+            Err(e) if e.code() == windows::core::HRESULT::from_win32(WAIT_TIMEOUT.0) => {}
             Err(_) => return,
         }
     }
@@ -414,33 +506,63 @@ struct Watched<'a> {
     pid: u32,
     variation: Variation,
     end: &'a AtomicU64,
+    stopped: &'a AtomicBool,
     #[cfg(test)]
     events: &'a std::sync::Mutex<Vec<Event>>,
+    /// The watcher's `TerminateJobObject` calls so far.
+    #[cfg(test)]
+    terminations: std::cell::Cell<u8>,
 }
 
 impl Watched<'_> {
-    /// Records `end`, unless an end was recorded before.
+    /// Records `end`, unless an end was recorded before: the event first,
+    /// so that a test that sees the end sees its event.
     fn ended(&self, end: End, start: Instant) {
+        self.log(Ok(end), start);
         let _ = self
             .end
             .compare_exchange(0, end.encode(), Ordering::AcqRel, Ordering::Acquire);
-        self.log(Ok(end), start);
     }
 
-    /// Ends the worker with `code`, as `end`.
-    fn terminate(&self, code: u32, end: End, start: Instant) {
-        // SAFETY: the watcher's own handle to the worker's job.
-        if let Err(e) = unsafe { TerminateJobObject(self.job.0, code) } {
-            log::warn!("media worker: its job could not be ended ({e})");
+    /// Asks for the worker's job to be ended for `cause`. The end is
+    /// recorded only once the process has ended, by its exit code.
+    fn terminate(&self, cause: Cause) {
+        #[cfg(test)]
+        if let Some(hook) = self.variation.before_terminate {
+            hook(self.process.0);
         }
-        log::warn!("media worker: ended for its memory ({end:?})");
-        self.ended(end, start);
+        match self.terminate_job(cause.code()) {
+            Ok(()) => log::warn!("media worker: ended for its memory ({cause:?})"),
+            Err(e) => log::warn!("media worker: its job could not be ended ({e}); asking again"),
+        }
     }
 
-    /// The worker's exit code once it has ended.
-    fn exited(&self) -> Option<u32> {
+    /// `TerminateJobObject` on the worker's job.
+    #[cfg(not(test))]
+    fn terminate_job(&self, code: u32) -> windows::core::Result<()> {
+        // SAFETY: the watcher's own handle to the worker's job.
+        unsafe { TerminateJobObject(self.job.0, code) }
+    }
+
+    /// `TerminateJobObject` on the worker's job, unless the test's
+    /// variation fails this one.
+    #[cfg(test)]
+    fn terminate_job(&self, code: u32) -> windows::core::Result<()> {
+        let n = self.terminations.get();
+        self.terminations.set(n.saturating_add(1));
+        if n < self.variation.failed_terminations {
+            return Err(windows::core::Error::from_hresult(
+                windows::Win32::Foundation::E_ACCESSDENIED,
+            ));
+        }
+        // SAFETY: the watcher's own handle to the worker's job.
+        unsafe { TerminateJobObject(self.job.0, code) }
+    }
+
+    /// The worker's exit code once it has ended, waiting up to `ms`.
+    fn exited(&self, ms: u32) -> Option<u32> {
         // SAFETY: the watcher's own handle to the worker's process.
-        if unsafe { WaitForSingleObject(self.process.0, 0) } != WAIT_OBJECT_0 {
+        if unsafe { WaitForSingleObject(self.process.0, ms) } != WAIT_OBJECT_0 {
             return None;
         }
         let mut code = 0;
@@ -475,33 +597,61 @@ impl Watched<'_> {
     const fn log(&self, _: Result<End, Option<usize>>, _: Instant) {}
 }
 
+/// Whole milliseconds from `now` to `then`, rounded up.
+fn ms_until(now: Instant, then: Instant) -> u32 {
+    u32::try_from(
+        then.saturating_duration_since(now)
+            .as_micros()
+            .div_ceil(1000),
+    )
+    .unwrap_or(u32::MAX)
+}
+
 /// The watcher's loop, from `start` until the worker ends or the watch is
-/// stopped.
+/// stopped. Once it has asked for the worker's job to be ended, it waits on
+/// the worker's process instead of the port, and asks again at each read
+/// while the worker lives.
 fn watch(w: &Watched, start: Instant) {
-    let mut next = start + PERIOD;
+    let period = w.variation.period();
+    let mut next = start + period;
+    let mut requested: Option<Cause> = None;
     loop {
+        if w.stopped.load(Ordering::Acquire) {
+            return;
+        }
         let now = Instant::now();
         if now >= next {
             // A read late by more than a period skips the reads it missed:
             // the schedule stays on its own grid.
             while next <= now {
-                next += PERIOD;
+                next += period;
             }
-            if let Some(code) = w.exited() {
-                w.ended(End::Exited(code), start);
+            if let Some(code) = w.exited(0) {
+                w.ended(End::of(requested, code), start);
                 return;
+            }
+            if let Some(cause) = requested {
+                w.terminate(cause);
+                continue;
             }
             if w.variation.accounting() {
                 let peak = job_peak(w.job);
                 w.log(Err(Some(peak.unwrap_or(0))), start);
                 if peak.is_some_and(|p| p >= LINE) {
-                    w.terminate(ENDED_AT_LINE, End::Line, start);
-                    return;
+                    requested = Some(Cause::Line);
+                    w.terminate(Cause::Line);
                 }
             }
             continue;
         }
-        let wait = u32::try_from((next - now).as_millis()).unwrap_or(u32::MAX);
+        let wait = ms_until(now, next);
+        if requested.is_some() {
+            if let Some(code) = w.exited(wait) {
+                w.ended(End::of(requested, code), start);
+                return;
+            }
+            continue;
+        }
         let (mut message, mut key) = (0, 0);
         let mut overlapped: *mut OVERLAPPED = std::ptr::null_mut();
         // SAFETY: the watcher's port, and locals for what a packet carries.
@@ -525,8 +675,8 @@ fn watch(w: &Watched, start: Instant) {
             {
                 w.log(Err(None), start);
                 if w.variation.message() {
-                    w.terminate(ENDED_BY_MESSAGE, End::Message, start);
-                    return;
+                    requested = Some(Cause::Message);
+                    w.terminate(Cause::Message);
                 }
             }
             // Another of the job's messages: the next read sees what it
