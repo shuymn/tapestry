@@ -9,10 +9,14 @@
 //! pixel cap on the size FFmpeg allocates, the probe's read budget, the
 //! refused allocations a demuxer goes on from, the refused secondary open,
 //! the decoded frames' stamps, the seek's back-off and the zlib-compressed
-//! containers (`media_sandbox.rs` checks the sandbox itself).
+//! containers (`media_sandbox.rs` checks the sandbox itself). They check
+//! the game's supervision of the worker too: the job watcher's two paths
+//! to ending a worker at its memory cap, each apart, a job for each launch
+//! and the peak of the four largest players.
 //!
 //! The clips are made by the worker's own `--dev-gen-clip` (dev-tools), run
-//! as a command of its own, so those tests need dev-tools; the committed
+//! as a command of its own, and the memory the job's cap is tested with by
+//! its `--dev-balloon`, so those tests need dev-tools; the committed
 //! fixtures (`tests/media/`), the files built here and the handshake do
 //! not.
 
@@ -20,6 +24,7 @@
 
 mod media_support;
 
+use std::collections::BTreeMap;
 use std::hash::{Hash as _, Hasher as _};
 use std::os::windows::io::{AsRawHandle as _, OwnedHandle};
 use std::path::Path;
@@ -32,7 +37,10 @@ use std::time::{Duration, Instant};
 
 #[cfg(feature = "dev-tools")]
 use media_support::WORKER;
-use media_support::{Kind, Launched, Stage, media_host, recipe, root};
+use media_support::media_host::watch::LINE;
+#[cfg(feature = "dev-tools")]
+use media_support::media_host::watch::{self, End, Event};
+use media_support::{Kind, Launched, Setup, Stage, media_host, recipe, root};
 use skin_model::media::control::{Command as Order, Reply};
 use skin_model::media::{Frame, Geometry, Reader, Window};
 use windows::Win32::Foundation::HANDLE;
@@ -44,6 +52,10 @@ use windows::Win32::System::Threading::SetEvent;
 /// How long a reply may take.
 const REPLY: Duration = Duration::from_secs(30);
 
+/// Three and a half of the job watcher's periods: three of its reads.
+#[cfg(feature = "dev-tools")]
+const WATCHED: Duration = Duration::from_millis(350);
+
 /// A worker the game's host launched under the recipe, staged in a
 /// directory of its own, and the replies on its control pipe.
 struct Worker {
@@ -54,10 +66,13 @@ struct Worker {
 impl Worker {
     /// Launches the worker with `args` and reads its hello.
     fn start(args: &[&str]) -> Self {
-        let stage = Stage::new();
-        let launched = stage
-            .launch(&recipe().args_of(args))
-            .unwrap_or_else(|e| panic!("{e}"));
+        Self::on(Stage::new(), &recipe().args_of(args))
+    }
+
+    /// Launches the worker staged in `stage` under `setup` and reads its
+    /// hello.
+    fn on(stage: Stage, setup: &Setup) -> Self {
+        let launched = stage.launch(setup).unwrap_or_else(|e| panic!("{e}"));
         Self {
             launched,
             _stage: stage,
@@ -217,6 +232,11 @@ impl Ring {
             unsafe { SetEvent(HANDLE(self.event.as_raw_handle())) }.unwrap();
         }
         poll.staged
+    }
+
+    /// The ring's section's size in bytes.
+    fn bytes(&self) -> usize {
+        self.reader.geometry().bytes()
     }
 
     /// Starts the next run, its stamps from `first`: the run's id.
@@ -847,6 +867,13 @@ fn decoder_enomem_fails_one_player_and_the_worker_lives() {
     for player in [1, 2, 3] {
         worker.close(player);
     }
+    // The refusal was FFmpeg's own: the job refused nothing, and no job
+    // message came.
+    let events = worker.launched.watch_events();
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Message { .. })),
+        "{events:?}"
+    );
 }
 
 // Covers: T02
@@ -1619,6 +1646,13 @@ fn demuxer_enomem_fails_one_player_and_the_worker_lives() {
     for player in [1, 2] {
         worker.close(player);
     }
+    // The refusal was the worker's own: the job refused nothing, and no job
+    // message came.
+    let events = worker.launched.watch_events();
+    assert!(
+        !events.iter().any(|e| matches!(e, Event::Message { .. })),
+        "{events:?}"
+    );
 }
 
 // Covers: T02
@@ -1648,4 +1682,340 @@ fn worker_refuses_an_unlisted_decoder_without_the_codec_whitelist() {
     assert!(log.contains("refused a decoder for h263"), "{log}");
     assert!(!log.contains("not on whitelist"), "{log}");
     worker.close(1);
+}
+
+/// A worker committing memory with `--dev-balloon args` (MiB), staged in
+/// `stage`, its job's watcher changed as `variation` says.
+#[cfg(feature = "dev-tools")]
+fn balloon(stage: &Stage, args: &str, variation: watch::Variation) -> Launched {
+    let mut all = vec!["--dev-balloon"];
+    all.extend(args.split(' '));
+    stage
+        .launch(&recipe().args_of(&all).watching_as(variation))
+        .unwrap_or_else(|e| panic!("{e}"))
+}
+
+/// Waits until `worker` has logged a line holding `text`, or its watcher
+/// has seen it end: its log.
+#[cfg(feature = "dev-tools")]
+fn logged(worker: &Launched, text: &str) -> String {
+    let deadline = Instant::now() + REPLY;
+    loop {
+        let log = worker.log();
+        if log.contains(text) || worker.end().is_some() {
+            return log;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no {text:?} in the worker's log:\n{log}"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// Waits until `worker`'s watcher has seen it end: how it ended.
+#[cfg(feature = "dev-tools")]
+fn ended(worker: &Launched) -> End {
+    let deadline = Instant::now() + REPLY;
+    loop {
+        if let Some(end) = worker.end() {
+            return end;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the worker did not end; its watcher saw {:?}; its log:\n{}",
+            worker.watch_events(),
+            worker.log()
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+/// The peaks the watcher's reads found, in order.
+#[cfg(feature = "dev-tools")]
+fn reads(events: &[Event]) -> Vec<usize> {
+    events
+        .iter()
+        .filter_map(|e| match e {
+            Event::Read { peak, .. } => Some(*peak),
+            _ => None,
+        })
+        .collect()
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn job_memory_cap_refuses_and_the_parent_terminates() {
+    let stage = Stage::new();
+    // Both of the watcher's paths off: the job refuses the commit that
+    // would take the worker past its cap (ERROR_COMMITMENT_LIMIT), and the
+    // worker goes on.
+    let off = watch::Variation {
+        no_message: true,
+        no_accounting: true,
+        discard_message: false,
+    };
+    let worker = balloon(&stage, "32 640", off);
+    let log = logged(&worker, "refused with");
+    assert!(log.contains("balloon: 32 MiB refused with 1455"), "{log}");
+    std::thread::sleep(WATCHED);
+    assert!(!worker.ended(), "{}", worker.log());
+    assert_eq!(worker.end(), None);
+    let peak = worker.job_peak().unwrap();
+    assert!((LINE..=512 << 20).contains(&peak), "{peak}");
+    drop(worker);
+    // Both on: the watcher ends the worker once its peak has reached the
+    // line, on the job's message if that came before the next scheduled
+    // read, else at that read.
+    let worker = balloon(&stage, "32 640", watch::Variation::default());
+    let end = ended(&worker);
+    let code = worker.wait_exit(REPLY);
+    let events = worker.watch_events();
+    let peak = worker.job_peak().unwrap();
+    assert!(peak >= LINE, "ended at a peak of {peak}: {events:?}");
+    let message = events.iter().any(|e| matches!(e, Event::Message { .. }));
+    let over = reads(&events).iter().any(|&p| p >= LINE);
+    match end {
+        End::Message => {
+            assert_eq!(code, Some(watch::ENDED_BY_MESSAGE));
+            assert!(message && !over, "{events:?}");
+        }
+        End::Line => {
+            assert_eq!(code, Some(watch::ENDED_AT_LINE));
+            assert!(!message && over, "{events:?}");
+        }
+        End::Exited(c) => panic!("the worker ended by itself ({c:#x}): {events:?}"),
+    }
+    eprintln!("ended on {end:?} at a peak of {peak}; the watcher saw {events:?}");
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn job_memory_message_alone_terminates_below_the_line() {
+    use windows::Win32::System::SystemServices::JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT;
+
+    let stage = Stage::new();
+    // The handler: below the line, where the accounting read cannot act,
+    // the job's message, posted to the job's port as the job posts it,
+    // ends the worker.
+    let worker = balloon(&stage, "32 384", watch::Variation::default());
+    let log = logged(&worker, "balloon: done");
+    assert!(log.contains("balloon: committed 384 MiB"), "{log}");
+    let peak = worker.job_peak().unwrap();
+    assert!(peak < LINE, "{peak}");
+    worker
+        .post_job_message(JOB_OBJECT_MSG_PROCESS_MEMORY_LIMIT)
+        .unwrap();
+    assert_eq!(ended(&worker), End::Message);
+    assert_eq!(worker.wait_exit(REPLY), Some(watch::ENDED_BY_MESSAGE));
+    let events = worker.watch_events();
+    assert!(reads(&events).iter().all(|&p| p < LINE), "{events:?}");
+    drop(worker);
+    // The system's own message, observed rather than required: 128 MiB at
+    // once past the cap is refused, and the peak stays below the line,
+    // which a refused commit does not raise. A message that comes ends the
+    // worker, maybe before it logs the refusal, which the message itself
+    // then reports.
+    let worker = balloon(&stage, "32 384 128", watch::Variation::default());
+    let log = logged(&worker, "balloon: done");
+    std::thread::sleep(WATCHED);
+    let peak = worker.job_peak().unwrap();
+    let events = worker.watch_events();
+    assert!(peak < LINE, "{peak}: {events:?}");
+    assert!(reads(&events).iter().all(|&p| p < LINE), "{events:?}");
+    match worker.end() {
+        Some(End::Message) => {
+            let at = events.iter().find_map(|e| match e {
+                Event::Message { at, .. } => Some(*at),
+                _ => None,
+            });
+            eprintln!("the job's own message came at {at:?} and ended the worker");
+        }
+        None => {
+            assert!(log.contains("balloon: 128 MiB refused with 1455"), "{log}");
+            eprintln!("the job's own message did not come; the worker lives");
+        }
+        other => panic!("{other:?}: {events:?}"),
+    }
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn job_memory_cap_terminates_when_the_message_is_lost() {
+    let stage = Stage::new();
+    // The job's message discarded before the watcher sees it: the first
+    // scheduled read at or past the line ends the worker.
+    let lost = watch::Variation {
+        no_message: false,
+        no_accounting: false,
+        discard_message: true,
+    };
+    let worker = balloon(&stage, "32 640", lost);
+    assert_eq!(ended(&worker), End::Line);
+    assert_eq!(worker.wait_exit(REPLY), Some(watch::ENDED_AT_LINE));
+    let events = worker.watch_events();
+    let peaks = reads(&events);
+    let (last, before) = peaks.split_last().unwrap();
+    assert!(
+        *last >= LINE && before.iter().all(|&p| p < LINE),
+        "{events:?}"
+    );
+    let watched: Vec<_> = events
+        .iter()
+        .filter(|e| {
+            !matches!(
+                e,
+                Event::Message {
+                    discarded: true,
+                    ..
+                }
+            )
+        })
+        .collect();
+    assert!(
+        matches!(watched.last(), Some(Event::Ended { end: End::Line, .. })),
+        "{events:?}"
+    );
+    assert!(
+        !watched.iter().any(|e| matches!(e, Event::Message { .. })),
+        "{events:?}"
+    );
+    eprintln!("the watcher saw {events:?}");
+}
+
+// Covers: T02
+#[cfg(feature = "dev-tools")]
+#[test]
+fn each_launch_gets_a_job_of_its_own() {
+    let stage = Stage::new();
+    let first = balloon(&stage, "32 640", watch::Variation::default());
+    assert!(matches!(ended(&first), End::Message | End::Line));
+    assert!(first.job_peak().unwrap() >= LINE);
+    drop(first);
+    // The next launch's worker is in a job of its own: its reads find its
+    // own peak, below the line, and it survives them and decodes.
+    let mut worker = Worker::on(stage, &recipe());
+    std::thread::sleep(WATCHED);
+    let events = worker.launched.watch_events();
+    let peaks = reads(&events);
+    assert!(
+        peaks.len() >= 3 && peaks.iter().all(|&p| p < LINE),
+        "{events:?}"
+    );
+    let fixture = root().join("crates/player/tests/media/zlib/plain.mkv");
+    let probe = worker.open(1, &fixture);
+    let Reply::Probed { width, height, .. } = probe else {
+        panic!("{probe:?}; the worker's log:\n{}", worker.log());
+    };
+    let mut ring = Ring::new(width, height);
+    assert_eq!(worker.play(1, &ring), Reply::Playing { player: 1 });
+    assert_eq!(take_all(&worker, &mut ring, 1, 0, 33_333).len(), 120);
+    worker.close(1);
+    assert_eq!(worker.launched.end(), None);
+}
+
+/// How many views of a section `bytes` long `process` has mapped.
+fn views(process: HANDLE, bytes: usize) -> usize {
+    use windows::Win32::System::Memory::{MEM_MAPPED, MEMORY_BASIC_INFORMATION, VirtualQueryEx};
+
+    let mut mapped: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut at = 0_usize;
+    loop {
+        let mut info = MEMORY_BASIC_INFORMATION::default();
+        // SAFETY: the worker's process handle, which has every access, and
+        // a struct of the size given.
+        let n = unsafe {
+            VirtualQueryEx(
+                process,
+                Some(std::ptr::without_provenance(at)),
+                &raw mut info,
+                size_of::<MEMORY_BASIC_INFORMATION>(),
+            )
+        };
+        if n == 0 {
+            break;
+        }
+        if info.Type == MEM_MAPPED {
+            *mapped.entry(info.AllocationBase.addr()).or_default() += info.RegionSize;
+        }
+        at = info.BaseAddress.addr() + info.RegionSize;
+    }
+    let size = bytes.next_multiple_of(4096);
+    mapped.values().filter(|&&s| s == size).count()
+}
+
+/// Opens `path` as player `player` and hands it a ring of its size.
+fn played(worker: &mut Worker, player: u8, path: &Path) -> Ring {
+    let probe = worker.open(player, path);
+    let Reply::Probed { width, height, .. } = probe else {
+        panic!("{probe:?}; the worker's log:\n{}", worker.log());
+    };
+    let ring = Ring::new(width, height);
+    assert_eq!(worker.play(player, &ring), Reply::Playing { player });
+    ring
+}
+
+/// Empties every ring as fast as the worker fills it until each player's
+/// video has ended: the frames each staged.
+fn drain(worker: &Worker, rings: &mut BTreeMap<u8, Ring>) -> BTreeMap<u8, usize> {
+    let mut shown: BTreeMap<u8, usize> = rings.keys().map(|&p| (p, 0)).collect();
+    let mut playing: Vec<u8> = rings.keys().copied().collect();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while !playing.is_empty() {
+        assert!(
+            Instant::now() < deadline,
+            "{playing:?} still playing; the worker's log:\n{}",
+            worker.log()
+        );
+        for (player, ring) in rings.iter_mut() {
+            if ring.poll(i64::MAX).is_some() {
+                *shown.get_mut(player).unwrap() += 1;
+            }
+        }
+        match worker.try_reply() {
+            Some(Reply::Ended { player, .. }) if playing.contains(&player) => {
+                playing.retain(|&p| p != player);
+            }
+            Some(other) => panic!("{other:?} while {playing:?} play"),
+            None => std::thread::sleep(Duration::from_millis(1)),
+        }
+    }
+    shown
+}
+
+// Covers: T02
+#[test]
+fn four_largest_players_stay_below_the_termination_line() {
+    let h264 = root().join("crates/player/tests/media/h264");
+    let wide = h264.join("h264-2560x1080.mp4");
+    let full = h264.join("h264-1920x1080.mp4");
+    let mut worker = Worker::start(&[]);
+    // Two players at 2 560 × 1 080 and two at 1 920 × 1 080, in H.264 with
+    // B-frames, each decoding into its ring, all four at once.
+    let mut rings = BTreeMap::new();
+    for (player, path) in [(1, &wide), (2, &wide), (3, &full), (4, &full)] {
+        rings.insert(player, played(&mut worker, player, path));
+    }
+    let shown = drain(&worker, &mut rings);
+    assert!(shown.values().all(|&n| n > 0), "{shown:?}");
+    let process = worker.launched.process();
+    let bytes = rings[&1].bytes();
+    assert_eq!(views(process, bytes), 2);
+    // One closed and opened again: the worker holds no view of the closed
+    // player's section, and the new one decodes beside the others.
+    worker.close(1);
+    rings.remove(&1);
+    assert_eq!(views(process, bytes), 1);
+    let mut again = BTreeMap::from([(1, played(&mut worker, 1, &wide))]);
+    drain(&worker, &mut again);
+    assert_eq!(views(process, bytes), 2);
+    let peak = worker.launched.job_peak().unwrap();
+    eprintln!("the job's peak: {peak} bytes ({} MiB)", peak >> 20);
+    assert!(peak <= LINE - (32 << 20), "{peak}");
+    for player in [1, 2, 3, 4] {
+        worker.close(player);
+    }
 }

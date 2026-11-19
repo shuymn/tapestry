@@ -3,7 +3,7 @@
 //!
 //! 1. a job: its committed memory capped, the worker ended when the job
 //!    closes and on an unhandled exception, one process, its UI
-//!    restricted;
+//!    restricted, and a completion port for its messages ([`watch::port`]);
 //! 2. the worker's AppContainer profile, with no capability, one for each
 //!    installation directory ([`profile_name`]), and an ACE granting it
 //!    read and execute on that directory, inherited by the files directly
@@ -22,8 +22,8 @@
 //!    job's limits and UI restrictions read back exactly as set, the
 //!    queried mitigation policies hold, its token is the AppContainer's
 //!    with no capability at low integrity, and it holds exactly the pipe's
-//!    ends; then it resumes and must answer with its hello within the
-//!    handshake deadline.
+//!    ends; then its watcher starts ([`watch`]), and it resumes and must
+//!    answer with its hello within the handshake deadline.
 //!
 //! A step that fails, or a check that finds anything else, terminates the
 //! process, if one was made, and fails the launch: never a weaker sandbox.
@@ -104,6 +104,7 @@ use windows::Win32::System::Threading::{
 use windows::Win32::System::WindowsProgramming::PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
 use windows::core::{PCWSTR, PWSTR, w};
 
+use super::watch::{self, Watch};
 use super::{Hello, Owned, Worker, handles};
 
 /// The worker's executable, in the directory the game launches it from.
@@ -115,7 +116,7 @@ pub const EXECUTABLE: &str = "tapestry-media.exe";
 const REPLIES: usize = 64;
 
 /// The job's cap on the worker's committed memory.
-const MEMORY_CAP: usize = 512 << 20;
+pub(super) const MEMORY_CAP: usize = 512 << 20;
 
 /// How long the worker may take to answer its launch (a design parameter).
 const HANDSHAKE: Duration = Duration::from_secs(2);
@@ -202,6 +203,7 @@ pub enum Step {
     Create,
     Assign,
     Check,
+    Watch,
     Resume,
     Handshake,
 }
@@ -209,7 +211,7 @@ pub enum Step {
 #[cfg(test)]
 impl Step {
     /// Every step, in order.
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Job,
         Self::Profile,
         Self::Grant,
@@ -219,6 +221,7 @@ impl Step {
         Self::Create,
         Self::Assign,
         Self::Check,
+        Self::Watch,
         Self::Resume,
         Self::Handshake,
     ];
@@ -265,6 +268,8 @@ pub struct Setup {
     args: Vec<String>,
     #[cfg(test)]
     handshake: Duration,
+    #[cfg(test)]
+    watching: watch::Variation,
 }
 
 impl Setup {
@@ -279,6 +284,12 @@ impl Setup {
             args: Vec::new(),
             #[cfg(test)]
             handshake: HANDSHAKE,
+            #[cfg(test)]
+            watching: watch::Variation {
+                no_message: false,
+                no_accounting: false,
+                discard_message: false,
+            },
         }
     }
 
@@ -326,6 +337,21 @@ impl Setup {
     const fn handshake(&self) -> Duration {
         HANDSHAKE
     }
+
+    /// What the test changes in the job's watcher.
+    #[cfg(test)]
+    const fn watching(&self) -> watch::Variation {
+        self.watching
+    }
+
+    #[cfg(not(test))]
+    #[expect(
+        clippy::unused_self,
+        reason = "a test's setup may change the watcher; the recipe does not"
+    )]
+    fn watching(&self) -> watch::Variation {
+        watch::Variation::default()
+    }
 }
 
 #[cfg(test)]
@@ -364,6 +390,12 @@ impl Setup {
     /// Waiting up to `limit` for the worker's hello.
     pub const fn waiting(mut self, limit: Duration) -> Self {
         self.handshake = limit;
+        self
+    }
+
+    /// With the job's watcher changed as `variation` says.
+    pub const fn watching_as(mut self, variation: watch::Variation) -> Self {
+        self.watching = variation;
         self
     }
 }
@@ -421,10 +453,11 @@ fn early((step, (code, what)): (Step, Failure)) -> LaunchError {
 /// Launches the worker in `dir` under `setup`.
 pub fn launch(dir: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
     let applied = setup.applied;
-    let job = if applied.has(Restrictions::JOB) {
-        Some(run(setup, Step::Job, || job(applied)).map_err(early)?)
+    let (job, port) = if applied.has(Restrictions::JOB) {
+        let (job, port) = run(setup, Step::Job, || job(applied)).map_err(early)?;
+        (Some(job), Some(port))
     } else {
-        None
+        (None, None)
     };
     let sid = if applied.has(Restrictions::APP_CONTAINER) {
         Some(run(setup, Step::Profile, || profile(&profile_name(dir))).map_err(early)?)
@@ -467,11 +500,20 @@ pub fn launch(dir: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
                 setup.expected,
             )
         })?;
+        // Watched from before it runs: a worker whose memory reaches the
+        // cap at once is ended as one that reaches it later is.
+        let watch = match (&job, port) {
+            (Some(job), Some(port)) => Some(run(setup, Step::Watch, || {
+                Watch::start(job, port, child.process.0, child.pid, setup.watching())
+                    .map_err(|code| (code, "its job's watcher".to_owned()))
+            })?),
+            _ => None,
+        };
         run(setup, Step::Resume, || child.resume())?;
-        Ok(table)
+        Ok((table, watch))
     })();
-    let table = match checked {
-        Ok(table) => table,
+    let (table, watch) = match checked {
+        Ok(checked) => checked,
         Err(e) => return Err(child.refuse(e)),
     };
     #[cfg(test)]
@@ -516,6 +558,7 @@ pub fn launch(dir: &Path, setup: &Setup) -> Result<Worker, LaunchError> {
         process,
         pid,
         job,
+        watch,
         _desktop: desktop,
         #[cfg(test)]
         log,
@@ -565,8 +608,8 @@ const JOB_UI: JOB_OBJECT_UILIMIT = JOB_OBJECT_UILIMIT(
         | JOB_OBJECT_UILIMIT_WRITECLIPBOARD.0,
 );
 
-/// Step 1: the job.
-fn job(applied: Restrictions) -> Result<Owned, Failure> {
+/// Step 1: the job, and the completion port its messages come to.
+fn job(applied: Restrictions) -> Result<(Owned, Owned), Failure> {
     // SAFETY: an unnamed job, owned by the value returned.
     let job = Owned(unsafe { CreateJobObjectW(None, PCWSTR::null()) }.map_err(failed("a job"))?);
     let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
@@ -596,7 +639,8 @@ fn job(applied: Restrictions) -> Result<Owned, Failure> {
         )
     }
     .map_err(failed("the job's UI restrictions"))?;
-    Ok(job)
+    let port = watch::port(&job).map_err(failed("the job's completion port"))?;
+    Ok((job, port))
 }
 
 /// The AppContainer profile's SID, freed when dropped.

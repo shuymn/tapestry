@@ -136,7 +136,12 @@ fn hello(max_alloc: usize) -> Out {
 /// Reads commands until the game quits or closes the pipe, FFmpeg's largest
 /// allocation capped at `max_alloc` bytes.
 fn serve(max_alloc: usize) -> ExitCode {
-    let out = hello(max_alloc);
+    serve_on(&hello(max_alloc))
+}
+
+/// Reads commands until the game quits or closes the pipe, after the hello
+/// (`out`).
+fn serve_on(out: &Out) -> ExitCode {
     let mut stdin = std::io::stdin().lock();
     let mut players: BTreeMap<u8, (Sender<ToPlayer>, JoinHandle<()>)> = BTreeMap::new();
     let mut closing: Vec<JoinHandle<()>> = Vec::new();
@@ -147,7 +152,7 @@ fn serve(max_alloc: usize) -> ExitCode {
                 let file = match os::Owned::take(file, os::Kind::File) {
                     Ok(file) => file,
                     Err(code) => {
-                        refuse_handle(&out, player, code);
+                        refuse_handle(out, player, code);
                         continue;
                     }
                 };
@@ -189,13 +194,13 @@ fn serve(max_alloc: usize) -> ExitCode {
                 });
                 match taken {
                     Ok((section, event)) => {
-                        to_player(&players, &out, player, ToPlayer::Play { section, event });
+                        to_player(&players, out, player, ToPlayer::Play { section, event });
                     }
-                    Err(code) => refuse_handle(&out, player, code),
+                    Err(code) => refuse_handle(out, player, code),
                 }
             }
             Command::Seek { player, run, at } => {
-                to_player(&players, &out, player, ToPlayer::Seek { run, at });
+                to_player(&players, out, player, ToPlayer::Seek { run, at });
             }
             Command::Close { player } => match players.remove(&player) {
                 Some((tx, thread)) => {

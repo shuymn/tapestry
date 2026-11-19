@@ -491,7 +491,7 @@ fn worker_launch_fails_closed() {
         // handshake, which it runs for.
         let made = matches!(
             step,
-            Step::Assign | Step::Check | Step::Resume | Step::Handshake
+            Step::Assign | Step::Check | Step::Watch | Step::Resume | Step::Handshake
         );
         assert_eq!(e.exit, made.then_some(REFUSED), "{step:?}: {e}");
     }

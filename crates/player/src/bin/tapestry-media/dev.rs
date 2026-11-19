@@ -23,6 +23,11 @@
 //! - `--dev-flood <n>`: answers the hello and, at the game's first
 //!   command, sends `n` replies the game never asked for, as fast as the
 //!   pipe takes them, then waits.
+//! - `--dev-balloon <step> <total> [<last>]`: answers the hello and serves
+//!   the control pipe while a thread commits memory the worker never frees,
+//!   `step` MiB at a time about 10 ms apart up to `total` MiB and then
+//!   `last` MiB at once, logging each commit and a refusal's error code,
+//!   after which it commits no more ([`balloon`]).
 
 mod probe;
 
@@ -69,6 +74,7 @@ pub fn run(args: &[OsString]) -> Option<ExitCode> {
             });
         }
         "--dev-probe" => return Some(probe::run(rest)),
+        "--dev-balloon" => return Some(balloon(rest)),
         "--dev-deaf" => {
             let _ = crate::hello(ffmpeg::MAX_ALLOC);
             wait_for_ever()
@@ -101,6 +107,69 @@ pub fn run(args: &[OsString]) -> Option<ExitCode> {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => usage(&e),
     })
+}
+
+/// `--dev-balloon`: the memory the job's cap and its watcher are tested
+/// with. A crafted stream cannot reach the cap, which the pixel cap and
+/// the allocation cap refuse long before (design.md "Threat Model" T02),
+/// so the worker commits it directly.
+fn balloon(args: &[String]) -> ExitCode {
+    let mib = |s: &String| s.parse::<usize>().map_err(|e| format!("{s}: {e}"));
+    let parsed = match args {
+        [step, total] => mib(step).and_then(|step| Ok((step, mib(total)?, 0))),
+        [step, total, last] => mib(step).and_then(|step| Ok((step, mib(total)?, mib(last)?))),
+        _ => Err("--dev-balloon <step> <total> [<last>]".to_owned()),
+    };
+    let (step, total, last) = match parsed {
+        Ok((0, ..)) => return usage("--dev-balloon: a step of 0 MiB"),
+        Ok(sizes) => sizes,
+        Err(e) => return usage(&e),
+    };
+    let out = crate::hello(ffmpeg::MAX_ALLOC);
+    let inflating = std::thread::Builder::new()
+        .name("balloon".to_owned())
+        .spawn(move || inflate(step, total, last));
+    if let Err(e) = inflating {
+        crate::say(&format!("balloon: its thread did not start: {e}"));
+    }
+    crate::serve_on(&out)
+}
+
+/// Commits `step` MiB at a time up to `total`, then `last` at once,
+/// stopping at the first refusal.
+fn inflate(step: usize, total: usize, last: usize) {
+    let mut committed = 0;
+    while committed < total {
+        let n = step.min(total - committed);
+        if !commit(n) {
+            return;
+        }
+        committed += n;
+        crate::say(&format!("balloon: committed {committed} MiB"));
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    if last > 0 && commit(last) {
+        committed += last;
+        crate::say(&format!("balloon: committed {committed} MiB"));
+    }
+    crate::say("balloon: done");
+}
+
+/// Commits `mib` MiB the worker never frees or touches: whether the commit
+/// was granted, a refusal logged with its error code.
+fn commit(mib: usize) -> bool {
+    use windows::Win32::Foundation::GetLastError;
+    use windows::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+
+    // SAFETY: a new private region, which nothing reads or frees.
+    let region = unsafe { VirtualAlloc(None, mib << 20, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE) };
+    if region.is_null() {
+        // SAFETY: the calling thread's last error, which the refusal set.
+        let code = unsafe { GetLastError() }.0;
+        crate::say(&format!("balloon: {mib} MiB refused with {code}"));
+        return false;
+    }
+    true
 }
 
 /// Waits until the game ends the worker.

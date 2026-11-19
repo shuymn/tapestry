@@ -12,12 +12,17 @@
 //! capacity ([`Worker::overflowed`]), ends the reading, as a worker that
 //! dies does: the replies then stop for good.
 //!
-//! Dropping a worker never waits on it: its job closes, ending it, after a
+//! Dropping a worker never waits on it: its job is ended and closed after a
 //! short grace on a thread of its own, whatever its pipe does, and a `Quit`
 //! is sent meanwhile on another, best effort.
+//!
+//! A watcher ends a worker whose memory reaches its job's cap ([`watch`])
+//! and records how each worker ended, which the game reads
+//! ([`Worker::end`]).
 
 pub mod handles;
 pub mod launch;
+pub mod watch;
 
 use std::io::Write as _;
 use std::os::windows::io::{FromRawHandle as _, OwnedHandle};
@@ -34,11 +39,13 @@ use windows::Win32::Security::Authorization::{
     ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
 };
 use windows::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+use windows::Win32::System::JobObjects::TerminateJobObject;
 use windows::Win32::System::Memory::{CreateFileMappingW, PAGE_READWRITE};
 use windows::Win32::System::Threading::{CreateEventW, GetCurrentProcess, WaitForSingleObject};
 use windows::core::{PCWSTR, w};
 
 use launch::{LaunchError, Setup};
+use watch::{End, Watch};
 
 /// A kind of handle the game hands the worker.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -162,6 +169,8 @@ pub struct Worker {
     /// The job, whose closing ends the worker (`None` only under a test's
     /// setup without one).
     job: Option<Owned>,
+    /// The job's watcher (with the job).
+    watch: Option<Watch>,
     /// The window station and desktop the worker runs on, kept while it
     /// runs.
     _desktop: Option<launch::Desktop>,
@@ -261,6 +270,12 @@ impl Worker {
     pub const fn pid(&self) -> u32 {
         self.pid
     }
+
+    /// How the worker ended, once its watcher has seen it end: `None` while
+    /// it runs (or without a job, under a test's setup).
+    pub fn end(&self) -> Option<End> {
+        self.watch.as_ref().and_then(Watch::end)
+    }
 }
 
 #[cfg(test)]
@@ -281,9 +296,38 @@ impl Worker {
         self.job.as_ref().map(|j| j.0)
     }
 
-    /// Closes the job, as the game's exit does, keeping the rest.
+    /// Closes the job, as the game's exit does, keeping the rest: the
+    /// watcher stops first, closing its own handle to the job.
     pub fn close_job(&mut self) {
+        if let Some(watch) = self.watch.take() {
+            watch.join();
+        }
         self.job = None;
+    }
+
+    /// Posts the job's `message` about the worker to the job's watcher, as
+    /// the job posts it.
+    ///
+    /// # Errors
+    ///
+    /// When the worker has no watcher, or the post fails.
+    pub fn post_job_message(&self, message: u32) -> windows::core::Result<()> {
+        self.watch
+            .as_ref()
+            .ok_or_else(|| {
+                windows::core::Error::from_hresult(windows::Win32::Foundation::E_UNEXPECTED)
+            })?
+            .post(message, self.pid)
+    }
+
+    /// The peak commit of the worker's job, as its watcher reads it.
+    pub fn job_peak(&self) -> Option<usize> {
+        watch::job_peak(self.job.as_ref()?)
+    }
+
+    /// What the job's watcher did so far.
+    pub fn watch_events(&self) -> Vec<watch::Event> {
+        self.watch.as_ref().map(Watch::events).unwrap_or_default()
     }
 
     /// Every log line the worker sent so far.
@@ -333,6 +377,8 @@ impl Worker {
 
 impl Drop for Worker {
     fn drop(&mut self) {
+        // The watcher stops: the worker's end from here on is the game's.
+        drop(self.watch.take());
         // `Quit`, best effort, on a thread of its own: the write waits while
         // the pipe is full, until the worker reads or ends. A thread that
         // does not start drops the pipe, which ends the worker's reading as
@@ -347,19 +393,23 @@ impl Drop for Worker {
                     let _ = commands.write_all(&bytes);
                 }
             });
-        // The job closes after the grace, on another thread, whatever the
-        // write does; closing it ends the worker (`KILL_ON_JOB_CLOSE`). A
-        // thread that does not start closes it at once, as its closure
-        // drops.
+        // The job is ended and closed after the grace, on another thread,
+        // whatever the write does: ended, so that a watcher still closing
+        // its own handle to the job keeps no worker alive, and closed, which
+        // ends the worker too (`KILL_ON_JOB_CLOSE`). A thread that does not
+        // start closes it at once, as its closure drops.
         let job = self.job.take();
         let process = std::mem::replace(&mut self.process, Owned(HANDLE::default()));
         let _ = std::thread::Builder::new()
             .name("media worker end".to_owned())
             .spawn(move || {
-                if job.is_some() {
-                    // SAFETY: the worker's process handle, which this
-                    // thread holds.
-                    let _ = unsafe { WaitForSingleObject(process.0, QUIT_GRACE_MS) };
+                if let Some(job) = &job {
+                    // SAFETY: the worker's process handle and its job's,
+                    // which this thread holds.
+                    unsafe {
+                        let _ = WaitForSingleObject(process.0, QUIT_GRACE_MS);
+                        let _ = TerminateJobObject(job.0, 0);
+                    }
                 }
                 drop((job, process));
             });
